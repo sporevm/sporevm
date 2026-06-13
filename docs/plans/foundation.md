@@ -367,14 +367,15 @@ and do not block the next release-critical fork/fan-out slices.
 
 Slice 6 has its first remote distribution proof. `scripts/smoke-remote-bundle.sh`
 orchestrates two SSM-managed aarch64 KVM hosts and an S3 staging prefix: it
-uploads the current checkout, captures and packs a spore on the source host,
-publishes the chunkpack bundle to S3, then downloads, unpacks, and resumes on
-the destination host. The first two-host run in `ap-southeast-2` packed 14
-non-zero chunks from a 512MiB ticker spore into a 29,382,174-byte bundle, then
-resumed on the second host with KVM lazy RAM reporting `ttfi_ms=5`,
-`ttuw_ms=1230`, `lazy_faults=9`, and `lazy_unique_chunks=9`. This proves the
-bundle can leave a source host and boot on a compatible destination; it is not
-yet the final fan-out data plane or origin-egress efficiency proof.
+uploads tracked `HEAD` plus the current tracked/staged diff, captures and packs
+a spore on the source host, publishes the chunkpack bundle to S3, then
+downloads, unpacks, and resumes on the destination host. The first two-host run
+in `ap-southeast-2` packed 14 non-zero chunks from a 512MiB ticker spore into a
+29,382,174-byte bundle, then resumed on the second host with KVM lazy RAM
+reporting `ttfi_ms=5`, `ttuw_ms=1222`, `lazy_faults=9`, and
+`lazy_unique_chunks=9`. This proves the bundle can leave a source host and boot
+on a compatible destination; it is not yet the final fan-out data plane or
+origin-egress efficiency proof.
 
 ## Delivery Strategy
 

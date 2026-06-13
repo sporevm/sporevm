@@ -12,8 +12,9 @@ usage:
 
 Capture a spore on one SSM-managed KVM host, pack it into a chunkpack bundle,
 stage the bundle in S3, then unpack and resume it on a second compatible KVM
-host. The script uploads the current checkout to S3 so it can validate local
-changes before they are committed.
+host. The script uploads tracked HEAD plus the current tracked/staged diff to
+S3 so it can validate local changes before they are committed without copying
+stray untracked files.
 
 Options:
   --region REGION             AWS region for SSM and S3
@@ -158,7 +159,7 @@ do
 done
 
 command -v aws >/dev/null 2>&1 || die "aws CLI is required"
-command -v tar >/dev/null 2>&1 || die "tar is required"
+command -v git >/dev/null 2>&1 || die "git is required"
 
 if [[ -z "${run_id}" ]]; then
   random_id="$(uuidgen 2>/dev/null || openssl rand -hex 16)"
@@ -185,24 +186,13 @@ cleanup() {
 trap cleanup EXIT
 
 source_archive="${tmpdir}/source.tar.gz"
+source_patch="${tmpdir}/source.patch"
 source_script="${tmpdir}/source.sh"
 dest_script="${tmpdir}/dest.sh"
 
 echo "packing local checkout for remote smoke" >&2
-export COPYFILE_DISABLE=1
-tar_metadata_flags=()
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  tar_metadata_flags=(--no-xattrs --no-mac-metadata)
-fi
-tar \
-  "${tar_metadata_flags[@]}" \
-  --exclude .git \
-  --exclude .zig-cache \
-  --exclude zig-out \
-  --exclude benchmarks/results \
-  -C "${repo_root}" \
-  -czf "${source_archive}" \
-  .
+git -C "${repo_root}" archive --format=tar.gz -o "${source_archive}" HEAD
+git -C "${repo_root}" diff --binary HEAD -- >"${source_patch}"
 
 cat >"${source_script}" <<EOF
 #!/usr/bin/env bash
@@ -213,6 +203,8 @@ export XDG_CACHE_HOME="\${XDG_CACHE_HOME:-\${HOME}/.cache}"
 export XDG_DATA_HOME="\${XDG_DATA_HOME:-\${HOME}/.local/share}"
 export XDG_STATE_HOME="\${XDG_STATE_HOME:-\${HOME}/.local/state}"
 mkdir -p "\${XDG_CACHE_HOME}" "\${XDG_DATA_HOME}" "\${XDG_STATE_HOME}"
+command -v git >/dev/null 2>&1 || { echo "git is required" >&2; exit 1; }
+command -v tar >/dev/null 2>&1 || { echo "tar is required" >&2; exit 1; }
 
 region=${q_region}
 bucket=${q_bucket}
@@ -225,8 +217,12 @@ workdir="/tmp/sporevm-remote-bundle-source-${run_id}"
 rm -rf "\${workdir}"
 mkdir -p "\${workdir}/repo"
 aws s3 cp "s3://\${bucket}/\${run_prefix}/source.tar.gz" "\${workdir}/source.tar.gz" --region "\${region}" --only-show-errors
+aws s3 cp "s3://\${bucket}/\${run_prefix}/source.patch" "\${workdir}/source.patch" --region "\${region}" --only-show-errors
 tar -xzf "\${workdir}/source.tar.gz" -C "\${workdir}/repo"
 cd "\${workdir}/repo"
+if [[ -s "\${workdir}/source.patch" ]]; then
+  git apply --binary "\${workdir}/source.patch"
+fi
 export MISE_TRUSTED_CONFIG_PATHS="\${PWD}/mise.toml"
 
 mise install
@@ -271,6 +267,8 @@ export XDG_CACHE_HOME="\${XDG_CACHE_HOME:-\${HOME}/.cache}"
 export XDG_DATA_HOME="\${XDG_DATA_HOME:-\${HOME}/.local/share}"
 export XDG_STATE_HOME="\${XDG_STATE_HOME:-\${HOME}/.local/state}"
 mkdir -p "\${XDG_CACHE_HOME}" "\${XDG_DATA_HOME}" "\${XDG_STATE_HOME}"
+command -v git >/dev/null 2>&1 || { echo "git is required" >&2; exit 1; }
+command -v tar >/dev/null 2>&1 || { echo "tar is required" >&2; exit 1; }
 
 region=${q_region}
 bucket=${q_bucket}
@@ -282,10 +280,14 @@ workdir="/tmp/sporevm-remote-bundle-dest-${run_id}"
 rm -rf "\${workdir}"
 mkdir -p "\${workdir}/repo" "\${workdir}/spore.bundle"
 aws s3 cp "s3://\${bucket}/\${run_prefix}/source.tar.gz" "\${workdir}/source.tar.gz" --region "\${region}" --only-show-errors
+aws s3 cp "s3://\${bucket}/\${run_prefix}/source.patch" "\${workdir}/source.patch" --region "\${region}" --only-show-errors
 aws s3 cp "s3://\${bucket}/\${run_prefix}/spore.bundle/" "\${workdir}/spore.bundle" --recursive --region "\${region}" --only-show-errors
 bundle_bytes="\$(du -sb "\${workdir}/spore.bundle" | awk '{print \$1}')"
 tar -xzf "\${workdir}/source.tar.gz" -C "\${workdir}/repo"
 cd "\${workdir}/repo"
+if [[ -s "\${workdir}/source.patch" ]]; then
+  git apply --binary "\${workdir}/source.patch"
+fi
 export MISE_TRUSTED_CONFIG_PATHS="\${PWD}/mise.toml"
 
 mise install
@@ -321,6 +323,7 @@ chmod +x "${source_script}" "${dest_script}"
 
 echo "uploading smoke inputs to ${s3_base}/" >&2
 aws s3 cp "${source_archive}" "${s3_base}/source.tar.gz" --region "${region}" --only-show-errors
+aws s3 cp "${source_patch}" "${s3_base}/source.patch" --region "${region}" --only-show-errors
 aws s3 cp "${source_script}" "${s3_base}/source.sh" --region "${region}" --only-show-errors
 aws s3 cp "${dest_script}" "${s3_base}/dest.sh" --region "${region}" --only-show-errors
 

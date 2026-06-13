@@ -80,6 +80,8 @@ into a normal spore directory with
 `zig-out/bin/spore unpack /tmp/spore.bundle --out /tmp/spore.unpacked`.
 To exercise the first cross-host bundle path over SSM and S3, use
 `scripts/smoke-remote-bundle.sh --region REGION --source-instance ID --dest-instance ID --bucket BUCKET`.
+It stages tracked `HEAD` plus the current tracked/staged diff; stage new files
+you want included in the remote run.
 
 For a lower-bound boot/exec probe comparable to Cleanroom's minimal
 `darwin-vz` benchmark, use the minimal benchmark wrapper. It builds a tiny
