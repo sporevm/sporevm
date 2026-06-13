@@ -54,6 +54,8 @@ The `hvf-boot` and `kvm-boot` harnesses accept `--initrd root.cpio` for
 diskless smoke workloads (`rdinit=/init` by default when no disk is supplied).
 Use an initrd-capable kernel such as the `cleanroom-kernels` `initrd` profile;
 the default `rootfs` profile intentionally ignores external initrds.
+Build the tiny ticker initrd used by smoke tests with
+`scripts/make-smoke-initrd.sh /tmp/sporevm-smoke.cpio`.
 
 KVM work needs an aarch64 Linux host with KVM; Hypervisor.framework work needs
 an Apple Silicon Mac on macOS 15+.

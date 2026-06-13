@@ -303,8 +303,9 @@ the HVF boot harness). The boot harnesses now accept `--initrd`, describe the
 initrd in `/chosen/linux,initrd-{start,end}`, and place it after the kernel so
 the first positive cross-hypervisor smoke can be diskless when using the
 `cleanroom-kernels` `initrd` profile (the default `rootfs` kernel profile
-intentionally ignores external initrds). The four-way cross-hypervisor matrix
-(slice 4) remains next.
+intentionally ignores external initrds). `scripts/make-smoke-initrd.sh` builds
+the tiny ticker initrd used for those smokes. The four-way cross-hypervisor
+matrix (slice 4) remains next.
 
 ## Delivery Strategy
 
