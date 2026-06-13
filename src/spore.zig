@@ -115,9 +115,7 @@ fn readFileAll(allocator: std.mem.Allocator, path: [:0]const u8, max: usize) Err
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
     if (fd < 0) return error.IoFailed;
     defer _ = std.c.close(fd);
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0) return error.IoFailed;
-    const size: usize = @intCast(@max(st.size, 0));
+    const size = try seekFileSize(fd);
     if (size > max) return error.BadChunk;
     const buf = try allocator.alloc(u8, size);
     errdefer allocator.free(buf);
@@ -128,6 +126,15 @@ fn readFileAll(allocator: std.mem.Allocator, path: [:0]const u8, max: usize) Err
         done += @intCast(n);
     }
     return buf;
+}
+
+fn seekFileSize(fd: std.c.fd_t) Error!usize {
+    const cur = std.c.lseek(fd, 0, std.c.SEEK.CUR);
+    if (cur < 0) return error.IoFailed;
+    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (end < 0) return error.IoFailed;
+    if (std.c.lseek(fd, cur, std.c.SEEK.SET) < 0) return error.IoFailed;
+    return @intCast(end);
 }
 
 fn ensureDir(path: [:0]const u8) Error!void {

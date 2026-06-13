@@ -30,9 +30,7 @@ pub const Backend = union(enum) {
     fn capacityBytes(self: Backend) u64 {
         switch (self) {
             .file => |fd| {
-                var st: std.c.Stat = undefined;
-                if (std.c.fstat(fd, &st) != 0) return 0;
-                return @intCast(@max(st.size, 0));
+                return seekFileSize(fd) orelse 0;
             },
             .memory => |m| return m.len,
         }
@@ -83,6 +81,15 @@ pub const Backend = union(enum) {
         }
     }
 };
+
+fn seekFileSize(fd: std.c.fd_t) ?u64 {
+    const cur = std.c.lseek(fd, 0, std.c.SEEK.CUR);
+    if (cur < 0) return null;
+    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (end < 0) return null;
+    if (std.c.lseek(fd, cur, std.c.SEEK.SET) < 0) return null;
+    return @intCast(end);
+}
 
 pub const Blk = struct {
     backend: Backend,
