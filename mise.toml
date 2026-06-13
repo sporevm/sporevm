@@ -1,0 +1,10 @@
+[tools]
+zig = "0.16.0"
+
+[tasks.build]
+run = "zig build"
+description = "Build sporevm"
+
+[tasks.test]
+run = "zig build test"
+description = "Run unit tests"

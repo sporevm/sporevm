@@ -1,0 +1,379 @@
+//! Spore manifest v0 and chunk store.
+//!
+//! A spore is a directory: `manifest.json` plus `chunks/<blake3-hex>` files.
+//! Guest memory is stored as fixed-size content-addressed chunks with
+//! all-zero chunks elided. Machine state is normalized architectural
+//! aarch64 state — never raw hypervisor structures (see
+//! docs/spore-format.md). v0 carries no compatibility promise.
+//!
+//! Manifests and chunks may come from untrusted storage: parsing is strict,
+//! chunk contents are verified against their ids before use, and restore
+//! fails closed on any mismatch. See SECURITY.md.
+
+const std = @import("std");
+const chunklib = @import("chunk.zig");
+
+pub const format_version: u32 = 0;
+pub const chunk_size: usize = 2 * 1024 * 1024;
+
+pub const Error = error{
+    BadManifest,
+    BadChunk,
+    PlatformMismatch,
+    IoFailed,
+    OutOfMemory,
+};
+
+pub const Platform = struct {
+    arch: []const u8 = "aarch64",
+    device_model_version: u32,
+    ram_base: u64,
+    ram_size: u64,
+    gic_dist_base: u64,
+    gic_redist_base: u64,
+};
+
+pub const QueueState = struct {
+    size: u16,
+    ready: bool,
+    desc_addr: u64,
+    avail_addr: u64,
+    used_addr: u64,
+    last_avail: u16,
+    used_idx: u16,
+};
+
+pub const TransportState = struct {
+    device_id: u32,
+    status: u32,
+    device_features_sel: u32,
+    driver_features_sel: u32,
+    driver_features: u64,
+    queue_sel: u32,
+    interrupt_status: u32,
+    queues: []QueueState,
+};
+
+pub const VtimerState = struct {
+    /// Guest virtual counter value at snapshot time.
+    cntvct: u64,
+    cntv_ctl: u64,
+    cntv_cval: u64,
+};
+
+pub const SysRegEntry = struct {
+    name: []const u8,
+    value: u64,
+};
+
+pub const MachineState = struct {
+    gprs: [31]u64,
+    pc: u64,
+    cpsr: u64,
+    fpcr: u64,
+    fpsr: u64,
+    /// 32 Q registers as pairs of u64 (little-endian halves).
+    simd: [32][2]u64,
+    sys_regs: []SysRegEntry,
+    /// GIC CPU-interface (ICC) registers, by architectural name.
+    icc_regs: []SysRegEntry,
+    vtimer: VtimerState,
+    /// Interrupt controller state blob (opaque to the manifest, produced
+    /// and consumed by the hypervisor backend), base64.
+    gic_state_b64: []const u8,
+};
+
+pub const MemoryManifest = struct {
+    chunk_size: u64,
+    /// One entry per chunk; null means all zeroes.
+    chunks: []?[]const u8,
+};
+
+pub const Manifest = struct {
+    version: u32 = format_version,
+    platform: Platform,
+    machine: MachineState,
+    devices: []TransportState,
+    memory: MemoryManifest,
+};
+
+// --- file helpers (libc-based; std.Io migration is a later cleanup) ---------
+
+fn writeFileAll(path: [:0]const u8, data: []const u8) Error!void {
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    var done: usize = 0;
+    while (done < data.len) {
+        const n = std.c.write(fd, data.ptr + done, data.len - done);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+}
+
+fn readFileAll(allocator: std.mem.Allocator, path: [:0]const u8, max: usize) Error![]u8 {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    const size = try seekFileSize(fd);
+    if (size > max) return error.BadChunk;
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    var done: usize = 0;
+    while (done < size) {
+        const n = std.c.read(fd, buf.ptr + done, size - done);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+    return buf;
+}
+
+fn seekFileSize(fd: std.c.fd_t) Error!usize {
+    const cur = std.c.lseek(fd, 0, std.c.SEEK.CUR);
+    if (cur < 0) return error.IoFailed;
+    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (end < 0) return error.IoFailed;
+    if (std.c.lseek(fd, cur, std.c.SEEK.SET) < 0) return error.IoFailed;
+    return @intCast(end);
+}
+
+fn ensureDir(path: [:0]const u8) Error!void {
+    if (std.c.mkdir(path, 0o755) != 0) {
+        const err = std.posix.errno(@as(isize, -1));
+        _ = err;
+        // Already exists is fine; verify it is usable by probing access.
+        if (std.c.access(path, 0) != 0) return error.IoFailed;
+    }
+}
+
+fn pathZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Error![:0]const u8 {
+    return std.fmt.allocPrintSentinel(allocator, fmt, args, 0) catch error.OutOfMemory;
+}
+
+// --- save / load -------------------------------------------------------------
+
+/// Write guest memory into the chunk store, returning the memory manifest.
+pub fn saveMemory(allocator: std.mem.Allocator, dir: []const u8, ram: []const u8) Error!MemoryManifest {
+    const chunks_dir = try pathZ(allocator, "{s}/chunks", .{dir});
+    try ensureDir(try pathZ(allocator, "{s}", .{dir}));
+    try ensureDir(chunks_dir);
+
+    const count = (ram.len + chunk_size - 1) / chunk_size;
+    const refs = try allocator.alloc(?[]const u8, count);
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const start = i * chunk_size;
+        const end = @min(start + chunk_size, ram.len);
+        const data = ram[start..end];
+        if (std.mem.allEqual(u8, data, 0)) {
+            refs[i] = null;
+            continue;
+        }
+        const id = chunklib.ChunkId.fromContents(data);
+        const hex = id.toHex();
+        const ref = try allocator.dupe(u8, &hex);
+        refs[i] = ref;
+        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, ref });
+        if (std.c.access(chunk_path, 0) != 0) {
+            try writeFileAll(chunk_path, data);
+        }
+    }
+    return .{ .chunk_size = chunk_size, .chunks = refs };
+}
+
+/// Materialize guest memory from the chunk store. Verifies every chunk
+/// against its id; fails closed on mismatch.
+pub fn loadMemory(allocator: std.mem.Allocator, dir: []const u8, manifest: MemoryManifest, ram: []u8) Error!void {
+    if (manifest.chunk_size == 0 or manifest.chunk_size > 64 * 1024 * 1024) return error.BadManifest;
+    const csize: usize = @intCast(manifest.chunk_size);
+    const expected = (ram.len + csize - 1) / csize;
+    if (manifest.chunks.len != expected) return error.BadManifest;
+
+    for (manifest.chunks, 0..) |maybe_ref, i| {
+        const start = i * csize;
+        const end = @min(start + csize, ram.len);
+        const target = ram[start..end];
+        if (maybe_ref) |ref| {
+            const id = chunklib.ChunkId.fromHex(ref) catch return error.BadManifest;
+            const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, ref });
+            const data = try readFileAll(allocator, chunk_path, csize);
+            defer allocator.free(data);
+            if (data.len != target.len) return error.BadChunk;
+            if (!id.matches(data)) return error.BadChunk;
+            @memcpy(target, data);
+        } else {
+            @memset(target, 0);
+        }
+    }
+}
+
+pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Manifest) Error!void {
+    const json = std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
+    defer allocator.free(json);
+    const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
+    try writeFileAll(path, json);
+}
+
+pub fn loadManifest(allocator: std.mem.Allocator, dir: []const u8) Error!std.json.Parsed(Manifest) {
+    const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
+    const bytes = try readFileAll(allocator, path, 64 * 1024 * 1024);
+    defer allocator.free(bytes);
+    return std.json.parseFromSlice(Manifest, allocator, bytes, .{
+        // The byte buffer is freed before the parse result is used.
+        .allocate = .alloc_always,
+    }) catch error.BadManifest;
+}
+
+// --- tests ------------------------------------------------------------------
+
+extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
+
+fn testDir(allocator: std.mem.Allocator) ![]const u8 {
+    const tmpl = "/tmp/sporevm-test-XXXXXX";
+    const buf = try allocator.dupeZ(u8, tmpl);
+    if (mkdtemp(buf) == null) return error.IoFailed;
+    return buf;
+}
+
+test "memory round-trips through the chunk store with zero elision" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+
+    const ram = try arena.alloc(u8, 5 * chunk_size + 1234);
+    @memset(ram, 0);
+    ram[0] = 1; // chunk 0 non-zero
+    ram[3 * chunk_size + 7] = 0xCC; // chunk 3 non-zero
+    ram[ram.len - 1] = 0xEE; // tail chunk non-zero
+
+    const mm = try saveMemory(arena, dir, ram);
+    try std.testing.expectEqual(@as(usize, 6), mm.chunks.len);
+    try std.testing.expect(mm.chunks[0] != null);
+    try std.testing.expect(mm.chunks[1] == null);
+    try std.testing.expect(mm.chunks[3] != null);
+    try std.testing.expect(mm.chunks[5] != null);
+
+    const out = try arena.alloc(u8, ram.len);
+    @memset(out, 0xAA);
+    try loadMemory(arena, dir, mm, out);
+    try std.testing.expectEqualSlices(u8, ram, out);
+}
+
+test "corrupted chunk fails closed" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, chunk_size);
+    @memset(ram, 0x42);
+    const mm = try saveMemory(arena, dir, ram);
+
+    // Corrupt the stored chunk.
+    const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, mm.chunks[0].? });
+    const data = try readFileAll(arena, chunk_path, chunk_size);
+    data[100] ^= 0xFF;
+    try writeFileAll(chunk_path, data);
+
+    const out = try arena.alloc(u8, ram.len);
+    try std.testing.expectError(error.BadChunk, loadMemory(arena, dir, mm, out));
+}
+
+fn fuzzManifestParse(_: void, s: *std.testing.Smith) !void {
+    // Manifests come from untrusted storage: parsing must never crash and
+    // must either fail or produce a structurally valid manifest.
+    var buf: [4096]u8 = undefined;
+    const len = s.slice(&buf);
+    const parsed = std.json.parseFromSlice(Manifest, std.testing.allocator, buf[0..len], .{
+        .allocate = .alloc_always,
+    }) catch return;
+    parsed.deinit();
+}
+
+test "fuzz manifest parsing" {
+    try std.testing.fuzz({}, fuzzManifestParse, .{});
+}
+
+fn fuzzMemoryManifest(_: void, s: *std.testing.Smith) !void {
+    // Hostile memory manifests must fail closed, never read outside the
+    // chunk store or write outside the target buffer.
+    var ram: [4096]u8 = undefined;
+    var ref_buf: [128]u8 = undefined;
+    const ref_len = s.slice(&ref_buf);
+    var refs: [4]?[]const u8 = .{ null, null, null, null };
+    if (ref_len > 0) refs[0] = ref_buf[0..ref_len];
+    const mm = MemoryManifest{
+        .chunk_size = s.value(u64),
+        .chunks = &refs,
+    };
+    _ = loadMemory(std.testing.allocator, "/nonexistent-spore", mm, &ram) catch return;
+}
+
+test "fuzz memory manifest handling" {
+    try std.testing.fuzz({}, fuzzMemoryManifest, .{});
+}
+
+test "manifest json round-trip" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    var queues = [_]QueueState{.{
+        .size = 64,
+        .ready = true,
+        .desc_addr = 0x1000,
+        .avail_addr = 0x2000,
+        .used_addr = 0x3000,
+        .last_avail = 7,
+        .used_idx = 7,
+    }};
+    var devices = [_]TransportState{.{
+        .device_id = 3,
+        .status = 0xf,
+        .device_features_sel = 0,
+        .driver_features_sel = 1,
+        .driver_features = 1 << 32,
+        .queue_sel = 1,
+        .interrupt_status = 0,
+        .queues = &queues,
+    }};
+    var sys_regs = [_]SysRegEntry{.{ .name = "sctlr_el1", .value = 0xdeadbeef }};
+    const manifest = Manifest{
+        .platform = .{
+            .device_model_version = 1,
+            .ram_base = 0x8000_0000,
+            .ram_size = 1 << 29,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0801_0000,
+        },
+        .machine = .{
+            .gprs = [_]u64{0} ** 31,
+            .pc = 0xffff_ffc0_0000_0000,
+            .cpsr = 0x3c5,
+            .fpcr = 0,
+            .fpsr = 0,
+            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .sys_regs = &sys_regs,
+            .icc_regs = &.{},
+            .vtimer = .{ .cntvct = 123, .cntv_ctl = 1, .cntv_cval = 456 },
+            .gic_state_b64 = "AAAA",
+        },
+        .devices = &devices,
+        .memory = .{ .chunk_size = chunk_size, .chunks = &.{} },
+    };
+    try saveManifest(arena, dir, manifest);
+    const parsed = try loadManifest(arena, dir);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 0), parsed.value.version);
+    try std.testing.expectEqual(@as(u64, 0x8000_0000), parsed.value.platform.ram_base);
+    try std.testing.expectEqual(@as(u64, 123), parsed.value.machine.vtimer.cntvct);
+    try std.testing.expectEqualStrings("sctlr_el1", parsed.value.machine.sys_regs[0].name);
+    try std.testing.expectEqual(@as(u16, 64), parsed.value.devices[0].queues[0].size);
+}

@@ -1,0 +1,35 @@
+steps:
+  - label: ":zig: Build & Test (Linux)"
+    command: |
+      mise install
+      mise exec -- zig build test --summary all
+      mise exec -- zig fmt --check build.zig src
+    plugins:
+      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          version: "2026.5.12"
+    cache:
+      paths:
+        - "~/.local/share/mise"
+        - "~/.cache/mise"
+        - "~/.local/state/mise"
+      size: "20g"
+      name: "mise-cache"
+    agents:
+      queue: cleanroom
+
+  - label: ":zig: Build & Test (macOS)"
+    command: |
+      mise install
+      mise exec -- zig build test --summary all
+    plugins:
+      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          version: "2026.5.12"
+    cache:
+      paths:
+        - "~/.local/share/mise"
+        - "~/.cache/mise"
+        - "~/.local/state/mise"
+      size: "20g"
+      name: "mise-cache"
+    agents:
+      queue: cleanroom-mac
