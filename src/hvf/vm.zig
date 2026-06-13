@@ -40,9 +40,12 @@ pub const Config = struct {
     /// stop. Requires snapshot_dir.
     snapshot_after_ms: ?u64 = null,
     snapshot_dir: ?[]const u8 = null,
+    /// Optional minimal host-initiated vsock stream used by benchmark harnesses.
+    exec_probe: ?*vsock.HostStream = null,
+    exec_probe_timeout_ms: u64 = 30_000,
 };
 
-pub const ExitCause = enum { guest_off, guest_reset, snapshotted };
+pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete };
 
 // PSCI v1.x (ARM DEN 0022) function ids and return codes.
 const psci_version: u32 = 0x8400_0000;
@@ -191,9 +194,18 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
 
     const counter_start = snapshot.hostCounter();
     const counter_freq = snapshot.hostCounterFreq();
+    if (config.exec_probe) |probe| {
+        try vsock_dev.attachHostStream(probe);
+        probe.markStarted();
+    }
 
     // Run loop.
     while (true) {
+        if (config.exec_probe) |probe| {
+            if (probe.state == .failed) return error.VsockProbeFailed;
+            if (probe.state == .complete) return .probe_complete;
+            if (probe.elapsedMs() > config.exec_probe_timeout_ms) return error.VsockProbeTimedOut;
+        }
         if (config.snapshot_after_ms) |after_ms| {
             const elapsed_ms = (snapshot.hostCounter() - counter_start) * 1000 / counter_freq;
             if (elapsed_ms >= after_ms) {

@@ -79,6 +79,18 @@ Pack a spore into the first local distribution format with
 into a normal spore directory with
 `zig-out/bin/spore unpack /tmp/spore.bundle --out /tmp/spore.unpacked`.
 
+For a lower-bound boot/exec probe comparable to Cleanroom's minimal
+`darwin-vz` benchmark, use the minimal benchmark wrapper. It builds a tiny
+initrd whose `/init` listens on virtio-vsock, sends one `/bin/true` exec
+request from the host, and writes JSONL timings for VM start, vsock connect,
+and first exec response:
+
+```bash
+scripts/benchmark-sporevm-minimal.sh \
+  --backend hvf \
+  --iterations 30
+```
+
 KVM work needs an aarch64 Linux host with KVM; Hypervisor.framework work needs
 an Apple Silicon Mac on macOS 15+.
 
