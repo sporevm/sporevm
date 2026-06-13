@@ -1,7 +1,7 @@
 //! Virtio console device (virtio spec 1.2 §5.3), minimal single-port.
 //!
-//! Queue 0 is receive (guest input, unused for now: buffers stay queued),
-//! queue 1 is transmit (guest output, forwarded to the host sink).
+//! Queue 0 is receive (host input via `feed`), and queue 1 is transmit
+//! (guest output, forwarded to the host sink).
 
 const std = @import("std");
 const guestmem = @import("../guestmem.zig");
@@ -138,4 +138,31 @@ test "rx notify is inert" {
     _ = t.write(0x044, 1, ram);
     try std.testing.expect(!t.write(0x050, 0, ram));
     try std.testing.expectEqual(@as(usize, 0), test_output.len);
+}
+
+fn fuzzConsoleQueues(_: void, s: *std.testing.Smith) !void {
+    // Console queue contents are guest controlled. TX must never crash while
+    // forwarding arbitrary readable descriptors, and RX feed must fail closed
+    // when guest buffers are malformed or absent.
+    test_output = .{};
+    var con = Console{ .sink = testSink };
+    var t = mmio.Transport.init(con.device());
+
+    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    _ = s.slice(&buf);
+    const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
+
+    t.queues[rx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x000, .avail_addr = 0x400, .used_addr = 0x800 };
+    t.queues[tx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x100, .avail_addr = 0x500, .used_addr = 0x900 };
+    ram.write(u16, 0x400 + 2, s.value(u8) % 4) catch {};
+    ram.write(u16, 0x500 + 2, s.value(u8) % 4) catch {};
+
+    var input: [256]u8 = undefined;
+    const input_len = s.slice(&input);
+    _ = con.feed(&t, ram, input[0..input_len]);
+    _ = t.write(0x050, tx_queue, ram);
+}
+
+test "fuzz console queue handling" {
+    try std.testing.fuzz({}, fuzzConsoleQueues, .{});
 }

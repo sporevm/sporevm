@@ -154,3 +154,24 @@ test "queue notification returns entropy buffer used" {
     try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, 0x800 + 2));
     try std.testing.expectEqual(@as(u32, data_len), try ram.read(u32, 0x800 + 8));
 }
+
+fn fuzzRngQueue(_: void, s: *std.testing.Smith) !void {
+    // RNG has no device-specific request header, but queue descriptors and
+    // lengths are guest controlled. Notification must never crash or write
+    // outside the guest RAM window.
+    var rng = Rng{ .fillFn = testFill };
+    var t = mmio.Transport.init(rng.device());
+
+    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    _ = s.slice(&buf);
+    const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
+
+    t.queues[request_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x000, .avail_addr = 0x400, .used_addr = 0x800 };
+    ram.write(u16, 0x400 + 2, s.value(u8) % 4) catch {};
+
+    _ = t.write(0x050, request_queue, ram);
+}
+
+test "fuzz rng queue handling" {
+    try std.testing.fuzz({}, fuzzRngQueue, .{});
+}
