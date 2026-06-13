@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("sporevm", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .link_libc = true,
     });
 
     const exe = b.addExecutable(.{
