@@ -1,7 +1,7 @@
 //! The `spore` CLI.
 //!
-//! Slice 0 scaffold: `version` and `help` only. Lifecycle commands land with
-//! their slices; see docs/plans/foundation.md.
+//! Temporary narrow surface: `version` and `help` only. Lifecycle commands
+//! land with their slices; see docs/plans/foundation.md.
 
 const std = @import("std");
 const Io = std.Io;

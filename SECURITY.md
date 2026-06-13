@@ -24,7 +24,7 @@ fuzz targets from the slice that introduces it:
 |---|---|---|
 | Virtqueue descriptors, rings, and device request headers | guest memory | shared queue/MMIO paths and current console/blk/net/vsock/rng device paths fuzzed; new device parsers require fuzz targets in the same slice |
 | Guest memory access during dirty scans | guest | required at slice 7 |
-| Spore manifest decode | registry, disk | required at slice 3 |
+| Spore manifest decode | registry, disk | fuzzed; unknown versions and malformed manifests fail closed |
 | Chunk decode (zstd) and CAS reads | peers, registry, disk | required at slice 5 |
 | Generation device inputs | guest | MMIO register surface fuzzed; fork params schema required at slice 6 |
 | Control socket JSON | local consumers | required at slice 3 |

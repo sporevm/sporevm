@@ -216,7 +216,7 @@ That is a deliberate tradeoff and it is bought back structurally, not by hope:
 Slice 0 scaffolding has landed: Zig 0.16.0 pinned via mise, `zig build test`
 green (chunk-id module with BLAKE3 CAS identities and verification tests),
 `spore` CLI stub with `version`/`help`, founding docs (`README.md`,
-`SECURITY.md`, `AGENTS.md`, MIT `LICENSE`, `docs/spore-format.md` stub),
+`SECURITY.md`, `AGENTS.md`, MIT `LICENSE`, `docs/spore-format.md`),
 Buildkite pipeline targeting the `cleanroom` and `cleanroom-mac` queues, and
 the QEMU cross-accelerator experiment designed in `docs/research.md`.
 
@@ -276,7 +276,7 @@ aarch64 Linux host with KVM; HVF work needs an Apple Silicon Mac on macOS 15+.
 
 Zig project skeleton (`build.zig`, pinned Zig toolchain via mise), CI that
 builds and runs unit tests on both platforms, `SECURITY.md`, `AGENTS.md`,
-`docs/spore-format.md` stub, MIT license, README stating the thesis.
+`docs/spore-format.md`, MIT license, README stating the thesis.
 
 In parallel, the cheapest possible validation of the riskiest claim, using no
 SporeVM code: take a QEMU `virt` machine snapshot under KVM on aarch64 Linux
