@@ -299,9 +299,11 @@ has a real design. Platform compatibility checks are now shared across the
 backends, and `spore host-info` / `spore inspect` expose the host and spore
 contract fields needed to pick compatible smoke hosts (`host-info` reports the
 process-visible `CNTFRQ_EL0`; HVF's guest timer frequency remains validated by
-the HVF boot harness). The boot harnesses now accept `--initrd`, describe the
-initrd in `/chosen/linux,initrd-{start,end}`, and place it after the kernel so
-the first positive cross-hypervisor smoke can be diskless when using the
+the HVF boot harness). `docs/state-portability.md` now records the portable
+state contract, backend mapping matrix, register policies, and fail-closed
+restore rules. The boot harnesses now accept `--initrd`, describe the initrd in
+`/chosen/linux,initrd-{start,end}`, and place it after the kernel so the first
+positive cross-hypervisor smoke can be diskless when using the
 `cleanroom-kernels` `initrd` profile (the default `rootfs` kernel profile
 intentionally ignores external initrds). `cleanroom-kernels` v0.2.0 now
 publishes that `initrd` profile alongside `rootfs`. `scripts/make-smoke-initrd.sh`
