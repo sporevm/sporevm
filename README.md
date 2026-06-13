@@ -75,26 +75,17 @@ an Apple Silicon Mac on macOS 15+.
 
 ## Rootfs Images
 
-`spore rootfs build` can materialize a digest-pinned OCI image into a
-deterministic ext4 rootfs image. The builder verifies fetched blobs against
-their SHA256 descriptors, applies OCI whiteouts, rejects unsafe tar paths, and
-shells out to `mkfs.ext4 -F -d` plus `debugfs` for the final filesystem.
-
-The generated ext4 image uses UUID and directory hash seeds derived from the
-selected OCI manifest digest, normalizes filesystem and inode timestamps to the
-Unix epoch, and omits the ext4 journal/metadata checksum features so repeated
-builds of the same image produce identical bytes.
+`spore rootfs build` materializes an OCI image into a deterministic ext4 rootfs
+image. Inputs may be digest-pinned refs or registry tags.
 
 ```bash
-spore rootfs build ghcr.io/org/image@sha256:<digest> \
+spore rootfs build ghcr.io/org/image:latest \
   --platform linux/arm64 \
-  --output rootfs.ext4 \
-  --metadata rootfs.ext4.json
+  --output rootfs.ext4
 ```
 
-`mkfs.ext4` and `debugfs` are auto-detected from `PATH`, common Linux
-locations, and Homebrew's `e2fsprogs` prefix. Use `--mkfs` and `--debugfs` to
-override the detected binaries.
+See [docs/rootfs.md](docs/rootfs.md) for tag resolution, metadata, and ext4
+tooling details.
 
 ## Security
 

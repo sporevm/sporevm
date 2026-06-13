@@ -29,23 +29,68 @@ pub const ImageRef = struct {
         const name = raw[0..at];
         const digest = raw[at + 1 ..];
         if (!isSha256Digest(digest)) return error.UnsupportedDigest;
-        const slash = std.mem.indexOfScalar(u8, name, '/') orelse return error.ImageRefNeedsRegistry;
-        const registry = name[0..slash];
-        const repository = name[slash + 1 ..];
-        if (registry.len == 0 or repository.len == 0) return error.BadImageReference;
-        validateRegistry(registry) catch return error.BadImageReference;
-        validateRepository(repository) catch return error.BadImageReference;
-        return .{ .registry = registry, .repository = repository, .digest = digest };
+        const parsed = try parseImageName(name);
+        return .{ .registry = parsed.registry, .repository = parsed.repository, .digest = digest };
     }
 
     pub fn manifestUrl(self: ImageRef, allocator: std.mem.Allocator, digest: []const u8) ![]u8 {
-        return std.fmt.allocPrint(allocator, "https://{s}/v2/{s}/manifests/{s}", .{ self.registry, self.repository, digest });
+        return manifestUrlFor(allocator, self.registry, self.repository, digest);
     }
 
     pub fn blobUrl(self: ImageRef, allocator: std.mem.Allocator, digest: []const u8) ![]u8 {
-        return std.fmt.allocPrint(allocator, "https://{s}/v2/{s}/blobs/{s}", .{ self.registry, self.repository, digest });
+        return blobUrlFor(allocator, self.registry, self.repository, digest);
     }
 };
+
+pub const ImageTag = struct {
+    registry: []const u8,
+    repository: []const u8,
+    tag: []const u8,
+
+    pub fn parse(raw: []const u8) !ImageTag {
+        if (std.mem.indexOfScalar(u8, raw, '@') != null) return error.BadImageReference;
+        const last_slash = std.mem.lastIndexOfScalar(u8, raw, '/') orelse return error.ImageRefNeedsRegistry;
+        const tag_colon = std.mem.lastIndexOfScalar(u8, raw, ':') orelse return error.ImageTagRequired;
+        if (tag_colon < last_slash) return error.ImageTagRequired;
+
+        const parsed = try parseImageName(raw[0..tag_colon]);
+        const tag = raw[tag_colon + 1 ..];
+        validateTag(tag) catch return error.BadImageReference;
+        return .{ .registry = parsed.registry, .repository = parsed.repository, .tag = tag };
+    }
+
+    pub fn manifestUrl(self: ImageTag, allocator: std.mem.Allocator) ![]u8 {
+        return manifestUrlFor(allocator, self.registry, self.repository, self.tag);
+    }
+
+    pub fn digestRef(self: ImageTag, allocator: std.mem.Allocator, digest: []const u8) ![]u8 {
+        if (!isSha256Digest(digest)) return error.UnsupportedDigest;
+        return std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ self.registry, self.repository, digest });
+    }
+};
+
+const ImageName = struct {
+    registry: []const u8,
+    repository: []const u8,
+};
+
+fn parseImageName(name: []const u8) !ImageName {
+    const slash = std.mem.indexOfScalar(u8, name, '/') orelse return error.ImageRefNeedsRegistry;
+    const registry = name[0..slash];
+    const repository = name[slash + 1 ..];
+    if (registry.len == 0 or repository.len == 0) return error.BadImageReference;
+    validateRegistry(registry) catch return error.BadImageReference;
+    validateRepository(repository) catch return error.BadImageReference;
+    return .{ .registry = registry, .repository = repository };
+}
+
+fn manifestUrlFor(allocator: std.mem.Allocator, registry: []const u8, repository: []const u8, reference: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "https://{s}/v2/{s}/manifests/{s}", .{ registry, repository, reference });
+}
+
+fn blobUrlFor(allocator: std.mem.Allocator, registry: []const u8, repository: []const u8, digest: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "https://{s}/v2/{s}/blobs/{s}", .{ registry, repository, digest });
+}
 
 pub const Descriptor = struct {
     mediaType: []const u8,
@@ -168,6 +213,15 @@ pub fn verifyDigestBytes(digest: []const u8, bytes: []const u8) !void {
     if (!std.ascii.eqlIgnoreCase(digest["sha256:".len..], &hex)) return error.DigestMismatch;
 }
 
+pub fn digestBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var h = Sha256.init(.{});
+    h.update(bytes);
+    var out: [Sha256.digest_length]u8 = undefined;
+    h.final(&out);
+    const hex = std.fmt.bytesToHex(out, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
+}
+
 pub fn verifyDigestFile(io: Io, digest: []const u8, path: []const u8) !void {
     if (!isSha256Digest(digest)) return error.UnsupportedDigest;
     const hex = try sha256File(io, path);
@@ -196,6 +250,14 @@ fn validateRepository(repository: []const u8) !void {
     }
 }
 
+fn validateTag(tag: []const u8) !void {
+    if (tag.len == 0 or tag.len > 128) return error.BadImageReference;
+    if (!(std.ascii.isAlphanumeric(tag[0]) or tag[0] == '_')) return error.BadImageReference;
+    for (tag[1..]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-')) return error.BadImageReference;
+    }
+}
+
 fn sha256File(io: Io, path: []const u8) ![64]u8 {
     var file = try Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
@@ -221,6 +283,21 @@ test "digest ref parsing requires explicit registry and sha256 digest" {
     try std.testing.expectError(error.ImageRefNeedsRegistry, ImageRef.parse("alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
 }
 
+test "tag ref parsing supports registry ports and validates docker tags" {
+    const parsed = try ImageTag.parse("registry.example:5000/team/repo:v1.2_3");
+    try std.testing.expectEqualStrings("registry.example:5000", parsed.registry);
+    try std.testing.expectEqualStrings("team/repo", parsed.repository);
+    try std.testing.expectEqualStrings("v1.2_3", parsed.tag);
+
+    const url = try parsed.manifestUrl(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://registry.example:5000/v2/team/repo/manifests/v1.2_3", url);
+
+    try std.testing.expectError(error.ImageRefNeedsRegistry, ImageTag.parse("alpine:latest"));
+    try std.testing.expectError(error.ImageTagRequired, ImageTag.parse("registry.example:5000/team/repo"));
+    try std.testing.expectError(error.BadImageReference, ImageTag.parse("registry.example/team/repo:bad+tag"));
+}
+
 test "pinned manifest bytes must match requested digest" {
     const index =
         \\{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}
@@ -228,6 +305,15 @@ test "pinned manifest bytes must match requested digest" {
     try std.testing.expectError(
         error.DigestMismatch,
         verifyDigestBytes("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", index),
+    );
+}
+
+test "manifest digest allocation returns sha256 digest ref" {
+    const digest = try digestBytesAlloc(std.testing.allocator, "data");
+    defer std.testing.allocator.free(digest);
+    try std.testing.expectEqualStrings(
+        "sha256:3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7",
+        digest,
     );
 }
 

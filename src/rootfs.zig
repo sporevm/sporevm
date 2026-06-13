@@ -20,7 +20,8 @@ const usage =
     \\Usage: spore rootfs <command>
     \\
     \\Commands:
-    \\  build <image@sha256:...> --output <rootfs.ext4>
+    \\  build <image@sha256:...|image:tag> --output <rootfs.ext4>
+    \\  resolve <image:tag>
     \\
     \\Options:
     \\  --platform <os/arch>       Target platform (default: linux/arm64)
@@ -39,6 +40,10 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         try runBuild(init, args[1..], stdout);
         return;
     }
+    if (std.mem.eql(u8, args[0], "resolve")) {
+        try runResolve(init, args[1..], stdout);
+        return;
+    }
     try stdout.print("unknown rootfs command: {s}\n\n", .{args[0]});
     try stdout.writeAll(usage);
     try stdout.flush();
@@ -54,6 +59,11 @@ const ParsedBuildOptions = struct {
     debugfs: ?[]const u8 = null,
 };
 
+const ParsedResolveOptions = struct {
+    ref: []const u8,
+    platform: Platform = .{},
+};
+
 const BuildOptions = struct {
     ref: []const u8,
     output: []const u8,
@@ -62,6 +72,13 @@ const BuildOptions = struct {
     mkfs: []const u8,
     debugfs: []const u8,
 };
+
+fn runResolve(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    const arena = init.arena.allocator();
+    const opts = try parseResolveOptions(args, stdout);
+    const pinned_ref = try resolveTaggedImageRef(init, arena, opts);
+    try stdout.print("{s}\n", .{pinned_ref});
+}
 
 fn runBuild(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
     const arena = init.arena.allocator();
@@ -81,6 +98,38 @@ fn runBuild(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
         opts.ref,
         result.rootfs_blake3,
     });
+}
+
+fn parseResolveOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedResolveOptions {
+    if (args.len == 0) {
+        try stdout.writeAll(usage);
+        try stdout.flush();
+        std.process.exit(2);
+    }
+
+    var image_ref: ?[]const u8 = null;
+    var platform: Platform = .{};
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--platform")) {
+            i += 1;
+            if (i >= args.len) return error.MissingPlatform;
+            platform = try Platform.parse(args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.UnknownRootFSOption;
+        } else if (image_ref == null) {
+            image_ref = arg;
+        } else {
+            return error.TooManyRootFSArguments;
+        }
+    }
+
+    return .{
+        .ref = image_ref orelse return error.MissingImageReference,
+        .platform = platform,
+    };
 }
 
 fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8, stdout: *Io.Writer) !ParsedBuildOptions {
@@ -267,6 +316,7 @@ fn isExecutablePath(io: Io, path: []const u8) !bool {
 
 pub const Platform = oci.Platform;
 pub const ImageRef = oci.ImageRef;
+const ImageTag = oci.ImageTag;
 const ImageManifest = oci.ImageManifest;
 const ImageConfig = oci.ImageConfig;
 
@@ -276,9 +326,15 @@ const BuildResult = struct {
 
 const OwnershipMap = ownership_mod.Map;
 
+const BuildImageSource = struct {
+    ref: ImageRef,
+    manifest_bytes: []const u8,
+};
+
 const RootFSMetadata = struct {
     builder_version: []const u8,
     image_ref: []const u8,
+    resolved_image_ref: []const u8,
     image_manifest_digest: []const u8,
     platform: Platform,
     config_digest: []const u8,
@@ -292,9 +348,74 @@ const RootFSMetadata = struct {
     rootfs_blake3: []const u8,
 };
 
-fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: BuildOptions) !BuildResult {
-    const image_ref = try ImageRef.parse(opts.ref);
+fn resolveTaggedImageRef(init: std.process.Init, allocator: std.mem.Allocator, opts: ParsedResolveOptions) ![]const u8 {
+    const image_tag = try ImageTag.parse(opts.ref);
 
+    var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
+    defer client.deinit();
+    var bearer_token: ?[]const u8 = null;
+
+    const fetched = try registry.fetchManifestByTag(allocator, &client, &bearer_token, image_tag);
+    const tag_digest = try manifestContentDigest(allocator, fetched.bytes, fetched.content_digest);
+    const image_ref = ImageRef{
+        .registry = image_tag.registry,
+        .repository = image_tag.repository,
+        .digest = tag_digest,
+    };
+    const selected_manifest_digest = try resolveManifestDigest(
+        allocator,
+        &client,
+        &bearer_token,
+        image_ref,
+        opts.platform,
+        tag_digest,
+        fetched.bytes,
+    );
+    return image_tag.digestRef(allocator, selected_manifest_digest);
+}
+
+fn manifestContentDigest(allocator: std.mem.Allocator, manifest_bytes: []const u8, content_digest: ?[]const u8) ![]const u8 {
+    if (content_digest) |digest| {
+        if (!oci.isSha256Digest(digest)) return error.UnsupportedDigest;
+        try oci.verifyDigestBytes(digest, manifest_bytes);
+    }
+    return oci.digestBytesAlloc(allocator, manifest_bytes);
+}
+
+fn fetchBuildImageSource(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    bearer_token: *?[]const u8,
+    raw_ref: []const u8,
+) !BuildImageSource {
+    if (ImageRef.parse(raw_ref)) |image_ref| {
+        const manifest_bytes = try registry.fetchManifest(allocator, client, bearer_token, image_ref, image_ref.digest);
+        try oci.verifyDigestBytes(image_ref.digest, manifest_bytes);
+        return .{ .ref = image_ref, .manifest_bytes = manifest_bytes };
+    } else |err| switch (err) {
+        error.ImageRefMustBeDigestPinned => {},
+        else => |e| return e,
+    }
+
+    const image_tag = try ImageTag.parse(raw_ref);
+    const fetched = try registry.fetchManifestByTag(allocator, client, bearer_token, image_tag);
+    const tag_digest = try manifestContentDigest(allocator, fetched.bytes, fetched.content_digest);
+    return .{
+        .ref = .{
+            .registry = image_tag.registry,
+            .repository = image_tag.repository,
+            .digest = tag_digest,
+        },
+        .manifest_bytes = fetched.bytes,
+    };
+}
+
+fn digestImageRef(allocator: std.mem.Allocator, image_ref: ImageRef, digest: []const u8) ![]u8 {
+    if (!oci.isSha256Digest(digest)) return error.UnsupportedDigest;
+    return std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ image_ref.registry, image_ref.repository, digest });
+}
+
+fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: BuildOptions) !BuildResult {
     var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
     defer client.deinit();
     var bearer_token: ?[]const u8 = null;
@@ -315,9 +436,11 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
     const layers_dir = try std.fmt.allocPrint(allocator, "{s}/layers", .{temp_dir});
     try Io.Dir.cwd().createDirPath(init.io, layers_dir);
 
-    const manifest_bytes = try registry.fetchManifest(allocator, &client, &bearer_token, image_ref, image_ref.digest);
-    try oci.verifyDigestBytes(image_ref.digest, manifest_bytes);
+    const image_source = try fetchBuildImageSource(allocator, &client, &bearer_token, opts.ref);
+    const image_ref = image_source.ref;
+    const manifest_bytes = image_source.manifest_bytes;
     const manifest_digest = try resolveManifestDigest(allocator, &client, &bearer_token, image_ref, opts.platform, image_ref.digest, manifest_bytes);
+    const resolved_image_ref = try digestImageRef(allocator, image_ref, manifest_digest);
     const selected_manifest_bytes = if (std.mem.eql(u8, manifest_digest, image_ref.digest))
         manifest_bytes
     else
@@ -378,6 +501,7 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
     const metadata = RootFSMetadata{
         .builder_version = "sporevm-rootfs-v1",
         .image_ref = opts.ref,
+        .resolved_image_ref = resolved_image_ref,
         .image_manifest_digest = manifest_digest,
         .platform = opts.platform,
         .config_digest = manifest.config.digest,
@@ -522,6 +646,75 @@ test "build options reject metadata path matching output path" {
             "--metadata",
             "./rootfs.ext4",
         }, &stdout.writer),
+    );
+}
+
+test "build options accept tag image refs" {
+    const allocator = std.testing.allocator;
+    var stdout: Io.Writer.Allocating = .init(allocator);
+    defer stdout.deinit();
+
+    const parsed = try parseBuildOptions(allocator, &.{
+        "registry.example/repo:latest",
+        "--output",
+        "rootfs.ext4",
+    }, &stdout.writer);
+    defer allocator.free(parsed.metadata);
+    try std.testing.expectEqualStrings("registry.example/repo:latest", parsed.ref);
+    try std.testing.expectEqualStrings("rootfs.ext4.json", parsed.metadata);
+}
+
+test "resolve options parse image tag and platform" {
+    const allocator = std.testing.allocator;
+    var stdout: Io.Writer.Allocating = .init(allocator);
+    defer stdout.deinit();
+
+    const parsed = try parseResolveOptions(&.{
+        "registry.example/repo:latest",
+        "--platform",
+        "linux/arm64",
+    }, &stdout.writer);
+    try std.testing.expectEqualStrings("registry.example/repo:latest", parsed.ref);
+    try std.testing.expectEqualStrings("linux", parsed.platform.os);
+    try std.testing.expectEqualStrings("arm64", parsed.platform.arch);
+    try std.testing.expectError(
+        error.TooManyRootFSArguments,
+        parseResolveOptions(&.{ "registry.example/repo:latest", "extra" }, &stdout.writer),
+    );
+}
+
+test "tag manifest content digest is computed and registry header is verified" {
+    const allocator = std.testing.allocator;
+    const manifest = "{\"schemaVersion\":2,\"config\":{},\"layers\":[]}";
+    const digest = try manifestContentDigest(allocator, manifest, null);
+    defer allocator.free(digest);
+    try std.testing.expectEqualStrings(
+        "sha256:4108250765b19c4d5000be73d2bdd612bbb17a989972bcfd1adbf5085a9af46b",
+        digest,
+    );
+
+    try std.testing.expectError(
+        error.DigestMismatch,
+        manifestContentDigest(
+            allocator,
+            manifest,
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ),
+    );
+}
+
+test "resolved image refs render selected digest" {
+    const allocator = std.testing.allocator;
+    const image_ref = try ImageRef.parse("registry.example/repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const resolved = try digestImageRef(
+        allocator,
+        image_ref,
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(
+        "registry.example/repo@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        resolved,
     );
 }
 

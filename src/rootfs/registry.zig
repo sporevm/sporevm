@@ -7,6 +7,11 @@ const max_registry_manifest_bytes: u64 = 32 << 20;
 const max_registry_config_bytes: u64 = 64 << 20;
 const max_registry_token_bytes: u64 = 1 << 20;
 
+pub const FetchManifestResult = struct {
+    bytes: []u8,
+    content_digest: ?[]u8 = null,
+};
+
 pub fn fetchManifest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -21,6 +26,21 @@ pub fn fetchManifest(
         "application/vnd.oci.image.manifest.v1+json, " ++
         "application/vnd.docker.distribution.manifest.v2+json";
     return fetchBytes(allocator, client, bearer_token, url, accept, max_registry_manifest_bytes);
+}
+
+pub fn fetchManifestByTag(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    bearer_token: *?[]const u8,
+    image_tag: oci.ImageTag,
+) !FetchManifestResult {
+    const url = try image_tag.manifestUrl(allocator);
+    const accept =
+        "application/vnd.oci.image.index.v1+json, " ++
+        "application/vnd.docker.distribution.manifest.list.v2+json, " ++
+        "application/vnd.oci.image.manifest.v1+json, " ++
+        "application/vnd.docker.distribution.manifest.v2+json";
+    return fetchBytesWithContentDigest(allocator, client, bearer_token, url, accept, max_registry_manifest_bytes);
 }
 
 pub fn fetchBlobBytes(
@@ -64,6 +84,7 @@ pub fn fetchBlobToFile(
         const result = try httpGetToFile(allocator, io, client, current_url, "application/octet-stream", current_token, path, body_limit);
         defer if (result.auth_header) |h| allocator.free(h);
         defer if (result.location) |l| allocator.free(l);
+        defer if (result.content_digest) |d| allocator.free(d);
 
         if (result.status == .unauthorized and result.auth_header != null and try sameOrigin(url, current_url)) {
             if (auth_retries != 0) return error.RegistryAuthFailed;
@@ -98,6 +119,19 @@ fn fetchBytes(
     accept: []const u8,
     max_body_bytes: u64,
 ) ![]u8 {
+    const result = try fetchBytesWithContentDigest(allocator, client, bearer_token, url, accept, max_body_bytes);
+    if (result.content_digest) |digest| allocator.free(digest);
+    return result.bytes;
+}
+
+fn fetchBytesWithContentDigest(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    bearer_token: *?[]const u8,
+    url: []const u8,
+    accept: []const u8,
+    max_body_bytes: u64,
+) !FetchManifestResult {
     var writer: Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
 
@@ -106,9 +140,10 @@ fn fetchBytes(
     var redirects: u8 = 0;
     var auth_retries: u8 = 0;
     while (true) {
-        const result = try httpGetToWriter(allocator, client, current_url, accept, current_token, &writer.writer, max_body_bytes);
+        var result = try httpGetToWriter(allocator, client, current_url, accept, current_token, &writer.writer, max_body_bytes);
         defer if (result.auth_header) |h| allocator.free(h);
         defer if (result.location) |l| allocator.free(l);
+        defer if (result.content_digest) |d| allocator.free(d);
 
         if (result.status == .unauthorized and result.auth_header != null and try sameOrigin(url, current_url)) {
             if (auth_retries != 0) return error.RegistryAuthFailed;
@@ -131,7 +166,10 @@ fn fetchBytes(
         }
 
         if (result.status != .ok) return error.RegistryHTTPStatus;
-        return writer.toOwnedSlice();
+        const bytes = try writer.toOwnedSlice();
+        const content_digest = result.content_digest;
+        result.content_digest = null;
+        return .{ .bytes = bytes, .content_digest = content_digest };
     }
 }
 
@@ -139,6 +177,7 @@ const HTTPGetResult = struct {
     status: std.http.Status,
     auth_header: ?[]u8 = null,
     location: ?[]u8 = null,
+    content_digest: ?[]u8 = null,
 };
 
 fn httpGetToFile(
@@ -194,13 +233,15 @@ fn httpGetToWriter(
     errdefer if (auth) |h| allocator.free(h);
     const location = try findHeaderAlloc(allocator, response.head.bytes, "location");
     errdefer if (location) |l| allocator.free(l);
+    const content_digest = try findHeaderAlloc(allocator, response.head.bytes, "docker-content-digest");
+    errdefer if (content_digest) |d| allocator.free(d);
 
     if (response.head.status == .ok) {
         var transfer_buffer: [64 * 1024]u8 = undefined;
         const body = response.reader(&transfer_buffer);
         try streamRemainingLimited(body, writer, max_body_bytes, &response);
     }
-    return .{ .status = response.head.status, .auth_header = auth, .location = location };
+    return .{ .status = response.head.status, .auth_header = auth, .location = location, .content_digest = content_digest };
 }
 
 fn fetchBearerToken(allocator: std.mem.Allocator, client: *std.http.Client, resource_url: []const u8, auth_header: []const u8) ![]const u8 {
@@ -212,6 +253,7 @@ fn fetchBearerToken(allocator: std.mem.Allocator, client: *std.http.Client, reso
     const result = try httpGetToWriter(allocator, client, url, "application/json", null, &body.writer, max_registry_token_bytes);
     defer if (result.auth_header) |h| allocator.free(h);
     defer if (result.location) |l| allocator.free(l);
+    defer if (result.content_digest) |d| allocator.free(d);
     if (result.status != .ok) return error.RegistryAuthFailed;
     var parsed = try std.json.parseFromSlice(TokenResponse, allocator, body.written(), .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
@@ -430,4 +472,14 @@ test "token realm validation rejects cross-origin realms" {
         error.UnsupportedRegistryAuthRealm,
         validateTokenRealm("https://ghcr.io/v2/buildkite/base/manifests/sha256:abc", "https://auth.example/token"),
     );
+}
+
+test "header lookup finds docker content digest case insensitively" {
+    const head =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Docker-Content-Digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\r\n" ++
+        "\r\n";
+    const digest = try findHeaderAlloc(std.testing.allocator, head, "docker-content-digest") orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(digest);
+    try std.testing.expectEqualStrings("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", digest);
 }
