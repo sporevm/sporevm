@@ -2,7 +2,10 @@
 
 ## QEMU Cross-Accelerator Restore Experiment
 
-**Status:** pending. Slice 0 of [plans/foundation.md](plans/foundation.md).
+**Status:** not run; superseded as the first de-risking step by direct HVF
+state capture/restore work in SporeVM. The experiment remains a useful
+cross-check once an aarch64 KVM host is available, but it no longer blocks the
+foundation slices already landed.
 
 ### Question
 
@@ -46,4 +49,28 @@ for the machine-state normalization design in the foundation plan.
 
 ### Results
 
-Not yet run.
+The QEMU proxy experiment was not run before SporeVM's direct HVF
+suspend/resume implementation landed. That implementation nevertheless
+answered the highest-risk state-normalization questions on the macOS side:
+
+- Apple's `hv_gic_get_state` / `hv_gic_set_state` blob is sufficient to
+  round-trip distributor and redistributor state on HVF, but it does not
+  include per-vCPU GIC CPU-interface (`ICC_*`) registers. Those registers must
+  be saved via `hv_gic_get_icc_reg` and restored with `hv_gic_set_icc_reg`; if
+  they are omitted, the resumed guest can hang with interrupts masked.
+- The virtual timer cannot be restored as a raw host timestamp. The spore
+  records guest virtual counter state and re-anchors `CNTV_CVAL_EL0` on
+  restore so guest time continues from the snapshot point.
+- Runtime GIC MMIO access through `hv_gic_{get,set}_*_reg` is not a substitute
+  for normal device emulation; those APIs use architectural offsets but return
+  `HV_DENIED` for this path. The board must describe the redistributor frame
+  returned after setting `MPIDR_EL1`.
+- The v0 spore format therefore keeps one documented backend-opaque exception:
+  `machine.gic_state_b64` is currently an HVF GIC blob. Cross-hypervisor
+  restore still needs either a normalized GICv3 representation or a proven
+  blob translation path.
+
+Decision: keep the architectural machine-state normalization design. Adjust
+the cross-hypervisor slice to treat GICv3 CPU-interface state and virtual
+timer anchoring as first-class normalized fields, and use the QEMU matrix only
+as an additional validation tool once the KVM side exists.

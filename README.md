@@ -27,9 +27,13 @@ spore pull <spore-id> && spore resume <spore-id>   # on a different OS
 ## Status
 
 Early development, pre-release. The plan of record is
-[docs/plans/foundation.md](docs/plans/foundation.md); current work is slice 0
-(scaffolding and the QEMU cross-accelerator de-risk experiment). Nothing here
-boots a VM yet.
+[docs/plans/foundation.md](docs/plans/foundation.md). Current `main` boots a
+pinned aarch64 Linux kernel on Hypervisor.framework to an interactive shell,
+with shared virtio-mmio console, block, net, vsock, and rng devices. The HVF
+path can write and resume a v0 spore on the same host.
+
+KVM bring-up and the cross-hypervisor restore matrix are still pending real
+aarch64 KVM hardware.
 
 ## Development
 
@@ -39,6 +43,7 @@ Tooling is pinned with [mise](https://mise.jdx.dev):
 mise install
 mise run build    # zig build
 mise run test     # zig build test
+mise exec -- zig build hvf-boot   # build/sign the HVF kernel boot harness
 ```
 
 KVM work needs an aarch64 Linux host with KVM; Hypervisor.framework work needs
