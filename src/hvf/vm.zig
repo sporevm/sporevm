@@ -150,6 +150,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         const m = resume_parsed.?.value;
         const host_counter_frequency_hz = snapshot.hostCounterFreq();
         if (m.version != spore.format_version or
+            !std.mem.eql(u8, m.platform.cpu_profile, board.cpu_profile) or
             m.platform.device_model_version != board.device_model_version or
             m.platform.ram_base != board.ram_base or
             m.platform.ram_size != config.ram_size or
@@ -300,6 +301,7 @@ fn takeSnapshot(
     const memory = try spore.saveMemory(arena, dir, ram_bytes);
     try spore.saveManifest(arena, dir, .{
         .platform = .{
+            .cpu_profile = board.cpu_profile,
             .device_model_version = board.device_model_version,
             .ram_base = board.ram_base,
             .ram_size = platform.ram_size,

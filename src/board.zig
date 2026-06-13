@@ -12,6 +12,11 @@ const generation = @import("generation.zig");
 /// Device model version recorded in spore manifests.
 pub const device_model_version = 4;
 
+/// CPU feature profile recorded in spore manifests. v0 is the current
+/// Apple-M/Graviton common-denominator policy; KVM enforces it by masking RNDR
+/// before guest boot.
+pub const cpu_profile = "sporevm-aarch64-v0";
+
 pub const ram_base: u64 = 0x8000_0000;
 /// Outside the GIC's reserved redistributor region (which can span tens of
 /// MB above the distributor at 0x0800_0000 on HVF).

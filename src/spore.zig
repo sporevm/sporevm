@@ -28,6 +28,7 @@ pub const Error = error{
 
 pub const Platform = struct {
     arch: []const u8 = "aarch64",
+    cpu_profile: []const u8,
     device_model_version: u32,
     ram_base: u64,
     ram_size: u64,
@@ -240,6 +241,7 @@ pub fn loadManifest(allocator: std.mem.Allocator, dir: []const u8) Error!std.jso
 
 fn validateManifest(manifest: Manifest) Error!void {
     if (manifest.version != format_version) return error.BadManifest;
+    if (manifest.platform.cpu_profile.len == 0) return error.BadManifest;
     if (manifest.platform.counter_frequency_hz == 0 or
         manifest.platform.counter_frequency_hz > std.math.maxInt(u32))
     {
@@ -370,6 +372,7 @@ test "manifest json round-trip" {
     var sys_regs = [_]SysRegEntry{.{ .name = "sctlr_el1", .value = 0xdeadbeef }};
     const manifest = Manifest{
         .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
             .ram_base = 0x8000_0000,
             .ram_size = 1 << 29,
@@ -408,6 +411,7 @@ test "manifest json round-trip" {
     const parsed = try loadManifest(arena, dir);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u32, 0), parsed.value.version);
+    try std.testing.expectEqualStrings("sporevm-aarch64-v0", parsed.value.platform.cpu_profile);
     try std.testing.expectEqual(@as(u64, 0x8000_0000), parsed.value.platform.ram_base);
     try std.testing.expectEqual(@as(u64, 24_000_000), parsed.value.platform.counter_frequency_hz);
     try std.testing.expectEqual(@as(u64, 123), parsed.value.machine.vtimer.cntvct);
@@ -427,6 +431,7 @@ test "backend-private GIC state json round-trip" {
     const dir = try testDir(arena);
     const manifest = Manifest{
         .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
             .ram_base = 0x8000_0000,
             .ram_size = 1 << 29,
@@ -468,6 +473,7 @@ test "backend-private GIC state json round-trip" {
 test "manifest rejects invalid counter frequency" {
     var manifest = Manifest{
         .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
             .ram_base = 0x8000_0000,
             .ram_size = 1 << 29,
@@ -500,5 +506,8 @@ test "manifest rejects invalid counter frequency" {
     };
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.platform.counter_frequency_hz = @as(u64, std.math.maxInt(u32)) + 1;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    manifest.platform.counter_frequency_hz = 24_000_000;
+    manifest.platform.cpu_profile = "";
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 }

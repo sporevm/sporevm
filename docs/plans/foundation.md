@@ -287,13 +287,14 @@ line-level getter and several redistributor/distributor offsets are not exposed.
 KVM→HVF now creates HVF's GIC at the manifest's KVM redistributor base and can
 apply portable GICv3 state. KVM masks the Graviton RNDR CPU feature before
 guest boot so Linux no longer patches in `RNDRRS_EL0` (`S3_3_C2_C4_1`), which
-Apple HVF does not expose to guests. With RNDR masked, a KVM snapshot resumes
-on HVF to `sporevm-tick 6`; the remaining observed blocker is virtual-counter
-frequency portability, because a guest booted against KVM's counter frequency
-runs slowly after restore on Apple HVF's 24MHz counter. The manifest now
-records `platform.counter_frequency_hz` and restore fails closed across a
-counter-frequency mismatch until cross-frequency timer virtualization has a
-real design. The four-way cross-hypervisor matrix (slice 4) remains next.
+Apple HVF does not expose to guests; the manifest records this as
+`platform.cpu_profile = "sporevm-aarch64-v0"`. With RNDR masked, a KVM snapshot
+resumes on HVF to `sporevm-tick 6`; the remaining observed blocker is
+virtual-counter frequency portability, because a guest booted against KVM's
+counter frequency runs slowly after restore on Apple HVF's 24MHz counter. The
+manifest now records `platform.counter_frequency_hz` and restore fails closed
+across a counter-frequency mismatch until cross-frequency timer virtualization
+has a real design. The four-way cross-hypervisor matrix (slice 4) remains next.
 
 ## Delivery Strategy
 

@@ -23,11 +23,13 @@ A spore is a directory:
 
 - `version`: format version, currently 0. Consumers reject unknown versions.
 - `platform`: contract the restoring host must satisfy exactly — `arch`
-  (aarch64), `device_model_version`, `ram_base`, `ram_size`,
+  (aarch64), `cpu_profile`, `device_model_version`, `ram_base`, `ram_size`,
   `gic_dist_base`, `gic_redist_base`, and `counter_frequency_hz`. Restore
-  fails closed on any mismatch. Device model version 4 includes the fixed
-  virtio-mmio range plus the generation MMIO device at `0x0c001000`, size
-  `0x1000`, SPI 24 / INTID 56.
+  fails closed on any mismatch. CPU profile `sporevm-aarch64-v0` is the
+  current Apple-M/Graviton common denominator; KVM enforces it by masking RNDR
+  before guest boot. Device model version 4 includes the fixed virtio-mmio
+  range plus the generation MMIO device at `0x0c001000`, size `0x1000`, SPI 24
+  / INTID 56.
 - `machine`: normalized architectural state for one vCPU — `gprs` (x0–x30),
   `pc`, `cpsr`, `fpcr`, `fpsr`, `simd` (32 Q registers as u64 pairs),
   `sys_regs` (EL1 context registers by architectural name), `icc_regs`
