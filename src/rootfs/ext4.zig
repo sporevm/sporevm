@@ -133,6 +133,8 @@ pub fn runMkfs(
 ) !void {
     const inode_count_arg = try std.fmt.allocPrint(allocator, "{d}", .{inode_count});
     defer allocator.free(inode_count_arg);
+    const feature_options = try mkfsFeatureOptions(allocator, try mkfsSupportsOrphanFile(init, allocator, mkfs));
+    defer allocator.free(feature_options);
     const extended_options = try std.fmt.allocPrint(
         allocator,
         "lazy_itable_init=0,lazy_journal_init=0,hash_seed={s}",
@@ -147,7 +149,7 @@ pub fn runMkfs(
             "-N",
             inode_count_arg,
             "-O",
-            "^has_journal,^metadata_csum,^metadata_csum_seed,^orphan_file",
+            feature_options,
             "-U",
             determinism.uuid[0..],
             "-E",
@@ -166,6 +168,65 @@ pub fn runMkfs(
         else => {},
     }
     return error.MkfsFailed;
+}
+
+fn mkfsFeatureOptions(allocator: std.mem.Allocator, supports_orphan_file: bool) ![]u8 {
+    const base = "^has_journal,^metadata_csum,^metadata_csum_seed";
+    if (!supports_orphan_file) return allocator.dupe(u8, base);
+    return std.fmt.allocPrint(allocator, "{s},^orphan_file", .{base});
+}
+
+fn mkfsSupportsOrphanFile(init: std.process.Init, allocator: std.mem.Allocator, mkfs: []const u8) !bool {
+    const result = std.process.run(allocator, init.io, .{
+        .argv = &.{ mkfs, "-V" },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return false,
+        else => return false,
+    }
+    if (e2fsprogsSupportsOrphanFileVersion(result.stdout)) |supported| return supported;
+    if (e2fsprogsSupportsOrphanFileVersion(result.stderr)) |supported| return supported;
+    return false;
+}
+
+fn e2fsprogsSupportsOrphanFileVersion(bytes: []const u8) ?bool {
+    var tokens = std.mem.tokenizeAny(u8, bytes, " \t\r\n()");
+    while (tokens.next()) |token| {
+        const version = parseDottedVersion(token) catch continue;
+        if (version.major != 1) return version.major > 1;
+        if (version.minor != 47) return version.minor > 47;
+        return true;
+    }
+    return null;
+}
+
+const DottedVersion = struct {
+    major: u64,
+    minor: u64,
+    patch: u64,
+};
+
+fn parseDottedVersion(token: []const u8) !DottedVersion {
+    var parts = std.mem.splitScalar(u8, token, '.');
+    const major_raw = parts.next() orelse return error.BadVersion;
+    const minor_raw = parts.next() orelse return error.BadVersion;
+    const patch_raw = parts.next() orelse "0";
+    if (parts.next() != null) return error.BadVersion;
+    return .{
+        .major = try parseVersionPart(major_raw),
+        .minor = try parseVersionPart(minor_raw),
+        .patch = try parseVersionPart(patch_raw),
+    };
+}
+
+fn parseVersionPart(raw: []const u8) !u64 {
+    if (raw.len == 0) return error.BadVersion;
+    for (raw) |c| if (!std.ascii.isDigit(c)) return error.BadVersion;
+    return std.fmt.parseInt(u64, raw, 10) catch return error.BadVersion;
 }
 
 pub fn runDebugfsFinalize(
@@ -483,6 +544,24 @@ test "directory entry count includes directories and files" {
     try tmp.dir.writeFile(io, .{ .sub_path = "top", .data = "" });
 
     try std.testing.expectEqual(@as(u64, 5), try dirEntryCount(io, tmp.dir));
+}
+
+test "mkfs feature options omit orphan_file when unsupported" {
+    const allocator = std.testing.allocator;
+    const unsupported = try mkfsFeatureOptions(allocator, false);
+    defer allocator.free(unsupported);
+    try std.testing.expectEqualStrings("^has_journal,^metadata_csum,^metadata_csum_seed", unsupported);
+
+    const supported = try mkfsFeatureOptions(allocator, true);
+    defer allocator.free(supported);
+    try std.testing.expectEqualStrings("^has_journal,^metadata_csum,^metadata_csum_seed,^orphan_file", supported);
+}
+
+test "e2fsprogs orphan_file support is version gated" {
+    try std.testing.expectEqual(false, e2fsprogsSupportsOrphanFileVersion("mke2fs 1.46.5 (30-Dec-2021)").?);
+    try std.testing.expectEqual(true, e2fsprogsSupportsOrphanFileVersion("mke2fs 1.47.0 (5-Feb-2023)").?);
+    try std.testing.expectEqual(true, e2fsprogsSupportsOrphanFileVersion("mke2fs 1.47.3 (8-Jul-2025)").?);
+    try std.testing.expect(e2fsprogsSupportsOrphanFileVersion("not a version") == null);
 }
 
 test "deterministic ext4 identity derives stable UUIDs from digest" {
