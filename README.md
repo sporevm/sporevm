@@ -39,8 +39,9 @@ on KVM/aarch64 to an Alpine shell prompt, with the shared virtio-mmio console,
 block, net, vsock, rng, and generation devices. The HVF and KVM paths can also
 write/resume a v0 spore on the same host. The CLI can report current host
 platform facts with `spore host-info`, summarise a spore manifest with
-`spore inspect <spore-dir>`, and mint metadata-only child spores with
-`spore fork <spore-dir> --count N --out DIR`.
+`spore inspect <spore-dir>`, mint metadata-only child spores with
+`spore fork <spore-dir> --count N --out DIR`, and round-trip portable local
+chunkpack bundles with `spore pack` / `spore unpack`.
 
 Identical-host fork/fan-out is the priority path. The cross-hypervisor restore
 matrix remains a secondary diagnostic portability track.
@@ -73,6 +74,10 @@ fork-aware initrd needs `/dev/mem` access to the fixed generation MMIO window:
 Fork an already-captured spore with
 `zig-out/bin/spore fork /tmp/spore --count 100 --out /tmp/forks`; children are
 named `000000`, `000001`, and so on, and share the parent's chunk store.
+Pack a spore into the first local distribution format with
+`zig-out/bin/spore pack /tmp/spore --out /tmp/spore.bundle`; unpack it back
+into a normal spore directory with
+`zig-out/bin/spore unpack /tmp/spore.bundle --out /tmp/spore.unpacked`.
 
 KVM work needs an aarch64 Linux host with KVM; Hypervisor.framework work needs
 an Apple Silicon Mac on macOS 15+.

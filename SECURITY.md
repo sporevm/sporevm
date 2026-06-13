@@ -27,6 +27,7 @@ fuzz targets from the slice that introduces it:
 | Lazy RAM fault handling | guest page faults plus spore CAS chunks | KVM userfaultfd path is opt-in; faults materialize whole verified chunks and fail closed on malformed manifests or chunk mismatches |
 | Spore manifest decode | registry, disk | fuzzed; unknown versions and malformed manifests fail closed |
 | CAS chunk reads | peers, registry, disk | BLAKE3 verified before restore; malformed memory manifests are fuzzed; compression is not in v0 |
+| Chunkpack bundle index and pack segments | peers, registry, disk | index parsing is fuzzed; unpack only accepts canonical pack paths and verifies segment SHA256 plus logical BLAKE3 chunk IDs before writing chunks |
 | OCI manifest and layer decode | registry | rootfs builder only, outside the monitor process; mutable tags are resolved into digest-pinned refs before build materialization, blobs are verified, tar application is path-safe, and JSON/tar fuzz targets cover parser inputs |
 | Generation device inputs | guest | MMIO register surface and fork/resume params schema are fuzz/unit covered |
 | Control socket JSON | local consumers | product monitor protocol not implemented yet |

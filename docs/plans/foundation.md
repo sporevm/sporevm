@@ -155,9 +155,12 @@ spore manifest
 
 Chunks live in a local CAS directory; v0 manifests are JSON documents. Disk
 manifests land in later fork/fan-out slices. Access traces are local benchmark
-artifacts today; persisted manifest hints land with later readahead work.
-Spores are exportable as OCI artifacts so existing registries (and cleanroom's
-gateway/content-cache) can serve them.
+artifacts today; persisted manifest hints land with later readahead work. The
+distribution primitive is a SporeVM chunkpack bundle: logical BLAKE3 chunks are
+packed into larger blobs with an index that preserves per-chunk verification.
+OCI, S3, HTTP, Dragonfly/Nydus-style caches, or cleanroom's gateway/content
+cache can wrap or serve those bundles later; the hot fan-out data plane is not
+defined as direct registry pulls from every agent.
 
 ### Memory and lifecycle model
 
@@ -461,9 +464,19 @@ fan-out.
 
 ### Slice 6: Identical-host fan-out distribution
 
-`spore push`/`pull` against an OCI registry; `spore daemon` chunk cache with
-peer chunk exchange; relay fan-out so N restores cost O(log N) origin work.
-Scale tests at 10 → 100 → 1,000 identical hosts before claiming 10,000.
+Start with a local bundle/chunkpack format, then add distribution adapters.
+`spore pack` writes a portable bundle containing a manifest with local RAM
+backing stripped plus a `chunkpack.index.json` mapping BLAKE3 chunk ids to
+offsets inside larger pack blobs. `spore unpack` reconstructs a normal spore
+directory and re-verifies every logical chunk before it can be restored. This
+first slice deliberately avoids registry auth, tag semantics, upload sessions,
+and direct-registry fan-out assumptions while the pack shape is still changing.
+
+Later Slice 6 work adds storage and fan-out backends around the same bundle
+primitive: OCI or object storage as a durable publication boundary, a
+`spore daemon` local CAS/cache, and peer or Dragonfly/Nydus-style distribution
+so N restores cost O(log N) origin work rather than N full downloads. Scale
+tests at 10 → 100 → 1,000 identical hosts happen before claiming 10,000.
 
 Done when: a multi-host fan-out demo restores one spore on every host in a
 test fleet with origin egress measured at a small multiple of the unique chunk
@@ -557,7 +570,9 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   hypervisor structs.
 - The checkpoint artifact is called a spore; the manifest is versioned; v0
   formats carry no compatibility promise.
-- Spores are exportable as OCI artifacts rather than inventing a transport.
+- Spore distribution starts with a SporeVM chunkpack bundle. OCI remains a
+  likely publication adapter, but not the hot 10,000-host fan-out data plane by
+  itself.
 - Control integration is newline-delimited JSON over a unix socket, mirroring
   the proven cleanroom helper pattern.
 - SporeVM is standalone; cleanroom integrates via an adapter in its own repo.

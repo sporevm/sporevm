@@ -21,6 +21,20 @@ A spore is a directory:
 └── ram.backing             # optional local same-host RAM acceleration file
 ```
 
+A local bundle is the first distribution form:
+
+```text
+<bundle>/
+├── manifest.json           # portable manifest; local RAM backing stripped
+├── chunkpack.index.json    # blake3 chunk id -> pack/offset/length/sha256
+└── chunkpacks/000000.pack  # uncompressed logical chunks concatenated
+```
+
+Bundles are an implementation format for distribution, not a new machine-state
+contract. The BLAKE3 ids in `manifest.json` remain the restore-time trust root;
+the SHA256 values in the chunkpack index make each packed segment compatible
+with blob-store and later OCI-style descriptor verification.
+
 ## Manifest v0
 
 `manifest.json` fields (see `src/spore.zig` for the authoritative shapes):
@@ -98,6 +112,9 @@ A spore is a directory:
 
 - Chunk ids are BLAKE3-256 of chunk contents (`src/chunk.zig`); every chunk
   is verified against its id before use, from any source.
+- Chunkpack bundles are portable only after local RAM backing metadata has been
+  stripped. `spore unpack` reconstitutes normal `chunks/<blake3>` files and
+  fails closed when a pack segment's SHA256 or logical BLAKE3 id mismatches.
 - Local RAM backing files are same-host acceleration hints, not portable trust
   roots. The current path/symlink form is an interim KVM harness adapter, not a
   sealed-fd security boundary. Consumers that need portable or untrusted restore

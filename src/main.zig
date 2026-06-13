@@ -17,6 +17,10 @@ const usage =
     \\  inspect <spore-dir> Print a spore manifest summary as JSON
     \\  fork <spore-dir> --count N --out DIR
     \\                      Mint child spores that share parent chunks
+    \\  pack <spore-dir> --out DIR
+    \\                      Pack portable spore chunks into a local bundle
+    \\  unpack <bundle-dir> --out DIR
+    \\                      Unpack a local spore bundle into a spore dir
     \\  help                Show this help
     \\
 ;
@@ -53,6 +57,12 @@ pub fn main(init: std.process.Init) !void {
         try printJson(arena, stdout, inspectSummary(parsed.value));
     } else if (std.mem.eql(u8, command, "fork")) {
         const result = try forkCommand(arena, args[2..]);
+        try printJson(arena, stdout, result);
+    } else if (std.mem.eql(u8, command, "pack")) {
+        const result = try packCommand(arena, args[2..]);
+        try printJson(arena, stdout, result);
+    } else if (std.mem.eql(u8, command, "unpack")) {
+        const result = try unpackCommand(arena, args[2..]);
         try printJson(arena, stdout, result);
     } else if (std.mem.eql(u8, command, "help")) {
         try stdout.writeAll(usage);
@@ -107,6 +117,68 @@ fn forkCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.
     });
 }
 
+fn packCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.spore.PackResult {
+    var spore_dir: ?[]const u8 = null;
+    var out_dir: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
+            i += 1;
+            out_dir = args[i];
+        } else if (std.mem.startsWith(u8, args[i], "--")) {
+            std.debug.print("unknown pack argument: {s}\n", .{args[i]});
+            std.process.exit(2);
+        } else if (spore_dir == null) {
+            spore_dir = args[i];
+        } else {
+            std.debug.print("unexpected pack argument: {s}\n", .{args[i]});
+            std.process.exit(2);
+        }
+    }
+
+    if (spore_dir == null or out_dir == null) {
+        std.debug.print("usage: spore pack <spore-dir> --out DIR\n", .{});
+        std.process.exit(2);
+    }
+
+    return sporevm.spore.pack(allocator, .{
+        .spore_dir = spore_dir.?,
+        .out_dir = out_dir.?,
+    });
+}
+
+fn unpackCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.spore.UnpackResult {
+    var bundle_dir: ?[]const u8 = null;
+    var out_dir: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
+            i += 1;
+            out_dir = args[i];
+        } else if (std.mem.startsWith(u8, args[i], "--")) {
+            std.debug.print("unknown unpack argument: {s}\n", .{args[i]});
+            std.process.exit(2);
+        } else if (bundle_dir == null) {
+            bundle_dir = args[i];
+        } else {
+            std.debug.print("unexpected unpack argument: {s}\n", .{args[i]});
+            std.process.exit(2);
+        }
+    }
+
+    if (bundle_dir == null or out_dir == null) {
+        std.debug.print("usage: spore unpack <bundle-dir> --out DIR\n", .{});
+        std.process.exit(2);
+    }
+
+    return sporevm.spore.unpack(allocator, .{
+        .bundle_dir = bundle_dir.?,
+        .out_dir = out_dir.?,
+    });
+}
+
 const InspectSummary = struct {
     version: u32,
     platform: sporevm.spore.Platform,
@@ -141,5 +213,7 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "host-info") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "inspect") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "fork") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "pack") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "unpack") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "help") != null);
 }
