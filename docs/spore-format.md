@@ -1,7 +1,7 @@
 # Spore Format
 
-**Status:** v0 implemented (`src/spore.zig`), single-vCPU, HVF producer and
-consumer. v0 carries no compatibility promise.
+**Status:** v0 implemented (`src/spore.zig`), single-vCPU, same-host HVF and
+KVM producers/consumers. v0 carries no compatibility promise.
 
 A spore is a sealed, content-addressed checkpoint of a VM. The format, not the
 implementation, is the product: two SporeVM builds on different hypervisors
@@ -34,8 +34,9 @@ A spore is a directory:
   virtual counter value plus `CNTV_CTL`/`CNTV_CVAL`. Restore re-anchors the
   counter so guest time continues from the snapshot.
 - `machine.gic_state_b64`: interrupt-controller state blob. This is the one
-  field that is currently backend-opaque (hv_gic state); slice 4 replaces it
-  with a normalized GICv3 representation or proves blob-level translation.
+  field that is currently backend-opaque (HVF stores `hv_gic` state; KVM stores
+  a small same-host VGICv3 JSON payload); slice 4 replaces it with a normalized
+  GICv3 representation or proves blob-level translation.
 - `devices`: ordered virtio-mmio transport states (device id, status,
   feature negotiation registers, interrupt status, and per-queue size/ready/
   ring addresses/indices). Device order is part of the board contract.

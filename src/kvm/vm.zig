@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const kvm = @import("kvm.zig");
+const snapshot = @import("snapshot.zig");
 const board = @import("../board.zig");
 const boot = @import("../boot.zig");
 const generation = @import("../generation.zig");
@@ -16,6 +17,7 @@ const console = @import("../virtio/console.zig");
 const blk = @import("../virtio/blk.zig");
 const net = @import("../virtio/net.zig");
 const rng = @import("../virtio/rng.zig");
+const spore = @import("../spore.zig");
 const vsock = @import("../virtio/vsock.zig");
 
 pub const Config = struct {
@@ -25,9 +27,15 @@ pub const Config = struct {
     console_sink: *const fn ([]const u8) void,
     /// Read-write host fd backing /dev/vda, if any.
     disk_fd: ?std.c.fd_t = null,
+    /// Resume from a spore directory instead of booting the kernel.
+    resume_dir: ?[]const u8 = null,
+    /// Take a spore snapshot after this many milliseconds of run time and
+    /// stop. Requires snapshot_dir.
+    snapshot_after_ms: ?u64 = null,
+    snapshot_dir: ?[]const u8 = null,
 };
 
-pub const ExitCause = enum { guest_off, guest_reset };
+pub const ExitCause = enum { guest_off, guest_reset, snapshotted };
 
 const gic_dist_base: u64 = 0x0800_0000;
 const gic_dist_size: u64 = 0x0001_0000;
@@ -42,6 +50,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ONE_REG, "KVM_CAP_ONE_REG");
     try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ARM_PSCI_0_2, "KVM_CAP_ARM_PSCI_0_2");
     try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_DEVICE_CTRL, "KVM_CAP_DEVICE_CTRL");
+    if (config.resume_dir != null or config.snapshot_after_ms != null) {
+        try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_COUNTER_OFFSET, "KVM_CAP_COUNTER_OFFSET");
+    }
 
     const vm_fd: std.c.fd_t = @intCast(try kvm.ioctl(kvm_fd, kvm.KVM_CREATE_VM, 0, "KVM_CREATE_VM"));
     defer closeFd(vm_fd);
@@ -91,32 +102,49 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     transport_count += 1;
     const transports = transports_buf[0..transport_count];
 
-    const dtb = try board.buildDtb(allocator, .{
-        .ram_size = config.ram_size,
-        .cpu_count = 1,
-        .gic = .{
-            .distributor_base = gic_dist_base,
-            .distributor_size = gic_dist_size,
-            .redistributor_base = gic_redist_base,
-            .redistributor_size = gic_redist_size,
-        },
-        .virtio_count = @intCast(transports.len),
-        .bootargs = config.cmdline,
-    });
-    defer allocator.free(dtb);
-    const layout = try boot.load(ram_bytes, board.ram_base, config.kernel, dtb);
-
     const vcpu_fd: std.c.fd_t = @intCast(try kvm.ioctl(vm_fd, kvm.KVM_CREATE_VCPU, 0, "KVM_CREATE_VCPU"));
     defer closeFd(vcpu_fd);
     try initVcpu(vm_fd, vcpu_fd);
     try initGic(gic_dev.fd);
 
-    var pstate: u64 = 0x3c5; // EL1h, DAIF masked.
-    var pc = layout.entry;
-    var x0 = layout.dtb;
-    try kvm.setOneReg(vcpu_fd, kvm.coreReg(kvm.KVM_REG_ARM_CORE_PSTATE), &pstate);
-    try kvm.setOneReg(vcpu_fd, kvm.coreReg(kvm.KVM_REG_ARM_CORE_PC), &pc);
-    try kvm.setOneReg(vcpu_fd, kvm.gprReg(0), &x0);
+    if (config.resume_dir) |spore_dir| {
+        const parsed = try spore.loadManifest(allocator, spore_dir);
+        defer parsed.deinit();
+        const m = parsed.value;
+        if (m.version != spore.format_version or
+            m.platform.device_model_version != board.device_model_version or
+            m.platform.ram_base != board.ram_base or
+            m.platform.ram_size != config.ram_size or
+            m.platform.gic_dist_base != gic_dist_base or
+            m.platform.gic_redist_base != gic_redist_base or
+            m.devices.len != transports.len)
+        {
+            return error.PlatformMismatch;
+        }
+        try spore.loadMemory(allocator, spore_dir, m.memory, ram_bytes);
+        try applyTransports(transports, m.devices);
+        try gen_dev.restore(allocator, m.generation);
+        try snapshot.applyMachine(allocator, vm_fd, @intCast(gic_dev.fd), vcpu_fd, m.machine);
+    } else {
+        const dtb = try board.buildDtb(allocator, .{
+            .ram_size = config.ram_size,
+            .cpu_count = 1,
+            .gic = .{
+                .distributor_base = gic_dist_base,
+                .distributor_size = gic_dist_size,
+                .redistributor_base = gic_redist_base,
+                .redistributor_size = gic_redist_size,
+            },
+            .virtio_count = @intCast(transports.len),
+            .bootargs = config.cmdline,
+        });
+        defer allocator.free(dtb);
+        const layout = try boot.load(ram_bytes, board.ram_base, config.kernel, dtb);
+
+        try kvm.setOneRegU64(vcpu_fd, kvm.coreReg(kvm.KVM_REG_ARM_CORE_PSTATE), 0x3c5); // EL1h, DAIF masked.
+        try kvm.setOneRegU64(vcpu_fd, kvm.coreReg(kvm.KVM_REG_ARM_CORE_PC), layout.entry);
+        try kvm.setOneRegU64(vcpu_fd, kvm.gprReg(0), layout.dtb);
+    }
 
     const run_size = try kvm.ioctl(kvm_fd, kvm.KVM_GET_VCPU_MMAP_SIZE, 0, "KVM_GET_VCPU_MMAP_SIZE");
     const run_bytes = try std.posix.mmap(
@@ -129,10 +157,29 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     );
     defer std.posix.munmap(run_bytes);
 
+    const start_ms = try monotonicMs();
+    var pending_kvm_completion = false;
     while (true) {
+        if (config.snapshot_after_ms) |after_ms| {
+            const elapsed_ms = (try monotonicMs()) - start_ms;
+            if (elapsed_ms >= after_ms) {
+                if (pending_kvm_completion) {
+                    try kvm.completePendingExit(vcpu_fd, run_bytes);
+                    pending_kvm_completion = false;
+                }
+                const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size);
+                return .snapshotted;
+            }
+        }
+
         _ = try kvm.ioctl(vcpu_fd, kvm.KVM_RUN, 0, "KVM_RUN");
+        pending_kvm_completion = false;
         switch (kvm.exitReason(run_bytes)) {
-            kvm.KVM_EXIT_MMIO => try handleMmio(vm_fd, run_bytes, transports, &gen_dev, ram),
+            kvm.KVM_EXIT_MMIO => {
+                try handleMmio(vm_fd, run_bytes, transports, &gen_dev, ram);
+                pending_kvm_completion = true;
+            },
             kvm.KVM_EXIT_SYSTEM_EVENT => switch (kvm.systemEventType(run_bytes)) {
                 kvm.KVM_SYSTEM_EVENT_SHUTDOWN => return .guest_off,
                 kvm.KVM_SYSTEM_EVENT_RESET => return .guest_reset,
@@ -144,6 +191,114 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 std.log.err("unhandled KVM exit reason {d}", .{reason});
                 return error.UnexpectedExit;
             },
+        }
+    }
+}
+
+fn monotonicMs() !u64 {
+    var ts: std.os.linux.timespec = undefined;
+    const rc = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => {},
+        else => |err| {
+            std.log.err("clock_gettime(CLOCK_MONOTONIC) failed: {s}", .{@tagName(err)});
+            return error.ClockFailed;
+        },
+    }
+    return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
+
+fn takeSnapshot(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    gic_fd: std.c.fd_t,
+    vcpu_fd: std.c.fd_t,
+    transports: []mmio.Transport,
+    gen_dev: *const generation.Device,
+    vsock_dev: *const vsock.Vsock,
+    ram_bytes: []const u8,
+    ram_size: u64,
+) !void {
+    if (vsock_dev.pending_len != 0) {
+        std.log.err("cannot snapshot while virtio-vsock has pending packets", .{});
+        return error.DeviceStatePending;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const machine = try snapshot.captureMachine(arena, gic_fd, vcpu_fd);
+    const devices = try captureTransports(arena, transports);
+    const gen_state = try gen_dev.capture(arena);
+    const memory = try spore.saveMemory(arena, dir, ram_bytes);
+    try spore.saveManifest(arena, dir, .{
+        .platform = .{
+            .device_model_version = board.device_model_version,
+            .ram_base = board.ram_base,
+            .ram_size = ram_size,
+            .gic_dist_base = gic_dist_base,
+            .gic_redist_base = gic_redist_base,
+        },
+        .machine = machine,
+        .devices = devices,
+        .generation = gen_state,
+        .memory = memory,
+    });
+    std.log.info("spore written to {s}", .{dir});
+}
+
+fn captureTransports(allocator: std.mem.Allocator, transports: []mmio.Transport) ![]spore.TransportState {
+    const out = try allocator.alloc(spore.TransportState, transports.len);
+    for (transports, 0..) |*t, i| {
+        const queues = try allocator.alloc(spore.QueueState, t.dev.queue_count);
+        for (queues, 0..) |*qs, qi| {
+            const q = t.queues[qi];
+            qs.* = .{
+                .size = q.size,
+                .ready = q.ready,
+                .desc_addr = q.desc_addr,
+                .avail_addr = q.avail_addr,
+                .used_addr = q.used_addr,
+                .last_avail = q.last_avail,
+                .used_idx = q.used_idx,
+            };
+        }
+        out[i] = .{
+            .device_id = t.dev.device_id,
+            .status = t.status,
+            .device_features_sel = t.device_features_sel,
+            .driver_features_sel = t.driver_features_sel,
+            .driver_features = t.driver_features,
+            .queue_sel = t.queue_sel,
+            .interrupt_status = t.interrupt_status,
+            .queues = queues,
+        };
+    }
+    return out;
+}
+
+fn applyTransports(transports: []mmio.Transport, states: []const spore.TransportState) !void {
+    if (states.len != transports.len) return error.PlatformMismatch;
+    for (transports, states) |*t, s| {
+        if (t.dev.device_id != s.device_id) return error.PlatformMismatch;
+        if (s.queues.len != t.dev.queue_count) return error.PlatformMismatch;
+        t.status = s.status;
+        t.device_features_sel = s.device_features_sel;
+        t.driver_features_sel = s.driver_features_sel;
+        t.driver_features = s.driver_features;
+        t.queue_sel = s.queue_sel;
+        t.interrupt_status = s.interrupt_status;
+        for (s.queues, 0..) |qs, qi| {
+            t.queues[qi] = .{
+                .size = qs.size,
+                .ready = qs.ready,
+                .desc_addr = qs.desc_addr,
+                .avail_addr = qs.avail_addr,
+                .used_addr = qs.used_addr,
+                .last_avail = qs.last_avail,
+                .used_idx = qs.used_idx,
+            };
         }
     }
 }
