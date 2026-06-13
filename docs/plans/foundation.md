@@ -365,6 +365,17 @@ spores now fail closed on the expected counter-frequency mismatch
 emitting portable GICv3 state. These are tracked in `docs/state-portability.md`
 and do not block the next release-critical fork/fan-out slices.
 
+Slice 6 has its first remote distribution proof. `scripts/smoke-remote-bundle.sh`
+orchestrates two SSM-managed aarch64 KVM hosts and an S3 staging prefix: it
+uploads the current checkout, captures and packs a spore on the source host,
+publishes the chunkpack bundle to S3, then downloads, unpacks, and resumes on
+the destination host. The first two-host run in `ap-southeast-2` packed 14
+non-zero chunks from a 512MiB ticker spore into a 29,382,174-byte bundle, then
+resumed on the second host with KVM lazy RAM reporting `ttfi_ms=5`,
+`ttuw_ms=1230`, `lazy_faults=9`, and `lazy_unique_chunks=9`. This proves the
+bundle can leave a source host and boot on a compatible destination; it is not
+yet the final fan-out data plane or origin-egress efficiency proof.
+
 ## Delivery Strategy
 
 Each slice is a reviewable unit with a runnable result. KVM work needs an
@@ -463,6 +474,10 @@ useful as a second implementation path, but does not block identical-host
 fan-out.
 
 ### Slice 6: Identical-host fan-out distribution
+
+Status: in progress. Local chunkpack bundles and the first two-host S3/SSM
+remote restore smoke have landed; cache/peer fan-out and measured origin-egress
+efficiency remain.
 
 Start with a local bundle/chunkpack format, then add distribution adapters.
 `spore pack` writes a portable bundle containing a manifest with local RAM
