@@ -1,15 +1,16 @@
 # 🍄 SporeVM
 
 SporeVM is a virtual machine monitor for aarch64 Linux microVMs that treats a
-suspended VM as a cheap, portable, forkable object. One Zig codebase targets
-two hypervisors — KVM on Linux and Hypervisor.framework on macOS — with an
-identical minimal device model on both, so a VM suspended on one host can
-resume on the other.
+suspended VM as a cheap, forkable object for fan-out across compatible hosts.
+One Zig codebase targets two hypervisors — KVM on Linux and
+Hypervisor.framework on macOS — with an identical minimal device model on both.
+Cross-backend restore is useful diagnostic portability, but the primary product
+path is fork/fan-out on identical host classes.
 
 The sealed checkpoint artifact is called a **spore**: a manifest of
 content-addressed memory and disk chunks plus a small normalized machine-state
-blob. Spores are the unit of suspend, fork, fan-out, and cross-platform
-transfer.
+blob. Spores are the unit of suspend, fork, fan-out, and cross-backend
+inspection.
 
 The defining design property: no lifecycle operation scales with RAM size.
 
@@ -21,7 +22,7 @@ The defining design property: no lifecycle operation scales with RAM size.
 spore create --kernel ... --disk ... my-vm
 spore suspend my-vm
 spore fork my-vm --count 10000
-spore pull <spore-id> && spore resume <spore-id>   # on a different OS
+spore pull <spore-id> && spore resume <spore-id>   # on a compatible host
 ```
 
 ## Status
@@ -35,7 +36,8 @@ write/resume a v0 spore on the same host. The CLI can report current host
 platform facts with `spore host-info` and summarise a spore manifest with
 `spore inspect <spore-dir>`.
 
-The cross-hypervisor restore matrix is still pending.
+Identical-host fork/fan-out is the priority path. The cross-hypervisor restore
+matrix remains a secondary diagnostic portability track.
 
 ## Development
 

@@ -8,6 +8,10 @@ The spore format describes bytes on disk. This document describes the portable
 meaning of those bytes: which guest-visible state is part of the contract, how
 each backend maps it to native APIs, and when restore must fail closed.
 
+This is a diagnostic portability track. The release-critical path is
+fork/fan-out on identical host classes; cross-backend restore helps inspect
+failed runs and keep backend-private state out of the spore contract.
+
 ## Scope
 
 v0 portability is deliberately narrow:
@@ -46,7 +50,8 @@ Current observed timer contracts:
 
 That mismatch is intentionally rejected. A positive KVM→HVF smoke needs a KVM
 producer whose guest-visible counter frequency is 24MHz, or a later timer
-design that makes frequency differences safely translatable.
+design that makes frequency differences safely translatable. This does not
+block identical-host fork/fan-out.
 
 ## State inventory
 
@@ -239,12 +244,12 @@ Current evidence:
 
 ## Next contract work
 
-1. Decide the timer portability design: fixed guest timer profile at VM
+1. Add kernel image identity to the platform contract.
+2. Add disk state or an explicit disk identity/hash contract before claiming
+   disk-backed cross-host restore.
+3. Decide the timer portability design: fixed guest timer profile at VM
    creation, frequency-neutral timer state plus guest-visible constraints, or
    host-class matching only.
-2. Make HVF emit portable GICv3 state instead of only the backend-private blob.
-3. Add kernel image identity to the platform contract.
-4. Add disk state or an explicit disk identity/hash contract before claiming
-   disk-backed cross-host restore.
+4. Make HVF emit portable GICv3 state instead of only the backend-private blob.
 5. Extend the matrix when multi-vCPU state, access traces, lazy restore, and
    fork generation semantics land.

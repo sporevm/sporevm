@@ -10,10 +10,11 @@ related_plans:
 ## Summary
 
 SporeVM is a virtual machine monitor for aarch64 Linux microVMs that treats a
-suspended VM as a cheap, portable, forkable object. One codebase targets two
-hypervisors — KVM on Linux and Hypervisor.framework (HVF) on macOS — with an
-identical minimal virtio-mmio device model on both, so a VM suspended on one
-host can resume on the other. It is written in Zig.
+suspended VM as a cheap, forkable object for fan-out across compatible hosts.
+One codebase targets two hypervisors — KVM on Linux and Hypervisor.framework
+(HVF) on macOS — with an identical minimal virtio-mmio device model on both.
+Cross-backend restore is useful diagnostic portability, but the primary product
+path is fork/fan-out on identical host classes. It is written in Zig.
 
 The defining design property is that no lifecycle operation scales with RAM
 size. A running VM is permanently checkpoint-ready: dirty pages stream
@@ -22,7 +23,7 @@ tail flush, fork is a metadata write, and resume is bounded by the working set,
 not by memory size. The sealed checkpoint artifact is called a **spore**: a
 manifest of content-addressed memory and disk chunks plus a small normalized
 machine-state blob. Spores are the unit of suspend, fork, fan-out, and
-cross-platform transfer.
+cross-backend inspection.
 
 The end state this plan drives toward:
 
@@ -30,7 +31,7 @@ The end state this plan drives toward:
 spore create --kernel ... --disk ... my-vm
 spore suspend my-vm                 # ~50ms regardless of RAM size
 spore fork my-vm --count 10000     # metadata-only, sub-second
-spore pull <spore-id> && spore resume <spore-id>   # on a different OS
+spore pull <spore-id> && spore resume <spore-id>   # on a compatible host
 ```
 
 SporeVM is a standalone project with its own CLI and control API. Cleanroom is
@@ -39,9 +40,10 @@ repository depends on cleanroom.
 
 ## Problem
 
-There is no VMM today that can suspend a Linux VM on a Linux host and resume it
-on macOS, or fork suspended state across thousands of hosts without copying
-memory images around:
+There is no VMM today that can fork suspended Linux VM state across thousands
+of compatible hosts without copying memory images around, while still retaining
+enough normalized machine state to inspect and debug failed runs across backend
+boundaries:
 
 - Firecracker snapshots are KVM-only and tied to its device model.
 - Apple Virtualization.framework saved state is opaque, version-locked, and not
@@ -50,10 +52,11 @@ memory images around:
   restore is unproven in production.
 - All of them treat a snapshot as a monolithic file whose cost scales with RAM.
 
-Cross-hypervisor portability requires owning the device model and the vCPU
-state encoding on both sides. Cheap fan-out requires memory to be
-content-addressed and lazily materialized. Both point at the same conclusion:
-a purpose-built VMM where the snapshot format is the product.
+Cheap fan-out requires memory to be content-addressed and lazily materialized.
+Owning the device model and vCPU state encoding also gives us cross-backend
+inspection leverage, but that is not the release-critical path. Both point at
+the same conclusion: a purpose-built VMM where the snapshot format is the
+product.
 
 The enabling platform facts are confirmed:
 
@@ -71,10 +74,12 @@ The enabling platform facts are confirmed:
   an identical device model.
 - Define a versioned spore manifest format whose machine state is
   architectural, not hypervisor-specific.
-- Suspend/restore on the same host, then restore across hypervisors in all
-  four directions (KVM→KVM, HVF→HVF, KVM→HVF, HVF→KVM).
-- Content-addressed chunked memory and disk with lazy, fault-driven restore.
 - O(1) fork with a guest-cooperative fixup protocol (identity, entropy, time).
+- Fan-out spores across identical host classes without copying full RAM images
+  to every destination.
+- Content-addressed chunked memory and disk with lazy, fault-driven restore.
+- Suspend/restore on the same host for both KVM and HVF, with cross-backend
+  restore kept as a diagnostic portability track rather than a release gate.
 - Always-on dirty tracking so suspend latency is independent of RAM size.
 - Chunk distribution that survives 10,000 concurrent restores without 10,000
   origin fetches.
@@ -328,11 +333,12 @@ Zig project skeleton (`build.zig`, pinned Zig toolchain via mise), CI that
 builds and runs unit tests on both platforms, `SECURITY.md`, `AGENTS.md`,
 `docs/spore-format.md`, MIT license, README stating the thesis.
 
-In parallel, the cheapest possible validation of the riskiest claim, using no
-SporeVM code: take a QEMU `virt` machine snapshot under KVM on aarch64 Linux
-and attempt restore under HVF on macOS (QEMU upstream has in-flight HVF GIC
-save/restore patches). Outcome is recorded in `docs/research.md` either way;
-failure modes inform the machine-state normalization design.
+In parallel, the cheapest possible validation of the cross-backend portability
+hypothesis, using no SporeVM code: take a QEMU `virt` machine snapshot under
+KVM on aarch64 Linux and attempt restore under HVF on macOS (QEMU upstream has
+in-flight HVF GIC save/restore patches). Outcome is recorded in
+`docs/research.md` either way; failure modes inform the machine-state
+normalization design.
 
 Done when: CI is green on both platforms and the QEMU experiment writeup
 exists with a clear keep/adjust decision for the normalization approach.
@@ -367,40 +373,39 @@ KVM and HVF independently. Manifest decode gets a fuzz target.
 Done when: a guest survives suspend/resume with running processes intact
 (KVM→KVM and HVF→HVF), and `docs/spore-format.md` documents manifest v0.
 
-### Slice 4: Cross-hypervisor restore
+### Slice 4: Fork and the generation protocol
 
-The headline result. Normalize the deltas the QEMU experiment and slice 3
-surfaced: GIC state mapping, timer offset handling, CPU feature-ID profile
-masking at creation, fail-closed contract checks.
+The release-critical result. `spore fork --count N` mints manifests CoW for an
+already-captured spore and resumes each child on an identical host class with an
+incremented generation. Generation device, in-guest fixup helper (machine-id,
+hostname, MAC, RNG reseed, clock step, userspace signal). Same-host fork storm
+test first; identical-host fleet fan-out follows once distribution lands.
 
-The first positive KVM→HVF smoke should use an initrd ticker and a KVM producer
-whose `CNTFRQ_EL0` matches Apple HVF's 24MHz guest counter. The m7g KVM host
-remains the same-host KVM and negative cross-frequency test host.
+Done when: 100 concurrent same-host forks of one spore run distinct workloads
+with distinct identities, no entropy or clock anomalies, and fork latency is
+measured in milliseconds.
 
-Done when: the four-direction matrix (KVM→KVM, HVF→HVF, KVM→HVF, HVF→KVM)
-passes a smoke test where the guest resumes mid-workload and the workload
-completes correctly. This is the moment to announce the project.
-
-### Slice 5: Lazy restore
+### Slice 5: Lazy restore for identical host classes
 
 Restore maps memory empty and materializes pages on fault: userfaultfd on
 Linux, unmapped-memory exits on HVF. Record an access trace on first resume;
 use it for readahead on later resumes. Benchmark resume time-to-first-
 instruction and time-to-useful-work against slice 3's eager restore.
 
-Done when: resume TTFI is independent of RAM size on both platforms and the
-benchmark harness tracks it in CI (or a recorded manual run where CI hardware
-does not exist).
+Done when: resume TTFI is independent of RAM size on the primary KVM host class
+and the benchmark harness tracks it in CI (or a recorded manual run where CI
+hardware does not exist). HVF remains useful as a second implementation path,
+but does not block identical-host fan-out.
 
-### Slice 6: Fork and the generation protocol
+### Slice 6: Identical-host fan-out distribution
 
-`spore fork --count N` mints manifests CoW, resumes with incremented
-generation. Generation device, in-guest fixup helper (machine-id, hostname,
-MAC, RNG reseed, clock step, userspace signal). Same-host fork storm test.
+`spore push`/`pull` against an OCI registry; `spore daemon` chunk cache with
+peer chunk exchange; relay fan-out so N restores cost O(log N) origin work.
+Scale tests at 10 → 100 → 1,000 identical hosts before claiming 10,000.
 
-Done when: 100 concurrent same-host forks of one spore run distinct workloads
-with distinct identities, no entropy or clock anomalies, and fork latency is
-measured in milliseconds.
+Done when: a multi-host fan-out demo restores one spore on every host in a
+test fleet with origin egress measured at a small multiple of the unique chunk
+set, and chunk verification rejects corrupted peer data.
 
 ### Slice 7: Always-on dirty tracking
 
@@ -413,15 +418,17 @@ platform support boundary rather than blocking the release.
 Done when: suspend latency is measured flat across 1/4/16GB guests on Linux,
 and the HVF overhead decision is recorded with numbers.
 
-### Slice 8: Distribution
+### Slice 8: Cross-backend diagnostic restore
 
-`spore push`/`pull` against an OCI registry; `spore daemon` chunk cache with
-peer chunk exchange; relay fan-out so N restores cost O(log N) origin work.
-Scale tests at 10 → 100 → 1,000 hosts before claiming 10,000.
+Cross-backend restore is valuable for inspecting failed runs on a different
+developer machine and proving the state contract is not accidentally backend
+private. It is not the fork/fan-out release gate. Continue normalizing the
+deltas surfaced by slice 3: GIC state mapping, timer offset handling, CPU
+feature-ID profile masking at creation, and fail-closed contract checks.
 
-Done when: a multi-host fan-out demo restores one spore on every host in a
-test fleet with origin egress measured at a small multiple of the unique
-chunk set, and chunk verification rejects corrupted peer data.
+Done when: the four-direction matrix (KVM→KVM, HVF→HVF, KVM→HVF, HVF→KVM) is
+documented with passing or intentionally rejected smoke outcomes, and at least
+one positive cross-backend direction works on compatible timer-profile hosts.
 
 ### Follow-up (separate plans)
 
@@ -449,10 +456,10 @@ chunk set, and chunk verification rejects corrupted peer data.
 
 ## Key Learnings From Pressure-Testing
 
-- The riskiest claim is cross-hypervisor machine-state restore, and the
-  cheapest test of it needs no SporeVM code. The QEMU KVM→HVF experiment was
-  moved into slice 0 so a negative result reshapes the design before slices
-  1–3 are built, not after.
+- The riskiest product claim is cheap fork/fan-out, not cross-backend restore.
+  Cross-backend portability remains useful for inspecting failed runs and
+  detecting backend-private leaks in the state contract, but it must not pull
+  effort away from identical-host fork, lazy restore, and distribution.
 - HVF dirty-tracking cost is unknown and could be materially worse than KVM's
   dirty ring. Slice 7 carries an explicit fallback (suspend-time scanning on
   macOS) and a measurement gate, so the always-checkpoint-ready property can
@@ -483,9 +490,10 @@ chunk set, and chunk verification rejects corrupted peer data.
 - Control integration is newline-delimited JSON over a unix socket, mirroring
   the proven cleanroom helper pattern.
 - SporeVM is standalone; cleanroom integrates via an adapter in its own repo.
-- The QEMU cross-accelerator experiment precedes VMM implementation.
+- Cross-backend restore is a diagnostic portability track, not the release
+  gate for fork/fan-out on identical hosts.
 - MIT licensed from the first commit, but the repository stays private for
-  now. The slice 4 cross-hypervisor demo is the natural moment to revisit
+  now. The identical-host fork/fan-out demo is the natural moment to revisit
   going public.
 - Development and CI hosts come from the `cleanroom-ops` fleet rather than
   new infrastructure. Smoke and benchmark jobs are CI-enforced as soon as the
