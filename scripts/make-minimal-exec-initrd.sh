@@ -5,9 +5,9 @@ usage() {
   cat <<'EOF'
 usage: scripts/make-minimal-exec-initrd.sh <out.cpio>
 
-Build a tiny aarch64 Linux initrd for the SporeVM minimal boot benchmark. The
-init process listens on AF_VSOCK, accepts one-line JSON exec requests, runs
-/bin/true for the default probe, and replies with a JSON exit frame.
+Build a tiny aarch64 Linux initrd for the SporeVM minimal boot/run path. The
+init process listens on AF_VSOCK, accepts one-line JSON argv requests, runs the
+requested binary, and replies with a JSON exit frame.
 
 Environment:
   CC   C compiler command. Defaults to `zig cc -target aarch64-linux-musl`
@@ -64,6 +64,9 @@ cat >"${workdir}/agent.c" <<'EOF'
 #ifndef VMADDR_CID_ANY
 #define VMADDR_CID_ANY 0xffffffffU
 #endif
+
+#define MAX_ARGC 16
+#define MAX_ARG_LEN 256
 
 struct sockaddr_vm {
   sa_family_t svm_family;
@@ -169,8 +172,14 @@ static void write_all(int fd, const char *buf, size_t len) {
 
 static void send_exit(int fd, int exit_code, const char *error) {
   char frame[1024];
-  if (error == NULL) error = "";
-  const char *error_json = error[0] == '\0' ? "null" : "\"unsupported command\"";
+  const char *error_json = "null";
+  if (error != NULL) {
+    if (strcmp(error, "bad request") == 0) {
+      error_json = "\"bad request\"";
+    } else {
+      error_json = "\"run failed\"";
+    }
+  }
   int n = snprintf(frame, sizeof(frame),
     "{\"type\":\"exit\",\"exit_code\":%d,\"error\":%s,\"guest_timing_ms\":{"
     "\"guest_init_start\":%lld,"
@@ -190,11 +199,84 @@ static void send_exit(int fd, int exit_code, const char *error) {
   if (n > 0) write_all(fd, frame, (size_t)n);
 }
 
-static int run_true(void) {
+static const char *skip_ws(const char *p) {
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+  return p;
+}
+
+static int parse_json_string(const char **cursor, char *out, size_t cap) {
+  const char *p = *cursor;
+  if (*p != '"') return -1;
+  p++;
+  size_t len = 0;
+  while (*p != '\0' && *p != '"') {
+    char c = *p++;
+    if (c == '\\') {
+      c = *p++;
+      switch (c) {
+        case '"':
+        case '\\':
+        case '/':
+          break;
+        case 'n':
+          c = '\n';
+          break;
+        case 'r':
+          c = '\r';
+          break;
+        case 't':
+          c = '\t';
+          break;
+        default:
+          return -1;
+      }
+    }
+    if (len + 1 >= cap) return -1;
+    out[len++] = c;
+  }
+  if (*p != '"') return -1;
+  out[len] = '\0';
+  *cursor = p + 1;
+  return 0;
+}
+
+static int parse_argv(const char *req, char storage[MAX_ARGC][MAX_ARG_LEN], char *argv[MAX_ARGC + 1]) {
+  const char *p = strstr(req, "\"argv\"");
+  if (p == NULL) p = strstr(req, "\"command\"");
+  if (p == NULL) return -1;
+  p = strchr(p, '[');
+  if (p == NULL) return -1;
+  p++;
+
+  int argc = 0;
+  for (;;) {
+    p = skip_ws(p);
+    if (*p == ']') {
+      argv[argc] = NULL;
+      return argc > 0 ? argc : -1;
+    }
+    if (argc >= MAX_ARGC) return -1;
+    if (parse_json_string(&p, storage[argc], MAX_ARG_LEN) != 0) return -1;
+    argv[argc] = storage[argc];
+    argc++;
+
+    p = skip_ws(p);
+    if (*p == ',') {
+      p++;
+      continue;
+    }
+    if (*p == ']') {
+      argv[argc] = NULL;
+      return argc;
+    }
+    return -1;
+  }
+}
+
+static int run_argv(char *const argv[]) {
   t_command_start = now_ms();
   pid_t pid = fork();
   if (pid == 0) {
-    char *argv[] = {"/bin/true", NULL};
     execv(argv[0], argv);
     _exit(127);
   }
@@ -243,15 +325,17 @@ int main(void) {
     }
     if (t_first_request_decode == 0) t_first_request_decode = now_ms();
 
-    if (strstr(req, "/bin/true") == NULL) {
+    char arg_storage[MAX_ARGC][MAX_ARG_LEN];
+    char *argv[MAX_ARGC + 1];
+    if (parse_argv(req, arg_storage, argv) <= 0) {
       t_command_start = now_ms();
       t_command_exit = t_command_start;
-      send_exit(conn, 1, "unsupported command");
+      send_exit(conn, 2, "bad request");
       close(conn);
       continue;
     }
 
-    int code = run_true();
+    int code = run_argv(argv);
     send_exit(conn, code, NULL);
     close(conn);
   }
@@ -262,9 +346,14 @@ cat >"${workdir}/true.c" <<'EOF'
 int main(void) { return 0; }
 EOF
 
+cat >"${workdir}/false.c" <<'EOF'
+int main(void) { return 1; }
+EOF
+
 "${cc_cmd[@]}" -static -Os -s "${workdir}/agent.c" -o "${workdir}/root/init"
 "${cc_cmd[@]}" -static -Os -s "${workdir}/true.c" -o "${workdir}/root/bin/true"
-chmod 0755 "${workdir}/root/init" "${workdir}/root/bin/true"
+"${cc_cmd[@]}" -static -Os -s "${workdir}/false.c" -o "${workdir}/root/bin/false"
+chmod 0755 "${workdir}/root/init" "${workdir}/root/bin/true" "${workdir}/root/bin/false"
 chmod 1777 "${workdir}/root/tmp"
 
 mkdir -p "$(dirname "${out}")"

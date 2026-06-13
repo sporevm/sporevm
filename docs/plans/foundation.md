@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-13
+last_reviewed: 2026-06-14
 related_plans:
   - buildkite/cleanroom: docs/plans/sandbox-suspend-wake.md
 ---
@@ -28,6 +28,7 @@ fork, fan-out, and cross-backend inspection.
 The end state this plan drives toward:
 
 ```console
+spore run --kernel ... --initrd ... -- /bin/true
 spore create --kernel ... --disk ... my-vm
 spore suspend my-vm                 # ~50ms regardless of RAM size
 spore fork my-vm.spore --count 10000 --out forks/  # metadata-only
@@ -115,6 +116,7 @@ control protocol on a per-VM unix socket (the cleanroom helper pattern), so the
 Zig core is invisible at the integration seam.
 
 ```console
+spore run --kernel ... --initrd ... -- <argv...>
 spore create | resume | suspend | fork | rm | ls | inspect
 spore push | pull        # spore artifacts to/from a registry
 spore daemon             # chunk cache + peer exchange service (later phase)
@@ -274,6 +276,14 @@ backend boundary, and boots the same cleanroom kernel/initrd/rootfs combinations
 to an interactive shell on Apple Silicon. The shared virtio-mmio console, blk,
 net, vsock, rng, and generation devices are present on both backends. Host
 network attachment remains a later transport concern, not a slice-2 blocker.
+
+A first product `spore run` bridge has landed on top of the minimal vsock exec
+probe. It boots a throwaway VM from explicit local kernel/initrd paths, sends
+one bounded argv request to the guest agent, and exits with the guest command's
+status. This is intentionally not the long-running monitor/control socket, not
+rootfs policy, and not a bundle distribution path; it is the smallest product
+CLI primitive that proves boot + command + status propagation through the real
+VMM path.
 
 Slice 3 (same-hypervisor eager suspend/restore and manifest v0) is complete for
 both backends. `src/spore.zig` and `docs/spore-format.md` define v0: eager,
@@ -535,7 +545,8 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   inputs. Fuzz targets are added in the same slice as the parsing code and run
   continuously in CI.
 - Smoke (real hardware): boot on KVM and HVF; suspend/resume matrix; fork
-  storm; lazy-restore TTFI. Fork-storm smokes must report child count,
+  storm; lazy-restore TTFI; one-shot `spore run` true/false exit propagation.
+  Fork-storm smokes must report child count,
   fork/resume latency, aggregate child PSS, RSS as a diagnostic, and
   private/dirty-child working-set estimates so we distinguish real CoW sharing
   from simply provisioning more RAM. Scripts in `scripts/` run identically in
@@ -588,6 +599,10 @@ one positive cross-backend direction works on compatible timer-profile hosts.
 - Spore distribution starts with a SporeVM chunkpack bundle. OCI remains a
   likely publication adapter, but not the hot 10,000-host fan-out data plane by
   itself.
+- The first `spore run` primitive is a local one-shot boot/exec/status command
+  over virtio-vsock with explicit kernel and initrd inputs. Monitor lifecycle,
+  stdin/stdout streaming, rootfs policy, and bundle-aware run semantics remain
+  later work.
 - Control integration is newline-delimited JSON over a unix socket, mirroring
   the proven cleanroom helper pattern.
 - SporeVM is standalone; cleanroom integrates via an adapter in its own repo.

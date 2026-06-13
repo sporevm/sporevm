@@ -23,7 +23,7 @@ Options:
   -h, --help                Show this help.
 
 The measured probe boots the VM, connects to the guest vsock listener, sends a
-JSON exec request for /bin/true, and records VM-start, vsock-connect, and
+JSON argv request for /bin/true, and records VM-start, vsock-connect, and
 first-exec-response timings. It intentionally bypasses Cleanroom policy,
 rootfs, gateway, repository, and control-plane behavior.
 EOF

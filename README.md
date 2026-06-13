@@ -19,11 +19,14 @@ The target lifecycle property: no operation scales with RAM size.
 - **Fork** is a metadata write — `spore fork --count 10000` is sub-second
 - **Resume** is bounded by the working set, not memory size, on either OS
 
-The product CLI shape is still landing. Today `spore fork` can mint child
-spores from an existing spore; create, suspend, and resume are still exercised
-through the backend smoke harnesses. The end-state interface is:
+The product CLI shape is still landing. Today `spore run` can boot a
+throwaway VM and execute one argv request through the minimal vsock agent, and
+`spore fork` can mint child spores from an existing spore. Create, suspend,
+and resume are still exercised through the backend smoke harnesses. The
+end-state interface is:
 
 ```console
+spore run --kernel ... --initrd ... -- /bin/true
 spore create --kernel ... --disk ... my-vm
 spore suspend my-vm
 spore fork my-vm.spore --count 10000 --out forks/
@@ -39,9 +42,10 @@ on KVM/aarch64 to an Alpine shell prompt, with the shared virtio-mmio console,
 block, net, vsock, rng, and generation devices. The HVF and KVM paths can also
 write/resume a v0 spore on the same host. The CLI can report current host
 platform facts with `spore host-info`, summarise a spore manifest with
-`spore inspect <spore-dir>`, mint metadata-only child spores with
-`spore fork <spore-dir> --count N --out DIR`, and round-trip portable local
-chunkpack bundles with `spore pack` / `spore unpack`.
+`spore inspect <spore-dir>`, run one command in a throwaway VM with
+`spore run`, mint metadata-only child spores with `spore fork <spore-dir>
+--count N --out DIR`, and round-trip portable local chunkpack bundles with
+`spore pack` / `spore unpack`.
 
 Identical-host fork/fan-out is the priority path. The cross-hypervisor restore
 matrix remains a secondary diagnostic portability track.
@@ -81,9 +85,20 @@ into a normal spore directory with
 To exercise the first cross-host bundle path over SSM and S3, use
 `scripts/smoke-remote-bundle.sh --region REGION --source-instance ID --dest-instance ID --bucket BUCKET`.
 
+Run a single command in a throwaway VM with the minimal agent initrd:
+
+```bash
+scripts/make-minimal-exec-initrd.sh /tmp/sporevm-minimal.cpio
+zig-out/bin/spore run \
+  --backend hvf \
+  --kernel "$(scripts/ensure-managed-kernel.sh initrd)" \
+  --initrd /tmp/sporevm-minimal.cpio \
+  -- /bin/true
+```
+
 For a lower-bound boot/exec probe comparable to Cleanroom's minimal
 `darwin-vz` benchmark, use the minimal benchmark wrapper. It builds a tiny
-initrd whose `/init` listens on virtio-vsock, sends one `/bin/true` exec
+initrd whose `/init` listens on virtio-vsock, sends one `/bin/true` argv
 request from the host, and writes JSONL timings for VM start, vsock connect,
 and first exec response:
 

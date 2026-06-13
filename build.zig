@@ -13,19 +13,36 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .link_libc = true,
     });
+    if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) {
+        mod.linkFramework("Hypervisor", .{});
+    }
+
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sporevm", .module = mod },
+        },
+    });
+    if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) {
+        exe_mod.linkFramework("Hypervisor", .{});
+    }
 
     const exe = b.addExecutable(.{
         .name = "spore",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "sporevm", .module = mod },
-            },
-        }),
+        .root_module = exe_mod,
     });
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
+    if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) {
+        const sign_spore = b.addSystemCommand(&.{
+            "codesign",                      "--sign", "-", "--force", "--entitlements", "spore.entitlements",
+            b.getInstallPath(.bin, "spore"),
+        });
+        sign_spore.step.dependOn(&install_exe.step);
+        b.getInstallStep().dependOn(&sign_spore.step);
+    }
 
     const run_step = b.step("run", "Run the spore CLI");
     const run_cmd = b.addRunArtifact(exe);

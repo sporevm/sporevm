@@ -12,6 +12,8 @@ const usage =
     \\
     \\Commands:
     \\  rootfs              Build rootfs images from OCI images
+    \\  run --kernel Image --initrd root.cpio -- <argv...>
+    \\                      Boot a throwaway VM and run one command
     \\  version             Print the sporevm version
     \\  host-info           Print this host's platform facts as JSON
     \\  inspect <spore-dir> Print a spore manifest summary as JSON
@@ -42,6 +44,8 @@ pub fn main(init: std.process.Init) !void {
     const command = args[1];
     if (std.mem.eql(u8, command, "rootfs")) {
         try sporevm.rootfs.run(init, args[2..], stdout);
+    } else if (std.mem.eql(u8, command, "run")) {
+        try sporevm.run.cli(init, args[2..], stdout);
     } else if (std.mem.eql(u8, command, "version")) {
         try stdout.print("spore {s}\n", .{sporevm.version});
     } else if (std.mem.eql(u8, command, "host-info")) {
@@ -209,6 +213,7 @@ fn inspectSummary(manifest: sporevm.spore.Manifest) InspectSummary {
 
 test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "rootfs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "run") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "version") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "host-info") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "inspect") != null);
