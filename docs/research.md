@@ -65,10 +65,10 @@ answered the highest-risk state-normalization questions on the macOS side:
   for normal device emulation; those APIs use architectural offsets but return
   `HV_DENIED` for this path. The board must describe the redistributor frame
   returned after setting `MPIDR_EL1`.
-- The v0 spore format therefore keeps one documented backend-opaque exception:
-  `machine.gic_state_b64` is currently an HVF GIC blob. Cross-hypervisor
-  restore still needs either a normalized GICv3 representation or a proven
-  blob translation path.
+- The v0 spore format therefore kept one documented backend-opaque exception
+  until the KVM side landed. Current KVM snapshots emit a normalized
+  `machine.gic` GICv3 register/line-level subset; HVF snapshots keep a tagged
+  backend-private `hv_gic` blob until the HVF GICv3 mapping lands.
 
 Decision: keep the architectural machine-state normalization design. Adjust
 the cross-hypervisor slice to treat GICv3 CPU-interface state and virtual

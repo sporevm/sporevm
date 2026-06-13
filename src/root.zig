@@ -11,6 +11,7 @@ pub const board = @import("board.zig");
 pub const boot = @import("boot.zig");
 pub const chunk = @import("chunk.zig");
 pub const generation = @import("generation.zig");
+pub const gicv3 = @import("gicv3.zig");
 pub const spore = @import("spore.zig");
 pub const fdt = @import("fdt.zig");
 pub const guestmem = @import("guestmem.zig");
@@ -36,6 +37,7 @@ test {
     const testing = @import("std").testing;
     testing.refAllDecls(@This());
     testing.refAllDecls(generation);
+    testing.refAllDecls(gicv3);
     testing.refAllDecls(virtio.queue);
     testing.refAllDecls(virtio.mmio);
     testing.refAllDecls(virtio.console);

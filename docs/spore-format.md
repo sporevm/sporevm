@@ -33,10 +33,13 @@ A spore is a directory:
   (GICv3 CPU-interface registers by name), and `vtimer` as the guest's
   virtual counter value plus `CNTV_CTL`/`CNTV_CVAL`. Restore re-anchors the
   counter so guest time continues from the snapshot.
-- `machine.gic_state_b64`: interrupt-controller state blob. This is the one
-  field that is currently backend-opaque (HVF stores `hv_gic` state; KVM stores
-  a small same-host VGICv3 JSON payload); slice 4 replaces it with a normalized
-  GICv3 representation or proves blob-level translation.
+- `machine.gic`: interrupt-controller state. `kind: "gicv3"` carries a
+  normalized single-vCPU GICv3 subset: distributor and redistributor register
+  values by architectural MMIO offset plus sampled PPI/SPI line levels. KVM
+  currently emits and consumes this portable shape. `kind: "backend_private"`
+  is a tagged fail-closed escape hatch for temporary same-backend restore;
+  HVF currently stores `backend: "hvf"`, `format: "hv_gic_state_v0"`, and a
+  base64 `hv_gic` blob until its GICv3 mapping lands.
 - `devices`: ordered virtio-mmio transport states (device id, status,
   feature negotiation registers, interrupt status, and per-queue size/ready/
   ring addresses/indices). Device order is part of the board contract.
@@ -61,9 +64,10 @@ A spore is a directory:
 
 - Chunk ids are BLAKE3-256 of chunk contents (`src/chunk.zig`); every chunk
   is verified against its id before use, from any source.
-- Machine state is normalized architectural aarch64 state; raw KVM or
-  Hypervisor.framework structures never appear in the format (the GIC blob
-  is the documented temporary exception).
+- Machine state is normalized architectural aarch64 state. Raw KVM structures
+  never appear in the format; the only documented temporary exception is the
+  explicitly tagged HVF `backend_private` GIC blob, which other backends must
+  reject.
 - Manifests carry a format version; consumers fail closed on versions or
   platform contracts they cannot satisfy.
 - Pre-1.0 versions carry no compatibility promise.

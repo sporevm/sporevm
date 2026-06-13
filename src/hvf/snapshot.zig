@@ -1,13 +1,13 @@
 //! HVF machine-state capture and restore.
 //!
 //! Converts between live HVF vCPU/GIC state and the normalized architectural
-//! `spore.MachineState`. Nothing hypervisor-specific leaks into the manifest:
-//! registers are stored by architectural name, and the GIC blob is the only
-//! opaque field (consumed by the same backend until cross-hypervisor GIC
-//! normalization lands in slice 4).
+//! `spore.MachineState`. Registers are stored by architectural name. HVF's
+//! GIC state remains a tagged backend-private blob until the HVF GICv3 mapping
+//! lands in the cross-hypervisor slice.
 
 const std = @import("std");
 const hvf = @import("hvf.zig");
+const gicv3 = @import("../gicv3.zig");
 const spore = @import("../spore.zig");
 
 /// EL1 context registers captured into the spore, by architectural name.
@@ -112,13 +112,20 @@ pub fn captureMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle) !spore
     }
     state.icc_regs = icc;
 
-    state.gic_state_b64 = try captureGic(allocator);
+    state.gic = .{
+        .kind = .backend_private,
+        .backend_private = .{
+            .backend = .hvf,
+            .format = gicv3.hvf_backend_private_format,
+            .data_b64 = try captureGic(allocator),
+        },
+    };
     return state;
 }
 
 pub fn applyMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle, state: spore.MachineState) !void {
     // GIC state first: must be applied before the vCPU runs.
-    try applyGic(allocator, state.gic_state_b64);
+    try applyGic(allocator, state.gic);
 
     for (0..31) |i| {
         try hvf.check(hvf.hv_vcpu_set_reg(vcpu, @enumFromInt(@as(u32, @intCast(i))), state.gprs[i]), "set gpr");
@@ -175,11 +182,17 @@ fn captureGic(allocator: std.mem.Allocator) ![]const u8 {
     return out;
 }
 
-fn applyGic(allocator: std.mem.Allocator, b64: []const u8) !void {
+fn applyGic(allocator: std.mem.Allocator, state: gicv3.State) !void {
+    try gicv3.validate(state);
+    const private = state.backend_private orelse return error.PlatformMismatch;
+    if (private.backend != .hvf or !std.mem.eql(u8, private.format, gicv3.hvf_backend_private_format)) {
+        return error.PlatformMismatch;
+    }
+
     const dec = std.base64.standard.Decoder;
-    const size = dec.calcSizeForSlice(b64) catch return error.PlatformMismatch;
+    const size = dec.calcSizeForSlice(private.data_b64) catch return error.PlatformMismatch;
     const raw = try allocator.alloc(u8, size);
     defer allocator.free(raw);
-    dec.decode(raw, b64) catch return error.PlatformMismatch;
+    dec.decode(raw, private.data_b64) catch return error.PlatformMismatch;
     try hvf.check(hvf.hv_gic_set_state(raw.ptr, raw.len), "hv_gic_set_state");
 }

@@ -13,6 +13,7 @@
 const std = @import("std");
 const chunklib = @import("chunk.zig");
 const generation = @import("generation.zig");
+const gicv3 = @import("gicv3.zig");
 
 pub const format_version: u32 = 0;
 pub const chunk_size: usize = 2 * 1024 * 1024;
@@ -79,9 +80,10 @@ pub const MachineState = struct {
     /// GIC CPU-interface (ICC) registers, by architectural name.
     icc_regs: []SysRegEntry,
     vtimer: VtimerState,
-    /// Interrupt controller state blob (opaque to the manifest, produced
-    /// and consumed by the hypervisor backend), base64.
-    gic_state_b64: []const u8,
+    /// Interrupt controller state. Portable producers use architectural
+    /// GICv3 offsets; same-backend temporary producers must tag their private
+    /// blob so other backends fail closed.
+    gic: gicv3.State,
 };
 
 pub const MemoryManifest = struct {
@@ -223,10 +225,18 @@ pub fn loadManifest(allocator: std.mem.Allocator, dir: []const u8) Error!std.jso
     const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
     const bytes = try readFileAll(allocator, path, 64 * 1024 * 1024);
     defer allocator.free(bytes);
-    return std.json.parseFromSlice(Manifest, allocator, bytes, .{
+    const parsed = std.json.parseFromSlice(Manifest, allocator, bytes, .{
         // The byte buffer is freed before the parse result is used.
         .allocate = .alloc_always,
-    }) catch error.BadManifest;
+    }) catch return error.BadManifest;
+    errdefer parsed.deinit();
+    validateManifest(parsed.value) catch return error.BadManifest;
+    return parsed;
+}
+
+fn validateManifest(manifest: Manifest) Error!void {
+    if (manifest.version != format_version) return error.BadManifest;
+    gicv3.validate(manifest.machine.gic) catch return error.BadManifest;
 }
 
 // --- tests ------------------------------------------------------------------
@@ -367,7 +377,14 @@ test "manifest json round-trip" {
             .sys_regs = &sys_regs,
             .icc_regs = &.{},
             .vtimer = .{ .cntvct = 123, .cntv_ctl = 1, .cntv_cval = 456 },
-            .gic_state_b64 = "AAAA",
+            .gic = .{
+                .kind = .gicv3,
+                .gicv3 = .{
+                    .dist_regs = &.{.{ .offset = gicv3.distRouterOffset(32), .width_bits = 64, .value = 0 }},
+                    .redist_regs = &.{.{ .offset = 0x10080, .width_bits = 32, .value = 0 }},
+                    .line_levels = &.{.{ .intid = 16, .asserted = false }},
+                },
+            },
         },
         .devices = &devices,
         .generation = .{
@@ -384,6 +401,54 @@ test "manifest json round-trip" {
     try std.testing.expectEqual(@as(u64, 0x8000_0000), parsed.value.platform.ram_base);
     try std.testing.expectEqual(@as(u64, 123), parsed.value.machine.vtimer.cntvct);
     try std.testing.expectEqualStrings("sctlr_el1", parsed.value.machine.sys_regs[0].name);
+    try std.testing.expectEqual(gicv3.StateKind.gicv3, parsed.value.machine.gic.kind);
+    try std.testing.expectEqual(@as(u32, gicv3.distRouterOffset(32)), parsed.value.machine.gic.gicv3.?.dist_regs[0].offset);
     try std.testing.expectEqual(@as(u16, 64), parsed.value.devices[0].queues[0].size);
     try std.testing.expectEqual(@as(u64, 7), parsed.value.generation.generation);
+}
+
+test "backend-private GIC state json round-trip" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const manifest = Manifest{
+        .platform = .{
+            .device_model_version = 4,
+            .ram_base = 0x8000_0000,
+            .ram_size = 1 << 29,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0801_0000,
+        },
+        .machine = .{
+            .gprs = [_]u64{0} ** 31,
+            .pc = 0,
+            .cpsr = 0,
+            .fpcr = 0,
+            .fpsr = 0,
+            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .sys_regs = &.{},
+            .icc_regs = &.{},
+            .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+            .gic = .{
+                .kind = .backend_private,
+                .backend_private = .{
+                    .backend = .hvf,
+                    .format = gicv3.hvf_backend_private_format,
+                    .data_b64 = "AAAA",
+                },
+            },
+        },
+        .devices = &.{},
+        .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
+        .memory = .{ .chunk_size = chunk_size, .chunks = &.{} },
+    };
+    try saveManifest(arena, dir, manifest);
+    const parsed = try loadManifest(arena, dir);
+    defer parsed.deinit();
+    try std.testing.expectEqual(gicv3.StateKind.backend_private, parsed.value.machine.gic.kind);
+    try std.testing.expectEqual(gicv3.BackendKind.hvf, parsed.value.machine.gic.backend_private.?.backend);
+    try std.testing.expectEqualStrings(gicv3.hvf_backend_private_format, parsed.value.machine.gic.backend_private.?.format);
 }

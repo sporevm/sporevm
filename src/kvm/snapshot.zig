@@ -1,16 +1,15 @@
 //! KVM machine-state capture and restore.
 //!
-//! Converts live KVM state into SporeVM's normalized manifest shape. The GIC
-//! state remains backend-private for this slice: a small JSON payload is
-//! base64-encoded into `machine.gic_state_b64` and consumed only by KVM
-//! same-host restore. Cross-hypervisor GIC normalization is Slice 4 work.
+//! Converts live KVM state into SporeVM's normalized manifest shape. KVM's
+//! userspace VGICv3 ioctls are mapped to the portable architectural GICv3
+//! distributor/redistributor offsets stored in the manifest.
 
 const std = @import("std");
 const kvm = @import("kvm.zig");
 const board = @import("../board.zig");
+const gicv3 = @import("../gicv3.zig");
 const spore = @import("../spore.zig");
 
-const gic_magic = "sporevm-kvm-vgic-v3-v0";
 const mpidr_affinity_vcpu0: u64 = 0;
 
 const SavedReg = struct {
@@ -63,18 +62,6 @@ const saved_icc_regs = [_]IccReg{
     .{ .name = "igrpen1_el1", .instr = kvm.sysRegInstr(3, 0, 12, 12, 7) },
 };
 
-const GicReg = struct {
-    group: u32,
-    attr: u64,
-    value: u64,
-    bits: u8,
-};
-
-const GicState = struct {
-    magic: []const u8,
-    regs: []GicReg,
-};
-
 pub fn hostCounter() u64 {
     return asm volatile ("mrs %[ret], cntvct_el0"
         : [ret] "=r" (-> u64),
@@ -120,12 +107,13 @@ pub fn captureMachine(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpu_fd:
         }
     }
     state.icc_regs = try icc_list.toOwnedSlice(allocator);
-    state.gic_state_b64 = try captureGic(allocator, gic_fd);
+    state.gic = .{ .kind = .gicv3, .gicv3 = try captureGic(allocator, gic_fd) };
     return state;
 }
 
 pub fn applyMachine(allocator: std.mem.Allocator, vm_fd: std.c.fd_t, gic_fd: std.c.fd_t, vcpu_fd: std.c.fd_t, state: spore.MachineState) !void {
-    try applyGic(allocator, gic_fd, state.gic_state_b64);
+    _ = allocator;
+    try applyGic(gic_fd, state.gic);
 
     for (0..31) |i| {
         try kvm.setOneRegU64(vcpu_fd, kvm.gprReg(@intCast(i)), state.gprs[i]);
@@ -179,44 +167,38 @@ fn findIccReg(name: []const u8) ?IccReg {
     return null;
 }
 
-fn captureGic(allocator: std.mem.Allocator, gic_fd: std.c.fd_t) ![]const u8 {
-    var regs: std.ArrayList(GicReg) = .empty;
-    defer regs.deinit(allocator);
-    try appendDistRegs(allocator, &regs, gic_fd);
-    try appendRedistRegs(allocator, &regs, gic_fd);
-    try appendLevelRegs(allocator, &regs, gic_fd);
+fn captureGic(allocator: std.mem.Allocator, gic_fd: std.c.fd_t) !gicv3.GicV3State {
+    var dist_regs: std.ArrayList(gicv3.MmioReg) = .empty;
+    defer dist_regs.deinit(allocator);
+    var redist_regs: std.ArrayList(gicv3.MmioReg) = .empty;
+    defer redist_regs.deinit(allocator);
+    var line_levels: std.ArrayList(gicv3.LineLevel) = .empty;
+    defer line_levels.deinit(allocator);
 
-    const payload = GicState{ .magic = gic_magic, .regs = regs.items };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    const enc = std.base64.standard.Encoder;
-    const out = try allocator.alloc(u8, enc.calcSize(json.len));
-    _ = enc.encode(out, json);
-    return out;
+    try appendDistRegs(allocator, &dist_regs, gic_fd);
+    try appendRedistRegs(allocator, &redist_regs, gic_fd);
+    try appendLevelRegs(allocator, &line_levels, gic_fd);
+
+    const state = gicv3.GicV3State{
+        .dist_regs = try dist_regs.toOwnedSlice(allocator),
+        .redist_regs = try redist_regs.toOwnedSlice(allocator),
+        .line_levels = try line_levels.toOwnedSlice(allocator),
+    };
+    try gicv3.validateGicV3(state);
+    return state;
 }
 
-fn applyGic(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, b64: []const u8) !void {
-    const dec = std.base64.standard.Decoder;
-    const size = dec.calcSizeForSlice(b64) catch return error.PlatformMismatch;
-    const raw = try allocator.alloc(u8, size);
-    defer allocator.free(raw);
-    dec.decode(raw, b64) catch return error.PlatformMismatch;
+fn applyGic(gic_fd: std.c.fd_t, state: gicv3.State) !void {
+    try gicv3.validate(state);
+    const g = state.gicv3 orelse return error.PlatformMismatch;
 
-    const parsed = std.json.parseFromSlice(GicState, allocator, raw, .{ .allocate = .alloc_always }) catch return error.PlatformMismatch;
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.magic, gic_magic)) return error.PlatformMismatch;
-
-    for (parsed.value.regs) |reg| {
-        switch (reg.bits) {
-            32 => try kvm.setDeviceAttrU32(gic_fd, reg.group, reg.attr, @truncate(reg.value), "set vgic reg"),
-            64 => try kvm.setDeviceAttrU64(gic_fd, reg.group, reg.attr, reg.value, "set vgic reg"),
-            else => return error.PlatformMismatch,
-        }
-    }
+    for (g.dist_regs) |reg| try setDistReg(gic_fd, reg);
+    for (g.redist_regs) |reg| try setRedistReg(gic_fd, reg);
+    for (g.line_levels) |line| try kvm.setDeviceAttrU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO, levelAttr(line.intid), @intFromBool(line.asserted), "set vgic line level");
 }
 
-fn appendDistRegs(allocator: std.mem.Allocator, regs: *std.ArrayList(GicReg), gic_fd: std.c.fd_t) !void {
-    const one_word_offsets = [_]u64{
+fn appendDistRegs(allocator: std.mem.Allocator, regs: *std.ArrayList(gicv3.MmioReg), gic_fd: std.c.fd_t) !void {
+    const one_word_offsets = [_]u32{
         0x000, // GICD_CTLR
         0x084, // GICD_IGROUPR1
         0x104, // GICD_ISENABLER1
@@ -224,22 +206,22 @@ fn appendDistRegs(allocator: std.mem.Allocator, regs: *std.ArrayList(GicReg), gi
         0x304, // GICD_ISACTIVER1
         0xd04, // GICD_IGRPMODR1
     };
-    for (one_word_offsets) |offset| try appendReg32(allocator, regs, gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_DIST_REGS, distAttr(offset));
+    for (one_word_offsets) |offset| try appendDistReg32(allocator, regs, gic_fd, offset);
 
-    var off: u64 = 0x420; // GICD_IPRIORITYR for INTIDs 32..63.
-    while (off < 0x440) : (off += 4) try appendReg32(allocator, regs, gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_DIST_REGS, distAttr(off));
+    var off: u32 = 0x420; // GICD_IPRIORITYR for INTIDs 32..63.
+    while (off < 0x440) : (off += 4) try appendDistReg32(allocator, regs, gic_fd, off);
 
     off = 0xc08; // GICD_ICFGR for INTIDs 32..63.
-    while (off < 0xc10) : (off += 4) try appendReg32(allocator, regs, gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_DIST_REGS, distAttr(off));
+    while (off < 0xc10) : (off += 4) try appendDistReg32(allocator, regs, gic_fd, off);
 
-    var intid: u64 = 32;
+    var intid: u32 = 32;
     while (intid <= board.generationIntid()) : (intid += 1) {
-        try appendReg64(allocator, regs, gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_DIST_REGS, distRouterAttr(intid));
+        try appendDistReg64(allocator, regs, gic_fd, gicv3.distRouterOffset(intid));
     }
 }
 
-fn appendRedistRegs(allocator: std.mem.Allocator, regs: *std.ArrayList(GicReg), gic_fd: std.c.fd_t) !void {
-    const one_word_offsets = [_]u64{
+fn appendRedistRegs(allocator: std.mem.Allocator, regs: *std.ArrayList(gicv3.MmioReg), gic_fd: std.c.fd_t) !void {
+    const one_word_offsets = [_]u32{
         0x0000, // GICR_CTLR
         0x0014, // GICR_WAKER
         0x10080, // GICR_IGROUPR0
@@ -248,44 +230,64 @@ fn appendRedistRegs(allocator: std.mem.Allocator, regs: *std.ArrayList(GicReg), 
         0x10300, // GICR_ISACTIVER0
         0x10d00, // GICR_IGRPMODR0
     };
-    for (one_word_offsets) |offset| try appendReg32(allocator, regs, gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, redistAttr(offset));
+    for (one_word_offsets) |offset| try appendRedistReg32(allocator, regs, gic_fd, offset);
 
-    var off: u64 = 0x10400; // GICR_IPRIORITYR for SGIs/PPIs.
-    while (off < 0x10420) : (off += 4) try appendReg32(allocator, regs, gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, redistAttr(off));
+    var off: u32 = 0x10400; // GICR_IPRIORITYR for SGIs/PPIs.
+    while (off < 0x10420) : (off += 4) try appendRedistReg32(allocator, regs, gic_fd, off);
 
     off = 0x10c00; // GICR_ICFGR for SGIs/PPIs.
-    while (off < 0x10c08) : (off += 4) try appendReg32(allocator, regs, gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, redistAttr(off));
+    while (off < 0x10c08) : (off += 4) try appendRedistReg32(allocator, regs, gic_fd, off);
 }
 
-fn appendLevelRegs(allocator: std.mem.Allocator, regs: *std.ArrayList(GicReg), gic_fd: std.c.fd_t) !void {
+fn appendLevelRegs(allocator: std.mem.Allocator, levels: *std.ArrayList(gicv3.LineLevel), gic_fd: std.c.fd_t) !void {
     // KVM exposes line-level state for PPIs and SPIs, not SGIs.
-    var intid: u64 = 16;
+    var intid: u32 = 16;
     while (intid <= board.generationIntid()) : (intid += 1) {
-        try appendReg32(allocator, regs, gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO, levelAttr(intid));
+        if (try kvm.getDeviceAttrMaybeU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO, levelAttr(intid), "get vgic line level")) |value| {
+            try levels.append(allocator, .{ .intid = intid, .asserted = value != 0 });
+        }
     }
 }
 
-fn appendReg32(allocator: std.mem.Allocator, regs: *std.ArrayList(GicReg), gic_fd: std.c.fd_t, group: u32, attr: u64) !void {
-    if (try kvm.getDeviceAttrMaybeU32(gic_fd, group, attr, "get vgic reg")) |value| {
-        try regs.append(allocator, .{ .group = group, .attr = attr, .value = value, .bits = 32 });
+fn appendDistReg32(allocator: std.mem.Allocator, regs: *std.ArrayList(gicv3.MmioReg), gic_fd: std.c.fd_t, offset: u32) !void {
+    if (try kvm.getDeviceAttrMaybeU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_DIST_REGS, distAttr(offset), "get vgic dist reg")) |value| {
+        try regs.append(allocator, .{ .offset = offset, .width_bits = 32, .value = value });
     }
 }
 
-fn appendReg64(allocator: std.mem.Allocator, regs: *std.ArrayList(GicReg), gic_fd: std.c.fd_t, group: u32, attr: u64) !void {
-    if (try kvm.getDeviceAttrMaybeU64(gic_fd, group, attr, "get vgic reg")) |value| {
-        try regs.append(allocator, .{ .group = group, .attr = attr, .value = value, .bits = 64 });
+fn appendDistReg64(allocator: std.mem.Allocator, regs: *std.ArrayList(gicv3.MmioReg), gic_fd: std.c.fd_t, offset: u32) !void {
+    if (try kvm.getDeviceAttrMaybeU64(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_DIST_REGS, distAttr(offset), "get vgic dist reg")) |value| {
+        try regs.append(allocator, .{ .offset = offset, .width_bits = 64, .value = value });
     }
 }
 
-fn distAttr(offset: u64) u64 {
+fn appendRedistReg32(allocator: std.mem.Allocator, regs: *std.ArrayList(gicv3.MmioReg), gic_fd: std.c.fd_t, offset: u32) !void {
+    if (try kvm.getDeviceAttrMaybeU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, redistAttr(offset), "get vgic redist reg")) |value| {
+        try regs.append(allocator, .{ .offset = offset, .width_bits = 32, .value = value });
+    }
+}
+
+fn setDistReg(gic_fd: std.c.fd_t, reg: gicv3.MmioReg) !void {
+    switch (reg.width_bits) {
+        32 => try kvm.setDeviceAttrU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_DIST_REGS, distAttr(reg.offset), @truncate(reg.value), "set vgic dist reg"),
+        64 => try kvm.setDeviceAttrU64(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_DIST_REGS, distAttr(reg.offset), reg.value, "set vgic dist reg"),
+        else => return error.PlatformMismatch,
+    }
+}
+
+fn setRedistReg(gic_fd: std.c.fd_t, reg: gicv3.MmioReg) !void {
+    switch (reg.width_bits) {
+        32 => try kvm.setDeviceAttrU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, redistAttr(reg.offset), @truncate(reg.value), "set vgic redist reg"),
+        64 => try kvm.setDeviceAttrU64(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, redistAttr(reg.offset), reg.value, "set vgic redist reg"),
+        else => return error.PlatformMismatch,
+    }
+}
+
+fn distAttr(offset: u32) u64 {
     return offset & 0xffff_ffff;
 }
 
-fn distRouterAttr(intid: u64) u64 {
-    return distAttr(0x6000 + intid * 8);
-}
-
-fn redistAttr(offset: u64) u64 {
+fn redistAttr(offset: u32) u64 {
     return (mpidr_affinity_vcpu0 << 32) | (offset & 0xffff_ffff);
 }
 
@@ -293,7 +295,7 @@ fn cpuSysregAttr(instr: u64) u64 {
     return (mpidr_affinity_vcpu0 << 32) | (instr & 0xffff);
 }
 
-fn levelAttr(intid: u64) u64 {
+fn levelAttr(intid: u32) u64 {
     return (mpidr_affinity_vcpu0 << 32) |
         (kvm.VGIC_LEVEL_INFO_LINE_LEVEL << kvm.KVM_DEV_ARM_VGIC_LINE_LEVEL_INFO_SHIFT) |
         intid;
@@ -301,8 +303,8 @@ fn levelAttr(intid: u64) u64 {
 
 test "VGIC attr encodings for vCPU0" {
     try std.testing.expectEqual(@as(u64, 0x84), distAttr(0x84));
-    try std.testing.expectEqual(@as(u64, 0x6100), distRouterAttr(32));
-    try std.testing.expectEqual(@as(u64, 0x61c0), distRouterAttr(56));
+    try std.testing.expectEqual(@as(u64, 0x6100), distAttr(gicv3.distRouterOffset(32)));
+    try std.testing.expectEqual(@as(u64, 0x61c0), distAttr(gicv3.distRouterOffset(56)));
     try std.testing.expectEqual(@as(u64, 0x10080), redistAttr(0x10080));
     try std.testing.expectEqual(@as(u64, 0xc230), cpuSysregAttr(kvm.sysRegInstr(3, 0, 4, 6, 0)));
 }
