@@ -31,10 +31,11 @@ pub const Config = struct {
     disk_fd: ?std.c.fd_t = null,
     /// Resume from a spore directory instead of booting the kernel.
     resume_dir: ?[]const u8 = null,
-    /// Trust local same-host RAM backing metadata and map it MAP_PRIVATE.
-    /// Imported or otherwise untrusted spores must leave this false so RAM is
-    /// materialized through verified chunks.
-    trust_ram_backing: bool = false,
+    /// Trusted same-host RAM backing fd supplied by the caller or future
+    /// monitor. The fd must refer to the manifest's optional RAM backing and
+    /// is mapped MAP_PRIVATE; imported or untrusted spores must leave this
+    /// null so RAM is materialized through verified chunks.
+    ram_backing_fd: ?std.c.fd_t = null,
     /// Take a spore snapshot after this many milliseconds of run time and
     /// stop. Requires snapshot_dir.
     snapshot_after_ms: ?u64 = null,
@@ -229,19 +230,12 @@ fn monotonicMs() !u64 {
 }
 
 fn mapRam(allocator: std.mem.Allocator, config: Config, manifest: ?spore.Manifest) !RamMapping {
-    if (config.trust_ram_backing) {
-        if (manifest) |m| {
-            if (m.memory.backing) |backing| {
-                const backing_path = spore.memoryBackingPath(allocator, config.resume_dir.?, backing) catch |err| {
-                    std.log.warn("RAM backing path unavailable ({}); falling back to eager chunk load", .{err});
-                    return mapAnonymousRam(config.ram_size);
-                };
-                return mapFileBackedRam(backing_path, config.ram_size) catch |err| {
-                    std.log.warn("RAM backing unavailable at {s} ({}); falling back to eager chunk load", .{ backing_path, err });
-                    return mapAnonymousRam(config.ram_size);
-                };
-            }
-        }
+    _ = allocator;
+    if (config.ram_backing_fd) |fd| {
+        const m = manifest orelse return error.BadManifest;
+        const backing = m.memory.backing orelse return error.BadManifest;
+        try spore.validateMemoryBacking(backing, config.ram_size);
+        return mapFileBackedRamFd(fd, config.ram_size);
     }
     return mapAnonymousRam(config.ram_size);
 }
@@ -258,11 +252,7 @@ fn mapAnonymousRam(size: u64) !RamMapping {
     return .{ .bytes = bytes, .file_backed = false };
 }
 
-fn mapFileBackedRam(path: [:0]const u8, size: u64) !RamMapping {
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
-    if (fd < 0) return error.IoFailed;
-    defer closeFd(fd);
-
+fn mapFileBackedRamFd(fd: std.c.fd_t, size: u64) !RamMapping {
     const actual_size = try fileSize(fd);
     if (actual_size != size) return error.BadManifest;
 
@@ -274,7 +264,7 @@ fn mapFileBackedRam(path: [:0]const u8, size: u64) !RamMapping {
         fd,
         0,
     );
-    std.log.info("mapped RAM from file backing: path={s} size={d} mode=MAP_PRIVATE", .{ path, size });
+    std.log.info("mapped RAM from file backing fd: size={d} mode=MAP_PRIVATE", .{size});
     return .{ .bytes = bytes, .file_backed = true };
 }
 

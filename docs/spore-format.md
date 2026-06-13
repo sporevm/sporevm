@@ -68,9 +68,12 @@ A spore is a directory:
   "linux-map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks
   remain the portable verified source of truth; unsupported backends,
   imported/cold spores, and normal untrusted restore must ignore `backing` and
-  materialize from chunks instead. KVM same-host restore may opt into mapping
-  the file `MAP_PRIVATE` to share clean parent pages across fork children while
-  child writes fault into private CoW pages.
+  materialize from chunks instead. KVM same-host restore consumes backing as a
+  trusted fd supplied by its caller, then maps it `MAP_PRIVATE` to share clean
+  parent pages across fork children while child writes fault into private CoW
+  pages. The current `kvm-boot --trust-ram-backing` harness opens the local
+  `ram.backing` path as an interim adapter; the backend itself no longer
+  resolves manifest paths.
 
 ## Not yet captured in v0
 
@@ -94,10 +97,11 @@ A spore is a directory:
 - Chunk ids are BLAKE3-256 of chunk contents (`src/chunk.zig`); every chunk
   is verified against its id before use, from any source.
 - Local RAM backing files are same-host acceleration hints, not portable trust
-  roots. The current path/symlink form is an interim KVM implementation, not a
+  roots. The current path/symlink form is an interim KVM harness adapter, not a
   sealed-fd security boundary. Consumers that need portable or untrusted restore
-  must use the chunk manifest path, or a later sealed-fd path, rather than
-  trusting a backing file by pathname.
+  must use the chunk manifest path. The planned monitor boundary passes a
+  sealed RAM-backing fd explicitly, rather than trusting a backing file by
+  pathname.
 - Machine state is normalized architectural aarch64 state. Raw KVM structures
   never appear in the format; the only documented temporary exception is the
   explicitly tagged HVF `backend_private` GIC blob, which other backends must

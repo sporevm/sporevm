@@ -72,6 +72,14 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    var ram_backing_fd: ?std.c.fd_t = null;
+    defer {
+        if (ram_backing_fd) |fd| _ = std.c.close(fd);
+    }
+    if (trust_ram_backing) {
+        ram_backing_fd = try openTrustedRamBacking(arena, resume_dir);
+    }
+
     const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], arena, .limited(256 * 1024 * 1024));
     const initrd = if (initrd_path) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, arena, .limited(256 * 1024 * 1024)) else null;
 
@@ -102,9 +110,23 @@ pub fn main(init: std.process.Init) !void {
         .console_sink = consoleSink,
         .disk_fd = disk_fd,
         .resume_dir = resume_dir,
-        .trust_ram_backing = trust_ram_backing,
+        .ram_backing_fd = ram_backing_fd,
         .snapshot_after_ms = snapshot_after_ms,
         .snapshot_dir = spore_dir,
     });
     std.debug.print("\nsporevm kvm-boot: guest requested {s}\n", .{@tagName(cause)});
+}
+
+fn openTrustedRamBacking(allocator: std.mem.Allocator, resume_dir: ?[]const u8) !?std.c.fd_t {
+    const dir = resume_dir orelse return null;
+    const parsed = try sporevm.spore.loadManifest(allocator, dir);
+    defer parsed.deinit();
+    const backing = parsed.value.memory.backing orelse return null;
+    const path = try sporevm.spore.memoryBackingPath(allocator, dir, backing);
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    if (fd < 0) {
+        std.debug.print("trusted RAM backing unavailable: {s}; falling back to chunks\n", .{path});
+        return null;
+    }
+    return fd;
 }
