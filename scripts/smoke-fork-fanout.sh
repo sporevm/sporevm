@@ -18,6 +18,7 @@ Options:
   --initrd root.cpio        prebuilt fork-aware initrd (default: build one)
   --workdir DIR             work directory (default: mktemp)
   --count N                 number of children to fork/resume (default: 8)
+  --parallel N              child resumes to run per batch (default: 1)
   --mem-mib N               guest memory size (default: 512)
   --snapshot-after-ms N     capture delay before snapshot (default: 3000)
   --resume-seconds N        seconds to let each child run (default: 6)
@@ -51,6 +52,7 @@ kernel=""
 initrd=""
 workdir=""
 count="8"
+parallel="1"
 mem_mib="512"
 snapshot_after_ms="3000"
 resume_seconds="6"
@@ -84,6 +86,11 @@ while (($#)); do
     --count)
       need_option_value "$1" "${2-}"
       count="${2:-}"
+      shift 2
+      ;;
+    --parallel)
+      need_option_value "$1" "${2-}"
+      parallel="${2:-}"
       shift 2
       ;;
     --mem-mib)
@@ -138,12 +145,13 @@ esac
 [[ -n "${kernel}" ]] || die "--kernel is required"
 [[ -f "${kernel}" ]] || die "kernel not found: ${kernel}"
 
-for numeric_value in "${count}" "${mem_mib}" "${snapshot_after_ms}" "${resume_seconds}"; do
+for numeric_value in "${count}" "${parallel}" "${mem_mib}" "${snapshot_after_ms}" "${resume_seconds}"; do
   case "${numeric_value}" in
     ''|*[!0-9]*) die "numeric options must be decimal integers" ;;
   esac
 done
 (( count > 0 )) || die "--count must be greater than zero"
+(( parallel > 0 )) || die "--parallel must be greater than zero"
 
 if [[ -z "${workdir}" ]]; then
   workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-fork-smoke.XXXXXX")"
@@ -159,6 +167,15 @@ fi
 if [[ -z "${initrd}" ]]; then
   initrd="${workdir}/fork-smoke.cpio"
 fi
+metrics_json="${workdir}/metrics.json"
+
+now_ms() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'
+  else
+    echo "$(( $(date +%s) * 1000 ))"
+  fi
+}
 
 build_all() {
   if [[ "${build}" == "0" ]]; then
@@ -187,12 +204,16 @@ print_tail() {
   echo "--- end tail ---" >&2
 }
 
+RUN_DURATION_MS=0
+
 run_with_deadline() {
   local seconds="$1"
   local log="$2"
   shift 2
 
   : >"${log}"
+  local start_ms
+  start_ms="$(now_ms)"
   "$@" >"${log}" 2>&1 &
   local pid="$!"
   local marker="__sporevm_deadline_${pid}__"
@@ -214,9 +235,59 @@ run_with_deadline() {
   kill "${timer}" >/dev/null 2>&1 || true
   wait "${timer}" >/dev/null 2>&1 || true
 
+  RUN_DURATION_MS=$(( $(now_ms) - start_ms ))
+
   if grep -q "${marker}" "${log}"; then
     return 124
   fi
+  return "${status}"
+}
+
+run_until_log_matches() {
+  local seconds="$1"
+  local pattern="$2"
+  local log="$3"
+  shift 3
+
+  : >"${log}"
+  local start_ms
+  start_ms="$(now_ms)"
+  local deadline_ms=$(( start_ms + seconds * 1000 ))
+  local pid
+  "$@" >"${log}" 2>&1 &
+  pid="$!"
+  local marker="__sporevm_deadline_${pid}__"
+  local status=124
+
+  while true; do
+    if grep -qE "${pattern}" "${log}"; then
+      status=0
+      break
+    fi
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+      wait "${pid}"
+      status="$?"
+      if grep -qE "${pattern}" "${log}"; then
+        status=0
+      fi
+      break
+    fi
+    if (( $(now_ms) >= deadline_ms )); then
+      printf '\n%s\n' "${marker}" >>"${log}"
+      status=124
+      break
+    fi
+    sleep 0.1
+  done
+
+  if kill -0 "${pid}" >/dev/null 2>&1; then
+    kill -TERM "${pid}" >/dev/null 2>&1 || true
+    sleep 0.2
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+    wait "${pid}" >/dev/null 2>&1 || true
+  fi
+
+  RUN_DURATION_MS=$(( $(now_ms) - start_ms ))
   return "${status}"
 }
 
@@ -235,6 +306,50 @@ assert_log_contains() {
   fi
 }
 
+json_string() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$1"
+  else
+    printf '"%s"' "$1"
+  fi
+}
+
+write_metrics() {
+  local children_wall_ms="$1"
+  local child_resume_sum_ms="$2"
+  local child_resume_min_ms="$3"
+  local child_resume_max_ms="$4"
+  local total_ms="$5"
+
+  {
+    echo "{"
+    echo "  \"backend\": $(json_string "${backend}"),"
+    echo "  \"count\": ${count},"
+    echo "  \"parallel\": ${parallel},"
+    echo "  \"mem_mib\": ${mem_mib},"
+    echo "  \"snapshot_after_ms\": ${snapshot_after_ms},"
+    echo "  \"resume_deadline_seconds\": ${resume_seconds},"
+    echo "  \"workdir\": $(json_string "${workdir}"),"
+    echo "  \"capture_ms\": ${capture_ms},"
+    echo "  \"fork_ms\": ${fork_ms},"
+    echo "  \"children_resume_wall_ms\": ${children_wall_ms},"
+    echo "  \"children_resume_sum_ms\": ${child_resume_sum_ms},"
+    echo "  \"child_resume_min_ms\": ${child_resume_min_ms},"
+    echo "  \"child_resume_max_ms\": ${child_resume_max_ms},"
+    echo "  \"total_smoke_ms\": ${total_ms},"
+    echo "  \"children\": ["
+    for ((i = 0; i < count; i++)); do
+      local comma=","
+      if (( i == count - 1 )); then
+        comma=""
+      fi
+      echo "    {\"index\": ${i}, \"resume_ms\": ${child_resume_ms[i]}, \"log\": $(json_string "${child_logs[i]}")}${comma}"
+    done
+    echo "  ]"
+    echo "}"
+  } >"${metrics_json}"
+}
+
 build_all
 
 [[ -x "${boot_bin}" ]] || die "boot harness not executable: ${boot_bin}"
@@ -249,6 +364,7 @@ parent_spore="${workdir}/parent-spore"
 children_dir="${workdir}/children"
 safe_remove "${parent_spore}"
 safe_remove "${children_dir}"
+smoke_start_ms="$(now_ms)"
 
 capture_log="${workdir}/capture.log"
 capture_deadline=$(( (snapshot_after_ms + 999) / 1000 + 30 ))
@@ -261,33 +377,80 @@ set +e
 run_with_deadline "${capture_deadline}" "${capture_log}" "${capture_cmd[@]}"
 capture_status="$?"
 set -e
+capture_ms="${RUN_DURATION_MS}"
 if [[ "${capture_status}" != "0" ]]; then
   print_tail "${capture_log}"
   die "capture failed with status ${capture_status}"
 fi
 [[ -f "${parent_spore}/manifest.json" ]] || die "capture did not write ${parent_spore}/manifest.json"
 
+fork_start_ms="$(now_ms)"
 "${spore_bin}" fork "${parent_spore}" --count "${count}" --out "${children_dir}" >"${workdir}/fork.json"
+fork_ms=$(( $(now_ms) - fork_start_ms ))
 
 vm_ids=()
 hostnames=()
 mac_addresses=()
 entropy_seeds=()
 resume_times=()
+child_resume_ms=()
+child_logs=()
+result_dir="${workdir}/child-results"
+safe_remove "${result_dir}"
+mkdir -p "${result_dir}"
 
-for ((i = 0; i < count; i++)); do
-  child_dir="${children_dir}/$(printf '%06d' "${i}")"
+run_child_resume() {
+  local i="$1"
+  local child_dir="${children_dir}/$(printf '%06d' "${i}")"
   [[ -f "${child_dir}/manifest.json" ]] || die "missing child manifest: ${child_dir}/manifest.json"
-  log="${workdir}/child-$(printf '%06d' "${i}").log"
-  cmd=("${boot_bin}" "${kernel}" --mem-mib "${mem_mib}" --resume "${child_dir}")
+  local log="${workdir}/child-$(printf '%06d' "${i}").log"
+  local result="${result_dir}/$(printf '%06d' "${i}").result"
+  local complete_pattern="sporevm-fork-smoke acked_generation=.*irq_status_after_ack=0"
+  local cmd=("${boot_bin}" "${kernel}" --mem-mib "${mem_mib}" --resume "${child_dir}")
 
   set +e
-  run_with_deadline "${resume_seconds}" "${log}" "${cmd[@]}"
-  status="$?"
+  run_until_log_matches "${resume_seconds}" "${complete_pattern}" "${log}" "${cmd[@]}"
+  local status="$?"
+  local duration_ms="${RUN_DURATION_MS}"
   set -e
-  if [[ "${status}" != "0" && "${status}" != "124" ]]; then
+
+  {
+    echo "status=${status}"
+    echo "resume_ms=${duration_ms}"
+    echo "log=${log}"
+  } >"${result}"
+}
+
+wait_batch() {
+  for pid in "${batch_pids[@]}"; do
+    wait "${pid}"
+  done
+  batch_pids=()
+}
+
+children_start_ms="$(now_ms)"
+batch_pids=()
+for ((i = 0; i < count; i++)); do
+  run_child_resume "${i}" &
+  batch_pids+=("$!")
+  if (( ${#batch_pids[@]} >= parallel )); then
+    wait_batch
+  fi
+done
+if (( ${#batch_pids[@]} > 0 )); then
+  wait_batch
+fi
+children_resume_wall_ms=$(( $(now_ms) - children_start_ms ))
+
+for ((i = 0; i < count; i++)); do
+  result="${result_dir}/$(printf '%06d' "${i}").result"
+  [[ -f "${result}" ]] || die "missing child result: ${result}"
+  status="$(awk -F= '$1 == "status" { print $2 }' "${result}")"
+  resume_ms="$(awk -F= '$1 == "resume_ms" { print $2 }' "${result}")"
+  log="$(awk -F= '$1 == "log" { print substr($0, index($0, "=") + 1) }' "${result}")"
+  if [[ "${status}" != "0" ]]; then
     print_tail "${log}"
-    die "child ${i} resume failed with status ${status}"
+    die "child ${i} did not finish fork fixup before deadline; status ${status}"
   fi
 
   assert_log_contains "sporevm-fork-smoke generation=.*fork_index=${i}.*fork_count=${count}.*irq_status=1" "${log}"
@@ -301,7 +464,9 @@ for ((i = 0; i < count; i++)); do
   mac_addresses+=("$(field_value mac_address "${log}")")
   entropy_seeds+=("$(field_value entropy_seed "${log}")")
   resume_times+=("$(field_value resume_time_unix_ns "${log}")")
-  echo "child ok: index=${i} vm_id=${vm_ids[-1]} hostname=${hostnames[-1]} log=${log}"
+  child_resume_ms[i]="${resume_ms}"
+  child_logs[i]="${log}"
+  echo "child ok: index=${i} vm_id=${vm_ids[-1]} hostname=${hostnames[-1]} resume_ms=${resume_ms} log=${log}"
 done
 
 unique_count() {
@@ -313,4 +478,20 @@ unique_count() {
 [[ "$(unique_count "${mac_addresses[@]}")" == "${count}" ]] || die "mac_address values were not unique"
 [[ "$(unique_count "${entropy_seeds[@]}")" == "${count}" ]] || die "entropy_seed values were not unique"
 
-echo "fork fan-out ok: backend=${backend} count=${count} workdir=${workdir}"
+child_resume_sum_ms=0
+child_resume_min_ms="${child_resume_ms[0]}"
+child_resume_max_ms="${child_resume_ms[0]}"
+for ((i = 0; i < count; i++)); do
+  child_resume_sum_ms=$(( child_resume_sum_ms + child_resume_ms[i] ))
+  if (( child_resume_ms[i] < child_resume_min_ms )); then
+    child_resume_min_ms="${child_resume_ms[i]}"
+  fi
+  if (( child_resume_ms[i] > child_resume_max_ms )); then
+    child_resume_max_ms="${child_resume_ms[i]}"
+  fi
+done
+total_smoke_ms=$(( $(now_ms) - smoke_start_ms ))
+write_metrics "${children_resume_wall_ms}" "${child_resume_sum_ms}" "${child_resume_min_ms}" "${child_resume_max_ms}" "${total_smoke_ms}"
+
+echo "fork fan-out metrics: capture_ms=${capture_ms} fork_ms=${fork_ms} children_resume_wall_ms=${children_resume_wall_ms} child_resume_min_ms=${child_resume_min_ms} child_resume_max_ms=${child_resume_max_ms} total_smoke_ms=${total_smoke_ms} metrics=${metrics_json}"
+echo "fork fan-out ok: backend=${backend} count=${count} parallel=${parallel} workdir=${workdir}"

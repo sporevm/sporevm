@@ -286,7 +286,8 @@ HVF locally each resume the ticker through `sporevm-initrd-tick 7` via
 compatibility checks are shared, and `spore host-info` / `spore inspect` expose
 the host and spore contract fields needed to pick compatible smoke hosts.
 
-Slice 4 is in progress. `spore fork <spore-dir> --count N --out DIR` writes
+Slice 4 is complete for the foundation correctness and measurement target.
+`spore fork <spore-dir> --count N --out DIR` writes
 child spore manifests named `000000`, `000001`, and so on, sharing the parent's
 chunk store with a `chunks` symlink. Each child gets a unique incremented
 generation, a pending generation-change interrupt, and JSON resume parameters
@@ -297,13 +298,17 @@ fresh entropy seed) into the generation params page at actual resume time. The
 fork-aware smoke initrd polls the generation device, applies/logs hostname,
 machine-id, entropy and clock fixups, then acks the generation interrupt last;
 `scripts/smoke-fork-fanout.sh` exercises parent capture plus same-host child
-fan-out. HVF and KVM now pass `--count 8` same-host fan-out smokes, with KVM
-validated on the `m7g.metal` host using the `cleanroom-kernels` v0.3.0
-`sporevm-arm64-linux-6.1.155-Image` asset. The remaining slice-4 gap is
-recording fork/resume latency and, at most, bounded-parallel correctness. A
-true 100-concurrent 512MiB fork storm with reasonable host RSS belongs after
-the same-host CoW RAM backing lands; otherwise the test mostly proves the host
-has enough RAM for eager restores.
+fan-out. The smoke supports bounded child-resume batches with `--parallel N`
+and writes `metrics.json` with capture latency, `spore fork` latency, child
+resume wall/sum/min/max latency, and total smoke time. HVF and KVM pass
+same-host fan-out smokes; the representative KVM run on the `m7g.metal` host
+used the `cleanroom-kernels` v0.3.0 `sporevm-arm64-linux-6.1.155-Image` asset
+with `--count 32 --parallel 4`, reporting capture_ms=5323, fork_ms=47,
+children_resume_wall_ms=6663, child_resume_min_ms=811,
+child_resume_max_ms=813, and total_smoke_ms=12695. A true 100-concurrent
+512MiB fork storm with reasonable host RSS belongs after the same-host CoW RAM
+backing lands; otherwise the test mostly proves the host has enough RAM for
+eager restores.
 
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
