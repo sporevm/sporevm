@@ -420,7 +420,7 @@ fn zeroSuperblockTimestampFields(file: Io.File, io: Io, superblock_offset: u64) 
     try zeroFileRange(file, io, superblock_offset + 0x30, 4); // s_wtime
     try zeroFileRange(file, io, superblock_offset + 0x40, 4); // s_lastcheck
     try zeroFileRange(file, io, superblock_offset + 0x108, 4); // s_mkfs_time
-    try zeroFileRange(file, io, superblock_offset + 0x240, 8); // s_kbytes_written
+    try zeroFileRange(file, io, superblock_offset + 0x178, 8); // s_kbytes_written
 }
 
 fn zeroFileRange(file: Io.File, io: Io, offset: u64, len: usize) !void {
@@ -462,11 +462,7 @@ fn writeDebugfsPath(writer: *Io.Writer, rel: []const u8) !void {
     try writer.writeByte('/');
     for (rel) |c| {
         switch (c) {
-            0, '\n', '\r' => return error.UnsupportedDebugfsPath,
-            '"', '\\' => {
-                try writer.writeByte('\\');
-                try writer.writeByte(c);
-            },
+            0, '\n', '\r', '"', '\\' => return error.UnsupportedDebugfsPath,
             else => try writer.writeByte(c),
         }
     }
@@ -586,6 +582,15 @@ test "debugfs stderr checker accepts banner and rejects diagnostics" {
     );
 }
 
+test "debugfs path writer rejects paths debugfs cannot address safely" {
+    const allocator = std.testing.allocator;
+    var script: Io.Writer.Allocating = .init(allocator);
+    defer script.deinit();
+
+    try std.testing.expectError(error.UnsupportedDebugfsPath, writeDebugfsPath(&script.writer, "quote\"name"));
+    try std.testing.expectError(error.UnsupportedDebugfsPath, writeDebugfsPath(&script.writer, "back\\slash"));
+}
+
 test "superblock timestamp normalization ignores matching file data" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -609,7 +614,8 @@ test "superblock timestamp normalization ignores matching file data" {
     std.mem.writeInt(u32, primary[0x30..0x34], 2, .little);
     std.mem.writeInt(u32, primary[0x40..0x44], 3, .little);
     std.mem.writeInt(u32, primary[0x108..0x10c], 4, .little);
-    std.mem.writeInt(u64, primary[0x240..0x248], 5, .little);
+    std.mem.writeInt(u64, primary[0x178..0x180], 5, .little);
+    std.mem.writeInt(u64, primary[0x240..0x248], 6, .little);
     try file.writePositionalAll(io, &primary, ext4_superblock_offset);
 
     var data = primary;
@@ -625,6 +631,8 @@ test "superblock timestamp normalization ignores matching file data" {
     try std.testing.expectEqual(data_after.len, try file.readPositionalAll(io, &data_after, 4096));
     try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, primary_after[0x2c..0x30], .little));
     try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, primary_after[0x30..0x34], .little));
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, primary_after[0x178..0x180], .little));
+    try std.testing.expectEqual(@as(u64, 6), std.mem.readInt(u64, primary_after[0x240..0x248], .little));
     try std.testing.expectEqual(@as(u32, 0x11111111), std.mem.readInt(u32, data_after[0x2c..0x30], .little));
     try std.testing.expectEqual(@as(u32, 0x22222222), std.mem.readInt(u32, data_after[0x30..0x34], .little));
 }

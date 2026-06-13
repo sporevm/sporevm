@@ -499,11 +499,13 @@ fn applyTarLayer(
     var long_name: ?[]u8 = null;
     var long_link: ?[]u8 = null;
     var pax: PendingPax = .{};
+    var global_pax: PendingPax = .{};
     var created = CreatedPathMap.init(allocator);
     defer {
         if (long_name) |p| allocator.free(p);
         if (long_link) |p| allocator.free(p);
         pax.clear(allocator);
+        global_pax.clear(allocator);
         deinitCreatedPaths(allocator, &created);
     }
 
@@ -531,9 +533,8 @@ fn applyTarLayer(
             continue;
         }
         if (kind == 'g') {
-            var global_pax: PendingPax = .{};
-            defer global_pax.clear(allocator);
             try readPaxHeader(allocator, reader, size, &global_pax);
+            try validateGlobalPax(global_pax);
             continue;
         }
 
@@ -569,7 +570,7 @@ fn applyTarLayer(
             else => |e| return e,
         };
         defer allocator.free(rel);
-        const entry_ownership = try tarOwnership(&header, pax);
+        const entry_ownership = try tarOwnership(&header, pax, global_pax);
 
         if (try applyWhiteout(allocator, io, root, ownership, &created, rel)) {
             try discardTarPayload(reader, payload_size);
@@ -1049,8 +1050,19 @@ fn validateSymlinkTarget(allocator: std.mem.Allocator, rel: []const u8, raw_link
 fn safeTarPath(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     if (raw.len == 0 or std.mem.startsWith(u8, raw, "/")) return error.UnsafeTarPath;
     if (std.mem.indexOfScalar(u8, raw, 0) != null) return error.UnsafeTarPath;
+    if (hasUnsupportedDebugfsPathByte(raw)) return error.UnsupportedDebugfsPath;
     if (isTarRootPath(raw)) return error.RootTarPath;
     return normalizeRelativePath(allocator, raw);
+}
+
+fn hasUnsupportedDebugfsPathByte(path: []const u8) bool {
+    for (path) |c| {
+        switch (c) {
+            '"', '\\', '\n', '\r' => return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn isTarRootPath(raw: []const u8) bool {
@@ -1176,6 +1188,10 @@ fn readPaxHeader(allocator: std.mem.Allocator, reader: *Io.Reader, size: u64, ou
     }
 }
 
+fn validateGlobalPax(pax: PendingPax) !void {
+    if (pax.path != null or pax.linkpath != null or pax.size != null) return error.UnsupportedGlobalPaxRecord;
+}
+
 fn isPaxXattrKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "SCHILY.xattr.") or
         std.mem.startsWith(u8, key, "LIBARCHIVE.xattr.");
@@ -1212,10 +1228,10 @@ fn tarMode(header: *const [512]u8) !u32 {
     return @intCast(value);
 }
 
-fn tarOwnership(header: *const [512]u8, pax: PendingPax) !Ownership {
+fn tarOwnership(header: *const [512]u8, pax: PendingPax, global_pax: PendingPax) !Ownership {
     return .{
-        .uid = pax.uid orelse try tarId(header[108..116]),
-        .gid = pax.gid orelse try tarId(header[116..124]),
+        .uid = pax.uid orelse global_pax.uid orelse try tarId(header[108..116]),
+        .gid = pax.gid orelse global_pax.gid orelse try tarId(header[116..124]),
     };
 }
 
@@ -1325,6 +1341,8 @@ test "safe tar path rejects traversal and absolute entries" {
     try std.testing.expectError(error.UnsafeTarPath, safeTarPath(allocator, "/etc/passwd"));
     try std.testing.expectError(error.UnsafeTarPath, safeTarPath(allocator, "../escape"));
     try std.testing.expectError(error.UnsafeTarPath, safeTarPath(allocator, "a/../../escape"));
+    try std.testing.expectError(error.UnsupportedDebugfsPath, safeTarPath(allocator, "quote\"name"));
+    try std.testing.expectError(error.UnsupportedDebugfsPath, safeTarPath(allocator, "back\\slash"));
 }
 
 test "layer blob path validates sha256 digest before slicing" {
@@ -1854,6 +1872,43 @@ test "global pax headers are consumed before following entries" {
     const bytes = try tmp.dir.readFileAlloc(std.testing.io, "file", allocator, .limited(8));
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("x", bytes);
+}
+
+test "global pax uid gid defaults apply to following entries" {
+    const allocator = std.testing.allocator;
+    var block = [_]u8{0} ** 2560;
+    const record = "10 uid=12\n10 gid=34\n";
+    makeTarHeader(block[0..512], "global-pax", 'g', record.len);
+    @memcpy(block[512 .. 512 + record.len], record);
+    makeTarHeader(block[1024..1536], "file", '0', 1);
+    block[1536] = 'x';
+    var reader: Io.Reader = .fixed(&block);
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+
+    try applyTarLayer(allocator, std.testing.io, tmp.dir, &reader, &ownership);
+    try std.testing.expectEqual(@as(u32, 12), ownership.get("file").?.uid);
+    try std.testing.expectEqual(@as(u32, 34), ownership.get("file").?.gid);
+}
+
+test "global pax extraction fields fail closed" {
+    const allocator = std.testing.allocator;
+    var block = [_]u8{0} ** 1024;
+    const record = "13 path=file\n";
+    makeTarHeader(block[0..512], "global-pax", 'g', record.len);
+    @memcpy(block[512 .. 512 + record.len], record);
+    var reader: Io.Reader = .fixed(&block);
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+
+    try std.testing.expectError(
+        error.UnsupportedGlobalPaxRecord,
+        applyTarLayer(allocator, std.testing.io, tmp.dir, &reader, &ownership),
+    );
 }
 
 test "pax size overrides ustar file size" {
