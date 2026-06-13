@@ -338,11 +338,18 @@ file_backed_children=100, host_memory_sampled_children=100, host_pss_kib=782723,
 child_resume_min_ms=137, and child_resume_max_ms=195. This is still a harness
 bridge, not the long-running product monitor/control socket. Remaining Slice 5
 work is monitor wiring and cold lazy restore over CAS. The first cold-lazy prep
-step has split eager CAS restore into validated per-chunk helpers and added KVM
+step split eager CAS restore into validated per-chunk helpers and added KVM
 restore phase metrics (`memory_ms`, `state_ms`, `pre_run_ms`) to establish the
-baseline that `userfaultfd` lazy restore must beat. On the `m7g.metal` host, a
-512MiB same-host eager restore reported mode=eager_chunks, chunks=256,
-nonzero_chunks=14, memory_ms=512, and pre_run_ms=513.
+baseline that lazy restore must beat. On the `m7g.metal` host, a 512MiB
+same-host eager restore reported mode=eager_chunks, chunks=256,
+nonzero_chunks=14, memory_ms=512, and pre_run_ms=513. The first KVM lazy cut
+keeps eager restore as the default and adds an explicit `kvm-boot --lazy-ram`
+harness path that registers anonymous guest RAM with `userfaultfd` and
+materializes verified 2MiB CAS chunks on first fault. The same host smoke now
+boots in that mode with mode=lazy_chunks, chunks=256, nonzero_chunks=14,
+memory_ms=0, and pre_run_ms=2; corrupt chunk contents fail closed with
+BadChunk. Fault counts, access traces, readahead, and clean cross-thread error
+propagation remain follow-up work.
 
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
@@ -430,10 +437,10 @@ the harness path opener with a sealed `memfd`/file-backed mapping owned by the
 monitor; on HVF use the closest private remap/file-backed path or fail closed
 until supported. For cold lazy restore, first keep eager behaviour but expose
 validated per-chunk CAS loading plus restore metrics; then map memory empty and
-materialize chunks on fault with userfaultfd on Linux and unmapped-memory exits
-on HVF. Record an access trace on first resume; use it for readahead on later
-resumes. Benchmark resume time-to-first-instruction and time-to-useful-work
-against slice 3's eager restore.
+materialize chunks on fault with an explicit userfaultfd KVM mode on Linux and
+unmapped-memory exits on HVF. Record an access trace on first resume; use it for
+readahead on later resumes. Benchmark resume time-to-first-instruction and
+time-to-useful-work against slice 3's eager restore.
 
 Done when: 100 concurrent same-host forks of one 512MiB spore run distinct
 workloads with aggregate child PSS proportional to the resident parent backing

@@ -22,6 +22,7 @@ Options:
   --snapshot-after-ms N     capture delay before snapshot (default: 3000)
   --resume-seconds N        seconds to let resumed VM tick (default: 5)
   --min-tick N              minimum observed ticker value on resume (default: 1)
+  --kvm-lazy-ram            use kvm-boot --lazy-ram for KVM resume
   --cmdline TEXT            override fresh-boot kernel command line
   --boot-bin PATH           use an already-built boot harness
   --no-build                do not run `zig build <backend>-boot`
@@ -67,6 +68,7 @@ mem_mib="512"
 snapshot_after_ms="3000"
 resume_seconds="5"
 min_tick="1"
+kvm_lazy_ram=0
 cmdline=""
 boot_bin=""
 build=1
@@ -117,6 +119,10 @@ while (($#)); do
       need_option_value "$1" "${2-}"
       min_tick="${2:-}"
       shift 2
+      ;;
+    --kvm-lazy-ram)
+      kvm_lazy_ram=1
+      shift
       ;;
     --cmdline)
       need_option_value "$1" "${2-}"
@@ -211,7 +217,8 @@ metric_value() {
 
 assert_kvm_restore_metrics() {
   local line="$1"
-  [[ "${line}" =~ (^|[[:space:]])mode=eager_chunks([[:space:]]|$) ]] || die "unexpected KVM restore mode in metrics: ${line}"
+  local expected_mode="$2"
+  [[ "${line}" =~ (^|[[:space:]])mode=${expected_mode}([[:space:]]|$) ]] || die "unexpected KVM restore mode in metrics: ${line}"
   for field in chunks memory_ms state_ms pre_run_ms; do
     local value
     value="$(metric_value "${field}" "${line}")"
@@ -291,6 +298,9 @@ resume() {
 
   local log="${spore_dir%/}.resume.${backend}.log"
   local cmd=("${boot_bin}" "${kernel}" --mem-mib "${mem_mib}" --resume "${spore_dir}")
+  if [[ "${backend}" == "kvm" && "${kvm_lazy_ram}" == "1" ]]; then
+    cmd+=(--lazy-ram)
+  fi
 
   set +e
   local resume_start_ms
@@ -311,7 +321,11 @@ resume() {
       print_tail "${log}"
       die "resume log did not contain kvm restore metrics"
     fi
-    assert_kvm_restore_metrics "${restore_metrics}"
+    local expected_mode="eager_chunks"
+    if [[ "${kvm_lazy_ram}" == "1" ]]; then
+      expected_mode="lazy_chunks"
+    fi
+    assert_kvm_restore_metrics "${restore_metrics}" "${expected_mode}"
   fi
 
   local max_tick

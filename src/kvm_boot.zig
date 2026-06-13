@@ -2,7 +2,7 @@
 //!
 //! Bring-up tool, not the product CLI. Usage:
 //!   zig build kvm-boot
-//!   ./zig-out/bin/kvm-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--trust-ram-backing] [--fdpass-ram-backing]
+//!   ./zig-out/bin/kvm-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--lazy-ram] [--trust-ram-backing] [--fdpass-ram-backing]
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
-        std.debug.print("usage: kvm-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--trust-ram-backing] [--fdpass-ram-backing]\n", .{});
+        std.debug.print("usage: kvm-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--lazy-ram] [--trust-ram-backing] [--fdpass-ram-backing]\n", .{});
         std.process.exit(2);
     }
 
@@ -33,6 +33,7 @@ pub fn main(init: std.process.Init) !void {
     var snapshot_after_ms: ?u64 = null;
     var spore_dir: ?[]const u8 = null;
     var resume_dir: ?[]const u8 = null;
+    var lazy_ram = false;
     var trust_ram_backing = false;
     var fdpass_ram_backing = false;
     var i: usize = 2;
@@ -58,6 +59,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--resume") and i + 1 < args.len) {
             i += 1;
             resume_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--lazy-ram")) {
+            lazy_ram = true;
         } else if (std.mem.eql(u8, args[i], "--trust-ram-backing")) {
             trust_ram_backing = true;
         } else if (std.mem.eql(u8, args[i], "--fdpass-ram-backing")) {
@@ -73,6 +76,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (resume_dir != null and snapshot_after_ms != null) {
         std.debug.print("--resume cannot be combined with --snapshot-after-ms\n", .{});
+        std.process.exit(2);
+    }
+    if (lazy_ram and resume_dir == null) {
+        std.debug.print("--lazy-ram requires --resume\n", .{});
+        std.process.exit(2);
+    }
+    if (lazy_ram and trust_ram_backing) {
+        std.debug.print("--lazy-ram cannot be combined with --trust-ram-backing\n", .{});
         std.process.exit(2);
     }
     if (fdpass_ram_backing and !trust_ram_backing) {
@@ -133,6 +144,7 @@ pub fn main(init: std.process.Init) !void {
         .disk_fd = disk_fd,
         .resume_dir = resume_dir,
         .ram_backing_fd = ram_backing_fd,
+        .ram_restore_mode = if (lazy_ram) .lazy_chunks else .eager_chunks,
         .snapshot_after_ms = snapshot_after_ms,
         .snapshot_dir = spore_dir,
     });

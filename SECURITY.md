@@ -24,6 +24,7 @@ fuzz targets from the slice that introduces it:
 |---|---|---|
 | Virtqueue descriptors, rings, and device request headers | guest memory | shared queue/MMIO paths and current console/blk/net/vsock/rng device paths fuzzed; new device parsers require fuzz targets in the same slice |
 | Guest memory access during dirty scans | guest | required at slice 7 |
+| Lazy RAM fault handling | guest page faults plus spore CAS chunks | KVM userfaultfd path is opt-in while under development; faults materialize whole verified chunks and fail closed on malformed manifests or chunk mismatches |
 | Spore manifest decode | registry, disk | fuzzed; unknown versions and malformed manifests fail closed |
 | Chunk decode (zstd) and CAS reads | peers, registry, disk | required at slice 5 |
 | OCI manifest and layer decode | registry | rootfs builder only, outside the monitor process; digest-pinned images, verified blobs, path-safe tar application, and JSON/tar fuzz targets |

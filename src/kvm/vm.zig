@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const kvm = @import("kvm.zig");
+const lazy_ram = @import("lazy_ram.zig");
 const snapshot = @import("snapshot.zig");
 const board = @import("../board.zig");
 const boot = @import("../boot.zig");
@@ -36,10 +37,18 @@ pub const Config = struct {
     /// is mapped MAP_PRIVATE; imported or untrusted spores must leave this
     /// null so RAM is materialized through verified chunks.
     ram_backing_fd: ?std.c.fd_t = null,
+    /// Chunk restore strategy for cold/imported KVM resumes. Eager remains the
+    /// default; lazy is an explicit development path backed by userfaultfd.
+    ram_restore_mode: RamRestoreMode = .eager_chunks,
     /// Take a spore snapshot after this many milliseconds of run time and
     /// stop. Requires snapshot_dir.
     snapshot_after_ms: ?u64 = null,
     snapshot_dir: ?[]const u8 = null,
+};
+
+pub const RamRestoreMode = enum {
+    eager_chunks,
+    lazy_chunks,
 };
 
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted };
@@ -73,6 +82,7 @@ const RamMapping = struct {
 pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var resume_parsed: ?std.json.Parsed(spore.Manifest) = null;
     defer if (resume_parsed) |*parsed| parsed.deinit();
+    var lazy_pager: ?lazy_ram.Pager = null;
     var restore_stats: ?RestoreStats = null;
     if (config.resume_dir) |spore_dir| {
         const manifest_start = try monotonicMs();
@@ -101,6 +111,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     const ram_mapping = try mapRam(allocator, config, if (resume_parsed) |parsed| parsed.value else null);
     if (restore_stats) |*stats| stats.map_ram_ms = (try monotonicMs()) - map_ram_start;
     defer ram_mapping.deinit();
+    defer if (lazy_pager) |*pager| pager.deinit();
     const ram_bytes = ram_mapping.bytes;
     const ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
 
@@ -161,13 +172,25 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             stats.chunk_count = memory_plan.chunk_count;
             stats.nonzero_chunk_count = memory_plan.nonzero_chunk_count;
         }
-        if (!ram_mapping.file_backed) {
-            if (restore_stats) |*stats| stats.mode = "eager_chunks";
-            const memory_start = try monotonicMs();
-            try spore.loadMemory(allocator, config.resume_dir.?, m.memory, ram_bytes);
-            if (restore_stats) |*stats| stats.memory_ms = (try monotonicMs()) - memory_start;
-        } else if (restore_stats) |*stats| {
-            stats.mode = "trusted_file_backed";
+        if (ram_mapping.file_backed) {
+            if (restore_stats) |*stats| stats.mode = "trusted_file_backed";
+        } else switch (config.ram_restore_mode) {
+            .eager_chunks => {
+                if (restore_stats) |*stats| stats.mode = "eager_chunks";
+                const memory_start = try monotonicMs();
+                try spore.loadMemory(allocator, config.resume_dir.?, m.memory, ram_bytes);
+                if (restore_stats) |*stats| stats.memory_ms = (try monotonicMs()) - memory_start;
+            },
+            .lazy_chunks => {
+                if (restore_stats) |*stats| stats.mode = "lazy_chunks";
+                const memory_start = try monotonicMs();
+                lazy_pager = try lazy_ram.Pager.start(.{
+                    .dir = config.resume_dir.?,
+                    .manifest = m.memory,
+                    .ram = ram_bytes,
+                });
+                if (restore_stats) |*stats| stats.memory_ms = (try monotonicMs()) - memory_start;
+            },
         }
         const state_start = try monotonicMs();
         try applyTransports(transports, m.devices);
