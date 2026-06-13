@@ -7,9 +7,10 @@
 
 const std = @import("std");
 const fdt = @import("fdt.zig");
+const generation = @import("generation.zig");
 
 /// Device model version recorded in spore manifests.
-pub const device_model_version = 3;
+pub const device_model_version = 4;
 
 pub const ram_base: u64 = 0x8000_0000;
 /// Outside the GIC's reserved redistributor region (which can span tens of
@@ -19,6 +20,12 @@ pub const virtio_stride: u64 = 0x200;
 /// First SPI number used for virtio devices (GIC intid = 32 + SPI).
 pub const virtio_first_spi: u32 = 16;
 pub const max_virtio_devices = 8;
+
+/// Fixed generation-device window after the reserved virtio-mmio range.
+pub const generation_base: u64 = virtio_base + virtio_stride * max_virtio_devices;
+pub const generation_size: u64 = generation.window_size;
+/// First non-virtio SPI after the reserved virtio range.
+pub const generation_spi: u32 = virtio_first_spi + max_virtio_devices;
 
 pub const spi_base_intid: u32 = 32;
 
@@ -47,6 +54,10 @@ pub fn virtioDeviceSpi(index: u32) u32 {
 
 pub fn virtioDeviceIntid(index: u32) u32 {
     return spi_base_intid + virtioDeviceSpi(index);
+}
+
+pub fn generationIntid() u32 {
+    return spi_base_intid + generation_spi;
 }
 
 /// Build the boot DTB. Caller owns the returned blob.
@@ -151,6 +162,20 @@ pub fn buildDtb(allocator: std.mem.Allocator, config: Config) ![]u8 {
     }
 
     {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "sporevm_generation@{x}", .{generation_base});
+        try f.beginNode(name);
+        try f.propStringList("compatible", &.{ "sporevm,generation-v1", "sporevm,generation" });
+        try f.propU32Array("reg", &.{
+            @truncate(generation_base >> 32), @truncate(generation_base),
+            @truncate(generation_size >> 32), @truncate(generation_size),
+        });
+        // SPI, level high: the device holds IRQ_STATUS until guest ack.
+        try f.propU32Array("interrupts", &.{ 0, generation_spi, 4 });
+        try f.endNode();
+    }
+
+    {
         try f.beginNode("chosen");
         try f.propString("bootargs", config.bootargs);
         try f.endNode();
@@ -179,10 +204,13 @@ test "dtb builds and addresses are consistent" {
     try std.testing.expect(std.mem.indexOf(u8, blob, "console=hvc0") != null);
     try std.testing.expect(std.mem.indexOf(u8, blob, "arm,gic-v3") != null);
     try std.testing.expect(std.mem.indexOf(u8, blob, "virtio,mmio") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blob, "sporevm,generation-v1") != null);
 }
 
 test "virtio addressing helpers" {
     try std.testing.expectEqual(virtio_base, virtioDeviceBase(0));
     try std.testing.expectEqual(virtio_base + virtio_stride, virtioDeviceBase(1));
     try std.testing.expectEqual(@as(u32, 48), virtioDeviceIntid(0));
+    try std.testing.expectEqual(virtio_base + virtio_stride * max_virtio_devices, generation_base);
+    try std.testing.expectEqual(@as(u32, 56), generationIntid());
 }

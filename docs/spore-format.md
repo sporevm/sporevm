@@ -25,6 +25,8 @@ A spore is a directory:
 - `platform`: contract the restoring host must satisfy exactly — `arch`
   (aarch64), `device_model_version`, `ram_base`, `ram_size`,
   `gic_dist_base`, `gic_redist_base`. Restore fails closed on any mismatch.
+  Device model version 4 includes the fixed virtio-mmio range plus the
+  generation MMIO device at `0x0c001000`, size `0x1000`, SPI 24 / INTID 56.
 - `machine`: normalized architectural state for one vCPU — `gprs` (x0–x30),
   `pc`, `cpsr`, `fpcr`, `fpsr`, `simd` (32 Q registers as u64 pairs),
   `sys_regs` (EL1 context registers by architectural name), `icc_regs`
@@ -37,6 +39,10 @@ A spore is a directory:
 - `devices`: ordered virtio-mmio transport states (device id, status,
   feature negotiation registers, interrupt status, and per-queue size/ready/
   ring addresses/indices). Device order is part of the board contract.
+- `generation`: non-virtio generation MMIO device state — `generation`
+  counter, `interrupt_status`, and `params_b64` (base64-encoded
+  resume-parameter bytes with trailing zeroes elided). In v0 this device is
+  present but inert unless later fork/resume code populates it.
 - `memory`: `chunk_size` plus one entry per chunk — a blake3-hex chunk
   reference, or null for an all-zero chunk.
 

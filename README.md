@@ -30,7 +30,8 @@ Early development, pre-release. The plan of record is
 [docs/plans/foundation.md](docs/plans/foundation.md). Current `main` boots a
 pinned aarch64 Linux kernel on Hypervisor.framework to an interactive shell,
 with shared virtio-mmio console, block, net, vsock, and rng devices. The HVF
-path can write and resume a v0 spore on the same host.
+path also exposes the frozen generation MMIO device and can write/resume a v0
+spore on the same host.
 
 KVM bring-up and the cross-hypervisor restore matrix are still pending real
 aarch64 KVM hardware.

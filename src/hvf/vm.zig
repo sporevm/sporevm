@@ -1,8 +1,9 @@
 //! HVF virtual machine: board assembly and vCPU run loop.
 //!
 //! Single-vCPU bring-up scope: boots the pinned kernel with the SporeVM
-//! board (GICv3 via hv_gic, virtio-mmio console/blk/net/vsock/rng), handles MMIO data
-//! aborts, PSCI over HVC, vtimer exits, WFI, and HVF snapshot/resume.
+//! board (GICv3 via hv_gic, virtio-mmio console/blk/net/vsock/rng, generation
+//! MMIO), handles MMIO data aborts, PSCI over HVC, vtimer exits, WFI, and HVF
+//! snapshot/resume.
 //! Multi-vCPU and the rest of the device set land in later slices.
 
 const std = @import("std");
@@ -10,6 +11,7 @@ const hvf = @import("hvf.zig");
 const gic = @import("gic.zig");
 const board = @import("../board.zig");
 const boot = @import("../boot.zig");
+const generation = @import("../generation.zig");
 const guestmem = @import("../guestmem.zig");
 const mmio = @import("../virtio/mmio.zig");
 const console = @import("../virtio/console.zig");
@@ -94,11 +96,13 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     const ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
 
     // Devices: console is virtio-mmio slot 0, disk (if any) follows, then net, vsock, rng.
+    // The generation device is a separate fixed MMIO window after the reserved virtio range.
     var con = console.Console{ .sink = config.console_sink };
     var blk_dev: blk.Blk = undefined;
     var net_dev = net.Net.init(.{});
     var rng_dev = rng.Rng{};
     var vsock_dev = vsock.Vsock.init(.{});
+    var gen_dev = generation.Device{};
     var transports_buf: [5]mmio.Transport = undefined;
     transports_buf[0] = mmio.Transport.init(con.device());
     var transport_count: usize = 1;
@@ -149,6 +153,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         }
         try spore.loadMemory(allocator, spore_dir, m.memory, ram_bytes);
         try applyTransports(transports, m.devices);
+        try gen_dev.restore(allocator, m.generation);
         try snapshot.applyMachine(allocator, vcpu, m.machine);
     } else {
         // Fresh boot: DTB + kernel. The DTB describes exactly one
@@ -182,7 +187,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             const elapsed_ms = (snapshot.hostCounter() - counter_start) * 1000 / counter_freq;
             if (elapsed_ms >= after_ms) {
                 const dir = config.snapshot_dir orelse return error.HvCallFailed;
-                try takeSnapshot(allocator, dir, vcpu, transports, ram_bytes, .{
+                try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, ram_bytes, .{
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
@@ -195,7 +200,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .exception => {
                 const ec = exit.exception.exceptionClass();
                 switch (ec) {
-                    hvf.ec_data_abort => try handleMmio(vcpu, exit, transports, ram, .{
+                    hvf.ec_data_abort => try handleMmio(vcpu, exit, transports, &gen_dev, ram, .{
                         .dist_base = dist_base,
                         .dist_size = dist_size,
                         .redist_base = vcpu_redist_base,
@@ -266,6 +271,7 @@ fn takeSnapshot(
     dir: []const u8,
     vcpu: hvf.VcpuHandle,
     transports: []mmio.Transport,
+    gen_dev: *const generation.Device,
     ram_bytes: []const u8,
     platform: SnapshotPlatform,
 ) !void {
@@ -275,6 +281,7 @@ fn takeSnapshot(
 
     const machine = try snapshot.captureMachine(arena, vcpu);
     const devices = try captureTransports(arena, transports);
+    const gen_state = try gen_dev.capture(arena);
     const memory = try spore.saveMemory(arena, dir, ram_bytes);
     try spore.saveManifest(arena, dir, .{
         .platform = .{
@@ -286,6 +293,7 @@ fn takeSnapshot(
         },
         .machine = machine,
         .devices = devices,
+        .generation = gen_state,
         .memory = memory,
     });
     std.log.info("spore written to {s}", .{dir});
@@ -406,6 +414,7 @@ fn handleMmio(
     vcpu: hvf.VcpuHandle,
     exit: *hvf.VcpuExit,
     transports: []mmio.Transport,
+    gen_dev: *generation.Device,
     ram: guestmem.GuestRam,
     gic_windows: GicWindows,
 ) !void {
@@ -444,6 +453,30 @@ fn handleMmio(
                 3 => value,
             };
             try hvf.check(hvf.hv_vcpu_set_reg(vcpu, @enumFromInt(@as(u32, srt)), masked), "gic write xt");
+        }
+        try advancePc(vcpu);
+        return;
+    }
+
+    if (ipa >= board.generation_base and ipa < board.generation_base + board.generation_size) {
+        const offset = ipa - board.generation_base;
+        if (is_write) {
+            var value: u64 = 0;
+            if (srt < 31) {
+                try hvf.check(hvf.hv_vcpu_get_reg(vcpu, @enumFromInt(@as(u32, srt)), &value), "generation read xt");
+            }
+            if (gen_dev.write(offset, value, sas)) {
+                try hvf.check(hvf.hv_gic_set_spi(board.generationIntid(), false), "generation lower spi");
+            }
+        } else if (srt < 31) {
+            const value = gen_dev.read(offset, sas);
+            const masked: u64 = switch (sas) {
+                0 => value & 0xff,
+                1 => value & 0xffff,
+                2 => value & 0xffff_ffff,
+                3 => value,
+            };
+            try hvf.check(hvf.hv_vcpu_set_reg(vcpu, @enumFromInt(@as(u32, srt)), masked), "generation write xt");
         }
         try advancePc(vcpu);
         return;

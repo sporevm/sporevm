@@ -26,7 +26,7 @@ fuzz targets from the slice that introduces it:
 | Guest memory access during dirty scans | guest | required at slice 7 |
 | Spore manifest decode | registry, disk | required at slice 3 |
 | Chunk decode (zstd) and CAS reads | peers, registry, disk | required at slice 5 |
-| Generation device inputs | guest | required at slice 6 |
+| Generation device inputs | guest | MMIO register surface fuzzed; fork params schema required at slice 6 |
 | Control socket JSON | local consumers | required at slice 3 |
 
 ## Structural Rules

@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const chunklib = @import("chunk.zig");
+const generation = @import("generation.zig");
 
 pub const format_version: u32 = 0;
 pub const chunk_size: usize = 2 * 1024 * 1024;
@@ -89,11 +90,14 @@ pub const MemoryManifest = struct {
     chunks: []?[]const u8,
 };
 
+pub const GenerationState = generation.State;
+
 pub const Manifest = struct {
     version: u32 = format_version,
     platform: Platform,
     machine: MachineState,
     devices: []TransportState,
+    generation: GenerationState,
     memory: MemoryManifest,
 };
 
@@ -347,7 +351,7 @@ test "manifest json round-trip" {
     var sys_regs = [_]SysRegEntry{.{ .name = "sctlr_el1", .value = 0xdeadbeef }};
     const manifest = Manifest{
         .platform = .{
-            .device_model_version = 3,
+            .device_model_version = 4,
             .ram_base = 0x8000_0000,
             .ram_size = 1 << 29,
             .gic_dist_base = 0x0800_0000,
@@ -366,6 +370,11 @@ test "manifest json round-trip" {
             .gic_state_b64 = "AAAA",
         },
         .devices = &devices,
+        .generation = .{
+            .generation = 7,
+            .interrupt_status = generation.irq_generation_changed,
+            .params_b64 = "",
+        },
         .memory = .{ .chunk_size = chunk_size, .chunks = &.{} },
     };
     try saveManifest(arena, dir, manifest);
@@ -376,4 +385,5 @@ test "manifest json round-trip" {
     try std.testing.expectEqual(@as(u64, 123), parsed.value.machine.vtimer.cntvct);
     try std.testing.expectEqualStrings("sctlr_el1", parsed.value.machine.sys_regs[0].name);
     try std.testing.expectEqual(@as(u16, 64), parsed.value.devices[0].queues[0].size);
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.generation.generation);
 }

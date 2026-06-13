@@ -248,18 +248,20 @@ and PSCI. HVF bring-up findings now encoded in `src/hvf/`:
 Slice 2 has since reached an interactive shell on HVF: virtio-blk against a
 cleanroom-built alpine ext4 rootfs, console input (rx queue plus idle-exit
 stdin polling), minimal virtio-net (stable MAC, TX drain), a minimal
-virtio-vsock closed endpoint, virtio-rng backed by host entropy, and
-`init=/bin/sh` workloads run end to end. Host networking remains a later
-backend attachment behind the shared net transport.
+virtio-vsock closed endpoint, virtio-rng backed by host entropy, the frozen
+generation MMIO device present/inert, and `init=/bin/sh` workloads run end to
+end. Host networking remains a later backend attachment behind the shared net
+transport.
 
 Slice 3 has landed on the HVF side: spore manifest v0 (`docs/spore-format.md`,
 `src/spore.zig`) with content-addressed zero-elided memory chunks, normalized
 machine state (GPRs, SIMD, EL1 sysregs, ICC regs, virtual-timer re-anchoring),
-hv_gic state blob capture/restore, and virtio transport state. Demonstrated: a
-shell counter loop snapshotted at tick 8 resumes at tick 9 in a fresh process
-(`hvf-boot --snapshot-after-ms/--spore/--resume`). A 512MiB idle guest spores
-to ~26MB. Key finding: GIC ICC (CPU-interface) registers are not part of the
-hv_gic state blob and must be saved per-vCPU via `hv_gic_{get,set}_icc_reg` —
+hv_gic state blob capture/restore, virtio transport state, and generation
+device state. Demonstrated: a shell counter loop snapshotted at tick 8 resumes
+at tick 9 in a fresh process (`hvf-boot --snapshot-after-ms/--spore/--resume`).
+A 512MiB idle guest spores to ~26MB. Key finding: GIC ICC (CPU-interface)
+registers are not part of the hv_gic state blob and must be saved per-vCPU via
+`hv_gic_{get,set}_icc_reg` —
 without them the resumed guest hangs with all interrupts masked. v0 does not
 capture disk state: resume requires the unmodified backing disk file
 (documented in the format doc). KVM-side suspend/restore and the four-way
