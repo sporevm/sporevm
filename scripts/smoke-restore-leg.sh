@@ -4,9 +4,9 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 usage:
-  scripts/smoke-restore-leg.sh capture --backend kvm|hvf --kernel Image --initrd root.cpio --spore-dir DIR [options]
-  scripts/smoke-restore-leg.sh resume --backend kvm|hvf --kernel Image --spore-dir DIR [options]
-  scripts/smoke-restore-leg.sh same-host --backend kvm|hvf --kernel Image --initrd root.cpio [--workdir DIR] [options]
+  scripts/smoke-restore-leg.sh capture --backend kvm|hvf [--kernel Image] --initrd root.cpio --spore-dir DIR [options]
+  scripts/smoke-restore-leg.sh resume --backend kvm|hvf [--kernel Image] --spore-dir DIR [options]
+  scripts/smoke-restore-leg.sh same-host --backend kvm|hvf [--kernel Image] --initrd root.cpio [--workdir DIR] [options]
 
 Run one restore-smoke leg using the tiny ticker initrd. Cross-host matrix runs
 are intentionally split: capture on the source host, transfer the spore
@@ -14,7 +14,7 @@ directory by your chosen direct channel, then resume on the destination host.
 
 Options:
   --backend kvm|hvf          Hypervisor harness to run
-  --kernel Image            aarch64 Linux kernel Image
+  --kernel Image            aarch64 Linux kernel Image (default: managed initrd kernel)
   --initrd root.cpio        initrd for capture/same-host fresh boot
   --spore-dir DIR           spore directory to write/read
   --workdir DIR             same-host work directory (default: mktemp)
@@ -30,12 +30,12 @@ Options:
 
 Examples:
   scripts/make-smoke-initrd.sh /tmp/sporevm-smoke.cpio
-  scripts/smoke-restore-leg.sh same-host --backend kvm --kernel /tmp/Image --initrd /tmp/sporevm-smoke.cpio
+  scripts/smoke-restore-leg.sh same-host --backend kvm --initrd /tmp/sporevm-smoke.cpio
 
-  scripts/smoke-restore-leg.sh capture --backend kvm --kernel /tmp/Image --initrd /tmp/sporevm-smoke.cpio --spore-dir /tmp/kvm-spore
+  scripts/smoke-restore-leg.sh capture --backend kvm --initrd /tmp/sporevm-smoke.cpio --spore-dir /tmp/kvm-spore
   tar -C /tmp -czf /tmp/kvm-spore.tgz kvm-spore
   # transfer kvm-spore.tgz directly to the HVF host, then:
-  scripts/smoke-restore-leg.sh resume --backend hvf --kernel /tmp/Image --spore-dir /tmp/kvm-spore
+  scripts/smoke-restore-leg.sh resume --backend hvf --spore-dir /tmp/kvm-spore
 EOF
 }
 
@@ -158,7 +158,10 @@ case "${backend}" in
   *) die "--backend must be kvm or hvf" ;;
 esac
 
-[[ -n "${kernel}" ]] || die "--kernel is required"
+if [[ -z "${kernel}" ]]; then
+  kernel="$(${repo_root}/scripts/ensure-managed-kernel.sh initrd)"
+  echo "using managed kernel: ${kernel}" >&2
+fi
 [[ -f "${kernel}" ]] || die "kernel not found: ${kernel}"
 
 for numeric_value in "${mem_mib}" "${snapshot_after_ms}" "${resume_seconds}" "${min_tick}"; do

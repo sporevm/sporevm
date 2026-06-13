@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 usage:
-  scripts/smoke-fork-fanout.sh --backend kvm|hvf --kernel Image [options]
+  scripts/smoke-fork-fanout.sh --backend kvm|hvf [--kernel Image] [options]
 
 Boot the fork-aware smoke initrd, capture one parent spore, fork it into N
 children, resume each child on the same host, and assert that each resumed guest
@@ -14,7 +14,7 @@ SporeVM kernel asset with /dev/mem support, for example
 
 Options:
   --backend kvm|hvf          Hypervisor harness to run
-  --kernel Image            aarch64 Linux kernel Image
+  --kernel Image            aarch64 Linux kernel Image (default: managed sporevm kernel)
   --initrd root.cpio        prebuilt fork-aware initrd (default: build one)
   --workdir DIR             work directory (default: mktemp)
   --count N                 number of children to fork/resume (default: 8)
@@ -35,7 +35,7 @@ Options:
 
 Example:
   CC="zig cc -target aarch64-linux-musl" scripts/smoke-fork-fanout.sh \
-    --backend kvm --kernel /tmp/sporevm-arm64-linux-6.1.155-Image --count 8
+    --backend kvm --count 8
 EOF
 }
 
@@ -172,7 +172,10 @@ if [[ "${ram_backing_mode}" == "fdpass" && "${backend}" != "kvm" ]]; then
   die "--ram-backing-mode fdpass currently requires --backend kvm"
 fi
 
-[[ -n "${kernel}" ]] || die "--kernel is required"
+if [[ -z "${kernel}" ]]; then
+  kernel="$(${repo_root}/scripts/ensure-managed-kernel.sh sporevm)"
+  echo "using managed kernel: ${kernel}" >&2
+fi
 [[ -f "${kernel}" ]] || die "kernel not found: ${kernel}"
 
 for numeric_value in "${count}" "${parallel}" "${mem_mib}" "${snapshot_after_ms}" "${resume_seconds}" "${memory_sample_seconds}"; do

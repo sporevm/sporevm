@@ -60,16 +60,16 @@ mise exec -- zig build kvm-boot   # build the KVM kernel boot harness on Linux/a
 
 The `hvf-boot` and `kvm-boot` harnesses accept `--initrd root.cpio` for
 diskless smoke workloads (`rdinit=/init` by default when no disk is supplied).
-Use an initrd-capable kernel such as the `cleanroom-kernels` `initrd` profile;
-the default `rootfs` profile intentionally ignores external initrds.
+The smoke scripts auto-download pinned `cleanroom-kernels` assets and cache
+them under the platform cache directory; pass `--kernel` or set
+`SPOREVM_KERNEL_IMAGE` for local kernel experiments.
 Build the tiny ticker initrd used by smoke tests with
 `scripts/make-smoke-initrd.sh /tmp/sporevm-smoke.cpio`.
 Run same-host restore smokes, or split cross-host capture/resume legs, with
 `scripts/smoke-restore-leg.sh`.
-Fork fan-out smokes use the separate `cleanroom-kernels` SporeVM kernel asset
-(`sporevm-arm64-linux-<version>-Image`) because the fork-aware initrd needs
-`/dev/mem` access to the fixed generation MMIO window:
-`scripts/smoke-fork-fanout.sh --backend hvf --kernel /tmp/sporevm-arm64-linux-<version>-Image`.
+Fork fan-out smokes use the separate SporeVM kernel asset because the
+fork-aware initrd needs `/dev/mem` access to the fixed generation MMIO window:
+`CC="zig cc -target aarch64-linux-musl" scripts/smoke-fork-fanout.sh --backend hvf`.
 Fork an already-captured spore with
 `zig-out/bin/spore fork /tmp/spore --count 100 --out /tmp/forks`; children are
 named `000000`, `000001`, and so on, and share the parent's chunk store.
