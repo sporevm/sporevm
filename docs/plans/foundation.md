@@ -271,7 +271,14 @@ Slice 1 has now started on real aarch64 KVM hardware (`m7g.metal`): the
 same board DTB, and routes shared virtio-mmio/generation device exits. It boots
 the cleanroom 6.1.155 kernel to the expected no-root VFS panic without a disk
 and to an Alpine `/bin/sh` prompt with a mountless `mkfs.ext4 -d` minirootfs.
-KVM suspend/restore and the four-way matrix (slice 4) remain next.
+
+The KVM side now has same-host suspend/restore groundwork using the v0 spore
+manifest: normalized KVM one-reg vCPU state, SIMD, EL1 sysregs, virtual-timer
+re-anchoring via `KVM_ARM_SET_COUNTER_OFFSET`, virtio/generation state, eager
+RAM chunks, and a backend-private VGICv3 JSON blob in `gic_state_b64`. A real
+`m7g.metal` smoke test booted an Alpine BusyBox ticker, snapshotted after
+`sporevm-tick 4`, and resumed in a fresh KVM process at `sporevm-tick 5`.
+The four-way cross-hypervisor matrix (slice 4) remains next.
 
 ## Delivery Strategy
 
