@@ -17,6 +17,7 @@ pub const virtio = struct {
     pub const mmio = @import("virtio/mmio.zig");
     pub const console = @import("virtio/console.zig");
     pub const blk = @import("virtio/blk.zig");
+    pub const net = @import("virtio/net.zig");
     pub const rng = @import("virtio/rng.zig");
     pub const vsock = @import("virtio/vsock.zig");
 };

@@ -244,9 +244,10 @@ and PSCI. HVF bring-up findings now encoded in `src/hvf/`:
 
 Slice 2 has since reached an interactive shell on HVF: virtio-blk against a
 cleanroom-built alpine ext4 rootfs, console input (rx queue plus idle-exit
-stdin polling), virtio-rng backed by host entropy, a minimal virtio-vsock
-closed endpoint, and `init=/bin/sh` workloads run end to end. net remains open
-within slice 2's device set.
+stdin polling), minimal virtio-net (stable MAC, TX drain), a minimal
+virtio-vsock closed endpoint, virtio-rng backed by host entropy, and
+`init=/bin/sh` workloads run end to end. Host networking remains a later
+backend attachment behind the shared net transport.
 
 Slice 3 has landed on the HVF side: spore manifest v0 (`docs/spore-format.md`,
 `src/spore.zig`) with content-addressed zero-elided memory chunks, normalized
