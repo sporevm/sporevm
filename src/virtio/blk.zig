@@ -123,9 +123,10 @@ pub const Blk = struct {
         };
     }
 
-    fn notify(ctx: *anyopaque, queue_index: u8, q: *queue.VirtQueue, ram: guestmem.GuestRam) bool {
+    fn notify(ctx: *anyopaque, queue_index: u8, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
         const self: *Blk = @ptrCast(@alignCast(ctx));
         if (queue_index != 0) return false;
+        const q = &queues[0];
 
         var did_work = false;
         while (true) {

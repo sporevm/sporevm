@@ -22,7 +22,7 @@ fuzz targets from the slice that introduces it:
 
 | Surface | Input source | Status |
 |---|---|---|
-| Virtqueue descriptors and rings | guest memory | fuzz target required at slice 1 |
+| Virtqueue descriptors, rings, and device request headers | guest memory | fuzz targets required as device parsers land |
 | Guest memory access during dirty scans | guest | required at slice 7 |
 | Spore manifest decode | registry, disk | required at slice 3 |
 | Chunk decode (zstd) and CAS reads | peers, registry, disk | required at slice 5 |

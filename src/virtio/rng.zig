@@ -47,9 +47,10 @@ pub const Rng = struct {
         }
     }
 
-    fn notify(ctx: *anyopaque, queue_index: u8, q: *queue.VirtQueue, ram: guestmem.GuestRam) bool {
+    fn notify(ctx: *anyopaque, queue_index: u8, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
         const self: *Rng = @ptrCast(@alignCast(ctx));
         if (queue_index != request_queue) return false;
+        const q = &queues[request_queue];
 
         var did_work = false;
         while (true) {

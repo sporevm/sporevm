@@ -31,7 +31,7 @@ pub const Device = struct {
     queue_count: u8,
     /// Called when the driver notifies a queue. The device drains/fills the
     /// queue and returns true if a used-buffer interrupt should be raised.
-    notifyFn: *const fn (context: *anyopaque, queue_index: u8, q: *queue.VirtQueue, ram: guestmem.GuestRam) bool,
+    notifyFn: *const fn (context: *anyopaque, queue_index: u8, queues: *[max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool,
     /// Device config space read (offset into config space, 1/2/4 byte widths
     /// arrive as u32). Return 0 for out-of-range reads.
     configReadFn: ?*const fn (context: *anyopaque, offset: u64) u32 = null,
@@ -128,7 +128,7 @@ pub const Transport = struct {
                 if (value < self.dev.queue_count) {
                     const q = &self.queues[@intCast(value)];
                     if (q.ready) {
-                        if (self.dev.notifyFn(self.dev.context, @intCast(value), q, ram)) {
+                        if (self.dev.notifyFn(self.dev.context, @intCast(value), &self.queues, ram)) {
                             self.interrupt_status |= 1;
                             return true;
                         }
@@ -168,8 +168,8 @@ fn setHigh(target: *u64, value: u32) void {
 const TestDev = struct {
     notified: ?u8 = null,
 
-    fn notify(ctx: *anyopaque, qi: u8, q: *queue.VirtQueue, ram: guestmem.GuestRam) bool {
-        _ = q;
+    fn notify(ctx: *anyopaque, qi: u8, queues: *[max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
+        _ = queues;
         _ = ram;
         const self: *TestDev = @ptrCast(@alignCast(ctx));
         self.notified = qi;

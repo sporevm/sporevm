@@ -347,7 +347,7 @@ test "manifest json round-trip" {
     var sys_regs = [_]SysRegEntry{.{ .name = "sctlr_el1", .value = 0xdeadbeef }};
     const manifest = Manifest{
         .platform = .{
-            .device_model_version = 1,
+            .device_model_version = 2,
             .ram_base = 0x8000_0000,
             .ram_size = 1 << 29,
             .gic_dist_base = 0x0800_0000,

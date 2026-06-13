@@ -51,9 +51,10 @@ pub const Console = struct {
         return consumed;
     }
 
-    fn notify(ctx: *anyopaque, queue_index: u8, q: *queue.VirtQueue, ram: guestmem.GuestRam) bool {
+    fn notify(ctx: *anyopaque, queue_index: u8, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
         const self: *Console = @ptrCast(@alignCast(ctx));
         if (queue_index != tx_queue) return false;
+        const q = &queues[tx_queue];
 
         var did_work = false;
         while (true) {

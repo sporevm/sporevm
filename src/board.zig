@@ -9,7 +9,7 @@ const std = @import("std");
 const fdt = @import("fdt.zig");
 
 /// Device model version recorded in spore manifests.
-pub const device_model_version = 1;
+pub const device_model_version = 2;
 
 pub const ram_base: u64 = 0x8000_0000;
 /// Outside the GIC's reserved redistributor region (which can span tens of
