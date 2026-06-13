@@ -103,6 +103,7 @@ pub fn selectedManifestDigest(allocator: std.mem.Allocator, bytes: []const u8, p
         if (!isManifestMediaType(desc.mediaType)) continue;
         const p = desc.platform orelse continue;
         if (std.mem.eql(u8, p.os, platform.os) and std.mem.eql(u8, p.architecture, platform.arch)) {
+            if (!isSha256Digest(desc.digest)) return error.UnsupportedDigest;
             return desc.digest;
         }
     }
@@ -151,6 +152,7 @@ pub fn verifyDigestBytes(digest: []const u8, bytes: []const u8) !void {
 }
 
 pub fn verifyDigestFile(io: Io, digest: []const u8, path: []const u8) !void {
+    if (!isSha256Digest(digest)) return error.UnsupportedDigest;
     const hex = try sha256File(io, path);
     if (!std.ascii.eqlIgnoreCase(digest["sha256:".len..], &hex)) return error.DigestMismatch;
 }
@@ -210,6 +212,14 @@ test "pinned manifest bytes must match requested digest" {
         error.DigestMismatch,
         verifyDigestBytes("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", index),
     );
+}
+
+test "file digest verification validates digest before slicing" {
+    const io = std.testing.io;
+    const path = "zig-cache/test-rootfs-oci-digest-file";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "data" });
+    try std.testing.expectError(error.UnsupportedDigest, verifyDigestFile(io, "sha256:short", path));
 }
 
 fn fuzzOCIManifestJson(_: void, s: *std.testing.Smith) !void {

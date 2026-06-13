@@ -314,6 +314,7 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
     if (manifest.schemaVersion != 2) return error.UnsupportedManifestSchema;
     if (manifest.layers.len > max_rootfs_layers) return error.RootFSTooManyLayers;
 
+    if (!oci.isSha256Digest(manifest.config.digest)) return error.UnsupportedDigest;
     const config_bytes = try registry.fetchBlobBytes(allocator, &client, &bearer_token, image_ref, manifest.config.digest, manifest.config.size);
     try oci.verifyDigestBytes(manifest.config.digest, config_bytes);
     var config_parsed = try std.json.parseFromSlice(ImageConfig, allocator, config_bytes, .{ .ignore_unknown_fields = true });
@@ -322,7 +323,7 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
     const layer_meta = try allocator.alloc(oci.LayerMetadata, manifest.layers.len);
     for (manifest.layers, 0..) |layer, i| {
         if (!oci.isSupportedLayerMediaType(layer.mediaType)) return error.UnsupportedLayerMediaType;
-        const layer_path = try std.fmt.allocPrint(allocator, "{s}/{s}.blob", .{ layers_dir, layer.digest["sha256:".len..] });
+        const layer_path = try layerBlobPath(allocator, layers_dir, layer.digest);
         try registry.fetchBlobToFile(allocator, init.io, &client, &bearer_token, image_ref, layer.digest, layer.size, max_rootfs_content_bytes, layer_path);
         try oci.verifyDigestFile(init.io, layer.digest, layer_path);
         try applyGzipLayer(allocator, init.io, rootfs_dir, layer_path, &owners);
@@ -390,6 +391,11 @@ fn resolveManifestDigest(
     return selected;
 }
 
+fn layerBlobPath(allocator: std.mem.Allocator, layers_dir: []const u8, digest: []const u8) ![]u8 {
+    if (!oci.isSha256Digest(digest)) return error.UnsupportedDigest;
+    return std.fmt.allocPrint(allocator, "{s}/{s}.blob", .{ layers_dir, digest["sha256:".len..] });
+}
+
 fn applyGzipLayer(
     allocator: std.mem.Allocator,
     io: Io,
@@ -413,6 +419,8 @@ const LayerLimits = struct {
     content_bytes: u64 = 0,
     entries: u64 = 0,
 };
+
+const CreatedPathMap = std.StringHashMap(void);
 
 const PendingPax = struct {
     path: ?[]u8 = null,
@@ -438,10 +446,12 @@ fn applyTarLayer(
     var long_name: ?[]u8 = null;
     var long_link: ?[]u8 = null;
     var pax: PendingPax = .{};
+    var created = CreatedPathMap.init(allocator);
     defer {
         if (long_name) |p| allocator.free(p);
         if (long_link) |p| allocator.free(p);
         pax.clear(allocator);
+        deinitCreatedPaths(allocator, &created);
     }
 
     while (true) {
@@ -497,7 +507,7 @@ fn applyTarLayer(
         defer allocator.free(rel);
         const entry_ownership = try tarOwnership(&header, pax);
 
-        if (try applyWhiteout(allocator, io, root, ownership, rel)) {
+        if (try applyWhiteout(allocator, io, root, ownership, &created, rel)) {
             try discardTarPayload(reader, size);
             continue;
         }
@@ -507,24 +517,27 @@ fn applyTarLayer(
                 try addContentBytes(&limits, size);
                 try writeRegularFile(allocator, io, root, rel, reader, size, try tarMode(&header));
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
+                try recordCreatedPath(allocator, &created, rel);
             },
             '5' => {
                 try discardTarPayload(reader, size);
-                try ensureNoSymlinkPath(allocator, io, root, rel, true);
-                try root.createDirPath(io, rel);
+                try writeDirectory(allocator, io, root, rel, try tarMode(&header));
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
+                try recordCreatedPath(allocator, &created, rel);
             },
             '2' => {
                 try discardTarPayload(reader, size);
                 const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&header);
                 try writeSymlink(allocator, io, root, rel, raw_link);
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
+                try recordCreatedPath(allocator, &created, rel);
             },
             '1' => {
                 try discardTarPayload(reader, size);
                 const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&header);
-                try copyHardlinkTarget(allocator, io, root, rel, raw_link, &limits);
+                try createHardlinkTarget(allocator, io, root, rel, raw_link);
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
+                try recordCreatedPath(allocator, &created, rel);
             },
             else => {
                 try discardTarPayload(reader, size);
@@ -560,6 +573,18 @@ fn writeRegularFile(
     file.setPermissions(io, permissionsFromMode(mode, .default_file)) catch {};
 }
 
+fn writeDirectory(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Io.Dir,
+    rel: []const u8,
+    mode: u32,
+) !void {
+    try ensureNoSymlinkPath(allocator, io, root, rel, true);
+    try root.createDirPath(io, rel);
+    root.setFilePermissions(io, rel, permissionsFromMode(mode, .default_dir), .{ .follow_symlinks = false }) catch {};
+}
+
 fn writeSymlink(allocator: std.mem.Allocator, io: Io, root: Io.Dir, rel: []const u8, raw_link: []const u8) !void {
     try validateSymlinkTarget(allocator, rel, raw_link);
     try ensureNoSymlinkPath(allocator, io, root, parentPath(rel), true);
@@ -568,34 +593,22 @@ fn writeSymlink(allocator: std.mem.Allocator, io: Io, root: Io.Dir, rel: []const
     try root.symLink(io, raw_link, rel, .{});
 }
 
-fn copyHardlinkTarget(
+fn createHardlinkTarget(
     allocator: std.mem.Allocator,
     io: Io,
     root: Io.Dir,
     rel: []const u8,
     raw_link: []const u8,
-    limits: *LayerLimits,
 ) !void {
     const link_rel = try safeTarPath(allocator, raw_link);
     defer allocator.free(link_rel);
     try ensureNoSymlinkPath(allocator, io, root, link_rel, false);
     const stat = try root.statFile(io, link_rel, .{ .follow_symlinks = false });
     if (stat.kind != .file) return error.BadHardlinkTarget;
-    try addContentBytes(limits, stat.size);
     try ensureNoSymlinkPath(allocator, io, root, rel, true);
     try ensureParent(root, io, rel);
     root.deleteTree(io, rel) catch {};
-
-    var input = try root.openFile(io, link_rel, .{});
-    defer input.close(io);
-    var output = try root.createFile(io, rel, .{ .permissions = stat.permissions });
-    defer output.close(io);
-    var input_buf: [64 * 1024]u8 = undefined;
-    var output_buf: [64 * 1024]u8 = undefined;
-    var input_reader: Io.File.Reader = .initStreaming(input, io, &input_buf);
-    var output_writer: Io.File.Writer = .initStreaming(output, io, &output_buf);
-    _ = try input_reader.interface.streamRemaining(&output_writer.interface);
-    try output_writer.interface.flush();
+    try Io.Dir.hardLink(root, link_rel, root, rel, io, .{});
 }
 
 fn applyWhiteout(
@@ -603,6 +616,7 @@ fn applyWhiteout(
     io: Io,
     root: Io.Dir,
     ownership: *OwnershipMap,
+    created: *CreatedPathMap,
     rel: []const u8,
 ) !bool {
     const base = baseName(rel);
@@ -610,8 +624,7 @@ fn applyWhiteout(
     const parent = parentPath(rel);
     if (std.mem.eql(u8, base, ".wh..wh..opq")) {
         try ensureNoSymlinkPath(allocator, io, root, parent, true);
-        try deleteChildrenAt(allocator, io, root, parent);
-        try ownership_mod.removeChildren(allocator, ownership, parent);
+        try deleteLowerChildrenAt(allocator, io, root, ownership, created, parent);
         return true;
     }
     const target_base = base[".wh.".len..];
@@ -624,12 +637,20 @@ fn applyWhiteout(
     try ensureNoSymlinkPath(allocator, io, root, parent, true);
     try root.deleteTree(io, target);
     try ownership_mod.removeSubtree(allocator, ownership, target);
+    try removeCreatedSubtree(allocator, created, target);
     return true;
 }
 
-fn deleteChildrenAt(allocator: std.mem.Allocator, io: Io, root: Io.Dir, rel: []const u8) !void {
+fn deleteLowerChildrenAt(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Io.Dir,
+    ownership: *OwnershipMap,
+    created: *CreatedPathMap,
+    rel: []const u8,
+) !void {
     if (rel.len == 0) {
-        try deleteChildren(allocator, io, root);
+        try deleteLowerChildren(allocator, io, root, ownership, created, "");
         return;
     }
     var dir = root.openDir(io, rel, .{
@@ -641,16 +662,85 @@ fn deleteChildrenAt(allocator: std.mem.Allocator, io: Io, root: Io.Dir, rel: []c
         else => |e| return e,
     };
     defer dir.close(io);
-    try deleteChildren(allocator, io, dir);
+    try deleteLowerChildren(allocator, io, dir, ownership, created, rel);
 }
 
-fn deleteChildren(allocator: std.mem.Allocator, io: Io, root: Io.Dir) !void {
+fn deleteLowerChildren(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Io.Dir,
+    ownership: *OwnershipMap,
+    created: *CreatedPathMap,
+    prefix: []const u8,
+) !void {
     var it = root.iterate();
     while (try it.next(io)) |entry| {
         const name = try allocator.dupe(u8, entry.name);
         defer allocator.free(name);
+        const rel = if (prefix.len == 0)
+            try allocator.dupe(u8, name)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, name });
+        defer allocator.free(rel);
+
+        const has_created_descendant = createdHasDescendant(created, rel);
+        if (entry.kind == .directory and (created.contains(rel) or has_created_descendant)) {
+            var child = try root.openDir(io, name, .{
+                .access_sub_paths = true,
+                .iterate = true,
+                .follow_symlinks = false,
+            });
+            defer child.close(io);
+            try deleteLowerChildren(allocator, io, child, ownership, created, rel);
+            continue;
+        }
+        if (created.contains(rel)) continue;
+
         try root.deleteTree(io, name);
+        try ownership_mod.removeSubtree(allocator, ownership, rel);
     }
+}
+
+fn recordCreatedPath(allocator: std.mem.Allocator, created: *CreatedPathMap, rel: []const u8) !void {
+    const key = try allocator.dupe(u8, rel);
+    const entry = try created.getOrPut(key);
+    if (entry.found_existing) allocator.free(key);
+}
+
+fn deinitCreatedPaths(allocator: std.mem.Allocator, created: *CreatedPathMap) void {
+    var it = created.iterator();
+    while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+    created.deinit();
+}
+
+fn removeCreatedSubtree(allocator: std.mem.Allocator, created: *CreatedPathMap, rel: []const u8) !void {
+    var keys = std.ArrayList([]const u8).empty;
+    defer keys.deinit(allocator);
+    const prefix = try std.fmt.allocPrint(allocator, "{s}/", .{rel});
+    defer allocator.free(prefix);
+
+    var it = created.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, rel) or std.mem.startsWith(u8, key, prefix)) {
+            try keys.append(allocator, key);
+        }
+    }
+    for (keys.items) |key| {
+        _ = created.remove(key);
+        allocator.free(key);
+    }
+}
+
+fn createdHasDescendant(created: *const CreatedPathMap, rel: []const u8) bool {
+    var it = created.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (key.len <= rel.len) continue;
+        if (!std.mem.startsWith(u8, key, rel)) continue;
+        if (key[rel.len] == '/') return true;
+    }
+    return false;
 }
 
 fn ensureRequiredDir(
@@ -671,7 +761,9 @@ fn ensureRequiredDir(
         },
         else => |e| return e,
     };
-    if (stat.kind != .directory and stat.kind != .sym_link) return error.RequiredRootFSPathNotDirectory;
+    if (stat.kind != .directory) return error.RequiredRootFSPathNotDirectory;
+    root.setFilePermissions(io, rel, permissionsFromMode(mode, .default_dir), .{ .follow_symlinks = false }) catch {};
+    try ownership_mod.record(allocator, ownership, rel, .{ .uid = 0, .gid = 0 });
 }
 
 fn recordImplicitDirectoryOwnership(
@@ -878,7 +970,9 @@ fn tarLinkName(header: *const [512]u8) []const u8 {
 }
 
 fn tarMode(header: *const [512]u8) !u32 {
-    return @intCast(try parseTarNumber(header[100..108]));
+    const value = try parseTarNumber(header[100..108]);
+    if (value > std.math.maxInt(u32)) return error.BadTarHeader;
+    return @intCast(value);
 }
 
 fn tarOwnership(header: *const [512]u8, pax: PendingPax) !Ownership {
@@ -946,6 +1040,13 @@ fn permissionsFromMode(mode: u32, fallback: Io.Dir.Permissions) Io.Dir.Permissio
     return fallback;
 }
 
+fn permissionsToMode(permissions: Io.Dir.Permissions) ?u32 {
+    if (@hasDecl(Io.Dir.Permissions, "toMode")) {
+        return @intCast(permissions.toMode() & 0o7777);
+    }
+    return null;
+}
+
 test "safe tar path rejects traversal and absolute entries" {
     const allocator = std.testing.allocator;
     const path = try safeTarPath(allocator, "./usr/bin/tool");
@@ -954,6 +1055,25 @@ test "safe tar path rejects traversal and absolute entries" {
     try std.testing.expectError(error.UnsafeTarPath, safeTarPath(allocator, "/etc/passwd"));
     try std.testing.expectError(error.UnsafeTarPath, safeTarPath(allocator, "../escape"));
     try std.testing.expectError(error.UnsafeTarPath, safeTarPath(allocator, "a/../../escape"));
+}
+
+test "layer blob path validates sha256 digest before slicing" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.UnsupportedDigest, layerBlobPath(allocator, "layers", "sha256:short"));
+    try std.testing.expectError(
+        error.UnsupportedDigest,
+        layerBlobPath(allocator, "layers", "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde/"),
+    );
+    const path = try layerBlobPath(
+        allocator,
+        "layers",
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings(
+        "layers/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.blob",
+        path,
+    );
 }
 
 test "ext4 tool detection finds executable on PATH" {
@@ -1013,8 +1133,10 @@ test "whiteout removes lower-layer path" {
     try root.writeFile(io, .{ .sub_path = "etc/old", .data = "old" });
     var ownership = OwnershipMap.init(allocator);
     defer ownership_mod.deinit(allocator, &ownership);
+    var created = CreatedPathMap.init(allocator);
+    defer deinitCreatedPaths(allocator, &created);
     try ownership_mod.record(allocator, &ownership, "etc/old", .{ .uid = 1, .gid = 2 });
-    try std.testing.expect(try applyWhiteout(allocator, io, root, &ownership, "etc/.wh.old"));
+    try std.testing.expect(try applyWhiteout(allocator, io, root, &ownership, &created, "etc/.wh.old"));
     try std.testing.expectError(error.FileNotFound, root.statFile(io, "etc/old", .{}));
     try std.testing.expect(!ownership.contains("etc/old"));
 }
@@ -1029,7 +1151,45 @@ test "whiteout ignores already absent target" {
     try root.createDirPath(io, "etc");
     var ownership = OwnershipMap.init(allocator);
     defer ownership_mod.deinit(allocator, &ownership);
-    try std.testing.expect(try applyWhiteout(allocator, io, root, &ownership, "etc/.wh.missing"));
+    var created = CreatedPathMap.init(allocator);
+    defer deinitCreatedPaths(allocator, &created);
+    try std.testing.expect(try applyWhiteout(allocator, io, root, &ownership, &created, "etc/.wh.missing"));
+}
+
+test "opaque whiteout preserves entries created in current layer" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-opaque-current-layer";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var root = try Io.Dir.cwd().createDirPathOpen(io, tmp, .{ .open_options = .{ .iterate = true, .access_sub_paths = true } });
+    defer root.close(io);
+    try root.createDirPath(io, "dir/sub");
+    try root.writeFile(io, .{ .sub_path = "dir/lower", .data = "lower" });
+    try root.writeFile(io, .{ .sub_path = "dir/current", .data = "current" });
+    try root.writeFile(io, .{ .sub_path = "dir/sub/lower", .data = "lower" });
+    try root.writeFile(io, .{ .sub_path = "dir/sub/current", .data = "current" });
+
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+    try ownership_mod.record(allocator, &ownership, "dir/lower", .{ .uid = 1, .gid = 1 });
+    try ownership_mod.record(allocator, &ownership, "dir/current", .{ .uid = 2, .gid = 2 });
+    try ownership_mod.record(allocator, &ownership, "dir/sub/lower", .{ .uid = 3, .gid = 3 });
+    try ownership_mod.record(allocator, &ownership, "dir/sub/current", .{ .uid = 4, .gid = 4 });
+
+    var created = CreatedPathMap.init(allocator);
+    defer deinitCreatedPaths(allocator, &created);
+    try recordCreatedPath(allocator, &created, "dir/current");
+    try recordCreatedPath(allocator, &created, "dir/sub/current");
+
+    try std.testing.expect(try applyWhiteout(allocator, io, root, &ownership, &created, "dir/.wh..wh..opq"));
+    try std.testing.expectError(error.FileNotFound, root.statFile(io, "dir/lower", .{}));
+    try std.testing.expectError(error.FileNotFound, root.statFile(io, "dir/sub/lower", .{}));
+    try root.access(io, "dir/current", .{});
+    try root.access(io, "dir/sub/current", .{});
+    try std.testing.expect(!ownership.contains("dir/lower"));
+    try std.testing.expect(!ownership.contains("dir/sub/lower"));
+    try std.testing.expect(ownership.contains("dir/current"));
+    try std.testing.expect(ownership.contains("dir/sub/current"));
 }
 
 test "opaque whiteout rejects symlink parent" {
@@ -1048,11 +1208,62 @@ test "opaque whiteout rejects symlink parent" {
 
     var ownership = OwnershipMap.init(allocator);
     defer ownership_mod.deinit(allocator, &ownership);
+    var created = CreatedPathMap.init(allocator);
+    defer deinitCreatedPaths(allocator, &created);
     try std.testing.expectError(
         error.SymlinkTraversal,
-        applyWhiteout(allocator, io, root, &ownership, "link/.wh..wh..opq"),
+        applyWhiteout(allocator, io, root, &ownership, &created, "link/.wh..wh..opq"),
     );
     try Io.Dir.cwd().access(io, victim_path ++ "/keep", .{});
+}
+
+test "directory entries preserve tar mode" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-directory-mode";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var root = try Io.Dir.cwd().createDirPathOpen(io, tmp, .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+
+    try writeDirectory(allocator, io, root, "root", 0o700);
+    const stat = try root.statFile(io, "root", .{ .follow_symlinks = false });
+    if (permissionsToMode(stat.permissions)) |mode| {
+        try std.testing.expectEqual(@as(u32, 0o700), mode & 0o777);
+    }
+}
+
+test "hardlink entries preserve inode identity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-hardlink";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var root = try Io.Dir.cwd().createDirPathOpen(io, tmp, .{ .open_options = .{ .iterate = true, .access_sub_paths = true } });
+    defer root.close(io);
+    try root.writeFile(io, .{ .sub_path = "target", .data = "same" });
+
+    try createHardlinkTarget(allocator, io, root, "alias", "target");
+    const target = try root.statFile(io, "target", .{ .follow_symlinks = false });
+    const alias = try root.statFile(io, "alias", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(target.inode, alias.inode);
+    try std.testing.expect(target.nlink >= 2);
+}
+
+test "required mount directories reject symlinks" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-required-dir-symlink";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var root = try Io.Dir.cwd().createDirPathOpen(io, tmp, .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try root.createDirPath(io, "target");
+    try root.symLink(io, "target", "dev", .{});
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+
+    try std.testing.expectError(
+        error.RequiredRootFSPathNotDirectory,
+        ensureRequiredDir(allocator, io, root, &ownership, "dev", 0o755),
+    );
 }
 
 test "tar layer rejects symlink traversal from earlier entry" {
@@ -1085,6 +1296,13 @@ test "oversized binary tar numbers fail closed" {
     var raw = [_]u8{0xff} ** 12;
     raw[0] = 0x80;
     try std.testing.expectError(error.BadTarHeader, parseTarNumber(&raw));
+}
+
+test "oversized binary tar modes fail closed" {
+    var header = [_]u8{0} ** 512;
+    header[100] = 0x80;
+    header[103] = 0x01;
+    try std.testing.expectError(error.BadTarHeader, tarMode(&header));
 }
 
 fn fuzzTarLayer(_: void, s: *std.testing.Smith) !void {

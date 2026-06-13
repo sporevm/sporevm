@@ -9,7 +9,9 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const min_rootfs_size_bytes: u64 = 512 << 20;
 const rootfs_headroom_bytes: u64 = 128 << 20;
 const rootfs_align_bytes: u64 = 4 << 20;
-const superblock_scan_chunk_bytes: usize = 1024 * 1024;
+const ext4_superblock_offset: u64 = 1024;
+const ext4_superblock_size: usize = 1024;
+const ext4_feature_sparse_super: u32 = 0x0001;
 const deterministic_epoch: Io.Timestamp = .{ .nanoseconds = 0 };
 
 pub const Determinism = struct {
@@ -246,6 +248,7 @@ fn normalizeDirChildrenTimestamps(allocator: std.mem.Allocator, io: Io, dir: Io.
 }
 
 fn normalizeSuperblockTimestamps(allocator: std.mem.Allocator, io: Io, path: []const u8, uuid: [16]u8) !void {
+    _ = allocator;
     var file = if (Io.Dir.path.isAbsolute(path))
         try Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write })
     else
@@ -253,30 +256,84 @@ fn normalizeSuperblockTimestamps(allocator: std.mem.Allocator, io: Io, path: []c
     defer file.close(io);
 
     const stat = try file.stat(io);
-    const buffer = try allocator.alloc(u8, superblock_scan_chunk_bytes);
-    defer allocator.free(buffer);
+    var primary: [ext4_superblock_size]u8 = undefined;
+    const read = try file.readPositionalAll(io, &primary, ext4_superblock_offset);
+    if (read != primary.len or !isExt4Superblock(&primary, uuid)) return error.BadExt4Image;
+    const layout = try ext4Layout(&primary);
 
-    var offset: u64 = 0;
-    while (offset < stat.size) {
-        const read_len: usize = @intCast(@min(buffer.len, stat.size - offset));
-        const read = try file.readPositionalAll(io, buffer[0..read_len], offset);
-        if (read == 0) break;
+    try zeroSuperblockTimestampFields(file, io, ext4_superblock_offset);
 
-        var index: usize = 0;
-        while (index + 1024 <= read) : (index += 1024) {
-            const block = buffer[index .. index + 1024];
-            if (block[0x38] != 0x53 or block[0x39] != 0xef) continue;
-            if (!std.mem.eql(u8, block[0x68..0x78], &uuid)) continue;
-
-            const superblock_offset = offset + index;
-            try zeroFileRange(file, io, superblock_offset + 0x2c, 4); // s_mtime
-            try zeroFileRange(file, io, superblock_offset + 0x30, 4); // s_wtime
-            try zeroFileRange(file, io, superblock_offset + 0x40, 4); // s_lastcheck
-            try zeroFileRange(file, io, superblock_offset + 0x108, 4); // s_mkfs_time
-            try zeroFileRange(file, io, superblock_offset + 0x240, 8); // s_kbytes_written
-        }
-        offset += read;
+    var group: u64 = 1;
+    while (group < layout.group_count) : (group += 1) {
+        if (layout.sparse_super and !isSparseSuperGroup(group)) continue;
+        const superblock_offset = (layout.first_data_block + group * layout.blocks_per_group) * layout.block_size;
+        if (superblock_offset + ext4_superblock_size > stat.size) continue;
+        if (!try ext4SuperblockAt(file, io, superblock_offset, uuid)) continue;
+        try zeroSuperblockTimestampFields(file, io, superblock_offset);
     }
+}
+
+const Ext4Layout = struct {
+    block_size: u64,
+    blocks_count: u64,
+    first_data_block: u64,
+    blocks_per_group: u64,
+    group_count: u64,
+    sparse_super: bool,
+};
+
+fn ext4Layout(superblock: *const [ext4_superblock_size]u8) !Ext4Layout {
+    const blocks_count_lo = std.mem.readInt(u32, superblock[0x04..0x08], .little);
+    const blocks_count_hi = std.mem.readInt(u32, superblock[0x150..0x154], .little);
+    const blocks_count = (@as(u64, blocks_count_hi) << 32) | blocks_count_lo;
+    const first_data_block = std.mem.readInt(u32, superblock[0x14..0x18], .little);
+    const log_block_size = std.mem.readInt(u32, superblock[0x18..0x1c], .little);
+    if (log_block_size > 16) return error.BadExt4Image;
+    const block_size = @as(u64, 1024) << @intCast(log_block_size);
+    const blocks_per_group = std.mem.readInt(u32, superblock[0x20..0x24], .little);
+    if (blocks_per_group == 0 or blocks_count <= first_data_block) return error.BadExt4Image;
+    const data_blocks = blocks_count - first_data_block;
+    const group_count = (data_blocks + blocks_per_group - 1) / blocks_per_group;
+    const ro_compat = std.mem.readInt(u32, superblock[0x64..0x68], .little);
+    return .{
+        .block_size = block_size,
+        .blocks_count = blocks_count,
+        .first_data_block = first_data_block,
+        .blocks_per_group = blocks_per_group,
+        .group_count = group_count,
+        .sparse_super = (ro_compat & ext4_feature_sparse_super) != 0,
+    };
+}
+
+fn ext4SuperblockAt(file: Io.File, io: Io, offset: u64, uuid: [16]u8) !bool {
+    var block: [ext4_superblock_size]u8 = undefined;
+    const read = try file.readPositionalAll(io, &block, offset);
+    if (read != block.len) return false;
+    return isExt4Superblock(&block, uuid);
+}
+
+fn isExt4Superblock(block: *const [ext4_superblock_size]u8, uuid: [16]u8) bool {
+    if (block[0x38] != 0x53 or block[0x39] != 0xef) return false;
+    return std.mem.eql(u8, block[0x68..0x78], &uuid);
+}
+
+fn isSparseSuperGroup(group: u64) bool {
+    return group == 0 or group == 1 or isPowerOf(group, 3) or isPowerOf(group, 5) or isPowerOf(group, 7);
+}
+
+fn isPowerOf(value: u64, base: u64) bool {
+    if (value == 0) return false;
+    var n = value;
+    while (n % base == 0) n /= base;
+    return n == 1;
+}
+
+fn zeroSuperblockTimestampFields(file: Io.File, io: Io, superblock_offset: u64) !void {
+    try zeroFileRange(file, io, superblock_offset + 0x2c, 4); // s_mtime
+    try zeroFileRange(file, io, superblock_offset + 0x30, 4); // s_wtime
+    try zeroFileRange(file, io, superblock_offset + 0x40, 4); // s_lastcheck
+    try zeroFileRange(file, io, superblock_offset + 0x108, 4); // s_mkfs_time
+    try zeroFileRange(file, io, superblock_offset + 0x240, 8); // s_kbytes_written
 }
 
 fn zeroFileRange(file: Io.File, io: Io, offset: u64, len: usize) !void {
@@ -406,4 +463,47 @@ test "debugfs stderr checker accepts banner and rejects diagnostics" {
         error.DebugfsFailed,
         checkDebugfsStderrBytes("debugfs 1.47.3 (8-Jul-2025)\n/nope: File not found by ext2_lookup\n"),
     );
+}
+
+test "superblock timestamp normalization ignores matching file data" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "zig-cache/test-rootfs-superblock-normalize.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try createEmptyFile(io, path, 16 * 1024);
+    var file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    const uuid = [_]u8{0xaa} ** 16;
+    var primary = [_]u8{0} ** ext4_superblock_size;
+    primary[0x38] = 0x53;
+    primary[0x39] = 0xef;
+    @memcpy(primary[0x68..0x78], &uuid);
+    std.mem.writeInt(u32, primary[0x04..0x08], 16, .little); // s_blocks_count_lo
+    std.mem.writeInt(u32, primary[0x14..0x18], 1, .little); // s_first_data_block
+    std.mem.writeInt(u32, primary[0x18..0x1c], 0, .little); // 1024-byte blocks
+    std.mem.writeInt(u32, primary[0x20..0x24], 8192, .little); // s_blocks_per_group
+    std.mem.writeInt(u32, primary[0x2c..0x30], 1, .little);
+    std.mem.writeInt(u32, primary[0x30..0x34], 2, .little);
+    std.mem.writeInt(u32, primary[0x40..0x44], 3, .little);
+    std.mem.writeInt(u32, primary[0x108..0x10c], 4, .little);
+    std.mem.writeInt(u64, primary[0x240..0x248], 5, .little);
+    try file.writePositionalAll(io, &primary, ext4_superblock_offset);
+
+    var data = primary;
+    std.mem.writeInt(u32, data[0x2c..0x30], 0x11111111, .little);
+    std.mem.writeInt(u32, data[0x30..0x34], 0x22222222, .little);
+    try file.writePositionalAll(io, &data, 4096);
+
+    try normalizeSuperblockTimestamps(allocator, io, path, uuid);
+
+    var primary_after: [ext4_superblock_size]u8 = undefined;
+    var data_after: [ext4_superblock_size]u8 = undefined;
+    try std.testing.expectEqual(primary_after.len, try file.readPositionalAll(io, &primary_after, ext4_superblock_offset));
+    try std.testing.expectEqual(data_after.len, try file.readPositionalAll(io, &data_after, 4096));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, primary_after[0x2c..0x30], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, primary_after[0x30..0x34], .little));
+    try std.testing.expectEqual(@as(u32, 0x11111111), std.mem.readInt(u32, data_after[0x2c..0x30], .little));
+    try std.testing.expectEqual(@as(u32, 0x22222222), std.mem.readInt(u32, data_after[0x30..0x34], .little));
 }
