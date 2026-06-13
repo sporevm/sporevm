@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: active
 last_reviewed: 2026-06-13
 related_plans:
   - buildkite/cleanroom: docs/plans/sandbox-suspend-wake.md
@@ -154,7 +154,8 @@ spore manifest
 ```
 
 Chunks live in a local CAS directory; v0 manifests are JSON documents. Disk
-manifests and access traces land in later fork/fan-out and lazy-restore slices.
+manifests land in later fork/fan-out slices. Access traces are local benchmark
+artifacts today; persisted manifest hints land with later readahead work.
 Spores are exportable as OCI artifacts so existing registries (and cleanroom's
 gateway/content-cache) can serve them.
 
@@ -312,10 +313,10 @@ child_resume_max_ms=813, and total_smoke_ms=12695. A true 100-concurrent
 same-host CoW RAM backing lands; otherwise the test mostly proves the host has
 enough RAM for eager restores.
 
-Slice 5 is now in progress with the first KVM same-host RAM backing step. KVM
-snapshots write an optional local `ram.backing` file next to the canonical chunk
-store; `spore fork` propagates that backing to children only when the local file
-is still available, otherwise it drops the optional metadata and leaves children
+Slice 5's KVM same-host RAM backing proof has landed. KVM snapshots write an
+optional local `ram.backing` file next to the canonical chunk store; `spore
+fork` propagates that backing to children only when the local file is still
+available, otherwise it drops the optional metadata and leaves children
 restorable from chunks. The KVM boot harness requires an explicit trusted
 same-host opt-in before opening `ram.backing`, then passes the already-open fd
 into the KVM backend for `MAP_PRIVATE` mapping. That trusted fd path checks the
@@ -430,6 +431,10 @@ is recorded. The high-concurrency memory-efficiency gate moves to Slice 5 so we
 do not mistake eager restore host capacity for fork architecture.
 
 ### Slice 5: Elastic same-host RAM and lazy restore
+
+Status: complete for the primary KVM same-host/fan-out proof. Product monitor
+wiring, readahead, clean pager error propagation, and HVF-equivalent elastic RAM
+remain follow-up hardening/portability work.
 
 First land the identical-host hot fork path in incremental steps. The interim
 KVM step uses a local `ram.backing` file and trusted same-host opt-in to open a

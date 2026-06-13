@@ -81,7 +81,9 @@ A spore is a directory:
   same backing disk file, unmodified since the snapshot (same-host suspend
   semantics; Firecracker snapshots have the same constraint). The disk
   manifest is planned for the fork/fan-out slices.
-- Access traces (lazy-restore prefetch hints): slice 5.
+- Access traces: the KVM lazy-restore harness can write a local first-touch
+  trace for measurement, but v0 does not persist access traces or prefetch
+  hints in the manifest.
 - Multi-vCPU machine state.
 - Kernel identity in the platform contract (pinned-build enforcement).
 - Durable disk/device identity fixup beyond the current diskless helper. The

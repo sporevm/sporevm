@@ -76,7 +76,7 @@ block identical-host fork/fan-out.
 | Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; fork path populates it |
 | Disk contents | not represented | no | same external bytes required | no | same external bytes required | out of v0 |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
-| Access trace | not yet represented | no | no | no | no | planned for lazy restore |
+| Access trace | not yet represented | no | no | no | no | local KVM lazy trace only; not a portability contract |
 
 ## Register classes
 
@@ -251,5 +251,5 @@ Current evidence:
    creation, frequency-neutral timer state plus guest-visible constraints, or
    host-class matching only.
 4. Make HVF emit portable GICv3 state instead of only the backend-private blob.
-5. Extend the matrix when multi-vCPU state, access traces, lazy restore, and
-   fork generation semantics land.
+5. Extend the matrix when multi-vCPU state, persisted access traces/readahead
+   hints, and additional fork generation semantics land.

@@ -24,12 +24,12 @@ fuzz targets from the slice that introduces it:
 |---|---|---|
 | Virtqueue descriptors, rings, and device request headers | guest memory | shared queue/MMIO paths and current console/blk/net/vsock/rng device paths fuzzed; new device parsers require fuzz targets in the same slice |
 | Guest memory access during dirty scans | guest | required at slice 7 |
-| Lazy RAM fault handling | guest page faults plus spore CAS chunks | KVM userfaultfd path is opt-in while under development; faults materialize whole verified chunks and fail closed on malformed manifests or chunk mismatches |
+| Lazy RAM fault handling | guest page faults plus spore CAS chunks | KVM userfaultfd path is opt-in; faults materialize whole verified chunks and fail closed on malformed manifests or chunk mismatches |
 | Spore manifest decode | registry, disk | fuzzed; unknown versions and malformed manifests fail closed |
-| Chunk decode (zstd) and CAS reads | peers, registry, disk | required at slice 5 |
+| CAS chunk reads | peers, registry, disk | BLAKE3 verified before restore; malformed memory manifests are fuzzed; compression is not in v0 |
 | OCI manifest and layer decode | registry | rootfs builder only, outside the monitor process; mutable tags are resolved into digest-pinned refs before build materialization, blobs are verified, tar application is path-safe, and JSON/tar fuzz targets cover parser inputs |
-| Generation device inputs | guest | MMIO register surface fuzzed; fork params schema required at slice 6 |
-| Control socket JSON | local consumers | required at slice 3 |
+| Generation device inputs | guest | MMIO register surface and fork/resume params schema are fuzz/unit covered |
+| Control socket JSON | local consumers | product monitor protocol not implemented yet |
 
 ## Structural Rules
 
