@@ -133,6 +133,7 @@ fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8, std
 
     const out = output orelse return error.MissingOutputPath;
     const meta = metadata orelse try std.fmt.allocPrint(allocator, "{s}.json", .{out});
+    if (std.mem.eql(u8, out, meta)) return error.RootFSMetadataPathMatchesOutput;
     return .{
         .ref = image_ref orelse return error.MissingImageReference,
         .output = out,
@@ -646,9 +647,14 @@ fn writeDirectory(
     mode: u32,
 ) !void {
     try ensureNoSymlinkPath(allocator, io, root, parentPath(rel), false);
+    try ensureParent(allocator, root, io, rel);
     try prepareEntryPath(allocator, io, root, ownership, created, rel, .directory);
-    try root.createDirPath(io, rel);
-    root.setFilePermissions(io, rel, permissionsFromMode(mode, .default_dir), .{ .follow_symlinks = false }) catch {};
+    const permissions = permissionsFromMode(mode, .default_dir);
+    root.createDir(io, rel, permissions) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => |e| return e,
+    };
+    root.setFilePermissions(io, rel, permissions, .{ .follow_symlinks = false }) catch {};
 }
 
 fn writeSymlink(
@@ -1110,10 +1116,17 @@ fn readPaxHeader(allocator: std.mem.Allocator, reader: *Io.Reader, size: u64, ou
                 out.uid = try parsePaxId(value);
             } else if (std.mem.eql(u8, key, "gid")) {
                 out.gid = try parsePaxId(value);
+            } else if (isPaxXattrKey(key)) {
+                return error.UnsupportedTarXattr;
             }
         }
         index = line_start + line_len;
     }
+}
+
+fn isPaxXattrKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "SCHILY.xattr.") or
+        std.mem.startsWith(u8, key, "LIBARCHIVE.xattr.");
 }
 
 fn parsePaxId(raw: []const u8) !u32 {
@@ -1270,6 +1283,23 @@ test "layer blob path validates sha256 digest before slicing" {
     try std.testing.expectEqualStrings(
         "layers/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.blob",
         path,
+    );
+}
+
+test "build options reject metadata path matching output path" {
+    const allocator = std.testing.allocator;
+    var stdout: Io.Writer.Allocating = .init(allocator);
+    defer stdout.deinit();
+
+    try std.testing.expectError(
+        error.RootFSMetadataPathMatchesOutput,
+        parseBuildOptions(allocator, &.{
+            "registry.example/repo@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--output",
+            "rootfs.ext4",
+            "--metadata",
+            "rootfs.ext4",
+        }, &stdout.writer),
     );
 }
 
@@ -1557,6 +1587,29 @@ test "implicit parent directories use deterministic mode without changing explic
     }
 }
 
+test "nested directory entries use deterministic implicit parent mode" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-directory-implicit-parent-mode";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var root = try Io.Dir.cwd().createDirPathOpen(io, tmp, .{ .open_options = .{ .iterate = true, .access_sub_paths = true } });
+    defer root.close(io);
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+    var created = CreatedPathMap.init(allocator);
+    defer deinitCreatedPaths(allocator, &created);
+
+    try writeDirectory(allocator, io, root, &ownership, &created, "a/b", 0o700);
+    const parent = try root.statFile(io, "a", .{ .follow_symlinks = false });
+    const child = try root.statFile(io, "a/b", .{ .follow_symlinks = false });
+    if (permissionsToMode(parent.permissions)) |mode| {
+        try std.testing.expectEqual(@as(u32, 0o755), mode & 0o777);
+    }
+    if (permissionsToMode(child.permissions)) |mode| {
+        try std.testing.expectEqual(@as(u32, 0o700), mode & 0o777);
+    }
+}
+
 test "hardlink entries preserve inode identity" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1724,6 +1777,18 @@ test "malformed pax records fail closed" {
     var pax: PendingPax = .{};
     defer pax.clear(allocator);
     try std.testing.expectError(error.BadPaxHeader, readPaxHeader(allocator, &reader, 2, &pax));
+}
+
+test "pax xattr records fail closed" {
+    const allocator = std.testing.allocator;
+    const record = "24 SCHILY.xattr.foo=bar\n";
+    var block = [_]u8{0} ** 512;
+    @memcpy(block[0..record.len], record);
+    var reader: Io.Reader = .fixed(&block);
+    var pax: PendingPax = .{};
+    defer pax.clear(allocator);
+
+    try std.testing.expectError(error.UnsupportedTarXattr, readPaxHeader(allocator, &reader, record.len, &pax));
 }
 
 test "oversized binary tar numbers fail closed" {

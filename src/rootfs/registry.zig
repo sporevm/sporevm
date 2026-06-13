@@ -69,7 +69,7 @@ pub fn fetchBlobToFile(
             if (auth_retries != 0) return error.RegistryAuthFailed;
             auth_retries += 1;
             Io.Dir.cwd().deleteFile(io, path) catch {};
-            bearer_token.* = try fetchBearerToken(allocator, client, result.auth_header.?);
+            bearer_token.* = try fetchBearerToken(allocator, client, current_url, result.auth_header.?);
             current_token = bearer_token.*;
             continue;
         }
@@ -113,7 +113,7 @@ fn fetchBytes(
         if (result.status == .unauthorized and result.auth_header != null and try sameOrigin(url, current_url)) {
             if (auth_retries != 0) return error.RegistryAuthFailed;
             auth_retries += 1;
-            bearer_token.* = try fetchBearerToken(allocator, client, result.auth_header.?);
+            bearer_token.* = try fetchBearerToken(allocator, client, current_url, result.auth_header.?);
             current_token = bearer_token.*;
             writer.clearRetainingCapacity();
             continue;
@@ -203,8 +203,9 @@ fn httpGetToWriter(
     return .{ .status = response.head.status, .auth_header = auth, .location = location };
 }
 
-fn fetchBearerToken(allocator: std.mem.Allocator, client: *std.http.Client, auth_header: []const u8) ![]const u8 {
+fn fetchBearerToken(allocator: std.mem.Allocator, client: *std.http.Client, resource_url: []const u8, auth_header: []const u8) ![]const u8 {
     const challenge = try parseBearerChallenge(auth_header);
+    try validateTokenRealm(resource_url, challenge.realm);
     const url = try challenge.tokenUrl(allocator);
     var body: Io.Writer.Allocating = .init(allocator);
     defer body.deinit();
@@ -217,6 +218,23 @@ fn fetchBearerToken(allocator: std.mem.Allocator, client: *std.http.Client, auth
     if (parsed.value.token) |token| return allocator.dupe(u8, token);
     if (parsed.value.access_token) |token| return allocator.dupe(u8, token);
     return error.RegistryAuthFailed;
+}
+
+fn validateTokenRealm(resource_url: []const u8, realm: []const u8) !void {
+    const resource = try std.Uri.parse(resource_url);
+    const token = try std.Uri.parse(realm);
+    if (!std.ascii.eqlIgnoreCase(token.scheme, "https")) return error.UnsupportedRegistryAuthRealm;
+    if (try sameOrigin(resource_url, realm)) return;
+
+    const resource_host = resource.host orelse return error.UnsupportedRegistryAuthRealm;
+    const token_host = token.host orelse return error.UnsupportedRegistryAuthRealm;
+    if (std.ascii.eqlIgnoreCase(uriComponentText(resource_host), "registry-1.docker.io") and
+        std.ascii.eqlIgnoreCase(uriComponentText(token_host), "auth.docker.io") and
+        normalizedPort(token) == 443)
+    {
+        return;
+    }
+    return error.UnsupportedRegistryAuthRealm;
 }
 
 fn streamRemainingLimited(
@@ -395,4 +413,21 @@ test "redirect resolution tracks cross-origin hops" {
     );
     defer allocator.free(relative);
     try std.testing.expect(try sameOrigin("https://ghcr.io/v2/a", relative));
+}
+
+test "token realm validation rejects cross-origin realms" {
+    try validateTokenRealm("https://ghcr.io/v2/buildkite/base/manifests/sha256:abc", "https://ghcr.io/token");
+    try validateTokenRealm("https://registry-1.docker.io/v2/library/alpine/manifests/latest", "https://auth.docker.io/token");
+    try std.testing.expectError(
+        error.UnsupportedRegistryAuthRealm,
+        validateTokenRealm("https://ghcr.io/v2/buildkite/base/manifests/sha256:abc", "http://ghcr.io/token"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedRegistryAuthRealm,
+        validateTokenRealm("https://ghcr.io/v2/buildkite/base/manifests/sha256:abc", "https://169.254.169.254/token"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedRegistryAuthRealm,
+        validateTokenRealm("https://ghcr.io/v2/buildkite/base/manifests/sha256:abc", "https://auth.example/token"),
+    );
 }

@@ -104,7 +104,7 @@ pub fn selectedManifestDigest(allocator: std.mem.Allocator, bytes: []const u8, p
         const p = desc.platform orelse continue;
         if (std.mem.eql(u8, p.os, platform.os) and std.mem.eql(u8, p.architecture, platform.arch)) {
             if (!isSha256Digest(desc.digest)) return error.UnsupportedDigest;
-            return desc.digest;
+            return try allocator.dupe(u8, desc.digest);
         }
     }
     return error.PlatformManifestNotFound;
@@ -237,6 +237,17 @@ test "file digest verification validates digest before slicing" {
     defer Io.Dir.cwd().deleteFile(io, path) catch {};
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "data" });
     try std.testing.expectError(error.UnsupportedDigest, verifyDigestFile(io, "sha256:short", path));
+}
+
+test "selected manifest digest is caller-owned" {
+    const allocator = std.testing.allocator;
+    const selected = try selectedManifestDigest(
+        allocator,
+        "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:\\u0030aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"platform\":{\"os\":\"linux\",\"architecture\":\"arm64\"}}]}",
+        .{},
+    ) orelse return error.TestExpectedEqual;
+    defer allocator.free(selected);
+    try std.testing.expectEqualStrings("sha256:0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", selected);
 }
 
 test "OCI index detection accepts manifest arrays without mediaType" {
