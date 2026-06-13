@@ -306,9 +306,9 @@ used the `cleanroom-kernels` v0.3.0 `sporevm-arm64-linux-6.1.155-Image` asset
 with `--count 32 --parallel 4`, reporting capture_ms=5323, fork_ms=47,
 children_resume_wall_ms=6663, child_resume_min_ms=811,
 child_resume_max_ms=813, and total_smoke_ms=12695. A true 100-concurrent
-512MiB fork storm with reasonable host RSS belongs after the same-host CoW RAM
-backing lands; otherwise the test mostly proves the host has enough RAM for
-eager restores.
+512MiB fork storm with reasonable aggregate child PSS belongs after the
+same-host CoW RAM backing lands; otherwise the test mostly proves the host has
+enough RAM for eager restores.
 
 Slice 5 is now in progress with the first KVM same-host RAM backing step. KVM
 snapshots write an optional local `ram.backing` file next to the canonical chunk
@@ -319,10 +319,14 @@ same-host opt-in before mapping `ram.backing` `MAP_PRIVATE`, so imported or
 untrusted spores still materialize through verified chunks. This is an interim
 path/symlink implementation that proves the CoW resume path; the sealed-fd /
 `SCM_RIGHTS` monitor shape remains the robust target before we claim the final
-trust boundary or 100-child RSS gate. The representative KVM run on the
-`m7g.metal` host used `--count 32 --parallel 4`, reported
-file_backed_children=32, child_resume_min_ms=337, child_resume_max_ms=338, and
-stored the 512MiB `ram.backing` as a sparse 28MiB file for that smoke workload.
+trust boundary. The memory-sampled KVM run on the `m7g.metal` host used
+`--count 100 --parallel 100 --mem-mib 512 --memory-sample-seconds 2`, reported
+file_backed_children=100, host_memory_sampled_children=100,
+host_pss_kib=778524, host_rss_kib=1699988, child_resume_min_ms=138, and
+child_resume_max_ms=196. That is roughly 760MiB aggregate child PSS for 50GiB
+of declared child RAM, with the 512MiB `ram.backing` stored as a sparse 28MiB
+file for that smoke workload. Remaining Slice 5 work is the sealed fd-passing
+monitor shape and cold lazy restore over CAS.
 
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
@@ -413,11 +417,13 @@ Benchmark resume time-to-first-instruction and time-to-useful-work against slice
 3's eager restore.
 
 Done when: 100 concurrent same-host forks of one 512MiB spore run distinct
-workloads with host RSS proportional to the parent's RAM plus dirty child
-working sets, not N × RAM; resume TTFI is independent of RAM size on the
-primary KVM host class; and the benchmark harness tracks it in CI (or a
-recorded manual run where CI hardware does not exist). HVF remains useful as a
-second implementation path, but does not block identical-host fan-out.
+workloads with aggregate child PSS proportional to the resident parent backing
+plus dirty child working sets, not N × RAM; summed RSS is reported only as a
+diagnostic because it double-counts shared pages. Resume TTFI is independent of
+RAM size on the primary KVM host class, and the benchmark harness tracks it in
+CI (or a recorded manual run where CI hardware does not exist). HVF remains
+useful as a second implementation path, but does not block identical-host
+fan-out.
 
 ### Slice 6: Identical-host fan-out distribution
 
@@ -468,9 +474,10 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   continuously in CI.
 - Smoke (real hardware): boot on KVM and HVF; suspend/resume matrix; fork
   storm; lazy-restore TTFI. Fork-storm smokes must report child count,
-  fork/resume latency, host RSS, and dirty-child working-set estimates so we
-  distinguish real CoW sharing from simply provisioning more RAM. Scripts in
-  `scripts/` run identically in CI and by hand. Hosts come from the
+  fork/resume latency, aggregate child PSS, RSS as a diagnostic, and
+  private/dirty-child working-set estimates so we distinguish real CoW sharing
+  from simply provisioning more RAM. Scripts in `scripts/` run identically in
+  CI and by hand. Hosts come from the
   `cleanroom-ops` fleet (aarch64 KVM dev boxes; Apple Silicon for the HVF
   side).
 - Benchmarks: suspend latency vs RAM size, fork latency, resume TTFI and

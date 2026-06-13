@@ -22,6 +22,9 @@ Options:
   --mem-mib N               guest memory size (default: 512)
   --snapshot-after-ms N     capture delay before snapshot (default: 3000)
   --resume-seconds N        seconds to let each child run (default: 6)
+  --memory-sample-seconds N keep matched KVM children alive and sample host
+                            /proc smaps_rollup after N seconds (default: 0)
+  --max-host-pss-mib N      fail if sampled child PSS exceeds this MiB total
   --cmdline TEXT            override fresh-boot kernel command line
   --boot-bin PATH           use an already-built boot harness
   --spore-bin PATH          use an already-built spore CLI
@@ -56,6 +59,8 @@ parallel="1"
 mem_mib="512"
 snapshot_after_ms="3000"
 resume_seconds="6"
+memory_sample_seconds="0"
+max_host_pss_mib=""
 cmdline=""
 boot_bin=""
 spore_bin=""
@@ -108,6 +113,16 @@ while (($#)); do
       resume_seconds="${2:-}"
       shift 2
       ;;
+    --memory-sample-seconds)
+      need_option_value "$1" "${2-}"
+      memory_sample_seconds="${2:-}"
+      shift 2
+      ;;
+    --max-host-pss-mib)
+      need_option_value "$1" "${2-}"
+      max_host_pss_mib="${2:-}"
+      shift 2
+      ;;
     --cmdline)
       need_option_value "$1" "${2-}"
       cmdline="${2:-}"
@@ -145,13 +160,24 @@ esac
 [[ -n "${kernel}" ]] || die "--kernel is required"
 [[ -f "${kernel}" ]] || die "kernel not found: ${kernel}"
 
-for numeric_value in "${count}" "${parallel}" "${mem_mib}" "${snapshot_after_ms}" "${resume_seconds}"; do
+for numeric_value in "${count}" "${parallel}" "${mem_mib}" "${snapshot_after_ms}" "${resume_seconds}" "${memory_sample_seconds}"; do
   case "${numeric_value}" in
     ''|*[!0-9]*) die "numeric options must be decimal integers" ;;
   esac
 done
+if [[ -n "${max_host_pss_mib}" ]]; then
+  case "${max_host_pss_mib}" in
+    ''|*[!0-9]*) die "--max-host-pss-mib must be a decimal integer" ;;
+  esac
+fi
 (( count > 0 )) || die "--count must be greater than zero"
 (( parallel > 0 )) || die "--parallel must be greater than zero"
+if (( memory_sample_seconds > 0 )) && [[ "${backend}" != "kvm" ]]; then
+  die "--memory-sample-seconds currently requires --backend kvm"
+fi
+if [[ -n "${max_host_pss_mib}" && "${memory_sample_seconds}" == "0" ]]; then
+  die "--max-host-pss-mib requires --memory-sample-seconds"
+fi
 
 if [[ -z "${workdir}" ]]; then
   workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-fork-smoke.XXXXXX")"
@@ -205,6 +231,12 @@ print_tail() {
 }
 
 RUN_DURATION_MS=0
+RUN_PID=""
+RUN_PID_FILE=""
+keep_matched_process=0
+if (( memory_sample_seconds > 0 )); then
+  keep_matched_process=1
+fi
 
 run_with_deadline() {
   local seconds="$1"
@@ -250,12 +282,17 @@ run_until_log_matches() {
   shift 3
 
   : >"${log}"
+  RUN_PID=""
   local start_ms
   start_ms="$(now_ms)"
   local deadline_ms=$(( start_ms + seconds * 1000 ))
   local pid
   "$@" >"${log}" 2>&1 &
   pid="$!"
+  RUN_PID="${pid}"
+  if [[ -n "${RUN_PID_FILE}" ]]; then
+    echo "${pid}" >"${RUN_PID_FILE}"
+  fi
   local marker="__sporevm_deadline_${pid}__"
   local status=124
 
@@ -279,6 +316,11 @@ run_until_log_matches() {
     fi
     sleep 0.1
   done
+
+  if (( keep_matched_process == 1 && status == 0 )) && kill -0 "${pid}" >/dev/null 2>&1; then
+    RUN_DURATION_MS=$(( $(now_ms) - start_ms ))
+    return 0
+  fi
 
   if kill -0 "${pid}" >/dev/null 2>&1; then
     kill -TERM "${pid}" >/dev/null 2>&1 || true
@@ -338,6 +380,11 @@ write_metrics() {
     echo "  \"child_resume_min_ms\": ${child_resume_min_ms},"
     echo "  \"child_resume_max_ms\": ${child_resume_max_ms},"
     echo "  \"file_backed_children\": ${file_backed_children},"
+    echo "  \"host_memory_sample_seconds\": ${memory_sample_seconds},"
+    echo "  \"host_memory_sampled_children\": ${host_memory_sampled_children},"
+    echo "  \"host_rss_kib\": ${host_rss_kib},"
+    echo "  \"host_pss_kib\": ${host_pss_kib},"
+    echo "  \"host_private_kib\": ${host_private_kib},"
     echo "  \"total_smoke_ms\": ${total_ms},"
     echo "  \"children\": ["
     for ((i = 0; i < count; i++)); do
@@ -415,16 +462,95 @@ run_child_resume() {
   fi
 
   set +e
+  RUN_PID_FILE="${result}.pid"
   run_until_log_matches "${resume_seconds}" "${complete_pattern}" "${log}" "${cmd[@]}"
   local status="$?"
   local duration_ms="${RUN_DURATION_MS}"
+  RUN_PID_FILE=""
   set -e
 
   {
     echo "status=${status}"
     echo "resume_ms=${duration_ms}"
     echo "log=${log}"
+    echo "pid=${RUN_PID}"
   } >"${result}"
+}
+
+child_pids=()
+
+cleanup_child_pids() {
+  if (( memory_sample_seconds == 0 )); then
+    return
+  fi
+  local pids=("${child_pids[@]}")
+  local pid_file result pid
+  if [[ -d "${result_dir:-}" ]]; then
+    for pid_file in "${result_dir}"/*.pid; do
+      [[ -f "${pid_file}" ]] || continue
+      pid="$(cat "${pid_file}")"
+      [[ -n "${pid}" ]] && pids+=("${pid}")
+    done
+    for result in "${result_dir}"/*.result; do
+      [[ -f "${result}" ]] || continue
+      pid="$(awk -F= '$1 == "pid" { print $2 }' "${result}")"
+      [[ -n "${pid}" ]] && pids+=("${pid}")
+    done
+  fi
+
+  for pid in "${pids[@]}"; do
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+      kill -TERM "${pid}" >/dev/null 2>&1 || true
+    fi
+  done
+  sleep 0.2
+  for pid in "${pids[@]}"; do
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+      kill -KILL "${pid}" >/dev/null 2>&1 || true
+    fi
+  done
+}
+trap cleanup_child_pids EXIT
+
+host_memory_sampled_children=0
+host_rss_kib=0
+host_pss_kib=0
+host_private_kib=0
+
+sample_host_memory() {
+  if (( memory_sample_seconds == 0 )); then
+    return
+  fi
+
+  sleep "${memory_sample_seconds}"
+  local pid rss_kib pss_kib private_kib
+  for pid in "${child_pids[@]}"; do
+    [[ -r "/proc/${pid}/smaps_rollup" ]] || continue
+    read -r rss_kib pss_kib private_kib < <(
+      awk '
+        /^Rss:/ { rss = $2 }
+        /^Pss:/ { pss = $2 }
+        /^Private_Clean:/ { private += $2 }
+        /^Private_Dirty:/ { private += $2 }
+        END { printf "%d %d %d\n", rss, pss, private }
+      ' "/proc/${pid}/smaps_rollup"
+    )
+    host_rss_kib=$(( host_rss_kib + rss_kib ))
+    host_pss_kib=$(( host_pss_kib + pss_kib ))
+    host_private_kib=$(( host_private_kib + private_kib ))
+    host_memory_sampled_children=$(( host_memory_sampled_children + 1 ))
+  done
+
+  if [[ "${host_memory_sampled_children}" != "${count}" ]]; then
+    die "sampled host memory for ${host_memory_sampled_children}/${count} children"
+  fi
+
+  if [[ -n "${max_host_pss_mib}" ]]; then
+    local max_host_pss_kib=$(( max_host_pss_mib * 1024 ))
+    if (( host_pss_kib > max_host_pss_kib )); then
+      die "host child PSS ${host_pss_kib}KiB exceeds limit ${max_host_pss_kib}KiB"
+    fi
+  fi
 }
 
 wait_batch() {
@@ -454,6 +580,10 @@ for ((i = 0; i < count; i++)); do
   status="$(awk -F= '$1 == "status" { print $2 }' "${result}")"
   resume_ms="$(awk -F= '$1 == "resume_ms" { print $2 }' "${result}")"
   log="$(awk -F= '$1 == "log" { print substr($0, index($0, "=") + 1) }' "${result}")"
+  pid="$(awk -F= '$1 == "pid" { print $2 }' "${result}")"
+  if (( memory_sample_seconds > 0 )); then
+    child_pids[i]="${pid}"
+  fi
   if [[ "${status}" != "0" ]]; then
     print_tail "${log}"
     die "child ${i} did not finish fork fixup before deadline; status ${status}"
@@ -489,6 +619,8 @@ unique_count() {
 [[ "$(unique_count "${mac_addresses[@]}")" == "${count}" ]] || die "mac_address values were not unique"
 [[ "$(unique_count "${entropy_seeds[@]}")" == "${count}" ]] || die "entropy_seed values were not unique"
 
+sample_host_memory
+
 child_resume_sum_ms=0
 child_resume_min_ms="${child_resume_ms[0]}"
 child_resume_max_ms="${child_resume_ms[0]}"
@@ -509,5 +641,5 @@ fi
 total_smoke_ms=$(( $(now_ms) - smoke_start_ms ))
 write_metrics "${children_resume_wall_ms}" "${child_resume_sum_ms}" "${child_resume_min_ms}" "${child_resume_max_ms}" "${file_backed_children}" "${total_smoke_ms}"
 
-echo "fork fan-out metrics: capture_ms=${capture_ms} fork_ms=${fork_ms} children_resume_wall_ms=${children_resume_wall_ms} child_resume_min_ms=${child_resume_min_ms} child_resume_max_ms=${child_resume_max_ms} file_backed_children=${file_backed_children} total_smoke_ms=${total_smoke_ms} metrics=${metrics_json}"
+echo "fork fan-out metrics: capture_ms=${capture_ms} fork_ms=${fork_ms} children_resume_wall_ms=${children_resume_wall_ms} child_resume_min_ms=${child_resume_min_ms} child_resume_max_ms=${child_resume_max_ms} file_backed_children=${file_backed_children} host_memory_sampled_children=${host_memory_sampled_children} host_pss_kib=${host_pss_kib} host_rss_kib=${host_rss_kib} total_smoke_ms=${total_smoke_ms} metrics=${metrics_json}"
 echo "fork fan-out ok: backend=${backend} count=${count} parallel=${parallel} workdir=${workdir}"
