@@ -27,6 +27,7 @@ pub const Config = struct {
     kernel: []const u8,
     ram_size: u64 = 512 * 1024 * 1024,
     cmdline: []const u8 = "console=hvc0",
+    initrd: ?[]const u8 = null,
     console_sink: *const fn ([]const u8) void,
     /// Read-write host fd backing /dev/vda, if any.
     disk_fd: ?std.c.fd_t = null,
@@ -164,6 +165,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     } else {
         // Fresh boot: DTB + kernel. The DTB describes exactly one
         // redistributor frame, where the framework actually put it.
+        const initrd_range = if (config.initrd) |initrd| try boot.planInitrd(ram_bytes.len, board.ram_base, config.kernel, initrd.len) else null;
         const dtb = try board.buildDtb(allocator, .{
             .ram_size = config.ram_size,
             .cpu_count = 1,
@@ -175,9 +177,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             },
             .virtio_count = @intCast(transports.len),
             .bootargs = config.cmdline,
+            .initrd = if (initrd_range) |r| .{ .start = r.start, .end = r.end } else null,
         });
         defer allocator.free(dtb);
-        const layout = try boot.load(ram_bytes, board.ram_base, config.kernel, dtb);
+        const layout = try boot.load(ram_bytes, board.ram_base, config.kernel, config.initrd, dtb);
 
         try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .cpsr, 0x3c5), "set cpsr"); // EL1h, DAIF masked
         try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .pc, layout.entry), "set pc");

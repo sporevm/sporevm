@@ -25,6 +25,7 @@ pub const Config = struct {
     kernel: []const u8,
     ram_size: u64 = 512 * 1024 * 1024,
     cmdline: []const u8 = "console=hvc0",
+    initrd: ?[]const u8 = null,
     console_sink: *const fn ([]const u8) void,
     /// Read-write host fd backing /dev/vda, if any.
     disk_fd: ?std.c.fd_t = null,
@@ -125,6 +126,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         try gen_dev.restore(allocator, m.generation);
         try snapshot.applyMachine(allocator, vm_fd, @intCast(gic_dev.fd), vcpu_fd, m.machine);
     } else {
+        const initrd_range = if (config.initrd) |initrd| try boot.planInitrd(ram_bytes.len, board.ram_base, config.kernel, initrd.len) else null;
         const dtb = try board.buildDtb(allocator, .{
             .ram_size = config.ram_size,
             .cpu_count = 1,
@@ -136,9 +138,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             },
             .virtio_count = @intCast(transports.len),
             .bootargs = config.cmdline,
+            .initrd = if (initrd_range) |r| .{ .start = r.start, .end = r.end } else null,
         });
         defer allocator.free(dtb);
-        const layout = try boot.load(ram_bytes, board.ram_base, config.kernel, dtb);
+        const layout = try boot.load(ram_bytes, board.ram_base, config.kernel, config.initrd, dtb);
 
         try kvm.setOneRegU64(vcpu_fd, kvm.coreReg(kvm.KVM_REG_ARM_CORE_PSTATE), 0x3c5); // EL1h, DAIF masked.
         try kvm.setOneRegU64(vcpu_fd, kvm.coreReg(kvm.KVM_REG_ARM_CORE_PC), layout.entry);

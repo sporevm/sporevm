@@ -299,8 +299,12 @@ has a real design. Platform compatibility checks are now shared across the
 backends, and `spore host-info` / `spore inspect` expose the host and spore
 contract fields needed to pick compatible smoke hosts (`host-info` reports the
 process-visible `CNTFRQ_EL0`; HVF's guest timer frequency remains validated by
-the HVF boot harness). The four-way
-cross-hypervisor matrix (slice 4) remains next.
+the HVF boot harness). The boot harnesses now accept `--initrd`, describe the
+initrd in `/chosen/linux,initrd-{start,end}`, and place it after the kernel so
+the first positive cross-hypervisor smoke can be diskless when using the
+`cleanroom-kernels` `initrd` profile (the default `rootfs` kernel profile
+intentionally ignores external initrds). The four-way cross-hypervisor matrix
+(slice 4) remains next.
 
 ## Delivery Strategy
 
@@ -357,6 +361,10 @@ Done when: a guest survives suspend/resume with running processes intact
 The headline result. Normalize the deltas the QEMU experiment and slice 3
 surfaced: GIC state mapping, timer offset handling, CPU feature-ID profile
 masking at creation, fail-closed contract checks.
+
+The first positive KVM→HVF smoke should use an initrd ticker and a KVM producer
+whose `CNTFRQ_EL0` matches Apple HVF's 24MHz guest counter. The m7g KVM host
+remains the same-host KVM and negative cross-frequency test host.
 
 Done when: the four-direction matrix (KVM→KVM, HVF→HVF, KVM→HVF, HVF→KVM)
 passes a smoke test where the guest resumes mid-workload and the workload

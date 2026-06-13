@@ -2,7 +2,7 @@
 //!
 //! Bring-up tool, not the product CLI. Usage:
 //!   zig build hvf-boot
-//!   ./zig-out/bin/hvf-boot <kernel-Image> [--cmdline "..."] [--mem-mib N]
+//!   ./zig-out/bin/hvf-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio]
 
 const std = @import("std");
 const sporevm = @import("sporevm");
@@ -21,12 +21,13 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
-        std.debug.print("usage: hvf-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N]\n", .{});
+        std.debug.print("usage: hvf-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio]\n", .{});
         std.process.exit(2);
     }
 
     var cmdline: ?[]const u8 = null;
     var mem_mib: u64 = 512;
+    var initrd_path: ?[]const u8 = null;
     var disk_path: ?[]const u8 = null;
     var snapshot_after_ms: ?u64 = null;
     var spore_dir: ?[]const u8 = null;
@@ -39,6 +40,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mem-mib") and i + 1 < args.len) {
             i += 1;
             mem_mib = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--initrd") and i + 1 < args.len) {
+            i += 1;
+            initrd_path = args[i];
         } else if (std.mem.eql(u8, args[i], "--disk") and i + 1 < args.len) {
             i += 1;
             disk_path = args[i];
@@ -58,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], arena, .limited(256 * 1024 * 1024));
+    const initrd = if (initrd_path) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, arena, .limited(256 * 1024 * 1024)) else null;
 
     var disk_fd: ?std.c.fd_t = null;
     if (disk_path) |path| {
@@ -72,6 +77,8 @@ pub fn main(init: std.process.Init) !void {
 
     const effective_cmdline = cmdline orelse if (disk_fd != null)
         "console=hvc0 root=/dev/vda rw init=/bin/sh"
+    else if (initrd != null)
+        "console=hvc0 rdinit=/init"
     else
         "console=hvc0 loglevel=8";
 
@@ -101,6 +108,7 @@ pub fn main(init: std.process.Init) !void {
         .kernel = kernel,
         .ram_size = mem_mib * 1024 * 1024,
         .cmdline = effective_cmdline,
+        .initrd = initrd,
         .console_sink = consoleSink,
         .disk_fd = disk_fd,
         .poll_stdin = interactive,

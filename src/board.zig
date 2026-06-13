@@ -41,12 +41,18 @@ pub const GicLayout = struct {
     redistributor_size: u64,
 };
 
+pub const InitrdRange = struct {
+    start: u64,
+    end: u64,
+};
+
 pub const Config = struct {
     ram_size: u64,
     cpu_count: u32,
     gic: GicLayout,
     virtio_count: u32,
     bootargs: []const u8,
+    initrd: ?InitrdRange = null,
 };
 
 pub fn virtioDeviceBase(index: u32) u64 {
@@ -183,6 +189,10 @@ pub fn buildDtb(allocator: std.mem.Allocator, config: Config) ![]u8 {
     {
         try f.beginNode("chosen");
         try f.propString("bootargs", config.bootargs);
+        if (config.initrd) |initrd| {
+            try f.propU64("linux,initrd-start", initrd.start);
+            try f.propU64("linux,initrd-end", initrd.end);
+        }
         try f.endNode();
     }
 
@@ -202,11 +212,14 @@ test "dtb builds and addresses are consistent" {
         },
         .virtio_count = 1,
         .bootargs = "console=hvc0",
+        .initrd = .{ .start = 0x8200_0000, .end = 0x8210_0000 },
     });
     defer std.testing.allocator.free(blob);
     try std.testing.expect(blob.len > 256);
     // Spot-check: bootargs string and compatible strings made it in.
     try std.testing.expect(std.mem.indexOf(u8, blob, "console=hvc0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blob, "linux,initrd-start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blob, "linux,initrd-end") != null);
     try std.testing.expect(std.mem.indexOf(u8, blob, "arm,gic-v3") != null);
     try std.testing.expect(std.mem.indexOf(u8, blob, "virtio,mmio") != null);
     try std.testing.expect(std.mem.indexOf(u8, blob, "sporevm,generation-v1") != null);

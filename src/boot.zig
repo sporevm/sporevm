@@ -43,12 +43,39 @@ pub const Layout = struct {
     dtb: u64,
 };
 
+pub const InitrdRange = struct {
+    start: u64,
+    end: u64,
+};
+
+pub fn planInitrd(ram_len: usize, ram_base: u64, kernel: []const u8, initrd_len: usize) Error!?InitrdRange {
+    if (initrd_len == 0) return null;
+    const kernel_end = try kernelEndOffset(ram_len, kernel);
+    const initrd_offset = std.mem.alignForward(u64, kernel_end, 0x20_0000);
+    if (initrd_offset > ram_len) return error.RamTooSmall;
+    if (initrd_len > ram_len - initrd_offset) return error.RamTooSmall;
+    return .{
+        .start = ram_base + initrd_offset,
+        .end = ram_base + initrd_offset + initrd_len,
+    };
+}
+
+fn kernelEndOffset(ram_len: usize, kernel: []const u8) Error!u64 {
+    const info = try parseImage(kernel);
+    if (info.text_offset >= ram_len) return error.RamTooSmall;
+    const kernel_room = ram_len - info.text_offset;
+    const effective_size = @max(info.image_size, kernel.len);
+    if (kernel.len > kernel_room or effective_size > kernel_room) return error.ImageTooLarge;
+    return info.text_offset + effective_size;
+}
+
 /// Place kernel and DTB into guest RAM and return the boot layout.
 ///
-/// The kernel goes at `ram_base + text_offset`. The DTB goes near the top of
-/// RAM, 2MiB aligned, which keeps it clear of the kernel image, BSS, and
-/// early allocations.
-pub fn load(ram: []u8, ram_base: u64, kernel: []const u8, dtb: []const u8) Error!Layout {
+/// The kernel goes at `ram_base + text_offset`. An optional initrd goes after
+/// the kernel's effective image, 2MiB aligned. The DTB goes near the top of RAM,
+/// also 2MiB aligned, which keeps it clear of the kernel image, BSS, initrd,
+/// and early allocations.
+pub fn load(ram: []u8, ram_base: u64, kernel: []const u8, initrd: ?[]const u8, dtb: []const u8) Error!Layout {
     const info = try parseImage(kernel);
 
     if (info.text_offset >= ram.len) return error.RamTooSmall;
@@ -56,11 +83,20 @@ pub fn load(ram: []u8, ram_base: u64, kernel: []const u8, dtb: []const u8) Error
     const effective_size = @max(info.image_size, kernel.len);
     if (kernel.len > kernel_room or effective_size > kernel_room) return error.ImageTooLarge;
 
+    var occupied_end = info.text_offset + effective_size;
+    const initrd_range = if (initrd) |bytes| try planInitrd(ram.len, ram_base, kernel, bytes.len) else null;
+    if (initrd_range) |range| occupied_end = range.end - ram_base;
+
     const dtb_offset = std.mem.alignBackward(u64, ram.len - @min(ram.len, dtb.len + 0x20_0000), 0x20_0000);
-    if (dtb_offset < info.text_offset + effective_size) return error.RamTooSmall;
+    if (dtb_offset < occupied_end) return error.RamTooSmall;
     if (dtb_offset + dtb.len > ram.len) return error.RamTooSmall;
 
     @memcpy(ram[@intCast(info.text_offset)..][0..kernel.len], kernel);
+    if (initrd) |bytes| {
+        const range = initrd_range.?;
+        const initrd_offset: usize = @intCast(range.start - ram_base);
+        @memcpy(ram[initrd_offset..][0..bytes.len], bytes);
+    }
     @memcpy(ram[@intCast(dtb_offset)..][0..dtb.len], dtb);
 
     return .{
@@ -97,7 +133,7 @@ test "load places kernel at text_offset and dtb high and aligned" {
     @memset(ram, 0);
 
     const dtb = "not a real dtb";
-    const layout = try load(ram, 0x8000_0000, img, dtb);
+    const layout = try load(ram, 0x8000_0000, img, null, dtb);
 
     try std.testing.expectEqual(@as(u64, 0x8000_0000 + 0x80000), layout.entry);
     try std.testing.expect(layout.dtb % 0x20_0000 == 0);
@@ -113,5 +149,24 @@ test "load rejects kernels that do not fit" {
     defer allocator.free(img);
     const ram = try allocator.alloc(u8, 16 * 1024 * 1024);
     defer allocator.free(ram);
-    try std.testing.expectError(error.ImageTooLarge, load(ram, 0x8000_0000, img, "dtb"));
+    try std.testing.expectError(error.ImageTooLarge, load(ram, 0x8000_0000, img, null, "dtb"));
+}
+
+test "load places initrd after kernel and before dtb" {
+    const allocator = std.testing.allocator;
+    const img = try makeImage(allocator, 0x80000, 0x100000, 1024);
+    defer allocator.free(img);
+
+    const ram = try allocator.alloc(u8, 64 * 1024 * 1024);
+    defer allocator.free(ram);
+    @memset(ram, 0);
+
+    const initrd = "tiny initramfs";
+    const range = (try planInitrd(ram.len, 0x8000_0000, img, initrd.len)).?;
+    const layout = try load(ram, 0x8000_0000, img, initrd, "dtb");
+
+    try std.testing.expectEqual(@as(u64, 0x8020_0000), range.start);
+    try std.testing.expect(range.end < layout.dtb);
+    const off: usize = @intCast(range.start - 0x8000_0000);
+    try std.testing.expectEqualStrings(initrd, ram[off .. off + initrd.len]);
 }

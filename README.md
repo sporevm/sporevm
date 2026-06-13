@@ -50,6 +50,11 @@ mise exec -- zig build hvf-gic-probe # probe HVF GICv3 portable-state support
 mise exec -- zig build kvm-boot   # build the KVM kernel boot harness on Linux/aarch64
 ```
 
+The `hvf-boot` and `kvm-boot` harnesses accept `--initrd root.cpio` for
+diskless smoke workloads (`rdinit=/init` by default when no disk is supplied).
+Use an initrd-capable kernel such as the `cleanroom-kernels` `initrd` profile;
+the default `rootfs` profile intentionally ignores external initrds.
+
 KVM work needs an aarch64 Linux host with KVM; Hypervisor.framework work needs
 an Apple Silicon Mac on macOS 15+.
 
