@@ -221,8 +221,26 @@ Buildkite pipeline targeting the `cleanroom` and `cleanroom-mac` queues, and
 the QEMU cross-accelerator experiment designed in `docs/research.md`.
 
 Slice 0 remains open until the QEMU KVM↔HVF experiment has run on real hosts
-and its keep/adjust decision is recorded, and until the pipeline has gone
-green on both queues.
+and its keep/adjust decision is recorded. CI is deferred until the repo gets a
+remote; local `zig build test` is the verification gate for now.
+
+Slice 2 (HVF boot) started ahead of slice 1 because the local dev machine is
+an Apple Silicon Mac while the aarch64 KVM dev host is still being
+provisioned. The HVF path boots the cleanroom 6.1.155 kernel to the expected
+root-mount panic with working GICv3 interrupts, virtio-mmio console output,
+and PSCI. HVF bring-up findings now encoded in `src/hvf/`:
+
+- Apple's hv_gic emulates the redistributor/distributor *behavior* in-kernel
+  but still traps GICD/GICR MMIO that misses its claimed ranges; the
+  `hv_gic_{get,set}_*_reg` enums are architectural register offsets but the
+  calls return HV_DENIED at runtime (they are save/restore APIs). Correct
+  approach: set MPIDR_EL1 before querying `hv_gic_get_redistributor_base` and
+  describe that exact frame in the DTB.
+- The framework reserves a large redistributor region (32MB observed); the
+  virtio-mmio window moved to 0x0c00_0000 to stay clear. This is a board
+  contract value (`src/board.zig`).
+- The cleanroom kernel has no PL011, so the first console is virtio-mmio
+  virtio-console (hvc0) and early boot is blind until virtio probes.
 
 ## Delivery Strategy
 

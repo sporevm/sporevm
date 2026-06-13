@@ -5,7 +5,17 @@
 //! module exposes the building blocks; the `spore` CLI in `main.zig` is a
 //! thin shell over them.
 
+pub const board = @import("board.zig");
+pub const boot = @import("boot.zig");
 pub const chunk = @import("chunk.zig");
+pub const fdt = @import("fdt.zig");
+pub const guestmem = @import("guestmem.zig");
+pub const hvf = @import("hvf/hvf.zig");
+pub const virtio = struct {
+    pub const queue = @import("virtio/queue.zig");
+    pub const mmio = @import("virtio/mmio.zig");
+    pub const console = @import("virtio/console.zig");
+};
 
 pub const version = "0.0.0";
 
