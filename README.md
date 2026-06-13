@@ -28,13 +28,12 @@ spore pull <spore-id> && spore resume <spore-id>   # on a different OS
 
 Early development, pre-release. The plan of record is
 [docs/plans/foundation.md](docs/plans/foundation.md). Current `main` boots a
-pinned aarch64 Linux kernel on Hypervisor.framework to an interactive shell,
-with shared virtio-mmio console, block, net, vsock, and rng devices. The HVF
-path also exposes the frozen generation MMIO device and can write/resume a v0
-spore on the same host.
+pinned aarch64 Linux kernel on Hypervisor.framework to an interactive shell and
+on KVM/aarch64 to an Alpine shell prompt, with the shared virtio-mmio console,
+block, net, vsock, rng, and generation devices. The HVF path can also
+write/resume a v0 spore on the same host.
 
-KVM bring-up and the cross-hypervisor restore matrix are still pending real
-aarch64 KVM hardware.
+KVM suspend/restore and the cross-hypervisor restore matrix are still pending.
 
 ## Development
 
@@ -45,6 +44,7 @@ mise install
 mise run build    # zig build
 mise run test     # zig build test
 mise exec -- zig build hvf-boot   # build/sign the HVF kernel boot harness
+mise exec -- zig build kvm-boot   # build the KVM kernel boot harness on Linux/aarch64
 ```
 
 KVM work needs an aarch64 Linux host with KVM; Hypervisor.framework work needs

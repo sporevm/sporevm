@@ -1,0 +1,257 @@
+//! KVM virtual machine: aarch64 Linux bring-up path.
+//!
+//! This is the first KVM slice: a single-vCPU VM using the shared SporeVM
+//! board, DTB builder, virtio-mmio devices, and generation MMIO device. KVM
+//! owns GICv3 and PSCI emulation; userspace handles only device MMIO exits and
+//! forwards virtio/generation interrupts into the VGIC.
+
+const std = @import("std");
+const kvm = @import("kvm.zig");
+const board = @import("../board.zig");
+const boot = @import("../boot.zig");
+const generation = @import("../generation.zig");
+const guestmem = @import("../guestmem.zig");
+const mmio = @import("../virtio/mmio.zig");
+const console = @import("../virtio/console.zig");
+const blk = @import("../virtio/blk.zig");
+const net = @import("../virtio/net.zig");
+const rng = @import("../virtio/rng.zig");
+const vsock = @import("../virtio/vsock.zig");
+
+pub const Config = struct {
+    kernel: []const u8,
+    ram_size: u64 = 512 * 1024 * 1024,
+    cmdline: []const u8 = "console=hvc0",
+    console_sink: *const fn ([]const u8) void,
+    /// Read-write host fd backing /dev/vda, if any.
+    disk_fd: ?std.c.fd_t = null,
+};
+
+pub const ExitCause = enum { guest_off, guest_reset };
+
+const gic_dist_base: u64 = 0x0800_0000;
+const gic_dist_size: u64 = 0x0001_0000;
+const gic_redist_base: u64 = 0x0802_0000;
+const gic_redist_size: u64 = 0x0002_0000;
+
+pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
+    const kvm_fd = try kvm.openDevKvm();
+    defer closeFd(kvm_fd);
+    try kvm.checkApiVersion(kvm_fd);
+    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_USER_MEMORY, "KVM_CAP_USER_MEMORY");
+    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ONE_REG, "KVM_CAP_ONE_REG");
+    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ARM_PSCI_0_2, "KVM_CAP_ARM_PSCI_0_2");
+    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_DEVICE_CTRL, "KVM_CAP_DEVICE_CTRL");
+
+    const vm_fd: std.c.fd_t = @intCast(try kvm.ioctl(kvm_fd, kvm.KVM_CREATE_VM, 0, "KVM_CREATE_VM"));
+    defer closeFd(vm_fd);
+
+    const ram_bytes = try std.posix.mmap(
+        null,
+        @intCast(config.ram_size),
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    defer std.posix.munmap(ram_bytes);
+    const ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
+
+    var region = kvm.UserspaceMemoryRegion{
+        .slot = 0,
+        .flags = 0,
+        .guest_phys_addr = board.ram_base,
+        .memory_size = config.ram_size,
+        .userspace_addr = @intFromPtr(ram_bytes.ptr),
+    };
+    _ = try kvm.ioctl(vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION");
+
+    const gic_dev = try createGic(vm_fd);
+    defer if (gic_dev.fd != 0) closeFd(@intCast(gic_dev.fd));
+
+    var con = console.Console{ .sink = config.console_sink };
+    var blk_dev: blk.Blk = undefined;
+    var net_dev = net.Net.init(.{});
+    var rng_dev = rng.Rng{};
+    var vsock_dev = vsock.Vsock.init(.{});
+    var gen_dev = generation.Device{};
+    var transports_buf: [5]mmio.Transport = undefined;
+    transports_buf[0] = mmio.Transport.init(con.device());
+    var transport_count: usize = 1;
+    if (config.disk_fd) |fd| {
+        blk_dev = blk.Blk.init(.{ .file = fd });
+        transports_buf[1] = mmio.Transport.init(blk_dev.device());
+        transport_count = 2;
+    }
+    transports_buf[transport_count] = mmio.Transport.init(net_dev.device());
+    transport_count += 1;
+    transports_buf[transport_count] = mmio.Transport.init(vsock_dev.device());
+    transport_count += 1;
+    transports_buf[transport_count] = mmio.Transport.init(rng_dev.device());
+    transport_count += 1;
+    const transports = transports_buf[0..transport_count];
+
+    const dtb = try board.buildDtb(allocator, .{
+        .ram_size = config.ram_size,
+        .cpu_count = 1,
+        .gic = .{
+            .distributor_base = gic_dist_base,
+            .distributor_size = gic_dist_size,
+            .redistributor_base = gic_redist_base,
+            .redistributor_size = gic_redist_size,
+        },
+        .virtio_count = @intCast(transports.len),
+        .bootargs = config.cmdline,
+    });
+    defer allocator.free(dtb);
+    const layout = try boot.load(ram_bytes, board.ram_base, config.kernel, dtb);
+
+    const vcpu_fd: std.c.fd_t = @intCast(try kvm.ioctl(vm_fd, kvm.KVM_CREATE_VCPU, 0, "KVM_CREATE_VCPU"));
+    defer closeFd(vcpu_fd);
+    try initVcpu(vm_fd, vcpu_fd);
+    try initGic(gic_dev.fd);
+
+    var pstate: u64 = 0x3c5; // EL1h, DAIF masked.
+    var pc = layout.entry;
+    var x0 = layout.dtb;
+    try kvm.setOneReg(vcpu_fd, kvm.coreReg(kvm.KVM_REG_ARM_CORE_PSTATE), &pstate);
+    try kvm.setOneReg(vcpu_fd, kvm.coreReg(kvm.KVM_REG_ARM_CORE_PC), &pc);
+    try kvm.setOneReg(vcpu_fd, kvm.gprReg(0), &x0);
+
+    const run_size = try kvm.ioctl(kvm_fd, kvm.KVM_GET_VCPU_MMAP_SIZE, 0, "KVM_GET_VCPU_MMAP_SIZE");
+    const run_bytes = try std.posix.mmap(
+        null,
+        run_size,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .SHARED },
+        vcpu_fd,
+        0,
+    );
+    defer std.posix.munmap(run_bytes);
+
+    while (true) {
+        _ = try kvm.ioctl(vcpu_fd, kvm.KVM_RUN, 0, "KVM_RUN");
+        switch (kvm.exitReason(run_bytes)) {
+            kvm.KVM_EXIT_MMIO => try handleMmio(vm_fd, run_bytes, transports, &gen_dev, ram),
+            kvm.KVM_EXIT_SYSTEM_EVENT => switch (kvm.systemEventType(run_bytes)) {
+                kvm.KVM_SYSTEM_EVENT_SHUTDOWN => return .guest_off,
+                kvm.KVM_SYSTEM_EVENT_RESET => return .guest_reset,
+                else => return error.UnexpectedExit,
+            },
+            kvm.KVM_EXIT_SHUTDOWN => return .guest_off,
+            kvm.KVM_EXIT_FAIL_ENTRY, kvm.KVM_EXIT_INTERNAL_ERROR => return error.UnexpectedExit,
+            else => |reason| {
+                std.log.err("unhandled KVM exit reason {d}", .{reason});
+                return error.UnexpectedExit;
+            },
+        }
+    }
+}
+
+fn closeFd(fd: std.c.fd_t) void {
+    _ = std.c.close(fd);
+}
+
+fn createGic(vm_fd: std.c.fd_t) !kvm.CreateDevice {
+    var dev = kvm.CreateDevice{ .type = kvm.KVM_DEV_TYPE_ARM_VGIC_V3, .fd = 0, .flags = 0 };
+    _ = try kvm.ioctl(vm_fd, kvm.KVM_CREATE_DEVICE, @intFromPtr(&dev), "KVM_CREATE_DEVICE vgicv3");
+    var dist = gic_dist_base;
+    var redist = gic_redist_base;
+    try setDeviceAttr(dev.fd, kvm.KVM_DEV_ARM_VGIC_GRP_ADDR, kvm.KVM_VGIC_V3_ADDR_TYPE_DIST, &dist, "vgic dist addr");
+    try setDeviceAttr(dev.fd, kvm.KVM_DEV_ARM_VGIC_GRP_ADDR, kvm.KVM_VGIC_V3_ADDR_TYPE_REDIST, &redist, "vgic redist addr");
+    return dev;
+}
+
+fn initGic(gic_fd: u32) !void {
+    var unused: u64 = 0;
+    try setDeviceAttr(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_CTRL, kvm.KVM_DEV_ARM_VGIC_CTRL_INIT, &unused, "vgic init");
+}
+
+fn setDeviceAttr(fd: u32, group: u32, attr_id: u64, value: *u64, op: []const u8) !void {
+    var attr = kvm.DeviceAttr{
+        .flags = 0,
+        .group = group,
+        .attr = attr_id,
+        .addr = @intFromPtr(value),
+    };
+    _ = try kvm.ioctl(@intCast(fd), kvm.KVM_SET_DEVICE_ATTR, @intFromPtr(&attr), op);
+}
+
+fn initVcpu(vm_fd: std.c.fd_t, vcpu_fd: std.c.fd_t) !void {
+    var init = kvm.VcpuInit{ .target = 0, .features = @splat(0) };
+    _ = try kvm.ioctl(vm_fd, kvm.KVM_ARM_PREFERRED_TARGET, @intFromPtr(&init), "KVM_ARM_PREFERRED_TARGET");
+    setFeature(&init, kvm.KVM_ARM_VCPU_PSCI_0_2);
+    _ = try kvm.ioctl(vcpu_fd, kvm.KVM_ARM_VCPU_INIT, @intFromPtr(&init), "KVM_ARM_VCPU_INIT");
+}
+
+fn setFeature(init: *kvm.VcpuInit, feature: u32) void {
+    init.features[feature / 32] |= @as(u32, 1) << @intCast(feature % 32);
+}
+
+fn handleMmio(
+    vm_fd: std.c.fd_t,
+    run_bytes: []u8,
+    transports: []mmio.Transport,
+    gen_dev: *generation.Device,
+    ram: guestmem.GuestRam,
+) !void {
+    const exit = kvm.mmioExit(run_bytes);
+    const size_log2 = sizeLog2(exit.len) orelse return error.UnhandledMmio;
+    const ipa = exit.phys_addr;
+
+    if (ipa >= board.generation_base and ipa < board.generation_base + board.generation_size) {
+        const offset = ipa - board.generation_base;
+        if (exit.is_write) {
+            if (gen_dev.write(offset, readData(exit.data, exit.len), size_log2)) {
+                try kvm.setIrq(vm_fd, board.generationIntid(), false);
+            }
+        } else {
+            writeData(exit.data, exit.len, gen_dev.read(offset, size_log2));
+        }
+        return;
+    }
+
+    const dev_index = blk: {
+        if (ipa < board.virtio_base) break :blk null;
+        const idx = (ipa - board.virtio_base) / board.virtio_stride;
+        if (idx >= transports.len) break :blk null;
+        break :blk idx;
+    };
+    if (dev_index) |idx| {
+        const t = &transports[@intCast(idx)];
+        const offset = ipa - board.virtioDeviceBase(@intCast(idx));
+        if (exit.is_write) {
+            const raised = t.write(offset, @truncate(readData(exit.data, exit.len)), ram);
+            if (raised) try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(idx)), true);
+            if (offset == 0x064) try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(idx)), false);
+        } else {
+            writeData(exit.data, exit.len, t.read(offset));
+        }
+        return;
+    }
+
+    std.log.debug("stray KVM MMIO {s} at ipa=0x{x}", .{ if (exit.is_write) "write" else "read", ipa });
+    if (!exit.is_write) writeData(exit.data, exit.len, 0);
+}
+
+fn sizeLog2(len: u32) ?u2 {
+    return switch (len) {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        8 => 3,
+        else => null,
+    };
+}
+
+fn readData(data: *const [8]u8, len: u32) u64 {
+    var tmp: [8]u8 = @splat(0);
+    @memcpy(tmp[0..@intCast(len)], data[0..@intCast(len)]);
+    return std.mem.readInt(u64, &tmp, .little);
+}
+
+fn writeData(data: *[8]u8, len: u32, value: u64) void {
+    var tmp: [8]u8 = @splat(0);
+    std.mem.writeInt(u64, &tmp, value, .little);
+    @memcpy(data[0..@intCast(len)], tmp[0..@intCast(len)]);
+}

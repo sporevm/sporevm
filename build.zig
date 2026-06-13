@@ -103,4 +103,26 @@ pub fn build(b: *std.Build) void {
         const boot_step = b.step("hvf-boot", "Build and sign the HVF kernel boot harness");
         boot_step.dependOn(&sign_boot.step);
     }
+
+    // Linux KVM boot harness: host-only, needs /dev/kvm on aarch64 Linux.
+    if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
+        const kvm_boot_mod = b.createModule(.{
+            .root_source_file = b.path("src/kvm_boot.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "sporevm", .module = mod },
+            },
+        });
+
+        const kvm_boot_exe = b.addExecutable(.{
+            .name = "kvm-boot",
+            .root_module = kvm_boot_mod,
+        });
+        const install_kvm_boot = b.addInstallArtifact(kvm_boot_exe, .{});
+
+        const kvm_boot_step = b.step("kvm-boot", "Build the Linux KVM kernel boot harness");
+        kvm_boot_step.dependOn(&install_kvm_boot.step);
+    }
 }

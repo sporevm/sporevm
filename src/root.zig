@@ -5,6 +5,8 @@
 //! module exposes the building blocks; the `spore` CLI in `main.zig` is a
 //! thin shell over them.
 
+const builtin = @import("builtin");
+
 pub const board = @import("board.zig");
 pub const boot = @import("boot.zig");
 pub const chunk = @import("chunk.zig");
@@ -13,6 +15,10 @@ pub const spore = @import("spore.zig");
 pub const fdt = @import("fdt.zig");
 pub const guestmem = @import("guestmem.zig");
 pub const hvf = @import("hvf/hvf.zig");
+pub const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
+    @import("kvm/kvm.zig")
+else
+    struct {};
 pub const virtio = struct {
     pub const queue = @import("virtio/queue.zig");
     pub const mmio = @import("virtio/mmio.zig");

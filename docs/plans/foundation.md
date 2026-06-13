@@ -264,8 +264,14 @@ registers are not part of the hv_gic state blob and must be saved per-vCPU via
 `hv_gic_{get,set}_icc_reg` —
 without them the resumed guest hangs with all interrupts masked. v0 does not
 capture disk state: resume requires the unmodified backing disk file
-(documented in the format doc). KVM-side suspend/restore and the four-way
-matrix (slice 4) wait on the arm64 dev host.
+(documented in the format doc).
+
+Slice 1 has now started on real aarch64 KVM hardware (`m7g.metal`): the
+`kvm-boot` harness creates a KVM VM/vCPU, configures userspace VGICv3, maps the
+same board DTB, and routes shared virtio-mmio/generation device exits. It boots
+the cleanroom 6.1.155 kernel to the expected no-root VFS panic without a disk
+and to an Alpine `/bin/sh` prompt with a mountless `mkfs.ext4 -d` minirootfs.
+KVM suspend/restore and the four-way matrix (slice 4) remain next.
 
 ## Delivery Strategy
 
@@ -443,10 +449,10 @@ chunk set, and chunk verification rejects corrupted peer data.
   SporeVM kernel profile (virtio-mmio, vsock, generation driver); the platform
   contract pins its build ID. Vendoring the config into this repo remains the
   recorded fallback if SporeVM must be self-contained when it goes public.
+- With the aarch64 KVM dev host available, proceed with a direct KVM backend
+  first. Keep the QEMU-assisted GICv3 cross-check as a diagnostic fallback,
+  not as a blocker before KVM restore.
 
 ## Open Questions
 
-None currently. The next decision point is practical rather than architectural:
-when an aarch64 KVM host is available, decide whether the fastest path to the
-four-way matrix is a direct KVM backend first or a QEMU-assisted GICv3
-cross-check before implementing KVM restore.
+None currently.
