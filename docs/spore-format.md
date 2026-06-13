@@ -7,6 +7,9 @@ A spore is a sealed, content-addressed checkpoint of a VM. The format, not the
 implementation, is the product: two SporeVM builds on different hypervisors
 interoperate through this document.
 
+For the backend mapping rules, state classes, and current restore-direction
+matrix, see [Spore State Portability Contract](state-portability.md).
+
 ## Layout
 
 A spore is a directory:
@@ -50,8 +53,11 @@ A spore is a directory:
   ring addresses/indices). Device order is part of the board contract.
 - `generation`: non-virtio generation MMIO device state — `generation`
   counter, `interrupt_status`, and `params_b64` (base64-encoded
-  resume-parameter bytes with trailing zeroes elided). In v0 this device is
-  present but inert unless later fork/resume code populates it.
+  resume-parameter bytes with trailing zeroes elided). `spore fork` increments
+  the counter per child, sets `interrupt_status` to
+  `irq_generation_changed`, and writes a JSON resume-parameter payload with
+  `schema_version`, `parent_generation`, `generation`, `fork_index`, and
+  `fork_count`.
 - `memory`: `chunk_size` plus one entry per chunk — a blake3-hex chunk
   reference, or null for an all-zero chunk.
 
@@ -64,6 +70,9 @@ A spore is a directory:
 - Access traces (lazy-restore prefetch hints): slice 5.
 - Multi-vCPU machine state.
 - Kernel identity in the platform contract (pinned-build enforcement).
+- Guest identity fixup state beyond the generation counter and resume
+  parameters; the in-guest helper that turns fork metadata into hostname,
+  machine-id, MAC, entropy, and clock updates is still planned.
 - Cross-frequency architected timer restore: v0 records and enforces the
   counter frequency, but cannot translate a running Linux guest between
   different `CNTFRQ_EL0` domains.

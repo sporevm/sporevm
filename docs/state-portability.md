@@ -1,0 +1,255 @@
+# Spore State Portability Contract
+
+**Status:** v0 current implementation. This document records what SporeVM can
+capture, map, translate, and reject when restoring an aarch64 spore across the
+KVM and Hypervisor.framework backends.
+
+The spore format describes bytes on disk. This document describes the portable
+meaning of those bytes: which guest-visible state is part of the contract, how
+each backend maps it to native APIs, and when restore must fail closed.
+
+This is a diagnostic portability track. The release-critical path is
+fork/fan-out on identical host classes; cross-backend restore helps inspect
+failed runs and keep backend-private state out of the spore contract.
+
+## Scope
+
+v0 portability is deliberately narrow:
+
+- Guest ISA: aarch64 only.
+- vCPU topology: one vCPU.
+- Backends: Linux KVM and Apple Hypervisor.framework.
+- Device model: the frozen SporeVM board contract — virtio-mmio console,
+  optional blk, net, vsock, rng, and the generation MMIO device.
+- Memory: full eager RAM materialization from content-addressed chunks.
+- Disk: not captured. A resumed VM using a disk must be given the same backing
+  disk bytes out of band.
+
+Cross-ISA restore, multi-vCPU restore, disk manifests, lazy paging, and fork
+generation fixups are later slices.
+
+## Platform contract
+
+`manifest.platform` is the restore gate. The destination backend must satisfy
+these fields exactly unless this document says a field is translatable:
+
+| Field | v0 policy | Why it matters |
+| --- | --- | --- |
+| `arch` | must be `aarch64` | Guest RAM and registers are ISA-specific. |
+| `cpu_profile` | must match `sporevm-aarch64-v0` | Guest-visible feature IDs must match the saved execution environment. |
+| `device_model_version` | must match | Virtio layout, interrupt lines, and generation MMIO are board contract. |
+| `ram_base`, `ram_size` | must match | Guest physical addresses and page tables are already live. |
+| `gic_dist_base`, `gic_redist_base` | must match | Linux has mapped the GIC MMIO windows. |
+| `counter_frequency_hz` | must match | Timer state is stored in this tick domain. |
+| device count/order | must match | Virtio transport state is positional and device IDs must line up. |
+
+Current observed timer contracts:
+
+- Apple Hypervisor.framework guest timer: `24_000_000` Hz.
+- AWS Graviton KVM dev host: `1_050_000_000` Hz.
+
+That mismatch is intentionally rejected. A positive KVM→HVF smoke needs a KVM
+producer whose guest-visible counter frequency is 24MHz, or a later timer
+design that makes frequency differences safely translatable. This does not
+block identical-host fork/fan-out.
+
+## State inventory
+
+| State area | Spore representation | KVM producer | KVM consumer | HVF producer | HVF consumer | v0 status |
+| --- | --- | --- | --- | --- | --- | --- |
+| RAM | BLAKE3-addressed fixed chunks, zero chunks elided | yes | yes | yes | yes | portable |
+| GPRs `x0`–`x30` | fixed array | yes | yes | yes | yes | portable |
+| `pc`, `cpsr` | scalar fields | yes | yes | yes | yes | portable |
+| `fpcr`, `fpsr`, SIMD `q0`–`q31` | scalar fields plus 128-bit register pairs | yes | yes | yes | yes | portable |
+| Selected EL1 system registers | architectural names and `u64` values | yes | yes | yes | yes | portable subset |
+| `mpidr_el1` | captured but not applied | yes | skipped on set | yes | skipped on set | platform-owned |
+| CPU feature ID registers | not serialized | masked/profiled at boot | profile check | profiled at boot | profile check | contract-only |
+| RNDR feature | hidden from KVM guest | yes | n/a | absent | n/a | masked into profile |
+| Virtual timer | `cntvct`, `cntv_ctl`, `cntv_cval` in `counter_frequency_hz` domain | yes | re-anchor | yes | re-anchor | same-frequency only |
+| GIC distributor/register state | GICv3 MMIO offsets | yes | yes | no | partial apply | producer gap on HVF |
+| GIC redistributor/register state | GICv3 MMIO offsets | yes | yes | no | partial apply | producer gap on HVF |
+| GIC line levels | INTID plus asserted bit | PPI/SPI | yes | no | SPI only; asserted PPI rejected | asymmetric |
+| GIC CPU interface | ICC register names and values | yes | yes | yes | yes | portable |
+| HVF GIC blob | tagged `backend_private` escape hatch | no | reject | same-HVF only | same-HVF only | not portable |
+| Virtio-mmio transport | device ID, feature selectors, negotiated features, status, interrupt status, queue addresses/indices | yes | yes | yes | yes | portable |
+| Virtqueue descriptors and buffers | guest RAM | yes | yes | yes | yes | portable through RAM |
+| Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; fork path populates it |
+| Disk contents | not represented | no | same external bytes required | no | same external bytes required | out of v0 |
+| Kernel identity | not yet represented | no | no | no | no | planned contract field |
+| Access trace | not yet represented | no | no | no | no | planned for lazy restore |
+
+## Register classes
+
+Each guest-visible register should be assigned one of these policies before it
+enters the manifest.
+
+### Portable
+
+The value is guest architectural state and may be copied by name across
+backends.
+
+Current portable v0 set:
+
+- GPRs: `x0`–`x30`.
+- Control flow: `pc`, `cpsr`.
+- FP/SIMD: `fpcr`, `fpsr`, `q0`–`q31`.
+- EL1 context: `sctlr_el1`, `cpacr_el1`, `ttbr0_el1`, `ttbr1_el1`, `tcr_el1`,
+  `spsr_el1`, `elr_el1`, `sp_el0`, `sp_el1`, `afsr0_el1`, `afsr1_el1`,
+  `esr_el1`, `far_el1`, `par_el1`, `mair_el1`, `amair_el1`, `vbar_el1`,
+  `contextidr_el1`, `tpidr_el1`, `cntkctl_el1`, `csselr_el1`, `tpidr_el0`,
+  and `tpidrro_el0`.
+- GIC CPU interface: `pmr_el1`, `bpr0_el1`, `ap0r0_el1`, `ap1r0_el1`,
+  `bpr1_el1`, `ctlr_el1`, `sre_el1`, `igrpen0_el1`, and `igrpen1_el1`.
+
+Restore rejects unknown `sys_regs` or `icc_regs` names. New registers require a
+spec update and backend mapping in the same slice.
+
+### Platform-owned
+
+The value is guest-visible but chosen by the board/backend contract rather than
+by the suspended workload.
+
+- `mpidr_el1` is captured for inspection but skipped on apply. The v0 board is
+  single-vCPU and sets MPIDR during vCPU bring-up.
+- GIC base addresses are not translated. They are platform fields and must
+  match because the guest has already observed and mapped them.
+
+### Profiled or masked
+
+The value is controlled by the CPU profile at guest creation, not by saving raw
+backend feature registers.
+
+- ID registers such as `ID_AA64*` are not serialized in v0.
+- KVM masks `ID_AA64ISAR0_EL1.RNDR` so Linux does not patch in RNDR/RNDRRS
+  instructions unavailable on Apple Hypervisor.framework guests.
+- Restore checks `cpu_profile` instead of trying to reconcile raw host feature
+  registers.
+
+### Translated
+
+The value is meaningful only after backend-specific re-anchoring.
+
+- Virtual timer state stores the guest virtual counter value plus
+  `cntv_ctl`/`cntv_cval`.
+- KVM restores by setting `KVM_ARM_SET_COUNTER_OFFSET` to align host counter
+  time with the saved guest counter.
+- Hypervisor.framework restores by setting the vtimer offset to align host
+  counter time with the saved guest counter.
+- This translation is only valid when `counter_frequency_hz` matches exactly.
+
+### Backend-private
+
+Backend-private state is allowed only as an explicit, fail-closed temporary
+escape hatch.
+
+- HVF same-host/same-backend GIC restore may use `backend_private` with
+  `backend: "hvf"` and `format: "hv_gic_state_v0"`.
+- Other backends must reject it.
+- Portable cross-backend restore must use `kind: "gicv3"` instead.
+
+### Outside the spore
+
+These are intentionally not captured in v0:
+
+- Disk contents and external host files.
+- Network connections and host-side sockets.
+- Host paths, credentials, secrets, and runtime policy.
+- Kernel image identity and DTB identity, until the platform contract grows
+  pinned kernel fields.
+
+## GICv3 portability
+
+Portable GIC state is the most backend-sensitive part of v0. The manifest form
+is architectural: distributor and redistributor MMIO offsets plus ICC register
+names. Backend handles, object references, and raw kernel/HVF structs must not
+cross the format boundary.
+
+### KVM
+
+KVM can currently:
+
+- produce portable distributor register values;
+- produce portable redistributor register values;
+- produce PPI/SPI line levels for the current single-vCPU INTID range;
+- consume portable distributor/redistributor values;
+- consume line levels;
+- produce and consume ICC registers through the VGIC CPU-system-register API.
+
+### Hypervisor.framework
+
+Hypervisor.framework can currently:
+
+- consume the portable GIC subset needed by the KVM→HVF smoke path;
+- consume ICC registers by architectural name;
+- produce and consume an HVF-only `backend_private` GIC blob for same-backend
+  restore;
+- set SPI line levels.
+
+Current HVF gaps:
+
+- it does not yet produce a portable distributor/redistributor offset list;
+- it does not expose a line-level getter;
+- asserted PPI line levels from a portable producer are rejected on HVF because
+  there is no safe destination API for them;
+- a few unsupported zero/reset registers are skipped only when their value is
+  known to be harmless for the v0 single-vCPU board.
+
+## Restore direction matrix
+
+| Direction | Current status | Gate before declaring green |
+| --- | --- | --- |
+| KVM→KVM | Passes same-host smoke on the `m7g.metal` KVM host. | Keep as regression coverage. |
+| HVF→HVF | Passes same-host smoke locally. | Keep as regression coverage. |
+| KVM→HVF | Portable vCPU, virtio, generation, GIC apply, and CPU profile machinery exist. `m7g.metal` spores fail closed on counter-frequency mismatch. | Need a KVM producer whose guest counter frequency matches HVF's 24MHz, or a designed cross-frequency timer contract. |
+| HVF→KVM | Blocked because HVF still produces backend-private GIC state. Timer compatibility still applies. | Make HVF produce portable GICv3 state, then run with compatible counter frequency. |
+
+## Failure policy
+
+Restore must fail closed for any state the destination cannot satisfy. Do not
+best-effort unknown machine state.
+
+Current hard failures include:
+
+- unknown manifest version;
+- platform field mismatch;
+- device count or device ID mismatch;
+- chunk hash mismatch or malformed memory manifest;
+- unknown EL1 system register name;
+- unknown ICC register name;
+- backend-private GIC state on the wrong backend;
+- unsupported portable GIC state that is not explicitly documented as a safe
+  zero/reset skip;
+- counter-frequency mismatch;
+- missing or changed external disk bytes when a disk-backed workload relies on
+  them.
+
+## Smoke contract
+
+Diskless restore smokes use:
+
+- the `cleanroom-kernels` `initrd` profile, published from v0.2.0 onward;
+- `scripts/make-smoke-initrd.sh` to build a static `/init` ticker;
+- `scripts/smoke-restore-leg.sh` to run capture and resume legs with explicit
+  spore transfer between hosts when needed.
+
+Current evidence:
+
+- KVM same-host diskless restore on the `m7g.metal` host resumes the ticker
+  through `sporevm-initrd-tick 7`.
+- HVF same-host diskless restore locally resumes the ticker through
+  `sporevm-initrd-tick 7`.
+- KVM→HVF with an `m7g.metal` producer is a negative test: the spore records
+  `counter_frequency_hz = 1_050_000_000` and HVF exposes 24MHz, so restore must
+  reject it before running guest code.
+
+## Next contract work
+
+1. Add kernel image identity to the platform contract.
+2. Add disk state or an explicit disk identity/hash contract before claiming
+   disk-backed cross-host restore.
+3. Decide the timer portability design: fixed guest timer profile at VM
+   creation, frequency-neutral timer state plus guest-visible constraints, or
+   host-class matching only.
+4. Make HVF emit portable GICv3 state instead of only the backend-private blob.
+5. Extend the matrix when multi-vCPU state, access traces, lazy restore, and
+   fork generation semantics land.

@@ -2,17 +2,17 @@
 
 ## QEMU Cross-Accelerator Restore Experiment
 
-**Status:** not run; superseded as the first de-risking step by direct HVF
-state capture/restore work in SporeVM. The experiment remains a useful
-cross-check once an aarch64 KVM host is available, but it no longer blocks the
-foundation slices already landed.
+**Status:** not run; superseded as the first de-risking step by direct HVF and
+KVM state capture/restore work in SporeVM. The experiment remains a useful
+diagnostic cross-check, but it no longer blocks the foundation slices already
+landed.
 
 ### Question
 
 Can an aarch64 `virt` machine snapshot taken under KVM be restored under
-Hypervisor.framework (HVF), and what state fails to translate? This is the
-cheapest possible test of SporeVM's riskiest claim — cross-hypervisor
-machine-state restore — and it requires no SporeVM code.
+Hypervisor.framework (HVF), and what state fails to translate? This is a cheap
+test of SporeVM's diagnostic portability claim — cross-hypervisor machine-state
+restore — and it requires no SporeVM code.
 
 ### Why QEMU is a valid proxy
 
@@ -75,13 +75,14 @@ answered the highest-risk state-normalization questions on the macOS side:
   writebacks 25 ok / 0 unsupported, SPI set/lower works for the generation
   device, and HVF exposes no line-level getter. That keeps HVF portable capture
   gated; the current HVF path remains the tagged `hv_gic` blob.
-- The first KVM→HVF resume attempt now gets through platform contract setup,
-  portable GICv3 restore, vCPU/ICC/timer restore, and reaches userspace
-  (`sporevm-tick 6`) before the guest kernel oopses on an undefined MRS of
-  `S3_3_C2_C4_1`. That moves the current cross-hypervisor blocker from GIC
-  mapping to the CPU feature-ID/profile masking work called out in slice 4.
+- Direct KVM→HVF work later got through platform contract setup, portable
+  GICv3 restore, vCPU/ICC/timer restore, and userspace after KVM masked the
+  Graviton RNDR feature into `sporevm-aarch64-v0`. The current `m7g.metal` →
+  Apple HVF leg is an intentional negative test: the manifest records a
+  1.05GHz guest counter and HVF exposes a 24MHz guest counter, so restore fails
+  closed before running guest code.
 
 Decision: keep the architectural machine-state normalization design. Adjust
-the cross-hypervisor slice to treat GICv3 CPU-interface state and virtual
+the diagnostic portability track to treat GICv3 CPU-interface state and virtual
 timer anchoring as first-class normalized fields, and use the QEMU matrix only
-as an additional validation tool once the KVM side exists.
+as an additional validation tool.
