@@ -7,6 +7,9 @@ A spore is a sealed, content-addressed checkpoint of a VM. The format, not the
 implementation, is the product: two SporeVM builds on different hypervisors
 interoperate through this document.
 
+For the backend mapping rules, state classes, and current restore-direction
+matrix, see [Spore State Portability Contract](state-portability.md).
+
 ## Layout
 
 A spore is a directory:
