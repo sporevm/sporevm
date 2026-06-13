@@ -2,7 +2,7 @@
 //!
 //! Bring-up tool, not the product CLI. Usage:
 //!   zig build kvm-boot
-//!   ./zig-out/bin/kvm-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--lazy-ram] [--trust-ram-backing] [--fdpass-ram-backing]
+//!   ./zig-out/bin/kvm-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH] [--trust-ram-backing] [--fdpass-ram-backing]
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
-        std.debug.print("usage: kvm-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--lazy-ram] [--trust-ram-backing] [--fdpass-ram-backing]\n", .{});
+        std.debug.print("usage: kvm-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH] [--trust-ram-backing] [--fdpass-ram-backing]\n", .{});
         std.process.exit(2);
     }
 
@@ -34,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
     var spore_dir: ?[]const u8 = null;
     var resume_dir: ?[]const u8 = null;
     var lazy_ram = false;
+    var lazy_ram_trace_path: ?[]const u8 = null;
     var trust_ram_backing = false;
     var fdpass_ram_backing = false;
     var i: usize = 2;
@@ -61,6 +62,9 @@ pub fn main(init: std.process.Init) !void {
             resume_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "--lazy-ram")) {
             lazy_ram = true;
+        } else if (std.mem.eql(u8, args[i], "--lazy-ram-trace") and i + 1 < args.len) {
+            i += 1;
+            lazy_ram_trace_path = args[i];
         } else if (std.mem.eql(u8, args[i], "--trust-ram-backing")) {
             trust_ram_backing = true;
         } else if (std.mem.eql(u8, args[i], "--fdpass-ram-backing")) {
@@ -84,6 +88,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (lazy_ram and trust_ram_backing) {
         std.debug.print("--lazy-ram cannot be combined with --trust-ram-backing\n", .{});
+        std.process.exit(2);
+    }
+    if (lazy_ram_trace_path != null and !lazy_ram) {
+        std.debug.print("--lazy-ram-trace requires --lazy-ram\n", .{});
         std.process.exit(2);
     }
     if (fdpass_ram_backing and !trust_ram_backing) {
@@ -111,6 +119,20 @@ pub fn main(init: std.process.Init) !void {
         ram_backing_fd = null;
         ram_backing_fd = try receiveRamBackingViaFdpass(original_fd);
         std.debug.print("sporevm kvm-boot: received RAM backing fd via SCM_RIGHTS harness path\n", .{});
+    }
+
+    var lazy_ram_trace_fd: ?std.c.fd_t = null;
+    defer {
+        if (lazy_ram_trace_fd) |fd| _ = std.c.close(fd);
+    }
+    if (lazy_ram_trace_path) |path| {
+        const pathz = try arena.dupeZ(u8, path);
+        const fd = std.c.open(pathz, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, @as(c_uint, 0o644));
+        if (fd < 0) {
+            std.debug.print("cannot open lazy RAM trace: {s}\n", .{path});
+            std.process.exit(1);
+        }
+        lazy_ram_trace_fd = fd;
     }
 
     const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], arena, .limited(256 * 1024 * 1024));
@@ -145,6 +167,7 @@ pub fn main(init: std.process.Init) !void {
         .resume_dir = resume_dir,
         .ram_backing_fd = ram_backing_fd,
         .ram_restore_mode = if (lazy_ram) .lazy_chunks else .eager_chunks,
+        .lazy_ram_trace_fd = lazy_ram_trace_fd,
         .snapshot_after_ms = snapshot_after_ms,
         .snapshot_dir = spore_dir,
     });

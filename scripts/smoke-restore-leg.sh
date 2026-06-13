@@ -262,6 +262,65 @@ run_with_deadline() {
   return "${status}"
 }
 
+resume_first_tick_ms=""
+run_resume_with_deadline() {
+  local seconds="$1"
+  local log="$2"
+  shift 2
+
+  : >"${log}"
+  "$@" >"${log}" 2>&1 &
+  local pid="$!"
+  local marker="__sporevm_deadline_${pid}__"
+  local start_ms
+  start_ms="$(now_ms)"
+  local deadline_ms=$(( start_ms + seconds * 1000 ))
+  local timed_out=0
+  resume_first_tick_ms=""
+
+  while kill -0 "${pid}" >/dev/null 2>&1; do
+    if [[ -z "${resume_first_tick_ms}" ]] && grep -Eaq 'sporevm-initrd-tick [0-9]+' "${log}"; then
+      resume_first_tick_ms=$(( $(now_ms) - start_ms ))
+    fi
+    if (( $(now_ms) >= deadline_ms )); then
+      printf '\n%s\n' "${marker}" >>"${log}"
+      kill -TERM "${pid}" >/dev/null 2>&1 || true
+      timed_out=1
+      break
+    fi
+    sleep 0.05
+  done
+
+  if (( timed_out )); then
+    local kill_deadline_ms=$(( $(now_ms) + 2000 ))
+    while kill -0 "${pid}" >/dev/null 2>&1 && (( $(now_ms) < kill_deadline_ms )); do
+      sleep 0.05
+    done
+    if kill -0 "${pid}" >/dev/null 2>&1; then
+      kill -KILL "${pid}" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  wait "${pid}"
+  local status="$?"
+  if [[ -z "${resume_first_tick_ms}" ]] && grep -Eaq 'sporevm-initrd-tick [0-9]+' "${log}"; then
+    resume_first_tick_ms=$(( $(now_ms) - start_ms ))
+  fi
+  if grep -q "${marker}" "${log}"; then
+    return 124
+  fi
+  return "${status}"
+}
+
+lazy_trace_counts() {
+  local trace="$1"
+  local faults
+  faults="$(grep -Ec '^fault_ms=' "${trace}" || true)"
+  local unique_chunks
+  unique_chunks="$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^chunk_index=/) { sub("chunk_index=", "", $i); print $i } }' "${trace}" | sort -nu | wc -l | tr -d ' ')"
+  echo "${faults} ${unique_chunks}"
+}
+
 capture() {
   [[ -n "${initrd}" ]] || die "--initrd is required for capture"
   [[ -f "${initrd}" ]] || die "initrd not found: ${initrd}"
@@ -298,14 +357,18 @@ resume() {
 
   local log="${spore_dir%/}.resume.${backend}.log"
   local cmd=("${boot_bin}" "${kernel}" --mem-mib "${mem_mib}" --resume "${spore_dir}")
+  local lazy_trace=""
   if [[ "${backend}" == "kvm" && "${kvm_lazy_ram}" == "1" ]]; then
+    lazy_trace="${spore_dir%/}.lazy-trace.log"
+    rm -f "${lazy_trace}"
     cmd+=(--lazy-ram)
+    cmd+=(--lazy-ram-trace "${lazy_trace}")
   fi
 
   set +e
   local resume_start_ms
   resume_start_ms="$(now_ms)"
-  run_with_deadline "${resume_seconds}" "${log}" "${cmd[@]}"
+  run_resume_with_deadline "${resume_seconds}" "${log}" "${cmd[@]}"
   local status="$?"
   local resume_wall_ms=$(( $(now_ms) - resume_start_ms ))
   set -e
@@ -315,6 +378,7 @@ resume() {
   fi
 
   local restore_metrics=""
+  local ttfi_ms=""
   if [[ "${backend}" == "kvm" ]]; then
     restore_metrics="$(grep -E 'kvm restore metrics:' "${log}" | tail -1 || true)"
     if [[ -z "${restore_metrics}" ]]; then
@@ -326,6 +390,17 @@ resume() {
       expected_mode="lazy_chunks"
     fi
     assert_kvm_restore_metrics "${restore_metrics}" "${expected_mode}"
+    ttfi_ms="$(metric_value pre_run_ms "${restore_metrics}")"
+  fi
+
+  local lazy_faults=""
+  local lazy_unique_chunks=""
+  if [[ "${backend}" == "kvm" && "${kvm_lazy_ram}" == "1" ]]; then
+    [[ -s "${lazy_trace}" ]] || die "lazy RAM trace was empty or missing: ${lazy_trace}"
+    read -r lazy_faults lazy_unique_chunks < <(lazy_trace_counts "${lazy_trace}")
+    if [[ "${lazy_faults}" == "0" || "${lazy_unique_chunks}" == "0" ]]; then
+      die "lazy RAM trace did not record faults: ${lazy_trace}"
+    fi
   fi
 
   local max_tick
@@ -338,7 +413,18 @@ resume() {
     print_tail "${log}"
     die "highest observed tick ${max_tick} was below --min-tick ${min_tick}"
   fi
-  echo "resume ok: backend=${backend} max_tick=${max_tick} resume_process_wall_ms=${resume_wall_ms} log=${log}"
+  local summary="resume ok: backend=${backend} max_tick=${max_tick} resume_process_wall_ms=${resume_wall_ms}"
+  if [[ -n "${ttfi_ms}" ]]; then
+    summary+=" ttfi_ms=${ttfi_ms}"
+  fi
+  if [[ -n "${resume_first_tick_ms}" ]]; then
+    summary+=" ttuw_ms=${resume_first_tick_ms}"
+  fi
+  if [[ -n "${lazy_faults}" ]]; then
+    summary+=" lazy_faults=${lazy_faults} lazy_unique_chunks=${lazy_unique_chunks} lazy_trace=${lazy_trace}"
+  fi
+  summary+=" log=${log}"
+  echo "${summary}"
   if [[ -n "${restore_metrics}" ]]; then
     echo "restore metrics: ${restore_metrics}"
   fi
