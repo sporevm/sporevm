@@ -13,6 +13,10 @@ pub const chunk = @import("chunk.zig");
 pub const generation = @import("generation.zig");
 pub const gicv3 = @import("gicv3.zig");
 pub const fdt = @import("fdt.zig");
+pub const fdpass = if (builtin.os.tag == .linux)
+    @import("fdpass.zig")
+else
+    struct {};
 pub const guestmem = @import("guestmem.zig");
 pub const platform = @import("platform.zig");
 pub const hvf = @import("hvf/hvf.zig");
@@ -38,6 +42,7 @@ test {
     // Ensure all referenced modules' tests are discovered.
     const testing = @import("std").testing;
     testing.refAllDecls(@This());
+    testing.refAllDecls(fdpass);
     testing.refAllDecls(generation);
     testing.refAllDecls(gicv3);
     testing.refAllDecls(platform);
