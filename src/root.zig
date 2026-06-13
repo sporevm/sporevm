@@ -1,9 +1,9 @@
 //! SporeVM library root.
 //!
 //! A spore is a sealed, content-addressed checkpoint of a VM: a manifest of
-//! memory and disk chunks plus a small normalized machine-state blob. This
-//! module exposes the building blocks; the `spore` CLI in `main.zig` is a
-//! thin shell over them.
+//! memory chunks, guest machine state, and eventually disk state. This module
+//! exposes the building blocks; the `spore` CLI in `main.zig` is a thin shell
+//! over them.
 
 const builtin = @import("builtin");
 

@@ -73,7 +73,7 @@ block identical-host fork/fan-out.
 | HVF GIC blob | tagged `backend_private` escape hatch | no | reject | same-HVF only | same-HVF only | not portable |
 | Virtio-mmio transport | device ID, feature selectors, negotiated features, status, interrupt status, queue addresses/indices | yes | yes | yes | yes | portable |
 | Virtqueue descriptors and buffers | guest RAM | yes | yes | yes | yes | portable through RAM |
-| Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; currently inert |
+| Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; fork path populates it |
 | Disk contents | not represented | no | same external bytes required | no | same external bytes required | out of v0 |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
 | Access trace | not yet represented | no | no | no | no | planned for lazy restore |

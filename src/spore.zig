@@ -11,6 +11,7 @@
 //! fails closed on any mismatch. See SECURITY.md.
 
 const std = @import("std");
+const board = @import("board.zig");
 const chunklib = @import("chunk.zig");
 const generation = @import("generation.zig");
 const gicv3 = @import("gicv3.zig");
@@ -21,6 +22,8 @@ pub const chunk_size: usize = 2 * 1024 * 1024;
 pub const Error = error{
     BadManifest,
     BadChunk,
+    BadForkCount,
+    AlreadyExists,
     PlatformMismatch,
     IoFailed,
     OutOfMemory,
@@ -157,8 +160,33 @@ fn ensureDir(path: [:0]const u8) Error!void {
     }
 }
 
+fn ensureNewDir(path: [:0]const u8) Error!void {
+    if (std.c.mkdir(path, 0o755) != 0) {
+        if (std.c.access(path, 0) == 0) return error.AlreadyExists;
+        return error.IoFailed;
+    }
+}
+
 fn pathZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Error![:0]const u8 {
     return std.fmt.allocPrintSentinel(allocator, fmt, args, 0) catch error.OutOfMemory;
+}
+
+fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) Error![]const u8 {
+    const path_z = try pathZ(allocator, "{s}", .{path});
+    var buf: [std.c.PATH_MAX]u8 = undefined;
+    const resolved = std.c.realpath(path_z, &buf) orelse return error.IoFailed;
+    return allocator.dupe(u8, std.mem.span(resolved)) catch error.OutOfMemory;
+}
+
+fn symlinkPath(target: []const u8, link_path: []const u8) Error!void {
+    const target_z = try std.heap.c_allocator.dupeZ(u8, target);
+    defer std.heap.c_allocator.free(target_z);
+    const link_z = try std.heap.c_allocator.dupeZ(u8, link_path);
+    defer std.heap.c_allocator.free(link_z);
+    if (std.c.symlink(target_z, link_z) != 0) {
+        if (std.c.access(link_z, 0) == 0) return error.AlreadyExists;
+        return error.IoFailed;
+    }
 }
 
 // --- save / load -------------------------------------------------------------
@@ -237,6 +265,128 @@ pub fn loadManifest(allocator: std.mem.Allocator, dir: []const u8) Error!std.jso
     errdefer parsed.deinit();
     validateManifest(parsed.value) catch return error.BadManifest;
     return parsed;
+}
+
+pub const ForkOptions = struct {
+    parent_dir: []const u8,
+    out_dir: []const u8,
+    count: usize,
+};
+
+pub const ForkResult = struct {
+    parent: []const u8,
+    out_dir: []const u8,
+    count: usize,
+    parent_generation: u64,
+    first_generation: u64,
+    last_generation: u64,
+    first_child: []const u8,
+    last_child: []const u8,
+};
+
+pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult {
+    if (options.count == 0) return error.BadForkCount;
+
+    const parsed = try loadManifest(allocator, options.parent_dir);
+    defer parsed.deinit();
+    const parent = parsed.value;
+    if (parent.generation.generation > std.math.maxInt(u64) - options.count) return error.BadForkCount;
+
+    const parent_chunks = try pathZ(allocator, "{s}/chunks", .{options.parent_dir});
+    const shared_chunks = try realpathAlloc(allocator, parent_chunks);
+    try ensureDir(try pathZ(allocator, "{s}", .{options.out_dir}));
+
+    var i: usize = 0;
+    while (i < options.count) : (i += 1) {
+        const child_dir = try pathZ(allocator, "{s}/{d:0>6}", .{ options.out_dir, i });
+        try ensureNewDir(child_dir);
+        const chunks_link = try pathZ(allocator, "{s}/chunks", .{child_dir});
+        try symlinkPath(shared_chunks, chunks_link);
+
+        var child = parent;
+        const child_generation = parent.generation.generation + i + 1;
+        const params_b64 = try forkParamsB64(allocator, parent.generation.generation, child_generation, i, options.count);
+        defer allocator.free(params_b64);
+        child.generation = .{
+            .generation = child_generation,
+            .interrupt_status = generation.irq_generation_changed,
+            .params_b64 = params_b64,
+        };
+        child.machine.gic = try forkGicState(allocator, parent.machine.gic);
+        try saveManifest(allocator, child_dir, child);
+    }
+
+    const first_child = try std.fmt.allocPrint(allocator, "{s}/{d:0>6}", .{ options.out_dir, 0 });
+    const last_child = try std.fmt.allocPrint(allocator, "{s}/{d:0>6}", .{ options.out_dir, options.count - 1 });
+    return .{
+        .parent = options.parent_dir,
+        .out_dir = options.out_dir,
+        .count = options.count,
+        .parent_generation = parent.generation.generation,
+        .first_generation = parent.generation.generation + 1,
+        .last_generation = parent.generation.generation + options.count,
+        .first_child = first_child,
+        .last_child = last_child,
+    };
+}
+
+fn forkParamsB64(
+    allocator: std.mem.Allocator,
+    parent_generation: u64,
+    child_generation: u64,
+    fork_index: usize,
+    fork_count: usize,
+) Error![]const u8 {
+    const payload = .{
+        .schema_version = @as(u32, 0),
+        .parent_generation = parent_generation,
+        .generation = child_generation,
+        .fork_index = fork_index,
+        .fork_count = fork_count,
+    };
+    const json = std.json.Stringify.valueAlloc(allocator, payload, .{}) catch return error.OutOfMemory;
+    defer allocator.free(json);
+    if (json.len > generation.params_size) return error.BadManifest;
+
+    const enc = std.base64.standard.Encoder;
+    const out = allocator.alloc(u8, enc.calcSize(json.len)) catch return error.OutOfMemory;
+    _ = enc.encode(out, json);
+    return out;
+}
+
+fn forkGicState(allocator: std.mem.Allocator, state: gicv3.State) Error!gicv3.State {
+    if (state.kind != .gicv3) return state;
+
+    const gic = state.gicv3 orelse return error.BadManifest;
+    var has_generation_line = false;
+    for (gic.line_levels) |line| {
+        if (line.intid == board.generationIntid()) {
+            has_generation_line = true;
+            break;
+        }
+    }
+
+    const next_len = gic.line_levels.len + @intFromBool(!has_generation_line);
+    const line_levels = allocator.alloc(gicv3.LineLevel, next_len) catch return error.OutOfMemory;
+    for (gic.line_levels, 0..) |line, i| {
+        line_levels[i] = if (line.intid == board.generationIntid()) .{
+            .intid = line.intid,
+            .asserted = true,
+        } else line;
+    }
+    if (!has_generation_line) {
+        line_levels[gic.line_levels.len] = .{ .intid = board.generationIntid(), .asserted = true };
+    }
+
+    return .{
+        .kind = .gicv3,
+        .gicv3 = .{
+            .schema_version = gic.schema_version,
+            .dist_regs = gic.dist_regs,
+            .redist_regs = gic.redist_regs,
+            .line_levels = line_levels,
+        },
+    };
 }
 
 fn validateManifest(manifest: Manifest) Error!void {
@@ -420,6 +570,99 @@ test "manifest json round-trip" {
     try std.testing.expectEqual(@as(u32, gicv3.distRouterOffset(32)), parsed.value.machine.gic.gicv3.?.dist_regs[0].offset);
     try std.testing.expectEqual(@as(u16, 64), parsed.value.devices[0].queues[0].size);
     try std.testing.expectEqual(@as(u64, 7), parsed.value.generation.generation);
+}
+
+test "fork mints child manifests with shared chunks and pending generation" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/children", .{root_dir});
+
+    const ram = try arena.alloc(u8, chunk_size + 8);
+    @memset(ram, 0);
+    ram[0] = 0x42;
+    ram[ram.len - 1] = 0x99;
+    const memory = try saveMemory(arena, parent_dir, ram);
+
+    const manifest = Manifest{
+        .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
+            .device_model_version = 4,
+            .ram_base = 0x8000_0000,
+            .ram_size = ram.len,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0801_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{
+            .gprs = [_]u64{0} ** 31,
+            .pc = 0,
+            .cpsr = 0,
+            .fpcr = 0,
+            .fpsr = 0,
+            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .sys_regs = &.{},
+            .icc_regs = &.{},
+            .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+            .gic = .{
+                .kind = .gicv3,
+                .gicv3 = .{
+                    .dist_regs = &.{},
+                    .redist_regs = &.{},
+                    .line_levels = &.{.{ .intid = board.generationIntid(), .asserted = false }},
+                },
+            },
+        },
+        .devices = &.{},
+        .generation = .{ .generation = 41, .interrupt_status = 0, .params_b64 = "" },
+        .memory = memory,
+    };
+    try saveManifest(arena, parent_dir, manifest);
+
+    const result = try fork(arena, .{ .parent_dir = parent_dir, .out_dir = out_dir, .count = 2 });
+    try std.testing.expectEqual(@as(usize, 2), result.count);
+    try std.testing.expectEqual(@as(u64, 41), result.parent_generation);
+    try std.testing.expectEqual(@as(u64, 42), result.first_generation);
+    try std.testing.expectEqual(@as(u64, 43), result.last_generation);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{s}/000000", .{out_dir}), result.first_child);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{s}/000001", .{out_dir}), result.last_child);
+
+    const first_child_dir = try pathZ(arena, "{s}/000000", .{out_dir});
+    const first = try loadManifest(arena, first_child_dir);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u64, 42), first.value.generation.generation);
+    try std.testing.expectEqual(@as(u32, generation.irq_generation_changed), first.value.generation.interrupt_status);
+    try std.testing.expect(first.value.generation.params_b64.len > 0);
+    try std.testing.expect(first.value.machine.gic.gicv3.?.line_levels[0].asserted);
+
+    const second_child_dir = try pathZ(arena, "{s}/000001", .{out_dir});
+    const second = try loadManifest(arena, second_child_dir);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u64, 43), second.value.generation.generation);
+
+    const dec = std.base64.standard.Decoder;
+    const decoded_size = try dec.calcSizeForSlice(second.value.generation.params_b64);
+    const decoded = try arena.alloc(u8, decoded_size);
+    try dec.decode(decoded, second.value.generation.params_b64);
+    try std.testing.expect(std.mem.indexOf(u8, decoded, "\"fork_index\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decoded, "\"fork_count\":2") != null);
+
+    const out = try arena.alloc(u8, ram.len);
+    @memset(out, 0);
+    try loadMemory(arena, second_child_dir, second.value.memory, out);
+    try std.testing.expectEqualSlices(u8, ram, out);
+}
+
+test "fork rejects empty count" {
+    try std.testing.expectError(error.BadForkCount, fork(std.testing.allocator, .{
+        .parent_dir = "/does/not/matter",
+        .out_dir = "/does/not/matter-either",
+        .count = 0,
+    }));
 }
 
 test "backend-private GIC state json round-trip" {

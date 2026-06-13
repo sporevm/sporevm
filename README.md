@@ -19,13 +19,14 @@ The target lifecycle property: no operation scales with RAM size.
 - **Fork** is a metadata write — `spore fork --count 10000` is sub-second
 - **Resume** is bounded by the working set, not memory size, on either OS
 
-The product CLI shape is still landing. Today the lifecycle operations are
-exercised through the backend smoke harnesses; the end-state interface is:
+The product CLI shape is still landing. Today `spore fork` can mint child
+spores from an existing spore; create, suspend, and resume are still exercised
+through the backend smoke harnesses. The end-state interface is:
 
 ```console
 spore create --kernel ... --disk ... my-vm
 spore suspend my-vm
-spore fork my-vm --count 10000
+spore fork my-vm.spore --count 10000 --out forks/
 spore pull <spore-id> && spore resume <spore-id>   # on a compatible host
 ```
 
@@ -37,8 +38,9 @@ pinned aarch64 Linux kernel on Hypervisor.framework to an interactive shell and
 on KVM/aarch64 to an Alpine shell prompt, with the shared virtio-mmio console,
 block, net, vsock, rng, and generation devices. The HVF and KVM paths can also
 write/resume a v0 spore on the same host. The CLI can report current host
-platform facts with `spore host-info` and summarise a spore manifest with
-`spore inspect <spore-dir>`.
+platform facts with `spore host-info`, summarise a spore manifest with
+`spore inspect <spore-dir>`, and mint metadata-only child spores with
+`spore fork <spore-dir> --count N --out DIR`.
 
 Identical-host fork/fan-out is the priority path. The cross-hypervisor restore
 matrix remains a secondary diagnostic portability track.
@@ -64,6 +66,9 @@ Build the tiny ticker initrd used by smoke tests with
 `scripts/make-smoke-initrd.sh /tmp/sporevm-smoke.cpio`.
 Run same-host restore smokes, or split cross-host capture/resume legs, with
 `scripts/smoke-restore-leg.sh`.
+Fork an already-captured spore with
+`zig-out/bin/spore fork /tmp/spore --count 100 --out /tmp/forks`; children are
+named `000000`, `000001`, and so on, and share the parent's chunk store.
 
 KVM work needs an aarch64 Linux host with KVM; Hypervisor.framework work needs
 an Apple Silicon Mac on macOS 15+.

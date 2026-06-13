@@ -125,6 +125,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         try applyTransports(transports, m.devices);
         try gen_dev.restore(allocator, m.generation);
         try snapshot.applyMachine(allocator, vm_fd, @intCast(gic_dev.fd), vcpu_fd, m.machine);
+        try raiseGenerationIrqIfPending(vm_fd, &gen_dev);
     } else {
         const initrd_range = if (config.initrd) |initrd| try boot.planInitrd(ram_bytes.len, board.ram_base, config.kernel, initrd.len) else null;
         const dtb = try board.buildDtb(allocator, .{
@@ -304,6 +305,12 @@ fn applyTransports(transports: []mmio.Transport, states: []const spore.Transport
                 .used_idx = qs.used_idx,
             };
         }
+    }
+}
+
+fn raiseGenerationIrqIfPending(vm_fd: std.c.fd_t, gen_dev: *const generation.Device) !void {
+    if (gen_dev.interrupt_status & generation.irq_generation_changed != 0) {
+        try kvm.setIrq(vm_fd, board.generationIntid(), true);
     }
 }
 

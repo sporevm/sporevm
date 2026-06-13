@@ -162,6 +162,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         try applyTransports(transports, m.devices);
         try gen_dev.restore(allocator, m.generation);
         try snapshot.applyMachine(allocator, vcpu, m.machine);
+        try raiseGenerationIrqIfPending(&gen_dev);
     } else {
         // Fresh boot: DTB + kernel. The DTB describes exactly one
         // redistributor frame, where the framework actually put it.
@@ -362,6 +363,12 @@ fn applyTransports(transports: []mmio.Transport, states: []const spore.Transport
                 .used_idx = qs.used_idx,
             };
         }
+    }
+}
+
+fn raiseGenerationIrqIfPending(gen_dev: *const generation.Device) !void {
+    if (gen_dev.interrupt_status & generation.irq_generation_changed != 0) {
+        try hvf.check(hvf.hv_gic_set_spi(board.generationIntid(), true), "generation raise spi");
     }
 }
 

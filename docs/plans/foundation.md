@@ -30,7 +30,7 @@ The end state this plan drives toward:
 ```console
 spore create --kernel ... --disk ... my-vm
 spore suspend my-vm                 # ~50ms regardless of RAM size
-spore fork my-vm --count 10000     # metadata-only, sub-second
+spore fork my-vm.spore --count 10000 --out forks/  # metadata-only
 spore pull <spore-id> && spore resume <spore-id>   # on a compatible host
 ```
 
@@ -260,6 +260,15 @@ HVF locally each resume the ticker through `sporevm-initrd-tick 7` via
 `scripts/make-smoke-initrd.sh` and `scripts/smoke-restore-leg.sh`. Platform
 compatibility checks are shared, and `spore host-info` / `spore inspect` expose
 the host and spore contract fields needed to pick compatible smoke hosts.
+
+Slice 4 has started with the metadata fork path: `spore fork <spore-dir>
+--count N --out DIR` writes child spore manifests named `000000`, `000001`,
+and so on, sharing the parent's chunk store with a `chunks` symlink. Each child
+gets a unique incremented generation, a pending generation-change interrupt,
+and a small JSON resume-parameter payload. KVM and HVF restore now reassert the
+generation SPI when the restored generation state is pending. The remaining
+slice-4 work is the guest-side fixup helper and a real same-host fork-storm
+smoke that proves distinct guest identities, entropy, and clock behaviour.
 
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
