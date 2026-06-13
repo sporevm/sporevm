@@ -119,7 +119,7 @@ pub fn captureMachine(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpu_fd:
 
 pub fn applyMachine(allocator: std.mem.Allocator, vm_fd: std.c.fd_t, gic_fd: std.c.fd_t, vcpu_fd: std.c.fd_t, state: spore.MachineState) !void {
     _ = allocator;
-    try applyGic(gic_fd, state.gic);
+    try applyGic(vm_fd, gic_fd, state.gic);
 
     for (0..31) |i| {
         try kvm.setOneRegU64(vcpu_fd, kvm.gprReg(@intCast(i)), state.gprs[i]);
@@ -194,13 +194,24 @@ fn captureGic(allocator: std.mem.Allocator, gic_fd: std.c.fd_t) !gicv3.GicV3Stat
     return state;
 }
 
-fn applyGic(gic_fd: std.c.fd_t, state: gicv3.State) !void {
+fn applyGic(vm_fd: std.c.fd_t, gic_fd: std.c.fd_t, state: gicv3.State) !void {
     try gicv3.validate(state);
     const g = state.gicv3 orelse return error.PlatformMismatch;
 
     for (g.dist_regs) |reg| try setDistReg(gic_fd, reg);
     for (g.redist_regs) |reg| try setRedistReg(gic_fd, reg);
-    for (g.line_levels) |line| try kvm.setDeviceAttrU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO, levelAttr(line.intid), @intFromBool(line.asserted), "set vgic line level");
+    for (g.line_levels) |line| {
+        if (shouldReplayLineLevel(line)) try kvm.setIrq(vm_fd, line.intid, true);
+    }
+}
+
+fn shouldReplayLineLevel(line: gicv3.LineLevel) bool {
+    // Fresh VGIC state starts with external lines deasserted, so false levels
+    // do not need replay. PPIs are private to a vCPU and are restored through
+    // vCPU/timer state for the current single-vCPU contract. The generation
+    // SPI is raised from generation.Device state after machine restore so the
+    // MMIO device and GIC line stay in sync.
+    return line.asserted and line.intid >= 32 and line.intid != board.generationIntid();
 }
 
 fn appendDistRegs(allocator: std.mem.Allocator, regs: *std.ArrayList(gicv3.MmioReg), gic_fd: std.c.fd_t) !void {
@@ -305,4 +316,11 @@ test "VGIC attr encodings for vCPU0" {
     try std.testing.expectEqual(@as(u64, 0x61c0), distAttr(gicv3.distRouterOffset(56)));
     try std.testing.expectEqual(@as(u64, 0x10080), redistAttr(0x10080));
     try std.testing.expectEqual(@as(u64, 0xc230), cpuSysregAttr(kvm.sysRegInstr(3, 0, 4, 6, 0)));
+}
+
+test "KVM line replay skips default and generation lines" {
+    try std.testing.expect(!shouldReplayLineLevel(.{ .intid = 16, .asserted = false }));
+    try std.testing.expect(!shouldReplayLineLevel(.{ .intid = 27, .asserted = true }));
+    try std.testing.expect(!shouldReplayLineLevel(.{ .intid = board.generationIntid(), .asserted = true }));
+    try std.testing.expect(shouldReplayLineLevel(.{ .intid = board.virtioDeviceIntid(0), .asserted = true }));
 }

@@ -276,9 +276,11 @@ fresh entropy seed) into the generation params page at actual resume time. The
 fork-aware smoke initrd polls the generation device, applies/logs hostname,
 machine-id, entropy and clock fixups, then acks the generation interrupt last;
 `scripts/smoke-fork-fanout.sh` exercises parent capture plus same-host child
-fan-out. The remaining slice-4 gap is scaling that smoke from the current small
-fan-out harness to the 100-concurrent-fork target and recording the latency
-measurement.
+fan-out. HVF and KVM now pass `--count 8` same-host fan-out smokes, with KVM
+validated on the `m7g.metal` host using the `cleanroom-kernels` v0.3.0
+`sporevm-arm64-linux-6.1.155-Image` asset. The remaining slice-4 gap is scaling
+that smoke from the current small fan-out harness to the 100-concurrent-fork
+target and recording the latency measurement.
 
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
