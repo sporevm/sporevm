@@ -8,15 +8,19 @@ Cross-backend restore is useful diagnostic portability, but the primary product
 path is fork/fan-out on identical host classes.
 
 The sealed checkpoint artifact is called a **spore**: a manifest of
-content-addressed memory and disk chunks plus a small normalized machine-state
-blob. Spores are the unit of suspend, fork, fan-out, and cross-backend
-inspection.
+content-addressed memory chunks, guest machine state, and eventually disk
+state. v0 spores do not capture disk bytes yet; disk-backed resume still
+requires the same backing disk out of band. Spores are the unit of suspend,
+fork, fan-out, and cross-backend inspection.
 
-The defining design property: no lifecycle operation scales with RAM size.
+The target lifecycle property: no operation scales with RAM size.
 
 - **Suspend** is a pause plus a small tail flush (~tens of ms at any RAM size)
 - **Fork** is a metadata write — `spore fork --count 10000` is sub-second
 - **Resume** is bounded by the working set, not memory size, on either OS
+
+The product CLI shape is still landing. Today the lifecycle operations are
+exercised through the backend smoke harnesses; the end-state interface is:
 
 ```console
 spore create --kernel ... --disk ... my-vm

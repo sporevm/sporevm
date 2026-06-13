@@ -21,9 +21,9 @@ size. A running VM is permanently checkpoint-ready: dirty pages stream
 continuously into a content-addressed store, so suspend is a pause plus a small
 tail flush, fork is a metadata write, and resume is bounded by the working set,
 not by memory size. The sealed checkpoint artifact is called a **spore**: a
-manifest of content-addressed memory and disk chunks plus a small normalized
-machine-state blob. Spores are the unit of suspend, fork, fan-out, and
-cross-backend inspection.
+manifest of content-addressed memory chunks, guest machine state, and eventually
+disk state. v0 does not capture disk bytes yet. Spores are the unit of suspend,
+fork, fan-out, and cross-backend inspection.
 
 The end state this plan drives toward:
 
@@ -107,10 +107,10 @@ The enabling platform facts are confirmed:
 
 ### Process and API surface
 
-`spore` is a single binary: CLI subcommands plus a long-running per-VM monitor
-process. Consumers integrate over a newline-delimited JSON control protocol on
-a per-VM unix socket (the cleanroom helper pattern), so the Zig core is
-invisible at the integration seam.
+Target-state `spore` is a single binary: CLI subcommands plus a long-running
+per-VM monitor process. Consumers integrate over a newline-delimited JSON
+control protocol on a per-VM unix socket (the cleanroom helper pattern), so the
+Zig core is invisible at the integration seam.
 
 ```console
 spore create | resume | suspend | fork | rm | ls | inspect
@@ -132,26 +132,27 @@ addition must justify itself against both.
 
 ### Guest platform contract
 
-A spore embeds a platform contract: aarch64, pinned kernel build ID, device
-model version, and a CPU feature-ID profile (the common denominator of Apple
-M-series and AWS Graviton, masked at VM creation). Restore fails closed when
-the host cannot satisfy the contract. The guest kernel config starts from
-cleanroom's managed-kernel config with virtio-mmio, vsock, and the generation
-driver enabled.
+A spore embeds a platform contract: aarch64, device model version, RAM/GIC
+layout, guest-visible counter frequency, and a CPU feature-ID profile (the
+common denominator of Apple M-series and AWS Graviton, masked at VM creation).
+Restore fails closed when the host cannot satisfy the contract. Kernel image
+identity is a planned contract field before claiming cross-host disk-backed
+restore. The guest kernel config starts from cleanroom's managed-kernel config
+with virtio-mmio, vsock, and the generation driver enabled.
 
 ### Spore manifest v0
 
 ```text
 spore manifest
-├── platform contract (arch, kernel build, device model ver, CPU profile)
-├── machine state: architectural vCPU state per CPU, GICv3 state,
-│   virtio queue state, timer offsets — normalized, hypervisor-neutral
-├── memory manifest: ordered chunk refs (blake3, zstd), zero-elided
-├── disk manifest: chunk refs over the block device
-└── access trace: page-touch order from prior resumes (prefetch hint)
+├── platform contract (arch, device model, CPU profile, RAM/GIC layout,
+│   counter frequency)
+├── machine state: architectural vCPU state, GICv3/ICC state, virtual timer,
+│   virtio transport state, generation device state
+└── memory manifest: ordered BLAKE3 chunk refs, zero-elided
 ```
 
-Chunks live in a local CAS directory; manifests are small JSON/CBOR documents.
+Chunks live in a local CAS directory; v0 manifests are JSON documents. Disk
+manifests and access traces land in later fork/fan-out and lazy-restore slices.
 Spores are exportable as OCI artifacts so existing registries (and cleanroom's
 gateway/content-cache) can serve them.
 
@@ -219,108 +220,53 @@ That is a deliberate tradeoff and it is bought back structurally, not by hope:
 ## Current Progress
 
 Slice 0 scaffolding has landed: Zig 0.16.0 pinned via mise, `zig build test`
-green (chunk-id module with BLAKE3 CAS identities and verification tests),
-`spore` CLI basics (`version`, `host-info`, `inspect`, `help`), founding docs
-(`README.md`, `SECURITY.md`, `AGENTS.md`, MIT `LICENSE`,
+green, `spore` CLI basics (`version`, `host-info`, `inspect`, `help`), founding
+docs (`README.md`, `SECURITY.md`, `AGENTS.md`, MIT `LICENSE`,
 `docs/spore-format.md`), Buildkite pipeline targeting the `cleanroom` and
-`cleanroom-mac` queues, and the QEMU cross-accelerator experiment designed in
-`docs/research.md`.
+`cleanroom-mac` queues, and the QEMU cross-accelerator experiment decision
+recorded in `docs/research.md`. The QEMU proxy experiment was not run because
+direct SporeVM HVF and KVM state work answered the useful normalization
+questions first; it remains a diagnostic fallback, not a blocker.
 
-The planned QEMU KVM↔HVF proxy experiment has not run because direct SporeVM
-HVF suspend/restore work landed first. `docs/research.md` records that result
-as an explicit keep/adjust decision: keep architectural machine-state
-normalization, but treat GICv3 CPU-interface state and virtual timer anchoring
-as first-class normalized fields. The QEMU matrix remains useful once the KVM
-side exists, but it no longer blocks the already-landed HVF foundation work.
+Slice 1 (KVM boot) is complete for the foundation target. On the real aarch64
+KVM `m7g.metal` dev host, `kvm-boot` creates the VM/vCPU, configures userspace
+VGICv3, maps the shared board DTB, and routes the shared virtio-mmio plus
+generation device exits. It boots the cleanroom 6.1.155 kernel to the expected
+no-root VFS panic without storage, to an Alpine `/bin/sh` with an ext4 rootfs,
+and through diskless initrd smoke workloads. DTB generation, virtqueue parsing,
+and hostile queue/device inputs are covered by unit and fuzz-style tests in the
+Zig test suite.
 
-Slice 2 (HVF boot) started ahead of slice 1 because the local dev machine is
-an Apple Silicon Mac while the aarch64 KVM dev host is still being
-provisioned. The HVF path boots the cleanroom 6.1.155 kernel to the expected
-root-mount panic with working GICv3 interrupts, virtio-mmio console output,
-and PSCI. HVF bring-up findings now encoded in `src/hvf/`:
+Slice 2 (HVF boot) is complete for the foundation target. The HVF backend uses
+the same board/device code paths, creates `hv_vm`/vCPU/GIC state behind the
+backend boundary, and boots the same cleanroom kernel/initrd/rootfs combinations
+to an interactive shell on Apple Silicon. The shared virtio-mmio console, blk,
+net, vsock, rng, and generation devices are present on both backends. Host
+network attachment remains a later transport concern, not a slice-2 blocker.
 
-- Apple's hv_gic emulates the redistributor/distributor *behavior* in-kernel
-  but still traps GICD/GICR MMIO that misses its claimed ranges; the
-  `hv_gic_{get,set}_*_reg` enums are architectural register offsets but the
-  calls return HV_DENIED at runtime (they are save/restore APIs). Correct
-  approach: set MPIDR_EL1 before querying `hv_gic_get_redistributor_base` and
-  describe that exact frame in the DTB.
-- The framework reserves a large redistributor region (32MB observed); the
-  virtio-mmio window moved to 0x0c00_0000 to stay clear. This is a board
-  contract value (`src/board.zig`).
-- The cleanroom kernel has no PL011, so the first console is virtio-mmio
-  virtio-console (hvc0) and early boot is blind until virtio probes.
+Slice 3 (same-hypervisor eager suspend/restore and manifest v0) is complete for
+both backends. `src/spore.zig` and `docs/spore-format.md` define v0: eager,
+content-addressed, zero-elided RAM chunks; normalized one-vCPU architectural
+state; virtual timer re-anchoring; GIC/ICC state; virtio transport state; and
+generation device state. KVM emits/consumes portable GICv3 distributor and
+redistributor state; HVF same-backend restore still uses a tagged
+`backend_private` `hv_gic` blob until HVF portable GIC capture is complete. v0
+does not capture disk contents, so disk-backed resume still requires unchanged
+external disk bytes.
 
-Slice 2 has since reached an interactive shell on HVF: virtio-blk against a
-cleanroom-built alpine ext4 rootfs, console input (rx queue plus idle-exit
-stdin polling), minimal virtio-net (stable MAC, TX drain), a minimal
-virtio-vsock closed endpoint, virtio-rng backed by host entropy, the frozen
-generation MMIO device present/inert, and `init=/bin/sh` workloads run end to
-end. Host networking remains a later backend attachment behind the shared net
-transport.
+Same-host diskless restore smokes now pass on both available sides using the
+`cleanroom-kernels` v0.2.0 `initrd` profile: KVM on the `m7g.metal` host and
+HVF locally each resume the ticker through `sporevm-initrd-tick 7` via
+`scripts/make-smoke-initrd.sh` and `scripts/smoke-restore-leg.sh`. Platform
+compatibility checks are shared, and `spore host-info` / `spore inspect` expose
+the host and spore contract fields needed to pick compatible smoke hosts.
 
-Slice 3 has landed on the HVF side: spore manifest v0 (`docs/spore-format.md`,
-`src/spore.zig`) with content-addressed zero-elided memory chunks, normalized
-machine state (GPRs, SIMD, EL1 sysregs, ICC regs, virtual-timer re-anchoring),
-hv_gic state blob capture/restore, virtio transport state, and generation
-device state. Demonstrated: a shell counter loop snapshotted at tick 8 resumes
-at tick 9 in a fresh process (`hvf-boot --snapshot-after-ms/--spore/--resume`).
-A 512MiB idle guest spores to ~26MB. Key finding: GIC ICC (CPU-interface)
-registers are not part of the hv_gic state blob and must be saved per-vCPU via
-`hv_gic_{get,set}_icc_reg` —
-without them the resumed guest hangs with all interrupts masked. v0 does not
-capture disk state: resume requires the unmodified backing disk file
-(documented in the format doc).
-
-Slice 1 has now started on real aarch64 KVM hardware (`m7g.metal`): the
-`kvm-boot` harness creates a KVM VM/vCPU, configures userspace VGICv3, maps the
-same board DTB, and routes shared virtio-mmio/generation device exits. It boots
-the cleanroom 6.1.155 kernel to the expected no-root VFS panic without a disk
-and to an Alpine `/bin/sh` prompt with a mountless `mkfs.ext4 -d` minirootfs.
-
-The KVM side now has same-host suspend/restore groundwork using the v0 spore
-manifest: normalized KVM one-reg vCPU state, SIMD, EL1 sysregs, virtual-timer
-re-anchoring via `KVM_ARM_SET_COUNTER_OFFSET`, virtio/generation state, eager
-RAM chunks, and portable GICv3 distributor/redistributor offsets plus line
-levels in `machine.gic`. HVF still uses a tagged backend-private `hv_gic` blob
-until its architectural GICv3 mapping lands. A real
-`m7g.metal` smoke test booted an Alpine BusyBox ticker, snapshotted after
-`sporevm-tick 4`, and resumed in a fresh KVM process at `sporevm-tick 5`.
-The first HVF GIC portability probe is now explicit and opt-in: it uses the
-same shared register subset as KVM, records unsupported offsets, and confirms
-that HVF cannot yet emit a complete portable GIC state because there is no
-line-level getter and several redistributor/distributor offsets are not exposed.
-KVM→HVF now creates HVF's GIC at the manifest's KVM redistributor base and can
-apply portable GICv3 state. KVM masks the Graviton RNDR CPU feature before
-guest boot so Linux no longer patches in `RNDRRS_EL0` (`S3_3_C2_C4_1`), which
-Apple HVF does not expose to guests; the manifest records this as
-`platform.cpu_profile = "sporevm-aarch64-v0"`. With RNDR masked, a KVM snapshot
-resumes on HVF to `sporevm-tick 6`; the remaining observed blocker is
-virtual-counter frequency portability, because a guest booted against KVM's
-counter frequency runs slowly after restore on Apple HVF's 24MHz counter. The
-manifest now records `platform.counter_frequency_hz` and restore fails closed
-across a counter-frequency mismatch until cross-frequency timer virtualization
-has a real design. Platform compatibility checks are now shared across the
-backends, and `spore host-info` / `spore inspect` expose the host and spore
-contract fields needed to pick compatible smoke hosts (`host-info` reports the
-process-visible `CNTFRQ_EL0`; HVF's guest timer frequency remains validated by
-the HVF boot harness). `docs/state-portability.md` now records the portable
-state contract, backend mapping matrix, register policies, and fail-closed
-restore rules. The boot harnesses now accept `--initrd`, describe the initrd in
-`/chosen/linux,initrd-{start,end}`, and place it after the kernel so the first
-positive cross-hypervisor smoke can be diskless when using the
-`cleanroom-kernels` `initrd` profile (the default `rootfs` kernel profile
-intentionally ignores external initrds). `cleanroom-kernels` v0.2.0 now
-publishes that `initrd` profile alongside `rootfs`. `scripts/make-smoke-initrd.sh`
-builds the tiny ticker initrd used for those smokes, including local
-`CC="zig cc -target aarch64-linux-musl"` builds, and
-`scripts/smoke-restore-leg.sh` runs same-host or split capture/resume legs for
-the matrix without hiding cross-host spore transfer. Diskless same-host smokes
-now pass on both available sides: KVM on the `m7g.metal` host and HVF locally
-each resume the initrd ticker through `sporevm-initrd-tick 7`. The four-way
-cross-hypervisor matrix (slice 4) remains next; its positive KVM→HVF leg still
-needs a 24MHz KVM producer host, while the current `m7g.metal` host remains the
-negative cross-frequency test host.
+Cross-backend restore is intentionally secondary. KVM→HVF can map portable
+vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
+spores now fail closed on the expected counter-frequency mismatch
+(`1_050_000_000` Hz vs Apple HVF's 24MHz). HVF→KVM remains gated on HVF
+emitting portable GICv3 state. These are tracked in `docs/state-portability.md`
+and do not block the next release-critical fork/fan-out slices.
 
 ## Delivery Strategy
 
@@ -346,8 +292,9 @@ exists with a clear keep/adjust decision for the normalization approach.
 ### Slice 1: Boot under KVM
 
 Minimal KVM VMM on Linux aarch64: load the pinned kernel + initramfs, build
-the device tree, virtio-mmio console only, serial output to stdout, clean
-shutdown. `spore create --kernel ... --initrd ...` boots to a shell.
+the device tree, virtio-mmio console, shared virtio device model, serial output
+to stdout, clean shutdown. `kvm-boot --initrd ...` boots to a smoke workload;
+`kvm-boot --disk ...` boots to a shell.
 
 Done when: a real aarch64 KVM host boots to an interactive console in under a
 second and `zig build test` covers DTB generation and virtqueue parsing, with
@@ -367,8 +314,10 @@ net + vsock + rng land on both backends (this slice or a small follow-up).
 
 Pause vCPUs, extract architectural vCPU state + GIC state + virtio state,
 write a spore manifest with full (not yet lazy) memory chunks into a local
-CAS. `spore suspend` / `spore resume` round-trips on the same host for both
-KVM and HVF independently. Manifest decode gets a fuzz target.
+CAS. The backend harnesses (`kvm-boot` and `hvf-boot`) round-trip on the same
+host with `--snapshot-after-ms ... --spore ...` and `--resume ...`; product
+`spore suspend` / `spore resume` commands land with the lifecycle CLI. Manifest
+decode gets a fuzz target.
 
 Done when: a guest survives suspend/resume with running processes intact
 (KVM→KVM and HVF→HVF), and `docs/spore-format.md` documents manifest v0.
@@ -501,10 +450,11 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   until then results are recorded manually in the plan.
 - Zig toolchain pinned via mise to the latest stable release at slice 0,
   upgraded deliberately per release.
-- Guest kernels are built and published by the `cleanroom-kernels` repo via a
-  SporeVM kernel profile (virtio-mmio, vsock, generation driver); the platform
-  contract pins its build ID. Vendoring the config into this repo remains the
-  recorded fallback if SporeVM must be self-contained when it goes public.
+- Guest kernels are built and published by the `cleanroom-kernels` repo via
+  `rootfs` and `initrd` profiles suitable for SporeVM smokes. Kernel build ID
+  is not yet in the platform contract; adding it is required before claiming
+  cross-host disk-backed restore. Vendoring the config into this repo remains
+  the recorded fallback if SporeVM must be self-contained when it goes public.
 - With the aarch64 KVM dev host available, proceed with a direct KVM backend
   first. Keep the QEMU-assisted GICv3 cross-check as a diagnostic fallback,
   not as a blocker before KVM restore.
