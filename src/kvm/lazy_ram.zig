@@ -28,6 +28,7 @@ pub const Options = struct {
     dir: []const u8,
     manifest: spore.MemoryManifest,
     ram: []u8,
+    trace_fd: ?std.c.fd_t = null,
 };
 
 pub const Pager = struct {
@@ -57,6 +58,8 @@ pub const Pager = struct {
             .manifest = options.manifest,
             .ram_addr = @intFromPtr(options.ram.ptr),
             .ram_len = options.ram.len,
+            .trace_fd = options.trace_fd,
+            .start_ms = monotonicMs() catch 0,
         };
 
         const thread = try std.Thread.spawn(.{}, faultThread, .{context});
@@ -83,6 +86,8 @@ const Context = struct {
     manifest: spore.MemoryManifest,
     ram_addr: usize,
     ram_len: usize,
+    trace_fd: ?std.c.fd_t,
+    start_ms: u64,
 };
 
 fn validateMapping(ram: []const u8) !void {
@@ -188,6 +193,7 @@ fn handleFault(context: *Context) !void {
     };
     if (c.ioctl(context.uffd, c.UFFDIO_COPY, &copy) < 0) return error.UserfaultfdCopyFailed;
     if (copy.copy < 0 or @as(usize, @intCast(copy.copy)) != len) return error.UserfaultfdCopyFailed;
+    try writeTrace(context, index, range, len);
 }
 
 fn linuxCall(rc: usize) !void {
@@ -210,6 +216,48 @@ fn sleepOneMs() void {
             else => return,
         }
     }
+}
+
+fn writeTrace(context: *Context, index: usize, range: spore.MemoryChunkRange, len: usize) !void {
+    const fd = context.trace_fd orelse return;
+    const now = monotonicMs() catch context.start_ms;
+    const fault_ms = if (now >= context.start_ms) now - context.start_ms else 0;
+    const nonzero: u1 = if (context.manifest.chunks[index] == null) 0 else 1;
+    var buf: [192]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "fault_ms={d} chunk_index={d} guest_offset={d} len={d} nonzero={d}\n", .{
+        fault_ms,
+        index,
+        range.start,
+        len,
+        nonzero,
+    });
+    try writeAll(fd, line);
+}
+
+fn writeAll(fd: std.c.fd_t, bytes: []const u8) !void {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const tail = bytes[written..];
+        const rc = linux.write(fd, tail.ptr, tail.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return error.IoFailed;
+                written += @intCast(rc);
+            },
+            .INTR => continue,
+            else => return error.IoFailed,
+        }
+    }
+}
+
+fn monotonicMs() !u64 {
+    var ts: linux.timespec = undefined;
+    const rc = linux.clock_gettime(.MONOTONIC, &ts);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.IoFailed,
+    }
+    return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) noreturn {

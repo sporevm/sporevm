@@ -40,6 +40,8 @@ pub const Config = struct {
     /// Chunk restore strategy for cold/imported KVM resumes. Eager remains the
     /// default; lazy is an explicit development path backed by userfaultfd.
     ram_restore_mode: RamRestoreMode = .eager_chunks,
+    /// Optional fd that receives one line per lazily materialized chunk.
+    lazy_ram_trace_fd: ?std.c.fd_t = null,
     /// Take a spore snapshot after this many milliseconds of run time and
     /// stop. Requires snapshot_dir.
     snapshot_after_ms: ?u64 = null,
@@ -188,6 +190,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     .dir = config.resume_dir.?,
                     .manifest = m.memory,
                     .ram = ram_bytes,
+                    .trace_fd = config.lazy_ram_trace_fd,
                 });
                 if (restore_stats) |*stats| stats.memory_ms = (try monotonicMs()) - memory_start;
             },
