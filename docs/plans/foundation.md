@@ -220,9 +220,12 @@ green (chunk-id module with BLAKE3 CAS identities and verification tests),
 Buildkite pipeline targeting the `cleanroom` and `cleanroom-mac` queues, and
 the QEMU cross-accelerator experiment designed in `docs/research.md`.
 
-Slice 0 remains open until the QEMU KVM↔HVF experiment has run on real hosts
-and its keep/adjust decision is recorded. CI is deferred until the repo gets a
-remote; local `zig build test` is the verification gate for now.
+The planned QEMU KVM↔HVF proxy experiment has not run because direct SporeVM
+HVF suspend/restore work landed first. `docs/research.md` records that result
+as an explicit keep/adjust decision: keep architectural machine-state
+normalization, but treat GICv3 CPU-interface state and virtual timer anchoring
+as first-class normalized fields. The QEMU matrix remains useful once the KVM
+side exists, but it no longer blocks the already-landed HVF foundation work.
 
 Slice 2 (HVF boot) started ahead of slice 1 because the local dev machine is
 an Apple Silicon Mac while the aarch64 KVM dev host is still being
@@ -441,6 +444,7 @@ chunk set, and chunk verification rejects corrupted peer data.
 
 ## Open Questions
 
-None currently. The next decision point is slice 0's QEMU experiment outcome,
-which feeds the machine-state normalization design rather than this plan's
-scope.
+None currently. The next decision point is practical rather than architectural:
+when an aarch64 KVM host is available, decide whether the fastest path to the
+four-way matrix is a direct KVM backend first or a QEMU-assisted GICv3
+cross-check before implementing KVM restore.
