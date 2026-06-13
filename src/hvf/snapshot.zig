@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const hvf = @import("hvf.zig");
+const board = @import("../board.zig");
 const gicv3 = @import("../gicv3.zig");
 const spore = @import("../spore.zig");
 
@@ -125,7 +126,7 @@ pub fn captureMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle) !spore
 
 pub fn applyMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle, state: spore.MachineState) !void {
     // GIC state first: must be applied before the vCPU runs.
-    try applyGic(allocator, state.gic);
+    try applyGic(allocator, vcpu, state.gic);
 
     for (0..31) |i| {
         try hvf.check(hvf.hv_vcpu_set_reg(vcpu, @enumFromInt(@as(u32, @intCast(i))), state.gprs[i]), "set gpr");
@@ -182,11 +183,10 @@ fn captureGic(allocator: std.mem.Allocator) ![]const u8 {
     return out;
 }
 
-fn applyGic(allocator: std.mem.Allocator, state: gicv3.State) !void {
+fn applyGic(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle, state: gicv3.State) !void {
     try gicv3.validate(state);
     if (state.kind == .gicv3) {
-        std.log.err("HVF portable GICv3 restore is not enabled; refusing cross-backend GIC state", .{});
-        return error.PlatformMismatch;
+        return applyPortableGic(vcpu, state.gicv3.?);
     }
 
     const private = state.backend_private orelse return error.PlatformMismatch;
@@ -200,4 +200,44 @@ fn applyGic(allocator: std.mem.Allocator, state: gicv3.State) !void {
     defer allocator.free(raw);
     dec.decode(raw, private.data_b64) catch return error.PlatformMismatch;
     try hvf.check(hvf.hv_gic_set_state(raw.ptr, raw.len), "hv_gic_set_state");
+}
+
+fn applyPortableGic(vcpu: hvf.VcpuHandle, state: gicv3.GicV3State) !void {
+    for (state.dist_regs) |reg| try writePortableReg(.distributor, vcpu, reg);
+    for (state.redist_regs) |reg| try writePortableReg(.redistributor, vcpu, reg);
+    for (state.line_levels) |line| {
+        if (line.intid < board.spi_base_intid) {
+            if (line.asserted) {
+                std.log.err("HVF cannot restore asserted PPI line level for INTID {d}", .{line.intid});
+                return error.PlatformMismatch;
+            }
+            continue;
+        }
+        try hvf.check(hvf.hv_gic_set_spi(line.intid, line.asserted), "hv_gic_set_spi restore line");
+    }
+}
+
+fn writePortableReg(region: hvf.gic.Region, vcpu: hvf.VcpuHandle, reg: gicv3.MmioReg) !void {
+    hvf.gic.writeRegStrict(region, vcpu, reg) catch {
+        if (canSkipUnsupportedPortableReg(region, reg)) return;
+        std.log.err("HVF does not support portable GICv3 {s} write offset=0x{x} width={d}", .{ @tagName(region), reg.offset, reg.width_bits });
+        return error.PlatformMismatch;
+    };
+}
+
+fn canSkipUnsupportedPortableReg(region: hvf.gic.Region, reg: gicv3.MmioReg) bool {
+    return switch (region) {
+        // Hypervisor.framework does not expose group-modifier registers, but
+        // SporeVM's current single-vCPU board keeps them at reset value.
+        .distributor => reg.offset == 0xd04 and reg.value == 0, // GICD_IGRPMODR1
+        .redistributor => switch (reg.offset) {
+            // GICR_CTLR: this board has no ITS/LPIs. KVM may report
+            // implementation status bits, but EnableLPIs must remain clear.
+            0x0000 => reg.value & 0x1 == 0,
+            0x0014, // GICR_WAKER; HVF's guest-MMIO path treats this as RAZ/WI.
+            0x10d00, // GICR_IGRPMODR0
+            => reg.value == 0,
+            else => false,
+        },
+    };
 }

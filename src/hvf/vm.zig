@@ -60,6 +60,12 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     try hvf.check(hvf.hv_vm_create(null), "hv_vm_create");
     defer _ = hvf.hv_vm_destroy();
 
+    var resume_parsed: ?std.json.Parsed(spore.Manifest) = null;
+    defer if (resume_parsed) |*parsed| parsed.deinit();
+    if (config.resume_dir) |spore_dir| {
+        resume_parsed = try spore.loadManifest(allocator, spore_dir);
+    }
+
     // GIC layout from runtime parameters; created before any vCPU.
     var dist_size: usize = 0;
     var dist_align: usize = 0;
@@ -70,8 +76,11 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     try hvf.check(hvf.hv_gic_get_redistributor_region_size(&redist_size), "gic redist size");
     try hvf.check(hvf.hv_gic_get_redistributor_base_alignment(&redist_align), "gic redist align");
 
-    const dist_base: u64 = std.mem.alignForward(u64, 0x0800_0000, dist_align);
-    const redist_base: u64 = std.mem.alignForward(u64, dist_base + dist_size, redist_align);
+    const default_dist_base: u64 = std.mem.alignForward(u64, 0x0800_0000, dist_align);
+    const default_redist_base: u64 = std.mem.alignForward(u64, default_dist_base + dist_size, redist_align);
+    const dist_base: u64 = if (resume_parsed) |parsed| parsed.value.platform.gic_dist_base else default_dist_base;
+    const redist_base: u64 = if (resume_parsed) |parsed| parsed.value.platform.gic_redist_base else default_redist_base;
+    if (dist_base % dist_align != 0 or redist_base % redist_align != 0) return error.PlatformMismatch;
 
     const gic_config = hvf.hv_gic_config_create();
     defer hvf.os_release(gic_config);
@@ -138,9 +147,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
 
     if (config.resume_dir) |spore_dir| {
         // Restore: memory, device, GIC, and vCPU state from the spore.
-        const parsed = try spore.loadManifest(allocator, spore_dir);
-        defer parsed.deinit();
-        const m = parsed.value;
+        const m = resume_parsed.?.value;
         if (m.version != spore.format_version or
             m.platform.device_model_version != board.device_model_version or
             m.platform.ram_base != board.ram_base or

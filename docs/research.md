@@ -75,6 +75,11 @@ answered the highest-risk state-normalization questions on the macOS side:
   writebacks 25 ok / 0 unsupported, SPI set/lower works for the generation
   device, and HVF exposes no line-level getter. That keeps HVF portable capture
   gated; the current HVF path remains the tagged `hv_gic` blob.
+- The first KVM→HVF resume attempt now gets through platform contract setup,
+  portable GICv3 restore, vCPU/ICC/timer restore, and reaches userspace
+  (`sporevm-tick 6`) before the guest kernel oopses on an undefined MRS of
+  `S3_3_C2_C4_1`. That moves the current cross-hypervisor blocker from GIC
+  mapping to the CPU feature-ID/profile masking work called out in slice 4.
 
 Decision: keep the architectural machine-state normalization design. Adjust
 the cross-hypervisor slice to treat GICv3 CPU-interface state and virtual

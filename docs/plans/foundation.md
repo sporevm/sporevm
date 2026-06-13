@@ -284,6 +284,10 @@ The first HVF GIC portability probe is now explicit and opt-in: it uses the
 same shared register subset as KVM, records unsupported offsets, and confirms
 that HVF cannot yet emit a complete portable GIC state because there is no
 line-level getter and several redistributor/distributor offsets are not exposed.
+KVM→HVF now creates HVF's GIC at the manifest's KVM redistributor base and can
+apply portable GICv3 state far enough to resume the ticker workload at tick 6;
+the guest then oopses on an undefined CPU system-register read (`S3_3_C2_C4_1`),
+so the next blocker is CPU feature-ID/profile masking rather than GIC mapping.
 The four-way cross-hypervisor matrix (slice 4) remains next.
 
 ## Delivery Strategy

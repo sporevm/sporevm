@@ -168,6 +168,7 @@ fn probeRegion(region: hvf.gic.Region, vcpu: hvf.VcpuHandle, specs: []const gicv
     var counts: ProbeCounts = .{};
     for (specs) |spec| {
         const reg = hvf.gic.readRegStrict(region, vcpu, spec) catch {
+            std.debug.print("hvf-gic-probe: unsupported read {s} offset=0x{x} width={d}\n", .{ @tagName(region), spec.offset, spec.width_bits });
             counts.reads_unsupported += 1;
             continue;
         };
@@ -175,6 +176,7 @@ fn probeRegion(region: hvf.gic.Region, vcpu: hvf.VcpuHandle, specs: []const gicv
 
         if (!safeWriteback(region, spec)) continue;
         hvf.gic.writeRegStrict(region, vcpu, reg) catch {
+            std.debug.print("hvf-gic-probe: unsupported writeback {s} offset=0x{x} width={d}\n", .{ @tagName(region), spec.offset, spec.width_bits });
             counts.writebacks_unsupported += 1;
             continue;
         };
