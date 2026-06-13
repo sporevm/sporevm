@@ -94,8 +94,10 @@ The enabling platform facts are confirmed:
 - Non-Linux guests, GUI, GPU, USB, or any device beyond the minimal set.
 - virtio-pci. The device model is virtio-mmio only.
 - Live migration of a running VM. Suspend/transfer/resume is the contract.
-- Network egress policy, secret mediation, OCI image handling, or workspace
-  semantics. Those belong to consumers like cleanroom.
+- Network egress policy, secret mediation, OCI runtime semantics, or workspace
+  semantics. Those belong to consumers like cleanroom. SporeVM may provide
+  offline developer utilities for materializing digest-pinned OCI root filesystems
+  into block images, but the VMM does not own image policy.
 - Preserving open TCP connections across cross-host resume.
 - Multi-tenant public-cloud hardening claims. The v0 threat model is
   self-hosted CI/agent isolation: an untrusted guest must not escape the VMM,
@@ -179,8 +181,10 @@ Three mechanisms hang off that:
 - SporeVM owns: hypervisor interaction, device model, spore format, CAS,
   lazy paging, fork mechanics, the generation device, and the in-guest fixup
   helper.
-- Consumers own: rootfs/image preparation, network policy and egress
-  enforcement, secrets, scheduling across hosts, and what workloads run.
+- Consumers own: rootfs/image policy, network policy and egress enforcement,
+  secrets, scheduling across hosts, and what workloads run. The `spore rootfs`
+  utility is a convenience path for turning a digest-pinned OCI image into an
+  ext4 disk; consumers may still bring their own rootfs.
 - Runtime/host specifics (entitlements, signing, kernel asset paths, cache
   directories) live in host config, never in the spore format.
 

@@ -26,6 +26,7 @@ fuzz targets from the slice that introduces it:
 | Guest memory access during dirty scans | guest | required at slice 7 |
 | Spore manifest decode | registry, disk | fuzzed; unknown versions and malformed manifests fail closed |
 | Chunk decode (zstd) and CAS reads | peers, registry, disk | required at slice 5 |
+| OCI manifest and layer decode | registry | rootfs builder only, outside the monitor process; digest-pinned images, verified blobs, path-safe tar application, and JSON/tar fuzz targets |
 | Generation device inputs | guest | MMIO register surface fuzzed; fork params schema required at slice 6 |
 | Control socket JSON | local consumers | required at slice 3 |
 

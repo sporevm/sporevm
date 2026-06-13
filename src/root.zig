@@ -12,11 +12,12 @@ pub const boot = @import("boot.zig");
 pub const chunk = @import("chunk.zig");
 pub const generation = @import("generation.zig");
 pub const gicv3 = @import("gicv3.zig");
-pub const spore = @import("spore.zig");
 pub const fdt = @import("fdt.zig");
 pub const guestmem = @import("guestmem.zig");
 pub const platform = @import("platform.zig");
 pub const hvf = @import("hvf/hvf.zig");
+pub const rootfs = @import("rootfs.zig");
+pub const spore = @import("spore.zig");
 pub const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
 else
