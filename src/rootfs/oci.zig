@@ -117,7 +117,13 @@ pub fn jsonIsIndexMediaType(allocator: std.mem.Allocator, bytes: []const u8) !bo
         .object => |object| object,
         else => return error.BadManifest,
     };
-    const media = object.get("mediaType") orelse return false;
+    const media = object.get("mediaType") orelse {
+        const manifests = object.get("manifests") orelse return false;
+        return switch (manifests) {
+            .array => true,
+            else => error.BadManifest,
+        };
+    };
     return switch (media) {
         .string => |s| isIndexMediaType(s),
         else => error.BadManifest,
@@ -135,10 +141,21 @@ pub fn isManifestMediaType(media_type: []const u8) bool {
 }
 
 pub fn isSupportedLayerMediaType(media_type: []const u8) bool {
+    return isGzipLayerMediaType(media_type) or isPlainTarLayerMediaType(media_type);
+}
+
+pub fn isGzipLayerMediaType(media_type: []const u8) bool {
     return std.mem.eql(u8, media_type, "application/vnd.oci.image.layer.v1.tar+gzip") or
         std.mem.eql(u8, media_type, "application/vnd.docker.image.rootfs.diff.tar.gzip") or
         std.mem.eql(u8, media_type, "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip") or
         std.mem.eql(u8, media_type, "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip");
+}
+
+pub fn isPlainTarLayerMediaType(media_type: []const u8) bool {
+    return std.mem.eql(u8, media_type, "application/vnd.oci.image.layer.v1.tar") or
+        std.mem.eql(u8, media_type, "application/vnd.docker.image.rootfs.diff.tar") or
+        std.mem.eql(u8, media_type, "application/vnd.oci.image.layer.nondistributable.v1.tar") or
+        std.mem.eql(u8, media_type, "application/vnd.docker.image.rootfs.foreign.diff.tar");
 }
 
 pub fn verifyDigestBytes(digest: []const u8, bytes: []const u8) !void {
@@ -220,6 +237,29 @@ test "file digest verification validates digest before slicing" {
     defer Io.Dir.cwd().deleteFile(io, path) catch {};
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "data" });
     try std.testing.expectError(error.UnsupportedDigest, verifyDigestFile(io, "sha256:short", path));
+}
+
+test "OCI index detection accepts manifest arrays without mediaType" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(try jsonIsIndexMediaType(allocator,
+        \\{"schemaVersion":2,"manifests":[]}
+    ));
+    try std.testing.expect(!try jsonIsIndexMediaType(allocator,
+        \\{"schemaVersion":2,"config":{},"layers":[]}
+    ));
+    try std.testing.expectError(
+        error.BadManifest,
+        jsonIsIndexMediaType(allocator,
+            \\{"schemaVersion":2,"manifests":{}}
+        ),
+    );
+}
+
+test "supported layer media types include gzip and plain tar variants" {
+    try std.testing.expect(isSupportedLayerMediaType("application/vnd.oci.image.layer.v1.tar+gzip"));
+    try std.testing.expect(isSupportedLayerMediaType("application/vnd.oci.image.layer.v1.tar"));
+    try std.testing.expect(isSupportedLayerMediaType("application/vnd.docker.image.rootfs.diff.tar"));
+    try std.testing.expect(!isSupportedLayerMediaType("application/vnd.oci.image.layer.v1.tar+zstd"));
 }
 
 fn fuzzOCIManifestJson(_: void, s: *std.testing.Smith) !void {

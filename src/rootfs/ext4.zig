@@ -7,6 +7,8 @@ const Blake3 = std.crypto.hash.Blake3;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const min_rootfs_size_bytes: u64 = 512 << 20;
+const min_rootfs_inodes: u64 = 65_536;
+const rootfs_inode_headroom: u64 = 4096;
 const rootfs_headroom_bytes: u64 = 128 << 20;
 const rootfs_align_bytes: u64 = 4 << 20;
 const ext4_superblock_offset: u64 = 1024;
@@ -54,12 +56,31 @@ pub fn dirContentSize(io: Io, dir: Io.Dir) !u64 {
     return total;
 }
 
+pub fn dirEntryCount(io: Io, dir: Io.Dir) !u64 {
+    var total: u64 = 1; // Include the directory itself.
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        total += 1;
+        if (entry.kind == .directory) {
+            var child = try dir.openDir(io, entry.name, .{ .iterate = true });
+            defer child.close(io);
+            total += try dirEntryCount(io, child) - 1;
+        }
+    }
+    return total;
+}
+
 pub fn computeImageSize(content_bytes: u64) u64 {
     var target = content_bytes + (content_bytes / 2) + rootfs_headroom_bytes;
     if (target < min_rootfs_size_bytes) target = min_rootfs_size_bytes;
     const remainder = target % rootfs_align_bytes;
     if (remainder == 0) return target;
     return target + (rootfs_align_bytes - remainder);
+}
+
+pub fn computeImageInodes(entry_count: u64) u64 {
+    const with_headroom = entry_count + (entry_count / 10) + rootfs_inode_headroom;
+    return @max(min_rootfs_inodes, with_headroom);
 }
 
 pub fn ensureParentDir(io: Io, path: []const u8) !void {
@@ -108,7 +129,10 @@ pub fn runMkfs(
     rootfs_dir: []const u8,
     output: []const u8,
     determinism: Determinism,
+    inode_count: u64,
 ) !void {
+    const inode_count_arg = try std.fmt.allocPrint(allocator, "{d}", .{inode_count});
+    defer allocator.free(inode_count_arg);
     const extended_options = try std.fmt.allocPrint(
         allocator,
         "lazy_itable_init=0,lazy_journal_init=0,hash_seed={s}",
@@ -120,6 +144,8 @@ pub fn runMkfs(
             mkfs,
             "-q",
             "-F",
+            "-N",
+            inode_count_arg,
             "-O",
             "^has_journal,^metadata_csum,^metadata_csum_seed,^orphan_file",
             "-U",
@@ -441,6 +467,22 @@ test "compute rootfs image size keeps minimum and alignment" {
     const size = computeImageSize(900 << 20);
     try std.testing.expectEqual(@as(u64, 0), size % rootfs_align_bytes);
     try std.testing.expect(size > 900 << 20);
+}
+
+test "compute rootfs inode count keeps minimum and headroom" {
+    try std.testing.expectEqual(@as(u64, min_rootfs_inodes), computeImageInodes(1));
+    try std.testing.expectEqual(@as(u64, 114_096), computeImageInodes(100_000));
+}
+
+test "directory entry count includes directories and files" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "a/b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "a/b/file", .data = "data" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "top", .data = "" });
+
+    try std.testing.expectEqual(@as(u64, 5), try dirEntryCount(io, tmp.dir));
 }
 
 test "deterministic ext4 identity derives stable UUIDs from digest" {
