@@ -78,6 +78,8 @@ Pack a spore into the first local distribution format with
 `zig-out/bin/spore pack /tmp/spore --out /tmp/spore.bundle`; unpack it back
 into a normal spore directory with
 `zig-out/bin/spore unpack /tmp/spore.bundle --out /tmp/spore.unpacked`.
+To exercise the first cross-host bundle path over SSM and S3, use
+`scripts/smoke-remote-bundle.sh --region REGION --source-instance ID --dest-instance ID --bucket BUCKET`.
 
 For a lower-bound boot/exec probe comparable to Cleanroom's minimal
 `darwin-vz` benchmark, use the minimal benchmark wrapper. It builds a tiny
