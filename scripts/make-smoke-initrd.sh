@@ -9,8 +9,9 @@ Build a tiny newc initrd containing a static /init that prints
 "sporevm-initrd-tick N" once per second. Intended for KVM/HVF smoke tests.
 
 Environment:
-  CC   C compiler to use (default: cc). Must produce an aarch64 static binary
-       when building an initrd for the current aarch64 guest profile.
+  CC   C compiler command to use (default: cc). May include simple arguments,
+       for example: CC="zig cc -target aarch64-linux-musl". Must produce an
+       aarch64 static binary for the current guest profile.
 EOF
 }
 
@@ -20,7 +21,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -ne 1 ]]; then
 fi
 
 out="$1"
-cc_bin="${CC:-cc}"
+read -r -a cc_cmd <<<"${CC:-cc}"
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-initrd.XXXXXX")"
 trap 'rm -rf "${workdir}"' EXIT
 
@@ -42,7 +43,7 @@ int main(void) {
 }
 EOF
 
-"${cc_bin}" -static -Os -s "${workdir}/init.c" -o "${workdir}/root/init"
+"${cc_cmd[@]}" -static -Os -s "${workdir}/init.c" -o "${workdir}/root/init"
 chmod 0755 "${workdir}/root/init"
 
 mkdir -p "$(dirname "${out}")"
