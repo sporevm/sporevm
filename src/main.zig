@@ -117,7 +117,7 @@ fn forkCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.
     });
 }
 
-fn packCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.spore.PackResult {
+fn packCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.PackResult {
     var spore_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
 
@@ -142,13 +142,13 @@ fn packCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.
         std.process.exit(2);
     }
 
-    return sporevm.spore.pack(allocator, .{
+    return sporevm.bundle.pack(allocator, .{
         .spore_dir = spore_dir.?,
         .out_dir = out_dir.?,
     });
 }
 
-fn unpackCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.spore.UnpackResult {
+fn unpackCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.UnpackResult {
     var bundle_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
 
@@ -173,7 +173,7 @@ fn unpackCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporev
         std.process.exit(2);
     }
 
-    return sporevm.spore.unpack(allocator, .{
+    return sporevm.bundle.unpack(allocator, .{
         .bundle_dir = bundle_dir.?,
         .out_dir = out_dir.?,
     });

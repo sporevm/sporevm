@@ -16,15 +16,11 @@ const chunklib = @import("chunk.zig");
 const generation = @import("generation.zig");
 const gicv3 = @import("gicv3.zig");
 const Blake3 = std.crypto.hash.Blake3;
-const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const format_version: u32 = 0;
 pub const chunk_size: usize = 2 * 1024 * 1024;
 pub const ram_backing_kind = "linux-map-private-file-v0";
 pub const ram_backing_path = "ram.backing";
-pub const bundle_index_version: u32 = 0;
-pub const bundle_index_path = "chunkpack.index.json";
-pub const bundle_pack_path = "chunkpacks/000000.pack";
 
 pub const Error = error{
     BadManifest,
@@ -157,15 +153,6 @@ fn pwriteFileAll(fd: std.c.fd_t, offset: usize, data: []const u8) Error!void {
     var done: usize = 0;
     while (done < data.len) {
         const n = std.c.pwrite(fd, data.ptr + done, data.len - done, @intCast(offset + done));
-        if (n <= 0) return error.IoFailed;
-        done += @intCast(n);
-    }
-}
-
-fn preadFileAll(fd: std.c.fd_t, offset: usize, target: []u8) Error!void {
-    var done: usize = 0;
-    while (done < target.len) {
-        const n = std.c.pread(fd, target.ptr + done, target.len - done, @intCast(offset + done));
         if (n <= 0) return error.IoFailed;
         done += @intCast(n);
     }
@@ -411,233 +398,6 @@ pub const ForkResult = struct {
     first_child: []const u8,
     last_child: []const u8,
 };
-
-pub const PackOptions = struct {
-    spore_dir: []const u8,
-    out_dir: []const u8,
-};
-
-pub const PackResult = struct {
-    source: []const u8,
-    out_dir: []const u8,
-    chunk_count: usize,
-    packed_chunk_count: usize,
-    pack_count: usize,
-    payload_bytes: u64,
-};
-
-pub const UnpackOptions = struct {
-    bundle_dir: []const u8,
-    out_dir: []const u8,
-};
-
-pub const UnpackResult = struct {
-    bundle: []const u8,
-    out_dir: []const u8,
-    chunk_count: usize,
-    unpacked_chunk_count: usize,
-    payload_bytes: u64,
-};
-
-pub const BundleChunk = struct {
-    id: []const u8,
-    pack: []const u8,
-    offset: u64,
-    size: u64,
-    sha256: []const u8,
-};
-
-pub const BundleIndex = struct {
-    version: u32 = bundle_index_version,
-    chunk_size: u64 = chunk_size,
-    chunks: []BundleChunk,
-};
-
-pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult {
-    const parsed = try loadManifest(allocator, options.spore_dir);
-    defer parsed.deinit();
-    var manifest = parsed.value;
-    manifest.memory.backing = null;
-    const plan = try validateMemoryForRam(manifest.memory, @intCast(manifest.platform.ram_size));
-
-    try ensureNewDir(try pathZ(allocator, "{s}", .{options.out_dir}));
-    try ensureNewDir(try pathZ(allocator, "{s}/chunkpacks", .{options.out_dir}));
-
-    const pack_path = try pathZ(allocator, "{s}/{s}", .{ options.out_dir, bundle_pack_path });
-    const pack_fd = std.c.open(pack_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
-    if (pack_fd < 0) return error.IoFailed;
-    defer _ = std.c.close(pack_fd);
-
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-    const entries = allocator.alloc(BundleChunk, plan.nonzero_chunk_count) catch return error.OutOfMemory;
-    var entry_count: usize = 0;
-    var payload_bytes: u64 = 0;
-
-    var i: usize = 0;
-    while (i < plan.chunk_count) : (i += 1) {
-        const ref = manifest.memory.chunks[i] orelse continue;
-        if (seen.contains(ref)) continue;
-        seen.put(ref, {}) catch return error.OutOfMemory;
-
-        const range = memoryChunkRangeFromPlan(plan, @intCast(manifest.platform.ram_size), i) catch return error.BadManifest;
-        const expected_size = range.end - range.start;
-        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ options.spore_dir, ref });
-        const data = try readFileAll(allocator, chunk_path, expected_size);
-        defer allocator.free(data);
-        if (data.len != expected_size) return error.BadChunk;
-        const id = chunklib.ChunkId.fromHex(ref) catch return error.BadManifest;
-        if (!id.matches(data)) return error.BadChunk;
-        if (payload_bytes > std.math.maxInt(usize)) return error.BadChunk;
-        try pwriteFileAll(pack_fd, @intCast(payload_bytes), data);
-        entries[entry_count] = .{
-            .id = ref,
-            .pack = bundle_pack_path,
-            .offset = payload_bytes,
-            .size = @intCast(data.len),
-            .sha256 = try sha256HexAlloc(allocator, data),
-        };
-        entry_count += 1;
-        payload_bytes += @intCast(data.len);
-    }
-
-    try saveManifest(allocator, options.out_dir, manifest);
-    try saveBundleIndex(allocator, options.out_dir, .{
-        .chunk_size = chunk_size,
-        .chunks = entries[0..entry_count],
-    });
-
-    return .{
-        .source = options.spore_dir,
-        .out_dir = options.out_dir,
-        .chunk_count = plan.chunk_count,
-        .packed_chunk_count = entry_count,
-        .pack_count = 1,
-        .payload_bytes = payload_bytes,
-    };
-}
-
-pub fn unpack(allocator: std.mem.Allocator, options: UnpackOptions) Error!UnpackResult {
-    const parsed_manifest = try loadManifest(allocator, options.bundle_dir);
-    defer parsed_manifest.deinit();
-    var manifest = parsed_manifest.value;
-    manifest.memory.backing = null;
-    const plan = try validateMemoryForRam(manifest.memory, @intCast(manifest.platform.ram_size));
-
-    const parsed_index = try loadBundleIndex(allocator, options.bundle_dir);
-    defer parsed_index.deinit();
-    try validateBundleIndex(parsed_index.value);
-
-    var by_id = std.StringHashMap(BundleChunk).init(allocator);
-    defer by_id.deinit();
-    for (parsed_index.value.chunks) |entry| {
-        try validateBundleChunk(entry);
-        by_id.put(entry.id, entry) catch return error.OutOfMemory;
-    }
-
-    try ensureNewDir(try pathZ(allocator, "{s}", .{options.out_dir}));
-    try ensureNewDir(try pathZ(allocator, "{s}/chunks", .{options.out_dir}));
-
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-    var unpacked_chunk_count: usize = 0;
-    var payload_bytes: u64 = 0;
-
-    var i: usize = 0;
-    while (i < plan.chunk_count) : (i += 1) {
-        const ref = manifest.memory.chunks[i] orelse continue;
-        if (seen.contains(ref)) continue;
-        seen.put(ref, {}) catch return error.OutOfMemory;
-        const entry = by_id.get(ref) orelse return error.BadManifest;
-        const range = memoryChunkRangeFromPlan(plan, @intCast(manifest.platform.ram_size), i) catch return error.BadManifest;
-        const expected_size = range.end - range.start;
-        if (entry.size != @as(u64, @intCast(expected_size))) return error.BadManifest;
-        const pack_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, entry.pack });
-        const data = try readFileRange(allocator, pack_path, entry.offset, entry.size);
-        defer allocator.free(data);
-        if (!sha256HexMatches(entry.sha256, data)) return error.BadChunk;
-        const id = chunklib.ChunkId.fromHex(ref) catch return error.BadManifest;
-        if (!id.matches(data)) return error.BadChunk;
-        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ options.out_dir, ref });
-        try writeFileAll(chunk_path, data);
-        unpacked_chunk_count += 1;
-        payload_bytes += @intCast(data.len);
-    }
-
-    try saveManifest(allocator, options.out_dir, manifest);
-
-    return .{
-        .bundle = options.bundle_dir,
-        .out_dir = options.out_dir,
-        .chunk_count = plan.chunk_count,
-        .unpacked_chunk_count = unpacked_chunk_count,
-        .payload_bytes = payload_bytes,
-    };
-}
-
-fn saveBundleIndex(allocator: std.mem.Allocator, dir: []const u8, index: BundleIndex) Error!void {
-    const json = std.json.Stringify.valueAlloc(allocator, index, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
-    defer allocator.free(json);
-    const path = try pathZ(allocator, "{s}/{s}", .{ dir, bundle_index_path });
-    try writeFileAll(path, json);
-}
-
-fn loadBundleIndex(allocator: std.mem.Allocator, dir: []const u8) Error!std.json.Parsed(BundleIndex) {
-    const path = try pathZ(allocator, "{s}/{s}", .{ dir, bundle_index_path });
-    const bytes = try readFileAll(allocator, path, 64 * 1024 * 1024);
-    defer allocator.free(bytes);
-    const parsed = std.json.parseFromSlice(BundleIndex, allocator, bytes, .{
-        .allocate = .alloc_always,
-    }) catch return error.BadManifest;
-    errdefer parsed.deinit();
-    try validateBundleIndex(parsed.value);
-    return parsed;
-}
-
-fn validateBundleIndex(index: BundleIndex) Error!void {
-    if (index.version != bundle_index_version) return error.BadManifest;
-    if (index.chunk_size != chunk_size) return error.BadManifest;
-    for (index.chunks) |entry| try validateBundleChunk(entry);
-}
-
-fn validateBundleChunk(entry: BundleChunk) Error!void {
-    _ = chunklib.ChunkId.fromHex(entry.id) catch return error.BadManifest;
-    if (!std.mem.eql(u8, entry.pack, bundle_pack_path)) return error.BadManifest;
-    if (entry.size == 0 or entry.size > chunk_size) return error.BadManifest;
-    if (entry.sha256.len != Sha256.digest_length * 2) return error.BadManifest;
-    var digest: [Sha256.digest_length]u8 = undefined;
-    _ = std.fmt.hexToBytes(&digest, entry.sha256) catch return error.BadManifest;
-}
-
-fn readFileRange(allocator: std.mem.Allocator, path: [:0]const u8, offset: u64, size: u64) Error![]u8 {
-    if (offset > std.math.maxInt(usize) or size > std.math.maxInt(usize)) return error.BadChunk;
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
-    if (fd < 0) return error.IoFailed;
-    defer _ = std.c.close(fd);
-    const file_size = try seekFileSize(fd);
-    const start: usize = @intCast(offset);
-    const len: usize = @intCast(size);
-    if (start > file_size or len > file_size - start) return error.BadChunk;
-    const out = allocator.alloc(u8, len) catch return error.OutOfMemory;
-    errdefer allocator.free(out);
-    try preadFileAll(fd, start, out);
-    return out;
-}
-
-fn sha256HexAlloc(allocator: std.mem.Allocator, data: []const u8) Error![]const u8 {
-    var digest: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(data, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    return allocator.dupe(u8, &hex) catch return error.OutOfMemory;
-}
-
-fn sha256HexMatches(hex: []const u8, data: []const u8) bool {
-    var expected: [Sha256.digest_length]u8 = undefined;
-    _ = std.fmt.hexToBytes(&expected, hex) catch return false;
-    var actual: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(data, &actual, .{});
-    return std.mem.eql(u8, &expected, &actual);
-}
 
 pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult {
     if (options.count == 0) return error.BadForkCount;
@@ -1106,23 +866,6 @@ test "fuzz memory manifest handling" {
     try std.testing.fuzz({}, fuzzMemoryManifest, .{});
 }
 
-fn fuzzBundleIndexParse(_: void, s: *std.testing.Smith) !void {
-    // Bundle indexes are distribution metadata from disk/peers/registries. They
-    // must either fail to parse or validate to canonical, path-safe chunkpack
-    // entries.
-    var buf: [4096]u8 = undefined;
-    const len = s.slice(&buf);
-    const parsed = std.json.parseFromSlice(BundleIndex, std.testing.allocator, buf[0..len], .{
-        .allocate = .alloc_always,
-    }) catch return;
-    defer parsed.deinit();
-    validateBundleIndex(parsed.value) catch return;
-}
-
-test "fuzz bundle index parsing" {
-    try std.testing.fuzz({}, fuzzBundleIndexParse, .{});
-}
-
 test "manifest json round-trip" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1239,85 +982,6 @@ fn testForkManifest(memory: MemoryManifest, ram_size: u64, initial_generation: u
         .generation = .{ .generation = initial_generation, .interrupt_status = 0, .params_b64 = "" },
         .memory = memory,
     };
-}
-
-test "pack and unpack chunkpack bundle strips local backing" {
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const root_dir = try testDir(arena);
-    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
-    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
-    const out_dir = try pathZ(arena, "{s}/unpacked", .{root_dir});
-
-    const ram = try arena.alloc(u8, 2 * chunk_size + 17);
-    @memset(ram, 0);
-    ram[9] = 0xA1;
-    ram[2 * chunk_size + 3] = 0xB2;
-    const memory = try saveMemoryWithBacking(arena, parent_dir, ram);
-    try saveManifest(arena, parent_dir, testForkManifest(memory, ram.len, 7));
-
-    const pack_result = try pack(arena, .{ .spore_dir = parent_dir, .out_dir = bundle_dir });
-    try std.testing.expectEqual(@as(usize, 3), pack_result.chunk_count);
-    try std.testing.expectEqual(@as(usize, 2), pack_result.packed_chunk_count);
-    try std.testing.expectEqual(@as(usize, 1), pack_result.pack_count);
-    try std.testing.expectEqual(@as(u64, chunk_size + 17), pack_result.payload_bytes);
-
-    const bundle_manifest = try loadManifest(arena, bundle_dir);
-    defer bundle_manifest.deinit();
-    try std.testing.expect(bundle_manifest.value.memory.backing == null);
-    const backing_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, ram_backing_path });
-    try std.testing.expect(std.c.access(backing_path, 0) != 0);
-
-    const index = try loadBundleIndex(arena, bundle_dir);
-    defer index.deinit();
-    try std.testing.expectEqual(@as(u32, bundle_index_version), index.value.version);
-    try std.testing.expectEqual(@as(usize, 2), index.value.chunks.len);
-    try std.testing.expectEqualStrings(bundle_pack_path, index.value.chunks[0].pack);
-    try std.testing.expectEqual(@as(u64, 0), index.value.chunks[0].offset);
-    try std.testing.expectEqual(@as(u64, chunk_size), index.value.chunks[0].size);
-    try std.testing.expectEqual(@as(u64, chunk_size), index.value.chunks[1].offset);
-    try std.testing.expectEqual(@as(u64, 17), index.value.chunks[1].size);
-
-    const unpacked = try unpack(arena, .{ .bundle_dir = bundle_dir, .out_dir = out_dir });
-    try std.testing.expectEqual(@as(usize, 3), unpacked.chunk_count);
-    try std.testing.expectEqual(@as(usize, 2), unpacked.unpacked_chunk_count);
-    try std.testing.expectEqual(@as(u64, chunk_size + 17), unpacked.payload_bytes);
-
-    const restored_manifest = try loadManifest(arena, out_dir);
-    defer restored_manifest.deinit();
-    try std.testing.expect(restored_manifest.value.memory.backing == null);
-    const out = try arena.alloc(u8, ram.len);
-    @memset(out, 0xCC);
-    try loadMemory(arena, out_dir, restored_manifest.value.memory, out);
-    try std.testing.expectEqualSlices(u8, ram, out);
-}
-
-test "unpack rejects corrupted chunkpack payload" {
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const root_dir = try testDir(arena);
-    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
-    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
-    const out_dir = try pathZ(arena, "{s}/unpacked", .{root_dir});
-
-    const ram = try arena.alloc(u8, chunk_size);
-    @memset(ram, 0x5D);
-    const memory = try saveMemory(arena, parent_dir, ram);
-    try saveManifest(arena, parent_dir, testForkManifest(memory, ram.len, 3));
-    _ = try pack(arena, .{ .spore_dir = parent_dir, .out_dir = bundle_dir });
-
-    const pack_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, bundle_pack_path });
-    const data = try readFileAll(arena, pack_path, chunk_size);
-    data[100] ^= 0xFF;
-    try writeFileAll(pack_path, data);
-
-    try std.testing.expectError(error.BadChunk, unpack(arena, .{ .bundle_dir = bundle_dir, .out_dir = out_dir }));
 }
 
 test "fork mints child manifests with shared chunks and pending generation" {

@@ -173,7 +173,7 @@ if [[ "${ram_backing_mode}" == "fdpass" && "${backend}" != "kvm" ]]; then
 fi
 
 if [[ -z "${kernel}" ]]; then
-  kernel="$(${repo_root}/scripts/ensure-managed-kernel.sh sporevm)"
+  kernel="$("${repo_root}/scripts/ensure-managed-kernel.sh" sporevm)"
   echo "using managed kernel: ${kernel}" >&2
 fi
 [[ -f "${kernel}" ]] || die "kernel not found: ${kernel}"

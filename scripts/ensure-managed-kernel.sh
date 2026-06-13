@@ -73,8 +73,7 @@ download_asset() {
   local repo="$1"
   local release="$2"
   local asset="$3"
-  local dest_dir="$4"
-  local tmp_dir="$5"
+  local tmp_dir="$4"
 
   if command -v gh >/dev/null 2>&1; then
     if GH_PROMPT_DISABLED=1 gh release download "${release}" \
@@ -145,7 +144,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "downloading managed kernel ${repo}@${release}:${asset}" >&2
-download_asset "${repo}" "${release}" "${asset}" "${dest_dir}" "${tmp_dir}" || die "failed to download ${asset} from ${repo}@${release}"
+download_asset "${repo}" "${release}" "${asset}" "${tmp_dir}" || die "failed to download ${asset} from ${repo}@${release}"
 verify_kernel "${tmp_dir}/${asset}" "${tmp_dir}/${asset}.sha256" || die "sha256 verification failed for ${asset}"
 
 mv "${tmp_dir}/${asset}" "${dest}"

@@ -159,7 +159,7 @@ case "${backend}" in
 esac
 
 if [[ -z "${kernel}" ]]; then
-  kernel="$(${repo_root}/scripts/ensure-managed-kernel.sh initrd)"
+  kernel="$("${repo_root}/scripts/ensure-managed-kernel.sh" initrd)"
   echo "using managed kernel: ${kernel}" >&2
 fi
 [[ -f "${kernel}" ]] || die "kernel not found: ${kernel}"
