@@ -2,9 +2,10 @@
 //!
 //! Bring-up tool, not the product CLI. Usage:
 //!   zig build kvm-boot
-//!   ./zig-out/bin/kvm-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--trust-ram-backing]
+//!   ./zig-out/bin/kvm-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--trust-ram-backing] [--fdpass-ram-backing]
 
 const std = @import("std");
+const linux = std.os.linux;
 const sporevm = @import("sporevm");
 
 fn consoleSink(bytes: []const u8) void {
@@ -21,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
-        std.debug.print("usage: kvm-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--trust-ram-backing]\n", .{});
+        std.debug.print("usage: kvm-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--trust-ram-backing] [--fdpass-ram-backing]\n", .{});
         std.process.exit(2);
     }
 
@@ -33,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
     var spore_dir: ?[]const u8 = null;
     var resume_dir: ?[]const u8 = null;
     var trust_ram_backing = false;
+    var fdpass_ram_backing = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--cmdline") and i + 1 < args.len) {
@@ -58,6 +60,8 @@ pub fn main(init: std.process.Init) !void {
             resume_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "--trust-ram-backing")) {
             trust_ram_backing = true;
+        } else if (std.mem.eql(u8, args[i], "--fdpass-ram-backing")) {
+            fdpass_ram_backing = true;
         } else {
             std.debug.print("unknown argument: {s}\n", .{args[i]});
             std.process.exit(2);
@@ -71,6 +75,14 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("--resume cannot be combined with --snapshot-after-ms\n", .{});
         std.process.exit(2);
     }
+    if (fdpass_ram_backing and !trust_ram_backing) {
+        std.debug.print("--fdpass-ram-backing requires --trust-ram-backing\n", .{});
+        std.process.exit(2);
+    }
+    if (fdpass_ram_backing and resume_dir == null) {
+        std.debug.print("--fdpass-ram-backing requires --resume\n", .{});
+        std.process.exit(2);
+    }
 
     var ram_backing_fd: ?std.c.fd_t = null;
     defer {
@@ -78,6 +90,16 @@ pub fn main(init: std.process.Init) !void {
     }
     if (trust_ram_backing) {
         ram_backing_fd = try openTrustedRamBacking(arena, resume_dir);
+    }
+    if (fdpass_ram_backing) {
+        if (ram_backing_fd == null) {
+            std.debug.print("--fdpass-ram-backing requires an available trusted RAM backing\n", .{});
+            std.process.exit(1);
+        }
+        const original_fd = ram_backing_fd.?;
+        ram_backing_fd = null;
+        ram_backing_fd = try receiveRamBackingViaFdpass(original_fd);
+        std.debug.print("sporevm kvm-boot: received RAM backing fd via SCM_RIGHTS harness path\n", .{});
     }
 
     const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], arena, .limited(256 * 1024 * 1024));
@@ -129,4 +151,60 @@ fn openTrustedRamBacking(allocator: std.mem.Allocator, resume_dir: ?[]const u8) 
         return null;
     }
     return fd;
+}
+
+fn receiveRamBackingViaFdpass(original_fd: std.c.fd_t) !std.c.fd_t {
+    var sockets: [2]std.c.fd_t = undefined;
+    try linuxCall(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets));
+
+    const fork_rc = linux.fork();
+    switch (linux.errno(fork_rc)) {
+        .SUCCESS => {},
+        else => {
+            _ = std.c.close(sockets[0]);
+            _ = std.c.close(sockets[1]);
+            return error.IoFailed;
+        },
+    }
+
+    if (fork_rc == 0) {
+        _ = std.c.close(sockets[0]);
+        sporevm.fdpass.sendFd(sockets[1], original_fd) catch std.process.exit(1);
+        _ = std.c.close(sockets[1]);
+        std.process.exit(0);
+    }
+
+    const helper_pid: linux.pid_t = @intCast(fork_rc);
+    _ = std.c.close(sockets[1]);
+    _ = std.c.close(original_fd);
+
+    const received = sporevm.fdpass.recvFd(sockets[0]) catch |err| {
+        _ = std.c.close(sockets[0]);
+        _ = waitForHelper(helper_pid) catch {};
+        return err;
+    };
+    _ = std.c.close(sockets[0]);
+    errdefer _ = std.c.close(received);
+    try waitForHelper(helper_pid);
+    return received;
+}
+
+fn waitForHelper(pid: linux.pid_t) !void {
+    var status: u32 = 0;
+    while (true) {
+        const rc = linux.waitpid(pid, &status, 0);
+        switch (linux.errno(rc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.IoFailed,
+        }
+    }
+    if (!linux.W.IFEXITED(status) or linux.W.EXITSTATUS(status) != 0) return error.IoFailed;
+}
+
+fn linuxCall(rc: usize) !void {
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.IoFailed,
+    }
 }

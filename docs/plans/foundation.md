@@ -328,9 +328,13 @@ host_pss_kib=778524, host_rss_kib=1699988, child_resume_min_ms=138, and
 child_resume_max_ms=196. That is roughly 760MiB aggregate child PSS for 50GiB
 of declared child RAM, with the 512MiB `ram.backing` stored as a sparse 28MiB
 file for that smoke workload. The Linux `SCM_RIGHTS` fd-passing primitive has
-landed with a round-trip test, giving the future monitor a tested mechanism to
-transfer RAM backing fds without manifest path trust. Remaining Slice 5 work is
-wiring that primitive into the monitor shape and cold lazy restore over CAS.
+landed with a round-trip test, and `kvm-boot --fdpass-ram-backing` now exercises
+that monitor-shaped handoff while keeping the original `kvm-boot` PID as the VM
+process for smoke sampling and cleanup. A 100-child fdpass-mode KVM run reported
+file_backed_children=100, host_memory_sampled_children=100, host_pss_kib=782723,
+child_resume_min_ms=137, and child_resume_max_ms=195. This is still a harness
+bridge, not the long-running product monitor/control socket. Remaining Slice 5
+work is monitor wiring and cold lazy restore over CAS.
 
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
@@ -412,15 +416,15 @@ do not mistake eager restore host capacity for fork architecture.
 First land the identical-host hot fork path in incremental steps. The interim
 KVM step uses a local `ram.backing` file and trusted same-host opt-in to open a
 backing fd, then the KVM backend maps that fd privately CoW without resolving
-manifest paths. The next step is the robust monitor wiring: replace the harness
-path opener with a sealed `memfd`/file-backed mapping passed to child monitors
-with the tested `SCM_RIGHTS` helper; on HVF use the closest private
-remap/file-backed path or fail closed until supported. Then layer cold lazy
-restore over CAS: restore maps memory empty and materializes pages on fault with
-userfaultfd on Linux and unmapped-memory exits on HVF. Record an access trace on
-first resume; use it for readahead on later resumes. Benchmark resume
-time-to-first-instruction and time-to-useful-work against slice 3's eager
-restore.
+manifest paths. The fdpass harness mode proves the same `SCM_RIGHTS` handoff
+shape the monitor will use, but the robust monitor wiring still has to replace
+the harness path opener with a sealed `memfd`/file-backed mapping owned by the
+monitor; on HVF use the closest private remap/file-backed path or fail closed
+until supported. Then layer cold lazy restore over CAS: restore maps memory empty
+and materializes pages on fault with userfaultfd on Linux and unmapped-memory
+exits on HVF. Record an access trace on first resume; use it for readahead on
+later resumes. Benchmark resume time-to-first-instruction and time-to-useful-work
+against slice 3's eager restore.
 
 Done when: 100 concurrent same-host forks of one 512MiB spore run distinct
 workloads with aggregate child PSS proportional to the resident parent backing

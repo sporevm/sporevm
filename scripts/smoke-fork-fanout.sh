@@ -25,6 +25,8 @@ Options:
   --memory-sample-seconds N keep matched KVM children alive and sample host
                             /proc smaps_rollup after N seconds (default: 0)
   --max-host-pss-mib N      fail if sampled child PSS exceeds this MiB total
+  --ram-backing-mode MODE   KVM child RAM backing handoff: path or fdpass
+                            (default: path)
   --cmdline TEXT            override fresh-boot kernel command line
   --boot-bin PATH           use an already-built boot harness
   --spore-bin PATH          use an already-built spore CLI
@@ -61,6 +63,7 @@ snapshot_after_ms="3000"
 resume_seconds="6"
 memory_sample_seconds="0"
 max_host_pss_mib=""
+ram_backing_mode="path"
 cmdline=""
 boot_bin=""
 spore_bin=""
@@ -123,6 +126,11 @@ while (($#)); do
       max_host_pss_mib="${2:-}"
       shift 2
       ;;
+    --ram-backing-mode)
+      need_option_value "$1" "${2-}"
+      ram_backing_mode="${2:-}"
+      shift 2
+      ;;
     --cmdline)
       need_option_value "$1" "${2-}"
       cmdline="${2:-}"
@@ -156,6 +164,13 @@ case "${backend}" in
   kvm|hvf) ;;
   *) die "--backend must be kvm or hvf" ;;
 esac
+case "${ram_backing_mode}" in
+  path|fdpass) ;;
+  *) die "--ram-backing-mode must be path or fdpass" ;;
+esac
+if [[ "${ram_backing_mode}" == "fdpass" && "${backend}" != "kvm" ]]; then
+  die "--ram-backing-mode fdpass currently requires --backend kvm"
+fi
 
 [[ -n "${kernel}" ]] || die "--kernel is required"
 [[ -f "${kernel}" ]] || die "kernel not found: ${kernel}"
@@ -370,6 +385,7 @@ write_metrics() {
     echo "  \"count\": ${count},"
     echo "  \"parallel\": ${parallel},"
     echo "  \"mem_mib\": ${mem_mib},"
+    echo "  \"ram_backing_mode\": $(json_string "${ram_backing_mode}"),"
     echo "  \"snapshot_after_ms\": ${snapshot_after_ms},"
     echo "  \"resume_deadline_seconds\": ${resume_seconds},"
     echo "  \"workdir\": $(json_string "${workdir}"),"
@@ -459,6 +475,9 @@ run_child_resume() {
   local cmd=("${boot_bin}" "${kernel}" --mem-mib "${mem_mib}" --resume "${child_dir}")
   if [[ "${backend}" == "kvm" ]]; then
     cmd+=(--trust-ram-backing)
+    if [[ "${ram_backing_mode}" == "fdpass" ]]; then
+      cmd+=(--fdpass-ram-backing)
+    fi
   fi
 
   set +e
@@ -594,6 +613,9 @@ for ((i = 0; i < count; i++)); do
   assert_log_contains "resume_time_unix_ns=[1-9][0-9]*" "${log}"
   assert_log_contains "entropy_seed=[0-9a-f]{32}" "${log}"
   assert_log_contains "irq_status_after_ack=0" "${log}"
+  if [[ "${ram_backing_mode}" == "fdpass" ]]; then
+    assert_log_contains "received RAM backing fd via SCM_RIGHTS harness path" "${log}"
+  fi
 
   vm_ids+=("$(field_value vm_id "${log}")")
   hostnames+=("$(field_value hostname "${log}")")
