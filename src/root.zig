@@ -15,6 +15,7 @@ pub const gicv3 = @import("gicv3.zig");
 pub const spore = @import("spore.zig");
 pub const fdt = @import("fdt.zig");
 pub const guestmem = @import("guestmem.zig");
+pub const platform = @import("platform.zig");
 pub const hvf = @import("hvf/hvf.zig");
 pub const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
@@ -38,6 +39,7 @@ test {
     testing.refAllDecls(@This());
     testing.refAllDecls(generation);
     testing.refAllDecls(gicv3);
+    testing.refAllDecls(platform);
     testing.refAllDecls(virtio.queue);
     testing.refAllDecls(virtio.mmio);
     testing.refAllDecls(virtio.console);

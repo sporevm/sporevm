@@ -215,10 +215,11 @@ That is a deliberate tradeoff and it is bought back structurally, not by hope:
 
 Slice 0 scaffolding has landed: Zig 0.16.0 pinned via mise, `zig build test`
 green (chunk-id module with BLAKE3 CAS identities and verification tests),
-`spore` CLI stub with `version`/`help`, founding docs (`README.md`,
-`SECURITY.md`, `AGENTS.md`, MIT `LICENSE`, `docs/spore-format.md`),
-Buildkite pipeline targeting the `cleanroom` and `cleanroom-mac` queues, and
-the QEMU cross-accelerator experiment designed in `docs/research.md`.
+`spore` CLI basics (`version`, `host-info`, `inspect`, `help`), founding docs
+(`README.md`, `SECURITY.md`, `AGENTS.md`, MIT `LICENSE`,
+`docs/spore-format.md`), Buildkite pipeline targeting the `cleanroom` and
+`cleanroom-mac` queues, and the QEMU cross-accelerator experiment designed in
+`docs/research.md`.
 
 The planned QEMU KVM↔HVF proxy experiment has not run because direct SporeVM
 HVF suspend/restore work landed first. `docs/research.md` records that result
@@ -294,7 +295,12 @@ virtual-counter frequency portability, because a guest booted against KVM's
 counter frequency runs slowly after restore on Apple HVF's 24MHz counter. The
 manifest now records `platform.counter_frequency_hz` and restore fails closed
 across a counter-frequency mismatch until cross-frequency timer virtualization
-has a real design. The four-way cross-hypervisor matrix (slice 4) remains next.
+has a real design. Platform compatibility checks are now shared across the
+backends, and `spore host-info` / `spore inspect` expose the host and spore
+contract fields needed to pick compatible smoke hosts (`host-info` reports the
+process-visible `CNTFRQ_EL0`; HVF's guest timer frequency remains validated by
+the HVF boot harness). The four-way
+cross-hypervisor matrix (slice 4) remains next.
 
 ## Delivery Strategy
 

@@ -19,6 +19,7 @@ const blk = @import("../virtio/blk.zig");
 const net = @import("../virtio/net.zig");
 const rng = @import("../virtio/rng.zig");
 const vsock = @import("../virtio/vsock.zig");
+const platform_contract = @import("../platform.zig");
 const spore = @import("../spore.zig");
 const snapshot = @import("snapshot.zig");
 
@@ -149,24 +150,13 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         // Restore: memory, device, GIC, and vCPU state from the spore.
         const m = resume_parsed.?.value;
         const host_counter_frequency_hz = snapshot.hostCounterFreq();
-        if (m.version != spore.format_version or
-            !std.mem.eql(u8, m.platform.cpu_profile, board.cpu_profile) or
-            m.platform.device_model_version != board.device_model_version or
-            m.platform.ram_base != board.ram_base or
-            m.platform.ram_size != config.ram_size or
-            m.platform.gic_dist_base != dist_base or
-            m.platform.gic_redist_base != vcpu_redist_base or
-            m.devices.len != transports.len)
-        {
-            return error.PlatformMismatch;
-        }
-        if (m.platform.counter_frequency_hz != host_counter_frequency_hz) {
-            std.log.err(
-                "counter frequency mismatch: spore={d}Hz host={d}Hz; cross-frequency architected timer restore unsupported",
-                .{ m.platform.counter_frequency_hz, host_counter_frequency_hz },
-            );
-            return error.PlatformMismatch;
-        }
+        try platform_contract.checkManifest(m, .{
+            .ram_size = config.ram_size,
+            .gic_dist_base = dist_base,
+            .gic_redist_base = vcpu_redist_base,
+            .counter_frequency_hz = host_counter_frequency_hz,
+            .device_count = transports.len,
+        });
         try spore.loadMemory(allocator, spore_dir, m.memory, ram_bytes);
         try applyTransports(transports, m.devices);
         try gen_dev.restore(allocator, m.generation);

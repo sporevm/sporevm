@@ -31,7 +31,9 @@ Early development, pre-release. The plan of record is
 pinned aarch64 Linux kernel on Hypervisor.framework to an interactive shell and
 on KVM/aarch64 to an Alpine shell prompt, with the shared virtio-mmio console,
 block, net, vsock, rng, and generation devices. The HVF and KVM paths can also
-write/resume a v0 spore on the same host.
+write/resume a v0 spore on the same host. The CLI can report current host
+platform facts with `spore host-info` and summarise a spore manifest with
+`spore inspect <spore-dir>`.
 
 The cross-hypervisor restore matrix is still pending.
 
