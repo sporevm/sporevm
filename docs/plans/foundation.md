@@ -310,6 +310,20 @@ child_resume_max_ms=813, and total_smoke_ms=12695. A true 100-concurrent
 backing lands; otherwise the test mostly proves the host has enough RAM for
 eager restores.
 
+Slice 5 is now in progress with the first KVM same-host RAM backing step. KVM
+snapshots write an optional local `ram.backing` file next to the canonical chunk
+store; `spore fork` propagates that backing to children only when the local file
+is still available, otherwise it drops the optional metadata and leaves children
+restorable from chunks. The KVM boot harness requires an explicit trusted
+same-host opt-in before mapping `ram.backing` `MAP_PRIVATE`, so imported or
+untrusted spores still materialize through verified chunks. This is an interim
+path/symlink implementation that proves the CoW resume path; the sealed-fd /
+`SCM_RIGHTS` monitor shape remains the robust target before we claim the final
+trust boundary or 100-child RSS gate. The representative KVM run on the
+`m7g.metal` host used `--count 32 --parallel 4`, reported
+file_backed_children=32, child_resume_min_ms=337, child_resume_max_ms=338, and
+stored the 512MiB `ram.backing` as a sparse 28MiB file for that smoke workload.
+
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
 spores now fail closed on the expected counter-frequency mismatch
@@ -387,16 +401,16 @@ do not mistake eager restore host capacity for fork architecture.
 
 ### Slice 5: Elastic same-host RAM and lazy restore
 
-First land the identical-host hot fork path: parent RAM is file-backed and
-sealed while children map it privately CoW, so N children cost parent RAM plus
-dirty child pages rather than N × declared guest RAM. On Linux this is a
+First land the identical-host hot fork path in two steps. The interim KVM step
+uses a local `ram.backing` file and trusted same-host opt-in to map child RAM
+privately CoW. The robust monitor step replaces path trust with a sealed
 `memfd`/file-backed mapping passed to child monitors with `SCM_RIGHTS`; on HVF
 use the closest private remap/file-backed path or fail closed until supported.
-Then layer cold lazy restore over CAS: restore maps memory empty and
-materializes pages on fault with userfaultfd on Linux and unmapped-memory exits
-on HVF. Record an access trace on first resume; use it for readahead on later
-resumes. Benchmark resume time-to-first-instruction and time-to-useful-work
-against slice 3's eager restore.
+Then layer cold lazy restore over CAS: restore maps memory empty and materializes
+pages on fault with userfaultfd on Linux and unmapped-memory exits on HVF. Record
+an access trace on first resume; use it for readahead on later resumes.
+Benchmark resume time-to-first-instruction and time-to-useful-work against slice
+3's eager restore.
 
 Done when: 100 concurrent same-host forks of one 512MiB spore run distinct
 workloads with host RSS proportional to the parent's RAM plus dirty child

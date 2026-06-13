@@ -17,7 +17,8 @@ A spore is a directory:
 ```text
 <spore>/
 ├── manifest.json
-└── chunks/<blake3-hex>     # content-addressed data chunks
+├── chunks/<blake3-hex>     # content-addressed data chunks
+└── ram.backing             # optional local same-host RAM acceleration file
 ```
 
 ## Manifest v0
@@ -62,7 +63,14 @@ A spore is a directory:
   params page at actual resume time with volatile `resume_time_unix_ns` and
   `resume_entropy_seed` values before reasserting the generation interrupt.
 - `memory`: `chunk_size` plus one entry per chunk — a blake3-hex chunk
-  reference, or null for an all-zero chunk.
+  reference, or null for an all-zero chunk. `backing` is optional local
+  acceleration metadata for trusted same-host KVM fork/fan-out: `kind:
+  "linux-map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks
+  remain the portable verified source of truth; unsupported backends,
+  imported/cold spores, and normal untrusted restore must ignore `backing` and
+  materialize from chunks instead. KVM same-host restore may opt into mapping
+  the file `MAP_PRIVATE` to share clean parent pages across fork children while
+  child writes fault into private CoW pages.
 
 ## Not yet captured in v0
 
@@ -85,6 +93,11 @@ A spore is a directory:
 
 - Chunk ids are BLAKE3-256 of chunk contents (`src/chunk.zig`); every chunk
   is verified against its id before use, from any source.
+- Local RAM backing files are same-host acceleration hints, not portable trust
+  roots. The current path/symlink form is an interim KVM implementation, not a
+  sealed-fd security boundary. Consumers that need portable or untrusted restore
+  must use the chunk manifest path, or a later sealed-fd path, rather than
+  trusting a backing file by pathname.
 - Machine state is normalized architectural aarch64 state. Raw KVM structures
   never appear in the format; the only documented temporary exception is the
   explicitly tagged HVF `backend_private` GIC blob, which other backends must

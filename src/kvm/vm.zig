@@ -31,6 +31,10 @@ pub const Config = struct {
     disk_fd: ?std.c.fd_t = null,
     /// Resume from a spore directory instead of booting the kernel.
     resume_dir: ?[]const u8 = null,
+    /// Trust local same-host RAM backing metadata and map it MAP_PRIVATE.
+    /// Imported or otherwise untrusted spores must leave this false so RAM is
+    /// materialized through verified chunks.
+    trust_ram_backing: bool = false,
     /// Take a spore snapshot after this many milliseconds of run time and
     /// stop. Requires snapshot_dir.
     snapshot_after_ms: ?u64 = null,
@@ -44,7 +48,22 @@ const gic_dist_size: u64 = 0x0001_0000;
 const gic_redist_base: u64 = 0x0802_0000;
 const gic_redist_size: u64 = 0x0002_0000;
 
+const RamMapping = struct {
+    bytes: []align(std.heap.page_size_min) u8,
+    file_backed: bool,
+
+    fn deinit(self: RamMapping) void {
+        std.posix.munmap(self.bytes);
+    }
+};
+
 pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
+    var resume_parsed: ?std.json.Parsed(spore.Manifest) = null;
+    defer if (resume_parsed) |*parsed| parsed.deinit();
+    if (config.resume_dir) |spore_dir| {
+        resume_parsed = try spore.loadManifest(allocator, spore_dir);
+    }
+
     const kvm_fd = try kvm.openDevKvm();
     defer closeFd(kvm_fd);
     try kvm.checkApiVersion(kvm_fd);
@@ -59,15 +78,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     const vm_fd: std.c.fd_t = @intCast(try kvm.ioctl(kvm_fd, kvm.KVM_CREATE_VM, 0, "KVM_CREATE_VM"));
     defer closeFd(vm_fd);
 
-    const ram_bytes = try std.posix.mmap(
-        null,
-        @intCast(config.ram_size),
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    );
-    defer std.posix.munmap(ram_bytes);
+    const ram_mapping = try mapRam(allocator, config, if (resume_parsed) |parsed| parsed.value else null);
+    defer ram_mapping.deinit();
+    const ram_bytes = ram_mapping.bytes;
     const ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
 
     var region = kvm.UserspaceMemoryRegion{
@@ -110,9 +123,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     try initGic(gic_dev.fd);
 
     if (config.resume_dir) |spore_dir| {
-        const parsed = try spore.loadManifest(allocator, spore_dir);
-        defer parsed.deinit();
-        const m = parsed.value;
+        _ = spore_dir;
+        const m = resume_parsed.?.value;
         const host_counter_frequency_hz = snapshot.hostCounterFreq();
         try platform.checkManifest(m, .{
             .ram_size = config.ram_size,
@@ -121,7 +133,11 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .counter_frequency_hz = host_counter_frequency_hz,
             .device_count = transports.len,
         });
-        try spore.loadMemory(allocator, spore_dir, m.memory, ram_bytes);
+        // The file-backed path is only enabled for trusted same-host forks.
+        // Otherwise RAM is materialized through verified chunks.
+        if (!ram_mapping.file_backed) {
+            try spore.loadMemory(allocator, config.resume_dir.?, m.memory, ram_bytes);
+        }
         try applyTransports(transports, m.devices);
         try gen_dev.restore(allocator, m.generation);
         try spore.refreshResumeParams(allocator, &gen_dev);
@@ -212,6 +228,65 @@ fn monotonicMs() !u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
+fn mapRam(allocator: std.mem.Allocator, config: Config, manifest: ?spore.Manifest) !RamMapping {
+    if (config.trust_ram_backing) {
+        if (manifest) |m| {
+            if (m.memory.backing) |backing| {
+                const backing_path = spore.memoryBackingPath(allocator, config.resume_dir.?, backing) catch |err| {
+                    std.log.warn("RAM backing path unavailable ({}); falling back to eager chunk load", .{err});
+                    return mapAnonymousRam(config.ram_size);
+                };
+                return mapFileBackedRam(backing_path, config.ram_size) catch |err| {
+                    std.log.warn("RAM backing unavailable at {s} ({}); falling back to eager chunk load", .{ backing_path, err });
+                    return mapAnonymousRam(config.ram_size);
+                };
+            }
+        }
+    }
+    return mapAnonymousRam(config.ram_size);
+}
+
+fn mapAnonymousRam(size: u64) !RamMapping {
+    const bytes = try std.posix.mmap(
+        null,
+        @intCast(size),
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    return .{ .bytes = bytes, .file_backed = false };
+}
+
+fn mapFileBackedRam(path: [:0]const u8, size: u64) !RamMapping {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    defer closeFd(fd);
+
+    const actual_size = try fileSize(fd);
+    if (actual_size != size) return error.BadManifest;
+
+    const bytes = try std.posix.mmap(
+        null,
+        @intCast(size),
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE },
+        fd,
+        0,
+    );
+    std.log.info("mapped RAM from file backing: path={s} size={d} mode=MAP_PRIVATE", .{ path, size });
+    return .{ .bytes = bytes, .file_backed = true };
+}
+
+fn fileSize(fd: std.c.fd_t) !u64 {
+    const cur = std.c.lseek(fd, 0, std.c.SEEK.CUR);
+    if (cur < 0) return error.IoFailed;
+    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (end < 0) return error.IoFailed;
+    if (std.c.lseek(fd, cur, std.c.SEEK.SET) < 0) return error.IoFailed;
+    return @intCast(end);
+}
+
 fn takeSnapshot(
     allocator: std.mem.Allocator,
     dir: []const u8,
@@ -235,7 +310,7 @@ fn takeSnapshot(
     const machine = try snapshot.captureMachine(arena, gic_fd, vcpu_fd);
     const devices = try captureTransports(arena, transports);
     const gen_state = try gen_dev.capture(arena);
-    const memory = try spore.saveMemory(arena, dir, ram_bytes);
+    const memory = try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
     try spore.saveManifest(arena, dir, .{
         .platform = .{
             .cpu_profile = board.cpu_profile,

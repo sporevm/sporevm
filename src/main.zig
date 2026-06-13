@@ -113,6 +113,8 @@ const InspectSummary = struct {
     device_count: usize,
     memory_chunk_count: usize,
     present_memory_chunk_count: usize,
+    memory_backing_kind: ?[]const u8,
+    memory_backing_size: ?u64,
     gic_kind: []const u8,
 };
 
@@ -127,6 +129,8 @@ fn inspectSummary(manifest: sporevm.spore.Manifest) InspectSummary {
         .device_count = manifest.devices.len,
         .memory_chunk_count = manifest.memory.chunks.len,
         .present_memory_chunk_count = present_chunks,
+        .memory_backing_kind = if (manifest.memory.backing) |backing| backing.kind else null,
+        .memory_backing_size = if (manifest.memory.backing) |backing| backing.size else null,
         .gic_kind = @tagName(manifest.machine.gic.kind),
     };
 }

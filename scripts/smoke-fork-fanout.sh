@@ -319,7 +319,8 @@ write_metrics() {
   local child_resume_sum_ms="$2"
   local child_resume_min_ms="$3"
   local child_resume_max_ms="$4"
-  local total_ms="$5"
+  local file_backed_children="$5"
+  local total_ms="$6"
 
   {
     echo "{"
@@ -336,6 +337,7 @@ write_metrics() {
     echo "  \"children_resume_sum_ms\": ${child_resume_sum_ms},"
     echo "  \"child_resume_min_ms\": ${child_resume_min_ms},"
     echo "  \"child_resume_max_ms\": ${child_resume_max_ms},"
+    echo "  \"file_backed_children\": ${file_backed_children},"
     echo "  \"total_smoke_ms\": ${total_ms},"
     echo "  \"children\": ["
     for ((i = 0; i < count; i++)); do
@@ -395,6 +397,7 @@ entropy_seeds=()
 resume_times=()
 child_resume_ms=()
 child_logs=()
+child_file_backed=()
 result_dir="${workdir}/child-results"
 safe_remove "${result_dir}"
 mkdir -p "${result_dir}"
@@ -407,6 +410,9 @@ run_child_resume() {
   local result="${result_dir}/$(printf '%06d' "${i}").result"
   local complete_pattern="sporevm-fork-smoke acked_generation=.*irq_status_after_ack=0"
   local cmd=("${boot_bin}" "${kernel}" --mem-mib "${mem_mib}" --resume "${child_dir}")
+  if [[ "${backend}" == "kvm" ]]; then
+    cmd+=(--trust-ram-backing)
+  fi
 
   set +e
   run_until_log_matches "${resume_seconds}" "${complete_pattern}" "${log}" "${cmd[@]}"
@@ -466,6 +472,11 @@ for ((i = 0; i < count; i++)); do
   resume_times+=("$(field_value resume_time_unix_ns "${log}")")
   child_resume_ms[i]="${resume_ms}"
   child_logs[i]="${log}"
+  if grep -q "mapped RAM from file backing" "${log}"; then
+    child_file_backed[i]=1
+  else
+    child_file_backed[i]=0
+  fi
   echo "child ok: index=${i} vm_id=${vm_ids[-1]} hostname=${hostnames[-1]} resume_ms=${resume_ms} log=${log}"
 done
 
@@ -481,8 +492,10 @@ unique_count() {
 child_resume_sum_ms=0
 child_resume_min_ms="${child_resume_ms[0]}"
 child_resume_max_ms="${child_resume_ms[0]}"
+file_backed_children=0
 for ((i = 0; i < count; i++)); do
   child_resume_sum_ms=$(( child_resume_sum_ms + child_resume_ms[i] ))
+  file_backed_children=$(( file_backed_children + child_file_backed[i] ))
   if (( child_resume_ms[i] < child_resume_min_ms )); then
     child_resume_min_ms="${child_resume_ms[i]}"
   fi
@@ -490,8 +503,11 @@ for ((i = 0; i < count; i++)); do
     child_resume_max_ms="${child_resume_ms[i]}"
   fi
 done
+if [[ "${backend}" == "kvm" && "${file_backed_children}" != "${count}" ]]; then
+  die "expected every KVM child to use file-backed RAM; got ${file_backed_children}/${count}"
+fi
 total_smoke_ms=$(( $(now_ms) - smoke_start_ms ))
-write_metrics "${children_resume_wall_ms}" "${child_resume_sum_ms}" "${child_resume_min_ms}" "${child_resume_max_ms}" "${total_smoke_ms}"
+write_metrics "${children_resume_wall_ms}" "${child_resume_sum_ms}" "${child_resume_min_ms}" "${child_resume_max_ms}" "${file_backed_children}" "${total_smoke_ms}"
 
-echo "fork fan-out metrics: capture_ms=${capture_ms} fork_ms=${fork_ms} children_resume_wall_ms=${children_resume_wall_ms} child_resume_min_ms=${child_resume_min_ms} child_resume_max_ms=${child_resume_max_ms} total_smoke_ms=${total_smoke_ms} metrics=${metrics_json}"
+echo "fork fan-out metrics: capture_ms=${capture_ms} fork_ms=${fork_ms} children_resume_wall_ms=${children_resume_wall_ms} child_resume_min_ms=${child_resume_min_ms} child_resume_max_ms=${child_resume_max_ms} file_backed_children=${file_backed_children} total_smoke_ms=${total_smoke_ms} metrics=${metrics_json}"
 echo "fork fan-out ok: backend=${backend} count=${count} parallel=${parallel} workdir=${workdir}"

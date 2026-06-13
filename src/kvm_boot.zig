@@ -2,7 +2,7 @@
 //!
 //! Bring-up tool, not the product CLI. Usage:
 //!   zig build kvm-boot
-//!   ./zig-out/bin/kvm-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR]
+//!   ./zig-out/bin/kvm-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--trust-ram-backing]
 
 const std = @import("std");
 const sporevm = @import("sporevm");
@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
-        std.debug.print("usage: kvm-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR]\n", .{});
+        std.debug.print("usage: kvm-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--trust-ram-backing]\n", .{});
         std.process.exit(2);
     }
 
@@ -32,6 +32,7 @@ pub fn main(init: std.process.Init) !void {
     var snapshot_after_ms: ?u64 = null;
     var spore_dir: ?[]const u8 = null;
     var resume_dir: ?[]const u8 = null;
+    var trust_ram_backing = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--cmdline") and i + 1 < args.len) {
@@ -55,6 +56,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--resume") and i + 1 < args.len) {
             i += 1;
             resume_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--trust-ram-backing")) {
+            trust_ram_backing = true;
         } else {
             std.debug.print("unknown argument: {s}\n", .{args[i]});
             std.process.exit(2);
@@ -99,6 +102,7 @@ pub fn main(init: std.process.Init) !void {
         .console_sink = consoleSink,
         .disk_fd = disk_fd,
         .resume_dir = resume_dir,
+        .trust_ram_backing = trust_ram_backing,
         .snapshot_after_ms = snapshot_after_ms,
         .snapshot_dir = spore_dir,
     });

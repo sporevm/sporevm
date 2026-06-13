@@ -19,6 +19,8 @@ const Blake3 = std.crypto.hash.Blake3;
 
 pub const format_version: u32 = 0;
 pub const chunk_size: usize = 2 * 1024 * 1024;
+pub const ram_backing_kind = "linux-map-private-file-v0";
+pub const ram_backing_path = "ram.backing";
 
 pub const Error = error{
     BadManifest,
@@ -95,10 +97,20 @@ pub const MachineState = struct {
     gic: gicv3.State,
 };
 
+pub const MemoryBacking = struct {
+    kind: []const u8 = ram_backing_kind,
+    path: []const u8,
+    size: u64,
+};
+
 pub const MemoryManifest = struct {
     chunk_size: u64,
     /// One entry per chunk; null means all zeroes.
     chunks: []?[]const u8,
+    /// Optional same-host acceleration hint. Chunks remain the portable,
+    /// verified source of truth; backends may ignore this and materialize
+    /// from chunks instead.
+    backing: ?MemoryBacking = null,
 };
 
 pub const GenerationState = generation.State;
@@ -121,6 +133,15 @@ fn writeFileAll(path: [:0]const u8, data: []const u8) Error!void {
     var done: usize = 0;
     while (done < data.len) {
         const n = std.c.write(fd, data.ptr + done, data.len - done);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+}
+
+fn pwriteFileAll(fd: std.c.fd_t, offset: usize, data: []const u8) Error!void {
+    var done: usize = 0;
+    while (done < data.len) {
+        const n = std.c.pwrite(fd, data.ptr + done, data.len - done, @intCast(offset + done));
         if (n <= 0) return error.IoFailed;
         done += @intCast(n);
     }
@@ -190,13 +211,48 @@ fn symlinkPath(target: []const u8, link_path: []const u8) Error!void {
     }
 }
 
+pub fn validateMemoryBacking(backing: MemoryBacking, expected_size: u64) Error!void {
+    if (!std.mem.eql(u8, backing.kind, ram_backing_kind)) return error.BadManifest;
+    if (!std.mem.eql(u8, backing.path, ram_backing_path)) return error.BadManifest;
+    if (backing.size != expected_size) return error.BadManifest;
+}
+
+pub fn memoryBackingPath(allocator: std.mem.Allocator, dir: []const u8, backing: MemoryBacking) Error![:0]const u8 {
+    try validateMemoryBacking(backing, backing.size);
+    return pathZ(allocator, "{s}/{s}", .{ dir, backing.path });
+}
+
 // --- save / load -------------------------------------------------------------
 
 /// Write guest memory into the chunk store, returning the memory manifest.
 pub fn saveMemory(allocator: std.mem.Allocator, dir: []const u8, ram: []const u8) Error!MemoryManifest {
+    return saveMemoryInternal(allocator, dir, ram, false);
+}
+
+/// Write guest memory into the chunk store and a sparse local RAM backing.
+/// The backing is a same-host acceleration hint for MAP_PRIVATE fork resumes;
+/// chunks remain the portable verified source of truth.
+pub fn saveMemoryWithBacking(allocator: std.mem.Allocator, dir: []const u8, ram: []const u8) Error!MemoryManifest {
+    return saveMemoryInternal(allocator, dir, ram, true);
+}
+
+fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []const u8, with_backing: bool) Error!MemoryManifest {
     const chunks_dir = try pathZ(allocator, "{s}/chunks", .{dir});
     try ensureDir(try pathZ(allocator, "{s}", .{dir}));
     try ensureDir(chunks_dir);
+
+    var backing_fd: std.c.fd_t = -1;
+    var backing_tmp_path: ?[:0]const u8 = null;
+    if (with_backing) {
+        const tmp_path = try pathZ(allocator, "{s}/{s}.tmp", .{ dir, ram_backing_path });
+        backing_tmp_path = tmp_path;
+        backing_fd = std.c.open(tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
+        if (backing_fd < 0) return error.IoFailed;
+        if (std.c.ftruncate(backing_fd, @intCast(ram.len)) != 0) return error.IoFailed;
+    }
+    defer {
+        if (backing_fd >= 0) _ = std.c.close(backing_fd);
+    }
 
     const count = (ram.len + chunk_size - 1) / chunk_size;
     const refs = try allocator.alloc(?[]const u8, count);
@@ -218,8 +274,21 @@ pub fn saveMemory(allocator: std.mem.Allocator, dir: []const u8, ram: []const u8
         if (std.c.access(chunk_path, 0) != 0) {
             try writeFileAll(chunk_path, data);
         }
+        if (backing_fd >= 0) {
+            try pwriteFileAll(backing_fd, start, data);
+        }
     }
-    return .{ .chunk_size = chunk_size, .chunks = refs };
+
+    const backing = if (with_backing) blk: {
+        if (std.c.fchmod(backing_fd, 0o444) != 0) return error.IoFailed;
+        _ = std.c.close(backing_fd);
+        backing_fd = -1;
+        const final_path = try pathZ(allocator, "{s}/{s}", .{ dir, ram_backing_path });
+        if (std.c.rename(backing_tmp_path.?.ptr, final_path.ptr) != 0) return error.IoFailed;
+        break :blk MemoryBacking{ .path = ram_backing_path, .size = ram.len };
+    } else null;
+
+    return .{ .chunk_size = chunk_size, .chunks = refs, .backing = backing };
 }
 
 /// Materialize guest memory from the chunk store. Verifies every chunk
@@ -295,6 +364,14 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
 
     const parent_chunks = try pathZ(allocator, "{s}/chunks", .{options.parent_dir});
     const shared_chunks = try realpathAlloc(allocator, parent_chunks);
+    var shared_backing: ?[]const u8 = null;
+    if (parent.memory.backing) |backing| {
+        const parent_backing = try memoryBackingPath(allocator, options.parent_dir, backing);
+        shared_backing = realpathAlloc(allocator, parent_backing) catch |err| switch (err) {
+            error.IoFailed => null,
+            else => |e| return e,
+        };
+    }
     try ensureDir(try pathZ(allocator, "{s}", .{options.out_dir}));
 
     const fork_batch_id = try randomHex(allocator, 16);
@@ -305,8 +382,13 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
         try ensureNewDir(child_dir);
         const chunks_link = try pathZ(allocator, "{s}/chunks", .{child_dir});
         try symlinkPath(shared_chunks, chunks_link);
-
         var child = parent;
+        if (shared_backing == null) child.memory.backing = null;
+        if (child.memory.backing) |backing| {
+            const backing_link = try pathZ(allocator, "{s}/{s}", .{ child_dir, backing.path });
+            try symlinkPath(shared_backing.?, backing_link);
+        }
+
         const child_generation = parent.generation.generation + i + 1;
         const identity = try childIdentity(allocator, fork_batch_id, i);
         const params_b64 = try forkParamsB64(allocator, .{
@@ -541,6 +623,9 @@ fn validateManifest(manifest: Manifest) Error!void {
     {
         return error.BadManifest;
     }
+    if (manifest.memory.backing) |backing| {
+        try validateMemoryBacking(backing, manifest.platform.ram_size);
+    }
     gicv3.validate(manifest.machine.gic) catch return error.BadManifest;
 }
 
@@ -580,6 +665,56 @@ test "memory round-trips through the chunk store with zero elision" {
     @memset(out, 0xAA);
     try loadMemory(arena, dir, mm, out);
     try std.testing.expectEqualSlices(u8, ram, out);
+}
+
+test "memory backing is sparse local acceleration metadata" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+
+    const ram = try arena.alloc(u8, 3 * chunk_size + 17);
+    @memset(ram, 0);
+    ram[11] = 0xAB;
+    ram[2 * chunk_size + 9] = 0xCD;
+
+    const mm = try saveMemoryWithBacking(arena, dir, ram);
+    const backing = mm.backing orelse return error.BadManifest;
+    try std.testing.expectEqualStrings(ram_backing_kind, backing.kind);
+    try std.testing.expectEqualStrings(ram_backing_path, backing.path);
+    try std.testing.expectEqual(@as(u64, ram.len), backing.size);
+    try validateMemoryBacking(backing, ram.len);
+
+    const backing_path = try memoryBackingPath(arena, dir, backing);
+    const backing_bytes = try readFileAll(arena, backing_path, ram.len);
+    try std.testing.expectEqualSlices(u8, ram, backing_bytes);
+
+    const out = try arena.alloc(u8, ram.len);
+    @memset(out, 0xAA);
+    try loadMemory(arena, dir, mm, out);
+    try std.testing.expectEqualSlices(u8, ram, out);
+}
+
+test "memory backing rejects non-canonical paths" {
+    const valid_size: u64 = 4096;
+    const invalid_paths = [_][]const u8{
+        "",
+        ".",
+        "..",
+        "chunks",
+        "manifest.json",
+        "ram.backing.tmp",
+        "nested/ram.backing",
+        "ram.backing\x00suffix",
+    };
+    for (invalid_paths) |path| {
+        try std.testing.expectError(error.BadManifest, validateMemoryBacking(.{
+            .path = path,
+            .size = valid_size,
+        }, valid_size));
+    }
 }
 
 test "corrupted chunk fails closed" {
@@ -716,28 +851,15 @@ test "manifest json round-trip" {
     try std.testing.expectEqual(@as(u64, 7), parsed.value.generation.generation);
 }
 
-test "fork mints child manifests with shared chunks and pending generation" {
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+const test_fork_line_levels = [_]gicv3.LineLevel{.{ .intid = board.generationIntid(), .asserted = false }};
 
-    const root_dir = try testDir(arena);
-    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
-    const out_dir = try pathZ(arena, "{s}/children", .{root_dir});
-
-    const ram = try arena.alloc(u8, chunk_size + 8);
-    @memset(ram, 0);
-    ram[0] = 0x42;
-    ram[ram.len - 1] = 0x99;
-    const memory = try saveMemory(arena, parent_dir, ram);
-
-    const manifest = Manifest{
+fn testForkManifest(memory: MemoryManifest, ram_size: u64, initial_generation: u64) Manifest {
+    return .{
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
             .ram_base = 0x8000_0000,
-            .ram_size = ram.len,
+            .ram_size = ram_size,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
             .counter_frequency_hz = 24_000_000,
@@ -757,15 +879,33 @@ test "fork mints child manifests with shared chunks and pending generation" {
                 .gicv3 = .{
                     .dist_regs = &.{},
                     .redist_regs = &.{},
-                    .line_levels = &.{.{ .intid = board.generationIntid(), .asserted = false }},
+                    .line_levels = &test_fork_line_levels,
                 },
             },
         },
         .devices = &.{},
-        .generation = .{ .generation = 41, .interrupt_status = 0, .params_b64 = "" },
+        .generation = .{ .generation = initial_generation, .interrupt_status = 0, .params_b64 = "" },
         .memory = memory,
     };
-    try saveManifest(arena, parent_dir, manifest);
+}
+
+test "fork mints child manifests with shared chunks and pending generation" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/children", .{root_dir});
+
+    const ram = try arena.alloc(u8, chunk_size + 8);
+    @memset(ram, 0);
+    ram[0] = 0x42;
+    ram[ram.len - 1] = 0x99;
+    const memory = try saveMemoryWithBacking(arena, parent_dir, ram);
+
+    try saveManifest(arena, parent_dir, testForkManifest(memory, ram.len, 41));
 
     const result = try fork(arena, .{ .parent_dir = parent_dir, .out_dir = out_dir, .count = 2 });
     try std.testing.expectEqual(@as(usize, 2), result.count);
@@ -782,6 +922,10 @@ test "fork mints child manifests with shared chunks and pending generation" {
     try std.testing.expectEqual(@as(u32, generation.irq_generation_changed), first.value.generation.interrupt_status);
     try std.testing.expect(first.value.generation.params_b64.len > 0);
     try std.testing.expect(first.value.machine.gic.gicv3.?.line_levels[0].asserted);
+    const first_backing = first.value.memory.backing orelse return error.BadManifest;
+    try std.testing.expectEqualStrings(ram_backing_path, first_backing.path);
+    const first_backing_path = try memoryBackingPath(arena, first_child_dir, first_backing);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.access(first_backing_path, 0));
 
     const second_child_dir = try pathZ(arena, "{s}/000001", .{out_dir});
     const second = try loadManifest(arena, second_child_dir);
@@ -823,6 +967,34 @@ test "fork mints child manifests with shared chunks and pending generation" {
     const out = try arena.alloc(u8, ram.len);
     @memset(out, 0);
     try loadMemory(arena, second_child_dir, second.value.memory, out);
+    try std.testing.expectEqualSlices(u8, ram, out);
+}
+
+test "fork drops stale optional memory backing" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/children", .{root_dir});
+
+    const ram = try arena.alloc(u8, chunk_size);
+    @memset(ram, 0x5A);
+    var memory = try saveMemory(arena, parent_dir, ram);
+    memory.backing = .{ .path = ram_backing_path, .size = ram.len };
+    try saveManifest(arena, parent_dir, testForkManifest(memory, ram.len, 9));
+
+    _ = try fork(arena, .{ .parent_dir = parent_dir, .out_dir = out_dir, .count = 1 });
+    const child_dir = try pathZ(arena, "{s}/000000", .{out_dir});
+    const child = try loadManifest(arena, child_dir);
+    defer child.deinit();
+    try std.testing.expect(child.value.memory.backing == null);
+
+    const out = try arena.alloc(u8, ram.len);
+    @memset(out, 0);
+    try loadMemory(arena, child_dir, child.value.memory, out);
     try std.testing.expectEqualSlices(u8, ram, out);
 }
 
