@@ -381,9 +381,12 @@ scale runs remain follow-up hardening work.
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
 spores now fail closed on the expected counter-frequency mismatch
-(`1_050_000_000` Hz vs Apple HVF's 24MHz). HVF→KVM remains gated on HVF
-emitting portable GICv3 state. These are tracked in `docs/state-portability.md`
-and do not block the next release-critical fork/fan-out slices.
+(`1_050_000_000` Hz vs Apple HVF's 24MHz). A ten-host `a1.metal` probe found
+that Graviton 1 exposes `CNTFRQ_EL0=83_333_333` on every host, so that cheaper
+host class is useful for KVM↔KVM distribution work but does not remove the
+KVM↔HVF timer mismatch. HVF→KVM remains gated on HVF emitting portable GICv3
+state. These are tracked in `docs/state-portability.md` and do not block the
+next release-critical fork/fan-out slices.
 
 Slice 6 has its first remote distribution proof. `scripts/smoke-remote-bundle.sh`
 orchestrates two SSM-managed aarch64 KVM hosts and an S3 staging prefix: it
@@ -426,7 +429,14 @@ the source peer over HTTP, all nine resumed with lazy KVM RAM, and aggregate
 metrics reported `destination_count=9`, `total_destination_origin_bytes=0`,
 `total_destination_peer_bytes=264,499,200`,
 `total_corrupt_bundle_rejections=9`, and
-`origin_multiplier_vs_resume_bundle=0.0`.
+`origin_multiplier_vs_resume_bundle=0.0`. The smoke now also supports an
+explicit source→relay→leaf tree topology. A ten-instance `a1.metal` run used
+one source, three relays, and six leaves; all nine non-source hosts resumed and
+rejected corrupted bundle copies, destination S3-origin bytes stayed at zero,
+and peer egress split as `source_peer_egress_bytes=88,166,400` plus
+`relay_peer_egress_bytes=176,332,800`. The heaviest peer served
+`max_peer_egress_bytes=88,166,400`, about three bundle archives instead of the
+nine bundle archives served by the previous star source.
 
 ## Delivery Strategy
 
@@ -533,9 +543,9 @@ Status: in progress. Local chunkpack bundles with canonical `bundle_digest`
 output, the first two-host S3/SSM remote restore smoke, a host-local
 cache-backed repeat restore smoke, a source-peer HTTP seed proof, and corrupted
 distributed-bundle rejection checks have landed. A ten-instance single-source
-peer fan-out smoke has also passed with zero destination S3-origin bytes.
-Multi-peer/cache-hierarchy fan-out and measured origin-egress efficiency beyond
-one seed remain.
+peer fan-out smoke and a ten-instance source→relay→leaf tree smoke have also
+passed with zero destination S3-origin bytes. Multi-peer/cache-hierarchy fan-out
+and measured origin-egress efficiency beyond an explicit relay tree remain.
 
 Start with a local bundle/chunkpack format, then add distribution adapters.
 `spore pack` writes a portable bundle containing a manifest with local RAM
@@ -553,10 +563,11 @@ downloads. The current script can prove per-host cache reuse with
 `--cache-dir` and `--dest-repeat`, and it can prove first-fetch reduction from
 the durable origin with source-peer HTTP seeding via `--source-peer-ip`; it also
 corrupts one fetched bundle copy per destination to keep peer/origin trust tied
-to chunk verification. The ten-instance run proves this works as a small fleet
-star topology, but it is still a single-seed proof, not the final peer graph or
-cache hierarchy. Scale tests at 100 → 1,000 identical hosts happen before
-claiming 10,000.
+to chunk verification. Tree mode (`--tree-relay INSTANCE_ID:IP`) proves a small
+fleet can bound source peer egress by relay count, but it is still an explicit
+test topology rather than the final daemon-selected peer graph or cache
+hierarchy. Scale tests at 100 → 1,000 identical hosts happen before claiming
+10,000.
 
 Done when: a multi-host fan-out demo restores one spore on every host in a
 test fleet with origin egress measured at a small multiple of the unique chunk
