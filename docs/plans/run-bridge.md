@@ -353,6 +353,13 @@ policy.
 
 ### Blocking Slice B
 
+- Kernel profile: the managed `v0.3.0` cleanroom-kernels assets split the
+  required capabilities. The `initrd` and `sporevm` profiles have
+  `CONFIG_BLK_DEV_INITRD=y` but do not expose virtio-blk/ext4 in the smoke;
+  the `rootfs` profile has `CONFIG_VIRTIO_BLK=y` and `CONFIG_EXT4_FS=y` but no
+  `CONFIG_BLK_DEV_INITRD`, so it panics before the initrd agent can run. Slice
+  B needs a combined run-rootfs kernel profile before the SporeVM `--rootfs`
+  CLI should be exposed.
 - Rootfs device discovery: prefer mounting `devtmpfs` in the agent and waiting
   for the virtio-blk device node. A fixed `/dev/vda` mknod is acceptable only
   as a temporary smoke fallback if devtmpfs support is missing from the managed
