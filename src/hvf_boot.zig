@@ -2,7 +2,7 @@
 //!
 //! Bring-up tool, not the product CLI. Usage:
 //!   zig build hvf-boot
-//!   ./zig-out/bin/hvf-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio]
+//!   ./zig-out/bin/hvf-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH] [--trust-ram-backing]
 
 const std = @import("std");
 const sporevm = @import("sporevm");
@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
-        std.debug.print("usage: hvf-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio]\n", .{});
+        std.debug.print("usage: hvf-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH] [--trust-ram-backing]\n", .{});
         std.process.exit(2);
     }
 
@@ -32,6 +32,9 @@ pub fn main(init: std.process.Init) !void {
     var snapshot_after_ms: ?u64 = null;
     var spore_dir: ?[]const u8 = null;
     var resume_dir: ?[]const u8 = null;
+    var lazy_ram = false;
+    var lazy_ram_trace_path: ?[]const u8 = null;
+    var trust_ram_backing = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--cmdline") and i + 1 < args.len) {
@@ -55,10 +58,59 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--resume") and i + 1 < args.len) {
             i += 1;
             resume_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--lazy-ram")) {
+            lazy_ram = true;
+        } else if (std.mem.eql(u8, args[i], "--lazy-ram-trace") and i + 1 < args.len) {
+            i += 1;
+            lazy_ram_trace_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--trust-ram-backing")) {
+            trust_ram_backing = true;
         } else {
             std.debug.print("unknown argument: {s}\n", .{args[i]});
             std.process.exit(2);
         }
+    }
+    if ((snapshot_after_ms == null) != (spore_dir == null)) {
+        std.debug.print("--snapshot-after-ms and --spore must be used together\n", .{});
+        std.process.exit(2);
+    }
+    if (resume_dir != null and snapshot_after_ms != null) {
+        std.debug.print("--resume cannot be combined with --snapshot-after-ms\n", .{});
+        std.process.exit(2);
+    }
+    if (lazy_ram and resume_dir == null) {
+        std.debug.print("--lazy-ram requires --resume\n", .{});
+        std.process.exit(2);
+    }
+    if (lazy_ram and trust_ram_backing) {
+        std.debug.print("--lazy-ram cannot be combined with --trust-ram-backing\n", .{});
+        std.process.exit(2);
+    }
+    if (lazy_ram_trace_path != null and !lazy_ram) {
+        std.debug.print("--lazy-ram-trace requires --lazy-ram\n", .{});
+        std.process.exit(2);
+    }
+
+    var ram_backing_fd: ?std.c.fd_t = null;
+    defer {
+        if (ram_backing_fd) |fd| _ = std.c.close(fd);
+    }
+    if (trust_ram_backing) {
+        ram_backing_fd = try openTrustedRamBacking(arena, resume_dir);
+    }
+
+    var lazy_ram_trace_fd: ?std.c.fd_t = null;
+    defer {
+        if (lazy_ram_trace_fd) |fd| _ = std.c.close(fd);
+    }
+    if (lazy_ram_trace_path) |path| {
+        const pathz = try arena.dupeZ(u8, path);
+        const fd = std.c.open(pathz, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, @as(c_uint, 0o644));
+        if (fd < 0) {
+            std.debug.print("cannot open lazy RAM trace: {s}\n", .{path});
+            std.process.exit(1);
+        }
+        lazy_ram_trace_fd = fd;
     }
 
     const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], arena, .limited(256 * 1024 * 1024));
@@ -113,8 +165,25 @@ pub fn main(init: std.process.Init) !void {
         .disk_fd = disk_fd,
         .poll_stdin = interactive,
         .resume_dir = resume_dir,
+        .ram_backing_fd = ram_backing_fd,
+        .ram_restore_mode = if (lazy_ram) .lazy_chunks else .eager_chunks,
+        .lazy_ram_trace_fd = lazy_ram_trace_fd,
         .snapshot_after_ms = snapshot_after_ms,
         .snapshot_dir = spore_dir,
     });
     std.debug.print("\nsporevm hvf-boot: guest requested {s}\n", .{@tagName(cause)});
+}
+
+fn openTrustedRamBacking(allocator: std.mem.Allocator, resume_dir: ?[]const u8) !?std.c.fd_t {
+    const dir = resume_dir orelse return null;
+    const parsed = try sporevm.spore.loadManifest(allocator, dir);
+    defer parsed.deinit();
+    const backing = parsed.value.memory.backing orelse return null;
+    const path = try sporevm.spore.memoryBackingPath(allocator, dir, backing);
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    if (fd < 0) {
+        std.debug.print("trusted RAM backing unavailable: {s}; falling back to chunks\n", .{path});
+        return null;
+    }
+    return fd;
 }

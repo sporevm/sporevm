@@ -24,7 +24,7 @@ fuzz targets from the slice that introduces it:
 |---|---|---|
 | Virtqueue descriptors, rings, and device request headers | guest memory | shared queue/MMIO paths and current console/blk/net/vsock/rng device paths fuzzed; new device parsers require fuzz targets in the same slice |
 | Guest memory access during dirty scans | guest | required at slice 7 |
-| Lazy RAM fault handling | guest page faults plus spore CAS chunks | KVM userfaultfd path is opt-in; faults materialize whole verified chunks and fail closed on malformed manifests or chunk mismatches |
+| Lazy RAM fault handling | guest page faults plus spore CAS chunks | KVM userfaultfd and HVF abort-exit paths are opt-in; faults materialize whole verified chunks and fail closed on malformed manifests or chunk mismatches |
 | Spore manifest decode | registry, disk | fuzzed; unknown versions and malformed manifests fail closed |
 | CAS chunk reads | peers, registry, disk | BLAKE3 verified before restore; malformed memory manifests are fuzzed; compression is not in v0 |
 | Chunkpack bundle index and pack segments | peers, registry, disk | index parsing is fuzzed; unpack only accepts canonical pack paths and verifies segment SHA256 plus logical BLAKE3 chunk IDs before writing chunks |

@@ -324,18 +324,17 @@ same-host fan-out smokes; the representative KVM run on the `m7g.metal` host
 used the `cleanroom-kernels` v0.3.0 `sporevm-arm64-linux-6.1.155-Image` asset
 with `--count 32 --parallel 4`, reporting capture_ms=5323, fork_ms=47,
 children_resume_wall_ms=6663, child_resume_min_ms=811,
-child_resume_max_ms=813, and total_smoke_ms=12695. A true 100-concurrent
-512MiB fork storm with reasonable aggregate child PSS belongs after the
-same-host CoW RAM backing lands; otherwise the test mostly proves the host has
-enough RAM for eager restores.
+child_resume_max_ms=813, and total_smoke_ms=12695. The high-concurrency memory
+efficiency proof belongs to Slice 5 so Slice 4 does not mistake eager-restore
+host capacity for fork architecture.
 
-Slice 5's KVM same-host RAM backing proof has landed. KVM snapshots write an
-optional local `ram.backing` file next to the canonical chunk store; `spore
-fork` propagates that backing to children only when the local file is still
-available, otherwise it drops the optional metadata and leaves children
-restorable from chunks. The KVM boot harness requires an explicit trusted
-same-host opt-in before opening `ram.backing`, then passes the already-open fd
-into the KVM backend for `MAP_PRIVATE` mapping. That trusted fd path checks the
+Slice 5's same-host RAM backing proof has landed for KVM and HVF. Snapshots
+write an optional local `ram.backing` file next to the canonical chunk store;
+`spore fork` propagates that backing to children only when the local file is
+still available, otherwise it drops the optional metadata and leaves children
+restorable from chunks. The boot harnesses require an explicit trusted
+same-host opt-in before opening `ram.backing`, then pass the already-open fd
+into the backend for `MAP_PRIVATE` mapping. That trusted fd path checks the
 manifest shape but does not re-hash the backing contents; imported or untrusted
 spores still materialize through verified chunks and the backend no longer
 resolves manifest paths. This remains an interim path/symlink harness adapter
@@ -353,24 +352,31 @@ that monitor-shaped handoff while keeping the original `kvm-boot` PID as the VM
 process for smoke sampling and cleanup. A 100-child fdpass-mode KVM run reported
 file_backed_children=100, host_memory_sampled_children=100, host_pss_kib=782723,
 child_resume_min_ms=137, and child_resume_max_ms=195. This is still a harness
-bridge, not the long-running product monitor/control socket.
+bridge, not the long-running product monitor/control socket. On HVF, the local
+Apple Silicon fork smoke now runs with trusted file-backed children too; a
+representative `--count 8 --parallel 4 --mem-mib 512` run reported
+file_backed_children=8, child_resume_min_ms=376, child_resume_max_ms=395, and
+children_resume_wall_ms=846.
 
-Slice 5 is complete for the primary KVM same-host/fan-out proof. KVM has an
-explicit `kvm-boot --lazy-ram` harness path that keeps eager restore as the
-default, registers anonymous guest RAM with `userfaultfd`, and materializes
-verified 2MiB CAS chunks on first fault. The same host smoke boots in that mode
-with mode=lazy_chunks, chunks=256, nonzero_chunks=14, memory_ms=0, and
-pre_run_ms=2; corrupt chunk contents fail closed with BadChunk. The smoke
-harness also writes a local lazy trace with one line per faulted chunk and
-reports `ttfi_ms` (time to first KVM_RUN), `ttuw_ms` (time to first guest
-ticker), `lazy_faults`, and `lazy_unique_chunks`. On `m7g.metal`, 512MiB eager
-restore reported ttfi_ms=512 and ttuw_ms=1565; 512MiB lazy restore reported
-ttfi_ms=2, ttuw_ms=1226, lazy_faults=9, and lazy_unique_chunks=9; 4GiB lazy
-restore reported ttfi_ms=3, ttuw_ms=1228, lazy_faults=10, and
-lazy_unique_chunks=10. Product monitor wiring, readahead, and clean cross-thread
-pager error propagation remain follow-up hardening work. HVF→HVF still needs
-the same class of same-host elastic RAM and lazy-restore proof; that is product
-parity for the macOS backend, not cross-backend portability.
+Slice 5 is complete for the primary same-backend lazy-restore proof on KVM and
+HVF. KVM has an explicit `kvm-boot --lazy-ram` harness path that keeps eager
+restore as the default, registers anonymous guest RAM with `userfaultfd`, and
+materializes verified 2MiB CAS chunks on first fault. HVF has the equivalent
+`hvf-boot --lazy-ram` path: resume starts with guest RAM unmapped in
+Hypervisor.framework, then instruction/data-abort exits inside the RAM window
+load verified CAS chunks into the VMM-owned host mapping and `hv_vm_map` only
+that chunk. Both paths write a local lazy trace with one line per faulted chunk
+and the smoke reports `ttfi_ms` (time to first VM entry), `ttuw_ms` (time to
+first guest ticker), `lazy_faults`, and `lazy_unique_chunks`. On `m7g.metal`,
+512MiB eager restore reported ttfi_ms=512 and ttuw_ms=1565; 512MiB lazy restore
+reported ttfi_ms=2, ttuw_ms=1226, lazy_faults=9, and lazy_unique_chunks=9; 4GiB
+lazy restore reported ttfi_ms=3, ttuw_ms=1228, lazy_faults=10, and
+lazy_unique_chunks=10. On local HVF, 512MiB eager restore reported ttfi_ms=229
+and ttuw_ms=1697; 512MiB lazy restore reported ttfi_ms=50, ttuw_ms=1398,
+lazy_faults=6, and lazy_unique_chunks=6; 4GiB lazy restore reported ttfi_ms=65,
+ttuw_ms=1411, lazy_faults=5, and lazy_unique_chunks=5. Product monitor wiring,
+readahead, clean cross-thread KVM pager error propagation, and larger macOS CI
+scale runs remain follow-up hardening work.
 
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
@@ -478,21 +484,20 @@ do not mistake eager restore host capacity for fork architecture.
 
 ### Slice 5: Elastic same-host RAM and lazy restore
 
-Status: complete for the primary KVM same-host/fan-out proof; incomplete for
-supported-backend parity. Product monitor wiring, readahead, clean pager error
-propagation, and HVF→HVF elastic RAM/lazy restore remain. The HVF work is
-same-backend product parity for Apple Silicon hosts, not the optional KVM↔HVF
-diagnostic portability track.
+Status: complete for the primary same-backend KVM and HVF proof. Product
+monitor wiring, readahead, clean KVM pager error propagation, and larger macOS
+CI scale runs remain. HVF→HVF elastic RAM/lazy restore is Apple Silicon product
+parity, not the optional KVM↔HVF diagnostic portability track.
 
 First land the identical-host hot fork path in incremental steps. The interim
 KVM step uses a local `ram.backing` file and trusted same-host opt-in to open a
 backing fd, then the KVM backend maps that fd privately CoW without resolving
-manifest paths. The fdpass harness mode proves the same `SCM_RIGHTS` handoff
-shape the monitor will use, but the robust monitor wiring still has to replace
-the harness path opener with a sealed `memfd`/file-backed mapping owned by the
-monitor; on HVF use the closest private remap/file-backed path or fail closed
-until supported. For cold lazy restore, first keep eager behaviour but expose
-validated per-chunk CAS loading plus restore metrics; then map memory empty and
+manifest paths. HVF uses the same trusted file-backed private mapping shape with
+`hv_vm_map`. The fdpass harness mode proves the same `SCM_RIGHTS` handoff shape
+the monitor will use, but the robust monitor wiring still has to replace the
+harness path opener with a sealed `memfd`/file-backed mapping owned by the
+monitor. For cold lazy restore, first keep eager behaviour but expose validated
+per-chunk CAS loading plus restore metrics; then map memory empty and
 materialize chunks on fault with an explicit userfaultfd KVM mode on Linux and
 unmapped-memory exits on HVF. Record an access trace on first resume; use it for
 readahead on later resumes. Benchmark resume time-to-first-instruction and
@@ -502,10 +507,10 @@ Done when: 100 concurrent same-host forks of one 512MiB spore run distinct
 workloads with aggregate child PSS proportional to the resident parent backing
 plus dirty child working sets, not N × RAM; summed RSS is reported only as a
 diagnostic because it double-counts shared pages. Resume TTFI is independent of
-RAM size on the primary KVM host class and on HVF→HVF once the macOS backend
-path lands, and the benchmark harness tracks both where CI hardware exists (or
-records manual runs where it does not). KVM proves the Linux CI economics first;
-HVF→HVF remains required backend parity, while KVM↔HVF cross-restore remains a
+RAM size on the primary KVM host class and on HVF→HVF, and the benchmark
+harness tracks both where CI hardware exists (or records manual runs where it
+does not). KVM proves the Linux CI economics first; HVF→HVF has the same-backend
+parity proof, while KVM↔HVF cross-restore remains a
 separate diagnostic goal.
 
 ### Slice 6: Identical-host fan-out distribution
@@ -645,10 +650,10 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   gate for fork/fan-out on identical hosts.
 - Same-host fan-out uses explicit RAM-backing transfer and private CoW mappings
   before claiming high-concurrency memory efficiency. Linux starts with
-  `memfd`/file-backed RAM plus `SCM_RIGHTS`; HVF needs a backend-specific
-  HVF→HVF equivalent for Apple Silicon same-host parity. KVM proves the
-  release-critical Linux CI economics first, but HVF same-backend elasticity is
-  not classified as cross-backend portability.
+  `memfd`/file-backed RAM plus `SCM_RIGHTS`; HVF uses same-host private
+  file-backed mappings plus abort-exit lazy chunk mapping for Apple Silicon
+  parity. KVM proves the release-critical Linux CI economics first, but HVF
+  same-backend elasticity is not classified as cross-backend portability.
 - MIT licensed from the first commit, but the repository stays private for
   now. The identical-host fork/fan-out demo is the natural moment to revisit
   going public.

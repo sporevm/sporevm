@@ -19,7 +19,7 @@ const Blake3 = std.crypto.hash.Blake3;
 
 pub const format_version: u32 = 0;
 pub const chunk_size: usize = 2 * 1024 * 1024;
-pub const ram_backing_kind = "linux-map-private-file-v0";
+pub const ram_backing_kind = "map-private-file-v0";
 pub const ram_backing_path = "ram.backing";
 
 pub const Error = error{

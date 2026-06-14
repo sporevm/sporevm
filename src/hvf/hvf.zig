@@ -105,6 +105,7 @@ pub const VcpuExit = extern struct {
 pub const ec_hvc: u6 = 0x16;
 pub const ec_smc: u6 = 0x17;
 pub const ec_brk: u6 = 0x3c;
+pub const ec_instruction_abort: u6 = 0x20;
 pub const ec_data_abort: u6 = 0x24;
 
 pub extern "c" fn hv_vm_create(config: ?*anyopaque) ReturnCode;

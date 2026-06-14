@@ -9,6 +9,7 @@
 const std = @import("std");
 const hvf = @import("hvf.zig");
 const gic = @import("gic.zig");
+const lazy_ram = @import("lazy_ram.zig");
 const board = @import("../board.zig");
 const boot = @import("../boot.zig");
 const generation = @import("../generation.zig");
@@ -36,6 +37,17 @@ pub const Config = struct {
     poll_stdin: bool = false,
     /// Resume from a spore directory instead of booting the kernel.
     resume_dir: ?[]const u8 = null,
+    /// Trusted same-host RAM backing fd supplied by the caller or future
+    /// monitor. The fd must refer to the manifest's optional RAM backing and
+    /// is mapped MAP_PRIVATE; imported or untrusted spores must leave this
+    /// null so RAM is materialized through verified chunks.
+    ram_backing_fd: ?std.c.fd_t = null,
+    /// Chunk restore strategy for cold/imported HVF resumes. Eager remains the
+    /// default; lazy is an explicit development path backed by RAM abort exits
+    /// on unmapped guest memory.
+    ram_restore_mode: RamRestoreMode = .eager_chunks,
+    /// Optional fd that receives one line per lazily materialized chunk.
+    lazy_ram_trace_fd: ?std.c.fd_t = null,
     /// Take a spore snapshot after this many milliseconds of run time and
     /// stop. Requires snapshot_dir.
     snapshot_after_ms: ?u64 = null,
@@ -46,6 +58,32 @@ pub const Config = struct {
 };
 
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete };
+
+pub const RamRestoreMode = enum {
+    eager_chunks,
+    lazy_chunks,
+};
+
+const RestoreStats = struct {
+    start_ms: u64,
+    manifest_ms: u64 = 0,
+    map_ram_ms: u64 = 0,
+    memory_ms: u64 = 0,
+    state_ms: u64 = 0,
+    pre_run_ms: u64 = 0,
+    mode: []const u8 = "none",
+    chunk_count: usize = 0,
+    nonzero_chunk_count: usize = 0,
+};
+
+const RamMapping = struct {
+    bytes: []align(std.heap.page_size_min) u8,
+    file_backed: bool,
+
+    fn deinit(self: RamMapping) void {
+        std.posix.munmap(self.bytes);
+    }
+};
 
 // PSCI v1.x (ARM DEN 0022) function ids and return codes.
 const psci_version: u32 = 0x8400_0000;
@@ -67,8 +105,16 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
 
     var resume_parsed: ?std.json.Parsed(spore.Manifest) = null;
     defer if (resume_parsed) |*parsed| parsed.deinit();
+    var lazy_pager: ?lazy_ram.Pager = null;
+    var restore_stats: ?RestoreStats = null;
+    if (config.ram_backing_fd != null and config.ram_restore_mode == .lazy_chunks) return error.BadManifest;
     if (config.resume_dir) |spore_dir| {
+        const manifest_start = monotonicMs();
         resume_parsed = try spore.loadManifest(allocator, spore_dir);
+        restore_stats = .{
+            .start_ms = manifest_start,
+            .manifest_ms = monotonicMs() - manifest_start,
+        };
     }
 
     // GIC layout from runtime parameters; created before any vCPU.
@@ -93,20 +139,26 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     try hvf.check(hvf.hv_gic_config_set_redistributor_base(gic_config, redist_base), "gic set redist base");
     try hvf.check(hvf.hv_gic_create(gic_config), "hv_gic_create");
 
-    // Guest RAM.
-    const ram_bytes = try std.posix.mmap(
-        null,
-        @intCast(config.ram_size),
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    );
-    defer std.posix.munmap(ram_bytes);
-    try hvf.check(
-        hvf.hv_vm_map(ram_bytes.ptr, board.ram_base, ram_bytes.len, hvf.MemoryFlags.rwx),
-        "hv_vm_map ram",
-    );
+    // Guest RAM. Eager and trusted-file resumes map the whole range up front;
+    // lazy chunk resumes leave it unmapped in HVF and materialize chunks from
+    // instruction/data-abort exits in the run loop.
+    const map_ram_start = monotonicMs();
+    const ram_mapping = try mapRam(config, if (resume_parsed) |parsed| parsed.value else null);
+    if (restore_stats) |*stats| stats.map_ram_ms = monotonicMs() - map_ram_start;
+    defer ram_mapping.deinit();
+    defer if (lazy_pager) |*pager| pager.deinit();
+    const ram_bytes = ram_mapping.bytes;
+    var ram_mapped_at_start = false;
+    if (shouldMapRamAtStart(config, ram_mapping)) {
+        try hvf.check(
+            hvf.hv_vm_map(ram_bytes.ptr, board.ram_base, ram_bytes.len, hvf.MemoryFlags.rwx),
+            "hv_vm_map ram",
+        );
+        ram_mapped_at_start = true;
+    }
+    defer {
+        if (ram_mapped_at_start) _ = hvf.hv_vm_unmap(board.ram_base, ram_bytes.len);
+    }
     const ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
 
     // Devices: console is virtio-mmio slot 0, disk (if any) follows, then net, vsock, rng.
@@ -161,12 +213,40 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .counter_frequency_hz = host_counter_frequency_hz,
             .device_count = transports.len,
         });
-        try spore.loadMemory(allocator, spore_dir, m.memory, ram_bytes);
+        const memory_plan = try spore.validateMemoryForRam(m.memory, ram_bytes.len);
+        if (restore_stats) |*stats| {
+            stats.chunk_count = memory_plan.chunk_count;
+            stats.nonzero_chunk_count = memory_plan.nonzero_chunk_count;
+        }
+        if (ram_mapping.file_backed) {
+            if (restore_stats) |*stats| stats.mode = "trusted_file_backed";
+        } else switch (config.ram_restore_mode) {
+            .eager_chunks => {
+                if (restore_stats) |*stats| stats.mode = "eager_chunks";
+                const memory_start = monotonicMs();
+                try spore.loadMemory(allocator, spore_dir, m.memory, ram_bytes);
+                if (restore_stats) |*stats| stats.memory_ms = monotonicMs() - memory_start;
+            },
+            .lazy_chunks => {
+                if (restore_stats) |*stats| stats.mode = "lazy_chunks";
+                const memory_start = monotonicMs();
+                lazy_pager = try lazy_ram.Pager.start(allocator, .{
+                    .dir = spore_dir,
+                    .manifest = m.memory,
+                    .ram = ram_bytes,
+                    .trace_fd = config.lazy_ram_trace_fd,
+                });
+                if (restore_stats) |*stats| stats.memory_ms = monotonicMs() - memory_start;
+            },
+        }
+        const state_start = monotonicMs();
         try applyTransports(transports, m.devices);
+        if (lazy_pager) |*pager| try materializeAllTransportQueues(pager, transports);
         try gen_dev.restore(allocator, m.generation);
         try spore.refreshResumeParams(allocator, &gen_dev);
         try snapshot.applyMachine(allocator, vcpu, m.machine);
         try raiseGenerationIrqIfPending(&gen_dev);
+        if (restore_stats) |*stats| stats.state_ms = monotonicMs() - state_start;
     } else {
         // Fresh boot: DTB + kernel. The DTB describes exactly one
         // redistributor frame, where the framework actually put it.
@@ -194,6 +274,24 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
 
     const counter_start = snapshot.hostCounter();
     const counter_freq = snapshot.hostCounterFreq();
+    const start_ms = monotonicMs();
+    if (restore_stats) |*stats| {
+        stats.pre_run_ms = start_ms - stats.start_ms;
+        std.log.info(
+            "hvf restore metrics: mode={s} ram_mib={d} chunks={d} nonzero_chunks={d} manifest_ms={d} map_ram_ms={d} memory_ms={d} state_ms={d} pre_run_ms={d}",
+            .{
+                stats.mode,
+                config.ram_size / 1024 / 1024,
+                stats.chunk_count,
+                stats.nonzero_chunk_count,
+                stats.manifest_ms,
+                stats.map_ram_ms,
+                stats.memory_ms,
+                stats.state_ms,
+                stats.pre_run_ms,
+            },
+        );
+    }
     if (config.exec_probe) |probe| {
         try vsock_dev.attachHostStream(probe);
         probe.markStarted();
@@ -223,12 +321,33 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .exception => {
                 const ec = exit.exception.exceptionClass();
                 switch (ec) {
-                    hvf.ec_data_abort => try handleMmio(vcpu, exit, transports, &gen_dev, ram, .{
-                        .dist_base = dist_base,
-                        .dist_size = dist_size,
-                        .redist_base = vcpu_redist_base,
-                        .redist_size = redist_stride,
-                    }),
+                    hvf.ec_instruction_abort => {
+                        if (lazy_pager) |*pager| {
+                            if (pager.isRamFault(exit.exception.physical_address)) {
+                                try pager.materializeFault(exit.exception.physical_address);
+                                continue;
+                            }
+                        }
+                        std.log.err(
+                            "unhandled instruction abort syndrome=0x{x} va=0x{x} ipa=0x{x}",
+                            .{ exit.exception.syndrome, exit.exception.virtual_address, exit.exception.physical_address },
+                        );
+                        return error.UnhandledGuestException;
+                    },
+                    hvf.ec_data_abort => {
+                        if (lazy_pager) |*pager| {
+                            if (pager.isRamFault(exit.exception.physical_address)) {
+                                try pager.materializeFault(exit.exception.physical_address);
+                                continue;
+                            }
+                        }
+                        try handleMmio(vcpu, exit, transports, &gen_dev, ram, if (lazy_pager) |*pager| pager else null, .{
+                            .dist_base = dist_base,
+                            .dist_size = dist_size,
+                            .redist_base = vcpu_redist_base,
+                            .redist_size = redist_stride,
+                        });
+                    },
                     hvf.ec_hvc => {
                         if (try handlePsci(vcpu)) |cause| return cause;
                     },
@@ -243,7 +362,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                         // WFI/WFE: nothing better to do single-threaded yet;
                         // poll input, yield briefly, let the vtimer wake us.
                         try advancePc(vcpu);
-                        if (config.poll_stdin) try drainStdin(&con, &transports[0], ram);
+                        if (config.poll_stdin) {
+                            if (lazy_pager) |*pager| try materializeTransportQueues(pager, &transports[0]);
+                            try drainStdin(&con, &transports[0], ram);
+                        }
                         var ts = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_us };
                         _ = std.c.nanosleep(&ts, null);
                     },
@@ -272,7 +394,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 // With hv_gic the timer PPI is delivered by the GIC; unmask
                 // so subsequent timer exits can fire.
                 try hvf.check(hvf.hv_vcpu_set_vtimer_mask(vcpu, false), "vtimer unmask");
-                if (config.poll_stdin) try drainStdin(&con, &transports[0], ram);
+                if (config.poll_stdin) {
+                    if (lazy_pager) |*pager| try materializeTransportQueues(pager, &transports[0]);
+                    try drainStdin(&con, &transports[0], ram);
+                }
             },
             .canceled => return error.VcpuCanceled,
             else => {
@@ -281,6 +406,81 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             },
         }
     }
+}
+
+fn monotonicMs() u64 {
+    const freq = snapshot.hostCounterFreq();
+    if (freq == 0) return 0;
+    return snapshot.hostCounter() * std.time.ms_per_s / freq;
+}
+
+fn shouldMapRamAtStart(config: Config, ram_mapping: RamMapping) bool {
+    if (config.resume_dir == null) return true;
+    if (ram_mapping.file_backed) return true;
+    return config.ram_restore_mode != .lazy_chunks;
+}
+
+fn mapRam(config: Config, manifest: ?spore.Manifest) !RamMapping {
+    if (config.ram_backing_fd) |fd| {
+        const m = manifest orelse return error.BadManifest;
+        const backing = m.memory.backing orelse return error.BadManifest;
+        try spore.validateMemoryBacking(backing, config.ram_size);
+        return mapFileBackedRamFd(fd, config.ram_size);
+    }
+    return mapAnonymousRam(config.ram_size);
+}
+
+fn mapAnonymousRam(size: u64) !RamMapping {
+    const bytes = try std.posix.mmap(
+        null,
+        @intCast(size),
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    return .{ .bytes = bytes, .file_backed = false };
+}
+
+fn mapFileBackedRamFd(fd: std.c.fd_t, size: u64) !RamMapping {
+    const actual_size = try fileSize(fd);
+    if (actual_size != size) return error.BadManifest;
+
+    const bytes = try std.posix.mmap(
+        null,
+        @intCast(size),
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE },
+        fd,
+        0,
+    );
+    std.log.info("mapped RAM from file backing fd: size={d} mode=MAP_PRIVATE", .{size});
+    return .{ .bytes = bytes, .file_backed = true };
+}
+
+fn fileSize(fd: std.c.fd_t) !u64 {
+    const cur = std.c.lseek(fd, 0, std.c.SEEK.CUR);
+    if (cur < 0) return error.IoFailed;
+    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (end < 0) return error.IoFailed;
+    if (std.c.lseek(fd, cur, std.c.SEEK.SET) < 0) return error.IoFailed;
+    return @intCast(end);
+}
+
+fn materializeAllTransportQueues(pager: *lazy_ram.Pager, transports: []mmio.Transport) !void {
+    for (transports) |*transport| {
+        try materializeTransportQueues(pager, transport);
+    }
+}
+
+fn materializeTransportQueues(pager: *lazy_ram.Pager, transport: *const mmio.Transport) !void {
+    for (transport.queues[0..transport.dev.queue_count]) |queue| {
+        try pager.materializeVirtQueue(queue);
+    }
+}
+
+fn maybeMaterializeTransportQueues(pager: ?*lazy_ram.Pager, transport: *const mmio.Transport) !void {
+    if (pager) |p| try materializeTransportQueues(p, transport);
 }
 
 const SnapshotPlatform = struct {
@@ -305,7 +505,7 @@ fn takeSnapshot(
     const machine = try snapshot.captureMachine(arena, vcpu);
     const devices = try captureTransports(arena, transports);
     const gen_state = try gen_dev.capture(arena);
-    const memory = try spore.saveMemory(arena, dir, ram_bytes);
+    const memory = try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
     try spore.saveManifest(arena, dir, .{
         .platform = .{
             .cpu_profile = board.cpu_profile,
@@ -447,6 +647,7 @@ fn handleMmio(
     transports: []mmio.Transport,
     gen_dev: *generation.Device,
     ram: guestmem.GuestRam,
+    lazy_pager: ?*lazy_ram.Pager,
     gic_windows: GicWindows,
 ) !void {
     const syndrome = exit.exception.syndrome;
@@ -529,6 +730,7 @@ fn handleMmio(
             if (srt < 31) {
                 try hvf.check(hvf.hv_vcpu_get_reg(vcpu, @enumFromInt(@as(u32, srt)), &value), "mmio read xt");
             }
+            if (offset == 0x050) try maybeMaterializeTransportQueues(lazy_pager, t);
             const raised = t.write(offset, @truncate(value), ram);
             if (raised) {
                 try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(@intCast(idx)), true), "raise spi");
