@@ -15,7 +15,9 @@ stage the bundle in S3, then unpack and resume it on one or more compatible KVM
 hosts. The script uploads tracked HEAD plus the current tracked/staged diff to
 S3 so it can validate local changes before they are committed without copying
 stray untracked files. Destinations fetch directly from S3; metrics report that
-direct-origin baseline before cache or peer fan-out layers are added.
+direct-origin baseline before cache or peer fan-out layers are added. Pass
+`--cache-dir` and `--dest-repeat N` to prove repeated restores on one host can
+reuse a host-local bundle cache without refetching from S3.
 
 Options:
   --region REGION             AWS region for SSM and S3
@@ -26,6 +28,8 @@ Options:
   --mem-mib N                 guest memory size (default: 512)
   --snapshot-after-ms N       capture delay before snapshot (default: 3000)
   --resume-seconds N          seconds to let resumed VM tick (default: 5)
+  --dest-repeat N             restore each destination N times (default: 1)
+  --cache-dir DIR             remote host-local bundle cache directory
   --ssm-timeout-seconds N     per-host SSM command timeout (default: 1800)
   --run-id ID                 stable run ID (default: UTC timestamp + uuid)
   --keep-remote               leave remote work directories in /tmp
@@ -77,6 +81,8 @@ prefix="sporevm/remote-bundle-smoke"
 mem_mib="512"
 snapshot_after_ms="3000"
 resume_seconds="5"
+dest_repeat="1"
+cache_dir=""
 ssm_timeout_seconds="1800"
 run_id=""
 keep_remote=0
@@ -123,6 +129,16 @@ while (($#)); do
       resume_seconds="$2"
       shift 2
       ;;
+    --dest-repeat)
+      need_value "$1" "${2-}"
+      dest_repeat="$2"
+      shift 2
+      ;;
+    --cache-dir)
+      need_value "$1" "${2-}"
+      cache_dir="$2"
+      shift 2
+      ;;
     --ssm-timeout-seconds)
       need_value "$1" "${2-}"
       ssm_timeout_seconds="$2"
@@ -151,11 +167,19 @@ done
 [[ -n "${source_instance}" ]] || die "--source-instance is required"
 (( ${#dest_instances[@]} > 0 )) || die "at least one --dest-instance is required"
 [[ -n "${bucket}" ]] || die "--bucket is required"
+for i in "${!dest_instances[@]}"; do
+  for j in "${!dest_instances[@]}"; do
+    if (( j > i )) && [[ "${dest_instances[$i]}" == "${dest_instances[$j]}" ]]; then
+      die "duplicate --dest-instance ${dest_instances[$i]}; use --dest-repeat for repeated restores on one host"
+    fi
+  done
+done
 
 for pair in \
   "mem-mib:${mem_mib}" \
   "snapshot-after-ms:${snapshot_after_ms}" \
   "resume-seconds:${resume_seconds}" \
+  "dest-repeat:${dest_repeat}" \
   "ssm-timeout-seconds:${ssm_timeout_seconds}"
 do
   name="${pair%%:*}"
@@ -183,6 +207,8 @@ q_run_prefix="$(shell_quote "${run_prefix}")"
 q_mem_mib="$(shell_quote "${mem_mib}")"
 q_snapshot_after_ms="$(shell_quote "${snapshot_after_ms}")"
 q_resume_seconds="$(shell_quote "${resume_seconds}")"
+q_dest_repeat="$(shell_quote "${dest_repeat}")"
+q_cache_dir="$(shell_quote "${cache_dir}")"
 q_keep_remote="$(shell_quote "${keep_remote}")"
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-remote-bundle.XXXXXX")"
@@ -211,6 +237,7 @@ export XDG_STATE_HOME="\${XDG_STATE_HOME:-\${HOME}/.local/state}"
 mkdir -p "\${XDG_CACHE_HOME}" "\${XDG_DATA_HOME}" "\${XDG_STATE_HOME}"
 command -v git >/dev/null 2>&1 || { echo "git is required" >&2; exit 1; }
 command -v tar >/dev/null 2>&1 || { echo "tar is required" >&2; exit 1; }
+command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum is required" >&2; exit 1; }
 
 region=${q_region}
 bucket=${q_bucket}
@@ -245,8 +272,11 @@ zig-out/bin/spore pack "\${workdir}/spore" --out "\${workdir}/spore.bundle"
 
 bundle_bytes="\$(du -sb "\${workdir}/spore.bundle" | awk '{print \$1}')"
 unique_chunk_bytes="\$(du -sb "\${workdir}/spore.bundle/chunkpacks/000000.pack" | awk '{print \$1}')"
+bundle_key="\$(cd "\${workdir}/spore.bundle" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print \$1}')"
 packed_chunks="\$(find "\${workdir}/spore.bundle/chunkpacks" -type f | wc -l | tr -d ' ')"
 aws s3 cp "\${workdir}/spore.bundle" "s3://\${bucket}/\${run_prefix}/spore.bundle/" --recursive --region "\${region}" --only-show-errors
+printf '%s\n' "\${bundle_key}" >"\${workdir}/bundle-key.txt"
+aws s3 cp "\${workdir}/bundle-key.txt" "s3://\${bucket}/\${run_prefix}/bundle-key.txt" --region "\${region}" --only-show-errors
 cat >"\${workdir}/source-result.json" <<JSON
 {
   "role": "source",
@@ -254,6 +284,7 @@ cat >"\${workdir}/source-result.json" <<JSON
   "workdir": "\${workdir}",
   "bundle_bytes": \${bundle_bytes},
   "unique_chunk_bytes": \${unique_chunk_bytes},
+  "bundle_key": "\${bundle_key}",
   "pack_files": \${packed_chunks},
   "bundle_s3_uri": "s3://\${bucket}/\${run_prefix}/spore.bundle/"
 }
@@ -282,17 +313,19 @@ region=${q_region}
 bucket=${q_bucket}
 run_prefix=${q_run_prefix}
 resume_seconds=${q_resume_seconds}
+dest_repeat=${q_dest_repeat}
+cache_dir=${q_cache_dir}
 keep_remote=${q_keep_remote}
 dest_instance="\${SPOREVM_DEST_INSTANCE:?SPOREVM_DEST_INSTANCE is required}"
 safe_dest="\$(printf '%s' "\${dest_instance}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 workdir="/tmp/sporevm-remote-bundle-dest-${run_id}-\${safe_dest}"
 
 rm -rf "\${workdir}"
-mkdir -p "\${workdir}/repo" "\${workdir}/spore.bundle"
+mkdir -p "\${workdir}/repo"
 aws s3 cp "s3://\${bucket}/\${run_prefix}/source.tar.gz" "\${workdir}/source.tar.gz" --region "\${region}" --only-show-errors
 aws s3 cp "s3://\${bucket}/\${run_prefix}/source.patch" "\${workdir}/source.patch" --region "\${region}" --only-show-errors
-aws s3 cp "s3://\${bucket}/\${run_prefix}/spore.bundle/" "\${workdir}/spore.bundle" --recursive --region "\${region}" --only-show-errors
-bundle_bytes="\$(du -sb "\${workdir}/spore.bundle" | awk '{print \$1}')"
+aws s3 cp "s3://\${bucket}/\${run_prefix}/bundle-key.txt" "\${workdir}/bundle-key.txt" --region "\${region}" --only-show-errors
+bundle_key="\$(tr -d '\n' <"\${workdir}/bundle-key.txt")"
 tar -xzf "\${workdir}/source.tar.gz" -C "\${workdir}/repo"
 cd "\${workdir}/repo"
 if [[ -s "\${workdir}/source.patch" ]]; then
@@ -303,22 +336,98 @@ export MISE_TRUSTED_CONFIG_PATHS="\${PWD}/mise.toml"
 mise install
 mise exec -- zig build
 mise exec -- zig build kvm-boot
-zig-out/bin/spore unpack "\${workdir}/spore.bundle" --out "\${workdir}/spore.unpacked"
-scripts/smoke-restore-leg.sh resume \
-  --backend kvm \
-  --spore-dir "\${workdir}/spore.unpacked" \
-  --resume-seconds "\${resume_seconds}" \
-  --kvm-lazy-ram
 
-unpacked_chunks="\$(find "\${workdir}/spore.unpacked/chunks" -type f | wc -l | tr -d ' ')"
+materialize_bundle() {
+  local out_dir="\$1"
+  local cache_hit_var="\$2"
+  local origin_bytes_var="\$3"
+
+  mkdir -p "\${out_dir}"
+  if [[ -z "\${cache_dir}" ]]; then
+    aws s3 cp "s3://\${bucket}/\${run_prefix}/spore.bundle/" "\${out_dir}" --recursive --region "\${region}" --only-show-errors
+    local direct_bytes
+    direct_bytes="\$(du -sb "\${out_dir}" | awk '{print \$1}')"
+    printf -v "\${cache_hit_var}" '%s' false
+    printf -v "\${origin_bytes_var}" '%s' "\${direct_bytes}"
+    return
+  fi
+
+  local cache_bundle_dir="\${cache_dir}/\${bundle_key}/spore.bundle"
+  local cache_complete="\${cache_dir}/\${bundle_key}/.complete"
+  if [[ -f "\${cache_complete}" ]]; then
+    cp -R "\${cache_bundle_dir}/." "\${out_dir}/"
+    printf -v "\${cache_hit_var}" '%s' true
+    printf -v "\${origin_bytes_var}" '%s' 0
+    return
+  fi
+
+  local cache_tmp="\${cache_dir}/.tmp-\${bundle_key}-\${safe_dest}-\$\$"
+  rm -rf "\${cache_tmp}"
+  mkdir -p "\${cache_tmp}/spore.bundle"
+  aws s3 cp "s3://\${bucket}/\${run_prefix}/spore.bundle/" "\${cache_tmp}/spore.bundle" --recursive --region "\${region}" --only-show-errors
+  local fetched_bytes
+  fetched_bytes="\$(du -sb "\${cache_tmp}/spore.bundle" | awk '{print \$1}')"
+  mkdir -p "\${cache_dir}/\${bundle_key}"
+  rm -rf "\${cache_bundle_dir}"
+  mv "\${cache_tmp}/spore.bundle" "\${cache_bundle_dir}"
+  : >"\${cache_complete}"
+  rm -rf "\${cache_tmp}"
+  cp -R "\${cache_bundle_dir}/." "\${out_dir}/"
+  printf -v "\${cache_hit_var}" '%s' false
+  printf -v "\${origin_bytes_var}" '%s' "\${fetched_bytes}"
+}
+
+if [[ -n "\${cache_dir}" ]]; then
+  mkdir -p "\${cache_dir}"
+fi
+
+total_origin_bytes=0
+cache_hits=0
+cache_misses=0
+local_bundle_bytes=0
+unpacked_chunks=0
+iteration_json=""
+for iteration in \$(seq 1 "\${dest_repeat}"); do
+  iter_dir="\${workdir}/resume-\${iteration}"
+  bundle_dir="\${iter_dir}/spore.bundle"
+  unpacked_dir="\${iter_dir}/spore.unpacked"
+  materialize_bundle "\${bundle_dir}" cache_hit origin_bytes
+  if [[ "\${cache_hit}" == "true" ]]; then
+    cache_hits=\$((cache_hits + 1))
+  else
+    cache_misses=\$((cache_misses + 1))
+  fi
+  total_origin_bytes=\$((total_origin_bytes + origin_bytes))
+  local_bundle_bytes="\$(du -sb "\${bundle_dir}" | awk '{print \$1}')"
+  zig-out/bin/spore unpack "\${bundle_dir}" --out "\${unpacked_dir}"
+  scripts/smoke-restore-leg.sh resume \
+    --backend kvm \
+    --spore-dir "\${unpacked_dir}" \
+    --resume-seconds "\${resume_seconds}" \
+    --kvm-lazy-ram
+  unpacked_chunks="\$(find "\${unpacked_dir}/chunks" -type f | wc -l | tr -d ' ')"
+  if [[ -n "\${iteration_json}" ]]; then
+    iteration_json="\${iteration_json},"
+  fi
+  iteration_json="\${iteration_json}{\"iteration\":\${iteration},\"cache_hit\":\${cache_hit},\"origin_downloaded_bundle_bytes\":\${origin_bytes},\"local_bundle_bytes\":\${local_bundle_bytes},\"unpacked_chunks\":\${unpacked_chunks}}"
+done
+
 cat >"\${workdir}/dest-result.json" <<JSON
 {
   "role": "dest",
   "instance_id": "\${dest_instance}",
   "workdir": "\${workdir}",
-  "downloaded_bundle_bytes": \${bundle_bytes},
+  "downloaded_bundle_bytes": \${total_origin_bytes},
+  "origin_downloaded_bundle_bytes": \${total_origin_bytes},
+  "local_bundle_bytes": \${local_bundle_bytes},
+  "bundle_key": "\${bundle_key}",
+  "cache_enabled": $(if [[ -n "${cache_dir}" ]]; then printf true; else printf false; fi),
+  "cache_hits": \${cache_hits},
+  "cache_misses": \${cache_misses},
+  "resume_count": \${dest_repeat},
   "unpacked_chunks": \${unpacked_chunks},
-  "resume_mode": "kvm-lazy-ram"
+  "resume_mode": "kvm-lazy-ram",
+  "iterations": [\${iteration_json}]
 }
 JSON
 aws s3 cp "\${workdir}/dest-result.json" "s3://\${bucket}/\${run_prefix}/dest-results/\${safe_dest}.json" --region "\${region}" --only-show-errors
@@ -459,6 +568,10 @@ for path in dest_paths:
 bundle_bytes = int(source["bundle_bytes"])
 unique_chunk_bytes = int(source["unique_chunk_bytes"])
 total_destination_download_bytes = sum(int(d["downloaded_bundle_bytes"]) for d in dests)
+total_resume_count = sum(int(d.get("resume_count", 1)) for d in dests)
+total_cache_hits = sum(int(d.get("cache_hits", 0)) for d in dests)
+total_cache_misses = sum(int(d.get("cache_misses", 0)) for d in dests)
+cache_enabled = any(bool(d.get("cache_enabled", False)) for d in dests)
 
 def ratio(numerator, denominator):
     if denominator == 0:
@@ -470,13 +583,18 @@ json.dump({
     "s3_uri": s3_uri,
     "source_instance": source["instance_id"],
     "destination_count": len(dests),
+    "destination_resume_count": total_resume_count,
     "destination_instances": [d["instance_id"] for d in dests],
     "bundle_bytes": bundle_bytes,
     "unique_chunk_bytes": unique_chunk_bytes,
+    "bundle_key": source["bundle_key"],
     "total_destination_download_bytes": total_destination_download_bytes,
+    "total_cache_hits": total_cache_hits,
+    "total_cache_misses": total_cache_misses,
     "origin_multiplier_vs_bundle": ratio(total_destination_download_bytes, bundle_bytes),
     "origin_multiplier_vs_unique_chunks": ratio(total_destination_download_bytes, unique_chunk_bytes),
-    "origin_mode": "direct-s3-per-destination",
+    "origin_multiplier_vs_resume_bundle": ratio(total_destination_download_bytes, bundle_bytes * total_resume_count),
+    "origin_mode": "host-local-bundle-cache" if cache_enabled else "direct-s3-per-destination",
     "destinations": dests,
 }, sys.stdout, indent=2)
 print()

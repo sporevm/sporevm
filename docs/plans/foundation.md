@@ -384,8 +384,14 @@ in `ap-southeast-2` packed 14 non-zero chunks from a 512MiB ticker spore into a
 29,382,174-byte bundle, then resumed on the second host with KVM lazy RAM
 reporting `ttfi_ms=5`, `ttuw_ms=1222`, `lazy_faults=9`, and
 `lazy_unique_chunks=9`. This proves the bundle can leave a source host and boot
-on a compatible destination; it is not yet the final fan-out data plane or
-origin-egress efficiency proof.
+on a compatible destination. The follow-up cache-backed run restored the same
+bundle twice on each of two hosts with `--cache-dir` and `--dest-repeat 2`:
+each host fetched the 29,382,174-byte bundle from S3 once, hit its local cache
+for the second restore, and reported `total_cache_hits=2`,
+`total_cache_misses=2`, and `origin_multiplier_vs_resume_bundle=0.5` across
+four resumes. That proves host-local cache reuse for repeated same-host
+restores; peer/fleet distribution is still required before the final fan-out
+data plane can claim low origin egress at large scale.
 
 ## Delivery Strategy
 
@@ -486,9 +492,10 @@ fan-out.
 
 ### Slice 6: Identical-host fan-out distribution
 
-Status: in progress. Local chunkpack bundles and the first two-host S3/SSM
-remote restore smoke have landed; cache/peer fan-out and measured origin-egress
-efficiency remain.
+Status: in progress. Local chunkpack bundles, the first two-host S3/SSM remote
+restore smoke, and a host-local cache-backed repeat restore smoke have landed;
+peer/fleet fan-out and measured origin-egress efficiency at larger host counts
+remain.
 
 Start with a local bundle/chunkpack format, then add distribution adapters.
 `spore pack` writes a portable bundle containing a manifest with local RAM
@@ -500,9 +507,12 @@ and direct-registry fan-out assumptions while the pack shape is still changing.
 
 Later Slice 6 work adds storage and fan-out backends around the same bundle
 primitive: OCI or object storage as a durable publication boundary, a
-`spore daemon` local CAS/cache, and peer or Dragonfly/Nydus-style distribution
-so N restores cost O(log N) origin work rather than N full downloads. Scale
-tests at 10 → 100 → 1,000 identical hosts happen before claiming 10,000.
+`spore daemon` local CAS/cache, and peer or cache-hierarchy distribution so N
+restores cost a small multiple of the unique chunks rather than N full origin
+downloads. The current script can prove per-host cache reuse with
+`--cache-dir` and `--dest-repeat`; it does not yet reduce first fetches across
+different hosts. Scale tests at 10 → 100 → 1,000 identical hosts happen before
+claiming 10,000.
 
 Done when: a multi-host fan-out demo restores one spore on every host in a
 test fleet with origin egress measured at a small multiple of the unique chunk
