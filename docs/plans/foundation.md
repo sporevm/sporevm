@@ -81,6 +81,9 @@ The enabling platform facts are confirmed:
 - Content-addressed chunked memory and disk with lazy, fault-driven restore.
 - Suspend/restore on the same host for both KVM and HVF, with cross-backend
   restore kept as a diagnostic portability track rather than a release gate.
+- Elastic same-host fork and lazy restore on both supported same-backend paths:
+  KVM→KVM for Linux CI hosts and HVF→HVF for Apple Silicon hosts. This is
+  product parity, not the optional cross-backend diagnostic portability track.
 - Always-on dirty tracking so suspend latency is independent of RAM size.
 - Chunk distribution that survives 10,000 concurrent restores without 10,000
   origin fetches.
@@ -365,8 +368,9 @@ restore reported ttfi_ms=512 and ttuw_ms=1565; 512MiB lazy restore reported
 ttfi_ms=2, ttuw_ms=1226, lazy_faults=9, and lazy_unique_chunks=9; 4GiB lazy
 restore reported ttfi_ms=3, ttuw_ms=1228, lazy_faults=10, and
 lazy_unique_chunks=10. Product monitor wiring, readahead, and clean cross-thread
-pager error propagation remain follow-up hardening work rather than blockers for
-the release-critical identical-host path.
+pager error propagation remain follow-up hardening work. HVF→HVF still needs
+the same class of same-host elastic RAM and lazy-restore proof; that is product
+parity for the macOS backend, not cross-backend portability.
 
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
@@ -474,9 +478,11 @@ do not mistake eager restore host capacity for fork architecture.
 
 ### Slice 5: Elastic same-host RAM and lazy restore
 
-Status: complete for the primary KVM same-host/fan-out proof. Product monitor
-wiring, readahead, clean pager error propagation, and HVF-equivalent elastic RAM
-remain follow-up hardening/portability work.
+Status: complete for the primary KVM same-host/fan-out proof; incomplete for
+supported-backend parity. Product monitor wiring, readahead, clean pager error
+propagation, and HVF→HVF elastic RAM/lazy restore remain. The HVF work is
+same-backend product parity for Apple Silicon hosts, not the optional KVM↔HVF
+diagnostic portability track.
 
 First land the identical-host hot fork path in incremental steps. The interim
 KVM step uses a local `ram.backing` file and trusted same-host opt-in to open a
@@ -496,10 +502,11 @@ Done when: 100 concurrent same-host forks of one 512MiB spore run distinct
 workloads with aggregate child PSS proportional to the resident parent backing
 plus dirty child working sets, not N × RAM; summed RSS is reported only as a
 diagnostic because it double-counts shared pages. Resume TTFI is independent of
-RAM size on the primary KVM host class, and the benchmark harness tracks it in
-CI (or a recorded manual run where CI hardware does not exist). HVF remains
-useful as a second implementation path, but does not block identical-host
-fan-out.
+RAM size on the primary KVM host class and on HVF→HVF once the macOS backend
+path lands, and the benchmark harness tracks both where CI hardware exists (or
+records manual runs where it does not). KVM proves the Linux CI economics first;
+HVF→HVF remains required backend parity, while KVM↔HVF cross-restore remains a
+separate diagnostic goal.
 
 ### Slice 6: Identical-host fan-out distribution
 
@@ -589,6 +596,10 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   Cross-backend portability remains useful for inspecting failed runs and
   detecting backend-private leaks in the state contract, but it must not pull
   effort away from identical-host fork, lazy restore, and distribution.
+- HVF→HVF elastic RAM is not part of the cross-backend portability nice-to-have.
+  It is same-backend product parity for Apple Silicon hosts. KVM can lead the
+  implementation because it is the CI release-critical host class, but the plan
+  should not describe HVF same-host memory mechanics as optional portability.
 - A 100-child eager-restore smoke mostly measures host RAM capacity. The
   architecture gate for high-concurrency same-host fan-out is elastic RAM:
   children must CoW-share the paused parent's backing and pay only for dirty
@@ -634,8 +645,10 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   gate for fork/fan-out on identical hosts.
 - Same-host fan-out uses explicit RAM-backing transfer and private CoW mappings
   before claiming high-concurrency memory efficiency. Linux starts with
-  `memfd`/file-backed RAM plus `SCM_RIGHTS`; HVF support may follow with a
-  backend-specific equivalent, but KVM proves the release-critical economics.
+  `memfd`/file-backed RAM plus `SCM_RIGHTS`; HVF needs a backend-specific
+  HVF→HVF equivalent for Apple Silicon same-host parity. KVM proves the
+  release-critical Linux CI economics first, but HVF same-backend elasticity is
+  not classified as cross-backend portability.
 - MIT licensed from the first commit, but the repository stays private for
   now. The identical-host fork/fan-out demo is the natural moment to revisit
   going public.
