@@ -394,7 +394,15 @@ restores; peer/fleet distribution is still required before the final fan-out
 data plane can claim low origin egress at large scale. The bundle identity used
 for that cache path is now a product-level `bundle_digest` reported by both
 `spore pack` and `spore unpack`, so future daemons and cache layers do not need
-to reinvent script-local tree hashes.
+to reinvent script-local tree hashes. After east-west TCP was opened between
+the two dev hosts, the smoke gained a source-peer HTTP seed mode on the allowed
+20000-20100 port range. A two-host run with `--source-peer-ip`, `--cache-dir`,
+and `--dest-repeat 2` completed four restores with `total_destination_origin_bytes=0`,
+`total_destination_peer_bytes=58,777,600`, `total_cache_hits=2`,
+`total_cache_misses=2`, and `origin_multiplier_vs_resume_bundle=0.0`. The
+bundle is still published to S3 as the durable staging boundary, but
+destinations no longer need to fetch bundle bytes directly from it in this
+mode.
 
 ## Delivery Strategy
 
@@ -496,9 +504,10 @@ fan-out.
 ### Slice 6: Identical-host fan-out distribution
 
 Status: in progress. Local chunkpack bundles with canonical `bundle_digest`
-output, the first two-host S3/SSM remote restore smoke, and a host-local
-cache-backed repeat restore smoke have landed; peer/fleet fan-out and measured
-origin-egress efficiency at larger host counts remain.
+output, the first two-host S3/SSM remote restore smoke, a host-local
+cache-backed repeat restore smoke, and a source-peer HTTP seed proof have
+landed. Larger-host-count peer/fleet fan-out and measured origin-egress
+efficiency remain.
 
 Start with a local bundle/chunkpack format, then add distribution adapters.
 `spore pack` writes a portable bundle containing a manifest with local RAM
@@ -513,9 +522,10 @@ primitive: OCI or object storage as a durable publication boundary, a
 `spore daemon` local CAS/cache, and peer or cache-hierarchy distribution so N
 restores cost a small multiple of the unique chunks rather than N full origin
 downloads. The current script can prove per-host cache reuse with
-`--cache-dir` and `--dest-repeat`; it does not yet reduce first fetches across
-different hosts. Scale tests at 10 → 100 → 1,000 identical hosts happen before
-claiming 10,000.
+`--cache-dir` and `--dest-repeat`, and it can prove first-fetch reduction from
+the durable origin with source-peer HTTP seeding via `--source-peer-ip`. That is
+still a single-seed proof, not the final peer graph or cache hierarchy. Scale
+tests at 10 → 100 → 1,000 identical hosts happen before claiming 10,000.
 
 Done when: a multi-host fan-out demo restores one spore on every host in a
 test fleet with origin egress measured at a small multiple of the unique chunk
