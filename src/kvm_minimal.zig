@@ -17,7 +17,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
-    try sporevm.run.writeJsonResult(stdout, result);
+    try sporevm.run.writeJsonResult(arena, stdout, result);
     try stdout.flush();
     const exit_code = result.processExitCode();
     if (exit_code != 0) std.process.exit(exit_code);

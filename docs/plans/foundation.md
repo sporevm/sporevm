@@ -709,8 +709,9 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   likely publication adapter, but not the hot 10,000-host fan-out data plane by
   itself.
 - The first `spore run` primitive is a local one-shot boot/exec/status command
-  over virtio-vsock with explicit kernel and initrd inputs. Monitor lifecycle,
-  stdin/stdout streaming, rootfs policy, and bundle-aware run semantics remain
+  over virtio-vsock with explicit kernel and initrd inputs. It now captures a
+  bounded stdout/stderr sample in the final exit frame. Monitor lifecycle,
+  stdin, streaming output, rootfs policy, and bundle-aware run semantics remain
   later work.
 - Control integration is newline-delimited JSON over a unix socket, mirroring
   the proven cleanroom helper pattern.

@@ -45,6 +45,7 @@ cat >"${workdir}/agent.c" <<'EOF'
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -67,6 +68,8 @@ cat >"${workdir}/agent.c" <<'EOF'
 
 #define MAX_ARGC 16
 #define MAX_ARG_LEN 256
+#define MAX_OUTPUT 16384
+#define MAX_OUTPUT_B64 (((MAX_OUTPUT + 2) / 3) * 4)
 
 struct sockaddr_vm {
   sa_family_t svm_family;
@@ -82,6 +85,15 @@ static int64_t t_first_accept = 0;
 static int64_t t_first_request_decode = 0;
 static int64_t t_command_start = 0;
 static int64_t t_command_exit = 0;
+
+struct output_capture {
+  unsigned char stdout_buf[MAX_OUTPUT];
+  unsigned char stderr_buf[MAX_OUTPUT];
+  size_t stdout_len;
+  size_t stderr_len;
+  int stdout_truncated;
+  int stderr_truncated;
+};
 
 static int64_t now_ms(void) {
   struct timespec ts;
@@ -170,8 +182,104 @@ static void write_all(int fd, const char *buf, size_t len) {
   }
 }
 
-static void send_exit(int fd, int exit_code, const char *error) {
-  char frame[1024];
+static void capture_append(unsigned char *dst, size_t *dst_len, int *truncated, const char *src, size_t src_len) {
+  size_t copied = 0;
+  if (*dst_len < MAX_OUTPUT) {
+    size_t n = MAX_OUTPUT - *dst_len;
+    if (n > src_len) n = src_len;
+    if (n > 0) {
+      memcpy(dst + *dst_len, src, n);
+      *dst_len += n;
+      copied = n;
+    }
+  }
+  if (copied < src_len) *truncated = 1;
+}
+
+static void capture_stream(struct output_capture *capture, int stream, const char *buf, size_t len) {
+  if (stream == 1) {
+    capture_append(capture->stdout_buf, &capture->stdout_len, &capture->stdout_truncated, buf, len);
+  } else {
+    capture_append(capture->stderr_buf, &capture->stderr_len, &capture->stderr_truncated, buf, len);
+  }
+}
+
+static int drain_pipe(int fd, struct output_capture *capture, int stream) {
+  char buf[4096];
+  for (;;) {
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n > 0) {
+      capture_stream(capture, stream, buf, (size_t)n);
+      continue;
+    }
+    if (n == 0) return 0;
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+    return 0;
+  }
+}
+
+static int wait_child(pid_t pid, int *status, int block) {
+  for (;;) {
+    pid_t rc = waitpid(pid, status, block ? 0 : WNOHANG);
+    if (rc == pid) return 1;
+    if (rc == 0) return 0;
+    if (errno == EINTR) continue;
+    return -1;
+  }
+}
+
+static int set_nonblock(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return -1;
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static void finish_pipe(int fd, int *open, struct output_capture *capture, int stream) {
+  if (!*open) return;
+  (void)drain_pipe(fd, capture, stream);
+  close(fd);
+  *open = 0;
+}
+
+/*
+ * Do not wait for pipe EOF after the direct command exits; inherited fds from
+ * daemonized children must not block the one-shot exec result.
+ */
+static void finish_output_pipes(int stdout_fd, int *stdout_open, int stderr_fd, int *stderr_open, struct output_capture *capture) {
+  finish_pipe(stdout_fd, stdout_open, capture, 1);
+  finish_pipe(stderr_fd, stderr_open, capture, 2);
+}
+
+static void base64_encode(const unsigned char *src, size_t len, char *out, size_t cap) {
+  static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  size_t i = 0;
+  size_t j = 0;
+  while (i < len && j + 4 < cap) {
+    size_t rem = len - i;
+    uint32_t a = src[i++];
+    uint32_t b = rem > 1 ? src[i++] : 0;
+    uint32_t c = rem > 2 ? src[i++] : 0;
+    out[j++] = table[(a >> 2) & 0x3f];
+    out[j++] = table[((a & 0x03) << 4) | ((b >> 4) & 0x0f)];
+    out[j++] = rem > 1 ? table[((b & 0x0f) << 2) | ((c >> 6) & 0x03)] : '=';
+    out[j++] = rem > 2 ? table[c & 0x3f] : '=';
+  }
+  if (j < cap) out[j] = '\0';
+}
+
+static void send_exit(int fd, int exit_code, const char *error, const struct output_capture *capture) {
+  char stdout_b64[MAX_OUTPUT_B64 + 1];
+  char stderr_b64[MAX_OUTPUT_B64 + 1];
+  if (capture != NULL) {
+    base64_encode(capture->stdout_buf, capture->stdout_len, stdout_b64, sizeof(stdout_b64));
+    base64_encode(capture->stderr_buf, capture->stderr_len, stderr_b64, sizeof(stderr_b64));
+  } else {
+    stdout_b64[0] = '\0';
+    stderr_b64[0] = '\0';
+  }
+
+  char frame[2048 + (MAX_OUTPUT_B64 * 2)];
   const char *error_json = "null";
   if (error != NULL) {
     if (strcmp(error, "bad request") == 0) {
@@ -181,7 +289,12 @@ static void send_exit(int fd, int exit_code, const char *error) {
     }
   }
   int n = snprintf(frame, sizeof(frame),
-    "{\"type\":\"exit\",\"exit_code\":%d,\"error\":%s,\"guest_timing_ms\":{"
+    "{\"type\":\"exit\",\"exit_code\":%d,\"error\":%s,"
+    "\"stdout_b64\":\"%s\","
+    "\"stderr_b64\":\"%s\","
+    "\"stdout_truncated\":%s,"
+    "\"stderr_truncated\":%s,"
+    "\"guest_timing_ms\":{"
     "\"guest_init_start\":%lld,"
     "\"guest_agent_listen_ready\":%lld,"
     "\"guest_agent_first_accept\":%lld,"
@@ -190,13 +303,21 @@ static void send_exit(int fd, int exit_code, const char *error) {
     "\"guest_command_exit\":%lld}}\n",
     exit_code,
     error_json,
+    stdout_b64,
+    stderr_b64,
+    capture != NULL && capture->stdout_truncated ? "true" : "false",
+    capture != NULL && capture->stderr_truncated ? "true" : "false",
     (long long)t_init_start,
     (long long)t_listen_ready,
     (long long)t_first_accept,
     (long long)t_first_request_decode,
     (long long)t_command_start,
     (long long)t_command_exit);
-  if (n > 0) write_all(fd, frame, (size_t)n);
+  if (n > 0) {
+    size_t len = (size_t)n;
+    if (len >= sizeof(frame)) len = sizeof(frame) - 1;
+    write_all(fd, frame, len);
+  }
 }
 
 static const char *skip_ws(const char *p) {
@@ -273,26 +394,117 @@ static int parse_argv(const char *req, char storage[MAX_ARGC][MAX_ARG_LEN], char
   }
 }
 
-static int run_argv(char *const argv[]) {
+static int run_argv(char *const argv[], struct output_capture *capture) {
   t_command_start = now_ms();
+  int stdout_pipe[2];
+  int stderr_pipe[2];
+  if (pipe2(stdout_pipe, O_CLOEXEC) != 0) {
+    t_command_exit = now_ms();
+    return 127;
+  }
+  if (pipe2(stderr_pipe, O_CLOEXEC) != 0) {
+    close(stdout_pipe[0]);
+    close(stdout_pipe[1]);
+    t_command_exit = now_ms();
+    return 127;
+  }
+  if (set_nonblock(stdout_pipe[0]) != 0 || set_nonblock(stderr_pipe[0]) != 0) {
+    close(stdout_pipe[0]);
+    close(stdout_pipe[1]);
+    close(stderr_pipe[0]);
+    close(stderr_pipe[1]);
+    t_command_exit = now_ms();
+    return 127;
+  }
+
   pid_t pid = fork();
   if (pid == 0) {
+    close(stdout_pipe[0]);
+    close(stderr_pipe[0]);
+    if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0) _exit(127);
+    if (dup2(stderr_pipe[1], STDERR_FILENO) < 0) _exit(127);
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
     char *const empty_env[] = { NULL };
     execve(argv[0], argv, empty_env);
     _exit(127);
   }
+  close(stdout_pipe[1]);
+  close(stderr_pipe[1]);
   if (pid < 0) {
+    close(stdout_pipe[0]);
+    close(stderr_pipe[0]);
     t_command_exit = now_ms();
     return 127;
   }
+
   int status = 0;
-  while (waitpid(pid, &status, 0) < 0) {
-    if (errno != EINTR) {
-      t_command_exit = now_ms();
-      return 127;
+  int stdout_open = 1;
+  int stderr_open = 1;
+  int child_done = 0;
+  int wait_failed = 0;
+
+  while (stdout_open || stderr_open || !child_done) {
+    if (stdout_open || stderr_open) {
+      struct pollfd fds[2];
+      int streams[2];
+      nfds_t nfds = 0;
+      if (stdout_open) {
+        fds[nfds].fd = stdout_pipe[0];
+        fds[nfds].events = POLLIN | POLLHUP | POLLERR;
+        fds[nfds].revents = 0;
+        streams[nfds++] = 1;
+      }
+      if (stderr_open) {
+        fds[nfds].fd = stderr_pipe[0];
+        fds[nfds].events = POLLIN | POLLHUP | POLLERR;
+        fds[nfds].revents = 0;
+        streams[nfds++] = 2;
+      }
+
+      int pr = poll(fds, nfds, 100);
+      if (pr > 0) {
+        for (nfds_t i = 0; i < nfds; i++) {
+          if ((fds[i].revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
+          int still_open = drain_pipe(fds[i].fd, capture, streams[i]);
+          if (!still_open) {
+            if (streams[i] == 1) {
+              close(stdout_pipe[0]);
+              stdout_open = 0;
+            } else {
+              close(stderr_pipe[0]);
+              stderr_open = 0;
+            }
+          }
+        }
+      } else if (pr < 0 && errno != EINTR) {
+        if (stdout_open) close(stdout_pipe[0]);
+        if (stderr_open) close(stderr_pipe[0]);
+        stdout_open = 0;
+        stderr_open = 0;
+      }
+    } else if (!child_done) {
+      int wr = wait_child(pid, &status, 1);
+      child_done = 1;
+      if (wr < 0) wait_failed = 1;
+      finish_output_pipes(stdout_pipe[0], &stdout_open, stderr_pipe[0], &stderr_open, capture);
+    }
+
+    if (!child_done) {
+      int wr = wait_child(pid, &status, 0);
+      if (wr == 1) {
+        child_done = 1;
+        finish_output_pipes(stdout_pipe[0], &stdout_open, stderr_pipe[0], &stderr_open, capture);
+      } else if (wr < 0) {
+        child_done = 1;
+        wait_failed = 1;
+        finish_output_pipes(stdout_pipe[0], &stdout_open, stderr_pipe[0], &stderr_open, capture);
+      }
     }
   }
+
   t_command_exit = now_ms();
+  if (wait_failed) return 127;
   if (WIFEXITED(status)) return WEXITSTATUS(status);
   if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
   return 1;
@@ -331,13 +543,15 @@ int main(void) {
     if (parse_argv(req, arg_storage, argv) <= 0) {
       t_command_start = now_ms();
       t_command_exit = t_command_start;
-      send_exit(conn, 2, "bad request");
+      send_exit(conn, 2, "bad request", NULL);
       close(conn);
       continue;
     }
 
-    int code = run_argv(argv);
-    send_exit(conn, code, NULL);
+    struct output_capture capture;
+    memset(&capture, 0, sizeof(capture));
+    int code = run_argv(argv, &capture);
+    send_exit(conn, code, NULL, &capture);
     close(conn);
   }
 }
@@ -351,10 +565,21 @@ cat >"${workdir}/false.c" <<'EOF'
 int main(void) { return 1; }
 EOF
 
+cat >"${workdir}/writeout.c" <<'EOF'
+#include <unistd.h>
+
+int main(void) {
+  write(1, "spore stdout\n", 13);
+  write(2, "spore stderr\n", 13);
+  return 0;
+}
+EOF
+
 "${cc_cmd[@]}" -static -Os -s "${workdir}/agent.c" -o "${workdir}/root/init"
 "${cc_cmd[@]}" -static -Os -s "${workdir}/true.c" -o "${workdir}/root/bin/true"
 "${cc_cmd[@]}" -static -Os -s "${workdir}/false.c" -o "${workdir}/root/bin/false"
-chmod 0755 "${workdir}/root/init" "${workdir}/root/bin/true" "${workdir}/root/bin/false"
+"${cc_cmd[@]}" -static -Os -s "${workdir}/writeout.c" -o "${workdir}/root/bin/writeout"
+chmod 0755 "${workdir}/root/init" "${workdir}/root/bin/true" "${workdir}/root/bin/false" "${workdir}/root/bin/writeout"
 chmod 1777 "${workdir}/root/tmp"
 
 mkdir -p "$(dirname "${out}")"

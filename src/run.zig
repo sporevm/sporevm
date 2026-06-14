@@ -17,6 +17,7 @@ const max_guest_argc = 16;
 const max_guest_arg_len = 255;
 const max_guest_request_len = 2047;
 const max_guest_port = 65535;
+const max_guest_output_bytes = 16 * 1024;
 
 pub const Backend = enum {
     auto,
@@ -61,6 +62,10 @@ pub const Result = struct {
     exit_code: i32,
     error_json: ?[]const u8,
     guest_timing_json: []const u8,
+    guest_stdout: []const u8,
+    guest_stderr: []const u8,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
     vcpus: u32,
     memory_mib: u64,
 
@@ -124,8 +129,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 
     const result = try execute(init, arena, opts);
     if (opts.emit_json) {
-        try writeJsonResult(stdout, result);
+        try writeJsonResult(arena, stdout, result);
         try stdout.flush();
+    } else {
+        try writeGuestOutput(init, stdout, result);
     }
     const code = result.processExitCode();
     if (code != 0) std.process.exit(code);
@@ -237,7 +244,11 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     return resultFromStream(allocator, backend, opts, &stream);
 }
 
-pub fn writeJsonResult(writer: *Io.Writer, result: Result) !void {
+pub fn writeJsonResult(allocator: std.mem.Allocator, writer: *Io.Writer, result: Result) !void {
+    const stdout_b64 = try base64Alloc(allocator, result.guest_stdout);
+    defer allocator.free(stdout_b64);
+    const stderr_b64 = try base64Alloc(allocator, result.guest_stderr);
+    defer allocator.free(stderr_b64);
     try writer.print(
         "{{\"backend\":\"{s}\",\"probe\":\"exec\",\"start_ms\":{d},\"vsock_connect_ms\":{d},\"exec_response_ms\":{d},\"probe_duration_ms\":{d},\"exit_code\":{d},\"error\":",
         .{ result.backend.name(), result.start_ms, result.vsock_connect_ms, result.exec_response_ms, result.probe_duration_ms, result.exit_code },
@@ -248,9 +259,42 @@ pub fn writeJsonResult(writer: *Io.Writer, result: Result) !void {
         try writer.writeAll("null");
     }
     try writer.print(
-        ",\"guest_timing_ms\":{s},\"vcpus\":{d},\"memory_mib\":{d}}}\n",
-        .{ result.guest_timing_json, result.vcpus, result.memory_mib },
+        ",\"stdout_b64\":\"{s}\",\"stderr_b64\":\"{s}\",\"stdout_truncated\":{},\"stderr_truncated\":{},\"guest_timing_ms\":{s},\"vcpus\":{d},\"memory_mib\":{d}}}\n",
+        .{
+            stdout_b64,
+            stderr_b64,
+            result.stdout_truncated,
+            result.stderr_truncated,
+            result.guest_timing_json,
+            result.vcpus,
+            result.memory_mib,
+        },
     );
+}
+
+fn writeGuestOutput(init: std.process.Init, stdout: *Io.Writer, result: Result) !void {
+    try stdout.writeAll(result.guest_stdout);
+    try stdout.flush();
+
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_file_writer: Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
+    const stderr = &stderr_file_writer.interface;
+    try stderr.writeAll(result.guest_stderr);
+    if (result.stdout_truncated) try writeTruncationNotice(stderr, result.guest_stderr.len > 0, "stdout");
+    if (result.stderr_truncated) try writeTruncationNotice(stderr, result.guest_stderr.len > 0 or result.stdout_truncated, "stderr");
+    try stderr.flush();
+}
+
+fn writeTruncationNotice(writer: *Io.Writer, already_wrote_stderr: bool, name: []const u8) !void {
+    if (already_wrote_stderr) try writer.writeAll("\n");
+    try writer.print("spore run: guest {s} truncated after {d} bytes\n", .{ name, max_guest_output_bytes });
+}
+
+fn base64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    const enc = std.base64.standard.Encoder;
+    const out = try allocator.alloc(u8, enc.calcSize(bytes.len));
+    _ = enc.encode(out, bytes);
+    return out;
 }
 
 pub var console_fd: std.c.fd_t = -1;
@@ -319,6 +363,10 @@ fn resultFromStream(allocator: std.mem.Allocator, backend: Backend, opts: Option
         .exit_code = frame.exit_code,
         .error_json = frame.error_json,
         .guest_timing_json = frame.guest_timing_json,
+        .guest_stdout = frame.guest_stdout,
+        .guest_stderr = frame.guest_stderr,
+        .stdout_truncated = frame.stdout_truncated,
+        .stderr_truncated = frame.stderr_truncated,
         .vcpus = opts.vcpus,
         .memory_mib = opts.memory_mib,
     };
@@ -390,6 +438,10 @@ const ExitFrame = struct {
     type: []const u8,
     exit_code: i64,
     @"error": ?[]const u8,
+    stdout_b64: ?[]const u8 = null,
+    stderr_b64: ?[]const u8 = null,
+    stdout_truncated: bool = false,
+    stderr_truncated: bool = false,
     guest_timing_ms: std.json.Value,
 };
 
@@ -397,10 +449,16 @@ const ParsedExitFrame = struct {
     exit_code: i32,
     error_json: ?[]const u8,
     guest_timing_json: []const u8,
+    guest_stdout: []const u8,
+    guest_stderr: []const u8,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
 
     fn deinit(self: ParsedExitFrame, allocator: std.mem.Allocator) void {
         if (self.error_json) |value| allocator.free(value);
         allocator.free(self.guest_timing_json);
+        allocator.free(self.guest_stdout);
+        allocator.free(self.guest_stderr);
     }
 };
 
@@ -423,12 +481,30 @@ fn parseExitFrame(allocator: std.mem.Allocator, output: []const u8) !ParsedExitF
     errdefer allocator.free(timing_json);
     const error_json = if (frame.@"error") |value| try std.json.Stringify.valueAlloc(allocator, value, .{}) else null;
     errdefer if (error_json) |value| allocator.free(value);
+    const guest_stdout = try decodeGuestOutput(allocator, frame.stdout_b64 orelse "");
+    errdefer allocator.free(guest_stdout);
+    const guest_stderr = try decodeGuestOutput(allocator, frame.stderr_b64 orelse "");
+    errdefer allocator.free(guest_stderr);
 
     return .{
         .exit_code = @intCast(frame.exit_code),
         .error_json = error_json,
         .guest_timing_json = timing_json,
+        .guest_stdout = guest_stdout,
+        .guest_stderr = guest_stderr,
+        .stdout_truncated = frame.stdout_truncated,
+        .stderr_truncated = frame.stderr_truncated,
     };
+}
+
+fn decodeGuestOutput(allocator: std.mem.Allocator, b64: []const u8) ![]const u8 {
+    const dec = std.base64.standard.Decoder;
+    const decoded_size = dec.calcSizeForSlice(b64) catch return error.BadRunExitFrame;
+    if (decoded_size > max_guest_output_bytes) return error.BadRunExitFrame;
+    const decoded = try allocator.alloc(u8, decoded_size);
+    errdefer allocator.free(decoded);
+    dec.decode(decoded, b64) catch return error.BadRunExitFrame;
+    return decoded;
 }
 
 fn printHarnessUsage(backend: Backend) void {
@@ -497,12 +573,16 @@ test "run harness parser shares common options" {
 
 test "run result parser extracts exit and timing" {
     const output =
-        "{\"type\":\"exit\",\"exit_code\":0,\"error\":null,\"guest_timing_ms\":{\"guest_init_start\":1,\"guest_command_exit\":9}}\n";
+        "{\"type\":\"exit\",\"exit_code\":0,\"error\":null,\"stdout_b64\":\"aGVsbG8K\",\"stderr_b64\":\"ZXJyCg==\",\"stdout_truncated\":false,\"stderr_truncated\":true,\"guest_timing_ms\":{\"guest_init_start\":1,\"guest_command_exit\":9}}\n";
     const frame = try parseExitFrame(std.testing.allocator, output);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(i32, 0), frame.exit_code);
     try std.testing.expectEqualStrings("{\"guest_init_start\":1,\"guest_command_exit\":9}", frame.guest_timing_json);
     try std.testing.expect(frame.error_json == null);
+    try std.testing.expectEqualStrings("hello\n", frame.guest_stdout);
+    try std.testing.expectEqualStrings("err\n", frame.guest_stderr);
+    try std.testing.expect(!frame.stdout_truncated);
+    try std.testing.expect(frame.stderr_truncated);
 }
 
 test "run result parser reads top-level exit code" {
@@ -526,6 +606,41 @@ test "run result parser rejects malformed timing value" {
         std.testing.allocator,
         "{\"type\":\"exit\",\"exit_code\":0,\"error\":null,\"guest_timing_ms\":\"not an object\"}\n",
     ));
+}
+
+test "run result parser rejects malformed output encoding" {
+    try std.testing.expectError(error.BadRunExitFrame, parseExitFrame(
+        std.testing.allocator,
+        "{\"type\":\"exit\",\"exit_code\":0,\"error\":null,\"stdout_b64\":\"not base64!\",\"stderr_b64\":\"\",\"guest_timing_ms\":{}}\n",
+    ));
+}
+
+test "run json result includes encoded output metadata" {
+    const allocator = std.testing.allocator;
+    var stdout: Io.Writer.Allocating = .init(allocator);
+    defer stdout.deinit();
+
+    try writeJsonResult(allocator, &stdout.writer, .{
+        .backend = .hvf,
+        .start_ms = 1,
+        .vsock_connect_ms = 2,
+        .exec_response_ms = 3,
+        .probe_duration_ms = 1,
+        .exit_code = 0,
+        .error_json = null,
+        .guest_timing_json = "{}",
+        .guest_stdout = "hello\n",
+        .guest_stderr = "err\n",
+        .stdout_truncated = false,
+        .stderr_truncated = true,
+        .vcpus = 1,
+        .memory_mib = 1024,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "\"stdout_b64\":\"aGVsbG8K\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "\"stderr_b64\":\"ZXJyCg==\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "\"stdout_truncated\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "\"stderr_truncated\":true") != null);
 }
 
 fn fuzzRunResultParsing(_: void, s: *std.testing.Smith) !void {

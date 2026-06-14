@@ -20,9 +20,10 @@ The target lifecycle property: no operation scales with RAM size.
 - **Resume** is bounded by the working set, not memory size, on either OS
 
 The product CLI shape is still landing. Today `spore run` can boot a
-throwaway VM and execute one argv request through the minimal vsock agent, and
-`spore fork` can mint child spores from an existing spore. Create, suspend,
-and resume are still exercised through the backend smoke harnesses. The
+throwaway VM, execute one argv request through the minimal vsock agent, and
+print bounded guest stdout/stderr. `spore fork` can mint child spores from an
+existing spore. Create, suspend, and resume are still exercised through the
+backend smoke harnesses. The
 end-state interface is:
 
 ```console
@@ -100,8 +101,13 @@ zig-out/bin/spore run \
   --backend hvf \
   --kernel "$(scripts/ensure-managed-kernel.sh initrd)" \
   --initrd /tmp/sporevm-minimal.cpio \
-  -- /bin/true
+  -- /bin/writeout
 ```
+
+The minimal agent captures up to 16 KiB each of command stdout and stderr. In
+normal mode those bytes are forwarded to the host streams and `spore run` exits
+with the guest command status. With `--json`, command output is reported as
+base64 fields alongside truncation metadata.
 
 For a lower-bound boot/exec probe comparable to Cleanroom's minimal
 `darwin-vz` benchmark, use the minimal benchmark wrapper. It builds a tiny
