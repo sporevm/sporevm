@@ -412,7 +412,14 @@ and `--dest-repeat 2` completed four restores with `total_destination_origin_byt
 `total_cache_misses=2`, and `origin_multiplier_vs_resume_bundle=0.0`. The
 bundle is still published to S3 as the durable staging boundary, but
 destinations no longer need to fetch bundle bytes directly from it in this
-mode.
+mode. The remote smoke now also hardens the negative path: each destination
+bit-flips a fetched chunkpack copy, asserts `spore unpack` rejects it, and
+records `corrupt_bundle_rejections` in the destination and aggregate metrics
+before the clean bundle is allowed to resume. A validation run over the two dev
+hosts with source-peer HTTP, `--cache-dir`, and `--dest-repeat 2` reported
+`total_destination_origin_bytes=0`, `total_cache_hits=1`,
+`total_cache_misses=1`, `total_corrupt_bundle_rejections=1`, and lazy KVM
+resume `ttfi_ms=1..2` on the destination.
 
 ## Delivery Strategy
 
@@ -517,9 +524,9 @@ separate diagnostic goal.
 
 Status: in progress. Local chunkpack bundles with canonical `bundle_digest`
 output, the first two-host S3/SSM remote restore smoke, a host-local
-cache-backed repeat restore smoke, and a source-peer HTTP seed proof have
-landed. Larger-host-count peer/fleet fan-out and measured origin-egress
-efficiency remain.
+cache-backed repeat restore smoke, a source-peer HTTP seed proof, and corrupted
+distributed-bundle rejection checks have landed. Larger-host-count peer/fleet
+fan-out and measured origin-egress efficiency remain.
 
 Start with a local bundle/chunkpack format, then add distribution adapters.
 `spore pack` writes a portable bundle containing a manifest with local RAM
@@ -535,9 +542,11 @@ primitive: OCI or object storage as a durable publication boundary, a
 restores cost a small multiple of the unique chunks rather than N full origin
 downloads. The current script can prove per-host cache reuse with
 `--cache-dir` and `--dest-repeat`, and it can prove first-fetch reduction from
-the durable origin with source-peer HTTP seeding via `--source-peer-ip`. That is
-still a single-seed proof, not the final peer graph or cache hierarchy. Scale
-tests at 10 → 100 → 1,000 identical hosts happen before claiming 10,000.
+the durable origin with source-peer HTTP seeding via `--source-peer-ip`; it also
+corrupts one fetched bundle copy per destination to keep peer/origin trust tied
+to chunk verification. That is still a single-seed proof, not the final peer
+graph or cache hierarchy. Scale tests at 10 → 100 → 1,000 identical hosts
+happen before claiming 10,000.
 
 Done when: a multi-host fan-out demo restores one spore on every host in a
 test fleet with origin egress measured at a small multiple of the unique chunk

@@ -18,7 +18,9 @@ stray untracked files. Destinations fetch directly from S3 by default; pass
 `--source-peer-ip IP` to have destinations fetch the bundle from a temporary
 HTTP seed on the source host instead. Pass `--cache-dir` and `--dest-repeat N`
 to prove repeated restores on one host can reuse a host-local bundle cache
-without refetching from S3 or the source peer.
+without refetching from S3 or the source peer. Each destination also corrupts a
+fetched bundle copy and asserts `spore unpack` rejects it before the normal
+restore path is counted successful.
 
 Options:
   --region REGION             AWS region for SSM and S3
@@ -498,6 +500,35 @@ materialize_bundle() {
   printf -v "\${peer_bytes_var}" '%s' "\${fetched_peer_bytes}"
 }
 
+assert_corrupt_bundle_rejected() {
+  local bundle_dir="\$1"
+  local iteration="\$2"
+  local corrupt_dir="\${workdir}/corrupt-\${iteration}.bundle"
+  local corrupt_out="\${workdir}/corrupt-\${iteration}.unpacked"
+  local corrupt_log="\${workdir}/corrupt-\${iteration}.log"
+
+  rm -rf "\${corrupt_dir}" "\${corrupt_out}" "\${corrupt_log}"
+  mkdir -p "\${corrupt_dir}"
+  cp -a "\${bundle_dir}/." "\${corrupt_dir}/"
+  python3 - "\${corrupt_dir}/chunkpacks/000000.pack" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+data = bytearray(path.read_bytes())
+if not data:
+    raise SystemExit("cannot corrupt empty chunkpack")
+data[0] ^= 0x01
+path.write_bytes(data)
+PY
+  if zig-out/bin/spore unpack "\${corrupt_dir}" --out "\${corrupt_out}" >"\${corrupt_log}" 2>&1; then
+    cat "\${corrupt_log}" >&2 || true
+    echo "corrupt bundle unexpectedly unpacked successfully" >&2
+    exit 1
+  fi
+  rm -rf "\${corrupt_dir}" "\${corrupt_out}"
+}
+
 if [[ -n "\${cache_dir}" ]]; then
   mkdir -p "\${cache_dir}"
 fi
@@ -507,6 +538,7 @@ total_peer_bytes=0
 total_download_bytes=0
 cache_hits=0
 cache_misses=0
+corrupt_bundle_rejections=0
 local_bundle_bytes=0
 unpacked_chunks=0
 iteration_json=""
@@ -514,6 +546,7 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   iter_dir="\${workdir}/resume-\${iteration}"
   bundle_dir="\${iter_dir}/spore.bundle"
   unpacked_dir="\${iter_dir}/spore.unpacked"
+  unpack_result="\${iter_dir}/unpack-result.json"
   materialize_bundle "\${bundle_dir}" cache_hit origin_bytes peer_bytes
   if [[ "\${cache_hit}" == "true" ]]; then
     cache_hits=\$((cache_hits + 1))
@@ -525,7 +558,18 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   total_peer_bytes=\$((total_peer_bytes + peer_bytes))
   total_download_bytes=\$((total_download_bytes + downloaded_bytes))
   local_bundle_bytes="\$(du -sb "\${bundle_dir}" | awk '{print \$1}')"
-  zig-out/bin/spore unpack "\${bundle_dir}" --out "\${unpacked_dir}"
+  corrupt_rejected=false
+  if [[ "\${iteration}" == "1" ]]; then
+    assert_corrupt_bundle_rejected "\${bundle_dir}" "\${iteration}"
+    corrupt_bundle_rejections=\$((corrupt_bundle_rejections + 1))
+    corrupt_rejected=true
+  fi
+  zig-out/bin/spore unpack "\${bundle_dir}" --out "\${unpacked_dir}" | tee "\${unpack_result}"
+  unpack_bundle_key="\$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["bundle_digest"])' "\${unpack_result}")"
+  if [[ "\${unpack_bundle_key}" != "\${bundle_key}" ]]; then
+    echo "unpacked bundle digest mismatch: expected \${bundle_key}, got \${unpack_bundle_key}" >&2
+    exit 1
+  fi
   scripts/smoke-restore-leg.sh resume \
     --backend kvm \
     --spore-dir "\${unpacked_dir}" \
@@ -535,7 +579,7 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   if [[ -n "\${iteration_json}" ]]; then
     iteration_json="\${iteration_json},"
   fi
-  iteration_json="\${iteration_json}{\"iteration\":\${iteration},\"cache_hit\":\${cache_hit},\"downloaded_bundle_bytes\":\${downloaded_bytes},\"origin_downloaded_bundle_bytes\":\${origin_bytes},\"peer_downloaded_bundle_bytes\":\${peer_bytes},\"local_bundle_bytes\":\${local_bundle_bytes},\"unpacked_chunks\":\${unpacked_chunks}}"
+  iteration_json="\${iteration_json}{\"iteration\":\${iteration},\"cache_hit\":\${cache_hit},\"downloaded_bundle_bytes\":\${downloaded_bytes},\"origin_downloaded_bundle_bytes\":\${origin_bytes},\"peer_downloaded_bundle_bytes\":\${peer_bytes},\"local_bundle_bytes\":\${local_bundle_bytes},\"unpacked_bundle_key\":\"\${unpack_bundle_key}\",\"unpacked_chunks\":\${unpacked_chunks},\"corrupt_bundle_rejected\":\${corrupt_rejected}}"
 done
 
 cache_enabled=false
@@ -561,6 +605,7 @@ cat >"\${workdir}/dest-result.json" <<JSON
   "source_peer_enabled": \${source_peer_enabled},
   "cache_hits": \${cache_hits},
   "cache_misses": \${cache_misses},
+  "corrupt_bundle_rejections": \${corrupt_bundle_rejections},
   "resume_count": \${dest_repeat},
   "unpacked_chunks": \${unpacked_chunks},
   "resume_mode": "kvm-lazy-ram",
@@ -713,6 +758,7 @@ total_destination_peer_bytes = sum(int(d.get("peer_downloaded_bundle_bytes", 0))
 total_resume_count = sum(int(d.get("resume_count", 1)) for d in dests)
 total_cache_hits = sum(int(d.get("cache_hits", 0)) for d in dests)
 total_cache_misses = sum(int(d.get("cache_misses", 0)) for d in dests)
+total_corrupt_bundle_rejections = sum(int(d.get("corrupt_bundle_rejections", 0)) for d in dests)
 cache_enabled = any(bool(d.get("cache_enabled", False)) for d in dests)
 source_peer_enabled = any(bool(d.get("source_peer_enabled", False)) for d in dests)
 
@@ -745,6 +791,7 @@ json.dump({
     "total_destination_peer_bytes": total_destination_peer_bytes,
     "total_cache_hits": total_cache_hits,
     "total_cache_misses": total_cache_misses,
+    "total_corrupt_bundle_rejections": total_corrupt_bundle_rejections,
     "download_multiplier_vs_bundle": ratio(total_destination_download_bytes, bundle_bytes),
     "peer_multiplier_vs_bundle": ratio(total_destination_peer_bytes, bundle_bytes),
     "origin_multiplier_vs_bundle": ratio(total_destination_origin_bytes, bundle_bytes),
