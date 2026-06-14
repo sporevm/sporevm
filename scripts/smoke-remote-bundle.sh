@@ -20,7 +20,9 @@ HTTP seed on the source host instead. Pass `--cache-dir` and `--dest-repeat N`
 to prove repeated restores on one host can reuse a host-local bundle cache
 without refetching from S3 or the source peer. Each destination also corrupts a
 fetched bundle copy and asserts `spore unpack` rejects it before the normal
-restore path is counted successful.
+restore path is counted successful. Pass `--tree-relay INSTANCE_ID:IP` one or
+more times to make relays fetch from the source peer, resume once, then serve
+the same bundle to leaf destinations.
 
 Options:
   --region REGION             AWS region for SSM and S3
@@ -35,6 +37,8 @@ Options:
   --cache-dir DIR             remote host-local bundle cache directory
   --source-peer-ip IP         source host IP destinations use for HTTP bundle fetches
   --source-peer-port N        source host HTTP port (default: 20000)
+  --tree-relay ID:IP          relay instance and private IP for source→relay→leaf fan-out
+                              (repeatable; relays also run one resume)
   --ssm-timeout-seconds N     per-host SSM command timeout (default: 1800)
   --run-id ID                 stable run ID (default: UTC timestamp + uuid)
   --keep-remote               leave remote work directories in /tmp
@@ -81,6 +85,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 region=""
 source_instance=""
 dest_instances=()
+tree_relay_ids=()
+tree_relay_ips=()
 bucket=""
 prefix="sporevm/remote-bundle-smoke"
 mem_mib="512"
@@ -109,6 +115,20 @@ while (($#)); do
     --dest-instance)
       need_value "$1" "${2-}"
       dest_instances+=("$2")
+      shift 2
+      ;;
+    --tree-relay)
+      need_value "$1" "${2-}"
+      relay_spec="$2"
+      case "${relay_spec}" in
+        *:*) ;;
+        *) die "--tree-relay must be INSTANCE_ID:IP" ;;
+      esac
+      relay_id="${relay_spec%%:*}"
+      relay_ip="${relay_spec#*:}"
+      [[ -n "${relay_id}" && -n "${relay_ip}" ]] || die "--tree-relay must be INSTANCE_ID:IP"
+      tree_relay_ids+=("${relay_id}")
+      tree_relay_ips+=("${relay_ip}")
       shift 2
       ;;
     --bucket)
@@ -184,11 +204,28 @@ done
 [[ -n "${source_instance}" ]] || die "--source-instance is required"
 (( ${#dest_instances[@]} > 0 )) || die "at least one --dest-instance is required"
 [[ -n "${bucket}" ]] || die "--bucket is required"
+if (( ${#tree_relay_ids[@]} > 0 )); then
+  [[ -n "${source_peer_ip}" ]] || die "--tree-relay requires --source-peer-ip for the source seed"
+  [[ "${dest_repeat}" == "1" ]] || die "--tree-relay currently requires --dest-repeat 1"
+  [[ -z "${cache_dir}" ]] || die "--tree-relay currently cannot be combined with --cache-dir"
+fi
 for i in "${!dest_instances[@]}"; do
   for j in "${!dest_instances[@]}"; do
     if (( j > i )) && [[ "${dest_instances[$i]}" == "${dest_instances[$j]}" ]]; then
       die "duplicate --dest-instance ${dest_instances[$i]}; use --dest-repeat for repeated restores on one host"
     fi
+  done
+  [[ "${dest_instances[$i]}" != "${source_instance}" ]] || die "source instance cannot also be a destination"
+done
+for i in "${!tree_relay_ids[@]}"; do
+  [[ "${tree_relay_ids[$i]}" != "${source_instance}" ]] || die "source instance cannot also be a tree relay"
+  for j in "${!tree_relay_ids[@]}"; do
+    if (( j > i )) && [[ "${tree_relay_ids[$i]}" == "${tree_relay_ids[$j]}" ]]; then
+      die "duplicate --tree-relay instance ${tree_relay_ids[$i]}"
+    fi
+  done
+  for dest_instance in "${dest_instances[@]}"; do
+    [[ "${tree_relay_ids[$i]}" != "${dest_instance}" ]] || die "tree relay ${tree_relay_ids[$i]} should not also be listed as --dest-instance"
   done
 done
 
@@ -233,12 +270,13 @@ q_keep_remote="$(shell_quote "${keep_remote}")"
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-remote-bundle.XXXXXX")"
 source_peer_started=0
-cleanup_remote_source() {
-  if (( source_peer_started == 0 )) || [[ "${keep_remote}" == "1" ]]; then
-    return 0
-  fi
+relay_peer_started_ids=()
+relay_peer_started_safes=()
 
-  local workdir="/tmp/sporevm-remote-bundle-source-${run_id}"
+cleanup_remote_workdir() {
+  local instance_id="$1"
+  local workdir="$2"
+  local comment="$3"
   local q_workdir
   local command
   local quoted_command
@@ -251,20 +289,44 @@ cleanup_remote_source() {
   parameters_json="{\"commands\":[\"$(json_escape "${ssm_command}")\"]}"
   aws ssm send-command \
     --region "${region}" \
-    --instance-ids "${source_instance}" \
+    --instance-ids "${instance_id}" \
     --document-name AWS-RunShellScript \
-    --comment "sporevm-remote-bundle-cleanup-${run_id}" \
+    --comment "${comment}" \
     --timeout-seconds 60 \
     --parameters "${parameters_json}" \
     --query 'Command.CommandId' \
     --output text >/dev/null 2>&1 || true
+}
+
+cleanup_remote_source() {
+  if (( source_peer_started == 0 )) || [[ "${keep_remote}" == "1" ]]; then
+    return 0
+  fi
+
+  local workdir="/tmp/sporevm-remote-bundle-source-${run_id}"
+  cleanup_remote_workdir "${source_instance}" "${workdir}" "sporevm-remote-bundle-cleanup-${run_id}"
   source_peer_started=0
+}
+
+cleanup_remote_relays() {
+  if [[ "${keep_remote}" == "1" ]]; then
+    return 0
+  fi
+  for i in "${!relay_peer_started_ids[@]}"; do
+    local instance_id="${relay_peer_started_ids[$i]}"
+    local safe_dest="${relay_peer_started_safes[$i]}"
+    local workdir="/tmp/sporevm-remote-bundle-dest-${run_id}-${safe_dest}"
+    cleanup_remote_workdir "${instance_id}" "${workdir}" "sporevm-remote-bundle-relay-cleanup-${run_id}"
+  done
+  relay_peer_started_ids=()
+  relay_peer_started_safes=()
 }
 
 cleanup() {
   local status=$?
   rm -rf "${tmpdir}"
   cleanup_remote_source
+  cleanup_remote_relays
   exit "${status}"
 }
 trap cleanup EXIT
@@ -391,6 +453,9 @@ source_peer_ip=${q_source_peer_ip}
 source_peer_port=${q_source_peer_port}
 keep_remote=${q_keep_remote}
 dest_instance="\${SPOREVM_DEST_INSTANCE:?SPOREVM_DEST_INSTANCE is required}"
+dest_role="\${SPOREVM_DEST_ROLE:-dest}"
+peer_ip="\${SPOREVM_PEER_IP:-\${source_peer_ip}}"
+serve_bundle="\${SPOREVM_SERVE_BUNDLE:-0}"
 safe_dest="\$(printf '%s' "\${dest_instance}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 workdir="/tmp/sporevm-remote-bundle-dest-${run_id}-\${safe_dest}"
 
@@ -417,10 +482,10 @@ fetch_bundle() {
   local peer_bytes_var="\$3"
 
   rm -rf "\${out_dir}"
-  if [[ -n "\${source_peer_ip}" ]]; then
+  if [[ -n "\${peer_ip}" ]]; then
     local tar_path="\${out_dir}.tar"
     mkdir -p "\$(dirname "\${out_dir}")"
-    python3 - "\${source_peer_ip}" "\${source_peer_port}" "\${tar_path}" <<'PY'
+    python3 - "\${peer_ip}" "\${source_peer_port}" "\${tar_path}" <<'PY'
 import sys
 import urllib.request
 
@@ -529,6 +594,22 @@ PY
   rm -rf "\${corrupt_dir}" "\${corrupt_out}"
 }
 
+start_peer_server() {
+  local bundle_dir="\$1"
+  local serve_dir="\${workdir}/peer-www"
+  rm -rf "\${serve_dir}"
+  mkdir -p "\${serve_dir}"
+  tar -cf "\${serve_dir}/spore.bundle.tar" -C "\$(dirname "\${bundle_dir}")" "\$(basename "\${bundle_dir}")"
+  nohup python3 -m http.server "\${source_peer_port}" --bind 0.0.0.0 --directory "\${serve_dir}" >"\${workdir}/peer-http.log" 2>&1 &
+  printf '%s\n' "\$!" >"\${workdir}/peer-http.pid"
+  sleep 1
+  if ! kill -0 "\$(cat "\${workdir}/peer-http.pid")" 2>/dev/null; then
+    cat "\${workdir}/peer-http.log" >&2 || true
+    exit 1
+  fi
+  wc -c <"\${serve_dir}/spore.bundle.tar" | tr -d ' '
+}
+
 if [[ -n "\${cache_dir}" ]]; then
   mkdir -p "\${cache_dir}"
 fi
@@ -540,6 +621,7 @@ cache_hits=0
 cache_misses=0
 corrupt_bundle_rejections=0
 local_bundle_bytes=0
+served_bundle_archive_bytes=0
 unpacked_chunks=0
 iteration_json=""
 for iteration in \$(seq 1 "\${dest_repeat}"); do
@@ -570,6 +652,9 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
     echo "unpacked bundle digest mismatch: expected \${bundle_key}, got \${unpack_bundle_key}" >&2
     exit 1
   fi
+  if [[ "\${serve_bundle}" == "1" && "\${iteration}" == "1" ]]; then
+    served_bundle_archive_bytes="\$(start_peer_server "\${bundle_dir}")"
+  fi
   scripts/smoke-restore-leg.sh resume \
     --backend kvm \
     --spore-dir "\${unpacked_dir}" \
@@ -587,15 +672,22 @@ if [[ -n "\${cache_dir}" ]]; then
   cache_enabled=true
 fi
 source_peer_enabled=false
-if [[ -n "\${source_peer_ip}" ]]; then
+if [[ -n "\${peer_ip}" ]]; then
   source_peer_enabled=true
+fi
+serves_bundle=false
+if [[ "\${serve_bundle}" == "1" ]]; then
+  serves_bundle=true
 fi
 
 cat >"\${workdir}/dest-result.json" <<JSON
 {
-  "role": "dest",
+  "role": "\${dest_role}",
   "instance_id": "\${dest_instance}",
   "workdir": "\${workdir}",
+  "upstream_peer_ip": "\${peer_ip}",
+  "serves_bundle": \${serves_bundle},
+  "served_bundle_archive_bytes": \${served_bundle_archive_bytes},
   "downloaded_bundle_bytes": \${total_download_bytes},
   "origin_downloaded_bundle_bytes": \${total_origin_bytes},
   "peer_downloaded_bundle_bytes": \${total_peer_bytes},
@@ -615,7 +707,7 @@ JSON
 aws s3 cp "\${workdir}/dest-result.json" "s3://\${bucket}/\${run_prefix}/dest-results/\${safe_dest}.json" --region "\${region}" --only-show-errors
 cat "\${workdir}/dest-result.json"
 
-if [[ "\${keep_remote}" != "1" ]]; then
+if [[ "\${keep_remote}" != "1" && "\${serve_bundle}" != "1" ]]; then
   rm -rf "\${workdir}"
 fi
 EOF
@@ -632,6 +724,9 @@ send_remote_script() {
   local instance_id="$1"
   local script_name="$2"
   local dest_instance_arg="${3-}"
+  local peer_ip_arg="${4-}"
+  local dest_role_arg="${5-}"
+  local serve_bundle_arg="${6-}"
   local comment="sporevm-remote-bundle-${script_name}-${run_id}"
   local command
   local quoted_command
@@ -639,13 +734,24 @@ send_remote_script() {
   local remote_script_path
   local remote_script_uri
   local remote_invocation
+  local env_prefix=""
   local ssm_command
   remote_script_uri="${s3_base}/${script_name}.sh"
   remote_script_path="/tmp/sporevm-${script_name}-${run_id}.sh"
   remote_invocation="$(shell_quote "${remote_script_path}")"
   if [[ -n "${dest_instance_arg}" ]]; then
-    remote_invocation="SPOREVM_DEST_INSTANCE=$(shell_quote "${dest_instance_arg}") ${remote_invocation}"
+    env_prefix="${env_prefix} SPOREVM_DEST_INSTANCE=$(shell_quote "${dest_instance_arg}")"
   fi
+  if [[ -n "${peer_ip_arg}" ]]; then
+    env_prefix="${env_prefix} SPOREVM_PEER_IP=$(shell_quote "${peer_ip_arg}")"
+  fi
+  if [[ -n "${dest_role_arg}" ]]; then
+    env_prefix="${env_prefix} SPOREVM_DEST_ROLE=$(shell_quote "${dest_role_arg}")"
+  fi
+  if [[ -n "${serve_bundle_arg}" ]]; then
+    env_prefix="${env_prefix} SPOREVM_SERVE_BUNDLE=$(shell_quote "${serve_bundle_arg}")"
+  fi
+  remote_invocation="${env_prefix# } ${remote_invocation}"
   command="aws s3 cp $(shell_quote "${remote_script_uri}") $(shell_quote "${remote_script_path}") --region $(shell_quote "${region}") --only-show-errors && chmod +x $(shell_quote "${remote_script_path}") && ${remote_invocation}"
   quoted_command="$(shell_quote "${command}")"
   ssm_command="bash -lc ${quoted_command}"
@@ -714,15 +820,48 @@ wait_remote_command "${source_instance}" "${source_command_id}" source
 
 dest_command_ids=()
 dest_safe_names=()
-for dest_instance in "${dest_instances[@]}"; do
-  echo "starting destination unpack/resume on ${dest_instance}" >&2
-  dest_command_ids+=("$(send_remote_script "${dest_instance}" dest "${dest_instance}")")
-  dest_safe_names+=("$(safe_component "${dest_instance}")")
-done
+if (( ${#tree_relay_ids[@]} > 0 )); then
+  relay_command_ids=()
+  relay_safe_names=()
+  for i in "${!tree_relay_ids[@]}"; do
+    relay_instance="${tree_relay_ids[$i]}"
+    relay_ip="${tree_relay_ips[$i]}"
+    relay_safe="$(safe_component "${relay_instance}")"
+    echo "starting relay unpack/resume/serve on ${relay_instance} (${relay_ip})" >&2
+    relay_command_ids+=("$(send_remote_script "${relay_instance}" dest "${relay_instance}" "${source_peer_ip}" relay 1)")
+    relay_safe_names+=("${relay_safe}")
+    relay_peer_started_ids+=("${relay_instance}")
+    relay_peer_started_safes+=("${relay_safe}")
+  done
 
-for i in "${!dest_instances[@]}"; do
-  wait_remote_command "${dest_instances[$i]}" "${dest_command_ids[$i]}" "dest:${dest_instances[$i]}"
-done
+  for i in "${!tree_relay_ids[@]}"; do
+    wait_remote_command "${tree_relay_ids[$i]}" "${relay_command_ids[$i]}" "relay:${tree_relay_ids[$i]}"
+    dest_safe_names+=("${relay_safe_names[$i]}")
+  done
+
+  for i in "${!dest_instances[@]}"; do
+    dest_instance="${dest_instances[$i]}"
+    relay_index=$(( i % ${#tree_relay_ids[@]} ))
+    relay_ip="${tree_relay_ips[$relay_index]}"
+    echo "starting leaf unpack/resume on ${dest_instance} via relay ${tree_relay_ids[$relay_index]} (${relay_ip})" >&2
+    dest_command_ids+=("$(send_remote_script "${dest_instance}" dest "${dest_instance}" "${relay_ip}" leaf 0)")
+    dest_safe_names+=("$(safe_component "${dest_instance}")")
+  done
+
+  for i in "${!dest_instances[@]}"; do
+    wait_remote_command "${dest_instances[$i]}" "${dest_command_ids[$i]}" "leaf:${dest_instances[$i]}"
+  done
+else
+  for dest_instance in "${dest_instances[@]}"; do
+    echo "starting destination unpack/resume on ${dest_instance}" >&2
+    dest_command_ids+=("$(send_remote_script "${dest_instance}" dest "${dest_instance}")")
+    dest_safe_names+=("$(safe_component "${dest_instance}")")
+  done
+
+  for i in "${!dest_instances[@]}"; do
+    wait_remote_command "${dest_instances[$i]}" "${dest_command_ids[$i]}" "dest:${dest_instances[$i]}"
+  done
+fi
 
 metrics_path="${tmpdir}/metrics.json"
 source_result_path="${tmpdir}/source-result.json"
@@ -737,6 +876,7 @@ done
 python3 - "${run_id}" "${s3_base}/" "${source_result_path}" "${dest_result_paths[@]}" >"${metrics_path}" <<'PY'
 import json
 import sys
+from urllib.parse import urlparse
 
 run_id = sys.argv[1]
 s3_uri = sys.argv[2]
@@ -761,8 +901,22 @@ total_cache_misses = sum(int(d.get("cache_misses", 0)) for d in dests)
 total_corrupt_bundle_rejections = sum(int(d.get("corrupt_bundle_rejections", 0)) for d in dests)
 cache_enabled = any(bool(d.get("cache_enabled", False)) for d in dests)
 source_peer_enabled = any(bool(d.get("source_peer_enabled", False)) for d in dests)
+relays = [d for d in dests if d.get("role") == "relay"]
+leaves = [d for d in dests if d.get("role") == "leaf"]
+source_peer_host = urlparse(source.get("source_peer_url", "")).hostname or ""
+peer_egress_by_upstream = {}
+for dest in dests:
+    upstream = dest.get("upstream_peer_ip") or ""
+    peer_bytes = int(dest.get("peer_downloaded_bundle_bytes", 0))
+    if upstream and peer_bytes:
+        peer_egress_by_upstream[upstream] = peer_egress_by_upstream.get(upstream, 0) + peer_bytes
+source_peer_egress_bytes = peer_egress_by_upstream.get(source_peer_host, 0)
+relay_peer_egress_bytes = total_destination_peer_bytes - source_peer_egress_bytes
+max_peer_egress_bytes = max(peer_egress_by_upstream.values(), default=0)
 
-if source_peer_enabled and cache_enabled:
+if relays:
+    origin_mode = "source-peer-http-tree"
+elif source_peer_enabled and cache_enabled:
     origin_mode = "source-peer-http-with-host-local-cache"
 elif source_peer_enabled:
     origin_mode = "source-peer-http"
@@ -781,6 +935,8 @@ json.dump({
     "s3_uri": s3_uri,
     "source_instance": source["instance_id"],
     "destination_count": len(dests),
+    "relay_count": len(relays),
+    "leaf_count": len(leaves),
     "destination_resume_count": total_resume_count,
     "destination_instances": [d["instance_id"] for d in dests],
     "bundle_bytes": bundle_bytes,
@@ -789,6 +945,10 @@ json.dump({
     "total_destination_download_bytes": total_destination_download_bytes,
     "total_destination_origin_bytes": total_destination_origin_bytes,
     "total_destination_peer_bytes": total_destination_peer_bytes,
+    "source_peer_egress_bytes": source_peer_egress_bytes,
+    "relay_peer_egress_bytes": relay_peer_egress_bytes,
+    "max_peer_egress_bytes": max_peer_egress_bytes,
+    "peer_egress_by_upstream": peer_egress_by_upstream,
     "total_cache_hits": total_cache_hits,
     "total_cache_misses": total_cache_misses,
     "total_corrupt_bundle_rejections": total_corrupt_bundle_rejections,
@@ -806,5 +966,6 @@ PY
 aws s3 cp "${metrics_path}" "${s3_base}/metrics.json" --region "${region}" --only-show-errors
 cat "${metrics_path}"
 
-echo "remote bundle smoke ok: source=${source_instance} dest_count=${#dest_instances[@]} s3=${s3_base}/"
+total_dest_count=$(( ${#dest_instances[@]} + ${#tree_relay_ids[@]} ))
+echo "remote bundle smoke ok: source=${source_instance} dest_count=${total_dest_count} s3=${s3_base}/"
 aws s3 ls "${s3_base}/" --recursive --region "${region}"

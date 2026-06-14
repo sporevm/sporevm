@@ -200,7 +200,7 @@ Current HVF gaps:
 | --- | --- | --- |
 | KVM→KVM | Passes same-host smoke on the `m7g.metal` KVM host. | Keep as regression coverage. |
 | HVF→HVF | Passes same-host smoke locally, including HVF lazy RAM and file-backed fork smokes. | Keep as regression coverage. |
-| KVM→HVF | Portable vCPU, virtio, generation, GIC apply, and CPU profile machinery exist. `m7g.metal` spores fail closed on counter-frequency mismatch. | Need a KVM producer whose guest counter frequency matches HVF's 24MHz, or a designed cross-frequency timer contract. |
+| KVM→HVF | Portable vCPU, virtio, generation, GIC apply, and CPU profile machinery exist. `m7g.metal` and `a1.metal` spores fail closed on counter-frequency mismatch. | Need a KVM producer whose guest counter frequency matches HVF's 24MHz, or a designed cross-frequency timer contract. |
 | HVF→KVM | Blocked because HVF still produces backend-private GIC state. Timer compatibility still applies. | Make HVF produce portable GICv3 state, then run with compatible counter frequency. |
 
 ## Failure policy
@@ -246,6 +246,9 @@ Current evidence:
 - KVM→HVF with an `m7g.metal` producer is a negative test: the spore records
   `counter_frequency_hz = 1_050_000_000` and HVF exposes 24MHz, so restore must
   reject it before running guest code.
+- A ten-host `a1.metal` probe reported `CNTFRQ_EL0 = 83_333_333` on every host.
+  That makes A1 useful for cheaper same-class KVM distribution tests, but it is
+  not a timer-compatible producer for current Apple HVF hosts.
 
 ## Next contract work
 
