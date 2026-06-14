@@ -7,19 +7,20 @@ usage:
   scripts/smoke-remote-bundle.sh \
     --region REGION \
     --source-instance INSTANCE_ID \
-    --dest-instance INSTANCE_ID \
+    --dest-instance INSTANCE_ID [--dest-instance INSTANCE_ID ...] \
     --bucket BUCKET [options]
 
 Capture a spore on one SSM-managed KVM host, pack it into a chunkpack bundle,
-stage the bundle in S3, then unpack and resume it on a second compatible KVM
-host. The script uploads tracked HEAD plus the current tracked/staged diff to
+stage the bundle in S3, then unpack and resume it on one or more compatible KVM
+hosts. The script uploads tracked HEAD plus the current tracked/staged diff to
 S3 so it can validate local changes before they are committed without copying
-stray untracked files.
+stray untracked files. Destinations fetch directly from S3; metrics report that
+direct-origin baseline before cache or peer fan-out layers are added.
 
 Options:
   --region REGION             AWS region for SSM and S3
   --source-instance ID        SSM instance ID for capture/pack
-  --dest-instance ID          SSM instance ID for unpack/resume
+  --dest-instance ID          SSM instance ID for unpack/resume (repeatable)
   --bucket BUCKET             S3 bucket used as the staging origin
   --prefix PREFIX             S3 prefix (default: sporevm/remote-bundle-smoke)
   --mem-mib N                 guest memory size (default: 512)
@@ -62,11 +63,15 @@ json_escape() {
   printf '%s' "${value}"
 }
 
+safe_component() {
+  printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_'
+}
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 region=""
 source_instance=""
-dest_instance=""
+dest_instances=()
 bucket=""
 prefix="sporevm/remote-bundle-smoke"
 mem_mib="512"
@@ -90,7 +95,7 @@ while (($#)); do
       ;;
     --dest-instance)
       need_value "$1" "${2-}"
-      dest_instance="$2"
+      dest_instances+=("$2")
       shift 2
       ;;
     --bucket)
@@ -144,7 +149,7 @@ done
 
 [[ -n "${region}" ]] || die "--region is required"
 [[ -n "${source_instance}" ]] || die "--source-instance is required"
-[[ -n "${dest_instance}" ]] || die "--dest-instance is required"
+(( ${#dest_instances[@]} > 0 )) || die "at least one --dest-instance is required"
 [[ -n "${bucket}" ]] || die "--bucket is required"
 
 for pair in \
@@ -160,6 +165,7 @@ done
 
 command -v aws >/dev/null 2>&1 || die "aws CLI is required"
 command -v git >/dev/null 2>&1 || die "git is required"
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
 
 if [[ -z "${run_id}" ]]; then
   random_id="$(uuidgen 2>/dev/null || openssl rand -hex 16)"
@@ -238,6 +244,7 @@ scripts/smoke-restore-leg.sh capture \
 zig-out/bin/spore pack "\${workdir}/spore" --out "\${workdir}/spore.bundle"
 
 bundle_bytes="\$(du -sb "\${workdir}/spore.bundle" | awk '{print \$1}')"
+unique_chunk_bytes="\$(du -sb "\${workdir}/spore.bundle/chunkpacks/000000.pack" | awk '{print \$1}')"
 packed_chunks="\$(find "\${workdir}/spore.bundle/chunkpacks" -type f | wc -l | tr -d ' ')"
 aws s3 cp "\${workdir}/spore.bundle" "s3://\${bucket}/\${run_prefix}/spore.bundle/" --recursive --region "\${region}" --only-show-errors
 cat >"\${workdir}/source-result.json" <<JSON
@@ -246,6 +253,7 @@ cat >"\${workdir}/source-result.json" <<JSON
   "instance_id": "${source_instance}",
   "workdir": "\${workdir}",
   "bundle_bytes": \${bundle_bytes},
+  "unique_chunk_bytes": \${unique_chunk_bytes},
   "pack_files": \${packed_chunks},
   "bundle_s3_uri": "s3://\${bucket}/\${run_prefix}/spore.bundle/"
 }
@@ -275,7 +283,9 @@ bucket=${q_bucket}
 run_prefix=${q_run_prefix}
 resume_seconds=${q_resume_seconds}
 keep_remote=${q_keep_remote}
-workdir="/tmp/sporevm-remote-bundle-dest-${run_id}"
+dest_instance="\${SPOREVM_DEST_INSTANCE:?SPOREVM_DEST_INSTANCE is required}"
+safe_dest="\$(printf '%s' "\${dest_instance}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+workdir="/tmp/sporevm-remote-bundle-dest-${run_id}-\${safe_dest}"
 
 rm -rf "\${workdir}"
 mkdir -p "\${workdir}/repo" "\${workdir}/spore.bundle"
@@ -304,14 +314,14 @@ unpacked_chunks="\$(find "\${workdir}/spore.unpacked/chunks" -type f | wc -l | t
 cat >"\${workdir}/dest-result.json" <<JSON
 {
   "role": "dest",
-  "instance_id": "${dest_instance}",
+  "instance_id": "\${dest_instance}",
   "workdir": "\${workdir}",
   "downloaded_bundle_bytes": \${bundle_bytes},
   "unpacked_chunks": \${unpacked_chunks},
   "resume_mode": "kvm-lazy-ram"
 }
 JSON
-aws s3 cp "\${workdir}/dest-result.json" "s3://\${bucket}/\${run_prefix}/dest-result.json" --region "\${region}" --only-show-errors
+aws s3 cp "\${workdir}/dest-result.json" "s3://\${bucket}/\${run_prefix}/dest-results/\${safe_dest}.json" --region "\${region}" --only-show-errors
 cat "\${workdir}/dest-result.json"
 
 if [[ "\${keep_remote}" != "1" ]]; then
@@ -330,16 +340,22 @@ aws s3 cp "${dest_script}" "${s3_base}/dest.sh" --region "${region}" --only-show
 send_remote_script() {
   local instance_id="$1"
   local script_name="$2"
+  local dest_instance_arg="${3-}"
   local comment="sporevm-remote-bundle-${script_name}-${run_id}"
   local command
   local quoted_command
   local parameters_json
   local remote_script_path
   local remote_script_uri
+  local remote_invocation
   local ssm_command
   remote_script_uri="${s3_base}/${script_name}.sh"
   remote_script_path="/tmp/sporevm-${script_name}-${run_id}.sh"
-  command="aws s3 cp $(shell_quote "${remote_script_uri}") $(shell_quote "${remote_script_path}") --region $(shell_quote "${region}") --only-show-errors && chmod +x $(shell_quote "${remote_script_path}") && $(shell_quote "${remote_script_path}")"
+  remote_invocation="$(shell_quote "${remote_script_path}")"
+  if [[ -n "${dest_instance_arg}" ]]; then
+    remote_invocation="SPOREVM_DEST_INSTANCE=$(shell_quote "${dest_instance_arg}") ${remote_invocation}"
+  fi
+  command="aws s3 cp $(shell_quote "${remote_script_uri}") $(shell_quote "${remote_script_path}") --region $(shell_quote "${region}") --only-show-errors && chmod +x $(shell_quote "${remote_script_path}") && ${remote_invocation}"
   quoted_command="$(shell_quote "${command}")"
   ssm_command="bash -lc ${quoted_command}"
   parameters_json="{\"commands\":[\"$(json_escape "${ssm_command}")\"]}"
@@ -402,9 +418,72 @@ echo "running source capture/pack on ${source_instance}" >&2
 source_command_id="$(send_remote_script "${source_instance}" source)"
 wait_remote_command "${source_instance}" "${source_command_id}" source
 
-echo "running destination unpack/resume on ${dest_instance}" >&2
-dest_command_id="$(send_remote_script "${dest_instance}" dest)"
-wait_remote_command "${dest_instance}" "${dest_command_id}" dest
+dest_command_ids=()
+dest_safe_names=()
+for dest_instance in "${dest_instances[@]}"; do
+  echo "starting destination unpack/resume on ${dest_instance}" >&2
+  dest_command_ids+=("$(send_remote_script "${dest_instance}" dest "${dest_instance}")")
+  dest_safe_names+=("$(safe_component "${dest_instance}")")
+done
 
-echo "remote bundle smoke ok: source=${source_instance} dest=${dest_instance} s3=${s3_base}/"
+for i in "${!dest_instances[@]}"; do
+  wait_remote_command "${dest_instances[$i]}" "${dest_command_ids[$i]}" "dest:${dest_instances[$i]}"
+done
+
+metrics_path="${tmpdir}/metrics.json"
+source_result_path="${tmpdir}/source-result.json"
+dest_result_paths=()
+aws s3 cp "${s3_base}/source-result.json" "${source_result_path}" --region "${region}" --only-show-errors
+for safe_dest in "${dest_safe_names[@]}"; do
+  dest_result_path="${tmpdir}/dest-${safe_dest}.json"
+  aws s3 cp "${s3_base}/dest-results/${safe_dest}.json" "${dest_result_path}" --region "${region}" --only-show-errors
+  dest_result_paths+=("${dest_result_path}")
+done
+
+python3 - "${run_id}" "${s3_base}/" "${source_result_path}" "${dest_result_paths[@]}" >"${metrics_path}" <<'PY'
+import json
+import sys
+
+run_id = sys.argv[1]
+s3_uri = sys.argv[2]
+source_path = sys.argv[3]
+dest_paths = sys.argv[4:]
+
+with open(source_path, "r", encoding="utf-8") as f:
+    source = json.load(f)
+dests = []
+for path in dest_paths:
+    with open(path, "r", encoding="utf-8") as f:
+        dests.append(json.load(f))
+
+bundle_bytes = int(source["bundle_bytes"])
+unique_chunk_bytes = int(source["unique_chunk_bytes"])
+total_destination_download_bytes = sum(int(d["downloaded_bundle_bytes"]) for d in dests)
+
+def ratio(numerator, denominator):
+    if denominator == 0:
+        return None
+    return round(numerator / denominator, 6)
+
+json.dump({
+    "run_id": run_id,
+    "s3_uri": s3_uri,
+    "source_instance": source["instance_id"],
+    "destination_count": len(dests),
+    "destination_instances": [d["instance_id"] for d in dests],
+    "bundle_bytes": bundle_bytes,
+    "unique_chunk_bytes": unique_chunk_bytes,
+    "total_destination_download_bytes": total_destination_download_bytes,
+    "origin_multiplier_vs_bundle": ratio(total_destination_download_bytes, bundle_bytes),
+    "origin_multiplier_vs_unique_chunks": ratio(total_destination_download_bytes, unique_chunk_bytes),
+    "origin_mode": "direct-s3-per-destination",
+    "destinations": dests,
+}, sys.stdout, indent=2)
+print()
+PY
+
+aws s3 cp "${metrics_path}" "${s3_base}/metrics.json" --region "${region}" --only-show-errors
+cat "${metrics_path}"
+
+echo "remote bundle smoke ok: source=${source_instance} dest_count=${#dest_instances[@]} s3=${s3_base}/"
 aws s3 ls "${s3_base}/" --recursive --region "${region}"
