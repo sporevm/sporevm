@@ -88,7 +88,9 @@ To exercise the first cross-host bundle path over SSM and S3, use
 It stages tracked `HEAD` plus the current tracked/staged diff; stage new files
 you want included in the remote run. Add `--cache-dir DIR --dest-repeat N` to
 prove host-local bundle cache reuse across repeated restores on each
-destination.
+destination. Add `--source-peer-ip IP --source-peer-port 20000` to serve the
+bundle from the source host over east-west HTTP so destinations avoid direct S3
+bundle downloads.
 
 Run a single command in a throwaway VM with the minimal agent initrd:
 

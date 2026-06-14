@@ -14,10 +14,11 @@ Capture a spore on one SSM-managed KVM host, pack it into a chunkpack bundle,
 stage the bundle in S3, then unpack and resume it on one or more compatible KVM
 hosts. The script uploads tracked HEAD plus the current tracked/staged diff to
 S3 so it can validate local changes before they are committed without copying
-stray untracked files. Destinations fetch directly from S3; metrics report that
-direct-origin baseline before cache or peer fan-out layers are added. Pass
-`--cache-dir` and `--dest-repeat N` to prove repeated restores on one host can
-reuse a host-local bundle cache without refetching from S3.
+stray untracked files. Destinations fetch directly from S3 by default; pass
+`--source-peer-ip IP` to have destinations fetch the bundle from a temporary
+HTTP seed on the source host instead. Pass `--cache-dir` and `--dest-repeat N`
+to prove repeated restores on one host can reuse a host-local bundle cache
+without refetching from S3 or the source peer.
 
 Options:
   --region REGION             AWS region for SSM and S3
@@ -30,6 +31,8 @@ Options:
   --resume-seconds N          seconds to let resumed VM tick (default: 5)
   --dest-repeat N             restore each destination N times (default: 1)
   --cache-dir DIR             remote host-local bundle cache directory
+  --source-peer-ip IP         source host IP destinations use for HTTP bundle fetches
+  --source-peer-port N        source host HTTP port (default: 20000)
   --ssm-timeout-seconds N     per-host SSM command timeout (default: 1800)
   --run-id ID                 stable run ID (default: UTC timestamp + uuid)
   --keep-remote               leave remote work directories in /tmp
@@ -83,6 +86,8 @@ snapshot_after_ms="3000"
 resume_seconds="5"
 dest_repeat="1"
 cache_dir=""
+source_peer_ip=""
+source_peer_port="20000"
 ssm_timeout_seconds="1800"
 run_id=""
 keep_remote=0
@@ -139,6 +144,16 @@ while (($#)); do
       cache_dir="$2"
       shift 2
       ;;
+    --source-peer-ip)
+      need_value "$1" "${2-}"
+      source_peer_ip="$2"
+      shift 2
+      ;;
+    --source-peer-port)
+      need_value "$1" "${2-}"
+      source_peer_port="$2"
+      shift 2
+      ;;
     --ssm-timeout-seconds)
       need_value "$1" "${2-}"
       ssm_timeout_seconds="$2"
@@ -180,6 +195,7 @@ for pair in \
   "snapshot-after-ms:${snapshot_after_ms}" \
   "resume-seconds:${resume_seconds}" \
   "dest-repeat:${dest_repeat}" \
+  "source-peer-port:${source_peer_port}" \
   "ssm-timeout-seconds:${ssm_timeout_seconds}"
 do
   name="${pair%%:*}"
@@ -209,11 +225,45 @@ q_snapshot_after_ms="$(shell_quote "${snapshot_after_ms}")"
 q_resume_seconds="$(shell_quote "${resume_seconds}")"
 q_dest_repeat="$(shell_quote "${dest_repeat}")"
 q_cache_dir="$(shell_quote "${cache_dir}")"
+q_source_peer_ip="$(shell_quote "${source_peer_ip}")"
+q_source_peer_port="$(shell_quote "${source_peer_port}")"
 q_keep_remote="$(shell_quote "${keep_remote}")"
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-remote-bundle.XXXXXX")"
+source_peer_started=0
+cleanup_remote_source() {
+  if (( source_peer_started == 0 )) || [[ "${keep_remote}" == "1" ]]; then
+    return 0
+  fi
+
+  local workdir="/tmp/sporevm-remote-bundle-source-${run_id}"
+  local q_workdir
+  local command
+  local quoted_command
+  local ssm_command
+  local parameters_json
+  q_workdir="$(shell_quote "${workdir}")"
+  command="if [ -f ${q_workdir}/peer-http.pid ]; then kill \$(cat ${q_workdir}/peer-http.pid) 2>/dev/null || true; fi; rm -rf ${q_workdir}"
+  quoted_command="$(shell_quote "${command}")"
+  ssm_command="bash -lc ${quoted_command}"
+  parameters_json="{\"commands\":[\"$(json_escape "${ssm_command}")\"]}"
+  aws ssm send-command \
+    --region "${region}" \
+    --instance-ids "${source_instance}" \
+    --document-name AWS-RunShellScript \
+    --comment "sporevm-remote-bundle-cleanup-${run_id}" \
+    --timeout-seconds 60 \
+    --parameters "${parameters_json}" \
+    --query 'Command.CommandId' \
+    --output text >/dev/null 2>&1 || true
+  source_peer_started=0
+}
+
 cleanup() {
+  local status=$?
   rm -rf "${tmpdir}"
+  cleanup_remote_source
+  exit "${status}"
 }
 trap cleanup EXIT
 
@@ -244,6 +294,8 @@ bucket=${q_bucket}
 run_prefix=${q_run_prefix}
 mem_mib=${q_mem_mib}
 snapshot_after_ms=${q_snapshot_after_ms}
+source_peer_ip=${q_source_peer_ip}
+source_peer_port=${q_source_peer_port}
 keep_remote=${q_keep_remote}
 workdir="/tmp/sporevm-remote-bundle-source-${run_id}"
 
@@ -274,6 +326,20 @@ bundle_bytes="\$(du -sb "\${workdir}/spore.bundle" | awk '{print \$1}')"
 unique_chunk_bytes="\$(du -sb "\${workdir}/spore.bundle/chunkpacks/000000.pack" | awk '{print \$1}')"
 bundle_key="\$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["bundle_digest"])' "\${workdir}/pack-result.json")"
 packed_chunks="\$(find "\${workdir}/spore.bundle/chunkpacks" -type f | wc -l | tr -d ' ')"
+bundle_archive_bytes=0
+source_peer_url=""
+if [[ -n "\${source_peer_ip}" ]]; then
+  tar -cf "\${workdir}/spore.bundle.tar" -C "\${workdir}" spore.bundle
+  bundle_archive_bytes="\$(wc -c <"\${workdir}/spore.bundle.tar" | tr -d ' ')"
+  source_peer_url="http://\${source_peer_ip}:\${source_peer_port}/spore.bundle.tar"
+  nohup python3 -m http.server "\${source_peer_port}" --bind 0.0.0.0 --directory "\${workdir}" >"\${workdir}/peer-http.log" 2>&1 &
+  printf '%s\n' "\$!" >"\${workdir}/peer-http.pid"
+  sleep 1
+  if ! kill -0 "\$(cat "\${workdir}/peer-http.pid")" 2>/dev/null; then
+    cat "\${workdir}/peer-http.log" >&2 || true
+    exit 1
+  fi
+fi
 aws s3 cp "\${workdir}/spore.bundle" "s3://\${bucket}/\${run_prefix}/spore.bundle/" --recursive --region "\${region}" --only-show-errors
 printf '%s\n' "\${bundle_key}" >"\${workdir}/bundle-key.txt"
 aws s3 cp "\${workdir}/bundle-key.txt" "s3://\${bucket}/\${run_prefix}/bundle-key.txt" --region "\${region}" --only-show-errors
@@ -285,14 +351,16 @@ cat >"\${workdir}/source-result.json" <<JSON
   "bundle_bytes": \${bundle_bytes},
   "unique_chunk_bytes": \${unique_chunk_bytes},
   "bundle_key": "\${bundle_key}",
+  "bundle_archive_bytes": \${bundle_archive_bytes},
   "pack_files": \${packed_chunks},
-  "bundle_s3_uri": "s3://\${bucket}/\${run_prefix}/spore.bundle/"
+  "bundle_s3_uri": "s3://\${bucket}/\${run_prefix}/spore.bundle/",
+  "source_peer_url": "\${source_peer_url}"
 }
 JSON
 aws s3 cp "\${workdir}/source-result.json" "s3://\${bucket}/\${run_prefix}/source-result.json" --region "\${region}" --only-show-errors
 cat "\${workdir}/source-result.json"
 
-if [[ "\${keep_remote}" != "1" ]]; then
+if [[ "\${keep_remote}" != "1" && -z "\${source_peer_ip}" ]]; then
   rm -rf "\${workdir}"
 fi
 EOF
@@ -308,6 +376,7 @@ export XDG_STATE_HOME="\${XDG_STATE_HOME:-\${HOME}/.local/state}"
 mkdir -p "\${XDG_CACHE_HOME}" "\${XDG_DATA_HOME}" "\${XDG_STATE_HOME}"
 command -v git >/dev/null 2>&1 || { echo "git is required" >&2; exit 1; }
 command -v tar >/dev/null 2>&1 || { echo "tar is required" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
 
 region=${q_region}
 bucket=${q_bucket}
@@ -315,6 +384,8 @@ run_prefix=${q_run_prefix}
 resume_seconds=${q_resume_seconds}
 dest_repeat=${q_dest_repeat}
 cache_dir=${q_cache_dir}
+source_peer_ip=${q_source_peer_ip}
+source_peer_port=${q_source_peer_port}
 keep_remote=${q_keep_remote}
 dest_instance="\${SPOREVM_DEST_INSTANCE:?SPOREVM_DEST_INSTANCE is required}"
 safe_dest="\$(printf '%s' "\${dest_instance}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
@@ -337,44 +408,84 @@ mise install
 mise exec -- zig build
 mise exec -- zig build kvm-boot
 
+fetch_bundle() {
+  local out_dir="\$1"
+  local origin_bytes_var="\$2"
+  local peer_bytes_var="\$3"
+
+  rm -rf "\${out_dir}"
+  if [[ -n "\${source_peer_ip}" ]]; then
+    local tar_path="\${out_dir}.tar"
+    mkdir -p "\$(dirname "\${out_dir}")"
+    python3 - "\${source_peer_ip}" "\${source_peer_port}" "\${tar_path}" <<'PY'
+import sys
+import urllib.request
+
+ip, port, out_path = sys.argv[1:4]
+url = f"http://{ip}:{port}/spore.bundle.tar"
+with urllib.request.urlopen(url, timeout=300) as response, open(out_path, "wb") as out:
+    while True:
+        chunk = response.read(1024 * 1024)
+        if not chunk:
+            break
+        out.write(chunk)
+PY
+    local peer_download_size
+    peer_download_size="\$(wc -c <"\${tar_path}" | tr -d ' ')"
+    tar -xf "\${tar_path}" -C "\$(dirname "\${out_dir}")"
+    rm -f "\${tar_path}"
+    [[ -d "\${out_dir}" ]] || { echo "peer bundle extraction did not create \${out_dir}" >&2; exit 1; }
+    printf -v "\${origin_bytes_var}" '%s' 0
+    printf -v "\${peer_bytes_var}" '%s' "\${peer_download_size}"
+    return
+  fi
+
+  mkdir -p "\${out_dir}"
+  aws s3 cp "s3://\${bucket}/\${run_prefix}/spore.bundle/" "\${out_dir}" --recursive --region "\${region}" --only-show-errors
+  local direct_bytes
+  direct_bytes="\$(du -sb "\${out_dir}" | awk '{print \$1}')"
+  printf -v "\${origin_bytes_var}" '%s' "\${direct_bytes}"
+  printf -v "\${peer_bytes_var}" '%s' 0
+}
+
 materialize_bundle() {
   local out_dir="\$1"
   local cache_hit_var="\$2"
   local origin_bytes_var="\$3"
+  local peer_bytes_var="\$4"
 
-  mkdir -p "\${out_dir}"
   if [[ -z "\${cache_dir}" ]]; then
-    aws s3 cp "s3://\${bucket}/\${run_prefix}/spore.bundle/" "\${out_dir}" --recursive --region "\${region}" --only-show-errors
-    local direct_bytes
-    direct_bytes="\$(du -sb "\${out_dir}" | awk '{print \$1}')"
+    fetch_bundle "\${out_dir}" origin_bytes peer_bytes
     printf -v "\${cache_hit_var}" '%s' false
-    printf -v "\${origin_bytes_var}" '%s' "\${direct_bytes}"
+    printf -v "\${origin_bytes_var}" '%s' "\${origin_bytes}"
+    printf -v "\${peer_bytes_var}" '%s' "\${peer_bytes}"
     return
   fi
 
   local cache_bundle_dir="\${cache_dir}/\${bundle_key}/spore.bundle"
   local cache_complete="\${cache_dir}/\${bundle_key}/.complete"
   if [[ -f "\${cache_complete}" ]]; then
+    mkdir -p "\${out_dir}"
     cp -R "\${cache_bundle_dir}/." "\${out_dir}/"
     printf -v "\${cache_hit_var}" '%s' true
     printf -v "\${origin_bytes_var}" '%s' 0
+    printf -v "\${peer_bytes_var}" '%s' 0
     return
   fi
 
   local cache_tmp="\${cache_dir}/.tmp-\${bundle_key}-\${safe_dest}-\$\$"
   rm -rf "\${cache_tmp}"
-  mkdir -p "\${cache_tmp}/spore.bundle"
-  aws s3 cp "s3://\${bucket}/\${run_prefix}/spore.bundle/" "\${cache_tmp}/spore.bundle" --recursive --region "\${region}" --only-show-errors
-  local fetched_bytes
-  fetched_bytes="\$(du -sb "\${cache_tmp}/spore.bundle" | awk '{print \$1}')"
+  fetch_bundle "\${cache_tmp}/spore.bundle" fetched_origin_bytes fetched_peer_bytes
   mkdir -p "\${cache_dir}/\${bundle_key}"
   rm -rf "\${cache_bundle_dir}"
   mv "\${cache_tmp}/spore.bundle" "\${cache_bundle_dir}"
   : >"\${cache_complete}"
   rm -rf "\${cache_tmp}"
+  mkdir -p "\${out_dir}"
   cp -R "\${cache_bundle_dir}/." "\${out_dir}/"
   printf -v "\${cache_hit_var}" '%s' false
-  printf -v "\${origin_bytes_var}" '%s' "\${fetched_bytes}"
+  printf -v "\${origin_bytes_var}" '%s' "\${fetched_origin_bytes}"
+  printf -v "\${peer_bytes_var}" '%s' "\${fetched_peer_bytes}"
 }
 
 if [[ -n "\${cache_dir}" ]]; then
@@ -382,6 +493,8 @@ if [[ -n "\${cache_dir}" ]]; then
 fi
 
 total_origin_bytes=0
+total_peer_bytes=0
+total_download_bytes=0
 cache_hits=0
 cache_misses=0
 local_bundle_bytes=0
@@ -391,13 +504,16 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   iter_dir="\${workdir}/resume-\${iteration}"
   bundle_dir="\${iter_dir}/spore.bundle"
   unpacked_dir="\${iter_dir}/spore.unpacked"
-  materialize_bundle "\${bundle_dir}" cache_hit origin_bytes
+  materialize_bundle "\${bundle_dir}" cache_hit origin_bytes peer_bytes
   if [[ "\${cache_hit}" == "true" ]]; then
     cache_hits=\$((cache_hits + 1))
   else
     cache_misses=\$((cache_misses + 1))
   fi
+  downloaded_bytes=\$((origin_bytes + peer_bytes))
   total_origin_bytes=\$((total_origin_bytes + origin_bytes))
+  total_peer_bytes=\$((total_peer_bytes + peer_bytes))
+  total_download_bytes=\$((total_download_bytes + downloaded_bytes))
   local_bundle_bytes="\$(du -sb "\${bundle_dir}" | awk '{print \$1}')"
   zig-out/bin/spore unpack "\${bundle_dir}" --out "\${unpacked_dir}"
   scripts/smoke-restore-leg.sh resume \
@@ -409,19 +525,30 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   if [[ -n "\${iteration_json}" ]]; then
     iteration_json="\${iteration_json},"
   fi
-  iteration_json="\${iteration_json}{\"iteration\":\${iteration},\"cache_hit\":\${cache_hit},\"origin_downloaded_bundle_bytes\":\${origin_bytes},\"local_bundle_bytes\":\${local_bundle_bytes},\"unpacked_chunks\":\${unpacked_chunks}}"
+  iteration_json="\${iteration_json}{\"iteration\":\${iteration},\"cache_hit\":\${cache_hit},\"downloaded_bundle_bytes\":\${downloaded_bytes},\"origin_downloaded_bundle_bytes\":\${origin_bytes},\"peer_downloaded_bundle_bytes\":\${peer_bytes},\"local_bundle_bytes\":\${local_bundle_bytes},\"unpacked_chunks\":\${unpacked_chunks}}"
 done
+
+cache_enabled=false
+if [[ -n "\${cache_dir}" ]]; then
+  cache_enabled=true
+fi
+source_peer_enabled=false
+if [[ -n "\${source_peer_ip}" ]]; then
+  source_peer_enabled=true
+fi
 
 cat >"\${workdir}/dest-result.json" <<JSON
 {
   "role": "dest",
   "instance_id": "\${dest_instance}",
   "workdir": "\${workdir}",
-  "downloaded_bundle_bytes": \${total_origin_bytes},
+  "downloaded_bundle_bytes": \${total_download_bytes},
   "origin_downloaded_bundle_bytes": \${total_origin_bytes},
+  "peer_downloaded_bundle_bytes": \${total_peer_bytes},
   "local_bundle_bytes": \${local_bundle_bytes},
   "bundle_key": "\${bundle_key}",
-  "cache_enabled": $(if [[ -n "${cache_dir}" ]]; then printf true; else printf false; fi),
+  "cache_enabled": \${cache_enabled},
+  "source_peer_enabled": \${source_peer_enabled},
   "cache_hits": \${cache_hits},
   "cache_misses": \${cache_misses},
   "resume_count": \${dest_repeat},
@@ -525,6 +652,9 @@ wait_remote_command() {
 
 echo "running source capture/pack on ${source_instance}" >&2
 source_command_id="$(send_remote_script "${source_instance}" source)"
+if [[ -n "${source_peer_ip}" && "${keep_remote}" != "1" ]]; then
+  source_peer_started=1
+fi
 wait_remote_command "${source_instance}" "${source_command_id}" source
 
 dest_command_ids=()
@@ -568,10 +698,22 @@ for path in dest_paths:
 bundle_bytes = int(source["bundle_bytes"])
 unique_chunk_bytes = int(source["unique_chunk_bytes"])
 total_destination_download_bytes = sum(int(d["downloaded_bundle_bytes"]) for d in dests)
+total_destination_origin_bytes = sum(int(d.get("origin_downloaded_bundle_bytes", d["downloaded_bundle_bytes"])) for d in dests)
+total_destination_peer_bytes = sum(int(d.get("peer_downloaded_bundle_bytes", 0)) for d in dests)
 total_resume_count = sum(int(d.get("resume_count", 1)) for d in dests)
 total_cache_hits = sum(int(d.get("cache_hits", 0)) for d in dests)
 total_cache_misses = sum(int(d.get("cache_misses", 0)) for d in dests)
 cache_enabled = any(bool(d.get("cache_enabled", False)) for d in dests)
+source_peer_enabled = any(bool(d.get("source_peer_enabled", False)) for d in dests)
+
+if source_peer_enabled and cache_enabled:
+    origin_mode = "source-peer-http-with-host-local-cache"
+elif source_peer_enabled:
+    origin_mode = "source-peer-http"
+elif cache_enabled:
+    origin_mode = "host-local-bundle-cache"
+else:
+    origin_mode = "direct-s3-per-destination"
 
 def ratio(numerator, denominator):
     if denominator == 0:
@@ -589,12 +731,16 @@ json.dump({
     "unique_chunk_bytes": unique_chunk_bytes,
     "bundle_key": source["bundle_key"],
     "total_destination_download_bytes": total_destination_download_bytes,
+    "total_destination_origin_bytes": total_destination_origin_bytes,
+    "total_destination_peer_bytes": total_destination_peer_bytes,
     "total_cache_hits": total_cache_hits,
     "total_cache_misses": total_cache_misses,
-    "origin_multiplier_vs_bundle": ratio(total_destination_download_bytes, bundle_bytes),
-    "origin_multiplier_vs_unique_chunks": ratio(total_destination_download_bytes, unique_chunk_bytes),
-    "origin_multiplier_vs_resume_bundle": ratio(total_destination_download_bytes, bundle_bytes * total_resume_count),
-    "origin_mode": "host-local-bundle-cache" if cache_enabled else "direct-s3-per-destination",
+    "download_multiplier_vs_bundle": ratio(total_destination_download_bytes, bundle_bytes),
+    "peer_multiplier_vs_bundle": ratio(total_destination_peer_bytes, bundle_bytes),
+    "origin_multiplier_vs_bundle": ratio(total_destination_origin_bytes, bundle_bytes),
+    "origin_multiplier_vs_unique_chunks": ratio(total_destination_origin_bytes, unique_chunk_bytes),
+    "origin_multiplier_vs_resume_bundle": ratio(total_destination_origin_bytes, bundle_bytes * total_resume_count),
+    "origin_mode": origin_mode,
     "destinations": dests,
 }, sys.stdout, indent=2)
 print()
