@@ -419,7 +419,14 @@ before the clean bundle is allowed to resume. A validation run over the two dev
 hosts with source-peer HTTP, `--cache-dir`, and `--dest-repeat 2` reported
 `total_destination_origin_bytes=0`, `total_cache_hits=1`,
 `total_cache_misses=1`, `total_corrupt_bundle_rejections=1`, and lazy KVM
-resume `ttfi_ms=1..2` on the destination.
+resume `ttfi_ms=1..2` on the destination. With ten live `m7g.metal` instances,
+the same smoke then ran a cost-bounded 1-source + 9-destination star topology:
+the source published the 29,382,174-byte bundle to S3, destinations fetched from
+the source peer over HTTP, all nine resumed with lazy KVM RAM, and aggregate
+metrics reported `destination_count=9`, `total_destination_origin_bytes=0`,
+`total_destination_peer_bytes=264,499,200`,
+`total_corrupt_bundle_rejections=9`, and
+`origin_multiplier_vs_resume_bundle=0.0`.
 
 ## Delivery Strategy
 
@@ -525,8 +532,10 @@ separate diagnostic goal.
 Status: in progress. Local chunkpack bundles with canonical `bundle_digest`
 output, the first two-host S3/SSM remote restore smoke, a host-local
 cache-backed repeat restore smoke, a source-peer HTTP seed proof, and corrupted
-distributed-bundle rejection checks have landed. Larger-host-count peer/fleet
-fan-out and measured origin-egress efficiency remain.
+distributed-bundle rejection checks have landed. A ten-instance single-source
+peer fan-out smoke has also passed with zero destination S3-origin bytes.
+Multi-peer/cache-hierarchy fan-out and measured origin-egress efficiency beyond
+one seed remain.
 
 Start with a local bundle/chunkpack format, then add distribution adapters.
 `spore pack` writes a portable bundle containing a manifest with local RAM
@@ -544,9 +553,10 @@ downloads. The current script can prove per-host cache reuse with
 `--cache-dir` and `--dest-repeat`, and it can prove first-fetch reduction from
 the durable origin with source-peer HTTP seeding via `--source-peer-ip`; it also
 corrupts one fetched bundle copy per destination to keep peer/origin trust tied
-to chunk verification. That is still a single-seed proof, not the final peer
-graph or cache hierarchy. Scale tests at 10 → 100 → 1,000 identical hosts
-happen before claiming 10,000.
+to chunk verification. The ten-instance run proves this works as a small fleet
+star topology, but it is still a single-seed proof, not the final peer graph or
+cache hierarchy. Scale tests at 100 → 1,000 identical hosts happen before
+claiming 10,000.
 
 Done when: a multi-host fan-out demo restores one spore on every host in a
 test fleet with origin egress measured at a small multiple of the unique chunk
