@@ -22,7 +22,8 @@ Options:
   --snapshot-after-ms N     capture delay before snapshot (default: 3000)
   --resume-seconds N        seconds to let resumed VM tick (default: 5)
   --min-tick N              minimum observed ticker value on resume (default: 1)
-  --kvm-lazy-ram            use kvm-boot --lazy-ram for KVM resume
+  --lazy-ram                use backend --lazy-ram for resume
+  --kvm-lazy-ram            compatibility alias for --lazy-ram
   --cmdline TEXT            override fresh-boot kernel command line
   --boot-bin PATH           use an already-built boot harness
   --no-build                do not run `zig build <backend>-boot`
@@ -68,7 +69,7 @@ mem_mib="512"
 snapshot_after_ms="3000"
 resume_seconds="5"
 min_tick="1"
-kvm_lazy_ram=0
+lazy_ram=0
 cmdline=""
 boot_bin=""
 build=1
@@ -120,8 +121,8 @@ while (($#)); do
       min_tick="${2:-}"
       shift 2
       ;;
-    --kvm-lazy-ram)
-      kvm_lazy_ram=1
+    --lazy-ram|--kvm-lazy-ram)
+      lazy_ram=1
       shift
       ;;
     --cmdline)
@@ -218,16 +219,16 @@ metric_value() {
   sed -nE "s/.*(^| )${name}=([0-9]+)( |$).*/\2/p" <<<"${line}"
 }
 
-assert_kvm_restore_metrics() {
+assert_restore_metrics() {
   local line="$1"
   local expected_mode="$2"
-  [[ "${line}" =~ (^|[[:space:]])mode=${expected_mode}([[:space:]]|$) ]] || die "unexpected KVM restore mode in metrics: ${line}"
+  [[ "${line}" =~ (^|[[:space:]])mode=${expected_mode}([[:space:]]|$) ]] || die "unexpected restore mode in metrics: ${line}"
   for field in chunks memory_ms state_ms pre_run_ms; do
     local value
     value="$(metric_value "${field}" "${line}")"
-    [[ -n "${value}" ]] || die "KVM restore metrics missing numeric ${field}: ${line}"
+    [[ -n "${value}" ]] || die "restore metrics missing numeric ${field}: ${line}"
     if [[ "${field}" == "chunks" && "${value}" == "0" ]]; then
-      die "KVM restore metrics reported zero chunks: ${line}"
+      die "restore metrics reported zero chunks: ${line}"
     fi
   done
 }
@@ -361,7 +362,7 @@ resume() {
   local log="${spore_dir%/}.resume.${backend}.log"
   local cmd=("${boot_bin}" "${kernel}" --mem-mib "${mem_mib}" --resume "${spore_dir}")
   local lazy_trace=""
-  if [[ "${backend}" == "kvm" && "${kvm_lazy_ram}" == "1" ]]; then
+  if [[ "${lazy_ram}" == "1" ]]; then
     lazy_trace="${spore_dir%/}.lazy-trace.log"
     rm -f "${lazy_trace}"
     cmd+=(--lazy-ram)
@@ -382,23 +383,23 @@ resume() {
 
   local restore_metrics=""
   local ttfi_ms=""
-  if [[ "${backend}" == "kvm" ]]; then
-    restore_metrics="$(grep -E 'kvm restore metrics:' "${log}" | tail -1 || true)"
+  if [[ "${mode}" == "resume" || "${mode}" == "same-host" ]]; then
+    restore_metrics="$(grep -E "${backend} restore metrics:" "${log}" | tail -1 || true)"
     if [[ -z "${restore_metrics}" ]]; then
       print_tail "${log}"
-      die "resume log did not contain kvm restore metrics"
+      die "resume log did not contain ${backend} restore metrics"
     fi
     local expected_mode="eager_chunks"
-    if [[ "${kvm_lazy_ram}" == "1" ]]; then
+    if [[ "${lazy_ram}" == "1" ]]; then
       expected_mode="lazy_chunks"
     fi
-    assert_kvm_restore_metrics "${restore_metrics}" "${expected_mode}"
+    assert_restore_metrics "${restore_metrics}" "${expected_mode}"
     ttfi_ms="$(metric_value pre_run_ms "${restore_metrics}")"
   fi
 
   local lazy_faults=""
   local lazy_unique_chunks=""
-  if [[ "${backend}" == "kvm" && "${kvm_lazy_ram}" == "1" ]]; then
+  if [[ "${lazy_ram}" == "1" ]]; then
     [[ -s "${lazy_trace}" ]] || die "lazy RAM trace was empty or missing: ${lazy_trace}"
     read -r lazy_faults lazy_unique_chunks < <(lazy_trace_counts "${lazy_trace}")
     if [[ "${lazy_faults}" == "0" || "${lazy_unique_chunks}" == "0" ]]; then

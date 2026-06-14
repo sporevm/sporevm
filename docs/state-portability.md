@@ -76,7 +76,7 @@ block identical-host fork/fan-out.
 | Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; fork path populates it |
 | Disk contents | not represented | no | same external bytes required | no | same external bytes required | out of v0 |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
-| Access trace | not yet represented | no | no | no | no | local KVM lazy trace only; not a portability contract |
+| Access trace | not yet represented | no | no | no | no | local KVM/HVF lazy traces only; not a portability contract |
 
 ## Register classes
 
@@ -199,7 +199,7 @@ Current HVF gaps:
 | Direction | Current status | Gate before declaring green |
 | --- | --- | --- |
 | KVM→KVM | Passes same-host smoke on the `m7g.metal` KVM host. | Keep as regression coverage. |
-| HVF→HVF | Passes same-host smoke locally. | Keep as regression coverage. |
+| HVF→HVF | Passes same-host smoke locally, including HVF lazy RAM and file-backed fork smokes. | Keep as regression coverage. |
 | KVM→HVF | Portable vCPU, virtio, generation, GIC apply, and CPU profile machinery exist. `m7g.metal` spores fail closed on counter-frequency mismatch. | Need a KVM producer whose guest counter frequency matches HVF's 24MHz, or a designed cross-frequency timer contract. |
 | HVF→KVM | Blocked because HVF still produces backend-private GIC state. Timer compatibility still applies. | Make HVF produce portable GICv3 state, then run with compatible counter frequency. |
 
@@ -238,6 +238,11 @@ Current evidence:
   through `sporevm-initrd-tick 7`.
 - HVF same-host diskless restore locally resumes the ticker through
   `sporevm-initrd-tick 7`.
+- HVF same-host lazy restore locally resumes 512MiB with ttfi_ms=50 and 4GiB
+  with ttfi_ms=65; both materialize only the touched CAS chunks before useful
+  guest work.
+- HVF same-host fork fan-out locally runs trusted file-backed children; a
+  representative 8-child, parallel-4 run reported file_backed_children=8.
 - KVM→HVF with an `m7g.metal` producer is a negative test: the spore records
   `counter_frequency_hz = 1_050_000_000` and HVF exposes 24MHz, so restore must
   reject it before running guest code.

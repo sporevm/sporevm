@@ -25,7 +25,7 @@ Options:
   --memory-sample-seconds N keep matched KVM children alive and sample host
                             /proc smaps_rollup after N seconds (default: 0)
   --max-host-pss-mib N      fail if sampled child PSS exceeds this MiB total
-  --ram-backing-mode MODE   KVM child RAM backing handoff: path or fdpass
+  --ram-backing-mode MODE   child RAM backing handoff: path or KVM fdpass
                             (default: path)
   --cmdline TEXT            override fresh-boot kernel command line
   --boot-bin PATH           use an already-built boot harness
@@ -476,7 +476,7 @@ run_child_resume() {
   local result="${result_dir}/$(printf '%06d' "${i}").result"
   local complete_pattern="sporevm-fork-smoke acked_generation=.*irq_status_after_ack=0"
   local cmd=("${boot_bin}" "${kernel}" --mem-mib "${mem_mib}" --resume "${child_dir}")
-  if [[ "${backend}" == "kvm" ]]; then
+  if [[ "${backend}" == "kvm" || "${backend}" == "hvf" ]]; then
     cmd+=(--trust-ram-backing)
     if [[ "${ram_backing_mode}" == "fdpass" ]]; then
       cmd+=(--fdpass-ram-backing)
@@ -660,8 +660,8 @@ for ((i = 0; i < count; i++)); do
     child_resume_max_ms="${child_resume_ms[i]}"
   fi
 done
-if [[ "${backend}" == "kvm" && "${file_backed_children}" != "${count}" ]]; then
-  die "expected every KVM child to use file-backed RAM; got ${file_backed_children}/${count}"
+if [[ ( "${backend}" == "kvm" || "${backend}" == "hvf" ) && "${file_backed_children}" != "${count}" ]]; then
+  die "expected every ${backend} child to use file-backed RAM; got ${file_backed_children}/${count}"
 fi
 total_smoke_ms=$(( $(now_ms) - smoke_start_ms ))
 write_metrics "${children_resume_wall_ms}" "${child_resume_sum_ms}" "${child_resume_min_ms}" "${child_resume_max_ms}" "${file_backed_children}" "${total_smoke_ms}"
