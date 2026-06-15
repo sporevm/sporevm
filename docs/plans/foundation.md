@@ -458,9 +458,15 @@ trusted `ram.backing` resume reported `mode=trusted_file_backed` with
 `pre_run_ms=3`.
 The 4GiB paired run reported full-scan `snapshot_pause_ms=27097` /
 `memory_ms=27095` versus dirty-log `snapshot_pause_ms=2` / `memory_ms=1` after
-`seed_ms=24432` and epoch sealing `seal_ms=3340`. This is the Linux proof path;
-HVF write-protect tracking still needs measurement before deciding whether
-macOS gets always-on tracking or an explicit suspend-time scan boundary.
+`seed_ms=24432` and epoch sealing `seal_ms=3340`. A 16GiB run reported
+full-scan `snapshot_pause_ms=106069` / `memory_ms=106065` versus dirty-log
+`snapshot_pause_ms=5` / `memory_ms=1` after `seed_ms=96912` and epoch sealing
+`seal_ms=11103`; eager cold resume from that spore passed with
+`memory_ms=28843` / `pre_run_ms=28853`, so large imported resumes remain a
+separate optimisation target from same-host trusted `ram.backing` forks. This
+is the Linux proof path; HVF write-protect tracking still needs measurement
+before deciding whether macOS gets always-on tracking or an explicit
+suspend-time scan boundary.
 
 ## Delivery Strategy
 
@@ -604,9 +610,9 @@ than dirty ring: it keeps the spore chunk refs and trusted same-host
 `ram.backing` up to date during execution, explicitly marks VMM-side guest RAM
 writes that KVM dirty logging cannot see, and records paired full-scan vs
 dirty-log metrics. The first A1 numbers show suspend pause dropping from
-~4.0s→1ms at 512MiB and ~27.1s→2ms at 4GiB, with chunk sealing paid before
-suspend. Dirty ring, product monitor background threading, 16GiB Linux
-measurement, and HVF write-protect-exit measurement remain.
+~4.0s→2ms at 512MiB, ~27.1s→2ms at 4GiB, and ~106s→5ms at 16GiB, with chunk
+sealing paid before suspend. Dirty ring, product monitor background threading,
+and HVF write-protect-exit measurement remain.
 
 Continuous epoch-based chunk sealing during normal execution; suspend becomes
 pause + tail flush. Measure the steady-state overhead (KVM dirty ring vs HVF
