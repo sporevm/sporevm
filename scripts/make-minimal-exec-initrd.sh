@@ -334,6 +334,11 @@ static int send_client_output(struct client *client, const char *name, uint64_t 
   return 0;
 }
 
+static void mirror_console(int is_stdout, const unsigned char *buf, size_t len) {
+  int fd = is_stdout ? STDOUT_FILENO : STDERR_FILENO;
+  (void)write_all(fd, buf, len);
+}
+
 static int wait_child(pid_t pid, int *status, int block) {
   for (;;) {
     pid_t rc = waitpid(pid, status, block ? 0 : WNOHANG);
@@ -603,6 +608,7 @@ static void pump_session_stream(struct session *session, struct client *client, 
     ssize_t n = read(*fd, buf, sizeof(buf));
     if (n > 0) {
       uint64_t frame_offset = *offset;
+      mirror_console(is_stdout, buf, (size_t)n);
       replay_append(replay, frame_offset, buf, (size_t)n);
       *offset += (uint64_t)n;
       if (client->fd >= 0) {
@@ -836,7 +842,26 @@ cat >"${workdir}/sleeper.c" <<'EOF'
 int main(void) {
   puts("spore run ready");
   fflush(stdout);
-  for (;;) sleep(60);
+  unsigned long i = 0;
+  for (;;) {
+    sleep(1);
+    printf("spore sleeper tick %lu\n", i++);
+    fflush(stdout);
+  }
+}
+EOF
+
+cat >"${workdir}/counter.c" <<'EOF'
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+  unsigned long i = 0;
+  for (;;) {
+    printf("spore counter %lu\n", i++);
+    fflush(stdout);
+    sleep(1);
+  }
 }
 EOF
 
@@ -845,7 +870,8 @@ EOF
 "${cc_cmd[@]}" -static -Os -s "${workdir}/false.c" -o "${workdir}/root/bin/false"
 "${cc_cmd[@]}" -static -Os -s "${workdir}/writeout.c" -o "${workdir}/root/bin/writeout"
 "${cc_cmd[@]}" -static -Os -s "${workdir}/sleeper.c" -o "${workdir}/root/bin/sleeper"
-chmod 0755 "${workdir}/root/init" "${workdir}/root/bin/true" "${workdir}/root/bin/false" "${workdir}/root/bin/writeout" "${workdir}/root/bin/sleeper"
+"${cc_cmd[@]}" -static -Os -s "${workdir}/counter.c" -o "${workdir}/root/bin/counter"
+chmod 0755 "${workdir}/root/init" "${workdir}/root/bin/true" "${workdir}/root/bin/false" "${workdir}/root/bin/writeout" "${workdir}/root/bin/sleeper" "${workdir}/root/bin/counter"
 chmod 1777 "${workdir}/root/tmp"
 
 mkdir -p "$(dirname "${out}")"

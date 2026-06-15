@@ -89,10 +89,10 @@ grep -Fq "captured snapshot at ${capture_dir}" "${run_stderr}" || {
 
 "${spore_bin}" resume --backend "${backend}" "${capture_dir}" >"${resume_log}" 2>&1 &
 resume_pid="$!"
-seen_restore=0
-for _ in $(seq 1 "${SPORE_SMOKE_RESUME_POLLS:-80}"); do
-  if grep -Eaq "${backend} restore metrics:" "${resume_log}"; then
-    seen_restore=1
+seen_resume_output=0
+for _ in $(seq 1 "${SPORE_SMOKE_RESUME_POLLS:-120}"); do
+  if grep -Eaq 'spore sleeper tick [0-9]+' "${resume_log}"; then
+    seen_resume_output=1
     break
   fi
   sleep "${SPORE_SMOKE_RESUME_POLL_INTERVAL:-0.1}"
@@ -103,9 +103,9 @@ sleep 0.2
 kill -KILL "${resume_pid}" >/dev/null 2>&1 || true
 wait "${resume_pid}" >/dev/null 2>&1 || true
 
-if [[ "${seen_restore}" != "1" ]]; then
+if [[ "${seen_resume_output}" != "1" ]]; then
   tail -80 "${resume_log}" >&2 || true
-  die "product resume did not restore the captured run spore"
+  die "product resume did not stream output from the captured run spore"
 fi
 
 echo "smoke:run-capture ok backend=${backend}"

@@ -9,6 +9,7 @@ spec_refs:
   - src/rootfs.zig
   - scripts/make-minimal-exec-initrd.sh
   - scripts/ensure-managed-kernel.sh
+  - scripts/smoke-counter-fanout.sh
 related_plans:
   - docs/plans/foundation.md
 ---
@@ -24,10 +25,11 @@ request over vsock, stream stdout/stderr, return the command status, and
 fail closed when required boot assets or workload inputs are unsupported.
 
 The current implementation proves the host/guest control path with default run
-assets, read-only rootfs execution, and direct OCI image cache convenience. The
-next bridge is lifecycle: turn the harness-only capture/resume path into a
-product surface that can run a long-lived process, capture it on a host signal,
-fork it, and resume each child through `spore resume`.
+assets, read-only rootfs execution, direct OCI image cache convenience, product
+resume, streaming run output, and host-signalled capture. The remaining bridge
+proof is diskless fan-out through product commands: run a long-lived process,
+capture it on a host signal, fork it, and resume child spores with visible
+post-resume output.
 
 The first OCI-capable milestone is intentionally two-step:
 
@@ -48,23 +50,17 @@ plan boundary that consumers own image policy.
 
 ## Problem
 
-The current `spore run` and `spore resume` commands are good enough for short
-fresh runs and explicit single-spore resumes, but the lifecycle still stops
-short of host-triggered capture:
+`spore run` and `spore resume` now cover the basic diskless lifecycle, but the
+fan-out proof still needs a product-shaped demo rather than a harness-shaped
+one. The remaining issue is output visibility after resume: the original
+host-side run-vsock stream is not a portable spore artifact, so resumed captured
+workloads must be visible through restore-time guest console output or through a
+future explicit reconnect protocol.
 
-- `spore run` has no host-triggered capture path. Backend run loops can
-  snapshot after a fixed delay, but not when the operator sends Ctrl-C or
-  another host signal.
-- fresh `spore run` streams stdout/stderr, but the capture path still needs to
-  request a snapshot from a safe backend loop point without corrupting in-flight
-  vsock/device state;
-- the run-vsock stream is part of captured virtio state, and the KVM snapshot
-  path already rejects snapshots while vsock has pending packets, so capture
-  must be driven from a safe run-loop point rather than directly from a signal
-  handler.
-
-Without this next bridge, the fork/fan-out thesis remains demonstrable through
-harnesses but awkward from the product CLI.
+Disk-backed/rootfs fan-out is still outside this bridge. v0 spores do not
+capture disk bytes, and product `spore resume` correctly rejects disk-backed
+spores until the foundation plan adds disk manifests or another explicit disk
+restore contract.
 
 ## Goals
 
@@ -123,16 +119,18 @@ harnesses but awkward from the product CLI.
 - `spore run --image REF -- <argv...>` resolves REF to a digest-pinned
   linux/arm64 image identity, builds or reuses a cached ext4 rootfs, and then
   delegates to the same read-only `--rootfs` execution path.
-- Harness capture remains real on both backends through `snapshot_after_ms`,
-  including eager, lazy, and trusted local RAM backing modes. Host-signalled
-  capture from `spore run` is still pending.
+- `spore run --capture-on-abort DIR` requests a backend-loop snapshot from a
+  host signal, defaulting to `INT`; `--capture-signal NAME` covers
+  non-interactive smokes.
+- `mise run smoke:run-capture` validates host-signalled capture and product
+  resume of the captured diskless spore.
 - Product `spore resume SPORE` now promotes the backend resume path for one
   spore at a time and defaults RAM size from `manifest.platform.ram_size`.
-- The minimal exec agent has an offset-aware attach/replay request shape for a
-  future resume-aware run stream, but product resume does not depend on it yet.
-- Product `spore resume` can stream the guest console through the existing
-  backend console sink, but it cannot assume the host-side run-vsock stream
-  from a captured `spore run` still exists after restore.
+- The minimal exec agent streams stdout/stderr over run-vsock for fresh runs and
+  mirrors workload output to the guest console so resumed captured workloads are
+  visible through `spore resume`.
+- The minimal initrd includes a diskless `/bin/counter` helper for lifecycle
+  fan-out smokes.
 
 ## Target Model
 
@@ -208,10 +206,10 @@ cache directory under `sporevm/rootfs`. Setup and cache messages go to stderr.
 ### Host-Signalled Capture And Resume
 
 ```console
-spore run --image ruby-demo --capture-on-abort ruby-counter.spore -- ruby /demo/counter.rb
+spore run --capture-on-abort counter.spore -- /bin/counter
 # press Ctrl-C to capture
-spore fork ruby-counter.spore --count 10 --out ruby-counter.children/
-for child in ruby-counter.children/*; do spore resume "$child" & done
+spore fork counter.spore --count 10 --out counter.children/
+for child in counter.children/*; do spore resume "$child" & done
 ```
 
 The product lifecycle should stay explicit:
@@ -242,8 +240,8 @@ request a specific host signal such as `USR1`. The signal handler only sets an
 atomic capture request or wakes the VMM loop. The actual snapshot is written
 from the normal VMM loop after pending device work has been made safe. The
 default `--capture-on-abort` behavior is to write the spore and exit. Future
-policy can add `--after-capture exit|continue|pause`, but the Ruby counter demo
-and CI fan-out proof only need capture-then-exit.
+policy can add `--after-capture exit|continue|pause`, but the diskless counter
+demo and CI fan-out proof only need capture-then-exit.
 
 Streaming output is part of this same surface. Fresh `spore run` now streams
 stdout/stderr as the workload runs. `spore run --capture-on-abort ...` should
@@ -253,10 +251,12 @@ spore from a safe backend loop point.
 Fresh `spore run` can stream over the run-vsock connection. Resuming a captured
 run is different: the guest may still believe it has an accepted vsock
 connection, but the host-side `HostStream` object is not a portable spore
-artifact. The first product resume surface should therefore stream restore-time
-guest console output, which already exists on both backends. If we need
-stdout/stderr separation after resume, add an explicit guest-agent reconnect or
-host-stream state model later; do not hide that behind `spore resume`.
+artifact. The first product resume surface therefore streams restore-time guest
+console output, and the minimal exec agent mirrors workload output to that
+console while still sending typed stdout/stderr frames for fresh runs. If we
+need stdout/stderr separation after resume, add an explicit guest-agent
+reconnect or host-stream state model later; do not hide that behind
+`spore resume`.
 
 This avoids requiring a guest API before the thesis is proven. A later
 guest-visible readiness/checkpoint API can still be added for applications that
@@ -414,8 +414,10 @@ policy.
 
 ### Slice F: Host-Signalled Run Capture And Resume Surface
 
-Status: in progress. F1 and F2 have landed; F3 is the next implementation
-slice. The full Ruby counter demo remains the Slice F completion proof.
+Status: implemented for diskless workloads. F1 through F4 have landed, and the
+diskless counter fan-out smoke is the Slice F completion proof. The earlier
+Ruby/rootfs demo remains deferred until product resume has a disk restore
+contract.
 
 Scope:
 
@@ -426,7 +428,8 @@ Scope:
 - Add `--capture-signal NAME` for non-interactive host-side capture triggers.
 - Snapshot from the backend run loop, not directly from the signal handler.
 - Stream guest output while the workload is running so demos can show progress
-  before capture, and stream resumed child output through the same path.
+  before capture, and mirror workload output to the guest console so resumed
+  children are visible through `spore resume`.
 - Add `spore resume SPORE` as the product resume verb for exactly one captured
   or forked spore.
 - Keep fan-out as `spore fork --count N --out DIR` plus repeated
@@ -457,9 +460,9 @@ Scope:
 Done when:
 
 ```console
-spore resume ruby-counter.spore
-spore fork ruby-counter.spore --count 10 --out ruby-counter.children/
-for child in ruby-counter.children/*; do spore resume "$child" & done
+spore resume counter.spore
+spore fork counter.spore --count 10 --out counter.children/
+for child in counter.children/*; do spore resume "$child" & done
 ```
 
 resumes one spore per command on the supported local backend, fails closed on
@@ -526,15 +529,16 @@ Done when a non-interactive smoke can send the configured host signal to
 
 #### Slice F4: Resume-Aware Output
 
+Status: implemented for the first product guarantee.
+
 Scope:
 
 - Make the long-running run demo visible after resume without depending on an
   uncaptured host-side vsock stream.
 - Start with restore-time guest console streaming, because that path already
   round-trips through backend resume.
-- Decide explicitly whether the guest run agent should also mirror workload
-  output to the guest console before capture, or whether a reconnectable agent
-  endpoint is required for separated stdout/stderr after resume.
+- Mirror workload stdout/stderr to the guest console from the minimal exec
+  agent while preserving the fresh-run typed run-vsock stream.
 - The current minimal exec agent already accepts offset-based attach requests
   and keeps bounded replay buffers, but `spore run --capture-on-abort` does not
   yet persist stream offsets for product resume to use.
@@ -545,28 +549,29 @@ Scope:
 Done when resumed children from a captured run produce visible output
 immediately through `spore resume`.
 
-#### Slice F5: Ruby Counter Fan-Out Demo
+#### Slice F5: Diskless Counter Fan-Out Demo
+
+Status: implemented.
 
 Scope:
 
-- Build or document a small linux/arm64 rootfs containing the Ruby counter
-  workload.
+- Add a small diskless `/bin/counter` helper to the minimal exec initrd.
 - Validate capture-on-abort, `spore fork --count 10`, and parallel product
   `spore resume` children from the captured process state.
 - Keep this as a smoke/demo boundary; do not add OCI runtime defaults, writable
-  rootfs state, or `resume --count`.
+  rootfs state, disk-backed product resume, or `resume --count`.
 
 Done when:
 
 ```console
-spore run --image ruby-demo --capture-on-abort ruby-counter.spore -- ruby /demo/counter.rb
+spore run --capture-on-abort counter.spore -- /bin/counter
 # press Ctrl-C to capture
-spore fork ruby-counter.spore --count 10 --out ruby-counter.children/
-for child in ruby-counter.children/*; do spore resume "$child" & done
+spore fork counter.spore --count 10 --out counter.children/
+for child in counter.children/*; do spore resume "$child" & done
 ```
 
-shows a live Ruby process counting before capture and ten resumed children
-streaming interleaved counters from the same captured process state.
+shows a live process counting before capture and ten resumed children streaming
+interleaved counters from the same captured process state.
 
 ## Verification
 
@@ -587,6 +592,8 @@ streaming interleaved counters from the same captured process state.
   not execute inside the signal handler.
 - KVM signal-capture smoke that proves `KVM_RUN` interruption wakes the run loop
   instead of surfacing as a generic ioctl failure.
+- `mise run smoke:counter-fanout` for diskless capture, fork, and parallel
+  product resume visibility.
 - Streaming protocol tests for stdout/stderr frame ordering, frame length
   validation, and final exit-code propagation.
 - Negative tests:
@@ -621,11 +628,16 @@ streaming interleaved counters from the same captured process state.
   RAM size from the spore manifest instead of the harness default.
 - The product `--json` final-frame behavior has been removed before 1.0. The
   desired product contract is streaming stdout/stderr plus process exit status.
-- The immediate next implementation slice is host-triggered capture from
-  `spore run`, because product resume and fresh-run streaming are now in place.
-- Resume visibility starts with backend console streaming. Separated
-  stdout/stderr after resuming a captured `spore run` requires a later explicit
-  reconnect or host-stream state design.
+- Host-triggered capture from `spore run` has landed as
+  `--capture-on-abort DIR`, with `--capture-signal NAME` for non-interactive
+  smokes.
+- Resume visibility starts with backend console streaming. The minimal exec
+  agent mirrors workload output to the guest console for the first product
+  guarantee. Separated stdout/stderr after resuming a captured `spore run`
+  requires a later explicit reconnect or host-stream state design.
+- The immediate fan-out proof is diskless. A Ruby/rootfs fan-out demo would
+  currently produce a disk-backed spore, and product `spore resume` correctly
+  rejects those until disk manifests or another disk restore contract land.
 
 ## Open Questions And Recommended Defaults
 
@@ -662,6 +674,8 @@ streaming interleaved counters from the same captured process state.
 - Event-stream JSON output for streaming runs.
 - Separated stdout/stderr after product `spore resume` if the first
   implementation streams only the guest console.
+- Ruby/rootfs fan-out through product `spore resume`, blocked on disk-backed
+  product resume rather than the run bridge itself.
 
 ## Key Learnings From Pressure-Testing
 
@@ -686,10 +700,9 @@ The first slice must either make the helper dependency explicitly
 development-only or install/generate assets in a way that survives normal
 `zig build` output and later package installation.
 
-The current Slice F risk is bundling several different problems into one PR:
-product resume, streaming run output, host-triggered snapshot, and resume-time
-output visibility. Product resume is still the narrow first slice because the
-backend mechanics already exist. Streaming run output should land before
-capture-on-abort so the long-running process is visible before it is captured.
-Resume-time output needs a separate decision because a host-side vsock stream is
-not part of the portable spore.
+The Slice F risk was bundling several different problems into one PR: product
+resume, streaming run output, host-triggered snapshot, and resume-time output
+visibility. Splitting those slices kept each behavior testable. The final proof
+stays diskless because `spore run --image ... --capture-on-abort` creates a
+disk-backed spore today, and product `spore resume` should not pretend that disk
+state is portable before the foundation plan has a disk manifest contract.

@@ -25,6 +25,10 @@ description = "Smoke product spore resume"
 run = "mise run build && scripts/smoke-run-capture.sh"
 description = "Smoke product spore run capture-on-abort"
 
+[tasks."smoke:counter-fanout"]
+run = "mise run build && scripts/smoke-counter-fanout.sh"
+description = "Smoke capture, fork, and resume counter fan-out"
+
 [tasks.smoke]
 run = "mise run build && scripts/smoke-run.sh && scripts/smoke-run-capture.sh && scripts/smoke-resume.sh"
 description = "Run product smoke tests"
