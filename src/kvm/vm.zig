@@ -509,6 +509,7 @@ const DirtyTracker = struct {
         dirty_pages_total: u64 = 0,
         dirty_pages_tail: u64 = 0,
         dirty_chunks_total: u64 = 0,
+        dirty_chunks_tail: u64 = 0,
         host_dirty_ranges_total: u64 = 0,
         host_dirty_chunks_total: u64 = 0,
         sealed_chunks_total: u64 = 0,
@@ -709,6 +710,7 @@ const DirtyTracker = struct {
         self.stats.seal_ms += (try monotonicMs()) - seal_start;
         self.stats.seal_cpu_ms += elapsedCpuMs(seal_cpu_start);
         self.stats.dirty_chunks_total += dirty_chunks_this_flush;
+        if (tail) self.stats.dirty_chunks_tail += dirty_chunks_this_flush;
     }
 
     fn collectDirtyLog(self: *DirtyTracker, tail: bool) !u64 {
@@ -786,6 +788,7 @@ const DirtyTracker = struct {
         self.stats.dirty_pages_total = 0;
         self.stats.dirty_pages_tail = 0;
         self.stats.dirty_chunks_total = 0;
+        self.stats.dirty_chunks_tail = 0;
         self.stats.host_dirty_ranges_total = 0;
         self.stats.host_dirty_chunks_total = 0;
         self.stats.sealed_chunks_total = 0;
@@ -902,7 +905,7 @@ fn takeSnapshot(
     if (dirty_tracker) |tracker| {
         const stats = tracker.stats;
         std.log.info(
-            "kvm snapshot metrics: mode=dirty-log ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} dirty_epoch_ms={d} dirty_epoch_count={d} dirty_pages_total={d} dirty_pages_tail={d} dirty_chunks_total={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} tail_flush_ms={d} get_dirty_log_ms={d} get_dirty_log_cpu_ms={d} seal_ms={d} seal_cpu_ms={d} worker_epoch_max_ms={d} worker_join_ms={d} tracking_ms={d} dirty_pages_per_sec={d} sealed_chunks_per_sec={d}",
+            "kvm snapshot metrics: mode=dirty-log ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} dirty_epoch_ms={d} dirty_epoch_count={d} dirty_pages_total={d} dirty_pages_tail={d} dirty_chunks_total={d} dirty_chunks_tail={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} tail_flush_ms={d} get_dirty_log_ms={d} get_dirty_log_cpu_ms={d} seal_ms={d} seal_cpu_ms={d} worker_epoch_max_ms={d} worker_join_ms={d} tracking_ms={d} dirty_pages_per_sec={d} sealed_chunks_per_sec={d}",
             .{
                 ram_size / 1024 / 1024,
                 memory_plan.chunk_count,
@@ -919,6 +922,7 @@ fn takeSnapshot(
                 stats.dirty_pages_total,
                 stats.dirty_pages_tail,
                 stats.dirty_chunks_total,
+                stats.dirty_chunks_tail,
                 stats.host_dirty_ranges_total,
                 stats.host_dirty_chunks_total,
                 stats.sealed_chunks_total,

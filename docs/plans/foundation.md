@@ -646,8 +646,10 @@ reported `snapshot_pause_ms=95` / `tail_flush_ms=72` at 1GiB and
 512MiB run reported `snapshot_pause_ms=124` and `127`, both with
 `tail_flush_ms=88`. This keeps the first macOS write-protect curve roughly flat
 with RAM size for the active-boot smoke, but 16GiB and higher-concurrency macOS
-CI scale runs remain before treating it as a product boundary. Reducing or
-predicting dirty-tail lag is still the next Slice 7 gap.
+CI scale runs remain before treating it as a product boundary. A later 512MiB
+HVF run at an 8s snapshot delay dropped to `snapshot_pause_ms=29` /
+`tail_flush_ms=15`, so active-boot dirty backlog is measurable; KVM and HVF now
+also report `dirty_chunks_tail` to make that backlog explicit.
 
 Continuous epoch-based chunk sealing during normal execution; suspend becomes
 pause + tail flush. First move epoch collection/sealing out of the vCPU loop
