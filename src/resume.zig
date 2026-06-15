@@ -109,7 +109,7 @@ pub fn execute(allocator: std.mem.Allocator, opts: Options) !void {
 
     switch (cause) {
         .guest_off, .guest_reset => {},
-        .snapshotted, .probe_complete => return error.UnexpectedResumeExit,
+        .snapshotted, .probe_complete, .monitor_stopped => return error.UnexpectedResumeExit,
     }
 }
 

@@ -14,7 +14,8 @@ const usage =
     \\  rootfs              Build rootfs images from OCI images
     \\  run [--kernel Image] [--initrd root.cpio] -- <argv...>
     \\                      Boot a throwaway VM and run one command
-    \\  resume <spore-dir>  Resume one captured or forked spore
+    \\  resume <spore-dir> [--name NAME]
+    \\                      Resume one spore, or resume it as a named VM
     \\  create NAME [options]
     \\                      Create a named VM lifecycle target
     \\  exec NAME -- <argv...>
@@ -22,8 +23,6 @@ const usage =
     \\  rm NAME             Remove a named VM
     \\  suspend NAME --out DIR
     \\                      Checkpoint a diskless named VM into a spore
-    \\  resume DIR --name NAME
-    \\                      Resume a diskless spore as a named VM
     \\  ls                  List named VMs in the local runtime registry
     \\  version             Print the sporevm version
     \\  host-info           Print this host's platform facts as JSON
@@ -58,7 +57,11 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, command, "run")) {
         try sporevm.run.cli(init, args[2..], stdout);
     } else if (std.mem.eql(u8, command, "resume")) {
-        try sporevm.resume_cmd.cli(init, args[2..], stdout);
+        if (wantsNamedResume(args[2..])) {
+            try sporevm.lifecycle.resumeCli(init, args[2..], stdout);
+        } else {
+            try sporevm.resume_cmd.cli(init, args[2..], stdout);
+        }
     } else if (std.mem.eql(u8, command, "create")) {
         try sporevm.lifecycle.createCli(init, args[2..], stdout);
     } else if (std.mem.eql(u8, command, "exec")) {
@@ -67,8 +70,6 @@ pub fn main(init: std.process.Init) !void {
         try sporevm.lifecycle.rmCli(init, args[2..], stdout);
     } else if (std.mem.eql(u8, command, "suspend")) {
         try sporevm.lifecycle.suspendCli(init, args[2..], stdout);
-    } else if (std.mem.eql(u8, command, "resume")) {
-        try sporevm.lifecycle.resumeCli(init, args[2..], stdout);
     } else if (std.mem.eql(u8, command, "ls")) {
         try sporevm.lifecycle.lsCli(init, args[2..], stdout);
     } else if (std.mem.eql(u8, command, "monitor")) {
@@ -110,6 +111,13 @@ fn printJson(allocator: std.mem.Allocator, writer: *Io.Writer, value: anytype) !
     const json = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
     try writer.writeAll(json);
     try writer.writeByte('\n');
+}
+
+fn wantsNamedResume(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--name")) return true;
+    }
+    return false;
 }
 
 fn forkCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.spore.ForkResult {
@@ -255,4 +263,9 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "pack") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "unpack") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "help") != null);
+}
+
+test "resume dispatch can distinguish product and named lifecycle modes" {
+    try std.testing.expect(!wantsNamedResume(&.{"spore-dir"}));
+    try std.testing.expect(wantsNamedResume(&.{ "spore-dir", "--name", "bench-1" }));
 }

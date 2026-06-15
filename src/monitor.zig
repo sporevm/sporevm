@@ -10,6 +10,7 @@ const vsock = @import("virtio/vsock.zig");
 
 const max_control_request = 4096;
 const max_control_response = 128 * 1024;
+const max_exec_output = 16 * 1024;
 const max_suspend_path = 4096;
 const default_backend = "auto";
 
@@ -159,6 +160,13 @@ const ExecServer = struct {
     suspend_dir_len: usize = 0,
     active_stream: vsock.HostStream = undefined,
     active_stream_valid: bool = false,
+    stdout_capture: [max_exec_output]u8 = undefined,
+    stdout_capture_len: usize = 0,
+    stdout_truncated: bool = false,
+    stderr_capture: [max_exec_output]u8 = undefined,
+    stderr_capture_len: usize = 0,
+    stderr_truncated: bool = false,
+    next_session_id: u64 = 1,
     next_host_port: u32 = 49152,
     wake: ?vsock.Wake = null,
     closed: std.atomic.Value(bool) = .init(false),
@@ -217,6 +225,8 @@ const ExecServer = struct {
             .active_suspend => return .keep_running,
             .pending_exec => {
                 self.active_stream = try vsock.HostStream.init(self.guest_port, self.request[0..self.request_len]);
+                self.resetExecCapture();
+                self.active_stream.setOutputSink(self, captureOutputThunk);
                 self.active_stream.host_port = self.next_host_port;
                 self.next_host_port +%= 1;
                 if (self.next_host_port < 49152) self.next_host_port = 49152;
@@ -236,7 +246,13 @@ const ExecServer = struct {
                     self.cond.broadcast(self.io);
                 },
                 .complete => {
-                    try self.storeExecResultLocked(self.active_stream.outputSlice());
+                    const exit_code = self.active_stream.exit_code orelse {
+                        try self.storeErrorLocked("guest exec missing exit code");
+                        self.state = .done;
+                        self.cond.broadcast(self.io);
+                        return .keep_running;
+                    };
+                    try self.storeExecResultLocked(exit_code);
                     self.state = .done;
                     self.cond.broadcast(self.io);
                 },
@@ -268,6 +284,43 @@ const ExecServer = struct {
         }
         self.state = .idle;
         return self.response[0..self.response_len];
+    }
+
+    fn execRequest(self: *ExecServer, argv: []const []const u8) ![]const u8 {
+        var id_buf: [64]u8 = undefined;
+        const session_id = try std.fmt.bufPrint(&id_buf, "lifecycle-{d}", .{self.next_session_id});
+        self.next_session_id +%= 1;
+        if (self.next_session_id == 0) self.next_session_id = 1;
+        return run.execRequestWithSession(self.allocator, argv, session_id);
+    }
+
+    fn resetExecCapture(self: *ExecServer) void {
+        self.stdout_capture_len = 0;
+        self.stdout_truncated = false;
+        self.stderr_capture_len = 0;
+        self.stderr_truncated = false;
+    }
+
+    fn captureOutput(self: *ExecServer, output: vsock.HostStreamOutput, bytes: []const u8) void {
+        const capture = switch (output) {
+            .stdout => &self.stdout_capture,
+            .stderr => &self.stderr_capture,
+        };
+        const len = switch (output) {
+            .stdout => &self.stdout_capture_len,
+            .stderr => &self.stderr_capture_len,
+        };
+        const truncated = switch (output) {
+            .stdout => &self.stdout_truncated,
+            .stderr => &self.stderr_truncated,
+        };
+        const available = capture.len - len.*;
+        const n = @min(bytes.len, available);
+        if (n > 0) {
+            @memcpy(capture[len.*..][0..n], bytes[0..n]);
+            len.* += n;
+        }
+        if (n < bytes.len) truncated.* = true;
     }
 
     fn submitSuspend(self: *ExecServer, out_dir: []const u8) ![]const u8 {
@@ -323,11 +376,25 @@ const ExecServer = struct {
         }
     }
 
-    fn storeExecResultLocked(self: *ExecServer, exit_frame: []const u8) !void {
+    fn storeExecResultLocked(self: *ExecServer, exit_code: i32) !void {
+        const stdout_b64 = try base64Alloc(self.allocator, self.stdout_capture[0..self.stdout_capture_len]);
+        defer self.allocator.free(stdout_b64);
+        const stderr_b64 = try base64Alloc(self.allocator, self.stderr_capture[0..self.stderr_capture_len]);
+        defer self.allocator.free(stderr_b64);
         const payload = struct {
             type: []const u8 = "exec_result",
-            exit_frame: []const u8,
-        }{ .exit_frame = exit_frame };
+            exit_code: i32,
+            stdout_b64: []const u8,
+            stderr_b64: []const u8,
+            stdout_truncated: bool,
+            stderr_truncated: bool,
+        }{
+            .exit_code = exit_code,
+            .stdout_b64 = stdout_b64,
+            .stderr_b64 = stderr_b64,
+            .stdout_truncated = self.stdout_truncated,
+            .stderr_truncated = self.stderr_truncated,
+        };
         try self.storeJsonLocked(payload);
     }
 
@@ -365,7 +432,19 @@ const ExecServer = struct {
         const self: *ExecServer = @ptrCast(@alignCast(context));
         self.setWake(wake);
     }
+
+    fn captureOutputThunk(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+        const self: *ExecServer = @ptrCast(@alignCast(context.?));
+        self.captureOutput(output, bytes);
+    }
 };
+
+fn base64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const enc = std.base64.standard.Encoder;
+    const out = try allocator.alloc(u8, enc.calcSize(bytes.len));
+    _ = enc.encode(out, bytes);
+    return out;
+}
 
 fn controlThreadMain(server: *ExecServer) void {
     while (true) {
@@ -417,7 +496,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         try writeControlError(server.io, stream, "exec request missing argv");
         return false;
     };
-    const request = run.execRequest(server.allocator, argv) catch {
+    const request = server.execRequest(argv) catch {
         try writeControlError(server.io, stream, "invalid argv");
         return false;
     };

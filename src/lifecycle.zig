@@ -198,7 +198,7 @@ pub fn createCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
     const resolved_rootfs = try run_mod.resolveRootfsInput(init, allocator, spec.rootfs_path, spec.image_ref, "create");
     spec.rootfs_path = if (resolved_rootfs) |path| try std.fs.path.resolve(allocator, &.{path}) else null;
     try spawnMonitor(init, allocator, spec);
-    try waitForReady(allocator, init.io, paths, spec.timeout_ms);
+    try waitForReady("create", allocator, init.io, paths, spec.timeout_ms);
 }
 
 pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
@@ -334,11 +334,14 @@ pub fn resumeCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
     const spec = Spec{
         .name = parsed.name,
         .backend = base.backend,
+        .kernel_path = base.kernel_path,
+        .initrd_path = base.initrd_path,
         .resume_dir = spore_dir,
         .memory_mib = memory_mib,
         .vcpus = 1,
         .guest_port = base.guest_port,
         .timeout_ms = base.timeout_ms,
+        .console_log_path = base.console_log_path,
     };
     if (!monitorBackendSupported(spec.backend)) {
         std.debug.print("spore resume: monitor mode currently supports only HVF on Apple Silicon\n", .{});
@@ -351,7 +354,7 @@ pub fn resumeCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
         std.process.exit(2);
     }
     try spawnMonitor(init, allocator, spec);
-    try waitForReady(allocator, init.io, paths, spec.timeout_ms);
+    try waitForReady("resume", allocator, init.io, paths, spec.timeout_ms);
 }
 
 pub fn lsCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
@@ -810,7 +813,7 @@ fn appendIntArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]co
     try argv.append(try std.fmt.allocPrint(allocator, "{d}", .{value}));
 }
 
-fn waitForReady(allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: u64) !void {
+fn waitForReady(command: []const u8, allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: u64) !void {
     const start = monotonicMs();
     while (monotonicMs() - start < timeout_ms) {
         var ready = readReady(allocator, io, paths) catch {
@@ -825,7 +828,7 @@ fn waitForReady(allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: 
         ready.deinit();
         return;
     }
-    std.debug.print("spore create: timed out waiting for monitor readiness\n", .{});
+    std.debug.print("spore {s}: timed out waiting for monitor readiness\n", .{command});
     std.process.exit(1);
 }
 
@@ -875,20 +878,37 @@ fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8
 
 const ControlResponse = struct {
     type: []const u8,
-    exit_frame: ?[]const u8 = null,
+    exit_code: ?i32 = null,
+    stdout_b64: ?[]const u8 = null,
+    stderr_b64: ?[]const u8 = null,
+    stdout_truncated: bool = false,
+    stderr_truncated: bool = false,
     out_dir: ?[]const u8 = null,
     message: ?[]const u8 = null,
 };
 
 fn handleExecResponse(init: std.process.Init, allocator: std.mem.Allocator, stdout: *Io.Writer, response: []const u8) !u8 {
+    _ = init;
     var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
     if (std.mem.eql(u8, parsed.value.type, "exec_result")) {
-        const frame = parsed.value.exit_frame orelse return error.BadMonitorResponse;
-        return run_mod.writeExitFrameOutput(init, allocator, stdout, frame);
+        const exit_code = parsed.value.exit_code orelse return error.BadMonitorResponse;
+        if (exit_code < 0 or exit_code > 255) return error.BadMonitorResponse;
+
+        const stdout_bytes = try decodeControlOutput(allocator, parsed.value.stdout_b64 orelse return error.BadMonitorResponse);
+        defer allocator.free(stdout_bytes);
+        const stderr_bytes = try decodeControlOutput(allocator, parsed.value.stderr_b64 orelse return error.BadMonitorResponse);
+        defer allocator.free(stderr_bytes);
+
+        try stdout.writeAll(stdout_bytes);
+        try stdout.flush();
+        try writeRawStderr(stderr_bytes);
+        if (parsed.value.stdout_truncated) try writeRawStderr("spore exec: stdout truncated after 16384 bytes\n");
+        if (parsed.value.stderr_truncated) try writeRawStderr("spore exec: stderr truncated after 16384 bytes\n");
+        return @intCast(exit_code);
     }
     const message = parsed.value.message orelse "monitor request failed";
     std.debug.print("spore exec: {s}\n", .{message});
@@ -912,6 +932,25 @@ fn writeAll(io: Io, stream: net.Stream, bytes: []const u8) !void {
     var writer = stream.writer(io, &write_buffer);
     try writer.interface.writeAll(bytes);
     try writer.interface.flush();
+}
+
+fn decodeControlOutput(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    const dec = std.base64.standard.Decoder;
+    const decoded_size = dec.calcSizeForSlice(encoded) catch return error.BadMonitorResponse;
+    if (decoded_size > max_control_response) return error.BadMonitorResponse;
+    const decoded = try allocator.alloc(u8, decoded_size);
+    errdefer allocator.free(decoded);
+    dec.decode(decoded, encoded) catch return error.BadMonitorResponse;
+    return decoded;
+}
+
+fn writeRawStderr(bytes: []const u8) !void {
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const n = std.c.write(2, remaining.ptr, remaining.len);
+        if (n <= 0) return error.StderrWriteFailed;
+        remaining = remaining[@intCast(n)..];
+    }
 }
 
 fn waitForPidExit(pid: i64, timeout_ms: u64) void {

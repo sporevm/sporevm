@@ -724,13 +724,17 @@ pub fn closeConsoleLog() void {
 }
 
 pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
+    return execRequestWithSession(allocator, argv, "default");
+}
+
+pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8) ![]const u8 {
     try validateGuestArgv(argv);
     const payload = struct {
         type: []const u8 = "start",
-        session_id: []const u8 = "default",
+        session_id: []const u8,
         argv: []const []const u8,
         closed_env: bool = true,
-    }{ .argv = argv };
+    }{ .session_id = session_id, .argv = argv };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
     if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
@@ -855,6 +859,12 @@ test "run request encodes argv" {
     const request = try execRequest(std.testing.allocator, &.{ "/bin/echo", "hello world" });
     defer std.testing.allocator.free(request);
     try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"argv\":[\"/bin/echo\",\"hello world\"],\"closed_env\":true}\n", request);
+}
+
+test "run request can encode explicit session id" {
+    const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42");
+    defer std.testing.allocator.free(request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"argv\":[\"/bin/true\"],\"closed_env\":true}\n", request);
 }
 
 test "run request rejects guest argv count overflow" {

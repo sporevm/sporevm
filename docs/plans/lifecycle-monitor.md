@@ -235,14 +235,16 @@ than redesigning the guest protocol.
 
 - `spore run` can resolve default run assets, attach read-only rootfs images,
   build/reuse cached rootfs images from OCI refs, and execute one argv request.
-- The minimal exec initrd guest agent listens on vsock and loops over accepted
-  connections.
+- The minimal exec initrd guest agent listens on vsock, uses session ids to make
+  retried starts idempotent, and allows fresh session ids to run sequential
+  commands in one boot.
 - `spore create`, `spore exec`, `spore rm`, and `spore ls` have the first
   runtime registry and metadata shape.
 - HVF can keep one minimal-initrd VM alive in an internal monitor process and
   attach one host-initiated vsock stream per `spore exec`.
-- The minimal exec initrd guest agent listens on vsock and loops over accepted
-  connections, so two `spore exec` calls can run against one boot.
+- The lifecycle monitor assigns a fresh guest session id per `spore exec`, so
+  two commands can run against one boot while same-session reconnects still
+  attach to the existing command result instead of executing twice.
 - KVM still treats the exec stream as a one-shot probe for lifecycle purposes.
   Monitor mode fails explicitly on KVM until that backend has a real wake path
   for host-attached streams.
