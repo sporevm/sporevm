@@ -201,7 +201,6 @@ backend debugging and hardware proof work:
   debugging.
 - `scripts/smoke-fork-fanout.sh`: exercise fork generation fixups.
 - `scripts/smoke-remote-bundle.sh`: run SSM/S3 cross-host bundle validation.
-- `scripts/benchmark-sporevm-minimal.sh`: collect lower-bound boot/exec timing.
 
 Run the relevant script with `--help` before using it; these are intentionally
 more harness-shaped than product-shaped.
