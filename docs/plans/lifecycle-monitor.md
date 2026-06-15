@@ -511,15 +511,11 @@ output directory.
   manifest machine state.
 - Do not add a central daemon for the first persistent lifecycle slice.
 - Store live runtime sockets under a runtime directory, not under cache roots.
+- Require explicit names for lifecycle VMs. Automatic names can be added later,
+  but the first stable surface keeps listing, cleanup, and scripting behavior
+  predictable.
 
 ## Open Questions
-
-- Should `spore create` require an explicit name in the first slice, or generate
-  one when omitted?
-
-  Recommendation: require a name first. Automatic names are convenient, but
-  they add listing, cleanup, and scripting edge cases before the lifecycle is
-  proven.
 
 - Should `spore exec` default to argv-only forever, or add a later
   command-string flag?

@@ -63,10 +63,13 @@ Current `main` can:
   `spore rootfs build`;
 - run from an explicit read-only rootfs with `spore run --rootfs`;
 - build or reuse a cached rootfs directly from an OCI ref with
-  `spore run --image`.
+  `spore run --image`;
+- create, exec, list, and remove named VMs through one per-VM monitor process;
+- suspend a diskless named VM and resume it under a new name on local HVF.
 
-Create and suspend as long-lived product verbs are still planned. The backend
-smoke harnesses exercise the lower-level capture path today.
+Named lifecycle monitor mode is currently local-HVF only. KVM monitor wake
+support and disk-backed lifecycle suspend/resume remain follow-up work. The
+backend smoke harnesses still exercise lower-level capture paths directly.
 
 ## Development
 
@@ -114,6 +117,31 @@ initrd installed by `zig build`. Override the boot assets with `--kernel` and
 The minimal agent streams command stdout and stderr over a small framed vsock
 protocol. The host forwards those streams and exits with the guest command
 status.
+
+Keep one named VM alive and run more than one command in it:
+
+```bash
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore create bench-1
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore exec bench-1 -- /bin/writeout
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore exec bench-1 -- /bin/true
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore rm bench-1
+```
+
+The lifecycle registry lives under `SPOREVM_RUNTIME_DIR`, then
+`$XDG_RUNTIME_DIR/sporevm`, then a private temp fallback. Names are explicit and
+restricted to a conservative path-safe set. `spore create --image` and
+`spore create --rootfs` reuse the same read-only rootfs path as `spore run`.
+
+Checkpoint a diskless named VM and resume it under a new name:
+
+```bash
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore create snap-1
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore exec snap-1 -- /bin/true
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore suspend snap-1 --out /tmp/snap.spore
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore resume /tmp/snap.spore --name snap-2
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore exec snap-2 -- /bin/writeout
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore rm snap-2
+```
 
 Capture a long-running run on a host signal:
 

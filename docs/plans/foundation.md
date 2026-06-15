@@ -295,6 +295,16 @@ rootfs policy, and not a bundle distribution path; it is the smallest product
 CLI primitive that proves boot + command + status propagation through the real
 VMM path.
 
+The first named VM lifecycle monitor has landed for local HVF. `spore create`,
+`spore exec`, `spore rm`, and `spore ls` use a private runtime registry and one
+per-VM monitor process with a newline-delimited JSON control socket.
+`spore create --rootfs` and `spore create --image` reuse the same read-only
+rootfs materialization path as `spore run`, and the guest agent uses per-command
+session ids so multiple `spore exec` calls can run inside one guest boot without
+turning reconnects into duplicate execution. Diskless `spore suspend NAME --out
+DIR` and `spore resume DIR --name NAME` also work locally on HVF. KVM monitor
+wake support and disk-backed lifecycle suspend/resume remain follow-ups.
+
 Slice 3 (same-hypervisor eager suspend/restore and manifest v0) is complete for
 both backends. `src/spore.zig` and `docs/spore-format.md` define v0: eager,
 content-addressed, zero-elided RAM chunks; normalized one-vCPU architectural
@@ -772,10 +782,13 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   itself.
 - The first `spore run` primitive is a local one-shot boot/exec/status command
   over virtio-vsock with default run assets and explicit kernel/initrd
-  overrides. It captures a bounded stdout/stderr sample in the final exit frame
-  and can attach a read-only ext4 rootfs for explicit argv execution. Monitor
-  lifecycle, stdin, streaming output, broader rootfs policy, and bundle-aware
-  run semantics remain later work.
+  overrides. It streams stdout/stderr, exits with the guest status, supports
+  explicit read-only rootfs images, and can build or reuse cached OCI-derived
+  rootfs images for explicit argv execution. The named lifecycle surface is a
+  separate top-level `create`/`exec`/`rm`/`ls` plus diskless
+  `suspend`/`resume --name` flow over one per-VM monitor process. Stdin, TTY,
+  broader OCI runtime semantics, KVM monitor mode, disk-backed lifecycle
+  suspend/resume, and bundle-aware run semantics remain later work.
 - Product capture starts as `spore run --capture-on-abort`: running a new
   workload can optionally write a spore snapshot when the host run process is
   interrupted, then exit. Resuming from an existing spore is a distinct
