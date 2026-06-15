@@ -623,8 +623,12 @@ sealing from the vCPU loop and reports worker/jitter/CPU rates. The first 512MiB
 worker run validated resume and trusted backing, but an active-boot snapshot at
 3s still had `tail_flush_ms=510` / `snapshot_pause_ms=512` because the worker
 had not fully caught up with the boot dirty burst (`worker_epoch_max_ms=1111`,
-`sealed_chunks_per_sec=8`). HVF write-protect-exit measurement and reducing or
-predicting dirty-tail lag are now the next Slice 7 gaps.
+`sealed_chunks_per_sec=8`). The benchmark harness now supports concurrent
+captures with `--parallel-vms`; the first two-VM 512MiB dirty-log run produced
+two JSONL rows with the same ~512ms active-boot tail profile, giving us a
+repeatable local many-VM shape before asking for more metal. HVF
+write-protect-exit measurement and reducing or predicting dirty-tail lag are now
+the next Slice 7 gaps.
 
 Continuous epoch-based chunk sealing during normal execution; suspend becomes
 pause + tail flush. First move epoch collection/sealing out of the vCPU loop

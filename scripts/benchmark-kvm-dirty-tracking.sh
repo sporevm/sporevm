@@ -13,9 +13,11 @@ Options:
   --kernel Image             aarch64 Linux kernel Image (default: managed initrd kernel)
   --initrd root.cpio         prebuilt ticker initrd (default: build one)
   --mem-mib-list "N ..."     memory sizes to test (default: "512 4096")
+  --modes "MODE ..."         modes to run: full-scan and/or dirty-log (default: "full-scan dirty-log")
   --snapshot-after-ms N      capture delay before snapshot (default: 3000)
   --dirty-epoch-ms N         dirty-log epoch cadence; 0 means tail only (default: 250)
   --iterations N             paired repetitions per memory size (default: 1)
+  --parallel-vms N           captures to run concurrently per mode/iteration (default: 1)
   --workdir DIR              work directory (default: mktemp)
   --output PATH              JSONL output path (default: <workdir>/dirty-tracking.jsonl)
   --boot-bin PATH            use an already-built kvm-boot harness
@@ -40,9 +42,11 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 kernel=""
 initrd=""
 mem_mib_list="512 4096"
+modes="full-scan dirty-log"
 snapshot_after_ms="3000"
 dirty_epoch_ms="250"
 iterations="1"
+parallel_vms="1"
 workdir=""
 output=""
 boot_bin=""
@@ -65,6 +69,11 @@ while (($#)); do
       mem_mib_list="${2:-}"
       shift 2
       ;;
+    --modes)
+      need_option_value "$1" "${2-}"
+      modes="${2:-}"
+      shift 2
+      ;;
     --snapshot-after-ms)
       need_option_value "$1" "${2-}"
       snapshot_after_ms="${2:-}"
@@ -78,6 +87,11 @@ while (($#)); do
     --iterations)
       need_option_value "$1" "${2-}"
       iterations="${2:-}"
+      shift 2
+      ;;
+    --parallel-vms)
+      need_option_value "$1" "${2-}"
+      parallel_vms="${2:-}"
       shift 2
       ;;
     --workdir)
@@ -109,14 +123,21 @@ while (($#)); do
   esac
 done
 
-for numeric_value in "${snapshot_after_ms}" "${dirty_epoch_ms}" "${iterations}"; do
+for numeric_value in "${snapshot_after_ms}" "${dirty_epoch_ms}" "${iterations}" "${parallel_vms}"; do
   case "${numeric_value}" in
     ''|*[!0-9]*) die "numeric options must be decimal integers" ;;
   esac
 done
+[[ "${parallel_vms}" != "0" ]] || die "--parallel-vms must be greater than zero"
 for mem_mib in ${mem_mib_list}; do
   case "${mem_mib}" in
     ''|*[!0-9]*) die "--mem-mib-list values must be decimal integers" ;;
+  esac
+done
+for mode in ${modes}; do
+  case "${mode}" in
+    full-scan|dirty-log) ;;
+    *) die "--modes values must be full-scan or dirty-log" ;;
   esac
 done
 
@@ -187,23 +208,38 @@ run_with_deadline() {
   return "${status}"
 }
 
+capture_name() {
+  local mode="$1"
+  local mem_mib="$2"
+  local iteration="$3"
+  local vm_index="$4"
+  if [[ "${parallel_vms}" == "1" ]]; then
+    echo "${mode}-${mem_mib}-${iteration}"
+  else
+    printf '%s-%s-%s-vm%06d' "${mode}" "${mem_mib}" "${iteration}" "${vm_index}"
+  fi
+}
+
 emit_jsonl() {
   local requested_mode="$1"
   local mem_mib="$2"
   local iteration="$3"
-  local log="$4"
-  local line="$5"
-  python3 - "${requested_mode}" "${mem_mib}" "${iteration}" "${log}" "${line}" <<'PY' >>"${output}"
+  local vm_index="$4"
+  local log="$5"
+  local line="$6"
+  python3 - "${requested_mode}" "${mem_mib}" "${iteration}" "${parallel_vms}" "${vm_index}" "${log}" "${line}" <<'PY' >>"${output}"
 import json
 import re
 import sys
 
-requested_mode, mem_mib, iteration, log, line = sys.argv[1:]
+requested_mode, mem_mib, iteration, parallel_vms, vm_index, log, line = sys.argv[1:]
 pairs = dict(re.findall(r'([A-Za-z0-9_]+)=([^\s]+)', line))
 out = {
     "requested_mode": requested_mode,
     "mem_mib": int(mem_mib),
     "iteration": int(iteration),
+    "parallel_vms": int(parallel_vms),
+    "vm_index": int(vm_index),
     "log": log,
 }
 for key, value in pairs.items():
@@ -215,31 +251,67 @@ print(json.dumps(out, sort_keys=True))
 PY
 }
 
+run_capture() {
+  local mode="$1"
+  local mem_mib="$2"
+  local iteration="$3"
+  local vm_index="$4"
+  local name
+  name="$(capture_name "${mode}" "${mem_mib}" "${iteration}" "${vm_index}")"
+  local spore_dir="${workdir}/spore-${name}"
+  local log="${workdir}/${name}.log"
+  rm -rf "${spore_dir}"
+  local cmd=("${boot_bin}" "${kernel}" --mem-mib "${mem_mib}" --initrd "${initrd}" --snapshot-after-ms "${snapshot_after_ms}" --spore "${spore_dir}")
+  if [[ "${mode}" == "dirty-log" ]]; then
+    cmd+=(--dirty-track --dirty-epoch-ms "${dirty_epoch_ms}")
+  fi
+
+  run_with_deadline "${deadline}" "${log}" "${cmd[@]}"
+}
+
+record_capture() {
+  local mode="$1"
+  local mem_mib="$2"
+  local iteration="$3"
+  local vm_index="$4"
+  local name
+  name="$(capture_name "${mode}" "${mem_mib}" "${iteration}" "${vm_index}")"
+  local log="${workdir}/${name}.log"
+  local line
+  line="$(grep -E 'kvm snapshot metrics:' "${log}" | tail -1 || true)"
+  [[ -n "${line}" ]] || die "missing kvm snapshot metrics in ${log}"
+  emit_jsonl "${mode}" "${mem_mib}" "${iteration}" "${vm_index}" "${log}" "${line}"
+  echo "dirty benchmark result: mode=${mode} mem_mib=${mem_mib} iteration=${iteration} vm_index=${vm_index} parallel_vms=${parallel_vms} log=${log}" >&2
+}
+
 deadline=$(( (snapshot_after_ms + 999) / 1000 + 120 ))
 
 for mem_mib in ${mem_mib_list}; do
   for ((iteration = 1; iteration <= iterations; iteration++)); do
-    for mode in full-scan dirty-log; do
-      spore_dir="${workdir}/spore-${mode}-${mem_mib}-${iteration}"
-      log="${workdir}/${mode}-${mem_mib}-${iteration}.log"
-      rm -rf "${spore_dir}"
-      cmd=("${boot_bin}" "${kernel}" --mem-mib "${mem_mib}" --initrd "${initrd}" --snapshot-after-ms "${snapshot_after_ms}" --spore "${spore_dir}")
-      if [[ "${mode}" == "dirty-log" ]]; then
-        cmd+=(--dirty-track --dirty-epoch-ms "${dirty_epoch_ms}")
+    for mode in ${modes}; do
+      pids=()
+      for ((vm_index = 1; vm_index <= parallel_vms; vm_index++)); do
+        run_capture "${mode}" "${mem_mib}" "${iteration}" "${vm_index}" &
+        pids+=("$!")
+      done
+
+      status=0
+      for pid in "${pids[@]}"; do
+        if ! wait "${pid}"; then
+          status=1
+        fi
+      done
+      if [[ "${status}" != "0" ]]; then
+        for ((vm_index = 1; vm_index <= parallel_vms; vm_index++)); do
+          log="${workdir}/$(capture_name "${mode}" "${mem_mib}" "${iteration}" "${vm_index}").log"
+          tail -80 "${log}" >&2 || true
+        done
+        die "${mode} capture failed for ${mem_mib}MiB iteration ${iteration} parallel_vms=${parallel_vms}"
       fi
 
-      set +e
-      run_with_deadline "${deadline}" "${log}" "${cmd[@]}"
-      status="$?"
-      set -e
-      if [[ "${status}" != "0" ]]; then
-        tail -80 "${log}" >&2 || true
-        die "${mode} capture failed for ${mem_mib}MiB iteration ${iteration} with status ${status}"
-      fi
-      line="$(grep -E 'kvm snapshot metrics:' "${log}" | tail -1 || true)"
-      [[ -n "${line}" ]] || die "missing kvm snapshot metrics in ${log}"
-      emit_jsonl "${mode}" "${mem_mib}" "${iteration}" "${log}" "${line}"
-      echo "dirty benchmark result: mode=${mode} mem_mib=${mem_mib} iteration=${iteration} log=${log}" >&2
+      for ((vm_index = 1; vm_index <= parallel_vms; vm_index++)); do
+        record_capture "${mode}" "${mem_mib}" "${iteration}" "${vm_index}"
+      done
     done
   done
 done
