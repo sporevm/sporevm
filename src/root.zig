@@ -21,6 +21,7 @@ else
 pub const guestmem = @import("guestmem.zig");
 pub const platform = @import("platform.zig");
 pub const hvf = @import("hvf/hvf.zig");
+pub const resume_cmd = @import("resume.zig");
 pub const rootfs = @import("rootfs.zig");
 pub const run = @import("run.zig");
 pub const spore = @import("spore.zig");
@@ -49,6 +50,7 @@ test {
     testing.refAllDecls(generation);
     testing.refAllDecls(gicv3);
     testing.refAllDecls(platform);
+    testing.refAllDecls(resume_cmd);
     testing.refAllDecls(run);
     testing.refAllDecls(virtio.queue);
     testing.refAllDecls(virtio.mmio);

@@ -35,7 +35,9 @@ const op_credit_request: u16 = 7;
 
 const max_pending = 16;
 const max_payload = 8192;
-const max_host_output = 64 * 1024;
+const host_stream_credit = 64 * 1024;
+const max_frame_header = 128;
+const max_frame_payload = 64 * 1024;
 const default_host_port: u32 = 49152;
 
 pub const Header = struct {
@@ -69,13 +71,18 @@ pub const HostStreamState = enum {
     failed,
 };
 
+pub const HostStreamOutput = enum {
+    stdout,
+    stderr,
+};
+
+pub const HostStreamOutputSink = *const fn (context: ?*anyopaque, output: HostStreamOutput, bytes: []const u8) void;
+
 pub const HostStream = struct {
     guest_port: u32,
     host_port: u32 = default_host_port,
     request: [max_payload]u8 = [_]u8{0} ** max_payload,
     request_len: usize = 0,
-    output: [max_host_output]u8 = [_]u8{0} ** max_host_output,
-    output_len: usize = 0,
     state: HostStreamState = .idle,
     started_at_ms: u64 = 0,
     start_ms: ?u64 = null,
@@ -83,6 +90,15 @@ pub const HostStream = struct {
     response_ms: ?u64 = null,
     received_bytes: u32 = 0,
     sent_bytes: u32 = 0,
+    exit_code: ?i32 = null,
+    header_buf: [max_frame_header]u8 = undefined,
+    header_len: usize = 0,
+    payload_output: ?HostStreamOutput = null,
+    payload_remaining: usize = 0,
+    stdout_offset: u64 = 0,
+    stderr_offset: u64 = 0,
+    output_sink: ?HostStreamOutputSink = null,
+    output_sink_context: ?*anyopaque = null,
 
     pub fn init(guest_port: u32, request: []const u8) !HostStream {
         if (request.len > max_payload) return error.RequestTooLarge;
@@ -98,8 +114,9 @@ pub const HostStream = struct {
         self.start_ms = self.elapsedMs();
     }
 
-    pub fn outputSlice(self: *const HostStream) []const u8 {
-        return self.output[0..self.output_len];
+    pub fn setOutputSink(self: *HostStream, context: ?*anyopaque, sink: HostStreamOutputSink) void {
+        self.output_sink_context = context;
+        self.output_sink = sink;
     }
 
     pub fn elapsedMs(self: *const HostStream) u64 {
@@ -114,17 +131,120 @@ pub const HostStream = struct {
     }
 
     fn appendOutput(self: *HostStream, data: []const u8) void {
-        const n = @min(data.len, self.output.len - self.output_len);
-        if (n > 0) {
-            @memcpy(self.output[self.output_len..][0..n], data[0..n]);
-            self.output_len += n;
-        }
         const inc: u32 = if (data.len > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(data.len);
         self.received_bytes +|= inc;
-        const output = self.outputSlice();
-        if (std.mem.indexOf(u8, output, "\"type\":\"exit\"") != null and std.mem.indexOfScalar(u8, output, '\n') != null) {
+
+        var rest = data;
+        while (rest.len > 0 and self.state != .failed and self.state != .complete) {
+            if (self.payload_output) |output| {
+                const take = @min(rest.len, self.payload_remaining);
+                self.emitOutput(output, rest[0..take]);
+                self.payload_remaining -= take;
+                rest = rest[take..];
+                if (self.payload_remaining == 0) self.payload_output = null;
+                continue;
+            }
+
+            if (std.mem.indexOfScalar(u8, rest, '\n')) |newline| {
+                if (self.header_len + newline > self.header_buf.len) {
+                    self.fail();
+                    return;
+                }
+                @memcpy(self.header_buf[self.header_len..][0..newline], rest[0..newline]);
+                self.header_len += newline;
+                const line = self.header_buf[0..self.header_len];
+                self.header_len = 0;
+                self.handleFrameHeader(line);
+                rest = rest[newline + 1 ..];
+            } else {
+                if (self.header_len + rest.len > self.header_buf.len) {
+                    self.fail();
+                    return;
+                }
+                @memcpy(self.header_buf[self.header_len..][0..rest.len], rest);
+                self.header_len += rest.len;
+                return;
+            }
+        }
+    }
+
+    fn handleFrameHeader(self: *HostStream, line: []const u8) void {
+        var fields = std.mem.splitScalar(u8, line, ' ');
+        const kind = fields.next() orelse {
+            self.fail();
+            return;
+        };
+        if (std.mem.eql(u8, kind, "stdout") or std.mem.eql(u8, kind, "stderr")) {
+            const offset_raw = fields.next() orelse {
+                self.fail();
+                return;
+            };
+            const len_raw = fields.next() orelse {
+                self.fail();
+                return;
+            };
+            if (fields.next() != null) {
+                self.fail();
+                return;
+            }
+            const offset = std.fmt.parseInt(u64, offset_raw, 10) catch {
+                self.fail();
+                return;
+            };
+            const len = std.fmt.parseInt(usize, len_raw, 10) catch {
+                self.fail();
+                return;
+            };
+            if (len > max_frame_payload) {
+                self.fail();
+                return;
+            }
+            const output: HostStreamOutput = if (std.mem.eql(u8, kind, "stdout")) .stdout else .stderr;
+            const expected = switch (output) {
+                .stdout => self.stdout_offset,
+                .stderr => self.stderr_offset,
+            };
+            if (offset != expected) {
+                self.fail();
+                return;
+            }
+            self.payload_output = output;
+            self.payload_remaining = len;
+            if (len == 0) self.payload_output = null;
+            return;
+        }
+        if (std.mem.eql(u8, kind, "exit")) {
+            const code_raw = fields.next() orelse {
+                self.fail();
+                return;
+            };
+            if (fields.next() != null) {
+                self.fail();
+                return;
+            }
+            const code = std.fmt.parseInt(i32, code_raw, 10) catch {
+                self.fail();
+                return;
+            };
+            if (code < 0 or code > 255) {
+                self.fail();
+                return;
+            }
+            self.exit_code = code;
             if (self.response_ms == null) self.response_ms = self.elapsedMs();
             self.state = .complete;
+            return;
+        }
+        self.fail();
+    }
+
+    fn emitOutput(self: *HostStream, output: HostStreamOutput, data: []const u8) void {
+        if (data.len == 0) return;
+        if (self.output_sink) |sink| sink(self.output_sink_context, output, data);
+        const len: u64 = @intCast(data.len);
+        switch (output) {
+            .stdout => self.stdout_offset += len,
+            .stderr => self.stderr_offset += len,
         }
     }
 
@@ -164,7 +284,7 @@ pub const Vsock = struct {
             .len = 0,
             .packet_type = packet_type_stream,
             .op = op_request,
-            .buf_alloc = max_host_output,
+            .buf_alloc = host_stream_credit,
             .fwd_cnt = stream.received_bytes,
         }, "");
     }
@@ -278,7 +398,7 @@ pub const Vsock = struct {
             .len = @intCast(payload.len),
             .packet_type = packet_type_stream,
             .op = op,
-            .buf_alloc = max_host_output,
+            .buf_alloc = host_stream_credit,
             .fwd_cnt = stream.received_bytes,
         }, payload);
         const inc: u32 = if (payload.len > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(payload.len);
@@ -495,7 +615,34 @@ test "stream connect request is answered with rst" {
     try std.testing.expectEqual(@as(u32, 0), response.len);
 }
 
-test "host stream connects, sends request, and captures exit frame" {
+const StreamCapture = struct {
+    stdout: [64]u8 = [_]u8{0} ** 64,
+    stderr: [64]u8 = [_]u8{0} ** 64,
+    stdout_len: usize = 0,
+    stderr_len: usize = 0,
+};
+
+fn captureSink(context: ?*anyopaque, output: HostStreamOutput, bytes: []const u8) void {
+    const capture: *StreamCapture = @ptrCast(@alignCast(context.?));
+    switch (output) {
+        .stdout => {
+            const n = @min(bytes.len, capture.stdout.len - capture.stdout_len);
+            if (n > 0) {
+                @memcpy(capture.stdout[capture.stdout_len..][0..n], bytes[0..n]);
+                capture.stdout_len += n;
+            }
+        },
+        .stderr => {
+            const n = @min(bytes.len, capture.stderr.len - capture.stderr_len);
+            if (n > 0) {
+                @memcpy(capture.stderr[capture.stderr_len..][0..n], bytes[0..n]);
+                capture.stderr_len += n;
+            }
+        },
+    }
+}
+
+test "host stream connects, sends request, and parses streamed frames" {
     var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
     var t = mmio.Transport.init(dev.device());
     var buf: [32 * 1024]u8 = [_]u8{0} ** (32 * 1024);
@@ -512,13 +659,17 @@ test "host stream connects, sends request, and captures exit frame" {
     const rx_buf_payload = 0x2400;
     const tx_buf_rst = 0x2600;
     const tx_buf_response = 0x2800;
-    const tx_buf_exit = 0x2a00;
+    const tx_buf_stdout = 0x2a00;
+    const tx_buf_stderr = 0x2c00;
+    const tx_buf_exit = 0x2e00;
 
     configureQueue(&t, rx_queue, rx_desc, rx_avail, rx_used, ram);
     configureQueue(&t, tx_queue, tx_desc, tx_avail, tx_used, ram);
 
     const request = "{\"command\":[\"/bin/true\"],\"closed_env\":true}\n";
     var stream = try HostStream.init(10700, request);
+    var capture = StreamCapture{};
+    stream.setOutputSink(&capture, captureSink);
     try dev.attachHostStream(&stream);
 
     try setDesc(ram, rx_desc, 0, rx_buf_request, header_len, 2); // VIRTQ_DESC_F_WRITE
@@ -583,7 +734,41 @@ test "host stream connects, sends request, and captures exit frame" {
     try std.testing.expectEqual(@as(u32, @intCast(request.len)), delivered.len);
     try std.testing.expectEqualStrings(request, buf[rx_buf_payload + header_len ..][0..request.len]);
 
-    const exit_frame = "{\"type\":\"exit\",\"exit_code\":0,\"error\":null,\"guest_timing_ms\":{}}\n";
+    const stdout_frame = "stdout 0 6\nhello\n";
+    var stdout_rw: [header_len]u8 = undefined;
+    writeHeader(&stdout_rw, .{
+        .src_cid = default_guest_cid,
+        .dst_cid = host_cid,
+        .src_port = 10700,
+        .dst_port = default_host_port,
+        .len = @intCast(stdout_frame.len),
+        .packet_type = packet_type_stream,
+        .op = op_rw,
+    });
+    @memcpy(buf[tx_buf_stdout..][0..header_len], &stdout_rw);
+    @memcpy(buf[tx_buf_stdout + header_len ..][0..stdout_frame.len], stdout_frame);
+    try setDesc(ram, tx_desc, 2, tx_buf_stdout, @intCast(header_len + stdout_frame.len), 0);
+    try pushAvail(ram, tx_avail, 8, 2);
+    try std.testing.expect(t.write(0x050, tx_queue, ram));
+
+    const stderr_frame = "stderr 0 4\nerr\n";
+    var stderr_rw: [header_len]u8 = undefined;
+    writeHeader(&stderr_rw, .{
+        .src_cid = default_guest_cid,
+        .dst_cid = host_cid,
+        .src_port = 10700,
+        .dst_port = default_host_port,
+        .len = @intCast(stderr_frame.len),
+        .packet_type = packet_type_stream,
+        .op = op_rw,
+    });
+    @memcpy(buf[tx_buf_stderr..][0..header_len], &stderr_rw);
+    @memcpy(buf[tx_buf_stderr + header_len ..][0..stderr_frame.len], stderr_frame);
+    try setDesc(ram, tx_desc, 3, tx_buf_stderr, @intCast(header_len + stderr_frame.len), 0);
+    try pushAvail(ram, tx_avail, 8, 3);
+    try std.testing.expect(t.write(0x050, tx_queue, ram));
+
+    const exit_frame = "exit 7\n";
     var rw: [header_len]u8 = undefined;
     writeHeader(&rw, .{
         .src_cid = default_guest_cid,
@@ -596,12 +781,49 @@ test "host stream connects, sends request, and captures exit frame" {
     });
     @memcpy(buf[tx_buf_exit..][0..header_len], &rw);
     @memcpy(buf[tx_buf_exit + header_len ..][0..exit_frame.len], exit_frame);
-    try setDesc(ram, tx_desc, 2, tx_buf_exit, @intCast(header_len + exit_frame.len), 0);
-    try pushAvail(ram, tx_avail, 8, 2);
+    try setDesc(ram, tx_desc, 4, tx_buf_exit, @intCast(header_len + exit_frame.len), 0);
+    try pushAvail(ram, tx_avail, 8, 4);
     try std.testing.expect(t.write(0x050, tx_queue, ram));
 
     try std.testing.expectEqual(HostStreamState.complete, stream.state);
-    try std.testing.expectEqualStrings(exit_frame, stream.outputSlice());
+    try std.testing.expectEqual(@as(i32, 7), stream.exit_code.?);
+    try std.testing.expectEqualStrings("hello\n", capture.stdout[0..capture.stdout_len]);
+    try std.testing.expectEqualStrings("err\n", capture.stderr[0..capture.stderr_len]);
+}
+
+test "host stream frame parser handles split frames" {
+    var stream = try HostStream.init(10700, "{}\n");
+    var capture = StreamCapture{};
+    stream.state = .connected;
+    stream.setOutputSink(&capture, captureSink);
+
+    stream.appendOutput("stdout 0 11\nhello");
+    try std.testing.expectEqual(HostStreamState.connected, stream.state);
+    stream.appendOutput(" worldstderr 0 4\n");
+    stream.appendOutput("err\nexit 3\n");
+
+    try std.testing.expectEqual(HostStreamState.complete, stream.state);
+    try std.testing.expectEqual(@as(i32, 3), stream.exit_code.?);
+    try std.testing.expectEqualStrings("hello world", capture.stdout[0..capture.stdout_len]);
+    try std.testing.expectEqualStrings("err\n", capture.stderr[0..capture.stderr_len]);
+}
+
+test "host stream frame parser rejects offset mismatch" {
+    var stream = try HostStream.init(10700, "{}\n");
+    stream.state = .connected;
+
+    stream.appendOutput("stdout 1 1\nx");
+
+    try std.testing.expectEqual(HostStreamState.failed, stream.state);
+}
+
+test "host stream frame parser rejects oversized payloads" {
+    var stream = try HostStream.init(10700, "{}\n");
+    stream.state = .connected;
+
+    stream.appendOutput("stderr 0 65537\n");
+
+    try std.testing.expectEqual(HostStreamState.failed, stream.state);
 }
 
 fn fuzzVsockTx(_: void, s: *std.testing.Smith) !void {
@@ -617,4 +839,16 @@ fn fuzzVsockTx(_: void, s: *std.testing.Smith) !void {
 
 test "fuzz vsock tx handling" {
     try std.testing.fuzz({}, fuzzVsockTx, .{});
+}
+
+fn fuzzHostStreamFrames(_: void, s: *std.testing.Smith) !void {
+    var stream = try HostStream.init(10700, "{}\n");
+    stream.state = .connected;
+    var buf: [4096]u8 = undefined;
+    const len = s.slice(&buf);
+    stream.appendOutput(buf[0..len]);
+}
+
+test "fuzz host stream frame parsing" {
+    try std.testing.fuzz({}, fuzzHostStreamFrames, .{});
 }
