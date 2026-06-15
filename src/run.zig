@@ -243,15 +243,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
 }
 
 fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parsed: CliOptions) !Options {
-    const rootfs_path = if (parsed.image_ref) |image_ref|
-        try resolveImageRootfs(init, allocator, image_ref)
-    else
-        parsed.rootfs_path;
-    if (rootfs_path) |path| {
-        if (!try readablePath(init.io, path)) {
-            failRunSetup("spore run: rootfs not found: {s}", .{path});
-        }
-    }
+    const rootfs_path = try resolveRootfsInput(init, allocator, parsed.rootfs_path, parsed.image_ref, "run");
     const kernel_path = parsed.shared.kernel_path orelse try resolveDefaultKernelPath(init, allocator);
     const initrd_path = parsed.shared.initrd_path orelse try resolveDefaultInitrdPath(init, allocator);
     var opts = parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs_path, parsed.command, true);
@@ -260,19 +252,41 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     return opts;
 }
 
-fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8) ![]const u8 {
+pub fn resolveRootfsInput(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    rootfs_path: ?[]const u8,
+    image_ref: ?[]const u8,
+    command_name: []const u8,
+) !?[]const u8 {
+    if (rootfs_path != null and image_ref != null) {
+        failRunSetup("spore {s}: --rootfs and --image are mutually exclusive", .{command_name});
+    }
+    const resolved = if (image_ref) |ref|
+        try resolveImageRootfs(init, allocator, ref, command_name)
+    else
+        rootfs_path;
+    if (resolved) |path| {
+        if (!try readablePath(init.io, path)) {
+            failRunSetup("spore {s}: rootfs not found: {s}", .{ command_name, path });
+        }
+    }
+    return resolved;
+}
+
+fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8, command_name: []const u8) ![]const u8 {
     const cache_root = try rootfsCacheRootPath(init, allocator);
     try ensureDirPath(init.io, cache_root);
 
     if (try rootfs_mod.digestPinnedImageIdentity(allocator, image_ref, direct_image_platform)) |digest_pinned| {
-        if (try cachedImageRootfsPath(init, allocator, cache_root, digest_pinned)) |path| return path;
+        if (try cachedImageRootfsPath(init, allocator, cache_root, digest_pinned, command_name)) |path| return path;
     }
 
     const resolved = rootfs_mod.resolveImageRef(init, allocator, image_ref, direct_image_platform) catch |err| {
-        failRunSetup("spore run: image resolve failed for {s}: {s}", .{ image_ref, @errorName(err) });
+        failRunSetup("spore {s}: image resolve failed for {s}: {s}", .{ command_name, image_ref, @errorName(err) });
     };
-    if (try cachedImageRootfsPath(init, allocator, cache_root, resolved)) |path| return path;
-    return buildCachedImageRootfs(init, allocator, cache_root, resolved);
+    if (try cachedImageRootfsPath(init, allocator, cache_root, resolved, command_name)) |path| return path;
+    return buildCachedImageRootfs(init, allocator, cache_root, resolved, command_name);
 }
 
 fn cachedImageRootfsPath(
@@ -280,15 +294,16 @@ fn cachedImageRootfsPath(
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     resolved: rootfs_mod.ResolvedImage,
+    command_name: []const u8,
 ) !?[]const u8 {
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
     const metadata_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
     const metadata_matches = cachedRootfsMetadataMatches(init.io, allocator, metadata_path, resolved) catch |err| {
-        failRunSetup("spore run: cached rootfs metadata check failed: {s}", .{@errorName(err)});
+        failRunSetup("spore {s}: cached rootfs metadata check failed: {s}", .{ command_name, @errorName(err) });
     };
     if (metadata_matches and try readablePath(init.io, rootfs_path)) {
-        const message = try std.fmt.allocPrint(allocator, "spore run: using cached rootfs {s} for {s}\n", .{ rootfs_path, resolved.ref });
+        const message = try std.fmt.allocPrint(allocator, "spore {s}: using cached rootfs {s} for {s}\n", .{ command_name, rootfs_path, resolved.ref });
         try writeSetupStderr(init, message);
         return rootfs_path;
     }
@@ -300,6 +315,7 @@ fn buildCachedImageRootfs(
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     resolved: rootfs_mod.ResolvedImage,
+    command_name: []const u8,
 ) ![]const u8 {
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
@@ -315,7 +331,7 @@ fn buildCachedImageRootfs(
     defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
     defer Io.Dir.cwd().deleteFile(init.io, temp_metadata_path) catch {};
 
-    const build_message = try std.fmt.allocPrint(allocator, "spore run: building cached rootfs for {s}\n", .{resolved.ref});
+    const build_message = try std.fmt.allocPrint(allocator, "spore {s}: building cached rootfs for {s}\n", .{ command_name, resolved.ref });
     try writeSetupStderr(init, build_message);
     _ = rootfs_mod.build(init, allocator, .{
         .ref = resolved.ref,
@@ -325,12 +341,12 @@ fn buildCachedImageRootfs(
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
     }) catch |err| {
-        failRunSetup("spore run: image rootfs build failed for {s}: {s}", .{ resolved.ref, @errorName(err) });
+        failRunSetup("spore {s}: image rootfs build failed for {s}: {s}", .{ command_name, resolved.ref, @errorName(err) });
     };
     try Io.Dir.renameAbsolute(temp_rootfs_path, rootfs_path, init.io);
     try Io.Dir.renameAbsolute(temp_metadata_path, metadata_path, init.io);
 
-    const cached_message = try std.fmt.allocPrint(allocator, "spore run: cached rootfs {s}\n", .{rootfs_path});
+    const cached_message = try std.fmt.allocPrint(allocator, "spore {s}: cached rootfs {s}\n", .{ command_name, rootfs_path });
     try writeSetupStderr(init, cached_message);
     return rootfs_path;
 }

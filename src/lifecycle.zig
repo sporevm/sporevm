@@ -150,22 +150,21 @@ pub fn createCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
 
     const allocator = init.arena.allocator();
     const parsed = try parseCreateArgs(args);
-    const paths = try cliPaths(init, allocator, "create", parsed.spec.name);
-    if (parsed.spec.rootfs_path != null or parsed.spec.image_ref != null) {
-        std.debug.print("spore create: --rootfs and --image land in the rootfs lifecycle slice\n", .{});
-        std.process.exit(2);
-    }
-    if (!monitorBackendSupported(parsed.spec.backend)) {
+    var spec = parsed.spec;
+    const paths = try cliPaths(init, allocator, "create", spec.name);
+    if (!monitorBackendSupported(spec.backend)) {
         std.debug.print("spore create: monitor mode currently supports only HVF on Apple Silicon\n", .{});
         std.process.exit(2);
     }
     const state = try classifyVmState(allocator, init.io, paths, pidAlive);
     if (state != .absent) {
-        std.debug.print("spore create: VM already exists or has stale state: {s}\n", .{parsed.spec.name});
+        std.debug.print("spore create: VM already exists or has stale state: {s}\n", .{spec.name});
         std.process.exit(2);
     }
-    try spawnMonitor(init, allocator, parsed.spec);
-    try waitForReady(allocator, init.io, paths, parsed.spec.timeout_ms);
+    const resolved_rootfs = try run_mod.resolveRootfsInput(init, allocator, spec.rootfs_path, spec.image_ref, "create");
+    spec.rootfs_path = if (resolved_rootfs) |path| try std.fs.path.resolve(allocator, &.{path}) else null;
+    try spawnMonitor(init, allocator, spec);
+    try waitForReady(allocator, init.io, paths, spec.timeout_ms);
 }
 
 pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
@@ -511,6 +510,14 @@ fn spawnMonitor(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec
     if (spec.initrd_path) |path| {
         try argv.append("--initrd");
         try argv.append(path);
+    }
+    if (spec.rootfs_path) |path| {
+        try argv.append("--rootfs");
+        try argv.append(path);
+    }
+    if (spec.image_ref) |image| {
+        try argv.append("--image");
+        try argv.append(image);
     }
     try appendIntArg(allocator, &argv, "--memory-mib", spec.memory_mib);
     try appendIntArg(allocator, &argv, "--vcpus", spec.vcpus);

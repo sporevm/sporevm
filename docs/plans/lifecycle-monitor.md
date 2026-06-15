@@ -321,7 +321,7 @@ runtime stack trace.
 
 ### Slice C: Rootfs And Direct Image Create
 
-Status: proposed.
+Status: complete for local HVF.
 
 Scope:
 
@@ -341,6 +341,27 @@ spore rm bench-alpine
 ```
 
 works from a warm rootfs cache and from an empty isolated cache directory.
+
+Validated locally with an isolated `/tmp/sporevm-slice-c-cache`:
+
+```console
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-c \
+SPOREVM_ROOTFS_CACHE_DIR=/tmp/sporevm-slice-c-cache \
+spore create bench-alpine --image docker.io/library/alpine:3.20 --timeout-ms 60000
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-c spore exec bench-alpine -- /bin/echo hi
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-c spore rm bench-alpine
+
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-c \
+spore create bench-rootfs --rootfs /tmp/sporevm-slice-c-cache/<cache-key>.ext4 --timeout-ms 60000
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-c spore exec bench-rootfs -- /bin/echo rootfs-ok
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-c spore rm bench-rootfs
+
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-c \
+SPOREVM_ROOTFS_CACHE_DIR=/tmp/sporevm-slice-c-cache \
+spore create bench-warm --image docker.io/library/alpine:3.20 --timeout-ms 60000
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-c spore exec bench-warm -- /bin/echo warm-ok
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-c spore rm bench-warm
+```
 
 ### Slice D: Local Lifecycle Timing Script
 

@@ -20,6 +20,8 @@ const monitor_usage =
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --kernel Image          Kernel Image path
     \\  --initrd root.cpio      Initrd path
+    \\  --rootfs rootfs.ext4    Resolved rootfs image path
+    \\  --image REF             Original OCI image ref for metadata
     \\  --memory-mib N          Guest memory in MiB (default: 1024)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
@@ -33,6 +35,8 @@ const MonitorOptions = struct {
     backend: run.Backend = .auto,
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
+    rootfs_path: ?[]const u8 = null,
+    image_ref: ?[]const u8 = null,
     memory_mib: u64 = 1024,
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
@@ -64,6 +68,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         std.debug.print("spore monitor: monitor mode currently supports only HVF on Apple Silicon\n", .{});
         std.process.exit(2);
     }
+    if (opts.image_ref != null and opts.rootfs_path == null) {
+        std.debug.print("spore monitor: --image is metadata only; pass a resolved --rootfs path\n", .{});
+        std.process.exit(2);
+    }
     const paths = try lifecycle.pathsFor(allocator, init.environ_map, opts.name);
     const kernel_path = opts.kernel_path orelse try run.resolveDefaultKernelPath(init, allocator);
     const initrd_path = opts.initrd_path orelse try run.resolveDefaultInitrdPath(init, allocator);
@@ -73,6 +81,8 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .backend = opts.backend.name(),
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
+        .rootfs_path = opts.rootfs_path,
+        .image_ref = opts.image_ref,
         .memory_mib = opts.memory_mib,
         .vcpus = opts.vcpus,
         .guest_port = opts.guest_port,
@@ -97,6 +107,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .backend = opts.backend,
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
+        .rootfs_path = opts.rootfs_path,
         .command = &.{"/bin/true"},
         .memory_mib = opts.memory_mib,
         .vcpus = opts.vcpus,
@@ -391,6 +402,10 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
             opts.kernel_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--initrd")) {
             opts.initrd_path = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--rootfs")) {
+            opts.rootfs_path = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--image")) {
+            opts.image_ref = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
             opts.memory_mib = try parsePositive(u64, args[i], takeValue(args, &i, args[i]));
         } else if (std.mem.eql(u8, args[i], "--vcpus")) {
