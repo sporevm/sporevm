@@ -17,6 +17,8 @@ const lifecycle_spore_metadata_file = "sporevm-lifecycle.json";
 const diskless_resume_device_count = 4;
 const spec_file = "spec.json";
 const ready_file = "ready.json";
+const create_timing_file = "create-timing.json";
+const monitor_timing_file = "monitor-timing.json";
 const pid_file = "pid";
 const control_socket_file = "control.sock";
 const console_log_file = "console.log";
@@ -97,6 +99,8 @@ pub const Paths = struct {
     vm_dir: []const u8,
     spec_path: []const u8,
     ready_path: []const u8,
+    create_timing_path: []const u8,
+    monitor_timing_path: []const u8,
     pid_path: []const u8,
     control_socket_path: []const u8,
     console_log_path: []const u8,
@@ -107,6 +111,8 @@ pub const Paths = struct {
         allocator.free(self.vm_dir);
         allocator.free(self.spec_path);
         allocator.free(self.ready_path);
+        allocator.free(self.create_timing_path);
+        allocator.free(self.monitor_timing_path);
         allocator.free(self.pid_path);
         allocator.free(self.control_socket_path);
         allocator.free(self.console_log_path);
@@ -132,6 +138,27 @@ pub const Ready = struct {
     pid: i64,
     control_socket_path: []const u8,
     console_log_path: []const u8,
+};
+
+pub const CreateTiming = struct {
+    version: u32 = 1,
+    parse_ms: u64,
+    paths_ms: u64,
+    state_check_ms: u64,
+    rootfs_resolve_ms: u64,
+    rootfs_abspath_ms: u64,
+    spawn_monitor_ms: u64,
+    wait_ready_ms: u64,
+    total_ms: u64,
+};
+
+pub const MonitorTiming = struct {
+    version: u32 = 1,
+    parse_ms: u64,
+    paths_ms: u64,
+    asset_resolve_ms: u64,
+    metadata_ms: u64,
+    ready_after_start_ms: u64,
 };
 
 pub const VmState = enum {
@@ -176,6 +203,7 @@ const ResumeOptions = struct {
 };
 
 pub fn createCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    const start_ms = monotonicMs();
     if (wantsHelp(args)) {
         try stdout.writeAll(create_usage);
         return;
@@ -184,8 +212,10 @@ pub fn createCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
 
     const allocator = init.arena.allocator();
     const parsed = try parseCreateArgs(args);
+    const parsed_ms = monotonicMs();
     var spec = parsed.spec;
     const paths = try cliPaths(init, allocator, "create", spec.name);
+    const paths_ms = monotonicMs();
     if (!monitorBackendSupported(spec.backend)) {
         std.debug.print("spore create: monitor mode currently supports only HVF on Apple Silicon\n", .{});
         std.process.exit(2);
@@ -195,10 +225,25 @@ pub fn createCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
         std.debug.print("spore create: VM already exists or has stale state: {s}\n", .{spec.name});
         std.process.exit(2);
     }
+    const state_checked_ms = monotonicMs();
     const resolved_rootfs = try run_mod.resolveRootfsInput(init, allocator, spec.rootfs_path, spec.image_ref, "create");
+    const rootfs_resolved_ms = monotonicMs();
     spec.rootfs_path = if (resolved_rootfs) |path| try std.fs.path.resolve(allocator, &.{path}) else null;
+    const rootfs_abspath_ms = monotonicMs();
     try spawnMonitor(init, allocator, spec);
+    const monitor_spawned_ms = monotonicMs();
     try waitForReady("create", allocator, init.io, paths, spec.timeout_ms);
+    const ready_ms = monotonicMs();
+    writeCreateTiming(allocator, init.io, paths, .{
+        .parse_ms = parsed_ms - start_ms,
+        .paths_ms = paths_ms - parsed_ms,
+        .state_check_ms = state_checked_ms - paths_ms,
+        .rootfs_resolve_ms = rootfs_resolved_ms - state_checked_ms,
+        .rootfs_abspath_ms = rootfs_abspath_ms - rootfs_resolved_ms,
+        .spawn_monitor_ms = monitor_spawned_ms - rootfs_abspath_ms,
+        .wait_ready_ms = ready_ms - monitor_spawned_ms,
+        .total_ms = ready_ms - start_ms,
+    }) catch {};
 }
 
 pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
@@ -414,6 +459,10 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
     errdefer allocator.free(spec_path);
     const ready_path = try std.fs.path.resolve(allocator, &.{ vm_dir, ready_file });
     errdefer allocator.free(ready_path);
+    const create_timing_path = try std.fs.path.resolve(allocator, &.{ vm_dir, create_timing_file });
+    errdefer allocator.free(create_timing_path);
+    const monitor_timing_path = try std.fs.path.resolve(allocator, &.{ vm_dir, monitor_timing_file });
+    errdefer allocator.free(monitor_timing_path);
     const pid_path = try std.fs.path.resolve(allocator, &.{ vm_dir, pid_file });
     errdefer allocator.free(pid_path);
     const control_socket_path = try std.fs.path.resolve(allocator, &.{ vm_dir, control_socket_file });
@@ -425,6 +474,8 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
         .vm_dir = vm_dir,
         .spec_path = spec_path,
         .ready_path = ready_path,
+        .create_timing_path = create_timing_path,
+        .monitor_timing_path = monitor_timing_path,
         .pid_path = pid_path,
         .control_socket_path = control_socket_path,
         .console_log_path = console_log_path,
@@ -462,6 +513,20 @@ pub fn readReady(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.P
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
+}
+
+pub fn writeCreateTiming(allocator: std.mem.Allocator, io: Io, paths: Paths, timing: CreateTiming) !void {
+    try writeTimingJson(allocator, io, paths.create_timing_path, timing);
+}
+
+pub fn writeMonitorTiming(allocator: std.mem.Allocator, io: Io, paths: Paths, timing: MonitorTiming) !void {
+    try writeTimingJson(allocator, io, paths.monitor_timing_path, timing);
+}
+
+fn writeTimingJson(allocator: std.mem.Allocator, io: Io, path: []const u8, timing: anytype) !void {
+    const json = try std.json.Stringify.valueAlloc(allocator, timing, .{ .whitespace = .indent_2 });
+    defer allocator.free(json);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
 pub fn writePid(allocator: std.mem.Allocator, io: Io, paths: Paths, pid: i64) !void {
@@ -969,7 +1034,7 @@ fn sleepMs(ms: u64) void {
     _ = std.c.nanosleep(&ts, null);
 }
 
-fn monotonicMs() u64 {
+pub fn monotonicMs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
@@ -1172,6 +1237,8 @@ test "lifecycle paths are rooted under vms by name" {
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1", paths.vm_dir);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/spec.json", paths.spec_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/ready.json", paths.ready_path);
+    try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/create-timing.json", paths.create_timing_path);
+    try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/monitor-timing.json", paths.monitor_timing_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/pid", paths.pid_path);
 }
 

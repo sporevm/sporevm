@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-15
+last_reviewed: 2026-06-16
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
@@ -145,6 +145,8 @@ $SPOREVM_RUNTIME_DIR/vms/<name>/
   pid
   spec.json
   ready.json
+  create-timing.json
+  monitor-timing.json
   console.log
 ```
 
@@ -395,6 +397,9 @@ Scope:
   only after the single-VM lifecycle is stable.
 - Write JSONL with per-iteration `create_to_node_ms`, command exit status, and
   enough phase detail to tell create readiness from command latency.
+- Flatten lifecycle timing metadata from `create-timing.json` and
+  `monitor-timing.json` into each JSONL row before cleanup removes the runtime
+  directory.
 - Keep benchmark outputs outside this repository unless explicitly committing
   benchmark data.
 
@@ -434,6 +439,98 @@ The Node-Alpine run built a cold rootfs, ran a boot-id identity probe and
 `create_to_node_ms=26418`, `create_ms=26343`, `identity_exec_ms=32`, and
 `workload_exec_ms=43`. A deliberate `exit 7` workload smoke confirms the script
 writes JSONL but exits non-zero when any iteration fails.
+
+After adding lifecycle phase timing, a local HVF warm-cache run with the tag
+`docker.io/library/node:22-alpine` showed the visible create time was dominated
+by rootfs input resolution, not monitor startup or command execution:
+
+```text
+create_to_node_ms             median 4141ms
+create_ms                     median 3852ms
+create_rootfs_resolve_ms      median 3772ms
+create_spawn_monitor_ms       median 2ms
+create_wait_ready_ms          median 47ms
+create_uninstrumented_ms      median 31ms
+monitor_asset_resolve_ms      median 27ms
+monitor_ready_after_start_ms  median 28ms
+identity_exec_ms              median 139ms
+workload_exec_ms              median 157ms
+```
+
+The same cached rootfs addressed by digest,
+`docker.io/library/node@sha256:342bd5d0a0f4b439d6071c45f317dac3bd12459c40aa6b248c9c8ceece181da8`,
+removed the repeated tag-resolution cost:
+
+```text
+create_to_node_ms             median 362ms
+create_ms                     median 76ms
+create_rootfs_resolve_ms      median 0ms
+create_spawn_monitor_ms       median 1ms
+create_wait_ready_ms          median 46ms
+create_uninstrumented_ms      median 27ms
+monitor_asset_resolve_ms      median 19ms
+monitor_ready_after_start_ms  median 20ms
+identity_exec_ms              median 136ms
+workload_exec_ms              median 151ms
+```
+
+These samples were three-iteration local checks, not official benchmark runs,
+but they identify the first optimization target: repeated OCI tag resolution on
+the `spore create --image <tag>` path.
+
+### Slice D.1: Speed Experiments
+
+Status: proposed.
+
+Run the experiments in this order, keeping each one measurable with the
+lifecycle benchmark JSONL fields before moving to the next:
+
+1. **Digest-pinned benchmark mode.** Teach the benchmark docs and examples to
+   prefer digest-pinned image refs once the rootfs cache is warm. This tests the
+   VM lifecycle and guest command path without measuring registry tag lookup.
+   Done when a 30-iteration digest-pinned Node run reports stable
+   `create_rootfs_resolve_ms` near zero and a ComputeSDK-style score estimate
+   from `create_to_node_ms`.
+
+2. **Tag-to-digest resolution cache.** Cache the result of resolving mutable
+   tags with an explicit TTL and metadata that records the resolved digest,
+   registry host, platform, and time. The default can stay conservative, but the
+   benchmark path needs a way to avoid repeated registry calls when the caller
+   accepts tag staleness. Done when `node:22-alpine` warm-cache runs are close
+   to digest-pinned runs without changing the rootfs cache key correctness.
+
+3. **Rootfs explicit-path benchmark.** Add a benchmark option or example that
+   feeds `spore create --rootfs <cached.ext4>` directly. This isolates VM
+   lifecycle startup from all OCI work. Done when `create_rootfs_resolve_ms` is
+   not present or negligible and the remaining create time matches monitor
+   spawn plus ready wait.
+
+4. **Exec round-trip split.** Add monitor/guest timing for control request
+   accepted, vsock stream attached, guest started command, and guest completed
+   command. Current exec latency is about 135-155ms, which is small relative to
+   tag lookup but large relative to a sub-500ms TTI target. Done when
+   `identity_exec_ms` and `workload_exec_ms` can be split into host control,
+   vsock setup, guest agent dispatch, and command execution.
+
+5. **CLI startup overhead check.** Track `create_uninstrumented_ms`, which is
+   the shell-observed `create_ms` not covered by `createCli` phase timing. The
+   median is small locally, but cold process startup can produce outliers. Done
+   when longer runs distinguish one-time host process startup from recurring VM
+   lifecycle work.
+
+6. **Preboot or snapshot baseline.** Measure a diskless prebooted monitor or
+   same-host snapshot path separately from fresh create. Fresh boot is no
+   longer the dominant issue once digest refs are used, but preboot/snapshot is
+   still the likely path to compete with providers that keep warm sandboxes.
+   Done when the benchmark reports both fresh digest-pinned TTI and
+   preboot/snapshot TTI without mixing the two modes.
+
+Non-goals for this experiment slice:
+
+- Do not make mutable tag caching invisible or indefinite.
+- Do not change rootfs cache keys to ignore the resolved image digest.
+- Do not optimize by keeping benchmark-only VMs alive across iterations unless
+  the output names that mode separately from fresh create.
 
 ### Slice E: Suspend/Resume Integration
 
