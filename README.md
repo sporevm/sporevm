@@ -1,23 +1,27 @@
-# SporeVM
+# 🍄 SporeVM
 
-SporeVM is an experimental virtual machine monitor for aarch64 Linux microVMs.
-It treats a suspended VM as a cheap, forkable object that can be resumed or
-fanned out across compatible hosts.
+SporeVM is a small aarch64 virtual machine monitor for forkable Linux microVM
+checkpoints. The spore is the product: a sealed checkpoint with normalized
+machine state, device state, content-addressed memory chunks, and a platform
+contract that fails closed when a host cannot restore it honestly.
 
-One Zig codebase targets two hypervisors:
+The first useful shape is warm CI fan-out: start the expensive runtime once,
+capture the VM at a quiescent point, then fork children without copying all of
+RAM.
+
+The arm64 bet is deliberate. Apple Silicon and AWS Graviton are the useful
+overlap; x86 platform archaeology can wait. One Zig codebase targets:
 
 - KVM on Linux/aarch64
 - Hypervisor.framework on Apple Silicon macOS
 
-Both backends share the same minimal device model: virtio-mmio console, block,
-net, vsock, rng, and the SporeVM generation device. Cross-backend restore is a
-useful portability diagnostic, but the primary product path is fork/fan-out on
-identical host classes.
+Both backends expose the same fixed guest-visible board: RAM layout, interrupt
+wiring, boot contract, virtio-mmio devices, and the SporeVM generation device.
+Cross-backend restore is a useful diagnostic; identical-host-class fork/fan-out
+is the product path.
 
-A sealed checkpoint artifact is called a **spore**. A spore is a manifest of
-content-addressed memory chunks, guest machine state, device state, and
-eventually disk state. v0 spores do not capture disk bytes yet, so disk-backed
-resume still requires the same backing disk out of band.
+v0 spores do not capture disk bytes yet, so disk-backed resume still requires
+the same backing disk out of band.
 
 The target lifecycle property is that common operations avoid scaling with RAM
 size:
@@ -25,6 +29,17 @@ size:
 - **Suspend** is a pause plus a small dirty tail flush.
 - **Fork** is a metadata write.
 - **Resume** is bounded by the working set, not total guest RAM.
+
+## Design Shape
+
+- **One boring board.** Linux sees the same intentionally small aarch64 machine
+  on KVM and HVF. Portable here means "restore only when the host satisfies this
+  contract", not "run any guest on any machine".
+- **Fork is mostly paperwork.** Child spores point at the same verified chunks
+  and get their own identity. On same-host paths, a trusted RAM backing can be
+  mapped privately so reads share pages and writes diverge.
+- **Forked guests know they forked.** The generation device gives the guest a
+  small hook for identity, entropy, clock, and shard fixups after resume.
 
 ## Status
 
@@ -96,9 +111,8 @@ initrd installed by `zig build`. Override the boot assets with `--kernel` and
 `--initrd`, or set `SPOREVM_KERNEL_IMAGE` and `SPOREVM_RUN_INITRD`.
 
 The minimal agent streams command stdout and stderr over a small framed vsock
-protocol. The host forwards stdout frames to stdout, stderr frames to stderr,
-and exits with the guest command status. The old `--json` final-frame mode is
-not part of the product CLI.
+protocol. The host forwards those streams and exits with the guest command
+status.
 
 Capture a long-running run on a host signal:
 
@@ -114,14 +128,9 @@ wait "$run_pid"
 zig-out/bin/spore resume /tmp/run.spore
 ```
 
-When `--capture-on-abort` is set, the default capture signal is `INT`. In an
-interactive terminal, the first Ctrl-C requests capture and the second exits
-with status 130. Non-interactive callers can pass `--capture-signal INT`,
-`TERM`, `HUP`, `USR1`, or `USR2`, with or without the `SIG` prefix.
-
-Captured runs exit zero after writing the spore and print the capture path to
-stderr. A command that finishes before capture still exits with its guest
-status.
+With `--capture-on-abort`, the first matching host signal writes a spore and
+exits zero; a second Ctrl-C exits 130. If the guest command finishes first,
+`spore run` still exits with the guest status.
 
 Fork an existing spore:
 
@@ -177,84 +186,25 @@ zig-out/bin/spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
 Entrypoint, Cmd, User, Env, or Workdir yet. Set `SPOREVM_ROOTFS_CACHE_DIR` to
 override the cache directory.
 
-Run the end-to-end OCI rootfs smoke with:
-
-```bash
-scripts/smoke-run-oci-rootfs.sh -- /bin/echo hi
-```
-
 See [docs/rootfs.md](docs/rootfs.md) for tag resolution, metadata, and ext4
 tooling details.
 
-## Backend Harnesses And Smokes
+## Advanced Validation
 
-Lower-level backend harnesses remain available for targeted debugging:
+Most local validation should use `mise run smoke`. Lower-level tools remain for
+backend debugging and hardware proof work:
 
-```bash
-mise exec -- zig build hvf-boot
-mise exec -- zig build hvf-gic-probe
-mise exec -- zig build kvm-boot
-```
+- `zig build hvf-boot` / `zig build kvm-boot`: build backend boot and capture
+  harnesses.
+- `zig build hvf-gic-probe`: probe Hypervisor.framework GIC state support.
+- `scripts/smoke-restore-leg.sh`: split capture/resume legs for backend
+  debugging.
+- `scripts/smoke-fork-fanout.sh`: exercise fork generation fixups.
+- `scripts/smoke-remote-bundle.sh`: run SSM/S3 cross-host bundle validation.
+- `scripts/benchmark-sporevm-minimal.sh`: collect lower-bound boot/exec timing.
 
-The `hvf-boot` and `kvm-boot` harnesses accept `--initrd root.cpio` for
-diskless smoke workloads. When no disk is supplied they default to
-`rdinit=/init`.
-
-The smoke scripts auto-download pinned `cleanroom-kernels` assets and cache
-them under the platform cache directory. Pass `--kernel` or set
-`SPOREVM_KERNEL_IMAGE` for local kernel experiments.
-
-Build the ticker initrd used by restore smokes:
-
-```bash
-scripts/make-smoke-initrd.sh /tmp/sporevm-smoke.cpio
-```
-
-Run same-host restore smokes, or split cross-host capture/resume legs:
-
-```bash
-scripts/smoke-restore-leg.sh same-host \
-  --backend hvf \
-  --initrd /tmp/sporevm-smoke.cpio
-```
-
-Fork fan-out smokes use the separate SporeVM kernel asset because the
-fork-aware initrd needs `/dev/mem` access to the fixed generation MMIO window:
-
-```bash
-CC="zig cc -target aarch64-linux-musl" \
-  scripts/smoke-fork-fanout.sh --backend hvf
-```
-
-To exercise the first cross-host bundle path over SSM and S3:
-
-```bash
-scripts/smoke-remote-bundle.sh \
-  --region REGION \
-  --source-instance ID \
-  --dest-instance ID \
-  --bucket BUCKET
-```
-
-It stages tracked `HEAD` plus the current tracked/staged diff. Stage new files
-you want included in the remote run. Add `--cache-dir DIR --dest-repeat N` to
-prove host-local bundle cache reuse across repeated restores. Add
-`--source-peer-ip IP --source-peer-port 20000` to serve the bundle from the
-source host over east-west HTTP so destinations avoid direct S3 bundle
-downloads.
-
-For a lower-bound boot/exec probe comparable to Cleanroom's minimal
-`darwin-vz` benchmark:
-
-```bash
-scripts/benchmark-sporevm-minimal.sh \
-  --backend hvf \
-  --iterations 30
-```
-
-The benchmark builds a tiny initrd whose `/init` listens on virtio-vsock, sends
-one `/bin/true` argv request from the host, and writes JSONL timings for VM
-start, vsock connect, and first exec response.
+Run the relevant script with `--help` before using it; these are intentionally
+more harness-shaped than product-shaped.
 
 ## Security
 
