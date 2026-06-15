@@ -640,8 +640,14 @@ validated same-host forks from trusted `ram.backing` with
 `snapshot_pause_ms=109` / `tail_flush_ms=87`. The dirty benchmark harness now
 also accepts `--backend hvf`; its first 512MiB write-protect JSONL row reported
 `snapshot_pause_ms=80` / `tail_flush_ms=71`, confirming the measurement path is
-not tied to ad hoc fork-smoke log scraping. Larger macOS CI scale runs and
-reducing or predicting dirty-tail lag are now the next Slice 7 gaps.
+not tied to ad hoc fork-smoke log scraping. Larger single-VM local HVF runs then
+reported `snapshot_pause_ms=95` / `tail_flush_ms=72` at 1GiB and
+`snapshot_pause_ms=126` / `tail_flush_ms=92` at 4GiB; a two-concurrent-VM
+512MiB run reported `snapshot_pause_ms=124` and `127`, both with
+`tail_flush_ms=88`. This keeps the first macOS write-protect curve roughly flat
+with RAM size for the active-boot smoke, but 16GiB and higher-concurrency macOS
+CI scale runs remain before treating it as a product boundary. Reducing or
+predicting dirty-tail lag is still the next Slice 7 gap.
 
 Continuous epoch-based chunk sealing during normal execution; suspend becomes
 pause + tail flush. First move epoch collection/sealing out of the vCPU loop
