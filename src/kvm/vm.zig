@@ -6,6 +6,7 @@
 //! forwards virtio/generation interrupts into the VGIC.
 
 const std = @import("std");
+const linux = std.os.linux;
 const chunk = @import("../chunk.zig");
 const kvm = @import("kvm.zig");
 const lazy_ram = @import("lazy_ram.zig");
@@ -92,6 +93,20 @@ const RamMapping = struct {
 
     fn deinit(self: RamMapping) void {
         std.posix.munmap(self.bytes);
+    }
+};
+
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(self: *SpinLock) void {
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.locked.store(false, .release);
     }
 };
 
@@ -253,6 +268,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         if (dirty_tracker) |*tracker| {
             ram.dirty_context = tracker;
             ram.dirty_fn = DirtyTracker.markGuestWriteCallback;
+            try tracker.startWorker();
         }
     }
 
@@ -302,9 +318,6 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             }
             if (probe.elapsedMs() > config.exec_probe_timeout_ms) return error.VsockProbeTimedOut;
         }
-        if (dirty_tracker) |*tracker| {
-            try tracker.flushEpochIfDue(try monotonicMs());
-        }
         if (config.snapshot_after_ms) |after_ms| {
             const elapsed_ms = (try monotonicMs()) - start_ms;
             if (elapsed_ms >= after_ms) {
@@ -351,6 +364,31 @@ fn monotonicMs() !u64 {
         },
     }
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
+
+fn threadCpuNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    const rc = std.os.linux.clock_gettime(.THREAD_CPUTIME_ID, &ts);
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => {},
+        else => return 0,
+    }
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn nsToMs(ns: u64) u64 {
+    return ns / std.time.ns_per_ms;
+}
+
+fn elapsedCpuMs(start_ns: u64) u64 {
+    const end_ns = threadCpuNs();
+    if (end_ns <= start_ns) return 0;
+    return nsToMs(end_ns - start_ns);
+}
+
+fn ratePerSec(count: u64, elapsed_ms: u64) u64 {
+    if (elapsed_ms == 0) return 0;
+    return count * std.time.ms_per_s / elapsed_ms;
 }
 
 fn mapRam(allocator: std.mem.Allocator, config: Config, manifest: ?spore.Manifest) !RamMapping {
@@ -445,7 +483,12 @@ const DirtyTracker = struct {
     backing_tmp_path: [:0]const u8,
     backing_final_path: [:0]const u8,
     epoch_ms: u64,
-    next_epoch_ms: u64,
+    mutex: SpinLock = .{},
+    worker_thread: ?std.Thread = null,
+    stop_read_fd: std.c.fd_t = -1,
+    stop_write_fd: std.c.fd_t = -1,
+    worker_failed: bool = false,
+    tracking_start_ms: u64 = 0,
     finished: bool = false,
     stats: DirtyStats = .{},
 
@@ -470,8 +513,15 @@ const DirtyTracker = struct {
         host_dirty_chunks_total: u64 = 0,
         sealed_chunks_total: u64 = 0,
         get_dirty_log_ms: u64 = 0,
+        get_dirty_log_cpu_ms: u64 = 0,
         seal_ms: u64 = 0,
+        seal_cpu_ms: u64 = 0,
         tail_flush_ms: u64 = 0,
+        worker_epoch_max_ms: u64 = 0,
+        worker_join_ms: u64 = 0,
+        tracking_ms: u64 = 0,
+        dirty_pages_per_sec: u64 = 0,
+        sealed_chunks_per_sec: u64 = 0,
     };
 
     fn start(allocator: std.mem.Allocator, options: Options) !DirtyTracker {
@@ -508,7 +558,6 @@ const DirtyTracker = struct {
             .backing_tmp_path = backing_tmp_path,
             .backing_final_path = backing_final_path,
             .epoch_ms = options.epoch_ms,
-            .next_epoch_ms = (try monotonicMs()) + options.epoch_ms,
         };
         @memset(tracker.refs, null);
         @memset(tracker.dirty_chunks, false);
@@ -527,6 +576,7 @@ const DirtyTracker = struct {
         // initrd, and DTB so subsequent epochs measure guest writes only.
         _ = try tracker.collectDirtyLog(false);
         tracker.resetDirtyStatsAfterBaseline();
+        tracker.tracking_start_ms = try monotonicMs();
 
         std.log.info(
             "kvm dirty tracking started: mode=dirty-log ram_mib={d} chunks={d} seed_nonzero_chunks={d} seed_ms={d} epoch_ms={d}",
@@ -536,6 +586,7 @@ const DirtyTracker = struct {
     }
 
     fn deinit(self: *DirtyTracker) void {
+        self.stopWorker();
         if (self.backing_fd >= 0) {
             _ = std.c.close(self.backing_fd);
             self.backing_fd = -1;
@@ -545,17 +596,83 @@ const DirtyTracker = struct {
         }
     }
 
-    fn flushEpochIfDue(self: *DirtyTracker, now_ms: u64) !void {
+    fn startWorker(self: *DirtyTracker) !void {
         if (self.epoch_ms == 0) return;
-        if (now_ms < self.next_epoch_ms) return;
-        try self.flushDirty(false);
-        while (self.next_epoch_ms <= now_ms) : (self.next_epoch_ms += self.epoch_ms) {}
+        var stop_pipe: [2]std.c.fd_t = undefined;
+        try linuxCall(linux.pipe2(&stop_pipe, .{ .CLOEXEC = true }));
+        errdefer closeFd(stop_pipe[0]);
+        errdefer closeFd(stop_pipe[1]);
+        self.stop_read_fd = stop_pipe[0];
+        self.stop_write_fd = stop_pipe[1];
+        errdefer {
+            closeFd(self.stop_read_fd);
+            closeFd(self.stop_write_fd);
+            self.stop_read_fd = -1;
+            self.stop_write_fd = -1;
+        }
+        self.worker_thread = try std.Thread.spawn(.{}, dirtyWorker, .{self});
+        std.log.info("kvm dirty tracking worker started: epoch_ms={d}", .{self.epoch_ms});
+    }
+
+    fn stopWorker(self: *DirtyTracker) void {
+        if (self.worker_thread) |thread| {
+            const join_start = monotonicMs() catch 0;
+            var byte: [1]u8 = .{1};
+            if (self.stop_write_fd >= 0) _ = linux.write(self.stop_write_fd, &byte, byte.len);
+            thread.join();
+            self.worker_thread = null;
+            const join_end = monotonicMs() catch join_start;
+            self.stats.worker_join_ms += join_end - join_start;
+        }
+        if (self.stop_read_fd >= 0) {
+            closeFd(self.stop_read_fd);
+            self.stop_read_fd = -1;
+        }
+        if (self.stop_write_fd >= 0) {
+            closeFd(self.stop_write_fd);
+            self.stop_write_fd = -1;
+        }
+    }
+
+    fn dirtyWorker(self: *DirtyTracker) void {
+        const timeout_ms: i32 = if (self.epoch_ms > std.math.maxInt(i32)) std.math.maxInt(i32) else @intCast(self.epoch_ms);
+        while (true) {
+            var fds = [_]linux.pollfd{.{ .fd = self.stop_read_fd, .events = linux.POLL.IN, .revents = 0 }};
+            const rc = linux.poll(&fds, fds.len, timeout_ms);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => {
+                    self.markWorkerFailed();
+                    return;
+                },
+            }
+            if (rc > 0 and fds[0].revents != 0) return;
+            const epoch_start = monotonicMs() catch 0;
+            self.flushDirty(false) catch {
+                self.markWorkerFailed();
+                return;
+            };
+            const epoch_ms = (monotonicMs() catch epoch_start) - epoch_start;
+            self.mutex.lock();
+            if (epoch_ms > self.stats.worker_epoch_max_ms) self.stats.worker_epoch_max_ms = epoch_ms;
+            self.mutex.unlock();
+        }
+    }
+
+    fn markWorkerFailed(self: *DirtyTracker) void {
+        self.mutex.lock();
+        self.worker_failed = true;
+        self.mutex.unlock();
     }
 
     fn finish(self: *DirtyTracker) !spore.MemoryManifest {
+        self.stopWorker();
+        if (self.worker_failed) return error.KvmDirtyWorkerFailed;
         const tail_start = try monotonicMs();
         try self.flushDirty(true);
         self.stats.tail_flush_ms = (try monotonicMs()) - tail_start;
+        self.finishRates(try monotonicMs());
 
         if (std.c.fchmod(self.backing_fd, 0o444) != 0) return error.IoFailed;
         _ = std.c.close(self.backing_fd);
@@ -571,11 +688,18 @@ const DirtyTracker = struct {
     }
 
     fn flushDirty(self: *DirtyTracker, tail: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.flushDirtyLocked(tail);
+    }
+
+    fn flushDirtyLocked(self: *DirtyTracker, tail: bool) !void {
         const dirty_pages = try self.collectDirtyLog(tail);
         if (dirty_pages == 0 and !self.hasDirtyChunks()) return;
 
         var dirty_chunks_this_flush: u64 = 0;
         const seal_start = try monotonicMs();
+        const seal_cpu_start = threadCpuNs();
         for (self.dirty_chunks, 0..) |is_dirty, i| {
             if (!is_dirty) continue;
             self.dirty_chunks[i] = false;
@@ -583,6 +707,7 @@ const DirtyTracker = struct {
             _ = try self.sealChunk(i, true);
         }
         self.stats.seal_ms += (try monotonicMs()) - seal_start;
+        self.stats.seal_cpu_ms += elapsedCpuMs(seal_cpu_start);
         self.stats.dirty_chunks_total += dirty_chunks_this_flush;
     }
 
@@ -593,8 +718,10 @@ const DirtyTracker = struct {
             .dirty_bitmap = @intFromPtr(self.bitmap.ptr),
         };
         const log_start = try monotonicMs();
+        const log_cpu_start = threadCpuNs();
         _ = try kvm.ioctl(self.vm_fd, kvm.KVM_GET_DIRTY_LOG, @intFromPtr(&log), "KVM_GET_DIRTY_LOG");
         self.stats.get_dirty_log_ms += (try monotonicMs()) - log_start;
+        self.stats.get_dirty_log_cpu_ms += elapsedCpuMs(log_cpu_start);
         if (!tail) self.stats.dirty_epoch_count += 1;
 
         var dirty_pages: u64 = 0;
@@ -642,6 +769,8 @@ const DirtyTracker = struct {
         const last_byte = start_offset + capped_len - 1;
         const last_chunk = last_byte / spore.chunk_size;
 
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.stats.host_dirty_ranges_total += 1;
         var chunk_index = first_chunk;
         while (chunk_index <= last_chunk) : (chunk_index += 1) {
@@ -661,10 +790,25 @@ const DirtyTracker = struct {
         self.stats.host_dirty_chunks_total = 0;
         self.stats.sealed_chunks_total = 0;
         self.stats.get_dirty_log_ms = 0;
+        self.stats.get_dirty_log_cpu_ms = 0;
         self.stats.seal_ms = 0;
+        self.stats.seal_cpu_ms = 0;
         self.stats.tail_flush_ms = 0;
+        self.stats.worker_epoch_max_ms = 0;
+        self.stats.worker_join_ms = 0;
+        self.stats.tracking_ms = 0;
+        self.stats.dirty_pages_per_sec = 0;
+        self.stats.sealed_chunks_per_sec = 0;
         @memset(self.dirty_chunks, false);
         @memset(self.bitmap, 0);
+    }
+
+    fn finishRates(self: *DirtyTracker, now_ms: u64) void {
+        if (now_ms <= self.tracking_start_ms) return;
+        const tracking_ms = now_ms - self.tracking_start_ms;
+        self.stats.tracking_ms = tracking_ms;
+        self.stats.dirty_pages_per_sec = ratePerSec(self.stats.dirty_pages_total, tracking_ms);
+        self.stats.sealed_chunks_per_sec = ratePerSec(self.stats.sealed_chunks_total, tracking_ms);
     }
 
     fn sealChunk(self: *DirtyTracker, index: usize, count_dirty_seal: bool) !bool {
@@ -758,7 +902,7 @@ fn takeSnapshot(
     if (dirty_tracker) |tracker| {
         const stats = tracker.stats;
         std.log.info(
-            "kvm snapshot metrics: mode=dirty-log ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} dirty_epoch_ms={d} dirty_epoch_count={d} dirty_pages_total={d} dirty_pages_tail={d} dirty_chunks_total={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} tail_flush_ms={d} get_dirty_log_ms={d} seal_ms={d}",
+            "kvm snapshot metrics: mode=dirty-log ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} dirty_epoch_ms={d} dirty_epoch_count={d} dirty_pages_total={d} dirty_pages_tail={d} dirty_chunks_total={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} tail_flush_ms={d} get_dirty_log_ms={d} get_dirty_log_cpu_ms={d} seal_ms={d} seal_cpu_ms={d} worker_epoch_max_ms={d} worker_join_ms={d} tracking_ms={d} dirty_pages_per_sec={d} sealed_chunks_per_sec={d}",
             .{
                 ram_size / 1024 / 1024,
                 memory_plan.chunk_count,
@@ -783,7 +927,14 @@ fn takeSnapshot(
                 stats.seed_nonzero_chunks,
                 stats.tail_flush_ms,
                 stats.get_dirty_log_ms,
+                stats.get_dirty_log_cpu_ms,
                 stats.seal_ms,
+                stats.seal_cpu_ms,
+                stats.worker_epoch_max_ms,
+                stats.worker_join_ms,
+                stats.tracking_ms,
+                stats.dirty_pages_per_sec,
+                stats.sealed_chunks_per_sec,
             },
         );
     } else {
@@ -869,6 +1020,13 @@ fn raiseGenerationIrqIfPending(vm_fd: std.c.fd_t, gen_dev: *const generation.Dev
 
 fn closeFd(fd: std.c.fd_t) void {
     _ = std.c.close(fd);
+}
+
+fn linuxCall(rc: usize) !void {
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.IoFailed,
+    }
 }
 
 fn createGic(vm_fd: std.c.fd_t) !kvm.CreateDevice {

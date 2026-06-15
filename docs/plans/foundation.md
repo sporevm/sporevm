@@ -618,8 +618,13 @@ dirty-log metrics. The first A1 numbers show suspend pause dropping from
 sealing paid before suspend. `KVM_GET_DIRTY_LOG` overhead was negligible in the
 16GiB run (`get_dirty_log_ms=3` total), so dirty ring is deferred until polling
 shows up in larger RAM, many-vCPU, or many-VM measurements. Product monitor
-background threading and HVF write-protect-exit measurement are now the next
-Slice 7 gaps.
+background threading has started with a KVM worker that removes periodic
+sealing from the vCPU loop and reports worker/jitter/CPU rates. The first 512MiB
+worker run validated resume and trusted backing, but an active-boot snapshot at
+3s still had `tail_flush_ms=510` / `snapshot_pause_ms=512` because the worker
+had not fully caught up with the boot dirty burst (`worker_epoch_max_ms=1111`,
+`sealed_chunks_per_sec=8`). HVF write-protect-exit measurement and reducing or
+predicting dirty-tail lag are now the next Slice 7 gaps.
 
 Continuous epoch-based chunk sealing during normal execution; suspend becomes
 pause + tail flush. First move epoch collection/sealing out of the vCPU loop
@@ -632,12 +637,12 @@ many-vCPU, or fleet-scale measurements.
 
 Next execution order:
 
-1. Split the KVM dirty-log path into a small dirty collector plus a background
-   chunk-sealing worker owned by the monitor/harness instead of doing sealing
-   inline with vCPU progress.
-2. Add benchmark fields for epoch max pause, collector CPU time, sealing CPU
-   time, dirty pages/sec, and sealed chunks/sec; use them to compare one VM,
-   many VMs, and larger RAM without changing APIs again.
+1. Use the worker metrics to compare one VM, many VMs, and larger RAM without
+   changing APIs again; separate steady-state idle snapshots from active boot or
+   workload dirty bursts.
+2. Reduce dirty-tail lag where it matters: tune epoch cadence, consider
+   immediate drain-on-snapshot before machine-state capture, and measure whether
+   chunk hashing or backing writes dominate.
 3. Measure HVF write-protect-exit dirty tracking on the macOS CI host and make
    the same always-on vs suspend-scan decision with numbers.
 4. Revisit KVM dirty ring only if bitmap polling, not hashing/sealing or cold
