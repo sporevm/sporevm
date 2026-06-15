@@ -28,6 +28,9 @@ const flag_indirect: u16 = 4;
 pub const Segment = struct {
     /// Host view of the descriptor's buffer.
     data: []u8,
+    /// Guest-physical start of `data`. Used to mark VMM-originated writes
+    /// dirty for snapshot paths that rely on hypervisor dirty logs.
+    addr: u64 = 0,
     /// Device-writable (VIRTQ_DESC_F_WRITE) or device-readable.
     writable: bool,
 };
@@ -62,6 +65,13 @@ pub const Chain = struct {
             if (!seg.writable) n += seg.data.len;
         }
         return n;
+    }
+
+    pub fn markWritableDirty(self: *const Chain, ram: guestmem.GuestRam) void {
+        for (self.segments.slice()) |seg| {
+            if (!seg.writable) continue;
+            ram.markDirty(seg.addr, @intCast(seg.data.len));
+        }
     }
 };
 
@@ -111,6 +121,7 @@ pub const VirtQueue = struct {
             const data = ram.slice(addr, len) catch return error.OutOfBounds;
             chain.segments.append(.{
                 .data = data,
+                .addr = addr,
                 .writable = flags & flag_write != 0,
             }) catch return error.ChainTooLong;
 
@@ -172,6 +183,29 @@ const TestRing = struct {
         const idx = r.read(u16, avail_base + 2) catch unreachable;
         r.write(u16, avail_base + 4 + 2 * @as(u64, idx % self.q.size), head) catch unreachable;
         r.write(u16, avail_base + 2, idx +% 1) catch unreachable;
+    }
+};
+
+const DirtyProbe = struct {
+    ranges: [8]Range = undefined,
+    len: usize = 0,
+
+    const Range = struct { gpa: u64, len: u64 };
+
+    fn mark(ctx: *anyopaque, gpa: u64, len: u64) void {
+        const self: *DirtyProbe = @ptrCast(@alignCast(ctx));
+        if (self.len < self.ranges.len) {
+            self.ranges[self.len] = .{ .gpa = gpa, .len = len };
+        }
+        self.len += 1;
+    }
+
+    fn saw(self: *const DirtyProbe, gpa: u64, len: u64) bool {
+        const n = @min(self.len, self.ranges.len);
+        for (self.ranges[0..n]) |r| {
+            if (r.gpa == gpa and r.len == len) return true;
+        }
+        return false;
     }
 };
 
@@ -249,6 +283,23 @@ test "used ring round-trip" {
     try std.testing.expectEqual(@as(u16, 1), try r.read(u16, TestRing.used_base + 2));
     try std.testing.expectEqual(@as(u32, 3), try r.read(u32, TestRing.used_base + 4));
     try std.testing.expectEqual(@as(u32, 4), try r.read(u32, TestRing.used_base + 8));
+}
+
+test "VMM writes can mark descriptor buffers and used ring dirty" {
+    var t = TestRing.init(8);
+    t.setDesc(3, TestRing.data_base, 4, flag_write, 0);
+    t.pushAvail(3);
+    const chain = (try t.q.popAvail(t.ram())).?;
+
+    var probe = DirtyProbe{};
+    const ram = guestmem.GuestRam{ .bytes = &t.buf, .base = 0, .dirty_context = &probe, .dirty_fn = DirtyProbe.mark };
+    chain.markWritableDirty(ram);
+    try t.q.pushUsed(ram, chain.head, 4);
+
+    try std.testing.expect(probe.saw(TestRing.data_base, 4));
+    try std.testing.expect(probe.saw(TestRing.used_base + 4, 4));
+    try std.testing.expect(probe.saw(TestRing.used_base + 8, 4));
+    try std.testing.expect(probe.saw(TestRing.used_base + 2, 2));
 }
 
 test "not-ready queue is rejected" {

@@ -13,6 +13,12 @@ pub const GuestRam = struct {
     bytes: []u8,
     /// Guest-physical base address of that region.
     base: u64,
+    /// Optional observer for VMM-originated writes. KVM dirty logging only
+    /// sees guest CPU writes, so device emulation uses this hook to keep
+    /// dirty-tracked snapshots coherent when the VMM writes used rings or
+    /// device-writable descriptor buffers.
+    dirty_context: ?*anyopaque = null,
+    dirty_fn: ?*const fn (ctx: *anyopaque, gpa: u64, len: u64) void = null,
 
     /// Translate a guest-physical range into a host slice, or fail.
     pub fn slice(self: GuestRam, gpa: u64, len: u64) Error![]u8 {
@@ -34,6 +40,27 @@ pub const GuestRam = struct {
     pub fn write(self: GuestRam, comptime T: type, gpa: u64, value: T) Error!void {
         const s = try self.slice(gpa, @sizeOf(T));
         std.mem.writeInt(T, s[0..@sizeOf(T)], value, .little);
+        self.markDirty(gpa, @sizeOf(T));
+    }
+
+    pub fn markDirty(self: GuestRam, gpa: u64, len: u64) void {
+        if (len == 0) return;
+        const f = self.dirty_fn orelse return;
+        const ctx = self.dirty_context orelse return;
+        f(ctx, gpa, len);
+    }
+};
+
+const DirtyProbe = struct {
+    calls: usize = 0,
+    last_gpa: u64 = 0,
+    last_len: u64 = 0,
+
+    fn mark(ctx: *anyopaque, gpa: u64, len: u64) void {
+        const self: *DirtyProbe = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.last_gpa = gpa;
+        self.last_len = len;
     }
 };
 
@@ -57,4 +84,14 @@ test "typed read/write round-trip" {
     try ram.write(u32, 1, 0xdeadbeef); // deliberately unaligned
     try std.testing.expectEqual(@as(u32, 0xdeadbeef), try ram.read(u32, 1));
     try std.testing.expectError(error.OutOfBounds, ram.read(u64, 9));
+}
+
+test "typed writes notify dirty observer" {
+    var buf = [_]u8{0} ** 16;
+    var probe = DirtyProbe{};
+    const ram = GuestRam{ .bytes = &buf, .base = 0x1000, .dirty_context = &probe, .dirty_fn = DirtyProbe.mark };
+    try ram.write(u32, 0x1004, 0x12345678);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(u64, 0x1004), probe.last_gpa);
+    try std.testing.expectEqual(@as(u64, 4), probe.last_len);
 }

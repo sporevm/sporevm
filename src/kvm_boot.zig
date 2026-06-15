@@ -2,7 +2,7 @@
 //!
 //! Bring-up tool, not the product CLI. Usage:
 //!   zig build kvm-boot
-//!   ./zig-out/bin/kvm-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH] [--trust-ram-backing] [--fdpass-ram-backing]
+//!   ./zig-out/bin/kvm-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--dirty-track] [--dirty-epoch-ms N] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH] [--trust-ram-backing] [--fdpass-ram-backing]
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
-        std.debug.print("usage: kvm-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH] [--trust-ram-backing] [--fdpass-ram-backing]\n", .{});
+        std.debug.print("usage: kvm-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--dirty-track] [--dirty-epoch-ms N] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH] [--trust-ram-backing] [--fdpass-ram-backing]\n", .{});
         std.process.exit(2);
     }
 
@@ -37,6 +37,8 @@ pub fn main(init: std.process.Init) !void {
     var lazy_ram_trace_path: ?[]const u8 = null;
     var trust_ram_backing = false;
     var fdpass_ram_backing = false;
+    var dirty_track = false;
+    var dirty_epoch_ms: u64 = 250;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--cmdline") and i + 1 < args.len) {
@@ -57,6 +59,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--spore") and i + 1 < args.len) {
             i += 1;
             spore_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dirty-track")) {
+            dirty_track = true;
+        } else if (std.mem.eql(u8, args[i], "--dirty-epoch-ms") and i + 1 < args.len) {
+            i += 1;
+            dirty_epoch_ms = try std.fmt.parseInt(u64, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--resume") and i + 1 < args.len) {
             i += 1;
             resume_dir = args[i];
@@ -80,6 +87,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (resume_dir != null and snapshot_after_ms != null) {
         std.debug.print("--resume cannot be combined with --snapshot-after-ms\n", .{});
+        std.process.exit(2);
+    }
+    if (dirty_track and snapshot_after_ms == null) {
+        std.debug.print("--dirty-track requires --snapshot-after-ms and --spore\n", .{});
         std.process.exit(2);
     }
     if (lazy_ram and resume_dir == null) {
@@ -170,6 +181,7 @@ pub fn main(init: std.process.Init) !void {
         .lazy_ram_trace_fd = lazy_ram_trace_fd,
         .snapshot_after_ms = snapshot_after_ms,
         .snapshot_dir = spore_dir,
+        .dirty_tracking = .{ .enabled = dirty_track, .epoch_ms = dirty_epoch_ms },
     });
     std.debug.print("\nsporevm kvm-boot: guest requested {s}\n", .{@tagName(cause)});
 }

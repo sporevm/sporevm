@@ -302,6 +302,7 @@ pub const Vsock = struct {
             const chain = maybe_chain orelse break;
             const packet = self.pending[0];
             const written = writePacketToChain(&chain, packet.header, packet.data[0..packet.data_len]) orelse 0;
+            chain.markWritableDirty(ram);
             rx.pushUsed(ram, chain.head, written) catch return did_work;
             self.dropFirstPending();
             did_work = true;

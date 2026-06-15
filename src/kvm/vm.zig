@@ -6,6 +6,7 @@
 //! forwards virtio/generation interrupts into the VGIC.
 
 const std = @import("std");
+const chunk = @import("../chunk.zig");
 const kvm = @import("kvm.zig");
 const lazy_ram = @import("lazy_ram.zig");
 const snapshot = @import("snapshot.zig");
@@ -46,9 +47,19 @@ pub const Config = struct {
     /// stop. Requires snapshot_dir.
     snapshot_after_ms: ?u64 = null,
     snapshot_dir: ?[]const u8 = null,
+    /// Opt-in KVM dirty-log capture path for Slice 7 measurement. When
+    /// enabled, guest writes are collected in epochs and snapshot only needs a
+    /// final dirty-log tail flush instead of a full RAM scan.
+    dirty_tracking: DirtyTrackingOptions = .{},
     /// Optional minimal host-initiated vsock stream used by benchmark harnesses.
     exec_probe: ?*vsock.HostStream = null,
     exec_probe_timeout_ms: u64 = 30_000,
+};
+
+pub const DirtyTrackingOptions = struct {
+    enabled: bool = false,
+    /// 0 disables periodic collection and measures only the final tail flush.
+    epoch_ms: u64 = 250,
 };
 
 pub const RamRestoreMode = enum {
@@ -88,6 +99,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var resume_parsed: ?std.json.Parsed(spore.Manifest) = null;
     defer if (resume_parsed) |*parsed| parsed.deinit();
     var lazy_pager: ?lazy_ram.Pager = null;
+    var dirty_tracker: ?DirtyTracker = null;
+    defer if (dirty_tracker) |*tracker| tracker.deinit();
     var restore_stats: ?RestoreStats = null;
     if (config.resume_dir) |spore_dir| {
         const manifest_start = try monotonicMs();
@@ -118,11 +131,11 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     defer ram_mapping.deinit();
     defer if (lazy_pager) |*pager| pager.deinit();
     const ram_bytes = ram_mapping.bytes;
-    const ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
+    var ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
 
     var region = kvm.UserspaceMemoryRegion{
         .slot = 0,
-        .flags = 0,
+        .flags = if (config.dirty_tracking.enabled) kvm.KVM_MEM_LOG_DIRTY_PAGES else 0,
         .guest_phys_addr = board.ram_base,
         .memory_size = config.ram_size,
         .userspace_addr = @intFromPtr(ram_bytes.ptr),
@@ -228,6 +241,21 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         try kvm.setOneRegU64(vcpu_fd, kvm.gprReg(0), layout.dtb);
     }
 
+    if (config.dirty_tracking.enabled) {
+        const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
+        dirty_tracker = try DirtyTracker.start(allocator, .{
+            .vm_fd = vm_fd,
+            .slot = 0,
+            .dir = dir,
+            .ram = ram_bytes,
+            .epoch_ms = config.dirty_tracking.epoch_ms,
+        });
+        if (dirty_tracker) |*tracker| {
+            ram.dirty_context = tracker;
+            ram.dirty_fn = DirtyTracker.markGuestWriteCallback;
+        }
+    }
+
     const run_size = try kvm.ioctl(kvm_fd, kvm.KVM_GET_VCPU_MMAP_SIZE, 0, "KVM_GET_VCPU_MMAP_SIZE");
     const run_bytes = try std.posix.mmap(
         null,
@@ -274,6 +302,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             }
             if (probe.elapsedMs() > config.exec_probe_timeout_ms) return error.VsockProbeTimedOut;
         }
+        if (dirty_tracker) |*tracker| {
+            try tracker.flushEpochIfDue(try monotonicMs());
+        }
         if (config.snapshot_after_ms) |after_ms| {
             const elapsed_ms = (try monotonicMs()) - start_ms;
             if (elapsed_ms >= after_ms) {
@@ -282,7 +313,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     pending_kvm_completion = false;
                 }
                 const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size);
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, if (dirty_tracker) |*tracker| tracker else null);
                 return .snapshotted;
             }
         }
@@ -370,6 +401,303 @@ fn fileSize(fd: std.c.fd_t) !u64 {
     return @intCast(end);
 }
 
+fn writeFileAll(path: [:0]const u8, data: []const u8) !void {
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    var done: usize = 0;
+    while (done < data.len) {
+        const n = std.c.write(fd, data.ptr + done, data.len - done);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+}
+
+fn pwriteFileAll(fd: std.c.fd_t, offset: usize, data: []const u8) !void {
+    var done: usize = 0;
+    while (done < data.len) {
+        const n = std.c.pwrite(fd, data.ptr + done, data.len - done, @intCast(offset + done));
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+}
+
+fn ensureDir(path: [:0]const u8) !void {
+    if (std.c.mkdir(path, 0o755) != 0) {
+        if (std.c.access(path, 0) != 0) return error.IoFailed;
+    }
+}
+
+fn pathZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![:0]const u8 {
+    return std.fmt.allocPrintSentinel(allocator, fmt, args, 0) catch error.OutOfMemory;
+}
+
+const DirtyTracker = struct {
+    allocator: std.mem.Allocator,
+    vm_fd: std.c.fd_t,
+    slot: u32,
+    dir: []const u8,
+    ram: []const u8,
+    refs: []?[]const u8,
+    dirty_chunks: []bool,
+    bitmap: []usize,
+    backing_fd: std.c.fd_t,
+    backing_tmp_path: [:0]const u8,
+    backing_final_path: [:0]const u8,
+    epoch_ms: u64,
+    next_epoch_ms: u64,
+    finished: bool = false,
+    stats: DirtyStats = .{},
+
+    const Options = struct {
+        vm_fd: std.c.fd_t,
+        slot: u32,
+        dir: []const u8,
+        ram: []const u8,
+        epoch_ms: u64,
+    };
+
+    const DirtyStats = struct {
+        seed_ms: u64 = 0,
+        seed_chunks: usize = 0,
+        seed_nonzero_chunks: usize = 0,
+        dirty_epoch_ms: u64 = 0,
+        dirty_epoch_count: u64 = 0,
+        dirty_pages_total: u64 = 0,
+        dirty_pages_tail: u64 = 0,
+        dirty_chunks_total: u64 = 0,
+        host_dirty_ranges_total: u64 = 0,
+        host_dirty_chunks_total: u64 = 0,
+        sealed_chunks_total: u64 = 0,
+        get_dirty_log_ms: u64 = 0,
+        seal_ms: u64 = 0,
+        tail_flush_ms: u64 = 0,
+    };
+
+    fn start(allocator: std.mem.Allocator, options: Options) !DirtyTracker {
+        if (options.ram.len == 0) return error.BadManifest;
+        if (options.ram.len % std.heap.page_size_min != 0) return error.BadManifest;
+        if (spore.chunk_size % std.heap.page_size_min != 0) return error.BadManifest;
+
+        const page_count = (options.ram.len + std.heap.page_size_min - 1) / std.heap.page_size_min;
+        const bitmap_word_count = (page_count + @bitSizeOf(usize) - 1) / @bitSizeOf(usize);
+        const chunk_count = (options.ram.len + spore.chunk_size - 1) / spore.chunk_size;
+
+        const dir_z = try pathZ(allocator, "{s}", .{options.dir});
+        const chunks_dir = try pathZ(allocator, "{s}/chunks", .{options.dir});
+        try ensureDir(dir_z);
+        try ensureDir(chunks_dir);
+
+        const backing_tmp_path = try pathZ(allocator, "{s}/{s}.tmp", .{ options.dir, spore.ram_backing_path });
+        const backing_final_path = try pathZ(allocator, "{s}/{s}", .{ options.dir, spore.ram_backing_path });
+        const backing_fd = std.c.open(backing_tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
+        if (backing_fd < 0) return error.IoFailed;
+        errdefer _ = std.c.close(backing_fd);
+        if (std.c.ftruncate(backing_fd, @intCast(options.ram.len)) != 0) return error.IoFailed;
+
+        var tracker = DirtyTracker{
+            .allocator = allocator,
+            .vm_fd = options.vm_fd,
+            .slot = options.slot,
+            .dir = options.dir,
+            .ram = options.ram,
+            .refs = try allocator.alloc(?[]const u8, chunk_count),
+            .dirty_chunks = try allocator.alloc(bool, chunk_count),
+            .bitmap = try allocator.alloc(usize, bitmap_word_count),
+            .backing_fd = backing_fd,
+            .backing_tmp_path = backing_tmp_path,
+            .backing_final_path = backing_final_path,
+            .epoch_ms = options.epoch_ms,
+            .next_epoch_ms = (try monotonicMs()) + options.epoch_ms,
+        };
+        @memset(tracker.refs, null);
+        @memset(tracker.dirty_chunks, false);
+
+        const seed_start = try monotonicMs();
+        for (tracker.refs, 0..) |_, i| {
+            const nonzero = try tracker.sealChunk(i, false);
+            tracker.stats.seed_chunks += 1;
+            if (nonzero) tracker.stats.seed_nonzero_chunks += 1;
+        }
+        tracker.stats.seed_ms = (try monotonicMs()) - seed_start;
+        tracker.stats.dirty_epoch_ms = options.epoch_ms;
+
+        // Some kernels conservatively mark a logging memslot dirty at
+        // creation. Drop that baseline after the host has loaded the kernel,
+        // initrd, and DTB so subsequent epochs measure guest writes only.
+        _ = try tracker.collectDirtyLog(false);
+        tracker.resetDirtyStatsAfterBaseline();
+
+        std.log.info(
+            "kvm dirty tracking started: mode=dirty-log ram_mib={d} chunks={d} seed_nonzero_chunks={d} seed_ms={d} epoch_ms={d}",
+            .{ options.ram.len / 1024 / 1024, tracker.refs.len, tracker.stats.seed_nonzero_chunks, tracker.stats.seed_ms, options.epoch_ms },
+        );
+        return tracker;
+    }
+
+    fn deinit(self: *DirtyTracker) void {
+        if (self.backing_fd >= 0) {
+            _ = std.c.close(self.backing_fd);
+            self.backing_fd = -1;
+        }
+        if (!self.finished) {
+            _ = std.c.unlink(self.backing_tmp_path.ptr);
+        }
+    }
+
+    fn flushEpochIfDue(self: *DirtyTracker, now_ms: u64) !void {
+        if (self.epoch_ms == 0) return;
+        if (now_ms < self.next_epoch_ms) return;
+        try self.flushDirty(false);
+        while (self.next_epoch_ms <= now_ms) : (self.next_epoch_ms += self.epoch_ms) {}
+    }
+
+    fn finish(self: *DirtyTracker) !spore.MemoryManifest {
+        const tail_start = try monotonicMs();
+        try self.flushDirty(true);
+        self.stats.tail_flush_ms = (try monotonicMs()) - tail_start;
+
+        if (std.c.fchmod(self.backing_fd, 0o444) != 0) return error.IoFailed;
+        _ = std.c.close(self.backing_fd);
+        self.backing_fd = -1;
+        if (std.c.rename(self.backing_tmp_path.ptr, self.backing_final_path.ptr) != 0) return error.IoFailed;
+        self.finished = true;
+
+        return .{
+            .chunk_size = spore.chunk_size,
+            .chunks = self.refs,
+            .backing = .{ .path = spore.ram_backing_path, .size = self.ram.len },
+        };
+    }
+
+    fn flushDirty(self: *DirtyTracker, tail: bool) !void {
+        const dirty_pages = try self.collectDirtyLog(tail);
+        if (dirty_pages == 0 and !self.hasDirtyChunks()) return;
+
+        var dirty_chunks_this_flush: u64 = 0;
+        const seal_start = try monotonicMs();
+        for (self.dirty_chunks, 0..) |is_dirty, i| {
+            if (!is_dirty) continue;
+            self.dirty_chunks[i] = false;
+            dirty_chunks_this_flush += 1;
+            _ = try self.sealChunk(i, true);
+        }
+        self.stats.seal_ms += (try monotonicMs()) - seal_start;
+        self.stats.dirty_chunks_total += dirty_chunks_this_flush;
+    }
+
+    fn collectDirtyLog(self: *DirtyTracker, tail: bool) !u64 {
+        @memset(self.bitmap, 0);
+        var log = kvm.DirtyLog{
+            .slot = self.slot,
+            .dirty_bitmap = @intFromPtr(self.bitmap.ptr),
+        };
+        const log_start = try monotonicMs();
+        _ = try kvm.ioctl(self.vm_fd, kvm.KVM_GET_DIRTY_LOG, @intFromPtr(&log), "KVM_GET_DIRTY_LOG");
+        self.stats.get_dirty_log_ms += (try monotonicMs()) - log_start;
+        if (!tail) self.stats.dirty_epoch_count += 1;
+
+        var dirty_pages: u64 = 0;
+        const page_count = (self.ram.len + std.heap.page_size_min - 1) / std.heap.page_size_min;
+        for (self.bitmap, 0..) |word, word_index| {
+            var bits = word;
+            while (bits != 0) {
+                const bit_index: usize = @ctz(bits);
+                const page_index = word_index * @bitSizeOf(usize) + bit_index;
+                if (page_index >= page_count) break;
+                const chunk_index = (page_index * std.heap.page_size_min) / spore.chunk_size;
+                self.dirty_chunks[chunk_index] = true;
+                dirty_pages += 1;
+                bits &= bits - 1;
+            }
+        }
+        self.stats.dirty_pages_total += dirty_pages;
+        if (tail) self.stats.dirty_pages_tail += dirty_pages;
+        return dirty_pages;
+    }
+
+    fn hasDirtyChunks(self: *const DirtyTracker) bool {
+        for (self.dirty_chunks) |is_dirty| {
+            if (is_dirty) return true;
+        }
+        return false;
+    }
+
+    fn markGuestWriteCallback(ctx: *anyopaque, gpa: u64, len: u64) void {
+        const self: *DirtyTracker = @ptrCast(@alignCast(ctx));
+        self.markGuestWrite(gpa, len);
+    }
+
+    fn markGuestWrite(self: *DirtyTracker, gpa: u64, len: u64) void {
+        if (len == 0) return;
+        if (gpa < board.ram_base) return;
+        const guest_offset = gpa - board.ram_base;
+        if (guest_offset >= self.ram.len) return;
+        const start_offset: usize = @intCast(guest_offset);
+        const remaining: u64 = @intCast(self.ram.len - start_offset);
+        const capped_len: usize = @intCast(@min(len, remaining));
+        if (capped_len == 0) return;
+
+        const first_chunk = start_offset / spore.chunk_size;
+        const last_byte = start_offset + capped_len - 1;
+        const last_chunk = last_byte / spore.chunk_size;
+
+        self.stats.host_dirty_ranges_total += 1;
+        var chunk_index = first_chunk;
+        while (chunk_index <= last_chunk) : (chunk_index += 1) {
+            if (!self.dirty_chunks[chunk_index]) {
+                self.stats.host_dirty_chunks_total += 1;
+            }
+            self.dirty_chunks[chunk_index] = true;
+        }
+    }
+
+    fn resetDirtyStatsAfterBaseline(self: *DirtyTracker) void {
+        self.stats.dirty_epoch_count = 0;
+        self.stats.dirty_pages_total = 0;
+        self.stats.dirty_pages_tail = 0;
+        self.stats.dirty_chunks_total = 0;
+        self.stats.host_dirty_ranges_total = 0;
+        self.stats.host_dirty_chunks_total = 0;
+        self.stats.sealed_chunks_total = 0;
+        self.stats.get_dirty_log_ms = 0;
+        self.stats.seal_ms = 0;
+        self.stats.tail_flush_ms = 0;
+        @memset(self.dirty_chunks, false);
+        @memset(self.bitmap, 0);
+    }
+
+    fn sealChunk(self: *DirtyTracker, index: usize, count_dirty_seal: bool) !bool {
+        const chunk_start = index * spore.chunk_size;
+        const end = @min(chunk_start + spore.chunk_size, self.ram.len);
+        const data = self.ram[chunk_start..end];
+
+        if (std.mem.allEqual(u8, data, 0)) {
+            if (self.refs[index] != null) {
+                self.refs[index] = null;
+                try pwriteFileAll(self.backing_fd, chunk_start, data);
+                if (count_dirty_seal) self.stats.sealed_chunks_total += 1;
+            }
+            return false;
+        }
+
+        const id = chunk.ChunkId.fromContents(data);
+        const hex = id.toHex();
+        const existing = self.refs[index];
+        if (existing == null or !std.mem.eql(u8, existing.?, &hex)) {
+            const ref = try self.allocator.dupe(u8, &hex);
+            self.refs[index] = ref;
+            const chunk_path = try pathZ(self.allocator, "{s}/chunks/{s}", .{ self.dir, ref });
+            if (std.c.access(chunk_path, 0) != 0) {
+                try writeFileAll(chunk_path, data);
+            }
+        }
+        try pwriteFileAll(self.backing_fd, chunk_start, data);
+        if (count_dirty_seal) self.stats.sealed_chunks_total += 1;
+        return true;
+    }
+};
+
 fn takeSnapshot(
     allocator: std.mem.Allocator,
     dir: []const u8,
@@ -380,6 +708,7 @@ fn takeSnapshot(
     vsock_dev: *const vsock.Vsock,
     ram_bytes: []const u8,
     ram_size: u64,
+    dirty_tracker: ?*DirtyTracker,
 ) !void {
     if (vsock_dev.pending_len != 0) {
         std.log.err("cannot snapshot while virtio-vsock has pending packets", .{});
@@ -390,10 +719,23 @@ fn takeSnapshot(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const total_start = try monotonicMs();
+    const machine_start = total_start;
     const machine = try snapshot.captureMachine(arena, gic_fd, vcpu_fd);
+    const machine_ms = (try monotonicMs()) - machine_start;
+    const devices_start = try monotonicMs();
     const devices = try captureTransports(arena, transports);
+    const devices_ms = (try monotonicMs()) - devices_start;
+    const generation_start = try monotonicMs();
     const gen_state = try gen_dev.capture(arena);
-    const memory = try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
+    const generation_ms = (try monotonicMs()) - generation_start;
+    const memory_start = try monotonicMs();
+    const memory = if (dirty_tracker) |tracker|
+        try tracker.finish()
+    else
+        try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
+    const memory_ms = (try monotonicMs()) - memory_start;
+    const manifest_start = try monotonicMs();
     try spore.saveManifest(arena, dir, .{
         .platform = .{
             .cpu_profile = board.cpu_profile,
@@ -409,6 +751,58 @@ fn takeSnapshot(
         .generation = gen_state,
         .memory = memory,
     });
+    const manifest_ms = (try monotonicMs()) - manifest_start;
+    const snapshot_total_ms = (try monotonicMs()) - total_start;
+
+    const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
+    if (dirty_tracker) |tracker| {
+        const stats = tracker.stats;
+        std.log.info(
+            "kvm snapshot metrics: mode=dirty-log ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} dirty_epoch_ms={d} dirty_epoch_count={d} dirty_pages_total={d} dirty_pages_tail={d} dirty_chunks_total={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} tail_flush_ms={d} get_dirty_log_ms={d} seal_ms={d}",
+            .{
+                ram_size / 1024 / 1024,
+                memory_plan.chunk_count,
+                memory_plan.nonzero_chunk_count,
+                machine_ms,
+                devices_ms,
+                generation_ms,
+                memory_ms,
+                manifest_ms,
+                snapshot_total_ms,
+                snapshot_total_ms,
+                stats.dirty_epoch_ms,
+                stats.dirty_epoch_count,
+                stats.dirty_pages_total,
+                stats.dirty_pages_tail,
+                stats.dirty_chunks_total,
+                stats.host_dirty_ranges_total,
+                stats.host_dirty_chunks_total,
+                stats.sealed_chunks_total,
+                stats.seed_ms,
+                stats.seed_chunks,
+                stats.seed_nonzero_chunks,
+                stats.tail_flush_ms,
+                stats.get_dirty_log_ms,
+                stats.seal_ms,
+            },
+        );
+    } else {
+        std.log.info(
+            "kvm snapshot metrics: mode=full-scan ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d}",
+            .{
+                ram_size / 1024 / 1024,
+                memory_plan.chunk_count,
+                memory_plan.nonzero_chunk_count,
+                machine_ms,
+                devices_ms,
+                generation_ms,
+                memory_ms,
+                manifest_ms,
+                snapshot_total_ms,
+                snapshot_total_ms,
+            },
+        );
+    }
     std.log.info("spore written to {s}", .{dir});
 }
 

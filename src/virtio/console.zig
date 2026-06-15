@@ -42,6 +42,7 @@ pub const Console = struct {
                 if (!seg.writable or consumed >= bytes.len) continue;
                 const n = @min(seg.data.len, bytes.len - consumed);
                 @memcpy(seg.data[0..n], bytes[consumed..][0..n]);
+                ram.markDirty(seg.addr, @intCast(n));
                 consumed += n;
                 written += @intCast(n);
             }

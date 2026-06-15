@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-14
+last_reviewed: 2026-06-15
 related_plans:
   - buildkite/cleanroom: docs/plans/sandbox-suspend-wake.md
 ---
@@ -438,6 +438,30 @@ and peer egress split as `source_peer_egress_bytes=88,166,400` plus
 `max_peer_egress_bytes=88,166,400`, about three bundle archives instead of the
 nine bundle archives served by the previous star source.
 
+Slice 7 has started with a KVM-only measurement path. `kvm-boot --dirty-track`
+sets `KVM_MEM_LOG_DIRTY_PAGES` on the RAM memslot, seeds chunk refs and the
+local `ram.backing` file after the host loads the kernel/initrd/DTB, collects
+guest dirties with `KVM_GET_DIRTY_LOG` on a tunable `--dirty-epoch-ms` cadence,
+tracks VMM-originated guest RAM writes from virtio used rings and
+device-writable descriptor buffers, and finalizes a snapshot with a last
+dirty-log tail flush instead of a full RAM scan.
+`scripts/benchmark-kvm-dirty-tracking.sh` runs paired full-scan and dirty-log
+captures across memory sizes and emits JSONL metrics including
+`snapshot_pause_ms`, `memory_ms`, epoch count, dirty pages/chunks,
+host-dirty ranges/chunks, seed time, and tail flush time. On `a1.metal`, the
+first 512MiB paired run reported
+full-scan `snapshot_pause_ms=4047` / `memory_ms=4047` versus dirty-log
+`snapshot_pause_ms=2` / `memory_ms=0` after `seed_ms=3374`, epoch sealing
+`seal_ms=2904`, and VMM-side dirty marking of `host_dirty_ranges_total=15` /
+`host_dirty_chunks_total=3`; eager resume from the dirty-log spore passed, and
+trusted `ram.backing` resume reported `mode=trusted_file_backed` with
+`pre_run_ms=3`.
+The 4GiB paired run reported full-scan `snapshot_pause_ms=27097` /
+`memory_ms=27095` versus dirty-log `snapshot_pause_ms=2` / `memory_ms=1` after
+`seed_ms=24432` and epoch sealing `seal_ms=3340`. This is the Linux proof path;
+HVF write-protect tracking still needs measurement before deciding whether
+macOS gets always-on tracking or an explicit suspend-time scan boundary.
+
 ## Delivery Strategy
 
 Each slice is a reviewable unit with a runnable result. KVM work needs an
@@ -574,6 +598,15 @@ test fleet with origin egress measured at a small multiple of the unique chunk
 set, and chunk verification rejects corrupted peer data.
 
 ### Slice 7: Always-on dirty tracking
+
+Status: started on KVM. The first harness path uses KVM dirty logging rather
+than dirty ring: it keeps the spore chunk refs and trusted same-host
+`ram.backing` up to date during execution, explicitly marks VMM-side guest RAM
+writes that KVM dirty logging cannot see, and records paired full-scan vs
+dirty-log metrics. The first A1 numbers show suspend pause dropping from
+~4.0s→1ms at 512MiB and ~27.1s→2ms at 4GiB, with chunk sealing paid before
+suspend. Dirty ring, product monitor background threading, 16GiB Linux
+measurement, and HVF write-protect-exit measurement remain.
 
 Continuous epoch-based chunk sealing during normal execution; suspend becomes
 pause + tail flush. Measure the steady-state overhead (KVM dirty ring vs HVF

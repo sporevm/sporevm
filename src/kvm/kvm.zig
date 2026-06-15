@@ -26,6 +26,7 @@ pub const KVM_CREATE_VM: u32 = 0xae01;
 pub const KVM_CHECK_EXTENSION: u32 = 0xae03;
 pub const KVM_GET_VCPU_MMAP_SIZE: u32 = 0xae04;
 pub const KVM_CREATE_VCPU: u32 = 0xae41;
+pub const KVM_GET_DIRTY_LOG: u32 = 0x4010ae42;
 pub const KVM_SET_USER_MEMORY_REGION: u32 = 0x4020ae46;
 pub const KVM_RUN: u32 = 0xae80;
 pub const KVM_IRQ_LINE: u32 = 0x4008ae61;
@@ -53,6 +54,8 @@ pub const KVM_CAP_ONE_REG: u32 = 70;
 pub const KVM_CAP_ARM_PSCI_0_2: u32 = 102;
 pub const KVM_CAP_DEVICE_CTRL: u32 = 89;
 pub const KVM_CAP_COUNTER_OFFSET: u32 = 227;
+
+pub const KVM_MEM_LOG_DIRTY_PAGES: u32 = 1 << 0;
 
 pub const KVM_DEV_TYPE_ARM_VGIC_V3: u32 = 7;
 pub const KVM_DEV_ARM_VGIC_GRP_ADDR: u32 = 0;
@@ -107,6 +110,12 @@ pub const UserspaceMemoryRegion = extern struct {
     guest_phys_addr: u64,
     memory_size: u64,
     userspace_addr: u64,
+};
+
+pub const DirtyLog = extern struct {
+    slot: u32,
+    padding1: u32 = 0,
+    dirty_bitmap: u64,
 };
 
 pub const VcpuInit = extern struct {
