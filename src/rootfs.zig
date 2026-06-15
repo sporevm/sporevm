@@ -15,6 +15,7 @@ const tar = @import("rootfs/tar.zig");
 const Io = std.Io;
 
 const max_rootfs_layers: usize = 512;
+pub const builder_version = "sporevm-rootfs-v1";
 
 const usage =
     \\Usage: spore rootfs <command>
@@ -64,6 +65,17 @@ const ParsedResolveOptions = struct {
     platform: Platform = .{},
 };
 
+pub const BuildRequest = struct {
+    ref: []const u8,
+    output: []const u8,
+    metadata: []const u8,
+    platform: Platform = .{},
+    mkfs: ?[]const u8 = null,
+    debugfs: ?[]const u8 = null,
+    metadata_rootfs_path: ?[]const u8 = null,
+    temp_dir_root: ?[]const u8 = null,
+};
+
 const BuildOptions = struct {
     ref: []const u8,
     output: []const u8,
@@ -71,6 +83,14 @@ const BuildOptions = struct {
     platform: Platform = .{},
     mkfs: []const u8,
     debugfs: []const u8,
+    metadata_rootfs_path: ?[]const u8 = null,
+    temp_dir_root: ?[]const u8 = null,
+};
+
+pub const ResolvedImage = struct {
+    ref: []const u8,
+    manifest_digest: []const u8,
+    platform: Platform,
 };
 
 fn runResolve(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
@@ -83,19 +103,18 @@ fn runResolve(init: std.process.Init, args: []const []const u8, stdout: *Io.Writ
 fn runBuild(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
     const arena = init.arena.allocator();
     const parsed = try parseBuildOptions(arena, args, stdout);
-    const opts = BuildOptions{
+    const result = try build(init, arena, .{
         .ref = parsed.ref,
         .output = parsed.output,
         .metadata = parsed.metadata,
         .platform = parsed.platform,
-        .mkfs = try resolveExt4Tool(arena, init.io, init.environ_map, parsed.mkfs, .mkfs),
-        .debugfs = try resolveExt4Tool(arena, init.io, init.environ_map, parsed.debugfs, .debugfs),
-    };
-    const result = try buildRootFS(init, arena, opts);
+        .mkfs = parsed.mkfs,
+        .debugfs = parsed.debugfs,
+    });
     try stdout.print("rootfs: {s}\nmetadata: {s}\nsource: {s}\nrootfs_blake3: {s}\n", .{
-        opts.output,
-        opts.metadata,
-        opts.ref,
+        parsed.output,
+        parsed.metadata,
+        parsed.ref,
         result.rootfs_blake3,
     });
 }
@@ -320,7 +339,7 @@ const ImageTag = oci.ImageTag;
 const ImageManifest = oci.ImageManifest;
 const ImageConfig = oci.ImageConfig;
 
-const BuildResult = struct {
+pub const BuildResult = struct {
     rootfs_blake3: [chunk.ChunkId.hex_len]u8,
 };
 
@@ -381,6 +400,36 @@ fn resolveTaggedImageRef(init: std.process.Init, allocator: std.mem.Allocator, o
     );
     try validateManifestConfigPlatform(allocator, &client, &bearer_token, image_ref, selected_manifest_bytes, opts.platform);
     return image_tag.digestRef(allocator, selected_manifest_digest);
+}
+
+pub fn resolveImageRef(init: std.process.Init, allocator: std.mem.Allocator, raw_ref: []const u8, platform: Platform) !ResolvedImage {
+    var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
+    defer client.deinit();
+    var bearer_token: ?[]const u8 = null;
+
+    const image_source = try fetchBuildImageSource(allocator, &client, &bearer_token, raw_ref);
+    const image_ref = image_source.ref;
+    const manifest_digest = try resolveManifestDigest(allocator, &client, &bearer_token, image_ref, platform, image_ref.digest, image_source.manifest_bytes);
+    const selected_manifest_bytes = try selectedManifestBytes(allocator, &client, &bearer_token, image_ref, manifest_digest, image_source.manifest_bytes);
+    try validateManifestConfigPlatform(allocator, &client, &bearer_token, image_ref, selected_manifest_bytes, platform);
+
+    return .{
+        .ref = try digestImageRef(allocator, image_ref, manifest_digest),
+        .manifest_digest = manifest_digest,
+        .platform = platform,
+    };
+}
+
+pub fn digestPinnedImageIdentity(allocator: std.mem.Allocator, raw_ref: []const u8, platform: Platform) !?ResolvedImage {
+    const image_ref = ImageRef.parse(raw_ref) catch |err| switch (err) {
+        error.ImageRefMustBeDigestPinned => return null,
+        else => |e| return e,
+    };
+    return .{
+        .ref = try digestImageRef(allocator, image_ref, image_ref.digest),
+        .manifest_digest = image_ref.digest,
+        .platform = platform,
+    };
 }
 
 fn manifestContentDigest(allocator: std.mem.Allocator, manifest_bytes: []const u8, content_digest: ?[]const u8) ![]const u8 {
@@ -461,13 +510,32 @@ fn validateManifestConfigPlatform(
     try validateConfigPlatform(config_parsed.value, platform);
 }
 
+pub fn build(init: std.process.Init, allocator: std.mem.Allocator, request: BuildRequest) !BuildResult {
+    const opts = BuildOptions{
+        .ref = request.ref,
+        .output = request.output,
+        .metadata = request.metadata,
+        .platform = request.platform,
+        .mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.mkfs, .mkfs),
+        .debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.debugfs, .debugfs),
+        .metadata_rootfs_path = request.metadata_rootfs_path,
+        .temp_dir_root = request.temp_dir_root,
+    };
+    return buildRootFS(init, allocator, opts);
+}
+
 fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: BuildOptions) !BuildResult {
     var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
     defer client.deinit();
     var bearer_token: ?[]const u8 = null;
 
+    const temp_dir_root = opts.temp_dir_root orelse ".zig-cache";
+    try Io.Dir.cwd().createDirPath(init.io, temp_dir_root);
     const temp_id = Io.Clock.real.now(init.io).nanoseconds;
-    const temp_dir = try std.fmt.allocPrint(allocator, ".zig-cache/spore-rootfs-{d}", .{temp_id});
+    var temp_nonce_bytes: [8]u8 = undefined;
+    init.io.random(&temp_nonce_bytes);
+    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
+    const temp_dir = try std.fmt.allocPrint(allocator, "{s}/spore-rootfs-{d}-{x}", .{ temp_dir_root, temp_id, temp_nonce });
     defer Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
     try Io.Dir.cwd().createDirPath(init.io, temp_dir);
 
@@ -541,7 +609,7 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
     try ext4.ensureParentDir(init.io, opts.metadata);
     try rejectMetadataOutputAlias(init.io, opts.output, opts.metadata);
     const metadata = RootFSMetadata{
-        .builder_version = "sporevm-rootfs-v1",
+        .builder_version = builder_version,
         .image_ref = opts.ref,
         .resolved_image_ref = resolved_image_ref,
         .image_manifest_digest = manifest_digest,
@@ -552,7 +620,7 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
         .deterministic = true,
         .ext4_uuid = deterministic_ext4.uuid[0..],
         .ext4_hash_seed = deterministic_ext4.hash_seed[0..],
-        .rootfs_path = opts.output,
+        .rootfs_path = opts.metadata_rootfs_path orelse opts.output,
         .rootfs_size = stat.size,
         .rootfs_blake3 = rootfs_hex,
     };

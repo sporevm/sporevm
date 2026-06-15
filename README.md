@@ -117,6 +117,15 @@ Attach an ext4 rootfs read-only and execute an explicit argv from it with
 zig-out/bin/spore run --rootfs rootfs.ext4 -- /bin/echo hi
 ```
 
+Or let `run` build and reuse a cached rootfs from an OCI image:
+
+```bash
+zig-out/bin/spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
+```
+
+`--image` still runs the explicit argv you pass after `--`; it does not apply
+OCI Entrypoint, Cmd, User, Env, or Workdir yet.
+
 For a lower-bound boot/exec probe comparable to Cleanroom's minimal
 `darwin-vz` benchmark, use the minimal benchmark wrapper. It builds a tiny
 initrd whose `/init` listens on virtio-vsock, sends one `/bin/true` argv
@@ -149,6 +158,11 @@ Run the end-to-end OCI rootfs smoke with
 `scripts/smoke-run-oci-rootfs.sh -- /bin/echo hi`. The smoke prints the
 digest-pinned `resolved_image_ref` recorded in rootfs metadata before running
 the command.
+
+For the direct image path, `spore run --image REF -- <argv...>` resolves the
+ref, builds or reuses a cached ext4 rootfs, and then runs through the same
+read-only rootfs execution path. Set `SPOREVM_ROOTFS_CACHE_DIR` to override
+the cache directory.
 
 See [docs/rootfs.md](docs/rootfs.md) for tag resolution, metadata, and ext4
 tooling details.

@@ -114,6 +114,9 @@ runtime semantics that the foundation plan says SporeVM should not own.
 - `scripts/smoke-run-oci-rootfs.sh` validates the two-step OCI path by
   building `docker.io/library/alpine:3.20`, checking digest-pinned
   `resolved_image_ref` metadata, and running an explicit argv from the rootfs.
+- `spore run --image REF -- <argv...>` resolves REF to a digest-pinned
+  linux/arm64 image identity, builds or reuses a cached ext4 rootfs, and then
+  delegates to the same read-only `--rootfs` execution path.
 
 ## Target Model
 
@@ -176,6 +179,9 @@ the reusable identity.
 
 Direct image mode remains explicit through `--image`; the first positional
 argument is not overloaded as an image reference.
+
+The cache root is `SPOREVM_ROOTFS_CACHE_DIR` when set, otherwise the platform
+cache directory under `sporevm/rootfs`. Setup and cache messages go to stderr.
 
 ## Safety And Invariants
 
@@ -288,6 +294,8 @@ is the documented first OCI-capable workflow.
 
 ### Slice D: Direct Image Cache
 
+Status: implemented.
+
 Scope:
 
 - Add `--image REF` as sugar over `rootfs build` plus `--rootfs`.
@@ -322,12 +330,15 @@ policy.
 ## Verification
 
 - Unit tests for run argument parsing and default asset resolution.
-- Unit tests for cache key construction and atomic cache writes.
+- Unit tests for cache key construction, cache metadata matching, and absolute
+  cache directory creation.
 - Shell syntax and build checks for any generated initrd helpers.
 - HVF smoke for default initrd run on Apple Silicon.
 - KVM smoke for default initrd run on Linux/aarch64.
 - HVF and KVM smokes for `--rootfs` once rootfs execution lands.
 - OCI two-step smoke using a small linux/arm64 image.
+- Direct image smoke showing first-run build, second-run cache reuse, and
+  `--json` stdout isolation.
 - Negative tests:
   - missing default assets;
   - unsupported host/backend;
@@ -345,6 +356,12 @@ policy.
 - Rootfs execution starts read-only to avoid mutating cached image state.
 - OCI Entrypoint/Cmd/User/Env/Workdir are deferred.
 - Bundle-aware run semantics are outside this bridge track.
+- Direct image cache entries are keyed by resolved digest-pinned image ref,
+  linux/arm64 platform, and rootfs builder version. The first build uses the
+  resolved digest-pinned ref so mutable tag changes cannot populate the wrong
+  cache entry after lookup.
+- `SPOREVM_ROOTFS_CACHE_DIR` is the explicit cache override for direct image
+  rootfs outputs.
 
 ## Open Questions And Recommended Defaults
 
@@ -373,9 +390,8 @@ policy.
 
 ### Safe To Defer
 
-- Direct image refs: start with digest-pinned refs if cache provenance is still
-  unclear when Slice D begins. Mutable tags are acceptable only after the cache
-  key records the resolved digest and metadata path.
+- Direct image cache pruning and garbage collection.
+- OCI Entrypoint/Cmd/User/Env/Workdir behavior.
 
 ## Key Learnings From Pressure-Testing
 

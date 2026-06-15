@@ -30,6 +30,20 @@ Run an explicit argv from a built rootfs by attaching it read-only:
 spore run --rootfs rootfs.ext4 -- /bin/echo hi
 ```
 
+For the direct convenience path, `spore run --image` resolves the image ref,
+builds or reuses a cached ext4 rootfs, and then delegates to the same read-only
+rootfs execution path:
+
+```bash
+spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
+```
+
+The cache key includes the resolved digest-pinned image ref, target platform,
+and rootfs builder version. Set `SPOREVM_ROOTFS_CACHE_DIR` to choose the cache
+directory; otherwise SporeVM uses the platform cache directory. Cache setup
+messages are written to stderr so `spore run --json --image ...` keeps one JSON
+result on stdout.
+
 Validate the tag-to-rootfs-to-run path with the local smoke script:
 
 ```bash
