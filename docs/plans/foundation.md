@@ -29,6 +29,7 @@ The end state this plan drives toward:
 
 ```console
 spore run --kernel ... --initrd ... -- /bin/true
+spore run --image ruby-demo --capture-on-abort ruby.spore -- ruby /demo/counter.rb
 spore create --kernel ... --disk ... my-vm
 spore suspend my-vm                 # ~50ms regardless of RAM size
 spore fork my-vm.spore --count 10000 --out forks/  # metadata-only
@@ -773,6 +774,11 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   and can attach a read-only ext4 rootfs for explicit argv execution. Monitor
   lifecycle, stdin, streaming output, broader rootfs policy, and bundle-aware
   run semantics remain later work.
+- Product capture starts as `spore run --capture-on-abort`: running a new
+  workload can optionally write a spore snapshot when the host run process is
+  interrupted, then exit. Resuming from an existing spore is a distinct
+  `spore resume` operation. Do not add a separate `spore capture` verb before
+  the run/resume surface proves out.
 - Control integration is newline-delimited JSON over a unix socket, mirroring
   the proven cleanroom helper pattern.
 - SporeVM is standalone; cleanroom integrates via an adapter in its own repo.
