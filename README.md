@@ -86,6 +86,7 @@ mise run build
 mise run smoke:run
 mise run smoke:run-capture
 mise run smoke:resume
+mise run smoke:counter-fanout
 ```
 
 `mise run check` runs unit tests, the product build, and diff hygiene.
@@ -199,8 +200,8 @@ backend debugging and hardware proof work:
 - `zig build hvf-gic-probe`: probe Hypervisor.framework GIC state support.
 - `scripts/smoke-restore-leg.sh`: split capture/resume legs for backend
   debugging.
-- `scripts/smoke-counter-fanout.sh`: exercise diskless capture, fork, and
-  parallel resume fan-out.
+- `mise run smoke:counter-fanout`: exercise diskless capture, fork, and
+  parallel product resume fan-out.
 - `scripts/smoke-fork-fanout.sh`: exercise fork generation fixups.
 - `scripts/smoke-remote-bundle.sh`: run SSM/S3 cross-host bundle validation.
 
