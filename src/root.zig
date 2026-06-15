@@ -21,6 +21,7 @@ else
     struct {};
 pub const guestmem = @import("guestmem.zig");
 pub const lifecycle = @import("lifecycle.zig");
+pub const monitor = @import("monitor.zig");
 pub const platform = @import("platform.zig");
 pub const hvf = @import("hvf/hvf.zig");
 pub const resume_cmd = @import("resume.zig");
@@ -53,6 +54,7 @@ test {
     testing.refAllDecls(generation);
     testing.refAllDecls(gicv3);
     testing.refAllDecls(lifecycle);
+    testing.refAllDecls(monitor);
     testing.refAllDecls(platform);
     testing.refAllDecls(resume_cmd);
     testing.refAllDecls(run);

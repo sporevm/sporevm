@@ -422,7 +422,7 @@ fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
     return std.mem.eql(u8, actual, expected);
 }
 
-fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+pub fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
     if (init.environ_map.get("SPOREVM_KERNEL_IMAGE")) |path| {
         if (!try readablePath(init.io, path)) {
             failRunSetup("spore run: SPOREVM_KERNEL_IMAGE not found: {s}", .{path});
@@ -464,7 +464,7 @@ fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Allocator
     );
 }
 
-fn resolveDefaultInitrdPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+pub fn resolveDefaultInitrdPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
     if (init.environ_map.get("SPOREVM_RUN_INITRD")) |path| {
         if (!try readablePath(init.io, path)) {
             failRunSetup("spore run: SPOREVM_RUN_INITRD not found: {s}", .{path});
@@ -604,6 +604,41 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         .snapshotted => resultFromCapture(backend, opts, &stream),
         else => error.ProbeDidNotComplete,
     };
+}
+
+pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !Backend {
+    if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
+
+    const backend = try resolveBackend(opts.backend);
+    const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
+    const initrd = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
+    const rootfs_fd = try openRootfsDisk(allocator, opts.rootfs_path);
+    defer {
+        if (rootfs_fd) |fd| _ = std.c.close(fd);
+    }
+    const boot_args = try cmdline(allocator, opts.guest_port, opts.rootfs_path != null);
+
+    const cause = switch (backend) {
+        .auto => unreachable,
+        .hvf => blk: {
+            if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
+            break :blk try hvf.vm.run(allocator, .{
+                .kernel = kernel,
+                .ram_size = opts.memory_mib * 1024 * 1024,
+                .cmdline = boot_args,
+                .initrd = initrd,
+                .console_sink = consoleSink,
+                .disk_fd = rootfs_fd,
+                .exec_control = control,
+            });
+        },
+        .kvm => {
+            if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
+            return error.UnsupportedMonitorBackend;
+        },
+    };
+    if (cause != .monitor_stopped) return error.MonitorDidNotStopCleanly;
+    return backend;
 }
 
 fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.c.fd_t {

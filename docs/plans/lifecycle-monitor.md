@@ -177,9 +177,10 @@ spore monitor --runtime-dir ... --name bench-1 --spec spec.json
 - the console log;
 - the control socket.
 
-`spore create` waits for monitor readiness through a pipe or socket handshake,
-then exits only after the guest agent is listening. `ready.json` is an
-inspection aid, not the primary synchronization mechanism.
+`spore create` waits for the monitor pid and control socket metadata to become
+ready before returning. The current minimal slice uses `ready.json` as the
+synchronization point; a stronger guest-agent readiness handshake can replace
+that once rootfs/image lifecycle work needs it.
 
 ### Control Protocol
 
@@ -236,15 +237,17 @@ than redesigning the guest protocol.
   build/reuse cached rootfs images from OCI refs, and execute one argv request.
 - The minimal exec initrd guest agent listens on vsock and loops over accepted
   connections.
-- HVF and KVM backend entry points currently treat the exec stream as a probe
-  and return after it completes.
-- The foundation plan already names the target state as CLI subcommands plus a
-  long-running per-VM monitor process over a Unix socket.
-- The lifecycle CLI shape and runtime registry helpers now exist:
-  `create`, `exec`, `rm`, and `ls` are wired; VM names and runtime paths fail
-  closed; runtime metadata helpers cover `spec.json`, `ready.json`, `pid`, and
-  stale-state detection.
-- No product monitor or persistent guest `exec` command exists yet.
+- `spore create`, `spore exec`, `spore rm`, and `spore ls` have the first
+  runtime registry and metadata shape.
+- HVF can keep one minimal-initrd VM alive in an internal monitor process and
+  attach one host-initiated vsock stream per `spore exec`.
+- The minimal exec initrd guest agent listens on vsock and loops over accepted
+  connections, so two `spore exec` calls can run against one boot.
+- KVM still treats the exec stream as a one-shot probe for lifecycle purposes.
+  Monitor mode fails explicitly on KVM until that backend has a real wake path
+  for host-attached streams.
+- Runtime rootfs cache work exists below `spore run`, but lifecycle
+  `--rootfs`/`--image` create remains a later slice.
 
 ## Delivery Strategy
 
@@ -276,7 +279,7 @@ closed before any backend work starts.
 
 ### Slice B: Minimal Initrd Monitor
 
-Status: proposed.
+Status: complete for local HVF; KVM wake support remains a follow-up.
 
 Scope:
 
@@ -287,6 +290,9 @@ Scope:
 - Implement `spore exec NAME -- <argv...>` over the local control socket.
 - Implement `spore rm NAME`.
 - Keep output bounded and reuse the existing run result framing.
+- Keep `--rootfs` and `--image` rejected until Slice C.
+- Fail KVM monitor mode explicitly until KVM has a real control-thread wake
+  path for `KVM_RUN`.
 
 Done when, on HVF locally:
 
@@ -299,6 +305,19 @@ spore rm bench-1
 
 uses one guest boot and two successful command requests. KVM repeats the same
 smoke once an aarch64 KVM host is available.
+
+Validated locally:
+
+```console
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-b spore create bench-1 --timeout-ms 30000
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-b spore exec bench-1 -- /bin/writeout
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-b spore ls
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-b spore rm bench-1
+```
+
+The stale-monitor smoke kills the recorded monitor pid after readiness and
+confirms `spore exec` reports `VM is not ready ... (stale)` instead of dumping a
+runtime stack trace.
 
 ### Slice C: Rootfs And Direct Image Create
 

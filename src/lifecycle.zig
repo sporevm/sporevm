@@ -3,11 +3,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const net = std.Io.net;
+
+const run_mod = @import("run.zig");
 
 pub const runtime_dir_env = "SPOREVM_RUNTIME_DIR";
 pub const max_name_len = 128;
 
 const max_metadata_bytes = 64 * 1024;
+const max_control_response = 128 * 1024;
 const spec_file = "spec.json";
 const ready_file = "ready.json";
 const pid_file = "pid";
@@ -146,9 +150,22 @@ pub fn createCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
 
     const allocator = init.arena.allocator();
     const parsed = try parseCreateArgs(args);
-    _ = try cliPaths(init, allocator, "create", parsed.spec.name);
-    std.debug.print("spore create: lifecycle monitor is not implemented yet\n", .{});
-    std.process.exit(1);
+    const paths = try cliPaths(init, allocator, "create", parsed.spec.name);
+    if (parsed.spec.rootfs_path != null or parsed.spec.image_ref != null) {
+        std.debug.print("spore create: --rootfs and --image land in the rootfs lifecycle slice\n", .{});
+        std.process.exit(2);
+    }
+    if (!monitorBackendSupported(parsed.spec.backend)) {
+        std.debug.print("spore create: monitor mode currently supports only HVF on Apple Silicon\n", .{});
+        std.process.exit(2);
+    }
+    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
+    if (state != .absent) {
+        std.debug.print("spore create: VM already exists or has stale state: {s}\n", .{parsed.spec.name});
+        std.process.exit(2);
+    }
+    try spawnMonitor(init, allocator, parsed.spec);
+    try waitForReady(allocator, init.io, paths, parsed.spec.timeout_ms);
 }
 
 pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
@@ -158,9 +175,23 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     }
     const parsed = parseExecArgs(args);
     const allocator = init.arena.allocator();
-    _ = try cliPaths(init, allocator, "exec", parsed.name);
-    std.debug.print("spore exec: lifecycle monitor is not implemented yet\n", .{});
-    std.process.exit(1);
+    const paths = try cliPaths(init, allocator, "exec", parsed.name);
+    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
+    if (state != .ready) {
+        std.debug.print("spore exec: VM is not ready: {s} ({s})\n", .{ parsed.name, state.name() });
+        std.process.exit(2);
+    }
+    var ready = lifecycleReadyOrExit(allocator, init.io, "exec", paths);
+    defer ready.deinit();
+    const response = sendExecRequest(allocator, init.io, ready.value.control_socket_path, parsed.command) catch |err| {
+        switch (err) {
+            error.MonitorUnavailable => std.debug.print("spore exec: monitor is unavailable for VM: {s}\n", .{parsed.name}),
+            else => std.debug.print("spore exec: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
+        }
+        std.process.exit(1);
+    };
+    const code = try handleExecResponse(init, allocator, stdout, response);
+    if (code != 0) std.process.exit(code);
 }
 
 pub fn rmCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
@@ -170,9 +201,22 @@ pub fn rmCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
     }
     const name = parseRmArgs(args);
     const allocator = init.arena.allocator();
-    _ = try cliPaths(init, allocator, "rm", name);
-    std.debug.print("spore rm: lifecycle monitor is not implemented yet\n", .{});
-    std.process.exit(1);
+    const paths = try cliPaths(init, allocator, "rm", name);
+    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
+    switch (state) {
+        .absent => {
+            std.debug.print("spore rm: VM not found: {s}\n", .{name});
+            std.process.exit(2);
+        },
+        .ready => {
+            var ready = lifecycleReadyOrExit(allocator, init.io, "rm", paths);
+            defer ready.deinit();
+            _ = sendShutdownRequest(allocator, init.io, ready.value.control_socket_path) catch {};
+            waitForPidExit(ready.value.pid, 5_000);
+            try Io.Dir.cwd().deleteTree(init.io, paths.vm_dir);
+        },
+        .incomplete, .stale => try Io.Dir.cwd().deleteTree(init.io, paths.vm_dir),
+    }
 }
 
 pub fn lsCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
@@ -186,7 +230,7 @@ pub fn lsCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
     const root = runtimeRootPath(allocator, init.environ_map) catch |err| {
         cliRuntimePathExit("ls", err);
     };
-    const entries = try listEntries(allocator, init.io, root, defaultPidAlive);
+    const entries = try listEntries(allocator, init.io, root, pidAlive);
     const json = try std.json.Stringify.valueAlloc(allocator, entries, .{ .whitespace = .indent_2 });
     try stdout.writeAll(json);
     try stdout.writeByte('\n');
@@ -451,6 +495,148 @@ fn cliPaths(init: std.process.Init, allocator: std.mem.Allocator, command: []con
     return paths;
 }
 
+fn spawnMonitor(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec) !void {
+    const full_args = try init.minimal.args.toSlice(allocator);
+    const exe = full_args[0];
+    var argv = std.array_list.Managed([]const u8).init(allocator);
+    try argv.append(exe);
+    try argv.append("monitor");
+    try argv.append(spec.name);
+    try argv.append("--backend");
+    try argv.append(spec.backend);
+    if (spec.kernel_path) |path| {
+        try argv.append("--kernel");
+        try argv.append(path);
+    }
+    if (spec.initrd_path) |path| {
+        try argv.append("--initrd");
+        try argv.append(path);
+    }
+    try appendIntArg(allocator, &argv, "--memory-mib", spec.memory_mib);
+    try appendIntArg(allocator, &argv, "--vcpus", spec.vcpus);
+    try appendIntArg(allocator, &argv, "--guest-port", spec.guest_port);
+    try appendIntArg(allocator, &argv, "--timeout-ms", spec.timeout_ms);
+    if (spec.console_log_path) |path| {
+        try argv.append("--console-log");
+        try argv.append(path);
+    }
+    _ = try std.process.spawn(init.io, .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = if (builtin.os.tag == .windows) null else 0,
+    });
+}
+
+fn appendIntArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), flag: []const u8, value: anytype) !void {
+    try argv.append(flag);
+    try argv.append(try std.fmt.allocPrint(allocator, "{d}", .{value}));
+}
+
+fn waitForReady(allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: u64) !void {
+    const start = monotonicMs();
+    while (monotonicMs() - start < timeout_ms) {
+        var ready = readReady(allocator, io, paths) catch {
+            sleepMs(20);
+            continue;
+        };
+        if (!pidAlive(ready.value.pid)) {
+            ready.deinit();
+            sleepMs(20);
+            continue;
+        }
+        ready.deinit();
+        return;
+    }
+    std.debug.print("spore create: timed out waiting for monitor readiness\n", .{});
+    std.process.exit(1);
+}
+
+fn lifecycleReadyOrExit(allocator: std.mem.Allocator, io: Io, command: []const u8, paths: Paths) std.json.Parsed(Ready) {
+    return readReady(allocator, io, paths) catch {
+        std.debug.print("spore {s}: VM is not ready\n", .{command});
+        std.process.exit(2);
+    };
+}
+
+fn sendExecRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8) ![]const u8 {
+    const payload = struct {
+        type: []const u8 = "exec",
+        argv: []const []const u8,
+    }{ .argv = argv };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    return sendControlJson(allocator, io, socket_path, json);
+}
+
+fn sendShutdownRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8) ![]const u8 {
+    return sendControlJson(allocator, io, socket_path, "{\"type\":\"shutdown\"}");
+}
+
+fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, json: []const u8) ![]const u8 {
+    const address = try net.UnixAddress.init(socket_path);
+    const stream = address.connect(io) catch return error.MonitorUnavailable;
+    defer stream.close(io);
+    writeAll(io, stream, json) catch return error.MonitorUnavailable;
+    writeAll(io, stream, "\n") catch return error.MonitorUnavailable;
+
+    var read_buffer: [max_control_response]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    const line = reader.interface.takeDelimiterExclusive('\n') catch return error.MonitorUnavailable;
+    return allocator.dupe(u8, line);
+}
+
+const ControlResponse = struct {
+    type: []const u8,
+    exit_frame: ?[]const u8 = null,
+    message: ?[]const u8 = null,
+};
+
+fn handleExecResponse(init: std.process.Init, allocator: std.mem.Allocator, stdout: *Io.Writer, response: []const u8) !u8 {
+    var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    if (std.mem.eql(u8, parsed.value.type, "exec_result")) {
+        const frame = parsed.value.exit_frame orelse return error.BadMonitorResponse;
+        return run_mod.writeExitFrameOutput(init, allocator, stdout, frame);
+    }
+    const message = parsed.value.message orelse "monitor request failed";
+    std.debug.print("spore exec: {s}\n", .{message});
+    return 1;
+}
+
+fn writeAll(io: Io, stream: net.Stream, bytes: []const u8) !void {
+    var write_buffer: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+}
+
+fn waitForPidExit(pid: i64, timeout_ms: u64) void {
+    const start = monotonicMs();
+    while (monotonicMs() - start < timeout_ms) {
+        if (!pidAlive(pid)) return;
+        sleepMs(20);
+    }
+}
+
+fn sleepMs(ms: u64) void {
+    var ts = std.c.timespec{
+        .sec = @intCast(ms / std.time.ms_per_s),
+        .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&ts, null);
+}
+
+fn monotonicMs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
+
 fn wantsHelp(args: []const []const u8) bool {
     return args.len == 1 and
         (std.mem.eql(u8, args[0], "help") or
@@ -503,6 +689,11 @@ fn parseIntArg(comptime T: type, raw: []const u8, flag: []const u8) T {
 
 fn validBackend(raw: []const u8) bool {
     return std.mem.eql(u8, raw, "auto") or std.mem.eql(u8, raw, "hvf") or std.mem.eql(u8, raw, "kvm");
+}
+
+pub fn monitorBackendSupported(raw: []const u8) bool {
+    if (!std.mem.eql(u8, raw, "auto") and !std.mem.eql(u8, raw, "hvf")) return false;
+    return comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
 }
 
 fn resolveRequiredAbsolute(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -576,7 +767,7 @@ fn validateExistingPrivateDir(io: Io, path: []const u8) !void {
     };
 }
 
-fn defaultPidAlive(pid: i64) bool {
+pub fn pidAlive(pid: i64) bool {
     if (pid <= 0) return false;
     if (comptime builtin.os.tag == .windows) return false;
     std.posix.kill(@intCast(pid), @enumFromInt(0)) catch |err| return err == error.PermissionDenied;
@@ -595,6 +786,13 @@ test "lifecycle validates VM names" {
     try std.testing.expectError(error.InvalidVMName, validateName("."));
     try std.testing.expectError(error.InvalidVMName, validateName("bad/name"));
     try std.testing.expectError(error.InvalidVMName, validateName("bad name"));
+}
+
+test "lifecycle monitor backend support is explicit" {
+    const hvf_supported = comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
+    try std.testing.expectEqual(hvf_supported, monitorBackendSupported("auto"));
+    try std.testing.expectEqual(hvf_supported, monitorBackendSupported("hvf"));
+    try std.testing.expect(!monitorBackendSupported("kvm"));
 }
 
 test "lifecycle runtime root prefers explicit and xdg absolute paths" {
