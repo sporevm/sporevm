@@ -637,7 +637,10 @@ repeatable local many-VM shape before asking for more metal. HVF
 write-protect tracking has also landed behind `hvf-boot --dirty-track` and the
 fan-out smoke's `--dirty-track` capture option. The first 512MiB local HVF run
 validated same-host forks from trusted `ram.backing` with
-`snapshot_pause_ms=109` / `tail_flush_ms=87`; larger macOS CI scale runs and
+`snapshot_pause_ms=109` / `tail_flush_ms=87`. The dirty benchmark harness now
+also accepts `--backend hvf`; its first 512MiB write-protect JSONL row reported
+`snapshot_pause_ms=80` / `tail_flush_ms=71`, confirming the measurement path is
+not tied to ad hoc fork-smoke log scraping. Larger macOS CI scale runs and
 reducing or predicting dirty-tail lag are now the next Slice 7 gaps.
 
 Continuous epoch-based chunk sealing during normal execution; suspend becomes
