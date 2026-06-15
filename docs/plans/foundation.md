@@ -736,9 +736,11 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   likely publication adapter, but not the hot 10,000-host fan-out data plane by
   itself.
 - The first `spore run` primitive is a local one-shot boot/exec/status command
-  over virtio-vsock with explicit kernel and initrd inputs. Monitor lifecycle,
-  stdin/stdout streaming, rootfs policy, and bundle-aware run semantics remain
-  later work.
+  over virtio-vsock with default run assets and explicit kernel/initrd
+  overrides. It captures a bounded stdout/stderr sample in the final exit frame
+  and can attach a read-only ext4 rootfs for explicit argv execution. Monitor
+  lifecycle, stdin, streaming output, broader rootfs policy, and bundle-aware
+  run semantics remain later work.
 - Control integration is newline-delimited JSON over a unix socket, mirroring
   the proven cleanroom helper pattern.
 - SporeVM is standalone; cleanroom integrates via an adapter in its own repo.
@@ -764,7 +766,8 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   upgraded deliberately per release.
 - Guest kernels are built and published by the `cleanroom-kernels` repo.
   Cleanroom-owned `rootfs` and `initrd` profiles cover normal boot/restore
-  smokes; separate `sporevm-arm64-linux-<version>` kernel assets cover fork
+  smokes; `sporevm-run-arm64-linux-<version>` covers `spore run` initrd and
+  rootfs execution. Legacy `sporevm-arm64-linux-<version>` assets cover fork
   smokes that need userspace access to SporeVM's fixed generation MMIO window.
   Kernel build ID is not yet in the platform contract; adding it is required
   before claiming cross-host disk-backed restore. Vendoring the config into

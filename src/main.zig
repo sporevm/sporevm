@@ -12,7 +12,7 @@ const usage =
     \\
     \\Commands:
     \\  rootfs              Build rootfs images from OCI images
-    \\  run --kernel Image --initrd root.cpio -- <argv...>
+    \\  run [--kernel Image] [--initrd root.cpio] -- <argv...>
     \\                      Boot a throwaway VM and run one command
     \\  version             Print the sporevm version
     \\  host-info           Print this host's platform facts as JSON

@@ -17,6 +17,8 @@ const max_guest_argc = 16;
 const max_guest_arg_len = 255;
 const max_guest_request_len = 2047;
 const max_guest_port = 65535;
+const max_guest_output_bytes = 16 * 1024;
+const default_run_initrd_name = "minimal-exec-initrd.cpio";
 
 pub const Backend = enum {
     auto,
@@ -43,6 +45,7 @@ pub const Options = struct {
     backend: Backend = .auto,
     kernel_path: []const u8,
     initrd_path: []const u8,
+    rootfs_path: ?[]const u8 = null,
     command: []const []const u8,
     memory_mib: u64 = 1024,
     vcpus: u32 = 1,
@@ -61,6 +64,10 @@ pub const Result = struct {
     exit_code: i32,
     error_json: ?[]const u8,
     guest_timing_json: []const u8,
+    guest_stdout: []const u8,
+    guest_stderr: []const u8,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
     vcpus: u32,
     memory_mib: u64,
 
@@ -80,10 +87,23 @@ const SharedOptions = struct {
     console_log_path: ?[]const u8 = null,
 
     fn complete(self: SharedOptions, backend: Backend, command: []const []const u8, emit_json: bool) Options {
+        return self.completeWithAssets(backend, self.kernel_path.?, self.initrd_path.?, null, command, emit_json);
+    }
+
+    fn completeWithAssets(
+        self: SharedOptions,
+        backend: Backend,
+        kernel_path: []const u8,
+        initrd_path: []const u8,
+        rootfs_path: ?[]const u8,
+        command: []const []const u8,
+        emit_json: bool,
+    ) Options {
         return .{
             .backend = backend,
-            .kernel_path = self.kernel_path.?,
-            .initrd_path = self.initrd_path.?,
+            .kernel_path = kernel_path,
+            .initrd_path = initrd_path,
+            .rootfs_path = rootfs_path,
             .command = command,
             .memory_mib = self.memory_mib,
             .vcpus = self.vcpus,
@@ -95,12 +115,23 @@ const SharedOptions = struct {
     }
 };
 
+pub const CliOptions = struct {
+    backend: Backend = .auto,
+    shared: SharedOptions = .{},
+    rootfs_path: ?[]const u8 = null,
+    command: []const []const u8,
+    emit_json: bool = false,
+};
+
 const cli_usage =
     \\Usage:
-    \\  spore run --kernel Image --initrd root.cpio [options] -- <argv...>
+    \\  spore run [--kernel Image] [--initrd root.cpio] [options] -- <argv...>
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
+    \\  --kernel Image          Kernel Image path (default: managed SporeVM run kernel)
+    \\  --initrd root.cpio      Initrd path (default: installed minimal exec initrd)
+    \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --memory-mib N          Guest memory in MiB (default: 1024)
     \\  --vcpus N               Guest vCPU count; must be 1 today
     \\  --guest-port N          Guest vsock listen port (default: 10700)
@@ -118,22 +149,26 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     }
 
     const arena = init.arena.allocator();
-    const opts = try parseCliArgs(args);
+    const parsed = try parseCliArgs(args);
+    const opts = try resolveCliOptions(init, arena, parsed);
     try openConsoleLog(opts.console_log_path);
     defer closeConsoleLog();
 
     const result = try execute(init, arena, opts);
     if (opts.emit_json) {
-        try writeJsonResult(stdout, result);
+        try writeJsonResult(arena, stdout, result);
         try stdout.flush();
+    } else {
+        try writeGuestOutput(init, stdout, result);
     }
     const code = result.processExitCode();
     if (code != 0) std.process.exit(code);
 }
 
-pub fn parseCliArgs(args: []const []const u8) !Options {
+pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var backend: Backend = .auto;
     var shared = SharedOptions{};
+    var rootfs_path: ?[]const u8 = null;
     var emit_json = false;
     var command: ?[]const []const u8 = null;
 
@@ -148,6 +183,8 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
                 std.debug.print("--backend must be auto, hvf, or kvm\n", .{});
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, args[i], "--rootfs")) {
+            rootfs_path = takeValue(args, &i, args[i]);
         } else if (try parseSharedOption(&shared, args, &i)) {
             continue;
         } else if (std.mem.eql(u8, args[i], "--json")) {
@@ -162,12 +199,150 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     }
 
     const argv = command orelse &.{};
-    if (shared.kernel_path == null or shared.initrd_path == null or argv.len == 0) {
+    if (argv.len == 0) {
         std.debug.print("{s}", .{cli_usage});
         std.process.exit(2);
     }
 
-    return shared.complete(backend, argv, emit_json);
+    return .{
+        .backend = backend,
+        .shared = shared,
+        .rootfs_path = rootfs_path,
+        .command = argv,
+        .emit_json = emit_json,
+    };
+}
+
+fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parsed: CliOptions) !Options {
+    if (parsed.rootfs_path) |path| {
+        if (!try readablePath(init.io, path)) {
+            failRunSetup("spore run: rootfs not found: {s}", .{path});
+        }
+    }
+    const kernel_path = parsed.shared.kernel_path orelse try resolveDefaultKernelPath(init, allocator);
+    const initrd_path = parsed.shared.initrd_path orelse try resolveDefaultInitrdPath(init, allocator);
+    return parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, parsed.rootfs_path, parsed.command, parsed.emit_json);
+}
+
+fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    if (init.environ_map.get("SPOREVM_KERNEL_IMAGE")) |path| {
+        if (!try readablePath(init.io, path)) {
+            failRunSetup("spore run: SPOREVM_KERNEL_IMAGE not found: {s}", .{path});
+        }
+        return path;
+    }
+
+    const helper = try sourceTreeKernelHelperPath(init, allocator);
+    if (!try executablePath(init.io, helper)) {
+        failRunSetup(
+            "spore run: default kernel resolver not found at {s}; pass --kernel or set SPOREVM_KERNEL_IMAGE",
+            .{helper},
+        );
+    }
+
+    const result = std.process.run(allocator, init.io, .{
+        .argv = &.{ helper, "run" },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch |err| {
+        failRunSetup("spore run: default kernel resolver failed before exec: {s}", .{@errorName(err)});
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try writeSetupStderr(init, result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            const trimmed = std.mem.trimEnd(u8, result.stdout, "\r\n");
+            if (trimmed.len == 0) {
+                failRunSetup("spore run: default kernel resolver returned an empty path", .{});
+            }
+            return allocator.dupe(u8, trimmed);
+        },
+        else => {},
+    }
+    failRunSetup(
+        "spore run: default kernel resolver failed; pass --kernel or set SPOREVM_KERNEL_IMAGE",
+        .{},
+    );
+}
+
+fn resolveDefaultInitrdPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    if (init.environ_map.get("SPOREVM_RUN_INITRD")) |path| {
+        if (!try readablePath(init.io, path)) {
+            failRunSetup("spore run: SPOREVM_RUN_INITRD not found: {s}", .{path});
+        }
+        return path;
+    }
+
+    const prefix = try installPrefixPath(init, allocator);
+    const path = try defaultInitrdPathFromPrefix(allocator, prefix);
+    if (!try readablePath(init.io, path)) {
+        failRunSetup(
+            "spore run: default initrd not found at {s}; run 'mise run build', pass --initrd, or set SPOREVM_RUN_INITRD",
+            .{path},
+        );
+    }
+    return path;
+}
+
+fn sourceTreeKernelHelperPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    const prefix = try installPrefixPath(init, allocator);
+    return sourceTreeKernelHelperPathFromPrefix(allocator, prefix);
+}
+
+fn defaultInitrdPathFromPrefix(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
+    return std.fs.path.join(allocator, &.{ prefix, "share", "sporevm", default_run_initrd_name });
+}
+
+fn sourceTreeKernelHelperPathFromPrefix(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
+    const repo_root = std.fs.path.dirname(prefix) orelse {
+        failRunSetup("spore run: cannot resolve source tree from install prefix {s}", .{prefix});
+    };
+    return std.fs.path.join(allocator, &.{ repo_root, "scripts", "ensure-managed-kernel.sh" });
+}
+
+fn installPrefixPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    const exe_dir = try std.process.executableDirPathAlloc(init.io, allocator);
+    return std.fs.path.dirname(exe_dir) orelse {
+        failRunSetup("spore run: cannot resolve install prefix from executable directory {s}", .{exe_dir});
+    };
+}
+
+fn readablePath(io: Io, path: []const u8) !bool {
+    return accessPath(io, path, .{ .read = true });
+}
+
+fn executablePath(io: Io, path: []const u8) !bool {
+    return accessPath(io, path, .{ .execute = true });
+}
+
+fn accessPath(io: Io, path: []const u8, options: Io.Dir.AccessOptions) !bool {
+    if (Io.Dir.path.isAbsolute(path)) {
+        Io.Dir.accessAbsolute(io, path, options) catch |err| switch (err) {
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+            else => |e| return e,
+        };
+        return true;
+    }
+    Io.Dir.cwd().access(io, path, options) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+        else => |e| return e,
+    };
+    return true;
+}
+
+fn writeSetupStderr(init: std.process.Init, bytes: []const u8) !void {
+    if (bytes.len == 0) return;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_file_writer: Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
+    const stderr = &stderr_file_writer.interface;
+    try stderr.writeAll(bytes);
+    try stderr.flush();
+}
+
+fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print(fmt ++ "\n", args);
+    std.process.exit(2);
 }
 
 pub fn parseHarnessArgs(backend: Backend, args: []const []const u8) !Options {
@@ -201,7 +376,11 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     const backend = try resolveBackend(opts.backend);
     const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
     const initrd = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
-    const boot_args = try cmdline(allocator, opts.guest_port);
+    const rootfs_fd = try openRootfsDisk(allocator, opts.rootfs_path);
+    defer {
+        if (rootfs_fd) |fd| _ = std.c.close(fd);
+    }
+    const boot_args = try cmdline(allocator, opts.guest_port, opts.rootfs_path != null);
     const request = try execRequest(allocator, opts.command);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
 
@@ -215,6 +394,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
+                .disk_fd = rootfs_fd,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
             });
@@ -227,6 +407,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
+                .disk_fd = rootfs_fd,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
             });
@@ -237,7 +418,19 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     return resultFromStream(allocator, backend, opts, &stream);
 }
 
-pub fn writeJsonResult(writer: *Io.Writer, result: Result) !void {
+fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.c.fd_t {
+    const path = rootfs_path orelse return null;
+    const pathz = try allocator.dupeZ(u8, path);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    if (fd < 0) return error.RootFSOpenFailed;
+    return fd;
+}
+
+pub fn writeJsonResult(allocator: std.mem.Allocator, writer: *Io.Writer, result: Result) !void {
+    const stdout_b64 = try base64Alloc(allocator, result.guest_stdout);
+    defer allocator.free(stdout_b64);
+    const stderr_b64 = try base64Alloc(allocator, result.guest_stderr);
+    defer allocator.free(stderr_b64);
     try writer.print(
         "{{\"backend\":\"{s}\",\"probe\":\"exec\",\"start_ms\":{d},\"vsock_connect_ms\":{d},\"exec_response_ms\":{d},\"probe_duration_ms\":{d},\"exit_code\":{d},\"error\":",
         .{ result.backend.name(), result.start_ms, result.vsock_connect_ms, result.exec_response_ms, result.probe_duration_ms, result.exit_code },
@@ -248,9 +441,42 @@ pub fn writeJsonResult(writer: *Io.Writer, result: Result) !void {
         try writer.writeAll("null");
     }
     try writer.print(
-        ",\"guest_timing_ms\":{s},\"vcpus\":{d},\"memory_mib\":{d}}}\n",
-        .{ result.guest_timing_json, result.vcpus, result.memory_mib },
+        ",\"stdout_b64\":\"{s}\",\"stderr_b64\":\"{s}\",\"stdout_truncated\":{},\"stderr_truncated\":{},\"guest_timing_ms\":{s},\"vcpus\":{d},\"memory_mib\":{d}}}\n",
+        .{
+            stdout_b64,
+            stderr_b64,
+            result.stdout_truncated,
+            result.stderr_truncated,
+            result.guest_timing_json,
+            result.vcpus,
+            result.memory_mib,
+        },
     );
+}
+
+fn writeGuestOutput(init: std.process.Init, stdout: *Io.Writer, result: Result) !void {
+    try stdout.writeAll(result.guest_stdout);
+    try stdout.flush();
+
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_file_writer: Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
+    const stderr = &stderr_file_writer.interface;
+    try stderr.writeAll(result.guest_stderr);
+    if (result.stdout_truncated) try writeTruncationNotice(stderr, result.guest_stderr.len > 0, "stdout");
+    if (result.stderr_truncated) try writeTruncationNotice(stderr, result.guest_stderr.len > 0 or result.stdout_truncated, "stderr");
+    try stderr.flush();
+}
+
+fn writeTruncationNotice(writer: *Io.Writer, already_wrote_stderr: bool, name: []const u8) !void {
+    if (already_wrote_stderr) try writer.writeAll("\n");
+    try writer.print("spore run: guest {s} truncated after {d} bytes\n", .{ name, max_guest_output_bytes });
+}
+
+fn base64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    const enc = std.base64.standard.Encoder;
+    const out = try allocator.alloc(u8, enc.calcSize(bytes.len));
+    _ = enc.encode(out, bytes);
+    return out;
 }
 
 pub var console_fd: std.c.fd_t = -1;
@@ -293,8 +519,11 @@ pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]co
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
-pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1", .{guest_port});
+pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool) ![]const u8 {
+    return if (rootfs)
+        std.fmt.allocPrint(allocator, "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1 spore_rootfs=1", .{guest_port})
+    else
+        std.fmt.allocPrint(allocator, "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1", .{guest_port});
 }
 
 fn resolveBackend(backend: Backend) !Backend {
@@ -319,6 +548,10 @@ fn resultFromStream(allocator: std.mem.Allocator, backend: Backend, opts: Option
         .exit_code = frame.exit_code,
         .error_json = frame.error_json,
         .guest_timing_json = frame.guest_timing_json,
+        .guest_stdout = frame.guest_stdout,
+        .guest_stderr = frame.guest_stderr,
+        .stdout_truncated = frame.stdout_truncated,
+        .stderr_truncated = frame.stderr_truncated,
         .vcpus = opts.vcpus,
         .memory_mib = opts.memory_mib,
     };
@@ -390,6 +623,10 @@ const ExitFrame = struct {
     type: []const u8,
     exit_code: i64,
     @"error": ?[]const u8,
+    stdout_b64: ?[]const u8 = null,
+    stderr_b64: ?[]const u8 = null,
+    stdout_truncated: bool = false,
+    stderr_truncated: bool = false,
     guest_timing_ms: std.json.Value,
 };
 
@@ -397,10 +634,16 @@ const ParsedExitFrame = struct {
     exit_code: i32,
     error_json: ?[]const u8,
     guest_timing_json: []const u8,
+    guest_stdout: []const u8,
+    guest_stderr: []const u8,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
 
     fn deinit(self: ParsedExitFrame, allocator: std.mem.Allocator) void {
         if (self.error_json) |value| allocator.free(value);
         allocator.free(self.guest_timing_json);
+        allocator.free(self.guest_stdout);
+        allocator.free(self.guest_stderr);
     }
 };
 
@@ -423,12 +666,30 @@ fn parseExitFrame(allocator: std.mem.Allocator, output: []const u8) !ParsedExitF
     errdefer allocator.free(timing_json);
     const error_json = if (frame.@"error") |value| try std.json.Stringify.valueAlloc(allocator, value, .{}) else null;
     errdefer if (error_json) |value| allocator.free(value);
+    const guest_stdout = try decodeGuestOutput(allocator, frame.stdout_b64 orelse "");
+    errdefer allocator.free(guest_stdout);
+    const guest_stderr = try decodeGuestOutput(allocator, frame.stderr_b64 orelse "");
+    errdefer allocator.free(guest_stderr);
 
     return .{
         .exit_code = @intCast(frame.exit_code),
         .error_json = error_json,
         .guest_timing_json = timing_json,
+        .guest_stdout = guest_stdout,
+        .guest_stderr = guest_stderr,
+        .stdout_truncated = frame.stdout_truncated,
+        .stderr_truncated = frame.stderr_truncated,
     };
+}
+
+fn decodeGuestOutput(allocator: std.mem.Allocator, b64: []const u8) ![]const u8 {
+    const dec = std.base64.standard.Decoder;
+    const decoded_size = dec.calcSizeForSlice(b64) catch return error.BadRunExitFrame;
+    if (decoded_size > max_guest_output_bytes) return error.BadRunExitFrame;
+    const decoded = try allocator.alloc(u8, decoded_size);
+    errdefer allocator.free(decoded);
+    dec.decode(decoded, b64) catch return error.BadRunExitFrame;
+    return decoded;
 }
 
 fn printHarnessUsage(backend: Backend) void {
@@ -479,10 +740,49 @@ test "run request rejects encoded line overflow" {
 test "run cli parser accepts command after separator" {
     const opts = try parseCliArgs(&.{ "--backend", "hvf", "--kernel", "Image", "--initrd", "root.cpio", "--", "/bin/true" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
-    try std.testing.expectEqualStrings("Image", opts.kernel_path);
-    try std.testing.expectEqualStrings("root.cpio", opts.initrd_path);
+    try std.testing.expectEqualStrings("Image", opts.shared.kernel_path.?);
+    try std.testing.expectEqualStrings("root.cpio", opts.shared.initrd_path.?);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
+}
+
+test "run cli parser allows default boot assets" {
+    const opts = try parseCliArgs(&.{ "--json", "--", "/bin/writeout" });
+    try std.testing.expectEqual(Backend.auto, opts.backend);
+    try std.testing.expect(opts.shared.kernel_path == null);
+    try std.testing.expect(opts.shared.initrd_path == null);
+    try std.testing.expect(opts.emit_json);
+    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
+    try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
+}
+
+test "run cli parser accepts rootfs path" {
+    const opts = try parseCliArgs(&.{ "--rootfs", "rootfs.ext4", "--", "/bin/echo", "hi" });
+    try std.testing.expectEqualStrings("rootfs.ext4", opts.rootfs_path.?);
+    try std.testing.expectEqual(@as(usize, 2), opts.command.len);
+    try std.testing.expectEqualStrings("/bin/echo", opts.command[0]);
+    try std.testing.expectEqualStrings("hi", opts.command[1]);
+}
+
+test "run cmdline marks rootfs mode" {
+    const without_rootfs = try cmdline(std.testing.allocator, 10700, false);
+    defer std.testing.allocator.free(without_rootfs);
+    try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs=1") == null);
+
+    const with_rootfs = try cmdline(std.testing.allocator, 10700, true);
+    defer std.testing.allocator.free(with_rootfs);
+    try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs=1") != null);
+}
+
+test "run default asset paths derive from install prefix" {
+    const allocator = std.testing.allocator;
+    const initrd = try defaultInitrdPathFromPrefix(allocator, "/repo/zig-out");
+    defer allocator.free(initrd);
+    try std.testing.expectEqualStrings("/repo/zig-out/share/sporevm/minimal-exec-initrd.cpio", initrd);
+
+    const helper = try sourceTreeKernelHelperPathFromPrefix(allocator, "/repo/zig-out");
+    defer allocator.free(helper);
+    try std.testing.expectEqualStrings("/repo/scripts/ensure-managed-kernel.sh", helper);
 }
 
 test "run harness parser shares common options" {
@@ -497,12 +797,16 @@ test "run harness parser shares common options" {
 
 test "run result parser extracts exit and timing" {
     const output =
-        "{\"type\":\"exit\",\"exit_code\":0,\"error\":null,\"guest_timing_ms\":{\"guest_init_start\":1,\"guest_command_exit\":9}}\n";
+        "{\"type\":\"exit\",\"exit_code\":0,\"error\":null,\"stdout_b64\":\"aGVsbG8K\",\"stderr_b64\":\"ZXJyCg==\",\"stdout_truncated\":false,\"stderr_truncated\":true,\"guest_timing_ms\":{\"guest_init_start\":1,\"guest_command_exit\":9}}\n";
     const frame = try parseExitFrame(std.testing.allocator, output);
     defer frame.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(i32, 0), frame.exit_code);
     try std.testing.expectEqualStrings("{\"guest_init_start\":1,\"guest_command_exit\":9}", frame.guest_timing_json);
     try std.testing.expect(frame.error_json == null);
+    try std.testing.expectEqualStrings("hello\n", frame.guest_stdout);
+    try std.testing.expectEqualStrings("err\n", frame.guest_stderr);
+    try std.testing.expect(!frame.stdout_truncated);
+    try std.testing.expect(frame.stderr_truncated);
 }
 
 test "run result parser reads top-level exit code" {
@@ -526,6 +830,41 @@ test "run result parser rejects malformed timing value" {
         std.testing.allocator,
         "{\"type\":\"exit\",\"exit_code\":0,\"error\":null,\"guest_timing_ms\":\"not an object\"}\n",
     ));
+}
+
+test "run result parser rejects malformed output encoding" {
+    try std.testing.expectError(error.BadRunExitFrame, parseExitFrame(
+        std.testing.allocator,
+        "{\"type\":\"exit\",\"exit_code\":0,\"error\":null,\"stdout_b64\":\"not base64!\",\"stderr_b64\":\"\",\"guest_timing_ms\":{}}\n",
+    ));
+}
+
+test "run json result includes encoded output metadata" {
+    const allocator = std.testing.allocator;
+    var stdout: Io.Writer.Allocating = .init(allocator);
+    defer stdout.deinit();
+
+    try writeJsonResult(allocator, &stdout.writer, .{
+        .backend = .hvf,
+        .start_ms = 1,
+        .vsock_connect_ms = 2,
+        .exec_response_ms = 3,
+        .probe_duration_ms = 1,
+        .exit_code = 0,
+        .error_json = null,
+        .guest_timing_json = "{}",
+        .guest_stdout = "hello\n",
+        .guest_stderr = "err\n",
+        .stdout_truncated = false,
+        .stderr_truncated = true,
+        .vcpus = 1,
+        .memory_mib = 1024,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "\"stdout_b64\":\"aGVsbG8K\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "\"stderr_b64\":\"ZXJyCg==\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "\"stdout_truncated\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "\"stderr_truncated\":true") != null);
 }
 
 fn fuzzRunResultParsing(_: void, s: *std.testing.Smith) !void {

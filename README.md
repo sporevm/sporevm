@@ -20,9 +20,10 @@ The target lifecycle property: no operation scales with RAM size.
 - **Resume** is bounded by the working set, not memory size, on either OS
 
 The product CLI shape is still landing. Today `spore run` can boot a
-throwaway VM and execute one argv request through the minimal vsock agent, and
-`spore fork` can mint child spores from an existing spore. Create, suspend,
-and resume are still exercised through the backend smoke harnesses. The
+throwaway VM, execute one argv request through the minimal vsock agent, and
+print bounded guest stdout/stderr. `spore fork` can mint child spores from an
+existing spore. Create, suspend, and resume are still exercised through the
+backend smoke harnesses. The
 end-state interface is:
 
 ```console
@@ -63,6 +64,9 @@ mise exec -- zig build hvf-gic-probe # probe HVF GICv3 portable-state support
 mise exec -- zig build kvm-boot   # build the KVM kernel boot harness on Linux/aarch64
 ```
 
+`zig build` also installs the minimal exec initrd used by `spore run`, so the
+host needs `cpio` available in `PATH`.
+
 The `hvf-boot` and `kvm-boot` harnesses accept `--initrd root.cpio` for
 diskless smoke workloads (`rdinit=/init` by default when no disk is supplied).
 The smoke scripts auto-download pinned `cleanroom-kernels` assets and cache
@@ -95,12 +99,22 @@ bundle downloads.
 Run a single command in a throwaway VM with the minimal agent initrd:
 
 ```bash
-scripts/make-minimal-exec-initrd.sh /tmp/sporevm-minimal.cpio
-zig-out/bin/spore run \
-  --backend hvf \
-  --kernel "$(scripts/ensure-managed-kernel.sh initrd)" \
-  --initrd /tmp/sporevm-minimal.cpio \
-  -- /bin/true
+zig-out/bin/spore run -- /bin/writeout
+```
+
+`spore run` defaults to the managed SporeVM run kernel and the minimal exec
+initrd installed by `zig build`. Pass `--kernel` and `--initrd`, or set
+`SPOREVM_KERNEL_IMAGE` and `SPOREVM_RUN_INITRD`, to use explicit boot assets.
+The minimal agent captures up to 16 KiB each of command stdout and stderr. In
+normal mode those bytes are forwarded to the host streams and `spore run` exits
+with the guest command status. With `--json`, command output is reported as
+base64 fields alongside truncation metadata.
+
+Attach an ext4 rootfs read-only and execute an explicit argv from it with
+`--rootfs`:
+
+```bash
+zig-out/bin/spore run --rootfs rootfs.ext4 -- /bin/echo hi
 ```
 
 For a lower-bound boot/exec probe comparable to Cleanroom's minimal
@@ -127,6 +141,8 @@ image. Inputs may be digest-pinned refs or registry tags.
 spore rootfs build ghcr.io/org/image:latest \
   --platform linux/arm64 \
   --output rootfs.ext4
+
+zig-out/bin/spore run --rootfs rootfs.ext4 -- /bin/echo hi
 ```
 
 See [docs/rootfs.md](docs/rootfs.md) for tag resolution, metadata, and ext4

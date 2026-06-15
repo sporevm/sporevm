@@ -4,19 +4,20 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 usage:
-  scripts/ensure-managed-kernel.sh sporevm|initrd|rootfs
+  scripts/ensure-managed-kernel.sh run|sporevm|initrd|rootfs
 
 Resolve, download, cache, and verify a managed aarch64 Linux kernel Image from
 buildkite/cleanroom-kernels. Prints the absolute Image path on stdout.
 
 Kinds:
-  sporevm  SporeVM smoke/fork kernel with /dev/mem support
+  run      SporeVM run kernel with initrd, virtio-blk, and ext4 support
+  sporevm  Legacy SporeVM smoke/fork kernel with /dev/mem support
   initrd   cleanroom minimal initrd-profile kernel
   rootfs   cleanroom minimal rootfs-profile kernel
 
 Environment:
   SPOREVM_KERNEL_IMAGE       explicit local Image path; skips download
-  SPOREVM_KERNEL_RELEASE     cleanroom-kernels release tag (default: v0.3.0)
+  SPOREVM_KERNEL_RELEASE     cleanroom-kernels release tag (default: v0.4.0)
   SPOREVM_KERNEL_VERSION     Linux version in the asset name (default: 6.1.155)
   SPOREVM_KERNEL_REPOSITORY  GitHub repo (default: buildkite/cleanroom-kernels)
   SPOREVM_KERNEL_CACHE_DIR   cache directory override
@@ -106,11 +107,14 @@ if [[ -n "${SPOREVM_KERNEL_IMAGE:-}" ]]; then
   exit 0
 fi
 
-release="${SPOREVM_KERNEL_RELEASE:-v0.3.0}"
+release="${SPOREVM_KERNEL_RELEASE:-v0.4.0}"
 linux_version="${SPOREVM_KERNEL_VERSION:-6.1.155}"
 repo="${SPOREVM_KERNEL_REPOSITORY:-buildkite/cleanroom-kernels}"
 
 case "${kind}" in
+  run)
+    asset="sporevm-run-arm64-linux-${linux_version}-Image"
+    ;;
   sporevm)
     asset="sporevm-arm64-linux-${linux_version}-Image"
     ;;
@@ -121,7 +125,7 @@ case "${kind}" in
     asset="cleanroom-darwin-vz-minimal-rootfs-arm64-linux-${linux_version}-Image"
     ;;
   *)
-    die "kernel kind must be sporevm, initrd, or rootfs"
+    die "kernel kind must be run, sporevm, initrd, or rootfs"
     ;;
 esac
 

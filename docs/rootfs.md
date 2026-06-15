@@ -14,6 +14,12 @@ spore rootfs build ghcr.io/org/image:latest \
   --output rootfs.ext4
 ```
 
+Run an explicit argv from a built rootfs by attaching it read-only:
+
+```bash
+spore run --rootfs rootfs.ext4 -- /bin/echo hi
+```
+
 Tag inputs are resolved to the selected platform manifest before rootfs
 materialization. Metadata records both the supplied `image_ref` and the
 `resolved_image_ref` used for the build, so builds started from mutable tags can

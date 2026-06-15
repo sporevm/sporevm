@@ -35,6 +35,13 @@ pub fn build(b: *std.Build) void {
     });
     const install_exe = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&install_exe.step);
+
+    const minimal_exec_initrd = b.addSystemCommand(&.{
+        "scripts/make-minimal-exec-initrd.sh",
+        b.getInstallPath(.prefix, "share/sporevm/minimal-exec-initrd.cpio"),
+    });
+    b.getInstallStep().dependOn(&minimal_exec_initrd.step);
+
     if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) {
         const sign_spore = b.addSystemCommand(&.{
             "codesign",                      "--sign", "-", "--force", "--entitlements", "spore.entitlements",
