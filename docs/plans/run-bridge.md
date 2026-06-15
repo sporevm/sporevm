@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-15
+last_reviewed: 2026-06-16
 spec_refs:
   - docs/plans/foundation.md
   - docs/rootfs.md
@@ -12,6 +12,7 @@ spec_refs:
   - scripts/smoke-counter-fanout.sh
 related_plans:
   - docs/plans/foundation.md
+  - docs/plans/immutable-rootfs-resume.md
 ---
 
 # Spore Run Bridge Plan
@@ -26,10 +27,10 @@ fail closed when required boot assets or workload inputs are unsupported.
 
 The current implementation proves the host/guest control path with default run
 assets, read-only rootfs execution, direct OCI image cache convenience, product
-resume, streaming run output, and host-signalled capture. The remaining bridge
-proof is diskless fan-out through product commands: run a long-lived process,
-capture it on a host signal, fork it, and resume child spores with visible
-post-resume output.
+resume, streaming run output, host-signalled capture, and immutable-rootfs
+resume. The completed bridge proof is diskless fan-out through product
+commands: run a long-lived process, capture it on a host signal, fork it, and
+resume child spores with visible post-resume output.
 
 The first OCI-capable milestone is intentionally two-step:
 
@@ -57,10 +58,10 @@ host-side run-vsock stream is not a portable spore artifact, so resumed captured
 workloads must be visible through restore-time guest console output or through a
 future explicit reconnect protocol.
 
-Disk-backed/rootfs fan-out is still outside this bridge. v0 spores do not
-capture disk bytes, and product `spore resume` correctly rejects disk-backed
-spores until the foundation plan adds disk manifests or another explicit disk
-restore contract.
+Ruby/rootfs fan-out is tracked outside this bridge in
+`docs/plans/immutable-rootfs-resume.md`. The local immutable-rootfs resume
+contract now exists, but the Ruby demo smoke, preload/bundle UX, and remote
+same-class host flow remain separate work.
 
 ## Goals
 
@@ -635,9 +636,9 @@ interleaved counters from the same captured process state.
   agent mirrors workload output to the guest console for the first product
   guarantee. Separated stdout/stderr after resuming a captured `spore run`
   requires a later explicit reconnect or host-stream state design.
-- The immediate fan-out proof is diskless. A Ruby/rootfs fan-out demo would
-  currently produce a disk-backed spore, and product `spore resume` correctly
-  rejects those until disk manifests or another disk restore contract land.
+- The immediate fan-out proof is diskless. Ruby/rootfs fan-out now has an
+  immutable rootfs resume contract, but the end-to-end Ruby demo smoke and
+  remote preload/bundle path remain in `docs/plans/immutable-rootfs-resume.md`.
 
 ## Open Questions And Recommended Defaults
 
@@ -674,8 +675,9 @@ interleaved counters from the same captured process state.
 - Event-stream JSON output for streaming runs.
 - Separated stdout/stderr after product `spore resume` if the first
   implementation streams only the guest console.
-- Ruby/rootfs fan-out through product `spore resume`, blocked on disk-backed
-  product resume rather than the run bridge itself.
+- Ruby/rootfs fan-out through product `spore resume`, tracked in
+  `docs/plans/immutable-rootfs-resume.md` as an immutable rootfs restore
+  contract rather than writable disk capture.
 
 ## Key Learnings From Pressure-Testing
 
@@ -703,6 +705,5 @@ development-only or install/generate assets in a way that survives normal
 The Slice F risk was bundling several different problems into one PR: product
 resume, streaming run output, host-triggered snapshot, and resume-time output
 visibility. Splitting those slices kept each behavior testable. The final proof
-stays diskless because `spore run --image ... --capture-on-abort` creates a
-disk-backed spore today, and product `spore resume` should not pretend that disk
-state is portable before the foundation plan has a disk manifest contract.
+stays diskless because Ruby/rootfs fan-out needs its own demo, preload, and
+remote distribution work even after immutable rootfs resume support exists.

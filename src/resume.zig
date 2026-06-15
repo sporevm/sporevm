@@ -37,7 +37,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     }
 
     const opts = try parseCliArgs(args);
-    try execute(init.arena.allocator(), opts);
+    try execute(init, init.arena.allocator(), opts);
 }
 
 pub fn parseCliArgs(args: []const []const u8) !Options {
@@ -75,12 +75,13 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     };
 }
 
-pub fn execute(allocator: std.mem.Allocator, opts: Options) !void {
+pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) !void {
     const parsed = try spore.loadManifest(allocator, opts.spore_dir);
     defer parsed.deinit();
 
-    if (requiresExternalDisk(parsed.value.devices)) {
-        failResumeSetup("spore resume: disk-backed spores are not supported by the product CLI yet; use the backend harness with --disk and the original backing disk", .{});
+    const rootfs_fd = try openResumeRootfs(init, allocator, parsed.value);
+    defer {
+        if (rootfs_fd) |fd| _ = std.c.close(fd);
     }
 
     const backend = try resolveBackend(opts.backend);
@@ -93,6 +94,7 @@ pub fn execute(allocator: std.mem.Allocator, opts: Options) !void {
                 .kernel = "",
                 .ram_size = ram_size,
                 .console_sink = consoleSink,
+                .disk_fd = rootfs_fd,
                 .resume_dir = opts.spore_dir,
             });
         },
@@ -102,6 +104,7 @@ pub fn execute(allocator: std.mem.Allocator, opts: Options) !void {
                 .kernel = "",
                 .ram_size = ram_size,
                 .console_sink = consoleSink,
+                .disk_fd = rootfs_fd,
                 .resume_dir = opts.spore_dir,
             });
         },
@@ -133,11 +136,29 @@ fn resumeRamSize(platform: spore.Platform) u64 {
     return platform.ram_size;
 }
 
-fn requiresExternalDisk(devices: []const spore.TransportState) bool {
-    for (devices) |device| {
-        if (device.device_id == virtio_blk.device_id) return true;
+fn openResumeRootfs(init: std.process.Init, allocator: std.mem.Allocator, manifest: spore.Manifest) !?std.c.fd_t {
+    const disk_count = countBlockDevices(manifest.devices);
+    if (disk_count == 0) return null;
+    if (disk_count != 1) {
+        failResumeSetup("spore resume: only one immutable rootfs disk is supported; found {d} block devices", .{disk_count});
     }
-    return false;
+    const rootfs = manifest.rootfs orelse {
+        failResumeSetup("spore resume: disk-backed spore has no immutable rootfs artifact; capture with spore run --image or use the backend harness with the original disk", .{});
+    };
+    spore.validateRootfs(rootfs, manifest.devices) catch {
+        failResumeSetup("spore resume: invalid immutable rootfs metadata in manifest", .{});
+    };
+    return run_mod.openVerifiedRootfs(init, allocator, rootfs, "resume") catch |err| {
+        failResumeSetup("spore resume: immutable rootfs artifact unavailable or unverifiable: {s}", .{@errorName(err)});
+    };
+}
+
+fn countBlockDevices(devices: []const spore.TransportState) usize {
+    var count: usize = 0;
+    for (devices) |device| {
+        if (device.device_id == virtio_blk.device_id) count += 1;
+    }
+    return count;
 }
 
 fn failResumeSetup(comptime fmt: []const u8, args: anytype) noreturn {
@@ -164,7 +185,7 @@ test "resume memory defaults to manifest ram size" {
     try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), resumeRamSize(platform));
 }
 
-test "resume rejects manifests that require an external disk" {
+test "resume counts block devices for disk dependency classification" {
     const disk_device = spore.TransportState{
         .device_id = virtio_blk.device_id,
         .status = 0,
@@ -186,6 +207,6 @@ test "resume rejects manifests that require an external disk" {
         .queues = &.{},
     };
 
-    try std.testing.expect(requiresExternalDisk(&.{ console_device, disk_device }));
-    try std.testing.expect(!requiresExternalDisk(&.{console_device}));
+    try std.testing.expectEqual(@as(usize, 1), countBlockDevices(&.{ console_device, disk_device }));
+    try std.testing.expectEqual(@as(usize, 0), countBlockDevices(&.{console_device}));
 }

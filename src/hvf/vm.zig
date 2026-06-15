@@ -32,8 +32,11 @@ pub const Config = struct {
     cmdline: []const u8 = "console=hvc0",
     initrd: ?[]const u8 = null,
     console_sink: *const fn ([]const u8) void,
-    /// Read-write host fd backing /dev/vda, if any.
+    /// Host fd backing /dev/vda, if any. Immutable rootfs callers pass a
+    /// read-only fd; guest write requests fail through the block device.
     disk_fd: ?std.c.fd_t = null,
+    /// Immutable rootfs artifact metadata for disk-backed snapshots.
+    rootfs: ?spore.Rootfs = null,
     /// Poll fd 0 (set non-blocking by the caller) for console input on
     /// guest idle exits.
     poll_stdin: bool = false,
@@ -365,7 +368,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
                         .ram_size = config.ram_size,
-                    }, if (dirty_tracker) |*tracker| tracker else null);
+                    }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
                     return .snapshotted;
                 },
             }
@@ -387,7 +390,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, if (dirty_tracker) |*tracker| tracker else null);
+                }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
                 return .snapshotted;
             }
         }
@@ -399,7 +402,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, if (dirty_tracker) |*tracker| tracker else null);
+                }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
                 return .snapshotted;
             }
         }
@@ -972,6 +975,7 @@ fn takeSnapshot(
     gen_dev: *const generation.Device,
     ram_bytes: []const u8,
     platform: SnapshotPlatform,
+    rootfs: ?spore.Rootfs,
     dirty_tracker: ?*DirtyTracker,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -985,6 +989,12 @@ fn takeSnapshot(
     const devices_start = monotonicMs();
     const devices = try captureTransports(arena, transports);
     const devices_ms = monotonicMs() - devices_start;
+    if (rootfs) |rootfs_artifact| {
+        if (!try spore.rootfsQueuesQuiescent(rootfs_artifact, devices)) {
+            std.log.err("cannot snapshot rootfs-backed VM while virtio-blk has pending requests", .{});
+            return error.DeviceStatePending;
+        }
+    }
     const generation_start = monotonicMs();
     const gen_state = try gen_dev.capture(arena);
     const generation_ms = monotonicMs() - generation_start;
@@ -1008,6 +1018,7 @@ fn takeSnapshot(
         .machine = machine,
         .devices = devices,
         .generation = gen_state,
+        .rootfs = rootfs,
         .memory = memory,
     });
     const manifest_ms = monotonicMs() - manifest_start;

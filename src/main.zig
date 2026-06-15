@@ -7,8 +7,18 @@ const std = @import("std");
 const Io = std.Io;
 const sporevm = @import("sporevm");
 
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = logFn,
+};
+
+var runtime_log_level: std.log.Level = .warn;
+
 const usage =
-    \\Usage: spore <command>
+    \\Usage: spore [--debug] <command>
+    \\
+    \\Global options:
+    \\  --debug             Show verbose VMM and restore logs
     \\
     \\Commands:
     \\  rootfs              Build rootfs images from OCI images
@@ -45,56 +55,60 @@ pub fn main(init: std.process.Init) !void {
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
 
-    if (args.len < 2) {
+    const parsed = parseGlobalArgs(args);
+    if (parsed.debug) runtime_log_level = .debug;
+
+    if (parsed.help or parsed.command == null) {
         try stdout.writeAll(usage);
         try stdout.flush();
-        std.process.exit(2);
+        std.process.exit(if (parsed.help) 0 else 2);
     }
 
-    const command = args[1];
+    const command = parsed.command.?;
+    const command_args = parsed.command_args;
     if (std.mem.eql(u8, command, "rootfs")) {
-        try sporevm.rootfs.run(init, args[2..], stdout);
+        try sporevm.rootfs.run(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "run")) {
-        try sporevm.run.cli(init, args[2..], stdout);
+        try sporevm.run.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "resume")) {
-        if (wantsNamedResume(args[2..])) {
-            try sporevm.lifecycle.resumeCli(init, args[2..], stdout);
+        if (wantsNamedResume(command_args)) {
+            try sporevm.lifecycle.resumeCli(init, command_args, stdout);
         } else {
-            try sporevm.resume_cmd.cli(init, args[2..], stdout);
+            try sporevm.resume_cmd.cli(init, command_args, stdout);
         }
     } else if (std.mem.eql(u8, command, "create")) {
-        try sporevm.lifecycle.createCli(init, args[2..], stdout);
+        try sporevm.lifecycle.createCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "exec")) {
-        try sporevm.lifecycle.execCli(init, args[2..], stdout);
+        try sporevm.lifecycle.execCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "rm")) {
-        try sporevm.lifecycle.rmCli(init, args[2..], stdout);
+        try sporevm.lifecycle.rmCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "suspend")) {
-        try sporevm.lifecycle.suspendCli(init, args[2..], stdout);
+        try sporevm.lifecycle.suspendCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "ls")) {
-        try sporevm.lifecycle.lsCli(init, args[2..], stdout);
+        try sporevm.lifecycle.lsCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "monitor")) {
-        try sporevm.monitor.cli(init, args[2..], stdout);
+        try sporevm.monitor.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "version")) {
         try stdout.print("spore {s}\n", .{sporevm.version});
     } else if (std.mem.eql(u8, command, "host-info")) {
         try printJson(arena, stdout, try sporevm.platform.hostInfo());
     } else if (std.mem.eql(u8, command, "inspect")) {
-        if (args.len != 3) {
+        if (command_args.len != 1) {
             try stdout.writeAll("usage: spore inspect <spore-dir>\n");
             try stdout.flush();
             std.process.exit(2);
         }
-        const parsed = try sporevm.spore.loadManifest(arena, args[2]);
-        defer parsed.deinit();
-        try printJson(arena, stdout, inspectSummary(parsed.value));
+        const manifest = try sporevm.spore.loadManifest(arena, command_args[0]);
+        defer manifest.deinit();
+        try printJson(arena, stdout, inspectSummary(manifest.value));
     } else if (std.mem.eql(u8, command, "fork")) {
-        const result = try forkCommand(arena, args[2..]);
+        const result = try forkCommand(arena, command_args);
         try printJson(arena, stdout, result);
     } else if (std.mem.eql(u8, command, "pack")) {
-        const result = try packCommand(arena, args[2..]);
+        const result = try packCommand(arena, command_args);
         try printJson(arena, stdout, result);
     } else if (std.mem.eql(u8, command, "unpack")) {
-        const result = try unpackCommand(arena, args[2..]);
+        const result = try unpackCommand(arena, command_args);
         try printJson(arena, stdout, result);
     } else if (std.mem.eql(u8, command, "help")) {
         try stdout.writeAll(usage);
@@ -105,6 +119,42 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
     try stdout.flush();
+}
+
+fn logFn(
+    comptime message_level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (@intFromEnum(message_level) <= @intFromEnum(runtime_log_level)) {
+        std.log.defaultLog(message_level, scope, format, args);
+    }
+}
+
+const GlobalArgs = struct {
+    debug: bool = false,
+    help: bool = false,
+    command: ?[]const u8 = null,
+    command_args: []const []const u8 = &.{},
+};
+
+fn parseGlobalArgs(args: []const []const u8) GlobalArgs {
+    var parsed = GlobalArgs{};
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--debug")) {
+            parsed.debug = true;
+        } else if (std.mem.eql(u8, args[i], "-h") or std.mem.eql(u8, args[i], "--help")) {
+            parsed.help = true;
+            return parsed;
+        } else {
+            parsed.command = args[i];
+            parsed.command_args = args[i + 1 ..];
+            return parsed;
+        }
+    }
+    return parsed;
 }
 
 fn printJson(allocator: std.mem.Allocator, writer: *Io.Writer, value: anytype) !void {
@@ -247,6 +297,7 @@ fn inspectSummary(manifest: sporevm.spore.Manifest) InspectSummary {
 }
 
 test "usage names every command" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--debug") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "rootfs") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "run") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "resume") != null);
@@ -268,4 +319,20 @@ test "usage names every command" {
 test "resume dispatch can distinguish product and named lifecycle modes" {
     try std.testing.expect(!wantsNamedResume(&.{"spore-dir"}));
     try std.testing.expect(wantsNamedResume(&.{ "spore-dir", "--name", "bench-1" }));
+}
+
+test "global args parse debug before command" {
+    const parsed = parseGlobalArgs(&.{ "spore", "--debug", "run", "--", "/bin/true" });
+    try std.testing.expect(parsed.debug);
+    try std.testing.expect(!parsed.help);
+    try std.testing.expectEqualStrings("run", parsed.command.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.command_args.len);
+    try std.testing.expectEqualStrings("--", parsed.command_args[0]);
+    try std.testing.expectEqualStrings("/bin/true", parsed.command_args[1]);
+}
+
+test "global args parse help without command" {
+    const parsed = parseGlobalArgs(&.{ "spore", "--help" });
+    try std.testing.expect(parsed.help);
+    try std.testing.expect(parsed.command == null);
 }

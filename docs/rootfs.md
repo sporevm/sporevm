@@ -41,8 +41,27 @@ spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
 The cache key includes the resolved digest-pinned image ref, target platform,
 and rootfs builder version. Set `SPOREVM_ROOTFS_CACHE_DIR` to choose the cache
 directory; otherwise SporeVM uses the platform cache directory. Cache setup
-messages are written to stderr so `spore run --json --image ...` keeps one JSON
-result on stdout.
+messages are shown only with `spore --debug ...`, so command stdout and stderr
+stay workload-focused by default.
+
+When `spore run --image ... --capture-on-abort SPORE` captures a VM, the spore
+manifest records an immutable rootfs artifact: the ext4 content BLAKE3 digest,
+size, virtio-blk binding, resolved OCI image identity, platform, and builder
+version. The rootfs is also stored under a digest-addressed cache path. Product
+`spore resume` reopens that cached artifact, verifies the same read-only fd by
+digest and size, then attaches it as virtio-blk. If the digest cache entry is
+missing or tampered with, resume refuses to boot.
+
+Plain `spore run --rootfs PATH` remains a local run escape hatch. Combining
+`--rootfs PATH` with `--capture-on-abort` is rejected until an import/preload
+command can record portable rootfs identity for arbitrary local images.
+
+Validate OCI rootfs capture, fork, and parallel product resume with the opt-in
+Ruby fan-out smoke:
+
+```bash
+mise run smoke:rootfs-fanout
+```
 
 Validate the tag-to-rootfs-to-run path with the local smoke script:
 

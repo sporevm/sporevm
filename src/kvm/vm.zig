@@ -31,8 +31,11 @@ pub const Config = struct {
     cmdline: []const u8 = "console=hvc0",
     initrd: ?[]const u8 = null,
     console_sink: *const fn ([]const u8) void,
-    /// Read-write host fd backing /dev/vda, if any.
+    /// Host fd backing /dev/vda, if any. Immutable rootfs callers pass a
+    /// read-only fd; guest write requests fail through the block device.
     disk_fd: ?std.c.fd_t = null,
+    /// Immutable rootfs artifact metadata for disk-backed snapshots.
+    rootfs: ?spore.Rootfs = null,
     /// Resume from a spore directory instead of booting the kernel.
     resume_dir: ?[]const u8 = null,
     /// Trusted same-host RAM backing fd supplied by the caller or future
@@ -335,7 +338,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     pending_kvm_completion = false;
                 }
                 const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, if (dirty_tracker) |*tracker| tracker else null);
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
                 return .snapshotted;
             }
         }
@@ -347,7 +350,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     pending_kvm_completion = false;
                 }
                 const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, if (dirty_tracker) |*tracker| tracker else null);
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
                 return .snapshotted;
             }
         }
@@ -906,6 +909,7 @@ fn takeSnapshot(
     vsock_dev: *const vsock.Vsock,
     ram_bytes: []const u8,
     ram_size: u64,
+    rootfs: ?spore.Rootfs,
     dirty_tracker: ?*DirtyTracker,
 ) !void {
     if (vsock_dev.pending_len != 0) {
@@ -924,6 +928,12 @@ fn takeSnapshot(
     const devices_start = try monotonicMs();
     const devices = try captureTransports(arena, transports);
     const devices_ms = (try monotonicMs()) - devices_start;
+    if (rootfs) |rootfs_artifact| {
+        if (!try spore.rootfsQueuesQuiescent(rootfs_artifact, devices)) {
+            std.log.err("cannot snapshot rootfs-backed VM while virtio-blk has pending requests", .{});
+            return error.DeviceStatePending;
+        }
+    }
     const generation_start = try monotonicMs();
     const gen_state = try gen_dev.capture(arena);
     const generation_ms = (try monotonicMs()) - generation_start;
@@ -947,6 +957,7 @@ fn takeSnapshot(
         .machine = machine,
         .devices = devices,
         .generation = gen_state,
+        .rootfs = rootfs,
         .memory = memory,
     });
     const manifest_ms = (try monotonicMs()) - manifest_start;

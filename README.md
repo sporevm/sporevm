@@ -20,8 +20,9 @@ wiring, boot contract, virtio-mmio devices, and the SporeVM generation device.
 Cross-backend restore is a useful diagnostic; identical-host-class fork/fan-out
 is the product path.
 
-v0 spores do not capture disk bytes yet, so disk-backed resume still requires
-the same backing disk out of band.
+v0 spores do not capture arbitrary disk bytes yet. Product resume can reattach
+verified immutable rootfs artifacts from the local content cache; writable or
+unknown disk state still requires an explicit future disk contract.
 
 The target lifecycle property is that common operations avoid scaling with RAM
 size:
@@ -57,7 +58,7 @@ Current `main` can:
 - capture a long-running `spore run` on a host signal with
   `--capture-on-abort`;
 - mint metadata-only child spores with `spore fork`;
-- resume one diskless spore with `spore resume`;
+- resume one diskless or verified immutable-rootfs spore with `spore resume`;
 - pack and unpack local chunkpack bundles with `spore pack` / `spore unpack`;
 - build deterministic ext4 rootfs images from OCI images with
   `spore rootfs build`;
@@ -90,11 +91,14 @@ mise run smoke:run
 mise run smoke:run-capture
 mise run smoke:resume
 mise run smoke:counter-fanout
+mise run smoke:rootfs-fanout
 ```
 
 `mise run check` runs unit tests, the product build, and diff hygiene.
 `mise run smoke` builds once, then runs product run, run-capture, and resume
-smokes.
+smokes. `smoke:counter-fanout` and `smoke:rootfs-fanout` are opt-in demo
+smokes; the rootfs fan-out smoke builds a published Ruby OCI image and resumes
+forked children in parallel.
 
 `zig build` installs the minimal exec initrd used by `spore run`, so `cpio`
 must be available in `PATH`.
@@ -113,6 +117,9 @@ zig-out/bin/spore run -- /bin/writeout
 `spore run` defaults to the managed SporeVM run kernel and the minimal exec
 initrd installed by `zig build`. Override the boot assets with `--kernel` and
 `--initrd`, or set `SPOREVM_KERNEL_IMAGE` and `SPOREVM_RUN_INITRD`.
+
+Pass `--debug` before the command, for example `spore --debug run ...`, to show
+verbose VMM setup and restore logs.
 
 The minimal agent streams command stdout and stderr over a small framed vsock
 protocol. The host forwards those streams and exits with the guest command
@@ -170,15 +177,17 @@ zig-out/bin/spore fork /tmp/run.spore --count 100 --out /tmp/forks
 Children are named `000000`, `000001`, and so on, and share the parent's chunk
 store.
 
-Resume one captured or forked diskless spore:
+Resume one captured or forked spore:
 
 ```bash
 zig-out/bin/spore resume /tmp/forks/000000
 ```
 
 Product resume streams the restored guest console and defaults RAM size from
-the spore manifest. Disk-backed restore still needs the backend harness plus
-the original backing disk.
+the spore manifest. Spores captured from `spore run --image` record the
+immutable rootfs content digest and resume by reopening the verified
+content-addressed cache entry. Arbitrary writable disk restore is still
+unsupported.
 
 Pack and unpack a spore:
 
@@ -214,6 +223,18 @@ zig-out/bin/spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
 `--image` still runs the explicit argv after `--`. It does not apply OCI
 Entrypoint, Cmd, User, Env, or Workdir yet. Set `SPOREVM_ROOTFS_CACHE_DIR` to
 override the cache directory.
+
+When combined with `--capture-on-abort`, `--image` records immutable rootfs
+identity in the spore manifest. `spore resume` later verifies the cached rootfs
+bytes by digest before attaching the fd read-only. `--rootfs PATH` still works
+for ordinary runs, but `--rootfs PATH --capture-on-abort` is rejected until
+there is an import/preload command that can record portable rootfs identity.
+
+Exercise the rootfs capture/fork/resume path with:
+
+```bash
+mise run smoke:rootfs-fanout
+```
 
 See [docs/rootfs.md](docs/rootfs.md) for tag resolution, metadata, and ext4
 tooling details.

@@ -22,7 +22,8 @@ const status_ioerr: u8 = 1;
 const status_unsupp: u8 = 2;
 
 pub const Backend = union(enum) {
-    /// Host file descriptor (opened read-write).
+    /// Host file descriptor. Read-only fds are valid for immutable rootfs
+    /// attachments; guest write requests then return an I/O error.
     file: std.c.fd_t,
     /// In-memory disk, used by tests.
     memory: []u8,

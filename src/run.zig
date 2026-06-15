@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const Blake3 = std.crypto.hash.Blake3;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const capture = @import("capture.zig");
@@ -12,6 +13,7 @@ const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
 else
     struct {};
 const rootfs_mod = @import("rootfs.zig");
+const spore = @import("spore.zig");
 const vsock = @import("virtio/vsock.zig");
 
 const max_file_size = 256 * 1024 * 1024;
@@ -50,6 +52,7 @@ pub const Options = struct {
     kernel_path: []const u8,
     initrd_path: []const u8,
     rootfs_path: ?[]const u8 = null,
+    rootfs: ?spore.Rootfs = null,
     resume_dir: ?[]const u8 = null,
     command: []const []const u8,
     memory_mib: u64 = 1024,
@@ -106,6 +109,7 @@ const SharedOptions = struct {
         kernel_path: []const u8,
         initrd_path: []const u8,
         rootfs_path: ?[]const u8,
+        rootfs: ?spore.Rootfs,
         command: []const []const u8,
         stream_output: bool,
     ) Options {
@@ -114,6 +118,7 @@ const SharedOptions = struct {
             .kernel_path = kernel_path,
             .initrd_path = initrd_path,
             .rootfs_path = rootfs_path,
+            .rootfs = rootfs,
             .resume_dir = null,
             .command = command,
             .memory_mib = self.memory_mib,
@@ -255,14 +260,34 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
 }
 
 fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parsed: CliOptions) !Options {
-    const rootfs_path = try resolveRootfsInput(init, allocator, parsed.rootfs_path, parsed.image_ref, "run");
+    if (parsed.capture_on_abort_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
+        failRunSetup("spore run: --rootfs with --capture-on-abort is not portable yet; use --image so capture can record immutable rootfs identity", .{});
+    }
+    const rootfs = try resolveRootfsInputDetailed(init, allocator, .{
+        .rootfs_path = parsed.rootfs_path,
+        .image_ref = parsed.image_ref,
+        .command_name = "run",
+        .record_artifact = parsed.capture_on_abort_path != null,
+    });
     const kernel_path = parsed.shared.kernel_path orelse try resolveDefaultKernelPath(init, allocator);
     const initrd_path = parsed.shared.initrd_path orelse try resolveDefaultInitrdPath(init, allocator);
-    var opts = parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs_path, parsed.command, true);
+    var opts = parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs.path, rootfs.rootfs, parsed.command, true);
     opts.capture_on_abort_path = parsed.capture_on_abort_path;
     opts.capture_signal = parsed.capture_signal;
     return opts;
 }
+
+const RootfsInputOptions = struct {
+    rootfs_path: ?[]const u8,
+    image_ref: ?[]const u8,
+    command_name: []const u8,
+    record_artifact: bool = false,
+};
+
+const ResolvedRootfsInput = struct {
+    path: ?[]const u8,
+    rootfs: ?spore.Rootfs = null,
+};
 
 pub fn resolveRootfsInput(
     init: std.process.Init,
@@ -271,34 +296,79 @@ pub fn resolveRootfsInput(
     image_ref: ?[]const u8,
     command_name: []const u8,
 ) !?[]const u8 {
-    if (rootfs_path != null and image_ref != null) {
-        failRunSetup("spore {s}: --rootfs and --image are mutually exclusive", .{command_name});
+    return (try resolveRootfsInputDetailed(init, allocator, .{
+        .rootfs_path = rootfs_path,
+        .image_ref = image_ref,
+        .command_name = command_name,
+    })).path;
+}
+
+fn resolveRootfsInputDetailed(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: RootfsInputOptions,
+) !ResolvedRootfsInput {
+    if (options.rootfs_path != null and options.image_ref != null) {
+        failRunSetup("spore {s}: --rootfs and --image are mutually exclusive", .{options.command_name});
     }
-    const resolved = if (image_ref) |ref|
-        try resolveImageRootfs(init, allocator, ref, command_name)
+    const resolved = if (options.image_ref) |ref|
+        try resolveImageRootfs(init, allocator, ref, options.command_name, options.record_artifact)
     else
-        rootfs_path;
-    if (resolved) |path| {
+        ResolvedRootfsInput{ .path = options.rootfs_path };
+    if (resolved.path) |path| {
         if (!try readablePath(init.io, path)) {
-            failRunSetup("spore {s}: rootfs not found: {s}", .{ command_name, path });
+            failRunSetup("spore {s}: rootfs not found: {s}", .{ options.command_name, path });
         }
     }
     return resolved;
 }
 
-fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8, command_name: []const u8) ![]const u8 {
-    const cache_root = try rootfsCacheRootPath(init, allocator);
+fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8, command_name: []const u8, record_artifact: bool) !ResolvedRootfsInput {
+    const cache_root = try rootfsCacheRootPath(init, allocator, command_name);
     try ensureDirPath(init.io, cache_root);
 
     if (try rootfs_mod.digestPinnedImageIdentity(allocator, image_ref, direct_image_platform)) |digest_pinned| {
-        if (try cachedImageRootfsPath(init, allocator, cache_root, digest_pinned, command_name)) |path| return path;
+        if (try cachedImageRootfsPath(init, allocator, cache_root, digest_pinned, command_name)) |path| {
+            return try resolvedImageRootfsInput(init, allocator, cache_root, image_ref, digest_pinned, path, record_artifact);
+        }
     }
 
     const resolved = rootfs_mod.resolveImageRef(init, allocator, image_ref, direct_image_platform) catch |err| {
         failRunSetup("spore {s}: image resolve failed for {s}: {s}", .{ command_name, image_ref, @errorName(err) });
     };
-    if (try cachedImageRootfsPath(init, allocator, cache_root, resolved, command_name)) |path| return path;
-    return buildCachedImageRootfs(init, allocator, cache_root, resolved, command_name);
+    if (try cachedImageRootfsPath(init, allocator, cache_root, resolved, command_name)) |path| {
+        return try resolvedImageRootfsInput(init, allocator, cache_root, image_ref, resolved, path, record_artifact);
+    }
+    const path = try buildCachedImageRootfs(init, allocator, cache_root, resolved, command_name);
+    return try resolvedImageRootfsInput(init, allocator, cache_root, image_ref, resolved, path, record_artifact);
+}
+
+fn resolvedImageRootfsInput(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    requested_ref: []const u8,
+    resolved: rootfs_mod.ResolvedImage,
+    rootfs_path: []const u8,
+    record_artifact: bool,
+) !ResolvedRootfsInput {
+    if (!record_artifact) return .{ .path = rootfs_path };
+    const artifact = try cacheRootfsByDigest(init, allocator, cache_root, rootfs_path);
+    const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch });
+    return .{
+        .path = rootfs_path,
+        .rootfs = .{
+            .device = .{ .mmio_slot = 1 },
+            .artifact = artifact,
+            .source = .{
+                .requested_ref = requested_ref,
+                .resolved_image_ref = resolved.ref,
+                .image_manifest_digest = resolved.manifest_digest,
+                .platform = platform,
+                .builder_version = rootfs_mod.builder_version,
+            },
+        },
+    };
 }
 
 fn cachedImageRootfsPath(
@@ -315,8 +385,7 @@ fn cachedImageRootfsPath(
         failRunSetup("spore {s}: cached rootfs metadata check failed: {s}", .{ command_name, @errorName(err) });
     };
     if (metadata_matches and try readablePath(init.io, rootfs_path)) {
-        const message = try std.fmt.allocPrint(allocator, "spore {s}: using cached rootfs {s} for {s}\n", .{ command_name, rootfs_path, resolved.ref });
-        try writeSetupStderr(init, message);
+        std.log.debug("spore {s}: using cached rootfs {s} for {s}", .{ command_name, rootfs_path, resolved.ref });
         return rootfs_path;
     }
     return null;
@@ -343,8 +412,7 @@ fn buildCachedImageRootfs(
     defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
     defer Io.Dir.cwd().deleteFile(init.io, temp_metadata_path) catch {};
 
-    const build_message = try std.fmt.allocPrint(allocator, "spore {s}: building cached rootfs for {s}\n", .{ command_name, resolved.ref });
-    try writeSetupStderr(init, build_message);
+    std.log.debug("spore {s}: building cached rootfs for {s}", .{ command_name, resolved.ref });
     _ = rootfs_mod.build(init, allocator, .{
         .ref = resolved.ref,
         .output = temp_rootfs_path,
@@ -358,8 +426,7 @@ fn buildCachedImageRootfs(
     try Io.Dir.renameAbsolute(temp_rootfs_path, rootfs_path, init.io);
     try Io.Dir.renameAbsolute(temp_metadata_path, metadata_path, init.io);
 
-    const cached_message = try std.fmt.allocPrint(allocator, "spore {s}: cached rootfs {s}\n", .{ command_name, rootfs_path });
-    try writeSetupStderr(init, cached_message);
+    std.log.debug("spore {s}: cached rootfs {s}", .{ command_name, rootfs_path });
     return rootfs_path;
 }
 
@@ -384,7 +451,7 @@ fn ensureDirPath(io: Io, path: []const u8) !void {
     existing.close(io);
 }
 
-fn rootfsCacheRootPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+pub fn rootfsCacheRootPath(init: std.process.Init, allocator: std.mem.Allocator, command_name: []const u8) ![]const u8 {
     if (init.environ_map.get(rootfs_cache_env)) |path| {
         return std.fs.path.resolve(allocator, &.{path});
     }
@@ -392,12 +459,163 @@ fn rootfsCacheRootPath(init: std.process.Init, allocator: std.mem.Allocator) ![]
         return std.fs.path.resolve(allocator, &.{ path, "sporevm", "rootfs" });
     }
     const home = init.environ_map.get("HOME") orelse {
-        failRunSetup("spore run: cannot resolve rootfs cache directory; set {s} or HOME", .{rootfs_cache_env});
+        failRunSetup("spore {s}: cannot resolve rootfs cache directory; set {s} or HOME", .{ command_name, rootfs_cache_env });
     };
     if (comptime builtin.os.tag == .macos) {
         return std.fs.path.resolve(allocator, &.{ home, "Library", "Caches", "sporevm", "rootfs" });
     }
     return std.fs.path.resolve(allocator, &.{ home, ".cache", "sporevm", "rootfs" });
+}
+
+pub fn openVerifiedRootfs(init: std.process.Init, allocator: std.mem.Allocator, rootfs: spore.Rootfs, command_name: []const u8) !std.c.fd_t {
+    const cache_root = try rootfsCacheRootPath(init, allocator, command_name);
+    return openVerifiedRootfsFromCache(init.io, allocator, cache_root, rootfs);
+}
+
+fn openVerifiedRootfsFromCache(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, rootfs: spore.Rootfs) !std.c.fd_t {
+    const path = try digestRootfsPath(allocator, cache_root, rootfs.artifact.digest);
+    if (!try regularFileNoSymlink(io, path)) return error.RootFSDigestCacheMiss;
+    const pathz = try allocator.dupeZ(u8, path);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    if (fd < 0) return error.RootFSDigestCacheMiss;
+    errdefer _ = std.c.close(fd);
+    if (!fdIsRegularFile(fd)) return error.RootFSDigestCacheMiss;
+
+    const actual = try hashFd(allocator, fd);
+    if (actual.size != rootfs.artifact.size) return error.RootFSDigestMismatch;
+    if (!std.mem.eql(u8, actual.digest, rootfs.artifact.digest)) return error.RootFSDigestMismatch;
+    if (std.c.lseek(fd, 0, std.c.SEEK.SET) < 0) return error.RootFSOpenFailed;
+    return fd;
+}
+
+fn cacheRootfsByDigest(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    rootfs_path: []const u8,
+) !spore.RootfsArtifactRef {
+    return cacheRootfsByDigestPath(init.io, allocator, cache_root, rootfs_path);
+}
+
+fn cacheRootfsByDigestPath(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    rootfs_path: []const u8,
+) !spore.RootfsArtifactRef {
+    const source = try hashPath(allocator, rootfs_path);
+    const digest_path = try digestRootfsPath(allocator, cache_root, source.digest);
+    const digest_dir = std.fs.path.dirname(digest_path) orelse return error.RootFSOpenFailed;
+    try ensureDirPath(io, digest_dir);
+
+    if (try pathExistsNoSymlink(io, digest_path)) {
+        if (!try regularFileNoSymlink(io, digest_path)) return error.RootFSDigestMismatch;
+    } else {
+        try copyRootfsIntoDigestCache(io, allocator, rootfs_path, digest_path);
+    }
+    const cached = try hashPath(allocator, digest_path);
+    if (cached.size != source.size or !std.mem.eql(u8, cached.digest, source.digest)) return error.RootFSDigestMismatch;
+
+    return .{
+        .digest = source.digest,
+        .size = source.size,
+    };
+}
+
+fn regularFileNoSymlink(io: Io, path: []const u8) !bool {
+    const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+        else => |e| return e,
+    };
+    return stat.kind == .file;
+}
+
+fn pathExistsNoSymlink(io: Io, path: []const u8) !bool {
+    _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+        else => |e| return e,
+    };
+    return true;
+}
+
+const RootfsHash = struct {
+    digest: []const u8,
+    size: u64,
+};
+
+fn hashPath(allocator: std.mem.Allocator, path: []const u8) !RootfsHash {
+    const pathz = try allocator.dupeZ(u8, path);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    if (fd < 0) return error.RootFSOpenFailed;
+    defer _ = std.c.close(fd);
+    return hashFd(allocator, fd);
+}
+
+fn hashFd(allocator: std.mem.Allocator, fd: std.c.fd_t) !RootfsHash {
+    if (!fdIsRegularFile(fd)) return error.RootFSOpenFailed;
+    if (std.c.lseek(fd, 0, std.c.SEEK.SET) < 0) return error.RootFSOpenFailed;
+    var h = Blake3.init(.{});
+    var size: u64 = 0;
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &buf, buf.len);
+        if (n < 0) return error.RootFSOpenFailed;
+        if (n == 0) break;
+        const read_len: usize = @intCast(n);
+        h.update(buf[0..read_len]);
+        size += @intCast(read_len);
+    }
+    var digest: [Blake3.digest_length]u8 = undefined;
+    h.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const digest_text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, &hex });
+    return .{ .digest = digest_text, .size = size };
+}
+
+fn fdIsRegularFile(fd: std.c.fd_t) bool {
+    var stat: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &stat) != 0) return false;
+    return std.c.S.ISREG(stat.mode);
+}
+
+fn digestRootfsPath(allocator: std.mem.Allocator, cache_root: []const u8, digest: []const u8) ![]const u8 {
+    try spore.validateRootfsDigest(digest);
+    const hex = digest[spore.rootfs_digest_prefix.len..];
+    return std.fs.path.join(allocator, &.{ cache_root, "by-digest", "blake3", try std.fmt.allocPrint(allocator, "{s}.ext4", .{hex}) });
+}
+
+fn copyRootfsIntoDigestCache(io: Io, allocator: std.mem.Allocator, source_path: []const u8, digest_path: []const u8) !void {
+    const source_z = try allocator.dupeZ(u8, source_path);
+    const dest_z = try allocator.dupeZ(u8, digest_path);
+    if (std.c.link(source_z, dest_z) == 0) return;
+
+    var temp_nonce_bytes: [8]u8 = undefined;
+    io.random(&temp_nonce_bytes);
+    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ digest_path, temp_nonce });
+    defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+    const temp_z = try allocator.dupeZ(u8, temp_path);
+    const source_fd = std.c.open(source_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    if (source_fd < 0) return error.RootFSOpenFailed;
+    defer _ = std.c.close(source_fd);
+    const dest_fd = std.c.open(temp_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(c_uint, 0o444));
+    if (dest_fd < 0) return error.RootFSOpenFailed;
+    defer _ = std.c.close(dest_fd);
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = std.c.read(source_fd, &buf, buf.len);
+        if (n < 0) return error.RootFSOpenFailed;
+        if (n == 0) break;
+        var done: usize = 0;
+        const read_len: usize = @intCast(n);
+        while (done < read_len) {
+            const written = std.c.write(dest_fd, buf[done..].ptr, read_len - done);
+            if (written <= 0) return error.RootFSOpenFailed;
+            done += @intCast(written);
+        }
+    }
+    if (std.c.fchmod(dest_fd, 0o444) != 0) return error.RootFSOpenFailed;
+    try Io.Dir.renameAbsolute(temp_path, digest_path, io);
 }
 
 fn rootfsCacheKeyAlloc(allocator: std.mem.Allocator, resolved: rootfs_mod.ResolvedImage) ![]u8 {
@@ -578,7 +796,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     const backend = try resolveBackend(opts.backend);
     const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
     const initrd = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
-    const rootfs_fd = try openRootfsDisk(allocator, opts.rootfs_path);
+    const rootfs_fd = try openRootfsForRun(init, allocator, opts.rootfs_path, opts.rootfs);
     defer {
         if (rootfs_fd) |fd| _ = std.c.close(fd);
     }
@@ -605,6 +823,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .initrd = initrd,
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
+                .rootfs = opts.rootfs,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .snapshot_dir = opts.capture_on_abort_path,
@@ -620,6 +839,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .initrd = initrd,
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
+                .rootfs = opts.rootfs,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .snapshot_dir = opts.capture_on_abort_path,
@@ -640,7 +860,7 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
     const backend = try resolveBackend(opts.backend);
     const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
     const initrd = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
-    const rootfs_fd = try openRootfsDisk(allocator, opts.rootfs_path);
+    const rootfs_fd = try openRootfsForRun(init, allocator, opts.rootfs_path, opts.rootfs);
     defer {
         if (rootfs_fd) |fd| _ = std.c.close(fd);
     }
@@ -657,6 +877,7 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
                 .initrd = initrd,
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
+                .rootfs = opts.rootfs,
                 .resume_dir = opts.resume_dir,
                 .ram_restore_mode = .eager_chunks,
                 .exec_control = control,
@@ -680,6 +901,11 @@ fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSOpenFailed;
     return fd;
+}
+
+fn openRootfsForRun(init: std.process.Init, allocator: std.mem.Allocator, rootfs_path: ?[]const u8, rootfs: ?spore.Rootfs) !?std.c.fd_t {
+    if (rootfs) |artifact| return try openVerifiedRootfs(init, allocator, artifact, "run");
+    return openRootfsDisk(allocator, rootfs_path);
 }
 
 pub var console_fd: std.c.fd_t = -1;
@@ -1055,6 +1281,74 @@ test "run image cache treats oversized metadata as a miss" {
         .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .platform = .{},
     }));
+}
+
+test "rootfs digest cache verifies exact bytes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-rootfs-digest-cache";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+
+    const artifact = try cacheRootfsByDigestPath(io, arena, cache_root, rootfs_path);
+    try std.testing.expect(std.mem.startsWith(u8, artifact.digest, spore.rootfs_digest_prefix));
+    try std.testing.expectEqual(@as(u64, "rootfs bytes".len), artifact.size);
+
+    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
+    const fd = try openVerifiedRootfsFromCache(io, arena, cache_root, rootfs);
+    _ = std.c.close(fd);
+
+    const digest_path = try digestRootfsPath(arena, cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
+    try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedRootfsFromCache(io, arena, cache_root, rootfs));
+}
+
+test "rootfs digest cache rejects unsafe existing paths" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-rootfs-digest-cache-symlink";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+
+    const artifact = try cacheRootfsByDigestPath(io, arena, cache_root, rootfs_path);
+    const digest_path = try digestRootfsPath(arena, cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
+    const digest_z = try arena.dupeZ(u8, digest_path);
+    const rootfs_z = try arena.dupeZ(u8, rootfs_path);
+    if (std.c.symlink(rootfs_z, digest_z) != 0) return error.SkipZigTest;
+
+    try std.testing.expectError(error.RootFSDigestMismatch, cacheRootfsByDigestPath(io, arena, cache_root, rootfs_path));
+}
+
+test "rootfs hashing rejects non-file descriptors" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-run-rootfs-fd-regular";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    const tmp_z = try allocator.dupeZ(u8, tmp);
+    defer allocator.free(tmp_z);
+    const fd = std.c.open(tmp_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    if (fd < 0) return error.SkipZigTest;
+    defer _ = std.c.close(fd);
+    try std.testing.expect(!fdIsRegularFile(fd));
+    try std.testing.expectError(error.RootFSOpenFailed, hashFd(allocator, fd));
 }
 
 test "run image cache creates absolute cache directories" {

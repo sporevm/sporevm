@@ -113,6 +113,45 @@ pub const MemoryManifest = struct {
     backing: ?MemoryBacking = null,
 };
 
+pub const rootfs_kind = "immutable-ext4-rootfs-v0";
+pub const rootfs_mode_read_only = "read-only";
+pub const rootfs_device_kind_virtio_mmio = "virtio-mmio";
+pub const rootfs_device_role = "rootfs";
+pub const rootfs_artifact_format_ext4 = "ext4";
+pub const rootfs_digest_prefix = "blake3:";
+pub const rootfs_source_kind_oci_image = "oci-image";
+pub const rootfs_virtio_blk_device_id: u32 = 2;
+
+pub const RootfsDevice = struct {
+    kind: []const u8 = rootfs_device_kind_virtio_mmio,
+    role: []const u8 = rootfs_device_role,
+    virtio_device_id: u32 = rootfs_virtio_blk_device_id,
+    mmio_slot: u32,
+};
+
+pub const RootfsArtifactRef = struct {
+    digest: []const u8,
+    size: u64,
+    format: []const u8 = rootfs_artifact_format_ext4,
+};
+
+pub const RootfsSource = struct {
+    kind: []const u8 = rootfs_source_kind_oci_image,
+    requested_ref: []const u8,
+    resolved_image_ref: []const u8,
+    image_manifest_digest: []const u8,
+    platform: []const u8,
+    builder_version: []const u8,
+};
+
+pub const Rootfs = struct {
+    kind: []const u8 = rootfs_kind,
+    mode: []const u8 = rootfs_mode_read_only,
+    device: RootfsDevice,
+    artifact: RootfsArtifactRef,
+    source: ?RootfsSource = null,
+};
+
 pub const MemoryPlan = struct {
     chunk_size: usize,
     chunk_count: usize,
@@ -132,6 +171,7 @@ pub const Manifest = struct {
     machine: MachineState,
     devices: []TransportState,
     generation: GenerationState,
+    rootfs: ?Rootfs = null,
     memory: MemoryManifest,
 };
 
@@ -226,6 +266,44 @@ pub fn validateMemoryBacking(backing: MemoryBacking, expected_size: u64) Error!v
     if (!std.mem.eql(u8, backing.kind, ram_backing_kind)) return error.BadManifest;
     if (!std.mem.eql(u8, backing.path, ram_backing_path)) return error.BadManifest;
     if (backing.size != expected_size) return error.BadManifest;
+}
+
+pub fn validateRootfs(rootfs: Rootfs, devices: []const TransportState) Error!void {
+    if (!std.mem.eql(u8, rootfs.kind, rootfs_kind)) return error.BadManifest;
+    if (!std.mem.eql(u8, rootfs.mode, rootfs_mode_read_only)) return error.BadManifest;
+    if (!std.mem.eql(u8, rootfs.device.kind, rootfs_device_kind_virtio_mmio)) return error.BadManifest;
+    if (!std.mem.eql(u8, rootfs.device.role, rootfs_device_role)) return error.BadManifest;
+    if (rootfs.device.virtio_device_id != rootfs_virtio_blk_device_id) return error.BadManifest;
+    if (rootfs.device.mmio_slot >= devices.len) return error.BadManifest;
+    if (devices[rootfs.device.mmio_slot].device_id != rootfs_virtio_blk_device_id) return error.BadManifest;
+    if (!std.mem.eql(u8, rootfs.artifact.format, rootfs_artifact_format_ext4)) return error.BadManifest;
+    if (rootfs.artifact.size == 0 or rootfs.artifact.size > std.math.maxInt(usize)) return error.BadManifest;
+    try validateRootfsDigest(rootfs.artifact.digest);
+    if (rootfs.source) |source| try validateRootfsSource(source);
+}
+
+pub fn rootfsQueuesQuiescent(rootfs: Rootfs, devices: []const TransportState) Error!bool {
+    try validateRootfs(rootfs, devices);
+    const device = devices[rootfs.device.mmio_slot];
+    for (device.queues) |queue| {
+        if (queue.ready and queue.last_avail != queue.used_idx) return false;
+    }
+    return true;
+}
+
+pub fn validateRootfsDigest(digest: []const u8) Error!void {
+    if (!std.mem.startsWith(u8, digest, rootfs_digest_prefix)) return error.BadManifest;
+    const hex = digest[rootfs_digest_prefix.len..];
+    _ = chunklib.ChunkId.fromHex(hex) catch return error.BadManifest;
+}
+
+fn validateRootfsSource(source: RootfsSource) Error!void {
+    if (!std.mem.eql(u8, source.kind, rootfs_source_kind_oci_image)) return error.BadManifest;
+    if (source.requested_ref.len == 0) return error.BadManifest;
+    if (source.resolved_image_ref.len == 0) return error.BadManifest;
+    if (source.image_manifest_digest.len == 0) return error.BadManifest;
+    if (source.platform.len == 0) return error.BadManifest;
+    if (source.builder_version.len == 0) return error.BadManifest;
 }
 
 pub fn memoryBackingPath(allocator: std.mem.Allocator, dir: []const u8, backing: MemoryBacking) Error![:0]const u8 {
@@ -673,6 +751,9 @@ fn validateManifest(manifest: Manifest) Error!void {
     if (manifest.memory.backing) |backing| {
         try validateMemoryBacking(backing, manifest.platform.ram_size);
     }
+    if (manifest.rootfs) |rootfs| {
+        try validateRootfs(rootfs, manifest.devices);
+    }
     gicv3.validate(manifest.machine.gic) catch return error.BadManifest;
 }
 
@@ -946,6 +1027,80 @@ test "manifest json round-trip" {
     try std.testing.expectEqual(@as(u64, 7), parsed.value.generation.generation);
 }
 
+fn testTransport(device_id: u32) TransportState {
+    return .{
+        .device_id = device_id,
+        .status = 0,
+        .device_features_sel = 0,
+        .driver_features_sel = 0,
+        .driver_features = 0,
+        .queue_sel = 0,
+        .interrupt_status = 0,
+        .queues = &.{},
+    };
+}
+
+fn testRootfs(mmio_slot: u32) Rootfs {
+    return .{
+        .device = .{ .mmio_slot = mmio_slot },
+        .artifact = .{
+            .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .size = 4096,
+        },
+        .source = .{
+            .requested_ref = "docker.io/library/ruby:3.3",
+            .resolved_image_ref = "docker.io/library/ruby@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .image_manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .platform = "linux/arm64",
+            .builder_version = "sporevm-rootfs-v1",
+        },
+    };
+}
+
+test "manifest rootfs artifact validates transport binding" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
+    var devices = [_]TransportState{
+        testTransport(3),
+        testTransport(rootfs_virtio_blk_device_id),
+    };
+    var manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, 3);
+    manifest.devices = &devices;
+    manifest.rootfs = testRootfs(1);
+
+    try saveManifest(arena, dir, manifest);
+    const parsed = try loadManifest(arena, dir);
+    defer parsed.deinit();
+    const rootfs = parsed.value.rootfs orelse return error.BadManifest;
+    try std.testing.expectEqual(@as(u32, 1), rootfs.device.mmio_slot);
+    try std.testing.expectEqualStrings("blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", rootfs.artifact.digest);
+    try std.testing.expect(try rootfsQueuesQuiescent(rootfs, manifest.devices));
+
+    manifest.rootfs.?.device.mmio_slot = 0;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    manifest.rootfs.?.device.mmio_slot = 1;
+    manifest.rootfs.?.artifact.digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+
+    var pending_queue = [_]QueueState{.{
+        .size = 64,
+        .ready = true,
+        .desc_addr = 0x1000,
+        .avail_addr = 0x2000,
+        .used_addr = 0x3000,
+        .last_avail = 2,
+        .used_idx = 1,
+    }};
+    devices[1].queues = &pending_queue;
+    manifest.rootfs.?.artifact.digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expect(!try rootfsQueuesQuiescent(manifest.rootfs.?, manifest.devices));
+}
+
 const test_fork_line_levels = [_]gicv3.LineLevel{.{ .intid = board.generationIntid(), .asserted = false }};
 
 fn testForkManifest(memory: MemoryManifest, ram_size: u64, initial_generation: u64) Manifest {
@@ -1000,7 +1155,14 @@ test "fork mints child manifests with shared chunks and pending generation" {
     ram[ram.len - 1] = 0x99;
     const memory = try saveMemoryWithBacking(arena, parent_dir, ram);
 
-    try saveManifest(arena, parent_dir, testForkManifest(memory, ram.len, 41));
+    var devices = [_]TransportState{
+        testTransport(3),
+        testTransport(rootfs_virtio_blk_device_id),
+    };
+    var parent_manifest = testForkManifest(memory, ram.len, 41);
+    parent_manifest.devices = &devices;
+    parent_manifest.rootfs = testRootfs(1);
+    try saveManifest(arena, parent_dir, parent_manifest);
 
     const result = try fork(arena, .{ .parent_dir = parent_dir, .out_dir = out_dir, .count = 2 });
     try std.testing.expectEqual(@as(usize, 2), result.count);
@@ -1017,6 +1179,8 @@ test "fork mints child manifests with shared chunks and pending generation" {
     try std.testing.expectEqual(@as(u32, generation.irq_generation_changed), first.value.generation.interrupt_status);
     try std.testing.expect(first.value.generation.params_b64.len > 0);
     try std.testing.expect(first.value.machine.gic.gicv3.?.line_levels[0].asserted);
+    try std.testing.expect(first.value.rootfs != null);
+    try std.testing.expectEqualStrings(parent_manifest.rootfs.?.artifact.digest, first.value.rootfs.?.artifact.digest);
     const first_backing = first.value.memory.backing orelse return error.BadManifest;
     try std.testing.expectEqualStrings(ram_backing_path, first_backing.path);
     const first_backing_path = try memoryBackingPath(arena, first_child_dir, first_backing);
