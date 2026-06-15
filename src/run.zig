@@ -1,4 +1,4 @@
-//! One-shot VM boot/exec support for `spore run` and minimal benchmark tools.
+//! One-shot VM boot/exec support for `spore run`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -14,7 +14,6 @@ else
 const rootfs_mod = @import("rootfs.zig");
 const vsock = @import("virtio/vsock.zig");
 
-const default_command = [_][]const u8{"/bin/true"};
 const max_file_size = 256 * 1024 * 1024;
 const max_guest_argc = 16;
 const max_guest_arg_len = 255;
@@ -89,10 +88,6 @@ const SharedOptions = struct {
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
-
-    fn complete(self: SharedOptions, backend: Backend, command: []const []const u8, stream_output: bool) Options {
-        return self.completeWithAssets(backend, self.kernel_path.?, self.initrd_path.?, null, command, stream_output);
-    }
 
     fn completeWithAssets(
         self: SharedOptions,
@@ -549,31 +544,6 @@ fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
-pub fn parseHarnessArgs(backend: Backend, args: []const []const u8) !Options {
-    var shared = SharedOptions{};
-
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (try parseSharedOption(&shared, args, &i)) {
-            continue;
-        } else if (std.mem.eql(u8, args[i], "-h") or std.mem.eql(u8, args[i], "--help")) {
-            printHarnessUsage(backend);
-            std.process.exit(0);
-        } else {
-            std.debug.print("unknown argument: {s}\n\n", .{args[i]});
-            printHarnessUsage(backend);
-            std.process.exit(2);
-        }
-    }
-
-    if (shared.kernel_path == null or shared.initrd_path == null) {
-        printHarnessUsage(backend);
-        std.process.exit(2);
-    }
-
-    return shared.complete(backend, default_command[0..], false);
-}
-
 pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) !Result {
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
 
@@ -642,22 +612,6 @@ fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSOpenFailed;
     return fd;
-}
-
-pub fn writeJsonResult(writer: *Io.Writer, result: Result) !void {
-    try writer.print(
-        "{{\"backend\":\"{s}\",\"probe\":\"exec\",\"start_ms\":{d},\"vsock_connect_ms\":{d},\"exec_response_ms\":{d},\"probe_duration_ms\":{d},\"exit_code\":{d},\"vcpus\":{d},\"memory_mib\":{d}}}\n",
-        .{
-            result.backend.name(),
-            result.start_ms,
-            result.vsock_connect_ms,
-            result.exec_response_ms,
-            result.probe_duration_ms,
-            result.exit_code,
-            result.vcpus,
-            result.memory_mib,
-        },
-    );
 }
 
 pub var console_fd: std.c.fd_t = -1;
@@ -827,22 +781,6 @@ fn takeValue(args: []const []const u8, i: *usize, name: []const u8) []const u8 {
     }
     i.* += 1;
     return args[i.*];
-}
-
-fn printHarnessUsage(backend: Backend) void {
-    std.debug.print(
-        \\Usage:
-        \\  {s}-minimal --kernel Image --initrd root.cpio [options]
-        \\
-        \\Options:
-        \\  --memory-mib N      Guest memory in MiB (default: 1024)
-        \\  --vcpus N           Guest vCPU count; must be 1 today
-        \\  --guest-port N      Guest vsock listen port (default: 10700)
-        \\  --timeout-ms N      Probe timeout in milliseconds (default: 30000)
-        \\  --console-log PATH  Write guest console output to PATH
-        \\  -h, --help          Show this help
-        \\
-    , .{backend.name()});
 }
 
 test "run request encodes argv" {
@@ -1073,34 +1011,4 @@ test "run default asset paths derive from install prefix" {
     const helper = try sourceTreeKernelHelperPathFromPrefix(allocator, "/repo/zig-out");
     defer allocator.free(helper);
     try std.testing.expectEqualStrings("/repo/scripts/ensure-managed-kernel.sh", helper);
-}
-
-test "run harness parser shares common options" {
-    const opts = try parseHarnessArgs(.kvm, &.{ "kvm-minimal", "--kernel", "Image", "--initrd", "root.cpio", "--memory-mib", "512", "--guest-port", "12000" });
-    try std.testing.expectEqual(Backend.kvm, opts.backend);
-    try std.testing.expectEqualStrings("Image", opts.kernel_path);
-    try std.testing.expectEqualStrings("root.cpio", opts.initrd_path);
-    try std.testing.expectEqual(@as(u64, 512), opts.memory_mib);
-    try std.testing.expectEqual(@as(u32, 12000), opts.guest_port);
-    try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
-}
-
-test "run json result includes benchmark timings" {
-    var stdout: Io.Writer.Allocating = .init(std.testing.allocator);
-    defer stdout.deinit();
-
-    try writeJsonResult(&stdout.writer, .{
-        .backend = .hvf,
-        .start_ms = 1,
-        .vsock_connect_ms = 2,
-        .exec_response_ms = 3,
-        .probe_duration_ms = 1,
-        .exit_code = 0,
-        .vcpus = 1,
-        .memory_mib = 1024,
-    });
-
-    try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "\"exec_response_ms\":3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "\"exit_code\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "\"memory_mib\":1024") != null);
 }

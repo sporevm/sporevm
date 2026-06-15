@@ -132,32 +132,6 @@ pub fn build(b: *std.Build) void {
 
         const boot_step = b.step("hvf-boot", "Build and sign the HVF kernel boot harness");
         boot_step.dependOn(&sign_boot.step);
-
-        const minimal_mod = b.createModule(.{
-            .root_source_file = b.path("src/hvf_minimal.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "sporevm", .module = mod },
-            },
-        });
-        minimal_mod.linkFramework("Hypervisor", .{});
-
-        const minimal_exe = b.addExecutable(.{
-            .name = "hvf-minimal",
-            .root_module = minimal_mod,
-        });
-        const install_minimal = b.addInstallArtifact(minimal_exe, .{});
-
-        const sign_minimal = b.addSystemCommand(&.{
-            "codesign",                            "--sign", "-", "--force", "--entitlements", "spore.entitlements",
-            b.getInstallPath(.bin, "hvf-minimal"),
-        });
-        sign_minimal.step.dependOn(&install_minimal.step);
-
-        const minimal_step = b.step("hvf-minimal", "Build and sign the minimal HVF boot/exec benchmark harness");
-        minimal_step.dependOn(&sign_minimal.step);
     }
 
     // Linux KVM boot harness: host-only, needs /dev/kvm on aarch64 Linux.
@@ -180,24 +154,5 @@ pub fn build(b: *std.Build) void {
 
         const kvm_boot_step = b.step("kvm-boot", "Build the Linux KVM kernel boot harness");
         kvm_boot_step.dependOn(&install_kvm_boot.step);
-
-        const kvm_minimal_mod = b.createModule(.{
-            .root_source_file = b.path("src/kvm_minimal.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "sporevm", .module = mod },
-            },
-        });
-
-        const kvm_minimal_exe = b.addExecutable(.{
-            .name = "kvm-minimal",
-            .root_module = kvm_minimal_mod,
-        });
-        const install_kvm_minimal = b.addInstallArtifact(kvm_minimal_exe, .{});
-
-        const kvm_minimal_step = b.step("kvm-minimal", "Build the minimal KVM boot/exec benchmark harness");
-        kvm_minimal_step.dependOn(&install_kvm_minimal.step);
     }
 }
