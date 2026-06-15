@@ -161,6 +161,20 @@ static int wait_for_path(const char *path, int attempts, int sleep_us) {
   return -1;
 }
 
+static int path_is_dir(const char *path) {
+  struct stat st;
+  return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int mount_if_dir(const char *source, const char *target, const char *fstype, unsigned long flags, const char *data, char *error, size_t cap) {
+  if (!path_is_dir(target)) return 0;
+  if (mount(source, target, fstype, flags, data) != 0 && errno != EBUSY) {
+    snprintf(error, cap, "rootfs runtime mount failed: %s errno=%d", target, errno);
+    return -1;
+  }
+  return 0;
+}
+
 static int setup_rootfs(char *error, size_t cap) {
   mkdir("/mnt", 0755);
   mkdir("/mnt/rootfs", 0755);
@@ -172,6 +186,11 @@ static int setup_rootfs(char *error, size_t cap) {
     snprintf(error, cap, "rootfs mount failed: errno=%d", errno);
     return -1;
   }
+  if (mount_if_dir("devtmpfs", "/mnt/rootfs/dev", "devtmpfs", MS_NOSUID, "", error, cap) != 0) return -1;
+  if (mount_if_dir("proc", "/mnt/rootfs/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, "", error, cap) != 0) return -1;
+  if (mount_if_dir("sysfs", "/mnt/rootfs/sys", "sysfs", MS_RDONLY | MS_NOSUID | MS_NOEXEC | MS_NODEV, "", error, cap) != 0) return -1;
+  if (mount_if_dir("tmpfs", "/mnt/rootfs/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755", error, cap) != 0) return -1;
+  if (mount_if_dir("tmpfs", "/mnt/rootfs/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777", error, cap) != 0) return -1;
   return 0;
 }
 
