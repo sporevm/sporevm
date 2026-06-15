@@ -573,9 +573,13 @@ fn hashFd(allocator: std.mem.Allocator, fd: std.c.fd_t) !RootfsHash {
 }
 
 fn fdIsRegularFile(fd: std.c.fd_t) bool {
-    var stat: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &stat) != 0) return false;
-    return std.c.S.ISREG(stat.mode);
+    if (std.posix.Stat == void) return false;
+    var stat = std.mem.zeroes(std.posix.Stat);
+    const fstat_sym = if (std.posix.lfs64_abi) std.posix.system.fstat64 else std.posix.system.fstat;
+    switch (std.posix.errno(fstat_sym(fd, &stat))) {
+        .SUCCESS => return std.posix.S.ISREG(stat.mode),
+        else => return false,
+    }
 }
 
 fn digestRootfsPath(allocator: std.mem.Allocator, cache_root: []const u8, digest: []const u8) ![]const u8 {
