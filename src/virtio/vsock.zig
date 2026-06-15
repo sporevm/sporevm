@@ -254,6 +254,35 @@ pub const HostStream = struct {
     }
 };
 
+pub const ControlAction = union(enum) {
+    keep_running,
+    stop,
+    snapshot: []const u8,
+};
+
+pub const Wake = struct {
+    context: *anyopaque,
+    wakeFn: *const fn (context: *anyopaque) void,
+
+    pub fn wake(self: Wake) void {
+        self.wakeFn(self.context);
+    }
+};
+
+pub const Control = struct {
+    context: *anyopaque,
+    pollFn: *const fn (context: *anyopaque, dev: *Vsock) anyerror!ControlAction,
+    setWakeFn: *const fn (context: *anyopaque, wake: Wake) void,
+
+    pub fn poll(self: Control, dev: *Vsock) !ControlAction {
+        return self.pollFn(self.context, dev);
+    }
+
+    pub fn setWake(self: Control, wake: Wake) void {
+        self.setWakeFn(self.context, wake);
+    }
+};
+
 fn monotonicMs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
@@ -273,6 +302,10 @@ pub const Vsock = struct {
     pub fn attachHostStream(self: *Vsock, stream: *HostStream) !void {
         self.host_stream = stream;
         try self.enqueueHostConnectRequest(stream);
+    }
+
+    pub fn flushPendingRx(self: *Vsock, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
+        return self.flushRx(&queues[rx_queue], ram);
     }
 
     fn enqueueHostConnectRequest(self: *Vsock, stream: *HostStream) !void {

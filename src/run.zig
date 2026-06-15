@@ -50,6 +50,7 @@ pub const Options = struct {
     kernel_path: []const u8,
     initrd_path: []const u8,
     rootfs_path: ?[]const u8 = null,
+    resume_dir: ?[]const u8 = null,
     command: []const []const u8,
     memory_mib: u64 = 1024,
     vcpus: u32 = 1,
@@ -80,6 +81,16 @@ pub const Result = struct {
     }
 };
 
+pub const MonitorExit = enum {
+    stopped,
+    snapshotted,
+};
+
+pub const MonitorResult = struct {
+    backend: Backend,
+    exit: MonitorExit,
+};
+
 const SharedOptions = struct {
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
@@ -103,6 +114,7 @@ const SharedOptions = struct {
             .kernel_path = kernel_path,
             .initrd_path = initrd_path,
             .rootfs_path = rootfs_path,
+            .resume_dir = null,
             .command = command,
             .memory_mib = self.memory_mib,
             .vcpus = self.vcpus,
@@ -243,15 +255,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
 }
 
 fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parsed: CliOptions) !Options {
-    const rootfs_path = if (parsed.image_ref) |image_ref|
-        try resolveImageRootfs(init, allocator, image_ref)
-    else
-        parsed.rootfs_path;
-    if (rootfs_path) |path| {
-        if (!try readablePath(init.io, path)) {
-            failRunSetup("spore run: rootfs not found: {s}", .{path});
-        }
-    }
+    const rootfs_path = try resolveRootfsInput(init, allocator, parsed.rootfs_path, parsed.image_ref, "run");
     const kernel_path = parsed.shared.kernel_path orelse try resolveDefaultKernelPath(init, allocator);
     const initrd_path = parsed.shared.initrd_path orelse try resolveDefaultInitrdPath(init, allocator);
     var opts = parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs_path, parsed.command, true);
@@ -260,19 +264,41 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     return opts;
 }
 
-fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8) ![]const u8 {
+pub fn resolveRootfsInput(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    rootfs_path: ?[]const u8,
+    image_ref: ?[]const u8,
+    command_name: []const u8,
+) !?[]const u8 {
+    if (rootfs_path != null and image_ref != null) {
+        failRunSetup("spore {s}: --rootfs and --image are mutually exclusive", .{command_name});
+    }
+    const resolved = if (image_ref) |ref|
+        try resolveImageRootfs(init, allocator, ref, command_name)
+    else
+        rootfs_path;
+    if (resolved) |path| {
+        if (!try readablePath(init.io, path)) {
+            failRunSetup("spore {s}: rootfs not found: {s}", .{ command_name, path });
+        }
+    }
+    return resolved;
+}
+
+fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8, command_name: []const u8) ![]const u8 {
     const cache_root = try rootfsCacheRootPath(init, allocator);
     try ensureDirPath(init.io, cache_root);
 
     if (try rootfs_mod.digestPinnedImageIdentity(allocator, image_ref, direct_image_platform)) |digest_pinned| {
-        if (try cachedImageRootfsPath(init, allocator, cache_root, digest_pinned)) |path| return path;
+        if (try cachedImageRootfsPath(init, allocator, cache_root, digest_pinned, command_name)) |path| return path;
     }
 
     const resolved = rootfs_mod.resolveImageRef(init, allocator, image_ref, direct_image_platform) catch |err| {
-        failRunSetup("spore run: image resolve failed for {s}: {s}", .{ image_ref, @errorName(err) });
+        failRunSetup("spore {s}: image resolve failed for {s}: {s}", .{ command_name, image_ref, @errorName(err) });
     };
-    if (try cachedImageRootfsPath(init, allocator, cache_root, resolved)) |path| return path;
-    return buildCachedImageRootfs(init, allocator, cache_root, resolved);
+    if (try cachedImageRootfsPath(init, allocator, cache_root, resolved, command_name)) |path| return path;
+    return buildCachedImageRootfs(init, allocator, cache_root, resolved, command_name);
 }
 
 fn cachedImageRootfsPath(
@@ -280,15 +306,16 @@ fn cachedImageRootfsPath(
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     resolved: rootfs_mod.ResolvedImage,
+    command_name: []const u8,
 ) !?[]const u8 {
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
     const metadata_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
     const metadata_matches = cachedRootfsMetadataMatches(init.io, allocator, metadata_path, resolved) catch |err| {
-        failRunSetup("spore run: cached rootfs metadata check failed: {s}", .{@errorName(err)});
+        failRunSetup("spore {s}: cached rootfs metadata check failed: {s}", .{ command_name, @errorName(err) });
     };
     if (metadata_matches and try readablePath(init.io, rootfs_path)) {
-        const message = try std.fmt.allocPrint(allocator, "spore run: using cached rootfs {s} for {s}\n", .{ rootfs_path, resolved.ref });
+        const message = try std.fmt.allocPrint(allocator, "spore {s}: using cached rootfs {s} for {s}\n", .{ command_name, rootfs_path, resolved.ref });
         try writeSetupStderr(init, message);
         return rootfs_path;
     }
@@ -300,6 +327,7 @@ fn buildCachedImageRootfs(
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     resolved: rootfs_mod.ResolvedImage,
+    command_name: []const u8,
 ) ![]const u8 {
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
@@ -315,7 +343,7 @@ fn buildCachedImageRootfs(
     defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
     defer Io.Dir.cwd().deleteFile(init.io, temp_metadata_path) catch {};
 
-    const build_message = try std.fmt.allocPrint(allocator, "spore run: building cached rootfs for {s}\n", .{resolved.ref});
+    const build_message = try std.fmt.allocPrint(allocator, "spore {s}: building cached rootfs for {s}\n", .{ command_name, resolved.ref });
     try writeSetupStderr(init, build_message);
     _ = rootfs_mod.build(init, allocator, .{
         .ref = resolved.ref,
@@ -325,12 +353,12 @@ fn buildCachedImageRootfs(
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
     }) catch |err| {
-        failRunSetup("spore run: image rootfs build failed for {s}: {s}", .{ resolved.ref, @errorName(err) });
+        failRunSetup("spore {s}: image rootfs build failed for {s}: {s}", .{ command_name, resolved.ref, @errorName(err) });
     };
     try Io.Dir.renameAbsolute(temp_rootfs_path, rootfs_path, init.io);
     try Io.Dir.renameAbsolute(temp_metadata_path, metadata_path, init.io);
 
-    const cached_message = try std.fmt.allocPrint(allocator, "spore run: cached rootfs {s}\n", .{rootfs_path});
+    const cached_message = try std.fmt.allocPrint(allocator, "spore {s}: cached rootfs {s}\n", .{ command_name, rootfs_path });
     try writeSetupStderr(init, cached_message);
     return rootfs_path;
 }
@@ -422,7 +450,7 @@ fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
     return std.mem.eql(u8, actual, expected);
 }
 
-fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+pub fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
     if (init.environ_map.get("SPOREVM_KERNEL_IMAGE")) |path| {
         if (!try readablePath(init.io, path)) {
             failRunSetup("spore run: SPOREVM_KERNEL_IMAGE not found: {s}", .{path});
@@ -464,7 +492,7 @@ fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Allocator
     );
 }
 
-fn resolveDefaultInitrdPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+pub fn resolveDefaultInitrdPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
     if (init.environ_map.get("SPOREVM_RUN_INITRD")) |path| {
         if (!try readablePath(init.io, path)) {
             failRunSetup("spore run: SPOREVM_RUN_INITRD not found: {s}", .{path});
@@ -606,6 +634,46 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     };
 }
 
+pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {
+    if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
+
+    const backend = try resolveBackend(opts.backend);
+    const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
+    const initrd = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
+    const rootfs_fd = try openRootfsDisk(allocator, opts.rootfs_path);
+    defer {
+        if (rootfs_fd) |fd| _ = std.c.close(fd);
+    }
+    const boot_args = try cmdline(allocator, opts.guest_port, opts.rootfs_path != null);
+
+    const cause = switch (backend) {
+        .auto => unreachable,
+        .hvf => blk: {
+            if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
+            break :blk try hvf.vm.run(allocator, .{
+                .kernel = kernel,
+                .ram_size = opts.memory_mib * 1024 * 1024,
+                .cmdline = boot_args,
+                .initrd = initrd,
+                .console_sink = consoleSink,
+                .disk_fd = rootfs_fd,
+                .resume_dir = opts.resume_dir,
+                .ram_restore_mode = .eager_chunks,
+                .exec_control = control,
+            });
+        },
+        .kvm => {
+            if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
+            return error.UnsupportedMonitorBackend;
+        },
+    };
+    return switch (cause) {
+        .monitor_stopped => .{ .backend = backend, .exit = .stopped },
+        .snapshotted => .{ .backend = backend, .exit = .snapshotted },
+        else => error.MonitorDidNotStopCleanly,
+    };
+}
+
 fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.c.fd_t {
     const path = rootfs_path orelse return null;
     const pathz = try allocator.dupeZ(u8, path);
@@ -656,13 +724,17 @@ pub fn closeConsoleLog() void {
 }
 
 pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
+    return execRequestWithSession(allocator, argv, "default");
+}
+
+pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8) ![]const u8 {
     try validateGuestArgv(argv);
     const payload = struct {
         type: []const u8 = "start",
-        session_id: []const u8 = "default",
+        session_id: []const u8,
         argv: []const []const u8,
         closed_env: bool = true,
-    }{ .argv = argv };
+    }{ .session_id = session_id, .argv = argv };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
     if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
@@ -787,6 +859,12 @@ test "run request encodes argv" {
     const request = try execRequest(std.testing.allocator, &.{ "/bin/echo", "hello world" });
     defer std.testing.allocator.free(request);
     try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"argv\":[\"/bin/echo\",\"hello world\"],\"closed_env\":true}\n", request);
+}
+
+test "run request can encode explicit session id" {
+    const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42");
+    defer std.testing.allocator.free(request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"argv\":[\"/bin/true\"],\"closed_env\":true}\n", request);
 }
 
 test "run request rejects guest argv count overflow" {

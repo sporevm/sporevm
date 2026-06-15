@@ -64,9 +64,11 @@ pub const Config = struct {
     /// Optional minimal host-initiated vsock stream used by benchmark harnesses.
     exec_probe: ?*vsock.HostStream = null,
     exec_probe_timeout_ms: u64 = 30_000,
+    /// Optional monitor control hook for attaching host streams after boot.
+    exec_control: ?vsock.Control = null,
 };
 
-pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete };
+pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete, monitor_stopped };
 
 pub const DirtyTrackingOptions = struct {
     enabled: bool = false,
@@ -213,6 +215,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     }
     transports_buf[transport_count] = mmio.Transport.init(net_dev.device());
     transport_count += 1;
+    const vsock_transport_index = transport_count;
     transports_buf[transport_count] = mmio.Transport.init(vsock_dev.device());
     transport_count += 1;
     transports_buf[transport_count] = mmio.Transport.init(rng_dev.device());
@@ -229,6 +232,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         request_capture.setWake(wakeCaptureVcpu, &vcpu);
     }
     defer if (config.capture_request) |request_capture| request_capture.clearWake();
+    if (config.exec_control) |control| {
+        control.setWake(.{ .context = &vcpu, .wakeFn = wakeVcpu });
+    }
 
     try hvf.check(hvf.hv_vcpu_set_sys_reg(vcpu, .mpidr_el1, 0x8000_0000), "set mpidr"); // aff 0, RES1
     var vcpu_redist_base: hvf.Ipa = 0;
@@ -350,6 +356,24 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
 
     // Run loop.
     while (true) {
+        if (config.exec_control) |control| {
+            switch (try control.poll(&vsock_dev)) {
+                .keep_running => {},
+                .stop => return .monitor_stopped,
+                .snapshot => |dir| {
+                    try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, ram_bytes, .{
+                        .dist_base = dist_base,
+                        .redist_base = vcpu_redist_base,
+                        .ram_size = config.ram_size,
+                    }, if (dirty_tracker) |*tracker| tracker else null);
+                    return .snapshotted;
+                },
+            }
+            if (vsock_dev.flushPendingRx(&transports_buf[vsock_transport_index].queues, ram)) {
+                transports_buf[vsock_transport_index].interrupt_status |= 1;
+                try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(@intCast(vsock_transport_index)), true), "raise vsock spi");
+            }
+        }
         if (config.exec_probe) |probe| {
             if (probe.state == .failed) return error.VsockProbeFailed;
             if (probe.state == .complete) return .probe_complete;
@@ -472,6 +496,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     if (request_capture.isAbortRequested()) return error.CaptureAborted;
                     if (request_capture.isRequested()) continue;
                 }
+                if (config.exec_control != null) continue;
                 return error.VcpuCanceled;
             },
             else => {
@@ -1104,6 +1129,11 @@ fn raiseGenerationIrqIfPending(gen_dev: *const generation.Device) !void {
     if (gen_dev.interrupt_status & generation.irq_generation_changed != 0) {
         try hvf.check(hvf.hv_gic_set_spi(board.generationIntid(), true), "generation raise spi");
     }
+}
+
+fn wakeVcpu(context: *anyopaque) void {
+    const vcpu: *hvf.VcpuHandle = @ptrCast(@alignCast(context));
+    _ = hvf.hv_vcpus_exit(@ptrCast(vcpu), 1);
 }
 
 /// Drain pending bytes from non-blocking stdin into the console rx queue.

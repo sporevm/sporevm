@@ -103,6 +103,7 @@ struct replay_buffer {
 struct session {
   int started;
   int exited;
+  char session_id[64];
   pid_t pid;
   int stdout_fd;
   int stderr_fd;
@@ -430,6 +431,7 @@ enum request_kind {
 
 struct run_request {
   enum request_kind kind;
+  char session_id[64];
   uint64_t stdout_offset;
   uint64_t stderr_offset;
   char arg_storage[MAX_ARGC][MAX_ARG_LEN];
@@ -480,10 +482,15 @@ static int parse_request(const char *req, struct run_request *out) {
     }
   }
 
-  char session_id[64];
-  int session_rc = parse_string_field(req, "session_id", session_id, sizeof(session_id));
+  char req_session_id[64];
+  int session_rc = parse_string_field(req, "session_id", req_session_id, sizeof(req_session_id));
   if (session_rc < 0) return -1;
-  if (session_rc > 0 && strcmp(session_id, SESSION_ID) != 0) return -1;
+  if (session_rc > 0) {
+    if (req_session_id[0] == '\0') return -1;
+    snprintf(out->session_id, sizeof(out->session_id), "%s", req_session_id);
+  } else {
+    snprintf(out->session_id, sizeof(out->session_id), "%s", SESSION_ID);
+  }
 
   uint64_t offset = 0;
   int stdout_rc = parse_u64_field(req, "stdout_offset", &offset);
@@ -505,7 +512,7 @@ static int send_error_exit(int fd, int code, const char *message) {
   return send_exit_frame(fd, code);
 }
 
-static int start_session(struct session *session, char *const argv[], int use_rootfs) {
+static int start_session(struct session *session, const char *session_id, char *const argv[], int use_rootfs) {
   t_command_start = now_ms();
   int stdout_pipe[2];
   int stderr_pipe[2];
@@ -555,12 +562,25 @@ static int start_session(struct session *session, char *const argv[], int use_ro
 
   memset(session, 0, sizeof(*session));
   session->started = 1;
+  snprintf(session->session_id, sizeof(session->session_id), "%s", session_id);
   session->pid = pid;
   session->stdout_fd = stdout_pipe[0];
   session->stderr_fd = stderr_pipe[0];
   session->stdout_open = 1;
   session->stderr_open = 1;
   return 0;
+}
+
+static int session_finished(const struct session *session) {
+  return session->started && session->exited && !session->stdout_open && !session->stderr_open;
+}
+
+static void reset_session(struct session *session) {
+  if (session->stdout_fd >= 0) close(session->stdout_fd);
+  if (session->stderr_fd >= 0) close(session->stderr_fd);
+  memset(session, 0, sizeof(*session));
+  session->stdout_fd = -1;
+  session->stderr_fd = -1;
 }
 
 static int replay_available(const struct replay_buffer *replay, uint64_t offset, uint64_t end_offset) {
@@ -706,16 +726,23 @@ static void accept_request(int listener, struct session *session, struct client 
 
   if (request.kind == REQUEST_START) {
     if (session->started) {
-      (void)send_error_exit(client->fd, 2, "spore run: session already started\n");
-      close_client(client);
-      return;
+      if (strcmp(request.session_id, session->session_id) == 0) {
+        (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
+        return;
+      }
+      if (!session_finished(session)) {
+        (void)send_error_exit(client->fd, 2, "spore run: session already started\n");
+        close_client(client);
+        return;
+      }
+      reset_session(session);
     }
     if (use_rootfs && !rootfs_ready) {
       (void)send_error_exit(client->fd, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
       close_client(client);
       return;
     }
-    int rc = start_session(session, request.argv, use_rootfs);
+    int rc = start_session(session, request.session_id, request.argv, use_rootfs);
     if (rc != 0) {
       (void)send_error_exit(client->fd, rc, "spore run: exec setup failed\n");
       close_client(client);
@@ -726,7 +753,7 @@ static void accept_request(int listener, struct session *session, struct client 
     return;
   }
 
-  if (!session->started) {
+  if (!session->started || strcmp(request.session_id, session->session_id) != 0) {
     (void)send_error_exit(client->fd, 2, "spore run: no session\n");
     close_client(client);
     return;

@@ -3,6 +3,8 @@ status: active
 last_reviewed: 2026-06-15
 related_plans:
   - buildkite/cleanroom: docs/plans/sandbox-suspend-wake.md
+  - docs/plans/run-bridge.md
+  - docs/plans/lifecycle-monitor.md
 ---
 
 # SporeVM Foundation Plan
