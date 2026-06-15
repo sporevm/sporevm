@@ -1,7 +1,7 @@
 //! The `spore` CLI.
 //!
-//! Temporary narrow surface. Create/suspend/resume land with later lifecycle
-//! slices; see docs/plans/foundation.md.
+//! `spore run` is the one-shot path. Named VM lifecycle commands grow in
+//! monitor-backed slices; see docs/plans/lifecycle-monitor.md.
 
 const std = @import("std");
 const Io = std.Io;
@@ -15,6 +15,12 @@ const usage =
     \\  run [--kernel Image] [--initrd root.cpio] -- <argv...>
     \\                      Boot a throwaway VM and run one command
     \\  resume <spore-dir>  Resume one captured or forked spore
+    \\  create NAME [options]
+    \\                      Create a named VM lifecycle target
+    \\  exec NAME -- <argv...>
+    \\                      Execute a command in a named VM
+    \\  rm NAME             Remove a named VM
+    \\  ls                  List named VMs in the local runtime registry
     \\  version             Print the sporevm version
     \\  host-info           Print this host's platform facts as JSON
     \\  inspect <spore-dir> Print a spore manifest summary as JSON
@@ -49,6 +55,14 @@ pub fn main(init: std.process.Init) !void {
         try sporevm.run.cli(init, args[2..], stdout);
     } else if (std.mem.eql(u8, command, "resume")) {
         try sporevm.resume_cmd.cli(init, args[2..], stdout);
+    } else if (std.mem.eql(u8, command, "create")) {
+        try sporevm.lifecycle.createCli(init, args[2..], stdout);
+    } else if (std.mem.eql(u8, command, "exec")) {
+        try sporevm.lifecycle.execCli(init, args[2..], stdout);
+    } else if (std.mem.eql(u8, command, "rm")) {
+        try sporevm.lifecycle.rmCli(init, args[2..], stdout);
+    } else if (std.mem.eql(u8, command, "ls")) {
+        try sporevm.lifecycle.lsCli(init, args[2..], stdout);
     } else if (std.mem.eql(u8, command, "version")) {
         try stdout.print("spore {s}\n", .{sporevm.version});
     } else if (std.mem.eql(u8, command, "host-info")) {
@@ -218,6 +232,10 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "rootfs") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "run") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "exec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "rm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "ls") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "version") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "host-info") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "inspect") != null);
