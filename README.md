@@ -64,6 +64,9 @@ mise exec -- zig build hvf-gic-probe # probe HVF GICv3 portable-state support
 mise exec -- zig build kvm-boot   # build the KVM kernel boot harness on Linux/aarch64
 ```
 
+`zig build` also installs the minimal exec initrd used by `spore run`, so the
+host needs `cpio` available in `PATH`.
+
 The `hvf-boot` and `kvm-boot` harnesses accept `--initrd root.cpio` for
 diskless smoke workloads (`rdinit=/init` by default when no disk is supplied).
 The smoke scripts auto-download pinned `cleanroom-kernels` assets and cache

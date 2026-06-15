@@ -20,6 +20,11 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -ne 1 ]]; then
   [[ $# -eq 1 ]] && exit 0 || exit 2
 fi
 
+if ! command -v cpio >/dev/null 2>&1; then
+  echo "error: cpio is required to build the minimal exec initrd" >&2
+  exit 1
+fi
+
 out="$1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
