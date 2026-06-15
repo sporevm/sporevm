@@ -8,7 +8,6 @@ spec_refs:
   - src/run.zig
   - src/rootfs.zig
   - scripts/make-minimal-exec-initrd.sh
-  - scripts/ensure-managed-kernel.sh
   - scripts/smoke-counter-fanout.sh
 related_plans:
   - docs/plans/foundation.md
@@ -100,9 +99,9 @@ same-class host flow remain separate work.
   request. When omitted, the CLI resolves default run assets before boot.
 - Backend selection already defaults to `auto`, resolving to HVF on Darwin
   arm64 and KVM on Linux/aarch64.
-- `scripts/ensure-managed-kernel.sh run` resolves, downloads, verifies, and
-  caches the managed cleanroom-kernels SporeVM run kernel. The run kernel
-  combines initrd boot with virtio-blk and ext4 support.
+- `spore` resolves, downloads, verifies, and caches the managed
+  cleanroom-kernels SporeVM run kernel. The run kernel combines initrd boot
+  with virtio-blk and ext4 support.
 - `scripts/make-minimal-exec-initrd.sh` builds a tiny initrd with the guest
   exec agent and fixed helper binaries.
 - `zig build` installs that minimal exec initrd at
@@ -645,11 +644,11 @@ interleaved counters from the same captured process state.
 
 ### Resolved Slice A Defaults
 
-- Managed kernel resolver: start by reusing the existing
-  `scripts/ensure-managed-kernel.sh` behavior for the worktree/dev build, but
-  keep the dependency explicit and fail with a clear error if the helper is not
-  available. Do not present this as a packaged single-binary behavior until the
-  resolver is moved into Zig or installed as a supported helper.
+- Managed kernel resolver: implemented in `spore` rather than a repo-local
+  shell helper. Keep `SPOREVM_KERNEL_IMAGE` as the explicit local override;
+  `SPOREVM_KERNEL_REPOSITORY`, `SPOREVM_KERNEL_RELEASE`,
+  `SPOREVM_KERNEL_VERSION`, and `SPOREVM_KERNEL_CACHE_DIR` remain escape
+  hatches for the managed kernel.
 - Minimal exec initrd: prefer a build-installed artifact over first-use
   generation. `zig build` should leave the default initrd somewhere `spore run`
   can locate from `zig-out/bin/spore`, while `SPOREVM_RUN_INITRD` remains the

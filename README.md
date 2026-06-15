@@ -87,6 +87,7 @@ Useful task split:
 ```bash
 mise run test
 mise run build
+mise run install
 mise run smoke:run
 mise run smoke:run-capture
 mise run smoke:resume
@@ -95,6 +96,8 @@ mise run smoke:rootfs-fanout
 ```
 
 `mise run check` runs unit tests, the product build, and diff hygiene.
+`mise run install` builds an optimized `spore` and installs it into `~/bin`,
+with runtime assets under `~/share/sporevm`.
 `mise run smoke` builds once, then runs product run, run-capture, and resume
 smokes. `smoke:counter-fanout` and `smoke:rootfs-fanout` are opt-in demo
 smokes; the rootfs fan-out smoke builds a published Ruby OCI image and resumes
@@ -115,7 +118,9 @@ zig-out/bin/spore run -- /bin/writeout
 ```
 
 `spore run` defaults to the managed SporeVM run kernel and the minimal exec
-initrd installed by `zig build`. Override the boot assets with `--kernel` and
+initrd installed by `zig build` or `mise run install`. The managed kernel is
+downloaded and SHA256-verified by `spore` itself, then cached under the
+platform cache directory. Override the boot assets with `--kernel` and
 `--initrd`, or set `SPOREVM_KERNEL_IMAGE` and `SPOREVM_RUN_INITRD`.
 
 Pass `--debug` before the command, for example `spore --debug run ...`, to show
