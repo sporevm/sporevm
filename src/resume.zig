@@ -11,6 +11,7 @@ else
     struct {};
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
+const virtio_blk = @import("virtio/blk.zig");
 
 pub const Backend = run_mod.Backend;
 
@@ -78,6 +79,10 @@ pub fn execute(allocator: std.mem.Allocator, opts: Options) !void {
     const parsed = try spore.loadManifest(allocator, opts.spore_dir);
     defer parsed.deinit();
 
+    if (requiresExternalDisk(parsed.value.devices)) {
+        failResumeSetup("spore resume: disk-backed spores are not supported by the product CLI yet; use the backend harness with --disk and the original backing disk", .{});
+    }
+
     const backend = try resolveBackend(opts.backend);
     const ram_size = resumeRamSize(parsed.value.platform);
     const cause = switch (backend) {
@@ -128,6 +133,18 @@ fn resumeRamSize(platform: spore.Platform) u64 {
     return platform.ram_size;
 }
 
+fn requiresExternalDisk(devices: []const spore.TransportState) bool {
+    for (devices) |device| {
+        if (device.device_id == virtio_blk.device_id) return true;
+    }
+    return false;
+}
+
+fn failResumeSetup(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print(fmt ++ "\n", args);
+    std.process.exit(2);
+}
+
 test "resume cli parser accepts one spore dir" {
     const opts = try parseCliArgs(&.{ "--backend", "hvf", "child.spore" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
@@ -145,4 +162,30 @@ test "resume memory defaults to manifest ram size" {
         .counter_frequency_hz = 24_000_000,
     };
     try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), resumeRamSize(platform));
+}
+
+test "resume rejects manifests that require an external disk" {
+    const disk_device = spore.TransportState{
+        .device_id = virtio_blk.device_id,
+        .status = 0,
+        .device_features_sel = 0,
+        .driver_features_sel = 0,
+        .driver_features = 0,
+        .queue_sel = 0,
+        .interrupt_status = 0,
+        .queues = &.{},
+    };
+    const console_device = spore.TransportState{
+        .device_id = 3,
+        .status = 0,
+        .device_features_sel = 0,
+        .driver_features_sel = 0,
+        .driver_features = 0,
+        .queue_sel = 0,
+        .interrupt_status = 0,
+        .queues = &.{},
+    };
+
+    try std.testing.expect(requiresExternalDisk(&.{ console_device, disk_device }));
+    try std.testing.expect(!requiresExternalDisk(&.{console_device}));
 }

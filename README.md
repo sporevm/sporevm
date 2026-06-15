@@ -92,7 +92,9 @@ Fork an already-captured spore with
 named `000000`, `000001`, and so on, and share the parent's chunk store.
 Resume one captured or forked spore with
 `zig-out/bin/spore resume /tmp/forks/000000`; product resume streams the
-restored guest console and defaults RAM size from the spore manifest.
+restored guest console and defaults RAM size from the spore manifest. Product
+resume currently supports diskless spores; disk-backed restore still needs the
+backend harness plus the original backing disk.
 Pack a spore into the first local distribution format with
 `zig-out/bin/spore pack /tmp/spore --out /tmp/spore.bundle`; unpack it back
 into a normal spore directory with
