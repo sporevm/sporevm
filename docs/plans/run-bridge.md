@@ -20,13 +20,14 @@ related_plans:
 `spore run` is the product bridge between the low-level VMM foundation and a
 user-visible "run a command" experience. It should stay narrower than a full
 container runtime: boot a supported aarch64 Linux guest, send one explicit argv
-request over vsock, return bounded stdout/stderr and the command status, and
+request over vsock, stream stdout/stderr, return the command status, and
 fail closed when required boot assets or workload inputs are unsupported.
 
-The current implementation proves the host/guest control path with explicit
-local kernel and initrd paths. This plan makes that primitive useful in stages:
-first remove manual boot-asset setup, then attach a read-only rootfs disk and
-exec from it, then connect the existing OCI-to-ext4 builder to `run`.
+The current implementation proves the host/guest control path with default run
+assets, read-only rootfs execution, and direct OCI image cache convenience. The
+next bridge is lifecycle: turn the harness-only capture/resume path into a
+product surface that can run a long-lived process, capture it on a host signal,
+fork it, and resume each child through `spore resume`.
 
 The first OCI-capable milestone is intentionally two-step:
 
@@ -35,7 +36,7 @@ spore rootfs build docker.io/library/alpine:3.20 --platform linux/arm64 --output
 spore run --rootfs alpine.ext4 -- /bin/echo hi
 ```
 
-Direct image references come later through an explicit flag:
+Direct image references stay explicit through a flag:
 
 ```console
 spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
@@ -47,20 +48,23 @@ plan boundary that consumers own image policy.
 
 ## Problem
 
-The current `spore run` command is useful for proving the VMM path, but it is
-awkward as a product surface:
+The current `spore run` and `spore resume` commands are good enough for short
+fresh runs and explicit single-spore resumes, but the lifecycle still stops
+short of host-triggered capture:
 
-- users must manually resolve a managed kernel path;
-- users must manually build and pass the minimal exec initrd;
-- only binaries packed into that initrd can run;
-- there is no way for `run` to attach a rootfs disk even though the boot
-  harnesses and backends already support virtio-blk;
-- `spore rootfs build` can materialize an OCI image into ext4, but that output
-  is not yet consumable by `spore run`.
+- `spore run` has no host-triggered capture path. Backend run loops can
+  snapshot after a fixed delay, but not when the operator sends Ctrl-C or
+  another host signal.
+- fresh `spore run` streams stdout/stderr, but the capture path still needs to
+  request a snapshot from a safe backend loop point without corrupting in-flight
+  vsock/device state;
+- the run-vsock stream is part of captured virtio state, and the KVM snapshot
+  path already rejects snapshots while vsock has pending packets, so capture
+  must be driven from a safe run-loop point rather than directly from a signal
+  handler.
 
-Without a run bridge plan, it is easy to overcorrect in either direction:
-spend too long polishing the toy initrd path, or jump straight to broad OCI
-runtime semantics that the foundation plan says SporeVM should not own.
+Without this next bridge, the fork/fan-out thesis remains demonstrable through
+harnesses but awkward from the product CLI.
 
 ## Goals
 
@@ -77,8 +81,8 @@ runtime semantics that the foundation plan says SporeVM should not own.
 - Connect OCI to `run` first through the existing deterministic ext4 builder.
 - Keep direct OCI image support as cache/build orchestration, not a full OCI
   runtime contract.
-- Keep all asset setup messages on stderr so `--json` remains machine-readable
-  on stdout.
+- Keep asset setup messages off guest stdout so normal command output remains
+  usable in shell pipelines.
 
 ## Non-Goals
 
@@ -106,7 +110,9 @@ runtime semantics that the foundation plan says SporeVM should not own.
   exec agent and fixed helper binaries.
 - `zig build` installs that minimal exec initrd at
   `share/sporevm/minimal-exec-initrd.cpio`.
-- The run output slice adds bounded stdout/stderr to the exit frame.
+- Fresh `spore run` streams stdout/stderr over a small typed vsock frame
+  protocol and exits with the guest command status. The product CLI rejects the
+  old `--json` final-frame mode.
 - `spore run --rootfs rootfs.ext4 -- <argv...>` attaches an ext4 rootfs
   read-only through the existing virtio-blk device and chroots before exec.
 - `spore rootfs build` already materializes OCI images into deterministic ext4
@@ -117,6 +123,16 @@ runtime semantics that the foundation plan says SporeVM should not own.
 - `spore run --image REF -- <argv...>` resolves REF to a digest-pinned
   linux/arm64 image identity, builds or reuses a cached ext4 rootfs, and then
   delegates to the same read-only `--rootfs` execution path.
+- Harness capture remains real on both backends through `snapshot_after_ms`,
+  including eager, lazy, and trusted local RAM backing modes. Host-signalled
+  capture from `spore run` is still pending.
+- Product `spore resume SPORE` now promotes the backend resume path for one
+  spore at a time and defaults RAM size from `manifest.platform.ram_size`.
+- The minimal exec agent has an offset-aware attach/replay request shape for a
+  future resume-aware run stream, but product resume does not depend on it yet.
+- Product `spore resume` can stream the guest console through the existing
+  backend console sink, but it cannot assume the host-side run-vsock stream
+  from a captured `spore run` still exists after restore.
 
 ## Target Model
 
@@ -124,7 +140,6 @@ runtime semantics that the foundation plan says SporeVM should not own.
 
 ```console
 spore run -- /bin/writeout
-spore run --json -- /bin/writeout
 spore run --kernel Image --initrd minimal.cpio -- /bin/writeout
 ```
 
@@ -138,6 +153,13 @@ When kernel or initrd are omitted, `run` resolves default run assets:
 The default initrd is a developer/product bridge, not the future rootfs.
 Commands only work if they are present inside the initrd.
 
+Fresh `spore run` uses one host-initiated vsock connection for the request and
+for the command result stream. The streaming protocol should be deliberately
+small: typed, length-prefixed frames for stdout, stderr, and exit status are
+enough. The host writes stdout frames to stdout and stderr frames to stderr as
+they arrive, then exits with the exit frame's code. The old single JSON exit
+frame is not a compatibility boundary before 1.0.
+
 ### Rootfs Run
 
 ```console
@@ -147,7 +169,7 @@ spore run --kernel Image --initrd minimal.cpio --rootfs rootfs.ext4 -- /bin/echo
 
 The host attaches the rootfs ext4 image as virtio-blk. The initrd agent mounts
 it read-only, sets up the minimum guest runtime required to exec an explicit
-argv from that filesystem, and returns the same stdout/stderr/status frame.
+argv from that filesystem, and uses the same stdout/stderr/status stream.
 
 The first rootfs version runs as root with a closed env, unless the current
 `run` contract has already gained explicit env support by then. OCI user,
@@ -223,13 +245,18 @@ default `--capture-on-abort` behavior is to write the spore and exit. Future
 policy can add `--after-capture exit|continue|pause`, but the Ruby counter demo
 and CI fan-out proof only need capture-then-exit.
 
-Streaming output is part of this same surface. The current one-shot exec agent
-captures bounded stdout/stderr and sends it only in the final exit frame; that
-is fine for short commands but invisible for a long-lived process that is going
-to be captured before it exits. `spore run --capture-on-abort ...` should tee
-guest stdout/stderr as the workload runs, then write the spore when the host
-capture signal arrives. `spore resume` should use the same streaming path so
-resumed children are visible immediately, not only after they exit.
+Streaming output is part of this same surface. Fresh `spore run` now streams
+stdout/stderr as the workload runs. `spore run --capture-on-abort ...` should
+preserve that visibility until the host capture signal arrives, then write the
+spore from a safe backend loop point.
+
+Fresh `spore run` can stream over the run-vsock connection. Resuming a captured
+run is different: the guest may still believe it has an accepted vsock
+connection, but the host-side `HostStream` object is not a portable spore
+artifact. The first product resume surface should therefore stream restore-time
+guest console output, which already exists on both backends. If we need
+stdout/stderr separation after resume, add an explicit guest-agent reconnect or
+host-stream state model later; do not hide that behind `spore resume`.
 
 This avoids requiring a guest API before the thesis is proven. A later
 guest-visible readiness/checkpoint API can still be added for applications that
@@ -238,11 +265,15 @@ compelling demo.
 
 ## Safety And Invariants
 
-- `--json` writes exactly one machine-readable result frame to stdout; asset
-  resolution, downloads, and cache messages go to stderr.
-- Streaming command output is initially a non-JSON product mode. Keep the
-  existing single-frame `--json` contract until an explicit event-stream JSON
-  mode is designed.
+- Default command output writes guest stdout to host stdout and guest stderr to
+  host stderr as it arrives, then exits with the guest command's exit code.
+- The run-vsock output protocol is a framed stream, not an unbounded append
+  buffer. Frames are length-limited and typed as stdout, stderr, exit, or
+  protocol error.
+- Product `--json` single-final-frame behavior has been removed. Any future
+  machine-readable output should be an explicit JSONL/event mode; the first
+  streaming slice optimizes for normal CLI stdout/stderr plus process exit
+  status.
 - Missing default assets fail before booting a VM.
 - Default asset cache writes use temporary files plus atomic rename.
 - Downloaded kernels are verified before use.
@@ -295,7 +326,6 @@ Done when:
 ```console
 mise run build
 zig-out/bin/spore run -- /bin/writeout
-zig-out/bin/spore run --json -- /bin/writeout
 zig-out/bin/spore run --kernel Image --initrd minimal.cpio -- /bin/writeout
 ```
 
@@ -321,7 +351,6 @@ Done when:
 ```console
 spore run --rootfs rootfs.ext4 -- /bin/echo hi
 spore run --rootfs rootfs.ext4 -- /bin/false
-spore run --json --rootfs rootfs.ext4 -- /bin/echo hi
 ```
 
 prove stdout/stderr/status propagation from binaries that live in the rootfs.
@@ -385,6 +414,9 @@ policy.
 
 ### Slice F: Host-Signalled Run Capture And Resume Surface
 
+Status: in progress. F1 and F2 have landed; F3 is the next implementation
+slice. The full Ruby counter demo remains the Slice F completion proof.
+
 Scope:
 
 - Add `spore run --capture-on-abort PATH` for long-running workloads.
@@ -400,6 +432,116 @@ Scope:
 - Keep fan-out as `spore fork --count N --out DIR` plus repeated
   `spore resume DIR/<child>` calls; `spore resume` must not grow a `--count`
   flag in this slice.
+
+#### Slice F1: Product `spore resume`
+
+Status: implemented.
+
+Scope:
+
+- Add `spore resume SPORE` to the main CLI as a single-spore resume command.
+- Reuse the existing backend resume machinery instead of adding a new spore
+  format or lifecycle path.
+- Default memory size from `manifest.platform.ram_size`. Keep an override only
+  for explicit compatibility experiments.
+- Do not require a kernel or initrd for resume unless a backend call path still
+  needs a temporary implementation detail; the spore contains machine state,
+  not a fresh boot request.
+- Default to verified chunk restore. A trusted same-host RAM backing opt-in can
+  follow as a separate flag once the product wording is clear.
+- Keep resumed console output streaming as the harness does today; this is
+  enough for fork-aware initrd children and gives the next slices a product
+  command to call. Do not claim separated stdout/stderr from a resumed captured
+  `spore run` until there is an explicit reconnect or host-stream state model.
+
+Done when:
+
+```console
+spore resume ruby-counter.spore
+spore fork ruby-counter.spore --count 10 --out ruby-counter.children/
+for child in ruby-counter.children/*; do spore resume "$child" & done
+```
+
+resumes one spore per command on the supported local backend, fails closed on
+platform mismatch, refuses `--count`, and shows resumed guest console output as
+the VM runs.
+
+#### Slice F2: Simple Streaming Run Protocol
+
+Status: implemented.
+
+Scope:
+
+- Replace the current final JSON exit frame with a small typed frame protocol on
+  the existing host-initiated run-vsock connection.
+- Stream stdout and stderr chunks as they are read from the child process
+  instead of buffering the whole result in the guest agent.
+- Send a final exit frame with the child exit code. The host process exits with
+  that code after draining prior output frames.
+- Remove, reject, or defer `--json` for this path. If machine-readable events
+  are needed later, add an explicit JSONL/event mode rather than preserving the
+  current final-frame shape.
+- Keep frame sizes bounded and add parser tests because frame headers and
+  lengths are attacker-influenced guest data.
+
+Done when a command that writes periodically shows output before it exits,
+large output does not require guest-side buffering, and the host process exit
+status still matches the guest command.
+
+#### Slice F3: Host-Requested Snapshot Trigger
+
+Status: next.
+
+Scope:
+
+- Add an explicit backend run-loop capture request, separate from
+  `snapshot_after_ms`, so host code can ask the normal run loop to snapshot at a
+  safe point.
+- Add `spore run --capture-on-abort PATH` and `--capture-signal NAME` parsing.
+- In interactive mode, install a host-side handler where the first Ctrl-C sets
+  the capture request and the second interrupt aborts.
+- For KVM, handle signal-interrupted `KVM_RUN` as a loop wakeup when a capture
+  request is pending; the generic ioctl helper currently treats `EINTR` as an
+  error.
+- Snapshot only after pending MMIO/device completion has been settled. Preserve
+  the existing fail-closed behavior when vsock has unsnapshot-safe pending
+  packets.
+
+Done when a non-interactive smoke can send the configured host signal to
+`spore run --capture-on-abort out.spore -- /bin/long-running-command`, observe
+`out.spore/manifest.json`, and resume that spore through Slice F1.
+
+#### Slice F4: Resume-Aware Output
+
+Scope:
+
+- Make the long-running run demo visible after resume without depending on an
+  uncaptured host-side vsock stream.
+- Start with restore-time guest console streaming, because that path already
+  round-trips through backend resume.
+- Decide explicitly whether the guest run agent should also mirror workload
+  output to the guest console before capture, or whether a reconnectable agent
+  endpoint is required for separated stdout/stderr after resume.
+- The current minimal exec agent already accepts offset-based attach requests
+  and keeps bounded replay buffers, but `spore run --capture-on-abort` does not
+  yet persist stream offsets for product resume to use.
+- Keep the first product guarantee modest: resumed children are visible as they
+  run. Separated stdout/stderr after resume is a later contract unless this
+  slice chooses a reconnect protocol.
+
+Done when resumed children from a captured run produce visible output
+immediately through `spore resume`.
+
+#### Slice F5: Ruby Counter Fan-Out Demo
+
+Scope:
+
+- Build or document a small linux/arm64 rootfs containing the Ruby counter
+  workload.
+- Validate capture-on-abort, `spore fork --count 10`, and parallel product
+  `spore resume` children from the captured process state.
+- Keep this as a smoke/demo boundary; do not add OCI runtime defaults, writable
+  rootfs state, or `resume --count`.
 
 Done when:
 
@@ -421,21 +563,31 @@ streaming interleaved counters from the same captured process state.
 - Shell syntax and build checks for any generated initrd helpers.
 - HVF smoke for default initrd run on Apple Silicon.
 - KVM smoke for default initrd run on Linux/aarch64.
-- HVF and KVM smokes for `--rootfs` once rootfs execution lands.
+- HVF and KVM smokes for `--rootfs`.
 - OCI two-step smoke using a small linux/arm64 image.
 - Direct image smoke showing first-run build, second-run cache reuse, and
-  `--json` stdout isolation.
+  clean command stdout/stderr streaming.
+- Unit tests for `spore resume` argument parsing, especially rejecting
+  `--count`.
+- Unit tests for manifest-derived resume memory defaults.
+- Backend unit or harness tests for host-requested snapshot triggers that do
+  not execute inside the signal handler.
+- KVM signal-capture smoke that proves `KVM_RUN` interruption wakes the run loop
+  instead of surfacing as a generic ioctl failure.
+- Streaming protocol tests for stdout/stderr frame ordering, frame length
+  validation, and final exit-code propagation.
 - Negative tests:
   - missing default assets;
   - unsupported host/backend;
   - corrupt or architecture-mismatched rootfs metadata when metadata is
     available;
   - rootfs command not found;
-  - `--json` with asset setup messages present only on stderr.
+  - malformed guest output frames;
+  - asset setup messages do not pollute guest stdout.
 
 ## Resolved Decisions
 
-- The first next slice is default run assets, not rootfs.
+- Earlier bridge work deliberately started with default run assets, not rootfs.
 - The first OCI-capable milestone is two-step `rootfs build` plus
   `run --rootfs`.
 - Direct OCI input uses `--image REF`, not a positional image argument.
@@ -452,6 +604,15 @@ streaming interleaved counters from the same captured process state.
   `spore capture` command for the first product surface.
 - `spore resume SPORE` resumes exactly one spore; fan-out remains explicit via
   `spore fork` plus repeated `spore resume` calls.
+- Product `spore resume` now promotes proven backend resume paths and defaults
+  RAM size from the spore manifest instead of the harness default.
+- The product `--json` final-frame behavior has been removed before 1.0. The
+  desired product contract is streaming stdout/stderr plus process exit status.
+- The immediate next implementation slice is host-triggered capture from
+  `spore run`, because product resume and fresh-run streaming are now in place.
+- Resume visibility starts with backend console streaming. Separated
+  stdout/stderr after resuming a captured `spore run` requires a later explicit
+  reconnect or host-stream state design.
 
 ## Open Questions And Recommended Defaults
 
@@ -482,6 +643,12 @@ streaming interleaved counters from the same captured process state.
 
 - Direct image cache pruning and garbage collection.
 - OCI Entrypoint/Cmd/User/Env/Workdir behavior.
+- Trusted same-host RAM backing as a default product resume behavior. Keep the
+  first resume surface verified-by-chunks unless the caller explicitly opts into
+  local trust.
+- Event-stream JSON output for streaming runs.
+- Separated stdout/stderr after product `spore resume` if the first
+  implementation streams only the guest console.
 
 ## Key Learnings From Pressure-Testing
 
@@ -505,3 +672,11 @@ The fourth risk is default asset resolution that only works from a source tree.
 The first slice must either make the helper dependency explicitly
 development-only or install/generate assets in a way that survives normal
 `zig build` output and later package installation.
+
+The current Slice F risk is bundling several different problems into one PR:
+product resume, streaming run output, host-triggered snapshot, and resume-time
+output visibility. Product resume is still the narrow first slice because the
+backend mechanics already exist. Streaming run output should land before
+capture-on-abort so the long-running process is visible before it is captured.
+Resume-time output needs a separate decision because a host-side vsock stream is
+not part of the portable spore.

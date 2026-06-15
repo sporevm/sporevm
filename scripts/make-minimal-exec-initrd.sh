@@ -6,8 +6,9 @@ usage() {
 usage: scripts/make-minimal-exec-initrd.sh <out.cpio>
 
 Build a tiny aarch64 Linux initrd for the SporeVM minimal boot/run path. The
-init process listens on AF_VSOCK, accepts one-line JSON argv requests, runs the
-requested binary, and replies with a JSON exit frame.
+init process listens on AF_VSOCK, accepts one-line JSON run-session requests,
+runs the requested binary, streams stdout/stderr frames, and finishes with an
+exit-status frame.
 
 Environment:
   CC   C compiler command. Defaults to `zig cc -target aarch64-linux-musl`
@@ -73,8 +74,10 @@ cat >"${workdir}/agent.c" <<'EOF'
 
 #define MAX_ARGC 16
 #define MAX_ARG_LEN 256
-#define MAX_OUTPUT 16384
-#define MAX_OUTPUT_B64 (((MAX_OUTPUT + 2) / 3) * 4)
+#define MAX_REQUEST 2048
+#define MAX_FRAME_PAYLOAD 4096
+#define REPLAY_CAP 65536
+#define SESSION_ID "default"
 
 struct sockaddr_vm {
   sa_family_t svm_family;
@@ -91,13 +94,31 @@ static int64_t t_first_request_decode = 0;
 static int64_t t_command_start = 0;
 static int64_t t_command_exit = 0;
 
-struct output_capture {
-  unsigned char stdout_buf[MAX_OUTPUT];
-  unsigned char stderr_buf[MAX_OUTPUT];
-  size_t stdout_len;
-  size_t stderr_len;
-  int stdout_truncated;
-  int stderr_truncated;
+struct replay_buffer {
+  unsigned char data[REPLAY_CAP];
+  uint64_t base_offset;
+  size_t len;
+};
+
+struct session {
+  int started;
+  int exited;
+  pid_t pid;
+  int stdout_fd;
+  int stderr_fd;
+  int stdout_open;
+  int stderr_open;
+  int exit_code;
+  uint64_t stdout_offset;
+  uint64_t stderr_offset;
+  struct replay_buffer stdout_replay;
+  struct replay_buffer stderr_replay;
+};
+
+struct client {
+  int fd;
+  uint64_t stdout_offset;
+  uint64_t stderr_offset;
 };
 
 static int64_t now_ms(void) {
@@ -230,53 +251,87 @@ static ssize_t read_line(int fd, char *buf, size_t cap) {
   return (ssize_t)len;
 }
 
-static void write_all(int fd, const char *buf, size_t len) {
+static int write_all(int fd, const void *raw, size_t len) {
+  const char *buf = (const char *)raw;
   while (len > 0) {
     ssize_t n = write(fd, buf, len);
     if (n < 0) {
       if (errno == EINTR) continue;
-      return;
+      return -1;
     }
     buf += n;
     len -= (size_t)n;
   }
+  return 0;
 }
 
-static void capture_append(unsigned char *dst, size_t *dst_len, int *truncated, const char *src, size_t src_len) {
-  size_t copied = 0;
-  if (*dst_len < MAX_OUTPUT) {
-    size_t n = MAX_OUTPUT - *dst_len;
-    if (n > src_len) n = src_len;
-    if (n > 0) {
-      memcpy(dst + *dst_len, src, n);
-      *dst_len += n;
-      copied = n;
-    }
-  }
-  if (copied < src_len) *truncated = 1;
+static int set_nonblock(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return -1;
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static void capture_stream(struct output_capture *capture, int stream, const char *buf, size_t len) {
-  if (stream == 1) {
-    capture_append(capture->stdout_buf, &capture->stdout_len, &capture->stdout_truncated, buf, len);
-  } else {
-    capture_append(capture->stderr_buf, &capture->stderr_len, &capture->stderr_truncated, buf, len);
+static void replay_append(struct replay_buffer *replay, uint64_t offset, const unsigned char *buf, size_t len) {
+  if (len >= REPLAY_CAP) {
+    memcpy(replay->data, buf + (len - REPLAY_CAP), REPLAY_CAP);
+    replay->base_offset = offset + len - REPLAY_CAP;
+    replay->len = REPLAY_CAP;
+    return;
+  }
+  while (replay->len + len > REPLAY_CAP) {
+    size_t drop = replay->len + len - REPLAY_CAP;
+    if (drop > replay->len) drop = replay->len;
+    memmove(replay->data, replay->data + drop, replay->len - drop);
+    replay->base_offset += drop;
+    replay->len -= drop;
+  }
+  memcpy(replay->data + replay->len, buf, len);
+  replay->len += len;
+}
+
+static int send_stream_frame(int fd, const char *name, uint64_t offset, const unsigned char *buf, size_t len) {
+  char header[96];
+  int n = snprintf(header, sizeof(header), "%s %llu %zu\n", name, (unsigned long long)offset, len);
+  if (n <= 0 || (size_t)n >= sizeof(header)) return -1;
+  if (write_all(fd, header, (size_t)n) != 0) return -1;
+  if (len > 0 && write_all(fd, buf, len) != 0) return -1;
+  return 0;
+}
+
+static int send_stream_data(int fd, const char *name, uint64_t offset, const unsigned char *buf, size_t len) {
+  size_t sent = 0;
+  while (sent < len) {
+    size_t chunk = len - sent;
+    if (chunk > MAX_FRAME_PAYLOAD) chunk = MAX_FRAME_PAYLOAD;
+    if (send_stream_frame(fd, name, offset + sent, buf + sent, chunk) != 0) return -1;
+    sent += chunk;
+  }
+  return 0;
+}
+
+static int send_exit_frame(int fd, int exit_code) {
+  char frame[32];
+  int n = snprintf(frame, sizeof(frame), "exit %d\n", exit_code);
+  if (n <= 0 || (size_t)n >= sizeof(frame)) return -1;
+  return write_all(fd, frame, (size_t)n);
+}
+
+static void close_client(struct client *client) {
+  if (client->fd >= 0) {
+    close(client->fd);
+    client->fd = -1;
   }
 }
 
-static int drain_pipe(int fd, struct output_capture *capture, int stream) {
-  char buf[4096];
-  for (;;) {
-    ssize_t n = read(fd, buf, sizeof(buf));
-    if (n > 0) {
-      capture_stream(capture, stream, buf, (size_t)n);
-      continue;
-    }
-    if (n == 0) return 0;
-    if (errno == EINTR) continue;
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
-    return 0;
+static int send_client_output(struct client *client, const char *name, uint64_t *client_offset, uint64_t offset, const unsigned char *buf, size_t len) {
+  if (client->fd < 0) return -1;
+  if (*client_offset != offset) return 0;
+  if (send_stream_data(client->fd, name, offset, buf, len) != 0) {
+    close_client(client);
+    return -1;
   }
+  *client_offset += len;
+  return 0;
 }
 
 static int wait_child(pid_t pid, int *status, int block) {
@@ -286,99 +341,6 @@ static int wait_child(pid_t pid, int *status, int block) {
     if (rc == 0) return 0;
     if (errno == EINTR) continue;
     return -1;
-  }
-}
-
-static int set_nonblock(int fd) {
-  int flags = fcntl(fd, F_GETFL, 0);
-  if (flags < 0) return -1;
-  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-static void finish_pipe(int fd, int *open, struct output_capture *capture, int stream) {
-  if (!*open) return;
-  (void)drain_pipe(fd, capture, stream);
-  close(fd);
-  *open = 0;
-}
-
-/*
- * Do not wait for pipe EOF after the direct command exits; inherited fds from
- * daemonized children must not block the one-shot exec result.
- */
-static void finish_output_pipes(int stdout_fd, int *stdout_open, int stderr_fd, int *stderr_open, struct output_capture *capture) {
-  finish_pipe(stdout_fd, stdout_open, capture, 1);
-  finish_pipe(stderr_fd, stderr_open, capture, 2);
-}
-
-static void base64_encode(const unsigned char *src, size_t len, char *out, size_t cap) {
-  static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  size_t i = 0;
-  size_t j = 0;
-  while (i < len && j + 4 < cap) {
-    size_t rem = len - i;
-    uint32_t a = src[i++];
-    uint32_t b = rem > 1 ? src[i++] : 0;
-    uint32_t c = rem > 2 ? src[i++] : 0;
-    out[j++] = table[(a >> 2) & 0x3f];
-    out[j++] = table[((a & 0x03) << 4) | ((b >> 4) & 0x0f)];
-    out[j++] = rem > 1 ? table[((b & 0x0f) << 2) | ((c >> 6) & 0x03)] : '=';
-    out[j++] = rem > 2 ? table[c & 0x3f] : '=';
-  }
-  if (j < cap) out[j] = '\0';
-}
-
-static void send_exit(int fd, int exit_code, const char *error, const struct output_capture *capture) {
-  char stdout_b64[MAX_OUTPUT_B64 + 1];
-  char stderr_b64[MAX_OUTPUT_B64 + 1];
-  if (capture != NULL) {
-    base64_encode(capture->stdout_buf, capture->stdout_len, stdout_b64, sizeof(stdout_b64));
-    base64_encode(capture->stderr_buf, capture->stderr_len, stderr_b64, sizeof(stderr_b64));
-  } else {
-    stdout_b64[0] = '\0';
-    stderr_b64[0] = '\0';
-  }
-
-  char frame[2048 + (MAX_OUTPUT_B64 * 2)];
-  const char *error_json = "null";
-  if (error != NULL) {
-    if (strcmp(error, "bad request") == 0) {
-      error_json = "\"bad request\"";
-    } else if (strcmp(error, "rootfs unavailable") == 0) {
-      error_json = "\"rootfs unavailable\"";
-    } else {
-      error_json = "\"run failed\"";
-    }
-  }
-  int n = snprintf(frame, sizeof(frame),
-    "{\"type\":\"exit\",\"exit_code\":%d,\"error\":%s,"
-    "\"stdout_b64\":\"%s\","
-    "\"stderr_b64\":\"%s\","
-    "\"stdout_truncated\":%s,"
-    "\"stderr_truncated\":%s,"
-    "\"guest_timing_ms\":{"
-    "\"guest_init_start\":%lld,"
-    "\"guest_agent_listen_ready\":%lld,"
-    "\"guest_agent_first_accept\":%lld,"
-    "\"guest_agent_first_request_decode\":%lld,"
-    "\"guest_command_start\":%lld,"
-    "\"guest_command_exit\":%lld}}\n",
-    exit_code,
-    error_json,
-    stdout_b64,
-    stderr_b64,
-    capture != NULL && capture->stdout_truncated ? "true" : "false",
-    capture != NULL && capture->stderr_truncated ? "true" : "false",
-    (long long)t_init_start,
-    (long long)t_listen_ready,
-    (long long)t_first_accept,
-    (long long)t_first_request_decode,
-    (long long)t_command_start,
-    (long long)t_command_exit);
-  if (n > 0) {
-    size_t len = (size_t)n;
-    if (len >= sizeof(frame)) len = sizeof(frame) - 1;
-    write_all(fd, frame, len);
   }
 }
 
@@ -456,7 +418,89 @@ static int parse_argv(const char *req, char storage[MAX_ARGC][MAX_ARG_LEN], char
   }
 }
 
-static int run_argv(char *const argv[], struct output_capture *capture, int use_rootfs) {
+enum request_kind {
+  REQUEST_START,
+  REQUEST_ATTACH,
+};
+
+struct run_request {
+  enum request_kind kind;
+  uint64_t stdout_offset;
+  uint64_t stderr_offset;
+  char arg_storage[MAX_ARGC][MAX_ARG_LEN];
+  char *argv[MAX_ARGC + 1];
+};
+
+static int parse_string_field(const char *req, const char *name, char *out, size_t cap) {
+  char key[64];
+  snprintf(key, sizeof(key), "\"%s\"", name);
+  const char *p = strstr(req, key);
+  if (p == NULL) return 0;
+  p = strchr(p, ':');
+  if (p == NULL) return -1;
+  p = skip_ws(p + 1);
+  return parse_json_string(&p, out, cap) == 0 ? 1 : -1;
+}
+
+static int parse_u64_field(const char *req, const char *name, uint64_t *out) {
+  char key[64];
+  snprintf(key, sizeof(key), "\"%s\"", name);
+  const char *p = strstr(req, key);
+  if (p == NULL) return 0;
+  p = strchr(p, ':');
+  if (p == NULL) return -1;
+  p = skip_ws(p + 1);
+  errno = 0;
+  char *end = NULL;
+  unsigned long long value = strtoull(p, &end, 10);
+  if (errno != 0 || end == p) return -1;
+  *out = (uint64_t)value;
+  return 1;
+}
+
+static int parse_request(const char *req, struct run_request *out) {
+  memset(out, 0, sizeof(*out));
+  out->kind = REQUEST_START;
+
+  char type[32];
+  int type_rc = parse_string_field(req, "type", type, sizeof(type));
+  if (type_rc < 0) return -1;
+  if (type_rc > 0) {
+    if (strcmp(type, "start") == 0) {
+      out->kind = REQUEST_START;
+    } else if (strcmp(type, "attach") == 0) {
+      out->kind = REQUEST_ATTACH;
+    } else {
+      return -1;
+    }
+  }
+
+  char session_id[64];
+  int session_rc = parse_string_field(req, "session_id", session_id, sizeof(session_id));
+  if (session_rc < 0) return -1;
+  if (session_rc > 0 && strcmp(session_id, SESSION_ID) != 0) return -1;
+
+  uint64_t offset = 0;
+  int stdout_rc = parse_u64_field(req, "stdout_offset", &offset);
+  if (stdout_rc < 0) return -1;
+  if (stdout_rc > 0) out->stdout_offset = offset;
+  offset = 0;
+  int stderr_rc = parse_u64_field(req, "stderr_offset", &offset);
+  if (stderr_rc < 0) return -1;
+  if (stderr_rc > 0) out->stderr_offset = offset;
+
+  if (out->kind == REQUEST_START) {
+    if (parse_argv(req, out->arg_storage, out->argv) <= 0) return -1;
+  }
+  return 0;
+}
+
+static int send_error_exit(int fd, int code, const char *message) {
+  (void)send_stream_data(fd, "stderr", 0, (const unsigned char *)message, strlen(message));
+  return send_exit_frame(fd, code);
+}
+
+static int start_session(struct session *session, char *const argv[], int use_rootfs) {
   t_command_start = now_ms();
   int stdout_pipe[2];
   int stderr_pipe[2];
@@ -504,76 +548,184 @@ static int run_argv(char *const argv[], struct output_capture *capture, int use_
     return 127;
   }
 
+  memset(session, 0, sizeof(*session));
+  session->started = 1;
+  session->pid = pid;
+  session->stdout_fd = stdout_pipe[0];
+  session->stderr_fd = stderr_pipe[0];
+  session->stdout_open = 1;
+  session->stderr_open = 1;
+  return 0;
+}
+
+static int replay_available(const struct replay_buffer *replay, uint64_t offset, uint64_t end_offset) {
+  return offset >= replay->base_offset && offset <= end_offset;
+}
+
+static int send_replay(struct client *client, const struct replay_buffer *replay, const char *name, uint64_t *client_offset, uint64_t end_offset) {
+  if (!replay_available(replay, *client_offset, end_offset)) return -1;
+  uint64_t replay_end = replay->base_offset + replay->len;
+  if (*client_offset >= replay_end) return 0;
+  size_t start = (size_t)(*client_offset - replay->base_offset);
+  size_t len = replay->len - start;
+  if (send_stream_data(client->fd, name, *client_offset, replay->data + start, len) != 0) return -1;
+  *client_offset += len;
+  return 0;
+}
+
+static int attach_client(struct session *session, struct client *client, uint64_t stdout_offset, uint64_t stderr_offset) {
+  client->stdout_offset = stdout_offset;
+  client->stderr_offset = stderr_offset;
+  if (send_replay(client, &session->stdout_replay, "stdout", &client->stdout_offset, session->stdout_offset) != 0 ||
+      send_replay(client, &session->stderr_replay, "stderr", &client->stderr_offset, session->stderr_offset) != 0) {
+    (void)send_error_exit(client->fd, 125, "spore run: requested replay offset is unavailable\n");
+    close_client(client);
+    return -1;
+  }
+  if (session->exited && !session->stdout_open && !session->stderr_open) {
+    (void)send_exit_frame(client->fd, session->exit_code);
+    close_client(client);
+  }
+  return 0;
+}
+
+static void pump_session_stream(struct session *session, struct client *client, int is_stdout) {
+  int *fd = is_stdout ? &session->stdout_fd : &session->stderr_fd;
+  int *open = is_stdout ? &session->stdout_open : &session->stderr_open;
+  uint64_t *offset = is_stdout ? &session->stdout_offset : &session->stderr_offset;
+  struct replay_buffer *replay = is_stdout ? &session->stdout_replay : &session->stderr_replay;
+  const char *name = is_stdout ? "stdout" : "stderr";
+  uint64_t *client_offset = is_stdout ? &client->stdout_offset : &client->stderr_offset;
+  unsigned char buf[MAX_FRAME_PAYLOAD];
+
+  if (!*open) return;
+  for (;;) {
+    ssize_t n = read(*fd, buf, sizeof(buf));
+    if (n > 0) {
+      uint64_t frame_offset = *offset;
+      replay_append(replay, frame_offset, buf, (size_t)n);
+      *offset += (uint64_t)n;
+      if (client->fd >= 0) {
+        (void)send_client_output(client, name, client_offset, frame_offset, buf, (size_t)n);
+      }
+      continue;
+    }
+    if (n == 0) {
+      close(*fd);
+      *fd = -1;
+      *open = 0;
+      return;
+    }
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+    close(*fd);
+    *fd = -1;
+    *open = 0;
+    return;
+  }
+}
+
+static void poll_session_exit(struct session *session, struct client *client) {
+  if (!session->started || session->exited) return;
+
   int status = 0;
-  int stdout_open = 1;
-  int stderr_open = 1;
-  int child_done = 0;
-  int wait_failed = 0;
+  int wr = wait_child(session->pid, &status, 0);
+  if (wr == 0) return;
+  t_command_exit = now_ms();
+  if (wr < 0) {
+    session->exit_code = 127;
+  } else if (WIFEXITED(status)) {
+    session->exit_code = WEXITSTATUS(status);
+  } else if (WIFSIGNALED(status)) {
+    session->exit_code = 128 + WTERMSIG(status);
+  } else {
+    session->exit_code = 1;
+  }
+  session->exited = 1;
 
-  while (stdout_open || stderr_open || !child_done) {
-    if (stdout_open || stderr_open) {
-      struct pollfd fds[2];
-      int streams[2];
-      nfds_t nfds = 0;
-      if (stdout_open) {
-        fds[nfds].fd = stdout_pipe[0];
-        fds[nfds].events = POLLIN | POLLHUP | POLLERR;
-        fds[nfds].revents = 0;
-        streams[nfds++] = 1;
-      }
-      if (stderr_open) {
-        fds[nfds].fd = stderr_pipe[0];
-        fds[nfds].events = POLLIN | POLLHUP | POLLERR;
-        fds[nfds].revents = 0;
-        streams[nfds++] = 2;
-      }
+  /*
+   * Do not wait indefinitely for pipe EOF after the direct command exits;
+   * inherited fds from daemonized children must not block the run result.
+   */
+  pump_session_stream(session, client, 1);
+  pump_session_stream(session, client, 0);
+  if (session->stdout_open) {
+    close(session->stdout_fd);
+    session->stdout_fd = -1;
+    session->stdout_open = 0;
+  }
+  if (session->stderr_open) {
+    close(session->stderr_fd);
+    session->stderr_fd = -1;
+    session->stderr_open = 0;
+  }
+}
 
-      int pr = poll(fds, nfds, 100);
-      if (pr > 0) {
-        for (nfds_t i = 0; i < nfds; i++) {
-          if ((fds[i].revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
-          int still_open = drain_pipe(fds[i].fd, capture, streams[i]);
-          if (!still_open) {
-            if (streams[i] == 1) {
-              close(stdout_pipe[0]);
-              stdout_open = 0;
-            } else {
-              close(stderr_pipe[0]);
-              stderr_open = 0;
-            }
-          }
-        }
-      } else if (pr < 0 && errno != EINTR) {
-        if (stdout_open) close(stdout_pipe[0]);
-        if (stderr_open) close(stderr_pipe[0]);
-        stdout_open = 0;
-        stderr_open = 0;
-      }
-    } else if (!child_done) {
-      int wr = wait_child(pid, &status, 1);
-      child_done = 1;
-      if (wr < 0) wait_failed = 1;
-      finish_output_pipes(stdout_pipe[0], &stdout_open, stderr_pipe[0], &stderr_open, capture);
+static void maybe_send_session_exit(struct session *session, struct client *client) {
+  if (client->fd < 0) return;
+  if (!session->started || !session->exited || session->stdout_open || session->stderr_open) return;
+  if (send_exit_frame(client->fd, session->exit_code) != 0) {
+    close_client(client);
+    return;
+  }
+  close_client(client);
+}
+
+static void accept_request(int listener, struct session *session, struct client *client, int use_rootfs, int rootfs_ready, const char *rootfs_error) {
+  int conn = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+  if (conn < 0) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+      dprintf(2, "accept failed: errno=%d\n", errno);
     }
+    return;
+  }
+  if (t_first_accept == 0) t_first_accept = now_ms();
 
-    if (!child_done) {
-      int wr = wait_child(pid, &status, 0);
-      if (wr == 1) {
-        child_done = 1;
-        finish_output_pipes(stdout_pipe[0], &stdout_open, stderr_pipe[0], &stderr_open, capture);
-      } else if (wr < 0) {
-        child_done = 1;
-        wait_failed = 1;
-        finish_output_pipes(stdout_pipe[0], &stdout_open, stderr_pipe[0], &stderr_open, capture);
-      }
-    }
+  char req[MAX_REQUEST];
+  if (read_line(conn, req, sizeof(req)) <= 0) {
+    close(conn);
+    return;
+  }
+  if (t_first_request_decode == 0) t_first_request_decode = now_ms();
+
+  struct run_request request;
+  if (parse_request(req, &request) != 0) {
+    (void)send_error_exit(conn, 2, "spore run: bad request\n");
+    close(conn);
+    return;
   }
 
-  t_command_exit = now_ms();
-  if (wait_failed) return 127;
-  if (WIFEXITED(status)) return WEXITSTATUS(status);
-  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
-  return 1;
+  close_client(client);
+  client->fd = conn;
+
+  if (request.kind == REQUEST_START) {
+    if (session->started) {
+      (void)send_error_exit(client->fd, 2, "spore run: session already started\n");
+      close_client(client);
+      return;
+    }
+    if (use_rootfs && !rootfs_ready) {
+      (void)send_error_exit(client->fd, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
+      close_client(client);
+      return;
+    }
+    int rc = start_session(session, request.argv, use_rootfs);
+    if (rc != 0) {
+      (void)send_error_exit(client->fd, rc, "spore run: exec setup failed\n");
+      close_client(client);
+      return;
+    }
+    client->stdout_offset = 0;
+    client->stderr_offset = 0;
+    return;
+  }
+
+  if (!session->started) {
+    (void)send_error_exit(client->fd, 2, "spore run: no session\n");
+    close_client(client);
+    return;
+  }
+  (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
 }
 
 int main(void) {
@@ -587,6 +739,11 @@ int main(void) {
   if (use_rootfs && setup_rootfs(rootfs_error, sizeof(rootfs_error)) != 0) {
     rootfs_ready = 0;
     dprintf(2, "%s\n", rootfs_error);
+    size_t len = strlen(rootfs_error);
+    if (len + 1 < sizeof(rootfs_error)) {
+      rootfs_error[len] = '\n';
+      rootfs_error[len + 1] = '\0';
+    }
   }
 
   int listener = listen_vsock(resolve_port());
@@ -594,46 +751,62 @@ int main(void) {
     dprintf(2, "listen vsock failed: errno=%d\n", errno);
     return 1;
   }
+  (void)set_nonblock(listener);
   t_listen_ready = now_ms();
 
+  struct session session;
+  memset(&session, 0, sizeof(session));
+  session.stdout_fd = -1;
+  session.stderr_fd = -1;
+  struct client client;
+  memset(&client, 0, sizeof(client));
+  client.fd = -1;
+
   for (;;) {
-    int conn = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
-    if (conn < 0) {
-      if (errno == EINTR) continue;
-      dprintf(2, "accept failed: errno=%d\n", errno);
-      continue;
+    struct pollfd fds[4];
+    int roles[4];
+    nfds_t nfds = 0;
+    fds[nfds].fd = listener;
+    fds[nfds].events = POLLIN;
+    fds[nfds].revents = 0;
+    roles[nfds++] = 0;
+    if (client.fd >= 0) {
+      fds[nfds].fd = client.fd;
+      fds[nfds].events = POLLHUP | POLLERR;
+      fds[nfds].revents = 0;
+      roles[nfds++] = 1;
     }
-    if (t_first_accept == 0) t_first_accept = now_ms();
-
-    char req[2048];
-    if (read_line(conn, req, sizeof(req)) <= 0) {
-      close(conn);
-      continue;
+    if (session.stdout_open) {
+      fds[nfds].fd = session.stdout_fd;
+      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
+      fds[nfds].revents = 0;
+      roles[nfds++] = 2;
     }
-    if (t_first_request_decode == 0) t_first_request_decode = now_ms();
-
-    char arg_storage[MAX_ARGC][MAX_ARG_LEN];
-    char *argv[MAX_ARGC + 1];
-    if (parse_argv(req, arg_storage, argv) <= 0) {
-      t_command_start = now_ms();
-      t_command_exit = t_command_start;
-      send_exit(conn, 2, "bad request", NULL);
-      close(conn);
-      continue;
-    }
-    if (use_rootfs && !rootfs_ready) {
-      t_command_start = now_ms();
-      t_command_exit = t_command_start;
-      send_exit(conn, 126, "rootfs unavailable", NULL);
-      close(conn);
-      continue;
+    if (session.stderr_open) {
+      fds[nfds].fd = session.stderr_fd;
+      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
+      fds[nfds].revents = 0;
+      roles[nfds++] = 3;
     }
 
-    struct output_capture capture;
-    memset(&capture, 0, sizeof(capture));
-    int code = run_argv(argv, &capture, use_rootfs);
-    send_exit(conn, code, NULL, &capture);
-    close(conn);
+    int pr = poll(fds, nfds, 100);
+    if (pr < 0 && errno != EINTR) continue;
+    if (pr > 0) {
+      for (nfds_t i = 0; i < nfds; i++) {
+        if (fds[i].revents == 0) continue;
+        if (roles[i] == 0 && (fds[i].revents & POLLIN)) {
+          accept_request(listener, &session, &client, use_rootfs, rootfs_ready, rootfs_error);
+        } else if (roles[i] == 1 && (fds[i].revents & (POLLHUP | POLLERR))) {
+          close_client(&client);
+        } else if (roles[i] == 2) {
+          pump_session_stream(&session, &client, 1);
+        } else if (roles[i] == 3) {
+          pump_session_stream(&session, &client, 0);
+        }
+      }
+    }
+    poll_session_exit(&session, &client);
+    maybe_send_session_exit(&session, &client);
   }
 }
 EOF

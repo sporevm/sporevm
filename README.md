@@ -20,10 +20,11 @@ The target lifecycle property: no operation scales with RAM size.
 - **Resume** is bounded by the working set, not memory size, on either OS
 
 The product CLI shape is still landing. Today `spore run` can boot a
-throwaway VM, execute one argv request through the minimal vsock agent, and
-print bounded guest stdout/stderr. `spore fork` can mint child spores from an
-existing spore. Create, suspend, and resume are still exercised through the
-backend smoke harnesses. The
+throwaway VM, execute one argv request through the minimal vsock agent, stream
+guest stdout/stderr, and exit with the guest command status. `spore fork` can
+mint child spores from an existing spore, and `spore resume` can resume one
+captured or forked spore on a compatible host. Create and suspend are still
+exercised through the backend smoke harnesses. The
 end-state interface is:
 
 ```console
@@ -45,8 +46,8 @@ write/resume a v0 spore on the same host. The CLI can report current host
 platform facts with `spore host-info`, summarise a spore manifest with
 `spore inspect <spore-dir>`, run one command in a throwaway VM with
 `spore run`, mint metadata-only child spores with `spore fork <spore-dir>
---count N --out DIR`, and round-trip portable local chunkpack bundles with
-`spore pack` / `spore unpack`.
+--count N --out DIR`, resume one spore with `spore resume <spore-dir>`, and
+round-trip portable local chunkpack bundles with `spore pack` / `spore unpack`.
 
 Identical-host fork/fan-out is the priority path. The cross-hypervisor restore
 matrix remains a secondary diagnostic portability track.
@@ -57,8 +58,15 @@ Tooling is pinned with [mise](https://mise.jdx.dev):
 
 ```bash
 mise install
-mise run build    # zig build
-mise run test     # zig build test
+mise run check       # unit tests, product build, diff hygiene
+mise run smoke       # product run + resume smokes
+mise run smoke:run   # product run streaming and exit-status smoke
+mise run smoke:resume  # product resume smoke
+```
+
+Lower-level backend harnesses remain available for targeted debugging:
+
+```bash
 mise exec -- zig build hvf-boot   # build/sign the HVF kernel boot harness
 mise exec -- zig build hvf-gic-probe # probe HVF GICv3 portable-state support
 mise exec -- zig build kvm-boot   # build the KVM kernel boot harness on Linux/aarch64
@@ -82,6 +90,11 @@ fork-aware initrd needs `/dev/mem` access to the fixed generation MMIO window:
 Fork an already-captured spore with
 `zig-out/bin/spore fork /tmp/spore --count 100 --out /tmp/forks`; children are
 named `000000`, `000001`, and so on, and share the parent's chunk store.
+Resume one captured or forked spore with
+`zig-out/bin/spore resume /tmp/forks/000000`; product resume streams the
+restored guest console and defaults RAM size from the spore manifest. Product
+resume currently supports diskless spores; disk-backed restore still needs the
+backend harness plus the original backing disk.
 Pack a spore into the first local distribution format with
 `zig-out/bin/spore pack /tmp/spore --out /tmp/spore.bundle`; unpack it back
 into a normal spore directory with
@@ -105,10 +118,10 @@ zig-out/bin/spore run -- /bin/writeout
 `spore run` defaults to the managed SporeVM run kernel and the minimal exec
 initrd installed by `zig build`. Pass `--kernel` and `--initrd`, or set
 `SPOREVM_KERNEL_IMAGE` and `SPOREVM_RUN_INITRD`, to use explicit boot assets.
-The minimal agent captures up to 16 KiB each of command stdout and stderr. In
-normal mode those bytes are forwarded to the host streams and `spore run` exits
-with the guest command status. With `--json`, command output is reported as
-base64 fields alongside truncation metadata.
+The minimal agent streams command stdout and stderr over a small framed vsock
+protocol. The host forwards stdout frames to stdout, stderr frames to stderr,
+and `spore run` exits with the guest command status. The previous `--json`
+final-frame mode has been removed from the product CLI.
 
 Attach an ext4 rootfs read-only and execute an explicit argv from it with
 `--rootfs`:
