@@ -9,7 +9,10 @@ Usage:
   scripts/benchmark-sporevm-lifecycle.sh --image REF [options]
 
 Options:
-  --image REF              OCI image to use for spore create. Prefer a digest-pinned linux/arm64 image.
+  --image REF              OCI image to use for spore create.
+                           Mutable tags are pinned once before timing by default.
+  --pin-image-once         Resolve mutable image tags before the timed loop (default).
+  --measure-tag-resolution Do not pre-resolve image tags; include tag lookup in create time.
   -n, --iterations N       Number of lifecycle runs (default: 10).
   --output-dir DIR         Directory for JSONL output and logs (default: /tmp/sporevm-lifecycle).
   --runtime-dir DIR        Runtime directory to reuse (default: <output-dir>/runtime).
@@ -28,6 +31,7 @@ Options:
 The timed section starts immediately before `spore create`, runs the identity
 probe and workload command with `spore exec`, then stops before `spore rm`.
 Cleanup is recorded separately and is not included in create_to_node_ms.
+When available, create and monitor phase timings are flattened into each JSONL row.
 EOF
 }
 
@@ -82,6 +86,57 @@ trim_file() {
   head -c 4096 "${path}" | sed -e 's/[[:space:]]*$//'
 }
 
+json_number_field() {
+  local path="$1"
+  local field="$2"
+  if [[ ! -f "${path}" ]]; then
+    printf 'null'
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "${path}" "${field}" <<'PY'
+import json
+import sys
+
+path, field = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        value = json.load(fh).get(field)
+except Exception:
+    print("null")
+    raise SystemExit(0)
+
+if isinstance(value, bool) or not isinstance(value, (int, float)):
+    print("null")
+else:
+    print(value)
+PY
+    return 0
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg field "${field}" 'if (.[$field] | type) == "number" then .[$field] else "null" end' "${path}" 2>/dev/null || printf 'null'
+    return 0
+  fi
+  printf 'null'
+}
+
+json_number_delta() {
+  local total="$1"
+  local part="$2"
+  if [[ "${total}" =~ ^[0-9]+$ && "${part}" =~ ^[0-9]+$ && "${total}" -ge "${part}" ]]; then
+    printf '%d' "$((total - part))"
+  else
+    printf 'null'
+  fi
+}
+
+json_bool() {
+  case "$1" in
+    true|false) printf '%s' "$1" ;;
+    *) die "internal error: invalid JSON boolean: $1" ;;
+  esac
+}
+
 positive_int() {
   local opt="$1"
   local value="$2"
@@ -109,6 +164,7 @@ timeout_ms=60000
 identity_command='cat /proc/sys/kernel/random/boot_id'
 workload_command='node -v'
 build=1
+pin_image_once=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -116,6 +172,14 @@ while [[ $# -gt 0 ]]; do
       need_value "$1" "${2-}"
       image="$2"
       shift 2
+      ;;
+    --pin-image-once)
+      pin_image_once=1
+      shift
+      ;;
+    --measure-tag-resolution)
+      pin_image_once=0
+      shift
       ;;
     -n|--iterations)
       need_value "$1" "${2-}"
@@ -235,6 +299,31 @@ if [[ -n "${rootfs_cache_dir}" ]]; then
   spore_env+=(SPOREVM_ROOTFS_CACHE_DIR="${rootfs_cache_dir}")
 fi
 
+requested_image="${image}"
+effective_image="${requested_image}"
+image_resolution_ms="0"
+image_resolution_timed="false"
+if [[ "${pin_image_once}" == "1" && "${requested_image}" != *@sha256:* ]]; then
+  image_resolve_stdout="${log_dir}/image-resolve.out"
+  image_resolve_stderr="${log_dir}/image-resolve.err"
+  image_resolve_start_ms="$(now_ms)"
+  if run_capture "${image_resolve_stdout}" "${image_resolve_stderr}" \
+    env "${spore_env[@]}" "${spore_bin}" rootfs resolve "${requested_image}"; then
+    image_resolution_ms="$(( $(now_ms) - image_resolve_start_ms ))"
+  else
+    status=$?
+    echo "image tag resolution failed for ${requested_image}; stderr follows:" >&2
+    trim_file "${image_resolve_stderr}" >&2 || true
+    exit "${status}"
+  fi
+  effective_image="$(trim_file "${image_resolve_stdout}")"
+  [[ "${effective_image}" == *@sha256:* ]] || die "image resolver did not return a digest-pinned ref: ${effective_image}"
+  echo "lifecycle benchmark image: requested=${requested_image} pinned=${effective_image} resolution_ms=${image_resolution_ms}" >&2
+elif [[ "${pin_image_once}" == "0" ]]; then
+  image_resolution_ms="null"
+  image_resolution_timed="true"
+fi
+
 create_base=("${spore_bin}" create)
 if [[ -n "${backend}" ]]; then
   create_base+=(--backend "${backend}")
@@ -245,7 +334,7 @@ fi
 if [[ -n "${initrd_path}" ]]; then
   create_base+=(--initrd "${initrd_path}")
 fi
-create_base+=(--image "${image}" --memory-mib "${memory_mib}" --timeout-ms "${timeout_ms}")
+create_base+=(--image "${effective_image}" --memory-mib "${memory_mib}" --timeout-ms "${timeout_ms}")
 
 for i in $(seq 1 "${iterations}"); do
   vm_name="spore-life-${timestamp}-${i}"
@@ -296,6 +385,24 @@ for i in $(seq 1 "${iterations}"); do
   fi
   workload_end_ms="$(now_ms)"
 
+  vm_dir="${runtime_dir}/vms/${vm_name}"
+  create_timing_path="${vm_dir}/create-timing.json"
+  monitor_timing_path="${vm_dir}/monitor-timing.json"
+  create_parse_ms="$(json_number_field "${create_timing_path}" "parse_ms")"
+  create_paths_ms="$(json_number_field "${create_timing_path}" "paths_ms")"
+  create_state_check_ms="$(json_number_field "${create_timing_path}" "state_check_ms")"
+  create_rootfs_resolve_ms="$(json_number_field "${create_timing_path}" "rootfs_resolve_ms")"
+  create_rootfs_abspath_ms="$(json_number_field "${create_timing_path}" "rootfs_abspath_ms")"
+  create_spawn_monitor_ms="$(json_number_field "${create_timing_path}" "spawn_monitor_ms")"
+  create_wait_ready_ms="$(json_number_field "${create_timing_path}" "wait_ready_ms")"
+  create_parent_total_ms="$(json_number_field "${create_timing_path}" "total_ms")"
+  create_uninstrumented_ms="$(json_number_delta "$((create_end_ms - create_start_ms))" "${create_parent_total_ms}")"
+  monitor_parse_ms="$(json_number_field "${monitor_timing_path}" "parse_ms")"
+  monitor_paths_ms="$(json_number_field "${monitor_timing_path}" "paths_ms")"
+  monitor_asset_resolve_ms="$(json_number_field "${monitor_timing_path}" "asset_resolve_ms")"
+  monitor_metadata_ms="$(json_number_field "${monitor_timing_path}" "metadata_ms")"
+  monitor_ready_after_start_ms="$(json_number_field "${monitor_timing_path}" "ready_after_start_ms")"
+
   rm_start_ms="$(now_ms)"
   if run_capture "${rm_stdout}" "${rm_stderr}" env "${spore_env[@]}" "${spore_bin}" rm "${vm_name}"; then
     rm_status=0
@@ -318,12 +425,29 @@ for i in $(seq 1 "${iterations}"); do
     printf '{'
     printf '"iteration":%d,' "${i}"
     printf '"vm_name":%s,' "$(json_string "${vm_name}")"
-    printf '"image":%s,' "$(json_string "${image}")"
+    printf '"requested_image":%s,' "$(json_string "${requested_image}")"
+    printf '"image":%s,' "$(json_string "${effective_image}")"
+    printf '"image_resolution_ms":%s,' "${image_resolution_ms}"
+    printf '"image_resolution_timed":%s,' "$(json_bool "${image_resolution_timed}")"
     printf '"backend":%s,' "$(json_string "${backend}")"
     printf '"memory_mib":%d,' "${memory_mib}"
     printf '"timeout_ms":%d,' "${timeout_ms}"
     printf '"create_to_node_ms":%d,' "$((workload_end_ms - start_ms))"
     printf '"create_ms":%d,' "$((create_end_ms - create_start_ms))"
+    printf '"create_parse_ms":%s,' "${create_parse_ms}"
+    printf '"create_paths_ms":%s,' "${create_paths_ms}"
+    printf '"create_state_check_ms":%s,' "${create_state_check_ms}"
+    printf '"create_rootfs_resolve_ms":%s,' "${create_rootfs_resolve_ms}"
+    printf '"create_rootfs_abspath_ms":%s,' "${create_rootfs_abspath_ms}"
+    printf '"create_spawn_monitor_ms":%s,' "${create_spawn_monitor_ms}"
+    printf '"create_wait_ready_ms":%s,' "${create_wait_ready_ms}"
+    printf '"create_parent_total_ms":%s,' "${create_parent_total_ms}"
+    printf '"create_uninstrumented_ms":%s,' "${create_uninstrumented_ms}"
+    printf '"monitor_parse_ms":%s,' "${monitor_parse_ms}"
+    printf '"monitor_paths_ms":%s,' "${monitor_paths_ms}"
+    printf '"monitor_asset_resolve_ms":%s,' "${monitor_asset_resolve_ms}"
+    printf '"monitor_metadata_ms":%s,' "${monitor_metadata_ms}"
+    printf '"monitor_ready_after_start_ms":%s,' "${monitor_ready_after_start_ms}"
     printf '"identity_exec_ms":%d,' "$((identity_end_ms - identity_start_ms))"
     printf '"workload_exec_ms":%d,' "$((workload_end_ms - workload_start_ms))"
     printf '"cleanup_ms":%d,' "$((rm_end_ms - rm_start_ms))"
@@ -348,14 +472,22 @@ printf 'wrote %s\n' "${output_path}"
 if command -v jq >/dev/null 2>&1; then
   jq -s -r '
     def round1: (. * 10 | round / 10);
+    def vals($field): map(.[$field] // empty);
     def stat($xs): ($xs | sort) as $s |
-      "n=" + (($s|length)|tostring) +
+      if ($s|length) == 0 then "n=0"
+      else "n=" + (($s|length)|tostring) +
       " median=" + ((if ($s|length)%2==1 then $s[(($s|length)/2|floor)] else (($s[(($s|length)/2)-1] + $s[(($s|length)/2)]) / 2) end)|round1|tostring) +
       " mean=" + (($s|add/length)|round1|tostring) +
       " min=" + ($s[0]|round1|tostring) +
-      " max=" + ($s[-1]|round1|tostring);
+      " max=" + ($s[-1]|round1|tostring) end;
     "create_to_node_ms " + stat(map(.create_to_node_ms)) + "\n" +
     "create_ms " + stat(map(.create_ms)) + "\n" +
+    "create_rootfs_resolve_ms " + stat(vals("create_rootfs_resolve_ms")) + "\n" +
+    "create_spawn_monitor_ms " + stat(vals("create_spawn_monitor_ms")) + "\n" +
+    "create_wait_ready_ms " + stat(vals("create_wait_ready_ms")) + "\n" +
+    "create_uninstrumented_ms " + stat(vals("create_uninstrumented_ms")) + "\n" +
+    "monitor_asset_resolve_ms " + stat(vals("monitor_asset_resolve_ms")) + "\n" +
+    "monitor_ready_after_start_ms " + stat(vals("monitor_ready_after_start_ms")) + "\n" +
     "identity_exec_ms " + stat(map(.identity_exec_ms)) + "\n" +
     "workload_exec_ms " + stat(map(.workload_exec_ms))
   ' "${output_path}"

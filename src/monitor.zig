@@ -59,6 +59,7 @@ const RequestState = enum {
 };
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    const start_ms = lifecycle.monotonicMs();
     _ = stdout;
     if (args.len == 1 and (std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "help"))) {
         var out_buffer: [1024]u8 = undefined;
@@ -70,6 +71,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 
     const allocator = init.arena.allocator();
     const opts = try parseMonitorArgs(args);
+    const parsed_ms = lifecycle.monotonicMs();
     if (!lifecycle.monitorBackendSupported(opts.backend.name())) {
         std.debug.print("spore monitor: monitor mode currently supports only HVF on Apple Silicon\n", .{});
         std.process.exit(2);
@@ -83,8 +85,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         std.process.exit(2);
     }
     const paths = try lifecycle.pathsFor(allocator, init.environ_map, opts.name);
+    const paths_ms = lifecycle.monotonicMs();
     const kernel_path = opts.kernel_path orelse try run.resolveDefaultKernelPath(init, allocator);
     const initrd_path = opts.initrd_path orelse try run.resolveDefaultInitrdPath(init, allocator);
+    const assets_ms = lifecycle.monotonicMs();
 
     try lifecycle.writeSpec(allocator, init.io, paths, .{
         .name = opts.name,
@@ -104,6 +108,15 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 
     var server = try ExecServer.init(allocator, init.io, paths.control_socket_path, opts.guest_port, opts.timeout_ms);
     const thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
+    const metadata_ms = lifecycle.monotonicMs();
+
+    lifecycle.writeMonitorTiming(allocator, init.io, paths, .{
+        .parse_ms = parsed_ms - start_ms,
+        .paths_ms = paths_ms - parsed_ms,
+        .asset_resolve_ms = assets_ms - paths_ms,
+        .metadata_ms = metadata_ms - assets_ms,
+        .ready_after_start_ms = metadata_ms - start_ms,
+    }) catch {};
 
     try lifecycle.writeReady(allocator, init.io, paths, .{
         .pid = currentPid(),

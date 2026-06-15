@@ -304,6 +304,15 @@ session ids so multiple `spore exec` calls can run inside one guest boot without
 turning reconnects into duplicate execution. Diskless `spore suspend NAME --out
 DIR` and `spore resume DIR --name NAME` also work locally on HVF. KVM monitor
 wake support and disk-backed lifecycle suspend/resume remain follow-ups.
+Lifecycle benchmark instrumentation now writes create and monitor phase timing
+into each JSONL row. The first local measurements show tag-based
+`spore create --image docker.io/library/node:22-alpine` spends most of its
+warm-cache time resolving the OCI tag, while a digest-pinned cached rootfs drops
+fresh create-to-`node -v` to the few-hundred-millisecond range. The benchmark
+script therefore resolves mutable tags once before the timed loop by default
+and records both the requested tag and effective digest. The next speed work
+should start with explicit tag-resolution caching and rootfs-path isolation
+before pursuing deeper VM boot or snapshot optimizations.
 
 Slice 3 (same-hypervisor eager suspend/restore and manifest v0) is complete for
 both backends. `src/spore.zig` and `docs/spore-format.md` define v0: eager,
