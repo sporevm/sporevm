@@ -85,11 +85,16 @@ fn parseImageName(name: []const u8) !ImageName {
 }
 
 fn manifestUrlFor(allocator: std.mem.Allocator, registry: []const u8, repository: []const u8, reference: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "https://{s}/v2/{s}/manifests/{s}", .{ registry, repository, reference });
+    return std.fmt.allocPrint(allocator, "https://{s}/v2/{s}/manifests/{s}", .{ registryApiHost(registry), repository, reference });
 }
 
 fn blobUrlFor(allocator: std.mem.Allocator, registry: []const u8, repository: []const u8, digest: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "https://{s}/v2/{s}/blobs/{s}", .{ registry, repository, digest });
+    return std.fmt.allocPrint(allocator, "https://{s}/v2/{s}/blobs/{s}", .{ registryApiHost(registry), repository, digest });
+}
+
+fn registryApiHost(registry: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(registry, "docker.io")) return "registry-1.docker.io";
+    return registry;
 }
 
 pub const Descriptor = struct {
@@ -296,6 +301,24 @@ test "tag ref parsing supports registry ports and validates docker tags" {
     try std.testing.expectError(error.ImageRefNeedsRegistry, ImageTag.parse("alpine:latest"));
     try std.testing.expectError(error.ImageTagRequired, ImageTag.parse("registry.example:5000/team/repo"));
     try std.testing.expectError(error.BadImageReference, ImageTag.parse("registry.example/team/repo:bad+tag"));
+}
+
+test "docker.io references fetch from Docker Hub registry API" {
+    const tag = try ImageTag.parse("docker.io/library/alpine:3.20");
+    const tag_url = try tag.manifestUrl(std.testing.allocator);
+    defer std.testing.allocator.free(tag_url);
+    try std.testing.expectEqualStrings("https://registry-1.docker.io/v2/library/alpine/manifests/3.20", tag_url);
+
+    const image_ref = try ImageRef.parse("docker.io/library/alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    const manifest_url = try image_ref.manifestUrl(
+        std.testing.allocator,
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
+    defer std.testing.allocator.free(manifest_url);
+    try std.testing.expectEqualStrings(
+        "https://registry-1.docker.io/v2/library/alpine/manifests/sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        manifest_url,
+    );
 }
 
 test "pinned manifest bytes must match requested digest" {

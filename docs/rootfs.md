@@ -1,7 +1,17 @@
 # Rootfs Images
 
 `spore rootfs build` materializes an OCI image into a deterministic ext4 rootfs
-image. The input can be either a digest-pinned ref or a registry tag:
+image. The first OCI-capable run workflow is deliberately two-step:
+
+```bash
+zig-out/bin/spore rootfs build docker.io/library/alpine:3.20 \
+  --platform linux/arm64 \
+  --output alpine.ext4
+
+zig-out/bin/spore run --rootfs alpine.ext4 -- /bin/echo hi
+```
+
+The input can be either a digest-pinned ref or a registry tag:
 
 ```bash
 spore rootfs build ghcr.io/org/image@sha256:<digest> \
@@ -19,6 +29,15 @@ Run an explicit argv from a built rootfs by attaching it read-only:
 ```bash
 spore run --rootfs rootfs.ext4 -- /bin/echo hi
 ```
+
+Validate the tag-to-rootfs-to-run path with the local smoke script:
+
+```bash
+scripts/smoke-run-oci-rootfs.sh -- /bin/echo hi
+```
+
+The smoke prints the metadata path and `resolved_image_ref` so tag-based runs
+can be traced back to the digest-pinned image identity that was built.
 
 Tag inputs are resolved to the selected platform manifest before rootfs
 materialization. Metadata records both the supplied `image_ref` and the

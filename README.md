@@ -138,12 +138,17 @@ an Apple Silicon Mac on macOS 15+.
 image. Inputs may be digest-pinned refs or registry tags.
 
 ```bash
-spore rootfs build ghcr.io/org/image:latest \
+zig-out/bin/spore rootfs build docker.io/library/alpine:3.20 \
   --platform linux/arm64 \
-  --output rootfs.ext4
+  --output alpine.ext4
 
-zig-out/bin/spore run --rootfs rootfs.ext4 -- /bin/echo hi
+zig-out/bin/spore run --rootfs alpine.ext4 -- /bin/echo hi
 ```
+
+Run the end-to-end OCI rootfs smoke with
+`scripts/smoke-run-oci-rootfs.sh -- /bin/echo hi`. The smoke prints the
+digest-pinned `resolved_image_ref` recorded in rootfs metadata before running
+the command.
 
 See [docs/rootfs.md](docs/rootfs.md) for tag resolution, metadata, and ext4
 tooling details.

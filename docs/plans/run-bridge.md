@@ -1,6 +1,6 @@
 ---
-status: proposed
-last_reviewed: 2026-06-14
+status: active
+last_reviewed: 2026-06-15
 spec_refs:
   - docs/plans/foundation.md
   - docs/rootfs.md
@@ -111,6 +111,9 @@ runtime semantics that the foundation plan says SporeVM should not own.
   read-only through the existing virtio-blk device and chroots before exec.
 - `spore rootfs build` already materializes OCI images into deterministic ext4
   images and records metadata.
+- `scripts/smoke-run-oci-rootfs.sh` validates the two-step OCI path by
+  building `docker.io/library/alpine:3.20`, checking digest-pinned
+  `resolved_image_ref` metadata, and running an explicit argv from the rootfs.
 
 ## Target Model
 
@@ -262,6 +265,8 @@ spore run --json --rootfs rootfs.ext4 -- /bin/echo hi
 prove stdout/stderr/status propagation from binaries that live in the rootfs.
 
 ### Slice C: OCI Two-Step Smoke
+
+Status: implemented.
 
 Scope:
 
