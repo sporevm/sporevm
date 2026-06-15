@@ -187,10 +187,14 @@ model has two materialization modes:
 
 Three lifecycle mechanisms hang off those backing modes:
 
-- **Dirty tracking**: KVM dirty ring on Linux; write-protection fault exits on
-  HVF. A background thread seals dirty pages into CAS chunks on an epoch
-  cadence. Suspend = pause vCPUs + flush current epoch + serialize machine
-  state.
+- **Dirty tracking**: Linux starts with `KVM_GET_DIRTY_LOG` as the simple
+  measured baseline. KVM dirty ring remains an optimisation for very large RAM,
+  many-vCPU, or many-VM cases where bitmap polling becomes visible; it is not
+  the next bottleneck in the current 16GiB measurements. HVF uses
+  write-protection fault exits if the measured overhead is acceptable, or an
+  explicit suspend-time scan boundary if not. A background worker seals dirty
+  pages into CAS chunks on an epoch cadence. Suspend = pause vCPUs + flush
+  current epoch + serialize machine state.
 - **Lazy restore**: pages materialize on fault — userfaultfd on Linux,
   unmapped-memory vm-exits on HVF — backed by local CAS, then peers, then
   origin. The access trace drives readahead so the guest does useful work
@@ -611,14 +615,33 @@ than dirty ring: it keeps the spore chunk refs and trusted same-host
 writes that KVM dirty logging cannot see, and records paired full-scan vs
 dirty-log metrics. The first A1 numbers show suspend pause dropping from
 ~4.0s→2ms at 512MiB, ~27.1s→2ms at 4GiB, and ~106s→5ms at 16GiB, with chunk
-sealing paid before suspend. Dirty ring, product monitor background threading,
-and HVF write-protect-exit measurement remain.
+sealing paid before suspend. `KVM_GET_DIRTY_LOG` overhead was negligible in the
+16GiB run (`get_dirty_log_ms=3` total), so dirty ring is deferred until polling
+shows up in larger RAM, many-vCPU, or many-VM measurements. Product monitor
+background threading and HVF write-protect-exit measurement are now the next
+Slice 7 gaps.
 
 Continuous epoch-based chunk sealing during normal execution; suspend becomes
-pause + tail flush. Measure the steady-state overhead (KVM dirty ring vs HVF
-write-protect exits) and make the epoch cadence tunable. If HVF overhead is
-unacceptable, fall back to suspend-time scanning on macOS and record that as a
-platform support boundary rather than blocking the release.
+pause + tail flush. First move epoch collection/sealing out of the vCPU loop
+and record steady-state jitter/CPU overhead for the existing KVM dirty-log path.
+Then measure HVF write-protect exits. If HVF overhead is unacceptable, fall
+back to suspend-time scanning on macOS and record that as a platform support
+boundary rather than blocking the release. Implement KVM dirty ring only if the
+baseline dirty-log collector becomes material after backgrounding, larger RAM,
+many-vCPU, or fleet-scale measurements.
+
+Next execution order:
+
+1. Split the KVM dirty-log path into a small dirty collector plus a background
+   chunk-sealing worker owned by the monitor/harness instead of doing sealing
+   inline with vCPU progress.
+2. Add benchmark fields for epoch max pause, collector CPU time, sealing CPU
+   time, dirty pages/sec, and sealed chunks/sec; use them to compare one VM,
+   many VMs, and larger RAM without changing APIs again.
+3. Measure HVF write-protect-exit dirty tracking on the macOS CI host and make
+   the same always-on vs suspend-scan decision with numbers.
+4. Revisit KVM dirty ring only if bitmap polling, not hashing/sealing or cold
+   eager restore, shows up as a limiting cost.
 
 Done when: suspend latency is measured flat across 1/4/16GB guests on Linux,
 and the HVF overhead decision is recorded with numbers.
@@ -679,10 +702,14 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   children must CoW-share the paused parent's backing and pay only for dirty
   child pages. Slice 4 therefore proves generation correctness; Slice 5 proves
   memory economics.
+- Dirty collection is not currently the limiting KVM cost: at 16GiB,
+  `KVM_GET_DIRTY_LOG` took only milliseconds while initial seeding, chunk
+  sealing, and cold eager resume took seconds. Keep dirty ring as a scale
+  optimisation, not the next implementation step.
 - HVF dirty-tracking cost is unknown and could be materially worse than KVM's
-  dirty ring. Slice 7 carries an explicit fallback (suspend-time scanning on
-  macOS) and a measurement gate, so the always-checkpoint-ready property can
-  land asymmetrically without blocking release.
+  dirty-log baseline. Slice 7 carries an explicit fallback (suspend-time
+  scanning on macOS) and a measurement gate, so the always-checkpoint-ready
+  property can land asymmetrically without blocking release.
 - Fork without guest cooperation silently produces duplicate entropy, machine
   ids, and stale clocks — bugs that look like flaky tests months later. The
   generation device and fixup protocol are therefore part of the fork slice
@@ -723,6 +750,9 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   file-backed mappings plus abort-exit lazy chunk mapping for Apple Silicon
   parity. KVM proves the release-critical Linux CI economics first, but HVF
   same-backend elasticity is not classified as cross-backend portability.
+- KVM dirty tracking stays on the `KVM_GET_DIRTY_LOG` baseline until benchmark
+  evidence shows bitmap polling is material. Dirty ring is an optimisation path,
+  not required for the next Slice 7 milestone.
 - MIT licensed from the first commit, but the repository stays private for
   now. The identical-host fork/fan-out demo is the natural moment to revisit
   going public.
