@@ -467,10 +467,17 @@ full-scan `snapshot_pause_ms=106069` / `memory_ms=106065` versus dirty-log
 `snapshot_pause_ms=5` / `memory_ms=1` after `seed_ms=96912` and epoch sealing
 `seal_ms=11103`; eager cold resume from that spore passed with
 `memory_ms=28843` / `pre_run_ms=28853`, so large imported resumes remain a
-separate optimisation target from same-host trusted `ram.backing` forks. This
-is the Linux proof path; HVF write-protect tracking still needs measurement
-before deciding whether macOS gets always-on tracking or an explicit
-suspend-time scan boundary.
+separate optimisation target from same-host trusted `ram.backing` forks. The
+macOS proof path now has an HVF write-protect tracker: `hvf-boot --dirty-track`
+seeds chunks and `ram.backing`, protects guest RAM read/execute, handles guest
+write faults by dirtying and reopening the touched chunk, re-seals/re-protects
+chunks in the background, and uses the same VMM-originated dirty-write hook as
+KVM. A local 512MiB HVF fork smoke with parent dirty tracking reported
+`snapshot_pause_ms=109`, `tail_flush_ms=87`, `seed_ms=928`,
+`worker_epoch_max_ms=220`, `write_fault_count=41`, and two children resumed
+from trusted `ram.backing` in 372-383ms. Larger macOS CI runs still need to
+confirm scale, but macOS no longer looks forced onto a suspend-time full scan
+for the primary HVF→HVF fork path.
 
 ## Delivery Strategy
 
@@ -609,8 +616,8 @@ set, and chunk verification rejects corrupted peer data.
 
 ### Slice 7: Always-on dirty tracking
 
-Status: started on KVM. The first harness path uses KVM dirty logging rather
-than dirty ring: it keeps the spore chunk refs and trusted same-host
+Status: started on KVM and HVF. The first Linux harness path uses KVM dirty
+logging rather than dirty ring: it keeps the spore chunk refs and trusted same-host
 `ram.backing` up to date during execution, explicitly marks VMM-side guest RAM
 writes that KVM dirty logging cannot see, and records paired full-scan vs
 dirty-log metrics. The first A1 numbers show suspend pause dropping from
@@ -627,8 +634,11 @@ had not fully caught up with the boot dirty burst (`worker_epoch_max_ms=1111`,
 captures with `--parallel-vms`; the first two-VM 512MiB dirty-log run produced
 two JSONL rows with the same ~512ms active-boot tail profile, giving us a
 repeatable local many-VM shape before asking for more metal. HVF
-write-protect-exit measurement and reducing or predicting dirty-tail lag are now
-the next Slice 7 gaps.
+write-protect tracking has also landed behind `hvf-boot --dirty-track` and the
+fan-out smoke's `--dirty-track` capture option. The first 512MiB local HVF run
+validated same-host forks from trusted `ram.backing` with
+`snapshot_pause_ms=109` / `tail_flush_ms=87`; larger macOS CI scale runs and
+reducing or predicting dirty-tail lag are now the next Slice 7 gaps.
 
 Continuous epoch-based chunk sealing during normal execution; suspend becomes
 pause + tail flush. First move epoch collection/sealing out of the vCPU loop
@@ -647,8 +657,9 @@ Next execution order:
 2. Reduce dirty-tail lag where it matters: tune epoch cadence, consider
    immediate drain-on-snapshot before machine-state capture, and measure whether
    chunk hashing or backing writes dominate.
-3. Measure HVF write-protect-exit dirty tracking on the macOS CI host and make
-   the same always-on vs suspend-scan decision with numbers.
+3. Expand HVF write-protect measurements on the macOS CI host across larger RAM
+   and concurrent fork captures before treating the 512MiB local result as the
+   product support boundary.
 4. Revisit KVM dirty ring only if bitmap polling, not hashing/sealing or cold
    eager restore, shows up as a limiting cost.
 
@@ -715,10 +726,11 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   `KVM_GET_DIRTY_LOG` took only milliseconds while initial seeding, chunk
   sealing, and cold eager resume took seconds. Keep dirty ring as a scale
   optimisation, not the next implementation step.
-- HVF dirty-tracking cost is unknown and could be materially worse than KVM's
-  dirty-log baseline. Slice 7 carries an explicit fallback (suspend-time
-  scanning on macOS) and a measurement gate, so the always-checkpoint-ready
-  property can land asymmetrically without blocking release.
+- HVF dirty-tracking cost has a passing 512MiB local write-protect result, but
+  larger RAM and concurrency are still unmeasured. Slice 7 carries an explicit
+  fallback (suspend-time scanning on macOS) and a measurement gate, so the
+  always-checkpoint-ready property can land asymmetrically without blocking
+  release.
 - Fork without guest cooperation silently produces duplicate entropy, machine
   ids, and stale clocks — bugs that look like flaky tests months later. The
   generation device and fixup protocol are therefore part of the fork slice

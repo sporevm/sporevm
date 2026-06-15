@@ -112,6 +112,7 @@ pub extern "c" fn hv_vm_create(config: ?*anyopaque) ReturnCode;
 pub extern "c" fn hv_vm_destroy() ReturnCode;
 pub extern "c" fn hv_vm_map(addr: *anyopaque, ipa: Ipa, size: usize, flags: MemoryFlags) ReturnCode;
 pub extern "c" fn hv_vm_unmap(ipa: Ipa, size: usize) ReturnCode;
+pub extern "c" fn hv_vm_protect(ipa: Ipa, size: usize, flags: MemoryFlags) ReturnCode;
 pub extern "c" fn hv_vcpu_create(vcpu: *VcpuHandle, exit: **VcpuExit, config: ?*anyopaque) ReturnCode;
 pub extern "c" fn hv_vcpu_destroy(vcpu: VcpuHandle) ReturnCode;
 pub extern "c" fn hv_vcpu_run(vcpu: VcpuHandle) ReturnCode;

@@ -21,6 +21,8 @@ Options:
   --parallel N              child resumes to run per batch (default: 1)
   --mem-mib N               guest memory size (default: 512)
   --snapshot-after-ms N     capture delay before snapshot (default: 3000)
+  --dirty-track             capture parent with backend dirty tracking
+  --dirty-epoch-ms N        dirty tracking epoch cadence (default: 250)
   --resume-seconds N        seconds to let each child run (default: 6)
   --memory-sample-seconds N keep matched KVM children alive and sample host
                             /proc smaps_rollup after N seconds (default: 0)
@@ -60,6 +62,8 @@ count="8"
 parallel="1"
 mem_mib="512"
 snapshot_after_ms="3000"
+dirty_track="0"
+dirty_epoch_ms="250"
 resume_seconds="6"
 memory_sample_seconds="0"
 max_host_pss_mib=""
@@ -109,6 +113,15 @@ while (($#)); do
     --snapshot-after-ms)
       need_option_value "$1" "${2-}"
       snapshot_after_ms="${2:-}"
+      shift 2
+      ;;
+    --dirty-track)
+      dirty_track="1"
+      shift
+      ;;
+    --dirty-epoch-ms)
+      need_option_value "$1" "${2-}"
+      dirty_epoch_ms="${2:-}"
       shift 2
       ;;
     --resume-seconds)
@@ -178,7 +191,7 @@ if [[ -z "${kernel}" ]]; then
 fi
 [[ -f "${kernel}" ]] || die "kernel not found: ${kernel}"
 
-for numeric_value in "${count}" "${parallel}" "${mem_mib}" "${snapshot_after_ms}" "${resume_seconds}" "${memory_sample_seconds}"; do
+for numeric_value in "${count}" "${parallel}" "${mem_mib}" "${snapshot_after_ms}" "${dirty_epoch_ms}" "${resume_seconds}" "${memory_sample_seconds}"; do
   case "${numeric_value}" in
     ''|*[!0-9]*) die "numeric options must be decimal integers" ;;
   esac
@@ -390,6 +403,8 @@ write_metrics() {
     echo "  \"mem_mib\": ${mem_mib},"
     echo "  \"ram_backing_mode\": $(json_string "${ram_backing_mode}"),"
     echo "  \"snapshot_after_ms\": ${snapshot_after_ms},"
+    echo "  \"dirty_track\": ${dirty_track},"
+    echo "  \"dirty_epoch_ms\": ${dirty_epoch_ms},"
     echo "  \"resume_deadline_seconds\": ${resume_seconds},"
     echo "  \"workdir\": $(json_string "${workdir}"),"
     echo "  \"capture_ms\": ${capture_ms},"
@@ -437,6 +452,9 @@ smoke_start_ms="$(now_ms)"
 capture_log="${workdir}/capture.log"
 capture_deadline=$(( (snapshot_after_ms + 999) / 1000 + 30 ))
 capture_cmd=("${boot_bin}" "${kernel}" --mem-mib "${mem_mib}" --initrd "${initrd}" --snapshot-after-ms "${snapshot_after_ms}" --spore "${parent_spore}")
+if [[ "${dirty_track}" == "1" ]]; then
+  capture_cmd+=(--dirty-track --dirty-epoch-ms "${dirty_epoch_ms}")
+fi
 if [[ -n "${cmdline}" ]]; then
   capture_cmd+=(--cmdline "${cmdline}")
 fi
