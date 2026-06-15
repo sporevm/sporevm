@@ -183,10 +183,66 @@ argument is not overloaded as an image reference.
 The cache root is `SPOREVM_ROOTFS_CACHE_DIR` when set, otherwise the platform
 cache directory under `sporevm/rootfs`. Setup and cache messages go to stderr.
 
+### Host-Signalled Capture And Resume
+
+```console
+spore run --image ruby-demo --capture-on-abort ruby-counter.spore -- ruby /demo/counter.rb
+# press Ctrl-C to capture
+spore fork ruby-counter.spore --count 10 --out ruby-counter.children/
+for child in ruby-counter.children/*; do spore resume "$child" & done
+```
+
+The product lifecycle should stay explicit:
+
+- `spore run` starts a new workload. Capture is an option on that run through a
+  path-valued `--capture-on-abort SPORE` flag.
+- `spore fork` mints one or more child spores from an existing spore.
+- `spore resume` starts exactly one spore.
+
+`spore resume` deliberately has no `--count` flag. Repeatedly resuming the
+exact same spore would duplicate VM identity, while making `resume` secretly
+fork would hide the lifecycle. Fan-out stays explicit and simple: run
+`spore fork SPORE --count N --out DIR`, then loop or orchestrate
+`spore resume DIR/<child>` for each child. Distributed fan-out assigns hosts
+subsets of the child spore directories minted by `spore fork`.
+
+There is no first-class `spore capture` verb in the planned product surface.
+That would split the mental model without adding capability: a new VM is still
+being run until it is captured.
+
+The first capture trigger is host-side and generic. In interactive mode,
+`spore run --capture-on-abort ...` treats the first Ctrl-C as "capture now"
+rather than "abort now"; a second interrupt can still abort. The host consumes
+that first abort signal and must not forward it into the guest before capture,
+otherwise the captured process may have already handled SIGINT or begun
+shutting down. Non-interactive callers can use `--capture-signal NAME` to
+request a specific host signal such as `USR1`. The signal handler only sets an
+atomic capture request or wakes the VMM loop. The actual snapshot is written
+from the normal VMM loop after pending device work has been made safe. The
+default `--capture-on-abort` behavior is to write the spore and exit. Future
+policy can add `--after-capture exit|continue|pause`, but the Ruby counter demo
+and CI fan-out proof only need capture-then-exit.
+
+Streaming output is part of this same surface. The current one-shot exec agent
+captures bounded stdout/stderr and sends it only in the final exit frame; that
+is fine for short commands but invisible for a long-lived process that is going
+to be captured before it exits. `spore run --capture-on-abort ...` should tee
+guest stdout/stderr as the workload runs, then write the spore when the host
+capture signal arrives. `spore resume` should use the same streaming path so
+resumed children are visible immediately, not only after they exit.
+
+This avoids requiring a guest API before the thesis is proven. A later
+guest-visible readiness/checkpoint API can still be added for applications that
+want to choose their own capture point, but it is not required for the first
+compelling demo.
+
 ## Safety And Invariants
 
 - `--json` writes exactly one machine-readable result frame to stdout; asset
   resolution, downloads, and cache messages go to stderr.
+- Streaming command output is initially a non-JSON product mode. Keep the
+  existing single-frame `--json` contract until an explicit event-stream JSON
+  mode is designed.
 - Missing default assets fail before booting a VM.
 - Default asset cache writes use temporary files plus atomic rename.
 - Downloaded kernels are verified before use.
@@ -327,6 +383,36 @@ Scope:
 This is deliberately later because it crosses from VMM bridge into workload
 policy.
 
+### Slice F: Host-Signalled Run Capture And Resume Surface
+
+Scope:
+
+- Add `spore run --capture-on-abort PATH` for long-running workloads.
+- In interactive capture mode, make the first Ctrl-C request capture and a
+  second interrupt abort. The first abort signal is consumed by the host and is
+  not forwarded to the guest before capture.
+- Add `--capture-signal NAME` for non-interactive host-side capture triggers.
+- Snapshot from the backend run loop, not directly from the signal handler.
+- Stream guest output while the workload is running so demos can show progress
+  before capture, and stream resumed child output through the same path.
+- Add `spore resume SPORE` as the product resume verb for exactly one captured
+  or forked spore.
+- Keep fan-out as `spore fork --count N --out DIR` plus repeated
+  `spore resume DIR/<child>` calls; `spore resume` must not grow a `--count`
+  flag in this slice.
+
+Done when:
+
+```console
+spore run --image ruby-demo --capture-on-abort ruby-counter.spore -- ruby /demo/counter.rb
+# press Ctrl-C to capture
+spore fork ruby-counter.spore --count 10 --out ruby-counter.children/
+for child in ruby-counter.children/*; do spore resume "$child" & done
+```
+
+shows a live Ruby process counting before capture and ten resumed children
+streaming interleaved counters from the same captured process state.
+
 ## Verification
 
 - Unit tests for run argument parsing and default asset resolution.
@@ -362,6 +448,10 @@ policy.
   cache entry after lookup.
 - `SPOREVM_ROOTFS_CACHE_DIR` is the explicit cache override for direct image
   rootfs outputs.
+- Capture belongs on `spore run --capture-on-abort`; do not add a standalone
+  `spore capture` command for the first product surface.
+- `spore resume SPORE` resumes exactly one spore; fan-out remains explicit via
+  `spore fork` plus repeated `spore resume` calls.
 
 ## Open Questions And Recommended Defaults
 
