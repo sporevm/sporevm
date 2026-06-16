@@ -29,7 +29,7 @@ fuzz targets from the slice that introduces it:
 | CAS chunk reads | peers, registry, disk | BLAKE3 verified before restore; malformed memory manifests are fuzzed; compression is not in v0 |
 | Chunkpack bundle index and pack segments | peers, registry, disk | index parsing is fuzzed; unpack only accepts canonical pack paths and verifies segment SHA256 plus logical BLAKE3 chunk IDs before writing chunks |
 | `spore run` exit frames | guest vsock stream | bounded host buffer; exit/timing string parser is unit and fuzz covered; malformed frames fail the run |
-| OCI manifest and layer decode | registry | rootfs builder only, outside the monitor process; mutable tags are resolved into digest-pinned refs before build materialization, blobs are verified, tar application is path-safe, and JSON/tar fuzz targets cover parser inputs |
+| OCI manifest, OCI layout, and layer decode | registry, local OCI layout | rootfs builder only, outside the monitor process; mutable tags are resolved into digest-pinned refs before build materialization, local refs resolve to digest-pinned local identities, blobs are verified, layout tar extraction and layer tar application are path-safe, and JSON/tar fuzz targets cover parser inputs |
 | Generation device inputs | guest | MMIO register surface and fork/resume params schema are fuzz/unit covered |
 | Control socket JSON | local consumers | product monitor protocol not implemented yet |
 

@@ -46,6 +46,36 @@ every invocation. If the ref record or referenced rootfs is missing or
 mismatched, SporeVM falls back to the registry path and updates the record after
 the rootfs cache is valid.
 
+For local Docker buildx workflows, SporeVM consumes an OCI layout instead of the
+Docker daemon or socket. Buildx writes the layout, then `spore rootfs
+import-oci` imports it into the same deterministic rootfs cache:
+
+```bash
+docker buildx build \
+  --platform linux/arm64 \
+  --output type=oci,dest=/tmp/sporevm-app.oci \
+  .
+
+spore rootfs import-oci /tmp/sporevm-app.oci \
+  --ref local/sporevm-app:dev \
+  --platform linux/arm64
+
+spore run --image local/sporevm-app:dev -- /bin/echo hi
+```
+
+`import-oci` accepts either an OCI layout directory or an uncompressed OCI layout
+tar like buildx writes. It verifies all `blobs/sha256/*` files against their
+filename digest, selects the requested platform from `index.json`, rejects
+unsupported manifest/config/layer media types, applies the verified layer tars,
+and writes the deterministic ext4 output under the resolved image cache key.
+
+Local refs use the `local/<name>:<tag>` form and are host-local mutable pointers
+only. The imported rootfs metadata records a digest-pinned local resolved
+identity, `local/<name>@sha256:<manifest>`, while captured spores continue to
+restore by the ext4 BLAKE3 artifact digest and size. `spore run --image
+local/...` resolves from the local ref cache and does not fall back to a network
+registry.
+
 Set `SPOREVM_ROOTFS_CACHE_DIR` to choose the cache directory; otherwise SporeVM
 uses the platform cache directory. Cache setup messages are shown only with
 `spore --debug ...`, so command stdout and stderr stay workload-focused by

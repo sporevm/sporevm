@@ -231,6 +231,10 @@ Or let `spore run` build and reuse a cached rootfs from an OCI reference:
 zig-out/bin/spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
 ```
 
+For local Docker buildx output without a registry push, import an OCI layout
+with `spore rootfs import-oci ... --ref local/name:tag`, then run with
+`spore run --image local/name:tag`.
+
 `--image` still runs the explicit argv after `--`. It does not apply OCI
 Entrypoint, Cmd, User, Env, or Workdir yet. Set `SPOREVM_ROOTFS_CACHE_DIR` to
 override the cache directory.
@@ -239,7 +243,7 @@ When combined with `--capture-on-abort`, `--image` records immutable rootfs
 identity in the spore manifest. `spore resume` later verifies the cached rootfs
 bytes by digest before attaching the fd read-only. `--rootfs PATH` still works
 for ordinary runs, but `--rootfs PATH --capture-on-abort` is rejected until
-there is an import/preload command that can record portable rootfs identity.
+there is an import/preload command for arbitrary local rootfs identity.
 
 Exercise the rootfs capture/fork/resume path with:
 

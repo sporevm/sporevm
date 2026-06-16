@@ -93,6 +93,9 @@ would be fragile locally and unsafe across multiple hosts.
 - `spore run --image REF` resolves REF to a linux/arm64 digest-pinned image
   identity, builds or reuses a cached deterministic ext4 rootfs, and delegates
   to the same read-only `--rootfs` execution path.
+- `spore rootfs import-oci` imports a local OCI layout directory or buildx
+  OCI-layout tar into the deterministic rootfs cache under a host-local
+  `local/<name>:<tag>` ref.
 - Rootfs build metadata records OCI identity such as `image_ref`,
   `resolved_image_ref`, `image_manifest_digest`, `platform`, and
   `builder_version`.
@@ -120,6 +123,8 @@ would be fragile locally and unsafe across multiple hosts.
   manifests.
 - Implemented: an opt-in Ruby OCI rootfs fan-out smoke that captures, forks,
   and resumes children in parallel through product commands.
+- Implemented: local OCI layout import for buildx output without Docker daemon
+  or registry access in SporeVM.
 - Remaining: the remote preload or bundle UX.
 
 ## Target Model

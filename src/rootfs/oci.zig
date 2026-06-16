@@ -190,6 +190,11 @@ pub fn isManifestMediaType(media_type: []const u8) bool {
         std.mem.eql(u8, media_type, "application/vnd.docker.distribution.manifest.v2+json");
 }
 
+pub fn isConfigMediaType(media_type: []const u8) bool {
+    return std.mem.eql(u8, media_type, "application/vnd.oci.image.config.v1+json") or
+        std.mem.eql(u8, media_type, "application/vnd.docker.container.image.v1+json");
+}
+
 pub fn isSupportedLayerMediaType(media_type: []const u8) bool {
     return isGzipLayerMediaType(media_type) or isPlainTarLayerMediaType(media_type);
 }
@@ -376,6 +381,9 @@ test "OCI index detection accepts manifest arrays without mediaType" {
 }
 
 test "supported layer media types include gzip and plain tar variants" {
+    try std.testing.expect(isConfigMediaType("application/vnd.oci.image.config.v1+json"));
+    try std.testing.expect(isConfigMediaType("application/vnd.docker.container.image.v1+json"));
+    try std.testing.expect(!isConfigMediaType("application/octet-stream"));
     try std.testing.expect(isSupportedLayerMediaType("application/vnd.oci.image.layer.v1.tar+gzip"));
     try std.testing.expect(isSupportedLayerMediaType("application/vnd.oci.image.layer.v1.tar"));
     try std.testing.expect(isSupportedLayerMediaType("application/vnd.docker.image.rootfs.diff.tar"));
