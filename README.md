@@ -54,7 +54,7 @@ Current `main` can:
 - inspect host platform facts with `spore host-info`;
 - summarize a spore manifest with `spore inspect <spore-dir>`;
 - run one explicit argv request in a throwaway VM with `spore run`;
-- run one explicit argv request from an existing spore with `spore run --from`;
+- run one explicit argv request from a completed base spore with `spore run --from`;
 - stream fresh run stdout/stderr and exit with the guest command status;
 - capture a `spore run` on command exit or on a host signal with `--capture`;
 - mint metadata-only child spores with `spore fork`;
@@ -135,7 +135,7 @@ The minimal agent streams command stdout and stderr over a small framed vsock
 protocol. The host forwards those streams and exits with the guest command
 status.
 
-Run one command from an existing spore:
+Run one command from a completed base spore:
 
 ```bash
 zig-out/bin/spore run --from /tmp/run.spore -- /bin/writeout
@@ -145,7 +145,10 @@ zig-out/bin/spore run --from /tmp/run.spore -- /bin/writeout
 recorded in the manifest, sends the argv after `--` to the restored exec agent,
 streams stdout/stderr, and exits with the command status. It is mutually
 exclusive with fresh boot inputs such as `--kernel`, `--initrd`, `--rootfs`, and
-`--image`; the RAM size comes from the spore manifest.
+`--image`; the RAM size comes from the spore manifest. The restored guest must be
+able to accept a fresh exec session. Signal-captured running workloads remain a
+`spore resume`, `spore fork`, or `spore fanout` path until the guest-agent
+protocol can reconnect to or multiplex active commands.
 
 Keep one named VM alive and run more than one command in it:
 

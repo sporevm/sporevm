@@ -54,7 +54,7 @@ vsock connection and exits with the guest command status. The old product
 `--json` final-frame mode is gone before 1.0; any future machine-readable stream
 should be a deliberate JSONL/event mode.
 
-Run one explicit argv request from an existing spore:
+Run one explicit argv request from a completed base spore:
 
 ```console
 spore run --from base.spore -- /bin/writeout
@@ -64,7 +64,10 @@ spore run --from base.spore -- /bin/writeout
 recorded in the manifest, sends the argv after `--` to the restored exec agent,
 streams stdout/stderr, and exits with the command status. It is mutually
 exclusive with fresh boot inputs such as `--kernel`, `--initrd`, `--rootfs`, and
-`--image`; RAM size is manifest-derived.
+`--image`; RAM size is manifest-derived. The restored guest must be able to
+accept a fresh exec session. Signal-captured running workloads remain a
+`spore resume`, `spore fork`, or `spore fanout` path until the guest-agent
+protocol can reconnect to or multiplex active commands.
 
 Run from an explicit read-only ext4 rootfs:
 
@@ -132,6 +135,9 @@ mint child spores with `spore fork`, then resume them individually or through
   frozen device model.
 - `spore run --from` does not accept fresh boot inputs; kernel, initrd, RAM size,
   and optional immutable rootfs identity come from the spore.
+- `spore run --from` starts a new exec-agent session. It does not reconnect to
+  or interrupt a command that was already running when the source spore was
+  captured.
 - `--rootfs PATH --capture` is rejected until an import/preload command
   can record portable rootfs identity for arbitrary local images.
 - Resumed captured workloads are visible through restored guest console output.
