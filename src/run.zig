@@ -12,17 +12,22 @@ const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
 else
     struct {};
+const local_paths = @import("local_paths.zig");
 const rootfs_mod = @import("rootfs.zig");
 const spore = @import("spore.zig");
 const vsock = @import("virtio/vsock.zig");
 
 const max_file_size = 256 * 1024 * 1024;
+const max_kernel_asset_size = 256 * 1024 * 1024;
+const managed_kernel_download_attempts = 3;
 const max_guest_argc = 16;
 const max_guest_arg_len = 255;
 const max_guest_request_len = 2047;
 const max_guest_port = 65535;
 const default_run_initrd_name = "minimal-exec-initrd.cpio";
-const rootfs_cache_env = "SPOREVM_ROOTFS_CACHE_DIR";
+const default_kernel_repository = "buildkite/cleanroom-kernels";
+const default_kernel_release = "v0.4.0";
+const default_kernel_version = "6.1.155";
 const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
 
@@ -452,19 +457,13 @@ fn ensureDirPath(io: Io, path: []const u8) !void {
 }
 
 pub fn rootfsCacheRootPath(init: std.process.Init, allocator: std.mem.Allocator, command_name: []const u8) ![]const u8 {
-    if (init.environ_map.get(rootfs_cache_env)) |path| {
-        return std.fs.path.resolve(allocator, &.{path});
-    }
-    if (init.environ_map.get("XDG_CACHE_HOME")) |path| {
-        return std.fs.path.resolve(allocator, &.{ path, "sporevm", "rootfs" });
-    }
-    const home = init.environ_map.get("HOME") orelse {
-        failRunSetup("spore {s}: cannot resolve rootfs cache directory; set {s} or HOME", .{ command_name, rootfs_cache_env });
+    return local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
+        error.MissingHome => failRunSetup(
+            "spore {s}: cannot resolve rootfs cache directory; set {s} or HOME",
+            .{ command_name, local_paths.rootfs_cache_env },
+        ),
+        else => |e| return e,
     };
-    if (comptime builtin.os.tag == .macos) {
-        return std.fs.path.resolve(allocator, &.{ home, "Library", "Caches", "sporevm", "rootfs" });
-    }
-    return std.fs.path.resolve(allocator, &.{ home, ".cache", "sporevm", "rootfs" });
 }
 
 pub fn openVerifiedRootfs(init: std.process.Init, allocator: std.mem.Allocator, rootfs: spore.Rootfs, command_name: []const u8) !std.c.fd_t {
@@ -688,38 +687,12 @@ pub fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Alloc
         return path;
     }
 
-    const helper = try sourceTreeKernelHelperPath(init, allocator);
-    if (!try executablePath(init.io, helper)) {
+    return resolveManagedRunKernelPath(init, allocator) catch |err| {
         failRunSetup(
-            "spore run: default kernel resolver not found at {s}; pass --kernel or set SPOREVM_KERNEL_IMAGE",
-            .{helper},
+            "spore run: managed run kernel resolution failed: {s}; pass --kernel or set SPOREVM_KERNEL_IMAGE",
+            .{@errorName(err)},
         );
-    }
-
-    const result = std.process.run(allocator, init.io, .{
-        .argv = &.{ helper, "run" },
-        .stdout_limit = .limited(16 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-    }) catch |err| {
-        failRunSetup("spore run: default kernel resolver failed before exec: {s}", .{@errorName(err)});
     };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    try writeSetupStderr(init, result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            const trimmed = std.mem.trimEnd(u8, result.stdout, "\r\n");
-            if (trimmed.len == 0) {
-                failRunSetup("spore run: default kernel resolver returned an empty path", .{});
-            }
-            return allocator.dupe(u8, trimmed);
-        },
-        else => {},
-    }
-    failRunSetup(
-        "spore run: default kernel resolver failed; pass --kernel or set SPOREVM_KERNEL_IMAGE",
-        .{},
-    );
 }
 
 pub fn resolveDefaultInitrdPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
@@ -741,20 +714,233 @@ pub fn resolveDefaultInitrdPath(init: std.process.Init, allocator: std.mem.Alloc
     return path;
 }
 
-fn sourceTreeKernelHelperPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
-    const prefix = try installPrefixPath(init, allocator);
-    return sourceTreeKernelHelperPathFromPrefix(allocator, prefix);
+fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    const opts = managedKernelOptions(init);
+    const asset = try managedRunKernelAssetName(allocator, opts.linux_version);
+    const cache_root = local_paths.kernelCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
+        error.MissingHome => failRunSetup(
+            "spore run: cannot resolve kernel cache directory; set {s} or HOME",
+            .{local_paths.kernel_cache_env},
+        ),
+        else => |e| return e,
+    };
+    const repo_cache = try managedKernelRepositoryCacheName(allocator, opts.repository);
+    const dest_dir = try std.fs.path.join(allocator, &.{ cache_root, repo_cache, opts.release });
+    const dest = try std.fs.path.join(allocator, &.{ dest_dir, asset });
+    const sha_dest = try std.fmt.allocPrint(allocator, "{s}.sha256", .{dest});
+
+    if (try verifiedManagedKernelPath(init.io, allocator, dest, sha_dest)) {
+        return dest;
+    }
+
+    try ensureDirPath(init.io, dest_dir);
+    const temp_dir_root = try std.fs.path.join(allocator, &.{ dest_dir, "download" });
+    try ensureDirPath(init.io, temp_dir_root);
+
+    var nonce_bytes: [8]u8 = undefined;
+    init.io.random(&nonce_bytes);
+    const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
+    const temp_image = try std.fmt.allocPrint(allocator, "{s}/{s}.{x}.tmp", .{ temp_dir_root, asset, nonce });
+    const temp_sha = try std.fmt.allocPrint(allocator, "{s}.sha256", .{temp_image});
+    defer Io.Dir.cwd().deleteFile(init.io, temp_image) catch {};
+    defer Io.Dir.cwd().deleteFile(init.io, temp_sha) catch {};
+
+    const message = try std.fmt.allocPrint(allocator, "spore run: downloading managed kernel {s}@{s}:{s}\n", .{ opts.repository, opts.release, asset });
+    try writeSetupStderr(init, message);
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
+    defer client.deinit();
+    try fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, asset, temp_image);
+    const sha_asset = try std.fmt.allocPrint(allocator, "{s}.sha256", .{asset});
+    try fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, sha_asset, temp_sha);
+    if (!try verifiedManagedKernelPath(init.io, allocator, temp_image, temp_sha)) return error.ManagedKernelChecksumMismatch;
+
+    try Io.Dir.renameAbsolute(temp_image, dest, init.io);
+    try Io.Dir.renameAbsolute(temp_sha, sha_dest, init.io);
+    chmodFileReadOnly(allocator, dest) catch {};
+    chmodFileReadOnly(allocator, sha_dest) catch {};
+    return dest;
+}
+
+const ManagedKernelOptions = struct {
+    repository: []const u8,
+    release: []const u8,
+    linux_version: []const u8,
+};
+
+fn managedKernelOptions(init: std.process.Init) ManagedKernelOptions {
+    return .{
+        .repository = init.environ_map.get("SPOREVM_KERNEL_REPOSITORY") orelse default_kernel_repository,
+        .release = init.environ_map.get("SPOREVM_KERNEL_RELEASE") orelse default_kernel_release,
+        .linux_version = init.environ_map.get("SPOREVM_KERNEL_VERSION") orelse default_kernel_version,
+    };
+}
+
+fn managedRunKernelAssetName(allocator: std.mem.Allocator, linux_version: []const u8) ![]const u8 {
+    try validateManagedKernelVersion(linux_version);
+    return std.fmt.allocPrint(allocator, "sporevm-run-arm64-linux-{s}-Image", .{linux_version});
+}
+
+fn validateManagedKernelVersion(version: []const u8) !void {
+    if (version.len == 0) return error.BadManagedKernelVersion;
+    for (version) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_')) return error.BadManagedKernelVersion;
+    }
+}
+
+fn managedKernelRepositoryCacheName(allocator: std.mem.Allocator, repository: []const u8) ![]const u8 {
+    try validateManagedKernelRepository(repository);
+    const cache = try allocator.dupe(u8, repository);
+    std.mem.replaceScalar(u8, cache, '/', '-');
+    return cache;
+}
+
+fn validateManagedKernelRepository(repository: []const u8) !void {
+    if (repository.len == 0) return error.BadManagedKernelRepository;
+    var slash_count: u8 = 0;
+    var segments = std.mem.splitScalar(u8, repository, '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return error.BadManagedKernelRepository;
+    }
+    for (repository) |c| {
+        if (c == '/') {
+            slash_count += 1;
+        } else if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_')) {
+            return error.BadManagedKernelRepository;
+        }
+    }
+    if (slash_count != 1) return error.BadManagedKernelRepository;
+}
+
+fn verifiedManagedKernelPath(io: Io, allocator: std.mem.Allocator, image_path: []const u8, sha_path: []const u8) !bool {
+    if (!try regularFileNoSymlink(io, image_path)) return false;
+    if (!try regularFileNoSymlink(io, sha_path)) return false;
+    const expected = readExpectedSha256(io, allocator, sha_path) catch |err| switch (err) {
+        error.BadManagedKernelChecksum => return false,
+        else => |e| return e,
+    };
+    defer allocator.free(expected);
+    const actual = try sha256FileHex(io, image_path);
+    return std.ascii.eqlIgnoreCase(expected, &actual);
+}
+
+fn readExpectedSha256(io: Io, allocator: std.mem.Allocator, sha_path: []const u8) ![]const u8 {
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, sha_path, allocator, .limited(4096));
+    defer allocator.free(bytes);
+    var fields = std.mem.tokenizeAny(u8, bytes, " \t\r\n");
+    const first = fields.next() orelse return error.BadManagedKernelChecksum;
+    if (!isSha256Hex(first)) return error.BadManagedKernelChecksum;
+    return allocator.dupe(u8, first);
+}
+
+fn isSha256Hex(value: []const u8) bool {
+    if (value.len != Sha256.digest_length * 2) return false;
+    for (value) |c| {
+        if (!std.ascii.isHex(c)) return false;
+    }
+    return true;
+}
+
+fn sha256FileHex(io: Io, path: []const u8) ![Sha256.digest_length * 2]u8 {
+    var file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader_buf: [64 * 1024]u8 = undefined;
+    var reader: Io.File.Reader = .initStreaming(file, io, &reader_buf);
+    var h = Sha256.init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = try reader.interface.readSliceShort(&buf);
+        if (n == 0) break;
+        h.update(buf[0..n]);
+    }
+    var out: [Sha256.digest_length]u8 = undefined;
+    h.final(&out);
+    return std.fmt.bytesToHex(out, .lower);
+}
+
+fn fetchManagedKernelAsset(
+    allocator: std.mem.Allocator,
+    io: Io,
+    client: *std.http.Client,
+    repository: []const u8,
+    release: []const u8,
+    asset: []const u8,
+    output_path: []const u8,
+) !void {
+    try validateManagedKernelRepository(repository);
+    try validateManagedKernelVersion(release);
+    try validateManagedKernelAsset(asset);
+    const url = try std.fmt.allocPrint(allocator, "https://github.com/{s}/releases/download/{s}/{s}", .{ repository, release, asset });
+    var attempt: u8 = 0;
+    while (attempt < managed_kernel_download_attempts) : (attempt += 1) {
+        Io.Dir.cwd().deleteFile(io, output_path) catch {};
+        httpGetToFile(io, client, url, output_path, max_kernel_asset_size) catch |err| {
+            if (attempt + 1 == managed_kernel_download_attempts) return err;
+            continue;
+        };
+        return;
+    }
+    unreachable;
+}
+
+fn validateManagedKernelAsset(asset: []const u8) !void {
+    if (asset.len == 0) return error.BadManagedKernelAsset;
+    for (asset) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_')) return error.BadManagedKernelAsset;
+    }
+}
+
+fn httpGetToFile(
+    io: Io,
+    client: *std.http.Client,
+    url: []const u8,
+    output_path: []const u8,
+    max_body_bytes: u64,
+) !void {
+    var file = try Io.Dir.cwd().createFile(io, output_path, .{});
+    defer file.close(io);
+    var buffer: [64 * 1024]u8 = undefined;
+    var file_writer: Io.File.Writer = .initStreaming(file, io, &buffer);
+    try httpGetToWriter(client, url, &file_writer.interface, max_body_bytes);
+    try file_writer.interface.flush();
+}
+
+fn httpGetToWriter(client: *std.http.Client, url: []const u8, writer: *Io.Writer, max_body_bytes: u64) !void {
+    const uri = try std.Uri.parse(url);
+    const accept_header = std.http.Header{ .name = "accept", .value = "application/octet-stream" };
+    var req = try client.request(.GET, uri, .{
+        .extra_headers = &.{accept_header},
+    });
+    defer req.deinit();
+    try req.sendBodiless();
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+    if (response.head.status != .ok) return error.ManagedKernelHTTPStatus;
+
+    var transfer_buffer: [64 * 1024]u8 = undefined;
+    var body = response.reader(&transfer_buffer);
+    var copied: u64 = 0;
+    var copy_buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = body.readSliceShort(&copy_buffer) catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr() orelse err,
+            else => |e| return e,
+        };
+        if (n == 0) return;
+        if (n > max_body_bytes - copied) return error.ManagedKernelBodyTooLarge;
+        copied += @intCast(n);
+        try writer.writeAll(copy_buffer[0..n]);
+    }
+}
+
+fn chmodFileReadOnly(allocator: std.mem.Allocator, path: []const u8) !void {
+    const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
+    if (std.c.chmod(pathz, 0o444) != 0) return error.ChmodFailed;
 }
 
 fn defaultInitrdPathFromPrefix(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
     return std.fs.path.join(allocator, &.{ prefix, "share", "sporevm", default_run_initrd_name });
-}
-
-fn sourceTreeKernelHelperPathFromPrefix(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
-    const repo_root = std.fs.path.dirname(prefix) orelse {
-        failRunSetup("spore run: cannot resolve source tree from install prefix {s}", .{prefix});
-    };
-    return std.fs.path.join(allocator, &.{ repo_root, "scripts", "ensure-managed-kernel.sh" });
 }
 
 fn installPrefixPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
@@ -1398,8 +1584,45 @@ test "run default asset paths derive from install prefix" {
     const initrd = try defaultInitrdPathFromPrefix(allocator, "/repo/zig-out");
     defer allocator.free(initrd);
     try std.testing.expectEqualStrings("/repo/zig-out/share/sporevm/minimal-exec-initrd.cpio", initrd);
+}
 
-    const helper = try sourceTreeKernelHelperPathFromPrefix(allocator, "/repo/zig-out");
-    defer allocator.free(helper);
-    try std.testing.expectEqualStrings("/repo/scripts/ensure-managed-kernel.sh", helper);
+test "managed run kernel asset names validate input" {
+    const allocator = std.testing.allocator;
+    const asset = try managedRunKernelAssetName(allocator, "6.1.155");
+    defer allocator.free(asset);
+    try std.testing.expectEqualStrings("sporevm-run-arm64-linux-6.1.155-Image", asset);
+
+    try std.testing.expectError(error.BadManagedKernelVersion, managedRunKernelAssetName(allocator, "../bad"));
+}
+
+test "managed kernel repository cache name validates owner and repo" {
+    const allocator = std.testing.allocator;
+    const cache = try managedKernelRepositoryCacheName(allocator, "buildkite/cleanroom-kernels");
+    defer allocator.free(cache);
+    try std.testing.expectEqualStrings("buildkite-cleanroom-kernels", cache);
+
+    try std.testing.expectError(error.BadManagedKernelRepository, managedKernelRepositoryCacheName(allocator, "buildkite"));
+    try std.testing.expectError(error.BadManagedKernelRepository, managedKernelRepositoryCacheName(allocator, "../cleanroom-kernels"));
+}
+
+test "managed kernel checksum parser reads sha256 sidecar" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-run-kernel-checksum";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, tmp);
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+
+    const sha_path = tmp ++ "/Image.sha256";
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = sha_path,
+        .data = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  Image\n",
+    });
+
+    const expected = try readExpectedSha256(io, allocator, sha_path);
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", expected);
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = sha_path, .data = "not-a-sha\n" });
+    try std.testing.expectError(error.BadManagedKernelChecksum, readExpectedSha256(io, allocator, sha_path));
 }

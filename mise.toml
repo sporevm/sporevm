@@ -5,6 +5,10 @@ zig = "0.16.0"
 run = "zig build"
 description = "Build sporevm"
 
+[tasks.install]
+run = "zig build --release=safe --prefix \"$HOME\""
+description = "Install optimized spore into ~/bin"
+
 [tasks.test]
 run = "zig build test"
 description = "Run unit tests"
