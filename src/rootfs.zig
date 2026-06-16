@@ -343,6 +343,10 @@ pub const BuildResult = struct {
     rootfs_blake3: [chunk.ChunkId.hex_len]u8,
 };
 
+pub fn validateTaggedImageRef(raw_ref: []const u8) !void {
+    _ = try ImageTag.parse(raw_ref);
+}
+
 const OwnershipMap = ownership_mod.Map;
 
 const BuildImageSource = struct {

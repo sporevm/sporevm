@@ -38,11 +38,18 @@ rootfs execution path:
 spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
 ```
 
-The cache key includes the resolved digest-pinned image ref, target platform,
-and rootfs builder version. Set `SPOREVM_ROOTFS_CACHE_DIR` to choose the cache
-directory; otherwise SporeVM uses the platform cache directory. Cache setup
-messages are shown only with `spore --debug ...`, so command stdout and stderr
-stay workload-focused by default.
+The rootfs cache key includes the resolved digest-pinned image ref, target
+platform, and rootfs builder version. Mutable tag inputs also get a small local
+ref record, so a warm `spore run --image docker.io/library/alpine:3.20` can go
+straight to the previously validated rootfs instead of re-resolving the tag on
+every invocation. If the ref record or referenced rootfs is missing or
+mismatched, SporeVM falls back to the registry path and updates the record after
+the rootfs cache is valid.
+
+Set `SPOREVM_ROOTFS_CACHE_DIR` to choose the cache directory; otherwise SporeVM
+uses the platform cache directory. Cache setup messages are shown only with
+`spore --debug ...`, so command stdout and stderr stay workload-focused by
+default.
 
 When `spore run --image ... --capture-on-abort SPORE` captures a VM, the spore
 manifest records an immutable rootfs artifact: the ext4 content BLAKE3 digest,
