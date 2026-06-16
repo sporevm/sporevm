@@ -21,6 +21,12 @@ A spore is a directory:
 └── ram.backing             # optional local same-host RAM acceleration file
 ```
 
+Spores captured from `spore run --image ... --capture-on-abort` may also require
+an immutable rootfs artifact from the local rootfs digest cache. The artifact is
+not stored inside the spore directory today; the manifest records its digest,
+size, device binding, and provenance so `spore resume` can reopen and verify the
+cached bytes before boot.
+
 A local bundle is the first distribution form:
 
 ```text
@@ -95,13 +101,19 @@ cache identity. It is not a replacement for per-chunk verification.
   CoW pages. The current `kvm-boot`/`hvf-boot --trust-ram-backing` harnesses
   open the local `ram.backing` path as an interim adapter; the backends
   themselves no longer resolve manifest paths.
+- `rootfs`: optional immutable rootfs artifact required by a captured
+  read-only virtio-blk root device. `kind` is
+  `immutable-ext4-rootfs-v0`, `mode` is `read-only`, `device` binds the
+  artifact to the rootfs virtio-mmio slot, `artifact` records a
+  `blake3:<hex>` digest, size, and `ext4` format, and `source` records OCI
+  provenance. The digest and size are restore authority; OCI metadata is not.
 
 ## Not yet captured in v0
 
-- Disk contents: the spore references no disk state. Resume requires the
-  same backing disk file, unmodified since the snapshot (same-host suspend
-  semantics; Firecracker snapshots have the same constraint). The disk
-  manifest is planned for the fork/fan-out slices.
+- Arbitrary or writable disk contents: v0 can reference one verified immutable
+  ext4 rootfs artifact for product resume, but it does not capture disk
+  mutations or general block-device state. Writable disk manifests are planned
+  for later fork/fan-out slices.
 - Access traces: the KVM and HVF lazy-restore harnesses can write local
   first-touch traces for measurement, but v0 does not persist access traces or
   prefetch hints in the manifest.
@@ -122,6 +134,9 @@ cache identity. It is not a replacement for per-chunk verification.
 - Chunkpack bundles are portable only after local RAM backing metadata has been
   stripped. `spore unpack` reconstitutes normal `chunks/<blake3>` files and
   fails closed when a pack segment's SHA256 or logical BLAKE3 id mismatches.
+- Immutable rootfs artifacts are portable by digest, not by local path. Resume
+  opens the digest-addressed rootfs cache entry read-only, verifies the same fd
+  by BLAKE3 and size, and only then attaches it to the VM.
 - Local RAM backing files are same-host acceleration hints, not portable trust
   roots. The current path/symlink form is an interim harness adapter, not a
   sealed-fd security boundary. Consumers that need portable or untrusted restore

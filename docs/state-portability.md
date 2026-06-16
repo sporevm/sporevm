@@ -22,11 +22,13 @@ v0 portability is deliberately narrow:
 - Device model: the frozen SporeVM board contract — virtio-mmio console,
   optional blk, net, vsock, rng, and the generation MMIO device.
 - Memory: full eager RAM materialization from content-addressed chunks.
-- Disk: not captured. A resumed VM using a disk must be given the same backing
-  disk bytes out of band.
+- Disk: arbitrary or writable disk state is not captured. A captured
+  `spore run --image` workload may reference one verified immutable ext4 rootfs
+  artifact by digest; any other disk dependency requires the same backing bytes
+  out of band or fails closed.
 
-Cross-ISA restore, multi-vCPU restore, disk manifests, lazy paging, and fork
-generation fixups are later slices.
+Cross-ISA restore, multi-vCPU restore, writable disk manifests, persisted access
+traces, and broader disk/device fixups are later slices.
 
 ## Platform contract
 
@@ -74,7 +76,8 @@ block identical-host fork/fan-out.
 | Virtio-mmio transport | device ID, feature selectors, negotiated features, status, interrupt status, queue addresses/indices | yes | yes | yes | yes | portable |
 | Virtqueue descriptors and buffers | guest RAM | yes | yes | yes | yes | portable through RAM |
 | Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; fork path populates it |
-| Disk contents | not represented | no | same external bytes required | no | same external bytes required | out of v0 |
+| Immutable rootfs artifact | optional digest/size/device binding plus OCI provenance | yes via `spore run --image` | verifies cached artifact fd | yes via `spore run --image` | verifies cached artifact fd | read-only product resume |
+| Writable disk contents | not represented | no | same external bytes required or reject | no | same external bytes required or reject | out of v0 |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
 | Access trace | not yet represented | no | no | no | no | local KVM/HVF lazy traces only; not a portability contract |
 
