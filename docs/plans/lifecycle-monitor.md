@@ -9,6 +9,8 @@ spec_refs:
   - src/lifecycle.zig
   - src/monitor.zig
   - src/run.zig
+  - guest/minimal-initrd/
+  - scripts/make-minimal-exec-initrd.sh
   - scripts/benchmark-sporevm-lifecycle.sh
 related_plans:
   - docs/plans/foundation.md

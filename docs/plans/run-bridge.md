@@ -10,6 +10,7 @@ spec_refs:
   - src/resume.zig
   - src/fanout.zig
   - src/rootfs.zig
+  - guest/minimal-initrd/
   - scripts/make-minimal-exec-initrd.sh
   - scripts/smoke-counter-fanout.sh
 related_plans:
