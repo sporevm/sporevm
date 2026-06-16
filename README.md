@@ -58,6 +58,7 @@ Current `main` can:
 - capture a long-running `spore run` on a host signal with
   `--capture-on-abort`;
 - mint metadata-only child spores with `spore fork`;
+- resume forked child directories with prefixed output using `spore fanout`;
 - resume one diskless or verified immutable-rootfs spore with `spore resume`;
 - pack and unpack local chunkpack bundles with `spore pack` / `spore unpack`;
 - build deterministic ext4 rootfs images from OCI images with
@@ -71,6 +72,10 @@ Current `main` can:
 Named lifecycle monitor mode is currently local-HVF only. KVM monitor wake
 support and disk-backed lifecycle suspend/resume remain follow-up work. The
 backend smoke harnesses still exercise lower-level capture paths directly.
+
+Current active work is concentrated in three places: always-on dirty tracking and
+distribution scale in the foundation plan, remote preparation for immutable
+rootfs artifacts, and named lifecycle speed/KVM parity.
 
 ## Development
 
