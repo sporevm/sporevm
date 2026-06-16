@@ -5,6 +5,7 @@ spec_refs:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
   - README.md
+  - src/local_paths.zig
   - src/run.zig
   - scripts/make-minimal-exec-initrd.sh
 related_plans:
@@ -155,6 +156,9 @@ Resolution order:
 1. `SPOREVM_RUNTIME_DIR`
 2. `$XDG_RUNTIME_DIR/sporevm`
 3. a platform temp fallback such as `$TMPDIR/sporevm-$UID`, created `0700`
+
+The path-selection logic is shared through `src/local_paths.zig`; lifecycle
+still owns private-directory validation for live VM state.
 
 Do not store live sockets under the rootfs cache or a persistent home cache.
 Runtime directories must be private to the current user. VM names are not path

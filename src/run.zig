@@ -12,6 +12,7 @@ const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
 else
     struct {};
+const local_paths = @import("local_paths.zig");
 const rootfs_mod = @import("rootfs.zig");
 const spore = @import("spore.zig");
 const vsock = @import("virtio/vsock.zig");
@@ -23,11 +24,9 @@ const max_guest_arg_len = 255;
 const max_guest_request_len = 2047;
 const max_guest_port = 65535;
 const default_run_initrd_name = "minimal-exec-initrd.cpio";
-const kernel_cache_env = "SPOREVM_KERNEL_CACHE_DIR";
 const default_kernel_repository = "buildkite/cleanroom-kernels";
 const default_kernel_release = "v0.4.0";
 const default_kernel_version = "6.1.155";
-const rootfs_cache_env = "SPOREVM_ROOTFS_CACHE_DIR";
 const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
 
@@ -457,19 +456,13 @@ fn ensureDirPath(io: Io, path: []const u8) !void {
 }
 
 pub fn rootfsCacheRootPath(init: std.process.Init, allocator: std.mem.Allocator, command_name: []const u8) ![]const u8 {
-    if (init.environ_map.get(rootfs_cache_env)) |path| {
-        return std.fs.path.resolve(allocator, &.{path});
-    }
-    if (init.environ_map.get("XDG_CACHE_HOME")) |path| {
-        return std.fs.path.resolve(allocator, &.{ path, "sporevm", "rootfs" });
-    }
-    const home = init.environ_map.get("HOME") orelse {
-        failRunSetup("spore {s}: cannot resolve rootfs cache directory; set {s} or HOME", .{ command_name, rootfs_cache_env });
+    return local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
+        error.MissingHome => failRunSetup(
+            "spore {s}: cannot resolve rootfs cache directory; set {s} or HOME",
+            .{ command_name, local_paths.rootfs_cache_env },
+        ),
+        else => |e| return e,
     };
-    if (comptime builtin.os.tag == .macos) {
-        return std.fs.path.resolve(allocator, &.{ home, "Library", "Caches", "sporevm", "rootfs" });
-    }
-    return std.fs.path.resolve(allocator, &.{ home, ".cache", "sporevm", "rootfs" });
 }
 
 pub fn openVerifiedRootfs(init: std.process.Init, allocator: std.mem.Allocator, rootfs: spore.Rootfs, command_name: []const u8) !std.c.fd_t {
@@ -723,7 +716,13 @@ pub fn resolveDefaultInitrdPath(init: std.process.Init, allocator: std.mem.Alloc
 fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
     const opts = managedKernelOptions(init);
     const asset = try managedRunKernelAssetName(allocator, opts.linux_version);
-    const cache_root = try kernelCacheRootPath(init, allocator);
+    const cache_root = local_paths.kernelCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
+        error.MissingHome => failRunSetup(
+            "spore run: cannot resolve kernel cache directory; set {s} or HOME",
+            .{local_paths.kernel_cache_env},
+        ),
+        else => |e| return e,
+    };
     const repo_cache = try managedKernelRepositoryCacheName(allocator, opts.repository);
     const dest_dir = try std.fs.path.join(allocator, &.{ cache_root, repo_cache, opts.release });
     const dest = try std.fs.path.join(allocator, &.{ dest_dir, asset });
@@ -810,22 +809,6 @@ fn validateManagedKernelRepository(repository: []const u8) !void {
         }
     }
     if (slash_count != 1) return error.BadManagedKernelRepository;
-}
-
-fn kernelCacheRootPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
-    if (init.environ_map.get(kernel_cache_env)) |path| {
-        return std.fs.path.resolve(allocator, &.{path});
-    }
-    if (init.environ_map.get("XDG_CACHE_HOME")) |path| {
-        return std.fs.path.resolve(allocator, &.{ path, "sporevm", "kernels" });
-    }
-    const home = init.environ_map.get("HOME") orelse {
-        failRunSetup("spore run: cannot resolve kernel cache directory; set {s} or HOME", .{kernel_cache_env});
-    };
-    if (comptime builtin.os.tag == .macos) {
-        return std.fs.path.resolve(allocator, &.{ home, "Library", "Caches", "sporevm", "kernels" });
-    }
-    return std.fs.path.resolve(allocator, &.{ home, ".cache", "sporevm", "kernels" });
 }
 
 fn verifiedManagedKernelPath(io: Io, allocator: std.mem.Allocator, image_path: []const u8, sha_path: []const u8) !bool {

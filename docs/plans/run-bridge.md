@@ -5,6 +5,7 @@ spec_refs:
   - docs/plans/foundation.md
   - docs/rootfs.md
   - README.md
+  - src/local_paths.zig
   - src/run.zig
   - src/rootfs.zig
   - scripts/make-minimal-exec-initrd.sh

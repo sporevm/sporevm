@@ -5,10 +5,11 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const net = std.Io.net;
 
+const local_paths = @import("local_paths.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 
-pub const runtime_dir_env = "SPOREVM_RUNTIME_DIR";
+pub const runtime_dir_env = local_paths.runtime_dir_env;
 pub const max_name_len = 128;
 
 const max_metadata_bytes = 64 * 1024;
@@ -429,16 +430,7 @@ pub fn validateName(name: []const u8) !void {
 }
 
 pub fn runtimeRootPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
-    if (environ.get(runtime_dir_env)) |path| return resolveRequiredAbsolute(allocator, path);
-    if (environ.get("XDG_RUNTIME_DIR")) |path| {
-        try validateAbsolutePath(path);
-        return std.fs.path.resolve(allocator, &.{ path, "sporevm" });
-    }
-    const tmp = environ.get("TMPDIR") orelse "/tmp";
-    try validateAbsolutePath(tmp);
-    const leaf = try fallbackRuntimeLeaf(allocator);
-    defer allocator.free(leaf);
-    return std.fs.path.resolve(allocator, &.{ tmp, leaf });
+    return local_paths.runtimeRootPath(allocator, environ);
 }
 
 pub fn pathsFor(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, name: []const u8) !Paths {
@@ -1099,23 +1091,9 @@ pub fn monitorBackendSupported(raw: []const u8) bool {
     return comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
 }
 
-fn resolveRequiredAbsolute(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    try validateAbsolutePath(path);
-    return std.fs.path.resolve(allocator, &.{path});
-}
-
-fn validateAbsolutePath(path: []const u8) !void {
-    if (path.len == 0 or !Io.Dir.path.isAbsolute(path)) return error.InvalidRuntimeDir;
-}
-
 fn openDirPath(io: Io, path: []const u8, flags: Io.Dir.OpenOptions) !Io.Dir {
     if (Io.Dir.path.isAbsolute(path)) return Io.Dir.openDirAbsolute(io, path, flags);
     return Io.Dir.cwd().openDir(io, path, flags);
-}
-
-fn fallbackRuntimeLeaf(allocator: std.mem.Allocator) ![]const u8 {
-    if (comptime builtin.os.tag == .windows) return allocator.dupe(u8, "sporevm");
-    return std.fmt.allocPrint(allocator, "sporevm-{d}", .{std.c.getuid()});
 }
 
 fn ensureVmDir(io: Io, paths: Paths) !void {
