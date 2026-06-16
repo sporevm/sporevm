@@ -217,6 +217,13 @@ spore fork counter.spore --count 10 --out counter.children/
 for child in counter.children/*; do spore resume "$child" & done
 ```
 
+Forked children in this local contract expose SporeVM-owned Buildkite-shaped
+identity as `SPORE_PARALLEL_JOB=0..N-1` and
+`SPORE_PARALLEL_JOB_COUNT=N` through `/run/sporevm/env` and
+`/run/sporevm/generation.json`. `fork_index/count` remain batch-local and match
+the parallel fields for this slice; distributed offset/range partitioning is
+deferred.
+
 The product lifecycle should stay explicit:
 
 - `spore run` starts a new workload. Capture is an option on that run through a

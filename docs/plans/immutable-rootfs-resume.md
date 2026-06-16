@@ -122,7 +122,10 @@ would be fragile locally and unsafe across multiple hosts.
 - Implemented: `spore fork` preserves the rootfs artifact reference in child
   manifests.
 - Implemented: an opt-in Ruby OCI rootfs fan-out smoke that captures, forks,
-  and resumes children in parallel through product commands.
+  and resumes children in parallel through product commands. The rootfs agent
+  publishes fork identity to `/run/sporevm/generation.json` and
+  `/run/sporevm/env`; local `parallel_index/count` match batch-local
+  `fork_index/count` until distributed offset/range semantics land.
 - Implemented: local OCI layout import for buildx output without Docker daemon
   or registry access in SporeVM.
 - Remaining: the remote preload or bundle UX.

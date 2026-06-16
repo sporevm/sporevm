@@ -187,6 +187,8 @@ static void process_generation(volatile uint8_t *gen, uint64_t generation, uint3
   unsigned long long parent_generation = 0;
   unsigned long long fork_index = 0;
   unsigned long long fork_count = 0;
+  unsigned long long parallel_index = 0;
+  unsigned long long parallel_count = 0;
   unsigned long long resume_time_unix_ns = 0;
 
   json_string(params, "vm_id", vm_id, sizeof(vm_id));
@@ -196,6 +198,8 @@ static void process_generation(volatile uint8_t *gen, uint64_t generation, uint3
   json_u64(params, "parent_generation", &parent_generation);
   json_u64(params, "fork_index", &fork_index);
   json_u64(params, "fork_count", &fork_count);
+  json_u64(params, "parallel_index", &parallel_index);
+  json_u64(params, "parallel_count", &parallel_count);
   json_u64(params, "resume_time_unix_ns", &resume_time_unix_ns);
 
   if (hostname[0] != '\0') {
@@ -212,8 +216,8 @@ static void process_generation(volatile uint8_t *gen, uint64_t generation, uint3
     apply_clock(resume_time_unix_ns);
   }
 
-  printf("sporevm-fork-smoke generation=%llu parent_generation=%llu fork_index=%llu fork_count=%llu irq_status=%u\n",
-         (unsigned long long)generation, parent_generation, fork_index, fork_count, irq_status);
+  printf("sporevm-fork-smoke generation=%llu parent_generation=%llu fork_index=%llu fork_count=%llu parallel_index=%llu parallel_count=%llu irq_status=%u\n",
+         (unsigned long long)generation, parent_generation, fork_index, fork_count, parallel_index, parallel_count, irq_status);
   printf("sporevm-fork-smoke vm_id=%s hostname=%s mac_address=%s resume_time_unix_ns=%llu entropy_seed=%s\n",
          vm_id, hostname, mac_address, resume_time_unix_ns, entropy_seed);
   printf("sporevm-fork-smoke params=%s\n", params);

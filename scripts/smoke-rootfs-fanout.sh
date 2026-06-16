@@ -68,7 +68,13 @@ printf 'rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}"
   --image "${resolved_image_ref}" \
   --capture-on-abort "${capture_dir}" \
   --capture-signal USR1 \
-  -- /usr/local/bin/ruby -e 'STDOUT.sync = true; puts "spore run ready"; i = 0; loop { puts "ruby counter #{i}"; i += 1; sleep 1 }' \
+  -- /usr/local/bin/ruby \
+  -e 'def spore_env; File.readlines("/run/sporevm/env").to_h { |l| l.strip.split("=", 2) }; rescue; {}; end' \
+  -e 'STDOUT.sync = true; puts "spore run ready"; printed = false; i = 0' \
+  -e 'loop do' \
+  -e 'e = spore_env; if !printed && e["SPORE_PARALLEL_JOB"] && e["SPORE_PARALLEL_JOB_COUNT"]' \
+  -e 'puts "spore parallel job #{e["SPORE_PARALLEL_JOB"]}/#{e["SPORE_PARALLEL_JOB_COUNT"]}"; printed = true; end' \
+  -e 'puts "ruby counter #{i}"; i += 1; sleep 1; end' \
   >"${run_stdout}" 2>"${run_stderr}" &
 run_pid="$!"
 
@@ -138,6 +144,12 @@ fi
 
 for child in "${children[@]}"; do
   child_name="$(basename "${child}")"
+  child_index="$((10#${child_name}))"
+  if ! grep -Eaq "^\[${child_name}\] spore parallel job ${child_index}/${count}" "${fanout_stdout}"; then
+    tail -160 "${fanout_stdout}" >&2 || true
+    cat "${fanout_stderr}" >&2 || true
+    die "child ${child_name} did not report SPORE_PARALLEL_JOB=${child_index} SPORE_PARALLEL_JOB_COUNT=${count}"
+  fi
   if ! grep -Eaq "^\[${child_name}\] .*ruby counter [0-9]+" "${fanout_stdout}"; then
     tail -120 "${fanout_stdout}" >&2 || true
     cat "${fanout_stderr}" >&2 || true

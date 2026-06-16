@@ -520,6 +520,8 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
             .generation = child_generation,
             .fork_index = i,
             .fork_count = options.count,
+            .parallel_index = i,
+            .parallel_count = options.count,
             .fork_batch_id = fork_batch_id,
             .vm_id = identity.vm_id,
             .hostname = identity.hostname,
@@ -556,6 +558,8 @@ const ForkStableParams = struct {
     generation: u64,
     fork_index: usize,
     fork_count: usize,
+    parallel_index: usize,
+    parallel_count: usize,
     fork_batch_id: []const u8,
     vm_id: []const u8,
     hostname: []const u8,
@@ -569,6 +573,8 @@ const ForkResumeParams = struct {
     generation: u64,
     fork_index: usize,
     fork_count: usize,
+    parallel_index: usize,
+    parallel_count: usize,
     fork_batch_id: []const u8,
     vm_id: []const u8,
     hostname: []const u8,
@@ -619,6 +625,8 @@ pub fn refreshResumeParams(allocator: std.mem.Allocator, gen_dev: *generation.De
         .generation = parsed.value.generation,
         .fork_index = parsed.value.fork_index,
         .fork_count = parsed.value.fork_count,
+        .parallel_index = parsed.value.parallel_index,
+        .parallel_count = parsed.value.parallel_count,
         .fork_batch_id = parsed.value.fork_batch_id,
         .vm_id = parsed.value.vm_id,
         .hostname = parsed.value.hostname,
@@ -1197,6 +1205,8 @@ test "fork mints child manifests with shared chunks and pending generation" {
     try dec.decode(decoded, second.value.generation.params_b64);
     try std.testing.expect(std.mem.indexOf(u8, decoded, "\"fork_index\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, decoded, "\"fork_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decoded, "\"parallel_index\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decoded, "\"parallel_count\":2") != null);
     const stable = try std.json.parseFromSlice(ForkStableParams, arena, decoded, .{ .allocate = .alloc_always });
     defer stable.deinit();
     try std.testing.expectEqual(@as(u32, 0), stable.value.schema_version);
@@ -1204,6 +1214,8 @@ test "fork mints child manifests with shared chunks and pending generation" {
     try std.testing.expectEqual(@as(u64, 43), stable.value.generation);
     try std.testing.expectEqual(@as(usize, 1), stable.value.fork_index);
     try std.testing.expectEqual(@as(usize, 2), stable.value.fork_count);
+    try std.testing.expectEqual(@as(usize, 1), stable.value.parallel_index);
+    try std.testing.expectEqual(@as(usize, 2), stable.value.parallel_count);
     try std.testing.expectEqual(@as(usize, 32), stable.value.fork_batch_id.len);
     try std.testing.expect(std.mem.startsWith(u8, stable.value.vm_id, "spore-"));
     try std.testing.expect(std.mem.startsWith(u8, stable.value.hostname, "spore-"));
@@ -1220,6 +1232,8 @@ test "fork mints child manifests with shared chunks and pending generation" {
     defer resumed_params.deinit();
     try std.testing.expectEqualStrings(stable.value.vm_id, resumed_params.value.vm_id);
     try std.testing.expectEqualStrings(stable.value.hostname, resumed_params.value.hostname);
+    try std.testing.expectEqual(@as(usize, 1), resumed_params.value.parallel_index);
+    try std.testing.expectEqual(@as(usize, 2), resumed_params.value.parallel_count);
     try std.testing.expect(resumed_params.value.resume_time_unix_ns > 0);
     try std.testing.expectEqual(@as(usize, 32), resumed_params.value.resume_entropy_seed.len);
 

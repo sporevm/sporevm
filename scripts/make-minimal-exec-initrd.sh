@@ -45,7 +45,7 @@ fi
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-minimal-initrd.XXXXXX")"
 trap 'rm -rf "${workdir}"' EXIT
 
-mkdir -p "${workdir}/root/bin" "${workdir}/root/dev" "${workdir}/root/proc" "${workdir}/root/tmp"
+mkdir -p "${workdir}/root/bin" "${workdir}/root/dev" "${workdir}/root/proc" "${workdir}/root/run" "${workdir}/root/tmp"
 
 cat >"${workdir}/agent.c" <<'EOF'
 #define _GNU_SOURCE
@@ -78,6 +78,7 @@ cat >"${workdir}/agent.c" <<'EOF'
 #define MAX_FRAME_PAYLOAD 4096
 #define REPLAY_CAP 65536
 #define SESSION_ID "default"
+#define GEN_PARAMS_MAX 4096
 
 struct sockaddr_vm {
   sa_family_t svm_family;
@@ -266,6 +267,103 @@ static int write_all(int fd, const void *raw, size_t len) {
   return 0;
 }
 
+static int write_file_atomic(const char *path, const char *data, size_t len) {
+  char tmp[256];
+  int n = snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
+  if (n <= 0 || (size_t)n >= sizeof(tmp)) return -1;
+
+  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) return -1;
+  int rc = write_all(fd, data, len);
+  if (close(fd) != 0) rc = -1;
+  if (rc != 0) {
+    unlink(tmp);
+    return -1;
+  }
+  if (rename(tmp, path) != 0) {
+    unlink(tmp);
+    return -1;
+  }
+  return 0;
+}
+
+static int parse_string_field(const char *req, const char *name, char *out, size_t cap);
+static int parse_u64_field(const char *req, const char *name, uint64_t *out);
+
+static void env_append(char *env, size_t *len, const char *key, const char *value) {
+  if (value[0] == '\0' || *len >= 2048) return;
+  int n = snprintf(env + *len, 2048 - *len, "%s=%s\n", key, value);
+  if (n > 0 && (size_t)n < 2048 - *len) *len += (size_t)n;
+}
+
+static void env_append_u64(char *env, size_t *len, const char *key, uint64_t value) {
+  if (*len >= 2048) return;
+  int n = snprintf(env + *len, 2048 - *len, "%s=%llu\n", key, (unsigned long long)value);
+  if (n > 0 && (size_t)n < 2048 - *len) *len += (size_t)n;
+}
+
+static int build_path(char *out, size_t cap, const char *root, const char *suffix) {
+  int n = snprintf(out, cap, "%s%s", root, suffix);
+  return n > 0 && (size_t)n < cap ? 0 : -1;
+}
+
+static int write_generation_files(const char *root, const char *params) {
+  char run_dir[128];
+  char spore_dir[160];
+  char generation_path[192];
+  char env_path[192];
+  if (build_path(run_dir, sizeof(run_dir), root, "/run") != 0) return -1;
+  if (build_path(spore_dir, sizeof(spore_dir), root, "/run/sporevm") != 0) return -1;
+  if (build_path(generation_path, sizeof(generation_path), spore_dir, "/generation.json") != 0) return -1;
+  if (build_path(env_path, sizeof(env_path), spore_dir, "/env") != 0) return -1;
+
+  if (mkdir(run_dir, 0755) != 0 && errno != EEXIST) return -1;
+  if (mkdir(spore_dir, 0755) != 0 && errno != EEXIST) return -1;
+
+  char json_with_newline[GEN_PARAMS_MAX + 2];
+  size_t params_len = strlen(params);
+  if (params_len + 1 >= sizeof(json_with_newline)) return -1;
+  memcpy(json_with_newline, params, params_len);
+  json_with_newline[params_len] = '\n';
+  json_with_newline[params_len + 1] = '\0';
+  if (write_file_atomic(generation_path, json_with_newline, params_len + 1) != 0) return -1;
+
+  char env[2048];
+  size_t env_len = 0;
+  env[0] = '\0';
+
+  uint64_t value = 0;
+  uint64_t fork_index = 0;
+  uint64_t fork_count = 0;
+  uint64_t parallel_index = 0;
+  uint64_t parallel_count = 0;
+  int have_fork_index = parse_u64_field(params, "fork_index", &fork_index);
+  int have_fork_count = parse_u64_field(params, "fork_count", &fork_count);
+  int have_parallel_index = parse_u64_field(params, "parallel_index", &parallel_index);
+  int have_parallel_count = parse_u64_field(params, "parallel_count", &parallel_count);
+  if (have_parallel_index == 0 && have_fork_index > 0) {
+    parallel_index = fork_index;
+    have_parallel_index = 1;
+  }
+  if (have_parallel_count == 0 && have_fork_count > 0) {
+    parallel_count = fork_count;
+    have_parallel_count = 1;
+  }
+  if (have_parallel_index > 0) env_append_u64(env, &env_len, "SPORE_PARALLEL_JOB", parallel_index);
+  if (have_parallel_count > 0) env_append_u64(env, &env_len, "SPORE_PARALLEL_JOB_COUNT", parallel_count);
+  if (have_fork_index > 0) env_append_u64(env, &env_len, "SPORE_FORK_INDEX", fork_index);
+  if (have_fork_count > 0) env_append_u64(env, &env_len, "SPORE_FORK_COUNT", fork_count);
+  if (parse_u64_field(params, "parent_generation", &value) > 0) env_append_u64(env, &env_len, "SPORE_PARENT_GENERATION", value);
+  if (parse_u64_field(params, "generation", &value) > 0) env_append_u64(env, &env_len, "SPORE_GENERATION", value);
+
+  char text[128];
+  if (parse_string_field(params, "vm_id", text, sizeof(text)) > 0) env_append(env, &env_len, "SPORE_VM_ID", text);
+  if (parse_string_field(params, "fork_batch_id", text, sizeof(text)) > 0) env_append(env, &env_len, "SPORE_FORK_BATCH_ID", text);
+  if (parse_string_field(params, "hostname", text, sizeof(text)) > 0) env_append(env, &env_len, "SPORE_HOSTNAME", text);
+
+  return write_file_atomic(env_path, env, env_len);
+}
+
 static int set_nonblock(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags < 0) return -1;
@@ -427,6 +525,7 @@ static int parse_argv(const char *req, char storage[MAX_ARGC][MAX_ARG_LEN], char
 enum request_kind {
   REQUEST_START,
   REQUEST_ATTACH,
+  REQUEST_GENERATION,
 };
 
 struct run_request {
@@ -434,6 +533,7 @@ struct run_request {
   char session_id[64];
   uint64_t stdout_offset;
   uint64_t stderr_offset;
+  char generation_params[GEN_PARAMS_MAX];
   char arg_storage[MAX_ARGC][MAX_ARG_LEN];
   char *argv[MAX_ARGC + 1];
 };
@@ -477,6 +577,8 @@ static int parse_request(const char *req, struct run_request *out) {
       out->kind = REQUEST_START;
     } else if (strcmp(type, "attach") == 0) {
       out->kind = REQUEST_ATTACH;
+    } else if (strcmp(type, "generation") == 0) {
+      out->kind = REQUEST_GENERATION;
     } else {
       return -1;
     }
@@ -501,7 +603,10 @@ static int parse_request(const char *req, struct run_request *out) {
   if (stderr_rc < 0) return -1;
   if (stderr_rc > 0) out->stderr_offset = offset;
 
-  if (out->kind == REQUEST_START) {
+  if (out->kind == REQUEST_GENERATION) {
+    int params_rc = parse_string_field(req, "params_json", out->generation_params, sizeof(out->generation_params));
+    if (params_rc <= 0) return -1;
+  } else if (out->kind == REQUEST_START) {
     if (parse_argv(req, out->arg_storage, out->argv) <= 0) return -1;
   }
   return 0;
@@ -724,6 +829,23 @@ static void accept_request(int listener, struct session *session, struct client 
   close_client(client);
   client->fd = conn;
 
+  if (request.kind == REQUEST_GENERATION) {
+    if (use_rootfs && !rootfs_ready) {
+      (void)send_error_exit(client->fd, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
+      close_client(client);
+      return;
+    }
+    const char *root = use_rootfs ? "/mnt/rootfs" : "";
+    if (write_generation_files(root, request.generation_params) != 0) {
+      (void)send_error_exit(client->fd, 126, "spore run: generation helper write failed\n");
+      close_client(client);
+      return;
+    }
+    (void)send_exit_frame(client->fd, 0);
+    close_client(client);
+    return;
+  }
+
   if (request.kind == REQUEST_START) {
     if (session->started) {
       if (strcmp(request.session_id, session->session_id) == 0) {
@@ -765,6 +887,7 @@ int main(void) {
   t_init_start = now_ms();
   mount_proc();
   prepare_dev();
+  mkdir("/run", 0755);
   int use_rootfs = cmdline_has_flag("spore_rootfs=1");
   int rootfs_ready = 1;
   char rootfs_error[128];
@@ -880,11 +1003,44 @@ EOF
 
 cat >"${workdir}/counter.c" <<'EOF'
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
+
+static int read_parallel_env(char *job, size_t job_len, char *count, size_t count_len) {
+  FILE *f = fopen("/run/sporevm/env", "r");
+  if (f == NULL) return 0;
+  char line[128];
+  int have_job = 0;
+  int have_count = 0;
+  while (fgets(line, sizeof(line), f) != NULL) {
+    const char *job_key = "SPORE_PARALLEL_JOB=";
+    const char *count_key = "SPORE_PARALLEL_JOB_COUNT=";
+    if (strncmp(line, job_key, strlen(job_key)) == 0) {
+      snprintf(job, job_len, "%s", line + strlen(job_key));
+      job[strcspn(job, "\r\n")] = '\0';
+      have_job = 1;
+    } else if (strncmp(line, count_key, strlen(count_key)) == 0) {
+      snprintf(count, count_len, "%s", line + strlen(count_key));
+      count[strcspn(count, "\r\n")] = '\0';
+      have_count = 1;
+    }
+  }
+  fclose(f);
+  return have_job && have_count;
+}
 
 int main(void) {
   unsigned long i = 0;
+  int printed_parallel = 0;
   for (;;) {
+    if (!printed_parallel) {
+      char job[32];
+      char count[32];
+      if (read_parallel_env(job, sizeof(job), count, sizeof(count))) {
+        printf("spore parallel job %s/%s\n", job, count);
+        printed_parallel = 1;
+      }
+    }
     printf("spore counter %lu\n", i++);
     fflush(stdout);
     sleep(1);

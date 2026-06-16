@@ -100,6 +100,25 @@ Ruby fan-out smoke:
 mise run smoke:rootfs-fanout
 ```
 
+Forked rootfs workloads should not read the generation MMIO page directly. The
+initrd/rootfs agent publishes the fork generation payload into the rootfs
+tmpfs at `/run/sporevm/generation.json` and writes env-style helper lines to
+`/run/sporevm/env`:
+
+```text
+SPORE_PARALLEL_JOB=0
+SPORE_PARALLEL_JOB_COUNT=5
+SPORE_VM_ID=spore-...
+SPORE_FORK_BATCH_ID=...
+```
+
+For the first local fan-out contract, `SPORE_PARALLEL_JOB` is the child index
+within the local `spore fork --count N --out DIR` batch and
+`SPORE_PARALLEL_JOB_COUNT` is `N`. The generation JSON also retains
+`fork_index` and `fork_count` as batch-local fields; they currently match the
+parallel fields. Distributed offsets, remote ranges, and global shard numbering
+are deferred.
+
 Validate the tag-to-rootfs-to-run path with the local smoke script:
 
 ```bash

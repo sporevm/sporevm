@@ -75,10 +75,14 @@ cache identity. It is not a replacement for per-chunk verification.
   the counter per child, sets `interrupt_status` to
   `irq_generation_changed`, and writes a JSON resume-parameter payload with
   stable child identity fields: `schema_version`, `parent_generation`,
-  `generation`, `fork_index`, `fork_count`, `fork_batch_id`, `vm_id`,
-  `hostname`, `mac_seed`, and `mac_address`. Backend restore refreshes the
-  params page at actual resume time with volatile `resume_time_unix_ns` and
-  `resume_entropy_seed` values before reasserting the generation interrupt.
+  `generation`, `fork_index`, `fork_count`, `parallel_index`,
+  `parallel_count`, `fork_batch_id`, `vm_id`, `hostname`, `mac_seed`, and
+  `mac_address`. `fork_index` and `fork_count` are batch-local fork metadata.
+  In the first local fan-out contract they are equal to `parallel_index` and
+  `parallel_count`; distributed offset/range partitioning is deferred. Backend
+  restore refreshes the params page at actual resume time with volatile
+  `resume_time_unix_ns` and `resume_entropy_seed` values before reasserting the
+  generation interrupt.
 - `memory`: `chunk_size` plus one entry per chunk — a blake3-hex chunk
   reference, or null for an all-zero chunk. `backing` is optional local
   acceleration metadata for trusted same-host KVM/HVF fork/fan-out: `kind:

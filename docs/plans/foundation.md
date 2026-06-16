@@ -208,7 +208,10 @@ Three lifecycle mechanisms hang off those backing modes:
   child resume. Assign a new VM identity and resume with the generation counter
   incremented. The guest agent reacts: machine-id/hostname/MAC fixups, RNG
   reseed via virtio-rng, forced clock step, "generation changed" signal to
-  userspace.
+  userspace. The first local fan-out identity contract records
+  `parallel_index` and `parallel_count` alongside batch-local `fork_index` and
+  `fork_count`; those pairs are equivalent until a later distributed
+  offset/range slice exists.
 
 ### Ownership boundaries
 

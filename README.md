@@ -188,6 +188,8 @@ Resume forked children concurrently with prefixed output:
 zig-out/bin/spore fanout /tmp/forks --parallel --for 20s
 ```
 
+See [docs/fanout.md](docs/fanout.md) for the local child identity contract.
+
 Resume one captured or forked spore:
 
 ```bash

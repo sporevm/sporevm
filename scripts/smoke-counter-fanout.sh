@@ -126,6 +126,12 @@ fi
 
 for child in "${children[@]}"; do
   child_name="$(basename "${child}")"
+  child_index="$((10#${child_name}))"
+  if ! grep -Eaq "^\[${child_name}\] spore parallel job ${child_index}/${count}" "${fanout_stdout}"; then
+    tail -160 "${fanout_stdout}" >&2 || true
+    cat "${fanout_stderr}" >&2 || true
+    die "child ${child_name} did not report SPORE_PARALLEL_JOB=${child_index} SPORE_PARALLEL_JOB_COUNT=${count}"
+  fi
   if ! grep -Eaq "^\[${child_name}\] .*spore counter [0-9]+" "${fanout_stdout}"; then
     tail -120 "${fanout_stdout}" >&2 || true
     cat "${fanout_stderr}" >&2 || true

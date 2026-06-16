@@ -1313,6 +1313,18 @@ pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []cons
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
+pub fn generationRequest(allocator: std.mem.Allocator, params_json: []const u8) ![]const u8 {
+    const payload = struct {
+        type: []const u8 = "generation",
+        session_id: []const u8 = "default",
+        params_json: []const u8,
+    }{ .params_json = params_json };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
+    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+}
+
 pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool) ![]const u8 {
     return if (rootfs)
         std.fmt.allocPrint(allocator, "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1 spore_rootfs=1", .{guest_port})
@@ -1437,6 +1449,12 @@ test "run request can encode explicit session id" {
     const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42");
     defer std.testing.allocator.free(request);
     try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"argv\":[\"/bin/true\"],\"closed_env\":true}\n", request);
+}
+
+test "generation request encodes params json as a string" {
+    const request = try generationRequest(std.testing.allocator, "{\"parallel_index\":2,\"parallel_count\":5}");
+    defer std.testing.allocator.free(request);
+    try std.testing.expectEqualStrings("{\"type\":\"generation\",\"session_id\":\"default\",\"params_json\":\"{\\\"parallel_index\\\":2,\\\"parallel_count\\\":5}\"}\n", request);
 }
 
 test "run request rejects guest argv count overflow" {

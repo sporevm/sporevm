@@ -12,8 +12,12 @@ else
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const virtio_blk = @import("virtio/blk.zig");
+const vsock = @import("virtio/vsock.zig");
 
 pub const Backend = run_mod.Backend;
+const default_resume_guest_port: u32 = 10700;
+const generation_probe_host_port: u32 = 49153;
+const generation_probe_timeout_ms: u64 = 5_000;
 
 pub const Options = struct {
     backend: Backend = .auto,
@@ -83,6 +87,17 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     defer {
         if (rootfs_fd) |fd| _ = std.c.close(fd);
     }
+    const identity_request = resumeIdentityRequest(allocator, parsed.value.generation) catch |err| switch (err) {
+        error.RunRequestTooLarge => null,
+        else => |e| return e,
+    };
+    defer if (identity_request) |request| allocator.free(request);
+    var identity_stream: ?vsock.HostStream = if (identity_request) |request|
+        try vsock.HostStream.init(default_resume_guest_port, request)
+    else
+        null;
+    if (identity_stream) |*stream| stream.host_port = generation_probe_host_port;
+    const identity_probe: ?*vsock.HostStream = if (identity_stream) |*stream| stream else null;
 
     const backend = try resolveBackend(opts.backend);
     const ram_size = resumeRamSize(parsed.value.platform);
@@ -96,6 +111,10 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
                 .resume_dir = opts.spore_dir,
+                .exec_probe = identity_probe,
+                .exec_probe_timeout_ms = generation_probe_timeout_ms,
+                .exec_probe_completes_run = false,
+                .exec_probe_failure_fatal = false,
             });
         },
         .kvm => blk: {
@@ -106,6 +125,10 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
                 .resume_dir = opts.spore_dir,
+                .exec_probe = identity_probe,
+                .exec_probe_timeout_ms = generation_probe_timeout_ms,
+                .exec_probe_completes_run = false,
+                .exec_probe_failure_fatal = false,
             });
         },
     };
@@ -159,6 +182,21 @@ fn countBlockDevices(devices: []const spore.TransportState) usize {
         if (device.device_id == virtio_blk.device_id) count += 1;
     }
     return count;
+}
+
+fn resumeIdentityRequest(allocator: std.mem.Allocator, state: spore.GenerationState) !?[]const u8 {
+    if (state.params_b64.len == 0) return null;
+    const dec = std.base64.standard.Decoder;
+    const decoded_size = dec.calcSizeForSlice(state.params_b64) catch return error.BadManifest;
+    if (decoded_size == 0) return null;
+    const decoded = try allocator.alloc(u8, decoded_size);
+    defer allocator.free(decoded);
+    dec.decode(decoded, state.params_b64) catch return error.BadManifest;
+
+    var end = decoded.len;
+    while (end > 0 and decoded[end - 1] == 0) : (end -= 1) {}
+    if (end == 0) return null;
+    return try run_mod.generationRequest(allocator, decoded[0..end]);
 }
 
 fn failResumeSetup(comptime fmt: []const u8, args: anytype) noreturn {

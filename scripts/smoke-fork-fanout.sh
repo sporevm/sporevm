@@ -629,7 +629,7 @@ for ((i = 0; i < count; i++)); do
     die "child ${i} did not finish fork fixup before deadline; status ${status}"
   fi
 
-  assert_log_contains "sporevm-fork-smoke generation=.*fork_index=${i}.*fork_count=${count}.*irq_status=1" "${log}"
+  assert_log_contains "sporevm-fork-smoke generation=.*fork_index=${i}.*fork_count=${count}.*parallel_index=${i}.*parallel_count=${count}.*irq_status=1" "${log}"
   assert_log_contains "sporevm-fork-smoke vm_id=spore-[0-9a-f]+ hostname=spore-[0-9a-f]+-[0-9]{6} mac_address=([0-9a-f]{2}:){5}[0-9a-f]{2}" "${log}"
   assert_log_contains "resume_time_unix_ns=[1-9][0-9]*" "${log}"
   assert_log_contains "entropy_seed=[0-9a-f]{32}" "${log}"

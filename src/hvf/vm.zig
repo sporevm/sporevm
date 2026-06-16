@@ -67,6 +67,8 @@ pub const Config = struct {
     /// Optional minimal host-initiated vsock stream used by benchmark harnesses.
     exec_probe: ?*vsock.HostStream = null,
     exec_probe_timeout_ms: u64 = 30_000,
+    exec_probe_completes_run: bool = true,
+    exec_probe_failure_fatal: bool = true,
     /// Optional monitor control hook for attaching host streams after boot.
     exec_control: ?vsock.Control = null,
 };
@@ -356,6 +358,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         try vsock_dev.attachHostStream(probe);
         probe.markStarted();
     }
+    var exec_probe_done = false;
 
     // Run loop.
     while (true) {
@@ -378,9 +381,23 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             }
         }
         if (config.exec_probe) |probe| {
-            if (probe.state == .failed) return error.VsockProbeFailed;
-            if (probe.state == .complete) return .probe_complete;
-            if (probe.elapsedMs() > config.exec_probe_timeout_ms) return error.VsockProbeTimedOut;
+            if (!exec_probe_done) {
+                if (probe.state == .failed) {
+                    if (config.exec_probe_failure_fatal) return error.VsockProbeFailed;
+                    vsock_dev.host_stream = null;
+                    exec_probe_done = true;
+                }
+                if (probe.state == .complete) {
+                    if (config.exec_probe_completes_run) return .probe_complete;
+                    vsock_dev.host_stream = null;
+                    exec_probe_done = true;
+                }
+                if (!exec_probe_done and probe.elapsedMs() > config.exec_probe_timeout_ms) {
+                    if (config.exec_probe_failure_fatal) return error.VsockProbeTimedOut;
+                    vsock_dev.host_stream = null;
+                    exec_probe_done = true;
+                }
+            }
         }
         if (config.capture_request) |request_capture| {
             if (request_capture.isAbortRequested()) return error.CaptureAborted;
