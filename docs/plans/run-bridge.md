@@ -30,9 +30,9 @@ stdout/stderr, return the guest command status, and fail closed when boot assets
 or workload inputs are unsupported.
 
 The landed bridge covers default run assets, read-only rootfs execution, cached
-OCI rootfs convenience, streaming output, exit and host-signalled capture,
-product `spore resume`, explicit fork/fan-out, and immutable-rootfs resume for
-captured `--image` workloads.
+OCI rootfs convenience, running from an existing spore, streaming output, exit
+and host-signalled capture, product `spore resume`, explicit fork/fan-out, and
+immutable-rootfs resume for captured `--image` workloads.
 
 ## Landed Product Contract
 
@@ -53,6 +53,21 @@ Fresh `spore run` streams typed stdout/stderr frames over one host-initiated
 vsock connection and exits with the guest command status. The old product
 `--json` final-frame mode is gone before 1.0; any future machine-readable stream
 should be a deliberate JSONL/event mode.
+
+Run one explicit argv request from a completed base spore:
+
+```console
+spore run --from base.spore -- /bin/writeout
+```
+
+`--from` resumes the spore, reopens any verified immutable rootfs artifact
+recorded in the manifest, sends the argv after `--` to the restored exec agent,
+streams stdout/stderr, and exits with the command status. It is mutually
+exclusive with fresh boot inputs such as `--kernel`, `--initrd`, `--rootfs`, and
+`--image`; RAM size is manifest-derived. The restored guest must be able to
+accept a fresh exec session. Signal-captured running workloads remain a
+`spore resume`, `spore fork`, or `spore fanout` path until the guest-agent
+protocol can reconnect to or multiplex active commands.
 
 Run from an explicit read-only ext4 rootfs:
 
@@ -94,7 +109,8 @@ mint child spores with `spore fork`, then resume them individually or through
 
 - `src/run.zig` implements one-shot run argument parsing, default asset
   resolution, read-only rootfs attachment, direct image cache lookup/build,
-  streaming output, and exit or host-signalled capture.
+  running from existing spores, streaming output, and exit or host-signalled
+  capture.
 - `src/resume.zig` implements product `spore resume` for one diskless or verified
   immutable-rootfs spore at a time.
 - `src/fanout.zig` implements product fan-out over an existing child-spore
@@ -117,6 +133,11 @@ mint child spores with `spore fork`, then resume them individually or through
 - Cached OCI rootfs images are never mounted writable by default.
 - Rootfs execution uses the existing virtio-blk device and does not widen the
   frozen device model.
+- `spore run --from` does not accept fresh boot inputs; kernel, initrd, RAM size,
+  and optional immutable rootfs identity come from the spore.
+- `spore run --from` starts a new exec-agent session. It does not reconnect to
+  or interrupt a command that was already running when the source spore was
+  captured.
 - `--rootfs PATH --capture` is rejected until an import/preload command
   can record portable rootfs identity for arbitrary local images.
 - Resumed captured workloads are visible through restored guest console output.

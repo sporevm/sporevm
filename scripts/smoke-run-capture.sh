@@ -33,9 +33,14 @@ workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-run-capture.XXXXXX")"
 trap 'rm -rf "${workdir}"' EXIT
 
 capture_dir="${workdir}/captured.spore"
+from_base_dir="${workdir}/from-base.spore"
 run_stdout="${workdir}/run.stdout"
 run_stderr="${workdir}/run.stderr"
 resume_log="${workdir}/resume.log"
+from_stdout="${workdir}/from.stdout"
+from_stderr="${workdir}/from.stderr"
+from_base_stdout="${workdir}/from-base.stdout"
+from_base_stderr="${workdir}/from-base.stderr"
 
 "${spore_bin}" run \
   --backend "${backend}" \
@@ -108,5 +113,29 @@ if [[ "${seen_resume_output}" != "1" ]]; then
   tail -80 "${resume_log}" >&2 || true
   die "product resume did not stream output from the captured run spore"
 fi
+
+"${spore_bin}" run \
+  --backend "${backend}" \
+  --memory-mib "${SPORE_SMOKE_MEMORY_MIB:-256}" \
+  --capture "${from_base_dir}" \
+  -- /bin/true \
+  >"${from_base_stdout}" 2>"${from_base_stderr}"
+[[ -f "${from_base_dir}/manifest.json" ]] || die "run --from base capture did not write ${from_base_dir}/manifest.json"
+
+"${spore_bin}" run \
+  --backend "${backend}" \
+  --from "${from_base_dir}" \
+  -- /bin/writeout \
+  >"${from_stdout}" 2>"${from_stderr}"
+grep -Fq "spore stdout" "${from_stdout}" || {
+  cat "${from_stdout}" >&2 || true
+  cat "${from_stderr}" >&2 || true
+  die "spore run --from did not stream stdout"
+}
+grep -Fq "spore stderr" "${from_stderr}" || {
+  cat "${from_stdout}" >&2 || true
+  cat "${from_stderr}" >&2 || true
+  die "spore run --from did not stream stderr"
+}
 
 echo "smoke:run-capture ok backend=${backend}"

@@ -70,8 +70,10 @@ Target-state `spore` is one binary with CLI subcommands and a local monitor
 protocol:
 
 ```console
-spore run --image ruby-demo --capture ruby.spore --capture-on USR1 -- ruby /demo/counter.rb
-spore fork ruby.spore --count 10000 --out forks/
+spore run --image ruby-demo --capture ruby-base.spore -- /bin/true
+spore run --from ruby-base.spore -- ruby /demo/counter.rb
+spore run --image ruby-demo --capture ruby-counter.spore --capture-on USR1 -- ruby /demo/counter.rb
+spore fork ruby-counter.spore --count 10000 --out forks/
 spore fanout forks/ --parallel --for 20s
 
 spore create bench-1 --image docker.io/library/node:22-alpine

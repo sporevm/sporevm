@@ -15,6 +15,7 @@ else
 const local_paths = @import("local_paths.zig");
 const rootfs_mod = @import("rootfs.zig");
 const spore = @import("spore.zig");
+const virtio_blk = @import("virtio/blk.zig");
 const vsock = @import("virtio/vsock.zig");
 
 const max_file_size = 256 * 1024 * 1024;
@@ -32,6 +33,7 @@ const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const max_image_ref_cache_record_bytes = 64 * 1024;
 const image_ref_cache_record_version: u32 = 1;
+const mib: u64 = 1024 * 1024;
 
 pub const Backend = enum {
     auto,
@@ -105,6 +107,7 @@ const SharedOptions = struct {
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
     memory_mib: u64 = 1024,
+    memory_mib_set: bool = false,
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
@@ -141,6 +144,7 @@ const SharedOptions = struct {
 pub const CliOptions = struct {
     backend: Backend = .auto,
     shared: SharedOptions = .{},
+    from_spore_dir: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
     capture_path: ?[]const u8 = null,
@@ -157,6 +161,7 @@ const cli_usage =
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --kernel Image          Kernel Image path (default: managed SporeVM run kernel)
     \\  --initrd root.cpio      Initrd path (default: installed minimal exec initrd)
+    \\  --from DIR              Resume from an existing spore, then run argv
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs, then run from it
     \\  --capture DIR           Snapshot to DIR; defaults to --capture-on EXIT
@@ -201,6 +206,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var backend: Backend = .auto;
     var shared = SharedOptions{};
+    var from_spore_dir: ?[]const u8 = null;
     var rootfs_path: ?[]const u8 = null;
     var image_ref: ?[]const u8 = null;
     var capture_path: ?[]const u8 = null;
@@ -224,6 +230,8 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             rootfs_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
             image_ref = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--from")) {
+            from_spore_dir = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--capture")) {
             capture_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--capture-on")) {
@@ -255,6 +263,20 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.debug.print("spore run: --rootfs and --image are mutually exclusive\n", .{});
         std.process.exit(2);
     }
+    if (from_spore_dir != null) {
+        if (rootfs_path != null or image_ref != null) {
+            std.debug.print("spore run: --from is mutually exclusive with --rootfs and --image\n", .{});
+            std.process.exit(2);
+        }
+        if (shared.kernel_path != null or shared.initrd_path != null) {
+            std.debug.print("spore run: --from is mutually exclusive with --kernel and --initrd\n", .{});
+            std.process.exit(2);
+        }
+        if (shared.memory_mib_set) {
+            std.debug.print("spore run: --from uses the spore manifest memory size; omit --memory-mib\n", .{});
+            std.process.exit(2);
+        }
+    }
     if (capture_trigger_set and capture_path == null) {
         std.debug.print("spore run: --capture-on requires --capture\n", .{});
         std.process.exit(2);
@@ -271,6 +293,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     return .{
         .backend = backend,
         .shared = shared,
+        .from_spore_dir = from_spore_dir,
         .rootfs_path = rootfs_path,
         .image_ref = image_ref,
         .capture_path = capture_path,
@@ -281,6 +304,22 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
 }
 
 fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parsed: CliOptions) !Options {
+    if (parsed.from_spore_dir) |spore_dir| {
+        const manifest = spore.loadManifest(allocator, spore_dir) catch |err| {
+            failRunSetup("spore run: --from could not load spore manifest: {s}", .{@errorName(err)});
+        };
+        defer manifest.deinit();
+
+        const rootfs = try resumeRootfsForRun(allocator, manifest.value);
+        var opts = parsed.shared.completeWithAssets(parsed.backend, "", "", null, rootfs, parsed.command, true);
+        opts.resume_dir = spore_dir;
+        opts.memory_mib = runMemoryMiBFromManifest(manifest.value);
+        opts.capture_path = parsed.capture_path;
+        opts.capture_trigger = parsed.capture_trigger;
+        opts.continue_after_capture = parsed.continue_after_capture;
+        return opts;
+    }
+
     if (parsed.capture_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
         failRunSetup("spore run: --rootfs with --capture is not portable yet; use --image so capture can record immutable rootfs identity", .{});
     }
@@ -297,6 +336,62 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     opts.capture_trigger = parsed.capture_trigger;
     opts.continue_after_capture = parsed.continue_after_capture;
     return opts;
+}
+
+fn runMemoryMiBFromManifest(manifest: spore.Manifest) u64 {
+    if (manifest.platform.ram_size % mib != 0) {
+        failRunSetup("spore run: --from manifest RAM size is not MiB-aligned: {d}", .{manifest.platform.ram_size});
+    }
+    return manifest.platform.ram_size / mib;
+}
+
+fn resumeRootfsForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Rootfs {
+    const disk_count = countBlockDevices(manifest.devices);
+    if (disk_count == 0) return null;
+    if (disk_count != 1) {
+        failRunSetup("spore run: --from supports at most one immutable rootfs disk; found {d} block devices", .{disk_count});
+    }
+    const rootfs = manifest.rootfs orelse {
+        failRunSetup("spore run: --from disk-backed spore has no immutable rootfs artifact; capture with spore run --image", .{});
+    };
+    spore.validateRootfs(rootfs, manifest.devices) catch {
+        failRunSetup("spore run: --from manifest has invalid immutable rootfs metadata", .{});
+    };
+    return try cloneRootfs(allocator, rootfs);
+}
+
+fn countBlockDevices(devices: []const spore.TransportState) usize {
+    var count: usize = 0;
+    for (devices) |device| {
+        if (device.device_id == virtio_blk.device_id) count += 1;
+    }
+    return count;
+}
+
+fn cloneRootfs(allocator: std.mem.Allocator, rootfs: spore.Rootfs) !spore.Rootfs {
+    return .{
+        .kind = try allocator.dupe(u8, rootfs.kind),
+        .mode = try allocator.dupe(u8, rootfs.mode),
+        .device = .{
+            .kind = try allocator.dupe(u8, rootfs.device.kind),
+            .role = try allocator.dupe(u8, rootfs.device.role),
+            .virtio_device_id = rootfs.device.virtio_device_id,
+            .mmio_slot = rootfs.device.mmio_slot,
+        },
+        .artifact = .{
+            .digest = try allocator.dupe(u8, rootfs.artifact.digest),
+            .size = rootfs.artifact.size,
+            .format = try allocator.dupe(u8, rootfs.artifact.format),
+        },
+        .source = if (rootfs.source) |source| .{
+            .kind = try allocator.dupe(u8, source.kind),
+            .requested_ref = try allocator.dupe(u8, source.requested_ref),
+            .resolved_image_ref = try allocator.dupe(u8, source.resolved_image_ref),
+            .image_manifest_digest = try allocator.dupe(u8, source.image_manifest_digest),
+            .platform = try allocator.dupe(u8, source.platform),
+            .builder_version = try allocator.dupe(u8, source.builder_version),
+        } else null,
+    };
 }
 
 const RootfsInputOptions = struct {
@@ -1155,14 +1250,15 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
 
     const backend = try resolveBackend(opts.backend);
-    const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
-    const initrd = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
+    const resuming = opts.resume_dir != null;
+    const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
+    const initrd: ?[]const u8 = if (resuming) null else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
     const rootfs_fd = try openRootfsForRun(init, allocator, opts.rootfs_path, opts.rootfs);
     defer {
         if (rootfs_fd) |fd| _ = std.c.close(fd);
     }
-    const boot_args = try cmdline(allocator, opts.guest_port, opts.rootfs_path != null);
-    const request = try execRequest(allocator, opts.command);
+    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null);
+    const request = try execRequestForRun(init, allocator, opts);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
     if (opts.stream_output) stream.setOutputSink(null, runOutputSink);
     var capture_request = capture.Request{};
@@ -1187,6 +1283,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
                 .rootfs = opts.rootfs,
+                .resume_dir = opts.resume_dir,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .snapshot_dir = opts.capture_path,
@@ -1205,6 +1302,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
                 .rootfs = opts.rootfs,
+                .resume_dir = opts.resume_dir,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .snapshot_dir = opts.capture_path,
@@ -1327,6 +1425,17 @@ pub fn closeConsoleLog() void {
 
 pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
     return execRequestWithSession(allocator, argv, "default");
+}
+
+fn execRequestForRun(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) ![]const u8 {
+    if (opts.resume_dir == null) return execRequest(allocator, opts.command);
+
+    const now = Io.Clock.real.now(init.io).nanoseconds;
+    var nonce_bytes: [8]u8 = undefined;
+    init.io.random(&nonce_bytes);
+    const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
+    const session_id = try std.fmt.allocPrint(allocator, "run-{x}-{x}", .{ now, nonce });
+    return execRequestWithSession(allocator, opts.command, session_id);
 }
 
 pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8) ![]const u8 {
@@ -1488,6 +1597,7 @@ fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize
         shared.initrd_path = takeValue(args, i, name);
     } else if (std.mem.eql(u8, name, "--memory-mib")) {
         shared.memory_mib = try parsePositive(u64, name, takeValue(args, i, name));
+        shared.memory_mib_set = true;
     } else if (std.mem.eql(u8, name, "--vcpus")) {
         shared.vcpus = try parsePositive(u32, name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--guest-port")) {
@@ -1585,6 +1695,15 @@ test "run cli parser accepts image ref" {
     try std.testing.expectEqual(@as(usize, 2), opts.command.len);
     try std.testing.expectEqualStrings("/bin/echo", opts.command[0]);
     try std.testing.expectEqualStrings("hi", opts.command[1]);
+}
+
+test "run cli parser accepts source spore" {
+    const opts = try parseCliArgs(&.{ "--from", "base.spore", "--", "/bin/writeout" });
+    try std.testing.expectEqualStrings("base.spore", opts.from_spore_dir.?);
+    try std.testing.expect(opts.rootfs_path == null);
+    try std.testing.expect(opts.image_ref == null);
+    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
+    try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
 }
 
 test "run cli parser accepts capture flags" {
