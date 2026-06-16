@@ -95,7 +95,6 @@ mise run build
 mise run install
 mise run smoke:run
 mise run smoke:run-capture
-mise run smoke:resume
 mise run smoke:counter-fanout
 mise run smoke:rootfs-fanout
 ```
@@ -103,10 +102,10 @@ mise run smoke:rootfs-fanout
 `mise run check` runs unit tests, the product build, and diff hygiene.
 `mise run install` builds an optimized `spore` and installs it into `~/bin`,
 with runtime assets under `~/share/sporevm`.
-`mise run smoke` builds once, then runs product run, run-capture, and resume
-smokes. `smoke:counter-fanout` and `smoke:rootfs-fanout` are opt-in demo
-smokes; the rootfs fan-out smoke builds a published Ruby OCI image and resumes
-forked children in parallel.
+`mise run smoke` builds once, then runs product run and run-capture/resume
+smokes. `smoke:counter-fanout` and `smoke:rootfs-fanout` are opt-in demo smokes;
+the rootfs fan-out smoke builds a published Ruby OCI image and runs forked
+children with `spore run --from` in parallel.
 
 `zig build` installs the minimal exec initrd used by `spore run`, so `cpio`
 must be available in `PATH`.
@@ -280,21 +279,24 @@ tooling details.
 
 ## Advanced Validation
 
-Most local validation should use `mise run smoke`. Lower-level tools remain for
-backend debugging and hardware proof work:
+Most local validation should use `mise run smoke`. Extra product-shaped checks
+are available when a change touches fan-out or rootfs behavior:
 
-- `zig build hvf-boot` / `zig build kvm-boot`: build backend boot and capture
-  harnesses.
-- `zig build hvf-gic-probe`: probe Hypervisor.framework GIC state support.
-- `scripts/smoke-restore-leg.sh`: split capture/resume legs for backend
-  debugging.
 - `mise run smoke:counter-fanout`: exercise diskless capture, fork, and
   parallel product resume fan-out.
-- `scripts/smoke-fork-fanout.sh`: exercise fork generation fixups.
-- `scripts/smoke-remote-bundle.sh`: run SSM/S3 cross-host bundle validation.
+- `mise run smoke:rootfs-fanout`: exercise OCI rootfs capture, fork, and
+  parallel `spore run --from` child execution.
+- `scripts/smoke-run-oci-rootfs.sh`: exercise an explicit OCI/rootfs command.
 
-Run the relevant script with `--help` before using it; these are intentionally
-more harness-shaped than product-shaped.
+`scripts/benchmark-kvm-dirty-tracking.sh` remains the lower-level measurement
+path for KVM dirty-log and HVF write-protect tracking until those metrics are
+available through product or lifecycle capture paths. It uses the backend boot
+harnesses from `zig build hvf-boot` / `zig build kvm-boot`.
+
+`zig build hvf-gic-probe` remains as a host capability probe for
+Hypervisor.framework GIC state. New validation should be product-shaped unless
+it proves or measures a backend capability that cannot be reached through the
+CLI.
 
 ## Security
 

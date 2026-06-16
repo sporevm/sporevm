@@ -138,12 +138,12 @@ remote URL is not restore authority.
   "map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks
   remain the portable verified source of truth; unsupported backends,
   imported/cold spores, and normal untrusted restore must ignore `backing` and
-  materialize from chunks instead. KVM and HVF same-host restore consume backing
-  as a trusted fd supplied by the caller, then map it `MAP_PRIVATE` to share
-  clean parent pages across fork children while child writes fault into private
-  CoW pages. The current `kvm-boot`/`hvf-boot --trust-ram-backing` harnesses
-  open the local `ram.backing` path as an interim adapter; the backends
-  themselves no longer resolve manifest paths.
+  materialize from chunks instead. KVM and HVF same-host restore can consume
+  backing as a trusted fd supplied by a same-host caller, then map it
+  `MAP_PRIVATE` to share clean parent pages across fork children while child
+  writes fault into private CoW pages. The product CLI currently restores from
+  chunks; a future monitor or same-host fan-out caller must pass any trusted
+  RAM-backing fd explicitly because the backends do not resolve manifest paths.
 - `rootfs`: optional immutable rootfs artifact required by a captured
   read-only virtio-blk root device. `kind` is
   `immutable-ext4-rootfs-v0`, `mode` is `read-only`, `device` binds the
@@ -191,11 +191,10 @@ remote URL is not restore authority.
   opens the digest-addressed rootfs cache entry read-only, verifies the same fd
   by BLAKE3 and size, and only then attaches it to the VM.
 - Local RAM backing files are same-host acceleration hints, not portable trust
-  roots. The current path/symlink form is an interim harness adapter, not a
-  sealed-fd security boundary. Consumers that need portable or untrusted restore
-  must use the chunk manifest path. The planned monitor boundary passes a
-  sealed RAM-backing fd explicitly, rather than trusting a backing file by
-  pathname.
+  roots. The current path/symlink form records locality, not a sealed-fd
+  security boundary. Consumers that need portable or untrusted restore must use
+  the chunk manifest path. Same-host acceleration must pass a sealed
+  RAM-backing fd explicitly, rather than trusting a backing file by pathname.
 - Machine state is normalized architectural aarch64 state. Raw KVM structures
   never appear in the format; the only documented temporary exception is the
   explicitly tagged HVF `backend_private` GIC blob, which other backends must

@@ -174,11 +174,16 @@ rejects corrupted peer data.
 
 ## Slice 7: Always-On Dirty Tracking
 
-KVM dirty tracking has a harness path using `KVM_GET_DIRTY_LOG`, explicit
-VMM-originated dirty marking, epoch sealing, and tail flush. HVF has a
-write-protect proof path behind `hvf-boot --dirty-track`. Both paths can seed
-chunks and `ram.backing` during execution and write snapshot manifests without a
-full suspend-time RAM scan in the happy path.
+KVM dirty tracking uses `KVM_GET_DIRTY_LOG`, explicit VMM-originated dirty
+marking, epoch sealing, and tail flush. HVF has backend write-protect tracking.
+Both paths can seed chunks and `ram.backing` during execution and write snapshot
+manifests without a full suspend-time RAM scan in the happy path.
+
+The old direct restore/fan-out smoke scripts have been removed now that product
+run/resume/fan-out paths are the source of truth. The backend boot harnesses
+remain as measurement adapters for `scripts/benchmark-kvm-dirty-tracking.sh`
+until dirty-tracking metrics are exposed through product or lifecycle capture
+paths.
 
 The KVM and HVF trackers now share the RAM sealing path: chunk refs, zero
 elision, content-addressed chunk writes, `ram.backing` lifecycle, dirty-tail
@@ -293,13 +298,12 @@ inputs.
   bundle indexes, rootfs/OCI parsers.
 - Product smoke: `mise run smoke`, `mise run smoke:counter-fanout`,
   `mise run smoke:rootfs-fanout`.
-- Backend smoke: KVM/HVF boot, suspend/resume, fork storm, lazy restore, dirty
-  tracking.
 - Remote smoke: chunkpack bundle distribution, peer/cache hierarchy, corrupt
   bundle rejection.
 - Benchmark: suspend latency vs RAM size, fork latency, resume time to first
-  instruction/useful work, dirty-tracking overhead, lifecycle create-to-workload
-  timing.
+  instruction/useful work, lifecycle create-to-workload timing, and
+  dirty-tracking overhead via `scripts/benchmark-kvm-dirty-tracking.sh` until
+  product-path metrics exist.
 
 ## Resolved Decisions
 
@@ -318,7 +322,7 @@ inputs.
 - `spore run` is one-shot; named lifecycle uses `create`/`exec`/`rm`/`ls` plus
   monitor-backed suspend/resume.
 - Product capture is `spore run --capture`, not a separate capture verb.
-- Same-host fan-out uses explicit RAM-backing transfer and private mappings
+- Same-host fan-out must use explicit RAM-backing transfer and private mappings
   before claiming high-concurrency memory efficiency.
 - KVM dirty tracking stays on `KVM_GET_DIRTY_LOG` until evidence shows bitmap
   polling is material.

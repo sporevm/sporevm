@@ -108,8 +108,8 @@ Plain `spore run --rootfs PATH` remains a local run escape hatch. Combining
 `--rootfs PATH` with `--capture` is rejected until an import/preload
 command can record portable rootfs identity for arbitrary local images.
 
-Validate OCI rootfs capture, fork, and parallel product resume with the opt-in
-Ruby fan-out smoke:
+Validate OCI rootfs capture, fork, and parallel `spore run --from` execution
+with the opt-in Ruby fan-out smoke:
 
 ```bash
 mise run smoke:rootfs-fanout
