@@ -11,6 +11,7 @@ spec_refs:
 related_plans:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
+  - docs/plans/local-image-ref-cache.md
 ---
 
 # Named VM Lifecycle Plan
@@ -503,12 +504,11 @@ lifecycle benchmark JSONL fields before moving to the next:
    digest-pinned Node run is still useful for the ComputeSDK-style score
    estimate from `create_to_node_ms`.
 
-2. **Tag-to-digest resolution cache.** Cache the result of resolving mutable
-   tags with an explicit TTL and metadata that records the resolved digest,
-   registry host, platform, and time. The default can stay conservative, but the
-   benchmark path needs a way to avoid repeated registry calls when the caller
-   accepts tag staleness. Done when `node:22-alpine` warm-cache runs are close
-   to digest-pinned runs without changing the rootfs cache key correctness.
+2. **Local image ref cache.** Implement the direct-addressed mutable-tag cache
+   in `docs/plans/local-image-ref-cache.md`. The benchmark path needs a way to
+   avoid repeated registry calls when the caller accepts local reuse, while rootfs
+   cache keys remain digest-based. Done when `node:22-alpine` warm-cache runs are
+   close to digest-pinned runs without changing rootfs cache key correctness.
 
 3. **Rootfs explicit-path benchmark.** Add a benchmark option or example that
    feeds `spore create --rootfs <cached.ext4>` directly. This isolates VM

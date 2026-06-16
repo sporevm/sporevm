@@ -5,6 +5,7 @@ related_plans:
   - buildkite/cleanroom: docs/plans/sandbox-suspend-wake.md
   - docs/plans/run-bridge.md
   - docs/plans/lifecycle-monitor.md
+  - docs/plans/local-image-ref-cache.md
 ---
 
 # SporeVM Foundation Plan
@@ -311,8 +312,9 @@ warm-cache time resolving the OCI tag, while a digest-pinned cached rootfs drops
 fresh create-to-`node -v` to the few-hundred-millisecond range. The benchmark
 script therefore resolves mutable tags once before the timed loop by default
 and records both the requested tag and effective digest. The next speed work
-should start with explicit tag-resolution caching and rootfs-path isolation
-before pursuing deeper VM boot or snapshot optimizations.
+should start with the direct-addressed local image ref cache in
+`docs/plans/local-image-ref-cache.md` and rootfs-path isolation before pursuing
+deeper VM boot or snapshot optimizations.
 
 Slice 3 (same-hypervisor eager suspend/restore and manifest v0) is complete for
 both backends. `src/spore.zig` and `docs/spore-format.md` define v0: eager,
