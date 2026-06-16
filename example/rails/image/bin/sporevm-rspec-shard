@@ -1,0 +1,160 @@
+#!/usr/local/bin/ruby
+# frozen_string_literal: true
+
+require "json"
+
+IDENTITY_ENV = "/run/sporevm/env"
+IDENTITY_JSON = "/run/sporevm/generation.json"
+
+def parse_args(argv)
+  capture_delay = nil
+
+  until argv.empty?
+    arg = argv.shift
+    case arg
+    when "--capture-delay"
+      raw = argv.shift
+      abort "missing --capture-delay value" unless raw
+
+      capture_delay = Integer(raw, 10)
+      abort "--capture-delay must be greater than zero" unless capture_delay.positive?
+    when "-h", "--help"
+      puts "usage: sporevm-rspec-shard [--capture-delay SECONDS]"
+      exit 0
+    else
+      abort "unknown argument: #{arg}"
+    end
+  end
+
+  capture_delay
+rescue ArgumentError
+  abort "--capture-delay must be a positive integer"
+end
+
+def parse_positive_timeout(raw)
+  timeout = Float(raw || "5")
+  timeout.positive? ? timeout : 5.0
+rescue ArgumentError
+  5.0
+end
+
+def parse_env_identity(path)
+  return nil unless File.file?(path)
+
+  values = {}
+  File.foreach(path) do |line|
+    line = line.strip
+    next if line.empty? || line.start_with?("#")
+
+    key, value = line.split("=", 2)
+    values[key] = value if key && value
+  end
+
+  job = values["SPORE_PARALLEL_JOB"]
+  count = values["SPORE_PARALLEL_JOB_COUNT"]
+  return nil unless job && count
+
+  {
+    "parallel_index" => Integer(job, 10),
+    "parallel_count" => Integer(count, 10),
+    "fork_batch_id" => values["SPORE_FORK_BATCH_ID"],
+    "vm_id" => values["SPORE_VM_ID"],
+    "source" => path
+  }
+rescue ArgumentError => e
+  warn "could not parse #{path}: #{e.message}"
+  nil
+end
+
+def parse_json_identity(path)
+  return nil unless File.file?(path)
+
+  params = JSON.parse(File.read(path))
+  index = params["parallel_index"] || params["fork_index"]
+  count = params["parallel_count"] || params["fork_count"]
+  return nil unless index && count
+
+  params.merge(
+    "parallel_index" => Integer(index),
+    "parallel_count" => Integer(count),
+    "source" => path
+  )
+rescue JSON::ParserError, ArgumentError => e
+  warn "could not parse #{path}: #{e.message}"
+  nil
+end
+
+def read_identity
+  timeout = parse_positive_timeout(ENV["SPOREVM_RSPEC_IDENTITY_TIMEOUT"])
+  deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+
+  loop do
+    identity = parse_env_identity(IDENTITY_ENV) || parse_json_identity(IDENTITY_JSON)
+    return identity if identity
+
+    break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+    sleep 0.1
+  end
+
+  if ENV["SPOREVM_RSPEC_ALLOW_UNSHARDED"] == "1"
+    return {
+      "parallel_index" => 0,
+      "parallel_count" => 1,
+      "source" => "unsharded-fallback"
+    }
+  end
+
+  abort "missing SporeVM fanout identity in #{IDENTITY_ENV} or #{IDENTITY_JSON}"
+end
+
+def preload_for_capture(capture_delay)
+  start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  require "./config/environment"
+  Rails.application.eager_load!
+  require "rspec/rails"
+  preload_seconds = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start
+
+  puts "rails preload ok"
+  puts "SPOREVM_RAILS_PRELOAD_TIMING preload=#{format('%.3f', preload_seconds)}s"
+  puts "SPOREVM_RAILS_READY pid=#{Process.pid} capture_delay=#{capture_delay}"
+  STDOUT.flush
+
+  sleep capture_delay
+
+  puts "SPOREVM_RAILS_RESUMED pid=#{Process.pid}"
+  STDOUT.flush
+end
+
+def run_specs(selected)
+  require "rspec/core" unless defined?(RSpec::Core::Runner)
+
+  RSpec::Core::Runner.run(selected, $stderr, $stdout)
+end
+
+capture_delay = parse_args(ARGV)
+preload_for_capture(capture_delay) if capture_delay
+
+identity = read_identity
+parallel_index = identity.fetch("parallel_index")
+parallel_count = identity.fetch("parallel_count")
+
+if parallel_count < 1
+  abort "invalid SPORE_PARALLEL_JOB_COUNT=#{parallel_count}"
+end
+if parallel_index.negative? || parallel_index >= parallel_count
+  abort "invalid SPORE_PARALLEL_JOB=#{parallel_index} for count #{parallel_count}"
+end
+
+specs = Dir["spec/**/*_spec.rb"].sort
+selected = specs.each_with_index.select { |_path, i| (i % parallel_count) == parallel_index }.map(&:first)
+
+puts "SPOREVM_RSPEC_SHARD parallel_index=#{parallel_index} parallel_count=#{parallel_count} selected=#{selected.length} identity_source=#{identity.fetch("source")}"
+if selected.empty?
+  puts "SPOREVM_RSPEC_DONE parallel_index=#{parallel_index} parallel_count=#{parallel_count} exit=0"
+  exit 0
+end
+
+status = run_specs(selected)
+puts "SPOREVM_RSPEC_DONE parallel_index=#{parallel_index} parallel_count=#{parallel_count} exit=#{status}"
+exit status

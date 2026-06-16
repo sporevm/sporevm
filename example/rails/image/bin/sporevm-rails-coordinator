@@ -1,0 +1,95 @@
+#!/bin/bash
+set -euo pipefail
+
+capture_delay=1
+total_start="${SECONDS}"
+
+elapsed_since() {
+  printf '%s' "$((SECONDS - $1))"
+}
+
+while (($#)); do
+  case "$1" in
+    --capture-delay)
+      [[ -n "${2-}" ]] || { echo "missing --capture-delay value" >&2; exit 2; }
+      capture_delay="$2"
+      shift 2
+      ;;
+    -h|--help)
+      echo "usage: sporevm-rails-coordinator [--capture-delay SECONDS]"
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "${capture_delay}" in
+  ''|*[!0-9]*) echo "--capture-delay must be a positive integer" >&2; exit 2 ;;
+  0) echo "--capture-delay must be greater than zero" >&2; exit 2 ;;
+esac
+
+export HOME=/tmp/sporevm-home
+export LANG=C.UTF-8
+export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export RAILS_ENV=test
+export RACK_ENV=test
+export SPOREVM_RAILS_RUNTIME_ROOT=/tmp/sporevm-rails
+export BUNDLE_GEMFILE=/tmp/sporevm-rails/app/Gemfile
+export BUNDLE_PATH=/usr/local/bundle
+
+run_as_postgres() {
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u postgres -- "$@"
+  elif command -v su-exec >/dev/null 2>&1; then
+    su-exec postgres "$@"
+  else
+    su postgres -s /bin/sh -c "$(printf '%q ' "$@")"
+  fi
+}
+
+if command -v initdb >/dev/null 2>&1; then
+  pg_bin="$(dirname "$(command -v initdb)")"
+else
+  pg_bin="$(find /usr/lib/postgresql -path '*/bin/initdb' -type f | sort | tail -n 1)"
+  pg_bin="$(dirname "${pg_bin}")"
+fi
+if [[ -z "${pg_bin}" || ! -x "${pg_bin}/initdb" ]]; then
+  echo "postgres initdb not found" >&2
+  exit 1
+fi
+export PATH="${pg_bin}:${PATH}"
+
+mkdir -p "${HOME}" "${SPOREVM_RAILS_RUNTIME_ROOT}" /tmp/sporevm-postgres/data /tmp/sporevm-postgres/run /tmp/sporevm-postgres/log
+cp -a /opt/sporevm-rails-src "${SPOREVM_RAILS_RUNTIME_ROOT}/app"
+chown -R postgres:postgres /tmp/sporevm-postgres
+
+phase_start="${SECONDS}"
+run_as_postgres "${pg_bin}/initdb" -D /tmp/sporevm-postgres/data --auth=trust --no-locale >/tmp/sporevm-postgres/log/initdb.log
+initdb_seconds="$(elapsed_since "${phase_start}")"
+cat >>/tmp/sporevm-postgres/data/postgresql.conf <<'EOF'
+listen_addresses = ''
+unix_socket_directories = '/tmp/sporevm-postgres/run'
+fsync = off
+full_page_writes = off
+synchronous_commit = off
+EOF
+chown postgres:postgres /tmp/sporevm-postgres/data/postgresql.conf
+phase_start="${SECONDS}"
+run_as_postgres "${pg_bin}/pg_ctl" -D /tmp/sporevm-postgres/data -l /tmp/sporevm-postgres/log/postgres.log -w start
+trap 'run_as_postgres "${pg_bin}/pg_ctl" -D /tmp/sporevm-postgres/data -m fast stop >/dev/null 2>&1 || true' EXIT
+run_as_postgres "${pg_bin}/createdb" -h /tmp/sporevm-postgres/run sporevm_rails_test
+postgres_seconds="$(elapsed_since "${phase_start}")"
+
+cd "${SPOREVM_RAILS_RUNTIME_ROOT}/app"
+phase_start="${SECONDS}"
+bundle exec ruby bin/rails db:schema:load >/tmp/sporevm-rails/schema-load.log
+schema_seconds="$(elapsed_since "${phase_start}")"
+printf 'SPOREVM_RAILS_WARM_TIMING initdb=%ss postgres=%ss schema=%ss before_preload=%ss\n' \
+  "${initdb_seconds}" \
+  "${postgres_seconds}" \
+  "${schema_seconds}" \
+  "$(elapsed_since "${total_start}")"
+bundle exec ruby /usr/local/bin/sporevm-rspec-shard --capture-delay "${capture_delay}"

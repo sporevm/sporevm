@@ -1,0 +1,7 @@
+test:
+  adapter: postgresql
+  encoding: unicode
+  database: sporevm_rails_test
+  host: /tmp/sporevm-postgres/run
+  username: postgres
+  pool: 5

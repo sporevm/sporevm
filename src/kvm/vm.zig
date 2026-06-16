@@ -189,6 +189,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     }
     transports_buf[transport_count] = mmio.Transport.init(net_dev.device());
     transport_count += 1;
+    const vsock_transport_index = transport_count;
     transports_buf[transport_count] = mmio.Transport.init(vsock_dev.device());
     transport_count += 1;
     transports_buf[transport_count] = mmio.Transport.init(rng_dev.device());
@@ -321,6 +322,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     }
     if (config.exec_probe) |probe| {
         try vsock_dev.attachHostStream(probe);
+        if (vsock_dev.flushPendingRx(&transports_buf[vsock_transport_index].queues, ram)) {
+            transports_buf[vsock_transport_index].interrupt_status |= 1;
+            try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(vsock_transport_index)), true);
+        }
         probe.markStarted();
     }
     var exec_probe_done = false;

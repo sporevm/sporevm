@@ -360,6 +360,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     }
     if (config.exec_probe) |probe| {
         try vsock_dev.attachHostStream(probe);
+        if (vsock_dev.flushPendingRx(&transports_buf[vsock_transport_index].queues, ram)) {
+            transports_buf[vsock_transport_index].interrupt_status |= 1;
+            try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(@intCast(vsock_transport_index)), true), "raise vsock spi");
+        }
         probe.markStarted();
     }
     var exec_probe_done = false;

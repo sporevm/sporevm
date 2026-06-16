@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage:
+  example/rails/bin/build-image [options]
+
+Build the linux/arm64 Rails/Postgres image used by the SporeVM Rails fan-out
+example. By default Docker buildx writes a local OCI layout tar, then SporeVM
+imports it into the local rootfs cache as local/sporevm-rails-rspec:dev.
+
+Options:
+  --image REF       Image ref (default: local/sporevm-rails-rspec:dev)
+  --oci PATH        OCI layout tar path (default: $TMPDIR/sporevm-rails-rspec.oci)
+  --platform P      Docker build platform (default: linux/arm64)
+  --spore-bin PATH  Prebuilt spore CLI (default: zig-out/bin/spore)
+  --no-build        Do not run `mise run build` before importing
+  --push            Push to a registry instead of importing a local OCI layout
+  -h, --help        Show this help
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+need_value() {
+  local opt="$1"
+  local value="${2-}"
+  [[ -n "${value}" ]] || die "${opt} requires a value"
+}
+
+phase() {
+  printf '\n==> %s\n' "$*"
+}
+
+buildx_builder_args=()
+
+ensure_buildx_oci_builder() {
+  local requested_builder="${SPORE_RAILS_BUILDX_BUILDER:-}"
+  if [[ -n "${requested_builder}" ]]; then
+    docker buildx inspect "${requested_builder}" --bootstrap >/dev/null
+    buildx_builder_args=(--builder "${requested_builder}")
+    return
+  fi
+
+  local current_driver
+  current_driver="$(docker buildx inspect 2>/dev/null | awk '/^Driver:/ {print $2; exit}')"
+  if [[ -n "${current_driver}" && "${current_driver}" != "docker" ]]; then
+    buildx_builder_args=()
+    return
+  fi
+
+  local builder_name="${SPORE_RAILS_AUTO_BUILDX_BUILDER:-sporevm-oci}"
+  if ! docker buildx inspect "${builder_name}" >/dev/null 2>&1; then
+    phase "create Docker buildx OCI exporter"
+    docker buildx create --name "${builder_name}" --driver docker-container >/dev/null || {
+      cat >&2 <<EOF
+Docker's current buildx builder cannot export OCI layouts, and creating a
+docker-container builder failed.
+
+Create one manually, then retry:
+  docker buildx create --name ${builder_name} --driver docker-container
+  docker buildx inspect ${builder_name} --bootstrap
+
+Or set SPORE_RAILS_BUILDX_BUILDER to an existing OCI-capable builder.
+EOF
+      exit 1
+    }
+  fi
+
+  docker buildx inspect "${builder_name}" --bootstrap >/dev/null
+  buildx_builder_args=(--builder "${builder_name}")
+}
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+example_dir="${repo_root}/example/rails"
+image_ref="${SPORE_RAILS_IMAGE:-local/sporevm-rails-rspec:dev}"
+oci_output="${SPORE_RAILS_OCI:-${TMPDIR:-/tmp}/sporevm-rails-rspec.oci}"
+platform="${SPORE_RAILS_PLATFORM:-linux/arm64}"
+spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
+build=1
+push=0
+
+while (($#)); do
+  case "$1" in
+    --image)
+      need_value "$1" "${2-}"
+      image_ref="$2"
+      shift 2
+      ;;
+    --oci)
+      need_value "$1" "${2-}"
+      oci_output="$2"
+      shift 2
+      ;;
+    --platform)
+      need_value "$1" "${2-}"
+      platform="$2"
+      shift 2
+      ;;
+    --spore-bin)
+      need_value "$1" "${2-}"
+      spore_bin="$2"
+      shift 2
+      ;;
+    --no-build)
+      build=0
+      shift
+      ;;
+    --push)
+      push=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+command -v docker >/dev/null 2>&1 || die "docker is required"
+docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
+
+if [[ "${push}" == "1" ]]; then
+  [[ "${image_ref}" != local/* ]] || die "--push requires a registry image ref, not ${image_ref}"
+  phase "build and push Rails image"
+  docker buildx build \
+    --platform "${platform}" \
+    -t "${image_ref}" \
+    --push \
+    "${example_dir}"
+
+  cat <<EOF
+built and pushed ${image_ref}
+
+Run the fan-out demo with:
+  example/rails/bin/fanout-rspec --image ${image_ref} --no-image-build
+EOF
+  exit 0
+fi
+
+[[ "${image_ref}" == local/* ]] || die "local OCI import requires --image local/name:tag; use --push for registry refs"
+
+if [[ "${build}" == "1" ]]; then
+  phase "build spore"
+  if command -v mise >/dev/null 2>&1; then
+    (cd "${repo_root}" && mise run build)
+  else
+    (cd "${repo_root}" && zig build)
+  fi
+fi
+[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+
+ensure_buildx_oci_builder
+
+phase "build Rails OCI layout"
+rm -rf "${oci_output}"
+mkdir -p "$(dirname "${oci_output}")"
+docker buildx build \
+  "${buildx_builder_args[@]}" \
+  --platform "${platform}" \
+  --output "type=oci,dest=${oci_output}" \
+  "${example_dir}"
+
+phase "import Rails rootfs"
+"${spore_bin}" rootfs import-oci "${oci_output}" \
+  --ref "${image_ref}" \
+  --platform "${platform}"
+
+cat <<EOF
+built ${oci_output}
+imported ${image_ref}
+
+Run the fan-out demo with:
+  example/rails/bin/fanout-rspec --image ${image_ref} --no-image-build
+EOF

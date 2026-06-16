@@ -7,6 +7,8 @@ spec_refs:
   - docs/rootfs.md
   - docs/spore-format.md
   - docs/plans/distribution.md
+  - example/rails/README.md
+  - src/fanout.zig
   - src/run.zig
   - src/resume.zig
   - src/spore.zig
@@ -101,6 +103,11 @@ possible preload input, not proof that local ext4 bytes are correct.
 - `spore fork` preserves the rootfs artifact reference in child manifests.
 - `scripts/smoke-rootfs-fanout.sh` validates local capture, fork, and parallel
   product resume of a Ruby OCI rootfs workload.
+- `example/rails/` builds and imports a local Docker buildx OCI layout. The
+  full warm Postgres fan-out run works with the `v0.5.0` managed run kernel,
+  which includes uid/gid privilege-drop support, SysV IPC, POSIX timers, script
+  binfmt support, virtio-blk, ext4, and initial container kernel facilities such
+  as cgroups, namespaces, seccomp, overlayfs, netfilter, and veth.
 
 ## Safety Invariants
 

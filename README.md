@@ -114,6 +114,16 @@ must be available in `PATH`.
 KVM work needs an aarch64 Linux host with KVM. Hypervisor.framework work needs
 an Apple Silicon Mac on macOS 15 or newer.
 
+## Examples
+
+- [Rails/Postgres RSpec fan-out](example/rails/README.md): build a Docker image
+  as a local OCI layout, import it with `spore rootfs import-oci`, warm Rails
+  and PostgreSQL once, capture the VM, fork the spore, and resume children in
+  parallel to run RSpec. The full PostgreSQL fan-out path works with the
+  `v0.5.0` managed run kernel, which includes the Rails/PostgreSQL runtime
+  facilities plus initial container primitives such as cgroups, namespaces,
+  seccomp, overlayfs, and common container networking options.
+
 ## Product CLI
 
 Run one command in a throwaway VM:

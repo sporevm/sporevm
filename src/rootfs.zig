@@ -18,6 +18,7 @@ const tar = @import("rootfs/tar.zig");
 const Io = std.Io;
 
 const max_rootfs_layers: usize = 512;
+const max_rootfs_metadata_bytes: usize = 1024 * 1024;
 pub const builder_version = "sporevm-rootfs-v1";
 
 const usage =
@@ -683,6 +684,18 @@ pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, req
     defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
     defer Io.Dir.cwd().deleteFile(init.io, temp_metadata_path) catch {};
 
+    if (try cachedImportedRootfs(init.io, allocator, metadata_path, rootfs_path, resolved)) |rootfs_blake3| {
+        const local_ref_path = try writeLocalRefCache(init.io, allocator, cache_root, request.ref, resolved);
+        return .{
+            .rootfs_path = rootfs_path,
+            .metadata_path = metadata_path,
+            .local_ref_path = local_ref_path,
+            .resolved_image_ref = resolved_image_ref,
+            .image_manifest_digest = source.manifest_digest,
+            .rootfs_blake3 = rootfs_blake3,
+        };
+    }
+
     const result = try buildRootFSFromLayout(init, allocator, .{
         .requested_ref = request.ref,
         .resolved_image_ref = resolved_image_ref,
@@ -915,6 +928,87 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     try ext4.writeFileAtPath(init.io, opts.metadata, metadata_json);
 
     return .{ .rootfs_blake3 = rootfs_blake3 };
+}
+
+fn cachedImportedRootfs(
+    io: Io,
+    allocator: std.mem.Allocator,
+    metadata_path: []const u8,
+    rootfs_path: []const u8,
+    resolved: ResolvedImage,
+) !?[chunk.ChunkId.hex_len]u8 {
+    const metadata = Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.StreamTooLong => return null,
+        else => |e| return e,
+    };
+    defer allocator.free(metadata);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, metadata, .{}) catch return null;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+
+    if (!jsonStringEquals(object.get("builder_version"), builder_version)) return null;
+    if (!jsonStringEquals(object.get("resolved_image_ref"), resolved.ref)) return null;
+    if (!jsonStringEquals(object.get("image_manifest_digest"), resolved.manifest_digest)) return null;
+    if (!jsonStringEquals(object.get("rootfs_path"), rootfs_path)) return null;
+
+    const platform_value = object.get("platform") orelse return null;
+    const platform_object = switch (platform_value) {
+        .object => |platform_object| platform_object,
+        else => return null,
+    };
+    if (!jsonStringEquals(platform_object.get("os"), resolved.platform.os)) return null;
+    if (!jsonStringEquals(platform_object.get("arch"), resolved.platform.arch)) return null;
+
+    const stat = Io.Dir.cwd().statFile(io, rootfs_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => |e| return e,
+    };
+    if (stat.kind != .file) return null;
+    if (!jsonU64Equals(object.get("rootfs_size"), stat.size)) return null;
+    if (!try readablePath(io, rootfs_path)) return null;
+
+    const rootfs_blake3 = jsonString(object.get("rootfs_blake3")) orelse return null;
+    const id = chunk.ChunkId.fromHex(rootfs_blake3) catch return null;
+    return id.toHex();
+}
+
+fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
+    const actual = jsonString(value) orelse return false;
+    return std.mem.eql(u8, actual, expected);
+}
+
+fn jsonString(value: ?std.json.Value) ?[]const u8 {
+    return switch (value orelse return null) {
+        .string => |string| string,
+        else => null,
+    };
+}
+
+fn jsonU64Equals(value: ?std.json.Value, expected: u64) bool {
+    return switch (value orelse return false) {
+        .integer => |actual| actual >= 0 and @as(u64, @intCast(actual)) == expected,
+        else => false,
+    };
+}
+
+fn readablePath(io: Io, path: []const u8) !bool {
+    if (Io.Dir.path.isAbsolute(path)) {
+        Io.Dir.accessAbsolute(io, path, .{ .read = true }) catch |err| switch (err) {
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+            else => |e| return e,
+        };
+        return true;
+    }
+    Io.Dir.cwd().access(io, path, .{ .read = true }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+        else => |e| return e,
+    };
+    return true;
 }
 
 fn resolveManifestDigest(
@@ -1337,6 +1431,55 @@ test "local digest ref resolves without mutable ref cache" {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         resolved.manifest_digest,
     );
+}
+
+test "cached imported rootfs requires matching metadata and readable image" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-import-cache-hit";
+    const rootfs_path = tmp ++ "/rootfs.ext4";
+    const metadata_path = tmp ++ "/rootfs.json";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs" });
+
+    const resolved = ResolvedImage{
+        .ref = "local/sporevm-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    };
+    const zero_digest = "00" ** 32;
+    const metadata = try std.fmt.allocPrint(
+        allocator,
+        \\{{
+        \\  "builder_version": "{s}",
+        \\  "resolved_image_ref": "{s}",
+        \\  "image_manifest_digest": "{s}",
+        \\  "platform": {{"os": "linux", "arch": "arm64"}},
+        \\  "rootfs_path": "{s}",
+        \\  "rootfs_size": 6,
+        \\  "rootfs_blake3": "{s}"
+        \\}}
+    ,
+        .{ builder_version, resolved.ref, resolved.manifest_digest, rootfs_path, zero_digest },
+    );
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
+
+    const hit = try cachedImportedRootfs(io, allocator, metadata_path, rootfs_path, resolved);
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqualStrings(zero_digest, hit.?[0..]);
+
+    const missing = try cachedImportedRootfs(io, allocator, metadata_path, tmp ++ "/missing.ext4", resolved);
+    try std.testing.expect(missing == null);
+
+    const wrong_platform = try cachedImportedRootfs(io, allocator, metadata_path, rootfs_path, .{
+        .ref = resolved.ref,
+        .manifest_digest = resolved.manifest_digest,
+        .platform = .{ .os = "linux", .arch = "amd64" },
+    });
+    try std.testing.expect(wrong_platform == null);
 }
 
 test "tag manifest content digest is computed and registry header is verified" {
