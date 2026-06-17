@@ -322,9 +322,15 @@ pub const Sealer = struct {
         for (indices) |i| {
             self.dirty_chunks[i] = false;
             if (options.before_seal) |before_seal| {
-                try before_seal(options.before_seal_ctx orelse return error.BadManifest, i);
+                before_seal(options.before_seal_ctx orelse return error.BadManifest, i) catch |err| {
+                    self.dirty_chunks[i] = true;
+                    return err;
+                };
             }
-            _ = try self.sealChunk(i, true, work_stats);
+            _ = self.sealChunk(i, true, work_stats) catch |err| {
+                self.dirty_chunks[i] = true;
+                return err;
+            };
         }
     }
 
@@ -387,10 +393,10 @@ pub const Sealer = struct {
 
         if (is_zero) {
             if (self.refs[index] != null) {
-                self.refs[index] = null;
                 const backing_write_start = try monotonicNs();
                 try pwriteFileAll(self.backing_fd, range.start, data);
                 work_stats.backing_write_ns +|= try elapsedMonotonicNs(backing_write_start);
+                self.refs[index] = null;
                 if (count_dirty_seal) work_stats.sealed_chunks += 1;
             }
             return false;
@@ -403,10 +409,10 @@ pub const Sealer = struct {
         const existing = self.refs[index];
         if (existing == null or !std.mem.eql(u8, existing.?, &hex)) {
             const ref, const chunk_path = try self.allocChunkRefAndPath(&hex);
-            self.refs[index] = ref;
             const chunk_write_start = try monotonicNs();
             try writeFileAllIfMissing(chunk_path, data);
             work_stats.chunk_write_ns +|= try elapsedMonotonicNs(chunk_write_start);
+            self.refs[index] = ref;
         }
         const backing_write_start = try monotonicNs();
         try pwriteFileAll(self.backing_fd, range.start, data);
@@ -703,6 +709,33 @@ test "dirty RAM sealer leaves stopped non-tail work for tail flush" {
     try std.testing.expectEqual(@as(u64, 2), sealer.stats.dirty_chunks_total);
     try std.testing.expectEqual(@as(u64, 2), sealer.stats.dirty_chunks_tail);
     try std.testing.expect(!sealer.hasDirtyChunks());
+}
+
+test "dirty RAM sealer preserves refs when zero backing write fails" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, spore.chunk_size);
+    @memset(ram, 0);
+    ram[0] = 0x77;
+
+    var sealer = try Sealer.start(arena, .{ .dir = dir, .ram = ram });
+    defer sealer.deinit();
+    const old_ref = sealer.refs[0].?;
+    sealer.resetStatsAfterBaseline();
+
+    ram[0] = 0;
+    sealer.markCollectedChunkDirty(0);
+    _ = std.c.close(sealer.backing_fd);
+    sealer.backing_fd = -1;
+
+    try std.testing.expectError(error.IoFailed, sealer.flushMarked(.{ .tail = true }));
+    try std.testing.expect(sealer.refs[0] != null);
+    try std.testing.expectEqualSlices(u8, old_ref, sealer.refs[0].?);
+    try std.testing.expect(sealer.hasDirtyChunks());
 }
 
 test "dirty RAM sealer can flush a dirty tail in parallel" {
