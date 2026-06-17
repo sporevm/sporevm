@@ -19,6 +19,7 @@ Options:
                               write-protect (HVF); defaults by backend
   --snapshot-after-ms N      capture delay before snapshot (default: 3000)
   --dirty-epoch-ms N         dirty tracking epoch cadence; 0 means tail only (default: 250)
+  --initrd-mode MODE         initrd workload: ticker, fork, or dirty (default: ticker)
   --iterations N             paired repetitions per memory size (default: 1)
   --parallel-vms N           captures to run concurrently per mode/iteration (default: 1)
   --workdir DIR              work directory (default: mktemp)
@@ -49,6 +50,7 @@ mem_mib_list="512 4096"
 modes=""
 snapshot_after_ms="3000"
 dirty_epoch_ms="250"
+initrd_mode="ticker"
 iterations="1"
 parallel_vms="1"
 workdir=""
@@ -93,6 +95,11 @@ while (($#)); do
       dirty_epoch_ms="${2:-}"
       shift 2
       ;;
+    --initrd-mode)
+      need_option_value "$1" "${2-}"
+      initrd_mode="${2:-}"
+      shift 2
+      ;;
     --iterations)
       need_option_value "$1" "${2-}"
       iterations="${2:-}"
@@ -135,6 +142,10 @@ done
 case "${backend}" in
   kvm|hvf) ;;
   *) die "--backend must be kvm or hvf" ;;
+esac
+case "${initrd_mode}" in
+  ticker|fork|dirty) ;;
+  *) die "--initrd-mode must be ticker, fork, or dirty" ;;
 esac
 if [[ -z "${modes}" ]]; then
   case "${backend}" in
@@ -184,8 +195,8 @@ fi
 [[ -f "${kernel}" ]] || die "kernel not found: ${kernel}"
 
 if [[ -z "${initrd}" ]]; then
-  initrd="${workdir}/ticker.cpio"
-  "${repo_root}/scripts/make-smoke-initrd.sh" --mode ticker "${initrd}"
+  initrd="${workdir}/${initrd_mode}.cpio"
+  "${repo_root}/scripts/make-smoke-initrd.sh" --mode "${initrd_mode}" "${initrd}"
 fi
 [[ -f "${initrd}" ]] || die "initrd not found: ${initrd}"
 

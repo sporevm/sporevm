@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-16
+last_reviewed: 2026-06-17
 related_plans:
   - buildkite/cleanroom: docs/plans/sandbox-suspend-wake.md
   - docs/plans/run-bridge.md
@@ -20,8 +20,10 @@ the same minimal virtio-mmio device model.
 
 The release-critical path is identical-host-class fork/fan-out. Cross-backend
 restore is useful diagnostic portability, but it must not distract from the
-product claim: suspend, fork, distribute, and resume VM state without costs that
-scale with guest RAM or fleet size.
+product claim: suspend, fork, distribute, and resume VM state without a
+suspend-time full-RAM scan in the caught-up path. Active write pressure still
+creates a dirty tail; the release bar is to measure and bound that tail rather
+than implying arbitrary write-heavy guests can suspend in constant time.
 
 The target lifecycle property is:
 
@@ -46,8 +48,9 @@ chunk/cache mechanics, and CLI.
   sharing on KVM and HVF.
 - Prove identical-host fan-out distribution with content verification and bounded
   origin egress.
-- Make dirty tracking continuous enough that suspend latency is independent of
-  RAM size.
+- Make dirty tracking continuous enough that caught-up suspend latency is
+  independent of configured RAM size, while active-write suspend latency is
+  measured against dirty working set and unsealed chunks.
 - Keep failure modes explicit and fail closed when the platform contract, disk
   artifact, memory chunks, or backend support are insufficient.
 
@@ -111,7 +114,7 @@ state and broader disk manifests remain later work.
 | Slice 4: fork and generation protocol | Complete for correctness | Keep fan-out identity smokes as regression coverage. |
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |
 | Slice 6: identical-host distribution | Active | Multi-peer/cache hierarchy and measured origin-egress efficiency beyond explicit relay trees. |
-| Slice 7: always-on dirty tracking | Active | Dirty-tail reduction, many-VM/larger-RAM measurement, HVF scale decision. |
+| Slice 7: always-on dirty tracking | Active | KVM dirty-tail backlog under active writes, many-VM/larger-RAM measurement, HVF scale decision. |
 | Slice 8: cross-backend diagnostic restore | Later diagnostic | HVF portable GIC producer and timer-frequency strategy. |
 
 ## Landed Foundation Capabilities
@@ -172,21 +175,60 @@ write-protect proof path behind `hvf-boot --dirty-track`. Both paths can seed
 chunks and `ram.backing` during execution and write snapshot manifests without a
 full suspend-time RAM scan in the happy path.
 
+The KVM and HVF trackers now share the RAM sealing path: chunk refs, zero
+elision, content-addressed chunk writes, `ram.backing` lifecycle, dirty-tail
+counts, and backing finalization live behind a backend-neutral sealer. Backends
+remain responsible only for detecting dirty memory: KVM via dirty-log bitmaps
+plus host-initiated write marking, and HVF via write-protect faults plus
+host-initiated write marking. This keeps future tail optimizations focused on
+the shared serial sealing path instead of letting KVM and HVF drift.
+
+Both backend dirty workers now report cadence lag and epoch overrun metrics, so
+benchmark output can distinguish a quiet tail from a worker that is falling
+behind. HVF successful dirty-tracked snapshot finalization no longer
+re-protects every guest RAM chunk before exit; unfinished teardown still
+restores writable mappings during cleanup. Dirty-tracked snapshot metrics also
+break down finalization into worker stop, tail flush, RAM-backing chmod, close,
+and rename timings so suspend pauses can be tied to dirty tail or backing-file
+handoff. Successful dirty-tracked finalization now renames the read-only
+`ram.backing` into place before handing its fd to a detached close path, with a
+synchronous close fallback if that handoff cannot start. Non-tail worker flushes
+also stop between chunks once snapshot finalization begins, so shutdown can hand
+remaining dirty chunks to the final tail flush instead of waiting for a whole
+worker epoch to drain. The manifest continues to treat `ram.backing` as optional
+same-host acceleration; verified chunks remain the portable source of truth.
+
+Current benchmark evidence separates boot/seal backlog from suspend tail. On
+HVF, the dirty workload is bounded in the tested cases: 1GiB repeated snapshots
+pause in 16-18ms, and a concurrent 2x4GiB run pauses in 20-22ms per VM with no
+tail chunks. On KVM, 4GiB and 16GiB dirty-workload snapshots remain around
+87-90ms, and concurrent 2x4GiB remains 87ms per VM with no tail chunks. The KVM
+1GiB dirty workload is still not product-ready: the worker no longer turns
+backlog into a 2.1s join, but the same pressure leaves roughly 115 dirty chunks
+for tail flush, with post-refactor runs observed at 114-117 dirty tail chunks
+and suspend around 2.1-2.2s. The next KVM step is to reduce or parallelize
+dirty-tail sealing, or change the backing strategy so active dirty writers
+cannot accumulate a serial tail that large.
+
 Current focus:
 
-1. Compare one VM, many VMs, and larger RAM using worker metrics without changing
-   APIs again.
-2. Separate steady-state idle snapshots from active boot or workload dirty
+1. Reduce KVM dirty-tail backlog under active write pressure; the 1GiB dirty
+   workload currently proves this is real suspend tail, not just worker cadence
+   lag.
+2. Compare one VM, many VMs, and larger RAM using worker metrics without
+   changing APIs again.
+3. Separate steady-state idle snapshots from active boot or workload dirty
    bursts.
-3. Reduce dirty-tail lag where it matters by tuning epoch cadence, draining on
-   snapshot, and measuring whether hashing or backing writes dominate.
 4. Expand HVF write-protect measurements on macOS CI hardware before declaring a
    product support boundary.
 5. Revisit KVM dirty ring only if bitmap polling becomes material after larger
    RAM, many-vCPU, or many-VM measurements.
 
-Done when suspend latency is measured flat across 1/4/16GiB guests on Linux and
-the HVF overhead decision is recorded with numbers.
+Done when caught-up suspend latency is measured flat across 1/4/16GiB guests on
+Linux and HVF, active-write dirty-tail behavior is bounded or documented as a
+support limit, the KVM 1GiB active-write tail regression is fixed or explicitly
+excluded from the Slice 7 support boundary, and the HVF overhead decision is
+recorded with numbers.
 
 ## Slice 8: Cross-Backend Diagnostic Restore
 

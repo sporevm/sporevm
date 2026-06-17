@@ -8,7 +8,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const capture = @import("../capture.zig");
-const chunk = @import("../chunk.zig");
+const dirty_ram = @import("../dirty_ram.zig");
 const kvm = @import("kvm.zig");
 const lazy_ram = @import("lazy_ram.zig");
 const snapshot = @import("snapshot.zig");
@@ -534,57 +534,19 @@ fn fileSize(fd: std.c.fd_t) !u64 {
     return @intCast(end);
 }
 
-fn writeFileAll(path: [:0]const u8, data: []const u8) !void {
-    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
-    if (fd < 0) return error.IoFailed;
-    defer _ = std.c.close(fd);
-    var done: usize = 0;
-    while (done < data.len) {
-        const n = std.c.write(fd, data.ptr + done, data.len - done);
-        if (n <= 0) return error.IoFailed;
-        done += @intCast(n);
-    }
-}
-
-fn pwriteFileAll(fd: std.c.fd_t, offset: usize, data: []const u8) !void {
-    var done: usize = 0;
-    while (done < data.len) {
-        const n = std.c.pwrite(fd, data.ptr + done, data.len - done, @intCast(offset + done));
-        if (n <= 0) return error.IoFailed;
-        done += @intCast(n);
-    }
-}
-
-fn ensureDir(path: [:0]const u8) !void {
-    if (std.c.mkdir(path, 0o755) != 0) {
-        if (std.c.access(path, 0) != 0) return error.IoFailed;
-    }
-}
-
-fn pathZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![:0]const u8 {
-    return std.fmt.allocPrintSentinel(allocator, fmt, args, 0) catch error.OutOfMemory;
-}
-
 const DirtyTracker = struct {
-    allocator: std.mem.Allocator,
+    sealer: dirty_ram.Sealer,
     vm_fd: std.c.fd_t,
     slot: u32,
-    dir: []const u8,
-    ram: []const u8,
-    refs: []?[]const u8,
-    dirty_chunks: []bool,
     bitmap: []usize,
-    backing_fd: std.c.fd_t,
-    backing_tmp_path: [:0]const u8,
-    backing_final_path: [:0]const u8,
     epoch_ms: u64,
     mutex: SpinLock = .{},
+    stop: std.atomic.Value(bool) = .init(false),
     worker_thread: ?std.Thread = null,
     stop_read_fd: std.c.fd_t = -1,
     stop_write_fd: std.c.fd_t = -1,
     worker_failed: bool = false,
     tracking_start_ms: u64 = 0,
-    finished: bool = false,
     stats: DirtyStats = .{},
 
     const Options = struct {
@@ -596,28 +558,20 @@ const DirtyTracker = struct {
     };
 
     const DirtyStats = struct {
-        seed_ms: u64 = 0,
-        seed_chunks: usize = 0,
-        seed_nonzero_chunks: usize = 0,
         dirty_epoch_ms: u64 = 0,
         dirty_epoch_count: u64 = 0,
         dirty_pages_total: u64 = 0,
         dirty_pages_tail: u64 = 0,
-        dirty_chunks_total: u64 = 0,
-        dirty_chunks_tail: u64 = 0,
-        host_dirty_ranges_total: u64 = 0,
-        host_dirty_chunks_total: u64 = 0,
-        sealed_chunks_total: u64 = 0,
         get_dirty_log_ms: u64 = 0,
         get_dirty_log_cpu_ms: u64 = 0,
-        seal_ms: u64 = 0,
-        seal_cpu_ms: u64 = 0,
-        tail_flush_ms: u64 = 0,
         worker_epoch_max_ms: u64 = 0,
+        worker_cadence_lag_max_ms: u64 = 0,
+        worker_cadence_lag_total_ms: u64 = 0,
+        worker_epoch_overrun_count: u64 = 0,
+        worker_epoch_overrun_ms: u64 = 0,
         worker_join_ms: u64 = 0,
-        tracking_ms: u64 = 0,
+        finish_worker_stop_ms: u64 = 0,
         dirty_pages_per_sec: u64 = 0,
-        sealed_chunks_per_sec: u64 = 0,
     };
 
     fn start(allocator: std.mem.Allocator, options: Options) !DirtyTracker {
@@ -627,44 +581,19 @@ const DirtyTracker = struct {
 
         const page_count = (options.ram.len + std.heap.page_size_min - 1) / std.heap.page_size_min;
         const bitmap_word_count = (page_count + @bitSizeOf(usize) - 1) / @bitSizeOf(usize);
-        const chunk_count = (options.ram.len + spore.chunk_size - 1) / spore.chunk_size;
-
-        const dir_z = try pathZ(allocator, "{s}", .{options.dir});
-        const chunks_dir = try pathZ(allocator, "{s}/chunks", .{options.dir});
-        try ensureDir(dir_z);
-        try ensureDir(chunks_dir);
-
-        const backing_tmp_path = try pathZ(allocator, "{s}/{s}.tmp", .{ options.dir, spore.ram_backing_path });
-        const backing_final_path = try pathZ(allocator, "{s}/{s}", .{ options.dir, spore.ram_backing_path });
-        const backing_fd = std.c.open(backing_tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
-        if (backing_fd < 0) return error.IoFailed;
-        errdefer _ = std.c.close(backing_fd);
-        if (std.c.ftruncate(backing_fd, @intCast(options.ram.len)) != 0) return error.IoFailed;
-
-        var tracker = DirtyTracker{
-            .allocator = allocator,
-            .vm_fd = options.vm_fd,
-            .slot = options.slot,
+        var sealer = try dirty_ram.Sealer.start(allocator, .{
             .dir = options.dir,
             .ram = options.ram,
-            .refs = try allocator.alloc(?[]const u8, chunk_count),
-            .dirty_chunks = try allocator.alloc(bool, chunk_count),
+        });
+        errdefer sealer.deinit();
+
+        var tracker = DirtyTracker{
+            .sealer = sealer,
+            .vm_fd = options.vm_fd,
+            .slot = options.slot,
             .bitmap = try allocator.alloc(usize, bitmap_word_count),
-            .backing_fd = backing_fd,
-            .backing_tmp_path = backing_tmp_path,
-            .backing_final_path = backing_final_path,
             .epoch_ms = options.epoch_ms,
         };
-        @memset(tracker.refs, null);
-        @memset(tracker.dirty_chunks, false);
-
-        const seed_start = try monotonicMs();
-        for (tracker.refs, 0..) |_, i| {
-            const nonzero = try tracker.sealChunk(i, false);
-            tracker.stats.seed_chunks += 1;
-            if (nonzero) tracker.stats.seed_nonzero_chunks += 1;
-        }
-        tracker.stats.seed_ms = (try monotonicMs()) - seed_start;
         tracker.stats.dirty_epoch_ms = options.epoch_ms;
 
         // Some kernels conservatively mark a logging memslot dirty at
@@ -676,20 +605,14 @@ const DirtyTracker = struct {
 
         std.log.info(
             "kvm dirty tracking started: mode=dirty-log ram_mib={d} chunks={d} seed_nonzero_chunks={d} seed_ms={d} epoch_ms={d}",
-            .{ options.ram.len / 1024 / 1024, tracker.refs.len, tracker.stats.seed_nonzero_chunks, tracker.stats.seed_ms, options.epoch_ms },
+            .{ options.ram.len / 1024 / 1024, tracker.sealer.chunkCount(), tracker.sealer.stats.seed_nonzero_chunks, tracker.sealer.stats.seed_ms, options.epoch_ms },
         );
         return tracker;
     }
 
     fn deinit(self: *DirtyTracker) void {
         self.stopWorker();
-        if (self.backing_fd >= 0) {
-            _ = std.c.close(self.backing_fd);
-            self.backing_fd = -1;
-        }
-        if (!self.finished) {
-            _ = std.c.unlink(self.backing_tmp_path.ptr);
-        }
+        self.sealer.deinit();
     }
 
     fn startWorker(self: *DirtyTracker) !void {
@@ -713,6 +636,7 @@ const DirtyTracker = struct {
     fn stopWorker(self: *DirtyTracker) void {
         if (self.worker_thread) |thread| {
             const join_start = monotonicMs() catch 0;
+            self.stop.store(true, .release);
             var byte: [1]u8 = .{1};
             if (self.stop_write_fd >= 0) _ = linux.write(self.stop_write_fd, &byte, byte.len);
             thread.join();
@@ -731,8 +655,12 @@ const DirtyTracker = struct {
     }
 
     fn dirtyWorker(self: *DirtyTracker) void {
-        const timeout_ms: i32 = if (self.epoch_ms > std.math.maxInt(i32)) std.math.maxInt(i32) else @intCast(self.epoch_ms);
+        var next_deadline = (monotonicMs() catch 0) +| self.epoch_ms;
         while (true) {
+            if (self.stop.load(.acquire)) return;
+            const now = monotonicMs() catch 0;
+            const wait_ms = if (next_deadline > now) next_deadline - now else 0;
+            const timeout_ms: i32 = if (wait_ms > std.math.maxInt(i32)) std.math.maxInt(i32) else @intCast(wait_ms);
             var fds = [_]linux.pollfd{.{ .fd = self.stop_read_fd, .events = linux.POLL.IN, .revents = 0 }};
             const rc = linux.poll(&fds, fds.len, timeout_ms);
             switch (linux.errno(rc)) {
@@ -744,15 +672,15 @@ const DirtyTracker = struct {
                 },
             }
             if (rc > 0 and fds[0].revents != 0) return;
+            if (self.stop.load(.acquire)) return;
             const epoch_start = monotonicMs() catch 0;
             self.flushDirty(false) catch {
                 self.markWorkerFailed();
                 return;
             };
-            const epoch_ms = (monotonicMs() catch epoch_start) - epoch_start;
-            self.mutex.lock();
-            if (epoch_ms > self.stats.worker_epoch_max_ms) self.stats.worker_epoch_max_ms = epoch_ms;
-            self.mutex.unlock();
+            const epoch_end = monotonicMs() catch epoch_start;
+            self.recordWorkerEpochTiming(epoch_start, epoch_end, next_deadline);
+            next_deadline = epoch_start +| self.epoch_ms;
         }
     }
 
@@ -762,25 +690,35 @@ const DirtyTracker = struct {
         self.mutex.unlock();
     }
 
+    fn recordWorkerEpochTiming(self: *DirtyTracker, epoch_start: u64, epoch_end: u64, deadline_ms: u64) void {
+        const epoch_ms = epoch_end -| epoch_start;
+        const lag_ms = if (epoch_start > deadline_ms) epoch_start - deadline_ms else 0;
+        const overrun_ms = if (epoch_ms > self.epoch_ms) epoch_ms - self.epoch_ms else 0;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (epoch_ms > self.stats.worker_epoch_max_ms) self.stats.worker_epoch_max_ms = epoch_ms;
+        if (lag_ms > self.stats.worker_cadence_lag_max_ms) self.stats.worker_cadence_lag_max_ms = lag_ms;
+        self.stats.worker_cadence_lag_total_ms +|= lag_ms;
+        if (overrun_ms != 0) {
+            self.stats.worker_epoch_overrun_count +|= 1;
+            self.stats.worker_epoch_overrun_ms +|= overrun_ms;
+        }
+    }
+
     fn finish(self: *DirtyTracker) !spore.MemoryManifest {
+        const worker_stop_start = try monotonicMs();
         self.stopWorker();
+        self.stats.finish_worker_stop_ms = (try monotonicMs()) - worker_stop_start;
         if (self.worker_failed) return error.KvmDirtyWorkerFailed;
+
         const tail_start = try monotonicMs();
         try self.flushDirty(true);
-        self.stats.tail_flush_ms = (try monotonicMs()) - tail_start;
-        self.finishRates(try monotonicMs());
-
-        if (std.c.fchmod(self.backing_fd, 0o444) != 0) return error.IoFailed;
-        _ = std.c.close(self.backing_fd);
-        self.backing_fd = -1;
-        if (std.c.rename(self.backing_tmp_path.ptr, self.backing_final_path.ptr) != 0) return error.IoFailed;
-        self.finished = true;
-
-        return .{
-            .chunk_size = spore.chunk_size,
-            .chunks = self.refs,
-            .backing = .{ .path = spore.ram_backing_path, .size = self.ram.len },
-        };
+        self.sealer.stats.tail_flush_ms = (try monotonicMs()) - tail_start;
+        const now_ms = try monotonicMs();
+        self.sealer.finishRates(self.tracking_start_ms, now_ms);
+        self.stats.dirty_pages_per_sec = ratePerSec(self.stats.dirty_pages_total, self.sealer.stats.tracking_ms);
+        return try self.sealer.finishBacking();
     }
 
     fn flushDirty(self: *DirtyTracker, tail: bool) !void {
@@ -791,21 +729,12 @@ const DirtyTracker = struct {
 
     fn flushDirtyLocked(self: *DirtyTracker, tail: bool) !void {
         const dirty_pages = try self.collectDirtyLog(tail);
-        if (dirty_pages == 0 and !self.hasDirtyChunks()) return;
-
-        var dirty_chunks_this_flush: u64 = 0;
-        const seal_start = try monotonicMs();
-        const seal_cpu_start = threadCpuNs();
-        for (self.dirty_chunks, 0..) |is_dirty, i| {
-            if (!is_dirty) continue;
-            self.dirty_chunks[i] = false;
-            dirty_chunks_this_flush += 1;
-            _ = try self.sealChunk(i, true);
-        }
-        self.stats.seal_ms += (try monotonicMs()) - seal_start;
-        self.stats.seal_cpu_ms += elapsedCpuMs(seal_cpu_start);
-        self.stats.dirty_chunks_total += dirty_chunks_this_flush;
-        if (tail) self.stats.dirty_chunks_tail += dirty_chunks_this_flush;
+        if (dirty_pages == 0 and !self.sealer.hasDirtyChunks()) return;
+        _ = try self.sealer.flushMarked(.{
+            .tail = tail,
+            .stop = &self.stop,
+            .record_cpu = true,
+        });
     }
 
     fn collectDirtyLog(self: *DirtyTracker, tail: bool) !u64 {
@@ -822,7 +751,7 @@ const DirtyTracker = struct {
         if (!tail) self.stats.dirty_epoch_count += 1;
 
         var dirty_pages: u64 = 0;
-        const page_count = (self.ram.len + std.heap.page_size_min - 1) / std.heap.page_size_min;
+        const page_count = (self.sealer.ram.len + std.heap.page_size_min - 1) / std.heap.page_size_min;
         for (self.bitmap, 0..) |word, word_index| {
             var bits = word;
             while (bits != 0) {
@@ -830,7 +759,7 @@ const DirtyTracker = struct {
                 const page_index = word_index * @bitSizeOf(usize) + bit_index;
                 if (page_index >= page_count) break;
                 const chunk_index = (page_index * std.heap.page_size_min) / spore.chunk_size;
-                self.dirty_chunks[chunk_index] = true;
+                self.sealer.markCollectedChunkDirty(chunk_index);
                 dirty_pages += 1;
                 bits &= bits - 1;
             }
@@ -838,13 +767,6 @@ const DirtyTracker = struct {
         self.stats.dirty_pages_total += dirty_pages;
         if (tail) self.stats.dirty_pages_tail += dirty_pages;
         return dirty_pages;
-    }
-
-    fn hasDirtyChunks(self: *const DirtyTracker) bool {
-        for (self.dirty_chunks) |is_dirty| {
-            if (is_dirty) return true;
-        }
-        return false;
     }
 
     fn markGuestWriteCallback(ctx: *anyopaque, gpa: u64, len: u64) void {
@@ -856,87 +778,33 @@ const DirtyTracker = struct {
         if (len == 0) return;
         if (gpa < board.ram_base) return;
         const guest_offset = gpa - board.ram_base;
-        if (guest_offset >= self.ram.len) return;
+        if (guest_offset >= self.sealer.ram.len) return;
         const start_offset: usize = @intCast(guest_offset);
-        const remaining: u64 = @intCast(self.ram.len - start_offset);
+        const remaining: u64 = @intCast(self.sealer.ram.len - start_offset);
         const capped_len: usize = @intCast(@min(len, remaining));
         if (capped_len == 0) return;
 
-        const first_chunk = start_offset / spore.chunk_size;
-        const last_byte = start_offset + capped_len - 1;
-        const last_chunk = last_byte / spore.chunk_size;
-
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.stats.host_dirty_ranges_total += 1;
-        var chunk_index = first_chunk;
-        while (chunk_index <= last_chunk) : (chunk_index += 1) {
-            if (!self.dirty_chunks[chunk_index]) {
-                self.stats.host_dirty_chunks_total += 1;
-            }
-            self.dirty_chunks[chunk_index] = true;
-        }
+        self.sealer.markHostDirtyRange(start_offset, capped_len);
     }
 
     fn resetDirtyStatsAfterBaseline(self: *DirtyTracker) void {
         self.stats.dirty_epoch_count = 0;
         self.stats.dirty_pages_total = 0;
         self.stats.dirty_pages_tail = 0;
-        self.stats.dirty_chunks_total = 0;
-        self.stats.dirty_chunks_tail = 0;
-        self.stats.host_dirty_ranges_total = 0;
-        self.stats.host_dirty_chunks_total = 0;
-        self.stats.sealed_chunks_total = 0;
         self.stats.get_dirty_log_ms = 0;
         self.stats.get_dirty_log_cpu_ms = 0;
-        self.stats.seal_ms = 0;
-        self.stats.seal_cpu_ms = 0;
-        self.stats.tail_flush_ms = 0;
         self.stats.worker_epoch_max_ms = 0;
+        self.stats.worker_cadence_lag_max_ms = 0;
+        self.stats.worker_cadence_lag_total_ms = 0;
+        self.stats.worker_epoch_overrun_count = 0;
+        self.stats.worker_epoch_overrun_ms = 0;
         self.stats.worker_join_ms = 0;
-        self.stats.tracking_ms = 0;
+        self.stats.finish_worker_stop_ms = 0;
         self.stats.dirty_pages_per_sec = 0;
-        self.stats.sealed_chunks_per_sec = 0;
-        @memset(self.dirty_chunks, false);
+        self.sealer.resetStatsAfterBaseline();
         @memset(self.bitmap, 0);
-    }
-
-    fn finishRates(self: *DirtyTracker, now_ms: u64) void {
-        if (now_ms <= self.tracking_start_ms) return;
-        const tracking_ms = now_ms - self.tracking_start_ms;
-        self.stats.tracking_ms = tracking_ms;
-        self.stats.dirty_pages_per_sec = ratePerSec(self.stats.dirty_pages_total, tracking_ms);
-        self.stats.sealed_chunks_per_sec = ratePerSec(self.stats.sealed_chunks_total, tracking_ms);
-    }
-
-    fn sealChunk(self: *DirtyTracker, index: usize, count_dirty_seal: bool) !bool {
-        const chunk_start = index * spore.chunk_size;
-        const end = @min(chunk_start + spore.chunk_size, self.ram.len);
-        const data = self.ram[chunk_start..end];
-
-        if (std.mem.allEqual(u8, data, 0)) {
-            if (self.refs[index] != null) {
-                self.refs[index] = null;
-                try pwriteFileAll(self.backing_fd, chunk_start, data);
-                if (count_dirty_seal) self.stats.sealed_chunks_total += 1;
-            }
-            return false;
-        }
-
-        const id = chunk.ChunkId.fromContents(data);
-        const hex = id.toHex();
-        const existing = self.refs[index];
-        if (existing == null or !std.mem.eql(u8, existing.?, &hex)) {
-            const ref = try self.allocator.dupe(u8, &hex);
-            self.refs[index] = ref;
-            const chunk_path = try pathZ(self.allocator, "{s}/chunks/{s}", .{ self.dir, ref });
-            if (std.c.access(chunk_path, 0) != 0) {
-                try writeFileAll(chunk_path, data);
-            }
-        }
-        try pwriteFileAll(self.backing_fd, chunk_start, data);
-        if (count_dirty_seal) self.stats.sealed_chunks_total += 1;
-        return true;
     }
 };
 
@@ -1007,8 +875,12 @@ fn takeSnapshot(
     const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
     if (dirty_tracker) |tracker| {
         const stats = tracker.stats;
-        std.log.info(
-            "kvm snapshot metrics: mode=dirty-log ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} dirty_epoch_ms={d} dirty_epoch_count={d} dirty_pages_total={d} dirty_pages_tail={d} dirty_chunks_total={d} dirty_chunks_tail={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} tail_flush_ms={d} get_dirty_log_ms={d} get_dirty_log_cpu_ms={d} seal_ms={d} seal_cpu_ms={d} worker_epoch_max_ms={d} worker_join_ms={d} tracking_ms={d} dirty_pages_per_sec={d} sealed_chunks_per_sec={d}",
+        const ram_stats = tracker.sealer.stats;
+        var metrics_head_buf: [2048]u8 = undefined;
+        var metrics_tail_buf: [2048]u8 = undefined;
+        const metrics_head = std.fmt.bufPrint(
+            &metrics_head_buf,
+            "kvm snapshot metrics: mode=dirty-log ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} dirty_epoch_ms={d} dirty_epoch_count={d} dirty_pages_total={d} dirty_pages_tail={d} dirty_chunks_total={d} dirty_chunks_tail={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} tail_flush_ms={d}",
             .{
                 ram_size / 1024 / 1024,
                 memory_plan.chunk_count,
@@ -1024,26 +896,42 @@ fn takeSnapshot(
                 stats.dirty_epoch_count,
                 stats.dirty_pages_total,
                 stats.dirty_pages_tail,
-                stats.dirty_chunks_total,
-                stats.dirty_chunks_tail,
-                stats.host_dirty_ranges_total,
-                stats.host_dirty_chunks_total,
-                stats.sealed_chunks_total,
-                stats.seed_ms,
-                stats.seed_chunks,
-                stats.seed_nonzero_chunks,
-                stats.tail_flush_ms,
+                ram_stats.dirty_chunks_total,
+                ram_stats.dirty_chunks_tail,
+                ram_stats.host_dirty_ranges_total,
+                ram_stats.host_dirty_chunks_total,
+                ram_stats.sealed_chunks_total,
+                ram_stats.seed_ms,
+                ram_stats.seed_chunks,
+                ram_stats.seed_nonzero_chunks,
+                ram_stats.tail_flush_ms,
+            },
+        ) catch "kvm snapshot metrics: formatting_failed=1";
+        const metrics_tail = std.fmt.bufPrint(
+            &metrics_tail_buf,
+            " get_dirty_log_ms={d} get_dirty_log_cpu_ms={d} seal_ms={d} seal_cpu_ms={d} worker_epoch_max_ms={d} worker_cadence_lag_max_ms={d} worker_cadence_lag_total_ms={d} worker_epoch_overrun_count={d} worker_epoch_overrun_ms={d} worker_join_ms={d} finish_worker_stop_ms={d} finish_fchmod_ms={d} finish_close_ms={d} finish_close_deferred={d} finish_rename_ms={d} tracking_ms={d} dirty_pages_per_sec={d} sealed_chunks_per_sec={d}",
+            .{
                 stats.get_dirty_log_ms,
                 stats.get_dirty_log_cpu_ms,
-                stats.seal_ms,
-                stats.seal_cpu_ms,
+                ram_stats.seal_ms,
+                ram_stats.seal_cpu_ms,
                 stats.worker_epoch_max_ms,
+                stats.worker_cadence_lag_max_ms,
+                stats.worker_cadence_lag_total_ms,
+                stats.worker_epoch_overrun_count,
+                stats.worker_epoch_overrun_ms,
                 stats.worker_join_ms,
-                stats.tracking_ms,
+                stats.finish_worker_stop_ms,
+                ram_stats.finish_fchmod_ms,
+                ram_stats.finish_close_ms,
+                ram_stats.finish_close_deferred,
+                ram_stats.finish_rename_ms,
+                ram_stats.tracking_ms,
                 stats.dirty_pages_per_sec,
-                stats.sealed_chunks_per_sec,
+                ram_stats.sealed_chunks_per_sec,
             },
-        );
+        ) catch "";
+        std.log.info("{s}{s}", .{ metrics_head, metrics_tail });
     } else {
         std.log.info(
             "kvm snapshot metrics: mode=full-scan ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d}",

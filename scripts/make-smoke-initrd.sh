@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: scripts/make-smoke-initrd.sh [--mode ticker|fork] <out.cpio>
+usage: scripts/make-smoke-initrd.sh [--mode ticker|fork|dirty] <out.cpio>
 
 Build a tiny newc initrd containing a static /init that prints
 "sporevm-initrd-tick N" once per second. Intended for KVM/HVF smoke tests.
@@ -12,6 +12,8 @@ Modes:
   ticker  print the restore-smoke ticker only (default)
   fork    poll the SporeVM generation device, apply fork identity fields, log
           the resume-time params, and ack the generation interrupt last
+  dirty   continuously write through an anonymous working set for dirty
+          tracking pressure benchmarks
 
 Environment:
   CC   C compiler command to use (default: cc). May include simple arguments,
@@ -31,9 +33,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -ne 1 ]]; then
   [[ $# -eq 1 ]] && exit 0 || exit 2
 fi
 case "${mode}" in
-  ticker|fork) ;;
+  ticker|fork|dirty) ;;
   *)
-    echo "error: --mode must be ticker or fork" >&2
+    echo "error: --mode must be ticker, fork, or dirty" >&2
     exit 2
     ;;
 esac
@@ -58,6 +60,56 @@ int main(void) {
       (void)ignored;
     }
     sleep(1);
+  }
+}
+EOF
+elif [[ "${mode}" == "dirty" ]]; then
+  cat >"${workdir}/init.c" <<'EOF'
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+
+#define WORKING_SET_MIB 1024UL
+#define MIN_WORKING_SET_MIB 128UL
+#define PAGE_SIZE_BYTES 4096UL
+
+static unsigned long long monotonic_ms(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+  return (unsigned long long)ts.tv_sec * 1000ULL + (unsigned long long)ts.tv_nsec / 1000000ULL;
+}
+
+int main(void) {
+  unsigned long working_set_mib = WORKING_SET_MIB;
+  size_t len = 0;
+  volatile uint8_t *buf = MAP_FAILED;
+  while (working_set_mib >= MIN_WORKING_SET_MIB) {
+    len = working_set_mib * 1024UL * 1024UL;
+    buf = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf != MAP_FAILED) break;
+    working_set_mib /= 2;
+  }
+  if (buf == MAP_FAILED) {
+    printf("sporevm-dirty-smoke error=mmap min_working_set_mib=%lu\n", MIN_WORKING_SET_MIB);
+    for (;;) sleep(3600);
+  }
+
+  unsigned long pass = 0;
+  unsigned long long last_log_ms = monotonic_ms();
+  for (;;) {
+    for (size_t offset = 0; offset < len; offset += PAGE_SIZE_BYTES) {
+      buf[offset] = (uint8_t)(pass + offset);
+    }
+    pass++;
+    unsigned long long now = monotonic_ms();
+    if (now - last_log_ms >= 1000ULL) {
+      printf("sporevm-dirty-smoke pass=%lu working_set_mib=%lu\n", pass, working_set_mib);
+      fflush(stdout);
+      last_log_ms = now;
+    }
   }
 }
 EOF

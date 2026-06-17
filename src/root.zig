@@ -25,6 +25,7 @@ pub const lifecycle = @import("lifecycle.zig");
 pub const local_paths = @import("local_paths.zig");
 pub const monitor = @import("monitor.zig");
 pub const platform = @import("platform.zig");
+const dirty_ram = @import("dirty_ram.zig");
 pub const hvf = @import("hvf/hvf.zig");
 pub const resume_cmd = @import("resume.zig");
 pub const rootfs = @import("rootfs.zig");
@@ -60,6 +61,7 @@ test {
     testing.refAllDecls(local_paths);
     testing.refAllDecls(monitor);
     testing.refAllDecls(platform);
+    testing.refAllDecls(dirty_ram);
     testing.refAllDecls(resume_cmd);
     testing.refAllDecls(run);
     testing.refAllDecls(virtio.queue);
