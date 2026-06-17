@@ -12,14 +12,15 @@ The script name is historical; use --backend hvf for macOS write-protect runs.
 
 Options:
   --backend kvm|hvf          hypervisor harness to benchmark (default: kvm)
-  --kernel Image             aarch64 Linux kernel Image (default: managed initrd kernel)
+  --kernel Image             aarch64 Linux kernel Image (default: managed initrd
+                              kernel, or managed sporevm kernel for idle/fork)
   --initrd root.cpio         prebuilt ticker initrd (default: build one)
   --mem-mib-list "N ..."     memory sizes to test (default: "512 4096")
   --modes "MODE ..."         modes to run: full-scan plus dirty-log (KVM) or
                               write-protect (HVF); defaults by backend
   --snapshot-after-ms N      capture delay before snapshot (default: 3000)
   --dirty-epoch-ms N         dirty tracking epoch cadence; 0 means tail only (default: 250)
-  --initrd-mode MODE         initrd workload: ticker, fork, or dirty (default: ticker)
+  --initrd-mode MODE         initrd workload: ticker, idle, fork, or dirty (default: ticker)
   --iterations N             paired repetitions per memory size (default: 1)
   --parallel-vms N           captures to run concurrently per mode/iteration (default: 1)
   --workdir DIR              work directory (default: mktemp)
@@ -144,8 +145,8 @@ case "${backend}" in
   *) die "--backend must be kvm or hvf" ;;
 esac
 case "${initrd_mode}" in
-  ticker|fork|dirty) ;;
-  *) die "--initrd-mode must be ticker, fork, or dirty" ;;
+  ticker|idle|fork|dirty) ;;
+  *) die "--initrd-mode must be ticker, idle, fork, or dirty" ;;
 esac
 if [[ -z "${modes}" ]]; then
   case "${backend}" in
@@ -189,8 +190,12 @@ fi
 : >"${output}"
 
 if [[ -z "${kernel}" ]]; then
-  kernel="$("${repo_root}/scripts/ensure-managed-kernel.sh" initrd)"
-  echo "using managed kernel: ${kernel}" >&2
+  kernel_kind="initrd"
+  case "${initrd_mode}" in
+    idle|fork) kernel_kind="sporevm" ;;
+  esac
+  kernel="$("${repo_root}/scripts/ensure-managed-kernel.sh" "${kernel_kind}")"
+  echo "using managed ${kernel_kind} kernel: ${kernel}" >&2
 fi
 [[ -f "${kernel}" ]] || die "kernel not found: ${kernel}"
 

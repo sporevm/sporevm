@@ -3,13 +3,13 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: scripts/make-smoke-initrd.sh [--mode ticker|fork|dirty] <out.cpio>
+usage: scripts/make-smoke-initrd.sh [--mode ticker|idle|fork|dirty] <out.cpio>
 
-Build a tiny newc initrd containing a static /init that prints
-"sporevm-initrd-tick N" once per second. Intended for KVM/HVF smoke tests.
+Build a tiny newc initrd containing a static /init for KVM/HVF smoke tests.
 
 Modes:
   ticker  print the restore-smoke ticker only (default)
+  idle    print readiness once, then sleep without intentional guest writes
   fork    poll the SporeVM generation device, apply fork identity fields, log
           the resume-time params, and ack the generation interrupt last
   dirty   continuously write through an anonymous working set for dirty
@@ -33,9 +33,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -ne 1 ]]; then
   [[ $# -eq 1 ]] && exit 0 || exit 2
 fi
 case "${mode}" in
-  ticker|fork|dirty) ;;
+  ticker|idle|fork|dirty) ;;
   *)
-    echo "error: --mode must be ticker, fork, or dirty" >&2
+    echo "error: --mode must be ticker, idle, fork, or dirty" >&2
     exit 2
     ;;
 esac
@@ -59,6 +59,53 @@ int main(void) {
       ssize_t ignored = write(1, buf, (size_t)n);
       (void)ignored;
     }
+    sleep(1);
+  }
+}
+EOF
+elif [[ "${mode}" == "idle" ]]; then
+  cat >"${workdir}/init.c" <<'EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
+
+#define GEN_BASE 0x0c001000ULL
+#define GEN_WINDOW_SIZE 0x1000U
+#define REG_MAGIC 0x000U
+
+int main(void) {
+  mkdir("/dev", 0755);
+  if (mknod("/dev/mem", S_IFCHR | 0600, makedev(1, 1)) != 0 && errno != EEXIST) {
+    printf("sporevm-idle-smoke error=mknod-devmem errno=%d\n", errno);
+    fflush(stdout);
+    for (;;) sleep(3600);
+  }
+  int fd = open("/dev/mem", O_RDONLY | O_SYNC);
+  if (fd < 0) {
+    printf("sporevm-idle-smoke error=open-devmem errno=%d\n", errno);
+    fflush(stdout);
+    for (;;) sleep(3600);
+  }
+  void *mapped = mmap(NULL, GEN_WINDOW_SIZE, PROT_READ, MAP_SHARED, fd, (off_t)GEN_BASE);
+  close(fd);
+  if (mapped == MAP_FAILED) {
+    printf("sporevm-idle-smoke error=mmap-generation errno=%d\n", errno);
+    fflush(stdout);
+    for (;;) sleep(3600);
+  }
+
+  volatile uint32_t *generation_magic = (volatile uint32_t *)((volatile uint8_t *)mapped + REG_MAGIC);
+  puts("sporevm-idle-smoke ready");
+  fflush(stdout);
+  for (;;) {
+    volatile uint32_t ignored = *generation_magic;
+    (void)ignored;
     sleep(1);
   }
 }

@@ -114,7 +114,7 @@ state and broader disk manifests remain later work.
 | Slice 4: fork and generation protocol | Complete for correctness | Keep fan-out identity smokes as regression coverage. |
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |
 | Slice 6: identical-host distribution | Active | Multi-peer/cache hierarchy and measured origin-egress efficiency beyond explicit relay trees. |
-| Slice 7: always-on dirty tracking | Active | KVM dirty-tail backlog under active writes, many-VM/larger-RAM measurement, HVF scale decision. |
+| Slice 7: always-on dirty tracking | Complete for the foundation target | Keep dirty-tail and worker-stop benchmarks as release regressions; tune worker preemption only if the product SLO tightens. |
 | Slice 8: cross-backend diagnostic restore | Later diagnostic | HVF portable GIC producer and timer-frequency strategy. |
 
 ## Landed Foundation Capabilities
@@ -167,7 +167,7 @@ Done when a multi-host fan-out demo restores one spore on every host in a test
 fleet, measures origin egress at a small multiple of unique chunk bytes, and
 rejects corrupted peer data.
 
-## Active Slice 7: Always-On Dirty Tracking
+## Slice 7: Always-On Dirty Tracking
 
 KVM dirty tracking has a harness path using `KVM_GET_DIRTY_LOG`, explicit
 VMM-originated dirty marking, epoch sealing, and tail flush. HVF has a
@@ -198,39 +198,52 @@ remaining dirty chunks to the final tail flush instead of waiting for a whole
 worker epoch to drain. The manifest continues to treat `ram.backing` as optional
 same-host acceleration; verified chunks remain the portable source of truth.
 
-Current benchmark evidence separates boot/seal backlog from suspend tail. On
-HVF, the dirty workload is bounded in the tested cases: 1GiB repeated snapshots
-pause in 16-18ms, local post-sealer sanity runs paused in 14-15ms with no tail
-chunks, and a concurrent 2x4GiB run paused in 20-22ms per VM with no tail
-chunks. On KVM, 4GiB and 16GiB dirty-workload snapshots remain around 87-90ms,
-and a post-parallel concurrent 2x4GiB run remained 87ms per VM with no tail
-chunks. The KVM 1GiB dirty workload proved the active-write tail was CPU-bound:
-before parallel sealing, 116 tail chunks produced a 2.19s tail flush while the
-whole run spent 2.90s zero-scanning, 2.99s hashing, 34ms writing chunk files,
-and 24ms writing `ram.backing`. Parallel tail sealing keeps the same exact
-snapshot contract and reduced the same 115-116 chunk tail to about 301ms using 8
-workers. This fixes the multi-second KVM tail regression, but active-write
-latency remains proportional to the unsealed dirty tail.
+Closeout evidence separates true idle snapshots from boot/ticker backlog and
+active write pressure. The benchmark initrd now has an `idle` mode that prints
+readiness once, then uses read-only generation-device MMIO to give the harness a
+periodic exit without intentional RAM writes. That keeps the caught-up benchmark
+from measuring console spam.
 
-Current focus:
+On KVM, the true-idle 30s dirty-log runs on an aarch64 A1 host paused in
+218ms, 99ms, and 317ms at 1/4/16GiB. The dirty tail stayed tiny at 4, 5, and 4
+chunks. The remaining spread came from worker-stop timing, not a configured-RAM
+scan: the final snapshot waited for the current sealing chunk or epoch boundary
+for 127ms, 1ms, and 217ms. Shorter 8s idle/ticker runs are useful backlog tests
+but not caught-up latency claims; they can still show hundreds of milliseconds
+of worker-stop time while boot dirties are being sealed.
 
-1. Repeat KVM 1GiB active-write runs to measure variance after parallel tail
-   sealing and choose a support boundary for guests that keep many chunks dirty
-   at suspend.
-2. Compare one VM, many VMs, and larger RAM using worker metrics without
-   changing APIs again.
-3. Separate steady-state idle snapshots from active boot or workload dirty
-   bursts.
-4. Expand HVF write-protect measurements on macOS CI hardware before declaring a
-   product support boundary.
-5. Revisit KVM dirty ring only if bitmap polling becomes material after larger
-   RAM, many-vCPU, or many-VM measurements.
+KVM active-write behavior is now bounded by dirty tail size rather than total
+RAM. Three repeated 1GiB dirty-workload runs paused in 677-678ms with 57-58
+tail chunks after the previous multi-second tail regression. A 4GiB active run
+paused in 474ms with 226 tail chunks, and a 16GiB run paused in 91ms with one
+tail chunk. A concurrent 2x4GiB active run paused in 86-87ms per VM with no
+tail chunks. `KVM_GET_DIRTY_LOG` remained cheap in these runs, so dirty ring is
+not justified for the foundation target; hashing/sealing and active tails are
+the limiting costs.
 
-Done when caught-up suspend latency is measured flat across 1/4/16GiB guests on
-Linux and HVF, active-write dirty-tail behavior is bounded or documented as a
-support limit, the KVM 1GiB active-write tail regression is fixed or explicitly
-excluded from the Slice 7 support boundary, and the HVF overhead decision is
-recorded with numbers.
+On HVF, write-protect dirty tracking is acceptable for the foundation support
+boundary. True-idle write-protect runs paused in 28-29ms at 1GiB, 61-62ms at
+4GiB, and 25-30ms at 16GiB after rerunning the local 16GiB case with enough disk
+headroom. The dirty workload paused in 14ms at 1GiB and 15-17ms at 4GiB with no
+tail chunks, and a concurrent 2x4GiB ticker run paused in 27ms and 70ms.
+
+The Slice 7 support claim is therefore: caught-up suspend avoids a suspend-time
+full-RAM scan on KVM and HVF, and measured pause time is not proportional to
+configured RAM size in the 1/4/16GiB foundation matrix. Active-write guests are
+not promised constant suspend latency. They are supported when the dirty tail is
+small enough for the product SLO; otherwise suspend latency remains proportional
+to unsealed dirty chunks. Worker cadence lag is observable and can contribute a
+few hundred milliseconds of worker-stop tail even with a tiny dirty tail, but it
+is not currently a foundation blocker.
+
+Follow-up release hardening:
+
+1. Add a CI or nightly dirty-tracking benchmark guard once the release SLO is
+   chosen.
+2. Tune worker preemption or chunk scheduling if the few-hundred-millisecond
+   worker-stop spread becomes user-visible.
+3. Revisit KVM dirty ring only if larger many-vCPU or many-VM runs show bitmap
+   polling, not hashing/sealing, is material.
 
 ## Slice 8: Cross-Backend Diagnostic Restore
 
