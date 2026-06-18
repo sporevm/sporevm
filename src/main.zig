@@ -45,6 +45,8 @@ const usage =
     \\                      Pack portable spore chunks into a local bundle
     \\  unpack <bundle-dir> [--child ID] --out DIR
     \\                      Unpack a local spore bundle into a spore dir
+    \\  pull file://BUNDLE [--child ID] --out DIR
+    \\                      Pull one child from a local bundle into a spore dir
     \\  help                Show this help
     \\
 ;
@@ -113,6 +115,9 @@ pub fn main(init: std.process.Init) !void {
         try printJson(arena, stdout, result);
     } else if (std.mem.eql(u8, command, "unpack")) {
         const result = try unpackCommand(init, arena, command_args);
+        try printJson(arena, stdout, result);
+    } else if (std.mem.eql(u8, command, "pull")) {
+        const result = try pullCommand(init, arena, command_args);
         try printJson(arena, stdout, result);
     } else if (std.mem.eql(u8, command, "help")) {
         try stdout.writeAll(usage);
@@ -286,8 +291,51 @@ fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []c
     });
 }
 
+fn pullCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.PullResult {
+    var source: ?[]const u8 = null;
+    var out_dir: ?[]const u8 = null;
+    var child_id: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
+            i += 1;
+            out_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--child") and i + 1 < args.len) {
+            i += 1;
+            child_id = args[i];
+        } else if (std.mem.startsWith(u8, args[i], "--")) {
+            std.debug.print("unknown pull argument: {s}\n", .{args[i]});
+            std.process.exit(2);
+        } else if (source == null) {
+            source = args[i];
+        } else {
+            std.debug.print("unexpected pull argument: {s}\n", .{args[i]});
+            std.process.exit(2);
+        }
+    }
+
+    if (source == null or out_dir == null) {
+        std.debug.print("usage: spore pull file://BUNDLE [--child ID] --out DIR\n", .{});
+        std.process.exit(2);
+    }
+
+    return sporevm.bundle.pull(allocator, .{
+        .io = init.io,
+        .source = source.?,
+        .out_dir = out_dir.?,
+        .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
+        .bundle_cache_dir = optionalBundleCacheRoot(allocator, init),
+        .child_id = child_id,
+    });
+}
+
 fn optionalRootfsCacheRoot(allocator: std.mem.Allocator, init: std.process.Init) ?[]const u8 {
     return sporevm.local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch null;
+}
+
+fn optionalBundleCacheRoot(allocator: std.mem.Allocator, init: std.process.Init) ?[]const u8 {
+    return sporevm.local_paths.bundleCacheRootPath(allocator, init.environ_map) catch null;
 }
 
 const InspectSummary = struct {
@@ -336,6 +384,7 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "fanout") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "pack") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "unpack") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "pull") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "help") != null);
 }
 

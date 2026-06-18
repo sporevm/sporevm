@@ -73,6 +73,33 @@ pub const UnpackResult = struct {
     selected_child: ?[]const u8 = null,
 };
 
+pub const PullOptions = struct {
+    io: Io,
+    source: []const u8,
+    out_dir: []const u8,
+    rootfs_cache_dir: ?[]const u8 = null,
+    bundle_cache_dir: ?[]const u8 = null,
+    child_id: ?[]const u8 = null,
+};
+
+pub const PullResult = struct {
+    source: []const u8,
+    bundle_dir: []const u8,
+    out_dir: []const u8,
+    bundle_digest: []const u8,
+    chunk_count: usize,
+    materialized_chunk_count: usize,
+    payload_bytes: u64,
+    cache_hit_count: usize = 0,
+    cache_miss_count: usize = 0,
+    linked_chunk_count: usize = 0,
+    copied_chunk_count: usize = 0,
+    rootfs_artifact_count: usize = 0,
+    rootfs_payload_bytes: u64 = 0,
+    child_count: usize = 0,
+    selected_child: ?[]const u8 = null,
+};
+
 pub const IndexChunk = struct {
     id: []const u8,
     pack: []const u8,
@@ -111,6 +138,61 @@ pub const RootfsArtifactEntry = struct {
 pub const RootfsIndex = struct {
     version: u32 = rootfs_index_version,
     artifacts: []RootfsArtifactEntry,
+};
+
+const VerifiedContentSource = struct {
+    ctx: *anyopaque,
+    read_chunk_fn: *const fn (*anyopaque, std.mem.Allocator, IndexChunk, []const u8, usize) Error![]u8,
+
+    fn readChunk(
+        self: VerifiedContentSource,
+        allocator: std.mem.Allocator,
+        entry: IndexChunk,
+        expected_id: []const u8,
+        expected_size: usize,
+    ) Error![]u8 {
+        return self.read_chunk_fn(self.ctx, allocator, entry, expected_id, expected_size);
+    }
+};
+
+const LocalBundleContentSource = struct {
+    bundle_dir: []const u8,
+
+    fn source(self: *LocalBundleContentSource) VerifiedContentSource {
+        return .{
+            .ctx = self,
+            .read_chunk_fn = readChunk,
+        };
+    }
+
+    fn readChunk(
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        entry: IndexChunk,
+        expected_id: []const u8,
+        expected_size: usize,
+    ) Error![]u8 {
+        const self: *LocalBundleContentSource = @ptrCast(@alignCast(ctx));
+        if (!std.mem.eql(u8, entry.id, expected_id)) return error.BadManifest;
+        if (entry.size != @as(u64, @intCast(expected_size))) return error.BadManifest;
+        const source_pack_path = try pathZ(allocator, "{s}/{s}", .{ self.bundle_dir, entry.pack });
+        const data = try readFileRange(allocator, source_pack_path, entry.offset, entry.size);
+        errdefer allocator.free(data);
+        if (!sha256HexMatches(entry.sha256, data)) return error.BadChunk;
+        const id = chunklib.ChunkId.fromHex(expected_id) catch return error.BadManifest;
+        if (!id.matches(data)) return error.BadChunk;
+        return data;
+    }
+};
+
+const MaterializeResult = struct {
+    chunk_count: usize,
+    materialized_chunk_count: usize = 0,
+    payload_bytes: u64 = 0,
+    cache_hit_count: usize = 0,
+    cache_miss_count: usize = 0,
+    linked_chunk_count: usize = 0,
+    copied_chunk_count: usize = 0,
 };
 
 pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult {
@@ -311,40 +393,19 @@ pub fn unpack(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unpack
     defer parsed_index.deinit();
     try validateIndex(allocator, parsed_index.value);
 
-    var by_id = std.StringHashMap(IndexChunk).init(allocator);
+    var by_id = try indexById(allocator, parsed_index.value);
     defer by_id.deinit();
-    for (parsed_index.value.chunks) |entry| {
-        by_id.put(entry.id, entry) catch return error.OutOfMemory;
-    }
-
-    try ensureNewDir(try pathZ(allocator, "{s}", .{options.out_dir}));
-    try ensureNewDir(try pathZ(allocator, "{s}/chunks", .{options.out_dir}));
-
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-    var unpacked_chunk_count: usize = 0;
-    var payload_bytes: u64 = 0;
-
-    var i: usize = 0;
-    while (i < plan.chunk_count) : (i += 1) {
-        const ref = manifest.memory.chunks[i] orelse continue;
-        if (seen.contains(ref)) continue;
-        seen.put(ref, {}) catch return error.OutOfMemory;
-        const entry = by_id.get(ref) orelse return error.BadManifest;
-        const range = chunkRange(plan, @intCast(manifest.platform.ram_size), i) catch return error.BadManifest;
-        const expected_size = range.end - range.start;
-        if (entry.size != @as(u64, @intCast(expected_size))) return error.BadManifest;
-        const source_pack_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, entry.pack });
-        const data = try readFileRange(allocator, source_pack_path, entry.offset, entry.size);
-        defer allocator.free(data);
-        if (!sha256HexMatches(entry.sha256, data)) return error.BadChunk;
-        const id = chunklib.ChunkId.fromHex(ref) catch return error.BadManifest;
-        if (!id.matches(data)) return error.BadChunk;
-        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ options.out_dir, ref });
-        try writeFileAll(chunk_path, data);
-        unpacked_chunk_count += 1;
-        payload_bytes += @intCast(data.len);
-    }
+    var local_source = LocalBundleContentSource{ .bundle_dir = options.bundle_dir };
+    const materialized = try materializeChunks(
+        allocator,
+        options.io,
+        options.out_dir,
+        manifest,
+        plan,
+        &by_id,
+        local_source.source(),
+        null,
+    );
 
     const rootfs_payload_bytes = try unpackRootfsArtifact(allocator, options, manifest);
     try spore.saveManifest(allocator, options.out_dir, manifest);
@@ -355,8 +416,8 @@ pub fn unpack(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unpack
         .out_dir = options.out_dir,
         .bundle_digest = bundle_digest,
         .chunk_count = plan.chunk_count,
-        .unpacked_chunk_count = unpacked_chunk_count,
-        .payload_bytes = payload_bytes,
+        .unpacked_chunk_count = materialized.materialized_chunk_count,
+        .payload_bytes = materialized.payload_bytes,
         .rootfs_artifact_count = if (manifest.rootfs == null) 0 else 1,
         .rootfs_payload_bytes = rootfs_payload_bytes,
     };
@@ -367,7 +428,8 @@ fn unpackIndexed(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unp
     defer parsed_bundle.deinit();
     const bundle_index = parsed_bundle.value;
 
-    const selected_rel = try selectedManifestPath(allocator, bundle_index, options.child_id);
+    const child_id = if (options.child_id) |id| try canonicalChildId(allocator, id) else null;
+    const selected_rel = try selectedManifestPath(allocator, bundle_index, child_id);
     const parsed_manifest = try spore.loadManifestPath(
         allocator,
         try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, selected_rel }),
@@ -381,40 +443,19 @@ fn unpackIndexed(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unp
     defer parsed_index.deinit();
     try validateIndex(allocator, parsed_index.value);
 
-    var by_id = std.StringHashMap(IndexChunk).init(allocator);
+    var by_id = try indexById(allocator, parsed_index.value);
     defer by_id.deinit();
-    for (parsed_index.value.chunks) |entry| {
-        by_id.put(entry.id, entry) catch return error.OutOfMemory;
-    }
-
-    try ensureNewDir(try pathZ(allocator, "{s}", .{options.out_dir}));
-    try ensureNewDir(try pathZ(allocator, "{s}/chunks", .{options.out_dir}));
-
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-    var unpacked_chunk_count: usize = 0;
-    var payload_bytes: u64 = 0;
-
-    var i: usize = 0;
-    while (i < plan.chunk_count) : (i += 1) {
-        const ref = manifest.memory.chunks[i] orelse continue;
-        if (seen.contains(ref)) continue;
-        seen.put(ref, {}) catch return error.OutOfMemory;
-        const entry = by_id.get(ref) orelse return error.BadManifest;
-        const range = chunkRange(plan, @intCast(manifest.platform.ram_size), i) catch return error.BadManifest;
-        const expected_size = range.end - range.start;
-        if (entry.size != @as(u64, @intCast(expected_size))) return error.BadManifest;
-        const source_pack_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, entry.pack });
-        const data = try readFileRange(allocator, source_pack_path, entry.offset, entry.size);
-        defer allocator.free(data);
-        if (!sha256HexMatches(entry.sha256, data)) return error.BadChunk;
-        const id = chunklib.ChunkId.fromHex(ref) catch return error.BadManifest;
-        if (!id.matches(data)) return error.BadChunk;
-        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ options.out_dir, ref });
-        try writeFileAll(chunk_path, data);
-        unpacked_chunk_count += 1;
-        payload_bytes += @intCast(data.len);
-    }
+    var local_source = LocalBundleContentSource{ .bundle_dir = options.bundle_dir };
+    const materialized = try materializeChunks(
+        allocator,
+        options.io,
+        options.out_dir,
+        manifest,
+        plan,
+        &by_id,
+        local_source.source(),
+        null,
+    );
 
     const rootfs_payload_bytes = try unpackRootfsArtifactIndexed(allocator, options, bundle_index, manifest);
     try spore.saveManifest(allocator, options.out_dir, manifest);
@@ -425,12 +466,78 @@ fn unpackIndexed(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unp
         .out_dir = options.out_dir,
         .bundle_digest = bundle_digest,
         .chunk_count = plan.chunk_count,
-        .unpacked_chunk_count = unpacked_chunk_count,
-        .payload_bytes = payload_bytes,
+        .unpacked_chunk_count = materialized.materialized_chunk_count,
+        .payload_bytes = materialized.payload_bytes,
         .rootfs_artifact_count = if (manifest.rootfs == null) 0 else 1,
         .rootfs_payload_bytes = rootfs_payload_bytes,
         .child_count = bundle_index.children.len,
-        .selected_child = options.child_id,
+        .selected_child = child_id,
+    };
+}
+
+pub fn pull(allocator: std.mem.Allocator, options: PullOptions) Error!PullResult {
+    const bundle_dir = try localFileUriPath(allocator, options.source);
+    const child_id = if (options.child_id) |id| try canonicalChildId(allocator, id) else null;
+
+    const parsed_bundle = try loadBundleIndex(allocator, bundle_dir);
+    defer parsed_bundle.deinit();
+    const bundle_index = parsed_bundle.value;
+
+    const selected_rel = try selectedManifestPath(allocator, bundle_index, child_id);
+    const parsed_manifest = try spore.loadManifestPath(
+        allocator,
+        try pathZ(allocator, "{s}/{s}", .{ bundle_dir, selected_rel }),
+    );
+    defer parsed_manifest.deinit();
+    var manifest = parsed_manifest.value;
+    manifest.memory.backing = null;
+    const plan = try spore.validateMemoryForRam(manifest.memory, @intCast(manifest.platform.ram_size));
+
+    const parsed_index = try loadIndex(allocator, bundle_dir);
+    defer parsed_index.deinit();
+    try validateIndex(allocator, parsed_index.value);
+    var by_id = try indexById(allocator, parsed_index.value);
+    defer by_id.deinit();
+
+    var local_source = LocalBundleContentSource{ .bundle_dir = bundle_dir };
+    const materialized = try materializeChunks(
+        allocator,
+        options.io,
+        options.out_dir,
+        manifest,
+        plan,
+        &by_id,
+        local_source.source(),
+        options.bundle_cache_dir,
+    );
+
+    const unpack_options = UnpackOptions{
+        .io = options.io,
+        .bundle_dir = bundle_dir,
+        .out_dir = options.out_dir,
+        .rootfs_cache_dir = options.rootfs_cache_dir,
+        .child_id = child_id,
+    };
+    const rootfs_payload_bytes = try unpackRootfsArtifactIndexed(allocator, unpack_options, bundle_index, manifest);
+    try spore.saveManifest(allocator, options.out_dir, manifest);
+    const bundle_digest = try digestHex(allocator, bundle_dir);
+
+    return .{
+        .source = options.source,
+        .bundle_dir = bundle_dir,
+        .out_dir = options.out_dir,
+        .bundle_digest = bundle_digest,
+        .chunk_count = plan.chunk_count,
+        .materialized_chunk_count = materialized.materialized_chunk_count,
+        .payload_bytes = materialized.payload_bytes,
+        .cache_hit_count = materialized.cache_hit_count,
+        .cache_miss_count = materialized.cache_miss_count,
+        .linked_chunk_count = materialized.linked_chunk_count,
+        .copied_chunk_count = materialized.copied_chunk_count,
+        .rootfs_artifact_count = if (manifest.rootfs == null) 0 else 1,
+        .rootfs_payload_bytes = rootfs_payload_bytes,
+        .child_count = bundle_index.children.len,
+        .selected_child = child_id,
     };
 }
 
@@ -640,6 +747,179 @@ fn validateChunk(entry: IndexChunk) Error!void {
     _ = std.fmt.hexToBytes(&digest, entry.sha256) catch return error.BadManifest;
 }
 
+fn indexById(allocator: std.mem.Allocator, index: Index) Error!std.StringHashMap(IndexChunk) {
+    var by_id = std.StringHashMap(IndexChunk).init(allocator);
+    errdefer by_id.deinit();
+    for (index.chunks) |entry| {
+        by_id.put(entry.id, entry) catch return error.OutOfMemory;
+    }
+    return by_id;
+}
+
+fn materializeChunks(
+    allocator: std.mem.Allocator,
+    io: Io,
+    out_dir: []const u8,
+    manifest: spore.Manifest,
+    plan: spore.MemoryPlan,
+    by_id: *const std.StringHashMap(IndexChunk),
+    source: VerifiedContentSource,
+    chunk_cache_dir: ?[]const u8,
+) Error!MaterializeResult {
+    try ensureNewDir(try pathZ(allocator, "{s}", .{out_dir}));
+    try ensureNewDir(try pathZ(allocator, "{s}/chunks", .{out_dir}));
+
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    var result = MaterializeResult{ .chunk_count = plan.chunk_count };
+
+    var i: usize = 0;
+    while (i < plan.chunk_count) : (i += 1) {
+        const ref = manifest.memory.chunks[i] orelse continue;
+        if (seen.contains(ref)) continue;
+        seen.put(ref, {}) catch return error.OutOfMemory;
+        const entry = by_id.get(ref) orelse return error.BadManifest;
+        const range = chunkRange(plan, @intCast(manifest.platform.ram_size), i) catch return error.BadManifest;
+        const expected_size = range.end - range.start;
+        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ out_dir, ref });
+        if (chunk_cache_dir) |cache_dir| {
+            try materializeChunkViaCache(
+                allocator,
+                io,
+                cache_dir,
+                chunk_path,
+                source,
+                entry,
+                ref,
+                expected_size,
+                &result,
+            );
+        } else {
+            const data = try source.readChunk(allocator, entry, ref, expected_size);
+            defer allocator.free(data);
+            try writeFileAll(chunk_path, data);
+            result.materialized_chunk_count += 1;
+            result.payload_bytes += @intCast(data.len);
+            result.copied_chunk_count += 1;
+        }
+    }
+
+    return result;
+}
+
+fn materializeChunkViaCache(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_dir: []const u8,
+    out_chunk_path: []const u8,
+    source: VerifiedContentSource,
+    entry: IndexChunk,
+    expected_id: []const u8,
+    expected_size: usize,
+    result: *MaterializeResult,
+) Error!void {
+    const cache_path = try chunkCachePath(allocator, cache_dir, expected_id);
+    const cache_parent = std.fs.path.dirname(cache_path) orelse return error.IoFailed;
+    try ensureDirPath(io, cache_parent);
+
+    if (try pathExistsNoSymlink(io, cache_path)) {
+        try verifyChunkPath(io, allocator, cache_path, expected_id, expected_size);
+        result.cache_hit_count += 1;
+    } else {
+        const data = try source.readChunk(allocator, entry, expected_id, expected_size);
+        defer allocator.free(data);
+        try installChunkCachePath(allocator, io, cache_path, data, expected_id, expected_size);
+        result.cache_miss_count += 1;
+        result.payload_bytes += @intCast(data.len);
+    }
+
+    const linked = try linkOrCopyVerifiedChunk(allocator, io, cache_path, out_chunk_path, expected_id, expected_size);
+    if (linked) {
+        result.linked_chunk_count += 1;
+    } else {
+        result.copied_chunk_count += 1;
+    }
+    result.materialized_chunk_count += 1;
+}
+
+fn installChunkCachePath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_path: []const u8,
+    data: []const u8,
+    expected_id: []const u8,
+    expected_size: usize,
+) Error!void {
+    if (data.len != expected_size) return error.BadChunk;
+    const id = chunklib.ChunkId.fromHex(expected_id) catch return error.BadManifest;
+    if (!id.matches(data)) return error.BadChunk;
+
+    var temp_nonce_bytes: [8]u8 = undefined;
+    io.random(&temp_nonce_bytes);
+    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
+    const temp_path = std.fmt.allocPrintSentinel(allocator, "{s}.{x}.tmp", .{ cache_path, temp_nonce }, 0) catch return error.OutOfMemory;
+    defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+    try writeFileExclusive(temp_path, data, 0o444);
+    try verifyChunkPath(io, allocator, temp_path, expected_id, expected_size);
+    try renamePath(io, temp_path, cache_path);
+    try verifyChunkPath(io, allocator, cache_path, expected_id, expected_size);
+}
+
+fn linkOrCopyVerifiedChunk(
+    allocator: std.mem.Allocator,
+    io: Io,
+    source_path: []const u8,
+    dest_path: []const u8,
+    expected_id: []const u8,
+    expected_size: usize,
+) Error!bool {
+    const source_z = try pathZ(allocator, "{s}", .{source_path});
+    const dest_z = try pathZ(allocator, "{s}", .{dest_path});
+    if (std.c.link(source_z, dest_z) == 0) {
+        try verifyChunkPath(io, allocator, dest_path, expected_id, expected_size);
+        return true;
+    }
+
+    const data = try readVerifiedChunkPath(io, allocator, source_path, expected_id, expected_size);
+    defer allocator.free(data);
+    try writeFileAll(dest_z, data);
+    try verifyChunkPath(io, allocator, dest_path, expected_id, expected_size);
+    return false;
+}
+
+fn verifyChunkPath(
+    io: Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    expected_id: []const u8,
+    expected_size: usize,
+) Error!void {
+    const data = try readVerifiedChunkPath(io, allocator, path, expected_id, expected_size);
+    allocator.free(data);
+}
+
+fn readVerifiedChunkPath(
+    io: Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    expected_id: []const u8,
+    expected_size: usize,
+) Error![]u8 {
+    if (!try regularFileNoSymlink(io, path)) return error.BadChunk;
+    const path_z = try pathZ(allocator, "{s}", .{path});
+    const data = try readFileAll(allocator, path_z, expected_size);
+    errdefer allocator.free(data);
+    if (data.len != expected_size) return error.BadChunk;
+    const id = chunklib.ChunkId.fromHex(expected_id) catch return error.BadManifest;
+    if (!id.matches(data)) return error.BadChunk;
+    return data;
+}
+
+fn chunkCachePath(allocator: std.mem.Allocator, cache_dir: []const u8, chunk_id: []const u8) Error![]const u8 {
+    _ = chunklib.ChunkId.fromHex(chunk_id) catch return error.BadManifest;
+    return std.fs.path.join(allocator, &.{ cache_dir, "chunks", "blake3", chunk_id }) catch return error.OutOfMemory;
+}
+
 fn packManifestChunks(
     allocator: std.mem.Allocator,
     manifest: spore.Manifest,
@@ -792,6 +1072,28 @@ fn selectedManifestPath(allocator: std.mem.Allocator, index: BundleIndex, child_
     return error.BadManifest;
 }
 
+fn canonicalChildId(allocator: std.mem.Allocator, raw: []const u8) Error![]const u8 {
+    if (raw.len == 0 or raw.len > 6) return error.BadManifest;
+    for (raw) |c| {
+        if (!std.ascii.isDigit(c)) return error.BadManifest;
+    }
+    const value = std.fmt.parseInt(u32, raw, 10) catch return error.BadManifest;
+    if (value > 999999) return error.BadManifest;
+    return std.fmt.allocPrint(allocator, "{d:0>6}", .{value}) catch return error.OutOfMemory;
+}
+
+fn localFileUriPath(allocator: std.mem.Allocator, source: []const u8) Error![]const u8 {
+    const prefix = "file://";
+    if (!std.mem.startsWith(u8, source, prefix)) return error.BadManifest;
+    var path = source[prefix.len..];
+    if (std.mem.startsWith(u8, path, "localhost/")) {
+        path = path["localhost".len..];
+    }
+    if (path.len == 0 or !Io.Dir.path.isAbsolute(path)) return error.BadManifest;
+    if (std.mem.indexOfScalar(u8, path, '%') != null) return error.BadManifest;
+    return std.fs.path.resolve(allocator, &.{path}) catch return error.IoFailed;
+}
+
 const ChildDir = struct {
     id: []const u8,
     path: []const u8,
@@ -914,6 +1216,67 @@ fn readFileRange(allocator: std.mem.Allocator, path: [:0]const u8, offset: u64, 
     errdefer allocator.free(out);
     try preadFileAll(fd, start, out);
     return out;
+}
+
+fn writeFileExclusive(path: [:0]const u8, data: []const u8, mode: c_uint) Error!void {
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, mode);
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    var done: usize = 0;
+    while (done < data.len) {
+        const n = std.c.write(fd, data.ptr + done, data.len - done);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+    if (std.c.fchmod(fd, @intCast(mode)) != 0) return error.IoFailed;
+}
+
+fn regularFileNoSymlink(io: Io, path: []const u8) Error!bool {
+    const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+        else => return error.IoFailed,
+    };
+    return stat.kind == .file;
+}
+
+fn pathExistsNoSymlink(io: Io, path: []const u8) Error!bool {
+    _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+        else => return error.IoFailed,
+    };
+    return true;
+}
+
+fn ensureDirPath(io: Io, path: []const u8) Error!void {
+    if (!Io.Dir.path.isAbsolute(path)) {
+        Io.Dir.cwd().createDirPath(io, path) catch return error.IoFailed;
+        return;
+    }
+    var existing = Io.Dir.openDirAbsolute(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (std.fs.path.dirname(path)) |parent| {
+                if (parent.len > 0 and !std.mem.eql(u8, parent, path)) try ensureDirPath(io, parent);
+            }
+            Io.Dir.createDirAbsolute(io, path, .default_dir) catch |create_err| switch (create_err) {
+                error.PathAlreadyExists => {},
+                else => return error.IoFailed,
+            };
+            return;
+        },
+        else => return error.IoFailed,
+    };
+    existing.close(io);
+}
+
+fn renamePath(io: Io, old_path: []const u8, new_path: []const u8) Error!void {
+    const old_absolute = Io.Dir.path.isAbsolute(old_path);
+    const new_absolute = Io.Dir.path.isAbsolute(new_path);
+    if (old_absolute != new_absolute) return error.BadManifest;
+    if (old_absolute) {
+        Io.Dir.renameAbsolute(old_path, new_path, io) catch return error.IoFailed;
+    } else {
+        Io.Dir.rename(Io.Dir.cwd(), old_path, Io.Dir.cwd(), new_path, io) catch return error.IoFailed;
+    }
 }
 
 fn updateHashWithFile(
@@ -1463,6 +1826,185 @@ test "pack children writes bundle index and unpacks selected child" {
     @memset(out, 0xCC);
     try spore.loadMemory(arena, out_dir, restored_manifest.value.memory, out);
     try std.testing.expectEqualSlices(u8, ram, out);
+}
+
+test "pull file bundle materializes children through chunk cache" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const out0_dir = try pathZ(arena, "{s}/pulled-0", .{root_dir});
+    const out1_dir = try pathZ(arena, "{s}/pulled-1", .{root_dir});
+    const chunk_cache_dir = try pathZ(arena, "{s}/chunk-cache", .{root_dir});
+    const pack_cache_root = try pathZ(arena, "{s}/pack-rootfs-cache", .{root_dir});
+    const pull_rootfs_cache = try pathZ(arena, "{s}/pull-rootfs-cache", .{root_dir});
+    const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
+    const source_uri = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
+
+    const ram = try arena.alloc(u8, spore.chunk_size + 11);
+    @memset(ram, 0);
+    ram[7] = 0x53;
+    ram[spore.chunk_size + 3] = 0xA7;
+    const memory = try spore.saveMemory(arena, parent_dir, ram);
+    try writeFileAll(rootfs_source_path, "pull rootfs artifact bytes");
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
+    try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 71, artifact));
+    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
+
+    const pack_result = try pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = bundle_dir,
+        .rootfs_cache_dir = pack_cache_root,
+        .children_dir = children_dir,
+    });
+
+    const pulled0 = try pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out0_dir,
+        .rootfs_cache_dir = pull_rootfs_cache,
+        .bundle_cache_dir = chunk_cache_dir,
+        .child_id = "0",
+    });
+    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled0.bundle_digest);
+    try std.testing.expectEqualStrings("000000", pulled0.selected_child.?);
+    try std.testing.expectEqual(@as(usize, 2), pulled0.materialized_chunk_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled0.cache_hit_count);
+    try std.testing.expectEqual(@as(usize, 2), pulled0.cache_miss_count);
+    try std.testing.expectEqual(@as(usize, 2), pulled0.linked_chunk_count);
+
+    const pulled1 = try pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out1_dir,
+        .rootfs_cache_dir = pull_rootfs_cache,
+        .bundle_cache_dir = chunk_cache_dir,
+        .child_id = "1",
+    });
+    try std.testing.expectEqualStrings("000001", pulled1.selected_child.?);
+    try std.testing.expectEqual(@as(usize, 2), pulled1.materialized_chunk_count);
+    try std.testing.expectEqual(@as(usize, 2), pulled1.cache_hit_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled1.cache_miss_count);
+    try std.testing.expectEqual(@as(usize, 2), pulled1.linked_chunk_count);
+
+    const restored_manifest = try spore.loadManifest(arena, out1_dir);
+    defer restored_manifest.deinit();
+    const restored_rootfs = restored_manifest.value.rootfs orelse return error.BadManifest;
+    const fd = try rootfs_cache.openVerifiedFromCache(io, arena, pull_rootfs_cache, restored_rootfs);
+    _ = std.c.close(fd);
+    const out = try arena.alloc(u8, ram.len);
+    @memset(out, 0xCC);
+    try spore.loadMemory(arena, out1_dir, restored_manifest.value.memory, out);
+    try std.testing.expectEqualSlices(u8, ram, out);
+}
+
+test "pull fails closed on corrupt chunk cache entries" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const out0_dir = try pathZ(arena, "{s}/pulled-0", .{root_dir});
+    const out_bad_dir = try pathZ(arena, "{s}/pulled-bad", .{root_dir});
+    const chunk_cache_dir = try pathZ(arena, "{s}/chunk-cache", .{root_dir});
+    const source_uri = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
+
+    const ram = try arena.alloc(u8, spore.chunk_size);
+    @memset(ram, 0x62);
+    const memory = try spore.saveMemory(arena, parent_dir, ram);
+    try spore.saveManifest(arena, parent_dir, testManifest(memory, ram.len, 81));
+    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 1 });
+    _ = try pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = bundle_dir,
+        .children_dir = children_dir,
+    });
+    _ = try pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out0_dir,
+        .bundle_cache_dir = chunk_cache_dir,
+        .child_id = "000000",
+    });
+
+    const restored_manifest = try spore.loadManifest(arena, out0_dir);
+    defer restored_manifest.deinit();
+    const first_ref = restored_manifest.value.memory.chunks[0] orelse return error.BadManifest;
+    const cache_path = try chunkCachePath(arena, chunk_cache_dir, first_ref);
+    try Io.Dir.cwd().deleteFile(io, cache_path);
+    try writeFileAll(try pathZ(arena, "{s}", .{cache_path}), "tampered");
+
+    try std.testing.expectError(error.BadChunk, pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out_bad_dir,
+        .bundle_cache_dir = chunk_cache_dir,
+        .child_id = "000000",
+    }));
+    const manifest_path = try pathZ(arena, "{s}/manifest.json", .{out_bad_dir});
+    try std.testing.expect(std.c.access(manifest_path, 0) != 0);
+}
+
+test "pull rejects unsupported sources and local file uri ambiguity" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.BadManifest, pull(allocator, .{
+        .io = std.testing.io,
+        .source = "s3://bucket/spore.bundle",
+        .out_dir = "zig-cache/pull-unsupported",
+    }));
+    try std.testing.expectError(error.BadManifest, pull(allocator, .{
+        .io = std.testing.io,
+        .source = "file://relative.bundle",
+        .out_dir = "zig-cache/pull-relative",
+    }));
+    try std.testing.expectError(error.BadManifest, pull(allocator, .{
+        .io = std.testing.io,
+        .source = "file:///tmp/with%20escape.bundle",
+        .out_dir = "zig-cache/pull-escaped",
+    }));
+}
+
+test "local bundle content source rejects out-of-bounds ranges" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+
+    const ram = try arena.alloc(u8, 4096);
+    @memset(ram, 0x84);
+    const memory = try spore.saveMemory(arena, parent_dir, ram);
+    try spore.saveManifest(arena, parent_dir, testManifest(memory, ram.len, 91));
+    _ = try pack(arena, .{ .io = io, .spore_dir = parent_dir, .out_dir = bundle_dir });
+
+    const parsed_index = try loadIndex(arena, bundle_dir);
+    defer parsed_index.deinit();
+    var bad_entry = parsed_index.value.chunks[0];
+    bad_entry.offset = spore.chunk_size;
+    var local_source = LocalBundleContentSource{ .bundle_dir = bundle_dir };
+    try std.testing.expectError(error.BadChunk, local_source.source().readChunk(
+        arena,
+        bad_entry,
+        bad_entry.id,
+        @intCast(bad_entry.size),
+    ));
 }
 
 test "pack children writes exact rootfs policy and unpacks selected rootfs child" {

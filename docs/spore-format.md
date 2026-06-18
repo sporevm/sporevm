@@ -71,6 +71,14 @@ that artifact in `rootfs.index.json` with an explicit `exact-bytes` policy.
 `metadata-only` is a recognized metadata policy, but materialized unpack rejects
 it until a later prepared-cache workflow exists.
 
+`spore pull file:///path/to/bundle --child 42 --out child.spore` is the first
+pull materialization policy. It accepts local indexed bundles, canonicalizes the
+child id to the six-digit child manifest id, verifies the selected chunks through
+the bundle index, and writes a normal spore directory. When
+`SPOREVM_BUNDLE_CACHE_DIR` is set, or the platform cache root is available, pull
+installs verified memory chunks into a node-local BLAKE3 chunk cache and hard
+links them into the output spore where the filesystem allows it.
+
 ## Manifest v0
 
 `manifest.json` fields (see `src/spore.zig` for the authoritative shapes):
@@ -164,6 +172,10 @@ it until a later prepared-cache workflow exists.
 - Indexed bundles validate `bundle.json` child ids and relative manifest paths
   before selecting a parent or child manifest. `spore unpack --child 000042`
   writes a normal spore directory for the selected child.
+- Local `spore pull file://... --child 42` uses the same manifest authority but
+  reads chunks through a verified content-source boundary and fails closed on
+  unsupported URI schemes, non-canonical bundle metadata, corrupt chunkpacks, or
+  corrupt node-local chunk cache entries.
 - Rootfs-backed bundles include exact immutable rootfs bytes by default. Bundle
   unpack refuses missing, symlinked, or digest-mismatched rootfs artifacts before
   writing a resumable spore.

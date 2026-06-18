@@ -95,6 +95,12 @@ requires the bundled artifact, verifies it against the manifest digest and size,
 and installs it into the destination host's rootfs digest cache before the
 unpacked spore can be resumed.
 
+`spore pull file:///path/to/bundle --child 42 --out child.spore` does the same
+rootfs installation for indexed local bundles while materializing one selected
+child. Use `SPOREVM_ROOTFS_CACHE_DIR` to choose the destination rootfs digest
+cache and `SPOREVM_BUNDLE_CACHE_DIR` to choose the node-local memory chunk cache
+used by pull.
+
 Plain `spore run --rootfs PATH` remains a local run escape hatch. Combining
 `--rootfs PATH` with `--capture` is rejected until an import/preload
 command can record portable rootfs identity for arbitrary local images.

@@ -10,16 +10,19 @@ const xdg_runtime_dir_env = "XDG_RUNTIME_DIR";
 
 pub const kernel_cache_env = "SPOREVM_KERNEL_CACHE_DIR";
 pub const rootfs_cache_env = "SPOREVM_ROOTFS_CACHE_DIR";
+pub const bundle_cache_env = "SPOREVM_BUNDLE_CACHE_DIR";
 pub const runtime_dir_env = "SPOREVM_RUNTIME_DIR";
 
 pub const CacheKind = enum {
     kernels,
     rootfs,
+    bundles,
 
     fn overrideEnvName(self: CacheKind) []const u8 {
         return switch (self) {
             .kernels => kernel_cache_env,
             .rootfs => rootfs_cache_env,
+            .bundles => bundle_cache_env,
         };
     }
 
@@ -27,6 +30,7 @@ pub const CacheKind = enum {
         return switch (self) {
             .kernels => "kernels",
             .rootfs => "rootfs",
+            .bundles => "bundles",
         };
     }
 };
@@ -61,6 +65,10 @@ pub fn kernelCacheRootPath(allocator: std.mem.Allocator, environ: *const std.pro
 
 pub fn rootfsCacheRootPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
     return cacheRootPath(allocator, environ, .rootfs);
+}
+
+pub fn bundleCacheRootPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
+    return cacheRootPath(allocator, environ, .bundles);
 }
 
 pub fn runtimeRootPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
@@ -100,7 +108,13 @@ test "cache roots prefer explicit and xdg paths" {
     defer allocator.free(explicit);
     try std.testing.expectEqualStrings("/tmp/sporevm-kernels", explicit);
 
+    try env.put(bundle_cache_env, "/tmp/sporevm-bundles");
+    const explicit_bundle = try bundleCacheRootPath(allocator, &env);
+    defer allocator.free(explicit_bundle);
+    try std.testing.expectEqualStrings("/tmp/sporevm-bundles", explicit_bundle);
+
     _ = env.swapRemove(kernel_cache_env);
+    _ = env.swapRemove(bundle_cache_env);
     try env.put(xdg_cache_home_env, "/tmp/xdg-cache");
     const kernels = try kernelCacheRootPath(allocator, &env);
     defer allocator.free(kernels);
@@ -109,6 +123,10 @@ test "cache roots prefer explicit and xdg paths" {
     const rootfs = try rootfsCacheRootPath(allocator, &env);
     defer allocator.free(rootfs);
     try std.testing.expectEqualStrings("/tmp/xdg-cache/sporevm/rootfs", rootfs);
+
+    const bundles = try bundleCacheRootPath(allocator, &env);
+    defer allocator.free(bundles);
+    try std.testing.expectEqualStrings("/tmp/xdg-cache/sporevm/bundles", bundles);
 }
 
 test "cache roots ignore empty optional environment values" {

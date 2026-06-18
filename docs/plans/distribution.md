@@ -37,10 +37,10 @@ lazy-capable so later work can fetch verified chunks on demand without changing
 the manifest contract.
 
 Rootfs-backed bundles are self-contained by default. If a selected manifest
-requires an immutable rootfs artifact, `spore pack` should include the exact ext4
-bytes named by the rootfs digest unless the caller explicitly asks for a
-metadata-only bundle for a prepared-cache workflow after bundle metadata supports
-that mode.
+requires an immutable rootfs artifact, `spore pack` includes the exact ext4
+bytes named by the rootfs digest. Metadata-only rootfs behavior remains a later
+explicit prepared-cache workflow; materialized unpack and pull paths reject it
+until that workflow exists.
 
 ## Problem
 
@@ -154,9 +154,10 @@ Rootfs inclusion is the default artifact policy:
   the bundle once per rootfs digest.
 - If the required rootfs bytes are absent or mismatched on the packing host,
   `spore pack` fails rather than emitting a misleading portable bundle.
-- Slice 1 has no metadata-only mode: a rootfs-backed spore either packs exact
-  rootfs bytes or fails. Metadata-only rootfs bundles require bundle metadata and
-  therefore land no earlier than the bundle-index slice.
+- The landed exact-rootfs bundle path has no metadata-only CLI mode: a
+  rootfs-backed spore either packs exact rootfs bytes or fails. Indexed bundle
+  metadata can describe rootfs artifact policy, but materialized unpack and pull
+  reject metadata-only rootfs entries until a prepared-cache workflow exists.
 - `spore unpack` and `spore pull` install bundled rootfs artifacts into the
   node-local digest cache by default, verifying digest and size before writing a
   resumable spore.
@@ -212,13 +213,16 @@ an attached rootfs fd.
   rootfs artifact policy.
 - `spore unpack --child ID` can materialize one selected child from an indexed
   local bundle into a normal spore directory.
+- `spore pull file://... --child ID` materializes one selected child from an
+  indexed local bundle through a verified local bundle content source, reusing a
+  node-local BLAKE3 chunk cache where hard links are available.
 - Foundation Slice 6 has S3/SSM remote restore, host-local cache reuse,
   source-peer HTTP seeding, corrupt-bundle rejection, and ten-instance star/tree
   smoke evidence.
 - `spore run --image`, `spore resume`, `spore fork`, and `spore fanout` support
   local immutable-rootfs fan-out.
-- Current distribution still has no `push`, `pull`, metadata-only rootfs CLI
-  mode, remote store adapter, or node-local bundle cache reuse.
+- Current distribution still has no `push`, remote `pull`, metadata-only rootfs
+  CLI mode, remote store adapter, or remote bundle cache reuse metrics.
 
 ## Delivery Strategy
 
@@ -245,11 +249,11 @@ included rootfs bytes, and missing or corrupted rootfs bytes fail before VM
 creation. Diskless spore bundles and existing chunkpack corruption tests must
 continue to pass.
 
-Slice 1 intentionally does not implement `--rootfs=metadata-only`, `bundle.json`,
-or a multi-rootfs `rootfs.index.json` parser. The single-spore manifest is enough
-to locate the required rootfs digest and canonical bundle path. If implementation
-does add a new attacker-influenced rootfs index in this slice, it must update
-`SECURITY.md` and add a fuzz target in the same PR.
+Slice 1 intentionally did not implement `--rootfs=metadata-only`, `bundle.json`,
+or a multi-rootfs `rootfs.index.json` parser. The single-spore manifest was
+enough to locate the required rootfs digest and canonical bundle path. Slice 2
+then added indexed bundle metadata, `rootfs.index.json`, parser tests, fuzz
+coverage, and the `SECURITY.md` attack-surface update.
 
 ### Slice 2: Distribution Bundle Index
 
@@ -276,6 +280,9 @@ and a `SECURITY.md` attack-surface update.
 
 ### Slice 3: Local Pull Materialization
 
+Status: implemented for local `file://` indexed bundles with a verified local
+bundle content source and node-local chunk cache.
+
 Add `spore pull` for filesystem bundles before adding remote stores. This should
 verify the bundle, select a child, populate or reuse the node-local content
 cache, and write a normal spore directory that `spore resume` already knows how
@@ -301,10 +308,9 @@ without changing manifest semantics.
 
 ### Slice 4: Object-Store Push And Pull
 
-Add the first remote store adapter using the simplest store that matches current
-smokes. S3 is the likely first choice because the existing remote restore
-evidence already uses S3 and SSM; an OCI-layout or registry transport can follow
-after the descriptor shape settles.
+Add the first remote store adapter using S3, matching the existing S3/SSM remote
+restore smoke path. An OCI-layout or registry transport can follow after the
+descriptor shape settles.
 
 Candidate commands:
 
@@ -363,7 +369,7 @@ rule: peers are byte sources, not trust roots.
 - `SECURITY.md` updates for every slice that widens bundle, rootfs artifact, or
   remote-store parsing.
 - Local smoke: fork one rootfs-backed workload, pack children, pull selected
-  children from `file://`, and resume them.
+  children from `file://`, and resume them with `mise run smoke:local-pull`.
 - Remote smoke: push one bundle to S3, pull separate children on same-class
   Linux/KVM aarch64 hosts, resume them, and record origin bytes.
 - Negative remote smoke: corrupt a bundle index, chunkpack segment, child
@@ -377,7 +383,8 @@ rule: peers are byte sources, not trust roots.
   operations. `resume` executes a materialized spore.
 - Rootfs-backed bundles include exact immutable rootfs bytes by default.
 - Metadata-only rootfs bundles require an explicit opt-out and must be marked in
-  bundle metadata; they do not exist in the first exact-rootfs bundle slice.
+  bundle metadata; materialized unpack and pull reject them until the
+  prepared-cache workflow exists.
 - Bundle digests cover all materialization-affecting bytes, including rootfs
   artifacts, so cache identity cannot ignore disk artifacts.
 - Rootfs artifacts are installed into the local digest cache with atomic,
@@ -392,19 +399,17 @@ rule: peers are byte sources, not trust roots.
 - Full child manifests are the first implementation target. Delta-encoded child
   manifests can wait until manifest size becomes material.
 - Direct object-store transfer comes before peer-assisted transfer.
+- S3 is the first remote store adapter because it matches the current remote
+  smoke infrastructure; OCI-layout or registry transport is follow-up work.
+- Multi-child bundling stays under `spore pack --children` until the artifact
+  surface clearly outgrows `pack`/`unpack`.
 
 ## Open Questions
 
-- The exact metadata-only opt-out spelling is not blocking Slice 1 because
-  metadata-only mode is deferred until bundle metadata exists.
+- The exact metadata-only opt-out spelling is not blocking Slice 4 or Slice 5
+  because materialized unpack and pull reject metadata-only rootfs entries today.
   Recommendation: use `--rootfs=metadata-only` rather than `--exclude-rootfs`
   because it names the artifact policy and leaves room for future modes.
-- Should the first remote transport be S3-only, generic object storage, or an
-  OCI-layout/registry adapter? Recommendation: land S3 first because the current
-  smoke path already proves it, then map the stable descriptor shape to OCI.
-- Should multi-child bundling stay under `spore pack --children` or become a new
-  subcommand later? Recommendation: keep `pack` until the local artifact surface
-  clearly outgrows it.
 
 ## Key Learnings From Pressure-Testing
 
@@ -413,10 +418,10 @@ rule: peers are byte sources, not trust roots.
   resume. The plan therefore makes exact rootfs bytes the default and reserves
   metadata-only behavior for a later explicit prepared-cache workflow with
   bundle metadata.
-- The first exact-rootfs slice must not depend on bundle metadata that does not
-  exist yet. It uses the single-spore manifest and canonical rootfs path, while
-  deferring metadata-only policy and multi-rootfs indexes to the bundle-index
-  slice.
+- The first exact-rootfs slice correctly avoided depending on bundle metadata
+  before that metadata existed. Indexed bundle metadata now exists for
+  multi-child bundles, while metadata-only CLI behavior remains deferred until a
+  prepared-cache workflow is designed.
 - Bundle identity must cover rootfs artifacts. Per-rootfs BLAKE3 verification
   still protects resume, but cache keys and remote references are misleading if
   rootfs bytes are outside the bundle digest.

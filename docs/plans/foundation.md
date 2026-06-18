@@ -114,7 +114,7 @@ state and broader disk manifests remain later work.
 | Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Disk manifests remain future work. |
 | Slice 4: fork and generation protocol | Complete for correctness | Keep fan-out identity smokes as regression coverage. |
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |
-| Slice 6: identical-host distribution | Active | Pull-based materialization, default rootfs artifact inclusion, cache hierarchy, and measured origin-egress efficiency beyond explicit relay trees. |
+| Slice 6: identical-host distribution | Active | Remote push/pull materialization, remote cache reuse metrics, and measured origin-egress efficiency beyond explicit relay trees. |
 | Slice 7: always-on dirty tracking | Complete for the foundation target | Keep dirty-tail and worker-stop benchmarks as release regressions; tune worker preemption only if the product SLO tightens. |
 | Slice 8: cross-backend diagnostic restore | Later diagnostic | HVF portable GIC producer and timer-frequency strategy. |
 
@@ -134,8 +134,10 @@ state and broader disk manifests remain later work.
 - Same-host file-backed RAM sharing and lazy restore have proof paths on KVM and
   HVF. Trusted backing remains a same-host acceleration hint; chunks remain the
   portable verified source of truth.
-- `spore pack` and `spore unpack` provide the first local chunkpack bundle shape
-  with `bundle_digest` for cache identity and per-chunk verification for trust.
+- `spore pack`, `spore unpack`, and local `spore pull file://...` provide the
+  first local distribution bundle shape with rootfs artifact inclusion,
+  multi-child indexes, `bundle_digest` for cache identity, and per-chunk
+  verification for trust.
 - `spore run`, product `spore resume`, and `spore fanout` provide the first
   user-facing run/capture/fork/resume/fan-out path.
 
@@ -148,7 +150,8 @@ the mechanisms have landed. Regenerate current evidence with the scripts in
 Slice 6 starts from chunkpack bundles and remote restore smokes. Current evidence
 includes:
 
-- local pack/unpack with canonical `bundle_digest`;
+- local pack/unpack and `file://` pull materialization with canonical
+  `bundle_digest`;
 - two-host S3/SSM restore;
 - host-local cache reuse with repeated destination restores;
 - source-peer HTTP seeding that keeps destination S3-origin bytes at zero;
@@ -157,15 +160,15 @@ includes:
 
 What remains:
 
-1. Convert explicit smoke topology into a pull-based product distribution path.
-2. Make rootfs-backed bundles include exact immutable rootfs bytes by default,
-   with metadata-only prepared-cache workflows deferred until bundle metadata
-   exists.
-3. Measure origin egress as a small multiple of unique chunk bytes across larger
+1. Add the first remote `spore push` and `spore pull` store adapter for the
+   pull-based product distribution path. S3 should land first because the
+   existing remote restore smoke path already uses S3 and SSM.
+2. Measure origin egress as a small multiple of unique chunk bytes across larger
    identical-host fleets.
-4. Keep corrupt peer/origin data rejected by chunk and rootfs verification.
-5. Keep immutable rootfs artifacts in the distribution path without blurring
-   memory chunks and rootfs bytes.
+3. Keep corrupt peer/origin data rejected by chunk and rootfs verification.
+4. Complete node-local bundle cache reuse and metrics for repeated remote pulls.
+5. Preserve default immutable rootfs artifact inclusion through remote
+   distribution without blurring memory chunks and rootfs bytes.
 
 Done when a multi-host fan-out demo restores one spore on every host in a test
 fleet, measures origin egress at a small multiple of unique chunk bytes, and
@@ -311,6 +314,9 @@ inputs.
 - Rootfs-backed distribution bundles include exact immutable rootfs bytes by
   default; metadata-only rootfs bundles require an explicit opt-out and bundle
   metadata, so they are not part of the first exact-rootfs bundle slice.
+- Local `spore pull file://...` fully materializes a selected child before
+  product resume; remote and lazy pull sources must keep the same verified
+  content-source boundary.
 - `spore run` is one-shot; named lifecycle uses `create`/`exec`/`rm`/`ls` plus
   monitor-backed suspend/resume.
 - Product capture is `spore run --capture`, not a separate capture verb.
