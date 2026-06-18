@@ -41,6 +41,18 @@ pub const Layout = struct {
     entry: u64,
     /// Guest-physical DTB address (x0 at entry).
     dtb: u64,
+    /// RAM offsets populated by the VMM before guest entry.
+    populated_ranges: [3]RamRange,
+    populated_range_count: usize,
+
+    pub fn populatedRanges(self: *const Layout) []const RamRange {
+        return self.populated_ranges[0..self.populated_range_count];
+    }
+};
+
+pub const RamRange = struct {
+    start: usize,
+    end: usize,
 };
 
 pub const InitrdRange = struct {
@@ -91,17 +103,31 @@ pub fn load(ram: []u8, ram_base: u64, kernel: []const u8, initrd: ?[]const u8, d
     if (dtb_offset < occupied_end) return error.RamTooSmall;
     if (dtb_offset + dtb.len > ram.len) return error.RamTooSmall;
 
-    @memcpy(ram[@intCast(info.text_offset)..][0..kernel.len], kernel);
+    var populated_ranges: [3]RamRange = undefined;
+    var populated_range_count: usize = 0;
+
+    const kernel_offset: usize = @intCast(info.text_offset);
+    @memcpy(ram[kernel_offset..][0..kernel.len], kernel);
+    populated_ranges[populated_range_count] = .{ .start = kernel_offset, .end = kernel_offset + kernel.len };
+    populated_range_count += 1;
+
     if (initrd) |bytes| {
         const range = initrd_range.?;
         const initrd_offset: usize = @intCast(range.start - ram_base);
         @memcpy(ram[initrd_offset..][0..bytes.len], bytes);
+        populated_ranges[populated_range_count] = .{ .start = initrd_offset, .end = initrd_offset + bytes.len };
+        populated_range_count += 1;
     }
-    @memcpy(ram[@intCast(dtb_offset)..][0..dtb.len], dtb);
+    const dtb_offset_usize: usize = @intCast(dtb_offset);
+    @memcpy(ram[dtb_offset_usize..][0..dtb.len], dtb);
+    populated_ranges[populated_range_count] = .{ .start = dtb_offset_usize, .end = dtb_offset_usize + dtb.len };
+    populated_range_count += 1;
 
     return .{
         .entry = ram_base + info.text_offset,
         .dtb = ram_base + dtb_offset,
+        .populated_ranges = populated_ranges,
+        .populated_range_count = populated_range_count,
     };
 }
 
@@ -141,6 +167,10 @@ test "load places kernel at text_offset and dtb high and aligned" {
     try std.testing.expectEqualSlices(u8, img, ram[0x80000 .. 0x80000 + img.len]);
     const dtb_off: usize = @intCast(layout.dtb - 0x8000_0000);
     try std.testing.expectEqualStrings(dtb, ram[dtb_off .. dtb_off + dtb.len]);
+    const populated = layout.populatedRanges();
+    try std.testing.expectEqual(@as(usize, 2), populated.len);
+    try std.testing.expectEqual(RamRange{ .start = 0x80000, .end = 0x80000 + img.len }, populated[0]);
+    try std.testing.expectEqual(RamRange{ .start = dtb_off, .end = dtb_off + dtb.len }, populated[1]);
 }
 
 test "load rejects kernels that do not fit" {
@@ -169,4 +199,10 @@ test "load places initrd after kernel and before dtb" {
     try std.testing.expect(range.end < layout.dtb);
     const off: usize = @intCast(range.start - 0x8000_0000);
     try std.testing.expectEqualStrings(initrd, ram[off .. off + initrd.len]);
+    const dtb_off: usize = @intCast(layout.dtb - 0x8000_0000);
+    const populated = layout.populatedRanges();
+    try std.testing.expectEqual(@as(usize, 3), populated.len);
+    try std.testing.expectEqual(RamRange{ .start = 0x80000, .end = 0x80000 + img.len }, populated[0]);
+    try std.testing.expectEqual(RamRange{ .start = off, .end = off + initrd.len }, populated[1]);
+    try std.testing.expectEqual(RamRange{ .start = dtb_off, .end = dtb_off + "dtb".len }, populated[2]);
 }

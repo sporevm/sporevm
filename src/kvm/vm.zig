@@ -130,6 +130,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var dirty_tracker: ?DirtyTracker = null;
     defer if (dirty_tracker) |*tracker| tracker.deinit();
     var restore_stats: ?RestoreStats = null;
+    var boot_seed_ranges_buf: [3]dirty_ram.ChunkRange = undefined;
+    var boot_seed_ranges: ?[]const dirty_ram.ChunkRange = null;
+
     if (config.resume_dir) |spore_dir| {
         const manifest_start = try monotonicMs();
         resume_parsed = try spore.loadManifest(allocator, spore_dir);
@@ -263,6 +266,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         });
         defer allocator.free(dtb);
         const layout = try boot.load(ram_bytes, board.ram_base, config.kernel, config.initrd, dtb);
+        for (layout.populatedRanges(), 0..) |range, i| {
+            boot_seed_ranges_buf[i] = .{ .start = range.start, .end = range.end };
+        }
+        boot_seed_ranges = boot_seed_ranges_buf[0..layout.populated_range_count];
 
         try kvm.setOneRegU64(vcpu_fd, kvm.coreReg(kvm.KVM_REG_ARM_CORE_PSTATE), 0x3c5); // EL1h, DAIF masked.
         try kvm.setOneRegU64(vcpu_fd, kvm.coreReg(kvm.KVM_REG_ARM_CORE_PC), layout.entry);
@@ -276,6 +283,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .slot = 0,
             .dir = dir,
             .ram = ram_bytes,
+            .seed_ranges = boot_seed_ranges,
             .epoch_ms = config.dirty_tracking.epoch_ms,
         });
         if (dirty_tracker) |*tracker| {
@@ -554,6 +562,7 @@ const DirtyTracker = struct {
         slot: u32,
         dir: []const u8,
         ram: []const u8,
+        seed_ranges: ?[]const dirty_ram.ChunkRange = null,
         epoch_ms: u64,
     };
 
@@ -584,6 +593,7 @@ const DirtyTracker = struct {
         var sealer = try dirty_ram.Sealer.start(allocator, .{
             .dir = options.dir,
             .ram = options.ram,
+            .seed_ranges = options.seed_ranges,
         });
         errdefer sealer.deinit();
 

@@ -86,6 +86,7 @@ const SpinLock = struct {
 pub const Options = struct {
     dir: []const u8,
     ram: []const u8,
+    seed_ranges: ?[]const ChunkRange = null,
 };
 
 pub const ChunkRange = struct {
@@ -129,7 +130,11 @@ pub const Sealer = struct {
         const backing_final_path = try pathZ(allocator, "{s}/{s}", .{ options.dir, spore.ram_backing_path });
         const backing_fd = std.c.open(backing_tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
         if (backing_fd < 0) return error.IoFailed;
-        errdefer _ = std.c.close(backing_fd);
+        var backing_fd_owned = true;
+        errdefer if (backing_fd_owned) {
+            _ = std.c.close(backing_fd);
+            _ = std.c.unlink(backing_tmp_path.ptr);
+        };
         if (std.c.ftruncate(backing_fd, @intCast(options.ram.len)) != 0) return error.IoFailed;
 
         var sealer = Sealer{
@@ -142,17 +147,12 @@ pub const Sealer = struct {
             .backing_tmp_path = backing_tmp_path,
             .backing_final_path = backing_final_path,
         };
+        backing_fd_owned = false;
+        errdefer sealer.deinit();
         @memset(sealer.refs, null);
         @memset(sealer.dirty_chunks, false);
 
-        const seed_start = try monotonicMs();
-        for (sealer.refs, 0..) |_, i| {
-            var work_stats: SealWorkStats = .{};
-            const nonzero = try sealer.sealChunk(i, false, &work_stats);
-            sealer.stats.seed_chunks += 1;
-            if (nonzero) sealer.stats.seed_nonzero_chunks += 1;
-        }
-        sealer.stats.seed_ms = (try monotonicMs()) - seed_start;
+        try sealer.seedInitial(options.seed_ranges);
         return sealer;
     }
 
@@ -421,6 +421,38 @@ pub const Sealer = struct {
         return true;
     }
 
+    fn seedInitial(self: *Sealer, maybe_ranges: ?[]const ChunkRange) !void {
+        const seed_start = try monotonicMs();
+        if (maybe_ranges) |ranges| {
+            var seeded = try self.allocator.alloc(bool, self.refs.len);
+            defer self.allocator.free(seeded);
+            @memset(seeded, false);
+
+            for (ranges) |range| {
+                if (range.start > range.end or range.end > self.ram.len) return error.BadManifest;
+                if (range.start == range.end) continue;
+                const first_chunk = range.start / spore.chunk_size;
+                const last_chunk = (range.end - 1) / spore.chunk_size;
+                var chunk_index = first_chunk;
+                while (chunk_index <= last_chunk) : (chunk_index += 1) {
+                    if (seeded[chunk_index]) continue;
+                    seeded[chunk_index] = true;
+                    try self.seedChunk(chunk_index);
+                }
+            }
+        } else {
+            for (self.refs, 0..) |_, i| try self.seedChunk(i);
+        }
+        self.stats.seed_ms = (try monotonicMs()) - seed_start;
+    }
+
+    fn seedChunk(self: *Sealer, index: usize) !void {
+        var work_stats: SealWorkStats = .{};
+        const nonzero = try self.sealChunk(index, false, &work_stats);
+        self.stats.seed_chunks += 1;
+        if (nonzero) self.stats.seed_nonzero_chunks += 1;
+    }
+
     fn allocChunkRefAndPath(self: *Sealer, hex: *const [chunk.ChunkId.hex_len]u8) !struct { []const u8, [:0]const u8 } {
         self.alloc_mutex.lock();
         defer self.alloc_mutex.unlock();
@@ -638,6 +670,84 @@ test "dirty RAM sealer seeds zero-elided chunks and finalizes backing" {
 
     const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, manifest.chunks[0].? });
     try std.testing.expectEqual(@as(c_int, 0), std.c.access(chunk_path, 0));
+}
+
+test "dirty RAM sealer can seed only known populated ranges" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, 3 * spore.chunk_size);
+    @memset(ram, 0);
+    ram[0] = 0x11;
+    ram[2 * spore.chunk_size] = 0x22;
+
+    const seed_ranges = [_]ChunkRange{.{ .start = 0, .end = 1 }};
+    var sealer = try Sealer.start(arena, .{ .dir = dir, .ram = ram, .seed_ranges = &seed_ranges });
+    defer sealer.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), sealer.chunkCount());
+    try std.testing.expectEqual(@as(usize, 1), sealer.stats.seed_chunks);
+    try std.testing.expectEqual(@as(usize, 1), sealer.stats.seed_nonzero_chunks);
+    try std.testing.expect(sealer.refs[0] != null);
+    try std.testing.expect(sealer.refs[1] == null);
+    try std.testing.expect(sealer.refs[2] == null);
+
+    const manifest = try sealer.finishBacking();
+    const plan = try spore.validateMemoryForRam(manifest, ram.len);
+    try std.testing.expectEqual(@as(usize, 3), plan.chunk_count);
+    try std.testing.expectEqual(@as(usize, 1), plan.nonzero_chunk_count);
+
+    const backing_path = try pathZ(arena, "{s}/{s}", .{ dir, spore.ram_backing_path });
+    const backing = try readFileAllForTest(arena, backing_path, ram.len);
+    try std.testing.expectEqual(@as(u8, 0x11), backing[0]);
+    try std.testing.expectEqual(@as(u8, 0), backing[2 * spore.chunk_size]);
+}
+
+test "dirty RAM sealer deduplicates overlapping seed ranges" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, 3 * spore.chunk_size);
+    @memset(ram, 0);
+    ram[0] = 0x11;
+    ram[spore.chunk_size] = 0x22;
+    ram[2 * spore.chunk_size] = 0x33;
+
+    const seed_ranges = [_]ChunkRange{
+        .{ .start = 1, .end = spore.chunk_size + 1 },
+        .{ .start = spore.chunk_size, .end = 2 * spore.chunk_size },
+    };
+    var sealer = try Sealer.start(arena, .{ .dir = dir, .ram = ram, .seed_ranges = &seed_ranges });
+    defer sealer.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), sealer.stats.seed_chunks);
+    try std.testing.expectEqual(@as(usize, 2), sealer.stats.seed_nonzero_chunks);
+    try std.testing.expect(sealer.refs[0] != null);
+    try std.testing.expect(sealer.refs[1] != null);
+    try std.testing.expect(sealer.refs[2] == null);
+}
+
+test "dirty RAM sealer rejects seed ranges outside RAM" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, spore.chunk_size);
+    @memset(ram, 0);
+
+    const seed_ranges = [_]ChunkRange{.{ .start = 0, .end = ram.len + 1 }};
+    try std.testing.expectError(error.BadManifest, Sealer.start(arena, .{ .dir = dir, .ram = ram, .seed_ranges = &seed_ranges }));
+
+    const tmp_path = try pathZ(arena, "{s}/{s}.tmp", .{ dir, spore.ram_backing_path });
+    try std.testing.expect(std.c.access(tmp_path, 0) != 0);
 }
 
 test "dirty RAM sealer tracks dirty ranges tail counts and zero transitions" {

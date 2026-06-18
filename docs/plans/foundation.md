@@ -8,6 +8,7 @@ related_plans:
   - docs/plans/local-image-ref-cache.md
   - docs/plans/immutable-rootfs-resume.md
   - docs/plans/distribution.md
+  - docs/plans/automatic-memory.md
 ---
 
 # SporeVM Foundation Plan

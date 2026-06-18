@@ -330,6 +330,11 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         });
         defer allocator.free(dtb);
         const layout = try boot.load(ram_bytes, board.ram_base, config.kernel, config.initrd, dtb);
+        var seed_ranges_buf: [3]dirty_ram.ChunkRange = undefined;
+        for (layout.populatedRanges(), 0..) |range, i| {
+            seed_ranges_buf[i] = .{ .start = range.start, .end = range.end };
+        }
+        const seed_ranges = seed_ranges_buf[0..layout.populated_range_count];
 
         try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .cpsr, 0x3c5), "set cpsr"); // EL1h, DAIF masked
         try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .pc, layout.entry), "set pc");
@@ -339,6 +344,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             dirty_tracker = try DirtyTracker.start(allocator, .{
                 .dir = config.snapshot_dir.?,
                 .ram = ram_bytes,
+                .seed_ranges = seed_ranges,
                 .epoch_ms = config.dirty_tracking.epoch_ms,
             });
             if (dirty_tracker) |*tracker| {
@@ -666,6 +672,7 @@ const DirtyTracker = struct {
     const Options = struct {
         dir: []const u8,
         ram: []const u8,
+        seed_ranges: ?[]const dirty_ram.ChunkRange = null,
         epoch_ms: u64,
     };
 
@@ -692,6 +699,7 @@ const DirtyTracker = struct {
         var sealer = try dirty_ram.Sealer.start(allocator, .{
             .dir = options.dir,
             .ram = options.ram,
+            .seed_ranges = options.seed_ranges,
         });
         errdefer sealer.deinit();
 
