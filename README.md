@@ -95,6 +95,7 @@ mise run build
 mise run install
 mise run smoke:run
 mise run smoke:run-net-config
+mise run smoke:run-net-dns
 mise run smoke:run-capture
 mise run smoke:counter-fanout
 mise run smoke:rootfs-fanout
@@ -105,9 +106,10 @@ mise run smoke:rootfs-fanout
 with runtime assets under `~/share/sporevm`.
 `mise run smoke` builds once, then runs product run, run-capture, and resume
 smokes. `smoke:run-net-config` checks the experimental `spore run --net` static
-guest link setup. `smoke:counter-fanout` and `smoke:rootfs-fanout` are opt-in
-demo smokes; the rootfs fan-out smoke builds a published Ruby OCI image and
-resumes forked children in parallel.
+guest link setup, and `smoke:run-net-dns` checks DNS proxying through the
+managed gateway. `smoke:counter-fanout` and `smoke:rootfs-fanout` are opt-in demo
+smokes; the rootfs fan-out smoke builds a published Ruby OCI image and resumes
+forked children in parallel.
 
 `zig build` installs the minimal exec initrd used by `spore run`, so `cpio`
 must be available in `PATH`.
@@ -291,6 +293,8 @@ are available when a change touches fan-out or rootfs behavior:
   debugging.
 - `mise run smoke:run-net-config`: verify the experimental `spore run --net`
   static guest address, route, resolver, and gateway ARP setup.
+- `mise run smoke:run-net-dns`: verify `spore run --net` DNS proxying with the
+  minimal initrd `/bin/nslookup` helper.
 - `mise run smoke:counter-fanout`: exercise diskless capture, fork, and
   parallel product resume fan-out.
 - `mise run smoke:rootfs-fanout`: exercise OCI rootfs capture, fork, and

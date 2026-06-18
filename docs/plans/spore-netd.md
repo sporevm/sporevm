@@ -95,7 +95,7 @@ instead own the virtual link boundary and keep the gateway backend-neutral.
 The public CLI starts small:
 
 ```console
-spore run --net -- /bin/sh -lc 'nslookup example.com'
+spore run --net -- /bin/nslookup example.com
 spore run --net -- /bin/sh -lc 'wget -qO- http://example.com/'
 ```
 
@@ -176,11 +176,12 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   helper, waits for readiness before VM start, and fails the run if the helper
   exits while networking is active. Normal `spore run` invocations still
   default to closed networking.
-- `src/spore_netd.zig` implements the first helper skeleton: a bounded
-  little-endian length-prefixed Ethernet frame stream over inherited stdio fds,
-  debug frame logging, clean EOF shutdown, and ARP replies for the fixed gateway
-  MAC/IP. Frame bounds and ARP handling have unit and fuzz coverage. It does not
-  implement DNS, TCP, policy, or zmoltcp integration yet.
+- `src/spore_netd.zig` implements a bounded little-endian length-prefixed
+  Ethernet frame stream over inherited stdio fds, debug frame logging, clean EOF
+  shutdown, ARP replies for the fixed gateway MAC/IP, and narrow IPv4 UDP/53 DNS
+  proxying through the host resolver. Frame bounds, ARP handling, IPv4/UDP DNS
+  dispatch, DNS name parsing, and malformed DNS handling have unit and fuzz
+  coverage. It does not implement TCP, policy, or zmoltcp integration yet.
 - `src/net_gateway.zig` owns helper startup, stderr readiness, deterministic
   shutdown, SIGPIPE-safe helper writes, and the parent-side virtio-net backend
   adapter. Helper RX frames wake the hypervisor loop, which explicitly flushes
@@ -193,6 +194,9 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   it does not require `ip`, DHCP, or other guest tools. The `/bin/netcheck`
   helper and `scripts/smoke-run-net-config.sh` inspect the resulting interface,
   route, resolver, and gateway ARP entry.
+- The minimal initrd now also includes `/bin/nslookup`, a tiny static smoke
+  helper used by `scripts/smoke-run-net-dns.sh` to prove guest DNS queries reach
+  the host-side proxy and receive IPv4 answers.
 - `SECURITY.md` already treats virtqueue descriptors and device request headers
   as guest-controlled attack surface requiring fuzz targets.
 - The local `lox/zmoltcp` fork exists at `/Users/lachlan/Develop/zmoltcp`. A
@@ -278,12 +282,14 @@ Definition of done:
 
 ### Slice 5: DNS Proxy
 
+Status: landed in the Slice 5 branch.
+
 Implement ARP, IPv4 parsing, UDP/53 dispatch, basic DNS query forwarding through
 the host, and response injection back to the guest.
 
 Definition of done:
 
-- `spore run --net -- nslookup example.com` succeeds.
+- `spore run --net -- /bin/nslookup example.com` succeeds.
 - Malformed DNS packets are dropped or SERVFAILed without crashing.
 - DNS answers cannot add exceptions to the hard egress floor yet.
 - Unit tests cover DNS parser bounds, name compression limits if supported, and
