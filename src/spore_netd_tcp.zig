@@ -8,6 +8,7 @@ const std = @import("std");
 const zmoltcp = @import("zmoltcp");
 
 const spore_net = @import("spore_net.zig");
+const spore_net_policy = @import("spore_net_policy.zig");
 
 const stack_mod = zmoltcp.stack;
 const tcp_socket = zmoltcp.socket.tcp;
@@ -189,12 +190,14 @@ pub const Gateway = struct {
     sock_ptrs: [max_flows]*TcpSock = undefined,
     forwarder: Forwarder = undefined,
     stack: TcpStack = undefined,
+    policy: *spore_net_policy.Runtime = undefined,
     output: OutputQueue = .{},
     current_now: Instant = Instant.ZERO,
     stats: Stats = .{},
 
-    pub fn init(self: *Gateway) void {
+    pub fn init(self: *Gateway, policy: *spore_net_policy.Runtime) void {
         self.device = Device.init();
+        self.policy = policy;
         self.output.reset();
         self.current_now = Instant.ZERO;
         self.stats = .{};
@@ -276,7 +279,7 @@ pub const Gateway = struct {
     }
 
     fn offer(self: *Gateway, request: ForwardRequest) ?*TcpSock {
-        if (!allowRequest(request)) {
+        if (!self.allowRequest(request)) {
             self.stats.denied += 1;
             return null;
         }
@@ -305,6 +308,25 @@ pub const Gateway = struct {
             },
         }
         return &flow.sock;
+    }
+
+    fn allowRequest(self: *Gateway, request: ForwardRequest) bool {
+        if (!std.mem.eql(u8, &request.remote.addr, &spore_net.guest_ipv4)) return false;
+        if (request.local.port == 0 or request.remote.port == 0) return false;
+        const decision = self.policy.decideIpv4(request.local.addr);
+        if (decision == .allow) return true;
+        std.log.debug(
+            "spore-netd denied egress reason={s} dst={d}.{d}.{d}.{d}:{d}",
+            .{
+                decision.name(),
+                request.local.addr[0],
+                request.local.addr[1],
+                request.local.addr[2],
+                request.local.addr[3],
+                request.local.port,
+            },
+        );
+        return false;
     }
 
     fn freeFlow(self: *Gateway) ?*Flow {
@@ -524,23 +546,8 @@ fn hostSend(fd: std.c.fd_t, bytes: []const u8) error{ WouldBlock, HostIoFailed }
     };
 }
 
-fn allowRequest(request: ForwardRequest) bool {
-    if (!std.mem.eql(u8, &request.remote.addr, &spore_net.guest_ipv4)) return false;
-    if (request.local.port == 0 or request.remote.port == 0) return false;
-    return !isBlockedDestination(request.local.addr);
-}
-
 pub fn isBlockedDestination(addr: ipv4.Address) bool {
-    if (addr[0] == 0) return true;
-    if (addr[0] == 10) return true;
-    if (addr[0] == 127) return true;
-    if (addr[0] == 169 and addr[1] == 254) return true;
-    if (addr[0] == 172 and (addr[1] & 0xf0) == 16) return true;
-    if (addr[0] == 192 and addr[1] == 168) return true;
-    if (addr[0] == 100 and (addr[1] & 0xc0) == 64) return true;
-    if (addr[0] == 192 and addr[1] == 0 and addr[2] == 0) return true;
-    if (addr[0] == 198 and (addr[1] == 18 or addr[1] == 19)) return true;
-    if (addr[0] >= 224) return true;
+    if (spore_net_policy.isHardFloorBlocked(addr)) return true;
     if (std.mem.eql(u8, &addr, &spore_net.guest_ipv4)) return true;
     if (std.mem.eql(u8, &addr, &spore_net.gateway_ipv4)) return true;
     return false;
@@ -616,8 +623,9 @@ test "spore-netd TCP policy blocks host and control-plane destinations" {
 }
 
 test "spore-netd TCP denies blocked SYN before host socket open" {
+    var policy = try spore_net_policy.Runtime.init(.{});
     var gateway: Gateway = undefined;
-    gateway.init();
+    gateway.init(&policy);
 
     const blocked = [_]ipv4.Address{
         .{ 169, 254, 169, 254 },

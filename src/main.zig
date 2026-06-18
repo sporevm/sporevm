@@ -22,7 +22,7 @@ const usage =
     \\
     \\Commands:
     \\  rootfs              Build rootfs images from OCI images
-    \\  run [--kernel Image] [--initrd root.cpio] [--net] -- <argv...>
+    \\  run [--kernel Image] [--initrd root.cpio] [--net] [--allow-cidr CIDR] [--allow-host HOST] -- <argv...>
     \\                      Boot a throwaway VM and run one command
     \\  resume <spore-dir> [--name NAME]
     \\                      Resume one spore, or resume it as a named VM

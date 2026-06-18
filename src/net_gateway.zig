@@ -6,6 +6,7 @@
 const std = @import("std");
 const Io = std.Io;
 
+const spore_net_policy = @import("spore_net_policy.zig");
 const spore_netd = @import("spore_netd.zig");
 const virtio_net = @import("virtio/net.zig");
 
@@ -37,13 +38,25 @@ pub const Process = struct {
     rx_len: usize = 0,
     rx_buf: [virtio_net.max_frame_len]u8 = undefined,
 
-    pub fn start(self: *Process, init: std.process.Init, allocator: std.mem.Allocator) StartError!void {
+    pub fn start(self: *Process, init: std.process.Init, allocator: std.mem.Allocator, policy: spore_net_policy.Config) StartError!void {
         self.* = .{};
         ignoreSigpipe();
         const args = init.minimal.args.toSlice(allocator) catch return error.NetdSpawnFailed;
-        const argv = allocator.dupe([]const u8, &.{ args[0], "netd", "--stdio" }) catch return error.OutOfMemory;
+        var argv = std.array_list.Managed([]const u8).init(allocator);
+        argv.append(args[0]) catch return error.OutOfMemory;
+        if (parentDebugEnabled(args)) argv.append("--debug") catch return error.OutOfMemory;
+        argv.append("netd") catch return error.OutOfMemory;
+        argv.append("--stdio") catch return error.OutOfMemory;
+        for (policy.allowCidrSlice()) |cidr| {
+            argv.append("--allow-cidr") catch return error.OutOfMemory;
+            argv.append(cidr) catch return error.OutOfMemory;
+        }
+        for (policy.allowHostSlice()) |host| {
+            argv.append("--allow-host") catch return error.OutOfMemory;
+            argv.append(host) catch return error.OutOfMemory;
+        }
         const child = std.process.spawn(init.io, .{
-            .argv = argv,
+            .argv = argv.items,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .pipe,
@@ -320,6 +333,7 @@ fn drainStderr(self: *Process) void {
     while (true) {
         const n = std.posix.read(self.stderr_fd, &buf) catch break;
         if (n == 0) break;
+        std.log.debug("spore-netd stderr: {s}", .{buf[0..n]});
     }
     closeIfOpen(&self.stderr_fd);
 }
@@ -349,4 +363,19 @@ fn ignoreSigpipe() void {
         .flags = 0,
     };
     std.posix.sigaction(.PIPE, &action, null);
+}
+
+fn parentDebugEnabled(args: []const []const u8) bool {
+    if (args.len <= 1) return false;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--debug")) return true;
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (!std.mem.startsWith(u8, arg, "-")) return false;
+    }
+    return false;
+}
+
+test "spore-net gateway detects parent global debug flag" {
+    try std.testing.expect(parentDebugEnabled(&.{ "spore", "--debug", "run", "--net", "--", "/bin/true" }));
+    try std.testing.expect(!parentDebugEnabled(&.{ "spore", "run", "--net", "--", "/bin/true" }));
 }

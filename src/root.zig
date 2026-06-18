@@ -33,6 +33,7 @@ pub const rootfs = @import("rootfs.zig");
 pub const rootfs_cache = @import("rootfs_cache.zig");
 pub const run = @import("run.zig");
 pub const spore_net = @import("spore_net.zig");
+pub const spore_net_policy = @import("spore_net_policy.zig");
 pub const spore_netd = @import("spore_netd.zig");
 pub const spore_netd_tcp = @import("spore_netd_tcp.zig");
 pub const spore = @import("spore.zig");
@@ -73,6 +74,7 @@ test {
     testing.refAllDecls(rootfs_cache);
     testing.refAllDecls(run);
     testing.refAllDecls(spore_net);
+    testing.refAllDecls(spore_net_policy);
     testing.refAllDecls(spore_netd);
     testing.refAllDecls(spore_netd_tcp);
     testing.refAllDecls(zmoltcp_gateway);

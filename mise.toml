@@ -37,6 +37,10 @@ description = "Smoke product spore run DNS proxying"
 run = "mise run build && scripts/smoke-run-net-http.sh"
 description = "Smoke product spore run outbound HTTP proxying"
 
+[tasks."smoke:run-net-deny"]
+run = "mise run build && scripts/smoke-run-net-deny.sh"
+description = "Smoke product spore run hard-floor egress denial"
+
 [tasks."smoke:counter-fanout"]
 run = "mise run build && scripts/smoke-counter-fanout.sh"
 description = "Smoke capture, fork, and resume counter fan-out"

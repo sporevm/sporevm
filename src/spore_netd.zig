@@ -8,6 +8,7 @@ const zmoltcp = @import("zmoltcp");
 const Io = std.Io;
 
 const spore_net = @import("spore_net.zig");
+const spore_net_policy = @import("spore_net_policy.zig");
 const spore_netd_tcp = @import("spore_netd_tcp.zig");
 
 pub const max_frame_len = spore_net.max_frame_len;
@@ -36,6 +37,8 @@ const dns_forward_timeout_ms = 1_000;
 const max_dns_payload_len = max_frame_len - ethernet_header_len - ipv4_header_min_len - udp_header_len;
 
 const fallback_dns_ipv4: [4]u8 = .{ 1, 1, 1, 1 };
+
+const netd_usage = "usage: spore netd --stdio [--allow-cidr CIDR] [--allow-host HOST]\n";
 
 pub const FrameIoError = error{
     EndOfStream,
@@ -99,17 +102,18 @@ const HostDnsForwarder = struct {
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
     _ = stdout;
-    if (args.len != 1 or !std.mem.eql(u8, args[0], "--stdio")) {
-        std.debug.print("usage: spore netd --stdio\n", .{});
+    const opts = parseCliArgs(args);
+    var policy = spore_net_policy.Runtime.init(opts.policy) catch |err| {
+        std.debug.print("spore netd: invalid network policy: {s}\n", .{@errorName(err)});
         std.process.exit(2);
-    }
+    };
 
     var host_dns = HostDnsForwarder{
         .server_ipv4 = resolveHostDnsServer(init.io, init.arena.allocator()),
     };
     const dns_forwarder = host_dns.forwarder();
     var tcp_gateway: spore_netd_tcp.Gateway = undefined;
-    tcp_gateway.init();
+    tcp_gateway.init(&policy);
 
     try writeAllFd(2, "ready\n");
     var in_buf: [max_frame_len]u8 = undefined;
@@ -131,7 +135,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
                 else => |e| return e,
             };
             std.log.debug("spore-netd rx frame len={d}", .{frame.len});
-            if (frameReply(frame, &reply_buf, dns_forwarder)) |reply| {
+            if (frameReply(frame, &reply_buf, dns_forwarder, &policy)) |reply| {
                 try writeFrameFd(1, reply);
             } else if (!tcp_gateway.receiveFrame(frame, after_poll)) {
                 std.log.debug("spore-netd dropped unsupported frame len={d}", .{frame.len});
@@ -142,6 +146,50 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         tcp_gateway.service(after_poll);
         try drainTcpGateway(&tcp_gateway);
     }
+}
+
+const CliOptions = struct {
+    policy: spore_net_policy.Config = .{},
+};
+
+fn parseCliArgs(args: []const []const u8) CliOptions {
+    var opts = CliOptions{};
+    var stdio = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--stdio")) {
+            stdio = true;
+        } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
+            const raw = takeValue(args, &i, args[i]);
+            opts.policy.addAllowCidr(raw) catch |err| {
+                std.debug.print("spore netd: invalid --allow-cidr {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, args[i], "--allow-host")) {
+            const raw = takeValue(args, &i, args[i]);
+            opts.policy.addAllowHost(raw) catch |err| {
+                std.debug.print("spore netd: invalid --allow-host {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
+        } else {
+            std.debug.print("unknown netd argument: {s}\n{s}", .{ args[i], netd_usage });
+            std.process.exit(2);
+        }
+    }
+    if (!stdio) {
+        std.debug.print("{s}", .{netd_usage});
+        std.process.exit(2);
+    }
+    return opts;
+}
+
+fn takeValue(args: []const []const u8, i: *usize, flag: []const u8) []const u8 {
+    if (i.* + 1 >= args.len) {
+        std.debug.print("{s} requires a value\n", .{flag});
+        std.process.exit(2);
+    }
+    i.* += 1;
+    return args[i.*];
 }
 
 fn drainTcpGateway(gateway: *spore_netd_tcp.Gateway) FrameIoError!void {
@@ -173,9 +221,9 @@ pub fn readFrameFd(fd: std.c.fd_t, out: *[max_frame_len]u8) FrameIoError![]const
     return out[0..len];
 }
 
-fn frameReply(frame: []const u8, out: *[max_frame_len]u8, dns_forwarder: DnsForwarder) ?[]const u8 {
+fn frameReply(frame: []const u8, out: *[max_frame_len]u8, dns_forwarder: DnsForwarder, policy: ?*spore_net_policy.Runtime) ?[]const u8 {
     if (arpReply(frame, out)) |reply| return reply;
-    return dnsReply(frame, out, dns_forwarder);
+    return dnsReply(frame, out, dns_forwarder, policy);
 }
 
 pub fn arpReply(frame: []const u8, out: *[max_frame_len]u8) ?[]const u8 {
@@ -205,15 +253,17 @@ const DnsUdpRequest = struct {
     question_end: usize,
 };
 
-fn dnsReply(frame: []const u8, out: *[max_frame_len]u8, dns_forwarder: DnsForwarder) ?[]const u8 {
+fn dnsReply(frame: []const u8, out: *[max_frame_len]u8, dns_forwarder: DnsForwarder, policy: ?*spore_net_policy.Runtime) ?[]const u8 {
     const request = parseDnsUdpRequest(frame) orelse return null;
 
     var forward_buf: [max_dns_payload_len]u8 = undefined;
     var response_buf: [max_dns_payload_len]u8 = undefined;
-    const response = dns_forwarder.forward(request.payload, &forward_buf) catch buildDnsServfail(request.payload, request.question_end, &response_buf);
-    const dns_payload = if (validDnsResponse(request.payload, response))
-        response
-    else
+    const forwarded = dns_forwarder.forward(request.payload, &forward_buf) catch null;
+    const dns_payload = if (forwarded) |response| valid: {
+        if (!validDnsResponse(request.payload, response)) break :valid buildDnsServfail(request.payload, request.question_end, &response_buf);
+        if (policy) |policy_runtime| _ = policy_runtime.noteDnsResponse(request.payload, response);
+        break :valid response;
+    } else
         buildDnsServfail(request.payload, request.question_end, &response_buf);
 
     return buildDnsUdpFrame(request, dns_payload, out);
@@ -593,7 +643,7 @@ test "spore-netd proxies bounded UDP DNS queries" {
     var forwarder = TestDnsForwarder{ .response = response };
 
     var out: [max_frame_len]u8 = undefined;
-    const reply = frameReply(frame, &out, forwarder.forwarder()).?;
+    const reply = frameReply(frame, &out, forwarder.forwarder(), null).?;
 
     try std.testing.expectEqual(query.len, forwarder.query_len);
     try std.testing.expectEqual(@as(u16, 0x1234), forwarder.query_id);
@@ -618,7 +668,7 @@ test "spore-netd returns DNS SERVFAIL when host forwarding fails" {
     var forwarder = TestDnsForwarder{ .fail = true };
 
     var out: [max_frame_len]u8 = undefined;
-    const reply = frameReply(frame, &out, forwarder.forwarder()).?;
+    const reply = frameReply(frame, &out, forwarder.forwarder(), null).?;
     const udp = reply[ethernet_header_len + ipv4_header_min_len ..];
     const dns = udp[udp_header_len..];
 
@@ -648,13 +698,13 @@ test "spore-netd drops malformed DNS compression and bad IPv4 checksums" {
     const frame = testDnsFrame(query, &frame_buf);
     var forwarder = TestDnsForwarder{};
     var out: [max_frame_len]u8 = undefined;
-    try std.testing.expect(frameReply(frame, &out, forwarder.forwarder()) == null);
+    try std.testing.expect(frameReply(frame, &out, forwarder.forwarder(), null) == null);
 
     var good_query_buf: [512]u8 = undefined;
     const good_query = testDnsQuery(0x2222, "example.com", &good_query_buf);
     const bad_frame = testDnsFrame(good_query, &frame_buf);
     frame_buf[ethernet_header_len + 8] ^= 1;
-    try std.testing.expect(frameReply(bad_frame, &out, forwarder.forwarder()) == null);
+    try std.testing.expect(frameReply(bad_frame, &out, forwarder.forwarder(), null) == null);
 }
 
 test "spore-netd parses host resolver nameserver lines" {
@@ -665,6 +715,20 @@ test "spore-netd parses host resolver nameserver lines" {
     ).?;
     try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 0, 2, 53 }, &parsed);
     try std.testing.expect(parseNameserver("nameserver ::1\n") == null);
+}
+
+test "spore-netd cli parser accepts network policy rules" {
+    const opts = parseCliArgs(&.{
+        "--stdio",
+        "--allow-cidr",
+        "93.184.216.34/32",
+        "--allow-host",
+        "example.com",
+    });
+    try std.testing.expectEqual(@as(usize, 1), opts.policy.allow_cidr_count);
+    try std.testing.expectEqualStrings("93.184.216.34/32", opts.policy.allow_cidrs[0]);
+    try std.testing.expectEqual(@as(usize, 1), opts.policy.allow_host_count);
+    try std.testing.expectEqualStrings("example.com", opts.policy.allow_hosts[0]);
 }
 
 test "spore-netd frame stream round trips bounded frames" {
@@ -700,13 +764,13 @@ fn fuzzFrameStreamAndArp(_: void, s: *std.testing.Smith) !void {
     var forwarder = TestDnsForwarder{ .fail = true };
 
     _ = arpReply(bytes[0..len], &out);
-    _ = frameReply(bytes[0..len], &out, forwarder.forwarder());
+    _ = frameReply(bytes[0..len], &out, forwarder.forwarder(), null);
 
     if (len < frame_header_len) return;
     const frame_len = decodeFrameLen(bytes[0..frame_header_len]) catch return;
     if (frame_header_len + frame_len > len) return;
     _ = arpReply(bytes[frame_header_len..][0..frame_len], &out);
-    _ = frameReply(bytes[frame_header_len..][0..frame_len], &out, forwarder.forwarder());
+    _ = frameReply(bytes[frame_header_len..][0..frame_len], &out, forwarder.forwarder(), null);
 }
 
 test "fuzz spore-netd frame stream, ARP, IPv4, UDP, and DNS handling" {

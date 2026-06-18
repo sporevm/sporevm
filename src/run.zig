@@ -16,6 +16,7 @@ const net_gateway = @import("net_gateway.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_mod = @import("rootfs.zig");
 const spore = @import("spore.zig");
+const spore_net_policy = @import("spore_net_policy.zig");
 const virtio_blk = @import("virtio/blk.zig");
 const virtio_net = @import("virtio/net.zig");
 const vsock = @import("virtio/vsock.zig");
@@ -76,6 +77,7 @@ pub const Options = struct {
     capture_trigger: capture.Trigger = .exit,
     continue_after_capture: bool = false,
     network: NetworkMode = .disabled,
+    network_policy: spore_net_policy.Config = .{},
 };
 
 pub const NetworkMode = enum {
@@ -159,6 +161,7 @@ pub const CliOptions = struct {
     capture_trigger: capture.Trigger = .exit,
     continue_after_capture: bool = false,
     network: NetworkMode = .disabled,
+    network_policy: spore_net_policy.Config = .{},
     command: []const []const u8,
 };
 
@@ -174,6 +177,8 @@ const cli_usage =
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs, then run from it
     \\  --net                   Experimental SporeVM-managed networking
+    \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
+    \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
     \\  --capture DIR           Snapshot to DIR; defaults to --capture-on EXIT
     \\  --capture-on WHEN       Capture trigger: EXIT, INT, TERM, HUP, USR1, or USR2
     \\  --continue-after-capture
@@ -228,6 +233,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var capture_trigger_set = false;
     var continue_after_capture = false;
     var network: NetworkMode = .disabled;
+    var network_policy = spore_net_policy.Config{};
     var command: ?[]const []const u8 = null;
 
     var i: usize = 0;
@@ -260,6 +266,18 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             continue_after_capture = true;
         } else if (std.mem.eql(u8, args[i], "--net")) {
             network = .spore;
+        } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
+            const raw = takeValue(args, &i, args[i]);
+            network_policy.addAllowCidr(raw) catch |err| {
+                std.debug.print("spore run: invalid --allow-cidr {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, args[i], "--allow-host")) {
+            const raw = takeValue(args, &i, args[i]);
+            network_policy.addAllowHost(raw) catch |err| {
+                std.debug.print("spore run: invalid --allow-host {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
         } else if (try parseSharedOption(&shared, args, &i)) {
             continue;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
@@ -306,6 +324,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.debug.print("spore run: --continue-after-capture requires a signal capture trigger\n", .{});
         std.process.exit(2);
     }
+    if (network == .disabled and network_policy.hasRules()) {
+        std.debug.print("spore run: --allow-cidr and --allow-host require --net\n", .{});
+        std.process.exit(2);
+    }
 
     return .{
         .backend = backend,
@@ -317,6 +339,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .capture_trigger = capture_trigger,
         .continue_after_capture = continue_after_capture,
         .network = network,
+        .network_policy = network_policy,
         .command = argv,
     };
 }
@@ -336,6 +359,7 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
         opts.capture_trigger = parsed.capture_trigger;
         opts.continue_after_capture = parsed.continue_after_capture;
         opts.network = parsed.network;
+        opts.network_policy = parsed.network_policy;
         return opts;
     }
 
@@ -355,6 +379,7 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     opts.capture_trigger = parsed.capture_trigger;
     opts.continue_after_capture = parsed.continue_after_capture;
     opts.network = parsed.network;
+    opts.network_policy = parsed.network_policy;
     return opts;
 }
 
@@ -1149,7 +1174,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     if (opts.network == .spore) {
-        try gateway.start(init, allocator);
+        try gateway.start(init, allocator, opts.network_policy);
         gateway_active = true;
     }
     defer if (gateway_active) gateway.deinit();
@@ -1643,6 +1668,24 @@ test "run cli parser accepts net flag" {
     const opts = try parseCliArgs(&.{ "--net", "--", "/bin/true" });
     try std.testing.expectEqual(NetworkMode.spore, opts.network);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
+    try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
+}
+
+test "run cli parser accepts network allow rules" {
+    const opts = try parseCliArgs(&.{
+        "--net",
+        "--allow-cidr",
+        "93.184.216.34/32",
+        "--allow-host",
+        "example.com",
+        "--",
+        "/bin/true",
+    });
+    try std.testing.expectEqual(NetworkMode.spore, opts.network);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_cidr_count);
+    try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
+    try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
 }
 

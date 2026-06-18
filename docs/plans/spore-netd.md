@@ -188,6 +188,11 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   denies blocked destinations before opening host sockets, relays accepted
   flows through nonblocking host `connect()` sockets, and bounds flow count,
   buffers, connect timeout, and idle lifetime.
+- `src/spore_net_policy.zig` now owns the explicit egress policy model. With no
+  allow rules, public IPv4 egress is allowed after the hard floor. When
+  `--allow-cidr` or `--allow-host` is supplied with `--net`, public egress is
+  restricted to exact CIDR matches or DNS A answers learned through the
+  SporeVM DNS proxy for the configured host; the hard floor still wins.
 - `src/net_gateway.zig` owns helper startup, stderr readiness, deterministic
   shutdown, SIGPIPE-safe helper writes, and the parent-side virtio-net backend
   adapter. Helper RX frames wake the hypervisor loop, which explicitly flushes
@@ -200,9 +205,9 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   it does not require `ip`, DHCP, or other guest tools. The `/bin/netcheck`
   helper and `scripts/smoke-run-net-config.sh` inspect the resulting interface,
   route, resolver, and gateway ARP entry.
-- The minimal initrd now also includes `/bin/nslookup`, a tiny static smoke
-  helper used by `scripts/smoke-run-net-dns.sh` to prove guest DNS queries reach
-  the host-side proxy and receive IPv4 answers.
+- The minimal initrd now also includes `/bin/nslookup` and `/bin/wget`, tiny
+  static smoke helpers used by the DNS and HTTP network smokes to prove guest
+  DNS queries and outbound TCP flows reach the host-side proxy.
 - `SECURITY.md` already treats virtqueue descriptors and device request headers
   as guest-controlled attack surface requiring fuzz targets.
 - `build.zig.zon` now pins `lox/zmoltcp` at `v0.2.12`, which includes the
@@ -210,9 +215,9 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   fixes. The dependency is wired into the `sporevm` module, and
   `src/zmoltcp_gateway.zig` contains a compile-level contract test proving
   SporeVM can build against the caller-owned forwarder surface.
-- The next missing piece is the SporeVM adapter: feeding guest Ethernet frames
-  into `zmoltcp`, accepting non-local TCP SYNs through the forwarder callback,
-  and relaying established payloads to bounded host sockets under policy.
+- The next missing piece is lifecycle integration: capture/resume/fork must
+  record requested network capability and policy without pretending live TCP
+  flow state is portable.
 
 ## Delivery Strategy
 
@@ -336,6 +341,8 @@ Definition of done:
 
 ### Slice 8: Policy and Observability Hardening
 
+Status: implemented in the Slice 8 branch.
+
 Make the default egress floor explicit and add user-selectable allow rules after
 the baseline path is working.
 
@@ -372,6 +379,7 @@ Definition of done:
   hard-floor denial, helper crash before ready, helper crash during run.
   `mise run smoke:run-net-http` covers the first outbound HTTP path with the
   minimal initrd `/bin/wget` helper.
+  `mise run smoke:run-net-deny` covers hard-floor denial and debug visibility.
 - Backend smokes: the same one-shot network smoke on HVF and KVM.
 - Regression checks: no behavior change for `spore run` without `--net`,
   capture without network, rootfs-backed run, and lifecycle commands.
