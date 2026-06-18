@@ -45,8 +45,10 @@ const usage =
     \\                      Pack portable spore chunks into a local bundle
     \\  unpack <bundle-dir> [--child ID] --out DIR
     \\                      Unpack a local spore bundle into a spore dir
-    \\  pull file://BUNDLE [--child ID] --out DIR
-    \\                      Pull one child from a local bundle into a spore dir
+    \\  push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]
+    \\                      Push an indexed bundle to an object store
+    \\  pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST [--child ID] --out DIR [--region REGION]
+    \\                      Pull one child into a spore dir
     \\  help                Show this help
     \\
 ;
@@ -115,6 +117,9 @@ pub fn main(init: std.process.Init) !void {
         try printJson(arena, stdout, result);
     } else if (std.mem.eql(u8, command, "unpack")) {
         const result = try unpackCommand(init, arena, command_args);
+        try printJson(arena, stdout, result);
+    } else if (std.mem.eql(u8, command, "push")) {
+        const result = try pushCommand(init, arena, command_args);
         try printJson(arena, stdout, result);
     } else if (std.mem.eql(u8, command, "pull")) {
         const result = try pullCommand(init, arena, command_args);
@@ -291,10 +296,47 @@ fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []c
     });
 }
 
+fn pushCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.PushResult {
+    var bundle_dir: ?[]const u8 = null;
+    var destination: ?[]const u8 = null;
+    var aws_region: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--region") and i + 1 < args.len) {
+            i += 1;
+            aws_region = args[i];
+        } else if (std.mem.startsWith(u8, args[i], "--")) {
+            std.debug.print("unknown push argument: {s}\n", .{args[i]});
+            std.process.exit(2);
+        } else if (bundle_dir == null) {
+            bundle_dir = args[i];
+        } else if (destination == null) {
+            destination = args[i];
+        } else {
+            std.debug.print("unexpected push argument: {s}\n", .{args[i]});
+            std.process.exit(2);
+        }
+    }
+
+    if (bundle_dir == null or destination == null) {
+        std.debug.print("usage: spore push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]\n", .{});
+        std.process.exit(2);
+    }
+
+    return sporevm.bundle.push(allocator, .{
+        .io = init.io,
+        .bundle_dir = bundle_dir.?,
+        .destination = destination.?,
+        .aws_region = aws_region,
+    });
+}
+
 fn pullCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.PullResult {
     var source: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var child_id: ?[]const u8 = null;
+    var aws_region: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -304,6 +346,9 @@ fn pullCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
         } else if (std.mem.eql(u8, args[i], "--child") and i + 1 < args.len) {
             i += 1;
             child_id = args[i];
+        } else if (std.mem.eql(u8, args[i], "--region") and i + 1 < args.len) {
+            i += 1;
+            aws_region = args[i];
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             std.debug.print("unknown pull argument: {s}\n", .{args[i]});
             std.process.exit(2);
@@ -316,7 +361,7 @@ fn pullCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
     }
 
     if (source == null or out_dir == null) {
-        std.debug.print("usage: spore pull file://BUNDLE [--child ID] --out DIR\n", .{});
+        std.debug.print("usage: spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST [--child ID] --out DIR [--region REGION]\n", .{});
         std.process.exit(2);
     }
 
@@ -327,6 +372,7 @@ fn pullCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
         .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
         .bundle_cache_dir = optionalBundleCacheRoot(allocator, init),
         .child_id = child_id,
+        .aws_region = aws_region,
     });
 }
 
@@ -384,6 +430,7 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "fanout") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "pack") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "unpack") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "push") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "pull") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "help") != null);
 }

@@ -134,10 +134,10 @@ state and broader disk manifests remain later work.
 - Same-host file-backed RAM sharing and lazy restore have proof paths on KVM and
   HVF. Trusted backing remains a same-host acceleration hint; chunks remain the
   portable verified source of truth.
-- `spore pack`, `spore unpack`, and local `spore pull file://...` provide the
-  first local distribution bundle shape with rootfs artifact inclusion,
-  multi-child indexes, `bundle_digest` for cache identity, and per-chunk
-  verification for trust.
+- `spore pack`, `spore unpack`, local `spore pull file://...`, and S3
+  `spore push`/digest-pinned `spore pull` provide the first distribution bundle
+  shape with rootfs artifact inclusion, multi-child indexes, `bundle_digest` for
+  cache identity, origin-byte reporting, and per-chunk verification for trust.
 - `spore run`, product `spore resume`, and `spore fanout` provide the first
   user-facing run/capture/fork/resume/fan-out path.
 
@@ -152,6 +152,7 @@ includes:
 
 - local pack/unpack and `file://` pull materialization with canonical
   `bundle_digest`;
+- S3 `spore push` and digest-pinned `spore pull` for indexed bundles;
 - two-host S3/SSM restore;
 - host-local cache reuse with repeated destination restores;
 - source-peer HTTP seeding that keeps destination S3-origin bytes at zero;
@@ -160,14 +161,11 @@ includes:
 
 What remains:
 
-1. Add the first remote `spore push` and `spore pull` store adapter for the
-   pull-based product distribution path. S3 should land first because the
-   existing remote restore smoke path already uses S3 and SSM.
-2. Measure origin egress as a small multiple of unique chunk bytes across larger
+1. Measure origin egress as a small multiple of unique chunk bytes across larger
    identical-host fleets.
-3. Keep corrupt peer/origin data rejected by chunk and rootfs verification.
-4. Complete node-local bundle cache reuse and metrics for repeated remote pulls.
-5. Preserve default immutable rootfs artifact inclusion through remote
+2. Keep corrupt peer/origin data rejected by chunk and rootfs verification.
+3. Complete node-local bundle cache reuse and metrics for repeated remote pulls.
+4. Preserve default immutable rootfs artifact inclusion through remote
    distribution without blurring memory chunks and rootfs bytes.
 
 Done when a multi-host fan-out demo restores one spore on every host in a test

@@ -216,13 +216,20 @@ an attached rootfs fd.
 - `spore pull file://... --child ID` materializes one selected child from an
   indexed local bundle through a verified local bundle content source, reusing a
   node-local BLAKE3 chunk cache where hard links are available.
+- `spore push BUNDLE s3://BUCKET/PREFIX/` publishes indexed bundles to S3 by
+  uploading the canonical bundle file set named by validated metadata.
+- `spore pull s3://BUCKET/PREFIX@sha256:<bundle> --child ID --out DIR`
+  downloads only that canonical file set, verifies the bundle digest, reports
+  `origin_bytes_read`, and then materializes through the same verified local
+  content source as `file://` pull.
 - Foundation Slice 6 has S3/SSM remote restore, host-local cache reuse,
   source-peer HTTP seeding, corrupt-bundle rejection, and ten-instance star/tree
   smoke evidence.
 - `spore run --image`, `spore resume`, `spore fork`, and `spore fanout` support
   local immutable-rootfs fan-out.
-- Current distribution still has no `push`, remote `pull`, metadata-only rootfs
-  CLI mode, remote store adapter, or remote bundle cache reuse metrics.
+- Current distribution still has no metadata-only rootfs CLI mode, peer-backed
+  `pull`, or full remote cache reuse metrics for bundle, chunk, rootfs, and
+  origin byte accounting.
 
 ## Delivery Strategy
 
@@ -308,6 +315,8 @@ without changing manifest semantics.
 
 ### Slice 4: Object-Store Push And Pull
 
+Status: implemented for indexed S3 bundles through the AWS CLI adapter.
+
 Add the first remote store adapter using S3, matching the existing S3/SSM remote
 restore smoke path. An OCI-layout or registry transport can follow after the
 descriptor shape settles.
@@ -323,7 +332,10 @@ spore pull s3://sporevm-artifacts/runs/ruby.bundle@sha256:<bundle> \
 
 Done when two or more same-class Linux/KVM aarch64 hosts can independently pull
 different children, reject corrupted remote data, and report origin bytes read
-for the run.
+for the run. The direct-S3 path in `scripts/smoke-remote-bundle.sh` now uses
+`spore push` on the source and digest-pinned `spore pull` on destinations; peer
+tree modes stay on the older explicit bundle fetch path until peer sources move
+behind `pull`.
 
 ### Slice 5: Node-Local Cache Reuse
 

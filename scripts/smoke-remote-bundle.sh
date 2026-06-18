@@ -215,7 +215,9 @@ for i in "${!dest_instances[@]}"; do
       die "duplicate --dest-instance ${dest_instances[$i]}; use --dest-repeat for repeated restores on one host"
     fi
   done
-  [[ "${dest_instances[$i]}" != "${source_instance}" ]] || die "source instance cannot also be a destination"
+  if [[ "${dest_instances[$i]}" == "${source_instance}" && ( -n "${source_peer_ip}" || "${#tree_relay_ids[@]}" -gt 0 ) ]]; then
+    die "source instance can only also be a destination in direct S3 mode"
+  fi
 done
 for i in "${!tree_relay_ids[@]}"; do
   [[ "${tree_relay_ids[$i]}" != "${source_instance}" ]] || die "source instance cannot also be a tree relay"
@@ -255,10 +257,15 @@ case "${run_id}" in
 esac
 run_prefix="${prefix%/}/${run_id}"
 s3_base="s3://${bucket}/${run_prefix}"
+child_count="${#dest_instances[@]}"
+if [[ "${child_count}" -le 0 ]]; then
+  child_count=1
+fi
 
 q_region="$(shell_quote "${region}")"
 q_bucket="$(shell_quote "${bucket}")"
 q_run_prefix="$(shell_quote "${run_prefix}")"
+q_child_count="$(shell_quote "${child_count}")"
 q_mem_mib="$(shell_quote "${mem_mib}")"
 q_snapshot_after_ms="$(shell_quote "${snapshot_after_ms}")"
 q_resume_seconds="$(shell_quote "${resume_seconds}")"
@@ -356,6 +363,7 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; 
 region=${q_region}
 bucket=${q_bucket}
 run_prefix=${q_run_prefix}
+child_count=${q_child_count}
 mem_mib=${q_mem_mib}
 snapshot_after_ms=${q_snapshot_after_ms}
 source_peer_ip=${q_source_peer_ip}
@@ -384,7 +392,8 @@ scripts/smoke-restore-leg.sh capture \
   --spore-dir "\${workdir}/spore" \
   --mem-mib "\${mem_mib}" \
   --snapshot-after-ms "\${snapshot_after_ms}"
-zig-out/bin/spore pack "\${workdir}/spore" --out "\${workdir}/spore.bundle" | tee "\${workdir}/pack-result.json"
+zig-out/bin/spore fork "\${workdir}/spore" --count "\${child_count}" --out "\${workdir}/spore.children" | tee "\${workdir}/fork-result.json"
+zig-out/bin/spore pack "\${workdir}/spore" --children "\${workdir}/spore.children" --out "\${workdir}/spore.bundle" | tee "\${workdir}/pack-result.json"
 
 bundle_bytes="\$(du -sb "\${workdir}/spore.bundle" | awk '{print \$1}')"
 unique_chunk_bytes="\$(du -sb "\${workdir}/spore.bundle/chunkpacks/000000.pack" | awk '{print \$1}')"
@@ -405,7 +414,7 @@ if [[ -n "\${source_peer_ip}" ]]; then
     exit 1
   fi
 fi
-aws s3 cp "\${workdir}/spore.bundle" "s3://\${bucket}/\${run_prefix}/spore.bundle/" --recursive --region "\${region}" --only-show-errors
+zig-out/bin/spore push "\${workdir}/spore.bundle" "s3://\${bucket}/\${run_prefix}/spore.bundle/" --region "\${region}" | tee "\${workdir}/push-result.json"
 printf '%s\n' "\${bundle_key}" >"\${workdir}/bundle-key.txt"
 aws s3 cp "\${workdir}/bundle-key.txt" "s3://\${bucket}/\${run_prefix}/bundle-key.txt" --region "\${region}" --only-show-errors
 cat >"\${workdir}/source-result.json" <<JSON
@@ -454,6 +463,7 @@ source_peer_port=${q_source_peer_port}
 keep_remote=${q_keep_remote}
 dest_instance="\${SPOREVM_DEST_INSTANCE:?SPOREVM_DEST_INSTANCE is required}"
 dest_role="\${SPOREVM_DEST_ROLE:-dest}"
+child_id="\${SPOREVM_CHILD_ID:-0}"
 peer_ip="\${SPOREVM_PEER_IP:-\${source_peer_ip}}"
 serve_bundle="\${SPOREVM_SERVE_BUNDLE:-0}"
 safe_dest="\$(printf '%s' "\${dest_instance}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
@@ -475,6 +485,10 @@ export MISE_TRUSTED_CONFIG_PATHS="\${PWD}/mise.toml"
 mise install
 mise exec -- zig build
 mise exec -- zig build kvm-boot
+
+json_field() {
+  python3 -c 'import json, sys; value=json.load(open(sys.argv[1], encoding="utf-8"))[sys.argv[2]]; print(str(value).lower() if isinstance(value, bool) else value)' "\$1" "\$2"
+}
 
 fetch_bundle() {
   local out_dir="\$1"
@@ -629,7 +643,23 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   bundle_dir="\${iter_dir}/spore.bundle"
   unpacked_dir="\${iter_dir}/spore.unpacked"
   unpack_result="\${iter_dir}/unpack-result.json"
-  materialize_bundle "\${bundle_dir}" cache_hit origin_bytes peer_bytes
+  if [[ -z "\${peer_ip}" ]]; then
+    mkdir -p "\${iter_dir}"
+    if [[ -n "\${cache_dir}" ]]; then
+      pull_bundle_cache="\${cache_dir}"
+    else
+      pull_bundle_cache="\${iter_dir}/bundle-cache"
+    fi
+    pull_source="s3://\${bucket}/\${run_prefix}/spore.bundle@sha256:\${bundle_key}"
+    SPOREVM_BUNDLE_CACHE_DIR="\${pull_bundle_cache}" \
+      zig-out/bin/spore pull "\${pull_source}" --child "\${child_id}" --out "\${unpacked_dir}" --region "\${region}" | tee "\${unpack_result}"
+    cache_hit="\$(json_field "\${unpack_result}" remote_bundle_cache_hit)"
+    origin_bytes="\$(json_field "\${unpack_result}" origin_bytes_read)"
+    peer_bytes=0
+    bundle_dir="\${pull_bundle_cache}/remote/s3/sha256/\${bundle_key}/bundle"
+  else
+    materialize_bundle "\${bundle_dir}" cache_hit origin_bytes peer_bytes
+  fi
   if [[ "\${cache_hit}" == "true" ]]; then
     cache_hits=\$((cache_hits + 1))
   else
@@ -646,8 +676,10 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
     corrupt_bundle_rejections=\$((corrupt_bundle_rejections + 1))
     corrupt_rejected=true
   fi
-  zig-out/bin/spore unpack "\${bundle_dir}" --out "\${unpacked_dir}" | tee "\${unpack_result}"
-  unpack_bundle_key="\$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["bundle_digest"])' "\${unpack_result}")"
+  if [[ -n "\${peer_ip}" ]]; then
+    zig-out/bin/spore unpack "\${bundle_dir}" --out "\${unpacked_dir}" | tee "\${unpack_result}"
+  fi
+  unpack_bundle_key="\$(json_field "\${unpack_result}" bundle_digest)"
   if [[ "\${unpack_bundle_key}" != "\${bundle_key}" ]]; then
     echo "unpacked bundle digest mismatch: expected \${bundle_key}, got \${unpack_bundle_key}" >&2
     exit 1
@@ -727,6 +759,7 @@ send_remote_script() {
   local peer_ip_arg="${4-}"
   local dest_role_arg="${5-}"
   local serve_bundle_arg="${6-}"
+  local child_id_arg="${7-}"
   local comment="sporevm-remote-bundle-${script_name}-${run_id}"
   local command
   local quoted_command
@@ -750,6 +783,9 @@ send_remote_script() {
   fi
   if [[ -n "${serve_bundle_arg}" ]]; then
     env_prefix="${env_prefix} SPOREVM_SERVE_BUNDLE=$(shell_quote "${serve_bundle_arg}")"
+  fi
+  if [[ -n "${child_id_arg}" ]]; then
+    env_prefix="${env_prefix} SPOREVM_CHILD_ID=$(shell_quote "${child_id_arg}")"
   fi
   remote_invocation="${env_prefix# } ${remote_invocation}"
   command="aws s3 cp $(shell_quote "${remote_script_uri}") $(shell_quote "${remote_script_path}") --region $(shell_quote "${region}") --only-show-errors && chmod +x $(shell_quote "${remote_script_path}") && ${remote_invocation}"
@@ -828,7 +864,7 @@ if (( ${#tree_relay_ids[@]} > 0 )); then
     relay_ip="${tree_relay_ips[$i]}"
     relay_safe="$(safe_component "${relay_instance}")"
     echo "starting relay unpack/resume/serve on ${relay_instance} (${relay_ip})" >&2
-    relay_command_ids+=("$(send_remote_script "${relay_instance}" dest "${relay_instance}" "${source_peer_ip}" relay 1)")
+    relay_command_ids+=("$(send_remote_script "${relay_instance}" dest "${relay_instance}" "${source_peer_ip}" relay 1 "${i}")")
     relay_safe_names+=("${relay_safe}")
     relay_peer_started_ids+=("${relay_instance}")
     relay_peer_started_safes+=("${relay_safe}")
@@ -844,7 +880,7 @@ if (( ${#tree_relay_ids[@]} > 0 )); then
     relay_index=$(( i % ${#tree_relay_ids[@]} ))
     relay_ip="${tree_relay_ips[$relay_index]}"
     echo "starting leaf unpack/resume on ${dest_instance} via relay ${tree_relay_ids[$relay_index]} (${relay_ip})" >&2
-    dest_command_ids+=("$(send_remote_script "${dest_instance}" dest "${dest_instance}" "${relay_ip}" leaf 0)")
+    dest_command_ids+=("$(send_remote_script "${dest_instance}" dest "${dest_instance}" "${relay_ip}" leaf 0 "${i}")")
     dest_safe_names+=("$(safe_component "${dest_instance}")")
   done
 
@@ -852,9 +888,10 @@ if (( ${#tree_relay_ids[@]} > 0 )); then
     wait_remote_command "${dest_instances[$i]}" "${dest_command_ids[$i]}" "leaf:${dest_instances[$i]}"
   done
 else
-  for dest_instance in "${dest_instances[@]}"; do
+  for i in "${!dest_instances[@]}"; do
+    dest_instance="${dest_instances[$i]}"
     echo "starting destination unpack/resume on ${dest_instance}" >&2
-    dest_command_ids+=("$(send_remote_script "${dest_instance}" dest "${dest_instance}")")
+    dest_command_ids+=("$(send_remote_script "${dest_instance}" dest "${dest_instance}" "" "" "" "${i}")")
     dest_safe_names+=("$(safe_component "${dest_instance}")")
   done
 

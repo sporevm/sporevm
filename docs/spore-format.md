@@ -79,6 +79,14 @@ the bundle index, and writes a normal spore directory. When
 installs verified memory chunks into a node-local BLAKE3 chunk cache and hard
 links them into the output spore where the filesystem allows it.
 
+`spore push /path/to/bundle s3://bucket/prefix/` publishes an indexed bundle to
+S3 by uploading only the canonical files named by the validated bundle metadata.
+`spore pull s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out
+child.spore` downloads that exact object set into the node-local bundle cache,
+checks the canonical `bundle_digest`, then uses the same chunk and rootfs
+verification path as local pull. Bare S3 URLs are rejected for pull because the
+remote URL is not restore authority.
+
 ## Manifest v0
 
 `manifest.json` fields (see `src/spore.zig` for the authoritative shapes):

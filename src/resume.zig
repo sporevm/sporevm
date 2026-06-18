@@ -135,7 +135,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
 
     switch (cause) {
         .guest_off, .guest_reset => {},
-        .snapshotted, .probe_complete, .monitor_stopped => return error.UnexpectedResumeExit,
+        else => return error.UnexpectedResumeExit,
     }
 }
 

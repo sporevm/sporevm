@@ -97,9 +97,12 @@ unpacked spore can be resumed.
 
 `spore pull file:///path/to/bundle --child 42 --out child.spore` does the same
 rootfs installation for indexed local bundles while materializing one selected
-child. Use `SPOREVM_ROOTFS_CACHE_DIR` to choose the destination rootfs digest
-cache and `SPOREVM_BUNDLE_CACHE_DIR` to choose the node-local memory chunk cache
-used by pull.
+child. `spore pull s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out
+child.spore` first verifies the remote bundle identity, then installs any
+bundled rootfs bytes through the same digest-cache path. Use
+`SPOREVM_ROOTFS_CACHE_DIR` to choose the destination rootfs digest cache and
+`SPOREVM_BUNDLE_CACHE_DIR` to choose the node-local bundle and memory chunk
+caches used by pull.
 
 Plain `spore run --rootfs PATH` remains a local run escape hatch. Combining
 `--rootfs PATH` with `--capture` is rejected until an import/preload
