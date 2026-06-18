@@ -154,16 +154,15 @@ Rootfs inclusion is the default artifact policy:
   the bundle once per rootfs digest.
 - If the required rootfs bytes are absent or mismatched on the packing host,
   `spore pack` fails rather than emitting a misleading portable bundle.
-- The landed exact-rootfs bundle path has no metadata-only CLI mode: a
-  rootfs-backed spore either packs exact rootfs bytes or fails. Indexed bundle
-  metadata can describe rootfs artifact policy, but materialized unpack and pull
-  reject metadata-only rootfs entries until a prepared-cache workflow exists.
+- The default rootfs artifact policy is exact bytes. `spore pack --children ...
+  --rootfs=metadata-only` is an explicit opt-out for indexed bundles whose
+  destinations already have the verified rootfs cache entry.
 - `spore unpack` and `spore pull` install bundled rootfs artifacts into the
   node-local digest cache by default, verifying digest and size before writing a
   resumable spore.
-- A metadata-only bundle may be unpacked only when the destination cache already
-  has the required verified rootfs bytes, or when the caller explicitly chooses a
-  non-resumable/preload-only operation.
+- A metadata-only bundle may be unpacked or pulled only with
+  `--allow-metadata-only-rootfs`, and only when the selected rootfs cache already
+  has the required verified bytes.
 
 The internal boundary should be:
 
@@ -223,13 +222,16 @@ an attached rootfs fd.
   `origin_bytes_read`, `remote_bundle_cache_hit`, `chunk_bytes_fetched`, and
   rootfs cache hit/fetch metrics, then materializes through the same verified
   local content source as `file://` pull.
+- `spore pack --children DIR --rootfs=metadata-only` can emit an indexed bundle
+  with rootfs metadata but no rootfs bytes after verifying the source rootfs
+  cache; `spore unpack` and `spore pull` accept it only with
+  `--allow-metadata-only-rootfs` and a verified destination cache hit.
 - Foundation Slice 6 has S3/SSM remote restore, host-local cache reuse,
   source-peer HTTP seeding, corrupt-bundle rejection, and ten-instance star/tree
   smoke evidence.
 - `spore run --image`, `spore resume`, `spore fork`, and `spore fanout` support
   local immutable-rootfs fan-out.
-- Current distribution still has no metadata-only rootfs CLI mode or
-  peer-backed `pull`.
+- Current distribution still has no peer-backed `pull`.
 
 ## Delivery Strategy
 
@@ -353,6 +355,31 @@ and local pull smokes cover rootfs cache reuse; the direct-S3 real-host smoke
 can run `--dest-repeat 2 --cache-dir DIR` to pull different children on one
 destination and assert the second pull reads zero origin and chunk bytes.
 
+### Slice 6: Metadata-Only Prepared Rootfs
+
+Status: implemented for indexed bundles with explicit prepared-cache
+materialization.
+
+Add the explicit rootfs artifact opt-out now that the exact-byte default is
+working. This is for environments that prepare the immutable rootfs digest cache
+out of band and want distribution bundles to carry memory and rootfs metadata
+without carrying the ext4 payload.
+
+Candidate commands:
+
+```console
+spore pack ruby.spore --children ruby.children/ --rootfs=metadata-only --out ruby.bundle/
+spore pull file:///tmp/ruby.bundle \
+  --child 42 \
+  --allow-metadata-only-rootfs \
+  --out ruby-42.spore
+```
+
+Done when metadata-only indexed bundles omit `rootfs/blake3/<hex>.ext4`, keep
+the rootfs digest in `rootfs.index.json`, fail normal materialized unpack/pull,
+fail the explicit allow path on an empty destination cache, and succeed only
+when the destination cache already contains the verified rootfs digest.
+
 ## Deferred Peer Distribution
 
 Lazy-pull and cache-only preheat are also deferred. They can fit behind the same
@@ -403,8 +430,8 @@ rule: peers are byte sources, not trust roots.
   operations. `resume` executes a materialized spore.
 - Rootfs-backed bundles include exact immutable rootfs bytes by default.
 - Metadata-only rootfs bundles require an explicit opt-out and must be marked in
-  bundle metadata; materialized unpack and pull reject them until the
-  prepared-cache workflow exists.
+  bundle metadata; materialized unpack and pull accept them only with an
+  explicit prepared-cache flag and a verified destination cache hit.
 - Bundle digests cover all materialization-affecting bytes, including rootfs
   artifacts, so cache identity cannot ignore disk artifacts.
 - Rootfs artifacts are installed into the local digest cache with atomic,
@@ -424,24 +451,22 @@ rule: peers are byte sources, not trust roots.
 - Multi-child bundling stays under `spore pack --children` until the artifact
   surface clearly outgrows `pack`/`unpack`.
 
-## Open Questions
+## Deferred Work
 
-- The exact metadata-only opt-out spelling is not blocking Slice 4 or Slice 5
-  because materialized unpack and pull reject metadata-only rootfs entries today.
-  Recommendation: use `--rootfs=metadata-only` rather than `--exclude-rootfs`
-  because it names the artifact policy and leaves room for future modes.
+- Peer-backed `pull` should land only after direct object-store pulls have
+  enough measurements to show origin egress is the next bottleneck.
 
 ## Key Learnings From Pressure-Testing
 
 - Default metadata-only rootfs bundles are operationally fragile because a clean
-  destination can verify the required digest but still lacks the bytes needed to
-  resume. The plan therefore makes exact rootfs bytes the default and reserves
-  metadata-only behavior for a later explicit prepared-cache workflow with
-  bundle metadata.
+  destination can verify the required digest from metadata but still lack the
+  bytes needed to resume. The plan therefore keeps exact rootfs bytes as the
+  default and requires explicit flags plus a verified prepared cache for
+  metadata-only materialization.
 - The first exact-rootfs slice correctly avoided depending on bundle metadata
   before that metadata existed. Indexed bundle metadata now exists for
-  multi-child bundles, while metadata-only CLI behavior remains deferred until a
-  prepared-cache workflow is designed.
+  multi-child bundles, and metadata-only CLI behavior is constrained to indexed
+  bundles with prepared destination caches.
 - Bundle identity must cover rootfs artifacts. Per-rootfs BLAKE3 verification
   still protects resume, but cache keys and remote references are misleading if
   rootfs bytes are outside the bundle digest.

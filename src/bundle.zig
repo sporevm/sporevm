@@ -31,12 +31,18 @@ pub const rootfs_index_path = "rootfs.index.json";
 pub const rootfs_policy_exact_bytes = "exact-bytes";
 pub const rootfs_policy_metadata_only = "metadata-only";
 
+pub const RootfsBundlePolicy = enum {
+    exact_bytes,
+    metadata_only,
+};
+
 pub const PackOptions = struct {
     io: Io,
     spore_dir: []const u8,
     out_dir: []const u8,
     rootfs_cache_dir: ?[]const u8 = null,
     children_dir: ?[]const u8 = null,
+    rootfs_policy: RootfsBundlePolicy = .exact_bytes,
 };
 
 pub const PackResult = struct {
@@ -58,6 +64,7 @@ pub const UnpackOptions = struct {
     out_dir: []const u8,
     rootfs_cache_dir: ?[]const u8 = null,
     child_id: ?[]const u8 = null,
+    allow_metadata_only_rootfs: bool = false,
 };
 
 pub const UnpackResult = struct {
@@ -97,6 +104,7 @@ pub const PullOptions = struct {
     rootfs_cache_dir: ?[]const u8 = null,
     bundle_cache_dir: ?[]const u8 = null,
     child_id: ?[]const u8 = null,
+    allow_metadata_only_rootfs: bool = false,
     aws_region: ?[]const u8 = null,
     aws_executable: []const u8 = "aws",
 };
@@ -230,6 +238,7 @@ const RootfsMaterializeResult = struct {
 
 pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult {
     if (options.children_dir != null) return packWithChildren(allocator, options);
+    if (options.rootfs_policy != .exact_bytes) return error.BadManifest;
 
     const parsed = try spore.loadManifest(allocator, options.spore_dir);
     defer parsed.deinit();
@@ -476,6 +485,8 @@ fn unpackIndexed(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unp
     defer parsed_index.deinit();
     try validateIndex(allocator, parsed_index.value);
 
+    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, options, bundle_index, manifest);
+
     var by_id = try indexById(allocator, parsed_index.value);
     defer by_id.deinit();
     var local_source = LocalBundleContentSource{ .bundle_dir = options.bundle_dir };
@@ -490,7 +501,6 @@ fn unpackIndexed(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unp
         null,
     );
 
-    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, options, bundle_index, manifest);
     try spore.saveManifest(allocator, options.out_dir, manifest);
     const bundle_digest = try digestHex(allocator, options.bundle_dir);
 
@@ -571,6 +581,16 @@ fn pullLocalIndexedBundle(
     const parsed_index = try loadIndex(allocator, bundle_dir);
     defer parsed_index.deinit();
     try validateIndex(allocator, parsed_index.value);
+    const unpack_options = UnpackOptions{
+        .io = options.io,
+        .bundle_dir = bundle_dir,
+        .out_dir = options.out_dir,
+        .rootfs_cache_dir = options.rootfs_cache_dir,
+        .child_id = child_id,
+        .allow_metadata_only_rootfs = options.allow_metadata_only_rootfs,
+    };
+    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, unpack_options, bundle_index, manifest);
+
     var by_id = try indexById(allocator, parsed_index.value);
     defer by_id.deinit();
 
@@ -586,14 +606,6 @@ fn pullLocalIndexedBundle(
         options.bundle_cache_dir,
     );
 
-    const unpack_options = UnpackOptions{
-        .io = options.io,
-        .bundle_dir = bundle_dir,
-        .out_dir = options.out_dir,
-        .rootfs_cache_dir = options.rootfs_cache_dir,
-        .child_id = child_id,
-    };
-    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, unpack_options, bundle_index, manifest);
     try spore.saveManifest(allocator, options.out_dir, manifest);
     const bundle_digest = try digestHex(allocator, bundle_dir);
 
@@ -1067,6 +1079,19 @@ fn packRootfsArtifactIndexed(
     seen.put(digest_copy, {}) catch return error.OutOfMemory;
 
     const source_path = rootfs_cache.digestPath(allocator, cache_root, rootfs.artifact.digest) catch |err| return rootfsError(err);
+    if (options.rootfs_policy == .metadata_only) {
+        const fd = rootfs_cache.openVerifiedFromCache(options.io, allocator, cache_root, .{ .device = rootfs.device, .artifact = rootfs.artifact }) catch |err| return rootfsError(err);
+        _ = std.c.close(fd);
+        try entries.append(.{
+            .digest = digest_copy,
+            .size = rootfs.artifact.size,
+            .format = spore.rootfs_artifact_format_ext4,
+            .policy = rootfs_policy_metadata_only,
+            .path = null,
+        });
+        return 0;
+    }
+
     const rel_path = try rootfsArtifactRelPath(allocator, rootfs.artifact);
     const dest_path = try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rel_path });
     rootfs_cache.copyVerifiedPath(options.io, allocator, source_path, dest_path, rootfs.artifact, .{
@@ -1115,7 +1140,18 @@ fn unpackRootfsArtifactIndexed(
     const entry = findRootfsEntry(parsed_rootfs_index.value, rootfs.artifact.digest) orelse return error.BadManifest;
     if (entry.size != rootfs.artifact.size) return error.BadManifest;
     if (!std.mem.eql(u8, entry.format, rootfs.artifact.format)) return error.BadManifest;
-    if (std.mem.eql(u8, entry.policy, rootfs_policy_metadata_only)) return error.BadManifest;
+    if (std.mem.eql(u8, entry.policy, rootfs_policy_metadata_only)) {
+        if (!options.allow_metadata_only_rootfs) return error.BadManifest;
+        const fd = rootfs_cache.openVerifiedFromCache(options.io, allocator, cache_root, rootfs) catch |err| return rootfsError(err);
+        _ = std.c.close(fd);
+        return .{
+            .artifact_count = 1,
+            .payload_bytes = 0,
+            .cache_hit_count = 1,
+            .cache_miss_count = 0,
+            .bytes_fetched = 0,
+        };
+    }
     if (!std.mem.eql(u8, entry.policy, rootfs_policy_exact_bytes)) return error.BadManifest;
     const rel_path = entry.path orelse return error.BadManifest;
     const source_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, rel_path });
@@ -2654,7 +2690,7 @@ test "pack children writes exact rootfs policy and unpacks selected rootfs child
     _ = std.c.close(fd);
 }
 
-test "unpack rejects metadata-only rootfs policy for materialized children" {
+test "metadata-only rootfs policy requires explicit prepared cache" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -2666,8 +2702,15 @@ test "unpack rejects metadata-only rootfs policy for materialized children" {
     const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
     const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
     const out_dir = try pathZ(arena, "{s}/unpacked-child", .{root_dir});
+    const out_missing_dir = try pathZ(arena, "{s}/unpacked-missing-child", .{root_dir});
+    const out_prepared_dir = try pathZ(arena, "{s}/unpacked-prepared-child", .{root_dir});
+    const out_pull_denied_dir = try pathZ(arena, "{s}/pulled-denied-child", .{root_dir});
+    const out_pull_missing_dir = try pathZ(arena, "{s}/pulled-missing-child", .{root_dir});
+    const out_pull_dir = try pathZ(arena, "{s}/pulled-prepared-child", .{root_dir});
     const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
     const unpack_cache_root = try pathZ(arena, "{s}/unpack-cache", .{root_dir});
+    const missing_cache_root = try pathZ(arena, "{s}/missing-cache", .{root_dir});
+    const pull_chunk_cache = try pathZ(arena, "{s}/pull-chunk-cache", .{root_dir});
     const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
 
     const ram = try arena.alloc(u8, 4096);
@@ -2683,15 +2726,17 @@ test "unpack rejects metadata-only rootfs policy for materialized children" {
         .out_dir = bundle_dir,
         .rootfs_cache_dir = pack_cache_root,
         .children_dir = children_dir,
+        .rootfs_policy = .metadata_only,
     });
 
-    var metadata_only = [_]RootfsArtifactEntry{.{
-        .digest = artifact.digest,
-        .size = artifact.size,
-        .policy = rootfs_policy_metadata_only,
-        .path = null,
-    }};
-    try saveRootfsIndex(arena, bundle_dir, .{ .artifacts = &metadata_only });
+    const rootfs_rel_path = try rootfsArtifactRelPath(arena, artifact);
+    try std.testing.expect(!try pathExistsNoSymlink(io, try pathZ(arena, "{s}/{s}", .{ bundle_dir, rootfs_rel_path })));
+    const rootfs_index = try loadRootfsIndex(arena, bundle_dir);
+    defer rootfs_index.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rootfs_index.value.artifacts.len);
+    try std.testing.expectEqualStrings(rootfs_policy_metadata_only, rootfs_index.value.artifacts[0].policy);
+    try std.testing.expect(rootfs_index.value.artifacts[0].path == null);
+
     try std.testing.expectError(error.BadManifest, unpack(arena, .{
         .io = io,
         .bundle_dir = bundle_dir,
@@ -2699,6 +2744,64 @@ test "unpack rejects metadata-only rootfs policy for materialized children" {
         .rootfs_cache_dir = unpack_cache_root,
         .child_id = "000000",
     }));
+    try std.testing.expect(!try pathExistsNoSymlink(io, out_dir));
+    try std.testing.expectError(error.BadChunk, unpack(arena, .{
+        .io = io,
+        .bundle_dir = bundle_dir,
+        .out_dir = out_missing_dir,
+        .rootfs_cache_dir = missing_cache_root,
+        .child_id = "000000",
+        .allow_metadata_only_rootfs = true,
+    }));
+    try std.testing.expect(!try pathExistsNoSymlink(io, out_missing_dir));
+
+    const source_uri = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
+    try std.testing.expectError(error.BadManifest, pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out_pull_denied_dir,
+        .rootfs_cache_dir = unpack_cache_root,
+        .bundle_cache_dir = pull_chunk_cache,
+        .child_id = "000000",
+    }));
+    try std.testing.expect(!try pathExistsNoSymlink(io, out_pull_denied_dir));
+    try std.testing.expectError(error.BadChunk, pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out_pull_missing_dir,
+        .rootfs_cache_dir = missing_cache_root,
+        .bundle_cache_dir = pull_chunk_cache,
+        .child_id = "000000",
+        .allow_metadata_only_rootfs = true,
+    }));
+    try std.testing.expect(!try pathExistsNoSymlink(io, out_pull_missing_dir));
+
+    try rootfs_cache.installExpectedPath(io, arena, unpack_cache_root, rootfs_source_path, artifact, .{});
+    const unpacked = try unpack(arena, .{
+        .io = io,
+        .bundle_dir = bundle_dir,
+        .out_dir = out_prepared_dir,
+        .rootfs_cache_dir = unpack_cache_root,
+        .child_id = "000000",
+        .allow_metadata_only_rootfs = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), unpacked.rootfs_artifact_count);
+    try std.testing.expectEqual(@as(u64, 0), unpacked.rootfs_payload_bytes);
+
+    const pulled = try pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out_pull_dir,
+        .rootfs_cache_dir = unpack_cache_root,
+        .bundle_cache_dir = pull_chunk_cache,
+        .child_id = "000000",
+        .allow_metadata_only_rootfs = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), pulled.rootfs_artifact_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled.rootfs_payload_bytes);
+    try std.testing.expectEqual(@as(usize, 1), pulled.rootfs_cache_hit_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled.rootfs_cache_miss_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled.rootfs_bytes_fetched);
 }
 
 test "pack rejects rootfs manifests without cache artifact" {

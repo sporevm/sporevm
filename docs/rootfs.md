@@ -95,6 +95,15 @@ requires the bundled artifact, verifies it against the manifest digest and size,
 and installs it into the destination host's rootfs digest cache before the
 unpacked spore can be resumed.
 
+Indexed bundles also support an explicit prepared-cache mode:
+`spore pack SPORE --children CHILDREN --rootfs=metadata-only --out BUNDLE`
+records the immutable rootfs digest and size without embedding the ext4 bytes.
+`spore unpack` and `spore pull` reject those bundles by default. Passing
+`--allow-metadata-only-rootfs` makes materialization verify that the selected
+`SPOREVM_ROOTFS_CACHE_DIR` already contains the exact digest-addressed rootfs
+bytes; it still fails before writing a resumable spore if the cache entry is
+missing or mismatched.
+
 `spore pull file:///path/to/bundle --child 42 --out child.spore` does the same
 rootfs installation for indexed local bundles while materializing one selected
 child. `spore pull s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out

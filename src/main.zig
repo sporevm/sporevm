@@ -41,13 +41,13 @@ const usage =
     \\                      Mint child spores that share parent chunks
     \\  fanout <children-dir> [--for DURATION]
     \\                      Resume forked children concurrently with prefixed output
-    \\  pack <spore-dir> [--children DIR] --out DIR
+    \\  pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR
     \\                      Pack portable spore chunks into a local bundle
-    \\  unpack <bundle-dir> [--child ID] --out DIR
+    \\  unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR
     \\                      Unpack a local spore bundle into a spore dir
     \\  push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]
     \\                      Push an indexed bundle to an object store
-    \\  pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST [--child ID] --out DIR [--region REGION]
+    \\  pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]
     \\                      Pull one child into a spore dir
     \\  help                Show this help
     \\
@@ -224,6 +224,7 @@ fn packCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
     var spore_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var children_dir: ?[]const u8 = null;
+    var rootfs_policy: sporevm.bundle.RootfsBundlePolicy = .exact_bytes;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -233,6 +234,11 @@ fn packCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
         } else if (std.mem.eql(u8, args[i], "--children") and i + 1 < args.len) {
             i += 1;
             children_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--rootfs") and i + 1 < args.len) {
+            i += 1;
+            rootfs_policy = try parseRootfsBundlePolicy(args[i]);
+        } else if (std.mem.startsWith(u8, args[i], "--rootfs=")) {
+            rootfs_policy = try parseRootfsBundlePolicy(args[i]["--rootfs=".len..]);
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             std.debug.print("unknown pack argument: {s}\n", .{args[i]});
             std.process.exit(2);
@@ -245,7 +251,7 @@ fn packCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
     }
 
     if (spore_dir == null or out_dir == null) {
-        std.debug.print("usage: spore pack <spore-dir> [--children DIR] --out DIR\n", .{});
+        std.debug.print("usage: spore pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR\n", .{});
         std.process.exit(2);
     }
 
@@ -255,6 +261,7 @@ fn packCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
         .out_dir = out_dir.?,
         .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
         .children_dir = children_dir,
+        .rootfs_policy = rootfs_policy,
     });
 }
 
@@ -262,6 +269,7 @@ fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []c
     var bundle_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var child_id: ?[]const u8 = null;
+    var allow_metadata_only_rootfs = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -271,6 +279,8 @@ fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []c
         } else if (std.mem.eql(u8, args[i], "--child") and i + 1 < args.len) {
             i += 1;
             child_id = args[i];
+        } else if (std.mem.eql(u8, args[i], "--allow-metadata-only-rootfs")) {
+            allow_metadata_only_rootfs = true;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             std.debug.print("unknown unpack argument: {s}\n", .{args[i]});
             std.process.exit(2);
@@ -283,7 +293,7 @@ fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []c
     }
 
     if (bundle_dir == null or out_dir == null) {
-        std.debug.print("usage: spore unpack <bundle-dir> [--child ID] --out DIR\n", .{});
+        std.debug.print("usage: spore unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR\n", .{});
         std.process.exit(2);
     }
 
@@ -293,6 +303,7 @@ fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []c
         .out_dir = out_dir.?,
         .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
         .child_id = child_id,
+        .allow_metadata_only_rootfs = allow_metadata_only_rootfs,
     });
 }
 
@@ -337,6 +348,7 @@ fn pullCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
     var out_dir: ?[]const u8 = null;
     var child_id: ?[]const u8 = null;
     var aws_region: ?[]const u8 = null;
+    var allow_metadata_only_rootfs = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -349,6 +361,8 @@ fn pullCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
         } else if (std.mem.eql(u8, args[i], "--region") and i + 1 < args.len) {
             i += 1;
             aws_region = args[i];
+        } else if (std.mem.eql(u8, args[i], "--allow-metadata-only-rootfs")) {
+            allow_metadata_only_rootfs = true;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             std.debug.print("unknown pull argument: {s}\n", .{args[i]});
             std.process.exit(2);
@@ -361,7 +375,7 @@ fn pullCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
     }
 
     if (source == null or out_dir == null) {
-        std.debug.print("usage: spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST [--child ID] --out DIR [--region REGION]\n", .{});
+        std.debug.print("usage: spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]\n", .{});
         std.process.exit(2);
     }
 
@@ -372,8 +386,16 @@ fn pullCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
         .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
         .bundle_cache_dir = optionalBundleCacheRoot(allocator, init),
         .child_id = child_id,
+        .allow_metadata_only_rootfs = allow_metadata_only_rootfs,
         .aws_region = aws_region,
     });
+}
+
+fn parseRootfsBundlePolicy(value: []const u8) !sporevm.bundle.RootfsBundlePolicy {
+    if (std.mem.eql(u8, value, "exact") or std.mem.eql(u8, value, "exact-bytes")) return .exact_bytes;
+    if (std.mem.eql(u8, value, "metadata-only")) return .metadata_only;
+    std.debug.print("unknown rootfs bundle policy: {s}\n", .{value});
+    std.process.exit(2);
 }
 
 fn optionalRootfsCacheRoot(allocator: std.mem.Allocator, init: std.process.Init) ?[]const u8 {
@@ -433,6 +455,12 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "push") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "pull") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "help") != null);
+}
+
+test "rootfs bundle policy parser accepts exact and metadata-only spellings" {
+    try std.testing.expectEqual(sporevm.bundle.RootfsBundlePolicy.exact_bytes, try parseRootfsBundlePolicy("exact"));
+    try std.testing.expectEqual(sporevm.bundle.RootfsBundlePolicy.exact_bytes, try parseRootfsBundlePolicy("exact-bytes"));
+    try std.testing.expectEqual(sporevm.bundle.RootfsBundlePolicy.metadata_only, try parseRootfsBundlePolicy("metadata-only"));
 }
 
 test "resume dispatch can distinguish product and named lifecycle modes" {

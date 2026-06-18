@@ -67,9 +67,11 @@ the exact ext4 bytes at `rootfs/blake3/<hex>.ext4` after verifying the source
 digest-cache entry by BLAKE3 and size. `spore unpack` requires that bundled
 artifact, verifies it against the manifest, then installs it into the local
 rootfs digest cache before writing the unpacked manifest. Indexed bundles record
-that artifact in `rootfs.index.json` with an explicit `exact-bytes` policy.
-`metadata-only` is a recognized metadata policy, but materialized unpack rejects
-it until a later prepared-cache workflow exists.
+that artifact in `rootfs.index.json` with an explicit `exact-bytes` policy by
+default. `spore pack --children ... --rootfs=metadata-only` records the same
+digest and size with `metadata-only` policy and omits the ext4 file; materialized
+unpack and pull accept that policy only with `--allow-metadata-only-rootfs` and
+a verified hit in the selected rootfs digest cache.
 
 `spore pull file:///path/to/bundle --child 42 --out child.spore` is the first
 pull materialization policy. It accepts local indexed bundles, canonicalizes the
