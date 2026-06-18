@@ -117,21 +117,22 @@ possible preload input, not proof that local ext4 bytes are correct.
 
 ## Distribution Boundary
 
-Remote same-class fan-out needs a way to put exact rootfs bytes where resume can
-verify them. That implementation sequence belongs to
-`docs/plans/distribution.md`.
+Remote same-class fan-out needs exact rootfs bytes to stay available wherever
+resume verifies them. The remaining remote distribution and cache sequence
+belongs to `docs/plans/distribution.md`.
 
 The distribution plan currently owns:
 
-1. Make rootfs-backed distribution bundles include exact immutable rootfs bytes
-   by default. Defer metadata-only prepared-cache workflows until bundle metadata
-   exists.
-2. Prefer exact ext4 bytes over OCI rebuilds for the first remote demo, because
+1. Preserve default exact immutable rootfs artifact inclusion through remote
+   push/pull.
+2. Defer metadata-only prepared-cache workflows until there is an explicit CLI
+   and cache-preparation contract.
+3. Prefer exact ext4 bytes over OCI rebuilds for the first remote demo, because
    rebuilds can drift with tooling even when OCI provenance is stable.
-3. Document the same-class Linux/KVM aarch64 host requirement.
-4. Refuse remote resume when the rootfs is absent, hash-mismatched, or the host
+4. Document the same-class Linux/KVM aarch64 host requirement.
+5. Refuse remote resume when the rootfs is absent, hash-mismatched, or the host
    platform contract is incompatible.
-5. Keep rootfs artifacts distinct from memory chunks inside the broader
+6. Keep rootfs artifacts distinct from memory chunks inside the broader
    distribution bundle model.
 
 This plan remains the source for the rootfs-specific resume invariant: resume

@@ -114,7 +114,7 @@ state and broader disk manifests remain later work.
 | Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Disk manifests remain future work. |
 | Slice 4: fork and generation protocol | Complete for correctness | Keep fan-out identity smokes as regression coverage. |
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |
-| Slice 6: identical-host distribution | Active | Pull-based materialization, default rootfs artifact inclusion, cache hierarchy, and measured origin-egress efficiency beyond explicit relay trees. |
+| Slice 6: identical-host distribution | Active | Remote push/pull materialization, remote cache reuse metrics, and measured origin-egress efficiency beyond explicit relay trees. |
 | Slice 7: always-on dirty tracking | Complete for the foundation target | Keep dirty-tail and worker-stop benchmarks as release regressions; tune worker preemption only if the product SLO tightens. |
 | Slice 8: cross-backend diagnostic restore | Later diagnostic | HVF portable GIC producer and timer-frequency strategy. |
 
@@ -150,7 +150,8 @@ the mechanisms have landed. Regenerate current evidence with the scripts in
 Slice 6 starts from chunkpack bundles and remote restore smokes. Current evidence
 includes:
 
-- local pack/unpack with canonical `bundle_digest`;
+- local pack/unpack and `file://` pull materialization with canonical
+  `bundle_digest`;
 - two-host S3/SSM restore;
 - host-local cache reuse with repeated destination restores;
 - source-peer HTTP seeding that keeps destination S3-origin bytes at zero;
@@ -160,13 +161,14 @@ includes:
 What remains:
 
 1. Add the first remote `spore push` and `spore pull` store adapter for the
-   pull-based product distribution path.
+   pull-based product distribution path. S3 should land first because the
+   existing remote restore smoke path already uses S3 and SSM.
 2. Measure origin egress as a small multiple of unique chunk bytes across larger
    identical-host fleets.
 3. Keep corrupt peer/origin data rejected by chunk and rootfs verification.
 4. Complete node-local bundle cache reuse and metrics for repeated remote pulls.
-5. Keep immutable rootfs artifacts in the distribution path without blurring
-   memory chunks and rootfs bytes.
+5. Preserve default immutable rootfs artifact inclusion through remote
+   distribution without blurring memory chunks and rootfs bytes.
 
 Done when a multi-host fan-out demo restores one spore on every host in a test
 fleet, measures origin egress at a small multiple of unique chunk bytes, and
