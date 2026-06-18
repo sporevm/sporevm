@@ -38,9 +38,9 @@ the manifest contract.
 
 Rootfs-backed bundles are self-contained by default. If a selected manifest
 requires an immutable rootfs artifact, `spore pack` includes the exact ext4
-bytes named by the rootfs digest. Metadata-only rootfs behavior remains a later
-explicit prepared-cache workflow; materialized unpack and pull paths reject it
-until that workflow exists.
+bytes named by the rootfs digest. Metadata-only rootfs behavior is an explicit
+prepared-cache opt-out for indexed bundles, and materialized unpack/pull require
+both an allow flag and a verified destination cache hit.
 
 ## Problem
 
@@ -222,16 +222,20 @@ an attached rootfs fd.
   `origin_bytes_read`, `remote_bundle_cache_hit`, `chunk_bytes_fetched`, and
   rootfs cache hit/fetch metrics, then materializes through the same verified
   local content source as `file://` pull.
+- `spore pull http://PEER:PORT/spore.bundle@sha256:<bundle> --child ID --out DIR`
+  treats a peer as a static byte source, downloads only the canonical bundle
+  file set, verifies the bundle digest before materialization, reports
+  `peer_bytes_read`, and reuses the node-local remote bundle cache on repeated
+  pulls.
 - `spore pack --children DIR --rootfs=metadata-only` can emit an indexed bundle
   with rootfs metadata but no rootfs bytes after verifying the source rootfs
   cache; `spore unpack` and `spore pull` accept it only with
   `--allow-metadata-only-rootfs` and a verified destination cache hit.
 - Foundation Slice 6 has S3/SSM remote restore, host-local cache reuse,
-  source-peer HTTP seeding, corrupt-bundle rejection, and ten-instance star/tree
-  smoke evidence.
+  source-peer HTTP pull support, corrupt-bundle rejection, and ten-instance
+  star/tree smoke evidence.
 - `spore run --image`, `spore resume`, `spore fork`, and `spore fanout` support
   local immutable-rootfs fan-out.
-- Current distribution still has no peer-backed `pull`.
 
 ## Delivery Strategy
 
@@ -335,9 +339,7 @@ spore pull s3://sporevm-artifacts/runs/ruby.bundle@sha256:<bundle> \
 Done when two or more same-class Linux/KVM aarch64 hosts can independently pull
 different children, reject corrupted remote data, and report origin bytes read
 for the run. The direct-S3 path in `scripts/smoke-remote-bundle.sh` now uses
-`spore push` on the source and digest-pinned `spore pull` on destinations; peer
-tree modes stay on the older explicit bundle fetch path until peer sources move
-behind `pull`.
+`spore push` on the source and digest-pinned `spore pull` on destinations.
 
 ### Slice 5: Node-Local Cache Reuse
 
@@ -380,23 +382,43 @@ the rootfs digest in `rootfs.index.json`, fail normal materialized unpack/pull,
 fail the explicit allow path on an empty destination cache, and succeed only
 when the destination cache already contains the verified rootfs digest.
 
+### Slice 7: Digest-Pinned HTTP Peer Pull
+
+Status: implemented for static HTTP(S) bundle peers behind `spore pull`.
+
+Move source-peer and relay-peer transfer behind the product pull contract without
+introducing a peer daemon or changing the trust model. A peer is only a byte
+source: the bundle digest, selected manifest, BLAKE3 memory chunks, SHA256 pack
+segments, and rootfs artifact digests remain the authority.
+
+Candidate command:
+
+```console
+spore pull http://10.0.0.12:20000/spore.bundle@sha256:<bundle> \
+  --child 42 \
+  --out ruby-42.spore
+```
+
+Done when HTTP(S) pull sources require `@sha256:<bundle>`, reject mutable or
+path-ambiguous URLs, download only canonical files named by validated bundle
+metadata, verify the canonical bundle digest before writing `.complete`, report
+`peer_bytes_read`, hit the `remote/http/sha256/<bundle>` cache on repeated
+pulls, and fail closed on corrupt peer bytes. The remote bundle smoke now serves
+static bundle directories from source and relay hosts and uses product
+`spore pull http://...@sha256:<bundle>` for peer star/tree paths.
+
 ## Deferred Peer Distribution
 
-Lazy-pull and cache-only preheat are also deferred. They can fit behind the same
-`pull` contract later, but the first product path should keep the failure
-boundary simple: `pull` either materializes and verifies a child, or it fails
-before `resume` starts. The code should still preserve a lazy-capable resolver
-boundary so this deferred work is an additional source policy, not a rewrite of
-bundle parsing or resume.
+Lazy-pull, cache-only preheat, peer discovery, gossip, DHTs, torrent scheduling,
+range-level peer reuse, and scheduler-aware source selection are still deferred.
+They can fit behind the same `pull` contract later, but the shipped product path
+keeps the failure boundary simple: `pull` either materializes and verifies a
+child, or it fails before `resume` starts.
 
-Peer-assisted transfer can fit behind the same `pull` contract later. The useful
-ideas from Dragonfly, Nydus, torrent systems, and gossip protocols are local:
-content-addressed verification, range-level reuse, pull-through node caches,
-preheating, and scheduler-aware source selection.
-
-Do not build a peer protocol until direct object-store pull has numbers that
-show origin egress is the bottleneck. A later peer slice should keep the same
-rule: peers are byte sources, not trust roots.
+The static HTTP(S) source is intentionally not a peer protocol. It is the first
+peer-backed pull source because it proves the byte-source rule without adding
+daemon state: peers can deny service or serve stale/corrupt bytes, but they
+cannot become restore authority.
 
 ## Verification
 
@@ -419,6 +441,9 @@ rule: peers are byte sources, not trust roots.
   Linux/KVM aarch64 hosts, resume them, record origin bytes, and use
   `--dest-repeat 2 --cache-dir DIR` to prove repeated direct-S3 pulls on one
   host reuse the remote bundle and chunk cache.
+- Peer remote smoke: serve a bundle from a source or relay host over HTTP,
+  materialize destinations through `spore pull http://...@sha256:<bundle>`,
+  resume selected children, and record peer bytes separately from origin bytes.
 - Negative remote smoke: corrupt a bundle index, chunkpack segment, child
   manifest, and rootfs artifact, and confirm every path fails before VM boot.
 
@@ -450,11 +475,15 @@ rule: peers are byte sources, not trust roots.
   smoke infrastructure; OCI-layout or registry transport is follow-up work.
 - Multi-child bundling stays under `spore pack --children` until the artifact
   surface clearly outgrows `pack`/`unpack`.
+- Digest-pinned HTTP(S) is the first peer-backed `pull` source. It has no
+  discovery protocol; callers provide the peer URL, and SporeVM treats it as an
+  untrusted byte source.
 
 ## Deferred Work
 
-- Peer-backed `pull` should land only after direct object-store pulls have
-  enough measurements to show origin egress is the next bottleneck.
+- Peer daemon, peer discovery, range-level peer scheduling, lazy remote reads,
+  and cache-only preheat remain follow-up work behind the verified content
+  source boundary.
 
 ## Key Learnings From Pressure-Testing
 
@@ -480,5 +509,5 @@ rule: peers are byte sources, not trust roots.
   loader simple and preserve today's restore path. Compression or delta encoding
   should wait until manifest size shows up in measurements.
 - Peer-to-peer ideas are most useful as cache policy, not as a new trust model.
-  Peers can supply bytes later, but manifests, chunk ids, and rootfs digests stay
-  the authority.
+  Static HTTP(S) peers now supply bytes through `spore pull`, but manifests,
+  chunk ids, bundle digests, and rootfs digests stay the authority.

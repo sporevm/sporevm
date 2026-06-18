@@ -106,8 +106,10 @@ missing or mismatched.
 
 `spore pull file:///path/to/bundle --child 42 --out child.spore` does the same
 rootfs installation for indexed local bundles while materializing one selected
-child. `spore pull s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out
-child.spore` first verifies the remote bundle identity, then installs any
+child. Digest-pinned remote pulls, such as `spore pull
+s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out child.spore` and
+`spore pull http://peer:20000/spore.bundle@sha256:<bundle_digest> --child 42
+--out child.spore`, first verify the remote bundle identity, then install any
 bundled rootfs bytes through the same digest-cache path. Use
 `SPOREVM_ROOTFS_CACHE_DIR` to choose the destination rootfs digest cache and
 `SPOREVM_BUNDLE_CACHE_DIR` to choose the node-local bundle and memory chunk

@@ -123,6 +123,7 @@ pub const PullResult = struct {
     linked_chunk_count: usize = 0,
     copied_chunk_count: usize = 0,
     origin_bytes_read: u64 = 0,
+    peer_bytes_read: u64 = 0,
     remote_bundle_cache_hit: bool = false,
     rootfs_artifact_count: usize = 0,
     rootfs_payload_bytes: u64 = 0,
@@ -549,6 +550,16 @@ pub fn pull(allocator: std.mem.Allocator, options: PullOptions) Error!PullResult
         const cached = try materializeS3Bundle(allocator, options, remote);
         var result = try pullLocalIndexedBundle(allocator, options, cached.bundle_dir, options.source);
         result.origin_bytes_read = cached.origin_bytes_read;
+        result.remote_bundle_cache_hit = cached.cache_hit;
+        return result;
+    }
+    if (std.mem.startsWith(u8, options.source, "http://") or std.mem.startsWith(u8, options.source, "https://")) {
+        const remote = try parseHttpSource(allocator, options.source);
+        var client: std.http.Client = .{ .allocator = allocator, .io = options.io };
+        defer client.deinit();
+        const cached = try materializeHttpBundle(allocator, options, &client, remote);
+        var result = try pullLocalIndexedBundle(allocator, options, cached.bundle_dir, options.source);
+        result.peer_bytes_read = cached.origin_bytes_read;
         result.remote_bundle_cache_hit = cached.cache_hit;
         return result;
     }
@@ -1234,6 +1245,20 @@ const S3Source = struct {
     expected_digest: []const u8,
 };
 
+const HttpLocation = struct {
+    base_url: []const u8,
+
+    fn objectUrl(self: HttpLocation, allocator: std.mem.Allocator, rel_path: []const u8) Error![]const u8 {
+        try validateBundleRelPath(rel_path);
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.base_url, rel_path }) catch return error.OutOfMemory;
+    }
+};
+
+const HttpSource = struct {
+    location: HttpLocation,
+    expected_digest: []const u8,
+};
+
 const RemoteBundleMaterialization = struct {
     bundle_dir: []const u8,
     origin_bytes_read: u64,
@@ -1257,6 +1282,34 @@ fn parseS3Source(allocator: std.mem.Allocator, uri: []const u8) Error!S3Source {
     };
 }
 
+fn parseHttpSource(allocator: std.mem.Allocator, uri: []const u8) Error!HttpSource {
+    const marker = "@sha256:";
+    const marker_index = std.mem.lastIndexOf(u8, uri, marker) orelse return error.BadManifest;
+    const location_url = uri[0..marker_index];
+    const digest = uri[marker_index + marker.len ..];
+    try validateSha256DigestHex(digest);
+    return .{
+        .location = try parseHttpLocation(allocator, location_url),
+        .expected_digest = allocator.dupe(u8, digest) catch return error.OutOfMemory,
+    };
+}
+
+fn parseHttpLocation(allocator: std.mem.Allocator, raw_url: []const u8) Error!HttpLocation {
+    if (std.mem.indexOfScalar(u8, raw_url, '@') != null) return error.BadManifest;
+    if (std.mem.indexOfScalar(u8, raw_url, '%') != null) return error.BadManifest;
+    const trimmed = std.mem.trimEnd(u8, raw_url, "/");
+    if (trimmed.len == 0) return error.BadManifest;
+    const uri = std.Uri.parse(trimmed) catch return error.BadManifest;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.BadManifest;
+    if (uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.BadManifest;
+    const path = uriComponentText(uri.path);
+    if (path.len > 0) {
+        if (path[0] != '/') return error.BadManifest;
+        if (path.len > 1) try validateRelativeSegments(path[1..]);
+    }
+    return .{ .base_url = allocator.dupe(u8, trimmed) catch return error.OutOfMemory };
+}
+
 fn parseS3Location(allocator: std.mem.Allocator, uri: []const u8) Error!S3Location {
     const prefix = "s3://";
     if (!std.mem.startsWith(u8, uri, prefix)) return error.BadManifest;
@@ -1272,6 +1325,13 @@ fn parseS3Location(allocator: std.mem.Allocator, uri: []const u8) Error!S3Locati
     return .{
         .bucket = allocator.dupe(u8, bucket) catch return error.OutOfMemory,
         .prefix = allocator.dupe(u8, key) catch return error.OutOfMemory,
+    };
+}
+
+fn uriComponentText(component: std.Uri.Component) []const u8 {
+    return switch (component) {
+        .raw => |s| s,
+        .percent_encoded => |s| s,
     };
 }
 
@@ -1420,6 +1480,62 @@ fn materializeS3Bundle(
     };
 }
 
+fn materializeHttpBundle(
+    allocator: std.mem.Allocator,
+    options: PullOptions,
+    client: *std.http.Client,
+    source: HttpSource,
+) Error!RemoteBundleMaterialization {
+    const cache_root = options.bundle_cache_dir orelse return error.IoFailed;
+    const bundle_dir = try remoteBundleCacheBundleDir(allocator, cache_root, "http", source.expected_digest);
+    const complete_path = try remoteBundleCacheCompletePath(allocator, cache_root, "http", source.expected_digest);
+    if (try pathExistsNoSymlink(options.io, complete_path)) {
+        const cached_digest = try digestHex(allocator, bundle_dir);
+        if (!std.mem.eql(u8, cached_digest, source.expected_digest)) return error.BadChunk;
+        return .{
+            .bundle_dir = bundle_dir,
+            .origin_bytes_read = 0,
+            .cache_hit = true,
+        };
+    }
+
+    const cache_parent = try remoteBundleCacheParent(allocator, cache_root, "http");
+    try ensureDirPath(options.io, cache_parent);
+    var nonce_bytes: [8]u8 = undefined;
+    options.io.random(&nonce_bytes);
+    const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
+    const temp_dir = try pathZ(allocator, "{s}/.tmp-{s}-{x}", .{ cache_parent, source.expected_digest[0..16], nonce });
+    defer Io.Dir.cwd().deleteTree(options.io, temp_dir) catch {};
+    try ensureNewDir(temp_dir);
+    const temp_bundle_dir = try pathZ(allocator, "{s}/bundle", .{temp_dir});
+
+    const peer_bytes = try downloadHttpBundleToDir(allocator, options, client, source.location, temp_bundle_dir);
+    const downloaded_digest = try digestHex(allocator, temp_bundle_dir);
+    if (!std.mem.eql(u8, downloaded_digest, source.expected_digest)) return error.BadChunk;
+    const temp_complete = try pathZ(allocator, "{s}/.complete", .{temp_dir});
+    try writeFileAll(temp_complete, source.expected_digest);
+
+    const final_dir = try remoteBundleCacheDir(allocator, cache_root, "http", source.expected_digest);
+    renamePath(options.io, temp_dir, final_dir) catch |err| {
+        if (try pathExistsNoSymlink(options.io, complete_path)) {
+            const cached_digest = try digestHex(allocator, bundle_dir);
+            if (!std.mem.eql(u8, cached_digest, source.expected_digest)) return error.BadChunk;
+            return .{
+                .bundle_dir = bundle_dir,
+                .origin_bytes_read = 0,
+                .cache_hit = true,
+            };
+        }
+        return err;
+    };
+
+    return .{
+        .bundle_dir = bundle_dir,
+        .origin_bytes_read = peer_bytes,
+        .cache_hit = false,
+    };
+}
+
 fn downloadS3BundleToDir(
     allocator: std.mem.Allocator,
     options: PullOptions,
@@ -1465,6 +1581,53 @@ fn downloadS3BundleToDir(
     return origin_bytes;
 }
 
+fn downloadHttpBundleToDir(
+    allocator: std.mem.Allocator,
+    options: PullOptions,
+    client: *std.http.Client,
+    location: HttpLocation,
+    bundle_dir: []const u8,
+) Error!u64 {
+    try ensureNewDir(try pathZ(allocator, "{s}", .{bundle_dir}));
+
+    var peer_bytes: u64 = 0;
+    peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, bundle_index_path);
+
+    const parsed_bundle = try loadBundleIndex(allocator, bundle_dir);
+    defer parsed_bundle.deinit();
+    const bundle_index = parsed_bundle.value;
+
+    peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, bundle_index.parent_manifest);
+    for (bundle_index.children) |child| {
+        peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, child.manifest);
+    }
+    peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, index_path);
+
+    const parsed_chunk_index = try loadIndex(allocator, bundle_dir);
+    defer parsed_chunk_index.deinit();
+    _ = parsed_chunk_index.value.chunks.len;
+    peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, pack_path);
+
+    if (bundle_index.rootfs_index) |rootfs_index_rel| {
+        peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rootfs_index_rel);
+        const parsed_rootfs_index = try loadRootfsIndex(allocator, bundle_dir);
+        defer parsed_rootfs_index.deinit();
+        for (parsed_rootfs_index.value.artifacts) |artifact| {
+            if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
+                peer_bytes += try downloadHttpBundleFile(
+                    allocator,
+                    options,
+                    client,
+                    location,
+                    bundle_dir,
+                    artifact.path orelse return error.BadManifest,
+                );
+            }
+        }
+    }
+    return peer_bytes;
+}
+
 fn downloadS3BundleFile(
     allocator: std.mem.Allocator,
     options: PullOptions,
@@ -1478,6 +1641,61 @@ fn downloadS3BundleFile(
     const object_uri = try location.objectUri(allocator, rel_path);
     try runAwsS3Cp(allocator, options.io, options.aws_executable, object_uri, dest_path, options.aws_region);
     return fileSizeNoSymlink(options.io, dest_path);
+}
+
+fn downloadHttpBundleFile(
+    allocator: std.mem.Allocator,
+    options: PullOptions,
+    client: *std.http.Client,
+    location: HttpLocation,
+    bundle_dir: []const u8,
+    rel_path: []const u8,
+) Error!u64 {
+    try validateBundleRelPath(rel_path);
+    const dest_path = try pathZ(allocator, "{s}/{s}", .{ bundle_dir, rel_path });
+    if (std.fs.path.dirname(dest_path)) |parent| try ensureDirPath(options.io, parent);
+    const url = try location.objectUrl(allocator, rel_path);
+    return httpGetToFile(options.io, client, url, dest_path);
+}
+
+fn httpGetToFile(
+    io: Io,
+    client: *std.http.Client,
+    url: []const u8,
+    path: []const u8,
+) Error!u64 {
+    const uri = std.Uri.parse(url) catch return error.BadManifest;
+    var file = Io.Dir.cwd().createFile(io, path, .{}) catch return error.IoFailed;
+    errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer file.close(io);
+
+    var file_buffer: [64 * 1024]u8 = undefined;
+    var file_writer: Io.File.Writer = .initStreaming(file, io, &file_buffer);
+    var req = client.request(.GET, uri, .{
+        .headers = .{ .accept_encoding = .omit },
+        .extra_headers = &.{std.http.Header{ .name = "accept", .value = "application/octet-stream" }},
+        .redirect_behavior = .unhandled,
+    }) catch return error.IoFailed;
+    defer req.deinit();
+    req.sendBodiless() catch return error.IoFailed;
+    var header_buffer: [8 * 1024]u8 = undefined;
+    var response = req.receiveHead(&header_buffer) catch return error.IoFailed;
+    if (response.head.status != .ok) return error.BadChunk;
+
+    var transfer_buffer: [64 * 1024]u8 = undefined;
+    var body = response.reader(&transfer_buffer);
+    var copied: u64 = 0;
+    var copy_buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = body.readSliceShort(&copy_buffer) catch return error.IoFailed;
+        if (n == 0) break;
+        const n_u64: u64 = @intCast(n);
+        if (copied > std.math.maxInt(u64) - n_u64) return error.BadChunk;
+        copied += n_u64;
+        file_writer.interface.writeAll(copy_buffer[0..n]) catch return error.IoFailed;
+    }
+    file_writer.interface.flush() catch return error.IoFailed;
+    return copied;
 }
 
 fn runAwsS3Cp(
@@ -1525,22 +1743,42 @@ fn fileSizeNoSymlink(io: Io, path: []const u8) Error!u64 {
 }
 
 fn s3BundleCacheParent(allocator: std.mem.Allocator, cache_root: []const u8) Error![]const u8 {
-    return std.fs.path.join(allocator, &.{ cache_root, "remote", "s3", "sha256" }) catch return error.OutOfMemory;
+    return remoteBundleCacheParent(allocator, cache_root, "s3");
 }
 
 fn s3BundleCacheDir(allocator: std.mem.Allocator, cache_root: []const u8, digest: []const u8) Error![]const u8 {
-    try validateSha256DigestHex(digest);
-    return std.fs.path.join(allocator, &.{ cache_root, "remote", "s3", "sha256", digest }) catch return error.OutOfMemory;
+    return remoteBundleCacheDir(allocator, cache_root, "s3", digest);
 }
 
 fn s3BundleCacheBundleDir(allocator: std.mem.Allocator, cache_root: []const u8, digest: []const u8) Error![]const u8 {
-    try validateSha256DigestHex(digest);
-    return std.fs.path.join(allocator, &.{ cache_root, "remote", "s3", "sha256", digest, "bundle" }) catch return error.OutOfMemory;
+    return remoteBundleCacheBundleDir(allocator, cache_root, "s3", digest);
 }
 
 fn s3BundleCacheCompletePath(allocator: std.mem.Allocator, cache_root: []const u8, digest: []const u8) Error![]const u8 {
+    return remoteBundleCacheCompletePath(allocator, cache_root, "s3", digest);
+}
+
+fn remoteBundleCacheParent(allocator: std.mem.Allocator, cache_root: []const u8, source_kind: []const u8) Error![]const u8 {
+    try validateRelativeSegment(source_kind);
+    return std.fs.path.join(allocator, &.{ cache_root, "remote", source_kind, "sha256" }) catch return error.OutOfMemory;
+}
+
+fn remoteBundleCacheDir(allocator: std.mem.Allocator, cache_root: []const u8, source_kind: []const u8, digest: []const u8) Error![]const u8 {
+    try validateRelativeSegment(source_kind);
     try validateSha256DigestHex(digest);
-    return std.fs.path.join(allocator, &.{ cache_root, "remote", "s3", "sha256", digest, ".complete" }) catch return error.OutOfMemory;
+    return std.fs.path.join(allocator, &.{ cache_root, "remote", source_kind, "sha256", digest }) catch return error.OutOfMemory;
+}
+
+fn remoteBundleCacheBundleDir(allocator: std.mem.Allocator, cache_root: []const u8, source_kind: []const u8, digest: []const u8) Error![]const u8 {
+    try validateRelativeSegment(source_kind);
+    try validateSha256DigestHex(digest);
+    return std.fs.path.join(allocator, &.{ cache_root, "remote", source_kind, "sha256", digest, "bundle" }) catch return error.OutOfMemory;
+}
+
+fn remoteBundleCacheCompletePath(allocator: std.mem.Allocator, cache_root: []const u8, source_kind: []const u8, digest: []const u8) Error![]const u8 {
+    try validateRelativeSegment(source_kind);
+    try validateSha256DigestHex(digest);
+    return std.fs.path.join(allocator, &.{ cache_root, "remote", source_kind, "sha256", digest, ".complete" }) catch return error.OutOfMemory;
 }
 
 const ChildDir = struct {
@@ -1800,6 +2038,109 @@ fn testDir(allocator: std.mem.Allocator) ![]const u8 {
     return buf;
 }
 
+const StaticHttpBundleServer = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    bundle_dir: []const u8,
+    url_prefix: []const u8,
+    server: std.Io.net.Server,
+    thread: std.Thread,
+    closed: std.atomic.Value(bool),
+    request_count: std.atomic.Value(usize),
+
+    fn init(self: *StaticHttpBundleServer, allocator: std.mem.Allocator, io: Io, bundle_dir: []const u8, url_prefix: []const u8) !void {
+        var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .bundle_dir = bundle_dir,
+            .url_prefix = url_prefix,
+            .server = try address.listen(io, .{ .kernel_backlog = 8, .reuse_address = true }),
+            .thread = undefined,
+            .closed = .init(false),
+            .request_count = .init(0),
+        };
+        self.thread = try std.Thread.spawn(.{}, StaticHttpBundleServer.serveThread, .{self});
+    }
+
+    fn deinit(self: *StaticHttpBundleServer) void {
+        const wake_address = self.server.socket.address;
+        self.closed.store(true, .release);
+        if (wake_address.connect(self.io, .{ .mode = .stream })) |stream| {
+            stream.close(self.io);
+        } else |_| {}
+        self.server.deinit(self.io);
+        self.thread.join();
+    }
+
+    fn baseUrl(self: *StaticHttpBundleServer, allocator: std.mem.Allocator) ![]const u8 {
+        const port = self.server.socket.address.getPort();
+        if (self.url_prefix.len == 0) return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/{s}", .{ port, self.url_prefix });
+    }
+
+    fn serveThread(self: *StaticHttpBundleServer) void {
+        while (!self.closed.load(.acquire)) {
+            var stream = self.server.accept(self.io) catch {
+                if (self.closed.load(.acquire)) return;
+                continue;
+            };
+            self.handle(stream) catch {};
+            stream.close(self.io);
+        }
+    }
+
+    fn handle(self: *StaticHttpBundleServer, stream: std.Io.net.Stream) !void {
+        _ = self.request_count.fetchAdd(1, .monotonic);
+        var read_buffer: [8 * 1024]u8 = undefined;
+        var reader = stream.reader(self.io, &read_buffer);
+        const request_line_raw = reader.interface.takeDelimiterExclusive('\n') catch return;
+        const request_line = std.mem.trimEnd(u8, request_line_raw, "\r");
+        while (true) {
+            const header_raw = reader.interface.takeDelimiterExclusive('\n') catch return;
+            const header = std.mem.trimEnd(u8, header_raw, "\r");
+            if (header.len == 0) break;
+        }
+
+        const method_prefix = "GET ";
+        if (!std.mem.startsWith(u8, request_line, method_prefix)) return self.writeStatus(stream, 405);
+        const rest = request_line[method_prefix.len..];
+        const path_end = std.mem.indexOfScalar(u8, rest, ' ') orelse return self.writeStatus(stream, 400);
+        const path = rest[0..path_end];
+        if (path.len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, '?') != null) return self.writeStatus(stream, 404);
+        var rel_path = path[1..];
+        if (self.url_prefix.len > 0) {
+            if (!std.mem.startsWith(u8, rel_path, self.url_prefix)) return self.writeStatus(stream, 404);
+            rel_path = rel_path[self.url_prefix.len..];
+            if (rel_path.len == 0 or rel_path[0] != '/') return self.writeStatus(stream, 404);
+            rel_path = rel_path[1..];
+        }
+        validateBundleRelPath(rel_path) catch return self.writeStatus(stream, 404);
+        const file_path = try pathZ(self.allocator, "{s}/{s}", .{ self.bundle_dir, rel_path });
+        const data = readFileAll(self.allocator, file_path, std.math.maxInt(usize)) catch return self.writeStatus(stream, 404);
+        defer self.allocator.free(data);
+
+        var write_buffer: [8 * 1024]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        try writer.interface.print(
+            "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{data.len},
+        );
+        try writer.interface.writeAll(data);
+        try writer.interface.flush();
+    }
+
+    fn writeStatus(self: *StaticHttpBundleServer, stream: std.Io.net.Stream, status: u16) !void {
+        var write_buffer: [256]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        try writer.interface.print(
+            "HTTP/1.1 {d} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            .{status},
+        );
+        try writer.interface.flush();
+    }
+};
+
 fn writeFakeAwsScript(allocator: std.mem.Allocator, script_path: [:0]const u8, fake_s3_root: []const u8) !void {
     const script = try std.fmt.allocPrint(
         allocator,
@@ -1944,6 +2285,29 @@ fn fuzzRootfsIndexParse(_: void, s: *std.testing.Smith) !void {
 
 test "fuzz rootfs index parsing" {
     try std.testing.fuzz({}, fuzzRootfsIndexParse, .{});
+}
+
+fn fuzzHttpSourceParse(_: void, s: *std.testing.Smith) !void {
+    // HTTP peer pull sources are attacker-influenced URI strings. They must
+    // either fail closed or parse to a digest-pinned, path-safe base URL.
+    var buf: [1024]u8 = undefined;
+    const len = s.slice(&buf);
+    const parsed = parseHttpSource(std.testing.allocator, buf[0..len]) catch return;
+    defer std.testing.allocator.free(parsed.location.base_url);
+    defer std.testing.allocator.free(parsed.expected_digest);
+    try validateSha256DigestHex(parsed.expected_digest);
+    const uri = std.Uri.parse(parsed.location.base_url) catch return error.BadManifest;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.BadManifest;
+    if (uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.BadManifest;
+    const path = uriComponentText(uri.path);
+    if (path.len > 0) {
+        if (path[0] != '/') return error.BadManifest;
+        if (path.len > 1) try validateRelativeSegments(path[1..]);
+    }
+}
+
+test "fuzz http pull source parsing" {
+    try std.testing.fuzz({}, fuzzHttpSourceParse, .{});
 }
 
 test "pack and unpack chunkpack bundle strips local backing" {
@@ -2511,6 +2875,116 @@ test "push and pull s3 indexed bundle through verified remote cache" {
     }));
 }
 
+test "pull http indexed bundle through verified peer cache" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const out0_dir = try pathZ(arena, "{s}/http-pulled-0", .{root_dir});
+    const out1_dir = try pathZ(arena, "{s}/http-pulled-1", .{root_dir});
+    const out_bad_dir = try pathZ(arena, "{s}/http-pulled-bad", .{root_dir});
+    const pack_cache_root = try pathZ(arena, "{s}/pack-rootfs-cache", .{root_dir});
+    const pull_rootfs_cache = try pathZ(arena, "{s}/pull-rootfs-cache", .{root_dir});
+    const peer_cache_dir = try pathZ(arena, "{s}/peer-cache", .{root_dir});
+    const bad_peer_cache_dir = try pathZ(arena, "{s}/bad-peer-cache", .{root_dir});
+    const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
+
+    const ram = try arena.alloc(u8, spore.chunk_size + 23);
+    @memset(ram, 0);
+    ram[13] = 0x97;
+    ram[spore.chunk_size + 11] = 0x38;
+    const memory = try spore.saveMemory(arena, parent_dir, ram);
+    try writeFileAll(rootfs_source_path, "http peer rootfs artifact bytes");
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
+    try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 111, artifact));
+    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
+
+    const pack_result = try pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = bundle_dir,
+        .rootfs_cache_dir = pack_cache_root,
+        .children_dir = children_dir,
+    });
+    var expected_peer_bytes: u64 = 0;
+    const files = try indexedBundleFiles(arena, bundle_dir);
+    for (files) |rel_path| {
+        expected_peer_bytes += try fileSizeNoSymlink(io, try pathZ(arena, "{s}/{s}", .{ bundle_dir, rel_path }));
+    }
+
+    var server: StaticHttpBundleServer = undefined;
+    try server.init(arena, io, bundle_dir, "spore.bundle");
+    defer server.deinit();
+
+    const base_url = try server.baseUrl(arena);
+    const source_uri = try std.fmt.allocPrint(arena, "{s}@sha256:{s}", .{ base_url, pack_result.bundle_digest });
+    const pulled0 = try pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out0_dir,
+        .rootfs_cache_dir = pull_rootfs_cache,
+        .bundle_cache_dir = peer_cache_dir,
+        .child_id = "0",
+    });
+    try std.testing.expectEqualStrings("000000", pulled0.selected_child.?);
+    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled0.bundle_digest);
+    try std.testing.expect(!pulled0.remote_bundle_cache_hit);
+    try std.testing.expectEqual(@as(u64, 0), pulled0.origin_bytes_read);
+    try std.testing.expectEqual(expected_peer_bytes, pulled0.peer_bytes_read);
+    try std.testing.expectEqual(@as(usize, 2), pulled0.cache_miss_count);
+    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.chunk_bytes_fetched);
+    try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs_cache_hit_count);
+    try std.testing.expectEqual(@as(usize, 1), pulled0.rootfs_cache_miss_count);
+    try std.testing.expectEqual(artifact.size, pulled0.rootfs_bytes_fetched);
+
+    const pulled1 = try pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out1_dir,
+        .rootfs_cache_dir = pull_rootfs_cache,
+        .bundle_cache_dir = peer_cache_dir,
+        .child_id = "1",
+    });
+    try std.testing.expectEqualStrings("000001", pulled1.selected_child.?);
+    try std.testing.expect(pulled1.remote_bundle_cache_hit);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.origin_bytes_read);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.peer_bytes_read);
+    try std.testing.expectEqual(@as(usize, 2), pulled1.cache_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.chunk_bytes_fetched);
+    try std.testing.expectEqual(@as(usize, 1), pulled1.rootfs_cache_hit_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled1.rootfs_cache_miss_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.rootfs_bytes_fetched);
+
+    const restored_manifest = try spore.loadManifest(arena, out1_dir);
+    defer restored_manifest.deinit();
+    const restored_rootfs = restored_manifest.value.rootfs orelse return error.BadManifest;
+    const fd = try rootfs_cache.openVerifiedFromCache(io, arena, pull_rootfs_cache, restored_rootfs);
+    _ = std.c.close(fd);
+    const out = try arena.alloc(u8, ram.len);
+    @memset(out, 0xCC);
+    try spore.loadMemory(arena, out1_dir, restored_manifest.value.memory, out);
+    try std.testing.expectEqualSlices(u8, ram, out);
+
+    const remote_pack_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, pack_path });
+    const data = try readFileAll(arena, remote_pack_path, 2 * spore.chunk_size);
+    data[0] ^= 0x22;
+    try writeFileAll(remote_pack_path, data);
+    try std.testing.expectError(error.BadChunk, pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out_bad_dir,
+        .rootfs_cache_dir = pull_rootfs_cache,
+        .bundle_cache_dir = bad_peer_cache_dir,
+        .child_id = "1",
+    }));
+}
+
 test "pull fails closed on corrupt chunk cache entries" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2586,6 +3060,24 @@ test "pull rejects mutable or ambiguous sources" {
         .source = "file:///tmp/with%20escape.bundle",
         .out_dir = "zig-cache/pull-escaped",
     }));
+}
+
+test "http uri parser requires immutable digest and path-safe source" {
+    const allocator = std.testing.allocator;
+    const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expectError(error.BadManifest, parseHttpSource(allocator, "http://127.0.0.1:20000/spore.bundle"));
+    try std.testing.expectError(error.BadManifest, parseHttpSource(allocator, "http://127.0.0.1:20000/spore.bundle@sha256:not-hex"));
+    try std.testing.expectError(error.BadManifest, parseHttpSource(allocator, "http://user@127.0.0.1:20000/spore.bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    try std.testing.expectError(error.BadManifest, parseHttpSource(allocator, "http://127.0.0.1:20000/runs/../spore.bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    try std.testing.expectError(error.BadManifest, parseHttpSource(allocator, "http://127.0.0.1:20000/spore.bundle?mutable=1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+
+    const source = try std.fmt.allocPrint(allocator, "http://127.0.0.1:20000/spore.bundle/@sha256:{s}", .{digest});
+    defer allocator.free(source);
+    const parsed = try parseHttpSource(allocator, source);
+    defer allocator.free(parsed.location.base_url);
+    defer allocator.free(parsed.expected_digest);
+    try std.testing.expectEqualStrings("http://127.0.0.1:20000/spore.bundle", parsed.location.base_url);
+    try std.testing.expectEqualStrings(digest, parsed.expected_digest);
 }
 
 test "s3 uri parser requires immutable digest for sources" {

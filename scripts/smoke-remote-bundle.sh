@@ -11,18 +11,19 @@ usage:
     --bucket BUCKET [options]
 
 Capture a spore on one SSM-managed KVM host, pack it into a chunkpack bundle,
-stage the bundle in S3, then unpack and resume it on one or more compatible KVM
+stage the bundle in S3, then pull and resume it on one or more compatible KVM
 hosts. The script uploads tracked HEAD plus the current tracked/staged diff to
 S3 so it can validate local changes before they are committed without copying
 stray untracked files. Destinations fetch directly from S3 by default; pass
-`--source-peer-ip IP` to have destinations fetch the bundle from a temporary
-HTTP seed on the source host instead. Pass `--cache-dir` and `--dest-repeat N`
-to prove repeated restores on one host can reuse a host-local bundle cache
-without refetching from S3 or the source peer. Each destination also corrupts a
-fetched bundle copy and asserts `spore unpack` rejects it before the normal
-restore path is counted successful. Pass `--tree-relay INSTANCE_ID:IP` one or
-more times to make relays fetch from the source peer, resume once, then serve
-the same bundle to leaf destinations.
+`--source-peer-ip IP` to have destinations use digest-pinned `spore pull`
+against a temporary HTTP seed on the source host instead. Pass `--cache-dir`
+and `--dest-repeat N` to prove repeated restores on one host can reuse a
+host-local bundle cache without refetching from S3 or the source peer. Each
+destination also corrupts a fetched bundle copy and asserts `spore unpack`
+rejects it before the normal restore path is counted successful. Pass
+`--tree-relay INSTANCE_ID:IP` one or more times to make relays pull from the
+source peer, resume once, then serve the same verified bundle cache to leaf
+destinations.
 
 Options:
   --region REGION             AWS region for SSM and S3
@@ -35,7 +36,7 @@ Options:
   --resume-seconds N          seconds to let resumed VM tick (default: 5)
   --dest-repeat N             restore each destination N times (default: 1)
   --cache-dir DIR             remote host-local bundle cache directory
-  --source-peer-ip IP         source host IP destinations use for HTTP bundle fetches
+  --source-peer-ip IP         source host IP destinations use for HTTP bundle pulls
   --source-peer-port N        source host HTTP port (default: 20000)
   --tree-relay ID:IP          relay instance and private IP for source→relay→leaf fan-out
                               (repeatable; relays also run one resume)
@@ -405,14 +406,19 @@ bundle_bytes="\$(du -sb "\${workdir}/spore.bundle" | awk '{print \$1}')"
 unique_chunk_bytes="\$(du -sb "\${workdir}/spore.bundle/chunkpacks/000000.pack" | awk '{print \$1}')"
 bundle_key="\$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["bundle_digest"])' "\${workdir}/pack-result.json")"
 packed_chunks="\$(find "\${workdir}/spore.bundle/chunkpacks" -type f | wc -l | tr -d ' ')"
-bundle_archive_bytes=0
+served_bundle_bytes=0
 source_peer_url=""
 if [[ -n "\${source_peer_ip}" ]]; then
-  mkdir -p "\${workdir}/peer-www"
-  tar -cf "\${workdir}/peer-www/spore.bundle.tar" -C "\${workdir}" spore.bundle
-  bundle_archive_bytes="\$(wc -c <"\${workdir}/peer-www/spore.bundle.tar" | tr -d ' ')"
-  source_peer_url="http://\${source_peer_ip}:\${source_peer_port}/spore.bundle.tar"
-  nohup python3 -m http.server "\${source_peer_port}" --bind 0.0.0.0 --directory "\${workdir}/peer-www" >"\${workdir}/peer-http.log" 2>&1 &
+  served_bundle_bytes="\$(python3 - "\${workdir}/spore.bundle" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+print(sum(path.stat().st_size for path in root.rglob("*") if path.is_file()))
+PY
+)"
+  source_peer_url="http://\${source_peer_ip}:\${source_peer_port}/spore.bundle"
+  nohup python3 -m http.server "\${source_peer_port}" --bind 0.0.0.0 --directory "\${workdir}" >"\${workdir}/peer-http.log" 2>&1 &
   printf '%s\n' "\$!" >"\${workdir}/peer-http.pid"
   sleep 1
   if ! kill -0 "\$(cat "\${workdir}/peer-http.pid")" 2>/dev/null; then
@@ -431,7 +437,7 @@ cat >"\${workdir}/source-result.json" <<JSON
   "bundle_bytes": \${bundle_bytes},
   "unique_chunk_bytes": \${unique_chunk_bytes},
   "bundle_key": "\${bundle_key}",
-  "bundle_archive_bytes": \${bundle_archive_bytes},
+  "served_bundle_bytes": \${served_bundle_bytes},
   "pack_files": \${packed_chunks},
   "bundle_s3_uri": "s3://\${bucket}/\${run_prefix}/spore.bundle/",
   "source_peer_url": "\${source_peer_url}"
@@ -500,95 +506,6 @@ json_field() {
   python3 -c 'import json, sys; value=json.load(open(sys.argv[1], encoding="utf-8"))[sys.argv[2]]; print(str(value).lower() if isinstance(value, bool) else value)' "\$1" "\$2"
 }
 
-fetch_bundle() {
-  local out_dir="\$1"
-  local origin_bytes_var="\$2"
-  local peer_bytes_var="\$3"
-
-  rm -rf "\${out_dir}"
-  if [[ -n "\${peer_ip}" ]]; then
-    local tar_path="\${out_dir}.tar"
-    mkdir -p "\$(dirname "\${out_dir}")"
-    python3 - "\${peer_ip}" "\${source_peer_port}" "\${tar_path}" <<'PY'
-import sys
-import urllib.request
-
-ip, port, out_path = sys.argv[1:4]
-url = f"http://{ip}:{port}/spore.bundle.tar"
-with urllib.request.urlopen(url, timeout=300) as response, open(out_path, "wb") as out:
-    while True:
-        chunk = response.read(1024 * 1024)
-        if not chunk:
-            break
-        out.write(chunk)
-PY
-    local peer_download_size
-    peer_download_size="\$(wc -c <"\${tar_path}" | tr -d ' ')"
-    while IFS= read -r member; do
-      case "\${member}" in
-        spore.bundle|spore.bundle/*) ;;
-        *) echo "unexpected peer bundle tar member: \${member}" >&2; exit 1 ;;
-      esac
-      case "\${member}" in
-        /*|..|../*|*/..|*/../*) echo "unsafe peer bundle tar member: \${member}" >&2; exit 1 ;;
-      esac
-    done < <(tar -tf "\${tar_path}")
-    tar -xf "\${tar_path}" -C "\$(dirname "\${out_dir}")"
-    rm -f "\${tar_path}"
-    [[ -d "\${out_dir}" ]] || { echo "peer bundle extraction did not create \${out_dir}" >&2; exit 1; }
-    printf -v "\${origin_bytes_var}" '%s' 0
-    printf -v "\${peer_bytes_var}" '%s' "\${peer_download_size}"
-    return
-  fi
-
-  mkdir -p "\${out_dir}"
-  aws s3 cp "s3://\${bucket}/\${run_prefix}/spore.bundle/" "\${out_dir}" --recursive --region "\${region}" --only-show-errors
-  local direct_bytes
-  direct_bytes="\$(du -sb "\${out_dir}" | awk '{print \$1}')"
-  printf -v "\${origin_bytes_var}" '%s' "\${direct_bytes}"
-  printf -v "\${peer_bytes_var}" '%s' 0
-}
-
-materialize_bundle() {
-  local out_dir="\$1"
-  local cache_hit_var="\$2"
-  local origin_bytes_var="\$3"
-  local peer_bytes_var="\$4"
-
-  if [[ -z "\${cache_dir}" ]]; then
-    fetch_bundle "\${out_dir}" origin_bytes peer_bytes
-    printf -v "\${cache_hit_var}" '%s' false
-    printf -v "\${origin_bytes_var}" '%s' "\${origin_bytes}"
-    printf -v "\${peer_bytes_var}" '%s' "\${peer_bytes}"
-    return
-  fi
-
-  local cache_bundle_dir="\${cache_dir}/\${bundle_key}/spore.bundle"
-  local cache_complete="\${cache_dir}/\${bundle_key}/.complete"
-  if [[ -f "\${cache_complete}" ]]; then
-    mkdir -p "\${out_dir}"
-    cp -R "\${cache_bundle_dir}/." "\${out_dir}/"
-    printf -v "\${cache_hit_var}" '%s' true
-    printf -v "\${origin_bytes_var}" '%s' 0
-    printf -v "\${peer_bytes_var}" '%s' 0
-    return
-  fi
-
-  local cache_tmp="\${cache_dir}/.tmp-\${bundle_key}-\${safe_dest}-\$\$"
-  rm -rf "\${cache_tmp}"
-  fetch_bundle "\${cache_tmp}/spore.bundle" fetched_origin_bytes fetched_peer_bytes
-  mkdir -p "\${cache_dir}/\${bundle_key}"
-  rm -rf "\${cache_bundle_dir}"
-  mv "\${cache_tmp}/spore.bundle" "\${cache_bundle_dir}"
-  : >"\${cache_complete}"
-  rm -rf "\${cache_tmp}"
-  mkdir -p "\${out_dir}"
-  cp -R "\${cache_bundle_dir}/." "\${out_dir}/"
-  printf -v "\${cache_hit_var}" '%s' false
-  printf -v "\${origin_bytes_var}" '%s' "\${fetched_origin_bytes}"
-  printf -v "\${peer_bytes_var}" '%s' "\${fetched_peer_bytes}"
-}
-
 assert_corrupt_bundle_rejected() {
   local bundle_dir="\$1"
   local iteration="\$2"
@@ -623,7 +540,7 @@ start_peer_server() {
   local serve_dir="\${workdir}/peer-www"
   rm -rf "\${serve_dir}"
   mkdir -p "\${serve_dir}"
-  tar -cf "\${serve_dir}/spore.bundle.tar" -C "\$(dirname "\${bundle_dir}")" "\$(basename "\${bundle_dir}")"
+  ln -s "\${bundle_dir}" "\${serve_dir}/spore.bundle"
   nohup python3 -m http.server "\${source_peer_port}" --bind 0.0.0.0 --directory "\${serve_dir}" >"\${workdir}/peer-http.log" 2>&1 &
   printf '%s\n' "\$!" >"\${workdir}/peer-http.pid"
   sleep 1
@@ -631,7 +548,13 @@ start_peer_server() {
     cat "\${workdir}/peer-http.log" >&2 || true
     exit 1
   fi
-  wc -c <"\${serve_dir}/spore.bundle.tar" | tr -d ' '
+  python3 - "\${bundle_dir}" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+print(sum(path.stat().st_size for path in root.rglob("*") if path.is_file()))
+PY
 }
 
 if [[ -n "\${cache_dir}" ]]; then
@@ -649,7 +572,7 @@ cache_hits=0
 cache_misses=0
 corrupt_bundle_rejections=0
 local_bundle_bytes=0
-served_bundle_archive_bytes=0
+served_bundle_bytes=0
 unpacked_chunks=0
 iteration_json=""
 for iteration in \$(seq 1 "\${dest_repeat}"); do
@@ -659,52 +582,55 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   unpack_result="\${iter_dir}/unpack-result.json"
   child_base=\$((10#\${child_id}))
   iteration_child_id="\${child_base}"
-  if [[ -z "\${peer_ip}" ]]; then
-    iteration_child_id="\$(( (child_base + iteration - 1) % child_count ))"
-  fi
+  iteration_child_id="\$(( (child_base + iteration - 1) % child_count ))"
   selected_child=""
   chunk_bytes_fetched=0
   rootfs_artifact_count=0
   rootfs_bytes_fetched=0
   rootfs_cache_hits=0
   rootfs_cache_misses=0
+  mkdir -p "\${iter_dir}"
+  if [[ -n "\${cache_dir}" ]]; then
+    pull_bundle_cache="\${cache_dir}"
+  else
+    pull_bundle_cache="\${iter_dir}/bundle-cache"
+  fi
+  pull_rootfs_cache="\${pull_bundle_cache}/rootfs-cache"
   if [[ -z "\${peer_ip}" ]]; then
-    mkdir -p "\${iter_dir}"
-    if [[ -n "\${cache_dir}" ]]; then
-      pull_bundle_cache="\${cache_dir}"
-    else
-      pull_bundle_cache="\${iter_dir}/bundle-cache"
-    fi
     pull_source="s3://\${bucket}/\${run_prefix}/spore.bundle@sha256:\${bundle_key}"
-    pull_rootfs_cache="\${pull_bundle_cache}/rootfs-cache"
     SPOREVM_BUNDLE_CACHE_DIR="\${pull_bundle_cache}" \
       SPOREVM_ROOTFS_CACHE_DIR="\${pull_rootfs_cache}" \
       zig-out/bin/spore pull "\${pull_source}" --child "\${iteration_child_id}" --out "\${unpacked_dir}" --region "\${region}" | tee "\${unpack_result}"
-    cache_hit="\$(json_field "\${unpack_result}" remote_bundle_cache_hit)"
-    origin_bytes="\$(json_field "\${unpack_result}" origin_bytes_read)"
-    selected_child="\$(json_field "\${unpack_result}" selected_child)"
-    chunk_bytes_fetched="\$(json_field "\${unpack_result}" chunk_bytes_fetched)"
-    rootfs_artifact_count="\$(json_field "\${unpack_result}" rootfs_artifact_count)"
-    rootfs_bytes_fetched="\$(json_field "\${unpack_result}" rootfs_bytes_fetched)"
-    rootfs_cache_hits="\$(json_field "\${unpack_result}" rootfs_cache_hit_count)"
-    rootfs_cache_misses="\$(json_field "\${unpack_result}" rootfs_cache_miss_count)"
-    expected_child="\$(printf '%06d' "\${iteration_child_id}")"
-    if [[ "\${selected_child}" != "\${expected_child}" ]]; then
-      echo "spore pull selected child \${selected_child}, expected \${expected_child}" >&2
-      exit 1
-    fi
-    if [[ -n "\${cache_dir}" && "\${iteration}" -gt 1 ]]; then
-      [[ "\${cache_hit}" == "true" ]] || { echo "repeat pull did not hit remote bundle cache" >&2; exit 1; }
-      [[ "\${origin_bytes}" == "0" ]] || { echo "repeat pull fetched \${origin_bytes} origin bytes, expected 0" >&2; exit 1; }
-      [[ "\${chunk_bytes_fetched}" == "0" ]] || { echo "repeat pull fetched \${chunk_bytes_fetched} chunk bytes, expected 0" >&2; exit 1; }
-      if [[ "\${rootfs_artifact_count}" -gt 0 ]]; then
-        [[ "\${rootfs_bytes_fetched}" == "0" ]] || { echo "repeat pull fetched \${rootfs_bytes_fetched} rootfs bytes, expected 0" >&2; exit 1; }
-      fi
-    fi
-    peer_bytes=0
     bundle_dir="\${pull_bundle_cache}/remote/s3/sha256/\${bundle_key}/bundle"
   else
-    materialize_bundle "\${bundle_dir}" cache_hit origin_bytes peer_bytes
+    pull_source="http://\${peer_ip}:\${source_peer_port}/spore.bundle@sha256:\${bundle_key}"
+    SPOREVM_BUNDLE_CACHE_DIR="\${pull_bundle_cache}" \
+      SPOREVM_ROOTFS_CACHE_DIR="\${pull_rootfs_cache}" \
+      zig-out/bin/spore pull "\${pull_source}" --child "\${iteration_child_id}" --out "\${unpacked_dir}" | tee "\${unpack_result}"
+    bundle_dir="\${pull_bundle_cache}/remote/http/sha256/\${bundle_key}/bundle"
+  fi
+  cache_hit="\$(json_field "\${unpack_result}" remote_bundle_cache_hit)"
+  origin_bytes="\$(json_field "\${unpack_result}" origin_bytes_read)"
+  peer_bytes="\$(json_field "\${unpack_result}" peer_bytes_read)"
+  selected_child="\$(json_field "\${unpack_result}" selected_child)"
+  chunk_bytes_fetched="\$(json_field "\${unpack_result}" chunk_bytes_fetched)"
+  rootfs_artifact_count="\$(json_field "\${unpack_result}" rootfs_artifact_count)"
+  rootfs_bytes_fetched="\$(json_field "\${unpack_result}" rootfs_bytes_fetched)"
+  rootfs_cache_hits="\$(json_field "\${unpack_result}" rootfs_cache_hit_count)"
+  rootfs_cache_misses="\$(json_field "\${unpack_result}" rootfs_cache_miss_count)"
+  expected_child="\$(printf '%06d' "\${iteration_child_id}")"
+  if [[ "\${selected_child}" != "\${expected_child}" ]]; then
+    echo "spore pull selected child \${selected_child}, expected \${expected_child}" >&2
+    exit 1
+  fi
+  if [[ -n "\${cache_dir}" && "\${iteration}" -gt 1 ]]; then
+    [[ "\${cache_hit}" == "true" ]] || { echo "repeat pull did not hit remote bundle cache" >&2; exit 1; }
+    [[ "\${origin_bytes}" == "0" ]] || { echo "repeat pull fetched \${origin_bytes} origin bytes, expected 0" >&2; exit 1; }
+    [[ "\${peer_bytes}" == "0" ]] || { echo "repeat pull fetched \${peer_bytes} peer bytes, expected 0" >&2; exit 1; }
+    [[ "\${chunk_bytes_fetched}" == "0" ]] || { echo "repeat pull fetched \${chunk_bytes_fetched} chunk bytes, expected 0" >&2; exit 1; }
+    if [[ "\${rootfs_artifact_count}" -gt 0 ]]; then
+      [[ "\${rootfs_bytes_fetched}" == "0" ]] || { echo "repeat pull fetched \${rootfs_bytes_fetched} rootfs bytes, expected 0" >&2; exit 1; }
+    fi
   fi
   if [[ "\${cache_hit}" == "true" ]]; then
     cache_hits=\$((cache_hits + 1))
@@ -726,16 +652,13 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
     corrupt_bundle_rejections=\$((corrupt_bundle_rejections + 1))
     corrupt_rejected=true
   fi
-  if [[ -n "\${peer_ip}" ]]; then
-    zig-out/bin/spore unpack "\${bundle_dir}" --out "\${unpacked_dir}" | tee "\${unpack_result}"
-  fi
   unpack_bundle_key="\$(json_field "\${unpack_result}" bundle_digest)"
   if [[ "\${unpack_bundle_key}" != "\${bundle_key}" ]]; then
     echo "unpacked bundle digest mismatch: expected \${bundle_key}, got \${unpack_bundle_key}" >&2
     exit 1
   fi
   if [[ "\${serve_bundle}" == "1" && "\${iteration}" == "1" ]]; then
-    served_bundle_archive_bytes="\$(start_peer_server "\${bundle_dir}")"
+    served_bundle_bytes="\$(start_peer_server "\${bundle_dir}")"
   fi
   scripts/smoke-restore-leg.sh resume \
     --backend kvm \
@@ -769,7 +692,7 @@ cat >"\${workdir}/dest-result.json" <<JSON
   "workdir": "\${workdir}",
   "upstream_peer_ip": "\${peer_ip}",
   "serves_bundle": \${serves_bundle},
-  "served_bundle_archive_bytes": \${served_bundle_archive_bytes},
+  "served_bundle_bytes": \${served_bundle_bytes},
   "downloaded_bundle_bytes": \${total_download_bytes},
   "origin_downloaded_bundle_bytes": \${total_origin_bytes},
   "peer_downloaded_bundle_bytes": \${total_peer_bytes},

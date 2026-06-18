@@ -87,8 +87,15 @@ S3 by uploading only the canonical files named by the validated bundle metadata.
 child.spore` downloads that exact object set into the node-local bundle cache,
 checks the canonical `bundle_digest`, then uses the same chunk and rootfs
 verification path as local pull. Bare S3 URLs are rejected for pull because the
-remote URL is not restore authority. Pull results report cache accounting for
-the materialization path: `origin_bytes_read`, `remote_bundle_cache_hit`,
+remote URL is not restore authority.
+
+`spore pull http://peer:20000/spore.bundle@sha256:<bundle_digest> --child 42
+--out child.spore` uses the same verified materialization path for a static
+HTTP(S) peer source. The peer URL is only a byte source: it must be digest
+pinned, redirects and mutable URL components are rejected, and corrupt peer
+bytes fail before the local cache is marked complete. Pull results report cache
+accounting for the materialization path: `origin_bytes_read` for object-store
+sources, `peer_bytes_read` for HTTP(S) peer sources, `remote_bundle_cache_hit`,
 `chunk_bytes_fetched`, and rootfs cache hit/fetch counters.
 
 ## Manifest v0
@@ -184,10 +191,12 @@ the materialization path: `origin_bytes_read`, `remote_bundle_cache_hit`,
 - Indexed bundles validate `bundle.json` child ids and relative manifest paths
   before selecting a parent or child manifest. `spore unpack --child 000042`
   writes a normal spore directory for the selected child.
-- Local `spore pull file://... --child 42` uses the same manifest authority but
-  reads chunks through a verified content-source boundary and fails closed on
-  unsupported URI schemes, non-canonical bundle metadata, corrupt chunkpacks, or
-  corrupt node-local chunk cache entries.
+- Local `spore pull file://... --child 42` and remote digest-pinned
+  `s3://...@sha256:<bundle>` / `http(s)://...@sha256:<bundle>` pulls use the
+  same manifest authority but read chunks through a verified content-source
+  boundary and fail closed on unsupported URI schemes, non-canonical bundle
+  metadata, corrupt chunkpacks, corrupt remote bytes, or corrupt node-local
+  chunk cache entries.
 - Rootfs-backed bundles include exact immutable rootfs bytes by default. Bundle
   unpack refuses missing, symlinked, or digest-mismatched rootfs artifacts before
   writing a resumable spore.

@@ -134,11 +134,11 @@ state and broader disk manifests remain later work.
 - Same-host file-backed RAM sharing and lazy restore have proof paths on KVM and
   HVF. Trusted backing remains a same-host acceleration hint; chunks remain the
   portable verified source of truth.
-- `spore pack`, `spore unpack`, local `spore pull file://...`, and S3
-  `spore push`/digest-pinned `spore pull` provide the first distribution bundle
-  shape with rootfs artifact inclusion, multi-child indexes, `bundle_digest` for
-  cache identity, origin/cache byte reporting, and per-chunk verification for
-  trust.
+- `spore pack`, `spore unpack`, local `spore pull file://...`, S3
+  `spore push`/digest-pinned `spore pull`, and digest-pinned HTTP(S) peer
+  `spore pull` provide the first distribution bundle shape with rootfs artifact
+  inclusion, multi-child indexes, `bundle_digest` for cache identity,
+  origin/peer/cache byte reporting, and per-chunk verification for trust.
 - `spore run`, product `spore resume`, and `spore fanout` provide the first
   user-facing run/capture/fork/resume/fan-out path.
 
@@ -148,8 +148,8 @@ the mechanisms have landed. Regenerate current evidence with the scripts in
 
 ## Active Slice 6: Identical-Host Fan-Out Distribution
 
-Slice 6 starts from chunkpack bundles and remote restore smokes. Current evidence
-includes:
+Slice 6 starts from chunkpack bundles and remote restore smokes. Current
+implementation and evidence include:
 
 - local pack/unpack and `file://` pull materialization with canonical
   `bundle_digest`;
@@ -158,7 +158,8 @@ includes:
 - host-local cache reuse with repeated destination restores;
 - direct-S3 repeated-child pulls with remote bundle, chunk, rootfs, and origin
   byte metrics;
-- source-peer HTTP seeding that keeps destination S3-origin bytes at zero;
+- remote smoke harness support for source-peer HTTP pulls that keep destination
+  S3-origin bytes at zero while preserving digest-pinned product materialization;
 - corrupt-bundle rejection on destinations;
 - ten-instance star and source-to-relay-to-leaf smoke runs.
 

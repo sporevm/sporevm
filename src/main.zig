@@ -47,7 +47,7 @@ const usage =
     \\                      Unpack a local spore bundle into a spore dir
     \\  push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]
     \\                      Push an indexed bundle to an object store
-    \\  pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]
+    \\  pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]
     \\                      Pull one child into a spore dir
     \\  help                Show this help
     \\
@@ -375,7 +375,7 @@ fn pullCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
     }
 
     if (source == null or out_dir == null) {
-        std.debug.print("usage: spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]\n", .{});
+        std.debug.print("usage: spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]\n", .{});
         std.process.exit(2);
     }
 
