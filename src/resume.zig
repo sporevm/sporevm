@@ -151,9 +151,16 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         },
     };
 
-    switch (cause) {
-        .guest_off, .guest_reset => {},
-        else => return error.UnexpectedResumeExit,
+    if (comptime @hasField(@TypeOf(cause), "monitor_stopped")) {
+        switch (cause) {
+            .guest_off, .guest_reset => {},
+            .snapshotted, .probe_complete, .monitor_stopped => return error.UnexpectedResumeExit,
+        }
+    } else {
+        switch (cause) {
+            .guest_off, .guest_reset => {},
+            .snapshotted, .probe_complete => return error.UnexpectedResumeExit,
+        }
     }
     if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
 }
