@@ -202,22 +202,23 @@ an attached rootfs fd.
 
 ## Current State
 
-- `spore pack` and `spore unpack` round-trip one portable memory bundle with
-  `manifest.json`, `chunkpack.index.json`, chunkpacks, `bundle_digest`, and
-  chunk verification.
+- `spore pack` and `spore unpack` round-trip one portable memory/rootfs bundle
+  with `manifest.json`, `chunkpack.index.json`, chunkpacks, optional
+  `rootfs/blake3/<hex>.ext4` artifacts, `bundle_digest`, chunk verification,
+  and rootfs digest-cache installation.
 - Foundation Slice 6 has S3/SSM remote restore, host-local cache reuse,
   source-peer HTTP seeding, corrupt-bundle rejection, and ten-instance star/tree
   smoke evidence.
 - `spore run --image`, `spore resume`, `spore fork`, and `spore fanout` support
   local immutable-rootfs fan-out.
-- Rootfs identity is in the spore manifest, but exact rootfs bytes are not inside
-  current bundles.
 - Current `spore pack` accepts one spore directory and has no `--children`,
-  `push`, `pull`, or rootfs artifact policy.
+  `push`, `pull`, metadata-only rootfs mode, or multi-rootfs artifact index.
 
 ## Delivery Strategy
 
 ### Slice 1: Default Rootfs Artifacts In Existing Bundles
+
+Status: implemented for the existing single-spore bundle path.
 
 Teach the existing single-spore bundle path to carry exact immutable rootfs
 bytes by default. This closes the immediate gap for rootfs-backed remote resume

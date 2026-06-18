@@ -109,10 +109,10 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, command, "fanout")) {
         try sporevm.fanout.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "pack")) {
-        const result = try packCommand(arena, command_args);
+        const result = try packCommand(init, arena, command_args);
         try printJson(arena, stdout, result);
     } else if (std.mem.eql(u8, command, "unpack")) {
-        const result = try unpackCommand(arena, command_args);
+        const result = try unpackCommand(init, arena, command_args);
         try printJson(arena, stdout, result);
     } else if (std.mem.eql(u8, command, "help")) {
         try stdout.writeAll(usage);
@@ -210,7 +210,7 @@ fn forkCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.
     });
 }
 
-fn packCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.PackResult {
+fn packCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.PackResult {
     var spore_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
 
@@ -236,12 +236,14 @@ fn packCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.
     }
 
     return sporevm.bundle.pack(allocator, .{
+        .io = init.io,
         .spore_dir = spore_dir.?,
         .out_dir = out_dir.?,
+        .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
     });
 }
 
-fn unpackCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.UnpackResult {
+fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.UnpackResult {
     var bundle_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
 
@@ -267,9 +269,15 @@ fn unpackCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporev
     }
 
     return sporevm.bundle.unpack(allocator, .{
+        .io = init.io,
         .bundle_dir = bundle_dir.?,
         .out_dir = out_dir.?,
+        .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
     });
+}
+
+fn optionalRootfsCacheRoot(allocator: std.mem.Allocator, init: std.process.Init) ?[]const u8 {
+    return sporevm.local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch null;
 }
 
 const InspectSummary = struct {

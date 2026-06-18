@@ -9,18 +9,24 @@
 const std = @import("std");
 const chunklib = @import("chunk.zig");
 const gicv3 = @import("gicv3.zig");
+const rootfs_cache = @import("rootfs_cache.zig");
 const spore = @import("spore.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Io = std.Io;
 
 const Error = spore.Error;
 
 pub const index_version: u32 = 0;
 pub const index_path = "chunkpack.index.json";
 pub const pack_path = "chunkpacks/000000.pack";
+pub const rootfs_dir_path = "rootfs";
+pub const rootfs_blake3_dir_path = "rootfs/blake3";
 
 pub const PackOptions = struct {
+    io: Io,
     spore_dir: []const u8,
     out_dir: []const u8,
+    rootfs_cache_dir: ?[]const u8 = null,
 };
 
 pub const PackResult = struct {
@@ -31,11 +37,15 @@ pub const PackResult = struct {
     packed_chunk_count: usize,
     pack_count: usize,
     payload_bytes: u64,
+    rootfs_artifact_count: usize = 0,
+    rootfs_payload_bytes: u64 = 0,
 };
 
 pub const UnpackOptions = struct {
+    io: Io,
     bundle_dir: []const u8,
     out_dir: []const u8,
+    rootfs_cache_dir: ?[]const u8 = null,
 };
 
 pub const UnpackResult = struct {
@@ -45,6 +55,8 @@ pub const UnpackResult = struct {
     chunk_count: usize,
     unpacked_chunk_count: usize,
     payload_bytes: u64,
+    rootfs_artifact_count: usize = 0,
+    rootfs_payload_bytes: u64 = 0,
 };
 
 pub const IndexChunk = struct {
@@ -109,6 +121,7 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
         payload_bytes += @intCast(data.len);
     }
 
+    const rootfs_payload_bytes = try packRootfsArtifact(allocator, options, manifest);
     try spore.saveManifest(allocator, options.out_dir, manifest);
     try saveIndex(allocator, options.out_dir, .{
         .chunk_size = spore.chunk_size,
@@ -124,6 +137,8 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
         .packed_chunk_count = entry_count,
         .pack_count = 1,
         .payload_bytes = payload_bytes,
+        .rootfs_artifact_count = if (manifest.rootfs == null) 0 else 1,
+        .rootfs_payload_bytes = rootfs_payload_bytes,
     };
 }
 
@@ -173,6 +188,7 @@ pub fn unpack(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unpack
         payload_bytes += @intCast(data.len);
     }
 
+    const rootfs_payload_bytes = try unpackRootfsArtifact(allocator, options, manifest);
     try spore.saveManifest(allocator, options.out_dir, manifest);
     const bundle_digest = try digestHex(allocator, options.bundle_dir);
 
@@ -183,6 +199,8 @@ pub fn unpack(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unpack
         .chunk_count = plan.chunk_count,
         .unpacked_chunk_count = unpacked_chunk_count,
         .payload_bytes = payload_bytes,
+        .rootfs_artifact_count = if (manifest.rootfs == null) 0 else 1,
+        .rootfs_payload_bytes = rootfs_payload_bytes,
     };
 }
 
@@ -197,6 +215,12 @@ pub fn digestHex(allocator: std.mem.Allocator, bundle_dir: []const u8) Error![]c
     try updateHashWithFile(allocator, &h, bundle_dir, "manifest.json");
     try updateHashWithFile(allocator, &h, bundle_dir, index_path);
     try updateHashWithFile(allocator, &h, bundle_dir, pack_path);
+    const parsed_manifest = try spore.loadManifest(allocator, bundle_dir);
+    defer parsed_manifest.deinit();
+    if (parsed_manifest.value.rootfs) |rootfs| {
+        const rel_path = try rootfsArtifactRelPath(allocator, rootfs.artifact);
+        try updateHashWithFile(allocator, &h, bundle_dir, rel_path);
+    }
 
     var digest: [Sha256.digest_length]u8 = undefined;
     h.final(&digest);
@@ -242,6 +266,54 @@ fn validateChunk(entry: IndexChunk) Error!void {
     if (entry.sha256.len != Sha256.digest_length * 2) return error.BadManifest;
     var digest: [Sha256.digest_length]u8 = undefined;
     _ = std.fmt.hexToBytes(&digest, entry.sha256) catch return error.BadManifest;
+}
+
+fn packRootfsArtifact(allocator: std.mem.Allocator, options: PackOptions, manifest: spore.Manifest) Error!u64 {
+    const rootfs = manifest.rootfs orelse return 0;
+    const cache_root = options.rootfs_cache_dir orelse return error.IoFailed;
+    try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_dir_path }));
+    try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_blake3_dir_path }));
+    const source_path = rootfs_cache.digestPath(allocator, cache_root, rootfs.artifact.digest) catch |err| return rootfsError(err);
+    const rel_path = try rootfsArtifactRelPath(allocator, rootfs.artifact);
+    const dest_path = try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rel_path });
+    rootfs_cache.copyVerifiedPath(options.io, allocator, source_path, dest_path, rootfs.artifact, .{
+        .source_must_not_be_symlink = true,
+        .allow_hardlink = false,
+    }) catch |err| return rootfsError(err);
+    return rootfs.artifact.size;
+}
+
+fn unpackRootfsArtifact(allocator: std.mem.Allocator, options: UnpackOptions, manifest: spore.Manifest) Error!u64 {
+    const rootfs = manifest.rootfs orelse return 0;
+    const cache_root = options.rootfs_cache_dir orelse return error.IoFailed;
+    const rel_path = try rootfsArtifactRelPath(allocator, rootfs.artifact);
+    const source_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, rel_path });
+    rootfs_cache.verifyPath(options.io, allocator, source_path, rootfs.artifact, true) catch |err| return rootfsError(err);
+    rootfs_cache.installExpectedPath(options.io, allocator, cache_root, source_path, rootfs.artifact, .{
+        .source_must_not_be_symlink = true,
+        .allow_hardlink = false,
+    }) catch |err| return rootfsError(err);
+    return rootfs.artifact.size;
+}
+
+fn rootfsArtifactRelPath(allocator: std.mem.Allocator, artifact: spore.RootfsArtifactRef) Error![]const u8 {
+    try spore.validateRootfsDigest(artifact.digest);
+    if (!std.mem.eql(u8, artifact.format, spore.rootfs_artifact_format_ext4)) return error.BadManifest;
+    const hex = artifact.digest[spore.rootfs_digest_prefix.len..];
+    return std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ rootfs_blake3_dir_path, hex }) catch return error.OutOfMemory;
+}
+
+fn rootfsError(err: anyerror) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BadManifest => error.BadManifest,
+        error.RootFSDigestMismatch,
+        error.RootFSDigestCacheMiss,
+        error.RootFSOpenFailed,
+        error.BadPathName,
+        => error.BadChunk,
+        else => error.IoFailed,
+    };
 }
 
 fn chunkRange(plan: spore.MemoryPlan, ram_len: usize, index: usize) Error!spore.MemoryChunkRange {
@@ -386,6 +458,16 @@ fn testDir(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 const test_line_levels = [_]gicv3.LineLevel{.{ .intid = 56, .asserted = false }};
+var test_rootfs_transport_devices = [_]spore.TransportState{.{
+    .device_id = spore.rootfs_virtio_blk_device_id,
+    .status = 0,
+    .device_features_sel = 0,
+    .driver_features_sel = 0,
+    .driver_features = 0,
+    .queue_sel = 0,
+    .interrupt_status = 0,
+    .queues = &.{},
+}};
 
 fn testManifest(memory: spore.MemoryManifest, ram_size: u64, initial_generation: u64) spore.Manifest {
     return .{
@@ -423,6 +505,23 @@ fn testManifest(memory: spore.MemoryManifest, ram_size: u64, initial_generation:
     };
 }
 
+fn testRootfsManifest(memory: spore.MemoryManifest, ram_size: u64, initial_generation: u64, artifact: spore.RootfsArtifactRef) spore.Manifest {
+    var manifest = testManifest(memory, ram_size, initial_generation);
+    manifest.devices = test_rootfs_transport_devices[0..];
+    manifest.rootfs = .{
+        .device = .{ .mmio_slot = 0 },
+        .artifact = artifact,
+        .source = .{
+            .requested_ref = "docker.io/library/ruby:3.3-alpine",
+            .resolved_image_ref = "docker.io/library/ruby@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .image_manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .platform = "linux/arm64",
+            .builder_version = "sporevm-rootfs-v1",
+        },
+    };
+    return manifest;
+}
+
 fn fuzzIndexParse(_: void, s: *std.testing.Smith) !void {
     // Bundle indexes are distribution metadata from disk/peers/registries. They
     // must either fail to parse or validate to canonical, path-safe chunkpack
@@ -458,7 +557,7 @@ test "pack and unpack chunkpack bundle strips local backing" {
     const memory = try spore.saveMemoryWithBacking(arena, parent_dir, ram);
     try spore.saveManifest(arena, parent_dir, testManifest(memory, ram.len, 7));
 
-    const pack_result = try pack(arena, .{ .spore_dir = parent_dir, .out_dir = bundle_dir });
+    const pack_result = try pack(arena, .{ .io = std.testing.io, .spore_dir = parent_dir, .out_dir = bundle_dir });
     try std.testing.expectEqual(@as(usize, 3), pack_result.chunk_count);
     try std.testing.expectEqual(@as(usize, 2), pack_result.packed_chunk_count);
     try std.testing.expectEqual(@as(usize, 1), pack_result.pack_count);
@@ -481,7 +580,7 @@ test "pack and unpack chunkpack bundle strips local backing" {
     try std.testing.expectEqual(@as(u64, spore.chunk_size), index.value.chunks[1].offset);
     try std.testing.expectEqual(@as(u64, 17), index.value.chunks[1].size);
 
-    const unpacked = try unpack(arena, .{ .bundle_dir = bundle_dir, .out_dir = out_dir });
+    const unpacked = try unpack(arena, .{ .io = std.testing.io, .bundle_dir = bundle_dir, .out_dir = out_dir });
     try std.testing.expectEqual(@as(usize, 3), unpacked.chunk_count);
     try std.testing.expectEqual(@as(usize, 2), unpacked.unpacked_chunk_count);
     try std.testing.expectEqual(@as(u64, spore.chunk_size + 17), unpacked.payload_bytes);
@@ -511,7 +610,7 @@ test "unpack rejects corrupted chunkpack payload" {
     @memset(ram, 0x5D);
     const memory = try spore.saveMemory(arena, parent_dir, ram);
     try spore.saveManifest(arena, parent_dir, testManifest(memory, ram.len, 3));
-    _ = try pack(arena, .{ .spore_dir = parent_dir, .out_dir = bundle_dir });
+    _ = try pack(arena, .{ .io = std.testing.io, .spore_dir = parent_dir, .out_dir = bundle_dir });
     const clean_digest = try digestHex(arena, bundle_dir);
 
     const source_pack_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, pack_path });
@@ -521,7 +620,257 @@ test "unpack rejects corrupted chunkpack payload" {
     const corrupt_digest = try digestHex(arena, bundle_dir);
     try std.testing.expect(!std.mem.eql(u8, clean_digest, corrupt_digest));
 
-    try std.testing.expectError(error.BadChunk, unpack(arena, .{ .bundle_dir = bundle_dir, .out_dir = out_dir }));
+    try std.testing.expectError(error.BadChunk, unpack(arena, .{ .io = std.testing.io, .bundle_dir = bundle_dir, .out_dir = out_dir }));
+}
+
+test "pack and unpack rootfs artifact in existing bundle shape" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/unpacked", .{root_dir});
+    const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
+    const unpack_cache_root = try pathZ(arena, "{s}/unpack-cache", .{root_dir});
+    const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
+
+    const ram = try arena.alloc(u8, spore.chunk_size);
+    @memset(ram, 0);
+    ram[77] = 0xC7;
+    const memory = try spore.saveMemory(arena, parent_dir, ram);
+    try writeFileAll(rootfs_source_path, "rootfs bytes for distribution");
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
+    try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 11, artifact));
+
+    const pack_result = try pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = bundle_dir,
+        .rootfs_cache_dir = pack_cache_root,
+    });
+    try std.testing.expectEqual(@as(usize, 1), pack_result.rootfs_artifact_count);
+    try std.testing.expectEqual(artifact.size, pack_result.rootfs_payload_bytes);
+
+    const rel_path = try rootfsArtifactRelPath(arena, artifact);
+    const bundle_rootfs_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, rel_path });
+    const bundled_rootfs = try readFileAll(arena, bundle_rootfs_path, 4096);
+    try std.testing.expectEqualSlices(u8, "rootfs bytes for distribution", bundled_rootfs);
+
+    const unpacked = try unpack(arena, .{
+        .io = io,
+        .bundle_dir = bundle_dir,
+        .out_dir = out_dir,
+        .rootfs_cache_dir = unpack_cache_root,
+    });
+    try std.testing.expectEqual(@as(usize, 1), unpacked.rootfs_artifact_count);
+    try std.testing.expectEqual(artifact.size, unpacked.rootfs_payload_bytes);
+    try std.testing.expectEqualStrings(pack_result.bundle_digest, unpacked.bundle_digest);
+
+    const restored_manifest = try spore.loadManifest(arena, out_dir);
+    defer restored_manifest.deinit();
+    const restored_rootfs = restored_manifest.value.rootfs orelse return error.BadManifest;
+    try std.testing.expectEqualStrings(artifact.digest, restored_rootfs.artifact.digest);
+    try std.testing.expectEqual(artifact.size, restored_rootfs.artifact.size);
+
+    const fd = try rootfs_cache.openVerifiedFromCache(io, arena, unpack_cache_root, restored_rootfs);
+    _ = std.c.close(fd);
+}
+
+test "bundle digest covers rootfs artifact bytes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
+    const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
+
+    const ram = try arena.alloc(u8, 4096);
+    @memset(ram, 0x41);
+    const memory = try spore.saveMemory(arena, parent_dir, ram);
+    try writeFileAll(rootfs_source_path, "rootfs digest bytes");
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
+    try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 12, artifact));
+
+    const pack_result = try pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = bundle_dir,
+        .rootfs_cache_dir = pack_cache_root,
+    });
+    const clean_digest = pack_result.bundle_digest;
+
+    const rel_path = try rootfsArtifactRelPath(arena, artifact);
+    const bundle_rootfs_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, rel_path });
+    const data = try readFileAll(arena, bundle_rootfs_path, 4096);
+    data[0] ^= 0xFF;
+    try Io.Dir.cwd().deleteFile(io, bundle_rootfs_path);
+    try writeFileAll(bundle_rootfs_path, data);
+    const corrupt_digest = try digestHex(arena, bundle_dir);
+    try std.testing.expect(!std.mem.eql(u8, clean_digest, corrupt_digest));
+}
+
+test "unpack rejects corrupted rootfs artifact" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/unpacked", .{root_dir});
+    const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
+    const unpack_cache_root = try pathZ(arena, "{s}/unpack-cache", .{root_dir});
+    const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
+
+    const ram = try arena.alloc(u8, 4096);
+    @memset(ram, 0x7A);
+    const memory = try spore.saveMemory(arena, parent_dir, ram);
+    try writeFileAll(rootfs_source_path, "rootfs clean bytes");
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
+    try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 13, artifact));
+    _ = try pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = bundle_dir,
+        .rootfs_cache_dir = pack_cache_root,
+    });
+
+    const rel_path = try rootfsArtifactRelPath(arena, artifact);
+    const bundle_rootfs_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, rel_path });
+    try Io.Dir.cwd().deleteFile(io, bundle_rootfs_path);
+    try writeFileAll(bundle_rootfs_path, "tampered rootfs bytes");
+    try std.testing.expectError(error.BadChunk, unpack(arena, .{
+        .io = io,
+        .bundle_dir = bundle_dir,
+        .out_dir = out_dir,
+        .rootfs_cache_dir = unpack_cache_root,
+    }));
+    const cache_path = try rootfs_cache.digestPath(arena, unpack_cache_root, artifact.digest);
+    try std.testing.expect(!try rootfs_cache.pathExistsNoSymlink(io, cache_path));
+}
+
+test "unpack requires bundled rootfs artifact even when destination cache is warm" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/unpacked", .{root_dir});
+    const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
+    const unpack_cache_root = try pathZ(arena, "{s}/unpack-cache", .{root_dir});
+    const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
+
+    const ram = try arena.alloc(u8, 4096);
+    @memset(ram, 0x21);
+    const memory = try spore.saveMemory(arena, parent_dir, ram);
+    try writeFileAll(rootfs_source_path, "rootfs cache warm bytes");
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
+    try rootfs_cache.installExpectedPath(io, arena, unpack_cache_root, rootfs_source_path, artifact, .{});
+    try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 15, artifact));
+    _ = try pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = bundle_dir,
+        .rootfs_cache_dir = pack_cache_root,
+    });
+
+    const rel_path = try rootfsArtifactRelPath(arena, artifact);
+    const bundle_rootfs_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, rel_path });
+    try Io.Dir.cwd().deleteFile(io, bundle_rootfs_path);
+    try std.testing.expectError(error.BadChunk, unpack(arena, .{
+        .io = io,
+        .bundle_dir = bundle_dir,
+        .out_dir = out_dir,
+        .rootfs_cache_dir = unpack_cache_root,
+    }));
+}
+
+test "unpack rejects symlinked rootfs artifact" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/unpacked", .{root_dir});
+    const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
+    const unpack_cache_root = try pathZ(arena, "{s}/unpack-cache", .{root_dir});
+    const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
+
+    const ram = try arena.alloc(u8, 4096);
+    @memset(ram, 0x22);
+    const memory = try spore.saveMemory(arena, parent_dir, ram);
+    try writeFileAll(rootfs_source_path, "rootfs symlink bytes");
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
+    try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 16, artifact));
+    _ = try pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = bundle_dir,
+        .rootfs_cache_dir = pack_cache_root,
+    });
+
+    const rel_path = try rootfsArtifactRelPath(arena, artifact);
+    const bundle_rootfs_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, rel_path });
+    const cache_rootfs_path = try rootfs_cache.digestPath(arena, pack_cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, bundle_rootfs_path);
+    const bundle_rootfs_z = try arena.dupeZ(u8, bundle_rootfs_path);
+    const cache_rootfs_z = try arena.dupeZ(u8, cache_rootfs_path);
+    if (std.c.symlink(cache_rootfs_z, bundle_rootfs_z) != 0) return error.SkipZigTest;
+
+    try std.testing.expectError(error.BadChunk, unpack(arena, .{
+        .io = io,
+        .bundle_dir = bundle_dir,
+        .out_dir = out_dir,
+        .rootfs_cache_dir = unpack_cache_root,
+    }));
+}
+
+test "pack rejects rootfs manifests without cache artifact" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const cache_root = try pathZ(arena, "{s}/cache", .{root_dir});
+
+    const ram = try arena.alloc(u8, 4096);
+    @memset(ram, 0x33);
+    const memory = try spore.saveMemory(arena, parent_dir, ram);
+    const artifact = spore.RootfsArtifactRef{
+        .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .size = 4096,
+    };
+    try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 14, artifact));
+
+    try std.testing.expectError(error.BadChunk, pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = bundle_dir,
+        .rootfs_cache_dir = cache_root,
+    }));
 }
 
 test "bundle index rejects duplicate chunk ids" {

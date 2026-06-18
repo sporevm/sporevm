@@ -33,7 +33,9 @@ A local bundle is the first distribution form:
 <bundle>/
 ├── manifest.json           # portable manifest; local RAM backing stripped
 ├── chunkpack.index.json    # blake3 chunk id -> pack/offset/length/sha256
-└── chunkpacks/000000.pack  # uncompressed logical chunks concatenated
+├── chunkpacks/000000.pack  # uncompressed logical chunks concatenated
+└── rootfs/blake3/<hex>.ext4
+                            # optional exact immutable rootfs artifact
 ```
 
 Bundles are an implementation format for distribution, not a new machine-state
@@ -41,8 +43,15 @@ contract. The BLAKE3 ids in `manifest.json` remain the restore-time trust root;
 the SHA256 values in the chunkpack index make each packed segment compatible
 with blob-store and later OCI-style descriptor verification. `spore pack` and
 `spore unpack` also report a `bundle_digest`, a SHA256 digest over the exact
-bundle bytes (`manifest.json`, `chunkpack.index.json`, and pack blobs) for
-cache identity. It is not a replacement for per-chunk verification.
+bundle bytes (`manifest.json`, `chunkpack.index.json`, pack blobs, and any
+included rootfs artifacts) for cache identity. It is not a replacement for
+per-chunk or per-rootfs verification.
+
+If `manifest.json` records an immutable rootfs artifact, `spore pack` includes
+the exact ext4 bytes at `rootfs/blake3/<hex>.ext4` after verifying the source
+digest-cache entry by BLAKE3 and size. `spore unpack` requires that bundled
+artifact, verifies it against the manifest, then installs it into the local
+rootfs digest cache before writing the unpacked manifest.
 
 ## Manifest v0
 
@@ -134,6 +143,9 @@ cache identity. It is not a replacement for per-chunk verification.
 - Chunkpack bundles are portable only after local RAM backing metadata has been
   stripped. `spore unpack` reconstitutes normal `chunks/<blake3>` files and
   fails closed when a pack segment's SHA256 or logical BLAKE3 id mismatches.
+- Rootfs-backed bundles include exact immutable rootfs bytes by default. Bundle
+  unpack refuses missing, symlinked, or digest-mismatched rootfs artifacts before
+  writing a resumable spore.
 - Immutable rootfs artifacts are portable by digest, not by local path. Resume
   opens the digest-addressed rootfs cache entry read-only, verifies the same fd
   by BLAKE3 and size, and only then attaches it to the VM.

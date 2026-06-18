@@ -89,6 +89,12 @@ version. The rootfs is also stored under a digest-addressed cache path. Product
 digest and size, then attaches it as virtio-blk. If the digest cache entry is
 missing or tampered with, resume refuses to boot.
 
+`spore pack` includes those exact rootfs bytes by default for rootfs-backed
+spores, under `rootfs/blake3/<hex>.ext4` in the local bundle. `spore unpack`
+requires the bundled artifact, verifies it against the manifest digest and size,
+and installs it into the destination host's rootfs digest cache before the
+unpacked spore can be resumed.
+
 Plain `spore run --rootfs PATH` remains a local run escape hatch. Combining
 `--rootfs PATH` with `--capture` is rejected until an import/preload
 command can record portable rootfs identity for arbitrary local images.

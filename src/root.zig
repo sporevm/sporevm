@@ -29,6 +29,7 @@ const dirty_ram = @import("dirty_ram.zig");
 pub const hvf = @import("hvf/hvf.zig");
 pub const resume_cmd = @import("resume.zig");
 pub const rootfs = @import("rootfs.zig");
+pub const rootfs_cache = @import("rootfs_cache.zig");
 pub const run = @import("run.zig");
 pub const spore = @import("spore.zig");
 pub const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
@@ -63,6 +64,7 @@ test {
     testing.refAllDecls(platform);
     testing.refAllDecls(dirty_ram);
     testing.refAllDecls(resume_cmd);
+    testing.refAllDecls(rootfs_cache);
     testing.refAllDecls(run);
     testing.refAllDecls(virtio.queue);
     testing.refAllDecls(virtio.mmio);

@@ -3,7 +3,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
-const Blake3 = std.crypto.hash.Blake3;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const capture = @import("capture.zig");
@@ -13,6 +12,7 @@ const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
 else
     struct {};
 const local_paths = @import("local_paths.zig");
+const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_mod = @import("rootfs.zig");
 const spore = @import("spore.zig");
 const virtio_blk = @import("virtio/blk.zig");
@@ -747,19 +747,7 @@ pub fn openVerifiedRootfs(init: std.process.Init, allocator: std.mem.Allocator, 
 }
 
 fn openVerifiedRootfsFromCache(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, rootfs: spore.Rootfs) !std.c.fd_t {
-    const path = try digestRootfsPath(allocator, cache_root, rootfs.artifact.digest);
-    if (!try regularFileNoSymlink(io, path)) return error.RootFSDigestCacheMiss;
-    const pathz = try allocator.dupeZ(u8, path);
-    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
-    if (fd < 0) return error.RootFSDigestCacheMiss;
-    errdefer _ = std.c.close(fd);
-    if (!try fdIsRegularFile(io, fd)) return error.RootFSDigestCacheMiss;
-
-    const actual = try hashFd(io, allocator, fd);
-    if (actual.size != rootfs.artifact.size) return error.RootFSDigestMismatch;
-    if (!std.mem.eql(u8, actual.digest, rootfs.artifact.digest)) return error.RootFSDigestMismatch;
-    if (std.c.lseek(fd, 0, std.c.SEEK.SET) < 0) return error.RootFSOpenFailed;
-    return fd;
+    return rootfs_cache.openVerifiedFromCache(io, allocator, cache_root, rootfs);
 }
 
 fn cacheRootfsByDigest(
@@ -777,24 +765,7 @@ fn cacheRootfsByDigestPath(
     cache_root: []const u8,
     rootfs_path: []const u8,
 ) !spore.RootfsArtifactRef {
-    const source = try hashPath(io, allocator, rootfs_path);
-    const digest_path = try digestRootfsPath(allocator, cache_root, source.digest);
-    const digest_dir = std.fs.path.dirname(digest_path) orelse return error.RootFSOpenFailed;
-    try ensureDirPath(io, digest_dir);
-
-    if (try pathExistsNoSymlink(io, digest_path)) {
-        if (!try regularFileNoSymlink(io, digest_path)) return error.RootFSDigestMismatch;
-        try chmodRootfsReadOnly(allocator, digest_path);
-    } else {
-        try copyRootfsIntoDigestCache(io, allocator, rootfs_path, digest_path);
-    }
-    const cached = try hashPath(io, allocator, digest_path);
-    if (cached.size != source.size or !std.mem.eql(u8, cached.digest, source.digest)) return error.RootFSDigestMismatch;
-
-    return .{
-        .digest = source.digest,
-        .size = source.size,
-    };
+    return rootfs_cache.cacheByDigestPath(io, allocator, cache_root, rootfs_path);
 }
 
 fn regularFileNoSymlink(io: Io, path: []const u8) !bool {
@@ -805,103 +776,8 @@ fn regularFileNoSymlink(io: Io, path: []const u8) !bool {
     return stat.kind == .file;
 }
 
-fn pathExistsNoSymlink(io: Io, path: []const u8) !bool {
-    _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
-        else => |e| return e,
-    };
-    return true;
-}
-
-const RootfsHash = struct {
-    digest: []const u8,
-    size: u64,
-};
-
-fn hashPath(io: Io, allocator: std.mem.Allocator, path: []const u8) !RootfsHash {
-    const pathz = try allocator.dupeZ(u8, path);
-    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
-    if (fd < 0) return error.RootFSOpenFailed;
-    defer _ = std.c.close(fd);
-    return hashFd(io, allocator, fd);
-}
-
-fn hashFd(io: Io, allocator: std.mem.Allocator, fd: std.c.fd_t) !RootfsHash {
-    if (!try fdIsRegularFile(io, fd)) return error.RootFSOpenFailed;
-    if (std.c.lseek(fd, 0, std.c.SEEK.SET) < 0) return error.RootFSOpenFailed;
-    var h = Blake3.init(.{});
-    var size: u64 = 0;
-    var buf: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
-        if (n < 0) return error.RootFSOpenFailed;
-        if (n == 0) break;
-        const read_len: usize = @intCast(n);
-        h.update(buf[0..read_len]);
-        size += @intCast(read_len);
-    }
-    var digest: [Blake3.digest_length]u8 = undefined;
-    h.final(&digest);
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    const digest_text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, &hex });
-    return .{ .digest = digest_text, .size = size };
-}
-
-fn fdIsRegularFile(io: Io, fd: std.c.fd_t) !bool {
-    const file = Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
-    const stat = file.stat(io) catch |err| switch (err) {
-        error.AccessDenied, error.PermissionDenied, error.Streaming => return false,
-        else => |e| return e,
-    };
-    return stat.kind == .file;
-}
-
 fn digestRootfsPath(allocator: std.mem.Allocator, cache_root: []const u8, digest: []const u8) ![]const u8 {
-    try spore.validateRootfsDigest(digest);
-    const hex = digest[spore.rootfs_digest_prefix.len..];
-    return std.fs.path.join(allocator, &.{ cache_root, "by-digest", "blake3", try std.fmt.allocPrint(allocator, "{s}.ext4", .{hex}) });
-}
-
-fn chmodRootfsReadOnly(allocator: std.mem.Allocator, path: []const u8) !void {
-    const pathz = try allocator.dupeZ(u8, path);
-    if (std.c.chmod(pathz, 0o444) != 0) return error.RootFSOpenFailed;
-}
-
-fn copyRootfsIntoDigestCache(io: Io, allocator: std.mem.Allocator, source_path: []const u8, digest_path: []const u8) !void {
-    const source_z = try allocator.dupeZ(u8, source_path);
-    const dest_z = try allocator.dupeZ(u8, digest_path);
-    if (std.c.link(source_z, dest_z) == 0) {
-        if (std.c.chmod(dest_z, 0o444) != 0) return error.RootFSOpenFailed;
-        return;
-    }
-
-    var temp_nonce_bytes: [8]u8 = undefined;
-    io.random(&temp_nonce_bytes);
-    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ digest_path, temp_nonce });
-    defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
-    const temp_z = try allocator.dupeZ(u8, temp_path);
-    const source_fd = std.c.open(source_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
-    if (source_fd < 0) return error.RootFSOpenFailed;
-    defer _ = std.c.close(source_fd);
-    const dest_fd = std.c.open(temp_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(c_uint, 0o444));
-    if (dest_fd < 0) return error.RootFSOpenFailed;
-    defer _ = std.c.close(dest_fd);
-    var buf: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = std.c.read(source_fd, &buf, buf.len);
-        if (n < 0) return error.RootFSOpenFailed;
-        if (n == 0) break;
-        var done: usize = 0;
-        const read_len: usize = @intCast(n);
-        while (done < read_len) {
-            const written = std.c.write(dest_fd, buf[done..].ptr, read_len - done);
-            if (written <= 0) return error.RootFSOpenFailed;
-            done += @intCast(written);
-        }
-    }
-    if (std.c.fchmod(dest_fd, 0o444) != 0) return error.RootFSOpenFailed;
-    try Io.Dir.renameAbsolute(temp_path, digest_path, io);
+    return rootfs_cache.digestPath(allocator, cache_root, digest);
 }
 
 fn cachedRootfsMetadataMatches(io: Io, allocator: std.mem.Allocator, metadata_path: []const u8, resolved: rootfs_mod.ResolvedImage) !bool {
@@ -2033,22 +1909,6 @@ test "rootfs digest cache rejects unsafe existing paths" {
     if (std.c.symlink(rootfs_z, digest_z) != 0) return error.SkipZigTest;
 
     try std.testing.expectError(error.RootFSDigestMismatch, cacheRootfsByDigestPath(io, arena, cache_root, rootfs_path));
-}
-
-test "rootfs hashing rejects non-file descriptors" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const tmp = "zig-cache/test-run-rootfs-fd-regular";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
-
-    const tmp_z = try allocator.dupeZ(u8, tmp);
-    defer allocator.free(tmp_z);
-    const fd = std.c.open(tmp_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
-    if (fd < 0) return error.SkipZigTest;
-    defer _ = std.c.close(fd);
-    try std.testing.expect(!try fdIsRegularFile(io, fd));
-    try std.testing.expectError(error.RootFSOpenFailed, hashFd(io, allocator, fd));
 }
 
 test "run image cache creates absolute cache directories" {
