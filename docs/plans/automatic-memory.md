@@ -197,8 +197,11 @@ best-effort scans.
 
 ## Current State
 
-- `spore run`, `spore create`, and `spore monitor` use `memory_mib` with a
-  1024MiB default.
+- Slice 2 is implemented in the product CLI: `spore run`, `spore create`, and
+  `spore monitor` use `--memory VALUE`, omitted `--memory` records `auto`, and
+  `auto` resolves to a 16GiB byte-sized RAM contract.
+- Lifecycle specs persist `memory.policy` plus resolved `memory.bytes` instead
+  of `memory_mib`.
 - `spore resume` derives RAM size from `manifest.platform.ram_size`.
 - KVM and HVF backend configs already accept byte-sized `ram_size`.
 - Fresh KVM/HVF boot maps RAM with demand-committed anonymous private mappings.
@@ -228,7 +231,7 @@ ranges it wrote. The shared dirty RAM sealer should initialize refs to all-null,
 seal only those ranges, and rely on dirty logs/write-protect faults plus
 `GuestRam` dirty hooks after guest entry.
 
-Status: implemented locally and validated on HVF plus KVM 16GiB idle
+Status: landed in PR #100 and validated on HVF plus KVM 16GiB idle
 dirty-tracking benchmarks.
 
 Done when:
@@ -244,6 +247,8 @@ Done when:
 Add a small shared memory parser and convert product commands to `--memory`.
 Update `spore run`, `spore create`, lifecycle spec writing, monitor spawning,
 and help text. Persist memory policy plus bytes in lifecycle specs.
+
+Status: implemented in this slice.
 
 Done when:
 
@@ -283,6 +288,10 @@ Done when:
 ## Verification
 
 - Unit tests for memory parsing and lifecycle spec JSON round-trips.
+- Slice 2 validation on 2026-06-18: `mise run check` passed with product memory
+  parser, run parser, create parser, and lifecycle spec round-trip coverage;
+  command-level checks confirmed `spore run`, `spore create`, and
+  `spore monitor` reject `--memory-mib`.
 - Unit tests for range-to-chunk seeding, including edge-aligned kernel/initrd
   and DTB ranges.
 - Existing `mise run test` suite.

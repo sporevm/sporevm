@@ -12,6 +12,7 @@ const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
 else
     struct {};
 const local_paths = @import("local_paths.zig");
+const memory_config = @import("memory.zig");
 const net_gateway = @import("net_gateway.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_mod = @import("rootfs.zig");
@@ -36,7 +37,6 @@ const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const max_image_ref_cache_record_bytes = 64 * 1024;
 const image_ref_cache_record_version: u32 = 1;
-const mib: u64 = 1024 * 1024;
 
 pub const Backend = enum {
     auto,
@@ -67,7 +67,7 @@ pub const Options = struct {
     rootfs: ?spore.Rootfs = null,
     resume_dir: ?[]const u8 = null,
     command: []const []const u8,
-    memory_mib: u64 = 1024,
+    memory: memory_config.Config = .{},
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
@@ -93,7 +93,7 @@ pub const Result = struct {
     probe_duration_ms: u64,
     exit_code: i32,
     vcpus: u32,
-    memory_mib: u64,
+    memory_bytes: u64,
     captured: bool = false,
     capture_path: ?[]const u8 = null,
 
@@ -116,8 +116,8 @@ pub const MonitorResult = struct {
 const SharedOptions = struct {
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
-    memory_mib: u64 = 1024,
-    memory_mib_set: bool = false,
+    memory: memory_config.Config = .{},
+    memory_set: bool = false,
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
@@ -141,7 +141,7 @@ const SharedOptions = struct {
             .rootfs = rootfs,
             .resume_dir = null,
             .command = command,
-            .memory_mib = self.memory_mib,
+            .memory = self.memory,
             .vcpus = self.vcpus,
             .guest_port = self.guest_port,
             .timeout_ms = self.timeout_ms,
@@ -189,7 +189,7 @@ const cli_usage =
     \\  --capture-on WHEN       Capture trigger: EXIT, INT, TERM, HUP, USR1, or USR2
     \\  --continue-after-capture
     \\                          Keep running after a signal-triggered capture
-    \\  --memory-mib N          Guest memory in MiB (default: 1024)
+    \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --vcpus N               Guest vCPU count; must be 1 today
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
@@ -315,8 +315,8 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             std.debug.print("spore run: --from is mutually exclusive with --kernel and --initrd\n", .{});
             std.process.exit(2);
         }
-        if (shared.memory_mib_set) {
-            std.debug.print("spore run: --from uses the spore manifest memory size; omit --memory-mib\n", .{});
+        if (shared.memory_set) {
+            std.debug.print("spore run: --from uses the spore manifest memory size; omit --memory\n", .{});
             std.process.exit(2);
         }
     }
@@ -367,7 +367,7 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
         const network_options = try networkOptionsFromManifest(allocator, manifest.value.network);
         var opts = parsed.shared.completeWithAssets(parsed.backend, "", "", null, rootfs, parsed.command, true);
         opts.resume_dir = spore_dir;
-        opts.memory_mib = runMemoryMiBFromManifest(manifest.value);
+        opts.memory = runMemoryFromManifest(manifest.value);
         opts.capture_path = parsed.capture_path;
         opts.capture_trigger = parsed.capture_trigger;
         opts.continue_after_capture = parsed.continue_after_capture;
@@ -417,11 +417,10 @@ fn manifestNetworkFromOptions(network: NetworkMode, policy: *const spore_net_pol
     };
 }
 
-fn runMemoryMiBFromManifest(manifest: spore.Manifest) u64 {
-    if (manifest.platform.ram_size % mib != 0) {
-        failRunSetup("spore run: --from manifest RAM size is not MiB-aligned: {d}", .{manifest.platform.ram_size});
-    }
-    return manifest.platform.ram_size / mib;
+fn runMemoryFromManifest(manifest: spore.Manifest) memory_config.Config {
+    return memory_config.fromManifestBytes(manifest.platform.ram_size) catch {
+        failRunSetup("spore run: --from manifest RAM size is not positive and page-aligned: {d}", .{manifest.platform.ram_size});
+    };
 }
 
 fn resumeRootfsForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Rootfs {
@@ -1242,7 +1241,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
             if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
             break :blk hvf.vm.run(allocator, .{
                 .kernel = kernel,
-                .ram_size = opts.memory_mib * 1024 * 1024,
+                .ram_size = opts.memory.bytes,
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
@@ -1263,7 +1262,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
             if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
             break :blk kvm.vm.run(allocator, .{
                 .kernel = kernel,
-                .ram_size = opts.memory_mib * 1024 * 1024,
+                .ram_size = opts.memory.bytes,
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
@@ -1316,7 +1315,7 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
             if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
             break :blk try hvf.vm.run(allocator, .{
                 .kernel = kernel,
-                .ram_size = opts.memory_mib * 1024 * 1024,
+                .ram_size = opts.memory.bytes,
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
@@ -1463,7 +1462,7 @@ fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostSt
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
         .vcpus = opts.vcpus,
-        .memory_mib = opts.memory_mib,
+        .memory_bytes = opts.memory.bytes,
         .captured = captured,
         .capture_path = if (captured) opts.capture_path else null,
     };
@@ -1489,7 +1488,7 @@ fn resultFromSignalCaptureExitCode(backend: Backend, opts: Options, stream: *con
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = exit_code,
         .vcpus = opts.vcpus,
-        .memory_mib = opts.memory_mib,
+        .memory_bytes = opts.memory.bytes,
         .captured = true,
         .capture_path = opts.capture_path,
     };
@@ -1507,7 +1506,7 @@ fn resultFromExitCapture(backend: Backend, opts: Options, stream: *const vsock.H
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
         .vcpus = opts.vcpus,
-        .memory_mib = opts.memory_mib,
+        .memory_bytes = opts.memory.bytes,
         .captured = true,
         .capture_path = opts.capture_path,
     };
@@ -1590,9 +1589,11 @@ fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize
         shared.kernel_path = takeValue(args, i, name);
     } else if (std.mem.eql(u8, name, "--initrd")) {
         shared.initrd_path = takeValue(args, i, name);
+    } else if (std.mem.eql(u8, name, "--memory")) {
+        shared.memory = memory_config.parseCliOrExit("spore run", takeValue(args, i, name));
+        shared.memory_set = true;
     } else if (std.mem.eql(u8, name, "--memory-mib")) {
-        shared.memory_mib = try parsePositive(u64, name, takeValue(args, i, name));
-        shared.memory_mib_set = true;
+        memory_config.rejectMemoryMiBFlag("spore run");
     } else if (std.mem.eql(u8, name, "--vcpus")) {
         shared.vcpus = try parsePositive(u32, name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--guest-port")) {
@@ -1671,8 +1672,22 @@ test "run cli parser allows default boot assets" {
     try std.testing.expectEqual(Backend.auto, opts.backend);
     try std.testing.expect(opts.shared.kernel_path == null);
     try std.testing.expect(opts.shared.initrd_path == null);
+    try std.testing.expectEqual(memory_config.Policy.auto, opts.shared.memory.policy);
+    try std.testing.expectEqual(memory_config.auto_bytes, opts.shared.memory.bytes);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
+}
+
+test "run cli parser accepts memory policy" {
+    const auto_opts = try parseCliArgs(&.{ "--memory", "auto", "--", "/bin/true" });
+    try std.testing.expectEqual(memory_config.Policy.auto, auto_opts.shared.memory.policy);
+    try std.testing.expectEqual(memory_config.auto_bytes, auto_opts.shared.memory.bytes);
+    try std.testing.expect(auto_opts.shared.memory_set);
+
+    const explicit_opts = try parseCliArgs(&.{ "--memory", "16gb", "--", "/bin/true" });
+    try std.testing.expectEqual(memory_config.Policy.explicit, explicit_opts.shared.memory.policy);
+    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), explicit_opts.shared.memory.bytes);
+    try std.testing.expect(explicit_opts.shared.memory_set);
 }
 
 test "run cli parser accepts rootfs path" {
@@ -1797,7 +1812,7 @@ test "captured run result exits zero" {
         .probe_duration_ms = 1,
         .exit_code = 0,
         .vcpus = 1,
-        .memory_mib = 1024,
+        .memory_bytes = memory_config.auto_bytes,
         .captured = true,
         .capture_path = "out.spore",
     };
@@ -1813,7 +1828,7 @@ test "captured run result preserves stored exit code" {
         .probe_duration_ms = 1,
         .exit_code = 7,
         .vcpus = 1,
-        .memory_mib = 1024,
+        .memory_bytes = memory_config.auto_bytes,
         .captured = true,
         .capture_path = "out.spore",
     };

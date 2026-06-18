@@ -23,6 +23,7 @@ pub const fanout = @import("fanout.zig");
 pub const guestmem = @import("guestmem.zig");
 pub const lifecycle = @import("lifecycle.zig");
 pub const local_paths = @import("local_paths.zig");
+pub const memory = @import("memory.zig");
 pub const monitor = @import("monitor.zig");
 pub const net_gateway = @import("net_gateway.zig");
 pub const platform = @import("platform.zig");
@@ -66,6 +67,7 @@ test {
     testing.refAllDecls(gicv3);
     testing.refAllDecls(lifecycle);
     testing.refAllDecls(local_paths);
+    testing.refAllDecls(memory);
     testing.refAllDecls(monitor);
     testing.refAllDecls(net_gateway);
     testing.refAllDecls(platform);

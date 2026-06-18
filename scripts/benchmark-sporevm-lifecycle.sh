@@ -21,7 +21,7 @@ Options:
   --backend NAME           Backend for spore create (default: auto).
   --kernel PATH            Kernel Image path to pass through to create.
   --initrd PATH            Initrd path to pass through to create.
-  --memory-mib N           Guest memory in MiB (default: 1024).
+  --memory VALUE           Guest memory: auto, 512mb, 2gb, ... (default: auto).
   --timeout-ms N           Exec/create timeout in milliseconds (default: 60000).
   --identity-command CMD   First command run in the VM (default: boot_id probe).
   --workload-command CMD   Second command run in the VM (default: node -v).
@@ -159,7 +159,7 @@ spore_bin="${REPO_ROOT}/zig-out/bin/spore"
 backend="auto"
 kernel_path=""
 initrd_path=""
-memory_mib=1024
+memory="auto"
 timeout_ms=60000
 identity_command='cat /proc/sys/kernel/random/boot_id'
 workload_command='node -v'
@@ -221,10 +221,13 @@ while [[ $# -gt 0 ]]; do
       initrd_path="$2"
       shift 2
       ;;
-    --memory-mib)
+    --memory)
       need_value "$1" "${2-}"
-      memory_mib="$2"
+      memory="$2"
       shift 2
+      ;;
+    --memory-mib)
+      die "--memory-mib has been replaced by --memory"
       ;;
     --timeout-ms)
       need_value "$1" "${2-}"
@@ -259,7 +262,7 @@ done
 
 [[ -n "${image}" ]] || { usage >&2; exit 2; }
 positive_int "--iterations" "${iterations}"
-positive_int "--memory-mib" "${memory_mib}"
+[[ -n "${memory}" ]] || die "--memory requires a value"
 positive_int "--timeout-ms" "${timeout_ms}"
 case "${backend}" in
   auto|hvf|kvm) ;;
@@ -334,7 +337,7 @@ fi
 if [[ -n "${initrd_path}" ]]; then
   create_base+=(--initrd "${initrd_path}")
 fi
-create_base+=(--image "${effective_image}" --memory-mib "${memory_mib}" --timeout-ms "${timeout_ms}")
+create_base+=(--image "${effective_image}" --memory "${memory}" --timeout-ms "${timeout_ms}")
 
 for i in $(seq 1 "${iterations}"); do
   vm_name="spore-life-${timestamp}-${i}"
@@ -430,7 +433,7 @@ for i in $(seq 1 "${iterations}"); do
     printf '"image_resolution_ms":%s,' "${image_resolution_ms}"
     printf '"image_resolution_timed":%s,' "$(json_bool "${image_resolution_timed}")"
     printf '"backend":%s,' "$(json_string "${backend}")"
-    printf '"memory_mib":%d,' "${memory_mib}"
+    printf '"memory":%s,' "$(json_string "${memory}")"
     printf '"timeout_ms":%d,' "${timeout_ms}"
     printf '"create_to_node_ms":%d,' "$((workload_end_ms - start_ms))"
     printf '"create_ms":%d,' "$((create_end_ms - create_start_ms))"

@@ -6,6 +6,7 @@ const Io = std.Io;
 const net = std.Io.net;
 
 const local_paths = @import("local_paths.zig");
+const memory_config = @import("memory.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 
@@ -38,7 +39,7 @@ const create_usage =
     \\  --initrd root.cpio      Initrd path
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs
-    \\  --memory-mib N          Guest memory in MiB (default: 1024)
+    \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --vcpus N               Guest vCPU count; must be 1 today
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
@@ -128,7 +129,7 @@ pub const Spec = struct {
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
     resume_dir: ?[]const u8 = null,
-    memory_mib: u64 = 1024,
+    memory: memory_config.Config = .{},
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
@@ -363,7 +364,7 @@ pub fn resumeCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
         std.debug.print("spore resume: disk-backed resume is not supported yet\n", .{});
         std.process.exit(2);
     }
-    const memory_mib = memoryMiBFromManifest(manifest.value) catch {
+    const memory = memoryFromManifest(manifest.value) catch {
         std.debug.print("spore resume: invalid spore memory size\n", .{});
         std.process.exit(2);
     };
@@ -387,7 +388,7 @@ pub fn resumeCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
         .kernel_path = base.kernel_path,
         .initrd_path = base.initrd_path,
         .resume_dir = spore_dir,
-        .memory_mib = memory_mib,
+        .memory = memory,
         .vcpus = 1,
         .guest_port = base.guest_port,
         .timeout_ms = base.timeout_ms,
@@ -636,9 +637,10 @@ fn parseCreateArgs(args: []const []const u8) !CreateOptions {
             spec.rootfs_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
             spec.image_ref = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--memory")) {
+            spec.memory = memory_config.parseCliOrExit("spore create", takeValue(args, &i, args[i]));
         } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
-            const flag = args[i];
-            spec.memory_mib = parseIntArg(u64, takeValue(args, &i, flag), flag);
+            memory_config.rejectMemoryMiBFlag("spore create");
         } else if (std.mem.eql(u8, args[i], "--vcpus")) {
             const flag = args[i];
             spec.vcpus = parseIntArg(u32, takeValue(args, &i, flag), flag);
@@ -817,10 +819,8 @@ fn readSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8)
     return parsed;
 }
 
-fn memoryMiBFromManifest(manifest: spore.Manifest) !u64 {
-    const mib = 1024 * 1024;
-    if (manifest.platform.ram_size == 0 or manifest.platform.ram_size % mib != 0) return error.BadManifest;
-    return manifest.platform.ram_size / mib;
+fn memoryFromManifest(manifest: spore.Manifest) !memory_config.Config {
+    return memory_config.fromManifestBytes(manifest.platform.ram_size);
 }
 
 fn spawnMonitor(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec) !void {
@@ -852,7 +852,7 @@ fn spawnMonitor(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec
         try argv.append("--resume");
         try argv.append(path);
     }
-    try appendIntArg(allocator, &argv, "--memory-mib", spec.memory_mib);
+    try appendMemoryArg(allocator, &argv, spec.memory);
     try appendIntArg(allocator, &argv, "--vcpus", spec.vcpus);
     try appendIntArg(allocator, &argv, "--guest-port", spec.guest_port);
     try appendIntArg(allocator, &argv, "--timeout-ms", spec.timeout_ms);
@@ -872,6 +872,11 @@ fn spawnMonitor(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec
 fn appendIntArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), flag: []const u8, value: anytype) !void {
     try argv.append(flag);
     try argv.append(try std.fmt.allocPrint(allocator, "{d}", .{value}));
+}
+
+fn appendMemoryArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), memory: memory_config.Config) !void {
+    try argv.append("--memory");
+    try argv.append(try memory.cliValueAlloc(allocator));
 }
 
 fn waitForReady(command: []const u8, allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: u64) !void {
@@ -1237,12 +1242,15 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
         .name = "bench-1",
         .backend = "hvf",
         .image_ref = "docker.io/library/alpine:3.20",
+        .memory = .{ .policy = .explicit, .bytes = 512 * 1024 * 1024 },
     });
     var spec = try readSpec(allocator, io, paths);
     defer spec.deinit();
     try std.testing.expectEqualStrings("bench-1", spec.value.name);
     try std.testing.expectEqualStrings("hvf", spec.value.backend);
     try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", spec.value.image_ref.?);
+    try std.testing.expectEqual(memory_config.Policy.explicit, spec.value.memory.policy);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), spec.value.memory.bytes);
 
     try writeReady(allocator, io, paths, .{
         .pid = 1234,
@@ -1256,6 +1264,16 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
 
     try writePid(allocator, io, paths, 1234);
     try std.testing.expectEqual(@as(i64, 1234), try readPid(allocator, io, paths));
+}
+
+test "create parser accepts memory policy" {
+    const default_opts = try parseCreateArgs(&.{"bench-1"});
+    try std.testing.expectEqual(memory_config.Policy.auto, default_opts.spec.memory.policy);
+    try std.testing.expectEqual(memory_config.auto_bytes, default_opts.spec.memory.bytes);
+
+    const explicit_opts = try parseCreateArgs(&.{ "bench-1", "--memory", "16gb" });
+    try std.testing.expectEqual(memory_config.Policy.explicit, explicit_opts.spec.memory.policy);
+    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), explicit_opts.spec.memory.bytes);
 }
 
 test "lifecycle detects incomplete ready and stale pid state" {
