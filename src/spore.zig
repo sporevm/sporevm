@@ -441,15 +441,25 @@ fn loadMemoryChunkRef(allocator: std.mem.Allocator, dir: []const u8, maybe_ref: 
 }
 
 pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Manifest) Error!void {
+    const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
+    try saveManifestPath(allocator, path, manifest);
+}
+
+pub fn saveManifestPath(allocator: std.mem.Allocator, path: []const u8, manifest: Manifest) Error!void {
     const json = std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
     defer allocator.free(json);
-    const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
-    try writeFileAll(path, json);
+    const path_z = try pathZ(allocator, "{s}", .{path});
+    try writeFileAll(path_z, json);
 }
 
 pub fn loadManifest(allocator: std.mem.Allocator, dir: []const u8) Error!std.json.Parsed(Manifest) {
     const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
-    const bytes = try readFileAll(allocator, path, 64 * 1024 * 1024);
+    return loadManifestPath(allocator, path);
+}
+
+pub fn loadManifestPath(allocator: std.mem.Allocator, path: []const u8) Error!std.json.Parsed(Manifest) {
+    const path_z = try pathZ(allocator, "{s}", .{path});
+    const bytes = try readFileAll(allocator, path_z, 64 * 1024 * 1024);
     defer allocator.free(bytes);
     const parsed = std.json.parseFromSlice(Manifest, allocator, bytes, .{
         // The byte buffer is freed before the parse result is used.

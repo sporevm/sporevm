@@ -41,9 +41,9 @@ const usage =
     \\                      Mint child spores that share parent chunks
     \\  fanout <children-dir> [--for DURATION]
     \\                      Resume forked children concurrently with prefixed output
-    \\  pack <spore-dir> --out DIR
+    \\  pack <spore-dir> [--children DIR] --out DIR
     \\                      Pack portable spore chunks into a local bundle
-    \\  unpack <bundle-dir> --out DIR
+    \\  unpack <bundle-dir> [--child ID] --out DIR
     \\                      Unpack a local spore bundle into a spore dir
     \\  help                Show this help
     \\
@@ -213,12 +213,16 @@ fn forkCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.
 fn packCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.PackResult {
     var spore_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
+    var children_dir: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
             i += 1;
             out_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--children") and i + 1 < args.len) {
+            i += 1;
+            children_dir = args[i];
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             std.debug.print("unknown pack argument: {s}\n", .{args[i]});
             std.process.exit(2);
@@ -231,7 +235,7 @@ fn packCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
     }
 
     if (spore_dir == null or out_dir == null) {
-        std.debug.print("usage: spore pack <spore-dir> --out DIR\n", .{});
+        std.debug.print("usage: spore pack <spore-dir> [--children DIR] --out DIR\n", .{});
         std.process.exit(2);
     }
 
@@ -240,18 +244,23 @@ fn packCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
         .spore_dir = spore_dir.?,
         .out_dir = out_dir.?,
         .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
+        .children_dir = children_dir,
     });
 }
 
 fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.UnpackResult {
     var bundle_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
+    var child_id: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
             i += 1;
             out_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--child") and i + 1 < args.len) {
+            i += 1;
+            child_id = args[i];
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             std.debug.print("unknown unpack argument: {s}\n", .{args[i]});
             std.process.exit(2);
@@ -264,7 +273,7 @@ fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []c
     }
 
     if (bundle_dir == null or out_dir == null) {
-        std.debug.print("usage: spore unpack <bundle-dir> --out DIR\n", .{});
+        std.debug.print("usage: spore unpack <bundle-dir> [--child ID] --out DIR\n", .{});
         std.process.exit(2);
     }
 
@@ -273,6 +282,7 @@ fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []c
         .bundle_dir = bundle_dir.?,
         .out_dir = out_dir.?,
         .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
+        .child_id = child_id,
     });
 }
 

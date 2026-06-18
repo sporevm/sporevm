@@ -27,7 +27,7 @@ not stored inside the spore directory today; the manifest records its digest,
 size, device binding, and provenance so `spore resume` can reopen and verify the
 cached bytes before boot.
 
-A local bundle is the first distribution form:
+A local single-spore bundle is the first distribution form:
 
 ```text
 <bundle>/
@@ -38,20 +38,38 @@ A local bundle is the first distribution form:
                             # optional exact immutable rootfs artifact
 ```
 
+An indexed distribution bundle can carry a parent manifest and many child
+manifests without duplicating shared memory chunks:
+
+```text
+<bundle>/
+├── bundle.json
+├── manifests/
+│   ├── parent.json
+│   └── children/000042.json
+├── chunkpack.index.json
+├── chunkpacks/000000.pack
+├── rootfs.index.json       # optional rootfs digest -> artifact policy
+└── rootfs/blake3/<hex>.ext4
+```
+
 Bundles are an implementation format for distribution, not a new machine-state
-contract. The BLAKE3 ids in `manifest.json` remain the restore-time trust root;
+contract. The BLAKE3 ids in the selected manifest remain the restore-time trust root;
 the SHA256 values in the chunkpack index make each packed segment compatible
 with blob-store and later OCI-style descriptor verification. `spore pack` and
 `spore unpack` also report a `bundle_digest`, a SHA256 digest over the exact
-bundle bytes (`manifest.json`, `chunkpack.index.json`, pack blobs, and any
-included rootfs artifacts) for cache identity. It is not a replacement for
-per-chunk or per-rootfs verification.
+bundle bytes that affect materialization, including bundle metadata, manifests,
+chunkpack metadata, pack blobs, rootfs metadata, and included rootfs artifacts.
+It is not a replacement for per-chunk or per-rootfs verification.
 
 If `manifest.json` records an immutable rootfs artifact, `spore pack` includes
 the exact ext4 bytes at `rootfs/blake3/<hex>.ext4` after verifying the source
 digest-cache entry by BLAKE3 and size. `spore unpack` requires that bundled
 artifact, verifies it against the manifest, then installs it into the local
-rootfs digest cache before writing the unpacked manifest.
+rootfs digest cache before writing the unpacked manifest. Indexed bundles record
+that artifact in `rootfs.index.json` with an explicit `exact-bytes` policy.
+`metadata-only` is a recognized metadata policy, but materialized unpack rejects
+it until a later prepared-cache workflow exists.
 
 ## Manifest v0
 
@@ -143,6 +161,9 @@ rootfs digest cache before writing the unpacked manifest.
 - Chunkpack bundles are portable only after local RAM backing metadata has been
   stripped. `spore unpack` reconstitutes normal `chunks/<blake3>` files and
   fails closed when a pack segment's SHA256 or logical BLAKE3 id mismatches.
+- Indexed bundles validate `bundle.json` child ids and relative manifest paths
+  before selecting a parent or child manifest. `spore unpack --child 000042`
+  writes a normal spore directory for the selected child.
 - Rootfs-backed bundles include exact immutable rootfs bytes by default. Bundle
   unpack refuses missing, symlinked, or digest-mismatched rootfs artifacts before
   writing a resumable spore.

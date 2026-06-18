@@ -206,13 +206,19 @@ an attached rootfs fd.
   with `manifest.json`, `chunkpack.index.json`, chunkpacks, optional
   `rootfs/blake3/<hex>.ext4` artifacts, `bundle_digest`, chunk verification,
   and rootfs digest-cache installation.
+- `spore pack --children DIR` writes an indexed local bundle with
+  `bundle.json`, `manifests/parent.json`, `manifests/children/<id>.json`,
+  shared chunkpacks, and optional `rootfs.index.json` entries with explicit
+  rootfs artifact policy.
+- `spore unpack --child ID` can materialize one selected child from an indexed
+  local bundle into a normal spore directory.
 - Foundation Slice 6 has S3/SSM remote restore, host-local cache reuse,
   source-peer HTTP seeding, corrupt-bundle rejection, and ten-instance star/tree
   smoke evidence.
 - `spore run --image`, `spore resume`, `spore fork`, and `spore fanout` support
   local immutable-rootfs fan-out.
-- Current `spore pack` accepts one spore directory and has no `--children`,
-  `push`, `pull`, metadata-only rootfs mode, or multi-rootfs artifact index.
+- Current distribution still has no `push`, `pull`, metadata-only rootfs CLI
+  mode, remote store adapter, or node-local bundle cache reuse.
 
 ## Delivery Strategy
 
@@ -246,6 +252,9 @@ does add a new attacker-influenced rootfs index in this slice, it must update
 `SECURITY.md` and add a fuzz target in the same PR.
 
 ### Slice 2: Distribution Bundle Index
+
+Status: implemented for local `spore pack --children` and `spore unpack --child`
+on filesystem bundles.
 
 Add a bundle-level index that can name one parent manifest, many child
 manifests, the chunkpack index, optional rootfs artifacts, and the bundle digest.
