@@ -18,6 +18,7 @@ pub const Backend = run_mod.Backend;
 const default_resume_guest_port: u32 = 10700;
 const generation_probe_host_port: u32 = 49153;
 const generation_probe_timeout_ms: u64 = 5_000;
+const hvf_generation_probe_rx_delay_ms: u64 = 25;
 
 pub const Options = struct {
     backend: Backend = .auto,
@@ -113,6 +114,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .resume_dir = opts.spore_dir,
                 .exec_probe = identity_probe,
                 .exec_probe_timeout_ms = generation_probe_timeout_ms,
+                .exec_probe_initial_rx_delay_ms = hvf_generation_probe_rx_delay_ms,
                 .exec_probe_completes_run = false,
                 .exec_probe_failure_fatal = false,
             });

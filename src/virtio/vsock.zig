@@ -111,6 +111,7 @@ pub const HostStream = struct {
     }
 
     pub fn markStarted(self: *HostStream) void {
+        self.started_at_ms = monotonicMs();
         self.start_ms = self.elapsedMs();
     }
 
