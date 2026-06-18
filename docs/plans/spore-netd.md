@@ -183,7 +183,9 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   implement DNS, TCP, policy, or zmoltcp integration yet.
 - `src/net_gateway.zig` owns helper startup, stderr readiness, deterministic
   shutdown, SIGPIPE-safe helper writes, and the parent-side virtio-net backend
-  adapter.
+  adapter. Helper RX frames wake the hypervisor loop, which explicitly flushes
+  pending virtio-net RX buffers and raises the existing net-device interrupt on
+  both HVF and KVM.
 - The minimal initrd agent now reads the `spore_net=1` boot flag, waits for
   `eth0`, assigns the fixed guest IPv4 address and netmask, brings the link up,
   installs the default route through the gateway, and writes resolver config

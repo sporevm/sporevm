@@ -123,6 +123,10 @@ pub const Net = struct {
         self.backend.shutdown();
     }
 
+    pub fn flushPendingRx(self: *Net, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
+        return self.flushRx(&queues[rx_queue], ram);
+    }
+
     fn configRead(ctx: *anyopaque, offset: u64) u32 {
         const self: *Net = @ptrCast(@alignCast(ctx));
         var out: u32 = 0;
@@ -461,6 +465,33 @@ test "rx queue injects pending backend frame with virtio net header" {
     try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, rx_used + 2));
     try std.testing.expectEqual(@as(u32, header_len + frame.len), try ram.read(u32, rx_used + 8));
     try std.testing.expectEqualSlices(u8, &[_]u8{0} ** header_len, buf[packet..][0..header_len]);
+    try std.testing.expectEqualStrings(frame, buf[packet + header_len ..][0..frame.len]);
+    try std.testing.expect(!backend.rx_pending);
+    try std.testing.expectEqual(@as(usize, 1), backend.rx_consumed);
+}
+
+test "net device exposes explicit pending rx flush for async backends" {
+    var backend = TestBackend{};
+    const frame = "async-reply";
+    backend.queueRx(frame);
+
+    var dev = Net.init(.{ .backend = backend.backend() });
+    var t = mmio.Transport.init(dev.device());
+    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
+
+    const rx_desc = 0x000;
+    const rx_avail = 0x400;
+    const rx_used = 0x800;
+    const packet = 0xc00;
+
+    configureQueue(&t, rx_queue, rx_desc, rx_avail, rx_used, ram);
+    try setDesc(ram, rx_desc, 0, packet, header_len + frame.len, 2);
+    try pushAvail(ram, rx_avail, 8, 0);
+
+    try std.testing.expect(dev.flushPendingRx(&t.queues, ram));
+    try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, rx_used + 2));
+    try std.testing.expectEqual(@as(u32, header_len + frame.len), try ram.read(u32, rx_used + 8));
     try std.testing.expectEqualStrings(frame, buf[packet + header_len ..][0..frame.len]);
     try std.testing.expect(!backend.rx_pending);
     try std.testing.expectEqual(@as(usize, 1), backend.rx_consumed);

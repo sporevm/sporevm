@@ -230,6 +230,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         transports_buf[1] = mmio.Transport.init(blk_dev.device());
         transport_count = 2;
     }
+    const net_transport_index = transport_count;
     transports_buf[transport_count] = mmio.Transport.init(net_dev.device());
     transport_count += 1;
     const vsock_transport_index = transport_count;
@@ -581,7 +582,11 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 }
                 if (config.exec_probe != null and !exec_probe_done) continue;
                 if (config.network.failed()) continue;
-                if (config.network.consumeWake()) continue;
+                if (config.network.consumeWake()) {
+                    const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
+                    try flushNetworkRxHvf(&net_dev, &transports_buf[net_transport_index], ram, pager, net_transport_index);
+                    continue;
+                }
                 if (config.exec_control != null) continue;
                 return error.VcpuCanceled;
             },
@@ -1155,6 +1160,20 @@ fn flushVsockRx(vsock_dev: *vsock.Vsock, transport: *mmio.Transport, ram: guestm
 fn wakeNetworkVcpu(context: ?*anyopaque) void {
     const vcpu: *hvf.VcpuHandle = @ptrCast(@alignCast(context orelse return));
     _ = hvf.hv_vcpus_exit(@ptrCast(vcpu), 1);
+}
+
+fn flushNetworkRxHvf(
+    net_dev: *net.Net,
+    transport: *mmio.Transport,
+    ram: guestmem.GuestRam,
+    lazy_pager: ?*lazy_ram.Pager,
+    transport_index: usize,
+) !void {
+    try maybeMaterializeTransportQueues(lazy_pager, transport);
+    if (net_dev.flushPendingRx(&transport.queues, ram)) {
+        transport.interrupt_status |= 1;
+        try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(@intCast(transport_index)), true), "raise net spi");
+    }
 }
 
 /// Drain pending bytes from non-blocking stdin into the console rx queue.

@@ -193,6 +193,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         transports_buf[1] = mmio.Transport.init(blk_dev.device());
         transport_count = 2;
     }
+    const net_transport_index = transport_count;
     transports_buf[transport_count] = mmio.Transport.init(net_dev.device());
     transport_count += 1;
     transports_buf[transport_count] = mmio.Transport.init(vsock_dev.device());
@@ -412,9 +413,13 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
 
         switch (try kvm.runVcpu(vcpu_fd)) {
             .completed => {
+                const stopped_for_wake = run_bytes[kvm.RunLayout.immediate_exit] != 0;
                 if (consumeCaptureWake(config.capture_request, run_bytes)) continue;
                 if (config.network.failed()) continue;
-                if (config.network.consumeWake()) continue;
+                if (config.network.consumeWake()) {
+                    try flushNetworkRxKvm(vm_fd, &net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
+                    if (stopped_for_wake) continue;
+                }
                 pending_kvm_completion = false;
             },
             .interrupted => {
@@ -423,7 +428,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     if (request_capture.isRequested() or request_capture.isAbortRequested()) continue;
                 }
                 if (config.network.failed()) continue;
-                if (config.network.consumeWake()) continue;
+                if (config.network.consumeWake()) {
+                    try flushNetworkRxKvm(vm_fd, &net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
+                    continue;
+                }
                 std.log.err("KVM_RUN interrupted without a pending capture request", .{});
                 return error.KvmIoctlFailed;
             },
@@ -460,6 +468,19 @@ fn wakeKvmRun(context: ?*anyopaque) callconv(.c) void {
 fn wakeNetworkKvmRun(context: ?*anyopaque) void {
     const wake: *KvmCaptureWake = @ptrCast(@alignCast(context orelse return));
     wake.run[kvm.RunLayout.immediate_exit] = 1;
+}
+
+fn flushNetworkRxKvm(
+    vm_fd: std.c.fd_t,
+    net_dev: *net.Net,
+    transport: *mmio.Transport,
+    ram: guestmem.GuestRam,
+    transport_index: usize,
+) !void {
+    if (net_dev.flushPendingRx(&transport.queues, ram)) {
+        transport.interrupt_status |= 1;
+        try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(transport_index)), true);
+    }
 }
 
 fn consumeCaptureWake(capture_request: ?*capture.Request, run_bytes: []u8) bool {
