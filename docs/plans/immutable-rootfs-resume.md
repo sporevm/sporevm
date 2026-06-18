@@ -125,8 +125,10 @@ The distribution plan currently owns:
 
 1. Preserve default exact immutable rootfs artifact inclusion through remote
    push/pull.
-2. Defer metadata-only prepared-cache workflows until there is an explicit CLI
-   and cache-preparation contract.
+2. Keep metadata-only prepared-cache workflows explicit: distribution bundles
+   may opt out of rootfs bytes only through the indexed bundle CLI, and
+   materialization must verify the destination digest cache before writing a
+   resumable spore.
 3. Prefer exact ext4 bytes over OCI rebuilds for the first remote demo, because
    rebuilds can drift with tooling even when OCI provenance is stable.
 4. Document the same-class Linux/KVM aarch64 host requirement.
@@ -144,8 +146,7 @@ restore authority.
 - `spore rootfs import PATH` for arbitrary local rootfs images.
 - Standalone `spore rootfs preload SPORE` for local artifact preparation after
   the distribution plan lands bundle-default rootfs inclusion.
-- Additional prepared-cache UX after distribution bundle metadata supports
-  metadata-only rootfs policy.
+- Additional prepared-cache UX beyond the indexed bundle `metadata-only` policy.
 - Automatic OCI rebuild during `spore resume`, if product UX later justifies
   network and toolchain dependency in the resume path.
 - Serialization of pending read-only virtio-blk requests at capture time.

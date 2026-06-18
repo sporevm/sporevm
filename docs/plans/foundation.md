@@ -317,7 +317,7 @@ inputs.
   pull-based artifact model in `docs/plans/distribution.md`.
 - Rootfs-backed distribution bundles include exact immutable rootfs bytes by
   default; metadata-only rootfs bundles require an explicit opt-out and bundle
-  metadata, so they are not part of the first exact-rootfs bundle slice.
+  metadata, plus an explicit prepared-cache materialization flag.
 - Local `spore pull file://...` fully materializes a selected child before
   product resume; remote and lazy pull sources must keep the same verified
   content-source boundary.
