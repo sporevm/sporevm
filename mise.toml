@@ -33,6 +33,10 @@ description = "Smoke product spore run static network configuration"
 run = "mise run build && scripts/smoke-run-net-dns.sh"
 description = "Smoke product spore run DNS proxying"
 
+[tasks."smoke:run-net-http"]
+run = "mise run build && scripts/smoke-run-net-http.sh"
+description = "Smoke product spore run outbound HTTP proxying"
+
 [tasks."smoke:counter-fanout"]
 run = "mise run build && scripts/smoke-counter-fanout.sh"
 description = "Smoke capture, fork, and resume counter fan-out"

@@ -32,7 +32,9 @@ pub const resume_cmd = @import("resume.zig");
 pub const rootfs = @import("rootfs.zig");
 pub const rootfs_cache = @import("rootfs_cache.zig");
 pub const run = @import("run.zig");
+pub const spore_net = @import("spore_net.zig");
 pub const spore_netd = @import("spore_netd.zig");
+pub const spore_netd_tcp = @import("spore_netd_tcp.zig");
 pub const spore = @import("spore.zig");
 pub const zmoltcp_gateway = @import("zmoltcp_gateway.zig");
 pub const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
@@ -70,7 +72,9 @@ test {
     testing.refAllDecls(resume_cmd);
     testing.refAllDecls(rootfs_cache);
     testing.refAllDecls(run);
+    testing.refAllDecls(spore_net);
     testing.refAllDecls(spore_netd);
+    testing.refAllDecls(spore_netd_tcp);
     testing.refAllDecls(zmoltcp_gateway);
     testing.refAllDecls(virtio.queue);
     testing.refAllDecls(virtio.mmio);

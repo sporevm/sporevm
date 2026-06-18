@@ -1,21 +1,22 @@
 //! Minimal `spore-netd` helper.
 //!
 //! The helper owns a bounded Ethernet frame stream, ARP replies for the fixed
-//! gateway address, and the first narrow DNS proxy path. TCP relay and policy
-//! land in later slices.
+//! gateway address, narrow DNS proxying, and the first outbound TCP proxy path.
 
 const std = @import("std");
+const zmoltcp = @import("zmoltcp");
 const Io = std.Io;
 
-const virtio_net = @import("virtio/net.zig");
+const spore_net = @import("spore_net.zig");
+const spore_netd_tcp = @import("spore_netd_tcp.zig");
 
-pub const max_frame_len = virtio_net.max_frame_len;
+pub const max_frame_len = spore_net.max_frame_len;
 pub const frame_header_len = 4;
 
-pub const guest_mac = virtio_net.default_mac;
-pub const gateway_mac: [6]u8 = .{ 0x02, 0x53, 0x50, 0x4f, 0x52, 0x01 };
-pub const guest_ipv4: [4]u8 = .{ 100, 96, 0, 2 };
-pub const gateway_ipv4: [4]u8 = .{ 100, 96, 0, 1 };
+pub const guest_mac = spore_net.guest_mac;
+pub const gateway_mac = spore_net.gateway_mac;
+pub const guest_ipv4 = spore_net.guest_ipv4;
+pub const gateway_ipv4 = spore_net.gateway_ipv4;
 
 const ethernet_header_len = 14;
 const arp_packet_len = 28;
@@ -107,20 +108,53 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .server_ipv4 = resolveHostDnsServer(init.io, init.arena.allocator()),
     };
     const dns_forwarder = host_dns.forwarder();
+    var tcp_gateway: spore_netd_tcp.Gateway = undefined;
+    tcp_gateway.init();
 
     try writeAllFd(2, "ready\n");
     var in_buf: [max_frame_len]u8 = undefined;
+    var reply_buf: [max_frame_len]u8 = undefined;
     while (true) {
-        const frame = readFrameFd(0, &in_buf) catch |err| switch (err) {
-            error.EndOfStream => return,
-            else => |e| return e,
-        };
-        std.log.debug("spore-netd rx frame len={d}", .{frame.len});
-        var reply_buf: [max_frame_len]u8 = undefined;
-        if (frameReply(frame, &reply_buf, dns_forwarder)) |reply| {
-            try writeFrameFd(1, reply);
+        const now = tcpNow();
+        var fds: [1 + spore_netd_tcp.max_flows]std.posix.pollfd = undefined;
+        fds[0] = .{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 };
+        const host_fd_count = tcp_gateway.fillPollFds(fds[1..]);
+        const poll_fds = fds[0 .. 1 + host_fd_count];
+        const timeout_ms = tcp_gateway.nextPollTimeoutMs(now);
+        _ = std.posix.poll(poll_fds, timeout_ms) catch return error.IoFailed;
+
+        const after_poll = tcpNow();
+        if ((fds[0].revents & (std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) return error.IoFailed;
+        if ((fds[0].revents & (std.c.POLL.IN | std.c.POLL.HUP)) != 0) {
+            const frame = readFrameFd(0, &in_buf) catch |err| switch (err) {
+                error.EndOfStream => return,
+                else => |e| return e,
+            };
+            std.log.debug("spore-netd rx frame len={d}", .{frame.len});
+            if (frameReply(frame, &reply_buf, dns_forwarder)) |reply| {
+                try writeFrameFd(1, reply);
+            } else if (!tcp_gateway.receiveFrame(frame, after_poll)) {
+                std.log.debug("spore-netd dropped unsupported frame len={d}", .{frame.len});
+            }
         }
+
+        tcp_gateway.servicePoll(fds[1 .. 1 + host_fd_count]);
+        tcp_gateway.service(after_poll);
+        try drainTcpGateway(&tcp_gateway);
     }
+}
+
+fn drainTcpGateway(gateway: *spore_netd_tcp.Gateway) FrameIoError!void {
+    while (gateway.dequeueFrame()) |frame| {
+        try writeFrameFd(1, frame);
+    }
+}
+
+fn tcpNow() zmoltcp.time.Instant {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return zmoltcp.time.Instant.ZERO;
+    const micros = @as(i64, @intCast(ts.sec)) * 1_000_000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000);
+    return zmoltcp.time.Instant.fromMicros(micros);
 }
 
 pub fn writeFrameFd(fd: std.c.fd_t, frame: []const u8) FrameIoError!void {

@@ -182,7 +182,12 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   shutdown, ARP replies for the fixed gateway MAC/IP, and narrow IPv4 UDP/53 DNS
   proxying through the host resolver. Frame bounds, ARP handling, IPv4/UDP DNS
   dispatch, DNS name parsing, and malformed DNS handling have unit and fuzz
-  coverage. It does not implement TCP relay or policy yet.
+  coverage.
+- `src/spore_netd_tcp.zig` now adapts the pinned `zmoltcp` forwarder into a
+  bounded outbound TCP proxy. It keeps the hard egress floor outside the guest,
+  denies blocked destinations before opening host sockets, relays accepted
+  flows through nonblocking host `connect()` sockets, and bounds flow count,
+  buffers, connect timeout, and idle lifetime.
 - `src/net_gateway.zig` owns helper startup, stderr readiness, deterministic
   shutdown, SIGPIPE-safe helper writes, and the parent-side virtio-net backend
   adapter. Helper RX frames wake the hypervisor loop, which explicitly flushes
@@ -315,6 +320,8 @@ Definition of done:
 
 ### Slice 7: Outbound TCP Proxy
 
+Status: implemented in the Slice 7 branch.
+
 Integrate the `zmoltcp` forwarder into `spore-netd` so guest TCP flows terminate
 at the gateway and relay payloads to host `connect()` sockets.
 
@@ -363,6 +370,8 @@ Definition of done:
   DNS packet parsing, TCP segment parsing, frame-stream decode.
 - Product smokes: guest address/route inspection, DNS lookup, outbound HTTP,
   hard-floor denial, helper crash before ready, helper crash during run.
+  `mise run smoke:run-net-http` covers the first outbound HTTP path with the
+  minimal initrd `/bin/wget` helper.
 - Backend smokes: the same one-shot network smoke on HVF and KVM.
 - Regression checks: no behavior change for `spore run` without `--net`,
   capture without network, rootfs-backed run, and lifecycle commands.
