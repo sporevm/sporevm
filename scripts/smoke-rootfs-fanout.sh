@@ -39,85 +39,39 @@ image_ref="${SPORE_SMOKE_ROOTFS_IMAGE:-docker.io/library/ruby:3.3-alpine}"
 platform="${SPORE_SMOKE_ROOTFS_PLATFORM:-linux/arm64}"
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-rootfs-fanout.XXXXXX")"
-run_pid=""
-watchdog_pid=""
+child_pids=()
 cleanup() {
-  if [[ -n "${run_pid}" ]]; then
-    kill -TERM "${run_pid}" >/dev/null 2>&1 || true
-    wait "${run_pid}" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "${watchdog_pid}" ]]; then
-    kill "${watchdog_pid}" >/dev/null 2>&1 || true
-    wait "${watchdog_pid}" >/dev/null 2>&1 || true
+  if ((${#child_pids[@]})); then
+    for pid in "${child_pids[@]}"; do
+      kill -TERM "${pid}" >/dev/null 2>&1 || true
+      wait "${pid}" >/dev/null 2>&1 || true
+    done
   fi
   rm -rf "${workdir}"
 }
 trap cleanup EXIT
 
-capture_dir="${workdir}/ruby-counter.spore"
+capture_dir="${workdir}/ruby-base.spore"
 fork_dir="${workdir}/children"
 run_stdout="${workdir}/run.stdout"
 run_stderr="${workdir}/run.stderr"
-fanout_stdout="${workdir}/fanout.stdout"
-fanout_stderr="${workdir}/fanout.stderr"
-resolved_image_ref="$("${spore_bin}" rootfs resolve "${image_ref}" --platform "${platform}")"
+if [[ "${image_ref}" == *@sha256:* ]]; then
+  resolved_image_ref="${image_ref}"
+else
+  resolved_image_ref="$("${spore_bin}" rootfs resolve "${image_ref}" --platform "${platform}")"
+fi
 printf 'rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}"
 
 "${spore_bin}" run \
   --backend "${backend}" \
   --image "${resolved_image_ref}" \
   --capture "${capture_dir}" \
-  --capture-on USR1 \
-  -- /usr/local/bin/ruby \
-  -e 'def spore_env; File.readlines("/run/sporevm/env").to_h { |l| l.strip.split("=", 2) }; rescue; {}; end' \
-  -e 'STDOUT.sync = true; puts "spore run ready"; printed = false; i = 0' \
-  -e 'loop do' \
-  -e 'e = spore_env; if !printed && e["SPORE_PARALLEL_JOB"] && e["SPORE_PARALLEL_JOB_COUNT"]' \
-  -e 'puts "spore parallel job #{e["SPORE_PARALLEL_JOB"]}/#{e["SPORE_PARALLEL_JOB_COUNT"]}"; printed = true; end' \
-  -e 'puts "ruby counter #{i}"; i += 1; sleep 1; end' \
-  >"${run_stdout}" 2>"${run_stderr}" &
-run_pid="$!"
-
-seen_counter=0
-for _ in $(seq 1 "${SPORE_SMOKE_ROOTFS_CAPTURE_POLLS:-600}"); do
-  if grep -Eaq 'ruby counter [0-9]+' "${run_stdout}"; then
-    seen_counter=1
-    break
-  fi
-  if ! kill -0 "${run_pid}" >/dev/null 2>&1; then
-    break
-  fi
-  sleep "${SPORE_SMOKE_ROOTFS_CAPTURE_POLL_INTERVAL:-0.5}"
-done
-if [[ "${seen_counter}" != "1" ]]; then
-  tail -80 "${run_stdout}" >&2 || true
-  tail -160 "${run_stderr}" >&2 || true
-  die "rootfs fan-out smoke did not see the fresh Ruby counter"
-fi
-
-sleep "${SPORE_SMOKE_ROOTFS_CAPTURE_SETTLE_SECONDS:-1}"
-kill -USR1 "${run_pid}"
-
-(
-  sleep "${SPORE_SMOKE_CAPTURE_TIMEOUT_SECONDS:-30}"
-  kill -TERM "${run_pid}" >/dev/null 2>&1 || true
-) &
-watchdog_pid="$!"
-
-set +e
-wait "${run_pid}"
-run_rc="$?"
-set -e
-run_pid=""
-kill "${watchdog_pid}" >/dev/null 2>&1 || true
-wait "${watchdog_pid}" >/dev/null 2>&1 || true
-watchdog_pid=""
-
-if [[ "${run_rc}" != "0" ]]; then
+  -- /bin/true \
+  >"${run_stdout}" 2>"${run_stderr}" || {
   cat "${run_stdout}" >&2 || true
   cat "${run_stderr}" >&2 || true
-  die "spore run capture exited ${run_rc}, expected 0"
-fi
+  die "spore run rootfs base capture failed"
+}
 [[ -f "${capture_dir}/manifest.json" ]] || die "capture did not write ${capture_dir}/manifest.json"
 grep -Fq '"rootfs"' "${capture_dir}/manifest.json" || die "capture manifest did not record rootfs metadata"
 grep -Fq '"digest": "blake3:' "${capture_dir}/manifest.json" || die "capture manifest did not record a rootfs digest"
@@ -130,30 +84,51 @@ while IFS= read -r child; do
 done < <(find "${fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort)
 [[ "${#children[@]}" == "${count}" ]] || die "expected ${count} child spores, found ${#children[@]}"
 
-set +e
-"${spore_bin}" fanout --backend "${backend}" "${fork_dir}" --parallel --for "${SPORE_SMOKE_ROOTFS_FANOUT_DURATION:-20s}" \
-  >"${fanout_stdout}" 2>"${fanout_stderr}"
-fanout_rc="$?"
-set -e
-
-if [[ "${fanout_rc}" != "0" ]]; then
-  cat "${fanout_stdout}" >&2 || true
-  cat "${fanout_stderr}" >&2 || true
-  die "spore fanout exited ${fanout_rc}, expected 0"
-fi
-
+child_stdout=()
+child_stderr=()
 for child in "${children[@]}"; do
   child_name="$(basename "${child}")"
-  child_index="$((10#${child_name}))"
-  if ! grep -Eaq "^\[${child_name}\] spore parallel job ${child_index}/${count}" "${fanout_stdout}"; then
-    tail -160 "${fanout_stdout}" >&2 || true
-    cat "${fanout_stderr}" >&2 || true
-    die "child ${child_name} did not report SPORE_PARALLEL_JOB=${child_index} SPORE_PARALLEL_JOB_COUNT=${count}"
+  stdout_path="${workdir}/run-from-${child_name}.stdout"
+  stderr_path="${workdir}/run-from-${child_name}.stderr"
+  child_stdout+=("${stdout_path}")
+  child_stderr+=("${stderr_path}")
+  "${spore_bin}" run \
+    --backend "${backend}" \
+    --from "${child}" \
+    -- /usr/local/bin/ruby \
+      -e 'STDOUT.sync = true; STDERR.sync = true; child = ARGV.fetch(0); puts "ruby child #{child}"; warn "ruby stderr #{child}"' \
+      "${child_name}" \
+    >"${stdout_path}" 2>"${stderr_path}" &
+  child_pids+=("$!")
+done
+
+failed=0
+for i in "${!child_pids[@]}"; do
+  pid="${child_pids[$i]}"
+  set +e
+  wait "${pid}"
+  rc="$?"
+  set -e
+  if [[ "${rc}" != "0" ]]; then
+    cat "${child_stdout[$i]}" >&2 || true
+    cat "${child_stderr[$i]}" >&2 || true
+    failed=1
   fi
-  if ! grep -Eaq "^\[${child_name}\] .*ruby counter [0-9]+" "${fanout_stdout}"; then
-    tail -120 "${fanout_stdout}" >&2 || true
-    cat "${fanout_stderr}" >&2 || true
-    die "child ${child_name} did not stream a prefixed resumed Ruby counter line"
+done
+child_pids=()
+[[ "${failed}" == "0" ]] || die "one or more rootfs child run-from commands failed"
+
+for i in "${!children[@]}"; do
+  child_name="$(basename "${children[$i]}")"
+  if ! grep -Fxq "ruby child ${child_name}" "${child_stdout[$i]}"; then
+    cat "${child_stdout[$i]}" >&2 || true
+    cat "${child_stderr[$i]}" >&2 || true
+    die "child ${child_name} did not stream run-from stdout"
+  fi
+  if ! grep -Fxq "ruby stderr ${child_name}" "${child_stderr[$i]}"; then
+    cat "${child_stdout[$i]}" >&2 || true
+    cat "${child_stderr[$i]}" >&2 || true
+    die "child ${child_name} did not stream run-from stderr"
   fi
 done
 

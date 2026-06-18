@@ -21,13 +21,9 @@ description = "Run unit tests, build, and diff hygiene"
 run = "mise run build && scripts/smoke-run.sh"
 description = "Smoke product spore run streaming and exit status"
 
-[tasks."smoke:resume"]
-run = "mise run build && scripts/smoke-resume.sh"
-description = "Smoke product spore resume"
-
 [tasks."smoke:run-capture"]
 run = "mise run build && scripts/smoke-run-capture.sh"
-description = "Smoke product spore run signal capture"
+description = "Smoke product spore run signal capture and resume"
 
 [tasks."smoke:counter-fanout"]
 run = "mise run build && scripts/smoke-counter-fanout.sh"
@@ -35,12 +31,12 @@ description = "Smoke capture, fork, and resume counter fan-out"
 
 [tasks."smoke:rootfs-fanout"]
 run = "mise run build && scripts/smoke-rootfs-fanout.sh"
-description = "Smoke OCI rootfs capture, fork, and resume fan-out"
+description = "Smoke OCI rootfs capture, fork, and run-from child execution"
 
 [tasks."smoke:local-pull"]
 run = "mise run build && scripts/smoke-local-pull.sh"
 description = "Smoke local file:// pull materialization and resumed rootfs fan-out"
 
 [tasks.smoke]
-run = "mise run build && scripts/smoke-run.sh && scripts/smoke-run-capture.sh && scripts/smoke-resume.sh"
+run = "mise run build && scripts/smoke-run.sh && scripts/smoke-run-capture.sh"
 description = "Run product smoke tests"

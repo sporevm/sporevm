@@ -228,24 +228,18 @@ Current hard failures include:
 
 ## Smoke contract
 
-Diskless restore smokes use:
+State portability checks should use product-created spores wherever possible:
 
-- the `cleanroom-kernels` `initrd` profile, published from v0.2.0 onward;
-- `scripts/make-smoke-initrd.sh` to build a static `/init` ticker;
-- `scripts/smoke-restore-leg.sh` to run capture and resume legs with explicit
-  spore transfer between hosts when needed.
+- `spore run --capture ...` to create diskless or immutable-rootfs spores;
+- `spore resume` to validate restore;
+- `spore fork` and `spore fanout` to validate child identity and parallel
+  resume behavior.
 
 Current evidence:
 
-- KVM same-host diskless restore on the `m7g.metal` host resumes the ticker
-  through `sporevm-initrd-tick 7`.
-- HVF same-host diskless restore locally resumes the ticker through
-  `sporevm-initrd-tick 7`.
-- HVF same-host lazy restore locally resumes 512MiB with ttfi_ms=50 and 4GiB
-  with ttfi_ms=65; both materialize only the touched CAS chunks before useful
-  guest work.
-- HVF same-host fork fan-out locally runs trusted file-backed children; a
-  representative 8-child, parallel-4 run reported file_backed_children=8.
+- Product smokes cover same-host diskless capture/resume, diskless fork/fan-out,
+  and OCI-rootfs child execution through `mise run smoke`,
+  `mise run smoke:counter-fanout`, and `mise run smoke:rootfs-fanout`.
 - KVM→HVF with an `m7g.metal` producer is a negative test: the spore records
   `counter_frequency_hz = 1_050_000_000` and HVF exposes 24MHz, so restore must
   reject it before running guest code.

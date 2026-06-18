@@ -115,13 +115,13 @@ mint child spores with `spore fork`, then resume them individually or through
   immutable-rootfs spore at a time.
 - `src/fanout.zig` implements product fan-out over an existing child-spore
   directory.
-- `scripts/ensure-managed-kernel.sh` remains available, but managed kernel
-  resolution now lives in the product path and verifies downloaded assets.
+- Managed kernel resolution lives in the product path and verifies downloaded
+  assets.
 - `scripts/make-minimal-exec-initrd.sh` builds the minimal guest exec agent and
   diskless helper binaries used by the bridge smokes.
 - `scripts/smoke-run.sh`, `scripts/smoke-run-capture.sh`,
-  `scripts/smoke-resume.sh`, `scripts/smoke-counter-fanout.sh`, and
-  `scripts/smoke-rootfs-fanout.sh` cover the landed bridge surface.
+  `scripts/smoke-counter-fanout.sh`, and `scripts/smoke-rootfs-fanout.sh` cover
+  the landed bridge surface.
 
 ## Safety And Invariants
 
@@ -166,10 +166,6 @@ mint child spores with `spore fork`, then resume them individually or through
 - `mise run smoke:counter-fanout`
 - `mise run smoke:rootfs-fanout`
 - `scripts/smoke-run-oci-rootfs.sh -- /bin/echo hi`
-
-Lower-level backend restore and dirty-tracking smokes remain in the foundation
-plan because they validate memory, distribution, and hypervisor mechanics rather
-than the run bridge itself.
 
 ## Resolved Decisions
 
