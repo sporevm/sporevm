@@ -21,6 +21,11 @@ pub const CopyOptions = struct {
     allow_hardlink: bool = false,
 };
 
+pub const InstallResult = struct {
+    cache_hit: bool,
+    bytes_fetched: u64,
+};
+
 pub fn openVerifiedFromCache(
     io: Io,
     allocator: std.mem.Allocator,
@@ -68,6 +73,17 @@ pub fn installExpectedPath(
     artifact: spore.RootfsArtifactRef,
     copy_options: CopyOptions,
 ) !void {
+    _ = try installExpectedPathWithResult(io, allocator, cache_root, source_path, artifact, copy_options);
+}
+
+pub fn installExpectedPathWithResult(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    source_path: []const u8,
+    artifact: spore.RootfsArtifactRef,
+    copy_options: CopyOptions,
+) !InstallResult {
     const digest_path = try digestPath(allocator, cache_root, artifact.digest);
     const digest_dir = std.fs.path.dirname(digest_path) orelse return error.RootFSOpenFailed;
     try ensureDirPath(io, digest_dir);
@@ -76,10 +92,13 @@ pub fn installExpectedPath(
     if (try pathExistsNoSymlink(io, digest_path)) {
         if (!try regularFileNoSymlink(io, digest_path)) return error.RootFSDigestMismatch;
         try chmodReadOnly(allocator, digest_path);
+        try verifyPath(io, allocator, digest_path, artifact, true);
+        return .{ .cache_hit = true, .bytes_fetched = 0 };
     } else {
         try copyVerifiedPath(io, allocator, source_path, digest_path, artifact, copy_options);
     }
     try verifyPath(io, allocator, digest_path, artifact, true);
+    return .{ .cache_hit = false, .bytes_fetched = artifact.size };
 }
 
 pub fn copyVerifiedPath(

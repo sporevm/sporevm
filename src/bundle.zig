@@ -109,6 +109,7 @@ pub const PullResult = struct {
     chunk_count: usize,
     materialized_chunk_count: usize,
     payload_bytes: u64,
+    chunk_bytes_fetched: u64 = 0,
     cache_hit_count: usize = 0,
     cache_miss_count: usize = 0,
     linked_chunk_count: usize = 0,
@@ -117,6 +118,9 @@ pub const PullResult = struct {
     remote_bundle_cache_hit: bool = false,
     rootfs_artifact_count: usize = 0,
     rootfs_payload_bytes: u64 = 0,
+    rootfs_cache_hit_count: usize = 0,
+    rootfs_cache_miss_count: usize = 0,
+    rootfs_bytes_fetched: u64 = 0,
     child_count: usize = 0,
     selected_child: ?[]const u8 = null,
 };
@@ -214,6 +218,14 @@ const MaterializeResult = struct {
     cache_miss_count: usize = 0,
     linked_chunk_count: usize = 0,
     copied_chunk_count: usize = 0,
+};
+
+const RootfsMaterializeResult = struct {
+    artifact_count: usize = 0,
+    payload_bytes: u64 = 0,
+    cache_hit_count: usize = 0,
+    cache_miss_count: usize = 0,
+    bytes_fetched: u64 = 0,
 };
 
 pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult {
@@ -428,7 +440,7 @@ pub fn unpack(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unpack
         null,
     );
 
-    const rootfs_payload_bytes = try unpackRootfsArtifact(allocator, options, manifest);
+    const rootfs_result = try unpackRootfsArtifact(allocator, options, manifest);
     try spore.saveManifest(allocator, options.out_dir, manifest);
     const bundle_digest = try digestHex(allocator, options.bundle_dir);
 
@@ -439,8 +451,8 @@ pub fn unpack(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unpack
         .chunk_count = plan.chunk_count,
         .unpacked_chunk_count = materialized.materialized_chunk_count,
         .payload_bytes = materialized.payload_bytes,
-        .rootfs_artifact_count = if (manifest.rootfs == null) 0 else 1,
-        .rootfs_payload_bytes = rootfs_payload_bytes,
+        .rootfs_artifact_count = rootfs_result.artifact_count,
+        .rootfs_payload_bytes = rootfs_result.payload_bytes,
     };
 }
 
@@ -478,7 +490,7 @@ fn unpackIndexed(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unp
         null,
     );
 
-    const rootfs_payload_bytes = try unpackRootfsArtifactIndexed(allocator, options, bundle_index, manifest);
+    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, options, bundle_index, manifest);
     try spore.saveManifest(allocator, options.out_dir, manifest);
     const bundle_digest = try digestHex(allocator, options.bundle_dir);
 
@@ -489,8 +501,8 @@ fn unpackIndexed(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unp
         .chunk_count = plan.chunk_count,
         .unpacked_chunk_count = materialized.materialized_chunk_count,
         .payload_bytes = materialized.payload_bytes,
-        .rootfs_artifact_count = if (manifest.rootfs == null) 0 else 1,
-        .rootfs_payload_bytes = rootfs_payload_bytes,
+        .rootfs_artifact_count = rootfs_result.artifact_count,
+        .rootfs_payload_bytes = rootfs_result.payload_bytes,
         .child_count = bundle_index.children.len,
         .selected_child = child_id,
     };
@@ -581,7 +593,7 @@ fn pullLocalIndexedBundle(
         .rootfs_cache_dir = options.rootfs_cache_dir,
         .child_id = child_id,
     };
-    const rootfs_payload_bytes = try unpackRootfsArtifactIndexed(allocator, unpack_options, bundle_index, manifest);
+    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, unpack_options, bundle_index, manifest);
     try spore.saveManifest(allocator, options.out_dir, manifest);
     const bundle_digest = try digestHex(allocator, bundle_dir);
 
@@ -593,12 +605,16 @@ fn pullLocalIndexedBundle(
         .chunk_count = plan.chunk_count,
         .materialized_chunk_count = materialized.materialized_chunk_count,
         .payload_bytes = materialized.payload_bytes,
+        .chunk_bytes_fetched = materialized.payload_bytes,
         .cache_hit_count = materialized.cache_hit_count,
         .cache_miss_count = materialized.cache_miss_count,
         .linked_chunk_count = materialized.linked_chunk_count,
         .copied_chunk_count = materialized.copied_chunk_count,
-        .rootfs_artifact_count = if (manifest.rootfs == null) 0 else 1,
-        .rootfs_payload_bytes = rootfs_payload_bytes,
+        .rootfs_artifact_count = rootfs_result.artifact_count,
+        .rootfs_payload_bytes = rootfs_result.payload_bytes,
+        .rootfs_cache_hit_count = rootfs_result.cache_hit_count,
+        .rootfs_cache_miss_count = rootfs_result.cache_miss_count,
+        .rootfs_bytes_fetched = rootfs_result.bytes_fetched,
         .child_count = bundle_index.children.len,
         .selected_child = child_id,
     };
@@ -1067,17 +1083,22 @@ fn packRootfsArtifactIndexed(
     return rootfs.artifact.size;
 }
 
-fn unpackRootfsArtifact(allocator: std.mem.Allocator, options: UnpackOptions, manifest: spore.Manifest) Error!u64 {
-    const rootfs = manifest.rootfs orelse return 0;
+fn unpackRootfsArtifact(allocator: std.mem.Allocator, options: UnpackOptions, manifest: spore.Manifest) Error!RootfsMaterializeResult {
+    const rootfs = manifest.rootfs orelse return .{};
     const cache_root = options.rootfs_cache_dir orelse return error.IoFailed;
     const rel_path = try rootfsArtifactRelPath(allocator, rootfs.artifact);
     const source_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, rel_path });
-    rootfs_cache.verifyPath(options.io, allocator, source_path, rootfs.artifact, true) catch |err| return rootfsError(err);
-    rootfs_cache.installExpectedPath(options.io, allocator, cache_root, source_path, rootfs.artifact, .{
+    const installed = rootfs_cache.installExpectedPathWithResult(options.io, allocator, cache_root, source_path, rootfs.artifact, .{
         .source_must_not_be_symlink = true,
         .allow_hardlink = false,
     }) catch |err| return rootfsError(err);
-    return rootfs.artifact.size;
+    return .{
+        .artifact_count = 1,
+        .payload_bytes = rootfs.artifact.size,
+        .cache_hit_count = if (installed.cache_hit) 1 else 0,
+        .cache_miss_count = if (installed.cache_hit) 0 else 1,
+        .bytes_fetched = installed.bytes_fetched,
+    };
 }
 
 fn unpackRootfsArtifactIndexed(
@@ -1085,8 +1106,8 @@ fn unpackRootfsArtifactIndexed(
     options: UnpackOptions,
     bundle_index: BundleIndex,
     manifest: spore.Manifest,
-) Error!u64 {
-    const rootfs = manifest.rootfs orelse return 0;
+) Error!RootfsMaterializeResult {
+    const rootfs = manifest.rootfs orelse return .{};
     const cache_root = options.rootfs_cache_dir orelse return error.IoFailed;
     if (bundle_index.rootfs_index == null) return error.BadManifest;
     const parsed_rootfs_index = try loadRootfsIndex(allocator, options.bundle_dir);
@@ -1098,12 +1119,17 @@ fn unpackRootfsArtifactIndexed(
     if (!std.mem.eql(u8, entry.policy, rootfs_policy_exact_bytes)) return error.BadManifest;
     const rel_path = entry.path orelse return error.BadManifest;
     const source_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, rel_path });
-    rootfs_cache.verifyPath(options.io, allocator, source_path, rootfs.artifact, true) catch |err| return rootfsError(err);
-    rootfs_cache.installExpectedPath(options.io, allocator, cache_root, source_path, rootfs.artifact, .{
+    const installed = rootfs_cache.installExpectedPathWithResult(options.io, allocator, cache_root, source_path, rootfs.artifact, .{
         .source_must_not_be_symlink = true,
         .allow_hardlink = false,
     }) catch |err| return rootfsError(err);
-    return rootfs.artifact.size;
+    return .{
+        .artifact_count = 1,
+        .payload_bytes = rootfs.artifact.size,
+        .cache_hit_count = if (installed.cache_hit) 1 else 0,
+        .cache_miss_count = if (installed.cache_hit) 0 else 1,
+        .bytes_fetched = installed.bytes_fetched,
+    };
 }
 
 fn findRootfsEntry(index: RootfsIndex, digest: []const u8) ?RootfsArtifactEntry {
@@ -2295,7 +2321,11 @@ test "pull file bundle materializes children through chunk cache" {
     try std.testing.expectEqual(@as(usize, 2), pulled0.materialized_chunk_count);
     try std.testing.expectEqual(@as(usize, 0), pulled0.cache_hit_count);
     try std.testing.expectEqual(@as(usize, 2), pulled0.cache_miss_count);
+    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.chunk_bytes_fetched);
     try std.testing.expectEqual(@as(usize, 2), pulled0.linked_chunk_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs_cache_hit_count);
+    try std.testing.expectEqual(@as(usize, 1), pulled0.rootfs_cache_miss_count);
+    try std.testing.expectEqual(artifact.size, pulled0.rootfs_bytes_fetched);
 
     const pulled1 = try pull(arena, .{
         .io = io,
@@ -2309,7 +2339,11 @@ test "pull file bundle materializes children through chunk cache" {
     try std.testing.expectEqual(@as(usize, 2), pulled1.materialized_chunk_count);
     try std.testing.expectEqual(@as(usize, 2), pulled1.cache_hit_count);
     try std.testing.expectEqual(@as(usize, 0), pulled1.cache_miss_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.chunk_bytes_fetched);
     try std.testing.expectEqual(@as(usize, 2), pulled1.linked_chunk_count);
+    try std.testing.expectEqual(@as(usize, 1), pulled1.rootfs_cache_hit_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled1.rootfs_cache_miss_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.rootfs_bytes_fetched);
 
     const restored_manifest = try spore.loadManifest(arena, out1_dir);
     defer restored_manifest.deinit();
@@ -2391,6 +2425,10 @@ test "push and pull s3 indexed bundle through verified remote cache" {
     try std.testing.expect(!pulled0.remote_bundle_cache_hit);
     try std.testing.expectEqual(push_result.uploaded_bytes, pulled0.origin_bytes_read);
     try std.testing.expectEqual(@as(usize, 2), pulled0.cache_miss_count);
+    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.chunk_bytes_fetched);
+    try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs_cache_hit_count);
+    try std.testing.expectEqual(@as(usize, 1), pulled0.rootfs_cache_miss_count);
+    try std.testing.expectEqual(artifact.size, pulled0.rootfs_bytes_fetched);
 
     const pulled1 = try pull(arena, .{
         .io = io,
@@ -2406,6 +2444,10 @@ test "push and pull s3 indexed bundle through verified remote cache" {
     try std.testing.expect(pulled1.remote_bundle_cache_hit);
     try std.testing.expectEqual(@as(u64, 0), pulled1.origin_bytes_read);
     try std.testing.expectEqual(@as(usize, 2), pulled1.cache_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.chunk_bytes_fetched);
+    try std.testing.expectEqual(@as(usize, 1), pulled1.rootfs_cache_hit_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled1.rootfs_cache_miss_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.rootfs_bytes_fetched);
 
     const restored_manifest = try spore.loadManifest(arena, out1_dir);
     defer restored_manifest.deinit();

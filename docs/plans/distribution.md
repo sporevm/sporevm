@@ -220,16 +220,16 @@ an attached rootfs fd.
   uploading the canonical bundle file set named by validated metadata.
 - `spore pull s3://BUCKET/PREFIX@sha256:<bundle> --child ID --out DIR`
   downloads only that canonical file set, verifies the bundle digest, reports
-  `origin_bytes_read`, and then materializes through the same verified local
-  content source as `file://` pull.
+  `origin_bytes_read`, `remote_bundle_cache_hit`, `chunk_bytes_fetched`, and
+  rootfs cache hit/fetch metrics, then materializes through the same verified
+  local content source as `file://` pull.
 - Foundation Slice 6 has S3/SSM remote restore, host-local cache reuse,
   source-peer HTTP seeding, corrupt-bundle rejection, and ten-instance star/tree
   smoke evidence.
 - `spore run --image`, `spore resume`, `spore fork`, and `spore fanout` support
   local immutable-rootfs fan-out.
-- Current distribution still has no metadata-only rootfs CLI mode, peer-backed
-  `pull`, or full remote cache reuse metrics for bundle, chunk, rootfs, and
-  origin byte accounting.
+- Current distribution still has no metadata-only rootfs CLI mode or
+  peer-backed `pull`.
 
 ## Delivery Strategy
 
@@ -339,6 +339,8 @@ behind `pull`.
 
 ### Slice 5: Node-Local Cache Reuse
 
+Status: implemented for local and direct-S3 `spore pull` cache metrics.
+
 Make repeated pulls on one host reuse already verified bundle, chunk, and rootfs
 bytes by digest. This is the short-term answer to fan-out efficiency without
 introducing a distributed peer protocol.
@@ -346,6 +348,10 @@ introducing a distributed peer protocol.
 Done when pulling child 0 and child 1 from the same remote bundle on one host
 does not re-fetch shared chunkpacks or rootfs artifacts, and metrics expose
 bundle cache hits, chunk bytes fetched, rootfs bytes fetched, and origin bytes.
+The product `pull` JSON now reports those counters directly. Rootfs-backed unit
+and local pull smokes cover rootfs cache reuse; the direct-S3 real-host smoke
+can run `--dest-repeat 2 --cache-dir DIR` to pull different children on one
+destination and assert the second pull reads zero origin and chunk bytes.
 
 ## Deferred Peer Distribution
 
@@ -383,7 +389,9 @@ rule: peers are byte sources, not trust roots.
 - Local smoke: fork one rootfs-backed workload, pack children, pull selected
   children from `file://`, and resume them with `mise run smoke:local-pull`.
 - Remote smoke: push one bundle to S3, pull separate children on same-class
-  Linux/KVM aarch64 hosts, resume them, and record origin bytes.
+  Linux/KVM aarch64 hosts, resume them, record origin bytes, and use
+  `--dest-repeat 2 --cache-dir DIR` to prove repeated direct-S3 pulls on one
+  host reuse the remote bundle and chunk cache.
 - Negative remote smoke: corrupt a bundle index, chunkpack segment, child
   manifest, and rootfs artifact, and confirm every path fails before VM boot.
 

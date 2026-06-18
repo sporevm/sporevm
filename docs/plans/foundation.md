@@ -137,7 +137,8 @@ state and broader disk manifests remain later work.
 - `spore pack`, `spore unpack`, local `spore pull file://...`, and S3
   `spore push`/digest-pinned `spore pull` provide the first distribution bundle
   shape with rootfs artifact inclusion, multi-child indexes, `bundle_digest` for
-  cache identity, origin-byte reporting, and per-chunk verification for trust.
+  cache identity, origin/cache byte reporting, and per-chunk verification for
+  trust.
 - `spore run`, product `spore resume`, and `spore fanout` provide the first
   user-facing run/capture/fork/resume/fan-out path.
 
@@ -155,6 +156,8 @@ includes:
 - S3 `spore push` and digest-pinned `spore pull` for indexed bundles;
 - two-host S3/SSM restore;
 - host-local cache reuse with repeated destination restores;
+- direct-S3 repeated-child pulls with remote bundle, chunk, rootfs, and origin
+  byte metrics;
 - source-peer HTTP seeding that keeps destination S3-origin bytes at zero;
 - corrupt-bundle rejection on destinations;
 - ten-instance star and source-to-relay-to-leaf smoke runs.
@@ -164,8 +167,7 @@ What remains:
 1. Measure origin egress as a small multiple of unique chunk bytes across larger
    identical-host fleets.
 2. Keep corrupt peer/origin data rejected by chunk and rootfs verification.
-3. Complete node-local bundle cache reuse and metrics for repeated remote pulls.
-4. Preserve default immutable rootfs artifact inclusion through remote
+3. Preserve default immutable rootfs artifact inclusion through remote
    distribution without blurring memory chunks and rootfs bytes.
 
 Done when a multi-host fan-out demo restores one spore on every host in a test

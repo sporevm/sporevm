@@ -258,7 +258,13 @@ esac
 run_prefix="${prefix%/}/${run_id}"
 s3_base="s3://${bucket}/${run_prefix}"
 child_count="${#dest_instances[@]}"
-if [[ "${child_count}" -le 0 ]]; then
+if (( ${#tree_relay_ids[@]} > child_count )); then
+  child_count="${#tree_relay_ids[@]}"
+fi
+if (( dest_repeat > child_count )); then
+  child_count="${dest_repeat}"
+fi
+if (( child_count <= 0 )); then
   child_count=1
 fi
 
@@ -455,6 +461,7 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; 
 region=${q_region}
 bucket=${q_bucket}
 run_prefix=${q_run_prefix}
+child_count=${q_child_count}
 resume_seconds=${q_resume_seconds}
 dest_repeat=${q_dest_repeat}
 cache_dir=${q_cache_dir}
@@ -464,6 +471,9 @@ keep_remote=${q_keep_remote}
 dest_instance="\${SPOREVM_DEST_INSTANCE:?SPOREVM_DEST_INSTANCE is required}"
 dest_role="\${SPOREVM_DEST_ROLE:-dest}"
 child_id="\${SPOREVM_CHILD_ID:-0}"
+case "\${child_id}" in
+  ''|*[!0-9]*) echo "SPOREVM_CHILD_ID must be a non-negative integer" >&2; exit 1 ;;
+esac
 peer_ip="\${SPOREVM_PEER_IP:-\${source_peer_ip}}"
 serve_bundle="\${SPOREVM_SERVE_BUNDLE:-0}"
 safe_dest="\$(printf '%s' "\${dest_instance}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
@@ -631,6 +641,10 @@ fi
 total_origin_bytes=0
 total_peer_bytes=0
 total_download_bytes=0
+total_chunk_bytes_fetched=0
+total_rootfs_bytes_fetched=0
+total_rootfs_cache_hits=0
+total_rootfs_cache_misses=0
 cache_hits=0
 cache_misses=0
 corrupt_bundle_rejections=0
@@ -643,6 +657,17 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   bundle_dir="\${iter_dir}/spore.bundle"
   unpacked_dir="\${iter_dir}/spore.unpacked"
   unpack_result="\${iter_dir}/unpack-result.json"
+  child_base=\$((10#\${child_id}))
+  iteration_child_id="\${child_base}"
+  if [[ -z "\${peer_ip}" ]]; then
+    iteration_child_id="\$(( (child_base + iteration - 1) % child_count ))"
+  fi
+  selected_child=""
+  chunk_bytes_fetched=0
+  rootfs_artifact_count=0
+  rootfs_bytes_fetched=0
+  rootfs_cache_hits=0
+  rootfs_cache_misses=0
   if [[ -z "\${peer_ip}" ]]; then
     mkdir -p "\${iter_dir}"
     if [[ -n "\${cache_dir}" ]]; then
@@ -651,10 +676,31 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
       pull_bundle_cache="\${iter_dir}/bundle-cache"
     fi
     pull_source="s3://\${bucket}/\${run_prefix}/spore.bundle@sha256:\${bundle_key}"
+    pull_rootfs_cache="\${pull_bundle_cache}/rootfs-cache"
     SPOREVM_BUNDLE_CACHE_DIR="\${pull_bundle_cache}" \
-      zig-out/bin/spore pull "\${pull_source}" --child "\${child_id}" --out "\${unpacked_dir}" --region "\${region}" | tee "\${unpack_result}"
+      SPOREVM_ROOTFS_CACHE_DIR="\${pull_rootfs_cache}" \
+      zig-out/bin/spore pull "\${pull_source}" --child "\${iteration_child_id}" --out "\${unpacked_dir}" --region "\${region}" | tee "\${unpack_result}"
     cache_hit="\$(json_field "\${unpack_result}" remote_bundle_cache_hit)"
     origin_bytes="\$(json_field "\${unpack_result}" origin_bytes_read)"
+    selected_child="\$(json_field "\${unpack_result}" selected_child)"
+    chunk_bytes_fetched="\$(json_field "\${unpack_result}" chunk_bytes_fetched)"
+    rootfs_artifact_count="\$(json_field "\${unpack_result}" rootfs_artifact_count)"
+    rootfs_bytes_fetched="\$(json_field "\${unpack_result}" rootfs_bytes_fetched)"
+    rootfs_cache_hits="\$(json_field "\${unpack_result}" rootfs_cache_hit_count)"
+    rootfs_cache_misses="\$(json_field "\${unpack_result}" rootfs_cache_miss_count)"
+    expected_child="\$(printf '%06d' "\${iteration_child_id}")"
+    if [[ "\${selected_child}" != "\${expected_child}" ]]; then
+      echo "spore pull selected child \${selected_child}, expected \${expected_child}" >&2
+      exit 1
+    fi
+    if [[ -n "\${cache_dir}" && "\${iteration}" -gt 1 ]]; then
+      [[ "\${cache_hit}" == "true" ]] || { echo "repeat pull did not hit remote bundle cache" >&2; exit 1; }
+      [[ "\${origin_bytes}" == "0" ]] || { echo "repeat pull fetched \${origin_bytes} origin bytes, expected 0" >&2; exit 1; }
+      [[ "\${chunk_bytes_fetched}" == "0" ]] || { echo "repeat pull fetched \${chunk_bytes_fetched} chunk bytes, expected 0" >&2; exit 1; }
+      if [[ "\${rootfs_artifact_count}" -gt 0 ]]; then
+        [[ "\${rootfs_bytes_fetched}" == "0" ]] || { echo "repeat pull fetched \${rootfs_bytes_fetched} rootfs bytes, expected 0" >&2; exit 1; }
+      fi
+    fi
     peer_bytes=0
     bundle_dir="\${pull_bundle_cache}/remote/s3/sha256/\${bundle_key}/bundle"
   else
@@ -669,6 +715,10 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   total_origin_bytes=\$((total_origin_bytes + origin_bytes))
   total_peer_bytes=\$((total_peer_bytes + peer_bytes))
   total_download_bytes=\$((total_download_bytes + downloaded_bytes))
+  total_chunk_bytes_fetched=\$((total_chunk_bytes_fetched + chunk_bytes_fetched))
+  total_rootfs_bytes_fetched=\$((total_rootfs_bytes_fetched + rootfs_bytes_fetched))
+  total_rootfs_cache_hits=\$((total_rootfs_cache_hits + rootfs_cache_hits))
+  total_rootfs_cache_misses=\$((total_rootfs_cache_misses + rootfs_cache_misses))
   local_bundle_bytes="\$(du -sb "\${bundle_dir}" | awk '{print \$1}')"
   corrupt_rejected=false
   if [[ "\${iteration}" == "1" ]]; then
@@ -696,7 +746,7 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   if [[ -n "\${iteration_json}" ]]; then
     iteration_json="\${iteration_json},"
   fi
-  iteration_json="\${iteration_json}{\"iteration\":\${iteration},\"cache_hit\":\${cache_hit},\"downloaded_bundle_bytes\":\${downloaded_bytes},\"origin_downloaded_bundle_bytes\":\${origin_bytes},\"peer_downloaded_bundle_bytes\":\${peer_bytes},\"local_bundle_bytes\":\${local_bundle_bytes},\"unpacked_bundle_key\":\"\${unpack_bundle_key}\",\"unpacked_chunks\":\${unpacked_chunks},\"corrupt_bundle_rejected\":\${corrupt_rejected}}"
+  iteration_json="\${iteration_json}{\"iteration\":\${iteration},\"requested_child\":\"\${iteration_child_id}\",\"selected_child\":\"\${selected_child}\",\"cache_hit\":\${cache_hit},\"downloaded_bundle_bytes\":\${downloaded_bytes},\"origin_downloaded_bundle_bytes\":\${origin_bytes},\"peer_downloaded_bundle_bytes\":\${peer_bytes},\"chunk_bytes_fetched\":\${chunk_bytes_fetched},\"rootfs_artifact_count\":\${rootfs_artifact_count},\"rootfs_bytes_fetched\":\${rootfs_bytes_fetched},\"rootfs_cache_hits\":\${rootfs_cache_hits},\"rootfs_cache_misses\":\${rootfs_cache_misses},\"local_bundle_bytes\":\${local_bundle_bytes},\"unpacked_bundle_key\":\"\${unpack_bundle_key}\",\"unpacked_chunks\":\${unpacked_chunks},\"corrupt_bundle_rejected\":\${corrupt_rejected}}"
 done
 
 cache_enabled=false
@@ -723,6 +773,10 @@ cat >"\${workdir}/dest-result.json" <<JSON
   "downloaded_bundle_bytes": \${total_download_bytes},
   "origin_downloaded_bundle_bytes": \${total_origin_bytes},
   "peer_downloaded_bundle_bytes": \${total_peer_bytes},
+  "chunk_bytes_fetched": \${total_chunk_bytes_fetched},
+  "rootfs_bytes_fetched": \${total_rootfs_bytes_fetched},
+  "rootfs_cache_hits": \${total_rootfs_cache_hits},
+  "rootfs_cache_misses": \${total_rootfs_cache_misses},
   "local_bundle_bytes": \${local_bundle_bytes},
   "bundle_key": "\${bundle_key}",
   "cache_enabled": \${cache_enabled},
@@ -932,6 +986,10 @@ unique_chunk_bytes = int(source["unique_chunk_bytes"])
 total_destination_download_bytes = sum(int(d["downloaded_bundle_bytes"]) for d in dests)
 total_destination_origin_bytes = sum(int(d.get("origin_downloaded_bundle_bytes", d["downloaded_bundle_bytes"])) for d in dests)
 total_destination_peer_bytes = sum(int(d.get("peer_downloaded_bundle_bytes", 0)) for d in dests)
+total_chunk_bytes_fetched = sum(int(d.get("chunk_bytes_fetched", 0)) for d in dests)
+total_rootfs_bytes_fetched = sum(int(d.get("rootfs_bytes_fetched", 0)) for d in dests)
+total_rootfs_cache_hits = sum(int(d.get("rootfs_cache_hits", 0)) for d in dests)
+total_rootfs_cache_misses = sum(int(d.get("rootfs_cache_misses", 0)) for d in dests)
 total_resume_count = sum(int(d.get("resume_count", 1)) for d in dests)
 total_cache_hits = sum(int(d.get("cache_hits", 0)) for d in dests)
 total_cache_misses = sum(int(d.get("cache_misses", 0)) for d in dests)
@@ -982,6 +1040,10 @@ json.dump({
     "total_destination_download_bytes": total_destination_download_bytes,
     "total_destination_origin_bytes": total_destination_origin_bytes,
     "total_destination_peer_bytes": total_destination_peer_bytes,
+    "total_chunk_bytes_fetched": total_chunk_bytes_fetched,
+    "total_rootfs_bytes_fetched": total_rootfs_bytes_fetched,
+    "total_rootfs_cache_hits": total_rootfs_cache_hits,
+    "total_rootfs_cache_misses": total_rootfs_cache_misses,
     "source_peer_egress_bytes": source_peer_egress_bytes,
     "relay_peer_egress_bytes": relay_peer_egress_bytes,
     "max_peer_egress_bytes": max_peer_egress_bytes,

@@ -85,7 +85,9 @@ S3 by uploading only the canonical files named by the validated bundle metadata.
 child.spore` downloads that exact object set into the node-local bundle cache,
 checks the canonical `bundle_digest`, then uses the same chunk and rootfs
 verification path as local pull. Bare S3 URLs are rejected for pull because the
-remote URL is not restore authority.
+remote URL is not restore authority. Pull results report cache accounting for
+the materialization path: `origin_bytes_read`, `remote_bundle_cache_hit`,
+`chunk_bytes_fetched`, and rootfs cache hit/fetch counters.
 
 ## Manifest v0
 
