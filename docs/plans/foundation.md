@@ -1,12 +1,13 @@
 ---
 status: active
-last_reviewed: 2026-06-17
+last_reviewed: 2026-06-18
 related_plans:
   - buildkite/cleanroom: docs/plans/sandbox-suspend-wake.md
   - docs/plans/run-bridge.md
   - docs/plans/lifecycle-monitor.md
   - docs/plans/local-image-ref-cache.md
   - docs/plans/immutable-rootfs-resume.md
+  - docs/plans/distribution.md
 ---
 
 # SporeVM Foundation Plan
@@ -113,7 +114,7 @@ state and broader disk manifests remain later work.
 | Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Disk manifests remain future work. |
 | Slice 4: fork and generation protocol | Complete for correctness | Keep fan-out identity smokes as regression coverage. |
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |
-| Slice 6: identical-host distribution | Active | Multi-peer/cache hierarchy and measured origin-egress efficiency beyond explicit relay trees. |
+| Slice 6: identical-host distribution | Active | Pull-based materialization, default rootfs artifact inclusion, cache hierarchy, and measured origin-egress efficiency beyond explicit relay trees. |
 | Slice 7: always-on dirty tracking | Complete for the foundation target | Keep dirty-tail and worker-stop benchmarks as release regressions; tune worker preemption only if the product SLO tightens. |
 | Slice 8: cross-backend diagnostic restore | Later diagnostic | HVF portable GIC producer and timer-frequency strategy. |
 
@@ -156,12 +157,15 @@ includes:
 
 What remains:
 
-1. Convert explicit smoke topology into a product-shaped cache or peer hierarchy.
-2. Measure origin egress as a small multiple of unique chunk bytes across larger
+1. Convert explicit smoke topology into a pull-based product distribution path.
+2. Make rootfs-backed bundles include exact immutable rootfs bytes by default,
+   with metadata-only prepared-cache workflows deferred until bundle metadata
+   exists.
+3. Measure origin egress as a small multiple of unique chunk bytes across larger
    identical-host fleets.
-3. Keep corrupt peer/origin data rejected by chunk verification.
-4. Decide how immutable rootfs artifacts join the distribution path without
-   blurring memory chunks and rootfs bytes.
+4. Keep corrupt peer/origin data rejected by chunk and rootfs verification.
+5. Keep immutable rootfs artifacts in the distribution path without blurring
+   memory chunks and rootfs bytes.
 
 Done when a multi-host fan-out demo restores one spore on every host in a test
 fleet, measures origin egress at a small multiple of unique chunk bytes, and
@@ -302,7 +306,11 @@ inputs.
 - aarch64-only for v0; virtio-mmio-only; device list frozen.
 - Machine state is normalized architectural state, never raw KVM or HVF structs.
 - The checkpoint artifact is a spore; v0 formats carry no compatibility promise.
-- Distribution starts with SporeVM chunkpack bundles.
+- Distribution starts with SporeVM chunkpack bundles and moves toward the
+  pull-based artifact model in `docs/plans/distribution.md`.
+- Rootfs-backed distribution bundles include exact immutable rootfs bytes by
+  default; metadata-only rootfs bundles require an explicit opt-out and bundle
+  metadata, so they are not part of the first exact-rootfs bundle slice.
 - `spore run` is one-shot; named lifecycle uses `create`/`exec`/`rm`/`ls` plus
   monitor-backed suspend/resume.
 - Product capture is `spore run --capture`, not a separate capture verb.

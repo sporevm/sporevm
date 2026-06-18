@@ -1,33 +1,37 @@
 ---
-status: active
-last_reviewed: 2026-06-16
+status: landed
+last_reviewed: 2026-06-18
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
   - docs/rootfs.md
   - docs/spore-format.md
+  - docs/plans/distribution.md
   - src/run.zig
   - src/resume.zig
   - src/spore.zig
 related_plans:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
+  - docs/plans/distribution.md
 ---
 
 # Immutable Rootfs Resume Plan
 
 ## Summary
 
-Local immutable rootfs resume has landed. A spore captured from
+Local immutable rootfs resume has landed. This file is the local rootfs resume
+contract and safety record. A spore captured from
 `spore run --image ... --capture` records the exact read-only ext4
 rootfs artifact it needs: BLAKE3 digest, size, virtio-blk binding, and OCI
 provenance. `spore resume` resolves that artifact from the local digest cache,
 verifies the same read-only fd it will attach, and fails before VM creation when
 the artifact is missing or mismatched.
 
-The active work is now remote preparation: make the same rootfs artifact
-available on compatible hosts without rebuilding or copying it per child, while
-preserving the invariant that the ext4 digest is restore authority.
+Active remote preparation no longer lives in this plan. Pull-based bundle,
+preload, push, pull, and cache work is tracked in
+`docs/plans/distribution.md`, while preserving the invariant that the ext4
+digest is restore authority.
 
 ## Landed Local Contract
 
@@ -111,33 +115,36 @@ possible preload input, not proof that local ext4 bytes are correct.
 - Rootfs-backed capture requires quiescent virtio-blk queues. Serializing pending
   read-only block requests is deferred.
 
-## Active Slice: Remote Preparation
+## Distribution Boundary
 
 Remote same-class fan-out needs a way to put exact rootfs bytes where resume can
-verify them.
+verify them. That implementation sequence belongs to
+`docs/plans/distribution.md`.
 
-Default next slice:
+The distribution plan currently owns:
 
-1. Add an exact-byte preload or bundle path for immutable rootfs artifacts.
+1. Make rootfs-backed distribution bundles include exact immutable rootfs bytes
+   by default. Defer metadata-only prepared-cache workflows until bundle metadata
+   exists.
 2. Prefer exact ext4 bytes over OCI rebuilds for the first remote demo, because
    rebuilds can drift with tooling even when OCI provenance is stable.
 3. Document the same-class Linux/KVM aarch64 host requirement.
 4. Refuse remote resume when the rootfs is absent, hash-mismatched, or the host
    platform contract is incompatible.
-5. Reuse the foundation bundle/cache concepts where practical, but keep rootfs
-   artifacts distinct from memory chunks until a broader artifact bundle format is
-   designed.
+5. Keep rootfs artifacts distinct from memory chunks inside the broader
+   distribution bundle model.
 
-Done when the same captured/forked rootfs workload can be distributed to prepared
-same-class aarch64 KVM hosts without rebuilding or copying rootfs bytes per
-child.
+This plan remains the source for the rootfs-specific resume invariant: resume
+must verify the exact digest-addressed fd it attaches, and OCI provenance is not
+restore authority.
 
 ## Deferred Work
 
 - `spore rootfs import PATH` for arbitrary local rootfs images.
-- Final command shape for preload: likely `spore rootfs preload SPORE` for local
-  artifact preparation, with host-targeted distribution layered later.
-- `spore pack --include-rootfs` or an equivalent artifact bundle.
+- Standalone `spore rootfs preload SPORE` for local artifact preparation after
+  the distribution plan lands bundle-default rootfs inclusion.
+- Additional prepared-cache UX after distribution bundle metadata supports
+  metadata-only rootfs policy.
 - Automatic OCI rebuild during `spore resume`, if product UX later justifies
   network and toolchain dependency in the resume path.
 - Serialization of pending read-only virtio-blk requests at capture time.
@@ -157,8 +164,8 @@ child.
 - Local smoke: `mise run smoke:rootfs-fanout`.
 - Negative smoke: delete or corrupt the digest-cached rootfs and confirm
   `spore resume` refuses to boot.
-- Later remote smoke on same-class Linux/KVM aarch64 hosts after preload or
-  bundle support lands.
+- Distribution smoke coverage for rootfs-backed bundles lives in
+  `docs/plans/distribution.md`.
 
 ## Resolved Decisions
 
@@ -172,3 +179,7 @@ child.
   records content identity and provenance. Plain `spore run --rootfs PATH` keeps
   working.
 - Fork copies rootfs references, not rootfs bytes.
+- Distribution bundles copy exact rootfs bytes by default so a clean compatible
+  destination can materialize and verify the spore without an OCI rebuild.
+- Metadata-only rootfs bundle behavior depends on explicit bundle metadata and is
+  not part of the first exact-rootfs bundle slice.

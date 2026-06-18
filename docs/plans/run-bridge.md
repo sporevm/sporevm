@@ -187,7 +187,7 @@ than the run bridge itself.
 The run bridge itself is landed. Future work belongs in narrower plans:
 
 - immutable rootfs preload/bundle distribution:
-  `docs/plans/immutable-rootfs-resume.md`;
+  `docs/plans/distribution.md`;
 - named VM lifecycle and benchmark speed work:
   `docs/plans/lifecycle-monitor.md`;
 - RAM economics, dirty tracking, and fleet fan-out distribution:
