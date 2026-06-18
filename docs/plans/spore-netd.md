@@ -163,8 +163,11 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
 
 ## Current State
 
-- `src/virtio/net.zig` is a minimal closed endpoint. It advertises a MAC address,
-  drains TX descriptors, and intentionally does not provide connectivity.
+- `src/virtio/net.zig` advertises a MAC address and now has an internal frame
+  backend boundary. Guest TX descriptors are parsed as virtio-net headers plus
+  complete Ethernet frames, and backend RX frames can be injected into guest
+  writable descriptors. The default backend remains closed, so this still does
+  not provide host connectivity.
 - `src/hvf/vm.zig` and `src/kvm/vm.zig` both instantiate the current network
   device with `net.Net.init(.{})` and no backend configuration.
 - `spore run` now accepts `--net`, records the requested SporeVM-managed
@@ -210,6 +213,8 @@ Definition of done:
 - Unit tests cover parsing and the fail-closed path.
 
 ### Slice 2: Frame Stream Boundary
+
+Status: landed in the Slice 2 branch.
 
 Turn the existing closed virtio-net device into a real frame producer/consumer
 behind an internal backend interface. The first backend can be an in-process

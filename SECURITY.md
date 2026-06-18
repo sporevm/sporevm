@@ -22,7 +22,7 @@ fuzz targets from the slice that introduces it:
 
 | Surface | Input source | Status |
 |---|---|---|
-| Virtqueue descriptors, rings, and device request headers | guest memory | shared queue/MMIO paths and current console/blk/net/vsock/rng device paths fuzzed; new device parsers require fuzz targets in the same slice |
+| Virtqueue descriptors, rings, and device request headers | guest memory | shared queue/MMIO paths and current console/blk/vsock/rng device paths fuzzed; virtio-net TX/RX frame-boundary handling, short virtio-net headers, oversized frames, queue exhaustion, reset, and shutdown paths are fuzz/unit covered; new device parsers require fuzz targets in the same slice |
 | Guest memory access during dirty scans | guest | KVM dirty-log and HVF write-protect harness paths have landed; dirty pages plus VMM-originated virtio writes are coalesced to fixed 2MiB chunks, zero chunks are elided, and non-zero chunks are BLAKE3-addressed before being recorded in the manifest. |
 | Lazy RAM fault handling | guest page faults plus spore CAS chunks | KVM userfaultfd and HVF abort-exit paths are opt-in; faults materialize whole verified chunks and fail closed on malformed manifests or chunk mismatches |
 | Spore manifest decode | registry, disk | fuzzed; unknown versions and malformed manifests fail closed |
