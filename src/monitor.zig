@@ -5,6 +5,7 @@ const Io = std.Io;
 const net = std.Io.net;
 
 const lifecycle = @import("lifecycle.zig");
+const memory_config = @import("memory.zig");
 const run = @import("run.zig");
 const vsock = @import("virtio/vsock.zig");
 
@@ -25,7 +26,7 @@ const monitor_usage =
     \\  --rootfs rootfs.ext4    Resolved rootfs image path
     \\  --image REF             Original OCI image ref for metadata
     \\  --resume DIR            Resume from a diskless spore directory
-    \\  --memory-mib N          Guest memory in MiB (default: 1024)
+    \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
@@ -41,7 +42,7 @@ const MonitorOptions = struct {
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
     resume_dir: ?[]const u8 = null,
-    memory_mib: u64 = 1024,
+    memory: memory_config.Config = .{},
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
@@ -98,7 +99,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .rootfs_path = opts.rootfs_path,
         .image_ref = opts.image_ref,
         .resume_dir = opts.resume_dir,
-        .memory_mib = opts.memory_mib,
+        .memory = opts.memory,
         .vcpus = opts.vcpus,
         .guest_port = opts.guest_port,
         .timeout_ms = opts.timeout_ms,
@@ -134,7 +135,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .rootfs_path = opts.rootfs_path,
         .resume_dir = opts.resume_dir,
         .command = &.{"/bin/true"},
-        .memory_mib = opts.memory_mib,
+        .memory = opts.memory,
         .vcpus = opts.vcpus,
         .guest_port = opts.guest_port,
         .timeout_ms = opts.timeout_ms,
@@ -573,8 +574,10 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
             opts.image_ref = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--resume")) {
             opts.resume_dir = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--memory")) {
+            opts.memory = memory_config.parseCliOrExit("spore monitor", takeValue(args, &i, args[i]));
         } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
-            opts.memory_mib = try parsePositive(u64, args[i], takeValue(args, &i, args[i]));
+            memory_config.rejectMemoryMiBFlag("spore monitor");
         } else if (std.mem.eql(u8, args[i], "--vcpus")) {
             opts.vcpus = try parsePositive(u32, args[i], takeValue(args, &i, args[i]));
         } else if (std.mem.eql(u8, args[i], "--guest-port")) {

@@ -117,6 +117,7 @@ state and broader disk manifests remain later work.
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |
 | Slice 6: identical-host distribution | Active | Remote push/pull materialization, remote cache reuse metrics, and measured origin-egress efficiency beyond explicit relay trees. |
 | Slice 7: always-on dirty tracking | Complete for the foundation target | Keep dirty-tail and worker-stop benchmarks as release regressions; tune worker preemption only if the product SLO tightens. |
+| Automatic memory | Active | Product CLI memory contract is moving through `docs/plans/automatic-memory.md`; next work is `spore ls` memory stats. |
 | Slice 8: cross-backend diagnostic restore | Later diagnostic | HVF portable GIC producer and timer-frequency strategy. |
 
 ## Landed Foundation Capabilities

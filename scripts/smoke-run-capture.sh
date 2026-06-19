@@ -41,10 +41,11 @@ from_stdout="${workdir}/from.stdout"
 from_stderr="${workdir}/from.stderr"
 from_base_stdout="${workdir}/from-base.stdout"
 from_base_stderr="${workdir}/from-base.stderr"
+smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --memory-mib "${SPORE_SMOKE_MEMORY_MIB:-256}" \
+  --memory "${smoke_memory}" \
   --capture "${capture_dir}" \
   --capture-on USR1 \
   -- /bin/sleeper \
@@ -116,7 +117,7 @@ fi
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --memory-mib "${SPORE_SMOKE_MEMORY_MIB:-256}" \
+  --memory "${smoke_memory}" \
   --capture "${from_base_dir}" \
   -- /bin/true \
   >"${from_base_stdout}" 2>"${from_base_stderr}"

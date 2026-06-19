@@ -39,10 +39,11 @@ from_stdout="${workdir}/from.stdout"
 from_stderr="${workdir}/from.stderr"
 deny_stdout="${workdir}/deny.stdout"
 deny_stderr="${workdir}/deny.stderr"
+smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --memory-mib "${SPORE_SMOKE_MEMORY_MIB:-256}" \
+  --memory "${smoke_memory}" \
   --net \
   --allow-host example.com \
   --capture "${capture_dir}" \
