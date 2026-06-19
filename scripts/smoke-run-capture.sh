@@ -123,7 +123,7 @@ fi
   >"${from_base_stdout}" 2>"${from_base_stderr}"
 [[ -f "${from_base_dir}/manifest.json" ]] || die "run --from base capture did not write ${from_base_dir}/manifest.json"
 
-"${spore_bin}" run \
+"${spore_bin}" --debug run \
   --backend "${backend}" \
   --from "${from_base_dir}" \
   -- /bin/writeout \
@@ -137,6 +137,11 @@ grep -Fq "spore stderr" "${from_stderr}" || {
   cat "${from_stdout}" >&2 || true
   cat "${from_stderr}" >&2 || true
   die "spore run --from did not stream stderr"
+}
+grep -Fq "run --from memory restore source=local_backing reason=proof_valid" "${from_stderr}" || {
+  cat "${from_stdout}" >&2 || true
+  cat "${from_stderr}" >&2 || true
+  die "spore run --from did not use proof-backed local RAM restore"
 }
 
 echo "smoke:run-capture ok backend=${backend}"

@@ -60,13 +60,14 @@ Run one explicit argv request from a completed base spore:
 spore run --from base.spore -- /bin/writeout
 ```
 
-`--from` resumes the spore, reopens any verified immutable rootfs artifact
-recorded in the manifest, sends the argv after `--` to the restored exec agent,
-streams stdout/stderr, and exits with the command status. It is mutually
-exclusive with fresh boot inputs such as `--kernel`, `--initrd`, `--rootfs`, and
-`--image`; RAM size is manifest-derived. The restored guest must be able to
-accept a fresh exec session. Signal-captured running workloads remain a
-`spore resume`, `spore fork`, or `spore fanout` path until the guest-agent
+`--from` resumes the spore, automatically uses proof-backed local RAM when the
+same-host `ram.backing.proof` validates, reopens any verified immutable rootfs
+artifact recorded in the manifest, sends the argv after `--` to the restored
+exec agent, streams stdout/stderr, and exits with the command status. It is
+mutually exclusive with fresh boot inputs such as `--kernel`, `--initrd`,
+`--rootfs`, and `--image`; RAM size is manifest-derived. The restored guest must
+be able to accept a fresh exec session. Signal-captured running workloads remain
+a `spore resume`, `spore fork`, or `spore fanout` path until the guest-agent
 protocol can reconnect to or multiplex active commands.
 
 Run from an explicit read-only ext4 rootfs:
@@ -134,7 +135,8 @@ mint child spores with `spore fork`, then resume them individually or through
 - Rootfs execution uses the existing virtio-blk device and does not widen the
   frozen device model.
 - `spore run --from` does not accept fresh boot inputs; kernel, initrd, RAM size,
-  and optional immutable rootfs identity come from the spore.
+  optional local RAM backing, and optional immutable rootfs identity come from
+  the spore.
 - `spore run --from` starts a new exec-agent session. It does not reconnect to
   or interrupt a command that was already running when the source spore was
   captured.

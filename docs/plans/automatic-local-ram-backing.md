@@ -20,8 +20,8 @@ related_plans:
 ## Summary
 
 SporeVM should make local same-host RAM sharing automatic and fast without
-asking users to choose a trust mode. `spore resume` should use the fastest
-memory source that fits the local provenance rules, then fall back to
+asking users to choose a trust mode. Product restore paths should use the
+fastest memory source that fits the local provenance rules, then fall back to
 chunk-verified restore when that proof is absent or invalid.
 
 The first version should be deliberately small: a local proof sidecar next to
@@ -51,8 +51,8 @@ provenance plus fallback, not as content verification of the whole backing file.
 ## Goals
 
 - No user-facing `trust` flag, mode, or policy parameter.
-- `spore resume` automatically maps local `ram.backing` only when local proof
-  validates.
+- Product restore paths (`spore resume` and `spore run --from`) automatically
+  map local `ram.backing` only when local proof validates.
 - `spore fanout` gets the fast path by using normal resume behavior.
 - Invalid, missing, foreign, or stale proofs fall back to chunk restore rather
   than widening the trust boundary.
@@ -116,7 +116,7 @@ owner-only `0700`, and the key must be a regular owner-only `0600` file. If
 those permissions cannot be enforced, or if the runtime key disappears after a
 reboot, resume simply uses chunks.
 
-Resume behavior:
+Resume and `run --from` behavior:
 
 1. Load and validate the manifest as today.
 2. If `ram.backing` and `ram.backing.proof` exist, open both read-only without
@@ -157,8 +157,8 @@ not kernel-enforced page integrity.
 Slice 1 is implemented in the active code path: product captures write
 `ram.backing.proof` when a runtime key is available, `spore fork` validates the
 parent proof before hard-linking local backing into children and writing
-child-local proofs, and product `spore resume` automatically chooses between
-`local_backing` and `chunks`.
+child-local proofs, and product restore paths (`spore resume` and
+`spore run --from`) automatically choose between `local_backing` and `chunks`.
 
 The proof is validated with bounded metadata-scale work. It is opened without
 following symlinks, must be a regular file, and is capped at 16KiB before JSON
@@ -173,7 +173,7 @@ mismatch, or manifest mismatch all fall back to verified chunks.
 
 Replace the temporary explicit `--trust-ram-backing` product path with an
 internal restore planner. Add proof read/write helpers, generate proofs for
-fresh captures and forks, and let product resume automatically use a
+fresh captures and forks, and let product restore paths automatically use a
 proof-validated local backing fd. Add restore-source reporting in the same slice
 so fast-path misses are visible in tests and operator output.
 
@@ -181,13 +181,13 @@ Status: implemented in this slice.
 
 Done when:
 
-- product `spore resume` has no user-visible trust flag;
+- product `spore resume` and `spore run --from` have no user-visible trust flag;
 - product `spore fanout` no longer passes a trust flag;
 - same-host fan-out still maps local backing and passes the default counter
   fan-out smoke;
 - missing, corrupt, foreign-key, or mismatched proof cases fall back to chunks;
 - restore output, logs, or stats distinguish `local_backing` from `chunks`, and
-  the fan-out smoke asserts the expected fast path;
+  the fan-out and `run --from` smokes assert the expected fast path;
 - proof validation does not read the 16GiB backing file.
 
 ### Slice 2: Distribution and Lifecycle Hygiene
@@ -239,6 +239,8 @@ Validation on 2026-06-20:
 - `mise exec -- zig build -Dtarget=aarch64-linux` passed, covering the Linux
   `statx` proof identity branch.
 - `SPORE_SMOKE_FANOUT_COUNT=3 scripts/smoke-counter-fanout.sh` passed on HVF.
+- `scripts/smoke-run-capture.sh` passed on HVF and asserts `spore run --from`
+  logs `source=local_backing reason=proof_valid`.
 - A direct product debug resume of a forked 16GiB child logged
   `source=local_backing reason=proof_valid` and backend
   `mode=local_backing ... memory_ms=0`.

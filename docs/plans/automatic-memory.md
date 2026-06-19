@@ -325,7 +325,7 @@ Done when:
   default 20s capture timeout.
 - Automatic local `ram.backing` restore is proof-gated, not flag-gated.
   `docs/plans/automatic-local-ram-backing.md` tracks the local provenance
-  contract: product resume can use a validated same-host backing fd, while
+  contract: product restore paths can use a validated same-host backing fd, while
   missing or invalid proof falls back to chunks with no user-facing trust mode.
 
 ## Key Learnings From Pressure-Testing

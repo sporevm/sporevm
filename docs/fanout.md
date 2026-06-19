@@ -16,9 +16,9 @@ When the parent has a proof-validated local `ram.backing` file, `spore fork`
 hard-links that file into each child and writes a child-local
 `ram.backing.proof`. If the parent proof is missing or stale, children omit
 backing metadata and resume from chunks. `spore fanout` does not need a trust
-flag or special mode: each child uses normal `spore resume`, which maps local
-backing only when the proof validates and otherwise restores from verified
-chunks.
+flag or special mode: each child uses normal product restore (`spore resume`, or
+`spore run --from` for run/rootfs children), which maps local backing only when
+the proof validates and otherwise restores from verified chunks.
 
 ## Local Child Identity
 

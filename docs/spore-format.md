@@ -149,13 +149,14 @@ sources, `peer_bytes_read` for HTTP(S) peer sources, `remote_bundle_cache_hit`,
   acceleration metadata for same-host KVM/HVF fork/fan-out: `kind:
   "map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks
   remain the portable verified source of truth; unsupported backends and
-  imported/cold spores materialize from chunks instead. Product `spore resume`
-  may automatically map `ram.backing` only when the local `ram.backing.proof`
-  validates against the manifest memory fingerprint, backing metadata, opened
-  file identity, and host-local runtime key. A missing, corrupt, foreign-key, or
-  mismatched proof falls back to chunks. The proof is local provenance metadata;
-  it is not a portable trust root and does not prove every RAM byte still
-  matches the manifest's chunk refs. KVM and HVF map a validated fd
+  imported/cold spores materialize from chunks instead. Product restore paths
+  (`spore resume` and `spore run --from`) may automatically map `ram.backing`
+  only when the local `ram.backing.proof` validates against the manifest memory
+  fingerprint, backing metadata, opened file identity, and host-local runtime
+  key. A missing, corrupt, foreign-key, or mismatched proof falls back to chunks.
+  The proof is local provenance metadata; it is not a portable trust root and
+  does not prove every RAM byte still matches the manifest's chunk refs. KVM and
+  HVF map a validated fd
   `MAP_PRIVATE` to share clean parent pages across fork children while child
   writes fault into private CoW pages.
 - `rootfs`: optional immutable rootfs artifact required by a captured
@@ -216,10 +217,10 @@ sources, `peer_bytes_read` for HTTP(S) peer sources, `remote_bundle_cache_hit`,
   opens the digest-addressed rootfs cache entry read-only, verifies the same fd
   by BLAKE3 and size, and only then attaches it to the VM.
 - Local RAM backing files and `ram.backing.proof` are same-host acceleration
-  hints, not portable trust roots. Product resume treats a valid proof as local
-  provenance for opening a backing fd; invalid or absent proof uses the chunk
-  manifest path. Bundles and pulls remain chunk-authoritative, and proof files
-  must not be treated as distribution authority.
+  hints, not portable trust roots. Product restore paths treat a valid proof as
+  local provenance for opening a backing fd; invalid or absent proof uses the
+  chunk manifest path. Bundles and pulls remain chunk-authoritative, and proof
+  files must not be treated as distribution authority.
 - Machine state is normalized architectural aarch64 state. Raw KVM structures
   never appear in the format; the only documented temporary exception is the
   explicitly tagged HVF `backend_private` GIC blob, which other backends must

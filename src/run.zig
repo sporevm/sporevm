@@ -1215,6 +1215,10 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     const network_manifest = manifestNetworkFromOptions(opts.network, &opts.network_policy);
 
     const resuming = opts.resume_dir != null;
+    const local_backing = try openRunLocalMemoryBacking(allocator, init.environ_map, opts.resume_dir, opts.memory.bytes);
+    defer if (local_backing.fd) |fd| {
+        _ = std.c.close(fd);
+    };
     const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
     const initrd: ?[]const u8 = if (resuming) null else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
     const rootfs_fd = try openRootfsForRun(init, allocator, opts.rootfs_path, opts.rootfs);
@@ -1253,6 +1257,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .resume_dir = opts.resume_dir,
+                .ram_backing_fd = local_backing.fd,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .snapshot_dir = capture_plan.snapshot_dir,
@@ -1276,6 +1281,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .resume_dir = opts.resume_dir,
+                .ram_backing_fd = local_backing.fd,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .snapshot_dir = capture_plan.snapshot_dir,
@@ -1357,6 +1363,20 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
         .snapshotted => .{ .backend = backend, .exit = .snapshotted },
         else => error.MonitorDidNotStopCleanly,
     };
+}
+
+fn openRunLocalMemoryBacking(
+    allocator: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    resume_dir: ?[]const u8,
+    ram_size: u64,
+) !spore.LocalBackingPlan {
+    const dir = resume_dir orelse return .{};
+    const parsed = try spore.loadManifest(allocator, dir);
+    defer parsed.deinit();
+    const local_backing = try spore.openProvenLocalMemoryBacking(allocator, environ, dir, parsed.value.memory, ram_size);
+    std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(local_backing.source), local_backing.reason });
+    return local_backing;
 }
 
 fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.c.fd_t {
