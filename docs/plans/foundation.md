@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-18
+last_reviewed: 2026-06-20
 related_plans:
   - buildkite/cleanroom: docs/plans/sandbox-suspend-wake.md
   - docs/plans/run-bridge.md
@@ -111,7 +111,7 @@ state and broader disk manifests remain later work.
 | Slice 1: KVM boot | Complete for the foundation target | Continue using KVM hardware smokes for regressions. |
 | Slice 2: HVF boot | Complete for the foundation target | Continue using Apple Silicon smokes for regressions. |
 | Product run bridge | Landed | See `docs/plans/run-bridge.md`; future OCI/writable policy is out of this plan. |
-| Named lifecycle | Local HVF landed | Speed work including local image ref caching, KVM monitor wake, disk-backed lifecycle resume; see `docs/plans/lifecycle-monitor.md`. |
+| Named lifecycle | Local HVF landed; KVM create/exec/ls/rm parity landed | Speed work including local image ref caching, KVM suspend/resume evidence, and disk-backed lifecycle resume; see `docs/plans/lifecycle-monitor.md`. |
 | Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Disk manifests remain future work. |
 | Slice 4: fork and generation protocol | Complete for correctness | Keep fan-out identity smokes as regression coverage. |
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |

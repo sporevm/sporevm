@@ -25,6 +25,10 @@ description = "Smoke product spore run streaming and exit status"
 run = "mise run build && scripts/smoke-run-capture.sh"
 description = "Smoke product spore run signal capture and resume"
 
+[tasks."smoke:lifecycle"]
+run = "mise run build && scripts/smoke-lifecycle.sh"
+description = "Smoke named lifecycle create, exec, ls, and rm"
+
 [tasks."smoke:run-net-config"]
 run = "mise run build && scripts/smoke-run-net-config.sh"
 description = "Smoke product spore run static network configuration"

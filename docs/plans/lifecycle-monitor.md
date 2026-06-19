@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-16
+last_reviewed: 2026-06-20
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
@@ -22,14 +22,14 @@ related_plans:
 
 ## Summary
 
-Local HVF named-VM lifecycle has landed. SporeVM can create a named VM, keep it
-alive in one per-VM monitor process, execute multiple commands over the guest
-agent, list/remove it through a private runtime registry, and suspend/resume a
-diskless lifecycle VM under a new name.
+Local named-VM lifecycle has landed for HVF and KVM create/exec/ls/rm. SporeVM
+can create a named VM, keep it alive in one per-VM monitor process, execute
+multiple commands over the guest agent, and list/remove it through a private
+runtime registry. Local HVF also has diskless lifecycle suspend/resume evidence.
 
 The active work is no longer the CLI shape. It is speed and parity:
 tag-resolution caching, rootfs-path benchmark isolation, exec timing breakdowns,
-KVM monitor wake support, and disk-backed lifecycle suspend/resume.
+KVM suspend/resume evidence, and disk-backed lifecycle suspend/resume.
 
 ## Landed Product Contract
 
@@ -68,15 +68,15 @@ policy, secrets, egress, mounts, workspace semantics, and scheduling.
 - VM names are explicit and restricted to a conservative path-safe set.
 - One per-VM monitor owns the hypervisor VM, vCPU loop, virtio state, rootfs fd,
   console log, vsock state, and newline-delimited JSON control socket.
-- HVF monitor mode supports minimal-initrd, `--rootfs`, and `--image` lifecycle
-  VMs locally.
+- HVF and KVM monitor mode support minimal-initrd, `--rootfs`, and `--image`
+  lifecycle VMs locally on their supported host platforms.
 - The guest agent uses per-command session ids, so repeated attaches do not
   duplicate execution but fresh `spore exec` calls can run sequentially in one
   boot.
 - `spore suspend NAME --out DIR` and `spore resume DIR --name NAME` work for
   diskless lifecycle VMs on local HVF.
-- KVM monitor mode still fails explicitly until the backend has a real wake path
-  for host-attached control streams.
+- KVM monitor wake support has landed for create, exec, repeated exec, ls, and
+  rm using `immediate_exit` plus a signal wake for host-attached control streams.
 - Disk-backed lifecycle suspend/resume still fails closed. Product one-shot
   `spore resume` can handle verified immutable-rootfs spores, but monitor-backed
   disk lifecycle needs a separate ownership model.
@@ -135,9 +135,12 @@ effective digest. The next speed work should stay measurement-led:
 
 ### KVM Monitor Wake
 
-KVM lifecycle parity needs a backend wake path for host-attached control streams
-while `KVM_RUN` is active. Until that exists, KVM monitor mode must keep failing
-before VM creation rather than pretending to support lifecycle commands.
+Status: landed for create, exec, repeated exec, ls, and rm.
+
+KVM lifecycle parity now uses a backend wake path for host-attached control
+streams while `KVM_RUN` is active. Monitor requests set `immediate_exit`, send a
+signal to the vCPU thread, poll the shared lifecycle control hook, and flush
+pending virtio-vsock RX before re-entering the guest.
 
 ### Disk-Backed Lifecycle Suspend/Resume
 
@@ -162,8 +165,8 @@ ordering.
   metadata read/write, stale-state handling, control protocol parsing.
 - CLI checks: help text, unknown VM errors, stale runtime errors, duplicate
   create name, unchanged `spore run` behavior.
-- Real-host smokes: local HVF create/exec/exec/rm, HVF `--image`, HVF diskless
-  suspend/resume/exec/rm.
+- Real-host smokes: local HVF create/exec/exec/rm, KVM create/exec/exec/ls/rm,
+  HVF `--image`, HVF diskless suspend/resume/exec/rm.
 - Benchmark smoke: low-iteration lifecycle timing run.
 - Failure smokes: monitor crash before/after ready, `rm` of a dead monitor,
   disk-backed `suspend` rejection, unsupported backend.

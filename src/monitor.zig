@@ -74,7 +74,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     const opts = try parseMonitorArgs(args);
     const parsed_ms = lifecycle.monotonicMs();
     if (!lifecycle.monitorBackendSupported(opts.backend.name())) {
-        std.debug.print("spore monitor: monitor mode currently supports only HVF on Apple Silicon\n", .{});
+        std.debug.print("spore monitor: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64\n", .{});
         std.process.exit(2);
     }
     if (opts.image_ref != null and opts.rootfs_path == null) {

@@ -219,7 +219,7 @@ pub fn createCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
     const paths = try cliPaths(init, allocator, "create", spec.name);
     const paths_ms = monotonicMs();
     if (!monitorBackendSupported(spec.backend)) {
-        std.debug.print("spore create: monitor mode currently supports only HVF on Apple Silicon\n", .{});
+        std.debug.print("spore create: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64\n", .{});
         std.process.exit(2);
     }
     const state = try classifyVmState(allocator, init.io, paths, pidAlive);
@@ -395,7 +395,7 @@ pub fn resumeCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
         .console_log_path = base.console_log_path,
     };
     if (!monitorBackendSupported(spec.backend)) {
-        std.debug.print("spore resume: monitor mode currently supports only HVF on Apple Silicon\n", .{});
+        std.debug.print("spore resume: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64\n", .{});
         std.process.exit(2);
     }
     const paths = try cliPaths(init, allocator, "resume", spec.name);
@@ -1096,8 +1096,12 @@ fn validBackend(raw: []const u8) bool {
 }
 
 pub fn monitorBackendSupported(raw: []const u8) bool {
-    if (!std.mem.eql(u8, raw, "auto") and !std.mem.eql(u8, raw, "hvf")) return false;
-    return comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
+    const hvf_supported = comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
+    const kvm_supported = comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64;
+    if (std.mem.eql(u8, raw, "auto")) return hvf_supported or kvm_supported;
+    if (std.mem.eql(u8, raw, "hvf")) return hvf_supported;
+    if (std.mem.eql(u8, raw, "kvm")) return kvm_supported;
+    return false;
 }
 
 fn openDirPath(io: Io, path: []const u8, flags: Io.Dir.OpenOptions) !Io.Dir {
@@ -1180,9 +1184,11 @@ test "lifecycle validates VM names" {
 
 test "lifecycle monitor backend support is explicit" {
     const hvf_supported = comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
-    try std.testing.expectEqual(hvf_supported, monitorBackendSupported("auto"));
+    const kvm_supported = comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64;
+    try std.testing.expectEqual(hvf_supported or kvm_supported, monitorBackendSupported("auto"));
     try std.testing.expectEqual(hvf_supported, monitorBackendSupported("hvf"));
-    try std.testing.expect(!monitorBackendSupported("kvm"));
+    try std.testing.expectEqual(kvm_supported, monitorBackendSupported("kvm"));
+    try std.testing.expect(!monitorBackendSupported("bogus"));
 }
 
 test "lifecycle runtime root prefers explicit and xdg absolute paths" {

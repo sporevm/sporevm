@@ -34,7 +34,7 @@ fuzz targets from the slice that introduces it:
 | `spore run` exit frames | guest vsock stream | bounded host buffer; exit/timing string parser is unit and fuzz covered; malformed frames fail the run |
 | OCI manifest, OCI layout, and layer decode | registry, local OCI layout | rootfs builder only, outside the monitor process; mutable tags are resolved into digest-pinned refs before build materialization, local refs resolve to digest-pinned local identities, blobs are verified, layout tar extraction and layer tar application are path-safe, and JSON/tar fuzz targets cover parser inputs |
 | Generation device inputs | guest | MMIO register surface and fork/resume params schema are fuzz/unit covered |
-| Control socket JSON | local consumers | local-only lifecycle monitor protocol is implemented for HVF; malformed requests fail closed and the socket is protected by private runtime-directory permissions |
+| Control socket JSON | local consumers | local-only lifecycle monitor protocol is implemented for HVF and KVM; malformed requests fail closed and the socket is protected by private runtime-directory permissions |
 
 ## Structural Rules
 
