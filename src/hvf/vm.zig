@@ -86,6 +86,10 @@ pub const Config = struct {
     exec_control: ?vsock.Control = null,
 };
 
+fn hasFreshCaptureTrigger(config: Config) bool {
+    return config.snapshot_after_ms != null or config.snapshot_on_probe_complete or config.capture_request != null;
+}
+
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete, monitor_stopped };
 
 pub const DirtyTrackingOptions = struct {
@@ -157,7 +161,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var lazy_pager: ?lazy_ram.Pager = null;
     var dirty_tracker: ?DirtyTracker = null;
     var restore_stats: ?RestoreStats = null;
-    if (config.dirty_tracking.enabled and (config.resume_dir != null or config.snapshot_after_ms == null or config.snapshot_dir == null)) {
+    if (config.dirty_tracking.enabled and (config.resume_dir != null or config.snapshot_dir == null or !hasFreshCaptureTrigger(config))) {
         return error.BadManifest;
     }
     if (config.ram_backing_fd != null and config.ram_restore_mode == .lazy_chunks) return error.BadManifest;

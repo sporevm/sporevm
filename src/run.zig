@@ -37,6 +37,10 @@ const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const max_image_ref_cache_record_bytes = 64 * 1024;
 const image_ref_cache_record_version: u32 = 1;
+// Product capture needs a coherent run-bridge snapshot; seal the final dirty
+// set at capture time instead of racing a periodic worker against the active
+// exec/vsock session.
+const product_capture_dirty_epoch_ms = 0;
 
 pub const Backend = enum {
     auto,
@@ -1255,6 +1259,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .snapshot_on_probe_complete = exit_capture,
                 .capture_request = capture_request_ptr,
                 .continue_after_capture = opts.continue_after_capture,
+                .dirty_tracking = .{ .enabled = shouldDirtyTrackRunCapture(opts), .epoch_ms = product_capture_dirty_epoch_ms },
                 .network = network,
             });
         },
@@ -1276,6 +1281,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .snapshot_on_probe_complete = exit_capture,
                 .capture_request = capture_request_ptr,
                 .continue_after_capture = opts.continue_after_capture,
+                .dirty_tracking = .{ .enabled = shouldDirtyTrackRunCapture(opts), .epoch_ms = product_capture_dirty_epoch_ms },
                 .network = network,
             });
         },
@@ -1295,6 +1301,10 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
             resultFromSignalCapture(backend, opts, &stream),
         else => error.ProbeDidNotComplete,
     };
+}
+
+fn shouldDirtyTrackRunCapture(opts: Options) bool {
+    return opts.capture_path != null and opts.resume_dir == null;
 }
 
 pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {

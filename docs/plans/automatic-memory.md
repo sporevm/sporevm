@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-18
+last_reviewed: 2026-06-20
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/lifecycle-monitor.md
@@ -219,6 +219,10 @@ best-effort scans.
   dirty RAM sealer accepts optional seed ranges; fresh KVM and HVF boot paths
   pass those ranges into dirty tracking. Resume paths deliberately keep the old
   full seed until a separate sparse-resume seed source exists.
+- Fresh product `spore run --capture` paths now enable backend dirty tracking
+  for base captures. Product capture uses tail-only sealing for the final dirty
+  set, which avoids the 16GiB full-RAM scan while preserving coherent
+  run-bridge/vsock state for forked children.
 - `spore ls` currently emits JSON with `name`, `state`, and `pid`.
 
 ## Delivery Strategy
@@ -310,6 +314,14 @@ Done when:
 - Product smoke: `spore run --memory auto -- /bin/true`.
 - Product lifecycle smoke: create, exec, `spore ls`, suspend or rm.
 - Same-host fork/fan-out smoke reporting declared RAM versus aggregate PSS/RSS.
+- HVF product capture validation on 2026-06-20: a mostly-idle 16GiB
+  `spore run --backend hvf --memory auto --capture <base.spore> --capture-on
+  USR1 -- /bin/counter` baseline took 25.724s from `USR1` to exit with the
+  full-scan path. Enabling product dirty tracking with tail-only sealing reduced
+  the same measurement to 1.870s, with 8192 chunks, 132 populated refs, 8060
+  zero-elided chunks, and a 16GiB `ram.backing` allocated at about 264MiB.
+  `SPORE_SMOKE_FANOUT_COUNT=3 scripts/smoke-counter-fanout.sh` passed with the
+  default 20s capture timeout.
 
 ## Key Learnings From Pressure-Testing
 
@@ -333,6 +345,12 @@ Done when:
   1471ms because the final dirty tail still had 136 chunks. That is useful
   evidence for the next worker/tail tuning pass, not a reason to make fresh
   seed scan configured RAM again.
+- Product signal capture is more sensitive than the backend idle benchmark:
+  periodic HVF worker sealing with an active run-bridge/vsock session produced
+  a fast manifest that resumed the inherited counter but did not accept fork
+  identity. Tail-only product sealing kept capture under the smoke watchdog and
+  preserved fork/fan-out correctness. Re-enabling periodic product sealing needs
+  a dedicated run-bridge coherence proof.
 
 ## Resolved Decisions
 
