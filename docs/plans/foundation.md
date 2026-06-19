@@ -302,7 +302,7 @@ inputs.
   bundle indexes, rootfs/OCI parsers.
 - Product smoke: `mise run smoke`, `mise run smoke:counter-fanout`,
   `mise run smoke:rootfs-fanout`.
-- Remote smoke: chunkpack bundle distribution, peer/cache hierarchy, corrupt
+- Remote smoke: chunkpack bundle distribution, pull/cache hierarchy, corrupt
   bundle rejection.
 - Benchmark: suspend latency vs RAM size, fork latency, resume time to first
   instruction/useful work, lifecycle create-to-workload timing, and
