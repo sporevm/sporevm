@@ -5,6 +5,8 @@
 //! and lengths are guest controlled and validated. See SECURITY.md.
 
 const std = @import("std");
+const cow_disk = @import("../cow_disk.zig");
+const disk_layer = @import("../disk_layer.zig");
 const guestmem = @import("../guestmem.zig");
 const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
@@ -25,6 +27,10 @@ pub const Backend = union(enum) {
     /// Host file descriptor. Read-only fds are valid for immutable rootfs
     /// attachments; guest write requests then return an I/O error.
     file: std.c.fd_t,
+    /// Immutable base plus local sparse writable head.
+    cow: *cow_disk.CowDisk,
+    /// Immutable base plus sealed layers plus local sparse writable head.
+    layered_cow: *disk_layer.LayeredCowDisk,
     /// In-memory disk, used by tests.
     memory: []u8,
 
@@ -33,6 +39,8 @@ pub const Backend = union(enum) {
             .file => |fd| {
                 return seekFileSize(fd) orelse 0;
             },
+            .cow => |disk| return disk.capacityBytes(),
+            .layered_cow => |disk| return disk.capacityBytes(),
             .memory => |m| return m.len,
         }
     }
@@ -46,6 +54,14 @@ pub const Backend = union(enum) {
                     if (n <= 0) return false;
                     done += @intCast(n);
                 }
+                return true;
+            },
+            .cow => |disk| {
+                disk.readAt(buf, offset) catch return false;
+                return true;
+            },
+            .layered_cow => |disk| {
+                disk.readAt(buf, offset) catch return false;
                 return true;
             },
             .memory => |m| {
@@ -67,6 +83,14 @@ pub const Backend = union(enum) {
                 }
                 return true;
             },
+            .cow => |disk| {
+                disk.writeAt(buf, offset) catch return false;
+                return true;
+            },
+            .layered_cow => |disk| {
+                disk.writeAt(buf, offset) catch return false;
+                return true;
+            },
             .memory => |m| {
                 if (offset + buf.len > m.len) return false;
                 @memcpy(m[@intCast(offset)..][0..buf.len], buf);
@@ -75,10 +99,18 @@ pub const Backend = union(enum) {
         }
     }
 
-    fn flush(self: Backend) void {
+    fn flush(self: Backend) bool {
         switch (self) {
-            .file => |fd| _ = std.c.fsync(fd),
-            .memory => {},
+            .file => |fd| return std.c.fsync(fd) == 0,
+            .cow => |disk| {
+                disk.flush() catch return false;
+                return true;
+            },
+            .layered_cow => |disk| {
+                disk.flush() catch return false;
+                return true;
+            },
+            .memory => return true,
         }
     }
 };
@@ -185,7 +217,7 @@ pub const Blk = struct {
                 return moved + 1;
             },
             req_flush => {
-                self.backend.flush();
+                if (!self.backend.flush()) return failStatus(status);
                 status.data[0] = status_ok;
                 return 1;
             },
@@ -276,6 +308,77 @@ test "write request persists and out-of-range is io error" {
         .{ .data = &status, .writable = true },
     });
     _ = blk.handleRequest(&chain);
+    try std.testing.expectEqual(status_ioerr, status[0]);
+}
+
+test "cow backend serves dirty writes without mutating base" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+
+    var base_bytes = [_]u8{0x11} ** (2 * sector_size);
+    try base.writeStreamingAll(io, &base_bytes);
+
+    var cow = try cow_disk.CowDisk.init(std.testing.allocator, base.handle, overlay.handle, base_bytes.len, sector_size);
+    defer cow.deinit();
+    var blk = Blk.init(.{ .cow = &cow });
+
+    var header: [16]u8 = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, header[0..4], req_out, .little);
+    std.mem.writeInt(u64, header[8..16], 1, .little);
+    var write_data: [sector_size]u8 = [_]u8{0x5A} ** sector_size;
+    var status: [1]u8 = .{0xff};
+
+    var chain = makeChain(&.{
+        .{ .data = &header, .writable = false },
+        .{ .data = &write_data, .writable = false },
+        .{ .data = &status, .writable = true },
+    });
+    _ = blk.handleRequest(&chain);
+    try std.testing.expectEqual(status_ok, status[0]);
+
+    var read_data: [sector_size]u8 = undefined;
+    @memset(&read_data, 0);
+    status[0] = 0xff;
+    std.mem.writeInt(u32, header[0..4], req_in, .little);
+    chain = makeChain(&.{
+        .{ .data = &header, .writable = false },
+        .{ .data = &read_data, .writable = true },
+        .{ .data = &status, .writable = true },
+    });
+    const written = blk.handleRequest(&chain);
+    try std.testing.expectEqual(@as(u32, sector_size + 1), written);
+    try std.testing.expectEqual(status_ok, status[0]);
+    try std.testing.expectEqualSlices(u8, &write_data, &read_data);
+    try std.testing.expectEqual(@as(usize, 1), cow.dirtyClusterCount());
+
+    var base_check: [sector_size]u8 = undefined;
+    const read = try base.readPositionalAll(io, &base_check, sector_size);
+    try std.testing.expectEqual(base_check.len, read);
+    try std.testing.expectEqualSlices(u8, base_bytes[sector_size..], &base_check);
+}
+
+test "flush request reports backend failure" {
+    var blk = Blk{
+        .backend = .{ .file = -1 },
+        .capacity_sectors = 0,
+    };
+
+    var header: [16]u8 = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, header[0..4], req_flush, .little);
+    var status: [1]u8 = .{0xff};
+
+    const chain = makeChain(&.{
+        .{ .data = &header, .writable = false },
+        .{ .data = &status, .writable = true },
+    });
+    const written = blk.handleRequest(&chain);
+    try std.testing.expectEqual(@as(u32, 1), written);
     try std.testing.expectEqual(status_ioerr, status[0]);
 }
 

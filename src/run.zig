@@ -6,6 +6,8 @@ const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const capture = @import("capture.zig");
+const cow_disk = @import("cow_disk.zig");
+const disk_layer = @import("disk_layer.zig");
 const hvf = @import("hvf/hvf.zig");
 const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
@@ -65,6 +67,7 @@ pub const Options = struct {
     initrd_path: []const u8,
     rootfs_path: ?[]const u8 = null,
     rootfs: ?spore.Rootfs = null,
+    disk: ?spore.Disk = null,
     resume_dir: ?[]const u8 = null,
     command: []const []const u8,
     memory: memory_config.Config = .{},
@@ -139,6 +142,7 @@ const SharedOptions = struct {
             .initrd_path = initrd_path,
             .rootfs_path = rootfs_path,
             .rootfs = rootfs,
+            .disk = null,
             .resume_dir = null,
             .command = command,
             .memory = self.memory,
@@ -364,8 +368,10 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
             failRunSetup("spore run: --from uses the captured network policy; omit --net and network allow flags", .{});
         }
         const rootfs = try resumeRootfsForRun(allocator, manifest.value);
+        const disk = try resumeDiskForRun(allocator, manifest.value);
         const network_options = try networkOptionsFromManifest(allocator, manifest.value.network);
         var opts = parsed.shared.completeWithAssets(parsed.backend, "", "", null, rootfs, parsed.command, true);
+        opts.disk = disk;
         opts.resume_dir = spore_dir;
         opts.memory = runMemoryFromManifest(manifest.value);
         opts.capture_path = parsed.capture_path;
@@ -436,6 +442,13 @@ fn resumeRootfsForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?
         failRunSetup("spore run: --from manifest has invalid immutable rootfs metadata", .{});
     };
     return try cloneRootfs(allocator, rootfs);
+}
+
+fn resumeDiskForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Disk {
+    if (manifest.disk) |disk| {
+        return try disk_layer.cloneDisk(allocator, disk);
+    }
+    return null;
 }
 
 fn countBlockDevices(devices: []const spore.TransportState) usize {
@@ -1221,11 +1234,15 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     };
     const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
     const initrd: ?[]const u8 = if (resuming) null else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
-    const rootfs_fd = try openRootfsForRun(init, allocator, opts.rootfs_path, opts.rootfs);
-    defer {
-        if (rootfs_fd) |fd| _ = std.c.close(fd);
-    }
-    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, opts.network);
+    var runtime_disk = try openRuntimeDisk(init, allocator, .{
+        .rootfs_path = opts.rootfs_path,
+        .rootfs = opts.rootfs,
+        .disk = opts.disk,
+        .spore_dir = opts.resume_dir,
+        .command_name = "run",
+    });
+    defer runtime_disk.deinit();
+    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, rootfsWritable(opts), opts.network);
     const request = try execRequestForRun(init, allocator, opts);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
     if (opts.stream_output) stream.setOutputSink(null, runOutputSink);
@@ -1253,7 +1270,8 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
-                .disk_fd = rootfs_fd,
+                .disk_backend = runtime_disk.backend(),
+                .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .resume_dir = opts.resume_dir,
@@ -1277,7 +1295,8 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
-                .disk_fd = rootfs_fd,
+                .disk_backend = runtime_disk.backend(),
+                .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .resume_dir = opts.resume_dir,
@@ -1317,11 +1336,15 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
     const backend = try resolveBackend(opts.backend);
     const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
     const initrd = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
-    const rootfs_fd = try openRootfsForRun(init, allocator, opts.rootfs_path, opts.rootfs);
-    defer {
-        if (rootfs_fd) |fd| _ = std.c.close(fd);
-    }
-    const boot_args = try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, .disabled);
+    var runtime_disk = try openRuntimeDisk(init, allocator, .{
+        .rootfs_path = opts.rootfs_path,
+        .rootfs = opts.rootfs,
+        .disk = opts.disk,
+        .spore_dir = opts.resume_dir,
+        .command_name = "run",
+    });
+    defer runtime_disk.deinit();
+    const boot_args = try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, rootfsWritable(opts), .disabled);
 
     const cause = switch (backend) {
         .auto => unreachable,
@@ -1333,7 +1356,8 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
-                .disk_fd = rootfs_fd,
+                .disk_backend = runtime_disk.backend(),
+                .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
                 .resume_dir = opts.resume_dir,
                 .ram_restore_mode = .eager_chunks,
@@ -1349,7 +1373,8 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
-                .disk_fd = rootfs_fd,
+                .disk_backend = runtime_disk.backend(),
+                .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
                 .resume_dir = opts.resume_dir,
                 .ram_restore_mode = .eager_chunks,
@@ -1382,14 +1407,86 @@ fn openRunLocalMemoryBacking(
 fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.c.fd_t {
     const path = rootfs_path orelse return null;
     const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSOpenFailed;
     return fd;
 }
 
-fn openRootfsForRun(init: std.process.Init, allocator: std.mem.Allocator, rootfs_path: ?[]const u8, rootfs: ?spore.Rootfs) !?std.c.fd_t {
-    if (rootfs) |artifact| return try openVerifiedRootfs(init, allocator, artifact, "run");
-    return openRootfsDisk(allocator, rootfs_path);
+pub const RuntimeDiskOptions = struct {
+    rootfs_path: ?[]const u8 = null,
+    rootfs: ?spore.Rootfs = null,
+    disk: ?spore.Disk = null,
+    spore_dir: ?[]const u8 = null,
+    command_name: []const u8,
+};
+
+pub const RuntimeDisk = struct {
+    rootfs_fd: ?std.c.fd_t = null,
+    overlay: ?disk_layer.TempOverlay = null,
+    cow: ?cow_disk.CowDisk = null,
+    layered_cow: ?disk_layer.LayeredCowDisk = null,
+    base_disk: ?spore.Disk = null,
+
+    pub fn backend(self: *RuntimeDisk) ?virtio_blk.Backend {
+        if (self.layered_cow) |*disk| return .{ .layered_cow = disk };
+        if (self.cow) |*disk| return .{ .cow = disk };
+        if (self.rootfs_fd) |fd| return .{ .file = fd };
+        return null;
+    }
+
+    pub fn snapshot(self: *RuntimeDisk) ?disk_layer.SnapshotState {
+        const base = self.base_disk orelse return null;
+        if (self.layered_cow) |*disk| return .{ .base = base, .active = .{ .layered_cow = disk } };
+        if (self.cow) |*disk| return .{ .base = base, .active = .{ .cow = disk } };
+        return null;
+    }
+
+    pub fn deinit(self: *RuntimeDisk) void {
+        if (self.layered_cow) |*disk| disk.deinit();
+        if (self.cow) |*disk| disk.deinit();
+        if (self.overlay) |*overlay| overlay.deinit();
+        if (self.rootfs_fd) |fd| _ = std.c.close(fd);
+        self.* = .{};
+    }
+};
+
+pub fn openRuntimeDisk(init: std.process.Init, allocator: std.mem.Allocator, options: RuntimeDiskOptions) !RuntimeDisk {
+    const rootfs_fd = if (options.rootfs) |artifact|
+        try openVerifiedRootfs(init, allocator, artifact, options.command_name)
+    else
+        try openRootfsDisk(allocator, options.rootfs_path);
+
+    const fd = rootfs_fd orelse return .{};
+    var runtime = RuntimeDisk{ .rootfs_fd = fd };
+    errdefer runtime.deinit();
+
+    if (options.disk) |disk| {
+        const rootfs = options.rootfs orelse return error.BadManifest;
+        const spore_dir = options.spore_dir orelse return error.BadManifest;
+        if (disk.size != rootfs.artifact.size or !std.mem.eql(u8, disk.base, rootfs.artifact.digest)) return error.BadManifest;
+        runtime.overlay = try disk_layer.createTempOverlay(allocator);
+        if (disk.layers.len == 0) {
+            runtime.cow = try cow_disk.CowDisk.init(allocator, fd, runtime.overlay.?.fd, disk.size, disk_layer.default_cluster_size);
+            runtime.base_disk = disk;
+        } else {
+            const layers = try disk_layer.loadLayerChain(allocator, spore_dir, disk);
+            errdefer disk_layer.freeLayerChain(allocator, layers);
+            runtime.layered_cow = try disk_layer.LayeredCowDisk.init(allocator, spore_dir, fd, runtime.overlay.?.fd, disk, layers);
+            runtime.base_disk = disk;
+        }
+        return runtime;
+    }
+
+    if (options.rootfs) |rootfs| {
+        runtime.overlay = try disk_layer.createTempOverlay(allocator);
+        const base = disk_layer.diskFromRootfs(rootfs);
+        runtime.cow = try cow_disk.CowDisk.init(allocator, fd, runtime.overlay.?.fd, base.size, disk_layer.default_cluster_size);
+        runtime.base_disk = base;
+        return runtime;
+    }
+
+    return runtime;
 }
 
 pub var console_fd: std.c.fd_t = -1;
@@ -1474,13 +1571,18 @@ pub fn generationRequest(allocator: std.mem.Allocator, params_json: []const u8) 
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
-pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, network: NetworkMode) ![]const u8 {
+fn rootfsWritable(opts: Options) bool {
+    return opts.rootfs != null or opts.disk != null;
+}
+
+pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, network: NetworkMode) ![]const u8 {
     const rootfs_flag = if (rootfs) " spore_rootfs=1" else "";
+    const rootfs_rw_flag = if (rootfs and rootfs_writable) " spore_rootfs_rw=1" else "";
     const network_flag = if (network == .spore) " spore_net=1" else "";
     return std.fmt.allocPrint(
         allocator,
-        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}",
-        .{ guest_port, rootfs_flag, network_flag },
+        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}{s}",
+        .{ guest_port, rootfs_flag, rootfs_rw_flag, network_flag },
     );
 }
 
@@ -1683,6 +1785,60 @@ test "run request rejects encoded line overflow" {
     var argv: [10][]const u8 = undefined;
     for (&argv) |*slot| slot.* = arg[0..];
     try std.testing.expectError(error.RunRequestTooLarge, execRequest(std.testing.allocator, &argv));
+}
+
+fn testDiskGuardManifest(with_disk: bool) spore.Manifest {
+    return .{
+        .platform = .{
+            .cpu_profile = "test",
+            .device_model_version = 1,
+            .ram_base = 0x8000_0000,
+            .ram_size = 0,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0801_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{
+            .gprs = [_]u64{0} ** 31,
+            .pc = 0,
+            .cpsr = 0,
+            .fpcr = 0,
+            .fpsr = 0,
+            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .sys_regs = &.{},
+            .icc_regs = &.{},
+            .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+            .gic = .{
+                .kind = .gicv3,
+                .gicv3 = .{
+                    .dist_regs = &.{},
+                    .redist_regs = &.{},
+                    .line_levels = &.{},
+                },
+            },
+        },
+        .devices = &.{},
+        .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
+        .disk = if (with_disk) .{
+            .device = .{ .mmio_slot = 0 },
+            .size = 4096,
+            .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        } else null,
+        .memory = .{ .chunk_size = spore.chunk_size, .chunks = &.{} },
+    };
+}
+
+test "run from carries writable disk manifests into runtime options" {
+    try std.testing.expect((try resumeDiskForRun(std.testing.allocator, testDiskGuardManifest(false))) == null);
+    const disk = (try resumeDiskForRun(std.testing.allocator, testDiskGuardManifest(true))).?;
+    defer {
+        std.testing.allocator.free(disk.kind);
+        std.testing.allocator.free(disk.device.kind);
+        std.testing.allocator.free(disk.device.role);
+        std.testing.allocator.free(disk.base);
+        std.testing.allocator.free(disk.layers);
+    }
+    try std.testing.expectEqualStrings("blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", disk.base);
 }
 
 test "run cli parser accepts command after separator" {
@@ -2153,21 +2309,28 @@ test "run image cache creates absolute cache directories" {
 }
 
 test "run cmdline marks rootfs mode" {
-    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, .disabled);
+    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, false, .disabled);
     defer std.testing.allocator.free(without_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs=1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_rw=1") == null);
 
-    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, .disabled);
+    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, false, .disabled);
     defer std.testing.allocator.free(with_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_rw=1") == null);
+
+    const with_writable_rootfs = try cmdline(std.testing.allocator, 10700, true, true, .disabled);
+    defer std.testing.allocator.free(with_writable_rootfs);
+    try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs_rw=1") != null);
 }
 
 test "run cmdline marks network mode" {
-    const without_network = try cmdline(std.testing.allocator, 10700, false, .disabled);
+    const without_network = try cmdline(std.testing.allocator, 10700, false, false, .disabled);
     defer std.testing.allocator.free(without_network);
     try std.testing.expect(std.mem.indexOf(u8, without_network, "spore_net=1") == null);
 
-    const with_network = try cmdline(std.testing.allocator, 10700, false, .spore);
+    const with_network = try cmdline(std.testing.allocator, 10700, false, false, .spore);
     defer std.testing.allocator.free(with_network);
     try std.testing.expect(std.mem.indexOf(u8, with_network, "spore_net=1") != null);
 }

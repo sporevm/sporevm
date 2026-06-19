@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const capture = @import("../capture.zig");
+const disk_layer = @import("../disk_layer.zig");
 const dirty_ram = @import("../dirty_ram.zig");
 const hvf = @import("hvf.zig");
 const gic = @import("gic.zig");
@@ -35,6 +36,12 @@ pub const Config = struct {
     /// Host fd backing /dev/vda, if any. Immutable rootfs callers pass a
     /// read-only fd; guest write requests fail through the block device.
     disk_fd: ?std.c.fd_t = null,
+    /// Full block backend for writable or layered rootfs runs. Takes
+    /// precedence over disk_fd.
+    disk_backend: ?blk.Backend = null,
+    /// Optional active disk head to seal into a portable manifest layer when
+    /// a snapshot is taken.
+    disk_snapshot: ?disk_layer.SnapshotState = null,
     /// Immutable rootfs artifact metadata for disk-backed snapshots.
     rootfs: ?spore.Rootfs = null,
     /// Requested network capability and policy metadata for snapshots.
@@ -234,8 +241,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var transports_buf: [5]mmio.Transport = undefined;
     transports_buf[0] = mmio.Transport.init(con.device());
     var transport_count: usize = 1;
-    if (config.disk_fd) |fd| {
-        blk_dev = blk.Blk.init(.{ .file = fd });
+    const disk_backend: ?blk.Backend = if (config.disk_backend) |backend| backend else if (config.disk_fd) |fd| .{ .file = fd } else null;
+    if (disk_backend) |backend| {
+        blk_dev = blk.Blk.init(backend);
         transports_buf[1] = mmio.Transport.init(blk_dev.device());
         transport_count = 2;
     }
@@ -432,7 +440,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
                         .ram_size = config.ram_size,
-                    }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                    }, config.rootfs, config.disk_snapshot, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                     return .snapshotted;
                 },
             }
@@ -446,7 +454,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                }, config.rootfs, config.disk_snapshot, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
                 if (config.continue_after_capture) {
@@ -471,7 +479,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                                 .dist_base = dist_base,
                                 .redist_base = vcpu_redist_base,
                                 .ram_size = config.ram_size,
-                            }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                            }, config.rootfs, config.disk_snapshot, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                             return .snapshotted;
                         }
                         return .probe_complete;
@@ -494,7 +502,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                }, config.rootfs, config.disk_snapshot, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                 return .snapshotted;
             }
         }
@@ -954,6 +962,7 @@ fn takeSnapshot(
     ram_bytes: []const u8,
     platform: SnapshotPlatform,
     rootfs: ?spore.Rootfs,
+    disk_snapshot: ?disk_layer.SnapshotState,
     network_manifest: ?spore.Network,
     dirty_tracker: ?*DirtyTracker,
     environ_map: ?*const std.process.Environ.Map,
@@ -969,7 +978,12 @@ fn takeSnapshot(
     const devices_start = monotonicMs();
     const devices = try captureTransports(arena, transports);
     const devices_ms = monotonicMs() - devices_start;
-    if (rootfs) |rootfs_artifact| {
+    if (disk_snapshot) |disk_state| {
+        if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
+            std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
+            return error.DeviceStatePending;
+        }
+    } else if (rootfs) |rootfs_artifact| {
         if (!try spore.rootfsQueuesQuiescent(rootfs_artifact, devices)) {
             std.log.err("cannot snapshot rootfs-backed VM while virtio-blk has pending requests", .{});
             return error.DeviceStatePending;
@@ -989,6 +1003,7 @@ fn takeSnapshot(
             std.log.debug("local RAM backing proof unavailable: {s}", .{@errorName(err)});
         };
     }
+    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir) else null;
     const manifest_start = monotonicMs();
     try spore.saveManifest(arena, dir, .{
         .platform = .{
@@ -1004,6 +1019,7 @@ fn takeSnapshot(
         .devices = devices,
         .generation = gen_state,
         .rootfs = rootfs,
+        .disk = disk_manifest,
         .network = network_manifest,
         .memory = memory,
     });

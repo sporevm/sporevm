@@ -12,6 +12,8 @@ pub const boot = @import("boot.zig");
 pub const bundle = @import("bundle.zig");
 pub const capture = @import("capture.zig");
 pub const chunk = @import("chunk.zig");
+pub const cow_disk = @import("cow_disk.zig");
+pub const disk_layer = @import("disk_layer.zig");
 pub const generation = @import("generation.zig");
 pub const gicv3 = @import("gicv3.zig");
 pub const fdt = @import("fdt.zig");
@@ -61,6 +63,8 @@ test {
     testing.refAllDecls(@This());
     testing.refAllDecls(bundle);
     testing.refAllDecls(capture);
+    testing.refAllDecls(cow_disk);
+    testing.refAllDecls(disk_layer);
     testing.refAllDecls(fdpass);
     testing.refAllDecls(fanout);
     testing.refAllDecls(generation);

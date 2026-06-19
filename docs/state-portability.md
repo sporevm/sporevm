@@ -22,13 +22,15 @@ v0 portability is deliberately narrow:
 - Device model: the frozen SporeVM board contract — virtio-mmio console,
   optional blk, net, vsock, rng, and the generation MMIO device.
 - Memory: full eager RAM materialization from content-addressed chunks.
-- Disk: arbitrary or writable disk state is not captured. A captured
-  `spore run --image` workload may reference one verified immutable ext4 rootfs
-  artifact by digest; any other disk dependency requires the same backing bytes
-  out of band or fails closed.
+- Disk: a captured `spore run --image` workload may reference one verified
+  immutable ext4 rootfs artifact by digest and an optional sealed writable
+  rootfs-bound COW layer chain. Bundles can carry that chain's layer indexes
+  and disk objects. General block devices are still outside the portable
+  contract.
 
-Cross-ISA restore, multi-vCPU restore, writable disk manifests, persisted access
-traces, and broader disk/device fixups are later slices.
+Cross-ISA restore, multi-vCPU restore, persisted access traces, remote product
+proof for writable disk bundles, and broader disk/device fixups are later
+slices.
 
 ## Platform contract
 
@@ -76,9 +78,10 @@ block identical-host fork/fan-out.
 | Virtio-mmio transport | device ID, feature selectors, negotiated features, status, interrupt status, queue addresses/indices | yes | yes | yes | yes | portable |
 | Virtqueue descriptors and buffers | guest RAM | yes | yes | yes | yes | portable through RAM |
 | Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; fork path populates it |
-| Immutable rootfs artifact | optional digest/size/device binding plus OCI provenance | yes via `spore run --image` | verifies cached artifact fd | yes via `spore run --image` | verifies cached artifact fd | read-only product resume |
+| Immutable rootfs artifact | optional digest/size/device binding plus OCI provenance | yes via `spore run --image` | verifies cached artifact fd | yes via `spore run --image` | verifies cached artifact fd | product resume base |
+| Writable root disk layers | optional `cow-block-v0` chain over the immutable rootfs artifact | yes for local layer store | verifies layer indexes and disk objects | yes for local layer store | verifies layer indexes and disk objects | product resume; bundle materialization unit-covered |
 | Network capability and policy | optional `spore-net-v0` plus allow CIDRs/hosts; no live flows | yes | fresh gateway | yes | fresh gateway | policy portable; flows dropped |
-| Writable disk contents | not represented | no | same external bytes required or reject | no | same external bytes required or reject | out of v0 |
+| General writable disk contents | not represented | no | reject | no | reject | out of v0 |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
 | Access trace | not yet represented | no | no | no | no | local KVM/HVF lazy traces only; not a portability contract |
 
@@ -224,14 +227,15 @@ Current hard failures include:
 - unsupported portable GIC state that is not explicitly documented as a safe
   zero/reset skip;
 - counter-frequency mismatch;
-- missing or changed external disk bytes when a disk-backed workload relies on
-  them.
+- missing rootfs cache bytes, missing disk layer objects, corrupt disk objects,
+  or general disk devices outside the rootfs-bound COW contract.
 
 ## Smoke contract
 
 State portability checks should use product-created spores wherever possible:
 
-- `spore run --capture ...` to create diskless or immutable-rootfs spores;
+- `spore run --capture ...` to create diskless, immutable-rootfs, or locally
+  layered writable-rootfs spores;
 - `spore resume` to validate restore;
 - `spore fork` and `spore fanout` to validate child identity and parallel
   resume behavior.
@@ -241,6 +245,11 @@ Current evidence:
 - Product smokes cover same-host diskless capture/resume, diskless fork/fan-out,
   and OCI-rootfs child execution through `mise run smoke`,
   `mise run smoke:counter-fanout`, and `mise run smoke:rootfs-fanout`.
+- Local writable rootfs layer persistence, fork divergence, and local
+  bundle-carried disk layer replay are covered by `mise run smoke:writable-rootfs`.
+- Same-class KVM writable-rootfs bundle materialization passed with
+  `scripts/smoke-remote-bundle.sh --writable-rootfs` on two `a1.metal` hosts
+  in run `writable-rootfs-20260619T212758Z`.
 - KVM→HVF with an `m7g.metal` producer is a negative test: the spore records
   `counter_frequency_hz = 1_050_000_000` and HVF exposes 24MHz, so restore must
   reject it before running guest code.
@@ -251,8 +260,8 @@ Current evidence:
 ## Next contract work
 
 1. Add kernel image identity to the platform contract.
-2. Add disk state or an explicit disk identity/hash contract before claiming
-   disk-backed cross-host restore.
+2. Broaden disk-backed remote proof beyond same-class KVM and decide whether
+   rootfs-bound writable disk is enough for the next product slice.
 3. Decide the timer portability design: fixed guest timer profile at VM
    creation, frequency-neutral timer state plus guest-visible constraints, or
    host-class matching only.

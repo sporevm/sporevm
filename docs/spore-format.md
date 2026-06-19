@@ -19,7 +19,11 @@ A spore is a directory:
 ├── manifest.json
 ├── chunks/<blake3-hex>     # content-addressed data chunks
 ├── ram.backing             # optional local same-host RAM acceleration file
-└── ram.backing.proof       # optional local-only provenance proof
+├── ram.backing.proof       # optional local-only provenance proof
+├── disklayers/blake3/<hex>.json
+│                           # optional sealed writable disk layer indexes
+└── diskobjects/blake3/<hex>.cluster
+│                           # optional content-addressed disk clusters
 ```
 
 Spores captured from `spore run --image ... --capture` may also require
@@ -35,8 +39,12 @@ A local single-spore bundle is the first distribution form:
 ├── manifest.json           # portable manifest; local RAM backing stripped
 ├── chunkpack.index.json    # blake3 chunk id -> pack/offset/length/sha256
 ├── chunkpacks/000000.pack  # uncompressed logical chunks concatenated
-└── rootfs/blake3/<hex>.ext4
+├── rootfs/blake3/<hex>.ext4
                             # optional exact immutable rootfs artifact
+├── disklayers/blake3/<hex>.json
+│                           # optional writable disk layer indexes
+└── diskobjects/blake3/<hex>.cluster
+                            # optional writable disk cluster objects
 ```
 
 An indexed distribution bundle can carry a parent manifest and many child
@@ -51,7 +59,9 @@ manifests without duplicating shared memory chunks:
 ├── chunkpack.index.json
 ├── chunkpacks/000000.pack
 ├── rootfs.index.json       # optional rootfs digest -> artifact policy
-└── rootfs/blake3/<hex>.ext4
+├── rootfs/blake3/<hex>.ext4
+├── disklayers/blake3/<hex>.json
+└── diskobjects/blake3/<hex>.cluster
 ```
 
 Bundles are an implementation format for distribution, not a new machine-state
@@ -60,8 +70,9 @@ the SHA256 values in the chunkpack index make each packed segment compatible
 with blob-store and later OCI-style descriptor verification. `spore pack` and
 `spore unpack` also report a `bundle_digest`, a SHA256 digest over the exact
 bundle bytes that affect materialization, including bundle metadata, manifests,
-chunkpack metadata, pack blobs, rootfs metadata, and included rootfs artifacts.
-It is not a replacement for per-chunk or per-rootfs verification.
+chunkpack metadata, pack blobs, rootfs metadata, included rootfs artifacts, disk
+layer indexes, and disk objects. It is not a replacement for per-chunk,
+per-rootfs, or per-disk-object verification.
 
 If `manifest.json` records an immutable rootfs artifact, `spore pack` includes
 the exact ext4 bytes at `rootfs/blake3/<hex>.ext4` after verifying the source
@@ -73,6 +84,12 @@ default. `spore pack --children ... --rootfs=metadata-only` records the same
 digest and size with `metadata-only` policy and omits the ext4 file; materialized
 unpack and pull accept that policy only with `--allow-metadata-only-rootfs` and
 a verified hit in the selected rootfs digest cache.
+
+If the selected manifest records a writable disk chain, `spore pack` includes
+the referenced `disk-layer-v0` indexes and BLAKE3-addressed disk cluster objects
+once per bundle. `spore unpack` and `spore pull` copy those verified files into
+the materialized spore before writing the manifest, failing closed on missing or
+digest-mismatched layer/object bytes.
 
 `spore pull file:///path/to/bundle --child 42 --out child.spore` is the first
 pull materialization policy. It accepts local indexed bundles, canonicalizes the
@@ -87,8 +104,9 @@ S3 by uploading only the canonical files named by the validated bundle metadata.
 `spore pull s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out
 child.spore` downloads that exact object set into the node-local bundle cache,
 checks the canonical `bundle_digest`, then uses the same chunk and rootfs
-verification path as local pull. Bare S3 URLs are rejected for pull because the
-remote URL is not restore authority.
+verification path as local pull, including writable disk layer/object
+verification when present. Bare S3 URLs are rejected for pull because the remote
+URL is not restore authority.
 
 `spore pull http://peer:20000/spore.bundle@sha256:<bundle_digest> --child 42
 --out child.spore` uses the same verified materialization path for a static
@@ -165,6 +183,14 @@ sources, `peer_bytes_read` for HTTP(S) peer sources, `remote_bundle_cache_hit`,
   artifact to the rootfs virtio-mmio slot, `artifact` records a
   `blake3:<hex>` digest, size, and `ext4` format, and `source` records OCI
   provenance. The digest and size are restore authority; OCI metadata is not.
+- `disk`: optional sealed writable root disk state for rootfs-backed captures.
+  `kind` is `cow-block-v0`, `device` binds the disk to the same virtio-mmio
+  rootfs slot, `size` is the full disk size, `base` is the immutable rootfs
+  artifact digest, and `layers` is an ordered list of `blake3:<hex>` layer index
+  references. Reads replay newest layer to oldest layer over the immutable base.
+  Each `disk-layer-v0` index records `cluster_size`, `disk_size`, explicit
+  nonzero extents as `logical_cluster` plus cluster digest, and sorted explicit
+  `zero_clusters`.
 - `network`: optional requested network capability and policy. `kind` is
   `spore-net-v0`; `allow_cidrs` and `allow_hosts` record the user-selected
   egress allow policy. The manifest does not carry live gateway state, TCP
@@ -174,10 +200,9 @@ sources, `peer_bytes_read` for HTTP(S) peer sources, `remote_bundle_cache_hit`,
 
 ## Not yet captured in v0
 
-- Arbitrary or writable disk contents: v0 can reference one verified immutable
-  ext4 rootfs artifact for product resume, but it does not capture disk
-  mutations or general block-device state. Writable disk manifests are planned
-  for later fork/fan-out slices.
+- General block-device state is still incomplete. The current writable disk
+  contract is one rootfs-bound COW chain over a verified immutable ext4 rootfs
+  artifact.
 - Access traces: the KVM and HVF lazy-restore harnesses can write local
   first-touch traces for measurement, but v0 does not persist access traces or
   prefetch hints in the manifest.
@@ -213,6 +238,9 @@ sources, `peer_bytes_read` for HTTP(S) peer sources, `remote_bundle_cache_hit`,
 - Rootfs-backed bundles include exact immutable rootfs bytes by default. Bundle
   unpack refuses missing, symlinked, or digest-mismatched rootfs artifacts before
   writing a resumable spore.
+- Rootfs-backed bundles include referenced writable disk layer indexes and disk
+  objects when present. Bundle materialization refuses corrupt or missing disk
+  layer/object bytes before writing a resumable spore manifest.
 - Immutable rootfs artifacts are portable by digest, not by local path. Resume
   opens the digest-addressed rootfs cache entry read-only, verifies the same fd
   by BLAKE3 and size, and only then attaches it to the VM.
@@ -221,6 +249,9 @@ sources, `peer_bytes_read` for HTTP(S) peer sources, `remote_bundle_cache_hit`,
   local provenance for opening a backing fd; invalid or absent proof uses the
   chunk manifest path. Bundles and pulls remain chunk-authoritative, and proof
   files must not be treated as distribution authority.
+- Writable disk layer indexes and disk cluster objects are portable by BLAKE3,
+  not by local active-head paths. Resume verifies every selected layer index and
+  disk object before attaching the layered COW backend.
 - Machine state is normalized architectural aarch64 state. Raw KVM structures
   never appear in the format; the only documented temporary exception is the
   explicitly tagged HVF `backend_private` GIC blob, which other backends must

@@ -57,6 +57,14 @@ description = "Smoke capture, fork, and resume counter fan-out"
 run = "mise run build && scripts/smoke-rootfs-fanout.sh"
 description = "Smoke OCI rootfs capture, fork, and run-from child execution"
 
+[tasks."smoke:writable-rootfs"]
+run = "mise run build && scripts/smoke-writable-rootfs.sh"
+description = "Smoke writable rootfs disk layer capture and run-from replay"
+
+[tasks."benchmark:writable-rootfs"]
+run = "mise run build && scripts/benchmark-writable-rootfs.sh --iterations 1"
+description = "Benchmark writable rootfs COW, sealed append, and replay paths"
+
 [tasks."smoke:local-pull"]
 run = "mise run build && scripts/smoke-local-pull.sh"
 description = "Smoke local file:// pull materialization and resumed rootfs fan-out"

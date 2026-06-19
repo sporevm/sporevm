@@ -98,10 +98,14 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     defer if (gateway_active) gateway.deinit();
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
 
-    const rootfs_fd = try openResumeRootfs(init, allocator, parsed.value);
-    defer {
-        if (rootfs_fd) |fd| _ = std.c.close(fd);
-    }
+    validateResumeDiskManifest(parsed.value);
+    var runtime_disk = try run_mod.openRuntimeDisk(init, allocator, .{
+        .rootfs = parsed.value.rootfs,
+        .disk = parsed.value.disk,
+        .spore_dir = opts.spore_dir,
+        .command_name = "resume",
+    });
+    defer runtime_disk.deinit();
     const identity_request = resumeIdentityRequest(allocator, parsed.value.generation) catch |err| switch (err) {
         error.RunRequestTooLarge => null,
         else => |e| return e,
@@ -129,7 +133,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .kernel = "",
                 .ram_size = ram_size,
                 .console_sink = consoleSink,
-                .disk_fd = rootfs_fd,
+                .disk_backend = runtime_disk.backend(),
                 .resume_dir = opts.spore_dir,
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
@@ -146,7 +150,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .kernel = "",
                 .ram_size = ram_size,
                 .console_sink = consoleSink,
-                .disk_fd = rootfs_fd,
+                .disk_backend = runtime_disk.backend(),
                 .resume_dir = opts.spore_dir,
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
@@ -192,9 +196,9 @@ fn resumeRamSize(platform: spore.Platform) u64 {
     return platform.ram_size;
 }
 
-fn openResumeRootfs(init: std.process.Init, allocator: std.mem.Allocator, manifest: spore.Manifest) !?std.c.fd_t {
+fn validateResumeDiskManifest(manifest: spore.Manifest) void {
     const disk_count = countBlockDevices(manifest.devices);
-    if (disk_count == 0) return null;
+    if (disk_count == 0) return;
     if (disk_count != 1) {
         failResumeSetup("spore resume: only one immutable rootfs disk is supported; found {d} block devices", .{disk_count});
     }
@@ -204,9 +208,11 @@ fn openResumeRootfs(init: std.process.Init, allocator: std.mem.Allocator, manife
     spore.validateRootfs(rootfs, manifest.devices) catch {
         failResumeSetup("spore resume: invalid immutable rootfs metadata in manifest", .{});
     };
-    return run_mod.openVerifiedRootfs(init, allocator, rootfs, "resume") catch |err| {
-        failResumeSetup("spore resume: immutable rootfs artifact unavailable or unverifiable: {s}", .{@errorName(err)});
-    };
+    if (manifest.disk) |disk| {
+        spore.validateDisk(disk, rootfs, manifest.devices) catch {
+            failResumeSetup("spore resume: invalid writable disk metadata in manifest", .{});
+        };
+    }
 }
 
 fn countBlockDevices(devices: []const spore.TransportState) usize {
@@ -280,4 +286,67 @@ test "resume counts block devices for disk dependency classification" {
 
     try std.testing.expectEqual(@as(usize, 1), countBlockDevices(&.{ console_device, disk_device }));
     try std.testing.expectEqual(@as(usize, 0), countBlockDevices(&.{console_device}));
+}
+
+fn testDiskGuardManifest(devices: []spore.TransportState, with_disk: bool) spore.Manifest {
+    return .{
+        .platform = .{
+            .cpu_profile = "test",
+            .device_model_version = 1,
+            .ram_base = 0x8000_0000,
+            .ram_size = 0,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0801_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{
+            .gprs = [_]u64{0} ** 31,
+            .pc = 0,
+            .cpsr = 0,
+            .fpcr = 0,
+            .fpsr = 0,
+            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .sys_regs = &.{},
+            .icc_regs = &.{},
+            .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+            .gic = .{
+                .kind = .gicv3,
+                .gicv3 = .{
+                    .dist_regs = &.{},
+                    .redist_regs = &.{},
+                    .line_levels = &.{},
+                },
+            },
+        },
+        .devices = devices,
+        .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
+        .rootfs = .{
+            .device = .{ .mmio_slot = 0 },
+            .artifact = .{
+                .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                .size = 4096,
+            },
+        },
+        .disk = if (with_disk) .{
+            .device = .{ .mmio_slot = 0 },
+            .size = 4096,
+            .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        } else null,
+        .memory = .{ .chunk_size = spore.chunk_size, .chunks = &.{} },
+    };
+}
+
+test "resume accepts writable disk manifests for layered runtime setup" {
+    var devices = [_]spore.TransportState{.{
+        .device_id = virtio_blk.device_id,
+        .status = 0,
+        .device_features_sel = 0,
+        .driver_features_sel = 0,
+        .driver_features = 0,
+        .queue_sel = 0,
+        .interrupt_status = 0,
+        .queues = &.{},
+    }};
+    validateResumeDiskManifest(testDiskGuardManifest(&devices, false));
+    validateResumeDiskManifest(testDiskGuardManifest(&devices, true));
 }

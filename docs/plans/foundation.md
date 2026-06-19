@@ -8,6 +8,7 @@ related_plans:
   - docs/plans/local-image-ref-cache.md
   - docs/plans/immutable-rootfs-resume.md
   - docs/plans/distribution.md
+  - docs/plans/writable-disk-layers.md
   - docs/plans/automatic-memory.md
   - docs/plans/automatic-local-ram-backing.md
 ---
@@ -96,13 +97,16 @@ spore manifest
 |   counter frequency
 |-- machine state: vCPU, timer, GIC/ICC, virtio transport, generation device
 |-- memory: ordered BLAKE3 chunk refs, zero-elided, optional same-host backing
-`-- optional immutable rootfs artifact: digest, size, virtio-blk binding,
-    OCI provenance
+|-- optional immutable rootfs artifact: digest, size, virtio-blk binding,
+|   OCI provenance
+`-- optional writable root disk chain: immutable rootfs base plus sealed
+    content-addressed disk layers
 ```
 
-Arbitrary writable disk contents are not captured in v0. A verified immutable
-rootfs artifact can be recorded and reattached for product resume; writable disk
-state and broader disk manifests remain later work.
+General block-device state is still outside v0. A verified immutable rootfs
+artifact can be recorded and reattached for product resume, and rootfs-bound
+writable state can now be represented as sealed disk layers. Bundle/pull
+materialization carries those rootfs-bound disk layers by content digest.
 
 ## Current Status
 
@@ -113,10 +117,11 @@ state and broader disk manifests remain later work.
 | Slice 2: HVF boot | Complete for the foundation target | Continue using Apple Silicon smokes for regressions. |
 | Product run bridge | Landed | See `docs/plans/run-bridge.md`; future OCI/writable policy is out of this plan. |
 | Named lifecycle | Local HVF landed; KVM create/exec/ls/rm parity landed | Speed work including local image ref caching, KVM suspend/resume evidence, and disk-backed lifecycle resume; see `docs/plans/lifecycle-monitor.md`. |
-| Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Disk manifests remain future work. |
+| Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Keep writable disk product smoke coverage as regression evidence. |
 | Slice 4: fork and generation protocol | Complete for correctness | Keep fan-out identity smokes as regression coverage. |
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |
 | Slice 6: identical-host distribution | Active | Remote push/pull materialization, remote cache reuse metrics, and measured origin-egress efficiency beyond explicit relay trees. |
+| Writable disk layers | Complete for the first product target | See `docs/plans/writable-disk-layers.md`; local layered COW restore, fork divergence, bundle/pull materialization, same-class remote KVM proof, corrupt disk-object rejection, warm remote cache reuse, and first KVM benchmark guardrails are implemented. |
 | Slice 7: always-on dirty tracking | Complete for the foundation target | Keep dirty-tail and worker-stop benchmarks as release regressions; tune worker preemption only if the product SLO tightens. |
 | Automatic memory | Active | Product CLI memory contract is moving through `docs/plans/automatic-memory.md`; automatic local backing provenance is tracked in `docs/plans/automatic-local-ram-backing.md`; next user-visible work is `spore ls` memory stats. |
 | Slice 8: cross-backend diagnostic restore | Later diagnostic | HVF portable GIC producer and timer-frequency strategy. |
@@ -140,8 +145,9 @@ state and broader disk manifests remain later work.
 - `spore pack`, `spore unpack`, local `spore pull file://...`, S3
   `spore push`/digest-pinned `spore pull`, and digest-pinned HTTP(S) peer
   `spore pull` provide the first distribution bundle shape with rootfs artifact
-  inclusion, multi-child indexes, `bundle_digest` for cache identity,
-  origin/peer/cache byte reporting, and per-chunk verification for trust.
+  inclusion, rootfs-bound writable disk layer inclusion, multi-child indexes,
+  `bundle_digest` for cache identity, origin/peer/cache byte reporting, and
+  per-chunk/per-artifact verification for trust.
 - `spore run`, product `spore resume`, and `spore fanout` provide the first
   user-facing run/capture/fork/resume/fan-out path.
 

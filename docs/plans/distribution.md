@@ -97,7 +97,8 @@ rootfs digest without carrying the bytes needed to satisfy it.
   materialized spores as first shipped product behavior.
 - OCI image policy, network policy, secrets, workspace semantics, or Cleanroom
   integration policy.
-- Writable disk distribution or persisted guest disk mutations.
+- General block-device distribution. The rootfs-bound writable disk chain is a
+  manifest-backed artifact and is in scope for bundle materialization.
 - Public compatibility promises before 1.0.
 
 ## Target Model
@@ -138,7 +139,9 @@ replacing the spore manifest contract:
 |-- chunkpack.index.json            # blake3 chunk id -> pack/offset/length/sha256
 |-- chunkpacks/000000.pack          # uncompressed logical chunks concatenated
 |-- rootfs.index.json               # optional rootfs digest -> artifact metadata
-`-- rootfs/blake3/<hex>.ext4        # optional exact immutable rootfs bytes
+|-- rootfs/blake3/<hex>.ext4        # optional exact immutable rootfs bytes
+|-- disklayers/blake3/<hex>.json    # optional writable disk layer indexes
+`-- diskobjects/blake3/<hex>.cluster # optional writable disk cluster objects
 ```
 
 `manifest.json` and its BLAKE3 memory chunk ids remain the restore-time trust
@@ -146,6 +149,10 @@ root. The bundle index and SHA256 segment hashes are transport and cache
 metadata. Rootfs artifacts stay separate from memory chunks: their manifest
 section records `kind`, read-only mode, device binding, BLAKE3 digest, size, and
 provenance, and `spore resume` must still verify the exact fd it will attach.
+Writable disk layer indexes and disk objects are also bundle payloads when a
+selected manifest records a `cow-block-v0` root disk chain. They stay separate
+from memory chunkpacks and rootfs artifacts; the manifest layer refs and object
+digests remain restore authority.
 
 Rootfs inclusion is the default artifact policy:
 
@@ -163,6 +170,10 @@ Rootfs inclusion is the default artifact policy:
 - A metadata-only bundle may be unpacked or pulled only with
   `--allow-metadata-only-rootfs`, and only when the selected rootfs cache already
   has the required verified bytes.
+- If any selected manifest records writable root disk layers, `spore pack`
+  copies the referenced disk layer indexes and BLAKE3 disk objects into the
+  bundle once by digest. `spore unpack` and `spore pull` verify those bytes
+  before writing a resumable spore.
 
 The internal boundary should be:
 
@@ -184,14 +195,18 @@ an attached rootfs fd.
 - Bundle digests key caches and remote references, but do not replace per-chunk
   or per-rootfs verification.
 - Bundle digests cover every file that affects materialization, including
-  `manifest.json`, bundle indexes, chunkpack blobs, rootfs indexes, and included
-  rootfs ext4 artifacts, in a canonical order.
+  `manifest.json`, bundle indexes, chunkpack blobs, rootfs indexes, included
+  rootfs ext4 artifacts, disk layer indexes, and disk objects, in a canonical
+  order.
 - Bundle chunkpacks remain seekable by chunk id, offset, and length. Avoid a
   distribution format that requires downloading or decompressing the whole bundle
   before one referenced chunk can be verified.
 - Rootfs artifacts are exact bytes, opened read-only, checked by BLAKE3 and
   size, included by default for portable bundles, and kept distinct from memory
   chunkpacks.
+- Disk layer indexes and disk objects are BLAKE3-addressed, included by default
+  when selected manifests reference them, and kept distinct from memory
+  chunkpacks and rootfs artifacts.
 - Rootfs cache installation is atomic and symlink-safe: write a temporary
   regular file outside the final digest path, verify size and BLAKE3, set the
   final permissions, then rename into the digest-addressed cache path.
@@ -204,8 +219,9 @@ an attached rootfs fd.
 
 - `spore pack` and `spore unpack` round-trip one portable memory/rootfs bundle
   with `manifest.json`, `chunkpack.index.json`, chunkpacks, optional
-  `rootfs/blake3/<hex>.ext4` artifacts, `bundle_digest`, chunk verification,
-  and rootfs digest-cache installation.
+  `rootfs/blake3/<hex>.ext4` artifacts, optional writable disk layer/object
+  files, `bundle_digest`, chunk verification, rootfs digest-cache installation,
+  and disk layer/object verification.
 - `spore pack --children DIR` writes an indexed local bundle with
   `bundle.json`, `manifests/parent.json`, `manifests/children/<id>.json`,
   shared chunkpacks, and optional `rootfs.index.json` entries with explicit
@@ -216,12 +232,13 @@ an attached rootfs fd.
   indexed local bundle through a verified local bundle content source, reusing a
   node-local BLAKE3 chunk cache where hard links are available.
 - `spore push BUNDLE s3://BUCKET/PREFIX/` publishes indexed bundles to S3 by
-  uploading the canonical bundle file set named by validated metadata.
+  uploading the canonical bundle file set named by validated metadata, including
+  referenced disk layer/object files.
 - `spore pull s3://BUCKET/PREFIX@sha256:<bundle> --child ID --out DIR`
   downloads only that canonical file set, verifies the bundle digest, reports
   `origin_bytes_read`, `remote_bundle_cache_hit`, `chunk_bytes_fetched`, and
   rootfs cache hit/fetch metrics, then materializes through the same verified
-  local content source as `file://` pull.
+  local content source as `file://` pull, including disk layer/object checks.
 - `spore pull http://PEER:PORT/spore.bundle@sha256:<bundle> --child ID --out DIR`
   treats a peer as a static byte source, downloads only the canonical bundle
   file set, verifies the bundle digest before materialization, reports
@@ -429,6 +446,9 @@ cannot become restore authority.
 - Existing single-spore pack/unpack tests continue to pass unchanged.
 - Unit tests for rootfs artifact inclusion, digest-cache preload, tampered rootfs
   bytes, descriptor type checks, and symlink handling.
+- Unit tests for bundle-carried writable disk layers, bundle digest coverage for
+  disk objects, S3 upload/download file lists, remote bundle cache reuse, and
+  corrupt disk object rejection.
 - Unit tests for atomic rootfs cache installation, concurrent cache hits, failed
   partial writes, and bundle digests changing when any rootfs artifact changes.
 - Fuzz targets for new attacker-influenced bundle metadata parsers such as
@@ -440,7 +460,10 @@ cannot become restore authority.
 - Remote smoke: push one bundle to S3, pull separate children on same-class
   Linux/KVM aarch64 hosts, resume them, record origin bytes, and use
   `--dest-repeat 2 --cache-dir DIR` to prove repeated direct-S3 pulls on one
-  host reuse the remote bundle and chunk cache.
+  host reuse the remote bundle and chunk cache. Add `--writable-rootfs` to run
+  the same path against a rootfs-backed writable disk bundle and report disk
+  object count/bytes; run `writable-rootfs-20260619T212758Z` proved this on two
+  `a1.metal` hosts.
 - Peer remote smoke: serve a bundle from a source or relay host over HTTP,
   materialize destinations through `spore pull http://...@sha256:<bundle>`,
   resume selected children, and record peer bytes separately from origin bytes.

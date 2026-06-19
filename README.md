@@ -20,9 +20,11 @@ wiring, boot contract, virtio-mmio devices, and the SporeVM generation device.
 Cross-backend restore is a useful diagnostic; identical-host-class fork/fan-out
 is the product path.
 
-v0 spores do not capture arbitrary disk bytes yet. Product resume can reattach
-verified immutable rootfs artifacts from the local content cache; writable or
-unknown disk state still requires an explicit future disk contract.
+v0 spores do not capture arbitrary block devices yet. Product resume can
+reattach verified immutable rootfs artifacts from the local content cache, and
+rootfs-backed captures can record writable changes as sealed content-addressed
+disk layers. Bundle distribution carries those rootfs-bound disk layers; general
+disk-device state remains follow-up work.
 
 The target lifecycle property is that common operations avoid scaling with RAM
 size:
@@ -57,10 +59,14 @@ Current `main` can:
 - run one explicit argv request from a completed base spore with `spore run --from`;
 - stream fresh run stdout/stderr and exit with the guest command status;
 - capture a `spore run` on command exit or on a host signal with `--capture`;
+- record local writable rootfs changes from `spore run --image ... --capture`
+  as sealed disk layers;
 - mint metadata-only child spores with `spore fork`;
 - resume forked child directories with prefixed output using `spore fanout`;
 - resume one diskless or verified immutable-rootfs spore with `spore resume`;
 - pack and unpack local chunkpack bundles with `spore pack` / `spore unpack`;
+- carry rootfs artifacts and sealed writable disk layers through
+  `spore pack`, `spore unpack`, `spore push`, and digest-pinned `spore pull`;
 - build deterministic ext4 rootfs images from OCI images with
   `spore rootfs build`;
 - run from an explicit read-only rootfs with `spore run --rootfs`;
@@ -75,9 +81,8 @@ create, exec, list, and remove. Disk-backed lifecycle suspend/resume remains
 follow-up work. The backend smoke harnesses still exercise lower-level capture
 paths directly.
 
-Current active work is concentrated in three places: always-on dirty tracking and
-distribution scale in the foundation plan, remote preparation for immutable
-rootfs artifacts, and named lifecycle speed/KVM parity.
+Current active work is concentrated in remote proof for rootfs and disk
+artifacts, disk performance guardrails, and named lifecycle speed/KVM parity.
 
 ## Development
 
@@ -102,6 +107,7 @@ mise run smoke:run-net-dns
 mise run smoke:run-capture
 mise run smoke:counter-fanout
 mise run smoke:rootfs-fanout
+mise run smoke:writable-rootfs
 ```
 
 `mise run check` runs unit tests, the product build, and diff hygiene.
@@ -114,6 +120,8 @@ on the selected backend. `smoke:run-net-config` checks the experimental
 proxying through the managed gateway. `smoke:counter-fanout` and
 `smoke:rootfs-fanout` are opt-in demo smokes; the rootfs fan-out smoke builds a
 published Ruby OCI image and resumes forked children in parallel.
+`smoke:writable-rootfs` verifies local writable rootfs disk layers across
+capture, fork divergence, bundle pack/unpack, and `run --from`.
 
 `zig build` installs the minimal exec initrd used by `spore run`, so `cpio`
 must be available in `PATH`.
@@ -148,9 +156,10 @@ Run one command from a completed base spore:
 zig-out/bin/spore run --from /tmp/run.spore -- /bin/writeout
 ```
 
-`--from` resumes the spore, attaches any verified immutable rootfs artifact
-recorded in the manifest, sends the argv after `--` to the restored exec agent,
-streams stdout/stderr, and exits with the command status. It is mutually
+`--from` resumes the spore, attaches any verified immutable rootfs artifact and
+sealed writable disk chain recorded in the manifest, sends the argv after `--`
+to the restored exec agent, streams stdout/stderr, and exits with the command
+status. It is mutually
 exclusive with fresh boot inputs such as `--kernel`, `--initrd`, `--rootfs`, and
 `--image`; the RAM size comes from the spore manifest. The restored guest must be
 able to accept a fresh exec session. Signal-captured running workloads remain a
@@ -228,8 +237,9 @@ zig-out/bin/spore resume /tmp/forks/000000
 Product resume streams the restored guest console and defaults RAM size from
 the spore manifest. Spores captured from `spore run --image` record the
 immutable rootfs content digest and resume by reopening the verified
-content-addressed cache entry. Arbitrary writable disk restore is still
-unsupported.
+content-addressed cache entry. If the spore also has sealed writable disk
+layers, resume verifies the layer indexes and disk objects before attaching the
+layered root disk. General block-device restore is still unsupported.
 
 Pack and unpack a spore:
 
@@ -238,7 +248,9 @@ zig-out/bin/spore pack /tmp/run.spore --out /tmp/run.bundle
 zig-out/bin/spore unpack /tmp/run.bundle --out /tmp/run.unpacked
 ```
 
-Both commands report a `bundle_digest` for cache identity.
+Both commands report a `bundle_digest` for cache identity. If the manifest has
+sealed writable disk layers, bundle materialization carries the referenced layer
+indexes and disk objects alongside memory chunks and rootfs artifacts.
 
 ## Rootfs Images
 
@@ -270,11 +282,13 @@ with `spore rootfs import-oci ... --ref local/name:tag`, then run with
 Entrypoint, Cmd, User, Env, or Workdir yet. Set `SPOREVM_ROOTFS_CACHE_DIR` to
 override the cache directory.
 
-When combined with `--capture`, `--image` records immutable rootfs
-identity in the spore manifest. `spore resume` later verifies the cached rootfs
-bytes by digest before attaching the fd read-only. `--rootfs PATH` still works
-for ordinary runs, but `--rootfs PATH --capture` is rejected until there is an
-import/preload command that can record portable rootfs identity.
+When combined with `--capture`, `--image` records immutable rootfs identity in
+the spore manifest and stores any writable rootfs changes as sealed disk layers.
+`spore resume` later verifies the cached rootfs bytes by digest, then verifies
+any disk layer indexes and disk objects before attaching the root disk.
+`--rootfs PATH` still works for ordinary runs, but `--rootfs PATH --capture` is
+rejected until there is an import/preload command that can record portable rootfs
+identity.
 
 Exercise the rootfs capture/fork/resume path with:
 
@@ -303,6 +317,11 @@ are available when a change touches fan-out or rootfs behavior:
   parallel product resume fan-out.
 - `mise run smoke:rootfs-fanout`: exercise OCI rootfs capture, fork, and
   parallel `spore run --from` child execution.
+- `mise run smoke:writable-rootfs`: exercise writable rootfs layer capture,
+  fork divergence, bundle pack/unpack, append, and replay through
+  `spore run --from`.
+- `mise run benchmark:writable-rootfs`: record JSONL timings for writable
+  rootfs fresh COW capture, sealed-layer append, and sealed-layer replay.
 - `scripts/smoke-run-oci-rootfs.sh`: exercise an explicit OCI/rootfs command.
 
 `scripts/benchmark-kvm-dirty-tracking.sh` remains the lower-level measurement

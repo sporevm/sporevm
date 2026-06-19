@@ -14,12 +14,13 @@ Capture a spore on one SSM-managed KVM host, pack it into a chunkpack bundle,
 stage the bundle in S3, then pull and resume it on one or more compatible KVM
 hosts. The script uploads tracked HEAD plus the current tracked/staged diff to
 S3 so it can validate local changes before they are committed without copying
-stray untracked files. Destinations fetch directly from S3 by default; pass
-`--source-peer-ip IP` to have destinations use digest-pinned `spore pull`
-against a temporary HTTP seed on the source host instead. Pass `--cache-dir`
-and `--dest-repeat N` to prove repeated restores on one host can reuse a
-host-local bundle cache without refetching from S3 or the source peer. Each
-destination also corrupts a fetched bundle copy and asserts `spore unpack`
+stray untracked files. Pass `--include-untracked` only when the local untracked
+files are intentionally part of the smoke. Destinations fetch directly from S3
+by default; pass `--source-peer-ip IP` to have destinations use digest-pinned
+`spore pull` against a temporary HTTP seed on the source host instead. Pass
+`--cache-dir` and `--dest-repeat N` to prove repeated restores on one host can
+reuse a host-local bundle cache without refetching from S3 or the source peer.
+Each destination also corrupts a fetched bundle copy and asserts `spore unpack`
 rejects it before the normal restore path is counted successful. Pass
 `--tree-relay INSTANCE_ID:IP` one or more times to make relays pull from the
 source peer, resume once, then serve the same verified bundle cache to leaf
@@ -38,6 +39,14 @@ Options:
   --cache-dir DIR             remote host-local bundle cache directory
   --source-peer-ip IP         source host IP destinations use for HTTP bundle pulls
   --source-peer-port N        source host HTTP port (default: 20000)
+  --writable-rootfs           capture a rootfs-backed writable disk spore instead of
+                              the low-level ticker initrd spore
+  --writable-rootfs-image REF OCI image for --writable-rootfs
+                              (default: docker.io/library/alpine:3.20)
+  --writable-rootfs-platform P
+                              OCI platform for --writable-rootfs (default: linux/arm64)
+  --include-untracked         include git-untracked, non-ignored files in the
+                              remote source checkout
   --tree-relay ID:IP          relay instance and private IP for source→relay→leaf fan-out
                               (repeatable; relays also run one resume)
   --ssm-timeout-seconds N     per-host SSM command timeout (default: 1800)
@@ -97,6 +106,10 @@ dest_repeat="1"
 cache_dir=""
 source_peer_ip=""
 source_peer_port="20000"
+writable_rootfs=0
+writable_rootfs_image="docker.io/library/alpine:3.20"
+writable_rootfs_platform="linux/arm64"
+include_untracked=0
 ssm_timeout_seconds="1800"
 run_id=""
 keep_remote=0
@@ -176,6 +189,24 @@ while (($#)); do
       need_value "$1" "${2-}"
       source_peer_port="$2"
       shift 2
+      ;;
+    --writable-rootfs)
+      writable_rootfs=1
+      shift
+      ;;
+    --writable-rootfs-image)
+      need_value "$1" "${2-}"
+      writable_rootfs_image="$2"
+      shift 2
+      ;;
+    --writable-rootfs-platform)
+      need_value "$1" "${2-}"
+      writable_rootfs_platform="$2"
+      shift 2
+      ;;
+    --include-untracked)
+      include_untracked=1
+      shift
       ;;
     --ssm-timeout-seconds)
       need_value "$1" "${2-}"
@@ -280,6 +311,10 @@ q_dest_repeat="$(shell_quote "${dest_repeat}")"
 q_cache_dir="$(shell_quote "${cache_dir}")"
 q_source_peer_ip="$(shell_quote "${source_peer_ip}")"
 q_source_peer_port="$(shell_quote "${source_peer_port}")"
+q_writable_rootfs="$(shell_quote "${writable_rootfs}")"
+q_writable_rootfs_image="$(shell_quote "${writable_rootfs_image}")"
+q_writable_rootfs_platform="$(shell_quote "${writable_rootfs_platform}")"
+q_include_untracked="$(shell_quote "${include_untracked}")"
 q_keep_remote="$(shell_quote "${keep_remote}")"
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-remote-bundle.XXXXXX")"
@@ -347,12 +382,23 @@ trap cleanup EXIT
 
 source_archive="${tmpdir}/source.tar.gz"
 source_patch="${tmpdir}/source.patch"
+source_untracked_archive="${tmpdir}/source-untracked.tar.gz"
+source_untracked_list="${tmpdir}/source-untracked.list"
 source_script="${tmpdir}/source.sh"
 dest_script="${tmpdir}/dest.sh"
 
 echo "packing local checkout for remote smoke" >&2
 git -C "${repo_root}" archive --format=tar.gz -o "${source_archive}" HEAD
 git -C "${repo_root}" diff --binary HEAD -- >"${source_patch}"
+if [[ "${include_untracked}" == "1" ]]; then
+  git -C "${repo_root}" ls-files --others --exclude-standard -z >"${source_untracked_list}"
+  if [[ -s "${source_untracked_list}" ]]; then
+    tar -czf "${source_untracked_archive}" -C "${repo_root}" --null -T "${source_untracked_list}"
+  else
+    mkdir -p "${tmpdir}/empty-untracked"
+    tar -czf "${source_untracked_archive}" -C "${tmpdir}/empty-untracked" .
+  fi
+fi
 
 cat >"${source_script}" <<EOF
 #!/usr/bin/env bash
@@ -375,6 +421,10 @@ mem_mib=${q_mem_mib}
 snapshot_after_ms=${q_snapshot_after_ms}
 source_peer_ip=${q_source_peer_ip}
 source_peer_port=${q_source_peer_port}
+writable_rootfs=${q_writable_rootfs}
+writable_rootfs_image=${q_writable_rootfs_image}
+writable_rootfs_platform=${q_writable_rootfs_platform}
+include_untracked=${q_include_untracked}
 keep_remote=${q_keep_remote}
 workdir="/tmp/sporevm-remote-bundle-source-${run_id}"
 
@@ -382,7 +432,13 @@ rm -rf "\${workdir}"
 mkdir -p "\${workdir}/repo"
 aws s3 cp "s3://\${bucket}/\${run_prefix}/source.tar.gz" "\${workdir}/source.tar.gz" --region "\${region}" --only-show-errors
 aws s3 cp "s3://\${bucket}/\${run_prefix}/source.patch" "\${workdir}/source.patch" --region "\${region}" --only-show-errors
+if [[ "\${include_untracked}" == "1" ]]; then
+  aws s3 cp "s3://\${bucket}/\${run_prefix}/source-untracked.tar.gz" "\${workdir}/source-untracked.tar.gz" --region "\${region}" --only-show-errors
+fi
 tar -xzf "\${workdir}/source.tar.gz" -C "\${workdir}/repo"
+if [[ "\${include_untracked}" == "1" ]]; then
+  tar -xzf "\${workdir}/source-untracked.tar.gz" -C "\${workdir}/repo"
+fi
 cd "\${workdir}/repo"
 if [[ -s "\${workdir}/source.patch" ]]; then
   git apply --binary "\${workdir}/source.patch"
@@ -392,20 +448,40 @@ export MISE_TRUSTED_CONFIG_PATHS="\${PWD}/mise.toml"
 mise install
 mise exec -- zig build
 mise exec -- zig build kvm-boot
-mise exec -- env CC='zig cc -target aarch64-linux-musl' scripts/make-smoke-initrd.sh "\${workdir}/ticker.cpio"
-scripts/smoke-restore-leg.sh capture \
-  --backend kvm \
-  --initrd "\${workdir}/ticker.cpio" \
-  --spore-dir "\${workdir}/spore" \
-  --mem-mib "\${mem_mib}" \
-  --snapshot-after-ms "\${snapshot_after_ms}"
+if [[ "\${writable_rootfs}" == "1" ]]; then
+  if [[ "\${writable_rootfs_image}" == *@sha256:* ]]; then
+    resolved_writable_image="\${writable_rootfs_image}"
+  else
+    resolved_writable_image="\$(zig-out/bin/spore rootfs resolve "\${writable_rootfs_image}" --platform "\${writable_rootfs_platform}")"
+  fi
+  zig-out/bin/spore run \
+    --backend kvm \
+    --image "\${resolved_writable_image}" \
+    --capture "\${workdir}/spore" \
+    -- /bin/sh -lc 'printf "remote-parent-layer-ok\n" >/var/sporevm-remote-parent && sync'
+else
+  resolved_writable_image=""
+  mise exec -- env CC='zig cc -target aarch64-linux-musl' scripts/make-smoke-initrd.sh "\${workdir}/ticker.cpio"
+  scripts/smoke-restore-leg.sh capture \
+    --backend kvm \
+    --initrd "\${workdir}/ticker.cpio" \
+    --spore-dir "\${workdir}/spore" \
+    --mem-mib "\${mem_mib}" \
+    --snapshot-after-ms "\${snapshot_after_ms}"
+fi
 zig-out/bin/spore fork "\${workdir}/spore" --count "\${child_count}" --out "\${workdir}/spore.children" | tee "\${workdir}/fork-result.json"
 zig-out/bin/spore pack "\${workdir}/spore" --children "\${workdir}/spore.children" --out "\${workdir}/spore.bundle" | tee "\${workdir}/pack-result.json"
 
 bundle_bytes="\$(du -sb "\${workdir}/spore.bundle" | awk '{print \$1}')"
 unique_chunk_bytes="\$(du -sb "\${workdir}/spore.bundle/chunkpacks/000000.pack" | awk '{print \$1}')"
+disk_object_count="\$(find "\${workdir}/spore.bundle/diskobjects" -type f 2>/dev/null | wc -l | tr -d ' ')"
+disk_object_bytes="\$(if [[ -d "\${workdir}/spore.bundle/diskobjects" ]]; then du -sb "\${workdir}/spore.bundle/diskobjects" | awk '{print \$1}'; else printf '0\n'; fi)"
 bundle_key="\$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["bundle_digest"])' "\${workdir}/pack-result.json")"
 packed_chunks="\$(find "\${workdir}/spore.bundle/chunkpacks" -type f | wc -l | tr -d ' ')"
+writable_rootfs_json=false
+if [[ "\${writable_rootfs}" == "1" ]]; then
+  writable_rootfs_json=true
+fi
 served_bundle_bytes=0
 source_peer_url=""
 if [[ -n "\${source_peer_ip}" ]]; then
@@ -432,10 +508,15 @@ aws s3 cp "\${workdir}/bundle-key.txt" "s3://\${bucket}/\${run_prefix}/bundle-ke
 cat >"\${workdir}/source-result.json" <<JSON
 {
   "role": "source",
+  "run_id": "${run_id}",
   "instance_id": "${source_instance}",
   "workdir": "\${workdir}",
+  "writable_rootfs": \${writable_rootfs_json},
+  "writable_rootfs_image": "\${resolved_writable_image}",
   "bundle_bytes": \${bundle_bytes},
   "unique_chunk_bytes": \${unique_chunk_bytes},
+  "disk_object_count": \${disk_object_count},
+  "disk_object_bytes": \${disk_object_bytes},
   "bundle_key": "\${bundle_key}",
   "served_bundle_bytes": \${served_bundle_bytes},
   "pack_files": \${packed_chunks},
@@ -473,6 +554,8 @@ dest_repeat=${q_dest_repeat}
 cache_dir=${q_cache_dir}
 source_peer_ip=${q_source_peer_ip}
 source_peer_port=${q_source_peer_port}
+writable_rootfs=${q_writable_rootfs}
+include_untracked=${q_include_untracked}
 keep_remote=${q_keep_remote}
 dest_instance="\${SPOREVM_DEST_INSTANCE:?SPOREVM_DEST_INSTANCE is required}"
 dest_role="\${SPOREVM_DEST_ROLE:-dest}"
@@ -489,9 +572,15 @@ rm -rf "\${workdir}"
 mkdir -p "\${workdir}/repo"
 aws s3 cp "s3://\${bucket}/\${run_prefix}/source.tar.gz" "\${workdir}/source.tar.gz" --region "\${region}" --only-show-errors
 aws s3 cp "s3://\${bucket}/\${run_prefix}/source.patch" "\${workdir}/source.patch" --region "\${region}" --only-show-errors
+if [[ "\${include_untracked}" == "1" ]]; then
+  aws s3 cp "s3://\${bucket}/\${run_prefix}/source-untracked.tar.gz" "\${workdir}/source-untracked.tar.gz" --region "\${region}" --only-show-errors
+fi
 aws s3 cp "s3://\${bucket}/\${run_prefix}/bundle-key.txt" "\${workdir}/bundle-key.txt" --region "\${region}" --only-show-errors
 bundle_key="\$(tr -d '\n' <"\${workdir}/bundle-key.txt")"
 tar -xzf "\${workdir}/source.tar.gz" -C "\${workdir}/repo"
+if [[ "\${include_untracked}" == "1" ]]; then
+  tar -xzf "\${workdir}/source-untracked.tar.gz" -C "\${workdir}/repo"
+fi
 cd "\${workdir}/repo"
 if [[ -s "\${workdir}/source.patch" ]]; then
   git apply --binary "\${workdir}/source.patch"
@@ -516,18 +605,22 @@ assert_corrupt_bundle_rejected() {
   rm -rf "\${corrupt_dir}" "\${corrupt_out}" "\${corrupt_log}"
   mkdir -p "\${corrupt_dir}"
   cp -a "\${bundle_dir}/." "\${corrupt_dir}/"
-  python3 - "\${corrupt_dir}/chunkpacks/000000.pack" <<'PY'
+  corrupt_target="\$(find "\${corrupt_dir}/diskobjects/blake3" -type f 2>/dev/null | head -n 1 || true)"
+  if [[ -z "\${corrupt_target}" ]]; then
+    corrupt_target="\${corrupt_dir}/chunkpacks/000000.pack"
+  fi
+  python3 - "\${corrupt_target}" <<'PY'
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
 data = bytearray(path.read_bytes())
 if not data:
-    raise SystemExit("cannot corrupt empty chunkpack")
+    raise SystemExit("cannot corrupt empty bundle payload")
 data[0] ^= 0x01
 path.write_bytes(data)
 PY
-  if zig-out/bin/spore unpack "\${corrupt_dir}" --out "\${corrupt_out}" >"\${corrupt_log}" 2>&1; then
+  if SPOREVM_ROOTFS_CACHE_DIR="\${pull_rootfs_cache}" zig-out/bin/spore unpack "\${corrupt_dir}" --out "\${corrupt_out}" >"\${corrupt_log}" 2>&1; then
     cat "\${corrupt_log}" >&2 || true
     echo "corrupt bundle unexpectedly unpacked successfully" >&2
     exit 1
@@ -660,11 +753,19 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   if [[ "\${serve_bundle}" == "1" && "\${iteration}" == "1" ]]; then
     served_bundle_bytes="\$(start_peer_server "\${bundle_dir}")"
   fi
-  scripts/smoke-restore-leg.sh resume \
-    --backend kvm \
-    --spore-dir "\${unpacked_dir}" \
-    --resume-seconds "\${resume_seconds}" \
-    --kvm-lazy-ram
+  if [[ "\${writable_rootfs}" == "1" ]]; then
+    SPOREVM_ROOTFS_CACHE_DIR="\${pull_rootfs_cache}" \
+      zig-out/bin/spore run \
+      --backend kvm \
+      --from "\${unpacked_dir}" \
+      -- /bin/sh -lc 'test "\$(cat /var/sporevm-remote-parent)" = "remote-parent-layer-ok"'
+  else
+    scripts/smoke-restore-leg.sh resume \
+      --backend kvm \
+      --spore-dir "\${unpacked_dir}" \
+      --resume-seconds "\${resume_seconds}" \
+      --kvm-lazy-ram
+  fi
   unpacked_chunks="\$(find "\${unpacked_dir}/chunks" -type f | wc -l | tr -d ' ')"
   if [[ -n "\${iteration_json}" ]]; then
     iteration_json="\${iteration_json},"
@@ -684,12 +785,21 @@ serves_bundle=false
 if [[ "\${serve_bundle}" == "1" ]]; then
   serves_bundle=true
 fi
+writable_rootfs_json=false
+if [[ "\${writable_rootfs}" == "1" ]]; then
+  writable_rootfs_json=true
+fi
+resume_mode="kvm-lazy-ram"
+if [[ "\${writable_rootfs}" == "1" ]]; then
+  resume_mode="kvm-run-from-writable-rootfs"
+fi
 
 cat >"\${workdir}/dest-result.json" <<JSON
 {
   "role": "\${dest_role}",
   "instance_id": "\${dest_instance}",
   "workdir": "\${workdir}",
+  "writable_rootfs": \${writable_rootfs_json},
   "upstream_peer_ip": "\${peer_ip}",
   "serves_bundle": \${serves_bundle},
   "served_bundle_bytes": \${served_bundle_bytes},
@@ -709,7 +819,7 @@ cat >"\${workdir}/dest-result.json" <<JSON
   "corrupt_bundle_rejections": \${corrupt_bundle_rejections},
   "resume_count": \${dest_repeat},
   "unpacked_chunks": \${unpacked_chunks},
-  "resume_mode": "kvm-lazy-ram",
+  "resume_mode": "\${resume_mode}",
   "iterations": [\${iteration_json}]
 }
 JSON
@@ -726,6 +836,9 @@ chmod +x "${source_script}" "${dest_script}"
 echo "uploading smoke inputs to ${s3_base}/" >&2
 aws s3 cp "${source_archive}" "${s3_base}/source.tar.gz" --region "${region}" --only-show-errors
 aws s3 cp "${source_patch}" "${s3_base}/source.patch" --region "${region}" --only-show-errors
+if [[ "${include_untracked}" == "1" ]]; then
+  aws s3 cp "${source_untracked_archive}" "${s3_base}/source-untracked.tar.gz" --region "${region}" --only-show-errors
+fi
 aws s3 cp "${source_script}" "${s3_base}/source.sh" --region "${region}" --only-show-errors
 aws s3 cp "${dest_script}" "${s3_base}/dest.sh" --region "${region}" --only-show-errors
 
@@ -957,8 +1070,11 @@ json.dump({
     "leaf_count": len(leaves),
     "destination_resume_count": total_resume_count,
     "destination_instances": [d["instance_id"] for d in dests],
+    "writable_rootfs": bool(source.get("writable_rootfs", False)),
     "bundle_bytes": bundle_bytes,
     "unique_chunk_bytes": unique_chunk_bytes,
+    "disk_object_count": int(source.get("disk_object_count", 0)),
+    "disk_object_bytes": int(source.get("disk_object_bytes", 0)),
     "bundle_key": source["bundle_key"],
     "total_destination_download_bytes": total_destination_download_bytes,
     "total_destination_origin_bytes": total_destination_origin_bytes,

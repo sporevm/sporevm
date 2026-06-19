@@ -1,10 +1,11 @@
 //! Spore manifest v0 and chunk store.
 //!
-//! A spore is a directory: `manifest.json` plus `chunks/<blake3-hex>` files.
-//! Guest memory is stored as fixed-size content-addressed chunks with
-//! all-zero chunks elided. Machine state is normalized architectural
-//! aarch64 state — never raw hypervisor structures (see
-//! docs/spore-format.md). v0 carries no compatibility promise.
+//! A spore is a directory rooted at `manifest.json`. Guest memory is stored as
+//! fixed-size `chunks/<blake3-hex>` files with all-zero chunks elided; optional
+//! writable disk layers use verified `disklayers/` indexes and `diskobjects/`
+//! clusters. Machine state is normalized architectural aarch64 state — never raw
+//! hypervisor structures (see docs/spore-format.md). v0 carries no compatibility
+//! promise.
 //!
 //! Manifests and chunks may come from untrusted storage: parsing is strict,
 //! chunk contents are verified against their ids before use, and restore
@@ -220,6 +221,31 @@ pub const Rootfs = struct {
     source: ?RootfsSource = null,
 };
 
+pub const disk_kind_cow_block = "cow-block-v0";
+pub const disk_layer_kind = "disk-layer-v0";
+pub const disk_digest_prefix = rootfs_digest_prefix;
+
+pub const Disk = struct {
+    kind: []const u8 = disk_kind_cow_block,
+    device: RootfsDevice,
+    size: u64,
+    base: []const u8,
+    layers: []const []const u8 = &.{},
+};
+
+pub const DiskLayerExtent = struct {
+    logical_cluster: u64,
+    digest: []const u8,
+};
+
+pub const DiskLayer = struct {
+    kind: []const u8 = disk_layer_kind,
+    cluster_size: u64,
+    disk_size: u64,
+    extents: []const DiskLayerExtent = &.{},
+    zero_clusters: []const u64 = &.{},
+};
+
 pub const network_kind_spore = "spore-net-v0";
 
 pub const Network = struct {
@@ -248,6 +274,7 @@ pub const Manifest = struct {
     devices: []TransportState,
     generation: GenerationState,
     rootfs: ?Rootfs = null,
+    disk: ?Disk = null,
     network: ?Network = null,
     memory: MemoryManifest,
 };
@@ -653,15 +680,108 @@ pub fn validateMemoryBacking(backing: MemoryBacking, expected_size: u64) Error!v
 pub fn validateRootfs(rootfs: Rootfs, devices: []const TransportState) Error!void {
     if (!std.mem.eql(u8, rootfs.kind, rootfs_kind)) return error.BadManifest;
     if (!std.mem.eql(u8, rootfs.mode, rootfs_mode_read_only)) return error.BadManifest;
-    if (!std.mem.eql(u8, rootfs.device.kind, rootfs_device_kind_virtio_mmio)) return error.BadManifest;
-    if (!std.mem.eql(u8, rootfs.device.role, rootfs_device_role)) return error.BadManifest;
-    if (rootfs.device.virtio_device_id != rootfs_virtio_blk_device_id) return error.BadManifest;
-    if (rootfs.device.mmio_slot >= devices.len) return error.BadManifest;
-    if (devices[rootfs.device.mmio_slot].device_id != rootfs_virtio_blk_device_id) return error.BadManifest;
+    try validateRootfsDevice(rootfs.device, devices);
     if (!std.mem.eql(u8, rootfs.artifact.format, rootfs_artifact_format_ext4)) return error.BadManifest;
     if (rootfs.artifact.size == 0 or rootfs.artifact.size > std.math.maxInt(usize)) return error.BadManifest;
     try validateRootfsDigest(rootfs.artifact.digest);
     if (rootfs.source) |source| try validateRootfsSource(source);
+}
+
+fn validateRootfsDevice(device: RootfsDevice, devices: []const TransportState) Error!void {
+    if (!std.mem.eql(u8, device.kind, rootfs_device_kind_virtio_mmio)) return error.BadManifest;
+    if (!std.mem.eql(u8, device.role, rootfs_device_role)) return error.BadManifest;
+    if (device.virtio_device_id != rootfs_virtio_blk_device_id) return error.BadManifest;
+    if (device.mmio_slot >= devices.len) return error.BadManifest;
+    if (devices[device.mmio_slot].device_id != rootfs_virtio_blk_device_id) return error.BadManifest;
+}
+
+fn rootfsDeviceEql(a: RootfsDevice, b: RootfsDevice) bool {
+    return std.mem.eql(u8, a.kind, b.kind) and
+        std.mem.eql(u8, a.role, b.role) and
+        a.virtio_device_id == b.virtio_device_id and
+        a.mmio_slot == b.mmio_slot;
+}
+
+pub fn validateDisk(disk: Disk, maybe_rootfs: ?Rootfs, devices: []const TransportState) Error!void {
+    const rootfs = maybe_rootfs orelse return error.BadManifest;
+    if (!std.mem.eql(u8, disk.kind, disk_kind_cow_block)) return error.BadManifest;
+    try validateRootfsDevice(disk.device, devices);
+    if (!rootfsDeviceEql(disk.device, rootfs.device)) return error.BadManifest;
+    if (disk.size == 0 or disk.size != rootfs.artifact.size) return error.BadManifest;
+    if (!std.mem.eql(u8, disk.base, rootfs.artifact.digest)) return error.BadManifest;
+    try validateDiskDigest(disk.base);
+    for (disk.layers) |layer_ref| {
+        try validateDiskDigest(layer_ref);
+    }
+}
+
+pub fn validateDiskLayer(layer: DiskLayer) Error!void {
+    if (!std.mem.eql(u8, layer.kind, disk_layer_kind)) return error.BadManifest;
+    const cluster_count = try diskClusterCount(layer.disk_size, layer.cluster_size);
+
+    var previous_extent: ?u64 = null;
+    for (layer.extents) |extent| {
+        if (extent.logical_cluster >= cluster_count) return error.BadManifest;
+        if (previous_extent) |previous| {
+            if (extent.logical_cluster <= previous) return error.BadManifest;
+        }
+        try validateDiskDigest(extent.digest);
+        previous_extent = extent.logical_cluster;
+    }
+
+    var extent_index: usize = 0;
+    var previous_zero: ?u64 = null;
+    for (layer.zero_clusters) |logical_cluster| {
+        if (logical_cluster >= cluster_count) return error.BadManifest;
+        if (previous_zero) |previous| {
+            if (logical_cluster <= previous) return error.BadManifest;
+        }
+        while (extent_index < layer.extents.len and layer.extents[extent_index].logical_cluster < logical_cluster) {
+            extent_index += 1;
+        }
+        if (extent_index < layer.extents.len and layer.extents[extent_index].logical_cluster == logical_cluster) {
+            return error.BadManifest;
+        }
+        previous_zero = logical_cluster;
+    }
+}
+
+pub fn validDiskClusterSize(cluster_size: u64) bool {
+    return cluster_size != 0 and
+        cluster_size % 512 == 0 and
+        cluster_size <= std.math.maxInt(usize);
+}
+
+pub fn diskClusterCount(disk_size: u64, cluster_size: u64) Error!u64 {
+    if (disk_size == 0 or disk_size > std.math.maxInt(usize)) return error.BadManifest;
+    if (!validDiskClusterSize(cluster_size)) return error.BadManifest;
+    const rounded = std.math.add(u64, disk_size, cluster_size - 1) catch return error.BadManifest;
+    return rounded / cluster_size;
+}
+
+pub fn diskClusterLen(disk_size: u64, cluster_size: u64, logical_cluster: u64) Error!usize {
+    const cluster_count = try diskClusterCount(disk_size, cluster_size);
+    if (logical_cluster >= cluster_count) return error.BadManifest;
+    const start = std.math.mul(u64, logical_cluster, cluster_size) catch return error.BadManifest;
+    if (start >= disk_size) return error.BadManifest;
+    const len = @min(cluster_size, disk_size - start);
+    return std.math.cast(usize, len) orelse return error.BadManifest;
+}
+
+pub fn findDiskExtent(layer: DiskLayer, logical_cluster: u64) ?DiskLayerExtent {
+    for (layer.extents) |extent| {
+        if (extent.logical_cluster == logical_cluster) return extent;
+        if (extent.logical_cluster > logical_cluster) return null;
+    }
+    return null;
+}
+
+pub fn diskLayerHasZeroCluster(layer: DiskLayer, logical_cluster: u64) bool {
+    for (layer.zero_clusters) |zero_cluster| {
+        if (zero_cluster == logical_cluster) return true;
+        if (zero_cluster > logical_cluster) return false;
+    }
+    return false;
 }
 
 pub fn validateNetwork(network: Network) Error!void {
@@ -685,10 +805,28 @@ pub fn rootfsQueuesQuiescent(rootfs: Rootfs, devices: []const TransportState) Er
     return true;
 }
 
+pub fn diskQueuesQuiescent(disk: Disk, devices: []const TransportState) Error!bool {
+    try validateRootfsDevice(disk.device, devices);
+    const device = devices[disk.device.mmio_slot];
+    for (device.queues) |queue| {
+        if (queue.ready and queue.last_avail != queue.used_idx) return false;
+    }
+    return true;
+}
+
 pub fn validateRootfsDigest(digest: []const u8) Error!void {
-    if (!std.mem.startsWith(u8, digest, rootfs_digest_prefix)) return error.BadManifest;
-    const hex = digest[rootfs_digest_prefix.len..];
+    try validateDiskDigest(digest);
+}
+
+pub fn validateDiskDigest(digest: []const u8) Error!void {
+    _ = try diskDigestHex(digest);
+}
+
+pub fn diskDigestHex(digest: []const u8) Error![]const u8 {
+    if (!std.mem.startsWith(u8, digest, disk_digest_prefix)) return error.BadManifest;
+    const hex = digest[disk_digest_prefix.len..];
     _ = chunklib.ChunkId.fromHex(hex) catch return error.BadManifest;
+    return hex;
 }
 
 fn validateRootfsSource(source: RootfsSource) Error!void {
@@ -908,6 +1046,14 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
             }
         }
     }
+    var shared_disk_layers: ?[]const u8 = null;
+    var shared_disk_objects: ?[]const u8 = null;
+    if (parent.disk) |disk| {
+        if (disk.layers.len > 0) {
+            shared_disk_layers = try realpathAlloc(allocator, try pathZ(allocator, "{s}/disklayers", .{options.parent_dir}));
+            shared_disk_objects = try realpathAlloc(allocator, try pathZ(allocator, "{s}/diskobjects", .{options.parent_dir}));
+        }
+    }
     try ensureDir(try pathZ(allocator, "{s}", .{options.out_dir}));
 
     const fork_batch_id = try randomHex(allocator, 16);
@@ -918,6 +1064,12 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
         try ensureNewDir(child_dir);
         const chunks_link = try pathZ(allocator, "{s}/chunks", .{child_dir});
         try symlinkPath(shared_chunks, chunks_link);
+        if (shared_disk_layers) |layers| {
+            try symlinkPath(layers, try pathZ(allocator, "{s}/disklayers", .{child_dir}));
+        }
+        if (shared_disk_objects) |objects| {
+            try symlinkPath(objects, try pathZ(allocator, "{s}/diskobjects", .{child_dir}));
+        }
         var child = parent;
         if (shared_backing == null) child.memory.backing = null;
         if (child.memory.backing) |backing| {
@@ -1181,6 +1333,9 @@ fn validateManifest(manifest: Manifest) Error!void {
     }
     if (manifest.rootfs) |rootfs| {
         try validateRootfs(rootfs, manifest.devices);
+    }
+    if (manifest.disk) |disk| {
+        try validateDisk(disk, manifest.rootfs, manifest.devices);
     }
     if (manifest.network) |network| {
         try validateNetwork(network);
@@ -1597,6 +1752,15 @@ fn testRootfs(mmio_slot: u32) Rootfs {
     };
 }
 
+fn testDisk(mmio_slot: u32) Disk {
+    return .{
+        .device = .{ .mmio_slot = mmio_slot },
+        .size = 4096,
+        .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .layers = &.{"blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    };
+}
+
 test "manifest rootfs artifact validates transport binding" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1639,6 +1803,104 @@ test "manifest rootfs artifact validates transport binding" {
     devices[1].queues = &pending_queue;
     manifest.rootfs.?.artifact.digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     try std.testing.expect(!try rootfsQueuesQuiescent(manifest.rootfs.?, manifest.devices));
+}
+
+test "manifest disk validates rootfs base and layer chain" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
+    var devices = [_]TransportState{
+        testTransport(3),
+        testTransport(rootfs_virtio_blk_device_id),
+    };
+    var manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, 3);
+    manifest.devices = &devices;
+    manifest.rootfs = testRootfs(1);
+    manifest.disk = testDisk(1);
+
+    try saveManifest(arena, dir, manifest);
+    const parsed = try loadManifest(arena, dir);
+    defer parsed.deinit();
+    const disk = parsed.value.disk orelse return error.BadManifest;
+    try std.testing.expectEqualStrings(disk_kind_cow_block, disk.kind);
+    try std.testing.expectEqualStrings(manifest.rootfs.?.artifact.digest, disk.base);
+    try std.testing.expectEqual(@as(u64, 4096), disk.size);
+    try std.testing.expect(try diskQueuesQuiescent(disk, parsed.value.devices));
+
+    manifest.rootfs = null;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    manifest.rootfs = testRootfs(1);
+    manifest.disk.?.base = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    manifest.disk.?.base = manifest.rootfs.?.artifact.digest;
+    manifest.disk.?.device.mmio_slot = 0;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    manifest.disk.?.device.mmio_slot = 1;
+    manifest.disk.?.size = 8192;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    manifest.disk.?.size = 4096;
+    manifest.disk.?.layers = &.{"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"};
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+}
+
+test "disk layer index validation fails closed" {
+    const digest_a = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const digest_b = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    var layer = DiskLayer{
+        .cluster_size = 4096,
+        .disk_size = 8192,
+        .extents = &.{
+            .{ .logical_cluster = 0, .digest = digest_a },
+            .{ .logical_cluster = 1, .digest = digest_b },
+        },
+        .zero_clusters = &.{},
+    };
+    try validateDiskLayer(layer);
+    try std.testing.expectEqual(@as(u64, 2), try diskClusterCount(layer.disk_size, layer.cluster_size));
+    try std.testing.expectEqual(@as(usize, 4096), try diskClusterLen(layer.disk_size, layer.cluster_size, 1));
+    try std.testing.expect(findDiskExtent(layer, 1) != null);
+    try std.testing.expect(!diskLayerHasZeroCluster(layer, 1));
+
+    layer.extents = &.{
+        .{ .logical_cluster = 1, .digest = digest_b },
+        .{ .logical_cluster = 0, .digest = digest_a },
+    };
+    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
+
+    layer.extents = &.{
+        .{ .logical_cluster = 1, .digest = digest_a },
+        .{ .logical_cluster = 1, .digest = digest_b },
+    };
+    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
+
+    layer.extents = &.{.{ .logical_cluster = 2, .digest = digest_a }};
+    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
+
+    layer.extents = &.{.{ .logical_cluster = 0, .digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }};
+    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
+
+    layer.extents = &.{.{ .logical_cluster = 0, .digest = digest_a }};
+    layer.zero_clusters = &.{0};
+    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
+
+    layer.extents = &.{};
+    layer.zero_clusters = &.{ 1, 1 };
+    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
+
+    layer.zero_clusters = &.{2};
+    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
+
+    layer.zero_clusters = &.{};
+    layer.cluster_size = 1000;
+    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
+
+    layer.cluster_size = 4096;
+    layer.disk_size = 0;
+    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
 }
 
 const test_fork_line_levels = [_]gicv3.LineLevel{.{ .intid = board.generationIntid(), .asserted = false }};
@@ -1707,10 +1969,13 @@ test "fork mints child manifests with shared chunks and pending generation" {
     var parent_manifest = testForkManifest(memory, ram.len, 41);
     parent_manifest.devices = &devices;
     parent_manifest.rootfs = testRootfs(1);
+    parent_manifest.disk = testDisk(1);
     parent_manifest.network = .{
         .allow_cidrs = &.{"93.184.216.0/24"},
         .allow_hosts = &.{"example.com"},
     };
+    try ensureDir(try pathZ(arena, "{s}/disklayers", .{parent_dir}));
+    try ensureDir(try pathZ(arena, "{s}/diskobjects", .{parent_dir}));
     try saveManifest(arena, parent_dir, parent_manifest);
 
     const result = try fork(arena, .{ .parent_dir = parent_dir, .out_dir = out_dir, .count = 2, .environ_map = &env });
@@ -1730,6 +1995,11 @@ test "fork mints child manifests with shared chunks and pending generation" {
     try std.testing.expect(first.value.machine.gic.gicv3.?.line_levels[0].asserted);
     try std.testing.expect(first.value.rootfs != null);
     try std.testing.expectEqualStrings(parent_manifest.rootfs.?.artifact.digest, first.value.rootfs.?.artifact.digest);
+    try std.testing.expect(first.value.disk != null);
+    try std.testing.expectEqualStrings(parent_manifest.disk.?.base, first.value.disk.?.base);
+    try std.testing.expectEqualStrings(parent_manifest.disk.?.layers[0], first.value.disk.?.layers[0]);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.access(try pathZ(arena, "{s}/disklayers", .{first_child_dir}), 0));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.access(try pathZ(arena, "{s}/diskobjects", .{first_child_dir}), 0));
     try std.testing.expect(first.value.network != null);
     try std.testing.expectEqualStrings(network_kind_spore, first.value.network.?.kind);
     try std.testing.expectEqualStrings(parent_manifest.network.?.allow_cidrs[0], first.value.network.?.allow_cidrs[0]);

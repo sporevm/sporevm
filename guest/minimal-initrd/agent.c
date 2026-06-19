@@ -160,14 +160,16 @@ static int mount_if_dir(const char *source, const char *target, const char *fsty
   return 0;
 }
 
-static int setup_rootfs(char *error, size_t cap) {
+static int setup_rootfs(int writable, char *error, size_t cap) {
   mkdir("/mnt", 0755);
   mkdir("/mnt/rootfs", 0755);
   if (wait_for_path("/dev/vda", 100, 50000) != 0) {
     snprintf(error, cap, "rootfs block device not found");
     return -1;
   }
-  if (mount("/dev/vda", "/mnt/rootfs", "ext4", MS_RDONLY, "noload") != 0) {
+  unsigned long rootfs_flags = writable ? 0 : MS_RDONLY;
+  const char *rootfs_data = writable ? "" : "noload";
+  if (mount("/dev/vda", "/mnt/rootfs", "ext4", rootfs_flags, rootfs_data) != 0) {
     snprintf(error, cap, "rootfs mount failed: errno=%d", errno);
     return -1;
   }
@@ -1017,11 +1019,12 @@ int main(void) {
   prepare_dev();
   mkdir("/run", 0755);
   int use_rootfs = cmdline_has_flag("spore_rootfs=1");
+  int rootfs_writable = cmdline_has_flag("spore_rootfs_rw=1");
   int use_network = cmdline_has_flag("spore_net=1");
   int rootfs_ready = 1;
   char rootfs_error[128];
   rootfs_error[0] = '\0';
-  if (use_rootfs && setup_rootfs(rootfs_error, sizeof(rootfs_error)) != 0) {
+  if (use_rootfs && setup_rootfs(rootfs_writable, rootfs_error, sizeof(rootfs_error)) != 0) {
     rootfs_ready = 0;
     dprintf(2, "%s\n", rootfs_error);
     size_t len = strlen(rootfs_error);

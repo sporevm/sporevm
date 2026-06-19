@@ -30,9 +30,9 @@ Run an explicit argv from a built rootfs by attaching it read-only:
 spore run --rootfs rootfs.ext4 -- /bin/echo hi
 ```
 
-For the direct convenience path, `spore run --image` resolves the image ref,
-builds or reuses a cached ext4 rootfs, and then delegates to the same read-only
-rootfs execution path:
+For the direct convenience path, ordinary `spore run --image` resolves the image
+ref, builds or reuses a cached ext4 rootfs, and then delegates to the same
+read-only rootfs execution path:
 
 ```bash
 spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
@@ -81,13 +81,15 @@ uses the platform cache directory. Cache setup messages are shown only with
 `spore --debug ...`, so command stdout and stderr stay workload-focused by
 default.
 
-When `spore run --image ... --capture SPORE` captures a VM, the spore
-manifest records an immutable rootfs artifact: the ext4 content BLAKE3 digest,
-size, virtio-blk binding, resolved OCI image identity, platform, and builder
-version. The rootfs is also stored under a digest-addressed cache path. Product
-`spore resume` reopens that cached artifact, verifies the same read-only fd by
-digest and size, then attaches it as virtio-blk. If the digest cache entry is
-missing or tampered with, resume refuses to boot.
+When `spore run --image ... --capture SPORE` captures a VM, the spore manifest
+records an immutable rootfs artifact: the ext4 content BLAKE3 digest, size,
+virtio-blk binding, resolved OCI image identity, platform, and builder version.
+The rootfs is also stored under a digest-addressed cache path. Product
+`spore resume` reopens that cached artifact, verifies it by digest and size, and
+attaches it as the base of the root disk. If the spore has sealed writable disk
+layers, resume also verifies those layer indexes and disk objects before
+attaching the layered COW backend. If the digest cache entry or any referenced
+disk layer data is missing or tampered with, resume refuses to boot.
 
 `spore pack` includes those exact rootfs bytes by default for rootfs-backed
 spores, under `rootfs/blake3/<hex>.ext4` in the local bundle. `spore unpack`
