@@ -35,6 +35,8 @@ pub const Device = struct {
     /// Device config space read (offset into config space, 1/2/4 byte widths
     /// arrive as u32). Return 0 for out-of-range reads.
     configReadFn: ?*const fn (context: *anyopaque, offset: u64) u32 = null,
+    /// Optional device reset hook called after transport-owned state is reset.
+    resetFn: ?*const fn (context: *anyopaque) void = null,
 };
 
 pub const f_version_1: u64 = 1 << 32;
@@ -74,6 +76,7 @@ pub const Transport = struct {
         self.device_features_sel = 0;
         self.driver_features_sel = 0;
         self.queue_sel = 0;
+        if (self.dev.resetFn) |f| f(self.dev.context);
     }
 
     /// MMIO read at `offset` within the register window.

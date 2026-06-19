@@ -15,6 +15,7 @@ const board = @import("board.zig");
 const chunklib = @import("chunk.zig");
 const generation = @import("generation.zig");
 const gicv3 = @import("gicv3.zig");
+const spore_net_policy = @import("spore_net_policy.zig");
 const Blake3 = std.crypto.hash.Blake3;
 
 pub const format_version: u32 = 0;
@@ -152,6 +153,14 @@ pub const Rootfs = struct {
     source: ?RootfsSource = null,
 };
 
+pub const network_kind_spore = "spore-net-v0";
+
+pub const Network = struct {
+    kind: []const u8 = network_kind_spore,
+    allow_cidrs: []const []const u8 = &.{},
+    allow_hosts: []const []const u8 = &.{},
+};
+
 pub const MemoryPlan = struct {
     chunk_size: usize,
     chunk_count: usize,
@@ -172,6 +181,7 @@ pub const Manifest = struct {
     devices: []TransportState,
     generation: GenerationState,
     rootfs: ?Rootfs = null,
+    network: ?Network = null,
     memory: MemoryManifest,
 };
 
@@ -280,6 +290,18 @@ pub fn validateRootfs(rootfs: Rootfs, devices: []const TransportState) Error!voi
     if (rootfs.artifact.size == 0 or rootfs.artifact.size > std.math.maxInt(usize)) return error.BadManifest;
     try validateRootfsDigest(rootfs.artifact.digest);
     if (rootfs.source) |source| try validateRootfsSource(source);
+}
+
+pub fn validateNetwork(network: Network) Error!void {
+    if (!std.mem.eql(u8, network.kind, network_kind_spore)) return error.BadManifest;
+    if (network.allow_cidrs.len > spore_net_policy.max_allow_cidrs) return error.BadManifest;
+    if (network.allow_hosts.len > spore_net_policy.max_allow_hosts) return error.BadManifest;
+    for (network.allow_cidrs) |cidr| {
+        _ = spore_net_policy.parseCidr(cidr) catch return error.BadManifest;
+    }
+    for (network.allow_hosts) |host| {
+        spore_net_policy.validateHost(host) catch return error.BadManifest;
+    }
 }
 
 pub fn rootfsQueuesQuiescent(rootfs: Rootfs, devices: []const TransportState) Error!bool {
@@ -772,6 +794,9 @@ fn validateManifest(manifest: Manifest) Error!void {
     if (manifest.rootfs) |rootfs| {
         try validateRootfs(rootfs, manifest.devices);
     }
+    if (manifest.network) |network| {
+        try validateNetwork(network);
+    }
     gicv3.validate(manifest.machine.gic) catch return error.BadManifest;
 }
 
@@ -1028,6 +1053,10 @@ test "manifest json round-trip" {
             .interrupt_status = generation.irq_generation_changed,
             .params_b64 = "",
         },
+        .network = .{
+            .allow_cidrs = &.{"93.184.216.34/32"},
+            .allow_hosts = &.{"example.com"},
+        },
         .memory = .{ .chunk_size = chunk_size, .chunks = &memory_chunks },
     };
     try saveManifest(arena, dir, manifest);
@@ -1043,6 +1072,10 @@ test "manifest json round-trip" {
     try std.testing.expectEqual(@as(u32, gicv3.distRouterOffset(32)), parsed.value.machine.gic.gicv3.?.dist_regs[0].offset);
     try std.testing.expectEqual(@as(u16, 64), parsed.value.devices[0].queues[0].size);
     try std.testing.expectEqual(@as(u64, 7), parsed.value.generation.generation);
+    try std.testing.expect(parsed.value.network != null);
+    try std.testing.expectEqualStrings(network_kind_spore, parsed.value.network.?.kind);
+    try std.testing.expectEqualStrings("93.184.216.34/32", parsed.value.network.?.allow_cidrs[0]);
+    try std.testing.expectEqualStrings("example.com", parsed.value.network.?.allow_hosts[0]);
 }
 
 fn testTransport(device_id: u32) TransportState {
@@ -1180,6 +1213,10 @@ test "fork mints child manifests with shared chunks and pending generation" {
     var parent_manifest = testForkManifest(memory, ram.len, 41);
     parent_manifest.devices = &devices;
     parent_manifest.rootfs = testRootfs(1);
+    parent_manifest.network = .{
+        .allow_cidrs = &.{"93.184.216.0/24"},
+        .allow_hosts = &.{"example.com"},
+    };
     try saveManifest(arena, parent_dir, parent_manifest);
 
     const result = try fork(arena, .{ .parent_dir = parent_dir, .out_dir = out_dir, .count = 2 });
@@ -1199,6 +1236,10 @@ test "fork mints child manifests with shared chunks and pending generation" {
     try std.testing.expect(first.value.machine.gic.gicv3.?.line_levels[0].asserted);
     try std.testing.expect(first.value.rootfs != null);
     try std.testing.expectEqualStrings(parent_manifest.rootfs.?.artifact.digest, first.value.rootfs.?.artifact.digest);
+    try std.testing.expect(first.value.network != null);
+    try std.testing.expectEqualStrings(network_kind_spore, first.value.network.?.kind);
+    try std.testing.expectEqualStrings(parent_manifest.network.?.allow_cidrs[0], first.value.network.?.allow_cidrs[0]);
+    try std.testing.expectEqualStrings(parent_manifest.network.?.allow_hosts[0], first.value.network.?.allow_hosts[0]);
     const first_backing = first.value.memory.backing orelse return error.BadManifest;
     try std.testing.expectEqualStrings(ram_backing_path, first_backing.path);
     const first_backing_path = try memoryBackingPath(arena, first_child_dir, first_backing);
@@ -1377,5 +1418,19 @@ test "manifest rejects invalid counter frequency" {
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.platform.counter_frequency_hz = 24_000_000;
     manifest.platform.cpu_profile = "";
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+}
+
+test "manifest rejects invalid network policy" {
+    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
+    var manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, 3);
+
+    manifest.network = .{ .kind = "future-net-v0" };
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+
+    manifest.network = .{ .allow_cidrs = &.{"not-cidr"} };
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+
+    manifest.network = .{ .allow_hosts = &.{"bad host"} };
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 }

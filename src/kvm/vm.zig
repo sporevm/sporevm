@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const posix = std.posix;
 const capture = @import("../capture.zig");
 const dirty_ram = @import("../dirty_ram.zig");
 const kvm = @import("kvm.zig");
@@ -36,6 +37,8 @@ pub const Config = struct {
     disk_fd: ?std.c.fd_t = null,
     /// Immutable rootfs artifact metadata for disk-backed snapshots.
     rootfs: ?spore.Rootfs = null,
+    /// Requested network capability and policy metadata for snapshots.
+    network_manifest: ?spore.Network = null,
     /// Resume from a spore directory instead of booting the kernel.
     resume_dir: ?[]const u8 = null,
     /// Trusted same-host RAM backing fd supplied by the caller or future
@@ -68,6 +71,8 @@ pub const Config = struct {
     exec_probe_timeout_ms: u64 = 30_000,
     exec_probe_completes_run: bool = true,
     exec_probe_failure_fatal: bool = true,
+    /// Optional virtio-net frame backend. The default remains closed.
+    network: net.Runtime = .{},
 };
 
 pub const DirtyTrackingOptions = struct {
@@ -178,7 +183,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
 
     var con = console.Console{ .sink = config.console_sink };
     var blk_dev: blk.Blk = undefined;
-    var net_dev = net.Net.init(.{});
+    var net_dev = net.Net.init(.{ .backend = config.network.backend });
+    defer net_dev.shutdown();
     var rng_dev = rng.Rng{};
     var vsock_dev = vsock.Vsock.init(.{});
     var gen_dev = generation.Device{};
@@ -190,6 +196,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         transports_buf[1] = mmio.Transport.init(blk_dev.device());
         transport_count = 2;
     }
+    const net_transport_index = transport_count;
     transports_buf[transport_count] = mmio.Transport.init(net_dev.device());
     transport_count += 1;
     transports_buf[transport_count] = mmio.Transport.init(vsock_dev.device());
@@ -303,10 +310,18 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         0,
     );
     defer std.posix.munmap(run_bytes);
-    var capture_wake = KvmCaptureWake{ .run = run_bytes };
+    var network_wake_signal = KvmNetworkWakeSignal.install();
+    defer network_wake_signal.deinit();
+    var run_wake = KvmRunWake{
+        .run = run_bytes,
+        .process_id = linux.getpid(),
+        .thread_id = linux.gettid(),
+    };
     if (config.capture_request) |request_capture| {
-        request_capture.setWake(wakeKvmRun, &capture_wake);
+        request_capture.setWake(wakeKvmRun, &run_wake);
     }
+    config.network.setWake(.{ .context = &run_wake, .wakeFn = wakeNetworkKvmRun });
+    defer config.network.clearWake();
     defer if (config.capture_request) |request_capture| request_capture.clearWake();
 
     const start_ms = try monotonicMs();
@@ -335,6 +350,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var pending_kvm_completion = false;
     var did_capture_request = false;
     while (true) {
+        if (config.network.failed()) return error.NetworkGatewayFailed;
         if (config.capture_request) |request_capture| {
             if (request_capture.isAbortRequested()) return error.CaptureAborted;
             if (request_capture.isRequested() and !did_capture_request) {
@@ -343,7 +359,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     pending_kvm_completion = false;
                 }
                 const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
                 if (config.continue_after_capture) {
@@ -372,7 +388,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     if (config.exec_probe_completes_run) {
                         if (config.snapshot_on_probe_complete) {
                             const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                            try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                            try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                             return .snapshotted;
                         }
                         return .probe_complete;
@@ -399,20 +415,31 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     pending_kvm_completion = false;
                 }
                 const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                 return .snapshotted;
             }
         }
 
         switch (try kvm.runVcpu(vcpu_fd)) {
             .completed => {
+                const stopped_for_wake = run_bytes[kvm.RunLayout.immediate_exit] != 0;
                 if (consumeCaptureWake(config.capture_request, run_bytes)) continue;
+                if (config.network.failed()) continue;
+                if (config.network.consumeWake()) {
+                    try flushNetworkRxKvm(vm_fd, &net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
+                    if (stopped_for_wake) continue;
+                }
                 pending_kvm_completion = false;
             },
             .interrupted => {
                 _ = consumeCaptureWake(config.capture_request, run_bytes);
                 if (config.capture_request) |request_capture| {
                     if (request_capture.isRequested() or request_capture.isAbortRequested()) continue;
+                }
+                if (config.network.failed()) continue;
+                if (config.network.consumeWake()) {
+                    try flushNetworkRxKvm(vm_fd, &net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
+                    continue;
                 }
                 std.log.err("KVM_RUN interrupted without a pending capture request", .{});
                 return error.KvmIoctlFailed;
@@ -438,13 +465,67 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     }
 }
 
-const KvmCaptureWake = struct {
+const kvm_network_wake_signal = posix.SIG.URG;
+
+const KvmRunWake = struct {
     run: []u8,
+    process_id: linux.pid_t,
+    thread_id: linux.pid_t,
+
+    fn wakeNetwork(self: *KvmRunWake) void {
+        self.run[kvm.RunLayout.immediate_exit] = 1;
+        _ = linux.tgkill(self.process_id, self.thread_id, kvm_network_wake_signal);
+    }
+};
+
+const KvmNetworkWakeSignal = struct {
+    old_action: posix.Sigaction,
+    active: bool = false,
+
+    fn install() KvmNetworkWakeSignal {
+        var old_action: posix.Sigaction = undefined;
+        const action = posix.Sigaction{
+            .handler = .{ .sigaction = handleKvmNetworkWakeSignal },
+            .mask = posix.sigemptyset(),
+            .flags = posix.SA.SIGINFO,
+        };
+        posix.sigaction(kvm_network_wake_signal, &action, &old_action);
+        return .{ .old_action = old_action, .active = true };
+    }
+
+    fn deinit(self: *KvmNetworkWakeSignal) void {
+        if (!self.active) return;
+        posix.sigaction(kvm_network_wake_signal, &self.old_action, null);
+        self.active = false;
+    }
 };
 
 fn wakeKvmRun(context: ?*anyopaque) callconv(.c) void {
-    const wake: *KvmCaptureWake = @ptrCast(@alignCast(context orelse return));
+    const wake: *KvmRunWake = @ptrCast(@alignCast(context orelse return));
     wake.run[kvm.RunLayout.immediate_exit] = 1;
+}
+
+fn wakeNetworkKvmRun(context: ?*anyopaque) void {
+    const wake: *KvmRunWake = @ptrCast(@alignCast(context orelse return));
+    wake.wakeNetwork();
+}
+
+fn handleKvmNetworkWakeSignal(_: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    // Empty handler: the signal exists only to interrupt KVM_RUN after
+    // `immediate_exit` is set by a helper thread.
+}
+
+fn flushNetworkRxKvm(
+    vm_fd: std.c.fd_t,
+    net_dev: *net.Net,
+    transport: *mmio.Transport,
+    ram: guestmem.GuestRam,
+    transport_index: usize,
+) !void {
+    if (net_dev.flushPendingRx(&transport.queues, ram)) {
+        transport.interrupt_status |= 1;
+        try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(transport_index)), true);
+    }
 }
 
 fn consumeCaptureWake(capture_request: ?*capture.Request, run_bytes: []u8) bool {
@@ -829,6 +910,7 @@ fn takeSnapshot(
     ram_bytes: []const u8,
     ram_size: u64,
     rootfs: ?spore.Rootfs,
+    network_manifest: ?spore.Network,
     dirty_tracker: ?*DirtyTracker,
 ) !void {
     if (vsock_dev.pending_len != 0) {
@@ -877,6 +959,7 @@ fn takeSnapshot(
         .devices = devices,
         .generation = gen_state,
         .rootfs = rootfs,
+        .network = network_manifest,
         .memory = memory,
     });
     const manifest_ms = (try monotonicMs()) - manifest_start;

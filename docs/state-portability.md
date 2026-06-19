@@ -77,6 +77,7 @@ block identical-host fork/fan-out.
 | Virtqueue descriptors and buffers | guest RAM | yes | yes | yes | yes | portable through RAM |
 | Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; fork path populates it |
 | Immutable rootfs artifact | optional digest/size/device binding plus OCI provenance | yes via `spore run --image` | verifies cached artifact fd | yes via `spore run --image` | verifies cached artifact fd | read-only product resume |
+| Network capability and policy | optional `spore-net-v0` plus allow CIDRs/hosts; no live flows | yes | fresh gateway | yes | fresh gateway | policy portable; flows dropped |
 | Writable disk contents | not represented | no | same external bytes required or reject | no | same external bytes required or reject | out of v0 |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
 | Access trace | not yet represented | no | no | no | no | local KVM/HVF lazy traces only; not a portability contract |

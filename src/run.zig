@@ -12,10 +12,13 @@ const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
 else
     struct {};
 const local_paths = @import("local_paths.zig");
+const net_gateway = @import("net_gateway.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_mod = @import("rootfs.zig");
 const spore = @import("spore.zig");
+const spore_net_policy = @import("spore_net_policy.zig");
 const virtio_blk = @import("virtio/blk.zig");
+const virtio_net = @import("virtio/net.zig");
 const vsock = @import("virtio/vsock.zig");
 
 const max_file_size = 256 * 1024 * 1024;
@@ -73,6 +76,13 @@ pub const Options = struct {
     capture_path: ?[]const u8 = null,
     capture_trigger: capture.Trigger = .exit,
     continue_after_capture: bool = false,
+    network: NetworkMode = .disabled,
+    network_policy: spore_net_policy.Config = .{},
+};
+
+pub const NetworkMode = enum {
+    disabled,
+    spore,
 };
 
 pub const Result = struct {
@@ -150,7 +160,15 @@ pub const CliOptions = struct {
     capture_path: ?[]const u8 = null,
     capture_trigger: capture.Trigger = .exit,
     continue_after_capture: bool = false,
+    network: NetworkMode = .disabled,
+    network_requested: bool = false,
+    network_policy: spore_net_policy.Config = .{},
     command: []const []const u8,
+};
+
+pub const NetworkOptions = struct {
+    network: NetworkMode = .disabled,
+    policy: spore_net_policy.Config = .{},
 };
 
 const cli_usage =
@@ -164,6 +182,9 @@ const cli_usage =
     \\  --from DIR              Resume from an existing spore, then run argv
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs, then run from it
+    \\  --net                   Experimental SporeVM-managed networking
+    \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
+    \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
     \\  --capture DIR           Snapshot to DIR; defaults to --capture-on EXIT
     \\  --capture-on WHEN       Capture trigger: EXIT, INT, TERM, HUP, USR1, or USR2
     \\  --continue-after-capture
@@ -191,6 +212,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 
     const result = execute(init, arena, opts) catch |err| {
         if (isCaptureAborted(err)) std.process.exit(130);
+        if (isNetworkGatewayError(err)) {
+            printNetworkGatewayError(err);
+            std.process.exit(1);
+        }
         return err;
     };
     if (result.captured) {
@@ -213,6 +238,9 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var capture_trigger: capture.Trigger = .exit;
     var capture_trigger_set = false;
     var continue_after_capture = false;
+    var network: NetworkMode = .disabled;
+    var network_requested = false;
+    var network_policy = spore_net_policy.Config{};
     var command: ?[]const []const u8 = null;
 
     var i: usize = 0;
@@ -243,6 +271,21 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             capture_trigger_set = true;
         } else if (std.mem.eql(u8, args[i], "--continue-after-capture")) {
             continue_after_capture = true;
+        } else if (std.mem.eql(u8, args[i], "--net")) {
+            network = .spore;
+            network_requested = true;
+        } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
+            const raw = takeValue(args, &i, args[i]);
+            network_policy.addAllowCidr(raw) catch |err| {
+                std.debug.print("spore run: invalid --allow-cidr {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, args[i], "--allow-host")) {
+            const raw = takeValue(args, &i, args[i]);
+            network_policy.addAllowHost(raw) catch |err| {
+                std.debug.print("spore run: invalid --allow-host {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
         } else if (try parseSharedOption(&shared, args, &i)) {
             continue;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
@@ -289,6 +332,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.debug.print("spore run: --continue-after-capture requires a signal capture trigger\n", .{});
         std.process.exit(2);
     }
+    if (network == .disabled and network_policy.hasRules()) {
+        std.debug.print("spore run: --allow-cidr and --allow-host require --net\n", .{});
+        std.process.exit(2);
+    }
 
     return .{
         .backend = backend,
@@ -299,6 +346,9 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .capture_path = capture_path,
         .capture_trigger = capture_trigger,
         .continue_after_capture = continue_after_capture,
+        .network = network,
+        .network_requested = network_requested,
+        .network_policy = network_policy,
         .command = argv,
     };
 }
@@ -310,13 +360,19 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
         };
         defer manifest.deinit();
 
+        if (parsed.network_requested or parsed.network_policy.hasRules()) {
+            failRunSetup("spore run: --from uses the captured network policy; omit --net and network allow flags", .{});
+        }
         const rootfs = try resumeRootfsForRun(allocator, manifest.value);
+        const network_options = try networkOptionsFromManifest(allocator, manifest.value.network);
         var opts = parsed.shared.completeWithAssets(parsed.backend, "", "", null, rootfs, parsed.command, true);
         opts.resume_dir = spore_dir;
         opts.memory_mib = runMemoryMiBFromManifest(manifest.value);
         opts.capture_path = parsed.capture_path;
         opts.capture_trigger = parsed.capture_trigger;
         opts.continue_after_capture = parsed.continue_after_capture;
+        opts.network = network_options.network;
+        opts.network_policy = network_options.policy;
         return opts;
     }
 
@@ -335,7 +391,30 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     opts.capture_path = parsed.capture_path;
     opts.capture_trigger = parsed.capture_trigger;
     opts.continue_after_capture = parsed.continue_after_capture;
+    opts.network = parsed.network;
+    opts.network_policy = parsed.network_policy;
     return opts;
+}
+
+pub fn networkOptionsFromManifest(allocator: std.mem.Allocator, manifest_network: ?spore.Network) !NetworkOptions {
+    const network = manifest_network orelse return .{};
+    try spore.validateNetwork(network);
+    var policy = spore_net_policy.Config{};
+    for (network.allow_cidrs) |cidr| {
+        try policy.addAllowCidr(try allocator.dupe(u8, cidr));
+    }
+    for (network.allow_hosts) |host| {
+        try policy.addAllowHost(try allocator.dupe(u8, host));
+    }
+    return .{ .network = .spore, .policy = policy };
+}
+
+fn manifestNetworkFromOptions(network: NetworkMode, policy: *const spore_net_policy.Config) ?spore.Network {
+    if (network != .spore) return null;
+    return .{
+        .allow_cidrs = policy.allowCidrSlice(),
+        .allow_hosts = policy.allowHostSlice(),
+    };
 }
 
 fn runMemoryMiBFromManifest(manifest: spore.Manifest) u64 {
@@ -1126,6 +1205,16 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
 
     const backend = try resolveBackend(opts.backend);
+    var gateway: net_gateway.Process = undefined;
+    var gateway_active = false;
+    if (opts.network == .spore) {
+        try gateway.start(init, allocator, opts.network_policy);
+        gateway_active = true;
+    }
+    defer if (gateway_active) gateway.deinit();
+    const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
+    const network_manifest = manifestNetworkFromOptions(opts.network, &opts.network_policy);
+
     const resuming = opts.resume_dir != null;
     const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
     const initrd: ?[]const u8 = if (resuming) null else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
@@ -1133,7 +1222,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     defer {
         if (rootfs_fd) |fd| _ = std.c.close(fd);
     }
-    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null);
+    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, opts.network);
     const request = try execRequestForRun(init, allocator, opts);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
     if (opts.stream_output) stream.setOutputSink(null, runOutputSink);
@@ -1159,6 +1248,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
                 .rootfs = opts.rootfs,
+                .network_manifest = network_manifest,
                 .resume_dir = opts.resume_dir,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
@@ -1166,6 +1256,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .snapshot_on_probe_complete = exit_capture,
                 .capture_request = capture_request_ptr,
                 .continue_after_capture = opts.continue_after_capture,
+                .network = network,
             });
         },
         .kvm => blk: {
@@ -1178,6 +1269,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
                 .rootfs = opts.rootfs,
+                .network_manifest = network_manifest,
                 .resume_dir = opts.resume_dir,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
@@ -1185,6 +1277,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .snapshot_on_probe_complete = exit_capture,
                 .capture_request = capture_request_ptr,
                 .continue_after_capture = opts.continue_after_capture,
+                .network = network,
             });
         },
     }) catch |err| {
@@ -1193,6 +1286,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         }
         return err;
     };
+    if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
     const signal_capture_observed = signal_capture and capture_request.isCompleted();
     return switch (cause) {
         .probe_complete => resultFromStream(backend, opts, &stream, signal_capture_observed),
@@ -1214,7 +1308,7 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
     defer {
         if (rootfs_fd) |fd| _ = std.c.close(fd);
     }
-    const boot_args = try cmdline(allocator, opts.guest_port, opts.rootfs_path != null);
+    const boot_args = try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, .disabled);
 
     const cause = switch (backend) {
         .auto => unreachable,
@@ -1340,11 +1434,14 @@ pub fn generationRequest(allocator: std.mem.Allocator, params_json: []const u8) 
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
-pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool) ![]const u8 {
-    return if (rootfs)
-        std.fmt.allocPrint(allocator, "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1 spore_rootfs=1", .{guest_port})
-    else
-        std.fmt.allocPrint(allocator, "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1", .{guest_port});
+pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, network: NetworkMode) ![]const u8 {
+    const rootfs_flag = if (rootfs) " spore_rootfs=1" else "";
+    const network_flag = if (network == .spore) " spore_net=1" else "";
+    return std.fmt.allocPrint(
+        allocator,
+        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}",
+        .{ guest_port, rootfs_flag, network_flag },
+    );
 }
 
 fn resolveBackend(backend: Backend) !Backend {
@@ -1432,6 +1529,28 @@ fn captureTriggerIsExit(trigger: capture.Trigger) bool {
 
 fn isCaptureAborted(err: anyerror) bool {
     return std.mem.eql(u8, @errorName(err), "CaptureAborted");
+}
+
+fn isNetworkGatewayError(err: anyerror) bool {
+    return std.mem.eql(u8, @errorName(err), "NetdSpawnFailed") or
+        std.mem.eql(u8, @errorName(err), "NetdReadyTimedOut") or
+        std.mem.eql(u8, @errorName(err), "NetdReadyFailed") or
+        std.mem.eql(u8, @errorName(err), "NetdThreadFailed") or
+        std.mem.eql(u8, @errorName(err), "NetworkGatewayFailed");
+}
+
+fn printNetworkGatewayError(err: anyerror) void {
+    const message = if (std.mem.eql(u8, @errorName(err), "NetdSpawnFailed"))
+        "spore run: failed to start spore-netd"
+    else if (std.mem.eql(u8, @errorName(err), "NetdReadyTimedOut"))
+        "spore run: spore-netd did not become ready"
+    else if (std.mem.eql(u8, @errorName(err), "NetdReadyFailed"))
+        "spore run: spore-netd failed before ready"
+    else if (std.mem.eql(u8, @errorName(err), "NetdThreadFailed"))
+        "spore run: failed to monitor spore-netd"
+    else
+        "spore run: spore-netd exited during run";
+    std.debug.print("{s}\n", .{message});
 }
 
 fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) !T {
@@ -1580,6 +1699,77 @@ test "run cli parser accepts source spore" {
     try std.testing.expect(opts.image_ref == null);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
+}
+
+test "run cli parser accepts net flag" {
+    const opts = try parseCliArgs(&.{ "--net", "--", "/bin/true" });
+    try std.testing.expectEqual(NetworkMode.spore, opts.network);
+    try std.testing.expect(opts.network_requested);
+    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
+    try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
+}
+
+test "run cli parser accepts network allow rules" {
+    const opts = try parseCliArgs(&.{
+        "--net",
+        "--allow-cidr",
+        "93.184.216.34/32",
+        "--allow-host",
+        "example.com",
+        "--",
+        "/bin/true",
+    });
+    try std.testing.expectEqual(NetworkMode.spore, opts.network);
+    try std.testing.expect(opts.network_requested);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_cidr_count);
+    try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
+    try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
+    try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
+}
+
+test "run restores network options from manifest policy" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const manifest_network = spore.Network{
+        .allow_cidrs = &.{"93.184.216.34/32"},
+        .allow_hosts = &.{"example.com"},
+    };
+
+    const opts = try networkOptionsFromManifest(arena, manifest_network);
+    try std.testing.expectEqual(NetworkMode.spore, opts.network);
+    try std.testing.expectEqual(@as(usize, 1), opts.policy.allow_cidr_count);
+    try std.testing.expectEqualStrings("93.184.216.34/32", opts.policy.allow_cidrs[0]);
+    try std.testing.expectEqual(@as(usize, 1), opts.policy.allow_host_count);
+    try std.testing.expectEqualStrings("example.com", opts.policy.allow_hosts[0]);
+
+    const disabled = try networkOptionsFromManifest(arena, null);
+    try std.testing.expectEqual(NetworkMode.disabled, disabled.network);
+    try std.testing.expect(!disabled.policy.hasRules());
+}
+
+test "run builds manifest network from active policy" {
+    var policy = spore_net_policy.Config{};
+    try policy.addAllowCidr("93.184.216.34/32");
+    try policy.addAllowHost("example.com");
+
+    const network = manifestNetworkFromOptions(.spore, &policy) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(spore.network_kind_spore, network.kind);
+    try std.testing.expectEqualStrings("93.184.216.34/32", network.allow_cidrs[0]);
+    try std.testing.expectEqualStrings("example.com", network.allow_hosts[0]);
+
+    try std.testing.expect(manifestNetworkFromOptions(.disabled, &policy) == null);
+}
+
+test "run network gateway errors are reported clearly" {
+    try std.testing.expect(isNetworkGatewayError(error.NetdSpawnFailed));
+    try std.testing.expect(isNetworkGatewayError(error.NetdReadyTimedOut));
+    try std.testing.expect(isNetworkGatewayError(error.NetdReadyFailed));
+    try std.testing.expect(isNetworkGatewayError(error.NetdThreadFailed));
+    try std.testing.expect(isNetworkGatewayError(error.NetworkGatewayFailed));
+    try std.testing.expect(!isNetworkGatewayError(error.UnsupportedBackend));
 }
 
 test "run cli parser accepts capture flags" {
@@ -1925,13 +2115,23 @@ test "run image cache creates absolute cache directories" {
 }
 
 test "run cmdline marks rootfs mode" {
-    const without_rootfs = try cmdline(std.testing.allocator, 10700, false);
+    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, .disabled);
     defer std.testing.allocator.free(without_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs=1") == null);
 
-    const with_rootfs = try cmdline(std.testing.allocator, 10700, true);
+    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, .disabled);
     defer std.testing.allocator.free(with_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs=1") != null);
+}
+
+test "run cmdline marks network mode" {
+    const without_network = try cmdline(std.testing.allocator, 10700, false, .disabled);
+    defer std.testing.allocator.free(without_network);
+    try std.testing.expect(std.mem.indexOf(u8, without_network, "spore_net=1") == null);
+
+    const with_network = try cmdline(std.testing.allocator, 10700, false, .spore);
+    defer std.testing.allocator.free(with_network);
+    try std.testing.expect(std.mem.indexOf(u8, with_network, "spore_net=1") != null);
 }
 
 test "run default asset paths derive from install prefix" {

@@ -113,7 +113,7 @@ fn userfaultApi(uffd: std.c.fd_t) !void {
         .features = 0,
         .ioctls = 0,
     };
-    if (c.ioctl(uffd, c.UFFDIO_API, &api) < 0) return error.UserfaultfdIoctlFailed;
+    try userfaultIoctl(uffd, c.UFFDIO_API, @intFromPtr(&api));
 }
 
 fn registerMissing(uffd: std.c.fd_t, ram: []u8) !void {
@@ -125,7 +125,7 @@ fn registerMissing(uffd: std.c.fd_t, ram: []u8) !void {
         .mode = c.UFFDIO_REGISTER_MODE_MISSING,
         .ioctls = 0,
     };
-    if (c.ioctl(uffd, c.UFFDIO_REGISTER, &reg) < 0) return error.UserfaultfdIoctlFailed;
+    try userfaultIoctl(uffd, c.UFFDIO_REGISTER, @intFromPtr(&reg));
 }
 
 fn faultThread(context: *Context) void {
@@ -191,9 +191,16 @@ fn handleFault(context: *Context) !void {
         .mode = 0,
         .copy = 0,
     };
-    if (c.ioctl(context.uffd, c.UFFDIO_COPY, &copy) < 0) return error.UserfaultfdCopyFailed;
+    userfaultIoctl(context.uffd, c.UFFDIO_COPY, @intFromPtr(&copy)) catch return error.UserfaultfdCopyFailed;
     if (copy.copy < 0 or @as(usize, @intCast(copy.copy)) != len) return error.UserfaultfdCopyFailed;
     try writeTrace(context, index, range, len);
+}
+
+fn userfaultIoctl(fd: std.c.fd_t, request: u32, arg: usize) !void {
+    switch (linux.errno(linux.ioctl(fd, request, arg))) {
+        .SUCCESS => {},
+        else => return error.UserfaultfdIoctlFailed,
+    }
 }
 
 fn linuxCall(rc: usize) !void {

@@ -1,0 +1,413 @@
+//! Parent-side `spore-netd` process adapter.
+//!
+//! The VMM still owns virtio-net queues. This adapter translates the internal
+//! Ethernet frame backend into the helper's length-prefixed stdio frame stream.
+
+const std = @import("std");
+const Io = std.Io;
+
+const spore_net_policy = @import("spore_net_policy.zig");
+const spore_netd = @import("spore_netd.zig");
+const virtio_net = @import("virtio/net.zig");
+
+const ready_timeout_ms = 1_000;
+const max_rx_pending = 16;
+
+pub const StartError = error{
+    NetdSpawnFailed,
+    NetdReadyTimedOut,
+    NetdReadyFailed,
+    NetdThreadFailed,
+} || std.mem.Allocator.Error;
+
+pub const Process = struct {
+    child: std.process.Child = undefined,
+    to_child_fd: std.c.fd_t = -1,
+    from_child_fd: std.c.fd_t = -1,
+    stderr_fd: std.c.fd_t = -1,
+    stdout_thread: ?std.Thread = null,
+    stderr_thread: ?std.Thread = null,
+    wait_thread: ?std.Thread = null,
+    failed: std.atomic.Value(bool) = .init(false),
+    shutdown_requested: std.atomic.Value(bool) = .init(false),
+    wake_pending: std.atomic.Value(bool) = .init(false),
+    wake_lock: SpinLock = .{},
+    wake: virtio_net.Wake = .{},
+    rx_lock: SpinLock = .{},
+    link_closed: bool = false,
+    rx_head: usize = 0,
+    rx_count: usize = 0,
+    rx_lens: [max_rx_pending]usize = [_]usize{0} ** max_rx_pending,
+    rx_bufs: [max_rx_pending][virtio_net.max_frame_len]u8 = undefined,
+
+    pub fn start(self: *Process, init: std.process.Init, allocator: std.mem.Allocator, policy: spore_net_policy.Config) StartError!void {
+        self.* = .{};
+        ignoreSigpipe();
+        const args = init.minimal.args.toSlice(allocator) catch return error.NetdSpawnFailed;
+        var argv = std.array_list.Managed([]const u8).init(allocator);
+        argv.append(args[0]) catch return error.OutOfMemory;
+        if (parentDebugEnabled(args)) argv.append("--debug") catch return error.OutOfMemory;
+        argv.append("netd") catch return error.OutOfMemory;
+        argv.append("--stdio") catch return error.OutOfMemory;
+        for (policy.allowCidrSlice()) |cidr| {
+            argv.append("--allow-cidr") catch return error.OutOfMemory;
+            argv.append(cidr) catch return error.OutOfMemory;
+        }
+        for (policy.allowHostSlice()) |host| {
+            argv.append("--allow-host") catch return error.OutOfMemory;
+            argv.append(host) catch return error.OutOfMemory;
+        }
+        const child = std.process.spawn(init.io, .{
+            .argv = argv.items,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        }) catch return error.NetdSpawnFailed;
+
+        self.child = child;
+        self.to_child_fd = child.stdin.?.handle;
+        self.from_child_fd = child.stdout.?.handle;
+        self.stderr_fd = child.stderr.?.handle;
+        self.child.stdin = null;
+        self.child.stdout = null;
+        self.child.stderr = null;
+
+        waitReady(self.stderr_fd) catch |err| {
+            self.child.kill(init.io);
+            closeIfOpen(&self.to_child_fd);
+            closeIfOpen(&self.from_child_fd);
+            closeIfOpen(&self.stderr_fd);
+            return switch (err) {
+                error.NetdReadyTimedOut => error.NetdReadyTimedOut,
+                else => error.NetdReadyFailed,
+            };
+        };
+
+        self.stdout_thread = std.Thread.spawn(.{}, readStdout, .{self}) catch {
+            self.child.kill(init.io);
+            closeIfOpen(&self.to_child_fd);
+            closeIfOpen(&self.from_child_fd);
+            closeIfOpen(&self.stderr_fd);
+            return error.NetdThreadFailed;
+        };
+        self.stderr_thread = std.Thread.spawn(.{}, drainStderr, .{self}) catch {
+            self.child.kill(init.io);
+            if (self.stdout_thread) |thread| thread.join();
+            closeIfOpen(&self.to_child_fd);
+            closeIfOpen(&self.from_child_fd);
+            closeIfOpen(&self.stderr_fd);
+            return error.NetdThreadFailed;
+        };
+        self.wait_thread = std.Thread.spawn(.{}, waitChild, .{ self, init.io }) catch {
+            self.child.kill(init.io);
+            if (self.stdout_thread) |thread| thread.join();
+            if (self.stderr_thread) |thread| thread.join();
+            closeIfOpen(&self.to_child_fd);
+            closeIfOpen(&self.from_child_fd);
+            return error.NetdThreadFailed;
+        };
+    }
+
+    pub fn runtime(self: *Process) virtio_net.Runtime {
+        return .{
+            .backend = self.backend(),
+            .context = self,
+            .failedFn = failedRuntime,
+            .setWakeFn = setWake,
+            .clearWakeFn = clearWake,
+            .consumeWakeFn = consumeWake,
+        };
+    }
+
+    pub fn deinit(self: *Process) void {
+        self.shutdown();
+        if (self.stdout_thread) |thread| {
+            thread.join();
+            self.stdout_thread = null;
+        }
+        if (self.stderr_thread) |thread| {
+            thread.join();
+            self.stderr_thread = null;
+        }
+        if (self.wait_thread) |thread| {
+            thread.join();
+            self.wait_thread = null;
+        }
+    }
+
+    pub fn hasFailed(self: *const Process) bool {
+        return self.failed.load(.acquire);
+    }
+
+    fn backend(self: *Process) virtio_net.Backend {
+        return .{
+            .context = self,
+            .transmitFn = transmit,
+            .peekRxFn = peekRx,
+            .consumeRxFn = consumeRx,
+            .resetFn = reset,
+            .shutdownFn = shutdownBackend,
+        };
+    }
+
+    fn shutdown(self: *Process) void {
+        if (self.link_closed) return;
+        self.shutdown_requested.store(true, .release);
+        closeIfOpen(&self.to_child_fd);
+        self.link_closed = true;
+    }
+
+    fn markFailed(self: *Process) void {
+        self.failed.store(true, .release);
+        self.wakeGuest();
+    }
+
+    fn wakeGuest(self: *Process) void {
+        self.wake_lock.lock();
+        const wake = self.wake;
+        self.wake_lock.unlock();
+        wake.wake();
+    }
+
+    fn transmit(ctx: ?*anyopaque, frame: []const u8) void {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        if (self.hasFailed() or self.link_closed) return;
+        logTxFrame(frame);
+        spore_netd.writeFrameFd(self.to_child_fd, frame) catch {
+            self.markFailed();
+            return;
+        };
+    }
+
+    fn peekRx(ctx: ?*anyopaque) ?[]const u8 {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.rx_lock.lock();
+        defer self.rx_lock.unlock();
+        if (self.rx_count == 0) return null;
+        return self.rx_bufs[self.rx_head][0..self.rx_lens[self.rx_head]];
+    }
+
+    fn consumeRx(ctx: ?*anyopaque) void {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.rx_lock.lock();
+        defer self.rx_lock.unlock();
+        if (self.rx_count == 0) return;
+        self.rx_lens[self.rx_head] = 0;
+        self.rx_head = (self.rx_head + 1) % max_rx_pending;
+        self.rx_count -= 1;
+    }
+
+    fn reset(ctx: ?*anyopaque) void {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.rx_lock.lock();
+        defer self.rx_lock.unlock();
+        self.rx_head = 0;
+        self.rx_count = 0;
+        @memset(&self.rx_lens, 0);
+    }
+
+    fn shutdownBackend(ctx: ?*anyopaque) void {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.shutdown();
+    }
+
+    fn failedRuntime(ctx: ?*anyopaque) bool {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        return self.hasFailed();
+    }
+
+    fn consumeWake(ctx: ?*anyopaque) bool {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        return self.wake_pending.swap(false, .acq_rel);
+    }
+
+    fn setWake(ctx: ?*anyopaque, wake: virtio_net.Wake) void {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.wake_lock.lock();
+        defer self.wake_lock.unlock();
+        self.wake = wake;
+    }
+
+    fn clearWake(ctx: ?*anyopaque) void {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.wake_lock.lock();
+        defer self.wake_lock.unlock();
+        self.wake = .{};
+    }
+
+    fn enqueueRxFrame(self: *Process, frame: []const u8) bool {
+        self.rx_lock.lock();
+        defer self.rx_lock.unlock();
+        if (self.rx_count >= max_rx_pending) return false;
+        const tail = (self.rx_head + self.rx_count) % max_rx_pending;
+        @memcpy(self.rx_bufs[tail][0..frame.len], frame);
+        self.rx_lens[tail] = frame.len;
+        self.rx_count += 1;
+        self.wake_pending.store(true, .release);
+        return true;
+    }
+};
+
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(self: *SpinLock) void {
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.locked.store(false, .release);
+    }
+};
+
+fn waitReady(fd: std.c.fd_t) error{ NetdReadyTimedOut, NetdReadyFailed }!void {
+    var line: [64]u8 = undefined;
+    var len: usize = 0;
+    while (len < line.len) {
+        var fds = [_]std.posix.pollfd{.{
+            .fd = fd,
+            .events = std.c.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&fds, ready_timeout_ms) catch return error.NetdReadyFailed;
+        if (ready == 0) return error.NetdReadyTimedOut;
+        if ((fds[0].revents & (std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) return error.NetdReadyFailed;
+
+        var byte: [1]u8 = undefined;
+        const n = std.posix.read(fd, &byte) catch return error.NetdReadyFailed;
+        if (n == 0) return error.NetdReadyFailed;
+        if (byte[0] == '\n') {
+            if (std.mem.eql(u8, line[0..len], "ready")) return;
+            len = 0;
+            continue;
+        }
+        line[len] = byte[0];
+        len += 1;
+    }
+    return error.NetdReadyFailed;
+}
+
+fn logTxFrame(frame: []const u8) void {
+    if (frame.len < 14) {
+        std.log.debug("spore-net gateway tx frame len={d}", .{frame.len});
+        return;
+    }
+    const ether_type = std.mem.readInt(u16, frame[12..14], .big);
+    if (ether_type != 0x0806 or frame.len < 42) {
+        std.log.debug("spore-net gateway tx frame len={d} ether_type=0x{x}", .{ frame.len, ether_type });
+        return;
+    }
+    std.log.debug(
+        "spore-net gateway tx arp len={d} op={d} sender={d}.{d}.{d}.{d} target={d}.{d}.{d}.{d}",
+        .{
+            frame.len,
+            std.mem.readInt(u16, frame[20..22], .big),
+            frame[28],
+            frame[29],
+            frame[30],
+            frame[31],
+            frame[38],
+            frame[39],
+            frame[40],
+            frame[41],
+        },
+    );
+}
+
+fn readStdout(self: *Process) void {
+    var buf: [virtio_net.max_frame_len]u8 = undefined;
+    while (true) {
+        const frame = spore_netd.readFrameFd(self.from_child_fd, &buf) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => {
+                self.markFailed();
+                break;
+            },
+        };
+        std.log.debug("spore-net gateway rx frame len={d}", .{frame.len});
+        if (self.enqueueRxFrame(frame)) {
+            self.wakeGuest();
+        } else {
+            std.log.debug("spore-net gateway dropped rx frame len={d}: rx queue full", .{frame.len});
+        }
+    }
+    if (!self.shutdown_requested.load(.acquire)) self.markFailed();
+    closeIfOpen(&self.from_child_fd);
+}
+
+fn drainStderr(self: *Process) void {
+    var buf: [256]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(self.stderr_fd, &buf) catch break;
+        if (n == 0) break;
+        std.log.debug("spore-netd stderr: {s}", .{buf[0..n]});
+    }
+    closeIfOpen(&self.stderr_fd);
+}
+
+fn waitChild(self: *Process, io: Io) void {
+    const term = self.child.wait(io) catch {
+        self.markFailed();
+        return;
+    };
+    if (!self.shutdown_requested.load(.acquire)) {
+        std.log.err("spore-netd exited during run: {}", .{term});
+        self.markFailed();
+    }
+}
+
+fn closeIfOpen(fd: *std.c.fd_t) void {
+    if (fd.* >= 0) {
+        _ = std.c.close(fd.*);
+        fd.* = -1;
+    }
+}
+
+fn ignoreSigpipe() void {
+    const action = std.posix.Sigaction{
+        .handler = .{ .handler = std.c.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.PIPE, &action, null);
+}
+
+fn parentDebugEnabled(args: []const []const u8) bool {
+    if (args.len <= 1) return false;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--debug")) return true;
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (!std.mem.startsWith(u8, arg, "-")) return false;
+    }
+    return false;
+}
+
+test "spore-net gateway detects parent global debug flag" {
+    try std.testing.expect(parentDebugEnabled(&.{ "spore", "--debug", "run", "--net", "--", "/bin/true" }));
+    try std.testing.expect(!parentDebugEnabled(&.{ "spore", "run", "--net", "--", "/bin/true" }));
+}
+
+test "spore-net gateway buffers multiple rx frames" {
+    var process = Process{};
+    try std.testing.expect(process.enqueueRxFrame("arp-reply"));
+    try std.testing.expect(process.enqueueRxFrame("dns-reply"));
+    try std.testing.expect(process.runtime().consumeWake());
+
+    const backend = process.backend();
+    try std.testing.expectEqualStrings("arp-reply", backend.peekRx().?);
+    backend.consumeRx();
+    try std.testing.expectEqualStrings("dns-reply", backend.peekRx().?);
+    backend.consumeRx();
+    try std.testing.expect(backend.peekRx() == null);
+}
+
+test "spore-net gateway drops rx frames only after queue capacity" {
+    var process = Process{};
+    var i: usize = 0;
+    while (i < max_rx_pending) : (i += 1) {
+        try std.testing.expect(process.enqueueRxFrame("frame"));
+    }
+    try std.testing.expect(!process.enqueueRxFrame("overflow"));
+}

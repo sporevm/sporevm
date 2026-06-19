@@ -9,9 +9,11 @@ const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
 else
     struct {};
+const net_gateway = @import("net_gateway.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const virtio_blk = @import("virtio/blk.zig");
+const virtio_net = @import("virtio/net.zig");
 const vsock = @import("virtio/vsock.zig");
 
 pub const Backend = run_mod.Backend;
@@ -84,6 +86,18 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     const parsed = try spore.loadManifest(allocator, opts.spore_dir);
     defer parsed.deinit();
 
+    const network_options = run_mod.networkOptionsFromManifest(allocator, parsed.value.network) catch {
+        failResumeSetup("spore resume: invalid network policy in manifest", .{});
+    };
+    var gateway: net_gateway.Process = undefined;
+    var gateway_active = false;
+    if (network_options.network == .spore) {
+        try gateway.start(init, allocator, network_options.policy);
+        gateway_active = true;
+    }
+    defer if (gateway_active) gateway.deinit();
+    const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
+
     const rootfs_fd = try openResumeRootfs(init, allocator, parsed.value);
     defer {
         if (rootfs_fd) |fd| _ = std.c.close(fd);
@@ -112,6 +126,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
                 .resume_dir = opts.spore_dir,
+                .network = network,
                 .exec_probe = identity_probe,
                 .exec_probe_timeout_ms = generation_probe_timeout_ms,
                 .exec_probe_initial_rx_delay_ms = hvf_generation_probe_rx_delay_ms,
@@ -127,6 +142,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
                 .resume_dir = opts.spore_dir,
+                .network = network,
                 .exec_probe = identity_probe,
                 .exec_probe_timeout_ms = generation_probe_timeout_ms,
                 .exec_probe_completes_run = false,
@@ -135,10 +151,18 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         },
     };
 
-    switch (cause) {
-        .guest_off, .guest_reset => {},
-        else => return error.UnexpectedResumeExit,
+    if (comptime @hasField(@TypeOf(cause), "monitor_stopped")) {
+        switch (cause) {
+            .guest_off, .guest_reset => {},
+            .snapshotted, .probe_complete, .monitor_stopped => return error.UnexpectedResumeExit,
+        }
+    } else {
+        switch (cause) {
+            .guest_off, .guest_reset => {},
+            .snapshotted, .probe_complete => return error.UnexpectedResumeExit,
+        }
     }
+    if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
 }
 
 fn consoleSink(bytes: []const u8) void {

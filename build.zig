@@ -3,6 +3,11 @@ const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+    const target_os = target.result.os.tag;
+    const target_arch = target.result.cpu.arch;
+    const target_is_hvf = target_os == .macos and target_arch == .aarch64;
+    const target_is_kvm = target_os == .linux and target_arch == .aarch64;
+    const host_is_hvf = builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
     const optimize = b.standardOptimizeOption(.{
         // Shipping builds are ReleaseSafe only; see SECURITY.md.
         .preferred_optimize_mode = .ReleaseSafe,
@@ -13,7 +18,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .link_libc = true,
     });
-    if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) {
+    const zmoltcp_dep = b.dependency("zmoltcp", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
+    if (target_is_hvf) {
         mod.linkFramework("Hypervisor", .{});
     }
 
@@ -25,7 +35,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sporevm", .module = mod },
         },
     });
-    if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) {
+    if (target_is_hvf) {
         exe_mod.linkFramework("Hypervisor", .{});
     }
 
@@ -42,7 +52,7 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&minimal_exec_initrd.step);
 
-    if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) {
+    if (target_is_hvf and host_is_hvf) {
         const sign_spore = b.addSystemCommand(&.{
             "codesign",                      "--sign", "-", "--force", "--entitlements", "spore.entitlements",
             b.getInstallPath(.bin, "spore"),
@@ -70,7 +80,7 @@ pub fn build(b: *std.Build) void {
 
     // Hypervisor.framework smoke test: host-only, needs entitlement signing.
     // Run with `zig build hvf-smoke` on an Apple Silicon Mac.
-    if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) {
+    if (target_is_hvf and host_is_hvf) {
         const smoke_mod = b.createModule(.{
             .root_source_file = b.path("src/hvf_smoke.zig"),
             .target = target,
@@ -135,7 +145,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // Linux KVM boot harness: host-only, needs /dev/kvm on aarch64 Linux.
-    if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
+    if (target_is_kvm) {
         const kvm_boot_mod = b.createModule(.{
             .root_source_file = b.path("src/kvm_boot.zig"),
             .target = target,

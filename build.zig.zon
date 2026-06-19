@@ -3,7 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0x95e05adceafdec8a, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .zmoltcp = .{
+            .url = "git+https://github.com/lox/zmoltcp.git#v0.2.12",
+            .hash = "zmoltcp-0.2.12-AMqcQdNmEgBmqyDeqKFN_33x810C4rmJlmzFMDAzYvNk",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

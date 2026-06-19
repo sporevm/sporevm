@@ -25,6 +25,26 @@ description = "Smoke product spore run streaming and exit status"
 run = "mise run build && scripts/smoke-run-capture.sh"
 description = "Smoke product spore run signal capture and resume"
 
+[tasks."smoke:run-net-config"]
+run = "mise run build && scripts/smoke-run-net-config.sh"
+description = "Smoke product spore run static network configuration"
+
+[tasks."smoke:run-net-dns"]
+run = "mise run build && scripts/smoke-run-net-dns.sh"
+description = "Smoke product spore run DNS proxying"
+
+[tasks."smoke:run-net-http"]
+run = "mise run build && scripts/smoke-run-net-http.sh"
+description = "Smoke product spore run outbound HTTP proxying"
+
+[tasks."smoke:run-net-deny"]
+run = "mise run build && scripts/smoke-run-net-deny.sh"
+description = "Smoke product spore run hard-floor egress denial"
+
+[tasks."smoke:run-net-capture"]
+run = "mise run build && scripts/smoke-run-net-capture.sh"
+description = "Smoke network policy persistence across capture and run --from"
+
 [tasks."smoke:counter-fanout"]
 run = "mise run build && scripts/smoke-counter-fanout.sh"
 description = "Smoke capture, fork, and resume counter fan-out"

@@ -1,12 +1,17 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <net/route.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -29,6 +34,11 @@
 #define REPLAY_CAP 65536
 #define SESSION_ID "default"
 #define GEN_PARAMS_MAX 4096
+#define SPORE_NET_IFACE "eth0"
+#define SPORE_NET_GUEST_IP "100.96.0.2"
+#define SPORE_NET_GATEWAY_IP "100.96.0.1"
+#define SPORE_NET_NETMASK "255.255.255.252"
+#define SPORE_NET_RESOLV_CONF "nameserver 100.96.0.1\n"
 
 struct sockaddr_vm {
   sa_family_t svm_family;
@@ -139,6 +149,8 @@ static int path_is_dir(const char *path) {
   return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+static int write_file_atomic(const char *path, const char *data, size_t len);
+
 static int mount_if_dir(const char *source, const char *target, const char *fstype, unsigned long flags, const char *data, char *error, size_t cap) {
   if (!path_is_dir(target)) return 0;
   if (mount(source, target, fstype, flags, data) != 0 && errno != EBUSY) {
@@ -164,6 +176,167 @@ static int setup_rootfs(char *error, size_t cap) {
   if (mount_if_dir("sysfs", "/mnt/rootfs/sys", "sysfs", MS_RDONLY | MS_NOSUID | MS_NOEXEC | MS_NODEV, "", error, cap) != 0) return -1;
   if (mount_if_dir("tmpfs", "/mnt/rootfs/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755", error, cap) != 0) return -1;
   if (mount_if_dir("tmpfs", "/mnt/rootfs/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777", error, cap) != 0) return -1;
+  return 0;
+}
+
+static int sockaddr_in_addr(struct sockaddr *sa, const char *ip) {
+  struct sockaddr_in sin;
+  memset(&sin, 0, sizeof(sin));
+  sin.sin_family = AF_INET;
+  if (inet_pton(AF_INET, ip, &sin.sin_addr) != 1) return -1;
+  memcpy(sa, &sin, sizeof(sin));
+  return 0;
+}
+
+static int wait_for_iface(int fd, const char *name, int attempts, int sleep_us) {
+  for (int i = 0; i < attempts; i++) {
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", name);
+    if (ioctl(fd, SIOCGIFFLAGS, &ifr) == 0) return 0;
+    usleep((useconds_t)sleep_us);
+  }
+  return -1;
+}
+
+static int set_iface_sockaddr(int fd, const char *name, unsigned long request, const char *ip) {
+  struct ifreq ifr;
+  memset(&ifr, 0, sizeof(ifr));
+  snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", name);
+  if (sockaddr_in_addr(&ifr.ifr_addr, ip) != 0) return -1;
+  return ioctl(fd, request, &ifr);
+}
+
+static int bring_iface_up(int fd, const char *name) {
+  struct ifreq ifr;
+  memset(&ifr, 0, sizeof(ifr));
+  snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", name);
+  if (ioctl(fd, SIOCGIFFLAGS, &ifr) != 0) return -1;
+  ifr.ifr_flags |= IFF_UP;
+  return ioctl(fd, SIOCSIFFLAGS, &ifr);
+}
+
+static int add_default_route(int fd, const char *name, const char *gateway) {
+  struct rtentry route;
+  memset(&route, 0, sizeof(route));
+  if (sockaddr_in_addr(&route.rt_dst, "0.0.0.0") != 0) return -1;
+  if (sockaddr_in_addr(&route.rt_gateway, gateway) != 0) return -1;
+  if (sockaddr_in_addr(&route.rt_genmask, "0.0.0.0") != 0) return -1;
+  route.rt_flags = RTF_UP | RTF_GATEWAY;
+  route.rt_dev = (char *)name;
+  if (ioctl(fd, SIOCADDRT, &route) != 0 && errno != EEXIST) return -1;
+  return 0;
+}
+
+static int write_resolv_conf_path(const char *path) {
+  return write_file_atomic(path, SPORE_NET_RESOLV_CONF, strlen(SPORE_NET_RESOLV_CONF));
+}
+
+static int mkdir_p(const char *path, mode_t mode) {
+  char tmp[192];
+  size_t len = strlen(path);
+  if (len == 0 || len >= sizeof(tmp)) return -1;
+  memcpy(tmp, path, len + 1);
+  for (char *p = tmp + 1; *p != '\0'; p++) {
+    if (*p != '/') continue;
+    *p = '\0';
+    if (mkdir(tmp, mode) != 0 && errno != EEXIST) return -1;
+    *p = '/';
+  }
+  if (mkdir(tmp, mode) != 0 && errno != EEXIST) return -1;
+  return 0;
+}
+
+static int write_resolv_conf_with_parent(const char *path) {
+  char parent[192];
+  size_t len = strlen(path);
+  if (len == 0 || len >= sizeof(parent)) return -1;
+  memcpy(parent, path, len + 1);
+  char *slash = strrchr(parent, '/');
+  if (slash == NULL || slash == parent) return -1;
+  *slash = '\0';
+  if (mkdir_p(parent, 0755) != 0) return -1;
+  return write_resolv_conf_path(path);
+}
+
+static int prepare_rootfs_resolv_targets(void) {
+  if (write_resolv_conf_with_parent("/mnt/rootfs/run/sporevm/resolv.conf") != 0) return -1;
+  if (write_resolv_conf_with_parent("/mnt/rootfs/run/systemd/resolve/stub-resolv.conf") != 0) return -1;
+  if (write_resolv_conf_with_parent("/mnt/rootfs/run/systemd/resolve/resolv.conf") != 0) return -1;
+  if (write_resolv_conf_with_parent("/mnt/rootfs/run/resolvconf/resolv.conf") != 0) return -1;
+  return 0;
+}
+
+static int bind_rootfs_resolv(char *error, size_t cap) {
+  if (!path_is_dir("/mnt/rootfs/etc")) {
+    snprintf(error, cap, "network setup failed: rootfs /etc missing");
+    return -1;
+  }
+  if (prepare_rootfs_resolv_targets() != 0) {
+    snprintf(error, cap, "network setup failed: rootfs resolv target errno=%d", errno);
+    return -1;
+  }
+  struct stat st;
+  if (lstat("/mnt/rootfs/etc/resolv.conf", &st) != 0) {
+    snprintf(error, cap, "network setup failed: rootfs /etc/resolv.conf missing");
+    return -1;
+  }
+  if (S_ISLNK(st.st_mode)) return 0;
+  if (mount("/run/sporevm/resolv.conf", "/mnt/rootfs/etc/resolv.conf", NULL, MS_BIND, NULL) != 0 && errno != EBUSY) {
+    snprintf(error, cap, "network setup failed: rootfs resolv.conf bind errno=%d", errno);
+    return -1;
+  }
+  return 0;
+}
+
+static int setup_network(int use_rootfs, char *error, size_t cap) {
+  int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    snprintf(error, cap, "network setup failed: socket errno=%d", errno);
+    return -1;
+  }
+
+  if (wait_for_iface(fd, SPORE_NET_IFACE, 100, 50000) != 0) {
+    snprintf(error, cap, "network setup failed: %s not found", SPORE_NET_IFACE);
+    close(fd);
+    return -1;
+  }
+  if (set_iface_sockaddr(fd, SPORE_NET_IFACE, SIOCSIFADDR, SPORE_NET_GUEST_IP) != 0) {
+    snprintf(error, cap, "network setup failed: set address errno=%d", errno);
+    close(fd);
+    return -1;
+  }
+  if (set_iface_sockaddr(fd, SPORE_NET_IFACE, SIOCSIFNETMASK, SPORE_NET_NETMASK) != 0) {
+    snprintf(error, cap, "network setup failed: set netmask errno=%d", errno);
+    close(fd);
+    return -1;
+  }
+  if (bring_iface_up(fd, SPORE_NET_IFACE) != 0) {
+    snprintf(error, cap, "network setup failed: bring link up errno=%d", errno);
+    close(fd);
+    return -1;
+  }
+  if (add_default_route(fd, SPORE_NET_IFACE, SPORE_NET_GATEWAY_IP) != 0) {
+    snprintf(error, cap, "network setup failed: default route errno=%d", errno);
+    close(fd);
+    return -1;
+  }
+  close(fd);
+
+  mkdir("/etc", 0755);
+  if (write_resolv_conf_path("/etc/resolv.conf") != 0) {
+    snprintf(error, cap, "network setup failed: write /etc/resolv.conf errno=%d", errno);
+    return -1;
+  }
+
+  if (use_rootfs) {
+    mkdir("/run/sporevm", 0755);
+    if (write_resolv_conf_path("/run/sporevm/resolv.conf") != 0) {
+      snprintf(error, cap, "network setup failed: write rootfs resolv source errno=%d", errno);
+      return -1;
+    }
+    if (bind_rootfs_resolv(error, cap) != 0) return -1;
+  }
   return 0;
 }
 
@@ -752,7 +925,7 @@ static void maybe_send_session_exit(struct session *session, struct client *clie
   close_client(client);
 }
 
-static void accept_request(int listener, struct session *session, struct client *client, int use_rootfs, int rootfs_ready, const char *rootfs_error) {
+static void accept_request(int listener, struct session *session, struct client *client, int use_rootfs, int rootfs_ready, const char *rootfs_error, int network_requested, int network_ready, const char *network_error) {
   int conn = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
   if (conn < 0) {
     if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -814,6 +987,11 @@ static void accept_request(int listener, struct session *session, struct client 
       close_client(client);
       return;
     }
+    if (network_requested && !network_ready) {
+      (void)send_error_exit(client->fd, 126, network_error[0] != '\0' ? network_error : "spore run: network unavailable\n");
+      close_client(client);
+      return;
+    }
     int rc = start_session(session, request.session_id, request.argv, use_rootfs);
     if (rc != 0) {
       (void)send_error_exit(client->fd, rc, "spore run: exec setup failed\n");
@@ -839,6 +1017,7 @@ int main(void) {
   prepare_dev();
   mkdir("/run", 0755);
   int use_rootfs = cmdline_has_flag("spore_rootfs=1");
+  int use_network = cmdline_has_flag("spore_net=1");
   int rootfs_ready = 1;
   char rootfs_error[128];
   rootfs_error[0] = '\0';
@@ -849,6 +1028,18 @@ int main(void) {
     if (len + 1 < sizeof(rootfs_error)) {
       rootfs_error[len] = '\n';
       rootfs_error[len + 1] = '\0';
+    }
+  }
+  int network_ready = 1;
+  char network_error[160];
+  network_error[0] = '\0';
+  if (use_network && setup_network(use_rootfs, network_error, sizeof(network_error)) != 0) {
+    network_ready = 0;
+    dprintf(2, "%s\n", network_error);
+    size_t len = strlen(network_error);
+    if (len + 1 < sizeof(network_error)) {
+      network_error[len] = '\n';
+      network_error[len + 1] = '\0';
     }
   }
 
@@ -901,7 +1092,7 @@ int main(void) {
       for (nfds_t i = 0; i < nfds; i++) {
         if (fds[i].revents == 0) continue;
         if (roles[i] == 0 && (fds[i].revents & POLLIN)) {
-          accept_request(listener, &session, &client, use_rootfs, rootfs_ready, rootfs_error);
+          accept_request(listener, &session, &client, use_rootfs, rootfs_ready, rootfs_error, use_network, network_ready, network_error);
         } else if (roles[i] == 1 && (fds[i].revents & (POLLHUP | POLLERR))) {
           close_client(&client);
         } else if (roles[i] == 2) {

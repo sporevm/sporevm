@@ -37,6 +37,8 @@ pub const Config = struct {
     disk_fd: ?std.c.fd_t = null,
     /// Immutable rootfs artifact metadata for disk-backed snapshots.
     rootfs: ?spore.Rootfs = null,
+    /// Requested network capability and policy metadata for snapshots.
+    network_manifest: ?spore.Network = null,
     /// Poll fd 0 (set non-blocking by the caller) for console input on
     /// guest idle exits.
     poll_stdin: bool = false,
@@ -78,6 +80,8 @@ pub const Config = struct {
     exec_probe_initial_rx_delay_ms: u64 = 0,
     exec_probe_completes_run: bool = true,
     exec_probe_failure_fatal: bool = true,
+    /// Optional virtio-net frame backend. The default remains closed.
+    network: net.Runtime = .{},
     /// Optional monitor control hook for attaching host streams after boot.
     exec_control: ?vsock.Control = null,
 };
@@ -215,7 +219,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     // The generation device is a separate fixed MMIO window after the reserved virtio range.
     var con = console.Console{ .sink = config.console_sink };
     var blk_dev: blk.Blk = undefined;
-    var net_dev = net.Net.init(.{});
+    var net_dev = net.Net.init(.{ .backend = config.network.backend });
+    defer net_dev.shutdown();
     var rng_dev = rng.Rng{};
     var vsock_dev = vsock.Vsock.init(.{});
     var gen_dev = generation.Device{};
@@ -227,6 +232,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         transports_buf[1] = mmio.Transport.init(blk_dev.device());
         transport_count = 2;
     }
+    const net_transport_index = transport_count;
     transports_buf[transport_count] = mmio.Transport.init(net_dev.device());
     transport_count += 1;
     const vsock_transport_index = transport_count;
@@ -249,6 +255,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     if (config.exec_control) |control| {
         control.setWake(.{ .context = &vcpu, .wakeFn = wakeVcpu });
     }
+    config.network.setWake(.{ .context = &vcpu, .wakeFn = wakeNetworkVcpu });
+    defer config.network.clearWake();
     var exec_probe_wake_stop = std.atomic.Value(bool).init(false);
     var exec_probe_wake_thread: ?std.Thread = null;
     defer {
@@ -402,6 +410,12 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
             }
         }
+        if (config.network.failed()) return error.NetworkGatewayFailed;
+        if (config.network.consumeWake()) {
+            const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
+            try flushNetworkRxHvf(&net_dev, &transports_buf[net_transport_index], ram, pager, net_transport_index);
+            continue;
+        }
         if (config.exec_control) |control| {
             switch (try control.poll(&vsock_dev)) {
                 .keep_running => {},
@@ -411,7 +425,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
                         .ram_size = config.ram_size,
-                    }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                    }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                     return .snapshotted;
                 },
             }
@@ -425,7 +439,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
                 if (config.continue_after_capture) {
@@ -450,7 +464,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                                 .dist_base = dist_base,
                                 .redist_base = vcpu_redist_base,
                                 .ram_size = config.ram_size,
-                            }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                            }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                             return .snapshotted;
                         }
                         return .probe_complete;
@@ -473,7 +487,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                 return .snapshotted;
             }
         }
@@ -574,6 +588,12 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     if (request_capture.isRequested()) continue;
                 }
                 if (config.exec_probe != null and !exec_probe_done) continue;
+                if (config.network.failed()) continue;
+                if (config.network.consumeWake()) {
+                    const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
+                    try flushNetworkRxHvf(&net_dev, &transports_buf[net_transport_index], ram, pager, net_transport_index);
+                    continue;
+                }
                 if (config.exec_control != null) continue;
                 return error.VcpuCanceled;
             },
@@ -927,6 +947,7 @@ fn takeSnapshot(
     ram_bytes: []const u8,
     platform: SnapshotPlatform,
     rootfs: ?spore.Rootfs,
+    network_manifest: ?spore.Network,
     dirty_tracker: ?*DirtyTracker,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -970,6 +991,7 @@ fn takeSnapshot(
         .devices = devices,
         .generation = gen_state,
         .rootfs = rootfs,
+        .network = network_manifest,
         .memory = memory,
     });
     const manifest_ms = monotonicMs() - manifest_start;
@@ -1141,6 +1163,25 @@ fn flushVsockRx(vsock_dev: *vsock.Vsock, transport: *mmio.Transport, ram: guestm
     if (vsock_dev.flushPendingRx(&transport.queues, ram)) {
         transport.interrupt_status |= 1;
         try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(transport_index), true), "raise vsock spi");
+    }
+}
+
+fn wakeNetworkVcpu(context: ?*anyopaque) void {
+    const vcpu: *hvf.VcpuHandle = @ptrCast(@alignCast(context orelse return));
+    _ = hvf.hv_vcpus_exit(@ptrCast(vcpu), 1);
+}
+
+fn flushNetworkRxHvf(
+    net_dev: *net.Net,
+    transport: *mmio.Transport,
+    ram: guestmem.GuestRam,
+    lazy_pager: ?*lazy_ram.Pager,
+    transport_index: usize,
+) !void {
+    try maybeMaterializeTransportQueues(lazy_pager, transport);
+    if (net_dev.flushPendingRx(&transport.queues, ram)) {
+        transport.interrupt_status |= 1;
+        try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(@intCast(transport_index)), true), "raise net spi");
     }
 }
 

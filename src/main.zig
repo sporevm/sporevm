@@ -22,7 +22,7 @@ const usage =
     \\
     \\Commands:
     \\  rootfs              Build rootfs images from OCI images
-    \\  run [--kernel Image] [--initrd root.cpio] -- <argv...>
+    \\  run [--kernel Image] [--initrd root.cpio] [--net] [--allow-cidr CIDR] [--allow-host HOST] -- <argv...>
     \\                      Boot a throwaway VM and run one command
     \\  resume <spore-dir> [--name NAME]
     \\                      Resume one spore, or resume it as a named VM
@@ -94,6 +94,8 @@ pub fn main(init: std.process.Init) !void {
         try sporevm.lifecycle.lsCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "monitor")) {
         try sporevm.monitor.cli(init, command_args, stdout);
+    } else if (std.mem.eql(u8, command, "netd")) {
+        try sporevm.spore_netd.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "version")) {
         try stdout.print("spore {s}\n", .{sporevm.version});
     } else if (std.mem.eql(u8, command, "host-info")) {

@@ -161,6 +161,12 @@ sources, `peer_bytes_read` for HTTP(S) peer sources, `remote_bundle_cache_hit`,
   artifact to the rootfs virtio-mmio slot, `artifact` records a
   `blake3:<hex>` digest, size, and `ext4` format, and `source` records OCI
   provenance. The digest and size are restore authority; OCI metadata is not.
+- `network`: optional requested network capability and policy. `kind` is
+  `spore-net-v0`; `allow_cidrs` and `allow_hosts` record the user-selected
+  egress allow policy. The manifest does not carry live gateway state, TCP
+  flows, DNS response caches, host sockets, or helper process state. Resume and
+  `spore run --from` must attach a fresh gateway under this policy or fail
+  closed.
 
 ## Not yet captured in v0
 
@@ -180,6 +186,9 @@ sources, `peer_bytes_read` for HTTP(S) peer sources, `remote_bundle_cache_hit`,
 - Cross-frequency architected timer restore: v0 records and enforces the
   counter frequency, but cannot translate a running Linux guest between
   different `CNTFRQ_EL0` domains.
+- Live network flows: v0 persists requested network capability and policy only.
+  Active TCP flows and learned DNS answers are dropped across capture, resume,
+  and fork.
 
 ## Invariants that hold regardless of version
 

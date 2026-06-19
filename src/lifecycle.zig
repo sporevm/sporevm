@@ -355,6 +355,10 @@ pub fn resumeCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
         std.process.exit(2);
     };
     defer manifest.deinit();
+    if (manifest.value.network != null) {
+        std.debug.print("spore resume: named lifecycle networking is not supported yet; use spore run --from for one-shot network resumes\n", .{});
+        std.process.exit(2);
+    }
     if (manifest.value.devices.len != diskless_resume_device_count) {
         std.debug.print("spore resume: disk-backed resume is not supported yet\n", .{});
         std.process.exit(2);
