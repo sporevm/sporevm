@@ -1332,9 +1332,20 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
                 .exec_control = control,
             });
         },
-        .kvm => {
+        .kvm => blk: {
             if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            return error.UnsupportedMonitorBackend;
+            break :blk try kvm.vm.run(allocator, .{
+                .kernel = kernel,
+                .ram_size = opts.memory.bytes,
+                .cmdline = boot_args,
+                .initrd = initrd,
+                .console_sink = consoleSink,
+                .disk_fd = rootfs_fd,
+                .rootfs = opts.rootfs,
+                .resume_dir = opts.resume_dir,
+                .ram_restore_mode = .eager_chunks,
+                .exec_control = control,
+            });
         },
     };
     return switch (cause) {

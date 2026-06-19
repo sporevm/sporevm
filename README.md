@@ -66,12 +66,14 @@ Current `main` can:
 - run from an explicit read-only rootfs with `spore run --rootfs`;
 - build or reuse a cached rootfs directly from an OCI ref with
   `spore run --image`;
-- create, exec, list, and remove named VMs through one per-VM monitor process;
+- create, exec, list, and remove named VMs through one per-VM monitor process on
+  HVF and KVM;
 - suspend a diskless named VM and resume it under a new name on local HVF.
 
-Named lifecycle monitor mode is currently local-HVF only. KVM monitor wake
-support and disk-backed lifecycle suspend/resume remain follow-up work. The
-backend smoke harnesses still exercise lower-level capture paths directly.
+Named lifecycle monitor mode supports local HVF and Linux/aarch64 KVM for
+create, exec, list, and remove. Disk-backed lifecycle suspend/resume remains
+follow-up work. The backend smoke harnesses still exercise lower-level capture
+paths directly.
 
 Current active work is concentrated in three places: always-on dirty tracking and
 distribution scale in the foundation plan, remote preparation for immutable
@@ -93,6 +95,7 @@ Useful task split:
 mise run test
 mise run build
 mise run install
+mise run smoke:lifecycle
 mise run smoke:run
 mise run smoke:run-net-config
 mise run smoke:run-net-dns
@@ -105,11 +108,12 @@ mise run smoke:rootfs-fanout
 `mise run install` builds an optimized `spore` and installs it into `~/bin`,
 with runtime assets under `~/share/sporevm`.
 `mise run smoke` builds once, then runs product run, run-capture, and resume
-smokes. `smoke:run-net-config` checks the experimental `spore run --net` static
-guest link setup, and `smoke:run-net-dns` checks DNS proxying through the
-managed gateway. `smoke:counter-fanout` and `smoke:rootfs-fanout` are opt-in demo
-smokes; the rootfs fan-out smoke builds a published Ruby OCI image and resumes
-forked children in parallel.
+smokes. `smoke:lifecycle` checks named create, repeated exec, list, and remove
+on the selected backend. `smoke:run-net-config` checks the experimental
+`spore run --net` static guest link setup, and `smoke:run-net-dns` checks DNS
+proxying through the managed gateway. `smoke:counter-fanout` and
+`smoke:rootfs-fanout` are opt-in demo smokes; the rootfs fan-out smoke builds a
+published Ruby OCI image and resumes forked children in parallel.
 
 `zig build` installs the minimal exec initrd used by `spore run`, so `cpio`
 must be available in `PATH`.
