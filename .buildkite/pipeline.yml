@@ -38,7 +38,12 @@ steps:
     if: build.branch == "main" || build.env("SPOREVM_RUN_BENCHMARKS") == "1"
     command: |
       upload_benchmark_artifacts() {
-        buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/**/*" || true
+        buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/latest-summary.json" || true
+        buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/config.json" || true
+        buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/results.jsonl" || true
+        buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/summary.json" || true
+        buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/logs/*" || true
+        buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/rootfs-cache/*.json" || true
       }
       trap upload_benchmark_artifacts EXIT
 
@@ -59,7 +64,7 @@ steps:
       size: "20g"
       name: "mise-cache"
     agents:
-      queue: cleanroom
+      queue: cleanroom-mac
 
   - wait
 
