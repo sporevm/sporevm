@@ -39,6 +39,8 @@ const host_stream_credit = 64 * 1024;
 const max_frame_header = 128;
 const max_frame_payload = 64 * 1024;
 const default_host_port: u32 = 49152;
+const dynamic_host_port_first: u32 = 49154;
+const dynamic_host_port_count: u32 = 65535 - dynamic_host_port_first + 1;
 
 pub const Header = struct {
     src_cid: u64,
@@ -86,8 +88,13 @@ pub const HostStream = struct {
     state: HostStreamState = .idle,
     started_at_ms: u64 = 0,
     start_ms: ?u64 = null,
+    attach_ms: ?u64 = null,
+    connect_request_delivered_ms: ?u64 = null,
     connect_ms: ?u64 = null,
+    request_delivered_ms: ?u64 = null,
+    first_output_ms: ?u64 = null,
     response_ms: ?u64 = null,
+    guest_timing_ms: ?u64 = null,
     received_bytes: u32 = 0,
     sent_bytes: u32 = 0,
     exit_code: ?i32 = null,
@@ -110,9 +117,25 @@ pub const HostStream = struct {
         return stream;
     }
 
+    pub fn deriveHostPort(request: []const u8) u32 {
+        return dynamic_host_port_first + @as(u32, @intCast(std.hash.Wyhash.hash(0, request) % dynamic_host_port_count));
+    }
+
     pub fn markStarted(self: *HostStream) void {
         self.started_at_ms = monotonicMs();
         self.start_ms = self.elapsedMs();
+    }
+
+    fn markAttached(self: *HostStream) void {
+        if (self.attach_ms == null) self.attach_ms = self.elapsedMs();
+    }
+
+    fn markConnectRequestDelivered(self: *HostStream) void {
+        if (self.connect_request_delivered_ms == null) self.connect_request_delivered_ms = self.elapsedMs();
+    }
+
+    fn markRequestDelivered(self: *HostStream) void {
+        if (self.request_delivered_ms == null) self.request_delivered_ms = self.elapsedMs();
     }
 
     pub fn setOutputSink(self: *HostStream, context: ?*anyopaque, sink: HostStreamOutputSink) void {
@@ -236,11 +259,17 @@ pub const HostStream = struct {
             self.state = .complete;
             return;
         }
+        if (std.mem.eql(u8, kind, "timing")) {
+            if (self.guest_timing_ms == null) self.guest_timing_ms = self.elapsedMs();
+            std.log.debug("vsock host stream guest timing: {s}", .{line});
+            return;
+        }
         self.fail();
     }
 
     fn emitOutput(self: *HostStream, output: HostStreamOutput, data: []const u8) void {
         if (data.len == 0) return;
+        if (self.first_output_ms == null) self.first_output_ms = self.elapsedMs();
         if (self.output_sink) |sink| sink(self.output_sink_context, output, data);
         const len: u64 = @intCast(data.len);
         switch (output) {
@@ -302,6 +331,7 @@ pub const Vsock = struct {
 
     pub fn attachHostStream(self: *Vsock, stream: *HostStream) !void {
         self.host_stream = stream;
+        stream.markAttached();
         try self.enqueueHostConnectRequest(stream);
     }
 
@@ -458,10 +488,22 @@ pub const Vsock = struct {
             const written = writePacketToChain(&chain, packet.header, packet.data[0..packet.data_len]) orelse 0;
             chain.markWritableDirty(ram);
             rx.pushUsed(ram, chain.head, written) catch return did_work;
+            self.recordHostDelivery(packet.header);
             self.dropFirstPending();
             did_work = true;
         }
         return did_work;
+    }
+
+    fn recordHostDelivery(self: *Vsock, h: Header) void {
+        const stream = self.host_stream orelse return;
+        if (h.src_cid != host_cid or h.dst_cid != self.guest_cid) return;
+        if (h.src_port != stream.host_port or h.dst_port != stream.guest_port) return;
+        switch (h.op) {
+            op_request => stream.markConnectRequestDelivered(),
+            op_rw => stream.markRequestDelivered(),
+            else => {},
+        }
     }
 
     fn dropFirstPending(self: *Vsock) void {
@@ -823,6 +865,17 @@ test "host stream connects, sends request, and parses streamed frames" {
     try std.testing.expectEqual(@as(i32, 7), stream.exit_code.?);
     try std.testing.expectEqualStrings("hello\n", capture.stdout[0..capture.stdout_len]);
     try std.testing.expectEqualStrings("err\n", capture.stderr[0..capture.stderr_len]);
+}
+
+test "request-derived host ports are stable dynamic ports" {
+    const first = HostStream.deriveHostPort("{\"session_id\":\"run-a\"}\n");
+    const again = HostStream.deriveHostPort("{\"session_id\":\"run-a\"}\n");
+    const second = HostStream.deriveHostPort("{\"session_id\":\"run-b\"}\n");
+
+    try std.testing.expect(first >= dynamic_host_port_first);
+    try std.testing.expect(first < dynamic_host_port_first + dynamic_host_port_count);
+    try std.testing.expectEqual(first, again);
+    try std.testing.expect(first != second);
 }
 
 test "host stream frame parser handles split frames" {

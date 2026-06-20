@@ -413,6 +413,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         }
     }
     var exec_probe_done = false;
+    var logged_first_vcpu_entry = false;
+    var logged_first_guest_exit = false;
 
     // Run loop.
     var did_capture_request = false;
@@ -506,9 +508,20 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 return .snapshotted;
             }
         }
+        if (config.resume_dir != null and config.exec_probe != null and !logged_first_vcpu_entry) {
+            logged_first_vcpu_entry = true;
+            std.log.debug("hvf exec probe timing: first_vcpu_entry_ms={d}", .{monotonicMs() -| start_ms});
+        }
         try hvf.check(hvf.hv_vcpu_run(vcpu), "hv_vcpu_run");
         if (config.exec_probe != null and !exec_probe_done and exit.reason != .canceled) {
             exec_probe_guest_exited = true;
+            if (config.resume_dir != null and !logged_first_guest_exit) {
+                logged_first_guest_exit = true;
+                std.log.debug(
+                    "hvf exec probe timing: first_guest_exit_ms={d} reason={}",
+                    .{ monotonicMs() -| start_ms, exit.reason },
+                );
+            }
         }
         switch (exit.reason) {
             .exception => {

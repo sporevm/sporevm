@@ -52,6 +52,8 @@ static int64_t t_init_start = 0;
 static int64_t t_listen_ready = 0;
 static int64_t t_first_accept = 0;
 static int64_t t_first_request_decode = 0;
+static int64_t t_request_accept = 0;
+static int64_t t_request_decode = 0;
 static int64_t t_command_start = 0;
 static int64_t t_command_exit = 0;
 
@@ -533,10 +535,26 @@ static int send_stream_data(int fd, const char *name, uint64_t offset, const uns
   return 0;
 }
 
+static int send_timing_frame(int fd) {
+  int64_t now = now_ms();
+  char frame[128];
+  int n = snprintf(frame, sizeof(frame),
+                   "timing listen=%lld accept=%lld decode=%lld spawn=%lld exit=%lld now=%lld\n",
+                   (long long)(t_listen_ready ? t_listen_ready - t_init_start : -1),
+                   (long long)(t_request_accept ? t_request_accept - t_init_start : -1),
+                   (long long)(t_request_decode ? t_request_decode - t_init_start : -1),
+                   (long long)(t_command_start ? t_command_start - t_init_start : -1),
+                   (long long)(t_command_exit ? t_command_exit - t_init_start : -1),
+                   (long long)(now ? now - t_init_start : -1));
+  if (n <= 0 || (size_t)n >= sizeof(frame)) return -1;
+  return write_all(fd, frame, (size_t)n);
+}
+
 static int send_exit_frame(int fd, int exit_code) {
   char frame[32];
   int n = snprintf(frame, sizeof(frame), "exit %d\n", exit_code);
   if (n <= 0 || (size_t)n >= sizeof(frame)) return -1;
+  (void)send_timing_frame(fd);
   return write_all(fd, frame, (size_t)n);
 }
 
@@ -936,6 +954,7 @@ static void accept_request(int listener, struct session *session, struct client 
     return;
   }
   if (t_first_accept == 0) t_first_accept = now_ms();
+  t_request_accept = now_ms();
 
   char req[MAX_REQUEST];
   if (read_line(conn, req, sizeof(req)) <= 0) {
@@ -943,6 +962,7 @@ static void accept_request(int listener, struct session *session, struct client 
     return;
   }
   if (t_first_request_decode == 0) t_first_request_decode = now_ms();
+  t_request_decode = now_ms();
 
   struct run_request request;
   if (parse_request(req, &request) != 0) {
