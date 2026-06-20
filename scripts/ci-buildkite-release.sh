@@ -11,6 +11,28 @@ require_command() {
   command -v "$name" >/dev/null 2>&1 || die "missing required command: ${name}"
 }
 
+hash_files() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$@"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$@"
+  else
+    die "missing required command: shasum or sha256sum"
+  fi
+}
+
+verify_checksum_file() {
+  local checksum_file="$1"
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -c "${checksum_file}"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "${checksum_file}"
+  else
+    die "missing required command: shasum or sha256sum"
+  fi
+}
+
 fetch_optional_secret() {
   local key="$1"
   buildkite-agent secret get "${key}" 2>/dev/null || true
@@ -23,55 +45,111 @@ normalize_secret_value() {
 load_github_token() {
   local github_token
 
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+    github_token="$(normalize_secret_value "$(fetch_optional_secret SPOREVM_GITHUB_RELEASE_TOKEN)")"
+    [[ -n "${github_token}" ]] || die "GITHUB_TOKEN or Buildkite secret SPOREVM_GITHUB_RELEASE_TOKEN is required"
+    export GITHUB_TOKEN="${github_token}"
+  fi
+
+  export GH_TOKEN="${GITHUB_TOKEN}"
+  export GH_PROMPT_DISABLED=1
+}
+
+download_release_archives() {
+  rm -rf "${ASSET_DIR}"
+  mkdir -p "${ASSET_DIR}"
+
+  buildkite-agent artifact download "dist/spore_*.tar.gz" "${REPO_ROOT}"
+
+  for asset_name in "${EXPECTED_ASSETS[@]}"; do
+    local asset_path="${ASSET_DIR}/${asset_name}"
+
+    [[ -f "${asset_path}" ]] || die "missing downloaded release asset: ${asset_path}"
+    tar -tzf "${asset_path}" >/dev/null
+  done
+}
+
+write_checksums() {
+  (
+    cd "${ASSET_DIR}"
+    hash_files "${EXPECTED_ASSETS[@]}" >checksums.txt
+    verify_checksum_file checksums.txt
+  )
+}
+
+create_or_update_release() {
+  local notes_path="docs/releases/${BUILDKITE_TAG}.md"
+
+  if gh release view "${BUILDKITE_TAG}" --repo "${GITHUB_REPOSITORY_NAME}" >/dev/null 2>&1; then
+    if [[ -f "${notes_path}" ]]; then
+      gh release edit "${BUILDKITE_TAG}" \
+        --repo "${GITHUB_REPOSITORY_NAME}" \
+        --title "SporeVM ${BUILDKITE_TAG}" \
+        --notes-file "${notes_path}" \
+        --prerelease
+    else
+      gh release edit "${BUILDKITE_TAG}" \
+        --repo "${GITHUB_REPOSITORY_NAME}" \
+        --title "SporeVM ${BUILDKITE_TAG}" \
+        --prerelease
+    fi
     return
   fi
 
-  github_token="$(normalize_secret_value "$(fetch_optional_secret SPOREVM_GITHUB_RELEASE_TOKEN)")"
-  [[ -n "${github_token}" ]] || die "GITHUB_TOKEN or Buildkite secret SPOREVM_GITHUB_RELEASE_TOKEN is required"
-  export GITHUB_TOKEN="${github_token}"
-}
-
-require_macos_arm64() {
-  [[ "$(uname -s)" == "Darwin" ]] || die "release publishing must run on macOS so the HVF binary is signed"
-  [[ "$(uname -m)" == "arm64" ]] || die "release publishing must run on Apple Silicon so zig build applies HVF signing"
-}
-
-resolve_macos_sdkroot() {
-  if [[ -n "${SDKROOT:-}" ]]; then
-    return
+  if [[ -f "${notes_path}" ]]; then
+    gh release create "${BUILDKITE_TAG}" \
+      --repo "${GITHUB_REPOSITORY_NAME}" \
+      --verify-tag \
+      --title "SporeVM ${BUILDKITE_TAG}" \
+      --notes-file "${notes_path}" \
+      --prerelease \
+      --latest=false
+  else
+    gh release create "${BUILDKITE_TAG}" \
+      --repo "${GITHUB_REPOSITORY_NAME}" \
+      --verify-tag \
+      --title "SporeVM ${BUILDKITE_TAG}" \
+      --generate-notes \
+      --prerelease \
+      --latest=false
   fi
+}
 
-  require_command xcrun
-  SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
-  [[ -d "${SDKROOT}/System/Library/Frameworks" ]] || die "macOS SDK framework path is missing under SDKROOT=${SDKROOT}"
-  export SDKROOT
+upload_release_assets() {
+  gh release upload "${BUILDKITE_TAG}" \
+    "${ASSET_DIR}/spore_Darwin_arm64.tar.gz" \
+    "${ASSET_DIR}/spore_Linux_arm64.tar.gz" \
+    "${ASSET_DIR}/checksums.txt" \
+    --repo "${GITHUB_REPOSITORY_NAME}" \
+    --clobber
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ASSET_DIR="${REPO_ROOT}/dist"
+GITHUB_REPOSITORY_NAME="${SPOREVM_GITHUB_REPOSITORY:-buildkite/sporevm}"
+EXPECTED_ASSETS=(
+  spore_Darwin_arm64.tar.gz
+  spore_Linux_arm64.tar.gz
+)
 
 require_command buildkite-agent
+require_command gh
 require_command git
-require_command goreleaser
-require_command uname
+require_command tar
 
 [[ -n "${BUILDKITE_TAG:-}" ]] || die "BUILDKITE_TAG is required for release publishing"
-require_macos_arm64
-resolve_macos_sdkroot
 load_github_token
 
 cd "${REPO_ROOT}"
 git fetch --tags origin
 
-echo "--- :package: Prepare release archive extras"
-scripts/prepare-release-extra.sh
+echo "--- :package: Download release archives"
+download_release_archives
 
-release_notes="docs/releases/${BUILDKITE_TAG}.md"
-release_args=(release --clean)
-if [[ -f "${release_notes}" ]]; then
-  release_args+=(--release-notes "${release_notes}")
-fi
+echo "--- :fingerprint: Write checksums"
+write_checksums
 
 echo "--- :rocket: Publish GitHub release"
-goreleaser "${release_args[@]}"
+create_or_update_release
+upload_release_assets
