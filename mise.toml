@@ -69,6 +69,10 @@ description = "Benchmark writable rootfs COW, sealed append, and replay paths"
 run = "mise run build && scripts/smoke-local-pull.sh"
 description = "Smoke local file:// pull materialization and resumed rootfs fan-out"
 
+[tasks."validate:release-a1-kvm"]
+run = "bash scripts/validate-release-a1-kvm.sh"
+description = "Run repeatable A1/KVM release validation over SSM remote hosts"
+
 [tasks.smoke]
 run = "mise run build && scripts/smoke-run.sh && scripts/smoke-run-capture.sh"
 description = "Run product smoke tests"

@@ -170,15 +170,21 @@ implementation and evidence include:
 - remote smoke harness support for source-peer HTTP pulls that keep destination
   S3-origin bytes at zero while preserving digest-pinned product materialization;
 - corrupt-bundle rejection on destinations;
+- rootfs-backed remote bundle smokes that build exact OCI rootfs bytes, pack
+  them into indexed bundles, prove destination rootfs fetch/cache reuse across
+  A1 hosts, reject corrupt rootfs artifacts, and verify materialization into the
+  destination rootfs digest cache;
+- a repo-local `mise run validate:release-a1-kvm -- ...` gate that composes the
+  direct-S3, HTTP-peer, destination cache reuse, corrupt rejection, rootfs, and
+  KVM networking release checks;
 - ten-instance star and source-to-relay-to-leaf smoke runs.
 
 What remains:
 
 1. Measure origin egress as a small multiple of unique chunk bytes across larger
    identical-host fleets.
-2. Keep corrupt peer/origin data rejected by chunk and rootfs verification.
-3. Preserve default immutable rootfs artifact inclusion through remote
-   distribution without blurring memory chunks and rootfs bytes.
+2. Keep corrupt peer/origin data rejected by chunk and rootfs verification as a
+   release regression.
 
 Done when a multi-host fan-out demo restores one spore on every host in a test
 fleet, measures origin egress at a small multiple of unique chunk bytes, and
