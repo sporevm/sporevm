@@ -150,7 +150,8 @@ restore authority.
 - Automatic OCI rebuild during `spore resume`, if product UX later justifies
   network and toolchain dependency in the resume path.
 - Serialization of pending read-only virtio-blk requests at capture time.
-- Rootfs cache garbage collection.
+- Automatic background rootfs cache garbage collection. Manual inspection and
+  pruning now live under `spore system df` and `spore system prune --rootfs`.
 - OCI runtime defaults and image policy.
 - Writable disks, writable overlays, or persisted guest disk mutations.
 - Cross-backend HVF-to-KVM rootfs-backed resume.

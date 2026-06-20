@@ -81,6 +81,36 @@ uses the platform cache directory. Cache setup messages are shown only with
 `spore --debug ...`, so command stdout and stderr stay workload-focused by
 default.
 
+Inspect local rootfs cache usage with:
+
+```bash
+spore system df --rootfs
+spore system df --rootfs --json
+```
+
+Prune rebuildable or reimportable image-rootfs cache entries with a dry run
+first:
+
+```bash
+spore system prune --dry-run
+spore system prune --force
+spore system prune --rootfs --dry-run --max-bytes 20gb
+spore system prune --rootfs --force --max-bytes 20gb
+spore system prune --dry-run --json
+```
+
+These commands render human summaries by default. Add `--json` when scripts need
+stable field names and exact byte counts. Without `--older-than` or
+`--max-bytes`, prune selects all default-prunable rootfs entries: rebuildable or
+reimportable image-rootfs files that are not hardlinked to digest-addressed
+artifacts.
+
+`spore system prune --rootfs` does not delete digest-addressed rootfs artifacts
+by default because those bytes can be required by existing captured spores and
+metadata-only bundles. Add `--include-digest-artifacts` only when you are
+comfortable making affected spores fail closed until their exact rootfs bytes
+are restored.
+
 When `spore run --image ... --capture SPORE` captures a VM, the spore manifest
 records an immutable rootfs artifact: the ext4 content BLAKE3 digest, size,
 virtio-blk binding, resolved OCI image identity, platform, and builder version.

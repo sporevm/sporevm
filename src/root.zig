@@ -41,6 +41,7 @@ pub const spore_net_policy = @import("spore_net_policy.zig");
 pub const spore_netd = @import("spore_netd.zig");
 pub const spore_netd_tcp = @import("spore_netd_tcp.zig");
 pub const spore = @import("spore.zig");
+pub const system = @import("system.zig");
 pub const zmoltcp_gateway = @import("zmoltcp_gateway.zig");
 pub const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
@@ -85,6 +86,7 @@ test {
     testing.refAllDecls(spore_net_policy);
     testing.refAllDecls(spore_netd);
     testing.refAllDecls(spore_netd_tcp);
+    testing.refAllDecls(system);
     testing.refAllDecls(zmoltcp_gateway);
     testing.refAllDecls(virtio.queue);
     testing.refAllDecls(virtio.mmio);

@@ -150,6 +150,9 @@ materialization carries those rootfs-bound disk layers by content digest.
   per-chunk/per-artifact verification for trust.
 - `spore run`, product `spore resume`, and `spore fanout` provide the first
   user-facing run/capture/fork/resume/fan-out path.
+- `spore system df` and `spore system prune` provide local rootfs cache
+  inspection and explicit cleanup, with human output by default and `--json`
+  for automation.
 
 Historical benchmark numbers are intentionally kept out of this plan now that
 the mechanisms have landed. Regenerate current evidence with the scripts in

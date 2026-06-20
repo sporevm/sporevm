@@ -21,6 +21,7 @@ const usage =
     \\  --debug             Show verbose VMM and restore logs
     \\
     \\Commands:
+    \\  system             Inspect and prune local SporeVM system state
     \\  rootfs              Build rootfs images from OCI images
     \\  run [--kernel Image] [--initrd root.cpio] [--net] [--allow-cidr CIDR] [--allow-host HOST] -- <argv...>
     \\                      Boot a throwaway VM and run one command
@@ -72,7 +73,9 @@ pub fn main(init: std.process.Init) !void {
 
     const command = parsed.command.?;
     const command_args = parsed.command_args;
-    if (std.mem.eql(u8, command, "rootfs")) {
+    if (std.mem.eql(u8, command, "system")) {
+        try sporevm.system.run(init, command_args, stdout);
+    } else if (std.mem.eql(u8, command, "rootfs")) {
         try sporevm.rootfs.run(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "run")) {
         try sporevm.run.cli(init, command_args, stdout);

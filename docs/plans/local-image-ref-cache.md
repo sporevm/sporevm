@@ -63,7 +63,8 @@ cold when addressed through its original tag.
 - No tag-based rootfs cache keys.
 - No OCI Entrypoint, Cmd, User, Env, or Workdir semantics in this slice.
 - No registry auth redesign.
-- No garbage collection policy in the first slice.
+- No garbage collection policy in the first slice. A later slice added explicit
+  `spore system df` and `spore system prune --rootfs` commands.
 
 ## Target Model
 
@@ -241,7 +242,7 @@ refresh, and rootfs cache hit.
 
 ## Deferred Work
 
-- Cache garbage collection.
+- Automatic background cache garbage collection.
 - TTL or staleness warnings for mutable tag records.
 - Importing images from a local daemon or OCI layout.
 - Registry credential policy beyond the current direct-registry behavior.
