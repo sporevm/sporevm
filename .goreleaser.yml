@@ -1,0 +1,66 @@
+version: 2
+
+project_name: spore
+
+builds:
+  - id: spore-linux-arm64
+    builder: zig
+    binary: spore
+    targets:
+      - aarch64-linux-musl
+    flags:
+      - --release=safe
+
+  - id: spore-darwin-arm64
+    builder: zig
+    binary: spore
+    targets:
+      - aarch64-macos
+    flags:
+      - --release=safe
+
+archives:
+  - id: spore-linux-arm64
+    ids: [spore-linux-arm64]
+    formats: [tar.gz]
+    wrap_in_directory: true
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- .Arch }}
+    files:
+      - LICENSE
+      - README.md
+      - src: release-extra/share/sporevm/minimal-exec-initrd.cpio
+        dst: share/sporevm
+        strip_parent: true
+
+  - id: spore-darwin-arm64
+    ids: [spore-darwin-arm64]
+    formats: [tar.gz]
+    wrap_in_directory: true
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- .Arch }}
+    files:
+      - LICENSE
+      - README.md
+      - src: release-extra/share/sporevm/minimal-exec-initrd.cpio
+        dst: share/sporevm
+        strip_parent: true
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  prerelease: auto
+  replace_existing_artifacts: true
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

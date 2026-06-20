@@ -12,6 +12,7 @@ pub fn build(b: *std.Build) void {
         // Shipping builds are ReleaseSafe only; see SECURITY.md.
         .preferred_optimize_mode = .ReleaseSafe,
     });
+    const macos_framework_path = macosFrameworkPath(b);
 
     const mod = b.addModule("sporevm", .{
         .root_source_file = b.path("src/root.zig"),
@@ -24,7 +25,7 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
     if (target_is_hvf) {
-        mod.linkFramework("Hypervisor", .{});
+        linkHypervisor(mod, macos_framework_path);
     }
 
     const exe_mod = b.createModule(.{
@@ -36,7 +37,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     if (target_is_hvf) {
-        exe_mod.linkFramework("Hypervisor", .{});
+        linkHypervisor(exe_mod, macos_framework_path);
     }
 
     const exe = b.addExecutable(.{
@@ -90,7 +91,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "sporevm", .module = mod },
             },
         });
-        smoke_mod.linkFramework("Hypervisor", .{});
+        linkHypervisor(smoke_mod, macos_framework_path);
 
         const smoke = b.addExecutable(.{
             .name = "hvf-smoke",
@@ -126,7 +127,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "sporevm", .module = mod },
             },
         });
-        boot_mod.linkFramework("Hypervisor", .{});
+        linkHypervisor(boot_mod, macos_framework_path);
 
         const boot_exe = b.addExecutable(.{
             .name = "hvf-boot",
@@ -165,4 +166,19 @@ pub fn build(b: *std.Build) void {
         const kvm_boot_step = b.step("kvm-boot", "Build the Linux KVM kernel boot harness");
         kvm_boot_step.dependOn(&install_kvm_boot.step);
     }
+}
+
+fn macosFrameworkPath(b: *std.Build) ?std.Build.LazyPath {
+    const sdkroot = b.graph.environ_map.get("SDKROOT") orelse return null;
+    if (sdkroot.len == 0) {
+        return null;
+    }
+    return .{ .cwd_relative = b.pathJoin(&.{ sdkroot, "System/Library/Frameworks" }) };
+}
+
+fn linkHypervisor(mod: *std.Build.Module, framework_path: ?std.Build.LazyPath) void {
+    if (framework_path) |path| {
+        mod.addSystemFrameworkPath(path);
+    }
+    mod.linkFramework("Hypervisor", .{});
 }

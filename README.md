@@ -127,6 +127,14 @@ capture, fork divergence, bundle pack/unpack, and `run --from`.
 `zig build` installs the minimal exec initrd used by `spore run`, so `cpio`
 must be available in `PATH`.
 
+Releases are tag driven. `mise run release` runs the local checks, computes the
+next semantic version from conventional commits with `svu`, verifies
+`src/root.zig` matches that version, and pushes the tag. The Buildkite tag build
+publishes GoReleaser archives for Linux ARM64 and macOS ARM64. The pipeline
+must build tags and provide `SPOREVM_GITHUB_RELEASE_TOKEN` to the release job.
+Use `mise run release:snapshot` to build the release archives locally without
+publishing.
+
 KVM work needs an aarch64 Linux host with KVM. Hypervisor.framework work needs
 an Apple Silicon Mac on macOS 15 or newer.
 

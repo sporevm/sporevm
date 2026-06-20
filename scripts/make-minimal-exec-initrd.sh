@@ -27,6 +27,9 @@ if ! command -v cpio >/dev/null 2>&1; then
 fi
 
 out="$1"
+if [[ "${out}" != /* ]]; then
+  out="${PWD}/${out}"
+fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 if [[ -f "${REPO_ROOT}/mise.toml" ]]; then

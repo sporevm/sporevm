@@ -2,3 +2,5 @@
 zig-out/
 zig-pkg/
 benchmarks/results/
+dist/
+release-extra/
