@@ -111,6 +111,7 @@ mise run smoke:rootfs-fanout
 mise run smoke:live-rootfs-fanout
 mise run smoke:writable-rootfs
 mise run benchmark:ci
+mise run benchmark:comparison
 ```
 
 `mise run check` runs unit tests, the product build, and diff hygiene.
@@ -141,9 +142,10 @@ Pre-1.0 releases are published as GitHub prereleases. Use
 publishing.
 
 Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).
-`mise run benchmark:ci` writes raw JSONL, a summary JSON, and logs under
-`zig-cache/sporevm-benchmarks/` for CI artifact upload and regression
-comparison.
+`mise run benchmark:ci` writes short cold/warm TTI JSONL, a summary JSON, and
+logs under `zig-cache/sporevm-benchmarks/` for CI artifact upload and regression
+comparison. Use `mise run benchmark:comparison` for the heavier
+distribution/writable-rootfs matrix.
 
 KVM work needs an aarch64 Linux host with KVM. Hypervisor.framework work needs
 an Apple Silicon Mac on macOS 15 or newer.

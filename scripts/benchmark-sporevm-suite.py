@@ -35,6 +35,16 @@ PROFILES = {
         "timeout_s": 180,
     },
     "ci": {
+        "iterations": 3,
+        "concurrency": 4,
+        "stagger_delay_ms": 200,
+        "modes": ("sequential", "burst"),
+        "benchmarks": ("cold_tti", "warm_spore_tti"),
+        "writable_rootfs_iterations": 1,
+        "writable_rootfs_workloads": ("package",),
+        "timeout_s": 180,
+    },
+    "comparison": {
         "iterations": 5,
         "concurrency": 8,
         "stagger_delay_ms": 200,

@@ -43,7 +43,8 @@ steps:
       trap upload_benchmark_artifacts EXIT
 
       mise install
-      mise run benchmark:ci
+      mise run build
+      scripts/benchmark-sporevm-suite.py --profile "${SPOREVM_BENCHMARK_PROFILE:-ci}" --no-build
       if [[ -n "${SPOREVM_BENCHMARK_BASELINE:-}" ]]; then
         scripts/compare-sporevm-benchmarks.py "${SPOREVM_BENCHMARK_BASELINE}" zig-cache/sporevm-benchmarks/latest-summary.json
       fi

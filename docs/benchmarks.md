@@ -15,13 +15,17 @@ upload and later comparison.
 ```console
 scripts/benchmark-sporevm-suite.py --profile smoke
 scripts/benchmark-sporevm-suite.py --profile ci
+scripts/benchmark-sporevm-suite.py --profile comparison
 scripts/benchmark-sporevm-suite.py --profile full
 ```
 
 - `smoke`: one sequential iteration plus a tiny warm/distribution pass and one
   package-style writable-rootfs pass.
-- `ci`: small sequential and burst runs plus one SQLite and package-style
-  writable-rootfs pass, suitable for regular CI artifacts.
+- `ci`: short cold and warm TTI sequential/burst runs, suitable for regular CI
+  artifacts.
+- `comparison`: small sequential and burst runs plus one SQLite and
+  package-style writable-rootfs pass, suitable for manual or nightly comparison
+  artifacts.
 - `full`: 100-way sequential, staggered, and burst runs matching the public TTI
   shape, plus three writable-rootfs iterations per workload.
 
@@ -72,8 +76,9 @@ spore run --from pulled/N -- /usr/local/bin/node -v
 
 Per-child `tti_ms` includes pull plus resume/exec. Rows also include pull metrics
 from `spore pull`, such as chunk bytes fetched, rootfs bytes fetched, and cache
-hits. The CI profile runs this sequentially by default; pass
-`--include-distribution-concurrency` to run selected staggered/burst modes too.
+hits. The smoke, comparison, and full profiles run this sequentially by default;
+pass `--include-distribution-concurrency` to run selected staggered/burst modes
+too.
 
 ### Writable Rootfs
 
@@ -158,7 +163,12 @@ The Buildkite benchmark step is opt-in:
 SPOREVM_RUN_BENCHMARKS=1
 ```
 
+It defaults to the short `ci` profile. Override with
+`SPOREVM_BENCHMARK_PROFILE=smoke`, `comparison`, or `full` when a build should
+pay for broader benchmark coverage.
+
 If `SPOREVM_BENCHMARK_BASELINE` points to a summary JSON available in the job
 workspace, the step compares the new `latest-summary.json` against that
-baseline. Regardless of comparison, the step uploads
-`zig-cache/sporevm-benchmarks/**/*` as artifacts.
+baseline. Baselines should come from the same profile unless the comparator is
+run by hand with a narrower `--only` list. Regardless of comparison result, the
+step uploads `zig-cache/sporevm-benchmarks/**/*` as artifacts.

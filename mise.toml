@@ -98,7 +98,11 @@ description = "Run a quick benchmark-suite smoke profile"
 
 [tasks."benchmark:ci"]
 run = "mise run build && scripts/benchmark-sporevm-suite.py --profile ci --no-build"
-description = "Run the CI benchmark profile and write comparable JSON output"
+description = "Run the short CI benchmark profile and write comparable JSON output"
+
+[tasks."benchmark:comparison"]
+run = "mise run build && scripts/benchmark-sporevm-suite.py --profile comparison --no-build"
+description = "Run the heavier all-dimension comparison benchmark profile"
 
 [tasks."benchmark:full"]
 run = "mise run build && scripts/benchmark-sporevm-suite.py --profile full --no-build"
