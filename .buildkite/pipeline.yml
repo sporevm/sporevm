@@ -38,7 +38,7 @@ steps:
 
   - label: ":package: Build Linux ARM64 release archive"
     key: "release-linux-arm64"
-    if: build.tag != null
+    if: build.branch == "lox/diy-release-assets-gh-artifacts"
     command: |
       mise install
       scripts/build-release-assets.sh --target linux-arm64 --output dist
@@ -59,7 +59,7 @@ steps:
 
   - label: ":package: Build macOS ARM64 release archive"
     key: "release-darwin-arm64"
-    if: build.tag != null
+    if: build.branch == "lox/diy-release-assets-gh-artifacts"
     command: |
       mise install
       scripts/build-release-assets.sh --target darwin-arm64 --output dist
@@ -78,15 +78,45 @@ steps:
     agents:
       queue: cleanroom-mac
 
-  - label: ":rocket: Publish release"
+  - label: ":mag: Verify release artifacts"
     key: "release-publish"
     depends_on:
       - "release-linux-arm64"
       - "release-darwin-arm64"
-    if: build.tag != null
+    if: build.branch == "lox/diy-release-assets-gh-artifacts"
     command: |
       mise install
-      scripts/ci-buildkite-release.sh
+      gh --version
+
+      set -euo pipefail
+      rm -rf dist
+      mkdir -p dist
+
+      buildkite-agent artifact download "dist/spore_*.tar.gz" .
+
+      test -f dist/spore_Linux_arm64.tar.gz
+      test -f dist/spore_Darwin_arm64.tar.gz
+
+      tar -tzf dist/spore_Linux_arm64.tar.gz | tee linux-archive.txt
+      tar -tzf dist/spore_Darwin_arm64.tar.gz | tee darwin-archive.txt
+
+      grep -qx "spore_Linux_arm64/spore" linux-archive.txt
+      grep -qx "spore_Linux_arm64/share/sporevm/minimal-exec-initrd.cpio" linux-archive.txt
+      grep -qx "spore_Darwin_arm64/spore" darwin-archive.txt
+      grep -qx "spore_Darwin_arm64/share/sporevm/minimal-exec-initrd.cpio" darwin-archive.txt
+
+      (
+        cd dist
+        if command -v shasum >/dev/null 2>&1; then
+          shasum -a 256 spore_Darwin_arm64.tar.gz spore_Linux_arm64.tar.gz > checksums.txt
+          shasum -a 256 -c checksums.txt
+        else
+          sha256sum spore_Darwin_arm64.tar.gz spore_Linux_arm64.tar.gz > checksums.txt
+          sha256sum -c checksums.txt
+        fi
+      )
+
+      buildkite-agent artifact upload "dist/checksums.txt"
     plugins:
       - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
           version: "2026.5.12"
