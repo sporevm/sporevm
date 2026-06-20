@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-18
+last_reviewed: 2026-06-20
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/immutable-rootfs-resume.md
@@ -251,6 +251,17 @@ an attached rootfs fd.
 - Foundation Slice 6 has S3/SSM remote restore, host-local cache reuse,
   source-peer HTTP pull support, corrupt-bundle rejection, and ten-instance
   star/tree smoke evidence.
+- `scripts/smoke-remote-bundle.sh --workload rootfs` extends the real-host
+  remote bundle smoke beyond diskless spores: the source builds exact OCI
+  rootfs bytes, packs them into the indexed bundle, destinations pull into a
+  fresh rootfs digest cache, repeated pulls prove rootfs cache reuse, corrupt
+  rootfs artifacts are rejected, and destinations verify materialization through
+  the selected child manifest and cache path.
+- `scripts/validate-release-a1-kvm.sh` is the repeatable release-readiness
+  wrapper for SSM-managed A1/KVM hosts. It runs a direct-S3 diskless bundle
+  check with destination cache reuse, corrupt-bundle rejection, and KVM
+  networking smokes, then runs an HTTP-peer rootfs-backed bundle check with
+  destination cache reuse and corrupt rootfs rejection.
 - `spore run --image`, `spore resume`, `spore fork`, and `spore fanout` support
   local immutable-rootfs fan-out.
 
@@ -467,6 +478,15 @@ cannot become restore authority.
 - Peer remote smoke: serve a bundle from a source or relay host over HTTP,
   materialize destinations through `spore pull http://...@sha256:<bundle>`,
   resume selected children, and record peer bytes separately from origin bytes.
+- Rootfs remote smoke: run `scripts/smoke-remote-bundle.sh --workload rootfs`
+  against source/destination A1 hosts and confirm the output reports bundled
+  rootfs artifacts, cold destination rootfs bytes fetched, warm destination
+  rootfs cache hits with zero refetch, corrupt rootfs rejection, and selected
+  child materialization into the rootfs digest cache.
+- Release wrapper: run `mise run validate:release-a1-kvm -- ...` or
+  `scripts/validate-release-a1-kvm.sh -- ...` with SSM instance ids, bucket, and
+  source peer IP to execute the direct-S3, HTTP-peer, cache-reuse,
+  corrupt-rejection, rootfs, and KVM networking checks as one repeatable gate.
 - Negative remote smoke: corrupt a bundle index, chunkpack segment, child
   manifest, and rootfs artifact, and confirm every path fails before VM boot.
 
