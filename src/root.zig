@@ -35,6 +35,7 @@ pub const hvf = @import("hvf/hvf.zig");
 pub const resume_cmd = @import("resume.zig");
 pub const rootfs = @import("rootfs.zig");
 pub const rootfs_cache = @import("rootfs_cache.zig");
+pub const rootfs_cas = @import("rootfs_cas.zig");
 pub const run = @import("run.zig");
 pub const spore_net = @import("spore_net.zig");
 pub const spore_net_policy = @import("spore_net_policy.zig");
@@ -81,6 +82,7 @@ test {
     testing.refAllDecls(dirty_ram);
     testing.refAllDecls(resume_cmd);
     testing.refAllDecls(rootfs_cache);
+    testing.refAllDecls(rootfs_cas);
     testing.refAllDecls(run);
     testing.refAllDecls(spore_net);
     testing.refAllDecls(spore_net_policy);

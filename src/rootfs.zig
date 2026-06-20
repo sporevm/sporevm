@@ -13,6 +13,7 @@ const oci = @import("rootfs/oci.zig");
 const oci_layout = @import("rootfs/oci_layout.zig");
 const ownership_mod = @import("rootfs/ownership.zig");
 const registry = @import("rootfs/registry.zig");
+const rootfs_cas = @import("rootfs_cas.zig");
 const tar = @import("rootfs/tar.zig");
 
 const Io = std.Io;
@@ -27,6 +28,7 @@ const usage =
     \\  build <image@sha256:...|image:tag> --output <rootfs.ext4>
     \\  import-oci <layout-dir|layout.tar> --ref local/name:tag
     \\  resolve <image:tag>
+    \\  cas-preload <blake3:digest> [--chunk-size BYTES]
     \\
     \\Options:
     \\  --platform <os/arch>       Target platform (default: linux/arm64)
@@ -51,6 +53,10 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     }
     if (std.mem.eql(u8, args[0], "resolve")) {
         try runResolve(init, args[1..], stdout);
+        return;
+    }
+    if (std.mem.eql(u8, args[0], "cas-preload")) {
+        try runCasPreload(init, args[1..], stdout);
         return;
     }
     try stdout.print("unknown rootfs command: {s}\n\n", .{args[0]});
@@ -79,6 +85,11 @@ const ParsedImportOciOptions = struct {
     platform: Platform = .{},
     mkfs: ?[]const u8 = null,
     debugfs: ?[]const u8 = null,
+};
+
+const ParsedCasPreloadOptions = struct {
+    digest: []const u8,
+    chunk_size: u64 = rootfs_cas.default_chunk_size,
 };
 
 pub const BuildRequest = struct {
@@ -191,6 +202,28 @@ fn runImportOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Wr
     );
 }
 
+fn runCasPreload(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    const arena = init.arena.allocator();
+    const parsed = try parseCasPreloadOptions(args, stdout);
+    const cache_root = try local_paths.rootfsCacheRootPath(arena, init.environ_map);
+    const result = try rootfs_cas.preload(init.io, arena, cache_root, parsed.digest, parsed.chunk_size);
+    try stdout.print(
+        "index: {s}\nrootfs: {s}\nrootfs_size: {d}\nchunk_size: {d}\nchunks: {d}\nzero_chunks: {d}\nnonzero_chunks: {d}\nobjects_written: {d}\nobject_bytes_written: {d}\nindex_bytes: {d}\n",
+        .{
+            result.index_path,
+            result.rootfs_digest,
+            result.rootfs_size,
+            result.chunk_size,
+            result.chunk_count,
+            result.zero_chunks,
+            result.nonzero_chunks,
+            result.objects_written,
+            result.object_bytes_written,
+            result.index_bytes,
+        },
+    );
+}
+
 fn parseResolveOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedResolveOptions {
     if (args.len == 0) {
         try stdout.writeAll(usage);
@@ -272,6 +305,39 @@ fn parseImportOciOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedIm
         .platform = platform,
         .mkfs = mkfs,
         .debugfs = debugfs,
+    };
+}
+
+fn parseCasPreloadOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedCasPreloadOptions {
+    if (args.len == 0) {
+        try stdout.writeAll(usage);
+        try stdout.flush();
+        std.process.exit(2);
+    }
+
+    var digest: ?[]const u8 = null;
+    var chunk_size: u64 = rootfs_cas.default_chunk_size;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--chunk-size")) {
+            i += 1;
+            if (i >= args.len) return error.MissingChunkSize;
+            chunk_size = std.fmt.parseInt(u64, args[i], 10) catch return error.InvalidChunkSize;
+            if (chunk_size == 0 or chunk_size % 512 != 0 or chunk_size > std.math.maxInt(usize)) return error.InvalidChunkSize;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.UnknownRootFSOption;
+        } else if (digest == null) {
+            digest = arg;
+        } else {
+            return error.TooManyRootFSArguments;
+        }
+    }
+
+    return .{
+        .digest = digest orelse return error.MissingRootFSDigest,
+        .chunk_size = chunk_size,
     };
 }
 

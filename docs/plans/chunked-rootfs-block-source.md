@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-20
+last_reviewed: 2026-06-21
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/distribution.md
@@ -216,6 +216,24 @@ can drift from the canonical index bytes.
   74us, which proves the same-host baseline is credible but not a complete
   restore-authority design. The replay uses SHA256 as a mechanics proxy; runtime
   rootfs chunks still need BLAKE3 identities.
+- Slice 3 now has an opt-in local runtime spike. `spore rootfs cas-preload`
+  materializes a local index and BLAKE3 object store from an already verified
+  digest-cache rootfs, and `SPOREVM_ROOTFS_CAS_EXPERIMENT=local-index-v0` makes
+  manifest-backed rootfs disks read clean clusters through a cached
+  `CasBlockSource`. The spike intentionally keeps the current manifest schema:
+  the local index is experiment data keyed by the existing rootfs digest and
+  size, not portable or manifest-bound restore authority.
+- Initial Slice 3 product-path evidence on the same 512MiB
+  `docker.io/library/node:22-alpine` rootfs is positive. Preloading the 64KiB
+  local CAS paid one full verification once, wrote 2,596 nonzero objects
+  totaling 170.1MiB, and produced a 243,667-byte JSON index. A hot child that
+  had already run `node -v` resumed in 145-146ms with CAS versus 3.4-3.5s
+  fd-backed, and performed zero clean rootfs reads. A colder child that had only
+  run `/bin/true` resumed `node -v` in 626-887ms with CAS versus 3.9-4.1s
+  fd-backed; CAS verified 488 unique 64KiB chunks, hashed 31,981,568 bytes, and
+  served 6,502 repeated read hits from the per-VM verified chunk cache.
+  Remaining benchmark work is 10-child and 100-child fan-out p50/p95, plus
+  16KiB and 256KiB runtime comparisons.
 
 ## Delivery Strategy
 
@@ -294,6 +312,9 @@ Scope:
   and zero fills;
 - compare same-host child TTI against the current fd-backed full verification
   path and a proof-sidecar control.
+- keep the opt-in local-only until a real product-path timing run proves the
+  block-source path improves child TTI rather than just moving verification
+  later into guest reads.
 
 Done when a warm `spore run --from <child> -- node -v` or equivalent
 rootfs-backed command shows whether cached chunk verification improves real

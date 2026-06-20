@@ -5,24 +5,28 @@
 //! the relevant restore authority.
 
 const std = @import("std");
+const rootfs_cas = @import("rootfs_cas.zig");
 
-pub const Error = error{
+pub const Error = rootfs_cas.SourceError || error{
     OutOfRange,
     ShortRead,
 };
 
 pub const BlockSource = union(enum) {
     file: FileBlockSource,
+    cas: *rootfs_cas.CasBlockSource,
 
     pub fn capacityBytes(self: BlockSource) u64 {
         return switch (self) {
             .file => |source| source.capacityBytes(),
+            .cas => |source| source.capacityBytes(),
         };
     }
 
     pub fn readAt(self: BlockSource, buf: []u8, offset: u64) Error!void {
         return switch (self) {
             .file => |source| source.readAt(buf, offset),
+            .cas => |source| source.readAt(buf, offset),
         };
     }
 };
