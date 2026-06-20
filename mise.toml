@@ -1,5 +1,5 @@
 [tools]
-goreleaser = "2.16.0"
+gh = "2.89.0"
 svu = "3.4.1"
 zig = "0.16.0"
 
@@ -25,8 +25,8 @@ run = "scripts/release.sh"
 description = "Tag the next version and push to trigger a Buildkite release"
 
 [tasks."release:snapshot"]
-run = "scripts/prepare-release-extra.sh && SDKROOT=\"$(xcrun --sdk macosx --show-sdk-path)\" goreleaser release --snapshot --clean"
-description = "Build local GoReleaser snapshot archives without publishing"
+run = "scripts/build-release-assets.sh"
+description = "Build local release archives without publishing"
 
 [tasks."smoke:run"]
 run = "mise run build && scripts/smoke-run.sh"
