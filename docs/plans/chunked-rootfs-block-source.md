@@ -198,6 +198,24 @@ can drift from the canonical index bytes.
   `mise run smoke:writable-rootfs` passed on 2026-06-20. The test suite includes
   a corrupt digest-cache rootfs regression proving `openRuntimeDisk` fails before
   constructing the `FileBlockSource`-backed COW path.
+- Slice 2 has a first product-path result from a 512MiB
+  `docker.io/library/node:22-alpine` rootfs on local HVF. A hot completed-base
+  child where the base had already run `node -v` took 3.8s to re-verify the full
+  rootfs and performed zero clean rootfs reads before returning `node -v`. A
+  colder child where the base captured `/bin/true` then ran `node -v` took 3.8s
+  to verify the full rootfs and read 28.6MiB from the clean rootfs base. Projected
+  chunk verification for that cold trace was 28.6MiB at 4KiB, 29.5MiB at 16KiB,
+  32.0MiB at 64KiB, and 37.2MiB at 256KiB.
+- After adversarial review, Slice 2 grew a local replay control rather than
+  moving straight to manifest format work. The replay materializes local
+  content-addressed chunk objects and replays the traced reads with cached and
+  uncached verification. On the cold Node trace, cached 64KiB replay hashed
+  31.9MiB through 487 object opens in 26.9ms, while the deliberately bad
+  uncached 64KiB replay hashed 458MiB through 6,990 object opens in 307.0ms. A
+  proof-sidecar control that only stats the rootfs and parses a tiny proof took
+  74us, which proves the same-host baseline is credible but not a complete
+  restore-authority design. The replay uses SHA256 as a mechanics proxy; runtime
+  rootfs chunks still need BLAKE3 identities.
 
 ## Delivery Strategy
 
@@ -219,25 +237,72 @@ pass with no product behavior change. The slice must also include a negative
 test or smoke that corrupts a digest-cache rootfs artifact and proves resume
 still fails before VM creation through the `FileBlockSource` path.
 
-### Slice 2: Rootfs Chunk-Size Experiment
+### Slice 2: Rootfs Chunking Kill-Or-Commit Experiment
 
-Build an offline experiment over real cached ext4 rootfs artifacts. Compare
-4KiB, 16KiB, 64KiB, and 256KiB rootfs chunks separately from writable disk
-clusters.
+Build a product-path experiment over real cached ext4 rootfs artifacts and
+representative `spore run --from` commands. The goal is to decide whether
+chunked rootfs should proceed at all before investing in the descriptor, parser,
+and `CasBlockSource`.
 
 Measure:
 
+- full-file rootfs verification time in the current fd-backed path;
+- clean rootfs read offsets and lengths for warm child commands;
+- projected chunk verification bytes for 4KiB, 16KiB, 64KiB, and 256KiB;
 - index bytes per rootfs;
-- unique chunk bytes across related OCI images;
 - chunk count and object count;
-- sparse boot/read working set for representative `spore run --from` commands;
-- first-read verification bytes and CPU time;
 - warm-cache child startup impact.
+- cached and uncached replay cost for traced reads;
+- proof-sidecar control cost for same-host fan-out.
 
-Done when the plan records a recommended first chunk size for immutable rootfs
-read/fan-out economics.
+Defer broader image-registry data until before choosing defaults:
 
-### Slice 3: Rootfs Storage Descriptor And Index Parser
+- unique chunk bytes across related OCI images;
+- package-manager-heavy rootfs variants;
+- cross-image object count and dedupe sensitivity for 16KiB, 64KiB, and 256KiB.
+
+Done when the plan records a clear proceed, stop, or proof-sidecar-first
+decision. The first local Node result is a proceed-to-prototype signal, not a
+format/default lock: full-file verification cost was roughly equal to child TTI,
+while the cold child trace would verify only 5.3-6.9% of the rootfs depending on
+chunk size. The replay control makes one requirement explicit: the runtime
+`CasBlockSource` must memoize verified chunks for the lifetime of the VM or it
+can re-hash hundreds of MiB through repeated small guest reads. Use 64KiB as the
+first balanced `CasBlockSource` prototype chunk size because it keeps overfetch
+modest at 12%, cuts touched chunks from 6,990 to 488 for the cold trace, and
+keeps a binary whole-image index around 85KiB. Keep 256KiB in the benchmark
+because it was locally faster in replay, and keep the proof-sidecar control in
+the benchmark because it is the simplest same-host baseline.
+
+### Slice 3: Cached CasBlockSource Runtime Spike
+
+Build a local runtime spike before locking the manifest/index format. It should
+use a generated index and local object store derived from one digest-cache rootfs
+artifact, then attach through a cached `CasBlockSource` under an experimental
+path.
+
+Scope:
+
+- no manifest schema change;
+- no remote reads;
+- no S3 path;
+- no distribution bundle changes;
+- no fallback to rebuilding missing chunks during resume;
+- verify every object against its content identity before first use;
+- memoize verified chunks per VM so repeated guest reads are cache hits;
+- emit stats for chunk accesses, cache hits, misses, object opens, bytes hashed,
+  and zero fills;
+- compare same-host child TTI against the current fd-backed full verification
+  path and a proof-sidecar control.
+
+Done when a warm `spore run --from <child> -- node -v` or equivalent
+rootfs-backed command shows whether cached chunk verification improves real
+child TTI, and the report includes p50/p95 for 10-child and 100-child fan-out.
+If the spike is not clearly faster than the proof-sidecar control for same-host
+fan-out, keep the proof sidecar as the local optimization path and continue
+chunked rootfs only for distribution economics.
+
+### Slice 4: Rootfs Storage Descriptor And Index Parser
 
 Add the manifest-bound chunked rootfs descriptor and canonical rootfs index
 parser without attaching it to product resume yet.
@@ -260,13 +325,14 @@ Scope:
   in the same slice.
 
 Done when malformed or mismatched descriptors and indexes fail before any block
-backend can be constructed.
+backend can be constructed. This slice should use the runtime spike results to
+choose only the fields needed for the first product path.
 
-### Slice 4: Local CasBlockSource Prototype
+### Slice 5: Manifest-Attached Local CasBlockSource Prototype
 
 Import or derive a chunked rootfs index and local object store for one cached
-rootfs artifact. Attach it through `CasBlockSource` for `spore run --from` on
-completed-base spores.
+rootfs artifact. Attach it through the manifest-selected descriptor and
+`CasBlockSource` for `spore run --from` on completed-base spores.
 
 Keep the first prototype local-only:
 
@@ -274,6 +340,8 @@ Keep the first prototype local-only:
 - no remote lazy reads;
 - no fallback to rebuilding missing objects during resume;
 - fail closed on missing or corrupt chunks.
+- memoize verified chunks per VM so repeated guest reads do not re-open and
+  re-hash the same object.
 
 Done when warm `spore run --from <child> -- node -v` or an equivalent
 rootfs-backed command avoids the current full-rootfs verification phase without
@@ -281,13 +349,15 @@ moving the same cost into synchronous boot reads. Report:
 
 - rootfs open/index verification time;
 - chunks read and verified before first command execution;
+- chunk cache hits and misses before first command execution;
+- object opens and bytes hashed before first command execution;
 - rootfs bytes verified before first command execution;
 - total rootfs verification CPU time;
 - command time after the exec bridge is ready;
 - child TTI p50/p95 for 10-child and 100-child same-host fan-out;
 - cold first-child overhead against the current monolithic path.
 
-### Slice 5: Distribution Convergence
+### Slice 6: Distribution Convergence
 
 Extend bundle and pull materialization so chunked rootfs objects use the same
 verified content-source machinery as RAM chunks and writable disk objects.
@@ -320,8 +390,9 @@ rootfs storage descriptors and keeps both manifest-authoritative.
 
 ## Resolved Decisions
 
-- Do not make a rootfs proof sidecar the first follow-up. It is a possible
-  `FileBlockSource` optimization, not the target architecture.
+- Do not make a rootfs proof sidecar the primary architecture. It remains a
+  credible same-host `FileBlockSource` optimization and a required benchmark
+  control, but it does not solve cross-host chunk distribution by itself.
 - Do not reuse the writable disk layer's 4KiB cluster result as the immutable
   rootfs default without measuring rootfs read/fan-out economics.
 - Keep rootfs chunks, RAM chunks, and writable disk objects semantically
@@ -336,6 +407,16 @@ rootfs storage descriptors and keeps both manifest-authoritative.
 - Do not overload the current `rootfs.source` OCI provenance field. Chunked
   rootfs storage authority needs a distinct field and an effective base identity
   that writable disk layers can validate against.
+- Proceed to a local cached `CasBlockSource` prototype before locking the
+  descriptor/parser shape. The first product-path experiment showed that
+  same-host child TTI can be dominated by full-rootfs verification even when the
+  child performs zero clean rootfs reads, and the colder Node child only needed a
+  sparse rootfs working set. The replay control showed cached chunk verification
+  is materially different from the no-cache failure mode.
+- Use 64KiB as the first balanced local `CasBlockSource` prototype chunk size,
+  not as a final default. Keep 16KiB and 256KiB in benchmark output while the
+  image-registry experiment broadens; 256KiB was fastest in the local replay, but
+  it overfetches more rootfs data and may weaken cross-image dedupe.
 
 ## Open Questions
 
@@ -345,10 +426,12 @@ rootfs storage descriptors and keeps both manifest-authoritative.
   restore authority.
 - Should rootfs chunks use the same on-disk object directory as RAM chunks, or a
   namespaced rootfs object directory with shared cache plumbing?
-- What is the right default immutable-rootfs chunk size for sparse startup reads:
-  4KiB, 16KiB, 64KiB, or 256KiB?
+- Does broader image-registry data contradict the first 64KiB prototype default,
+  especially for cross-image dedupe and package-manager-heavy rootfs variants?
 - Should `spore rootfs build` emit chunked rootfs objects directly, or should a
   separate preload/import command convert existing digest-cache ext4 artifacts?
+- Should a local proof sidecar ship as a same-host fd-backed optimization before
+  chunked rootfs distribution, or stay only as a benchmark control?
 
 ## Key Learnings From Pressure-Testing
 
@@ -363,7 +446,11 @@ rootfs storage descriptors and keeps both manifest-authoritative.
 - The dangerous failure mode is not a bad chunk-size choice; it is a new path
   that attaches unverified or incorrectly described rootfs bytes. The plan now
   requires the descriptor/parser/security slice before `CasBlockSource` is used
-  by product resume.
+  by manifest-attached product resume.
 - Avoiding the full-file hash is not enough to call the work fast. The benchmark
   must prove child TTI improves and that verification work is not merely shifted
   onto synchronous guest block reads.
+- Verified chunk caching is a hard runtime requirement. The replay control showed
+  that without caching, 64KiB chunks on the cold Node trace would re-hash 458MiB
+  through 6,990 object opens, which is close enough to the monolithic tax to
+  erase much of the win.

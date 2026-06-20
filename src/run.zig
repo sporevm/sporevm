@@ -40,6 +40,7 @@ const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const max_image_ref_cache_record_bytes = 64 * 1024;
 const image_ref_cache_record_version: u32 = 1;
+const rootfs_trace_env = "SPOREVM_ROOTFS_TRACE";
 
 pub const Backend = enum {
     auto,
@@ -835,11 +836,57 @@ pub fn rootfsCacheRootPath(init: std.process.Init, allocator: std.mem.Allocator,
 
 pub fn openVerifiedRootfs(init: std.process.Init, allocator: std.mem.Allocator, rootfs: spore.Rootfs, command_name: []const u8) !std.c.fd_t {
     const cache_root = try rootfsCacheRootPath(init, allocator, command_name);
-    return openVerifiedRootfsFromCache(init.io, allocator, cache_root, rootfs);
+    const trace_path = try rootfsTracePath(init, allocator);
+    const start_ms = monotonicMs();
+    const fd = try openVerifiedRootfsFromCache(init.io, allocator, cache_root, rootfs);
+    if (trace_path) |path| {
+        appendRootfsTrace(allocator, path, rootfs, monotonicMs() -| start_ms) catch {};
+    }
+    return fd;
 }
 
 fn openVerifiedRootfsFromCache(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, rootfs: spore.Rootfs) !std.c.fd_t {
     return rootfs_cache.openVerifiedFromCache(io, allocator, cache_root, rootfs);
+}
+
+fn rootfsTracePath(init: std.process.Init, allocator: std.mem.Allocator) !?[:0]const u8 {
+    const path = init.environ_map.get(rootfs_trace_env) orelse return null;
+    if (path.len == 0) return null;
+    const copy = try allocator.dupeZ(u8, path);
+    return copy;
+}
+
+fn appendRootfsTrace(
+    allocator: std.mem.Allocator,
+    path: [:0]const u8,
+    rootfs: spore.Rootfs,
+    elapsed_ms: u64,
+) !void {
+    const line = try std.fmt.allocPrint(
+        allocator,
+        "{{\"event\":\"rootfs_open_verified\",\"digest\":\"{s}\",\"size\":{d},\"elapsed_ms\":{d}}}\n",
+        .{ rootfs.artifact.digest, rootfs.artifact.size, elapsed_ms },
+    );
+    defer allocator.free(line);
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    writeAllTrace(fd, line);
+}
+
+fn writeAllTrace(fd: std.c.fd_t, bytes: []const u8) void {
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const n = std.c.write(fd, remaining.ptr, remaining.len);
+        if (n <= 0) return;
+        remaining = remaining[@intCast(n)..];
+    }
+}
+
+fn monotonicMs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
 fn cacheRootfsByDigest(
@@ -1462,12 +1509,13 @@ pub fn openRuntimeDisk(init: std.process.Init, allocator: std.mem.Allocator, opt
     const fd = rootfs_fd orelse return .{};
     var runtime = RuntimeDisk{ .rootfs_fd = fd };
     errdefer runtime.deinit();
+    const trace_path = try rootfsTracePath(init, allocator);
 
     if (options.disk) |disk| {
         const rootfs = options.rootfs orelse return error.BadManifest;
         const spore_dir = options.spore_dir orelse return error.BadManifest;
         if (disk.size != rootfs.artifact.size or !std.mem.eql(u8, disk.base, rootfs.artifact.digest)) return error.BadManifest;
-        const base_source = block_source.FileBlockSource.init(fd, disk.size).source();
+        const base_source = block_source.FileBlockSource.initWithTrace(fd, disk.size, trace_path).source();
         runtime.overlay = try disk_layer.createTempOverlay(allocator);
         if (disk.layers.len == 0) {
             runtime.cow = try cow_disk.CowDisk.init(allocator, base_source, runtime.overlay.?.fd, disk.size, disk_layer.default_cluster_size);
@@ -1484,7 +1532,7 @@ pub fn openRuntimeDisk(init: std.process.Init, allocator: std.mem.Allocator, opt
     if (options.rootfs) |rootfs| {
         runtime.overlay = try disk_layer.createTempOverlay(allocator);
         const base = disk_layer.diskFromRootfs(rootfs);
-        const base_source = block_source.FileBlockSource.init(fd, base.size).source();
+        const base_source = block_source.FileBlockSource.initWithTrace(fd, base.size, trace_path).source();
         runtime.cow = try cow_disk.CowDisk.init(allocator, base_source, runtime.overlay.?.fd, base.size, disk_layer.default_cluster_size);
         runtime.base_disk = base;
         return runtime;

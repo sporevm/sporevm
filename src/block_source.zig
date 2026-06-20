@@ -32,11 +32,20 @@ pub const FileBlockSource = struct {
     /// and fd lifetime.
     fd: std.c.fd_t,
     size: u64,
+    trace_path: ?[:0]const u8 = null,
 
     pub fn init(fd: std.c.fd_t, size: u64) FileBlockSource {
         return .{
             .fd = fd,
             .size = size,
+        };
+    }
+
+    pub fn initWithTrace(fd: std.c.fd_t, size: u64, trace_path: ?[:0]const u8) FileBlockSource {
+        return .{
+            .fd = fd,
+            .size = size,
+            .trace_path = trace_path,
         };
     }
 
@@ -52,6 +61,7 @@ pub const FileBlockSource = struct {
         const end = std.math.add(u64, offset, buf.len) catch return error.OutOfRange;
         if (end > self.size) return error.OutOfRange;
 
+        const start_ms = monotonicMs();
         var done: usize = 0;
         while (done < buf.len) {
             const absolute = std.math.add(u64, offset, done) catch return error.OutOfRange;
@@ -60,8 +70,40 @@ pub const FileBlockSource = struct {
             if (n <= 0) return error.ShortRead;
             done += @intCast(n);
         }
+        if (self.trace_path) |trace_path| {
+            appendTraceRead(trace_path, offset, buf.len, monotonicMs() -| start_ms);
+        }
     }
 };
+
+fn appendTraceRead(path: [:0]const u8, offset: u64, len: usize, elapsed_ms: u64) void {
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+
+    var line_buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &line_buf,
+        "{{\"event\":\"block_source_read\",\"source\":\"file\",\"offset\":{d},\"len\":{d},\"elapsed_ms\":{d}}}\n",
+        .{ offset, len, elapsed_ms },
+    ) catch return;
+    writeAll(fd, line);
+}
+
+fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const n = std.c.write(fd, remaining.ptr, remaining.len);
+        if (n <= 0) return;
+        remaining = remaining[@intCast(n)..];
+    }
+}
+
+fn monotonicMs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
 
 test "file source reports capacity and reads ranges" {
     const io = std.testing.io;
