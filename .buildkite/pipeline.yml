@@ -34,6 +34,28 @@ steps:
     agents:
       queue: cleanroom-mac
 
+  - label: ":chart_with_upwards_trend: Benchmark Suite"
+    if: build.env("SPOREVM_RUN_BENCHMARKS") == "1"
+    command: |
+      mise install
+      mise run benchmark:ci
+      if [[ -n "${SPOREVM_BENCHMARK_BASELINE:-}" ]]; then
+        scripts/compare-sporevm-benchmarks.py "${SPOREVM_BENCHMARK_BASELINE}" zig-cache/sporevm-benchmarks/latest-summary.json
+      fi
+      buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/**/*"
+    plugins:
+      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          version: "2026.5.12"
+    cache:
+      paths:
+        - "~/.local/share/mise"
+        - "~/.cache/mise"
+        - "~/.local/state/mise"
+      size: "20g"
+      name: "mise-cache"
+    agents:
+      queue: cleanroom
+
   - wait
 
   - label: ":rocket: Publish release"

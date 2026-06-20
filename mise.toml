@@ -91,3 +91,19 @@ description = "Run repeatable A1/KVM release validation over SSM remote hosts"
 [tasks.smoke]
 run = "mise run build && scripts/smoke-run.sh && scripts/smoke-run-capture.sh"
 description = "Run product smoke tests"
+
+[tasks."benchmark:smoke"]
+run = "mise run build && scripts/benchmark-sporevm-suite.py --profile smoke --no-build"
+description = "Run a quick benchmark-suite smoke profile"
+
+[tasks."benchmark:ci"]
+run = "mise run build && scripts/benchmark-sporevm-suite.py --profile ci --no-build"
+description = "Run the CI benchmark profile and write comparable JSON output"
+
+[tasks."benchmark:full"]
+run = "mise run build && scripts/benchmark-sporevm-suite.py --profile full --no-build"
+description = "Run the full benchmark suite"
+
+[tasks."benchmark:compare"]
+run = "scripts/compare-sporevm-benchmarks.py"
+description = "Compare two benchmark summary JSON files"

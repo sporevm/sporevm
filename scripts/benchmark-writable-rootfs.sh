@@ -212,7 +212,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-spore_image_common=(--backend "${backend}" --memory-mib "${memory_mib}" --timeout-ms "${timeout_ms}")
+spore_image_common=(--backend "${backend}" --memory "${memory_mib}mb" --timeout-ms "${timeout_ms}")
 spore_from_common=(--backend "${backend}" --timeout-ms "${timeout_ms}")
 
 resolve_image() {

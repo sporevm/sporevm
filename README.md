@@ -110,6 +110,7 @@ mise run smoke:counter-fanout
 mise run smoke:rootfs-fanout
 mise run smoke:live-rootfs-fanout
 mise run smoke:writable-rootfs
+mise run benchmark:ci
 ```
 
 `mise run check` runs unit tests, the product build, and diff hygiene.
@@ -138,6 +139,11 @@ must build tags and provide `SPOREVM_GITHUB_RELEASE_TOKEN` to the release job.
 Pre-1.0 releases are published as GitHub prereleases. Use
 `mise run release:snapshot` to build the release archives locally without
 publishing.
+
+Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).
+`mise run benchmark:ci` writes raw JSONL, a summary JSON, and logs under
+`zig-cache/sporevm-benchmarks/` for CI artifact upload and regression
+comparison.
 
 KVM work needs an aarch64 Linux host with KVM. Hypervisor.framework work needs
 an Apple Silicon Mac on macOS 15 or newer.
