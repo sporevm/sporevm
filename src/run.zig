@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+const block_source = @import("block_source.zig");
 const capture = @import("capture.zig");
 const cow_disk = @import("cow_disk.zig");
 const disk_layer = @import("disk_layer.zig");
@@ -1466,14 +1467,15 @@ pub fn openRuntimeDisk(init: std.process.Init, allocator: std.mem.Allocator, opt
         const rootfs = options.rootfs orelse return error.BadManifest;
         const spore_dir = options.spore_dir orelse return error.BadManifest;
         if (disk.size != rootfs.artifact.size or !std.mem.eql(u8, disk.base, rootfs.artifact.digest)) return error.BadManifest;
+        const base_source = block_source.FileBlockSource.init(fd, disk.size).source();
         runtime.overlay = try disk_layer.createTempOverlay(allocator);
         if (disk.layers.len == 0) {
-            runtime.cow = try cow_disk.CowDisk.init(allocator, fd, runtime.overlay.?.fd, disk.size, disk_layer.default_cluster_size);
+            runtime.cow = try cow_disk.CowDisk.init(allocator, base_source, runtime.overlay.?.fd, disk.size, disk_layer.default_cluster_size);
             runtime.base_disk = disk;
         } else {
             const layers = try disk_layer.loadLayerChain(allocator, spore_dir, disk);
             errdefer disk_layer.freeLayerChain(allocator, layers);
-            runtime.layered_cow = try disk_layer.LayeredCowDisk.init(allocator, spore_dir, fd, runtime.overlay.?.fd, disk, layers);
+            runtime.layered_cow = try disk_layer.LayeredCowDisk.init(allocator, spore_dir, base_source, runtime.overlay.?.fd, disk, layers);
             runtime.base_disk = disk;
         }
         return runtime;
@@ -1482,7 +1484,8 @@ pub fn openRuntimeDisk(init: std.process.Init, allocator: std.mem.Allocator, opt
     if (options.rootfs) |rootfs| {
         runtime.overlay = try disk_layer.createTempOverlay(allocator);
         const base = disk_layer.diskFromRootfs(rootfs);
-        runtime.cow = try cow_disk.CowDisk.init(allocator, fd, runtime.overlay.?.fd, base.size, disk_layer.default_cluster_size);
+        const base_source = block_source.FileBlockSource.init(fd, base.size).source();
+        runtime.cow = try cow_disk.CowDisk.init(allocator, base_source, runtime.overlay.?.fd, base.size, disk_layer.default_cluster_size);
         runtime.base_disk = base;
         return runtime;
     }
@@ -2282,6 +2285,48 @@ test "rootfs digest cache verifies exact bytes" {
     try Io.Dir.cwd().deleteFile(io, digest_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
     try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedRootfsFromCache(io, arena, cache_root, rootfs));
+}
+
+test "runtime disk rejects corrupt rootfs before constructing file block source" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-runtime-disk-corrupt-rootfs";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+
+    const artifact = try cacheRootfsByDigestPath(io, arena, cache_root, rootfs_path);
+    const digest_path = try digestRootfsPath(arena, cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
+    try std.testing.expectError(error.RootFSDigestMismatch, openRuntimeDisk(init, arena, .{
+        .rootfs = rootfs,
+        .command_name = "run",
+    }));
 }
 
 test "rootfs digest cache rejects unsafe existing paths" {

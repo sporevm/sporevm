@@ -7,6 +7,7 @@
 //! CAS directory.
 
 const std = @import("std");
+const block_source = @import("block_source.zig");
 const chunklib = @import("chunk.zig");
 const cow_disk = @import("cow_disk.zig");
 const disk_layer = @import("disk_layer.zig");
@@ -2492,7 +2493,8 @@ fn attachTestDiskLayer(
     const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
     defer _ = std.c.close(overlay_fd);
 
-    var cow = try cow_disk.CowDisk.init(allocator, base_fd, overlay_fd, rootfs.artifact.size, disk_layer.default_cluster_size);
+    const base_source = block_source.FileBlockSource.init(base_fd, rootfs.artifact.size).source();
+    var cow = try cow_disk.CowDisk.init(allocator, base_source, overlay_fd, rootfs.artifact.size, disk_layer.default_cluster_size);
     defer cow.deinit();
     try cow.writeAt(payload, write_offset);
     try cow.flush();

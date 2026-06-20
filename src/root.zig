@@ -8,6 +8,7 @@
 const builtin = @import("builtin");
 
 pub const board = @import("board.zig");
+pub const block_source = @import("block_source.zig");
 pub const boot = @import("boot.zig");
 pub const bundle = @import("bundle.zig");
 pub const capture = @import("capture.zig");
@@ -61,6 +62,7 @@ test {
     // Ensure all referenced modules' tests are discovered.
     const testing = @import("std").testing;
     testing.refAllDecls(@This());
+    testing.refAllDecls(block_source);
     testing.refAllDecls(bundle);
     testing.refAllDecls(capture);
     testing.refAllDecls(cow_disk);

@@ -1,11 +1,12 @@
 //! Host-side COW disk backing for writable block devices.
 //!
 //! This is the local active-head primitive for writable rootfs work. It reads
-//! from an immutable base fd until a cluster is dirtied, then serves that whole
-//! cluster from a sparse overlay fd. The overlay is not a portable artifact
+//! from an immutable block source until a cluster is dirtied, then serves that
+//! whole cluster from a sparse overlay fd. The overlay is not a portable artifact
 //! until later sealing code records verified disk-layer objects.
 
 const std = @import("std");
+const block_source = @import("block_source.zig");
 
 pub const Error = error{
     BadClusterSize,
@@ -15,11 +16,11 @@ pub const Error = error{
     ShortWrite,
     ResizeFailed,
     FlushFailed,
-} || std.mem.Allocator.Error;
+} || block_source.Error || std.mem.Allocator.Error;
 
 pub const CowDisk = struct {
     allocator: std.mem.Allocator,
-    base_fd: std.c.fd_t,
+    base: block_source.BlockSource,
     overlay_fd: std.c.fd_t,
     size: u64,
     cluster_size: u64,
@@ -27,12 +28,13 @@ pub const CowDisk = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        base_fd: std.c.fd_t,
+        base: block_source.BlockSource,
         overlay_fd: std.c.fd_t,
         size: u64,
         cluster_size: u64,
     ) Error!CowDisk {
         if (size == 0) return error.BadDiskSize;
+        if (base.capacityBytes() < size) return error.BadDiskSize;
         if (cluster_size == 0 or cluster_size % 512 != 0 or cluster_size > std.math.maxInt(usize)) {
             return error.BadClusterSize;
         }
@@ -44,7 +46,7 @@ pub const CowDisk = struct {
         @memset(dirty, false);
         return .{
             .allocator = allocator,
-            .base_fd = base_fd,
+            .base = base,
             .overlay_fd = overlay_fd,
             .size = size,
             .cluster_size = cluster_size,
@@ -102,8 +104,12 @@ pub const CowDisk = struct {
         while (cursor < buf.len) {
             const absolute = offset + cursor;
             const span = try self.spanFor(absolute, buf.len - cursor);
-            const fd = if (self.dirty[span.cluster_index]) self.overlay_fd else self.base_fd;
-            try readExact(fd, buf[cursor..][0..span.len], absolute);
+            const target = buf[cursor..][0..span.len];
+            if (self.dirty[span.cluster_index]) {
+                try readExact(self.overlay_fd, target, absolute);
+            } else {
+                try self.base.readAt(target, absolute);
+            }
             cursor += span.len;
         }
     }
@@ -150,7 +156,7 @@ pub const CowDisk = struct {
         const len = std.math.cast(usize, end - start) orelse return error.BadClusterSize;
         const buf = try self.allocator.alloc(u8, len);
         defer self.allocator.free(buf);
-        try readExact(self.base_fd, buf, start);
+        try self.base.readAt(buf, start);
         try writeExact(self.overlay_fd, buf, start);
     }
 };
@@ -201,7 +207,8 @@ test "partial write preserves untouched bytes from base" {
     for (&base_bytes, 0..) |*byte, i| byte.* = @truncate(i);
     try base.writeStreamingAll(io, &base_bytes);
 
-    var disk = try CowDisk.init(std.testing.allocator, base.handle, overlay.handle, base_bytes.len, 4096);
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len).source();
+    var disk = try CowDisk.init(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 4096);
     defer disk.deinit();
 
     const patch = [_]u8{0xAA} ** 512;
@@ -229,7 +236,8 @@ test "writes spanning clusters seed and read from overlay" {
     @memset(&base_bytes, 0x11);
     try base.writeStreamingAll(io, &base_bytes);
 
-    var disk = try CowDisk.init(std.testing.allocator, base.handle, overlay.handle, base_bytes.len, 4096);
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len).source();
+    var disk = try CowDisk.init(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 4096);
     defer disk.deinit();
 
     const patch = [_]u8{0x44} ** 4096;
@@ -253,12 +261,13 @@ test "range and cluster validation fail closed" {
     var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
     defer overlay.close(io);
     try base.writeStreamingAll(io, &([_]u8{0} ** 4096));
+    const base_source = block_source.FileBlockSource.init(base.handle, 4096).source();
 
-    try std.testing.expectError(error.BadClusterSize, CowDisk.init(std.testing.allocator, base.handle, overlay.handle, 4096, 1000));
+    try std.testing.expectError(error.BadClusterSize, CowDisk.init(std.testing.allocator, base_source, overlay.handle, 4096, 1000));
     const oversized = @as(u64, @intCast(std.math.maxInt(std.c.off_t))) + 1;
-    try std.testing.expectError(error.BadDiskSize, CowDisk.init(std.testing.allocator, base.handle, overlay.handle, oversized, 4096));
+    try std.testing.expectError(error.BadDiskSize, CowDisk.init(std.testing.allocator, base_source, overlay.handle, oversized, 4096));
 
-    var disk = try CowDisk.init(std.testing.allocator, base.handle, overlay.handle, 4096, 4096);
+    var disk = try CowDisk.init(std.testing.allocator, base_source, overlay.handle, 4096, 4096);
     defer disk.deinit();
 
     var byte: [1]u8 = .{0};
@@ -276,7 +285,8 @@ test "failed clean-cluster write does not mark dirty" {
     var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
     try base.writeStreamingAll(io, &([_]u8{0x11} ** 4096));
 
-    var disk = try CowDisk.init(std.testing.allocator, base.handle, overlay.handle, 4096, 4096);
+    const base_source = block_source.FileBlockSource.init(base.handle, 4096).source();
+    var disk = try CowDisk.init(std.testing.allocator, base_source, overlay.handle, 4096, 4096);
     defer disk.deinit();
     overlay.close(io);
 

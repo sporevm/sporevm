@@ -13,6 +13,7 @@ related_plans:
   - docs/plans/foundation.md
   - docs/plans/distribution.md
   - docs/plans/immutable-rootfs-resume.md
+  - docs/plans/chunked-rootfs-block-source.md
 ---
 
 # Writable Disk Layer Plan
@@ -36,6 +37,13 @@ The runtime hot path optimizes for local block performance. Snapshot, pack, and
 pull optimize for content-addressed distribution. A later file-content index may
 improve dedupe for shifted package installs or model files, but it must remain
 advisory. Exact block-layer replay is the thing that makes a VM resume correct.
+
+This plan is complete for the mutable rootfs-bound layer. The next filesystem
+pressure point is the immutable rootfs base: warm `spore run --from` fan-out is
+still paying to open and verify a monolithic ext4 artifact before VM creation.
+That follow-up belongs in
+[`docs/plans/chunked-rootfs-block-source.md`](chunked-rootfs-block-source.md),
+not in this mutable-layer plan.
 
 ## Problem
 
@@ -129,6 +137,36 @@ bundle/
 - Local active heads are not portable trust roots until sealed.
 - Optional file-content indexes cannot change restore semantics; they can only
   reduce transport or cache bytes.
+
+## Follow-Up: Chunked Immutable Base
+
+The writable layer work proved the right guest contract: one ordinary
+`virtio-blk` root disk, with immutable base reads and mutable writes handled by
+host-side block backends. It did not remove the current immutable-rootfs
+fan-out cost. Product resume still opens a digest-cache ext4 artifact and
+verifies the whole file before VM creation.
+
+The follow-up decision is to introduce a block-read boundary under the COW and
+layered-COW devices instead of adding a local rootfs proof sidecar first:
+
+```text
+virtio-blk
+  -> COW / layered COW disk
+       dirty reads -> active head
+       clean reads -> BlockSource
+
+BlockSource
+  FileBlockSource -> current verified ext4 fd
+  CasBlockSource  -> verified rootfs chunk index plus local object store
+```
+
+That keeps this plan's mutable disk-layer semantics intact while letting the
+immutable base evolve from "one verified fd" to "small verified index plus
+verified chunks". A proof sidecar may still be useful for the fd-backed
+compatibility path, but it should not become the primary fan-out architecture.
+The chunked-rootfs plan owns the chunk size experiments, rootfs index format,
+`spore run --from` benchmark, and distribution convergence with RAM chunks and
+writable disk objects.
 
 ## Current Experiment
 

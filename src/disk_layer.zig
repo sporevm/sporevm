@@ -6,6 +6,7 @@
 //! immutable rootfs base.
 
 const std = @import("std");
+const block_source = @import("block_source.zig");
 const chunk = @import("chunk.zig");
 const cow_disk = @import("cow_disk.zig");
 const spore = @import("spore.zig");
@@ -40,7 +41,7 @@ pub const TempOverlay = struct {
 pub const LayeredCowDisk = struct {
     allocator: std.mem.Allocator,
     dir: []const u8,
-    base_fd: std.c.fd_t,
+    base: block_source.BlockSource,
     overlay_fd: std.c.fd_t,
     size: u64,
     cluster_size: u64,
@@ -50,13 +51,14 @@ pub const LayeredCowDisk = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         dir: []const u8,
-        base_fd: std.c.fd_t,
+        base: block_source.BlockSource,
         overlay_fd: std.c.fd_t,
         disk: spore.Disk,
         layers: []const spore.DiskLayer,
     ) Error!LayeredCowDisk {
         // Takes ownership of the cloned layer chain on success.
         if (layers.len == 0) return error.BadManifest;
+        if (base.capacityBytes() < disk.size) return error.BadManifest;
         const cluster_size = layers[0].cluster_size;
         for (layers) |layer| {
             try spore.validateDiskLayer(layer);
@@ -71,7 +73,7 @@ pub const LayeredCowDisk = struct {
         return .{
             .allocator = allocator,
             .dir = dir,
-            .base_fd = base_fd,
+            .base = base,
             .overlay_fd = overlay_fd,
             .size = disk.size,
             .cluster_size = cluster_size,
@@ -135,7 +137,7 @@ pub const LayeredCowDisk = struct {
                 const cluster_len = try self.clusterLen(span.cluster_index);
                 const cluster_buf = try self.allocator.alloc(u8, cluster_len);
                 defer self.allocator.free(cluster_buf);
-                try readClusterFromChain(self.allocator, self.dir, self.base_fd, self.layers, @intCast(span.cluster_index), cluster_buf);
+                try readClusterFromChain(self.allocator, self.dir, self.base, self.layers, @intCast(span.cluster_index), cluster_buf);
                 const cluster_offset: usize = @intCast(absolute % self.cluster_size);
                 @memcpy(target, cluster_buf[cluster_offset..][0..span.len]);
             }
@@ -184,7 +186,7 @@ pub const LayeredCowDisk = struct {
         const offset = std.math.mul(u64, cluster_index, self.cluster_size) catch return error.OutOfRange;
         const buf = try self.allocator.alloc(u8, len);
         defer self.allocator.free(buf);
-        try readClusterFromChain(self.allocator, self.dir, self.base_fd, self.layers, @intCast(cluster_index), buf);
+        try readClusterFromChain(self.allocator, self.dir, self.base, self.layers, @intCast(cluster_index), buf);
         try writeExact(self.overlay_fd, buf, offset);
     }
 };
@@ -475,13 +477,13 @@ pub fn copyLayerChain(allocator: std.mem.Allocator, source_dir: []const u8, targ
 pub fn readAt(
     allocator: std.mem.Allocator,
     dir: []const u8,
-    base_fd: std.c.fd_t,
+    base: block_source.BlockSource,
     layers: []const spore.DiskLayer,
     buf: []u8,
     offset: u64,
 ) Error!void {
     if (layers.len == 0) {
-        try readExact(base_fd, buf, offset);
+        try base.readAt(buf, offset);
         return;
     }
 
@@ -505,7 +507,7 @@ pub fn readAt(
 
         const cluster_buf = try allocator.alloc(u8, cluster_len);
         defer allocator.free(cluster_buf);
-        try readClusterFromChain(allocator, dir, base_fd, layers, logical_cluster, cluster_buf);
+        try readClusterFromChain(allocator, dir, base, layers, logical_cluster, cluster_buf);
         @memcpy(buf[cursor..][0..span_len], cluster_buf[@intCast(cluster_offset)..][0..span_len]);
         cursor += span_len;
     }
@@ -524,7 +526,7 @@ pub fn diskLayerPath(allocator: std.mem.Allocator, dir: []const u8, layer_ref: [
 fn readClusterFromChain(
     allocator: std.mem.Allocator,
     dir: []const u8,
-    base_fd: std.c.fd_t,
+    base: block_source.BlockSource,
     layers: []const spore.DiskLayer,
     logical_cluster: u64,
     target: []u8,
@@ -544,7 +546,7 @@ fn readClusterFromChain(
     }
 
     const offset = std.math.mul(u64, logical_cluster, layers[0].cluster_size) catch return error.BadManifest;
-    try readExact(base_fd, target, offset);
+    try base.readAt(target, offset);
 }
 
 fn readDiskObject(allocator: std.mem.Allocator, dir: []const u8, digest: []const u8, target: []u8) Error!void {
@@ -697,7 +699,8 @@ test "sealed cow layer reads over immutable base" {
     const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
     defer _ = std.c.close(overlay_fd);
 
-    var disk = try cow_disk.CowDisk.init(arena, base_fd, overlay_fd, base_bytes.len, default_cluster_size);
+    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len).source();
+    var disk = try cow_disk.CowDisk.init(arena, base_source, overlay_fd, base_bytes.len, default_cluster_size);
     defer disk.deinit();
 
     const patch = [_]u8{0xAA} ** 512;
@@ -711,7 +714,7 @@ test "sealed cow layer reads over immutable base" {
     defer parsed.deinit();
     const layers = [_]spore.DiskLayer{parsed.value};
     var readback: [4096]u8 = undefined;
-    try readAt(arena, dir, base_fd, &layers, &readback, 0);
+    try readAt(arena, dir, base_source, &layers, &readback, 0);
     try std.testing.expectEqualSlices(u8, base_bytes[0..1024], readback[0..1024]);
     try std.testing.expectEqualSlices(u8, &patch, readback[1024..1536]);
     try std.testing.expectEqualSlices(u8, base_bytes[1536..4096], readback[1536..4096]);
@@ -735,7 +738,8 @@ test "zero dirty cluster overrides nonzero base" {
     const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
     defer _ = std.c.close(overlay_fd);
 
-    var disk = try cow_disk.CowDisk.init(arena, base_fd, overlay_fd, base_bytes.len, default_cluster_size);
+    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len).source();
+    var disk = try cow_disk.CowDisk.init(arena, base_source, overlay_fd, base_bytes.len, default_cluster_size);
     defer disk.deinit();
     const zeros = [_]u8{0} ** 4096;
     try disk.writeAt(&zeros, 0);
@@ -746,7 +750,7 @@ test "zero dirty cluster overrides nonzero base" {
 
     const layers = [_]spore.DiskLayer{sealed.layer};
     var readback: [4096]u8 = undefined;
-    try readAt(arena, dir, base_fd, &layers, &readback, 0);
+    try readAt(arena, dir, base_source, &layers, &readback, 0);
     try std.testing.expect(std.mem.allEqual(u8, &readback, 0));
 }
 
@@ -771,13 +775,14 @@ test "layered cow appends only the new active head" {
     defer _ = std.c.close(base_fd);
     const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
     defer _ = std.c.close(overlay_fd);
+    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len).source();
 
     const base_disk = spore.Disk{
         .device = .{ .mmio_slot = 0 },
         .size = base_bytes.len,
         .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     };
-    var first_head = try cow_disk.CowDisk.init(arena, base_fd, overlay_fd, base_bytes.len, default_cluster_size);
+    var first_head = try cow_disk.CowDisk.init(arena, base_source, overlay_fd, base_bytes.len, default_cluster_size);
     defer first_head.deinit();
     const first_patch = [_]u8{0x22} ** 4096;
     try first_head.writeAt(&first_patch, 0);
@@ -791,7 +796,7 @@ test "layered cow appends only the new active head" {
     const loaded_layers = try loadLayerChain(arena, parent_dir, first_disk);
     var second_overlay = try createTempOverlay(arena);
     defer second_overlay.deinit();
-    var second_head = try LayeredCowDisk.init(arena, parent_dir, base_fd, second_overlay.fd, first_disk, loaded_layers);
+    var second_head = try LayeredCowDisk.init(arena, parent_dir, base_source, second_overlay.fd, first_disk, loaded_layers);
     defer second_head.deinit();
 
     var inherited: [4096]u8 = undefined;
@@ -808,7 +813,7 @@ test "layered cow appends only the new active head" {
 
     const second_layers = try loadLayerChain(arena, child_dir, second_disk);
     var readback: [8192]u8 = undefined;
-    try readAt(arena, child_dir, base_fd, second_layers, &readback, 0);
+    try readAt(arena, child_dir, base_source, second_layers, &readback, 0);
     try std.testing.expectEqualSlices(u8, &first_patch, readback[0..4096]);
     try std.testing.expectEqualSlices(u8, &second_patch, readback[4096..8192]);
 }
@@ -831,7 +836,8 @@ test "sealing rejects corrupt preexisting objects" {
     const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
     defer _ = std.c.close(overlay_fd);
 
-    var disk = try cow_disk.CowDisk.init(arena, base_fd, overlay_fd, base_bytes.len, default_cluster_size);
+    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len).source();
+    var disk = try cow_disk.CowDisk.init(arena, base_source, overlay_fd, base_bytes.len, default_cluster_size);
     defer disk.deinit();
     const patch = [_]u8{0x44} ** 4096;
     try disk.writeAt(&patch, 0);
@@ -864,7 +870,8 @@ test "corrupt disk objects and layer indexes fail closed" {
     const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
     defer _ = std.c.close(overlay_fd);
 
-    var disk = try cow_disk.CowDisk.init(arena, base_fd, overlay_fd, base_bytes.len, default_cluster_size);
+    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len).source();
+    var disk = try cow_disk.CowDisk.init(arena, base_source, overlay_fd, base_bytes.len, default_cluster_size);
     defer disk.deinit();
     const patch = [_]u8{0x22} ** 4096;
     try disk.writeAt(&patch, 0);
@@ -877,7 +884,7 @@ test "corrupt disk objects and layer indexes fail closed" {
 
     const layers = [_]spore.DiskLayer{sealed.layer};
     var readback: [4096]u8 = undefined;
-    try std.testing.expectError(error.BadChunk, readAt(arena, dir, base_fd, &layers, &readback, 0));
+    try std.testing.expectError(error.BadChunk, readAt(arena, dir, base_source, &layers, &readback, 0));
 
     const layer_path = try diskLayerPath(arena, dir, sealed.layer_ref);
     try writeFileAll(layer_path, "{}");
