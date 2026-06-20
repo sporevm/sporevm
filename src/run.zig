@@ -1245,6 +1245,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, rootfsWritable(opts), opts.network);
     const request = try execRequestForRun(init, allocator, opts);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
+    if (resuming) stream.host_port = vsock.HostStream.deriveHostPort(request);
     if (opts.stream_output) stream.setOutputSink(null, runOutputSink);
     var capture_request = capture.Request{};
     var signal_registration: ?capture.SignalRegistration = null;
@@ -1597,6 +1598,18 @@ fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostSt
     const start_ms = stream.start_ms orelse 0;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
+    std.log.debug(
+        "run exec probe timing: attach_ms={?} connect_request_delivered_ms={?} connect_ms={?} request_delivered_ms={?} first_output_ms={?} guest_timing_ms={?} response_ms={?}",
+        .{
+            stream.attach_ms,
+            stream.connect_request_delivered_ms,
+            stream.connect_ms,
+            stream.request_delivered_ms,
+            stream.first_output_ms,
+            stream.guest_timing_ms,
+            stream.response_ms,
+        },
+    );
     return .{
         .backend = backend,
         .start_ms = start_ms,
