@@ -167,6 +167,7 @@ mint child spores with `spore fork`, then resume them individually or through
 - `mise run smoke`
 - `mise run smoke:counter-fanout`
 - `mise run smoke:rootfs-fanout`
+- `mise run smoke:live-rootfs-fanout`
 - `scripts/smoke-run-oci-rootfs.sh -- /bin/echo hi`
 
 ## Resolved Decisions

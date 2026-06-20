@@ -108,6 +108,7 @@ mise run smoke:run-net-dns
 mise run smoke:run-capture
 mise run smoke:counter-fanout
 mise run smoke:rootfs-fanout
+mise run smoke:live-rootfs-fanout
 mise run smoke:writable-rootfs
 ```
 
@@ -120,7 +121,9 @@ on the selected backend. `smoke:run-net-config` checks the experimental
 `spore run --net` static guest link setup, and `smoke:run-net-dns` checks DNS
 proxying through the managed gateway. `smoke:counter-fanout` and
 `smoke:rootfs-fanout` are opt-in demo smokes; the rootfs fan-out smoke builds a
-published Ruby OCI image and resumes forked children in parallel.
+published Ruby OCI image and runs fresh commands in forked children in parallel.
+`smoke:live-rootfs-fanout` captures an already-running Ruby rootfs workload and
+checks resumed children can discover their distinct fan-out identity.
 `smoke:writable-rootfs` verifies local writable rootfs disk layers across
 capture, fork divergence, bundle pack/unpack, and `run --from`.
 
@@ -318,6 +321,8 @@ are available when a change touches fan-out or rootfs behavior:
   parallel product resume fan-out.
 - `mise run smoke:rootfs-fanout`: exercise OCI rootfs capture, fork, and
   parallel `spore run --from` child execution.
+- `mise run smoke:live-rootfs-fanout`: exercise live OCI rootfs capture, fork,
+  and resumed child identity discovery.
 - `mise run smoke:writable-rootfs`: exercise writable rootfs layer capture,
   fork divergence, bundle pack/unpack, append, and replay through
   `spore run --from`.
