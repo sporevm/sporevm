@@ -179,6 +179,11 @@ within the local `spore fork --count N --out DIR` batch and
 parallel fields. Distributed offsets, remote ranges, and global shard numbering
 are deferred.
 
+Live rootfs fan-out resumes the already-running process tree. Such processes
+should discover child identity by reading `/run/sporevm/env` or
+`/run/sporevm/generation.json` after resume, not by expecting their inherited
+environment to change.
+
 Validate the tag-to-rootfs-to-run path with the local smoke script:
 
 ```bash

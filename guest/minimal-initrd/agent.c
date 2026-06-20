@@ -12,9 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -39,6 +41,16 @@
 #define SPORE_NET_GATEWAY_IP "100.96.0.1"
 #define SPORE_NET_NETMASK "255.255.255.252"
 #define SPORE_NET_RESOLV_CONF "nameserver 100.96.0.1\n"
+#define GEN_BASE 0x0c001000ULL
+#define GEN_WINDOW_SIZE 0x1000U
+#define GEN_MAGIC 0x4e475053U
+#define GEN_IRQ_GENERATION_CHANGED 1U
+#define REG_MAGIC 0x000U
+#define REG_PARAMS_OFFSET 0x008U
+#define REG_PARAMS_SIZE 0x00cU
+#define REG_IRQ_STATUS 0x010U
+#define REG_IRQ_ACK 0x014U
+#define REG_GENERATION 0x018U
 
 struct sockaddr_vm {
   sa_family_t svm_family;
@@ -83,6 +95,12 @@ struct client {
   int fd;
   uint64_t stdout_offset;
   uint64_t stderr_offset;
+};
+
+struct generation_monitor {
+  volatile uint8_t *base;
+  uint64_t last_generation;
+  int unavailable;
 };
 
 static int64_t now_ms(void) {
@@ -489,6 +507,88 @@ static int write_generation_files(const char *root, const char *params) {
   if (parse_string_field(params, "hostname", text, sizeof(text)) > 0) env_append(env, &env_len, "SPORE_HOSTNAME", text);
 
   return write_file_atomic(env_path, env, env_len);
+}
+
+static volatile uint8_t *generation_map(void) {
+  mkdir("/dev", 0755);
+  if (mknod("/dev/mem", S_IFCHR | 0600, makedev(1, 1)) != 0 && errno != EEXIST) {
+    dprintf(2, "spore generation: mknod /dev/mem failed errno=%d\n", errno);
+    return NULL;
+  }
+  int fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+  if (fd < 0) {
+    dprintf(2, "spore generation: open /dev/mem failed errno=%d\n", errno);
+    return NULL;
+  }
+  void *mapped = mmap(NULL, GEN_WINDOW_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)GEN_BASE);
+  close(fd);
+  if (mapped == MAP_FAILED) {
+    dprintf(2, "spore generation: mmap failed errno=%d\n", errno);
+    return NULL;
+  }
+  return (volatile uint8_t *)mapped;
+}
+
+static uint32_t mmio_read32(volatile uint8_t *base, unsigned offset) {
+  volatile uint32_t *p = (volatile uint32_t *)(base + offset);
+  return *p;
+}
+
+static uint64_t mmio_read64(volatile uint8_t *base, unsigned offset) {
+  uint64_t lo = mmio_read32(base, offset);
+  uint64_t hi = mmio_read32(base, offset + 4);
+  return lo | (hi << 32);
+}
+
+static void mmio_write32(volatile uint8_t *base, unsigned offset, uint32_t value) {
+  volatile uint32_t *p = (volatile uint32_t *)(base + offset);
+  *p = value;
+}
+
+static void apply_generation_identity(const char *params) {
+  char hostname[128];
+  if (parse_string_field(params, "hostname", hostname, sizeof(hostname)) > 0 && hostname[0] != '\0') {
+    (void)sethostname(hostname, strlen(hostname));
+  }
+}
+
+static void poll_generation(struct generation_monitor *monitor, const char *root) {
+  if (monitor->unavailable) return;
+  if (monitor->base == NULL) {
+    monitor->base = generation_map();
+    if (monitor->base == NULL) {
+      monitor->unavailable = 1;
+      return;
+    }
+  }
+
+  if (mmio_read32(monitor->base, REG_MAGIC) != GEN_MAGIC) return;
+  uint32_t params_offset = mmio_read32(monitor->base, REG_PARAMS_OFFSET);
+  uint32_t params_size = mmio_read32(monitor->base, REG_PARAMS_SIZE);
+  if (params_offset >= GEN_WINDOW_SIZE || params_size > GEN_WINDOW_SIZE - params_offset) return;
+
+  uint64_t generation = mmio_read64(monitor->base, REG_GENERATION);
+  if (generation == monitor->last_generation) return;
+
+  char params[GEN_PARAMS_MAX];
+  size_t limit = params_size;
+  if (limit >= sizeof(params)) limit = sizeof(params) - 1;
+  size_t i = 0;
+  for (; i < limit; i++) {
+    params[i] = (char)*(monitor->base + params_offset + i);
+    if (params[i] == '\0') break;
+  }
+  params[i] = '\0';
+  if (params[0] == '\0') return;
+
+  if (write_generation_files(root, params) == 0) {
+    uint32_t irq_status = mmio_read32(monitor->base, REG_IRQ_STATUS);
+    apply_generation_identity(params);
+    monitor->last_generation = generation;
+    if ((irq_status & GEN_IRQ_GENERATION_CHANGED) != 0) {
+      mmio_write32(monitor->base, REG_IRQ_ACK, GEN_IRQ_GENERATION_CHANGED);
+    }
+  }
 }
 
 static int set_nonblock(int fd) {
@@ -986,6 +1086,7 @@ static void accept_request(int listener, struct session *session, struct client 
       close_client(client);
       return;
     }
+    apply_generation_identity(request.generation_params);
     (void)send_exit_frame(client->fd, 0);
     close_client(client);
     return;
@@ -1081,8 +1182,16 @@ int main(void) {
   struct client client;
   memset(&client, 0, sizeof(client));
   client.fd = -1;
+  struct generation_monitor generation;
+  memset(&generation, 0, sizeof(generation));
+  generation.last_generation = UINT64_MAX;
+  const char *generation_root = use_rootfs ? "/mnt/rootfs" : "";
 
   for (;;) {
+    if (!use_rootfs || rootfs_ready) {
+      poll_generation(&generation, generation_root);
+    }
+
     struct pollfd fds[4];
     int roles[4];
     nfds_t nfds = 0;

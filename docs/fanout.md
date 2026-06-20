@@ -52,3 +52,10 @@ The generation JSON also includes `parallel_index`, `parallel_count`,
 `fork_index`, `fork_count`, `fork_batch_id`, and `vm_id`. `fork_index` and
 `fork_count` are batch-local metadata and match the parallel fields for this
 local-only slice. Do not infer global shard positions from these fields.
+
+For live captures, already-running processes do not get a new environment block
+on resume. They should read `/run/sporevm/env` or
+`/run/sporevm/generation.json` after fan-out; the guest agent refreshes those
+files from the generation device once the resumed guest is actually running.
+`spore run --from` remains the completed-base path for starting a fresh command
+inside a child spore.
