@@ -164,7 +164,8 @@ builds can opt in with:
 SPOREVM_RUN_BENCHMARKS=1
 ```
 
-It defaults to the broader `comparison` profile. Override with
+It runs on `cleanroom-mac` by default so the suite has a supported HVF backend,
+and defaults to the broader `comparison` profile. Override with
 `SPOREVM_BENCHMARK_PROFILE=ci` for a short cold/warm run, or `full` when a build
 should pay for the full benchmark matrix.
 
@@ -172,4 +173,4 @@ If `SPOREVM_BENCHMARK_BASELINE` points to a summary JSON available in the job
 workspace, the step compares the new `latest-summary.json` against that
 baseline. Baselines should come from the same profile unless the comparator is
 run by hand with a narrower `--only` list. Regardless of comparison result, the
-step uploads `zig-cache/sporevm-benchmarks/**/*` as artifacts.
+step uploads benchmark JSON, logs, and rootfs metadata as artifacts.
