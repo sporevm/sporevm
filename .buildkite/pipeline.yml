@@ -35,7 +35,7 @@ steps:
       queue: cleanroom-mac
 
   - label: ":chart_with_upwards_trend: Benchmark Suite"
-    if: build.env("SPOREVM_RUN_BENCHMARKS") == "1"
+    if: build.branch == "main" || build.env("SPOREVM_RUN_BENCHMARKS") == "1"
     command: |
       upload_benchmark_artifacts() {
         buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/**/*" || true
@@ -44,7 +44,7 @@ steps:
 
       mise install
       mise run build
-      scripts/benchmark-sporevm-suite.py --profile "${SPOREVM_BENCHMARK_PROFILE:-ci}" --no-build
+      scripts/benchmark-sporevm-suite.py --profile "${SPOREVM_BENCHMARK_PROFILE:-comparison}" --no-build
       if [[ -n "${SPOREVM_BENCHMARK_BASELINE:-}" ]]; then
         scripts/compare-sporevm-benchmarks.py "${SPOREVM_BENCHMARK_BASELINE}" zig-cache/sporevm-benchmarks/latest-summary.json
       fi

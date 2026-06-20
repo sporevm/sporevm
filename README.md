@@ -143,8 +143,8 @@ publishing.
 
 Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).
 `mise run benchmark:ci` writes short cold/warm TTI JSONL, a summary JSON, and
-logs under `zig-cache/sporevm-benchmarks/` for CI artifact upload and regression
-comparison. Use `mise run benchmark:comparison` for the heavier
+logs under `zig-cache/sporevm-benchmarks/`. The Buildkite post-merge benchmark
+step defaults to `benchmark:comparison` for the heavier
 distribution/writable-rootfs matrix.
 
 KVM work needs an aarch64 Linux host with KVM. Hypervisor.framework work needs

@@ -24,8 +24,8 @@ scripts/benchmark-sporevm-suite.py --profile full
 - `ci`: short cold and warm TTI sequential/burst runs, suitable for regular CI
   artifacts.
 - `comparison`: small sequential and burst runs plus one SQLite and
-  package-style writable-rootfs pass, suitable for manual or nightly comparison
-  artifacts.
+  package-style writable-rootfs pass, suitable for post-merge, manual, or
+  nightly comparison artifacts.
 - `full`: 100-way sequential, staggered, and burst runs matching the public TTI
   shape, plus three writable-rootfs iterations per workload.
 
@@ -157,15 +157,16 @@ benchmark data format.
 
 ## Buildkite
 
-The Buildkite benchmark step is opt-in:
+The Buildkite benchmark step runs automatically on `main` after merge. Non-main
+builds can opt in with:
 
 ```console
 SPOREVM_RUN_BENCHMARKS=1
 ```
 
-It defaults to the short `ci` profile. Override with
-`SPOREVM_BENCHMARK_PROFILE=smoke`, `comparison`, or `full` when a build should
-pay for broader benchmark coverage.
+It defaults to the broader `comparison` profile. Override with
+`SPOREVM_BENCHMARK_PROFILE=ci` for a short cold/warm run, or `full` when a build
+should pay for the full benchmark matrix.
 
 If `SPOREVM_BENCHMARK_BASELINE` points to a summary JSON available in the job
 workspace, the step compares the new `latest-summary.json` against that
