@@ -36,11 +36,35 @@ steps:
 
   - wait
 
-  - label: ":rocket: Publish release"
+  - label: ":package: Build Linux ARM64 release archive"
+    key: "release-linux-arm64"
     if: build.tag != null
     command: |
       mise install
-      scripts/ci-buildkite-release.sh
+      scripts/build-release-assets.sh --target linux-arm64 --output dist
+    artifact_paths:
+      - "dist/spore_Linux_arm64.tar.gz"
+    plugins:
+      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          version: "2026.5.12"
+    cache:
+      paths:
+        - "~/.local/share/mise"
+        - "~/.cache/mise"
+        - "~/.local/state/mise"
+      size: "20g"
+      name: "mise-cache"
+    agents:
+      queue: cleanroom
+
+  - label: ":package: Build macOS ARM64 release archive"
+    key: "release-darwin-arm64"
+    if: build.tag != null
+    command: |
+      mise install
+      scripts/build-release-assets.sh --target darwin-arm64 --output dist
+    artifact_paths:
+      - "dist/spore_Darwin_arm64.tar.gz"
     plugins:
       - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
           version: "2026.5.12"
@@ -53,3 +77,14 @@ steps:
       name: "mise-cache"
     agents:
       queue: cleanroom-mac
+
+  - label: ":rocket: Publish release"
+    key: "release-publish"
+    depends_on:
+      - "release-linux-arm64"
+      - "release-darwin-arm64"
+    if: build.tag != null
+    command: |
+      scripts/ci-buildkite-release.sh
+    agents:
+      queue: hosted
