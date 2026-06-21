@@ -71,12 +71,11 @@ printf 'live rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}"
 ruby_args=(
   /usr/local/bin/ruby
   -e 'STDOUT.sync=true;STDERR.sync=true;puts "ruby live ready";printed=false;tick=0'
-  -e 'loop do'
-  -e 'env={};begin;File.readlines("/run/sporevm/env").each{|l|k,v=l.strip.split("=",2);env[k]=v};rescue Errno::ENOENT;end'
-  -e 'if !printed&&env["SPORE_PARALLEL_JOB"]&&env["SPORE_PARALLEL_JOB_COUNT"]'
-  -e 'host=(File.read("/proc/sys/kernel/hostname").strip rescue "unknown");puts "ruby live parallel #{env["SPORE_PARALLEL_JOB"]}/#{env["SPORE_PARALLEL_JOB_COUNT"]} host=#{host}";printed=true'
-  -e 'end;puts "ruby live tick #{tick}";tick+=1;sleep 1'
-  -e 'end'
+  -e 'def e;begin;File.readlines("/run/sporevm/env").to_h{|l|l.strip.split("=",2)};rescue Errno::ENOENT;{};end;end'
+  -e 'loop do;env=e;ready=%w[SPORE_PARALLEL_JOB SPORE_PARALLEL_JOB_COUNT SPORE_GENERATION SPORE_PARENT_GENERATION SPORE_FORK_BATCH_ID].all?{|k|env[k]}'
+  -e 'if !printed&&ready;gen=env["SPORE_GENERATION"].to_i;parent=env["SPORE_PARENT_GENERATION"].to_i;if gen>parent'
+  -e 'host=(File.read("/proc/sys/kernel/hostname").strip rescue "unknown");puts "ruby live generation #{gen} parent=#{parent} batch=#{env["SPORE_FORK_BATCH_ID"]}"'
+  -e 'puts "ruby live parallel #{env["SPORE_PARALLEL_JOB"]}/#{env["SPORE_PARALLEL_JOB_COUNT"]} host=#{host}";printed=true;end;end;puts "ruby live tick #{tick}";tick+=1;sleep 1;end'
 )
 
 "${spore_bin}" run \
@@ -152,6 +151,11 @@ for child in "${children[@]}"; do
     tail -200 "${fanout_stdout}" >&2 || true
     cat "${fanout_stderr}" >&2 || true
     die "child ${child_name} did not observe distinct live fanout identity"
+  fi
+  if ! grep -Eaq "^\[${child_name}\] ruby live generation [0-9]+ parent=[0-9]+ batch=[0-9a-f]{32}" "${fanout_stdout}"; then
+    tail -200 "${fanout_stdout}" >&2 || true
+    cat "${fanout_stderr}" >&2 || true
+    die "child ${child_name} did not observe fresh live generation metadata"
   fi
 done
 

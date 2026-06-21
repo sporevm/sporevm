@@ -169,21 +169,30 @@ tmpfs at `/run/sporevm/generation.json` and writes env-style helper lines to
 ```text
 SPORE_PARALLEL_JOB=0
 SPORE_PARALLEL_JOB_COUNT=5
+SPORE_GENERATION=42
+SPORE_PARENT_GENERATION=41
 SPORE_VM_ID=spore-...
 SPORE_FORK_BATCH_ID=...
+SPORE_RESUME_TIME_UNIX_NS=...
 ```
 
 For the first local fan-out contract, `SPORE_PARALLEL_JOB` is the child index
 within the local `spore fork --count N --out DIR` batch and
 `SPORE_PARALLEL_JOB_COUNT` is `N`. The generation JSON also retains
-`fork_index` and `fork_count` as batch-local fields; they currently match the
-parallel fields. Distributed offsets, remote ranges, and global shard numbering
-are deferred.
+`fork_index`, `fork_count`, `generation`, `parent_generation`, and resume-time
+fields; the fork fields currently match the parallel fields. Distributed
+offsets, remote ranges, and global shard numbering are deferred.
 
 Live rootfs fan-out resumes the already-running process tree. Such processes
 should discover child identity by reading `/run/sporevm/env` or
 `/run/sporevm/generation.json` after resume, not by expecting their inherited
-environment to change.
+environment to change. `/run/sporevm` is runtime metadata, not rootfs image
+content, and a live snapshot can contain older files until the guest agent
+refreshes them. Sharded live workloads should wait for fresh child generation
+metadata before starting work; for a pre-fork parent capture, require the fork
+batch, parallel fields, and `SPORE_GENERATION > SPORE_PARENT_GENERATION`.
+Harnesses that can read the child manifest can compare the exact expected
+generation.
 
 Validate the tag-to-rootfs-to-run path with the local smoke script:
 

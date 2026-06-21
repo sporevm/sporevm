@@ -169,6 +169,11 @@ static int path_is_dir(const char *path) {
   return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+static const char *generation_root_path(int use_rootfs, int rootfs_ready) {
+  if (use_rootfs && rootfs_ready) return "/mnt/rootfs";
+  return "";
+}
+
 static int write_file_atomic(const char *path, const char *data, size_t len);
 
 static int mount_if_dir(const char *source, const char *target, const char *fstype, unsigned long flags, const char *data, char *error, size_t cap) {
@@ -500,11 +505,13 @@ static int write_generation_files(const char *root, const char *params) {
   if (have_fork_count > 0) env_append_u64(env, &env_len, "SPORE_FORK_COUNT", fork_count);
   if (parse_u64_field(params, "parent_generation", &value) > 0) env_append_u64(env, &env_len, "SPORE_PARENT_GENERATION", value);
   if (parse_u64_field(params, "generation", &value) > 0) env_append_u64(env, &env_len, "SPORE_GENERATION", value);
+  if (parse_u64_field(params, "resume_time_unix_ns", &value) > 0) env_append_u64(env, &env_len, "SPORE_RESUME_TIME_UNIX_NS", value);
 
   char text[128];
   if (parse_string_field(params, "vm_id", text, sizeof(text)) > 0) env_append(env, &env_len, "SPORE_VM_ID", text);
   if (parse_string_field(params, "fork_batch_id", text, sizeof(text)) > 0) env_append(env, &env_len, "SPORE_FORK_BATCH_ID", text);
   if (parse_string_field(params, "hostname", text, sizeof(text)) > 0) env_append(env, &env_len, "SPORE_HOSTNAME", text);
+  if (parse_string_field(params, "resume_entropy_seed", text, sizeof(text)) > 0) env_append(env, &env_len, "SPORE_RESUME_ENTROPY_SEED", text);
 
   return write_file_atomic(env_path, env, env_len);
 }
@@ -1080,7 +1087,7 @@ static void accept_request(int listener, struct session *session, struct client 
       close_client(client);
       return;
     }
-    const char *root = use_rootfs ? "/mnt/rootfs" : "";
+    const char *root = generation_root_path(use_rootfs, rootfs_ready);
     if (write_generation_files(root, request.generation_params) != 0) {
       (void)send_error_exit(client->fd, 126, "spore run: generation helper write failed\n");
       close_client(client);
@@ -1185,7 +1192,7 @@ int main(void) {
   struct generation_monitor generation;
   memset(&generation, 0, sizeof(generation));
   generation.last_generation = UINT64_MAX;
-  const char *generation_root = use_rootfs ? "/mnt/rootfs" : "";
+  const char *generation_root = generation_root_path(use_rootfs, rootfs_ready);
 
   for (;;) {
     if (!use_rootfs || rootfs_ready) {
