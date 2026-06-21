@@ -38,6 +38,11 @@ pub const PreloadResult = struct {
     index_bytes: usize,
 };
 
+pub const InstallResult = struct {
+    cache_hit: bool,
+    bytes_fetched: u64,
+};
+
 pub const Stats = struct {
     chunk_accesses: u64 = 0,
     cache_hits: u64 = 0,
@@ -336,9 +341,79 @@ pub fn storageComplete(
             error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
             else => |e| return e,
         };
-        if (stat.size != try storageChunkLen(storage, entry.logical_chunk)) return false;
+        const expected_size = try storageChunkLen(storage, entry.logical_chunk);
+        if (stat.size != @as(u64, @intCast(expected_size))) return false;
     }
     return true;
+}
+
+pub fn readVerifiedStorageIndexPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    storage: spore.RootfsStorage,
+) ![]u8 {
+    const bytes = try readFileAll(allocator, path, rootfs_index.max_index_bytes);
+    errdefer allocator.free(bytes);
+    var parsed = try rootfs_index.parseRootfsBlockIndex(allocator, bytes, storage);
+    parsed.deinit();
+    return bytes;
+}
+
+pub fn readVerifiedChunkPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    digest: []const u8,
+    expected_size: usize,
+) ![]u8 {
+    const data = try readFileExact(allocator, path, expected_size);
+    errdefer allocator.free(data);
+    try verifyDigestBytes(digest, data);
+    return data;
+}
+
+pub fn installStorageIndexPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_path: []const u8,
+    data: []const u8,
+    storage: spore.RootfsStorage,
+) !InstallResult {
+    const cache_parent = std.fs.path.dirname(cache_path) orelse return error.IoFailed;
+    try ensureDirPath(io, cache_parent);
+    if (try pathExistsNoSymlink(io, cache_path)) {
+        const existing = try readVerifiedStorageIndexPath(allocator, cache_path, storage);
+        allocator.free(existing);
+        return .{ .cache_hit = true, .bytes_fetched = 0 };
+    }
+    var parsed = try rootfs_index.parseRootfsBlockIndex(allocator, data, storage);
+    parsed.deinit();
+    try writeFileAtomic(io, allocator, cache_path, data);
+    const installed = try readVerifiedStorageIndexPath(allocator, cache_path, storage);
+    defer allocator.free(installed);
+    return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
+}
+
+pub fn installChunkPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_path: []const u8,
+    data: []const u8,
+    digest: []const u8,
+    expected_size: usize,
+) !InstallResult {
+    const cache_parent = std.fs.path.dirname(cache_path) orelse return error.IoFailed;
+    try ensureDirPath(io, cache_parent);
+    if (try pathExistsNoSymlink(io, cache_path)) {
+        const existing = try readVerifiedChunkPath(allocator, cache_path, digest, expected_size);
+        allocator.free(existing);
+        return .{ .cache_hit = true, .bytes_fetched = 0 };
+    }
+    if (data.len != expected_size) return error.BadChunk;
+    try verifyDigestBytes(digest, data);
+    try writeFileAtomic(io, allocator, cache_path, data);
+    const installed = try readVerifiedChunkPath(allocator, cache_path, digest, expected_size);
+    defer allocator.free(installed);
+    return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
 }
 
 pub fn manifestIndexPath(allocator: std.mem.Allocator, cache_root: []const u8, index_digest: []const u8) ![]const u8 {
@@ -422,10 +497,11 @@ fn chunkCount(size: u64, chunk_size: u64) !u64 {
     return (try std.math.add(u64, size, chunk_size - 1)) / chunk_size;
 }
 
-fn storageChunkLen(storage: spore.RootfsStorage, logical_chunk: u64) !u64 {
+pub fn storageChunkLen(storage: spore.RootfsStorage, logical_chunk: u64) !usize {
     const start = std.math.mul(u64, logical_chunk, storage.chunk_size) catch return error.BadManifest;
     if (start >= storage.logical_size) return error.BadManifest;
-    return @min(storage.chunk_size, storage.logical_size - start);
+    const len = @min(storage.chunk_size, storage.logical_size - start);
+    return std.math.cast(usize, len) orelse error.BadManifest;
 }
 
 fn isZero(bytes: []const u8) bool {
@@ -488,6 +564,14 @@ fn fstatRegularSize(fd: std.c.fd_t) SourceError!usize {
     }
 }
 
+fn pathExistsNoSymlink(io: Io, path: []const u8) !bool {
+    _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+        else => |e| return e,
+    };
+    return true;
+}
+
 fn objectMatches(allocator: std.mem.Allocator, path: []const u8, id: chunk.ChunkId, expected_size: usize) !bool {
     const data = readFileExact(allocator, path, expected_size) catch |err| switch (err) {
         error.MissingChunk, error.BadChunk, error.ShortRead => return false,
@@ -495,6 +579,12 @@ fn objectMatches(allocator: std.mem.Allocator, path: []const u8, id: chunk.Chunk
     };
     defer allocator.free(data);
     return id.matches(data);
+}
+
+fn verifyDigestBytes(digest: []const u8, data: []const u8) !void {
+    const hex = try rootfsDigestHex(digest);
+    const id = chunk.ChunkId.fromHex(hex) catch return error.BadManifest;
+    if (!id.matches(data)) return error.BadChunk;
 }
 
 fn removeStaleObject(io: Io, path: []const u8) !void {

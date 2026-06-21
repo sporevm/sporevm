@@ -1546,7 +1546,7 @@ fn packRootfsStorageIndexed(
     }
 
     const source_index_path = rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
-    const index_bytes = try readFileAllNoSymlink(allocator, source_index_path, rootfs_block_index.max_index_bytes);
+    const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
     defer allocator.free(index_bytes);
     const parsed_index = rootfs_block_index.parseRootfsBlockIndex(allocator, index_bytes, storage) catch |err| return rootfsError(err);
     defer parsed_index.deinit();
@@ -1560,9 +1560,9 @@ fn packRootfsStorageIndexed(
     var object_bytes: u64 = 0;
     var object_count: usize = 0;
     for (parsed_index.value.chunks) |chunk_entry| {
-        const expected_size = try rootfsStorageChunkLen(storage, chunk_entry.logical_chunk);
+        const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
         const source_object_path = rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest) catch |err| return rootfsError(err);
-        const object_data = try readVerifiedRootfsCasChunkPath(allocator, source_object_path, chunk_entry.digest, expected_size);
+        const object_data = rootfs_cas.readVerifiedChunkPath(allocator, source_object_path, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
         defer allocator.free(object_data);
         object_count += 1;
         object_bytes += @intCast(object_data.len);
@@ -1688,7 +1688,7 @@ fn unpackRootfsStorageIndexed(
     if (!rootfsStorageEntryMatches(entry, storage)) return error.BadManifest;
 
     const source_index_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, entry.index_path });
-    const index_bytes = try readVerifiedRootfsStorageIndexPath(allocator, source_index_path, storage);
+    const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
     defer allocator.free(index_bytes);
     const parsed_index = rootfs_block_index.parseRootfsBlockIndex(allocator, index_bytes, storage) catch |err| return rootfsError(err);
     defer parsed_index.deinit();
@@ -1698,7 +1698,7 @@ fn unpackRootfsStorageIndexed(
         .artifact_count = 1,
         .payload_bytes = @intCast(index_bytes.len),
     };
-    const installed_index = try installRootfsCasIndexPath(allocator, options.io, cache_index_path, index_bytes, storage);
+    const installed_index = rootfs_cas.installStorageIndexPath(allocator, options.io, cache_index_path, index_bytes, storage) catch |err| return rootfsError(err);
     if (installed_index.cache_hit) {
         result.cache_hit_count += 1;
         result.bytes_reused += @intCast(index_bytes.len);
@@ -1710,13 +1710,13 @@ fn unpackRootfsStorageIndexed(
     var object_count: usize = 0;
     var object_bytes: u64 = 0;
     for (parsed_index.value.chunks) |chunk_entry| {
-        const expected_size = try rootfsStorageChunkLen(storage, chunk_entry.logical_chunk);
+        const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
         const source_object_rel_path = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
         const source_object_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, source_object_rel_path });
-        const object_data = try readVerifiedRootfsCasChunkPath(allocator, source_object_path, chunk_entry.digest, expected_size);
+        const object_data = rootfs_cas.readVerifiedChunkPath(allocator, source_object_path, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
         defer allocator.free(object_data);
         const cache_object_path = rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest) catch |err| return rootfsError(err);
-        const installed_object = try installRootfsCasChunkPath(allocator, options.io, cache_object_path, object_data, chunk_entry.digest, expected_size);
+        const installed_object = rootfs_cas.installChunkPath(allocator, options.io, cache_object_path, object_data, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
         if (installed_object.cache_hit) {
             result.cache_hit_count += 1;
             result.bytes_reused += @intCast(object_data.len);
@@ -1807,13 +1807,6 @@ fn rootfsStorageObjectRelPath(allocator: std.mem.Allocator, object_digest: []con
     return std.fmt.allocPrint(allocator, "{s}/{s}.chunk", .{ rootfs_blake3_objects_dir_path, hex }) catch return error.OutOfMemory;
 }
 
-fn rootfsStorageChunkLen(storage: spore.RootfsStorage, logical_chunk: u64) Error!usize {
-    const start = std.math.mul(u64, logical_chunk, storage.chunk_size) catch return error.BadManifest;
-    if (start >= storage.logical_size) return error.BadManifest;
-    const len = @min(storage.chunk_size, storage.logical_size - start);
-    return std.math.cast(usize, len) orelse error.BadManifest;
-}
-
 fn loadRootfsBlockIndexForEntry(
     allocator: std.mem.Allocator,
     bundle_dir: []const u8,
@@ -1841,7 +1834,7 @@ fn validateRootfsStoragePayloadStats(
     var object_count: usize = 0;
     var object_bytes: u64 = 0;
     for (index.chunks) |chunk_entry| {
-        const expected_size = try rootfsStorageChunkLen(storage, chunk_entry.logical_chunk);
+        const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
         object_count += 1;
         object_bytes = std.math.add(u64, object_bytes, @intCast(expected_size)) catch return error.BadManifest;
     }
@@ -2754,6 +2747,9 @@ fn rootfsError(err: anyerror) Error {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.BadManifest => error.BadManifest,
+        error.BadChunk,
+        error.MissingChunk,
+        error.ShortRead,
         error.RootFSDigestMismatch,
         error.RootFSDigestCacheMiss,
         error.RootFSOpenFailed,
@@ -2872,102 +2868,6 @@ fn fstatRegularSize(fd: std.c.fd_t) Error!usize {
         if (stat.size < 0) return error.IoFailed;
         return std.math.cast(usize, stat.size) orelse error.BadChunk;
     }
-}
-
-fn readVerifiedRootfsStorageIndexPath(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    storage: spore.RootfsStorage,
-) Error![]u8 {
-    const bytes = try readFileAllNoSymlink(allocator, path, rootfs_block_index.max_index_bytes);
-    errdefer allocator.free(bytes);
-    const parsed = rootfs_block_index.parseRootfsBlockIndex(allocator, bytes, storage) catch |err| return rootfsError(err);
-    parsed.deinit();
-    return bytes;
-}
-
-fn readVerifiedRootfsCasChunkPath(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    digest: []const u8,
-    expected_size: usize,
-) Error![]u8 {
-    const data = try readFileAllNoSymlink(allocator, path, expected_size);
-    errdefer allocator.free(data);
-    if (data.len != expected_size) return error.BadChunk;
-    try verifyRootfsDigestBytes(digest, data);
-    return data;
-}
-
-fn verifyRootfsDigestBytes(digest: []const u8, data: []const u8) Error!void {
-    const hex = try spore.diskDigestHex(digest);
-    const id = chunklib.ChunkId.fromHex(hex) catch return error.BadManifest;
-    if (!id.matches(data)) return error.BadChunk;
-}
-
-const RootfsCasInstallResult = struct {
-    cache_hit: bool,
-    bytes_fetched: u64,
-};
-
-fn installRootfsCasIndexPath(
-    allocator: std.mem.Allocator,
-    io: Io,
-    cache_path: []const u8,
-    data: []const u8,
-    storage: spore.RootfsStorage,
-) Error!RootfsCasInstallResult {
-    const cache_parent = std.fs.path.dirname(cache_path) orelse return error.IoFailed;
-    try ensureDirPath(io, cache_parent);
-    if (try pathExistsNoSymlink(io, cache_path)) {
-        const existing = try readVerifiedRootfsStorageIndexPath(allocator, cache_path, storage);
-        allocator.free(existing);
-        return .{ .cache_hit = true, .bytes_fetched = 0 };
-    }
-    const parsed = rootfs_block_index.parseRootfsBlockIndex(allocator, data, storage) catch |err| return rootfsError(err);
-    parsed.deinit();
-    try writeRootfsCasCacheFileAtomic(allocator, io, cache_path, data);
-    const installed = try readVerifiedRootfsStorageIndexPath(allocator, cache_path, storage);
-    defer allocator.free(installed);
-    return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
-}
-
-fn installRootfsCasChunkPath(
-    allocator: std.mem.Allocator,
-    io: Io,
-    cache_path: []const u8,
-    data: []const u8,
-    digest: []const u8,
-    expected_size: usize,
-) Error!RootfsCasInstallResult {
-    const cache_parent = std.fs.path.dirname(cache_path) orelse return error.IoFailed;
-    try ensureDirPath(io, cache_parent);
-    if (try pathExistsNoSymlink(io, cache_path)) {
-        const existing = try readVerifiedRootfsCasChunkPath(allocator, cache_path, digest, expected_size);
-        allocator.free(existing);
-        return .{ .cache_hit = true, .bytes_fetched = 0 };
-    }
-    if (data.len != expected_size) return error.BadChunk;
-    try verifyRootfsDigestBytes(digest, data);
-    try writeRootfsCasCacheFileAtomic(allocator, io, cache_path, data);
-    const installed = try readVerifiedRootfsCasChunkPath(allocator, cache_path, digest, expected_size);
-    defer allocator.free(installed);
-    return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
-}
-
-fn writeRootfsCasCacheFileAtomic(
-    allocator: std.mem.Allocator,
-    io: Io,
-    cache_path: []const u8,
-    data: []const u8,
-) Error!void {
-    var temp_nonce_bytes: [8]u8 = undefined;
-    io.random(&temp_nonce_bytes);
-    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
-    const temp_path = std.fmt.allocPrintSentinel(allocator, "{s}.{x}.tmp", .{ cache_path, temp_nonce }, 0) catch return error.OutOfMemory;
-    defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
-    try writeFileExclusive(temp_path, data, 0o444);
-    try renamePath(io, temp_path, cache_path);
 }
 
 fn readFileRange(allocator: std.mem.Allocator, path: [:0]const u8, offset: u64, size: u64) Error![]u8 {
