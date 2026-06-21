@@ -1040,7 +1040,7 @@ fn runProcess(io: Io, argv: []const []const u8) !void {
         .argv = argv,
         .stdin = .ignore,
         .stdout = .ignore,
-        .stderr = .ignore,
+        .stderr = .inherit,
     });
     defer child.kill(io);
     const term = try child.wait(io);
