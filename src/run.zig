@@ -694,6 +694,21 @@ fn cloneRootfs(allocator: std.mem.Allocator, rootfs: spore.Rootfs) !spore.Rootfs
             .size = rootfs.artifact.size,
             .format = try allocator.dupe(u8, rootfs.artifact.format),
         },
+        .storage = if (rootfs.storage) |storage| .{
+            .kind = try allocator.dupe(u8, storage.kind),
+            .device = .{
+                .kind = try allocator.dupe(u8, storage.device.kind),
+                .role = try allocator.dupe(u8, storage.device.role),
+                .virtio_device_id = storage.device.virtio_device_id,
+                .mmio_slot = storage.device.mmio_slot,
+            },
+            .logical_size = storage.logical_size,
+            .chunk_size = storage.chunk_size,
+            .hash_algorithm = try allocator.dupe(u8, storage.hash_algorithm),
+            .index_digest = try allocator.dupe(u8, storage.index_digest),
+            .base_identity = try allocator.dupe(u8, storage.base_identity),
+            .object_namespace = try allocator.dupe(u8, storage.object_namespace),
+        } else null,
         .source = if (rootfs.source) |source| .{
             .kind = try allocator.dupe(u8, source.kind),
             .requested_ref = try allocator.dupe(u8, source.requested_ref),
@@ -1773,6 +1788,7 @@ pub fn openRuntimeDisk(init: std.process.Init, allocator: std.mem.Allocator, opt
     const trace_path = try rootfsTracePath(init, allocator);
 
     if (options.rootfs) |rootfs| {
+        if (rootfs.storage != null) return error.BadManifest;
         if (rootfsCasExperimentEnabled(init)) {
             runtime.allocator = allocator;
             runtime.cas_rootfs = try openExperimentalCasRootfs(init, allocator, rootfs, options.command_name, trace_path);
@@ -1788,7 +1804,8 @@ pub fn openRuntimeDisk(init: std.process.Init, allocator: std.mem.Allocator, opt
     if (options.disk) |disk| {
         const rootfs = options.rootfs orelse return error.BadManifest;
         const spore_dir = options.spore_dir orelse return error.BadManifest;
-        if (disk.size != rootfs.artifact.size or !std.mem.eql(u8, disk.base, rootfs.artifact.digest)) return error.BadManifest;
+        if (disk.size != spore.effectiveRootfsLogicalSize(rootfs) or
+            !std.mem.eql(u8, disk.base, spore.effectiveRootfsBaseIdentity(rootfs))) return error.BadManifest;
         const base_source = try runtime.baseSource(disk.size, trace_path);
         runtime.overlay = try disk_layer.createTempOverlay(allocator);
         if (disk.layers.len == 0) {
@@ -2765,6 +2782,47 @@ test "runtime disk rejects corrupt rootfs before constructing file block source"
 
     const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
     try std.testing.expectError(error.RootFSDigestMismatch, openRuntimeDisk(init, arena, .{
+        .rootfs = rootfs,
+        .command_name = "run",
+    }));
+}
+
+test "runtime disk rejects manifest-bound rootfs storage before product attach" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const storage_identity = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const rootfs = spore.Rootfs{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = .{
+            .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .size = 4096,
+        },
+        .storage = .{
+            .kind = spore.rootfs_storage_kind_chunked_ext4,
+            .device = .{ .mmio_slot = 1 },
+            .logical_size = 4096,
+            .chunk_size = 4096,
+            .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+            .index_digest = storage_identity,
+            .base_identity = storage_identity,
+            .object_namespace = spore.rootfs_storage_object_namespace,
+        },
+    };
+    try std.testing.expectError(error.BadManifest, openRuntimeDisk(init, allocator, .{
         .rootfs = rootfs,
         .command_name = "run",
     }));

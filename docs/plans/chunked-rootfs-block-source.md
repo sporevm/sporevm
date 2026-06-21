@@ -112,7 +112,7 @@ field name can land in Slice 3, but the descriptor must live under rootfs storag
 or artifact identity, not provenance:
 
 ```text
-rootfs_storage:
+rootfs.storage:
   kind: chunked-ext4-rootfs-v0
   device: virtio-mmio rootfs slot
   logical_size: <bytes>
@@ -127,12 +127,11 @@ The rootfs index records the layout selected by that descriptor:
 
 ```text
 rootfs-block-index-v0
-  kind: chunked-ext4-rootfs-v0
+  kind: rootfs-block-index-v0
   logical_size: <bytes>
   chunk_size: 4096 | 16384 | 65536 | 262144 | ...
   hash_algorithm: blake3
   object_namespace: rootfs/blake3
-  base_identity: blake3:<canonical-rootfs-index-bytes>
   chunks:
     logical_chunk -> blake3:<chunk-bytes>
   zero_chunks:
@@ -145,7 +144,10 @@ manifest's `index_digest`, then verifies only chunks it inserts into the cache o
 serves to the guest. A clean same-host fan-out path should not re-hash the full
 rootfs artifact for every child before VM creation, and it should not allow a
 cache or bundle to redefine logical size, chunk size, algorithm, zero-fill
-semantics, object namespace, device binding, or base identity. Writable disk
+semantics, object namespace, device binding, or base identity. The canonical
+index does not repeat `base_identity`: for the first storage kind,
+`base_identity == index_digest`, so embedding it in the hashed bytes would make
+the index self-referential. Writable disk
 chains must bind `disk.base` to this same rootfs base identity when the immutable
 base is chunked; for the fd-backed path, the base identity remains the current
 full ext4 artifact digest. For the first chunked storage kind, `base_identity`
@@ -250,6 +252,14 @@ can drift from the canonical index bytes.
   the cached block-source path is faster, not merely neutral, and that the
   remaining roughly 10s child TTI is outside the old full-rootfs open/digest
   verification phase.
+- Slice 4 now has the manifest-bound descriptor/parser boundary. `rootfs.storage`
+  carries the experimental `chunked-ext4-rootfs-v0` descriptor separately from
+  OCI provenance, writable disk validation compares against the effective
+  rootfs base identity, and the `rootfs-block-index-v0` parser verifies the
+  exact index bytes against the descriptor digest before validating canonical
+  chunk and zero-fill tables. Product resume intentionally rejects manifests
+  with `rootfs.storage` until Slice 5 attaches the descriptor-selected
+  `CasBlockSource`.
 
 ## Delivery Strategy
 

@@ -183,12 +183,26 @@ cache hit/fetch counters under `rootfs.cache`.
   `immutable-ext4-rootfs-v0`, `mode` is `read-only`, `device` binds the
   artifact to the rootfs virtio-mmio slot, `artifact` records a
   `blake3:<hex>` digest, size, and `ext4` format, and `source` records OCI
-  provenance. The digest and size are restore authority; OCI metadata is not.
+  provenance. The digest and size are restore authority for the fd-backed
+  path; OCI metadata is not. Experimental manifests may also include
+  `rootfs.storage` with `kind: "chunked-ext4-rootfs-v0"`, the same rootfs
+  device binding, logical size, chunk size, `hash_algorithm: "blake3"`,
+  `index_digest`, `base_identity`, and `object_namespace: "rootfs/blake3"`.
+  For this first chunked storage kind, `base_identity` must equal
+  `index_digest`, and the digest is the BLAKE3 identity of the canonical
+  rootfs block index bytes. The index itself records index version
+  `rootfs-block-index-v0`, logical size, chunk size, hash algorithm, object
+  namespace, sorted non-zero chunk entries, and sorted explicit zero chunks;
+  it does not repeat `base_identity` because that would make the index
+  self-referential.
 - `disk`: optional sealed writable root disk state for rootfs-backed captures.
   `kind` is `cow-block-v0`, `device` binds the disk to the same virtio-mmio
   rootfs slot, `size` is the full disk size, `base` is the immutable rootfs
-  artifact digest, and `layers` is an ordered list of `blake3:<hex>` layer index
-  references. Reads replay newest layer to oldest layer over the immutable base.
+  base identity, and `layers` is an ordered list of `blake3:<hex>` layer index
+  references. For fd-backed rootfs this base identity is the full ext4 artifact
+  digest; for chunked rootfs it is the manifest-bound rootfs storage
+  `base_identity`. Reads replay newest layer to oldest layer over the
+  immutable base.
   Each `disk-layer-v0` index records `cluster_size`, `disk_size`, explicit
   nonzero extents as `logical_cluster` plus cluster digest, and sorted explicit
   `zero_clusters`.
@@ -245,6 +259,10 @@ cache hit/fetch counters under `rootfs.cache`.
 - Immutable rootfs artifacts are portable by digest, not by local path. Resume
   opens the digest-addressed rootfs cache entry read-only, verifies the same fd
   by BLAKE3 and size, and only then attaches it to the VM.
+- Manifest-bound chunked rootfs storage descriptors are parsed and validated,
+  but product resume rejects them until the descriptor-selected block source is
+  attached. The fd-backed path must not silently ignore `rootfs.storage` and
+  treat the monolithic artifact as equivalent authority.
 - Local RAM backing files and `ram.backing.proof` are same-host acceleration
   hints, not portable trust roots. Product restore paths treat a valid proof as
   local provenance for opening a backing fd; invalid or absent proof uses the

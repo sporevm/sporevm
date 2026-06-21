@@ -247,8 +247,8 @@ pub fn createTempOverlay(allocator: std.mem.Allocator) Error!TempOverlay {
 pub fn diskFromRootfs(rootfs: spore.Rootfs) spore.Disk {
     return .{
         .device = rootfs.device,
-        .size = rootfs.artifact.size,
-        .base = rootfs.artifact.digest,
+        .size = spore.effectiveRootfsLogicalSize(rootfs),
+        .base = spore.effectiveRootfsBaseIdentity(rootfs),
         .layers = &.{},
     };
 }

@@ -190,6 +190,9 @@ pub const rootfs_artifact_format_ext4 = "ext4";
 pub const rootfs_digest_prefix = "blake3:";
 pub const rootfs_source_kind_oci_image = "oci-image";
 pub const rootfs_virtio_blk_device_id: u32 = 2;
+pub const rootfs_storage_kind_chunked_ext4 = "chunked-ext4-rootfs-v0";
+pub const rootfs_storage_hash_algorithm_blake3 = "blake3";
+pub const rootfs_storage_object_namespace = "rootfs/blake3";
 
 pub const RootfsDevice = struct {
     kind: []const u8 = rootfs_device_kind_virtio_mmio,
@@ -213,11 +216,23 @@ pub const RootfsSource = struct {
     builder_version: []const u8,
 };
 
+pub const RootfsStorage = struct {
+    kind: []const u8,
+    device: RootfsDevice,
+    logical_size: u64,
+    chunk_size: u64,
+    hash_algorithm: []const u8,
+    index_digest: []const u8,
+    base_identity: []const u8,
+    object_namespace: []const u8,
+};
+
 pub const Rootfs = struct {
     kind: []const u8 = rootfs_kind,
     mode: []const u8 = rootfs_mode_read_only,
     device: RootfsDevice,
     artifact: RootfsArtifactRef,
+    storage: ?RootfsStorage = null,
     source: ?RootfsSource = null,
 };
 
@@ -684,6 +699,7 @@ pub fn validateRootfs(rootfs: Rootfs, devices: []const TransportState) Error!voi
     if (!std.mem.eql(u8, rootfs.artifact.format, rootfs_artifact_format_ext4)) return error.BadManifest;
     if (rootfs.artifact.size == 0 or rootfs.artifact.size > std.math.maxInt(usize)) return error.BadManifest;
     try validateRootfsDigest(rootfs.artifact.digest);
+    if (rootfs.storage) |storage| try validateRootfsStorage(storage, rootfs, devices);
     if (rootfs.source) |source| try validateRootfsSource(source);
 }
 
@@ -702,13 +718,41 @@ fn rootfsDeviceEql(a: RootfsDevice, b: RootfsDevice) bool {
         a.mmio_slot == b.mmio_slot;
 }
 
+fn validateRootfsStorage(storage: RootfsStorage, rootfs: Rootfs, devices: []const TransportState) Error!void {
+    try validateRootfsStorageDescriptor(storage);
+    try validateRootfsDevice(storage.device, devices);
+    if (!rootfsDeviceEql(storage.device, rootfs.device)) return error.BadManifest;
+    if (storage.logical_size != rootfs.artifact.size) return error.BadManifest;
+}
+
+pub fn validateRootfsStorageDescriptor(storage: RootfsStorage) Error!void {
+    if (!std.mem.eql(u8, storage.kind, rootfs_storage_kind_chunked_ext4)) return error.BadManifest;
+    if (storage.logical_size == 0 or storage.logical_size > std.math.maxInt(usize)) return error.BadManifest;
+    if (!validDiskClusterSize(storage.chunk_size)) return error.BadManifest;
+    if (!std.mem.eql(u8, storage.hash_algorithm, rootfs_storage_hash_algorithm_blake3)) return error.BadManifest;
+    try validateRootfsDigest(storage.index_digest);
+    try validateRootfsDigest(storage.base_identity);
+    if (!std.mem.eql(u8, storage.base_identity, storage.index_digest)) return error.BadManifest;
+    if (!std.mem.eql(u8, storage.object_namespace, rootfs_storage_object_namespace)) return error.BadManifest;
+}
+
+pub fn effectiveRootfsBaseIdentity(rootfs: Rootfs) []const u8 {
+    if (rootfs.storage) |storage| return storage.base_identity;
+    return rootfs.artifact.digest;
+}
+
+pub fn effectiveRootfsLogicalSize(rootfs: Rootfs) u64 {
+    if (rootfs.storage) |storage| return storage.logical_size;
+    return rootfs.artifact.size;
+}
+
 pub fn validateDisk(disk: Disk, maybe_rootfs: ?Rootfs, devices: []const TransportState) Error!void {
     const rootfs = maybe_rootfs orelse return error.BadManifest;
     if (!std.mem.eql(u8, disk.kind, disk_kind_cow_block)) return error.BadManifest;
     try validateRootfsDevice(disk.device, devices);
     if (!rootfsDeviceEql(disk.device, rootfs.device)) return error.BadManifest;
-    if (disk.size == 0 or disk.size != rootfs.artifact.size) return error.BadManifest;
-    if (!std.mem.eql(u8, disk.base, rootfs.artifact.digest)) return error.BadManifest;
+    if (disk.size == 0 or disk.size != effectiveRootfsLogicalSize(rootfs)) return error.BadManifest;
+    if (!std.mem.eql(u8, disk.base, effectiveRootfsBaseIdentity(rootfs))) return error.BadManifest;
     try validateDiskDigest(disk.base);
     for (disk.layers) |layer_ref| {
         try validateDiskDigest(layer_ref);
@@ -1761,6 +1805,19 @@ fn testDisk(mmio_slot: u32) Disk {
     };
 }
 
+fn testRootfsStorage(mmio_slot: u32) RootfsStorage {
+    return .{
+        .kind = rootfs_storage_kind_chunked_ext4,
+        .device = .{ .mmio_slot = mmio_slot },
+        .logical_size = 4096,
+        .chunk_size = 4096,
+        .hash_algorithm = rootfs_storage_hash_algorithm_blake3,
+        .index_digest = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .base_identity = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .object_namespace = rootfs_storage_object_namespace,
+    };
+}
+
 test "manifest rootfs artifact validates transport binding" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1844,6 +1901,50 @@ test "manifest disk validates rootfs base and layer chain" {
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.disk.?.size = 4096;
     manifest.disk.?.layers = &.{"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"};
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+}
+
+test "manifest disk binds to chunked rootfs storage identity" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
+    var devices = [_]TransportState{
+        testTransport(3),
+        testTransport(rootfs_virtio_blk_device_id),
+    };
+    var manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, 3);
+    manifest.devices = &devices;
+    manifest.rootfs = testRootfs(1);
+    manifest.rootfs.?.storage = testRootfsStorage(1);
+    manifest.disk = testDisk(1);
+    manifest.disk.?.base = manifest.rootfs.?.storage.?.base_identity;
+
+    try saveManifest(arena, dir, manifest);
+    const parsed = try loadManifest(arena, dir);
+    defer parsed.deinit();
+    const rootfs = parsed.value.rootfs orelse return error.BadManifest;
+    const disk = parsed.value.disk orelse return error.BadManifest;
+    try std.testing.expectEqualStrings(rootfs.storage.?.index_digest, effectiveRootfsBaseIdentity(rootfs));
+    try std.testing.expectEqualStrings(rootfs.storage.?.base_identity, disk.base);
+    try std.testing.expectEqual(@as(u64, 4096), effectiveRootfsLogicalSize(rootfs));
+
+    manifest.disk.?.base = manifest.rootfs.?.artifact.digest;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    manifest.disk.?.base = manifest.rootfs.?.storage.?.base_identity;
+
+    manifest.rootfs.?.storage.?.base_identity = "blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    manifest.rootfs.?.storage = testRootfsStorage(1);
+
+    manifest.rootfs.?.storage.?.device.mmio_slot = 0;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    manifest.rootfs.?.storage = testRootfsStorage(1);
+
+    manifest.rootfs.?.storage.?.object_namespace = "../rootfs";
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 }
 
