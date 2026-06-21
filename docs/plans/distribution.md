@@ -281,11 +281,12 @@ an attached rootfs fd.
   star/tree smoke evidence.
 - `scripts/smoke-remote-bundle.sh --workload rootfs` extends the real-host
   remote bundle smoke beyond diskless spores: the source builds OCI rootfs
-  bytes, packs either exact ext4 storage or `--rootfs-storage chunked` CAS
-  storage into the indexed bundle, destinations pull into a fresh rootfs cache,
-  repeated pulls prove rootfs cache reuse with `rootfs.cache.bytes_reused`,
-  corrupt rootfs payloads are rejected, and destinations verify materialization
-  through the selected child manifest and cache path.
+  bytes, packs chunked rootfs CAS storage into the indexed bundle by default,
+  destinations pull into a fresh rootfs cache, repeated pulls prove rootfs cache
+  reuse with `rootfs.cache.bytes_reused`, corrupt rootfs payloads are rejected,
+  and destinations verify materialization through the selected child manifest
+  and cache path. `--rootfs-storage exact` remains as an explicit legacy
+  exact-artifact control.
 - `scripts/validate-release-a1-kvm.sh` is the repeatable release-readiness
   wrapper for SSM-managed A1/KVM hosts. It runs a direct-S3 diskless bundle
   check with destination cache reuse, corrupt-bundle rejection, and KVM
@@ -532,9 +533,9 @@ cannot become restore authority.
   against source/destination A1 hosts and confirm the output reports bundled
   rootfs payloads, cold destination rootfs bytes fetched, warm destination
   `rootfs.cache.bytes_reused` with zero refetch, corrupt rootfs rejection, and
-  selected child materialization into the exact digest cache or chunked rootfs
-  CAS cache. Add `--rootfs-storage chunked` to exercise manifest-attached
-  rootfs CAS storage.
+  selected child materialization into the chunked rootfs CAS cache. Add
+  `--rootfs-storage exact` only when exercising the legacy exact-artifact
+  control.
 - Release wrapper: run `mise run validate:release-a1-kvm -- ...` or
   `scripts/validate-release-a1-kvm.sh -- ...` with SSM instance ids, bucket, and
   source peer IP to execute the direct-S3 diskless gate plus direct-S3 and

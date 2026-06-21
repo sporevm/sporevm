@@ -299,6 +299,20 @@ can drift from the canonical index bytes.
   HTTP peer pulls: cold pulls installed 9,535,761 rootfs CAS bytes, warm pulls
   reported the same bytes reused with zero refetch, and corrupt rootfs payloads
   failed before materialization.
+- Slice 7 now has default producer integration. `spore rootfs build` writes the
+  manifest-bound rootfs CAS index and chunk objects by default and records the
+  descriptor in the metadata sidecar. `spore run --image ... --capture` records
+  `rootfs.storage` without requiring `spore rootfs cas-preload --attach-spore`;
+  older image-cache entries are upgraded once when capture needs portable
+  rootfs identity. The manifest CAS benchmark now proves the default captured
+  base already has `rootfs.storage`, then creates an explicit stripped fd-backed
+  baseline for comparison. The rootfs remote smoke defaults `--workload rootfs`
+  to chunked storage; `--rootfs-storage exact` remains as the legacy control.
+  Local validation on 2026-06-21 with
+  `scripts/benchmark-manifest-rootfs-cas.py --no-build --counts 1 --timeout-s 900`
+  (`20260621T125603Z-ee42bba5`) confirmed the captured base had
+  `chunked-ext4-rootfs-v0` storage at 64KiB chunks; the stripped fd-backed
+  control took 7.376s and the default manifest CAS child took 655ms.
 
 ## Delivery Strategy
 
@@ -479,6 +493,32 @@ materialize through both direct S3 and HTTP peer pulls. This slice also updates
 exact-byte rootfs artifacts from chunked rootfs storage descriptors and keeps
 both manifest-authoritative.
 
+### Slice 7: Default Producer Integration
+
+Status: implemented and locally validated.
+
+Make chunked rootfs storage the normal producer path for image-created spores.
+
+Scope:
+
+- make `spore rootfs build` install the ext4 artifact into the digest cache,
+  write default 64KiB rootfs CAS objects, and record `rootfs_storage` in the
+  metadata sidecar;
+- make `spore run --image ... --capture` attach `rootfs.storage` from metadata
+  when complete, or upgrade an older exact cache entry once before writing the
+  captured manifest;
+- keep `spore rootfs cas-preload --attach-spore` as a repair/debug path for
+  existing exact-rootfs spores;
+- make the rootfs remote smoke default to chunked storage, while keeping
+  `--rootfs-storage exact` as an explicit legacy control;
+- update the manifest CAS benchmark so the CAS variant is the default captured
+  spore and the fd-backed variant is an explicit stripped control copy.
+
+Done when unit tests prove image-cache storage is recorded and reused without
+the monolithic digest artifact, `mise run benchmark:manifest-rootfs-cas`
+exercises the default manifest-attached path with no manual preload, and the
+remote rootfs smoke still has an exact-storage escape hatch.
+
 ## Verification
 
 - Unit tests for `BlockSource` range checks, partial reads, EOF/short read
@@ -503,11 +543,11 @@ both manifest-authoritative.
   artifact is absent, open the restored rootfs through `CasBlockSource`, and
   corrupt a bundled rootfs chunk to prove pull fails closed before writing the
   destination spore.
-- Remote distribution regression: run
-  `scripts/smoke-remote-bundle.sh --workload rootfs --rootfs-storage chunked`
-  over direct S3 and HTTP peer transports, confirm cold rootfs bytes are fetched,
-  repeated pulls report `rootfs.cache.bytes_reused`, and corrupt rootfs payloads
-  fail before materialization.
+- Remote distribution regression: run `scripts/smoke-remote-bundle.sh --workload
+  rootfs` over direct S3 and HTTP peer transports, confirm cold rootfs bytes are
+  fetched, repeated pulls report `rootfs.cache.bytes_reused`, and corrupt rootfs
+  payloads fail before materialization. Use `--rootfs-storage exact` only for
+  the legacy exact-artifact control.
 
 ## Resolved Decisions
 
@@ -549,6 +589,10 @@ both manifest-authoritative.
   256KiB. A proof sidecar can still be evaluated as a same-host fd-backed
   optimization, but it should not block the chunked rootfs descriptor/parser
   slice because it does not solve cross-host distribution.
+- `spore rootfs build` should emit chunked rootfs objects directly. A separate
+  `cas-preload --attach-spore` command remains useful for repair, debug, and
+  upgrading existing exact-rootfs spores, but it is no longer the normal image
+  build or capture UX.
 
 ## Open Questions
 
@@ -558,8 +602,6 @@ both manifest-authoritative.
   restore authority.
 - Does broader image-registry data contradict the first 64KiB prototype default,
   especially for cross-image dedupe and package-manager-heavy rootfs variants?
-- Should `spore rootfs build` emit chunked rootfs objects directly, or should a
-  separate preload/import command convert existing digest-cache ext4 artifacts?
 - Should a local proof sidecar ship as a same-host fd-backed optimization before
   chunked rootfs distribution, or stay only as a benchmark control?
 

@@ -23,6 +23,7 @@ const xattrs_mod = @import("rootfs/xattrs.zig");
 const Io = std.Io;
 
 const max_rootfs_layers: usize = 512;
+const max_rootfs_metadata_bytes: usize = 1024 * 1024;
 pub const builder_version = "sporevm-rootfs-v3";
 const resolver_placeholder_path = "etc/resolv.conf";
 const resolver_placeholder_bytes =
@@ -180,11 +181,12 @@ fn runBuild(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
         .mkfs = parsed.mkfs,
         .debugfs = parsed.debugfs,
     });
-    try stdout.print("rootfs: {s}\nmetadata: {s}\nsource: {s}\nrootfs_blake3: {s}\n", .{
+    try stdout.print("rootfs: {s}\nmetadata: {s}\nsource: {s}\nrootfs_blake3: {s}\nrootfs_storage: {s}\n", .{
         parsed.output,
         parsed.metadata,
         parsed.ref,
         result.rootfs_blake3,
+        result.rootfs_storage.index_digest,
     });
 }
 
@@ -603,7 +605,117 @@ const ImageConfig = oci.ImageConfig;
 
 pub const BuildResult = struct {
     rootfs_blake3: [chunk.ChunkId.hex_len]u8,
+    rootfs_storage: spore.RootfsStorage,
 };
+
+pub fn rootfsMetadataPathAlloc(allocator: std.mem.Allocator, cache_root: []const u8, resolved: ResolvedImage) ![]const u8 {
+    const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
+    return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
+}
+
+pub fn cloneRootfsStorage(allocator: std.mem.Allocator, storage: spore.RootfsStorage) !spore.RootfsStorage {
+    return .{
+        .kind = try allocator.dupe(u8, storage.kind),
+        .device = .{
+            .kind = try allocator.dupe(u8, storage.device.kind),
+            .role = try allocator.dupe(u8, storage.device.role),
+            .virtio_device_id = storage.device.virtio_device_id,
+            .mmio_slot = storage.device.mmio_slot,
+        },
+        .logical_size = storage.logical_size,
+        .chunk_size = storage.chunk_size,
+        .hash_algorithm = try allocator.dupe(u8, storage.hash_algorithm),
+        .index_digest = try allocator.dupe(u8, storage.index_digest),
+        .base_identity = try allocator.dupe(u8, storage.base_identity),
+        .object_namespace = try allocator.dupe(u8, storage.object_namespace),
+    };
+}
+
+pub fn ensureCachedRootfsStorage(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    resolved: ResolvedImage,
+    artifact: spore.RootfsArtifactRef,
+    device: spore.RootfsDevice,
+) !spore.RootfsStorage {
+    const metadata_path = try rootfsMetadataPathAlloc(allocator, cache_root, resolved);
+    if (try readCachedRootfsStorage(io, allocator, metadata_path, artifact)) |cached| {
+        var storage = cached;
+        storage.device = device;
+        if (storage.logical_size == artifact.size and try rootfs_cas.storageComplete(io, allocator, cache_root, storage)) {
+            return storage;
+        }
+    }
+
+    const preload = try rootfs_cas.preload(io, allocator, cache_root, artifact.digest, rootfs_cas.default_chunk_size);
+    const storage = rootfs_cas.storageDescriptor(device, preload);
+    try writeCachedRootfsStorage(io, allocator, metadata_path, storage);
+    return storage;
+}
+
+const CachedRootfsStorageMetadata = struct {
+    rootfs_size: ?u64 = null,
+    rootfs_blake3: ?[]const u8 = null,
+    rootfs_storage: ?spore.RootfsStorage = null,
+};
+
+fn readCachedRootfsStorage(
+    io: Io,
+    allocator: std.mem.Allocator,
+    metadata_path: []const u8,
+    artifact: spore.RootfsArtifactRef,
+) !?spore.RootfsStorage {
+    const metadata = Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return null,
+        else => |e| return e,
+    };
+    defer allocator.free(metadata);
+    var parsed = std.json.parseFromSlice(CachedRootfsStorageMetadata, allocator, metadata, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    const storage = parsed.value.rootfs_storage orelse return null;
+    const rootfs_size = parsed.value.rootfs_size orelse return null;
+    if (rootfs_size != artifact.size) return null;
+    const rootfs_blake3 = parsed.value.rootfs_blake3 orelse return null;
+    if (!std.mem.startsWith(u8, artifact.digest, spore.rootfs_digest_prefix)) return null;
+    if (!std.mem.eql(u8, artifact.digest[spore.rootfs_digest_prefix.len..], rootfs_blake3)) return null;
+    spore.validateRootfsStorageDescriptor(storage) catch return null;
+    return try cloneRootfsStorage(allocator, storage);
+}
+
+fn writeCachedRootfsStorage(io: Io, allocator: std.mem.Allocator, metadata_path: []const u8, storage: spore.RootfsStorage) !void {
+    const metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes));
+    defer allocator.free(metadata);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, metadata, .{});
+    const object = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.BadManifest,
+    };
+    const storage_json = try std.json.Stringify.valueAlloc(arena, storage, .{});
+    const storage_value = try std.json.parseFromSlice(std.json.Value, arena, storage_json, .{});
+    try object.put(arena, "rootfs_storage", storage_value.value);
+    const json = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+    defer allocator.free(json);
+    try writeFileAtomicPath(io, allocator, metadata_path, json);
+}
+
+fn writeFileAtomicPath(io: Io, allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    var temp_nonce_bytes: [8]u8 = undefined;
+    io.random(&temp_nonce_bytes);
+    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ path, temp_nonce });
+    defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = temp_path, .data = data });
+    try renamePath(allocator, temp_path, path);
+}
 
 pub fn validateTaggedImageRef(raw_ref: []const u8) !void {
     _ = try ImageTag.parse(raw_ref);
@@ -632,6 +744,7 @@ const RootFSMetadata = struct {
     rootfs_path: []const u8,
     rootfs_size: u64,
     rootfs_blake3: []const u8,
+    rootfs_storage: spore.RootfsStorage,
 };
 
 fn resolveTaggedImageRef(init: std.process.Init, allocator: std.mem.Allocator, opts: ParsedResolveOptions) ![]const u8 {
@@ -1099,6 +1212,18 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     const rootfs_blake3 = try ext4.blake3File(init.io, opts.output);
     const rootfs_hex = try allocator.dupe(u8, &rootfs_blake3);
     const stat = try Io.Dir.cwd().statFile(init.io, opts.output, .{});
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    const artifact = spore.RootfsArtifactRef{
+        .digest = try std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, rootfs_hex }),
+        .size = stat.size,
+        .format = spore.rootfs_artifact_format_ext4,
+    };
+    try rootfs_cache.installExpectedPath(init.io, allocator, cache_root, opts.output, artifact, .{
+        .source_must_not_be_symlink = false,
+        .allow_hardlink = true,
+    });
+    const preload_result = try rootfs_cas.preload(init.io, allocator, cache_root, artifact.digest, rootfs_cas.default_chunk_size);
+    const rootfs_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
 
     try ext4.ensureParentDir(init.io, opts.metadata);
     try rejectMetadataOutputAlias(init.io, opts.output, opts.metadata);
@@ -1117,11 +1242,12 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
         .rootfs_path = opts.metadata_rootfs_path orelse opts.output,
         .rootfs_size = stat.size,
         .rootfs_blake3 = rootfs_hex,
+        .rootfs_storage = rootfs_storage,
     };
     const metadata_json = try std.json.Stringify.valueAlloc(allocator, metadata, .{ .whitespace = .indent_2 });
     try ext4.writeFileAtPath(init.io, opts.metadata, metadata_json);
 
-    return .{ .rootfs_blake3 = rootfs_blake3 };
+    return .{ .rootfs_blake3 = rootfs_blake3, .rootfs_storage = rootfs_storage };
 }
 
 fn resolveManifestDigest(
@@ -1594,6 +1720,64 @@ test "cas preload attach rejects unexpected disk base" {
         error.BadManifest,
         attachPreloadedRootfsStorage(arena, spore_dir, artifact.digest, preload_result),
     );
+}
+
+test "cached rootfs storage is recorded and reused without the digest artifact" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-storage-metadata";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+
+    const resolved = ResolvedImage{
+        .ref = "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try rootfsMetadataPathAlloc(arena, cache_root, resolved);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const metadata = try std.fmt.allocPrint(arena,
+        \\{{
+        \\  "builder_version": "sporevm-rootfs-v3",
+        \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "platform": {{"os": "linux", "arch": "arm64"}},
+        \\  "rootfs_size": {d},
+        \\  "rootfs_blake3": "{s}"
+        \\}}
+    , .{ artifact.size, artifact.digest[spore.rootfs_digest_prefix.len..] });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
+    const first = try ensureCachedRootfsStorage(io, arena, cache_root, resolved, artifact, .{ .mmio_slot = 1 });
+    try std.testing.expect(try rootfs_cas.storageComplete(io, arena, cache_root, first));
+    const recorded = (try readCachedRootfsStorage(io, arena, metadata_path, artifact)).?;
+    try std.testing.expectEqualStrings(first.index_digest, recorded.index_digest);
+    const metadata_with_storage = try Io.Dir.cwd().readFileAlloc(io, metadata_path, arena, .limited(max_rootfs_metadata_bytes));
+
+    const storage_json = try std.json.Stringify.valueAlloc(arena, first, .{});
+    const stale_metadata = try std.fmt.allocPrint(arena,
+        \\{{
+        \\  "rootfs_size": {d},
+        \\  "rootfs_blake3": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        \\  "rootfs_storage": {s}
+        \\}}
+    , .{ artifact.size, storage_json });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = stale_metadata });
+    try std.testing.expect((try readCachedRootfsStorage(io, arena, metadata_path, artifact)) == null);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata_with_storage });
+
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
+    const second = try ensureCachedRootfsStorage(io, arena, cache_root, resolved, artifact, .{ .mmio_slot = 1 });
+    try std.testing.expectEqualStrings(first.index_digest, second.index_digest);
 }
 
 fn testRootfsAttachManifest(allocator: std.mem.Allocator, artifact: spore.RootfsArtifactRef) !spore.Manifest {

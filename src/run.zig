@@ -709,21 +709,7 @@ fn cloneRootfs(allocator: std.mem.Allocator, rootfs: spore.Rootfs) !spore.Rootfs
             .size = rootfs.artifact.size,
             .format = try allocator.dupe(u8, rootfs.artifact.format),
         },
-        .storage = if (rootfs.storage) |storage| .{
-            .kind = try allocator.dupe(u8, storage.kind),
-            .device = .{
-                .kind = try allocator.dupe(u8, storage.device.kind),
-                .role = try allocator.dupe(u8, storage.device.role),
-                .virtio_device_id = storage.device.virtio_device_id,
-                .mmio_slot = storage.device.mmio_slot,
-            },
-            .logical_size = storage.logical_size,
-            .chunk_size = storage.chunk_size,
-            .hash_algorithm = try allocator.dupe(u8, storage.hash_algorithm),
-            .index_digest = try allocator.dupe(u8, storage.index_digest),
-            .base_identity = try allocator.dupe(u8, storage.base_identity),
-            .object_namespace = try allocator.dupe(u8, storage.object_namespace),
-        } else null,
+        .storage = if (rootfs.storage) |storage| try rootfs_mod.cloneRootfsStorage(allocator, storage) else null,
         .source = if (rootfs.source) |source| .{
             .kind = try allocator.dupe(u8, source.kind),
             .requested_ref = try allocator.dupe(u8, source.requested_ref),
@@ -836,13 +822,18 @@ fn resolvedImageRootfsInput(
 ) !ResolvedRootfsInput {
     if (!record_artifact) return .{ .path = rootfs_path };
     const artifact = try cacheRootfsByDigest(init, allocator, cache_root, rootfs_path);
+    const rootfs_device = spore.RootfsDevice{ .mmio_slot = 1 };
+    const storage = rootfs_mod.ensureCachedRootfsStorage(init.io, allocator, cache_root, resolved, artifact, rootfs_device) catch |err| {
+        failRunSetup("spore run: rootfs CAS storage preparation failed for {s}: {s}", .{ artifact.digest, @errorName(err) });
+    };
     const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch });
     const manifest_requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved.ref else requested_ref;
     return .{
         .path = rootfs_path,
         .rootfs = .{
-            .device = .{ .mmio_slot = 1 },
+            .device = rootfs_device,
             .artifact = artifact,
+            .storage = storage,
             .source = .{
                 .requested_ref = manifest_requested_ref,
                 .resolved_image_ref = resolved.ref,
@@ -863,7 +854,7 @@ fn cachedImageRootfsPath(
 ) !?[]const u8 {
     const cache_key = try rootfs_mod.rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
-    const metadata_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
+    const metadata_path = try rootfs_mod.rootfsMetadataPathAlloc(allocator, cache_root, resolved);
     const metadata_matches = cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved) catch |err| {
         failRunSetup("spore {s}: cached rootfs metadata check failed: {s}", .{ command_name, @errorName(err) });
     };

@@ -1,7 +1,9 @@
 # Rootfs Images
 
 `spore rootfs build` materializes an OCI image into a deterministic ext4 rootfs
-image. The first OCI-capable run workflow is deliberately two-step:
+image, installs that image into the local digest cache, and writes chunked
+rootfs CAS objects plus a `rootfs_storage` descriptor into the metadata sidecar.
+The first OCI-capable run workflow is deliberately two-step:
 
 ```bash
 zig-out/bin/spore rootfs build docker.io/library/alpine:3.20 \
@@ -44,7 +46,10 @@ ref record, so a warm `spore run --image docker.io/library/alpine:3.20` can go
 straight to the previously validated rootfs instead of re-resolving the tag on
 every invocation. If the ref record or referenced rootfs is missing or
 mismatched, SporeVM falls back to the registry path and updates the record after
-the rootfs cache is valid.
+the rootfs cache is valid. Captured image runs also require manifest-bound
+chunked rootfs storage. New builds write it immediately; older cache entries are
+upgraded once when `spore run --image ... --capture` needs to record portable
+rootfs identity.
 
 For local Docker buildx workflows, SporeVM consumes an OCI layout instead of the
 Docker daemon or socket. Buildx writes the layout, then `spore rootfs
@@ -121,18 +126,23 @@ are restored.
 When `spore run --image ... --capture SPORE` captures a VM, the spore manifest
 records an immutable rootfs artifact: the ext4 content BLAKE3 digest, size,
 virtio-blk binding, resolved OCI image identity, platform, and builder version.
-The rootfs is also stored under a digest-addressed cache path. Product
-`spore resume` reopens that cached artifact, verifies it by digest and size, and
-attaches it as the base of the root disk. If the spore has sealed writable disk
-layers, resume also verifies those layer indexes and disk objects before
-attaching the layered COW backend. If the digest cache entry or any referenced
-disk layer data is missing or tampered with, resume refuses to boot.
+For image-created spores, the manifest also records `rootfs.storage` pointing at
+the chunked rootfs index and CAS object namespace. Product `spore resume` and
+`spore run --from` use that descriptor when present, opening the small verified
+index and verifying only chunks read by the guest instead of re-hashing the
+whole ext4 artifact before VM creation. Older spores without `rootfs.storage`
+keep the exact fd-backed path: resume reopens the cached ext4 artifact, verifies
+it by digest and size, and attaches it as the root disk base. If the spore has
+sealed writable disk layers, resume also verifies those layer indexes and disk
+objects before attaching the layered COW backend. If the required exact artifact,
+rootfs index/chunk, or disk layer data is missing or tampered with, resume
+refuses to boot.
 
-`spore pack` includes those exact rootfs bytes by default for rootfs-backed
-spores, under `rootfs/blake3/<hex>.ext4` in the local bundle. `spore unpack`
-requires the bundled artifact, verifies it against the manifest digest and size,
-and installs it into the destination host's rootfs digest cache before the
-unpacked spore can be resumed.
+`spore pack` follows the manifest. Spores without `rootfs.storage` include exact
+rootfs bytes under `rootfs/blake3/<hex>.ext4`; spores with `rootfs.storage`
+include the descriptor-bound index and referenced chunk objects instead.
+`spore unpack` verifies whichever form the manifest selected before writing a
+resumable spore.
 
 If a spore manifest has manifest-attached chunked rootfs storage under
 `rootfs.storage`, indexed bundles carry the descriptor-bound
@@ -143,6 +153,10 @@ index against the manifest descriptor, verify each chunk by BLAKE3, and install
 those files into the destination host's rootfs CAS cache. They do not require
 the monolithic ext4 digest-cache artifact on the destination for a chunked
 rootfs child.
+
+`spore rootfs cas-preload <blake3:digest> --attach-spore DIR` remains available
+for repairing or upgrading an existing exact-rootfs spore. It is no longer the
+normal image-build or image-capture path.
 
 Indexed bundles also support an explicit prepared-cache mode:
 `spore pack SPORE --children CHILDREN --rootfs=metadata-only --out BUNDLE`
