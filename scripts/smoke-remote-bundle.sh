@@ -15,8 +15,9 @@ stage the bundle in S3, then pull and resume it on one or more compatible KVM
 hosts. The default initrd workload exercises the low-level diskless resume path.
 Pass `--workload rootfs` to build an OCI rootfs artifact, include immutable
 rootfs bytes in the bundle, and verify destination materialization without
-booting the child VM. Pass `--rootfs-storage chunked` to attach manifest-bound
-rootfs CAS storage instead of the exact ext4 artifact.
+booting the child VM. Rootfs workloads use manifest-bound chunked rootfs CAS
+storage by default; pass `--rootfs-storage exact` to exercise the legacy exact
+ext4 artifact path.
 
 The script uploads tracked HEAD plus the current tracked/staged diff to S3 so
 it can validate local changes before they are committed without copying stray
@@ -46,7 +47,7 @@ Options:
   --rootfs-mem-mib N          guest memory for --workload rootfs (default: 2048)
   --rootfs-storage exact|chunked
                               rootfs bundle storage for --workload rootfs
-                              (default: exact)
+                              (default: chunked)
   --snapshot-after-ms N       capture delay before snapshot (default: 3000)
   --resume-seconds N          seconds to let resumed VM tick (default: 5)
   --dest-repeat N             restore each destination N times (default: 1)
@@ -123,7 +124,7 @@ workload="initrd"
 rootfs_image="${SPORE_SMOKE_ROOTFS_IMAGE:-docker.io/library/alpine:3.20}"
 rootfs_platform="${SPORE_SMOKE_ROOTFS_PLATFORM:-linux/arm64}"
 rootfs_mem_mib="${SPORE_SMOKE_ROOTFS_MEM_MIB:-2048}"
-rootfs_storage="${SPORE_SMOKE_ROOTFS_STORAGE:-exact}"
+rootfs_storage="${SPORE_SMOKE_ROOTFS_STORAGE:-}"
 snapshot_after_ms="3000"
 resume_seconds="5"
 dest_repeat="1"
@@ -306,6 +307,13 @@ case "${workload}" in
   initrd|rootfs) ;;
   *) die "--workload must be initrd or rootfs" ;;
 esac
+if [[ -z "${rootfs_storage}" ]]; then
+  if [[ "${workload}" == "rootfs" ]]; then
+    rootfs_storage="chunked"
+  else
+    rootfs_storage="exact"
+  fi
+fi
 case "${rootfs_storage}" in
   exact|chunked) ;;
   *) die "--rootfs-storage must be exact or chunked" ;;
@@ -587,18 +595,19 @@ else
   mkdir -p "\${rootfs_cache}"
   rootfs_ext4="\${workdir}/rootfs.ext4"
   rootfs_metadata="\${workdir}/rootfs.ext4.json"
-  zig-out/bin/spore rootfs build "\${rootfs_image}" \
+  SPOREVM_ROOTFS_CACHE_DIR="\${rootfs_cache}" \
+    zig-out/bin/spore rootfs build "\${rootfs_image}" \
     --platform "\${rootfs_platform}" \
     --output "\${rootfs_ext4}" \
     --metadata "\${rootfs_metadata}" | tee "\${workdir}/rootfs-build.txt"
-  python3 - "\${rootfs_metadata}" "\${rootfs_cache}" "\${rootfs_ext4}" "\${workdir}/spore/manifest.json" "\${rootfs_mem_mib}" <<'PY'
+  python3 - "\${rootfs_metadata}" "\${rootfs_cache}" "\${rootfs_ext4}" "\${workdir}/spore/manifest.json" "\${rootfs_mem_mib}" "\${rootfs_storage}" <<'PY'
 import json
 import os
 import pathlib
 import shutil
 import sys
 
-metadata_path, cache_root, rootfs_ext4, manifest_path, rootfs_mem_mib = sys.argv[1:]
+metadata_path, cache_root, rootfs_ext4, manifest_path, rootfs_mem_mib, rootfs_storage = sys.argv[1:]
 with open(metadata_path, "r", encoding="utf-8") as f:
     metadata = json.load(f)
 
@@ -612,7 +621,8 @@ else:
     platform_text = str(metadata_platform)
 cache_path = pathlib.Path(cache_root) / "by-digest" / "blake3" / f"{rootfs_hex}.ext4"
 cache_path.parent.mkdir(parents=True, exist_ok=True)
-shutil.copyfile(rootfs_ext4, cache_path)
+if not cache_path.exists():
+    shutil.copyfile(rootfs_ext4, cache_path)
 os.chmod(cache_path, 0o444)
 
 manifest_file = pathlib.Path(manifest_path)
@@ -690,6 +700,13 @@ manifest = {
     "network": None,
     "memory": {"chunk_size": chunk_size, "chunks": [None] * chunk_count, "backing": None},
 }
+if rootfs_storage == "chunked":
+    storage = metadata.get("rootfs_storage")
+    if not isinstance(storage, dict):
+        raise SystemExit("rootfs build metadata did not include rootfs_storage")
+    storage = dict(storage)
+    storage["device"] = manifest["rootfs"]["device"]
+    manifest["rootfs"]["storage"] = storage
 manifest_file.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 print(json.dumps({
     "rootfs_digest": rootfs_digest,
@@ -697,6 +714,7 @@ print(json.dumps({
     "resolved_image_ref": metadata["resolved_image_ref"],
     "ram_size": ram_size,
     "chunk_count": chunk_count,
+    "rootfs_storage": rootfs_storage,
 }, indent=2))
 PY
   resolved_rootfs_image="\$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["resolved_image_ref"])' "\${rootfs_metadata}")"
@@ -704,9 +722,6 @@ PY
   grep -Fq '"rootfs"' "\${workdir}/spore/manifest.json" || { echo "rootfs synthetic manifest did not record rootfs" >&2; exit 1; }
   grep -Fq '"digest": "blake3:' "\${workdir}/spore/manifest.json" || { echo "rootfs synthetic manifest did not record digest" >&2; exit 1; }
   if [[ "\${rootfs_storage}" == "chunked" ]]; then
-    SPOREVM_ROOTFS_CACHE_DIR="\${rootfs_cache}" \
-      zig-out/bin/spore rootfs cas-preload "\$(python3 -c 'import json, sys; print("blake3:" + json.load(open(sys.argv[1], encoding="utf-8"))["rootfs_blake3"])' "\${rootfs_metadata}")" \
-      --attach-spore "\${workdir}/spore" | tee "\${workdir}/rootfs-cas-preload.txt"
     grep -Fq '"storage"' "\${workdir}/spore/manifest.json" || { echo "rootfs manifest did not attach chunked storage" >&2; exit 1; }
   fi
 fi
