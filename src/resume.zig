@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 
 const hvf = @import("hvf/hvf.zig");
+const generation = @import("generation.zig");
 const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
 else
@@ -149,9 +150,10 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         try vsock.HostStream.init(default_resume_guest_port, request)
     else
         null;
-    if (identity_stream) |*stream| stream.host_port = generation_probe_host_port;
     if (identity_stream) |*stream| {
+        stream.host_port = generation_probe_host_port;
         if (opts.event_writer) |writer| stream.setLifecycleSink(writer, resumeEventLifecycleSink);
+        stream.setOutputSink(null, identityProbeOutputSink);
     }
     const identity_probe: ?*vsock.HostStream = if (identity_stream) |*stream| stream else null;
 
@@ -250,6 +252,16 @@ fn resumeEventLifecycleSink(context: ?*anyopaque, event: vsock.HostStreamLifecyc
     }
 }
 
+fn identityProbeOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+    if (output != .stderr) return;
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const n = std.c.write(2, remaining.ptr, remaining.len);
+        if (n <= 0) return;
+        remaining = remaining[@intCast(n)..];
+    }
+}
+
 fn resolveBackend(backend: Backend) !Backend {
     if (backend != .auto) return backend;
     if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return .hvf;
@@ -290,17 +302,18 @@ fn countBlockDevices(devices: []const spore.TransportState) usize {
 
 fn resumeIdentityRequest(allocator: std.mem.Allocator, state: spore.GenerationState) !?[]const u8 {
     if (state.params_b64.len == 0) return null;
-    const dec = std.base64.standard.Decoder;
-    const decoded_size = dec.calcSizeForSlice(state.params_b64) catch return error.BadManifest;
-    if (decoded_size == 0) return null;
-    const decoded = try allocator.alloc(u8, decoded_size);
-    defer allocator.free(decoded);
-    dec.decode(decoded, state.params_b64) catch return error.BadManifest;
 
-    var end = decoded.len;
-    while (end > 0 and decoded[end - 1] == 0) : (end -= 1) {}
+    var gen_dev = generation.Device{};
+    gen_dev.restore(allocator, state) catch |err| switch (err) {
+        error.BadState => return error.BadManifest,
+        else => |e| return e,
+    };
+    try spore.refreshResumeParams(allocator, &gen_dev);
+
+    var end = gen_dev.params.len;
+    while (end > 0 and gen_dev.params[end - 1] == 0) : (end -= 1) {}
     if (end == 0) return null;
-    return try run_mod.generationRequest(allocator, decoded[0..end]);
+    return try run_mod.generationRequest(allocator, gen_dev.params[0..end]);
 }
 
 fn failResumeSetup(comptime fmt: []const u8, args: anytype) noreturn {
@@ -331,6 +344,29 @@ test "resume memory defaults to manifest ram size" {
         .counter_frequency_hz = 24_000_000,
     };
     try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), resumeRamSize(platform));
+}
+
+test "resume identity request carries resume-time fields" {
+    const allocator = std.testing.allocator;
+    const params =
+        \\{"schema_version":0,"parent_generation":7,"generation":8,"fork_index":2,"fork_count":4,"parallel_index":2,"parallel_count":4,"fork_batch_id":"0123456789abcdef0123456789abcdef","vm_id":"spore-test","hostname":"spore-test","mac_seed":"0123456789abcdef0123456789abcdef","mac_address":"02:00:00:00:00:02"}
+    ;
+    const enc = std.base64.standard.Encoder;
+    const params_b64 = try allocator.alloc(u8, enc.calcSize(params.len));
+    defer allocator.free(params_b64);
+    _ = enc.encode(params_b64, params);
+
+    const request = (try resumeIdentityRequest(allocator, .{
+        .generation = 8,
+        .interrupt_status = generation.irq_generation_changed,
+        .params_b64 = params_b64,
+    })).?;
+    defer allocator.free(request);
+
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"generation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "resume_time_unix_ns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "resume_entropy_seed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "parallel_index\\\":2") != null);
 }
 
 test "resume counts block devices for disk dependency classification" {

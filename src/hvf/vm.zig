@@ -404,11 +404,11 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var exec_probe_guest_exited = exec_probe_rx_enabled;
     if (config.exec_probe) |probe| {
         try vsock_dev.attachHostStream(probe);
-        probe.markStarted();
         if (!exec_probe_rx_enabled) {
             exec_probe_wake_thread = try std.Thread.spawn(.{}, wakeVcpuAfterMs, .{ vcpu, config.exec_probe_initial_rx_delay_ms, &exec_probe_wake_stop });
         }
         if (exec_probe_rx_enabled) {
+            probe.markStarted();
             try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
         }
     }
@@ -422,6 +422,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         if (config.exec_probe != null and !exec_probe_done) {
             if (!exec_probe_rx_enabled and exec_probe_guest_exited and monotonicMs() -| start_ms >= config.exec_probe_initial_rx_delay_ms) {
                 exec_probe_rx_enabled = true;
+                // The timeout measures guest-visible probe delivery time. A
+                // restored guest can run for a while before its first exit.
+                config.exec_probe.?.markStarted();
             }
             if (exec_probe_rx_enabled) {
                 try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
@@ -489,7 +492,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
-                if (!exec_probe_done and probe.elapsedMs() > config.exec_probe_timeout_ms) {
+                if (!exec_probe_done and exec_probe_rx_enabled and probe.elapsedMs() > config.exec_probe_timeout_ms) {
                     if (config.exec_probe_failure_fatal) return error.VsockProbeTimedOut;
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;

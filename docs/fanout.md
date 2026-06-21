@@ -44,18 +44,33 @@ Inside run/rootfs guests, the initrd agent publishes the generation payload at
 ```text
 SPORE_PARALLEL_JOB=0
 SPORE_PARALLEL_JOB_COUNT=5
+SPORE_GENERATION=42
+SPORE_PARENT_GENERATION=41
 SPORE_VM_ID=spore-...
 SPORE_FORK_BATCH_ID=...
+SPORE_RESUME_TIME_UNIX_NS=...
 ```
 
 The generation JSON also includes `parallel_index`, `parallel_count`,
-`fork_index`, `fork_count`, `fork_batch_id`, and `vm_id`. `fork_index` and
-`fork_count` are batch-local metadata and match the parallel fields for this
-local-only slice. Do not infer global shard positions from these fields.
+`fork_index`, `fork_count`, `fork_batch_id`, `vm_id`, `generation`,
+`parent_generation`, and resume-time fields minted when a child actually
+resumes. `fork_index` and `fork_count` are batch-local metadata and match the
+parallel fields for this local-only slice. Do not infer global shard positions
+from these fields.
 
 For live captures, already-running processes do not get a new environment block
-on resume. They should read `/run/sporevm/env` or
-`/run/sporevm/generation.json` after fan-out; the guest agent refreshes those
-files from the generation device once the resumed guest is actually running.
-`spore run --from` remains the completed-base path for starting a fresh command
-inside a child spore.
+on resume. `/run/sporevm` is a runtime metadata surface backed by guest runtime
+state, not rootfs image content; a live snapshot can contain older files until
+the guest agent refreshes them from the generation device. Workloads that need
+shard identity must read `/run/sporevm/env` or `/run/sporevm/generation.json`
+after fan-out and wait for child generation metadata before starting sharded
+work. For a parent captured before `spore fork`, a practical barrier is to
+require `SPORE_FORK_BATCH_ID`, `SPORE_PARALLEL_JOB`,
+`SPORE_PARALLEL_JOB_COUNT`, and `SPORE_GENERATION >
+SPORE_PARENT_GENERATION`. Harnesses that can read the child manifest can compare
+the exact expected generation.
+
+`spore fanout` orchestrates child resumes and prefixes output. It does not prove
+that arbitrary already-running workloads consumed the metadata; workload
+harnesses own the identity-before-work barrier. `spore run --from` remains the
+completed-base path for starting a fresh command inside a child spore.

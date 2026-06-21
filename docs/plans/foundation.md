@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-20
+last_reviewed: 2026-06-21
 related_plans:
   - buildkite/cleanroom: docs/plans/sandbox-suspend-wake.md
   - docs/plans/run-bridge.md
@@ -118,7 +118,7 @@ materialization carries those rootfs-bound disk layers by content digest.
 | Product run bridge | Landed | See `docs/plans/run-bridge.md`; future OCI/writable policy is out of this plan. |
 | Named lifecycle | Local HVF landed; KVM create/exec/ls/rm parity landed | Speed work including local image ref caching, KVM suspend/resume evidence, and disk-backed lifecycle resume; see `docs/plans/lifecycle-monitor.md`. |
 | Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Keep writable disk product smoke coverage as regression evidence. |
-| Slice 4: fork and generation protocol | Complete for correctness | Keep fan-out identity smokes as regression coverage. |
+| Slice 4: fork and generation protocol | Complete for correctness | `/run/sporevm` is the live metadata contract; keep fan-out identity smokes as regression coverage. |
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |
 | Slice 6: identical-host distribution | Active | Remote push/pull materialization, remote cache reuse metrics, and measured origin-egress efficiency beyond explicit relay trees. |
 | Writable disk layers | Complete for the first product target | See `docs/plans/writable-disk-layers.md`; local layered COW restore, fork divergence, bundle/pull materialization, same-class remote KVM proof, corrupt disk-object rejection, warm remote cache reuse, and first KVM benchmark guardrails are implemented. |
