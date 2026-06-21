@@ -80,6 +80,10 @@ description = "Smoke writable rootfs disk layer capture and run-from replay"
 run = "mise run build && scripts/benchmark-writable-rootfs.sh --iterations 1"
 description = "Benchmark writable rootfs COW, sealed append, and replay paths"
 
+[tasks."benchmark:manifest-rootfs-cas"]
+run = "mise run build && scripts/benchmark-manifest-rootfs-cas.py --no-build"
+description = "Benchmark fd-backed rootfs restore against manifest-attached rootfs CAS"
+
 [tasks."smoke:local-pull"]
 run = "mise run build && scripts/smoke-local-pull.sh"
 description = "Smoke local file:// pull materialization and resumed rootfs fan-out"

@@ -265,6 +265,20 @@ can drift from the canonical index bytes.
   local `CasBlockSource` from `rootfs.storage` without the old experiment flag.
   This remains node-local: missing or corrupt local index/chunk objects fail
   closed, and S3/peer distribution of rootfs chunks remains a follow-up slice.
+- The Slice 5 manifest-attached benchmark gate is complete on local HVF with
+  `scripts/benchmark-manifest-rootfs-cas.py` / `mise run benchmark:manifest-rootfs-cas`
+  (`20260621T085323Z-0865bb26`) using
+  `docker.io/library/node@sha256:df4408dadd34d7c54e0f9a6c3acee7d97c61e00975cf6e8b09db4e660ae37534`,
+  64KiB chunks, and `spore run --from <child> -- /usr/local/bin/node -v`.
+  The fd-backed path took 7.824s p50 / 9.873s p95 across 10 children and
+  6.677s p50 / 11.483s p95 across 100 children. Manifest-attached CAS took
+  775ms p50 / 871ms p95 across 10 children and 773ms p50 / 1.260s p95 across
+  100 children. Full-rootfs verification dropped from 536.9MiB and 6.111s
+  median verification elapsed on the 100-child fd-backed run to a 398,819-byte
+  index open in 19ms plus sparse chunk reads/hashing with 488 object opens,
+  31.98MiB hashed, and 6,502 per-VM verified chunk cache hits. The one-time local preload
+  after rootfs prewarm took 10.957s, wrote 2,596 chunk objects / 170.1MiB, and
+  produced a 398,819-byte `rootfs-block-index-v0`.
 
 ## Delivery Strategy
 

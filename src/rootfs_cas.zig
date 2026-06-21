@@ -65,6 +65,7 @@ const LoadedIndex = struct {
     chunk_ids: []?chunk.ChunkId,
     logical_size: u64,
     chunk_size: u64,
+    index_bytes: usize,
 
     fn deinit(self: *LoadedIndex, allocator: std.mem.Allocator) void {
         allocator.free(self.chunk_ids);
@@ -128,7 +129,9 @@ pub const CasBlockSource = struct {
         if (storage.logical_size != rootfs.artifact.size) return error.BadManifest;
         const path = try manifestIndexPath(allocator, cache_root, storage.index_digest);
         defer allocator.free(path);
+        const start_ms = monotonicMs();
         const index = try loadManifestIndex(allocator, path, storage);
+        if (trace_path) |trace| appendIndexOpenTrace(trace, storage, index, monotonicMs() -| start_ms);
         errdefer {
             var mutable_index = index;
             mutable_index.deinit(allocator);
@@ -448,6 +451,7 @@ fn loadIndex(
         .chunk_ids = ids,
         .logical_size = logical_size,
         .chunk_size = loaded_chunk_size,
+        .index_bytes = bytes.len,
     };
 }
 
@@ -475,6 +479,7 @@ fn loadManifestIndex(
         .chunk_ids = ids,
         .logical_size = storage.logical_size,
         .chunk_size = storage.chunk_size,
+        .index_bytes = bytes.len,
     };
 }
 
@@ -626,6 +631,24 @@ fn appendTraceRead(path: [:0]const u8, offset: u64, len: usize, elapsed_ms: u64)
     writeAll(fd, line) catch {};
 }
 
+fn appendIndexOpenTrace(
+    path: [:0]const u8,
+    storage: spore.RootfsStorage,
+    index: LoadedIndex,
+    elapsed_ms: u64,
+) void {
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    var line_buf: [1024]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &line_buf,
+        "{{\"event\":\"rootfs_cas_index_open\",\"index_digest\":\"{s}\",\"logical_size\":{d},\"chunk_size\":{d},\"chunk_count\":{d},\"index_bytes\":{d},\"elapsed_ms\":{d}}}\n",
+        .{ storage.index_digest, index.logical_size, index.chunkSize(), index.chunk_ids.len, index.index_bytes, elapsed_ms },
+    ) catch return;
+    writeAll(fd, line) catch {};
+}
+
 fn writeAll(fd: std.c.fd_t, bytes: []const u8) SourceError!void {
     var remaining = bytes;
     while (remaining.len > 0) {
@@ -673,14 +696,20 @@ test "preload builds an index and cached source verifies chunks once" {
     try std.testing.expectEqual(@as(u64, 1), source.stats.cache_misses);
     try std.testing.expectEqual(@as(u64, 1), source.stats.cache_hits);
 
+    const trace_path = tmp ++ "/cas-trace.jsonl";
+    const trace_path_z = try arena.dupeZ(u8, trace_path);
     var manifest_source = try CasBlockSource.openManifest(allocator, cache_root, .{
         .device = .{ .mmio_slot = 1 },
         .artifact = artifact,
         .storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
-    }, null);
+    }, trace_path_z);
     defer manifest_source.deinit();
     try manifest_source.readAt(&readback, 4100);
     try std.testing.expectEqualStrings("efgh", &readback);
+
+    const trace_bytes = try Io.Dir.cwd().readFileAlloc(io, trace_path, arena, .limited(4096));
+    try std.testing.expect(std.mem.indexOf(u8, trace_bytes, "\"event\":\"rootfs_cas_index_open\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace_bytes, "\"index_digest\":\"") != null);
 }
 
 test "cas source rejects corrupt chunk objects" {
