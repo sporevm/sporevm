@@ -81,6 +81,12 @@ uses the platform cache directory. Cache setup messages are shown only with
 `spore --debug ...`, so command stdout and stderr stay workload-focused by
 default.
 
+OCI layers may contain distinct paths that differ only by case. On hosts with
+case-insensitive filesystems, such as the default macOS APFS configuration,
+SporeVM fails closed rather than corrupting those paths during rootfs staging.
+Use `SPOREVM_ROOTFS_CACHE_DIR` to point the rootfs cache at a case-sensitive
+volume when importing or running those images.
+
 Inspect local rootfs cache usage with:
 
 ```bash
