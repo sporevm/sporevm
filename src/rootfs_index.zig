@@ -1,8 +1,8 @@
 //! Manifest-bound chunked rootfs index parsing.
 //!
 //! This is the portable restore-authority parser for chunked immutable rootfs
-//! storage. The local `rootfs_cas` spike intentionally remains separate until a
-//! later slice attaches this descriptor/index pair to product resume.
+//! storage. Product resume uses it to validate the descriptor-selected local
+//! rootfs CAS index before guest-visible block reads.
 
 const std = @import("std");
 const chunk = @import("chunk.zig");

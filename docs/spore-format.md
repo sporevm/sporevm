@@ -259,10 +259,13 @@ cache hit/fetch counters under `rootfs.cache`.
 - Immutable rootfs artifacts are portable by digest, not by local path. Resume
   opens the digest-addressed rootfs cache entry read-only, verifies the same fd
   by BLAKE3 and size, and only then attaches it to the VM.
-- Manifest-bound chunked rootfs storage descriptors are parsed and validated,
-  but product resume rejects them until the descriptor-selected block source is
-  attached. The fd-backed path must not silently ignore `rootfs.storage` and
-  treat the monolithic artifact as equivalent authority.
+- Manifest-bound chunked rootfs storage descriptors select the rootfs block
+  source for product resume. The runtime opens the exact local
+  `rootfs-block-index-v0` named by `rootfs.storage.index_digest`, validates the
+  index against that descriptor, and serves only BLAKE3-verified local chunk
+  objects. Missing or corrupt index/chunk bytes fail before guest use. The
+  fd-backed path must not silently ignore `rootfs.storage` and treat the
+  monolithic artifact as equivalent authority.
 - Local RAM backing files and `ram.backing.proof` are same-host acceleration
   hints, not portable trust roots. Product restore paths treat a valid proof as
   local provenance for opening a backing fd; invalid or absent proof uses the

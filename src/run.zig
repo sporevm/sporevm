@@ -1808,8 +1808,10 @@ pub fn openRuntimeDisk(init: std.process.Init, allocator: std.mem.Allocator, opt
     const trace_path = try rootfsTracePath(init, allocator);
 
     if (options.rootfs) |rootfs| {
-        if (rootfs.storage != null) return error.BadManifest;
-        if (rootfsCasExperimentEnabled(init)) {
+        if (rootfs.storage != null) {
+            runtime.allocator = allocator;
+            runtime.cas_rootfs = try openManifestCasRootfs(init, allocator, rootfs, options.command_name, trace_path);
+        } else if (rootfsCasExperimentEnabled(init)) {
             runtime.allocator = allocator;
             runtime.cas_rootfs = try openExperimentalCasRootfs(init, allocator, rootfs, options.command_name, trace_path);
         } else {
@@ -1866,6 +1868,21 @@ fn rootfsCasExperimentChunkSize(init: std.process.Init, command_name: []const u8
         failRunSetup("spore {s}: {s} must be a positive multiple of 512 bytes", .{ command_name, rootfs_cas_chunk_size_env });
     }
     return value;
+}
+
+fn openManifestCasRootfs(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    rootfs: spore.Rootfs,
+    command_name: []const u8,
+    trace_path: ?[:0]const u8,
+) !*rootfs_cas.CasBlockSource {
+    const cache_root = try rootfsCacheRootPath(init, allocator, command_name);
+    defer allocator.free(cache_root);
+    const source = try allocator.create(rootfs_cas.CasBlockSource);
+    errdefer allocator.destroy(source);
+    source.* = try rootfs_cas.CasBlockSource.openManifest(allocator, cache_root, rootfs, trace_path);
+    return source;
 }
 
 fn openExperimentalCasRootfs(
@@ -2807,11 +2824,28 @@ test "runtime disk rejects corrupt rootfs before constructing file block source"
     }));
 }
 
-test "runtime disk rejects manifest-bound rootfs storage before product attach" {
+test "runtime disk uses manifest-bound rootfs cas source without experiment flag" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-runtime-disk-manifest-rootfs-cas";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    const rootfs_bytes = ("abcd" ** 1024) ++ ("efgh" ** 1024);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
+
+    const artifact = try cacheRootfsByDigestPath(io, arena, cache_root, rootfs_path);
+    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, 4096);
+
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
+    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
 
     var process_arena = std.heap.ArenaAllocator.init(allocator);
     defer process_arena.deinit();
@@ -2824,25 +2858,69 @@ test "runtime disk rejects manifest-bound rootfs storage before product attach" 
         .preopens = .empty,
     };
 
-    const storage_identity = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
-        .artifact = .{
-            .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            .size = 4096,
-        },
-        .storage = .{
-            .kind = spore.rootfs_storage_kind_chunked_ext4,
-            .device = .{ .mmio_slot = 1 },
-            .logical_size = 4096,
-            .chunk_size = 4096,
-            .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
-            .index_digest = storage_identity,
-            .base_identity = storage_identity,
-            .object_namespace = spore.rootfs_storage_object_namespace,
-        },
+        .artifact = artifact,
+        .storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
     };
-    try std.testing.expectError(error.BadManifest, openRuntimeDisk(init, allocator, .{
+    var runtime = try openRuntimeDisk(init, allocator, .{
+        .rootfs = rootfs,
+        .command_name = "run",
+    });
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.rootfs_fd == null);
+    try std.testing.expect(runtime.cas_rootfs != null);
+    try std.testing.expect(runtime.cow != null);
+    var readback: [4]u8 = undefined;
+    try runtime.cow.?.readAt(&readback, 0);
+    try std.testing.expectEqualStrings("abcd", &readback);
+    try std.testing.expectEqual(@as(u64, 1), runtime.cas_rootfs.?.stats.cache_misses);
+    try runtime.cow.?.readAt(&readback, 0);
+    try std.testing.expectEqual(@as(u64, 1), runtime.cas_rootfs.?.stats.cache_hits);
+}
+
+test "runtime disk manifest rootfs cas fails closed without index" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-runtime-disk-manifest-rootfs-cas-missing";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+
+    const artifact = try cacheRootfsByDigestPath(io, arena, cache_root, rootfs_path);
+    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, 4096);
+    const index_path = try rootfs_cas.manifestIndexPath(arena, cache_root, preload_result.index_digest);
+    try Io.Dir.cwd().deleteFile(io, index_path);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const rootfs = spore.Rootfs{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = artifact,
+        .storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
+    };
+    try std.testing.expectError(error.MissingChunk, openRuntimeDisk(init, allocator, .{
         .rootfs = rootfs,
         .command_name = "run",
     }));

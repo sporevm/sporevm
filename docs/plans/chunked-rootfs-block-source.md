@@ -105,11 +105,12 @@ create a new path for attaching unverified rootfs bytes. `FileBlockSource` may
 only wrap an fd that came from the existing verified rootfs cache path, or an
 equivalent verify-the-same-fd-before-attach path.
 
-`CasBlockSource` is the product follow-up. A manifest-selected rootfs storage
-descriptor is the restore authority for the chunked base. It must not reuse the
-existing `rootfs.source` field, which is OCI provenance only. The exact manifest
-field name can land in Slice 3, but the descriptor must live under rootfs storage
-or artifact identity, not provenance:
+`CasBlockSource` is the product rootfs chunk backend. The local prototype is
+manifest-selected in Slice 5; cross-host distribution and remote lazy reads are
+follow-up work. A manifest-selected rootfs storage descriptor is the restore
+authority for the chunked base. It must not reuse the existing `rootfs.source`
+field, which is OCI provenance only. The descriptor lives under
+`rootfs.storage`, not provenance:
 
 ```text
 rootfs.storage:
@@ -257,9 +258,13 @@ can drift from the canonical index bytes.
   OCI provenance, writable disk validation compares against the effective
   rootfs base identity, and the `rootfs-block-index-v0` parser verifies the
   exact index bytes against the descriptor digest before validating canonical
-  chunk and zero-fill tables. Product resume intentionally rejects manifests
-  with `rootfs.storage` until Slice 5 attaches the descriptor-selected
-  `CasBlockSource`.
+  chunk and zero-fill tables.
+- Slice 5 now has the local manifest-attached prototype: `spore rootfs
+  cas-preload` writes a manifest-bound rootfs block index and can attach
+  `rootfs.storage` to an existing spore, while product resume constructs the
+  local `CasBlockSource` from `rootfs.storage` without the old experiment flag.
+  This remains node-local: missing or corrupt local index/chunk objects fail
+  closed, and S3/peer distribution of rootfs chunks remains a follow-up slice.
 
 ## Delivery Strategy
 
@@ -386,9 +391,30 @@ Keep the first prototype local-only:
 - no S3 path;
 - no remote lazy reads;
 - no fallback to rebuilding missing objects during resume;
-- fail closed on missing or corrupt chunks.
+- fail closed on missing or corrupt chunks;
 - memoize verified chunks per VM so repeated guest reads do not re-open and
   re-hash the same object.
+
+Narrow implementation boundary:
+
+- extend `spore rootfs cas-preload <blake3:digest> [--chunk-size BYTES]` so it
+  writes a manifest-bound `rootfs-block-index-v0` alongside local rootfs chunk
+  objects and reports its `index_digest`;
+- add `--attach-spore DIR` to that preload command as the first local manifest
+  attachment path. It must load `DIR/manifest.json`, require a matching
+  `rootfs.artifact.digest`, attach `rootfs.storage`, and update `disk.base` to
+  the effective chunked rootfs base identity when a writable disk chain exists;
+- reject attach when the spore has no rootfs, has a different rootfs artifact
+  digest, already has conflicting `rootfs.storage`, has a disk base that is
+  neither the old artifact digest nor the new storage identity, or cannot
+  validate after mutation;
+- teach product `spore run --from` / resume disk setup to construct the local
+  `CasBlockSource` from `rootfs.storage` without requiring
+  `SPOREVM_ROOTFS_CAS_EXPERIMENT`. The old env-gated local-index spike can stay
+  temporarily for comparison, but it must not override manifest storage;
+- keep object reads local and descriptor-authoritative: runtime reads the exact
+  index named by `rootfs.storage.index_digest`, validates it with the Slice 4
+  parser, then serves only BLAKE3-verified chunks from the local cache.
 
 Done when warm `spore run --from <child> -- node -v` or an equivalent
 rootfs-backed command avoids the current full-rootfs verification phase without

@@ -1362,7 +1362,7 @@ fn forkGicState(allocator: std.mem.Allocator, state: gicv3.State) Error!gicv3.St
     };
 }
 
-fn validateManifest(manifest: Manifest) Error!void {
+pub fn validateManifest(manifest: Manifest) Error!void {
     if (manifest.version != format_version) return error.BadManifest;
     if (manifest.platform.cpu_profile.len == 0) return error.BadManifest;
     if (manifest.platform.counter_frequency_hz == 0 or

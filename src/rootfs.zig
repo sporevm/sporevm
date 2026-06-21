@@ -13,7 +13,9 @@ const oci = @import("rootfs/oci.zig");
 const oci_layout = @import("rootfs/oci_layout.zig");
 const ownership_mod = @import("rootfs/ownership.zig");
 const registry = @import("rootfs/registry.zig");
+const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
+const spore = @import("spore.zig");
 const tar = @import("rootfs/tar.zig");
 
 const Io = std.Io;
@@ -28,7 +30,7 @@ const usage =
     \\  build <image@sha256:...|image:tag> --output <rootfs.ext4>
     \\  import-oci <layout-dir|layout.tar> --ref local/name:tag
     \\  resolve <image:tag>
-    \\  cas-preload <blake3:digest> [--chunk-size BYTES]
+    \\  cas-preload <blake3:digest> [--chunk-size BYTES] [--attach-spore DIR]
     \\
     \\Options:
     \\  --platform <os/arch>       Target platform (default: linux/arm64)
@@ -90,6 +92,7 @@ const ParsedImportOciOptions = struct {
 const ParsedCasPreloadOptions = struct {
     digest: []const u8,
     chunk_size: u64 = rootfs_cas.default_chunk_size,
+    attach_spore: ?[]const u8 = null,
 };
 
 pub const BuildRequest = struct {
@@ -207,10 +210,14 @@ fn runCasPreload(init: std.process.Init, args: []const []const u8, stdout: *Io.W
     const parsed = try parseCasPreloadOptions(args, stdout);
     const cache_root = try local_paths.rootfsCacheRootPath(arena, init.environ_map);
     const result = try rootfs_cas.preload(init.io, arena, cache_root, parsed.digest, parsed.chunk_size);
+    if (parsed.attach_spore) |spore_dir| {
+        try attachPreloadedRootfsStorage(arena, spore_dir, parsed.digest, result);
+    }
     try stdout.print(
-        "index: {s}\nrootfs: {s}\nrootfs_size: {d}\nchunk_size: {d}\nchunks: {d}\nzero_chunks: {d}\nnonzero_chunks: {d}\nobjects_written: {d}\nobject_bytes_written: {d}\nindex_bytes: {d}\n",
+        "index: {s}\nindex_digest: {s}\nrootfs: {s}\nrootfs_size: {d}\nchunk_size: {d}\nchunks: {d}\nzero_chunks: {d}\nnonzero_chunks: {d}\nobjects_written: {d}\nobject_bytes_written: {d}\nindex_bytes: {d}\n",
         .{
             result.index_path,
+            result.index_digest,
             result.rootfs_digest,
             result.rootfs_size,
             result.chunk_size,
@@ -222,6 +229,9 @@ fn runCasPreload(init: std.process.Init, args: []const []const u8, stdout: *Io.W
             result.index_bytes,
         },
     );
+    if (parsed.attach_spore) |spore_dir| {
+        try stdout.print("attached_spore: {s}\n", .{spore_dir});
+    }
 }
 
 fn parseResolveOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedResolveOptions {
@@ -317,6 +327,7 @@ fn parseCasPreloadOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedC
 
     var digest: ?[]const u8 = null;
     var chunk_size: u64 = rootfs_cas.default_chunk_size;
+    var attach_spore: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -326,6 +337,10 @@ fn parseCasPreloadOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedC
             if (i >= args.len) return error.MissingChunkSize;
             chunk_size = std.fmt.parseInt(u64, args[i], 10) catch return error.InvalidChunkSize;
             if (chunk_size == 0 or chunk_size % 512 != 0 or chunk_size > std.math.maxInt(usize)) return error.InvalidChunkSize;
+        } else if (std.mem.eql(u8, arg, "--attach-spore")) {
+            i += 1;
+            if (i >= args.len) return error.MissingSporeDir;
+            attach_spore = args[i];
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.UnknownRootFSOption;
         } else if (digest == null) {
@@ -338,7 +353,59 @@ fn parseCasPreloadOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedC
     return .{
         .digest = digest orelse return error.MissingRootFSDigest,
         .chunk_size = chunk_size,
+        .attach_spore = attach_spore,
     };
+}
+
+fn attachPreloadedRootfsStorage(
+    allocator: std.mem.Allocator,
+    spore_dir: []const u8,
+    expected_digest: []const u8,
+    preload_result: rootfs_cas.PreloadResult,
+) !void {
+    var parsed = try spore.loadManifest(allocator, spore_dir);
+    defer parsed.deinit();
+    var manifest = parsed.value;
+    var rootfs = manifest.rootfs orelse return error.BadManifest;
+    if (!std.mem.eql(u8, rootfs.artifact.digest, expected_digest)) return error.BadManifest;
+    if (!std.mem.eql(u8, preload_result.rootfs_digest, expected_digest)) return error.BadManifest;
+    if (rootfs.artifact.size != preload_result.rootfs_size) return error.BadManifest;
+
+    const storage = rootfs_cas.storageDescriptor(rootfs.device, preload_result);
+    if (rootfs.storage) |existing| {
+        if (!rootfsStorageMatches(existing, storage)) return error.BadManifest;
+    }
+    rootfs.storage = storage;
+    manifest.rootfs = rootfs;
+
+    if (manifest.disk) |disk_value| {
+        var disk = disk_value;
+        if (!std.mem.eql(u8, disk.base, rootfs.artifact.digest) and
+            !std.mem.eql(u8, disk.base, storage.base_identity)) return error.BadManifest;
+        disk.base = storage.base_identity;
+        manifest.disk = disk;
+    }
+
+    try spore.validateManifest(manifest);
+    try spore.saveManifest(allocator, spore_dir, manifest);
+}
+
+fn rootfsStorageMatches(a: spore.RootfsStorage, b: spore.RootfsStorage) bool {
+    return std.mem.eql(u8, a.kind, b.kind) and
+        rootfsDeviceMatches(a.device, b.device) and
+        a.logical_size == b.logical_size and
+        a.chunk_size == b.chunk_size and
+        std.mem.eql(u8, a.hash_algorithm, b.hash_algorithm) and
+        std.mem.eql(u8, a.index_digest, b.index_digest) and
+        std.mem.eql(u8, a.base_identity, b.base_identity) and
+        std.mem.eql(u8, a.object_namespace, b.object_namespace);
+}
+
+fn rootfsDeviceMatches(a: spore.RootfsDevice, b: spore.RootfsDevice) bool {
+    return std.mem.eql(u8, a.kind, b.kind) and
+        std.mem.eql(u8, a.role, b.role) and
+        a.virtio_device_id == b.virtio_device_id and
+        a.mmio_slot == b.mmio_slot;
 }
 
 fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8, stdout: *Io.Writer) !ParsedBuildOptions {
@@ -1350,6 +1417,151 @@ test "import-oci options require a local mutable ref" {
             &stdout.writer,
         ),
     );
+}
+
+test "cas preload can attach manifest-bound rootfs storage to a spore" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-cas-attach-spore";
+    const spore_dir = tmp ++ "/spore";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, spore_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, 4096);
+    const manifest = try testRootfsAttachManifest(arena, artifact);
+    try spore.saveManifest(arena, spore_dir, manifest);
+
+    try attachPreloadedRootfsStorage(arena, spore_dir, artifact.digest, preload_result);
+
+    const parsed = try spore.loadManifest(arena, spore_dir);
+    defer parsed.deinit();
+    const storage = parsed.value.rootfs.?.storage orelse return error.BadManifest;
+    try std.testing.expectEqualStrings(preload_result.index_digest, storage.index_digest);
+    try std.testing.expectEqualStrings(preload_result.index_digest, storage.base_identity);
+    try std.testing.expectEqual(preload_result.rootfs_size, storage.logical_size);
+    try std.testing.expectEqual(preload_result.chunk_size, storage.chunk_size);
+    try std.testing.expectEqualStrings(storage.base_identity, parsed.value.disk.?.base);
+
+    const first_index_digest = storage.index_digest;
+    try attachPreloadedRootfsStorage(arena, spore_dir, artifact.digest, preload_result);
+    const second = try spore.loadManifest(arena, spore_dir);
+    defer second.deinit();
+    try std.testing.expectEqualStrings(first_index_digest, second.value.rootfs.?.storage.?.index_digest);
+}
+
+test "cas preload attach rejects unexpected disk base" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-cas-attach-spore-bad-disk-base";
+    const spore_dir = tmp ++ "/spore";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, spore_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, 4096);
+    var manifest = try testRootfsAttachManifest(arena, artifact);
+    manifest.disk.?.base = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    try spore.saveManifest(arena, spore_dir, manifest);
+
+    try std.testing.expectError(
+        error.BadManifest,
+        attachPreloadedRootfsStorage(arena, spore_dir, artifact.digest, preload_result),
+    );
+}
+
+fn testRootfsAttachManifest(allocator: std.mem.Allocator, artifact: spore.RootfsArtifactRef) !spore.Manifest {
+    const memory_chunks = try allocator.alloc(?[]const u8, 1);
+    memory_chunks[0] = null;
+    const devices = try allocator.alloc(spore.TransportState, 2);
+    devices[0] = .{
+        .device_id = 3,
+        .status = 0,
+        .device_features_sel = 0,
+        .driver_features_sel = 0,
+        .driver_features = 0,
+        .queue_sel = 0,
+        .interrupt_status = 0,
+        .queues = &.{},
+    };
+    devices[1] = .{
+        .device_id = spore.rootfs_virtio_blk_device_id,
+        .status = 0,
+        .device_features_sel = 0,
+        .driver_features_sel = 0,
+        .driver_features = 0,
+        .queue_sel = 0,
+        .interrupt_status = 0,
+        .queues = &.{},
+    };
+    return .{
+        .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
+            .device_model_version = 4,
+            .ram_base = 0x8000_0000,
+            .ram_size = spore.chunk_size,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0801_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{
+            .gprs = [_]u64{0} ** 31,
+            .pc = 0xffff_ffc0_0000_0000,
+            .cpsr = 0x3c5,
+            .fpcr = 0,
+            .fpsr = 0,
+            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .sys_regs = &.{},
+            .icc_regs = &.{},
+            .vtimer = .{ .cntvct = 123, .cntv_ctl = 1, .cntv_cval = 456 },
+            .gic = .{
+                .kind = .gicv3,
+                .gicv3 = .{
+                    .dist_regs = &.{},
+                    .redist_regs = &.{},
+                    .line_levels = &.{},
+                },
+            },
+        },
+        .devices = devices,
+        .generation = .{
+            .generation = 7,
+            .interrupt_status = 0,
+            .params_b64 = "",
+        },
+        .rootfs = .{
+            .device = .{ .mmio_slot = 1 },
+            .artifact = artifact,
+            .source = .{
+                .requested_ref = "docker.io/library/ruby:3.3",
+                .resolved_image_ref = "docker.io/library/ruby@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                .image_manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                .platform = "linux/arm64",
+                .builder_version = builder_version,
+            },
+        },
+        .disk = .{
+            .device = .{ .mmio_slot = 1 },
+            .size = artifact.size,
+            .base = artifact.digest,
+            .layers = &.{},
+        },
+        .memory = .{ .chunk_size = spore.chunk_size, .chunks = memory_chunks },
+    };
 }
 
 test "local ref cache resolves to digest-pinned local identity" {
