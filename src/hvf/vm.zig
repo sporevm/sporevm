@@ -163,7 +163,10 @@ const ec_wfx: u6 = 0x01;
 const ec_sysreg: u6 = 0x18;
 
 pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
+    const setup_start = monotonicMs();
+    const hv_vm_create_start = setup_start;
     try hvf.check(hvf.hv_vm_create(null), "hv_vm_create");
+    const hv_vm_create_ms = monotonicMs() - hv_vm_create_start;
     defer _ = hvf.hv_vm_destroy();
 
     var resume_parsed: ?std.json.Parsed(spore.Manifest) = null;
@@ -185,6 +188,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     }
 
     // GIC layout from runtime parameters; created before any vCPU.
+    const gic_start = monotonicMs();
     var dist_size: usize = 0;
     var dist_align: usize = 0;
     var redist_size: usize = 0;
@@ -205,22 +209,27 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     try hvf.check(hvf.hv_gic_config_set_distributor_base(gic_config, dist_base), "gic set dist base");
     try hvf.check(hvf.hv_gic_config_set_redistributor_base(gic_config, redist_base), "gic set redist base");
     try hvf.check(hvf.hv_gic_create(gic_config), "hv_gic_create");
+    const gic_ms = monotonicMs() - gic_start;
 
     // Guest RAM. Eager and trusted-file resumes map the whole range up front;
     // lazy chunk resumes leave it unmapped in HVF and materialize chunks from
     // instruction/data-abort exits in the run loop.
     const map_ram_start = monotonicMs();
     const ram_mapping = try mapRam(config, if (resume_parsed) |parsed| parsed.value else null);
-    if (restore_stats) |*stats| stats.map_ram_ms = monotonicMs() - map_ram_start;
+    const map_ram_ms = monotonicMs() - map_ram_start;
+    if (restore_stats) |*stats| stats.map_ram_ms = map_ram_ms;
     defer ram_mapping.deinit();
     defer if (lazy_pager) |*pager| pager.deinit();
     const ram_bytes = ram_mapping.bytes;
     var ram_mapped_at_start = false;
+    var hv_map_ram_ms: u64 = 0;
     if (shouldMapRamAtStart(config, ram_mapping)) {
+        const hv_map_ram_start = monotonicMs();
         try hvf.check(
             hvf.hv_vm_map(ram_bytes.ptr, board.ram_base, ram_bytes.len, hvf.MemoryFlags.rwx),
             "hv_vm_map ram",
         );
+        hv_map_ram_ms = monotonicMs() - hv_map_ram_start;
         ram_mapped_at_start = true;
     }
     defer {
@@ -231,6 +240,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
 
     // Devices: console is virtio-mmio slot 0, disk (if any) follows, then net, vsock, rng.
     // The generation device is a separate fixed MMIO window after the reserved virtio range.
+    const devices_start = monotonicMs();
     var con = console.Console{ .sink = config.console_sink };
     var blk_dev: blk.Blk = undefined;
     var net_dev = net.Net.init(.{ .backend = config.network.backend });
@@ -256,9 +266,11 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     transports_buf[transport_count] = mmio.Transport.init(rng_dev.device());
     transport_count += 1;
     const transports = transports_buf[0..transport_count];
+    const devices_ms = monotonicMs() - devices_start;
 
     // vCPU. Created before the DTB because the framework assigns the
     // redistributor frame from the vCPU's MPIDR affinity.
+    const vcpu_start = monotonicMs();
     var vcpu: hvf.VcpuHandle = undefined;
     var exit: *hvf.VcpuExit = undefined;
     try hvf.check(hvf.hv_vcpu_create(&vcpu, &exit, null), "hv_vcpu_create");
@@ -288,7 +300,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         "gic: dist=0x{x}+0x{x} redist(vcpu0)=0x{x}+0x{x} (region 0x{x}+0x{x})",
         .{ dist_base, dist_size, vcpu_redist_base, redist_stride, redist_base, redist_size },
     );
+    const vcpu_ms = monotonicMs() - vcpu_start;
 
+    var boot_ms: u64 = 0;
     if (config.resume_dir) |spore_dir| {
         // Restore: memory, device, GIC, and vCPU state from the spore.
         const m = resume_parsed.?.value;
@@ -337,6 +351,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     } else {
         // Fresh boot: DTB + kernel. The DTB describes exactly one
         // redistributor frame, where the framework actually put it.
+        const boot_start = monotonicMs();
         const initrd_range = if (config.initrd) |initrd| try boot.planInitrd(ram_bytes.len, board.ram_base, config.kernel, initrd.len) else null;
         const dtb = try board.buildDtb(allocator, .{
             .ram_size = config.ram_size,
@@ -376,6 +391,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 try tracker.startWorker();
             }
         }
+        boot_ms = monotonicMs() - boot_start;
     }
 
     const counter_start = snapshot.hostCounter();
@@ -402,7 +418,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     // Under host load, the delayed wake can cancel the vCPU before the restored
     // guest has actually run. Wait for a real guest exit before delivering RX.
     var exec_probe_guest_exited = exec_probe_rx_enabled;
+    var attach_probe_ms: u64 = 0;
     if (config.exec_probe) |probe| {
+        const attach_probe_start = monotonicMs();
         try vsock_dev.attachHostStream(probe);
         if (!exec_probe_rx_enabled) {
             exec_probe_wake_thread = try std.Thread.spawn(.{}, wakeVcpuAfterMs, .{ vcpu, config.exec_probe_initial_rx_delay_ms, &exec_probe_wake_stop });
@@ -411,6 +429,24 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             probe.markStarted();
             try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
         }
+        attach_probe_ms = monotonicMs() - attach_probe_start;
+    }
+    if (config.resume_dir == null) {
+        std.log.debug(
+            "hvf cold setup timing: total_ms={d} hv_vm_create_ms={d} gic_ms={d} mmap_ram_ms={d} hv_map_ram_ms={d} devices_ms={d} vcpu_ms={d} boot_ms={d} attach_probe_ms={d} ram_mib={d}",
+            .{
+                start_ms - setup_start,
+                hv_vm_create_ms,
+                gic_ms,
+                map_ram_ms,
+                hv_map_ram_ms,
+                devices_ms,
+                vcpu_ms,
+                boot_ms,
+                attach_probe_ms,
+                config.ram_size / 1024 / 1024,
+            },
+        );
     }
     var exec_probe_done = false;
     var logged_first_vcpu_entry = false;
