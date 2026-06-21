@@ -310,6 +310,9 @@ with `spore rootfs import-oci ... --ref local/name:tag`, then run with
 Entrypoint, Cmd, User, Env, or Workdir yet. Set `SPOREVM_ROOTFS_CACHE_DIR` to
 override the cache directory.
 
+On default macOS APFS, SporeVM uses managed case-sensitive staging for OCI
+rootfs materialization; the final rootfs cache remains ordinary ext4/json files.
+
 When combined with `--capture`, `--image` records immutable rootfs identity in
 the spore manifest and stores any writable rootfs changes as sealed disk layers.
 `spore resume` later verifies the cached rootfs bytes by digest, then verifies

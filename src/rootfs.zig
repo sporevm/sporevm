@@ -5,6 +5,7 @@
 //! so layer application is strict and fail-closed.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const chunk = @import("chunk.zig");
 const ext4 = @import("rootfs/ext4.zig");
@@ -898,6 +899,8 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
     const temp_dir = try std.fmt.allocPrint(allocator, "{s}/spore-rootfs-{d}-{x}", .{ temp_dir_root, temp_id, temp_nonce });
     defer Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
     try Io.Dir.cwd().createDirPath(init.io, temp_dir);
+    var materialize_temp = try prepareMaterializeTempDir(init.io, allocator, temp_dir);
+    defer materialize_temp.deinit(init.io);
 
     const layers_dir = try std.fmt.allocPrint(allocator, "{s}/layers", .{temp_dir});
     try Io.Dir.cwd().createDirPath(init.io, layers_dir);
@@ -945,7 +948,7 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
         .mkfs = opts.mkfs,
         .debugfs = opts.debugfs,
         .metadata_rootfs_path = opts.metadata_rootfs_path,
-        .temp_dir = temp_dir,
+        .temp_dir = materialize_temp.path,
     });
 }
 
@@ -958,6 +961,8 @@ fn buildRootFSFromLayout(init: std.process.Init, allocator: std.mem.Allocator, o
     const temp_dir = try std.fmt.allocPrint(allocator, "{s}/spore-rootfs-{d}-{x}", .{ opts.temp_dir_root, temp_id, temp_nonce });
     defer Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
     try Io.Dir.cwd().createDirPath(init.io, temp_dir);
+    var materialize_temp = try prepareMaterializeTempDir(init.io, allocator, temp_dir);
+    defer materialize_temp.deinit(init.io);
 
     if (opts.source.layers.len > max_rootfs_layers) return error.RootFSTooManyLayers;
 
@@ -984,8 +989,66 @@ fn buildRootFSFromLayout(init: std.process.Init, allocator: std.mem.Allocator, o
         .mkfs = opts.mkfs,
         .debugfs = opts.debugfs,
         .metadata_rootfs_path = opts.metadata_rootfs_path,
-        .temp_dir = temp_dir,
+        .temp_dir = materialize_temp.path,
     });
+}
+
+const MaterializeTempDir = struct {
+    path: []const u8,
+    mountpoint: ?[]const u8 = null,
+
+    fn deinit(self: *MaterializeTempDir, io: Io) void {
+        if (self.mountpoint) |mountpoint| {
+            runProcess(io, &.{ "/usr/bin/hdiutil", "detach", "-quiet", mountpoint }) catch |err| {
+                std.log.warn("spore rootfs: failed to detach managed case-sensitive staging volume {s}: {s}", .{ mountpoint, @errorName(err) });
+            };
+        }
+    }
+};
+
+fn prepareMaterializeTempDir(io: Io, allocator: std.mem.Allocator, temp_dir: []const u8) !MaterializeTempDir {
+    var dir = try Io.Dir.cwd().openDir(io, temp_dir, .{ .iterate = true });
+    defer dir.close(io);
+    if (try tar.isCaseSensitiveDirectory(io, dir)) return .{ .path = temp_dir };
+
+    if (comptime builtin.os.tag != .macos) return .{ .path = temp_dir };
+
+    const image_path = try std.fmt.allocPrint(allocator, "{s}/case-sensitive.sparseimage", .{temp_dir});
+    const mountpoint = try std.fmt.allocPrint(allocator, "{s}/case-sensitive", .{temp_dir});
+    try Io.Dir.cwd().createDirPath(io, mountpoint);
+    try runProcess(io, &.{
+        "/usr/bin/hdiutil",
+        "create",
+        "-quiet",
+        "-type",
+        "SPARSE",
+        "-size",
+        "128g",
+        "-fs",
+        "Case-sensitive APFS",
+        "-volname",
+        "SporeVMRootFS",
+        image_path,
+    });
+    errdefer Io.Dir.cwd().deleteFile(io, image_path) catch {};
+    try runProcess(io, &.{ "/usr/bin/hdiutil", "attach", "-quiet", "-nobrowse", "-mountpoint", mountpoint, image_path });
+    return .{ .path = mountpoint, .mountpoint = mountpoint };
+}
+
+fn runProcess(io: Io, argv: []const []const u8) !void {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+    const term = try child.wait(io);
+    const ok = switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) return error.ProcessFailed;
 }
 
 fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: MaterializeOptions) !BuildResult {

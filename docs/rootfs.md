@@ -83,9 +83,9 @@ default.
 
 OCI layers may contain distinct paths that differ only by case. On hosts with
 case-insensitive filesystems, such as the default macOS APFS configuration,
-SporeVM fails closed rather than corrupting those paths during rootfs staging.
-Use `SPOREVM_ROOTFS_CACHE_DIR` to point the rootfs cache at a case-sensitive
-volume when importing or running those images.
+SporeVM uses managed case-sensitive staging for rootfs materialization rather
+than corrupting those paths. `SPOREVM_ROOTFS_CACHE_DIR` still overrides the
+final ext4/json cache location.
 
 Inspect local rootfs cache usage with:
 
