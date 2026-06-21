@@ -58,15 +58,15 @@ load_github_token() {
 verify_release_archive() {
   local asset_path="$1"
   local root_dir="$2"
-  local entry
+  local entry listing
 
-  tar -tzf "${asset_path}" >/dev/null
+  listing="$(tar -tzf "${asset_path}")"
   for entry in \
     "${root_dir}/spore" \
     "${root_dir}/LICENSE" \
     "${root_dir}/README.md" \
     "${root_dir}/share/sporevm/minimal-exec-initrd.cpio"; do
-    tar -tzf "${asset_path}" | grep -Fxq "${entry}" \
+    grep -Fxq "${entry}" <<<"${listing}" \
       || die "missing ${entry} in ${asset_path}"
   done
 }
