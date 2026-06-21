@@ -35,7 +35,7 @@ and host-signalled capture, product `spore resume`, explicit fork/fan-out, and
 immutable-rootfs resume for captured `--image` workloads.
 The default managed run kernel is also checked against its release `.config` for
 guest runtime features that Docker/containerd expect, including file locking,
-tmpfs/shmem, fsnotify/inotify, and cgroup BPF support.
+tmpfs/shmem, fsnotify/inotify, cgroups, and cgroup BPF support.
 
 ## Landed Product Contract
 
@@ -123,11 +123,14 @@ mint child spores with `spore fork`, then resume them individually or through
   directory.
 - Managed kernel resolution lives in the product path and verifies downloaded
   assets, including the run-kernel `.config` sidecar.
+- The minimal initrd mounts cgroup2 at `/sys/fs/cgroup` and exposes it inside
+  rootfs-backed runs so Docker sees a unified writable cgroup hierarchy.
 - `scripts/make-minimal-exec-initrd.sh` builds the minimal guest exec agent and
   diskless helper binaries used by the bridge smokes.
 - `scripts/smoke-run.sh`, `scripts/smoke-run-capture.sh`,
-  `scripts/smoke-run-file-locking.sh`, `scripts/smoke-counter-fanout.sh`, and
-  `scripts/smoke-rootfs-fanout.sh` cover the landed bridge surface.
+  `scripts/smoke-run-file-locking.sh`, `scripts/smoke-run-cgroup.sh`,
+  `scripts/smoke-counter-fanout.sh`, and `scripts/smoke-rootfs-fanout.sh` cover
+  the landed bridge surface.
 
 ## Safety And Invariants
 
@@ -138,6 +141,8 @@ mint child spores with `spore fork`, then resume them individually or through
 - Downloaded kernels are verified before use, and the managed run kernel must
   provide the file-locking and Docker-adjacent options required by the product
   smoke surface.
+- The guest cgroup2 mount is runtime-owned. Workloads may use it, but SporeVM
+  does not expose a host cgroup policy boundary through this mount.
 - Cached OCI rootfs images are never mounted writable by default.
 - Rootfs execution uses the existing virtio-blk device and does not widen the
   frozen device model.

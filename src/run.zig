@@ -40,6 +40,7 @@ const default_kernel_repository = "buildkite/cleanroom-kernels";
 const default_kernel_release = "v0.5.1";
 const default_kernel_version = "6.1.155";
 const managed_run_kernel_required_config_symbols = [_][]const u8{
+    "CONFIG_CGROUPS",
     "CONFIG_FILE_LOCKING",
     "CONFIG_SHMEM",
     "CONFIG_TMPFS",
@@ -47,6 +48,10 @@ const managed_run_kernel_required_config_symbols = [_][]const u8{
     "CONFIG_INOTIFY_USER",
     "CONFIG_BPF_SYSCALL",
     "CONFIG_CGROUP_BPF",
+    "CONFIG_MEMCG",
+    "CONFIG_CGROUP_PIDS",
+    "CONFIG_CPUSETS",
+    "CONFIG_CGROUP_DEVICE",
 };
 const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
@@ -3271,12 +3276,17 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = config_path,
         .data = "CONFIG_FILE_LOCKING=y\n" ++
+            "CONFIG_CGROUPS=y\n" ++
             "CONFIG_SHMEM=y\n" ++
             "CONFIG_TMPFS=y\n" ++
             "CONFIG_FSNOTIFY=y\n" ++
             "CONFIG_INOTIFY_USER=y\n" ++
             "CONFIG_BPF_SYSCALL=y\n" ++
-            "CONFIG_CGROUP_BPF=y\n",
+            "CONFIG_CGROUP_BPF=y\n" ++
+            "CONFIG_MEMCG=y\n" ++
+            "CONFIG_CGROUP_PIDS=y\n" ++
+            "CONFIG_CPUSETS=y\n" ++
+            "CONFIG_CGROUP_DEVICE=y\n",
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_sha_path, .data = "not-a-sha\n" });
 
@@ -3297,35 +3307,50 @@ test "managed run kernel config requires Docker runtime symbols" {
     const good_config =
         "# CONFIG_DEVMEM is not set\n" ++
         "CONFIG_FILE_LOCKING=y\n" ++
+        "CONFIG_CGROUPS=y\n" ++
         "CONFIG_SHMEM=y\n" ++
         "CONFIG_TMPFS=y\n" ++
         "CONFIG_FSNOTIFY=y\n" ++
         "CONFIG_INOTIFY_USER=y\n" ++
         "CONFIG_BPF_SYSCALL=y\n" ++
-        "CONFIG_CGROUP_BPF=y\n";
+        "CONFIG_CGROUP_BPF=y\n" ++
+        "CONFIG_MEMCG=y\n" ++
+        "CONFIG_CGROUP_PIDS=y\n" ++
+        "CONFIG_CPUSETS=y\n" ++
+        "CONFIG_CGROUP_DEVICE=y\n";
 
     try std.testing.expect(try missingManagedRunKernelConfigSymbol(allocator, good_config) == null);
 
     const missing_file_locking =
         "# CONFIG_FILE_LOCKING is not set\n" ++
+        "CONFIG_CGROUPS=y\n" ++
         "CONFIG_SHMEM=y\n" ++
         "CONFIG_TMPFS=y\n" ++
         "CONFIG_FSNOTIFY=y\n" ++
         "CONFIG_INOTIFY_USER=y\n" ++
         "CONFIG_BPF_SYSCALL=y\n" ++
-        "CONFIG_CGROUP_BPF=y\n";
+        "CONFIG_CGROUP_BPF=y\n" ++
+        "CONFIG_MEMCG=y\n" ++
+        "CONFIG_CGROUP_PIDS=y\n" ++
+        "CONFIG_CPUSETS=y\n" ++
+        "CONFIG_CGROUP_DEVICE=y\n";
     const missing = (try missingManagedRunKernelConfigSymbol(allocator, missing_file_locking)).?;
     defer allocator.free(missing);
     try std.testing.expectEqualStrings("CONFIG_FILE_LOCKING", missing);
 
     const module_value =
         "CONFIG_FILE_LOCKING=m\n" ++
+        "CONFIG_CGROUPS=y\n" ++
         "CONFIG_SHMEM=y\n" ++
         "CONFIG_TMPFS=y\n" ++
         "CONFIG_FSNOTIFY=y\n" ++
         "CONFIG_INOTIFY_USER=y\n" ++
         "CONFIG_BPF_SYSCALL=y\n" ++
-        "CONFIG_CGROUP_BPF=y\n";
+        "CONFIG_CGROUP_BPF=y\n" ++
+        "CONFIG_MEMCG=y\n" ++
+        "CONFIG_CGROUP_PIDS=y\n" ++
+        "CONFIG_CPUSETS=y\n" ++
+        "CONFIG_CGROUP_DEVICE=y\n";
     const module_missing = (try missingManagedRunKernelConfigSymbol(allocator, module_value)).?;
     defer allocator.free(module_missing);
     try std.testing.expectEqualStrings("CONFIG_FILE_LOCKING", module_missing);

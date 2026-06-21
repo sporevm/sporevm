@@ -36,6 +36,10 @@ description = "Smoke product spore run streaming and exit status"
 run = "mise run build && scripts/smoke-run-file-locking.sh"
 description = "Smoke product spore run guest file locking support"
 
+[tasks."smoke:run-cgroup"]
+run = "mise run build && scripts/smoke-run-cgroup.sh"
+description = "Smoke product spore run guest cgroup2 support"
+
 [tasks."smoke:run-capture"]
 run = "mise run build && scripts/smoke-run-capture.sh"
 description = "Smoke product spore run signal capture and resume"

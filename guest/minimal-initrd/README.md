@@ -16,6 +16,8 @@ one A-record query to the configured resolver and prints the first IPv4 answer.
 supports `-qO-` and streams bounded response bodies to stdout.
 `flockcheck.c` verifies guest `flock(2)` behavior for runtime paths such as
 Docker and containerd metadata databases.
+`cgroupcheck.c` verifies the cgroup2 mount behavior Docker expects before daemon
+startup.
 
 Keep this directory source-only. `scripts/make-minimal-exec-initrd.sh` owns
 compiling these files into static aarch64 binaries and packing the initrd.
