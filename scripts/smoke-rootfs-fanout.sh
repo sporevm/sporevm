@@ -55,6 +55,8 @@ capture_dir="${workdir}/ruby-base.spore"
 fork_dir="${workdir}/children"
 run_stdout="${workdir}/run.stdout"
 run_stderr="${workdir}/run.stderr"
+base_from_stdout="${workdir}/run-from-base.stdout"
+base_from_stderr="${workdir}/run-from-base.stderr"
 if [[ "${image_ref}" == *@sha256:* ]]; then
   resolved_image_ref="${image_ref}"
 else
@@ -75,6 +77,26 @@ printf 'rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}"
 [[ -f "${capture_dir}/manifest.json" ]] || die "capture did not write ${capture_dir}/manifest.json"
 grep -Fq '"rootfs"' "${capture_dir}/manifest.json" || die "capture manifest did not record rootfs metadata"
 grep -Fq '"digest": "blake3:' "${capture_dir}/manifest.json" || die "capture manifest did not record a rootfs digest"
+
+"${spore_bin}" run \
+  --backend "${backend}" \
+  --from "${capture_dir}" \
+  -- /bin/sh -lc 'echo rootfs-base-out; echo rootfs-base-err >&2' \
+  >"${base_from_stdout}" 2>"${base_from_stderr}" || {
+  cat "${base_from_stdout}" >&2 || true
+  cat "${base_from_stderr}" >&2 || true
+  die "rootfs base run-from output command failed"
+}
+grep -Fxq "rootfs-base-out" "${base_from_stdout}" || {
+  cat "${base_from_stdout}" >&2 || true
+  cat "${base_from_stderr}" >&2 || true
+  die "rootfs base run-from did not stream stdout"
+}
+grep -Fxq "rootfs-base-err" "${base_from_stderr}" || {
+  cat "${base_from_stdout}" >&2 || true
+  cat "${base_from_stderr}" >&2 || true
+  die "rootfs base run-from did not stream stderr"
+}
 
 "${spore_bin}" fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
 
