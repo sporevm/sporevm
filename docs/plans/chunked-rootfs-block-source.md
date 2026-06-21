@@ -17,6 +17,7 @@ producer path: `spore rootfs build` writes chunked rootfs CAS storage, and
 preload step.
 
 Use `docs/filesystem.md` for the current `CasBlockSource`,
-`rootfs.storage`, distribution, cache, and verification contract. The
-manifest-attached benchmark remains available as
+`rootfs.storage`, distribution, cache, and verification contract. The old
+env-gated local-index spike has been removed, so manifest storage is the only
+CAS runtime selector. The manifest-attached benchmark remains available as
 `mise run benchmark:manifest-rootfs-cas`.
