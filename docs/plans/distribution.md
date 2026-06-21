@@ -260,6 +260,13 @@ an attached rootfs fd.
   file set, verifies the bundle digest before materialization, reports
   `remote.peer_bytes_read`, and reuses the node-local remote bundle cache on
   repeated pulls.
+- Remote smoke metrics report `unique_content_bytes`, `origin_egress_bytes`,
+  `origin_egress_multiplier_vs_bundle`, and
+  `origin_egress_multiplier_vs_unique_content`. In source-peer mode the source
+  peer is the measured origin edge; otherwise object-store origin bytes are.
+  Passing `--max-origin-egress-multiplier-vs-bundle` or
+  `--max-origin-egress-multiplier-vs-content` to
+  `scripts/smoke-remote-bundle.sh` turns those measurements into a release gate.
 - Indexed bundles now carry manifest-attached chunked rootfs storage. A selected
   child with `rootfs.storage` materializes by installing the bundled
   descriptor-bound rootfs block index and referenced rootfs chunk objects into
@@ -519,6 +526,8 @@ cannot become restore authority.
 - Peer remote smoke: serve a bundle from a source or relay host over HTTP,
   materialize destinations through `spore pull http://...@sha256:<bundle>`,
   resume selected children, and record peer bytes separately from origin bytes.
+  Use the optional max-origin-egress multiplier flags when closing the
+  foundation fan-out egress gate.
 - Rootfs remote smoke: run `scripts/smoke-remote-bundle.sh --workload rootfs`
   against source/destination A1 hosts and confirm the output reports bundled
   rootfs payloads, cold destination rootfs bytes fetched, warm destination

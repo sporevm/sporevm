@@ -181,11 +181,25 @@ implementation and evidence include:
   direct-S3, HTTP-peer, destination cache reuse, corrupt rejection, rootfs, and
   KVM networking release checks;
 - ten-instance star and source-to-relay-to-leaf smoke runs.
+- `scripts/smoke-remote-bundle.sh` now emits source/origin egress metrics for
+  fan-out runs and can fail the run when optional
+  `--max-origin-egress-multiplier-vs-bundle` or
+  `--max-origin-egress-multiplier-vs-content` ceilings are exceeded. In peer
+  mode the source peer is treated as the origin edge; otherwise S3 origin bytes
+  are used.
+- The first egress-gated live run, `fanout-egress-20260621T121315Z`, passed on
+  the available A1 pair (`i-07ccd00f26fbaec6d` source peer at `10.44.0.158`,
+  `i-0521d926e8cba111d` destination). The destination pulled over digest-pinned
+  HTTP from the source peer, resumed the KVM child, rejected a corrupted bundle,
+  and reported S3 origin bytes of `0`, source-peer egress of `29,401,288`
+  bytes, unique content bytes of `29,360,128`, source/origin egress multiplier
+  `1.0x` vs bundle bytes, and `1.001402x` vs unique content bytes.
 
 What remains:
 
-1. Measure origin egress as a small multiple of unique chunk bytes across larger
-   identical-host fleets.
+1. Repeat the opt-in egress gate with more than the current two-host A1 dev pair
+   or a relay/tree topology when capacity is available, and record the measured
+   origin/source egress multiplier.
 2. Keep corrupt peer/origin data rejected by chunk and rootfs verification as a
    release regression.
 

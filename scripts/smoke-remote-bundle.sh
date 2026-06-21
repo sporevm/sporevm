@@ -63,6 +63,10 @@ Options:
                               remote source checkout
   --tree-relay ID:IP          relay instance and private IP for source→relay→leaf fan-out
                               (repeatable; relays also run one resume)
+  --max-origin-egress-multiplier-vs-bundle N
+                              fail if source/origin egress exceeds N× bundle bytes
+  --max-origin-egress-multiplier-vs-content N
+                              fail if source/origin egress exceeds N× unique content bytes
   --source-network-smokes     run KVM networking smokes on the source host before bundling
   --ssm-timeout-seconds N     per-host SSM command timeout (default: 1800)
   --run-id ID                 stable run ID (default: UTC timestamp + uuid)
@@ -134,6 +138,8 @@ source_network_smokes=0
 ssm_timeout_seconds="1800"
 run_id=""
 keep_remote=0
+max_origin_egress_multiplier_vs_bundle=""
+max_origin_egress_multiplier_vs_content=""
 
 while (($#)); do
   case "$1" in
@@ -164,6 +170,16 @@ while (($#)); do
       [[ -n "${relay_id}" && -n "${relay_ip}" ]] || die "--tree-relay must be INSTANCE_ID:IP"
       tree_relay_ids+=("${relay_id}")
       tree_relay_ips+=("${relay_ip}")
+      shift 2
+      ;;
+    --max-origin-egress-multiplier-vs-bundle)
+      need_value "$1" "${2-}"
+      max_origin_egress_multiplier_vs_bundle="$2"
+      shift 2
+      ;;
+    --max-origin-egress-multiplier-vs-content)
+      need_value "$1" "${2-}"
+      max_origin_egress_multiplier_vs_content="$2"
       shift 2
       ;;
     --bucket)
@@ -339,6 +355,14 @@ do
   name="${pair%%:*}"
   value="${pair#*:}"
   [[ "${value}" =~ ^[0-9]+$ && "${value}" -gt 0 ]] || die "--${name} must be a positive integer"
+done
+for pair in \
+  "max-origin-egress-multiplier-vs-bundle:${max_origin_egress_multiplier_vs_bundle}" \
+  "max-origin-egress-multiplier-vs-content:${max_origin_egress_multiplier_vs_content}"
+do
+  name="${pair%%:*}"
+  value="${pair#*:}"
+  [[ -z "${value}" || "${value}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--${name} must be a non-negative number"
 done
 
 command -v aws >/dev/null 2>&1 || die "aws CLI is required"
@@ -1445,6 +1469,8 @@ writable_rootfs = bool(source.get("writable_rootfs", False))
 rootfs_storage = source.get("rootfs_storage", "exact")
 rootfs_artifact_count = int(source.get("rootfs_artifact_count", 0))
 rootfs_payload_bytes = int(source.get("rootfs_payload_bytes", 0))
+disk_object_bytes = int(source.get("disk_object_bytes", 0))
+unique_content_bytes = unique_chunk_bytes + disk_object_bytes + rootfs_payload_bytes
 total_destination_download_bytes = sum(int(d["downloaded_bundle_bytes"]) for d in dests)
 total_destination_origin_bytes = sum(int(d.get("origin_downloaded_bundle_bytes", d["downloaded_bundle_bytes"])) for d in dests)
 total_destination_peer_bytes = sum(int(d.get("peer_downloaded_bundle_bytes", 0)) for d in dests)
@@ -1472,6 +1498,12 @@ for dest in dests:
 source_peer_egress_bytes = peer_egress_by_upstream.get(source_peer_host, 0)
 relay_peer_egress_bytes = total_destination_peer_bytes - source_peer_egress_bytes
 max_peer_egress_bytes = max(peer_egress_by_upstream.values(), default=0)
+if source_peer_enabled:
+    origin_egress_source = "source-peer"
+    origin_egress_bytes = source_peer_egress_bytes
+else:
+    origin_egress_source = "object-store"
+    origin_egress_bytes = total_destination_origin_bytes
 
 if relays:
     origin_mode = "source-peer-http-tree"
@@ -1518,8 +1550,9 @@ json.dump({
     "writable_rootfs": writable_rootfs,
     "bundle_bytes": bundle_bytes,
     "unique_chunk_bytes": unique_chunk_bytes,
+    "unique_content_bytes": unique_content_bytes,
     "disk_object_count": int(source.get("disk_object_count", 0)),
-    "disk_object_bytes": int(source.get("disk_object_bytes", 0)),
+    "disk_object_bytes": disk_object_bytes,
     "rootfs_artifact_count": rootfs_artifact_count,
     "rootfs_payload_bytes": rootfs_payload_bytes,
     "bundle_key": source["bundle_key"],
@@ -1535,6 +1568,8 @@ json.dump({
     "relay_peer_egress_bytes": relay_peer_egress_bytes,
     "max_peer_egress_bytes": max_peer_egress_bytes,
     "peer_egress_by_upstream": peer_egress_by_upstream,
+    "origin_egress_source": origin_egress_source,
+    "origin_egress_bytes": origin_egress_bytes,
     "total_cache_hits": total_cache_hits,
     "total_cache_misses": total_cache_misses,
     "total_corrupt_bundle_rejections": total_corrupt_bundle_rejections,
@@ -1544,6 +1579,8 @@ json.dump({
     "origin_multiplier_vs_bundle": ratio(total_destination_origin_bytes, bundle_bytes),
     "origin_multiplier_vs_unique_chunks": ratio(total_destination_origin_bytes, unique_chunk_bytes),
     "origin_multiplier_vs_resume_bundle": ratio(total_destination_origin_bytes, bundle_bytes * total_resume_count),
+    "origin_egress_multiplier_vs_bundle": ratio(origin_egress_bytes, bundle_bytes),
+    "origin_egress_multiplier_vs_unique_content": ratio(origin_egress_bytes, unique_content_bytes),
     "origin_mode": origin_mode,
     "destinations": dests,
 }, sys.stdout, indent=2)
@@ -1552,6 +1589,17 @@ PY
 
 aws s3 cp "${metrics_path}" "${s3_base}/metrics.json" --region "${region}" --only-show-errors
 cat "${metrics_path}"
+
+egress_gate_args=()
+if [[ -n "${max_origin_egress_multiplier_vs_bundle}" ]]; then
+  egress_gate_args+=(--max-origin-egress-multiplier-vs-bundle "${max_origin_egress_multiplier_vs_bundle}")
+fi
+if [[ -n "${max_origin_egress_multiplier_vs_content}" ]]; then
+  egress_gate_args+=(--max-origin-egress-multiplier-vs-content "${max_origin_egress_multiplier_vs_content}")
+fi
+if ((${#egress_gate_args[@]} > 0)); then
+  "${repo_root}/scripts/check-remote-bundle-egress.py" "${egress_gate_args[@]}" "${metrics_path}"
+fi
 
 total_dest_count=$(( ${#dest_instances[@]} + ${#tree_relay_ids[@]} ))
 echo "remote bundle smoke ok: workload=${workload} source=${source_instance} dest_count=${total_dest_count} s3=${s3_base}/"
