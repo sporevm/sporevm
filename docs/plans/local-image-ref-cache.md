@@ -125,7 +125,7 @@ The file stores human-readable metadata and the immutable cache target:
   "version": 1,
   "requested_ref": "docker.io/library/ruby:3.3-alpine",
   "platform": "linux/arm64",
-  "builder_version": "sporevm-rootfs-v2",
+  "builder_version": "sporevm-rootfs-v3",
   "resolved_image_ref": "docker.io/library/ruby@sha256:f22bbb...",
   "image_manifest_digest": "sha256:f22bbb...",
   "rootfs_cache_key": "d78e3ac...",

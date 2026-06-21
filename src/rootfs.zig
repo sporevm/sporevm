@@ -22,7 +22,10 @@ const xattrs_mod = @import("rootfs/xattrs.zig");
 const Io = std.Io;
 
 const max_rootfs_layers: usize = 512;
-pub const builder_version = "sporevm-rootfs-v2";
+pub const builder_version = "sporevm-rootfs-v3";
+const resolver_placeholder_path = "etc/resolv.conf";
+const resolver_placeholder_bytes =
+    "# SporeVM generated placeholder; --net bind-mounts the guest resolver here.\n";
 
 const usage =
     \\Usage: spore rootfs <command>
@@ -1014,6 +1017,7 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "run", 0o755);
     try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "sys", 0o755);
     try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "tmp", 0o1777);
+    try ensureResolverPlaceholder(allocator, init.io, rootfs_dir, &owners);
     try recordImplicitDirectoryOwnership(allocator, init.io, rootfs_dir, &owners, "");
 
     const deterministic_ext4 = ext4.Determinism.fromDigest(opts.manifest_digest);
@@ -1279,6 +1283,44 @@ fn ensureRequiredDir(
     if (stat.kind != .directory) return error.RequiredRootFSPathNotDirectory;
     root.setFilePermissions(io, rel, permissionsFromMode(mode, .default_dir), .{ .follow_symlinks = false }) catch {};
     try ownership_mod.record(allocator, ownership, rel, .{ .uid = 0, .gid = 0 });
+}
+
+fn ensureResolverPlaceholder(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Io.Dir,
+    ownership: *OwnershipMap,
+) !void {
+    if (root.statFile(io, "etc", .{ .follow_symlinks = false })) |stat| {
+        if (stat.kind != .directory) return error.RequiredRootFSPathNotDirectory;
+    } else |err| {
+        switch (err) {
+            error.FileNotFound => {
+                const permissions = permissionsFromMode(0o755, .default_dir);
+                try root.createDir(io, "etc", permissions);
+                root.setFilePermissions(io, "etc", permissions, .{ .follow_symlinks = false }) catch {};
+                try ownership_mod.record(allocator, ownership, "etc", .{ .uid = 0, .gid = 0 });
+            },
+            else => |e| return e,
+        }
+    }
+
+    if (root.statFile(io, resolver_placeholder_path, .{ .follow_symlinks = false })) |_| {
+        return;
+    } else |err| {
+        switch (err) {
+            error.FileNotFound => {
+                const permissions = permissionsFromMode(0o644, .default_file);
+                var file = try root.createFile(io, resolver_placeholder_path, .{ .permissions = permissions });
+                defer file.close(io);
+                try file.writeStreamingAll(io, resolver_placeholder_bytes);
+                file.setPermissions(io, permissions) catch {};
+                try ownership_mod.record(allocator, ownership, resolver_placeholder_path, .{ .uid = 0, .gid = 0 });
+                return;
+            },
+            else => |e| return e,
+        }
+    }
 }
 
 fn recordImplicitDirectoryOwnership(
@@ -1687,6 +1729,98 @@ test "required mount directories reject symlinks" {
     try std.testing.expectError(
         error.RequiredRootFSPathNotDirectory,
         ensureRequiredDir(allocator, io, root, &ownership, "dev", 0o755),
+    );
+}
+
+test "rootfs materialization creates missing resolver placeholder" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-resolver-placeholder";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var root = try Io.Dir.cwd().createDirPathOpen(io, tmp, .{
+        .open_options = .{ .access_sub_paths = true, .iterate = true },
+    });
+    defer root.close(io);
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+
+    try ensureResolverPlaceholder(allocator, io, root, &ownership);
+
+    const etc = try root.statFile(io, "etc", .{ .follow_symlinks = false });
+    const resolv = try root.statFile(io, resolver_placeholder_path, .{ .follow_symlinks = false });
+    try std.testing.expect(etc.kind == .directory);
+    try std.testing.expect(resolv.kind == .file);
+    const bytes = try root.readFileAlloc(io, resolver_placeholder_path, allocator, .limited(256));
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings(resolver_placeholder_bytes, bytes);
+    try std.testing.expectEqual(@as(u32, 0), ownership.get("etc").?.uid);
+    try std.testing.expectEqual(@as(u32, 0), ownership.get(resolver_placeholder_path).?.gid);
+}
+
+test "rootfs materialization preserves existing resolver file" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-resolver-preserve-file";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var root = try Io.Dir.cwd().createDirPathOpen(io, tmp, .{
+        .open_options = .{ .access_sub_paths = true, .iterate = true },
+    });
+    defer root.close(io);
+    try root.createDirPath(io, "etc");
+    try root.writeFile(io, .{ .sub_path = resolver_placeholder_path, .data = "nameserver 1.1.1.1\n" });
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+
+    try ensureResolverPlaceholder(allocator, io, root, &ownership);
+
+    const bytes = try root.readFileAlloc(io, resolver_placeholder_path, allocator, .limited(256));
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("nameserver 1.1.1.1\n", bytes);
+    try std.testing.expect(ownership.get(resolver_placeholder_path) == null);
+}
+
+test "rootfs materialization preserves existing resolver symlink" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-resolver-preserve-symlink";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var root = try Io.Dir.cwd().createDirPathOpen(io, tmp, .{
+        .open_options = .{ .access_sub_paths = true, .iterate = true },
+    });
+    defer root.close(io);
+    try root.createDirPath(io, "etc");
+    try root.symLink(io, "../run/systemd/resolve/resolv.conf", resolver_placeholder_path, .{});
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+
+    try ensureResolverPlaceholder(allocator, io, root, &ownership);
+
+    const stat = try root.statFile(io, resolver_placeholder_path, .{ .follow_symlinks = false });
+    try std.testing.expect(stat.kind == .sym_link);
+    try std.testing.expect(ownership.get(resolver_placeholder_path) == null);
+}
+
+test "rootfs materialization does not follow etc symlink for resolver placeholder" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-resolver-etc-symlink";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var root = try Io.Dir.cwd().createDirPathOpen(io, tmp, .{
+        .open_options = .{ .access_sub_paths = true, .iterate = true },
+    });
+    defer root.close(io);
+    try root.createDirPath(io, "target");
+    try root.symLink(io, "target", "etc", .{});
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+
+    try std.testing.expectError(
+        error.RequiredRootFSPathNotDirectory,
+        ensureResolverPlaceholder(allocator, io, root, &ownership),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        root.statFile(io, "target/resolv.conf", .{ .follow_symlinks = false }),
     );
 }
 

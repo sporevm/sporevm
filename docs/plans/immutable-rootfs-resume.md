@@ -69,7 +69,7 @@ The captured manifest includes one optional `rootfs` artifact section:
       "resolved_image_ref": "docker.io/library/ruby@sha256:<manifest>",
       "image_manifest_digest": "sha256:<manifest>",
       "platform": "linux/arm64",
-      "builder_version": "sporevm-rootfs-v2"
+      "builder_version": "sporevm-rootfs-v3"
     }
   }
 }
