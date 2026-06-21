@@ -1,9 +1,10 @@
 ---
 status: active
-last_reviewed: 2026-06-16
+last_reviewed: 2026-06-22
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/lifecycle-monitor.md
+  - docs/filesystem.md
   - docs/rootfs.md
   - src/local_paths.zig
   - src/run.zig
@@ -11,7 +12,7 @@ spec_refs:
 related_plans:
   - docs/plans/foundation.md
   - docs/plans/lifecycle-monitor.md
-  - docs/plans/immutable-rootfs-resume.md
+  - docs/filesystem.md
 ---
 
 # Local Image Ref Cache Plan

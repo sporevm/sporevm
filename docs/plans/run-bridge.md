@@ -1,6 +1,6 @@
 ---
 status: landed
-last_reviewed: 2026-06-21
+last_reviewed: 2026-06-22
 spec_refs:
   - docs/plans/foundation.md
   - docs/rootfs.md
@@ -15,7 +15,7 @@ spec_refs:
   - scripts/smoke-counter-fanout.sh
 related_plans:
   - docs/plans/foundation.md
-  - docs/plans/immutable-rootfs-resume.md
+  - docs/filesystem.md
   - docs/plans/lifecycle-monitor.md
 ---
 
@@ -169,9 +169,8 @@ mint child spores with `spore fork`, then resume them individually or through
 - A first-class `spore capture` verb. Capture remains an option on `spore run`.
 - Event-stream JSON output for fresh runs.
 - Separated stdout/stderr after product resume.
-- General disk manifests. Immutable rootfs identity is handled in
-  `docs/plans/immutable-rootfs-resume.md`; arbitrary writable disk capture is a
-  later foundation problem.
+- General block-device manifests. Rootfs identity and rootfs-bound writable
+  layers are handled in `docs/filesystem.md`.
 
 ## Verification
 

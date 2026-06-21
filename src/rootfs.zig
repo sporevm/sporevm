@@ -180,11 +180,12 @@ fn runBuild(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
         .mkfs = parsed.mkfs,
         .debugfs = parsed.debugfs,
     });
-    try stdout.print("rootfs: {s}\nmetadata: {s}\nsource: {s}\nrootfs_blake3: {s}\n", .{
+    try stdout.print("rootfs: {s}\nmetadata: {s}\nsource: {s}\nrootfs_blake3: {s}\nrootfs_storage: {s}\n", .{
         parsed.output,
         parsed.metadata,
         parsed.ref,
         result.rootfs_blake3,
+        result.rootfs_storage.index_digest,
     });
 }
 
@@ -603,6 +604,7 @@ const ImageConfig = oci.ImageConfig;
 
 pub const BuildResult = struct {
     rootfs_blake3: [chunk.ChunkId.hex_len]u8,
+    rootfs_storage: spore.RootfsStorage,
 };
 
 pub fn validateTaggedImageRef(raw_ref: []const u8) !void {
@@ -632,6 +634,7 @@ const RootFSMetadata = struct {
     rootfs_path: []const u8,
     rootfs_size: u64,
     rootfs_blake3: []const u8,
+    rootfs_storage: spore.RootfsStorage,
 };
 
 fn resolveTaggedImageRef(init: std.process.Init, allocator: std.mem.Allocator, opts: ParsedResolveOptions) ![]const u8 {
@@ -1099,6 +1102,18 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     const rootfs_blake3 = try ext4.blake3File(init.io, opts.output);
     const rootfs_hex = try allocator.dupe(u8, &rootfs_blake3);
     const stat = try Io.Dir.cwd().statFile(init.io, opts.output, .{});
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    const artifact = spore.RootfsArtifactRef{
+        .digest = try std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, rootfs_hex }),
+        .size = stat.size,
+        .format = spore.rootfs_artifact_format_ext4,
+    };
+    try rootfs_cache.installExpectedPath(init.io, allocator, cache_root, opts.output, artifact, .{
+        .source_must_not_be_symlink = false,
+        .allow_hardlink = true,
+    });
+    const preload_result = try rootfs_cas.preload(init.io, allocator, cache_root, artifact.digest, rootfs_cas.default_chunk_size);
+    const rootfs_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
 
     try ext4.ensureParentDir(init.io, opts.metadata);
     try rejectMetadataOutputAlias(init.io, opts.output, opts.metadata);
@@ -1117,11 +1132,12 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
         .rootfs_path = opts.metadata_rootfs_path orelse opts.output,
         .rootfs_size = stat.size,
         .rootfs_blake3 = rootfs_hex,
+        .rootfs_storage = rootfs_storage,
     };
     const metadata_json = try std.json.Stringify.valueAlloc(allocator, metadata, .{ .whitespace = .indent_2 });
     try ext4.writeFileAtPath(init.io, opts.metadata, metadata_json);
 
-    return .{ .rootfs_blake3 = rootfs_blake3 };
+    return .{ .rootfs_blake3 = rootfs_blake3, .rootfs_storage = rootfs_storage };
 }
 
 fn resolveManifestDigest(

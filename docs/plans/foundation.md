@@ -1,14 +1,13 @@
 ---
 status: active
-last_reviewed: 2026-06-21
+last_reviewed: 2026-06-22
 related_plans:
   - buildkite/cleanroom: docs/plans/sandbox-suspend-wake.md
   - docs/plans/run-bridge.md
   - docs/plans/lifecycle-monitor.md
   - docs/plans/local-image-ref-cache.md
-  - docs/plans/immutable-rootfs-resume.md
+  - docs/filesystem.md
   - docs/plans/distribution.md
-  - docs/plans/writable-disk-layers.md
   - docs/plans/automatic-memory.md
   - docs/plans/automatic-local-ram-backing.md
 ---
@@ -97,16 +96,16 @@ spore manifest
 |   counter frequency
 |-- machine state: vCPU, timer, GIC/ICC, virtio transport, generation device
 |-- memory: ordered BLAKE3 chunk refs, zero-elided, optional same-host backing
-|-- optional immutable rootfs artifact: digest, size, virtio-blk binding,
-|   OCI provenance
+|-- optional immutable rootfs: exact ext4 artifact plus optional chunked storage
 `-- optional writable root disk chain: immutable rootfs base plus sealed
     content-addressed disk layers
 ```
 
-General block-device state is still outside v0. A verified immutable rootfs
-artifact can be recorded and reattached for product resume, and rootfs-bound
-writable state can now be represented as sealed disk layers. Bundle/pull
-materialization carries those rootfs-bound disk layers by content digest.
+General block-device state is still outside v0. Image-created spores record a
+verified immutable rootfs artifact and default to manifest-attached chunked
+rootfs storage for fast resume and distribution. Rootfs-bound writable state is
+represented as sealed disk layers. See `docs/filesystem.md` for the root disk
+contract.
 
 ## Current Status
 
@@ -121,7 +120,7 @@ materialization carries those rootfs-bound disk layers by content digest.
 | Slice 4: fork and generation protocol | Complete for correctness | `/run/sporevm` is the live metadata contract; keep fan-out identity smokes as regression coverage. |
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |
 | Slice 6: identical-host distribution | Active | Remote push/pull materialization, remote cache reuse metrics, and measured origin-egress efficiency beyond explicit relay trees. |
-| Writable disk layers | Complete for the first product target | See `docs/plans/writable-disk-layers.md`; local layered COW restore, fork divergence, bundle/pull materialization, same-class remote KVM proof, corrupt disk-object rejection, warm remote cache reuse, and first KVM benchmark guardrails are implemented. |
+| Filesystem/root disk | Complete for the first product target | See `docs/filesystem.md`; chunked rootfs storage is the default image-capture path, writable root disk layers are implemented, and bundle/pull materialization carries rootfs CAS plus sealed disk layers. |
 | Slice 7: always-on dirty tracking | Complete for the foundation target | Keep dirty-tail and worker-stop benchmarks as release regressions; tune worker preemption only if the product SLO tightens. |
 | Automatic memory | Active | Product CLI memory contract is moving through `docs/plans/automatic-memory.md`; automatic local backing provenance is tracked in `docs/plans/automatic-local-ram-backing.md`; next user-visible work is `spore ls` memory stats. |
 | Slice 8: cross-backend diagnostic restore | Later diagnostic | HVF portable GIC producer and timer-frequency strategy. |
@@ -173,10 +172,10 @@ implementation and evidence include:
 - remote smoke harness support for source-peer HTTP pulls that keep destination
   S3-origin bytes at zero while preserving digest-pinned product materialization;
 - corrupt-bundle rejection on destinations;
-- rootfs-backed remote bundle smokes that build exact OCI rootfs bytes, pack
-  them into indexed bundles, prove destination rootfs fetch/cache reuse across
-  A1 hosts, reject corrupt rootfs artifacts, and verify materialization into the
-  destination rootfs digest cache;
+- rootfs-backed remote bundle smokes that build OCI rootfs bytes, pack chunked
+  rootfs CAS storage into indexed bundles by default, prove destination rootfs
+  cache reuse across A1 hosts, reject corrupt rootfs payloads, and verify
+  materialization into the destination rootfs cache;
 - a repo-local `mise run validate:release-a1-kvm -- ...` gate that composes the
   direct-S3, HTTP-peer, destination cache reuse, corrupt rejection, rootfs, and
   KVM networking release checks;
@@ -348,9 +347,10 @@ inputs.
 - The checkpoint artifact is a spore; v0 formats carry no compatibility promise.
 - Distribution starts with SporeVM chunkpack bundles and moves toward the
   pull-based artifact model in `docs/plans/distribution.md`.
-- Rootfs-backed distribution bundles include exact immutable rootfs bytes by
-  default; metadata-only rootfs bundles require an explicit opt-out and bundle
-  metadata, plus an explicit prepared-cache materialization flag.
+- Rootfs-backed distribution follows the manifest: chunked rootfs storage is
+  bundled as rootfs CAS data, fd-backed rootfs uses exact immutable ext4 bytes,
+  and metadata-only exact-rootfs bundles require an explicit opt-out plus a
+  prepared-cache materialization flag.
 - Local `spore pull file://...` fully materializes a selected child before
   product resume; remote and lazy pull sources must keep the same verified
   content-source boundary.

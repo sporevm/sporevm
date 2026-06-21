@@ -26,11 +26,13 @@ A spore is a directory:
 │                           # optional content-addressed disk clusters
 ```
 
-Spores captured from `spore run --image ... --capture` may also require
-an immutable rootfs artifact from the local rootfs digest cache. The artifact is
-not stored inside the spore directory today; the manifest records its digest,
-size, device binding, and provenance so `spore resume` can reopen and verify the
-cached bytes before boot.
+Spores captured from `spore run --image ... --capture` may also require rootfs
+storage from the local rootfs cache. The manifest records an immutable ext4
+artifact digest, size, device binding, and provenance. Image-created spores also
+record `rootfs.storage` for the default chunked rootfs CAS path when available.
+Rootfs bytes are not stored inside the spore directory today; `spore resume`
+opens and verifies the manifest-selected exact artifact or chunked storage
+before boot.
 
 A local single-spore bundle is the first distribution form:
 
@@ -197,7 +199,7 @@ under `rootfs.cache`.
   artifact to the rootfs virtio-mmio slot, `artifact` records a
   `blake3:<hex>` digest, size, and `ext4` format, and `source` records OCI
   provenance. The digest and size are restore authority for the fd-backed
-  path; OCI metadata is not. Experimental manifests may also include
+  path; OCI metadata is not. Image-created manifests normally also include
   `rootfs.storage` with `kind: "chunked-ext4-rootfs-v0"`, the same rootfs
   device binding, logical size, chunk size, `hash_algorithm: "blake3"`,
   `index_digest`, `base_identity`, and `object_namespace: "rootfs/blake3"`.
@@ -271,9 +273,10 @@ under `rootfs.cache`.
 - Rootfs-backed bundles include referenced writable disk layer indexes and disk
   objects when present. Bundle materialization refuses corrupt or missing disk
   layer/object bytes before writing a resumable spore manifest.
-- Immutable rootfs artifacts are portable by digest, not by local path. Resume
-  opens the digest-addressed rootfs cache entry read-only, verifies the same fd
-  by BLAKE3 and size, and only then attaches it to the VM.
+- Immutable rootfs artifacts and chunked rootfs storage are portable by digest,
+  not by local path. For fd-backed manifests, resume opens the digest-addressed
+  rootfs cache entry read-only, verifies the same fd by BLAKE3 and size, and
+  only then attaches it to the VM.
 - Manifest-bound chunked rootfs storage descriptors select the rootfs block
   source for product resume. The runtime opens the exact local
   `rootfs-block-index-v0` named by `rootfs.storage.index_digest`, validates the

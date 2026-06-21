@@ -23,10 +23,11 @@ v0 portability is deliberately narrow:
   optional blk, net, vsock, rng, and the generation MMIO device.
 - Memory: full eager RAM materialization from content-addressed chunks.
 - Disk: a captured `spore run --image` workload may reference one verified
-  immutable ext4 rootfs artifact by digest and an optional sealed writable
-  rootfs-bound COW layer chain. Bundles can carry that chain's layer indexes
-  and disk objects. General block devices are still outside the portable
-  contract.
+  immutable ext4 rootfs artifact and, for image-created spores, manifest-bound
+  chunked rootfs storage. It may also reference an optional sealed writable
+  rootfs-bound COW layer chain. Bundles can carry rootfs CAS bytes, exact
+  rootfs artifacts, layer indexes, and disk objects. General block devices are
+  still outside the portable contract.
 
 Cross-ISA restore, multi-vCPU restore, persisted access traces, remote product
 proof for writable disk bundles, and broader disk/device fixups are later
@@ -78,8 +79,8 @@ block identical-host fork/fan-out.
 | Virtio-mmio transport | device ID, feature selectors, negotiated features, status, interrupt status, queue addresses/indices | yes | yes | yes | yes | portable |
 | Virtqueue descriptors and buffers | guest RAM | yes | yes | yes | yes | portable through RAM |
 | Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; fork path populates it |
-| Immutable rootfs artifact | optional digest/size/device binding plus OCI provenance | yes via `spore run --image` | verifies cached artifact fd | yes via `spore run --image` | verifies cached artifact fd | product resume base |
-| Writable root disk layers | optional `cow-block-v0` chain over the immutable rootfs artifact | yes for local layer store | verifies layer indexes and disk objects | yes for local layer store | verifies layer indexes and disk objects | product resume; bundle materialization unit-covered |
+| Immutable rootfs base | optional exact artifact plus optional `chunked-ext4-rootfs-v0` storage descriptor | yes via `spore run --image` | verifies exact artifact fd or chunked index/chunks | yes via `spore run --image` | verifies exact artifact fd or chunked index/chunks | product resume base |
+| Writable root disk layers | optional `cow-block-v0` chain over the effective immutable rootfs base | yes for local layer store | verifies layer indexes and disk objects | yes for local layer store | verifies layer indexes and disk objects | product resume; bundle materialization unit-covered |
 | Network capability and policy | optional `spore-net-v0` plus allow CIDRs/hosts; no live flows | yes | fresh gateway | yes | fresh gateway | policy portable; flows dropped |
 | General writable disk contents | not represented | no | reject | no | reject | out of v0 |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |

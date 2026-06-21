@@ -1,10 +1,8 @@
-//! Experimental chunked rootfs cache and block source.
+//! Chunked rootfs cache and block source.
 //!
-//! This is a runtime spike, not the manifest-bound chunked rootfs format. The
-//! index is local-only and keyed by the existing monolithic rootfs digest so we
-//! can measure the cached block-source path before locking the portable format.
-//! The index is not portable restore authority and must stay behind the
-//! experiment gate until a manifest-bound descriptor lands.
+//! The old local-index spike is still supported for comparison, but product
+//! restore uses the manifest-bound rootfs block index selected by
+//! `rootfs.storage`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -374,6 +372,40 @@ pub fn preload(
     };
 }
 
+pub fn storageComplete(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    storage: spore.RootfsStorage,
+) !bool {
+    const index_path = try manifestIndexPath(allocator, cache_root, storage.index_digest);
+    defer allocator.free(index_path);
+    if (!try rootfs_cache.regularFileNoSymlink(io, index_path)) return false;
+
+    const bytes = readFileAll(allocator, index_path, rootfs_index.max_index_bytes) catch |err| switch (err) {
+        error.MissingChunk, error.BadChunk, error.ShortRead => return false,
+        else => |e| return e,
+    };
+    defer allocator.free(bytes);
+    var parsed = rootfs_index.parseRootfsBlockIndex(allocator, bytes, storage) catch |err| switch (err) {
+        error.BadManifest => return false,
+        else => |e| return e,
+    };
+    defer parsed.deinit();
+
+    for (parsed.value.chunks) |entry| {
+        const path = try manifestObjectPath(allocator, cache_root, entry.digest);
+        defer allocator.free(path);
+        if (!try rootfs_cache.regularFileNoSymlink(io, path)) return false;
+        const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+            else => |e| return e,
+        };
+        if (stat.size != try storageChunkLen(storage, entry.logical_chunk)) return false;
+    }
+    return true;
+}
+
 pub fn indexPath(allocator: std.mem.Allocator, cache_root: []const u8, rootfs_digest: []const u8, chunk_size: u64) ![]const u8 {
     const hex = try rootfsDigestHex(rootfs_digest);
     return std.fmt.allocPrint(allocator, "{s}/cas-spike/rootfs/blake3/{s}/{d}/index.json", .{ cache_root, hex, chunk_size });
@@ -500,6 +532,12 @@ fn chunkCount(size: u64, chunk_size: u64) !u64 {
     if (chunk_size == 0) return error.BadManifest;
     if (size == 0) return 0;
     return (try std.math.add(u64, size, chunk_size - 1)) / chunk_size;
+}
+
+fn storageChunkLen(storage: spore.RootfsStorage, logical_chunk: u64) !u64 {
+    const start = std.math.mul(u64, logical_chunk, storage.chunk_size) catch return error.BadManifest;
+    if (start >= storage.logical_size) return error.BadManifest;
+    return @min(storage.chunk_size, storage.logical_size - start);
 }
 
 fn isZero(bytes: []const u8) bool {

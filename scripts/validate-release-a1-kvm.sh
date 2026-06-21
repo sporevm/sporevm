@@ -301,7 +301,6 @@ run_check "direct S3 diskless bundle, cache reuse, corrupt rejection, KVM networ
 run_check "direct S3 chunked rootfs bundle, CAS reuse, corrupt rootfs rejection" \
   "${common_args[@]}" \
   --workload rootfs \
-  --rootfs-storage chunked \
   --rootfs-image "${rootfs_image}" \
   --rootfs-platform "${rootfs_platform}" \
   --rootfs-mem-mib "${rootfs_mem_mib}" \
@@ -311,7 +310,6 @@ run_check "direct S3 chunked rootfs bundle, CAS reuse, corrupt rootfs rejection"
 run_check "HTTP peer chunked rootfs bundle, CAS reuse, corrupt rootfs rejection" \
   "${http_peer_args[@]}" \
   --workload rootfs \
-  --rootfs-storage chunked \
   --rootfs-image "${rootfs_image}" \
   --rootfs-platform "${rootfs_platform}" \
   --rootfs-mem-mib "${rootfs_mem_mib}" \

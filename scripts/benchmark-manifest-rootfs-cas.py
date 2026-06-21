@@ -130,19 +130,6 @@ def load_jsonl(path: Path) -> list[dict[str, object]]:
     return rows
 
 
-def read_key_values(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    if not path.exists():
-        return values
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            if ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            values[key.strip()] = value.strip()
-    return values
-
-
 def parse_run_events(path: Path) -> dict[str, object]:
     exit_event: dict[str, object] | None = None
     stdout_bytes = 0
@@ -414,46 +401,48 @@ class ManifestCasGate:
             die(f"base spore capture failed status={status} stderr={stderr}")
         return base_dir
 
-    def rootfs_digest(self, spore_dir: Path) -> str:
+    def default_storage(self, spore_dir: Path) -> dict[str, object]:
         manifest = json.loads((spore_dir / "manifest.json").read_text(encoding="utf-8"))
+        rootfs = manifest.get("rootfs") or {}
+        storage = rootfs.get("storage") if isinstance(rootfs, dict) else None
+        if not isinstance(storage, dict):
+            die(f"default image capture did not attach rootfs.storage: {spore_dir}")
+        self.emit({
+            "benchmark": "manifest_rootfs_cas_gate",
+            "variant": "setup",
+            "mode": "default_rootfs_storage",
+            "success": True,
+            "storage_kind": storage.get("kind"),
+            "index_digest": storage.get("index_digest"),
+            "chunk_size": storage.get("chunk_size"),
+            "logical_size": storage.get("logical_size"),
+        })
+        return storage
+
+    def fd_baseline_copy(self, base_dir: Path) -> Path:
+        baseline_dir = self.work_dir / "baseline-fd.spore"
+        shutil.rmtree(baseline_dir, ignore_errors=True)
+        shutil.copytree(base_dir, baseline_dir, symlinks=True)
+        manifest_path = baseline_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         rootfs = manifest.get("rootfs") or {}
         artifact = rootfs.get("artifact") if isinstance(rootfs, dict) else None
         digest = artifact.get("digest") if isinstance(artifact, dict) else None
-        if not isinstance(digest, str) or not digest.startswith("blake3:"):
-            die(f"spore manifest missing rootfs artifact digest: {spore_dir}")
-        return digest
-
-    def preload_and_attach(self, base_dir: Path, digest: str) -> dict[str, str]:
-        stdout = self.log_dir / "cas-preload.stdout"
-        stderr = self.log_dir / "cas-preload.stderr"
-        argv = [
-            str(self.spore_bin),
-            "rootfs",
-            "cas-preload",
-            digest,
-            "--chunk-size",
-            str(self.args.chunk_size),
-            "--attach-spore",
-            str(base_dir),
-        ]
-        status, elapsed_ms, error = run_command(argv, env=self.env, stdout_path=stdout, stderr_path=stderr, timeout_s=self.args.preload_timeout_s)
-        values = read_key_values(stdout)
+        if not isinstance(rootfs, dict) or not isinstance(digest, str):
+            die(f"cannot create fd baseline without rootfs artifact digest: {base_dir}")
+        rootfs.pop("storage", None)
+        disk = manifest.get("disk")
+        if isinstance(disk, dict):
+            disk["base"] = digest
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         self.emit({
             "benchmark": "manifest_rootfs_cas_gate",
-            "variant": "manifest_cas",
-            "mode": "cas_preload_attach",
-            "success": status == 0,
-            "status": status,
-            "elapsed_ms": elapsed_ms,
-            "error": error,
-            "chunk_size": self.args.chunk_size,
-            "preload": values,
-            "stdout_path": str(stdout),
-            "stderr_path": str(stderr),
+            "variant": "baseline",
+            "mode": "fd_baseline_copy",
+            "success": True,
+            "spore_dir": str(baseline_dir),
         })
-        if status != 0:
-            die(f"cas-preload attach failed status={status} stderr={stderr}")
-        return values
+        return baseline_dir
 
     def fork_children(self, base_dir: Path, variant: str, count: int) -> Path:
         out_dir = self.work_dir / variant / f"count-{count}" / "children"
@@ -559,7 +548,7 @@ class ManifestCasGate:
             children_dir = self.fork_children(base_dir, variant, count)
             self.run_children(variant, count, children_dir)
 
-    def summary(self, preload_values: dict[str, str]) -> dict[str, object]:
+    def summary(self, storage: dict[str, object]) -> dict[str, object]:
         results: list[dict[str, object]] = []
         run_rows = [row for row in self.rows if row.get("mode") == "run_child"]
         groups: dict[tuple[str, int], list[dict[str, object]]] = {}
@@ -646,7 +635,6 @@ class ManifestCasGate:
                 "platform": self.args.platform,
                 "memory": self.args.memory,
                 "command": self.command,
-                "chunk_size": self.args.chunk_size,
                 "baseline_counts": self.args.baseline_counts,
                 "cas_counts": self.args.cas_counts,
                 "concurrency": self.args.concurrency,
@@ -654,7 +642,7 @@ class ManifestCasGate:
                 "rootfs_cache_dir": str(self.rootfs_cache_dir),
                 "spore_bin": str(self.spore_bin),
             },
-            "preload": preload_values,
+            "default_rootfs_storage": storage,
             "results": results,
             "comparisons": comparisons,
             "raw_results": str(self.raw_path),
@@ -663,11 +651,11 @@ class ManifestCasGate:
     def run(self) -> None:
         self.setup()
         base_dir = self.capture_base()
-        digest = self.rootfs_digest(base_dir)
-        self.run_variant_counts(base_dir, "baseline", self.args.baseline_counts)
-        preload_values = self.preload_and_attach(base_dir, digest)
+        storage = self.default_storage(base_dir)
+        baseline_dir = self.fd_baseline_copy(base_dir)
+        self.run_variant_counts(baseline_dir, "baseline", self.args.baseline_counts)
         self.run_variant_counts(base_dir, "manifest_cas", self.args.cas_counts)
-        summary = self.summary(preload_values)
+        summary = self.summary(storage)
         write_json(self.summary_path, summary)
         write_json(self.output_dir / "latest-manifest-rootfs-cas-summary.json", summary)
         print(f"manifest rootfs CAS benchmark ok: results={self.raw_path} summary={self.summary_path}")
@@ -683,13 +671,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--platform", default=DEFAULT_PLATFORM)
     parser.add_argument("--memory", default="auto")
     parser.add_argument("--command", default=DEFAULT_COMMAND)
-    parser.add_argument("--chunk-size", type=int, default=64 * 1024)
     parser.add_argument("--counts", default="10,100", help="Default comma-separated fan-out counts")
     parser.add_argument("--baseline-counts", help="Comma-separated fd-backed fan-out counts")
     parser.add_argument("--cas-counts", help="Comma-separated manifest CAS fan-out counts")
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--timeout-s", type=int, default=300)
-    parser.add_argument("--preload-timeout-s", type=int, default=900)
     parser.add_argument("--prewarm-memory", default="512mb")
     parser.add_argument("--no-prewarm-rootfs", dest="prewarm_rootfs", action="store_false")
     parser.add_argument("--no-build", dest="build", action="store_false")
@@ -698,8 +684,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     counts = parse_csv_ints(args.counts)
     args.baseline_counts = parse_csv_ints(args.baseline_counts) if args.baseline_counts else counts
     args.cas_counts = parse_csv_ints(args.cas_counts) if args.cas_counts else counts
-    if args.chunk_size <= 0 or args.chunk_size % 512 != 0:
-        die("--chunk-size must be a positive multiple of 512")
     if args.concurrency <= 0:
         die("--concurrency must be positive")
     return args

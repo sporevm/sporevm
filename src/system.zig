@@ -18,7 +18,7 @@ const usage =
     \\  --force                     Delete selected cache entries
     \\  --older-than DURATION       Select entries older than 7d, 24h, 30m, or seconds
     \\  --max-bytes SIZE            Prune oldest entries until the selected cache scope is under SIZE
-    \\  --include-digest-artifacts  Also prune digest-addressed rootfs artifacts used by resume
+    \\  --include-digest-artifacts  Also prune digest/CAS rootfs artifacts used by resume
     \\  -h, --help                  Show this help
     \\
     \\Defaults:
@@ -37,6 +37,8 @@ pub const RootfsSystemSummary = struct {
     linked_image_rootfs: CacheStats = .{},
     image_metadata: CacheStats = .{},
     digest_artifacts: CacheStats = .{},
+    cas_indexes: CacheStats = .{},
+    cas_objects: CacheStats = .{},
     ref_records: CacheStats = .{},
     temp_entries: CacheStats = .{},
     known_logical_bytes: u64 = 0,
@@ -46,11 +48,15 @@ pub const RootfsSystemSummary = struct {
 const RootfsEntryKind = enum {
     image_rootfs,
     digest_artifact,
+    cas_index,
+    cas_object,
 
     fn label(self: RootfsEntryKind) []const u8 {
         return switch (self) {
             .image_rootfs => "image-rootfs",
             .digest_artifact => "digest-artifact",
+            .cas_index => "rootfs-cas-index",
+            .cas_object => "rootfs-cas-object",
         };
     }
 };
@@ -372,8 +378,11 @@ fn summarizeRootfsCache(allocator: std.mem.Allocator, io: Io, cache_root: []cons
     }
 
     summary.digest_artifacts = try digestArtifactStats(allocator, io, cache_root);
+    summary.cas_indexes = try treeStats(allocator, io, cache_root, "cas/rootfs/blake3/indexes");
+    summary.cas_objects = try treeStats(allocator, io, cache_root, "cas/rootfs/blake3/objects");
     summary.known_logical_bytes = summary.image_rootfs.bytes + summary.image_metadata.bytes +
-        summary.digest_artifacts.bytes + summary.ref_records.bytes + summary.temp_entries.bytes;
+        summary.digest_artifacts.bytes + summary.cas_indexes.bytes + summary.cas_objects.bytes +
+        summary.ref_records.bytes + summary.temp_entries.bytes;
     return summary;
 }
 
@@ -506,9 +515,43 @@ fn collectPruneEntries(
 
     if (include_digest_artifacts) {
         try collectDigestArtifacts(allocator, io, cache_root, &entries);
+        try collectCasArtifacts(allocator, io, cache_root, "cas/rootfs/blake3/indexes", ".json", .cas_index, &entries);
+        try collectCasArtifacts(allocator, io, cache_root, "cas/rootfs/blake3/objects", ".chunk", .cas_object, &entries);
     }
 
     return entries.toOwnedSlice();
+}
+
+fn collectCasArtifacts(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    sub_path: []const u8,
+    suffix: []const u8,
+    kind: RootfsEntryKind,
+    entries: *std.array_list.Managed(PrunePlanEntry),
+) !void {
+    const dir_path = try std.fs.path.join(allocator, &.{ cache_root, sub_path });
+    var dir = openDirPath(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, suffix)) continue;
+        const stat = try dir.statFile(io, entry.name, .{ .follow_symlinks = false });
+        if (stat.kind != .file) continue;
+        const path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        try entries.append(.{
+            .kind = kind,
+            .path = path,
+            .bytes = stat.size,
+            .link_count = @intCast(stat.nlink),
+            .mtime_ns = stat.mtime.nanoseconds,
+        });
+    }
 }
 
 fn collectDigestArtifacts(
@@ -677,12 +720,14 @@ fn writeRootfsSummary(writer: *Io.Writer, summary: RootfsSystemSummary) !void {
     try writer.writeAll("  Reclaimable by default: ");
     try writeHumanBytes(writer, summary.default_prunable_bytes);
     try writer.writeByte('\n');
-    try writer.writeAll("  Normal prune skips digest artifacts and hardlinked image rootfs files.\n\n");
+    try writer.writeAll("  Normal prune skips digest/CAS artifacts and hardlinked image rootfs files.\n\n");
 
     try writer.writeAll("Usage\n");
     try writeStatsLine(writer, "Image rootfs files", summary.image_rootfs);
     try writeStatsLine(writer, "Linked image rootfs files", summary.linked_image_rootfs);
     try writeStatsLine(writer, "Digest artifacts", summary.digest_artifacts);
+    try writeStatsLine(writer, "Rootfs CAS indexes", summary.cas_indexes);
+    try writeStatsLine(writer, "Rootfs CAS objects", summary.cas_objects);
     try writeStatsLine(writer, "Image metadata", summary.image_metadata);
     try writeStatsLine(writer, "Ref records", summary.ref_records);
     try writeStatsLine(writer, "Temporary entries", summary.temp_entries);
@@ -708,7 +753,7 @@ fn writeRootfsPruneResult(writer: *Io.Writer, result: RootfsPruneResult) !void {
     try writer.writeAll("  Selection: ");
     try writePruneSelection(writer, result);
     try writer.writeByte('\n');
-    try writer.print("  Digest artifacts included: {s}\n", .{yesNo(result.include_digest_artifacts)});
+    try writer.print("  Digest/CAS artifacts included: {s}\n", .{yesNo(result.include_digest_artifacts)});
     if (result.dry_run) {
         try writer.print("  Would delete: {d} entries\n", .{result.candidate_count});
         try writer.writeAll("  Would remove from cache scope: ");
@@ -886,6 +931,8 @@ test "system summarizes rootfs cache and dry-run prunes oldest image entries" {
     Io.Dir.cwd().deleteTree(io, root) catch {};
     try Io.Dir.cwd().createDirPath(io, root);
     try Io.Dir.cwd().createDirPath(io, root ++ "/by-digest/blake3");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/cas/rootfs/blake3/indexes");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/cas/rootfs/blake3/objects");
     try Io.Dir.cwd().createDirPath(io, root ++ "/refs");
     try Io.Dir.cwd().createDirPath(io, root ++ "/tmp");
 
@@ -894,6 +941,8 @@ test "system summarizes rootfs cache and dry-run prunes oldest image entries" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/b.ext4", .data = "bbbbbb" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/b.json", .data = "{}" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/by-digest/blake3/c.ext4", .data = "cccccccc" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/cas/rootfs/blake3/indexes/d.json", .data = "index" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/cas/rootfs/blake3/objects/e.chunk", .data = "chunkdata" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/refs/ref.json", .data = "{}" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/tmp/tmpfile", .data = "tmp" });
 
@@ -904,6 +953,10 @@ test "system summarizes rootfs cache and dry-run prunes oldest image entries" {
     try std.testing.expectEqual(@as(u64, 4), summary.image_metadata.bytes);
     try std.testing.expectEqual(@as(usize, 1), summary.digest_artifacts.count);
     try std.testing.expectEqual(@as(u64, 8), summary.digest_artifacts.bytes);
+    try std.testing.expectEqual(@as(usize, 1), summary.cas_indexes.count);
+    try std.testing.expectEqual(@as(u64, 5), summary.cas_indexes.bytes);
+    try std.testing.expectEqual(@as(usize, 1), summary.cas_objects.count);
+    try std.testing.expectEqual(@as(u64, 9), summary.cas_objects.bytes);
     try std.testing.expectEqual(@as(u64, 14), summary.default_prunable_bytes);
 
     const dry_run = try pruneRootfsCache(allocator, io, root, .{ .max_bytes = 8 }, std.time.ns_per_s);
@@ -931,6 +984,18 @@ test "system summarizes rootfs cache and dry-run prunes oldest image entries" {
     try std.testing.expect(try fileExists(io, root ++ "/a.ext4"));
     try std.testing.expect(try fileExists(io, root ++ "/b.ext4"));
     try std.testing.expect(try fileExists(io, root ++ "/by-digest/blake3/c.ext4"));
+    try std.testing.expect(try fileExists(io, root ++ "/cas/rootfs/blake3/indexes/d.json"));
+    try std.testing.expect(try fileExists(io, root ++ "/cas/rootfs/blake3/objects/e.chunk"));
+
+    const include_artifacts_dry_run = try pruneRootfsCache(
+        allocator,
+        io,
+        root,
+        .{ .max_bytes = default_prune_max_bytes, .include_digest_artifacts = true },
+        std.time.ns_per_s,
+    );
+    try std.testing.expectEqual(@as(usize, 5), include_artifacts_dry_run.candidate_count);
+    try std.testing.expectEqual(@as(u64, 36), include_artifacts_dry_run.candidate_bytes);
 
     const forced = try pruneRootfsCache(allocator, io, root, .{ .dry_run = false, .max_bytes = 8 }, std.time.ns_per_s);
     try std.testing.expect(!forced.dry_run);
