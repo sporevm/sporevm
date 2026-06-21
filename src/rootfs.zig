@@ -928,13 +928,16 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     defer ownership_mod.deinit(allocator, &owners);
     var xattrs = XattrMap.init(allocator);
     defer xattrs_mod.deinit(allocator, &xattrs);
+    const tar_options = tar.ApplyOptions{
+        .case_sensitive_staging = try tar.isCaseSensitiveDirectory(init.io, rootfs_dir),
+    };
 
     if (opts.layers.len > max_rootfs_layers) return error.RootFSTooManyLayers;
 
     const layer_meta = try allocator.alloc(oci.LayerMetadata, opts.layers.len);
     for (opts.layers, 0..) |layer, i| {
         if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
-        try tar.applyLayer(allocator, init.io, rootfs_dir, layer.path, layer.media_type, &owners, &xattrs);
+        try tar.applyLayer(allocator, init.io, rootfs_dir, layer.path, layer.media_type, &owners, &xattrs, tar_options);
         if (try ext4.dirContentSize(init.io, rootfs_dir) > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
         layer_meta[i] = .{ .media_type = layer.media_type, .digest = layer.digest };
     }

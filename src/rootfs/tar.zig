@@ -19,6 +19,10 @@ const Ownership = ownership_mod.Ownership;
 const OwnershipMap = ownership_mod.Map;
 const XattrMap = xattrs_mod.Map;
 
+pub const ApplyOptions = struct {
+    case_sensitive_staging: bool,
+};
+
 pub fn applyLayer(
     allocator: std.mem.Allocator,
     io: Io,
@@ -27,13 +31,14 @@ pub fn applyLayer(
     media_type: []const u8,
     ownership: *OwnershipMap,
     xattrs: *XattrMap,
+    options: ApplyOptions,
 ) !void {
     if (oci.isGzipLayerMediaType(media_type)) {
-        try applyGzipLayer(allocator, io, root, layer_path, ownership, xattrs);
+        try applyGzipLayer(allocator, io, root, layer_path, ownership, xattrs, options);
         return;
     }
     if (oci.isPlainTarLayerMediaType(media_type)) {
-        try applyTarFileLayer(allocator, io, root, layer_path, ownership, xattrs);
+        try applyTarFileLayer(allocator, io, root, layer_path, ownership, xattrs, options);
         return;
     }
     return error.UnsupportedLayerMediaType;
@@ -46,6 +51,7 @@ fn applyGzipLayer(
     layer_path: []const u8,
     ownership: *OwnershipMap,
     xattrs: *XattrMap,
+    options: ApplyOptions,
 ) !void {
     var file = try Io.Dir.cwd().openFile(io, layer_path, .{});
     defer file.close(io);
@@ -53,7 +59,7 @@ fn applyGzipLayer(
     var file_reader: Io.File.Reader = .initStreaming(file, io, &file_buf);
     var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
     var decompress: std.compress.flate.Decompress = .init(&file_reader.interface, .gzip, &decompress_buf);
-    applyTarLayerWithXattrs(allocator, io, root, &decompress.reader, ownership, xattrs) catch |err| switch (err) {
+    applyTarLayerWithXattrs(allocator, io, root, &decompress.reader, ownership, xattrs, options) catch |err| switch (err) {
         error.ReadFailed => return decompress.err orelse err,
         else => |e| return e,
     };
@@ -66,12 +72,13 @@ fn applyTarFileLayer(
     layer_path: []const u8,
     ownership: *OwnershipMap,
     xattrs: *XattrMap,
+    options: ApplyOptions,
 ) !void {
     var file = try Io.Dir.cwd().openFile(io, layer_path, .{});
     defer file.close(io);
     var file_buf: [64 * 1024]u8 = undefined;
     var file_reader: Io.File.Reader = .initStreaming(file, io, &file_buf);
-    try applyTarLayerWithXattrs(allocator, io, root, &file_reader.interface, ownership, xattrs);
+    try applyTarLayerWithXattrs(allocator, io, root, &file_reader.interface, ownership, xattrs, options);
 }
 
 const LayerLimits = struct {
@@ -82,6 +89,8 @@ const LayerLimits = struct {
 };
 
 const CreatedPathMap = std.StringHashMap(void);
+const case_sensitive_test_options = ApplyOptions{ .case_sensitive_staging = true };
+const case_insensitive_test_options = ApplyOptions{ .case_sensitive_staging = false };
 
 const PendingPax = struct {
     path: ?[]u8 = null,
@@ -109,7 +118,9 @@ fn applyTarLayer(
 ) !void {
     var xattrs = XattrMap.init(allocator);
     defer xattrs_mod.deinit(allocator, &xattrs);
-    try applyTarLayerWithXattrs(allocator, io, root, reader, ownership, &xattrs);
+    try applyTarLayerWithXattrs(allocator, io, root, reader, ownership, &xattrs, .{
+        .case_sensitive_staging = try isCaseSensitiveDirectory(io, root),
+    });
 }
 
 fn applyTarLayerWithXattrs(
@@ -119,6 +130,7 @@ fn applyTarLayerWithXattrs(
     reader: *Io.Reader,
     ownership: *OwnershipMap,
     xattrs: *XattrMap,
+    options: ApplyOptions,
 ) !void {
     var limits: LayerLimits = .{};
     var long_name: ?[]u8 = null;
@@ -210,7 +222,7 @@ fn applyTarLayerWithXattrs(
             0, '0' => {
                 try addContentBytes(&limits, payload_size);
                 try xattrs_mod.removeSubtree(allocator, xattrs, rel);
-                try writeRegularFile(allocator, io, root, ownership, &created, rel, reader, payload_size, try tarMode(&header));
+                try writeRegularFile(allocator, io, root, ownership, &created, rel, reader, payload_size, try tarMode(&header), options);
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
                 try recordEntryXattrs(allocator, xattrs, &limits, rel, pax.xattrs.items);
                 try recordCreatedPath(allocator, &created, rel);
@@ -219,7 +231,7 @@ fn applyTarLayerWithXattrs(
                 try discardTarPayload(reader, payload_size);
                 if (pax.xattrs.items.len != 0) return error.UnsupportedTarXattr;
                 xattrs_mod.clearPath(allocator, xattrs, rel);
-                try writeDirectory(allocator, io, root, ownership, &created, rel, try tarMode(&header));
+                try writeDirectory(allocator, io, root, ownership, &created, rel, try tarMode(&header), options);
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
                 try recordCreatedPath(allocator, &created, rel);
             },
@@ -228,7 +240,7 @@ fn applyTarLayerWithXattrs(
                 if (pax.xattrs.items.len != 0) return error.UnsupportedTarXattr;
                 const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&header);
                 try xattrs_mod.removeSubtree(allocator, xattrs, rel);
-                try writeSymlink(allocator, io, root, ownership, &created, rel, raw_link);
+                try writeSymlink(allocator, io, root, ownership, &created, rel, raw_link, options);
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
                 try recordCreatedPath(allocator, &created, rel);
             },
@@ -236,7 +248,7 @@ fn applyTarLayerWithXattrs(
                 try discardTarPayload(reader, payload_size);
                 const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&header);
                 try xattrs_mod.removeSubtree(allocator, xattrs, rel);
-                try createHardlinkTarget(allocator, io, root, ownership, &created, rel, raw_link);
+                try createHardlinkTarget(allocator, io, root, ownership, &created, rel, raw_link, options);
                 try recordHardlinkOwnership(allocator, io, root, ownership, rel, entry_ownership);
                 try recordHardlinkXattrs(allocator, io, root, xattrs, &limits, rel, pax.xattrs.items);
                 try recordCreatedPath(allocator, &created, rel);
@@ -302,9 +314,10 @@ fn writeRegularFile(
     reader: *Io.Reader,
     size: u64,
     mode: u32,
+    options: ApplyOptions,
 ) !void {
     try ensureNoSymlinkPath(allocator, io, root, parentPath(rel), false);
-    try ensureNoCaseCollision(allocator, io, root, rel);
+    try ensureNoCaseCollision(allocator, io, root, rel, options);
     try ensureParent(allocator, root, io, rel);
     try prepareEntryPath(allocator, io, root, ownership, created, rel, .non_directory);
     var file = try root.createFile(io, rel, .{ .permissions = permissionsFromMode(mode, .default_file) });
@@ -325,9 +338,10 @@ fn writeDirectory(
     created: *CreatedPathMap,
     rel: []const u8,
     mode: u32,
+    options: ApplyOptions,
 ) !void {
     try ensureNoSymlinkPath(allocator, io, root, parentPath(rel), false);
-    try ensureNoCaseCollision(allocator, io, root, rel);
+    try ensureNoCaseCollision(allocator, io, root, rel, options);
     try ensureParent(allocator, root, io, rel);
     try prepareEntryPath(allocator, io, root, ownership, created, rel, .directory);
     const permissions = permissionsFromMode(mode, .default_dir);
@@ -346,10 +360,11 @@ fn writeSymlink(
     created: *CreatedPathMap,
     rel: []const u8,
     raw_link: []const u8,
+    options: ApplyOptions,
 ) !void {
     try validateSymlinkTarget(allocator, rel, raw_link);
     try ensureNoSymlinkPath(allocator, io, root, parentPath(rel), false);
-    try ensureNoCaseCollision(allocator, io, root, rel);
+    try ensureNoCaseCollision(allocator, io, root, rel, options);
     try ensureParent(allocator, root, io, rel);
     try prepareEntryPath(allocator, io, root, ownership, created, rel, .non_directory);
     try root.symLink(io, raw_link, rel, .{});
@@ -363,15 +378,16 @@ fn createHardlinkTarget(
     created: *CreatedPathMap,
     rel: []const u8,
     raw_link: []const u8,
+    options: ApplyOptions,
 ) !void {
     const link_rel = try safeTarPath(allocator, raw_link);
     defer allocator.free(link_rel);
     try ensureNoSymlinkPath(allocator, io, root, link_rel, false);
-    try ensureNoCaseCollision(allocator, io, root, link_rel);
+    try ensureNoCaseCollision(allocator, io, root, link_rel, options);
     const stat = try root.statFile(io, link_rel, .{ .follow_symlinks = false });
     if (stat.kind != .file) return error.BadHardlinkTarget;
     try ensureNoSymlinkPath(allocator, io, root, parentPath(rel), false);
-    try ensureNoCaseCollision(allocator, io, root, rel);
+    try ensureNoCaseCollision(allocator, io, root, rel, options);
     try ensureParent(allocator, root, io, rel);
     try prepareEntryPath(allocator, io, root, ownership, created, rel, .non_directory);
     try Io.Dir.hardLink(root, link_rel, root, rel, io, .{});
@@ -676,8 +692,26 @@ fn ensureNoSymlinkPath(allocator: std.mem.Allocator, io: Io, root: Io.Dir, rel: 
     }
 }
 
-fn ensureNoCaseCollision(allocator: std.mem.Allocator, io: Io, root: Io.Dir, rel: []const u8) !void {
+pub fn isCaseSensitiveDirectory(io: Io, dir: Io.Dir) !bool {
+    const lower = ".sporevm-case-probe";
+    const upper = ".SPOREVM-CASE-PROBE";
+
+    dir.deleteFile(io, lower) catch {};
+    dir.deleteFile(io, upper) catch {};
+    defer dir.deleteFile(io, lower) catch {};
+    defer dir.deleteFile(io, upper) catch {};
+
+    try dir.writeFile(io, .{ .sub_path = lower, .data = "lower" });
+    try dir.writeFile(io, .{ .sub_path = upper, .data = "upper" });
+
+    const lower_stat = try dir.statFile(io, lower, .{ .follow_symlinks = false });
+    const upper_stat = try dir.statFile(io, upper, .{ .follow_symlinks = false });
+    return lower_stat.inode != upper_stat.inode;
+}
+
+fn ensureNoCaseCollision(allocator: std.mem.Allocator, io: Io, root: Io.Dir, rel: []const u8, options: ApplyOptions) !void {
     _ = allocator;
+    if (options.case_sensitive_staging) return;
     if (rel.len == 0) return;
     try ensureNoCaseCollisionInDir(io, root, rel);
 }
@@ -1084,7 +1118,7 @@ test "plain tar layer media type extracts without gzip" {
     var xattrs = XattrMap.init(allocator);
     defer xattrs_mod.deinit(allocator, &xattrs);
 
-    try applyLayer(allocator, io, tmp.dir, layer_path, "application/vnd.oci.image.layer.v1.tar", &ownership, &xattrs);
+    try applyLayer(allocator, io, tmp.dir, layer_path, "application/vnd.oci.image.layer.v1.tar", &ownership, &xattrs, case_sensitive_test_options);
     const bytes = try tmp.dir.readFileAlloc(io, "file", allocator, .limited(16));
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("hello", bytes);
@@ -1246,7 +1280,7 @@ test "directory entries preserve tar mode" {
     var created = CreatedPathMap.init(allocator);
     defer deinitCreatedPaths(allocator, &created);
 
-    try writeDirectory(allocator, io, root, &ownership, &created, "root", 0o700);
+    try writeDirectory(allocator, io, root, &ownership, &created, "root", 0o700, case_sensitive_test_options);
     const stat = try root.statFile(io, "root", .{ .follow_symlinks = false });
     if (permissionsToMode(stat.permissions)) |mode| {
         try std.testing.expectEqual(@as(u32, 0o700), mode & 0o777);
@@ -1267,7 +1301,7 @@ test "directory entries replace non-directories" {
     var created = CreatedPathMap.init(allocator);
     defer deinitCreatedPaths(allocator, &created);
 
-    try writeDirectory(allocator, io, root, &ownership, &created, "x", 0o755);
+    try writeDirectory(allocator, io, root, &ownership, &created, "x", 0o755, case_sensitive_test_options);
     const stat = try root.statFile(io, "x", .{ .follow_symlinks = false });
     try std.testing.expectEqual(Io.File.Kind.directory, stat.kind);
     try std.testing.expect(!ownership.contains("x"));
@@ -1285,11 +1319,11 @@ test "implicit parent directories use deterministic mode without changing explic
     var created = CreatedPathMap.init(allocator);
     defer deinitCreatedPaths(allocator, &created);
 
-    try writeDirectory(allocator, io, root, &ownership, &created, "usr", 0o700);
+    try writeDirectory(allocator, io, root, &ownership, &created, "usr", 0o700, case_sensitive_test_options);
     var payload = [_]u8{0} ** 512;
     payload[0] = 'x';
     var reader: Io.Reader = .fixed(&payload);
-    try writeRegularFile(allocator, io, root, &ownership, &created, "usr/bin/tool", &reader, 1, 0o755);
+    try writeRegularFile(allocator, io, root, &ownership, &created, "usr/bin/tool", &reader, 1, 0o755, case_sensitive_test_options);
 
     const usr = try root.statFile(io, "usr", .{ .follow_symlinks = false });
     const bin = try root.statFile(io, "usr/bin", .{ .follow_symlinks = false });
@@ -1313,7 +1347,7 @@ test "nested directory entries use deterministic implicit parent mode" {
     var created = CreatedPathMap.init(allocator);
     defer deinitCreatedPaths(allocator, &created);
 
-    try writeDirectory(allocator, io, root, &ownership, &created, "a/b", 0o700);
+    try writeDirectory(allocator, io, root, &ownership, &created, "a/b", 0o700, case_sensitive_test_options);
     const parent = try root.statFile(io, "a", .{ .follow_symlinks = false });
     const child = try root.statFile(io, "a/b", .{ .follow_symlinks = false });
     if (permissionsToMode(parent.permissions)) |mode| {
@@ -1324,7 +1358,7 @@ test "nested directory entries use deterministic implicit parent mode" {
     }
 }
 
-test "case-colliding layer paths fail closed" {
+test "case-colliding layer paths fail closed on case-insensitive staging" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const tmp = "zig-cache/test-rootfs-case-collision";
@@ -1343,8 +1377,34 @@ test "case-colliding layer paths fail closed" {
 
     try std.testing.expectError(
         error.CaseCollisionPath,
-        writeRegularFile(allocator, io, root, &ownership, &created, "bin/foo", &reader, 1, 0o644),
+        writeRegularFile(allocator, io, root, &ownership, &created, "bin/foo", &reader, 1, 0o644, case_insensitive_test_options),
     );
+}
+
+test "case-distinct layer paths are allowed on case-sensitive staging" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-case-sensitive-collision";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var root = try Io.Dir.cwd().createDirPathOpen(io, tmp, .{ .open_options = .{ .iterate = true, .access_sub_paths = true } });
+    defer root.close(io);
+    if (!try isCaseSensitiveDirectory(io, root)) return error.SkipZigTest;
+
+    try root.createDirPath(io, "bin");
+    try root.writeFile(io, .{ .sub_path = "bin/Foo", .data = "old" });
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+    var created = CreatedPathMap.init(allocator);
+    defer deinitCreatedPaths(allocator, &created);
+    var payload = [_]u8{0} ** 512;
+    payload[0] = 'x';
+    var reader: Io.Reader = .fixed(&payload);
+
+    try writeRegularFile(allocator, io, root, &ownership, &created, "bin/foo", &reader, 1, 0o644, case_sensitive_test_options);
+    try root.access(io, "bin/Foo", .{});
+    const bytes = try root.readFileAlloc(io, "bin/foo", allocator, .limited(8));
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("x", bytes);
 }
 
 test "hardlink entries preserve inode identity" {
@@ -1360,7 +1420,7 @@ test "hardlink entries preserve inode identity" {
     var created = CreatedPathMap.init(allocator);
     defer deinitCreatedPaths(allocator, &created);
 
-    try createHardlinkTarget(allocator, io, root, &ownership, &created, "alias", "target");
+    try createHardlinkTarget(allocator, io, root, &ownership, &created, "alias", "target", case_sensitive_test_options);
     const target = try root.statFile(io, "target", .{ .follow_symlinks = false });
     const alias = try root.statFile(io, "alias", .{ .follow_symlinks = false });
     try std.testing.expectEqual(target.inode, alias.inode);
@@ -1381,7 +1441,7 @@ test "hardlink ownership is normalized across shared inode paths" {
     var created = CreatedPathMap.init(allocator);
     defer deinitCreatedPaths(allocator, &created);
 
-    try createHardlinkTarget(allocator, io, root, &ownership, &created, "alias", "target");
+    try createHardlinkTarget(allocator, io, root, &ownership, &created, "alias", "target", case_sensitive_test_options);
     try recordHardlinkOwnership(allocator, io, root, &ownership, "alias", .{ .uid = 2, .gid = 3 });
 
     try std.testing.expectEqual(@as(u32, 2), ownership.get("target").?.uid);
@@ -1408,7 +1468,7 @@ test "regular files clear stale ownership when replacing directories" {
     @memcpy(payload[0..3], "new");
     var reader: Io.Reader = .fixed(&payload);
 
-    try writeRegularFile(allocator, io, root, &ownership, &created, "etc/conf.d", &reader, 3, 0o644);
+    try writeRegularFile(allocator, io, root, &ownership, &created, "etc/conf.d", &reader, 3, 0o644, case_sensitive_test_options);
     try std.testing.expect(!ownership.contains("etc/conf.d/file"));
     const stat = try root.statFile(io, "etc/conf.d", .{ .follow_symlinks = false });
     try std.testing.expectEqual(Io.File.Kind.file, stat.kind);
@@ -1430,7 +1490,7 @@ test "tar layer rejects symlink traversal from earlier entry" {
     defer deinitCreatedPaths(allocator, &created);
     try std.testing.expectError(
         error.SymlinkTraversal,
-        writeRegularFile(allocator, io, root, &ownership, &created, "link/escape", &reader, 0, 0o644),
+        writeRegularFile(allocator, io, root, &ownership, &created, "link/escape", &reader, 0, 0o644, case_sensitive_test_options),
     );
 }
 
@@ -1633,7 +1693,7 @@ test "tar layer records file security capability xattrs" {
     var xattrs = XattrMap.init(allocator);
     defer xattrs_mod.deinit(allocator, &xattrs);
 
-    try applyTarLayerWithXattrs(allocator, std.testing.io, tmp.dir, &reader, &ownership, &xattrs);
+    try applyTarLayerWithXattrs(allocator, std.testing.io, tmp.dir, &reader, &ownership, &xattrs, case_sensitive_test_options);
     const entry = xattrs.get("bin/ping").?;
     try std.testing.expectEqual(@as(usize, 1), entry.attrs.len);
     try std.testing.expectEqualStrings(xattrs_mod.security_capability_name, entry.attrs[0].name);
