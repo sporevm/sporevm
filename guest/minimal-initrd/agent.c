@@ -62,8 +62,6 @@ struct sockaddr_vm {
 
 static int64_t t_init_start = 0;
 static int64_t t_listen_ready = 0;
-static int64_t t_first_accept = 0;
-static int64_t t_first_request_decode = 0;
 static int64_t t_request_accept = 0;
 static int64_t t_request_decode = 0;
 static int64_t t_command_start = 0;
@@ -273,7 +271,7 @@ static int add_default_route(int fd, const char *name, const char *gateway) {
 }
 
 static int write_resolv_conf_path(const char *path) {
-  return write_file_atomic(path, SPORE_NET_RESOLV_CONF, strlen(SPORE_NET_RESOLV_CONF));
+  return write_file_atomic(path, SPORE_NET_RESOLV_CONF, sizeof(SPORE_NET_RESOLV_CONF) - 1);
 }
 
 static int mkdir_p(const char *path, mode_t mode) {
@@ -316,16 +314,16 @@ static int bind_rootfs_resolv(char *error, size_t cap) {
     snprintf(error, cap, "network setup failed: rootfs /etc missing");
     return -1;
   }
-  if (prepare_rootfs_resolv_targets() != 0) {
-    snprintf(error, cap, "network setup failed: rootfs resolv target errno=%d", errno);
-    return -1;
-  }
   struct stat st;
   if (lstat("/mnt/rootfs/etc/resolv.conf", &st) != 0) {
     snprintf(error, cap, "network setup failed: rootfs /etc/resolv.conf missing");
     return -1;
   }
   if (S_ISLNK(st.st_mode)) return 0;
+  if (prepare_rootfs_resolv_targets() != 0) {
+    snprintf(error, cap, "network setup failed: rootfs resolv target errno=%d", errno);
+    return -1;
+  }
   if (mount("/run/sporevm/resolv.conf", "/mnt/rootfs/etc/resolv.conf", NULL, MS_BIND, NULL) != 0 && errno != EBUSY) {
     snprintf(error, cap, "network setup failed: rootfs resolv.conf bind errno=%d", errno);
     return -1;
@@ -628,9 +626,8 @@ static void replay_append(struct replay_buffer *replay, uint64_t offset, const u
     replay->len = REPLAY_CAP;
     return;
   }
-  while (replay->len + len > REPLAY_CAP) {
+  if (replay->len + len > REPLAY_CAP) {
     size_t drop = replay->len + len - REPLAY_CAP;
-    if (drop > replay->len) drop = replay->len;
     memmove(replay->data, replay->data + drop, replay->len - drop);
     replay->base_offset += drop;
     replay->len -= drop;
@@ -705,9 +702,9 @@ static void mirror_console(int is_stdout, const unsigned char *buf, size_t len) 
   (void)write_all(fd, buf, len);
 }
 
-static int wait_child(pid_t pid, int *status, int block) {
+static int wait_child(pid_t pid, int *status) {
   for (;;) {
-    pid_t rc = waitpid(pid, status, block ? 0 : WNOHANG);
+    pid_t rc = waitpid(pid, status, WNOHANG);
     if (rc == pid) return 1;
     if (rc == 0) return 0;
     if (errno == EINTR) continue;
@@ -1027,7 +1024,7 @@ static void poll_session_exit(struct session *session, struct client *client) {
   if (!session->started || session->exited) return;
 
   int status = 0;
-  int wr = wait_child(session->pid, &status, 0);
+  int wr = wait_child(session->pid, &status);
   if (wr == 0) return;
   t_command_exit = now_ms();
   if (wr < 0) {
@@ -1077,7 +1074,6 @@ static void accept_request(int listener, struct session *session, struct client 
     }
     return;
   }
-  if (t_first_accept == 0) t_first_accept = now_ms();
   t_request_accept = now_ms();
 
   char req[MAX_REQUEST];
@@ -1085,7 +1081,6 @@ static void accept_request(int listener, struct session *session, struct client 
     close(conn);
     return;
   }
-  if (t_first_request_decode == 0) t_first_request_decode = now_ms();
   t_request_decode = now_ms();
 
   struct run_request request;
@@ -1244,7 +1239,9 @@ int main(void) {
       roles[nfds++] = 3;
     }
 
-    int pr = poll(fds, nfds, 100);
+    // ponytail: polling for child exit; use SIGCHLD/self-pipe if quiet long-running commands make wakeups matter.
+    int timeout_ms = session.started && !session.exited ? 10 : 100;
+    int pr = poll(fds, nfds, timeout_ms);
     if (pr < 0 && errno != EINTR) continue;
     if (pr > 0) {
       for (nfds_t i = 0; i < nfds; i++) {

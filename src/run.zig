@@ -1624,6 +1624,7 @@ fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) !Result {
+    const setup_start = monotonicMs();
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
 
     const backend = try resolveBackend(opts.backend);
@@ -1639,12 +1640,19 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     const network_manifest = manifestNetworkFromOptions(opts.network, &opts.network_policy);
 
     const resuming = opts.resume_dir != null;
+    const local_backing_start = monotonicMs();
     const local_backing = try openRunLocalMemoryBacking(allocator, init.environ_map, opts.resume_dir, opts.memory.bytes);
+    const local_backing_ms = monotonicMs() -| local_backing_start;
     defer if (local_backing.fd) |fd| {
         _ = std.c.close(fd);
     };
+    const kernel_start = monotonicMs();
     const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
+    const kernel_ms = monotonicMs() -| kernel_start;
+    const initrd_start = monotonicMs();
     const initrd: ?[]const u8 = if (resuming) null else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
+    const initrd_ms = monotonicMs() -| initrd_start;
+    const disk_start = monotonicMs();
     var runtime_disk = try openRuntimeDisk(init, allocator, .{
         .rootfs_path = opts.rootfs_path,
         .rootfs = opts.rootfs,
@@ -1652,10 +1660,13 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         .spore_dir = opts.resume_dir,
         .command_name = "run",
     });
+    const disk_ms = monotonicMs() -| disk_start;
     defer runtime_disk.deinit();
     const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, rootfsWritable(opts), opts.network);
+    const request_start = monotonicMs();
     const request = try execRequestForRun(init, allocator, opts);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
+    const request_ms = monotonicMs() -| request_start;
     if (resuming) stream.host_port = vsock.HostStream.deriveHostPort(request);
     if (opts.event_writer) |writer| {
         stream.setLifecycleSink(writer, runEventLifecycleSink);
@@ -1676,6 +1687,18 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     if (capture_plan.signal) |signal| {
         signal_registration = capture.SignalRegistration.install(signal, capture_plan.request.?);
     }
+    std.log.debug(
+        "run host setup timing: total_ms={d} local_backing_ms={d} kernel_ms={d} initrd_ms={d} disk_ms={d} request_ms={d} ram_mib={d}",
+        .{
+            monotonicMs() -| setup_start,
+            local_backing_ms,
+            kernel_ms,
+            initrd_ms,
+            disk_ms,
+            request_ms,
+            opts.memory.bytes / 1024 / 1024,
+        },
+    );
 
     const cause = (switch (backend) {
         .auto => unreachable,
