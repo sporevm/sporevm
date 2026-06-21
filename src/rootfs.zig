@@ -146,6 +146,9 @@ pub const ResolvedImage = struct {
 };
 
 pub const local_ref_cache_kind = "sporevm-local-rootfs-ref-v1";
+const image_ref_cache_record_version: u32 = 1;
+const max_rootfs_metadata_bytes = 1024 * 1024;
+const max_image_ref_cache_record_bytes = 64 * 1024;
 
 const LocalRefMetadata = struct {
     kind: []const u8 = local_ref_cache_kind,
@@ -1271,7 +1274,7 @@ pub fn writeLocalRefCache(
     };
     const json = try std.json.Stringify.valueAlloc(allocator, metadata, .{ .whitespace = .indent_2 });
     try ext4.writeFileAtPath(io, temp_path, json);
-    try renamePath(allocator, temp_path, path);
+    try renameCachePath(io, temp_path, path);
     return path;
 }
 
@@ -1312,6 +1315,324 @@ pub fn rootfsCacheKeyAlloc(allocator: std.mem.Allocator, resolved: ResolvedImage
     return allocator.dupe(u8, &hex);
 }
 
+pub fn cachedImageRootfsMetadataPath(allocator: std.mem.Allocator, cache_root: []const u8, resolved: ResolvedImage) ![]const u8 {
+    const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
+    return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
+}
+
+pub fn cachedImageRootfsPath(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    resolved: ResolvedImage,
+) !?[]const u8 {
+    const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
+    const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try cachedImageRootfsMetadataPath(allocator, cache_root, resolved);
+    if (try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved) and try readablePath(io, rootfs_path)) {
+        std.log.debug("spore rootfs: using cached rootfs {s} for {s}", .{ rootfs_path, resolved.ref });
+        return rootfs_path;
+    }
+    return null;
+}
+
+pub const ImageRefCacheHit = struct {
+    path: []const u8,
+    resolved: ResolvedImage,
+};
+
+const ImageRefCacheRecord = struct {
+    version: u32,
+    requested_ref: []const u8,
+    platform: []const u8,
+    builder_version: []const u8,
+    resolved_image_ref: []const u8,
+    image_manifest_digest: []const u8,
+    rootfs_cache_key: []const u8,
+    resolved_at_unix: i64,
+};
+
+pub fn cachedImageRefRootfsPath(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    requested_ref: []const u8,
+    platform: Platform,
+) !?ImageRefCacheHit {
+    const record_path = try imageRefCacheRecordPath(allocator, cache_root, requested_ref, platform);
+    if (!try rootfs_cache.regularFileNoSymlink(io, record_path)) return null;
+
+    const data = Io.Dir.cwd().readFileAlloc(io, record_path, allocator, .limited(max_image_ref_cache_record_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return null,
+        else => |e| return e,
+    };
+    defer allocator.free(data);
+
+    var parsed = std.json.parseFromSlice(ImageRefCacheRecord, allocator, data, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+
+    const record = parsed.value;
+    const platform_text = try platformTextAlloc(allocator, platform);
+    if (record.version != image_ref_cache_record_version) return null;
+    if (!std.mem.eql(u8, record.requested_ref, requested_ref)) return null;
+    if (!std.mem.eql(u8, record.platform, platform_text)) return null;
+    if (!std.mem.eql(u8, record.builder_version, builder_version)) return null;
+
+    const resolved = (digestPinnedImageIdentity(allocator, record.resolved_image_ref, platform) catch return null) orelse return null;
+    if (!std.mem.eql(u8, resolved.manifest_digest, record.image_manifest_digest)) return null;
+    const expected_cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
+    if (!std.mem.eql(u8, record.rootfs_cache_key, expected_cache_key)) return null;
+
+    const rootfs_path = (try cachedImageRootfsPath(io, allocator, cache_root, resolved)) orelse return null;
+    std.log.debug("spore rootfs: using cached image ref {s} -> {s}", .{ requested_ref, resolved.ref });
+    return .{ .path = rootfs_path, .resolved = resolved };
+}
+
+pub fn writeImageRefCacheRecord(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    requested_ref: []const u8,
+    resolved: ResolvedImage,
+) !void {
+    const refs_dir = try std.fs.path.join(allocator, &.{ cache_root, "refs" });
+    try ensureDirPath(io, refs_dir);
+
+    const rootfs_cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
+    const platform = try platformTextAlloc(allocator, resolved.platform);
+    const record_path = try imageRefCacheRecordPath(allocator, cache_root, requested_ref, resolved.platform);
+    const now = Io.Clock.real.now(io).nanoseconds;
+    const record = ImageRefCacheRecord{
+        .version = image_ref_cache_record_version,
+        .requested_ref = requested_ref,
+        .platform = platform,
+        .builder_version = builder_version,
+        .resolved_image_ref = resolved.ref,
+        .image_manifest_digest = resolved.manifest_digest,
+        .rootfs_cache_key = rootfs_cache_key,
+        .resolved_at_unix = @intCast(@divFloor(now, std.time.ns_per_s)),
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, record, .{ .whitespace = .indent_2 });
+    const temp_id = now;
+    var temp_nonce_bytes: [8]u8 = undefined;
+    io.random(&temp_nonce_bytes);
+    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}/.{d}.{x}.json.tmp", .{ refs_dir, temp_id, temp_nonce });
+    defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = temp_path, .data = json });
+    try renameCachePath(io, temp_path, record_path);
+    std.log.debug("spore rootfs: cached image ref {s} -> {s}", .{ requested_ref, resolved.ref });
+}
+
+fn imageRefCacheRecordPath(
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    requested_ref: []const u8,
+    platform: Platform,
+) ![]const u8 {
+    const key = try imageRefCacheKeyAlloc(allocator, requested_ref, platform);
+    const filename = try std.fmt.allocPrint(allocator, "{s}.json", .{key});
+    return std.fs.path.join(allocator, &.{ cache_root, "refs", filename });
+}
+
+fn imageRefCacheKeyAlloc(allocator: std.mem.Allocator, requested_ref: []const u8, platform: Platform) ![]u8 {
+    var h = Sha256.init(.{});
+    h.update("sporevm-rootfs-ref-v1\n");
+    h.update(builder_version);
+    h.update("\n");
+    h.update(platform.os);
+    h.update("/");
+    h.update(platform.arch);
+    h.update("\n");
+    h.update(requested_ref);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    h.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &hex);
+}
+
+fn platformTextAlloc(allocator: std.mem.Allocator, platform: Platform) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ platform.os, platform.arch });
+}
+
+pub fn buildCachedImageRootfs(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    resolved: ResolvedImage,
+) ![]const u8 {
+    const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
+    const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
+    const temp_dir_root = try std.fmt.allocPrint(allocator, "{s}/tmp", .{cache_root});
+    try ensureDirPath(init.io, temp_dir_root);
+    const temp_id = Io.Clock.real.now(init.io).nanoseconds;
+    var temp_nonce_bytes: [8]u8 = undefined;
+    init.io.random(&temp_nonce_bytes);
+    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
+    const temp_rootfs_path = try std.fmt.allocPrint(allocator, "{s}/.{s}.{d}.{x}.ext4.tmp", .{ cache_root, cache_key, temp_id, temp_nonce });
+    const temp_metadata_path = try std.fmt.allocPrint(allocator, "{s}/.{s}.{d}.{x}.json.tmp", .{ cache_root, cache_key, temp_id, temp_nonce });
+    defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
+    defer Io.Dir.cwd().deleteFile(init.io, temp_metadata_path) catch {};
+
+    std.log.debug("spore rootfs: building cached rootfs for {s}", .{resolved.ref});
+    _ = try build(init, allocator, .{
+        .ref = resolved.ref,
+        .output = temp_rootfs_path,
+        .metadata = temp_metadata_path,
+        .platform = resolved.platform,
+        .metadata_rootfs_path = rootfs_path,
+        .temp_dir_root = temp_dir_root,
+    });
+    try renameCachePath(init.io, temp_rootfs_path, rootfs_path);
+    try renameCachePath(init.io, temp_metadata_path, metadata_path);
+
+    std.log.debug("spore rootfs: cached rootfs {s}", .{rootfs_path});
+    return rootfs_path;
+}
+
+pub fn ensureImageRootfsStorage(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    resolved: ResolvedImage,
+    artifact: spore.RootfsArtifactRef,
+    device: spore.RootfsDevice,
+) !spore.RootfsStorage {
+    const metadata_path = try cachedImageRootfsMetadataPath(allocator, cache_root, resolved);
+    if (try readCachedRootfsStorage(init.io, allocator, metadata_path)) |cached| {
+        var storage = cached;
+        storage.device = device;
+        if (storage.logical_size == artifact.size and try rootfs_cas.storageComplete(init.io, allocator, cache_root, storage)) {
+            return storage;
+        }
+    }
+
+    const preload = try rootfs_cas.preload(init.io, allocator, cache_root, artifact.digest, rootfs_cas.default_chunk_size);
+    const storage = rootfs_cas.storageDescriptor(device, preload);
+    try writeCachedRootfsStorage(init.io, allocator, metadata_path, storage);
+    return storage;
+}
+
+const CachedRootfsStorageMetadata = struct {
+    rootfs_storage: ?spore.RootfsStorage = null,
+};
+
+fn readCachedRootfsStorage(io: Io, allocator: std.mem.Allocator, metadata_path: []const u8) !?spore.RootfsStorage {
+    const metadata = Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return null,
+        else => |e| return e,
+    };
+    defer allocator.free(metadata);
+    var parsed = std.json.parseFromSlice(CachedRootfsStorageMetadata, allocator, metadata, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    const storage = parsed.value.rootfs_storage orelse return null;
+    spore.validateRootfsStorageDescriptor(storage) catch return null;
+    return try cloneRootfsStorage(allocator, storage);
+}
+
+fn writeCachedRootfsStorage(io: Io, allocator: std.mem.Allocator, metadata_path: []const u8, storage: spore.RootfsStorage) !void {
+    const metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes));
+    defer allocator.free(metadata);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, metadata, .{});
+    const object = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.BadManifest,
+    };
+    const storage_json = try std.json.Stringify.valueAlloc(arena, storage, .{});
+    const storage_value = try std.json.parseFromSlice(std.json.Value, arena, storage_json, .{});
+    try object.put(arena, "rootfs_storage", storage_value.value);
+    const json = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+    defer allocator.free(json);
+    try writeFileAtomicPath(io, allocator, metadata_path, json);
+}
+
+fn writeFileAtomicPath(io: Io, allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    var temp_nonce_bytes: [8]u8 = undefined;
+    io.random(&temp_nonce_bytes);
+    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ path, temp_nonce });
+    defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = temp_path, .data = data });
+    try renameCachePath(io, temp_path, path);
+}
+
+fn cachedRootfsMetadataMatches(io: Io, allocator: std.mem.Allocator, metadata_path: []const u8, resolved: ResolvedImage) !bool {
+    const metadata = Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return false,
+        else => |e| return e,
+    };
+    defer allocator.free(metadata);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, metadata, .{}) catch return false;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    if (!jsonStringEquals(object.get("builder_version"), builder_version)) return false;
+    if (!jsonStringEquals(object.get("resolved_image_ref"), resolved.ref)) return false;
+    if (!jsonStringEquals(object.get("image_manifest_digest"), resolved.manifest_digest)) return false;
+    const platform_value = object.get("platform") orelse return false;
+    const platform_object = switch (platform_value) {
+        .object => |platform_object| platform_object,
+        else => return false,
+    };
+    return jsonStringEquals(platform_object.get("os"), resolved.platform.os) and
+        jsonStringEquals(platform_object.get("arch"), resolved.platform.arch);
+}
+
+fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
+    const actual = switch (value orelse return false) {
+        .string => |string| string,
+        else => return false,
+    };
+    return std.mem.eql(u8, actual, expected);
+}
+
+fn cloneRootfsStorage(allocator: std.mem.Allocator, storage: spore.RootfsStorage) !spore.RootfsStorage {
+    return .{
+        .kind = try allocator.dupe(u8, storage.kind),
+        .device = .{
+            .kind = try allocator.dupe(u8, storage.device.kind),
+            .role = try allocator.dupe(u8, storage.device.role),
+            .virtio_device_id = storage.device.virtio_device_id,
+            .mmio_slot = storage.device.mmio_slot,
+        },
+        .logical_size = storage.logical_size,
+        .chunk_size = storage.chunk_size,
+        .hash_algorithm = try allocator.dupe(u8, storage.hash_algorithm),
+        .index_digest = try allocator.dupe(u8, storage.index_digest),
+        .base_identity = try allocator.dupe(u8, storage.base_identity),
+        .object_namespace = try allocator.dupe(u8, storage.object_namespace),
+    };
+}
+
+fn readablePath(io: Io, path: []const u8) !bool {
+    if (Io.Dir.path.isAbsolute(path)) {
+        Io.Dir.accessAbsolute(io, path, .{ .read = true }) catch |err| switch (err) {
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+            else => |e| return e,
+        };
+        return true;
+    }
+    Io.Dir.cwd().access(io, path, .{ .read = true }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+        else => |e| return e,
+    };
+    return true;
+}
+
 fn ensureDirPath(io: Io, path: []const u8) !void {
     if (!Io.Dir.path.isAbsolute(path)) {
         try Io.Dir.cwd().createDirPath(io, path);
@@ -1333,12 +1654,15 @@ fn ensureDirPath(io: Io, path: []const u8) !void {
     existing.close(io);
 }
 
-fn renamePath(allocator: std.mem.Allocator, old_path: []const u8, new_path: []const u8) !void {
-    const old_z = try allocator.dupeZ(u8, old_path);
-    defer allocator.free(old_z);
-    const new_z = try allocator.dupeZ(u8, new_path);
-    defer allocator.free(new_z);
-    if (std.c.rename(old_z, new_z) != 0) return error.RootFSOpenFailed;
+fn renameCachePath(io: Io, old_path: []const u8, new_path: []const u8) !void {
+    const old_absolute = Io.Dir.path.isAbsolute(old_path);
+    const new_absolute = Io.Dir.path.isAbsolute(new_path);
+    if (old_absolute != new_absolute) return error.BadPathName;
+    if (old_absolute) {
+        try Io.Dir.renameAbsolute(old_path, new_path, io);
+    } else {
+        try Io.Dir.rename(Io.Dir.cwd(), old_path, Io.Dir.cwd(), new_path, io);
+    }
 }
 
 fn ensureRequiredDir(
@@ -1743,6 +2067,286 @@ test "local digest ref resolves without mutable ref cache" {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         resolved.manifest_digest,
     );
+}
+
+test "image rootfs cache key is deterministic and scoped to resolved image identity" {
+    const allocator = std.testing.allocator;
+    const resolved = ResolvedImage{
+        .ref = "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    };
+    const same = try rootfsCacheKeyAlloc(allocator, resolved);
+    defer allocator.free(same);
+    const again = try rootfsCacheKeyAlloc(allocator, resolved);
+    defer allocator.free(again);
+    try std.testing.expectEqual(@as(usize, Sha256.digest_length * 2), same.len);
+    try std.testing.expectEqualStrings(same, again);
+
+    const changed_ref = try rootfsCacheKeyAlloc(allocator, .{
+        .ref = "docker.io/library/alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .platform = .{},
+    });
+    defer allocator.free(changed_ref);
+    try std.testing.expect(!std.mem.eql(u8, same, changed_ref));
+
+    const changed_platform = try rootfsCacheKeyAlloc(allocator, .{
+        .ref = resolved.ref,
+        .manifest_digest = resolved.manifest_digest,
+        .platform = .{ .os = "linux", .arch = "amd64" },
+    });
+    defer allocator.free(changed_platform);
+    try std.testing.expect(!std.mem.eql(u8, same, changed_platform));
+}
+
+test "image rootfs cache can identify digest-pinned refs without network" {
+    const allocator = std.testing.allocator;
+    const resolved = (try digestPinnedImageIdentity(
+        allocator,
+        "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .{},
+    )).?;
+    defer allocator.free(resolved.ref);
+
+    try std.testing.expectEqualStrings(
+        "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        resolved.ref,
+    );
+    try std.testing.expectEqualStrings(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        resolved.manifest_digest,
+    );
+    try std.testing.expect((try digestPinnedImageIdentity(allocator, "docker.io/library/alpine:3.20", .{})) == null);
+    try validateTaggedImageRef("docker.io/library/alpine:3.20");
+    try std.testing.expectError(error.ImageRefNeedsRegistry, validateTaggedImageRef("alpine:3.20"));
+}
+
+test "image rootfs cache metadata matches resolved image identity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-image-cache-metadata";
+    const metadata_path = tmp ++ "/metadata.json";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    const resolved = ResolvedImage{
+        .ref = "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    };
+    try std.testing.expect(!try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved));
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = metadata_path,
+        .data =
+        \\{
+        \\  "builder_version": "sporevm-rootfs-v3",
+        \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "platform": {"os": "linux", "arch": "arm64"}
+        \\}
+        ,
+    });
+    try std.testing.expect(try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved));
+
+    try std.testing.expect(!try cachedRootfsMetadataMatches(io, allocator, metadata_path, .{
+        .ref = "docker.io/library/alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .platform = .{},
+    }));
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = "not json" });
+    try std.testing.expect(!try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved));
+}
+
+test "image rootfs cache treats oversized metadata as a miss" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-image-cache-oversized-metadata";
+    const metadata_path = tmp ++ "/metadata.json";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    const oversized = try allocator.alloc(u8, max_rootfs_metadata_bytes);
+    defer allocator.free(oversized);
+    @memset(oversized, ' ');
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = oversized });
+
+    try std.testing.expect(!try cachedRootfsMetadataMatches(io, allocator, metadata_path, .{
+        .ref = "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    }));
+}
+
+test "image ref cache key is deterministic and scoped to requested tag" {
+    const allocator = std.testing.allocator;
+    const key = try imageRefCacheKeyAlloc(allocator, "docker.io/library/alpine:3.20", .{});
+    defer allocator.free(key);
+    const again = try imageRefCacheKeyAlloc(allocator, "docker.io/library/alpine:3.20", .{});
+    defer allocator.free(again);
+    try std.testing.expectEqual(@as(usize, Sha256.digest_length * 2), key.len);
+    try std.testing.expectEqualStrings(key, again);
+
+    const changed_tag = try imageRefCacheKeyAlloc(allocator, "docker.io/library/alpine:3.21", .{});
+    defer allocator.free(changed_tag);
+    try std.testing.expect(!std.mem.eql(u8, key, changed_tag));
+
+    const changed_platform = try imageRefCacheKeyAlloc(allocator, "docker.io/library/alpine:3.20", .{ .os = "linux", .arch = "amd64" });
+    defer allocator.free(changed_platform);
+    try std.testing.expect(!std.mem.eql(u8, key, changed_platform));
+}
+
+test "image ref cache maps tag to verified rootfs path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-image-ref-cache-hit";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+
+    const resolved = ResolvedImage{
+        .ref = "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ cache_root, cache_key });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = metadata_path,
+        .data =
+        \\{
+        \\  "builder_version": "sporevm-rootfs-v3",
+        \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "platform": {"os": "linux", "arch": "arm64"}
+        \\}
+        ,
+    });
+
+    try writeImageRefCacheRecord(io, arena, cache_root, "docker.io/library/alpine:3.20", resolved);
+    const hit = (try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{})).?;
+    try std.testing.expectEqualStrings(rootfs_path, hit.path);
+    try std.testing.expectEqualStrings(resolved.ref, hit.resolved.ref);
+    try std.testing.expectEqualStrings(resolved.manifest_digest, hit.resolved.manifest_digest);
+}
+
+test "image ref cache treats mismatched records and missing rootfs as misses" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-image-ref-cache-miss";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+    try ensureDirPath(io, try std.fs.path.join(arena, &.{ cache_root, "refs" }));
+
+    const resolved = ResolvedImage{
+        .ref = "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
+    const record_path = try imageRefCacheRecordPath(arena, cache_root, "docker.io/library/alpine:3.20", .{});
+    const bad_record = try std.fmt.allocPrint(arena,
+        \\{{
+        \\  "version": 1,
+        \\  "requested_ref": "docker.io/library/alpine:other",
+        \\  "platform": "linux/arm64",
+        \\  "builder_version": "sporevm-rootfs-v3",
+        \\  "resolved_image_ref": "{s}",
+        \\  "image_manifest_digest": "{s}",
+        \\  "rootfs_cache_key": "{s}",
+        \\  "resolved_at_unix": 123
+        \\}}
+    , .{ resolved.ref, resolved.manifest_digest, cache_key });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = record_path, .data = bad_record });
+    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{})) == null);
+
+    const bad_resolved_ref_record = try std.fmt.allocPrint(arena,
+        \\{{
+        \\  "version": 1,
+        \\  "requested_ref": "docker.io/library/alpine:3.20",
+        \\  "platform": "linux/arm64",
+        \\  "builder_version": "sporevm-rootfs-v3",
+        \\  "resolved_image_ref": "docker.io/library/alpine:not-a-digest",
+        \\  "image_manifest_digest": "{s}",
+        \\  "rootfs_cache_key": "{s}",
+        \\  "resolved_at_unix": 123
+        \\}}
+    , .{ resolved.manifest_digest, cache_key });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = record_path, .data = bad_resolved_ref_record });
+    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{})) == null);
+
+    try writeImageRefCacheRecord(io, arena, cache_root, "docker.io/library/alpine:3.20", resolved);
+    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{})) == null);
+}
+
+test "image rootfs storage is recorded and reused without the digest artifact" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-image-rootfs-storage";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+
+    const resolved = ResolvedImage{
+        .ref = "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try cachedImageRootfsMetadataPath(arena, cache_root, resolved);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = metadata_path,
+        .data =
+        \\{
+        \\  "builder_version": "sporevm-rootfs-v3",
+        \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "platform": {"os": "linux", "arch": "arm64"}
+        \\}
+        ,
+    });
+
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const first = try ensureImageRootfsStorage(init, arena, cache_root, resolved, artifact, .{ .mmio_slot = 1 });
+    try std.testing.expect(try rootfs_cas.storageComplete(io, arena, cache_root, first));
+    const recorded = (try readCachedRootfsStorage(io, arena, metadata_path)).?;
+    try std.testing.expectEqualStrings(first.index_digest, recorded.index_digest);
+
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
+    const second = try ensureImageRootfsStorage(init, arena, cache_root, resolved, artifact, .{ .mmio_slot = 1 });
+    try std.testing.expectEqualStrings(first.index_digest, second.index_digest);
 }
 
 test "tag manifest content digest is computed and registry header is verified" {
