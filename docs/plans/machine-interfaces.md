@@ -266,10 +266,10 @@ The first implementation should pin a small stable code table in tests:
   digest, materialization, rootfs, remote, and child-selection summaries, and
   the smoke scripts consume the nested machine contract through global `--json`.
 - Slice 4 is implemented in this branch: `run` and `resume` accept
-  `--events=jsonl`, stdout is JSONL in event mode, run guest stdout/stderr are
-  base64-encoded typed events, resume console bytes are typed stdout events,
-  vsock readiness emits `ready`, and runtime terminal failures emit
-  `failure` records using the shared error classification. Older parser/setup
+  `--events=jsonl`, stdout is JSONL in event mode, guest stdout/stderr are
+  base64-encoded typed events, vsock readiness emits `ready`, and runtime
+  terminal failures emit `failure` records using the shared error
+  classification. Older parser/setup
   direct exits remain a follow-up hardening item outside the runtime stream
   path.
 - Slice 5 is implemented in this branch: `src/api.zig` exposes option-based

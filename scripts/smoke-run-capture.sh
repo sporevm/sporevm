@@ -33,10 +33,12 @@ workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-run-capture.XXXXXX")"
 trap 'rm -rf "${workdir}"' EXIT
 
 capture_dir="${workdir}/captured.spore"
+fork_dir="${workdir}/children"
 from_base_dir="${workdir}/from-base.spore"
 run_stdout="${workdir}/run.stdout"
 run_stderr="${workdir}/run.stderr"
-resume_log="${workdir}/resume.log"
+resume_stdout="${workdir}/resume.stdout"
+resume_stderr="${workdir}/resume.stderr"
 from_stdout="${workdir}/from.stdout"
 from_stderr="${workdir}/from.stderr"
 from_base_stdout="${workdir}/from-base.stdout"
@@ -48,13 +50,13 @@ smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
   --memory "${smoke_memory}" \
   --capture "${capture_dir}" \
   --capture-on USR1 \
-  -- /bin/sleeper \
+  -- /bin/finite \
   >"${run_stdout}" 2>"${run_stderr}" &
 run_pid="$!"
 
 seen_ready=0
 for _ in $(seq 1 "${SPORE_SMOKE_CAPTURE_POLLS:-120}"); do
-  if grep -Fxq "spore run ready" "${run_stdout}"; then
+  if grep -Fxq "spore finite ready" "${run_stdout}"; then
     seen_ready=1
     break
   fi
@@ -94,26 +96,34 @@ grep -Fq "captured snapshot at ${capture_dir}" "${run_stderr}" || {
   die "spore run capture did not report the capture path"
 }
 
-"${spore_bin}" resume --backend "${backend}" "${capture_dir}" >"${resume_log}" 2>&1 &
+"${spore_bin}" fork "${capture_dir}" --count 1 --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
+child_dir="$(find "${fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort | head -n 1)"
+[[ -n "${child_dir}" ]] || die "fork did not create a child spore"
+
+"${spore_bin}" resume --events=jsonl --backend "${backend}" "${child_dir}" >"${resume_stdout}" 2>"${resume_stderr}" &
 resume_pid="$!"
-seen_resume_output=0
-for _ in $(seq 1 "${SPORE_SMOKE_RESUME_POLLS:-120}"); do
-  if grep -Eaq 'spore sleeper tick [0-9]+' "${resume_log}"; then
-    seen_resume_output=1
-    break
-  fi
-  sleep "${SPORE_SMOKE_RESUME_POLL_INTERVAL:-0.1}"
-done
+(
+  sleep "${SPORE_SMOKE_RESUME_TIMEOUT_SECONDS:-20}"
+  kill -TERM "${resume_pid}" >/dev/null 2>&1 || true
+) &
+watchdog_pid="$!"
 
-kill -TERM "${resume_pid}" >/dev/null 2>&1 || true
-sleep 0.2
-kill -KILL "${resume_pid}" >/dev/null 2>&1 || true
-wait "${resume_pid}" >/dev/null 2>&1 || true
+set +e
+wait "${resume_pid}"
+resume_rc="$?"
+set -e
+kill "${watchdog_pid}" >/dev/null 2>&1 || true
+wait "${watchdog_pid}" >/dev/null 2>&1 || true
 
-if [[ "${seen_resume_output}" != "1" ]]; then
-  tail -80 "${resume_log}" >&2 || true
-  die "product resume did not stream output from the captured run spore"
+if [[ "${resume_rc}" != "0" ]]; then
+  cat "${resume_stdout}" >&2 || true
+  cat "${resume_stderr}" >&2 || true
+  die "spore resume --events=jsonl exited ${resume_rc}, expected 0"
 fi
+grep -Fq '"event":"ready"' "${resume_stdout}" || die "spore resume --events=jsonl did not emit ready"
+grep -Fq '"event":"stdout"' "${resume_stdout}" || die "spore resume --events=jsonl did not emit stdout"
+grep -Fq '"event":"exit"' "${resume_stdout}" || die "spore resume --events=jsonl did not emit terminal exit"
+grep -Fq '"exit_code":0' "${resume_stdout}" || die "spore resume --events=jsonl did not report exit_code 0"
 
 "${spore_bin}" run \
   --backend "${backend}" \

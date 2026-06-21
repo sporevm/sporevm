@@ -5,7 +5,6 @@ const builtin = @import("builtin");
 const Io = std.Io;
 
 const hvf = @import("hvf/hvf.zig");
-const generation = @import("generation.zig");
 const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
 else
@@ -19,9 +18,10 @@ const vsock = @import("virtio/vsock.zig");
 
 pub const Backend = run_mod.Backend;
 const default_resume_guest_port: u32 = 10700;
-const generation_probe_host_port: u32 = 49153;
-const generation_probe_timeout_ms: u64 = 5_000;
-const hvf_generation_probe_rx_delay_ms: u64 = 25;
+const resume_attach_host_port: u32 = 49153;
+const resume_attach_timeout_ms: u64 = 30_000;
+const hvf_resume_attach_rx_delay_ms: u64 = 25;
+const resume_attach_request = "{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n";
 
 pub const Options = struct {
     backend: Backend = .auto,
@@ -36,7 +36,7 @@ const cli_usage =
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
-    \\  --events=jsonl          Emit lifecycle and console output events as JSONL on stdout
+    \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
     \\  -h, --help              Show this help
     \\
 ;
@@ -63,6 +63,8 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     if (opts.event_mode == .jsonl) {
         try event_writer.emitExit(result);
     }
+    const code = result.processExitCode();
+    if (code != 0) std.process.exit(code);
 }
 
 pub fn parseCliArgs(args: []const []const u8) !Options {
@@ -115,9 +117,6 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
 }
 
 pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) !run_mod.Result {
-    resume_event_writer = opts.event_writer;
-    defer resume_event_writer = null;
-
     const parsed = try spore.loadManifest(allocator, opts.spore_dir);
     defer parsed.deinit();
 
@@ -141,19 +140,15 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         .command_name = "resume",
     });
     defer runtime_disk.deinit();
-    const identity_request = resumeIdentityRequest(allocator, parsed.value.generation) catch |err| switch (err) {
-        error.RunRequestTooLarge => null,
-        else => |e| return e,
-    };
-    defer if (identity_request) |request| allocator.free(request);
-    var identity_stream: ?vsock.HostStream = if (identity_request) |request|
-        try vsock.HostStream.init(default_resume_guest_port, request)
-    else
-        null;
+    var identity_stream: ?vsock.HostStream = try vsock.HostStream.init(default_resume_guest_port, resume_attach_request);
     if (identity_stream) |*stream| {
-        stream.host_port = generation_probe_host_port;
-        if (opts.event_writer) |writer| stream.setLifecycleSink(writer, resumeEventLifecycleSink);
-        stream.setOutputSink(null, identityProbeOutputSink);
+        stream.host_port = resume_attach_host_port;
+        if (opts.event_writer) |writer| {
+            stream.setLifecycleSink(writer, resumeEventLifecycleSink);
+            stream.setOutputSink(writer, resumeEventOutputSink);
+        } else {
+            stream.setOutputSink(null, identityProbeOutputSink);
+        }
     }
     const identity_probe: ?*vsock.HostStream = if (identity_stream) |*stream| stream else null;
 
@@ -172,16 +167,16 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
             break :blk try hvf.vm.run(allocator, .{
                 .kernel = "",
                 .ram_size = ram_size,
-                .console_sink = if (opts.event_writer == null) consoleSink else eventConsoleSink,
+                .console_sink = if (opts.event_writer == null) consoleSink else discardConsoleSink,
                 .disk_backend = runtime_disk.backend(),
                 .resume_dir = opts.spore_dir,
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
-                .exec_probe_timeout_ms = generation_probe_timeout_ms,
-                .exec_probe_initial_rx_delay_ms = hvf_generation_probe_rx_delay_ms,
-                .exec_probe_completes_run = false,
-                .exec_probe_failure_fatal = false,
+                .exec_probe_timeout_ms = resume_attach_timeout_ms,
+                .exec_probe_initial_rx_delay_ms = hvf_resume_attach_rx_delay_ms,
+                .exec_probe_completes_run = true,
+                .exec_probe_failure_fatal = true,
             });
         },
         .kvm => blk: {
@@ -189,15 +184,15 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
             break :blk try kvm.vm.run(allocator, .{
                 .kernel = "",
                 .ram_size = ram_size,
-                .console_sink = if (opts.event_writer == null) consoleSink else eventConsoleSink,
+                .console_sink = if (opts.event_writer == null) consoleSink else discardConsoleSink,
                 .disk_backend = runtime_disk.backend(),
                 .resume_dir = opts.spore_dir,
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
-                .exec_probe_timeout_ms = generation_probe_timeout_ms,
-                .exec_probe_completes_run = false,
-                .exec_probe_failure_fatal = false,
+                .exec_probe_timeout_ms = resume_attach_timeout_ms,
+                .exec_probe_completes_run = true,
+                .exec_probe_failure_fatal = true,
             });
         },
     };
@@ -205,12 +200,14 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     if (comptime @hasField(@TypeOf(cause), "monitor_stopped")) {
         switch (cause) {
             .guest_off, .guest_reset => {},
-            .snapshotted, .probe_complete, .monitor_stopped => return error.UnexpectedResumeExit,
+            .probe_complete => return resultFromResumeStream(backend, ram_size, identity_stream),
+            .snapshotted, .monitor_stopped => return error.UnexpectedResumeExit,
         }
     } else {
         switch (cause) {
             .guest_off, .guest_reset => {},
-            .snapshotted, .probe_complete => return error.UnexpectedResumeExit,
+            .probe_complete => return resultFromResumeStream(backend, ram_size, identity_stream),
+            .snapshotted => return error.UnexpectedResumeExit,
         }
     }
     if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
@@ -237,12 +234,11 @@ fn consoleSink(bytes: []const u8) void {
     }
 }
 
-var resume_event_writer: ?*run_mod.EventWriter = null;
+fn discardConsoleSink(_: []const u8) void {}
 
-fn eventConsoleSink(bytes: []const u8) void {
-    if (resume_event_writer) |writer| {
-        writer.emitOutputBestEffort(.stdout, bytes);
-    }
+fn resumeEventOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+    const writer: *run_mod.EventWriter = @ptrCast(@alignCast(context.?));
+    writer.emitOutputBestEffort(output, bytes);
 }
 
 fn resumeEventLifecycleSink(context: ?*anyopaque, event: vsock.HostStreamLifecycle) void {
@@ -260,6 +256,22 @@ fn identityProbeOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes
         if (n <= 0) return;
         remaining = remaining[@intCast(n)..];
     }
+}
+
+fn resultFromResumeStream(backend: Backend, ram_size: u64, identity_stream: ?vsock.HostStream) !run_mod.Result {
+    const stream = identity_stream orelse return error.UnexpectedResumeExit;
+    const connect_ms = stream.connect_ms orelse stream.elapsedMs();
+    const response_ms = stream.response_ms orelse stream.elapsedMs();
+    return .{
+        .backend = backend,
+        .start_ms = stream.start_ms orelse 0,
+        .vsock_connect_ms = connect_ms,
+        .exec_response_ms = response_ms,
+        .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
+        .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
+        .vcpus = 1,
+        .memory_bytes = ram_size,
+    };
 }
 
 fn resolveBackend(backend: Backend) !Backend {
@@ -300,22 +312,6 @@ fn countBlockDevices(devices: []const spore.TransportState) usize {
     return count;
 }
 
-fn resumeIdentityRequest(allocator: std.mem.Allocator, state: spore.GenerationState) !?[]const u8 {
-    if (state.params_b64.len == 0) return null;
-
-    var gen_dev = generation.Device{};
-    gen_dev.restore(allocator, state) catch |err| switch (err) {
-        error.BadState => return error.BadManifest,
-        else => |e| return e,
-    };
-    try spore.refreshResumeParams(allocator, &gen_dev);
-
-    var end = gen_dev.params.len;
-    while (end > 0 and gen_dev.params[end - 1] == 0) : (end -= 1) {}
-    if (end == 0) return null;
-    return try run_mod.generationRequest(allocator, gen_dev.params[0..end]);
-}
-
 fn failResumeSetup(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print(fmt ++ "\n", args);
     std.process.exit(2);
@@ -344,29 +340,6 @@ test "resume memory defaults to manifest ram size" {
         .counter_frequency_hz = 24_000_000,
     };
     try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), resumeRamSize(platform));
-}
-
-test "resume identity request carries resume-time fields" {
-    const allocator = std.testing.allocator;
-    const params =
-        \\{"schema_version":0,"parent_generation":7,"generation":8,"fork_index":2,"fork_count":4,"parallel_index":2,"parallel_count":4,"fork_batch_id":"0123456789abcdef0123456789abcdef","vm_id":"spore-test","hostname":"spore-test","mac_seed":"0123456789abcdef0123456789abcdef","mac_address":"02:00:00:00:00:02"}
-    ;
-    const enc = std.base64.standard.Encoder;
-    const params_b64 = try allocator.alloc(u8, enc.calcSize(params.len));
-    defer allocator.free(params_b64);
-    _ = enc.encode(params_b64, params);
-
-    const request = (try resumeIdentityRequest(allocator, .{
-        .generation = 8,
-        .interrupt_status = generation.irq_generation_changed,
-        .params_b64 = params_b64,
-    })).?;
-    defer allocator.free(request);
-
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"generation\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "resume_time_unix_ns") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "resume_entropy_seed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "parallel_index\\\":2") != null);
 }
 
 test "resume counts block devices for disk dependency classification" {
