@@ -1266,7 +1266,7 @@ fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Alloca
     const dest = try std.fs.path.join(allocator, &.{ dest_dir, asset });
     const sha_dest = try std.fmt.allocPrint(allocator, "{s}.sha256", .{dest});
 
-    if (try verifiedManagedKernelPath(init.io, allocator, dest, sha_dest)) {
+    if (try managedKernelCacheHit(init.io, allocator, dest, sha_dest)) {
         return dest;
     }
 
@@ -1359,6 +1359,26 @@ fn verifiedManagedKernelPath(io: Io, allocator: std.mem.Allocator, image_path: [
     defer allocator.free(expected);
     const actual = try sha256FileHex(io, image_path);
     return std.ascii.eqlIgnoreCase(expected, &actual);
+}
+
+fn managedKernelCacheHit(io: Io, allocator: std.mem.Allocator, image_path: []const u8, sha_path: []const u8) !bool {
+    if (!try readOnlyRegularFileNoSymlink(io, image_path)) return false;
+    if (!try readOnlyRegularFileNoSymlink(io, sha_path)) return false;
+
+    const expected = readExpectedSha256(io, allocator, sha_path) catch |err| switch (err) {
+        error.BadManagedKernelChecksum => return false,
+        else => |e| return e,
+    };
+    allocator.free(expected);
+    return true;
+}
+
+fn readOnlyRegularFileNoSymlink(io: Io, path: []const u8) !bool {
+    const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+        else => |e| return e,
+    };
+    return stat.kind == .file and @intFromEnum(stat.permissions) & 0o222 == 0;
 }
 
 fn readExpectedSha256(io: Io, allocator: std.mem.Allocator, sha_path: []const u8) ![]const u8 {
@@ -3074,4 +3094,32 @@ test "managed kernel checksum parser reads sha256 sidecar" {
 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = sha_path, .data = "not-a-sha\n" });
     try std.testing.expectError(error.BadManagedKernelChecksum, readExpectedSha256(io, allocator, sha_path));
+}
+
+test "managed kernel cache hit trusts read-only image with checksum sidecar" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-run-kernel-cache-hit";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, tmp);
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+
+    const image_path = tmp ++ "/Image";
+    const sha_path = tmp ++ "/Image.sha256";
+    const bad_sha_path = tmp ++ "/Image.bad.sha256";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "kernel bytes" });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = sha_path,
+        .data = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  Image\n",
+    });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_sha_path, .data = "not-a-sha\n" });
+
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path));
+    try chmodFileReadOnly(allocator, image_path);
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path));
+    try chmodFileReadOnly(allocator, sha_path);
+    try std.testing.expect(try managedKernelCacheHit(io, allocator, image_path, sha_path));
+
+    try chmodFileReadOnly(allocator, bad_sha_path);
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, bad_sha_path));
 }
