@@ -63,6 +63,7 @@ const managed_run_kernel_required_config_symbols = [_][]const u8{
 const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const rootfs_trace_env = "SPOREVM_ROOTFS_TRACE";
+const auto_boot_memory_bytes: u64 = 512 * 1024 * 1024;
 
 pub const MemoryConfig = memory_config.Config;
 pub const CaptureTrigger = capture.Trigger;
@@ -1723,8 +1724,11 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const network_manifest = manifestNetworkFromOptions(opts.network, &opts.network_policy);
 
     const resuming = opts.resume_dir != null;
+    const fixed_ram = resuming or opts.capture_path != null;
+    const boot_ram_size = runBootRamSize(opts.memory, fixed_ram);
+    const virtio_mem_region_size = runVirtioMemRegionSize(opts.memory, fixed_ram);
     const local_backing_start = monotonicMs();
-    const local_backing = try openRunLocalMemoryBacking(allocator, context.environ_map, opts.resume_dir, opts.memory.bytes);
+    const local_backing = try openRunLocalMemoryBacking(allocator, context.environ_map, opts.resume_dir, boot_ram_size);
     const local_backing_ms = monotonicMs() -| local_backing_start;
     defer if (local_backing.fd) |fd| {
         _ = std.c.close(fd);
@@ -1771,7 +1775,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         signal_registration = capture.SignalRegistration.install(signal, capture_plan.request.?);
     }
     std.log.debug(
-        "run host setup timing: total_ms={d} local_backing_ms={d} kernel_ms={d} initrd_ms={d} disk_ms={d} request_ms={d} ram_mib={d}",
+        "run host setup timing: total_ms={d} local_backing_ms={d} kernel_ms={d} initrd_ms={d} disk_ms={d} request_ms={d} ram_mib={d} virtio_mem_mib={d}",
         .{
             monotonicMs() -| setup_start,
             local_backing_ms,
@@ -1779,7 +1783,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             initrd_ms,
             disk_ms,
             request_ms,
-            opts.memory.bytes / 1024 / 1024,
+            boot_ram_size / 1024 / 1024,
+            virtio_mem_region_size / 1024 / 1024,
         },
     );
 
@@ -1789,7 +1794,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
             break :blk hvf.vm.run(allocator, .{
                 .kernel = kernel,
-                .ram_size = opts.memory.bytes,
+                .ram_size = boot_ram_size,
+                .virtio_mem_region_size = virtio_mem_region_size,
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
@@ -1814,7 +1820,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
             break :blk kvm.vm.run(allocator, .{
                 .kernel = kernel,
-                .ram_size = opts.memory.bytes,
+                .ram_size = boot_ram_size,
+                .virtio_mem_region_size = virtio_mem_region_size,
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
@@ -1857,6 +1864,16 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     try events.emitExit(result);
     if (events.write_failed) return error.EventSinkFailed;
     return result;
+}
+
+fn runBootRamSize(memory: memory_config.Config, fixed_ram: bool) u64 {
+    if (!fixed_ram and memory.policy == .auto and memory.bytes > auto_boot_memory_bytes) return auto_boot_memory_bytes;
+    return memory.bytes;
+}
+
+fn runVirtioMemRegionSize(memory: memory_config.Config, fixed_ram: bool) u64 {
+    if (fixed_ram or memory.policy != .auto or memory.bytes <= auto_boot_memory_bytes) return 0;
+    return memory.bytes - auto_boot_memory_bytes;
 }
 
 pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {
@@ -2643,6 +2660,18 @@ test "run cli parser accepts memory policy" {
     try std.testing.expectEqual(memory_config.Policy.explicit, explicit_opts.shared.memory.policy);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), explicit_opts.shared.memory.bytes);
     try std.testing.expect(explicit_opts.shared.memory_set);
+}
+
+test "run auto memory boots small unless fixed RAM is required" {
+    const auto = memory_config.Config{};
+    try std.testing.expectEqual(auto_boot_memory_bytes, runBootRamSize(auto, false));
+    try std.testing.expectEqual(memory_config.auto_bytes - auto_boot_memory_bytes, runVirtioMemRegionSize(auto, false));
+    try std.testing.expectEqual(memory_config.auto_bytes, runBootRamSize(auto, true));
+    try std.testing.expectEqual(@as(u64, 0), runVirtioMemRegionSize(auto, true));
+
+    const explicit = memory_config.Config{ .policy = .explicit, .bytes = 1024 * 1024 * 1024 };
+    try std.testing.expectEqual(explicit.bytes, runBootRamSize(explicit, false));
+    try std.testing.expectEqual(@as(u64, 0), runVirtioMemRegionSize(explicit, false));
 }
 
 test "run cli parser accepts rootfs path" {

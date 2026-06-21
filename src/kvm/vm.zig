@@ -23,6 +23,7 @@ const console = @import("../virtio/console.zig");
 const blk = @import("../virtio/blk.zig");
 const net = @import("../virtio/net.zig");
 const rng = @import("../virtio/rng.zig");
+const virtio_mem = @import("../virtio/mem.zig");
 const platform = @import("../platform.zig");
 const spore = @import("../spore.zig");
 const vsock = @import("../virtio/vsock.zig");
@@ -30,6 +31,7 @@ const vsock = @import("../virtio/vsock.zig");
 pub const Config = struct {
     kernel: []const u8,
     ram_size: u64 = 512 * 1024 * 1024,
+    virtio_mem_region_size: u64 = 0,
     cmdline: []const u8 = "console=hvc0",
     initrd: ?[]const u8 = null,
     console_sink: *const fn ([]const u8) void,
@@ -128,6 +130,55 @@ const RamMapping = struct {
     }
 };
 
+const HotplugMapping = struct {
+    bytes: []align(std.heap.page_size_min) u8,
+    guest_addr: u64,
+    vm_fd: std.c.fd_t,
+    mapped: bool = false,
+
+    fn init(size: u64, guest_addr: u64, vm_fd: std.c.fd_t) !HotplugMapping {
+        return .{
+            .bytes = (try mapAnonymousRam(size)).bytes,
+            .guest_addr = guest_addr,
+            .vm_fd = vm_fd,
+        };
+    }
+
+    fn deinit(self: *HotplugMapping) void {
+        if (self.mapped) {
+            var region = kvm.UserspaceMemoryRegion{
+                .slot = 1,
+                .flags = 0,
+                .guest_phys_addr = self.guest_addr,
+                .memory_size = 0,
+                .userspace_addr = 0,
+            };
+            _ = kvm.ioctl(self.vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION");
+        }
+        std.posix.munmap(self.bytes);
+    }
+
+    fn mapForGuest(self: *HotplugMapping) !void {
+        if (self.mapped) return;
+        var region = kvm.UserspaceMemoryRegion{
+            .slot = 1,
+            .flags = 0,
+            .guest_phys_addr = self.guest_addr,
+            .memory_size = self.bytes.len,
+            .userspace_addr = @intFromPtr(self.bytes.ptr),
+        };
+        _ = try kvm.ioctl(self.vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION");
+        self.mapped = true;
+        std.log.debug("virtio-mem mapped hotplug region: addr=0x{x} bytes={d}", .{ self.guest_addr, self.bytes.len });
+    }
+
+    fn plug(ctx: *anyopaque) bool {
+        const self: *HotplugMapping = @ptrCast(@alignCast(ctx));
+        self.mapForGuest() catch return false;
+        return true;
+    }
+};
+
 const SpinLock = struct {
     locked: std.atomic.Value(bool) = .init(false),
 
@@ -182,6 +233,11 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     defer if (lazy_pager) |*pager| pager.deinit();
     const ram_bytes = ram_mapping.bytes;
     var ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
+    var hotplug_mapping: ?HotplugMapping = if (config.virtio_mem_region_size > 0)
+        try HotplugMapping.init(config.virtio_mem_region_size, board.ram_base + config.ram_size, vm_fd)
+    else
+        null;
+    defer if (hotplug_mapping) |*mapping| mapping.deinit();
 
     var region = kvm.UserspaceMemoryRegion{
         .slot = 0,
@@ -201,8 +257,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     defer net_dev.shutdown();
     var rng_dev = rng.Rng{};
     var vsock_dev = vsock.Vsock.init(.{});
+    var mem_dev: virtio_mem.Mem = undefined;
     var gen_dev = generation.Device{};
-    var transports_buf: [5]mmio.Transport = undefined;
+    var transports_buf: [6]mmio.Transport = undefined;
     transports_buf[0] = mmio.Transport.init(con.device());
     var transport_count: usize = 1;
     const disk_backend: ?blk.Backend = if (config.disk_backend) |backend| backend else if (config.disk_fd) |fd| .{ .file = fd } else null;
@@ -219,6 +276,17 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     transport_count += 1;
     transports_buf[transport_count] = mmio.Transport.init(rng_dev.device());
     transport_count += 1;
+    if (hotplug_mapping) |*mapping| {
+        mem_dev = virtio_mem.Mem.init(.{
+            .addr = mapping.guest_addr,
+            .region_size = @intCast(mapping.bytes.len),
+            .requested_size = @intCast(mapping.bytes.len),
+            .plug_context = mapping,
+            .plugFn = HotplugMapping.plug,
+        });
+        transports_buf[transport_count] = mmio.Transport.init(mem_dev.device());
+        transport_count += 1;
+    }
     const transports = transports_buf[0..transport_count];
 
     const vcpu_fd: std.c.fd_t = @intCast(try kvm.ioctl(vm_fd, kvm.KVM_CREATE_VCPU, 0, "KVM_CREATE_VCPU"));

@@ -51,7 +51,8 @@ without duplicating behavior.
 
 - Boot a pinned aarch64 Linux kernel under KVM and HVF from one codebase.
 - Keep the device model small and backend-neutral: virtio-mmio console, blk, net,
-  vsock, rng, plus the generation MMIO device.
+  vsock, rng, an experimental grow-only virtio-mem device for `--memory auto`,
+  plus the generation MMIO device.
 - Define a versioned spore manifest whose machine state is architectural, not
   raw KVM or HVF structs.
 - Expose the shared product surface as `libspore`; keep the CLI from owning
@@ -141,7 +142,7 @@ contract.
 - Zig 0.16.0 is pinned through `mise`; `mise run check` runs unit tests, build,
   and diff hygiene.
 - KVM and HVF boot the same board/device model, including virtio-mmio console,
-  blk, net, vsock, rng, and generation devices.
+  blk, net, vsock, rng, experimental virtio-mem, and generation devices.
 - `src/spore.zig` and `docs/spore-format.md` define manifest v0 with
   content-addressed RAM chunks, normalized one-vCPU machine state, timer state,
   GIC/ICC state, virtio transport state, generation state, optional same-host RAM
@@ -355,7 +356,8 @@ inputs.
 ## Resolved Decisions
 
 - Language is Zig; shipping builds are ReleaseSafe.
-- aarch64-only for v0; virtio-mmio-only; device list frozen.
+- aarch64-only for v0; virtio-mmio-only; device list frozen except the
+  `--memory auto` virtio-mem prototype.
 - Machine state is normalized architectural state, never raw KVM or HVF structs.
 - The checkpoint artifact is a spore; v0 formats carry no compatibility promise.
 - Distribution starts with SporeVM chunkpack bundles and moves toward the
