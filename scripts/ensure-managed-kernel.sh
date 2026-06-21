@@ -10,7 +10,7 @@ Resolve, download, cache, and verify a managed aarch64 Linux kernel Image from
 buildkite/cleanroom-kernels. Prints the absolute Image path on stdout.
 
 Kinds:
-  run      SporeVM run kernel with initrd, virtio-blk, and ext4 support
+  run      SporeVM run kernel with initrd, virtio-blk, ext4, and Docker runtime support
   sporevm  Legacy SporeVM smoke/fork kernel with /dev/mem support
   initrd   cleanroom minimal initrd-profile kernel
   rootfs   cleanroom minimal rootfs-profile kernel
@@ -58,16 +58,43 @@ sha256_file() {
   fi
 }
 
+required_run_config_symbols=(
+  CONFIG_FILE_LOCKING
+  CONFIG_SHMEM
+  CONFIG_TMPFS
+  CONFIG_FSNOTIFY
+  CONFIG_INOTIFY_USER
+  CONFIG_BPF_SYSCALL
+  CONFIG_CGROUP_BPF
+)
+
+verify_run_kernel_config() {
+  local config_file="$1"
+  [[ -f "${config_file}" ]] || return 1
+
+  local symbol
+  for symbol in "${required_run_config_symbols[@]}"; do
+    if ! grep -Fxq "${symbol}=y" "${config_file}"; then
+      echo "error: managed run kernel config ${config_file} is missing ${symbol}=y" >&2
+      return 1
+    fi
+  done
+}
+
 verify_kernel() {
   local image="$1"
   local sha_file="$2"
+  local config_file="${3:-}"
   [[ -f "${image}" && -f "${sha_file}" ]] || return 1
 
   local expected actual
   expected="$(awk 'NF {print $1; exit}' "${sha_file}")"
   [[ -n "${expected}" ]] || return 1
   actual="$(sha256_file "${image}")"
-  [[ "${actual}" == "${expected}" ]]
+  [[ "${actual}" == "${expected}" ]] || return 1
+  if [[ -n "${config_file}" ]]; then
+    verify_run_kernel_config "${config_file}" || return 1
+  fi
 }
 
 download_asset() {
@@ -75,12 +102,16 @@ download_asset() {
   local release="$2"
   local asset="$3"
   local tmp_dir="$4"
+  local require_config="$5"
 
   if command -v gh >/dev/null 2>&1; then
+    local patterns=(--pattern "${asset}" --pattern "${asset}.sha256")
+    if [[ "${require_config}" == "1" ]]; then
+      patterns+=(--pattern "${asset}.config")
+    fi
     if GH_PROMPT_DISABLED=1 gh release download "${release}" \
       --repo "${repo}" \
-      --pattern "${asset}" \
-      --pattern "${asset}.sha256" \
+      "${patterns[@]}" \
       --dir "${tmp_dir}" \
       --clobber >/dev/null 2>&1; then
       return 0
@@ -91,6 +122,9 @@ download_asset() {
   local base_url="https://github.com/${repo}/releases/download/${release}"
   curl -fsSL --retry 3 "${base_url}/${asset}" -o "${tmp_dir}/${asset}"
   curl -fsSL --retry 3 "${base_url}/${asset}.sha256" -o "${tmp_dir}/${asset}.sha256"
+  if [[ "${require_config}" == "1" ]]; then
+    curl -fsSL --retry 3 "${base_url}/${asset}.config" -o "${tmp_dir}/${asset}.config"
+  fi
 }
 
 kind="${1:-}"
@@ -133,13 +167,23 @@ repo_cache="${repo//\//-}"
 dest_dir="$(cache_root)/${repo_cache}/${release}"
 dest="${dest_dir}/${asset}"
 sha_dest="${dest}.sha256"
+config_dest=""
+require_config=0
+if [[ "${kind}" == "run" ]]; then
+  config_dest="${dest}.config"
+  require_config=1
+fi
 
-if verify_kernel "${dest}" "${sha_dest}"; then
+if verify_kernel "${dest}" "${sha_dest}" "${config_dest}"; then
   abs_path "${dest}"
   exit 0
 fi
 
-rm -f "${dest}" "${sha_dest}"
+if [[ -n "${config_dest}" ]]; then
+  rm -f "${dest}" "${sha_dest}" "${config_dest}"
+else
+  rm -f "${dest}" "${sha_dest}"
+fi
 mkdir -p "${dest_dir}"
 tmp_dir="$(mktemp -d "${dest_dir}/download.XXXXXX")"
 cleanup() {
@@ -148,11 +192,16 @@ cleanup() {
 trap cleanup EXIT
 
 echo "downloading managed kernel ${repo}@${release}:${asset}" >&2
-download_asset "${repo}" "${release}" "${asset}" "${tmp_dir}" || die "failed to download ${asset} from ${repo}@${release}"
-verify_kernel "${tmp_dir}/${asset}" "${tmp_dir}/${asset}.sha256" || die "sha256 verification failed for ${asset}"
+download_asset "${repo}" "${release}" "${asset}" "${tmp_dir}" "${require_config}" || die "failed to download ${asset} from ${repo}@${release}"
+verify_kernel "${tmp_dir}/${asset}" "${tmp_dir}/${asset}.sha256" "${config_dest:+${tmp_dir}/${asset}.config}" || die "verification failed for ${asset}"
 
 mv "${tmp_dir}/${asset}" "${dest}"
 mv "${tmp_dir}/${asset}.sha256" "${sha_dest}"
-chmod 0644 "${dest}" "${sha_dest}" || true
+if [[ -n "${config_dest}" ]]; then
+  mv "${tmp_dir}/${asset}.config" "${config_dest}"
+  chmod 0444 "${dest}" "${sha_dest}" "${config_dest}" || true
+else
+  chmod 0444 "${dest}" "${sha_dest}" || true
+fi
 
 abs_path "${dest}"

@@ -1,6 +1,6 @@
 ---
 status: landed
-last_reviewed: 2026-06-16
+last_reviewed: 2026-06-21
 spec_refs:
   - docs/plans/foundation.md
   - docs/rootfs.md
@@ -33,6 +33,9 @@ The landed bridge covers default run assets, read-only rootfs execution, cached
 OCI rootfs convenience, running from an existing spore, streaming output, exit
 and host-signalled capture, product `spore resume`, explicit fork/fan-out, and
 immutable-rootfs resume for captured `--image` workloads.
+The default managed run kernel is also checked against its release `.config` for
+guest runtime features that Docker/containerd expect, including file locking,
+tmpfs/shmem, fsnotify/inotify, and cgroup BPF support.
 
 ## Landed Product Contract
 
@@ -46,7 +49,9 @@ spore run --kernel Image --initrd minimal.cpio -- /bin/writeout
 When kernel or initrd are omitted, `spore run` resolves:
 
 - kernel: the managed SporeVM run aarch64 kernel, honoring
-  `SPOREVM_KERNEL_IMAGE` as an explicit local override;
+  `SPOREVM_KERNEL_IMAGE` as an explicit local override, with managed downloads
+  requiring the release `.config` to include the run-kernel Docker-adjacent
+  options;
 - initrd: the installed minimal exec initrd, honoring `SPOREVM_RUN_INITRD`.
 
 Fresh `spore run` streams typed stdout/stderr frames over one host-initiated
@@ -117,12 +122,12 @@ mint child spores with `spore fork`, then resume them individually or through
 - `src/fanout.zig` implements product fan-out over an existing child-spore
   directory.
 - Managed kernel resolution lives in the product path and verifies downloaded
-  assets.
+  assets, including the run-kernel `.config` sidecar.
 - `scripts/make-minimal-exec-initrd.sh` builds the minimal guest exec agent and
   diskless helper binaries used by the bridge smokes.
 - `scripts/smoke-run.sh`, `scripts/smoke-run-capture.sh`,
-  `scripts/smoke-counter-fanout.sh`, and `scripts/smoke-rootfs-fanout.sh` cover
-  the landed bridge surface.
+  `scripts/smoke-run-file-locking.sh`, `scripts/smoke-counter-fanout.sh`, and
+  `scripts/smoke-rootfs-fanout.sh` cover the landed bridge surface.
 
 ## Safety And Invariants
 
@@ -130,7 +135,9 @@ mint child spores with `spore fork`, then resume them individually or through
   host stderr as frames arrive, then exits with the guest command's status.
 - Frame payloads are bounded and typed. Malformed frames fail the run.
 - Missing default assets fail before booting a VM.
-- Downloaded kernels are verified before use.
+- Downloaded kernels are verified before use, and the managed run kernel must
+  provide the file-locking and Docker-adjacent options required by the product
+  smoke surface.
 - Cached OCI rootfs images are never mounted writable by default.
 - Rootfs execution uses the existing virtio-blk device and does not widen the
   frozen device model.
