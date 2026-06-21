@@ -232,8 +232,24 @@ can drift from the canonical index bytes.
   run `/bin/true` resumed `node -v` in 626-887ms with CAS versus 3.9-4.1s
   fd-backed; CAS verified 488 unique 64KiB chunks, hashed 31,981,568 bytes, and
   served 6,502 repeated read hits from the per-VM verified chunk cache.
-  Remaining benchmark work is 10-child and 100-child fan-out p50/p95, plus
-  16KiB and 256KiB runtime comparisons.
+- The Slice 3 a1/KVM benchmark gate is complete. On `a1.metal`
+  `i-07ccd00f26fbaec6d`, with the same 512MiB
+  `docker.io/library/node:22-alpine` rootfs and 100 forked children from a
+  `/bin/true` base, fd-backed `spore run --from <child> -- node -v` took
+  30.237s p50 / 30.260s p95 across 100 sequential children. Full-rootfs open
+  and digest verification alone took 21.463s p50 / 21.483s p95; the child then
+  read 28.7MiB from the clean rootfs through 6,996 4KiB reads.
+- The same a1/KVM run showed cached CAS is materially faster end to end:
+  16KiB chunks took 10.174s p50 / 10.180s p95, hashing 29.5MiB through 1,803
+  object opens; 64KiB chunks took 10.142s p50 / 10.146s p95, hashing 32.1MiB
+  through 490 object opens; 256KiB chunks took 10.322s p50 / 10.326s p95,
+  hashing 37.5MiB through 143 object opens. The benchmark was pinned to
+  `099f5d592af6` because `origin/main` moved while the run was in flight. The
+  local preload path paid a full rootfs scan plus object/index writes per chunk
+  size: 46.0s for 16KiB, 44.3s for 64KiB, and 43.9s for 256KiB. This confirms
+  the cached block-source path is faster, not merely neutral, and that the
+  remaining roughly 10s child TTI is outside the old full-rootfs open/digest
+  verification phase.
 
 ## Delivery Strategy
 
@@ -438,6 +454,13 @@ rootfs storage descriptors and keeps both manifest-authoritative.
   not as a final default. Keep 16KiB and 256KiB in benchmark output while the
   image-registry experiment broadens; 256KiB was fastest in the local replay, but
   it overfetches more rootfs data and may weaken cross-image dedupe.
+- The a1/KVM 100-child runtime gate reinforces 64KiB as the first
+  manifest-attached prototype size. It was the fastest measured child TTI in the
+  product path, kept index size small at 243,667 bytes, and cut per-child object
+  opens from 1,803 at 16KiB to 490 while avoiding the 37.5MiB overfetch seen at
+  256KiB. A proof sidecar can still be evaluated as a same-host fd-backed
+  optimization, but it should not block the chunked rootfs descriptor/parser
+  slice because it does not solve cross-host distribution.
 
 ## Open Questions
 
