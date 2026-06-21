@@ -103,6 +103,7 @@ mise run build
 mise run install
 mise run smoke:lifecycle
 mise run smoke:run
+mise run smoke:run-file-locking
 mise run smoke:run-net-config
 mise run smoke:run-net-dns
 mise run smoke:run-capture
@@ -119,7 +120,9 @@ mise run benchmark:comparison
 with runtime assets under `~/share/sporevm`.
 `mise run smoke` builds once, then runs product run, run-capture, and resume
 smokes. `smoke:lifecycle` checks named create, repeated exec, list, and remove
-on the selected backend. `smoke:run-net-config` checks the experimental
+on the selected backend. `smoke:run-file-locking` checks that the managed run
+kernel supports guest `flock(2)` behavior needed by Docker and containerd volume
+metadata. `smoke:run-net-config` checks the experimental
 `spore run --net` static guest link setup, and `smoke:run-net-dns` checks DNS
 proxying through the managed gateway. `smoke:counter-fanout` and
 `smoke:rootfs-fanout` are opt-in demo smokes; the rootfs fan-out smoke builds a
@@ -161,9 +164,10 @@ zig-out/bin/spore run -- /bin/writeout
 
 `spore run` defaults to the managed SporeVM run kernel and the minimal exec
 initrd installed by `zig build` or `mise run install`. The managed kernel is
-downloaded and SHA256-verified by `spore` itself, then cached under the
-platform cache directory. Override the boot assets with `--kernel` and
-`--initrd`, or set `SPOREVM_KERNEL_IMAGE` and `SPOREVM_RUN_INITRD`.
+downloaded by `spore` itself, SHA256-verified, checked against the release
+`.config` for Docker-adjacent runtime features, then cached under the platform
+cache directory. Override the boot assets with `--kernel` and `--initrd`, or set
+`SPOREVM_KERNEL_IMAGE` and `SPOREVM_RUN_INITRD`.
 
 Pass `--debug` before the command, for example `spore --debug run ...`, to show
 verbose VMM setup and restore logs.
@@ -331,6 +335,8 @@ are available when a change touches fan-out or rootfs behavior:
 - `zig build hvf-gic-probe`: probe Hypervisor.framework GIC state support.
 - `scripts/smoke-restore-leg.sh`: split capture/resume legs for backend
   debugging.
+- `mise run smoke:run-file-locking`: verify guest `flock(2)` behavior through
+  the default `spore run` boot path.
 - `mise run smoke:run-net-config`: verify the experimental `spore run --net`
   static guest address, route, resolver, and gateway ARP setup.
 - `mise run smoke:run-net-dns`: verify `spore run --net` DNS proxying with the

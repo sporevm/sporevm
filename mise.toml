@@ -32,6 +32,10 @@ description = "Build local release archives without publishing"
 run = "mise run build && scripts/smoke-run.sh"
 description = "Smoke product spore run streaming and exit status"
 
+[tasks."smoke:run-file-locking"]
+run = "mise run build && scripts/smoke-run-file-locking.sh"
+description = "Smoke product spore run guest file locking support"
+
 [tasks."smoke:run-capture"]
 run = "mise run build && scripts/smoke-run-capture.sh"
 description = "Smoke product spore run signal capture and resume"

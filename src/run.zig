@@ -29,6 +29,7 @@ const vsock = @import("virtio/vsock.zig");
 
 const max_file_size = 256 * 1024 * 1024;
 const max_kernel_asset_size = 256 * 1024 * 1024;
+const max_kernel_config_asset_size = 2 * 1024 * 1024;
 const managed_kernel_download_attempts = 3;
 const max_guest_argc = 16;
 const max_guest_arg_len = 255;
@@ -38,6 +39,15 @@ const default_run_initrd_name = "minimal-exec-initrd.cpio";
 const default_kernel_repository = "buildkite/cleanroom-kernels";
 const default_kernel_release = "v0.5.1";
 const default_kernel_version = "6.1.155";
+const managed_run_kernel_required_config_symbols = [_][]const u8{
+    "CONFIG_FILE_LOCKING",
+    "CONFIG_SHMEM",
+    "CONFIG_TMPFS",
+    "CONFIG_FSNOTIFY",
+    "CONFIG_INOTIFY_USER",
+    "CONFIG_BPF_SYSCALL",
+    "CONFIG_CGROUP_BPF",
+};
 const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const max_image_ref_cache_record_bytes = 64 * 1024;
@@ -1254,6 +1264,7 @@ pub fn resolveDefaultInitrdPath(init: std.process.Init, allocator: std.mem.Alloc
 fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
     const opts = managedKernelOptions(init);
     const asset = try managedRunKernelAssetName(allocator, opts.linux_version);
+    const config_asset = try managedRunKernelConfigAssetName(allocator, asset);
     const cache_root = local_paths.kernelCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
         error.MissingHome => failRunSetup(
             "spore run: cannot resolve kernel cache directory; set {s} or HOME",
@@ -1265,8 +1276,9 @@ fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Alloca
     const dest_dir = try std.fs.path.join(allocator, &.{ cache_root, repo_cache, opts.release });
     const dest = try std.fs.path.join(allocator, &.{ dest_dir, asset });
     const sha_dest = try std.fmt.allocPrint(allocator, "{s}.sha256", .{dest});
+    const config_dest = try std.fmt.allocPrint(allocator, "{s}.config", .{dest});
 
-    if (try managedKernelCacheHit(init.io, allocator, dest, sha_dest)) {
+    if (try managedKernelCacheHit(init.io, allocator, dest, sha_dest, config_dest)) {
         return dest;
     }
 
@@ -1279,23 +1291,40 @@ fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Alloca
     const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
     const temp_image = try std.fmt.allocPrint(allocator, "{s}/{s}.{x}.tmp", .{ temp_dir_root, asset, nonce });
     const temp_sha = try std.fmt.allocPrint(allocator, "{s}.sha256", .{temp_image});
+    const temp_config = try std.fmt.allocPrint(allocator, "{s}.config", .{temp_image});
     defer Io.Dir.cwd().deleteFile(init.io, temp_image) catch {};
     defer Io.Dir.cwd().deleteFile(init.io, temp_sha) catch {};
+    defer Io.Dir.cwd().deleteFile(init.io, temp_config) catch {};
 
     const message = try std.fmt.allocPrint(allocator, "spore run: downloading managed kernel {s}@{s}:{s}\n", .{ opts.repository, opts.release, asset });
     try writeSetupStderr(init, message);
 
     var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
     defer client.deinit();
-    try fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, asset, temp_image);
+    try fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, asset, temp_image, max_kernel_asset_size);
     const sha_asset = try std.fmt.allocPrint(allocator, "{s}.sha256", .{asset});
-    try fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, sha_asset, temp_sha);
+    try fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, sha_asset, temp_sha, max_kernel_config_asset_size);
+    fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, config_asset, temp_config, max_kernel_config_asset_size) catch |err| {
+        failRunSetup(
+            "spore run: managed run kernel config asset {s}@{s}:{s} is unavailable: {s}",
+            .{ opts.repository, opts.release, config_asset, @errorName(err) },
+        );
+    };
     if (!try verifiedManagedKernelPath(init.io, allocator, temp_image, temp_sha)) return error.ManagedKernelChecksumMismatch;
+    if (try missingManagedRunKernelConfigSymbolFromPath(init.io, allocator, temp_config)) |missing| {
+        defer allocator.free(missing);
+        failRunSetup(
+            "spore run: managed run kernel config {s}@{s}:{s} is missing {s}; use cleanroom-kernels v0.5.1 or newer, pass --kernel, or set SPOREVM_KERNEL_RELEASE to a fixed release",
+            .{ opts.repository, opts.release, config_asset, missing },
+        );
+    }
 
     try Io.Dir.renameAbsolute(temp_image, dest, init.io);
     try Io.Dir.renameAbsolute(temp_sha, sha_dest, init.io);
+    try Io.Dir.renameAbsolute(temp_config, config_dest, init.io);
     chmodFileReadOnly(allocator, dest) catch {};
     chmodFileReadOnly(allocator, sha_dest) catch {};
+    chmodFileReadOnly(allocator, config_dest) catch {};
     return dest;
 }
 
@@ -1316,6 +1345,11 @@ fn managedKernelOptions(init: std.process.Init) ManagedKernelOptions {
 fn managedRunKernelAssetName(allocator: std.mem.Allocator, linux_version: []const u8) ![]const u8 {
     try validateManagedKernelVersion(linux_version);
     return std.fmt.allocPrint(allocator, "sporevm-run-arm64-linux-{s}-Image", .{linux_version});
+}
+
+fn managedRunKernelConfigAssetName(allocator: std.mem.Allocator, image_asset: []const u8) ![]const u8 {
+    try validateManagedKernelAsset(image_asset);
+    return std.fmt.allocPrint(allocator, "{s}.config", .{image_asset});
 }
 
 fn validateManagedKernelVersion(version: []const u8) !void {
@@ -1361,16 +1395,54 @@ fn verifiedManagedKernelPath(io: Io, allocator: std.mem.Allocator, image_path: [
     return std.ascii.eqlIgnoreCase(expected, &actual);
 }
 
-fn managedKernelCacheHit(io: Io, allocator: std.mem.Allocator, image_path: []const u8, sha_path: []const u8) !bool {
+fn managedKernelCacheHit(io: Io, allocator: std.mem.Allocator, image_path: []const u8, sha_path: []const u8, config_path: []const u8) !bool {
     if (!try readOnlyRegularFileNoSymlink(io, image_path)) return false;
     if (!try readOnlyRegularFileNoSymlink(io, sha_path)) return false;
+    if (!try readOnlyRegularFileNoSymlink(io, config_path)) return false;
 
     const expected = readExpectedSha256(io, allocator, sha_path) catch |err| switch (err) {
         error.BadManagedKernelChecksum => return false,
         else => |e| return e,
     };
     allocator.free(expected);
+    if (!try managedRunKernelConfigHasRequiredSymbols(io, allocator, config_path)) return false;
     return true;
+}
+
+fn managedRunKernelConfigHasRequiredSymbols(io: Io, allocator: std.mem.Allocator, config_path: []const u8) !bool {
+    const missing = try missingManagedRunKernelConfigSymbolFromPath(io, allocator, config_path);
+    if (missing) |symbol| {
+        allocator.free(symbol);
+        return false;
+    }
+    return true;
+}
+
+fn missingManagedRunKernelConfigSymbolFromPath(io: Io, allocator: std.mem.Allocator, config_path: []const u8) !?[]const u8 {
+    if (!try regularFileNoSymlink(io, config_path)) return error.ManagedKernelConfigMissing;
+    const config = try Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(max_kernel_config_asset_size));
+    defer allocator.free(config);
+    return missingManagedRunKernelConfigSymbol(allocator, config);
+}
+
+fn missingManagedRunKernelConfigSymbol(allocator: std.mem.Allocator, config: []const u8) !?[]const u8 {
+    for (&managed_run_kernel_required_config_symbols) |symbol| {
+        if (!kernelConfigHasBuiltin(config, symbol)) return try allocator.dupe(u8, symbol);
+    }
+    return null;
+}
+
+fn kernelConfigHasBuiltin(config: []const u8, symbol: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, config, '\n');
+    while (lines.next()) |raw_line| {
+        const line = if (std.mem.endsWith(u8, raw_line, "\r")) raw_line[0 .. raw_line.len - 1] else raw_line;
+        if (line.len != symbol.len + 2) continue;
+        if (!std.mem.startsWith(u8, line, symbol)) continue;
+        if (line[symbol.len] != '=') continue;
+        if (line[symbol.len + 1] != 'y') continue;
+        return true;
+    }
+    return false;
 }
 
 fn readOnlyRegularFileNoSymlink(io: Io, path: []const u8) !bool {
@@ -1423,6 +1495,7 @@ fn fetchManagedKernelAsset(
     release: []const u8,
     asset: []const u8,
     output_path: []const u8,
+    max_body_bytes: u64,
 ) !void {
     try validateManagedKernelRepository(repository);
     try validateManagedKernelVersion(release);
@@ -1431,7 +1504,7 @@ fn fetchManagedKernelAsset(
     var attempt: u8 = 0;
     while (attempt < managed_kernel_download_attempts) : (attempt += 1) {
         Io.Dir.cwd().deleteFile(io, output_path) catch {};
-        httpGetToFile(io, client, url, output_path, max_kernel_asset_size) catch |err| {
+        httpGetToFile(io, client, url, output_path, max_body_bytes) catch |err| {
             if (attempt + 1 == managed_kernel_download_attempts) return err;
             continue;
         };
@@ -3139,6 +3212,10 @@ test "managed run kernel asset names validate input" {
     defer allocator.free(asset);
     try std.testing.expectEqualStrings("sporevm-run-arm64-linux-6.1.155-Image", asset);
 
+    const config_asset = try managedRunKernelConfigAssetName(allocator, asset);
+    defer allocator.free(config_asset);
+    try std.testing.expectEqualStrings("sporevm-run-arm64-linux-6.1.155-Image.config", config_asset);
+
     try std.testing.expectError(error.BadManagedKernelVersion, managedRunKernelAssetName(allocator, "../bad"));
 }
 
@@ -3184,20 +3261,72 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
 
     const image_path = tmp ++ "/Image";
     const sha_path = tmp ++ "/Image.sha256";
+    const config_path = tmp ++ "/Image.config";
     const bad_sha_path = tmp ++ "/Image.bad.sha256";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "kernel bytes" });
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = sha_path,
         .data = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  Image\n",
     });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = config_path,
+        .data = "CONFIG_FILE_LOCKING=y\n" ++
+            "CONFIG_SHMEM=y\n" ++
+            "CONFIG_TMPFS=y\n" ++
+            "CONFIG_FSNOTIFY=y\n" ++
+            "CONFIG_INOTIFY_USER=y\n" ++
+            "CONFIG_BPF_SYSCALL=y\n" ++
+            "CONFIG_CGROUP_BPF=y\n",
+    });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_sha_path, .data = "not-a-sha\n" });
 
-    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path));
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
     try chmodFileReadOnly(allocator, image_path);
-    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path));
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
     try chmodFileReadOnly(allocator, sha_path);
-    try std.testing.expect(try managedKernelCacheHit(io, allocator, image_path, sha_path));
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
+    try chmodFileReadOnly(allocator, config_path);
+    try std.testing.expect(try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
 
     try chmodFileReadOnly(allocator, bad_sha_path);
-    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, bad_sha_path));
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, bad_sha_path, config_path));
+}
+
+test "managed run kernel config requires Docker runtime symbols" {
+    const allocator = std.testing.allocator;
+    const good_config =
+        "# CONFIG_DEVMEM is not set\n" ++
+        "CONFIG_FILE_LOCKING=y\n" ++
+        "CONFIG_SHMEM=y\n" ++
+        "CONFIG_TMPFS=y\n" ++
+        "CONFIG_FSNOTIFY=y\n" ++
+        "CONFIG_INOTIFY_USER=y\n" ++
+        "CONFIG_BPF_SYSCALL=y\n" ++
+        "CONFIG_CGROUP_BPF=y\n";
+
+    try std.testing.expect(try missingManagedRunKernelConfigSymbol(allocator, good_config) == null);
+
+    const missing_file_locking =
+        "# CONFIG_FILE_LOCKING is not set\n" ++
+        "CONFIG_SHMEM=y\n" ++
+        "CONFIG_TMPFS=y\n" ++
+        "CONFIG_FSNOTIFY=y\n" ++
+        "CONFIG_INOTIFY_USER=y\n" ++
+        "CONFIG_BPF_SYSCALL=y\n" ++
+        "CONFIG_CGROUP_BPF=y\n";
+    const missing = (try missingManagedRunKernelConfigSymbol(allocator, missing_file_locking)).?;
+    defer allocator.free(missing);
+    try std.testing.expectEqualStrings("CONFIG_FILE_LOCKING", missing);
+
+    const module_value =
+        "CONFIG_FILE_LOCKING=m\n" ++
+        "CONFIG_SHMEM=y\n" ++
+        "CONFIG_TMPFS=y\n" ++
+        "CONFIG_FSNOTIFY=y\n" ++
+        "CONFIG_INOTIFY_USER=y\n" ++
+        "CONFIG_BPF_SYSCALL=y\n" ++
+        "CONFIG_CGROUP_BPF=y\n";
+    const module_missing = (try missingManagedRunKernelConfigSymbol(allocator, module_value)).?;
+    defer allocator.free(module_missing);
+    try std.testing.expectEqualStrings("CONFIG_FILE_LOCKING", module_missing);
 }
