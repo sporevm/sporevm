@@ -60,6 +60,8 @@ manifests without duplicating shared memory chunks:
 ├── chunkpacks/000000.pack
 ├── rootfs.index.json       # optional rootfs digest -> artifact policy
 ├── rootfs/blake3/<hex>.ext4
+├── rootfs/blake3/indexes/<hex>.json
+├── rootfs/blake3/objects/<hex>.chunk
 ├── disklayers/blake3/<hex>.json
 └── diskobjects/blake3/<hex>.cluster
 ```
@@ -70,9 +72,9 @@ the SHA256 values in the chunkpack index make each packed segment compatible
 with blob-store and later OCI-style descriptor verification. `spore pack` and
 `spore unpack` also report a `bundle_digest`, a SHA256 digest over the exact
 bundle bytes that affect materialization, including bundle metadata, manifests,
-chunkpack metadata, pack blobs, rootfs metadata, included rootfs artifacts, disk
-layer indexes, and disk objects. It is not a replacement for per-chunk,
-per-rootfs, or per-disk-object verification.
+chunkpack metadata, pack blobs, rootfs metadata, included rootfs artifacts,
+chunked rootfs indexes and objects, disk layer indexes, and disk objects. It is
+not a replacement for per-chunk, per-rootfs, or per-disk-object verification.
 
 If `manifest.json` records an immutable rootfs artifact, `spore pack` includes
 the exact ext4 bytes at `rootfs/blake3/<hex>.ext4` after verifying the source
@@ -84,6 +86,16 @@ default. `spore pack --children ... --rootfs=metadata-only` records the same
 digest and size with `metadata-only` policy and omits the ext4 file; materialized
 unpack and pull accept that policy only with `--allow-metadata-only-rootfs` and
 a verified hit in the selected rootfs digest cache.
+
+If `manifest.json` records `rootfs.storage.kind:
+"chunked-ext4-rootfs-v0"`, indexed bundles carry the exact
+`rootfs-block-index-v0` bytes named by `rootfs.storage.index_digest` under
+`rootfs/blake3/indexes/<hex>.json`, plus each referenced nonzero rootfs chunk
+object under `rootfs/blake3/objects/<hex>.chunk`. Unpack and pull verify the
+index against the manifest storage descriptor and verify every chunk by BLAKE3
+before installing them into the destination rootfs CAS cache. They do not require
+the monolithic ext4 digest-cache artifact on the destination for a chunked
+rootfs child.
 
 If the selected manifest records a writable disk chain, `spore pack` includes
 the referenced `disk-layer-v0` indexes and BLAKE3-addressed disk cluster objects
@@ -250,9 +262,11 @@ cache hit/fetch counters under `rootfs.cache`.
   boundary and fail closed on unsupported URI schemes, non-canonical bundle
   metadata, corrupt chunkpacks, corrupt remote bytes, or corrupt node-local
   chunk cache entries.
-- Rootfs-backed bundles include exact immutable rootfs bytes by default. Bundle
-  unpack refuses missing, symlinked, or digest-mismatched rootfs artifacts before
-  writing a resumable spore.
+- Rootfs-backed bundles include exact immutable rootfs bytes by default for
+  fd-backed rootfs manifests. For manifest-attached chunked rootfs storage, they
+  include the descriptor-bound rootfs block index and BLAKE3 chunk objects.
+  Bundle unpack refuses missing, symlinked, or digest-mismatched rootfs artifacts
+  and rootfs CAS files before writing a resumable spore.
 - Rootfs-backed bundles include referenced writable disk layer indexes and disk
   objects when present. Bundle materialization refuses corrupt or missing disk
   layer/object bytes before writing a resumable spore manifest.

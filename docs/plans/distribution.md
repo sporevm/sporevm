@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-20
+last_reviewed: 2026-06-21
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/immutable-rootfs-resume.md
@@ -37,10 +37,12 @@ lazy-capable so later work can fetch verified chunks on demand without changing
 the manifest contract.
 
 Rootfs-backed bundles are self-contained by default. If a selected manifest
-requires an immutable rootfs artifact, `spore pack` includes the exact ext4
-bytes named by the rootfs digest. Metadata-only rootfs behavior is an explicit
-prepared-cache opt-out for indexed bundles, and materialized unpack/pull require
-both an allow flag and a verified destination cache hit.
+requires an immutable fd-backed rootfs artifact, `spore pack` includes the exact
+ext4 bytes named by the rootfs digest. If the manifest selects chunked rootfs
+storage, `spore pack` includes the descriptor-bound rootfs block index and the
+BLAKE3 chunk objects it names. Metadata-only rootfs behavior remains an explicit
+prepared-cache opt-out for indexed exact-rootfs bundles, and materialized
+unpack/pull require both an allow flag and a verified destination cache hit.
 
 ## Problem
 
@@ -140,6 +142,8 @@ replacing the spore manifest contract:
 |-- chunkpacks/000000.pack          # uncompressed logical chunks concatenated
 |-- rootfs.index.json               # optional rootfs digest -> artifact metadata
 |-- rootfs/blake3/<hex>.ext4        # optional exact immutable rootfs bytes
+|-- rootfs/blake3/indexes/<hex>.json # optional chunked rootfs block indexes
+|-- rootfs/blake3/objects/<hex>.chunk # optional chunked rootfs objects
 |-- disklayers/blake3/<hex>.json    # optional writable disk layer indexes
 `-- diskobjects/blake3/<hex>.cluster # optional writable disk cluster objects
 ```
@@ -156,16 +160,26 @@ digests remain restore authority.
 
 Rootfs inclusion is the default artifact policy:
 
-- If any selected manifest records an immutable rootfs artifact, `spore pack`
-  verifies the source digest-cache ext4 by BLAKE3 and size, then includes it in
-  the bundle once per rootfs digest.
+- If any selected manifest records an immutable fd-backed rootfs artifact,
+  `spore pack` verifies the source digest-cache ext4 by BLAKE3 and size, then
+  includes it in the bundle once per rootfs digest.
 - If the required rootfs bytes are absent or mismatched on the packing host,
   `spore pack` fails rather than emitting a misleading portable bundle.
+- If any selected manifest records `rootfs.storage` with
+  `chunked-ext4-rootfs-v0`, `spore pack` reads the exact
+  `rootfs-block-index-v0` named by `rootfs.storage.index_digest`, verifies it
+  against the manifest descriptor, copies it to
+  `rootfs/blake3/indexes/<hex>.json`, and copies each referenced nonzero chunk
+  object to `rootfs/blake3/objects/<hex>.chunk` once by digest.
 - The default rootfs artifact policy is exact bytes. `spore pack --children ...
   --rootfs=metadata-only` is an explicit opt-out for indexed bundles whose
   destinations already have the verified rootfs cache entry.
 - `spore unpack` and `spore pull` install bundled rootfs artifacts into the
   node-local digest cache by default, verifying digest and size before writing a
+  resumable spore.
+- `spore unpack` and `spore pull` install bundled chunked rootfs storage into
+  the node-local rootfs CAS cache by default, verifying the index digest,
+  descriptor fields, chunk sizes, and each chunk BLAKE3 digest before writing a
   resumable spore.
 - A metadata-only bundle may be unpacked or pulled only with
   `--allow-metadata-only-rootfs`, and only when the selected rootfs cache already
@@ -245,6 +259,11 @@ an attached rootfs fd.
   file set, verifies the bundle digest before materialization, reports
   `remote.peer_bytes_read`, and reuses the node-local remote bundle cache on
   repeated pulls.
+- Indexed bundles now carry manifest-attached chunked rootfs storage. A selected
+  child with `rootfs.storage` materializes by installing the bundled
+  descriptor-bound rootfs block index and referenced rootfs chunk objects into
+  the destination rootfs CAS cache; the exact ext4 digest-cache artifact is not
+  required on the destination.
 - `spore pack --children DIR --rootfs=metadata-only` can emit an indexed bundle
   with rootfs metadata but no rootfs bytes after verifying the source rootfs
   cache; `spore unpack` and `spore pull` accept it only with
@@ -436,6 +455,20 @@ repeated pulls, and fail closed on corrupt peer bytes. The remote bundle smoke
 now serves static bundle directories from source and relay hosts and uses product
 `spore pull http://...@sha256:<bundle>` for peer star/tree paths.
 
+### Slice 8: Chunked Rootfs Storage Bundles
+
+Status: implemented for indexed bundles and complete materialization.
+
+Teach the indexed bundle path to carry manifest-attached chunked rootfs storage
+without falling back to the monolithic ext4 artifact. This extends the existing
+verified bundle/cache story rather than adding a new pull mode.
+
+Done when local, S3, and HTTP bundle file enumeration includes rootfs storage
+indexes and chunk objects in the canonical bundle file set, bundle digest covers
+those files, and `spore pull file://... --child ID` can materialize a selected
+child into the node-local rootfs CAS cache while rejecting corrupt rootfs chunk
+objects before writing a resumable spore.
+
 ## Deferred Peer Distribution
 
 Lazy-pull, cache-only preheat, peer discovery, gossip, DHTs, torrent scheduling,
@@ -463,6 +496,9 @@ cannot become restore authority.
   corrupt disk object rejection.
 - Unit tests for atomic rootfs cache installation, concurrent cache hits, failed
   partial writes, and bundle digests changing when any rootfs artifact changes.
+- Unit tests for chunked rootfs storage bundles: positive local pull into a
+  fresh rootfs CAS cache, absence of monolithic ext4 cache installation, bundle
+  digest coverage of rootfs storage files, and corrupt rootfs chunk rejection.
 - Fuzz targets for new attacker-influenced bundle metadata parsers such as
   `bundle.json` and `rootfs.index.json`, in the same PR that introduces them.
 - `SECURITY.md` updates for every slice that widens bundle, rootfs artifact, or
@@ -512,6 +548,10 @@ cannot become restore authority.
   source.
 - Rootfs bytes remain distinct from memory chunks even when both live in one
   bundle.
+- Manifest-attached chunked rootfs storage is distributed as rootfs-specific
+  CAS data: descriptor-bound rootfs indexes and chunk objects live under
+  `rootfs/blake3`, are installed into the rootfs CAS cache, and remain distinct
+  from RAM chunks and writable disk objects.
 - Full child manifests are the first implementation target. Delta-encoded child
   manifests can wait until manifest size becomes material.
 - Direct object-store transfer comes before peer-assisted transfer.

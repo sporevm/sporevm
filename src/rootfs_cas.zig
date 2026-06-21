@@ -384,6 +384,14 @@ pub fn manifestIndexPath(allocator: std.mem.Allocator, cache_root: []const u8, i
     return std.fmt.allocPrint(allocator, "{s}/cas/rootfs/blake3/indexes/{s}.json", .{ cache_root, hex });
 }
 
+pub fn manifestObjectPath(allocator: std.mem.Allocator, cache_root: []const u8, object_digest: []const u8) ![]const u8 {
+    const hex = try rootfsDigestHex(object_digest);
+    const id = chunk.ChunkId.fromHex(hex) catch return error.BadManifest;
+    const dir = try objectDir(allocator, cache_root);
+    defer allocator.free(dir);
+    return objectPathForDir(allocator, dir, id);
+}
+
 pub fn storageDescriptor(device: spore.RootfsDevice, result: PreloadResult) spore.RootfsStorage {
     return .{
         .kind = spore.rootfs_storage_kind_chunked_ext4,

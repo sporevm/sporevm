@@ -134,6 +134,16 @@ requires the bundled artifact, verifies it against the manifest digest and size,
 and installs it into the destination host's rootfs digest cache before the
 unpacked spore can be resumed.
 
+If a spore manifest has manifest-attached chunked rootfs storage under
+`rootfs.storage`, indexed bundles carry the descriptor-bound
+`rootfs-block-index-v0` under `rootfs/blake3/indexes/<hex>.json` and the
+referenced nonzero rootfs chunk objects under
+`rootfs/blake3/objects/<hex>.chunk`. `spore unpack` and `spore pull` verify the
+index against the manifest descriptor, verify each chunk by BLAKE3, and install
+those files into the destination host's rootfs CAS cache. They do not require
+the monolithic ext4 digest-cache artifact on the destination for a chunked
+rootfs child.
+
 Indexed bundles also support an explicit prepared-cache mode:
 `spore pack SPORE --children CHILDREN --rootfs=metadata-only --out BUNDLE`
 records the immutable rootfs digest and size without embedding the ext4 bytes.
@@ -149,7 +159,8 @@ child. Digest-pinned remote pulls, such as `spore pull
 s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out child.spore` and
 `spore pull http://peer:20000/spore.bundle@sha256:<bundle_digest> --child 42
 --out child.spore`, first verify the remote bundle identity, then install any
-bundled rootfs bytes through the same digest-cache path. Use
+bundled exact rootfs bytes or chunked rootfs CAS bytes through the same verified
+materialization boundary. Use
 `SPOREVM_ROOTFS_CACHE_DIR` to choose the destination rootfs digest cache and
 `SPOREVM_BUNDLE_CACHE_DIR` to choose the node-local bundle and memory chunk
 caches used by pull. Pull JSON reports `rootfs.cache.hit_count`,

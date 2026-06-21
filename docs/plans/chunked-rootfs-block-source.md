@@ -279,6 +279,18 @@ can drift from the canonical index bytes.
   31.98MiB hashed, and 6,502 per-VM verified chunk cache hits. The one-time local preload
   after rootfs prewarm took 10.957s, wrote 2,596 chunk objects / 170.1MiB, and
   produced a 398,819-byte `rootfs-block-index-v0`.
+- Slice 6 is implemented for complete bundle materialization. Indexed bundles
+  can now carry manifest-attached chunked rootfs storage by copying the
+  descriptor-bound `rootfs-block-index-v0` and referenced nonzero rootfs chunk
+  objects under `rootfs/blake3`. `spore pull file://... --child ID` installs
+  those bytes into the destination rootfs CAS cache after verifying the index
+  digest, descriptor fields, chunk sizes, and each chunk BLAKE3 digest. The
+  canonical bundle file set used by local digesting, S3 push/pull, and HTTP
+  peer pull now includes rootfs storage indexes and chunk objects. Validation:
+  `mise run check` and `mise run smoke:local-pull` passed on 2026-06-21; the
+  unit regression proves local pull materializes chunked rootfs CAS without
+  installing the monolithic ext4 digest artifact, and rejects a corrupted
+  bundled rootfs chunk.
 
 ## Delivery Strategy
 
@@ -446,6 +458,8 @@ moving the same cost into synchronous boot reads. Report:
 
 ### Slice 6: Distribution Convergence
 
+Status: implemented for complete bundle materialization.
+
 Extend bundle and pull materialization so chunked rootfs objects use the same
 verified content-source machinery as RAM chunks and writable disk objects.
 
@@ -474,6 +488,11 @@ rootfs storage descriptors and keeps both manifest-authoritative.
   `spore run --from` children before and after `CasBlockSource`.
 - Negative smoke: corrupt one rootfs chunk and prove resume fails before guest
   use.
+- Distribution regression: pack a child manifest with `rootfs.storage`, pull it
+  from `file://` into a fresh rootfs CAS cache, confirm the ext4 digest-cache
+  artifact is absent, open the restored rootfs through `CasBlockSource`, and
+  corrupt a bundled rootfs chunk to prove pull fails closed before writing the
+  destination spore.
 
 ## Resolved Decisions
 
@@ -491,6 +510,10 @@ rootfs storage descriptors and keeps both manifest-authoritative.
 - For `chunked-ext4-rootfs-v0`, the rootfs base identity used by writable disk
   layers is the canonical index digest. A later Merkle tree can change lookup
   internals, but changing the base identity rule requires a new storage kind.
+- The first distribution path uses a rootfs-namespaced object store. Bundle
+  payloads live under `rootfs/blake3/indexes` and `rootfs/blake3/objects`, and
+  node-local materialization installs them under the rootfs CAS cache rather
+  than sharing RAM chunk or writable disk object directories.
 - Do not overload the current `rootfs.source` OCI provenance field. Chunked
   rootfs storage authority needs a distinct field and an effective base identity
   that writable disk layers can validate against.
@@ -518,8 +541,6 @@ rootfs storage descriptors and keeps both manifest-authoritative.
   table plus a tree root? The descriptor still binds the canonical index bytes
   by `index_digest`; this question affects lookup and verification cost, not
   restore authority.
-- Should rootfs chunks use the same on-disk object directory as RAM chunks, or a
-  namespaced rootfs object directory with shared cache plumbing?
 - Does broader image-registry data contradict the first 64KiB prototype default,
   especially for cross-image dedupe and package-manager-heavy rootfs variants?
 - Should `spore rootfs build` emit chunked rootfs objects directly, or should a

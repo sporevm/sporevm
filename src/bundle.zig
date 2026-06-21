@@ -7,6 +7,7 @@
 //! CAS directory.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const block_source = @import("block_source.zig");
 const chunklib = @import("chunk.zig");
 const cow_disk = @import("cow_disk.zig");
@@ -14,6 +15,8 @@ const disk_layer = @import("disk_layer.zig");
 const gicv3 = @import("gicv3.zig");
 const machine_output = @import("machine_output.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
+const rootfs_cas = @import("rootfs_cas.zig");
+const rootfs_block_index = @import("rootfs_index.zig");
 const spore = @import("spore.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Io = std.Io;
@@ -31,6 +34,8 @@ pub const parent_manifest_path = "manifests/parent.json";
 pub const child_manifests_dir_path = "manifests/children";
 pub const rootfs_dir_path = "rootfs";
 pub const rootfs_blake3_dir_path = "rootfs/blake3";
+pub const rootfs_blake3_indexes_dir_path = "rootfs/blake3/indexes";
+pub const rootfs_blake3_objects_dir_path = "rootfs/blake3/objects";
 pub const rootfs_index_path = "rootfs.index.json";
 pub const rootfs_policy_exact_bytes = "exact-bytes";
 pub const rootfs_policy_metadata_only = "metadata-only";
@@ -177,8 +182,10 @@ pub const ChunkpackSummary = struct {
 
 pub const RootfsBundleSummary = struct {
     artifact_count: usize = 0,
+    storage_count: usize = 0,
     exact_bytes_count: usize = 0,
     metadata_only_count: usize = 0,
+    object_count: usize = 0,
     payload_bytes: u64 = 0,
 };
 
@@ -233,9 +240,25 @@ pub const RootfsArtifactEntry = struct {
     path: ?[]const u8 = null,
 };
 
+pub const RootfsStorageEntry = struct {
+    kind: []const u8 = spore.rootfs_storage_kind_chunked_ext4,
+    device: spore.RootfsDevice,
+    logical_size: u64,
+    chunk_size: u64,
+    hash_algorithm: []const u8 = spore.rootfs_storage_hash_algorithm_blake3,
+    index_digest: []const u8,
+    base_identity: []const u8,
+    object_namespace: []const u8 = spore.rootfs_storage_object_namespace,
+    index_path: []const u8,
+    index_bytes: u64,
+    object_count: usize,
+    object_bytes: u64,
+};
+
 pub const RootfsIndex = struct {
     version: u32 = rootfs_index_version,
-    artifacts: []RootfsArtifactEntry,
+    artifacts: []RootfsArtifactEntry = &.{},
+    storages: []RootfsStorageEntry = &.{},
 };
 
 const VerifiedContentSource = struct {
@@ -471,7 +494,10 @@ fn inspectIndexedRootfs(allocator: std.mem.Allocator, bundle_dir: []const u8, bu
     if (bundle_index.rootfs_index == null) return .{};
     const parsed_rootfs = try loadRootfsIndex(allocator, bundle_dir);
     defer parsed_rootfs.deinit();
-    var summary = RootfsBundleSummary{ .artifact_count = parsed_rootfs.value.artifacts.len };
+    var summary = RootfsBundleSummary{
+        .artifact_count = parsed_rootfs.value.artifacts.len,
+        .storage_count = parsed_rootfs.value.storages.len,
+    };
     for (parsed_rootfs.value.artifacts) |artifact| {
         if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
             summary.exact_bytes_count += 1;
@@ -481,6 +507,10 @@ fn inspectIndexedRootfs(allocator: std.mem.Allocator, bundle_dir: []const u8, bu
         } else {
             return error.BadManifest;
         }
+    }
+    for (parsed_rootfs.value.storages) |storage| {
+        summary.object_count += storage.object_count;
+        summary.payload_bytes += storage.index_bytes + storage.object_bytes;
     }
     return summary;
 }
@@ -493,6 +523,9 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
     defer parsed.deinit();
     var manifest = parsed.value;
     manifest.memory.backing = null;
+    if (manifest.rootfs) |rootfs| {
+        if (rootfs.storage != null) return error.BadManifest;
+    }
     const plan = try spore.validateMemoryForRam(manifest.memory, @intCast(manifest.platform.ram_size));
 
     try ensureNewDir(try pathZ(allocator, "{s}", .{options.out_dir}));
@@ -569,6 +602,8 @@ fn packWithChildren(allocator: std.mem.Allocator, options: PackOptions) Error!Pa
     try ensureNewDir(try pathZ(allocator, "{s}/chunkpacks", .{options.out_dir}));
     try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_dir_path }));
     try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_blake3_dir_path }));
+    try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_blake3_indexes_dir_path }));
+    try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_blake3_objects_dir_path }));
 
     const bundle_pack_path = try pathZ(allocator, "{s}/{s}", .{ options.out_dir, pack_path });
     const pack_fd = std.c.open(bundle_pack_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
@@ -581,8 +616,14 @@ fn packWithChildren(allocator: std.mem.Allocator, options: PackOptions) Error!Pa
     defer chunk_entries.deinit();
     var seen_rootfs = std.StringHashMap(void).init(allocator);
     defer seen_rootfs.deinit();
+    var seen_rootfs_storage = std.StringHashMap(void).init(allocator);
+    defer seen_rootfs_storage.deinit();
+    var seen_rootfs_objects = std.StringHashMap(void).init(allocator);
+    defer seen_rootfs_objects.deinit();
     var rootfs_entries = std.array_list.Managed(RootfsArtifactEntry).init(allocator);
     defer rootfs_entries.deinit();
+    var rootfs_storage_entries = std.array_list.Managed(RootfsStorageEntry).init(allocator);
+    defer rootfs_storage_entries.deinit();
     var bundle_children = std.array_list.Managed(BundleChild).init(allocator);
     defer bundle_children.deinit();
 
@@ -603,7 +644,16 @@ fn packWithChildren(allocator: std.mem.Allocator, options: PackOptions) Error!Pa
         &chunk_entries,
         &payload_bytes,
     )).chunk_count;
-    rootfs_payload_bytes += try packRootfsArtifactIndexed(allocator, options, parent_manifest, &seen_rootfs, &rootfs_entries);
+    rootfs_payload_bytes += try packRootfsIndexed(
+        allocator,
+        options,
+        parent_manifest,
+        &seen_rootfs,
+        &rootfs_entries,
+        &seen_rootfs_storage,
+        &rootfs_storage_entries,
+        &seen_rootfs_objects,
+    );
     try packDiskLayersForManifest(allocator, options.spore_dir, options.out_dir, parent_manifest);
     try spore.saveManifestPath(
         allocator,
@@ -626,7 +676,16 @@ fn packWithChildren(allocator: std.mem.Allocator, options: PackOptions) Error!Pa
             &chunk_entries,
             &payload_bytes,
         )).chunk_count;
-        rootfs_payload_bytes += try packRootfsArtifactIndexed(allocator, options, child_manifest, &seen_rootfs, &rootfs_entries);
+        rootfs_payload_bytes += try packRootfsIndexed(
+            allocator,
+            options,
+            child_manifest,
+            &seen_rootfs,
+            &rootfs_entries,
+            &seen_rootfs_storage,
+            &rootfs_storage_entries,
+            &seen_rootfs_objects,
+        );
         try packDiskLayersForManifest(allocator, child_dir, options.out_dir, child_manifest);
         const manifest_rel = try childManifestRelPath(allocator, child.id);
         try spore.saveManifestPath(
@@ -645,10 +704,12 @@ fn packWithChildren(allocator: std.mem.Allocator, options: PackOptions) Error!Pa
         .chunks = chunk_entries.items,
     });
 
-    const rootfs_index_rel: ?[]const u8 = if (rootfs_entries.items.len > 0) blk: {
+    const rootfs_index_rel: ?[]const u8 = if (rootfs_entries.items.len > 0 or rootfs_storage_entries.items.len > 0) blk: {
         std.mem.sort(RootfsArtifactEntry, rootfs_entries.items, {}, lessRootfsArtifactEntry);
+        std.mem.sort(RootfsStorageEntry, rootfs_storage_entries.items, {}, lessRootfsStorageEntry);
         try saveRootfsIndex(allocator, options.out_dir, .{
             .artifacts = rootfs_entries.items,
+            .storages = rootfs_storage_entries.items,
         });
         break :blk rootfs_index_path;
     } else null;
@@ -667,7 +728,7 @@ fn packWithChildren(allocator: std.mem.Allocator, options: PackOptions) Error!Pa
         .packed_chunk_count = chunk_entries.items.len,
         .pack_count = 1,
         .payload_bytes = payload_bytes,
-        .rootfs_artifact_count = rootfs_entries.items.len,
+        .rootfs_artifact_count = rootfs_entries.items.len + rootfs_storage_entries.items.len,
         .rootfs_payload_bytes = rootfs_payload_bytes,
         .child_count = children.len,
     };
@@ -959,11 +1020,7 @@ fn digestHexIndexed(allocator: std.mem.Allocator, bundle_dir: []const u8) Error!
         try updateHashWithFile(allocator, &h, bundle_dir, rootfs_index_rel);
         const parsed_rootfs_index = try loadRootfsIndex(allocator, bundle_dir);
         defer parsed_rootfs_index.deinit();
-        for (parsed_rootfs_index.value.artifacts) |artifact| {
-            if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
-                try updateHashWithFile(allocator, &h, bundle_dir, artifact.path orelse return error.BadManifest);
-            }
-        }
+        try updateHashWithRootfsIndexPayloads(allocator, &h, bundle_dir, parsed_rootfs_index.value);
     }
     var seen_disk_files = std.StringHashMap(void).init(allocator);
     defer seen_disk_files.deinit();
@@ -976,6 +1033,33 @@ fn digestHexIndexed(allocator: std.mem.Allocator, bundle_dir: []const u8) Error!
     h.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
     return allocator.dupe(u8, &hex) catch return error.OutOfMemory;
+}
+
+fn updateHashWithRootfsIndexPayloads(
+    allocator: std.mem.Allocator,
+    h: *Sha256,
+    bundle_dir: []const u8,
+    index: RootfsIndex,
+) Error!void {
+    for (index.artifacts) |artifact| {
+        if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
+            try updateHashWithFile(allocator, h, bundle_dir, artifact.path orelse return error.BadManifest);
+        }
+    }
+
+    var seen_objects = std.StringHashMap(void).init(allocator);
+    defer seen_objects.deinit();
+    for (index.storages) |storage_entry| {
+        try updateHashWithFile(allocator, h, bundle_dir, storage_entry.index_path);
+        const storage = rootfsStorageEntryDescriptor(storage_entry);
+        const parsed_index = try loadRootfsBlockIndexForEntry(allocator, bundle_dir, storage_entry, storage);
+        defer parsed_index.deinit();
+        for (parsed_index.value.chunks) |chunk_entry| {
+            const rel_path = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
+            if (!try markBundleFileSeen(allocator, &seen_objects, rel_path)) continue;
+            try updateHashWithFile(allocator, h, bundle_dir, rel_path);
+        }
+    }
 }
 
 fn saveIndex(allocator: std.mem.Allocator, dir: []const u8, index: Index) Error!void {
@@ -1076,7 +1160,7 @@ fn loadRootfsIndex(allocator: std.mem.Allocator, dir: []const u8) Error!std.json
 
 fn validateRootfsIndex(allocator: std.mem.Allocator, index: RootfsIndex) Error!void {
     if (index.version != rootfs_index_version) return error.BadManifest;
-    if (index.artifacts.len == 0) return error.BadManifest;
+    if (index.artifacts.len == 0 and index.storages.len == 0) return error.BadManifest;
     var digests = std.StringHashMap(void).init(allocator);
     defer digests.deinit();
     var previous: ?[]const u8 = null;
@@ -1088,6 +1172,19 @@ fn validateRootfsIndex(allocator: std.mem.Allocator, index: RootfsIndex) Error!v
             if (std.mem.order(u8, prev, entry.digest) != .lt) return error.BadManifest;
         }
         previous = entry.digest;
+    }
+
+    var storage_digests = std.StringHashMap(void).init(allocator);
+    defer storage_digests.deinit();
+    var previous_storage: ?[]const u8 = null;
+    for (index.storages) |entry| {
+        try validateRootfsStorageEntry(allocator, entry);
+        const existing = storage_digests.getOrPut(entry.index_digest) catch return error.OutOfMemory;
+        if (existing.found_existing) return error.BadManifest;
+        if (previous_storage) |prev| {
+            if (std.mem.order(u8, prev, entry.index_digest) != .lt) return error.BadManifest;
+        }
+        previous_storage = entry.index_digest;
     }
 }
 
@@ -1106,6 +1203,25 @@ fn validateRootfsArtifactEntry(allocator: std.mem.Allocator, entry: RootfsArtifa
     } else {
         return error.BadManifest;
     }
+}
+
+fn validateRootfsStorageEntry(allocator: std.mem.Allocator, entry: RootfsStorageEntry) Error!void {
+    try validateRootfsDeviceShape(entry.device);
+    const storage = rootfsStorageEntryDescriptor(entry);
+    try spore.validateRootfsStorageDescriptor(storage);
+    const expected_path = try rootfsStorageIndexRelPath(allocator, entry.index_digest);
+    defer allocator.free(expected_path);
+    if (!std.mem.eql(u8, entry.index_path, expected_path)) return error.BadManifest;
+    if (entry.index_bytes == 0 or entry.index_bytes > @as(u64, @intCast(rootfs_block_index.max_index_bytes))) return error.BadManifest;
+    const chunk_count = try spore.diskClusterCount(entry.logical_size, entry.chunk_size);
+    if (@as(u64, @intCast(entry.object_count)) > chunk_count) return error.BadManifest;
+    if (entry.object_bytes > entry.logical_size) return error.BadManifest;
+}
+
+fn validateRootfsDeviceShape(device: spore.RootfsDevice) Error!void {
+    if (!std.mem.eql(u8, device.kind, spore.rootfs_device_kind_virtio_mmio)) return error.BadManifest;
+    if (!std.mem.eql(u8, device.role, spore.rootfs_device_role)) return error.BadManifest;
+    if (device.virtio_device_id != spore.rootfs_virtio_blk_device_id) return error.BadManifest;
 }
 
 fn hasBundleIndex(allocator: std.mem.Allocator, bundle_dir: []const u8) Error!bool {
@@ -1349,18 +1465,31 @@ fn packRootfsArtifact(allocator: std.mem.Allocator, options: PackOptions, manife
     return rootfs.artifact.size;
 }
 
-fn packRootfsArtifactIndexed(
+fn packRootfsIndexed(
     allocator: std.mem.Allocator,
     options: PackOptions,
     manifest: spore.Manifest,
-    seen: *std.StringHashMap(void),
+    seen_artifacts: *std.StringHashMap(void),
     entries: *std.array_list.Managed(RootfsArtifactEntry),
+    seen_storages: *std.StringHashMap(void),
+    storage_entries: *std.array_list.Managed(RootfsStorageEntry),
+    seen_objects: *std.StringHashMap(void),
 ) Error!u64 {
     const rootfs = manifest.rootfs orelse return 0;
+    if (rootfs.storage != null) {
+        return packRootfsStorageIndexed(
+            allocator,
+            options,
+            rootfs,
+            seen_storages,
+            storage_entries,
+            seen_objects,
+        );
+    }
     const cache_root = options.rootfs_cache_dir orelse return error.IoFailed;
-    if (seen.contains(rootfs.artifact.digest)) return 0;
+    if (seen_artifacts.contains(rootfs.artifact.digest)) return 0;
     const digest_copy = allocator.dupe(u8, rootfs.artifact.digest) catch return error.OutOfMemory;
-    seen.put(digest_copy, {}) catch return error.OutOfMemory;
+    seen_artifacts.put(digest_copy, {}) catch return error.OutOfMemory;
 
     const source_path = rootfs_cache.digestPath(allocator, cache_root, rootfs.artifact.digest) catch |err| return rootfsError(err);
     if (options.rootfs_policy == .metadata_only) {
@@ -1392,8 +1521,84 @@ fn packRootfsArtifactIndexed(
     return rootfs.artifact.size;
 }
 
+fn packRootfsStorageIndexed(
+    allocator: std.mem.Allocator,
+    options: PackOptions,
+    rootfs: spore.Rootfs,
+    seen_storages: *std.StringHashMap(void),
+    storage_entries: *std.array_list.Managed(RootfsStorageEntry),
+    seen_objects: *std.StringHashMap(void),
+) Error!u64 {
+    if (options.rootfs_policy == .metadata_only) return error.BadManifest;
+    const cache_root = options.rootfs_cache_dir orelse return error.IoFailed;
+    const storage = rootfs.storage orelse return error.BadManifest;
+    try validateRootfsStorageForRootfs(storage, rootfs);
+
+    if (seen_storages.contains(storage.index_digest)) {
+        const existing = findRootfsStorageEntryInSlice(storage_entries.items, storage.index_digest) orelse return error.BadManifest;
+        if (!rootfsStorageEntryMatches(existing, storage)) return error.BadManifest;
+        return 0;
+    }
+
+    const source_index_path = rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
+    const index_bytes = try readFileAllNoSymlink(allocator, source_index_path, rootfs_block_index.max_index_bytes);
+    defer allocator.free(index_bytes);
+    const parsed_index = rootfs_block_index.parseRootfsBlockIndex(allocator, index_bytes, storage) catch |err| return rootfsError(err);
+    defer parsed_index.deinit();
+
+    const index_rel_path = try rootfsStorageIndexRelPath(allocator, storage.index_digest);
+    const dest_index_path = try pathZ(allocator, "{s}/{s}", .{ options.out_dir, index_rel_path });
+    if (std.fs.path.dirname(dest_index_path)) |parent| try ensureDirPath(options.io, parent);
+    try writeFileAll(dest_index_path, index_bytes);
+
+    var payload_bytes: u64 = @intCast(index_bytes.len);
+    var object_bytes: u64 = 0;
+    var object_count: usize = 0;
+    for (parsed_index.value.chunks) |chunk_entry| {
+        const expected_size = try rootfsStorageChunkLen(storage, chunk_entry.logical_chunk);
+        const source_object_path = rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest) catch |err| return rootfsError(err);
+        const object_data = try readVerifiedRootfsCasChunkPath(allocator, source_object_path, chunk_entry.digest, expected_size);
+        defer allocator.free(object_data);
+        object_count += 1;
+        object_bytes += @intCast(object_data.len);
+        if (seen_objects.contains(chunk_entry.digest)) continue;
+        const digest_copy = allocator.dupe(u8, chunk_entry.digest) catch return error.OutOfMemory;
+        seen_objects.put(digest_copy, {}) catch return error.OutOfMemory;
+
+        const object_rel_path = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
+        const dest_object_path = try pathZ(allocator, "{s}/{s}", .{ options.out_dir, object_rel_path });
+        if (std.fs.path.dirname(dest_object_path)) |parent| try ensureDirPath(options.io, parent);
+        try writeFileAll(dest_object_path, object_data);
+        payload_bytes += @intCast(object_data.len);
+    }
+
+    const index_digest_copy = allocator.dupe(u8, storage.index_digest) catch return error.OutOfMemory;
+    seen_storages.put(index_digest_copy, {}) catch return error.OutOfMemory;
+    try storage_entries.append(.{
+        .kind = allocator.dupe(u8, storage.kind) catch return error.OutOfMemory,
+        .device = .{
+            .kind = allocator.dupe(u8, storage.device.kind) catch return error.OutOfMemory,
+            .role = allocator.dupe(u8, storage.device.role) catch return error.OutOfMemory,
+            .virtio_device_id = storage.device.virtio_device_id,
+            .mmio_slot = storage.device.mmio_slot,
+        },
+        .logical_size = storage.logical_size,
+        .chunk_size = storage.chunk_size,
+        .hash_algorithm = allocator.dupe(u8, storage.hash_algorithm) catch return error.OutOfMemory,
+        .index_digest = index_digest_copy,
+        .base_identity = allocator.dupe(u8, storage.base_identity) catch return error.OutOfMemory,
+        .object_namespace = allocator.dupe(u8, storage.object_namespace) catch return error.OutOfMemory,
+        .index_path = index_rel_path,
+        .index_bytes = @intCast(index_bytes.len),
+        .object_count = object_count,
+        .object_bytes = object_bytes,
+    });
+    return payload_bytes;
+}
+
 fn unpackRootfsArtifact(allocator: std.mem.Allocator, options: UnpackOptions, manifest: spore.Manifest) Error!RootfsMaterializeResult {
     const rootfs = manifest.rootfs orelse return .{};
+    if (rootfs.storage != null) return error.BadManifest;
     const cache_root = options.rootfs_cache_dir orelse return error.IoFailed;
     const rel_path = try rootfsArtifactRelPath(allocator, rootfs.artifact);
     const source_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, rel_path });
@@ -1421,6 +1626,16 @@ fn unpackRootfsArtifactIndexed(
     if (bundle_index.rootfs_index == null) return error.BadManifest;
     const parsed_rootfs_index = try loadRootfsIndex(allocator, options.bundle_dir);
     defer parsed_rootfs_index.deinit();
+    if (rootfs.storage) |storage| {
+        return unpackRootfsStorageIndexed(
+            allocator,
+            options,
+            rootfs,
+            storage,
+            parsed_rootfs_index.value,
+            cache_root,
+        );
+    }
     const entry = findRootfsEntry(parsed_rootfs_index.value, rootfs.artifact.digest) orelse return error.BadManifest;
     if (entry.size != rootfs.artifact.size) return error.BadManifest;
     if (!std.mem.eql(u8, entry.format, rootfs.artifact.format)) return error.BadManifest;
@@ -1452,9 +1667,77 @@ fn unpackRootfsArtifactIndexed(
     };
 }
 
+fn unpackRootfsStorageIndexed(
+    allocator: std.mem.Allocator,
+    options: UnpackOptions,
+    rootfs: spore.Rootfs,
+    storage: spore.RootfsStorage,
+    index: RootfsIndex,
+    cache_root: []const u8,
+) Error!RootfsMaterializeResult {
+    try validateRootfsStorageForRootfs(storage, rootfs);
+    const entry = findRootfsStorageEntry(index, storage.index_digest) orelse return error.BadManifest;
+    if (!rootfsStorageEntryMatches(entry, storage)) return error.BadManifest;
+
+    const source_index_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, entry.index_path });
+    const index_bytes = try readVerifiedRootfsStorageIndexPath(allocator, source_index_path, storage);
+    defer allocator.free(index_bytes);
+    const parsed_index = rootfs_block_index.parseRootfsBlockIndex(allocator, index_bytes, storage) catch |err| return rootfsError(err);
+    defer parsed_index.deinit();
+
+    const cache_index_path = rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
+    var result = RootfsMaterializeResult{
+        .artifact_count = 1,
+        .payload_bytes = @intCast(index_bytes.len),
+    };
+    const installed_index = try installRootfsCasIndexPath(allocator, options.io, cache_index_path, index_bytes, storage);
+    if (installed_index.cache_hit) {
+        result.cache_hit_count += 1;
+    } else {
+        result.cache_miss_count += 1;
+        result.bytes_fetched += installed_index.bytes_fetched;
+    }
+
+    var object_count: usize = 0;
+    var object_bytes: u64 = 0;
+    for (parsed_index.value.chunks) |chunk_entry| {
+        const expected_size = try rootfsStorageChunkLen(storage, chunk_entry.logical_chunk);
+        const source_object_rel_path = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
+        const source_object_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, source_object_rel_path });
+        const object_data = try readVerifiedRootfsCasChunkPath(allocator, source_object_path, chunk_entry.digest, expected_size);
+        defer allocator.free(object_data);
+        const cache_object_path = rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest) catch |err| return rootfsError(err);
+        const installed_object = try installRootfsCasChunkPath(allocator, options.io, cache_object_path, object_data, chunk_entry.digest, expected_size);
+        if (installed_object.cache_hit) {
+            result.cache_hit_count += 1;
+        } else {
+            result.cache_miss_count += 1;
+            result.bytes_fetched += installed_object.bytes_fetched;
+        }
+        object_count += 1;
+        object_bytes += @intCast(object_data.len);
+        result.payload_bytes += @intCast(object_data.len);
+    }
+    if (entry.object_count != object_count or
+        entry.object_bytes != object_bytes or
+        entry.index_bytes != @as(u64, @intCast(index_bytes.len))) return error.BadManifest;
+    return result;
+}
+
 fn findRootfsEntry(index: RootfsIndex, digest: []const u8) ?RootfsArtifactEntry {
     for (index.artifacts) |entry| {
         if (std.mem.eql(u8, entry.digest, digest)) return entry;
+    }
+    return null;
+}
+
+fn findRootfsStorageEntry(index: RootfsIndex, index_digest: []const u8) ?RootfsStorageEntry {
+    return findRootfsStorageEntryInSlice(index.storages, index_digest);
+}
+
+fn findRootfsStorageEntryInSlice(entries: []const RootfsStorageEntry, index_digest: []const u8) ?RootfsStorageEntry {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.index_digest, index_digest)) return entry;
     }
     return null;
 }
@@ -1464,6 +1747,95 @@ fn rootfsArtifactRelPath(allocator: std.mem.Allocator, artifact: spore.RootfsArt
     if (!std.mem.eql(u8, artifact.format, spore.rootfs_artifact_format_ext4)) return error.BadManifest;
     const hex = artifact.digest[spore.rootfs_digest_prefix.len..];
     return std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ rootfs_blake3_dir_path, hex }) catch return error.OutOfMemory;
+}
+
+fn rootfsStorageEntryDescriptor(entry: RootfsStorageEntry) spore.RootfsStorage {
+    return .{
+        .kind = entry.kind,
+        .device = entry.device,
+        .logical_size = entry.logical_size,
+        .chunk_size = entry.chunk_size,
+        .hash_algorithm = entry.hash_algorithm,
+        .index_digest = entry.index_digest,
+        .base_identity = entry.base_identity,
+        .object_namespace = entry.object_namespace,
+    };
+}
+
+fn rootfsStorageEntryMatches(entry: RootfsStorageEntry, storage: spore.RootfsStorage) bool {
+    return std.mem.eql(u8, entry.kind, storage.kind) and
+        rootfsDeviceMatches(entry.device, storage.device) and
+        entry.logical_size == storage.logical_size and
+        entry.chunk_size == storage.chunk_size and
+        std.mem.eql(u8, entry.hash_algorithm, storage.hash_algorithm) and
+        std.mem.eql(u8, entry.index_digest, storage.index_digest) and
+        std.mem.eql(u8, entry.base_identity, storage.base_identity) and
+        std.mem.eql(u8, entry.object_namespace, storage.object_namespace);
+}
+
+fn rootfsDeviceMatches(a: spore.RootfsDevice, b: spore.RootfsDevice) bool {
+    return std.mem.eql(u8, a.kind, b.kind) and
+        std.mem.eql(u8, a.role, b.role) and
+        a.virtio_device_id == b.virtio_device_id and
+        a.mmio_slot == b.mmio_slot;
+}
+
+fn validateRootfsStorageForRootfs(storage: spore.RootfsStorage, rootfs: spore.Rootfs) Error!void {
+    try spore.validateRootfsStorageDescriptor(storage);
+    try validateRootfsDeviceShape(storage.device);
+    if (!rootfsDeviceMatches(storage.device, rootfs.device)) return error.BadManifest;
+    if (storage.logical_size != rootfs.artifact.size) return error.BadManifest;
+}
+
+fn rootfsStorageIndexRelPath(allocator: std.mem.Allocator, index_digest: []const u8) Error![]const u8 {
+    const hex = try spore.diskDigestHex(index_digest);
+    return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ rootfs_blake3_indexes_dir_path, hex }) catch return error.OutOfMemory;
+}
+
+fn rootfsStorageObjectRelPath(allocator: std.mem.Allocator, object_digest: []const u8) Error![]const u8 {
+    const hex = try spore.diskDigestHex(object_digest);
+    return std.fmt.allocPrint(allocator, "{s}/{s}.chunk", .{ rootfs_blake3_objects_dir_path, hex }) catch return error.OutOfMemory;
+}
+
+fn rootfsStorageChunkLen(storage: spore.RootfsStorage, logical_chunk: u64) Error!usize {
+    const start = std.math.mul(u64, logical_chunk, storage.chunk_size) catch return error.BadManifest;
+    if (start >= storage.logical_size) return error.BadManifest;
+    const len = @min(storage.chunk_size, storage.logical_size - start);
+    return std.math.cast(usize, len) orelse error.BadManifest;
+}
+
+fn loadRootfsBlockIndexForEntry(
+    allocator: std.mem.Allocator,
+    bundle_dir: []const u8,
+    entry: RootfsStorageEntry,
+    storage: spore.RootfsStorage,
+) Error!std.json.Parsed(rootfs_block_index.RootfsBlockIndex) {
+    const expected_path = try rootfsStorageIndexRelPath(allocator, entry.index_digest);
+    defer allocator.free(expected_path);
+    if (!std.mem.eql(u8, entry.index_path, expected_path)) return error.BadManifest;
+    const path = try pathZ(allocator, "{s}/{s}", .{ bundle_dir, entry.index_path });
+    const bytes = try readFileAllNoSymlink(allocator, path, rootfs_block_index.max_index_bytes);
+    defer allocator.free(bytes);
+    if (entry.index_bytes != @as(u64, @intCast(bytes.len))) return error.BadManifest;
+    const parsed = rootfs_block_index.parseRootfsBlockIndex(allocator, bytes, storage) catch |err| return rootfsError(err);
+    errdefer parsed.deinit();
+    try validateRootfsStoragePayloadStats(entry, storage, parsed.value);
+    return parsed;
+}
+
+fn validateRootfsStoragePayloadStats(
+    entry: RootfsStorageEntry,
+    storage: spore.RootfsStorage,
+    index: rootfs_block_index.RootfsBlockIndex,
+) Error!void {
+    var object_count: usize = 0;
+    var object_bytes: u64 = 0;
+    for (index.chunks) |chunk_entry| {
+        const expected_size = try rootfsStorageChunkLen(storage, chunk_entry.logical_chunk);
+        object_count += 1;
+        object_bytes = std.math.add(u64, object_bytes, @intCast(expected_size)) catch return error.BadManifest;
+    }
+    if (entry.object_count != object_count or entry.object_bytes != object_bytes) return error.BadManifest;
 }
 
 fn packDiskLayersForManifest(
@@ -1746,11 +2118,7 @@ fn indexedBundleFiles(allocator: std.mem.Allocator, bundle_dir: []const u8) Erro
         try appendBundleFile(allocator, &files, &seen, rootfs_index_rel);
         const parsed_rootfs_index = try loadRootfsIndex(allocator, bundle_dir);
         defer parsed_rootfs_index.deinit();
-        for (parsed_rootfs_index.value.artifacts) |artifact| {
-            if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
-                try appendBundleFile(allocator, &files, &seen, artifact.path orelse return error.BadManifest);
-            }
-        }
+        try appendRootfsIndexPayloadFiles(allocator, bundle_dir, parsed_rootfs_index.value, &files, &seen);
     }
     try appendDiskBundleFilesForManifestPath(allocator, bundle_dir, bundle_index.parent_manifest, &files, &seen);
     for (bundle_index.children) |child| {
@@ -1758,6 +2126,30 @@ fn indexedBundleFiles(allocator: std.mem.Allocator, bundle_dir: []const u8) Erro
     }
 
     return files.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+fn appendRootfsIndexPayloadFiles(
+    allocator: std.mem.Allocator,
+    bundle_dir: []const u8,
+    index: RootfsIndex,
+    files: *std.array_list.Managed([]const u8),
+    seen: *std.StringHashMap(void),
+) Error!void {
+    for (index.artifacts) |artifact| {
+        if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
+            try appendBundleFileIfMissing(allocator, files, seen, artifact.path orelse return error.BadManifest);
+        }
+    }
+    for (index.storages) |storage_entry| {
+        try appendBundleFileIfMissing(allocator, files, seen, storage_entry.index_path);
+        const storage = rootfsStorageEntryDescriptor(storage_entry);
+        const parsed_index = try loadRootfsBlockIndexForEntry(allocator, bundle_dir, storage_entry, storage);
+        defer parsed_index.deinit();
+        for (parsed_index.value.chunks) |chunk_entry| {
+            const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
+            try appendBundleFileIfMissing(allocator, files, seen, object_rel);
+        }
+    }
 }
 
 fn appendDiskBundleFilesForManifestPath(
@@ -1964,17 +2356,7 @@ fn downloadS3BundleToDir(
         origin_bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, rootfs_index_rel);
         const parsed_rootfs_index = try loadRootfsIndex(allocator, bundle_dir);
         defer parsed_rootfs_index.deinit();
-        for (parsed_rootfs_index.value.artifacts) |artifact| {
-            if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
-                origin_bytes += try downloadS3BundleFile(
-                    allocator,
-                    options,
-                    location,
-                    bundle_dir,
-                    artifact.path orelse return error.BadManifest,
-                );
-            }
-        }
+        origin_bytes += try downloadS3RootfsIndexPayloadFiles(allocator, options, location, bundle_dir, parsed_rootfs_index.value);
     }
     var seen_disk_files = std.StringHashMap(void).init(allocator);
     defer seen_disk_files.deinit();
@@ -2016,18 +2398,7 @@ fn downloadHttpBundleToDir(
         peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rootfs_index_rel);
         const parsed_rootfs_index = try loadRootfsIndex(allocator, bundle_dir);
         defer parsed_rootfs_index.deinit();
-        for (parsed_rootfs_index.value.artifacts) |artifact| {
-            if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
-                peer_bytes += try downloadHttpBundleFile(
-                    allocator,
-                    options,
-                    client,
-                    location,
-                    bundle_dir,
-                    artifact.path orelse return error.BadManifest,
-                );
-            }
-        }
+        peer_bytes += try downloadHttpRootfsIndexPayloadFiles(allocator, options, client, location, bundle_dir, parsed_rootfs_index.value);
     }
     var seen_disk_files = std.StringHashMap(void).init(allocator);
     defer seen_disk_files.deinit();
@@ -2036,6 +2407,71 @@ fn downloadHttpBundleToDir(
         peer_bytes += try downloadHttpDiskFilesForManifestPath(allocator, options, client, location, bundle_dir, child.manifest, &seen_disk_files);
     }
     return peer_bytes;
+}
+
+fn downloadS3RootfsIndexPayloadFiles(
+    allocator: std.mem.Allocator,
+    options: PullOptions,
+    location: S3Location,
+    bundle_dir: []const u8,
+    index: RootfsIndex,
+) Error!u64 {
+    var bytes: u64 = 0;
+    for (index.artifacts) |artifact| {
+        if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
+            bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, artifact.path orelse return error.BadManifest);
+        }
+    }
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    for (index.storages) |storage_entry| {
+        if (try markBundleFileSeen(allocator, &seen, storage_entry.index_path)) {
+            bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, storage_entry.index_path);
+        }
+        const storage = rootfsStorageEntryDescriptor(storage_entry);
+        const parsed_index = try loadRootfsBlockIndexForEntry(allocator, bundle_dir, storage_entry, storage);
+        defer parsed_index.deinit();
+        for (parsed_index.value.chunks) |chunk_entry| {
+            const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
+            if (try markBundleFileSeen(allocator, &seen, object_rel)) {
+                bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, object_rel);
+            }
+        }
+    }
+    return bytes;
+}
+
+fn downloadHttpRootfsIndexPayloadFiles(
+    allocator: std.mem.Allocator,
+    options: PullOptions,
+    client: *std.http.Client,
+    location: HttpLocation,
+    bundle_dir: []const u8,
+    index: RootfsIndex,
+) Error!u64 {
+    var bytes: u64 = 0;
+    for (index.artifacts) |artifact| {
+        if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
+            bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, artifact.path orelse return error.BadManifest);
+        }
+    }
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    for (index.storages) |storage_entry| {
+        if (try markBundleFileSeen(allocator, &seen, storage_entry.index_path)) {
+            bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, storage_entry.index_path);
+        }
+        const storage = rootfsStorageEntryDescriptor(storage_entry);
+        const parsed_index = try loadRootfsBlockIndexForEntry(allocator, bundle_dir, storage_entry, storage);
+        defer parsed_index.deinit();
+        for (parsed_index.value.chunks) |chunk_entry| {
+            const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
+            if (try markBundleFileSeen(allocator, &seen, object_rel)) {
+                bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, object_rel);
+            }
+        }
+    }
+    return bytes;
 }
 
 fn downloadS3DiskFilesForManifestPath(
@@ -2300,6 +2736,10 @@ fn lessRootfsArtifactEntry(_: void, a: RootfsArtifactEntry, b: RootfsArtifactEnt
     return std.mem.lessThan(u8, a.digest, b.digest);
 }
 
+fn lessRootfsStorageEntry(_: void, a: RootfsStorageEntry, b: RootfsStorageEntry) bool {
+    return std.mem.lessThan(u8, a.index_digest, b.index_digest);
+}
+
 fn rootfsError(err: anyerror) Error {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -2382,6 +2822,142 @@ fn readFileAll(allocator: std.mem.Allocator, path: [:0]const u8, max: usize) Err
         done += @intCast(n);
     }
     return buf;
+}
+
+fn readFileAllNoSymlink(allocator: std.mem.Allocator, path: []const u8, max: usize) Error![]u8 {
+    const path_z = try pathZ(allocator, "{s}", .{path});
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.BadChunk;
+    defer _ = std.c.close(fd);
+    const size = try fstatRegularSize(fd);
+    if (size > max) return error.BadChunk;
+    const buf = allocator.alloc(u8, size) catch return error.OutOfMemory;
+    errdefer allocator.free(buf);
+    var done: usize = 0;
+    while (done < size) {
+        const n = std.c.read(fd, buf.ptr + done, size - done);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+    return buf;
+}
+
+fn fstatRegularSize(fd: std.c.fd_t) Error!usize {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var statx_buf: linux.Statx = undefined;
+        const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{
+            .TYPE = true,
+            .MODE = true,
+            .SIZE = true,
+        }, &statx_buf);
+        if (linux.errno(rc) != .SUCCESS) return error.IoFailed;
+        if (!linux.S.ISREG(statx_buf.mode)) return error.BadChunk;
+        return std.math.cast(usize, statx_buf.size) orelse error.BadChunk;
+    } else {
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &stat) != 0) return error.IoFailed;
+        if (!std.c.S.ISREG(stat.mode)) return error.BadChunk;
+        if (stat.size < 0) return error.IoFailed;
+        return std.math.cast(usize, stat.size) orelse error.BadChunk;
+    }
+}
+
+fn readVerifiedRootfsStorageIndexPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    storage: spore.RootfsStorage,
+) Error![]u8 {
+    const bytes = try readFileAllNoSymlink(allocator, path, rootfs_block_index.max_index_bytes);
+    errdefer allocator.free(bytes);
+    const parsed = rootfs_block_index.parseRootfsBlockIndex(allocator, bytes, storage) catch |err| return rootfsError(err);
+    parsed.deinit();
+    return bytes;
+}
+
+fn readVerifiedRootfsCasChunkPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    digest: []const u8,
+    expected_size: usize,
+) Error![]u8 {
+    const data = try readFileAllNoSymlink(allocator, path, expected_size);
+    errdefer allocator.free(data);
+    if (data.len != expected_size) return error.BadChunk;
+    try verifyRootfsDigestBytes(digest, data);
+    return data;
+}
+
+fn verifyRootfsDigestBytes(digest: []const u8, data: []const u8) Error!void {
+    const hex = try spore.diskDigestHex(digest);
+    const id = chunklib.ChunkId.fromHex(hex) catch return error.BadManifest;
+    if (!id.matches(data)) return error.BadChunk;
+}
+
+const RootfsCasInstallResult = struct {
+    cache_hit: bool,
+    bytes_fetched: u64,
+};
+
+fn installRootfsCasIndexPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_path: []const u8,
+    data: []const u8,
+    storage: spore.RootfsStorage,
+) Error!RootfsCasInstallResult {
+    const cache_parent = std.fs.path.dirname(cache_path) orelse return error.IoFailed;
+    try ensureDirPath(io, cache_parent);
+    if (try pathExistsNoSymlink(io, cache_path)) {
+        const existing = try readVerifiedRootfsStorageIndexPath(allocator, cache_path, storage);
+        allocator.free(existing);
+        return .{ .cache_hit = true, .bytes_fetched = 0 };
+    }
+    const parsed = rootfs_block_index.parseRootfsBlockIndex(allocator, data, storage) catch |err| return rootfsError(err);
+    parsed.deinit();
+    try writeRootfsCasCacheFileAtomic(allocator, io, cache_path, data);
+    const installed = try readVerifiedRootfsStorageIndexPath(allocator, cache_path, storage);
+    defer allocator.free(installed);
+    return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
+}
+
+fn installRootfsCasChunkPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_path: []const u8,
+    data: []const u8,
+    digest: []const u8,
+    expected_size: usize,
+) Error!RootfsCasInstallResult {
+    const cache_parent = std.fs.path.dirname(cache_path) orelse return error.IoFailed;
+    try ensureDirPath(io, cache_parent);
+    if (try pathExistsNoSymlink(io, cache_path)) {
+        const existing = try readVerifiedRootfsCasChunkPath(allocator, cache_path, digest, expected_size);
+        allocator.free(existing);
+        return .{ .cache_hit = true, .bytes_fetched = 0 };
+    }
+    if (data.len != expected_size) return error.BadChunk;
+    try verifyRootfsDigestBytes(digest, data);
+    try writeRootfsCasCacheFileAtomic(allocator, io, cache_path, data);
+    const installed = try readVerifiedRootfsCasChunkPath(allocator, cache_path, digest, expected_size);
+    defer allocator.free(installed);
+    return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
+}
+
+fn writeRootfsCasCacheFileAtomic(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_path: []const u8,
+    data: []const u8,
+) Error!void {
+    var temp_nonce_bytes: [8]u8 = undefined;
+    io.random(&temp_nonce_bytes);
+    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
+    const temp_path = std.fmt.allocPrintSentinel(allocator, "{s}.{x}.tmp", .{ cache_path, temp_nonce }, 0) catch return error.OutOfMemory;
+    defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+    try writeFileExclusive(temp_path, data, 0o444);
+    try renamePath(io, temp_path, cache_path);
 }
 
 fn readFileRange(allocator: std.mem.Allocator, path: [:0]const u8, offset: u64, size: u64) Error![]u8 {
@@ -3909,11 +4485,11 @@ test "pack children writes exact rootfs policy and unpacks selected rootfs child
     const bundle_index = try loadBundleIndex(arena, bundle_dir);
     defer bundle_index.deinit();
     try std.testing.expectEqualStrings(rootfs_index_path, bundle_index.value.rootfs_index.?);
-    const rootfs_index = try loadRootfsIndex(arena, bundle_dir);
-    defer rootfs_index.deinit();
-    try std.testing.expectEqual(@as(usize, 1), rootfs_index.value.artifacts.len);
-    try std.testing.expectEqualStrings(rootfs_policy_exact_bytes, rootfs_index.value.artifacts[0].policy);
-    try std.testing.expectEqualStrings(artifact.digest, rootfs_index.value.artifacts[0].digest);
+    const parsed_rootfs_index = try loadRootfsIndex(arena, bundle_dir);
+    defer parsed_rootfs_index.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_rootfs_index.value.artifacts.len);
+    try std.testing.expectEqualStrings(rootfs_policy_exact_bytes, parsed_rootfs_index.value.artifacts[0].policy);
+    try std.testing.expectEqualStrings(artifact.digest, parsed_rootfs_index.value.artifacts[0].digest);
 
     _ = try unpack(arena, .{
         .io = io,
@@ -3927,6 +4503,121 @@ test "pack children writes exact rootfs policy and unpacks selected rootfs child
     const restored_rootfs = restored_manifest.value.rootfs orelse return error.BadManifest;
     const fd = try rootfs_cache.openVerifiedFromCache(io, arena, unpack_cache_root, restored_rootfs);
     _ = std.c.close(fd);
+}
+
+test "pack and pull chunked rootfs storage materializes rootfs CAS" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const legacy_bundle_dir = try pathZ(arena, "{s}/legacy-bundle", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/pulled-child", .{root_dir});
+    const out_bad_dir = try pathZ(arena, "{s}/pulled-bad-child", .{root_dir});
+    const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
+    const pull_rootfs_cache = try pathZ(arena, "{s}/pull-rootfs-cache", .{root_dir});
+    const bad_rootfs_cache = try pathZ(arena, "{s}/bad-rootfs-cache", .{root_dir});
+    const pull_bundle_cache = try pathZ(arena, "{s}/pull-bundle-cache", .{root_dir});
+    const bad_bundle_cache = try pathZ(arena, "{s}/bad-bundle-cache", .{root_dir});
+    const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
+
+    const ram = try arena.alloc(u8, 4096);
+    @memset(ram, 0x64);
+    const memory = try spore.saveMemory(arena, parent_dir, ram);
+    const rootfs_bytes = try arena.alloc(u8, 3 * 4096 + 7);
+    @memset(rootfs_bytes, 0);
+    rootfs_bytes[0] = 0x11;
+    rootfs_bytes[2 * 4096 + 3] = 0x22;
+    try writeFileAll(rootfs_source_path, rootfs_bytes);
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
+    const preload_result = try rootfs_cas.preload(io, arena, pack_cache_root, artifact.digest, 4096);
+    var manifest = testRootfsManifest(memory, ram.len, 62, artifact);
+    manifest.rootfs.?.storage = rootfs_cas.storageDescriptor(manifest.rootfs.?.device, preload_result);
+    try spore.saveManifest(arena, parent_dir, manifest);
+    try std.testing.expectError(error.BadManifest, pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = legacy_bundle_dir,
+        .rootfs_cache_dir = pack_cache_root,
+    }));
+    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 1 });
+
+    const pack_result = try pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = bundle_dir,
+        .rootfs_cache_dir = pack_cache_root,
+        .children_dir = children_dir,
+    });
+    try std.testing.expectEqual(@as(usize, 1), pack_result.rootfs_artifact_count);
+    try std.testing.expect(pack_result.rootfs_payload_bytes > 0);
+
+    const exact_rel_path = try rootfsArtifactRelPath(arena, artifact);
+    try std.testing.expect(!try pathExistsNoSymlink(io, try pathZ(arena, "{s}/{s}", .{ bundle_dir, exact_rel_path })));
+    const parsed_rootfs_index = try loadRootfsIndex(arena, bundle_dir);
+    defer parsed_rootfs_index.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed_rootfs_index.value.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed_rootfs_index.value.storages.len);
+    const storage_entry = parsed_rootfs_index.value.storages[0];
+    try std.testing.expectEqualStrings(preload_result.index_digest, storage_entry.index_digest);
+    try std.testing.expectEqual(preload_result.nonzero_chunks, storage_entry.object_count);
+
+    const source_uri = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
+    const pulled = try pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out_dir,
+        .rootfs_cache_dir = pull_rootfs_cache,
+        .bundle_cache_dir = pull_bundle_cache,
+        .child_id = "000000",
+    });
+    try std.testing.expectEqual(@as(usize, 1), pulled.rootfs.artifact_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled.rootfs.cache.hit_count);
+    try std.testing.expectEqual(preload_result.nonzero_chunks + 1, pulled.rootfs.cache.miss_count);
+    try std.testing.expect(pulled.rootfs.cache.bytes_fetched > 0);
+
+    const exact_cache_path = try rootfs_cache.digestPath(arena, pull_rootfs_cache, artifact.digest);
+    try std.testing.expect(!try pathExistsNoSymlink(io, exact_cache_path));
+    const restored_manifest = try spore.loadManifest(arena, out_dir);
+    defer restored_manifest.deinit();
+    const restored_rootfs = restored_manifest.value.rootfs orelse return error.BadManifest;
+    try std.testing.expect(restored_rootfs.storage != null);
+    var source = try rootfs_cas.CasBlockSource.openManifest(allocator, pull_rootfs_cache, restored_rootfs, null);
+    defer source.deinit();
+    var first_byte: [1]u8 = undefined;
+    try source.readAt(&first_byte, 0);
+    try std.testing.expectEqual(@as(u8, 0x11), first_byte[0]);
+    try source.readAt(&first_byte, 4096);
+    try std.testing.expectEqual(@as(u8, 0), first_byte[0]);
+    try source.readAt(&first_byte, 2 * 4096 + 3);
+    try std.testing.expectEqual(@as(u8, 0x22), first_byte[0]);
+
+    const storage = rootfsStorageEntryDescriptor(storage_entry);
+    const parsed_block_index = try loadRootfsBlockIndexForEntry(arena, bundle_dir, storage_entry, storage);
+    defer parsed_block_index.deinit();
+    const first_chunk = parsed_block_index.value.chunks[0];
+    const object_rel_path = try rootfsStorageObjectRelPath(arena, first_chunk.digest);
+    const object_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, object_rel_path });
+    const clean_digest = try digestHex(arena, bundle_dir);
+    const object_data = try readFileAll(arena, object_path, 4096);
+    object_data[0] ^= 0xff;
+    try writeFileAll(object_path, object_data);
+    const corrupt_digest = try digestHex(arena, bundle_dir);
+    try std.testing.expect(!std.mem.eql(u8, clean_digest, corrupt_digest));
+    try std.testing.expectError(error.BadChunk, pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out_bad_dir,
+        .rootfs_cache_dir = bad_rootfs_cache,
+        .bundle_cache_dir = bad_bundle_cache,
+        .child_id = "000000",
+    }));
+    try std.testing.expect(!try pathExistsNoSymlink(io, out_bad_dir));
 }
 
 test "metadata-only rootfs policy requires explicit prepared cache" {
@@ -3970,11 +4661,11 @@ test "metadata-only rootfs policy requires explicit prepared cache" {
 
     const rootfs_rel_path = try rootfsArtifactRelPath(arena, artifact);
     try std.testing.expect(!try pathExistsNoSymlink(io, try pathZ(arena, "{s}/{s}", .{ bundle_dir, rootfs_rel_path })));
-    const rootfs_index = try loadRootfsIndex(arena, bundle_dir);
-    defer rootfs_index.deinit();
-    try std.testing.expectEqual(@as(usize, 1), rootfs_index.value.artifacts.len);
-    try std.testing.expectEqualStrings(rootfs_policy_metadata_only, rootfs_index.value.artifacts[0].policy);
-    try std.testing.expect(rootfs_index.value.artifacts[0].path == null);
+    const parsed_rootfs_index = try loadRootfsIndex(arena, bundle_dir);
+    defer parsed_rootfs_index.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_rootfs_index.value.artifacts.len);
+    try std.testing.expectEqualStrings(rootfs_policy_metadata_only, parsed_rootfs_index.value.artifacts[0].policy);
+    try std.testing.expect(parsed_rootfs_index.value.artifacts[0].path == null);
 
     try std.testing.expectError(error.BadManifest, unpack(arena, .{
         .io = io,
@@ -4122,5 +4813,49 @@ test "rootfs index rejects duplicate digests and unsafe exact paths" {
     }};
     try std.testing.expectError(error.BadManifest, validateRootfsIndex(std.testing.allocator, .{
         .artifacts = &unsafe,
+    }));
+
+    const storage_path = "rootfs/blake3/indexes/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+    var duplicate_storage = [_]RootfsStorageEntry{
+        .{
+            .device = .{ .mmio_slot = 0 },
+            .logical_size = 4096,
+            .chunk_size = 4096,
+            .index_digest = digest,
+            .base_identity = digest,
+            .index_path = storage_path,
+            .index_bytes = 128,
+            .object_count = 0,
+            .object_bytes = 0,
+        },
+        .{
+            .device = .{ .mmio_slot = 0 },
+            .logical_size = 4096,
+            .chunk_size = 4096,
+            .index_digest = digest,
+            .base_identity = digest,
+            .index_path = storage_path,
+            .index_bytes = 128,
+            .object_count = 0,
+            .object_bytes = 0,
+        },
+    };
+    try std.testing.expectError(error.BadManifest, validateRootfsIndex(std.testing.allocator, .{
+        .storages = &duplicate_storage,
+    }));
+
+    var unsafe_storage = [_]RootfsStorageEntry{.{
+        .device = .{ .mmio_slot = 0 },
+        .logical_size = 4096,
+        .chunk_size = 4096,
+        .index_digest = digest,
+        .base_identity = digest,
+        .index_path = "../rootfs-index.json",
+        .index_bytes = 128,
+        .object_count = 0,
+        .object_bytes = 0,
+    }};
+    try std.testing.expectError(error.BadManifest, validateRootfsIndex(std.testing.allocator, .{
+        .storages = &unsafe_storage,
     }));
 }
