@@ -59,6 +59,7 @@ sha256_file() {
 }
 
 required_run_config_symbols=(
+  CONFIG_CGROUPS
   CONFIG_FILE_LOCKING
   CONFIG_SHMEM
   CONFIG_TMPFS
@@ -66,6 +67,10 @@ required_run_config_symbols=(
   CONFIG_INOTIFY_USER
   CONFIG_BPF_SYSCALL
   CONFIG_CGROUP_BPF
+  CONFIG_MEMCG
+  CONFIG_CGROUP_PIDS
+  CONFIG_CPUSETS
+  CONFIG_CGROUP_DEVICE
 )
 
 verify_run_kernel_config() {

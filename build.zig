@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_exe.step);
 
     const minimal_exec_initrd = b.addSystemCommand(&.{
+        "bash",
         "scripts/make-minimal-exec-initrd.sh",
         b.getInstallPath(.prefix, "share/sporevm/minimal-exec-initrd.cpio"),
     });

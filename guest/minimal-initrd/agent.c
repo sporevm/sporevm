@@ -69,6 +69,8 @@ static int64_t t_request_decode = 0;
 static int64_t t_command_start = 0;
 static int64_t t_command_exit = 0;
 
+static int path_is_dir(const char *path);
+
 struct replay_buffer {
   unsigned char data[REPLAY_CAP];
   uint64_t base_offset;
@@ -115,6 +117,20 @@ static void mount_proc(void) {
   mkdir("/proc", 0755);
   if (mount("proc", "/proc", "proc", 0, "") != 0 && errno != EBUSY) {
     dprintf(2, "mount proc failed: errno=%d\n", errno);
+  }
+}
+
+static void mount_sysfs(void) {
+  mkdir("/sys", 0755);
+  if (mount("sysfs", "/sys", "sysfs", MS_RDONLY | MS_NOSUID | MS_NOEXEC | MS_NODEV, "") != 0 && errno != EBUSY) {
+    dprintf(2, "mount sysfs failed: errno=%d\n", errno);
+  }
+}
+
+static void mount_cgroup2_if_dir(const char *target) {
+  if (!path_is_dir(target)) return;
+  if (mount("none", target, "cgroup2", MS_NOSUID | MS_NOEXEC | MS_NODEV, "") != 0 && errno != EBUSY) {
+    dprintf(2, "mount cgroup2 failed: target=%s errno=%d\n", target, errno);
   }
 }
 
@@ -201,6 +217,7 @@ static int setup_rootfs(int writable, char *error, size_t cap) {
   if (mount_if_dir("devtmpfs", "/mnt/rootfs/dev", "devtmpfs", MS_NOSUID, "", error, cap) != 0) return -1;
   if (mount_if_dir("proc", "/mnt/rootfs/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, "", error, cap) != 0) return -1;
   if (mount_if_dir("sysfs", "/mnt/rootfs/sys", "sysfs", MS_RDONLY | MS_NOSUID | MS_NOEXEC | MS_NODEV, "", error, cap) != 0) return -1;
+  mount_cgroup2_if_dir("/mnt/rootfs/sys/fs/cgroup");
   if (mount_if_dir("tmpfs", "/mnt/rootfs/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755", error, cap) != 0) return -1;
   if (mount_if_dir("tmpfs", "/mnt/rootfs/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777", error, cap) != 0) return -1;
   return 0;
@@ -1144,6 +1161,8 @@ static void accept_request(int listener, struct session *session, struct client 
 int main(void) {
   t_init_start = now_ms();
   mount_proc();
+  mount_sysfs();
+  mount_cgroup2_if_dir("/sys/fs/cgroup");
   prepare_dev();
   mkdir("/run", 0755);
   int use_rootfs = cmdline_has_flag("spore_rootfs=1");

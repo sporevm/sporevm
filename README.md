@@ -104,6 +104,7 @@ mise run install
 mise run smoke:lifecycle
 mise run smoke:run
 mise run smoke:run-file-locking
+mise run smoke:run-cgroup
 mise run smoke:run-net-config
 mise run smoke:run-net-dns
 mise run smoke:run-capture
@@ -122,7 +123,8 @@ with runtime assets under `~/share/sporevm`.
 smokes. `smoke:lifecycle` checks named create, repeated exec, list, and remove
 on the selected backend. `smoke:run-file-locking` checks that the managed run
 kernel supports guest `flock(2)` behavior needed by Docker and containerd volume
-metadata. `smoke:run-net-config` checks the experimental
+metadata. `smoke:run-cgroup` checks that the run guest mounts writable cgroup2
+at `/sys/fs/cgroup`, which Docker needs before daemon startup. `smoke:run-net-config` checks the experimental
 `spore run --net` static guest link setup, and `smoke:run-net-dns` checks DNS
 proxying through the managed gateway. `smoke:counter-fanout` and
 `smoke:rootfs-fanout` are opt-in demo smokes; the rootfs fan-out smoke builds a
@@ -336,6 +338,8 @@ are available when a change touches fan-out or rootfs behavior:
 - `scripts/smoke-restore-leg.sh`: split capture/resume legs for backend
   debugging.
 - `mise run smoke:run-file-locking`: verify guest `flock(2)` behavior through
+  the default `spore run` boot path.
+- `mise run smoke:run-cgroup`: verify writable guest cgroup2 behavior through
   the default `spore run` boot path.
 - `mise run smoke:run-net-config`: verify the experimental `spore run --net`
   static guest address, route, resolver, and gateway ARP setup.
