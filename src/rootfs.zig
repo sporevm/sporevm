@@ -632,7 +632,7 @@ const RootfsBuildProfile = struct {
     fn preloadPhase(self: RootfsBuildProfile, start_ms: u64, result: rootfs_cas.PreloadResult) void {
         if (!self.enabled) return;
         std.debug.print(
-            "spore rootfs profile: phase=rootfs_cas_preload ms={d} chunks={d} zero_chunks={d} nonzero_chunks={d} objects_written={d} object_bytes_written={d} index_bytes={d}\n",
+            "spore rootfs profile: phase=rootfs_cas_preload ms={d} chunks={d} zero_chunks={d} nonzero_chunks={d} objects_written={d} object_bytes_written={d} index_bytes={d} source_verify_ms={d} chunk_scan_ms={d} object_check_ms={d} object_write_ms={d} index_build_ms={d} index_write_ms={d}\n",
             .{
                 monotonicMs() -| start_ms,
                 result.chunk_count,
@@ -641,6 +641,12 @@ const RootfsBuildProfile = struct {
                 result.objects_written,
                 result.object_bytes_written,
                 result.index_bytes,
+                result.source_verify_ms,
+                result.chunk_scan_ms,
+                result.object_check_ms,
+                result.object_write_ms,
+                result.index_build_ms,
+                result.index_write_ms,
             },
         );
     }
@@ -1204,7 +1210,7 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
         .format = spore.rootfs_artifact_format_ext4,
     };
     const cache_start = opts.profile.start();
-    try rootfs_cache.installExpectedPath(init.io, allocator, cache_root, opts.output, artifact, .{
+    _ = try rootfs_cache.installExpectedPathAfterSourceVerified(init.io, allocator, cache_root, opts.output, artifact, .{
         .source_must_not_be_symlink = false,
         .allow_hardlink = true,
     });

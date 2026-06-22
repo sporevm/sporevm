@@ -36,6 +36,12 @@ pub const PreloadResult = struct {
     objects_written: usize,
     object_bytes_written: u64,
     index_bytes: usize,
+    source_verify_ms: u64 = 0,
+    chunk_scan_ms: u64 = 0,
+    object_check_ms: u64 = 0,
+    object_write_ms: u64 = 0,
+    index_build_ms: u64 = 0,
+    index_write_ms: u64 = 0,
 };
 
 pub const InstallResult = struct {
@@ -225,7 +231,9 @@ pub fn preload(
             .format = spore.rootfs_artifact_format_ext4,
         },
     };
+    const source_verify_start_ms = monotonicMs();
     const fd = try rootfs_cache.openVerifiedFromCache(io, allocator, cache_root, rootfs);
+    const source_verify_ms = monotonicMs() -| source_verify_start_ms;
     defer _ = std.c.close(fd);
 
     const object_dir_path = try objectDir(allocator, cache_root);
@@ -247,9 +255,12 @@ pub fn preload(
     var nonzero_chunks: usize = 0;
     var objects_written: usize = 0;
     var object_bytes_written: u64 = 0;
+    var object_check_ms: u64 = 0;
+    var object_write_ms: u64 = 0;
     const read_buf = try allocator.alloc(u8, @intCast(chunk_size));
     defer allocator.free(read_buf);
 
+    const chunk_scan_start_ms = monotonicMs();
     for (0..chunk_count) |i| {
         const start = std.math.mul(u64, @as(u64, @intCast(i)), chunk_size) catch return error.BadManifest;
         const len = @min(chunk_size, stat.size - start);
@@ -270,15 +281,22 @@ pub fn preload(
         });
         const object_path = try objectPathForDir(allocator, object_dir_path, id);
         defer allocator.free(object_path);
-        if (!try objectMatches(allocator, object_path, id, data.len)) {
+        const object_check_start_ms = monotonicMs();
+        const object_exists = try objectMatches(allocator, object_path, id, data.len);
+        object_check_ms += monotonicMs() -| object_check_start_ms;
+        if (!object_exists) {
             try removeStaleObject(io, object_path);
-            try writeObjectAtomic(io, allocator, object_path, data);
+            const object_write_start_ms = monotonicMs();
+            try writeFileAtomic(io, allocator, object_path, data);
+            object_write_ms += monotonicMs() -| object_write_start_ms;
             objects_written += 1;
             object_bytes_written += data.len;
         }
         nonzero_chunks += 1;
     }
+    const chunk_scan_ms = monotonicMs() -| chunk_scan_start_ms;
 
+    const index_build_start_ms = monotonicMs();
     const manifest_index = rootfs_index.RootfsBlockIndex{
         .kind = rootfs_index.rootfs_block_index_kind,
         .logical_size = stat.size,
@@ -291,12 +309,15 @@ pub fn preload(
     const manifest_json = try std.json.Stringify.valueAlloc(allocator, manifest_index, .{ .whitespace = .indent_2 });
     defer allocator.free(manifest_json);
     const index_digest = try rootfs_index.indexDigestAlloc(allocator, manifest_json);
+    const index_build_ms = monotonicMs() -| index_build_start_ms;
     errdefer allocator.free(index_digest);
     const manifest_path = try manifestIndexPath(allocator, cache_root, index_digest);
     errdefer allocator.free(manifest_path);
     const manifest_dir = std.fs.path.dirname(manifest_path) orelse return error.BadManifest;
     try ensureDirPath(io, manifest_dir);
+    const index_write_start_ms = monotonicMs();
     try writeFileAtomic(io, allocator, manifest_path, manifest_json);
+    const index_write_ms = monotonicMs() -| index_write_start_ms;
     return .{
         .index_path = manifest_path,
         .index_digest = index_digest,
@@ -309,6 +330,12 @@ pub fn preload(
         .objects_written = objects_written,
         .object_bytes_written = object_bytes_written,
         .index_bytes = manifest_json.len,
+        .source_verify_ms = source_verify_ms,
+        .chunk_scan_ms = chunk_scan_ms,
+        .object_check_ms = object_check_ms,
+        .object_write_ms = object_write_ms,
+        .index_build_ms = index_build_ms,
+        .index_write_ms = index_write_ms,
     };
 }
 
@@ -592,12 +619,6 @@ fn removeStaleObject(io: Io, path: []const u8) !void {
         error.FileNotFound => {},
         else => |e| return e,
     };
-}
-
-fn writeObjectAtomic(io: Io, allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
-    const id = chunk.ChunkId.fromContents(data);
-    if (!id.matches(data)) return error.BadChunk;
-    try writeFileAtomic(io, allocator, path, data);
 }
 
 fn writeFileAtomic(io: Io, allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
