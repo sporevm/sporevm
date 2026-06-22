@@ -1269,11 +1269,7 @@ fn managedKernelCacheHit(io: Io, allocator: std.mem.Allocator, image_path: []con
     if (!try readOnlyRegularFileNoSymlink(io, sha_path)) return false;
     if (!try readOnlyRegularFileNoSymlink(io, config_path)) return false;
 
-    const expected = readExpectedSha256(io, allocator, sha_path) catch |err| switch (err) {
-        error.BadManagedKernelChecksum => return false,
-        else => |e| return e,
-    };
-    allocator.free(expected);
+    if (!try verifiedManagedKernelPath(io, allocator, image_path, sha_path)) return false;
     if (!try managedRunKernelConfigHasRequiredSymbols(io, allocator, config_path)) return false;
     return true;
 }
@@ -1436,6 +1432,12 @@ fn chmodFileReadOnly(allocator: std.mem.Allocator, path: []const u8) !void {
     const pathz = try allocator.dupeZ(u8, path);
     defer allocator.free(pathz);
     if (std.c.chmod(pathz, 0o444) != 0) return error.ChmodFailed;
+}
+
+fn chmodFileWritable(allocator: std.mem.Allocator, path: []const u8) !void {
+    const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
+    if (std.c.chmod(pathz, 0o644) != 0) return error.ChmodFailed;
 }
 
 fn defaultInitrdPathFromPrefix(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
@@ -2858,7 +2860,7 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "kernel bytes" });
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = sha_path,
-        .data = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  Image\n",
+        .data = "8daf3e4f39d310222b89e05b97f1aa56319811c728a147e8c6c86448f534194f  Image\n",
     });
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = config_path,
@@ -2886,6 +2888,11 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
     try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
     try chmodFileReadOnly(allocator, config_path);
     try std.testing.expect(try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
+
+    try chmodFileWritable(allocator, image_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "tampered kernel bytes" });
+    try chmodFileReadOnly(allocator, image_path);
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
 
     try chmodFileReadOnly(allocator, bad_sha_path);
     try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, bad_sha_path, config_path));
