@@ -95,9 +95,8 @@ pub fn installExpectedPathWithResult(
         try verifyPath(io, allocator, digest_path, artifact, true);
         return .{ .cache_hit = true, .bytes_fetched = 0 };
     } else {
-        try copyVerifiedPath(io, allocator, source_path, digest_path, artifact, copy_options);
+        try copyVerifiedPathAfterSourceVerified(io, allocator, source_path, digest_path, artifact, copy_options);
     }
-    try verifyPath(io, allocator, digest_path, artifact, true);
     return .{ .cache_hit = false, .bytes_fetched = artifact.size };
 }
 
@@ -110,6 +109,17 @@ pub fn copyVerifiedPath(
     options: CopyOptions,
 ) !void {
     try verifyPath(io, allocator, source_path, artifact, options.source_must_not_be_symlink);
+    try copyVerifiedPathAfterSourceVerified(io, allocator, source_path, dest_path, artifact, options);
+}
+
+fn copyVerifiedPathAfterSourceVerified(
+    io: Io,
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    dest_path: []const u8,
+    artifact: spore.RootfsArtifactRef,
+    options: CopyOptions,
+) !void {
     if (options.allow_hardlink and try hardlinkVerifiedPath(io, allocator, source_path, dest_path, artifact)) return;
 
     var temp_nonce_bytes: [8]u8 = undefined;
@@ -143,7 +153,6 @@ pub fn copyVerifiedPath(
         }
     }
     if (std.c.fchmod(dest_fd, 0o444) != 0) return error.RootFSOpenFailed;
-    try verifyPath(io, allocator, temp_path, artifact, true);
     try renamePath(io, temp_path, dest_path);
     try verifyPath(io, allocator, dest_path, artifact, true);
 }
