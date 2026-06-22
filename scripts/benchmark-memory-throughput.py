@@ -65,7 +65,7 @@ def append_jsonl(path: Path, row: dict[str, object]) -> None:
 
 def node_program(size_mib: int, copies: int, warmup_copies: int) -> str:
     return (
-        f"m={size_mib},c={copies},w={warmup_copies},s=m<<20,a=Buffer.alloc(s,90),b=Buffer.alloc(s);"
+        f"m={size_mib},c={copies},w={warmup_copies},s=m*1048576,a=Buffer.alloc(s,90),b=Buffer.alloc(s);"
         "while(w--)a.copy(b);t=process.hrtime.bigint();x=0;"
         "for(i=0;i<c;i++){a.copy(b);x+=b[i*4096%s]}"
         "e=Number(process.hrtime.bigint()-t)/1e9;console.log(JSON.stringify([m,c,e,m*c/e,x]))"
@@ -531,6 +531,7 @@ def nested_median(value: object, field: str) -> float | None:
 
 
 def self_test() -> None:
+    program = node_program(4096, 48, 4)
     paths = [
         write_temp_output({"schema": "spore.memory_throughput.v1", "copy_s": 1, "copy_mib_s": 2}),
         write_temp_output([64, 48, 0.1, 30720, 4320]),
@@ -542,6 +543,9 @@ def self_test() -> None:
         assert compact and compact["copied_mib"] == 3072
         assert stat([3, 1, 2])["median"] == 2
         assert nested_median({"x": {"median": 4}}, "x") == 4
+        assert "s=m*1048576" in program
+        assert "<<20" not in program
+        assert len(program) <= 255
     finally:
         for path in paths:
             path.unlink(missing_ok=True)
