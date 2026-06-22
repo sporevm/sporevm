@@ -58,7 +58,7 @@ pub fn cacheByDigestPath(
         .digest = source.digest,
         .size = source.size,
     };
-    try installExpectedPath(io, allocator, cache_root, rootfs_path, artifact, .{
+    _ = try installExpectedPathAfterSourceVerified(io, allocator, cache_root, rootfs_path, artifact, .{
         .source_must_not_be_symlink = false,
         .allow_hardlink = true,
     });
@@ -84,10 +84,21 @@ pub fn installExpectedPathWithResult(
     artifact: spore.RootfsArtifactRef,
     copy_options: CopyOptions,
 ) !InstallResult {
+    try verifyPath(io, allocator, source_path, artifact, copy_options.source_must_not_be_symlink);
+    return installExpectedPathAfterSourceVerified(io, allocator, cache_root, source_path, artifact, copy_options);
+}
+
+pub fn installExpectedPathAfterSourceVerified(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    source_path: []const u8,
+    artifact: spore.RootfsArtifactRef,
+    copy_options: CopyOptions,
+) !InstallResult {
     const digest_path = try digestPath(allocator, cache_root, artifact.digest);
     const digest_dir = std.fs.path.dirname(digest_path) orelse return error.RootFSOpenFailed;
     try ensureDirPath(io, digest_dir);
-    try verifyPath(io, allocator, source_path, artifact, copy_options.source_must_not_be_symlink);
 
     if (try pathExistsNoSymlink(io, digest_path)) {
         if (!try regularFileNoSymlink(io, digest_path)) return error.RootFSDigestMismatch;
@@ -95,9 +106,8 @@ pub fn installExpectedPathWithResult(
         try verifyPath(io, allocator, digest_path, artifact, true);
         return .{ .cache_hit = true, .bytes_fetched = 0 };
     } else {
-        try copyVerifiedPath(io, allocator, source_path, digest_path, artifact, copy_options);
+        try copyVerifiedPathAfterSourceVerified(io, allocator, source_path, digest_path, artifact, copy_options);
     }
-    try verifyPath(io, allocator, digest_path, artifact, true);
     return .{ .cache_hit = false, .bytes_fetched = artifact.size };
 }
 
@@ -110,6 +120,17 @@ pub fn copyVerifiedPath(
     options: CopyOptions,
 ) !void {
     try verifyPath(io, allocator, source_path, artifact, options.source_must_not_be_symlink);
+    try copyVerifiedPathAfterSourceVerified(io, allocator, source_path, dest_path, artifact, options);
+}
+
+fn copyVerifiedPathAfterSourceVerified(
+    io: Io,
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    dest_path: []const u8,
+    artifact: spore.RootfsArtifactRef,
+    options: CopyOptions,
+) !void {
     if (options.allow_hardlink and try hardlinkVerifiedPath(io, allocator, source_path, dest_path, artifact)) return;
 
     var temp_nonce_bytes: [8]u8 = undefined;
@@ -143,8 +164,8 @@ pub fn copyVerifiedPath(
         }
     }
     if (std.c.fchmod(dest_fd, 0o444) != 0) return error.RootFSOpenFailed;
-    try verifyPath(io, allocator, temp_path, artifact, true);
     try renamePath(io, temp_path, dest_path);
+    errdefer Io.Dir.cwd().deleteFile(io, dest_path) catch {};
     try verifyPath(io, allocator, dest_path, artifact, true);
 }
 
@@ -203,6 +224,7 @@ fn hardlinkVerifiedPath(
     const source_z = try allocator.dupeZ(u8, source_path);
     const dest_z = try allocator.dupeZ(u8, dest_path);
     if (std.c.link(source_z, dest_z) != 0) return false;
+    errdefer Io.Dir.cwd().deleteFile(io, dest_path) catch {};
     if (std.c.chmod(dest_z, 0o444) != 0) return error.RootFSOpenFailed;
     try verifyPath(io, allocator, dest_path, artifact, true);
     return true;
@@ -304,6 +326,36 @@ test "digest cache installs rootfs bytes atomically and verifies final content" 
     try Io.Dir.cwd().deleteFile(io, digest_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
     try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedFromCache(io, arena, cache_root, rootfs));
+}
+
+test "install after source verification cleans up bad installed bytes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-cache-preverified-cleanup";
+    const expected_path = tmp ++ "/expected.ext4";
+    const source_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = expected_path, .data = "expected rootfs bytes" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "tampered rootfs bytes" });
+
+    const expected = try hashPath(io, arena, expected_path);
+    const artifact = spore.RootfsArtifactRef{
+        .digest = expected.digest,
+        .size = expected.size,
+    };
+    try std.testing.expectError(error.RootFSDigestMismatch, installExpectedPathAfterSourceVerified(io, arena, cache_root, source_path, artifact, .{
+        .source_must_not_be_symlink = false,
+        .allow_hardlink = true,
+    }));
+
+    const digest_path = try digestPath(arena, cache_root, artifact.digest);
+    try std.testing.expect(!try pathExistsNoSymlink(io, digest_path));
 }
 
 test "digest cache rejects unsafe existing paths" {

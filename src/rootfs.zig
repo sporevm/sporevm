@@ -24,6 +24,7 @@ const Io = std.Io;
 
 const max_rootfs_layers: usize = 512;
 pub const builder_version = "sporevm-rootfs-v3";
+const rootfs_build_profile_env = "SPOREVM_ROOTFS_BUILD_PROFILE";
 const resolver_placeholder_path = "etc/resolv.conf";
 const resolver_placeholder_bytes =
     "# SporeVM generated placeholder; --net bind-mounts the guest resolver here.\n";
@@ -610,6 +611,59 @@ pub const BuildResult = struct {
     rootfs_storage: spore.RootfsStorage,
 };
 
+const RootfsBuildProfile = struct {
+    enabled: bool,
+    total_start_ms: u64,
+
+    fn init(environ: *const std.process.Environ.Map) RootfsBuildProfile {
+        const enabled = rootfsBuildProfileEnabled(environ.get(rootfs_build_profile_env));
+        return .{
+            .enabled = enabled,
+            .total_start_ms = if (enabled) monotonicMs() else 0,
+        };
+    }
+
+    fn start(self: RootfsBuildProfile) u64 {
+        return if (self.enabled) monotonicMs() else 0;
+    }
+
+    fn phase(self: RootfsBuildProfile, name: []const u8, start_ms: u64) void {
+        if (!self.enabled) return;
+        std.debug.print("spore rootfs profile: phase={s} ms={d}\n", .{ name, monotonicMs() -| start_ms });
+    }
+
+    fn preloadPhase(self: RootfsBuildProfile, start_ms: u64, result: rootfs_cas.PreloadResult) void {
+        if (!self.enabled) return;
+        std.debug.print(
+            "spore rootfs profile: phase=rootfs_cas_preload ms={d} chunks={d} zero_chunks={d} nonzero_chunks={d} objects_written={d} object_bytes_written={d} index_bytes={d} source_verify_ms={d} chunk_scan_ms={d} object_check_ms={d} object_write_ms={d} index_build_ms={d} index_write_ms={d}\n",
+            .{
+                monotonicMs() -| start_ms,
+                result.chunk_count,
+                result.zero_chunks,
+                result.nonzero_chunks,
+                result.objects_written,
+                result.object_bytes_written,
+                result.index_bytes,
+                result.source_verify_ms,
+                result.chunk_scan_ms,
+                result.object_check_ms,
+                result.object_write_ms,
+                result.index_build_ms,
+                result.index_write_ms,
+            },
+        );
+    }
+
+    fn finish(self: RootfsBuildProfile) void {
+        self.phase("total", self.total_start_ms);
+    }
+};
+
+fn rootfsBuildProfileEnabled(value: ?[]const u8) bool {
+    const raw = value orelse return false;
+    return raw.len != 0;
+}
+
 pub fn validateTaggedImageRef(raw_ref: []const u8) !void {
     _ = try ImageTag.parse(raw_ref);
 }
@@ -889,6 +943,7 @@ const MaterializeOptions = struct {
     debugfs: []const u8,
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir: []const u8,
+    profile: RootfsBuildProfile,
 };
 
 fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: BuildOptions) !BuildResult {
@@ -903,20 +958,25 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
     init.io.random(&temp_nonce_bytes);
     const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
     const temp_dir = try std.fmt.allocPrint(allocator, "{s}/spore-rootfs-{d}-{x}", .{ temp_dir_root, temp_id, temp_nonce });
-    defer Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
+    errdefer Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
     try Io.Dir.cwd().createDirPath(init.io, temp_dir);
+    const profile = RootfsBuildProfile.init(init.environ_map);
+    const staging_start = profile.start();
     var materialize_temp = try prepareMaterializeTempDir(init.io, allocator, temp_dir);
-    defer materialize_temp.deinit(init.io);
+    errdefer materialize_temp.deinit(init.io);
+    profile.phase("staging_prepare", staging_start);
 
     const layers_dir = try std.fmt.allocPrint(allocator, "{s}/layers", .{temp_dir});
     try Io.Dir.cwd().createDirPath(init.io, layers_dir);
 
+    const resolve_start = profile.start();
     const image_source = try fetchBuildImageSource(allocator, &client, &bearer_token, opts.ref);
     const image_ref = image_source.ref;
     const manifest_bytes = image_source.manifest_bytes;
     const manifest_digest = try resolveManifestDigest(allocator, &client, &bearer_token, image_ref, opts.platform, image_ref.digest, manifest_bytes);
     const resolved_image_ref = try digestImageRef(allocator, image_ref, manifest_digest);
     const selected_manifest_bytes = try selectedManifestBytes(allocator, &client, &bearer_token, image_ref, manifest_digest, manifest_bytes);
+    profile.phase("oci_resolve_fetch", resolve_start);
 
     var manifest_parsed = try std.json.parseFromSlice(ImageManifest, allocator, selected_manifest_bytes, .{ .ignore_unknown_fields = true });
     defer manifest_parsed.deinit();
@@ -925,13 +985,16 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
     if (manifest.schemaVersion != 2) return error.UnsupportedManifestSchema;
     if (manifest.layers.len > max_rootfs_layers) return error.RootFSTooManyLayers;
 
+    const config_start = profile.start();
     if (!oci.isSha256Digest(manifest.config.digest)) return error.UnsupportedDigest;
     const config_bytes = try registry.fetchBlobBytes(allocator, &client, &bearer_token, image_ref, manifest.config.digest, manifest.config.size);
     try oci.verifyDigestBytes(manifest.config.digest, config_bytes);
     var config_parsed = try std.json.parseFromSlice(ImageConfig, allocator, config_bytes, .{ .ignore_unknown_fields = true });
     defer config_parsed.deinit();
     try validateConfigPlatform(config_parsed.value, opts.platform);
+    profile.phase("oci_config_fetch", config_start);
 
+    const layer_fetch_start = profile.start();
     const layer_files = try allocator.alloc(MaterializeLayer, manifest.layers.len);
     for (manifest.layers, 0..) |layer, i| {
         if (!oci.isSupportedLayerMediaType(layer.mediaType)) return error.UnsupportedLayerMediaType;
@@ -940,8 +1003,9 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
         try oci.verifyDigestFile(init.io, layer.digest, layer_path);
         layer_files[i] = .{ .media_type = layer.mediaType, .digest = layer.digest, .path = layer_path };
     }
+    profile.phase("oci_layer_fetch", layer_fetch_start);
 
-    return materializeRootFS(init, allocator, .{
+    const result = try materializeRootFS(init, allocator, .{
         .requested_ref = opts.ref,
         .resolved_image_ref = resolved_image_ref,
         .manifest_digest = manifest_digest,
@@ -955,7 +1019,14 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
         .debugfs = opts.debugfs,
         .metadata_rootfs_path = opts.metadata_rootfs_path,
         .temp_dir = materialize_temp.path,
+        .profile = profile,
     });
+    const cleanup_start = profile.start();
+    materialize_temp.deinit(init.io);
+    Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
+    profile.phase("temp_cleanup", cleanup_start);
+    profile.finish();
+    return result;
 }
 
 fn buildRootFSFromLayout(init: std.process.Init, allocator: std.mem.Allocator, opts: LayoutBuildOptions) !BuildResult {
@@ -965,24 +1036,31 @@ fn buildRootFSFromLayout(init: std.process.Init, allocator: std.mem.Allocator, o
     init.io.random(&temp_nonce_bytes);
     const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
     const temp_dir = try std.fmt.allocPrint(allocator, "{s}/spore-rootfs-{d}-{x}", .{ opts.temp_dir_root, temp_id, temp_nonce });
-    defer Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
+    errdefer Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
     try Io.Dir.cwd().createDirPath(init.io, temp_dir);
+    const profile = RootfsBuildProfile.init(init.environ_map);
+    const staging_start = profile.start();
     var materialize_temp = try prepareMaterializeTempDir(init.io, allocator, temp_dir);
-    defer materialize_temp.deinit(init.io);
+    errdefer materialize_temp.deinit(init.io);
+    profile.phase("staging_prepare", staging_start);
 
     if (opts.source.layers.len > max_rootfs_layers) return error.RootFSTooManyLayers;
 
+    const config_start = profile.start();
     var config_parsed = try std.json.parseFromSlice(ImageConfig, allocator, opts.source.config_bytes, .{ .ignore_unknown_fields = true });
     defer config_parsed.deinit();
     try validateConfigPlatform(config_parsed.value, opts.platform);
+    profile.phase("oci_config_parse", config_start);
 
+    const layer_plan_start = profile.start();
     const layer_files = try allocator.alloc(MaterializeLayer, opts.source.layers.len);
     for (opts.source.layers, 0..) |layer, i| {
         if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
         layer_files[i] = .{ .media_type = layer.media_type, .digest = layer.digest, .path = layer.path };
     }
+    profile.phase("oci_layer_plan", layer_plan_start);
 
-    return materializeRootFS(init, allocator, .{
+    const result = try materializeRootFS(init, allocator, .{
         .requested_ref = opts.requested_ref,
         .resolved_image_ref = opts.resolved_image_ref,
         .manifest_digest = opts.manifest_digest,
@@ -996,7 +1074,14 @@ fn buildRootFSFromLayout(init: std.process.Init, allocator: std.mem.Allocator, o
         .debugfs = opts.debugfs,
         .metadata_rootfs_path = opts.metadata_rootfs_path,
         .temp_dir = materialize_temp.path,
+        .profile = profile,
     });
+    const cleanup_start = profile.start();
+    materialize_temp.deinit(init.io);
+    Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
+    profile.phase("temp_cleanup", cleanup_start);
+    profile.finish();
+    return result;
 }
 
 const MaterializeTempDir = struct {
@@ -1074,13 +1159,16 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     if (opts.layers.len > max_rootfs_layers) return error.RootFSTooManyLayers;
 
     const layer_meta = try allocator.alloc(oci.LayerMetadata, opts.layers.len);
+    const extraction_start = opts.profile.start();
     for (opts.layers, 0..) |layer, i| {
         if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
         try tar.applyLayer(allocator, init.io, rootfs_dir, layer.path, layer.media_type, &owners, &xattrs, tar_options);
         if (try ext4.dirContentSize(init.io, rootfs_dir) > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
         layer_meta[i] = .{ .media_type = layer.media_type, .digest = layer.digest };
     }
+    opts.profile.phase("layer_extract_staging", extraction_start);
 
+    const required_dirs_start = opts.profile.start();
     try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "dev", 0o755);
     try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "proc", 0o755);
     try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "run", 0o755);
@@ -1088,21 +1176,34 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "tmp", 0o1777);
     try ensureResolverPlaceholder(allocator, init.io, rootfs_dir, &owners);
     try recordImplicitDirectoryOwnership(allocator, init.io, rootfs_dir, &owners, "");
+    opts.profile.phase("rootfs_tree_finalize", required_dirs_start);
 
     const deterministic_ext4 = ext4.Determinism.fromDigest(opts.manifest_digest);
+    const normalize_start = opts.profile.start();
     try ext4.normalizeHostTreeTimestamps(allocator, init.io, rootfs_dir, rootfs_dir_path);
+    opts.profile.phase("host_metadata_normalize", normalize_start);
 
+    const scan_start = opts.profile.start();
     const content_size = try ext4.dirContentSize(init.io, rootfs_dir);
     const inode_count = ext4.computeImageInodes(try ext4.dirEntryCount(init.io, rootfs_dir));
     const image_size = ext4.computeImageSize(content_size);
+    opts.profile.phase("ext4_size_scan", scan_start);
 
+    const create_start = opts.profile.start();
     try ext4.ensureParentDir(init.io, opts.output);
     try ext4.createEmptyFile(init.io, opts.output, image_size);
+    opts.profile.phase("ext4_create_empty", create_start);
+    const mkfs_start = opts.profile.start();
     try ext4.runMkfs(init, allocator, opts.mkfs, rootfs_dir_path, opts.output, deterministic_ext4, inode_count);
+    opts.profile.phase("mkfs_ext4", mkfs_start);
     const debugfs_script = try std.fmt.allocPrint(allocator, "{s}/debugfs-ownership.cmds", .{opts.temp_dir});
+    const debugfs_start = opts.profile.start();
     try ext4.runDebugfsFinalize(init, allocator, opts.debugfs, opts.output, debugfs_script, &owners, &xattrs, deterministic_ext4);
+    opts.profile.phase("debugfs_finalize", debugfs_start);
 
+    const blake3_start = opts.profile.start();
     const rootfs_blake3 = try ext4.blake3File(init.io, opts.output);
+    opts.profile.phase("rootfs_blake3", blake3_start);
     const rootfs_hex = try allocator.dupe(u8, &rootfs_blake3);
     const stat = try Io.Dir.cwd().statFile(init.io, opts.output, .{});
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
@@ -1111,13 +1212,18 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
         .size = stat.size,
         .format = spore.rootfs_artifact_format_ext4,
     };
-    try rootfs_cache.installExpectedPath(init.io, allocator, cache_root, opts.output, artifact, .{
+    const cache_start = opts.profile.start();
+    _ = try rootfs_cache.installExpectedPathAfterSourceVerified(init.io, allocator, cache_root, opts.output, artifact, .{
         .source_must_not_be_symlink = false,
         .allow_hardlink = true,
     });
+    opts.profile.phase("digest_cache_install", cache_start);
+    const preload_start = opts.profile.start();
     const preload_result = try rootfs_cas.preload(init.io, allocator, cache_root, artifact.digest, rootfs_cas.default_chunk_size);
+    opts.profile.preloadPhase(preload_start, preload_result);
     const rootfs_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
 
+    const metadata_start = opts.profile.start();
     try ext4.ensureParentDir(init.io, opts.metadata);
     try rejectMetadataOutputAlias(init.io, opts.output, opts.metadata);
     const metadata = RootFSMetadata{
@@ -1139,8 +1245,15 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     };
     const metadata_json = try std.json.Stringify.valueAlloc(allocator, metadata, .{ .whitespace = .indent_2 });
     try ext4.writeFileAtPath(init.io, opts.metadata, metadata_json);
+    opts.profile.phase("metadata_write", metadata_start);
 
     return .{ .rootfs_blake3 = rootfs_blake3, .rootfs_storage = rootfs_storage };
+}
+
+fn monotonicMs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
 fn resolveManifestDigest(
@@ -1822,6 +1935,12 @@ test "build options accept tag image refs" {
     defer allocator.free(parsed.metadata);
     try std.testing.expectEqualStrings("registry.example/repo:latest", parsed.ref);
     try std.testing.expectEqualStrings("rootfs.ext4.json", parsed.metadata);
+}
+
+test "rootfs build profile env is opt-in" {
+    try std.testing.expect(!rootfsBuildProfileEnabled(null));
+    try std.testing.expect(!rootfsBuildProfileEnabled(""));
+    try std.testing.expect(rootfsBuildProfileEnabled("1"));
 }
 
 test "resolve options parse image tag and platform" {
