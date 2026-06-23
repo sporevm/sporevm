@@ -55,7 +55,7 @@ resolve_macos_sdkroot() {
 
 build_target() {
   local target_key="$1"
-  local zig_target asset_dir archive_name prefix staging binary initrd
+  local zig_target asset_dir archive_name prefix staging binary
 
   case "${target_key}" in
     linux-arm64)
@@ -78,23 +78,20 @@ build_target() {
   prefix="${WORK_DIR}/${target_key}/prefix"
   staging="${WORK_DIR}/${asset_dir}"
   binary="${prefix}/bin/spore"
-  initrd="${prefix}/share/sporevm/minimal-exec-initrd.cpio"
 
   echo "--- :zig: Build ${target_key}"
   zig build -Dtarget="${zig_target}" --release=safe --prefix "${prefix}"
 
   [[ -x "${binary}" ]] || die "missing built binary: ${binary}"
-  [[ -f "${initrd}" ]] || die "missing built initrd: ${initrd}"
 
-  mkdir -p "${staging}/share/sporevm"
-  install -m 0755 "${binary}" "${staging}/spore"
+  mkdir -p "${staging}/bin"
+  install -m 0755 "${binary}" "${staging}/bin/spore"
   install -m 0644 "${REPO_ROOT}/LICENSE" "${staging}/LICENSE"
   install -m 0644 "${REPO_ROOT}/README.md" "${staging}/README.md"
-  install -m 0644 "${initrd}" "${staging}/share/sporevm/minimal-exec-initrd.cpio"
 
-  file "${staging}/spore"
+  file "${staging}/bin/spore"
   if [[ "${target_key}" == "darwin-arm64" ]]; then
-    codesign -dv --verbose=2 "${staging}/spore" >/dev/null
+    codesign -dv --verbose=2 "${staging}/bin/spore" >/dev/null
   fi
 
   echo "--- :package: Archive ${archive_name}"

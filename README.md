@@ -1,384 +1,298 @@
-# 🍄 SporeVM
+# SporeVM
 
-SporeVM is a small aarch64 virtual machine monitor for forkable Linux microVM
-checkpoints. The spore is the product: a sealed checkpoint with normalized
-machine state, device state, content-addressed memory chunks, and a platform
-contract that fails closed when a host cannot restore it honestly.
+SporeVM is an aarch64 virtual machine monitor for forkable Linux microVM
+checkpoints. A spore is a sealed VM checkpoint: normalized machine state,
+device state, verified memory chunks, optional rootfs state, and a platform
+contract that fails closed when a host cannot restore it.
 
-The first useful shape is warm CI fan-out: start the expensive runtime once,
-capture the VM at a quiescent point, then fork children without copying all of
-RAM.
+The 1.0 surface is aimed at warm CI and agent fan-out:
 
-The arm64 bet is deliberate. Apple Silicon and AWS Graviton are the useful
-overlap; x86 platform archaeology can wait. One Zig codebase targets:
+1. Start a runtime once.
+2. Capture it at a useful point.
+3. Fork cheap child spores.
+4. Resume the children on compatible aarch64 hosts without copying all RAM for
+   every child.
 
-- KVM on Linux/aarch64
-- Hypervisor.framework on Apple Silicon macOS
+SporeVM targets the useful arm64 overlap:
 
-Both backends expose the same fixed guest-visible board: RAM layout, interrupt
-wiring, boot contract, virtio-mmio devices, and the SporeVM generation device.
-Cross-backend restore is a useful diagnostic; identical-host-class fork/fan-out
-is the product path.
+- KVM on Linux/aarch64.
+- Hypervisor.framework on Apple Silicon macOS.
 
-v0 spores do not capture arbitrary block devices yet. Product resume can
-reattach verified immutable rootfs artifacts from the local content cache, and
-rootfs-backed captures can record writable changes as sealed content-addressed
-disk layers. Bundle distribution carries those rootfs-bound disk layers; general
-disk-device state remains follow-up work.
+Both backends expose the same small guest-visible board: fixed RAM layout,
+interrupt wiring, boot contract, virtio-mmio console, blk, net, vsock, rng, and
+the SporeVM generation device. Cross-backend restore is diagnostic. The product
+path is same-host-class capture, fork, distribution, and resume.
 
-The target lifecycle property is that common operations avoid scaling with RAM
-size:
+## Install
 
-- **Suspend** is a pause plus a small dirty tail flush.
-- **Fork** is a metadata write.
-- **Resume** is bounded by the working set, not total guest RAM.
+Download the Linux ARM64 or macOS ARM64 archive from
+[GitHub releases](https://github.com/buildkite/sporevm/releases/latest):
 
-## Design Shape
+```bash
+asset=spore_Darwin_arm64 # or spore_Linux_arm64
+tar -xzf "$asset.tar.gz"
+"$asset/bin/spore" version
+```
 
-- **One boring board.** Linux sees the same intentionally small aarch64 machine
-  on KVM and HVF. Portable here means "restore only when the host satisfies this
-  contract", not "run any guest on any machine".
-- **Fork is mostly paperwork.** Child spores point at the same verified chunks
-  and get their own identity. On same-host paths, a trusted RAM backing can be
-  mapped privately so reads share pages and writes diverge.
-- **Forked guests know they forked.** The generation device gives the guest a
-  small hook for identity, entropy, clock, and shard fixups after resume.
+Use `spore_Linux_arm64` on Linux. Add `$asset/bin` to `PATH`, or move the
+extracted directory wherever you keep standalone tools.
 
-## Status
-
-SporeVM is early, pre-release software. Breaking changes are expected before
-1.0. The plan of record is
-[docs/plans/foundation.md](docs/plans/foundation.md).
-
-Current `main` can:
-
-- boot the pinned aarch64 Linux kernel on HVF and KVM;
-- inspect host platform facts with `spore host-info`;
-- summarize a spore manifest with `spore inspect <spore-dir>`;
-- run one explicit argv request in a throwaway VM with `spore run`;
-- run one explicit argv request from a completed base spore with `spore run --from`;
-- stream fresh run stdout/stderr and exit with the guest command status;
-- capture a `spore run` on command exit or on a host signal with `--capture`;
-- record local writable rootfs changes from `spore run --image ... --capture`
-  as sealed disk layers;
-- mint metadata-only child spores with `spore fork`;
-- resume forked child directories with prefixed output using `spore fanout`;
-- resume one diskless or verified immutable-rootfs spore with `spore resume`;
-- pack and unpack local chunkpack bundles with `spore pack` / `spore unpack`;
-- carry rootfs artifacts and sealed writable disk layers through
-  `spore pack`, `spore unpack`, `spore push`, and digest-pinned `spore pull`;
-- build deterministic ext4 rootfs images from OCI images with
-  `spore rootfs build`;
-- run from an explicit read-only rootfs with `spore run --rootfs`;
-- build or reuse a cached rootfs directly from an OCI ref with
-  `spore run --image`;
-- create, exec, list, and remove named VMs through one per-VM monitor process on
-  HVF and KVM;
-- suspend a diskless named VM and resume it under a new name on local HVF.
-
-Named lifecycle monitor mode is experimental and requires
-`SPOREVM_EXPERIMENTAL_MONITOR=1`. It supports local HVF and Linux/aarch64 KVM
-for create, exec, list, and remove. Disk-backed lifecycle suspend/resume
-remains follow-up work. The backend smoke harnesses still exercise lower-level
-capture paths directly.
-
-Current active work after the v0.1.0 baseline is concentrated in disk
-performance guardrails, disk-backed named lifecycle suspend/resume, and
-cross-backend restore diagnostics.
-
-## Development
+## Build from source
 
 Tooling is pinned with [mise](https://mise.jdx.dev):
 
 ```bash
 mise install
 mise run check
-mise run smoke
-```
-
-Useful task split:
-
-```bash
-mise run test
-mise run build
 mise run install
-mise run smoke:lifecycle
-mise run smoke:run
-mise run smoke:run-file-locking
-mise run smoke:run-cgroup
-mise run smoke:run-net-config
-mise run smoke:run-net-dns
-mise run smoke:run-capture
-mise run smoke:counter-fanout
-mise run smoke:rootfs-fanout
-mise run smoke:live-rootfs-fanout
-mise run smoke:writable-rootfs
-mise run benchmark:ci
-mise run benchmark:comparison
 ```
 
 `mise run check` runs unit tests, the product build, and diff hygiene.
-`mise run install` builds an optimized `spore` and installs it into `~/bin`,
-with runtime assets under `~/share/sporevm`.
-`mise run smoke` builds once, then runs product run, run-capture, and resume
-smokes. `smoke:lifecycle` checks named create, repeated exec, list, and remove
-on the selected backend. `smoke:run-file-locking` checks that the managed run
-kernel supports guest `flock(2)` behavior needed by Docker and containerd volume
-metadata. `smoke:run-cgroup` checks that the run guest mounts writable cgroup2
-at `/sys/fs/cgroup`, which Docker needs before daemon startup. `smoke:run-net-config` checks the experimental
-`spore run --net` static guest link setup, and `smoke:run-net-dns` checks DNS
-proxying through the managed gateway. `smoke:counter-fanout` and
-`smoke:rootfs-fanout` are opt-in demo smokes; the rootfs fan-out smoke builds a
-published Ruby OCI image and runs fresh commands in forked children in parallel.
-`smoke:live-rootfs-fanout` captures an already-running Ruby rootfs workload and
-checks resumed children can discover their distinct fan-out identity.
-`smoke:writable-rootfs` verifies local writable rootfs disk layers across
-capture, fork divergence, bundle pack/unpack, and `run --from`.
+`mise run install` installs an optimized `spore` into `~/bin`.
+Source builds require `cpio` in `PATH` so the minimal exec initrd can be
+generated and embedded into the binary.
 
-`zig build` installs the minimal exec initrd used by `spore run`, so `cpio`
-must be available in `PATH`.
+For local iteration:
 
-Releases are tag driven. `mise run release` runs the local checks, computes the
-next semantic version from conventional commits with `svu` unless
-`SPOREVM_RELEASE_VERSION=vX.Y.Z` is set, verifies `src/root.zig` matches that
-version, and pushes the tag. The Buildkite tag build builds Linux ARM64 and
-macOS ARM64 archives in platform-specific jobs, then a publish job downloads
-those artifacts, writes `checksums.txt`, and uploads the GitHub release assets.
-The pipeline must build tags and provide `SPOREVM_GITHUB_RELEASE_TOKEN` to the
-release job. Pre-1.0 releases are published as GitHub prereleases; 1.0 and
-later releases are published as latest releases. Use `mise run release:snapshot`
-to build the release archives locally without publishing.
+```bash
+mise run build
+zig-out/bin/spore version
+```
 
-Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).
-`mise run benchmark:ci` writes short cold/warm TTI JSONL, a summary JSON, and
-logs under `zig-cache/sporevm-benchmarks/`. The Buildkite post-merge benchmark
-step defaults to `benchmark:comparison` for the heavier
-distribution/writable-rootfs matrix.
-
-KVM work needs an aarch64 Linux host with KVM. Hypervisor.framework work needs
-an Apple Silicon Mac on macOS 15 or newer.
-
-## Product CLI
+## Run a command
 
 Run one command in a throwaway VM:
 
 ```bash
-zig-out/bin/spore run -- /bin/writeout
+spore run -- /bin/writeout
 ```
 
-`spore run` defaults to the managed SporeVM run kernel and the minimal exec
-initrd installed by `zig build` or `mise run install`. The managed kernel is
-downloaded by `spore` itself, SHA256-verified, checked against the release
-`.config` for Docker-adjacent runtime features, then cached under the platform
-cache directory. Override the boot assets with `--kernel` and `--initrd`, or set
-`SPOREVM_KERNEL_IMAGE` and `SPOREVM_RUN_INITRD`.
+`spore run` uses the managed SporeVM run kernel and the embedded minimal exec
+initrd. On first use it downloads the managed kernel, verifies it, checks the
+release kernel config for required runtime features, then caches it under the
+platform cache directory.
 
-Pass `--debug` before the command, for example `spore --debug run ...`, to show
-verbose VMM setup and restore logs.
-
-The minimal agent streams command stdout and stderr over a small framed vsock
-protocol. The host forwards those streams and exits with the guest command
-status.
-
-Run one command from a completed base spore:
+Override boot assets when needed:
 
 ```bash
-zig-out/bin/spore run --from /tmp/run.spore -- /bin/writeout
+spore run --kernel Image --initrd root.cpio -- /bin/writeout
+```
+
+Use `spore --debug run ...` for verbose VMM setup and restore logs.
+
+## Run from an OCI image
+
+Build or reuse a cached ext4 rootfs from an OCI reference, then run an explicit
+argv inside it:
+
+```bash
+spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
+```
+
+`--image` applies OCI `Env` and `WorkingDir` when present. It does not apply
+OCI `Entrypoint`, `Cmd`, or `User`; the command after `--` is always the
+command SporeVM runs.
+
+Build a reusable rootfs artifact explicitly:
+
+```bash
+spore rootfs build docker.io/library/alpine:3.20 \
+  --platform linux/arm64 \
+  --output alpine.ext4
+
+spore run --rootfs alpine.ext4 -- /bin/echo hi
+```
+
+Use `spore rootfs import-oci ... --ref local/name:tag` for local Docker buildx
+OCI layouts that have not been pushed to a registry. Set
+`SPOREVM_ROOTFS_CACHE_DIR` to override the rootfs cache.
+
+## Networked runs
+
+SporeVM-managed networking is explicit:
+
+```bash
+spore run --net --allow-host example.com \
+  --image docker.io/library/alpine:3.20 \
+  -- /bin/wget -qO- https://example.com
+```
+
+Use `--allow-host` or `--allow-cidr` to open egress beyond the built-in deny
+floor. Captured network policy is replayed by `spore run --from`; omit `--net`
+and allow flags on resumed runs.
+
+## Capture and resume
+
+Capture a run when the command exits:
+
+```bash
+spore run --image docker.io/library/alpine:3.20 \
+  --capture /tmp/base.spore \
+  -- /bin/true
+```
+
+Run another command from that completed base spore:
+
+```bash
+spore run --from /tmp/base.spore -- /bin/echo resumed
 ```
 
 `--from` resumes the spore, attaches any verified immutable rootfs artifact and
-sealed writable disk chain recorded in the manifest, sends the argv after `--`
-to the restored exec agent, streams stdout/stderr, and exits with the command
-status. It is mutually
-exclusive with fresh boot inputs such as `--kernel`, `--initrd`, `--rootfs`, and
-`--image`; the RAM size comes from the spore manifest. The restored guest must be
-able to accept a fresh exec session. Signal-captured running workloads remain a
-`spore resume`, `spore fork`, or `spore fanout` path until the guest-agent
-protocol can reconnect to or multiplex active commands.
+sealed writable disk chain recorded in the manifest, sends the new argv to the
+restored exec agent, streams stdout and stderr, and exits with the guest command
+status.
 
-Keep one named VM alive and run more than one command in it:
+Capture a running workload on a host signal:
 
 ```bash
-export SPOREVM_EXPERIMENTAL_MONITOR=1 SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
-zig-out/bin/spore create bench-1
-zig-out/bin/spore exec bench-1 -- /bin/writeout
-zig-out/bin/spore exec bench-1 -- /bin/true
-zig-out/bin/spore rm bench-1
-```
-
-The lifecycle registry lives under `SPOREVM_RUNTIME_DIR`, then
-`$XDG_RUNTIME_DIR/sporevm`, then a private temp fallback. Names are explicit and
-restricted to a conservative path-safe set. `spore create --image` and
-`spore create --rootfs` reuse the same read-only rootfs path as `spore run`.
-
-Checkpoint a diskless named VM and resume it under a new name:
-
-```bash
-export SPOREVM_EXPERIMENTAL_MONITOR=1 SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
-zig-out/bin/spore create snap-1
-zig-out/bin/spore exec snap-1 -- /bin/true
-zig-out/bin/spore suspend snap-1 --out /tmp/snap.spore
-zig-out/bin/spore resume /tmp/snap.spore --name snap-2
-zig-out/bin/spore exec snap-2 -- /bin/writeout
-zig-out/bin/spore rm snap-2
-```
-
-Capture a run on command exit or on a host signal:
-
-```bash
-zig-out/bin/spore run \
-  --capture /tmp/run.spore \
+spore run \
+  --capture /tmp/live.spore \
   --capture-on USR1 \
   -- /bin/sleeper &
 run_pid=$!
 
 kill -USR1 "$run_pid"
 wait "$run_pid"
-zig-out/bin/spore resume /tmp/run.spore
+spore resume /tmp/live.spore
 ```
 
-With plain `--capture DIR`, `spore run` captures after the guest command exits
-and returns the guest status. With `--capture-on USR1` or another host signal,
-the first matching signal writes a spore and exits zero; a second matching
-signal exits 130. Add `--continue-after-capture` to keep the original run alive
-after a signal-triggered snapshot.
+With plain `--capture DIR`, SporeVM captures after guest command exit. With
+`--capture-on SIGNAL`, the first matching host signal writes the spore and
+exits zero. Add `--continue-after-capture` to keep the original run alive after
+a signal-triggered capture.
+
+## Fork and fan out
 
 Fork an existing spore:
 
 ```bash
-zig-out/bin/spore fork /tmp/run.spore --count 100 --out /tmp/forks
+spore fork /tmp/base.spore --count 100 --out /tmp/forks
 ```
 
-Children are named `000000`, `000001`, and so on, and share the parent's chunk
-store.
+Children are named `000000`, `000001`, and so on. They share the parent chunk
+store and get distinct generation metadata.
 
-Resume forked children concurrently with prefixed output:
+Resume forked children locally with prefixed output:
 
 ```bash
-zig-out/bin/spore fanout /tmp/forks --parallel --for 20s
+spore fanout /tmp/forks --parallel --for 20s
 ```
 
-See [docs/fanout.md](docs/fanout.md) for the local child identity contract.
+See [docs/fanout.md](docs/fanout.md) for the child identity contract.
 
-Resume one captured or forked spore:
+## Pack and distribute
+
+Pack a spore, optionally with forked children:
 
 ```bash
-zig-out/bin/spore resume /tmp/forks/000000
+spore pack /tmp/base.spore --children /tmp/forks --out /tmp/base.bundle
 ```
 
-Product resume streams the restored guest console and defaults RAM size from
-the spore manifest. Spores captured from `spore run --image` record the
-immutable rootfs content digest and resume by reopening the verified
-content-addressed cache entry. If the spore also has sealed writable disk
-layers, resume verifies the layer indexes and disk objects before attaching the
-layered root disk. General block-device restore is still unsupported.
-
-Pack and unpack a spore:
+Unpack or pull one selected child before resume:
 
 ```bash
-zig-out/bin/spore pack /tmp/run.spore --out /tmp/run.bundle
-zig-out/bin/spore unpack /tmp/run.bundle --out /tmp/run.unpacked
+spore unpack /tmp/base.bundle --child 000042 --out /tmp/child.spore
+spore resume /tmp/child.spore
 ```
 
-Both commands report a `bundle_digest` for cache identity. If the manifest has
-sealed writable disk layers, bundle materialization carries the referenced layer
-indexes and disk objects alongside memory chunks and rootfs artifacts.
-
-## Rootfs Images
-
-Build a deterministic ext4 rootfs from an OCI image:
+Remote pulls are digest-pinned:
 
 ```bash
-zig-out/bin/spore rootfs build docker.io/library/alpine:3.20 \
-  --platform linux/arm64 \
-  --output alpine.ext4
+spore pull s3://bucket/path/base.bundle@sha256:<bundle-digest> \
+  --child 000042 \
+  --out /tmp/child.spore
 ```
 
-Run from that rootfs read-only:
+`spore pack`, `spore unpack`, `spore push`, and `spore pull` carry memory
+chunks, immutable rootfs artifacts, chunked rootfs storage, and sealed writable
+disk layers. Bytes from local caches, bundles, S3, and HTTP(S) peers are
+verified before use.
+
+## Named lifecycle
+
+Named VM lifecycle commands are available, but they are not part of the default
+stable CLI surface. Opt in explicitly:
 
 ```bash
-zig-out/bin/spore run --rootfs alpine.ext4 -- /bin/echo hi
+export SPOREVM_EXPERIMENTAL_MONITOR=1
+export SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
+
+spore create bench-1 --image docker.io/library/alpine:3.20
+spore exec bench-1 -- /bin/echo hi
+spore ls
+spore rm bench-1
 ```
 
-Or let `spore run` build and reuse a cached rootfs from an OCI reference:
+Monitor processes run with a denied-child-exec jail on macOS and Linux. The
+broader lifecycle surface remains experimental while disk-backed lifecycle
+suspend/resume and jail policy mature.
+
+## What 1.0 supports
+
+- One-shot `spore run`, signal capture, `spore resume`, `spore run --from`,
+  `spore fork`, and local `spore fanout`.
+- Rootfs-backed runs from OCI images or explicit ext4 files.
+- Manifest-attached immutable rootfs identity, chunked rootfs storage, and
+  sealed writable rootfs disk layers for `spore run --image ... --capture`.
+- Local bundle pack/unpack and digest-pinned S3 or HTTP(S) pull/push paths for
+  selected children.
+- Managed kernel download and verification for the default run path.
+- Spore-managed guest networking for DNS, HTTP/HTTPS, persisted egress policy,
+  and hard-floor egress denial.
+
+Known limits:
+
+- Hosts and guests are aarch64 only.
+- Cross-backend restore is diagnostic, not the product path.
+- General block-device state is out of scope. Rootfs-bound writable state is
+  represented as sealed disk layers.
+- Named lifecycle monitor commands require `SPOREVM_EXPERIMENTAL_MONITOR=1`.
+- SporeVM is a VMM isolation boundary, but it does not claim hardened
+  public-cloud multi-tenant isolation.
+
+## Validation
+
+Most local changes should start here:
 
 ```bash
-zig-out/bin/spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
+mise run check
+mise run smoke
 ```
 
-For local Docker buildx output without a registry push, import an OCI layout
-with `spore rootfs import-oci ... --ref local/name:tag`, then run with
-`spore run --image local/name:tag`.
-
-`--image` still runs the explicit argv after `--`. It applies OCI image `Env`
-and `WorkingDir` when present, but does not apply OCI Entrypoint, Cmd, or User.
-Set `SPOREVM_ROOTFS_CACHE_DIR` to override the cache directory.
-
-On default macOS APFS, SporeVM uses managed case-sensitive staging for OCI
-rootfs materialization; the final rootfs cache remains ordinary ext4/json files.
-
-When combined with `--capture`, `--image` records immutable rootfs identity in
-the spore manifest and stores any writable rootfs changes as sealed disk layers.
-`spore resume` later verifies the cached rootfs bytes by digest, then verifies
-any disk layer indexes and disk objects before attaching the root disk.
-`--rootfs PATH` still works for ordinary runs, but `--rootfs PATH --capture` is
-rejected until there is an import/preload command that can record portable rootfs
-identity.
-
-Exercise the rootfs capture/fork/resume path with:
+Useful focused checks:
 
 ```bash
+mise run smoke:run
+mise run smoke:run-capture
 mise run smoke:rootfs-fanout
+mise run smoke:writable-rootfs
+mise run smoke:run-net-dns
+mise run smoke:monitor-jail
 ```
 
-See [docs/rootfs.md](docs/rootfs.md) for tag resolution, metadata, and ext4
-tooling details.
+Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).
+The release notes in [docs/releases/v1.0.0.md](docs/releases/v1.0.0.md) list
+the A1/KVM release gate.
 
-## Advanced Validation
+## Release
 
-Most local validation should use `mise run smoke`. Extra product-shaped checks
-are available when a change touches fan-out or rootfs behavior:
+Releases are tag driven:
 
-- `zig build hvf-boot` / `zig build kvm-boot`: build backend boot and capture
-  harnesses.
-- `zig build hvf-gic-probe`: probe Hypervisor.framework GIC state support.
-- `scripts/smoke-restore-leg.sh`: split capture/resume legs for backend
-  debugging.
-- `mise run smoke:run-file-locking`: verify guest `flock(2)` behavior through
-  the default `spore run` boot path.
-- `mise run smoke:run-cgroup`: verify writable guest cgroup2 behavior through
-  the default `spore run` boot path.
-- `mise run smoke:run-net-config`: verify the experimental `spore run --net`
-  static guest address, route, resolver, and gateway ARP setup.
-- `mise run smoke:run-net-dns`: verify `spore run --net` DNS proxying with the
-  minimal initrd `/bin/nslookup` helper.
-- `mise run smoke:counter-fanout`: exercise diskless capture, fork, and
-  parallel product resume fan-out.
-- `mise run smoke:rootfs-fanout`: exercise OCI rootfs capture, fork, and
-  parallel `spore run --from` child execution.
-- `mise run smoke:live-rootfs-fanout`: exercise live OCI rootfs capture, fork,
-  and resumed child identity discovery.
-- `mise run smoke:writable-rootfs`: exercise writable rootfs layer capture,
-  fork divergence, bundle pack/unpack, append, and replay through
-  `spore run --from`.
-- `mise run benchmark:writable-rootfs`: record JSONL timings for writable
-  rootfs fresh COW capture, sealed-layer append, and sealed-layer replay.
-- `scripts/smoke-run-oci-rootfs.sh`: exercise an explicit OCI/rootfs command.
+```bash
+SPOREVM_RELEASE_VERSION=vX.Y.Z mise run release
+```
 
-`scripts/benchmark-kvm-dirty-tracking.sh` remains the lower-level measurement
-path for KVM dirty-log and HVF write-protect tracking until those metrics are
-available through product or lifecycle capture paths. It uses the backend boot
-harnesses from `zig build hvf-boot` / `zig build kvm-boot`.
-
-`zig build hvf-gic-probe` remains as a host capability probe for
-Hypervisor.framework GIC state. New validation should be product-shaped unless
-it proves or measures a backend capability that cannot be reached through the
-CLI.
+`mise run release` runs local checks, verifies `src/root.zig` matches the target
+version, and pushes the tag. The Buildkite tag build creates Linux ARM64 and
+macOS ARM64 archives, writes `checksums.txt`, and publishes the GitHub release.
+Use `mise run release:snapshot` to build release archives locally without
+publishing.
 
 ## Security
 
-SporeVM is an isolation boundary. Read [SECURITY.md](SECURITY.md) before
-touching virtqueue parsing, manifest decoding, or guest memory access.
+Read [SECURITY.md](SECURITY.md) before changing virtqueue parsing, manifest or
+bundle decoding, guest memory access, rootfs materialization, or monitor control
+paths.
 
 ## License
 

@@ -1,7 +1,7 @@
 # Minimal Exec Initrd
 
-These sources build the small SporeVM guest control plane installed as
-`share/sporevm/minimal-exec-initrd.cpio`.
+These sources build the small SporeVM guest control plane embedded into the
+`spore` binary.
 
 The `agent.c` binary runs as `/init`, listens for the host's run request over
 vsock, mounts an optional rootfs read-only or read-write based on the kernel

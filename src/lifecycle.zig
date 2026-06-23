@@ -37,7 +37,7 @@ const create_usage =
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --kernel Image          Kernel Image path
-    \\  --initrd root.cpio      Initrd path
+    \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)

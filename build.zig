@@ -19,6 +19,21 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .link_libc = true,
     });
+    const minimal_exec_assets = b.addSystemCommand(&.{
+        "bash",
+        "-c",
+        \\set -euo pipefail
+        \\scripts/make-minimal-exec-initrd.sh "$1"
+        \\printf '%s\n' 'pub const minimal_exec_initrd = @embedFile("minimal-exec-initrd.cpio");' >"$2"
+        ,
+        "sporevm-initrd-assets",
+    });
+    _ = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.cpio");
+    const minimal_exec_initrd_module = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.zig");
+    mod.addAnonymousImport("run_assets", .{
+        .root_source_file = minimal_exec_initrd_module,
+    });
+
     const zmoltcp_dep = b.dependency("zmoltcp", .{
         .target = target,
         .optimize = optimize,
@@ -46,13 +61,6 @@ pub fn build(b: *std.Build) void {
     });
     const install_exe = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&install_exe.step);
-
-    const minimal_exec_initrd = b.addSystemCommand(&.{
-        "bash",
-        "scripts/make-minimal-exec-initrd.sh",
-        b.getInstallPath(.prefix, "share/sporevm/minimal-exec-initrd.cpio"),
-    });
-    b.getInstallStep().dependOn(&minimal_exec_initrd.step);
 
     if (target_is_hvf and host_is_hvf) {
         const sign_spore = b.addSystemCommand(&.{

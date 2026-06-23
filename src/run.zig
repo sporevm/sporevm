@@ -21,6 +21,7 @@ const net_gateway = @import("net_gateway.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_mod = @import("rootfs.zig");
+const run_assets = @import("run_assets");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const virtio_blk = @import("virtio/blk.zig");
@@ -38,7 +39,7 @@ const max_guest_env_len = 255;
 const max_guest_working_dir_len = 255;
 const max_guest_request_len = 8191;
 const max_guest_port = 65535;
-const default_run_initrd_name = "minimal-exec-initrd.cpio";
+const embedded_run_initrd = run_assets.minimal_exec_initrd;
 const default_kernel_repository = "buildkite/cleanroom-kernels";
 const default_kernel_release = "v0.5.2";
 const default_kernel_version = "6.1.155";
@@ -86,7 +87,7 @@ pub const Backend = enum {
 pub const Options = struct {
     backend: Backend = .auto,
     kernel_path: []const u8,
-    initrd_path: []const u8,
+    initrd_path: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
     rootfs: ?spore.Rootfs = null,
     disk: ?spore.Disk = null,
@@ -338,7 +339,7 @@ const SharedOptions = struct {
         self: SharedOptions,
         backend: Backend,
         kernel_path: []const u8,
-        initrd_path: []const u8,
+        initrd_path: ?[]const u8,
         rootfs_path: ?[]const u8,
         rootfs: ?spore.Rootfs,
         command: []const []const u8,
@@ -391,7 +392,7 @@ const cli_usage =
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --kernel Image          Kernel Image path (default: managed SporeVM run kernel)
-    \\  --initrd root.cpio      Initrd path (default: installed minimal exec initrd)
+    \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
     \\  --from DIR              Resume from an existing spore, then run argv
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs, then run from it
@@ -607,7 +608,7 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
         const rootfs = try resumeRootfsForRun(allocator, manifest.value);
         const disk = try resumeDiskForRun(allocator, manifest.value);
         const network_options = try networkOptionsFromManifest(allocator, manifest.value.network);
-        var opts = parsed.shared.completeWithAssets(parsed.backend, "", "", null, rootfs, parsed.command, true);
+        var opts = parsed.shared.completeWithAssets(parsed.backend, "", null, null, rootfs, parsed.command, true);
         opts.disk = disk;
         opts.resume_dir = spore_dir;
         opts.memory = runMemoryFromManifest(manifest.value);
@@ -629,7 +630,7 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
         .record_artifact = parsed.capture_path != null,
     });
     const kernel_path = parsed.shared.kernel_path orelse try resolveDefaultKernelPath(init, allocator);
-    const initrd_path = parsed.shared.initrd_path orelse try resolveDefaultInitrdPath(init, allocator);
+    const initrd_path = try resolveConfiguredInitrdPath(init, parsed.shared.initrd_path);
     var opts = parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs.path, rootfs.rootfs, parsed.command, true);
     opts.guest_env = rootfs.guest_env;
     opts.guest_working_dir = rootfs.guest_working_dir;
@@ -1111,23 +1112,15 @@ pub fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Alloc
     };
 }
 
-pub fn resolveDefaultInitrdPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+pub fn resolveConfiguredInitrdPath(init: std.process.Init, cli_path: ?[]const u8) !?[]const u8 {
+    if (cli_path) |path| return path;
     if (init.environ_map.get("SPOREVM_RUN_INITRD")) |path| {
         if (!try readablePath(init.io, path)) {
             failRunSetup("spore run: SPOREVM_RUN_INITRD not found: {s}", .{path});
         }
         return path;
     }
-
-    const prefix = try installPrefixPath(init, allocator);
-    const path = try defaultInitrdPathFromPrefix(allocator, prefix);
-    if (!try readablePath(init.io, path)) {
-        failRunSetup(
-            "spore run: default initrd not found at {s}; run 'mise run build', pass --initrd, or set SPOREVM_RUN_INITRD",
-            .{path},
-        );
-    }
-    return path;
+    return null;
 }
 
 fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
@@ -1440,15 +1433,11 @@ fn chmodFileWritable(allocator: std.mem.Allocator, path: []const u8) !void {
     if (std.c.chmod(pathz, 0o644) != 0) return error.ChmodFailed;
 }
 
-fn defaultInitrdPathFromPrefix(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
-    return std.fs.path.join(allocator, &.{ prefix, "share", "sporevm", default_run_initrd_name });
-}
-
-fn installPrefixPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
-    const exe_dir = try std.process.executableDirPathAlloc(init.io, allocator);
-    return std.fs.path.dirname(exe_dir) orelse {
-        failRunSetup("spore run: cannot resolve install prefix from executable directory {s}", .{exe_dir});
-    };
+fn loadRunInitrd(init: std.process.Init, allocator: std.mem.Allocator, path: ?[]const u8) ![]const u8 {
+    if (path) |initrd_path| {
+        return try std.Io.Dir.cwd().readFileAlloc(init.io, initrd_path, allocator, .limited(max_file_size));
+    }
+    return embedded_run_initrd;
 }
 
 fn readablePath(io: Io, path: []const u8) !bool {
@@ -1516,7 +1505,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
     const kernel_ms = monotonicMs() -| kernel_start;
     const initrd_start = monotonicMs();
-    const initrd: ?[]const u8 = if (resuming) null else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
+    const initrd: ?[]const u8 = if (resuming) null else try loadRunInitrd(init, allocator, opts.initrd_path);
     const initrd_ms = monotonicMs() -| initrd_start;
     const disk_start = monotonicMs();
     var runtime_disk = try openRuntimeDisk(init, allocator, .{
@@ -1641,7 +1630,7 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
 
     const backend = try resolveBackend(opts.backend);
     const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
-    const initrd = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
+    const initrd = try loadRunInitrd(init, allocator, opts.initrd_path);
     var runtime_disk = try openRuntimeDisk(init, allocator, .{
         .rootfs_path = opts.rootfs_path,
         .rootfs = opts.rootfs,
@@ -2801,11 +2790,8 @@ test "run cmdline marks network mode" {
     try std.testing.expect(std.mem.indexOf(u8, with_network, "spore_net=1") != null);
 }
 
-test "run default asset paths derive from install prefix" {
-    const allocator = std.testing.allocator;
-    const initrd = try defaultInitrdPathFromPrefix(allocator, "/repo/zig-out");
-    defer allocator.free(initrd);
-    try std.testing.expectEqualStrings("/repo/zig-out/share/sporevm/minimal-exec-initrd.cpio", initrd);
+test "run embeds default initrd" {
+    try std.testing.expect(embedded_run_initrd.len > 0);
 }
 
 test "managed run kernel asset names validate input" {

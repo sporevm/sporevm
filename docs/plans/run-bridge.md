@@ -52,7 +52,8 @@ When kernel or initrd are omitted, `spore run` resolves:
   `SPOREVM_KERNEL_IMAGE` as an explicit local override, with managed downloads
   requiring the release `.config` to include the run-kernel Docker-adjacent
   options;
-- initrd: the installed minimal exec initrd, honoring `SPOREVM_RUN_INITRD`.
+- initrd: the embedded minimal exec initrd, honoring `SPOREVM_RUN_INITRD` as an
+  explicit local override.
 
 Fresh `spore run` streams typed stdout/stderr frames over one host-initiated
 vsock connection and exits with the guest command status. The old product
@@ -126,8 +127,8 @@ mint child spores with `spore fork`, then resume them individually or through
   assets, including the run-kernel `.config` sidecar.
 - The minimal initrd mounts cgroup2 at `/sys/fs/cgroup` and exposes it inside
   rootfs-backed runs so Docker sees a unified writable cgroup hierarchy.
-- `scripts/make-minimal-exec-initrd.sh` builds the minimal guest exec agent and
-  diskless helper binaries used by the bridge smokes.
+- `scripts/make-minimal-exec-initrd.sh` builds the embedded minimal guest exec
+  agent and diskless helper binaries used by the bridge smokes.
 - `scripts/smoke-run.sh`, `scripts/smoke-run-capture.sh`,
   `scripts/smoke-run-file-locking.sh`, `scripts/smoke-run-cgroup.sh`,
   `scripts/smoke-counter-fanout.sh`, and `scripts/smoke-rootfs-fanout.sh` cover

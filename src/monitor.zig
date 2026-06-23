@@ -23,7 +23,7 @@ const monitor_usage =
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --kernel Image          Kernel Image path
-    \\  --initrd root.cpio      Initrd path
+    \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
     \\  --rootfs rootfs.ext4    Resolved rootfs image path
     \\  --image REF             Original OCI image ref for metadata
     \\  --resume DIR            Resume from a diskless spore directory
@@ -95,7 +95,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     const paths = try lifecycle.pathsFor(allocator, init.environ_map, opts.name);
     const paths_ms = lifecycle.monotonicMs();
     const kernel_path = opts.kernel_path orelse try run.resolveDefaultKernelPath(init, allocator);
-    const initrd_path = opts.initrd_path orelse try run.resolveDefaultInitrdPath(init, allocator);
+    const initrd_path = try run.resolveConfiguredInitrdPath(init, opts.initrd_path);
     const assets_ms = lifecycle.monotonicMs();
 
     try lifecycle.writeSpec(allocator, init.io, paths, .{
