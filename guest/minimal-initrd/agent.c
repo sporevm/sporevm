@@ -933,10 +933,12 @@ static int parse_request(const char *req, struct run_request *out) {
   if (resume_time_rc < 0) return -1;
   if (resume_time_rc > 0) out->resume_time_unix_ns = resume_time_unix_ns;
 
-  if (out->kind == REQUEST_GENERATION) {
+  if (out->kind == REQUEST_GENERATION || out->kind == REQUEST_ATTACH) {
     int params_rc = parse_string_field(req, "params_json", out->generation_params, sizeof(out->generation_params));
-    if (params_rc <= 0) return -1;
-  } else if (out->kind == REQUEST_START) {
+    if (out->kind == REQUEST_GENERATION && params_rc <= 0) return -1;
+    if (params_rc < 0) return -1;
+  }
+  if (out->kind == REQUEST_START) {
     if (parse_argv(req, out->arg_storage, out->argv) <= 0) return -1;
     if (parse_env(req, out->env_storage, out->envp) < 0) return -1;
     int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
@@ -1283,6 +1285,21 @@ static void accept_request(int listener, struct session *session, struct client 
     (void)send_error_exit(client->fd, 2, "spore run: no session\n");
     close_client(client);
     return;
+  }
+
+  if (request.generation_params[0] != '\0') {
+    if (use_rootfs && !rootfs_ready) {
+      (void)send_error_exit(client->fd, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
+      close_client(client);
+      return;
+    }
+    const char *root = generation_root_path(use_rootfs, rootfs_ready);
+    if (write_generation_files(root, request.generation_params) != 0) {
+      (void)send_error_exit(client->fd, 126, "spore run: generation helper write failed\n");
+      close_client(client);
+      return;
+    }
+    apply_generation_identity(request.generation_params);
   }
   (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
 }

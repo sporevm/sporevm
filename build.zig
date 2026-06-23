@@ -30,6 +30,11 @@ pub fn build(b: *std.Build) void {
     });
     _ = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.cpio");
     const minimal_exec_initrd_module = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.zig");
+    minimal_exec_assets.addFileInput(b.path("scripts/make-minimal-exec-initrd.sh"));
+    const minimal_exec_sources = [_][]const u8{ "agent", "true", "false", "writeout", "sleeper", "finite", "counter", "netcheck", "nslookup", "wget", "flockcheck", "cgroupcheck" };
+    for (minimal_exec_sources) |src| {
+        minimal_exec_assets.addFileInput(b.path(b.fmt("guest/minimal-initrd/{s}.c", .{src})));
+    }
     mod.addAnonymousImport("run_assets", .{
         .root_source_file = minimal_exec_initrd_module,
     });

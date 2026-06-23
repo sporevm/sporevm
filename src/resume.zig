@@ -10,6 +10,7 @@ const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
 else
     struct {};
 const net_gateway = @import("net_gateway.zig");
+const generation = @import("generation.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const virtio_blk = @import("virtio/blk.zig");
@@ -21,7 +22,6 @@ const default_resume_guest_port: u32 = 10700;
 const resume_attach_host_port: u32 = 49153;
 const resume_attach_timeout_ms: u64 = 30_000;
 const hvf_resume_attach_rx_delay_ms: u64 = 25;
-const resume_attach_request = "{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n";
 
 pub const Options = struct {
     backend: Backend = .auto,
@@ -140,7 +140,8 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         .command_name = "resume",
     });
     defer runtime_disk.deinit();
-    var identity_stream: ?vsock.HostStream = try vsock.HostStream.init(default_resume_guest_port, resume_attach_request);
+    const attach_request = try resumeAttachRequest(allocator, parsed.value);
+    var identity_stream: ?vsock.HostStream = try vsock.HostStream.init(default_resume_guest_port, attach_request);
     if (identity_stream) |*stream| {
         stream.host_port = resume_attach_host_port;
         if (opts.event_writer) |writer| {
@@ -274,6 +275,39 @@ fn resultFromResumeStream(backend: Backend, ram_size: u64, identity_stream: ?vso
     };
 }
 
+fn resumeAttachRequest(allocator: std.mem.Allocator, manifest: spore.Manifest) ![]const u8 {
+    var gen_dev = generation.Device{};
+    try gen_dev.restore(allocator, manifest.generation);
+    try spore.refreshResumeParams(allocator, &gen_dev);
+
+    var params_end = gen_dev.params.len;
+    while (params_end > 0 and gen_dev.params[params_end - 1] == 0) : (params_end -= 1) {}
+    if (params_end == 0) {
+        const payload = struct {
+            type: []const u8 = "attach",
+            session_id: []const u8 = "default",
+            stdout_offset: u64 = 0,
+            stderr_offset: u64 = 0,
+        }{};
+        const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+        defer allocator.free(json);
+        return try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    }
+
+    const payload = struct {
+        type: []const u8 = "attach",
+        session_id: []const u8 = "default",
+        stdout_offset: u64 = 0,
+        stderr_offset: u64 = 0,
+        params_json: []const u8,
+    }{
+        .params_json = gen_dev.params[0..params_end],
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    return try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+}
+
 fn resolveBackend(backend: Backend) !Backend {
     if (backend != .auto) return backend;
     if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return .hvf;
@@ -327,6 +361,35 @@ test "resume cli parser accepts jsonl events" {
     const opts = try parseCliArgs(&.{ "--events=jsonl", "child.spore" });
     try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
+}
+
+test "resume attach request omits empty generation params" {
+    const allocator = std.testing.allocator;
+    const manifest = testDiskGuardManifest(&.{}, false);
+    const request = try resumeAttachRequest(allocator, manifest);
+    defer allocator.free(request);
+    try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", request);
+}
+
+test "resume attach request carries refreshed generation params" {
+    const allocator = std.testing.allocator;
+    var manifest = testDiskGuardManifest(&.{}, false);
+    var gen_dev = generation.Device{};
+    const stable_params =
+        \\{"schema_version":0,"parent_generation":1,"generation":2,"fork_index":0,"fork_count":2,"parallel_index":0,"parallel_count":2,"fork_batch_id":"0123456789abcdef0123456789abcdef","vm_id":"spore-0123456789abcdef0123456789abcdef","hostname":"spore-01234567-000000","mac_seed":"0123456789abcdef0123456789abcdef","mac_address":"02:00:00:00:00:01"}
+    ;
+    try std.testing.expect(try gen_dev.setResume(2, stable_params));
+    manifest.generation = try gen_dev.capture(allocator);
+    defer allocator.free(manifest.generation.params_b64);
+
+    const request = try resumeAttachRequest(allocator, manifest);
+    defer allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"attach\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"params_json\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\\\"parallel_index\\\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\\\"parallel_count\\\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\\\"resume_time_unix_ns\\\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\\\"resume_entropy_seed\\\":") != null);
 }
 
 test "resume memory defaults to manifest ram size" {
