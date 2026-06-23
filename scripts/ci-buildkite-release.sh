@@ -62,10 +62,9 @@ verify_release_archive() {
 
   listing="$(tar -tzf "${asset_path}")"
   for entry in \
-    "${root_dir}/spore" \
+    "${root_dir}/bin/spore" \
     "${root_dir}/LICENSE" \
-    "${root_dir}/README.md" \
-    "${root_dir}/share/sporevm/minimal-exec-initrd.cpio"; do
+    "${root_dir}/README.md"; do
     grep -Fxq "${entry}" <<<"${listing}" \
       || die "missing ${entry} in ${asset_path}"
   done

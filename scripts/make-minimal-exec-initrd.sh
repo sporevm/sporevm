@@ -83,7 +83,10 @@ chmod 1777 "${workdir}/root/tmp"
 mkdir -p "$(dirname "${out}")"
 (
   cd "${workdir}/root"
-  find . -print | LC_ALL=C sort | cpio -o -H newc >"${out}"
+  if ! find . -print | LC_ALL=C sort | cpio -o -H newc >"${out}" 2>"${workdir}/cpio.stderr"; then
+    cat "${workdir}/cpio.stderr" >&2
+    exit 1
+  fi
 )
 
 echo "wrote ${out}"
