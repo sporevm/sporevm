@@ -21,15 +21,18 @@ related_plans:
 ## Summary
 
 SporeVM should stop making users pick a small RAM value up front. Product
-commands should move toward `--memory auto`, where `auto` means a 16GiB
-guest-visible RAM contract backed by demand-committed host mappings, sparse RAM
-backing files, dirty tracking, and content-addressed chunks.
+commands should move toward `--memory auto`, where `auto` means a 16GiB logical
+memory contract backed by demand-committed host mappings, sparse RAM backing
+files, dirty tracking, content-addressed chunks, or the fresh-run virtio-mem
+prototype.
 
-The user-facing promise is not guest-visible hotplug. The guest sees a normal
-fixed RAM size. The product value is that declared RAM is a compatibility
-ceiling, while host cost is based on touched pages and dirty chunks. `spore ls`
-should make that visible by showing configured memory next to resident memory,
-sparse backing allocation, chunk counts, and pending dirty work.
+The original user-facing promise was not guest-visible hotplug: the guest saw a
+normal fixed RAM size, while host cost was based on touched pages and dirty
+chunks. The `spore run --memory auto` virtio-mem prototype narrows that for
+fresh managed one-shot runs: boot with a small base RAM, expose the 16GiB
+logical max through grow-only virtio-mem, and request growth after guest
+readiness. `spore create`, monitor, capture, and resume still use fixed RAM
+until the spore format records hotplug state.
 
 Foundation Slice 7 has landed the fast caught-up suspend model: dirty-tracked
 KVM and HVF snapshots avoid a suspend-time full-RAM scan when the dirty tail is
@@ -61,7 +64,7 @@ on the kernel/initrd/DTB ranges the VMM actually populated.
 
 - Replace product `--memory-mib N` with `--memory VALUE`.
 - Make omitted `--memory` equivalent to `--memory auto`.
-- Resolve `auto` to a 16GiB guest-visible RAM size for the first product slice.
+- Resolve `auto` to a 16GiB logical max for the first product slice.
 - Accept unit-based memory arguments such as `512mb`, `2gb`, `16gb`, `1024mib`,
   and `17179869184b`.
 - Store runtime/spec memory as bytes so the product surface matches the spore
@@ -74,8 +77,9 @@ on the kernel/initrd/DTB ranges the VMM actually populated.
 
 ## Non-Goals
 
-- No virtio-mem, ACPI hotplug, DTB hotplug, or guest-visible memory resizing in
-  this plan.
+- No ACPI hotplug, DTB hotplug, unplug, or pressure-based growth in this plan.
+  The only guest-visible resizing is the explicit fresh-run grow-only
+  virtio-mem prototype.
 - No balloon or free-page-reporting device in the first slice. That remains
   future work for shrinking manifests and reclaiming guest-free pages.
 - No compatibility alias for `--memory-mib` in product commands. The project is
@@ -200,7 +204,7 @@ best-effort scans.
 
 - Slice 2 is implemented in the product CLI: `spore run`, `spore create`, and
   `spore monitor` use `--memory VALUE`, omitted `--memory` records `auto`, and
-  `auto` resolves to a 16GiB byte-sized RAM contract.
+  `auto` resolves to a 16GiB byte-sized logical memory contract.
 - Lifecycle specs persist `memory.policy` plus resolved `memory.bytes` instead
   of `memory_mib`.
 - `spore resume` derives RAM size from `manifest.platform.ram_size`.
@@ -336,9 +340,10 @@ Done when:
 - `spore ls` can accidentally become the new scaling bug. Every displayed field
   must come from runtime metadata, monitor counters, sparse-file stat data, or
   OS process accounting. It must never sample by reading guest RAM.
-- Guest-visible RAM is still fixed. This plan deliberately avoids virtio-mem
-  and hotplug so the frozen device model and manifest platform contract do not
-  grow before the simpler sparse-ceiling model is proven.
+- Guest-visible RAM is still fixed for create, monitor, capture, and resume.
+  Fresh managed `spore run --memory auto` is the explicit grow-only virtio-mem
+  exception; keep it out of spore capture/resume until hotplug state is part of
+  the format contract.
 - The lower-level boot harnesses should keep their current `--mem-mib` flags
   for the first slice. Churning every smoke script at once would make the
   product CLI change harder to review without improving the user contract.
@@ -371,7 +376,8 @@ Done when:
 ## Deferred Work
 
 - Memory ballooning and free-page reporting.
-- Guest-visible memory hotplug through virtio-mem or another device.
+- Pressure-based virtio-mem growth, unplug, and capture/resume of hotplugged
+  memory.
 - Host admission control and fleet scheduling based on observed memory.
 - Raising `auto` beyond 16GiB.
 - Renaming low-level harness memory flags.

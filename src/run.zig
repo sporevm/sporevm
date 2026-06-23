@@ -105,6 +105,7 @@ pub const Options = struct {
     backend: Backend = .auto,
     kernel_path: []const u8,
     initrd_path: ?[]const u8 = null,
+    auto_memory_hotplug: bool = false,
     rootfs_path: ?[]const u8 = null,
     rootfs: ?spore.Rootfs = null,
     disk: ?spore.Disk = null,
@@ -853,11 +854,14 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
         .command_name = "run",
         .record_artifact = parsed.capture_path != null,
     });
+    const default_kernel = parsed.shared.kernel_path == null and init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null;
+    const default_initrd = parsed.shared.initrd_path == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null;
     const kernel_path = parsed.shared.kernel_path orelse try resolveDefaultKernelPath(init, allocator);
     const initrd_path = try resolveConfiguredInitrdPath(init, parsed.shared.initrd_path);
     var opts = parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs.path, rootfs.rootfs, parsed.command, true);
     opts.guest_env = rootfs.guest_env;
     opts.guest_working_dir = rootfs.guest_working_dir;
+    opts.auto_memory_hotplug = default_kernel and default_initrd;
     opts.capture_path = parsed.capture_path;
     opts.capture_trigger = parsed.capture_trigger;
     opts.continue_after_capture = parsed.continue_after_capture;
@@ -1730,7 +1734,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const network_manifest = manifestNetworkFromOptions(opts.network, &opts.network_policy);
 
     const resuming = opts.resume_dir != null;
-    const fixed_ram = resuming or opts.capture_path != null;
+    const fixed_ram = resuming or opts.capture_path != null or !opts.auto_memory_hotplug;
     const boot_ram_size = runBootRamSize(opts.memory, fixed_ram);
     const virtio_mem_region_size = runVirtioMemRegionSize(opts.memory, fixed_ram);
     const local_backing_start = monotonicMs();
@@ -3093,7 +3097,7 @@ test "managed kernel checksum parser reads sha256 sidecar" {
     try std.testing.expectError(error.BadManagedKernelChecksum, readExpectedSha256(io, allocator, sha_path));
 }
 
-test "managed kernel cache hit trusts read-only image with checksum sidecar" {
+test "managed kernel cache hit verifies read-only image with checksum sidecar" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const tmp = "zig-cache/test-run-kernel-cache-hit";
@@ -3105,6 +3109,7 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
     const sha_path = tmp ++ "/Image.sha256";
     const config_path = tmp ++ "/Image.config";
     const bad_sha_path = tmp ++ "/Image.bad.sha256";
+    const mismatch_sha_path = tmp ++ "/Image.mismatch.sha256";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "kernel bytes" });
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = sha_path,
@@ -3134,6 +3139,7 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
             "CONFIG_VIRTIO_MEM=y\n",
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_sha_path, .data = "not-a-sha\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = mismatch_sha_path, .data = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  Image\n" });
 
     try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
     try chmodFileReadOnly(allocator, image_path);
@@ -3150,6 +3156,8 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
 
     try chmodFileReadOnly(allocator, bad_sha_path);
     try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, bad_sha_path, config_path));
+    try chmodFileReadOnly(allocator, mismatch_sha_path);
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, mismatch_sha_path, config_path));
 }
 
 test "managed run kernel config requires Docker and virtio-mem runtime symbols" {

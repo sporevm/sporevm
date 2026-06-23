@@ -71,8 +71,8 @@ without duplicating behavior.
 ## Non-Goals
 
 - x86 hosts or guests on the portable path.
-- Non-Linux guests, GUI, GPU, USB, PCI, hotplug, or device expansion beyond the
-  frozen model.
+- Non-Linux guests, GUI, GPU, USB, PCI, device hotplug, or device expansion
+  beyond the frozen model.
 - Live migration of a running VM.
 - Network policy, secrets, workspace semantics, or OCI runtime policy. Consumers
   own those layers.

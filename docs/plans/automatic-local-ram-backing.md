@@ -33,10 +33,11 @@ remains the manifest's BLAKE3 chunk refs.
 
 ## Problem
 
-Automatic memory makes the guest-visible RAM contract large, currently 16GiB for
-`--memory auto`. Restoring that from verified chunks is correct and portable, but
-it is too slow for local fork/fan-out when the parent already has a sparse,
-read-only `ram.backing` file that children could map privately and cheaply.
+For create/capture/resume, automatic memory makes the guest-visible RAM contract
+large, currently 16GiB for `--memory auto`. Restoring that from verified chunks
+is correct and portable, but it is too slow for local fork/fan-out when the
+parent already has a sparse, read-only `ram.backing` file that children could
+map privately and cheaply.
 
 An earlier experiment proved the performance shape with an explicit
 `--trust-ram-backing` resume flag and fan-out plumbing. That is the wrong product

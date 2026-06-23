@@ -13,7 +13,8 @@
 - Machine state in spore manifests is normalized architectural aarch64 state.
   Never serialize raw KVM or Hypervisor.framework structs into the format.
 - Keep the device model frozen: virtio-mmio console, blk, net, vsock, rng,
-  plus the generation device. Additions require editing the foundation plan.
+  the experimental grow-only virtio-mem device, plus the generation device.
+  Additions require editing the foundation plan.
 - Hypervisor-specific code lives behind the hypervisor interface; device
   model, DTB generation, and manifest code must stay backend-neutral and
   shared.
