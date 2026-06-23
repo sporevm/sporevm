@@ -5,7 +5,6 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const linux = std.os.linux;
 
-pub const experimental_monitor_env = "SPOREVM_EXPERIMENTAL_MONITOR";
 pub const smoke_env = "SPOREVM_MONITOR_JAIL_SMOKE";
 
 const macos_profile =
@@ -19,16 +18,11 @@ const macos = if (builtin.os.tag == .macos) struct {
     extern "c" fn sandbox_free_error(errorbuf: ?[*:0]u8) void;
 } else struct {};
 
-pub fn enabled(environ: *const std.process.Environ.Map) bool {
-    return std.mem.eql(u8, environ.get(experimental_monitor_env) orelse "", "1");
-}
-
 pub fn wantsSmoke(environ: *const std.process.Environ.Map) bool {
     return std.mem.eql(u8, environ.get(smoke_env) orelse "", "1");
 }
 
-pub fn applyForMonitor(environ: *const std.process.Environ.Map) !void {
-    if (!enabled(environ)) return;
+pub fn applyForMonitor(_: *const std.process.Environ.Map) !void {
     if (comptime builtin.os.tag == .macos) try applyMacos();
     if (comptime builtin.os.tag == .linux) try applyLinux();
 }
@@ -90,14 +84,7 @@ pub fn smokeDeniedExec(io: Io) !void {
     return error.MonitorJailAllowedExec;
 }
 
-test "monitor jail is opt in and has a denied exec profile" {
-    const allocator = std.testing.allocator;
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-
-    try std.testing.expect(!enabled(&env));
-    try env.put(experimental_monitor_env, "1");
-    try std.testing.expect(enabled(&env));
+test "monitor jail has a denied exec profile" {
     try std.testing.expect(std.mem.indexOf(u8, macos_profile, "(deny process-exec)") != null);
     if (comptime builtin.os.tag == .linux) {
         const filter = linuxExecDenyFilter();

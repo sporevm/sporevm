@@ -9,8 +9,7 @@ case "$(uname -s)" in
   *) echo "smoke:monitor-jail skipped: unsupported host $(uname -s)"; exit 0 ;;
 esac
 
-SPOREVM_EXPERIMENTAL_MONITOR=1 \
-  SPOREVM_MONITOR_JAIL_SMOKE=1 \
+SPOREVM_MONITOR_JAIL_SMOKE=1 \
   "${spore_bin}" monitor jail-smoke
 
 echo "smoke:monitor-jail ok"

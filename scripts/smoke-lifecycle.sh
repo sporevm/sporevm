@@ -3,7 +3,6 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-spore_env=(SPOREVM_EXPERIMENTAL_MONITOR=1)
 
 die() {
   echo "error: $*" >&2
@@ -67,7 +66,7 @@ cleanup() {
     return
   fi
   if [[ "${created}" == "1" ]]; then
-    env "${spore_env[@]}" SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
+    env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
   fi
   rm -rf "${runtime_dir}"
   rm -rf "${workdir}"
@@ -93,7 +92,6 @@ ls_after_stderr="${workdir}/ls-after.stderr"
 
 if run_capture "${create_stdout}" "${create_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-    "${spore_env[@]}" \
   "${spore_bin}" create "${vm_name}" \
     --backend "${backend}" \
     --memory "${smoke_memory}" \
@@ -107,7 +105,6 @@ fi
 
 if run_capture "${writeout_stdout}" "${writeout_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-    "${spore_env[@]}" \
   "${spore_bin}" exec "${vm_name}" -- /bin/writeout; then
   :
 else
@@ -127,7 +124,6 @@ grep -Fq "spore stderr" "${writeout_stderr}" || {
 
 if run_capture "${true_stdout}" "${true_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-    "${spore_env[@]}" \
   "${spore_bin}" exec "${vm_name}" -- /bin/true; then
   :
 else
@@ -139,7 +135,7 @@ fi
   die "second spore exec wrote unexpected stdout"
 }
 
-if run_capture "${ls_stdout}" "${ls_stderr}" env "${spore_env[@]}" SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json ls; then
+if run_capture "${ls_stdout}" "${ls_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json ls; then
   :
 else
   status=$?
@@ -157,14 +153,14 @@ if not any(entry.get("name") == vm_name and entry.get("state") == "ready" for en
     raise SystemExit(f"VM {vm_name} was not listed as ready")
 PY
 
-if run_capture "${rm_stdout}" "${rm_stderr}" env "${spore_env[@]}" SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}"; then
+if run_capture "${rm_stdout}" "${rm_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}"; then
   created=0
 else
   status=$?
   require_success "${status}" "spore rm" "${rm_stderr}"
 fi
 
-if run_capture "${ls_after_stdout}" "${ls_after_stderr}" env "${spore_env[@]}" SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json ls; then
+if run_capture "${ls_after_stdout}" "${ls_after_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json ls; then
   :
 else
   status=$?

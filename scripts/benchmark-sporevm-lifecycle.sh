@@ -295,7 +295,7 @@ mkdir -p "${log_dir}"
 : >"${output_path}"
 failures=0
 
-spore_env=(SPOREVM_EXPERIMENTAL_MONITOR=1 SPOREVM_RUNTIME_DIR="${runtime_dir}")
+spore_env=(SPOREVM_RUNTIME_DIR="${runtime_dir}")
 if [[ -n "${rootfs_cache_dir}" ]]; then
   mkdir -p "${rootfs_cache_dir}"
   rootfs_cache_dir="$(cd "${rootfs_cache_dir}" && pwd)"

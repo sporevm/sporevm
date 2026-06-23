@@ -22,11 +22,10 @@ related_plans:
 
 ## Summary
 
-Local named-VM lifecycle has landed behind `SPOREVM_EXPERIMENTAL_MONITOR=1` for
-HVF and KVM create/exec/ls/rm. SporeVM can create a named VM, keep it alive in
-one per-VM monitor process, execute multiple commands over the guest agent, and
-list/remove it through a private runtime registry. Local HVF also has diskless
-lifecycle suspend/resume evidence.
+Local named-VM lifecycle has landed for HVF and KVM create/exec/ls/rm. SporeVM
+can create a named VM, keep it alive in one per-VM monitor process, execute
+multiple commands over the guest agent, and list/remove it through a private
+runtime registry. Local HVF also has diskless lifecycle suspend/resume evidence.
 
 The active work is no longer the CLI shape. It is speed and parity:
 tag-resolution caching, rootfs-path benchmark isolation, exec timing breakdowns,
@@ -35,7 +34,6 @@ KVM suspend/resume evidence, and disk-backed lifecycle suspend/resume.
 ## Landed Product Contract
 
 ```console
-export SPOREVM_EXPERIMENTAL_MONITOR=1
 spore create bench-1 --image docker.io/library/alpine:3.20
 spore exec bench-1 -- /bin/echo hi
 spore exec bench-1 -- /bin/sh -lc 'cat /proc/sys/kernel/random/boot_id'
@@ -43,14 +41,13 @@ spore rm bench-1
 ```
 
 `spore run` remains the one-shot convenience command. Named lifecycle commands
-are experimental and opt-in. Monitor processes deny child process execution
-through an embedded macOS sandbox profile or Linux seccomp filter; broader jail
-policy remains follow-up work before stable lifecycle support.
+are experimental. Monitor processes deny child process execution through an
+embedded macOS sandbox profile or Linux seccomp filter; broader jail policy
+remains follow-up work before stable lifecycle support.
 
 Future suspend/resume extends the same named-VM model:
 
 ```console
-export SPOREVM_EXPERIMENTAL_MONITOR=1
 spore suspend bench-1 --out bench-1.spore
 spore resume bench-1.spore --name bench-2
 ```
@@ -68,7 +65,7 @@ policy, secrets, egress, mounts, workspace semantics, and scheduling.
 ## Current State
 
 - `spore create`, `spore exec`, `spore rm`, `spore ls`, `spore monitor`, and
-  named `spore resume` require `SPOREVM_EXPERIMENTAL_MONITOR=1`.
+  named `spore resume` are available on supported backends.
 - Monitor processes deny child process execution through an embedded macOS
   sandbox profile or Linux seccomp filter. `mise run smoke:monitor-jail` covers
   the denied-operation path.

@@ -94,7 +94,6 @@ Product commands use one memory flag:
 ```console
 spore run --memory auto -- /bin/true
 spore run --memory 16gb -- /bin/true
-export SPOREVM_EXPERIMENTAL_MONITOR=1
 spore create node-ci --image docker.io/library/node:22-alpine --memory auto
 spore create tiny --memory 512mb
 ```
@@ -164,7 +163,7 @@ Default `spore ls` should become a human table. `spore --json ls` should remain
 the stable machine-readable API.
 
 ```console
-$ SPOREVM_EXPERIMENTAL_MONITOR=1 spore ls
+$ spore ls
 NAME      STATE  PID    MEMORY  RESIDENT  BACKING      CHUNKS    DIRTY
 node-ci   ready  44129  auto    184MiB    34MiB/16GiB  17/8192   2
 tiny      ready  44188  512MiB  72MiB     none         ?         ?
@@ -314,8 +313,7 @@ Done when:
   `seed_chunks=5`, `seed_nonzero_chunks=5`, `seed_ms=425`,
   `snapshot_pause_ms=1471`, and a 16GiB `ram.backing` with 262MiB allocated.
 - Product smoke: `spore run --memory auto -- /bin/true`.
-- Product lifecycle smoke: create, exec, `spore ls`, suspend or rm with
-  `SPOREVM_EXPERIMENTAL_MONITOR=1`.
+- Product lifecycle smoke: create, exec, `spore ls`, suspend or rm.
 - Same-host fork/fan-out smoke reporting declared RAM versus aggregate PSS/RSS.
 - HVF product capture validation on 2026-06-20: a mostly-idle 16GiB
   `spore run --backend hvf --memory auto --capture <base.spore> --capture-on

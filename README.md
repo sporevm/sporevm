@@ -210,11 +210,9 @@ verified before use.
 
 ## Named lifecycle
 
-Named VM lifecycle commands are available, but they are not part of the default
-stable CLI surface. Opt in explicitly:
+Named VM lifecycle commands are available on supported backends:
 
 ```bash
-export SPOREVM_EXPERIMENTAL_MONITOR=1
 export SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
 
 spore create bench-1 --image docker.io/library/alpine:3.20
@@ -246,7 +244,7 @@ Known limits:
 - Cross-backend restore is diagnostic, not the product path.
 - General block-device state is out of scope. Rootfs-bound writable state is
   represented as sealed disk layers.
-- Named lifecycle monitor commands require `SPOREVM_EXPERIMENTAL_MONITOR=1`.
+- Named lifecycle monitor commands are available on supported HVF/KVM backends.
 - SporeVM is a VMM isolation boundary, but it does not claim hardened
   public-cloud multi-tenant isolation.
 
@@ -268,6 +266,7 @@ mise run smoke:rootfs-fanout
 mise run smoke:writable-rootfs
 mise run smoke:run-net-dns
 mise run smoke:monitor-jail
+mise run smoke:monitor-failure-modes
 ```
 
 Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).

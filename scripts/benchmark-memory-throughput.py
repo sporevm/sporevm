@@ -196,7 +196,6 @@ class Runner:
         self.runtime_dir = self.run_dir / "runtime"
         self.spore_bin = Path(args.spore_bin).resolve()
         self.env = os.environ.copy()
-        self.env["SPOREVM_EXPERIMENTAL_MONITOR"] = "1"
         self.env["SPOREVM_ROOTFS_CACHE_DIR"] = str(self.rootfs_cache_dir)
         self.env["SPOREVM_RUNTIME_DIR"] = str(self.runtime_dir)
         self.effective_image = args.image

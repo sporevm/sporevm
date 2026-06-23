@@ -75,7 +75,6 @@ The default policy is local-first:
 
 ```console
 spore run --image docker.io/library/ruby:3.3-alpine -- /bin/echo hi
-export SPOREVM_EXPERIMENTAL_MONITOR=1
 spore create bench-ruby --image docker.io/library/ruby:3.3-alpine
 ```
 

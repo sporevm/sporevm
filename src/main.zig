@@ -58,8 +58,6 @@ const usage =
     \\
 ;
 
-const experimental_monitor_env = sporevm.monitor_jail.experimental_monitor_env;
-
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
@@ -112,11 +110,6 @@ fn runCommand(
     if (mode == .json and !supportsJson(command)) {
         const message = allocMessage(arena, "spore --json does not support command: {s}", .{command});
         exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "GlobalJson"), message);
-    }
-
-    if (requiresExperimentalMonitor(command, command_args) and !experimentalMonitorEnabled(init.environ_map)) {
-        const message = allocMessage(arena, "spore {s}: monitor lifecycle commands are experimental; set {s}=1 to opt in", .{ command, experimental_monitor_env });
-        exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "ExperimentalMonitor"), message);
     }
 
     if (std.mem.eql(u8, command, "system")) {
@@ -358,20 +351,6 @@ fn wantsNamedResume(args: []const []const u8) bool {
         if (std.mem.eql(u8, arg, "--name")) return true;
     }
     return false;
-}
-
-fn requiresExperimentalMonitor(command: []const u8, args: []const []const u8) bool {
-    return std.mem.eql(u8, command, "monitor") or
-        std.mem.eql(u8, command, "create") or
-        std.mem.eql(u8, command, "exec") or
-        std.mem.eql(u8, command, "rm") or
-        std.mem.eql(u8, command, "suspend") or
-        std.mem.eql(u8, command, "ls") or
-        (std.mem.eql(u8, command, "resume") and wantsNamedResume(args));
-}
-
-fn experimentalMonitorEnabled(environ: *const std.process.Environ.Map) bool {
-    return std.mem.eql(u8, environ.get(experimental_monitor_env) orelse "", "1");
 }
 
 fn forkCommand(
@@ -876,24 +855,6 @@ test "rootfs bundle policy parser accepts exact and metadata-only spellings" {
 test "resume dispatch can distinguish product and named lifecycle modes" {
     try std.testing.expect(!wantsNamedResume(&.{"spore-dir"}));
     try std.testing.expect(wantsNamedResume(&.{ "spore-dir", "--name", "bench-1" }));
-}
-
-test "monitor lifecycle commands require explicit experiment opt in" {
-    try std.testing.expect(requiresExperimentalMonitor("monitor", &.{"bench-1"}));
-    try std.testing.expect(requiresExperimentalMonitor("create", &.{"bench-1"}));
-    try std.testing.expect(requiresExperimentalMonitor("exec", &.{ "bench-1", "--", "/bin/true" }));
-    try std.testing.expect(requiresExperimentalMonitor("resume", &.{ "spore-dir", "--name", "bench-1" }));
-    try std.testing.expect(!requiresExperimentalMonitor("resume", &.{"spore-dir"}));
-    try std.testing.expect(!requiresExperimentalMonitor("run", &.{ "--from", "spore-dir", "--", "/bin/true" }));
-    try std.testing.expect(!requiresExperimentalMonitor("fork", &.{ "spore-dir", "--count", "2", "--out", "children" }));
-    try std.testing.expect(!requiresExperimentalMonitor("fanout", &.{"children"}));
-
-    const allocator = std.testing.allocator;
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    try std.testing.expect(!experimentalMonitorEnabled(&env));
-    try env.put(experimental_monitor_env, "1");
-    try std.testing.expect(experimentalMonitorEnabled(&env));
 }
 
 test "global args parse debug before command" {
