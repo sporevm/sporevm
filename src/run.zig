@@ -105,7 +105,7 @@ pub const Options = struct {
     backend: Backend = .auto,
     kernel_path: []const u8,
     initrd_path: ?[]const u8 = null,
-    auto_memory_hotplug: bool = false,
+    auto_memory_hotplug_capable: bool = false,
     rootfs_path: ?[]const u8 = null,
     rootfs: ?spore.Rootfs = null,
     disk: ?spore.Disk = null,
@@ -861,7 +861,7 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     var opts = parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs.path, rootfs.rootfs, parsed.command, true);
     opts.guest_env = rootfs.guest_env;
     opts.guest_working_dir = rootfs.guest_working_dir;
-    opts.auto_memory_hotplug = default_kernel and default_initrd;
+    opts.auto_memory_hotplug_capable = default_kernel and default_initrd;
     opts.capture_path = parsed.capture_path;
     opts.capture_trigger = parsed.capture_trigger;
     opts.continue_after_capture = parsed.continue_after_capture;
@@ -1734,11 +1734,12 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const network_manifest = manifestNetworkFromOptions(opts.network, &opts.network_policy);
 
     const resuming = opts.resume_dir != null;
-    const fixed_ram = resuming or opts.capture_path != null or !opts.auto_memory_hotplug;
-    const boot_ram_size = runBootRamSize(opts.memory, fixed_ram);
-    const virtio_mem_region_size = runVirtioMemRegionSize(opts.memory, fixed_ram);
+    const memory_plan = runMemoryPlan(opts.memory, .{
+        .fixed_ram = resuming or opts.capture_path != null,
+        .auto_hotplug_capable = opts.auto_memory_hotplug_capable,
+    });
     const local_backing_start = monotonicMs();
-    const local_backing = try openRunLocalMemoryBacking(allocator, context.environ_map, opts.resume_dir, boot_ram_size);
+    const local_backing = try openRunLocalMemoryBacking(allocator, context.environ_map, opts.resume_dir, memory_plan.boot_ram_size);
     const local_backing_ms = monotonicMs() -| local_backing_start;
     defer if (local_backing.fd) |fd| {
         _ = std.c.close(fd);
@@ -1793,8 +1794,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             initrd_ms,
             disk_ms,
             request_ms,
-            boot_ram_size / 1024 / 1024,
-            virtio_mem_region_size / 1024 / 1024,
+            memory_plan.boot_ram_size / 1024 / 1024,
+            memory_plan.virtio_mem_region_size / 1024 / 1024,
         },
     );
 
@@ -1804,8 +1805,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
             break :blk hvf.vm.run(allocator, .{
                 .kernel = kernel,
-                .ram_size = boot_ram_size,
-                .virtio_mem_region_size = virtio_mem_region_size,
+                .ram_size = memory_plan.boot_ram_size,
+                .virtio_mem_region_size = memory_plan.virtio_mem_region_size,
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
@@ -1830,8 +1831,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
             break :blk kvm.vm.run(allocator, .{
                 .kernel = kernel,
-                .ram_size = boot_ram_size,
-                .virtio_mem_region_size = virtio_mem_region_size,
+                .ram_size = memory_plan.boot_ram_size,
+                .virtio_mem_region_size = memory_plan.virtio_mem_region_size,
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
@@ -1876,14 +1877,31 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     return result;
 }
 
-fn runBootRamSize(memory: memory_config.Config, fixed_ram: bool) u64 {
-    if (!fixed_ram and memory.policy == .auto and memory.bytes > auto_boot_memory_bytes) return auto_boot_memory_bytes;
-    return memory.bytes;
-}
+const RunMemoryPlan = struct {
+    boot_ram_size: u64,
+    virtio_mem_region_size: u64,
+};
 
-fn runVirtioMemRegionSize(memory: memory_config.Config, fixed_ram: bool) u64 {
-    if (fixed_ram or memory.policy != .auto or memory.bytes <= auto_boot_memory_bytes) return 0;
-    return memory.bytes - auto_boot_memory_bytes;
+const RunMemoryConstraints = struct {
+    fixed_ram: bool = false,
+    auto_hotplug_capable: bool = false,
+};
+
+fn runMemoryPlan(memory: memory_config.Config, constraints: RunMemoryConstraints) RunMemoryPlan {
+    if (!constraints.fixed_ram and
+        constraints.auto_hotplug_capable and
+        memory.policy == .auto and
+        memory.bytes > auto_boot_memory_bytes)
+    {
+        return .{
+            .boot_ram_size = auto_boot_memory_bytes,
+            .virtio_mem_region_size = memory.bytes - auto_boot_memory_bytes,
+        };
+    }
+    return .{
+        .boot_ram_size = memory.bytes,
+        .virtio_mem_region_size = 0,
+    };
 }
 
 pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {
@@ -2672,16 +2690,24 @@ test "run cli parser accepts memory policy" {
     try std.testing.expect(explicit_opts.shared.memory_set);
 }
 
-test "run auto memory boots small unless fixed RAM is required" {
+test "run memory plan selects virtio-mem only for capable fresh auto runs" {
     const auto = memory_config.Config{};
-    try std.testing.expectEqual(auto_boot_memory_bytes, runBootRamSize(auto, false));
-    try std.testing.expectEqual(memory_config.auto_bytes - auto_boot_memory_bytes, runVirtioMemRegionSize(auto, false));
-    try std.testing.expectEqual(memory_config.auto_bytes, runBootRamSize(auto, true));
-    try std.testing.expectEqual(@as(u64, 0), runVirtioMemRegionSize(auto, true));
+    const hotplug = runMemoryPlan(auto, .{ .auto_hotplug_capable = true });
+    try std.testing.expectEqual(auto_boot_memory_bytes, hotplug.boot_ram_size);
+    try std.testing.expectEqual(memory_config.auto_bytes - auto_boot_memory_bytes, hotplug.virtio_mem_region_size);
+
+    const custom_assets = runMemoryPlan(auto, .{});
+    try std.testing.expectEqual(memory_config.auto_bytes, custom_assets.boot_ram_size);
+    try std.testing.expectEqual(@as(u64, 0), custom_assets.virtio_mem_region_size);
+
+    const capture_or_resume = runMemoryPlan(auto, .{ .fixed_ram = true, .auto_hotplug_capable = true });
+    try std.testing.expectEqual(memory_config.auto_bytes, capture_or_resume.boot_ram_size);
+    try std.testing.expectEqual(@as(u64, 0), capture_or_resume.virtio_mem_region_size);
 
     const explicit = memory_config.Config{ .policy = .explicit, .bytes = 1024 * 1024 * 1024 };
-    try std.testing.expectEqual(explicit.bytes, runBootRamSize(explicit, false));
-    try std.testing.expectEqual(@as(u64, 0), runVirtioMemRegionSize(explicit, false));
+    const explicit_plan = runMemoryPlan(explicit, .{ .auto_hotplug_capable = true });
+    try std.testing.expectEqual(explicit.bytes, explicit_plan.boot_ram_size);
+    try std.testing.expectEqual(@as(u64, 0), explicit_plan.virtio_mem_region_size);
 }
 
 test "run cli parser accepts rootfs path" {
