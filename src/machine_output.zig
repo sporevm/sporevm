@@ -1,6 +1,7 @@
 //! Shared machine-output contracts for the `spore` CLI and future bindings.
 
 const std = @import("std");
+const contracts = @import("contracts.zig");
 const Io = std.Io;
 
 pub const error_schema = "spore.error.v1";
@@ -13,35 +14,13 @@ pub const Mode = enum {
     json,
 };
 
-pub const DigestRef = struct {
-    algorithm: []const u8 = "sha256",
-    hex: []const u8,
-};
-
-pub const CacheState = struct {
-    hit_count: usize = 0,
-    miss_count: usize = 0,
-    bytes_fetched: u64 = 0,
-    bytes_reused: u64 = 0,
-};
-
-pub const ChunkMaterializationSummary = struct {
-    chunk_count: usize,
-    materialized_chunk_count: usize,
-    payload_bytes: u64,
-    linked_chunk_count: usize = 0,
-    copied_chunk_count: usize = 0,
-    cache: CacheState = .{},
-};
-
-pub const RootfsMaterializationSummary = struct {
-    artifact_count: usize = 0,
-    payload_bytes: u64 = 0,
-    cache: CacheState = .{},
-};
+pub const DigestRef = contracts.DigestRef;
+pub const CacheState = contracts.CacheState;
+pub const ChunkMaterializationSummary = contracts.ChunkMaterializationSummary;
+pub const RootfsMaterializationSummary = contracts.RootfsMaterializationSummary;
 
 pub fn digestRef(hex: []const u8) DigestRef {
-    return .{ .hex = hex };
+    return contracts.digestRef(hex);
 }
 
 pub const Scope = enum {

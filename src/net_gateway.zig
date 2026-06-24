@@ -40,13 +40,19 @@ pub const Process = struct {
     rx_lens: [max_rx_pending]usize = [_]usize{0} ** max_rx_pending,
     rx_bufs: [max_rx_pending][virtio_net.max_frame_len]u8 = undefined,
 
-    pub fn start(self: *Process, init: std.process.Init, allocator: std.mem.Allocator, policy: spore_net_policy.Config) StartError!void {
+    pub fn start(
+        self: *Process,
+        io: Io,
+        allocator: std.mem.Allocator,
+        spore_executable: []const u8,
+        debug: bool,
+        policy: spore_net_policy.Config,
+    ) StartError!void {
         self.* = .{};
         ignoreSigpipe();
-        const args = init.minimal.args.toSlice(allocator) catch return error.NetdSpawnFailed;
         var argv = std.array_list.Managed([]const u8).init(allocator);
-        argv.append(args[0]) catch return error.OutOfMemory;
-        if (parentDebugEnabled(args)) argv.append("--debug") catch return error.OutOfMemory;
+        argv.append(spore_executable) catch return error.OutOfMemory;
+        if (debug) argv.append("--debug") catch return error.OutOfMemory;
         argv.append("netd") catch return error.OutOfMemory;
         argv.append("--stdio") catch return error.OutOfMemory;
         for (policy.allowCidrSlice()) |cidr| {
@@ -57,7 +63,7 @@ pub const Process = struct {
             argv.append("--allow-host") catch return error.OutOfMemory;
             argv.append(host) catch return error.OutOfMemory;
         }
-        const child = std.process.spawn(init.io, .{
+        const child = std.process.spawn(io, .{
             .argv = argv.items,
             .stdin = .pipe,
             .stdout = .pipe,
@@ -73,7 +79,7 @@ pub const Process = struct {
         self.child.stderr = null;
 
         waitReady(self.stderr_fd) catch |err| {
-            self.child.kill(init.io);
+            self.child.kill(io);
             closeIfOpen(&self.to_child_fd);
             closeIfOpen(&self.from_child_fd);
             closeIfOpen(&self.stderr_fd);
@@ -84,22 +90,22 @@ pub const Process = struct {
         };
 
         self.stdout_thread = std.Thread.spawn(.{}, readStdout, .{self}) catch {
-            self.child.kill(init.io);
+            self.child.kill(io);
             closeIfOpen(&self.to_child_fd);
             closeIfOpen(&self.from_child_fd);
             closeIfOpen(&self.stderr_fd);
             return error.NetdThreadFailed;
         };
         self.stderr_thread = std.Thread.spawn(.{}, drainStderr, .{self}) catch {
-            self.child.kill(init.io);
+            self.child.kill(io);
             if (self.stdout_thread) |thread| thread.join();
             closeIfOpen(&self.to_child_fd);
             closeIfOpen(&self.from_child_fd);
             closeIfOpen(&self.stderr_fd);
             return error.NetdThreadFailed;
         };
-        self.wait_thread = std.Thread.spawn(.{}, waitChild, .{ self, init.io }) catch {
-            self.child.kill(init.io);
+        self.wait_thread = std.Thread.spawn(.{}, waitChild, .{ self, io }) catch {
+            self.child.kill(io);
             if (self.stdout_thread) |thread| thread.join();
             if (self.stderr_thread) |thread| thread.join();
             closeIfOpen(&self.to_child_fd);
@@ -372,21 +378,6 @@ fn ignoreSigpipe() void {
         .flags = 0,
     };
     std.posix.sigaction(.PIPE, &action, null);
-}
-
-fn parentDebugEnabled(args: []const []const u8) bool {
-    if (args.len <= 1) return false;
-    for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--debug")) return true;
-        if (std.mem.eql(u8, arg, "--")) return false;
-        if (!std.mem.startsWith(u8, arg, "-")) return false;
-    }
-    return false;
-}
-
-test "spore-net gateway detects parent global debug flag" {
-    try std.testing.expect(parentDebugEnabled(&.{ "spore", "--debug", "run", "--net", "--", "/bin/true" }));
-    try std.testing.expect(!parentDebugEnabled(&.{ "spore", "run", "--net", "--", "/bin/true" }));
 }
 
 test "spore-net gateway buffers multiple rx frames" {

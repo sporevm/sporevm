@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-21
+last_reviewed: 2026-06-24
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
@@ -29,9 +29,9 @@ normal arguments, single-result commands default to human output, and
 
 The implementation should be factored as though a library transport exists:
 command handlers call product APIs, product APIs return typed result structs,
-and the CLI is one serializer over those structs. A future `libspore` C ABI can
-then wrap the same APIs without re-defining behavior or exposing raw Zig structs
-as a public ABI.
+and the CLI is one serializer over those structs. The source-level Zig module is
+published as `libspore` first; a future C ABI can then wrap the same APIs without
+re-defining behavior or exposing raw Zig structs as a public ABI.
 
 This plan deliberately keeps the contract SporeVM-native. The abstractions are
 host facts, bundle inspection, materialization, run/resume lifecycle events,
@@ -67,8 +67,8 @@ streams, or expose a library transport later.
 - Use one shared JSON error envelope for SporeVM-originated failures.
 - Keep stream output explicit through a separate JSONL event mode for commands
   that need lifecycle events.
-- Factor command implementations through internal product APIs before adding any
-  public library ABI.
+- Factor command implementations through product APIs before adding any public C
+  ABI.
 - Make a future `libspore` transport a wrapper over the same product API and
   JSON contracts, not a second behavior surface.
 - Keep docs and field names generic: callers, automation, embedding, host,
@@ -78,8 +78,8 @@ streams, or expose a library transport later.
 
 ## Non-Goals
 
-- No public Zig ABI.
-- No raw Zig struct layout exposed as an embedding contract.
+- No frozen Zig binary ABI or raw Zig struct layout exposed as an embedding
+  contract.
 - No compatibility promise before 1.0 beyond the current plan status.
 - No preservation of current JSON-default or command-local `--json` behavior.
 - No caller-specific execution policy, queue model, or deployment model in this
@@ -273,10 +273,20 @@ The first implementation should pin a small stable code table in tests:
   direct exits remain a follow-up hardening item outside the runtime stream
   path.
 - Slice 5 is implemented in this branch: `src/api.zig` exposes option-based
-  internal calls for host-info, inspect-bundle, pull, run, and resume, pull
-  cache selection uses explicit `env`/`none`/`path` choices, and the CLI routes
-  host-info, inspect-bundle, and pull through the API boundary instead of using
-  command parsing as the product interface.
+  product calls for run, resume, host-info, inspect, fork, pack, unpack, push,
+  inspect-bundle, and pull; run/resume expose typed event callbacks instead of
+  CLI JSONL writer plumbing; pull and bundle materialization use explicit
+  `env`/`none`/`path` cache choices; public calls take a small
+  `libspore.Context` instead of `std.process.Init`; and the CLI routes
+  single-result host, manifest, fork, and bundle commands through the API
+  boundary instead of using command parsing as the product interface. The public
+  Zig module now exposes explicit deinit helpers for owned result fields and
+  classified failure values for run/resume events instead of raw Zig error names.
+- The build now publishes that shared Zig module as `libspore`. The in-repo CLI
+  compiles through `spore_internal.api` because Zig requires a source file to
+  belong to only one module in a compilation unit; external embedders should
+  import `libspore`. Initrd assets, zmoltcp, and hypervisor linkage are module
+  dependencies for VM execution but are not part of the public facade.
 
 ## Delivery Strategy
 
@@ -330,14 +340,16 @@ Done when start, ready, stdout, stderr, exit, and failure events are complete
 JSONL records, there is exactly one terminal event, failure classification
 matches `spore.error.v1`, and process exit behavior matches the target model.
 
-### Slice 5: Internal API Boundary
+### Slice 5: Product API Boundary
 
-Move CLI command bodies behind a small internal API layer, likely `src/api.zig`,
-where this reduces duplication. The goal is not a broad framework; the goal is
-that command parsing, product behavior, and serialization are separable.
+Move CLI command bodies behind a small product API layer in `src/api.zig`, where
+this reduces duplication. The goal is not a broad framework; the goal is that
+command parsing, product behavior, and serialization are separable.
 
-Done when host-info, inspect-bundle, pull, and event-producing run/resume paths
-can be called without constructing argv arrays.
+Done when run, resume, host-info, inspect, fork, pack, unpack, push,
+inspect-bundle, and pull can be called without constructing argv arrays, and
+run/resume event consumers receive typed callbacks rather than CLI writer
+plumbing.
 
 ### Slice 6: Optional C ABI
 
@@ -387,6 +399,9 @@ against them and verify that the schemas match the Zig-owned result structs.
 - Runtime event mode needs stream ownership rules, not just event names. The plan
   now makes JSONL stdout the only event channel and represents guest output as
   events.
+- Library result ownership needs to be explicit even before a C ABI exists.
+  Arena allocation is fine for many Zig callers, but the public module should
+  still name which result fields it owns and provide matching cleanup helpers.
 
 ## Resolved Decisions
 

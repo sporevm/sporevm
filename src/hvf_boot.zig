@@ -5,7 +5,7 @@
 //!   ./zig-out/bin/hvf-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--dirty-track] [--dirty-epoch-ms N] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH] [--trust-ram-backing]
 
 const std = @import("std");
-const sporevm = @import("sporevm");
+const spore_internal = @import("spore_internal");
 
 fn consoleSink(bytes: []const u8) void {
     var remaining = bytes;
@@ -167,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("sporevm hvf-boot: kernel={s} mem={d}MiB cmdline=\"{s}\"\n", .{ args[1], mem_mib, effective_cmdline });
 
-    const cause = try sporevm.hvf.vm.run(arena, .{
+    const cause = try spore_internal.hvf.vm.run(arena, .{
         .kernel = kernel,
         .ram_size = mem_mib * 1024 * 1024,
         .cmdline = effective_cmdline,
@@ -188,10 +188,10 @@ pub fn main(init: std.process.Init) !void {
 
 fn openTrustedRamBacking(allocator: std.mem.Allocator, resume_dir: ?[]const u8) !?std.c.fd_t {
     const dir = resume_dir orelse return null;
-    const parsed = try sporevm.spore.loadManifest(allocator, dir);
+    const parsed = try spore_internal.spore.loadManifest(allocator, dir);
     defer parsed.deinit();
     const backing = parsed.value.memory.backing orelse return null;
-    const path = try sporevm.spore.memoryBackingPath(allocator, dir, backing);
+    const path = try spore_internal.spore.memoryBackingPath(allocator, dir, backing);
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
     if (fd < 0) {
         std.debug.print("trusted RAM backing unavailable: {s}; falling back to chunks\n", .{path});

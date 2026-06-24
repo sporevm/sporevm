@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const block_source = @import("block_source.zig");
+const contracts = @import("contracts.zig");
 const chunklib = @import("chunk.zig");
 const cow_disk = @import("cow_disk.zig");
 const disk_layer = @import("disk_layer.zig");
@@ -41,9 +42,9 @@ pub const rootfs_policy_exact_bytes = "exact-bytes";
 pub const rootfs_policy_metadata_only = "metadata-only";
 pub const disk_layers_blake3_dir_path = "disklayers/blake3";
 pub const disk_objects_blake3_dir_path = "diskobjects/blake3";
-pub const inspect_bundle_schema = "spore.bundle.inspect.v1";
-pub const pull_result_schema = "spore.pull.result.v1";
-pub const bundle_schema_version: u32 = 1;
+pub const inspect_bundle_schema = contracts.inspect_bundle_schema;
+pub const pull_result_schema = contracts.pull_result_schema;
+pub const bundle_schema_version = contracts.bundle_schema_version;
 
 pub const RootfsBundlePolicy = enum {
     exact_bytes,
@@ -123,34 +124,13 @@ pub const PullOptions = struct {
     aws_executable: []const u8 = "aws",
 };
 
-pub const DigestRef = machine_output.DigestRef;
-pub const CacheState = machine_output.CacheState;
-pub const ChunkMaterializationSummary = machine_output.ChunkMaterializationSummary;
-pub const RootfsMaterializationSummary = machine_output.RootfsMaterializationSummary;
-
-pub const RemoteBundleCache = struct {
-    cache_hit: bool = false,
-    origin_bytes_read: u64 = 0,
-    peer_bytes_read: u64 = 0,
-};
-
-pub const BundleChildrenSummary = struct {
-    count: usize = 0,
-    selected_child: ?[]const u8 = null,
-};
-
-pub const PullResult = struct {
-    schema: []const u8 = pull_result_schema,
-    schema_version: u32 = bundle_schema_version,
-    source: []const u8,
-    bundle_dir: []const u8,
-    out_dir: []const u8,
-    bundle_digest: DigestRef,
-    materialization: ChunkMaterializationSummary,
-    rootfs: RootfsMaterializationSummary = .{},
-    remote: RemoteBundleCache = .{},
-    children: BundleChildrenSummary = .{},
-};
+pub const DigestRef = contracts.DigestRef;
+pub const CacheState = contracts.CacheState;
+pub const ChunkMaterializationSummary = contracts.ChunkMaterializationSummary;
+pub const RootfsMaterializationSummary = contracts.RootfsMaterializationSummary;
+pub const RemoteBundleCache = contracts.RemoteBundleCache;
+pub const BundleChildrenSummary = contracts.BundleChildrenSummary;
+pub const PullResult = contracts.PullResult;
 
 pub const ChildRange = struct {
     start: u32,
@@ -163,47 +143,11 @@ pub const InspectBundleOptions = struct {
     child_range: ?ChildRange = null,
 };
 
-pub const BundleChildSummary = struct {
-    id: []const u8,
-    manifest: []const u8,
-};
-
-pub const BundleSelectionSummary = struct {
-    kind: []const u8,
-    selected_count: usize = 0,
-    children: []const BundleChildSummary = &.{},
-};
-
-pub const ChunkpackSummary = struct {
-    chunk_count: usize,
-    pack_count: usize,
-    payload_bytes: u64,
-};
-
-pub const RootfsBundleSummary = struct {
-    artifact_count: usize = 0,
-    storage_count: usize = 0,
-    exact_bytes_count: usize = 0,
-    metadata_only_count: usize = 0,
-    object_count: usize = 0,
-    payload_bytes: u64 = 0,
-};
-
-pub const InspectBundleResult = struct {
-    schema: []const u8 = inspect_bundle_schema,
-    schema_version: u32 = bundle_schema_version,
-    source: []const u8,
-    bundle_dir: []const u8,
-    bundle_digest: DigestRef,
-    indexed: bool,
-    parent_manifest: []const u8,
-    chunkpack_index: []const u8,
-    chunkpack: ChunkpackSummary,
-    child_count: usize = 0,
-    children: []const BundleChildSummary = &.{},
-    selection: BundleSelectionSummary = .{ .kind = "none" },
-    rootfs: RootfsBundleSummary = .{},
-};
+pub const BundleChildSummary = contracts.BundleChildSummary;
+pub const BundleSelectionSummary = contracts.BundleSelectionSummary;
+pub const ChunkpackSummary = contracts.ChunkpackSummary;
+pub const RootfsBundleSummary = contracts.RootfsBundleSummary;
+pub const InspectBundleResult = contracts.InspectBundleResult;
 
 pub const IndexChunk = struct {
     id: []const u8,
@@ -330,8 +274,10 @@ pub fn inspectBundle(allocator: std.mem.Allocator, options: InspectBundleOptions
     if (options.child_id != null and options.child_range != null) return error.BadManifest;
 
     const bundle_dir = try localBundleRefPath(allocator, options.source);
+    errdefer allocator.free(bundle_dir);
     try ensureInspectableBundlePath(allocator, bundle_dir);
     const bundle_digest = try digestHex(allocator, bundle_dir);
+    errdefer allocator.free(bundle_digest);
     const parsed_index = try loadIndex(allocator, bundle_dir);
     defer parsed_index.deinit();
     const chunkpack = try summarizeChunkpack(allocator, parsed_index.value);
@@ -342,13 +288,17 @@ pub fn inspectBundle(allocator: std.mem.Allocator, options: InspectBundleOptions
 
     if (options.child_id != null or options.child_range != null) return error.BadManifest;
     const rootfs = try inspectLegacyRootfs(allocator, bundle_dir);
+    const parent_manifest = allocator.dupe(u8, "manifest.json") catch return error.OutOfMemory;
+    errdefer allocator.free(parent_manifest);
+    const chunkpack_index = allocator.dupe(u8, index_path) catch return error.OutOfMemory;
+    errdefer allocator.free(chunkpack_index);
     return .{
         .source = options.source,
         .bundle_dir = bundle_dir,
         .bundle_digest = digestRef(bundle_digest),
         .indexed = false,
-        .parent_manifest = "manifest.json",
-        .chunkpack_index = index_path,
+        .parent_manifest = parent_manifest,
+        .chunkpack_index = chunkpack_index,
         .chunkpack = chunkpack,
         .rootfs = rootfs,
     };
@@ -365,15 +315,21 @@ fn inspectIndexedBundle(
     defer parsed_bundle.deinit();
     const bundle_index = parsed_bundle.value;
     const children = try childSummaries(allocator, bundle_index.children);
+    errdefer contracts.deinitBundleChildSummaries(allocator, children);
     const selection = try inspectSelection(allocator, bundle_index, options.child_id, options.child_range);
+    errdefer contracts.deinitBundleSelectionSummary(allocator, selection);
     const rootfs = try inspectIndexedRootfs(allocator, bundle_dir, bundle_index);
+    const parent_manifest = allocator.dupe(u8, bundle_index.parent_manifest) catch return error.OutOfMemory;
+    errdefer allocator.free(parent_manifest);
+    const chunkpack_index = allocator.dupe(u8, bundle_index.chunkpack_index) catch return error.OutOfMemory;
+    errdefer allocator.free(chunkpack_index);
     return .{
         .source = options.source,
         .bundle_dir = bundle_dir,
         .bundle_digest = digestRef(bundle_digest),
         .indexed = true,
-        .parent_manifest = bundle_index.parent_manifest,
-        .chunkpack_index = bundle_index.chunkpack_index,
+        .parent_manifest = parent_manifest,
+        .chunkpack_index = chunkpack_index,
         .chunkpack = chunkpack,
         .child_count = bundle_index.children.len,
         .children = children,
@@ -428,11 +384,23 @@ fn summarizeChunkpack(allocator: std.mem.Allocator, index: Index) Error!Chunkpac
 
 fn childSummaries(allocator: std.mem.Allocator, children: []const BundleChild) Error![]const BundleChildSummary {
     const out = allocator.alloc(BundleChildSummary, children.len) catch return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |summary| {
+            allocator.free(summary.id);
+            allocator.free(summary.manifest);
+        }
+        allocator.free(out);
+    }
     for (children, out) |child, *summary| {
+        const id = allocator.dupe(u8, child.id) catch return error.OutOfMemory;
+        errdefer allocator.free(id);
+        const manifest = allocator.dupe(u8, child.manifest) catch return error.OutOfMemory;
         summary.* = .{
-            .id = allocator.dupe(u8, child.id) catch return error.OutOfMemory,
-            .manifest = allocator.dupe(u8, child.manifest) catch return error.OutOfMemory,
+            .id = id,
+            .manifest = manifest,
         };
+        initialized += 1;
     }
     return out;
 }
@@ -445,25 +413,46 @@ fn inspectSelection(
 ) Error!BundleSelectionSummary {
     if (child_id) |raw| {
         const canonical = try canonicalChildId(allocator, raw);
+        defer allocator.free(canonical);
         const child = try findBundleChild(index, canonical);
         const children = allocator.alloc(BundleChildSummary, 1) catch return error.OutOfMemory;
-        children[0] = .{
-            .id = allocator.dupe(u8, child.id) catch return error.OutOfMemory,
-            .manifest = allocator.dupe(u8, child.manifest) catch return error.OutOfMemory,
-        };
+        errdefer allocator.free(children);
+        const id = allocator.dupe(u8, child.id) catch return error.OutOfMemory;
+        errdefer allocator.free(id);
+        const manifest = allocator.dupe(u8, child.manifest) catch return error.OutOfMemory;
+        errdefer {
+            allocator.free(manifest);
+        }
+        children[0] = .{ .id = id, .manifest = manifest };
         return .{ .kind = "child", .selected_count = 1, .children = children };
     }
 
     if (child_range) |range| {
         if (range.start > range.end) return error.BadManifest;
         var selected = std.array_list.Managed(BundleChildSummary).init(allocator);
+        errdefer {
+            for (selected.items) |child| {
+                allocator.free(child.id);
+                allocator.free(child.manifest);
+            }
+            selected.deinit();
+        }
         for (index.children) |child| {
             const value = std.fmt.parseInt(u32, child.id, 10) catch return error.BadManifest;
             if (value < range.start or value > range.end) continue;
-            try selected.append(.{
-                .id = allocator.dupe(u8, child.id) catch return error.OutOfMemory,
-                .manifest = allocator.dupe(u8, child.manifest) catch return error.OutOfMemory,
-            });
+            const id = allocator.dupe(u8, child.id) catch return error.OutOfMemory;
+            const manifest = allocator.dupe(u8, child.manifest) catch {
+                allocator.free(id);
+                return error.OutOfMemory;
+            };
+            selected.append(.{
+                .id = id,
+                .manifest = manifest,
+            }) catch {
+                allocator.free(id);
+                allocator.free(manifest);
+                return error.OutOfMemory;
+            };
         }
         if (selected.items.len == 0) return error.BadManifest;
         const children = selected.toOwnedSlice() catch return error.OutOfMemory;

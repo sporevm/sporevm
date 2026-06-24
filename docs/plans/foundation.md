@@ -1,8 +1,9 @@
 ---
 status: active
-last_reviewed: 2026-06-22
+last_reviewed: 2026-06-24
 related_plans:
   - buildkite/cleanroom: docs/plans/sandbox-suspend-wake.md
+  - docs/plans/machine-interfaces.md
   - docs/plans/run-bridge.md
   - docs/plans/lifecycle-monitor.md
   - docs/plans/local-image-ref-cache.md
@@ -40,6 +41,12 @@ SporeVM is standalone. Cleanroom is the first expected consumer through a backen
 adapter, but this repository owns the VMM, spore format, local rootfs utility,
 chunk/cache mechanics, and CLI.
 
+The Ghostty/libghostty precedent is the right shape for the SporeVM split:
+`libspore` is the shared Zig core, and `spore` is one adapter over the same
+product API source. Keep native callers on the Zig module and product APIs
+first; add a C ABI only after those APIs have proven stable enough to wrap
+without duplicating behavior.
+
 ## Goals
 
 - Boot a pinned aarch64 Linux kernel under KVM and HVF from one codebase.
@@ -47,6 +54,9 @@ chunk/cache mechanics, and CLI.
   vsock, rng, plus the generation MMIO device.
 - Define a versioned spore manifest whose machine state is architectural, not
   raw KVM or HVF structs.
+- Expose the shared product surface as `libspore`; keep the CLI from owning
+  product behavior even when its in-repo compile reaches that source through the
+  internal module root.
 - Prove same-backend suspend/restore, fork, lazy restore, and same-host RAM
   sharing on KVM and HVF.
 - Prove identical-host fan-out distribution with content verification and bounded
@@ -116,6 +126,7 @@ contract.
 | Slice 2: HVF boot | Complete for the foundation target | Continue using Apple Silicon smokes for regressions. |
 | Product run bridge | Landed | See `docs/plans/run-bridge.md`; future OCI/writable policy is out of this plan. |
 | Named lifecycle | Experimental; macOS sandbox and Linux seccomp deny child process execution; local HVF landed; KVM create/exec/ls/rm parity landed | Broader jail policy before stable lifecycle support; speed work including local image ref caching, KVM suspend/resume evidence, and disk-backed lifecycle resume; see `docs/plans/lifecycle-monitor.md`. |
+| libspore shared core | Active | The Zig module is published as `libspore`; `src/api.zig` is the product surface, including run/resume with typed events. Backend, device, storage, daemon, and CLI modules are not re-exported. |
 | Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Keep writable disk product smoke coverage as regression evidence. |
 | Slice 4: fork and generation protocol | Complete for correctness | `/run/sporevm` is the live metadata contract; keep fan-out identity smokes as regression coverage. |
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |

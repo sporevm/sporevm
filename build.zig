@@ -14,7 +14,12 @@ pub fn build(b: *std.Build) void {
     });
     const macos_framework_path = macosFrameworkPath(b);
 
-    const mod = b.addModule("sporevm", .{
+    const libspore_mod = b.addModule("libspore", .{
+        .root_source_file = b.path("src/libspore.zig"),
+        .target = target,
+        .link_libc = true,
+    });
+    const internal_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .link_libc = true,
@@ -35,7 +40,10 @@ pub fn build(b: *std.Build) void {
     for (minimal_exec_sources) |src| {
         minimal_exec_assets.addFileInput(b.path(b.fmt("guest/minimal-initrd/{s}.c", .{src})));
     }
-    mod.addAnonymousImport("run_assets", .{
+    libspore_mod.addAnonymousImport("run_assets", .{
+        .root_source_file = minimal_exec_initrd_module,
+    });
+    internal_mod.addAnonymousImport("run_assets", .{
         .root_source_file = minimal_exec_initrd_module,
     });
 
@@ -43,9 +51,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
+    libspore_mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
+    internal_mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
     if (target_is_hvf) {
-        linkHypervisor(mod, macos_framework_path);
+        linkHypervisor(libspore_mod, macos_framework_path);
+        linkHypervisor(internal_mod, macos_framework_path);
     }
 
     const exe_mod = b.createModule(.{
@@ -53,7 +63,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "sporevm", .module = mod },
+            .{ .name = "spore_internal", .module = internal_mod },
         },
     });
     if (target_is_hvf) {
@@ -84,13 +94,27 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const mod_tests = b.addTest(.{ .root_module = mod });
-    const run_mod_tests = b.addRunArtifact(mod_tests);
+    const libspore_tests = b.addTest(.{ .root_module = libspore_mod });
+    const run_libspore_tests = b.addRunArtifact(libspore_tests);
+    const libspore_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("src/libspore_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "libspore", .module = libspore_mod },
+        },
+    });
+    const libspore_smoke_tests = b.addTest(.{ .root_module = libspore_smoke_mod });
+    const run_libspore_smoke_tests = b.addRunArtifact(libspore_smoke_tests);
+    const internal_tests = b.addTest(.{ .root_module = internal_mod });
+    const run_internal_tests = b.addRunArtifact(internal_tests);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_libspore_tests.step);
+    test_step.dependOn(&run_libspore_smoke_tests.step);
+    test_step.dependOn(&run_internal_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
     // Hypervisor.framework smoke test: host-only, needs entitlement signing.
@@ -102,7 +126,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
             .imports = &.{
-                .{ .name = "sporevm", .module = mod },
+                .{ .name = "spore_internal", .module = internal_mod },
             },
         });
         linkHypervisor(smoke_mod, macos_framework_path);
@@ -138,7 +162,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
             .imports = &.{
-                .{ .name = "sporevm", .module = mod },
+                .{ .name = "spore_internal", .module = internal_mod },
             },
         });
         linkHypervisor(boot_mod, macos_framework_path);
@@ -167,7 +191,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
             .imports = &.{
-                .{ .name = "sporevm", .module = mod },
+                .{ .name = "spore_internal", .module = internal_mod },
             },
         });
 

@@ -1,17 +1,218 @@
-//! Internal product API boundary used by the CLI and future embedding layers.
+//! Product API boundary used by the CLI and future embedding layers.
 
 const std = @import("std");
 
 const bundle = @import("bundle.zig");
+const contracts = @import("contracts.zig");
+const context_mod = @import("context.zig");
 const local_paths = @import("local_paths.zig");
 const platform = @import("platform.zig");
 const resume_mod = @import("resume.zig");
 const run_mod = @import("run.zig");
+const spore = @import("spore.zig");
+
+pub const Context = context_mod.Context;
 
 pub const CacheRoot = union(enum) {
     env,
     none,
     path: []const u8,
+};
+
+pub const HostInfo = struct {
+    schema: []const u8 = platform.host_info_schema,
+    schema_version: u32 = platform.host_info_schema_version,
+    host_class: []const u8,
+    platform: PlatformFacts,
+    backends: []const BackendAvailability,
+    cache_roots: CacheRoots,
+};
+
+pub const PlatformFacts = struct {
+    os: []const u8,
+    arch: []const u8,
+    cpu_profile: []const u8,
+    device_model_version: u32,
+    ram_base: u64,
+    gic_dist_base: u64,
+    gic_redist_base: u64,
+    counter_frequency_source: []const u8,
+    counter_frequency_hz: u64,
+};
+
+pub const BackendAvailability = struct {
+    name: []const u8,
+    supported: bool,
+    available: bool,
+    reason: []const u8,
+};
+
+pub const CacheRoots = struct {
+    kernels: PathFact,
+    rootfs: PathFact,
+    bundles: PathFact,
+    runtime: PathFact,
+};
+
+pub const PathFact = struct {
+    path: ?[]const u8,
+    resolved: bool,
+    source: []const u8,
+};
+
+pub const RootfsBundlePolicy = enum {
+    exact_bytes,
+    metadata_only,
+};
+
+pub const ChildRange = struct {
+    start: u32,
+    end: u32,
+};
+
+pub const InspectBundleOptions = struct {
+    source: []const u8,
+    child_id: ?[]const u8 = null,
+    child_range: ?ChildRange = null,
+};
+
+pub const DigestRef = contracts.DigestRef;
+pub const CacheState = contracts.CacheState;
+pub const ChunkMaterializationSummary = contracts.ChunkMaterializationSummary;
+pub const RootfsMaterializationSummary = contracts.RootfsMaterializationSummary;
+pub const RemoteBundleCache = contracts.RemoteBundleCache;
+pub const BundleChildrenSummary = contracts.BundleChildrenSummary;
+pub const PullResult = contracts.PullResult;
+pub const BundleChildSummary = contracts.BundleChildSummary;
+pub const BundleSelectionSummary = contracts.BundleSelectionSummary;
+pub const ChunkpackSummary = contracts.ChunkpackSummary;
+pub const RootfsBundleSummary = contracts.RootfsBundleSummary;
+pub const InspectBundleResult = contracts.InspectBundleResult;
+
+pub const Backend = run_mod.Backend;
+pub const MemoryConfig = run_mod.MemoryConfig;
+pub const CaptureTrigger = run_mod.CaptureTrigger;
+pub const NetworkMode = run_mod.NetworkMode;
+pub const NetworkPolicy = run_mod.NetworkPolicy;
+pub const Rootfs = run_mod.Rootfs;
+pub const Disk = run_mod.Disk;
+pub const RunResult = run_mod.Result;
+pub const ResumeResult = run_mod.Result;
+pub const RunEvent = run_mod.RunEvent;
+pub const EventSink = run_mod.EventSink;
+pub const ClassifiedFailure = run_mod.ClassifiedFailure;
+pub const FailureCode = run_mod.FailureCode;
+pub const FailureScope = run_mod.FailureScope;
+pub const Timings = run_mod.Timings;
+pub const StartEvent = run_mod.StartEvent;
+pub const ReadyEvent = run_mod.ReadyEvent;
+pub const OutputEvent = run_mod.OutputEvent;
+pub const ExitEvent = run_mod.ExitEvent;
+pub const FailureEvent = run_mod.FailureEvent;
+
+pub const RunOptions = struct {
+    backend: Backend = .auto,
+    kernel_path: []const u8,
+    initrd_path: ?[]const u8 = null,
+    rootfs_path: ?[]const u8 = null,
+    rootfs: ?Rootfs = null,
+    disk: ?Disk = null,
+    command: []const []const u8,
+    guest_env: []const []const u8 = &.{},
+    guest_working_dir: ?[]const u8 = null,
+    memory: MemoryConfig = .{},
+    vcpus: u32 = 1,
+    guest_port: u32 = 10700,
+    timeout_ms: u64 = 30_000,
+    capture_path: ?[]const u8 = null,
+    capture_trigger: CaptureTrigger = .exit,
+    continue_after_capture: bool = false,
+    network: NetworkMode = .disabled,
+    network_policy: NetworkPolicy = .{},
+    spore_executable: []const u8 = "spore",
+    events: ?EventSink = null,
+};
+
+pub const ResumeOptions = struct {
+    backend: Backend = .auto,
+    spore_dir: []const u8,
+    spore_executable: []const u8 = "spore",
+    events: ?EventSink = null,
+};
+
+pub const ForkOptions = struct {
+    parent_dir: []const u8,
+    out_dir: []const u8,
+    count: usize,
+};
+
+pub const ForkResult = struct {
+    parent: []const u8,
+    out_dir: []const u8,
+    count: usize,
+    parent_generation: u64,
+    first_generation: u64,
+    last_generation: u64,
+    first_child: []const u8,
+    last_child: []const u8,
+};
+
+pub const PackOptions = struct {
+    spore_dir: []const u8,
+    out_dir: []const u8,
+    rootfs_cache: CacheRoot = .env,
+    children_dir: ?[]const u8 = null,
+    rootfs_policy: RootfsBundlePolicy = .exact_bytes,
+};
+
+pub const PackResult = struct {
+    source: []const u8,
+    out_dir: []const u8,
+    bundle_digest: []const u8,
+    chunk_count: usize,
+    packed_chunk_count: usize,
+    pack_count: usize,
+    payload_bytes: u64,
+    rootfs_artifact_count: usize = 0,
+    rootfs_payload_bytes: u64 = 0,
+    child_count: usize = 0,
+};
+
+pub const UnpackOptions = struct {
+    bundle_dir: []const u8,
+    out_dir: []const u8,
+    rootfs_cache: CacheRoot = .env,
+    child_id: ?[]const u8 = null,
+    allow_metadata_only_rootfs: bool = false,
+};
+
+pub const UnpackResult = struct {
+    bundle: []const u8,
+    out_dir: []const u8,
+    bundle_digest: []const u8,
+    chunk_count: usize,
+    unpacked_chunk_count: usize,
+    payload_bytes: u64,
+    rootfs_artifact_count: usize = 0,
+    rootfs_payload_bytes: u64 = 0,
+    child_count: usize = 0,
+    selected_child: ?[]const u8 = null,
+};
+
+pub const PushOptions = struct {
+    bundle_dir: []const u8,
+    destination: []const u8,
+    aws_region: ?[]const u8 = null,
+    aws_executable: []const u8 = "aws",
+};
+
+pub const PushResult = struct {
+    source: []const u8,
+    destination: []const u8,
+    store: []const u8 = "s3",
+    bundle_digest: []const u8,
+    uploaded_file_count: usize,
+    uploaded_bytes: u64,
 };
 
 pub const PullOptions = struct {
@@ -25,31 +226,294 @@ pub const PullOptions = struct {
     aws_executable: []const u8 = "aws",
 };
 
+pub const SporePlatformSummary = struct {
+    arch: []const u8,
+    cpu_profile: []const u8,
+    device_model_version: u32,
+    ram_base: u64,
+    ram_size: u64,
+    gic_dist_base: u64,
+    gic_redist_base: u64,
+    counter_frequency_hz: u64,
+};
+
+pub const SporeInspectResult = struct {
+    version: u32,
+    platform: SporePlatformSummary,
+    device_count: usize,
+    memory_chunk_count: usize,
+    present_memory_chunk_count: usize,
+    memory_backing_kind: ?[]const u8,
+    memory_backing_size: ?u64,
+    gic_kind: []const u8,
+};
+
 pub fn hostInfo(
+    context: Context,
     allocator: std.mem.Allocator,
-    environ_map: *const std.process.Environ.Map,
-) !platform.HostInfo {
-    return platform.hostInfo(allocator, environ_map);
+) !HostInfo {
+    const info = try platform.hostInfo(allocator, context.environ_map);
+    errdefer platform.deinitHostInfo(allocator, info);
+
+    const backends = try allocator.alloc(BackendAvailability, info.backends.len);
+    errdefer allocator.free(backends);
+    for (info.backends, backends) |backend, *out| {
+        out.* = .{
+            .name = backend.name,
+            .supported = backend.supported,
+            .available = backend.available,
+            .reason = backend.reason,
+        };
+    }
+    allocator.free(info.backends);
+
+    return .{
+        .host_class = info.host_class,
+        .platform = .{
+            .os = info.platform.os,
+            .arch = info.platform.arch,
+            .cpu_profile = info.platform.cpu_profile,
+            .device_model_version = info.platform.device_model_version,
+            .ram_base = info.platform.ram_base,
+            .gic_dist_base = info.platform.gic_dist_base,
+            .gic_redist_base = info.platform.gic_redist_base,
+            .counter_frequency_source = info.platform.counter_frequency_source,
+            .counter_frequency_hz = info.platform.counter_frequency_hz,
+        },
+        .backends = backends,
+        .cache_roots = .{
+            .kernels = pathFact(info.cache_roots.kernels),
+            .rootfs = pathFact(info.cache_roots.rootfs),
+            .bundles = pathFact(info.cache_roots.bundles),
+            .runtime = pathFact(info.cache_roots.runtime),
+        },
+    };
+}
+
+pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
+    allocator.free(info.backends);
+    freePathFact(allocator, info.cache_roots.kernels);
+    freePathFact(allocator, info.cache_roots.rootfs);
+    freePathFact(allocator, info.cache_roots.bundles);
+    freePathFact(allocator, info.cache_roots.runtime);
+}
+
+pub fn inspectSpore(
+    allocator: std.mem.Allocator,
+    spore_dir: []const u8,
+) !SporeInspectResult {
+    const manifest = try spore.loadManifest(allocator, spore_dir);
+    defer manifest.deinit();
+    return summarizeSpore(allocator, manifest.value);
+}
+
+pub fn deinitSporeInspectResult(allocator: std.mem.Allocator, result: SporeInspectResult) void {
+    allocator.free(result.platform.arch);
+    allocator.free(result.platform.cpu_profile);
+    if (result.memory_backing_kind) |kind| allocator.free(kind);
+}
+
+pub fn classifyFailure(err: anyerror) ClassifiedFailure {
+    return run_mod.classifyFailure(err);
+}
+
+pub fn run(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: RunOptions,
+) !RunResult {
+    return run_mod.execute(context, allocator, .{
+        .backend = options.backend,
+        .kernel_path = options.kernel_path,
+        .initrd_path = options.initrd_path,
+        .rootfs_path = options.rootfs_path,
+        .rootfs = options.rootfs,
+        .disk = options.disk,
+        .command = options.command,
+        .guest_env = options.guest_env,
+        .guest_working_dir = options.guest_working_dir,
+        .memory = options.memory,
+        .vcpus = options.vcpus,
+        .guest_port = options.guest_port,
+        .timeout_ms = options.timeout_ms,
+        .stream_output = false,
+        .capture_path = options.capture_path,
+        .capture_trigger = options.capture_trigger,
+        .continue_after_capture = options.continue_after_capture,
+        .network = options.network,
+        .network_policy = options.network_policy,
+        .spore_executable = options.spore_executable,
+        .events = options.events,
+    });
+}
+
+pub fn resumeSpore(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: ResumeOptions,
+) !ResumeResult {
+    return resume_mod.execute(context, allocator, .{
+        .backend = options.backend,
+        .spore_dir = options.spore_dir,
+        .spore_executable = options.spore_executable,
+        .events = options.events,
+    });
+}
+
+pub fn fork(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: ForkOptions,
+) !ForkResult {
+    const result = try spore.fork(allocator, .{
+        .parent_dir = options.parent_dir,
+        .out_dir = options.out_dir,
+        .count = options.count,
+        .environ_map = context.environ_map,
+    });
+    return .{
+        .parent = result.parent,
+        .out_dir = result.out_dir,
+        .count = result.count,
+        .parent_generation = result.parent_generation,
+        .first_generation = result.first_generation,
+        .last_generation = result.last_generation,
+        .first_child = result.first_child,
+        .last_child = result.last_child,
+    };
+}
+
+pub fn deinitForkResult(allocator: std.mem.Allocator, result: ForkResult) void {
+    allocator.free(result.first_child);
+    allocator.free(result.last_child);
+}
+
+pub fn pack(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: PackOptions,
+) !PackResult {
+    const rootfs_cache = resolveCacheRoot(options.rootfs_cache, allocator, context.environ_map, .rootfs);
+    defer rootfs_cache.deinit(allocator);
+
+    const result = try bundle.pack(allocator, .{
+        .io = context.io,
+        .spore_dir = options.spore_dir,
+        .out_dir = options.out_dir,
+        .rootfs_cache_dir = rootfs_cache.path,
+        .children_dir = options.children_dir,
+        .rootfs_policy = rootfsBundlePolicy(options.rootfs_policy),
+    });
+    return .{
+        .source = result.source,
+        .out_dir = result.out_dir,
+        .bundle_digest = result.bundle_digest,
+        .chunk_count = result.chunk_count,
+        .packed_chunk_count = result.packed_chunk_count,
+        .pack_count = result.pack_count,
+        .payload_bytes = result.payload_bytes,
+        .rootfs_artifact_count = result.rootfs_artifact_count,
+        .rootfs_payload_bytes = result.rootfs_payload_bytes,
+        .child_count = result.child_count,
+    };
+}
+
+pub fn deinitPackResult(allocator: std.mem.Allocator, result: PackResult) void {
+    allocator.free(result.bundle_digest);
+}
+
+pub fn unpack(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: UnpackOptions,
+) !UnpackResult {
+    const rootfs_cache = resolveCacheRoot(options.rootfs_cache, allocator, context.environ_map, .rootfs);
+    defer rootfs_cache.deinit(allocator);
+
+    const result = try bundle.unpack(allocator, .{
+        .io = context.io,
+        .bundle_dir = options.bundle_dir,
+        .out_dir = options.out_dir,
+        .rootfs_cache_dir = rootfs_cache.path,
+        .child_id = options.child_id,
+        .allow_metadata_only_rootfs = options.allow_metadata_only_rootfs,
+    });
+    return .{
+        .bundle = result.bundle,
+        .out_dir = result.out_dir,
+        .bundle_digest = result.bundle_digest,
+        .chunk_count = result.chunk_count,
+        .unpacked_chunk_count = result.unpacked_chunk_count,
+        .payload_bytes = result.payload_bytes,
+        .rootfs_artifact_count = result.rootfs_artifact_count,
+        .rootfs_payload_bytes = result.rootfs_payload_bytes,
+        .child_count = result.child_count,
+        .selected_child = result.selected_child,
+    };
+}
+
+pub fn deinitUnpackResult(allocator: std.mem.Allocator, result: UnpackResult) void {
+    allocator.free(result.bundle_digest);
+    if (result.selected_child) |child| allocator.free(child);
+}
+
+pub fn push(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: PushOptions,
+) !PushResult {
+    const result = try bundle.push(allocator, .{
+        .io = context.io,
+        .bundle_dir = options.bundle_dir,
+        .destination = options.destination,
+        .aws_region = options.aws_region,
+        .aws_executable = options.aws_executable,
+    });
+    return .{
+        .source = result.source,
+        .destination = result.destination,
+        .store = result.store,
+        .bundle_digest = result.bundle_digest,
+        .uploaded_file_count = result.uploaded_file_count,
+        .uploaded_bytes = result.uploaded_bytes,
+    };
+}
+
+pub fn deinitPushResult(allocator: std.mem.Allocator, result: PushResult) void {
+    allocator.free(result.bundle_digest);
 }
 
 pub fn inspectBundle(
     allocator: std.mem.Allocator,
-    options: bundle.InspectBundleOptions,
-) !bundle.InspectBundleResult {
-    return bundle.inspectBundle(allocator, options);
+    options: InspectBundleOptions,
+) !InspectBundleResult {
+    return bundle.inspectBundle(allocator, .{
+        .source = options.source,
+        .child_id = options.child_id,
+        .child_range = if (options.child_range) |range| .{ .start = range.start, .end = range.end } else null,
+    });
+}
+
+pub fn deinitInspectBundleResult(allocator: std.mem.Allocator, result: InspectBundleResult) void {
+    contracts.deinitInspectBundleResult(allocator, result);
 }
 
 pub fn pull(
-    init: std.process.Init,
+    context: Context,
     allocator: std.mem.Allocator,
     options: PullOptions,
-) !bundle.PullResult {
+) !PullResult {
+    const rootfs_cache = resolveCacheRoot(options.rootfs_cache, allocator, context.environ_map, .rootfs);
+    defer rootfs_cache.deinit(allocator);
+    const bundle_cache = resolveCacheRoot(options.bundle_cache, allocator, context.environ_map, .bundle);
+    defer bundle_cache.deinit(allocator);
+
     return bundle.pull(allocator, .{
-        .io = init.io,
+        .io = context.io,
         .source = options.source,
         .out_dir = options.out_dir,
-        .rootfs_cache_dir = cacheRoot(options.rootfs_cache, allocator, init.environ_map, .rootfs),
-        .bundle_cache_dir = cacheRoot(options.bundle_cache, allocator, init.environ_map, .bundle),
+        .rootfs_cache_dir = rootfs_cache.path,
+        .bundle_cache_dir = bundle_cache.path,
         .child_id = options.child_id,
         .allow_metadata_only_rootfs = options.allow_metadata_only_rootfs,
         .aws_region = options.aws_region,
@@ -57,20 +521,47 @@ pub fn pull(
     });
 }
 
-pub fn runCommand(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: run_mod.Options,
-) !run_mod.Result {
-    return run_mod.execute(init, allocator, options);
+pub fn deinitPullResult(allocator: std.mem.Allocator, result: PullResult) void {
+    contracts.deinitPullResult(allocator, result);
 }
 
-pub fn resumeCommand(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: resume_mod.Options,
-) !run_mod.Result {
-    return resume_mod.execute(init, allocator, options);
+fn summarizeSpore(allocator: std.mem.Allocator, manifest: spore.Manifest) !SporeInspectResult {
+    var present_chunks: usize = 0;
+    for (manifest.memory.chunks) |maybe_chunk| {
+        if (maybe_chunk != null) present_chunks += 1;
+    }
+
+    return .{
+        .version = manifest.version,
+        .platform = .{
+            .arch = try allocator.dupe(u8, manifest.platform.arch),
+            .cpu_profile = try allocator.dupe(u8, manifest.platform.cpu_profile),
+            .device_model_version = manifest.platform.device_model_version,
+            .ram_base = manifest.platform.ram_base,
+            .ram_size = manifest.platform.ram_size,
+            .gic_dist_base = manifest.platform.gic_dist_base,
+            .gic_redist_base = manifest.platform.gic_redist_base,
+            .counter_frequency_hz = manifest.platform.counter_frequency_hz,
+        },
+        .device_count = manifest.devices.len,
+        .memory_chunk_count = manifest.memory.chunks.len,
+        .present_memory_chunk_count = present_chunks,
+        .memory_backing_kind = if (manifest.memory.backing) |backing| try allocator.dupe(u8, backing.kind) else null,
+        .memory_backing_size = if (manifest.memory.backing) |backing| backing.size else null,
+        .gic_kind = @tagName(manifest.machine.gic.kind),
+    };
+}
+
+fn pathFact(fact: platform.PathFact) PathFact {
+    return .{
+        .path = fact.path,
+        .resolved = fact.resolved,
+        .source = fact.source,
+    };
+}
+
+fn freePathFact(allocator: std.mem.Allocator, fact: PathFact) void {
+    if (fact.path) |path| allocator.free(path);
 }
 
 const CacheKind = enum {
@@ -78,18 +569,34 @@ const CacheKind = enum {
     bundle,
 };
 
-fn cacheRoot(
+const ResolvedCacheRoot = struct {
+    path: ?[]const u8 = null,
+    owned: bool = false,
+
+    fn deinit(self: ResolvedCacheRoot, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.path.?);
+    }
+};
+
+fn resolveCacheRoot(
     requested: CacheRoot,
     allocator: std.mem.Allocator,
     environ_map: *const std.process.Environ.Map,
     kind: CacheKind,
-) ?[]const u8 {
+) ResolvedCacheRoot {
     return switch (requested) {
-        .none => null,
-        .path => |path| path,
+        .none => .{},
+        .path => |path| .{ .path = path },
         .env => switch (kind) {
-            .rootfs => local_paths.rootfsCacheRootPath(allocator, environ_map) catch null,
-            .bundle => local_paths.bundleCacheRootPath(allocator, environ_map) catch null,
+            .rootfs => if (local_paths.rootfsCacheRootPath(allocator, environ_map) catch null) |path| .{ .path = path, .owned = true } else .{},
+            .bundle => if (local_paths.bundleCacheRootPath(allocator, environ_map) catch null) |path| .{ .path = path, .owned = true } else .{},
         },
+    };
+}
+
+fn rootfsBundlePolicy(policy: RootfsBundlePolicy) bundle.RootfsBundlePolicy {
+    return switch (policy) {
+        .exact_bytes => .exact_bytes,
+        .metadata_only => .metadata_only,
     };
 }

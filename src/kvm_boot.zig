@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const sporevm = @import("sporevm");
+const spore_internal = @import("spore_internal");
 
 fn consoleSink(bytes: []const u8) void {
     var remaining = bytes;
@@ -168,7 +168,7 @@ pub fn main(init: std.process.Init) !void {
         "console=hvc0 loglevel=8";
 
     std.debug.print("sporevm kvm-boot: kernel={s} mem={d}MiB cmdline=\"{s}\"\n", .{ args[1], mem_mib, effective_cmdline });
-    const cause = try sporevm.kvm.vm.run(arena, .{
+    const cause = try spore_internal.kvm.vm.run(arena, .{
         .kernel = kernel,
         .ram_size = mem_mib * 1024 * 1024,
         .cmdline = effective_cmdline,
@@ -188,10 +188,10 @@ pub fn main(init: std.process.Init) !void {
 
 fn openTrustedRamBacking(allocator: std.mem.Allocator, resume_dir: ?[]const u8) !?std.c.fd_t {
     const dir = resume_dir orelse return null;
-    const parsed = try sporevm.spore.loadManifest(allocator, dir);
+    const parsed = try spore_internal.spore.loadManifest(allocator, dir);
     defer parsed.deinit();
     const backing = parsed.value.memory.backing orelse return null;
-    const path = try sporevm.spore.memoryBackingPath(allocator, dir, backing);
+    const path = try spore_internal.spore.memoryBackingPath(allocator, dir, backing);
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
     if (fd < 0) {
         std.debug.print("trusted RAM backing unavailable: {s}; falling back to chunks\n", .{path});
@@ -216,7 +216,7 @@ fn receiveRamBackingViaFdpass(original_fd: std.c.fd_t) !std.c.fd_t {
 
     if (fork_rc == 0) {
         _ = std.c.close(sockets[0]);
-        sporevm.fdpass.sendFd(sockets[1], original_fd) catch std.process.exit(1);
+        spore_internal.fdpass.sendFd(sockets[1], original_fd) catch std.process.exit(1);
         _ = std.c.close(sockets[1]);
         std.process.exit(0);
     }
@@ -225,7 +225,7 @@ fn receiveRamBackingViaFdpass(original_fd: std.c.fd_t) !std.c.fd_t {
     _ = std.c.close(sockets[1]);
     _ = std.c.close(original_fd);
 
-    const received = sporevm.fdpass.recvFd(sockets[0]) catch |err| {
+    const received = spore_internal.fdpass.recvFd(sockets[0]) catch |err| {
         _ = std.c.close(sockets[0]);
         _ = waitForHelper(helper_pid) catch {};
         return err;

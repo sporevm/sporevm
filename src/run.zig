@@ -7,6 +7,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const block_source = @import("block_source.zig");
 const capture = @import("capture.zig");
+const Context = @import("context.zig").Context;
 const cow_disk = @import("cow_disk.zig");
 const disk_layer = @import("disk_layer.zig");
 const hvf = @import("hvf/hvf.zig");
@@ -63,6 +64,15 @@ const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const rootfs_trace_env = "SPOREVM_ROOTFS_TRACE";
 
+pub const MemoryConfig = memory_config.Config;
+pub const CaptureTrigger = capture.Trigger;
+pub const NetworkPolicy = spore_net_policy.Config;
+pub const Rootfs = spore.Rootfs;
+pub const Disk = spore.Disk;
+pub const ClassifiedFailure = machine_output.CliError;
+pub const FailureCode = machine_output.ErrorCode;
+pub const FailureScope = machine_output.Scope;
+
 pub const Backend = enum {
     auto,
     hvf,
@@ -106,7 +116,9 @@ pub const Options = struct {
     continue_after_capture: bool = false,
     network: NetworkMode = .disabled,
     network_policy: spore_net_policy.Config = .{},
-    event_writer: ?*EventWriter = null,
+    events: ?EventSink = null,
+    spore_executable: []const u8 = "spore",
+    debug: bool = false,
 };
 
 pub const NetworkMode = enum {
@@ -142,6 +154,163 @@ pub const Result = struct {
     }
 };
 
+pub const Timings = struct {
+    start_ms: u64,
+    vsock_connect_ms: u64,
+    exec_response_ms: u64,
+    probe_duration_ms: u64,
+};
+
+pub const StartEvent = struct {
+    command: []const u8,
+    requested_backend: Backend,
+};
+
+pub const ReadyEvent = struct {
+    command: []const u8,
+    backend: ?Backend,
+};
+
+pub const OutputEvent = struct {
+    command: []const u8,
+    backend: ?Backend,
+    offset: u64,
+    bytes: []const u8,
+};
+
+pub const ExitEvent = struct {
+    command: []const u8,
+    backend: Backend,
+    exit_code: i32,
+    vcpus: u32,
+    memory_bytes: u64,
+    captured: bool = false,
+    capture_path: ?[]const u8 = null,
+    timings: Timings,
+};
+
+pub const FailureEvent = struct {
+    command: []const u8,
+    backend: ?Backend,
+    classified: ClassifiedFailure,
+};
+
+/// Runtime lifecycle events delivered synchronously to EventSink.
+/// Output bytes are callback-scoped. Ready is emitted at most once, and exit or
+/// failure is emitted at most once as the terminal event.
+pub const RunEvent = union(enum) {
+    start: StartEvent,
+    ready: ReadyEvent,
+    stdout: OutputEvent,
+    stderr: OutputEvent,
+    exit: ExitEvent,
+    failure: FailureEvent,
+};
+
+/// Callback interface for run/resume lifecycle consumers. If the sink fails
+/// while relaying guest output or readiness, execution records the failure and
+/// returns error.EventSinkFailed after the terminal event path completes.
+pub const EventSink = struct {
+    context: ?*anyopaque = null,
+    emitFn: *const fn (?*anyopaque, RunEvent) anyerror!void,
+
+    pub fn emit(self: EventSink, event: RunEvent) !void {
+        try self.emitFn(self.context, event);
+    }
+};
+
+pub const EventEmitter = struct {
+    sink: ?EventSink,
+    command: []const u8,
+    backend: ?Backend = null,
+    ready_emitted: bool = false,
+    terminal_emitted: bool = false,
+    stdout_offset: u64 = 0,
+    stderr_offset: u64 = 0,
+    write_failed: bool = false,
+
+    pub fn init(sink: ?EventSink, command: []const u8) EventEmitter {
+        return .{ .sink = sink, .command = command };
+    }
+
+    pub fn emitStart(self: *EventEmitter, requested_backend: Backend) !void {
+        if (self.sink) |sink| try sink.emit(.{ .start = .{ .command = self.command, .requested_backend = requested_backend } });
+    }
+
+    pub fn setBackend(self: *EventEmitter, backend: Backend) void {
+        self.backend = backend;
+    }
+
+    pub fn emitReady(self: *EventEmitter) !void {
+        if (self.ready_emitted) return;
+        self.ready_emitted = true;
+        if (self.sink) |sink| try sink.emit(.{ .ready = .{ .command = self.command, .backend = self.backend } });
+    }
+
+    pub fn emitOutput(self: *EventEmitter, output: vsock.HostStreamOutput, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try self.emitReady();
+        const offset = switch (output) {
+            .stdout => self.stdout_offset,
+            .stderr => self.stderr_offset,
+        };
+        const event: RunEvent = switch (output) {
+            .stdout => .{ .stdout = .{ .command = self.command, .backend = self.backend, .offset = offset, .bytes = bytes } },
+            .stderr => .{ .stderr = .{ .command = self.command, .backend = self.backend, .offset = offset, .bytes = bytes } },
+        };
+        if (self.sink) |sink| try sink.emit(event);
+        const inc: u64 = @intCast(bytes.len);
+        switch (output) {
+            .stdout => self.stdout_offset += inc,
+            .stderr => self.stderr_offset += inc,
+        }
+    }
+
+    pub fn emitExit(self: *EventEmitter, result: Result) !void {
+        if (self.terminal_emitted) return;
+        self.setBackend(result.backend);
+        try self.emitReady();
+        self.terminal_emitted = true;
+        if (self.sink) |sink| try sink.emit(.{ .exit = exitEvent(self.command, result) });
+    }
+
+    pub fn emitFailure(self: *EventEmitter, err: anyerror) !void {
+        if (self.terminal_emitted) return;
+        self.terminal_emitted = true;
+        if (self.sink) |sink| try sink.emit(.{ .failure = .{ .command = self.command, .backend = self.backend, .classified = classifyFailure(err) } });
+    }
+
+    pub fn emitReadyBestEffort(self: *EventEmitter) void {
+        self.emitReady() catch {
+            self.write_failed = true;
+        };
+    }
+
+    pub fn emitOutputBestEffort(self: *EventEmitter, output: vsock.HostStreamOutput, bytes: []const u8) void {
+        self.emitOutput(output, bytes) catch {
+            self.write_failed = true;
+        };
+    }
+};
+
+fn exitEvent(command: []const u8, result: Result) ExitEvent {
+    return .{
+        .command = command,
+        .backend = result.backend,
+        .exit_code = result.exit_code,
+        .vcpus = result.vcpus,
+        .memory_bytes = result.memory_bytes,
+        .captured = result.captured,
+        .capture_path = result.capture_path,
+        .timings = .{
+            .start_ms = result.start_ms,
+            .vsock_connect_ms = result.vsock_connect_ms,
+            .exec_response_ms = result.exec_response_ms,
+            .probe_duration_ms = result.probe_duration_ms,
+        },
+    };
+}
+
 pub const EventWriter = struct {
     allocator: std.mem.Allocator,
     writer: *Io.Writer,
@@ -161,6 +330,29 @@ pub const EventWriter = struct {
         };
     }
 
+    pub fn sink(self: *EventWriter) EventSink {
+        return .{ .context = self, .emitFn = emitSink };
+    }
+
+    fn emitSink(context: ?*anyopaque, event: RunEvent) !void {
+        const self: *EventWriter = @ptrCast(@alignCast(context.?));
+        try self.emitEvent(event);
+    }
+
+    pub fn emitEvent(self: *EventWriter, event: RunEvent) !void {
+        switch (event) {
+            .start => |value| try self.emitStart(value.requested_backend),
+            .ready => |value| {
+                if (value.backend) |backend| self.setBackend(backend);
+                try self.emitReady();
+            },
+            .stdout => |value| try self.emitOutputEvent("stdout", value),
+            .stderr => |value| try self.emitOutputEvent("stderr", value),
+            .exit => |value| try self.emitExitEvent(value),
+            .failure => |value| try self.emitFailure(value.classified),
+        }
+    }
+
     pub fn emitStart(self: *EventWriter, requested_backend: Backend) !void {
         const event = struct {
             schema: []const u8 = machine_output.run_events_schema,
@@ -171,6 +363,62 @@ pub const EventWriter = struct {
         }{
             .command = self.command,
             .requested_backend = requested_backend.name(),
+        };
+        try self.write(event);
+    }
+
+    fn emitOutputEvent(self: *EventWriter, name: []const u8, output: OutputEvent) !void {
+        if (output.bytes.len == 0) return;
+        if (output.backend) |backend| self.setBackend(backend);
+        try self.emitReady();
+        const data_base64 = try base64Alloc(self.allocator, output.bytes);
+        defer self.allocator.free(data_base64);
+        const event = struct {
+            schema: []const u8 = machine_output.run_events_schema,
+            schema_version: u32 = machine_output.run_events_schema_version,
+            event: []const u8,
+            command: []const u8,
+            backend: ?[]const u8,
+            offset: u64,
+            byte_count: usize,
+            data_base64: []const u8,
+        }{
+            .event = name,
+            .command = output.command,
+            .backend = self.backend,
+            .offset = output.offset,
+            .byte_count = output.bytes.len,
+            .data_base64 = data_base64,
+        };
+        try self.write(event);
+    }
+
+    fn emitExitEvent(self: *EventWriter, value: ExitEvent) !void {
+        if (self.terminal_emitted) return;
+        self.setBackend(value.backend);
+        try self.emitReady();
+        self.terminal_emitted = true;
+        const event = struct {
+            schema: []const u8 = machine_output.run_events_schema,
+            schema_version: u32 = machine_output.run_events_schema_version,
+            event: []const u8 = "exit",
+            command: []const u8,
+            backend: []const u8,
+            exit_code: i32,
+            vcpus: u32,
+            memory_bytes: u64,
+            captured: bool,
+            capture_path: ?[]const u8,
+            timings: Timings,
+        }{
+            .command = value.command,
+            .backend = value.backend.name(),
+            .exit_code = value.exit_code,
+            .vcpus = value.vcpus,
+            .memory_bytes = value.memory_bytes,
+            .captured = value.captured,
+            .capture_path = value.capture_path,
+            .timings = value.timings,
         };
         try self.write(event);
     }
@@ -230,51 +478,12 @@ pub const EventWriter = struct {
     }
 
     pub fn emitExit(self: *EventWriter, result: Result) !void {
-        if (self.terminal_emitted) return;
-        self.setBackend(result.backend);
-        try self.emitReady();
-        self.terminal_emitted = true;
-        const event = struct {
-            schema: []const u8 = machine_output.run_events_schema,
-            schema_version: u32 = machine_output.run_events_schema_version,
-            event: []const u8 = "exit",
-            command: []const u8,
-            backend: []const u8,
-            exit_code: i32,
-            vcpus: u32,
-            memory_bytes: u64,
-            captured: bool,
-            capture_path: ?[]const u8,
-            timings: Timings,
-
-            const Timings = struct {
-                start_ms: u64,
-                vsock_connect_ms: u64,
-                exec_response_ms: u64,
-                probe_duration_ms: u64,
-            };
-        }{
-            .command = self.command,
-            .backend = result.backend.name(),
-            .exit_code = result.exit_code,
-            .vcpus = result.vcpus,
-            .memory_bytes = result.memory_bytes,
-            .captured = result.captured,
-            .capture_path = result.capture_path,
-            .timings = .{
-                .start_ms = result.start_ms,
-                .vsock_connect_ms = result.vsock_connect_ms,
-                .exec_response_ms = result.exec_response_ms,
-                .probe_duration_ms = result.probe_duration_ms,
-            },
-        };
-        try self.write(event);
+        try self.emitExitEvent(exitEvent(self.command, result));
     }
 
-    pub fn emitFailure(self: *EventWriter, err: anyerror) !void {
+    pub fn emitFailure(self: *EventWriter, classified: ClassifiedFailure) !void {
         if (self.terminal_emitted) return;
         self.terminal_emitted = true;
-        const classified = machine_output.fromZigError(err);
         const event = struct {
             schema: []const u8 = machine_output.run_events_schema,
             schema_version: u32 = machine_output.run_events_schema_version,
@@ -310,6 +519,10 @@ pub const EventWriter = struct {
         };
     }
 };
+
+pub fn classifyFailure(err: anyerror) ClassifiedFailure {
+    return machine_output.fromZigError(err);
+}
 
 pub fn machineErrorExitCode(err: anyerror) u8 {
     return machine_output.fromZigError(err).exit_code;
@@ -425,15 +638,19 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     var event_writer = EventWriter.init(std.heap.page_allocator, stdout, "run");
     if (parsed.event_mode == .jsonl) {
         opts.stream_output = false;
-        opts.event_writer = &event_writer;
-        try event_writer.emitStart(opts.backend);
+        opts.events = event_writer.sink();
     }
     try openConsoleLog(opts.console_log_path);
     defer closeConsoleLog();
 
-    const result = execute(init, arena, opts) catch |err| {
+    const full_args = try init.minimal.args.toSlice(arena);
+    opts.spore_executable = full_args[0];
+    opts.debug = runtimeDebugEnabled(full_args);
+    const result = execute(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, arena, opts) catch |err| {
         if (parsed.event_mode == .jsonl) {
-            try event_writer.emitFailure(err);
             std.process.exit(machine_output.fromZigError(err).exit_code);
         }
         if (isCaptureAborted(err)) std.process.exit(130);
@@ -450,7 +667,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         }
     }
     if (parsed.event_mode == .jsonl) {
-        try event_writer.emitExit(result);
+        try stdout.flush();
     }
     const code = result.processExitCode();
     if (code != 0) std.process.exit(code);
@@ -793,7 +1010,7 @@ fn resolveRootfsInputDetailed(
 }
 
 fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8, command_name: []const u8, record_artifact: bool) !ResolvedRootfsInput {
-    const cache_root = try rootfsCacheRootPath(init, allocator, command_name);
+    const cache_root = try rootfsCacheRootPath(.{ .io = init.io, .environ_map = init.environ_map }, allocator, command_name);
     try ensureDirPath(init.io, cache_root);
 
     const digest_pinned = try rootfs_mod.digestPinnedImageIdentity(allocator, image_ref, direct_image_platform);
@@ -962,8 +1179,8 @@ fn ensureDirPath(io: Io, path: []const u8) !void {
     existing.close(io);
 }
 
-pub fn rootfsCacheRootPath(init: std.process.Init, allocator: std.mem.Allocator, command_name: []const u8) ![]const u8 {
-    return local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
+pub fn rootfsCacheRootPath(context: Context, allocator: std.mem.Allocator, command_name: []const u8) ![]const u8 {
+    return local_paths.rootfsCacheRootPath(allocator, context.environ_map) catch |err| switch (err) {
         error.MissingHome => failRunSetup(
             "spore {s}: cannot resolve rootfs cache directory; set {s} or HOME",
             .{ command_name, local_paths.rootfs_cache_env },
@@ -972,11 +1189,11 @@ pub fn rootfsCacheRootPath(init: std.process.Init, allocator: std.mem.Allocator,
     };
 }
 
-pub fn openVerifiedRootfs(init: std.process.Init, allocator: std.mem.Allocator, rootfs: spore.Rootfs, command_name: []const u8) !std.c.fd_t {
-    const cache_root = try rootfsCacheRootPath(init, allocator, command_name);
-    const trace_path = try rootfsTracePath(init, allocator);
+pub fn openVerifiedRootfs(context: Context, allocator: std.mem.Allocator, rootfs: spore.Rootfs, command_name: []const u8) !std.c.fd_t {
+    const cache_root = try rootfsCacheRootPath(context, allocator, command_name);
+    const trace_path = try rootfsTracePath(context, allocator);
     const start_ms = monotonicMs();
-    const fd = try openVerifiedRootfsFromCache(init.io, allocator, cache_root, rootfs);
+    const fd = try openVerifiedRootfsFromCache(context.io, allocator, cache_root, rootfs);
     if (trace_path) |path| {
         appendRootfsTrace(allocator, path, rootfs, monotonicMs() -| start_ms) catch {};
     }
@@ -987,8 +1204,8 @@ fn openVerifiedRootfsFromCache(io: Io, allocator: std.mem.Allocator, cache_root:
     return rootfs_cache.openVerifiedFromCache(io, allocator, cache_root, rootfs);
 }
 
-fn rootfsTracePath(init: std.process.Init, allocator: std.mem.Allocator) !?[:0]const u8 {
-    const path = init.environ_map.get(rootfs_trace_env) orelse return null;
+fn rootfsTracePath(context: Context, allocator: std.mem.Allocator) !?[:0]const u8 {
+    const path = context.environ_map.get(rootfs_trace_env) orelse return null;
     if (path.len == 0) return null;
     const copy = try allocator.dupeZ(u8, path);
     return copy;
@@ -1433,9 +1650,9 @@ fn chmodFileWritable(allocator: std.mem.Allocator, path: []const u8) !void {
     if (std.c.chmod(pathz, 0o644) != 0) return error.ChmodFailed;
 }
 
-fn loadRunInitrd(init: std.process.Init, allocator: std.mem.Allocator, path: ?[]const u8) ![]const u8 {
+fn loadRunInitrd(io: Io, allocator: std.mem.Allocator, path: ?[]const u8) ![]const u8 {
     if (path) |initrd_path| {
-        return try std.Io.Dir.cwd().readFileAlloc(init.io, initrd_path, allocator, .limited(max_file_size));
+        return try std.Io.Dir.cwd().readFileAlloc(io, initrd_path, allocator, .limited(max_file_size));
     }
     return embedded_run_initrd;
 }
@@ -1478,16 +1695,27 @@ fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
-pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) !Result {
+fn runtimeDebugEnabled(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--debug")) return true;
+    }
+    return false;
+}
+
+pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !Result {
+    var events = EventEmitter.init(opts.events, "run");
+    try events.emitStart(opts.backend);
+    errdefer |err| events.emitFailure(err) catch {};
+
     const setup_start = monotonicMs();
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
 
     const backend = try resolveBackend(opts.backend);
-    if (opts.event_writer) |writer| writer.setBackend(backend);
+    events.setBackend(backend);
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     if (opts.network == .spore) {
-        try gateway.start(init, allocator, opts.network_policy);
+        try gateway.start(context.io, allocator, opts.spore_executable, opts.debug, opts.network_policy);
         gateway_active = true;
     }
     defer if (gateway_active) gateway.deinit();
@@ -1496,19 +1724,19 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
 
     const resuming = opts.resume_dir != null;
     const local_backing_start = monotonicMs();
-    const local_backing = try openRunLocalMemoryBacking(allocator, init.environ_map, opts.resume_dir, opts.memory.bytes);
+    const local_backing = try openRunLocalMemoryBacking(allocator, context.environ_map, opts.resume_dir, opts.memory.bytes);
     const local_backing_ms = monotonicMs() -| local_backing_start;
     defer if (local_backing.fd) |fd| {
         _ = std.c.close(fd);
     };
     const kernel_start = monotonicMs();
-    const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
+    const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(context.io, opts.kernel_path, allocator, .limited(max_file_size));
     const kernel_ms = monotonicMs() -| kernel_start;
     const initrd_start = monotonicMs();
-    const initrd: ?[]const u8 = if (resuming) null else try loadRunInitrd(init, allocator, opts.initrd_path);
+    const initrd: ?[]const u8 = if (resuming) null else try loadRunInitrd(context.io, allocator, opts.initrd_path);
     const initrd_ms = monotonicMs() -| initrd_start;
     const disk_start = monotonicMs();
-    var runtime_disk = try openRuntimeDisk(init, allocator, .{
+    var runtime_disk = try openRuntimeDisk(context, allocator, .{
         .rootfs_path = opts.rootfs_path,
         .rootfs = opts.rootfs,
         .disk = opts.disk,
@@ -1519,13 +1747,13 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     defer runtime_disk.deinit();
     const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, rootfsWritable(opts), opts.network);
     const request_start = monotonicMs();
-    const request = try execRequestForRun(init, allocator, opts);
+    const request = try execRequestForRun(context, allocator, opts);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
     const request_ms = monotonicMs() -| request_start;
     if (resuming) stream.host_port = vsock.HostStream.deriveHostPort(request);
-    if (opts.event_writer) |writer| {
-        stream.setLifecycleSink(writer, runEventLifecycleSink);
-        stream.setOutputSink(writer, runEventOutputSink);
+    if (opts.events != null) {
+        stream.setLifecycleSink(&events, runEventLifecycleSink);
+        stream.setOutputSink(&events, runEventOutputSink);
     } else if (opts.stream_output) {
         stream.setOutputSink(null, runOutputSink);
     }
@@ -1579,7 +1807,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .continue_after_capture = capture_plan.continue_after_capture,
                 .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled, .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
                 .network = network,
-                .environ_map = init.environ_map,
+                .environ_map = context.environ_map,
             });
         },
         .kvm => blk: {
@@ -1604,18 +1832,21 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .continue_after_capture = capture_plan.continue_after_capture,
                 .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled, .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
                 .network = network,
-                .environ_map = init.environ_map,
+                .environ_map = context.environ_map,
             });
         },
     }) catch |err| {
         if (capture_plan.isSignalCapture() and capture_request.isCompleted() and isCaptureAborted(err)) {
-            return resultFromAbortedSignalCapture(backend, opts, &stream);
+            const result = resultFromAbortedSignalCapture(backend, opts, &stream);
+            try events.emitExit(result);
+            if (events.write_failed) return error.EventSinkFailed;
+            return result;
         }
-        return err;
+        return @errorCast(err);
     };
     if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
     const signal_capture_observed = capture_plan.isSignalCapture() and capture_request.isCompleted();
-    return switch (cause) {
+    const result = try switch (cause) {
         .probe_complete => resultFromStream(backend, opts, &stream, signal_capture_observed),
         .snapshotted => if (capture_plan.isExitCapture())
             resultFromExitCapture(backend, opts, &stream)
@@ -1623,15 +1854,18 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
             resultFromSignalCapture(backend, opts, &stream),
         else => error.ProbeDidNotComplete,
     };
+    try events.emitExit(result);
+    if (events.write_failed) return error.EventSinkFailed;
+    return result;
 }
 
-pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {
+pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
 
     const backend = try resolveBackend(opts.backend);
-    const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
-    const initrd = try loadRunInitrd(init, allocator, opts.initrd_path);
-    var runtime_disk = try openRuntimeDisk(init, allocator, .{
+    const kernel = try std.Io.Dir.cwd().readFileAlloc(context.io, opts.kernel_path, allocator, .limited(max_file_size));
+    const initrd = try loadRunInitrd(context.io, allocator, opts.initrd_path);
+    var runtime_disk = try openRuntimeDisk(context, allocator, .{
         .rootfs_path = opts.rootfs_path,
         .rootfs = opts.rootfs,
         .disk = opts.disk,
@@ -1657,7 +1891,7 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
                 .resume_dir = opts.resume_dir,
                 .ram_restore_mode = .eager_chunks,
                 .exec_control = control,
-                .environ_map = init.environ_map,
+                .environ_map = context.environ_map,
             });
         },
         .kvm => blk: {
@@ -1674,7 +1908,7 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
                 .resume_dir = opts.resume_dir,
                 .ram_restore_mode = .eager_chunks,
                 .exec_control = control,
-                .environ_map = init.environ_map,
+                .environ_map = context.environ_map,
             });
         },
     };
@@ -1758,17 +1992,17 @@ pub const RuntimeDisk = struct {
     }
 };
 
-pub fn openRuntimeDisk(init: std.process.Init, allocator: std.mem.Allocator, options: RuntimeDiskOptions) !RuntimeDisk {
+pub fn openRuntimeDisk(context: Context, allocator: std.mem.Allocator, options: RuntimeDiskOptions) !RuntimeDisk {
     var runtime = RuntimeDisk{};
     errdefer runtime.deinit();
-    const trace_path = try rootfsTracePath(init, allocator);
+    const trace_path = try rootfsTracePath(context, allocator);
 
     if (options.rootfs) |rootfs| {
         if (rootfs.storage != null) {
             runtime.allocator = allocator;
-            runtime.cas_rootfs = try openManifestCasRootfs(init, allocator, rootfs, options.command_name, trace_path);
+            runtime.cas_rootfs = try openManifestCasRootfs(context, allocator, rootfs, options.command_name, trace_path);
         } else {
-            runtime.rootfs_fd = try openVerifiedRootfs(init, allocator, rootfs, options.command_name);
+            runtime.rootfs_fd = try openVerifiedRootfs(context, allocator, rootfs, options.command_name);
         }
     } else {
         runtime.rootfs_fd = try openRootfsDisk(allocator, options.rootfs_path);
@@ -1808,13 +2042,13 @@ pub fn openRuntimeDisk(init: std.process.Init, allocator: std.mem.Allocator, opt
 }
 
 fn openManifestCasRootfs(
-    init: std.process.Init,
+    context: Context,
     allocator: std.mem.Allocator,
     rootfs: spore.Rootfs,
     command_name: []const u8,
     trace_path: ?[:0]const u8,
 ) !*rootfs_cas.CasBlockSource {
-    const cache_root = try rootfsCacheRootPath(init, allocator, command_name);
+    const cache_root = try rootfsCacheRootPath(context, allocator, command_name);
     defer allocator.free(cache_root);
     const source = try allocator.create(rootfs_cas.CasBlockSource);
     errdefer allocator.destroy(source);
@@ -1838,14 +2072,14 @@ fn runOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const 
 }
 
 fn runEventOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
-    const writer: *EventWriter = @ptrCast(@alignCast(context.?));
-    writer.emitOutputBestEffort(output, bytes);
+    const events: *EventEmitter = @ptrCast(@alignCast(context.?));
+    events.emitOutputBestEffort(output, bytes);
 }
 
 fn runEventLifecycleSink(context: ?*anyopaque, event: vsock.HostStreamLifecycle) void {
-    const writer: *EventWriter = @ptrCast(@alignCast(context.?));
+    const events: *EventEmitter = @ptrCast(@alignCast(context.?));
     switch (event) {
-        .ready => writer.emitReadyBestEffort(),
+        .ready => events.emitReadyBestEffort(),
     }
 }
 
@@ -1886,17 +2120,17 @@ pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]co
     return execRequestWithSession(allocator, argv, "default");
 }
 
-fn execRequestForRun(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) ![]const u8 {
-    const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(init.io).nanoseconds);
+fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options) ![]const u8 {
+    const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(context.io).nanoseconds);
     if (opts.resume_dir == null) return execRequestWithSessionOptions(allocator, opts.command, "default", .{
         .env = opts.guest_env,
         .working_dir = opts.guest_working_dir,
         .resume_time_unix_ns = resume_time_unix_ns,
     });
 
-    const now = Io.Clock.real.now(init.io).nanoseconds;
+    const now = Io.Clock.real.now(context.io).nanoseconds;
     var nonce_bytes: [8]u8 = undefined;
-    init.io.random(&nonce_bytes);
+    context.io.random(&nonce_bytes);
     const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
     const session_id = try std.fmt.allocPrint(allocator, "run-{x}-{x}", .{ now, nonce });
     return execRequestWithSessionOptions(allocator, opts.command, session_id, .{
@@ -2234,12 +2468,9 @@ test "event writer emits JSONL lifecycle and output records" {
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     var events = EventWriter.init(allocator, &out.writer, "run");
+    const sink = events.sink();
 
-    try events.emitStart(.hvf);
-    events.setBackend(.hvf);
-    try events.emitReady();
-    try events.emitOutput(.stdout, "hi\n");
-    try events.emitExit(.{
+    const result = Result{
         .backend = .hvf,
         .start_ms = 1,
         .vsock_connect_ms = 2,
@@ -2248,7 +2479,11 @@ test "event writer emits JSONL lifecycle and output records" {
         .exit_code = 7,
         .vcpus = 1,
         .memory_bytes = memory_config.auto_bytes,
-    });
+    };
+    try sink.emit(.{ .start = .{ .command = "run", .requested_backend = .hvf } });
+    try sink.emit(.{ .ready = .{ .command = "run", .backend = .hvf } });
+    try sink.emit(.{ .stdout = .{ .command = "run", .backend = .hvf, .offset = 0, .bytes = "hi\n" } });
+    try sink.emit(.{ .exit = exitEvent("run", result) });
 
     var lines = std.mem.splitScalar(u8, out.written(), '\n');
     const start_line = lines.next().?;
@@ -2270,8 +2505,9 @@ test "event writer emits exactly one terminal failure" {
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     var events = EventWriter.init(allocator, &out.writer, "run");
+    const sink = events.sink();
 
-    try events.emitFailure(error.BadChunk);
+    try sink.emit(.{ .failure = .{ .command = "run", .backend = null, .classified = classifyFailure(error.BadChunk) } });
     try events.emitExit(.{
         .backend = .hvf,
         .start_ms = 1,
@@ -2288,6 +2524,16 @@ test "event writer emits exactly one terminal failure" {
     try std.testing.expectEqualStrings("", lines.next().?);
     try expectJsonStringField(allocator, failure_line, "event", "failure");
     try expectNestedJsonStringField(allocator, failure_line, "error", "code", "cache.integrity_failed");
+}
+
+fn failingEventSink(_: ?*anyopaque, _: RunEvent) !void {
+    return error.TestEventSinkFailed;
+}
+
+test "event emitter records best-effort sink failures" {
+    var events = EventEmitter.init(.{ .emitFn = failingEventSink }, "run");
+    events.emitOutputBestEffort(.stdout, "lost\n");
+    try std.testing.expect(events.write_failed);
 }
 
 test "run request rejects guest argv count overflow" {
@@ -2606,19 +2852,10 @@ test "runtime disk rejects corrupt rootfs before constructing file block source"
     const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
     try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
 
-    var process_arena = std.heap.ArenaAllocator.init(allocator);
-    defer process_arena.deinit();
-    const init = std.process.Init{
-        .minimal = undefined,
-        .arena = &process_arena,
-        .gpa = allocator,
-        .io = io,
-        .environ_map = &env,
-        .preopens = .empty,
-    };
+    const context = Context{ .io = io, .environ_map = &env };
 
     const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
-    try std.testing.expectError(error.RootFSDigestMismatch, openRuntimeDisk(init, arena, .{
+    try std.testing.expectError(error.RootFSDigestMismatch, openRuntimeDisk(context, arena, .{
         .rootfs = rootfs,
         .command_name = "run",
     }));
@@ -2647,23 +2884,14 @@ test "runtime disk uses manifest-bound rootfs cas source without experiment flag
     const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
     try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
 
-    var process_arena = std.heap.ArenaAllocator.init(allocator);
-    defer process_arena.deinit();
-    const init = std.process.Init{
-        .minimal = undefined,
-        .arena = &process_arena,
-        .gpa = allocator,
-        .io = io,
-        .environ_map = &env,
-        .preopens = .empty,
-    };
+    const context = Context{ .io = io, .environ_map = &env };
 
     const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
         .artifact = artifact,
         .storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
     };
-    var runtime = try openRuntimeDisk(init, allocator, .{
+    var runtime = try openRuntimeDisk(context, allocator, .{
         .rootfs = rootfs,
         .command_name = "run",
     });
@@ -2704,23 +2932,14 @@ test "runtime disk manifest rootfs cas fails closed without index" {
     const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
     try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
 
-    var process_arena = std.heap.ArenaAllocator.init(allocator);
-    defer process_arena.deinit();
-    const init = std.process.Init{
-        .minimal = undefined,
-        .arena = &process_arena,
-        .gpa = allocator,
-        .io = io,
-        .environ_map = &env,
-        .preopens = .empty,
-    };
+    const context = Context{ .io = io, .environ_map = &env };
 
     const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
         .artifact = artifact,
         .storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
     };
-    try std.testing.expectError(error.MissingChunk, openRuntimeDisk(init, allocator, .{
+    try std.testing.expectError(error.MissingChunk, openRuntimeDisk(context, allocator, .{
         .rootfs = rootfs,
         .command_name = "run",
     }));

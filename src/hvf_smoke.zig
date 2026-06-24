@@ -7,10 +7,10 @@
 //! Run via `zig build hvf-smoke` (handles entitlement signing).
 
 const std = @import("std");
-const sporevm = @import("sporevm");
-const board = sporevm.board;
-const gicv3 = sporevm.gicv3;
-const hvf = sporevm.hvf;
+const spore_internal = @import("spore_internal");
+const board = spore_internal.board;
+const gicv3 = spore_internal.gicv3;
+const hvf = spore_internal.hvf;
 
 const guest_base: u64 = 0x8000_0000;
 const mem_size: usize = 0x10000; // 64 KiB

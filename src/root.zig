@@ -1,9 +1,9 @@
-//! SporeVM library root.
+//! Internal SporeVM implementation module root.
 //!
 //! A spore is a sealed, content-addressed checkpoint of a VM: a manifest of
 //! memory chunks, guest machine state, and eventually disk state. This module
-//! exposes the building blocks; the `spore` CLI in `main.zig` is a thin shell
-//! over them.
+//! exposes backend, device, storage, daemon, and CLI implementation modules for
+//! in-repo tools. Product callers should import `libspore`, not this module.
 
 const builtin = @import("builtin");
 
@@ -14,6 +14,7 @@ pub const boot = @import("boot.zig");
 pub const bundle = @import("bundle.zig");
 pub const capture = @import("capture.zig");
 pub const chunk = @import("chunk.zig");
+pub const contracts = @import("contracts.zig");
 pub const cow_disk = @import("cow_disk.zig");
 pub const disk_layer = @import("disk_layer.zig");
 pub const generation = @import("generation.zig");
@@ -72,6 +73,7 @@ test {
     testing.refAllDecls(block_source);
     testing.refAllDecls(bundle);
     testing.refAllDecls(capture);
+    testing.refAllDecls(contracts);
     testing.refAllDecls(cow_disk);
     testing.refAllDecls(disk_layer);
     testing.refAllDecls(fdpass);

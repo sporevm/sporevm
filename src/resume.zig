@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 
+const Context = @import("context.zig").Context;
 const hvf = @import("hvf/hvf.zig");
 const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
@@ -27,7 +28,9 @@ pub const Options = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
     event_mode: run_mod.EventMode = .none,
-    event_writer: ?*run_mod.EventWriter = null,
+    events: ?run_mod.EventSink = null,
+    spore_executable: []const u8 = "spore",
+    debug: bool = false,
 };
 
 const cli_usage =
@@ -50,18 +53,23 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     var opts = try parseCliArgs(args);
     var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "resume");
     if (opts.event_mode == .jsonl) {
-        opts.event_writer = &event_writer;
-        try event_writer.emitStart(opts.backend);
+        opts.events = event_writer.sink();
     }
-    const result = execute(init, init.arena.allocator(), opts) catch |err| {
+    const arena = init.arena.allocator();
+    const full_args = try init.minimal.args.toSlice(arena);
+    opts.spore_executable = full_args[0];
+    opts.debug = runtimeDebugEnabled(full_args);
+    const result = execute(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, arena, opts) catch |err| {
         if (opts.event_mode == .jsonl) {
-            try event_writer.emitFailure(err);
             std.process.exit(run_mod.machineErrorExitCode(err));
         }
         return err;
     };
     if (opts.event_mode == .jsonl) {
-        try event_writer.emitExit(result);
+        try stdout.flush();
     }
     const code = result.processExitCode();
     if (code != 0) std.process.exit(code);
@@ -116,7 +124,11 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     };
 }
 
-pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) !run_mod.Result {
+pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !run_mod.Result {
+    var events = run_mod.EventEmitter.init(opts.events, "resume");
+    try events.emitStart(opts.backend);
+    errdefer |err| events.emitFailure(err) catch {};
+
     const parsed = try spore.loadManifest(allocator, opts.spore_dir);
     defer parsed.deinit();
 
@@ -126,14 +138,14 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     if (network_options.network == .spore) {
-        try gateway.start(init, allocator, network_options.policy);
+        try gateway.start(context.io, allocator, opts.spore_executable, opts.debug, network_options.policy);
         gateway_active = true;
     }
     defer if (gateway_active) gateway.deinit();
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
 
     validateResumeDiskManifest(parsed.value);
-    var runtime_disk = try run_mod.openRuntimeDisk(init, allocator, .{
+    var runtime_disk = try run_mod.openRuntimeDisk(context, allocator, .{
         .rootfs = parsed.value.rootfs,
         .disk = parsed.value.disk,
         .spore_dir = opts.spore_dir,
@@ -145,9 +157,9 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     var identity_stream: ?vsock.HostStream = try vsock.HostStream.init(default_resume_guest_port, attach.request);
     if (identity_stream) |*stream| {
         stream.host_port = resume_attach_host_port;
-        if (opts.event_writer) |writer| {
-            stream.setLifecycleSink(writer, resumeEventLifecycleSink);
-            stream.setOutputSink(writer, resumeEventOutputSink);
+        if (opts.events != null) {
+            stream.setLifecycleSink(&events, resumeEventLifecycleSink);
+            stream.setOutputSink(&events, resumeEventOutputSink);
         } else {
             stream.setOutputSink(null, identityProbeOutputSink);
         }
@@ -155,9 +167,9 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     const identity_probe: ?*vsock.HostStream = if (identity_stream) |*stream| stream else null;
 
     const backend = try resolveBackend(opts.backend);
-    if (opts.event_writer) |writer| writer.setBackend(backend);
+    events.setBackend(backend);
     const ram_size = resumeRamSize(parsed.value.platform);
-    const local_backing = try spore.openProvenLocalMemoryBacking(allocator, init.environ_map, opts.spore_dir, parsed.value.memory, ram_size);
+    const local_backing = try spore.openProvenLocalMemoryBacking(allocator, context.environ_map, opts.spore_dir, parsed.value.memory, ram_size);
     defer if (local_backing.fd) |fd| {
         _ = std.c.close(fd);
     };
@@ -169,7 +181,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
             break :blk try hvf.vm.run(allocator, .{
                 .kernel = "",
                 .ram_size = ram_size,
-                .console_sink = if (opts.event_writer == null) consoleSink else discardConsoleSink,
+                .console_sink = if (opts.events == null) consoleSink else discardConsoleSink,
                 .disk_backend = runtime_disk.backend(),
                 .resume_dir = opts.spore_dir,
                 .resume_generation = attach.generation_state,
@@ -187,7 +199,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
             break :blk try kvm.vm.run(allocator, .{
                 .kernel = "",
                 .ram_size = ram_size,
-                .console_sink = if (opts.event_writer == null) consoleSink else discardConsoleSink,
+                .console_sink = if (opts.events == null) consoleSink else discardConsoleSink,
                 .disk_backend = runtime_disk.backend(),
                 .resume_dir = opts.spore_dir,
                 .resume_generation = attach.generation_state,
@@ -204,20 +216,30 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     if (comptime @hasField(@TypeOf(cause), "monitor_stopped")) {
         switch (cause) {
             .guest_off, .guest_reset => {},
-            .probe_complete => return resultFromResumeStream(backend, ram_size, identity_stream),
+            .probe_complete => {
+                const result = try resultFromResumeStream(backend, ram_size, identity_stream);
+                try events.emitExit(result);
+                if (events.write_failed) return error.EventSinkFailed;
+                return result;
+            },
             .snapshotted, .monitor_stopped => return error.UnexpectedResumeExit,
         }
     } else {
         switch (cause) {
             .guest_off, .guest_reset => {},
-            .probe_complete => return resultFromResumeStream(backend, ram_size, identity_stream),
+            .probe_complete => {
+                const result = try resultFromResumeStream(backend, ram_size, identity_stream);
+                try events.emitExit(result);
+                if (events.write_failed) return error.EventSinkFailed;
+                return result;
+            },
             .snapshotted => return error.UnexpectedResumeExit,
         }
     }
     if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
     const connect_ms = if (identity_stream) |stream| stream.connect_ms orelse 0 else 0;
     const response_ms = if (identity_stream) |stream| stream.response_ms orelse 0 else 0;
-    return .{
+    const result = run_mod.Result{
         .backend = backend,
         .start_ms = 0,
         .vsock_connect_ms = connect_ms,
@@ -227,6 +249,9 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         .vcpus = 1,
         .memory_bytes = ram_size,
     };
+    try events.emitExit(result);
+    if (events.write_failed) return error.EventSinkFailed;
+    return result;
 }
 
 fn consoleSink(bytes: []const u8) void {
@@ -241,14 +266,14 @@ fn consoleSink(bytes: []const u8) void {
 fn discardConsoleSink(_: []const u8) void {}
 
 fn resumeEventOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
-    const writer: *run_mod.EventWriter = @ptrCast(@alignCast(context.?));
-    writer.emitOutputBestEffort(output, bytes);
+    const events: *run_mod.EventEmitter = @ptrCast(@alignCast(context.?));
+    events.emitOutputBestEffort(output, bytes);
 }
 
 fn resumeEventLifecycleSink(context: ?*anyopaque, event: vsock.HostStreamLifecycle) void {
-    const writer: *run_mod.EventWriter = @ptrCast(@alignCast(context.?));
+    const events: *run_mod.EventEmitter = @ptrCast(@alignCast(context.?));
     switch (event) {
-        .ready => writer.emitReadyBestEffort(),
+        .ready => events.emitReadyBestEffort(),
     }
 }
 
@@ -370,6 +395,13 @@ fn countBlockDevices(devices: []const spore.TransportState) usize {
 fn failResumeSetup(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print(fmt ++ "\n", args);
     std.process.exit(2);
+}
+
+fn runtimeDebugEnabled(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--debug")) return true;
+    }
+    return false;
 }
 
 test "resume cli parser accepts one spore dir" {

@@ -135,7 +135,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     try run.openConsoleLog(opts.console_log_path);
     defer run.closeConsoleLog();
 
-    const result = run.executeMonitor(init, allocator, .{
+    const result = run.executeMonitor(.{ .io = init.io, .environ_map = init.environ_map }, allocator, .{
         .backend = opts.backend,
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,

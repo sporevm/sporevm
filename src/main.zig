@@ -5,8 +5,9 @@
 
 const std = @import("std");
 const Io = std.Io;
-const sporevm = @import("sporevm");
-const machine_output = sporevm.machine_output;
+const spore_internal = @import("spore_internal");
+const spore_api = spore_internal.api;
+const machine_output = spore_internal.machine_output;
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
@@ -37,7 +38,7 @@ const usage =
     \\  suspend NAME --out DIR
     \\                      Checkpoint a diskless named VM into a spore
     \\  ls                  List named VMs in the local runtime registry
-    \\  version             Print the sporevm version
+    \\  version             Print the spore version
     \\  host-info           Print this host's platform facts
     \\  inspect <spore-dir> Print a spore manifest summary
     \\  fork <spore-dir> --count N --out DIR
@@ -112,34 +113,39 @@ fn runCommand(
         exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "GlobalJson"), message);
     }
 
+    const context = spore_api.Context{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    };
+
     if (std.mem.eql(u8, command, "system")) {
-        try sporevm.system.run(init, command_args, stdout, stderr, mode);
+        try spore_internal.system.run(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "rootfs")) {
-        try sporevm.rootfs.run(init, command_args, stdout);
+        try spore_internal.rootfs.run(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "run")) {
-        try sporevm.run.cli(init, command_args, stdout);
+        try spore_internal.run.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "resume")) {
         if (wantsNamedResume(command_args)) {
-            try sporevm.lifecycle.resumeCli(init, command_args, stdout);
+            try spore_internal.lifecycle.resumeCli(init, command_args, stdout);
         } else {
-            try sporevm.resume_cmd.cli(init, command_args, stdout);
+            try spore_internal.resume_cmd.cli(init, command_args, stdout);
         }
     } else if (std.mem.eql(u8, command, "create")) {
-        try sporevm.lifecycle.createCli(init, command_args, stdout);
+        try spore_internal.lifecycle.createCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "exec")) {
-        try sporevm.lifecycle.execCli(init, command_args, stdout);
+        try spore_internal.lifecycle.execCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "rm")) {
-        try sporevm.lifecycle.rmCli(init, command_args, stdout);
+        try spore_internal.lifecycle.rmCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "suspend")) {
-        try sporevm.lifecycle.suspendCli(init, command_args, stdout);
+        try spore_internal.lifecycle.suspendCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "ls")) {
-        try sporevm.lifecycle.lsCli(init, command_args, stdout, stderr, mode);
+        try spore_internal.lifecycle.lsCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "monitor")) {
-        try sporevm.monitor.cli(init, command_args, stdout);
+        try spore_internal.monitor.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "netd")) {
-        try sporevm.spore_netd.cli(init, command_args, stdout);
+        try spore_internal.spore_netd.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "version")) {
-        try stdout.print("spore {s}\n", .{sporevm.version});
+        try stdout.print("spore {s}\n", .{spore_internal.version});
     } else if (std.mem.eql(u8, command, "host-info")) {
         if (command_args.len != 0) {
             if (std.mem.startsWith(u8, command_args[0], "--")) {
@@ -147,7 +153,7 @@ fn runCommand(
             }
             exitUnexpectedArgument(arena, stderr, mode, "host-info", command_args[0]);
         }
-        const info = try sporevm.api.hostInfo(arena, init.environ_map);
+        const info = try spore_api.hostInfo(context, arena);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, info);
         } else {
@@ -157,39 +163,37 @@ fn runCommand(
         if (command_args.len != 1) {
             exitWithCliError(arena, stderr, mode, machine_output.usageMissingArgument("usage: spore inspect <spore-dir>", "inspect"), "usage: spore inspect <spore-dir>");
         }
-        const manifest = try sporevm.spore.loadManifest(arena, command_args[0]);
-        defer manifest.deinit();
-        const summary = inspectSummary(manifest.value);
+        const summary = try spore_api.inspectSpore(arena, command_args[0]);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, summary);
         } else {
             try writeInspectSummary(stdout, summary);
         }
     } else if (std.mem.eql(u8, command, "fork")) {
-        const result = try forkCommand(init, arena, stderr, mode, command_args);
+        const result = try forkCommand(context, arena, stderr, mode, command_args);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, result);
         } else {
             try writeForkResult(stdout, result);
         }
     } else if (std.mem.eql(u8, command, "fanout")) {
-        try sporevm.fanout.cli(init, command_args, stdout);
+        try spore_internal.fanout.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "pack")) {
-        const result = try packCommand(init, arena, stderr, mode, command_args);
+        const result = try packCommand(context, arena, stderr, mode, command_args);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, result);
         } else {
             try writePackResult(stdout, result);
         }
     } else if (std.mem.eql(u8, command, "unpack")) {
-        const result = try unpackCommand(init, arena, stderr, mode, command_args);
+        const result = try unpackCommand(context, arena, stderr, mode, command_args);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, result);
         } else {
             try writeUnpackResult(stdout, result);
         }
     } else if (std.mem.eql(u8, command, "push")) {
-        const result = try pushCommand(init, arena, stderr, mode, command_args);
+        const result = try pushCommand(context, arena, stderr, mode, command_args);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, result);
         } else {
@@ -203,7 +207,7 @@ fn runCommand(
             try writeInspectBundleResult(stdout, result);
         }
     } else if (std.mem.eql(u8, command, "pull")) {
-        const result = try pullCommand(init, arena, stderr, mode, command_args);
+        const result = try pullCommand(context, arena, stderr, mode, command_args);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, result);
         } else {
@@ -354,12 +358,12 @@ fn wantsNamedResume(args: []const []const u8) bool {
 }
 
 fn forkCommand(
-    init: std.process.Init,
+    context: spore_api.Context,
     allocator: std.mem.Allocator,
     stderr: *Io.Writer,
     mode: machine_output.Mode,
     args: []const []const u8,
-) !sporevm.spore.ForkResult {
+) !spore_api.ForkResult {
     var parent_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var count: ?usize = null;
@@ -387,25 +391,24 @@ fn forkCommand(
         exitUsage(allocator, stderr, mode, "fork", "usage: spore fork <spore-dir> --count N --out DIR");
     }
 
-    return sporevm.spore.fork(allocator, .{
+    return spore_api.fork(context, allocator, .{
         .parent_dir = parent_dir.?,
         .out_dir = out_dir.?,
         .count = count.?,
-        .environ_map = init.environ_map,
     });
 }
 
 fn packCommand(
-    init: std.process.Init,
+    context: spore_api.Context,
     allocator: std.mem.Allocator,
     stderr: *Io.Writer,
     mode: machine_output.Mode,
     args: []const []const u8,
-) !sporevm.bundle.PackResult {
+) !spore_api.PackResult {
     var spore_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var children_dir: ?[]const u8 = null;
-    var rootfs_policy: sporevm.bundle.RootfsBundlePolicy = .exact_bytes;
+    var rootfs_policy: spore_api.RootfsBundlePolicy = .exact_bytes;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -438,23 +441,21 @@ fn packCommand(
         exitUsage(allocator, stderr, mode, "pack", "usage: spore pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR");
     }
 
-    return sporevm.bundle.pack(allocator, .{
-        .io = init.io,
+    return spore_api.pack(context, allocator, .{
         .spore_dir = spore_dir.?,
         .out_dir = out_dir.?,
-        .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
         .children_dir = children_dir,
         .rootfs_policy = rootfs_policy,
     });
 }
 
 fn unpackCommand(
-    init: std.process.Init,
+    context: spore_api.Context,
     allocator: std.mem.Allocator,
     stderr: *Io.Writer,
     mode: machine_output.Mode,
     args: []const []const u8,
-) !sporevm.bundle.UnpackResult {
+) !spore_api.UnpackResult {
     var bundle_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var child_id: ?[]const u8 = null;
@@ -483,23 +484,21 @@ fn unpackCommand(
         exitUsage(allocator, stderr, mode, "unpack", "usage: spore unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR");
     }
 
-    return sporevm.bundle.unpack(allocator, .{
-        .io = init.io,
+    return spore_api.unpack(context, allocator, .{
         .bundle_dir = bundle_dir.?,
         .out_dir = out_dir.?,
-        .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
         .child_id = child_id,
         .allow_metadata_only_rootfs = allow_metadata_only_rootfs,
     });
 }
 
 fn pushCommand(
-    init: std.process.Init,
+    context: spore_api.Context,
     allocator: std.mem.Allocator,
     stderr: *Io.Writer,
     mode: machine_output.Mode,
     args: []const []const u8,
-) !sporevm.bundle.PushResult {
+) !spore_api.PushResult {
     var bundle_dir: ?[]const u8 = null;
     var destination: ?[]const u8 = null;
     var aws_region: ?[]const u8 = null;
@@ -524,8 +523,7 @@ fn pushCommand(
         exitUsage(allocator, stderr, mode, "push", "usage: spore push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]");
     }
 
-    return sporevm.bundle.push(allocator, .{
-        .io = init.io,
+    return spore_api.push(context, allocator, .{
         .bundle_dir = bundle_dir.?,
         .destination = destination.?,
         .aws_region = aws_region,
@@ -537,10 +535,10 @@ fn inspectBundleCommand(
     stderr: *Io.Writer,
     mode: machine_output.Mode,
     args: []const []const u8,
-) !sporevm.bundle.InspectBundleResult {
+) !spore_api.InspectBundleResult {
     var source: ?[]const u8 = null;
     var child_id: ?[]const u8 = null;
-    var child_range: ?sporevm.bundle.ChildRange = null;
+    var child_range: ?spore_api.ChildRange = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -577,7 +575,7 @@ fn inspectBundleCommand(
         exitUsage(allocator, stderr, mode, "inspect-bundle", "usage: spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]");
     }
 
-    return sporevm.api.inspectBundle(allocator, .{
+    return spore_api.inspectBundle(allocator, .{
         .source = source.?,
         .child_id = child_id,
         .child_range = child_range,
@@ -585,12 +583,12 @@ fn inspectBundleCommand(
 }
 
 fn pullCommand(
-    init: std.process.Init,
+    context: spore_api.Context,
     allocator: std.mem.Allocator,
     stderr: *Io.Writer,
     mode: machine_output.Mode,
     args: []const []const u8,
-) !sporevm.bundle.PullResult {
+) !spore_api.PullResult {
     var source: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var child_id: ?[]const u8 = null;
@@ -623,7 +621,7 @@ fn pullCommand(
         exitUsage(allocator, stderr, mode, "pull", "usage: spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]");
     }
 
-    return sporevm.api.pull(init, allocator, .{
+    return spore_api.pull(context, allocator, .{
         .source = source.?,
         .out_dir = out_dir.?,
         .child_id = child_id,
@@ -644,7 +642,7 @@ fn exitWithInvalidCombination(
     exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
 }
 
-fn parseChildRange(value: []const u8) ?sporevm.bundle.ChildRange {
+fn parseChildRange(value: []const u8) ?spore_api.ChildRange {
     const sep = std.mem.indexOf(u8, value, "..") orelse return null;
     if (sep == 0 or sep + 2 >= value.len) return null;
     const start = std.fmt.parseInt(u32, value[0..sep], 10) catch return null;
@@ -653,45 +651,13 @@ fn parseChildRange(value: []const u8) ?sporevm.bundle.ChildRange {
     return .{ .start = start, .end = end };
 }
 
-fn parseRootfsBundlePolicy(value: []const u8) ?sporevm.bundle.RootfsBundlePolicy {
+fn parseRootfsBundlePolicy(value: []const u8) ?spore_api.RootfsBundlePolicy {
     if (std.mem.eql(u8, value, "exact") or std.mem.eql(u8, value, "exact-bytes")) return .exact_bytes;
     if (std.mem.eql(u8, value, "metadata-only")) return .metadata_only;
     return null;
 }
 
-fn optionalRootfsCacheRoot(allocator: std.mem.Allocator, init: std.process.Init) ?[]const u8 {
-    return sporevm.local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch null;
-}
-
-const InspectSummary = struct {
-    version: u32,
-    platform: sporevm.spore.Platform,
-    device_count: usize,
-    memory_chunk_count: usize,
-    present_memory_chunk_count: usize,
-    memory_backing_kind: ?[]const u8,
-    memory_backing_size: ?u64,
-    gic_kind: []const u8,
-};
-
-fn inspectSummary(manifest: sporevm.spore.Manifest) InspectSummary {
-    var present_chunks: usize = 0;
-    for (manifest.memory.chunks) |maybe_chunk| {
-        if (maybe_chunk != null) present_chunks += 1;
-    }
-    return .{
-        .version = manifest.version,
-        .platform = manifest.platform,
-        .device_count = manifest.devices.len,
-        .memory_chunk_count = manifest.memory.chunks.len,
-        .present_memory_chunk_count = present_chunks,
-        .memory_backing_kind = if (manifest.memory.backing) |backing| backing.kind else null,
-        .memory_backing_size = if (manifest.memory.backing) |backing| backing.size else null,
-        .gic_kind = @tagName(manifest.machine.gic.kind),
-    };
-}
-
-fn writeHostInfo(writer: *Io.Writer, info: sporevm.platform.HostInfo) !void {
+fn writeHostInfo(writer: *Io.Writer, info: spore_api.HostInfo) !void {
     try writer.writeAll("Host info\n");
     try writer.print("  Class: {s}\n", .{info.host_class});
     try writer.print("  Platform: {s}/{s}\n", .{ info.platform.os, info.platform.arch });
@@ -714,7 +680,7 @@ fn writeHostInfo(writer: *Io.Writer, info: sporevm.platform.HostInfo) !void {
     try writePathFact(writer, "runtime", info.cache_roots.runtime);
 }
 
-fn writePathFact(writer: *Io.Writer, label: []const u8, fact: sporevm.platform.PathFact) !void {
+fn writePathFact(writer: *Io.Writer, label: []const u8, fact: spore_api.PathFact) !void {
     if (fact.path) |path| {
         try writer.print("    {s}: {s}\n", .{ label, path });
     } else {
@@ -726,7 +692,7 @@ fn yesNo(value: bool) []const u8 {
     return if (value) "yes" else "no";
 }
 
-fn writeInspectSummary(writer: *Io.Writer, summary: InspectSummary) !void {
+fn writeInspectSummary(writer: *Io.Writer, summary: spore_api.SporeInspectResult) !void {
     try writer.writeAll("Spore manifest\n");
     try writer.print("  Version: {d}\n", .{summary.version});
     try writer.print("  Platform: {s}/{s}, {d} bytes RAM\n", .{ summary.platform.arch, summary.platform.cpu_profile, summary.platform.ram_size });
@@ -742,7 +708,7 @@ fn writeInspectSummary(writer: *Io.Writer, summary: InspectSummary) !void {
     try writer.print("  GIC: {s}\n", .{summary.gic_kind});
 }
 
-fn writeForkResult(writer: *Io.Writer, result: sporevm.spore.ForkResult) !void {
+fn writeForkResult(writer: *Io.Writer, result: spore_api.ForkResult) !void {
     try writer.writeAll("Fork complete\n");
     try writer.print("  Parent: {s}\n", .{result.parent});
     try writer.print("  Children: {d}\n", .{result.count});
@@ -750,7 +716,7 @@ fn writeForkResult(writer: *Io.Writer, result: sporevm.spore.ForkResult) !void {
     try writer.print("  Generation range: {d}..{d}\n", .{ result.first_generation, result.last_generation });
 }
 
-fn writePackResult(writer: *Io.Writer, result: sporevm.bundle.PackResult) !void {
+fn writePackResult(writer: *Io.Writer, result: spore_api.PackResult) !void {
     try writer.writeAll("Bundle packed\n");
     try writer.print("  Source: {s}\n", .{result.source});
     try writer.print("  Output: {s}\n", .{result.out_dir});
@@ -763,7 +729,7 @@ fn writePackResult(writer: *Io.Writer, result: sporevm.bundle.PackResult) !void 
     }
 }
 
-fn writeUnpackResult(writer: *Io.Writer, result: sporevm.bundle.UnpackResult) !void {
+fn writeUnpackResult(writer: *Io.Writer, result: spore_api.UnpackResult) !void {
     try writer.writeAll("Bundle unpacked\n");
     try writer.print("  Bundle: {s}\n", .{result.bundle});
     try writer.print("  Output: {s}\n", .{result.out_dir});
@@ -774,7 +740,7 @@ fn writeUnpackResult(writer: *Io.Writer, result: sporevm.bundle.UnpackResult) !v
     if (result.selected_child) |child| try writer.print("  Selected child: {s}\n", .{child});
 }
 
-fn writePushResult(writer: *Io.Writer, result: sporevm.bundle.PushResult) !void {
+fn writePushResult(writer: *Io.Writer, result: spore_api.PushResult) !void {
     try writer.writeAll("Bundle pushed\n");
     try writer.print("  Source: {s}\n", .{result.source});
     try writer.print("  Destination: {s}\n", .{result.destination});
@@ -783,7 +749,7 @@ fn writePushResult(writer: *Io.Writer, result: sporevm.bundle.PushResult) !void 
     try writer.print("  Uploaded: {d} files, {d} bytes\n", .{ result.uploaded_file_count, result.uploaded_bytes });
 }
 
-fn writeInspectBundleResult(writer: *Io.Writer, result: sporevm.bundle.InspectBundleResult) !void {
+fn writeInspectBundleResult(writer: *Io.Writer, result: spore_api.InspectBundleResult) !void {
     try writer.writeAll("Bundle\n");
     try writer.print("  Source: {s}\n", .{result.source});
     try writer.print("  Bundle: {s}\n", .{result.bundle_dir});
@@ -799,7 +765,7 @@ fn writeInspectBundleResult(writer: *Io.Writer, result: sporevm.bundle.InspectBu
     }
 }
 
-fn writePullResult(writer: *Io.Writer, result: sporevm.bundle.PullResult) !void {
+fn writePullResult(writer: *Io.Writer, result: spore_api.PullResult) !void {
     try writer.writeAll("Bundle pulled\n");
     try writer.print("  Source: {s}\n", .{result.source});
     try writer.print("  Output: {s}\n", .{result.out_dir});
@@ -846,9 +812,9 @@ test "parse inspect bundle child range" {
 }
 
 test "rootfs bundle policy parser accepts exact and metadata-only spellings" {
-    try std.testing.expectEqual(sporevm.bundle.RootfsBundlePolicy.exact_bytes, parseRootfsBundlePolicy("exact").?);
-    try std.testing.expectEqual(sporevm.bundle.RootfsBundlePolicy.exact_bytes, parseRootfsBundlePolicy("exact-bytes").?);
-    try std.testing.expectEqual(sporevm.bundle.RootfsBundlePolicy.metadata_only, parseRootfsBundlePolicy("metadata-only").?);
+    try std.testing.expectEqual(spore_api.RootfsBundlePolicy.exact_bytes, parseRootfsBundlePolicy("exact").?);
+    try std.testing.expectEqual(spore_api.RootfsBundlePolicy.exact_bytes, parseRootfsBundlePolicy("exact-bytes").?);
+    try std.testing.expectEqual(spore_api.RootfsBundlePolicy.metadata_only, parseRootfsBundlePolicy("metadata-only").?);
     try std.testing.expect(parseRootfsBundlePolicy("bad") == null);
 }
 
