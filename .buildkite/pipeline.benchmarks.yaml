@@ -20,7 +20,17 @@ steps:
     command: |
       set -euo pipefail
       scripts/ci-buildkite-benchmarks.sh
-      aws s3 sync zig-cache/sporevm-benchmarks/ "s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/macos/" --no-progress
+      aws s3 sync zig-cache/sporevm-benchmarks/ "s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/macos/" \
+        --no-progress \
+        --exclude "*" \
+        --include "latest-summary.json" \
+        --include "site/*" \
+        --include "buildkite-annotation.md" \
+        --include "*/config.json" \
+        --include "*/results.jsonl" \
+        --include "*/summary.json" \
+        --include "*/logs/*" \
+        --include "*/rootfs-cache/*.json"
     agents:
       queue: cleanroom-mac
 
@@ -45,6 +55,16 @@ steps:
     command: |
       set -euo pipefail
       scripts/ci-buildkite-benchmarks.sh
-      aws s3 sync zig-cache/sporevm-benchmarks/ "s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/linux-arm64/" --no-progress
+      aws s3 sync zig-cache/sporevm-benchmarks/ "s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/linux-arm64/" \
+        --no-progress \
+        --exclude "*" \
+        --include "latest-summary.json" \
+        --include "site/*" \
+        --include "buildkite-annotation.md" \
+        --include "*/config.json" \
+        --include "*/results.jsonl" \
+        --include "*/summary.json" \
+        --include "*/logs/*" \
+        --include "*/rootfs-cache/*.json"
     agents:
       queue: cleanroom-linux-arm64

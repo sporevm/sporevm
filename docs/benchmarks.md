@@ -229,7 +229,7 @@ Buildkite pipeline can use this repository with this upload command:
 buildkite-agent pipeline upload .buildkite/pipeline.benchmarks.yaml
 ```
 
-That dedicated pipeline also uploads the full benchmark directories to:
+That dedicated pipeline also uploads durable benchmark data to:
 
 ```text
 s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/macos/
@@ -241,5 +241,6 @@ workspace, the step compares the new `latest-summary.json` against that
 baseline. Baselines should come from the same profile unless the comparator is
 run by hand with a narrower `--only` list. Regardless of comparison result, the
 step exports `site/data.json` and `site/data.js`, uploads benchmark JSON, logs,
-rootfs metadata, and trend data as artifacts, and publishes a Buildkite
-annotation summarizing the latest benchmark run.
+rootfs metadata, and trend data as artifacts and S3 objects, and publishes a
+Buildkite annotation summarizing the latest benchmark run. Generated work
+directories, bundle chunks, and rootfs chunk stores stay out of S3.
