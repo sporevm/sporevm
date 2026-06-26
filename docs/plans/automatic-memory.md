@@ -224,7 +224,9 @@ best-effort scans.
   for base captures. Product capture uses tail-only sealing for the final dirty
   set, which avoids the 16GiB full-RAM scan while preserving coherent
   run-bridge/vsock state for forked children.
-- `spore ls` currently emits JSON with `name`, `state`, and `pid`.
+- `spore ls` now includes lifecycle-spec memory policy and configured bytes in
+  human and JSON output. Resident, backing, chunk, and dirty counters remain
+  explicitly unknown until they have cheap runtime metadata or monitor sources.
 
 ## Delivery Strategy
 
@@ -276,6 +278,12 @@ Done when:
 - Fields that cannot be collected on a platform render as `?` in the table and
   `null` in JSON.
 - `spore ls` remains O(number of VMs), not O(total configured RAM).
+
+Progress:
+
+- First visibility slice: lifecycle list output reads `memory.policy` and
+  `memory.bytes` from each VM's `spec.json` and emits nullable stat fields
+  instead of trying to derive them by walking RAM.
 
 ### Slice 4: Measurement Gate for Raising Defaults Further
 

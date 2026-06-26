@@ -189,6 +189,23 @@ pub const ListEntry = struct {
     name: []const u8,
     state: []const u8,
     pid: ?i64 = null,
+    memory: ?ListMemory = null,
+    stats: ListStats = .{},
+};
+
+pub const ListMemory = struct {
+    policy: []const u8,
+    bytes: u64,
+};
+
+pub const ListStats = struct {
+    resident_bytes: ?u64 = null,
+    backing_logical_bytes: ?u64 = null,
+    backing_allocated_bytes: ?u64 = null,
+    chunk_size: ?u64 = null,
+    chunks_total: ?u64 = null,
+    chunks_nonzero: ?u64 = null,
+    dirty_chunks_pending: ?u64 = null,
 };
 
 pub const lifecycle_schema = "spore.lifecycle.v1";
@@ -638,7 +655,7 @@ fn writeListEntries(writer: *Io.Writer, entries: []const ListEntry) !void {
         return;
     }
 
-    try writer.writeAll("NAME\tSTATE\tPID\n");
+    try writer.writeAll("NAME\tSTATE\tPID\tMEMORY\tRESIDENT\tBACKING\tCHUNKS\tDIRTY\n");
     for (entries) |entry| {
         try writer.print("{s}\t{s}\t", .{ entry.name, entry.state });
         if (entry.pid) |pid| {
@@ -646,7 +663,13 @@ fn writeListEntries(writer: *Io.Writer, entries: []const ListEntry) !void {
         } else {
             try writer.writeByte('-');
         }
-        try writer.writeByte('\n');
+        try writer.writeByte('\t');
+        if (entry.memory) |memory| {
+            try writeMemoryValue(writer, memory);
+        } else {
+            try writer.writeByte('?');
+        }
+        try writer.writeAll("\t?\t?\t?\t?\n");
     }
 }
 
@@ -826,6 +849,7 @@ pub fn listEntries(allocator: std.mem.Allocator, io: Io, runtime_root: []const u
             .name = try allocator.dupe(u8, entry.name),
             .state = state.name(),
             .pid = pid,
+            .memory = readListMemory(allocator, io, paths) catch null,
         });
     }
     const out = try entries.toOwnedSlice();
@@ -840,6 +864,38 @@ pub fn freeListEntries(allocator: std.mem.Allocator, entries: []ListEntry) void 
 
 fn emptyListEntries(allocator: std.mem.Allocator) ![]ListEntry {
     return allocator.alloc(ListEntry, 0);
+}
+
+fn readListMemory(allocator: std.mem.Allocator, io: Io, paths: Paths) !ListMemory {
+    var spec = try readSpec(allocator, io, paths);
+    defer spec.deinit();
+    return listMemoryFromConfig(spec.value.memory);
+}
+
+fn listMemoryFromConfig(memory: memory_config.Config) ListMemory {
+    return .{
+        .policy = @tagName(memory.policy),
+        .bytes = memory.bytes,
+    };
+}
+
+fn writeMemoryValue(writer: *Io.Writer, memory: ListMemory) !void {
+    if (std.mem.eql(u8, memory.policy, "auto")) {
+        try writer.writeAll("auto/");
+    }
+    try writeBytesHuman(writer, memory.bytes);
+}
+
+fn writeBytesHuman(writer: *Io.Writer, bytes: u64) !void {
+    const gib: u64 = 1024 * 1024 * 1024;
+    const mib: u64 = 1024 * 1024;
+    if (bytes % gib == 0) {
+        try writer.print("{d}GiB", .{bytes / gib});
+    } else if (bytes % mib == 0) {
+        try writer.print("{d}MiB", .{bytes / mib});
+    } else {
+        try writer.print("{d}B", .{bytes});
+    }
 }
 
 fn parseCreateArgs(
@@ -1723,7 +1779,10 @@ test "lifecycle list entries sorts and classifies VM directories" {
 
     const stale = try pathsFromRoot(allocator, root, "b-stale");
     defer stale.deinit(allocator);
-    try writeSpec(allocator, io, stale, .{ .name = "b-stale" });
+    try writeSpec(allocator, io, stale, .{
+        .name = "b-stale",
+        .memory = .{ .policy = .explicit, .bytes = 512 * 1024 * 1024 },
+    });
     try writeReady(allocator, io, stale, .{
         .pid = 9001,
         .control_socket_path = stale.control_socket_path,
@@ -1747,9 +1806,14 @@ test "lifecycle list entries sorts and classifies VM directories" {
     try std.testing.expectEqualStrings("a-ready", entries[0].name);
     try std.testing.expectEqualStrings("ready", entries[0].state);
     try std.testing.expectEqual(@as(?i64, 42), entries[0].pid);
+    try std.testing.expectEqualStrings("auto", entries[0].memory.?.policy);
+    try std.testing.expectEqual(memory_config.auto_bytes, entries[0].memory.?.bytes);
+    try std.testing.expectEqual(@as(?u64, null), entries[0].stats.resident_bytes);
     try std.testing.expectEqualStrings("b-stale", entries[1].name);
     try std.testing.expectEqualStrings("stale", entries[1].state);
     try std.testing.expectEqual(@as(?i64, 9001), entries[1].pid);
+    try std.testing.expectEqualStrings("explicit", entries[1].memory.?.policy);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), entries[1].memory.?.bytes);
 }
 
 test "lifecycle list entries render human table" {
@@ -1758,19 +1822,34 @@ test "lifecycle list entries render human table" {
     defer out.deinit();
 
     try writeListEntries(&out.writer, &.{
-        .{ .name = "a-ready", .state = "ready", .pid = 42 },
-        .{ .name = "b-stale", .state = "stale", .pid = null },
+        .{ .name = "a-ready", .state = "ready", .pid = 42, .memory = listMemoryFromConfig(.{}) },
+        .{ .name = "b-stale", .state = "stale", .pid = null, .memory = listMemoryFromConfig(.{ .policy = .explicit, .bytes = 512 * 1024 * 1024 }) },
     });
     try std.testing.expectEqualStrings(
-        "NAME\tSTATE\tPID\n" ++
-            "a-ready\tready\t42\n" ++
-            "b-stale\tstale\t-\n",
+        "NAME\tSTATE\tPID\tMEMORY\tRESIDENT\tBACKING\tCHUNKS\tDIRTY\n" ++
+            "a-ready\tready\t42\tauto/16GiB\t?\t?\t?\t?\n" ++
+            "b-stale\tstale\t-\t512MiB\t?\t?\t?\t?\n",
         out.written(),
     );
 
     out.clearRetainingCapacity();
     try writeListEntries(&out.writer, &.{});
     try std.testing.expectEqualStrings("No VMs\n", out.written());
+}
+
+test "lifecycle list JSON exposes memory and nullable stats" {
+    const allocator = std.testing.allocator;
+    const json = try std.json.Stringify.valueAlloc(allocator, ListEntry{
+        .name = "a-ready",
+        .state = "ready",
+        .pid = 42,
+        .memory = listMemoryFromConfig(.{}),
+    }, .{});
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"memory\":{\"policy\":\"auto\",\"bytes\":17179869184}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"stats\":{\"resident_bytes\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"dirty_chunks_pending\":null") != null);
 }
 
 fn alwaysDead(_: i64) bool {
