@@ -234,7 +234,8 @@ The writer role needs `GetObject` for those exported per-build files and
 ## Buildkite
 
 The main Buildkite pipeline triggers the dedicated `sporevm-benchmarks` pipeline
-on `main` after merge. Non-main builds can opt in with:
+on `main` after merge with the short `ci` profile. Non-main builds can opt in
+with:
 
 ```console
 SPOREVM_RUN_BENCHMARKS=1
@@ -242,9 +243,9 @@ SPOREVM_RUN_BENCHMARKS=1
 
 The dedicated benchmark pipeline runs macOS and Linux ARM64 benchmark jobs in
 parallel on `cleanroom-mac` and `cleanroom-linux-arm64`. It defaults to the
-broader `comparison` profile. Override with `SPOREVM_BENCHMARK_PROFILE=ci` for a
-short cold/warm run, or `full` when a build should pay for the full benchmark
-matrix.
+broader `comparison` profile for manual runs. Override with
+`SPOREVM_BENCHMARK_PROFILE=ci` for a short cold/warm run, or `full` when a build
+should pay for the full benchmark matrix.
 
 The benchmark steps live in `.buildkite/pipeline.benchmarks.yaml`. A standalone
 Buildkite pipeline can use this repository with this upload command:
