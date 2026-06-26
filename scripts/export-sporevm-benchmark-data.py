@@ -8,6 +8,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -90,6 +91,22 @@ def git_value(args: list[str]) -> str | None:
     return value if completed.returncode == 0 and value else None
 
 
+def command_value(args: list[str]) -> str | None:
+    try:
+        completed = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = completed.stdout.strip()
+    return value if completed.returncode == 0 and value else None
+
+
 def env_or_git(name: str, git_args: list[str]) -> str | None:
     value = os.environ.get(name)
     return value if value else git_value(git_args)
@@ -117,6 +134,66 @@ def runner_metadata(config: dict[str, object]) -> dict[str, object]:
     }
 
 
+def linux_mem_total_bytes() -> int | None:
+    meminfo = Path("/proc/meminfo")
+    if not meminfo.exists():
+        return None
+    for line in meminfo.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("MemTotal:"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    return int(parts[1]) * 1024
+                except ValueError:
+                    return None
+    return None
+
+
+def mem_total_bytes() -> int | None:
+    value = command_value(["sysctl", "-n", "hw.memsize"])
+    if value and value.isdigit():
+        return int(value)
+    return linux_mem_total_bytes()
+
+
+def cpu_model() -> str | None:
+    value = command_value(["sysctl", "-n", "machdep.cpu.brand_string"])
+    if value:
+        return value
+    cpuinfo = Path("/proc/cpuinfo")
+    if not cpuinfo.exists():
+        return None
+    for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+        if ":" not in line:
+            continue
+        key, raw = line.split(":", 1)
+        if key.strip() in ("model name", "Hardware", "Processor"):
+            value = raw.strip()
+            if value:
+                return value
+    return None
+
+
+def host_metadata() -> dict[str, object]:
+    uname = os.uname()
+    disk = shutil.disk_usage(Path.cwd())
+    try:
+        loadavg = list(os.getloadavg())
+    except OSError:
+        loadavg = None
+    return {
+        "os": uname.sysname,
+        "arch": uname.machine,
+        "kernel": uname.release,
+        "cpu_model": cpu_model(),
+        "cpu_count": os.cpu_count(),
+        "mem_total_bytes": mem_total_bytes(),
+        "loadavg": loadavg,
+        "disk_total_bytes": disk.total,
+        "disk_free_bytes": disk.free,
+    }
+
+
 def number(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
@@ -139,7 +216,7 @@ def export_result(result: dict[str, object]) -> dict[str, object] | None:
     if not benchmark or not mode or value is None:
         return None
     stats = result.get("tti_ms") if isinstance(result.get("tti_ms"), dict) else {}
-    return {
+    exported = {
         "name": f"{benchmark}/{mode}",
         "benchmark": benchmark,
         "mode": mode,
@@ -155,6 +232,10 @@ def export_result(result: dict[str, object]) -> dict[str, object] | None:
         "time_to_first_ready_ms": result.get("time_to_first_ready_ms"),
         "composite_score": result.get("composite_score"),
     }
+    phase_metrics = result.get("phase_metrics")
+    if isinstance(phase_metrics, dict):
+        exported["phase_metrics"] = phase_metrics
+    return exported
 
 
 def export_run(summary: dict[str, object], source: Path) -> dict[str, object]:
@@ -174,6 +255,7 @@ def export_run(summary: dict[str, object], source: Path) -> dict[str, object]:
         "source_summary": str(source),
         "commit": commit_metadata(),
         "runner": runner_metadata(config),
+        "host": host_metadata(),
         "config": {
             "profile": config.get("profile"),
             "backend": config.get("backend"),
@@ -215,6 +297,13 @@ def build_series(runs: list[dict[str, object]]) -> list[dict[str, object]]:
             value = number(raw_result.get("value"))
             if not name or value is None:
                 continue
+            stats = raw_result.get("stats") if isinstance(raw_result.get("stats"), dict) else {}
+            phase_metrics = raw_result.get("phase_metrics") if isinstance(raw_result.get("phase_metrics"), dict) else {}
+            phase_values = {
+                key: metrics.get("median")
+                for key, metrics in phase_metrics.items()
+                if isinstance(metrics, dict) and metrics.get("median") is not None
+            }
             series_name = f"{name}@{runner_key}" if runner_key else name
             label = raw_result.get("label")
             if runner_label:
@@ -233,15 +322,20 @@ def build_series(runs: list[dict[str, object]]) -> list[dict[str, object]]:
                     "points": [],
                 },
             )
-            item["points"].append({
+            point = {
                 "run_id": run.get("run_id"),
                 "generated_at": run.get("generated_at"),
                 "commit": commit.get("sha"),
                 "branch": commit.get("branch"),
                 "build_number": runner.get("build_number"),
                 "value": value,
+                "p95": stats.get("p95"),
+                "p99": stats.get("p99"),
                 "success_rate": raw_result.get("success_rate"),
-            })
+            }
+            if phase_values:
+                point["phase_values"] = phase_values
+            item["points"].append(point)
     return sorted(series.values(), key=lambda item: str(item.get("name")))
 
 
@@ -288,6 +382,10 @@ def self_test() -> None:
                 "wall_clock_ms": 400,
                 "time_to_first_ready_ms": 125,
                 "composite_score": 98.0,
+                "phase_metrics": {
+                    "vsock_connect_ms": {"median": 5.0, "p95": 6.0, "p99": 7.0},
+                    "exec_response_ms": {"median": 8.0, "p95": 9.0, "p99": 10.0},
+                },
             }
         ],
     }
@@ -305,7 +403,12 @@ def self_test() -> None:
         )
         data = export(args)
         assert len(data["runs"]) == 1
+        assert data["runs"][0]["host"]["os"]
+        assert data["runs"][0]["results"][0]["phase_metrics"]["vsock_connect_ms"]["median"] == 5.0
         assert data["series"][0]["points"][0]["value"] == 123.0
+        assert data["series"][0]["points"][0]["p95"] == 130.0
+        assert data["series"][0]["points"][0]["p99"] == 131.0
+        assert data["series"][0]["points"][0]["phase_values"]["exec_response_ms"] == 8.0
         partitioned = build_series([
             {"run_id": "mac", "generated_at": "2026-06-26T00:00:00Z", "runner": {"queue": "cleanroom-mac"}, "results": data["runs"][0]["results"]},
             {"run_id": "linux", "generated_at": "2026-06-26T00:01:00Z", "runner": {"queue": "cleanroom-linux-arm64"}, "results": data["runs"][0]["results"]},

@@ -41,6 +41,8 @@ steps:
       branch: "${BUILDKITE_BRANCH}"
       commit: "${BUILDKITE_COMMIT}"
       message: "${BUILDKITE_MESSAGE}"
+      env:
+        SPOREVM_BENCHMARK_PROFILE: "ci"
 
   - wait
 

@@ -10,10 +10,12 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -22,6 +24,24 @@ SUITE_VERSION = "1.1"
 DEFAULT_IMAGE = "docker.io/library/node:22-alpine"
 DEFAULT_COMMAND = "/usr/local/bin/node -v"
 DEFAULT_PLATFORM = "linux/arm64"
+RESTORE_METRICS_RE = re.compile(r"(?:kvm|hvf) restore metrics: (?P<fields>.+)")
+EXEC_PROBE_TIMING_RE = re.compile(r"run exec probe timing: (?P<fields>.+)")
+
+PHASE_METRIC_FIELDS = (
+    "rootfs_open_verified_ms",
+    "rootfs_verification_elapsed_ms",
+    "backend_map_ram_ms",
+    "backend_memory_ms",
+    "backend_state_ms",
+    "backend_pre_run_ms",
+    "backend_restore_ms",
+    "vsock_connect_ms",
+    "exec_response_ms",
+    "first_output_ms",
+    "exec_probe_attach_ms",
+    "exec_request_delivered_ms",
+    "exec_guest_timing_ms",
+)
 
 PROFILES = {
     "smoke": {
@@ -152,6 +172,61 @@ def first_output_line(path: Path) -> str:
             if line:
                 return line[:512]
     return ""
+
+
+def parse_int_field(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(str(value))
+    except ValueError:
+        return None
+
+
+def parse_key_value_tail(value: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for part in value.split():
+        if "=" in part:
+            key, raw = part.split("=", 1)
+            fields[key] = raw
+    return fields
+
+
+def parse_run_stderr_metrics(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    metrics: dict[str, object] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("event") == "rootfs_open_verified":
+            elapsed_ms = parse_int_field(event.get("elapsed_ms"))
+            metrics["rootfs_open_verified_ms"] = elapsed_ms
+            metrics["rootfs_verification_elapsed_ms"] = elapsed_ms
+            metrics["rootfs_bytes_verified"] = parse_int_field(event.get("size"))
+    for match in RESTORE_METRICS_RE.finditer(text):
+        fields = parse_key_value_tail(match.group("fields"))
+        metrics["backend_restore_mode"] = fields.get("mode")
+        metrics["backend_map_ram_ms"] = parse_int_field(fields.get("map_ram_ms"))
+        metrics["backend_memory_ms"] = parse_int_field(fields.get("memory_ms"))
+        metrics["backend_state_ms"] = parse_int_field(fields.get("state_ms"))
+        metrics["backend_pre_run_ms"] = parse_int_field(fields.get("pre_run_ms"))
+        metrics["backend_restore_ms"] = metrics["backend_pre_run_ms"]
+    for match in EXEC_PROBE_TIMING_RE.finditer(text):
+        fields = parse_key_value_tail(match.group("fields"))
+        metrics["exec_probe_attach_ms"] = parse_int_field(fields.get("attach_ms"))
+        metrics["vsock_connect_ms"] = parse_int_field(fields.get("connect_ms"))
+        metrics["exec_request_delivered_ms"] = parse_int_field(fields.get("request_delivered_ms"))
+        metrics["first_output_ms"] = parse_int_field(fields.get("first_output_ms"))
+        metrics["exec_guest_timing_ms"] = parse_int_field(fields.get("guest_timing_ms"))
+        metrics["exec_response_ms"] = parse_int_field(fields.get("response_ms"))
+    return {key: value for key, value in metrics.items() if value is not None}
 
 
 def file_allocated_bytes(path: Path) -> int | None:
@@ -407,6 +482,7 @@ class BenchmarkRunner:
                 "stdout_first_line": first_output_line(stdout),
                 "stdout_path": str(stdout),
                 "stderr_path": str(stderr),
+                **parse_run_stderr_metrics(stderr),
             }
 
         self.run_batch("cold_tti", mode, count, worker)
@@ -508,6 +584,7 @@ class BenchmarkRunner:
                 "stdout_first_line": first_output_line(stdout),
                 "stdout_path": str(stdout),
                 "stderr_path": str(stderr),
+                **parse_run_stderr_metrics(stderr),
             }
 
         self.run_batch("warm_spore_tti", mode, count, worker)
@@ -618,6 +695,7 @@ class BenchmarkRunner:
                 "stderr_path": str(run_stderr),
                 "pull_stdout_path": str(pull_stdout),
                 "pull_stderr_path": str(pull_stderr),
+                **parse_run_stderr_metrics(run_stderr),
             }
 
         self.run_batch("distribution_tti", mode, count, worker)
@@ -778,6 +856,13 @@ class BenchmarkRunner:
                 "wall_clock_ms": batch.get("wall_clock_ms"),
                 "time_to_first_ready_ms": batch.get("time_to_first_ready_ms"),
             }
+            phase_metrics = {}
+            for field in PHASE_METRIC_FIELDS:
+                summary = summarize_field(success_rows, field)
+                if summary is not None:
+                    phase_metrics[field] = summary
+            if phase_metrics:
+                result["phase_metrics"] = phase_metrics
             results.append(result)
         return {
             "version": SUITE_VERSION,
@@ -816,6 +901,11 @@ def load_jsonl(path: Path) -> list[dict[str, object]]:
             else:
                 die(f"expected JSON object in {path}:{line_number}")
     return rows
+
+
+def summarize_field(rows: list[dict[str, object]], field: str) -> dict[str, float | int | None] | None:
+    values = [float(row[field]) for row in rows if isinstance(row.get(field), (int, float))]
+    return summarize_values(values) if values else None
 
 
 def percentile(sorted_values: list[float], pct: float) -> float | None:
@@ -895,6 +985,28 @@ def writable_workload_arg(workloads: tuple[str, ...]) -> str:
     die("--writable-rootfs-workloads must be sqlite, package, or sqlite,package")
 
 
+def self_test() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        stderr = Path(tmp) / "run.stderr"
+        stderr.write_text(
+            "\n".join([
+                '{"event":"rootfs_open_verified","digest":"abc","size":4096,"elapsed_ms":7}',
+                "kvm restore metrics: mode=local_backing ram_mib=512 chunks=4 nonzero_chunks=2 manifest_ms=1 map_ram_ms=2 memory_ms=3 state_ms=4 pre_run_ms=10",
+                "run exec probe timing: attach_ms=1 connect_request_delivered_ms=2 connect_ms=3 request_delivered_ms=4 first_output_ms=5 guest_timing_ms=6 response_ms=8",
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        metrics = parse_run_stderr_metrics(stderr)
+        assert metrics["rootfs_open_verified_ms"] == 7
+        assert metrics["rootfs_bytes_verified"] == 4096
+        assert metrics["backend_restore_mode"] == "local_backing"
+        assert metrics["backend_restore_ms"] == 10
+        assert metrics["vsock_connect_ms"] == 3
+        assert metrics["exec_response_ms"] == 8
+        assert summarize_field([metrics], "exec_response_ms")["median"] == 8.0
+    print("self-test ok")
+
+
 def apply_profile_defaults(args: argparse.Namespace) -> None:
     profile = PROFILES[args.profile]
     if args.iterations is None:
@@ -945,8 +1057,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--no-prewarm-rootfs", dest="prewarm_rootfs", action="store_false")
     parser.add_argument("--prewarm-memory", default="512mb")
     parser.add_argument("--no-build", dest="build", action="store_false")
+    parser.add_argument("--self-test", action="store_true")
     parser.set_defaults(build=True, prewarm_rootfs=True)
     args = parser.parse_args(argv)
+    if args.self_test:
+        return args
     apply_profile_defaults(args)
     for mode in args.modes:
         if mode not in ("sequential", "staggered", "burst"):
@@ -972,8 +1087,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    runner = BenchmarkRunner(args)
-    runner.run()
+    if args.self_test:
+        self_test()
+    else:
+        runner = BenchmarkRunner(args)
+        runner.run()
     return 0
 
 

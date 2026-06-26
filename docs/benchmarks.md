@@ -193,6 +193,16 @@ timings for every summarized hot path. It also includes pre-shaped series keyed
 as `benchmark/mode`, such as `cold_tti/sequential` or
 `warm_spore_tti/burst`.
 
+Each series point carries median `value`, `p95`, `p99`, success rate, commit,
+branch, and Buildkite build number. Runs also include host context (`os`,
+`arch`, `kernel`, CPU model/count, memory, load average, and disk space) so
+public charts can distinguish product movement from runner noise.
+
+When the underlying `spore run` logs expose phase timings, the suite summarizes
+them under `phase_metrics` and exports median phase values on each series point.
+Currently that includes rootfs open/verification, backend restore/pre-run,
+vsock connect, exec response, first output, and exec-probe timing slices.
+
 Append to an existing published history with:
 
 ```console
@@ -224,7 +234,8 @@ The writer role needs `GetObject` for those exported per-build files and
 ## Buildkite
 
 The main Buildkite pipeline triggers the dedicated `sporevm-benchmarks` pipeline
-on `main` after merge. Non-main builds can opt in with:
+on `main` after merge with the short `ci` profile. Non-main builds can opt in
+with:
 
 ```console
 SPOREVM_RUN_BENCHMARKS=1
@@ -232,9 +243,9 @@ SPOREVM_RUN_BENCHMARKS=1
 
 The dedicated benchmark pipeline runs macOS and Linux ARM64 benchmark jobs in
 parallel on `cleanroom-mac` and `cleanroom-linux-arm64`. It defaults to the
-broader `comparison` profile. Override with `SPOREVM_BENCHMARK_PROFILE=ci` for a
-short cold/warm run, or `full` when a build should pay for the full benchmark
-matrix.
+broader `comparison` profile for manual runs. Override with
+`SPOREVM_BENCHMARK_PROFILE=ci` for a short cold/warm run, or `full` when a build
+should pay for the full benchmark matrix.
 
 The benchmark steps live in `.buildkite/pipeline.benchmarks.yaml`. A standalone
 Buildkite pipeline can use this repository with this upload command:
