@@ -217,11 +217,10 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   fixes. The dependency is wired into the `sporevm` module, and
   `src/zmoltcp_gateway.zig` contains a compile-level contract test proving
   SporeVM can build against the caller-owned forwarder surface.
-- One-shot lifecycle integration has landed for captured network spores:
-  capture records requested network capability and policy, `spore run --from`
-  reattaches a fresh helper-backed gateway under the recorded policy, and live
-  TCP flow state remains non-portable. Named lifecycle networking is still
-  deferred.
+- One-shot and named lifecycle integration have landed for captured network
+  spores: capture records requested network capability and policy, `spore run
+  --from` and named `spore resume --name` reattach a fresh helper-backed gateway
+  under the recorded policy, and live TCP flow state remains non-portable.
 
 ## Delivery Strategy
 
@@ -371,8 +370,8 @@ Definition of done:
 - Resume either reattaches a fresh network gateway under the same policy or
   fails closed if the policy cannot be satisfied.
 - Live TCP flows are explicitly dropped across suspend/resume/fork.
-- Named lifecycle support is sequenced only after one-shot `spore run --net`
-  is stable.
+- Named lifecycle support reuses the same policy persistence and fresh-gateway
+  resume contract as one-shot `spore run --net`.
 
 ## Verification
 
@@ -439,7 +438,6 @@ Definition of done:
 - IPv6, NDP, router advertisements, and IPv6 DNS.
 - DHCP or dynamic address allocation.
 - Multiple NICs or guest networks.
-- Named lifecycle networking.
 - Policy-profile files or reusable network policy manifests.
 - Optional diagnostic adapters such as `tap:<ifname>` or external helper engines.
 
