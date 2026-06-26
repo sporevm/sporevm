@@ -76,6 +76,24 @@ tar -xzf "$asset.tar.gz"
 Use `spore_Linux_arm64` on Linux. Add `$asset/bin` to `PATH`, or move the
 extracted directory wherever you keep standalone tools.
 
+## Use as a library
+
+`spore` is the CLI. `libspore` is the embedding surface for Zig, C, and
+eventually Go callers.
+
+Zig callers import the `libspore` module from this package. C callers should
+download the matching `libspore_Linux_arm64` or `libspore_Darwin_arm64` archive
+from GitHub releases and link with `pkg-config`:
+
+```bash
+asset=libspore_Darwin_arm64 # or libspore_Linux_arm64
+tar -xzf "$asset.tar.gz"
+export PKG_CONFIG_PATH="$PWD/$asset/lib/pkgconfig"
+cc my_program.c -o my_program $(pkg-config --cflags --libs libspore)
+```
+
+See [docs/libspore.md](docs/libspore.md) for the current API.
+
 ## Build from source
 
 Tooling is pinned with [mise](https://mise.jdx.dev):
@@ -336,9 +354,9 @@ SPOREVM_RELEASE_VERSION=vX.Y.Z mise run release
 
 `mise run release` runs local checks, verifies `src/root.zig` matches the target
 version, and pushes the tag. The Buildkite tag build creates Linux ARM64 and
-macOS ARM64 archives, writes `checksums.txt`, and publishes the GitHub release.
-Use `mise run release:snapshot` to build release archives locally without
-publishing.
+macOS ARM64 CLI archives plus matching `libspore` archives, writes
+`checksums.txt`, and publishes the GitHub release. Use
+`mise run release:snapshot` to build release archives locally without publishing.
 
 ## Security
 

@@ -138,6 +138,43 @@ The C ABI is declared in [`include/spore.h`](../include/spore.h). The first
 slice exposes context management, build info, context-local last errors, owned
 string cleanup, host-info JSON, and inspect-bundle JSON.
 
+Release builds publish separate `libspore_Linux_arm64` and
+`libspore_Darwin_arm64` archives so CLI-only installs do not carry development
+files. Each libspore archive contains:
+
+- `include/spore.h`
+- `lib/libspore.a`
+- the platform shared library under `lib/`
+- `lib/pkgconfig/libspore.pc`
+- this guide and the project license
+
+Use the archive that matches the target platform:
+
+```bash
+asset=libspore_Darwin_arm64 # or libspore_Linux_arm64
+tar -xzf "$asset.tar.gz"
+export PKG_CONFIG_PATH="$PWD/$asset/lib/pkgconfig"
+cc my_program.c -o my_program $(pkg-config --cflags --libs libspore)
+```
+
+When running from an unpacked archive instead of a system install, point the
+dynamic loader at the archive lib directory:
+
+```bash
+# Linux
+LD_LIBRARY_PATH="$PWD/$asset/lib:${LD_LIBRARY_PATH:-}" ./my_program
+
+# macOS
+DYLD_LIBRARY_PATH="$PWD/$asset/lib:${DYLD_LIBRARY_PATH:-}" ./my_program
+```
+
+To build and install the same layout from source:
+
+```bash
+zig build --release=safe --prefix /path/to/prefix
+export PKG_CONFIG_PATH="/path/to/prefix/lib/pkgconfig"
+```
+
 Returned JSON strings are NUL-terminated for C convenience. The reported length
 excludes the trailing NUL and includes the final newline, matching CLI JSON
 output. Free returned strings with `spore_free_string` on the same context:
