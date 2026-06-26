@@ -9,6 +9,27 @@ die() {
   exit 1
 }
 
+jsonl_stdout_contains() {
+  python3 - "$1" "$2" <<'PY'
+import base64
+import json
+import sys
+
+needle = sys.argv[2].encode()
+with open(sys.argv[1], encoding="utf-8") as f:
+    for line in f:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") != "stdout":
+            continue
+        if needle in base64.b64decode(event.get("data_base64", "")):
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
 infer_backend() {
   if [[ -n "${SPORE_BACKEND:-}" ]]; then
     echo "${SPORE_BACKEND}"
@@ -27,6 +48,7 @@ case "${backend}" in
   hvf|kvm) ;;
   *) die "SPORE_BACKEND must be hvf or kvm" ;;
 esac
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
 [[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
 
 count="${SPORE_SMOKE_FANOUT_COUNT:-10}"
@@ -37,11 +59,16 @@ esac
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-counter-fanout.XXXXXX")"
 run_pid=""
+resume_pid=""
 watchdog_pid=""
 cleanup() {
   if [[ -n "${run_pid}" ]]; then
     kill -TERM "${run_pid}" >/dev/null 2>&1 || true
     wait "${run_pid}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${resume_pid}" ]]; then
+    kill -TERM "${resume_pid}" >/dev/null 2>&1 || true
+    wait "${resume_pid}" >/dev/null 2>&1 || true
   fi
   if [[ -n "${watchdog_pid}" ]]; then
     kill "${watchdog_pid}" >/dev/null 2>&1 || true
@@ -53,6 +80,10 @@ trap cleanup EXIT
 
 capture_dir="${workdir}/counter.spore"
 fork_dir="${workdir}/children"
+generation_fork_dir="${workdir}/generation-children"
+generation_json="${workdir}/generation.json"
+generation_resume_stdout="${workdir}/generation-resume.stdout"
+generation_resume_stderr="${workdir}/generation-resume.stderr"
 run_stdout="${workdir}/run.stdout"
 run_stderr="${workdir}/run.stderr"
 fanout_stdout="${workdir}/fanout.stdout"
@@ -103,6 +134,38 @@ if [[ "${run_rc}" != "0" ]]; then
   die "spore run capture exited ${run_rc}, expected 0"
 fi
 [[ -f "${capture_dir}/manifest.json" ]] || die "capture did not write ${capture_dir}/manifest.json"
+
+"${spore_bin}" fork "${capture_dir}" --count 1 --out "${generation_fork_dir}" >"${workdir}/generation-fork.stdout" 2>"${workdir}/generation-fork.stderr"
+cat >"${generation_json}" <<'JSON'
+{"run_id":"counter-smoke","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"counter-smoke-batch","vm_id":"spore-counter-smoke-7"}
+JSON
+
+"${spore_bin}" resume --events=jsonl --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" \
+  >"${generation_resume_stdout}" 2>"${generation_resume_stderr}" &
+resume_pid="$!"
+
+seen_generation=0
+for _ in $(seq 1 "${SPORE_SMOKE_GENERATION_POLLS:-120}"); do
+  if ! kill -0 "${resume_pid}" >/dev/null 2>&1; then
+    break
+  fi
+  if jsonl_stdout_contains "${generation_resume_stdout}" 'spore parallel job 7/1000'; then
+    seen_generation=1
+    break
+  fi
+  sleep "${SPORE_SMOKE_GENERATION_POLL_INTERVAL:-0.1}"
+done
+kill -TERM "${resume_pid}" >/dev/null 2>&1 || true
+wait "${resume_pid}" >/dev/null 2>&1 || true
+resume_pid=""
+
+if [[ "${seen_generation}" != "1" ]]; then
+  cat "${generation_resume_stdout}" >&2 || true
+  cat "${generation_resume_stderr}" >&2 || true
+  die "spore resume --generation did not inject guest fan-out identity"
+fi
+grep -Fq '"event":"ready"' "${generation_resume_stdout}" || die "spore resume --generation --events=jsonl did not emit ready"
+grep -Fq '"event":"stdout"' "${generation_resume_stdout}" || die "spore resume --generation --events=jsonl did not emit stdout"
 
 "${spore_bin}" fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
 

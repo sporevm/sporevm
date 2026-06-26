@@ -131,6 +131,7 @@ Runtime streams stay separate:
 ```console
 spore run --events=jsonl -- /bin/true
 spore resume --events=jsonl <spore-dir>
+spore resume --generation generation.json --events=jsonl <spore-dir>
 ```
 
 `--events=jsonl` emits newline-delimited lifecycle events on stdout. It is not a
@@ -141,6 +142,8 @@ The stream ends with exactly one terminal event. SporeVM-originated terminal
 failures carry the same error object used by `spore --json` so callers do not
 learn two failure taxonomies. The process exit status is the guest exit status
 for guest completion and `error.exit_code` for SporeVM failures.
+`resume --generation` is the single-child fan-out identity injection surface;
+it reuses the generation attach path and still preserves the JSONL event stream.
 
 The internal shape should be:
 

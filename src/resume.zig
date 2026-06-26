@@ -27,6 +27,7 @@ const hvf_resume_attach_rx_delay_ms: u64 = 25;
 pub const Options = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
+    generation_path: ?[]const u8 = null,
     event_mode: run_mod.EventMode = .none,
     events: ?run_mod.EventSink = null,
     spore_executable: []const u8 = "spore",
@@ -39,6 +40,7 @@ const cli_usage =
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
+    \\  --generation FILE       Inject fan-out identity JSON before resume
     \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
     \\  -h, --help              Show this help
     \\
@@ -78,6 +80,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 pub fn parseCliArgs(args: []const []const u8) !Options {
     var backend: Backend = .auto;
     var spore_dir: ?[]const u8 = null;
+    var generation_path: ?[]const u8 = null;
     var event_mode: run_mod.EventMode = .none;
 
     var i: usize = 0;
@@ -88,6 +91,11 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
                 std.debug.print("--backend must be auto, hvf, or kvm\n", .{});
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, args[i], "--generation") and i + 1 < args.len) {
+            i += 1;
+            generation_path = args[i];
+        } else if (std.mem.startsWith(u8, args[i], "--generation=")) {
+            generation_path = args[i]["--generation=".len..];
         } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
             i += 1;
             event_mode = run_mod.EventMode.parse(args[i]) orelse {
@@ -116,6 +124,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
 
     return .{
         .backend = backend,
+        .generation_path = generation_path,
         .event_mode = event_mode,
         .spore_dir = spore_dir orelse {
             std.debug.print("{s}", .{cli_usage});
@@ -152,7 +161,15 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .command_name = "resume",
     });
     defer runtime_disk.deinit();
-    const attach = try prepareResumeAttach(allocator, parsed.value);
+    const generation_params = if (opts.generation_path) |path|
+        loadGenerationParams(context.io, allocator, path) catch |err| switch (err) {
+            error.BadGenerationPayload => failResumeSetup("spore resume: invalid --generation payload; required JSON fields: run_id, child_id, parallel_index, parallel_count, fork_index, fork_count, fork_batch_id, vm_id", .{}),
+            error.StreamTooLong => failResumeSetup("spore resume: --generation payload exceeds {d} bytes", .{generation.params_size}),
+            else => |e| failResumeSetup("spore resume: cannot read --generation {s}: {s}", .{ path, @errorName(e) }),
+        }
+    else
+        null;
+    const attach = try prepareResumeAttach(allocator, parsed.value, generation_params);
     defer attach.deinit(allocator);
     var identity_stream: ?vsock.HostStream = try vsock.HostStream.init(default_resume_guest_port, attach.request);
     if (identity_stream) |*stream| {
@@ -313,10 +330,20 @@ const PreparedResumeAttach = struct {
     }
 };
 
-fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest) !PreparedResumeAttach {
+fn loadGenerationParams(io: Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const params = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(generation.params_size));
+    try validateGenerationParams(allocator, params);
+    return params;
+}
+
+fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest, generation_params: ?[]const u8) !PreparedResumeAttach {
     var gen_dev = generation.Device{};
     try gen_dev.restore(allocator, manifest.generation);
-    try spore.refreshResumeParams(allocator, &gen_dev);
+    if (generation_params) |params| {
+        _ = try gen_dev.setResume(manifest.generation.generation, params);
+    } else {
+        try spore.refreshResumeParams(allocator, &gen_dev);
+    }
     const generation_state = try gen_dev.capture(allocator);
     errdefer allocator.free(generation_state.params_b64);
 
@@ -352,6 +379,47 @@ fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest) !
         .request = try std.fmt.allocPrint(allocator, "{s}\n", .{json}),
         .generation_state = generation_state,
     };
+}
+
+fn validateGenerationParams(allocator: std.mem.Allocator, params: []const u8) !void {
+    if (params.len == 0 or params.len > generation.params_size) return error.BadGenerationPayload;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, params, .{}) catch return error.BadGenerationPayload;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.BadGenerationPayload,
+    };
+
+    _ = try requiredJsonString(object, "run_id");
+    _ = try requiredJsonU64(object, "child_id");
+    const parallel_index = try requiredJsonU64(object, "parallel_index");
+    const parallel_count = try requiredJsonU64(object, "parallel_count");
+    const fork_index = try requiredJsonU64(object, "fork_index");
+    const fork_count = try requiredJsonU64(object, "fork_count");
+    _ = try requiredJsonString(object, "fork_batch_id");
+    _ = try requiredJsonString(object, "vm_id");
+
+    if (parallel_count == 0 or fork_count == 0) return error.BadGenerationPayload;
+    if (parallel_index >= parallel_count or fork_index >= fork_count) return error.BadGenerationPayload;
+}
+
+fn requiredJsonU64(object: std.json.ObjectMap, field: []const u8) !u64 {
+    const value = object.get(field) orelse return error.BadGenerationPayload;
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @intCast(integer) else error.BadGenerationPayload,
+        .number_string => |string| std.fmt.parseInt(u64, string, 10) catch return error.BadGenerationPayload,
+        else => error.BadGenerationPayload,
+    };
+}
+
+fn requiredJsonString(object: std.json.ObjectMap, field: []const u8) ![]const u8 {
+    const value = object.get(field) orelse return error.BadGenerationPayload;
+    const string = switch (value) {
+        .string => |string| string,
+        else => return error.BadGenerationPayload,
+    };
+    if (string.len == 0) return error.BadGenerationPayload;
+    return string;
 }
 
 fn resolveBackend(backend: Backend) !Backend {
@@ -416,10 +484,17 @@ test "resume cli parser accepts jsonl events" {
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }
 
+test "resume cli parser accepts generation file" {
+    const opts = try parseCliArgs(&.{ "--generation", "generation.json", "--events=jsonl", "child.spore" });
+    try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
+    try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
+    try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
+}
+
 test "resume attach request omits empty generation params" {
     const allocator = std.testing.allocator;
     const manifest = testDiskGuardManifest(&.{}, false);
-    const attach = try prepareResumeAttach(allocator, manifest);
+    const attach = try prepareResumeAttach(allocator, manifest, null);
     defer attach.deinit(allocator);
     try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", attach.request);
     try std.testing.expectEqualStrings("", attach.generation_state.params_b64);
@@ -436,7 +511,7 @@ test "resume attach request carries refreshed generation params" {
     manifest.generation = try gen_dev.capture(allocator);
     defer allocator.free(manifest.generation.params_b64);
 
-    const attach = try prepareResumeAttach(allocator, manifest);
+    const attach = try prepareResumeAttach(allocator, manifest, null);
     defer attach.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"type\":\"attach\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"params_json\":\"") != null);
@@ -460,6 +535,36 @@ test "resume attach request carries refreshed generation params" {
     });
     defer parsed.deinit();
     try std.testing.expectEqualStrings(restored.params[0..params_end], parsed.value.params_json);
+}
+
+test "resume attach request accepts explicit generation params" {
+    const allocator = std.testing.allocator;
+    const params =
+        \\{"run_id":"rails-rspec-1","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"batch-1","vm_id":"spore-child-7"}
+    ;
+    try validateGenerationParams(allocator, params);
+
+    const manifest = testDiskGuardManifest(&.{}, false);
+    const attach = try prepareResumeAttach(allocator, manifest, params);
+    defer attach.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"run_id\\\":\\\"rails-rspec-1\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"parallel_index\\\":7") != null);
+
+    var restored = generation.Device{};
+    try restored.restore(allocator, attach.generation_state);
+    var params_end = restored.params.len;
+    while (params_end > 0 and restored.params[params_end - 1] == 0) : (params_end -= 1) {}
+    try std.testing.expectEqualStrings(params, restored.params[0..params_end]);
+}
+
+test "explicit generation params require shard identity fields" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.BadGenerationPayload, validateGenerationParams(allocator,
+        \\{"run_id":"rails-rspec-1","parallel_index":0,"parallel_count":1}
+    ));
+    try std.testing.expectError(error.BadGenerationPayload, validateGenerationParams(allocator,
+        \\{"run_id":"rails-rspec-1","child_id":1,"parallel_index":2,"parallel_count":2,"fork_index":0,"fork_count":1,"fork_batch_id":"batch-1","vm_id":"spore-child-1"}
+    ));
 }
 
 test "resume memory defaults to manifest ram size" {
