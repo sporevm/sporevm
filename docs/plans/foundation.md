@@ -126,7 +126,7 @@ root disk contract.
 | Slice 1: KVM boot | Complete for the foundation target | Continue using KVM hardware smokes for regressions. |
 | Slice 2: HVF boot | Complete for the foundation target | Continue using Apple Silicon smokes for regressions. |
 | Product run bridge | Landed | See `docs/plans/run-bridge.md`; future OCI/writable policy is out of this plan. |
-| Named lifecycle | Stable for local `create`/`exec`/`suspend`/`resume --name`/`ls`/`rm` on supported HVF/KVM backends; monitor jail denies child process execution on macOS and Linux | Continue speed work in `docs/plans/lifecycle-monitor.md`; explicit `--rootfs` path lifecycle checkpoints remain non-portable and fail closed. |
+| Named lifecycle | Stable for local `create`/`exec`/`suspend`/`resume --name`/`ls`/`rm` on supported HVF/KVM backends; monitor jail denies child process execution on macOS and Linux | Continue speed work in `docs/plans/lifecycle-monitor.md`; explicit `--rootfs` path lifecycle checkpoints use exact immutable rootfs artifacts. |
 | libspore shared core | Active | The Zig module is published as `libspore`; `src/api.zig` is the product surface, including raw run, managed fresh run setup, run-from-spore, and resume with typed events. Backend, device, storage, daemon, and CLI modules are not re-exported. |
 | Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Keep writable disk product smoke coverage as regression evidence. |
 | Slice 4: fork and generation protocol | Complete for correctness | `/run/sporevm` is the live metadata contract; keep fan-out identity smokes as regression coverage. |
@@ -331,9 +331,8 @@ SporeVM is an isolation boundary written in Zig. The defensive posture is:
 - ReleaseSafe shipping builds;
 - stable monitor lifecycle scope is local
   `create`/`exec`/`suspend`/`resume --name`/`ls`/`rm` on supported backends;
-  macOS sandbox and Linux seccomp deny monitor child process execution, while
-  explicit `--rootfs` path lifecycle checkpoints fail closed because they lack
-  portable immutable-rootfs identity.
+  macOS sandbox and Linux seccomp deny monitor child process execution; explicit
+  `--rootfs` path lifecycle checkpoints use exact immutable rootfs artifacts.
 
 `SECURITY.md` is the attack-surface inventory and must be updated in the same
 change that widens parsing, device, manifest, rootfs, bundle, or control-socket

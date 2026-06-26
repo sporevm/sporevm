@@ -29,9 +29,12 @@ needs portable chunked rootfs identity. `spore rootfs cas-preload --attach-spore
 remains a repair/debug path for existing exact-rootfs spores; it is not the
 normal producer path.
 
-Plain `spore run --rootfs PATH` is still a local read-only escape hatch. Combining
-`--rootfs PATH` with `--capture` is rejected until an import path can record
-portable rootfs identity for arbitrary local images.
+Plain `spore run --rootfs PATH` is still a local read-only escape hatch. Named
+`spore create --rootfs PATH` records exact immutable rootfs identity in the
+digest cache, so lifecycle checkpoints can resume through the fd-backed rootfs
+path. Combining one-shot `spore run --rootfs PATH` with `--capture` is rejected
+until an import path can record chunked portable rootfs identity for arbitrary
+local images.
 
 ## Manifest Authority
 

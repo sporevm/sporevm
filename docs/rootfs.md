@@ -204,8 +204,10 @@ caches used by pull. Pull JSON reports `rootfs.cache.hit_count`,
 cache is not refetching or reinstalling rootfs bytes.
 
 Plain `spore run --rootfs PATH` remains a local read-only run escape hatch.
-Combining `--rootfs PATH` with `--capture` is rejected until an import/preload
-command can record portable rootfs identity for arbitrary local images.
+Named `spore create --rootfs PATH` records exact immutable rootfs identity in
+the digest cache for lifecycle checkpoints. Combining one-shot `spore run
+--rootfs PATH` with `--capture` is rejected until an import/preload command can
+record chunked portable rootfs identity for arbitrary local images.
 
 Validate OCI rootfs capture, fork, and parallel `spore run --from` execution
 with the opt-in Ruby fan-out smoke:

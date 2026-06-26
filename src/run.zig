@@ -1081,10 +1081,12 @@ pub fn resolveRootfsInputDetailedResult(
             .{options.command_name},
         ) };
     }
-    const resolved = if (options.image_ref) |ref|
+    const resolved = if (options.rootfs_path) |path|
+        try resolvePathRootfs(init, allocator, path, options.command_name, options.record_artifact)
+    else if (options.image_ref) |ref|
         try resolveImageRootfs(init, allocator, ref, options.command_name, options.pull_policy, options.record_artifact)
     else
-        RootfsInputResolution{ .resolved = .{ .path = options.rootfs_path } };
+        RootfsInputResolution{ .resolved = .{ .path = null } };
     switch (resolved) {
         .failure => return resolved,
         .resolved => |rootfs| {
@@ -1102,6 +1104,53 @@ pub fn resolveRootfsInputDetailedResult(
             return .{ .resolved = rootfs };
         },
     }
+}
+
+fn resolvePathRootfs(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    rootfs_path: []const u8,
+    command_name: []const u8,
+    record_artifact: bool,
+) !RootfsInputResolution {
+    if (!try readablePath(init.io, rootfs_path)) {
+        return .{ .failure = rootfsInputFailure(
+            allocator,
+            .object_not_found,
+            command_name,
+            "spore {s}: rootfs not found: {s}",
+            .{ command_name, rootfs_path },
+        ) };
+    }
+    if (!record_artifact) return .{ .resolved = .{ .path = rootfs_path } };
+
+    const cache_root = local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
+        error.MissingHome => return .{ .failure = rootfsInputFailure(
+            allocator,
+            .cache_unavailable,
+            command_name,
+            "spore {s}: cannot resolve rootfs cache directory; set {s} or HOME",
+            .{ command_name, local_paths.rootfs_cache_env },
+        ) },
+        else => |e| return e,
+    };
+    try ensureDirPath(init.io, cache_root);
+    const artifact = rootfs_cache.cacheByDigestPathCopy(init.io, allocator, cache_root, rootfs_path) catch |err| {
+        return .{ .failure = rootfsInputFailure(
+            allocator,
+            machine_output.fromZigError(err).code,
+            command_name,
+            "spore {s}: rootfs artifact setup failed for {s}: {s}",
+            .{ command_name, rootfs_path, @errorName(err) },
+        ) };
+    };
+    return .{ .resolved = .{
+        .path = rootfs_path,
+        .rootfs = .{
+            .device = .{ .mmio_slot = 1 },
+            .artifact = artifact,
+        },
+    } };
 }
 
 fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8, command_name: []const u8, pull_policy: PullPolicy, record_artifact: bool) !RootfsInputResolution {
@@ -3111,6 +3160,59 @@ test "rootfs digest cache verifies exact bytes" {
     try Io.Dir.cwd().deleteFile(io, digest_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
     try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedRootfsFromCache(io, arena, cache_root, rootfs));
+}
+
+test "explicit rootfs input can record exact immutable identity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-explicit-rootfs-record-artifact";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const result = try resolveRootfsInputDetailedResult(init, arena, .{
+        .rootfs_path = rootfs_path,
+        .image_ref = null,
+        .command_name = "create",
+        .record_artifact = true,
+    });
+    const resolved = switch (result) {
+        .resolved => |resolved| resolved,
+        .failure => return error.ExpectedRootfsRecord,
+    };
+    try std.testing.expectEqualStrings(rootfs_path, resolved.path.?);
+    try std.testing.expect(resolved.rootfs != null);
+    try std.testing.expect(resolved.rootfs.?.storage == null);
+    try std.testing.expect(resolved.rootfs.?.source == null);
+    try std.testing.expectEqual(@as(u32, 1), resolved.rootfs.?.device.mmio_slot);
+    try std.testing.expectEqual(@as(u64, "rootfs bytes".len), resolved.rootfs.?.artifact.size);
+
+    const digest_path = try digestRootfsPath(arena, absolute_cache_root, resolved.rootfs.?.artifact.digest);
+    try Io.Dir.cwd().access(io, digest_path, .{ .read = true });
+    const source_stat = try Io.Dir.cwd().statFile(io, rootfs_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@intFromEnum(source_stat.permissions) & 0o777)));
 }
 
 test "runtime disk rejects corrupt rootfs before constructing file block source" {

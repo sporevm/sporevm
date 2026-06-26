@@ -53,15 +53,37 @@ pub fn cacheByDigestPath(
     cache_root: []const u8,
     rootfs_path: []const u8,
 ) !spore.RootfsArtifactRef {
+    return cacheByDigestPathWithOptions(io, allocator, cache_root, rootfs_path, .{
+        .source_must_not_be_symlink = false,
+        .allow_hardlink = true,
+    });
+}
+
+pub fn cacheByDigestPathCopy(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    rootfs_path: []const u8,
+) !spore.RootfsArtifactRef {
+    return cacheByDigestPathWithOptions(io, allocator, cache_root, rootfs_path, .{
+        .source_must_not_be_symlink = false,
+        .allow_hardlink = false,
+    });
+}
+
+fn cacheByDigestPathWithOptions(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    rootfs_path: []const u8,
+    copy_options: CopyOptions,
+) !spore.RootfsArtifactRef {
     const source = try hashPath(io, allocator, rootfs_path);
     const artifact = spore.RootfsArtifactRef{
         .digest = source.digest,
         .size = source.size,
     };
-    _ = try installExpectedPathAfterSourceVerified(io, allocator, cache_root, rootfs_path, artifact, .{
-        .source_must_not_be_symlink = false,
-        .allow_hardlink = true,
-    });
+    _ = try installExpectedPathAfterSourceVerified(io, allocator, cache_root, rootfs_path, artifact, copy_options);
     return artifact;
 }
 
@@ -326,6 +348,30 @@ test "digest cache installs rootfs bytes atomically and verifies final content" 
     try Io.Dir.cwd().deleteFile(io, digest_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
     try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedFromCache(io, arena, cache_root, rootfs));
+}
+
+test "copy-only digest cache does not chmod source rootfs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-cache-copy-source-perms";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
+
+    const artifact = try cacheByDigestPathCopy(io, arena, cache_root, rootfs_path);
+    const source_stat = try Io.Dir.cwd().statFile(io, rootfs_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@intFromEnum(source_stat.permissions) & 0o777)));
+
+    const digest_path = try digestPath(arena, cache_root, artifact.digest);
+    const cache_stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(cache_stat.permissions) & 0o777)));
 }
 
 test "install after source verification cleans up bad installed bytes" {

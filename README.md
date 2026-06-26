@@ -290,9 +290,9 @@ lifecycle state. `spore exec` forwards guest stdout and stderr as workload
 streams.
 
 Monitor processes run with a denied-child-exec jail on macOS and Linux. Named
-checkpoint lifecycle supports diskless VMs and image-created writable rootfs
-state; explicit `--rootfs` path checkpoints still fail closed because they do
-not carry portable immutable-rootfs identity.
+checkpoint lifecycle supports diskless VMs, image-created writable rootfs state,
+and explicit `--rootfs` path checkpoints backed by exact immutable rootfs
+artifacts.
 
 ## What 1.0 supports
 
@@ -318,8 +318,9 @@ Known limits:
   user contract.
 - General block-device state is out of scope. Rootfs-bound writable state is
   represented as sealed disk layers.
-- Explicit `spore create --rootfs PATH` lifecycle VMs cannot be suspended into
-  portable disk-backed spores; use `--image` when checkpointing rootfs state.
+- Explicit `spore create --rootfs PATH` lifecycle checkpoints use exact rootfs
+  artifacts, not chunked rootfs storage; use `--image` for the chunked CAS fast
+  path.
 - SporeVM is a VMM isolation boundary, but it does not claim hardened
   public-cloud multi-tenant isolation.
 

@@ -300,7 +300,7 @@ pub fn createCli(
         .rootfs_path = spec.rootfs_path,
         .image_ref = spec.image_ref,
         .command_name = "create",
-        .record_artifact = spec.image_ref != null,
+        .record_artifact = spec.rootfs_path != null or spec.image_ref != null,
     });
     const resolved_rootfs = switch (rootfs_resolution) {
         .resolved => |rootfs| rootfs,
@@ -453,7 +453,7 @@ pub fn suspendCli(
     };
     defer spec.deinit();
     if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
-        const message = "spore suspend: disk-backed lifecycle suspend requires an image-created VM";
+        const message = "spore suspend: disk-backed lifecycle suspend requires recorded immutable rootfs identity";
         exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
     }
     var ready = readReady(allocator, init.io, paths) catch {

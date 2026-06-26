@@ -93,9 +93,8 @@ policy, secrets, egress, mounts, workspace semantics, and scheduling.
 - KVM monitor wake support has landed for create, exec, repeated exec, ls, and
   rm using `immediate_exit` plus a signal wake for host-attached control streams.
 - Disk-backed lifecycle suspend/resume uses monitor-owned rootfs and disk
-  identity for image-created VMs. Explicit `spore create --rootfs PATH` VMs still
-  fail closed on suspend because they do not carry portable immutable-rootfs
-  identity.
+  identity. Image-created VMs use chunked rootfs storage; explicit
+  `spore create --rootfs PATH` VMs use exact immutable rootfs artifacts.
 - `spore create --net [--allow-cidr CIDR] [--allow-host HOST]` reuses the
   existing virtio-net -> `spore-netd` path. The monitor owns the helper
   lifetime, records requested policy in checkpoints, and named resume starts a
@@ -166,12 +165,11 @@ pending virtio-vsock RX before re-entering the guest.
 ### Checkpoint Lifecycle
 
 Disk-backed lifecycle checkpoints carry explicit disk/rootfs ownership through
-the monitor. `spore create --image` records immutable-rootfs identity in
-`spec.json`, the monitor preserves it while opening the live writable root disk,
-and `spore suspend` writes lifecycle metadata into the checkpoint so named
-`spore resume` can restore the same disk model. Explicit `--rootfs` path VMs
-remain non-portable and fail closed on suspend until callers can provide
-immutable-rootfs identity.
+the monitor. `spore create --image` records chunked immutable-rootfs identity in
+`spec.json`; `spore create --rootfs PATH` records exact immutable-rootfs
+identity in the digest cache. The monitor preserves that identity while opening
+the live writable root disk, and `spore suspend` writes lifecycle metadata into
+the checkpoint so named `spore resume` can restore the same disk model.
 
 ## Non-Goals
 
@@ -196,7 +194,7 @@ immutable-rootfs identity.
   preserved.
 - Benchmark smoke: low-iteration lifecycle timing run.
 - Failure smokes: monitor crash before/after ready, `rm` of a dead monitor,
-  explicit-rootfs `suspend` rejection, unsupported backend.
+  missing exact rootfs artifact rejection, unsupported backend.
 
 ## Resolved Decisions
 

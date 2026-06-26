@@ -53,9 +53,10 @@ fuzz targets from the slice that introduces it:
   `spore rm` are available on supported backends. Monitor processes deny child
   process execution through an embedded macOS sandbox profile or Linux seccomp
   filter after optional startup helpers are spawned, covered by
-  `mise run smoke:monitor-jail`. Disk-backed named checkpointing is limited to
-  image-created VMs so the monitor can preserve immutable-rootfs identity and
-  sealed writable disk layers.
+  `mise run smoke:monitor-jail`. Disk-backed named checkpointing preserves
+  immutable-rootfs identity and sealed writable disk layers; image-created VMs
+  use chunked rootfs storage, and explicit `--rootfs PATH` VMs use exact rootfs
+  artifacts.
 - **The device model stays minimal.** Every device addition expands both the
   attack surface and the portability contract, and requires editing
   docs/plans/foundation.md.
