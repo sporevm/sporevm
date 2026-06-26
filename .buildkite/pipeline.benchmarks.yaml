@@ -93,4 +93,4 @@ steps:
       set -euo pipefail
       scripts/publish-sporevm-benchmark-site-data.py
     agents:
-      queue: hosted
+      queue: cleanroom-linux-arm64
