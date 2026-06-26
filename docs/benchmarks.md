@@ -178,7 +178,11 @@ scripts/benchmark-substrate-snapshot.py --memory-mib 2048 --iterations 1
 
 This fetches the latest `https://benchmarks.substrate.so/<arch>/data.js`, runs
 matching RAM sizes, and writes JSONL plus `summary.json` under
-`zig-cache/sporevm-substrate-snapshot/`.
+`zig-cache/sporevm-substrate-snapshot/`. Restore rows fail by default unless the
+child used proof-backed local RAM with backend `mode=local_backing` and
+`MAP_PRIVATE` file-backed memory. The summary reports both the existing
+`exec_response_ms` and `backend_pre_run_ms + exec_response_ms`, which is the
+closer restore-to-first-reply comparison.
 
 Defaults fail when:
 

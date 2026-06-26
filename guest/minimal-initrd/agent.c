@@ -6,6 +6,7 @@
 #include <net/route.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -72,6 +73,7 @@ static int64_t t_request_accept = 0;
 static int64_t t_request_decode = 0;
 static int64_t t_command_start = 0;
 static int64_t t_command_exit = 0;
+static int sigchld_pipe[2] = { -1, -1 };
 
 static int path_is_dir(const char *path);
 
@@ -733,6 +735,33 @@ static int wait_child(pid_t pid, int *status) {
   }
 }
 
+static void sigchld_handler(int signum) {
+  (void)signum;
+  int saved_errno = errno;
+  if (sigchld_pipe[1] >= 0) {
+    char byte = 1;
+    (void)write(sigchld_pipe[1], &byte, 1);
+  }
+  errno = saved_errno;
+}
+
+static int setup_sigchld_wakeup(void) {
+  if (pipe2(sigchld_pipe, O_CLOEXEC | O_NONBLOCK) != 0) return -1;
+
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = sigchld_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_NOCLDSTOP | SA_RESTART;
+  return sigaction(SIGCHLD, &sa, NULL);
+}
+
+static void drain_sigchld_wakeup(void) {
+  char buf[32];
+  while (read(sigchld_pipe[0], buf, sizeof(buf)) > 0) {
+  }
+}
+
 static const char *skip_ws(const char *p) {
   while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
   return p;
@@ -1346,6 +1375,10 @@ int main(void) {
   }
   (void)set_nonblock(listener);
   t_listen_ready = now_ms();
+  if (setup_sigchld_wakeup() != 0) {
+    dprintf(2, "sigchld wakeup setup failed: errno=%d\n", errno);
+    return 1;
+  }
 
   struct session session;
   memset(&session, 0, sizeof(session));
@@ -1364,8 +1397,8 @@ int main(void) {
       poll_generation(&generation, generation_root);
     }
 
-    struct pollfd fds[4];
-    int roles[4];
+    struct pollfd fds[5];
+    int roles[5];
     nfds_t nfds = 0;
     fds[nfds].fd = listener;
     fds[nfds].events = POLLIN;
@@ -1389,10 +1422,12 @@ int main(void) {
       fds[nfds].revents = 0;
       roles[nfds++] = 3;
     }
+    fds[nfds].fd = sigchld_pipe[0];
+    fds[nfds].events = POLLIN;
+    fds[nfds].revents = 0;
+    roles[nfds++] = 4;
 
-    // ponytail: polling for child exit; use SIGCHLD/self-pipe if quiet long-running commands make wakeups matter.
-    int timeout_ms = session.started && !session.exited ? 10 : 100;
-    int pr = poll(fds, nfds, timeout_ms);
+    int pr = poll(fds, nfds, 100);
     if (pr < 0 && errno != EINTR) continue;
     if (pr > 0) {
       for (nfds_t i = 0; i < nfds; i++) {
@@ -1405,6 +1440,8 @@ int main(void) {
           pump_session_stream(&session, &client, 1);
         } else if (roles[i] == 3) {
           pump_session_stream(&session, &client, 0);
+        } else if (roles[i] == 4) {
+          drain_sigchld_wakeup();
         }
       }
     }

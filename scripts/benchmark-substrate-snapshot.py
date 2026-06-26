@@ -22,6 +22,10 @@ import uuid
 
 DEFAULT_MEMORY_MIB = (2048, 4096, 8192, 16384)
 SUBSTRATE_SERIES = ("substrate-mmap", "substrate-uffd", "fc-file", "chv")
+RESTORE_SOURCE_RE = re.compile(r"run --from memory restore source=(?P<source>\S+) reason=(?P<reason>\S+)")
+RESTORE_METRICS_RE = re.compile(r"(?:kvm|hvf) restore metrics: (?P<fields>.+)")
+EXEC_PROBE_TIMING_RE = re.compile(r"run exec probe timing: (?P<fields>.+)")
+GUEST_TIMING_RE = re.compile(r"vsock host stream guest timing: timing (?P<fields>.+)")
 
 
 def die(message: str) -> None:
@@ -201,6 +205,71 @@ def parse_run_events(path: Path) -> dict[str, object]:
     }
 
 
+def parse_int_field(raw: str | None) -> int | None:
+    if raw is None or raw == "null":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def parse_key_value_tail(raw: str) -> dict[str, str]:
+    fields = {}
+    for part in raw.split():
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key] = value
+    return fields
+
+
+def parse_restore_logs(path: Path) -> dict[str, object]:
+    text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+    result: dict[str, object] = {
+        "restore_source": None,
+        "restore_reason": None,
+        "backend_restore_mode": None,
+        "backend_map_ram_ms": None,
+        "backend_memory_ms": None,
+        "backend_state_ms": None,
+        "backend_pre_run_ms": None,
+        "probe_attach_ms": None,
+        "probe_request_delivered_ms": None,
+        "probe_guest_timing_ms": None,
+        "guest_accept_to_exit_ms": None,
+        "ram_backing_map_private": False,
+    }
+    for match in RESTORE_SOURCE_RE.finditer(text):
+        result["restore_source"] = match.group("source")
+        result["restore_reason"] = match.group("reason")
+    for match in RESTORE_METRICS_RE.finditer(text):
+        fields = parse_key_value_tail(match.group("fields"))
+        result["backend_restore_mode"] = fields.get("mode")
+        result["backend_map_ram_ms"] = parse_int_field(fields.get("map_ram_ms"))
+        result["backend_memory_ms"] = parse_int_field(fields.get("memory_ms"))
+        result["backend_state_ms"] = parse_int_field(fields.get("state_ms"))
+        result["backend_pre_run_ms"] = parse_int_field(fields.get("pre_run_ms"))
+    for match in EXEC_PROBE_TIMING_RE.finditer(text):
+        fields = parse_key_value_tail(match.group("fields"))
+        result["probe_attach_ms"] = parse_int_field(fields.get("attach_ms"))
+        result["probe_request_delivered_ms"] = parse_int_field(fields.get("request_delivered_ms"))
+        result["probe_guest_timing_ms"] = parse_int_field(fields.get("guest_timing_ms"))
+    for match in GUEST_TIMING_RE.finditer(text):
+        fields = parse_key_value_tail(match.group("fields"))
+        accept_ms = parse_int_field(fields.get("accept"))
+        exit_ms = parse_int_field(fields.get("exit"))
+        if accept_ms is not None and exit_ms is not None and exit_ms >= accept_ms:
+            result["guest_accept_to_exit_ms"] = exit_ms - accept_ms
+    result["ram_backing_map_private"] = "mapped RAM from file backing fd" in text and "mode=MAP_PRIVATE" in text
+    result["local_backing_ok"] = (
+        result["restore_source"] == "local_backing"
+        and result["restore_reason"] == "proof_valid"
+        and result["backend_restore_mode"] == "local_backing"
+        and result["ram_backing_map_private"] is True
+    )
+    return result
+
+
 def summarize(values: list[float]) -> dict[str, float | int | None]:
     if not values:
         return {"count": 0, "min": None, "max": None, "mean": None, "median": None}
@@ -352,6 +421,7 @@ class Runner:
         stderr = self.log_dir / f"{mib}MiB" / f"{child_name}.stderr"
         argv = [
             str(self.spore_bin),
+            "--debug",
             "run",
             "--backend",
             self.args.backend,
@@ -363,9 +433,12 @@ class Runner:
         ]
         status, host_wall_ms, error = run_command(argv, env=self.env, stdout_path=stdout, stderr_path=stderr, timeout_s=self.args.timeout_s)
         events = parse_run_events(stdout)
+        restore = parse_restore_logs(stderr)
         guest_exit = events.get("guest_exit_code")
         exec_response_ms = events.get("exec_response_ms")
         success = status == 0 and guest_exit == 0 and isinstance(exec_response_ms, (int, float))
+        if self.args.require_local_backing:
+            success = success and restore.get("local_backing_ok") is True
         self.emit({
             "phase": "restore",
             "memory_mib": mib,
@@ -380,7 +453,18 @@ class Runner:
             "stdout_path": str(stdout),
             "stderr_path": str(stderr),
             **events,
+            **restore,
         })
+        if self.args.require_local_backing and restore.get("local_backing_ok") is not True:
+            die(
+                "restore did not use proof-backed mmap RAM "
+                f"for {mib}MiB iteration={iteration}: "
+                f"source={restore.get('restore_source')} "
+                f"reason={restore.get('restore_reason')} "
+                f"mode={restore.get('backend_restore_mode')} "
+                f"map_private={restore.get('ram_backing_map_private')} "
+                f"stderr={stderr}"
+            )
         state = "ok" if success else "failed"
         print(f"{mib}MiB restore iteration={iteration} {state} exec_response_ms={exec_response_ms}", file=sys.stderr)
 
@@ -396,18 +480,30 @@ class Runner:
                 for row in restore_rows
                 if row.get("success") and isinstance(row.get("exec_response_ms"), (int, float))
             ]
+            backend_restore_to_reply = [
+                float(row["backend_pre_run_ms"]) + float(row["exec_response_ms"])
+                for row in restore_rows
+                if row.get("success")
+                and isinstance(row.get("backend_pre_run_ms"), (int, float))
+                and isinstance(row.get("exec_response_ms"), (int, float))
+            ]
             spore = summarize(values)
+            spore_backend = summarize(backend_restore_to_reply)
             sub = {series: substrate_value(self.substrate, self.args.arch, series, mib) for series in SUBSTRATE_SERIES}
             median = spore["median"] if isinstance(spore["median"], (int, float)) else None
+            backend_median = spore_backend["median"] if isinstance(spore_backend["median"], (int, float)) else None
             results.append({
                 "memory_mib": mib,
                 "spore_exec_response_ms": spore,
+                "spore_backend_restore_to_reply_ms": spore_backend,
                 "spore_success_rate": len(values) / len(restore_rows) if restore_rows else 0.0,
                 "substrate_ms": sub,
                 "spore_vs_substrate_mmap": ratio(median, sub.get("substrate-mmap")),
                 "spore_vs_substrate_uffd": ratio(median, sub.get("substrate-uffd")),
                 "spore_vs_firecracker_file": ratio(median, sub.get("fc-file")),
                 "spore_vs_cloud_hypervisor": ratio(median, sub.get("chv")),
+                "spore_backend_vs_substrate_mmap": ratio(backend_median, sub.get("substrate-mmap")),
+                "spore_backend_vs_substrate_uffd": ratio(backend_median, sub.get("substrate-uffd")),
             })
         return {
             "run_id": self.run_id,
@@ -421,6 +517,7 @@ class Runner:
                 "capture_command": self.args.capture_command,
                 "probe_command": self.args.probe_command,
                 "spore_bin": str(self.spore_bin),
+                "require_local_backing": self.args.require_local_backing,
             },
             "substrate": {
                 "url": self.substrate.get("url"),
@@ -446,19 +543,21 @@ def print_table(summary: dict[str, object]) -> None:
     commit = substrate.get("commit", {}) if isinstance(substrate, dict) else {}
     commit_id = commit.get("id", "") if isinstance(commit, dict) else ""
     print(f"Substrate snapshot: {str(commit_id)[:7]} {substrate.get('url') if isinstance(substrate, dict) else ''}")
-    print("memory  spore_reply_ms  sub_mmap_ms  sub_uffd_ms  fc_file_ms  spore/mmap  spore/fc")
+    print("memory  spore_reply_ms  spore_backend_ms  sub_mmap_ms  sub_uffd_ms  fc_file_ms  backend/mmap")
     for row in summary.get("results", []):
         spore = row.get("spore_exec_response_ms", {})
         median = spore.get("median") if isinstance(spore, dict) else None
+        spore_backend = row.get("spore_backend_restore_to_reply_ms", {})
+        backend_median = spore_backend.get("median") if isinstance(spore_backend, dict) else None
         sub = row.get("substrate_ms", {})
         print(
             f"{row.get('memory_mib'):>5}  "
             f"{fmt_ms(median):>14}  "
+            f"{fmt_ms(backend_median):>16}  "
             f"{fmt_ms(sub.get('substrate-mmap') if isinstance(sub, dict) else None):>11}  "
             f"{fmt_ms(sub.get('substrate-uffd') if isinstance(sub, dict) else None):>11}  "
             f"{fmt_ms(sub.get('fc-file') if isinstance(sub, dict) else None):>10}  "
-            f"{fmt_ratio(row.get('spore_vs_substrate_mmap')):>10}  "
-            f"{fmt_ratio(row.get('spore_vs_firecracker_file')):>8}"
+            f"{fmt_ratio(row.get('spore_backend_vs_substrate_mmap')):>12}"
         )
 
 
@@ -495,8 +594,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeout-s", type=int, default=240)
     parser.add_argument("--substrate-data-url", default="https://benchmarks.substrate.so/{arch}/data.js")
     parser.add_argument("--fetch-only", action="store_true", help="Only print the latest Substrate snapshot data")
+    parser.add_argument("--no-require-local-backing", dest="require_local_backing", action="store_false", help="Allow chunk-backed restores instead of failing the warm/mmap comparison")
     parser.add_argument("--no-build", dest="build", action="store_false")
-    parser.set_defaults(build=True)
+    parser.set_defaults(build=True, require_local_backing=True)
     args = parser.parse_args(argv)
     args.memory_mib = parse_csv_ints(args.memory_mib)
     args.capture_command = shlex.split(args.capture_command)
