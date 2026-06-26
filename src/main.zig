@@ -43,6 +43,8 @@ const usage =
     \\  inspect <spore-dir> Print a spore manifest summary
     \\  fork <spore-dir> --count N --out DIR
     \\                      Mint child spores that share parent chunks
+    \\  fork --vm NAME --count N --name PATTERN
+    \\                      Snapshot-and-continue a named VM into named children
     \\  fanout <children-dir> [--for DURATION]
     \\                      Resume forked children concurrently with prefixed output
     \\  pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR
@@ -174,11 +176,15 @@ fn runCommand(
             try writeInspectSummary(stdout, summary);
         }
     } else if (std.mem.eql(u8, command, "fork")) {
-        const result = try forkCommand(context, arena, stderr, mode, command_args);
-        if (mode == .json) {
-            try machine_output.writeJson(arena, stdout, result);
+        if (spore_internal.lifecycle.wantsNamedFork(command_args)) {
+            try spore_internal.lifecycle.forkCli(init, command_args, stdout, stderr, mode);
         } else {
-            try writeForkResult(stdout, result);
+            const result = try forkCommand(context, arena, stderr, mode, command_args);
+            if (mode == .json) {
+                try machine_output.writeJson(arena, stdout, result);
+            } else {
+                try writeForkResult(stdout, result);
+            }
         }
     } else if (std.mem.eql(u8, command, "fanout")) {
         try spore_internal.fanout.cli(init, command_args, stdout);
@@ -833,6 +839,7 @@ test "resume dispatch can distinguish product and named lifecycle modes" {
 
 test "stable lifecycle commands support global json where output is one document" {
     try std.testing.expect(supportsJson("create"));
+    try std.testing.expect(supportsJson("fork"));
     try std.testing.expect(supportsJson("ls"));
     try std.testing.expect(supportsJson("rm"));
     try std.testing.expect(supportsJson("resume"));

@@ -62,6 +62,8 @@ const RequestState = enum {
     active_exec,
     pending_suspend,
     active_suspend,
+    pending_snapshot,
+    active_snapshot,
     done,
     stop_requested,
 };
@@ -260,6 +262,7 @@ const ExecServer = struct {
             .context = self,
             .pollFn = pollThunk,
             .setWakeFn = setWakeThunk,
+            .completeSnapshotFn = completeSnapshotThunk,
         };
     }
 
@@ -278,9 +281,17 @@ const ExecServer = struct {
             .stop_requested => return .stop,
             .pending_suspend => {
                 self.state = .active_suspend;
-                return .{ .snapshot = self.suspend_dir[0..self.suspend_dir_len] };
+                return .{ .snapshot = .{ .dir = self.suspend_dir[0..self.suspend_dir_len] } };
             },
             .active_suspend => return .keep_running,
+            .pending_snapshot => {
+                self.state = .active_snapshot;
+                return .{ .snapshot = .{
+                    .dir = self.suspend_dir[0..self.suspend_dir_len],
+                    .continue_after = true,
+                } };
+            },
+            .active_snapshot => return .keep_running,
             .pending_exec => {
                 self.active_stream = try vsock.HostStream.init(self.guest_port, self.request[0..self.request_len]);
                 self.resetExecCapture();
@@ -398,12 +409,43 @@ const ExecServer = struct {
         return self.response[0..self.response_len];
     }
 
+    fn submitSnapshot(self: *ExecServer, out_dir: []const u8) ![]const u8 {
+        if (out_dir.len == 0 or out_dir.len > self.suspend_dir.len) return error.InvalidSuspendDir;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.state != .idle) return error.ControlBusy;
+        @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
+        self.suspend_dir_len = out_dir.len;
+        self.response_len = 0;
+        self.state = .pending_snapshot;
+        if (self.wake) |wake| wake.wake();
+        self.cond.broadcast(self.io);
+        while (self.state != .done) {
+            self.cond.waitUncancelable(self.io, &self.mutex);
+        }
+        self.state = .idle;
+        return self.response[0..self.response_len];
+    }
+
     fn completeSuspend(self: *ExecServer) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         switch (self.state) {
             .pending_suspend, .active_suspend => {
                 try self.storeSuspendResultLocked(self.suspend_dir[0..self.suspend_dir_len]);
+                self.state = .done;
+                self.cond.broadcast(self.io);
+            },
+            else => {},
+        }
+    }
+
+    fn completeSnapshot(self: *ExecServer, dir: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        switch (self.state) {
+            .pending_snapshot, .active_snapshot => {
+                try self.storeSnapshotResultLocked(dir);
                 self.state = .done;
                 self.cond.broadcast(self.io);
             },
@@ -423,7 +465,7 @@ const ExecServer = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         switch (self.state) {
-            .pending_exec, .active_exec, .pending_suspend, .active_suspend => {
+            .pending_exec, .active_exec, .pending_suspend, .active_suspend, .pending_snapshot, .active_snapshot => {
                 self.storeErrorLocked(message) catch {
                     self.response_len = 0;
                 };
@@ -464,6 +506,14 @@ const ExecServer = struct {
         try self.storeJsonLocked(payload);
     }
 
+    fn storeSnapshotResultLocked(self: *ExecServer, out_dir: []const u8) !void {
+        const payload = struct {
+            type: []const u8 = "snapshotted",
+            out_dir: []const u8,
+        }{ .out_dir = out_dir };
+        try self.storeJsonLocked(payload);
+    }
+
     fn storeErrorLocked(self: *ExecServer, message: []const u8) !void {
         const payload = struct {
             type: []const u8 = "error",
@@ -489,6 +539,11 @@ const ExecServer = struct {
     fn setWakeThunk(context: *anyopaque, wake: vsock.Wake) void {
         const self: *ExecServer = @ptrCast(@alignCast(context));
         self.setWake(wake);
+    }
+
+    fn completeSnapshotThunk(context: *anyopaque, dir: []const u8) !void {
+        const self: *ExecServer = @ptrCast(@alignCast(context));
+        try self.completeSnapshot(dir);
     }
 
     fn captureOutputThunk(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
@@ -546,6 +601,23 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         try writeAll(server.io, stream, response);
         return true;
     }
+    if (std.mem.eql(u8, parsed.value.type, "snapshot")) {
+        const out_dir = parsed.value.out_dir orelse {
+            try writeControlError(server.io, stream, "snapshot request missing out_dir");
+            return false;
+        };
+        const continue_after = parsed.value.@"continue" orelse false;
+        if (!continue_after) {
+            try writeControlError(server.io, stream, "snapshot request must set continue=true");
+            return false;
+        }
+        const response = server.submitSnapshot(out_dir) catch {
+            try writeControlError(server.io, stream, "monitor busy");
+            return false;
+        };
+        try writeAll(server.io, stream, response);
+        return false;
+    }
     if (!std.mem.eql(u8, parsed.value.type, "exec")) {
         try writeControlError(server.io, stream, "unknown control request");
         return false;
@@ -571,6 +643,7 @@ const ControlRequest = struct {
     type: []const u8,
     argv: ?[]const []const u8 = null,
     out_dir: ?[]const u8 = null,
+    @"continue": ?bool = null,
 };
 
 fn writeControlOk(io: Io, stream: net.Stream) !void {

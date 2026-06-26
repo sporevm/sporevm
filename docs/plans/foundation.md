@@ -126,7 +126,7 @@ root disk contract.
 | Slice 1: KVM boot | Complete for the foundation target | Continue using KVM hardware smokes for regressions. |
 | Slice 2: HVF boot | Complete for the foundation target | Continue using Apple Silicon smokes for regressions. |
 | Product run bridge | Landed | See `docs/plans/run-bridge.md`; future OCI/writable policy is out of this plan. |
-| Named lifecycle | Stable for local `create`/`exec`/`suspend`/`resume --name`/`ls`/`rm` on supported HVF/KVM backends; monitor jail denies child process execution on macOS and Linux | Continue speed work in `docs/plans/lifecycle-monitor.md`; explicit `--rootfs` path lifecycle checkpoints use exact immutable rootfs artifacts. |
+| Named lifecycle | Stable for local `create`/`exec`/`suspend`/`resume --name`/`fork --vm`/`ls`/`rm` on supported HVF/KVM backends; monitor jail denies child process execution on macOS and Linux; diskless named live fork and unreferenced fork-batch pruning have landed | Continue speed work in `docs/plans/lifecycle-monitor.md`; explicit `--rootfs` path lifecycle checkpoints use exact immutable rootfs artifacts; disk-backed and networked named live fork remain follow-up work. |
 | libspore shared core | Active | The Zig module is published as `libspore`; `src/api.zig` is the product surface, including raw run, managed fresh run setup, run-from-spore, and resume with typed events. Backend, device, storage, daemon, and CLI modules are not re-exported. |
 | Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Keep writable disk product smoke coverage as regression evidence. |
 | Slice 4: fork and generation protocol | Complete for correctness | `/run/sporevm` is the live metadata contract; keep fan-out identity smokes as regression coverage. |
@@ -370,7 +370,8 @@ inputs.
   product resume; remote and lazy pull sources must keep the same verified
   content-source boundary.
 - `spore run` is one-shot; stable named lifecycle uses
-  `create`/`exec`/`suspend`/`resume --name`/`rm`/`ls` on supported backends.
+  `create`/`exec`/`suspend`/`resume --name`/`fork --vm`/`rm`/`ls` on supported
+  backends; named live fork keeps the source VM running.
 - Product capture is `spore run --capture`, not a separate capture verb.
 - Same-host fan-out must use explicit RAM-backing transfer and private mappings
   before claiming high-concurrency memory efficiency.

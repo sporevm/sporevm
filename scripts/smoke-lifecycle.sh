@@ -58,12 +58,19 @@ runtime_dir="$(mktemp -d "${runtime_parent%/}/svm-life.XXXXXX")"
 chmod 700 "${runtime_dir}" 2>/dev/null || true
 
 vm_name="life-${backend}-$$"
+worker0="${vm_name}-worker-0"
+worker1="${vm_name}-worker-1"
 created=0
+worker_created=0
 failed=0
 cleanup() {
   if [[ "${failed}" == "1" && -n "${SPORE_KEEP_SMOKE_WORKDIR:-}" ]]; then
     echo "smoke:lifecycle kept workdir=${workdir} runtime_dir=${runtime_dir}" >&2
     return
+  fi
+  if [[ "${worker_created}" == "1" ]]; then
+    env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${worker0}" >/dev/null 2>&1 || true
+    env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${worker1}" >/dev/null 2>&1 || true
   fi
   if [[ "${created}" == "1" ]]; then
     env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
@@ -83,8 +90,20 @@ writeout_stdout="${workdir}/writeout.stdout"
 writeout_stderr="${workdir}/writeout.stderr"
 true_stdout="${workdir}/true.stdout"
 true_stderr="${workdir}/true.stderr"
+fork_stdout="${workdir}/fork.stdout"
+fork_stderr="${workdir}/fork.stderr"
+source_after_fork_stdout="${workdir}/source-after-fork.stdout"
+source_after_fork_stderr="${workdir}/source-after-fork.stderr"
+worker0_stdout="${workdir}/worker0.stdout"
+worker0_stderr="${workdir}/worker0.stderr"
+worker1_stdout="${workdir}/worker1.stdout"
+worker1_stderr="${workdir}/worker1.stderr"
 ls_stdout="${workdir}/ls.stdout"
 ls_stderr="${workdir}/ls.stderr"
+rm_worker0_stdout="${workdir}/rm-worker0.stdout"
+rm_worker0_stderr="${workdir}/rm-worker0.stderr"
+rm_worker1_stdout="${workdir}/rm-worker1.stdout"
+rm_worker1_stderr="${workdir}/rm-worker1.stderr"
 rm_stdout="${workdir}/rm.stdout"
 rm_stderr="${workdir}/rm.stderr"
 ls_after_stdout="${workdir}/ls-after.stdout"
@@ -191,23 +210,93 @@ fi
   die "second spore exec wrote unexpected stdout"
 }
 
+if run_capture "${fork_stdout}" "${fork_stderr}" \
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" fork --vm "${vm_name}" --count 2 --name "${vm_name}-worker-%d"; then
+  worker_created=1
+else
+  status=$?
+  require_success "${status}" "spore fork --vm" "${fork_stderr}"
+fi
+
+if run_capture "${source_after_fork_stdout}" "${source_after_fork_stderr}" \
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" exec "${vm_name}" -- /bin/true; then
+  :
+else
+  status=$?
+  require_success "${status}" "source spore exec after fork" "${source_after_fork_stderr}"
+fi
+[[ ! -s "${source_after_fork_stdout}" ]] || {
+  cat "${source_after_fork_stdout}" >&2 || true
+  die "source exec after fork wrote unexpected stdout"
+}
+
+if run_capture "${worker0_stdout}" "${worker0_stderr}" \
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" exec "${worker0}" -- /bin/writeout; then
+  :
+else
+  status=$?
+  require_success "${status}" "worker0 spore exec" "${worker0_stderr}"
+fi
+grep -Fxq "spore stdout" "${worker0_stdout}" || {
+  cat "${worker0_stdout}" >&2 || true
+  cat "${worker0_stderr}" >&2 || true
+  die "worker0 spore exec did not forward guest stdout"
+}
+grep -Fq "spore stderr" "${worker0_stderr}" || {
+  cat "${worker0_stdout}" >&2 || true
+  cat "${worker0_stderr}" >&2 || true
+  die "worker0 spore exec did not forward guest stderr"
+}
+
+if run_capture "${worker1_stdout}" "${worker1_stderr}" \
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" exec "${worker1}" -- /bin/true; then
+  :
+else
+  status=$?
+  require_success "${status}" "worker1 spore exec" "${worker1_stderr}"
+fi
+[[ ! -s "${worker1_stdout}" ]] || {
+  cat "${worker1_stdout}" >&2 || true
+  die "worker1 spore exec wrote unexpected stdout"
+}
+
 if run_capture "${ls_stdout}" "${ls_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json ls; then
   :
 else
   status=$?
   require_success "${status}" "spore ls" "${ls_stderr}"
 fi
-python3 - "${ls_stdout}" "${vm_name}" <<'PY'
+python3 - "${ls_stdout}" "${vm_name}" "${worker0}" "${worker1}" <<'PY'
 import json
 import sys
 
-path, vm_name = sys.argv[1], sys.argv[2]
+path, *names = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as fh:
     entries = json.load(fh)
 
-if not any(entry.get("name") == vm_name and entry.get("state") == "ready" for entry in entries):
-    raise SystemExit(f"VM {vm_name} was not listed as ready")
+ready_names = {entry.get("name") for entry in entries if entry.get("state") == "ready"}
+missing = [name for name in names if name not in ready_names]
+if missing:
+    raise SystemExit(f"VMs were not listed as ready: {', '.join(missing)}")
 PY
+
+if run_capture "${rm_worker0_stdout}" "${rm_worker0_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${worker0}"; then
+  :
+else
+  status=$?
+  require_success "${status}" "spore rm worker0" "${rm_worker0_stderr}"
+fi
+
+if run_capture "${rm_worker1_stdout}" "${rm_worker1_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${worker1}"; then
+  worker_created=0
+else
+  status=$?
+  require_success "${status}" "spore rm worker1" "${rm_worker1_stderr}"
+fi
 
 if run_capture "${rm_stdout}" "${rm_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}"; then
   created=0
@@ -222,16 +311,18 @@ else
   status=$?
   require_success "${status}" "post-rm spore ls" "${ls_after_stderr}"
 fi
-python3 - "${ls_after_stdout}" "${vm_name}" <<'PY'
+python3 - "${ls_after_stdout}" "${vm_name}" "${worker0}" "${worker1}" <<'PY'
 import json
 import sys
 
-path, vm_name = sys.argv[1], sys.argv[2]
+path, *names = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as fh:
     entries = json.load(fh)
 
-if any(entry.get("name") == vm_name for entry in entries):
-    raise SystemExit(f"VM {vm_name} remained listed after rm")
+remaining = {entry.get("name") for entry in entries}
+unexpected = [name for name in names if name in remaining]
+if unexpected:
+    raise SystemExit(f"VMs remained listed after rm: {', '.join(unexpected)}")
 PY
 
 echo "smoke:lifecycle ok backend=${backend}"

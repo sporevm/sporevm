@@ -6,6 +6,7 @@ const Io = std.Io;
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const default_prune_max_bytes = 0;
+const max_runtime_spec_bytes = 64 * 1024;
 
 const usage =
     \\Usage:
@@ -13,7 +14,7 @@ const usage =
     \\  spore system prune [--rootfs] [--dry-run|--force] [--older-than DURATION] [--max-bytes SIZE] [--include-digest-artifacts]
     \\
     \\Options:
-    \\  --rootfs                    Inspect or prune the rootfs cache
+    \\  --rootfs                    Inspect or prune only the rootfs cache
     \\  --dry-run                   Report prune candidates without deleting them (default)
     \\  --force                     Delete selected cache entries
     \\  --older-than DURATION       Select entries older than 7d, 24h, 30m, or seconds
@@ -23,6 +24,7 @@ const usage =
     \\
     \\Defaults:
     \\  prune selects all default-prunable rootfs entries when no age or size limit is set
+    \\  unreferenced runtime fork batches are selected only when --older-than is set
     \\
 ;
 
@@ -88,6 +90,24 @@ pub const RootfsPruneResult = struct {
     deleted_bytes: u64 = 0,
     deleted_reclaimable_bytes: u64 = 0,
     entries: []const RootfsPruneEntry = &.{},
+    runtime_forks: ?RuntimeForkPruneResult = null,
+};
+
+pub const RuntimeForkPruneEntry = struct {
+    path: []const u8,
+    bytes: u64,
+    mtime_unix: i64,
+};
+
+pub const RuntimeForkPruneResult = struct {
+    runtime_root: []const u8,
+    dry_run: bool,
+    older_than_seconds: ?u64 = null,
+    candidate_count: usize = 0,
+    candidate_bytes: u64 = 0,
+    deleted_count: usize = 0,
+    deleted_bytes: u64 = 0,
+    entries: []const RuntimeForkPruneEntry = &.{},
 };
 
 const PruneOptions = struct {
@@ -116,6 +136,17 @@ const PrunePlanEntry = struct {
     fn reclaimableBytes(self: PrunePlanEntry) u64 {
         return (if (self.link_count <= 1) self.bytes else 0) + self.metadata_bytes;
     }
+};
+
+const RuntimeForkPlanEntry = struct {
+    path: []const u8,
+    bytes: u64,
+    mtime_ns: i96,
+    selected: bool = false,
+};
+
+const RuntimeVmSpecRef = struct {
+    resume_dir: ?[]const u8 = null,
 };
 
 pub fn run(
@@ -196,6 +227,7 @@ fn dfCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, s
 
 fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
     var opts = PruneOptions{};
+    var rootfs_only = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -215,7 +247,7 @@ fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
         } else if (std.mem.eql(u8, arg, "--json")) {
             exitLocalJsonUnsupported(init.arena.allocator(), stderr, mode, "system prune");
         } else if (std.mem.eql(u8, arg, "--rootfs")) {
-            continue;
+            rootfs_only = true;
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
             opts.dry_run = true;
         } else if (std.mem.eql(u8, arg, "--force")) {
@@ -264,7 +296,13 @@ fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
         else => |e| return e,
     };
     const now = Io.Clock.real.now(init.io).nanoseconds;
-    const result = try pruneRootfsCache(allocator, init.io, cache_root, opts, now);
+    var result = try pruneRootfsCache(allocator, init.io, cache_root, opts, now);
+    if (!rootfs_only and opts.older_than_ns != null) {
+        const runtime_root = local_paths.runtimeRootPath(allocator, init.environ_map) catch null;
+        if (runtime_root) |root| {
+            result.runtime_forks = try pruneRuntimeForkBatches(allocator, init.io, root, opts, now);
+        }
+    }
     if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, result);
     } else {
@@ -476,6 +514,136 @@ fn pruneRootfsCache(
     };
 }
 
+fn pruneRuntimeForkBatches(
+    allocator: std.mem.Allocator,
+    io: Io,
+    runtime_root: []const u8,
+    opts: PruneOptions,
+    now_ns: i96,
+) !RuntimeForkPruneResult {
+    const plan = try collectRuntimeForkEntries(allocator, io, runtime_root);
+    std.mem.sort(RuntimeForkPlanEntry, plan, {}, lessRuntimeForkPlanEntry);
+
+    if (opts.older_than_ns) |age_ns| {
+        const cutoff = now_ns - age_ns;
+        for (plan) |*entry| {
+            if (entry.mtime_ns < cutoff) entry.selected = true;
+        }
+    }
+
+    var result_entries = std.array_list.Managed(RuntimeForkPruneEntry).init(allocator);
+    var candidate_bytes: u64 = 0;
+    var deleted_count: usize = 0;
+    var deleted_bytes: u64 = 0;
+
+    for (plan) |entry| {
+        if (!entry.selected) continue;
+        candidate_bytes += entry.bytes;
+        try result_entries.append(.{
+            .path = entry.path,
+            .bytes = entry.bytes,
+            .mtime_unix = @intCast(@divFloor(entry.mtime_ns, std.time.ns_per_s)),
+        });
+        if (!opts.dry_run) {
+            try Io.Dir.cwd().deleteTree(io, entry.path);
+            deleted_count += 1;
+            deleted_bytes += entry.bytes;
+        }
+    }
+
+    const entries = try result_entries.toOwnedSlice();
+    return .{
+        .runtime_root = runtime_root,
+        .dry_run = opts.dry_run,
+        .older_than_seconds = opts.older_than_seconds,
+        .candidate_count = entries.len,
+        .candidate_bytes = candidate_bytes,
+        .deleted_count = deleted_count,
+        .deleted_bytes = deleted_bytes,
+        .entries = entries,
+    };
+}
+
+fn collectRuntimeForkEntries(
+    allocator: std.mem.Allocator,
+    io: Io,
+    runtime_root: []const u8,
+) ![]RuntimeForkPlanEntry {
+    var entries = std.array_list.Managed(RuntimeForkPlanEntry).init(allocator);
+    const refs = try collectRuntimeForkRefs(allocator, io, runtime_root);
+    const forks_dir_path = try std.fs.path.join(allocator, &.{ runtime_root, "forks" });
+    var forks_dir = openDirPath(io, forks_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return entries.toOwnedSlice(),
+        else => |e| return e,
+    };
+    defer forks_dir.close(io);
+
+    var it = forks_dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const path = try std.fs.path.join(allocator, &.{ forks_dir_path, entry.name });
+        if (pathReferenced(path, refs)) continue;
+        const stat = try forks_dir.statFile(io, entry.name, .{ .follow_symlinks = false });
+        if (stat.kind != .directory) continue;
+        const stats = blk: {
+            var batch_dir = try forks_dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
+            defer batch_dir.close(io);
+            break :blk try treeStatsDir(allocator, io, batch_dir, path);
+        };
+        try entries.append(.{
+            .path = path,
+            .bytes = stats.bytes,
+            .mtime_ns = stat.mtime.nanoseconds,
+        });
+    }
+
+    return entries.toOwnedSlice();
+}
+
+fn collectRuntimeForkRefs(allocator: std.mem.Allocator, io: Io, runtime_root: []const u8) ![]const []const u8 {
+    var refs = std.array_list.Managed([]const u8).init(allocator);
+    const vms_dir_path = try std.fs.path.join(allocator, &.{ runtime_root, "vms" });
+    var vms_dir = openDirPath(io, vms_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return refs.toOwnedSlice(),
+        else => |e| return e,
+    };
+    defer vms_dir.close(io);
+
+    var it = vms_dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const spec_path = try std.fs.path.join(allocator, &.{ vms_dir_path, entry.name, "spec.json" });
+        const data = Io.Dir.cwd().readFileAlloc(io, spec_path, allocator, .limited(max_runtime_spec_bytes)) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => |e| return e,
+        };
+        defer allocator.free(data);
+        var parsed = std.json.parseFromSlice(RuntimeVmSpecRef, allocator, data, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch continue;
+        defer parsed.deinit();
+        const resume_dir = parsed.value.resume_dir orelse continue;
+        try refs.append(try std.fs.path.resolve(allocator, &.{resume_dir}));
+    }
+
+    return refs.toOwnedSlice();
+}
+
+fn pathReferenced(path: []const u8, refs: []const []const u8) bool {
+    for (refs) |ref| {
+        if (pathContains(path, ref)) return true;
+    }
+    return false;
+}
+
+fn pathContains(parent: []const u8, child: []const u8) bool {
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    if (child.len == parent.len) return true;
+    if (parent.len > 0 and parent[parent.len - 1] == std.fs.path.sep) return true;
+    return child[parent.len] == std.fs.path.sep;
+}
+
 fn collectPruneEntries(
     allocator: std.mem.Allocator,
     io: Io,
@@ -654,6 +822,11 @@ fn lessPrunePlanEntry(_: void, a: PrunePlanEntry, b: PrunePlanEntry) bool {
     return std.mem.lessThan(u8, a.path, b.path);
 }
 
+fn lessRuntimeForkPlanEntry(_: void, a: RuntimeForkPlanEntry, b: RuntimeForkPlanEntry) bool {
+    if (a.mtime_ns != b.mtime_ns) return a.mtime_ns < b.mtime_ns;
+    return std.mem.lessThan(u8, a.path, b.path);
+}
+
 fn rootfsCacheRootPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
     return local_paths.rootfsCacheRootPath(allocator, environ);
 }
@@ -807,7 +980,61 @@ fn writeRootfsPruneResult(writer: *Io.Writer, result: RootfsPruneResult) !void {
     if (result.dry_run and result.candidate_count > 0) {
         try writer.writeAll("\nRun again with --force to delete the selected entries.\n");
     }
+    if (result.runtime_forks) |runtime_forks| {
+        try writer.writeByte('\n');
+        try writeRuntimeForkPruneResult(writer, runtime_forks);
+    }
     try writer.writeAll("Use spore --json system prune for exact paths and byte counts.\n");
+}
+
+fn writeRuntimeForkPruneResult(writer: *Io.Writer, result: RuntimeForkPruneResult) !void {
+    if (result.dry_run) {
+        try writer.writeAll("Runtime fork prune dry run\n");
+    } else {
+        try writer.writeAll("Runtime fork prune\n");
+    }
+    try writer.print("  Runtime: {s}\n", .{result.runtime_root});
+    try writer.writeAll("  Selection: ");
+    if (result.older_than_seconds) |seconds| {
+        try writer.writeAll("unreferenced fork batches older than ");
+        try writeHumanDuration(writer, seconds);
+    } else {
+        try writer.writeAll("none; set --older-than to select unreferenced fork batches");
+    }
+    try writer.writeByte('\n');
+    if (result.dry_run) {
+        try writer.print("  Would delete: {d} batches\n", .{result.candidate_count});
+        try writer.writeAll("  Would reclaim: ");
+        try writeHumanBytes(writer, result.candidate_bytes);
+        try writer.writeByte('\n');
+    } else {
+        try writer.print("  Deleted: {d} batches\n", .{result.deleted_count});
+        try writer.writeAll("  Reclaimed: ");
+        try writeHumanBytes(writer, result.deleted_bytes);
+        try writer.writeByte('\n');
+    }
+
+    if (result.entries.len == 0) {
+        try writer.writeAll("\nNo runtime fork batches selected.\n");
+    } else {
+        try writer.writeByte('\n');
+        try writer.writeAll(if (result.dry_run) "Runtime fork candidates\n" else "Runtime fork batches deleted\n");
+        const visible_count = @min(result.entries.len, 20);
+        for (result.entries[0..visible_count]) |entry| {
+            try writer.writeAll("  - ");
+            try writeDisplayPath(writer, entry.path);
+            try writer.writeAll(": ");
+            try writeHumanBytes(writer, entry.bytes);
+            try writer.writeByte('\n');
+        }
+        if (result.entries.len > visible_count) {
+            try writer.print("  ... {d} more batches omitted; use spore --json system prune for the full list.\n", .{result.entries.len - visible_count});
+        }
+    }
+
+    if (result.dry_run and result.candidate_count > 0) {
+        try writer.writeAll("\nRun again with --force to delete the selected runtime fork batches.\n");
+    }
 }
 
 fn yesNo(value: bool) []const u8 {
@@ -1006,6 +1233,45 @@ test "system summarizes rootfs cache and dry-run prunes oldest image entries" {
     try std.testing.expect(!try fileExists(io, root ++ "/a.json"));
     try std.testing.expect(try fileExists(io, root ++ "/b.ext4"));
     try std.testing.expect(try fileExists(io, root ++ "/by-digest/blake3/c.ext4"));
+}
+
+test "system prunes only unreferenced runtime fork batches" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-system-runtime-fork-prune"});
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const live_child = try std.fs.path.join(allocator, &.{ root, "forks", "live", "children", "000000" });
+    try Io.Dir.cwd().createDirPath(io, live_child);
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(allocator, &.{ root, "forks", "dead" }));
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(allocator, &.{ root, "vms", "worker" }));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ live_child, "manifest.json" }), .data = "live" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ root, "forks", "dead", "manifest.json" }), .data = "dead" });
+    const spec = try std.fmt.allocPrint(allocator, "{{\"resume_dir\":\"{s}\"}}", .{live_child});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ root, "vms", "worker", "spec.json" }), .data = spec });
+
+    const opts = PruneOptions{
+        .older_than_ns = 1,
+        .older_than_seconds = 1,
+    };
+    const dry_run = try pruneRuntimeForkBatches(allocator, io, root, opts, std.math.maxInt(i96));
+    try std.testing.expect(dry_run.dry_run);
+    try std.testing.expectEqual(@as(usize, 1), dry_run.candidate_count);
+    try std.testing.expect(std.mem.endsWith(u8, dry_run.entries[0].path, "/forks/dead"));
+    try std.testing.expect(try fileExists(io, try std.fs.path.join(allocator, &.{ root, "forks", "live" })));
+    try std.testing.expect(try fileExists(io, try std.fs.path.join(allocator, &.{ root, "forks", "dead" })));
+
+    const forced = try pruneRuntimeForkBatches(allocator, io, root, .{
+        .dry_run = false,
+        .older_than_ns = 1,
+        .older_than_seconds = 1,
+    }, std.math.maxInt(i96));
+    try std.testing.expectEqual(@as(usize, 1), forced.deleted_count);
+    try std.testing.expect(try fileExists(io, try std.fs.path.join(allocator, &.{ root, "forks", "live" })));
+    try std.testing.expect(!try fileExists(io, try std.fs.path.join(allocator, &.{ root, "forks", "dead" })));
 }
 
 fn fileExists(io: Io, path: []const u8) !bool {

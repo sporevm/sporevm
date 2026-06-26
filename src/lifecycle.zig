@@ -80,6 +80,18 @@ const suspend_usage =
     \\
 ;
 
+const fork_usage =
+    \\Usage:
+    \\  spore fork --vm NAME --count N --name PATTERN
+    \\
+    \\Options:
+    \\  --vm NAME             Running named VM to fork from
+    \\  --count N             Number of named child VMs to create
+    \\  --name PATTERN        Child VM name or pattern, e.g. worker-%d
+    \\  -h, --help            Show this help
+    \\
+;
+
 const resume_usage =
     \\Usage:
     \\  spore resume DIR --name NAME
@@ -243,9 +255,21 @@ const SuspendOptions = struct {
     out_dir: []const u8,
 };
 
+const ForkOptions = struct {
+    source_name: []const u8,
+    count: usize,
+    name_pattern: []const u8,
+};
+
 const ResumeOptions = struct {
     spore_dir: []const u8,
     name: []const u8,
+};
+
+pub const NamedForkResult = struct {
+    source: []const u8,
+    count: usize,
+    children: []const []const u8,
 };
 
 pub fn createCli(
@@ -489,6 +513,116 @@ pub fn suspendCli(
             .pid = ready.value.pid,
             .spore_dir = out_dir,
         });
+    }
+}
+
+pub fn forkCli(
+    init: std.process.Init,
+    args: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) !void {
+    if (wantsHelp(args)) {
+        if (mode == .json) {
+            exitLifecycleCliError(
+                init.arena.allocator(),
+                stderr,
+                mode,
+                machine_output.usageInvalidArgument("spore --json fork does not support help output", "fork"),
+                "spore --json fork does not support help output",
+            );
+        }
+        try stdout.writeAll(fork_usage);
+        return;
+    }
+
+    const allocator = init.arena.allocator();
+    const parsed = parseForkArgs(args, allocator, stderr, mode);
+    const child_names = try renderForkNamesOrExit(allocator, "fork", parsed.name_pattern, parsed.count);
+    const source_paths = try cliPaths(init, allocator, "fork", parsed.source_name);
+    const state = try classifyVmState(allocator, init.io, source_paths, pidAlive);
+    if (state != .ready) {
+        std.debug.print("spore fork: VM is not ready: {s} ({s})\n", .{ parsed.source_name, state.name() });
+        std.process.exit(2);
+    }
+
+    var source_spec = readSpec(allocator, init.io, source_paths) catch {
+        std.debug.print("spore fork: VM is not ready\n", .{});
+        std.process.exit(2);
+    };
+    defer source_spec.deinit();
+    if (source_spec.value.rootfs_path != null or source_spec.value.image_ref != null or source_spec.value.rootfs != null or source_spec.value.disk != null) {
+        const message = "spore fork: disk-backed named live fork is not supported yet";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+    }
+    if (source_spec.value.network != null) {
+        const message = "spore fork: networked named live fork is not supported yet";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+    }
+    if (source_spec.value.vcpus != 1) {
+        const message = "spore fork: multi-vCPU named live fork is not supported yet";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+    }
+
+    for (child_names) |child_name| {
+        const child_paths = try cliPaths(init, allocator, "fork", child_name);
+        const child_state = try classifyVmState(allocator, init.io, child_paths, pidAlive);
+        if (child_state != .absent) {
+            std.debug.print("spore fork: VM already exists or has stale state: {s}\n", .{child_name});
+            std.process.exit(2);
+        }
+    }
+
+    var ready = lifecycleReadyOrExit(allocator, init.io, "fork", source_paths);
+    defer ready.deinit();
+
+    const batch_dir = try hiddenForkBatchDir(allocator, source_paths.runtime_root, parsed.source_name);
+    const snapshot_dir = try std.fs.path.resolve(allocator, &.{ batch_dir, "source.spore" });
+    const children_dir = try std.fs.path.resolve(allocator, &.{ batch_dir, "children" });
+    try ensureDirPath(init.io, batch_dir);
+    var cleanup_batch = true;
+    defer if (cleanup_batch) Io.Dir.cwd().deleteTree(init.io, batch_dir) catch {};
+
+    const response = sendSnapshotRequest(allocator, init.io, ready.value.control_socket_path, snapshot_dir) catch |err| {
+        switch (err) {
+            error.MonitorUnavailable => std.debug.print("spore fork: monitor is unavailable for VM: {s}\n", .{parsed.source_name}),
+            else => std.debug.print("spore fork: monitor request failed for VM {s}: {s}\n", .{ parsed.source_name, @errorName(err) }),
+        }
+        std.process.exit(1);
+    };
+    if (!try handleSnapshotResponse("fork", allocator, response)) std.process.exit(1);
+    try writeSporeLifecycleSpec(allocator, init.io, snapshot_dir, source_spec.value);
+
+    _ = try spore.fork(allocator, .{
+        .parent_dir = snapshot_dir,
+        .out_dir = children_dir,
+        .count = parsed.count,
+        .environ_map = init.environ_map,
+    });
+
+    var started = std.array_list.Managed([]const u8).init(allocator);
+    for (child_names, 0..) |child_name, index| {
+        const spore_dir = try childSporeDir(allocator, children_dir, index);
+        startForkChild(init, allocator, child_name, spore_dir, source_spec.value) catch |err| {
+            cleanupStartedChildren(init, allocator, started.items);
+            std.debug.print("spore fork: failed to start child VM {s}: {s}\n", .{ child_name, @errorName(err) });
+            std.process.exit(1);
+        };
+        try started.append(child_name);
+    }
+
+    cleanup_batch = false;
+
+    const result = NamedForkResult{
+        .source = parsed.source_name,
+        .count = parsed.count,
+        .children = child_names,
+    };
+    if (mode == .json) {
+        try machine_output.writeJson(allocator, stdout, result);
+    } else {
+        try writeNamedForkResult(stdout, result);
     }
 }
 
@@ -1063,6 +1197,55 @@ fn parseSuspendArgs(
     return .{ .name = name.?, .out_dir = out_dir.? };
 }
 
+fn parseForkArgs(
+    args: []const []const u8,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) ForkOptions {
+    var source_name: ?[]const u8 = null;
+    var count: ?usize = null;
+    var name_pattern: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--vm")) {
+            source_name = takeValueLifecycleCli(allocator, stderr, mode, "fork", args, &i, args[i]);
+            validateNameLifecycleCli(allocator, stderr, mode, "fork", source_name.?);
+        } else if (std.mem.eql(u8, args[i], "--count")) {
+            const flag = args[i];
+            count = parseIntArgLifecycleCli(usize, allocator, stderr, mode, "fork", takeValueLifecycleCli(allocator, stderr, mode, "fork", args, &i, flag), flag);
+        } else if (std.mem.eql(u8, args[i], "--name")) {
+            name_pattern = takeValueLifecycleCli(allocator, stderr, mode, "fork", args, &i, args[i]);
+        } else if (std.mem.startsWith(u8, args[i], "--")) {
+            const message = allocLifecycleMessage(allocator, "unknown fork argument: {s}", .{args[i]});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+        } else {
+            const message = allocLifecycleMessage(allocator, "unexpected fork argument: {s}", .{args[i]});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+        }
+    }
+
+    if (source_name == null or count == null or name_pattern == null) {
+        exitLifecycleCliError(
+            allocator,
+            stderr,
+            mode,
+            machine_output.usageMissingArgument("usage: spore fork --vm NAME --count N --name PATTERN", "fork"),
+            fork_usage,
+        );
+    }
+    if (count.? == 0) {
+        const message = "spore fork: --count must be a positive integer";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+    }
+    return .{
+        .source_name = source_name.?,
+        .count = count.?,
+        .name_pattern = name_pattern.?,
+    };
+}
+
 fn parseResumeArgs(
     args: []const []const u8,
     allocator: std.mem.Allocator,
@@ -1202,6 +1385,149 @@ fn memoryFromManifest(manifest: spore.Manifest) !memory_config.Config {
     return memory_config.fromManifestBytes(manifest.platform.ram_size);
 }
 
+const ForkNamePlaceholder = struct {
+    start: usize,
+    end: usize,
+    width: usize = 0,
+};
+
+fn renderForkNamesOrExit(allocator: std.mem.Allocator, command: []const u8, pattern: []const u8, count: usize) ![]const []const u8 {
+    const placeholder = findForkNamePlaceholder(pattern) catch {
+        std.debug.print("spore {s}: --name must contain at most one %d or %0Nd placeholder\n", .{command});
+        std.process.exit(2);
+    };
+    if (count > 1 and placeholder == null) {
+        std.debug.print("spore {s}: --name must contain %d when --count is greater than 1\n", .{command});
+        std.process.exit(2);
+    }
+
+    const names = try allocator.alloc([]const u8, count);
+    for (names, 0..) |*slot, index| {
+        slot.* = try renderForkName(allocator, pattern, placeholder, index);
+        validateNameOrExit(command, slot.*) catch unreachable;
+        for (names[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, slot.*)) {
+                std.debug.print("spore {s}: duplicate rendered VM name: {s}\n", .{ command, slot.* });
+                std.process.exit(2);
+            }
+        }
+    }
+    return names;
+}
+
+fn findForkNamePlaceholder(pattern: []const u8) !?ForkNamePlaceholder {
+    var found: ?ForkNamePlaceholder = null;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, pattern, i, '%')) |start| {
+        if (found != null) return error.InvalidForkNamePattern;
+        if (start + 1 >= pattern.len) return error.InvalidForkNamePattern;
+
+        var cursor = start + 1;
+        var width: usize = 0;
+        if (pattern[cursor] == '0') {
+            cursor += 1;
+            if (cursor >= pattern.len or !std.ascii.isDigit(pattern[cursor])) return error.InvalidForkNamePattern;
+            while (cursor < pattern.len and std.ascii.isDigit(pattern[cursor])) : (cursor += 1) {
+                width = std.math.mul(usize, width, 10) catch return error.InvalidForkNamePattern;
+                width = std.math.add(usize, width, pattern[cursor] - '0') catch return error.InvalidForkNamePattern;
+                if (width > max_name_len) return error.InvalidForkNamePattern;
+            }
+            if (cursor >= pattern.len or pattern[cursor] != 'd') return error.InvalidForkNamePattern;
+        } else if (pattern[cursor] != 'd') {
+            return error.InvalidForkNamePattern;
+        }
+        found = .{ .start = start, .end = cursor + 1, .width = width };
+        i = cursor + 1;
+    }
+    return found;
+}
+
+fn renderForkName(
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+    placeholder: ?ForkNamePlaceholder,
+    index: usize,
+) ![]const u8 {
+    const marker = placeholder orelse return allocator.dupe(u8, pattern);
+    const digits = try std.fmt.allocPrint(allocator, "{d}", .{index});
+    defer allocator.free(digits);
+    const prefix = pattern[0..marker.start];
+    const suffix = pattern[marker.end..];
+    const padding = if (marker.width > digits.len) marker.width - digits.len else 0;
+    const out = try allocator.alloc(u8, prefix.len + padding + digits.len + suffix.len);
+    var offset: usize = 0;
+    @memcpy(out[offset..][0..prefix.len], prefix);
+    offset += prefix.len;
+    @memset(out[offset..][0..padding], '0');
+    offset += padding;
+    @memcpy(out[offset..][0..digits.len], digits);
+    offset += digits.len;
+    @memcpy(out[offset..][0..suffix.len], suffix);
+    return out;
+}
+
+fn hiddenForkBatchDir(allocator: std.mem.Allocator, runtime_root: []const u8, source_name: []const u8) ![]const u8 {
+    const pid: i64 = if (comptime builtin.os.tag == .windows) 1 else @intCast(std.c.getpid());
+    const leaf = try std.fmt.allocPrint(allocator, "{s}-{d}-{d}", .{ source_name, pid, monotonicMs() });
+    return std.fs.path.resolve(allocator, &.{ runtime_root, "forks", leaf });
+}
+
+fn childSporeDir(allocator: std.mem.Allocator, children_dir: []const u8, index: usize) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{d:0>6}", .{ children_dir, index });
+}
+
+fn startForkChild(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    child_name: []const u8,
+    spore_dir: []const u8,
+    base: Spec,
+) !void {
+    var manifest = try spore.loadManifest(allocator, spore_dir);
+    defer manifest.deinit();
+    if (manifest.value.network != null) return error.UnsupportedNamedForkNetwork;
+    if (manifest.value.devices.len != diskless_resume_device_count) return error.UnsupportedNamedForkDisk;
+    const memory = try memoryFromManifest(manifest.value);
+    const spec = Spec{
+        .name = child_name,
+        .backend = base.backend,
+        .kernel_path = base.kernel_path,
+        .initrd_path = base.initrd_path,
+        .resume_dir = spore_dir,
+        .memory = memory,
+        .vcpus = 1,
+        .guest_port = base.guest_port,
+        .timeout_ms = base.timeout_ms,
+        .console_log_path = null,
+    };
+    const paths = try cliPaths(init, allocator, "fork", child_name);
+    try spawnMonitor(init, allocator, spec);
+    try waitForReady("fork", allocator, init.io, paths, spec.timeout_ms);
+}
+
+fn cleanupStartedChildren(init: std.process.Init, allocator: std.mem.Allocator, names: []const []const u8) void {
+    for (names) |name| {
+        const paths = pathsFor(allocator, init.environ_map, name) catch continue;
+        var ready = readReady(allocator, init.io, paths) catch {
+            Io.Dir.cwd().deleteTree(init.io, paths.vm_dir) catch {};
+            continue;
+        };
+        _ = sendShutdownRequest(allocator, init.io, ready.value.control_socket_path) catch {};
+        waitForPidExit(ready.value.pid, 5_000);
+        ready.deinit();
+        Io.Dir.cwd().deleteTree(init.io, paths.vm_dir) catch {};
+    }
+}
+
+fn writeNamedForkResult(writer: *Io.Writer, result: NamedForkResult) !void {
+    try writer.writeAll("Named fork complete\n");
+    try writer.print("  Source: {s}\n", .{result.source});
+    try writer.print("  Children: {d}\n", .{result.count});
+    for (result.children) |name| {
+        try writer.print("  - {s}\n", .{name});
+    }
+}
+
 fn spawnMonitor(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec) !void {
     const full_args = try init.minimal.args.toSlice(allocator);
     const exe = full_args[0];
@@ -1319,6 +1645,17 @@ fn sendSuspendRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const
     return sendControlJson(allocator, io, socket_path, json);
 }
 
+fn sendSnapshotRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, out_dir: []const u8) ![]const u8 {
+    const payload = struct {
+        type: []const u8 = "snapshot",
+        out_dir: []const u8,
+        @"continue": bool = true,
+    }{ .out_dir = out_dir };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    return sendControlJson(allocator, io, socket_path, json);
+}
+
 fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, json: []const u8) ![]const u8 {
     const address = try net.UnixAddress.init(socket_path);
     const stream = address.connect(io) catch return error.MonitorUnavailable;
@@ -1380,6 +1717,18 @@ fn suspendResponseFailureMessage(allocator: std.mem.Allocator, response: []const
     if (std.mem.eql(u8, parsed.value.type, "suspended")) return null;
     const message = parsed.value.message orelse "monitor request failed";
     return try allocator.dupe(u8, message);
+}
+
+fn handleSnapshotResponse(command: []const u8, allocator: std.mem.Allocator, response: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    if (std.mem.eql(u8, parsed.value.type, "snapshotted")) return true;
+    const message = parsed.value.message orelse "monitor request failed";
+    std.debug.print("spore {s}: {s}\n", .{ command, message });
+    return false;
 }
 
 fn writeAll(io: Io, stream: net.Stream, bytes: []const u8) !void {
@@ -1559,6 +1908,13 @@ pub fn monitorBackendSupported(raw: []const u8) bool {
     return false;
 }
 
+pub fn wantsNamedFork(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--vm") or std.mem.eql(u8, arg, "--name")) return true;
+    }
+    return false;
+}
+
 fn openDirPath(io: Io, path: []const u8, flags: Io.Dir.OpenOptions) !Io.Dir {
     if (Io.Dir.path.isAbsolute(path)) return Io.Dir.openDirAbsolute(io, path, flags);
     return Io.Dir.cwd().openDir(io, path, flags);
@@ -1650,6 +2006,21 @@ test "lifecycle result carries stable schema" {
     try std.testing.expectEqualStrings("bench-1", result.name);
     try std.testing.expectEqualStrings("ready", result.state);
     try std.testing.expectEqual(@as(?i64, 42), result.pid);
+}
+
+test "lifecycle renders fork name patterns" {
+    const allocator = std.testing.allocator;
+    const placeholder = (try findForkNamePlaceholder("worker-%06d")).?;
+    const first = try renderForkName(allocator, "worker-%06d", placeholder, 7);
+    defer allocator.free(first);
+    try std.testing.expectEqualStrings("worker-000007", first);
+
+    const literal = try renderForkName(allocator, "worker", null, 0);
+    defer allocator.free(literal);
+    try std.testing.expectEqualStrings("worker", literal);
+
+    try std.testing.expect(try findForkNamePlaceholder("worker") == null);
+    try std.testing.expectError(error.InvalidForkNamePattern, findForkNamePlaceholder("worker-%d-%d"));
 }
 
 test "lifecycle monitor backend support is explicit" {

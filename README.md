@@ -105,9 +105,23 @@ mise run install
 ```
 
 `mise run check` runs unit tests, the product build, and diff hygiene.
-`mise run install` installs an optimized `spore` into `~/bin`.
-Source builds require `cpio` in `PATH` so the minimal exec initrd can be
-generated and embedded into the binary.
+`mise run install` builds an optimized `spore` and installs it into `~/bin`,
+with runtime assets under `~/share/sporevm`.
+`mise run smoke` builds once, then runs product run, run-capture, and resume
+smokes. `smoke:lifecycle` checks named create, repeated exec, named live fork,
+list, and remove on the selected backend. `smoke:run-file-locking` checks that
+the managed run kernel supports guest `flock(2)` behavior needed by Docker and
+containerd volume metadata. `smoke:run-cgroup` checks that the run guest mounts
+writable cgroup2 at `/sys/fs/cgroup`, which Docker needs before daemon startup.
+`smoke:run-net-config` checks the experimental `spore run --net` static guest
+link setup, and `smoke:run-net-dns` checks DNS
+proxying through the managed gateway. `smoke:counter-fanout` and
+`smoke:rootfs-fanout` are opt-in demo smokes; the rootfs fan-out smoke builds a
+published Ruby OCI image and runs fresh commands in forked children in parallel.
+`smoke:live-rootfs-fanout` captures an already-running Ruby rootfs workload and
+checks resumed children can discover their distinct fan-out identity.
+`smoke:writable-rootfs` verifies local writable rootfs disk layers across
+capture, fork divergence, bundle pack/unpack, and `run --from`.
 
 For local iteration:
 
@@ -285,14 +299,34 @@ spore rm bench-2
 ```
 
 Machine callers can use `spore --json create`, `spore --json suspend`,
-`spore --json resume`, `spore --json ls`, and `spore --json rm` for structured
-lifecycle state. `spore exec` forwards guest stdout and stderr as workload
-streams.
+`spore --json resume`, `spore --json fork`, `spore --json ls`, and
+`spore --json rm` for structured lifecycle state. `spore exec` forwards guest
+stdout and stderr as workload streams.
+
+Fork a running diskless named VM into named children while keeping the source
+running:
+
+```bash
+export SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
+
+spore create golden
+spore exec golden -- /bin/true
+spore fork --vm golden --count 2 --name worker-%d
+spore exec worker-0 -- /bin/writeout
+spore exec golden -- /bin/true
+spore rm worker-0
+spore rm worker-1
+spore rm golden
+```
+
+Hidden fork batches are retained until children no longer reference them. Use
+`spore system prune --older-than 1d` to dry-run cleanup of old unreferenced
+batches, then add `--force` to delete them.
 
 Monitor processes run with a denied-child-exec jail on macOS and Linux. Named
 checkpoint lifecycle supports diskless VMs, image-created writable rootfs state,
 and explicit `--rootfs` path checkpoints backed by exact immutable rootfs
-artifacts.
+artifacts. Named live fork is currently diskless-only.
 
 ## What 1.0 supports
 
@@ -306,8 +340,8 @@ artifacts.
 - Managed kernel download and verification for the default run path.
 - Spore-managed guest networking for DNS, HTTP/HTTPS, persisted egress policy,
   and hard-floor egress denial.
-- Named lifecycle `create`, `exec`, `suspend`, `resume`, `ls`, and `rm` on
-  supported HVF/KVM backends.
+- Named lifecycle `create`, `exec`, `suspend`, `resume`, `fork --vm`, `ls`, and
+  `rm` on supported HVF/KVM backends.
 
 Known limits:
 
@@ -321,6 +355,8 @@ Known limits:
 - Explicit `spore create --rootfs PATH` lifecycle checkpoints use exact rootfs
   artifacts, not chunked rootfs storage; use `--image` for the chunked CAS fast
   path.
+- Named live fork is diskless-only until disk-backed and networked fork support
+  are added.
 - SporeVM is a VMM isolation boundary, but it does not claim hardened
   public-cloud multi-tenant isolation.
 

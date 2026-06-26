@@ -478,13 +478,14 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             switch (try control.poll(&vsock_dev)) {
                 .keep_running => {},
                 .stop => return .monitor_stopped,
-                .snapshot => |dir| {
-                    try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, ram_bytes, .{
+                .snapshot => |request| {
+                    try takeSnapshot(allocator, request.dir, vcpu, transports, &gen_dev, ram_bytes, .{
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
                         .ram_size = config.ram_size,
                     }, config.rootfs, config.disk_snapshot, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
-                    return .snapshotted;
+                    if (!request.continue_after) return .snapshotted;
+                    try control.completeSnapshot(request.dir);
                 },
             }
             try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));

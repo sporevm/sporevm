@@ -301,7 +301,12 @@ pub const HostStream = struct {
 pub const ControlAction = union(enum) {
     keep_running,
     stop,
-    snapshot: []const u8,
+    snapshot: SnapshotAction,
+};
+
+pub const SnapshotAction = struct {
+    dir: []const u8,
+    continue_after: bool = false,
 };
 
 pub const Wake = struct {
@@ -317,6 +322,7 @@ pub const Control = struct {
     context: *anyopaque,
     pollFn: *const fn (context: *anyopaque, dev: *Vsock) anyerror!ControlAction,
     setWakeFn: *const fn (context: *anyopaque, wake: Wake) void,
+    completeSnapshotFn: *const fn (context: *anyopaque, dir: []const u8) anyerror!void,
 
     pub fn poll(self: Control, dev: *Vsock) !ControlAction {
         return self.pollFn(self.context, dev);
@@ -324,6 +330,10 @@ pub const Control = struct {
 
     pub fn setWake(self: Control, wake: Wake) void {
         self.setWakeFn(self.context, wake);
+    }
+
+    pub fn completeSnapshot(self: Control, dir: []const u8) !void {
+        try self.completeSnapshotFn(self.context, dir);
     }
 };
 

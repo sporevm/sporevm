@@ -379,9 +379,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             switch (try control.poll(&vsock_dev)) {
                 .keep_running => {},
                 .stop => return .monitor_stopped,
-                .snapshot => |dir| {
-                    try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
-                    return .snapshotted;
+                .snapshot => |request| {
+                    try takeSnapshot(allocator, request.dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                    if (!request.continue_after) return .snapshotted;
+                    try control.completeSnapshot(request.dir);
                 },
             }
             try flushVsockRxKvm(vm_fd, &vsock_dev, &transports_buf[vsock_transport_index], ram, vsock_transport_index);

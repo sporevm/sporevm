@@ -23,14 +23,16 @@ related_plans:
 ## Summary
 
 Local named-VM lifecycle is stable for HVF and KVM
-create/exec/suspend/resume/ls/rm. SporeVM can create a named VM, keep it alive
-in one per-VM monitor process, execute multiple commands over the guest agent,
-checkpoint it into a spore, resume it under a new name, and list/remove it
-through a private runtime registry.
+create/exec/suspend/resume/fork/ls/rm. SporeVM can create a named VM, keep it
+alive in one per-VM monitor process, execute multiple commands over the guest
+agent, checkpoint it into a spore, resume it under a new name, fork diskless
+children while keeping the source running, and list/remove VMs through a
+private runtime registry.
 
 The active work is no longer the stable lifecycle CLI shape. It is speed:
 tag-resolution caching, rootfs-path benchmark isolation, exec timing
-breakdowns, and preboot or same-host snapshot baselines.
+breakdowns, preboot or same-host snapshot baselines, and disk-backed or
+networked named live fork follow-ups.
 
 ## Landed Product Contract
 
@@ -44,10 +46,11 @@ spore rm bench-2
 ```
 
 `spore run` remains the one-shot convenience command. Named live-VM lifecycle is
-stable for `create`, `exec`, `suspend`, `resume --name`, `ls`, and `rm`.
-`spore --json create`, `spore --json suspend`, `spore --json resume`,
-`spore --json ls`, and `spore --json rm` provide the machine-readable lifecycle
-state surface; `spore exec` keeps guest stdout and stderr as workload streams.
+stable for `create`, `exec`, `suspend`, `resume --name`, `fork --vm`, `ls`, and
+`rm`. `spore --json create`, `spore --json suspend`, `spore --json resume`,
+`spore --json fork`, `spore --json ls`, and `spore --json rm` provide the
+machine-readable lifecycle state surface; `spore exec` keeps guest stdout and
+stderr as workload streams.
 Monitor processes deny child process execution through an embedded macOS
 sandbox profile or Linux seccomp filter.
 
@@ -71,9 +74,9 @@ policy, secrets, egress, mounts, workspace semantics, and scheduling.
 ## Current State
 
 - `spore create`, `spore exec`, `spore suspend`, named `spore resume`,
-  `spore rm`, `spore ls`, and `spore monitor` are available on supported
-  backends; the stable surface is
-  `create`/`exec`/`suspend`/`resume --name`/`ls`/`rm`.
+  `spore fork --vm`, `spore rm`, `spore ls`, and `spore monitor` are available
+  on supported backends; the stable surface is
+  `create`/`exec`/`suspend`/`resume --name`/`fork --vm`/`ls`/`rm`.
 - Monitor processes deny child process execution through an embedded macOS
   sandbox profile or Linux seccomp filter. `mise run smoke:monitor-jail` covers
   the denied-operation path.
@@ -100,6 +103,11 @@ policy, secrets, egress, mounts, workspace semantics, and scheduling.
   lifetime, records requested policy in checkpoints, and named resume starts a
   fresh helper under that policy. Live TCP flows and learned DNS answers are not
   checkpointed.
+- Named live fork first slice has landed for diskless lifecycle VMs. It keeps
+  the source VM running by using monitor snapshot-and-continue, not
+  `spore suspend`.
+- Old unreferenced hidden fork batches are prunable with
+  `spore system prune --older-than ...`.
 
 ## Runtime Directory
 
@@ -134,7 +142,91 @@ The protocol is local-only in the first lifecycle version. There is no TCP
 control socket and no auth story beyond filesystem permissions. A separate
 status request can be added later, but unknown request types fail closed today.
 
+Named live fork uses one monitor request:
+
+```json
+{"type":"snapshot","out_dir":"/tmp/golden.spore","continue":true}
+```
+
+This is deliberately not `suspend`: after a successful snapshot the source VM
+keeps running, and the caller forks/resumes child spores from the point-in-time
+artifact.
+
 ## Active Work
+
+### Named Live Fork
+
+Status: first slice implemented.
+
+User-facing shape:
+
+```console
+spore create golden
+spore exec golden -- /bin/warmup
+spore fork --vm golden --count 4 --name worker-%06d
+spore exec worker-000000 -- /bin/task
+```
+
+Existing artifact fork stays unchanged:
+
+```console
+spore fork warm.spore --count 4 --out forks/
+```
+
+`--vm NAME` selects a running named VM as the source. Without `--vm`, `spore
+fork` keeps its current `<spore-dir> --count N --out DIR` contract. Named live
+fork has no public `--out`; the implementation uses hidden runtime or temp
+spore directories as child restore inputs. The first slice keeps those hidden
+runtime batches after child monitors are ready because monitor readiness only
+means the control socket exists; the child may not have loaded its forked spore
+yet. `spore system prune --older-than ...` removes unreferenced old batches; a
+future restore-ready signal can make immediate cleanup safe.
+
+Name formatting rules:
+
+- `--name` is required with `--vm`.
+- `--count 1` may use a literal name, for example `--name worker`.
+- `--count > 1` requires exactly one `%d`-style integer placeholder, for example
+  `--name worker-%d` or `--name worker-%06d`.
+- Render and validate every child name before requesting a snapshot. Reject
+  duplicates, invalid VM names, and existing or stale runtime state before the
+  source VM is paused.
+
+First slice delivery:
+
+1. Extend the monitor control path with snapshot-and-continue. The backend run
+   loops already support continuing after host-triggered product captures; expose
+   the same behavior through the monitor control action instead of reusing
+   `suspend`.
+2. Extend `spore fork` parsing with `--vm` and `--name`, preserving current
+   artifact fork behavior.
+3. Add a lifecycle helper that validates the source VM, snapshots it to a hidden
+   spore, calls the existing `spore.fork` implementation, and starts each child
+   monitor from its forked spore.
+4. On child-start failure, remove any children that were started and remove
+   hidden temp artifacts. Leave the source VM running.
+5. On success, leave the hidden fork batch under the runtime root for now;
+   `spore system prune --older-than ...` cleans unreferenced old batches until
+   lifecycle monitors expose a stronger restored signal.
+
+First slice limits:
+
+- Diskless lifecycle VMs only.
+- No named lifecycle networking.
+- No disk-backed named fork until disk-backed lifecycle suspend/resume exists.
+- No `--keep-source` flag because keeping the source running is the only first
+  slice behavior.
+- No live TCP-flow preservation.
+
+Key learnings from pressure-testing:
+
+- Reusing `spore suspend` would be simpler but wrong: it consumes the source VM.
+- Making users pass `--out` is artifact workflow leakage; named fork should
+  produce named running children.
+- Name validation must happen before pausing the source, otherwise simple CLI
+  errors become visible runtime side effects.
+- Disk and network support are the complexity hotspots. They stay behind the
+  existing disk-backed lifecycle and named-networking work.
 
 ### Speed Experiments
 
@@ -182,6 +274,8 @@ the checkpoint so named `spore resume` can restore the same disk model.
 - No writable cached OCI rootfs.
 - No inbound ports, broad UDP forwarding, L7 policy, or live network-flow
   checkpointing for named lifecycle networking.
+- No disk-backed or networked named live fork in the first named live fork
+  slice.
 
 ## Verification
 
@@ -192,6 +286,11 @@ the checkpoint so named `spore resume` can restore the same disk model.
 - Real-host smokes: local HVF create/exec/exec/rm, KVM create/exec/exec/ls/rm,
   HVF and KVM `--image` suspend/resume/exec/rm with writable-rootfs state
   preserved.
+- Named live fork smoke: create a diskless `golden`, exec a warmup command,
+  `spore fork --vm golden --count 2 --name worker-%d`, exec both workers, verify
+  `golden` still accepts exec, then remove all three VMs.
+- Failure smoke: attempt a duplicate child name and verify the source VM remains
+  running with no new child runtime state.
 - Benchmark smoke: low-iteration lifecycle timing run.
 - Failure smokes: monitor crash before/after ready, `rm` of a dead monitor,
   missing exact rootfs artifact rejection, unsupported backend.
@@ -203,6 +302,10 @@ the checkpoint so named `spore resume` can restore the same disk model.
 - Use one monitor process per VM, not a central daemon.
 - Store live sockets under a runtime directory, not under cache roots.
 - Require explicit VM names for the first stable surface.
+- Use `spore fork --vm NAME --count N --name FORMAT` for named live fork rather
+  than adding a new top-level `clone` command.
+- Named live fork keeps the source VM running. Source-consuming behavior remains
+  `spore suspend`.
 - Keep argv-only execution in core commands; a later `--shell` flag can be added
   if it proves useful.
 - Defer OCI runtime metadata. Lifecycle should not pull image-policy work ahead
