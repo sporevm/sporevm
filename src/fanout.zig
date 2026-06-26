@@ -7,11 +7,13 @@ const run_mod = @import("run.zig");
 
 pub const Backend = run_mod.Backend;
 const max_pending_line_bytes = 64 * 1024;
+const default_resume_timeout_ms: u64 = 30_000;
 
 pub const Options = struct {
     backend: Backend = .auto,
     children_dir: []const u8,
     duration_ms: ?u64 = null,
+    timeout_ms: u64 = default_resume_timeout_ms,
 };
 
 const cli_usage =
@@ -22,6 +24,7 @@ const cli_usage =
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --parallel              Resume all child spores concurrently (default)
     \\  --for DURATION          Stop resumed children after DURATION, e.g. 10s, 500ms, 1m
+    \\  --timeout-ms N          Per-child resume probe timeout in milliseconds (default: 30000)
     \\  -h, --help              Show this help
     \\
 ;
@@ -66,6 +69,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var backend: Backend = .auto;
     var children_dir: ?[]const u8 = null;
     var duration_ms: ?u64 = null;
+    var timeout_ms: u64 = default_resume_timeout_ms;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -82,6 +86,11 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             duration_ms = parseDurationMs(args[i]) catch {
                 failCli("--for expects a duration like 10s, 500ms, or 1m", .{});
             };
+        } else if (std.mem.eql(u8, args[i], "--timeout-ms") and i + 1 < args.len) {
+            i += 1;
+            timeout_ms = parsePositiveInteger(args[i]) catch {
+                failCli("--timeout-ms must be a positive integer", .{});
+            };
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             failCli("unknown fanout argument: {s}\n\n{s}", .{ args[i], cli_usage });
         } else if (children_dir == null) {
@@ -97,6 +106,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             failCli("{s}", .{cli_usage});
         },
         .duration_ms = duration_ms,
+        .timeout_ms = timeout_ms,
     };
 }
 
@@ -116,7 +126,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     errdefer cleanupRunning(init.io, running.items);
 
     for (children) |child| {
-        const run = try startRunningChild(init, allocator, argv0, opts.backend, child, &output_lock);
+        const run = try startRunningChild(init, allocator, argv0, opts.backend, opts.timeout_ms, child, &output_lock);
         running.append(run) catch |err| {
             var single = [_]RunningChild{run};
             cleanupRunning(init.io, single[0..]);
@@ -158,10 +168,12 @@ fn spawnResume(
     allocator: std.mem.Allocator,
     argv0: []const u8,
     backend: Backend,
+    timeout_ms: u64,
     spore_dir: []const u8,
 ) !std.process.Child {
     const backend_arg = @tagName(backend);
-    const argv = try allocator.dupe([]const u8, &.{ argv0, "resume", "--backend", backend_arg, spore_dir });
+    const timeout_arg = try std.fmt.allocPrint(allocator, "{d}", .{timeout_ms});
+    const argv = try allocator.dupe([]const u8, &.{ argv0, "resume", "--backend", backend_arg, "--timeout-ms", timeout_arg, spore_dir });
     return std.process.spawn(init.io, .{
         .argv = argv,
         .stdin = .ignore,
@@ -175,10 +187,11 @@ fn startRunningChild(
     allocator: std.mem.Allocator,
     argv0: []const u8,
     backend: Backend,
+    timeout_ms: u64,
     child: ChildSpec,
     output_lock: *OutputLock,
 ) !RunningChild {
-    var proc = try spawnResume(init, allocator, argv0, backend, child.path);
+    var proc = try spawnResume(init, allocator, argv0, backend, timeout_ms, child.path);
     const stdout_fd = proc.stdout.?.handle;
     const stderr_fd = proc.stderr.?.handle;
     proc.stdout = null;
@@ -361,10 +374,15 @@ fn parseDurationMs(raw: []const u8) !u64 {
 }
 
 fn parsePositiveDuration(number: []const u8, multiplier: u64) !u64 {
-    if (number.len == 0) return error.InvalidDuration;
-    const value = try std.fmt.parseInt(u64, number, 10);
-    if (value == 0) return error.InvalidDuration;
+    const value = try parsePositiveInteger(number);
     return try std.math.mul(u64, value, multiplier);
+}
+
+fn parsePositiveInteger(raw: []const u8) !u64 {
+    if (raw.len == 0) return error.InvalidDuration;
+    const value = try std.fmt.parseInt(u64, raw, 10);
+    if (value == 0) return error.InvalidDuration;
+    return value;
 }
 
 fn sleepMs(ms: u64) void {
@@ -396,10 +414,11 @@ fn failCli(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 test "fanout cli parser accepts requested demo shape" {
-    const opts = try parseCliArgs(&.{ "children", "--parallel", "--for", "10s", "--backend", "hvf" });
+    const opts = try parseCliArgs(&.{ "children", "--parallel", "--for", "10s", "--backend", "hvf", "--timeout-ms", "120000" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
     try std.testing.expectEqualStrings("children", opts.children_dir);
     try std.testing.expectEqual(@as(?u64, 10_000), opts.duration_ms);
+    try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
 }
 
 test "fanout duration parser accepts common suffixes" {

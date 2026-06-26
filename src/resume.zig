@@ -21,7 +21,7 @@ const vsock = @import("virtio/vsock.zig");
 pub const Backend = run_mod.Backend;
 const default_resume_guest_port: u32 = 10700;
 const resume_attach_host_port: u32 = 49153;
-const resume_attach_timeout_ms: u64 = 30_000;
+const default_resume_attach_timeout_ms: u64 = 30_000;
 const hvf_resume_attach_rx_delay_ms: u64 = 25;
 
 pub const Options = struct {
@@ -32,6 +32,7 @@ pub const Options = struct {
     events: ?run_mod.EventSink = null,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
+    timeout_ms: u64 = default_resume_attach_timeout_ms,
 };
 
 const cli_usage =
@@ -42,6 +43,7 @@ const cli_usage =
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --generation FILE       Inject fan-out identity JSON before resume
     \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
+    \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
     \\  -h, --help              Show this help
     \\
 ;
@@ -82,6 +84,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var spore_dir: ?[]const u8 = null;
     var generation_path: ?[]const u8 = null;
     var event_mode: run_mod.EventMode = .none;
+    var timeout_ms: u64 = default_resume_attach_timeout_ms;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -108,6 +111,9 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
                 std.debug.print("--events must be jsonl\n", .{});
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, args[i], "--timeout-ms") and i + 1 < args.len) {
+            i += 1;
+            timeout_ms = parsePositive(u64, "--timeout-ms", args[i]);
         } else if (std.mem.eql(u8, args[i], "--count")) {
             std.debug.print("spore resume resumes exactly one spore; use spore fork --count N --out DIR, then resume each child\n", .{});
             std.process.exit(2);
@@ -130,6 +136,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             std.debug.print("{s}", .{cli_usage});
             std.process.exit(2);
         },
+        .timeout_ms = timeout_ms,
     };
 }
 
@@ -205,7 +212,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
-                .exec_probe_timeout_ms = resume_attach_timeout_ms,
+                .exec_probe_timeout_ms = opts.timeout_ms,
                 .exec_probe_initial_rx_delay_ms = hvf_resume_attach_rx_delay_ms,
                 .exec_probe_completes_run = true,
                 .exec_probe_failure_fatal = true,
@@ -223,7 +230,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
-                .exec_probe_timeout_ms = resume_attach_timeout_ms,
+                .exec_probe_timeout_ms = opts.timeout_ms,
                 .exec_probe_completes_run = true,
                 .exec_probe_failure_fatal = true,
             });
@@ -302,6 +309,18 @@ fn identityProbeOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes
         if (n <= 0) return;
         remaining = remaining[@intCast(n)..];
     }
+}
+
+fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) T {
+    const parsed = std.fmt.parseInt(T, raw, 10) catch {
+        std.debug.print("{s} must be a positive integer\n", .{name});
+        std.process.exit(2);
+    };
+    if (parsed == 0) {
+        std.debug.print("{s} must be a positive integer\n", .{name});
+        std.process.exit(2);
+    }
+    return parsed;
 }
 
 fn resultFromResumeStream(backend: Backend, ram_size: u64, identity_stream: ?vsock.HostStream) !run_mod.Result {
@@ -473,8 +492,9 @@ fn runtimeDebugEnabled(args: []const []const u8) bool {
 }
 
 test "resume cli parser accepts one spore dir" {
-    const opts = try parseCliArgs(&.{ "--backend", "hvf", "child.spore" });
+    const opts = try parseCliArgs(&.{ "--backend", "hvf", "--timeout-ms", "120000", "child.spore" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
+    try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }
 
