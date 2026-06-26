@@ -29,10 +29,11 @@ supported aarch64 Linux guest, send one explicit argv request over vsock, stream
 stdout/stderr, return the guest command status, and fail closed when boot assets
 or workload inputs are unsupported.
 
-The landed bridge covers default run assets, read-only rootfs execution, cached
-OCI rootfs convenience, running from an existing spore, streaming output, exit
-and host-signalled capture, product `spore resume`, explicit fork/fan-out, and
-immutable-rootfs resume for captured `--image` workloads.
+The landed bridge covers default run assets, read-only local rootfs execution,
+cached OCI rootfs convenience, writable rootfs capture for `--image` runs,
+running from an existing spore, streaming output, exit and host-signalled
+capture, product `spore resume`, explicit fork/fan-out, and rootfs-backed resume
+for captured `--image` workloads.
 The default managed run kernel is also checked against its release `.config` for
 guest runtime features that Docker/containerd expect, including file locking,
 tmpfs/shmem, fsnotify/inotify, cgroups, and cgroup BPF support.
@@ -165,7 +166,8 @@ mint child spores with `spore fork`, then resume them individually or through
 ## What Stayed Out
 
 - OCI Entrypoint, Cmd, User, workspace, secret, and network policy.
-- Writable cached rootfs or persisted disk mutation.
+- Writable cached rootfs mutation outside the `--image ... --capture` spore
+  contract.
 - Bundle-aware initial workload input. Bundles distribute spores, not first-run
   images.
 - A first-class `spore capture` verb. Capture remains an option on `spore run`.

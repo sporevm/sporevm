@@ -628,8 +628,8 @@ const cli_usage =
     \\  --kernel Image          Kernel Image path (default: managed SporeVM run kernel)
     \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
     \\  --from DIR              Resume from an existing spore, then run argv
-    \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
-    \\  --image REF             Build or reuse cached OCI rootfs, then run from it
+    \\  --rootfs rootfs.ext4    Attach local rootfs read-only; capture unsupported
+    \\  --image REF             Build or reuse cached OCI rootfs; capture preserves rootfs writes
     \\  --pull=missing|always|never
     \\                          Pull policy for mutable --image refs (default: missing)
     \\  --net                   Experimental SporeVM-managed networking
@@ -2386,6 +2386,7 @@ pub fn generationRequest(allocator: std.mem.Allocator, params_json: []const u8) 
 }
 
 fn rootfsWritable(opts: Options) bool {
+    // Manifest-bound rootfs runs get a COW head; plain --rootfs stays local/read-only.
     return opts.rootfs != null or opts.disk != null;
 }
 
@@ -2651,11 +2652,22 @@ test "image rootfs metadata supplies run env and working directory" {
         .preopens = .empty,
     };
 
-    const input = try resolvedImageRootfsInput(init, arena, cache_root, "local/buildkite-spore:ci", resolved, tmp ++ "/rootfs.ext4", false);
+    const rootfs_path = tmp ++ "/rootfs.ext4";
+    const input = try resolvedImageRootfsInput(init, arena, cache_root, "local/buildkite-spore:ci", resolved, rootfs_path, false);
     try std.testing.expectEqual(@as(usize, 2), input.guest_env.len);
     try std.testing.expectEqualStrings("GEM_HOME=/usr/local/bundle", input.guest_env[0]);
     try std.testing.expectEqualStrings("BUNDLE_APP_CONFIG=/usr/local/bundle", input.guest_env[1]);
     try std.testing.expectEqualStrings("/app", input.guest_working_dir.?);
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+    const captured = try resolvedImageRootfsInput(init, arena, cache_root, "local/buildkite-spore:ci", resolved, rootfs_path, true);
+    try std.testing.expect(captured.rootfs != null);
+    try std.testing.expect(rootfsWritable(.{
+        .kernel_path = "",
+        .rootfs_path = captured.path,
+        .rootfs = captured.rootfs,
+        .command = &.{"/bin/true"},
+    }));
 }
 
 test "generation request encodes params json as a string" {
@@ -3252,6 +3264,14 @@ test "run cmdline marks rootfs mode" {
     defer std.testing.allocator.free(with_writable_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs_rw=1") != null);
+}
+
+test "run rootfs path stays read-only without manifest rootfs metadata" {
+    try std.testing.expect(!rootfsWritable(.{
+        .kernel_path = "",
+        .rootfs_path = "rootfs.ext4",
+        .command = &.{"/bin/true"},
+    }));
 }
 
 test "run cmdline marks network mode" {

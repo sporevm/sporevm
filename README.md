@@ -185,19 +185,23 @@ Capture a run when the command exits:
 ```bash
 spore run --image docker.io/library/alpine:3.20 \
   --capture /tmp/base.spore \
-  -- /bin/true
+  -- /bin/sh -lc 'echo warmed > /var/tmp/example'
 ```
 
 Run another command from that completed base spore:
 
 ```bash
-spore run --from /tmp/base.spore -- /bin/echo resumed
+spore run --from /tmp/base.spore -- /bin/cat /var/tmp/example
 ```
 
 `--from` resumes the spore, attaches any verified immutable rootfs artifact and
 sealed writable disk chain recorded in the manifest, sends the new argv to the
 restored exec agent, streams stdout and stderr, and exits with the guest command
 status.
+
+For image captures, filesystem writes under the rootfs are portable through the
+sealed disk chain. General attached block devices are not part of the product
+contract.
 
 Capture a running workload on a host signal:
 

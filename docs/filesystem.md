@@ -21,13 +21,15 @@ $SPOREVM_ROOTFS_CACHE_DIR/
   cas/rootfs/blake3/objects/<id>.chunk
 ```
 
-`spore run --image ... --capture` records the immutable ext4 artifact and, for
-image-created spores, records `rootfs.storage` from the metadata sidecar. Older
-image cache entries are upgraded once when capture needs portable chunked rootfs
-identity. `spore rootfs cas-preload --attach-spore` remains a repair/debug path
-for existing exact-rootfs spores; it is not the normal producer path.
+`spore run --image ... --capture` is the writable-rootfs product path. It
+records the immutable ext4 artifact, records `rootfs.storage` from the metadata
+sidecar for image-created spores, and captures rootfs writes as sealed disk
+layers over that base. Older image cache entries are upgraded once when capture
+needs portable chunked rootfs identity. `spore rootfs cas-preload --attach-spore`
+remains a repair/debug path for existing exact-rootfs spores; it is not the
+normal producer path.
 
-Plain `spore run --rootfs PATH` is still a local escape hatch. Combining
+Plain `spore run --rootfs PATH` is still a local read-only escape hatch. Combining
 `--rootfs PATH` with `--capture` is rejected until an import path can record
 portable rootfs identity for arbitrary local images.
 
