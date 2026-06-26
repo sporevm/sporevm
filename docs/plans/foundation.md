@@ -126,7 +126,7 @@ contract.
 | Slice 2: HVF boot | Complete for the foundation target | Continue using Apple Silicon smokes for regressions. |
 | Product run bridge | Landed | See `docs/plans/run-bridge.md`; future OCI/writable policy is out of this plan. |
 | Named lifecycle | Stable for local `create`/`exec`/`suspend`/`resume --name`/`ls`/`rm` on supported HVF/KVM backends; monitor jail denies child process execution on macOS and Linux | Continue speed work in `docs/plans/lifecycle-monitor.md`; explicit `--rootfs` path lifecycle checkpoints remain non-portable and fail closed. |
-| libspore shared core | Active | The Zig module is published as `libspore`; `src/api.zig` is the product surface, including run/resume with typed events. Backend, device, storage, daemon, and CLI modules are not re-exported. |
+| libspore shared core | Active | The Zig module is published as `libspore`; `src/api.zig` is the product surface, including raw run, managed fresh run setup, run-from-spore, and resume with typed events. Backend, device, storage, daemon, and CLI modules are not re-exported. |
 | Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Keep writable disk product smoke coverage as regression evidence. |
 | Slice 4: fork and generation protocol | Complete for correctness | `/run/sporevm` is the live metadata contract; keep fan-out identity smokes as regression coverage. |
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |

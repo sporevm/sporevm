@@ -101,8 +101,14 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     defer if (existing_spec) |*spec| spec.deinit();
     const spec_rootfs = if (existing_spec) |spec| spec.value.rootfs else null;
     const spec_disk = if (existing_spec) |spec| spec.value.disk else null;
-    const kernel_path = opts.kernel_path orelse try run.resolveDefaultKernelPath(init, allocator);
-    const initrd_path = try run.resolveConfiguredInitrdPath(init, opts.initrd_path);
+    const kernel_path = opts.kernel_path orelse run.resolveDefaultKernelPath(init, allocator) catch |err| {
+        std.debug.print("spore monitor: kernel setup failed: {s}\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
+    const initrd_path = run.resolveConfiguredInitrdPath(init, opts.initrd_path) catch |err| {
+        std.debug.print("spore monitor: initrd setup failed: {s}\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
     const assets_ms = lifecycle.monotonicMs();
 
     try lifecycle.writeSpec(allocator, init.io, paths, .{

@@ -284,15 +284,18 @@ The first implementation should pin a small stable code table in tests:
   direct exits remain a follow-up hardening item outside the runtime stream
   path.
 - Slice 5 is implemented in this branch: `src/api.zig` exposes option-based
-  product calls for run, resume, host-info, inspect, fork, pack, unpack, push,
-  inspect-bundle, and pull; run/resume expose typed event callbacks instead of
-  CLI JSONL writer plumbing; pull and bundle materialization use explicit
-  `env`/`none`/`path` cache choices; public calls take a small
-  `libspore.Context` instead of `std.process.Init`; and the CLI routes
-  single-result host, manifest, fork, and bundle commands through the API
-  boundary instead of using command parsing as the product interface. The public
-  Zig module now exposes explicit deinit helpers for owned result fields and
-  classified failure values for run/resume events instead of raw Zig error names.
+  product calls for run, managed fresh run setup, `run --from` semantics,
+  resume, host-info, inspect, fork, pack, unpack, push, inspect-bundle, and
+  pull; run/resume expose typed event callbacks instead of CLI JSONL writer
+  plumbing; pull and bundle materialization use explicit `env`/`none`/`path`
+  cache choices; most public calls take a small `libspore.Context`, while
+  managed fresh runs take `std.process.Init` because image/rootfs and kernel
+  setup can spawn tools, use process IO, and resolve process environment; and
+  the CLI routes single-result host, manifest, fork, and bundle commands through
+  the API boundary instead of using command parsing as the product interface.
+  The public Zig module now exposes explicit deinit helpers for owned result
+  fields and classified failure values for run/resume events instead of raw Zig
+  error names.
 - The build now publishes that shared Zig module as `libspore`. The in-repo CLI
   compiles through `spore_internal.api` because Zig requires a source file to
   belong to only one module in a compilation unit; external embedders should

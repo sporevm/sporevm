@@ -31,6 +31,7 @@ pub const ForkResult = api.ForkResult;
 pub const HostInfo = api.HostInfo;
 pub const InspectBundleOptions = api.InspectBundleOptions;
 pub const InspectBundleResult = api.InspectBundleResult;
+pub const ManagedRunOptions = api.ManagedRunOptions;
 pub const MemoryConfig = api.MemoryConfig;
 pub const NetworkMode = api.NetworkMode;
 pub const NetworkPolicy = api.NetworkPolicy;
@@ -51,6 +52,7 @@ pub const RootfsBundleSummary = api.RootfsBundleSummary;
 pub const RootfsBundlePolicy = api.RootfsBundlePolicy;
 pub const RootfsMaterializationSummary = api.RootfsMaterializationSummary;
 pub const RunEvent = api.RunEvent;
+pub const RunFromSporeOptions = api.RunFromSporeOptions;
 pub const RunOptions = api.RunOptions;
 pub const RunResult = api.RunResult;
 pub const SporeInspectResult = api.SporeInspectResult;
@@ -78,6 +80,8 @@ pub const pull = api.pull;
 pub const push = api.push;
 pub const resumeSpore = api.resumeSpore;
 pub const run = api.run;
+pub const runFromSpore = api.runFromSpore;
+pub const runManaged = api.runManaged;
 pub const unpack = api.unpack;
 
 test {

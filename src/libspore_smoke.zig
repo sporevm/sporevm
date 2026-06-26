@@ -33,3 +33,19 @@ test "external import can consume classified failure events" {
     };
     try std.testing.expectEqual(libspore.FailureCode.cache_integrity_failed, event.failure.classified.code);
 }
+
+test "external import can name managed and run-from APIs" {
+    const managed = libspore.ManagedRunOptions{
+        .kernel_path = "Image",
+        .command = &.{"/bin/true"},
+    };
+    try std.testing.expectEqualStrings("Image", managed.kernel_path.?);
+
+    const from = libspore.RunFromSporeOptions{
+        .spore_dir = "base.spore",
+        .command = &.{"/bin/true"},
+    };
+    try std.testing.expectEqualStrings("base.spore", from.spore_dir);
+    _ = libspore.runManaged;
+    _ = libspore.runFromSpore;
+}

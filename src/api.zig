@@ -133,6 +133,40 @@ pub const RunOptions = struct {
     events: ?EventSink = null,
 };
 
+pub const ManagedRunOptions = struct {
+    backend: Backend = .auto,
+    kernel_path: ?[]const u8 = null,
+    initrd_path: ?[]const u8 = null,
+    rootfs_path: ?[]const u8 = null,
+    image_ref: ?[]const u8 = null,
+    command: []const []const u8,
+    memory: MemoryConfig = .{},
+    vcpus: u32 = 1,
+    guest_port: u32 = 10700,
+    timeout_ms: u64 = 30_000,
+    capture_path: ?[]const u8 = null,
+    capture_trigger: CaptureTrigger = .exit,
+    continue_after_capture: bool = false,
+    network: NetworkMode = .disabled,
+    network_policy: NetworkPolicy = .{},
+    spore_executable: []const u8 = "spore",
+    events: ?EventSink = null,
+};
+
+pub const RunFromSporeOptions = struct {
+    backend: Backend = .auto,
+    spore_dir: []const u8,
+    command: []const []const u8,
+    vcpus: u32 = 1,
+    guest_port: u32 = 10700,
+    timeout_ms: u64 = 30_000,
+    capture_path: ?[]const u8 = null,
+    capture_trigger: CaptureTrigger = .exit,
+    continue_after_capture: bool = false,
+    spore_executable: []const u8 = "spore",
+    events: ?EventSink = null,
+};
+
 pub const ResumeOptions = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
@@ -342,6 +376,92 @@ pub fn run(
         .continue_after_capture = options.continue_after_capture,
         .network = options.network,
         .network_policy = options.network_policy,
+        .spore_executable = options.spore_executable,
+        .events = options.events,
+    });
+}
+
+pub fn runManaged(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ManagedRunOptions,
+) !RunResult {
+    if (options.capture_path != null and options.rootfs_path != null and options.image_ref == null) {
+        return error.InvalidRootfsInput;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rootfs = try run_mod.resolveRootfsInputDetailed(init, arena, .{
+        .rootfs_path = options.rootfs_path,
+        .image_ref = options.image_ref,
+        .command_name = "run",
+        .record_artifact = options.capture_path != null,
+    });
+    const kernel_path = options.kernel_path orelse try run_mod.resolveDefaultKernelPath(init, arena);
+    const initrd_path = try run_mod.resolveConfiguredInitrdPath(init, options.initrd_path);
+
+    return run_mod.execute(.{ .io = init.io, .environ_map = init.environ_map }, arena, .{
+        .backend = options.backend,
+        .kernel_path = kernel_path,
+        .initrd_path = initrd_path,
+        .rootfs_path = rootfs.path,
+        .rootfs = rootfs.rootfs,
+        .command = options.command,
+        .guest_env = rootfs.guest_env,
+        .guest_working_dir = rootfs.guest_working_dir,
+        .memory = options.memory,
+        .vcpus = options.vcpus,
+        .guest_port = options.guest_port,
+        .timeout_ms = options.timeout_ms,
+        .stream_output = false,
+        .capture_path = options.capture_path,
+        .capture_trigger = options.capture_trigger,
+        .continue_after_capture = options.continue_after_capture,
+        .network = options.network,
+        .network_policy = options.network_policy,
+        .spore_executable = options.spore_executable,
+        .events = options.events,
+    });
+}
+
+pub fn runFromSpore(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: RunFromSporeOptions,
+) !RunResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const manifest = try spore.loadManifest(arena, options.spore_dir);
+    defer manifest.deinit();
+
+    const rootfs = try run_mod.resumeRootfsForRun(arena, manifest.value);
+    const disk = try run_mod.resumeDiskForRun(arena, manifest.value);
+    const network_options = try run_mod.networkOptionsFromManifest(arena, manifest.value.network);
+
+    return run_mod.execute(context, arena, .{
+        .backend = options.backend,
+        .kernel_path = "",
+        .initrd_path = null,
+        .rootfs_path = null,
+        .rootfs = rootfs,
+        .disk = disk,
+        .resume_dir = options.spore_dir,
+        .command = options.command,
+        .memory = try run_mod.runMemoryFromManifest(manifest.value),
+        .vcpus = options.vcpus,
+        .guest_port = options.guest_port,
+        .timeout_ms = options.timeout_ms,
+        .stream_output = false,
+        .capture_path = options.capture_path,
+        .capture_trigger = options.capture_trigger,
+        .continue_after_capture = options.continue_after_capture,
+        .network = network_options.network,
+        .network_policy = network_options.policy,
         .spore_executable = options.spore_executable,
         .events = options.events,
     });

@@ -172,6 +172,11 @@ pub fn usageMissingArgument(message: []const u8, source: []const u8) CliError {
 
 pub fn fromZigError(err: anyerror) CliError {
     return switch (err) {
+        error.InvalidRootfsInput,
+        error.BadManagedKernelRepository,
+        error.BadManagedKernelVersion,
+        error.BadManagedKernelAsset,
+        => CliError.init(.usage_invalid_argument, ErrorCode.usage_invalid_argument.defaultMessage(), @errorName(err)),
         error.FileNotFound => CliError.init(.object_not_found, ErrorCode.object_not_found.defaultMessage(), @errorName(err)),
         error.AccessDenied,
         error.PermissionDenied,
@@ -181,6 +186,11 @@ pub fn fromZigError(err: anyerror) CliError {
         error.InvalidManifest,
         error.BadManifest,
         error.PlatformMismatch,
+        error.MissingRootfsArtifact,
+        error.UnsupportedRootfsDeviceCount,
+        error.ManagedKernelConfigMissing,
+        error.ManagedKernelHTTPStatus,
+        error.ManagedKernelBodyTooLarge,
         => CliError.init(.object_invalid, ErrorCode.object_invalid.defaultMessage(), @errorName(err)),
         error.UnsupportedHost,
         error.UnsupportedBackend,
@@ -191,6 +201,8 @@ pub fn fromZigError(err: anyerror) CliError {
         error.BadChunk,
         error.BadBundleDigest,
         error.BadRootfsDigest,
+        error.BadManagedKernelChecksum,
+        error.ManagedKernelChecksumMismatch,
         => CliError.init(.cache_integrity_failed, ErrorCode.cache_integrity_failed.defaultMessage(), @errorName(err)),
         else => CliError.init(.runtime_execution_failed, ErrorCode.runtime_execution_failed.defaultMessage(), @errorName(err)),
     };
@@ -217,6 +229,12 @@ test "stable error code table matches the plan" {
     try std.testing.expectEqualStrings("cache.integrity_failed", ErrorCode.cache_integrity_failed.text());
     try std.testing.expectEqualStrings("runtime.start_failed", ErrorCode.runtime_start_failed.text());
     try std.testing.expectEqualStrings("runtime.execution_failed", ErrorCode.runtime_execution_failed.text());
+}
+
+test "setup errors classify for API callers" {
+    try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.InvalidRootfsInput).code);
+    try std.testing.expectEqual(ErrorCode.object_invalid, fromZigError(error.MissingRootfsArtifact).code);
+    try std.testing.expectEqual(ErrorCode.cache_integrity_failed, fromZigError(error.ManagedKernelChecksumMismatch).code);
 }
 
 test "error envelope uses shared schema" {

@@ -822,13 +822,20 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
         if (parsed.network_requested or parsed.network_policy.hasRules()) {
             failRunSetup("spore run: --from uses the captured network policy; omit --net and network allow flags", .{});
         }
-        const rootfs = try resumeRootfsForRun(allocator, manifest.value);
+        const rootfs = resumeRootfsForRun(allocator, manifest.value) catch |err| switch (err) {
+            error.UnsupportedRootfsDeviceCount => failRunSetup("spore run: --from supports at most one immutable rootfs disk; found {d} block devices", .{countBlockDevices(manifest.value.devices)}),
+            error.MissingRootfsArtifact => failRunSetup("spore run: --from disk-backed spore has no immutable rootfs artifact; capture with spore run --image", .{}),
+            error.BadManifest => failRunSetup("spore run: --from manifest has invalid immutable rootfs metadata", .{}),
+            else => |e| return e,
+        };
         const disk = try resumeDiskForRun(allocator, manifest.value);
         const network_options = try networkOptionsFromManifest(allocator, manifest.value.network);
         var opts = parsed.shared.completeWithAssets(parsed.backend, "", null, null, rootfs, parsed.command, true);
         opts.disk = disk;
         opts.resume_dir = spore_dir;
-        opts.memory = runMemoryFromManifest(manifest.value);
+        opts.memory = runMemoryFromManifest(manifest.value) catch {
+            failRunSetup("spore run: --from manifest RAM size is not positive and page-aligned: {d}", .{manifest.value.platform.ram_size});
+        };
         opts.capture_path = parsed.capture_path;
         opts.capture_trigger = parsed.capture_trigger;
         opts.continue_after_capture = parsed.continue_after_capture;
@@ -840,14 +847,18 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     if (parsed.capture_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
         failRunSetup("spore run: --rootfs with --capture is not portable yet; use --image so capture can record immutable rootfs identity", .{});
     }
-    const rootfs = try resolveRootfsInputDetailed(init, allocator, .{
+    const rootfs = resolveRootfsInputForCli(init, allocator, .{
         .rootfs_path = parsed.rootfs_path,
         .image_ref = parsed.image_ref,
         .command_name = "run",
         .record_artifact = parsed.capture_path != null,
     });
-    const kernel_path = parsed.shared.kernel_path orelse try resolveDefaultKernelPath(init, allocator);
-    const initrd_path = try resolveConfiguredInitrdPath(init, parsed.shared.initrd_path);
+    const kernel_path = parsed.shared.kernel_path orelse resolveDefaultKernelPath(init, allocator) catch |err| {
+        failRunSetup("spore run: managed run kernel resolution failed: {s}; pass --kernel or set SPOREVM_KERNEL_IMAGE", .{@errorName(err)});
+    };
+    const initrd_path = resolveConfiguredInitrdPath(init, parsed.shared.initrd_path) catch |err| {
+        failRunSetup("spore run: initrd setup failed: {s}", .{@errorName(err)});
+    };
     var opts = parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs.path, rootfs.rootfs, parsed.command, true);
     opts.guest_env = rootfs.guest_env;
     opts.guest_working_dir = rootfs.guest_working_dir;
@@ -880,24 +891,16 @@ fn manifestNetworkFromOptions(network: NetworkMode, policy: *const spore_net_pol
     };
 }
 
-fn runMemoryFromManifest(manifest: spore.Manifest) memory_config.Config {
-    return memory_config.fromManifestBytes(manifest.platform.ram_size) catch {
-        failRunSetup("spore run: --from manifest RAM size is not positive and page-aligned: {d}", .{manifest.platform.ram_size});
-    };
+pub fn runMemoryFromManifest(manifest: spore.Manifest) !memory_config.Config {
+    return memory_config.fromManifestBytes(manifest.platform.ram_size);
 }
 
 pub fn resumeRootfsForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Rootfs {
     const disk_count = countBlockDevices(manifest.devices);
     if (disk_count == 0) return null;
-    if (disk_count != 1) {
-        failRunSetup("spore run: --from supports at most one immutable rootfs disk; found {d} block devices", .{disk_count});
-    }
-    const rootfs = manifest.rootfs orelse {
-        failRunSetup("spore run: --from disk-backed spore has no immutable rootfs artifact; capture with spore run --image", .{});
-    };
-    spore.validateRootfs(rootfs, manifest.devices) catch {
-        failRunSetup("spore run: --from manifest has invalid immutable rootfs metadata", .{});
-    };
+    if (disk_count != 1) return error.UnsupportedRootfsDeviceCount;
+    const rootfs = manifest.rootfs orelse return error.MissingRootfsArtifact;
+    try spore.validateRootfs(rootfs, manifest.devices);
     return try cloneRootfs(allocator, rootfs);
 }
 
@@ -987,11 +990,11 @@ pub fn resolveRootfsInput(
     image_ref: ?[]const u8,
     command_name: []const u8,
 ) !?[]const u8 {
-    return (try resolveRootfsInputDetailed(init, allocator, .{
+    return resolveRootfsInputForCli(init, allocator, .{
         .rootfs_path = rootfs_path,
         .image_ref = image_ref,
         .command_name = command_name,
-    })).path;
+    }).path;
 }
 
 pub fn resolveRootfsInputDetailed(
@@ -999,6 +1002,18 @@ pub fn resolveRootfsInputDetailed(
     allocator: std.mem.Allocator,
     options: RootfsInputOptions,
 ) !ResolvedRootfsInput {
+    const resolution = try resolveRootfsInputDetailedResult(init, allocator, options);
+    switch (resolution) {
+        .resolved => |resolved| return resolved,
+        .failure => |failure| return rootfsInputError(failure.code),
+    }
+}
+
+fn resolveRootfsInputForCli(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: RootfsInputOptions,
+) ResolvedRootfsInput {
     const resolution = resolveRootfsInputDetailedResult(init, allocator, options) catch |err| {
         failRunSetup("spore {s}: rootfs setup failed: {s}", .{ options.command_name, @errorName(err) });
     };
@@ -1208,6 +1223,24 @@ fn rootfsInputFailure(
     return machine_output.CliError.init(code, message, source);
 }
 
+fn rootfsInputError(code: machine_output.ErrorCode) anyerror {
+    return switch (code) {
+        .usage_invalid_argument,
+        .usage_missing_argument,
+        => error.InvalidRootfsInput,
+        .object_not_found => error.FileNotFound,
+        .object_invalid => error.BadManifest,
+        .cache_unavailable => error.RootfsCacheUnavailable,
+        .cache_integrity_failed => error.BadRootfsDigest,
+        .host_unsupported,
+        .host_unavailable,
+        => error.UnsupportedHost,
+        .runtime_start_failed,
+        .runtime_execution_failed,
+        => error.RuntimeFailed,
+    };
+}
+
 fn resolvedImageRootfsInput(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -1318,12 +1351,9 @@ fn ensureDirPath(io: Io, path: []const u8) !void {
     existing.close(io);
 }
 
-pub fn rootfsCacheRootPath(context: Context, allocator: std.mem.Allocator, command_name: []const u8) ![]const u8 {
+pub fn rootfsCacheRootPath(context: Context, allocator: std.mem.Allocator, _: []const u8) ![]const u8 {
     return local_paths.rootfsCacheRootPath(allocator, context.environ_map) catch |err| switch (err) {
-        error.MissingHome => failRunSetup(
-            "spore {s}: cannot resolve rootfs cache directory; set {s} or HOME",
-            .{ command_name, local_paths.rootfs_cache_env },
-        ),
+        error.MissingHome => return error.MissingHome,
         else => |e| return e,
     };
 }
@@ -1454,26 +1484,17 @@ fn expectNestedJsonStringField(
 
 pub fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
     if (init.environ_map.get("SPOREVM_KERNEL_IMAGE")) |path| {
-        if (!try readablePath(init.io, path)) {
-            failRunSetup("spore run: SPOREVM_KERNEL_IMAGE not found: {s}", .{path});
-        }
+        if (!try readablePath(init.io, path)) return error.FileNotFound;
         return path;
     }
 
-    return resolveManagedRunKernelPath(init, allocator) catch |err| {
-        failRunSetup(
-            "spore run: managed run kernel resolution failed: {s}; pass --kernel or set SPOREVM_KERNEL_IMAGE",
-            .{@errorName(err)},
-        );
-    };
+    return resolveManagedRunKernelPath(init, allocator);
 }
 
 pub fn resolveConfiguredInitrdPath(init: std.process.Init, cli_path: ?[]const u8) !?[]const u8 {
     if (cli_path) |path| return path;
     if (init.environ_map.get("SPOREVM_RUN_INITRD")) |path| {
-        if (!try readablePath(init.io, path)) {
-            failRunSetup("spore run: SPOREVM_RUN_INITRD not found: {s}", .{path});
-        }
+        if (!try readablePath(init.io, path)) return error.FileNotFound;
         return path;
     }
     return null;
@@ -1484,10 +1505,7 @@ fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Alloca
     const asset = try managedRunKernelAssetName(allocator, opts.linux_version);
     const config_asset = try managedRunKernelConfigAssetName(allocator, asset);
     const cache_root = local_paths.kernelCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
-        error.MissingHome => failRunSetup(
-            "spore run: cannot resolve kernel cache directory; set {s} or HOME",
-            .{local_paths.kernel_cache_env},
-        ),
+        error.MissingHome => return error.MissingHome,
         else => |e| return e,
     };
     const repo_cache = try managedKernelRepositoryCacheName(allocator, opts.repository);
@@ -1514,27 +1532,16 @@ fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Alloca
     defer Io.Dir.cwd().deleteFile(init.io, temp_sha) catch {};
     defer Io.Dir.cwd().deleteFile(init.io, temp_config) catch {};
 
-    const message = try std.fmt.allocPrint(allocator, "spore run: downloading managed kernel {s}@{s}:{s}\n", .{ opts.repository, opts.release, asset });
-    try writeSetupStderr(init, message);
-
     var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
     defer client.deinit();
     try fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, asset, temp_image, max_kernel_asset_size);
     const sha_asset = try std.fmt.allocPrint(allocator, "{s}.sha256", .{asset});
     try fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, sha_asset, temp_sha, max_kernel_config_asset_size);
-    fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, config_asset, temp_config, max_kernel_config_asset_size) catch |err| {
-        failRunSetup(
-            "spore run: managed run kernel config asset {s}@{s}:{s} is unavailable: {s}",
-            .{ opts.repository, opts.release, config_asset, @errorName(err) },
-        );
-    };
+    try fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, config_asset, temp_config, max_kernel_config_asset_size);
     if (!try verifiedManagedKernelPath(init.io, allocator, temp_image, temp_sha)) return error.ManagedKernelChecksumMismatch;
     if (try missingManagedRunKernelConfigSymbolFromPath(init.io, allocator, temp_config)) |missing| {
         defer allocator.free(missing);
-        failRunSetup(
-            "spore run: managed run kernel config {s}@{s}:{s} is missing {s}; use cleanroom-kernels v0.5.2 or newer, pass --kernel, or set SPOREVM_KERNEL_RELEASE to a fixed release",
-            .{ opts.repository, opts.release, config_asset, missing },
-        );
+        return error.ManagedKernelConfigMissing;
     }
 
     try Io.Dir.renameAbsolute(temp_image, dest, init.io);
