@@ -136,6 +136,26 @@ pub const EventMode = enum {
     }
 };
 
+pub const PullPolicy = enum {
+    missing,
+    always,
+    never,
+
+    pub fn parse(raw: []const u8) ?PullPolicy {
+        if (std.mem.eql(u8, raw, "missing")) return .missing;
+        if (std.mem.eql(u8, raw, "always")) return .always;
+        if (std.mem.eql(u8, raw, "never")) return .never;
+        return null;
+    }
+};
+
+fn useMutableImageRefCache(policy: PullPolicy) bool {
+    return switch (policy) {
+        .missing, .never => true,
+        .always => false,
+    };
+}
+
 pub const Result = struct {
     backend: Backend,
     start_ms: u64,
@@ -583,6 +603,7 @@ pub const CliOptions = struct {
     from_spore_dir: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
+    pull_policy: PullPolicy = .missing,
     capture_path: ?[]const u8 = null,
     capture_trigger: capture.Trigger = .exit,
     continue_after_capture: bool = false,
@@ -609,6 +630,8 @@ const cli_usage =
     \\  --from DIR              Resume from an existing spore, then run argv
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs, then run from it
+    \\  --pull=missing|always|never
+    \\                          Pull policy for mutable --image refs (default: missing)
     \\  --net                   Experimental SporeVM-managed networking
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
@@ -679,6 +702,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var from_spore_dir: ?[]const u8 = null;
     var rootfs_path: ?[]const u8 = null;
     var image_ref: ?[]const u8 = null;
+    var pull_policy: PullPolicy = .missing;
     var capture_path: ?[]const u8 = null;
     var capture_trigger: capture.Trigger = .exit;
     var capture_trigger_set = false;
@@ -704,6 +728,18 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             rootfs_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
             image_ref = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--pull")) {
+            const raw = takeValue(args, &i, args[i]);
+            pull_policy = PullPolicy.parse(raw) orelse {
+                std.debug.print("--pull must be missing, always, or never\n", .{});
+                std.process.exit(2);
+            };
+        } else if (std.mem.startsWith(u8, args[i], "--pull=")) {
+            const raw = args[i]["--pull=".len..];
+            pull_policy = PullPolicy.parse(raw) orelse {
+                std.debug.print("--pull must be missing, always, or never\n", .{});
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, args[i], "--from")) {
             from_spore_dir = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--capture")) {
@@ -764,6 +800,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.debug.print("spore run: --rootfs and --image are mutually exclusive\n", .{});
         std.process.exit(2);
     }
+    if (image_ref == null and pull_policy != .missing) {
+        std.debug.print("spore run: --pull requires --image\n", .{});
+        std.process.exit(2);
+    }
     if (from_spore_dir != null) {
         if (rootfs_path != null or image_ref != null) {
             std.debug.print("spore run: --from is mutually exclusive with --rootfs and --image\n", .{});
@@ -801,6 +841,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .from_spore_dir = from_spore_dir,
         .rootfs_path = rootfs_path,
         .image_ref = image_ref,
+        .pull_policy = pull_policy,
         .capture_path = capture_path,
         .capture_trigger = capture_trigger,
         .continue_after_capture = continue_after_capture,
@@ -850,6 +891,7 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     const rootfs = resolveRootfsInputForCli(init, allocator, .{
         .rootfs_path = parsed.rootfs_path,
         .image_ref = parsed.image_ref,
+        .pull_policy = parsed.pull_policy,
         .command_name = "run",
         .record_artifact = parsed.capture_path != null,
     });
@@ -967,6 +1009,7 @@ fn cloneRootfsStorage(allocator: std.mem.Allocator, storage: spore.RootfsStorage
 pub const RootfsInputOptions = struct {
     rootfs_path: ?[]const u8,
     image_ref: ?[]const u8,
+    pull_policy: PullPolicy = .missing,
     command_name: []const u8,
     record_artifact: bool = false,
 };
@@ -1038,7 +1081,7 @@ pub fn resolveRootfsInputDetailedResult(
         ) };
     }
     const resolved = if (options.image_ref) |ref|
-        try resolveImageRootfs(init, allocator, ref, options.command_name, options.record_artifact)
+        try resolveImageRootfs(init, allocator, ref, options.command_name, options.pull_policy, options.record_artifact)
     else
         RootfsInputResolution{ .resolved = .{ .path = options.rootfs_path } };
     switch (resolved) {
@@ -1060,7 +1103,7 @@ pub fn resolveRootfsInputDetailedResult(
     }
 }
 
-fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8, command_name: []const u8, record_artifact: bool) !RootfsInputResolution {
+fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8, command_name: []const u8, pull_policy: PullPolicy, record_artifact: bool) !RootfsInputResolution {
     const cache_root = local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
         error.MissingHome => return .{ .failure = rootfsInputFailure(
             allocator,
@@ -1127,16 +1170,27 @@ fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, imag
                 .{ command_name, image_ref, @errorName(err) },
             ) };
         };
-        if (rootfs_mod.cachedImageRefRootfsPath(init.io, allocator, cache_root, image_ref, direct_image_platform) catch |err| {
+        if (useMutableImageRefCache(pull_policy)) {
+            if (rootfs_mod.cachedImageRefRootfsPath(init.io, allocator, cache_root, image_ref, direct_image_platform) catch |err| {
+                return .{ .failure = rootfsInputFailure(
+                    allocator,
+                    .cache_integrity_failed,
+                    command_name,
+                    "spore {s}: cached image ref check failed: {s}",
+                    .{ command_name, @errorName(err) },
+                ) };
+            }) |hit| {
+                return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, hit.resolved, hit.path, command_name, record_artifact);
+            }
+        }
+        if (pull_policy == .never) {
             return .{ .failure = rootfsInputFailure(
                 allocator,
-                .cache_integrity_failed,
+                .object_not_found,
                 command_name,
-                "spore {s}: cached image ref check failed: {s}",
-                .{ command_name, @errorName(err) },
+                "spore {s}: image ref cache miss for {s} with --pull=never",
+                .{ command_name, image_ref },
             ) };
-        }) |hit| {
-            return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, hit.resolved, hit.path, command_name, record_artifact);
         }
     }
 
@@ -2804,9 +2858,63 @@ test "run cli parser accepts image ref" {
     const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "--", "/bin/echo", "hi" });
     try std.testing.expect(opts.rootfs_path == null);
     try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", opts.image_ref.?);
+    try std.testing.expectEqual(PullPolicy.missing, opts.pull_policy);
     try std.testing.expectEqual(@as(usize, 2), opts.command.len);
     try std.testing.expectEqualStrings("/bin/echo", opts.command[0]);
     try std.testing.expectEqualStrings("hi", opts.command[1]);
+}
+
+test "run cli parser accepts image pull policy" {
+    const equals_opts = try parseCliArgs(&.{ "--pull=always", "--image", "docker.io/library/alpine:3.20", "--", "/bin/true" });
+    try std.testing.expectEqual(PullPolicy.always, equals_opts.pull_policy);
+
+    const value_opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "--pull", "never", "--", "/bin/true" });
+    try std.testing.expectEqual(PullPolicy.never, value_opts.pull_policy);
+}
+
+test "run pull policy routes mutable image ref cache lookups" {
+    try std.testing.expect(useMutableImageRefCache(.missing));
+    try std.testing.expect(!useMutableImageRefCache(.always));
+    try std.testing.expect(useMutableImageRefCache(.never));
+}
+
+test "run pull never fails closed on mutable image ref cache miss" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-image-pull-never-cache-miss";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, tmp ++ "/cache");
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const result = try resolveRootfsInputDetailedResult(init, arena, .{
+        .rootfs_path = null,
+        .image_ref = "docker.io/library/alpine:3.20",
+        .pull_policy = .never,
+        .command_name = "run",
+    });
+    switch (result) {
+        .resolved => return error.ExpectedPullNeverCacheMiss,
+        .failure => |failure| {
+            try std.testing.expectEqual(machine_output.ErrorCode.object_not_found, failure.code);
+            try std.testing.expect(std.mem.indexOf(u8, failure.message, "--pull=never") != null);
+        },
+    }
 }
 
 test "run cli parser accepts source spore" {
