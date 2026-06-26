@@ -251,6 +251,66 @@ test "writes spanning clusters seed and read from overlay" {
     try std.testing.expectEqual(@as(usize, 2), disk.dirtyClusterCount());
 }
 
+test "cow disk matches byte model across partial writes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+
+    var base_bytes: [2048 + 137]u8 = undefined;
+    for (&base_bytes, 0..) |*byte, i| byte.* = @truncate((i * 31) + 7);
+    var model = base_bytes;
+    try base.writeStreamingAll(io, &base_bytes);
+
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len).source();
+    var disk = try CowDisk.init(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 512);
+    defer disk.deinit();
+
+    const patch_a = [_]u8{0xAA} ** 13;
+    const patch_b = [_]u8{0xBB} ** 700;
+    const patch_c = [_]u8{0xCC} ** 37;
+    const writes = [_]struct {
+        offset: usize,
+        data: []const u8,
+    }{
+        .{ .offset = 3, .data = &patch_a },
+        .{ .offset = 500, .data = &patch_b },
+        .{ .offset = base_bytes.len - patch_c.len, .data = &patch_c },
+    };
+
+    var dirty_model = [_]bool{false} ** 8;
+    for (writes) |write| {
+        try disk.writeAt(write.data, write.offset);
+        @memcpy(model[write.offset..][0..write.data.len], write.data);
+
+        const first = write.offset / 512;
+        const last = (write.offset + write.data.len - 1) / 512;
+        for (first..last + 1) |i| dirty_model[i] = true;
+    }
+
+    for (disk.dirty, 0..) |is_dirty, i| {
+        try std.testing.expectEqual(dirty_model[i], is_dirty);
+    }
+
+    const read_lengths = [_]usize{ 0, 1, 7, 255, 512, 513, 900 };
+    var readback: [900]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < model.len) : (offset += 127) {
+        for (read_lengths) |len| {
+            if (offset + len > model.len) continue;
+            try disk.readAt(readback[0..len], offset);
+            try std.testing.expectEqualSlices(u8, model[offset..][0..len], readback[0..len]);
+        }
+    }
+
+    try disk.readAt(readback[0..patch_c.len], base_bytes.len - patch_c.len);
+    try std.testing.expectEqualSlices(u8, model[base_bytes.len - patch_c.len ..], readback[0..patch_c.len]);
+}
+
 test "range and cluster validation fail closed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

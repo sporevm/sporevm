@@ -827,6 +827,20 @@ test "layered cow appends only the new active head" {
     try readAt(arena, child_dir, base_source, second_layers, &readback, 0);
     try std.testing.expectEqualSlices(u8, &first_patch, readback[0..4096]);
     try std.testing.expectEqualSlices(u8, &second_patch, readback[4096..8192]);
+
+    var model = base_bytes;
+    @memcpy(model[0..4096], &first_patch);
+    @memcpy(model[4096..8192], &second_patch);
+    const read_lengths = [_]usize{ 0, 1, 17, 4095, 4096, 4097, 7000 };
+    var window: [7000]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < model.len) : (offset += 733) {
+        for (read_lengths) |len| {
+            if (offset + len > model.len) continue;
+            try readAt(arena, child_dir, base_source, second_layers, window[0..len], offset);
+            try std.testing.expectEqualSlices(u8, model[offset..][0..len], window[0..len]);
+        }
+    }
 }
 
 test "sealing rejects corrupt preexisting objects" {

@@ -752,6 +752,46 @@ test "preload builds an index and cached source verifies chunks once" {
     try std.testing.expect(std.mem.indexOf(u8, trace_bytes, "\"index_digest\":\"") != null);
 }
 
+test "cas source reads match byte model across chunk boundaries" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-cas-model";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    var model: [3 * 512 + 73]u8 = undefined;
+    for (model[0..512], 0..) |*byte, i| byte.* = @truncate((i * 17) + 3);
+    @memset(model[512..1024], 0);
+    for (model[1024..], 0..) |*byte, i| byte.* = @truncate((i * 29) + 11);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = &model });
+
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const preload_result = try preload(io, arena, cache_root, artifact.digest, 512);
+    var source = try CasBlockSource.openManifest(allocator, cache_root, .{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = artifact,
+        .storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
+    }, null);
+    defer source.deinit();
+
+    const read_lengths = [_]usize{ 0, 1, 17, 511, 512, 513, 900 };
+    var readback: [900]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < model.len) : (offset += 137) {
+        for (read_lengths) |len| {
+            if (offset + len > model.len) continue;
+            try source.readAt(readback[0..len], offset);
+            try std.testing.expectEqualSlices(u8, model[offset..][0..len], readback[0..len]);
+        }
+    }
+}
+
 test "cas source rejects corrupt chunk objects" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

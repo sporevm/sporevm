@@ -919,6 +919,28 @@ test "host stream frame parser handles split frames" {
     try std.testing.expectEqualStrings("err\n", capture.stderr[0..capture.stderr_len]);
 }
 
+test "host stream frame parser is independent of two-part packetization" {
+    const frames = "stdout 0 5\nhello" ++
+        "stderr 0 4\nwarn" ++
+        "exit 9\n";
+
+    var split: usize = 0;
+    while (split <= frames.len) : (split += 1) {
+        var stream = try HostStream.init(10700, "{}\n");
+        var capture = StreamCapture{};
+        stream.state = .connected;
+        stream.setOutputSink(&capture, captureSink);
+
+        stream.appendOutput(frames[0..split]);
+        stream.appendOutput(frames[split..]);
+
+        try std.testing.expectEqual(HostStreamState.complete, stream.state);
+        try std.testing.expectEqual(@as(i32, 9), stream.exit_code.?);
+        try std.testing.expectEqualStrings("hello", capture.stdout[0..capture.stdout_len]);
+        try std.testing.expectEqualStrings("warn", capture.stderr[0..capture.stderr_len]);
+    }
+}
+
 test "host stream frame parser rejects offset mismatch" {
     var stream = try HostStream.init(10700, "{}\n");
     stream.state = .connected;

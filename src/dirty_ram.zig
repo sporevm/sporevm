@@ -859,6 +859,55 @@ test "dirty RAM sealer tracks dirty ranges tail counts and zero transitions" {
     try std.testing.expect(std.mem.allEqual(u8, backing, 0));
 }
 
+test "dirty RAM host dirty ranges match chunk model" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, 4 * spore.chunk_size);
+    @memset(ram, 0);
+
+    var sealer = try Sealer.start(arena, .{ .dir = dir, .ram = ram });
+    defer sealer.deinit();
+    sealer.resetStatsAfterBaseline();
+
+    const ranges = [_]struct {
+        offset: usize,
+        len: usize,
+    }{
+        .{ .offset = 0, .len = 1 },
+        .{ .offset = spore.chunk_size - 1, .len = 2 },
+        .{ .offset = spore.chunk_size + 123, .len = spore.chunk_size + 5 },
+        .{ .offset = 3 * spore.chunk_size + 17, .len = 19 },
+    };
+
+    var model = [_]bool{false} ** 4;
+    var newly_dirty: u64 = 0;
+    for (ranges) |range| {
+        sealer.markHostDirtyRange(range.offset, range.len);
+        const first = range.offset / spore.chunk_size;
+        const last = (range.offset + range.len - 1) / spore.chunk_size;
+        for (first..last + 1) |i| {
+            if (!model[i]) {
+                model[i] = true;
+                newly_dirty += 1;
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(u64, ranges.len), sealer.stats.host_dirty_ranges_total);
+    try std.testing.expectEqual(newly_dirty, sealer.stats.host_dirty_chunks_total);
+    for (sealer.dirty_chunks, 0..) |is_dirty, i| {
+        try std.testing.expectEqual(model[i], is_dirty);
+    }
+
+    const flushed = try sealer.flushMarked(.{ .tail = true });
+    try std.testing.expectEqual(newly_dirty, flushed);
+    try std.testing.expect(!sealer.hasDirtyChunks());
+}
+
 test "dirty RAM sealer leaves stopped non-tail work for tail flush" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
