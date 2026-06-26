@@ -96,6 +96,18 @@ pub fn build(b: *std.Build) void {
 
     const libspore_tests = b.addTest(.{ .root_module = libspore_mod });
     const run_libspore_tests = b.addRunArtifact(libspore_tests);
+    const libspore_docs = b.addObject(.{
+        .name = "libspore-docs",
+        .root_module = libspore_mod,
+    });
+    const install_libspore_docs = b.addInstallDirectory(.{
+        .source_dir = libspore_docs.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "share/doc/spore/libspore-zig",
+    });
+    const docs_step = b.step("docs", "Generate libspore API documentation");
+    docs_step.dependOn(&install_libspore_docs.step);
+
     const libspore_smoke_mod = b.createModule(.{
         .root_source_file = b.path("src/libspore_smoke.zig"),
         .target = target,
