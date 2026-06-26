@@ -362,8 +362,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         );
     }
     if (config.exec_probe) |probe| {
-        try vsock_dev.attachHostStream(probe);
         probe.markStarted();
+        try vsock_dev.attachHostStream(probe);
+        try flushVsockRxKvm(vm_fd, &vsock_dev, &transports_buf[vsock_transport_index], ram, vsock_transport_index);
     }
     var exec_probe_done = false;
     var pending_kvm_completion = false;
