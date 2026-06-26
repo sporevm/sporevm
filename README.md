@@ -345,7 +345,7 @@ mise run smoke:monitor-failure-modes
 ```
 
 Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).
-The release notes in [docs/releases/v1.1.0.md](docs/releases/v1.1.0.md) list
+The release notes in [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) list
 the A1/KVM release gate.
 
 ## Release

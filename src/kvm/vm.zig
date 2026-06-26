@@ -479,8 +479,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     continue;
                 }
                 if (stopped_for_wake and config.exec_control != null) continue;
-                std.log.err("KVM_RUN interrupted without a pending capture request", .{});
-                return error.KvmIoctlFailed;
+                continue;
             },
         }
         switch (kvm.exitReason(run_bytes)) {
