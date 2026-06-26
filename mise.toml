@@ -15,6 +15,10 @@ description = "Install optimized spore into ~/bin"
 run = "zig build test"
 description = "Run unit tests"
 
+[tasks.docs]
+run = "zig build docs"
+description = "Generate libspore API documentation"
+
 [tasks.check]
 run = "mise run test && mise run build && git diff --check"
 description = "Run unit tests, build, and diff hygiene"

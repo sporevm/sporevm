@@ -1,4 +1,8 @@
-//! Product API boundary used by the CLI and future embedding layers.
+//! Product API boundary used by the CLI and embedding layers.
+//!
+//! Import this module through `libspore`. Backend, device, storage, monitor, and
+//! CLI modules stay internal; this file owns the product operations and result
+//! contracts callers should build against.
 
 const std = @import("std");
 
@@ -11,14 +15,26 @@ const resume_mod = @import("resume.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 
+/// Process context shared by product operations.
+///
+/// `Context` carries process IO and environment access without requiring
+/// embedders to construct CLI argument vectors.
 pub const Context = context_mod.Context;
 
+/// Cache root selection for operations that materialize or read cached bytes.
+///
+/// `.env` uses the same environment-derived defaults as the CLI, `.none`
+/// disables the optional cache, and `.path` uses an explicit caller path.
 pub const CacheRoot = union(enum) {
     env,
     none,
     path: []const u8,
 };
 
+/// Host capability and cache summary returned by `hostInfo`.
+///
+/// The result owns `backends` and any resolved cache-root paths. Release it with
+/// `deinitHostInfo` using the same allocator passed to `hostInfo`.
 pub const HostInfo = struct {
     schema: []const u8 = platform.host_info_schema,
     schema_version: u32 = platform.host_info_schema_version,
@@ -60,19 +76,27 @@ pub const PathFact = struct {
     source: []const u8,
 };
 
+/// Rootfs storage policy used when packing a spore into a bundle.
 pub const RootfsBundlePolicy = enum {
+    /// Include rootfs bytes so the bundle can be unpacked without the original cache.
     exact_bytes,
+    /// Include only rootfs metadata; unpacking requires an already-populated cache.
     metadata_only,
 };
 
+/// Inclusive bundle child range.
 pub const ChildRange = struct {
     start: u32,
     end: u32,
 };
 
+/// Options for read-only bundle inspection.
 pub const InspectBundleOptions = struct {
+    /// Local path or remote reference understood by SporeVM's bundle resolver.
     source: []const u8,
+    /// Optional child id to summarize.
     child_id: ?[]const u8 = null,
+    /// Optional child range to summarize.
     child_range: ?ChildRange = null,
 };
 
@@ -110,6 +134,10 @@ pub const OutputEvent = run_mod.OutputEvent;
 pub const ExitEvent = run_mod.ExitEvent;
 pub const FailureEvent = run_mod.FailureEvent;
 
+/// Low-level VM run options.
+///
+/// Use this when the caller already has an explicit kernel and rootfs/disk
+/// inputs. For CLI-like image/rootfs setup, use `runManaged`.
 pub const RunOptions = struct {
     backend: Backend = .auto,
     kernel_path: []const u8,
@@ -117,6 +145,7 @@ pub const RunOptions = struct {
     rootfs_path: ?[]const u8 = null,
     rootfs: ?Rootfs = null,
     disk: ?Disk = null,
+    /// Guest command and arguments. The first element is the executable.
     command: []const []const u8,
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
@@ -130,15 +159,22 @@ pub const RunOptions = struct {
     network: NetworkMode = .disabled,
     network_policy: NetworkPolicy = .{},
     spore_executable: []const u8 = "spore",
+    /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
 };
 
+/// CLI-like fresh run options.
+///
+/// `runManaged` resolves default kernel/initrd assets and can materialize an OCI
+/// image reference before booting. It takes `std.process.Init` because this setup
+/// path may spawn helper tools and read the process environment.
 pub const ManagedRunOptions = struct {
     backend: Backend = .auto,
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
+    /// Guest command and arguments. The first element is the executable.
     command: []const []const u8,
     memory: MemoryConfig = .{},
     vcpus: u32 = 1,
@@ -150,12 +186,19 @@ pub const ManagedRunOptions = struct {
     network: NetworkMode = .disabled,
     network_policy: NetworkPolicy = .{},
     spore_executable: []const u8 = "spore",
+    /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
 };
 
+/// Run a command from a captured spore directory.
+///
+/// This is the product API for `spore run --from`: it reads the manifest,
+/// restores machine/rootfs/disk policy from the capture, then executes a new
+/// guest command.
 pub const RunFromSporeOptions = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
+    /// Guest command and arguments. The first element is the executable.
     command: []const []const u8,
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
@@ -164,22 +207,30 @@ pub const RunFromSporeOptions = struct {
     capture_trigger: CaptureTrigger = .exit,
     continue_after_capture: bool = false,
     spore_executable: []const u8 = "spore",
+    /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
 };
 
+/// Resume a captured spore to its recorded continuation point.
 pub const ResumeOptions = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
     spore_executable: []const u8 = "spore",
+    /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
 };
 
+/// Options for creating child spores from a parent spore.
 pub const ForkOptions = struct {
     parent_dir: []const u8,
     out_dir: []const u8,
     count: usize,
 };
 
+/// Result returned by `fork`.
+///
+/// `first_child` and `last_child` are owned and must be released with
+/// `deinitForkResult`.
 pub const ForkResult = struct {
     parent: []const u8,
     out_dir: []const u8,
@@ -191,6 +242,7 @@ pub const ForkResult = struct {
     last_child: []const u8,
 };
 
+/// Options for packing a spore directory into a portable bundle.
 pub const PackOptions = struct {
     spore_dir: []const u8,
     out_dir: []const u8,
@@ -199,6 +251,9 @@ pub const PackOptions = struct {
     rootfs_policy: RootfsBundlePolicy = .exact_bytes,
 };
 
+/// Result returned by `pack`.
+///
+/// `bundle_digest` is owned and must be released with `deinitPackResult`.
 pub const PackResult = struct {
     source: []const u8,
     out_dir: []const u8,
@@ -212,6 +267,7 @@ pub const PackResult = struct {
     child_count: usize = 0,
 };
 
+/// Options for unpacking a bundle into a spore directory.
 pub const UnpackOptions = struct {
     bundle_dir: []const u8,
     out_dir: []const u8,
@@ -220,6 +276,10 @@ pub const UnpackOptions = struct {
     allow_metadata_only_rootfs: bool = false,
 };
 
+/// Result returned by `unpack`.
+///
+/// `bundle_digest` and `selected_child`, when present, are owned and must be
+/// released with `deinitUnpackResult`.
 pub const UnpackResult = struct {
     bundle: []const u8,
     out_dir: []const u8,
@@ -233,6 +293,7 @@ pub const UnpackResult = struct {
     selected_child: ?[]const u8 = null,
 };
 
+/// Options for pushing a bundle to a remote destination.
 pub const PushOptions = struct {
     bundle_dir: []const u8,
     destination: []const u8,
@@ -240,6 +301,9 @@ pub const PushOptions = struct {
     aws_executable: []const u8 = "aws",
 };
 
+/// Result returned by `push`.
+///
+/// `bundle_digest` is owned and must be released with `deinitPushResult`.
 pub const PushResult = struct {
     source: []const u8,
     destination: []const u8,
@@ -249,6 +313,7 @@ pub const PushResult = struct {
     uploaded_bytes: u64,
 };
 
+/// Options for pulling a bundle into a local spore directory.
 pub const PullOptions = struct {
     source: []const u8,
     out_dir: []const u8,
@@ -260,6 +325,7 @@ pub const PullOptions = struct {
     aws_executable: []const u8 = "aws",
 };
 
+/// Platform summary returned by `inspectSpore`.
 pub const SporePlatformSummary = struct {
     arch: []const u8,
     cpu_profile: []const u8,
@@ -271,6 +337,9 @@ pub const SporePlatformSummary = struct {
     counter_frequency_hz: u64,
 };
 
+/// Manifest summary returned by `inspectSpore`.
+///
+/// Owned string fields must be released with `deinitSporeInspectResult`.
 pub const SporeInspectResult = struct {
     version: u32,
     platform: SporePlatformSummary,
@@ -282,6 +351,10 @@ pub const SporeInspectResult = struct {
     gic_kind: []const u8,
 };
 
+/// Return host facts, backend availability, and cache roots.
+///
+/// The caller owns returned slices and optional paths. Call `deinitHostInfo`
+/// with the same allocator when done.
 pub fn hostInfo(
     context: Context,
     allocator: std.mem.Allocator,
@@ -324,6 +397,7 @@ pub fn hostInfo(
     };
 }
 
+/// Release memory owned by a `HostInfo` result.
 pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
     allocator.free(info.backends);
     freePathFact(allocator, info.cache_roots.kernels);
@@ -332,6 +406,10 @@ pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
     freePathFact(allocator, info.cache_roots.runtime);
 }
 
+/// Inspect a spore manifest without resuming or mutating it.
+///
+/// Owned strings in the result must be released with
+/// `deinitSporeInspectResult`.
 pub fn inspectSpore(
     allocator: std.mem.Allocator,
     spore_dir: []const u8,
@@ -341,16 +419,23 @@ pub fn inspectSpore(
     return summarizeSpore(allocator, manifest.value);
 }
 
+/// Release memory owned by a `SporeInspectResult`.
 pub fn deinitSporeInspectResult(allocator: std.mem.Allocator, result: SporeInspectResult) void {
     allocator.free(result.platform.arch);
     allocator.free(result.platform.cpu_profile);
     if (result.memory_backing_kind) |kind| allocator.free(kind);
 }
 
+/// Map an internal Zig error to the stable failure classification used by
+/// machine output and run/resume event consumers.
 pub fn classifyFailure(err: anyerror) ClassifiedFailure {
     return run_mod.classifyFailure(err);
 }
 
+/// Boot a VM with explicit kernel/rootfs inputs and execute a guest command.
+///
+/// This call does not stream guest output to process stdout/stderr. Use
+/// `RunOptions.events` to observe lifecycle and output events.
 pub fn run(
     context: Context,
     allocator: std.mem.Allocator,
@@ -381,6 +466,9 @@ pub fn run(
     });
 }
 
+/// Resolve managed kernel/initrd/rootfs inputs, boot a VM, and execute a command.
+///
+/// This is the library form of the high-level `spore run` setup path.
 pub fn runManaged(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -427,6 +515,8 @@ pub fn runManaged(
     });
 }
 
+/// Restore machine inputs from an existing spore directory and execute a new
+/// guest command.
 pub fn runFromSpore(
     context: Context,
     allocator: std.mem.Allocator,
@@ -467,6 +557,7 @@ pub fn runFromSpore(
     });
 }
 
+/// Resume a captured spore to its recorded continuation point.
 pub fn resumeSpore(
     context: Context,
     allocator: std.mem.Allocator,
@@ -480,6 +571,9 @@ pub fn resumeSpore(
     });
 }
 
+/// Fork a parent spore into multiple child spores.
+///
+/// Owned strings in the result must be released with `deinitForkResult`.
 pub fn fork(
     context: Context,
     allocator: std.mem.Allocator,
@@ -503,11 +597,15 @@ pub fn fork(
     };
 }
 
+/// Release memory owned by a `ForkResult`.
 pub fn deinitForkResult(allocator: std.mem.Allocator, result: ForkResult) void {
     allocator.free(result.first_child);
     allocator.free(result.last_child);
 }
 
+/// Pack a spore directory into a portable bundle.
+///
+/// Owned strings in the result must be released with `deinitPackResult`.
 pub fn pack(
     context: Context,
     allocator: std.mem.Allocator,
@@ -538,10 +636,14 @@ pub fn pack(
     };
 }
 
+/// Release memory owned by a `PackResult`.
 pub fn deinitPackResult(allocator: std.mem.Allocator, result: PackResult) void {
     allocator.free(result.bundle_digest);
 }
 
+/// Unpack a bundle into a spore directory.
+///
+/// Owned strings in the result must be released with `deinitUnpackResult`.
 pub fn unpack(
     context: Context,
     allocator: std.mem.Allocator,
@@ -572,11 +674,15 @@ pub fn unpack(
     };
 }
 
+/// Release memory owned by an `UnpackResult`.
 pub fn deinitUnpackResult(allocator: std.mem.Allocator, result: UnpackResult) void {
     allocator.free(result.bundle_digest);
     if (result.selected_child) |child| allocator.free(child);
 }
 
+/// Push a bundle to a remote destination.
+///
+/// Owned strings in the result must be released with `deinitPushResult`.
 pub fn push(
     context: Context,
     allocator: std.mem.Allocator,
@@ -599,10 +705,15 @@ pub fn push(
     };
 }
 
+/// Release memory owned by a `PushResult`.
 pub fn deinitPushResult(allocator: std.mem.Allocator, result: PushResult) void {
     allocator.free(result.bundle_digest);
 }
 
+/// Inspect bundle metadata without materializing a child spore.
+///
+/// Owned strings and child summaries must be released with
+/// `deinitInspectBundleResult`.
 pub fn inspectBundle(
     allocator: std.mem.Allocator,
     options: InspectBundleOptions,
@@ -614,10 +725,15 @@ pub fn inspectBundle(
     });
 }
 
+/// Release memory owned by an `InspectBundleResult`.
 pub fn deinitInspectBundleResult(allocator: std.mem.Allocator, result: InspectBundleResult) void {
     contracts.deinitInspectBundleResult(allocator, result);
 }
 
+/// Pull a bundle into a local spore directory.
+///
+/// The returned contract is owned by the caller and must be released with
+/// `deinitPullResult`.
 pub fn pull(
     context: Context,
     allocator: std.mem.Allocator,
@@ -641,6 +757,7 @@ pub fn pull(
     });
 }
 
+/// Release memory owned by a `PullResult`.
 pub fn deinitPullResult(allocator: std.mem.Allocator, result: PullResult) void {
     contracts.deinitPullResult(allocator, result);
 }
