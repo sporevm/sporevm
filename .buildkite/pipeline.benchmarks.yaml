@@ -30,7 +30,10 @@ steps:
         --include "*/results.jsonl" \
         --include "*/summary.json" \
         --include "*/logs/*" \
-        --include "*/rootfs-cache/*.json"
+        --include "*/rootfs-cache/*.json" \
+        --exclude "*/work/*" \
+        --exclude "*/bundle-cache/*" \
+        --exclude "*/rootfs-cache/cas/*"
     agents:
       queue: cleanroom-mac
 
@@ -65,6 +68,9 @@ steps:
         --include "*/results.jsonl" \
         --include "*/summary.json" \
         --include "*/logs/*" \
-        --include "*/rootfs-cache/*.json"
+        --include "*/rootfs-cache/*.json" \
+        --exclude "*/work/*" \
+        --exclude "*/bundle-cache/*" \
+        --exclude "*/rootfs-cache/cas/*"
     agents:
       queue: cleanroom-linux-arm64
