@@ -249,20 +249,28 @@ verified before use.
 
 ## Named lifecycle
 
-Named VM lifecycle commands are available on supported backends:
+Named VM lifecycle is stable on supported HVF/KVM backends:
 
 ```bash
 export SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
 
 spore create bench-1 --image docker.io/library/alpine:3.20
 spore exec bench-1 -- /bin/echo hi
+spore suspend bench-1 --out bench-1.spore
+spore resume bench-1.spore --name bench-2
 spore ls
-spore rm bench-1
+spore rm bench-2
 ```
 
-Monitor processes run with a denied-child-exec jail on macOS and Linux. The
-broader lifecycle surface remains experimental while disk-backed lifecycle
-suspend/resume and jail policy mature.
+Machine callers can use `spore --json create`, `spore --json suspend`,
+`spore --json resume`, `spore --json ls`, and `spore --json rm` for structured
+lifecycle state. `spore exec` forwards guest stdout and stderr as workload
+streams.
+
+Monitor processes run with a denied-child-exec jail on macOS and Linux. Named
+checkpoint lifecycle supports diskless VMs and image-created writable rootfs
+state; explicit `--rootfs` path checkpoints still fail closed because they do
+not carry portable immutable-rootfs identity.
 
 ## What 1.0 supports
 
@@ -276,6 +284,8 @@ suspend/resume and jail policy mature.
 - Managed kernel download and verification for the default run path.
 - Spore-managed guest networking for DNS, HTTP/HTTPS, persisted egress policy,
   and hard-floor egress denial.
+- Named lifecycle `create`, `exec`, `suspend`, `resume`, `ls`, and `rm` on
+  supported HVF/KVM backends.
 
 Known limits:
 
@@ -286,7 +296,8 @@ Known limits:
   user contract.
 - General block-device state is out of scope. Rootfs-bound writable state is
   represented as sealed disk layers.
-- Named lifecycle monitor commands are available on supported HVF/KVM backends.
+- Explicit `spore create --rootfs PATH` lifecycle VMs cannot be suspended into
+  portable disk-backed spores; use `--image` when checkpointing rootfs state.
 - SporeVM is a VMM isolation boundary, but it does not claim hardened
   public-cloud multi-tenant isolation.
 

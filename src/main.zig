@@ -36,7 +36,7 @@ const usage =
     \\                      Execute a command in a named VM
     \\  rm NAME             Remove a named VM
     \\  suspend NAME --out DIR
-    \\                      Checkpoint a diskless named VM into a spore
+    \\                      Checkpoint a named VM into a spore
     \\  ls                  List named VMs in the local runtime registry
     \\  version             Print the spore version
     \\  host-info           Print this host's platform facts
@@ -126,18 +126,22 @@ fn runCommand(
         try spore_internal.run.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "resume")) {
         if (wantsNamedResume(command_args)) {
-            try spore_internal.lifecycle.resumeCli(init, command_args, stdout);
+            try spore_internal.lifecycle.resumeCli(init, command_args, stdout, stderr, mode);
         } else {
+            if (mode == .json) {
+                const message = "spore --json resume requires named lifecycle mode with --name; use --events jsonl for product resume";
+                exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            }
             try spore_internal.resume_cmd.cli(init, command_args, stdout);
         }
     } else if (std.mem.eql(u8, command, "create")) {
-        try spore_internal.lifecycle.createCli(init, command_args, stdout);
+        try spore_internal.lifecycle.createCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "exec")) {
         try spore_internal.lifecycle.execCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "rm")) {
-        try spore_internal.lifecycle.rmCli(init, command_args, stdout);
+        try spore_internal.lifecycle.rmCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "suspend")) {
-        try spore_internal.lifecycle.suspendCli(init, command_args, stdout);
+        try spore_internal.lifecycle.suspendCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "ls")) {
         try spore_internal.lifecycle.lsCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "monitor")) {
@@ -270,6 +274,10 @@ fn parseGlobalArgs(args: []const []const u8) GlobalArgs {
 
 fn supportsJson(command: []const u8) bool {
     return std.mem.eql(u8, command, "system") or
+        std.mem.eql(u8, command, "create") or
+        std.mem.eql(u8, command, "rm") or
+        std.mem.eql(u8, command, "resume") or
+        std.mem.eql(u8, command, "suspend") or
         std.mem.eql(u8, command, "host-info") or
         std.mem.eql(u8, command, "inspect") or
         std.mem.eql(u8, command, "ls") or
@@ -821,6 +829,15 @@ test "rootfs bundle policy parser accepts exact and metadata-only spellings" {
 test "resume dispatch can distinguish product and named lifecycle modes" {
     try std.testing.expect(!wantsNamedResume(&.{"spore-dir"}));
     try std.testing.expect(wantsNamedResume(&.{ "spore-dir", "--name", "bench-1" }));
+}
+
+test "stable lifecycle commands support global json where output is one document" {
+    try std.testing.expect(supportsJson("create"));
+    try std.testing.expect(supportsJson("ls"));
+    try std.testing.expect(supportsJson("rm"));
+    try std.testing.expect(supportsJson("resume"));
+    try std.testing.expect(supportsJson("suspend"));
+    try std.testing.expect(!supportsJson("exec"));
 }
 
 test "global args parse debug before command" {
