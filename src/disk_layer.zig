@@ -6,6 +6,7 @@
 //! immutable rootfs base.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const block_source = @import("block_source.zig");
 const chunk = @import("chunk.zig");
 const cow_disk = @import("cow_disk.zig");
@@ -612,28 +613,38 @@ fn writeAllFd(fd: std.c.fd_t, data: []const u8) Error!void {
 }
 
 fn readFileAll(allocator: std.mem.Allocator, path: [:0]const u8, max: usize) Error![]u8 {
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.IoFailed;
     defer _ = std.c.close(fd);
 
-    const cur = std.c.lseek(fd, 0, std.c.SEEK.CUR);
-    if (cur < 0) return error.IoFailed;
-    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
-    if (end < 0) return error.IoFailed;
-    if (std.c.lseek(fd, cur, std.c.SEEK.SET) < 0) return error.IoFailed;
-    if (end < 0 or end > std.math.maxInt(usize)) return error.BadChunk;
-    const size: usize = @intCast(end);
+    const size = try fstatRegularSize(fd);
     if (size > max) return error.BadChunk;
 
     const buf = try allocator.alloc(u8, size);
     errdefer allocator.free(buf);
-    var done: usize = 0;
-    while (done < size) {
-        const n = std.c.read(fd, buf.ptr + done, size - done);
-        if (n <= 0) return error.ShortRead;
-        done += @intCast(n);
-    }
+    try readExact(fd, buf, 0);
     return buf;
+}
+
+fn fstatRegularSize(fd: std.c.fd_t) Error!usize {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var statx_buf: linux.Statx = undefined;
+        const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{
+            .TYPE = true,
+            .MODE = true,
+            .SIZE = true,
+        }, &statx_buf);
+        if (linux.errno(rc) != .SUCCESS) return error.IoFailed;
+        if (!linux.S.ISREG(statx_buf.mode)) return error.BadChunk;
+        return std.math.cast(usize, statx_buf.size) orelse error.BadChunk;
+    } else {
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &stat) != 0) return error.IoFailed;
+        if (!std.c.S.ISREG(stat.mode)) return error.BadChunk;
+        if (stat.size < 0) return error.IoFailed;
+        return std.math.cast(usize, stat.size) orelse error.BadChunk;
+    }
 }
 
 fn readExact(fd: std.c.fd_t, buf: []u8, offset: u64) Error!void {
@@ -850,6 +861,31 @@ test "sealing rejects corrupt preexisting objects" {
     try writeFileAll(object_path, &corrupt);
 
     try std.testing.expectError(error.BadChunk, sealCowDisk(arena, dir, &disk));
+}
+
+test "content-addressed disk reads reject unsafe paths" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    try ensureStoreDirs(arena, dir);
+
+    const object_data = [_]u8{0x42} ** 128;
+    const object_ref = try digestRefAlloc(arena, &object_data);
+    const object_path = try diskObjectPath(arena, dir, object_ref);
+    if (std.c.mkdir(object_path.ptr, 0o755) != 0) return error.IoFailed;
+    var target: [object_data.len]u8 = undefined;
+    try std.testing.expectError(error.BadChunk, readDiskObject(arena, dir, object_ref, &target));
+
+    const layer_bytes = "{}";
+    const layer_ref = try digestRefAlloc(arena, layer_bytes);
+    const layer_path = try diskLayerPath(arena, dir, layer_ref);
+    const symlink_target = try pathZ(arena, "{s}/layer-target.json", .{dir});
+    try writeFileAll(symlink_target, layer_bytes);
+    if (std.c.symlink(symlink_target.ptr, layer_path.ptr) != 0) return error.SkipZigTest;
+    try std.testing.expectError(error.IoFailed, loadLayer(arena, dir, layer_ref));
 }
 
 test "corrupt disk objects and layer indexes fail closed" {

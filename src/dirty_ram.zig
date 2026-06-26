@@ -5,6 +5,7 @@
 //! same-host RAM backing file.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const chunk = @import("chunk.zig");
 const spore = @import("spore.zig");
 
@@ -524,7 +525,10 @@ fn writeFileAll(path: [:0]const u8, data: []const u8) !void {
 fn writeFileAllIfMissing(path: [:0]const u8, data: []const u8) !void {
     const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(c_uint, 0o644));
     if (fd < 0) {
-        if (std.c.errno(fd) == .EXIST) return;
+        if (std.c.errno(fd) == .EXIST) {
+            try verifyExistingFile(path, data);
+            return;
+        }
         return error.IoFailed;
     }
     defer _ = std.c.close(fd);
@@ -533,6 +537,48 @@ fn writeFileAllIfMissing(path: [:0]const u8, data: []const u8) !void {
         const n = std.c.write(fd, data.ptr + done, data.len - done);
         if (n <= 0) return error.IoFailed;
         done += @intCast(n);
+    }
+}
+
+fn verifyExistingFile(path: [:0]const u8, expected: []const u8) !void {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.BadChunk;
+    defer _ = std.c.close(fd);
+
+    const size = try fstatRegularSize(fd);
+    if (size != expected.len) return error.BadChunk;
+
+    var buf: [8192]u8 = undefined;
+    var done: usize = 0;
+    while (done < expected.len) {
+        const len = @min(buf.len, expected.len - done);
+        const offset = std.math.cast(std.c.off_t, done) orelse return error.BadChunk;
+        const n = std.c.pread(fd, buf[0..len].ptr, len, offset);
+        if (n <= 0) return error.BadChunk;
+        const read_len: usize = @intCast(n);
+        if (!std.mem.eql(u8, buf[0..read_len], expected[done..][0..read_len])) return error.BadChunk;
+        done += read_len;
+    }
+}
+
+fn fstatRegularSize(fd: std.c.fd_t) !usize {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var statx_buf: linux.Statx = undefined;
+        const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{
+            .TYPE = true,
+            .MODE = true,
+            .SIZE = true,
+        }, &statx_buf);
+        if (linux.errno(rc) != .SUCCESS) return error.IoFailed;
+        if (!linux.S.ISREG(statx_buf.mode)) return error.BadChunk;
+        return std.math.cast(usize, statx_buf.size) orelse error.BadChunk;
+    } else {
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &stat) != 0) return error.IoFailed;
+        if (!std.c.S.ISREG(stat.mode)) return error.BadChunk;
+        if (stat.size < 0) return error.IoFailed;
+        return std.math.cast(usize, stat.size) orelse error.BadChunk;
     }
 }
 
@@ -670,6 +716,28 @@ test "dirty RAM sealer seeds zero-elided chunks and finalizes backing" {
 
     const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, manifest.chunks[0].? });
     try std.testing.expectEqual(@as(c_int, 0), std.c.access(chunk_path, 0));
+}
+
+test "dirty RAM sealer rejects corrupt preexisting chunks" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, spore.chunk_size);
+    @memset(ram, 0x5A);
+    ram[ram.len - 1] = 0xA5;
+
+    try ensureDir(try pathZ(arena, "{s}/chunks", .{dir}));
+    const id = chunk.ChunkId.fromContents(ram);
+    const hex = id.toHex();
+    const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, hex[0..] });
+    const corrupt = try arena.dupe(u8, ram);
+    corrupt[0] ^= 0xFF;
+    try writeFileAll(chunk_path, corrupt);
+
+    try std.testing.expectError(error.BadChunk, Sealer.start(arena, .{ .dir = dir, .ram = ram }));
 }
 
 test "dirty RAM sealer can seed only known populated ranges" {
