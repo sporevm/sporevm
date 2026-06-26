@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-24
+last_reviewed: 2026-06-26
 related_plans:
   - buildkite/cleanroom: docs/plans/sandbox-suspend-wake.md
   - docs/plans/machine-interfaces.md
@@ -125,7 +125,7 @@ contract.
 | Slice 1: KVM boot | Complete for the foundation target | Continue using KVM hardware smokes for regressions. |
 | Slice 2: HVF boot | Complete for the foundation target | Continue using Apple Silicon smokes for regressions. |
 | Product run bridge | Landed | See `docs/plans/run-bridge.md`; future OCI/writable policy is out of this plan. |
-| Named lifecycle | Experimental; macOS sandbox and Linux seccomp deny child process execution; local HVF landed; KVM create/exec/ls/rm parity landed | Broader jail policy before stable lifecycle support; speed work including local image ref caching, KVM suspend/resume evidence, and disk-backed lifecycle resume; see `docs/plans/lifecycle-monitor.md`. |
+| Named lifecycle | Stable for local `create`/`exec`/`suspend`/`resume --name`/`ls`/`rm` on supported HVF/KVM backends; monitor jail denies child process execution on macOS and Linux | Continue speed work in `docs/plans/lifecycle-monitor.md`; explicit `--rootfs` path lifecycle checkpoints remain non-portable and fail closed. |
 | libspore shared core | Active | The Zig module is published as `libspore`; `src/api.zig` is the product surface, including run/resume with typed events. Backend, device, storage, daemon, and CLI modules are not re-exported. |
 | Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Keep writable disk product smoke coverage as regression evidence. |
 | Slice 4: fork and generation protocol | Complete for correctness | `/run/sporevm` is the live metadata contract; keep fan-out identity smokes as regression coverage. |
@@ -328,9 +328,11 @@ SporeVM is an isolation boundary written in Zig. The defensive posture is:
 - fail-closed platform and artifact checks;
 - fuzz targets with new attacker-influenced parsers;
 - ReleaseSafe shipping builds;
-- monitor lifecycle available on supported backends; macOS sandbox and Linux
-  seccomp deny monitor child process execution, with broader jail policy still
-  before stable lifecycle support.
+- stable monitor lifecycle scope is local
+  `create`/`exec`/`suspend`/`resume --name`/`ls`/`rm` on supported backends;
+  macOS sandbox and Linux seccomp deny monitor child process execution, while
+  explicit `--rootfs` path lifecycle checkpoints fail closed because they lack
+  portable immutable-rootfs identity.
 
 `SECURITY.md` is the attack-surface inventory and must be updated in the same
 change that widens parsing, device, manifest, rootfs, bundle, or control-socket
@@ -367,9 +369,8 @@ inputs.
 - Local `spore pull file://...` fully materializes a selected child before
   product resume; remote and lazy pull sources must keep the same verified
   content-source boundary.
-- `spore run` is one-shot; experimental named lifecycle uses
-  `create`/`exec`/`rm`/`ls` plus monitor-backed suspend/resume on supported
-  backends.
+- `spore run` is one-shot; stable named lifecycle uses
+  `create`/`exec`/`suspend`/`resume --name`/`rm`/`ls` on supported backends.
 - Product capture is `spore run --capture`, not a separate capture verb.
 - Same-host fan-out must use explicit RAM-backing transfer and private mappings
   before claiming high-concurrency memory efficiency.

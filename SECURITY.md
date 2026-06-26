@@ -48,11 +48,13 @@ fuzz targets from the slice that introduces it:
   parsed. A malicious peer can deny service, never inject state.
 - **Fail closed.** Unknown manifest versions, unsatisfiable platform
   contracts, and unverifiable chunks are errors, never degraded behavior.
-- **The monitor is still experimental.** Named lifecycle commands are available
-  on supported backends. Monitor processes deny child process execution through
-  an embedded macOS sandbox profile or Linux seccomp filter, covered by
-  `mise run smoke:monitor-jail`. Broader syscall and filesystem policy remains
-  follow-up work before stable lifecycle support.
+- **The stable monitor scope is local named lifecycle.** `spore create`,
+  `spore exec`, `spore suspend`, `spore resume --name`, `spore ls`, and
+  `spore rm` are available on supported backends. Monitor processes deny child
+  process execution through an embedded macOS sandbox profile or Linux seccomp
+  filter, covered by `mise run smoke:monitor-jail`. Disk-backed named
+  checkpointing is limited to image-created VMs so the monitor can preserve
+  immutable-rootfs identity and sealed writable disk layers.
 - **The device model stays minimal.** Every device addition expands both the
   attack surface and the portability contract, and requires editing
   docs/plans/foundation.md.

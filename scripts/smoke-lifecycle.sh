@@ -89,6 +89,62 @@ rm_stdout="${workdir}/rm.stdout"
 rm_stderr="${workdir}/rm.stderr"
 ls_after_stdout="${workdir}/ls-after.stdout"
 ls_after_stderr="${workdir}/ls-after.stderr"
+json_rootfs_stdout="${workdir}/json-rootfs.stdout"
+json_rootfs_stderr="${workdir}/json-rootfs.stderr"
+json_image_stdout="${workdir}/json-image.stdout"
+json_image_stderr="${workdir}/json-image.stderr"
+
+if run_capture "${json_rootfs_stdout}" "${json_rootfs_stderr}" \
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" --json create "${vm_name}-missing-rootfs" --rootfs "${workdir}/missing.ext4"; then
+  die "spore --json create accepted a missing rootfs"
+else
+  status=$?
+  [[ "${status}" == "22" ]] || {
+    cat "${json_rootfs_stderr}" >&2 || true
+    die "spore --json create missing rootfs exited ${status}, expected 22"
+  }
+fi
+python3 - "${json_rootfs_stdout}" "${json_rootfs_stderr}" <<'PY'
+import json
+import sys
+
+stdout_path, stderr_path = sys.argv[1], sys.argv[2]
+if open(stdout_path, "rb").read():
+    raise SystemExit("spore --json create missing rootfs wrote stdout")
+with open(stderr_path, "r", encoding="utf-8") as fh:
+    payload = json.load(fh)
+
+err = payload.get("error", {})
+if payload.get("schema") != "spore.error.v1" or err.get("code") != "object.not_found" or err.get("source") != "create":
+    raise SystemExit("spore --json create missing rootfs did not emit the stable error envelope")
+PY
+
+if run_capture "${json_image_stdout}" "${json_image_stderr}" \
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" --json create "${vm_name}-bad-image" --image alpine:3.20; then
+  die "spore --json create accepted an image ref without registry"
+else
+  status=$?
+  [[ "${status}" == "2" ]] || {
+    cat "${json_image_stderr}" >&2 || true
+    die "spore --json create bad image exited ${status}, expected 2"
+  }
+fi
+python3 - "${json_image_stdout}" "${json_image_stderr}" <<'PY'
+import json
+import sys
+
+stdout_path, stderr_path = sys.argv[1], sys.argv[2]
+if open(stdout_path, "rb").read():
+    raise SystemExit("spore --json create bad image wrote stdout")
+with open(stderr_path, "r", encoding="utf-8") as fh:
+    payload = json.load(fh)
+
+err = payload.get("error", {})
+if payload.get("schema") != "spore.error.v1" or err.get("code") != "usage.invalid_argument" or err.get("source") != "create":
+    raise SystemExit("spore --json create bad image did not emit the stable error envelope")
+PY
 
 if run_capture "${create_stdout}" "${create_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" \

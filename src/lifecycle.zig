@@ -72,7 +72,7 @@ const suspend_usage =
     \\  spore suspend NAME --out DIR
     \\
     \\Options:
-    \\  --out DIR              Write a diskless spore checkpoint to DIR
+    \\  --out DIR              Write a spore checkpoint to DIR
     \\  -h, --help             Show this help
     \\
 ;
@@ -131,6 +131,8 @@ pub const Spec = struct {
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
+    rootfs: ?spore.Rootfs = null,
+    disk: ?spore.Disk = null,
     image_ref: ?[]const u8 = null,
     resume_dir: ?[]const u8 = null,
     memory: memory_config.Config = .{},
@@ -189,6 +191,21 @@ pub const ListEntry = struct {
     pid: ?i64 = null,
 };
 
+pub const lifecycle_schema = "spore.lifecycle.v1";
+pub const lifecycle_schema_version: u32 = 1;
+
+pub const LifecycleResult = struct {
+    schema: []const u8 = lifecycle_schema,
+    schema_version: u32 = lifecycle_schema_version,
+    action: []const u8,
+    name: []const u8,
+    state: []const u8,
+    pid: ?i64 = null,
+    control_socket_path: ?[]const u8 = null,
+    console_log_path: ?[]const u8 = null,
+    spore_dir: ?[]const u8 = null,
+};
+
 const CreateOptions = struct {
     spec: Spec,
 };
@@ -208,34 +225,68 @@ const ResumeOptions = struct {
     name: []const u8,
 };
 
-pub fn createCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+pub fn createCli(
+    init: std.process.Init,
+    args: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) !void {
     const start_ms = monotonicMs();
     if (wantsHelp(args)) {
+        if (mode == .json) {
+            exitLifecycleCliError(
+                init.arena.allocator(),
+                stderr,
+                mode,
+                machine_output.usageInvalidArgument("spore --json create does not support help output", "create"),
+                "spore --json create does not support help output",
+            );
+        }
         try stdout.writeAll(create_usage);
         return;
     }
-    if (args.len == 0) usageExit(create_usage);
+    if (args.len == 0) {
+        exitLifecycleCliError(
+            init.arena.allocator(),
+            stderr,
+            mode,
+            machine_output.usageMissingArgument("usage: spore create NAME [options]", "create"),
+            create_usage,
+        );
+    }
 
     const allocator = init.arena.allocator();
-    const parsed = try parseCreateArgs(args);
+    const parsed = try parseCreateArgs(args, allocator, stderr, mode);
     const parsed_ms = monotonicMs();
     var spec = parsed.spec;
     const paths = try cliPaths(init, allocator, "create", spec.name);
     const paths_ms = monotonicMs();
     if (!monitorBackendSupported(spec.backend)) {
-        std.debug.print("spore create: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64\n", .{});
-        std.process.exit(2);
+        const message = "spore create: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "create"), message);
     }
     const state = try classifyVmState(allocator, init.io, paths, pidAlive);
     if (state != .absent) {
-        std.debug.print("spore create: VM already exists or has stale state: {s}\n", .{spec.name});
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore create: VM already exists or has stale state: {s}", .{spec.name});
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
     }
     const state_checked_ms = monotonicMs();
-    const resolved_rootfs = try run_mod.resolveRootfsInput(init, allocator, spec.rootfs_path, spec.image_ref, "create");
+    const rootfs_resolution = try run_mod.resolveRootfsInputDetailedResult(init, allocator, .{
+        .rootfs_path = spec.rootfs_path,
+        .image_ref = spec.image_ref,
+        .command_name = "create",
+        .record_artifact = spec.image_ref != null,
+    });
+    const resolved_rootfs = switch (rootfs_resolution) {
+        .resolved => |rootfs| rootfs,
+        .failure => |failure| exitLifecycleCliError(allocator, stderr, mode, failure, failure.message),
+    };
     const rootfs_resolved_ms = monotonicMs();
-    spec.rootfs_path = if (resolved_rootfs) |path| try std.fs.path.resolve(allocator, &.{path}) else null;
+    spec.rootfs_path = if (resolved_rootfs.path) |path| try std.fs.path.resolve(allocator, &.{path}) else null;
+    spec.rootfs = resolved_rootfs.rootfs;
     const rootfs_abspath_ms = monotonicMs();
+    if (spec.rootfs != null) try writeSpec(allocator, init.io, paths, spec);
     try spawnMonitor(init, allocator, spec);
     const monitor_spawned_ms = monotonicMs();
     try waitForReady("create", allocator, init.io, paths, spec.timeout_ms);
@@ -250,6 +301,18 @@ pub fn createCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
         .wait_ready_ms = ready_ms - monitor_spawned_ms,
         .total_ms = ready_ms - start_ms,
     }) catch {};
+    if (mode == .json) {
+        var ready = try readReady(allocator, init.io, paths);
+        defer ready.deinit();
+        try machine_output.writeJson(allocator, stdout, LifecycleResult{
+            .action = "created",
+            .name = spec.name,
+            .state = "ready",
+            .pid = ready.value.pid,
+            .control_socket_path = ready.value.control_socket_path,
+            .console_log_path = ready.value.console_log_path,
+        });
+    }
 }
 
 pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
@@ -278,64 +341,113 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     if (code != 0) std.process.exit(code);
 }
 
-pub fn rmCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+pub fn rmCli(
+    init: std.process.Init,
+    args: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) !void {
     if (wantsHelp(args)) {
+        if (mode == .json) {
+            exitLifecycleCliError(
+                init.arena.allocator(),
+                stderr,
+                mode,
+                machine_output.usageInvalidArgument("spore --json rm does not support help output", "rm"),
+                "spore --json rm does not support help output",
+            );
+        }
         try stdout.writeAll(rm_usage);
         return;
     }
-    const name = parseRmArgs(args);
     const allocator = init.arena.allocator();
+    const name = parseRmArgs(args, allocator, stderr, mode);
     const paths = try cliPaths(init, allocator, "rm", name);
     const state = try classifyVmState(allocator, init.io, paths, pidAlive);
+    var removed_pid: ?i64 = null;
     switch (state) {
         .absent => {
-            std.debug.print("spore rm: VM not found: {s}\n", .{name});
-            std.process.exit(2);
+            const message = allocLifecycleMessage(allocator, "spore rm: VM not found: {s}", .{name});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "rm"), message);
         },
         .ready => {
             var ready = lifecycleReadyOrExit(allocator, init.io, "rm", paths);
             defer ready.deinit();
+            removed_pid = ready.value.pid;
             _ = sendShutdownRequest(allocator, init.io, ready.value.control_socket_path) catch {};
             waitForPidExit(ready.value.pid, 5_000);
             try Io.Dir.cwd().deleteTree(init.io, paths.vm_dir);
         },
-        .incomplete, .stale => try Io.Dir.cwd().deleteTree(init.io, paths.vm_dir),
+        .incomplete, .stale => {
+            removed_pid = readPid(allocator, init.io, paths) catch null;
+            try Io.Dir.cwd().deleteTree(init.io, paths.vm_dir);
+        },
+    }
+    if (mode == .json) {
+        try machine_output.writeJson(allocator, stdout, LifecycleResult{
+            .action = "removed",
+            .name = name,
+            .state = "absent",
+            .pid = removed_pid,
+        });
     }
 }
 
-pub fn suspendCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+pub fn suspendCli(
+    init: std.process.Init,
+    args: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) !void {
     if (wantsHelp(args)) {
+        if (mode == .json) {
+            exitLifecycleCliError(
+                init.arena.allocator(),
+                stderr,
+                mode,
+                machine_output.usageInvalidArgument("spore --json suspend does not support help output", "suspend"),
+                "spore --json suspend does not support help output",
+            );
+        }
         try stdout.writeAll(suspend_usage);
         return;
     }
-    const parsed = parseSuspendArgs(args);
     const allocator = init.arena.allocator();
-    const out_dir = resolveNewOutputDir(allocator, init.io, "suspend", parsed.out_dir);
+    const parsed = parseSuspendArgs(args, allocator, stderr, mode);
+    const out_dir = resolveNewOutputDir(allocator, init.io, stderr, mode, "suspend", parsed.out_dir);
     const paths = try cliPaths(init, allocator, "suspend", parsed.name);
     const state = try classifyVmState(allocator, init.io, paths, pidAlive);
     if (state != .ready) {
-        std.debug.print("spore suspend: VM is not ready: {s} ({s})\n", .{ parsed.name, state.name() });
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore suspend: VM is not ready: {s} ({s})", .{ parsed.name, state.name() });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
     }
     var spec = readSpec(allocator, init.io, paths) catch {
-        std.debug.print("spore suspend: VM is not ready\n", .{});
-        std.process.exit(2);
+        const message = "spore suspend: VM is not ready";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
     };
     defer spec.deinit();
-    if (spec.value.rootfs_path != null or spec.value.image_ref != null) {
-        std.debug.print("spore suspend: disk-backed lifecycle suspend is not supported yet\n", .{});
-        std.process.exit(2);
+    if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
+        const message = "spore suspend: disk-backed lifecycle suspend requires an image-created VM";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
     }
-    var ready = lifecycleReadyOrExit(allocator, init.io, "suspend", paths);
+    var ready = readReady(allocator, init.io, paths) catch {
+        const message = "spore suspend: VM is not ready";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
+    };
     defer ready.deinit();
     const response = sendSuspendRequest(allocator, init.io, ready.value.control_socket_path, out_dir) catch |err| {
-        switch (err) {
-            error.MonitorUnavailable => std.debug.print("spore suspend: monitor is unavailable for VM: {s}\n", .{parsed.name}),
-            else => std.debug.print("spore suspend: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
-        }
-        std.process.exit(1);
+        const message = switch (err) {
+            error.MonitorUnavailable => allocLifecycleMessage(allocator, "spore suspend: monitor is unavailable for VM: {s}", .{parsed.name}),
+            else => allocLifecycleMessage(allocator, "spore suspend: monitor request failed for VM {s}: {s}", .{ parsed.name, @errorName(err) }),
+        };
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "suspend"), message);
     };
-    if (!try handleSuspendResponse(allocator, response)) std.process.exit(1);
+    if (try suspendResponseFailureMessage(allocator, response)) |response_message| {
+        const message = allocLifecycleMessage(allocator, "spore suspend: {s}", .{response_message});
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "suspend"), message);
+    }
     var cleanup_after_suspend = true;
     defer if (cleanup_after_suspend) {
         waitForPidExit(ready.value.pid, 5_000);
@@ -345,43 +457,69 @@ pub fn suspendCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
     cleanup_after_suspend = false;
     waitForPidExit(ready.value.pid, 5_000);
     try Io.Dir.cwd().deleteTree(init.io, paths.vm_dir);
+    if (mode == .json) {
+        try machine_output.writeJson(allocator, stdout, LifecycleResult{
+            .action = "suspended",
+            .name = parsed.name,
+            .state = "checkpointed",
+            .pid = ready.value.pid,
+            .spore_dir = out_dir,
+        });
+    }
 }
 
-pub fn resumeCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+pub fn resumeCli(
+    init: std.process.Init,
+    args: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) !void {
     if (wantsHelp(args)) {
+        if (mode == .json) {
+            exitLifecycleCliError(
+                init.arena.allocator(),
+                stderr,
+                mode,
+                machine_output.usageInvalidArgument("spore --json resume does not support help output", "resume"),
+                "spore --json resume does not support help output",
+            );
+        }
         try stdout.writeAll(resume_usage);
         return;
     }
-    const parsed = parseResumeArgs(args);
     const allocator = init.arena.allocator();
-    const spore_dir = resolveExistingSporeDir(allocator, init.io, "resume", parsed.spore_dir);
+    const parsed = parseResumeArgs(args, allocator, stderr, mode);
+    const spore_dir = resolveExistingSporeDir(allocator, init.io, stderr, mode, "resume", parsed.spore_dir);
     var manifest = spore.loadManifest(allocator, spore_dir) catch |err| {
-        std.debug.print("spore resume: invalid spore directory {s}: {s}\n", .{ spore_dir, @errorName(err) });
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore resume: invalid spore directory {s}: {s}", .{ spore_dir, @errorName(err) });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
     };
     defer manifest.deinit();
     if (manifest.value.network != null) {
-        std.debug.print("spore resume: named lifecycle networking is not supported yet; use spore run --from for one-shot network resumes\n", .{});
-        std.process.exit(2);
+        const message = "spore resume: named lifecycle networking is not supported yet; use spore run --from for one-shot network resumes";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
     }
-    if (manifest.value.devices.len != diskless_resume_device_count) {
-        std.debug.print("spore resume: disk-backed resume is not supported yet\n", .{});
-        std.process.exit(2);
+    const rootfs = try run_mod.resumeRootfsForRun(allocator, manifest.value);
+    const disk = try run_mod.resumeDiskForRun(allocator, manifest.value);
+    if (rootfs == null and manifest.value.devices.len != diskless_resume_device_count) {
+        const message = "spore resume: unsupported lifecycle device model";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
     }
     const memory = memoryFromManifest(manifest.value) catch {
-        std.debug.print("spore resume: invalid spore memory size\n", .{});
-        std.process.exit(2);
+        const message = "spore resume: invalid spore memory size";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
     };
 
     var lifecycle_spec = readSporeLifecycleSpec(allocator, init.io, spore_dir) catch |err| {
-        std.debug.print("spore resume: invalid lifecycle metadata: {s}\n", .{@errorName(err)});
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore resume: invalid lifecycle metadata: {s}", .{@errorName(err)});
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
     };
     defer if (lifecycle_spec) |*spec| spec.deinit();
     if (lifecycle_spec) |spec| {
-        if (spec.value.rootfs_path != null or spec.value.image_ref != null or spec.value.vcpus != 1) {
-            std.debug.print("spore resume: disk-backed or multi-vCPU lifecycle metadata is not supported yet\n", .{});
-            std.process.exit(2);
+        if (spec.value.vcpus != 1) {
+            const message = "spore resume: multi-vCPU lifecycle metadata is not supported yet";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
         }
     }
 
@@ -392,6 +530,8 @@ pub fn resumeCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
         .kernel_path = base.kernel_path,
         .initrd_path = base.initrd_path,
         .resume_dir = spore_dir,
+        .rootfs = rootfs,
+        .disk = disk,
         .memory = memory,
         .vcpus = 1,
         .guest_port = base.guest_port,
@@ -399,17 +539,31 @@ pub fn resumeCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
         .console_log_path = base.console_log_path,
     };
     if (!monitorBackendSupported(spec.backend)) {
-        std.debug.print("spore resume: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64\n", .{});
-        std.process.exit(2);
+        const message = "spore resume: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "resume"), message);
     }
     const paths = try cliPaths(init, allocator, "resume", spec.name);
     const state = try classifyVmState(allocator, init.io, paths, pidAlive);
     if (state != .absent) {
-        std.debug.print("spore resume: VM already exists or has stale state: {s}\n", .{spec.name});
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore resume: VM already exists or has stale state: {s}", .{spec.name});
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
     }
+    if (spec.rootfs != null or spec.disk != null) try writeSpec(allocator, init.io, paths, spec);
     try spawnMonitor(init, allocator, spec);
     try waitForReady("resume", allocator, init.io, paths, spec.timeout_ms);
+    if (mode == .json) {
+        var ready = try readReady(allocator, init.io, paths);
+        defer ready.deinit();
+        try machine_output.writeJson(allocator, stdout, LifecycleResult{
+            .action = "resumed",
+            .name = spec.name,
+            .state = "ready",
+            .pid = ready.value.pid,
+            .control_socket_path = ready.value.control_socket_path,
+            .console_log_path = ready.value.console_log_path,
+            .spore_dir = spore_dir,
+        });
+    }
 }
 
 pub fn lsCli(
@@ -688,58 +842,80 @@ fn emptyListEntries(allocator: std.mem.Allocator) ![]ListEntry {
     return allocator.alloc(ListEntry, 0);
 }
 
-fn parseCreateArgs(args: []const []const u8) !CreateOptions {
+fn parseCreateArgs(
+    args: []const []const u8,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) !CreateOptions {
     var name: ?[]const u8 = null;
     var spec = Spec{ .name = "" };
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--backend")) {
-            spec.backend = takeValue(args, &i, args[i]);
+            spec.backend = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
             if (!validBackend(spec.backend)) {
-                std.debug.print("--backend must be auto, hvf, or kvm\n", .{});
-                std.process.exit(2);
+                const message = "--backend must be auto, hvf, or kvm";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             }
         } else if (std.mem.eql(u8, args[i], "--kernel")) {
-            spec.kernel_path = takeValue(args, &i, args[i]);
+            spec.kernel_path = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--initrd")) {
-            spec.initrd_path = takeValue(args, &i, args[i]);
+            spec.initrd_path = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--rootfs")) {
-            spec.rootfs_path = takeValue(args, &i, args[i]);
+            spec.rootfs_path = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
-            spec.image_ref = takeValue(args, &i, args[i]);
+            spec.image_ref = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--memory")) {
-            spec.memory = memory_config.parseCliOrExit("spore create", takeValue(args, &i, args[i]));
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+            spec.memory = memory_config.parse(raw) catch |err| {
+                const message = allocLifecycleMessage(
+                    allocator,
+                    "spore create: --memory must be auto or a positive page-aligned size like 512mb or 16gb ({s})",
+                    .{@errorName(err)},
+                );
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            };
         } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
-            memory_config.rejectMemoryMiBFlag("spore create");
+            const message = "spore create: --memory-mib has been replaced by --memory";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
         } else if (std.mem.eql(u8, args[i], "--vcpus")) {
             const flag = args[i];
-            spec.vcpus = parseIntArg(u32, takeValue(args, &i, flag), flag);
+            spec.vcpus = parseIntArgLifecycleCli(u32, allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
         } else if (std.mem.eql(u8, args[i], "--guest-port")) {
             const flag = args[i];
-            spec.guest_port = parseIntArg(u32, takeValue(args, &i, flag), flag);
+            spec.guest_port = parseIntArgLifecycleCli(u32, allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
         } else if (std.mem.eql(u8, args[i], "--timeout-ms")) {
             const flag = args[i];
-            spec.timeout_ms = parseIntArg(u64, takeValue(args, &i, flag), flag);
+            spec.timeout_ms = parseIntArgLifecycleCli(u64, allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
         } else if (std.mem.eql(u8, args[i], "--console-log")) {
-            spec.console_log_path = takeValue(args, &i, args[i]);
+            spec.console_log_path = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            std.debug.print("unknown create argument: {s}\n\n{s}", .{ args[i], create_usage });
-            std.process.exit(2);
+            const message = allocLifecycleMessage(allocator, "unknown create argument: {s}", .{args[i]});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
         } else if (name == null) {
-            try validateNameOrExit("create", args[i]);
+            validateNameLifecycleCli(allocator, stderr, mode, "create", args[i]);
             name = args[i];
             spec.name = args[i];
         } else {
-            std.debug.print("unexpected create argument: {s}\n\n{s}", .{ args[i], create_usage });
-            std.process.exit(2);
+            const message = allocLifecycleMessage(allocator, "unexpected create argument: {s}", .{args[i]});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
         }
     }
 
-    if (name == null) usageExit(create_usage);
+    if (name == null) {
+        exitLifecycleCliError(
+            allocator,
+            stderr,
+            mode,
+            machine_output.usageMissingArgument("usage: spore create NAME [options]", "create"),
+            create_usage,
+        );
+    }
     if (spec.rootfs_path != null and spec.image_ref != null) {
-        std.debug.print("spore create: --rootfs and --image are mutually exclusive\n", .{});
-        std.process.exit(2);
+        const message = "spore create: --rootfs and --image are mutually exclusive";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
     }
     return .{ .spec = spec };
 }
@@ -752,57 +928,91 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
     return .{ .name = args[0], .command = command };
 }
 
-fn parseRmArgs(args: []const []const u8) []const u8 {
-    if (args.len != 1) usageExit(rm_usage);
-    validateNameOrExit("rm", args[0]) catch unreachable;
+fn parseRmArgs(args: []const []const u8, allocator: std.mem.Allocator, stderr: *Io.Writer, mode: machine_output.Mode) []const u8 {
+    if (args.len != 1) {
+        exitLifecycleCliError(
+            allocator,
+            stderr,
+            mode,
+            machine_output.usageMissingArgument("usage: spore rm NAME", "rm"),
+            rm_usage,
+        );
+    }
+    validateNameLifecycleCli(allocator, stderr, mode, "rm", args[0]);
     return args[0];
 }
 
-fn parseSuspendArgs(args: []const []const u8) SuspendOptions {
+fn parseSuspendArgs(
+    args: []const []const u8,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) SuspendOptions {
     var name: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out")) {
-            out_dir = takeValue(args, &i, args[i]);
+            out_dir = takeValueLifecycleCli(allocator, stderr, mode, "suspend", args, &i, args[i]);
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            std.debug.print("unknown suspend argument: {s}\n\n{s}", .{ args[i], suspend_usage });
-            std.process.exit(2);
+            const message = allocLifecycleMessage(allocator, "unknown suspend argument: {s}", .{args[i]});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "suspend"), message);
         } else if (name == null) {
-            validateNameOrExit("suspend", args[i]) catch unreachable;
+            validateNameLifecycleCli(allocator, stderr, mode, "suspend", args[i]);
             name = args[i];
         } else {
-            std.debug.print("unexpected suspend argument: {s}\n\n{s}", .{ args[i], suspend_usage });
-            std.process.exit(2);
+            const message = allocLifecycleMessage(allocator, "unexpected suspend argument: {s}", .{args[i]});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "suspend"), message);
         }
     }
 
-    if (name == null or out_dir == null) usageExit(suspend_usage);
+    if (name == null or out_dir == null) {
+        exitLifecycleCliError(
+            allocator,
+            stderr,
+            mode,
+            machine_output.usageMissingArgument("usage: spore suspend NAME --out DIR", "suspend"),
+            suspend_usage,
+        );
+    }
     return .{ .name = name.?, .out_dir = out_dir.? };
 }
 
-fn parseResumeArgs(args: []const []const u8) ResumeOptions {
+fn parseResumeArgs(
+    args: []const []const u8,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) ResumeOptions {
     var spore_dir: ?[]const u8 = null;
     var name: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--name")) {
-            name = takeValue(args, &i, args[i]);
-            validateNameOrExit("resume", name.?) catch unreachable;
+            name = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, args[i]);
+            validateNameLifecycleCli(allocator, stderr, mode, "resume", name.?);
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            std.debug.print("unknown resume argument: {s}\n\n{s}", .{ args[i], resume_usage });
-            std.process.exit(2);
+            const message = allocLifecycleMessage(allocator, "unknown resume argument: {s}", .{args[i]});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
         } else if (spore_dir == null) {
             spore_dir = args[i];
         } else {
-            std.debug.print("unexpected resume argument: {s}\n\n{s}", .{ args[i], resume_usage });
-            std.process.exit(2);
+            const message = allocLifecycleMessage(allocator, "unexpected resume argument: {s}", .{args[i]});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
         }
     }
 
-    if (spore_dir == null or name == null) usageExit(resume_usage);
+    if (spore_dir == null or name == null) {
+        exitLifecycleCliError(
+            allocator,
+            stderr,
+            mode,
+            machine_output.usageMissingArgument("usage: spore resume DIR --name NAME", "resume"),
+            resume_usage,
+        );
+    }
     return .{ .spore_dir = spore_dir.?, .name = name.? };
 }
 
@@ -816,45 +1026,59 @@ fn cliPaths(init: std.process.Init, allocator: std.mem.Allocator, command: []con
     return paths;
 }
 
-fn resolveNewOutputDir(allocator: std.mem.Allocator, io: Io, command: []const u8, raw: []const u8) []const u8 {
+fn resolveNewOutputDir(
+    allocator: std.mem.Allocator,
+    io: Io,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    raw: []const u8,
+) []const u8 {
     const path = std.fs.path.resolve(allocator, &.{raw}) catch |err| {
-        std.debug.print("spore {s}: invalid output directory: {s}\n", .{ command, @errorName(err) });
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore {s}: invalid output directory: {s}", .{ command, @errorName(err) });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     };
     if (pathExists(io, path) catch |err| {
-        std.debug.print("spore {s}: output directory check failed: {s}\n", .{ command, @errorName(err) });
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore {s}: output directory check failed: {s}", .{ command, @errorName(err) });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, command), message);
     }) {
-        std.debug.print("spore {s}: output directory already exists: {s}\n", .{ command, path });
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore {s}: output directory already exists: {s}", .{ command, path });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     }
     const parent = std.fs.path.dirname(path) orelse {
-        std.debug.print("spore {s}: output directory has no parent: {s}\n", .{ command, path });
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore {s}: output directory has no parent: {s}", .{ command, path });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     };
     const stat = Io.Dir.cwd().statFile(io, parent, .{ .follow_symlinks = true }) catch |err| {
-        std.debug.print("spore {s}: output parent is not available: {s}\n", .{ command, @errorName(err) });
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore {s}: output parent is not available: {s}", .{ command, @errorName(err) });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, command), message);
     };
     if (stat.kind != Io.File.Kind.directory) {
-        std.debug.print("spore {s}: output parent is not a directory: {s}\n", .{ command, parent });
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore {s}: output parent is not a directory: {s}", .{ command, parent });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, command), message);
     }
     return path;
 }
 
-fn resolveExistingSporeDir(allocator: std.mem.Allocator, io: Io, command: []const u8, raw: []const u8) []const u8 {
+fn resolveExistingSporeDir(
+    allocator: std.mem.Allocator,
+    io: Io,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    raw: []const u8,
+) []const u8 {
     const path = std.fs.path.resolve(allocator, &.{raw}) catch |err| {
-        std.debug.print("spore {s}: invalid spore directory: {s}\n", .{ command, @errorName(err) });
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore {s}: invalid spore directory: {s}", .{ command, @errorName(err) });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     };
     const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| {
-        std.debug.print("spore {s}: spore directory is not available: {s}\n", .{ command, @errorName(err) });
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore {s}: spore directory is not available: {s}", .{ command, @errorName(err) });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, command), message);
     };
     if (stat.kind != Io.File.Kind.directory) {
-        std.debug.print("spore {s}: spore path is not a directory: {s}\n", .{ command, path });
-        std.process.exit(2);
+        const message = allocLifecycleMessage(allocator, "spore {s}: spore path is not a directory: {s}", .{ command, path });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, command), message);
     }
     return path;
 }
@@ -1052,16 +1276,15 @@ fn handleExecResponse(init: std.process.Init, allocator: std.mem.Allocator, stdo
     return 1;
 }
 
-fn handleSuspendResponse(allocator: std.mem.Allocator, response: []const u8) !bool {
+fn suspendResponseFailureMessage(allocator: std.mem.Allocator, response: []const u8) !?[]const u8 {
     var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
-    if (std.mem.eql(u8, parsed.value.type, "suspended")) return true;
+    if (std.mem.eql(u8, parsed.value.type, "suspended")) return null;
     const message = parsed.value.message orelse "monitor request failed";
-    std.debug.print("spore suspend: {s}\n", .{message});
-    return false;
+    return try allocator.dupe(u8, message);
 }
 
 fn writeAll(io: Io, stream: net.Stream, bytes: []const u8) !void {
@@ -1152,6 +1375,19 @@ fn validateNameOrExit(command: []const u8, name: []const u8) !void {
     };
 }
 
+fn validateNameLifecycleCli(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    name: []const u8,
+) void {
+    validateName(name) catch {
+        const message = allocLifecycleMessage(allocator, "spore {s}: invalid VM name: {s}", .{ command, name });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
+    };
+}
+
 fn cliRuntimePathExit(command: []const u8, err: anyerror) noreturn {
     switch (err) {
         error.InvalidRuntimeDir => std.debug.print(
@@ -1176,10 +1412,42 @@ fn takeValue(args: []const []const u8, i: *usize, flag: []const u8) []const u8 {
     return args[i.*];
 }
 
+fn takeValueLifecycleCli(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    args: []const []const u8,
+    i: *usize,
+    flag: []const u8,
+) []const u8 {
+    if (i.* + 1 >= args.len) {
+        const message = allocLifecycleMessage(allocator, "{s} requires a value", .{flag});
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageMissingArgument(message, command), message);
+    }
+    i.* += 1;
+    return args[i.*];
+}
+
 fn parseIntArg(comptime T: type, raw: []const u8, flag: []const u8) T {
     return std.fmt.parseInt(T, raw, 10) catch {
         std.debug.print("{s} must be an integer\n", .{flag});
         std.process.exit(2);
+    };
+}
+
+fn parseIntArgLifecycleCli(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    raw: []const u8,
+    flag: []const u8,
+) T {
+    return std.fmt.parseInt(T, raw, 10) catch {
+        const message = allocLifecycleMessage(allocator, "{s} must be an integer", .{flag});
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     };
 }
 
@@ -1274,6 +1542,21 @@ test "lifecycle validates VM names" {
     try std.testing.expectError(error.InvalidVMName, validateName("bad name"));
 }
 
+test "lifecycle result carries stable schema" {
+    const result = LifecycleResult{
+        .action = "created",
+        .name = "bench-1",
+        .state = "ready",
+        .pid = 42,
+    };
+    try std.testing.expectEqualStrings(lifecycle_schema, result.schema);
+    try std.testing.expectEqual(lifecycle_schema_version, result.schema_version);
+    try std.testing.expectEqualStrings("created", result.action);
+    try std.testing.expectEqualStrings("bench-1", result.name);
+    try std.testing.expectEqualStrings("ready", result.state);
+    try std.testing.expectEqual(@as(?i64, 42), result.pid);
+}
+
 test "lifecycle monitor backend support is explicit" {
     const hvf_supported = comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
     const kvm_supported = comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64;
@@ -1365,11 +1648,15 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
 }
 
 test "create parser accepts memory policy" {
-    const default_opts = try parseCreateArgs(&.{"bench-1"});
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    const default_opts = try parseCreateArgs(&.{"bench-1"}, allocator, &stderr.writer, .human);
     try std.testing.expectEqual(memory_config.Policy.auto, default_opts.spec.memory.policy);
     try std.testing.expectEqual(memory_config.auto_bytes, default_opts.spec.memory.bytes);
 
-    const explicit_opts = try parseCreateArgs(&.{ "bench-1", "--memory", "16gb" });
+    const explicit_opts = try parseCreateArgs(&.{ "bench-1", "--memory", "16gb" }, allocator, &stderr.writer, .human);
     try std.testing.expectEqual(memory_config.Policy.explicit, explicit_opts.spec.memory.policy);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), explicit_opts.spec.memory.bytes);
 }

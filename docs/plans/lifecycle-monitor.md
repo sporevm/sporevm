@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-20
+last_reviewed: 2026-06-26
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
@@ -22,14 +22,15 @@ related_plans:
 
 ## Summary
 
-Local named-VM lifecycle has landed for HVF and KVM create/exec/ls/rm. SporeVM
-can create a named VM, keep it alive in one per-VM monitor process, execute
-multiple commands over the guest agent, and list/remove it through a private
-runtime registry. Local HVF also has diskless lifecycle suspend/resume evidence.
+Local named-VM lifecycle is stable for HVF and KVM
+create/exec/suspend/resume/ls/rm. SporeVM can create a named VM, keep it alive
+in one per-VM monitor process, execute multiple commands over the guest agent,
+checkpoint it into a spore, resume it under a new name, and list/remove it
+through a private runtime registry.
 
-The active work is no longer the CLI shape. It is speed and parity:
-tag-resolution caching, rootfs-path benchmark isolation, exec timing breakdowns,
-KVM suspend/resume evidence, and disk-backed lifecycle suspend/resume.
+The active work is no longer the stable lifecycle CLI shape. It is speed:
+tag-resolution caching, rootfs-path benchmark isolation, exec timing
+breakdowns, and preboot or same-host snapshot baselines.
 
 ## Landed Product Contract
 
@@ -37,15 +38,20 @@ KVM suspend/resume evidence, and disk-backed lifecycle suspend/resume.
 spore create bench-1 --image docker.io/library/alpine:3.20
 spore exec bench-1 -- /bin/echo hi
 spore exec bench-1 -- /bin/sh -lc 'cat /proc/sys/kernel/random/boot_id'
-spore rm bench-1
+spore suspend bench-1 --out bench-1.spore
+spore resume bench-1.spore --name bench-2
+spore rm bench-2
 ```
 
-`spore run` remains the one-shot convenience command. Named lifecycle commands
-are experimental. Monitor processes deny child process execution through an
-embedded macOS sandbox profile or Linux seccomp filter; broader jail policy
-remains follow-up work before stable lifecycle support.
+`spore run` remains the one-shot convenience command. Named live-VM lifecycle is
+stable for `create`, `exec`, `suspend`, `resume --name`, `ls`, and `rm`.
+`spore --json create`, `spore --json suspend`, `spore --json resume`,
+`spore --json ls`, and `spore --json rm` provide the machine-readable lifecycle
+state surface; `spore exec` keeps guest stdout and stderr as workload streams.
+Monitor processes deny child process execution through an embedded macOS
+sandbox profile or Linux seccomp filter.
 
-Future suspend/resume extends the same named-VM model:
+Checkpointing extends the same named-VM model:
 
 ```console
 spore suspend bench-1 --out bench-1.spore
@@ -64,8 +70,10 @@ policy, secrets, egress, mounts, workspace semantics, and scheduling.
 
 ## Current State
 
-- `spore create`, `spore exec`, `spore rm`, `spore ls`, `spore monitor`, and
-  named `spore resume` are available on supported backends.
+- `spore create`, `spore exec`, `spore suspend`, named `spore resume`,
+  `spore rm`, `spore ls`, and `spore monitor` are available on supported
+  backends; the stable surface is
+  `create`/`exec`/`suspend`/`resume --name`/`ls`/`rm`.
 - Monitor processes deny child process execution through an embedded macOS
   sandbox profile or Linux seccomp filter. `mise run smoke:monitor-jail` covers
   the denied-operation path.
@@ -80,12 +88,14 @@ policy, secrets, egress, mounts, workspace semantics, and scheduling.
   duplicate execution but fresh `spore exec` calls can run sequentially in one
   boot.
 - `spore suspend NAME --out DIR` and `spore resume DIR --name NAME` work for
-  diskless lifecycle VMs on local HVF.
+  diskless lifecycle VMs and image-created writable rootfs lifecycle VMs on HVF
+  and KVM.
 - KVM monitor wake support has landed for create, exec, repeated exec, ls, and
   rm using `immediate_exit` plus a signal wake for host-attached control streams.
-- Disk-backed lifecycle suspend/resume still fails closed. Product one-shot
-  `spore resume` can handle verified immutable-rootfs spores, but monitor-backed
-  disk lifecycle needs a separate ownership model.
+- Disk-backed lifecycle suspend/resume uses monitor-owned rootfs and disk
+  identity for image-created VMs. Explicit `spore create --rootfs PATH` VMs still
+  fail closed on suspend because they do not carry portable immutable-rootfs
+  identity.
 
 ## Runtime Directory
 
@@ -148,12 +158,15 @@ streams while `KVM_RUN` is active. Monitor requests set `immediate_exit`, send a
 signal to the vCPU thread, poll the shared lifecycle control hook, and flush
 pending virtio-vsock RX before re-entering the guest.
 
-### Disk-Backed Lifecycle Suspend/Resume
+### Checkpoint Lifecycle
 
-Disk-backed lifecycle checkpoints need explicit disk/rootfs ownership through the
-monitor. The one-shot immutable-rootfs resume contract is not enough by itself:
-the monitor owns live rootfs fds, runtime metadata, and shutdown/suspend
-ordering.
+Disk-backed lifecycle checkpoints carry explicit disk/rootfs ownership through
+the monitor. `spore create --image` records immutable-rootfs identity in
+`spec.json`, the monitor preserves it while opening the live writable root disk,
+and `spore suspend` writes lifecycle metadata into the checkpoint so named
+`spore resume` can restore the same disk model. Explicit `--rootfs` path VMs
+remain non-portable and fail closed on suspend until callers can provide
+immutable-rootfs identity.
 
 ## Non-Goals
 
@@ -172,10 +185,11 @@ ordering.
 - CLI checks: help text, unknown VM errors, stale runtime errors, duplicate
   create name, unchanged `spore run` behavior.
 - Real-host smokes: local HVF create/exec/exec/rm, KVM create/exec/exec/ls/rm,
-  HVF `--image`, HVF diskless suspend/resume/exec/rm.
+  HVF and KVM `--image` suspend/resume/exec/rm with writable-rootfs state
+  preserved.
 - Benchmark smoke: low-iteration lifecycle timing run.
 - Failure smokes: monitor crash before/after ready, `rm` of a dead monitor,
-  disk-backed `suspend` rejection, unsupported backend.
+  explicit-rootfs `suspend` rejection, unsupported backend.
 
 ## Resolved Decisions
 

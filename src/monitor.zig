@@ -26,7 +26,7 @@ const monitor_usage =
     \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
     \\  --rootfs rootfs.ext4    Resolved rootfs image path
     \\  --image REF             Original OCI image ref for metadata
-    \\  --resume DIR            Resume from a diskless spore directory
+    \\  --resume DIR            Resume from a spore directory
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
@@ -89,11 +89,18 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         std.process.exit(2);
     }
     if (opts.resume_dir != null and opts.rootfs_path != null) {
-        std.debug.print("spore monitor: disk-backed resume is not supported yet\n", .{});
+        std.debug.print("spore monitor: direct --resume with --rootfs is not supported; use lifecycle metadata for disk-backed named resume\n", .{});
         std.process.exit(2);
     }
     const paths = try lifecycle.pathsFor(allocator, init.environ_map, opts.name);
     const paths_ms = lifecycle.monotonicMs();
+    var existing_spec = lifecycle.readSpec(allocator, init.io, paths) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => |e| return e,
+    };
+    defer if (existing_spec) |*spec| spec.deinit();
+    const spec_rootfs = if (existing_spec) |spec| spec.value.rootfs else null;
+    const spec_disk = if (existing_spec) |spec| spec.value.disk else null;
     const kernel_path = opts.kernel_path orelse try run.resolveDefaultKernelPath(init, allocator);
     const initrd_path = try run.resolveConfiguredInitrdPath(init, opts.initrd_path);
     const assets_ms = lifecycle.monotonicMs();
@@ -104,6 +111,8 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
         .rootfs_path = opts.rootfs_path,
+        .rootfs = spec_rootfs,
+        .disk = spec_disk,
         .image_ref = opts.image_ref,
         .resume_dir = opts.resume_dir,
         .memory = opts.memory,
@@ -140,6 +149,8 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
         .rootfs_path = opts.rootfs_path,
+        .rootfs = spec_rootfs,
+        .disk = spec_disk,
         .resume_dir = opts.resume_dir,
         .command = &.{"/bin/true"},
         .memory = opts.memory,

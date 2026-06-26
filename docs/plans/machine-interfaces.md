@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-24
+last_reviewed: 2026-06-26
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
@@ -95,6 +95,10 @@ There are three public output modes:
 ```console
 spore host-info
 spore inspect <spore-dir>
+spore create <name> [options]
+spore suspend <name> --out <spore-dir>
+spore resume <spore-dir> --name <name>
+spore rm <name>
 spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]
 spore pull <bundle-ref> --child ID --out <spore-dir>
 ```
@@ -107,7 +111,11 @@ For one-document machine output:
 ```console
 spore --json host-info
 spore --json inspect <spore-dir>
+spore --json create <name> [options]
+spore --json suspend <name> --out <spore-dir>
+spore --json resume <spore-dir> --name <name>
 spore --json ls
+spore --json rm <name>
 spore --json inspect-bundle <bundle-ref> [--child ID|--child-range START..END]
 spore --json pull <bundle-ref> --child ID --out <spore-dir>
 ```
@@ -238,9 +246,12 @@ The first implementation should pin a small stable code table in tests:
   global `--json`.
 - A success result means the command reached its documented completion point.
   For `pull`, that means bytes are verified and the selected spore directory has
-  been written.
+  been written. For lifecycle `create`, it means the monitor is ready; for
+  lifecycle `suspend`, it means the checkpoint directory has been written and
+  runtime state has been removed; for lifecycle `resume`, it means the monitor
+  is ready; for lifecycle `rm`, it means runtime state has been removed.
 - Runtime guest stdout/stderr are workload streams, not structured SporeVM
-  result documents.
+  result documents, so `spore exec` is not a one-document JSON command.
 - Event streams are line-delimited, stdout contains only event JSONL, and each
   line is a complete JSON object.
 - Error codes are stable product values; internal Zig error names may change.
