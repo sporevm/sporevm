@@ -261,8 +261,9 @@ Current evidence:
 ## Next contract work
 
 1. Add kernel image identity to the platform contract.
-2. Broaden disk-backed remote proof beyond same-class KVM and decide whether
-   rootfs-bound writable disk is enough for the next product slice.
+2. Broaden disk-backed remote proof beyond same-class KVM while keeping the
+   product disk contract rootfs-bound; add general volumes only for a concrete
+   workflow that cannot live in the rootfs.
 3. Decide the timer portability design: fixed guest timer profile at VM
    creation, frequency-neutral timer state plus guest-visible constraints, or
    host-class matching only.

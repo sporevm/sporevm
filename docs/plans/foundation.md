@@ -111,11 +111,12 @@ spore manifest
     content-addressed disk layers
 ```
 
-General block-device state is still outside v0. Image-created spores record a
-verified immutable rootfs artifact and default to manifest-attached chunked
-rootfs storage for fast resume and distribution. Rootfs-bound writable state is
-represented as sealed disk layers. See `docs/filesystem.md` for the root disk
-contract.
+General block-device state is still outside v0. The product shape is image plus
+VM state plus rootfs writes, not arbitrary attached disks. Image-created spores
+record a verified immutable rootfs artifact and default to manifest-attached
+chunked rootfs storage for fast resume and distribution. Rootfs-bound writable
+state is represented as sealed disk layers. See `docs/filesystem.md` for the
+root disk contract.
 
 ## Current Status
 

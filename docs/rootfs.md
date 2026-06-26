@@ -36,8 +36,8 @@ spore run --rootfs rootfs.ext4 -- /bin/echo hi
 ```
 
 For the direct convenience path, ordinary `spore run --image` resolves the image
-ref, builds or reuses a cached ext4 rootfs, and then delegates to the same
-read-only rootfs execution path:
+ref, builds or reuses a cached ext4 rootfs, and runs the explicit command with
+the rootfs attached read-only:
 
 ```bash
 spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
@@ -46,6 +46,18 @@ spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
 `--image` runs the explicit argv after `--`, with OCI image `Env` and
 `WorkingDir` applied when present. It does not apply OCI Entrypoint, Cmd, or
 User.
+
+Add `--capture` to make rootfs writes part of the spore. The guest still sees a
+normal root filesystem, but writes land in a local COW head and capture seals
+the changed blocks as disk layers:
+
+```bash
+spore run --image docker.io/library/alpine:3.20 \
+  --capture /tmp/base.spore \
+  -- /bin/sh -lc 'echo warmed > /var/tmp/example'
+
+spore run --from /tmp/base.spore -- /bin/cat /var/tmp/example
+```
 
 The rootfs cache key includes the resolved digest-pinned image ref, target
 platform, and rootfs builder version. Mutable tag inputs also get a small local
@@ -135,16 +147,17 @@ When `spore run --image ... --capture SPORE` captures a VM, the spore manifest
 records an immutable rootfs artifact: the ext4 content BLAKE3 digest, size,
 virtio-blk binding, resolved OCI image identity, platform, and builder version.
 For image-created spores, the manifest also records `rootfs.storage` pointing at
-the chunked rootfs index and CAS object namespace. Product `spore resume` and
-`spore run --from` use that descriptor when present, opening the small verified
-index and verifying only chunks read by the guest instead of re-hashing the
-whole ext4 artifact before VM creation. Older spores without `rootfs.storage`
-keep the exact fd-backed path: resume reopens the cached ext4 artifact, verifies
-it by digest and size, and attaches it as the root disk base. If the spore has
-sealed writable disk layers, resume also verifies those layer indexes and disk
-objects before attaching the layered COW backend. If the required exact artifact,
-rootfs index/chunk, or disk layer data is missing or tampered with, resume
-refuses to boot.
+the chunked rootfs index and CAS object namespace. Any rootfs writes made during
+the run are represented as sealed `disk-layer-v0` entries over that immutable
+base. Product `spore resume` and `spore run --from` use the descriptor when
+present, opening the small verified index and verifying only chunks read by the
+guest instead of re-hashing the whole ext4 artifact before VM creation. Older
+spores without `rootfs.storage` keep the exact fd-backed path: resume reopens
+the cached ext4 artifact, verifies it by digest and size, and attaches it as the
+root disk base. If the spore has sealed writable disk layers, resume also
+verifies those layer indexes and disk objects before attaching the layered COW
+backend. If the required exact artifact, rootfs index/chunk, or disk layer data
+is missing or tampered with, resume refuses to boot.
 
 `spore pack` follows the manifest. Spores without `rootfs.storage` include exact
 rootfs bytes under `rootfs/blake3/<hex>.ext4`; spores with `rootfs.storage`
@@ -190,8 +203,8 @@ caches used by pull. Pull JSON reports `rootfs.cache.hit_count`,
 `rootfs.cache.bytes_reused` so repeated pulls can prove a warm digest or CAS
 cache is not refetching or reinstalling rootfs bytes.
 
-Plain `spore run --rootfs PATH` remains a local run escape hatch. Combining
-`--rootfs PATH` with `--capture` is rejected until an import/preload
+Plain `spore run --rootfs PATH` remains a local read-only run escape hatch.
+Combining `--rootfs PATH` with `--capture` is rejected until an import/preload
 command can record portable rootfs identity for arbitrary local images.
 
 Validate OCI rootfs capture, fork, and parallel `spore run --from` execution
