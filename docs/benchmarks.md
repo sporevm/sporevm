@@ -160,6 +160,26 @@ Compare two summary files with:
 scripts/compare-sporevm-benchmarks.py baseline-summary.json candidate-summary.json
 ```
 
+## Substrate Snapshot Comparison
+
+The public Substrate snapshot page measures restore start to the first in-guest
+vsock reply. The closest SporeVM product-path comparison is resumed child
+`exec_response_ms` from `spore run --events=jsonl --from child -- /bin/true`.
+
+```console
+mise run benchmark:substrate-snapshot
+```
+
+For a quick 2 GiB local check:
+
+```console
+scripts/benchmark-substrate-snapshot.py --memory-mib 2048 --iterations 1
+```
+
+This fetches the latest `https://benchmarks.substrate.so/<arch>/data.js`, runs
+matching RAM sizes, and writes JSONL plus `summary.json` under
+`zig-cache/sporevm-substrate-snapshot/`.
+
 Defaults fail when:
 
 - median TTI regresses by more than 20 percent and at least 50ms;

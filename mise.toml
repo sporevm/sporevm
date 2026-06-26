@@ -135,3 +135,7 @@ description = "Run the full benchmark suite"
 [tasks."benchmark:compare"]
 run = "scripts/compare-sporevm-benchmarks.py"
 description = "Compare two benchmark summary JSON files"
+
+[tasks."benchmark:substrate-snapshot"]
+run = "mise run build && scripts/benchmark-substrate-snapshot.py --no-build"
+description = "Compare SporeVM restore timing with Substrate's public snapshot benchmark"

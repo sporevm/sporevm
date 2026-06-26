@@ -16,7 +16,6 @@ comptime {
 }
 
 const c = @cImport({
-    @cInclude("fcntl.h");
     @cInclude("poll.h");
     @cInclude("sys/ioctl.h");
     @cInclude("sys/syscall.h");
@@ -99,7 +98,8 @@ fn validateMapping(ram: []const u8) !void {
 }
 
 fn openUserfaultfd() !std.c.fd_t {
-    const rc = c.syscall(c.SYS_userfaultfd, c.O_CLOEXEC | c.O_NONBLOCK);
+    const flags: u32 = @bitCast(linux.O{ .CLOEXEC = true, .NONBLOCK = true });
+    const rc = c.syscall(c.SYS_userfaultfd, flags);
     if (rc < 0) {
         std.log.err("userfaultfd unavailable; enable vm.unprivileged_userfaultfd or run with the required capability", .{});
         return error.UserfaultfdUnavailable;
