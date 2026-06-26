@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
         .preferred_optimize_mode = .ReleaseSafe,
     });
     const macos_framework_path = macosFrameworkPath(b);
+    const libspore_version = std.SemanticVersion{ .major = 1, .minor = 1, .patch = 0 };
 
     const libspore_mod = b.addModule("libspore", .{
         .root_source_file = b.path("src/libspore.zig"),
@@ -57,6 +58,52 @@ pub fn build(b: *std.Build) void {
         linkHypervisor(libspore_mod, macos_framework_path);
         linkHypervisor(internal_mod, macos_framework_path);
     }
+
+    const c_api_mod = b.createModule(.{
+        .root_source_file = b.path("src/c_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "libspore", .module = libspore_mod },
+        },
+    });
+    if (target_is_hvf) {
+        linkHypervisor(c_api_mod, macos_framework_path);
+    }
+    const libspore_shared = b.addLibrary(.{
+        .name = "spore",
+        .root_module = c_api_mod,
+        .linkage = .dynamic,
+        .version = libspore_version,
+    });
+    const libspore_static = b.addLibrary(.{
+        .name = "spore",
+        .root_module = c_api_mod,
+        .linkage = .static,
+        .version = libspore_version,
+    });
+    const install_libspore_shared = b.addInstallArtifact(libspore_shared, .{});
+    const install_libspore_static = b.addInstallArtifact(libspore_static, .{});
+    const install_libspore_header = b.addInstallHeaderFile(b.path("include/spore.h"), "spore.h");
+    const pc_files = b.addWriteFiles();
+    const libspore_pc = pc_files.add("libspore.pc",
+        \\prefix=${pcfiledir}/../..
+        \\libdir=${prefix}/lib
+        \\includedir=${prefix}/include
+        \\
+        \\Name: libspore
+        \\Description: SporeVM C ABI
+        \\Version: 1.1.0
+        \\Libs: -L${libdir} -lspore
+        \\Cflags: -I${includedir}
+        \\
+    );
+    const install_libspore_pc = b.addInstallFileWithDir(libspore_pc, .lib, "pkgconfig/libspore.pc");
+    b.getInstallStep().dependOn(&install_libspore_shared.step);
+    b.getInstallStep().dependOn(&install_libspore_static.step);
+    b.getInstallStep().dependOn(&install_libspore_header.step);
+    b.getInstallStep().dependOn(&install_libspore_pc.step);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -118,16 +165,42 @@ pub fn build(b: *std.Build) void {
     });
     const libspore_smoke_tests = b.addTest(.{ .root_module = libspore_smoke_mod });
     const run_libspore_smoke_tests = b.addRunArtifact(libspore_smoke_tests);
+    const c_api_tests = b.addTest(.{ .root_module = c_api_mod });
+    const run_c_api_tests = b.addRunArtifact(c_api_tests);
     const internal_tests = b.addTest(.{ .root_module = internal_mod });
     const run_internal_tests = b.addRunArtifact(internal_tests);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    const c_smoke_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    c_smoke_mod.addCSourceFile(.{
+        .file = b.path("test/c/libspore_smoke.c"),
+        .flags = if (target_arch == .aarch64)
+            &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-DSPORE_SMOKE_HOST_INFO" }
+        else
+            &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    c_smoke_mod.addIncludePath(b.path("include"));
+    c_smoke_mod.linkLibrary(libspore_static);
+    if (target_is_hvf) {
+        linkHypervisor(c_smoke_mod, macos_framework_path);
+    }
+    const c_smoke = b.addExecutable(.{
+        .name = "libspore-c-smoke",
+        .root_module = c_smoke_mod,
+    });
+    const run_c_smoke = b.addRunArtifact(c_smoke);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_libspore_tests.step);
     test_step.dependOn(&run_libspore_smoke_tests.step);
+    test_step.dependOn(&run_c_api_tests.step);
     test_step.dependOn(&run_internal_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_c_smoke.step);
 
     // Hypervisor.framework smoke test: host-only, needs entitlement signing.
     // Run with `zig build hvf-smoke` on an Apple Silicon Mac.

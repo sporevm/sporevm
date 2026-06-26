@@ -301,6 +301,11 @@ The first implementation should pin a small stable code table in tests:
   belong to only one module in a compilation unit; external embedders should
   import `libspore`. Initrd assets, zmoltcp, and hypervisor linkage are module
   dependencies for VM execution but are not part of the public facade.
+- Slice 6 is implemented in this branch: `include/spore.h` declares the first
+  C ABI, `src/c_api.zig` wraps the product API behind opaque context and owned
+  string helpers, the build installs shared/static `libspore` artifacts plus a
+  pkg-config file, and a C smoke covers build info, option initialization, and
+  host-info JSON on aarch64 hosts.
 
 ## Delivery Strategy
 

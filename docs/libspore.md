@@ -131,3 +131,33 @@ mise run docs
 
 The generated Zig API docs are installed under
 `zig-out/share/doc/spore/libspore-zig`.
+
+## C ABI
+
+The C ABI is declared in [`include/spore.h`](../include/spore.h). The first
+slice exposes context management, build info, context-local last errors, owned
+string cleanup, host-info JSON, and inspect-bundle JSON.
+
+Returned JSON strings are NUL-terminated for C convenience. The reported length
+excludes the trailing NUL and includes the final newline, matching CLI JSON
+output. Free returned strings with `spore_free_string` on the same context:
+
+```c
+SporeContext context = 0;
+SporeOwnedString json = {0};
+
+if (spore_context_new(&context) != SPORE_SUCCESS) return 1;
+if (spore_host_info_json(context, &json) != SPORE_SUCCESS) return 1;
+
+spore_free_string(context, json);
+spore_context_free(context);
+```
+
+Options structs use `size` and `version` fields and should be initialized with
+their matching helper:
+
+```c
+SporeInspectBundleOptions options;
+spore_inspect_bundle_options_init(&options);
+options.source = (SporeString){ .ptr = "file:///tmp/base.bundle", .len = 23 };
+```
