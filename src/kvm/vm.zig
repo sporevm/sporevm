@@ -417,6 +417,12 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     exec_probe_done = true;
                 }
                 if (probe.state == .complete) {
+                    if (config.exec_probe_completes_run and !config.snapshot_on_probe_complete) {
+                        // The VM is being torn down; avoid an extra KVM_RUN
+                        // just to complete an MMIO exit whose state will not
+                        // be snapshotted or resumed.
+                        return .probe_complete;
+                    }
                     if (pending_kvm_completion) {
                         try kvm.completePendingExit(vcpu_fd, run_bytes);
                         pending_kvm_completion = false;
