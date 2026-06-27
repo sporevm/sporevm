@@ -13,6 +13,7 @@ const lifecycle = @import("lifecycle.zig");
 const local_paths = @import("local_paths.zig");
 const platform = @import("platform.zig");
 const resume_mod = @import("resume.zig");
+const rootfs_mod = @import("rootfs.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
@@ -119,6 +120,7 @@ pub const InspectBundleResult = contracts.InspectBundleResult;
 pub const Backend = run_mod.Backend;
 pub const MemoryConfig = run_mod.MemoryConfig;
 pub const CaptureTrigger = run_mod.CaptureTrigger;
+pub const ImagePullPolicy = run_mod.PullPolicy;
 pub const NetworkMode = run_mod.NetworkMode;
 pub const NetworkConfig = run_mod.NetworkPolicy;
 pub const NetworkCapabilities = spore_net_policy.NetworkCapabilities;
@@ -128,6 +130,14 @@ pub const NetworkRule = spore_net_policy.NetworkRule;
 pub const BoundService = spore_net_policy.BoundService;
 pub const BoundServiceTarget = spore_net_policy.BoundServiceTarget;
 pub const Rootfs = run_mod.Rootfs;
+pub const RootfsBuildOptions = rootfs_mod.BuildRequest;
+pub const RootfsBuildResult = rootfs_mod.BuildResult;
+pub const RootfsCasPreloadOptions = rootfs_mod.CasPreloadRequest;
+pub const RootfsCasPreloadResult = rootfs_mod.CasPreloadResult;
+pub const RootfsImportOciOptions = rootfs_mod.ImportOciRequest;
+pub const RootfsImportOciResult = rootfs_mod.ImportOciResult;
+pub const RootfsPlatform = rootfs_mod.Platform;
+pub const RootfsResolveOptions = rootfs_mod.ResolveRequest;
 pub const Disk = run_mod.Disk;
 pub const RunResult = run_mod.Result;
 pub const ResumeResult = run_mod.Result;
@@ -189,6 +199,7 @@ pub const RunOptions = struct {
     network: NetworkMode = .disabled,
     network_policy: NetworkConfig = .{},
     spore_executable: []const u8 = "spore",
+    debug: bool = false,
     /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
 };
@@ -204,6 +215,7 @@ pub const ManagedRunOptions = struct {
     initrd_path: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
+    image_pull_policy: ImagePullPolicy = .missing,
     /// Guest command and arguments. The first element is the executable.
     command: []const []const u8,
     memory: MemoryConfig = .{},
@@ -216,6 +228,7 @@ pub const ManagedRunOptions = struct {
     network: NetworkMode = .disabled,
     network_policy: NetworkConfig = .{},
     spore_executable: []const u8 = "spore",
+    debug: bool = false,
     /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
 };
@@ -237,6 +250,7 @@ pub const RunFromSporeOptions = struct {
     capture_trigger: CaptureTrigger = .exit,
     continue_after_capture: bool = false,
     spore_executable: []const u8 = "spore",
+    debug: bool = false,
     /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
 };
@@ -245,7 +259,10 @@ pub const RunFromSporeOptions = struct {
 pub const ResumeOptions = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
+    generation_path: ?[]const u8 = null,
+    timeout_ms: u64 = 30_000,
     spore_executable: []const u8 = "spore",
+    debug: bool = false,
     /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
 };
@@ -500,6 +517,150 @@ pub fn systemPrune(
     }, std.Io.Clock.real.now(context.io).nanoseconds);
 }
 
+/// Build an ext4 rootfs from an OCI image reference.
+///
+/// Release owned result fields with `deinitRootfsBuildResult`.
+pub fn rootfsBuild(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: RootfsBuildOptions,
+) !RootfsBuildResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const result = try rootfs_mod.build(init, arena_state.allocator(), options);
+    return .{
+        .rootfs_blake3 = result.rootfs_blake3,
+        .rootfs_storage = try ownRootfsStorageDigestFields(allocator, result.rootfs_storage),
+    };
+}
+
+/// Release memory owned by a `RootfsBuildResult`.
+pub fn deinitRootfsBuildResult(allocator: std.mem.Allocator, result: RootfsBuildResult) void {
+    rootfs_mod.deinitBuildResult(allocator, result);
+}
+
+/// Import an OCI layout into the local rootfs cache under a local ref.
+///
+/// Release owned result fields with `deinitRootfsImportOciResult`.
+pub fn rootfsImportOci(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: RootfsImportOciOptions,
+) !RootfsImportOciResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const result = try rootfs_mod.importOciLayout(init, arena_state.allocator(), options);
+    return ownRootfsImportOciResult(allocator, result);
+}
+
+/// Release memory owned by a `RootfsImportOciResult`.
+pub fn deinitRootfsImportOciResult(allocator: std.mem.Allocator, result: RootfsImportOciResult) void {
+    rootfs_mod.deinitImportOciResult(allocator, result);
+}
+
+/// Resolve an image tag or local ref to the digest-pinned ref used by SporeVM.
+///
+/// The returned string is owned by the caller. Release it with
+/// `deinitRootfsResolveResult`.
+pub fn rootfsResolve(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: RootfsResolveOptions,
+) ![]const u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const resolved = try rootfs_mod.resolveReference(init, arena_state.allocator(), options);
+    return allocator.dupe(u8, resolved);
+}
+
+/// Release memory owned by a `rootfsResolve` result.
+pub fn deinitRootfsResolveResult(allocator: std.mem.Allocator, resolved_ref: []const u8) void {
+    rootfs_mod.deinitResolvedReference(allocator, resolved_ref);
+}
+
+/// Preload a cached rootfs into chunked CAS storage.
+///
+/// Release owned result fields with `deinitRootfsCasPreloadResult`.
+pub fn rootfsCasPreload(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: RootfsCasPreloadOptions,
+) !RootfsCasPreloadResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const result = try rootfs_mod.casPreload(init, arena_state.allocator(), options);
+    return ownRootfsCasPreloadResult(allocator, result);
+}
+
+/// Release memory owned by a `RootfsCasPreloadResult`.
+pub fn deinitRootfsCasPreloadResult(allocator: std.mem.Allocator, result: RootfsCasPreloadResult) void {
+    rootfs_mod.deinitCasPreloadResult(allocator, result);
+}
+
+fn ownRootfsStorageDigestFields(allocator: std.mem.Allocator, storage: spore.RootfsStorage) !spore.RootfsStorage {
+    const index_digest = try allocator.dupe(u8, storage.index_digest);
+    errdefer allocator.free(index_digest);
+    const same_base = storage.index_digest.ptr == storage.base_identity.ptr and storage.index_digest.len == storage.base_identity.len;
+    const base_identity = if (same_base) index_digest else try allocator.dupe(u8, storage.base_identity);
+    return .{
+        .kind = storage.kind,
+        .device = storage.device,
+        .logical_size = storage.logical_size,
+        .chunk_size = storage.chunk_size,
+        .hash_algorithm = storage.hash_algorithm,
+        .index_digest = index_digest,
+        .base_identity = base_identity,
+        .object_namespace = storage.object_namespace,
+    };
+}
+
+fn ownRootfsImportOciResult(allocator: std.mem.Allocator, result: RootfsImportOciResult) !RootfsImportOciResult {
+    const rootfs_path = try allocator.dupe(u8, result.rootfs_path);
+    errdefer allocator.free(rootfs_path);
+    const metadata_path = try allocator.dupe(u8, result.metadata_path);
+    errdefer allocator.free(metadata_path);
+    const local_ref_path = try allocator.dupe(u8, result.local_ref_path);
+    errdefer allocator.free(local_ref_path);
+    const resolved_image_ref = try allocator.dupe(u8, result.resolved_image_ref);
+    errdefer allocator.free(resolved_image_ref);
+    const image_manifest_digest = try allocator.dupe(u8, result.image_manifest_digest);
+    return .{
+        .rootfs_path = rootfs_path,
+        .metadata_path = metadata_path,
+        .local_ref_path = local_ref_path,
+        .resolved_image_ref = resolved_image_ref,
+        .image_manifest_digest = image_manifest_digest,
+        .rootfs_blake3 = result.rootfs_blake3,
+    };
+}
+
+fn ownRootfsCasPreloadResult(allocator: std.mem.Allocator, result: RootfsCasPreloadResult) !RootfsCasPreloadResult {
+    const index_path = try allocator.dupe(u8, result.index_path);
+    errdefer allocator.free(index_path);
+    const index_digest = try allocator.dupe(u8, result.index_digest);
+    errdefer allocator.free(index_digest);
+    const rootfs_digest = try allocator.dupe(u8, result.rootfs_digest);
+    return .{
+        .index_path = index_path,
+        .index_digest = index_digest,
+        .rootfs_digest = rootfs_digest,
+        .rootfs_size = result.rootfs_size,
+        .chunk_size = result.chunk_size,
+        .chunk_count = result.chunk_count,
+        .zero_chunks = result.zero_chunks,
+        .nonzero_chunks = result.nonzero_chunks,
+        .objects_written = result.objects_written,
+        .object_bytes_written = result.object_bytes_written,
+        .index_bytes = result.index_bytes,
+        .source_verify_ms = result.source_verify_ms,
+        .chunk_scan_ms = result.chunk_scan_ms,
+        .object_check_ms = result.object_check_ms,
+        .object_write_ms = result.object_write_ms,
+        .index_build_ms = result.index_build_ms,
+        .index_write_ms = result.index_write_ms,
+    };
+}
+
 /// Release memory owned by a `RootfsPruneResult`.
 pub fn deinitRootfsPruneResult(allocator: std.mem.Allocator, result: RootfsPruneResult) void {
     system.deinitRootfsPruneResult(allocator, result);
@@ -566,6 +727,7 @@ pub fn run(
         .network = options.network,
         .network_policy = options.network_policy,
         .spore_executable = options.spore_executable,
+        .debug = options.debug,
         .events = options.events,
     });
 }
@@ -589,6 +751,7 @@ pub fn runManaged(
     const rootfs = try run_mod.resolveRootfsInputDetailed(init, arena, .{
         .rootfs_path = options.rootfs_path,
         .image_ref = options.image_ref,
+        .pull_policy = options.image_pull_policy,
         .command_name = "run",
         .record_artifact = options.capture_path != null,
     });
@@ -615,6 +778,7 @@ pub fn runManaged(
         .network = options.network,
         .network_policy = options.network_policy,
         .spore_executable = options.spore_executable,
+        .debug = options.debug,
         .events = options.events,
     });
 }
@@ -657,6 +821,7 @@ pub fn runFromSpore(
         .network = network_options.network,
         .network_policy = network_options.policy,
         .spore_executable = options.spore_executable,
+        .debug = options.debug,
         .events = options.events,
     });
 }
@@ -670,7 +835,10 @@ pub fn resumeSpore(
     return resume_mod.execute(context, allocator, .{
         .backend = options.backend,
         .spore_dir = options.spore_dir,
+        .generation_path = options.generation_path,
+        .timeout_ms = options.timeout_ms,
         .spore_executable = options.spore_executable,
+        .debug = options.debug,
         .events = options.events,
     });
 }

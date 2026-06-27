@@ -35,7 +35,7 @@ pub const Options = struct {
     timeout_ms: u64 = default_resume_attach_timeout_ms,
 };
 
-const cli_usage =
+pub const cli_usage =
     \\Usage:
     \\  spore resume [--backend auto|hvf|kvm] <spore-dir>
     \\
@@ -47,37 +47,6 @@ const cli_usage =
     \\  -h, --help              Show this help
     \\
 ;
-
-pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (args.len == 0 or std.mem.eql(u8, args[0], "help") or std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help")) {
-        try stdout.writeAll(cli_usage);
-        return;
-    }
-
-    var opts = try parseCliArgs(args);
-    var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "resume");
-    if (opts.event_mode == .jsonl) {
-        opts.events = event_writer.sink();
-    }
-    const arena = init.arena.allocator();
-    const full_args = try init.minimal.args.toSlice(arena);
-    opts.spore_executable = full_args[0];
-    opts.debug = runtimeDebugEnabled(full_args);
-    const result = execute(.{
-        .io = init.io,
-        .environ_map = init.environ_map,
-    }, arena, opts) catch |err| {
-        if (opts.event_mode == .jsonl) {
-            std.process.exit(run_mod.machineErrorExitCode(err));
-        }
-        return err;
-    };
-    if (opts.event_mode == .jsonl) {
-        try stdout.flush();
-    }
-    const code = result.processExitCode();
-    if (code != 0) std.process.exit(code);
-}
 
 pub fn parseCliArgs(args: []const []const u8) !Options {
     var backend: Backend = .auto;

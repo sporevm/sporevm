@@ -635,7 +635,7 @@ pub const MonitorResult = struct {
     exit: MonitorExit,
 };
 
-const SharedOptions = struct {
+pub const SharedOptions = struct {
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
     memory: memory_config.Config = .{},
@@ -696,7 +696,7 @@ pub const NetworkOptions = struct {
     policy: spore_net_policy.Config = .{},
 };
 
-const cli_usage =
+pub const cli_usage =
     \\Usage:
     \\  spore run [--kernel Image] [--initrd root.cpio] [options] -- <argv...>
     \\
@@ -727,53 +727,6 @@ const cli_usage =
     \\  -h, --help              Show this help
     \\
 ;
-
-pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (args.len == 0 or std.mem.eql(u8, args[0], "help") or std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help")) {
-        try stdout.writeAll(cli_usage);
-        return;
-    }
-
-    const arena = init.arena.allocator();
-    const parsed = try parseCliArgs(args);
-    var opts = try resolveCliOptions(init, arena, parsed);
-    var event_writer = EventWriter.init(std.heap.page_allocator, stdout, "run");
-    if (parsed.event_mode == .jsonl) {
-        opts.stream_output = false;
-        opts.events = event_writer.sink();
-    }
-    try openConsoleLog(opts.console_log_path);
-    defer closeConsoleLog();
-
-    const full_args = try init.minimal.args.toSlice(arena);
-    opts.spore_executable = full_args[0];
-    opts.debug = runtimeDebugEnabled(full_args);
-    const result = execute(.{
-        .io = init.io,
-        .environ_map = init.environ_map,
-    }, arena, opts) catch |err| {
-        if (parsed.event_mode == .jsonl) {
-            std.process.exit(machine_output.fromZigError(err).exit_code);
-        }
-        if (isCaptureAborted(err)) std.process.exit(130);
-        if (isNetworkGatewayError(err)) {
-            printNetworkGatewayError(err);
-            std.process.exit(1);
-        }
-        return err;
-    };
-    if (result.captured and parsed.event_mode != .jsonl) {
-        if (result.capture_path) |path| {
-            const message = try std.fmt.allocPrint(arena, "spore run: captured snapshot at {s}\n", .{path});
-            try writeSetupStderr(init, message);
-        }
-    }
-    if (parsed.event_mode == .jsonl) {
-        try stdout.flush();
-    }
-    const code = result.processExitCode();
-    if (code != 0) std.process.exit(code);
-}
 
 pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var backend: Backend = .auto;
@@ -2717,11 +2670,11 @@ fn resultFromExitCapture(backend: Backend, opts: Options, stream: *const vsock.H
     };
 }
 
-fn isCaptureAborted(err: anyerror) bool {
+pub fn isCaptureAborted(err: anyerror) bool {
     return std.mem.eql(u8, @errorName(err), "CaptureAborted");
 }
 
-fn isNetworkGatewayError(err: anyerror) bool {
+pub fn isNetworkGatewayError(err: anyerror) bool {
     return std.mem.eql(u8, @errorName(err), "NetdSpawnFailed") or
         std.mem.eql(u8, @errorName(err), "NetdReadyTimedOut") or
         std.mem.eql(u8, @errorName(err), "NetdReadyFailed") or
@@ -2729,7 +2682,7 @@ fn isNetworkGatewayError(err: anyerror) bool {
         std.mem.eql(u8, @errorName(err), "NetworkGatewayFailed");
 }
 
-fn printNetworkGatewayError(err: anyerror) void {
+pub fn printNetworkGatewayError(err: anyerror) void {
     const message = if (std.mem.eql(u8, @errorName(err), "NetdSpawnFailed"))
         "spore run: failed to start spore-netd"
     else if (std.mem.eql(u8, @errorName(err), "NetdReadyTimedOut"))

@@ -370,25 +370,23 @@ The first implementation should pin a small stable code table in tests:
   failures emit `failure` records using the shared error classification. Older
   parser/setup direct exits remain a follow-up hardening item outside the
   runtime stream path.
-- Slice 5 is active in this branch: `src/api.zig` exposes option-based
-  product calls for run, managed fresh run setup, `run --from` semantics,
-  resume, host-info, inspect, fork, pack, unpack, push, inspect-bundle, and
-  pull; run/resume expose typed event callbacks instead of CLI JSONL writer
-  plumbing; pull and bundle materialization use explicit `env`/`none`/`path`
-  cache choices; most public calls take a small `libspore.Context`, while
-  managed fresh runs take `std.process.Init` because image/rootfs and kernel
-  setup can spawn tools, use process IO, and resolve process environment; and
-  the CLI has begun routing single-result host, manifest, fork, bundle, and
-  named `create`/`resume`/`fork`/`exec`/`rm`/`suspend`/`ls` commands through
+- Slice 5 is implemented in this branch: `src/api.zig` exposes option-based
+  product calls for rootfs build/import/resolve/CAS preload, run, managed fresh
+  run setup, `run --from` semantics, resume, host-info, inspect, fork, pack,
+  unpack, push, inspect-bundle, and pull; run/resume expose typed event
+  callbacks instead of CLI JSONL writer plumbing; pull and bundle
+  materialization use explicit `env`/`none`/`path` cache choices; most public
+  calls take a small `libspore.Context`, while managed fresh runs and rootfs
+  setup take `std.process.Init` because they can spawn tools, use process IO,
+  and resolve process environment; and the CLI routes product commands through
   the API boundary instead of using command parsing as the product interface.
-  `system df` and `system prune` now share typed rootfs cache summary and prune
-  operations with `libspore`, with dry-run/default-selection behavior owned by
-  that API layer.
-  Remaining CLI product paths should move behind the same boundary before the
-  surface is considered complete.
-  The public Zig module now exposes explicit deinit helpers for owned result
-  fields and classified failure values for run/resume events instead of raw Zig
-  error names.
+  CLI-only adapters now own argv parsing and stdout/stderr serialization for
+  rootfs, run, and resume, with the VM/rootfs behavior delegated through
+  `src/api.zig`. `system df` and `system prune` share typed rootfs cache summary
+  and prune operations with `libspore`, with dry-run/default-selection behavior
+  owned by that API layer. The public Zig module exposes explicit deinit helpers
+  for owned result fields and classified failure values for run/resume events
+  instead of raw Zig error names.
 - The build now publishes that shared Zig module as `libspore`. The in-repo CLI
   compiles through `spore_internal.api` because Zig requires a source file to
   belong to only one module in a compilation unit; external embedders should

@@ -117,6 +117,25 @@ test "external import can name managed run-from and named lifecycle APIs" {
 
     const facts = libspore.networkCapabilities();
     try std.testing.expect(facts.supported and facts.exact_host_port);
+
+    const rootfs_build = libspore.RootfsBuildOptions{
+        .ref = "docker.io/library/alpine:3.20",
+        .output = "rootfs.ext4",
+        .metadata = "rootfs.ext4.json",
+    };
+    try std.testing.expectEqualStrings("rootfs.ext4", rootfs_build.output);
+    const rootfs_resolve = libspore.RootfsResolveOptions{
+        .ref = "docker.io/library/alpine:3.20",
+    };
+    try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", rootfs_resolve.ref);
+    _ = libspore.rootfsBuild;
+    _ = libspore.rootfsImportOci;
+    _ = libspore.rootfsResolve;
+    _ = libspore.rootfsCasPreload;
+    _ = libspore.deinitRootfsBuildResult;
+    _ = libspore.deinitRootfsImportOciResult;
+    _ = libspore.deinitRootfsResolveResult;
+    _ = libspore.deinitRootfsCasPreloadResult;
 }
 
 test "external import can inspect and prune system cache" {
