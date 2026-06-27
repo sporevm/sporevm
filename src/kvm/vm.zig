@@ -445,7 +445,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     while (true) {
         if (!virtio_mem_requested and mem_transport_index != null) {
             if (config.exec_probe) |probe| {
-                if (probe.memory_ready_ms != null and probe.state == .connected) {
+                if (probe.memory_pressure_ms != null and probe.state == .connected) {
                     const idx = mem_transport_index.?;
                     const mapping = if (hotplug_mapping) |*m| m else unreachable;
                     try mem_dev.setRequestedSize(@intCast(mapping.bytes.len));

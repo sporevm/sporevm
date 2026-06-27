@@ -763,6 +763,8 @@ pub fn runManaged(
         .command_name = "run",
         .record_artifact = options.capture_path != null,
     });
+    const default_kernel = options.kernel_path == null and init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null;
+    const default_initrd = options.initrd_path == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null;
     const kernel_path = options.kernel_path orelse try run_mod.resolveDefaultKernelPath(init, arena);
     const initrd_path = try run_mod.resolveConfiguredInitrdPath(init, options.initrd_path);
 
@@ -770,6 +772,7 @@ pub fn runManaged(
         .backend = options.backend,
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
+        .auto_memory_hotplug_capable = default_kernel and default_initrd,
         .rootfs_path = rootfs.path,
         .rootfs = rootfs.rootfs,
         .command = options.command,

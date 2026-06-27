@@ -74,6 +74,7 @@ static int64_t t_request_decode = 0;
 static int64_t t_command_start = 0;
 static int64_t t_command_exit = 0;
 static int sigchld_pipe[2] = { -1, -1 };
+static const char memory_pressure_trigger[] = "some 10000 100000\n";
 
 static int path_is_dir(const char *path);
 
@@ -86,7 +87,9 @@ struct replay_buffer {
 struct session {
   int started;
   int exited;
-  int memory_ready_sent;
+  int memory_pressure_sent;
+  int memory_pressure_fd;
+  char memory_cgroup_path[128];
   char session_id[64];
   pid_t pid;
   int stdout_fd;
@@ -695,8 +698,8 @@ static int send_timing_frame(int fd) {
   return write_all(fd, frame, (size_t)n);
 }
 
-static int send_memory_ready_frame(int fd) {
-  return write_all(fd, "memory-ready\n", 13);
+static int send_memory_pressure_frame(int fd) {
+  return write_all(fd, "memory-pressure\n", 16);
 }
 
 static int send_exit_frame(int fd, int exit_code) {
@@ -705,6 +708,59 @@ static int send_exit_frame(int fd, int exit_code) {
   if (n <= 0 || (size_t)n >= sizeof(frame)) return -1;
   (void)send_timing_frame(fd);
   return write_all(fd, frame, (size_t)n);
+}
+
+static int write_text_file(const char *path, const char *text) {
+  int fd = open(path, O_WRONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  int rc = write_all(fd, text, strlen(text));
+  close(fd);
+  return rc;
+}
+
+static int write_pid_file(const char *path, pid_t pid) {
+  char buf[32];
+  int n = snprintf(buf, sizeof(buf), "%ld\n", (long)pid);
+  if (n <= 0 || (size_t)n >= sizeof(buf)) return -1;
+  return write_text_file(path, buf);
+}
+
+static int cgroup_child_path(char *out, size_t out_len, const char *dir, const char *file) {
+  int n = snprintf(out, out_len, "%s/%s", dir, file);
+  return (n > 0 && (size_t)n < out_len) ? 0 : -1;
+}
+
+static void close_memory_pressure(struct session *session) {
+  if (session->memory_pressure_fd >= 0) {
+    close(session->memory_pressure_fd);
+    session->memory_pressure_fd = -1;
+  }
+  if (session->memory_cgroup_path[0] != '\0') {
+    if (rmdir(session->memory_cgroup_path) == 0 || errno == ENOENT) {
+      session->memory_cgroup_path[0] = '\0';
+    }
+  }
+}
+
+static int memory_pressure_setup_error(const char *step) {
+  dprintf(2, "memory pressure setup failed: %s errno=%d\n", step, errno);
+  return -1;
+}
+
+static int setup_memory_pressure(struct session *session, pid_t pid) {
+  if (write_text_file("/sys/fs/cgroup/cgroup.subtree_control", "+memory\n") != 0) return memory_pressure_setup_error("enable memory controller");
+  int n = snprintf(session->memory_cgroup_path, sizeof(session->memory_cgroup_path), "/sys/fs/cgroup/spore-run-%ld", (long)pid);
+  if (n <= 0 || (size_t)n >= sizeof(session->memory_cgroup_path)) return memory_pressure_setup_error("format cgroup path");
+  if (mkdir(session->memory_cgroup_path, 0755) != 0) return memory_pressure_setup_error("create cgroup");
+
+  char path[192];
+  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "cgroup.procs") != 0 ||
+      write_pid_file(path, pid) != 0) return memory_pressure_setup_error("move process");
+  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "memory.pressure") != 0) return memory_pressure_setup_error("format pressure path");
+  session->memory_pressure_fd = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+  if (session->memory_pressure_fd < 0) return memory_pressure_setup_error("open pressure");
+  if (write_all(session->memory_pressure_fd, memory_pressure_trigger, sizeof(memory_pressure_trigger) - 1) != 0) return memory_pressure_setup_error("arm pressure trigger");
+  return 0;
 }
 
 static void close_client(struct client *client) {
@@ -1026,8 +1082,9 @@ static void close_file_stdio(struct session *session) {
 
 static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio) {
   t_command_start = now_ms();
-  int stdout_pipe[2];
-  int stderr_pipe[2];
+  int stdout_pipe[2] = { -1, -1 };
+  int stderr_pipe[2] = { -1, -1 };
+  int start_pipe[2] = { -1, -1 };
   if (file_stdio) {
     stdout_pipe[1] = open(FILE_STDOUT_PATH, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
     stderr_pipe[1] = open(FILE_STDERR_PATH, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -1061,9 +1118,23 @@ static int start_session(struct session *session, const char *session_id, char *
       return 127;
     }
   }
+  if (pipe2(start_pipe, O_CLOEXEC) != 0) {
+    if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
+    if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
+    if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
+    if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
+    t_command_exit = now_ms();
+    return 127;
+  }
 
   pid_t pid = fork();
   if (pid == 0) {
+    close(start_pipe[1]);
+    char start_byte = 0;
+    while (read(start_pipe[0], &start_byte, 1) < 0 && errno == EINTR) {
+    }
+    if (start_byte != 1) _exit(127);
+    close(start_pipe[0]);
     if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
     if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
     if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0) _exit(127);
@@ -1081,7 +1152,9 @@ static int start_session(struct session *session, const char *session_id, char *
   }
   close(stdout_pipe[1]);
   close(stderr_pipe[1]);
+  close(start_pipe[0]);
   if (pid < 0) {
+    close(start_pipe[1]);
     if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
     if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
     t_command_exit = now_ms();
@@ -1089,6 +1162,21 @@ static int start_session(struct session *session, const char *session_id, char *
   }
 
   memset(session, 0, sizeof(*session));
+  session->memory_pressure_fd = -1;
+  if (setup_memory_pressure(session, pid) != 0 || write_all(start_pipe[1], "\1", 1) != 0) {
+    close(start_pipe[1]);
+    (void)kill(pid, SIGKILL);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
+    if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
+    close_memory_pressure(session);
+    t_command_exit = now_ms();
+    return 127;
+  }
+  close(start_pipe[1]);
+
   session->started = 1;
   snprintf(session->session_id, sizeof(session->session_id), "%s", session_id);
   session->pid = pid;
@@ -1105,11 +1193,13 @@ static int session_finished(const struct session *session) {
 }
 
 static void reset_session(struct session *session) {
+  close_memory_pressure(session);
   if (session->stdout_fd >= 0) close(session->stdout_fd);
   if (session->stderr_fd >= 0) close(session->stderr_fd);
   memset(session, 0, sizeof(*session));
   session->stdout_fd = -1;
   session->stderr_fd = -1;
+  session->memory_pressure_fd = -1;
 }
 
 static int replay_available(const struct replay_buffer *replay, uint64_t offset, uint64_t end_offset) {
@@ -1220,6 +1310,7 @@ static void poll_session_exit(struct session *session, struct client *client) {
       session->stderr_open = 0;
     }
   }
+  close_memory_pressure(session);
 }
 
 static void maybe_send_session_exit(struct session *session, struct client *client) {
@@ -1232,13 +1323,15 @@ static void maybe_send_session_exit(struct session *session, struct client *clie
   close_client(client);
 }
 
-static void maybe_send_memory_ready(struct session *session, struct client *client) {
-  if (client->fd < 0 || !session->started || session->exited || session->memory_ready_sent) return;
-  if (send_memory_ready_frame(client->fd) != 0) {
+static void maybe_send_memory_pressure(struct session *session, struct client *client) {
+  if (client->fd < 0 || !session->started || session->exited || session->memory_pressure_sent || session->memory_pressure_fd < 0) return;
+  if (send_memory_pressure_frame(client->fd) != 0) {
     close_client(client);
     return;
   }
-  session->memory_ready_sent = 1;
+  session->memory_pressure_sent = 1;
+  close(session->memory_pressure_fd);
+  session->memory_pressure_fd = -1;
 }
 
 static void accept_request(int listener, struct session *session, struct client *client, int use_rootfs, int rootfs_ready, const char *rootfs_error, int network_requested, int network_ready, const char *network_error) {
@@ -1398,6 +1491,7 @@ int main(void) {
   memset(&session, 0, sizeof(session));
   session.stdout_fd = -1;
   session.stderr_fd = -1;
+  session.memory_pressure_fd = -1;
   struct client client;
   memset(&client, 0, sizeof(client));
   client.fd = -1;
@@ -1417,8 +1511,8 @@ int main(void) {
       maybe_send_session_exit(&session, &client);
     }
 
-    struct pollfd fds[5];
-    int roles[5];
+    struct pollfd fds[6];
+    int roles[6];
     nfds_t nfds = 0;
     fds[nfds].fd = listener;
     fds[nfds].events = POLLIN;
@@ -1446,6 +1540,12 @@ int main(void) {
     fds[nfds].events = POLLIN;
     fds[nfds].revents = 0;
     roles[nfds++] = 4;
+    if (session.memory_pressure_fd >= 0 && !session.memory_pressure_sent) {
+      fds[nfds].fd = session.memory_pressure_fd;
+      fds[nfds].events = POLLPRI | POLLERR;
+      fds[nfds].revents = 0;
+      roles[nfds++] = 5;
+    }
 
     int poll_timeout_ms = session.file_stdio && session.started && !session.exited ? 10 : 100;
     int pr = poll(fds, nfds, poll_timeout_ms);
@@ -1463,6 +1563,8 @@ int main(void) {
           pump_session_stream(&session, &client, 0);
         } else if (roles[i] == 4) {
           drain_sigchld_wakeup();
+        } else if (roles[i] == 5 && (fds[i].revents & (POLLPRI | POLLERR))) {
+          maybe_send_memory_pressure(&session, &client);
         }
       }
     }
@@ -1471,7 +1573,6 @@ int main(void) {
       pump_session_file(&session, &client, 0);
     }
     poll_session_exit(&session, &client);
-    if (pr == 0) maybe_send_memory_ready(&session, &client);
     maybe_send_session_exit(&session, &client);
   }
 }
