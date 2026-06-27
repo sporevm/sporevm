@@ -11,9 +11,13 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 2;
+const c_abi_version: u32 = 6;
 const inspect_bundle_options_version: u32 = 1;
-const create_named_options_version: u32 = 2;
+const system_df_options_version: u32 = 1;
+const system_prune_options_version: u32 = 1;
+const create_named_options_version: u32 = 3;
+const resume_named_options_version: u32 = 1;
+const fork_named_options_version: u32 = 1;
 const exec_named_options_version: u32 = 2;
 const snapshot_named_options_version: u32 = 1;
 const suspend_named_options_version: u32 = 1;
@@ -52,6 +56,25 @@ const SporeInspectBundleOptions = extern struct {
     child_range_end: u32,
 };
 
+const SporeSystemDfOptions = extern struct {
+    size: u32,
+    version: u32,
+    rootfs_cache: SporeString,
+};
+
+const SporeSystemPruneOptions = extern struct {
+    size: u32,
+    version: u32,
+    rootfs_cache: SporeString,
+    dry_run: u8,
+    include_digest_artifacts: u8,
+    has_older_than_seconds: u8,
+    older_than_seconds: u64,
+    has_max_bytes: u8,
+    max_bytes: u64,
+    rootfs_only: u8,
+};
+
 const SporeCreateNamedOptions = extern struct {
     size: u32,
     version: u32,
@@ -68,6 +91,10 @@ const SporeCreateNamedOptions = extern struct {
     timeout_ms: u64,
     console_log_path: SporeString,
     network_enabled: u8,
+    allow_cidrs: ?[*]const SporeString,
+    allow_cidr_count: usize,
+    allow_hosts: ?[*]const SporeString,
+    allow_host_count: usize,
     network_rules: ?[*]const SporeNetworkRule,
     network_rule_count: usize,
     bound_unix_services: ?[*]const SporeBoundUnixService,
@@ -83,6 +110,23 @@ const SporeExecNamedOptions = extern struct {
     has_network_policy: u8,
     network_rules: ?[*]const SporeNetworkRule,
     network_rule_count: usize,
+};
+
+const SporeResumeNamedOptions = extern struct {
+    size: u32,
+    version: u32,
+    spore_dir: SporeString,
+    name: SporeString,
+    spore_executable: SporeString,
+};
+
+const SporeForkNamedOptions = extern struct {
+    size: u32,
+    version: u32,
+    source_name: SporeString,
+    count: usize,
+    name_pattern: SporeString,
+    spore_executable: SporeString,
 };
 
 const SporeSnapshotNamedOptions = extern struct {
@@ -147,6 +191,31 @@ pub export fn spore_inspect_bundle_options_init(options: ?*SporeInspectBundleOpt
     };
 }
 
+pub export fn spore_system_df_options_init(options: ?*SporeSystemDfOptions) void {
+    const out = options orelse return;
+    out.* = .{
+        .size = @sizeOf(SporeSystemDfOptions),
+        .version = system_df_options_version,
+        .rootfs_cache = .{},
+    };
+}
+
+pub export fn spore_system_prune_options_init(options: ?*SporeSystemPruneOptions) void {
+    const out = options orelse return;
+    out.* = .{
+        .size = @sizeOf(SporeSystemPruneOptions),
+        .version = system_prune_options_version,
+        .rootfs_cache = .{},
+        .dry_run = 1,
+        .include_digest_artifacts = 0,
+        .has_older_than_seconds = 0,
+        .older_than_seconds = 0,
+        .has_max_bytes = 0,
+        .max_bytes = 0,
+        .rootfs_only = 0,
+    };
+}
+
 pub export fn spore_create_named_options_init(options: ?*SporeCreateNamedOptions) void {
     const out = options orelse return;
     out.* = .{
@@ -165,6 +234,10 @@ pub export fn spore_create_named_options_init(options: ?*SporeCreateNamedOptions
         .timeout_ms = 30_000,
         .console_log_path = .{},
         .network_enabled = 0,
+        .allow_cidrs = null,
+        .allow_cidr_count = 0,
+        .allow_hosts = null,
+        .allow_host_count = 0,
         .network_rules = null,
         .network_rule_count = 0,
         .bound_unix_services = null,
@@ -183,6 +256,29 @@ pub export fn spore_exec_named_options_init(options: ?*SporeExecNamedOptions) vo
         .has_network_policy = 0,
         .network_rules = null,
         .network_rule_count = 0,
+    };
+}
+
+pub export fn spore_resume_named_options_init(options: ?*SporeResumeNamedOptions) void {
+    const out = options orelse return;
+    out.* = .{
+        .size = @sizeOf(SporeResumeNamedOptions),
+        .version = resume_named_options_version,
+        .spore_dir = .{},
+        .name = .{},
+        .spore_executable = .{},
+    };
+}
+
+pub export fn spore_fork_named_options_init(options: ?*SporeForkNamedOptions) void {
+    const out = options orelse return;
+    out.* = .{
+        .size = @sizeOf(SporeForkNamedOptions),
+        .version = fork_named_options_version,
+        .source_name = .{},
+        .count = 0,
+        .name_pattern = .{},
+        .spore_executable = .{},
     };
 }
 
@@ -334,6 +430,57 @@ pub export fn spore_inspect_bundle_json(
     return result_success;
 }
 
+pub export fn spore_system_df_json(
+    context: ?*SporeContextImpl,
+    options: ?*const SporeSystemDfOptions,
+    out_json: ?*SporeOwnedString,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    const out = out_json orelse return fail(ctx, error.InvalidValue);
+    out.* = .{};
+    ctx.clearLastError();
+    if (opts.version != system_df_options_version or opts.size < @sizeOf(SporeSystemDfOptions)) {
+        return fail(ctx, error.InvalidValue);
+    }
+
+    const result = libspore.systemDf(ctx.productContext(), ctx.allocator, .{
+        .rootfs_cache = cacheRootFromPath(optionalSlice(opts.rootfs_cache) catch |err| return fail(ctx, err)),
+    }) catch |err| return fail(ctx, err);
+    defer libspore.deinitRootfsSystemSummary(ctx.allocator, result);
+
+    out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_system_prune_json(
+    context: ?*SporeContextImpl,
+    options: ?*const SporeSystemPruneOptions,
+    out_json: ?*SporeOwnedString,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    const out = out_json orelse return fail(ctx, error.InvalidValue);
+    out.* = .{};
+    ctx.clearLastError();
+    if (opts.version != system_prune_options_version or opts.size < @sizeOf(SporeSystemPruneOptions)) {
+        return fail(ctx, error.InvalidValue);
+    }
+
+    const result = libspore.systemPrune(ctx.productContext(), ctx.allocator, .{
+        .rootfs_cache = cacheRootFromPath(optionalSlice(opts.rootfs_cache) catch |err| return fail(ctx, err)),
+        .dry_run = opts.dry_run != 0,
+        .include_digest_artifacts = opts.include_digest_artifacts != 0,
+        .older_than_seconds = if (opts.has_older_than_seconds != 0) opts.older_than_seconds else null,
+        .max_bytes = if (opts.has_max_bytes != 0) opts.max_bytes else null,
+        .rootfs_only = opts.rootfs_only != 0,
+    }) catch |err| return fail(ctx, err);
+    defer libspore.deinitRootfsPruneResult(ctx.allocator, result);
+
+    out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
 pub export fn spore_create_named_json(
     context: ?*SporeContextImpl,
     options: ?*const SporeCreateNamedOptions,
@@ -352,6 +499,8 @@ pub export fn spore_create_named_json(
     defer process_arena.deinit();
     const arena = process_arena.allocator();
     const init = cInit(ctx, &process_arena);
+    const allow_cidrs = parseStringList(arena, opts.allow_cidrs, opts.allow_cidr_count) catch |err| return fail(ctx, err);
+    const allow_hosts = parseStringList(arena, opts.allow_hosts, opts.allow_host_count) catch |err| return fail(ctx, err);
     const network_policy = parseNetworkPolicy(arena, opts.network_rules, opts.network_rule_count) catch |err| return fail(ctx, err);
     const bound_services = parseBoundUnixServices(arena, opts.bound_unix_services, opts.bound_unix_service_count) catch |err| return fail(ctx, err);
     const result = libspore.createNamed(init, ctx.allocator, .{
@@ -363,6 +512,8 @@ pub export fn spore_create_named_json(
         .image_ref = optionalSlice(opts.image_ref) catch |err| return fail(ctx, err),
         .network = .{
             .enabled = opts.network_enabled != 0,
+            .allow_cidrs = allow_cidrs,
+            .allow_hosts = allow_hosts,
             .policy = network_policy,
             .bound_services = bound_services,
         },
@@ -407,6 +558,63 @@ pub export fn spore_exec_named_json(
         .network_policy = network_policy,
     }) catch |err| return fail(ctx, err);
     defer libspore.deinitExecNamedResult(ctx.allocator, result);
+
+    out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_resume_named_json(
+    context: ?*SporeContextImpl,
+    options: ?*const SporeResumeNamedOptions,
+    out_json: ?*SporeOwnedString,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    const out = out_json orelse return fail(ctx, error.InvalidValue);
+    out.* = .{};
+    ctx.clearLastError();
+    if (opts.version != resume_named_options_version or opts.size < @sizeOf(SporeResumeNamedOptions)) {
+        return fail(ctx, error.InvalidValue);
+    }
+
+    var process_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer process_arena.deinit();
+    const init = cInit(ctx, &process_arena);
+    const result = libspore.resumeNamed(init, ctx.allocator, .{
+        .spore_dir = toSlice(opts.spore_dir) catch |err| return fail(ctx, err),
+        .name = toSlice(opts.name) catch |err| return fail(ctx, err),
+        .spore_executable = (optionalSlice(opts.spore_executable) catch |err| return fail(ctx, err)) orelse "spore",
+    }) catch |err| return fail(ctx, err);
+    defer libspore.deinitNamedLifecycleResult(ctx.allocator, result);
+
+    out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_fork_named_json(
+    context: ?*SporeContextImpl,
+    options: ?*const SporeForkNamedOptions,
+    out_json: ?*SporeOwnedString,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    const out = out_json orelse return fail(ctx, error.InvalidValue);
+    out.* = .{};
+    ctx.clearLastError();
+    if (opts.version != fork_named_options_version or opts.size < @sizeOf(SporeForkNamedOptions)) {
+        return fail(ctx, error.InvalidValue);
+    }
+
+    var process_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer process_arena.deinit();
+    const init = cInit(ctx, &process_arena);
+    const result = libspore.forkNamed(init, ctx.allocator, .{
+        .source_name = toSlice(opts.source_name) catch |err| return fail(ctx, err),
+        .count = opts.count,
+        .name_pattern = toSlice(opts.name_pattern) catch |err| return fail(ctx, err),
+        .spore_executable = (optionalSlice(opts.spore_executable) catch |err| return fail(ctx, err)) orelse "spore",
+    }) catch |err| return fail(ctx, err);
+    defer libspore.deinitNamedForkResult(ctx.allocator, result);
 
     out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
     return result_success;
@@ -515,6 +723,10 @@ fn optionalSlice(value: SporeString) !?[]const u8 {
     return try toSlice(value);
 }
 
+fn cacheRootFromPath(path: ?[]const u8) libspore.CacheRoot {
+    return if (path) |value| .{ .path = value } else .env;
+}
+
 fn cInit(ctx: *SporeContextImpl, arena: *std.heap.ArenaAllocator) std.process.Init {
     return .{
         .minimal = undefined,
@@ -550,6 +762,16 @@ fn parseNetworkPolicy(allocator: std.mem.Allocator, raw: ?[*]const SporeNetworkR
         };
     }
     return .{ .allow = allow };
+}
+
+fn parseStringList(allocator: std.mem.Allocator, raw: ?[*]const SporeString, len: usize) ![]const []const u8 {
+    if (len == 0) return &.{};
+    const values = raw orelse return error.InvalidValue;
+    const out = try allocator.alloc([]const u8, len);
+    for (out, values[0..len]) |*item, value| {
+        item.* = try toSlice(value);
+    }
+    return out;
 }
 
 fn parseBoundUnixServices(allocator: std.mem.Allocator, raw: ?[*]const SporeBoundUnixService, len: usize) ![]const libspore.BoundService {
@@ -591,7 +813,7 @@ fn fail(ctx: *SporeContextImpl, err: anyerror) c_int {
     ctx.setLastError(@errorName(err));
     return switch (err) {
         error.OutOfMemory => result_out_of_memory,
-        error.InvalidValue => result_invalid_value,
+        error.InvalidPruneSelection, error.InvalidValue => result_invalid_value,
         else => result_error,
     };
 }
@@ -607,6 +829,18 @@ test "inspect bundle options initialize size and version" {
     spore_inspect_bundle_options_init(&options);
     try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeInspectBundleOptions))), options.size);
     try std.testing.expectEqual(inspect_bundle_options_version, options.version);
+
+    var df_options: SporeSystemDfOptions = undefined;
+    spore_system_df_options_init(&df_options);
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeSystemDfOptions))), df_options.size);
+    try std.testing.expectEqual(system_df_options_version, df_options.version);
+
+    var prune_options: SporeSystemPruneOptions = undefined;
+    spore_system_prune_options_init(&prune_options);
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeSystemPruneOptions))), prune_options.size);
+    try std.testing.expectEqual(system_prune_options_version, prune_options.version);
+    try std.testing.expectEqual(@as(u8, 1), prune_options.dry_run);
+    try std.testing.expectEqual(@as(u8, 0), prune_options.include_digest_artifacts);
 }
 
 test "named lifecycle options initialize defaults" {
@@ -618,6 +852,8 @@ test "named lifecycle options initialize defaults" {
     try std.testing.expectEqual(@as(u32, 10700), create.guest_port);
     try std.testing.expectEqual(@as(u64, 30_000), create.timeout_ms);
     try std.testing.expectEqual(@as(u8, 0), create.network_enabled);
+    try std.testing.expectEqual(@as(usize, 0), create.allow_cidr_count);
+    try std.testing.expectEqual(@as(usize, 0), create.allow_host_count);
     try std.testing.expectEqual(@as(usize, 0), create.network_rule_count);
     try std.testing.expectEqual(@as(usize, 0), create.bound_unix_service_count);
 
@@ -625,6 +861,14 @@ test "named lifecycle options initialize defaults" {
     spore_exec_named_options_init(&exec);
     try std.testing.expectEqual(exec_named_options_version, exec.version);
     try std.testing.expectEqual(@as(u8, 0), exec.has_network_policy);
+
+    var resume_options: SporeResumeNamedOptions = undefined;
+    spore_resume_named_options_init(&resume_options);
+    try std.testing.expectEqual(resume_named_options_version, resume_options.version);
+
+    var fork_options: SporeForkNamedOptions = undefined;
+    spore_fork_named_options_init(&fork_options);
+    try std.testing.expectEqual(fork_named_options_version, fork_options.version);
 
     var snapshot: SporeSnapshotNamedOptions = undefined;
     spore_snapshot_named_options_init(&snapshot);

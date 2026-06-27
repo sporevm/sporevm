@@ -6,11 +6,17 @@ spec_refs:
   - docs/plans/run-bridge.md
   - docs/plans/distribution.md
   - docs/spore-format.md
+  - docs/libspore.md
+  - src/api.zig
+  - src/libspore.zig
+  - src/c_api.zig
   - src/main.zig
   - src/platform.zig
   - src/bundle.zig
   - src/run.zig
   - src/resume.zig
+  - include/spore.h
+  - bindings/go/spore.go
 related_plans:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
@@ -22,22 +28,26 @@ related_plans:
 ## Summary
 
 SporeVM needs a stable machine interface that is useful from scripts, services,
-tests, and future embedded callers without making the CLI the only architecture
-boundary. The first public contract should remain process-based: commands accept
-normal arguments, single-result commands default to human output, and
-`spore --json <command>` is the only one-document machine-output mode.
+tests, and embedded callers without making the CLI the only architecture
+boundary. The process contract remains the widest compatibility surface:
+commands accept normal arguments, single-result commands default to human
+output, and `spore --json <command>` is the only one-document machine-output
+mode.
 
-The implementation should be factored as though a library transport exists:
-command handlers call product APIs, product APIs return typed result structs,
-and the CLI is one serializer over those structs. The source-level Zig module is
-published as `libspore` first; a future C ABI can then wrap the same APIs without
-re-defining behavior or exposing raw Zig structs as a public ABI.
+The implementation should be factored around one product API: every `spore` CLI
+command delegates product behavior to the same source used by `libspore`,
+product APIs return typed result structs, and the CLI is one parser and
+serializer over those structs. The source-level Zig module is published as
+`libspore`; the C ABI wraps settled calls without exposing raw Zig structs; the
+Go interface should be an idiomatic cgo adapter over that C ABI, not a second
+runtime implementation or a CLI wrapper.
 
 This plan deliberately keeps the contract SporeVM-native. The abstractions are
 host facts, bundle inspection, materialization, run/resume lifecycle events,
 cache roots, and classified failures. They should compose with any caller that
-can execute a process or embed a C ABI, without naming a particular higher-level
-system in the product contract.
+can execute a process, import the Zig module, embed the C ABI, or use a Go
+binding, without naming a particular higher-level system in the product
+contract.
 
 ## Problem
 
@@ -50,14 +60,14 @@ machine interface:
 - error classification is mostly internal Zig error names;
 - typed result structs live with the implementation but are not clearly owned as
   product contracts;
-- a future embedding surface would either duplicate CLI behavior or depend on
+- additional embedding surfaces would either duplicate CLI behavior or depend on
   command parsing details.
 
 The repository is still pre-1.0, so this plan should use a breaking
 normalization rather than preserve ad hoc output compatibility. Without a single
 model, callers learn command-specific conventions and then carry those
 conventions forever. That makes it harder to tighten error handling, add event
-streams, or expose a library transport later.
+streams, or keep library transports aligned.
 
 ## Goals
 
@@ -67,10 +77,11 @@ streams, or expose a library transport later.
 - Use one shared JSON error envelope for SporeVM-originated failures.
 - Keep stream output explicit through a separate JSONL event mode for commands
   that need lifecycle events.
-- Factor command implementations through product APIs before adding any public C
-  ABI.
-- Make a future `libspore` transport a wrapper over the same product API and
-  JSON contracts, not a second behavior surface.
+- Keep all `spore` CLI product behavior behind `src/api.zig` and exported
+  through `src/libspore.zig`, so the CLI, C ABI, and Go binding share behavior.
+- Make C and Go library surfaces wrappers over the same product API and JSON
+  contracts, not second behavior surfaces.
+- Add Go methods only after the matching product call and C ABI endpoint exist.
 - Keep docs and field names generic: callers, automation, embedding, host,
   bundle, cache, run, resume, and materialization.
 - Normalize existing JSON-default single-result commands so human summaries are
@@ -87,6 +98,10 @@ streams, or expose a library transport later.
 - No formal JSON Schema files in the first slice unless they are generated from
   or tested against the Zig-owned contracts.
 - No conversion of guest stdout/stderr into JSON for normal `spore run`.
+- No Go-native reimplementation of VM execution, bundle handling, cache policy,
+  or command parsing.
+- No Go CLI fallback path in the binding; Go callers should fail clearly when
+  the required `libspore` C ABI is unavailable.
 
 ## Target Model
 
@@ -154,34 +169,87 @@ CLI parse
   -> product API call
     -> typed result or typed error
       -> CLI JSON/text/event serializer
-      -> later C ABI JSON/callback serializer
+
+C ABI entrypoint
+  -> product API call
+    -> JSON string or event callback serializer
+
+Go package
+  -> C ABI entrypoint
+    -> decoded Go struct or typed event callback
 ```
 
-The C ABI, if added, should be deliberately narrow and allocation-safe:
+The CLI may own argv parsing, usage text, exit-status mapping, and output
+serialization. It must not own runtime, bundle, manifest, cache, lifecycle,
+network, or host-capability behavior. If a command needs product behavior that
+is not present in `src/api.zig`, add the product operation first and make the
+CLI call it.
+
+The C ABI should stay deliberately narrow and allocation-safe:
 
 ```c
-typedef struct spore_inspect_bundle_options {
+typedef struct SporeInspectBundleOptions {
     uint32_t size;
     uint32_t version;
     /* versioned fields follow */
-} spore_inspect_bundle_options_t;
+} SporeInspectBundleOptions;
 
-spore_result_t spore_host_info_json(spore_context_t *, char **out_json);
-spore_result_t spore_inspect_bundle_json(spore_context_t *, const spore_inspect_bundle_options_t *, char **out_json);
-spore_result_t spore_pull_json(spore_context_t *, const spore_pull_options_t *, char **out_json);
-spore_result_t spore_resume_events(spore_context_t *, const spore_resume_options_t *, spore_event_callback_t, void *);
-void spore_free_string(spore_context_t *, char *);
+SporeResult spore_host_info_json(SporeContext context, SporeOwnedString *out_json);
+SporeResult spore_inspect_bundle_json(SporeContext context,
+                                      const SporeInspectBundleOptions *options,
+                                      SporeOwnedString *out_json);
+SporeResult spore_pull_json(SporeContext context,
+                            const SporePullOptions *options,
+                            SporeOwnedString *out_json);
+SporeResult spore_resume_events(SporeContext context,
+                                const SporeResumeOptions *options,
+                                SporeEventCallback callback,
+                                void *callback_context);
+void spore_free_string(SporeContext context, SporeOwnedString string);
 ```
 
-The ABI returns JSON strings or calls event callbacks. It does not expose Zig
-allocators, slices, error sets, or struct layout. Every public C options struct
-must start with `size` and `version`, and ABI entrypoints must fail closed on
-unknown incompatible versions.
+The shipped header currently exposes build info, context management, environment
+overrides, host-info JSON, network capabilities JSON, inspect-bundle JSON, named
+lifecycle JSON, context-local errors, and owned-string cleanup. Pull and resume
+show the next-operation shape, not a separate ABI style. The ABI returns JSON
+strings or calls event callbacks. It does not expose Zig allocators, slices,
+error sets, or struct layout. Every public C options struct must start with
+`size` and `version`, and ABI entrypoints must fail closed on unknown
+incompatible versions.
+
+The Go package should live in `bindings/go` until packaging pressure justifies a
+separate repository. Its public surface should decode the same JSON contracts
+into Go structs and adapt C event callbacks into Go callbacks:
+
+```go
+client, err := spore.New()
+defer client.Close()
+
+info, err := client.HostInfo(ctx)
+
+bundle, err := client.InspectBundle(ctx, spore.InspectBundleOptions{
+    Source: "file:///tmp/base.bundle",
+})
+```
+
+Go `context.Context` support should be honest. Short metadata calls can check
+context before entering C. Long-running run/resume cancellation should not be
+promised until the Zig product API and C ABI expose a cancellation primitive.
+
+New public operations should graduate in this order:
+
+1. Zig product API in `src/api.zig` and exported through `src/libspore.zig`.
+2. CLI serializer or event stream when the operation has a CLI command.
+3. C ABI wrapper with size/version options, owned-string cleanup, and a C smoke.
+4. Go wrapper over the C ABI with decoded structs and a Go test.
 
 ## Contract Ownership
 
 Canonical schema ownership stays in code:
 
+- `src/api.zig` should own product operation options, result ownership rules,
+  and the backend-neutral shape consumed by all adapters.
+- `src/libspore.zig` should re-export only the product-facing Zig surface.
 - `src/machine_output.zig` should own shared schema constants, error envelope
   structs, digest references, cache-state names, rootfs references, and common
   event/result helpers.
@@ -189,8 +257,14 @@ Canonical schema ownership stays in code:
 - `src/bundle.zig` should own bundle inspection and pull result structs.
 - run/resume event structs should live with the run/resume lifecycle code, while
   reusing the shared error envelope.
+- `src/c_api.zig` should translate settled product calls into C-owned JSON
+  strings, error codes, context-local last errors, and callbacks.
+- `bindings/go` should translate C ABI calls into idiomatic Go structs and
+  callbacks without adding behavior that is not present in `libspore`.
 - `src/main.zig` should only parse CLI arguments and serialize the typed result
-  or typed error.
+  or typed error. It may import the internal module root for Zig build-system
+  reasons, but CLI command bodies should call the product API rather than
+  backend, storage, manifest, or lifecycle internals directly.
 
 Durable docs should explain the contract without duplicating every field as the
 source of truth. A later `schemas/` directory is useful only if external
@@ -266,6 +340,14 @@ The first implementation should pin a small stable code table in tests:
   backend fact or capability.
 - Library bindings must not depend on Zig ABI stability or caller-owned Zig
   allocators.
+- Each `spore` CLI command must route product behavior through the same API
+  surface exported by `libspore`; direct calls into lower-level internals are
+  acceptable only when implementing that product API, not when handling CLI
+  commands.
+- Each C or Go entrypoint must map to one product operation. If a binding needs
+  behavior not present in `src/api.zig`, add the product operation first.
+- Go bindings must not shell out to `spore`; process-based callers already have
+  the CLI contract.
 
 ## Current Progress
 
@@ -288,7 +370,7 @@ The first implementation should pin a small stable code table in tests:
   failures emit `failure` records using the shared error classification. Older
   parser/setup direct exits remain a follow-up hardening item outside the
   runtime stream path.
-- Slice 5 is implemented in this branch: `src/api.zig` exposes option-based
+- Slice 5 is active in this branch: `src/api.zig` exposes option-based
   product calls for run, managed fresh run setup, `run --from` semantics,
   resume, host-info, inspect, fork, pack, unpack, push, inspect-bundle, and
   pull; run/resume expose typed event callbacks instead of CLI JSONL writer
@@ -296,8 +378,14 @@ The first implementation should pin a small stable code table in tests:
   cache choices; most public calls take a small `libspore.Context`, while
   managed fresh runs take `std.process.Init` because image/rootfs and kernel
   setup can spawn tools, use process IO, and resolve process environment; and
-  the CLI routes single-result host, manifest, fork, and bundle commands through
+  the CLI has begun routing single-result host, manifest, fork, bundle, and
+  named `create`/`resume`/`fork`/`exec`/`rm`/`suspend`/`ls` commands through
   the API boundary instead of using command parsing as the product interface.
+  `system df` and `system prune` now share typed rootfs cache summary and prune
+  operations with `libspore`, with dry-run/default-selection behavior owned by
+  that API layer.
+  Remaining CLI product paths should move behind the same boundary before the
+  surface is considered complete.
   The public Zig module now exposes explicit deinit helpers for owned result
   fields and classified failure values for run/resume events instead of raw Zig
   error names.
@@ -306,11 +394,17 @@ The first implementation should pin a small stable code table in tests:
   belong to only one module in a compilation unit; external embedders should
   import `libspore`. Initrd assets, zmoltcp, and hypervisor linkage are module
   dependencies for VM execution but are not part of the public facade.
-- Slice 6 is implemented in this branch: `include/spore.h` declares the first
+- Slice 6 is implemented on main: `include/spore.h` declares the first
   C ABI, `src/c_api.zig` wraps the product API behind opaque context and owned
   string helpers, the build installs shared/static `libspore` artifacts plus a
-  pkg-config file, and a C smoke covers build info, option initialization, and
-  host-info JSON on aarch64 hosts.
+  pkg-config file, and C smoke coverage includes build info, option
+  initialization, network capabilities, host-info JSON, inspect-bundle defaults,
+  and named lifecycle defaults on aarch64 hosts.
+- Slice 7 is implemented in this branch: `bindings/go` provides a cgo wrapper
+  over the existing C ABI for build info, context lifetime, host-info, and
+  inspect-bundle. The Go package decodes the same JSON contracts into Go
+  structs, requires C ABI version 6 or newer, and intentionally exposes no
+  runtime methods until the matching runtime C ABI calls exist.
 
 ## Delivery Strategy
 
@@ -368,25 +462,48 @@ target model.
 
 ### Slice 5: Product API Boundary
 
-Move CLI command bodies behind a small product API layer in `src/api.zig`, where
-this reduces duplication. The goal is not a broad framework; the goal is that
-command parsing, product behavior, and serialization are separable.
+Move all CLI product behavior behind a small product API layer in `src/api.zig`.
+The goal is not a broad framework; the goal is that command parsing, product
+behavior, and serialization are separable, and that the CLI does not become a
+second source of truth beside `libspore`.
 
-Done when run, resume, host-info, inspect, fork, pack, unpack, push,
-inspect-bundle, and pull can be called without constructing argv arrays, and
-run/resume event consumers receive typed callbacks rather than CLI writer
-plumbing.
+Done when every `spore` command that performs product work calls a product API
+instead of lower-level implementation modules, run/resume/host-info/inspect/
+fork/pack/unpack/push/inspect-bundle/pull can be called without constructing
+argv arrays, and run/resume event consumers receive typed callbacks rather than
+CLI writer plumbing.
 
-### Slice 6: Optional C ABI
+### Slice 6: First C ABI
 
-Add `src/c_api.zig` only after the internal API has held up through the CLI
-slices. The first ABI should expose JSON strings and event callbacks, not raw
-Zig data. All public C option structs must carry `size` and `version` fields,
-and unsupported versions must return a structured error rather than attempting a
-best-effort interpretation.
+The first C ABI lives in `src/c_api.zig` and should only grow after the internal
+API has held up through the CLI slices. The ABI should expose JSON strings and
+event callbacks, not raw Zig data. All public C option structs must carry `size`
+and `version` fields, and unsupported versions must return a structured error
+rather than attempting a best-effort interpretation.
 
 Done when a tiny C smoke can call host-info or inspect-bundle, free returned
 strings correctly, and observe the same JSON contract as the CLI.
+
+### Slice 7: First Go Binding
+
+Add `bindings/go` as a cgo package over the existing C ABI. Keep the first
+surface to build info, context lifetime, host-info, and inspect-bundle.
+
+Done when Go tests can construct a client, call host-info and inspect-bundle
+through `libspore`, decode the returned JSON into Go structs with schema fields,
+free C-owned strings, and fail clearly when the library cannot be loaded or the
+C ABI version is unsupported.
+
+### Slice 8: Runtime Calls Through C And Go
+
+Only after the first Go binding lands, add the next runtime-oriented C ABI
+operation and Go wrapper. Prefer `pull`, `runFromSpore`, and `resumeSpore`
+before exposing low-level `run`, because they are the product operations most
+callers should use.
+
+Done when the Zig API, CLI JSON or event stream, C ABI, and Go binding all
+observe the same result schema, event ordering, terminal-event rule, error
+classification, and ownership rules.
 
 ## Verification
 
@@ -398,6 +515,10 @@ strings correctly, and observe the same JSON contract as the CLI.
 - JSONL tests that parse each emitted run/resume event line independently.
 - Snapshot tests for human defaults on commands that previously emitted JSON by
   default.
+- C ABI smoke tests for every exported operation, including options
+  initialization and owned-string cleanup.
+- Go binding tests that decode the same JSON contracts rather than asserting a
+  separate Go-only schema.
 - Existing bundle, rootfs, run, resume, and smoke tests continue to pass.
 - `mise run check` remains the default local gate.
 
@@ -408,9 +529,9 @@ against them and verify that the schemas match the Zig-owned result structs.
 
 - A broad `--machine-readable` flag would hide whether a command emits one JSON
   document or a stream. The plan keeps `--json` and `--events=jsonl` separate.
-- A library-first public ABI would force ABI and memory-ownership decisions too
-  early. The plan factors code for embedding first, then adds a C ABI only if
-  the product APIs settle.
+- A library-first public ABI would have forced ABI and memory-ownership
+  decisions too early. The plan factors code for embedding first, and future C
+  ABI expansion plus Go binding work still follows settled product APIs.
 - Duplicating schemas in docs or hand-written JSON Schema files would drift from
   the Zig implementation. The plan keeps Zig structs authoritative and treats
   external schema artifacts as generated or test-verified follow-up work.
@@ -428,6 +549,12 @@ against them and verify that the schemas match the Zig-owned result structs.
 - Library result ownership needs to be explicit even before a C ABI exists.
   Arena allocation is fine for many Zig callers, but the public module should
   still name which result fields it owns and provide matching cleanup helpers.
+- The Go API should not get ahead of the C ABI. Letting Go shell out to the CLI
+  would be quick, but it would create a fourth behavior surface instead of
+  testing the embedding contract.
+- Allowing new CLI commands to call internals directly is the easiest way to
+  drift. The plan treats CLI direct-to-internals code as transitional debt: add
+  or deepen the product API first, then parse argv into that API.
 
 ## Resolved Decisions
 
@@ -438,9 +565,15 @@ against them and verify that the schemas match the Zig-owned result structs.
 - Command-local `--json` flags are not part of the public machine interface.
 - Machine-mode parser failures use the shared JSON error envelope.
 - JSON result and error contracts are owned by typed Zig structs.
-- Future library bindings should expose JSON strings and callbacks through a C
-  ABI, not raw Zig structs. Public C options structs must be size- and
-  version-tagged.
+- All `spore` CLI product behavior delegates to the `libspore` product source
+  of truth. The CLI owns parsing and serialization, not VM, bundle, manifest,
+  cache, lifecycle, host-capability, or network behavior.
+- Library bindings expose JSON strings and callbacks through a C ABI, not raw
+  Zig structs. Public C options structs must be size- and version-tagged.
+- The Go binding starts in `bindings/go`, uses cgo over the C ABI, and decodes
+  the same JSON contracts into Go structs.
+- Go methods are added only after the matching Zig product API and C ABI
+  endpoint exist.
 - Contract docs must remain integration-neutral.
 
 ## Open Questions

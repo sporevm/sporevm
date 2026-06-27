@@ -50,10 +50,37 @@ Use the matching helper for owned results:
 - `deinitPullResult`
 - `deinitNamedLifecycleResult`
 - `deinitExecNamedResult`
+- `deinitNamedForkResult`
 - `deinitNamedList`
+- `deinitRootfsSystemSummary`
+- `deinitRootfsPruneResult`
 
 `run`, `runManaged`, `runFromSpore`, and `resumeSpore` return value results and
 do not need deinit.
+
+## Local System
+
+Use `systemDf` and `systemPrune` for rootfs cache inspection and cleanup without
+constructing `spore system` argv:
+
+```zig
+const summary = try libspore.systemDf(context, allocator, .{
+    .rootfs_cache = .env,
+});
+defer libspore.deinitRootfsSystemSummary(allocator, summary);
+
+const pruned = try libspore.systemPrune(context, allocator, .{
+    .rootfs_cache = .env,
+    .dry_run = true,
+    .older_than_seconds = 7 * 24 * 60 * 60,
+});
+defer libspore.deinitRootfsPruneResult(allocator, pruned);
+```
+
+`systemPrune` is dry-run by default. When no age or size limit is provided, it
+selects the same default-prunable rootfs entries as `spore system prune`.
+Digest/CAS artifacts require an explicit `older_than_seconds` or `max_bytes`
+limit.
 
 ## Running
 
@@ -101,11 +128,26 @@ const snap = try libspore.snapshotNamed(context, allocator, .{
     .continue_after = true,
 });
 defer libspore.deinitNamedLifecycleResult(allocator, snap);
+
+const resumed = try libspore.resumeNamed(init, allocator, .{
+    .spore_dir = "worker-1.spore",
+    .name = "worker-2",
+});
+defer libspore.deinitNamedLifecycleResult(allocator, resumed);
+
+const forked = try libspore.forkNamed(init, allocator, .{
+    .source_name = "worker-2",
+    .count = 2,
+    .name_pattern = "worker-child-%d",
+});
+defer libspore.deinitNamedForkResult(allocator, forked);
 ```
 
 The named surface is:
 
 - `createNamed`
+- `resumeNamed`
+- `forkNamed`
 - `execNamed`
 - `snapshotNamed`
 - `suspendNamed`
@@ -113,8 +155,8 @@ The named surface is:
 - `listNamed`
 
 `snapshotNamed` currently supports snapshot-and-continue only. Use
-`deinitNamedLifecycleResult`, `deinitExecNamedResult`, and `deinitNamedList`
-for owned results.
+`deinitNamedLifecycleResult`, `deinitExecNamedResult`,
+`deinitNamedForkResult`, and `deinitNamedList` for owned results.
 
 ## Networking
 
@@ -306,6 +348,12 @@ create.name = (SporeString){ .ptr = "worker-1", .len = 8 };
 create.spore_executable = (SporeString){ .ptr = "/usr/local/bin/spore", .len = 20 };
 
 uint16_t github_ports[] = {443};
+SporeString allow_cidrs[] = {
+    { .ptr = "93.184.216.34/32", .len = 16 },
+};
+SporeString allow_hosts[] = {
+    { .ptr = "example.com", .len = 11 },
+};
 SporeNetworkRule rules[] = {
     {
         .host = { .ptr = "github.com", .len = 10 },
@@ -322,6 +370,10 @@ SporeBoundUnixService services[] = {
     },
 };
 create.network_enabled = 1;
+create.allow_cidrs = allow_cidrs;
+create.allow_cidr_count = 1;
+create.allow_hosts = allow_hosts;
+create.allow_host_count = 1;
 create.network_rules = rules;
 create.network_rule_count = 1;
 create.bound_unix_services = services;
@@ -333,3 +385,51 @@ spore_free_string(context, json);
 
 Set `SPOREVM_RUNTIME_DIR`, cache roots, and similar process settings with
 `spore_context_set_env` before calling lifecycle functions.
+
+## Go Binding
+
+The first Go binding lives in [`bindings/go`](../bindings/go). It is a thin cgo
+adapter over the C ABI, so `libspore` must be installed or discoverable through
+`pkg-config`.
+
+```go
+client, err := spore.New()
+if err != nil {
+    return err
+}
+defer client.Close()
+
+info, err := client.HostInfo(ctx)
+if err != nil {
+    return err
+}
+
+bundle, err := client.InspectBundle(ctx, spore.InspectBundleOptions{
+    Source: "file:///tmp/base.bundle",
+})
+if err != nil {
+    return err
+}
+
+_ = info
+_ = bundle
+```
+
+The initial surface covers build info, context lifetime, host-info, and
+inspect-bundle. It decodes the same JSON contracts as the CLI and C ABI, and it
+requires C ABI version 6 or newer. Go context cancellation is checked before
+entering short C calls; long-running runtime cancellation is not exposed until
+the Zig product API and C ABI provide it.
+
+From a source checkout, build `libspore` first and point Go at the generated
+pkg-config and dynamic library paths:
+
+```bash
+mise run build
+cd bindings/go
+PKG_CONFIG_PATH="$PWD/../../zig-out/lib/pkgconfig" \
+DYLD_LIBRARY_PATH="$PWD/../../zig-out/lib" \
+go test ./...
+```
+
+Use `LD_LIBRARY_PATH` instead of `DYLD_LIBRARY_PATH` on Linux.

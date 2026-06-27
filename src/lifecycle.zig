@@ -274,8 +274,17 @@ pub const NamedForkResult = struct {
     children: []const []const u8,
 };
 
+pub const ForkNamedOptions = struct {
+    source_name: []const u8,
+    count: usize,
+    name_pattern: []const u8,
+    spore_executable: []const u8 = "spore",
+};
+
 pub const NamedNetworkOptions = struct {
     enabled: bool = false,
+    allow_cidrs: []const []const u8 = &.{},
+    allow_hosts: []const []const u8 = &.{},
     policy: spore_net_policy.NetworkPolicy = .{},
     bound_services: []const spore_net_policy.BoundService = &.{},
 };
@@ -293,6 +302,12 @@ pub const CreateNamedOptions = struct {
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
+    spore_executable: []const u8 = "spore",
+};
+
+pub const ResumeNamedOptions = struct {
+    spore_dir: []const u8,
+    name: []const u8,
     spore_executable: []const u8 = "spore",
 };
 
@@ -346,11 +361,22 @@ const NamedNetworkConfig = struct {
 
 fn namedNetworkConfig(options: NamedNetworkOptions) !NamedNetworkConfig {
     if (!options.enabled) {
-        if (options.policy.allow.len != 0 or options.bound_services.len != 0) return error.InvalidNetworkPolicy;
+        if (options.allow_cidrs.len != 0 or
+            options.allow_hosts.len != 0 or
+            options.policy.allow.len != 0 or
+            options.bound_services.len != 0) return error.InvalidNetworkPolicy;
         return .{};
     }
     var config = run_mod.NetworkPolicy{};
-    try config.addNetworkPolicy(options.policy);
+    for (options.allow_cidrs) |cidr| {
+        try config.addAllowCidr(cidr);
+    }
+    for (options.allow_hosts) |host| {
+        try config.addAllowHost(host);
+    }
+    if (options.policy.allow.len != 0) {
+        try config.addNetworkPolicy(options.policy);
+    }
     for (options.bound_services) |service| {
         try config.addBoundService(service);
     }
@@ -361,6 +387,24 @@ pub fn createNamed(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     options: CreateNamedOptions,
+) !NamedLifecycleResult {
+    const start_ms = monotonicMs();
+    return createNamedWithTiming(init, allocator, options, .{
+        .start_ms = start_ms,
+        .parsed_ms = start_ms,
+    });
+}
+
+const CreateTimingAnchors = struct {
+    start_ms: u64,
+    parsed_ms: u64,
+};
+
+fn createNamedWithTiming(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: CreateNamedOptions,
+    timing: CreateTimingAnchors,
 ) !NamedLifecycleResult {
     if (options.rootfs_path != null and options.image_ref != null) return error.InvalidRootfsInput;
     if (!monitorBackendSupported(options.backend.name())) return error.HostUnsupported;
@@ -385,8 +429,10 @@ pub fn createNamed(
         .console_log_path = options.console_log_path,
     };
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
+    const paths_ms = monotonicMs();
     const state = try classifyVmState(arena, init.io, paths, pidAlive);
     if (state != .absent) return error.NamedVmExists;
+    const state_checked_ms = monotonicMs();
 
     const rootfs = try run_mod.resolveRootfsInputDetailed(init, arena, .{
         .rootfs_path = spec.rootfs_path,
@@ -394,13 +440,27 @@ pub fn createNamed(
         .command_name = "create",
         .record_artifact = spec.rootfs_path != null or spec.image_ref != null,
     });
+    const rootfs_resolved_ms = monotonicMs();
     spec.rootfs_path = if (rootfs.path) |path| try std.fs.path.resolve(arena, &.{path}) else null;
     spec.rootfs = rootfs.rootfs;
+    const rootfs_abspath_ms = monotonicMs();
     if (spec.rootfs != null) try writeSpec(arena, init.io, paths, spec);
 
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (named_network.mode == .spore) &named_network.policy else null;
     try spawnMonitorExecutable(init, arena, spec, options.spore_executable, spawn_policy);
+    const monitor_spawned_ms = monotonicMs();
     try waitForReadyResult(arena, init.io, paths, spec.timeout_ms);
+    const ready_ms = monotonicMs();
+    writeCreateTiming(arena, init.io, paths, .{
+        .parse_ms = timing.parsed_ms - timing.start_ms,
+        .paths_ms = paths_ms - timing.parsed_ms,
+        .state_check_ms = state_checked_ms - paths_ms,
+        .rootfs_resolve_ms = rootfs_resolved_ms - state_checked_ms,
+        .rootfs_abspath_ms = rootfs_abspath_ms - rootfs_resolved_ms,
+        .spawn_monitor_ms = monitor_spawned_ms - rootfs_abspath_ms,
+        .wait_ready_ms = ready_ms - monitor_spawned_ms,
+        .total_ms = ready_ms - timing.start_ms,
+    }) catch {};
 
     var ready = try readReady(arena, init.io, paths);
     defer ready.deinit();
@@ -410,6 +470,69 @@ pub fn createNamed(
         .state = "ready",
         .pid = ready.value.pid,
         .console_log_path = ready.value.console_log_path,
+    });
+}
+
+pub fn resumeNamed(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ResumeNamedOptions,
+) !NamedLifecycleResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const spore_dir = try resolveExistingSporeDirApi(arena, init.io, options.spore_dir);
+    var manifest = spore.loadManifest(arena, spore_dir) catch return error.InvalidSporeDir;
+    defer manifest.deinit();
+    const network_options = run_mod.networkOptionsFromManifest(arena, manifest.value.network) catch return error.InvalidNetworkPolicy;
+    const rootfs = try run_mod.resumeRootfsForRun(arena, manifest.value);
+    const disk = try run_mod.resumeDiskForRun(arena, manifest.value);
+    if (rootfs == null and manifest.value.devices.len != diskless_resume_device_count) return error.UnsupportedLifecycleDeviceModel;
+    const memory = memoryFromManifest(manifest.value) catch return error.InvalidMemorySize;
+
+    var lifecycle_spec = readSporeLifecycleSpec(arena, init.io, spore_dir) catch return error.InvalidLifecycleMetadata;
+    defer if (lifecycle_spec) |*spec| spec.deinit();
+    if (lifecycle_spec) |spec| {
+        if (spec.value.vcpus != 1) return error.UnsupportedLifecycleMetadata;
+    }
+
+    const base = if (lifecycle_spec) |spec| spec.value else Spec{ .name = options.name };
+    const spec = Spec{
+        .name = options.name,
+        .backend = base.backend,
+        .kernel_path = base.kernel_path,
+        .initrd_path = base.initrd_path,
+        .resume_dir = spore_dir,
+        .rootfs = rootfs,
+        .disk = disk,
+        .network = try run_mod.manifestNetworkFromOptions(arena, network_options.network, &network_options.policy),
+        .memory = memory,
+        .vcpus = 1,
+        .guest_port = base.guest_port,
+        .timeout_ms = base.timeout_ms,
+        .console_log_path = base.console_log_path,
+    };
+    if (!monitorBackendSupported(spec.backend)) return error.HostUnsupported;
+
+    const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
+    const state = try classifyVmState(arena, init.io, paths, pidAlive);
+    if (state != .absent) return error.NamedVmExists;
+    if (spec.rootfs != null or spec.disk != null) try writeSpec(arena, init.io, paths, spec);
+
+    const spawn_policy: ?*const run_mod.NetworkPolicy = if (network_options.network == .spore) &network_options.policy else null;
+    try spawnMonitorExecutable(init, arena, spec, options.spore_executable, spawn_policy);
+    try waitForReadyResult(arena, init.io, paths, spec.timeout_ms);
+
+    var ready = try readReady(arena, init.io, paths);
+    defer ready.deinit();
+    return ownedNamedLifecycleResult(allocator, .{
+        .action = "resumed",
+        .name = spec.name,
+        .state = "ready",
+        .pid = ready.value.pid,
+        .console_log_path = ready.value.console_log_path,
+        .spore_dir = spore_dir,
     });
 }
 
@@ -509,6 +632,76 @@ pub fn suspendNamed(
     });
 }
 
+pub fn forkNamed(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ForkNamedOptions,
+) !NamedForkResult {
+    if (options.count == 0) return error.InvalidForkCount;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const context = Context{ .io = init.io, .environ_map = init.environ_map };
+
+    const child_names = try renderForkNames(arena, options.name_pattern, options.count);
+    const source_paths = try apiPaths(context, arena, options.source_name);
+    const state = try classifyVmState(arena, init.io, source_paths, pidAlive);
+    if (state != .ready) return error.NamedVmNotReady;
+
+    var source_spec = readSpec(arena, init.io, source_paths) catch return error.NamedVmNotReady;
+    defer source_spec.deinit();
+    if (source_spec.value.rootfs_path != null or source_spec.value.image_ref != null or source_spec.value.rootfs != null or source_spec.value.disk != null) {
+        return error.UnsupportedNamedForkDisk;
+    }
+    if (source_spec.value.network != null) return error.UnsupportedNamedForkNetwork;
+    if (source_spec.value.vcpus != 1) return error.UnsupportedNamedForkVcpu;
+
+    for (child_names) |child_name| {
+        const child_paths = try apiPaths(context, arena, child_name);
+        const child_state = try classifyVmState(arena, init.io, child_paths, pidAlive);
+        if (child_state != .absent) return error.NamedVmExists;
+    }
+
+    var ready = readReady(arena, init.io, source_paths) catch return error.NamedVmNotReady;
+    defer ready.deinit();
+
+    const batch_dir = try hiddenForkBatchDir(arena, source_paths.runtime_root, options.source_name);
+    const snapshot_dir = try std.fs.path.resolve(arena, &.{ batch_dir, "source.spore" });
+    const children_dir = try std.fs.path.resolve(arena, &.{ batch_dir, "children" });
+    try ensureDirPath(init.io, batch_dir);
+    var cleanup_batch = true;
+    defer if (cleanup_batch) Io.Dir.cwd().deleteTree(init.io, batch_dir) catch {};
+
+    const response = try sendSnapshotRequest(arena, init.io, ready.value.control_socket_path, snapshot_dir);
+    if (!(snapshotResponseOk(arena, response) catch return error.BadMonitorResponse)) return error.MonitorRequestFailed;
+    try writeSporeLifecycleSpec(arena, init.io, snapshot_dir, source_spec.value);
+
+    _ = try spore.fork(arena, .{
+        .parent_dir = snapshot_dir,
+        .out_dir = children_dir,
+        .count = options.count,
+        .environ_map = init.environ_map,
+    });
+
+    var started = std.array_list.Managed([]const u8).init(arena);
+    for (child_names, 0..) |child_name, index| {
+        const spore_dir = try childSporeDir(arena, children_dir, index);
+        startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable) catch |err| {
+            cleanupStartedChildren(init, arena, started.items);
+            return err;
+        };
+        try started.append(child_name);
+    }
+
+    cleanup_batch = false;
+    return ownedNamedForkResult(allocator, .{
+        .source = options.source_name,
+        .count = options.count,
+        .children = child_names,
+    });
+}
+
 pub fn removeNamed(
     context: Context,
     allocator: std.mem.Allocator,
@@ -567,6 +760,12 @@ pub fn deinitExecNamedResult(allocator: std.mem.Allocator, result: ExecNamedResu
     allocator.free(result.network_events_jsonl);
 }
 
+pub fn deinitNamedForkResult(allocator: std.mem.Allocator, result: NamedForkResult) void {
+    allocator.free(result.source);
+    for (result.children) |child| allocator.free(child);
+    allocator.free(result.children);
+}
+
 pub fn createCli(
     init: std.process.Init,
     args: []const []const u8,
@@ -601,60 +800,56 @@ pub fn createCli(
     const allocator = init.arena.allocator();
     const parsed = try parseCreateArgs(args, allocator, stderr, mode);
     const parsed_ms = monotonicMs();
-    var spec = parsed.spec;
-    spec.network = try run_mod.manifestNetworkFromOptions(allocator, parsed.network, &parsed.network_policy);
-    const paths = try cliPaths(init, allocator, "create", spec.name);
-    const paths_ms = monotonicMs();
-    if (!monitorBackendSupported(spec.backend)) {
-        const message = "spore create: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "create"), message);
-    }
-    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
-    if (state != .absent) {
-        const message = allocLifecycleMessage(allocator, "spore create: VM already exists or has stale state: {s}", .{spec.name});
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
-    }
-    const state_checked_ms = monotonicMs();
-    const rootfs_resolution = try run_mod.resolveRootfsInputDetailedResult(init, allocator, .{
+    const spec = parsed.spec;
+    const full_args = try init.minimal.args.toSlice(allocator);
+    const result = createNamedWithTiming(init, allocator, .{
+        .name = spec.name,
+        .backend = run_mod.Backend.parse(spec.backend) orelse unreachable,
+        .kernel_path = spec.kernel_path,
+        .initrd_path = spec.initrd_path,
         .rootfs_path = spec.rootfs_path,
         .image_ref = spec.image_ref,
-        .command_name = "create",
-        .record_artifact = spec.rootfs_path != null or spec.image_ref != null,
-    });
-    const resolved_rootfs = switch (rootfs_resolution) {
-        .resolved => |rootfs| rootfs,
-        .failure => |failure| exitLifecycleCliError(allocator, stderr, mode, failure, failure.message),
+        .network = .{
+            .enabled = parsed.network == .spore,
+            .allow_cidrs = if (parsed.network == .spore) parsed.network_policy.allowCidrSlice() else &.{},
+            .allow_hosts = if (parsed.network == .spore) parsed.network_policy.allowHostSlice() else &.{},
+        },
+        .memory = spec.memory,
+        .vcpus = spec.vcpus,
+        .guest_port = spec.guest_port,
+        .timeout_ms = spec.timeout_ms,
+        .console_log_path = spec.console_log_path,
+        .spore_executable = full_args[0],
+    }, .{
+        .start_ms = start_ms,
+        .parsed_ms = parsed_ms,
+    }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "create", err),
+        error.HostUnsupported => {
+            const message = "spore create: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "create"), message);
+        },
+        error.NamedVmExists => {
+            const message = allocLifecycleMessage(allocator, "spore create: VM already exists or has stale state: {s}", .{spec.name});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+        },
+        error.InvalidNetworkPolicy, error.InvalidRootfsInput => {
+            const message = allocLifecycleMessage(allocator, "spore create: invalid configuration: {s}", .{@errorName(err)});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+        },
+        error.FileNotFound => {
+            const message = "spore create: required rootfs object was not found";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "create"), message);
+        },
+        error.MonitorReadyTimeout => {
+            const message = "spore create: timed out waiting for monitor readiness";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "create"), message);
+        },
+        else => |e| return e,
     };
-    const rootfs_resolved_ms = monotonicMs();
-    spec.rootfs_path = if (resolved_rootfs.path) |path| try std.fs.path.resolve(allocator, &.{path}) else null;
-    spec.rootfs = resolved_rootfs.rootfs;
-    const rootfs_abspath_ms = monotonicMs();
-    if (spec.rootfs != null) try writeSpec(allocator, init.io, paths, spec);
-    try spawnMonitor(init, allocator, spec, &parsed.network_policy);
-    const monitor_spawned_ms = monotonicMs();
-    try waitForReady("create", allocator, init.io, paths, spec.timeout_ms);
-    const ready_ms = monotonicMs();
-    writeCreateTiming(allocator, init.io, paths, .{
-        .parse_ms = parsed_ms - start_ms,
-        .paths_ms = paths_ms - parsed_ms,
-        .state_check_ms = state_checked_ms - paths_ms,
-        .rootfs_resolve_ms = rootfs_resolved_ms - state_checked_ms,
-        .rootfs_abspath_ms = rootfs_abspath_ms - rootfs_resolved_ms,
-        .spawn_monitor_ms = monitor_spawned_ms - rootfs_abspath_ms,
-        .wait_ready_ms = ready_ms - monitor_spawned_ms,
-        .total_ms = ready_ms - start_ms,
-    }) catch {};
+    defer deinitNamedLifecycleResult(allocator, result);
     if (mode == .json) {
-        var ready = try readReady(allocator, init.io, paths);
-        defer ready.deinit();
-        try machine_output.writeJson(allocator, stdout, LifecycleResult{
-            .action = "created",
-            .name = spec.name,
-            .state = "ready",
-            .pid = ready.value.pid,
-            .control_socket_path = ready.value.control_socket_path,
-            .console_log_path = ready.value.console_log_path,
-        });
+        try machine_output.writeJson(allocator, stdout, result);
     }
 }
 
@@ -665,23 +860,30 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     }
     const parsed = parseExecArgs(args);
     const allocator = init.arena.allocator();
-    const paths = try cliPaths(init, allocator, "exec", parsed.name);
-    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
-    if (state != .ready) {
-        std.debug.print("spore exec: VM is not ready: {s} ({s})\n", .{ parsed.name, state.name() });
-        std.process.exit(2);
-    }
-    var ready = lifecycleReadyOrExit(allocator, init.io, "exec", paths);
-    defer ready.deinit();
-    const response = sendExecRequest(allocator, init.io, ready.value.control_socket_path, parsed.command) catch |err| {
-        switch (err) {
-            error.MonitorUnavailable => std.debug.print("spore exec: monitor is unavailable for VM: {s}\n", .{parsed.name}),
-            else => std.debug.print("spore exec: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
-        }
-        std.process.exit(1);
+    const result = execNamed(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, allocator, .{
+        .name = parsed.name,
+        .command = parsed.command,
+    }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => cliRuntimePathExit("exec", err),
+        error.NamedVmNotReady => {
+            std.debug.print("spore exec: VM is not ready: {s}\n", .{parsed.name});
+            std.process.exit(2);
+        },
+        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+            switch (err) {
+                error.MonitorUnavailable => std.debug.print("spore exec: monitor is unavailable for VM: {s}\n", .{parsed.name}),
+                else => std.debug.print("spore exec: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
+            }
+            std.process.exit(1);
+        },
+        else => |e| return e,
     };
-    const code = try handleExecResponse(init, allocator, stdout, response);
-    if (code != 0) std.process.exit(code);
+    defer deinitExecNamedResult(allocator, result);
+    try writeExecNamedResult(stdout, result);
+    if (result.exit_code != 0) std.process.exit(result.exit_code);
 }
 
 pub fn rmCli(
@@ -706,34 +908,20 @@ pub fn rmCli(
     }
     const allocator = init.arena.allocator();
     const name = parseRmArgs(args, allocator, stderr, mode);
-    const paths = try cliPaths(init, allocator, "rm", name);
-    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
-    var removed_pid: ?i64 = null;
-    switch (state) {
-        .absent => {
+    const result = removeNamed(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, allocator, .{ .name = name }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "rm", err),
+        error.NamedVmNotFound => {
             const message = allocLifecycleMessage(allocator, "spore rm: VM not found: {s}", .{name});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "rm"), message);
         },
-        .ready => {
-            var ready = lifecycleReadyOrExit(allocator, init.io, "rm", paths);
-            defer ready.deinit();
-            removed_pid = ready.value.pid;
-            _ = sendShutdownRequest(allocator, init.io, ready.value.control_socket_path) catch {};
-            waitForPidExit(ready.value.pid, 5_000);
-            try Io.Dir.cwd().deleteTree(init.io, paths.vm_dir);
-        },
-        .incomplete, .stale => {
-            removed_pid = readPid(allocator, init.io, paths) catch null;
-            try Io.Dir.cwd().deleteTree(init.io, paths.vm_dir);
-        },
-    }
+        else => |e| return e,
+    };
+    defer deinitNamedLifecycleResult(allocator, result);
     if (mode == .json) {
-        try machine_output.writeJson(allocator, stdout, LifecycleResult{
-            .action = "removed",
-            .name = name,
-            .state = "absent",
-            .pid = removed_pid,
-        });
+        try machine_output.writeJson(allocator, stdout, result);
     }
 }
 
@@ -759,55 +947,34 @@ pub fn suspendCli(
     }
     const allocator = init.arena.allocator();
     const parsed = parseSuspendArgs(args, allocator, stderr, mode);
-    const out_dir = resolveNewOutputDir(allocator, init.io, stderr, mode, "suspend", parsed.out_dir);
-    const paths = try cliPaths(init, allocator, "suspend", parsed.name);
-    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
-    if (state != .ready) {
-        const message = allocLifecycleMessage(allocator, "spore suspend: VM is not ready: {s} ({s})", .{ parsed.name, state.name() });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
-    }
-    var spec = readSpec(allocator, init.io, paths) catch {
-        const message = "spore suspend: VM is not ready";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
+    const result = suspendNamed(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, allocator, .{
+        .name = parsed.name,
+        .out_dir = parsed.out_dir,
+    }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "suspend", err),
+        error.NamedVmNotReady => {
+            const message = allocLifecycleMessage(allocator, "spore suspend: VM is not ready: {s}", .{parsed.name});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
+        },
+        error.MissingRootfsIdentity => {
+            const message = "spore suspend: disk-backed lifecycle suspend requires recorded immutable rootfs identity";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
+        },
+        error.MonitorUnavailable, error.MonitorRequestFailed => {
+            const message = switch (err) {
+                error.MonitorUnavailable => allocLifecycleMessage(allocator, "spore suspend: monitor is unavailable for VM: {s}", .{parsed.name}),
+                else => allocLifecycleMessage(allocator, "spore suspend: monitor request failed for VM {s}: {s}", .{ parsed.name, @errorName(err) }),
+            };
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "suspend"), message);
+        },
+        else => |e| return e,
     };
-    defer spec.deinit();
-    if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
-        const message = "spore suspend: disk-backed lifecycle suspend requires recorded immutable rootfs identity";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
-    }
-    var ready = readReady(allocator, init.io, paths) catch {
-        const message = "spore suspend: VM is not ready";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
-    };
-    defer ready.deinit();
-    const response = sendSuspendRequest(allocator, init.io, ready.value.control_socket_path, out_dir) catch |err| {
-        const message = switch (err) {
-            error.MonitorUnavailable => allocLifecycleMessage(allocator, "spore suspend: monitor is unavailable for VM: {s}", .{parsed.name}),
-            else => allocLifecycleMessage(allocator, "spore suspend: monitor request failed for VM {s}: {s}", .{ parsed.name, @errorName(err) }),
-        };
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "suspend"), message);
-    };
-    if (try suspendResponseFailureMessage(allocator, response)) |response_message| {
-        const message = allocLifecycleMessage(allocator, "spore suspend: {s}", .{response_message});
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "suspend"), message);
-    }
-    var cleanup_after_suspend = true;
-    defer if (cleanup_after_suspend) {
-        waitForPidExit(ready.value.pid, 5_000);
-        Io.Dir.cwd().deleteTree(init.io, paths.vm_dir) catch {};
-    };
-    try writeSporeLifecycleSpec(allocator, init.io, out_dir, spec.value);
-    cleanup_after_suspend = false;
-    waitForPidExit(ready.value.pid, 5_000);
-    try Io.Dir.cwd().deleteTree(init.io, paths.vm_dir);
+    defer deinitNamedLifecycleResult(allocator, result);
     if (mode == .json) {
-        try machine_output.writeJson(allocator, stdout, LifecycleResult{
-            .action = "suspended",
-            .name = parsed.name,
-            .state = "checkpointed",
-            .pid = ready.value.pid,
-            .spore_dir = out_dir,
-        });
+        try machine_output.writeJson(allocator, stdout, result);
     }
 }
 
@@ -834,86 +1001,61 @@ pub fn forkCli(
 
     const allocator = init.arena.allocator();
     const parsed = parseForkArgs(args, allocator, stderr, mode);
-    const child_names = try renderForkNamesOrExit(allocator, "fork", parsed.name_pattern, parsed.count);
-    const source_paths = try cliPaths(init, allocator, "fork", parsed.source_name);
-    const state = try classifyVmState(allocator, init.io, source_paths, pidAlive);
-    if (state != .ready) {
-        std.debug.print("spore fork: VM is not ready: {s} ({s})\n", .{ parsed.source_name, state.name() });
-        std.process.exit(2);
-    }
-
-    var source_spec = readSpec(allocator, init.io, source_paths) catch {
-        std.debug.print("spore fork: VM is not ready\n", .{});
-        std.process.exit(2);
-    };
-    defer source_spec.deinit();
-    if (source_spec.value.rootfs_path != null or source_spec.value.image_ref != null or source_spec.value.rootfs != null or source_spec.value.disk != null) {
-        const message = "spore fork: disk-backed named live fork is not supported yet";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
-    }
-    if (source_spec.value.network != null) {
-        const message = "spore fork: networked named live fork is not supported yet";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
-    }
-    if (source_spec.value.vcpus != 1) {
-        const message = "spore fork: multi-vCPU named live fork is not supported yet";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
-    }
-
-    for (child_names) |child_name| {
-        const child_paths = try cliPaths(init, allocator, "fork", child_name);
-        const child_state = try classifyVmState(allocator, init.io, child_paths, pidAlive);
-        if (child_state != .absent) {
-            std.debug.print("spore fork: VM already exists or has stale state: {s}\n", .{child_name});
-            std.process.exit(2);
-        }
-    }
-
-    var ready = lifecycleReadyOrExit(allocator, init.io, "fork", source_paths);
-    defer ready.deinit();
-
-    const batch_dir = try hiddenForkBatchDir(allocator, source_paths.runtime_root, parsed.source_name);
-    const snapshot_dir = try std.fs.path.resolve(allocator, &.{ batch_dir, "source.spore" });
-    const children_dir = try std.fs.path.resolve(allocator, &.{ batch_dir, "children" });
-    try ensureDirPath(init.io, batch_dir);
-    var cleanup_batch = true;
-    defer if (cleanup_batch) Io.Dir.cwd().deleteTree(init.io, batch_dir) catch {};
-
-    const response = sendSnapshotRequest(allocator, init.io, ready.value.control_socket_path, snapshot_dir) catch |err| {
-        switch (err) {
-            error.MonitorUnavailable => std.debug.print("spore fork: monitor is unavailable for VM: {s}\n", .{parsed.source_name}),
-            else => std.debug.print("spore fork: monitor request failed for VM {s}: {s}\n", .{ parsed.source_name, @errorName(err) }),
-        }
-        std.process.exit(1);
-    };
-    if (!try handleSnapshotResponse("fork", allocator, response)) std.process.exit(1);
-    try writeSporeLifecycleSpec(allocator, init.io, snapshot_dir, source_spec.value);
-
-    _ = try spore.fork(allocator, .{
-        .parent_dir = snapshot_dir,
-        .out_dir = children_dir,
+    const full_args = try init.minimal.args.toSlice(allocator);
+    const result = forkNamed(init, allocator, .{
+        .source_name = parsed.source_name,
         .count = parsed.count,
-        .environ_map = init.environ_map,
-    });
-
-    var started = std.array_list.Managed([]const u8).init(allocator);
-    for (child_names, 0..) |child_name, index| {
-        const spore_dir = try childSporeDir(allocator, children_dir, index);
-        startForkChild(init, allocator, child_name, spore_dir, source_spec.value) catch |err| {
-            cleanupStartedChildren(init, allocator, started.items);
-            std.debug.print("spore fork: failed to start child VM {s}: {s}\n", .{ child_name, @errorName(err) });
-            std.process.exit(1);
-        };
-        try started.append(child_name);
-    }
-
-    cleanup_batch = false;
-
-    const result = NamedForkResult{
-        .source = parsed.source_name,
-        .count = parsed.count,
-        .children = child_names,
+        .name_pattern = parsed.name_pattern,
+        .spore_executable = full_args[0],
+    }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "fork", err),
+        error.InvalidForkNamePattern => {
+            const message = "spore fork: --name must contain at most one %d or %0Nd placeholder";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+        },
+        error.MissingForkNamePlaceholder => {
+            const message = "spore fork: --name must contain %d when --count is greater than 1";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+        },
+        error.InvalidVMName => {
+            const message = "spore fork: rendered VM name is invalid";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+        },
+        error.DuplicateForkName => {
+            const message = "spore fork: duplicate rendered VM name";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+        },
+        error.NamedVmNotReady => {
+            const message = allocLifecycleMessage(allocator, "spore fork: VM is not ready: {s}", .{parsed.source_name});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "fork"), message);
+        },
+        error.UnsupportedNamedForkDisk => {
+            const message = "spore fork: disk-backed named live fork is not supported yet";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+        },
+        error.UnsupportedNamedForkNetwork => {
+            const message = "spore fork: networked named live fork is not supported yet";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+        },
+        error.UnsupportedNamedForkVcpu => {
+            const message = "spore fork: multi-vCPU named live fork is not supported yet";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+        },
+        error.NamedVmExists => {
+            const message = "spore fork: VM already exists or has stale state";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+        },
+        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+            const message = allocLifecycleMessage(allocator, "spore fork: monitor request failed for VM {s}: {s}", .{ parsed.source_name, @errorName(err) });
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "fork"), message);
+        },
+        error.MonitorReadyTimeout => {
+            const message = "spore fork: timed out waiting for monitor readiness";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "fork"), message);
+        },
+        else => |e| return e,
     };
+    defer deinitNamedForkResult(allocator, result);
     if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, result);
     } else {
@@ -943,80 +1085,58 @@ pub fn resumeCli(
     }
     const allocator = init.arena.allocator();
     const parsed = parseResumeArgs(args, allocator, stderr, mode);
-    const spore_dir = resolveExistingSporeDir(allocator, init.io, stderr, mode, "resume", parsed.spore_dir);
-    var manifest = spore.loadManifest(allocator, spore_dir) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore resume: invalid spore directory {s}: {s}", .{ spore_dir, @errorName(err) });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-    };
-    defer manifest.deinit();
-    const network_options = run_mod.networkOptionsFromManifest(allocator, manifest.value.network) catch {
-        const message = "spore resume: invalid network policy in manifest";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-    };
-    const rootfs = try run_mod.resumeRootfsForRun(allocator, manifest.value);
-    const disk = try run_mod.resumeDiskForRun(allocator, manifest.value);
-    if (rootfs == null and manifest.value.devices.len != diskless_resume_device_count) {
-        const message = "spore resume: unsupported lifecycle device model";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-    }
-    const memory = memoryFromManifest(manifest.value) catch {
-        const message = "spore resume: invalid spore memory size";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-    };
-
-    var lifecycle_spec = readSporeLifecycleSpec(allocator, init.io, spore_dir) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore resume: invalid lifecycle metadata: {s}", .{@errorName(err)});
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-    };
-    defer if (lifecycle_spec) |*spec| spec.deinit();
-    if (lifecycle_spec) |spec| {
-        if (spec.value.vcpus != 1) {
+    const full_args = try init.minimal.args.toSlice(allocator);
+    const result = resumeNamed(init, allocator, .{
+        .spore_dir = parsed.spore_dir,
+        .name = parsed.name,
+        .spore_executable = full_args[0],
+    }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "resume", err),
+        error.FileNotFound => {
+            const message = "spore resume: spore directory is not available";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "resume"), message);
+        },
+        error.InvalidSporeDir => {
+            const message = allocLifecycleMessage(allocator, "spore resume: invalid spore directory: {s}", .{parsed.spore_dir});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.InvalidNetworkPolicy => {
+            const message = "spore resume: invalid network policy in manifest";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.UnsupportedLifecycleDeviceModel => {
+            const message = "spore resume: unsupported lifecycle device model";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.InvalidMemorySize => {
+            const message = "spore resume: invalid spore memory size";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.InvalidLifecycleMetadata => {
+            const message = "spore resume: invalid lifecycle metadata";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.UnsupportedLifecycleMetadata => {
             const message = "spore resume: multi-vCPU lifecycle metadata is not supported yet";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-        }
-    }
-
-    const base = if (lifecycle_spec) |spec| spec.value else Spec{ .name = parsed.name };
-    const spec = Spec{
-        .name = parsed.name,
-        .backend = base.backend,
-        .kernel_path = base.kernel_path,
-        .initrd_path = base.initrd_path,
-        .resume_dir = spore_dir,
-        .rootfs = rootfs,
-        .disk = disk,
-        .network = try run_mod.manifestNetworkFromOptions(allocator, network_options.network, &network_options.policy),
-        .memory = memory,
-        .vcpus = 1,
-        .guest_port = base.guest_port,
-        .timeout_ms = base.timeout_ms,
-        .console_log_path = base.console_log_path,
+        },
+        error.HostUnsupported => {
+            const message = "spore resume: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "resume"), message);
+        },
+        error.NamedVmExists => {
+            const message = allocLifecycleMessage(allocator, "spore resume: VM already exists or has stale state: {s}", .{parsed.name});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+        },
+        error.MonitorReadyTimeout => {
+            const message = "spore resume: timed out waiting for monitor readiness";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "resume"), message);
+        },
+        else => |e| return e,
     };
-    if (!monitorBackendSupported(spec.backend)) {
-        const message = "spore resume: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "resume"), message);
-    }
-    const paths = try cliPaths(init, allocator, "resume", spec.name);
-    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
-    if (state != .absent) {
-        const message = allocLifecycleMessage(allocator, "spore resume: VM already exists or has stale state: {s}", .{spec.name});
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
-    }
-    if (spec.rootfs != null or spec.disk != null) try writeSpec(allocator, init.io, paths, spec);
-    try spawnMonitor(init, allocator, spec, &network_options.policy);
-    try waitForReady("resume", allocator, init.io, paths, spec.timeout_ms);
+    defer deinitNamedLifecycleResult(allocator, result);
     if (mode == .json) {
-        var ready = try readReady(allocator, init.io, paths);
-        defer ready.deinit();
-        try machine_output.writeJson(allocator, stdout, LifecycleResult{
-            .action = "resumed",
-            .name = spec.name,
-            .state = "ready",
-            .pid = ready.value.pid,
-            .control_socket_path = ready.value.control_socket_path,
-            .console_log_path = ready.value.console_log_path,
-            .spore_dir = spore_dir,
-        });
+        try machine_output.writeJson(allocator, stdout, result);
     }
 }
 
@@ -1061,24 +1181,14 @@ pub fn lsCli(
     }
 
     const allocator = init.arena.allocator();
-    const root = runtimeRootPath(allocator, init.environ_map) catch |err| switch (err) {
-        error.InvalidRuntimeDir => {
-            const message = allocLifecycleMessage(allocator, "spore ls: invalid runtime directory; set {s} or XDG_RUNTIME_DIR to an absolute path", .{runtime_dir_env});
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "ls"), message);
-        },
+    const entries = listNamed(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, allocator, .{}) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "ls", err),
         else => |e| return e,
     };
-    const entries = listEntries(allocator, init.io, root, pidAlive) catch |err| switch (err) {
-        error.InvalidRuntimeDir => {
-            const message = "spore ls: invalid runtime directory";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "ls"), message);
-        },
-        error.InsecureRuntimeDir => {
-            const message = "spore ls: insecure runtime directory; registry directories must be private to the current user";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "ls"), message);
-        },
-        else => |e| return e,
-    };
+    defer freeListEntries(allocator, entries);
     if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, entries);
     } else {
@@ -1603,6 +1713,13 @@ fn resolveNewOutputDirApi(allocator: std.mem.Allocator, io: Io, raw: []const u8)
     return path;
 }
 
+fn resolveExistingSporeDirApi(allocator: std.mem.Allocator, io: Io, raw: []const u8) ![]const u8 {
+    const path = try std.fs.path.resolve(allocator, &.{raw});
+    const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    if (stat.kind != Io.File.Kind.directory) return error.InvalidSporeDir;
+    return path;
+}
+
 fn resolveNewOutputDir(
     allocator: std.mem.Allocator,
     io: Io,
@@ -1632,29 +1749,6 @@ fn resolveNewOutputDir(
     };
     if (stat.kind != Io.File.Kind.directory) {
         const message = allocLifecycleMessage(allocator, "spore {s}: output parent is not a directory: {s}", .{ command, parent });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, command), message);
-    }
-    return path;
-}
-
-fn resolveExistingSporeDir(
-    allocator: std.mem.Allocator,
-    io: Io,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    command: []const u8,
-    raw: []const u8,
-) []const u8 {
-    const path = std.fs.path.resolve(allocator, &.{raw}) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore {s}: invalid spore directory: {s}", .{ command, @errorName(err) });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
-    };
-    const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore {s}: spore directory is not available: {s}", .{ command, @errorName(err) });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, command), message);
-    };
-    if (stat.kind != Io.File.Kind.directory) {
-        const message = allocLifecycleMessage(allocator, "spore {s}: spore path is not a directory: {s}", .{ command, path });
         exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, command), message);
     }
     return path;
@@ -1701,25 +1795,21 @@ const ForkNamePlaceholder = struct {
     width: usize = 0,
 };
 
-fn renderForkNamesOrExit(allocator: std.mem.Allocator, command: []const u8, pattern: []const u8, count: usize) ![]const []const u8 {
-    const placeholder = findForkNamePlaceholder(pattern) catch {
-        std.debug.print("spore {s}: --name must contain at most one %d or %0Nd placeholder\n", .{command});
-        std.process.exit(2);
-    };
-    if (count > 1 and placeholder == null) {
-        std.debug.print("spore {s}: --name must contain %d when --count is greater than 1\n", .{command});
-        std.process.exit(2);
-    }
-
+fn renderForkNames(allocator: std.mem.Allocator, pattern: []const u8, count: usize) ![]const []const u8 {
+    const placeholder = try findForkNamePlaceholder(pattern);
+    if (count > 1 and placeholder == null) return error.MissingForkNamePlaceholder;
     const names = try allocator.alloc([]const u8, count);
+    var name_count: usize = 0;
+    errdefer {
+        for (names[0..name_count]) |name| allocator.free(name);
+        allocator.free(names);
+    }
     for (names, 0..) |*slot, index| {
         slot.* = try renderForkName(allocator, pattern, placeholder, index);
-        validateNameOrExit(command, slot.*) catch unreachable;
+        name_count += 1;
+        try validateName(slot.*);
         for (names[0..index]) |previous| {
-            if (std.mem.eql(u8, previous, slot.*)) {
-                std.debug.print("spore {s}: duplicate rendered VM name: {s}\n", .{ command, slot.* });
-                std.process.exit(2);
-            }
+            if (std.mem.eql(u8, previous, slot.*)) return error.DuplicateForkName;
         }
     }
     return names;
@@ -1786,12 +1876,13 @@ fn childSporeDir(allocator: std.mem.Allocator, children_dir: []const u8, index: 
     return std.fmt.allocPrint(allocator, "{s}/{d:0>6}", .{ children_dir, index });
 }
 
-fn startForkChild(
+fn startForkChildExecutable(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     child_name: []const u8,
     spore_dir: []const u8,
     base: Spec,
+    spore_executable: []const u8,
 ) !void {
     var manifest = try spore.loadManifest(allocator, spore_dir);
     defer manifest.deinit();
@@ -1810,9 +1901,9 @@ fn startForkChild(
         .timeout_ms = base.timeout_ms,
         .console_log_path = null,
     };
-    const paths = try cliPaths(init, allocator, "fork", child_name);
-    try spawnMonitor(init, allocator, spec, null);
-    try waitForReady("fork", allocator, init.io, paths, spec.timeout_ms);
+    const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, allocator, child_name);
+    try spawnMonitorExecutable(init, allocator, spec, spore_executable, null);
+    try waitForReadyResult(allocator, init.io, paths, spec.timeout_ms);
 }
 
 fn cleanupStartedChildren(init: std.process.Init, allocator: std.mem.Allocator, names: []const []const u8) void {
@@ -1836,11 +1927,6 @@ fn writeNamedForkResult(writer: *Io.Writer, result: NamedForkResult) !void {
     for (result.children) |name| {
         try writer.print("  - {s}\n", .{name});
     }
-}
-
-fn spawnMonitor(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec, network_policy: ?*const run_mod.NetworkPolicy) !void {
-    const full_args = try init.minimal.args.toSlice(allocator);
-    try spawnMonitorExecutable(init, allocator, spec, full_args[0], network_policy);
 }
 
 fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec, exe: []const u8, network_policy: ?*const run_mod.NetworkPolicy) !void {
@@ -1974,13 +2060,6 @@ fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeou
     return error.MonitorReadyTimeout;
 }
 
-fn lifecycleReadyOrExit(allocator: std.mem.Allocator, io: Io, command: []const u8, paths: Paths) std.json.Parsed(Ready) {
-    return readReady(allocator, io, paths) catch {
-        std.debug.print("spore {s}: VM is not ready\n", .{command});
-        std.process.exit(2);
-    };
-}
-
 fn sendExecRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8) ![]const u8 {
     const payload = struct {
         type: []const u8 = "exec",
@@ -2041,32 +2120,12 @@ const ControlResponse = struct {
     message: ?[]const u8 = null,
 };
 
-fn handleExecResponse(init: std.process.Init, allocator: std.mem.Allocator, stdout: *Io.Writer, response: []const u8) !u8 {
-    _ = init;
-    var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-    if (std.mem.eql(u8, parsed.value.type, "exec_result")) {
-        const exit_code = parsed.value.exit_code orelse return error.BadMonitorResponse;
-        if (exit_code < 0 or exit_code > 255) return error.BadMonitorResponse;
-
-        const stdout_bytes = try decodeControlOutput(allocator, parsed.value.stdout_b64 orelse return error.BadMonitorResponse);
-        defer allocator.free(stdout_bytes);
-        const stderr_bytes = try decodeControlOutput(allocator, parsed.value.stderr_b64 orelse return error.BadMonitorResponse);
-        defer allocator.free(stderr_bytes);
-
-        try stdout.writeAll(stdout_bytes);
-        try stdout.flush();
-        try writeRawStderr(stderr_bytes);
-        if (parsed.value.stdout_truncated) try writeRawStderr("spore exec: stdout truncated after 16384 bytes\n");
-        if (parsed.value.stderr_truncated) try writeRawStderr("spore exec: stderr truncated after 16384 bytes\n");
-        return @intCast(exit_code);
-    }
-    const message = parsed.value.message orelse "monitor request failed";
-    std.debug.print("spore exec: {s}\n", .{message});
-    return 1;
+fn writeExecNamedResult(stdout: *Io.Writer, result: ExecNamedResult) !void {
+    try stdout.writeAll(result.stdout);
+    try stdout.flush();
+    try writeRawStderr(result.stderr);
+    if (result.stdout_truncated) try writeRawStderr("spore exec: stdout truncated after 16384 bytes\n");
+    if (result.stderr_truncated) try writeRawStderr("spore exec: stderr truncated after 16384 bytes\n");
 }
 
 fn parseExecNamedResponse(
@@ -2113,18 +2172,6 @@ fn suspendResponseFailureMessage(allocator: std.mem.Allocator, response: []const
     return try allocator.dupe(u8, message);
 }
 
-fn handleSnapshotResponse(command: []const u8, allocator: std.mem.Allocator, response: []const u8) !bool {
-    var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-    if (std.mem.eql(u8, parsed.value.type, "snapshotted")) return true;
-    const message = parsed.value.message orelse "monitor request failed";
-    std.debug.print("spore {s}: {s}\n", .{ command, message });
-    return false;
-}
-
 fn snapshotResponseOk(allocator: std.mem.Allocator, response: []const u8) !bool {
     var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
         .allocate = .alloc_always,
@@ -2147,6 +2194,26 @@ fn ownedNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycl
         .pid = result.pid,
         .console_log_path = console_log_path,
         .spore_dir = spore_dir,
+    };
+}
+
+fn ownedNamedForkResult(allocator: std.mem.Allocator, result: NamedForkResult) !NamedForkResult {
+    const source = try allocator.dupe(u8, result.source);
+    errdefer allocator.free(source);
+    const children = try allocator.alloc([]const u8, result.children.len);
+    errdefer allocator.free(children);
+    var child_count: usize = 0;
+    errdefer {
+        for (children[0..child_count]) |owned| allocator.free(owned);
+    }
+    for (result.children, children) |child, *out| {
+        out.* = try allocator.dupe(u8, child);
+        child_count += 1;
+    }
+    return .{
+        .source = source,
+        .count = result.count,
+        .children = children,
     };
 }
 
@@ -2229,6 +2296,21 @@ fn exitLifecycleCliError(
     }
     stderr.flush() catch {};
     std.process.exit(err.exit_code);
+}
+
+fn exitLifecycleRuntimePathError(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    err: anyerror,
+) noreturn {
+    const message = switch (err) {
+        error.InvalidRuntimeDir => allocLifecycleMessage(allocator, "spore {s}: invalid runtime directory; set {s} or XDG_RUNTIME_DIR to an absolute path", .{ command, runtime_dir_env }),
+        error.InsecureRuntimeDir => allocLifecycleMessage(allocator, "spore {s}: insecure runtime directory; registry directories must be private to the current user", .{command}),
+        else => allocLifecycleMessage(allocator, "spore {s}: runtime directory error: {s}", .{ command, @errorName(err) }),
+    };
+    exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
 }
 
 fn validateNameOrExit(command: []const u8, name: []const u8) !void {
@@ -2454,8 +2536,18 @@ test "lifecycle renders fork name patterns" {
     defer allocator.free(literal);
     try std.testing.expectEqualStrings("worker", literal);
 
+    const names = try renderForkNames(allocator, "worker-%d", 2);
+    defer {
+        for (names) |name| allocator.free(name);
+        allocator.free(names);
+    }
+    try std.testing.expectEqualStrings("worker-0", names[0]);
+    try std.testing.expectEqualStrings("worker-1", names[1]);
+
     try std.testing.expect(try findForkNamePlaceholder("worker") == null);
     try std.testing.expectError(error.InvalidForkNamePattern, findForkNamePlaceholder("worker-%d-%d"));
+    try std.testing.expectError(error.MissingForkNamePlaceholder, renderForkNames(allocator, "worker", 2));
+    try std.testing.expectError(error.InvalidVMName, renderForkNames(allocator, "-worker", 1));
 }
 
 test "lifecycle monitor backend support is explicit" {
@@ -2587,6 +2679,28 @@ test "create parser accepts network allow policy" {
     try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
     try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
     try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
+}
+
+test "named network config accepts create cli policy" {
+    const config = try namedNetworkConfig(.{
+        .enabled = true,
+        .allow_cidrs = &.{"93.184.216.34/32"},
+        .allow_hosts = &.{"example.com"},
+    });
+
+    try std.testing.expectEqual(run_mod.NetworkMode.spore, config.mode);
+    try std.testing.expectEqual(@as(usize, 1), config.policy.allow_cidr_count);
+    try std.testing.expectEqualStrings("93.184.216.34/32", config.policy.allow_cidrs[0]);
+    try std.testing.expectEqual(@as(usize, 1), config.policy.allow_host_count);
+    try std.testing.expectEqualStrings("example.com", config.policy.allow_hosts[0]);
+}
+
+test "named network config keeps bare network unrestricted" {
+    const config = try namedNetworkConfig(.{ .enabled = true });
+
+    try std.testing.expectEqual(run_mod.NetworkMode.spore, config.mode);
+    try std.testing.expect(!config.policy.default_deny);
+    try std.testing.expect(!config.policy.hasRules());
 }
 
 test "lifecycle detects incomplete ready and stale pid state" {

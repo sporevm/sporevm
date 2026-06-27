@@ -16,6 +16,7 @@ const resume_mod = @import("resume.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
+const system = @import("system.zig");
 
 /// Process context shared by product operations.
 ///
@@ -142,6 +143,8 @@ pub const OutputEvent = run_mod.OutputEvent;
 pub const ExitEvent = run_mod.ExitEvent;
 pub const FailureEvent = run_mod.FailureEvent;
 pub const CreateNamedOptions = lifecycle.CreateNamedOptions;
+pub const ResumeNamedOptions = lifecycle.ResumeNamedOptions;
+pub const ForkNamedOptions = lifecycle.ForkNamedOptions;
 pub const ExecNamedOptions = lifecycle.ExecNamedOptions;
 pub const NamedNetworkOptions = lifecycle.NamedNetworkOptions;
 pub const SnapshotNamedOptions = lifecycle.SnapshotNamedOptions;
@@ -150,9 +153,16 @@ pub const RemoveNamedOptions = lifecycle.RemoveNamedOptions;
 pub const ListNamedOptions = lifecycle.ListNamedOptions;
 pub const NamedLifecycleResult = lifecycle.NamedLifecycleResult;
 pub const ExecNamedResult = lifecycle.ExecNamedResult;
+pub const NamedForkResult = lifecycle.NamedForkResult;
 pub const NamedListEntry = lifecycle.ListEntry;
 pub const NamedListMemory = lifecycle.ListMemory;
 pub const NamedListStats = lifecycle.ListStats;
+pub const CacheStats = system.CacheStats;
+pub const RootfsSystemSummary = system.RootfsSystemSummary;
+pub const RootfsPruneEntry = system.RootfsPruneEntry;
+pub const RootfsPruneResult = system.RootfsPruneResult;
+pub const RuntimeForkPruneEntry = system.RuntimeForkPruneEntry;
+pub const RuntimeForkPruneResult = system.RuntimeForkPruneResult;
 
 /// Low-level VM run options.
 ///
@@ -345,6 +355,21 @@ pub const PullOptions = struct {
     aws_executable: []const u8 = "aws",
 };
 
+/// Options for rootfs cache inspection.
+pub const SystemDfOptions = struct {
+    rootfs_cache: CacheRoot = .env,
+};
+
+/// Options for local rootfs and runtime cleanup.
+pub const SystemPruneOptions = struct {
+    rootfs_cache: CacheRoot = .env,
+    dry_run: bool = true,
+    include_digest_artifacts: bool = false,
+    older_than_seconds: ?u64 = null,
+    max_bytes: ?u64 = null,
+    rootfs_only: bool = false,
+};
+
 /// Platform summary returned by `inspectSpore`.
 pub const SporePlatformSummary = struct {
     arch: []const u8,
@@ -424,6 +449,60 @@ pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
     freePathFact(allocator, info.cache_roots.rootfs);
     freePathFact(allocator, info.cache_roots.bundles);
     freePathFact(allocator, info.cache_roots.runtime);
+}
+
+/// Summarize the local rootfs cache.
+///
+/// The returned cache root is owned by the caller. Release it with
+/// `deinitRootfsSystemSummary`.
+pub fn systemDf(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: SystemDfOptions,
+) !RootfsSystemSummary {
+    const rootfs_cache = try resolveRequiredCacheRoot(options.rootfs_cache, allocator, context.environ_map, .rootfs);
+    defer rootfs_cache.deinit(allocator);
+    return system.df(allocator, context.io, .{ .cache_root = rootfs_cache.path.? });
+}
+
+/// Release memory owned by a `RootfsSystemSummary`.
+pub fn deinitRootfsSystemSummary(allocator: std.mem.Allocator, summary: RootfsSystemSummary) void {
+    system.deinitRootfsSystemSummary(allocator, summary);
+}
+
+/// Prune the local rootfs cache and, when age-based cleanup is requested,
+/// unreferenced runtime fork batches.
+///
+/// The result owns cache roots and entry paths. Release it with
+/// `deinitRootfsPruneResult`.
+pub fn systemPrune(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: SystemPruneOptions,
+) !RootfsPruneResult {
+    const rootfs_cache = try resolveRequiredCacheRoot(options.rootfs_cache, allocator, context.environ_map, .rootfs);
+    defer rootfs_cache.deinit(allocator);
+
+    const runtime_root = if (!options.rootfs_only and options.older_than_seconds != null)
+        local_paths.runtimeRootPath(allocator, context.environ_map) catch null
+    else
+        null;
+    defer if (runtime_root) |root| allocator.free(root);
+
+    return system.prune(allocator, context.io, .{
+        .cache_root = rootfs_cache.path.?,
+        .runtime_root = runtime_root,
+        .dry_run = options.dry_run,
+        .include_digest_artifacts = options.include_digest_artifacts,
+        .older_than_seconds = options.older_than_seconds,
+        .max_bytes = options.max_bytes,
+        .rootfs_only = options.rootfs_only,
+    }, std.Io.Clock.real.now(context.io).nanoseconds);
+}
+
+/// Release memory owned by a `RootfsPruneResult`.
+pub fn deinitRootfsPruneResult(allocator: std.mem.Allocator, result: RootfsPruneResult) void {
+    system.deinitRootfsPruneResult(allocator, result);
 }
 
 /// Inspect a spore manifest without resuming or mutating it.
@@ -605,6 +684,24 @@ pub fn createNamed(
     return lifecycle.createNamed(init, allocator, options);
 }
 
+/// Resume a spore checkpoint as a long-lived named VM.
+pub fn resumeNamed(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ResumeNamedOptions,
+) !NamedLifecycleResult {
+    return lifecycle.resumeNamed(init, allocator, options);
+}
+
+/// Fork a ready diskless named VM into ready named child VMs.
+pub fn forkNamed(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ForkNamedOptions,
+) !NamedForkResult {
+    return lifecycle.forkNamed(init, allocator, options);
+}
+
 /// Execute a command inside a ready named VM.
 pub fn execNamed(
     context: Context,
@@ -656,6 +753,10 @@ pub fn deinitNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLif
 
 pub fn deinitExecNamedResult(allocator: std.mem.Allocator, result: ExecNamedResult) void {
     lifecycle.deinitExecNamedResult(allocator, result);
+}
+
+pub fn deinitNamedForkResult(allocator: std.mem.Allocator, result: NamedForkResult) void {
+    lifecycle.deinitNamedForkResult(allocator, result);
 }
 
 pub fn deinitNamedList(allocator: std.mem.Allocator, entries: []NamedListEntry) void {
@@ -918,6 +1019,22 @@ fn resolveCacheRoot(
         .env => switch (kind) {
             .rootfs => if (local_paths.rootfsCacheRootPath(allocator, environ_map) catch null) |path| .{ .path = path, .owned = true } else .{},
             .bundle => if (local_paths.bundleCacheRootPath(allocator, environ_map) catch null) |path| .{ .path = path, .owned = true } else .{},
+        },
+    };
+}
+
+fn resolveRequiredCacheRoot(
+    requested: CacheRoot,
+    allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+    kind: CacheKind,
+) !ResolvedCacheRoot {
+    return switch (requested) {
+        .none => error.CacheUnavailable,
+        .path => |path| .{ .path = path },
+        .env => switch (kind) {
+            .rootfs => .{ .path = try local_paths.rootfsCacheRootPath(allocator, environ_map), .owned = true },
+            .bundle => .{ .path = try local_paths.bundleCacheRootPath(allocator, environ_map), .owned = true },
         },
     };
 }
