@@ -27,6 +27,8 @@ DEFAULT_PLATFORM = "linux/arm64"
 RESTORE_METRICS_RE = re.compile(r"(?:kvm|hvf) restore metrics: (?P<fields>.+)")
 EXEC_PROBE_TIMING_RE = re.compile(r"run exec probe timing: (?P<fields>.+)")
 BACKEND_TIMING_RE = re.compile(r"run backend timing: (?P<fields>.+)")
+GUEST_TIMING_RE = re.compile(r"vsock host stream guest timing: timing (?P<fields>.+)")
+KVM_PROBE_COMPLETION_RE = re.compile(r"kvm probe completion timing: (?P<fields>.+)")
 
 PHASE_METRIC_FIELDS = (
     "rootfs_open_verified_ms",
@@ -42,8 +44,24 @@ PHASE_METRIC_FIELDS = (
     "exec_response_ms",
     "first_output_ms",
     "exec_probe_attach_ms",
+    "exec_connect_request_delivery_ms",
+    "exec_connect_ack_ms",
     "exec_request_delivered_ms",
+    "exec_request_delivery_ms",
     "exec_guest_timing_ms",
+    "guest_listen_ms",
+    "guest_accept_ms",
+    "guest_decode_ms",
+    "guest_spawn_ms",
+    "guest_exit_ms",
+    "guest_now_ms",
+    "guest_accept_delay_ms",
+    "guest_decode_delay_ms",
+    "guest_spawn_delay_ms",
+    "guest_exit_delay_ms",
+    "kvm_probe_complete_observed_ms",
+    "kvm_pending_exit_completion_ms",
+    "kvm_probe_return_ms",
 )
 
 PROFILES = {
@@ -186,6 +204,21 @@ def parse_int_field(value: object) -> int | None:
         return None
 
 
+def parse_ms_field(value: object) -> int | None:
+    parsed = parse_int_field(value)
+    if parsed is None or parsed < 0:
+        return None
+    return parsed
+
+
+def delta_ms(after: object, before: object) -> int | None:
+    after_ms = parse_ms_field(after)
+    before_ms = parse_ms_field(before)
+    if after_ms is None or before_ms is None or after_ms < before_ms:
+        return None
+    return after_ms - before_ms
+
+
 def parse_key_value_tail(value: str) -> dict[str, str]:
     fields: dict[str, str] = {}
     for part in value.split():
@@ -229,10 +262,39 @@ def parse_run_stderr_metrics(path: Path) -> dict[str, object]:
         metrics["first_output_ms"] = parse_int_field(fields.get("first_output_ms"))
         metrics["exec_guest_timing_ms"] = parse_int_field(fields.get("guest_timing_ms"))
         metrics["exec_response_ms"] = parse_int_field(fields.get("response_ms"))
+        metrics["exec_connect_request_delivery_ms"] = delta_ms(
+            fields.get("connect_request_delivered_ms"),
+            fields.get("attach_ms"),
+        )
+        metrics["exec_connect_ack_ms"] = delta_ms(
+            fields.get("connect_ms"),
+            fields.get("connect_request_delivered_ms"),
+        )
+        metrics["exec_request_delivery_ms"] = delta_ms(
+            fields.get("request_delivered_ms"),
+            fields.get("connect_ms"),
+        )
     for match in BACKEND_TIMING_RE.finditer(text):
         fields = parse_key_value_tail(match.group("fields"))
         metrics["backend_run_ms"] = parse_int_field(fields.get("elapsed_ms"))
         metrics["backend_tail_ms"] = parse_int_field(fields.get("tail_ms"))
+    for match in GUEST_TIMING_RE.finditer(text):
+        fields = parse_key_value_tail(match.group("fields"))
+        metrics["guest_listen_ms"] = parse_ms_field(fields.get("listen"))
+        metrics["guest_accept_ms"] = parse_ms_field(fields.get("accept"))
+        metrics["guest_decode_ms"] = parse_ms_field(fields.get("decode"))
+        metrics["guest_spawn_ms"] = parse_ms_field(fields.get("spawn"))
+        metrics["guest_exit_ms"] = parse_ms_field(fields.get("exit"))
+        metrics["guest_now_ms"] = parse_ms_field(fields.get("now"))
+        metrics["guest_accept_delay_ms"] = delta_ms(fields.get("accept"), fields.get("listen"))
+        metrics["guest_decode_delay_ms"] = delta_ms(fields.get("decode"), fields.get("accept"))
+        metrics["guest_spawn_delay_ms"] = delta_ms(fields.get("spawn"), fields.get("decode"))
+        metrics["guest_exit_delay_ms"] = delta_ms(fields.get("exit"), fields.get("spawn"))
+    for match in KVM_PROBE_COMPLETION_RE.finditer(text):
+        fields = parse_key_value_tail(match.group("fields"))
+        metrics["kvm_probe_complete_observed_ms"] = parse_ms_field(fields.get("observed_ms"))
+        metrics["kvm_pending_exit_completion_ms"] = parse_ms_field(fields.get("pending_completion_ms"))
+        metrics["kvm_probe_return_ms"] = parse_ms_field(fields.get("return_ms"))
     return {key: value for key, value in metrics.items() if value is not None}
 
 
@@ -1017,6 +1079,8 @@ def self_test() -> None:
                 "kvm restore metrics: mode=local_backing ram_mib=512 chunks=4 nonzero_chunks=2 manifest_ms=1 map_ram_ms=2 memory_ms=3 state_ms=4 pre_run_ms=10",
                 "run exec probe timing: attach_ms=1 connect_request_delivered_ms=2 connect_ms=3 request_delivered_ms=4 first_output_ms=5 guest_timing_ms=6 response_ms=8",
                 "run backend timing: elapsed_ms=12 stream_response_ms=8 tail_ms=4 cause=probe_complete",
+                "vsock host stream guest timing: timing listen=20 accept=30 decode=31 spawn=34 exit=39 now=40",
+                "kvm probe completion timing: observed_ms=8 pending_completion_ms=2 return_ms=10",
             ]) + "\n",
             encoding="utf-8",
         )
@@ -1028,6 +1092,13 @@ def self_test() -> None:
         assert metrics["backend_run_ms"] == 12
         assert metrics["backend_tail_ms"] == 4
         assert metrics["vsock_connect_ms"] == 3
+        assert metrics["exec_connect_request_delivery_ms"] == 1
+        assert metrics["exec_connect_ack_ms"] == 1
+        assert metrics["exec_request_delivery_ms"] == 1
+        assert metrics["guest_listen_ms"] == 20
+        assert metrics["guest_accept_delay_ms"] == 10
+        assert metrics["guest_exit_delay_ms"] == 5
+        assert metrics["kvm_pending_exit_completion_ms"] == 2
         assert metrics["exec_response_ms"] == 8
         assert summarize_field([metrics], "exec_response_ms")["median"] == 8.0
     print("self-test ok")
@@ -1075,7 +1146,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--backend", default=infer_backend(), choices=("auto", "hvf", "kvm"))
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument("--platform", default=DEFAULT_PLATFORM)
-    parser.add_argument("--memory", default="auto")
+    parser.add_argument("--memory", default="512mb")
     parser.add_argument("--command", default=DEFAULT_COMMAND)
     parser.add_argument("--timeout-s", type=int)
     parser.add_argument("--writable-rootfs-iterations", type=int, help="Writable-rootfs iterations per workload")

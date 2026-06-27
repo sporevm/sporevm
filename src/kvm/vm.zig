@@ -417,10 +417,18 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     exec_probe_done = true;
                 }
                 if (probe.state == .complete) {
+                    const observed_ms = probe.elapsedMs();
+                    var pending_completion_ms: u64 = 0;
                     if (pending_kvm_completion) {
+                        const completion_start = try monotonicMs();
                         try kvm.completePendingExit(vcpu_fd, run_bytes);
+                        pending_completion_ms = (try monotonicMs()) -| completion_start;
                         pending_kvm_completion = false;
                     }
+                    std.log.debug(
+                        "kvm probe completion timing: observed_ms={d} pending_completion_ms={d} return_ms={d}",
+                        .{ observed_ms, pending_completion_ms, probe.elapsedMs() },
+                    );
                     if (config.exec_probe_completes_run) {
                         if (config.snapshot_on_probe_complete) {
                             const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
