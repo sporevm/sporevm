@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-26
+last_reviewed: 2026-06-27
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
@@ -134,14 +134,16 @@ spore resume --events=jsonl <spore-dir>
 spore resume --generation generation.json --events=jsonl <spore-dir>
 ```
 
-`--events=jsonl` emits newline-delimited lifecycle events on stdout. It is not a
-synonym for `--json`; it is the stream transport for commands whose useful
-output is a sequence of states. In event mode, stdout is JSONL only. Guest
-stdout and stderr are represented as typed events instead of raw byte streams.
-The stream ends with exactly one terminal event. SporeVM-originated terminal
-failures carry the same error object used by `spore --json` so callers do not
-learn two failure taxonomies. The process exit status is the guest exit status
-for guest completion and `error.exit_code` for SporeVM failures.
+`--events=jsonl` emits newline-delimited lifecycle and runtime audit events on
+stdout. It is not a synonym for `--json`; it is the stream transport for
+commands whose useful output is a sequence of states. In event mode, stdout is
+JSONL only. Guest stdout and stderr are represented as typed events instead of
+raw byte streams, and network audit records such as denied egress attempts use
+typed events instead of debug log scraping. The stream ends with exactly one
+terminal event. SporeVM-originated terminal failures carry the same error object
+used by `spore --json` so callers do not learn two failure taxonomies. The
+process exit status is the guest exit status for guest completion and
+`error.exit_code` for SporeVM failures.
 `resume --generation` is the single-child fan-out identity injection surface;
 it reuses the generation attach path and still preserves the JSONL event stream.
 
@@ -281,11 +283,11 @@ The first implementation should pin a small stable code table in tests:
   the smoke scripts consume the nested machine contract through global `--json`.
 - Slice 4 is implemented in this branch: `run` and `resume` accept
   `--events=jsonl`, stdout is JSONL in event mode, guest stdout/stderr are
-  base64-encoded typed events, vsock readiness emits `ready`, and runtime
-  terminal failures emit `failure` records using the shared error
-  classification. Older parser/setup
-  direct exits remain a follow-up hardening item outside the runtime stream
-  path.
+  base64-encoded typed events, network denied-egress audit records emit
+  `network` events, vsock readiness emits `ready`, and runtime terminal
+  failures emit `failure` records using the shared error classification. Older
+  parser/setup direct exits remain a follow-up hardening item outside the
+  runtime stream path.
 - Slice 5 is implemented in this branch: `src/api.zig` exposes option-based
   product calls for run, managed fresh run setup, `run --from` semantics,
   resume, host-info, inspect, fork, pack, unpack, push, inspect-bundle, and
@@ -356,11 +358,13 @@ coherent schema names, cache-state values, and shared error handling.
 
 Add `--events=jsonl` for run/resume lifecycle streams. Keep it separate from
 `--json`. Reuse the shared error envelope inside failure events. In event mode,
-guest stdout/stderr become typed events and stdout carries no raw guest bytes.
+guest stdout/stderr become typed events, network audit records are typed events,
+and stdout carries no raw guest bytes.
 
-Done when start, ready, stdout, stderr, exit, and failure events are complete
-JSONL records, there is exactly one terminal event, failure classification
-matches `spore.error.v1`, and process exit behavior matches the target model.
+Done when start, ready, stdout, stderr, network, exit, and failure events are
+complete JSONL records, there is exactly one terminal event, failure
+classification matches `spore.error.v1`, and process exit behavior matches the
+target model.
 
 ### Slice 5: Product API Boundary
 

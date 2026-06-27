@@ -242,6 +242,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
             .guest_off, .guest_reset => {},
             .probe_complete => {
                 const result = try resultFromResumeStream(backend, ram_size, identity_stream);
+                run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
                 try events.emitExit(result);
                 if (events.write_failed) return error.EventSinkFailed;
                 return result;
@@ -253,6 +254,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
             .guest_off, .guest_reset => {},
             .probe_complete => {
                 const result = try resultFromResumeStream(backend, ram_size, identity_stream);
+                run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
                 try events.emitExit(result);
                 if (events.write_failed) return error.EventSinkFailed;
                 return result;
@@ -260,7 +262,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
             .snapshotted => return error.UnexpectedResumeExit,
         }
     }
-    if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
+    const gateway_failed = gateway_active and gateway.hasFailed();
+    run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
+    if (gateway_failed) return error.NetworkGatewayFailed;
     const connect_ms = if (identity_stream) |stream| stream.connect_ms orelse 0 else 0;
     const response_ms = if (identity_stream) |stream| stream.response_ms orelse 0 else 0;
     const result = run_mod.Result{

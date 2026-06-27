@@ -2220,7 +2220,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     return result;
 }
 
-fn finishGatewayNetworkEvents(gateway: *net_gateway.Process, gateway_active: *bool, events: *EventEmitter) void {
+pub fn finishGatewayNetworkEvents(gateway: *net_gateway.Process, gateway_active: *bool, events: *EventEmitter) void {
     if (!gateway_active.*) return;
     gateway.deinit();
     gateway_active.* = false;
