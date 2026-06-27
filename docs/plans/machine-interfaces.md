@@ -1,6 +1,6 @@
 ---
-status: active
-last_reviewed: 2026-06-27
+status: landed
+last_reviewed: 2026-06-28
 spec_refs:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
@@ -401,8 +401,14 @@ The first implementation should pin a small stable code table in tests:
 - Slice 7 is implemented in this branch: `bindings/go` provides a cgo wrapper
   over the existing C ABI for build info, context lifetime, host-info, and
   inspect-bundle. The Go package decodes the same JSON contracts into Go
-  structs, requires C ABI version 6 or newer, and intentionally exposes no
-  runtime methods until the matching runtime C ABI calls exist.
+  structs, and intentionally exposed no runtime methods until the matching
+  runtime C ABI calls existed.
+- Slice 8 is implemented in this branch: the C ABI now exposes
+  `spore_pull_json` with size/versioned `SporePullOptions`, explicit cache-root
+  ownership, and owned JSON cleanup; the Go binding exposes `Client.Pull` over
+  that ABI and decodes `spore.pull.result.v1`; and tests exercise the Go path
+  against the same local bundle materialization schema used by the CLI and Zig
+  product API. The C ABI version is now 7.
 
 ## Delivery Strategy
 
@@ -574,7 +580,8 @@ against them and verify that the schemas match the Zig-owned result structs.
   endpoint exist.
 - Contract docs must remain integration-neutral.
 
-## Open Questions
+## Deferred Work
 
-- Should formal JSON Schema artifacts be generated in the first implementation
-  PR? Default: no; start with Zig-owned structs and golden JSON tests.
+- Formal JSON Schema artifacts remain a possible follow-up if external
+  validators need them. The landed contract keeps Zig-owned structs and
+  golden/decoded JSON tests as the source of truth.

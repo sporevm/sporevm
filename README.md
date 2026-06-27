@@ -78,8 +78,8 @@ extracted directory wherever you keep standalone tools.
 
 ## Use as a library
 
-`spore` is the CLI. `libspore` is the embedding surface for Zig, C, and
-eventually Go callers.
+`spore` is the CLI. `libspore` is the embedding surface for Zig, C, and Go
+callers.
 
 Zig callers import the `libspore` module from this package. C callers should
 download the matching `libspore_Linux_arm64` or `libspore_Darwin_arm64` archive

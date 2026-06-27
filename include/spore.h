@@ -70,6 +70,7 @@ typedef struct SporeOwnedString {
 typedef struct SporeContextImpl *SporeContext;
 
 #define SPORE_INSPECT_BUNDLE_OPTIONS_VERSION 1u
+#define SPORE_PULL_OPTIONS_VERSION 1u
 #define SPORE_SYSTEM_DF_OPTIONS_VERSION 1u
 #define SPORE_SYSTEM_PRUNE_OPTIONS_VERSION 1u
 #define SPORE_CREATE_NAMED_OPTIONS_VERSION 3u
@@ -79,6 +80,10 @@ typedef struct SporeContextImpl *SporeContext;
 #define SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION 1u
 #define SPORE_SUSPEND_NAMED_OPTIONS_VERSION 1u
 #define SPORE_REMOVE_NAMED_OPTIONS_VERSION 1u
+
+#define SPORE_CACHE_ROOT_ENV 0u
+#define SPORE_CACHE_ROOT_NONE 1u
+#define SPORE_CACHE_ROOT_PATH 2u
 
 /** Options for spore_inspect_bundle_json(). */
 typedef struct SporeInspectBundleOptions {
@@ -90,6 +95,26 @@ typedef struct SporeInspectBundleOptions {
   uint32_t child_range_start;
   uint32_t child_range_end;
 } SporeInspectBundleOptions;
+
+/** Cache-root selection for operations that can use SporeVM caches. */
+typedef struct SporeCacheRoot {
+  uint32_t kind;
+  SporeString path;
+} SporeCacheRoot;
+
+/** Options for spore_pull_json(). */
+typedef struct SporePullOptions {
+  uint32_t size;
+  uint32_t version;
+  SporeString source;
+  SporeString out_dir;
+  SporeCacheRoot rootfs_cache;
+  SporeCacheRoot bundle_cache;
+  SporeString child_id;
+  uint8_t allow_metadata_only_rootfs;
+  SporeString aws_region;
+  SporeString aws_executable;
+} SporePullOptions;
 
 /** Options for spore_system_df_json(). */
 typedef struct SporeSystemDfOptions {
@@ -212,6 +237,9 @@ typedef struct SporeRemoveNamedOptions {
 /** Initialize inspect-bundle options with the current ABI size and version. */
 SPORE_API void spore_inspect_bundle_options_init(SporeInspectBundleOptions *options);
 
+/** Initialize pull options with defaults. */
+SPORE_API void spore_pull_options_init(SporePullOptions *options);
+
 /** Initialize system-df options with defaults. */
 SPORE_API void spore_system_df_options_init(SporeSystemDfOptions *options);
 
@@ -288,6 +316,18 @@ SPORE_API SporeResult spore_network_capabilities_json(SporeContext context, Spor
 SPORE_API SporeResult spore_inspect_bundle_json(SporeContext context,
                                                 const SporeInspectBundleOptions *options,
                                                 SporeOwnedString *out_json);
+
+/**
+ * Pull a bundle into a local spore directory and return `spore.pull.result.v1`
+ * JSON.
+ *
+ * Cache roots default to SPORE_CACHE_ROOT_ENV. Use SPORE_CACHE_ROOT_NONE to
+ * disable a cache or SPORE_CACHE_ROOT_PATH with a non-empty path to select one
+ * explicitly.
+ */
+SPORE_API SporeResult spore_pull_json(SporeContext context,
+                                      const SporePullOptions *options,
+                                      SporeOwnedString *out_json);
 
 /** Return rootfs cache usage as JSON. */
 SPORE_API SporeResult spore_system_df_json(SporeContext context,

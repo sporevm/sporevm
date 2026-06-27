@@ -68,6 +68,42 @@ func TestInspectBundle(t *testing.T) {
 	}
 }
 
+func TestPull(t *testing.T) {
+	client, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	dir := writeInspectBundleFixture(t)
+	outDir := filepath.Join(t.TempDir(), "pulled.spore")
+	result, err := client.Pull(context.Background(), PullOptions{
+		Source:      "file://" + dir,
+		OutDir:      outDir,
+		RootfsCache: CacheRoot{Kind: CacheRootNone},
+		BundleCache: CacheRoot{Kind: CacheRootNone},
+		ChildID:     "1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Schema != "spore.pull.result.v1" {
+		t.Fatalf("schema = %q", result.Schema)
+	}
+	if result.OutDir != outDir {
+		t.Fatalf("out_dir = %q", result.OutDir)
+	}
+	if result.Children.SelectedChild == nil || *result.Children.SelectedChild != "000001" {
+		t.Fatalf("selected child = %#v", result.Children.SelectedChild)
+	}
+	if result.Materialization.ChunkCount != 1 || result.Materialization.MaterializedChunkCount != 0 {
+		t.Fatalf("materialization = %#v", result.Materialization)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "manifest.json")); err != nil {
+		t.Fatalf("expected pulled manifest: %v", err)
+	}
+}
+
 func writeInspectBundleFixture(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()

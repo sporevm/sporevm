@@ -14,12 +14,20 @@ int main(void) {
 
   uint32_t abi_version = 0;
   if (expect_success(spore_build_info(SPORE_BUILD_INFO_ABI_VERSION, &abi_version)) != 0) return 1;
-  if (abi_version != 6) return 1;
+  if (abi_version != 7) return 1;
 
   SporeInspectBundleOptions options;
   spore_inspect_bundle_options_init(&options);
   if (options.size != sizeof(options)) return 1;
   if (options.version != SPORE_INSPECT_BUNDLE_OPTIONS_VERSION) return 1;
+
+  SporePullOptions pull_options;
+  spore_pull_options_init(&pull_options);
+  if (pull_options.size != sizeof(pull_options)) return 1;
+  if (pull_options.version != SPORE_PULL_OPTIONS_VERSION) return 1;
+  if (pull_options.rootfs_cache.kind != SPORE_CACHE_ROOT_ENV) return 1;
+  if (pull_options.bundle_cache.kind != SPORE_CACHE_ROOT_ENV) return 1;
+  if (pull_options.allow_metadata_only_rootfs != 0) return 1;
 
   SporeSystemDfOptions df_options;
   spore_system_df_options_init(&df_options);
