@@ -14,12 +14,24 @@ int main(void) {
 
   uint32_t abi_version = 0;
   if (expect_success(spore_build_info(SPORE_BUILD_INFO_ABI_VERSION, &abi_version)) != 0) return 1;
-  if (abi_version != 5) return 1;
+  if (abi_version != 6) return 1;
 
   SporeInspectBundleOptions options;
   spore_inspect_bundle_options_init(&options);
   if (options.size != sizeof(options)) return 1;
   if (options.version != SPORE_INSPECT_BUNDLE_OPTIONS_VERSION) return 1;
+
+  SporeSystemDfOptions df_options;
+  spore_system_df_options_init(&df_options);
+  if (df_options.size != sizeof(df_options)) return 1;
+  if (df_options.version != SPORE_SYSTEM_DF_OPTIONS_VERSION) return 1;
+
+  SporeSystemPruneOptions prune_options;
+  spore_system_prune_options_init(&prune_options);
+  if (prune_options.size != sizeof(prune_options)) return 1;
+  if (prune_options.version != SPORE_SYSTEM_PRUNE_OPTIONS_VERSION) return 1;
+  if (prune_options.dry_run != 1) return 1;
+  if (prune_options.include_digest_artifacts != 0) return 1;
 
   SporeCreateNamedOptions create_options;
   spore_create_named_options_init(&create_options);
@@ -80,6 +92,19 @@ int main(void) {
   if (expect_success(spore_network_capabilities_json(context, &capabilities_json)) != 0) return 1;
   if (capabilities_json.ptr == 0 || strstr(capabilities_json.ptr, "\"exact_host_port\": true") == 0) return 1;
   spore_free_string(context, capabilities_json);
+
+  SporeString rootfs_cache = { "/tmp/sporevm-c-smoke-rootfs-empty", strlen("/tmp/sporevm-c-smoke-rootfs-empty") };
+  df_options.rootfs_cache = rootfs_cache;
+  SporeOwnedString df_json = {0};
+  if (expect_success(spore_system_df_json(context, &df_options, &df_json)) != 0) return 1;
+  if (df_json.ptr == 0 || strstr(df_json.ptr, "\"cache_root\": \"/tmp/sporevm-c-smoke-rootfs-empty\"") == 0) return 1;
+  spore_free_string(context, df_json);
+
+  prune_options.rootfs_cache = rootfs_cache;
+  SporeOwnedString prune_json = {0};
+  if (expect_success(spore_system_prune_json(context, &prune_options, &prune_json)) != 0) return 1;
+  if (prune_json.ptr == 0 || strstr(prune_json.ptr, "\"dry_run\": true") == 0) return 1;
+  spore_free_string(context, prune_json);
 
   SporeString env_name = { "SPOREVM_RUNTIME_DIR", strlen("SPOREVM_RUNTIME_DIR") };
   SporeString env_value = { "/tmp/sporevm-c-smoke-empty", strlen("/tmp/sporevm-c-smoke-empty") };

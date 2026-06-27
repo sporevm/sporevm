@@ -11,8 +11,10 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 5;
+const c_abi_version: u32 = 6;
 const inspect_bundle_options_version: u32 = 1;
+const system_df_options_version: u32 = 1;
+const system_prune_options_version: u32 = 1;
 const create_named_options_version: u32 = 3;
 const resume_named_options_version: u32 = 1;
 const fork_named_options_version: u32 = 1;
@@ -52,6 +54,25 @@ const SporeInspectBundleOptions = extern struct {
     has_child_range: u8,
     child_range_start: u32,
     child_range_end: u32,
+};
+
+const SporeSystemDfOptions = extern struct {
+    size: u32,
+    version: u32,
+    rootfs_cache: SporeString,
+};
+
+const SporeSystemPruneOptions = extern struct {
+    size: u32,
+    version: u32,
+    rootfs_cache: SporeString,
+    dry_run: u8,
+    include_digest_artifacts: u8,
+    has_older_than_seconds: u8,
+    older_than_seconds: u64,
+    has_max_bytes: u8,
+    max_bytes: u64,
+    rootfs_only: u8,
 };
 
 const SporeCreateNamedOptions = extern struct {
@@ -167,6 +188,31 @@ pub export fn spore_inspect_bundle_options_init(options: ?*SporeInspectBundleOpt
         .has_child_range = 0,
         .child_range_start = 0,
         .child_range_end = 0,
+    };
+}
+
+pub export fn spore_system_df_options_init(options: ?*SporeSystemDfOptions) void {
+    const out = options orelse return;
+    out.* = .{
+        .size = @sizeOf(SporeSystemDfOptions),
+        .version = system_df_options_version,
+        .rootfs_cache = .{},
+    };
+}
+
+pub export fn spore_system_prune_options_init(options: ?*SporeSystemPruneOptions) void {
+    const out = options orelse return;
+    out.* = .{
+        .size = @sizeOf(SporeSystemPruneOptions),
+        .version = system_prune_options_version,
+        .rootfs_cache = .{},
+        .dry_run = 1,
+        .include_digest_artifacts = 0,
+        .has_older_than_seconds = 0,
+        .older_than_seconds = 0,
+        .has_max_bytes = 0,
+        .max_bytes = 0,
+        .rootfs_only = 0,
     };
 }
 
@@ -379,6 +425,57 @@ pub export fn spore_inspect_bundle_json(
         .child_range = child_range,
     }) catch |err| return fail(ctx, err);
     defer libspore.deinitInspectBundleResult(ctx.allocator, result);
+
+    out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_system_df_json(
+    context: ?*SporeContextImpl,
+    options: ?*const SporeSystemDfOptions,
+    out_json: ?*SporeOwnedString,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    const out = out_json orelse return fail(ctx, error.InvalidValue);
+    out.* = .{};
+    ctx.clearLastError();
+    if (opts.version != system_df_options_version or opts.size < @sizeOf(SporeSystemDfOptions)) {
+        return fail(ctx, error.InvalidValue);
+    }
+
+    const result = libspore.systemDf(ctx.productContext(), ctx.allocator, .{
+        .rootfs_cache = cacheRootFromPath(optionalSlice(opts.rootfs_cache) catch |err| return fail(ctx, err)),
+    }) catch |err| return fail(ctx, err);
+    defer libspore.deinitRootfsSystemSummary(ctx.allocator, result);
+
+    out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_system_prune_json(
+    context: ?*SporeContextImpl,
+    options: ?*const SporeSystemPruneOptions,
+    out_json: ?*SporeOwnedString,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    const out = out_json orelse return fail(ctx, error.InvalidValue);
+    out.* = .{};
+    ctx.clearLastError();
+    if (opts.version != system_prune_options_version or opts.size < @sizeOf(SporeSystemPruneOptions)) {
+        return fail(ctx, error.InvalidValue);
+    }
+
+    const result = libspore.systemPrune(ctx.productContext(), ctx.allocator, .{
+        .rootfs_cache = cacheRootFromPath(optionalSlice(opts.rootfs_cache) catch |err| return fail(ctx, err)),
+        .dry_run = opts.dry_run != 0,
+        .include_digest_artifacts = opts.include_digest_artifacts != 0,
+        .older_than_seconds = if (opts.has_older_than_seconds != 0) opts.older_than_seconds else null,
+        .max_bytes = if (opts.has_max_bytes != 0) opts.max_bytes else null,
+        .rootfs_only = opts.rootfs_only != 0,
+    }) catch |err| return fail(ctx, err);
+    defer libspore.deinitRootfsPruneResult(ctx.allocator, result);
 
     out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
     return result_success;
@@ -626,6 +723,10 @@ fn optionalSlice(value: SporeString) !?[]const u8 {
     return try toSlice(value);
 }
 
+fn cacheRootFromPath(path: ?[]const u8) libspore.CacheRoot {
+    return if (path) |value| .{ .path = value } else .env;
+}
+
 fn cInit(ctx: *SporeContextImpl, arena: *std.heap.ArenaAllocator) std.process.Init {
     return .{
         .minimal = undefined,
@@ -712,7 +813,7 @@ fn fail(ctx: *SporeContextImpl, err: anyerror) c_int {
     ctx.setLastError(@errorName(err));
     return switch (err) {
         error.OutOfMemory => result_out_of_memory,
-        error.InvalidValue => result_invalid_value,
+        error.InvalidPruneSelection, error.InvalidValue => result_invalid_value,
         else => result_error,
     };
 }
@@ -728,6 +829,18 @@ test "inspect bundle options initialize size and version" {
     spore_inspect_bundle_options_init(&options);
     try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeInspectBundleOptions))), options.size);
     try std.testing.expectEqual(inspect_bundle_options_version, options.version);
+
+    var df_options: SporeSystemDfOptions = undefined;
+    spore_system_df_options_init(&df_options);
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeSystemDfOptions))), df_options.size);
+    try std.testing.expectEqual(system_df_options_version, df_options.version);
+
+    var prune_options: SporeSystemPruneOptions = undefined;
+    spore_system_prune_options_init(&prune_options);
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeSystemPruneOptions))), prune_options.size);
+    try std.testing.expectEqual(system_prune_options_version, prune_options.version);
+    try std.testing.expectEqual(@as(u8, 1), prune_options.dry_run);
+    try std.testing.expectEqual(@as(u8, 0), prune_options.include_digest_artifacts);
 }
 
 test "named lifecycle options initialize defaults" {

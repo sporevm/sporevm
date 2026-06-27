@@ -110,7 +110,21 @@ pub const RuntimeForkPruneResult = struct {
     entries: []const RuntimeForkPruneEntry = &.{},
 };
 
-const PruneOptions = struct {
+pub const DfOptions = struct {
+    cache_root: []const u8,
+};
+
+pub const PruneOptions = struct {
+    cache_root: []const u8,
+    runtime_root: ?[]const u8 = null,
+    dry_run: bool = true,
+    include_digest_artifacts: bool = false,
+    older_than_seconds: ?u64 = null,
+    max_bytes: ?u64 = null,
+    rootfs_only: bool = false,
+};
+
+const PrunePlanOptions = struct {
     dry_run: bool = true,
     include_digest_artifacts: bool = false,
     older_than_ns: ?i96 = null,
@@ -148,6 +162,52 @@ const RuntimeForkPlanEntry = struct {
 const RuntimeVmSpecRef = struct {
     resume_dir: ?[]const u8 = null,
 };
+
+pub fn df(allocator: std.mem.Allocator, io: Io, options: DfOptions) !RootfsSystemSummary {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+
+    var summary = try summarizeRootfsCache(arena_state.allocator(), io, options.cache_root);
+    summary.cache_root = try allocator.dupe(u8, options.cache_root);
+    return summary;
+}
+
+pub fn deinitRootfsSystemSummary(allocator: std.mem.Allocator, summary: RootfsSystemSummary) void {
+    allocator.free(summary.cache_root);
+}
+
+pub fn prune(
+    allocator: std.mem.Allocator,
+    io: Io,
+    options: PruneOptions,
+    now_ns: i96,
+) !RootfsPruneResult {
+    const plan_options = try normalizePruneOptions(options);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var result = try pruneRootfsCache(arena, io, options.cache_root, plan_options, now_ns);
+    if (!options.rootfs_only and plan_options.older_than_ns != null) {
+        if (options.runtime_root) |runtime_root| {
+            result.runtime_forks = try pruneRuntimeForkBatches(arena, io, runtime_root, plan_options, now_ns);
+        }
+    }
+    return ownRootfsPruneResult(allocator, result);
+}
+
+pub fn deinitRootfsPruneResult(allocator: std.mem.Allocator, result: RootfsPruneResult) void {
+    allocator.free(result.cache_root);
+    for (result.entries) |entry| {
+        allocator.free(entry.path);
+        if (entry.metadata_path) |path| allocator.free(path);
+    }
+    allocator.free(result.entries);
+    if (result.runtime_forks) |runtime_forks| {
+        deinitRuntimeForkPruneResult(allocator, runtime_forks);
+    }
+}
 
 pub fn run(
     init: std.process.Init,
@@ -217,7 +277,7 @@ fn dfCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, s
         },
         else => |e| return e,
     };
-    const summary = try summarizeRootfsCache(allocator, init.io, cache_root);
+    const summary = try df(allocator, init.io, .{ .cache_root = cache_root });
     if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, summary);
     } else {
@@ -226,8 +286,7 @@ fn dfCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, s
 }
 
 fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
-    var opts = PruneOptions{};
-    var rootfs_only = false;
+    var opts = PruneOptions{ .cache_root = "" };
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -247,7 +306,7 @@ fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
         } else if (std.mem.eql(u8, arg, "--json")) {
             exitLocalJsonUnsupported(init.arena.allocator(), stderr, mode, "system prune");
         } else if (std.mem.eql(u8, arg, "--rootfs")) {
-            rootfs_only = true;
+            opts.rootfs_only = true;
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
             opts.dry_run = true;
         } else if (std.mem.eql(u8, arg, "--force")) {
@@ -261,7 +320,6 @@ fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
                 exitInvalidValue(init.arena.allocator(), stderr, mode, "system prune", "--older-than", args[i]);
             };
             opts.older_than_seconds = seconds;
-            opts.older_than_ns = @as(i96, seconds) * std.time.ns_per_s;
         } else if (std.mem.eql(u8, arg, "--max-bytes")) {
             i += 1;
             if (i >= args.len) exitMissingValue(init.arena.allocator(), stderr, mode, "system prune", "--max-bytes");
@@ -273,13 +331,9 @@ fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
         }
     }
 
-    if (opts.older_than_ns == null and opts.max_bytes == null) {
-        if (opts.include_digest_artifacts) {
-            const message = "spore system prune: set --older-than or --max-bytes when using --include-digest-artifacts";
-            exitWithCliError(init.arena.allocator(), stderr, mode, machine_output.usageMissingArgument(message, "system prune"), messageWithUsage(init.arena.allocator(), message));
-        }
-        opts.max_bytes = default_prune_max_bytes;
-        opts.default_selection = true;
+    if (opts.older_than_seconds == null and opts.max_bytes == null and opts.include_digest_artifacts) {
+        const message = "spore system prune: set --older-than or --max-bytes when using --include-digest-artifacts";
+        exitWithCliError(init.arena.allocator(), stderr, mode, machine_output.usageMissingArgument(message, "system prune"), messageWithUsage(init.arena.allocator(), message));
     }
 
     const allocator = init.arena.allocator();
@@ -295,14 +349,13 @@ fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
         },
         else => |e| return e,
     };
+    opts.cache_root = cache_root;
     const now = Io.Clock.real.now(init.io).nanoseconds;
-    var result = try pruneRootfsCache(allocator, init.io, cache_root, opts, now);
-    if (!rootfs_only and opts.older_than_ns != null) {
+    if (!opts.rootfs_only and opts.older_than_seconds != null) {
         const runtime_root = local_paths.runtimeRootPath(allocator, init.environ_map) catch null;
-        if (runtime_root) |root| {
-            result.runtime_forks = try pruneRuntimeForkBatches(allocator, init.io, root, opts, now);
-        }
+        if (runtime_root) |root| opts.runtime_root = root;
     }
+    const result = try prune(allocator, init.io, opts, now);
     if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, result);
     } else {
@@ -379,6 +432,92 @@ fn exitInvalidValue(
     exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
 }
 
+fn normalizePruneOptions(options: PruneOptions) !PrunePlanOptions {
+    var out = PrunePlanOptions{
+        .dry_run = options.dry_run,
+        .include_digest_artifacts = options.include_digest_artifacts,
+        .older_than_seconds = options.older_than_seconds,
+        .max_bytes = options.max_bytes,
+    };
+
+    if (options.older_than_seconds) |seconds| {
+        out.older_than_ns = std.math.mul(i96, @intCast(seconds), std.time.ns_per_s) catch return error.InvalidPruneSelection;
+    }
+
+    if (out.older_than_ns == null and out.max_bytes == null) {
+        if (out.include_digest_artifacts) return error.InvalidPruneSelection;
+        out.max_bytes = default_prune_max_bytes;
+        out.default_selection = true;
+    }
+    return out;
+}
+
+fn ownRootfsPruneResult(allocator: std.mem.Allocator, result: RootfsPruneResult) !RootfsPruneResult {
+    var out = result;
+    out.cache_root = try allocator.dupe(u8, result.cache_root);
+    errdefer allocator.free(out.cache_root);
+
+    const entries = try allocator.alloc(RootfsPruneEntry, result.entries.len);
+    var owned_entry_count: usize = 0;
+    errdefer {
+        for (entries[0..owned_entry_count]) |entry| {
+            allocator.free(entry.path);
+            if (entry.metadata_path) |path| allocator.free(path);
+        }
+        allocator.free(entries);
+    }
+    for (entries, result.entries) |*dest, source| {
+        dest.* = source;
+        dest.path = "";
+        dest.metadata_path = null;
+        dest.path = try allocator.dupe(u8, source.path);
+        owned_entry_count += 1;
+        if (source.metadata_path) |path| {
+            dest.metadata_path = try allocator.dupe(u8, path);
+        }
+    }
+    out.entries = entries;
+
+    var runtime_owned = false;
+    errdefer if (runtime_owned) {
+        if (out.runtime_forks) |owned_runtime_forks| {
+            deinitRuntimeForkPruneResult(allocator, owned_runtime_forks);
+        }
+    };
+    if (result.runtime_forks) |runtime_forks| {
+        out.runtime_forks = try ownRuntimeForkPruneResult(allocator, runtime_forks);
+        runtime_owned = true;
+    }
+    return out;
+}
+
+fn ownRuntimeForkPruneResult(allocator: std.mem.Allocator, result: RuntimeForkPruneResult) !RuntimeForkPruneResult {
+    var out = result;
+    out.runtime_root = try allocator.dupe(u8, result.runtime_root);
+    errdefer allocator.free(out.runtime_root);
+
+    const entries = try allocator.alloc(RuntimeForkPruneEntry, result.entries.len);
+    var owned_entry_count: usize = 0;
+    errdefer {
+        for (entries[0..owned_entry_count]) |entry| allocator.free(entry.path);
+        allocator.free(entries);
+    }
+    for (entries, result.entries) |*dest, source| {
+        dest.* = source;
+        dest.path = "";
+        dest.path = try allocator.dupe(u8, source.path);
+        owned_entry_count += 1;
+    }
+    out.entries = entries;
+    return out;
+}
+
+fn deinitRuntimeForkPruneResult(allocator: std.mem.Allocator, result: RuntimeForkPruneResult) void {
+    allocator.free(result.runtime_root);
+    for (result.entries) |entry| allocator.free(entry.path);
+    allocator.free(result.entries);
+}
+
 fn summarizeRootfsCache(allocator: std.mem.Allocator, io: Io, cache_root: []const u8) !RootfsSystemSummary {
     var summary = RootfsSystemSummary{ .cache_root = cache_root };
     var root = openDirPath(io, cache_root, .{ .iterate = true }) catch |err| switch (err) {
@@ -428,7 +567,7 @@ fn pruneRootfsCache(
     allocator: std.mem.Allocator,
     io: Io,
     cache_root: []const u8,
-    opts: PruneOptions,
+    opts: PrunePlanOptions,
     now_ns: i96,
 ) !RootfsPruneResult {
     const plan = try collectPruneEntries(allocator, io, cache_root, opts.include_digest_artifacts);
@@ -518,7 +657,7 @@ fn pruneRuntimeForkBatches(
     allocator: std.mem.Allocator,
     io: Io,
     runtime_root: []const u8,
-    opts: PruneOptions,
+    opts: PrunePlanOptions,
     now_ns: i96,
 ) !RuntimeForkPruneResult {
     const plan = try collectRuntimeForkEntries(allocator, io, runtime_root);
@@ -1253,7 +1392,7 @@ test "system prunes only unreferenced runtime fork batches" {
     const spec = try std.fmt.allocPrint(allocator, "{{\"resume_dir\":\"{s}\"}}", .{live_child});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ root, "vms", "worker", "spec.json" }), .data = spec });
 
-    const opts = PruneOptions{
+    const opts = PrunePlanOptions{
         .older_than_ns = 1,
         .older_than_seconds = 1,
     };
@@ -1264,7 +1403,7 @@ test "system prunes only unreferenced runtime fork batches" {
     try std.testing.expect(try fileExists(io, try std.fs.path.join(allocator, &.{ root, "forks", "live" })));
     try std.testing.expect(try fileExists(io, try std.fs.path.join(allocator, &.{ root, "forks", "dead" })));
 
-    const forced = try pruneRuntimeForkBatches(allocator, io, root, .{
+    const forced = try pruneRuntimeForkBatches(allocator, io, root, PrunePlanOptions{
         .dry_run = false,
         .older_than_ns = 1,
         .older_than_seconds = 1,

@@ -118,3 +118,48 @@ test "external import can name managed run-from and named lifecycle APIs" {
     const facts = libspore.networkCapabilities();
     try std.testing.expect(facts.supported and facts.exact_host_port);
 }
+
+test "external import can inspect and prune system cache" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const context = libspore.Context{
+        .io = std.testing.io,
+        .environ_map = &env,
+    };
+    const root = "zig-cache/libspore-system-smoke";
+
+    const df_options = libspore.SystemDfOptions{ .rootfs_cache = .{ .path = root } };
+    switch (df_options.rootfs_cache) {
+        .path => |path| try std.testing.expectEqualStrings("zig-cache/libspore-system-smoke", path),
+        else => return error.UnexpectedCacheRoot,
+    }
+
+    const summary = try libspore.systemDf(context, allocator, df_options);
+    defer libspore.deinitRootfsSystemSummary(allocator, summary);
+    try std.testing.expectEqualStrings(root, summary.cache_root);
+    try std.testing.expectEqual(@as(u64, 0), summary.known_logical_bytes);
+
+    const prune_options = libspore.SystemPruneOptions{
+        .rootfs_cache = .{ .path = root },
+        .dry_run = true,
+        .max_bytes = 0,
+        .rootfs_only = true,
+    };
+    try std.testing.expect(prune_options.dry_run);
+    try std.testing.expect(prune_options.rootfs_only);
+
+    const pruned = try libspore.systemPrune(context, allocator, prune_options);
+    defer libspore.deinitRootfsPruneResult(allocator, pruned);
+    try std.testing.expect(pruned.dry_run);
+    try std.testing.expectEqual(@as(usize, 0), pruned.entries.len);
+
+    _ = libspore.CacheStats;
+    _ = libspore.RootfsSystemSummary;
+    _ = libspore.RootfsPruneResult;
+    _ = libspore.RuntimeForkPruneResult;
+    _ = libspore.systemDf;
+    _ = libspore.systemPrune;
+    _ = libspore.deinitRootfsSystemSummary;
+    _ = libspore.deinitRootfsPruneResult;
+}

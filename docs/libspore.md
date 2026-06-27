@@ -52,9 +52,35 @@ Use the matching helper for owned results:
 - `deinitExecNamedResult`
 - `deinitNamedForkResult`
 - `deinitNamedList`
+- `deinitRootfsSystemSummary`
+- `deinitRootfsPruneResult`
 
 `run`, `runManaged`, `runFromSpore`, and `resumeSpore` return value results and
 do not need deinit.
+
+## Local System
+
+Use `systemDf` and `systemPrune` for rootfs cache inspection and cleanup without
+constructing `spore system` argv:
+
+```zig
+const summary = try libspore.systemDf(context, allocator, .{
+    .rootfs_cache = .env,
+});
+defer libspore.deinitRootfsSystemSummary(allocator, summary);
+
+const pruned = try libspore.systemPrune(context, allocator, .{
+    .rootfs_cache = .env,
+    .dry_run = true,
+    .older_than_seconds = 7 * 24 * 60 * 60,
+});
+defer libspore.deinitRootfsPruneResult(allocator, pruned);
+```
+
+`systemPrune` is dry-run by default. When no age or size limit is provided, it
+selects the same default-prunable rootfs entries as `spore system prune`.
+Digest/CAS artifacts require an explicit `older_than_seconds` or `max_bytes`
+limit.
 
 ## Running
 

@@ -380,6 +380,9 @@ The first implementation should pin a small stable code table in tests:
   the CLI has begun routing single-result host, manifest, fork, bundle, and
   named `create`/`resume`/`fork`/`exec`/`rm`/`suspend`/`ls` commands through
   the API boundary instead of using command parsing as the product interface.
+  `system df` and `system prune` now share typed rootfs cache summary and prune
+  operations with `libspore`, with dry-run/default-selection behavior owned by
+  that API layer.
   Remaining CLI product paths should move behind the same boundary before the
   surface is considered complete.
   The public Zig module now exposes explicit deinit helpers for owned result

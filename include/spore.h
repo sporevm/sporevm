@@ -70,6 +70,8 @@ typedef struct SporeOwnedString {
 typedef struct SporeContextImpl *SporeContext;
 
 #define SPORE_INSPECT_BUNDLE_OPTIONS_VERSION 1u
+#define SPORE_SYSTEM_DF_OPTIONS_VERSION 1u
+#define SPORE_SYSTEM_PRUNE_OPTIONS_VERSION 1u
 #define SPORE_CREATE_NAMED_OPTIONS_VERSION 3u
 #define SPORE_RESUME_NAMED_OPTIONS_VERSION 1u
 #define SPORE_FORK_NAMED_OPTIONS_VERSION 1u
@@ -88,6 +90,27 @@ typedef struct SporeInspectBundleOptions {
   uint32_t child_range_start;
   uint32_t child_range_end;
 } SporeInspectBundleOptions;
+
+/** Options for spore_system_df_json(). */
+typedef struct SporeSystemDfOptions {
+  uint32_t size;
+  uint32_t version;
+  SporeString rootfs_cache;
+} SporeSystemDfOptions;
+
+/** Options for spore_system_prune_json(). */
+typedef struct SporeSystemPruneOptions {
+  uint32_t size;
+  uint32_t version;
+  SporeString rootfs_cache;
+  uint8_t dry_run;
+  uint8_t include_digest_artifacts;
+  uint8_t has_older_than_seconds;
+  uint64_t older_than_seconds;
+  uint8_t has_max_bytes;
+  uint64_t max_bytes;
+  uint8_t rootfs_only;
+} SporeSystemPruneOptions;
 
 /** Exact host plus port egress rule. */
 typedef struct SporeNetworkRule {
@@ -189,6 +212,12 @@ typedef struct SporeRemoveNamedOptions {
 /** Initialize inspect-bundle options with the current ABI size and version. */
 SPORE_API void spore_inspect_bundle_options_init(SporeInspectBundleOptions *options);
 
+/** Initialize system-df options with defaults. */
+SPORE_API void spore_system_df_options_init(SporeSystemDfOptions *options);
+
+/** Initialize system-prune options with defaults. */
+SPORE_API void spore_system_prune_options_init(SporeSystemPruneOptions *options);
+
 /** Initialize create-named options with defaults. */
 SPORE_API void spore_create_named_options_init(SporeCreateNamedOptions *options);
 
@@ -259,6 +288,16 @@ SPORE_API SporeResult spore_network_capabilities_json(SporeContext context, Spor
 SPORE_API SporeResult spore_inspect_bundle_json(SporeContext context,
                                                 const SporeInspectBundleOptions *options,
                                                 SporeOwnedString *out_json);
+
+/** Return rootfs cache usage as JSON. */
+SPORE_API SporeResult spore_system_df_json(SporeContext context,
+                                           const SporeSystemDfOptions *options,
+                                           SporeOwnedString *out_json);
+
+/** Prune local system state and return JSON output. */
+SPORE_API SporeResult spore_system_prune_json(SporeContext context,
+                                              const SporeSystemPruneOptions *options,
+                                              SporeOwnedString *out_json);
 
 /** Create a named VM and return `spore.lifecycle.v1` JSON. */
 SPORE_API SporeResult spore_create_named_json(SporeContext context,
