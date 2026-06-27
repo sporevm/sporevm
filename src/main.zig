@@ -123,9 +123,9 @@ fn runCommand(
     if (std.mem.eql(u8, command, "system")) {
         try spore_internal.system.run(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "rootfs")) {
-        try spore_internal.rootfs.run(init, command_args, stdout);
+        try spore_internal.rootfs_cli.run(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "run")) {
-        try spore_internal.run.cli(init, command_args, stdout);
+        try spore_internal.run_cli.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "resume")) {
         if (wantsNamedResume(command_args)) {
             try spore_internal.lifecycle.resumeCli(init, command_args, stdout, stderr, mode);
@@ -134,7 +134,7 @@ fn runCommand(
                 const message = "spore --json resume requires named lifecycle mode with --name; use --events jsonl for product resume";
                 exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
             }
-            try spore_internal.resume_cmd.cli(init, command_args, stdout);
+            try spore_internal.resume_cli.cli(init, command_args, stdout);
         }
     } else if (std.mem.eql(u8, command, "create")) {
         try spore_internal.lifecycle.createCli(init, command_args, stdout, stderr, mode);

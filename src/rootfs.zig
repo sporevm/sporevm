@@ -29,7 +29,7 @@ const resolver_placeholder_path = "etc/resolv.conf";
 const resolver_placeholder_bytes =
     "# SporeVM generated placeholder; --net bind-mounts the guest resolver here.\n";
 
-const usage =
+pub const usage =
     \\Usage: spore rootfs <command>
     \\
     \\Commands:
@@ -46,34 +46,7 @@ const usage =
     \\
 ;
 
-pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (args.len == 0 or std.mem.eql(u8, args[0], "help")) {
-        try stdout.writeAll(usage);
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "build")) {
-        try runBuild(init, args[1..], stdout);
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "import-oci")) {
-        try runImportOci(init, args[1..], stdout);
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "resolve")) {
-        try runResolve(init, args[1..], stdout);
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "cas-preload")) {
-        try runCasPreload(init, args[1..], stdout);
-        return;
-    }
-    try stdout.print("unknown rootfs command: {s}\n\n", .{args[0]});
-    try stdout.writeAll(usage);
-    try stdout.flush();
-    std.process.exit(2);
-}
-
-const ParsedBuildOptions = struct {
+pub const ParsedBuildOptions = struct {
     ref: []const u8,
     output: []const u8,
     metadata: []const u8,
@@ -82,12 +55,12 @@ const ParsedBuildOptions = struct {
     debugfs: ?[]const u8 = null,
 };
 
-const ParsedResolveOptions = struct {
+pub const ParsedResolveOptions = struct {
     ref: []const u8,
     platform: Platform = .{},
 };
 
-const ParsedImportOciOptions = struct {
+pub const ParsedImportOciOptions = struct {
     input: []const u8,
     ref: []const u8,
     platform: Platform = .{},
@@ -95,7 +68,7 @@ const ParsedImportOciOptions = struct {
     debugfs: ?[]const u8 = null,
 };
 
-const ParsedCasPreloadOptions = struct {
+pub const ParsedCasPreloadOptions = struct {
     digest: []const u8,
     chunk_size: u64 = rootfs_cas.default_chunk_size,
     attach_spore: ?[]const u8 = null,
@@ -119,6 +92,19 @@ pub const ImportOciRequest = struct {
     mkfs: ?[]const u8 = null,
     debugfs: ?[]const u8 = null,
 };
+
+pub const ResolveRequest = struct {
+    ref: []const u8,
+    platform: Platform = .{},
+};
+
+pub const CasPreloadRequest = struct {
+    digest: []const u8,
+    chunk_size: u64 = rootfs_cas.default_chunk_size,
+    attach_spore: ?[]const u8 = null,
+};
+
+pub const CasPreloadResult = rootfs_cas.PreloadResult;
 
 pub const ImportOciResult = struct {
     rootfs_path: []const u8,
@@ -160,91 +146,7 @@ const LocalRefMetadata = struct {
     builder_version: []const u8 = builder_version,
 };
 
-fn runResolve(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    const arena = init.arena.allocator();
-    const opts = try parseResolveOptions(args, stdout);
-    if (isLocalImageRef(opts.ref)) {
-        const cache_root = try local_paths.rootfsCacheRootPath(arena, init.environ_map);
-        const resolved = try resolveLocalCachedRef(init.io, arena, cache_root, opts.ref, opts.platform);
-        try stdout.print("{s}\n", .{resolved.ref});
-        return;
-    }
-    const pinned_ref = try resolveTaggedImageRef(init, arena, opts);
-    try stdout.print("{s}\n", .{pinned_ref});
-}
-
-fn runBuild(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    const arena = init.arena.allocator();
-    const parsed = try parseBuildOptions(arena, args, stdout);
-    const result = try build(init, arena, .{
-        .ref = parsed.ref,
-        .output = parsed.output,
-        .metadata = parsed.metadata,
-        .platform = parsed.platform,
-        .mkfs = parsed.mkfs,
-        .debugfs = parsed.debugfs,
-    });
-    try stdout.print("rootfs: {s}\nmetadata: {s}\nsource: {s}\nrootfs_blake3: {s}\nrootfs_storage: {s}\n", .{
-        parsed.output,
-        parsed.metadata,
-        parsed.ref,
-        result.rootfs_blake3,
-        result.rootfs_storage.index_digest,
-    });
-}
-
-fn runImportOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    const arena = init.arena.allocator();
-    const parsed = try parseImportOciOptions(args, stdout);
-    const result = try importOciLayout(init, arena, .{
-        .input = parsed.input,
-        .ref = parsed.ref,
-        .platform = parsed.platform,
-        .mkfs = parsed.mkfs,
-        .debugfs = parsed.debugfs,
-    });
-    try stdout.print(
-        "rootfs: {s}\nmetadata: {s}\nref: {s}\nresolved: {s}\nrootfs_blake3: {s}\n",
-        .{
-            result.rootfs_path,
-            result.metadata_path,
-            parsed.ref,
-            result.resolved_image_ref,
-            result.rootfs_blake3,
-        },
-    );
-}
-
-fn runCasPreload(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    const arena = init.arena.allocator();
-    const parsed = try parseCasPreloadOptions(args, stdout);
-    const cache_root = try local_paths.rootfsCacheRootPath(arena, init.environ_map);
-    const result = try rootfs_cas.preload(init.io, arena, cache_root, parsed.digest, parsed.chunk_size);
-    if (parsed.attach_spore) |spore_dir| {
-        try attachPreloadedRootfsStorage(arena, spore_dir, parsed.digest, result);
-    }
-    try stdout.print(
-        "index: {s}\nindex_digest: {s}\nrootfs: {s}\nrootfs_size: {d}\nchunk_size: {d}\nchunks: {d}\nzero_chunks: {d}\nnonzero_chunks: {d}\nobjects_written: {d}\nobject_bytes_written: {d}\nindex_bytes: {d}\n",
-        .{
-            result.index_path,
-            result.index_digest,
-            result.rootfs_digest,
-            result.rootfs_size,
-            result.chunk_size,
-            result.chunk_count,
-            result.zero_chunks,
-            result.nonzero_chunks,
-            result.objects_written,
-            result.object_bytes_written,
-            result.index_bytes,
-        },
-    );
-    if (parsed.attach_spore) |spore_dir| {
-        try stdout.print("attached_spore: {s}\n", .{spore_dir});
-    }
-}
-
-fn parseResolveOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedResolveOptions {
+pub fn parseResolveOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedResolveOptions {
     if (args.len == 0) {
         try stdout.writeAll(usage);
         try stdout.flush();
@@ -276,7 +178,7 @@ fn parseResolveOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedReso
     };
 }
 
-fn parseImportOciOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedImportOciOptions {
+pub fn parseImportOciOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedImportOciOptions {
     if (args.len == 0) {
         try stdout.writeAll(usage);
         try stdout.flush();
@@ -328,7 +230,7 @@ fn parseImportOciOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedIm
     };
 }
 
-fn parseCasPreloadOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedCasPreloadOptions {
+pub fn parseCasPreloadOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedCasPreloadOptions {
     if (args.len == 0) {
         try stdout.writeAll(usage);
         try stdout.flush();
@@ -418,7 +320,7 @@ fn rootfsDeviceMatches(a: spore.RootfsDevice, b: spore.RootfsDevice) bool {
         a.mmio_slot == b.mmio_slot;
 }
 
-fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8, stdout: *Io.Writer) !ParsedBuildOptions {
+pub fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8, stdout: *Io.Writer) !ParsedBuildOptions {
     if (args.len == 0) {
         try stdout.writeAll(usage);
         try stdout.flush();
@@ -854,6 +756,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, request: Buil
 pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, request: ImportOciRequest) !ImportOciResult {
     _ = try parseLocalTagRef(request.ref);
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    defer allocator.free(cache_root);
     try ensureDirPath(init.io, cache_root);
     const temp_dir_root = try std.fs.path.join(allocator, &.{ cache_root, "tmp" });
     try ensureDirPath(init.io, temp_dir_root);
@@ -907,6 +810,60 @@ pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, req
         .image_manifest_digest = source.manifest_digest,
         .rootfs_blake3 = result.rootfs_blake3,
     };
+}
+
+pub fn resolveReference(init: std.process.Init, allocator: std.mem.Allocator, request: ResolveRequest) ![]const u8 {
+    if (isLocalImageRef(request.ref)) {
+        const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+        defer allocator.free(cache_root);
+        const resolved = try resolveLocalCachedRef(init.io, allocator, cache_root, request.ref, request.platform);
+        return resolved.ref;
+    }
+    return resolveTaggedImageRef(init, allocator, .{
+        .ref = request.ref,
+        .platform = request.platform,
+    });
+}
+
+pub fn casPreload(init: std.process.Init, allocator: std.mem.Allocator, request: CasPreloadRequest) !CasPreloadResult {
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    defer allocator.free(cache_root);
+    const result = try rootfs_cas.preload(init.io, allocator, cache_root, request.digest, request.chunk_size);
+    if (request.attach_spore) |spore_dir| {
+        try attachPreloadedRootfsStorage(allocator, spore_dir, request.digest, result);
+    }
+    return result;
+}
+
+pub fn deinitBuildResult(allocator: std.mem.Allocator, result: BuildResult) void {
+    deinitStorageDigestFields(allocator, result.rootfs_storage);
+}
+
+pub fn deinitImportOciResult(allocator: std.mem.Allocator, result: ImportOciResult) void {
+    allocator.free(result.rootfs_path);
+    allocator.free(result.metadata_path);
+    allocator.free(result.local_ref_path);
+    allocator.free(result.resolved_image_ref);
+    allocator.free(result.image_manifest_digest);
+}
+
+pub fn deinitResolvedReference(allocator: std.mem.Allocator, resolved_ref: []const u8) void {
+    allocator.free(resolved_ref);
+}
+
+pub fn deinitCasPreloadResult(allocator: std.mem.Allocator, result: CasPreloadResult) void {
+    allocator.free(result.index_path);
+    allocator.free(result.index_digest);
+    allocator.free(result.rootfs_digest);
+}
+
+fn deinitStorageDigestFields(allocator: std.mem.Allocator, storage: spore.RootfsStorage) void {
+    if (storage.index_digest.ptr == storage.base_identity.ptr and storage.index_digest.len == storage.base_identity.len) {
+        allocator.free(storage.index_digest);
+    } else {
+        allocator.free(storage.index_digest);
+        allocator.free(storage.base_identity);
+    }
 }
 
 const LayoutBuildOptions = struct {
@@ -1207,6 +1164,7 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     const rootfs_hex = try allocator.dupe(u8, &rootfs_blake3);
     const stat = try Io.Dir.cwd().statFile(init.io, opts.output, .{});
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    defer allocator.free(cache_root);
     const artifact = spore.RootfsArtifactRef{
         .digest = try std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, rootfs_hex }),
         .size = stat.size,

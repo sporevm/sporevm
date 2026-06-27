@@ -52,6 +52,10 @@ Use the matching helper for owned results:
 - `deinitExecNamedResult`
 - `deinitNamedForkResult`
 - `deinitNamedList`
+- `deinitRootfsBuildResult`
+- `deinitRootfsImportOciResult`
+- `deinitRootfsResolveResult`
+- `deinitRootfsCasPreloadResult`
 - `deinitRootfsSystemSummary`
 - `deinitRootfsPruneResult`
 
@@ -81,6 +85,29 @@ defer libspore.deinitRootfsPruneResult(allocator, pruned);
 selects the same default-prunable rootfs entries as `spore system prune`.
 Digest/CAS artifacts require an explicit `older_than_seconds` or `max_bytes`
 limit.
+
+## Rootfs
+
+Use rootfs APIs for the `spore rootfs` product operations without constructing
+argv:
+
+```zig
+const built = try libspore.rootfsBuild(init, allocator, .{
+    .ref = "docker.io/library/alpine:3.20",
+    .output = "alpine.ext4",
+    .metadata = "alpine.ext4.json",
+});
+defer libspore.deinitRootfsBuildResult(allocator, built);
+
+const resolved = try libspore.rootfsResolve(init, allocator, .{
+    .ref = "docker.io/library/alpine:3.20",
+});
+defer libspore.deinitRootfsResolveResult(allocator, resolved);
+```
+
+`rootfsImportOci` imports OCI layouts under local refs. `rootfsCasPreload`
+preloads a rootfs digest into chunked CAS storage and can attach the resulting
+descriptor to an existing spore.
 
 ## Running
 
