@@ -51,6 +51,7 @@ pub const Transport = struct {
     driver_features_sel: u32 = 0,
     driver_features: u64 = 0,
     queue_sel: u32 = 0,
+    config_generation: u32 = 0,
     /// Bit 0: used buffer notification pending. Guest acks via InterruptACK.
     interrupt_status: u32 = 0,
 
@@ -76,6 +77,7 @@ pub const Transport = struct {
         self.device_features_sel = 0;
         self.driver_features_sel = 0;
         self.queue_sel = 0;
+        self.config_generation = 0;
         if (self.dev.resetFn) |f| f(self.dev.context);
     }
 
@@ -96,7 +98,7 @@ pub const Transport = struct {
             0x044 => if (self.selectedQueue()) |q| @intFromBool(q.ready) else 0,
             0x060 => self.interrupt_status,
             0x070 => self.status,
-            0x0fc => 0, // ConfigGeneration: config spaces here are static
+            0x0fc => self.config_generation,
             else => blk: {
                 if (offset >= 0x100) {
                     if (self.dev.configReadFn) |f| break :blk f(self.dev.context, offset - 0x100);
@@ -155,6 +157,12 @@ pub const Transport = struct {
             else => {},
         }
         return false;
+    }
+
+    pub fn raiseConfigChange(self: *Transport) bool {
+        self.config_generation +%= 1;
+        self.interrupt_status |= 2;
+        return true;
     }
 };
 
@@ -250,6 +258,17 @@ test "notify routes to device and latches interrupt until ack" {
     try std.testing.expect(!t.write(0x050, 0, ram));
     try std.testing.expect(!t.write(0x050, 99, ram));
     try std.testing.expectEqual(@as(?u8, null), td.notified);
+}
+
+test "config change latches interrupt and bumps generation" {
+    var td = TestDev{};
+    var t = Transport.init(td.dev());
+    try std.testing.expect(t.raiseConfigChange());
+    try std.testing.expectEqual(@as(u32, 1), t.read(0x0fc));
+    try std.testing.expectEqual(@as(u32, 2), t.read(0x060));
+    var buf: [16]u8 = undefined;
+    _ = t.write(0x064, 2, testRam(&buf));
+    try std.testing.expectEqual(@as(u32, 0), t.read(0x060));
 }
 
 test "status write of zero resets transport state" {

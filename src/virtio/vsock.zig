@@ -98,6 +98,7 @@ pub const HostStream = struct {
     connect_request_delivered_ms: ?u64 = null,
     connect_ms: ?u64 = null,
     request_delivered_ms: ?u64 = null,
+    memory_ready_ms: ?u64 = null,
     first_output_ms: ?u64 = null,
     response_ms: ?u64 = null,
     guest_timing_ms: ?u64 = null,
@@ -276,6 +277,10 @@ pub const HostStream = struct {
         if (std.mem.eql(u8, kind, "timing")) {
             if (self.guest_timing_ms == null) self.guest_timing_ms = self.elapsedMs();
             std.log.debug("vsock host stream guest timing: {s}", .{line});
+            return;
+        }
+        if (std.mem.eql(u8, kind, "memory-ready")) {
+            if (self.memory_ready_ms == null) self.memory_ready_ms = self.elapsedMs();
             return;
         }
         self.fail();
@@ -921,10 +926,11 @@ test "host stream frame parser handles split frames" {
     stream.appendOutput("stdout 0 11\nhello");
     try std.testing.expectEqual(HostStreamState.connected, stream.state);
     stream.appendOutput(" worldstderr 0 4\n");
-    stream.appendOutput("err\nexit 3\n");
+    stream.appendOutput("err\nmemory-ready\nexit 3\n");
 
     try std.testing.expectEqual(HostStreamState.complete, stream.state);
     try std.testing.expectEqual(@as(i32, 3), stream.exit_code.?);
+    try std.testing.expect(stream.memory_ready_ms != null);
     try std.testing.expectEqualStrings("hello world", capture.stdout[0..capture.stdout_len]);
     try std.testing.expectEqualStrings("err\n", capture.stderr[0..capture.stderr_len]);
 }

@@ -154,7 +154,8 @@ const HotplugMapping = struct {
                 .memory_size = 0,
                 .userspace_addr = 0,
             };
-            _ = kvm.ioctl(self.vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION");
+            _ = kvm.ioctl(self.vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION") catch |err|
+                std.log.warn("failed to unmap virtio-mem hotplug region: {}", .{err});
         }
         std.posix.munmap(self.bytes);
     }
@@ -277,14 +278,16 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     transport_count += 1;
     transports_buf[transport_count] = mmio.Transport.init(rng_dev.device());
     transport_count += 1;
+    var mem_transport_index: ?usize = null;
     if (hotplug_mapping) |*mapping| {
         mem_dev = virtio_mem.Mem.init(.{
             .addr = mapping.guest_addr,
             .region_size = @intCast(mapping.bytes.len),
-            .requested_size = @intCast(mapping.bytes.len),
+            .requested_size = 0,
             .plug_context = mapping,
             .plugFn = HotplugMapping.plug,
         });
+        mem_transport_index = transport_count;
         transports_buf[transport_count] = mmio.Transport.init(mem_dev.device());
         transport_count += 1;
     }
@@ -436,9 +439,25 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         try flushVsockRxKvm(vm_fd, &vsock_dev, &transports_buf[vsock_transport_index], ram, vsock_transport_index);
     }
     var exec_probe_done = false;
+    var virtio_mem_requested = mem_transport_index == null;
     var pending_kvm_completion = false;
     var did_capture_request = false;
     while (true) {
+        if (!virtio_mem_requested and mem_transport_index != null) {
+            if (config.exec_probe) |probe| {
+                if (probe.memory_ready_ms != null and probe.state == .connected) {
+                    const idx = mem_transport_index.?;
+                    const mapping = if (hotplug_mapping) |*m| m else unreachable;
+                    try mem_dev.setRequestedSize(@intCast(mapping.bytes.len));
+                    _ = transports_buf[idx].raiseConfigChange();
+                    try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(idx)), true);
+                    std.log.debug("virtio-mem requested hotplug size: bytes={d}", .{mapping.bytes.len});
+                    virtio_mem_requested = true;
+                }
+            } else {
+                virtio_mem_requested = true;
+            }
+        }
         if (config.network.failed()) return error.NetworkGatewayFailed;
         if (config.exec_control) |control| {
             if (pending_kvm_completion) {

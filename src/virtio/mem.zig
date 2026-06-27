@@ -57,11 +57,16 @@ pub const Mem = struct {
             .block_size = config.block_size,
             .addr = config.addr,
             .region_size = config.region_size,
-            .usable_region_size = config.requested_size,
+            .usable_region_size = config.region_size,
             .requested_size = config.requested_size,
             .plug_context = config.plug_context,
             .plugFn = config.plugFn,
         };
+    }
+
+    pub fn setRequestedSize(self: *Mem, bytes: u64) !void {
+        if (bytes > self.region_size or bytes % self.block_size != 0) return error.InvalidVirtioMemRequest;
+        self.requested_size = bytes;
     }
 
     pub fn device(self: *Mem) mmio.Device {

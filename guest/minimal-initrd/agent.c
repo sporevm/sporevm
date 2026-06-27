@@ -86,6 +86,7 @@ struct replay_buffer {
 struct session {
   int started;
   int exited;
+  int memory_ready_sent;
   char session_id[64];
   pid_t pid;
   int stdout_fd;
@@ -694,6 +695,10 @@ static int send_timing_frame(int fd) {
   return write_all(fd, frame, (size_t)n);
 }
 
+static int send_memory_ready_frame(int fd) {
+  return write_all(fd, "memory-ready\n", 13);
+}
+
 static int send_exit_frame(int fd, int exit_code) {
   char frame[32];
   int n = snprintf(frame, sizeof(frame), "exit %d\n", exit_code);
@@ -1227,6 +1232,15 @@ static void maybe_send_session_exit(struct session *session, struct client *clie
   close_client(client);
 }
 
+static void maybe_send_memory_ready(struct session *session, struct client *client) {
+  if (client->fd < 0 || !session->started || session->exited || session->memory_ready_sent) return;
+  if (send_memory_ready_frame(client->fd) != 0) {
+    close_client(client);
+    return;
+  }
+  session->memory_ready_sent = 1;
+}
+
 static void accept_request(int listener, struct session *session, struct client *client, int use_rootfs, int rootfs_ready, const char *rootfs_error, int network_requested, int network_ready, const char *network_error) {
   int conn = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
   if (conn < 0) {
@@ -1457,6 +1471,7 @@ int main(void) {
       pump_session_file(&session, &client, 0);
     }
     poll_session_exit(&session, &client);
+    if (pr == 0) maybe_send_memory_ready(&session, &client);
     maybe_send_session_exit(&session, &client);
   }
 }

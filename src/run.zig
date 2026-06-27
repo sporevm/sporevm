@@ -59,6 +59,12 @@ const managed_run_kernel_required_config_symbols = [_][]const u8{
     "CONFIG_CGROUP_PIDS",
     "CONFIG_CPUSETS",
     "CONFIG_CGROUP_DEVICE",
+    "CONFIG_MEMORY_HOTPLUG",
+    "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE",
+    "CONFIG_MEMORY_HOTREMOVE",
+    "CONFIG_CONTIG_ALLOC",
+    "CONFIG_EXCLUSIVE_SYSTEM_RAM",
+    "CONFIG_VIRTIO_MEM",
 };
 const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
@@ -3723,7 +3729,13 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
             "CONFIG_MEMCG=y\n" ++
             "CONFIG_CGROUP_PIDS=y\n" ++
             "CONFIG_CPUSETS=y\n" ++
-            "CONFIG_CGROUP_DEVICE=y\n",
+            "CONFIG_CGROUP_DEVICE=y\n" ++
+            "CONFIG_MEMORY_HOTPLUG=y\n" ++
+            "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
+            "CONFIG_MEMORY_HOTREMOVE=y\n" ++
+            "CONFIG_CONTIG_ALLOC=y\n" ++
+            "CONFIG_EXCLUSIVE_SYSTEM_RAM=y\n" ++
+            "CONFIG_VIRTIO_MEM=y\n",
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_sha_path, .data = "not-a-sha\n" });
 
@@ -3744,7 +3756,7 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
     try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, bad_sha_path, config_path));
 }
 
-test "managed run kernel config requires Docker runtime and entropy symbols" {
+test "managed run kernel config requires Docker and virtio-mem runtime symbols" {
     const allocator = std.testing.allocator;
     const good_config =
         "# CONFIG_DEVMEM is not set\n" ++
@@ -3761,7 +3773,13 @@ test "managed run kernel config requires Docker runtime and entropy symbols" {
         "CONFIG_MEMCG=y\n" ++
         "CONFIG_CGROUP_PIDS=y\n" ++
         "CONFIG_CPUSETS=y\n" ++
-        "CONFIG_CGROUP_DEVICE=y\n";
+        "CONFIG_CGROUP_DEVICE=y\n" ++
+        "CONFIG_MEMORY_HOTPLUG=y\n" ++
+        "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
+        "CONFIG_MEMORY_HOTREMOVE=y\n" ++
+        "CONFIG_CONTIG_ALLOC=y\n" ++
+        "CONFIG_EXCLUSIVE_SYSTEM_RAM=y\n" ++
+        "CONFIG_VIRTIO_MEM=y\n";
 
     try std.testing.expect(try missingManagedRunKernelConfigSymbol(allocator, good_config) == null);
 
@@ -3779,7 +3797,13 @@ test "managed run kernel config requires Docker runtime and entropy symbols" {
         "CONFIG_MEMCG=y\n" ++
         "CONFIG_CGROUP_PIDS=y\n" ++
         "CONFIG_CPUSETS=y\n" ++
-        "CONFIG_CGROUP_DEVICE=y\n";
+        "CONFIG_CGROUP_DEVICE=y\n" ++
+        "CONFIG_MEMORY_HOTPLUG=y\n" ++
+        "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
+        "CONFIG_MEMORY_HOTREMOVE=y\n" ++
+        "CONFIG_CONTIG_ALLOC=y\n" ++
+        "CONFIG_EXCLUSIVE_SYSTEM_RAM=y\n" ++
+        "CONFIG_VIRTIO_MEM=y\n";
     const missing = (try missingManagedRunKernelConfigSymbol(allocator, missing_file_locking)).?;
     defer allocator.free(missing);
     try std.testing.expectEqualStrings("CONFIG_FILE_LOCKING", missing);
@@ -3796,7 +3820,13 @@ test "managed run kernel config requires Docker runtime and entropy symbols" {
         "CONFIG_MEMCG=y\n" ++
         "CONFIG_CGROUP_PIDS=y\n" ++
         "CONFIG_CPUSETS=y\n" ++
-        "CONFIG_CGROUP_DEVICE=y\n";
+        "CONFIG_CGROUP_DEVICE=y\n" ++
+        "CONFIG_MEMORY_HOTPLUG=y\n" ++
+        "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
+        "CONFIG_MEMORY_HOTREMOVE=y\n" ++
+        "CONFIG_CONTIG_ALLOC=y\n" ++
+        "CONFIG_EXCLUSIVE_SYSTEM_RAM=y\n" ++
+        "CONFIG_VIRTIO_MEM=y\n";
     const module_missing = (try missingManagedRunKernelConfigSymbol(allocator, module_value)).?;
     defer allocator.free(module_missing);
     try std.testing.expectEqualStrings("CONFIG_FILE_LOCKING", module_missing);
