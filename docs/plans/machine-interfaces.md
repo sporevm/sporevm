@@ -378,8 +378,8 @@ The first implementation should pin a small stable code table in tests:
   managed fresh runs take `std.process.Init` because image/rootfs and kernel
   setup can spawn tools, use process IO, and resolve process environment; and
   the CLI has begun routing single-result host, manifest, fork, bundle, and
-  named `create`/`exec`/`rm`/`suspend`/`ls` commands through the API boundary
-  instead of using command parsing as the product interface. Remaining CLI
+  named `create`/`resume`/`exec`/`rm`/`suspend`/`ls` commands through the API
+  boundary instead of using command parsing as the product interface. Remaining CLI
   product paths should move behind the same boundary before the surface is
   considered complete.
   The public Zig module now exposes explicit deinit helpers for owned result

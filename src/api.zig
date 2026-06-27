@@ -142,6 +142,7 @@ pub const OutputEvent = run_mod.OutputEvent;
 pub const ExitEvent = run_mod.ExitEvent;
 pub const FailureEvent = run_mod.FailureEvent;
 pub const CreateNamedOptions = lifecycle.CreateNamedOptions;
+pub const ResumeNamedOptions = lifecycle.ResumeNamedOptions;
 pub const ExecNamedOptions = lifecycle.ExecNamedOptions;
 pub const NamedNetworkOptions = lifecycle.NamedNetworkOptions;
 pub const SnapshotNamedOptions = lifecycle.SnapshotNamedOptions;
@@ -603,6 +604,15 @@ pub fn createNamed(
     options: CreateNamedOptions,
 ) !NamedLifecycleResult {
     return lifecycle.createNamed(init, allocator, options);
+}
+
+/// Resume a spore checkpoint as a long-lived named VM.
+pub fn resumeNamed(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ResumeNamedOptions,
+) !NamedLifecycleResult {
+    return lifecycle.resumeNamed(init, allocator, options);
 }
 
 /// Execute a command inside a ready named VM.

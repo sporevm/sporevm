@@ -101,11 +101,18 @@ const snap = try libspore.snapshotNamed(context, allocator, .{
     .continue_after = true,
 });
 defer libspore.deinitNamedLifecycleResult(allocator, snap);
+
+const resumed = try libspore.resumeNamed(init, allocator, .{
+    .spore_dir = "worker-1.spore",
+    .name = "worker-2",
+});
+defer libspore.deinitNamedLifecycleResult(allocator, resumed);
 ```
 
 The named surface is:
 
 - `createNamed`
+- `resumeNamed`
 - `execNamed`
 - `snapshotNamed`
 - `suspendNamed`

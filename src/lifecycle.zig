@@ -298,6 +298,12 @@ pub const CreateNamedOptions = struct {
     spore_executable: []const u8 = "spore",
 };
 
+pub const ResumeNamedOptions = struct {
+    spore_dir: []const u8,
+    name: []const u8,
+    spore_executable: []const u8 = "spore",
+};
+
 pub const ExecNamedOptions = struct {
     name: []const u8,
     command: []const []const u8,
@@ -457,6 +463,69 @@ fn createNamedWithTiming(
         .state = "ready",
         .pid = ready.value.pid,
         .console_log_path = ready.value.console_log_path,
+    });
+}
+
+pub fn resumeNamed(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ResumeNamedOptions,
+) !NamedLifecycleResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const spore_dir = try resolveExistingSporeDirApi(arena, init.io, options.spore_dir);
+    var manifest = spore.loadManifest(arena, spore_dir) catch return error.InvalidSporeDir;
+    defer manifest.deinit();
+    const network_options = run_mod.networkOptionsFromManifest(arena, manifest.value.network) catch return error.InvalidNetworkPolicy;
+    const rootfs = try run_mod.resumeRootfsForRun(arena, manifest.value);
+    const disk = try run_mod.resumeDiskForRun(arena, manifest.value);
+    if (rootfs == null and manifest.value.devices.len != diskless_resume_device_count) return error.UnsupportedLifecycleDeviceModel;
+    const memory = memoryFromManifest(manifest.value) catch return error.InvalidMemorySize;
+
+    var lifecycle_spec = readSporeLifecycleSpec(arena, init.io, spore_dir) catch return error.InvalidLifecycleMetadata;
+    defer if (lifecycle_spec) |*spec| spec.deinit();
+    if (lifecycle_spec) |spec| {
+        if (spec.value.vcpus != 1) return error.UnsupportedLifecycleMetadata;
+    }
+
+    const base = if (lifecycle_spec) |spec| spec.value else Spec{ .name = options.name };
+    const spec = Spec{
+        .name = options.name,
+        .backend = base.backend,
+        .kernel_path = base.kernel_path,
+        .initrd_path = base.initrd_path,
+        .resume_dir = spore_dir,
+        .rootfs = rootfs,
+        .disk = disk,
+        .network = try run_mod.manifestNetworkFromOptions(arena, network_options.network, &network_options.policy),
+        .memory = memory,
+        .vcpus = 1,
+        .guest_port = base.guest_port,
+        .timeout_ms = base.timeout_ms,
+        .console_log_path = base.console_log_path,
+    };
+    if (!monitorBackendSupported(spec.backend)) return error.HostUnsupported;
+
+    const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
+    const state = try classifyVmState(arena, init.io, paths, pidAlive);
+    if (state != .absent) return error.NamedVmExists;
+    if (spec.rootfs != null or spec.disk != null) try writeSpec(arena, init.io, paths, spec);
+
+    const spawn_policy: ?*const run_mod.NetworkPolicy = if (network_options.network == .spore) &network_options.policy else null;
+    try spawnMonitorExecutable(init, arena, spec, options.spore_executable, spawn_policy);
+    try waitForReadyResult(arena, init.io, paths, spec.timeout_ms);
+
+    var ready = try readReady(arena, init.io, paths);
+    defer ready.deinit();
+    return ownedNamedLifecycleResult(allocator, .{
+        .action = "resumed",
+        .name = spec.name,
+        .state = "ready",
+        .pid = ready.value.pid,
+        .console_log_path = ready.value.console_log_path,
+        .spore_dir = spore_dir,
     });
 }
 
@@ -958,80 +1027,58 @@ pub fn resumeCli(
     }
     const allocator = init.arena.allocator();
     const parsed = parseResumeArgs(args, allocator, stderr, mode);
-    const spore_dir = resolveExistingSporeDir(allocator, init.io, stderr, mode, "resume", parsed.spore_dir);
-    var manifest = spore.loadManifest(allocator, spore_dir) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore resume: invalid spore directory {s}: {s}", .{ spore_dir, @errorName(err) });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-    };
-    defer manifest.deinit();
-    const network_options = run_mod.networkOptionsFromManifest(allocator, manifest.value.network) catch {
-        const message = "spore resume: invalid network policy in manifest";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-    };
-    const rootfs = try run_mod.resumeRootfsForRun(allocator, manifest.value);
-    const disk = try run_mod.resumeDiskForRun(allocator, manifest.value);
-    if (rootfs == null and manifest.value.devices.len != diskless_resume_device_count) {
-        const message = "spore resume: unsupported lifecycle device model";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-    }
-    const memory = memoryFromManifest(manifest.value) catch {
-        const message = "spore resume: invalid spore memory size";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-    };
-
-    var lifecycle_spec = readSporeLifecycleSpec(allocator, init.io, spore_dir) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore resume: invalid lifecycle metadata: {s}", .{@errorName(err)});
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-    };
-    defer if (lifecycle_spec) |*spec| spec.deinit();
-    if (lifecycle_spec) |spec| {
-        if (spec.value.vcpus != 1) {
+    const full_args = try init.minimal.args.toSlice(allocator);
+    const result = resumeNamed(init, allocator, .{
+        .spore_dir = parsed.spore_dir,
+        .name = parsed.name,
+        .spore_executable = full_args[0],
+    }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "resume", err),
+        error.FileNotFound => {
+            const message = "spore resume: spore directory is not available";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "resume"), message);
+        },
+        error.InvalidSporeDir => {
+            const message = allocLifecycleMessage(allocator, "spore resume: invalid spore directory: {s}", .{parsed.spore_dir});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.InvalidNetworkPolicy => {
+            const message = "spore resume: invalid network policy in manifest";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.UnsupportedLifecycleDeviceModel => {
+            const message = "spore resume: unsupported lifecycle device model";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.InvalidMemorySize => {
+            const message = "spore resume: invalid spore memory size";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.InvalidLifecycleMetadata => {
+            const message = "spore resume: invalid lifecycle metadata";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.UnsupportedLifecycleMetadata => {
             const message = "spore resume: multi-vCPU lifecycle metadata is not supported yet";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-        }
-    }
-
-    const base = if (lifecycle_spec) |spec| spec.value else Spec{ .name = parsed.name };
-    const spec = Spec{
-        .name = parsed.name,
-        .backend = base.backend,
-        .kernel_path = base.kernel_path,
-        .initrd_path = base.initrd_path,
-        .resume_dir = spore_dir,
-        .rootfs = rootfs,
-        .disk = disk,
-        .network = try run_mod.manifestNetworkFromOptions(allocator, network_options.network, &network_options.policy),
-        .memory = memory,
-        .vcpus = 1,
-        .guest_port = base.guest_port,
-        .timeout_ms = base.timeout_ms,
-        .console_log_path = base.console_log_path,
+        },
+        error.HostUnsupported => {
+            const message = "spore resume: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "resume"), message);
+        },
+        error.NamedVmExists => {
+            const message = allocLifecycleMessage(allocator, "spore resume: VM already exists or has stale state: {s}", .{parsed.name});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+        },
+        error.MonitorReadyTimeout => {
+            const message = "spore resume: timed out waiting for monitor readiness";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "resume"), message);
+        },
+        else => |e| return e,
     };
-    if (!monitorBackendSupported(spec.backend)) {
-        const message = "spore resume: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "resume"), message);
-    }
-    const paths = try cliPaths(init, allocator, "resume", spec.name);
-    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
-    if (state != .absent) {
-        const message = allocLifecycleMessage(allocator, "spore resume: VM already exists or has stale state: {s}", .{spec.name});
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
-    }
-    if (spec.rootfs != null or spec.disk != null) try writeSpec(allocator, init.io, paths, spec);
-    try spawnMonitor(init, allocator, spec, &network_options.policy);
-    try waitForReady("resume", allocator, init.io, paths, spec.timeout_ms);
+    defer deinitNamedLifecycleResult(allocator, result);
     if (mode == .json) {
-        var ready = try readReady(allocator, init.io, paths);
-        defer ready.deinit();
-        try machine_output.writeJson(allocator, stdout, LifecycleResult{
-            .action = "resumed",
-            .name = spec.name,
-            .state = "ready",
-            .pid = ready.value.pid,
-            .control_socket_path = ready.value.control_socket_path,
-            .console_log_path = ready.value.console_log_path,
-            .spore_dir = spore_dir,
-        });
+        try machine_output.writeJson(allocator, stdout, result);
     }
 }
 
@@ -1608,6 +1655,13 @@ fn resolveNewOutputDirApi(allocator: std.mem.Allocator, io: Io, raw: []const u8)
     return path;
 }
 
+fn resolveExistingSporeDirApi(allocator: std.mem.Allocator, io: Io, raw: []const u8) ![]const u8 {
+    const path = try std.fs.path.resolve(allocator, &.{raw});
+    const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    if (stat.kind != Io.File.Kind.directory) return error.InvalidSporeDir;
+    return path;
+}
+
 fn resolveNewOutputDir(
     allocator: std.mem.Allocator,
     io: Io,
@@ -1637,29 +1691,6 @@ fn resolveNewOutputDir(
     };
     if (stat.kind != Io.File.Kind.directory) {
         const message = allocLifecycleMessage(allocator, "spore {s}: output parent is not a directory: {s}", .{ command, parent });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, command), message);
-    }
-    return path;
-}
-
-fn resolveExistingSporeDir(
-    allocator: std.mem.Allocator,
-    io: Io,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    command: []const u8,
-    raw: []const u8,
-) []const u8 {
-    const path = std.fs.path.resolve(allocator, &.{raw}) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore {s}: invalid spore directory: {s}", .{ command, @errorName(err) });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
-    };
-    const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore {s}: spore directory is not available: {s}", .{ command, @errorName(err) });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, command), message);
-    };
-    if (stat.kind != Io.File.Kind.directory) {
-        const message = allocLifecycleMessage(allocator, "spore {s}: spore path is not a directory: {s}", .{ command, path });
         exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, command), message);
     }
     return path;

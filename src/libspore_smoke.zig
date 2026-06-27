@@ -78,6 +78,13 @@ test "external import can name managed run-from and named lifecycle APIs" {
     try std.testing.expectEqual(@as(usize, 1), networked_create.network.allow_cidrs.len);
     try std.testing.expectEqual(@as(usize, 1), networked_create.network.allow_hosts.len);
 
+    const resumed = libspore.ResumeNamedOptions{
+        .spore_dir = "dev.spore",
+        .name = "resumed-vm",
+    };
+    try std.testing.expectEqualStrings("resumed-vm", resumed.name);
+    _ = libspore.resumeNamed;
+
     const exec = libspore.ExecNamedOptions{
         .name = "dev-vm",
         .command = &.{"/bin/true"},
