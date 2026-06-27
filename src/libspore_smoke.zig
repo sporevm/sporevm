@@ -85,6 +85,15 @@ test "external import can name managed run-from and named lifecycle APIs" {
     try std.testing.expectEqualStrings("resumed-vm", resumed.name);
     _ = libspore.resumeNamed;
 
+    const forked = libspore.ForkNamedOptions{
+        .source_name = "dev-vm",
+        .count = 2,
+        .name_pattern = "worker-%d",
+    };
+    try std.testing.expectEqual(@as(usize, 2), forked.count);
+    _ = libspore.forkNamed;
+    _ = libspore.deinitNamedForkResult;
+
     const exec = libspore.ExecNamedOptions{
         .name = "dev-vm",
         .command = &.{"/bin/true"},

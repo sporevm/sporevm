@@ -50,6 +50,7 @@ Use the matching helper for owned results:
 - `deinitPullResult`
 - `deinitNamedLifecycleResult`
 - `deinitExecNamedResult`
+- `deinitNamedForkResult`
 - `deinitNamedList`
 
 `run`, `runManaged`, `runFromSpore`, and `resumeSpore` return value results and
@@ -107,12 +108,20 @@ const resumed = try libspore.resumeNamed(init, allocator, .{
     .name = "worker-2",
 });
 defer libspore.deinitNamedLifecycleResult(allocator, resumed);
+
+const forked = try libspore.forkNamed(init, allocator, .{
+    .source_name = "worker-2",
+    .count = 2,
+    .name_pattern = "worker-child-%d",
+});
+defer libspore.deinitNamedForkResult(allocator, forked);
 ```
 
 The named surface is:
 
 - `createNamed`
 - `resumeNamed`
+- `forkNamed`
 - `execNamed`
 - `snapshotNamed`
 - `suspendNamed`
@@ -120,8 +129,8 @@ The named surface is:
 - `listNamed`
 
 `snapshotNamed` currently supports snapshot-and-continue only. Use
-`deinitNamedLifecycleResult`, `deinitExecNamedResult`, and `deinitNamedList`
-for owned results.
+`deinitNamedLifecycleResult`, `deinitExecNamedResult`,
+`deinitNamedForkResult`, and `deinitNamedList` for owned results.
 
 ## Networking
 

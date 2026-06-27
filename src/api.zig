@@ -143,6 +143,7 @@ pub const ExitEvent = run_mod.ExitEvent;
 pub const FailureEvent = run_mod.FailureEvent;
 pub const CreateNamedOptions = lifecycle.CreateNamedOptions;
 pub const ResumeNamedOptions = lifecycle.ResumeNamedOptions;
+pub const ForkNamedOptions = lifecycle.ForkNamedOptions;
 pub const ExecNamedOptions = lifecycle.ExecNamedOptions;
 pub const NamedNetworkOptions = lifecycle.NamedNetworkOptions;
 pub const SnapshotNamedOptions = lifecycle.SnapshotNamedOptions;
@@ -151,6 +152,7 @@ pub const RemoveNamedOptions = lifecycle.RemoveNamedOptions;
 pub const ListNamedOptions = lifecycle.ListNamedOptions;
 pub const NamedLifecycleResult = lifecycle.NamedLifecycleResult;
 pub const ExecNamedResult = lifecycle.ExecNamedResult;
+pub const NamedForkResult = lifecycle.NamedForkResult;
 pub const NamedListEntry = lifecycle.ListEntry;
 pub const NamedListMemory = lifecycle.ListMemory;
 pub const NamedListStats = lifecycle.ListStats;
@@ -615,6 +617,15 @@ pub fn resumeNamed(
     return lifecycle.resumeNamed(init, allocator, options);
 }
 
+/// Fork a ready diskless named VM into ready named child VMs.
+pub fn forkNamed(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ForkNamedOptions,
+) !NamedForkResult {
+    return lifecycle.forkNamed(init, allocator, options);
+}
+
 /// Execute a command inside a ready named VM.
 pub fn execNamed(
     context: Context,
@@ -666,6 +677,10 @@ pub fn deinitNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLif
 
 pub fn deinitExecNamedResult(allocator: std.mem.Allocator, result: ExecNamedResult) void {
     lifecycle.deinitExecNamedResult(allocator, result);
+}
+
+pub fn deinitNamedForkResult(allocator: std.mem.Allocator, result: NamedForkResult) void {
+    lifecycle.deinitNamedForkResult(allocator, result);
 }
 
 pub fn deinitNamedList(allocator: std.mem.Allocator, entries: []NamedListEntry) void {

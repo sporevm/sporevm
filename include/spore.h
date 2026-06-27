@@ -72,6 +72,7 @@ typedef struct SporeContextImpl *SporeContext;
 #define SPORE_INSPECT_BUNDLE_OPTIONS_VERSION 1u
 #define SPORE_CREATE_NAMED_OPTIONS_VERSION 3u
 #define SPORE_RESUME_NAMED_OPTIONS_VERSION 1u
+#define SPORE_FORK_NAMED_OPTIONS_VERSION 1u
 #define SPORE_EXEC_NAMED_OPTIONS_VERSION 2u
 #define SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION 1u
 #define SPORE_SUSPEND_NAMED_OPTIONS_VERSION 1u
@@ -151,6 +152,16 @@ typedef struct SporeResumeNamedOptions {
   SporeString spore_executable;
 } SporeResumeNamedOptions;
 
+/** Options for spore_fork_named_json(). */
+typedef struct SporeForkNamedOptions {
+  uint32_t size;
+  uint32_t version;
+  SporeString source_name;
+  size_t count;
+  SporeString name_pattern;
+  SporeString spore_executable;
+} SporeForkNamedOptions;
+
 /** Options for spore_snapshot_named_json(). */
 typedef struct SporeSnapshotNamedOptions {
   uint32_t size;
@@ -186,6 +197,9 @@ SPORE_API void spore_exec_named_options_init(SporeExecNamedOptions *options);
 
 /** Initialize resume-named options with defaults. */
 SPORE_API void spore_resume_named_options_init(SporeResumeNamedOptions *options);
+
+/** Initialize fork-named options with defaults. */
+SPORE_API void spore_fork_named_options_init(SporeForkNamedOptions *options);
 
 /** Initialize snapshot-named options with defaults. */
 SPORE_API void spore_snapshot_named_options_init(SporeSnapshotNamedOptions *options);
@@ -260,6 +274,11 @@ SPORE_API SporeResult spore_exec_named_json(SporeContext context,
 SPORE_API SporeResult spore_resume_named_json(SporeContext context,
                                               const SporeResumeNamedOptions *options,
                                               SporeOwnedString *out_json);
+
+/** Fork a named VM and return JSON output. */
+SPORE_API SporeResult spore_fork_named_json(SporeContext context,
+                                            const SporeForkNamedOptions *options,
+                                            SporeOwnedString *out_json);
 
 /** Snapshot a named VM and return `spore.lifecycle.v1` JSON. */
 SPORE_API SporeResult spore_snapshot_named_json(SporeContext context,
