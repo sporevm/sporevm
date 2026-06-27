@@ -233,9 +233,10 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   spores: capture records requested network capability and policy, `spore run
   --from` and named `spore resume --name` reattach a fresh helper-backed gateway
   under the recorded policy, and live TCP flow state remains non-portable.
-- `spore run --net --bind-service NAME=unix:/path.sock` now parses and validates
-  service declarations, then fails closed before VM startup because the
-  guest-local service proxy is not implemented yet.
+- `spore run --net --bind-service NAME=unix:/path.sock` now supports one
+  non-named run service: `NAME.spore.internal` resolves to the gateway IP and
+  guest TCP port 80 proxies bytes to the declared host Unix stream socket. More
+  than one bound service still fails before VM startup.
 - Denied TCP egress now emits typed `--events=jsonl` network audit events via
   the existing `spore-netd` stderr and parent gateway path. Bound service
   availability events are not implemented yet.
@@ -393,7 +394,7 @@ Definition of done:
 
 ### Slice 10: Bound Services and Network Events
 
-Status: partially implemented in the Slice 10 branch.
+Status: first narrow Unix-service slice landed for non-named `spore run`.
 
 Expose explicitly declared host-local services to the guest while keeping
 SporeVM-owned networking and egress policy in `spore-netd`. The first service
@@ -413,17 +414,21 @@ Definition of done:
 - `--bind-service NAME=unix:/path.sock` parses only with `--net`, rejects invalid
   names and targets, starts the VM fail-closed when a declared service cannot be
   represented, and keeps the bound service guest-local.
-- Until the Unix-socket proxy lands, valid `--bind-service` declarations fail
-  closed before VM startup with a clear message rather than silently exposing no
-  service.
-- `spore-netd` accepts guest TCP connections for bound services and proxies
-  bytes to the configured host Unix socket without opening general egress.
-- `--events=jsonl` emits typed network events for bound service availability and
-  denied egress attempts, with destination, port, and denial reason but no guest
-  payload bytes.
-- Captured spores record service declarations only when they are portable enough
-  to re-bind on the same host; resume/fork reattach fresh services or fail
-  closed. Live service connections are dropped across suspend/resume/fork.
+- The first landed shape is deliberately capped at exactly one Unix stream
+  target, the default guest HTTP port 80, and the gateway IP returned for
+  `NAME.spore.internal`. TCP host targets, custom guest ports, multiple service
+  IPs, and application-layer `Host` parsing are deferred.
+- `spore-netd` accepts guest TCP/80 connections to the gateway for the configured
+  bound service and proxies bytes to the configured host Unix socket without
+  opening general egress. Ordinary DNS forwarding, outbound TCP proxying, and
+  hard-floor denied-egress events stay on their existing paths.
+- `--events=jsonl` emits typed denied-egress network events with destination,
+  port, and denial reason but no guest payload bytes. Bound service availability
+  events are deferred until there is a concrete consumer.
+- Captured/named spores do not persist or re-bind service declarations in this
+  slice; `spore run --capture --bind-service ...` fails before startup until
+  manifest/schema work can record the re-bind contract. Live service connections
+  remain non-portable and are dropped across suspend/resume/fork.
 - Unit tests cover CLI parsing, service-name validation, target validation,
   deny-event formatting, and policy precedence between bound services and normal
   egress.

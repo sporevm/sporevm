@@ -977,8 +977,11 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     if (parsed.capture_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
         failRunSetup("spore run: --rootfs with --capture is not portable yet; use --image so capture can record immutable rootfs identity", .{});
     }
-    if (parsed.network_policy.hasBoundServices()) {
-        failRunSetup("spore run: --bind-service is parsed but the guest-local service proxy is not implemented yet", .{});
+    if (parsed.network_policy.bound_service_count > 1) {
+        failRunSetup("spore run: --bind-service supports exactly one service for now", .{});
+    }
+    if (parsed.capture_path != null and parsed.network_policy.hasBoundServices()) {
+        failRunSetup("spore run: --bind-service with --capture needs manifest support first", .{});
     }
     const rootfs = resolveRootfsInputForCli(init, allocator, .{
         .rootfs_path = parsed.rootfs_path,

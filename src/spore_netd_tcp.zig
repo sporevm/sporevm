@@ -20,6 +20,12 @@ const time = zmoltcp.time;
 const Instant = time.Instant;
 const Duration = time.Duration;
 
+// Keep the guest-visible gateway IP unassigned so the TCP forwarder can own it.
+// The /31 makes .3 a usable internal route source instead of the guest /30's
+// broadcast address.
+const tcp_stack_ipv4: ipv4.Address = .{ 100, 96, 0, 3 };
+const tcp_stack_prefix_len: u8 = 31;
+
 pub const max_flows = 8;
 pub const flow_buffer_len = 8 * 1024;
 pub const tcp_rx_buffer_len = 16 * 1024;
@@ -45,6 +51,10 @@ pub const Stats = struct {
     connect_failed: usize = 0,
     flow_limit_drops: usize = 0,
     output_drops: usize = 0,
+};
+
+pub const BoundService = struct {
+    unix_path: []const u8,
 };
 
 const HostState = enum {
@@ -195,6 +205,7 @@ pub const Gateway = struct {
     current_now: Instant = Instant.ZERO,
     stats: Stats = .{},
     emit_events: bool = false,
+    bound_service: ?BoundService = null,
 
     pub fn init(self: *Gateway, policy: *spore_net_policy.Runtime) void {
         self.device = Device.init();
@@ -203,6 +214,7 @@ pub const Gateway = struct {
         self.current_now = Instant.ZERO;
         self.stats = .{};
         self.emit_events = false;
+        self.bound_service = null;
         for (&self.flows, 0..) |*flow, i| {
             flow.init();
             self.sock_ptrs[i] = &flow.sock;
@@ -212,7 +224,11 @@ pub const Gateway = struct {
             .tcp4_sockets = &self.sock_ptrs,
             .tcp4_forwarder = &self.forwarder,
         });
-        self.stack.iface.v4.addIpAddr(.{ .address = spore_net.gateway_ipv4, .prefix_len = 30 });
+        self.stack.iface.v4.addIpAddr(.{ .address = tcp_stack_ipv4, .prefix_len = tcp_stack_prefix_len });
+    }
+
+    pub fn bindUnixService(self: *Gateway, unix_path: []const u8) void {
+        self.bound_service = .{ .unix_path = unix_path };
     }
 
     pub fn receiveFrame(self: *Gateway, frame: []const u8, now: Instant) bool {
@@ -293,7 +309,11 @@ pub const Gateway = struct {
         flow.start(request, self.current_now);
 
         self.stats.connect_attempts += 1;
-        switch (openHostSocket(request.local.addr, request.local.port)) {
+        const open_result = if (self.boundServiceRequest(request))
+            openUnixSocket(self.bound_service.?.unix_path)
+        else
+            openHostSocket(request.local.addr, request.local.port);
+        switch (open_result) {
             .connected => |fd| {
                 flow.fd = fd;
                 flow.state = .connected;
@@ -315,6 +335,7 @@ pub const Gateway = struct {
     fn allowRequest(self: *Gateway, request: ForwardRequest) bool {
         if (!std.mem.eql(u8, &request.remote.addr, &spore_net.guest_ipv4)) return false;
         if (request.local.port == 0 or request.remote.port == 0) return false;
+        if (self.boundServiceRequest(request)) return true;
         const decision = self.policy.decideIpv4(request.local.addr);
         if (decision == .allow) return true;
         if (self.emit_events) emitDeniedEgressEvent(request.local.addr, request.local.port, decision);
@@ -330,6 +351,12 @@ pub const Gateway = struct {
             },
         );
         return false;
+    }
+
+    fn boundServiceRequest(self: *const Gateway, request: ForwardRequest) bool {
+        return self.bound_service != null and
+            request.local.port == 80 and
+            std.mem.eql(u8, &request.local.addr, &spore_net.gateway_ipv4);
     }
 
     fn freeFlow(self: *Gateway) ?*Flow {
@@ -510,6 +537,28 @@ fn openHostSocket(addr: ipv4.Address, port: u16) OpenResult {
     }
 }
 
+fn openUnixSocket(path: []const u8) OpenResult {
+    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return .failed;
+    if (!setNonBlocking(fd)) {
+        _ = std.c.close(fd);
+        return .failed;
+    }
+
+    var sockaddr = std.mem.zeroInit(std.c.sockaddr.un, .{});
+    sockaddr.family = std.c.AF.UNIX;
+    @memcpy(sockaddr.path[0..path.len], path);
+    const rc = std.c.connect(fd, @ptrCast(&sockaddr), @sizeOf(std.c.sockaddr.un));
+    if (rc == 0) return .{ .connected = fd };
+    switch (std.c.errno(rc)) {
+        .INPROGRESS, .AGAIN => return .{ .connecting = fd },
+        else => {
+            _ = std.c.close(fd);
+            return .failed;
+        },
+    }
+}
+
 fn setNonBlocking(fd: std.c.fd_t) bool {
     const fl = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
     if (fl < 0) return false;
@@ -656,6 +705,66 @@ test "spore-netd TCP denies blocked SYN before host socket open" {
     try std.testing.expectEqual(blocked.len, gateway.stats.denied);
     try std.testing.expectEqual(@as(usize, 0), gateway.stats.connect_attempts);
     try std.testing.expectEqual(@as(?[]const u8, null), gateway.dequeueFrame());
+}
+
+test "spore-netd TCP routes bound service SYNs before gateway hard-floor denial" {
+    var policy = try spore_net_policy.Runtime.init(.{});
+    var gateway: Gateway = undefined;
+    gateway.init(&policy);
+    gateway.bindUnixService("/tmp/sporevm-netd-missing-bound-service.sock");
+
+    var frame_buf: [spore_net.max_frame_len]u8 = undefined;
+    const service_syn = buildTcpSynFrame(spore_net.gateway_ipv4, 80, &frame_buf);
+    const now = Instant.fromMillis(1);
+    try std.testing.expect(gateway.receiveFrame(service_syn, now));
+    gateway.service(now);
+
+    try std.testing.expectEqual(@as(usize, 0), gateway.stats.denied);
+    try std.testing.expectEqual(@as(usize, 1), gateway.stats.connect_attempts);
+    try std.testing.expectEqual(@as(usize, 1), gateway.stats.connect_failed);
+
+    const denied_syn = buildTcpSynFrame(spore_net.gateway_ipv4, 81, &frame_buf);
+    const later = Instant.fromMillis(2);
+    try std.testing.expect(gateway.receiveFrame(denied_syn, later));
+    gateway.service(later);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.stats.denied);
+    try std.testing.expectEqual(@as(usize, 1), gateway.stats.connect_attempts);
+}
+
+test "spore-netd TCP opens bound Unix stream sockets" {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-unix-test-{d}.sock", .{std.c.getpid()});
+    const path = path_z[0..path_z.len];
+    _ = std.c.unlink(path_z.ptr);
+    defer _ = std.c.unlink(path_z.ptr);
+
+    const listener = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    try std.testing.expect(listener >= 0);
+    defer _ = std.c.close(listener);
+
+    var sockaddr = std.mem.zeroInit(std.c.sockaddr.un, .{});
+    sockaddr.family = std.c.AF.UNIX;
+    @memcpy(sockaddr.path[0..path.len], path);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.bind(listener, @ptrCast(&sockaddr), @sizeOf(std.c.sockaddr.un)));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.listen(listener, 1));
+
+    const opened = openUnixSocket(path);
+    const client = switch (opened) {
+        .connected, .connecting => |fd| fd,
+        .failed => return error.TestUnexpectedResult,
+    };
+    defer _ = std.c.close(client);
+
+    const accepted = std.c.accept(listener, null, null);
+    try std.testing.expect(accepted >= 0);
+    defer _ = std.c.close(accepted);
+
+    try std.testing.expectEqual(@as(usize, 4), try hostSend(client, "ping"));
+    var buf: [4]u8 = undefined;
+    const n = std.c.recv(accepted, &buf, buf.len, 0);
+    try std.testing.expectEqual(@as(isize, 4), n);
+    try std.testing.expectEqualStrings("ping", &buf);
 }
 
 fn fuzzGuestTcpFrameClassifier(_: void, s: *std.testing.Smith) !void {
