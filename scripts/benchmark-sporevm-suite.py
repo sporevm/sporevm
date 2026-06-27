@@ -470,6 +470,7 @@ class BenchmarkRunner:
             stderr = prefix.with_suffix(".stderr")
             argv = [
                 str(self.spore_bin),
+                "--debug",
                 "run",
                 "--backend",
                 self.backend,
@@ -506,6 +507,7 @@ class BenchmarkRunner:
         stderr = self.log_dir / "base-capture.stderr"
         argv = [
             str(self.spore_bin),
+            "--debug",
             "run",
             "--backend",
             self.backend,
@@ -573,6 +575,7 @@ class BenchmarkRunner:
             stderr = prefix.with_suffix(".stderr")
             argv = [
                 str(self.spore_bin),
+                "--debug",
                 "run",
                 "--backend",
                 self.backend,
@@ -679,6 +682,7 @@ class BenchmarkRunner:
             run_stderr = run_prefix.with_suffix(".stderr")
             run_argv = [
                 str(self.spore_bin),
+                "--debug",
                 "run",
                 "--backend",
                 self.backend,
