@@ -11,9 +11,9 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 2;
+const c_abi_version: u32 = 3;
 const inspect_bundle_options_version: u32 = 1;
-const create_named_options_version: u32 = 2;
+const create_named_options_version: u32 = 3;
 const exec_named_options_version: u32 = 2;
 const snapshot_named_options_version: u32 = 1;
 const suspend_named_options_version: u32 = 1;
@@ -68,6 +68,10 @@ const SporeCreateNamedOptions = extern struct {
     timeout_ms: u64,
     console_log_path: SporeString,
     network_enabled: u8,
+    allow_cidrs: ?[*]const SporeString,
+    allow_cidr_count: usize,
+    allow_hosts: ?[*]const SporeString,
+    allow_host_count: usize,
     network_rules: ?[*]const SporeNetworkRule,
     network_rule_count: usize,
     bound_unix_services: ?[*]const SporeBoundUnixService,
@@ -165,6 +169,10 @@ pub export fn spore_create_named_options_init(options: ?*SporeCreateNamedOptions
         .timeout_ms = 30_000,
         .console_log_path = .{},
         .network_enabled = 0,
+        .allow_cidrs = null,
+        .allow_cidr_count = 0,
+        .allow_hosts = null,
+        .allow_host_count = 0,
         .network_rules = null,
         .network_rule_count = 0,
         .bound_unix_services = null,
@@ -352,6 +360,8 @@ pub export fn spore_create_named_json(
     defer process_arena.deinit();
     const arena = process_arena.allocator();
     const init = cInit(ctx, &process_arena);
+    const allow_cidrs = parseStringList(arena, opts.allow_cidrs, opts.allow_cidr_count) catch |err| return fail(ctx, err);
+    const allow_hosts = parseStringList(arena, opts.allow_hosts, opts.allow_host_count) catch |err| return fail(ctx, err);
     const network_policy = parseNetworkPolicy(arena, opts.network_rules, opts.network_rule_count) catch |err| return fail(ctx, err);
     const bound_services = parseBoundUnixServices(arena, opts.bound_unix_services, opts.bound_unix_service_count) catch |err| return fail(ctx, err);
     const result = libspore.createNamed(init, ctx.allocator, .{
@@ -363,6 +373,8 @@ pub export fn spore_create_named_json(
         .image_ref = optionalSlice(opts.image_ref) catch |err| return fail(ctx, err),
         .network = .{
             .enabled = opts.network_enabled != 0,
+            .allow_cidrs = allow_cidrs,
+            .allow_hosts = allow_hosts,
             .policy = network_policy,
             .bound_services = bound_services,
         },
@@ -552,6 +564,16 @@ fn parseNetworkPolicy(allocator: std.mem.Allocator, raw: ?[*]const SporeNetworkR
     return .{ .allow = allow };
 }
 
+fn parseStringList(allocator: std.mem.Allocator, raw: ?[*]const SporeString, len: usize) ![]const []const u8 {
+    if (len == 0) return &.{};
+    const values = raw orelse return error.InvalidValue;
+    const out = try allocator.alloc([]const u8, len);
+    for (out, values[0..len]) |*item, value| {
+        item.* = try toSlice(value);
+    }
+    return out;
+}
+
 fn parseBoundUnixServices(allocator: std.mem.Allocator, raw: ?[*]const SporeBoundUnixService, len: usize) ![]const libspore.BoundService {
     if (len == 0) return &.{};
     const values = raw orelse return error.InvalidValue;
@@ -618,6 +640,8 @@ test "named lifecycle options initialize defaults" {
     try std.testing.expectEqual(@as(u32, 10700), create.guest_port);
     try std.testing.expectEqual(@as(u64, 30_000), create.timeout_ms);
     try std.testing.expectEqual(@as(u8, 0), create.network_enabled);
+    try std.testing.expectEqual(@as(usize, 0), create.allow_cidr_count);
+    try std.testing.expectEqual(@as(usize, 0), create.allow_host_count);
     try std.testing.expectEqual(@as(usize, 0), create.network_rule_count);
     try std.testing.expectEqual(@as(usize, 0), create.bound_unix_service_count);
 

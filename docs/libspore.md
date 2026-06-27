@@ -306,6 +306,12 @@ create.name = (SporeString){ .ptr = "worker-1", .len = 8 };
 create.spore_executable = (SporeString){ .ptr = "/usr/local/bin/spore", .len = 20 };
 
 uint16_t github_ports[] = {443};
+SporeString allow_cidrs[] = {
+    { .ptr = "93.184.216.34/32", .len = 16 },
+};
+SporeString allow_hosts[] = {
+    { .ptr = "example.com", .len = 11 },
+};
 SporeNetworkRule rules[] = {
     {
         .host = { .ptr = "github.com", .len = 10 },
@@ -322,6 +328,10 @@ SporeBoundUnixService services[] = {
     },
 };
 create.network_enabled = 1;
+create.allow_cidrs = allow_cidrs;
+create.allow_cidr_count = 1;
+create.allow_hosts = allow_hosts;
+create.allow_host_count = 1;
 create.network_rules = rules;
 create.network_rule_count = 1;
 create.bound_unix_services = services;

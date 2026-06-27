@@ -70,7 +70,7 @@ typedef struct SporeOwnedString {
 typedef struct SporeContextImpl *SporeContext;
 
 #define SPORE_INSPECT_BUNDLE_OPTIONS_VERSION 1u
-#define SPORE_CREATE_NAMED_OPTIONS_VERSION 2u
+#define SPORE_CREATE_NAMED_OPTIONS_VERSION 3u
 #define SPORE_EXEC_NAMED_OPTIONS_VERSION 2u
 #define SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION 1u
 #define SPORE_SUSPEND_NAMED_OPTIONS_VERSION 1u
@@ -119,6 +119,10 @@ typedef struct SporeCreateNamedOptions {
   uint64_t timeout_ms;
   SporeString console_log_path;
   uint8_t network_enabled;
+  const SporeString *allow_cidrs;
+  size_t allow_cidr_count;
+  const SporeString *allow_hosts;
+  size_t allow_host_count;
   const SporeNetworkRule *network_rules;
   size_t network_rule_count;
   const SporeBoundUnixService *bound_unix_services;

@@ -276,6 +276,8 @@ pub const NamedForkResult = struct {
 
 pub const NamedNetworkOptions = struct {
     enabled: bool = false,
+    allow_cidrs: []const []const u8 = &.{},
+    allow_hosts: []const []const u8 = &.{},
     policy: spore_net_policy.NetworkPolicy = .{},
     bound_services: []const spore_net_policy.BoundService = &.{},
 };
@@ -346,11 +348,22 @@ const NamedNetworkConfig = struct {
 
 fn namedNetworkConfig(options: NamedNetworkOptions) !NamedNetworkConfig {
     if (!options.enabled) {
-        if (options.policy.allow.len != 0 or options.bound_services.len != 0) return error.InvalidNetworkPolicy;
+        if (options.allow_cidrs.len != 0 or
+            options.allow_hosts.len != 0 or
+            options.policy.allow.len != 0 or
+            options.bound_services.len != 0) return error.InvalidNetworkPolicy;
         return .{};
     }
     var config = run_mod.NetworkPolicy{};
-    try config.addNetworkPolicy(options.policy);
+    for (options.allow_cidrs) |cidr| {
+        try config.addAllowCidr(cidr);
+    }
+    for (options.allow_hosts) |host| {
+        try config.addAllowHost(host);
+    }
+    if (options.policy.allow.len != 0) {
+        try config.addNetworkPolicy(options.policy);
+    }
     for (options.bound_services) |service| {
         try config.addBoundService(service);
     }
@@ -361,6 +374,24 @@ pub fn createNamed(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     options: CreateNamedOptions,
+) !NamedLifecycleResult {
+    const start_ms = monotonicMs();
+    return createNamedWithTiming(init, allocator, options, .{
+        .start_ms = start_ms,
+        .parsed_ms = start_ms,
+    });
+}
+
+const CreateTimingAnchors = struct {
+    start_ms: u64,
+    parsed_ms: u64,
+};
+
+fn createNamedWithTiming(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: CreateNamedOptions,
+    timing: CreateTimingAnchors,
 ) !NamedLifecycleResult {
     if (options.rootfs_path != null and options.image_ref != null) return error.InvalidRootfsInput;
     if (!monitorBackendSupported(options.backend.name())) return error.HostUnsupported;
@@ -385,8 +416,10 @@ pub fn createNamed(
         .console_log_path = options.console_log_path,
     };
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
+    const paths_ms = monotonicMs();
     const state = try classifyVmState(arena, init.io, paths, pidAlive);
     if (state != .absent) return error.NamedVmExists;
+    const state_checked_ms = monotonicMs();
 
     const rootfs = try run_mod.resolveRootfsInputDetailed(init, arena, .{
         .rootfs_path = spec.rootfs_path,
@@ -394,13 +427,27 @@ pub fn createNamed(
         .command_name = "create",
         .record_artifact = spec.rootfs_path != null or spec.image_ref != null,
     });
+    const rootfs_resolved_ms = monotonicMs();
     spec.rootfs_path = if (rootfs.path) |path| try std.fs.path.resolve(arena, &.{path}) else null;
     spec.rootfs = rootfs.rootfs;
+    const rootfs_abspath_ms = monotonicMs();
     if (spec.rootfs != null) try writeSpec(arena, init.io, paths, spec);
 
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (named_network.mode == .spore) &named_network.policy else null;
     try spawnMonitorExecutable(init, arena, spec, options.spore_executable, spawn_policy);
+    const monitor_spawned_ms = monotonicMs();
     try waitForReadyResult(arena, init.io, paths, spec.timeout_ms);
+    const ready_ms = monotonicMs();
+    writeCreateTiming(arena, init.io, paths, .{
+        .parse_ms = timing.parsed_ms - timing.start_ms,
+        .paths_ms = paths_ms - timing.parsed_ms,
+        .state_check_ms = state_checked_ms - paths_ms,
+        .rootfs_resolve_ms = rootfs_resolved_ms - state_checked_ms,
+        .rootfs_abspath_ms = rootfs_abspath_ms - rootfs_resolved_ms,
+        .spawn_monitor_ms = monitor_spawned_ms - rootfs_abspath_ms,
+        .wait_ready_ms = ready_ms - monitor_spawned_ms,
+        .total_ms = ready_ms - timing.start_ms,
+    }) catch {};
 
     var ready = try readReady(arena, init.io, paths);
     defer ready.deinit();
@@ -601,60 +648,56 @@ pub fn createCli(
     const allocator = init.arena.allocator();
     const parsed = try parseCreateArgs(args, allocator, stderr, mode);
     const parsed_ms = monotonicMs();
-    var spec = parsed.spec;
-    spec.network = try run_mod.manifestNetworkFromOptions(allocator, parsed.network, &parsed.network_policy);
-    const paths = try cliPaths(init, allocator, "create", spec.name);
-    const paths_ms = monotonicMs();
-    if (!monitorBackendSupported(spec.backend)) {
-        const message = "spore create: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "create"), message);
-    }
-    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
-    if (state != .absent) {
-        const message = allocLifecycleMessage(allocator, "spore create: VM already exists or has stale state: {s}", .{spec.name});
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
-    }
-    const state_checked_ms = monotonicMs();
-    const rootfs_resolution = try run_mod.resolveRootfsInputDetailedResult(init, allocator, .{
+    const spec = parsed.spec;
+    const full_args = try init.minimal.args.toSlice(allocator);
+    const result = createNamedWithTiming(init, allocator, .{
+        .name = spec.name,
+        .backend = run_mod.Backend.parse(spec.backend) orelse unreachable,
+        .kernel_path = spec.kernel_path,
+        .initrd_path = spec.initrd_path,
         .rootfs_path = spec.rootfs_path,
         .image_ref = spec.image_ref,
-        .command_name = "create",
-        .record_artifact = spec.rootfs_path != null or spec.image_ref != null,
-    });
-    const resolved_rootfs = switch (rootfs_resolution) {
-        .resolved => |rootfs| rootfs,
-        .failure => |failure| exitLifecycleCliError(allocator, stderr, mode, failure, failure.message),
+        .network = .{
+            .enabled = parsed.network == .spore,
+            .allow_cidrs = if (parsed.network == .spore) parsed.network_policy.allowCidrSlice() else &.{},
+            .allow_hosts = if (parsed.network == .spore) parsed.network_policy.allowHostSlice() else &.{},
+        },
+        .memory = spec.memory,
+        .vcpus = spec.vcpus,
+        .guest_port = spec.guest_port,
+        .timeout_ms = spec.timeout_ms,
+        .console_log_path = spec.console_log_path,
+        .spore_executable = full_args[0],
+    }, .{
+        .start_ms = start_ms,
+        .parsed_ms = parsed_ms,
+    }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "create", err),
+        error.HostUnsupported => {
+            const message = "spore create: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "create"), message);
+        },
+        error.NamedVmExists => {
+            const message = allocLifecycleMessage(allocator, "spore create: VM already exists or has stale state: {s}", .{spec.name});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+        },
+        error.InvalidNetworkPolicy, error.InvalidRootfsInput => {
+            const message = allocLifecycleMessage(allocator, "spore create: invalid configuration: {s}", .{@errorName(err)});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+        },
+        error.FileNotFound => {
+            const message = "spore create: required rootfs object was not found";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "create"), message);
+        },
+        error.MonitorReadyTimeout => {
+            const message = "spore create: timed out waiting for monitor readiness";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "create"), message);
+        },
+        else => |e| return e,
     };
-    const rootfs_resolved_ms = monotonicMs();
-    spec.rootfs_path = if (resolved_rootfs.path) |path| try std.fs.path.resolve(allocator, &.{path}) else null;
-    spec.rootfs = resolved_rootfs.rootfs;
-    const rootfs_abspath_ms = monotonicMs();
-    if (spec.rootfs != null) try writeSpec(allocator, init.io, paths, spec);
-    try spawnMonitor(init, allocator, spec, &parsed.network_policy);
-    const monitor_spawned_ms = monotonicMs();
-    try waitForReady("create", allocator, init.io, paths, spec.timeout_ms);
-    const ready_ms = monotonicMs();
-    writeCreateTiming(allocator, init.io, paths, .{
-        .parse_ms = parsed_ms - start_ms,
-        .paths_ms = paths_ms - parsed_ms,
-        .state_check_ms = state_checked_ms - paths_ms,
-        .rootfs_resolve_ms = rootfs_resolved_ms - state_checked_ms,
-        .rootfs_abspath_ms = rootfs_abspath_ms - rootfs_resolved_ms,
-        .spawn_monitor_ms = monitor_spawned_ms - rootfs_abspath_ms,
-        .wait_ready_ms = ready_ms - monitor_spawned_ms,
-        .total_ms = ready_ms - start_ms,
-    }) catch {};
+    defer deinitNamedLifecycleResult(allocator, result);
     if (mode == .json) {
-        var ready = try readReady(allocator, init.io, paths);
-        defer ready.deinit();
-        try machine_output.writeJson(allocator, stdout, LifecycleResult{
-            .action = "created",
-            .name = spec.name,
-            .state = "ready",
-            .pid = ready.value.pid,
-            .control_socket_path = ready.value.control_socket_path,
-            .console_log_path = ready.value.console_log_path,
-        });
+        try machine_output.writeJson(allocator, stdout, result);
     }
 }
 
@@ -2544,6 +2587,28 @@ test "create parser accepts network allow policy" {
     try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
     try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
     try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
+}
+
+test "named network config accepts create cli policy" {
+    const config = try namedNetworkConfig(.{
+        .enabled = true,
+        .allow_cidrs = &.{"93.184.216.34/32"},
+        .allow_hosts = &.{"example.com"},
+    });
+
+    try std.testing.expectEqual(run_mod.NetworkMode.spore, config.mode);
+    try std.testing.expectEqual(@as(usize, 1), config.policy.allow_cidr_count);
+    try std.testing.expectEqualStrings("93.184.216.34/32", config.policy.allow_cidrs[0]);
+    try std.testing.expectEqual(@as(usize, 1), config.policy.allow_host_count);
+    try std.testing.expectEqualStrings("example.com", config.policy.allow_hosts[0]);
+}
+
+test "named network config keeps bare network unrestricted" {
+    const config = try namedNetworkConfig(.{ .enabled = true });
+
+    try std.testing.expectEqual(run_mod.NetworkMode.spore, config.mode);
+    try std.testing.expect(!config.policy.default_deny);
+    try std.testing.expect(!config.policy.hasRules());
 }
 
 test "lifecycle detects incomplete ready and stale pid state" {

@@ -14,7 +14,7 @@ int main(void) {
 
   uint32_t abi_version = 0;
   if (expect_success(spore_build_info(SPORE_BUILD_INFO_ABI_VERSION, &abi_version)) != 0) return 1;
-  if (abi_version != 2) return 1;
+  if (abi_version != 3) return 1;
 
   SporeInspectBundleOptions options;
   spore_inspect_bundle_options_init(&options);
@@ -27,6 +27,8 @@ int main(void) {
   if (create_options.version != SPORE_CREATE_NAMED_OPTIONS_VERSION) return 1;
   if (create_options.guest_port != 10700) return 1;
   if (create_options.network_enabled != 0) return 1;
+  if (create_options.allow_cidr_count != 0) return 1;
+  if (create_options.allow_host_count != 0) return 1;
   if (create_options.network_rule_count != 0) return 1;
   if (create_options.bound_unix_service_count != 0) return 1;
 

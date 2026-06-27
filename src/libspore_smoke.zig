@@ -68,11 +68,15 @@ test "external import can name managed run-from and named lifecycle APIs" {
         .name = "networked-vm",
         .network = .{
             .enabled = true,
+            .allow_cidrs = &.{"93.184.216.34/32"},
+            .allow_hosts = &.{"example.com"},
             .policy = network_policy,
             .bound_services = &.{bound_service},
         },
     };
     try std.testing.expect(networked_create.network.enabled);
+    try std.testing.expectEqual(@as(usize, 1), networked_create.network.allow_cidrs.len);
+    try std.testing.expectEqual(@as(usize, 1), networked_create.network.allow_hosts.len);
 
     const exec = libspore.ExecNamedOptions{
         .name = "dev-vm",
