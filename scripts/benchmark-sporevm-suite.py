@@ -922,7 +922,8 @@ class BenchmarkRunner:
         results = []
         for (benchmark, mode), rows in sorted(groups.items()):
             success_rows = [row for row in rows if row.get("success")]
-            values = [float(row["tti_ms"]) for row in success_rows]
+            samples = [row["tti_ms"] for row in success_rows]
+            values = [float(value) for value in samples]
             batch = next(
                 (
                     row for row in self.rows
@@ -936,6 +937,7 @@ class BenchmarkRunner:
                 "count": len(rows),
                 "success_count": len(success_rows),
                 "success_rate": len(success_rows) / len(rows) if rows else 0,
+                "samples": samples,
                 "tti_ms": summarize_values(values),
                 "composite_score": composite_score(values, len(success_rows) / len(rows) if rows else 0),
                 "wall_clock_ms": batch.get("wall_clock_ms"),
@@ -1101,6 +1103,20 @@ def self_test() -> None:
         assert metrics["kvm_pending_exit_completion_ms"] == 2
         assert metrics["exec_response_ms"] == 8
         assert summarize_field([metrics], "exec_response_ms")["median"] == 8.0
+        runner = object.__new__(BenchmarkRunner)
+        runner.run_id = "self-test"
+        runner.raw_path = Path(tmp) / "results.jsonl"
+        runner.rows = [
+            {"benchmark": "cold_tti", "mode": "burst", "iteration": 0, "tti_ms": 214, "success": True},
+            {"benchmark": "cold_tti", "mode": "burst", "iteration": 1, "tti_ms": 999, "success": False},
+            {"benchmark": "cold_tti", "mode": "burst", "iteration": 2, "tti_ms": 216, "success": True},
+        ]
+        runner.config_json = lambda: {}
+        result = BenchmarkRunner.summary(runner)["results"][0]
+        assert result["count"] == 3
+        assert result["success_count"] == 2
+        assert result["samples"] == [214, 216]
+        assert result["tti_ms"]["median"] == 215.0
     print("self-test ok")
 
 

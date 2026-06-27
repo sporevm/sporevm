@@ -216,6 +216,10 @@ def export_result(result: dict[str, object]) -> dict[str, object] | None:
     if not benchmark or not mode or value is None:
         return None
     stats = result.get("tti_ms") if isinstance(result.get("tti_ms"), dict) else {}
+    samples = result.get("samples") if isinstance(result.get("samples"), list) else None
+    numeric_samples = [
+        sample for sample in samples if isinstance(sample, (int, float)) and not isinstance(sample, bool)
+    ] if samples is not None else None
     exported = {
         "name": f"{benchmark}/{mode}",
         "benchmark": benchmark,
@@ -225,13 +229,15 @@ def export_result(result: dict[str, object]) -> dict[str, object] | None:
         "lower_is_better": True,
         "value": value,
         "stats": stats,
-        "count": result.get("count"),
+        "count": len(numeric_samples) if numeric_samples is not None else result.get("count"),
         "success_count": result.get("success_count"),
         "success_rate": result.get("success_rate"),
         "wall_clock_ms": result.get("wall_clock_ms"),
         "time_to_first_ready_ms": result.get("time_to_first_ready_ms"),
         "composite_score": result.get("composite_score"),
     }
+    if numeric_samples is not None:
+        exported["samples"] = numeric_samples
     phase_metrics = result.get("phase_metrics")
     if isinstance(phase_metrics, dict):
         exported["phase_metrics"] = phase_metrics
@@ -375,9 +381,10 @@ def self_test() -> None:
             {
                 "benchmark": "cold_tti",
                 "mode": "sequential",
-                "count": 3,
+                "count": 4,
                 "success_count": 3,
-                "success_rate": 1.0,
+                "success_rate": 0.75,
+                "samples": [121, 123, 130],
                 "tti_ms": {"median": 123.0, "p95": 130.0, "p99": 131.0},
                 "wall_clock_ms": 400,
                 "time_to_first_ready_ms": 125,
@@ -404,6 +411,9 @@ def self_test() -> None:
         data = export(args)
         assert len(data["runs"]) == 1
         assert data["runs"][0]["host"]["os"]
+        assert data["runs"][0]["results"][0]["samples"] == [121, 123, 130]
+        assert data["runs"][0]["results"][0]["count"] == 3
+        assert data["runs"][0]["results"][0]["success_rate"] == 0.75
         assert data["runs"][0]["results"][0]["phase_metrics"]["vsock_connect_ms"]["median"] == 5.0
         assert data["series"][0]["points"][0]["value"] == 123.0
         assert data["series"][0]["points"][0]["p95"] == 130.0
