@@ -706,34 +706,20 @@ pub fn rmCli(
     }
     const allocator = init.arena.allocator();
     const name = parseRmArgs(args, allocator, stderr, mode);
-    const paths = try cliPaths(init, allocator, "rm", name);
-    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
-    var removed_pid: ?i64 = null;
-    switch (state) {
-        .absent => {
+    const result = removeNamed(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, allocator, .{ .name = name }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "rm", err),
+        error.NamedVmNotFound => {
             const message = allocLifecycleMessage(allocator, "spore rm: VM not found: {s}", .{name});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "rm"), message);
         },
-        .ready => {
-            var ready = lifecycleReadyOrExit(allocator, init.io, "rm", paths);
-            defer ready.deinit();
-            removed_pid = ready.value.pid;
-            _ = sendShutdownRequest(allocator, init.io, ready.value.control_socket_path) catch {};
-            waitForPidExit(ready.value.pid, 5_000);
-            try Io.Dir.cwd().deleteTree(init.io, paths.vm_dir);
-        },
-        .incomplete, .stale => {
-            removed_pid = readPid(allocator, init.io, paths) catch null;
-            try Io.Dir.cwd().deleteTree(init.io, paths.vm_dir);
-        },
-    }
+        else => |e| return e,
+    };
+    defer deinitNamedLifecycleResult(allocator, result);
     if (mode == .json) {
-        try machine_output.writeJson(allocator, stdout, LifecycleResult{
-            .action = "removed",
-            .name = name,
-            .state = "absent",
-            .pid = removed_pid,
-        });
+        try machine_output.writeJson(allocator, stdout, result);
     }
 }
 
@@ -759,55 +745,34 @@ pub fn suspendCli(
     }
     const allocator = init.arena.allocator();
     const parsed = parseSuspendArgs(args, allocator, stderr, mode);
-    const out_dir = resolveNewOutputDir(allocator, init.io, stderr, mode, "suspend", parsed.out_dir);
-    const paths = try cliPaths(init, allocator, "suspend", parsed.name);
-    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
-    if (state != .ready) {
-        const message = allocLifecycleMessage(allocator, "spore suspend: VM is not ready: {s} ({s})", .{ parsed.name, state.name() });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
-    }
-    var spec = readSpec(allocator, init.io, paths) catch {
-        const message = "spore suspend: VM is not ready";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
+    const result = suspendNamed(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, allocator, .{
+        .name = parsed.name,
+        .out_dir = parsed.out_dir,
+    }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "suspend", err),
+        error.NamedVmNotReady => {
+            const message = allocLifecycleMessage(allocator, "spore suspend: VM is not ready: {s}", .{parsed.name});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
+        },
+        error.MissingRootfsIdentity => {
+            const message = "spore suspend: disk-backed lifecycle suspend requires recorded immutable rootfs identity";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
+        },
+        error.MonitorUnavailable, error.MonitorRequestFailed => {
+            const message = switch (err) {
+                error.MonitorUnavailable => allocLifecycleMessage(allocator, "spore suspend: monitor is unavailable for VM: {s}", .{parsed.name}),
+                else => allocLifecycleMessage(allocator, "spore suspend: monitor request failed for VM {s}: {s}", .{ parsed.name, @errorName(err) }),
+            };
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "suspend"), message);
+        },
+        else => |e| return e,
     };
-    defer spec.deinit();
-    if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
-        const message = "spore suspend: disk-backed lifecycle suspend requires recorded immutable rootfs identity";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
-    }
-    var ready = readReady(allocator, init.io, paths) catch {
-        const message = "spore suspend: VM is not ready";
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
-    };
-    defer ready.deinit();
-    const response = sendSuspendRequest(allocator, init.io, ready.value.control_socket_path, out_dir) catch |err| {
-        const message = switch (err) {
-            error.MonitorUnavailable => allocLifecycleMessage(allocator, "spore suspend: monitor is unavailable for VM: {s}", .{parsed.name}),
-            else => allocLifecycleMessage(allocator, "spore suspend: monitor request failed for VM {s}: {s}", .{ parsed.name, @errorName(err) }),
-        };
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "suspend"), message);
-    };
-    if (try suspendResponseFailureMessage(allocator, response)) |response_message| {
-        const message = allocLifecycleMessage(allocator, "spore suspend: {s}", .{response_message});
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "suspend"), message);
-    }
-    var cleanup_after_suspend = true;
-    defer if (cleanup_after_suspend) {
-        waitForPidExit(ready.value.pid, 5_000);
-        Io.Dir.cwd().deleteTree(init.io, paths.vm_dir) catch {};
-    };
-    try writeSporeLifecycleSpec(allocator, init.io, out_dir, spec.value);
-    cleanup_after_suspend = false;
-    waitForPidExit(ready.value.pid, 5_000);
-    try Io.Dir.cwd().deleteTree(init.io, paths.vm_dir);
+    defer deinitNamedLifecycleResult(allocator, result);
     if (mode == .json) {
-        try machine_output.writeJson(allocator, stdout, LifecycleResult{
-            .action = "suspended",
-            .name = parsed.name,
-            .state = "checkpointed",
-            .pid = ready.value.pid,
-            .spore_dir = out_dir,
-        });
+        try machine_output.writeJson(allocator, stdout, result);
     }
 }
 
@@ -1061,24 +1026,14 @@ pub fn lsCli(
     }
 
     const allocator = init.arena.allocator();
-    const root = runtimeRootPath(allocator, init.environ_map) catch |err| switch (err) {
-        error.InvalidRuntimeDir => {
-            const message = allocLifecycleMessage(allocator, "spore ls: invalid runtime directory; set {s} or XDG_RUNTIME_DIR to an absolute path", .{runtime_dir_env});
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "ls"), message);
-        },
+    const entries = listNamed(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, allocator, .{}) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "ls", err),
         else => |e| return e,
     };
-    const entries = listEntries(allocator, init.io, root, pidAlive) catch |err| switch (err) {
-        error.InvalidRuntimeDir => {
-            const message = "spore ls: invalid runtime directory";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "ls"), message);
-        },
-        error.InsecureRuntimeDir => {
-            const message = "spore ls: insecure runtime directory; registry directories must be private to the current user";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "ls"), message);
-        },
-        else => |e| return e,
-    };
+    defer freeListEntries(allocator, entries);
     if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, entries);
     } else {
@@ -2229,6 +2184,21 @@ fn exitLifecycleCliError(
     }
     stderr.flush() catch {};
     std.process.exit(err.exit_code);
+}
+
+fn exitLifecycleRuntimePathError(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    err: anyerror,
+) noreturn {
+    const message = switch (err) {
+        error.InvalidRuntimeDir => allocLifecycleMessage(allocator, "spore {s}: invalid runtime directory; set {s} or XDG_RUNTIME_DIR to an absolute path", .{ command, runtime_dir_env }),
+        error.InsecureRuntimeDir => allocLifecycleMessage(allocator, "spore {s}: insecure runtime directory; registry directories must be private to the current user", .{command}),
+        else => allocLifecycleMessage(allocator, "spore {s}: runtime directory error: {s}", .{ command, @errorName(err) }),
+    };
+    exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
 }
 
 fn validateNameOrExit(command: []const u8, name: []const u8) !void {
