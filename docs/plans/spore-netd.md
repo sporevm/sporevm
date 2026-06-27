@@ -394,11 +394,12 @@ Definition of done:
 
 ### Slice 10: Bound Services and Network Events
 
-Status: first narrow Unix-service slice landed for non-named `spore run`.
+Status: implemented for non-named `spore run`; broader bound-service
+capabilities are deferred below.
 
 Expose explicitly declared host-local services to the guest while keeping
-SporeVM-owned networking and egress policy in `spore-netd`. The first service
-target is a host Unix socket; TCP loopback targets can follow if needed.
+SporeVM-owned networking and egress policy in `spore-netd`. The implemented
+service target is a host Unix socket; TCP loopback targets can follow if needed.
 Network audit events should flow through the existing `--events=jsonl` run event
 stream instead of a separate telemetry subsystem.
 
