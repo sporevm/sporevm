@@ -5,11 +5,13 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const net = std.Io.net;
 
+const Context = @import("context.zig").Context;
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
+const spore_net_policy = @import("spore_net_policy.zig");
 
 pub const runtime_dir_env = local_paths.runtime_dir_env;
 pub const max_name_len = 128;
@@ -272,6 +274,299 @@ pub const NamedForkResult = struct {
     children: []const []const u8,
 };
 
+pub const NamedNetworkOptions = struct {
+    enabled: bool = false,
+    policy: spore_net_policy.NetworkPolicy = .{},
+    bound_services: []const spore_net_policy.BoundService = &.{},
+};
+
+pub const CreateNamedOptions = struct {
+    name: []const u8,
+    backend: run_mod.Backend = .auto,
+    kernel_path: ?[]const u8 = null,
+    initrd_path: ?[]const u8 = null,
+    rootfs_path: ?[]const u8 = null,
+    image_ref: ?[]const u8 = null,
+    network: NamedNetworkOptions = .{},
+    memory: memory_config.Config = .{},
+    vcpus: u32 = 1,
+    guest_port: u32 = 10700,
+    timeout_ms: u64 = 30_000,
+    console_log_path: ?[]const u8 = null,
+    spore_executable: []const u8 = "spore",
+};
+
+pub const ExecNamedOptions = struct {
+    name: []const u8,
+    command: []const []const u8,
+    network_policy: ?spore_net_policy.NetworkPolicy = null,
+};
+
+pub const SnapshotNamedOptions = struct {
+    name: []const u8,
+    out_dir: []const u8,
+    continue_after: bool = true,
+};
+
+pub const SuspendNamedOptions = struct {
+    name: []const u8,
+    out_dir: []const u8,
+};
+
+pub const RemoveNamedOptions = struct {
+    name: []const u8,
+};
+
+pub const ListNamedOptions = struct {};
+
+pub const NamedLifecycleResult = struct {
+    schema: []const u8 = lifecycle_schema,
+    schema_version: u32 = lifecycle_schema_version,
+    action: []const u8,
+    name: []const u8,
+    state: []const u8,
+    pid: ?i64 = null,
+    console_log_path: ?[]const u8 = null,
+    spore_dir: ?[]const u8 = null,
+};
+
+pub const ExecNamedResult = struct {
+    exit_code: u8,
+    stdout: []u8,
+    stderr: []u8,
+    network_events_jsonl: []u8 = &.{},
+    stdout_truncated: bool = false,
+    stderr_truncated: bool = false,
+};
+
+const NamedNetworkConfig = struct {
+    mode: run_mod.NetworkMode = .disabled,
+    policy: run_mod.NetworkPolicy = .{},
+};
+
+fn namedNetworkConfig(options: NamedNetworkOptions) !NamedNetworkConfig {
+    if (!options.enabled) {
+        if (options.policy.allow.len != 0 or options.bound_services.len != 0) return error.InvalidNetworkPolicy;
+        return .{};
+    }
+    var config = run_mod.NetworkPolicy{};
+    try config.addNetworkPolicy(options.policy);
+    for (options.bound_services) |service| {
+        try config.addBoundService(service);
+    }
+    return .{ .mode = .spore, .policy = config };
+}
+
+pub fn createNamed(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: CreateNamedOptions,
+) !NamedLifecycleResult {
+    if (options.rootfs_path != null and options.image_ref != null) return error.InvalidRootfsInput;
+    if (!monitorBackendSupported(options.backend.name())) return error.HostUnsupported;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const named_network = try namedNetworkConfig(options.network);
+
+    var spec = Spec{
+        .name = options.name,
+        .backend = options.backend.name(),
+        .kernel_path = options.kernel_path,
+        .initrd_path = options.initrd_path,
+        .rootfs_path = options.rootfs_path,
+        .image_ref = options.image_ref,
+        .network = try run_mod.manifestNetworkFromOptions(arena, named_network.mode, &named_network.policy),
+        .memory = options.memory,
+        .vcpus = options.vcpus,
+        .guest_port = options.guest_port,
+        .timeout_ms = options.timeout_ms,
+        .console_log_path = options.console_log_path,
+    };
+    const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
+    const state = try classifyVmState(arena, init.io, paths, pidAlive);
+    if (state != .absent) return error.NamedVmExists;
+
+    const rootfs = try run_mod.resolveRootfsInputDetailed(init, arena, .{
+        .rootfs_path = spec.rootfs_path,
+        .image_ref = spec.image_ref,
+        .command_name = "create",
+        .record_artifact = spec.rootfs_path != null or spec.image_ref != null,
+    });
+    spec.rootfs_path = if (rootfs.path) |path| try std.fs.path.resolve(arena, &.{path}) else null;
+    spec.rootfs = rootfs.rootfs;
+    if (spec.rootfs != null) try writeSpec(arena, init.io, paths, spec);
+
+    const spawn_policy: ?*const run_mod.NetworkPolicy = if (named_network.mode == .spore) &named_network.policy else null;
+    try spawnMonitorExecutable(init, arena, spec, options.spore_executable, spawn_policy);
+    try waitForReadyResult(arena, init.io, paths, spec.timeout_ms);
+
+    var ready = try readReady(arena, init.io, paths);
+    defer ready.deinit();
+    return ownedNamedLifecycleResult(allocator, .{
+        .action = "created",
+        .name = spec.name,
+        .state = "ready",
+        .pid = ready.value.pid,
+        .console_log_path = ready.value.console_log_path,
+    });
+}
+
+pub fn execNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: ExecNamedOptions,
+) !ExecNamedResult {
+    if (options.command.len == 0) return error.InvalidGuestCommand;
+    if (options.network_policy != null) return error.UnsupportedNetworkPolicyUpdate;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const paths = try apiPaths(context, arena, options.name);
+    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    if (state != .ready) return error.NamedVmNotReady;
+    var ready = try readReady(arena, context.io, paths);
+    defer ready.deinit();
+    const response = try sendExecRequest(arena, context.io, ready.value.control_socket_path, options.command);
+    return parseExecNamedResponse(allocator, arena, response);
+}
+
+pub fn snapshotNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: SnapshotNamedOptions,
+) !NamedLifecycleResult {
+    if (!options.continue_after) return error.UnsupportedSnapshotMode;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const out_dir = try resolveNewOutputDirApi(arena, context.io, options.out_dir);
+    const paths = try apiPaths(context, arena, options.name);
+    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    if (state != .ready) return error.NamedVmNotReady;
+    var spec = try readSpec(arena, context.io, paths);
+    defer spec.deinit();
+    if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
+        return error.MissingRootfsIdentity;
+    }
+    var ready = try readReady(arena, context.io, paths);
+    defer ready.deinit();
+    const response = try sendSnapshotRequest(arena, context.io, ready.value.control_socket_path, out_dir);
+    if (!try snapshotResponseOk(arena, response)) return error.MonitorRequestFailed;
+    try writeSporeLifecycleSpec(arena, context.io, out_dir, spec.value);
+    return ownedNamedLifecycleResult(allocator, .{
+        .action = "snapshotted",
+        .name = options.name,
+        .state = "ready",
+        .pid = ready.value.pid,
+        .spore_dir = out_dir,
+    });
+}
+
+pub fn suspendNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: SuspendNamedOptions,
+) !NamedLifecycleResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const out_dir = try resolveNewOutputDirApi(arena, context.io, options.out_dir);
+    const paths = try apiPaths(context, arena, options.name);
+    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    if (state != .ready) return error.NamedVmNotReady;
+    var spec = try readSpec(arena, context.io, paths);
+    defer spec.deinit();
+    if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
+        return error.MissingRootfsIdentity;
+    }
+    var ready = try readReady(arena, context.io, paths);
+    defer ready.deinit();
+    const response = try sendSuspendRequest(arena, context.io, ready.value.control_socket_path, out_dir);
+    if (try suspendResponseFailureMessage(arena, response) != null) return error.MonitorRequestFailed;
+
+    var cleanup_after_suspend = true;
+    defer if (cleanup_after_suspend) {
+        waitForPidExit(ready.value.pid, 5_000);
+        Io.Dir.cwd().deleteTree(context.io, paths.vm_dir) catch {};
+    };
+    try writeSporeLifecycleSpec(arena, context.io, out_dir, spec.value);
+    cleanup_after_suspend = false;
+    waitForPidExit(ready.value.pid, 5_000);
+    try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
+    return ownedNamedLifecycleResult(allocator, .{
+        .action = "suspended",
+        .name = options.name,
+        .state = "checkpointed",
+        .pid = ready.value.pid,
+        .spore_dir = out_dir,
+    });
+}
+
+pub fn removeNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: RemoveNamedOptions,
+) !NamedLifecycleResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const paths = try apiPaths(context, arena, options.name);
+    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    var removed_pid: ?i64 = null;
+    switch (state) {
+        .absent => return error.NamedVmNotFound,
+        .ready => {
+            var ready = try readReady(arena, context.io, paths);
+            defer ready.deinit();
+            removed_pid = ready.value.pid;
+            _ = sendShutdownRequest(arena, context.io, ready.value.control_socket_path) catch {};
+            waitForPidExit(ready.value.pid, 5_000);
+            try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
+        },
+        .incomplete, .stale => {
+            removed_pid = readPid(arena, context.io, paths) catch null;
+            try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
+        },
+    }
+    return ownedNamedLifecycleResult(allocator, .{
+        .action = "removed",
+        .name = options.name,
+        .state = "absent",
+        .pid = removed_pid,
+    });
+}
+
+pub fn listNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: ListNamedOptions,
+) ![]ListEntry {
+    _ = options;
+    const root = try runtimeRootPath(allocator, context.environ_map);
+    defer allocator.free(root);
+    return listEntries(allocator, context.io, root, pidAlive);
+}
+
+pub fn deinitNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycleResult) void {
+    allocator.free(result.name);
+    if (result.console_log_path) |path| allocator.free(path);
+    if (result.spore_dir) |path| allocator.free(path);
+}
+
+pub fn deinitExecNamedResult(allocator: std.mem.Allocator, result: ExecNamedResult) void {
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
+    allocator.free(result.network_events_jsonl);
+}
+
 pub fn createCli(
     init: std.process.Init,
     args: []const []const u8,
@@ -307,7 +602,7 @@ pub fn createCli(
     const parsed = try parseCreateArgs(args, allocator, stderr, mode);
     const parsed_ms = monotonicMs();
     var spec = parsed.spec;
-    spec.network = run_mod.manifestNetworkFromOptions(parsed.network, &parsed.network_policy);
+    spec.network = try run_mod.manifestNetworkFromOptions(allocator, parsed.network, &parsed.network_policy);
     const paths = try cliPaths(init, allocator, "create", spec.name);
     const paths_ms = monotonicMs();
     if (!monitorBackendSupported(spec.backend)) {
@@ -335,7 +630,7 @@ pub fn createCli(
     spec.rootfs = resolved_rootfs.rootfs;
     const rootfs_abspath_ms = monotonicMs();
     if (spec.rootfs != null) try writeSpec(allocator, init.io, paths, spec);
-    try spawnMonitor(init, allocator, spec);
+    try spawnMonitor(init, allocator, spec, &parsed.network_policy);
     const monitor_spawned_ms = monotonicMs();
     try waitForReady("create", allocator, init.io, paths, spec.timeout_ms);
     const ready_ms = monotonicMs();
@@ -690,7 +985,7 @@ pub fn resumeCli(
         .resume_dir = spore_dir,
         .rootfs = rootfs,
         .disk = disk,
-        .network = run_mod.manifestNetworkFromOptions(network_options.network, &network_options.policy),
+        .network = try run_mod.manifestNetworkFromOptions(allocator, network_options.network, &network_options.policy),
         .memory = memory,
         .vcpus = 1,
         .guest_port = base.guest_port,
@@ -708,7 +1003,7 @@ pub fn resumeCli(
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
     }
     if (spec.rootfs != null or spec.disk != null) try writeSpec(allocator, init.io, paths, spec);
-    try spawnMonitor(init, allocator, spec);
+    try spawnMonitor(init, allocator, spec, &network_options.policy);
     try waitForReady("resume", allocator, init.io, paths, spec.timeout_ms);
     if (mode == .json) {
         var ready = try readReady(allocator, init.io, paths);
@@ -1293,6 +1588,21 @@ fn cliPaths(init: std.process.Init, allocator: std.mem.Allocator, command: []con
     return paths;
 }
 
+fn apiPaths(context: Context, allocator: std.mem.Allocator, name: []const u8) !Paths {
+    const paths = try pathsFor(allocator, context.environ_map, name);
+    try validateExistingRuntimeDirs(context.io, paths);
+    return paths;
+}
+
+fn resolveNewOutputDirApi(allocator: std.mem.Allocator, io: Io, raw: []const u8) ![]const u8 {
+    const path = try std.fs.path.resolve(allocator, &.{raw});
+    if (try pathExists(io, path)) return error.OutputDirExists;
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidOutputDir;
+    const stat = try Io.Dir.cwd().statFile(io, parent, .{ .follow_symlinks = true });
+    if (stat.kind != Io.File.Kind.directory) return error.InvalidOutputDir;
+    return path;
+}
+
 fn resolveNewOutputDir(
     allocator: std.mem.Allocator,
     io: Io,
@@ -1501,7 +1811,7 @@ fn startForkChild(
         .console_log_path = null,
     };
     const paths = try cliPaths(init, allocator, "fork", child_name);
-    try spawnMonitor(init, allocator, spec);
+    try spawnMonitor(init, allocator, spec, null);
     try waitForReady("fork", allocator, init.io, paths, spec.timeout_ms);
 }
 
@@ -1528,9 +1838,12 @@ fn writeNamedForkResult(writer: *Io.Writer, result: NamedForkResult) !void {
     }
 }
 
-fn spawnMonitor(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec) !void {
+fn spawnMonitor(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec, network_policy: ?*const run_mod.NetworkPolicy) !void {
     const full_args = try init.minimal.args.toSlice(allocator);
-    const exe = full_args[0];
+    try spawnMonitorExecutable(init, allocator, spec, full_args[0], network_policy);
+}
+
+fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec, exe: []const u8, network_policy: ?*const run_mod.NetworkPolicy) !void {
     var argv = std.array_list.Managed([]const u8).init(allocator);
     try argv.append(exe);
     try argv.append("monitor");
@@ -1557,16 +1870,10 @@ fn spawnMonitor(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec
         try argv.append("--resume");
         try argv.append(path);
     }
-    if (spec.network) |network| {
-        try argv.append("--net");
-        for (network.allow_cidrs) |cidr| {
-            try argv.append("--allow-cidr");
-            try argv.append(cidr);
-        }
-        for (network.allow_hosts) |host| {
-            try argv.append("--allow-host");
-            try argv.append(host);
-        }
+    if (network_policy) |policy| {
+        if (spec.network != null) try appendMonitorNetworkPolicyArgs(allocator, &argv, policy);
+    } else if (spec.network) |network| {
+        try appendMonitorNetworkManifestArgs(allocator, &argv, network);
     }
     try appendMemoryArg(allocator, &argv, spec.memory);
     try appendIntArg(allocator, &argv, "--vcpus", spec.vcpus);
@@ -1585,6 +1892,50 @@ fn spawnMonitor(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec
     });
 }
 
+fn appendMonitorNetworkPolicyArgs(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), policy: *const run_mod.NetworkPolicy) !void {
+    try argv.append("--net");
+    for (policy.allowCidrSlice()) |cidr| {
+        try argv.append("--allow-cidr");
+        try argv.append(cidr);
+    }
+    for (policy.allowHostSlice()) |host| {
+        try argv.append("--allow-host");
+        try argv.append(host);
+    }
+    for (policy.exactRuleSlice()) |rule| {
+        for (rule.portSlice()) |port| {
+            try argv.append("--allow-host-port");
+            try argv.append(try std.fmt.allocPrint(allocator, "{s}:{d}", .{ rule.host, port }));
+        }
+    }
+    for (policy.boundServiceSlice()) |service| {
+        try argv.append("--bound-unix-service");
+        try argv.append(service.name);
+        try argv.append(service.guest_host);
+        try argv.append(try std.fmt.allocPrint(allocator, "{d}", .{service.guest_port}));
+        try argv.append(service.unix_path);
+    }
+}
+
+fn appendMonitorNetworkManifestArgs(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), network: spore.Network) !void {
+    if (network.bound_services.len != 0) return error.UnsupportedBoundServiceRestore;
+    try argv.append("--net");
+    for (network.allow_cidrs) |cidr| {
+        try argv.append("--allow-cidr");
+        try argv.append(cidr);
+    }
+    for (network.allow_hosts) |host| {
+        try argv.append("--allow-host");
+        try argv.append(host);
+    }
+    for (network.allow_host_ports) |rule| {
+        for (rule.ports) |port| {
+            try argv.append("--allow-host-port");
+            try argv.append(try std.fmt.allocPrint(allocator, "{s}:{d}", .{ rule.host, port }));
+        }
+    }
+}
+
 fn appendIntArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), flag: []const u8, value: anytype) !void {
     try argv.append(flag);
     try argv.append(try std.fmt.allocPrint(allocator, "{d}", .{value}));
@@ -1596,6 +1947,16 @@ fn appendMemoryArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([
 }
 
 fn waitForReady(command: []const u8, allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: u64) !void {
+    waitForReadyResult(allocator, io, paths, timeout_ms) catch |err| switch (err) {
+        error.MonitorReadyTimeout => {
+            std.debug.print("spore {s}: timed out waiting for monitor readiness\n", .{command});
+            std.process.exit(1);
+        },
+        else => |e| return e,
+    };
+}
+
+fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: u64) !void {
     const start = monotonicMs();
     while (monotonicMs() - start < timeout_ms) {
         var ready = readReady(allocator, io, paths) catch {
@@ -1610,8 +1971,7 @@ fn waitForReady(command: []const u8, allocator: std.mem.Allocator, io: Io, paths
         ready.deinit();
         return;
     }
-    std.debug.print("spore {s}: timed out waiting for monitor readiness\n", .{command});
-    std.process.exit(1);
+    return error.MonitorReadyTimeout;
 }
 
 fn lifecycleReadyOrExit(allocator: std.mem.Allocator, io: Io, command: []const u8, paths: Paths) std.json.Parsed(Ready) {
@@ -1674,6 +2034,7 @@ const ControlResponse = struct {
     exit_code: ?i32 = null,
     stdout_b64: ?[]const u8 = null,
     stderr_b64: ?[]const u8 = null,
+    network_events_jsonl_b64: ?[]const u8 = null,
     stdout_truncated: bool = false,
     stderr_truncated: bool = false,
     out_dir: ?[]const u8 = null,
@@ -1708,6 +2069,39 @@ fn handleExecResponse(init: std.process.Init, allocator: std.mem.Allocator, stdo
     return 1;
 }
 
+fn parseExecNamedResponse(
+    allocator: std.mem.Allocator,
+    parse_allocator: std.mem.Allocator,
+    response: []const u8,
+) !ExecNamedResult {
+    var parsed = try std.json.parseFromSlice(ControlResponse, parse_allocator, response, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.type, "exec_result")) return error.MonitorRequestFailed;
+    const exit_code = parsed.value.exit_code orelse return error.BadMonitorResponse;
+    if (exit_code < 0 or exit_code > 255) return error.BadMonitorResponse;
+
+    const stdout = try decodeControlOutput(allocator, parsed.value.stdout_b64 orelse return error.BadMonitorResponse);
+    errdefer allocator.free(stdout);
+    const stderr = try decodeControlOutput(allocator, parsed.value.stderr_b64 orelse return error.BadMonitorResponse);
+    errdefer allocator.free(stderr);
+    const network_events_jsonl = if (parsed.value.network_events_jsonl_b64) |encoded|
+        try decodeControlOutput(allocator, encoded)
+    else
+        try allocator.dupe(u8, "");
+    errdefer allocator.free(network_events_jsonl);
+    return .{
+        .exit_code = @intCast(exit_code),
+        .stdout = stdout,
+        .stderr = stderr,
+        .network_events_jsonl = network_events_jsonl,
+        .stdout_truncated = parsed.value.stdout_truncated,
+        .stderr_truncated = parsed.value.stderr_truncated,
+    };
+}
+
 fn suspendResponseFailureMessage(allocator: std.mem.Allocator, response: []const u8) !?[]const u8 {
     var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
         .allocate = .alloc_always,
@@ -1729,6 +2123,31 @@ fn handleSnapshotResponse(command: []const u8, allocator: std.mem.Allocator, res
     const message = parsed.value.message orelse "monitor request failed";
     std.debug.print("spore {s}: {s}\n", .{ command, message });
     return false;
+}
+
+fn snapshotResponseOk(allocator: std.mem.Allocator, response: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    return std.mem.eql(u8, parsed.value.type, "snapshotted");
+}
+
+fn ownedNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycleResult) !NamedLifecycleResult {
+    const name = try allocator.dupe(u8, result.name);
+    errdefer allocator.free(name);
+    const console_log_path = if (result.console_log_path) |path| try allocator.dupe(u8, path) else null;
+    errdefer if (console_log_path) |path| allocator.free(path);
+    const spore_dir = if (result.spore_dir) |path| try allocator.dupe(u8, path) else null;
+    return .{
+        .action = result.action,
+        .name = name,
+        .state = result.state,
+        .pid = result.pid,
+        .console_log_path = console_log_path,
+        .spore_dir = spore_dir,
+    };
 }
 
 fn writeAll(io: Io, stream: net.Stream, bytes: []const u8) !void {
@@ -2006,6 +2425,22 @@ test "lifecycle result carries stable schema" {
     try std.testing.expectEqualStrings("bench-1", result.name);
     try std.testing.expectEqualStrings("ready", result.state);
     try std.testing.expectEqual(@as(?i64, 42), result.pid);
+}
+
+test "named exec response decodes owned output" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"type":"exec_result","exit_code":7,"stdout_b64":"b2s=","stderr_b64":"ZXJy","network_events_jsonl_b64":"eyJldmVudCI6Im5ldHdvcmtfZGVjaXNpb24ifQo=","stdout_truncated":false,"stderr_truncated":true}
+    ;
+    const result = try parseExecNamedResponse(allocator, allocator, response);
+    defer deinitExecNamedResult(allocator, result);
+
+    try std.testing.expectEqual(@as(u8, 7), result.exit_code);
+    try std.testing.expectEqualStrings("ok", result.stdout);
+    try std.testing.expectEqualStrings("err", result.stderr);
+    try std.testing.expectEqualStrings("{\"event\":\"network_decision\"}\n", result.network_events_jsonl);
+    try std.testing.expect(!result.stdout_truncated);
+    try std.testing.expect(result.stderr_truncated);
 }
 
 test "lifecycle renders fork name patterns" {

@@ -14,12 +14,43 @@ int main(void) {
 
   uint32_t abi_version = 0;
   if (expect_success(spore_build_info(SPORE_BUILD_INFO_ABI_VERSION, &abi_version)) != 0) return 1;
-  if (abi_version != 1) return 1;
+  if (abi_version != 2) return 1;
 
   SporeInspectBundleOptions options;
   spore_inspect_bundle_options_init(&options);
   if (options.size != sizeof(options)) return 1;
   if (options.version != SPORE_INSPECT_BUNDLE_OPTIONS_VERSION) return 1;
+
+  SporeCreateNamedOptions create_options;
+  spore_create_named_options_init(&create_options);
+  if (create_options.size != sizeof(create_options)) return 1;
+  if (create_options.version != SPORE_CREATE_NAMED_OPTIONS_VERSION) return 1;
+  if (create_options.guest_port != 10700) return 1;
+  if (create_options.network_enabled != 0) return 1;
+  if (create_options.network_rule_count != 0) return 1;
+  if (create_options.bound_unix_service_count != 0) return 1;
+
+  SporeExecNamedOptions exec_options;
+  spore_exec_named_options_init(&exec_options);
+  if (exec_options.size != sizeof(exec_options)) return 1;
+  if (exec_options.version != SPORE_EXEC_NAMED_OPTIONS_VERSION) return 1;
+  if (exec_options.has_network_policy != 0) return 1;
+
+  SporeSnapshotNamedOptions snapshot_options;
+  spore_snapshot_named_options_init(&snapshot_options);
+  if (snapshot_options.size != sizeof(snapshot_options)) return 1;
+  if (snapshot_options.version != SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION) return 1;
+  if (snapshot_options.continue_after != 1) return 1;
+
+  SporeSuspendNamedOptions suspend_options;
+  spore_suspend_named_options_init(&suspend_options);
+  if (suspend_options.size != sizeof(suspend_options)) return 1;
+  if (suspend_options.version != SPORE_SUSPEND_NAMED_OPTIONS_VERSION) return 1;
+
+  SporeRemoveNamedOptions remove_options;
+  spore_remove_named_options_init(&remove_options);
+  if (remove_options.size != sizeof(remove_options)) return 1;
+  if (remove_options.version != SPORE_REMOVE_NAMED_OPTIONS_VERSION) return 1;
 
 #if defined(SPORE_SMOKE_HOST_INFO)
   SporeContext context = 0;
@@ -32,6 +63,20 @@ int main(void) {
   if (strstr(json.ptr, "\"schema\": \"spore.host-info.v1\"") == 0) return 1;
 
   spore_free_string(context, json);
+
+  SporeOwnedString capabilities_json = {0};
+  if (expect_success(spore_network_capabilities_json(context, &capabilities_json)) != 0) return 1;
+  if (capabilities_json.ptr == 0 || strstr(capabilities_json.ptr, "\"exact_host_port\": true") == 0) return 1;
+  spore_free_string(context, capabilities_json);
+
+  SporeString env_name = { "SPOREVM_RUNTIME_DIR", strlen("SPOREVM_RUNTIME_DIR") };
+  SporeString env_value = { "/tmp/sporevm-c-smoke-empty", strlen("/tmp/sporevm-c-smoke-empty") };
+  if (expect_success(spore_context_set_env(context, env_name, env_value)) != 0) return 1;
+  SporeOwnedString named_json = {0};
+  if (expect_success(spore_list_named_json(context, &named_json)) != 0) return 1;
+  if (named_json.ptr == 0 || strcmp(named_json.ptr, "[]\n") != 0) return 1;
+  spore_free_string(context, named_json);
+
   spore_context_free(context);
 #endif
 

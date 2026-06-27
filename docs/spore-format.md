@@ -222,11 +222,14 @@ under `rootfs.cache`.
   nonzero extents as `logical_cluster` plus cluster digest, and sorted explicit
   `zero_clusters`.
 - `network`: optional requested network capability and policy. `kind` is
-  `spore-net-v0`; `allow_cidrs` and `allow_hosts` record the user-selected
-  egress allow policy. The manifest does not carry live gateway state, TCP
-  flows, DNS response caches, host sockets, or helper process state. Resume and
-  `spore run --from` must attach a fresh gateway under this policy or fail
-  closed.
+  `spore-net-v0`; `allow_cidrs` and `allow_hosts` record the legacy CLI egress
+  allow policy, while `allow_host_ports` records exact DNS-learned host plus
+  port rules and `bound_services` records restore-time guest service
+  requirements by name, guest host, and guest port. The manifest does not carry
+  live gateway state, TCP flows, DNS response caches, host socket paths,
+  credential material, or helper process state. Resume and `spore run --from`
+  must attach a fresh gateway that satisfies the recorded `requirements` and
+  policy or fail closed.
 
 ## Not yet captured in v0
 

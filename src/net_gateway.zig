@@ -12,9 +12,10 @@ const virtio_net = @import("virtio/net.zig");
 
 const ready_timeout_ms = 1_000;
 const max_rx_pending = 16;
-const max_network_events = 64;
+const max_network_events = 128;
 const max_stderr_line_len = 512;
 const netd_event_prefix = "spore-net-event ";
+const netd_json_event_prefix = "{\"event\":\"network_";
 
 pub const StartError = error{
     NetdSpawnFailed,
@@ -63,6 +64,11 @@ pub const Process = struct {
     network_event_head: usize = 0,
     network_event_count: usize = 0,
     network_events: [max_network_events]NetworkEvent = undefined,
+    event_lock: SpinLock = .{},
+    event_head: usize = 0,
+    event_count: usize = 0,
+    event_lens: [max_network_events]usize = [_]usize{0} ** max_network_events,
+    event_bufs: [max_network_events][max_stderr_line_len]u8 = undefined,
 
     pub fn start(
         self: *Process,
@@ -87,9 +93,25 @@ pub const Process = struct {
             argv.append("--allow-host") catch return error.OutOfMemory;
             argv.append(host) catch return error.OutOfMemory;
         }
+        for (policy.exactRuleSlice()) |rule| {
+            for (rule.portSlice()) |port| {
+                const host_port = std.fmt.allocPrint(allocator, "{s}:{d}", .{ rule.host, port }) catch return error.OutOfMemory;
+                argv.append("--allow-host-port") catch return error.OutOfMemory;
+                argv.append(host_port) catch return error.OutOfMemory;
+            }
+        }
         for (policy.boundServiceSlice()) |service| {
-            argv.append("--bind-service") catch return error.OutOfMemory;
-            argv.append(service.declaration) catch return error.OutOfMemory;
+            if (service.declaration.len != 0) {
+                argv.append("--bind-service") catch return error.OutOfMemory;
+                argv.append(service.declaration) catch return error.OutOfMemory;
+            } else {
+                const port = std.fmt.allocPrint(allocator, "{d}", .{service.guest_port}) catch return error.OutOfMemory;
+                argv.append("--bound-unix-service") catch return error.OutOfMemory;
+                argv.append(service.name) catch return error.OutOfMemory;
+                argv.append(service.guest_host) catch return error.OutOfMemory;
+                argv.append(port) catch return error.OutOfMemory;
+                argv.append(service.unix_path) catch return error.OutOfMemory;
+            }
         }
         const child = std.process.spawn(io, .{
             .argv = argv.items,
@@ -181,6 +203,41 @@ pub const Process = struct {
         self.network_event_head = (self.network_event_head + 1) % max_network_events;
         self.network_event_count -= 1;
         return event;
+    }
+
+    pub fn clearEvents(self: *Process) void {
+        self.event_lock.lock();
+        defer self.event_lock.unlock();
+        self.event_head = 0;
+        self.event_count = 0;
+        @memset(&self.event_lens, 0);
+    }
+
+    pub fn drainEventJsonl(self: *Process, allocator: std.mem.Allocator) ![]u8 {
+        self.event_lock.lock();
+        defer self.event_lock.unlock();
+
+        var total: usize = 0;
+        var i: usize = 0;
+        while (i < self.event_count) : (i += 1) {
+            const idx = (self.event_head + i) % max_network_events;
+            total += self.event_lens[idx] + 1;
+        }
+        const out = try allocator.alloc(u8, total);
+        var pos: usize = 0;
+        i = 0;
+        while (i < self.event_count) : (i += 1) {
+            const idx = (self.event_head + i) % max_network_events;
+            const len = self.event_lens[idx];
+            @memcpy(out[pos..][0..len], self.event_bufs[idx][0..len]);
+            pos += len;
+            out[pos] = '\n';
+            pos += 1;
+        }
+        self.event_head = 0;
+        self.event_count = 0;
+        @memset(&self.event_lens, 0);
+        return out;
     }
 
     fn backend(self: *Process) virtio_net.Backend {
@@ -300,6 +357,24 @@ pub const Process = struct {
         self.network_event_count += 1;
         return true;
     }
+
+    fn enqueueJsonEventLine(self: *Process, line: []const u8) void {
+        if (!std.mem.startsWith(u8, line, netd_json_event_prefix)) return;
+        self.event_lock.lock();
+        defer self.event_lock.unlock();
+        const idx = if (self.event_count < max_network_events) blk: {
+            const tail = (self.event_head + self.event_count) % max_network_events;
+            self.event_count += 1;
+            break :blk tail;
+        } else blk: {
+            const tail = self.event_head;
+            self.event_head = (self.event_head + 1) % max_network_events;
+            break :blk tail;
+        };
+        const len = @min(line.len, max_stderr_line_len);
+        @memcpy(self.event_bufs[idx][0..len], line[0..len]);
+        self.event_lens[idx] = len;
+    }
 };
 
 const SpinLock = struct {
@@ -398,7 +473,6 @@ fn drainStderr(self: *Process) void {
     while (true) {
         const n = std.posix.read(self.stderr_fd, &buf) catch break;
         if (n == 0) break;
-        std.log.debug("spore-netd stderr: {s}", .{buf[0..n]});
         for (buf[0..n]) |byte| {
             if (byte == '\n') {
                 handleStderrLine(self, line_buf[0..line_len]);
@@ -416,10 +490,17 @@ fn drainStderr(self: *Process) void {
 }
 
 fn handleStderrLine(self: *Process, line: []const u8) void {
-    const event = parseNetworkEventLine(line) orelse return;
-    if (!self.enqueueNetworkEvent(event)) {
-        std.log.debug("spore-net gateway dropped network event: queue full", .{});
+    if (std.mem.startsWith(u8, line, netd_json_event_prefix)) {
+        self.enqueueJsonEventLine(line);
+        return;
     }
+    if (parseNetworkEventLine(line)) |event| {
+        if (!self.enqueueNetworkEvent(event)) {
+            std.log.debug("spore-net gateway dropped network event: queue full", .{});
+        }
+        return;
+    }
+    if (line.len != 0) std.log.debug("spore-netd stderr: {s}", .{line});
 }
 
 fn parseNetworkEventLine(line: []const u8) ?NetworkEvent {
@@ -520,4 +601,13 @@ test "spore-net gateway parses denied egress events from netd stderr" {
     try std.testing.expectEqual(spore_net_policy.Decision.deny_hard_floor, event.reason);
     try std.testing.expect(parseNetworkEventLine("spore-net-event egress_denied 169.254.169.254 80 allow") == null);
     try std.testing.expect(parseNetworkEventLine("debug noise") == null);
+}
+
+test "spore-net gateway buffers network event lines from stderr" {
+    var process = Process{};
+    handleStderrLine(&process, "{\"event\":\"network_decision\",\"action\":\"deny\"}");
+    handleStderrLine(&process, "ignored");
+    const events = try process.drainEventJsonl(std.testing.allocator);
+    defer std.testing.allocator.free(events);
+    try std.testing.expectEqualStrings("{\"event\":\"network_decision\",\"action\":\"deny\"}\n", events);
 }

@@ -207,6 +207,10 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   `--allow-cidr` or `--allow-host` is supplied with `--net`, public egress is
   restricted to exact CIDR matches or DNS A answers learned through the
   SporeVM DNS proxy for the configured host; the hard floor still wins.
+  libspore also exposes the Cleanroom-facing first slice: capability facts,
+  default-deny exact host-port policy, bound Unix service declarations, and
+  decision events for named exec. Per-exec policy replacement remains
+  unsupported until the gateway can update policy on a running VM.
 - `src/net_gateway.zig` owns helper startup, stderr readiness, deterministic
   shutdown, SIGPIPE-safe helper writes, and the parent-side virtio-net backend
   adapter. Helper RX frames wake the hypervisor loop, which explicitly flushes
@@ -385,9 +389,9 @@ Define how networking behaves for capture, resume, fork, and named lifecycle.
 Definition of done:
 
 - Captured spores record requested network capability and policy, not live
-  gateway flow state.
+  gateway flow state or host socket credential material.
 - Resume either reattaches a fresh network gateway under the same policy or
-  fails closed if the policy cannot be satisfied.
+  fails closed if the policy or bound-service requirements cannot be satisfied.
 - Live TCP flows are explicitly dropped across suspend/resume/fork.
 - Named lifecycle support reuses the same policy persistence and fresh-gateway
   resume contract as one-shot `spore run --net`.

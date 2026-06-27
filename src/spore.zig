@@ -262,11 +262,33 @@ pub const DiskLayer = struct {
 };
 
 pub const network_kind_spore = "spore-net-v0";
+pub const network_default_deny = "deny";
+
+pub const NetworkHostPortRule = struct {
+    host: []const u8,
+    ports: []const u16,
+};
+
+pub const NetworkBoundServiceRequirement = struct {
+    name: []const u8,
+    guest_host: []const u8,
+    guest_port: u16,
+};
+
+pub const NetworkRequirements = struct {
+    tcp_ipv4: bool = true,
+    exact_host_port: bool = false,
+    bound_services: bool = false,
+};
 
 pub const Network = struct {
     kind: []const u8 = network_kind_spore,
+    default_action: ?[]const u8 = null,
     allow_cidrs: []const []const u8 = &.{},
     allow_hosts: []const []const u8 = &.{},
+    allow_host_ports: []const NetworkHostPortRule = &.{},
+    bound_services: []const NetworkBoundServiceRequirement = &.{},
+    requirements: NetworkRequirements = .{},
 };
 
 pub const MemoryPlan = struct {
@@ -830,14 +852,35 @@ pub fn diskLayerHasZeroCluster(layer: DiskLayer, logical_cluster: u64) bool {
 
 pub fn validateNetwork(network: Network) Error!void {
     if (!std.mem.eql(u8, network.kind, network_kind_spore)) return error.BadManifest;
+    if (network.default_action) |action| {
+        if (!std.mem.eql(u8, action, network_default_deny)) return error.BadManifest;
+    }
     if (network.allow_cidrs.len > spore_net_policy.max_allow_cidrs) return error.BadManifest;
     if (network.allow_hosts.len > spore_net_policy.max_allow_hosts) return error.BadManifest;
+    if (network.allow_host_ports.len > spore_net_policy.max_exact_rules) return error.BadManifest;
+    if (network.bound_services.len > spore_net_policy.max_bound_services) return error.BadManifest;
     for (network.allow_cidrs) |cidr| {
         _ = spore_net_policy.parseCidr(cidr) catch return error.BadManifest;
     }
     for (network.allow_hosts) |host| {
         spore_net_policy.validateHost(host) catch return error.BadManifest;
     }
+    for (network.allow_host_ports) |rule| {
+        spore_net_policy.validateHost(rule.host) catch return error.BadManifest;
+        if (rule.ports.len == 0 or rule.ports.len > spore_net_policy.max_rule_ports) return error.BadManifest;
+        for (rule.ports) |port| {
+            if (port == 0) return error.BadManifest;
+        }
+    }
+    for (network.bound_services) |service| {
+        spore_net_policy.validateHost(service.guest_host) catch return error.BadManifest;
+        spore_net_policy.validateServiceName(service.name) catch return error.BadManifest;
+        if (service.guest_port == 0) return error.BadManifest;
+    }
+    const facts = spore_net_policy.capabilities();
+    if (network.requirements.tcp_ipv4 and !facts.tcp_ipv4) return error.BadManifest;
+    if (network.requirements.exact_host_port and !facts.exact_host_port) return error.BadManifest;
+    if (network.requirements.bound_services and !facts.bound_services) return error.BadManifest;
 }
 
 pub fn rootfsQueuesQuiescent(rootfs: Rootfs, devices: []const TransportState) Error!bool {

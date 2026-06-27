@@ -81,7 +81,7 @@ block identical-host fork/fan-out.
 | Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; fork path populates it |
 | Immutable rootfs base | optional exact artifact plus optional `chunked-ext4-rootfs-v0` storage descriptor | yes via `spore run --image` | verifies exact artifact fd or chunked index/chunks | yes via `spore run --image` | verifies exact artifact fd or chunked index/chunks | product resume base |
 | Writable root disk layers | optional `cow-block-v0` chain over the effective immutable rootfs base | yes for local layer store | verifies layer indexes and disk objects | yes for local layer store | verifies layer indexes and disk objects | product resume; bundle materialization unit-covered |
-| Network capability and policy | optional `spore-net-v0` plus allow CIDRs/hosts; no live flows | yes | fresh gateway | yes | fresh gateway | policy portable; flows dropped |
+| Network capability and policy | optional `spore-net-v0` plus allow CIDRs/hosts, exact host-port rules, and bound-service requirements; no live flows or host socket material | yes | fresh gateway | yes | fresh gateway | policy portable; flows dropped; bound services fail closed unless restored |
 | General writable disk contents | not represented | no | reject | no | reject | out of v0 |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
 | Access trace | not yet represented | no | no | no | no | local KVM/HVF lazy traces only; not a portability contract |

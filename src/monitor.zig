@@ -9,6 +9,7 @@ const memory_config = @import("memory.zig");
 const monitor_jail = @import("monitor_jail.zig");
 const net_gateway = @import("net_gateway.zig");
 const run = @import("run.zig");
+const spore_net_policy = @import("spore_net_policy.zig");
 const vsock = @import("virtio/vsock.zig");
 
 const max_control_request = 4096;
@@ -31,6 +32,10 @@ const monitor_usage =
     \\  --net                   Experimental SporeVM-managed networking
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
+    \\  --allow-host-port HOST:PORT
+    \\                          With --net, allow only DNS-learned HOST on PORT
+    \\  --bound-unix-service NAME HOST PORT PATH
+    \\                          With --net, expose a host Unix socket as HOST:PORT
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
@@ -136,7 +141,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .rootfs_path = opts.rootfs_path,
         .rootfs = spec_rootfs,
         .disk = spec_disk,
-        .network = run.manifestNetworkFromOptions(opts.network, &opts.network_policy),
+        .network = try run.manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy),
         .image_ref = opts.image_ref,
         .resume_dir = opts.resume_dir,
         .memory = opts.memory,
@@ -148,6 +153,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     try lifecycle.writePid(allocator, init.io, paths, currentPid());
 
     var server = try ExecServer.init(allocator, init.io, paths.control_socket_path, opts.guest_port, opts.timeout_ms);
+    if (gateway_active) server.network_events = &gateway;
     const thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
     const metadata_ms = lifecycle.monotonicMs();
 
@@ -226,6 +232,7 @@ const ExecServer = struct {
     stderr_capture: [max_exec_output]u8 = undefined,
     stderr_capture_len: usize = 0,
     stderr_truncated: bool = false,
+    network_events: ?*net_gateway.Process = null,
     next_session_id: u64 = 1,
     next_host_port: u32 = 49152,
     wake: ?vsock.Wake = null,
@@ -345,6 +352,7 @@ const ExecServer = struct {
         @memcpy(self.request[0..request.len], request);
         self.request_len = request.len;
         self.response_len = 0;
+        if (self.network_events) |events| events.clearEvents();
         self.state = .pending_exec;
         if (self.wake) |wake| wake.wake();
         self.cond.broadcast(self.io);
@@ -481,17 +489,26 @@ const ExecServer = struct {
         defer self.allocator.free(stdout_b64);
         const stderr_b64 = try base64Alloc(self.allocator, self.stderr_capture[0..self.stderr_capture_len]);
         defer self.allocator.free(stderr_b64);
+        const network_events_jsonl = if (self.network_events) |events|
+            try events.drainEventJsonl(self.allocator)
+        else
+            try self.allocator.dupe(u8, "");
+        defer self.allocator.free(network_events_jsonl);
+        const network_events_jsonl_b64 = try base64Alloc(self.allocator, network_events_jsonl);
+        defer self.allocator.free(network_events_jsonl_b64);
         const payload = struct {
             type: []const u8 = "exec_result",
             exit_code: i32,
             stdout_b64: []const u8,
             stderr_b64: []const u8,
+            network_events_jsonl_b64: []const u8,
             stdout_truncated: bool,
             stderr_truncated: bool,
         }{
             .exit_code = exit_code,
             .stdout_b64 = stdout_b64,
             .stderr_b64 = stderr_b64,
+            .network_events_jsonl_b64 = network_events_jsonl_b64,
             .stdout_truncated = self.stdout_truncated,
             .stderr_truncated = self.stderr_truncated,
         };
@@ -705,6 +722,30 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
                 std.debug.print("spore monitor: invalid --allow-host {s}: {s}\n", .{ raw, @errorName(err) });
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, args[i], "--allow-host-port")) {
+            const raw = takeValue(args, &i, args[i]);
+            const parsed = parseHostPort(raw) catch |err| {
+                std.debug.print("spore monitor: invalid --allow-host-port {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
+            opts.network_policy.addExactHostPorts(parsed.host, &.{parsed.port}) catch |err| {
+                std.debug.print("spore monitor: invalid --allow-host-port {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, args[i], "--bound-unix-service")) {
+            const flag = args[i];
+            const name = takeValue(args, &i, flag);
+            const guest_host = takeValue(args, &i, flag);
+            const guest_port_raw = takeValue(args, &i, flag);
+            const unix_path = takeValue(args, &i, flag);
+            const guest_port = std.fmt.parseUnsigned(u16, guest_port_raw, 10) catch {
+                std.debug.print("spore monitor: invalid --bound-unix-service port {s}\n", .{guest_port_raw});
+                std.process.exit(2);
+            };
+            opts.network_policy.addBoundUnixService(name, guest_host, guest_port, unix_path) catch |err| {
+                std.debug.print("spore monitor: invalid --bound-unix-service {s}: {s}\n", .{ name, @errorName(err) });
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, args[i], "--memory")) {
             opts.memory = memory_config.parseCliOrExit("spore monitor", takeValue(args, &i, args[i]));
         } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
@@ -727,6 +768,21 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
         std.process.exit(2);
     }
     return opts;
+}
+
+const HostPort = struct {
+    host: []const u8,
+    port: u16,
+};
+
+fn parseHostPort(raw: []const u8) !HostPort {
+    const colon = std.mem.lastIndexOfScalar(u8, raw, ':') orelse return error.InvalidPort;
+    const host = raw[0..colon];
+    const port_raw = raw[colon + 1 ..];
+    const port = std.fmt.parseUnsigned(u16, port_raw, 10) catch return error.InvalidPort;
+    if (port == 0) return error.InvalidPort;
+    try spore_net_policy.validateHost(host);
+    return .{ .host = host, .port = port };
 }
 
 fn usageExit() noreturn {

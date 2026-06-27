@@ -34,7 +34,7 @@ test "external import can consume classified failure events" {
     try std.testing.expectEqual(libspore.FailureCode.cache_integrity_failed, event.failure.classified.code);
 }
 
-test "external import can name managed and run-from APIs" {
+test "external import can name managed run-from and named lifecycle APIs" {
     const managed = libspore.ManagedRunOptions{
         .kernel_path = "Image",
         .command = &.{"/bin/true"},
@@ -48,4 +48,53 @@ test "external import can name managed and run-from APIs" {
     try std.testing.expectEqualStrings("base.spore", from.spore_dir);
     _ = libspore.runManaged;
     _ = libspore.runFromSpore;
+
+    const create = libspore.CreateNamedOptions{ .name = "dev-vm" };
+    try std.testing.expectEqualStrings("dev-vm", create.name);
+
+    const network_policy = libspore.NetworkPolicy{
+        .allow = &.{.{
+            .host = "github.com",
+            .ports = &.{443},
+        }},
+    };
+    const bound_service = libspore.BoundService{
+        .name = "cleanroom-gateway",
+        .guest_host = "gateway.cleanroom.internal",
+        .guest_port = 8170,
+        .target = .{ .unix = "/tmp/gateway.sock" },
+    };
+    const networked_create = libspore.CreateNamedOptions{
+        .name = "networked-vm",
+        .network = .{
+            .enabled = true,
+            .policy = network_policy,
+            .bound_services = &.{bound_service},
+        },
+    };
+    try std.testing.expect(networked_create.network.enabled);
+
+    const exec = libspore.ExecNamedOptions{
+        .name = "dev-vm",
+        .command = &.{"/bin/true"},
+    };
+    try std.testing.expectEqual(@as(usize, 1), exec.command.len);
+
+    const snapshot = libspore.SnapshotNamedOptions{
+        .name = "dev-vm",
+        .out_dir = "dev.spore",
+        .continue_after = true,
+    };
+    try std.testing.expect(snapshot.continue_after);
+
+    _ = libspore.createNamed;
+    _ = libspore.execNamed;
+    _ = libspore.networkCapabilities;
+    _ = libspore.snapshotNamed;
+    _ = libspore.suspendNamed;
+    _ = libspore.removeNamed;
+    _ = libspore.listNamed;
+
+    const facts = libspore.networkCapabilities();
+    try std.testing.expect(facts.supported and facts.exact_host_port);
 }

@@ -5,6 +5,7 @@
 //! bridge between guest TCP payloads and nonblocking host `connect()` sockets.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zmoltcp = @import("zmoltcp");
 
 const spore_net = @import("spore_net.zig");
@@ -62,6 +63,12 @@ const HostState = enum {
     connecting,
     connected,
     failed,
+};
+
+const RequestTarget = union(enum) {
+    tcp: ?[]const u8,
+    legacy_bound_unix: []const u8,
+    bound_unix: *const spore_net_policy.BoundServiceConfig,
 };
 
 const ByteBuffer = struct {
@@ -297,10 +304,10 @@ pub const Gateway = struct {
     }
 
     fn offer(self: *Gateway, request: ForwardRequest) ?*TcpSock {
-        if (!self.allowRequest(request)) {
+        const target = self.targetForRequest(request) orelse {
             self.stats.denied += 1;
             return null;
-        }
+        };
 
         const flow = self.freeFlow() orelse {
             self.stats.flow_limit_drops += 1;
@@ -309,10 +316,21 @@ pub const Gateway = struct {
         flow.start(request, self.current_now);
 
         self.stats.connect_attempts += 1;
-        const open_result = if (self.boundServiceRequest(request))
-            openUnixSocket(self.bound_service.?.unix_path)
-        else
-            openHostSocket(request.local.addr, request.local.port);
+        const open_result = switch (target) {
+            .tcp => |host| blk: {
+                emitNetworkDecision("allow", host, request.local.addr, request.local.port, "policy");
+                break :blk openHostSocket(request.local.addr, request.local.port);
+            },
+            .legacy_bound_unix => |path| blk: {
+                emitNetworkDecision("allow", null, request.local.addr, request.local.port, "bound-service");
+                break :blk openUnixSocket(path);
+            },
+            .bound_unix => |bound| blk: {
+                const host: ?[]const u8 = if (bound.guest_host.len == 0) null else bound.guest_host;
+                emitNetworkDecision("allow", host, request.local.addr, request.local.port, bound.name);
+                break :blk openUnixSocket(bound.unix_path);
+            },
+        };
         switch (open_result) {
             .connected => |fd| {
                 flow.fd = fd;
@@ -332,13 +350,18 @@ pub const Gateway = struct {
         return &flow.sock;
     }
 
-    fn allowRequest(self: *Gateway, request: ForwardRequest) bool {
-        if (!std.mem.eql(u8, &request.remote.addr, &spore_net.guest_ipv4)) return false;
-        if (request.local.port == 0 or request.remote.port == 0) return false;
-        if (self.boundServiceRequest(request)) return true;
-        const decision = self.policy.decideIpv4(request.local.addr);
-        if (decision == .allow) return true;
+    fn targetForRequest(self: *Gateway, request: ForwardRequest) ?RequestTarget {
+        if (!std.mem.eql(u8, &request.remote.addr, &spore_net.guest_ipv4)) return null;
+        if (request.local.port == 0 or request.remote.port == 0) return null;
+        if (std.mem.eql(u8, &request.local.addr, &spore_net.gateway_ipv4)) {
+            if (self.policy.boundServiceForPort(request.local.port)) |bound| return .{ .bound_unix = bound };
+            if (self.boundServiceRequest(request)) return .{ .legacy_bound_unix = self.bound_service.?.unix_path };
+        }
+        const decision = self.policy.decideIpv4Port(request.local.addr, request.local.port);
+        const host = self.policy.hostForIpv4Port(request.local.addr, request.local.port);
+        if (decision == .allow) return .{ .tcp = host };
         if (self.emit_events) emitDeniedEgressEvent(request.local.addr, request.local.port, decision);
+        emitNetworkDecision("deny", host, request.local.addr, request.local.port, decision.name());
         std.log.debug(
             "spore-netd denied egress reason={s} dst={d}.{d}.{d}.{d}:{d}",
             .{
@@ -350,7 +373,7 @@ pub const Gateway = struct {
                 request.local.port,
             },
         );
-        return false;
+        return null;
     }
 
     fn boundServiceRequest(self: *const Gateway, request: ForwardRequest) bool {
@@ -508,6 +531,21 @@ pub const Gateway = struct {
     }
 };
 
+fn emitNetworkDecision(action: []const u8, host: ?[]const u8, addr: ipv4.Address, port: u16, reason: []const u8) void {
+    if (builtin.is_test) return;
+    if (host) |value| {
+        std.debug.print(
+            "{{\"event\":\"network_decision\",\"action\":\"{s}\",\"host\":\"{s}\",\"ip\":\"{d}.{d}.{d}.{d}\",\"port\":{d},\"reason_code\":\"{s}\"}}\n",
+            .{ action, value, addr[0], addr[1], addr[2], addr[3], port, reason },
+        );
+    } else {
+        std.debug.print(
+            "{{\"event\":\"network_decision\",\"action\":\"{s}\",\"host\":null,\"ip\":\"{d}.{d}.{d}.{d}\",\"port\":{d},\"reason_code\":\"{s}\"}}\n",
+            .{ action, addr[0], addr[1], addr[2], addr[3], port, reason },
+        );
+    }
+}
+
 const OpenResult = union(enum) {
     connected: std.c.fd_t,
     connecting: std.c.fd_t,
@@ -545,8 +583,13 @@ fn openUnixSocket(path: []const u8) OpenResult {
         return .failed;
     }
 
-    var sockaddr = std.mem.zeroInit(std.c.sockaddr.un, .{});
+    var sockaddr = std.mem.zeroes(std.c.sockaddr.un);
     sockaddr.family = std.c.AF.UNIX;
+    if (@hasField(std.c.sockaddr.un, "len")) sockaddr.len = @sizeOf(std.c.sockaddr.un);
+    if (path.len >= sockaddr.path.len) {
+        _ = std.c.close(fd);
+        return .failed;
+    }
     @memcpy(sockaddr.path[0..path.len], path);
     const rc = std.c.connect(fd, @ptrCast(&sockaddr), @sizeOf(std.c.sockaddr.un));
     if (rc == 0) return .{ .connected = fd };
@@ -668,6 +711,13 @@ fn buildTcpSynFrame(dst_addr: ipv4.Address, dst_port: u16, out: *[spore_net.max_
     return out[0 .. ethernet.HEADER_LEN + ipv4.HEADER_LEN + tcp_len];
 }
 
+fn testForwardRequest(dst_addr: ipv4.Address, dst_port: u16) ForwardRequest {
+    return .{
+        .local = .{ .addr = dst_addr, .port = dst_port },
+        .remote = .{ .addr = spore_net.guest_ipv4, .port = 49152 },
+    };
+}
+
 test "spore-netd TCP policy blocks host and control-plane destinations" {
     try std.testing.expect(isBlockedDestination(.{ 0, 1, 2, 3 }));
     try std.testing.expect(isBlockedDestination(.{ 10, 0, 0, 1 }));
@@ -765,6 +815,39 @@ test "spore-netd TCP opens bound Unix stream sockets" {
     const n = std.c.recv(accepted, &buf, buf.len, 0);
     try std.testing.expectEqual(@as(isize, 4), n);
     try std.testing.expectEqualStrings("ping", &buf);
+}
+
+test "spore-netd TCP enforces exact learned host ports" {
+    var config = spore_net_policy.Config{};
+    try config.addExactHostPorts("github.com", &.{443});
+    var policy = try spore_net_policy.Runtime.init(config);
+
+    var query_buf: [512]u8 = undefined;
+    const query = spore_net_policy.testDnsQuery(0x1234, "github.com", &query_buf);
+    var response_buf: [512]u8 = undefined;
+    const response = spore_net_policy.testDnsResponse(query, "*", &.{.{ 203, 0, 113, 10 }}, &response_buf);
+    try std.testing.expectEqual(@as(usize, 1), policy.noteDnsResponse(query, response));
+
+    var gateway: Gateway = undefined;
+    gateway.init(&policy);
+    try std.testing.expect(gateway.targetForRequest(testForwardRequest(.{ 203, 0, 113, 10 }, 443)) != null);
+    try std.testing.expect(gateway.targetForRequest(testForwardRequest(.{ 203, 0, 113, 10 }, 80)) == null);
+}
+
+test "spore-netd TCP routes configured bound service ports to Unix sockets" {
+    var config = spore_net_policy.Config{};
+    try config.addBoundUnixService("cleanroom-gateway", "gateway.cleanroom.internal", 8170, "/tmp/missing-cleanroom.sock");
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    gateway.init(&policy);
+
+    const target = gateway.targetForRequest(testForwardRequest(spore_net.gateway_ipv4, 8170)) orelse return error.TestUnexpectedResult;
+    switch (target) {
+        .bound_unix => |service| try std.testing.expectEqualStrings("cleanroom-gateway", service.name),
+        .legacy_bound_unix => return error.TestUnexpectedResult,
+        .tcp => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(gateway.targetForRequest(testForwardRequest(spore_net.gateway_ipv4, 8171)) == null);
 }
 
 fn fuzzGuestTcpFrameClassifier(_: void, s: *std.testing.Smith) !void {

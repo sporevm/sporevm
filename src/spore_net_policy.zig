@@ -4,21 +4,76 @@ const std = @import("std");
 
 pub const max_allow_cidrs = 16;
 pub const max_allow_hosts = 16;
-pub const max_learned_host_ips = 64;
+pub const max_exact_rules = 32;
+pub const max_rule_ports = 16;
 pub const max_bound_services = 16;
+pub const max_learned_host_ips = 64;
 pub const max_bound_service_name_len = 63;
 pub const max_unix_socket_path_len = 103;
 
 pub const ParseError = error{
     InvalidCidr,
     InvalidHost,
+    InvalidPort,
+    InvalidNetworkPolicy,
     InvalidBoundService,
     InvalidBoundServiceName,
     InvalidBoundServiceTarget,
     UnsupportedBoundServiceTarget,
     TooManyAllowCidrs,
     TooManyAllowHosts,
+    TooManyExactRules,
+    TooManyRulePorts,
     TooManyBoundServices,
+    DuplicateBoundService,
+};
+
+pub const NetworkCapabilities = struct {
+    supported: bool,
+    tcp_ipv4: bool,
+    tcp_ipv6: bool,
+    udp_dns: bool,
+    exact_host_port: bool,
+    stage_policy_update: bool,
+    bound_services: bool,
+    decision_events: bool,
+};
+
+pub fn capabilities() NetworkCapabilities {
+    return .{
+        .supported = true,
+        .tcp_ipv4 = true,
+        .tcp_ipv6 = false,
+        .udp_dns = true,
+        .exact_host_port = true,
+        .stage_policy_update = false,
+        .bound_services = true,
+        .decision_events = true,
+    };
+}
+
+pub const NetworkDefault = enum { deny };
+
+pub const NetworkRule = struct {
+    host: []const u8,
+    ports: []const u16,
+};
+
+pub const NetworkPolicy = struct {
+    default: NetworkDefault = .deny,
+    allow: []const NetworkRule = &.{},
+};
+
+pub const BoundServiceTarget = union(enum) {
+    unix: []const u8,
+    tcp: struct { host: []const u8, port: u16 },
+};
+
+pub const BoundService = struct {
+    name: []const u8,
+    guest_host: []const u8,
+    guest_port: u16,
+    target: BoundServiceTarget,
 };
 
 pub const Decision = enum {
@@ -45,18 +100,40 @@ pub const Cidr = struct {
     }
 };
 
-pub const BoundService = struct {
-    declaration: []const u8,
-    name: []const u8,
-    unix_path: []const u8,
+pub const ExactRuleConfig = struct {
+    host: []const u8 = "",
+    ports: [max_rule_ports]u16 = [_]u16{0} ** max_rule_ports,
+    port_count: usize = 0,
+
+    pub fn portSlice(self: *const ExactRuleConfig) []const u16 {
+        return self.ports[0..self.port_count];
+    }
+
+    fn containsPort(self: *const ExactRuleConfig, port: u16) bool {
+        for (self.portSlice()) |allowed| {
+            if (allowed == port) return true;
+        }
+        return false;
+    }
+};
+
+pub const BoundServiceConfig = struct {
+    declaration: []const u8 = "",
+    name: []const u8 = "",
+    guest_host: []const u8 = "",
+    guest_port: u16 = 0,
+    unix_path: []const u8 = "",
 };
 
 pub const Config = struct {
+    default_deny: bool = false,
     allow_cidrs: [max_allow_cidrs][]const u8 = [_][]const u8{""} ** max_allow_cidrs,
     allow_cidr_count: usize = 0,
     allow_hosts: [max_allow_hosts][]const u8 = [_][]const u8{""} ** max_allow_hosts,
     allow_host_count: usize = 0,
-    bound_services: [max_bound_services]BoundService = undefined,
+    exact_rules: [max_exact_rules]ExactRuleConfig = [_]ExactRuleConfig{.{}} ** max_exact_rules,
+    exact_rule_count: usize = 0,
+    bound_services: [max_bound_services]BoundServiceConfig = [_]BoundServiceConfig{.{}} ** max_bound_services,
     bound_service_count: usize = 0,
 
     pub fn addAllowCidr(self: *Config, raw: []const u8) ParseError!void {
@@ -89,13 +166,70 @@ pub const Config = struct {
         self.bound_services[self.bound_service_count] = .{
             .declaration = raw,
             .name = name,
+            .guest_port = 80,
             .unix_path = path,
         };
         self.bound_service_count += 1;
     }
 
+    pub fn addNetworkPolicy(self: *Config, policy: NetworkPolicy) ParseError!void {
+        if (policy.default != .deny) return error.InvalidNetworkPolicy;
+        self.default_deny = true;
+        for (policy.allow) |rule| {
+            try self.addExactHostPorts(rule.host, rule.ports);
+        }
+    }
+
+    pub fn addExactHostPorts(self: *Config, host: []const u8, ports: []const u16) ParseError!void {
+        try validateHost(host);
+        if (ports.len == 0) return error.InvalidPort;
+        if (ports.len > max_rule_ports) return error.TooManyRulePorts;
+        if (self.exact_rule_count >= max_exact_rules) return error.TooManyExactRules;
+        var rule = ExactRuleConfig{ .host = host };
+        for (ports) |port| {
+            if (port == 0) return error.InvalidPort;
+            if (!rule.containsPort(port)) {
+                rule.ports[rule.port_count] = port;
+                rule.port_count += 1;
+            }
+        }
+        self.exact_rules[self.exact_rule_count] = rule;
+        self.exact_rule_count += 1;
+    }
+
+    pub fn addBoundService(self: *Config, service: BoundService) ParseError!void {
+        switch (service.target) {
+            .unix => |path| try self.addBoundUnixService(service.name, service.guest_host, service.guest_port, path),
+            .tcp => return error.UnsupportedBoundServiceTarget,
+        }
+    }
+
+    pub fn addBoundUnixService(self: *Config, name: []const u8, guest_host: []const u8, guest_port: u16, unix_path: []const u8) ParseError!void {
+        try validateServiceName(name);
+        try validateHost(guest_host);
+        if (guest_port == 0) return error.InvalidPort;
+        try validateUnixSocketPath(unix_path);
+        if (self.bound_service_count >= max_bound_services) return error.TooManyBoundServices;
+        for (self.boundServiceSlice()) |existing| {
+            if (std.mem.eql(u8, existing.name, name)) return error.DuplicateBoundService;
+            if (existing.guest_host.len != 0 and std.mem.eql(u8, existing.guest_host, guest_host)) return error.DuplicateBoundService;
+            if (existing.guest_port != 0 and existing.guest_port == guest_port) return error.DuplicateBoundService;
+        }
+        self.bound_services[self.bound_service_count] = .{
+            .name = name,
+            .guest_host = guest_host,
+            .guest_port = guest_port,
+            .unix_path = unix_path,
+        };
+        self.bound_service_count += 1;
+    }
+
     pub fn hasRules(self: Config) bool {
-        return self.allow_cidr_count != 0 or self.allow_host_count != 0;
+        return self.default_deny or
+            self.allow_cidr_count != 0 or
+            self.allow_host_count != 0 or
+            self.exact_rule_count != 0 or
+            self.bound_service_count != 0;
     }
 
     pub fn hasBoundServices(self: Config) bool {
@@ -110,7 +244,11 @@ pub const Config = struct {
         return self.allow_hosts[0..self.allow_host_count];
     }
 
-    pub fn boundServiceSlice(self: *const Config) []const BoundService {
+    pub fn exactRuleSlice(self: *const Config) []const ExactRuleConfig {
+        return self.exact_rules[0..self.exact_rule_count];
+    }
+
+    pub fn boundServiceSlice(self: *const Config) []const BoundServiceConfig {
         return self.bound_services[0..self.bound_service_count];
     }
 };
@@ -120,16 +258,29 @@ const LearnedHostIp = struct {
     addr: [4]u8,
 };
 
+const LearnedExactHostIp = struct {
+    rule_index: usize,
+    addr: [4]u8,
+};
+
 pub const Runtime = struct {
+    default_deny: bool = false,
     allow_cidrs: [max_allow_cidrs]Cidr = undefined,
     allow_cidr_count: usize = 0,
     allow_hosts: [max_allow_hosts][]const u8 = [_][]const u8{""} ** max_allow_hosts,
     allow_host_count: usize = 0,
+    exact_rules: [max_exact_rules]ExactRuleConfig = [_]ExactRuleConfig{.{}} ** max_exact_rules,
+    exact_rule_count: usize = 0,
+    bound_services: [max_bound_services]BoundServiceConfig = [_]BoundServiceConfig{.{}} ** max_bound_services,
+    bound_service_count: usize = 0,
     learned_host_ips: [max_learned_host_ips]LearnedHostIp = undefined,
     learned_host_ip_count: usize = 0,
+    learned_exact_host_ips: [max_learned_host_ips]LearnedExactHostIp = undefined,
+    learned_exact_host_ip_count: usize = 0,
 
     pub fn init(config: Config) ParseError!Runtime {
         var runtime = Runtime{};
+        runtime.default_deny = config.default_deny;
         for (config.allowCidrSlice()) |raw| {
             runtime.allow_cidrs[runtime.allow_cidr_count] = try parseCidr(raw);
             runtime.allow_cidr_count += 1;
@@ -139,23 +290,44 @@ pub const Runtime = struct {
             runtime.allow_hosts[runtime.allow_host_count] = raw;
             runtime.allow_host_count += 1;
         }
+        for (config.exactRuleSlice()) |rule| {
+            try validateHost(rule.host);
+            runtime.exact_rules[runtime.exact_rule_count] = rule;
+            runtime.exact_rule_count += 1;
+        }
+        for (config.boundServiceSlice()) |service| {
+            try validateServiceName(service.name);
+            if (service.guest_host.len != 0) try validateHost(service.guest_host);
+            runtime.bound_services[runtime.bound_service_count] = service;
+            runtime.bound_service_count += 1;
+        }
         return runtime;
     }
 
     pub fn decideIpv4(self: *const Runtime, addr: [4]u8) Decision {
+        return self.decideIpv4Port(addr, 0);
+    }
+
+    pub fn decideIpv4Port(self: *const Runtime, addr: [4]u8, port: u16) Decision {
         if (isHardFloorBlocked(addr)) return .deny_hard_floor;
-        if (!self.hasAllowRules()) return .allow;
         for (self.allow_cidrs[0..self.allow_cidr_count]) |cidr| {
             if (cidr.contains(addr)) return .allow;
         }
         for (self.learned_host_ips[0..self.learned_host_ip_count]) |learned| {
             if (std.mem.eql(u8, &learned.addr, &addr)) return .allow;
         }
+        if (port != 0) {
+            for (self.learned_exact_host_ips[0..self.learned_exact_host_ip_count]) |learned| {
+                if (!std.mem.eql(u8, &learned.addr, &addr)) continue;
+                if (self.exact_rules[learned.rule_index].containsPort(port)) return .allow;
+            }
+        }
+        if (!self.default_deny and !self.hasAllowRules()) return .allow;
         return .deny_not_allowed;
     }
 
     pub fn noteDnsResponse(self: *Runtime, query: []const u8, response: []const u8) usize {
-        if (self.allow_host_count == 0) return 0;
+        if (self.allow_host_count == 0 and self.exact_rule_count == 0) return 0;
         if (query.len < dns_header_len or response.len < dns_header_len) return 0;
         if (!std.mem.eql(u8, query[0..2], response[0..2])) return 0;
         const flags = std.mem.readInt(u16, response[2..4], .big);
@@ -169,8 +341,11 @@ pub const Runtime = struct {
         const qclass = std.mem.readInt(u16, query[query_name_end + 2 ..][0..2], .big);
         if (qtype != dns_type_a or qclass != dns_class_in) return 0;
 
-        const host_index = self.allowedHostIndexForDnsName(query, dns_header_len) orelse return 0;
-        const host = self.allow_hosts[host_index];
+        const legacy_host_index = self.allowedHostIndexForDnsName(query, dns_header_len);
+        const exact_match_count = self.exactRuleIndicesForDnsName(query, dns_header_len, null);
+        if (legacy_host_index == null and exact_match_count == 0) return 0;
+        var exact_matches: [max_exact_rules]usize = undefined;
+        _ = self.exactRuleIndicesForDnsName(query, dns_header_len, &exact_matches);
 
         var offset = skipDnsName(response, dns_header_len) orelse return 0;
         if (offset + 4 > response.len) return 0;
@@ -190,20 +365,51 @@ pub const Runtime = struct {
             const data_end = data_start + @as(usize, data_len);
             if (data_end > response.len) return learned;
 
-            if (answer_type == dns_type_a and answer_class == dns_class_in and data_len == 4 and
-                dnsNameMatchesHost(response, name_start, host))
-            {
+            if (answer_type == dns_type_a and answer_class == dns_class_in and data_len == 4) {
                 var addr: [4]u8 = undefined;
                 @memcpy(&addr, response[data_start..data_end]);
-                if (self.recordLearnedHostIp(host_index, addr)) learned += 1;
+                if (legacy_host_index) |host_index| {
+                    const host = self.allow_hosts[host_index];
+                    if (dnsNameMatchesHost(response, name_start, host) and self.recordLearnedHostIp(host_index, addr)) learned += 1;
+                }
+                for (exact_matches[0..exact_match_count]) |rule_index| {
+                    const host = self.exact_rules[rule_index].host;
+                    if (dnsNameMatchesHost(response, name_start, host) and self.recordLearnedExactHostIp(rule_index, addr)) learned += 1;
+                }
             }
             offset = data_end;
         }
         return learned;
     }
 
+    pub fn boundServiceForDnsQuery(self: *const Runtime, packet: []const u8, name_offset: usize) ?*const BoundServiceConfig {
+        for (self.bound_services[0..self.bound_service_count]) |*service| {
+            if (dnsNameMatchesHost(packet, name_offset, service.guest_host)) return service;
+        }
+        return null;
+    }
+
+    pub fn boundServiceForPort(self: *const Runtime, port: u16) ?*const BoundServiceConfig {
+        for (self.bound_services[0..self.bound_service_count]) |*service| {
+            if (service.guest_port == port) return service;
+        }
+        return null;
+    }
+
+    pub fn hostForIpv4Port(self: *const Runtime, addr: [4]u8, port: u16) ?[]const u8 {
+        for (self.learned_exact_host_ips[0..self.learned_exact_host_ip_count]) |learned| {
+            if (!std.mem.eql(u8, &learned.addr, &addr)) continue;
+            const rule = self.exact_rules[learned.rule_index];
+            if (rule.containsPort(port)) return rule.host;
+        }
+        for (self.learned_host_ips[0..self.learned_host_ip_count]) |learned| {
+            if (std.mem.eql(u8, &learned.addr, &addr)) return self.allow_hosts[learned.host_index];
+        }
+        return null;
+    }
+
     fn hasAllowRules(self: *const Runtime) bool {
-        return self.allow_cidr_count != 0 or self.allow_host_count != 0;
+        return self.allow_cidr_count != 0 or self.allow_host_count != 0 or self.exact_rule_count != 0;
     }
 
     fn allowedHostIndexForDnsName(self: *const Runtime, packet: []const u8, offset: usize) ?usize {
@@ -213,6 +419,16 @@ pub const Runtime = struct {
         return null;
     }
 
+    fn exactRuleIndicesForDnsName(self: *const Runtime, packet: []const u8, offset: usize, out: ?*[max_exact_rules]usize) usize {
+        var count: usize = 0;
+        for (self.exact_rules[0..self.exact_rule_count], 0..) |rule, i| {
+            if (!dnsNameMatchesHost(packet, offset, rule.host)) continue;
+            if (out) |slots| slots[count] = i;
+            count += 1;
+        }
+        return count;
+    }
+
     fn recordLearnedHostIp(self: *Runtime, host_index: usize, addr: [4]u8) bool {
         for (self.learned_host_ips[0..self.learned_host_ip_count]) |learned| {
             if (learned.host_index == host_index and std.mem.eql(u8, &learned.addr, &addr)) return false;
@@ -220,6 +436,16 @@ pub const Runtime = struct {
         if (self.learned_host_ip_count >= max_learned_host_ips) return false;
         self.learned_host_ips[self.learned_host_ip_count] = .{ .host_index = host_index, .addr = addr };
         self.learned_host_ip_count += 1;
+        return true;
+    }
+
+    fn recordLearnedExactHostIp(self: *Runtime, rule_index: usize, addr: [4]u8) bool {
+        for (self.learned_exact_host_ips[0..self.learned_exact_host_ip_count]) |learned| {
+            if (learned.rule_index == rule_index and std.mem.eql(u8, &learned.addr, &addr)) return false;
+        }
+        if (self.learned_exact_host_ip_count >= max_learned_host_ips) return false;
+        self.learned_exact_host_ips[self.learned_exact_host_ip_count] = .{ .rule_index = rule_index, .addr = addr };
+        self.learned_exact_host_ip_count += 1;
         return true;
     }
 };
@@ -271,6 +497,10 @@ fn validateUnixSocketPath(raw: []const u8) ParseError!void {
     if (raw.len == 0 or raw[0] != '/') return error.InvalidBoundServiceTarget;
     if (raw.len > max_unix_socket_path_len) return error.InvalidBoundServiceTarget;
     if (std.mem.indexOfScalar(u8, raw, 0) != null) return error.InvalidBoundServiceTarget;
+}
+
+pub fn validateServiceName(raw: []const u8) ParseError!void {
+    validateBoundServiceName(raw) catch return error.InvalidBoundService;
 }
 
 pub fn isHardFloorBlocked(addr: [4]u8) bool {
@@ -377,7 +607,7 @@ fn lowerAscii(c: u8) u8 {
     return c;
 }
 
-fn testDnsQuery(id: u16, qname: []const u8, out: *[512]u8) []const u8 {
+pub fn testDnsQuery(id: u16, qname: []const u8, out: *[512]u8) []const u8 {
     std.mem.writeInt(u16, out[0..2], id, .big);
     std.mem.writeInt(u16, out[2..4], 0x0100, .big);
     std.mem.writeInt(u16, out[4..6], 1, .big);
@@ -401,7 +631,7 @@ fn testDnsQuery(id: u16, qname: []const u8, out: *[512]u8) []const u8 {
     return out[0..len];
 }
 
-fn testDnsResponse(query: []const u8, answer_owner: []const u8, answers: []const [4]u8, out: *[512]u8) []const u8 {
+pub fn testDnsResponse(query: []const u8, answer_owner: []const u8, answers: []const [4]u8, out: *[512]u8) []const u8 {
     @memcpy(out[0..query.len], query);
     std.mem.writeInt(u16, out[2..4], 0x8180, .big);
     std.mem.writeInt(u16, out[6..8], @intCast(answers.len), .big);
@@ -507,6 +737,7 @@ test "spore-net policy parses bound unix service declarations" {
     try std.testing.expectEqual(@as(usize, 1), config.bound_service_count);
     try std.testing.expectEqualStrings("metadata=unix:/tmp/metadata.sock", config.bound_services[0].declaration);
     try std.testing.expectEqualStrings("metadata", config.bound_services[0].name);
+    try std.testing.expectEqual(@as(u16, 80), config.bound_services[0].guest_port);
     try std.testing.expectEqualStrings("/tmp/metadata.sock", config.bound_services[0].unix_path);
 }
 
@@ -516,4 +747,78 @@ test "spore-net policy rejects invalid bound service declarations" {
     try std.testing.expectError(error.InvalidBoundServiceName, config.addBindService("MetaData=unix:/tmp/metadata.sock"));
     try std.testing.expectError(error.UnsupportedBoundServiceTarget, config.addBindService("metadata=tcp:127.0.0.1:8080"));
     try std.testing.expectError(error.InvalidBoundServiceTarget, config.addBindService("metadata=unix:relative.sock"));
+}
+
+test "spore-net policy exposes first-slice capability facts" {
+    const facts = capabilities();
+    try std.testing.expect(facts.supported);
+    try std.testing.expect(facts.tcp_ipv4);
+    try std.testing.expect(facts.udp_dns);
+    try std.testing.expect(facts.exact_host_port);
+    try std.testing.expect(facts.bound_services);
+    try std.testing.expect(!facts.tcp_ipv6);
+    try std.testing.expect(!facts.stage_policy_update);
+}
+
+test "spore-net exact policy learns A records and enforces host plus port" {
+    var config = Config{};
+    try config.addNetworkPolicy(.{
+        .allow = &.{.{
+            .host = "github.com",
+            .ports = &.{443},
+        }},
+    });
+    var policy = try Runtime.init(config);
+
+    try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 140, 82, 112, 4 }, 443));
+
+    var query_buf: [512]u8 = undefined;
+    const query = testDnsQuery(0x1234, "github.com", &query_buf);
+    var response_buf: [512]u8 = undefined;
+    const response = testDnsResponse(query, "*", &.{.{ 140, 82, 112, 4 }}, &response_buf);
+    try std.testing.expectEqual(@as(usize, 1), policy.noteDnsResponse(query, response));
+    try std.testing.expectEqual(Decision.allow, policy.decideIpv4Port(.{ 140, 82, 112, 4 }, 443));
+    try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 140, 82, 112, 4 }, 80));
+    try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 140, 82, 112, 5 }, 443));
+    try std.testing.expectEqualStrings("github.com", policy.hostForIpv4Port(.{ 140, 82, 112, 4 }, 443).?);
+    try std.testing.expect(policy.hostForIpv4Port(.{ 140, 82, 112, 4 }, 80) == null);
+}
+
+test "spore-net exact policy ignores different DNS answer owner" {
+    var config = Config{};
+    try config.addExactHostPorts("github.com", &.{443});
+    var policy = try Runtime.init(config);
+
+    var query_buf: [512]u8 = undefined;
+    const query = testDnsQuery(0x1234, "github.com", &query_buf);
+    var response_buf: [512]u8 = undefined;
+    const response = testDnsResponse(query, "other.example", &.{.{ 140, 82, 112, 4 }}, &response_buf);
+    try std.testing.expectEqual(@as(usize, 0), policy.noteDnsResponse(query, response));
+    try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 140, 82, 112, 4 }, 443));
+}
+
+test "spore-net exact default deny with no allow rules blocks public egress" {
+    var config = Config{};
+    try config.addNetworkPolicy(.{});
+    const policy = try Runtime.init(config);
+    try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
+}
+
+test "spore-net bound Unix services validate and lookup by DNS name and guest port" {
+    var config = Config{};
+    try config.addBoundService(.{
+        .name = "cleanroom-gateway",
+        .guest_host = "gateway.cleanroom.internal",
+        .guest_port = 8170,
+        .target = .{ .unix = "/tmp/cleanroom-gateway.sock" },
+    });
+    const policy = try Runtime.init(config);
+
+    var query_buf: [512]u8 = undefined;
+    const query = testDnsQuery(0x1234, "gateway.cleanroom.internal", &query_buf);
+    const by_dns = policy.boundServiceForDnsQuery(query, dns_header_len) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("cleanroom-gateway", by_dns.name);
+    const by_port = policy.boundServiceForPort(8170) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("/tmp/cleanroom-gateway.sock", by_port.unix_path);
+    try std.testing.expect(policy.boundServiceForPort(8171) == null);
 }

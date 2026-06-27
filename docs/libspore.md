@@ -48,6 +48,9 @@ Use the matching helper for owned results:
 - `deinitPushResult`
 - `deinitInspectBundleResult`
 - `deinitPullResult`
+- `deinitNamedLifecycleResult`
+- `deinitExecNamedResult`
+- `deinitNamedList`
 
 `run`, `runManaged`, `runFromSpore`, and `resumeSpore` return value results and
 do not need deinit.
@@ -73,6 +76,100 @@ const result = try libspore.runFromSpore(context, allocator, .{
 ```
 
 Use `run` only when you already have explicit kernel and rootfs or disk inputs.
+
+## Named Lifecycle
+
+Use named lifecycle APIs when an embedder needs long-lived VM handles without
+constructing `spore` command argv or touching the private monitor socket:
+
+```zig
+const created = try libspore.createNamed(init, allocator, .{
+    .name = "worker-1",
+    .image_ref = "docker.io/library/alpine:3.20",
+});
+defer libspore.deinitNamedLifecycleResult(allocator, created);
+
+const exec = try libspore.execNamed(context, allocator, .{
+    .name = "worker-1",
+    .command = &.{ "/bin/true" },
+});
+defer libspore.deinitExecNamedResult(allocator, exec);
+
+const snap = try libspore.snapshotNamed(context, allocator, .{
+    .name = "worker-1",
+    .out_dir = "worker-1.spore",
+    .continue_after = true,
+});
+defer libspore.deinitNamedLifecycleResult(allocator, snap);
+```
+
+The named surface is:
+
+- `createNamed`
+- `execNamed`
+- `snapshotNamed`
+- `suspendNamed`
+- `removeNamed`
+- `listNamed`
+
+`snapshotNamed` currently supports snapshot-and-continue only. Use
+`deinitNamedLifecycleResult`, `deinitExecNamedResult`, and `deinitNamedList`
+for owned results.
+
+## Networking
+
+Call `networkCapabilities()` before accepting user policy:
+
+```zig
+const caps = libspore.networkCapabilities();
+if (!caps.supported or !caps.exact_host_port) return error.UnsupportedNetworkPolicy;
+```
+
+The first networking slice supports TCP IPv4, DNS A-record learning, exact
+host-plus-port policy, default deny policy, bound Unix services, and named exec
+decision-event capture. It does not support IPv6, UDP egress, wildcard hosts,
+CIDR in Cleanroom policy, SNI/HTTP matching, or live per-exec policy updates.
+
+Create a named VM with exact egress and a bound host service:
+
+```zig
+const policy = libspore.NetworkPolicy{
+    .allow = &.{.{
+        .host = "github.com",
+        .ports = &.{443},
+    }},
+};
+
+const service = libspore.BoundService{
+    .name = "cleanroom-gateway",
+    .guest_host = "gateway.cleanroom.internal",
+    .guest_port = 8170,
+    .target = .{ .unix = "/tmp/cleanroom-gateway.sock" },
+};
+
+const created = try libspore.createNamed(init, allocator, .{
+    .name = "cr-test",
+    .image_ref = "docker.io/library/alpine:3.20",
+    .network = .{
+        .enabled = true,
+        .policy = policy,
+        .bound_services = &.{service},
+    },
+});
+defer libspore.deinitNamedLifecycleResult(allocator, created);
+```
+
+`execNamed(.{ .network_policy = ... })` is part of the API contract but returns
+`error.UnsupportedNetworkPolicyUpdate` in this slice. Callers that need
+stage-scoped networking should start the VM with a single all-stage policy, or
+reject stage-scoped policy until `networkCapabilities().stage_policy_update`
+is true.
+
+`ExecNamedResult.network_events_jsonl` contains decoded JSONL network events
+captured during the exec window. Bound service declarations are recorded in
+captured manifests as restore-time requirements without host socket paths; a
+manifest with bound services fails closed on restore unless live bindings are
+provided by a future API.
 
 ## Events
 
@@ -135,8 +232,9 @@ The generated Zig API docs are installed under
 ## C ABI
 
 The C ABI is declared in [`include/spore.h`](../include/spore.h). The first
-slice exposes context management, build info, context-local last errors, owned
-string cleanup, host-info JSON, and inspect-bundle JSON.
+slice exposes context management, build info, context-local environment
+overrides, context-local last errors, owned string cleanup, host-info JSON,
+inspect-bundle JSON, and named lifecycle JSON.
 
 Release builds publish separate `libspore_Linux_arm64` and
 `libspore_Darwin_arm64` archives so CLI-only installs do not carry development
@@ -198,3 +296,40 @@ SporeInspectBundleOptions options;
 spore_inspect_bundle_options_init(&options);
 options.source = (SporeString){ .ptr = "file:///tmp/base.bundle", .len = 23 };
 ```
+
+Named lifecycle functions follow the same pattern:
+
+```c
+SporeCreateNamedOptions create;
+spore_create_named_options_init(&create);
+create.name = (SporeString){ .ptr = "worker-1", .len = 8 };
+create.spore_executable = (SporeString){ .ptr = "/usr/local/bin/spore", .len = 20 };
+
+uint16_t github_ports[] = {443};
+SporeNetworkRule rules[] = {
+    {
+        .host = { .ptr = "github.com", .len = 10 },
+        .ports = github_ports,
+        .port_count = 1,
+    },
+};
+SporeBoundUnixService services[] = {
+    {
+        .name = { .ptr = "cleanroom-gateway", .len = 17 },
+        .guest_host = { .ptr = "gateway.cleanroom.internal", .len = 26 },
+        .guest_port = 8170,
+        .unix_path = { .ptr = "/tmp/cleanroom-gateway.sock", .len = 27 },
+    },
+};
+create.network_enabled = 1;
+create.network_rules = rules;
+create.network_rule_count = 1;
+create.bound_unix_services = services;
+create.bound_unix_service_count = 1;
+
+if (spore_create_named_json(context, &create, &json) != SPORE_SUCCESS) return 1;
+spore_free_string(context, json);
+```
+
+Set `SPOREVM_RUNTIME_DIR`, cache roots, and similar process settings with
+`spore_context_set_env` before calling lifecycle functions.

@@ -9,11 +9,13 @@ const std = @import("std");
 const bundle = @import("bundle.zig");
 const contracts = @import("contracts.zig");
 const context_mod = @import("context.zig");
+const lifecycle = @import("lifecycle.zig");
 const local_paths = @import("local_paths.zig");
 const platform = @import("platform.zig");
 const resume_mod = @import("resume.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
+const spore_net_policy = @import("spore_net_policy.zig");
 
 /// Process context shared by product operations.
 ///
@@ -117,7 +119,13 @@ pub const Backend = run_mod.Backend;
 pub const MemoryConfig = run_mod.MemoryConfig;
 pub const CaptureTrigger = run_mod.CaptureTrigger;
 pub const NetworkMode = run_mod.NetworkMode;
-pub const NetworkPolicy = run_mod.NetworkPolicy;
+pub const NetworkConfig = run_mod.NetworkPolicy;
+pub const NetworkCapabilities = spore_net_policy.NetworkCapabilities;
+pub const NetworkDefault = spore_net_policy.NetworkDefault;
+pub const NetworkPolicy = spore_net_policy.NetworkPolicy;
+pub const NetworkRule = spore_net_policy.NetworkRule;
+pub const BoundService = spore_net_policy.BoundService;
+pub const BoundServiceTarget = spore_net_policy.BoundServiceTarget;
 pub const Rootfs = run_mod.Rootfs;
 pub const Disk = run_mod.Disk;
 pub const RunResult = run_mod.Result;
@@ -133,6 +141,18 @@ pub const ReadyEvent = run_mod.ReadyEvent;
 pub const OutputEvent = run_mod.OutputEvent;
 pub const ExitEvent = run_mod.ExitEvent;
 pub const FailureEvent = run_mod.FailureEvent;
+pub const CreateNamedOptions = lifecycle.CreateNamedOptions;
+pub const ExecNamedOptions = lifecycle.ExecNamedOptions;
+pub const NamedNetworkOptions = lifecycle.NamedNetworkOptions;
+pub const SnapshotNamedOptions = lifecycle.SnapshotNamedOptions;
+pub const SuspendNamedOptions = lifecycle.SuspendNamedOptions;
+pub const RemoveNamedOptions = lifecycle.RemoveNamedOptions;
+pub const ListNamedOptions = lifecycle.ListNamedOptions;
+pub const NamedLifecycleResult = lifecycle.NamedLifecycleResult;
+pub const ExecNamedResult = lifecycle.ExecNamedResult;
+pub const NamedListEntry = lifecycle.ListEntry;
+pub const NamedListMemory = lifecycle.ListMemory;
+pub const NamedListStats = lifecycle.ListStats;
 
 /// Low-level VM run options.
 ///
@@ -157,7 +177,7 @@ pub const RunOptions = struct {
     capture_trigger: CaptureTrigger = .exit,
     continue_after_capture: bool = false,
     network: NetworkMode = .disabled,
-    network_policy: NetworkPolicy = .{},
+    network_policy: NetworkConfig = .{},
     spore_executable: []const u8 = "spore",
     /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
@@ -184,7 +204,7 @@ pub const ManagedRunOptions = struct {
     capture_trigger: CaptureTrigger = .exit,
     continue_after_capture: bool = false,
     network: NetworkMode = .disabled,
-    network_policy: NetworkPolicy = .{},
+    network_policy: NetworkConfig = .{},
     spore_executable: []const u8 = "spore",
     /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
@@ -432,6 +452,11 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
     return run_mod.classifyFailure(err);
 }
 
+/// Return libspore's enforceable network capability facts.
+pub fn networkCapabilities() NetworkCapabilities {
+    return spore_net_policy.capabilities();
+}
+
 /// Boot a VM with explicit kernel/rootfs inputs and execute a guest command.
 ///
 /// This call does not stream guest output to process stdout/stderr. Use
@@ -569,6 +594,72 @@ pub fn resumeSpore(
         .spore_executable = options.spore_executable,
         .events = options.events,
     });
+}
+
+/// Create a long-lived named VM without exposing the private monitor socket.
+pub fn createNamed(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: CreateNamedOptions,
+) !NamedLifecycleResult {
+    return lifecycle.createNamed(init, allocator, options);
+}
+
+/// Execute a command inside a ready named VM.
+pub fn execNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: ExecNamedOptions,
+) !ExecNamedResult {
+    return lifecycle.execNamed(context, allocator, options);
+}
+
+/// Snapshot a named VM while it keeps running.
+pub fn snapshotNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: SnapshotNamedOptions,
+) !NamedLifecycleResult {
+    return lifecycle.snapshotNamed(context, allocator, options);
+}
+
+/// Suspend a named VM into a spore checkpoint and remove the live registry entry.
+pub fn suspendNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: SuspendNamedOptions,
+) !NamedLifecycleResult {
+    return lifecycle.suspendNamed(context, allocator, options);
+}
+
+/// Remove a named VM registry entry, stopping the monitor when it is ready.
+pub fn removeNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: RemoveNamedOptions,
+) !NamedLifecycleResult {
+    return lifecycle.removeNamed(context, allocator, options);
+}
+
+/// List named VMs in the process runtime root.
+pub fn listNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: ListNamedOptions,
+) ![]NamedListEntry {
+    return lifecycle.listNamed(context, allocator, options);
+}
+
+pub fn deinitNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycleResult) void {
+    lifecycle.deinitNamedLifecycleResult(allocator, result);
+}
+
+pub fn deinitExecNamedResult(allocator: std.mem.Allocator, result: ExecNamedResult) void {
+    lifecycle.deinitExecNamedResult(allocator, result);
+}
+
+pub fn deinitNamedList(allocator: std.mem.Allocator, entries: []NamedListEntry) void {
+    lifecycle.freeListEntries(allocator, entries);
 }
 
 /// Fork a parent spore into multiple child spores.
