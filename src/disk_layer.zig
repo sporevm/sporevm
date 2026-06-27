@@ -135,12 +135,18 @@ pub const LayeredCowDisk = struct {
             if (self.dirty[span.cluster_index]) {
                 try readExact(self.overlay_fd, target, absolute);
             } else {
-                const cluster_len = try self.clusterLen(span.cluster_index);
-                const cluster_buf = try self.allocator.alloc(u8, cluster_len);
-                defer self.allocator.free(cluster_buf);
-                try readClusterFromChain(self.allocator, self.dir, self.base, self.layers, @intCast(span.cluster_index), cluster_buf);
-                const cluster_offset: usize = @intCast(absolute % self.cluster_size);
-                @memcpy(target, cluster_buf[cluster_offset..][0..span.len]);
+                switch (self.layerSource(span.cluster_index)) {
+                    .base => try self.base.readAt(target, absolute),
+                    .zero => @memset(target, 0),
+                    .object => |digest| {
+                        const cluster_len = try self.clusterLen(span.cluster_index);
+                        const cluster_buf = try self.allocator.alloc(u8, cluster_len);
+                        defer self.allocator.free(cluster_buf);
+                        try readDiskObject(self.allocator, self.dir, digest, cluster_buf);
+                        const cluster_offset: usize = @intCast(absolute % self.cluster_size);
+                        @memcpy(target, cluster_buf[cluster_offset..][0..span.len]);
+                    },
+                }
             }
             cursor += span.len;
         }
@@ -180,6 +186,18 @@ pub const LayeredCowDisk = struct {
             .cluster_index = @intCast(cluster_index_u64),
             .len = len,
         };
+    }
+
+    fn layerSource(self: LayeredCowDisk, cluster_index: usize) LayerSource {
+        const logical_cluster: u64 = @intCast(cluster_index);
+        var layer_index = self.layers.len;
+        while (layer_index > 0) {
+            layer_index -= 1;
+            const layer = self.layers[layer_index];
+            if (spore.findDiskExtent(layer, logical_cluster)) |extent| return .{ .object = extent.digest };
+            if (spore.diskLayerHasZeroCluster(layer, logical_cluster)) return .zero;
+        }
+        return .base;
     }
 
     fn seedCluster(self: *LayeredCowDisk, cluster_index: usize) Error!void {
@@ -359,6 +377,12 @@ fn cloneLayer(allocator: std.mem.Allocator, layer: spore.DiskLayer) Error!spore.
 const Span = struct {
     cluster_index: usize,
     len: usize,
+};
+
+const LayerSource = union(enum) {
+    base,
+    zero,
+    object: []const u8,
 };
 
 pub fn sealCowDisk(allocator: std.mem.Allocator, dir: []const u8, disk: *cow_disk.CowDisk) Error!SealResult {
@@ -813,6 +837,9 @@ test "layered cow appends only the new active head" {
     var inherited: [4096]u8 = undefined;
     try second_head.readAt(&inherited, 0);
     try std.testing.expectEqualSlices(u8, &first_patch, &inherited);
+    var base_fallback: [4096]u8 = undefined;
+    try second_head.readAt(&base_fallback, 4096);
+    try std.testing.expectEqualSlices(u8, base_bytes[4096..8192], &base_fallback);
     const second_patch = [_]u8{0x33} ** 4096;
     try second_head.writeAt(&second_patch, 4096);
 
