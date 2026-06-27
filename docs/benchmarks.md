@@ -204,7 +204,8 @@ public charts can distinguish product movement from runner noise.
 When the underlying `spore run` logs expose phase timings, the suite summarizes
 them under `phase_metrics` and exports median phase values on each series point.
 Currently that includes rootfs open/verification, backend restore/pre-run,
-vsock connect, exec response, first output, and exec-probe timing slices.
+backend run/tail, vsock connect, exec response, first output, and exec-probe
+timing slices.
 
 Append to an existing published history with:
 

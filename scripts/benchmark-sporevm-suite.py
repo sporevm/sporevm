@@ -26,6 +26,7 @@ DEFAULT_COMMAND = "/usr/local/bin/node -v"
 DEFAULT_PLATFORM = "linux/arm64"
 RESTORE_METRICS_RE = re.compile(r"(?:kvm|hvf) restore metrics: (?P<fields>.+)")
 EXEC_PROBE_TIMING_RE = re.compile(r"run exec probe timing: (?P<fields>.+)")
+BACKEND_TIMING_RE = re.compile(r"run backend timing: (?P<fields>.+)")
 
 PHASE_METRIC_FIELDS = (
     "rootfs_open_verified_ms",
@@ -35,6 +36,8 @@ PHASE_METRIC_FIELDS = (
     "backend_state_ms",
     "backend_pre_run_ms",
     "backend_restore_ms",
+    "backend_run_ms",
+    "backend_tail_ms",
     "vsock_connect_ms",
     "exec_response_ms",
     "first_output_ms",
@@ -226,6 +229,10 @@ def parse_run_stderr_metrics(path: Path) -> dict[str, object]:
         metrics["first_output_ms"] = parse_int_field(fields.get("first_output_ms"))
         metrics["exec_guest_timing_ms"] = parse_int_field(fields.get("guest_timing_ms"))
         metrics["exec_response_ms"] = parse_int_field(fields.get("response_ms"))
+    for match in BACKEND_TIMING_RE.finditer(text):
+        fields = parse_key_value_tail(match.group("fields"))
+        metrics["backend_run_ms"] = parse_int_field(fields.get("elapsed_ms"))
+        metrics["backend_tail_ms"] = parse_int_field(fields.get("tail_ms"))
     return {key: value for key, value in metrics.items() if value is not None}
 
 
@@ -470,6 +477,7 @@ class BenchmarkRunner:
             stderr = prefix.with_suffix(".stderr")
             argv = [
                 str(self.spore_bin),
+                "--debug",
                 "run",
                 "--backend",
                 self.backend,
@@ -506,6 +514,7 @@ class BenchmarkRunner:
         stderr = self.log_dir / "base-capture.stderr"
         argv = [
             str(self.spore_bin),
+            "--debug",
             "run",
             "--backend",
             self.backend,
@@ -573,6 +582,7 @@ class BenchmarkRunner:
             stderr = prefix.with_suffix(".stderr")
             argv = [
                 str(self.spore_bin),
+                "--debug",
                 "run",
                 "--backend",
                 self.backend,
@@ -679,6 +689,7 @@ class BenchmarkRunner:
             run_stderr = run_prefix.with_suffix(".stderr")
             run_argv = [
                 str(self.spore_bin),
+                "--debug",
                 "run",
                 "--backend",
                 self.backend,
@@ -1005,6 +1016,7 @@ def self_test() -> None:
                 '{"event":"rootfs_open_verified","digest":"abc","size":4096,"elapsed_ms":7}',
                 "kvm restore metrics: mode=local_backing ram_mib=512 chunks=4 nonzero_chunks=2 manifest_ms=1 map_ram_ms=2 memory_ms=3 state_ms=4 pre_run_ms=10",
                 "run exec probe timing: attach_ms=1 connect_request_delivered_ms=2 connect_ms=3 request_delivered_ms=4 first_output_ms=5 guest_timing_ms=6 response_ms=8",
+                "run backend timing: elapsed_ms=12 stream_response_ms=8 tail_ms=4 cause=probe_complete",
             ]) + "\n",
             encoding="utf-8",
         )
@@ -1013,6 +1025,8 @@ def self_test() -> None:
         assert metrics["rootfs_bytes_verified"] == 4096
         assert metrics["backend_restore_mode"] == "local_backing"
         assert metrics["backend_restore_ms"] == 10
+        assert metrics["backend_run_ms"] == 12
+        assert metrics["backend_tail_ms"] == 4
         assert metrics["vsock_connect_ms"] == 3
         assert metrics["exec_response_ms"] == 8
         assert summarize_field([metrics], "exec_response_ms")["median"] == 8.0

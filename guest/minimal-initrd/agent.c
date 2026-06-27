@@ -1396,6 +1396,12 @@ int main(void) {
     if (!use_rootfs || rootfs_ready) {
       poll_generation(&generation, generation_root);
     }
+    if (session.file_stdio && !session.exited) {
+      pump_session_file(&session, &client, 1);
+      pump_session_file(&session, &client, 0);
+      poll_session_exit(&session, &client);
+      maybe_send_session_exit(&session, &client);
+    }
 
     struct pollfd fds[5];
     int roles[5];
@@ -1427,7 +1433,8 @@ int main(void) {
     fds[nfds].revents = 0;
     roles[nfds++] = 4;
 
-    int pr = poll(fds, nfds, 100);
+    int poll_timeout_ms = session.file_stdio && session.started && !session.exited ? 10 : 100;
+    int pr = poll(fds, nfds, poll_timeout_ms);
     if (pr < 0 && errno != EINTR) continue;
     if (pr > 0) {
       for (nfds_t i = 0; i < nfds; i++) {

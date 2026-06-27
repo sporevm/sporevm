@@ -2178,6 +2178,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         },
     );
 
+    const backend_run_start = monotonicMs();
     const cause = (switch (backend) {
         .auto => unreachable,
         .hvf => blk: {
@@ -2240,6 +2241,17 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         }
         return @errorCast(err);
     };
+    const backend_run_ms = monotonicMs() -| backend_run_start;
+    const response_ms = stream.response_ms orelse stream.elapsedMs();
+    std.log.debug(
+        "run backend timing: elapsed_ms={d} stream_response_ms={d} tail_ms={d} cause={s}",
+        .{
+            backend_run_ms,
+            response_ms,
+            if (backend_run_ms >= response_ms) backend_run_ms - response_ms else 0,
+            @tagName(cause),
+        },
+    );
     if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
     const signal_capture_observed = capture_plan.isSignalCapture() and capture_request.isCompleted();
     const result = try switch (cause) {
