@@ -300,10 +300,10 @@ The generated Zig API docs are installed under
 
 ## C ABI
 
-The C ABI is declared in [`include/spore.h`](../include/spore.h). The first
-slice exposes context management, build info, context-local environment
+The C ABI is declared in [`include/spore.h`](../include/spore.h). The current
+surface exposes context management, build info, context-local environment
 overrides, context-local last errors, owned string cleanup, host-info JSON,
-inspect-bundle JSON, and named lifecycle JSON.
+inspect-bundle JSON, pull JSON, and named lifecycle JSON.
 
 Release builds publish separate `libspore_Linux_arm64` and
 `libspore_Darwin_arm64` archives so CLI-only installs do not carry development
@@ -364,6 +364,21 @@ their matching helper:
 SporeInspectBundleOptions options;
 spore_inspect_bundle_options_init(&options);
 options.source = (SporeString){ .ptr = "file:///tmp/base.bundle", .len = 23 };
+```
+
+`spore_pull_json` follows the same owned-string contract and returns the
+`spore.pull.result.v1` schema used by `spore --json pull`:
+
+```c
+SporePullOptions pull;
+spore_pull_options_init(&pull);
+pull.source = (SporeString){ .ptr = "file:///tmp/base.bundle", .len = 23 };
+pull.out_dir = (SporeString){ .ptr = "/tmp/base.spore", .len = 15 };
+pull.child_id = (SporeString){ .ptr = "0", .len = 1 };
+pull.bundle_cache.kind = SPORE_CACHE_ROOT_NONE;
+
+if (spore_pull_json(context, &pull, &json) != SPORE_SUCCESS) return 1;
+spore_free_string(context, json);
 ```
 
 Named lifecycle functions follow the same pattern:
@@ -438,15 +453,25 @@ if err != nil {
     return err
 }
 
+pulled, err := client.Pull(ctx, spore.PullOptions{
+    Source: "file:///tmp/base.bundle",
+    OutDir: "/tmp/base.spore",
+    ChildID: "0",
+})
+if err != nil {
+    return err
+}
+
 _ = info
 _ = bundle
+_ = pulled
 ```
 
-The initial surface covers build info, context lifetime, host-info, and
-inspect-bundle. It decodes the same JSON contracts as the CLI and C ABI, and it
-requires C ABI version 6 or newer. Go context cancellation is checked before
-entering short C calls; long-running runtime cancellation is not exposed until
-the Zig product API and C ABI provide it.
+The surface covers build info, context lifetime, host-info, inspect-bundle, and
+pull. It decodes the same JSON contracts as the CLI and C ABI, and it requires
+C ABI version 7 or newer. Go context cancellation is checked before entering C
+calls; long-running runtime cancellation is not exposed until the Zig product
+API and C ABI provide it.
 
 From a source checkout, build `libspore` first and point Go at the generated
 pkg-config and dynamic library paths:

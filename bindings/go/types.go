@@ -54,6 +54,22 @@ type ChildRange struct {
 	End   uint32
 }
 
+// CacheRootKind selects how libspore resolves a cache root.
+type CacheRootKind uint32
+
+const (
+	CacheRootEnv CacheRootKind = iota
+	CacheRootNone
+	CacheRootPath
+)
+
+// CacheRoot selects a SporeVM cache root. The zero value uses environment
+// defaults, matching the CLI.
+type CacheRoot struct {
+	Kind CacheRootKind
+	Path string
+}
+
 // InspectBundleResult is the decoded spore.bundle.inspect.v1 contract.
 type InspectBundleResult struct {
 	Schema         string                 `json:"schema"`
@@ -71,9 +87,68 @@ type InspectBundleResult struct {
 	Rootfs         RootfsBundleSummary    `json:"rootfs"`
 }
 
+// PullOptions selects a bundle child to materialize into a local spore directory.
+type PullOptions struct {
+	Source                  string
+	OutDir                  string
+	RootfsCache             CacheRoot
+	BundleCache             CacheRoot
+	ChildID                 string
+	AllowMetadataOnlyRootfs bool
+	AWSRegion               string
+	AWSExecutable           string
+}
+
+// PullResult is the decoded spore.pull.result.v1 contract.
+type PullResult struct {
+	Schema          string                       `json:"schema"`
+	SchemaVersion   uint32                       `json:"schema_version"`
+	Source          string                       `json:"source"`
+	BundleDir       string                       `json:"bundle_dir"`
+	OutDir          string                       `json:"out_dir"`
+	BundleDigest    DigestRef                    `json:"bundle_digest"`
+	Materialization ChunkMaterializationSummary  `json:"materialization"`
+	Rootfs          RootfsMaterializationSummary `json:"rootfs"`
+	Remote          RemoteBundleCache            `json:"remote"`
+	Children        BundleChildrenSummary        `json:"children"`
+}
+
 type DigestRef struct {
 	Algorithm string `json:"algorithm"`
 	Hex       string `json:"hex"`
+}
+
+type CacheState struct {
+	HitCount     uint64 `json:"hit_count"`
+	MissCount    uint64 `json:"miss_count"`
+	BytesFetched uint64 `json:"bytes_fetched"`
+	BytesReused  uint64 `json:"bytes_reused"`
+}
+
+type ChunkMaterializationSummary struct {
+	ChunkCount             uint64     `json:"chunk_count"`
+	MaterializedChunkCount uint64     `json:"materialized_chunk_count"`
+	PayloadBytes           uint64     `json:"payload_bytes"`
+	LinkedChunkCount       uint64     `json:"linked_chunk_count"`
+	CopiedChunkCount       uint64     `json:"copied_chunk_count"`
+	Cache                  CacheState `json:"cache"`
+}
+
+type RootfsMaterializationSummary struct {
+	ArtifactCount uint64     `json:"artifact_count"`
+	PayloadBytes  uint64     `json:"payload_bytes"`
+	Cache         CacheState `json:"cache"`
+}
+
+type RemoteBundleCache struct {
+	CacheHit        bool   `json:"cache_hit"`
+	OriginBytesRead uint64 `json:"origin_bytes_read"`
+	PeerBytesRead   uint64 `json:"peer_bytes_read"`
+}
+
+type BundleChildrenSummary struct {
+	Count         uint64  `json:"count"`
+	SelectedChild *string `json:"selected_child"`
 }
 
 type ChunkpackSummary struct {

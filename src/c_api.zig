@@ -11,8 +11,9 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 6;
+const c_abi_version: u32 = 7;
 const inspect_bundle_options_version: u32 = 1;
+const pull_options_version: u32 = 1;
 const system_df_options_version: u32 = 1;
 const system_prune_options_version: u32 = 1;
 const create_named_options_version: u32 = 3;
@@ -54,6 +55,28 @@ const SporeInspectBundleOptions = extern struct {
     has_child_range: u8,
     child_range_start: u32,
     child_range_end: u32,
+};
+
+const cache_root_env: u32 = 0;
+const cache_root_none: u32 = 1;
+const cache_root_path: u32 = 2;
+
+const SporeCacheRoot = extern struct {
+    kind: u32,
+    path: SporeString,
+};
+
+const SporePullOptions = extern struct {
+    size: u32,
+    version: u32,
+    source: SporeString,
+    out_dir: SporeString,
+    rootfs_cache: SporeCacheRoot,
+    bundle_cache: SporeCacheRoot,
+    child_id: SporeString,
+    allow_metadata_only_rootfs: u8,
+    aws_region: SporeString,
+    aws_executable: SporeString,
 };
 
 const SporeSystemDfOptions = extern struct {
@@ -188,6 +211,22 @@ pub export fn spore_inspect_bundle_options_init(options: ?*SporeInspectBundleOpt
         .has_child_range = 0,
         .child_range_start = 0,
         .child_range_end = 0,
+    };
+}
+
+pub export fn spore_pull_options_init(options: ?*SporePullOptions) void {
+    const out = options orelse return;
+    out.* = .{
+        .size = @sizeOf(SporePullOptions),
+        .version = pull_options_version,
+        .source = .{},
+        .out_dir = .{},
+        .rootfs_cache = .{ .kind = cache_root_env, .path = .{} },
+        .bundle_cache = .{ .kind = cache_root_env, .path = .{} },
+        .child_id = .{},
+        .allow_metadata_only_rootfs = 0,
+        .aws_region = .{},
+        .aws_executable = .{},
     };
 }
 
@@ -425,6 +464,41 @@ pub export fn spore_inspect_bundle_json(
         .child_range = child_range,
     }) catch |err| return fail(ctx, err);
     defer libspore.deinitInspectBundleResult(ctx.allocator, result);
+
+    out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_pull_json(
+    context: ?*SporeContextImpl,
+    options: ?*const SporePullOptions,
+    out_json: ?*SporeOwnedString,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    const out = out_json orelse return fail(ctx, error.InvalidValue);
+    out.* = .{};
+    ctx.clearLastError();
+
+    if (opts.version != pull_options_version or opts.size < @sizeOf(SporePullOptions)) {
+        return fail(ctx, error.InvalidValue);
+    }
+
+    const source = toSlice(opts.source) catch |err| return fail(ctx, err);
+    const out_dir = toSlice(opts.out_dir) catch |err| return fail(ctx, err);
+    if (source.len == 0 or out_dir.len == 0) return fail(ctx, error.InvalidValue);
+
+    const result = libspore.pull(ctx.productContext(), ctx.allocator, .{
+        .source = source,
+        .out_dir = out_dir,
+        .rootfs_cache = parseCacheRoot(opts.rootfs_cache) catch |err| return fail(ctx, err),
+        .bundle_cache = parseCacheRoot(opts.bundle_cache) catch |err| return fail(ctx, err),
+        .child_id = optionalSlice(opts.child_id) catch |err| return fail(ctx, err),
+        .allow_metadata_only_rootfs = opts.allow_metadata_only_rootfs != 0,
+        .aws_region = optionalSlice(opts.aws_region) catch |err| return fail(ctx, err),
+        .aws_executable = (optionalSlice(opts.aws_executable) catch |err| return fail(ctx, err)) orelse "aws",
+    }) catch |err| return fail(ctx, err);
+    defer libspore.deinitPullResult(ctx.allocator, result);
 
     out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
     return result_success;
@@ -727,6 +801,19 @@ fn cacheRootFromPath(path: ?[]const u8) libspore.CacheRoot {
     return if (path) |value| .{ .path = value } else .env;
 }
 
+fn parseCacheRoot(value: SporeCacheRoot) !libspore.CacheRoot {
+    return switch (value.kind) {
+        cache_root_env => .env,
+        cache_root_none => .none,
+        cache_root_path => {
+            const path = try toSlice(value.path);
+            if (path.len == 0) return error.InvalidValue;
+            return .{ .path = path };
+        },
+        else => error.InvalidValue,
+    };
+}
+
 fn cInit(ctx: *SporeContextImpl, arena: *std.heap.ArenaAllocator) std.process.Init {
     return .{
         .minimal = undefined,
@@ -830,6 +917,14 @@ test "inspect bundle options initialize size and version" {
     try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeInspectBundleOptions))), options.size);
     try std.testing.expectEqual(inspect_bundle_options_version, options.version);
 
+    var pull_options: SporePullOptions = undefined;
+    spore_pull_options_init(&pull_options);
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporePullOptions))), pull_options.size);
+    try std.testing.expectEqual(pull_options_version, pull_options.version);
+    try std.testing.expectEqual(cache_root_env, pull_options.rootfs_cache.kind);
+    try std.testing.expectEqual(cache_root_env, pull_options.bundle_cache.kind);
+    try std.testing.expectEqual(@as(u8, 0), pull_options.allow_metadata_only_rootfs);
+
     var df_options: SporeSystemDfOptions = undefined;
     spore_system_df_options_init(&df_options);
     try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeSystemDfOptions))), df_options.size);
@@ -885,6 +980,18 @@ test "C ABI exposes network capabilities JSON" {
     try std.testing.expectEqual(result_success, spore_network_capabilities_json(context, &json));
     defer spore_free_string(context, json);
     try std.testing.expect(std.mem.indexOf(u8, json.ptr.?[0..json.len], "\"exact_host_port\": true") != null);
+}
+
+test "pull rejects missing required options at ABI boundary" {
+    var context: ?*SporeContextImpl = null;
+    try std.testing.expectEqual(result_success, spore_context_new(&context));
+    defer spore_context_free(context);
+
+    var options: SporePullOptions = undefined;
+    spore_pull_options_init(&options);
+    var json: SporeOwnedString = .{};
+    try std.testing.expectEqual(result_invalid_value, spore_pull_json(context, &options, &json));
+    try std.testing.expectEqual(@as(?[*]u8, null), json.ptr);
 }
 
 test "C ABI can list named VMs from context runtime env" {

@@ -16,7 +16,7 @@ import (
 	"unsafe"
 )
 
-const minABIVersion uint32 = 6
+const minABIVersion uint32 = 7
 
 var ErrClosed = errors.New("spore client closed")
 
@@ -147,6 +147,51 @@ func (c *Client) InspectBundle(ctx context.Context, options InspectBundleOptions
 	return inspected, nil
 }
 
+// Pull materializes a bundle into a local spore directory.
+func (c *Client) Pull(ctx context.Context, options PullOptions) (PullResult, error) {
+	if err := c.ready(ctx); err != nil {
+		return PullResult{}, err
+	}
+	source, freeSource := cString(options.Source)
+	defer freeSource()
+	outDir, freeOutDir := cString(options.OutDir)
+	defer freeOutDir()
+	childID, freeChildID := cString(options.ChildID)
+	defer freeChildID()
+	awsRegion, freeAWSRegion := cString(options.AWSRegion)
+	defer freeAWSRegion()
+	awsExecutable, freeAWSExecutable := cString(options.AWSExecutable)
+	defer freeAWSExecutable()
+	rootfsCache, freeRootfsCache := cCacheRoot(options.RootfsCache)
+	defer freeRootfsCache()
+	bundleCache, freeBundleCache := cCacheRoot(options.BundleCache)
+	defer freeBundleCache()
+
+	var opts C.SporePullOptions
+	C.spore_pull_options_init(&opts)
+	opts.source = source
+	opts.out_dir = outDir
+	opts.rootfs_cache = rootfsCache
+	opts.bundle_cache = bundleCache
+	opts.child_id = childID
+	if options.AllowMetadataOnlyRootfs {
+		opts.allow_metadata_only_rootfs = 1
+	}
+	opts.aws_region = awsRegion
+	opts.aws_executable = awsExecutable
+
+	var out C.SporeOwnedString
+	if result := Result(C.spore_pull_json(c.ctx, &opts, &out)); result != Success {
+		return PullResult{}, c.callError(result)
+	}
+	defer C.spore_free_string(c.ctx, out)
+	var pulled PullResult
+	if err := json.Unmarshal(goBytes(out), &pulled); err != nil {
+		return PullResult{}, fmt.Errorf("decode pull result: %w", err)
+	}
+	return pulled, nil
+}
+
 func (c *Client) ready(ctx context.Context) error {
 	if c == nil || c.ctx == nil {
 		return ErrClosed
@@ -183,4 +228,12 @@ func cString(s string) (C.SporeString, func()) {
 	return C.SporeString{ptr: ptr, len: C.size_t(len(s))}, func() {
 		C.free(unsafe.Pointer(ptr))
 	}
+}
+
+func cCacheRoot(root CacheRoot) (C.SporeCacheRoot, func()) {
+	path, freePath := cString(root.Path)
+	return C.SporeCacheRoot{
+		kind: C.uint32_t(root.Kind),
+		path: path,
+	}, freePath
 }
