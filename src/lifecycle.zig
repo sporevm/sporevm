@@ -665,23 +665,30 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     }
     const parsed = parseExecArgs(args);
     const allocator = init.arena.allocator();
-    const paths = try cliPaths(init, allocator, "exec", parsed.name);
-    const state = try classifyVmState(allocator, init.io, paths, pidAlive);
-    if (state != .ready) {
-        std.debug.print("spore exec: VM is not ready: {s} ({s})\n", .{ parsed.name, state.name() });
-        std.process.exit(2);
-    }
-    var ready = lifecycleReadyOrExit(allocator, init.io, "exec", paths);
-    defer ready.deinit();
-    const response = sendExecRequest(allocator, init.io, ready.value.control_socket_path, parsed.command) catch |err| {
-        switch (err) {
-            error.MonitorUnavailable => std.debug.print("spore exec: monitor is unavailable for VM: {s}\n", .{parsed.name}),
-            else => std.debug.print("spore exec: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
-        }
-        std.process.exit(1);
+    const result = execNamed(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, allocator, .{
+        .name = parsed.name,
+        .command = parsed.command,
+    }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => cliRuntimePathExit("exec", err),
+        error.NamedVmNotReady => {
+            std.debug.print("spore exec: VM is not ready: {s}\n", .{parsed.name});
+            std.process.exit(2);
+        },
+        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+            switch (err) {
+                error.MonitorUnavailable => std.debug.print("spore exec: monitor is unavailable for VM: {s}\n", .{parsed.name}),
+                else => std.debug.print("spore exec: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
+            }
+            std.process.exit(1);
+        },
+        else => |e| return e,
     };
-    const code = try handleExecResponse(init, allocator, stdout, response);
-    if (code != 0) std.process.exit(code);
+    defer deinitExecNamedResult(allocator, result);
+    try writeExecNamedResult(stdout, result);
+    if (result.exit_code != 0) std.process.exit(result.exit_code);
 }
 
 pub fn rmCli(
@@ -1996,32 +2003,12 @@ const ControlResponse = struct {
     message: ?[]const u8 = null,
 };
 
-fn handleExecResponse(init: std.process.Init, allocator: std.mem.Allocator, stdout: *Io.Writer, response: []const u8) !u8 {
-    _ = init;
-    var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-    if (std.mem.eql(u8, parsed.value.type, "exec_result")) {
-        const exit_code = parsed.value.exit_code orelse return error.BadMonitorResponse;
-        if (exit_code < 0 or exit_code > 255) return error.BadMonitorResponse;
-
-        const stdout_bytes = try decodeControlOutput(allocator, parsed.value.stdout_b64 orelse return error.BadMonitorResponse);
-        defer allocator.free(stdout_bytes);
-        const stderr_bytes = try decodeControlOutput(allocator, parsed.value.stderr_b64 orelse return error.BadMonitorResponse);
-        defer allocator.free(stderr_bytes);
-
-        try stdout.writeAll(stdout_bytes);
-        try stdout.flush();
-        try writeRawStderr(stderr_bytes);
-        if (parsed.value.stdout_truncated) try writeRawStderr("spore exec: stdout truncated after 16384 bytes\n");
-        if (parsed.value.stderr_truncated) try writeRawStderr("spore exec: stderr truncated after 16384 bytes\n");
-        return @intCast(exit_code);
-    }
-    const message = parsed.value.message orelse "monitor request failed";
-    std.debug.print("spore exec: {s}\n", .{message});
-    return 1;
+fn writeExecNamedResult(stdout: *Io.Writer, result: ExecNamedResult) !void {
+    try stdout.writeAll(result.stdout);
+    try stdout.flush();
+    try writeRawStderr(result.stderr);
+    if (result.stdout_truncated) try writeRawStderr("spore exec: stdout truncated after 16384 bytes\n");
+    if (result.stderr_truncated) try writeRawStderr("spore exec: stderr truncated after 16384 bytes\n");
 }
 
 fn parseExecNamedResponse(
