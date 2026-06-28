@@ -316,6 +316,11 @@ pub const SnapshotAction = struct {
     continue_after: bool = false,
 };
 
+pub const ControlStats = struct {
+    chunks_nonzero: ?u64 = null,
+    dirty_chunks_pending: ?u64 = null,
+};
+
 pub const Wake = struct {
     context: *anyopaque,
     wakeFn: *const fn (context: *anyopaque) void,
@@ -330,6 +335,7 @@ pub const Control = struct {
     pollFn: *const fn (context: *anyopaque, dev: *Vsock) anyerror!ControlAction,
     setWakeFn: *const fn (context: *anyopaque, wake: Wake) void,
     completeSnapshotFn: *const fn (context: *anyopaque, dir: []const u8) anyerror!void,
+    reportStatsFn: *const fn (context: *anyopaque, stats: ControlStats) void,
 
     pub fn poll(self: Control, dev: *Vsock) !ControlAction {
         return self.pollFn(self.context, dev);
@@ -341,6 +347,10 @@ pub const Control = struct {
 
     pub fn completeSnapshot(self: Control, dir: []const u8) !void {
         try self.completeSnapshotFn(self.context, dir);
+    }
+
+    pub fn reportStats(self: Control, stats: ControlStats) void {
+        self.reportStatsFn(self.context, stats);
     }
 };
 

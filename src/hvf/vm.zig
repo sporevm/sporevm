@@ -551,6 +551,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             continue;
         }
         if (config.exec_control) |control| {
+            control.reportStats(monitorStatsFromDirtyTracker(if (dirty_tracker) |*tracker| tracker else null));
             switch (try control.poll(&vsock_dev)) {
                 .keep_running => {},
                 .stop => return .monitor_stopped,
@@ -1061,6 +1062,14 @@ const DirtyTracker = struct {
         );
     }
 };
+
+fn monitorStatsFromDirtyTracker(tracker: ?*DirtyTracker) vsock.ControlStats {
+    const active = tracker orelse return .{};
+    return .{
+        .chunks_nonzero = @intCast(active.sealer.nonzeroChunkCount()),
+        .dirty_chunks_pending = @intCast(active.sealer.dirtyChunksPending()),
+    };
+}
 
 fn materializeAllTransportQueues(pager: *lazy_ram.Pager, transports: []mmio.Transport) !void {
     for (transports) |*transport| {

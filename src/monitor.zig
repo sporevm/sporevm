@@ -17,6 +17,7 @@ const max_control_request = 4096;
 const max_control_response = 128 * 1024;
 const max_exec_output = 16 * 1024;
 const max_suspend_path = 4096;
+const stats_write_interval_ms = 250;
 const default_backend = "auto";
 
 const monitor_usage =
@@ -155,7 +156,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     });
     try lifecycle.writePid(allocator, init.io, paths, currentPid());
 
-    var server = try ExecServer.init(allocator, init.io, paths.control_socket_path, opts.guest_port, opts.timeout_ms);
+    var server = try ExecServer.init(allocator, init.io, paths.control_socket_path, paths.monitor_stats_path, opts.guest_port, opts.timeout_ms);
     if (gateway_active) server.network_events = &gateway;
     const thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
     const metadata_ms = lifecycle.monotonicMs();
@@ -216,6 +217,7 @@ const ExecServer = struct {
     allocator: std.mem.Allocator,
     io: Io,
     socket_path: []const u8,
+    stats_path: []const u8,
     guest_port: u32,
     timeout_ms: u64,
     server: net.Server,
@@ -240,9 +242,12 @@ const ExecServer = struct {
     next_session_id: u64 = 1,
     next_host_port: u32 = 49152,
     wake: ?vsock.Wake = null,
+    stats_written: bool = false,
+    stats_written_value: vsock.ControlStats = .{},
+    stats_write_ms: u64 = 0,
     closed: std.atomic.Value(bool) = .init(false),
 
-    fn init(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, guest_port: u32, timeout_ms: u64) !ExecServer {
+    fn init(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, stats_path: []const u8, guest_port: u32, timeout_ms: u64) !ExecServer {
         Io.Dir.cwd().deleteFile(io, socket_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => |e| return e,
@@ -252,6 +257,7 @@ const ExecServer = struct {
             .allocator = allocator,
             .io = io,
             .socket_path = socket_path,
+            .stats_path = stats_path,
             .guest_port = guest_port,
             .timeout_ms = timeout_ms,
             .server = try address.listen(io, .{ .kernel_backlog = 8 }),
@@ -274,6 +280,7 @@ const ExecServer = struct {
             .pollFn = pollThunk,
             .setWakeFn = setWakeThunk,
             .completeSnapshotFn = completeSnapshotThunk,
+            .reportStatsFn = reportStatsThunk,
         };
     }
 
@@ -465,6 +472,21 @@ const ExecServer = struct {
         }
     }
 
+    fn reportStats(self: *ExecServer, stats: vsock.ControlStats) void {
+        if (self.stats_written and std.meta.eql(stats, self.stats_written_value)) return;
+        const now = lifecycle.monotonicMs();
+        const first_write = self.stats_write_ms == 0;
+        const clean_tail = (stats.dirty_chunks_pending orelse 0) == 0;
+        if (!first_write and !clean_tail and now -| self.stats_write_ms < stats_write_interval_ms) return;
+        lifecycle.writeMonitorStatsPath(self.allocator, self.io, self.stats_path, .{
+            .chunks_nonzero = stats.chunks_nonzero,
+            .dirty_chunks_pending = stats.dirty_chunks_pending,
+        }) catch return;
+        self.stats_written = true;
+        self.stats_written_value = stats;
+        self.stats_write_ms = now;
+    }
+
     fn requestStop(self: *ExecServer) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -565,6 +587,11 @@ const ExecServer = struct {
     fn completeSnapshotThunk(context: *anyopaque, dir: []const u8) !void {
         const self: *ExecServer = @ptrCast(@alignCast(context));
         try self.completeSnapshot(dir);
+    }
+
+    fn reportStatsThunk(context: *anyopaque, stats: vsock.ControlStats) void {
+        const self: *ExecServer = @ptrCast(@alignCast(context));
+        self.reportStats(stats);
     }
 
     fn captureOutputThunk(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {

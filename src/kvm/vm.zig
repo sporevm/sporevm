@@ -470,6 +470,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 try kvm.completePendingExit(vcpu_fd, run_bytes);
                 pending_kvm_completion = false;
             }
+            control.reportStats(monitorStatsFromDirtyTracker(if (dirty_tracker) |*tracker| tracker else null));
             switch (try control.poll(&vsock_dev)) {
                 .keep_running => {},
                 .stop => return .monitor_stopped,
@@ -1056,6 +1057,14 @@ const DirtyTracker = struct {
         @memset(self.bitmap, 0);
     }
 };
+
+fn monitorStatsFromDirtyTracker(tracker: ?*DirtyTracker) vsock.ControlStats {
+    const active = tracker orelse return .{};
+    return .{
+        .chunks_nonzero = @intCast(active.sealer.nonzeroChunkCount()),
+        .dirty_chunks_pending = @intCast(active.sealer.dirtyChunksPending()),
+    };
+}
 
 fn takeSnapshot(
     allocator: std.mem.Allocator,

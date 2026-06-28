@@ -40,6 +40,7 @@ $SPOREVM_RUNTIME_DIR/vms/<name>/
   ready.json
   create-timing.json
   monitor-timing.json
+  monitor-stats.json
   console.log
 ```
 
@@ -77,7 +78,9 @@ Named live fork is currently diskless-only.
 
 The monitor protocol is local-only and protected by private runtime-directory
 permissions. There is no TCP control socket and no central `spore daemon`.
-Unknown monitor request types fail closed.
+Unknown monitor request types fail closed. `spore ls` reads monitor-published
+metadata such as `monitor-stats.json`; unavailable stats render as unknown
+instead of forcing an expensive VM memory scan.
 
 Monitor processes deny child process execution through an embedded macOS
 sandbox profile or Linux seccomp filter after optional startup helpers are
