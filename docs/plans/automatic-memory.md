@@ -284,6 +284,9 @@ Progress:
 - First visibility slice: lifecycle list output reads `memory.policy` and
   `memory.bytes` from each VM's `spec.json` and emits nullable stat fields
   instead of trying to derive them by walking RAM.
+- The human `spore ls` table now renders populated nullable stats when a cheap
+  runtime source supplies them. Resident, backing, chunk, and dirty collection
+  sources are still pending.
 
 ### Slice 4: Measurement Gate for Raising Defaults Further
 

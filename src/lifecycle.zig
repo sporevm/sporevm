@@ -1237,7 +1237,15 @@ fn writeListEntries(writer: *Io.Writer, entries: []const ListEntry) !void {
         } else {
             try writer.writeByte('?');
         }
-        try writer.writeAll("\t?\t?\t?\t?\n");
+        try writer.writeByte('\t');
+        try writeOptionalBytesHuman(writer, entry.stats.resident_bytes);
+        try writer.writeByte('\t');
+        try writeBackingStats(writer, entry.stats);
+        try writer.writeByte('\t');
+        try writeChunkStats(writer, entry.stats);
+        try writer.writeByte('\t');
+        try writeOptionalCount(writer, entry.stats.dirty_chunks_pending);
+        try writer.writeByte('\n');
     }
 }
 
@@ -1463,6 +1471,42 @@ fn writeBytesHuman(writer: *Io.Writer, bytes: u64) !void {
         try writer.print("{d}MiB", .{bytes / mib});
     } else {
         try writer.print("{d}B", .{bytes});
+    }
+}
+
+fn writeOptionalBytesHuman(writer: *Io.Writer, value: ?u64) !void {
+    if (value) |bytes| {
+        try writeBytesHuman(writer, bytes);
+    } else {
+        try writer.writeByte('?');
+    }
+}
+
+fn writeBackingStats(writer: *Io.Writer, stats: ListStats) !void {
+    if (stats.backing_logical_bytes == null and stats.backing_allocated_bytes == null) {
+        try writer.writeByte('?');
+        return;
+    }
+    try writeOptionalBytesHuman(writer, stats.backing_allocated_bytes);
+    try writer.writeByte('/');
+    try writeOptionalBytesHuman(writer, stats.backing_logical_bytes);
+}
+
+fn writeChunkStats(writer: *Io.Writer, stats: ListStats) !void {
+    if (stats.chunks_total == null and stats.chunks_nonzero == null) {
+        try writer.writeByte('?');
+        return;
+    }
+    try writeOptionalCount(writer, stats.chunks_nonzero);
+    try writer.writeByte('/');
+    try writeOptionalCount(writer, stats.chunks_total);
+}
+
+fn writeOptionalCount(writer: *Io.Writer, value: ?u64) !void {
+    if (value) |count| {
+        try writer.print("{d}", .{count});
+    } else {
+        try writer.writeByte('?');
     }
 }
 
@@ -2887,12 +2931,25 @@ test "lifecycle list entries render human table" {
     defer out.deinit();
 
     try writeListEntries(&out.writer, &.{
-        .{ .name = "a-ready", .state = "ready", .pid = 42, .memory = listMemoryFromConfig(.{}) },
+        .{
+            .name = "a-ready",
+            .state = "ready",
+            .pid = 42,
+            .memory = listMemoryFromConfig(.{}),
+            .stats = .{
+                .resident_bytes = 184 * 1024 * 1024,
+                .backing_logical_bytes = memory_config.auto_bytes,
+                .backing_allocated_bytes = 34 * 1024 * 1024,
+                .chunks_total = 8192,
+                .chunks_nonzero = 17,
+                .dirty_chunks_pending = 2,
+            },
+        },
         .{ .name = "b-stale", .state = "stale", .pid = null, .memory = listMemoryFromConfig(.{ .policy = .explicit, .bytes = 512 * 1024 * 1024 }) },
     });
     try std.testing.expectEqualStrings(
         "NAME\tSTATE\tPID\tMEMORY\tRESIDENT\tBACKING\tCHUNKS\tDIRTY\n" ++
-            "a-ready\tready\t42\tauto/16GiB\t?\t?\t?\t?\n" ++
+            "a-ready\tready\t42\tauto/16GiB\t184MiB\t34MiB/16GiB\t17/8192\t2\n" ++
             "b-stale\tstale\t-\t512MiB\t?\t?\t?\t?\n",
         out.written(),
     );
