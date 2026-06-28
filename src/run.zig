@@ -922,7 +922,7 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
         var opts = parsed.shared.completeWithAssets(parsed.backend, "", null, null, rootfs, parsed.command, true);
         opts.disk = disk;
         opts.resume_dir = spore_dir;
-        opts.memory = runMemoryFromManifest(manifest.value) catch {
+        opts.memory = memory_config.fromManifestBytes(manifest.value.platform.ram_size) catch {
             failRunSetup("spore run: --from manifest RAM size is not positive and page-aligned: {d}", .{manifest.value.platform.ram_size});
         };
         opts.capture_path = parsed.capture_path;
@@ -1020,10 +1020,6 @@ pub fn manifestNetworkFromOptions(allocator: std.mem.Allocator, network: Network
             .bound_services = policy.bound_service_count != 0,
         },
     };
-}
-
-pub fn runMemoryFromManifest(manifest: spore.Manifest) !memory_config.Config {
-    return memory_config.fromManifestBytes(manifest.platform.ram_size);
 }
 
 pub fn resumeRootfsForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Rootfs {
