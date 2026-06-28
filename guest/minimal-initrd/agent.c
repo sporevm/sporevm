@@ -88,7 +88,6 @@ struct replay_buffer {
 struct session {
   int started;
   int exited;
-  int memory_pressure_sent;
   int memory_pressure_fd;
   char memory_cgroup_path[128];
   char session_id[64];
@@ -1393,7 +1392,6 @@ static void maybe_send_memory_pressure(struct session *session, struct client *c
     close_client(client);
     return;
   }
-  session->memory_pressure_sent++;
   if (rearm_memory_pressure_limit(session) != 0) {
     dprintf(2, "memory pressure setup failed: rearm high limit errno=%d\n", errno);
     close(session->memory_pressure_fd);
