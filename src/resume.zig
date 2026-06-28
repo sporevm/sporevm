@@ -13,6 +13,7 @@ else
 const net_gateway = @import("net_gateway.zig");
 const generation = @import("generation.zig");
 const run_mod = @import("run.zig");
+const runtime_disk = @import("runtime_disk.zig");
 const spore = @import("spore.zig");
 const virtio_blk = @import("virtio/blk.zig");
 const virtio_net = @import("virtio/net.zig");
@@ -131,13 +132,12 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     errdefer run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
 
     validateResumeDiskManifest(parsed.value);
-    var runtime_disk = try run_mod.openRuntimeDisk(context, allocator, .{
+    var runtime_disk_state = try runtime_disk.open(context, allocator, .{
         .rootfs = parsed.value.rootfs,
         .disk = parsed.value.disk,
         .spore_dir = opts.spore_dir,
-        .command_name = "resume",
     });
-    defer runtime_disk.deinit();
+    defer runtime_disk_state.deinit();
     const generation_params = if (opts.generation_path) |path|
         loadGenerationParams(context.io, allocator, path) catch |err| switch (err) {
             error.BadGenerationPayload => failResumeSetup("spore resume: invalid --generation payload; required JSON fields: run_id, child_id, parallel_index, parallel_count, fork_index, fork_count, fork_batch_id, vm_id", .{}),
@@ -176,7 +176,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .kernel = "",
                 .ram_size = ram_size,
                 .console_sink = if (opts.events == null) consoleSink else discardConsoleSink,
-                .disk_backend = runtime_disk.backend(),
+                .disk_backend = runtime_disk_state.backend(),
                 .resume_dir = opts.spore_dir,
                 .resume_generation = attach.generation_state,
                 .ram_backing_fd = local_backing.fd,
@@ -194,7 +194,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .kernel = "",
                 .ram_size = ram_size,
                 .console_sink = if (opts.events == null) consoleSink else discardConsoleSink,
-                .disk_backend = runtime_disk.backend(),
+                .disk_backend = runtime_disk_state.backend(),
                 .resume_dir = opts.spore_dir,
                 .resume_generation = attach.generation_state,
                 .ram_backing_fd = local_backing.fd,

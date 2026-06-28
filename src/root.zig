@@ -41,6 +41,7 @@ pub const rootfs_cli = @import("rootfs_cli.zig");
 pub const rootfs_index = @import("rootfs_index.zig");
 pub const run = @import("run.zig");
 pub const run_cli = @import("run_cli.zig");
+pub const runtime_disk = @import("runtime_disk.zig");
 pub const spore_net = @import("spore_net.zig");
 pub const spore_net_policy = @import("spore_net_policy.zig");
 pub const spore_netd = @import("spore_netd.zig");
@@ -95,6 +96,7 @@ test {
     testing.refAllDecls(rootfs_index);
     testing.refAllDecls(run);
     testing.refAllDecls(run_cli);
+    testing.refAllDecls(runtime_disk);
     testing.refAllDecls(spore_net);
     testing.refAllDecls(spore_net_policy);
     testing.refAllDecls(spore_netd);
