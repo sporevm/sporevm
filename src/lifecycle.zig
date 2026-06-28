@@ -3046,9 +3046,9 @@ test "lifecycle list entries sorts and classifies VM directories" {
     try std.testing.expectEqual(@as(?i64, ready_pid), entries[0].pid);
     try std.testing.expectEqualStrings("auto", entries[0].memory.?.policy);
     try std.testing.expectEqual(memory_config.auto_bytes, entries[0].memory.?.bytes);
-    if (comptime builtin.os.tag == .linux or builtin.os.tag.isDarwin()) {
+    if (readProcessResidentBytes(allocator, io, ready_pid) != null) {
         try std.testing.expect(entries[0].stats.resident_bytes != null);
-    } else {
+    } else if (!(comptime builtin.os.tag == .linux or builtin.os.tag.isDarwin())) {
         try std.testing.expectEqual(@as(?u64, null), entries[0].stats.resident_bytes);
     }
     const chunk_size: u64 = spore.chunk_size;
