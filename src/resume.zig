@@ -162,7 +162,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
 
     const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
-    const ram_size = resumeRamSize(parsed.value.platform);
+    const ram_size = parsed.value.platform.ram_size;
     const local_backing = try spore.openProvenLocalMemoryBacking(allocator, context.environ_map, opts.spore_dir, parsed.value.memory, ram_size);
     defer if (local_backing.fd) |fd| {
         _ = std.c.close(fd);
@@ -361,10 +361,6 @@ fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest, g
     };
 }
 
-fn resumeRamSize(platform: spore.Platform) u64 {
-    return platform.ram_size;
-}
-
 fn validateResumeDiskManifest(manifest: spore.Manifest) void {
     const disk_count = countBlockDevices(manifest.devices);
     if (disk_count == 0) return;
@@ -478,19 +474,6 @@ test "resume attach request accepts explicit generation params" {
     var restored = generation.Device{};
     try restored.restore(allocator, attach.generation_state);
     try std.testing.expectEqualStrings(params, restored.paramsPayload());
-}
-
-test "resume memory defaults to manifest ram size" {
-    const platform = spore.Platform{
-        .cpu_profile = "test",
-        .device_model_version = 1,
-        .ram_base = 0x40000000,
-        .ram_size = 384 * 1024 * 1024,
-        .gic_dist_base = 0x08000000,
-        .gic_redist_base = 0x08010000,
-        .counter_frequency_hz = 24_000_000,
-    };
-    try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), resumeRamSize(platform));
 }
 
 test "resume counts block devices for disk dependency classification" {
