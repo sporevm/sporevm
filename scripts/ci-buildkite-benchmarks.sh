@@ -92,6 +92,9 @@ trap finish_benchmark_step EXIT
 mise install
 mise run build
 prepare_benchmark_scratch
+if [[ "$(uname -s)" == "Linux" ]]; then
+  scripts/smoke-run-auto-memory.sh
+fi
 benchmark_args=(--profile "${SPOREVM_BENCHMARK_PROFILE:-comparison}" --no-build)
 if [[ -n "${benchmark_scratch_dir}" ]]; then
   benchmark_args+=(--scratch-dir "${benchmark_scratch_dir}")
