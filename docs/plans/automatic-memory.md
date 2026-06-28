@@ -328,6 +328,25 @@ guest boot progress, resident memory, backing allocation, suspend pause, and
 dirty tail across KVM and HVF. Only after those numbers are stable should the
 project consider larger auto values.
 
+Progress:
+
+- 2026-06-28 local HVF fresh managed product smoke:
+  `scripts/smoke-run-auto-memory.sh` with `docker.io/library/node:22-alpine`
+  passed. Idle `spore run --memory auto` reported guest `MemTotal` of
+  507708 KiB, below the 1GiB idle ceiling. The pressure run reported guest
+  `MemTotal` of 1556284 KiB, above the 1.5GiB growth floor. This validates the
+  default-kernel/default-initrd grow-only virtio-mem path on HVF.
+- 2026-06-28 local HVF named lifecycle boundary check: `spore create --memory
+  auto`, two `spore exec` calls, `spore --json ls`, and `spore suspend`
+  completed with a 16GiB manifest (`8192` 2MiB chunks). Create wall time was
+  539ms; monitor-reported ready time was 40ms; `spore ls` reported
+  `resident_bytes=351420416` and `chunks_total=8192`; suspend wall time was
+  27.406s; the suspended manifest had 154 nonzero chunks and a 16GiB
+  `ram.backing` allocated at 331350016 bytes. Dirty counters were unavailable
+  before suspend because this named lifecycle fixed-RAM path does not use the
+  fresh managed virtio-mem path.
+- KVM product-path evidence remains outstanding for this slice.
+
 Done when:
 
 - KVM and HVF have representative 16GiB product-path runs in `docs/memory.md`
@@ -357,6 +376,9 @@ Done when:
   `seed_chunks=5`, `seed_nonzero_chunks=5`, `seed_ms=425`,
   `snapshot_pause_ms=1471`, and a 16GiB `ram.backing` with 262MiB allocated.
 - Product smoke: `spore run --memory auto -- /bin/true`.
+- HVF product auto-memory smoke on 2026-06-28:
+  `scripts/smoke-run-auto-memory.sh` passed with idle guest `MemTotal` at
+  507708 KiB and pressure guest `MemTotal` at 1556284 KiB.
 - Product lifecycle smoke: create, exec, `spore ls`, suspend or rm.
 - Same-host fork/fan-out smoke reporting declared RAM versus aggregate PSS/RSS.
 - HVF product capture validation on 2026-06-20: a mostly-idle 16GiB
