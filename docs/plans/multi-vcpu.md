@@ -438,10 +438,22 @@ the actual CLI.
 
 Done when:
 
-- `docs/spore-format.md`, `docs/state-portability.md`, `docs/lifecycle.md`, and
-  `SECURITY.md` describe the new contract;
-- release notes call out backend support and any remaining fail-closed limits;
-- real KVM and HVF smoke evidence exists for fresh boot and capture/resume.
+- [x] `docs/spore-format.md`, `docs/state-portability.md`,
+  `docs/lifecycle.md`, and `SECURITY.md` describe the new contract;
+- [x] release notes call out backend support and any remaining fail-closed
+  limits;
+- [x] real KVM and HVF smoke evidence exists for fresh boot and capture/resume.
+
+Validation:
+
+- Local HVF: `scripts/smoke-multi-vcpu.sh` passed on Apple Silicon with
+  `backend=hvf vcpus=2`, covering guest CPU visibility, manifest v1 capture,
+  `run --from`, and `resume`.
+- KVM: `sporevm-ops` Terraform output selected ARM64 Linux CI host
+  `i-08fa4a14319c9c1b5` (`sporevm-ci-apse2-linux-arm64`, `c7gd.metal`).
+  SSM command `efa79320-1242-4ab9-ae72-55eceda450c3` ran
+  `scripts/smoke-multi-vcpu.sh` with `SPORE_BACKEND=kvm` and reported
+  `smoke:multi-vcpu ok backend=kvm vcpus=2`.
 
 ## Verification
 

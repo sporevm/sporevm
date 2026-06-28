@@ -131,8 +131,9 @@ spec update and backend mapping in the same slice.
 The value is guest-visible but chosen by the board/backend contract rather than
 by the suspended workload.
 
-- `mpidr_el1` is captured for inspection but skipped on apply. The current
-  board is single-vCPU and sets MPIDR during vCPU bring-up.
+- `mpidr_el1` is captured for inspection but skipped on apply. The board owns
+  CPU identity: manifest v0 is single-vCPU, and manifest v1 validates stable
+  `index`/`mpidr` topology while each backend sets MPIDR during vCPU bring-up.
 - GIC base addresses are not translated. They are platform fields and must
   match because the guest has already observed and mapped them.
 
@@ -229,7 +230,7 @@ Current HVF gaps:
 
 | Direction | Current status | Gate before declaring green |
 | --- | --- | --- |
-| KVM→KVM | Manifest v0 passes same-host smoke on the `m7g.metal` KVM host. Manifest v1 multi-vCPU producer/consumer code is implemented; live smoke is still pending. | Run KVM v1 `--vcpus 2 --capture`, `run --from`, and `resume` on an aarch64 KVM host. |
+| KVM→KVM | Manifest v0 passes same-host smoke on the `m7g.metal` KVM host. Manifest v1 multi-vCPU capture, `run --from`, and `resume` pass on the `sporevm-ops` ARM64 KVM CI host. | Keep v0 and v1 as regression coverage. |
 | HVF→HVF | Passes same-host v0 smoke locally, including HVF lazy RAM and file-backed fork smokes. Manifest v1 multi-vCPU same-backend capture, `run --from`, and `resume` pass on Apple Silicon with private GIC state. | Keep v0 and v1 as regression coverage. |
 | KVM→HVF | Portable vCPU, virtio, generation, GIC apply, and CPU profile machinery exist. `m7g.metal` and `a1.metal` spores fail closed on counter-frequency mismatch. | Need a KVM producer whose guest counter frequency matches HVF's 24MHz, or a designed cross-frequency timer contract. |
 | HVF→KVM | Blocked because HVF still produces backend-private GIC state. Timer compatibility still applies. | Make HVF produce portable GICv3 state, then run with compatible counter frequency. |
@@ -282,6 +283,12 @@ Current evidence:
   not a timer-compatible producer for current Apple HVF hosts.
 - HVF v1 multi-vCPU same-backend capture, `run --from`, and `resume` passed
   locally with `--backend hvf --vcpus 2` on Apple Silicon.
+- KVM v1 multi-vCPU fresh boot, capture, `run --from`, and `resume` passed on
+  the `sporevm-ops` ARM64 Linux CI host
+  `i-08fa4a14319c9c1b5` (`sporevm-ci-apse2-linux-arm64`, `c7gd.metal`) via SSM
+  command `efa79320-1242-4ab9-ae72-55eceda450c3`, which ran
+  `scripts/smoke-multi-vcpu.sh` with `SPORE_BACKEND=kvm` and reported
+  `smoke:multi-vcpu ok backend=kvm vcpus=2`.
 
 ## Next contract work
 

@@ -70,6 +70,7 @@ pub const KVM_VGIC_V3_ADDR_TYPE_REDIST: u64 = 3;
 pub const KVM_DEV_ARM_VGIC_LINE_LEVEL_INFO_SHIFT: u6 = 10;
 pub const VGIC_LEVEL_INFO_LINE_LEVEL: u64 = 0;
 
+pub const KVM_ARM_VCPU_POWER_OFF: u32 = 0;
 pub const KVM_ARM_VCPU_PSCI_0_2: u32 = 2;
 pub const KVM_ARM_IRQ_TYPE_SHIFT: u5 = 24;
 pub const KVM_ARM_IRQ_TYPE_SPI: u32 = 1;

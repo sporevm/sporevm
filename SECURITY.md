@@ -37,7 +37,7 @@ fuzz targets from the slice that introduces it:
 | `spore run` exit frames | guest vsock stream | bounded host buffer; exit/timing string parser is unit and fuzz covered; malformed frames fail the run |
 | OCI manifest, OCI layout, and layer decode | registry, local OCI layout | rootfs builder only, outside the monitor process; mutable tags are resolved into digest-pinned refs before build materialization, local refs resolve to digest-pinned local identities, blobs are verified, layout tar extraction and layer tar application are path-safe, PAX xattr handling is bounded and limited to deliberately supported capability records, and JSON/tar fuzz targets cover parser inputs |
 | Generation device inputs | guest | MMIO register surface and fork/resume params schema are fuzz/unit covered |
-| Control socket JSON | local consumers | local-only lifecycle monitor protocol is implemented for HVF and KVM; monitor processes deny child process execution through an embedded macOS sandbox profile or Linux seccomp filter; malformed requests fail closed and the socket is protected by private runtime-directory permissions |
+| Control socket JSON | local consumers | local-only lifecycle monitor protocol is implemented for HVF and KVM, including fixed-RAM multi-vCPU create, exec, suspend, and named resume; monitor processes deny child process execution through an embedded macOS sandbox profile or Linux seccomp filter; malformed requests fail closed and the socket is protected by private runtime-directory permissions |
 
 ## Structural Rules
 
@@ -50,9 +50,10 @@ fuzz targets from the slice that introduces it:
   contracts, and unverifiable chunks are errors, never degraded behavior.
 - **The stable monitor scope is local named lifecycle.** `spore create`,
   `spore exec`, `spore suspend`, `spore resume --name`, `spore ls`, and
-  `spore rm` are available on supported backends. Monitor processes deny child
-  process execution through an embedded macOS sandbox profile or Linux seccomp
-  filter after optional startup helpers are spawned, covered by
+  `spore rm` are available on supported backends, with fixed-RAM multi-vCPU
+  create, exec, suspend, and named resume. Monitor processes deny child process
+  execution through an embedded macOS sandbox profile or Linux seccomp filter
+  after optional startup helpers are spawned, covered by
   `mise run smoke:monitor-jail`. Disk-backed named checkpointing preserves
   immutable-rootfs identity and sealed writable disk layers; image-created VMs
   use chunked rootfs storage, and explicit `--rootfs PATH` VMs use exact rootfs

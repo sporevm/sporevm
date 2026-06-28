@@ -336,7 +336,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     }
     for (vcpus, 0..) |*vcpu, index| {
         try vcpu.init(vm_fd, run_size, @intCast(index));
-        try initVcpu(vm_fd, vcpu.fd);
+        try initVcpu(vm_fd, vcpu.fd, config.resume_dir == null and index != 0);
     }
     defer {
         for (vcpus) |*vcpu| vcpu.deinit();
@@ -665,7 +665,7 @@ const kvm_run_wake_signal = posix.SIG.URG;
 const KvmVcpu = struct {
     index: topology.VcpuIndex = 0,
     fd: std.c.fd_t = -1,
-    run_bytes: []u8 = undefined,
+    run_bytes: []align(std.heap.page_size_min) u8 = undefined,
     run_mapped: bool = false,
     wake: KvmRunWake = undefined,
     thread: ?std.Thread = null,
@@ -791,7 +791,7 @@ const MultiKvmResult = union(enum) {
 };
 
 const MultiKvmRunState = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: SpinLock = .{},
     stop: std.atomic.Value(bool) = .init(false),
     result_value: ?MultiKvmResult = null,
 
@@ -841,7 +841,7 @@ const MultiKvmThreadContext = struct {
     vm_fd: std.c.fd_t,
     vcpu: *KvmVcpu,
     state: *MultiKvmRunState,
-    device_lock: *std.Thread.Mutex,
+    device_lock: *SpinLock,
     network: net.Runtime,
     transports: []mmio.Transport,
     gen_dev: *generation.Device,
@@ -852,7 +852,7 @@ const MultiKvmThreadContext = struct {
 
 fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) !ExitCause {
     var state = MultiKvmRunState{};
-    var device_lock = std.Thread.Mutex{};
+    var device_lock = SpinLock{};
     const contexts = try allocator.alloc(MultiKvmThreadContext, options.vcpus.len);
     defer allocator.free(contexts);
     defer joinKvmVcpuThreads(options.vcpus);
@@ -988,7 +988,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
                 continue;
             }
         }
-        std.time.sleep(std.time.ns_per_ms);
+        sleepMs(1);
     }
 }
 
@@ -1119,6 +1119,14 @@ fn monotonicMs() !u64 {
         },
     }
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
+
+fn sleepMs(ms: u64) void {
+    var ts = std.c.timespec{
+        .sec = @intCast(ms / std.time.ms_per_s),
+        .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&ts, null);
 }
 
 fn threadCpuNs() u64 {
@@ -1870,10 +1878,11 @@ fn initGic(gic_fd: u32) !void {
     try kvm.setDeviceAttr(@intCast(gic_fd), kvm.KVM_DEV_ARM_VGIC_GRP_CTRL, kvm.KVM_DEV_ARM_VGIC_CTRL_INIT, &unused, "vgic init");
 }
 
-fn initVcpu(vm_fd: std.c.fd_t, vcpu_fd: std.c.fd_t) !void {
+fn initVcpu(vm_fd: std.c.fd_t, vcpu_fd: std.c.fd_t, power_off: bool) !void {
     var init = kvm.VcpuInit{ .target = 0, .features = @splat(0) };
     _ = try kvm.ioctl(vm_fd, kvm.KVM_ARM_PREFERRED_TARGET, @intFromPtr(&init), "KVM_ARM_PREFERRED_TARGET");
     setFeature(&init, kvm.KVM_ARM_VCPU_PSCI_0_2);
+    if (power_off) setFeature(&init, kvm.KVM_ARM_VCPU_POWER_OFF);
     _ = try kvm.ioctl(vcpu_fd, kvm.KVM_ARM_VCPU_INIT, @intFromPtr(&init), "KVM_ARM_VCPU_INIT");
     try maskPortableCpuFeatures(vcpu_fd);
 }
