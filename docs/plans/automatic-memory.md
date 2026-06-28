@@ -287,6 +287,10 @@ Progress:
 - The human `spore ls` table now renders populated nullable stats when a cheap
   runtime source supplies them. Resident, backing, chunk, and dirty collection
   sources are still pending.
+- Lifecycle list entries now derive `chunk_size` and `chunks_total` from the
+  configured memory contract. Resident bytes, sparse backing allocation,
+  nonzero chunks, and pending dirty chunks still need monitor or platform
+  sources.
 
 ### Slice 4: Measurement Gate for Raising Defaults Further
 

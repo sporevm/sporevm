@@ -1421,11 +1421,13 @@ pub fn listEntries(allocator: std.mem.Allocator, io: Io, runtime_root: []const u
         const state = try classifyVmState(allocator, io, paths, pid_alive);
         if (state == .absent) continue;
         const pid = if (state == .ready or state == .stale) readPid(allocator, io, paths) catch null else null;
+        const memory = readListMemory(allocator, io, paths) catch null;
         try entries.append(.{
             .name = try allocator.dupe(u8, entry.name),
             .state = state.name(),
             .pid = pid,
-            .memory = readListMemory(allocator, io, paths) catch null,
+            .memory = memory,
+            .stats = if (memory) |value| listStatsFromMemory(value) else .{},
         });
     }
     const out = try entries.toOwnedSlice();
@@ -1452,6 +1454,14 @@ fn listMemoryFromConfig(memory: memory_config.Config) ListMemory {
     return .{
         .policy = @tagName(memory.policy),
         .bytes = memory.bytes,
+    };
+}
+
+fn listStatsFromMemory(memory: ListMemory) ListStats {
+    const chunk_size: u64 = spore.chunk_size;
+    return .{
+        .chunk_size = chunk_size,
+        .chunks_total = std.math.divCeil(u64, memory.bytes, chunk_size) catch unreachable,
     };
 }
 
@@ -2918,11 +2928,15 @@ test "lifecycle list entries sorts and classifies VM directories" {
     try std.testing.expectEqualStrings("auto", entries[0].memory.?.policy);
     try std.testing.expectEqual(memory_config.auto_bytes, entries[0].memory.?.bytes);
     try std.testing.expectEqual(@as(?u64, null), entries[0].stats.resident_bytes);
+    const chunk_size: u64 = spore.chunk_size;
+    try std.testing.expectEqual(@as(?u64, chunk_size), entries[0].stats.chunk_size);
+    try std.testing.expectEqual(@as(?u64, memory_config.auto_bytes / chunk_size), entries[0].stats.chunks_total);
     try std.testing.expectEqualStrings("b-stale", entries[1].name);
     try std.testing.expectEqualStrings("stale", entries[1].state);
     try std.testing.expectEqual(@as(?i64, 9001), entries[1].pid);
     try std.testing.expectEqualStrings("explicit", entries[1].memory.?.policy);
     try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), entries[1].memory.?.bytes);
+    try std.testing.expectEqual(@as(?u64, 256), entries[1].stats.chunks_total);
 }
 
 test "lifecycle list entries render human table" {
@@ -2930,6 +2944,7 @@ test "lifecycle list entries render human table" {
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
+    const stale_memory = listMemoryFromConfig(.{ .policy = .explicit, .bytes = 512 * 1024 * 1024 });
     try writeListEntries(&out.writer, &.{
         .{
             .name = "a-ready",
@@ -2945,12 +2960,18 @@ test "lifecycle list entries render human table" {
                 .dirty_chunks_pending = 2,
             },
         },
-        .{ .name = "b-stale", .state = "stale", .pid = null, .memory = listMemoryFromConfig(.{ .policy = .explicit, .bytes = 512 * 1024 * 1024 }) },
+        .{
+            .name = "b-stale",
+            .state = "stale",
+            .pid = null,
+            .memory = stale_memory,
+            .stats = listStatsFromMemory(stale_memory),
+        },
     });
     try std.testing.expectEqualStrings(
         "NAME\tSTATE\tPID\tMEMORY\tRESIDENT\tBACKING\tCHUNKS\tDIRTY\n" ++
             "a-ready\tready\t42\tauto/16GiB\t184MiB\t34MiB/16GiB\t17/8192\t2\n" ++
-            "b-stale\tstale\t-\t512MiB\t?\t?\t?\t?\n",
+            "b-stale\tstale\t-\t512MiB\t?\t?\t?/256\t?\n",
         out.written(),
     );
 
