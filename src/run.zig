@@ -2113,7 +2113,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     defer runtime_disk.deinit();
     const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, rootfsWritable(opts), opts.network);
     const request_start = monotonicMs();
-    const request = try execRequestForRun(context, allocator, opts);
+    const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
     const request_ms = monotonicMs() -| request_start;
     if (resuming) stream.host_port = vsock.HostStream.deriveHostPort(request);
@@ -2562,12 +2562,13 @@ pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]co
     return execRequestWithSession(allocator, argv, "default");
 }
 
-fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options) ![]const u8 {
+fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options, memory_pressure: bool) ![]const u8 {
     const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(context.io).nanoseconds);
     if (opts.resume_dir == null) return execRequestWithSessionOptions(allocator, opts.command, "default", .{
         .env = opts.guest_env,
         .working_dir = opts.guest_working_dir,
         .resume_time_unix_ns = resume_time_unix_ns,
+        .memory_pressure = memory_pressure,
     });
 
     const now = Io.Clock.real.now(context.io).nanoseconds;
@@ -2577,6 +2578,7 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
     const session_id = try std.fmt.allocPrint(allocator, "run-{x}-{x}", .{ now, nonce });
     return execRequestWithSessionOptions(allocator, opts.command, session_id, .{
         .resume_time_unix_ns = resume_time_unix_ns,
+        .memory_pressure = memory_pressure,
     });
 }
 
@@ -2588,6 +2590,7 @@ const GuestExecOptions = struct {
     env: []const []const u8 = &.{},
     working_dir: ?[]const u8 = null,
     resume_time_unix_ns: u64 = 0,
+    memory_pressure: bool = false,
 };
 
 fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: GuestExecOptions) ![]const u8 {
@@ -2600,6 +2603,7 @@ fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []c
         argv: []const []const u8,
         env: []const []const u8,
         working_dir: []const u8,
+        memory_pressure: bool,
         closed_env: bool = true,
     }{
         .session_id = session_id,
@@ -2607,6 +2611,7 @@ fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []c
         .argv = argv,
         .env = options.env,
         .working_dir = options.working_dir orelse "",
+        .memory_pressure = options.memory_pressure,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
@@ -2827,13 +2832,13 @@ fn takeValue(args: []const []const u8, i: *usize, name: []const u8) []const u8 {
 test "run request encodes argv" {
     const request = try execRequest(std.testing.allocator, &.{ "/bin/echo", "hello world" });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/echo\",\"hello world\"],\"env\":[],\"working_dir\":\"\",\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/echo\",\"hello world\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"closed_env\":true}\n", request);
 }
 
 test "run request can encode explicit session id" {
     const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42");
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"closed_env\":true}\n", request);
 }
 
 test "run request encodes image env and working directory" {
@@ -2841,9 +2846,10 @@ test "run request encodes image env and working directory" {
         .env = &.{ "GEM_HOME=/usr/local/bundle", "RUBYOPT=--yjit" },
         .working_dir = "/app",
         .resume_time_unix_ns = 123,
+        .memory_pressure = true,
     });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":123,\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":123,\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"memory_pressure\":true,\"closed_env\":true}\n", request);
 }
 
 test "image rootfs metadata supplies run env and working directory" {

@@ -477,6 +477,7 @@ static int write_file_atomic(const char *path, const char *data, size_t len) {
 
 static int parse_string_field(const char *req, const char *name, char *out, size_t cap);
 static int parse_u64_field(const char *req, const char *name, uint64_t *out);
+static int parse_bool_field(const char *req, const char *name, int *out);
 
 static void env_append(char *env, size_t *len, const char *key, const char *value) {
   if (value[0] == '\0' || *len >= 2048) return;
@@ -956,6 +957,7 @@ struct run_request {
   uint64_t stdout_offset;
   uint64_t stderr_offset;
   uint64_t resume_time_unix_ns;
+  int memory_pressure;
   char generation_params[GEN_PARAMS_MAX];
   char arg_storage[MAX_ARGC][MAX_ARG_LEN];
   char *argv[MAX_ARGC + 1];
@@ -979,6 +981,24 @@ static int parse_u64_field(const char *req, const char *name, uint64_t *out) {
   if (errno != 0 || end == p) return -1;
   *out = (uint64_t)value;
   return 1;
+}
+
+static int json_token_finished(char c) {
+  return c == '\0' || c == ',' || c == '}' || c == ']' || c == ' ' || c == '\n' || c == '\r' || c == '\t';
+}
+
+static int parse_bool_field(const char *req, const char *name, int *out) {
+  const char *p = find_field_value(req, name);
+  if (p == NULL) return 0;
+  if (strncmp(p, "true", 4) == 0 && json_token_finished(p[4])) {
+    *out = 1;
+    return 1;
+  }
+  if (strncmp(p, "false", 5) == 0 && json_token_finished(p[5])) {
+    *out = 0;
+    return 1;
+  }
+  return -1;
 }
 
 static int parse_request(const char *req, struct run_request *out) {
@@ -1034,6 +1054,10 @@ static int parse_request(const char *req, struct run_request *out) {
     int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
     if (working_dir_rc < 0) return -1;
     if (working_dir_rc == 0) out->working_dir[0] = '\0';
+    int memory_pressure = 0;
+    int memory_pressure_rc = parse_bool_field(req, "memory_pressure", &memory_pressure);
+    if (memory_pressure_rc < 0) return -1;
+    if (memory_pressure_rc > 0) out->memory_pressure = memory_pressure;
   }
   return 0;
 }
@@ -1080,7 +1104,7 @@ static void close_file_stdio(struct session *session) {
   unlink(FILE_STDERR_PATH);
 }
 
-static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio) {
+static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio, int memory_pressure) {
   t_command_start = now_ms();
   int stdout_pipe[2] = { -1, -1 };
   int stderr_pipe[2] = { -1, -1 };
@@ -1163,7 +1187,7 @@ static int start_session(struct session *session, const char *session_id, char *
 
   memset(session, 0, sizeof(*session));
   session->memory_pressure_fd = -1;
-  if (setup_memory_pressure(session, pid) != 0 || write_all(start_pipe[1], "\1", 1) != 0) {
+  if ((memory_pressure && setup_memory_pressure(session, pid) != 0) || write_all(start_pipe[1], "\1", 1) != 0) {
     close(start_pipe[1]);
     (void)kill(pid, SIGKILL);
     int status = 0;
@@ -1406,7 +1430,7 @@ static void accept_request(int listener, struct session *session, struct client 
       return;
     }
     apply_resume_clock(request.resume_time_unix_ns);
-    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs, file_stdio);
+    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs, file_stdio, request.memory_pressure);
     if (rc != 0) {
       (void)send_error_exit(client->fd, rc, "spore run: exec setup failed\n");
       close_client(client);
