@@ -17,7 +17,7 @@ pub const HostInfo = struct {
     schema_version: u32 = host_info_schema_version,
     host_class: []const u8,
     platform: PlatformFacts,
-    backends: []const BackendAvailability,
+    backends: [2]BackendAvailability,
     cache_roots: CacheRoots,
 };
 
@@ -69,9 +69,6 @@ pub fn hostInfo(
     allocator: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
 ) !HostInfo {
-    const backends = try backendAvailability(allocator);
-    errdefer allocator.free(backends);
-
     const kernels = try cacheRootFact(allocator, environ, .kernels);
     errdefer freePathFact(allocator, kernels);
     const rootfs = try cacheRootFact(allocator, environ, .rootfs);
@@ -94,7 +91,7 @@ pub fn hostInfo(
             .counter_frequency_source = "cntfrq_el0",
             .counter_frequency_hz = try hostCounterFrequencyHz(),
         },
-        .backends = backends,
+        .backends = .{ hvfAvailability(), kvmAvailability() },
         .cache_roots = .{
             .kernels = kernels,
             .rootfs = rootfs,
@@ -105,7 +102,6 @@ pub fn hostInfo(
 }
 
 pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
-    allocator.free(info.backends);
     freePathFact(allocator, info.cache_roots.kernels);
     freePathFact(allocator, info.cache_roots.rootfs);
     freePathFact(allocator, info.cache_roots.bundles);
@@ -120,13 +116,6 @@ fn hostClass() []const u8 {
     if (comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return "macos-aarch64-hvf";
     if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) return "linux-aarch64-kvm";
     return "unsupported";
-}
-
-fn backendAvailability(allocator: std.mem.Allocator) ![]const BackendAvailability {
-    const backends = try allocator.alloc(BackendAvailability, 2);
-    backends[0] = hvfAvailability();
-    backends[1] = kvmAvailability();
-    return backends;
 }
 
 fn hvfAvailability() BackendAvailability {

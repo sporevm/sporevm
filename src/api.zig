@@ -439,7 +439,6 @@ pub fn hostInfo(
             .reason = backend.reason,
         };
     }
-    allocator.free(info.backends);
 
     return .{
         .host_class = info.host_class,
