@@ -8,6 +8,7 @@ upload_benchmark_artifacts() {
   buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/results.jsonl" || true
   buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/summary.json" || true
   buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/logs/*" || true
+  buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/logs/**/*" || true
   buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/rootfs-cache/*.json" || true
 }
 
@@ -58,6 +59,9 @@ choose_benchmark_scratch_root() {
 
 benchmark_scratch_dir=""
 benchmark_rootfs_cache_dir="${SPOREVM_BENCHMARK_ROOTFS_CACHE_DIR:-${SPOREVM_ROOTFS_CACHE_DIR:-}}"
+benchmark_profile="${SPOREVM_BENCHMARK_PROFILE:-}"
+benchmark_image="${SPOREVM_BENCHMARK_IMAGE:-}"
+benchmark_command="${SPOREVM_BENCHMARK_COMMAND:-}"
 
 default_rootfs_cache_dir() {
   if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
@@ -116,7 +120,27 @@ mkdir -p "${benchmark_rootfs_cache_dir}"
 if [[ "$(uname -s)" == "Linux" ]]; then
   scripts/smoke-run-auto-memory.sh
 fi
-benchmark_args=(--profile "${SPOREVM_BENCHMARK_PROFILE:-comparison}" --no-build)
+if [[ -z "${benchmark_profile}" ]]; then
+  if [[ "${BUILDKITE_BRANCH:-}" == "main" ]]; then
+    benchmark_profile="comparison"
+  else
+    benchmark_profile="ci"
+  fi
+fi
+if [[ "${BUILDKITE_BRANCH:-}" != "main" ]]; then
+  benchmark_image="${benchmark_image:-quay.io/prometheus/busybox:latest}"
+  benchmark_command="${benchmark_command:-/bin/sh -lc true}"
+fi
+benchmark_args=(--profile "${benchmark_profile}" --no-build)
+if [[ -n "${benchmark_image}" ]]; then
+  benchmark_args+=(--image "${benchmark_image}")
+fi
+if [[ -n "${benchmark_command}" ]]; then
+  benchmark_args+=(--command "${benchmark_command}")
+fi
+if [[ "${SPOREVM_BENCHMARK_ALLOW_IMAGE_RESOLVE_FALLBACK:-}" == "1" ]]; then
+  benchmark_args+=(--allow-image-resolve-fallback)
+fi
 if [[ -n "${benchmark_scratch_dir}" ]]; then
   benchmark_args+=(--scratch-dir "${benchmark_scratch_dir}")
 fi

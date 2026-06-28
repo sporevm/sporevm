@@ -406,6 +406,21 @@ class BenchmarkRunner:
         stderr = self.log_dir / "rootfs-resolve.stderr"
         rc, elapsed_ms, error = run_command(argv, env=self.env, stdout_path=stdout, stderr_path=stderr, timeout_s=self.args.timeout_s)
         if rc != 0:
+            if self.args.allow_image_resolve_fallback:
+                self.effective_image = self.args.image
+                self.emit({
+                    "benchmark": "rootfs_resolve",
+                    "mode": "setup",
+                    "success": False,
+                    "status": rc,
+                    "elapsed_ms": elapsed_ms,
+                    "requested_image": self.args.image,
+                    "image": self.effective_image,
+                    "error": error,
+                    "stdout_path": str(stdout),
+                    "stderr_path": str(stderr),
+                })
+                return
             die(f"rootfs resolve failed rc={rc} elapsed_ms={elapsed_ms} error={error or ''} stderr={stderr}")
         resolved = stdout.read_text(encoding="utf-8").strip()
         if "@sha256:" not in resolved:
@@ -1164,6 +1179,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--platform", default=DEFAULT_PLATFORM)
     parser.add_argument("--memory", default="512mb")
     parser.add_argument("--command", default=DEFAULT_COMMAND)
+    parser.add_argument("--allow-image-resolve-fallback", action="store_true", help="Use the requested image ref when rootfs resolve fails")
     parser.add_argument("--timeout-s", type=int)
     parser.add_argument("--writable-rootfs-iterations", type=int, help="Writable-rootfs iterations per workload")
     parser.add_argument("--writable-rootfs-workloads", help="Comma-separated subset: sqlite,package")

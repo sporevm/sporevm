@@ -1,3 +1,6 @@
+env:
+  SPOREVM_BENCHMARK_ALLOW_IMAGE_RESOLVE_FALLBACK: "1"
+
 steps:
   - label: ":bar_chart: Benchmarks macOS"
     key: "benchmarks-macos"
@@ -30,6 +33,7 @@ steps:
         --include "*/results.jsonl" \
         --include "*/summary.json" \
         --include "*/logs/*" \
+        --include "*/logs/**/*" \
         --include "*/rootfs-cache/*.json" \
         --exclude "*/work/*" \
         --exclude "*/bundle-cache/*" \
@@ -68,6 +72,7 @@ steps:
         --include "*/results.jsonl" \
         --include "*/summary.json" \
         --include "*/logs/*" \
+        --include "*/logs/**/*" \
         --include "*/rootfs-cache/*.json" \
         --exclude "*/work/*" \
         --exclude "*/bundle-cache/*" \
