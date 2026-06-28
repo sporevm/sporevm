@@ -1,5 +1,5 @@
 <p align="left">
-  <img src="assets/sporevm-icon.png" alt="SporeVM" width="160">
+  <img src="assets/sporevm-mark-bounded.png" alt="SporeVM" width="160">
 </p>
 
 # SporeVM
