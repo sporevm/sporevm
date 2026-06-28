@@ -31,8 +31,9 @@ The landed first version is deliberately small: a local proof sidecar next to
 the proof as an acceleration hint only. This proof says "this host produced and
 still recognizes this backing file for this manifest"; it does not prove every
 page still matches the manifest's chunk refs. The portable source of truth
-remains the manifest's BLAKE3 chunk refs. The remaining active slice is an
-opportunistic Linux fs-verity upgrade behind the same automatic planner.
+remains the manifest's BLAKE3 chunk refs. The remaining active work is Linux
+benchmark evidence for the opportunistic fs-verity upgrade behind the same
+automatic planner.
 
 ## Problem
 
@@ -324,5 +325,5 @@ Validation on 2026-06-20:
 
 ## Open Questions
 
-No blocking questions for the landed slices. Slice 3 needs Linux filesystem
-support and benchmark evidence before it is worth implementing.
+No blocking questions for the landed slices. Slice 3 still needs Linux
+filesystem support and benchmark evidence before it is complete.
