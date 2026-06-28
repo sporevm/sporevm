@@ -25,6 +25,7 @@ pub const Options = struct {
 
 pub const RuntimeDisk = struct {
     allocator: ?std.mem.Allocator = null,
+    trace_path: ?[:0]const u8 = null,
     rootfs_fd: ?std.c.fd_t = null,
     cas_rootfs: ?*rootfs_cas.CasBlockSource = null,
     overlay: ?disk_layer.TempOverlay = null,
@@ -55,40 +56,42 @@ pub const RuntimeDisk = struct {
             source.deinit();
             if (self.allocator) |alloc| alloc.destroy(source);
         }
+        if (self.trace_path) |path| {
+            if (self.allocator) |alloc| alloc.free(path);
+        }
         self.* = .{};
     }
 
-    fn baseSource(self: *RuntimeDisk, size: u64, trace_path: ?[:0]const u8) !block_source.BlockSource {
+    fn baseSource(self: *RuntimeDisk, size: u64) !block_source.BlockSource {
         if (self.cas_rootfs) |source| return .{ .cas = source };
         const fd = self.rootfs_fd orelse return error.BadManifest;
-        return block_source.FileBlockSource.initWithTrace(fd, size, trace_path).source();
+        return block_source.FileBlockSource.initWithTrace(fd, size, self.trace_path).source();
     }
 };
 
 pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !RuntimeDisk {
-    var runtime = RuntimeDisk{};
+    var runtime = RuntimeDisk{ .allocator = allocator };
     errdefer runtime.deinit();
-    const trace_path = try rootfsTracePath(context, allocator);
+    runtime.trace_path = try rootfsTracePath(context, allocator);
 
     if (options.rootfs) |rootfs| {
         if (rootfs.storage != null) {
-            runtime.allocator = allocator;
-            runtime.cas_rootfs = try openManifestCasRootfs(context, allocator, rootfs, trace_path);
+            runtime.cas_rootfs = try openManifestCasRootfs(context, allocator, rootfs, runtime.trace_path);
         } else {
-            runtime.rootfs_fd = try openVerifiedRootfs(context, allocator, rootfs, trace_path);
+            runtime.rootfs_fd = try openVerifiedRootfs(context, allocator, rootfs, runtime.trace_path);
         }
     } else {
         runtime.rootfs_fd = try openRootfsDisk(allocator, options.rootfs_path);
     }
 
-    if (runtime.rootfs_fd == null and runtime.cas_rootfs == null) return .{};
+    if (runtime.rootfs_fd == null and runtime.cas_rootfs == null) return runtime;
 
     if (options.disk) |disk| {
         const rootfs = options.rootfs orelse return error.BadManifest;
         const spore_dir = options.spore_dir orelse return error.BadManifest;
         if (disk.size != spore.effectiveRootfsLogicalSize(rootfs) or
             !std.mem.eql(u8, disk.base, spore.effectiveRootfsBaseIdentity(rootfs))) return error.BadManifest;
-        const base_source = try runtime.baseSource(disk.size, trace_path);
+        const base_source = try runtime.baseSource(disk.size);
         runtime.overlay = try disk_layer.createTempOverlay(allocator);
         if (disk.layers.len == 0) {
             runtime.cow = try cow_disk.CowDisk.init(allocator, base_source, runtime.overlay.?.fd, disk.size, disk_layer.default_cluster_size);
@@ -105,7 +108,7 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
     if (options.rootfs) |rootfs| {
         runtime.overlay = try disk_layer.createTempOverlay(allocator);
         const base = disk_layer.diskFromRootfs(rootfs);
-        const base_source = try runtime.baseSource(base.size, trace_path);
+        const base_source = try runtime.baseSource(base.size);
         runtime.cow = try cow_disk.CowDisk.init(allocator, base_source, runtime.overlay.?.fd, base.size, disk_layer.default_cluster_size);
         runtime.base_disk = base;
         return runtime;
@@ -184,6 +187,29 @@ fn monotonicMs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
+test "runtime disk owns trace path without a rootfs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-runtime-disk-no-rootfs-trace";
+    const trace_path = tmp ++ "/rootfs-trace.jsonl";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const absolute_trace_path = try std.fs.path.resolve(arena, &.{trace_path});
+    try env.put(rootfs_trace_env, absolute_trace_path);
+
+    const context = Context{ .io = io, .environ_map = &env };
+    var runtime = try open(context, allocator, .{});
+    defer runtime.deinit();
+    try std.testing.expect(runtime.backend() == null);
+}
+
 test "runtime disk rejects corrupt rootfs before constructing file block source" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -207,6 +233,9 @@ test "runtime disk rejects corrupt rootfs before constructing file block source"
     defer env.deinit();
     const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
     try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    const trace_path = tmp ++ "/rootfs-trace.jsonl";
+    const absolute_trace_path = try std.fs.path.resolve(arena, &.{trace_path});
+    try env.put(rootfs_trace_env, absolute_trace_path);
 
     const context = Context{ .io = io, .environ_map = &env };
 
@@ -238,6 +267,9 @@ test "runtime disk uses manifest-bound rootfs cas source without experiment flag
     defer env.deinit();
     const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
     try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    const trace_path = tmp ++ "/rootfs-trace.jsonl";
+    const absolute_trace_path = try std.fs.path.resolve(arena, &.{trace_path});
+    try env.put(rootfs_trace_env, absolute_trace_path);
 
     const context = Context{ .io = io, .environ_map = &env };
 
@@ -260,6 +292,8 @@ test "runtime disk uses manifest-bound rootfs cas source without experiment flag
     try std.testing.expectEqual(@as(u64, 1), runtime.cas_rootfs.?.stats.cache_misses);
     try runtime.cow.?.readAt(&readback, 0);
     try std.testing.expectEqual(@as(u64, 1), runtime.cas_rootfs.?.stats.cache_hits);
+    const trace_bytes = try Io.Dir.cwd().readFileAlloc(io, trace_path, arena, .limited(4096));
+    try std.testing.expect(std.mem.indexOf(u8, trace_bytes, "\"event\":\"rootfs_cas_index_open\"") != null);
 }
 
 test "runtime disk manifest rootfs cas fails closed without index" {
