@@ -1181,17 +1181,6 @@ pub fn resolveRootfsInputDetailedResult(
     switch (resolved) {
         .failure => return resolved,
         .resolved => |rootfs| {
-            if (rootfs.path) |path| {
-                if (!try readablePath(init.io, path)) {
-                    return .{ .failure = rootfsInputFailure(
-                        allocator,
-                        .object_not_found,
-                        options.command_name,
-                        "spore {s}: rootfs not found: {s}",
-                        .{ options.command_name, path },
-                    ) };
-                }
-            }
             return .{ .resolved = rootfs };
         },
     }
