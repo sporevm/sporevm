@@ -1212,7 +1212,7 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
       --backend kvm \
       --spore-dir "\${unpacked_dir}" \
       --resume-seconds "\${resume_seconds}" \
-      --kvm-lazy-ram
+      --lazy-ram
   fi
   unpacked_chunks="\$(find "\${unpacked_dir}/chunks" -type f | wc -l | tr -d ' ')"
   if [[ -n "\${iteration_json}" ]]; then
@@ -1237,7 +1237,7 @@ writable_rootfs_json=false
 if [[ "\${writable_rootfs}" == "1" ]]; then
   writable_rootfs_json=true
 fi
-resume_mode="kvm-lazy-ram"
+resume_mode="lazy-ram"
 if [[ "\${writable_rootfs}" == "1" ]]; then
   resume_mode="kvm-run-from-writable-rootfs"
 elif [[ "\${workload}" == "rootfs" ]]; then

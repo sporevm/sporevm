@@ -23,7 +23,6 @@ Options:
   --resume-seconds N        seconds to let resumed VM tick (default: 5)
   --min-tick N              minimum observed ticker value on resume (default: 1)
   --lazy-ram                use backend --lazy-ram for resume
-  --kvm-lazy-ram            compatibility alias for --lazy-ram
   --cmdline TEXT            override fresh-boot kernel command line
   --boot-bin PATH           use an already-built boot harness
   --no-build                do not run `zig build <backend>-boot`
@@ -121,7 +120,7 @@ while (($#)); do
       min_tick="${2:-}"
       shift 2
       ;;
-    --lazy-ram|--kvm-lazy-ram)
+    --lazy-ram)
       lazy_ram=1
       shift
       ;;
