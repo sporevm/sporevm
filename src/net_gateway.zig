@@ -6,6 +6,7 @@
 const std = @import("std");
 const Io = std.Io;
 
+const spore_net = @import("spore_net.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_netd = @import("spore_netd.zig");
 const virtio_net = @import("virtio/net.zig");
@@ -513,7 +514,7 @@ fn parseNetworkEventLine(line: []const u8) ?NetworkEvent {
     if (fields.next() != null) return null;
 
     const kind: NetworkEventKind = if (std.mem.eql(u8, kind_raw, "egress_denied")) .egress_denied else return null;
-    const destination_ip = parseIpv4Text(ip_raw) orelse return null;
+    const destination_ip = spore_net.parseIpv4(ip_raw) orelse return null;
     const destination_port = std.fmt.parseUnsigned(u16, port_raw, 10) catch return null;
     const reason: spore_net_policy.Decision = if (std.mem.eql(u8, reason_raw, spore_net_policy.Decision.deny_hard_floor.name()))
         .deny_hard_floor
@@ -528,19 +529,6 @@ fn parseNetworkEventLine(line: []const u8) ?NetworkEvent {
         .destination_port = destination_port,
         .reason = reason,
     };
-}
-
-fn parseIpv4Text(raw: []const u8) ?[4]u8 {
-    var out: [4]u8 = undefined;
-    var fields = std.mem.splitScalar(u8, raw, '.');
-    var i: usize = 0;
-    while (i < out.len) : (i += 1) {
-        const field = fields.next() orelse return null;
-        if (field.len == 0) return null;
-        out[i] = std.fmt.parseUnsigned(u8, field, 10) catch return null;
-    }
-    if (fields.next() != null) return null;
-    return out;
 }
 
 fn waitChild(self: *Process, io: Io) void {

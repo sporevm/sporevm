@@ -652,22 +652,9 @@ fn parseNameserver(resolv: []const u8) ?[4]u8 {
         if (line.len == "nameserver".len or (line["nameserver".len] != ' ' and line["nameserver".len] != '\t')) continue;
         const rest = std.mem.trim(u8, line["nameserver".len..], " \t");
         const end = std.mem.indexOfAny(u8, rest, " \t#") orelse rest.len;
-        if (parseIpv4(rest[0..end])) |ip| return ip;
+        if (spore_net.parseIpv4(rest[0..end])) |ip| return ip;
     }
     return null;
-}
-
-fn parseIpv4(raw: []const u8) ?[4]u8 {
-    var ip: [4]u8 = undefined;
-    var parts = std.mem.splitScalar(u8, raw, '.');
-    var i: usize = 0;
-    while (parts.next()) |part| {
-        if (i >= ip.len or part.len == 0) return null;
-        ip[i] = std.fmt.parseUnsigned(u8, part, 10) catch return null;
-        i += 1;
-    }
-    if (i != ip.len) return null;
-    return ip;
 }
 
 const TestDnsForwarder = struct {

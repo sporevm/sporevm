@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const spore = @import("spore.zig");
+const spore_net = @import("spore_net.zig");
 
 pub const max_allow_cidrs = 16;
 pub const max_allow_hosts = 16;
@@ -509,7 +510,7 @@ const dns_class_in = 1;
 pub fn parseCidr(raw: []const u8) ParseError!Cidr {
     const slash = std.mem.indexOfScalar(u8, raw, '/') orelse return error.InvalidCidr;
     if (std.mem.indexOfScalar(u8, raw[slash + 1 ..], '/') != null) return error.InvalidCidr;
-    const addr = parseIpv4(raw[0..slash]) orelse return error.InvalidCidr;
+    const addr = spore_net.parseIpv4(raw[0..slash]) orelse return error.InvalidCidr;
     const prefix = std.fmt.parseUnsigned(u8, raw[slash + 1 ..], 10) catch return error.InvalidCidr;
     if (prefix > 32) return error.InvalidCidr;
     return .{ .network = addr, .prefix_len = prefix };
@@ -567,19 +568,6 @@ pub fn isHardFloorBlocked(addr: [4]u8) bool {
     if (addr[0] == 198 and (addr[1] == 18 or addr[1] == 19)) return true;
     if (addr[0] >= 224) return true;
     return false;
-}
-
-fn parseIpv4(raw: []const u8) ?[4]u8 {
-    var ip: [4]u8 = undefined;
-    var parts = std.mem.splitScalar(u8, raw, '.');
-    var i: usize = 0;
-    while (parts.next()) |part| {
-        if (i >= ip.len or part.len == 0) return null;
-        ip[i] = std.fmt.parseUnsigned(u8, part, 10) catch return null;
-        i += 1;
-    }
-    if (i != ip.len) return null;
-    return ip;
 }
 
 fn ipv4ToU32(addr: [4]u8) u32 {
