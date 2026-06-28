@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zmoltcp = .{
-            .url = "git+https://github.com/lox/zmoltcp.git#v0.2.12",
+            .url = "git+https://github.com/sporevm/zmoltcp.git#v0.2.12",
             .hash = "zmoltcp-0.2.12-AMqcQdNmEgBmqyDeqKFN_33x810C4rmJlmzFMDAzYvNk",
         },
     },
