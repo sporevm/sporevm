@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 
+const fd_util = @import("fd.zig");
 const run_mod = @import("run.zig");
 
 pub const Backend = run_mod.Backend;
@@ -307,11 +308,11 @@ fn flushLongPendingLine(output_lock: *OutputLock, name: []const u8, pending: *st
 
 fn writePrefixedLine(output_lock: *OutputLock, name: []const u8, line: []const u8, newline: bool) void {
     output_lock.lock();
-    writeAllFd(1, "[");
-    writeAllFd(1, name);
-    writeAllFd(1, "] ");
-    writeAllFd(1, line);
-    if (newline) writeAllFd(1, "\n");
+    fd_util.writeAllBestEffort(1, "[");
+    fd_util.writeAllBestEffort(1, name);
+    fd_util.writeAllBestEffort(1, "] ");
+    fd_util.writeAllBestEffort(1, line);
+    if (newline) fd_util.writeAllBestEffort(1, "\n");
     output_lock.unlock();
 }
 
@@ -396,16 +397,7 @@ fn sleepMs(ms: u64) void {
 fn writeStderr(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    writeAllFd(2, msg);
-}
-
-fn writeAllFd(fd: std.c.fd_t, bytes: []const u8) void {
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const n = std.c.write(fd, remaining.ptr, remaining.len);
-        if (n <= 0) return;
-        remaining = remaining[@intCast(n)..];
-    }
+    fd_util.writeAllBestEffort(2, msg);
 }
 
 fn failCli(comptime fmt: []const u8, args: anytype) noreturn {

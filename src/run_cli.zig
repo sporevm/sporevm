@@ -7,6 +7,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const api = @import("api.zig");
+const fd_util = @import("fd.zig");
 const run_mod = @import("run.zig");
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
@@ -125,24 +126,15 @@ const RawOutputSink = struct {
     fn emit(context: ?*anyopaque, event: api.RunEvent) !void {
         _ = context;
         switch (event) {
-            .stdout => |output| writeFd(1, output.bytes),
-            .stderr => |output| writeFd(2, output.bytes),
+            .stdout => |output| fd_util.writeAllBestEffort(1, output.bytes),
+            .stderr => |output| fd_util.writeAllBestEffort(2, output.bytes),
             else => {},
         }
     }
 };
 
-fn writeFd(fd: std.c.fd_t, bytes: []const u8) void {
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const n = std.c.write(fd, remaining.ptr, remaining.len);
-        if (n <= 0) return;
-        remaining = remaining[@intCast(n)..];
-    }
-}
-
 fn writeStderr(bytes: []const u8) void {
-    writeFd(2, bytes);
+    fd_util.writeAllBestEffort(2, bytes);
 }
 
 fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {

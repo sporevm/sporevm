@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 
 const Context = @import("context.zig").Context;
+const fd_util = @import("fd.zig");
 const hvf = @import("hvf/hvf.zig");
 const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
@@ -240,12 +241,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
 }
 
 fn consoleSink(bytes: []const u8) void {
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const n = std.c.write(1, remaining.ptr, remaining.len);
-        if (n <= 0) return;
-        remaining = remaining[@intCast(n)..];
-    }
+    fd_util.writeAllBestEffort(1, bytes);
 }
 
 fn discardConsoleSink(_: []const u8) void {}
@@ -264,12 +260,7 @@ fn resumeEventLifecycleSink(context: ?*anyopaque, event: vsock.HostStreamLifecyc
 
 fn identityProbeOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
     if (output != .stderr) return;
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const n = std.c.write(2, remaining.ptr, remaining.len);
-        if (n <= 0) return;
-        remaining = remaining[@intCast(n)..];
-    }
+    fd_util.writeAllBestEffort(2, bytes);
 }
 
 fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) T {

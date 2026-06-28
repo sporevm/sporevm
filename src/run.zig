@@ -8,6 +8,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const capture = @import("capture.zig");
 const Context = @import("context.zig").Context;
 const disk_layer = @import("disk_layer.zig");
+const fd_util = @import("fd.zig");
 const hvf = @import("hvf/hvf.zig");
 const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
@@ -2193,12 +2194,7 @@ fn runOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const 
         .stdout => 1,
         .stderr => 2,
     };
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const n = std.c.write(fd, remaining.ptr, remaining.len);
-        if (n <= 0) return;
-        remaining = remaining[@intCast(n)..];
-    }
+    fd_util.writeAllBestEffort(fd, bytes);
 }
 
 fn runEventOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
@@ -2222,12 +2218,7 @@ fn base64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
 
 pub fn consoleSink(bytes: []const u8) void {
     if (console_fd < 0) return;
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const n = std.c.write(console_fd, remaining.ptr, remaining.len);
-        if (n <= 0) return;
-        remaining = remaining[@intCast(n)..];
-    }
+    fd_util.writeAllBestEffort(console_fd, bytes);
 }
 
 pub fn openConsoleLog(path: ?[]const u8) !void {

@@ -6,6 +6,7 @@ const block_source = @import("block_source.zig");
 const Context = @import("context.zig").Context;
 const cow_disk = @import("cow_disk.zig");
 const disk_layer = @import("disk_layer.zig");
+const fd_util = @import("fd.zig");
 const local_paths = @import("local_paths.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -174,16 +175,7 @@ fn appendRootfsTrace(
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
     if (fd < 0) return;
     defer _ = std.c.close(fd);
-    writeAllTrace(fd, line);
-}
-
-fn writeAllTrace(fd: std.c.fd_t, bytes: []const u8) void {
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const n = std.c.write(fd, remaining.ptr, remaining.len);
-        if (n <= 0) return;
-        remaining = remaining[@intCast(n)..];
-    }
+    fd_util.writeAllBestEffort(fd, line);
 }
 
 fn monotonicMs() u64 {

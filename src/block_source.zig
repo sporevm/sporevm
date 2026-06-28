@@ -5,6 +5,7 @@
 //! the relevant restore authority.
 
 const std = @import("std");
+const fd_util = @import("fd.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 
 pub const Error = rootfs_cas.SourceError || error{
@@ -91,16 +92,7 @@ fn appendTraceRead(path: [:0]const u8, offset: u64, len: usize, elapsed_ms: u64)
         "{{\"event\":\"block_source_read\",\"source\":\"file\",\"offset\":{d},\"len\":{d},\"elapsed_ms\":{d}}}\n",
         .{ offset, len, elapsed_ms },
     ) catch return;
-    writeAll(fd, line);
-}
-
-fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const n = std.c.write(fd, remaining.ptr, remaining.len);
-        if (n <= 0) return;
-        remaining = remaining[@intCast(n)..];
-    }
+    fd_util.writeAllBestEffort(fd, line);
 }
 
 fn monotonicMs() u64 {

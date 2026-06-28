@@ -8,12 +8,7 @@ const std = @import("std");
 const spore_internal = @import("spore_internal");
 
 fn consoleSink(bytes: []const u8) void {
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const n = std.c.write(1, remaining.ptr, remaining.len);
-        if (n <= 0) return;
-        remaining = remaining[@intCast(n)..];
-    }
+    spore_internal.fd.writeAllBestEffort(1, bytes);
 }
 
 pub fn main(init: std.process.Init) !void {
