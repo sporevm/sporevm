@@ -160,7 +160,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     }
     const identity_probe: ?*vsock.HostStream = if (identity_stream) |*stream| stream else null;
 
-    const backend = try resolveBackend(opts.backend);
+    const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
     const ram_size = resumeRamSize(parsed.value.platform);
     const local_backing = try spore.openProvenLocalMemoryBacking(allocator, context.environ_map, opts.spore_dir, parsed.value.memory, ram_size);
@@ -359,13 +359,6 @@ fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest, g
         .request = try std.fmt.allocPrint(allocator, "{s}\n", .{json}),
         .generation_state = generation_state,
     };
-}
-
-fn resolveBackend(backend: Backend) !Backend {
-    if (backend != .auto) return backend;
-    if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return .hvf;
-    if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) return .kvm;
-    return error.UnsupportedBackend;
 }
 
 fn resumeRamSize(platform: spore.Platform) u64 {

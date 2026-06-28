@@ -96,6 +96,25 @@ pub const Backend = enum {
             .kvm => "kvm",
         };
     }
+
+    pub fn supportedOnHost(self: Backend) bool {
+        return switch (self) {
+            .auto => Backend.hvf.supportedOnHost() or Backend.kvm.supportedOnHost(),
+            .hvf => comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64,
+            .kvm => comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64,
+        };
+    }
+
+    pub fn resolveForHost(self: Backend) !Backend {
+        return switch (self) {
+            .auto => blk: {
+                if (comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) break :blk .hvf;
+                if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) break :blk .kvm;
+                return error.UnsupportedBackend;
+            },
+            .hvf, .kvm => self,
+        };
+    }
 };
 
 pub const Options = struct {
@@ -1872,7 +1891,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
     try spore.validateAnnotations(opts.annotations);
 
-    const backend = try resolveBackend(opts.backend);
+    const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
@@ -2086,7 +2105,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
     try spore.validateAnnotations(opts.annotations);
 
-    const backend = try resolveBackend(opts.backend);
+    const backend = try opts.backend.resolveForHost();
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     const network: virtio_net.Runtime = if (opts.network_runtime) |runtime| runtime else blk: {
@@ -2323,13 +2342,6 @@ pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, root
         "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}{s}",
         .{ guest_port, rootfs_flag, rootfs_rw_flag, network_flag },
     );
-}
-
-fn resolveBackend(backend: Backend) !Backend {
-    if (backend != .auto) return backend;
-    if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return .hvf;
-    if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) return .kvm;
-    return error.UnsupportedBackend;
 }
 
 fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostStream, captured: bool) !Result {
@@ -2801,6 +2813,16 @@ test "run cli parser allows default boot assets" {
     try std.testing.expectEqual(memory_config.auto_bytes, opts.shared.memory.bytes);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
+}
+
+test "backend auto resolves to a supported host backend" {
+    if (Backend.auto.supportedOnHost()) {
+        const resolved = try Backend.auto.resolveForHost();
+        try std.testing.expect(resolved != .auto);
+        try std.testing.expect(resolved.supportedOnHost());
+    } else {
+        try std.testing.expectError(error.UnsupportedBackend, Backend.auto.resolveForHost());
+    }
 }
 
 test "run cli parser accepts memory policy" {
