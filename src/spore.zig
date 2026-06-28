@@ -21,6 +21,7 @@ const local_paths = @import("local_paths.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const Blake3 = std.crypto.hash.Blake3;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const format_version: u32 = 0;
 pub const chunk_size: usize = 2 * 1024 * 1024;
@@ -28,11 +29,14 @@ pub const ram_backing_kind = "map-private-file-v0";
 pub const ram_backing_path = "ram.backing";
 pub const ram_backing_proof_path = "ram.backing.proof";
 
-const local_backing_proof_version: u32 = 1;
+const local_backing_proof_version_v1: u32 = 1;
+const local_backing_proof_version_v2: u32 = 2;
 const local_backing_producer = "sporevm-local-ram-backing-v0";
+const local_backing_verity_algorithm_sha256 = "sha256";
 const local_backing_key_path = "local-ram-backing.key";
 const local_backing_key_len = HmacSha256.key_length;
 const local_backing_proof_max_bytes = 16 * 1024;
+const fs_verity_hash_alg_sha256: u16 = 1;
 
 pub const Error = error{
     BadManifest,
@@ -142,7 +146,13 @@ const LocalBackingProof = struct {
     backing: LocalBackingProofBacking,
     file: LocalBackingFileIdentity,
     producer: []const u8,
+    verity: ?LocalBackingVerity = null,
     mac: []const u8,
+};
+
+const LocalBackingVerity = struct {
+    algorithm: []const u8,
+    digest: []const u8,
 };
 
 const LocalBackingProofBacking = struct {
@@ -498,17 +508,18 @@ fn hashBytes(hasher: *Blake3, value: []const u8) void {
 }
 
 fn proofMac(
-    allocator: std.mem.Allocator,
     key: *const [local_backing_key_len]u8,
     memory_fingerprint: []const u8,
+    schema_version: u32,
     backing: LocalBackingProofBacking,
     file: LocalBackingFileIdentity,
     producer: []const u8,
+    verity: ?LocalBackingVerity,
 ) Error![HmacSha256.mac_length]u8 {
-    _ = allocator;
+    if (!proofVersionAcceptsVerity(schema_version, verity)) return error.BadManifest;
     var mac = HmacSha256.init(key);
     mac.update("sporevm-local-ram-backing-proof-v1");
-    macU64(&mac, local_backing_proof_version);
+    macU64(&mac, schema_version);
     macBytes(&mac, memory_fingerprint);
     macBytes(&mac, backing.kind);
     macBytes(&mac, backing.path);
@@ -521,9 +532,21 @@ fn proofMac(
     macI64(&mac, file.mtime_sec);
     macI64(&mac, file.mtime_nsec);
     macBytes(&mac, producer);
+    if (verity) |v| {
+        macBytes(&mac, v.algorithm);
+        macBytes(&mac, v.digest);
+    }
     var out: [HmacSha256.mac_length]u8 = undefined;
     mac.final(&out);
     return out;
+}
+
+fn proofVersionAcceptsVerity(schema_version: u32, verity: ?LocalBackingVerity) bool {
+    return switch (schema_version) {
+        local_backing_proof_version_v1 => verity == null,
+        local_backing_proof_version_v2 => verity != null,
+        else => false,
+    };
 }
 
 fn macU64(mac: *HmacSha256, value: u64) void {
@@ -624,8 +647,11 @@ fn proofFieldsMatch(
     backing: LocalBackingProofBacking,
     file: LocalBackingFileIdentity,
 ) bool {
-    return proof.schema_version == local_backing_proof_version and
-        std.mem.eql(u8, proof.memory_fingerprint, memory_fingerprint) and
+    if (!proofVersionAcceptsVerity(proof.schema_version, proof.verity)) return false;
+    if (proof.verity) |verity| {
+        if (!proofVerityShapeValid(verity)) return false;
+    }
+    return std.mem.eql(u8, proof.memory_fingerprint, memory_fingerprint) and
         std.mem.eql(u8, proof.backing.kind, backing.kind) and
         std.mem.eql(u8, proof.backing.path, backing.path) and
         proof.backing.size == backing.size and
@@ -637,6 +663,102 @@ fn proofFieldsMatch(
         proof.file.mtime_sec == file.mtime_sec and
         proof.file.mtime_nsec == file.mtime_nsec and
         std.mem.eql(u8, proof.producer, local_backing_producer);
+}
+
+fn proofVerityShapeValid(verity: LocalBackingVerity) bool {
+    return std.mem.eql(u8, verity.algorithm, local_backing_verity_algorithm_sha256) and
+        isLowerHexDigest(verity.digest, Sha256.digest_length);
+}
+
+fn isLowerHexDigest(value: []const u8, comptime digest_len: usize) bool {
+    if (value.len != digest_len * 2) return false;
+    for (value) |byte| {
+        const is_digit = byte >= '0' and byte <= '9';
+        const is_lower_hex = byte >= 'a' and byte <= 'f';
+        if (!is_digit and !is_lower_hex) return false;
+    }
+    return true;
+}
+
+const FsVerityEnableArg = extern struct {
+    version: u32,
+    hash_algorithm: u32,
+    block_size: u32,
+    salt_size: u32,
+    salt_ptr: u64,
+    sig_size: u32,
+    reserved1: u32,
+    sig_ptr: u64,
+    reserved2: [11]u64,
+};
+
+const FsVerityDigestHeader = extern struct {
+    digest_algorithm: u16,
+    digest_size: u16,
+};
+
+const FsVerityDigestSha256 = extern struct {
+    header: FsVerityDigestHeader,
+    digest: [Sha256.digest_length]u8,
+};
+
+fn proofVerityForWrite(allocator: std.mem.Allocator, fd: std.c.fd_t) Error!?LocalBackingVerity {
+    if (comptime builtin.os.tag != .linux) return null;
+    linuxEnableFsVerity(fd) catch return null;
+    return linuxMeasureFsVerity(allocator, fd) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+}
+
+fn proofVerityForRead(allocator: std.mem.Allocator, fd: std.c.fd_t) Error!?LocalBackingVerity {
+    if (comptime builtin.os.tag != .linux) return null;
+    return linuxMeasureFsVerity(allocator, fd) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+}
+
+fn linuxEnableFsVerity(fd: std.c.fd_t) Error!void {
+    const linux = std.os.linux;
+    var arg = FsVerityEnableArg{
+        .version = 1,
+        .hash_algorithm = fs_verity_hash_alg_sha256,
+        .block_size = @intCast(std.heap.pageSize()),
+        .salt_size = 0,
+        .salt_ptr = 0,
+        .sig_size = 0,
+        .reserved1 = 0,
+        .sig_ptr = 0,
+        .reserved2 = .{0} ** 11,
+    };
+    const request = linux.IOCTL.IOW('f', 133, FsVerityEnableArg);
+    switch (linux.errno(linux.ioctl(fd, request, @intFromPtr(&arg)))) {
+        .SUCCESS, .EXIST => {},
+        else => return error.IoFailed,
+    }
+}
+
+fn linuxMeasureFsVerity(allocator: std.mem.Allocator, fd: std.c.fd_t) Error!LocalBackingVerity {
+    const linux = std.os.linux;
+    var measured = FsVerityDigestSha256{
+        .header = .{
+            .digest_algorithm = fs_verity_hash_alg_sha256,
+            .digest_size = Sha256.digest_length,
+        },
+        .digest = .{0} ** Sha256.digest_length,
+    };
+    const request = linux.IOCTL.IOWR('f', 134, FsVerityDigestHeader);
+    switch (linux.errno(linux.ioctl(fd, request, @intFromPtr(&measured)))) {
+        .SUCCESS => {},
+        else => return error.IoFailed,
+    }
+    if (measured.header.digest_algorithm != fs_verity_hash_alg_sha256) return error.IoFailed;
+    if (measured.header.digest_size != Sha256.digest_length) return error.IoFailed;
+    return .{
+        .algorithm = local_backing_verity_algorithm_sha256,
+        .digest = try hexAlloc(allocator, &measured.digest),
+    };
 }
 
 pub fn writeLocalMemoryBackingProof(
@@ -651,22 +773,30 @@ pub fn writeLocalMemoryBackingProof(
     const backing_path = try memoryBackingPath(allocator, dir, backing);
     const fd = try openReadOnlyNoFollow(backing_path);
     defer _ = std.c.close(fd);
-    const file = (try fstatLocalFile(fd)).identity();
-    if (file.size != expected_size) return error.BadManifest;
+    const initial_file = (try fstatLocalFile(fd)).identity();
+    if (initial_file.size != expected_size) return error.BadManifest;
     const key = (try localBackingKey(allocator, environ, true)) orelse return error.IoFailed;
     const memory_fingerprint = try memoryFingerprintHex(allocator, memory, expected_size);
     const proof_backing = proofBackingFromManifest(backing);
-    const mac = try proofMac(allocator, &key, memory_fingerprint, proof_backing, file, local_backing_producer);
+    const verity = try proofVerityForWrite(allocator, fd);
+    const file = (try fstatLocalFile(fd)).identity();
+    if (file.size != expected_size) return error.BadManifest;
+    const schema_version: u32 = if (verity == null) local_backing_proof_version_v1 else local_backing_proof_version_v2;
+    const mac = try proofMac(&key, memory_fingerprint, schema_version, proof_backing, file, local_backing_producer, verity);
     const mac_hex = try hexAlloc(allocator, &mac);
     const proof = LocalBackingProof{
-        .schema_version = local_backing_proof_version,
+        .schema_version = schema_version,
         .memory_fingerprint = memory_fingerprint,
         .backing = proof_backing,
         .file = file,
         .producer = local_backing_producer,
+        .verity = verity,
         .mac = mac_hex,
     };
-    const json = std.json.Stringify.valueAlloc(allocator, proof, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
+    const json = std.json.Stringify.valueAlloc(allocator, proof, .{
+        .whitespace = .indent_2,
+        .emit_null_optional_fields = false,
+    }) catch return error.OutOfMemory;
     const proof_path = try pathZ(allocator, "{s}/{s}", .{ dir, ram_backing_proof_path });
     try writeFileAll(proof_path, json);
 }
@@ -705,8 +835,24 @@ pub fn openProvenLocalMemoryBacking(
     if (parsed.value.mac.len != HmacSha256.mac_length * 2) return localBackingChunksPlan("proof_mac_invalid");
     var actual_mac: [HmacSha256.mac_length]u8 = undefined;
     _ = std.fmt.hexToBytes(&actual_mac, parsed.value.mac) catch return localBackingChunksPlan("proof_mac_invalid");
-    const expected_mac = try proofMac(allocator, &key, memory_fingerprint, proof_backing, file, local_backing_producer);
+    const expected_mac = try proofMac(
+        &key,
+        memory_fingerprint,
+        parsed.value.schema_version,
+        proof_backing,
+        file,
+        local_backing_producer,
+        parsed.value.verity,
+    );
     if (!std.crypto.timing_safe.eql([HmacSha256.mac_length]u8, actual_mac, expected_mac)) return localBackingChunksPlan("proof_mac_mismatch");
+    if (parsed.value.verity) |proof_verity| {
+        const measured_verity = (try proofVerityForRead(allocator, fd)) orelse return localBackingChunksPlan("verity_unavailable");
+        if (!std.mem.eql(u8, measured_verity.algorithm, proof_verity.algorithm) or
+            !std.mem.eql(u8, measured_verity.digest, proof_verity.digest))
+        {
+            return localBackingChunksPlan("verity_mismatch");
+        }
+    }
     handoff_fd = true;
     return .{ .fd = fd, .source = .local_backing, .reason = "proof_valid" };
 }
@@ -1686,6 +1832,69 @@ test "local memory backing proof rejects foreign key and manifest mismatch" {
     };
     try std.testing.expectEqual(LocalBackingRestoreSource.chunks, mismatch_plan.source);
     try std.testing.expectEqualStrings("proof_mismatch", mismatch_plan.reason);
+}
+
+test "local memory backing proof MAC covers verity digest" {
+    const key = [_]u8{0xA5} ** local_backing_key_len;
+    const memory_fingerprint = "memory-fingerprint";
+    const backing = LocalBackingProofBacking{
+        .kind = ram_backing_kind,
+        .path = ram_backing_path,
+        .size = 4096,
+    };
+    const file = LocalBackingFileIdentity{
+        .device = 1,
+        .inode = 2,
+        .owner_uid = 501,
+        .size = 4096,
+        .mtime_sec = 3,
+        .mtime_nsec = 4,
+    };
+    const verity_a = LocalBackingVerity{
+        .algorithm = local_backing_verity_algorithm_sha256,
+        .digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    const verity_b = LocalBackingVerity{
+        .algorithm = local_backing_verity_algorithm_sha256,
+        .digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    };
+
+    const mac_a = try proofMac(&key, memory_fingerprint, local_backing_proof_version_v2, backing, file, local_backing_producer, verity_a);
+    const mac_b = try proofMac(&key, memory_fingerprint, local_backing_proof_version_v2, backing, file, local_backing_producer, verity_b);
+    try std.testing.expect(!std.crypto.timing_safe.eql([HmacSha256.mac_length]u8, mac_a, mac_b));
+    try std.testing.expectError(error.BadManifest, proofMac(&key, memory_fingerprint, local_backing_proof_version_v1, backing, file, local_backing_producer, verity_a));
+    try std.testing.expectError(error.BadManifest, proofMac(&key, memory_fingerprint, local_backing_proof_version_v2, backing, file, local_backing_producer, null));
+
+    const proof_v1 = LocalBackingProof{
+        .schema_version = local_backing_proof_version_v1,
+        .memory_fingerprint = memory_fingerprint,
+        .backing = backing,
+        .file = file,
+        .producer = local_backing_producer,
+        .mac = "",
+    };
+    try std.testing.expect(proofFieldsMatch(proof_v1, memory_fingerprint, backing, file));
+
+    const proof_v2 = LocalBackingProof{
+        .schema_version = local_backing_proof_version_v2,
+        .memory_fingerprint = memory_fingerprint,
+        .backing = backing,
+        .file = file,
+        .producer = local_backing_producer,
+        .verity = verity_a,
+        .mac = "",
+    };
+    try std.testing.expect(proofFieldsMatch(proof_v2, memory_fingerprint, backing, file));
+
+    const bad_v2 = LocalBackingProof{
+        .schema_version = local_backing_proof_version_v2,
+        .memory_fingerprint = memory_fingerprint,
+        .backing = backing,
+        .file = file,
+        .producer = local_backing_producer,
+        .mac = "",
+    };
+    try std.testing.expect(!proofFieldsMatch(bad_v2, memory_fingerprint, backing, file));
 }
 
 test "memory backing rejects non-canonical paths" {

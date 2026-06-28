@@ -150,7 +150,7 @@ and file permissions instead of re-verifying every chunk.
 
 The proof prevents accidental or imported use of arbitrary local paths as RAM.
 It is not a substitute for content verification against every memory chunk. On
-Linux, a later fs-verity slice can strengthen this by storing and checking the
+Linux, fs-verity support can strengthen this by storing and checking the
 kernel's verity digest before mapping. On macOS, the default remains honest
 about its boundary: local proof plus private file permissions are provenance,
 not kernel-enforced page integrity.
@@ -178,6 +178,14 @@ not distribution authority.
 The old `kvm-boot` and `hvf-boot` explicit trust flags have been removed as
 well. Backend file-backed restore is still supported, but product paths now feed
 it only through proof-gated local backing selection.
+
+The first Linux fs-verity code slice has landed behind the same planner. Capture
+and fork proof writes opportunistically enable fs-verity on `ram.backing`; when
+the kernel returns a SHA-256 verity digest, the proof upgrades to schema v2 and
+signs that digest. Restore still uses the same automatic path, but a v2 proof
+must re-measure the fd and match the signed digest before mapping. Filesystems or
+kernels without fs-verity support continue to write v1 proofs and preserve the
+Slice 1 fallback behavior.
 
 The current implementation keeps the host-local proof and restore planner behind
 one internal seam: `openProvenLocalMemoryBacking` and
@@ -230,7 +238,7 @@ Done when:
 
 ### Slice 3: Linux fs-verity Upgrade
 
-Status: not started.
+Status: first code slice landed; Linux benchmark evidence outstanding.
 
 Add an opportunistic Linux-only verifier behind the same automatic planner. When
 the filesystem supports fs-verity, enable it after finalizing `ram.backing`,
