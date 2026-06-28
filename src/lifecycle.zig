@@ -1939,16 +1939,6 @@ fn parseResumeArgs(
     return .{ .spore_dir = spore_dir.?, .name = name.? };
 }
 
-fn cliPaths(init: std.process.Init, allocator: std.mem.Allocator, command: []const u8, name: []const u8) !Paths {
-    const paths = pathsFor(allocator, init.environ_map, name) catch |err| {
-        cliRuntimePathExit(command, err);
-    };
-    validateExistingRuntimeDirs(init.io, paths) catch |err| {
-        cliRuntimePathExit(command, err);
-    };
-    return paths;
-}
-
 fn apiPaths(context: Context, allocator: std.mem.Allocator, name: []const u8) !Paths {
     const paths = try pathsFor(allocator, context.environ_map, name);
     try validateExistingRuntimeDirs(context.io, paths);
@@ -1968,40 +1958,6 @@ fn resolveExistingSporeDirApi(allocator: std.mem.Allocator, io: Io, raw: []const
     const path = try std.fs.path.resolve(allocator, &.{raw});
     const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
     if (stat.kind != Io.File.Kind.directory) return error.InvalidSporeDir;
-    return path;
-}
-
-fn resolveNewOutputDir(
-    allocator: std.mem.Allocator,
-    io: Io,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    command: []const u8,
-    raw: []const u8,
-) []const u8 {
-    const path = std.fs.path.resolve(allocator, &.{raw}) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore {s}: invalid output directory: {s}", .{ command, @errorName(err) });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
-    };
-    if (pathExists(io, path) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore {s}: output directory check failed: {s}", .{ command, @errorName(err) });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, command), message);
-    }) {
-        const message = allocLifecycleMessage(allocator, "spore {s}: output directory already exists: {s}", .{ command, path });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
-    }
-    const parent = std.fs.path.dirname(path) orelse {
-        const message = allocLifecycleMessage(allocator, "spore {s}: output directory has no parent: {s}", .{ command, path });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
-    };
-    const stat = Io.Dir.cwd().statFile(io, parent, .{ .follow_symlinks = true }) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore {s}: output parent is not available: {s}", .{ command, @errorName(err) });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, command), message);
-    };
-    if (stat.kind != Io.File.Kind.directory) {
-        const message = allocLifecycleMessage(allocator, "spore {s}: output parent is not a directory: {s}", .{ command, parent });
-        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, command), message);
-    }
     return path;
 }
 
@@ -2282,16 +2238,6 @@ fn appendIntArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]co
 fn appendMemoryArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), memory: memory_config.Config) !void {
     try argv.append("--memory");
     try argv.append(try memory.cliValueAlloc(allocator));
-}
-
-fn waitForReady(command: []const u8, allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: u64) !void {
-    waitForReadyResult(allocator, io, paths, timeout_ms) catch |err| switch (err) {
-        error.MonitorReadyTimeout => {
-            std.debug.print("spore {s}: timed out waiting for monitor readiness\n", .{command});
-            std.process.exit(1);
-        },
-        else => |e| return e,
-    };
 }
 
 fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: u64) !void {
@@ -2635,13 +2581,6 @@ fn takeValueLifecycleCli(
     }
     i.* += 1;
     return args[i.*];
-}
-
-fn parseIntArg(comptime T: type, raw: []const u8, flag: []const u8) T {
-    return std.fmt.parseInt(T, raw, 10) catch {
-        std.debug.print("{s} must be an integer\n", .{flag});
-        std.process.exit(2);
-    };
 }
 
 fn parseIntArgLifecycleCli(
