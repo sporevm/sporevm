@@ -99,6 +99,7 @@ pub const HostStream = struct {
     connect_ms: ?u64 = null,
     request_delivered_ms: ?u64 = null,
     memory_pressure_ms: ?u64 = null,
+    memory_pressure_count: u32 = 0,
     first_output_ms: ?u64 = null,
     response_ms: ?u64 = null,
     guest_timing_ms: ?u64 = null,
@@ -281,6 +282,7 @@ pub const HostStream = struct {
         }
         if (std.mem.eql(u8, kind, "memory-pressure")) {
             if (self.memory_pressure_ms == null) self.memory_pressure_ms = self.elapsedMs();
+            self.memory_pressure_count +|= 1;
             return;
         }
         self.fail();
@@ -931,8 +933,18 @@ test "host stream frame parser handles split frames" {
     try std.testing.expectEqual(HostStreamState.complete, stream.state);
     try std.testing.expectEqual(@as(i32, 3), stream.exit_code.?);
     try std.testing.expect(stream.memory_pressure_ms != null);
+    try std.testing.expectEqual(@as(u32, 1), stream.memory_pressure_count);
     try std.testing.expectEqualStrings("hello world", capture.stdout[0..capture.stdout_len]);
     try std.testing.expectEqualStrings("err\n", capture.stderr[0..capture.stderr_len]);
+}
+
+test "host stream frame parser counts memory pressure frames" {
+    var stream = try HostStream.init(10700, "{}\n");
+    stream.state = .connected;
+
+    stream.appendOutput("memory-pressure\nmemory-pressure\n");
+
+    try std.testing.expectEqual(@as(u32, 2), stream.memory_pressure_count);
 }
 
 test "host stream frame parser is independent of two-part packetization" {

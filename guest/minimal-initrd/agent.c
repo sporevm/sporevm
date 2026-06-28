@@ -74,8 +74,8 @@ static int64_t t_request_decode = 0;
 static int64_t t_command_start = 0;
 static int64_t t_command_exit = 0;
 static int sigchld_pipe[2] = { -1, -1 };
+static const uint64_t memory_high_step_bytes = 402653184ULL;
 static const char memory_high_limit[] = "402653184\n";
-static const char memory_high_max[] = "max\n";
 
 static int path_is_dir(const char *path);
 
@@ -727,6 +727,21 @@ static int write_pid_file(const char *path, pid_t pid) {
   return write_text_file(path, buf);
 }
 
+static int read_u64_file(const char *path, uint64_t *out) {
+  char buf[32];
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) return -1;
+  buf[n] = '\0';
+  char *end = NULL;
+  unsigned long long value = strtoull(buf, &end, 10);
+  if (end == buf) return -1;
+  *out = (uint64_t)value;
+  return 0;
+}
+
 static int cgroup_child_path(char *out, size_t out_len, const char *dir, const char *file) {
   int n = snprintf(out, out_len, "%s/%s", dir, file);
   return (n > 0 && (size_t)n < out_len) ? 0 : -1;
@@ -768,10 +783,24 @@ static int setup_memory_pressure(struct session *session, pid_t pid) {
   return 0;
 }
 
-static void lift_memory_pressure_limit(struct session *session) {
+static void drain_memory_pressure_events(struct session *session) {
+  char buf[256];
+  (void)lseek(session->memory_pressure_fd, 0, SEEK_SET);
+  (void)read(session->memory_pressure_fd, buf, sizeof(buf));
+}
+
+static int rearm_memory_pressure_limit(struct session *session) {
   char path[192];
-  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "memory.high") != 0) return;
-  (void)write_text_file(path, memory_high_max);
+  uint64_t current = 0;
+  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "memory.current") != 0 ||
+      read_u64_file(path, &current) != 0) return -1;
+  uint64_t next = current + memory_high_step_bytes;
+  if (next < current) return -1;
+  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "memory.high") != 0) return -1;
+  char limit[32];
+  int n = snprintf(limit, sizeof(limit), "%llu\n", (unsigned long long)next);
+  if (n <= 0 || (size_t)n >= sizeof(limit)) return -1;
+  return write_text_file(path, limit);
 }
 
 static void close_client(struct client *client) {
@@ -1358,15 +1387,18 @@ static void maybe_send_session_exit(struct session *session, struct client *clie
 }
 
 static void maybe_send_memory_pressure(struct session *session, struct client *client) {
-  if (client->fd < 0 || !session->started || session->exited || session->memory_pressure_sent || session->memory_pressure_fd < 0) return;
+  if (client->fd < 0 || !session->started || session->exited || session->memory_pressure_fd < 0) return;
+  drain_memory_pressure_events(session);
   if (send_memory_pressure_frame(client->fd) != 0) {
     close_client(client);
     return;
   }
-  session->memory_pressure_sent = 1;
-  lift_memory_pressure_limit(session);
-  close(session->memory_pressure_fd);
-  session->memory_pressure_fd = -1;
+  session->memory_pressure_sent++;
+  if (rearm_memory_pressure_limit(session) != 0) {
+    dprintf(2, "memory pressure setup failed: rearm high limit errno=%d\n", errno);
+    close(session->memory_pressure_fd);
+    session->memory_pressure_fd = -1;
+  }
 }
 
 static void accept_request(int listener, struct session *session, struct client *client, int use_rootfs, int rootfs_ready, const char *rootfs_error, int network_requested, int network_ready, const char *network_error) {
@@ -1575,7 +1607,7 @@ int main(void) {
     fds[nfds].events = POLLIN;
     fds[nfds].revents = 0;
     roles[nfds++] = 4;
-    if (session.memory_pressure_fd >= 0 && !session.memory_pressure_sent) {
+    if (session.memory_pressure_fd >= 0) {
       fds[nfds].fd = session.memory_pressure_fd;
       fds[nfds].events = POLLPRI | POLLERR;
       fds[nfds].revents = 0;

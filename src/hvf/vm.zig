@@ -28,6 +28,8 @@ const platform_contract = @import("../platform.zig");
 const spore = @import("../spore.zig");
 const snapshot = @import("snapshot.zig");
 
+const hotplug_request_chunk: u64 = 2 * 1024 * 1024 * 1024;
+
 pub const Config = struct {
     kernel: []const u8,
     ram_size: u64 = 512 * 1024 * 1024,
@@ -507,7 +509,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         );
     }
     var exec_probe_done = false;
-    var virtio_mem_requested = mem_transport_index == null;
+    var handled_memory_pressure_count: u32 = 0;
+    var requested_hotplug_size: u64 = 0;
     var logged_first_vcpu_entry = false;
     var logged_first_guest_exit = false;
 
@@ -525,19 +528,22 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
             }
         }
-        if (!virtio_mem_requested and mem_transport_index != null) {
+        if (mem_transport_index != null) {
             if (config.exec_probe) |probe| {
-                if (probe.memory_pressure_ms != null and probe.state == .connected) {
+                const new_pressure_events = probe.memory_pressure_count -| handled_memory_pressure_count;
+                if (new_pressure_events > 0 and probe.state == .connected) {
                     const idx = mem_transport_index.?;
                     const mapping = if (hotplug_mapping) |*m| m else unreachable;
-                    try mem_dev.setRequestedSize(@intCast(mapping.bytes.len));
+                    var i: u32 = 0;
+                    while (i < new_pressure_events and requested_hotplug_size < mapping.bytes.len) : (i += 1) {
+                        requested_hotplug_size = @min(mapping.bytes.len, requested_hotplug_size + hotplug_request_chunk);
+                    }
+                    handled_memory_pressure_count = probe.memory_pressure_count;
+                    try mem_dev.setRequestedSize(@intCast(requested_hotplug_size));
                     _ = transports_buf[idx].raiseConfigChange();
                     try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(@intCast(idx)), true), "raise virtio-mem config spi");
-                    std.log.debug("virtio-mem requested hotplug size: bytes={d}", .{mapping.bytes.len});
-                    virtio_mem_requested = true;
+                    std.log.debug("virtio-mem requested hotplug size: bytes={d} pressure_count={d}", .{ requested_hotplug_size, handled_memory_pressure_count });
                 }
-            } else {
-                virtio_mem_requested = true;
             }
         }
         if (config.network.failed()) return error.NetworkGatewayFailed;

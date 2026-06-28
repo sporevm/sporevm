@@ -11,7 +11,7 @@ spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
 backend="${SPORE_BACKEND:-}"
 image="${SPORE_AUTO_MEMORY_IMAGE:-docker.io/library/node:22-alpine}"
 idle_max_kb="${SPORE_AUTO_MEMORY_IDLE_MAX_KB:-1000000}"
-pressure_min_kb="${SPORE_AUTO_MEMORY_PRESSURE_MIN_KB:-10000000}"
+pressure_min_kb="${SPORE_AUTO_MEMORY_PRESSURE_MIN_KB:-1500000}"
 
 if [[ -z "${backend}" ]]; then
   case "$(uname -s)" in

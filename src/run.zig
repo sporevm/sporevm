@@ -59,7 +59,6 @@ const managed_run_kernel_required_config_symbols = [_][]const u8{
     "CONFIG_CGROUP_PIDS",
     "CONFIG_CPUSETS",
     "CONFIG_CGROUP_DEVICE",
-    "CONFIG_PSI",
     "CONFIG_MEMORY_HOTPLUG",
     "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE",
     "CONFIG_MEMORY_HOTREMOVE",
@@ -3767,7 +3766,6 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
             "CONFIG_CGROUP_PIDS=y\n" ++
             "CONFIG_CPUSETS=y\n" ++
             "CONFIG_CGROUP_DEVICE=y\n" ++
-            "CONFIG_PSI=y\n" ++
             "CONFIG_MEMORY_HOTPLUG=y\n" ++
             "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
             "CONFIG_MEMORY_HOTREMOVE=y\n" ++
@@ -3812,7 +3810,6 @@ test "managed run kernel config requires Docker and virtio-mem runtime symbols" 
         "CONFIG_CGROUP_PIDS=y\n" ++
         "CONFIG_CPUSETS=y\n" ++
         "CONFIG_CGROUP_DEVICE=y\n" ++
-        "CONFIG_PSI=y\n" ++
         "CONFIG_MEMORY_HOTPLUG=y\n" ++
         "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
         "CONFIG_MEMORY_HOTREMOVE=y\n" ++
