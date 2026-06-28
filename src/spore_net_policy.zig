@@ -389,7 +389,7 @@ pub const Runtime = struct {
         if (std.mem.readInt(u16, query[4..6], .big) != 1) return 0;
         if (std.mem.readInt(u16, response[4..6], .big) != 1) return 0;
 
-        const query_name_end = skipDnsName(query, dns_header_len) orelse return 0;
+        const query_name_end = spore_net.skipDnsName(query, dns_header_len) orelse return 0;
         if (query_name_end + 4 > query.len) return 0;
         const qtype = std.mem.readInt(u16, query[query_name_end..][0..2], .big);
         const qclass = std.mem.readInt(u16, query[query_name_end + 2 ..][0..2], .big);
@@ -400,7 +400,7 @@ pub const Runtime = struct {
         const exact_match_count = self.exactRuleIndicesForDnsName(query, dns_header_len, &exact_matches);
         if (legacy_host_index == null and exact_match_count == 0) return 0;
 
-        var offset = skipDnsName(response, dns_header_len) orelse return 0;
+        var offset = spore_net.skipDnsName(response, dns_header_len) orelse return 0;
         if (offset + 4 > response.len) return 0;
         offset += 4;
 
@@ -409,7 +409,7 @@ pub const Runtime = struct {
         var i: usize = 0;
         while (i < answer_count) : (i += 1) {
             const name_start = offset;
-            const name_end = skipDnsName(response, offset) orelse return learned;
+            const name_end = spore_net.skipDnsName(response, offset) orelse return learned;
             if (name_end + 10 > response.len) return learned;
             const answer_type = std.mem.readInt(u16, response[name_end..][0..2], .big);
             const answer_class = std.mem.readInt(u16, response[name_end + 2 ..][0..2], .big);
@@ -581,31 +581,6 @@ fn prefixMask(prefix_len: u8) u32 {
     if (prefix_len == 0) return 0;
     const shift: u5 = @intCast(32 - prefix_len);
     return @as(u32, std.math.maxInt(u32)) << shift;
-}
-
-fn skipDnsName(packet: []const u8, start: usize) ?usize {
-    var offset = start;
-    var end: ?usize = null;
-    var jumps: usize = 0;
-    while (true) {
-        if (offset >= packet.len) return null;
-        const len = packet[offset];
-        if ((len & 0xc0) == 0xc0) {
-            if (offset + 1 >= packet.len) return null;
-            const pointer = (@as(usize, len & 0x3f) << 8) | packet[offset + 1];
-            if (pointer >= packet.len) return null;
-            if (end == null) end = offset + 2;
-            jumps += 1;
-            if (jumps > 16) return null;
-            offset = pointer;
-            continue;
-        }
-        if ((len & 0xc0) != 0) return null;
-        offset += 1;
-        if (len == 0) return end orelse offset;
-        if (len > 63 or offset + len > packet.len) return null;
-        offset += len;
-    }
 }
 
 fn dnsNameMatchesHost(packet: []const u8, start: usize, host: []const u8) bool {
