@@ -76,7 +76,8 @@ pausing the source VM.
 
 Named checkpoints support diskless VMs, image-created writable rootfs state, and
 explicit `--rootfs PATH` checkpoints backed by exact immutable rootfs artifacts.
-Named live fork is currently diskless-only.
+Supported backends can create, suspend, and resume fixed-RAM multi-vCPU named
+VMs. Named live fork is currently single-vCPU and diskless-only.
 
 ## Monitor Boundary
 
@@ -93,8 +94,7 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
 ## Limits
 
 - No stdin streaming, TTY, or interactive terminal.
-- No multi-vCPU named lifecycle support yet; one-shot run support is
-  backend-dependent.
+- No multi-vCPU named live fork yet.
 - No disk-backed or networked named live fork yet.
 - No live network-flow checkpointing.
 - No OCI `Entrypoint`, `Cmd`, or `User` semantics. Callers pass explicit argv.

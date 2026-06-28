@@ -18,6 +18,7 @@ const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_block_index = @import("rootfs_index.zig");
 const spore = @import("spore.zig");
+const topology = @import("topology.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Io = std.Io;
 
@@ -44,6 +45,81 @@ pub const disk_objects_blake3_dir_path = "diskobjects/blake3";
 pub const inspect_bundle_schema = contracts.inspect_bundle_schema;
 pub const pull_result_schema = contracts.pull_result_schema;
 pub const bundle_schema_version = contracts.bundle_schema_version;
+
+const LoadedManifest = struct {
+    v0: ?std.json.Parsed(spore.Manifest) = null,
+    v1: ?std.json.Parsed(spore.ManifestV1) = null,
+
+    fn loadDir(allocator: std.mem.Allocator, dir: []const u8) Error!LoadedManifest {
+        var loaded = LoadedManifest{};
+        loaded.v0 = spore.loadManifest(allocator, dir) catch |err| switch (err) {
+            error.BadManifest => null,
+            else => |e| return e,
+        };
+        if (loaded.v0 == null) loaded.v1 = try spore.loadManifestV1(allocator, dir);
+        return loaded;
+    }
+
+    fn loadPath(allocator: std.mem.Allocator, path: []const u8) Error!LoadedManifest {
+        var loaded = LoadedManifest{};
+        loaded.v0 = spore.loadManifestPath(allocator, path) catch |err| switch (err) {
+            error.BadManifest => null,
+            else => |e| return e,
+        };
+        if (loaded.v0 == null) loaded.v1 = try spore.loadManifestV1Path(allocator, path);
+        return loaded;
+    }
+
+    fn deinit(self: *LoadedManifest) void {
+        if (self.v0) |*parsed| parsed.deinit();
+        if (self.v1) |*parsed| parsed.deinit();
+    }
+
+    fn memoryPtr(self: *LoadedManifest) *spore.MemoryManifest {
+        if (self.v0) |*parsed| return &parsed.value.memory;
+        return &self.v1.?.value.memory;
+    }
+
+    fn memory(self: LoadedManifest) spore.MemoryManifest {
+        if (self.v0) |parsed| return parsed.value.memory;
+        return self.v1.?.value.memory;
+    }
+
+    fn clearMemoryBacking(self: *LoadedManifest) void {
+        self.memoryPtr().backing = null;
+    }
+
+    fn ramSize(self: LoadedManifest) u64 {
+        if (self.v0) |parsed| return parsed.value.platform.ram_size;
+        return self.v1.?.value.platform.ram_size;
+    }
+
+    fn rootfs(self: LoadedManifest) ?spore.Rootfs {
+        if (self.v0) |parsed| return parsed.value.rootfs;
+        return self.v1.?.value.rootfs;
+    }
+
+    fn disk(self: LoadedManifest) ?spore.Disk {
+        if (self.v0) |parsed| return parsed.value.disk;
+        return self.v1.?.value.disk;
+    }
+
+    fn saveDir(self: LoadedManifest, allocator: std.mem.Allocator, dir: []const u8) Error!void {
+        if (self.v0) |parsed| {
+            try spore.saveManifest(allocator, dir, parsed.value);
+        } else {
+            try spore.saveManifestV1(allocator, dir, self.v1.?.value);
+        }
+    }
+
+    fn savePath(self: LoadedManifest, allocator: std.mem.Allocator, path: []const u8) Error!void {
+        if (self.v0) |parsed| {
+            try spore.saveManifestPath(allocator, path, parsed.value);
+        } else {
+            try spore.saveManifestV1Path(allocator, path, self.v1.?.value);
+        }
+    }
+};
 
 pub const RootfsBundlePolicy = enum {
     exact_bytes,
@@ -466,9 +542,9 @@ fn findBundleChild(index: BundleIndex, child_id: []const u8) Error!BundleChild {
 }
 
 fn inspectLegacyRootfs(allocator: std.mem.Allocator, bundle_dir: []const u8) Error!RootfsBundleSummary {
-    const parsed_manifest = try spore.loadManifest(allocator, bundle_dir);
+    var parsed_manifest = try LoadedManifest.loadDir(allocator, bundle_dir);
     defer parsed_manifest.deinit();
-    const rootfs = parsed_manifest.value.rootfs orelse return .{};
+    const rootfs = parsed_manifest.rootfs() orelse return .{};
     return .{
         .artifact_count = 1,
         .exact_bytes_count = 1,
@@ -505,14 +581,15 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
     if (options.children_dir != null) return packIndexed(allocator, options);
     if (options.rootfs_policy != .exact_bytes) return error.BadManifest;
 
-    const parsed = try spore.loadManifest(allocator, options.spore_dir);
-    defer parsed.deinit();
-    var manifest = parsed.value;
-    manifest.memory.backing = null;
-    if (manifest.rootfs) |rootfs| {
+    var manifest = try LoadedManifest.loadDir(allocator, options.spore_dir);
+    defer manifest.deinit();
+    manifest.clearMemoryBacking();
+    if (manifest.rootfs()) |rootfs| {
         if (rootfs.storage != null) return packIndexed(allocator, options);
     }
-    const plan = try spore.validateMemoryForRam(manifest.memory, @intCast(manifest.platform.ram_size));
+    const memory = manifest.memory();
+    const ram_size = manifest.ramSize();
+    const plan = try spore.validateMemoryForRam(memory, @intCast(ram_size));
 
     try ensureNewDir(try pathZ(allocator, "{s}", .{options.out_dir}));
     try ensureNewDir(try pathZ(allocator, "{s}/chunkpacks", .{options.out_dir}));
@@ -530,11 +607,11 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
 
     var i: usize = 0;
     while (i < plan.chunk_count) : (i += 1) {
-        const ref = manifest.memory.chunks[i] orelse continue;
+        const ref = memory.chunks[i] orelse continue;
         if (seen.contains(ref)) continue;
         seen.put(ref, {}) catch return error.OutOfMemory;
 
-        const range = chunkRange(plan, @intCast(manifest.platform.ram_size), i) catch return error.BadManifest;
+        const range = chunkRange(plan, @intCast(ram_size), i) catch return error.BadManifest;
         const expected_size = range.end - range.start;
         const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ options.spore_dir, ref });
         const data = try readFileAll(allocator, chunk_path, expected_size);
@@ -555,9 +632,9 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
         payload_bytes += @intCast(data.len);
     }
 
-    const rootfs_payload_bytes = try packRootfsArtifact(allocator, options, manifest);
-    try packDiskLayersForManifest(allocator, options.spore_dir, options.out_dir, manifest);
-    try spore.saveManifest(allocator, options.out_dir, manifest);
+    const rootfs_payload_bytes = try packRootfsArtifact(allocator, options, manifest.rootfs());
+    try packDiskLayersForManifest(allocator, options.spore_dir, options.out_dir, manifest.disk());
+    try manifest.saveDir(allocator, options.out_dir);
     try saveIndex(allocator, options.out_dir, .{
         .chunk_size = spore.chunk_size,
         .chunks = entries[0..entry_count],
@@ -572,7 +649,7 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
         .packed_chunk_count = entry_count,
         .pack_count = 1,
         .payload_bytes = payload_bytes,
-        .rootfs_artifact_count = if (manifest.rootfs == null) 0 else 1,
+        .rootfs_artifact_count = if (manifest.rootfs() == null) 0 else 1,
         .rootfs_payload_bytes = rootfs_payload_bytes,
     };
 }
@@ -619,13 +696,13 @@ fn packIndexed(allocator: std.mem.Allocator, options: PackOptions) Error!PackRes
     var rootfs_payload_bytes: u64 = 0;
     var total_chunk_count: usize = 0;
 
-    const parsed_parent = try spore.loadManifest(allocator, options.spore_dir);
-    defer parsed_parent.deinit();
-    var parent_manifest = parsed_parent.value;
-    parent_manifest.memory.backing = null;
+    var parent_manifest = try LoadedManifest.loadDir(allocator, options.spore_dir);
+    defer parent_manifest.deinit();
+    parent_manifest.clearMemoryBacking();
     total_chunk_count += (try packManifestChunks(
         allocator,
-        parent_manifest,
+        parent_manifest.memory(),
+        parent_manifest.ramSize(),
         options.spore_dir,
         pack_fd,
         &seen_chunks,
@@ -635,29 +712,25 @@ fn packIndexed(allocator: std.mem.Allocator, options: PackOptions) Error!PackRes
     rootfs_payload_bytes += try packRootfsIndexed(
         allocator,
         options,
-        parent_manifest,
+        parent_manifest.rootfs(),
         &seen_rootfs,
         &rootfs_entries,
         &seen_rootfs_storage,
         &rootfs_storage_entries,
         &seen_rootfs_objects,
     );
-    try packDiskLayersForManifest(allocator, options.spore_dir, options.out_dir, parent_manifest);
-    try spore.saveManifestPath(
-        allocator,
-        try pathZ(allocator, "{s}/{s}", .{ options.out_dir, parent_manifest_path }),
-        parent_manifest,
-    );
+    try packDiskLayersForManifest(allocator, options.spore_dir, options.out_dir, parent_manifest.disk());
+    try parent_manifest.savePath(allocator, try pathZ(allocator, "{s}/{s}", .{ options.out_dir, parent_manifest_path }));
 
     for (children) |child| {
         const child_dir = child.path;
-        const parsed_child = try spore.loadManifest(allocator, child_dir);
-        defer parsed_child.deinit();
-        var child_manifest = parsed_child.value;
-        child_manifest.memory.backing = null;
+        var child_manifest = try LoadedManifest.loadDir(allocator, child_dir);
+        defer child_manifest.deinit();
+        child_manifest.clearMemoryBacking();
         total_chunk_count += (try packManifestChunks(
             allocator,
-            child_manifest,
+            child_manifest.memory(),
+            child_manifest.ramSize(),
             child_dir,
             pack_fd,
             &seen_chunks,
@@ -667,20 +740,16 @@ fn packIndexed(allocator: std.mem.Allocator, options: PackOptions) Error!PackRes
         rootfs_payload_bytes += try packRootfsIndexed(
             allocator,
             options,
-            child_manifest,
+            child_manifest.rootfs(),
             &seen_rootfs,
             &rootfs_entries,
             &seen_rootfs_storage,
             &rootfs_storage_entries,
             &seen_rootfs_objects,
         );
-        try packDiskLayersForManifest(allocator, child_dir, options.out_dir, child_manifest);
+        try packDiskLayersForManifest(allocator, child_dir, options.out_dir, child_manifest.disk());
         const manifest_rel = try childManifestRelPath(allocator, child.id);
-        try spore.saveManifestPath(
-            allocator,
-            try pathZ(allocator, "{s}/{s}", .{ options.out_dir, manifest_rel }),
-            child_manifest,
-        );
+        try child_manifest.savePath(allocator, try pathZ(allocator, "{s}/{s}", .{ options.out_dir, manifest_rel }));
         try bundle_children.append(.{
             .id = child.id,
             .manifest = manifest_rel,
@@ -726,11 +795,10 @@ pub fn unpack(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unpack
     if (try hasBundleIndex(allocator, options.bundle_dir)) return unpackIndexed(allocator, options);
     if (options.child_id != null) return error.BadManifest;
 
-    const parsed_manifest = try spore.loadManifest(allocator, options.bundle_dir);
-    defer parsed_manifest.deinit();
-    var manifest = parsed_manifest.value;
-    manifest.memory.backing = null;
-    const plan = try spore.validateMemoryForRam(manifest.memory, @intCast(manifest.platform.ram_size));
+    var manifest = try LoadedManifest.loadDir(allocator, options.bundle_dir);
+    defer manifest.deinit();
+    manifest.clearMemoryBacking();
+    const plan = try spore.validateMemoryForRam(manifest.memory(), @intCast(manifest.ramSize()));
 
     const parsed_index = try loadIndex(allocator, options.bundle_dir);
     defer parsed_index.deinit();
@@ -743,16 +811,17 @@ pub fn unpack(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unpack
         allocator,
         options.io,
         options.out_dir,
-        manifest,
+        manifest.memory(),
+        manifest.ramSize(),
         plan,
         &by_id,
         local_source.source(),
         null,
     );
 
-    const rootfs_result = try unpackRootfsArtifact(allocator, options, manifest);
-    try unpackDiskLayersForManifest(allocator, options.bundle_dir, options.out_dir, manifest);
-    try spore.saveManifest(allocator, options.out_dir, manifest);
+    const rootfs_result = try unpackRootfsArtifact(allocator, options, manifest.rootfs());
+    try unpackDiskLayersForManifest(allocator, options.bundle_dir, options.out_dir, manifest.disk());
+    try manifest.saveDir(allocator, options.out_dir);
     const bundle_digest = try digestHex(allocator, options.bundle_dir);
 
     return .{
@@ -774,20 +843,19 @@ fn unpackIndexed(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unp
 
     const child_id = if (options.child_id) |id| try canonicalChildId(allocator, id) else null;
     const selected_rel = try selectedManifestPath(allocator, bundle_index, child_id);
-    const parsed_manifest = try spore.loadManifestPath(
+    var manifest = try LoadedManifest.loadPath(
         allocator,
         try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, selected_rel }),
     );
-    defer parsed_manifest.deinit();
-    var manifest = parsed_manifest.value;
-    manifest.memory.backing = null;
-    const plan = try spore.validateMemoryForRam(manifest.memory, @intCast(manifest.platform.ram_size));
+    defer manifest.deinit();
+    manifest.clearMemoryBacking();
+    const plan = try spore.validateMemoryForRam(manifest.memory(), @intCast(manifest.ramSize()));
 
     const parsed_index = try loadIndex(allocator, options.bundle_dir);
     defer parsed_index.deinit();
     try validateIndex(allocator, parsed_index.value);
 
-    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, options, bundle_index, manifest);
+    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, options, bundle_index, manifest.rootfs());
 
     var by_id = try indexById(allocator, parsed_index.value);
     defer by_id.deinit();
@@ -796,15 +864,16 @@ fn unpackIndexed(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unp
         allocator,
         options.io,
         options.out_dir,
-        manifest,
+        manifest.memory(),
+        manifest.ramSize(),
         plan,
         &by_id,
         local_source.source(),
         null,
     );
 
-    try unpackDiskLayersForManifest(allocator, options.bundle_dir, options.out_dir, manifest);
-    try spore.saveManifest(allocator, options.out_dir, manifest);
+    try unpackDiskLayersForManifest(allocator, options.bundle_dir, options.out_dir, manifest.disk());
+    try manifest.saveDir(allocator, options.out_dir);
     const bundle_digest = try digestHex(allocator, options.bundle_dir);
 
     return .{
@@ -882,14 +951,13 @@ fn pullLocalIndexedBundle(
     const bundle_index = parsed_bundle.value;
 
     const selected_rel = try selectedManifestPath(allocator, bundle_index, child_id);
-    const parsed_manifest = try spore.loadManifestPath(
+    var manifest = try LoadedManifest.loadPath(
         allocator,
         try pathZ(allocator, "{s}/{s}", .{ bundle_dir, selected_rel }),
     );
-    defer parsed_manifest.deinit();
-    var manifest = parsed_manifest.value;
-    manifest.memory.backing = null;
-    const plan = try spore.validateMemoryForRam(manifest.memory, @intCast(manifest.platform.ram_size));
+    defer manifest.deinit();
+    manifest.clearMemoryBacking();
+    const plan = try spore.validateMemoryForRam(manifest.memory(), @intCast(manifest.ramSize()));
 
     const parsed_index = try loadIndex(allocator, bundle_dir);
     defer parsed_index.deinit();
@@ -902,7 +970,7 @@ fn pullLocalIndexedBundle(
         .child_id = child_id,
         .allow_metadata_only_rootfs = options.allow_metadata_only_rootfs,
     };
-    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, unpack_options, bundle_index, manifest);
+    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, unpack_options, bundle_index, manifest.rootfs());
 
     var by_id = try indexById(allocator, parsed_index.value);
     defer by_id.deinit();
@@ -912,15 +980,16 @@ fn pullLocalIndexedBundle(
         allocator,
         options.io,
         options.out_dir,
-        manifest,
+        manifest.memory(),
+        manifest.ramSize(),
         plan,
         &by_id,
         local_source.source(),
         options.bundle_cache_dir,
     );
 
-    try unpackDiskLayersForManifest(allocator, bundle_dir, options.out_dir, manifest);
-    try spore.saveManifest(allocator, options.out_dir, manifest);
+    try unpackDiskLayersForManifest(allocator, bundle_dir, options.out_dir, manifest.disk());
+    try manifest.saveDir(allocator, options.out_dir);
     const bundle_digest = try digestHex(allocator, bundle_dir);
 
     return .{
@@ -971,15 +1040,15 @@ pub fn digestHex(allocator: std.mem.Allocator, bundle_dir: []const u8) Error![]c
     try updateHashWithFile(allocator, &h, bundle_dir, "manifest.json");
     try updateHashWithFile(allocator, &h, bundle_dir, index_path);
     try updateHashWithFile(allocator, &h, bundle_dir, pack_path);
-    const parsed_manifest = try spore.loadManifest(allocator, bundle_dir);
+    var parsed_manifest = try LoadedManifest.loadDir(allocator, bundle_dir);
     defer parsed_manifest.deinit();
-    if (parsed_manifest.value.rootfs) |rootfs| {
+    if (parsed_manifest.rootfs()) |rootfs| {
         const rel_path = try rootfsArtifactRelPath(allocator, rootfs.artifact);
         try updateHashWithFile(allocator, &h, bundle_dir, rel_path);
     }
     var seen_disk_files = std.StringHashMap(void).init(allocator);
     defer seen_disk_files.deinit();
-    try updateHashWithDiskFilesForManifest(allocator, &h, bundle_dir, parsed_manifest.value, &seen_disk_files);
+    try updateHashWithDiskFilesForManifest(allocator, &h, bundle_dir, parsed_manifest.disk(), &seen_disk_files);
 
     var digest: [Sha256.digest_length]u8 = undefined;
     h.final(&digest);
@@ -1234,7 +1303,8 @@ fn materializeChunks(
     allocator: std.mem.Allocator,
     io: Io,
     out_dir: []const u8,
-    manifest: spore.Manifest,
+    memory: spore.MemoryManifest,
+    ram_size: u64,
     plan: spore.MemoryPlan,
     by_id: *const std.StringHashMap(IndexChunk),
     source: VerifiedContentSource,
@@ -1249,11 +1319,11 @@ fn materializeChunks(
 
     var i: usize = 0;
     while (i < plan.chunk_count) : (i += 1) {
-        const ref = manifest.memory.chunks[i] orelse continue;
+        const ref = memory.chunks[i] orelse continue;
         if (seen.contains(ref)) continue;
         seen.put(ref, {}) catch return error.OutOfMemory;
         const entry = by_id.get(ref) orelse return error.BadManifest;
-        const range = chunkRange(plan, @intCast(manifest.platform.ram_size), i) catch return error.BadManifest;
+        const range = chunkRange(plan, @intCast(ram_size), i) catch return error.BadManifest;
         const expected_size = range.end - range.start;
         const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ out_dir, ref });
         if (chunk_cache_dir) |cache_dir| {
@@ -1397,22 +1467,23 @@ fn chunkCachePath(allocator: std.mem.Allocator, cache_dir: []const u8, chunk_id:
 
 fn packManifestChunks(
     allocator: std.mem.Allocator,
-    manifest: spore.Manifest,
+    memory: spore.MemoryManifest,
+    ram_size: u64,
     source_dir: []const u8,
     pack_fd: std.c.fd_t,
     seen: *std.StringHashMap(void),
     entries: *std.array_list.Managed(IndexChunk),
     payload_bytes: *u64,
 ) Error!spore.MemoryPlan {
-    const plan = try spore.validateMemoryForRam(manifest.memory, @intCast(manifest.platform.ram_size));
+    const plan = try spore.validateMemoryForRam(memory, @intCast(ram_size));
     var i: usize = 0;
     while (i < plan.chunk_count) : (i += 1) {
-        const ref = manifest.memory.chunks[i] orelse continue;
+        const ref = memory.chunks[i] orelse continue;
         if (seen.contains(ref)) continue;
         const ref_copy = allocator.dupe(u8, ref) catch return error.OutOfMemory;
         seen.put(ref_copy, {}) catch return error.OutOfMemory;
 
-        const range = chunkRange(plan, @intCast(manifest.platform.ram_size), i) catch return error.BadManifest;
+        const range = chunkRange(plan, @intCast(ram_size), i) catch return error.BadManifest;
         const expected_size = range.end - range.start;
         const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ source_dir, ref });
         const data = try readFileAll(allocator, chunk_path, expected_size);
@@ -1434,8 +1505,8 @@ fn packManifestChunks(
     return plan;
 }
 
-fn packRootfsArtifact(allocator: std.mem.Allocator, options: PackOptions, manifest: spore.Manifest) Error!u64 {
-    const rootfs = manifest.rootfs orelse return 0;
+fn packRootfsArtifact(allocator: std.mem.Allocator, options: PackOptions, rootfs_opt: ?spore.Rootfs) Error!u64 {
+    const rootfs = rootfs_opt orelse return 0;
     const cache_root = options.rootfs_cache_dir orelse return error.IoFailed;
     try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_dir_path }));
     try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_blake3_dir_path }));
@@ -1452,14 +1523,14 @@ fn packRootfsArtifact(allocator: std.mem.Allocator, options: PackOptions, manife
 fn packRootfsIndexed(
     allocator: std.mem.Allocator,
     options: PackOptions,
-    manifest: spore.Manifest,
+    rootfs_opt: ?spore.Rootfs,
     seen_artifacts: *std.StringHashMap(void),
     entries: *std.array_list.Managed(RootfsArtifactEntry),
     seen_storages: *std.StringHashMap(void),
     storage_entries: *std.array_list.Managed(RootfsStorageEntry),
     seen_objects: *std.StringHashMap(void),
 ) Error!u64 {
-    const rootfs = manifest.rootfs orelse return 0;
+    const rootfs = rootfs_opt orelse return 0;
     if (rootfs.storage != null) {
         return packRootfsStorageIndexed(
             allocator,
@@ -1575,8 +1646,8 @@ fn packRootfsStorageIndexed(
     return payload_bytes;
 }
 
-fn unpackRootfsArtifact(allocator: std.mem.Allocator, options: UnpackOptions, manifest: spore.Manifest) Error!RootfsMaterializeResult {
-    const rootfs = manifest.rootfs orelse return .{};
+fn unpackRootfsArtifact(allocator: std.mem.Allocator, options: UnpackOptions, rootfs_opt: ?spore.Rootfs) Error!RootfsMaterializeResult {
+    const rootfs = rootfs_opt orelse return .{};
     if (rootfs.storage != null) return error.BadManifest;
     const cache_root = options.rootfs_cache_dir orelse return error.IoFailed;
     const rel_path = try rootfsArtifactRelPath(allocator, rootfs.artifact);
@@ -1599,9 +1670,9 @@ fn unpackRootfsArtifactIndexed(
     allocator: std.mem.Allocator,
     options: UnpackOptions,
     bundle_index: BundleIndex,
-    manifest: spore.Manifest,
+    rootfs_opt: ?spore.Rootfs,
 ) Error!RootfsMaterializeResult {
-    const rootfs = manifest.rootfs orelse return .{};
+    const rootfs = rootfs_opt orelse return .{};
     const cache_root = options.rootfs_cache_dir orelse return error.IoFailed;
     if (bundle_index.rootfs_index == null) return error.BadManifest;
     const parsed_rootfs_index = try loadRootfsIndex(allocator, options.bundle_dir);
@@ -1801,9 +1872,9 @@ fn packDiskLayersForManifest(
     allocator: std.mem.Allocator,
     source_dir: []const u8,
     bundle_dir: []const u8,
-    manifest: spore.Manifest,
+    disk_opt: ?spore.Disk,
 ) Error!void {
-    const disk = manifest.disk orelse return;
+    const disk = disk_opt orelse return;
     disk_layer.copyLayerChain(allocator, source_dir, bundle_dir, disk) catch |err| return diskLayerError(err);
 }
 
@@ -1811,9 +1882,9 @@ fn unpackDiskLayersForManifest(
     allocator: std.mem.Allocator,
     bundle_dir: []const u8,
     out_dir: []const u8,
-    manifest: spore.Manifest,
+    disk_opt: ?spore.Disk,
 ) Error!void {
-    const disk = manifest.disk orelse return;
+    const disk = disk_opt orelse return;
     disk_layer.copyLayerChain(allocator, bundle_dir, out_dir, disk) catch |err| return diskLayerError(err);
 }
 
@@ -1834,22 +1905,22 @@ fn updateHashWithDiskFilesForManifestPath(
     manifest_rel: []const u8,
     seen: *std.StringHashMap(void),
 ) Error!void {
-    const parsed_manifest = try spore.loadManifestPath(
+    var parsed_manifest = try LoadedManifest.loadPath(
         allocator,
         try pathZ(allocator, "{s}/{s}", .{ bundle_dir, manifest_rel }),
     );
     defer parsed_manifest.deinit();
-    try updateHashWithDiskFilesForManifest(allocator, h, bundle_dir, parsed_manifest.value, seen);
+    try updateHashWithDiskFilesForManifest(allocator, h, bundle_dir, parsed_manifest.disk(), seen);
 }
 
 fn updateHashWithDiskFilesForManifest(
     allocator: std.mem.Allocator,
     h: *Sha256,
     bundle_dir: []const u8,
-    manifest: spore.Manifest,
+    disk_opt: ?spore.Disk,
     seen: *std.StringHashMap(void),
 ) Error!void {
-    const disk = manifest.disk orelse return;
+    const disk = disk_opt orelse return;
     for (disk.layers) |layer_ref| {
         const layer_rel = try diskLayerRelPath(allocator, layer_ref);
         if (try markBundleFileSeen(seen, layer_rel)) {
@@ -2118,12 +2189,12 @@ fn appendDiskBundleFilesForManifestPath(
     files: *std.array_list.Managed([]const u8),
     seen: *std.StringHashMap(void),
 ) Error!void {
-    const parsed_manifest = try spore.loadManifestPath(
+    var parsed_manifest = try LoadedManifest.loadPath(
         allocator,
         try pathZ(allocator, "{s}/{s}", .{ bundle_dir, manifest_rel }),
     );
     defer parsed_manifest.deinit();
-    const disk = parsed_manifest.value.disk orelse return;
+    const disk = parsed_manifest.disk() orelse return;
     for (disk.layers) |layer_ref| {
         const layer_rel = try diskLayerRelPath(allocator, layer_ref);
         try appendBundleFileIfMissing(allocator, files, seen, layer_rel);
@@ -2441,12 +2512,12 @@ fn downloadS3DiskFilesForManifestPath(
     manifest_rel: []const u8,
     seen: *std.StringHashMap(void),
 ) Error!u64 {
-    const parsed_manifest = try spore.loadManifestPath(
+    var parsed_manifest = try LoadedManifest.loadPath(
         allocator,
         try pathZ(allocator, "{s}/{s}", .{ bundle_dir, manifest_rel }),
     );
     defer parsed_manifest.deinit();
-    const disk = parsed_manifest.value.disk orelse return 0;
+    const disk = parsed_manifest.disk() orelse return 0;
     var bytes: u64 = 0;
     for (disk.layers) |layer_ref| {
         const layer_rel = try diskLayerRelPath(allocator, layer_ref);
@@ -2475,12 +2546,12 @@ fn downloadHttpDiskFilesForManifestPath(
     manifest_rel: []const u8,
     seen: *std.StringHashMap(void),
 ) Error!u64 {
-    const parsed_manifest = try spore.loadManifestPath(
+    var parsed_manifest = try LoadedManifest.loadPath(
         allocator,
         try pathZ(allocator, "{s}/{s}", .{ bundle_dir, manifest_rel }),
     );
     defer parsed_manifest.deinit();
-    const disk = parsed_manifest.value.disk orelse return 0;
+    const disk = parsed_manifest.disk() orelse return 0;
     var bytes: u64 = 0;
     for (disk.layers) |layer_ref| {
         const layer_rel = try diskLayerRelPath(allocator, layer_ref);
@@ -3139,6 +3210,52 @@ fn testManifest(memory: spore.MemoryManifest, ram_size: u64, initial_generation:
     };
 }
 
+fn testVcpuState(index: topology.VcpuIndex) spore.VcpuState {
+    return .{
+        .index = index,
+        .mpidr = topology.mpidrForIndex(index),
+        .gprs = [_]u64{0} ** 31,
+        .pc = 0,
+        .cpsr = 0,
+        .fpcr = 0,
+        .fpsr = 0,
+        .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+        .sys_regs = &.{},
+        .icc_regs = &.{},
+        .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+    };
+}
+
+fn testManifestV1(memory: spore.MemoryManifest, ram_size: u64, vcpus: []spore.VcpuState) spore.ManifestV1 {
+    return .{
+        .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
+            .device_model_version = 5,
+            .vcpu_count = @intCast(vcpus.len),
+            .ram_base = 0x8000_0000,
+            .ram_size = ram_size,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0802_0000,
+            .gic_redist_stride = 0x2_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{
+            .vcpus = vcpus,
+            .gic = .{
+                .kind = .backend_private,
+                .backend_private = .{
+                    .backend = .hvf,
+                    .format = gicv3.hvf_backend_private_format,
+                    .data_b64 = "AA==",
+                },
+            },
+        },
+        .devices = &.{},
+        .generation = .{ .generation = 1, .interrupt_status = 0, .params_b64 = "" },
+        .memory = memory,
+    };
+}
+
 fn testRootfsManifest(memory: spore.MemoryManifest, ram_size: u64, initial_generation: u64, artifact: spore.RootfsArtifactRef) spore.Manifest {
     var manifest = testManifest(memory, ram_size, initial_generation);
     manifest.devices = test_rootfs_transport_devices[0..];
@@ -3319,6 +3436,87 @@ test "pack and unpack chunkpack bundle strips local backing" {
     const restored_manifest = try spore.loadManifest(arena, out_dir);
     defer restored_manifest.deinit();
     try std.testing.expect(restored_manifest.value.memory.backing == null);
+    const out = try arena.alloc(u8, ram.len);
+    @memset(out, 0xCC);
+    try spore.loadMemory(arena, out_dir, restored_manifest.value.memory, out);
+    try std.testing.expectEqualSlices(u8, ram, out);
+}
+
+test "pack and unpack preserves manifest v1" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/unpacked", .{root_dir});
+    const missing_out_dir = try pathZ(arena, "{s}/missing", .{root_dir});
+
+    const ram = try arena.alloc(u8, spore.chunk_size + 11);
+    @memset(ram, 0);
+    ram[0] = 0x41;
+    ram[ram.len - 1] = 0x42;
+    const memory = try spore.saveMemoryWithBacking(arena, parent_dir, ram);
+    var vcpus = [_]spore.VcpuState{ testVcpuState(0), testVcpuState(1) };
+    try spore.saveManifestV1(arena, parent_dir, testManifestV1(memory, ram.len, &vcpus));
+
+    _ = try pack(arena, .{ .io = io, .spore_dir = parent_dir, .out_dir = bundle_dir });
+    try std.testing.expectError(error.BadManifest, spore.loadManifest(arena, bundle_dir));
+    const bundle_manifest = try spore.loadManifestV1(arena, bundle_dir);
+    defer bundle_manifest.deinit();
+    try std.testing.expectEqual(@as(topology.VcpuCount, 2), bundle_manifest.value.platform.vcpu_count);
+    try std.testing.expect(bundle_manifest.value.memory.backing == null);
+    try std.testing.expectEqual(gicv3.StateKind.backend_private, bundle_manifest.value.machine.gic.kind);
+
+    _ = try unpack(arena, .{ .io = io, .bundle_dir = bundle_dir, .out_dir = out_dir });
+    const restored_manifest = try spore.loadManifestV1(arena, out_dir);
+    defer restored_manifest.deinit();
+    try std.testing.expectEqual(@as(topology.VcpuCount, 2), restored_manifest.value.platform.vcpu_count);
+    try std.testing.expect(restored_manifest.value.memory.backing == null);
+    const out = try arena.alloc(u8, ram.len);
+    @memset(out, 0xCC);
+    try spore.loadMemory(arena, out_dir, restored_manifest.value.memory, out);
+    try std.testing.expectEqualSlices(u8, ram, out);
+
+    try Io.Dir.cwd().deleteFile(io, try pathZ(arena, "{s}/{s}", .{ bundle_dir, pack_path }));
+    try std.testing.expectError(error.IoFailed, unpack(arena, .{ .io = io, .bundle_dir = bundle_dir, .out_dir = missing_out_dir }));
+}
+
+test "indexed bundle pull preserves manifest v1" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
+    const child_dir = try pathZ(arena, "{s}/000000", .{children_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/pulled", .{root_dir});
+    const source_uri = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
+
+    const ram = try arena.alloc(u8, spore.chunk_size + 3);
+    @memset(ram, 0);
+    ram[2] = 0x51;
+    ram[ram.len - 1] = 0x52;
+    var vcpus = [_]spore.VcpuState{ testVcpuState(0), testVcpuState(1) };
+    try spore.saveManifestV1(arena, parent_dir, testManifestV1(try spore.saveMemory(arena, parent_dir, ram), ram.len, &vcpus));
+    try ensureDirPath(io, children_dir);
+    try spore.saveManifestV1(arena, child_dir, testManifestV1(try spore.saveMemory(arena, child_dir, ram), ram.len, &vcpus));
+
+    const pack_result = try pack(arena, .{ .io = io, .spore_dir = parent_dir, .out_dir = bundle_dir, .children_dir = children_dir });
+    const pulled = try pull(arena, .{ .io = io, .source = source_uri, .out_dir = out_dir, .child_id = "0" });
+    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled.bundle_digest.hex);
+    try std.testing.expectEqualStrings("000000", pulled.children.selected_child.?);
+
+    const restored_manifest = try spore.loadManifestV1(arena, out_dir);
+    defer restored_manifest.deinit();
+    try std.testing.expectEqual(@as(topology.VcpuCount, 2), restored_manifest.value.platform.vcpu_count);
     const out = try arena.alloc(u8, ram.len);
     @memset(out, 0xCC);
     try spore.loadMemory(arena, out_dir, restored_manifest.value.memory, out);

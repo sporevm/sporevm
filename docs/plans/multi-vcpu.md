@@ -251,15 +251,18 @@ limit.
   backend configs.
 - KVM backend configs carry `vcpus`, feed it into DTB construction, and can run
   fresh multi-vCPU guests with one host thread per vCPU. KVM multi-vCPU
-  capture/resume now uses manifest v1 for fixed-RAM run paths; monitor,
-  `--continue-after-capture`, exec-control, and transient virtio-mem still fail
-  closed for `vcpus != 1`.
+  capture/resume now uses manifest v1 for fixed-RAM run paths. Monitor
+  exec-control is wired for named create/resume/suspend; continue-after capture
+  and transient virtio-mem still fail closed for `vcpus != 1`.
 - HVF backend configs carry `vcpus`, feed it into DTB construction, and can run
   fresh and fixed-RAM capture/resume multi-vCPU guests with one owner thread per
-  vCPU. HVF monitor, dirty-tracked capture, `--continue-after-capture`, and
-  transient virtio-mem still fail closed for `vcpus != 1`.
-- Lifecycle metadata records `vcpus`; named create/monitor, named resume, and
-  named fork reject unsupported multi-vCPU lifecycle state before guest boot.
+  vCPU. HVF monitor exec-control is wired for named create/resume/suspend;
+  dirty-tracked capture, `--continue-after-capture`, and transient virtio-mem
+  still fail closed for `vcpus != 1`.
+- Lifecycle metadata records `vcpus`; named create and named resume support
+  manifest v1 multi-vCPU captures on supported backends, continue-after named
+  snapshots fail before monitor mutation, and named fork rejects multi-vCPU
+  live fork before child state is written.
 - `board.buildDtb` emits one CPU node per `cpu_count`, and DTB tests cover
   multi-node CPU topology plus redistributor region sizing.
 - HVF single-vCPU capture/resume still creates one main-thread-owned vCPU; the
@@ -274,9 +277,9 @@ limit.
   captures.
 - Manifest v0 and the state portability docs explicitly define one-vCPU
   topology. Manifest v1 now has KVM portable producers/consumers and HVF
-  same-backend producers/consumers for multi-vCPU machine state; lifecycle,
-  fork/fan-out, bundle production, and portable HVF GIC output remain later
-  slices.
+  same-backend producers/consumers for multi-vCPU machine state. Bundle
+  production, pull, and local materialization preserve v1 manifests. Portable
+  HVF GIC output remains a later slice.
 
 ## Delivery Strategy
 
@@ -419,6 +422,14 @@ Done when:
 - bundles, pulls, and local materialization preserve v1 manifests and reject
   incomplete v1 object sets.
 
+Status: implemented in this branch slice on 2026-06-28. Validation: `mise run
+test`, `mise run build`, `git diff --check`, and live Apple Silicon smoke with
+`spore create --backend hvf --vcpus 2`, `spore exec`, `spore suspend`,
+manifest v1 inspection, named `spore resume --name`, and post-resume `spore
+exec`. Named live fork keeps the product-level multi-vCPU rejection before
+child state is written; direct `spore.fork` now rejects manifest v1 before
+creating the output directory.
+
 ### Slice 8: Documentation, Release Notes, and Runtime Evidence
 
 Update durable docs and release notes after behavior lands. Include backend
@@ -491,9 +502,6 @@ Done when:
 - HVF portable GIC production: Slice 6 ships same-HVF restore with tagged
   `backend_private` GIC state. Portable `gicv3_multi` production remains the
   cross-backend gap.
-- Lifecycle fork scope: the default is to support named resume before named
-  fork/fan-out for v1, because fork mutates generation and backing metadata and
-  has more ways to produce partial children.
 
 ## Key Learnings From Pressure-Testing
 

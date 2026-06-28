@@ -211,7 +211,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var config = input_config;
     const setup_start = monotonicMs();
     try topology.validateVcpuCount(config.vcpus);
-    if (config.vcpus != 1 and (config.exec_control != null or config.dirty_tracking.enabled or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
+    if (config.vcpus != 1 and (config.dirty_tracking.enabled or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
         return error.UnsupportedVcpuCount;
     }
     const hv_vm_create_start = setup_start;
@@ -251,7 +251,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         };
     }
     try topology.validateVcpuCount(config.vcpus);
-    if (config.vcpus != 1 and (config.exec_control != null or config.dirty_tracking.enabled or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
+    if (config.vcpus != 1 and (config.dirty_tracking.enabled or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
         return error.UnsupportedVcpuCount;
     }
 
@@ -1120,6 +1120,9 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
     var wake_set = HvfVcpuWakeSet{ .vcpus = vcpus };
     options.config.network.setWake(.{ .context = &wake_set, .wakeFn = wakeNetworkVcpuSet });
     defer options.config.network.clearWake();
+    if (options.config.exec_control) |control| {
+        control.setWake(.{ .context = &wake_set, .wakeFn = wakeVcpuSet });
+    }
     if (options.config.capture_request) |request_capture| {
         request_capture.setWake(wakeCaptureVcpuSet, &wake_set);
     }
@@ -1252,6 +1255,43 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
             state.finish(.{ .err = error.NetworkGatewayFailed });
             continue;
         }
+        if (options.config.exec_control) |control| {
+            control.reportStats(monitorStatsFromDirtyTracker(null));
+            device_lock.lock();
+            const action = control.poll(options.vsock_dev) catch |err| {
+                device_lock.unlock();
+                state.finish(.{ .err = err });
+                continue;
+            };
+            switch (action) {
+                .keep_running => flushVsockRx(
+                    options.vsock_dev,
+                    &options.transports_buf[options.vsock_transport_index],
+                    options.ram,
+                    @intCast(options.vsock_transport_index),
+                ) catch |err| {
+                    device_lock.unlock();
+                    state.finish(.{ .err = err });
+                    continue;
+                },
+                else => {},
+            }
+            device_lock.unlock();
+            switch (action) {
+                .keep_running => {},
+                .stop => {
+                    state.finish(.{ .exit = .monitor_stopped });
+                    continue;
+                },
+                .snapshot => |request| {
+                    if (request.continue_after) {
+                        state.finish(.{ .err = error.UnsupportedSnapshotMode });
+                        continue;
+                    }
+                    return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), request.dir, null);
+                },
+            }
+        }
         const elapsed_ms = monotonicMs() -| start_ms;
         if (options.config.exec_probe != null and !exec_probe_rx_enabled and elapsed_ms >= options.config.exec_probe_initial_rx_delay_ms) {
             exec_probe_rx_enabled = true;
@@ -1271,7 +1311,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                     std.log.debug("hvf multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
                     if (options.config.exec_probe_completes_run) {
                         if (options.config.snapshot_on_probe_complete) {
-                            return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), null);
+                            return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), null, null);
                         }
                         state.finish(.{ .exit = .probe_complete });
                         continue;
@@ -1293,12 +1333,12 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                 continue;
             }
             if (request_capture.isRequested()) {
-                return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), request_capture);
+                return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), null, request_capture);
             }
         }
         if (options.config.snapshot_after_ms) |after_ms| {
             if (elapsed_ms >= after_ms) {
-                return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), null);
+                return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), null, null);
             }
         }
         sleepMs(1);
@@ -1320,9 +1360,10 @@ fn snapshotMultiHvfAndStop(
     wake_set: *HvfVcpuWakeSet,
     redist_base: u64,
     redist_stride: u64,
+    snapshot_dir_override: ?[]const u8,
     request_capture: ?*capture.Request,
 ) !ExitCause {
-    const snapshot_dir = options.config.snapshot_dir orelse {
+    const snapshot_dir = snapshot_dir_override orelse options.config.snapshot_dir orelse {
         state.finish(.{ .err = error.HvCallFailed });
         return error.HvCallFailed;
     };
@@ -2361,6 +2402,11 @@ fn raiseGenerationIrqIfPending(gen_dev: *const generation.Device) !void {
 fn wakeVcpu(context: *anyopaque) void {
     const vcpu: *hvf.VcpuHandle = @ptrCast(@alignCast(context));
     _ = hvf.hv_vcpus_exit(@ptrCast(vcpu), 1);
+}
+
+fn wakeVcpuSet(context: *anyopaque) void {
+    const wake_set: *HvfVcpuWakeSet = @ptrCast(@alignCast(context));
+    wake_set.wakeAll();
 }
 
 fn wakeVcpuAfterMs(vcpu: hvf.VcpuHandle, delay_ms: u64, stop: *std.atomic.Value(bool)) void {

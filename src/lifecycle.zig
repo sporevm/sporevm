@@ -78,7 +78,7 @@ const create_usage =
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
-    \\  --vcpus N               Guest vCPU count (1-8; current backends accept 1)
+    \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
@@ -467,7 +467,7 @@ fn createNamedWithTiming(
 ) !NamedLifecycleResult {
     if (options.rootfs_path != null and options.image_ref != null) return error.InvalidRootfsInput;
     if (!monitorBackendSupported(options.backend.name())) return error.HostUnsupported;
-    try topology.requireSingleVcpu(options.vcpus);
+    try topology.validateVcpuCount(options.vcpus);
     try spore.validateAnnotations(options.annotations);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -546,18 +546,35 @@ pub fn resumeNamed(
     const arena = arena_state.allocator();
 
     const spore_dir = try resolveExistingSporeDirApi(arena, init.io, options.spore_dir);
-    var manifest = spore.loadManifest(arena, spore_dir) catch return error.InvalidSporeDir;
-    defer manifest.deinit();
-    const network_options = run_mod.networkOptionsFromManifest(arena, manifest.value.network) catch return error.InvalidNetworkPolicy;
-    const rootfs = try run_mod.resumeRootfsForRun(arena, manifest.value);
-    const disk = try run_mod.resumeDiskForRun(arena, manifest.value);
-    if (rootfs == null and manifest.value.devices.len != diskless_resume_device_count) return error.UnsupportedLifecycleDeviceModel;
-    const memory = memory_config.fromManifestBytes(manifest.value.platform.ram_size) catch return error.InvalidMemorySize;
+    var manifest = spore.loadManifest(arena, spore_dir) catch |err| switch (err) {
+        error.BadManifest => null,
+        else => return error.InvalidSporeDir,
+    };
+    defer if (manifest) |*parsed| parsed.deinit();
+    var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
+    defer if (manifest_v1) |*parsed| parsed.deinit();
+    if (manifest == null) {
+        manifest_v1 = spore.loadManifestV1(arena, spore_dir) catch return error.InvalidSporeDir;
+    }
+    const network_options = run_mod.networkOptionsFromManifest(arena, if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network) catch return error.InvalidNetworkPolicy;
+    const rootfs = if (manifest) |parsed|
+        try run_mod.resumeRootfsForRun(arena, parsed.value)
+    else
+        try run_mod.resumeRootfsForRunV1(arena, manifest_v1.?.value);
+    const disk = if (manifest) |parsed|
+        try run_mod.resumeDiskForRun(arena, parsed.value)
+    else
+        try run_mod.resumeDiskForRunV1(arena, manifest_v1.?.value);
+    const devices_len = if (manifest) |parsed| parsed.value.devices.len else manifest_v1.?.value.devices.len;
+    if (rootfs == null and devices_len != diskless_resume_device_count) return error.UnsupportedLifecycleDeviceModel;
+    const ram_size = if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size;
+    const memory = memory_config.fromManifestBytes(ram_size) catch return error.InvalidMemorySize;
+    const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else @as(topology.VcpuCount, 1);
 
     var lifecycle_spec = readSporeLifecycleSpec(arena, init.io, spore_dir) catch return error.InvalidLifecycleMetadata;
     defer if (lifecycle_spec) |*spec| spec.deinit();
     if (lifecycle_spec) |spec| {
-        if (spec.value.vcpus != 1) return error.UnsupportedLifecycleMetadata;
+        if (spec.value.vcpus != manifest_vcpus) return error.UnsupportedLifecycleMetadata;
     }
 
     const base = if (lifecycle_spec) |spec| spec.value else Spec{ .name = options.name };
@@ -570,9 +587,9 @@ pub fn resumeNamed(
         .rootfs = rootfs,
         .disk = disk,
         .network = try run_mod.manifestNetworkFromOptions(arena, network_options.network, &network_options.policy),
-        .annotations = manifest.value.annotations,
+        .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
         .memory = memory,
-        .vcpus = 1,
+        .vcpus = manifest_vcpus,
         .guest_port = base.guest_port,
         .timeout_ms = base.timeout_ms,
         .console_log_path = base.console_log_path,
@@ -660,6 +677,7 @@ pub fn snapshotNamed(
     if (state != .ready) return error.NamedVmNotReady;
     var spec = try readSpec(arena, context.io, paths);
     defer spec.deinit();
+    if (spec.value.vcpus != 1) return error.UnsupportedSnapshotMode;
     if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
         return error.MissingRootfsIdentity;
     }
@@ -939,7 +957,7 @@ pub fn createCli(
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
         },
         error.UnsupportedVcpuCount => {
-            const message = "spore create: --vcpus currently supports 1";
+            const message = "spore create: unsupported vCPU/backend combination";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
         },
         error.InvalidNetworkPolicy, error.InvalidRootfsInput => {
@@ -1264,7 +1282,7 @@ pub fn resumeCli(
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
         },
         error.UnsupportedLifecycleMetadata => {
-            const message = "spore resume: multi-vCPU lifecycle metadata is not supported yet";
+            const message = "spore resume: lifecycle metadata does not match the spore topology";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
         },
         error.HostUnsupported => {

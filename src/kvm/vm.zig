@@ -242,7 +242,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         };
     }
     try topology.validateVcpuCount(config.vcpus);
-    if (config.vcpus != 1 and (config.exec_control != null or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
+    if (config.vcpus != 1 and (config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
         return error.UnsupportedVcpuCount;
     }
 
@@ -441,6 +441,9 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         if (config.capture_request) |request_capture| {
             request_capture.setWake(wakeKvmRunSet, &multi_wake);
         }
+        if (config.exec_control) |control| {
+            control.setWake(.{ .context = &multi_wake, .wakeFn = wakeControlKvmRunSet });
+        }
         config.network.setWake(.{ .context = &multi_wake, .wakeFn = wakeNetworkKvmRunSet });
     }
     defer config.network.clearWake();
@@ -484,6 +487,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             .ram_size = config.ram_size,
             .net_dev = &net_dev,
             .net_transport_index = net_transport_index,
+            .vsock_transport_index = vsock_transport_index,
             .rootfs = config.rootfs,
             .disk_snapshot = config.disk_snapshot,
             .network_manifest = config.network_manifest,
@@ -770,6 +774,11 @@ fn wakeControlKvmRun(context: *anyopaque) void {
     wake.wakeRun();
 }
 
+fn wakeControlKvmRunSet(context: *anyopaque) void {
+    const wake_set: *KvmRunWakeSet = @ptrCast(@alignCast(context));
+    wake_set.wakeAll();
+}
+
 fn handleKvmRunWakeSignal(_: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
     // Empty handler: the signal exists only to interrupt KVM_RUN after
     // `immediate_exit` is set by a helper thread.
@@ -777,7 +786,7 @@ fn handleKvmRunWakeSignal(_: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaqu
 
 const MultiKvmResult = union(enum) {
     exit: ExitCause,
-    snapshot,
+    snapshot: ?[]const u8,
     err: anyerror,
 };
 
@@ -812,12 +821,13 @@ const MultiKvmRunOptions = struct {
     config: *const Config,
     transports: []mmio.Transport,
     gen_dev: *generation.Device,
-    vsock_dev: *const vsock.Vsock,
+    vsock_dev: *vsock.Vsock,
     ram: guestmem.GuestRam,
     ram_bytes: []const u8,
     ram_size: u64,
     net_dev: *net.Net,
     net_transport_index: usize,
+    vsock_transport_index: usize,
     rootfs: ?spore.Rootfs,
     disk_snapshot: ?disk_layer.SnapshotState,
     network_manifest: ?spore.Network,
@@ -871,11 +881,11 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
         if (state.result()) |result| {
             options.wake_set.wakeAll();
             switch (result) {
-                .snapshot => {
+                .snapshot => |snapshot_dir| {
                     joinKvmVcpuThreads(options.vcpus);
                     try takeSnapshotV1(
                         allocator,
-                        options.config.snapshot_dir orelse return error.KvmIoctlFailed,
+                        snapshot_dir orelse options.config.snapshot_dir orelse return error.KvmIoctlFailed,
                         options.gic_fd,
                         options.vcpus,
                         options.transports,
@@ -903,6 +913,45 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
             state.finish(.{ .err = error.NetworkGatewayFailed });
             continue;
         }
+        if (options.config.exec_control) |control| {
+            control.reportStats(monitorStatsFromDirtyTracker(options.dirty_tracker));
+            device_lock.lock();
+            const action = control.poll(options.vsock_dev) catch |err| {
+                device_lock.unlock();
+                state.finish(.{ .err = err });
+                continue;
+            };
+            switch (action) {
+                .keep_running => flushVsockRxKvm(
+                    options.vm_fd,
+                    options.vsock_dev,
+                    &options.transports[options.vsock_transport_index],
+                    options.ram,
+                    options.vsock_transport_index,
+                ) catch |err| {
+                    device_lock.unlock();
+                    state.finish(.{ .err = err });
+                    continue;
+                },
+                else => {},
+            }
+            device_lock.unlock();
+            switch (action) {
+                .keep_running => {},
+                .stop => {
+                    state.finish(.{ .exit = .monitor_stopped });
+                    continue;
+                },
+                .snapshot => |request| {
+                    if (request.continue_after) {
+                        state.finish(.{ .err = error.UnsupportedSnapshotMode });
+                        continue;
+                    }
+                    state.finish(.{ .snapshot = request.dir });
+                    continue;
+                },
+            }
+        }
         if (options.config.exec_probe) |probe| {
             if (probe.state == .failed) {
                 state.finish(.{ .err = error.VsockProbeFailed });
@@ -911,7 +960,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
             if (probe.state == .complete) {
                 std.log.debug("kvm multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
                 if (options.config.snapshot_on_probe_complete) {
-                    state.finish(.snapshot);
+                    state.finish(.{ .snapshot = null });
                     continue;
                 }
                 state.finish(.{ .exit = .probe_complete });
@@ -928,14 +977,14 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
                 continue;
             }
             if (request_capture.isRequested()) {
-                state.finish(.snapshot);
+                state.finish(.{ .snapshot = null });
                 continue;
             }
         }
         const elapsed_ms = (try monotonicMs()) -| options.start_ms;
         if (options.config.snapshot_after_ms) |after_ms| {
             if (elapsed_ms >= after_ms) {
-                state.finish(.snapshot);
+                state.finish(.{ .snapshot = null });
                 continue;
             }
         }

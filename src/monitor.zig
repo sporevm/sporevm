@@ -39,7 +39,7 @@ const monitor_usage =
     \\  --bound-unix-service NAME HOST PORT PATH
     \\                          With --net, expose a host Unix socket as HOST:PORT
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
-    \\  --vcpus N               Guest vCPU count (1-8; current backends accept 1)
+    \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
@@ -108,8 +108,8 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         std.debug.print("spore monitor: direct --resume with --rootfs is not supported; use lifecycle metadata for disk-backed named resume\n", .{});
         std.process.exit(2);
     }
-    topology.requireSingleVcpu(opts.vcpus) catch {
-        std.debug.print("spore monitor: --vcpus currently supports 1\n", .{});
+    topology.validateVcpuCount(opts.vcpus) catch {
+        std.debug.print("spore monitor: unsupported vCPU count\n", .{});
         std.process.exit(2);
     };
     const full_args = try init.minimal.args.toSlice(allocator);

@@ -45,6 +45,7 @@ pub const Error = error{
     BadManifest,
     BadChunk,
     BadForkCount,
+    UnsupportedVcpuCount,
     AlreadyExists,
     PlatformMismatch,
     IoFailed,
@@ -1408,7 +1409,14 @@ pub const ForkResult = struct {
 pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult {
     if (options.count == 0) return error.BadForkCount;
 
-    const parsed = try loadManifest(allocator, options.parent_dir);
+    const parsed = loadManifest(allocator, options.parent_dir) catch |err| switch (err) {
+        error.BadManifest => {
+            var parsed_v1 = loadManifestV1(allocator, options.parent_dir) catch return error.BadManifest;
+            parsed_v1.deinit();
+            return error.UnsupportedVcpuCount;
+        },
+        else => |e| return e,
+    };
     defer parsed.deinit();
     const parent = parsed.value;
     if (parent.generation.generation > std.math.maxInt(u64) - options.count) return error.BadForkCount;
@@ -2940,6 +2948,34 @@ test "fork rejects empty count" {
         .out_dir = "/does/not/matter-either",
         .count = 0,
     }));
+}
+
+test "fork rejects manifest v1 before writing children" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/children", .{root_dir});
+
+    const ram = try arena.alloc(u8, chunk_size);
+    @memset(ram, 0);
+    const memory = try saveMemory(arena, parent_dir, ram);
+    var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
+    const redists = [_]gicv3.RedistributorState{
+        .{ .mpidr = topology.mpidrForIndex(0), .regs = &.{} },
+        .{ .mpidr = topology.mpidrForIndex(1), .regs = &.{} },
+    };
+    try saveManifestV1(arena, parent_dir, testManifestV1(memory, ram.len, &vcpus, &redists));
+
+    try std.testing.expectError(error.UnsupportedVcpuCount, fork(arena, .{
+        .parent_dir = parent_dir,
+        .out_dir = out_dir,
+        .count = 1,
+    }));
+    try std.testing.expectEqual(@as(c_int, -1), std.c.access(try pathZ(arena, "{s}", .{out_dir}), 0));
 }
 
 test "backend-private GIC state json round-trip" {
