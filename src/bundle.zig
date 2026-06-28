@@ -1756,14 +1756,7 @@ fn rootfsStorageEntryDescriptor(entry: RootfsStorageEntry) spore.RootfsStorage {
 }
 
 fn rootfsStorageEntryMatches(entry: RootfsStorageEntry, storage: spore.RootfsStorage) bool {
-    return std.mem.eql(u8, entry.kind, storage.kind) and
-        spore.rootfsDeviceEql(entry.device, storage.device) and
-        entry.logical_size == storage.logical_size and
-        entry.chunk_size == storage.chunk_size and
-        std.mem.eql(u8, entry.hash_algorithm, storage.hash_algorithm) and
-        std.mem.eql(u8, entry.index_digest, storage.index_digest) and
-        std.mem.eql(u8, entry.base_identity, storage.base_identity) and
-        std.mem.eql(u8, entry.object_namespace, storage.object_namespace);
+    return spore.rootfsStorageEql(rootfsStorageEntryDescriptor(entry), storage);
 }
 
 fn validateRootfsStorageForRootfs(storage: spore.RootfsStorage, rootfs: spore.Rootfs) Error!void {
