@@ -257,12 +257,6 @@ pub fn setIrq(vm_fd: std.c.fd_t, intid: u32, level: bool) Error!void {
     _ = try ioctl(vm_fd, KVM_IRQ_LINE, @intFromPtr(&irq), "KVM_IRQ_LINE");
 }
 
-pub fn hasDeviceAttr(fd: std.c.fd_t, group: u32, attr_id: u64) bool {
-    var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = 0 };
-    const rc = linux.ioctl(fd, KVM_HAS_DEVICE_ATTR, @intFromPtr(&attr));
-    return linux.errno(rc) == .SUCCESS;
-}
-
 pub fn getDeviceAttr(fd: std.c.fd_t, group: u32, attr_id: u64, value: *anyopaque, op: []const u8) Error!void {
     var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(value) };
     _ = try ioctl(fd, KVM_GET_DEVICE_ATTR, @intFromPtr(&attr), op);
@@ -271,12 +265,6 @@ pub fn getDeviceAttr(fd: std.c.fd_t, group: u32, attr_id: u64, value: *anyopaque
 pub fn setDeviceAttr(fd: std.c.fd_t, group: u32, attr_id: u64, value: *const anyopaque, op: []const u8) Error!void {
     var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(value) };
     _ = try ioctl(fd, KVM_SET_DEVICE_ATTR, @intFromPtr(&attr), op);
-}
-
-pub fn getDeviceAttrU32(fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!u32 {
-    var value: u32 = 0;
-    try getDeviceAttr(fd, group, attr_id, &value, op);
-    return value;
 }
 
 pub fn getDeviceAttrMaybeU32(fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!?u32 {
@@ -296,12 +284,6 @@ pub fn getDeviceAttrMaybeU32(fd: std.c.fd_t, group: u32, attr_id: u64, op: []con
 pub fn setDeviceAttrU32(fd: std.c.fd_t, group: u32, attr_id: u64, value: u32, op: []const u8) Error!void {
     var v = value;
     try setDeviceAttr(fd, group, attr_id, &v, op);
-}
-
-pub fn getDeviceAttrU64(fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!u64 {
-    var value: u64 = 0;
-    try getDeviceAttr(fd, group, attr_id, &value, op);
-    return value;
 }
 
 pub fn getDeviceAttrMaybeU64(fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!?u64 {
