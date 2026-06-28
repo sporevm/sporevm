@@ -2145,9 +2145,9 @@ fn appendBundleFile(
     rel_path: []const u8,
 ) Error!void {
     try validateBundleRelPath(rel_path);
+    if (seen.contains(rel_path)) return error.BadManifest;
     const copy = allocator.dupe(u8, rel_path) catch return error.OutOfMemory;
-    const seen_entry = seen.getOrPut(copy) catch return error.OutOfMemory;
-    if (seen_entry.found_existing) return error.BadManifest;
+    seen.put(copy, {}) catch return error.OutOfMemory;
     files.append(copy) catch return error.OutOfMemory;
 }
 
