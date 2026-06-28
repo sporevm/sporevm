@@ -549,38 +549,13 @@ pub const Vsock = struct {
 
 fn parsePacketFromChain(chain: *const queue.Chain) ?Packet {
     var buf: [header_len]u8 = undefined;
-    if (!copyReadablePrefix(chain, &buf)) return null;
+    if (!chain.copyReadableRange(0, &buf)) return null;
     const header = parseHeader(&buf);
     if (header.len > max_payload) return null;
     const data_len: usize = @intCast(header.len);
     var packet = Packet{ .header = header, .data_len = data_len };
-    if (data_len > 0 and !copyReadableRange(chain, header_len, packet.data[0..data_len])) return null;
+    if (data_len > 0 and !chain.copyReadableRange(header_len, packet.data[0..data_len])) return null;
     return packet;
-}
-
-fn copyReadablePrefix(chain: *const queue.Chain, out: []u8) bool {
-    return copyReadableRange(chain, 0, out);
-}
-
-fn copyReadableRange(chain: *const queue.Chain, skip: usize, out: []u8) bool {
-    if (out.len == 0) return true;
-    var skipped: usize = 0;
-    var copied: usize = 0;
-    for (chain.segments.slice()) |seg| {
-        if (seg.writable) continue;
-        if (skipped + seg.data.len <= skip) {
-            skipped += seg.data.len;
-            continue;
-        }
-        const offset = if (skip > skipped) skip - skipped else 0;
-        const readable = seg.data[offset..];
-        const n = @min(readable.len, out.len - copied);
-        @memcpy(out[copied..][0..n], readable[0..n]);
-        copied += n;
-        if (copied == out.len) return true;
-        skipped += seg.data.len;
-    }
-    return false;
 }
 
 fn writePacketToChain(chain: *const queue.Chain, h: Header, payload: []const u8) ?u32 {

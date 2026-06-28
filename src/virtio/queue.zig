@@ -67,6 +67,27 @@ pub const Chain = struct {
         return n;
     }
 
+    pub fn copyReadableRange(self: *const Chain, skip: usize, out: []u8) bool {
+        if (out.len == 0) return true;
+        var skipped: usize = 0;
+        var copied: usize = 0;
+        for (self.segments.slice()) |seg| {
+            if (seg.writable) continue;
+            if (skipped + seg.data.len <= skip) {
+                skipped += seg.data.len;
+                continue;
+            }
+            const offset = if (skip > skipped) skip - skipped else 0;
+            const readable = seg.data[offset..];
+            const n = @min(readable.len, out.len - copied);
+            @memcpy(out[copied..][0..n], readable[0..n]);
+            copied += n;
+            if (copied == out.len) return true;
+            skipped += seg.data.len;
+        }
+        return false;
+    }
+
     pub fn markWritableDirty(self: *const Chain, ram: guestmem.GuestRam) void {
         for (self.segments.slice()) |seg| {
             if (!seg.writable) continue;
@@ -236,6 +257,21 @@ test "chained descriptors preserve order and flags" {
     try std.testing.expect(!chain.segments.get(0).writable);
     try std.testing.expect(chain.segments.get(1).writable);
     try std.testing.expectEqual(@as(usize, 2), chain.readableLen());
+}
+
+test "copy readable range spans readable descriptors and skips writable descriptors" {
+    var first = [_]u8{ 'a', 'b' };
+    var writable = [_]u8{ 'x', 'x' };
+    var second = [_]u8{ 'c', 'd', 'e' };
+    var chain = Chain{ .head = 0, .segments = .{} };
+    try chain.segments.append(.{ .data = &first, .writable = false });
+    try chain.segments.append(.{ .data = &writable, .writable = true });
+    try chain.segments.append(.{ .data = &second, .writable = false });
+
+    var out: [4]u8 = undefined;
+    try std.testing.expect(chain.copyReadableRange(1, &out));
+    try std.testing.expectEqualStrings("bcde", &out);
+    try std.testing.expect(!chain.copyReadableRange(5, out[0..1]));
 }
 
 test "descriptor loop is bounded" {
