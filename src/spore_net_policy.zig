@@ -395,10 +395,9 @@ pub const Runtime = struct {
         if (qtype != dns_type_a or qclass != dns_class_in) return 0;
 
         const legacy_host_index = self.allowedHostIndexForDnsName(query, dns_header_len);
-        const exact_match_count = self.exactRuleIndicesForDnsName(query, dns_header_len, null);
-        if (legacy_host_index == null and exact_match_count == 0) return 0;
         var exact_matches: [max_exact_rules]usize = undefined;
-        _ = self.exactRuleIndicesForDnsName(query, dns_header_len, &exact_matches);
+        const exact_match_count = self.exactRuleIndicesForDnsName(query, dns_header_len, &exact_matches);
+        if (legacy_host_index == null and exact_match_count == 0) return 0;
 
         var offset = skipDnsName(response, dns_header_len) orelse return 0;
         if (offset + 4 > response.len) return 0;
