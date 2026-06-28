@@ -103,7 +103,10 @@ const HostDnsForwarder = struct {
 };
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    _ = stdout;
+    if (wantsHelp(args)) {
+        try stdout.writeAll(netd_usage);
+        return;
+    }
     const opts = parseCliArgs(args);
     var policy = spore_net_policy.Runtime.init(opts.policy) catch |err| {
         std.debug.print("spore netd: invalid network policy: {s}\n", .{@errorName(err)});
@@ -219,6 +222,21 @@ fn parseCliArgs(args: []const []const u8) CliOptions {
         std.process.exit(2);
     }
     return opts;
+}
+
+fn wantsHelp(args: []const []const u8) bool {
+    return args.len == 1 and
+        (std.mem.eql(u8, args[0], "help") or
+            std.mem.eql(u8, args[0], "-h") or
+            std.mem.eql(u8, args[0], "--help"));
+}
+
+test "netd cli help accepts standard help spellings" {
+    try std.testing.expect(wantsHelp(&.{"--help"}));
+    try std.testing.expect(wantsHelp(&.{"-h"}));
+    try std.testing.expect(wantsHelp(&.{"help"}));
+    try std.testing.expect(!wantsHelp(&.{}));
+    try std.testing.expect(!wantsHelp(&.{ "--help", "extra" }));
 }
 
 const HostPort = struct {

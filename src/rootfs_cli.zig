@@ -10,7 +10,7 @@ const api = @import("api.zig");
 const rootfs_mod = @import("rootfs.zig");
 
 pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (args.len == 0 or std.mem.eql(u8, args[0], "help")) {
+    if (args.len == 0 or wantsHelp(args)) {
         try stdout.writeAll(rootfs_mod.usage);
         return;
     }
@@ -37,6 +37,10 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 }
 
 fn build(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    if (wantsHelp(args)) {
+        try stdout.writeAll(rootfs_mod.usage);
+        return;
+    }
     const arena = init.arena.allocator();
     const parsed = try rootfs_mod.parseBuildOptions(arena, args, stdout);
     const result = try api.rootfsBuild(init, arena, .{
@@ -57,6 +61,10 @@ fn build(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !
 }
 
 fn importOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    if (wantsHelp(args)) {
+        try stdout.writeAll(rootfs_mod.usage);
+        return;
+    }
     const arena = init.arena.allocator();
     const parsed = try rootfs_mod.parseImportOciOptions(args, stdout);
     const result = try api.rootfsImportOci(init, arena, .{
@@ -79,6 +87,10 @@ fn importOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
 }
 
 fn resolve(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    if (wantsHelp(args)) {
+        try stdout.writeAll(rootfs_mod.usage);
+        return;
+    }
     const arena = init.arena.allocator();
     const parsed = try rootfs_mod.parseResolveOptions(args, stdout);
     const resolved = try api.rootfsResolve(init, arena, .{
@@ -89,6 +101,10 @@ fn resolve(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 }
 
 fn casPreload(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    if (wantsHelp(args)) {
+        try stdout.writeAll(rootfs_mod.usage);
+        return;
+    }
     const arena = init.arena.allocator();
     const parsed = try rootfs_mod.parseCasPreloadOptions(args, stdout);
     const result = try api.rootfsCasPreload(init, arena, .{
@@ -115,4 +131,19 @@ fn casPreload(init: std.process.Init, args: []const []const u8, stdout: *Io.Writ
     if (parsed.attach_spore) |spore_dir| {
         try stdout.print("attached_spore: {s}\n", .{spore_dir});
     }
+}
+
+fn wantsHelp(args: []const []const u8) bool {
+    return args.len == 1 and
+        (std.mem.eql(u8, args[0], "help") or
+            std.mem.eql(u8, args[0], "-h") or
+            std.mem.eql(u8, args[0], "--help"));
+}
+
+test "rootfs cli help accepts standard help spellings" {
+    try std.testing.expect(wantsHelp(&.{"--help"}));
+    try std.testing.expect(wantsHelp(&.{"-h"}));
+    try std.testing.expect(wantsHelp(&.{"help"}));
+    try std.testing.expect(!wantsHelp(&.{}));
+    try std.testing.expect(!wantsHelp(&.{ "--help", "extra" }));
 }

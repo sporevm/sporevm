@@ -151,8 +151,16 @@ fn runCommand(
     } else if (std.mem.eql(u8, command, "netd")) {
         try spore_internal.spore_netd.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "version")) {
+        if (wantsCommandHelp(command_args)) {
+            try stdout.writeAll("usage: spore version\n");
+            return;
+        }
         try stdout.print("spore {s}\n", .{spore_internal.version});
     } else if (std.mem.eql(u8, command, "host-info")) {
+        if (wantsCommandHelp(command_args)) {
+            try stdout.writeAll("usage: spore host-info\n");
+            return;
+        }
         if (command_args.len != 0) {
             if (std.mem.startsWith(u8, command_args[0], "--")) {
                 exitUnknownArgument(arena, stderr, mode, "host-info", command_args[0]);
@@ -166,6 +174,10 @@ fn runCommand(
             try writeHostInfo(stdout, info);
         }
     } else if (std.mem.eql(u8, command, "inspect")) {
+        if (wantsCommandHelp(command_args)) {
+            try stdout.writeAll("usage: spore inspect <spore-dir>\n");
+            return;
+        }
         if (command_args.len != 1) {
             exitWithCliError(arena, stderr, mode, machine_output.usageMissingArgument("usage: spore inspect <spore-dir>", "inspect"), "usage: spore inspect <spore-dir>");
         }
@@ -189,6 +201,10 @@ fn runCommand(
     } else if (std.mem.eql(u8, command, "fanout")) {
         try spore_internal.fanout.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "pack")) {
+        if (wantsCommandHelp(command_args)) {
+            try stdout.writeAll("usage: spore pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR\n");
+            return;
+        }
         const result = try packCommand(context, arena, stderr, mode, command_args);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, result);
@@ -196,6 +212,10 @@ fn runCommand(
             try writePackResult(stdout, result);
         }
     } else if (std.mem.eql(u8, command, "unpack")) {
+        if (wantsCommandHelp(command_args)) {
+            try stdout.writeAll("usage: spore unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR\n");
+            return;
+        }
         const result = try unpackCommand(context, arena, stderr, mode, command_args);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, result);
@@ -203,6 +223,10 @@ fn runCommand(
             try writeUnpackResult(stdout, result);
         }
     } else if (std.mem.eql(u8, command, "push")) {
+        if (wantsCommandHelp(command_args)) {
+            try stdout.writeAll("usage: spore push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]\n");
+            return;
+        }
         const result = try pushCommand(context, arena, stderr, mode, command_args);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, result);
@@ -210,6 +234,10 @@ fn runCommand(
             try writePushResult(stdout, result);
         }
     } else if (std.mem.eql(u8, command, "inspect-bundle")) {
+        if (wantsCommandHelp(command_args)) {
+            try stdout.writeAll("usage: spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]\n");
+            return;
+        }
         const result = try inspectBundleCommand(arena, stderr, mode, command_args);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, result);
@@ -217,6 +245,10 @@ fn runCommand(
             try writeInspectBundleResult(stdout, result);
         }
     } else if (std.mem.eql(u8, command, "pull")) {
+        if (wantsCommandHelp(command_args)) {
+            try stdout.writeAll("usage: spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]\n");
+            return;
+        }
         const result = try pullCommand(context, arena, stderr, mode, command_args);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, result);
@@ -369,6 +401,13 @@ fn wantsNamedResume(args: []const []const u8) bool {
         if (std.mem.eql(u8, arg, "--name")) return true;
     }
     return false;
+}
+
+fn wantsCommandHelp(args: []const []const u8) bool {
+    return args.len == 1 and
+        (std.mem.eql(u8, args[0], "help") or
+            std.mem.eql(u8, args[0], "-h") or
+            std.mem.eql(u8, args[0], "--help"));
 }
 
 fn forkCommand(
@@ -843,6 +882,14 @@ test "rootfs bundle policy parser accepts exact and metadata-only spellings" {
 test "resume dispatch can distinguish product and named lifecycle modes" {
     try std.testing.expect(!wantsNamedResume(&.{"spore-dir"}));
     try std.testing.expect(wantsNamedResume(&.{ "spore-dir", "--name", "bench-1" }));
+}
+
+test "command help accepts standard help spellings" {
+    try std.testing.expect(wantsCommandHelp(&.{"--help"}));
+    try std.testing.expect(wantsCommandHelp(&.{"-h"}));
+    try std.testing.expect(wantsCommandHelp(&.{"help"}));
+    try std.testing.expect(!wantsCommandHelp(&.{}));
+    try std.testing.expect(!wantsCommandHelp(&.{ "--help", "extra" }));
 }
 
 test "stable lifecycle commands support global json where output is one document" {

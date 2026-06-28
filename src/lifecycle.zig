@@ -114,11 +114,13 @@ const suspend_usage =
 
 const fork_usage =
     \\Usage:
+    \\  spore fork <spore-dir> --count N --out DIR
     \\  spore fork --vm NAME --count N --name PATTERN
     \\
     \\Options:
+    \\  --out DIR            Directory for forked spores
     \\  --vm NAME             Running named VM to fork from
-    \\  --count N             Number of named child VMs to create
+    \\  --count N             Number of children to create
     \\  --name PATTERN        Child VM name or pattern, e.g. worker-%d
     \\  -h, --help            Show this help
     \\
@@ -2603,6 +2605,7 @@ pub fn monitorBackendSupported(raw: []const u8) bool {
 }
 
 pub fn wantsNamedFork(args: []const []const u8) bool {
+    if (wantsHelp(args)) return true;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--vm") or std.mem.eql(u8, arg, "--name")) return true;
     }
@@ -2741,6 +2744,14 @@ test "lifecycle renders fork name patterns" {
     try std.testing.expectError(error.InvalidForkNamePattern, findForkNamePlaceholder("worker-%d-%d"));
     try std.testing.expectError(error.MissingForkNamePlaceholder, renderForkNames(allocator, "worker", 2));
     try std.testing.expectError(error.InvalidVMName, renderForkNames(allocator, "-worker", 1));
+}
+
+test "lifecycle fork help routes through named fork cli" {
+    try std.testing.expect(wantsNamedFork(&.{"--help"}));
+    try std.testing.expect(wantsNamedFork(&.{"-h"}));
+    try std.testing.expect(wantsNamedFork(&.{"help"}));
+    try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fork <spore-dir> --count N --out DIR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fork --vm NAME --count N --name PATTERN") != null);
 }
 
 test "lifecycle monitor backend support is explicit" {
