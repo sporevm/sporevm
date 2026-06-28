@@ -754,7 +754,7 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
             };
         } else if (std.mem.eql(u8, args[i], "--allow-host-port")) {
             const raw = takeValue(args, &i, args[i]);
-            const parsed = parseHostPort(raw) catch |err| {
+            const parsed = spore_net_policy.parseHostPort(raw) catch |err| {
                 std.debug.print("spore monitor: invalid --allow-host-port {s}: {s}\n", .{ raw, @errorName(err) });
                 std.process.exit(2);
             };
@@ -798,21 +798,6 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
         std.process.exit(2);
     }
     return opts;
-}
-
-const HostPort = struct {
-    host: []const u8,
-    port: u16,
-};
-
-fn parseHostPort(raw: []const u8) !HostPort {
-    const colon = std.mem.lastIndexOfScalar(u8, raw, ':') orelse return error.InvalidPort;
-    const host = raw[0..colon];
-    const port_raw = raw[colon + 1 ..];
-    const port = std.fmt.parseUnsigned(u16, port_raw, 10) catch return error.InvalidPort;
-    if (port == 0) return error.InvalidPort;
-    try spore_net_policy.validateHost(host);
-    return .{ .host = host, .port = port };
 }
 
 fn usageExit() noreturn {

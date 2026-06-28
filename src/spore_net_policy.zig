@@ -516,6 +516,21 @@ pub fn parseCidr(raw: []const u8) ParseError!Cidr {
     return .{ .network = addr, .prefix_len = prefix };
 }
 
+pub const HostPort = struct {
+    host: []const u8,
+    port: u16,
+};
+
+pub fn parseHostPort(raw: []const u8) ParseError!HostPort {
+    const colon = std.mem.lastIndexOfScalar(u8, raw, ':') orelse return error.InvalidPort;
+    const host = raw[0..colon];
+    const port_raw = raw[colon + 1 ..];
+    const port = std.fmt.parseUnsigned(u16, port_raw, 10) catch return error.InvalidPort;
+    if (port == 0) return error.InvalidPort;
+    try validateHost(host);
+    return .{ .host = host, .port = port };
+}
+
 pub fn validateHost(raw: []const u8) ParseError!void {
     if (raw.len == 0 or raw.len > 253) return error.InvalidHost;
     var label_len: usize = 0;
@@ -766,6 +781,15 @@ test "spore-net policy exposes first-slice capability facts" {
     try std.testing.expect(facts.bound_services);
     try std.testing.expect(!facts.tcp_ipv6);
     try std.testing.expect(!facts.stage_policy_update);
+}
+
+test "spore-net policy parses host port values" {
+    const parsed = try parseHostPort("github.com:443");
+    try std.testing.expectEqualStrings("github.com", parsed.host);
+    try std.testing.expectEqual(@as(u16, 443), parsed.port);
+    try std.testing.expectError(error.InvalidPort, parseHostPort("github.com"));
+    try std.testing.expectError(error.InvalidPort, parseHostPort("github.com:0"));
+    try std.testing.expectError(error.InvalidHost, parseHostPort("-github.com:443"));
 }
 
 test "spore-net exact policy learns A records and enforces host plus port" {
