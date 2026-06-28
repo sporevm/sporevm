@@ -40,7 +40,6 @@ pub const Mem = struct {
     block_size: u64,
     addr: u64,
     region_size: u64,
-    usable_region_size: u64,
     requested_size: u64,
     plugged_size: u64 = 0,
     plugged: std.StaticBitSet(max_blocks) = .initEmpty(),
@@ -57,7 +56,6 @@ pub const Mem = struct {
             .block_size = config.block_size,
             .addr = config.addr,
             .region_size = config.region_size,
-            .usable_region_size = config.region_size,
             .requested_size = config.requested_size,
             .plug_context = config.plug_context,
             .plugFn = config.plugFn,
@@ -90,8 +88,8 @@ pub const Mem = struct {
             20 => @truncate(self.addr >> 32),
             24 => @truncate(self.region_size),
             28 => @truncate(self.region_size >> 32),
-            32 => @truncate(self.usable_region_size),
-            36 => @truncate(self.usable_region_size >> 32),
+            32 => @truncate(self.region_size),
+            36 => @truncate(self.region_size >> 32),
             40 => @truncate(self.plugged_size),
             44 => @truncate(self.plugged_size >> 32),
             48 => @truncate(self.requested_size),
@@ -118,10 +116,11 @@ pub const Mem = struct {
     }
 
     fn handleRequest(self: *Mem, chain: *const queue.Chain) u32 {
-        const request = firstReadable(chain) orelse return 0;
         const response = firstWritable(chain) orelse return 0;
-        if (request.len < 24 or response.len < 10) return 0;
+        if (response.len < 10) return 0;
 
+        var request: [24]u8 = undefined;
+        if (!chain.copyReadableRange(0, &request)) return 0;
         const kind = std.mem.readInt(u16, request[0..2], .little);
         const addr = std.mem.readInt(u64, request[8..16], .little);
         const nb_blocks = std.mem.readInt(u16, request[16..18], .little);
@@ -185,20 +184,13 @@ pub const Mem = struct {
         if (start_bytes % self.block_size != 0) return null;
         const len_bytes = std.math.mul(u64, nb_blocks, self.block_size) catch return null;
         const end_bytes = std.math.add(u64, start_bytes, len_bytes) catch return null;
-        if (end_bytes > self.usable_region_size) return null;
+        if (end_bytes > self.region_size) return null;
         const start = start_bytes / self.block_size;
         const end = end_bytes / self.block_size;
         if (end > max_blocks) return null;
         return .{ .start = @intCast(start), .end = @intCast(end), .start_bytes = start_bytes, .end_bytes = end_bytes };
     }
 };
-
-fn firstReadable(chain: *const queue.Chain) ?[]u8 {
-    for (chain.segments.slice()) |seg| {
-        if (!seg.writable) return seg.data;
-    }
-    return null;
-}
 
 fn firstWritable(chain: *const queue.Chain) ?[]u8 {
     for (chain.segments.slice()) |seg| {
@@ -226,6 +218,8 @@ test "config exposes grow-only region" {
     try std.testing.expectEqual(@as(u32, 0), Mem.configRead(&mem, 8));
     try std.testing.expectEqual(@as(u32, 0), Mem.configRead(&mem, 16));
     try std.testing.expectEqual(@as(u32, 1), Mem.configRead(&mem, 20));
+    try std.testing.expectEqual(mem.region_size, @as(u64, Mem.configRead(&mem, 24)) | (@as(u64, Mem.configRead(&mem, 28)) << 32));
+    try std.testing.expectEqual(mem.region_size, @as(u64, Mem.configRead(&mem, 32)) | (@as(u64, Mem.configRead(&mem, 36)) << 32));
 }
 
 test "plug and state requests update plugged size" {
@@ -247,6 +241,23 @@ test "plug and state requests update plugged size" {
     try std.testing.expectEqual(@as(u32, 10), mem.handleRequest(&chain));
     try std.testing.expectEqual(resp_ack, std.mem.readInt(u16, resp[0..2], .little));
     try std.testing.expectEqual(state_mixed, std.mem.readInt(u16, resp[8..10], .little));
+}
+
+test "request header may span readable descriptors" {
+    var mem = Mem.init(.{ .addr = 0x1000_0000, .region_size = default_block_size * 4, .requested_size = default_block_size * 4 });
+    var req: [24]u8 = @splat(0);
+    var resp: [10]u8 = @splat(0);
+    std.mem.writeInt(u16, req[0..2], req_plug, .little);
+    std.mem.writeInt(u64, req[8..16], 0x1000_0000, .little);
+    std.mem.writeInt(u16, req[16..18], 1, .little);
+
+    var chain = queue.Chain{ .head = 0, .segments = .{} };
+    try chain.segments.append(.{ .data = req[0..8], .writable = false });
+    try chain.segments.append(.{ .data = req[8..], .writable = false });
+    try chain.segments.append(.{ .data = &resp, .writable = true });
+
+    try std.testing.expectEqual(@as(u32, 10), mem.handleRequest(&chain));
+    try std.testing.expectEqual(resp_ack, std.mem.readInt(u16, resp[0..2], .little));
 }
 
 test "plug callback receives requested size" {
