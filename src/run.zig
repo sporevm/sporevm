@@ -1008,18 +1008,13 @@ fn cloneRootfs(allocator: std.mem.Allocator, rootfs: spore.Rootfs) !spore.Rootfs
     return .{
         .kind = try allocator.dupe(u8, rootfs.kind),
         .mode = try allocator.dupe(u8, rootfs.mode),
-        .device = .{
-            .kind = try allocator.dupe(u8, rootfs.device.kind),
-            .role = try allocator.dupe(u8, rootfs.device.role),
-            .virtio_device_id = rootfs.device.virtio_device_id,
-            .mmio_slot = rootfs.device.mmio_slot,
-        },
+        .device = try spore.cloneRootfsDevice(allocator, rootfs.device),
         .artifact = .{
             .digest = try allocator.dupe(u8, rootfs.artifact.digest),
             .size = rootfs.artifact.size,
             .format = try allocator.dupe(u8, rootfs.artifact.format),
         },
-        .storage = if (rootfs.storage) |storage| try cloneRootfsStorage(allocator, storage) else null,
+        .storage = if (rootfs.storage) |storage| try spore.cloneRootfsStorage(allocator, storage) else null,
         .source = if (rootfs.source) |source| .{
             .kind = try allocator.dupe(u8, source.kind),
             .requested_ref = try allocator.dupe(u8, source.requested_ref),
@@ -1028,24 +1023,6 @@ fn cloneRootfs(allocator: std.mem.Allocator, rootfs: spore.Rootfs) !spore.Rootfs
             .platform = try allocator.dupe(u8, source.platform),
             .builder_version = try allocator.dupe(u8, source.builder_version),
         } else null,
-    };
-}
-
-fn cloneRootfsStorage(allocator: std.mem.Allocator, storage: spore.RootfsStorage) !spore.RootfsStorage {
-    return .{
-        .kind = try allocator.dupe(u8, storage.kind),
-        .device = .{
-            .kind = try allocator.dupe(u8, storage.device.kind),
-            .role = try allocator.dupe(u8, storage.device.role),
-            .virtio_device_id = storage.device.virtio_device_id,
-            .mmio_slot = storage.device.mmio_slot,
-        },
-        .logical_size = storage.logical_size,
-        .chunk_size = storage.chunk_size,
-        .hash_algorithm = try allocator.dupe(u8, storage.hash_algorithm),
-        .index_digest = try allocator.dupe(u8, storage.index_digest),
-        .base_identity = try allocator.dupe(u8, storage.base_identity),
-        .object_namespace = try allocator.dupe(u8, storage.object_namespace),
     };
 }
 

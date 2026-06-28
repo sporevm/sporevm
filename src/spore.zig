@@ -912,6 +912,28 @@ pub fn rootfsStorageEql(a: RootfsStorage, b: RootfsStorage) bool {
         std.mem.eql(u8, a.object_namespace, b.object_namespace);
 }
 
+pub fn cloneRootfsDevice(allocator: std.mem.Allocator, device: RootfsDevice) !RootfsDevice {
+    return .{
+        .kind = try allocator.dupe(u8, device.kind),
+        .role = try allocator.dupe(u8, device.role),
+        .virtio_device_id = device.virtio_device_id,
+        .mmio_slot = device.mmio_slot,
+    };
+}
+
+pub fn cloneRootfsStorage(allocator: std.mem.Allocator, storage: RootfsStorage) !RootfsStorage {
+    return .{
+        .kind = try allocator.dupe(u8, storage.kind),
+        .device = try cloneRootfsDevice(allocator, storage.device),
+        .logical_size = storage.logical_size,
+        .chunk_size = storage.chunk_size,
+        .hash_algorithm = try allocator.dupe(u8, storage.hash_algorithm),
+        .index_digest = try allocator.dupe(u8, storage.index_digest),
+        .base_identity = try allocator.dupe(u8, storage.base_identity),
+        .object_namespace = try allocator.dupe(u8, storage.object_namespace),
+    };
+}
+
 fn validateRootfsStorage(storage: RootfsStorage, rootfs: Rootfs, devices: []const TransportState) Error!void {
     try validateRootfsStorageDescriptor(storage);
     try validateRootfsDevice(storage.device, devices);
