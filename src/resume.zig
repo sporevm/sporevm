@@ -404,13 +404,6 @@ fn failResumeSetup(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
-fn runtimeDebugEnabled(args: []const []const u8) bool {
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--debug")) return true;
-    }
-    return false;
-}
-
 test "resume cli parser accepts one spore dir" {
     const opts = try parseCliArgs(&.{ "--backend", "hvf", "--timeout-ms", "120000", "child.spore" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
