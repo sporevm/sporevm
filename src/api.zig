@@ -11,6 +11,7 @@ const contracts = @import("contracts.zig");
 const context_mod = @import("context.zig");
 const lifecycle = @import("lifecycle.zig");
 const local_paths = @import("local_paths.zig");
+const memory_config = @import("memory.zig");
 const platform = @import("platform.zig");
 const resume_mod = @import("resume.zig");
 const rootfs_mod = @import("rootfs.zig");
@@ -821,7 +822,7 @@ pub fn runFromSpore(
         .disk = disk,
         .resume_dir = options.spore_dir,
         .command = options.command,
-        .memory = try run_mod.runMemoryFromManifest(manifest.value),
+        .memory = try memory_config.fromManifestBytes(manifest.value.platform.ram_size),
         .vcpus = options.vcpus,
         .guest_port = options.guest_port,
         .timeout_ms = options.timeout_ms,
