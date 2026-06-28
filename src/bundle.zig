@@ -1560,22 +1560,17 @@ fn packRootfsStorageIndexed(
         payload_bytes += @intCast(object_data.len);
     }
 
-    const index_digest_copy = allocator.dupe(u8, storage.index_digest) catch return error.OutOfMemory;
-    seen_storages.put(index_digest_copy, {}) catch return error.OutOfMemory;
+    const storage_copy = try spore.cloneRootfsStorage(allocator, storage);
+    seen_storages.put(storage_copy.index_digest, {}) catch return error.OutOfMemory;
     try storage_entries.append(.{
-        .kind = allocator.dupe(u8, storage.kind) catch return error.OutOfMemory,
-        .device = .{
-            .kind = allocator.dupe(u8, storage.device.kind) catch return error.OutOfMemory,
-            .role = allocator.dupe(u8, storage.device.role) catch return error.OutOfMemory,
-            .virtio_device_id = storage.device.virtio_device_id,
-            .mmio_slot = storage.device.mmio_slot,
-        },
-        .logical_size = storage.logical_size,
-        .chunk_size = storage.chunk_size,
-        .hash_algorithm = allocator.dupe(u8, storage.hash_algorithm) catch return error.OutOfMemory,
-        .index_digest = index_digest_copy,
-        .base_identity = allocator.dupe(u8, storage.base_identity) catch return error.OutOfMemory,
-        .object_namespace = allocator.dupe(u8, storage.object_namespace) catch return error.OutOfMemory,
+        .kind = storage_copy.kind,
+        .device = storage_copy.device,
+        .logical_size = storage_copy.logical_size,
+        .chunk_size = storage_copy.chunk_size,
+        .hash_algorithm = storage_copy.hash_algorithm,
+        .index_digest = storage_copy.index_digest,
+        .base_identity = storage_copy.base_identity,
+        .object_namespace = storage_copy.object_namespace,
         .index_path = index_rel_path,
         .index_bytes = @intCast(index_bytes.len),
         .object_count = object_count,
