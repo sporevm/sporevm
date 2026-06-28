@@ -17,7 +17,7 @@ Kinds:
 
 Environment:
   SPOREVM_KERNEL_IMAGE       explicit local Image path; skips download
-  SPOREVM_KERNEL_RELEASE     kernel release tag (default: v0.6.1)
+  SPOREVM_KERNEL_RELEASE     kernel release tag (default: v0.6.2)
   SPOREVM_KERNEL_VERSION     Linux version in the asset name (default: 6.1.155)
   SPOREVM_KERNEL_REPOSITORY  GitHub repo override
                               default: sporevm/kernels for run/sporevm,
@@ -157,7 +157,7 @@ if [[ -n "${SPOREVM_KERNEL_IMAGE:-}" ]]; then
   exit 0
 fi
 
-release="${SPOREVM_KERNEL_RELEASE:-v0.6.1}"
+release="${SPOREVM_KERNEL_RELEASE:-v0.6.2}"
 linux_version="${SPOREVM_KERNEL_VERSION:-6.1.155}"
 repo="${SPOREVM_KERNEL_REPOSITORY:-}"
 

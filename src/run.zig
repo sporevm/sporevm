@@ -42,7 +42,7 @@ const max_guest_request_len = 8191;
 const max_guest_port = 65535;
 const embedded_run_initrd = run_assets.minimal_exec_initrd;
 const default_kernel_repository = "sporevm/kernels";
-const default_kernel_release = "v0.6.1";
+const default_kernel_release = "v0.6.2";
 const default_kernel_version = "6.1.155";
 const managed_run_kernel_required_config_symbols = [_][]const u8{
     "CONFIG_CGROUPS",
