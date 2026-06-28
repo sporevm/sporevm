@@ -24,6 +24,7 @@ const spec_file = "spec.json";
 const ready_file = "ready.json";
 const create_timing_file = "create-timing.json";
 const monitor_timing_file = "monitor-timing.json";
+const monitor_stats_file = "monitor-stats.json";
 const pid_file = "pid";
 const control_socket_file = "control.sock";
 const console_log_file = "console.log";
@@ -153,6 +154,7 @@ pub const Paths = struct {
     ready_path: []const u8,
     create_timing_path: []const u8,
     monitor_timing_path: []const u8,
+    monitor_stats_path: []const u8,
     pid_path: []const u8,
     control_socket_path: []const u8,
     console_log_path: []const u8,
@@ -165,6 +167,7 @@ pub const Paths = struct {
         allocator.free(self.ready_path);
         allocator.free(self.create_timing_path);
         allocator.free(self.monitor_timing_path);
+        allocator.free(self.monitor_stats_path);
         allocator.free(self.pid_path);
         allocator.free(self.control_socket_path);
         allocator.free(self.console_log_path);
@@ -252,6 +255,11 @@ pub const ListStats = struct {
     backing_allocated_bytes: ?u64 = null,
     chunk_size: ?u64 = null,
     chunks_total: ?u64 = null,
+    chunks_nonzero: ?u64 = null,
+    dirty_chunks_pending: ?u64 = null,
+};
+
+pub const MonitorStats = struct {
     chunks_nonzero: ?u64 = null,
     dirty_chunks_pending: ?u64 = null,
 };
@@ -1316,6 +1324,8 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
     errdefer allocator.free(create_timing_path);
     const monitor_timing_path = try std.fs.path.resolve(allocator, &.{ vm_dir, monitor_timing_file });
     errdefer allocator.free(monitor_timing_path);
+    const monitor_stats_path = try std.fs.path.resolve(allocator, &.{ vm_dir, monitor_stats_file });
+    errdefer allocator.free(monitor_stats_path);
     const pid_path = try std.fs.path.resolve(allocator, &.{ vm_dir, pid_file });
     errdefer allocator.free(pid_path);
     const control_socket_path = try std.fs.path.resolve(allocator, &.{ vm_dir, control_socket_file });
@@ -1329,6 +1339,7 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
         .ready_path = ready_path,
         .create_timing_path = create_timing_path,
         .monitor_timing_path = monitor_timing_path,
+        .monitor_stats_path = monitor_stats_path,
         .pid_path = pid_path,
         .control_socket_path = control_socket_path,
         .console_log_path = console_log_path,
@@ -1374,6 +1385,16 @@ pub fn writeCreateTiming(allocator: std.mem.Allocator, io: Io, paths: Paths, tim
 
 pub fn writeMonitorTiming(allocator: std.mem.Allocator, io: Io, paths: Paths, timing: MonitorTiming) !void {
     try writeTimingJson(allocator, io, paths.monitor_timing_path, timing);
+}
+
+pub fn writeMonitorStatsPath(allocator: std.mem.Allocator, io: Io, path: []const u8, stats: MonitorStats) !void {
+    const json = try std.json.Stringify.valueAlloc(allocator, stats, .{ .whitespace = .indent_2 });
+    defer allocator.free(json);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+}
+
+pub fn writeMonitorStats(allocator: std.mem.Allocator, io: Io, paths: Paths, stats: MonitorStats) !void {
+    try writeMonitorStatsPath(allocator, io, paths.monitor_stats_path, stats);
 }
 
 fn writeTimingJson(allocator: std.mem.Allocator, io: Io, path: []const u8, timing: anytype) !void {
@@ -1457,6 +1478,10 @@ pub fn listEntries(allocator: std.mem.Allocator, io: Io, runtime_root: []const u
         var stats = if (metadata) |value| value.stats else ListStats{};
         if (state == .ready) {
             if (pid) |value| stats.resident_bytes = readProcessResidentBytes(allocator, io, value);
+            if (readMonitorStats(allocator, io, paths)) |monitor_stats| {
+                stats.chunks_nonzero = monitor_stats.chunks_nonzero;
+                stats.dirty_chunks_pending = monitor_stats.dirty_chunks_pending;
+            } else |_| {}
         }
         try entries.append(.{
             .name = try allocator.dupe(u8, entry.name),
@@ -2408,6 +2433,17 @@ fn snapshotResponseOk(allocator: std.mem.Allocator, response: []const u8) !bool 
     return std.mem.eql(u8, parsed.value.type, "snapshotted");
 }
 
+fn readMonitorStats(allocator: std.mem.Allocator, io: Io, paths: Paths) !MonitorStats {
+    const data = try Io.Dir.cwd().readFileAlloc(io, paths.monitor_stats_path, allocator, .limited(max_metadata_bytes));
+    defer allocator.free(data);
+    var parsed = try std.json.parseFromSlice(MonitorStats, allocator, data, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    return parsed.value;
+}
+
 fn ownedNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycleResult) !NamedLifecycleResult {
     const name = try allocator.dupe(u8, result.name);
     errdefer allocator.free(name);
@@ -2844,6 +2880,7 @@ test "lifecycle paths are rooted under vms by name" {
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/ready.json", paths.ready_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/create-timing.json", paths.create_timing_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/monitor-timing.json", paths.monitor_timing_path);
+    try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/monitor-stats.json", paths.monitor_stats_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/pid", paths.pid_path);
 }
 
@@ -3052,6 +3089,10 @@ test "lifecycle list entries sorts and classifies VM directories" {
         .console_log_path = ready.console_log_path,
     });
     try writePid(allocator, io, ready, ready_pid);
+    try writeMonitorStats(allocator, io, ready, .{
+        .chunks_nonzero = 17,
+        .dirty_chunks_pending = 2,
+    });
 
     const entries = try listEntries(allocator, io, root, aliveOnlyCurrentProcess);
     defer freeListEntries(allocator, entries);
@@ -3069,6 +3110,8 @@ test "lifecycle list entries sorts and classifies VM directories" {
     const chunk_size: u64 = spore.chunk_size;
     try std.testing.expectEqual(@as(?u64, chunk_size), entries[0].stats.chunk_size);
     try std.testing.expectEqual(@as(?u64, memory_config.auto_bytes / chunk_size), entries[0].stats.chunks_total);
+    try std.testing.expectEqual(@as(?u64, 17), entries[0].stats.chunks_nonzero);
+    try std.testing.expectEqual(@as(?u64, 2), entries[0].stats.dirty_chunks_pending);
     try std.testing.expectEqualStrings("b-stale", entries[1].name);
     try std.testing.expectEqualStrings("stale", entries[1].state);
     try std.testing.expectEqual(@as(?i64, 9001), entries[1].pid);
@@ -3133,6 +3176,25 @@ test "lifecycle list JSON exposes memory and nullable stats" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"memory\":{\"policy\":\"auto\",\"bytes\":17179869184}") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stats\":{\"resident_bytes\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"dirty_chunks_pending\":null") != null);
+}
+
+test "lifecycle reads monitor stats metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-monitor-stats"});
+    defer allocator.free(root);
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const paths = try pathsFromRoot(allocator, root, "bench-1");
+    defer paths.deinit(allocator);
+    try ensureVmDir(io, paths);
+    try writeMonitorStats(allocator, io, paths, .{
+        .chunks_nonzero = 17,
+        .dirty_chunks_pending = 2,
+    });
+
+    const stats = try readMonitorStats(allocator, io, paths);
+    try std.testing.expectEqual(@as(?u64, 17), stats.chunks_nonzero);
+    try std.testing.expectEqual(@as(?u64, 2), stats.dirty_chunks_pending);
 }
 
 test "linux statm resident parser reads resident pages" {

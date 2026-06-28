@@ -53,9 +53,9 @@ The VMM has the right sparse mechanics: fresh boot maps RAM with private
 anonymous `mmap`, sparse dirty seeding starts from boot-populated ranges,
 same-host restore can use proof-gated `ram.backing`, memory manifests elide zero
 chunks, and dirty tracking keeps chunk refs and backing files up to date while
-the VM runs. The remaining product gap is that `spore ls` still lacks cheap
-resident memory, nonzero chunk, and pending dirty counters, and the plan still
-needs current real-host evidence for the 16GiB product path.
+the VM runs. The remaining product gap is current real-host evidence for the
+16GiB product path and enough runtime reporting to keep that evidence visible
+without scanning configured RAM.
 
 ## Goals
 
@@ -244,13 +244,13 @@ best-effort scans.
   configured memory contract, reports Linux/macOS monitor process resident
   bytes for ready VMs, and reports local `ram.backing` logical and allocated
   bytes with metadata-only file stats when the lifecycle spec points at a local
-  spore directory. Nonzero chunk and dirty counters remain explicitly unknown
-  until they have cheap runtime metadata or monitor sources.
+  spore directory. Ready dirty-tracked monitor VMs also report nonzero and
+  pending dirty chunk counters from `monitor-stats.json`.
 - The current stats collector deliberately lives in `src/lifecycle.zig`: it
   combines lifecycle spec metadata, process resident metadata, and sparse
-  backing file stats for one list call path. Do not extract a
-  runtime-accounting module until monitor-emitted nonzero and dirty counters
-  create a real second runtime source.
+  backing file stats for one list call path. The monitor remains the live
+  runtime source for dirty-tracker counters; do not extract a runtime-accounting
+  module until another caller needs the same composition.
 
 ## Delivery Strategy
 
@@ -309,18 +309,16 @@ Progress:
   `memory.bytes` from each VM's `spec.json` and emits nullable stat fields
   instead of trying to derive them by walking RAM.
 - The human `spore ls` table now renders populated nullable stats when a cheap
-  runtime, process, or filesystem metadata source supplies them. Nonzero chunk
-  and dirty collection sources are still pending.
+  runtime, process, or filesystem metadata source supplies them.
 - Lifecycle list entries now derive `chunk_size` and `chunks_total` from the
   configured memory contract, and derive sparse backing logical/allocated bytes
   from no-follow `ram.backing` file stats when a local resume directory is
   known. Ready VMs now get resident bytes from bounded process metadata
-  (`/proc/<pid>/statm` on Linux, `proc_pidinfo` on macOS). Nonzero chunks and
-  pending dirty chunks still need monitor sources.
-- Keep the collector lifecycle-local until monitor counters land. Once there
-  are multiple runtime-owned sources, split around a small list-facing collector
-  that preserves the O(number of VMs) contract instead of adding a wrapper
-  around today's lifecycle implementation.
+  (`/proc/<pid>/statm` on Linux, `proc_pidinfo` on macOS) and nonzero/pending
+  dirty chunk counters from monitor-published metadata.
+- Keep the collector lifecycle-local until another caller needs composed list
+  stats. The monitor only publishes live counters; lifecycle remains the
+  list-facing composition point that preserves the O(number of VMs) contract.
 
 ### Slice 4: Measurement Gate for Raising Defaults Further
 

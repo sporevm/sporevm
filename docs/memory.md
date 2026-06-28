@@ -63,8 +63,9 @@ and that tail must stay visible in benchmark and runtime stats.
 - `spore ls` reports lifecycle memory policy, configured bytes, monitor process
   resident bytes on Linux/macOS, chunk size and total chunks, and local
   `ram.backing` logical/allocated bytes when a listed VM points at a local spore
-  directory with a backing file. Nonzero chunks and dirty counters are still
-  nullable until cheap monitor/runtime sources exist.
+  directory with a backing file. Ready dirty-tracked monitor VMs also report
+  monitor-published nonzero and pending dirty chunk counters. Fields
+  remain nullable when no cheap runtime source exists.
 - Resume from chunks is portable; local backing is same-host acceleration only.
 - Linux fs-verity could strengthen backing-file integrity later, but it should
   not become a user-facing mode.
