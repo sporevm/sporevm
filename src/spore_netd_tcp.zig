@@ -54,10 +54,6 @@ pub const Stats = struct {
     output_drops: usize = 0,
 };
 
-pub const BoundService = struct {
-    unix_path: []const u8,
-};
-
 const HostState = enum {
     none,
     connecting,
@@ -67,7 +63,6 @@ const HostState = enum {
 
 const RequestTarget = union(enum) {
     tcp: ?[]const u8,
-    legacy_bound_unix: []const u8,
     bound_unix: *const spore_net_policy.BoundServiceConfig,
 };
 
@@ -212,7 +207,6 @@ pub const Gateway = struct {
     current_now: Instant = Instant.ZERO,
     stats: Stats = .{},
     emit_events: bool = false,
-    bound_service: ?BoundService = null,
 
     pub fn init(self: *Gateway, policy: *spore_net_policy.Runtime) void {
         self.device = Device.init();
@@ -221,7 +215,6 @@ pub const Gateway = struct {
         self.current_now = Instant.ZERO;
         self.stats = .{};
         self.emit_events = false;
-        self.bound_service = null;
         for (&self.flows, 0..) |*flow, i| {
             flow.init();
             self.sock_ptrs[i] = &flow.sock;
@@ -232,10 +225,6 @@ pub const Gateway = struct {
             .tcp4_forwarder = &self.forwarder,
         });
         self.stack.iface.v4.addIpAddr(.{ .address = tcp_stack_ipv4, .prefix_len = tcp_stack_prefix_len });
-    }
-
-    pub fn bindUnixService(self: *Gateway, unix_path: []const u8) void {
-        self.bound_service = .{ .unix_path = unix_path };
     }
 
     pub fn receiveFrame(self: *Gateway, frame: []const u8, now: Instant) bool {
@@ -321,10 +310,6 @@ pub const Gateway = struct {
                 emitNetworkDecision("allow", host, request.local.addr, request.local.port, "policy");
                 break :blk openHostSocket(request.local.addr, request.local.port);
             },
-            .legacy_bound_unix => |path| blk: {
-                emitNetworkDecision("allow", null, request.local.addr, request.local.port, "bound-service");
-                break :blk openUnixSocket(path);
-            },
             .bound_unix => |bound| blk: {
                 const host: ?[]const u8 = if (bound.guest_host.len == 0) null else bound.guest_host;
                 emitNetworkDecision("allow", host, request.local.addr, request.local.port, bound.name);
@@ -355,7 +340,6 @@ pub const Gateway = struct {
         if (request.local.port == 0 or request.remote.port == 0) return null;
         if (std.mem.eql(u8, &request.local.addr, &spore_net.gateway_ipv4)) {
             if (self.policy.boundServiceForPort(request.local.port)) |bound| return .{ .bound_unix = bound };
-            if (self.boundServiceRequest(request)) return .{ .legacy_bound_unix = self.bound_service.?.unix_path };
         }
         const decision = self.policy.decideIpv4Port(request.local.addr, request.local.port);
         const host = self.policy.hostForIpv4Port(request.local.addr, request.local.port);
@@ -374,12 +358,6 @@ pub const Gateway = struct {
             },
         );
         return null;
-    }
-
-    fn boundServiceRequest(self: *const Gateway, request: ForwardRequest) bool {
-        return self.bound_service != null and
-            request.local.port == 80 and
-            std.mem.eql(u8, &request.local.addr, &spore_net.gateway_ipv4);
     }
 
     fn freeFlow(self: *Gateway) ?*Flow {
@@ -758,10 +736,11 @@ test "spore-netd TCP denies blocked SYN before host socket open" {
 }
 
 test "spore-netd TCP routes bound service SYNs before gateway hard-floor denial" {
-    var policy = try spore_net_policy.Runtime.init(.{});
+    var config = spore_net_policy.Config{};
+    try config.addBindService("metadata=unix:/tmp/sporevm-netd-missing-bound-service.sock");
+    var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
     gateway.init(&policy);
-    gateway.bindUnixService("/tmp/sporevm-netd-missing-bound-service.sock");
 
     var frame_buf: [spore_net.max_frame_len]u8 = undefined;
     const service_syn = buildTcpSynFrame(spore_net.gateway_ipv4, 80, &frame_buf);
@@ -844,7 +823,6 @@ test "spore-netd TCP routes configured bound service ports to Unix sockets" {
     const target = gateway.targetForRequest(testForwardRequest(spore_net.gateway_ipv4, 8170)) orelse return error.TestUnexpectedResult;
     switch (target) {
         .bound_unix => |service| try std.testing.expectEqualStrings("cleanroom-gateway", service.name),
-        .legacy_bound_unix => return error.TestUnexpectedResult,
         .tcp => return error.TestUnexpectedResult,
     }
     try std.testing.expect(gateway.targetForRequest(testForwardRequest(spore_net.gateway_ipv4, 8171)) == null);
