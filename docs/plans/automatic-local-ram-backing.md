@@ -179,6 +179,16 @@ The old `kvm-boot` and `hvf-boot` explicit trust flags have been removed as
 well. Backend file-backed restore is still supported, but product paths now feed
 it only through proof-gated local backing selection.
 
+The current implementation keeps the host-local proof and restore planner behind
+one internal seam: `openProvenLocalMemoryBacking` and
+`writeLocalMemoryBackingProof` in `src/spore.zig`. That is deliberate for the
+landed slices. Product restore callers (`src/resume.zig` and `src/run.zig`) use
+the planner result, while `spore.fork` still rewrites child manifests, backing
+links, and child proofs in one place. Do not extract a separate local-backing
+module just to move code around; before fs-verity there is only one concrete
+proof path, so a split would add indirection without reducing what callers need
+to know.
+
 ## Delivery Strategy
 
 ### Slice 1: Proof-Gated Automatic Local Backing
@@ -225,6 +235,10 @@ Status: not started.
 Add an opportunistic Linux-only verifier behind the same automatic planner. When
 the filesystem supports fs-verity, enable it after finalizing `ram.backing`,
 store the verity digest in the proof, and verify the digest before mapping.
+This should deepen the existing planner seam rather than introduce a
+user-facing mode. If the code is split before or during this slice, split around
+the planner contract after the `spore.fork` coupling is addressed, not around a
+new wrapper with one implementation.
 
 Done when:
 
