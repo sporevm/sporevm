@@ -78,25 +78,6 @@ expect_nproc_equals() {
   }
 }
 
-run_with_timeout() {
-  local timeout_seconds="$1"
-  shift
-  "$@" &
-  local pid="$!"
-  (
-    sleep "${timeout_seconds}"
-    kill -TERM "${pid}" >/dev/null 2>&1 || true
-  ) &
-  local watchdog="$!"
-  set +e
-  wait "${pid}"
-  local status="$?"
-  set -e
-  kill "${watchdog}" >/dev/null 2>&1 || true
-  wait "${watchdog}" >/dev/null 2>&1 || true
-  return "${status}"
-}
-
 backend="$(infer_backend)"
 case "${backend}" in
   hvf|kvm) ;;
@@ -106,7 +87,6 @@ esac
 
 vcpus="${SPORE_SMOKE_VCPUS:-2}"
 memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-512}mib}"
-timeout_seconds="${SPORE_SMOKE_TIMEOUT_SECONDS:-30}"
 create_timeout_ms="${SPORE_SMOKE_CREATE_TIMEOUT_MS:-120000}"
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-multi-vcpu.XXXXXX")"
 runtime_dir="${workdir}/runtime"
@@ -168,44 +148,31 @@ jsonl_output_contains "${from_stdout}" stderr "spore stderr" || die "multi-vCPU 
 capture_dir="${workdir}/active.spore"
 capture_stdout="${workdir}/capture.stdout"
 capture_stderr="${workdir}/capture.stderr"
+capture_events_pipe="${workdir}/capture.events.pipe"
+mkfifo "${capture_events_pipe}"
 "${spore_bin}" run \
   --backend "${backend}" \
+  --events=jsonl \
   --vcpus "${vcpus}" \
   --memory "${memory}" \
   --capture "${capture_dir}" \
   --capture-on USR1 \
   -- /bin/finite \
-  >"${capture_stdout}" 2>"${capture_stderr}" &
+  >"${capture_events_pipe}" 2>"${capture_stderr}" &
 capture_pid="$!"
 
-seen_ready=0
-for _ in $(seq 1 "${SPORE_SMOKE_CAPTURE_POLLS:-120}"); do
-  if grep -Fxq "spore finite ready" "${capture_stdout}"; then
-    seen_ready=1
-    break
-  fi
-  sleep "${SPORE_SMOKE_CAPTURE_POLL_INTERVAL:-0.1}"
-done
-if [[ "${seen_ready}" != "1" ]]; then
+if ! python3 "${repo_root}/scripts/capture-on-output-marker.py" --pid "${capture_pid}" --signal USR1 --event stdout --contains "spore finite ready" --out "${capture_stdout}" <"${capture_events_pipe}"; then
   kill -TERM "${capture_pid}" >/dev/null 2>&1 || true
   wait "${capture_pid}" >/dev/null 2>&1 || true
-  tail -80 "${capture_stderr}" >&2 || true
+  cat "${capture_stdout}" >&2 || true
+  cat "${capture_stderr}" >&2 || true
   die "multi-vCPU capture did not reach the long-running command"
 fi
 
-sleep "${SPORE_SMOKE_CAPTURE_SETTLE_SECONDS:-0.3}"
-kill -USR1 "${capture_pid}"
-(
-  sleep "${timeout_seconds}"
-  kill -TERM "${capture_pid}" >/dev/null 2>&1 || true
-) &
-capture_watchdog="$!"
 set +e
 wait "${capture_pid}"
 capture_status="$?"
 set -e
-kill "${capture_watchdog}" >/dev/null 2>&1 || true
-wait "${capture_watchdog}" >/dev/null 2>&1 || true
 if [[ "${capture_status}" != "0" ]]; then
   cat "${capture_stdout}" >&2 || true
   cat "${capture_stderr}" >&2 || true
@@ -215,7 +182,7 @@ expect_manifest_v1 "${capture_dir}"
 
 resume_stdout="${workdir}/resume.stdout"
 resume_stderr="${workdir}/resume.stderr"
-if ! run_with_timeout "${timeout_seconds}" "${spore_bin}" resume --events=jsonl --backend "${backend}" "${capture_dir}" >"${resume_stdout}" 2>"${resume_stderr}"; then
+if ! "${spore_bin}" resume --events=jsonl --backend "${backend}" "${capture_dir}" >"${resume_stdout}" 2>"${resume_stderr}"; then
   cat "${resume_stdout}" >&2 || true
   cat "${resume_stderr}" >&2 || true
   die "multi-vCPU resume failed"

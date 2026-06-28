@@ -286,7 +286,7 @@ Current evidence:
 - KVM v1 multi-vCPU fresh boot, capture, `run --from`, and `resume` passed on
   the `sporevm-ops` ARM64 Linux CI host
   `i-08fa4a14319c9c1b5` (`sporevm-ci-apse2-linux-arm64`, `c7gd.metal`) via SSM
-  command `efa79320-1242-4ab9-ae72-55eceda450c3`, which ran
+  command `977b7ee2-4bbf-4e7c-a5d5-782202c872b1`, which ran
   `scripts/smoke-multi-vcpu.sh` with `SPORE_BACKEND=kvm` and reported
   `smoke:multi-vcpu ok backend=kvm vcpus=2`.
 
