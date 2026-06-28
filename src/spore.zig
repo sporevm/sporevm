@@ -19,11 +19,14 @@ const generation = @import("generation.zig");
 const gicv3 = @import("gicv3.zig");
 const local_paths = @import("local_paths.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
+const topology = @import("topology.zig");
 const Blake3 = std.crypto.hash.Blake3;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const format_version: u32 = 0;
+pub const format_version_v1: u32 = 1;
+pub const machine_schema_version_v1: u32 = 1;
 pub const chunk_size: usize = 2 * 1024 * 1024;
 pub const ram_backing_kind = "map-private-file-v0";
 pub const ram_backing_path = "ram.backing";
@@ -59,6 +62,19 @@ pub const Platform = struct {
     /// Architected counter frequency in Hz. `machine.vtimer` values are in
     /// this tick domain; restore requires an exact match until cross-frequency
     /// timer virtualization has a real design.
+    counter_frequency_hz: u64,
+};
+
+pub const PlatformV1 = struct {
+    arch: []const u8 = "aarch64",
+    cpu_profile: []const u8,
+    device_model_version: u32,
+    vcpu_count: topology.VcpuCount,
+    ram_base: u64,
+    ram_size: u64,
+    gic_dist_base: u64,
+    gic_redist_base: u64,
+    gic_redist_stride: u64,
     counter_frequency_hz: u64,
 };
 
@@ -110,6 +126,31 @@ pub const MachineState = struct {
     /// Interrupt controller state. Portable producers use architectural
     /// GICv3 offsets; same-backend temporary producers must tag their private
     /// blob so other backends fail closed.
+    gic: gicv3.State,
+};
+
+pub const VcpuState = struct {
+    index: topology.VcpuIndex,
+    mpidr: topology.Mpidr,
+    gprs: [31]u64,
+    pc: u64,
+    cpsr: u64,
+    fpcr: u64,
+    fpsr: u64,
+    /// 32 Q registers as pairs of u64 (little-endian halves).
+    simd: [32][2]u64,
+    sys_regs: []SysRegEntry,
+    /// Per-vCPU GIC CPU-interface (ICC) registers, by architectural name.
+    icc_regs: []SysRegEntry,
+    vtimer: VtimerState,
+};
+
+pub const MachineStateV1 = struct {
+    schema_version: u32 = machine_schema_version_v1,
+    vcpus: []VcpuState,
+    /// Interrupt controller state. Manifest v1 currently accepts the portable
+    /// multi-vCPU GICv3 shape; backend-private v1 restore can be added when a
+    /// backend actually needs that escape hatch.
     gic: gicv3.State,
 };
 
@@ -339,6 +380,19 @@ pub const Manifest = struct {
     annotations: Annotations = .{},
     platform: Platform,
     machine: MachineState,
+    devices: []TransportState,
+    generation: GenerationState,
+    rootfs: ?Rootfs = null,
+    disk: ?Disk = null,
+    network: ?Network = null,
+    memory: MemoryManifest,
+};
+
+pub const ManifestV1 = struct {
+    version: u32 = format_version_v1,
+    annotations: Annotations = .{},
+    platform: PlatformV1,
+    machine: MachineStateV1,
     devices: []TransportState,
     generation: GenerationState,
     rootfs: ?Rootfs = null,
@@ -1284,6 +1338,19 @@ pub fn saveManifestPath(allocator: std.mem.Allocator, path: []const u8, manifest
     try writeFileAll(path_z, json);
 }
 
+pub fn saveManifestV1(allocator: std.mem.Allocator, dir: []const u8, manifest: ManifestV1) Error!void {
+    const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
+    try saveManifestV1Path(allocator, path, manifest);
+}
+
+pub fn saveManifestV1Path(allocator: std.mem.Allocator, path: []const u8, manifest: ManifestV1) Error!void {
+    try validateManifestV1(manifest);
+    const json = std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
+    defer allocator.free(json);
+    const path_z = try pathZ(allocator, "{s}", .{path});
+    try writeFileAll(path_z, json);
+}
+
 pub fn loadManifest(allocator: std.mem.Allocator, dir: []const u8) Error!std.json.Parsed(Manifest) {
     const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
     return loadManifestPath(allocator, path);
@@ -1299,6 +1366,24 @@ pub fn loadManifestPath(allocator: std.mem.Allocator, path: []const u8) Error!st
     }) catch return error.BadManifest;
     errdefer parsed.deinit();
     validateManifest(parsed.value) catch return error.BadManifest;
+    return parsed;
+}
+
+pub fn loadManifestV1(allocator: std.mem.Allocator, dir: []const u8) Error!std.json.Parsed(ManifestV1) {
+    const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
+    return loadManifestV1Path(allocator, path);
+}
+
+pub fn loadManifestV1Path(allocator: std.mem.Allocator, path: []const u8) Error!std.json.Parsed(ManifestV1) {
+    const path_z = try pathZ(allocator, "{s}", .{path});
+    const bytes = try readFileAll(allocator, path_z, 64 * 1024 * 1024);
+    defer allocator.free(bytes);
+    const parsed = std.json.parseFromSlice(ManifestV1, allocator, bytes, .{
+        // The byte buffer is freed before the parse result is used.
+        .allocate = .alloc_always,
+    }) catch return error.BadManifest;
+    errdefer parsed.deinit();
+    validateManifestV1(parsed.value) catch return error.BadManifest;
     return parsed;
 }
 
@@ -1626,28 +1711,97 @@ fn forkGicState(allocator: std.mem.Allocator, state: gicv3.State) Error!gicv3.St
 
 pub fn validateManifest(manifest: Manifest) Error!void {
     if (manifest.version != format_version) return error.BadManifest;
-    try validateAnnotations(manifest.annotations);
-    if (manifest.platform.cpu_profile.len == 0) return error.BadManifest;
-    if (manifest.platform.counter_frequency_hz == 0 or
-        manifest.platform.counter_frequency_hz > std.math.maxInt(u32))
+    try validateManifestCommon(
+        manifest.annotations,
+        manifest.platform.cpu_profile,
+        manifest.platform.counter_frequency_hz,
+        manifest.platform.ram_size,
+        manifest.devices,
+        manifest.rootfs,
+        manifest.disk,
+        manifest.network,
+        manifest.memory,
+    );
+    gicv3.validate(manifest.machine.gic) catch return error.BadManifest;
+}
+
+pub fn validateManifestV1(manifest: ManifestV1) Error!void {
+    if (manifest.version != format_version_v1) return error.BadManifest;
+    try validateManifestCommon(
+        manifest.annotations,
+        manifest.platform.cpu_profile,
+        manifest.platform.counter_frequency_hz,
+        manifest.platform.ram_size,
+        manifest.devices,
+        manifest.rootfs,
+        manifest.disk,
+        manifest.network,
+        manifest.memory,
+    );
+    try validateMachineV1(manifest.platform, manifest.machine);
+}
+
+fn validateManifestCommon(
+    annotations: Annotations,
+    cpu_profile: []const u8,
+    counter_frequency_hz: u64,
+    ram_size: u64,
+    devices: []const TransportState,
+    rootfs: ?Rootfs,
+    disk: ?Disk,
+    network: ?Network,
+    memory: MemoryManifest,
+) Error!void {
+    try validateAnnotations(annotations);
+    if (cpu_profile.len == 0) return error.BadManifest;
+    if (counter_frequency_hz == 0 or
+        counter_frequency_hz > std.math.maxInt(u32))
     {
         return error.BadManifest;
     }
-    if (manifest.platform.ram_size > std.math.maxInt(usize)) return error.BadManifest;
-    _ = try validateMemoryForRam(manifest.memory, @intCast(manifest.platform.ram_size));
-    if (manifest.memory.backing) |backing| {
-        try validateMemoryBacking(backing, manifest.platform.ram_size);
+    if (ram_size > std.math.maxInt(usize)) return error.BadManifest;
+    _ = try validateMemoryForRam(memory, @intCast(ram_size));
+    if (memory.backing) |backing| {
+        try validateMemoryBacking(backing, ram_size);
     }
-    if (manifest.rootfs) |rootfs| {
-        try validateRootfs(rootfs, manifest.devices);
+    if (rootfs) |r| {
+        try validateRootfs(r, devices);
     }
-    if (manifest.disk) |disk| {
-        try validateDisk(disk, manifest.rootfs, manifest.devices);
+    if (disk) |d| {
+        try validateDisk(d, rootfs, devices);
     }
-    if (manifest.network) |network| {
-        try validateNetwork(network);
+    if (network) |n| {
+        try validateNetwork(n);
     }
-    gicv3.validate(manifest.machine.gic) catch return error.BadManifest;
+}
+
+fn validateMachineV1(platform: PlatformV1, machine: MachineStateV1) Error!void {
+    if (machine.schema_version != machine_schema_version_v1) return error.BadManifest;
+    topology.validateVcpuCount(platform.vcpu_count) catch return error.BadManifest;
+    if (platform.gic_redist_stride == 0) return error.BadManifest;
+    _ = board.redistributorRegionSize(platform.gic_redist_stride, platform.vcpu_count) catch return error.BadManifest;
+    if (machine.vcpus.len != platform.vcpu_count) return error.BadManifest;
+    if (machine.gic.kind != .gicv3_multi) return error.BadManifest;
+    gicv3.validate(machine.gic) catch return error.BadManifest;
+    const gic = machine.gic.gicv3_multi orelse return error.BadManifest;
+    if (gic.redistributors.len != machine.vcpus.len) return error.BadManifest;
+
+    for (machine.vcpus, 0..) |vcpu, i| {
+        if (vcpu.index != i) return error.BadManifest;
+        if (vcpu.index >= platform.vcpu_count) return error.BadManifest;
+        if (vcpu.mpidr != topology.mpidrForIndex(vcpu.index)) return error.BadManifest;
+        for (machine.vcpus[0..i]) |prev| {
+            if (prev.index == vcpu.index or prev.mpidr == vcpu.mpidr) return error.BadManifest;
+        }
+        if (!gicHasRedistributor(gic, vcpu.mpidr)) return error.BadManifest;
+    }
+}
+
+fn gicHasRedistributor(gic: gicv3.GicV3MultiState, mpidr: topology.Mpidr) bool {
+    for (gic.redistributors) |redist| {
+        if (redist.mpidr == mpidr) return true;
+    }
+    return false;
 }
 
 pub fn annotationsEmpty(annotations: Annotations) bool {
@@ -2036,11 +2190,28 @@ fn fuzzManifestParse(_: void, s: *std.testing.Smith) !void {
     const parsed = std.json.parseFromSlice(Manifest, std.testing.allocator, buf[0..len], .{
         .allocate = .alloc_always,
     }) catch return;
-    parsed.deinit();
+    defer parsed.deinit();
+    validateManifest(parsed.value) catch return;
 }
 
 test "fuzz manifest parsing" {
     try std.testing.fuzz({}, fuzzManifestParse, .{});
+}
+
+fn fuzzManifestV1Parse(_: void, s: *std.testing.Smith) !void {
+    // Manifest v1 adds per-vCPU and per-redistributor arrays at the same trust
+    // boundary as v0; parse plus validation must fail closed.
+    var buf: [4096]u8 = undefined;
+    const len = s.slice(&buf);
+    const parsed = std.json.parseFromSlice(ManifestV1, std.testing.allocator, buf[0..len], .{
+        .allocate = .alloc_always,
+    }) catch return;
+    defer parsed.deinit();
+    validateManifestV1(parsed.value) catch return;
+}
+
+test "fuzz manifest v1 parsing" {
+    try std.testing.fuzz({}, fuzzManifestV1Parse, .{});
 }
 
 fn fuzzMemoryManifest(_: void, s: *std.testing.Smith) !void {
@@ -2156,6 +2327,61 @@ test "manifest json round-trip" {
     try std.testing.expectEqualStrings("worker", parsed.value.annotations.map.get("org.opencontainers.image.ref.name").?);
 }
 
+test "manifest v1 validates and round-trips multi-vCPU topology" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
+    var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
+    var redist_regs = [_]gicv3.MmioReg{.{ .offset = 0x10080, .width_bits = 32, .value = 0 }};
+    var redists = [_]gicv3.RedistributorState{
+        .{ .mpidr = topology.mpidrForIndex(0), .regs = &redist_regs },
+        .{ .mpidr = topology.mpidrForIndex(1), .regs = &redist_regs },
+    };
+    const manifest = testManifestV1(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, &vcpus, &redists);
+
+    try validateManifestV1(manifest);
+    try saveManifestV1(arena, dir, manifest);
+    try std.testing.expectError(error.BadManifest, loadManifest(arena, dir));
+    const parsed = try loadManifestV1(arena, dir);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.version);
+    try std.testing.expectEqual(@as(topology.VcpuCount, 2), parsed.value.platform.vcpu_count);
+    try std.testing.expectEqual(@as(u64, 0x2_0000), parsed.value.platform.gic_redist_stride);
+    try std.testing.expectEqual(@as(topology.Mpidr, 0x8000_0001), parsed.value.machine.vcpus[1].mpidr);
+    try std.testing.expectEqual(gicv3.StateKind.gicv3_multi, parsed.value.machine.gic.kind);
+}
+
+test "manifest v1 rejects invalid vCPU topology" {
+    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
+    var redists = [_]gicv3.RedistributorState{
+        .{ .mpidr = topology.mpidrForIndex(0), .regs = &.{} },
+        .{ .mpidr = topology.mpidrForIndex(1), .regs = &.{} },
+    };
+
+    var count_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
+    var manifest = testManifestV1(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, &count_vcpus, &redists);
+    manifest.platform.vcpu_count = 3;
+    try std.testing.expectError(error.BadManifest, validateManifestV1(manifest));
+
+    var duplicate_index_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
+    manifest = testManifestV1(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, &duplicate_index_vcpus, &redists);
+    manifest.machine.vcpus[1].index = 0;
+    try std.testing.expectError(error.BadManifest, validateManifestV1(manifest));
+
+    var duplicate_mpidr_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
+    manifest = testManifestV1(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, &duplicate_mpidr_vcpus, &redists);
+    manifest.machine.vcpus[1].mpidr = manifest.machine.vcpus[0].mpidr;
+    try std.testing.expectError(error.BadManifest, validateManifestV1(manifest));
+
+    var missing_redist_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
+    manifest = testManifestV1(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, &missing_redist_vcpus, redists[0..1]);
+    try std.testing.expectError(error.BadManifest, validateManifestV1(manifest));
+}
+
 test "manifest rejects oversized annotations" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -2208,6 +2434,52 @@ fn testDisk(mmio_slot: u32) Disk {
         .size = 4096,
         .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .layers = &.{"blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    };
+}
+
+fn testVcpuState(index: topology.VcpuIndex) VcpuState {
+    return .{
+        .index = index,
+        .mpidr = topology.mpidrForIndex(index),
+        .gprs = [_]u64{0} ** 31,
+        .pc = 0,
+        .cpsr = 0,
+        .fpcr = 0,
+        .fpsr = 0,
+        .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+        .sys_regs = &.{},
+        .icc_regs = &.{},
+        .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+    };
+}
+
+fn testManifestV1(memory: MemoryManifest, ram_size: u64, vcpus: []VcpuState, redists: []const gicv3.RedistributorState) ManifestV1 {
+    return .{
+        .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
+            .device_model_version = 4,
+            .vcpu_count = @intCast(vcpus.len),
+            .ram_base = 0x8000_0000,
+            .ram_size = ram_size,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0802_0000,
+            .gic_redist_stride = 0x2_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{
+            .vcpus = vcpus,
+            .gic = .{
+                .kind = .gicv3_multi,
+                .gicv3_multi = .{
+                    .dist_regs = &.{},
+                    .redistributors = redists,
+                    .line_levels = &.{},
+                },
+            },
+        },
+        .devices = &.{},
+        .generation = .{ .generation = 1, .interrupt_status = 0, .params_b64 = "" },
+        .memory = memory,
     };
 }
 

@@ -1,8 +1,9 @@
 # Spore State Portability Contract
 
-**Status:** current implementation for manifest format v0. This document records
-what SporeVM can capture, map, translate, and reject when restoring an aarch64
-spore across the KVM and Hypervisor.framework backends.
+**Status:** current implementation for manifest format v0, plus manifest-v1
+data-model validation for future multi-vCPU captures. This document records what
+SporeVM can capture, map, translate, and reject when restoring an aarch64 spore
+across the KVM and Hypervisor.framework backends.
 
 The spore format describes bytes on disk. This document describes the portable
 meaning of those bytes: which guest-visible state is part of the contract, how
@@ -35,6 +36,12 @@ Manifest-format-v0 portability is deliberately narrow:
 
 Cross-ISA restore, multi-vCPU restore, persisted access traces, general volumes,
 and broader disk/device fixups are later slices.
+
+Manifest format v1 is now reserved for multi-vCPU machine state. It records a
+bounded `vcpu_count`, per-vCPU normalized aarch64 state keyed by stable
+`index`/`mpidr`, and portable `gicv3_multi` state with global distributor,
+per-MPIDR redistributors, and owner-tagged PPI line levels. Current capture and
+restore paths do not produce or consume v1 yet.
 
 ## Platform contract
 
@@ -79,6 +86,7 @@ block identical-host fork/fan-out.
 | GIC redistributor/register state | GICv3 MMIO offsets | yes | yes | no | partial apply | producer gap on HVF |
 | GIC line levels | INTID plus asserted bit | PPI/SPI | yes | no | SPI only; asserted PPI rejected | asymmetric |
 | GIC CPU interface | ICC register names and values | yes | yes | yes | yes | portable |
+| Multi-vCPU machine state | manifest v1 per-vCPU arrays plus `gicv3_multi` | planned | planned | planned | planned | validators only |
 | HVF GIC blob | tagged `backend_private` escape hatch | no | reject | same-HVF only | same-HVF only | not portable |
 | Virtio-mmio transport | device ID, feature selectors, negotiated features, status, interrupt status, queue addresses/indices | yes | yes | yes | yes | portable |
 | Virtqueue descriptors and buffers | guest RAM | yes | yes | yes | yes | portable through RAM |
@@ -159,6 +167,8 @@ escape hatch.
   `backend: "hvf"` and `format: "hv_gic_state_v0"`.
 - Other backends must reject it.
 - Portable cross-backend restore must use `kind: "gicv3"` instead.
+- Manifest v1 currently validates only portable `kind: "gicv3_multi"`;
+  backend-private multi-vCPU GIC state needs an explicit later extension.
 
 ### Outside the spore
 
@@ -178,6 +188,10 @@ Portable GIC state is the most backend-sensitive part of the current manifest
 format. The manifest form is architectural: distributor and redistributor MMIO
 offsets plus ICC register names. Backend handles, object references, and raw
 kernel/HVF structs must not cross the format boundary.
+
+For manifest v1, `gicv3_multi` keeps distributor state global, stores one
+redistributor register set per MPIDR, and requires per-vCPU PPIs to name their
+owning MPIDR. SPIs remain global and must not name an owner.
 
 ### KVM
 

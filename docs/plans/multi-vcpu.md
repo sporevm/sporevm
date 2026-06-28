@@ -348,6 +348,12 @@ Done when:
   GIC register offsets;
 - manifest and GIC validation fuzz targets cover v1 attacker-controlled inputs.
 
+Status: implemented for the manifest data model and fail-closed validators in
+this branch slice on 2026-06-28. Validation: `git diff --check`, `mise run
+test`, and `mise run build`. The current runtime, fork, and bundle production
+paths still use manifest v0 loaders/writers; v1 fork/fan-out and bundle
+preservation remain in Slice 7 when v1 capture/restore has producers.
+
 ### Slice 5: KVM Multi-vCPU Capture and Resume
 
 Add a stop-the-world KVM snapshot barrier. Capture every vCPU state, per-vCPU

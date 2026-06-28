@@ -1,7 +1,9 @@
 # Spore Format
 
 **Status:** manifest format v0 implemented (`src/spore.zig`), single-vCPU,
-same-host HVF and KVM producers/consumers.
+same-host HVF and KVM producers/consumers. Manifest format v1 has data structs
+and validators for multi-vCPU state; capture, restore, and bundle production for
+v1 land in later slices.
 
 Format v0 is still the current SporeVM 1.x manifest and artifact contract.
 Do not rename version or kind strings to v1 for release-label symmetry; use a
@@ -242,6 +244,34 @@ under `rootfs.cache`.
   must attach a fresh gateway that satisfies the recorded `requirements` and
   policy or fail closed.
 
+## Manifest Format v1
+
+Manifest v1 is the incompatible multi-vCPU machine-state shape. Existing v0
+loaders reject it through the normal unknown-version path; current runtime and
+bundle commands still use the v0 loader until the backend capture/restore and
+distribution slices land.
+
+V1 keeps the v0 memory, device, generation, rootfs, disk, network, and
+annotation contracts. The platform object adds:
+
+- `vcpu_count`: bounded by the shared SporeVM topology cap.
+- `gic_redist_stride`: the redistributor frame stride used to validate the
+  exposed GIC layout.
+
+The v1 `machine` object has `schema_version: 1`, `vcpus`, and `gic`.
+
+Each `machine.vcpus[]` entry records one normalized aarch64 vCPU state:
+`index`, `mpidr`, `gprs`, `pc`, `cpsr`, `fpcr`, `fpsr`, `simd`, `sys_regs`,
+`icc_regs`, and `vtimer`. The validator requires stable array order
+(`index == array position`), unique indexes, unique MPIDRs, and the normalized
+MPIDR mapping from `src/topology.zig`.
+
+V1 portable GIC state uses `machine.gic.kind: "gicv3_multi"`. It carries global
+distributor registers, per-vCPU redistributor register arrays keyed by MPIDR,
+and line levels where PPIs include an owning MPIDR and SPIs do not. Validation
+rejects unknown register offsets, duplicate redistributors, duplicate line
+records, PPIs without a known owner, and SPIs with an owner.
+
 ## Not Yet Captured By Manifest v0
 
 - General block-device state is still incomplete. The current writable disk
@@ -251,6 +281,8 @@ under `rootfs.cache`.
   first-touch traces for measurement, but manifest v0 does not persist access
   traces or prefetch hints.
 - Multi-vCPU machine state.
+- Manifest v1 multi-vCPU machine state is defined but not yet produced by
+  capture or consumed by restore.
 - Kernel identity in the platform contract (pinned-build enforcement).
 - Durable disk/device identity fixup beyond the current diskless helper. The
   product initrd consumes generation params for hostname and applies
