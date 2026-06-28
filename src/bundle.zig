@@ -507,7 +507,7 @@ fn inspectIndexedRootfs(allocator: std.mem.Allocator, bundle_dir: []const u8, bu
 }
 
 pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult {
-    if (options.children_dir != null) return packWithChildren(allocator, options);
+    if (options.children_dir != null) return packIndexed(allocator, options);
     if (options.rootfs_policy != .exact_bytes) return error.BadManifest;
 
     const parsed = try spore.loadManifest(allocator, options.spore_dir);
@@ -515,7 +515,7 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
     var manifest = parsed.value;
     manifest.memory.backing = null;
     if (manifest.rootfs) |rootfs| {
-        if (rootfs.storage != null) return error.BadManifest;
+        if (rootfs.storage != null) return packIndexed(allocator, options);
     }
     const plan = try spore.validateMemoryForRam(manifest.memory, @intCast(manifest.platform.ram_size));
 
@@ -582,10 +582,12 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
     };
 }
 
-fn packWithChildren(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult {
-    const children_dir = options.children_dir orelse return error.BadManifest;
-    const children = try listChildDirs(allocator, options.io, children_dir);
-    if (children.len == 0) return error.BadManifest;
+fn packIndexed(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult {
+    const children: []const ChildDir = if (options.children_dir) |children_dir| blk: {
+        const listed = try listChildDirs(allocator, options.io, children_dir);
+        if (listed.len == 0) return error.BadManifest;
+        break :blk listed;
+    } else &.{};
 
     try ensureNewDir(try pathZ(allocator, "{s}", .{options.out_dir}));
     try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, manifests_dir_path }));
@@ -1113,7 +1115,6 @@ fn validateBundleIndex(allocator: std.mem.Allocator, index: BundleIndex) Error!v
     if (index.rootfs_index) |path| {
         if (!std.mem.eql(u8, path, rootfs_index_path)) return error.BadManifest;
     }
-    if (index.children.len == 0) return error.BadManifest;
     var ids = std.StringHashMap(void).init(allocator);
     defer ids.deinit();
     var previous: ?[]const u8 = null;
@@ -4408,11 +4409,13 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
     const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
     const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
-    const legacy_bundle_dir = try pathZ(arena, "{s}/legacy-bundle", .{root_dir});
+    const single_bundle_dir = try pathZ(arena, "{s}/single-bundle", .{root_dir});
+    const single_out_dir = try pathZ(arena, "{s}/single-unpacked", .{root_dir});
     const out_dir = try pathZ(arena, "{s}/pulled-child", .{root_dir});
     const out_cached_dir = try pathZ(arena, "{s}/pulled-cached-child", .{root_dir});
     const out_bad_dir = try pathZ(arena, "{s}/pulled-bad-child", .{root_dir});
     const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
+    const single_rootfs_cache = try pathZ(arena, "{s}/single-rootfs-cache", .{root_dir});
     const pull_rootfs_cache = try pathZ(arena, "{s}/pull-rootfs-cache", .{root_dir});
     const bad_rootfs_cache = try pathZ(arena, "{s}/bad-rootfs-cache", .{root_dir});
     const pull_bundle_cache = try pathZ(arena, "{s}/pull-bundle-cache", .{root_dir});
@@ -4432,12 +4435,22 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     var manifest = testRootfsManifest(memory, ram.len, 62, artifact);
     manifest.rootfs.?.storage = rootfs_cas.storageDescriptor(manifest.rootfs.?.device, preload_result);
     try spore.saveManifest(arena, parent_dir, manifest);
-    try std.testing.expectError(error.BadManifest, pack(arena, .{
+    const single_pack = try pack(arena, .{
         .io = io,
         .spore_dir = parent_dir,
-        .out_dir = legacy_bundle_dir,
+        .out_dir = single_bundle_dir,
         .rootfs_cache_dir = pack_cache_root,
-    }));
+    });
+    try std.testing.expectEqual(@as(usize, 0), single_pack.child_count);
+    try std.testing.expectEqual(@as(usize, 1), single_pack.rootfs_artifact_count);
+    const single_unpacked = try unpack(arena, .{
+        .io = io,
+        .bundle_dir = single_bundle_dir,
+        .out_dir = single_out_dir,
+        .rootfs_cache_dir = single_rootfs_cache,
+    });
+    try std.testing.expectEqual(@as(usize, 0), single_unpacked.child_count);
+    try std.testing.expectEqual(@as(usize, 1), single_unpacked.rootfs_artifact_count);
     _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 1 });
 
     const pack_result = try pack(arena, .{
