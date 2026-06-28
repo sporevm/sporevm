@@ -280,12 +280,7 @@ pub fn cloneDisk(allocator: std.mem.Allocator, disk: spore.Disk) Error!spore.Dis
     }
     return .{
         .kind = try allocator.dupe(u8, disk.kind),
-        .device = .{
-            .kind = try allocator.dupe(u8, disk.device.kind),
-            .role = try allocator.dupe(u8, disk.device.role),
-            .virtio_device_id = disk.device.virtio_device_id,
-            .mmio_slot = disk.device.mmio_slot,
-        },
+        .device = try spore.cloneRootfsDevice(allocator, disk.device),
         .size = disk.size,
         .base = try allocator.dupe(u8, disk.base),
         .layers = layers,
@@ -334,12 +329,7 @@ fn appendLayer(allocator: std.mem.Allocator, disk: spore.Disk, layer_ref: []cons
     layers[disk.layers.len] = try allocator.dupe(u8, layer_ref);
     return .{
         .kind = try allocator.dupe(u8, disk.kind),
-        .device = .{
-            .kind = try allocator.dupe(u8, disk.device.kind),
-            .role = try allocator.dupe(u8, disk.device.role),
-            .virtio_device_id = disk.device.virtio_device_id,
-            .mmio_slot = disk.device.mmio_slot,
-        },
+        .device = try spore.cloneRootfsDevice(allocator, disk.device),
         .size = disk.size,
         .base = try allocator.dupe(u8, disk.base),
         .layers = layers,
