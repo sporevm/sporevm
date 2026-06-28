@@ -389,10 +389,6 @@ pub fn sealCowDisk(allocator: std.mem.Allocator, dir: []const u8, disk: *cow_dis
     return sealDisk(allocator, dir, disk);
 }
 
-pub fn sealLayeredCowDisk(allocator: std.mem.Allocator, dir: []const u8, disk: *LayeredCowDisk) Error!SealResult {
-    return sealDisk(allocator, dir, disk);
-}
-
 fn sealDisk(allocator: std.mem.Allocator, dir: []const u8, disk: anytype) Error!SealResult {
     try ensureStoreDirs(allocator, dir);
 

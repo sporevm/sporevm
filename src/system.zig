@@ -265,7 +265,7 @@ fn dfCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, s
     }
 
     const allocator = init.arena.allocator();
-    const cache_root = rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
+    const cache_root = local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
         error.MissingHome => {
             exitWithCliError(
                 allocator,
@@ -337,7 +337,7 @@ fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
     }
 
     const allocator = init.arena.allocator();
-    const cache_root = rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
+    const cache_root = local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
         error.MissingHome => {
             exitWithCliError(
                 allocator,
@@ -964,10 +964,6 @@ fn lessPrunePlanEntry(_: void, a: PrunePlanEntry, b: PrunePlanEntry) bool {
 fn lessRuntimeForkPlanEntry(_: void, a: RuntimeForkPlanEntry, b: RuntimeForkPlanEntry) bool {
     if (a.mtime_ns != b.mtime_ns) return a.mtime_ns < b.mtime_ns;
     return std.mem.lessThan(u8, a.path, b.path);
-}
-
-fn rootfsCacheRootPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
-    return local_paths.rootfsCacheRootPath(allocator, environ);
 }
 
 fn parseDurationSeconds(raw: []const u8) !u64 {
