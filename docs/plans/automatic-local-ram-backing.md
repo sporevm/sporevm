@@ -174,6 +174,10 @@ materialization paths strip `memory.backing` from distributed manifests, and
 durable format docs describe `ram.backing.proof` as local acceleration metadata,
 not distribution authority.
 
+The old `kvm-boot` and `hvf-boot` explicit trust flags have been removed as
+well. Backend file-backed restore is still supported, but product paths now feed
+it only through proof-gated local backing selection.
+
 ## Delivery Strategy
 
 ### Slice 1: Proof-Gated Automatic Local Backing

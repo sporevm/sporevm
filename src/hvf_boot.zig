@@ -2,7 +2,7 @@
 //!
 //! Bring-up tool, not the product CLI. Usage:
 //!   zig build hvf-boot
-//!   ./zig-out/bin/hvf-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--dirty-track] [--dirty-epoch-ms N] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH] [--trust-ram-backing]
+//!   ./zig-out/bin/hvf-boot <kernel-Image> [--cmdline "..."] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--dirty-track] [--dirty-epoch-ms N] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH]
 
 const std = @import("std");
 const spore_internal = @import("spore_internal");
@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
-        std.debug.print("usage: hvf-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--dirty-track] [--dirty-epoch-ms N] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH] [--trust-ram-backing]\n", .{});
+        std.debug.print("usage: hvf-boot <kernel-Image> [--cmdline \"...\"] [--mem-mib N] [--initrd root.cpio] [--disk rootfs.ext4] [--snapshot-after-ms N --spore DIR] [--dirty-track] [--dirty-epoch-ms N] [--resume DIR] [--lazy-ram] [--lazy-ram-trace PATH]\n", .{});
         std.process.exit(2);
     }
 
@@ -34,7 +34,6 @@ pub fn main(init: std.process.Init) !void {
     var resume_dir: ?[]const u8 = null;
     var lazy_ram = false;
     var lazy_ram_trace_path: ?[]const u8 = null;
-    var trust_ram_backing = false;
     var dirty_track = false;
     var dirty_epoch_ms: u64 = 250;
     var i: usize = 2;
@@ -70,8 +69,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--lazy-ram-trace") and i + 1 < args.len) {
             i += 1;
             lazy_ram_trace_path = args[i];
-        } else if (std.mem.eql(u8, args[i], "--trust-ram-backing")) {
-            trust_ram_backing = true;
         } else {
             std.debug.print("unknown argument: {s}\n", .{args[i]});
             std.process.exit(2);
@@ -93,21 +90,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("--lazy-ram requires --resume\n", .{});
         std.process.exit(2);
     }
-    if (lazy_ram and trust_ram_backing) {
-        std.debug.print("--lazy-ram cannot be combined with --trust-ram-backing\n", .{});
-        std.process.exit(2);
-    }
     if (lazy_ram_trace_path != null and !lazy_ram) {
         std.debug.print("--lazy-ram-trace requires --lazy-ram\n", .{});
         std.process.exit(2);
-    }
-
-    var ram_backing_fd: ?std.c.fd_t = null;
-    defer {
-        if (ram_backing_fd) |fd| _ = std.c.close(fd);
-    }
-    if (trust_ram_backing) {
-        ram_backing_fd = try openTrustedRamBacking(arena, resume_dir);
     }
 
     var lazy_ram_trace_fd: ?std.c.fd_t = null;
@@ -176,7 +161,7 @@ pub fn main(init: std.process.Init) !void {
         .disk_fd = disk_fd,
         .poll_stdin = interactive,
         .resume_dir = resume_dir,
-        .ram_backing_fd = ram_backing_fd,
+        .ram_backing_fd = null,
         .ram_restore_mode = if (lazy_ram) .lazy_chunks else .eager_chunks,
         .lazy_ram_trace_fd = lazy_ram_trace_fd,
         .snapshot_after_ms = snapshot_after_ms,
@@ -184,18 +169,4 @@ pub fn main(init: std.process.Init) !void {
         .dirty_tracking = .{ .enabled = dirty_track, .epoch_ms = dirty_epoch_ms },
     });
     std.debug.print("\nsporevm hvf-boot: guest requested {s}\n", .{@tagName(cause)});
-}
-
-fn openTrustedRamBacking(allocator: std.mem.Allocator, resume_dir: ?[]const u8) !?std.c.fd_t {
-    const dir = resume_dir orelse return null;
-    const parsed = try spore_internal.spore.loadManifest(allocator, dir);
-    defer parsed.deinit();
-    const backing = parsed.value.memory.backing orelse return null;
-    const path = try spore_internal.spore.memoryBackingPath(allocator, dir, backing);
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
-    if (fd < 0) {
-        std.debug.print("trusted RAM backing unavailable: {s}; falling back to chunks\n", .{path});
-        return null;
-    }
-    return fd;
 }
