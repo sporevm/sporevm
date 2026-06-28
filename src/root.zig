@@ -20,10 +20,6 @@ pub const disk_layer = @import("disk_layer.zig");
 pub const generation = @import("generation.zig");
 pub const gicv3 = @import("gicv3.zig");
 pub const fdt = @import("fdt.zig");
-pub const fdpass = if (builtin.os.tag == .linux)
-    @import("fdpass.zig")
-else
-    struct {};
 pub const fanout = @import("fanout.zig");
 pub const guestmem = @import("guestmem.zig");
 pub const lifecycle = @import("lifecycle.zig");
@@ -78,7 +74,6 @@ test {
     testing.refAllDecls(contracts);
     testing.refAllDecls(cow_disk);
     testing.refAllDecls(disk_layer);
-    testing.refAllDecls(fdpass);
     testing.refAllDecls(fanout);
     testing.refAllDecls(generation);
     testing.refAllDecls(gicv3);
