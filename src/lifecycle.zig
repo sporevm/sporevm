@@ -541,7 +541,7 @@ pub fn resumeNamed(
     const rootfs = try run_mod.resumeRootfsForRun(arena, manifest.value);
     const disk = try run_mod.resumeDiskForRun(arena, manifest.value);
     if (rootfs == null and manifest.value.devices.len != diskless_resume_device_count) return error.UnsupportedLifecycleDeviceModel;
-    const memory = memoryFromManifest(manifest.value) catch return error.InvalidMemorySize;
+    const memory = memory_config.fromManifestBytes(manifest.value.platform.ram_size) catch return error.InvalidMemorySize;
 
     var lifecycle_spec = readSporeLifecycleSpec(arena, init.io, spore_dir) catch return error.InvalidLifecycleMetadata;
     defer if (lifecycle_spec) |*spec| spec.deinit();
@@ -1994,10 +1994,6 @@ fn readSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8)
     return parsed;
 }
 
-fn memoryFromManifest(manifest: spore.Manifest) !memory_config.Config {
-    return memory_config.fromManifestBytes(manifest.platform.ram_size);
-}
-
 const ForkNamePlaceholder = struct {
     start: usize,
     end: usize,
@@ -2097,7 +2093,7 @@ fn startForkChildExecutable(
     defer manifest.deinit();
     if (manifest.value.network != null) return error.UnsupportedNamedForkNetwork;
     if (manifest.value.devices.len != diskless_resume_device_count) return error.UnsupportedNamedForkDisk;
-    const memory = try memoryFromManifest(manifest.value);
+    const memory = try memory_config.fromManifestBytes(manifest.value.platform.ram_size);
     const spec = Spec{
         .name = child_name,
         .backend = base.backend,
