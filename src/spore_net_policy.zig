@@ -471,11 +471,11 @@ pub const Runtime = struct {
         return null;
     }
 
-    fn exactRuleIndicesForDnsName(self: *const Runtime, packet: []const u8, offset: usize, out: ?*[max_exact_rules]usize) usize {
+    fn exactRuleIndicesForDnsName(self: *const Runtime, packet: []const u8, offset: usize, out: *[max_exact_rules]usize) usize {
         var count: usize = 0;
         for (self.exact_rules[0..self.exact_rule_count], 0..) |rule, i| {
             if (!dnsNameMatchesHost(packet, offset, rule.host)) continue;
-            if (out) |slots| slots[count] = i;
+            out[count] = i;
             count += 1;
         }
         return count;
