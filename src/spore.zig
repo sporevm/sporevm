@@ -729,11 +729,15 @@ pub fn validateRootfs(rootfs: Rootfs, devices: []const TransportState) Error!voi
 }
 
 fn validateRootfsDevice(device: RootfsDevice, devices: []const TransportState) Error!void {
+    try validateRootfsDeviceShape(device);
+    if (device.mmio_slot >= devices.len) return error.BadManifest;
+    if (devices[device.mmio_slot].device_id != rootfs_virtio_blk_device_id) return error.BadManifest;
+}
+
+pub fn validateRootfsDeviceShape(device: RootfsDevice) Error!void {
     if (!std.mem.eql(u8, device.kind, rootfs_device_kind_virtio_mmio)) return error.BadManifest;
     if (!std.mem.eql(u8, device.role, rootfs_device_role)) return error.BadManifest;
     if (device.virtio_device_id != rootfs_virtio_blk_device_id) return error.BadManifest;
-    if (device.mmio_slot >= devices.len) return error.BadManifest;
-    if (devices[device.mmio_slot].device_id != rootfs_virtio_blk_device_id) return error.BadManifest;
 }
 
 pub fn rootfsDeviceEql(a: RootfsDevice, b: RootfsDevice) bool {

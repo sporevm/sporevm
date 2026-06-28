@@ -1200,7 +1200,7 @@ fn validateRootfsArtifactEntry(allocator: std.mem.Allocator, entry: RootfsArtifa
 }
 
 fn validateRootfsStorageEntry(allocator: std.mem.Allocator, entry: RootfsStorageEntry) Error!void {
-    try validateRootfsDeviceShape(entry.device);
+    try spore.validateRootfsDeviceShape(entry.device);
     const storage = rootfsStorageEntryDescriptor(entry);
     try spore.validateRootfsStorageDescriptor(storage);
     const expected_path = try rootfsStorageIndexRelPath(allocator, entry.index_digest);
@@ -1210,12 +1210,6 @@ fn validateRootfsStorageEntry(allocator: std.mem.Allocator, entry: RootfsStorage
     const chunk_count = try spore.diskClusterCount(entry.logical_size, entry.chunk_size);
     if (@as(u64, @intCast(entry.object_count)) > chunk_count) return error.BadManifest;
     if (entry.object_bytes > entry.logical_size) return error.BadManifest;
-}
-
-fn validateRootfsDeviceShape(device: spore.RootfsDevice) Error!void {
-    if (!std.mem.eql(u8, device.kind, spore.rootfs_device_kind_virtio_mmio)) return error.BadManifest;
-    if (!std.mem.eql(u8, device.role, spore.rootfs_device_role)) return error.BadManifest;
-    if (device.virtio_device_id != spore.rootfs_virtio_blk_device_id) return error.BadManifest;
 }
 
 fn hasBundleIndex(allocator: std.mem.Allocator, bundle_dir: []const u8) Error!bool {
@@ -1775,7 +1769,7 @@ fn rootfsStorageEntryMatches(entry: RootfsStorageEntry, storage: spore.RootfsSto
 
 fn validateRootfsStorageForRootfs(storage: spore.RootfsStorage, rootfs: spore.Rootfs) Error!void {
     try spore.validateRootfsStorageDescriptor(storage);
-    try validateRootfsDeviceShape(storage.device);
+    try spore.validateRootfsDeviceShape(storage.device);
     if (!spore.rootfsDeviceEql(storage.device, rootfs.device)) return error.BadManifest;
     if (storage.logical_size != rootfs.artifact.size) return error.BadManifest;
 }
