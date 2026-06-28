@@ -2180,8 +2180,8 @@ fn materializeS3Bundle(
     source: S3Source,
 ) Error!RemoteBundleMaterialization {
     const cache_root = options.bundle_cache_dir orelse return error.IoFailed;
-    const bundle_dir = try s3BundleCacheBundleDir(allocator, cache_root, source.expected_digest);
-    const complete_path = try s3BundleCacheCompletePath(allocator, cache_root, source.expected_digest);
+    const bundle_dir = try remoteBundleCacheBundleDir(allocator, cache_root, "s3", source.expected_digest);
+    const complete_path = try remoteBundleCacheCompletePath(allocator, cache_root, "s3", source.expected_digest);
     if (try pathExistsNoSymlink(options.io, complete_path)) {
         const cached_digest = try digestHex(allocator, bundle_dir);
         if (!std.mem.eql(u8, cached_digest, source.expected_digest)) return error.BadChunk;
@@ -2192,7 +2192,7 @@ fn materializeS3Bundle(
         };
     }
 
-    const cache_parent = try s3BundleCacheParent(allocator, cache_root);
+    const cache_parent = try remoteBundleCacheParent(allocator, cache_root, "s3");
     try ensureDirPath(options.io, cache_parent);
     var nonce_bytes: [8]u8 = undefined;
     options.io.random(&nonce_bytes);
@@ -2208,7 +2208,7 @@ fn materializeS3Bundle(
     const temp_complete = try pathZ(allocator, "{s}/.complete", .{temp_dir});
     try writeFileAll(temp_complete, source.expected_digest);
 
-    const final_dir = try s3BundleCacheDir(allocator, cache_root, source.expected_digest);
+    const final_dir = try remoteBundleCacheDir(allocator, cache_root, "s3", source.expected_digest);
     renamePath(options.io, temp_dir, final_dir) catch |err| {
         if (try pathExistsNoSymlink(options.io, complete_path)) {
             const cached_digest = try digestHex(allocator, bundle_dir);
@@ -2612,22 +2612,6 @@ fn fileSizeNoSymlink(io: Io, path: []const u8) Error!u64 {
     };
     if (stat.kind != .file) return error.BadChunk;
     return stat.size;
-}
-
-fn s3BundleCacheParent(allocator: std.mem.Allocator, cache_root: []const u8) Error![]const u8 {
-    return remoteBundleCacheParent(allocator, cache_root, "s3");
-}
-
-fn s3BundleCacheDir(allocator: std.mem.Allocator, cache_root: []const u8, digest: []const u8) Error![]const u8 {
-    return remoteBundleCacheDir(allocator, cache_root, "s3", digest);
-}
-
-fn s3BundleCacheBundleDir(allocator: std.mem.Allocator, cache_root: []const u8, digest: []const u8) Error![]const u8 {
-    return remoteBundleCacheBundleDir(allocator, cache_root, "s3", digest);
-}
-
-fn s3BundleCacheCompletePath(allocator: std.mem.Allocator, cache_root: []const u8, digest: []const u8) Error![]const u8 {
-    return remoteBundleCacheCompletePath(allocator, cache_root, "s3", digest);
 }
 
 fn remoteBundleCacheParent(allocator: std.mem.Allocator, cache_root: []const u8, source_kind: []const u8) Error![]const u8 {
