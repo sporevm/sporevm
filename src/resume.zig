@@ -207,32 +207,17 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         },
     };
 
-    if (comptime @hasField(@TypeOf(cause), "monitor_stopped")) {
-        switch (cause) {
-            .guest_off, .guest_reset => {},
-            .probe_complete => {
-                var result = try resultFromResumeStream(backend, ram_size, identity_stream);
-                result = result.withMemoryRestore(local_backing);
-                run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
-                try events.emitExit(result);
-                if (events.write_failed) return error.EventSinkFailed;
-                return result;
-            },
-            .snapshotted, .monitor_stopped => return error.UnexpectedResumeExit,
-        }
-    } else {
-        switch (cause) {
-            .guest_off, .guest_reset => {},
-            .probe_complete => {
-                var result = try resultFromResumeStream(backend, ram_size, identity_stream);
-                result = result.withMemoryRestore(local_backing);
-                run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
-                try events.emitExit(result);
-                if (events.write_failed) return error.EventSinkFailed;
-                return result;
-            },
-            .snapshotted => return error.UnexpectedResumeExit,
-        }
+    switch (cause) {
+        .guest_off, .guest_reset => {},
+        .probe_complete => {
+            var result = try resultFromResumeStream(backend, ram_size, identity_stream);
+            result = result.withMemoryRestore(local_backing);
+            run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
+            try events.emitExit(result);
+            if (events.write_failed) return error.EventSinkFailed;
+            return result;
+        },
+        .snapshotted, .monitor_stopped => return error.UnexpectedResumeExit,
     }
     const gateway_failed = gateway_active and gateway.hasFailed();
     run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
