@@ -1599,7 +1599,7 @@ fn parseCreateArgs(
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--backend")) {
             spec.backend = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
-            if (!validBackend(spec.backend)) {
+            if (run_mod.Backend.parse(spec.backend) == null) {
                 const message = "--backend must be auto, hvf, or kvm";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             }
@@ -2555,10 +2555,6 @@ fn parseIntArgLifecycleCli(
         const message = allocLifecycleMessage(allocator, "{s} must be an integer", .{flag});
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     };
-}
-
-fn validBackend(raw: []const u8) bool {
-    return std.mem.eql(u8, raw, "auto") or std.mem.eql(u8, raw, "hvf") or std.mem.eql(u8, raw, "kvm");
 }
 
 pub fn monitorBackendSupported(raw: []const u8) bool {
