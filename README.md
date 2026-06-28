@@ -1,4 +1,13 @@
-# 🍄 SporeVM
+<p align="left">
+  <img src="assets/sporevm-icon.png" alt="SporeVM" width="160">
+</p>
+
+# SporeVM
+
+[![Buildkite](https://badge.buildkite.com/43af213c90bb781b385d58fc664e5ee8f1b99502f66102e53a.svg?branch=main)](https://buildkite.com/buildkite/sporevm)
+[![Release](https://img.shields.io/github/v/release/sporevm/sporevm?sort=semver)](https://github.com/sporevm/sporevm/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Zig 0.16.0](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](mise.toml)
 
 SporeVM is a small aarch64 virtual machine monitor for forkable Linux microVM
 checkpoints.
@@ -44,12 +53,12 @@ hypervisors.
 If you use [mise](https://mise.jdx.dev), install it globally:
 
 ```bash
-mise use -g github:buildkite/sporevm@latest
+mise use -g github:sporevm/sporevm@latest
 spore version
 ```
 
 Or download the Linux ARM64 or macOS ARM64 archive from
-[GitHub releases](https://github.com/buildkite/sporevm/releases/latest):
+[GitHub releases](https://github.com/sporevm/sporevm/releases/latest):
 
 ```bash
 asset=spore_Darwin_arm64 # or spore_Linux_arm64

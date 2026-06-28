@@ -179,7 +179,7 @@ upload_release_assets() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ASSET_DIR="${REPO_ROOT}/dist"
-GITHUB_REPOSITORY_NAME="${SPOREVM_GITHUB_REPOSITORY:-buildkite/sporevm}"
+GITHUB_REPOSITORY_NAME="${SPOREVM_GITHUB_REPOSITORY:-sporevm/sporevm}"
 EXPECTED_ASSETS=(
   libspore_Darwin_arm64.tar.gz
   libspore_Linux_arm64.tar.gz
