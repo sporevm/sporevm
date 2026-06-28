@@ -21,27 +21,33 @@ related_plans:
 ## Summary
 
 SporeVM should stop making users pick a small RAM value up front. Product
-commands should move toward `--memory auto`, where `auto` means a 16GiB
-guest-visible RAM contract backed by demand-committed host mappings, sparse RAM
-backing files, dirty tracking, and content-addressed chunks.
+commands use `--memory auto`, where `auto` means a 16GiB product memory contract.
+Fresh managed runs with the default kernel/initrd can now boot at a 512MiB RAM
+floor and grow through a transient grow-only virtio-mem region. Capture, resume,
+custom-kernel, custom-initrd, and explicit-memory paths keep the fixed-RAM
+behavior that the manifest format records.
 
-The user-facing promise is not guest-visible hotplug. The guest sees a normal
-fixed RAM size. The product value is that declared RAM is a compatibility
-ceiling, while host cost is based on touched pages and dirty chunks. `spore ls`
-should make that visible by showing configured memory next to resident memory,
-sparse backing allocation, chunk counts, and pending dirty work.
+The user-facing promise is still `--memory auto`, not a public hotplug API. The
+product value is that declared memory is a compatibility ceiling, while host
+cost follows touched pages, dirty chunks, and, for fresh managed auto runs,
+pressure-driven virtio-mem growth. `spore ls` should make that visible by
+showing configured memory next to resident memory, sparse backing allocation,
+chunk counts, and pending dirty work.
 
-The product memory contract, sparse fresh-boot seeding, and caught-up suspend
-path have landed. The remaining automatic-memory work is observability and
-evidence: cheap resident/process accounting, nonzero and dirty chunk counters,
-and real-host measurements that prove the 16GiB default stays sparse in normal
-product flows.
+The product memory contract, sparse fresh-boot seeding, caught-up suspend path,
+and first grow-only virtio-mem prototype have landed. The remaining
+automatic-memory work is observability and evidence: cheap resident/process
+accounting, nonzero and dirty chunk counters, and real-host measurements that
+prove the 16GiB default stays sparse in normal product flows.
 
 ## Problem
 
 The product CLI now uses `--memory VALUE`; omitted memory records `auto` and
-resolves to a 16GiB guest-visible RAM contract. That is only a good default if
-operators can see the difference between configured RAM and host cost.
+resolves to a 16GiB product memory contract. Fresh managed auto runs can satisfy
+that contract with a 512MiB boot RAM floor plus a transient virtio-mem growth
+region. Capture and resume still serialize a normal fixed RAM size in manifest
+v0. That is only a good default if operators can see the difference between
+configured RAM and host cost.
 
 The VMM has the right sparse mechanics: fresh boot maps RAM with private
 anonymous `mmap`, sparse dirty seeding starts from boot-populated ranges,
@@ -60,6 +66,9 @@ needs current real-host evidence for the 16GiB product path.
   and `17179869184b`.
 - Store runtime/spec memory as bytes so the product surface matches the spore
   manifest's byte-sized `platform.ram_size`.
+- For fresh managed `--memory auto` runs, allow the host to boot a smaller base
+  RAM mapping and grow toward the product contract through virtio-mem pressure
+  requests.
 - Seed fresh-boot dirty tracking from known populated RAM ranges instead of the
   whole configured RAM range.
 - Keep logical RAM cheap: fresh boot, dirty tracking, backing updates, suspend,
@@ -68,10 +77,13 @@ needs current real-host evidence for the 16GiB product path.
 
 ## Non-Goals
 
-- No virtio-mem, ACPI hotplug, DTB hotplug, or guest-visible memory resizing in
-  this plan.
-- No balloon or free-page-reporting device in the first slice. That remains
-  future work for shrinking manifests and reclaiming guest-free pages.
+- No ACPI hotplug or DTB hotplug.
+- No virtio-mem unplug, host reclaim, balloon, or free-page-reporting device in
+  the first prototype. That remains future work for shrinking manifests and
+  reclaiming guest-free pages.
+- No manifest-v0 capture of virtio-mem state. Capture, resume, named lifecycle,
+  custom-kernel, custom-initrd, and explicit-memory paths keep fixed RAM until a
+  deliberate format/device-model migration exists.
 - No compatibility alias for `--memory-mib` in product commands unless a real
   external dependency needs it.
 - No churn to lower-level harness flags such as `kvm-boot --mem-mib` or
@@ -138,8 +150,10 @@ boundary.
 
 Large logical RAM is cheap only if every hot path is sparse:
 
-- Fresh boot maps the full RAM range but only writes kernel, initrd, DTB, and
-  device state that is actually needed.
+- Fresh managed auto runs boot a small fixed RAM floor and expose the remaining
+  auto contract as a transient grow-only virtio-mem region.
+- Fixed-RAM fresh boot maps the full RAM range but only writes kernel, initrd,
+  DTB, and device state that is actually needed.
 - Boot planning returns populated RAM ranges so dirty tracking can seed only
   the chunks intersecting those ranges.
 - New dirty-tracker state initializes the chunk-ref table as all `null` and
@@ -218,6 +232,13 @@ best-effort scans.
   for base captures. Product capture uses tail-only sealing for the final dirty
   set, which avoids the 16GiB full-RAM scan while preserving coherent
   run-bridge/vsock state for forked children.
+- Fresh managed default-kernel/default-initrd `spore run --memory auto` paths
+  now boot 512MiB of fixed RAM and expose the remaining auto contract through a
+  transient grow-only virtio-mem region. The guest agent reports cgroup
+  `memory.events` pressure over the existing run bridge; KVM and HVF request
+  1GiB virtio-mem growth steps and map hotplug memory on guest plug requests.
+  Capture, resume, custom assets, named lifecycle, and explicit memory keep the
+  old fixed-RAM behavior.
 - `spore ls` now includes lifecycle-spec memory policy and configured bytes in
   human and JSON output. It derives chunk size and total chunks from the
   configured memory contract, and reports local `ram.backing` logical and
@@ -359,9 +380,9 @@ Done when:
 - `spore ls` can accidentally become the new scaling bug. Every displayed field
   must come from runtime metadata, monitor counters, sparse-file stat data, or
   OS process accounting. It must never sample by reading guest RAM.
-- Guest-visible RAM is still fixed. This plan deliberately avoids virtio-mem
-  and hotplug so the frozen device model and manifest platform contract do not
-  grow before the simpler sparse-ceiling model is proven.
+- The persisted spore contract is still fixed RAM. The first virtio-mem slice is
+  deliberately fresh-run-only so the manifest platform contract does not grow
+  before capture/resume semantics are designed.
 - The lower-level boot harnesses should keep their current `--mem-mib` flags
   for the first slice. Churning every smoke script at once would make the
   product CLI change harder to review without improving the user contract.
@@ -393,8 +414,8 @@ Done when:
 
 ## Deferred Work
 
+- Virtio-mem unplug, reclaim, and capture/resume semantics.
 - Memory ballooning and free-page reporting.
-- Guest-visible memory hotplug through virtio-mem or another device.
 - Host admission control and fleet scheduling based on observed memory.
 - Raising `auto` beyond 16GiB.
 - Renaming low-level harness memory flags.
