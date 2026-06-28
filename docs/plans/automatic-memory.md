@@ -241,16 +241,16 @@ best-effort scans.
   old fixed-RAM behavior.
 - `spore ls` now includes lifecycle-spec memory policy and configured bytes in
   human and JSON output. It derives chunk size and total chunks from the
-  configured memory contract, and reports local `ram.backing` logical and
-  allocated bytes with metadata-only file stats when the lifecycle spec points
-  at a local spore directory. Resident memory, nonzero chunks, and dirty
-  counters remain explicitly unknown until they have cheap runtime metadata or
-  monitor sources.
-- The current stats collector deliberately lives in `src/lifecycle.zig`: it only
-  combines lifecycle spec metadata and sparse backing file stats for one list
-  call path. Do not extract a runtime-accounting module until there is another
-  cheap source, such as process resident accounting or monitor-emitted nonzero
-  and dirty counters.
+  configured memory contract, reports Linux/macOS monitor process resident
+  bytes for ready VMs, and reports local `ram.backing` logical and allocated
+  bytes with metadata-only file stats when the lifecycle spec points at a local
+  spore directory. Nonzero chunk and dirty counters remain explicitly unknown
+  until they have cheap runtime metadata or monitor sources.
+- The current stats collector deliberately lives in `src/lifecycle.zig`: it
+  combines lifecycle spec metadata, process resident metadata, and sparse
+  backing file stats for one list call path. Do not extract a
+  runtime-accounting module until monitor-emitted nonzero and dirty counters
+  create a real second runtime source.
 
 ## Delivery Strategy
 
@@ -309,17 +309,18 @@ Progress:
   `memory.bytes` from each VM's `spec.json` and emits nullable stat fields
   instead of trying to derive them by walking RAM.
 - The human `spore ls` table now renders populated nullable stats when a cheap
-  runtime or filesystem metadata source supplies them. Resident, nonzero chunk,
+  runtime, process, or filesystem metadata source supplies them. Nonzero chunk
   and dirty collection sources are still pending.
 - Lifecycle list entries now derive `chunk_size` and `chunks_total` from the
   configured memory contract, and derive sparse backing logical/allocated bytes
   from no-follow `ram.backing` file stats when a local resume directory is
-  known. Resident bytes, nonzero chunks, and pending dirty chunks still need
-  monitor or platform sources.
-- Keep the collector lifecycle-local until resident/process accounting or
-  monitor counters land. Once there are multiple cheap sources, split around a
-  small list-facing collector that preserves the O(number of VMs) contract
-  instead of adding a wrapper around today's single implementation.
+  known. Ready VMs now get resident bytes from bounded process metadata
+  (`/proc/<pid>/statm` on Linux, `proc_pidinfo` on macOS). Nonzero chunks and
+  pending dirty chunks still need monitor sources.
+- Keep the collector lifecycle-local until monitor counters land. Once there
+  are multiple runtime-owned sources, split around a small list-facing collector
+  that preserves the O(number of VMs) contract instead of adding a wrapper
+  around today's lifecycle implementation.
 
 ### Slice 4: Measurement Gate for Raising Defaults Further
 

@@ -32,6 +32,33 @@ const private_dir_permissions: Io.File.Permissions = if (builtin.os.tag == .wind
 else
     @enumFromInt(0o700);
 
+const darwin_process = if (builtin.os.tag.isDarwin()) struct {
+    const proc_pid_task_info: c_int = 4;
+
+    const TaskInfo = extern struct {
+        virtual_size: u64,
+        resident_size: u64,
+        total_user: u64,
+        total_system: u64,
+        threads_user: u64,
+        threads_system: u64,
+        policy: i32,
+        faults: i32,
+        pageins: i32,
+        cow_faults: i32,
+        messages_sent: i32,
+        messages_received: i32,
+        syscalls_mach: i32,
+        syscalls_unix: i32,
+        csw: i32,
+        threadnum: i32,
+        numrunning: i32,
+        priority: i32,
+    };
+
+    extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: *anyopaque, buffersize: c_int) c_int;
+} else struct {};
+
 const create_usage =
     \\Usage:
     \\  spore create NAME [options]
@@ -1427,12 +1454,16 @@ pub fn listEntries(allocator: std.mem.Allocator, io: Io, runtime_root: []const u
         if (state == .absent) continue;
         const pid = if (state == .ready or state == .stale) readPid(allocator, io, paths) catch null else null;
         const metadata = readListMetadata(allocator, io, paths) catch null;
+        var stats = if (metadata) |value| value.stats else ListStats{};
+        if (state == .ready) {
+            if (pid) |value| stats.resident_bytes = readProcessResidentBytes(allocator, io, value);
+        }
         try entries.append(.{
             .name = try allocator.dupe(u8, entry.name),
             .state = state.name(),
             .pid = pid,
             .memory = if (metadata) |value| value.memory else null,
-            .stats = if (metadata) |value| value.stats else .{},
+            .stats = stats,
         });
     }
     const out = try entries.toOwnedSlice();
@@ -1526,6 +1557,41 @@ fn fstatBackingFileStats(fd: std.c.fd_t) !ListStats {
     } else {
         return error.UnsupportedPlatform;
     }
+}
+
+fn readProcessResidentBytes(allocator: std.mem.Allocator, io: Io, pid: i64) ?u64 {
+    if (pid <= 0) return null;
+    return if (comptime builtin.os.tag == .linux)
+        readLinuxProcessResidentBytes(allocator, io, pid) catch null
+    else if (comptime builtin.os.tag.isDarwin())
+        readDarwinProcessResidentBytes(pid)
+    else
+        null;
+}
+
+fn readLinuxProcessResidentBytes(allocator: std.mem.Allocator, io: Io, pid: i64) !u64 {
+    const statm_path = try std.fmt.allocPrint(allocator, "/proc/{d}/statm", .{pid});
+    defer allocator.free(statm_path);
+    const data = try Io.Dir.cwd().readFileAlloc(io, statm_path, allocator, .limited(256));
+    defer allocator.free(data);
+    return linuxStatmResidentBytes(data, @intCast(std.heap.pageSize()));
+}
+
+fn linuxStatmResidentBytes(data: []const u8, page_size: u64) !u64 {
+    var fields = std.mem.tokenizeAny(u8, data, " \t\r\n");
+    _ = fields.next() orelse return error.InvalidProcessStat;
+    const resident_raw = fields.next() orelse return error.InvalidProcessStat;
+    const resident_pages = try std.fmt.parseUnsigned(u64, resident_raw, 10);
+    return std.math.mul(u64, resident_pages, page_size) catch error.InvalidProcessStat;
+}
+
+fn readDarwinProcessResidentBytes(pid: i64) ?u64 {
+    const pid_c = std.math.cast(c_int, pid) orelse return null;
+    var info: darwin_process.TaskInfo = undefined;
+    const expected: c_int = @intCast(@sizeOf(darwin_process.TaskInfo));
+    const rc = darwin_process.proc_pidinfo(pid_c, darwin_process.proc_pid_task_info, 0, @ptrCast(&info), expected);
+    if (rc != expected) return null;
+    return info.resident_size;
 }
 
 fn writeMemoryValue(writer: *Io.Writer, memory: ListMemory) !void {
@@ -2978,23 +3044,28 @@ test "lifecycle list entries sorts and classifies VM directories" {
 
     const ready = try pathsFromRoot(allocator, root, "a-ready");
     defer ready.deinit(allocator);
+    const ready_pid = currentTestPid();
     try writeSpec(allocator, io, ready, .{ .name = "a-ready" });
     try writeReady(allocator, io, ready, .{
-        .pid = 42,
+        .pid = ready_pid,
         .control_socket_path = ready.control_socket_path,
         .console_log_path = ready.console_log_path,
     });
-    try writePid(allocator, io, ready, 42);
+    try writePid(allocator, io, ready, ready_pid);
 
-    const entries = try listEntries(allocator, io, root, aliveOnly42);
+    const entries = try listEntries(allocator, io, root, aliveOnlyCurrentProcess);
     defer freeListEntries(allocator, entries);
     try std.testing.expectEqual(@as(usize, 2), entries.len);
     try std.testing.expectEqualStrings("a-ready", entries[0].name);
     try std.testing.expectEqualStrings("ready", entries[0].state);
-    try std.testing.expectEqual(@as(?i64, 42), entries[0].pid);
+    try std.testing.expectEqual(@as(?i64, ready_pid), entries[0].pid);
     try std.testing.expectEqualStrings("auto", entries[0].memory.?.policy);
     try std.testing.expectEqual(memory_config.auto_bytes, entries[0].memory.?.bytes);
-    try std.testing.expectEqual(@as(?u64, null), entries[0].stats.resident_bytes);
+    if (comptime builtin.os.tag == .linux or builtin.os.tag.isDarwin()) {
+        try std.testing.expect(entries[0].stats.resident_bytes != null);
+    } else {
+        try std.testing.expectEqual(@as(?u64, null), entries[0].stats.resident_bytes);
+    }
     const chunk_size: u64 = spore.chunk_size;
     try std.testing.expectEqual(@as(?u64, chunk_size), entries[0].stats.chunk_size);
     try std.testing.expectEqual(@as(?u64, memory_config.auto_bytes / chunk_size), entries[0].stats.chunks_total);
@@ -3064,6 +3135,11 @@ test "lifecycle list JSON exposes memory and nullable stats" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"dirty_chunks_pending\":null") != null);
 }
 
+test "linux statm resident parser reads resident pages" {
+    try std.testing.expectEqual(@as(u64, 12 * 4096), try linuxStatmResidentBytes("99 12 3 4 5 6 7\n", 4096));
+    try std.testing.expectError(error.InvalidProcessStat, linuxStatmResidentBytes("99\n", 4096));
+}
+
 fn alwaysDead(_: i64) bool {
     return false;
 }
@@ -3072,6 +3148,10 @@ fn alwaysAlive(_: i64) bool {
     return true;
 }
 
-fn aliveOnly42(pid: i64) bool {
-    return pid == 42;
+fn currentTestPid() i64 {
+    return if (comptime builtin.os.tag == .windows) 1 else @intCast(std.c.getpid());
+}
+
+fn aliveOnlyCurrentProcess(pid: i64) bool {
+    return pid == currentTestPid();
 }
