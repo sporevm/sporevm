@@ -15,7 +15,7 @@ steps:
       size: "20g"
       name: "mise-cache"
     agents:
-      queue: cleanroom
+      queue: sporevm-linux-arm64
 
   - label: ":zig: Build & Test (macOS)"
     command: |
@@ -32,7 +32,7 @@ steps:
       size: "20g"
       name: "mise-cache"
     agents:
-      queue: cleanroom-mac
+      queue: sporevm-mac
 
   - trigger: "sporevm-benchmarks"
     label: ":chart_with_upwards_trend: Trigger Benchmark Suite"
@@ -68,7 +68,7 @@ steps:
       size: "20g"
       name: "mise-cache"
     agents:
-      queue: cleanroom
+      queue: sporevm-linux-arm64
 
   - label: ":package: Build macOS ARM64 release archive"
     key: "release-darwin-arm64"
@@ -90,7 +90,7 @@ steps:
       size: "20g"
       name: "mise-cache"
     agents:
-      queue: cleanroom-mac
+      queue: sporevm-mac
 
   - label: ":rocket: Publish release"
     key: "release-publish"

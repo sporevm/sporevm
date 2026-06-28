@@ -253,7 +253,7 @@ SPOREVM_RUN_BENCHMARKS=1
 ```
 
 The dedicated benchmark pipeline runs macOS and Linux ARM64 benchmark jobs in
-parallel on `cleanroom-mac` and `cleanroom-linux-arm64`. It defaults to the
+parallel on `sporevm-mac` and `sporevm-linux-arm64`. It defaults to the
 broader `comparison` profile for manual runs. Override with
 `SPOREVM_BENCHMARK_PROFILE=ci` for a short cold/warm run, or `full` when a build
 should pay for the full benchmark matrix.

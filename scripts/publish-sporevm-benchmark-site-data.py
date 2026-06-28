@@ -206,7 +206,7 @@ def self_test() -> None:
         "run_id": "1-old-linux-arm64",
         "generated_at": "2026-06-25T00:00:00Z",
         "commit": {"sha": "old", "branch": "main"},
-        "runner": {"queue": "cleanroom-linux-arm64", "build_number": "1"},
+        "runner": {"queue": "sporevm-linux-arm64", "build_number": "1"},
         "results": [dict(result, value=20.0)],
     }]
     new_runs = [
@@ -214,14 +214,14 @@ def self_test() -> None:
             "run_id": "random-mac",
             "generated_at": "2026-06-26T00:00:00Z",
             "commit": {"branch": "main"},
-            "runner": {"queue": "cleanroom-mac", "build_number": "2"},
+            "runner": {"queue": "sporevm-mac", "build_number": "2"},
             "results": [dict(result, value=11.0)],
         }, build_number="2", commit="abcdef1234567890", platform="macos", build_url="https://example.test/build/2"),
         canonical_run({
             "run_id": "random-linux",
             "generated_at": "2026-06-26T00:01:00Z",
             "commit": {"branch": "main"},
-            "runner": {"queue": "cleanroom-linux-arm64", "build_number": "2"},
+            "runner": {"queue": "sporevm-linux-arm64", "build_number": "2"},
             "results": [dict(result, value=12.0)],
         }, build_number="2", commit="abcdef1234567890", platform="linux-arm64", build_url="https://example.test/build/2"),
     ]
@@ -230,8 +230,8 @@ def self_test() -> None:
     assert {run["run_id"] for run in data["runs"]} >= {"2-abcdef123456-macos", "2-abcdef123456-linux-arm64"}
     assert len(data["series"]) == 2
     assert {series["name"] for series in data["series"]} == {
-        "cold_tti/sequential@cleanroom-mac",
-        "cold_tti/sequential@cleanroom-linux-arm64",
+        "cold_tti/sequential@sporevm-mac",
+        "cold_tti/sequential@sporevm-linux-arm64",
     }
     print("self-test ok")
 

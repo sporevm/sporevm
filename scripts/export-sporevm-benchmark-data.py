@@ -28,8 +28,8 @@ LABELS = {
 }
 
 RUNNER_LABELS = {
-    "cleanroom-mac": "macOS",
-    "cleanroom-linux-arm64": "Linux ARM64",
+    "sporevm-mac": "macOS",
+    "sporevm-linux-arm64": "Linux ARM64",
 }
 
 
@@ -420,8 +420,8 @@ def self_test() -> None:
         assert data["series"][0]["points"][0]["p99"] == 131.0
         assert data["series"][0]["points"][0]["phase_values"]["exec_response_ms"] == 8.0
         partitioned = build_series([
-            {"run_id": "mac", "generated_at": "2026-06-26T00:00:00Z", "runner": {"queue": "cleanroom-mac"}, "results": data["runs"][0]["results"]},
-            {"run_id": "linux", "generated_at": "2026-06-26T00:01:00Z", "runner": {"queue": "cleanroom-linux-arm64"}, "results": data["runs"][0]["results"]},
+            {"run_id": "mac", "generated_at": "2026-06-26T00:00:00Z", "runner": {"queue": "sporevm-mac"}, "results": data["runs"][0]["results"]},
+            {"run_id": "linux", "generated_at": "2026-06-26T00:01:00Z", "runner": {"queue": "sporevm-linux-arm64"}, "results": data["runs"][0]["results"]},
         ])
         assert len(partitioned) == 2
         assert {item["label"] for item in partitioned} == {"Cold TTI / sequential / macOS", "Cold TTI / sequential / Linux ARM64"}

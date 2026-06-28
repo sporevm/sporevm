@@ -1,4 +1,5 @@
 env:
+  BUILDKITE_REPO: "https://github.com/sporevm/sporevm.git"
   SPOREVM_BENCHMARK_ALLOW_IMAGE_RESOLVE_FALLBACK: "1"
 
 steps:
@@ -39,7 +40,7 @@ steps:
         --exclude "*/bundle-cache/*" \
         --exclude "*/rootfs-cache/cas/*"
     agents:
-      queue: cleanroom-mac
+      queue: sporevm-mac
 
   - label: ":bar_chart: Benchmarks Linux ARM64"
     key: "benchmarks-linux-arm64"
@@ -78,7 +79,7 @@ steps:
         --exclude "*/bundle-cache/*" \
         --exclude "*/rootfs-cache/cas/*"
     agents:
-      queue: cleanroom-linux-arm64
+      queue: sporevm-linux-arm64
 
   - wait
 
@@ -98,4 +99,4 @@ steps:
       set -euo pipefail
       scripts/publish-sporevm-benchmark-site-data.py
     agents:
-      queue: cleanroom-linux-arm64
+      queue: sporevm-linux-arm64
