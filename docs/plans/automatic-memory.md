@@ -31,11 +31,11 @@ ceiling, while host cost is based on touched pages and dirty chunks. `spore ls`
 should make that visible by showing configured memory next to resident memory,
 sparse backing allocation, chunk counts, and pending dirty work.
 
-Foundation Slice 7 has landed the fast caught-up suspend model: dirty-tracked
-KVM and HVF snapshots avoid a suspend-time full-RAM scan when the dirty tail is
-small. The remaining automatic-memory blocker is earlier in the lifecycle:
-initial dirty-tracker seeding must not scan every configured RAM chunk before
-the guest runs.
+The dirty-tracking work has landed the fast caught-up suspend model:
+dirty-tracked KVM and HVF snapshots avoid a suspend-time full-RAM scan when the
+dirty tail is small. The remaining automatic-memory blocker is earlier in the
+lifecycle: initial dirty-tracker seeding must not scan every configured RAM
+chunk before the guest runs.
 
 ## Problem
 
@@ -255,7 +255,7 @@ Add a small shared memory parser and convert product commands to `--memory`.
 Update `spore run`, `spore create`, lifecycle spec writing, monitor spawning,
 and help text. Persist memory policy plus bytes in lifecycle specs.
 
-Status: implemented in this slice.
+Status: landed.
 
 Done when:
 

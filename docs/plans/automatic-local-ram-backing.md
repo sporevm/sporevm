@@ -169,6 +169,11 @@ opened file identity, producer, and HMAC from the host-local runtime key. Missin
 proof, corrupt proof, symlinked proof, missing or foreign key, file identity
 mismatch, or manifest mismatch all fall back to verified chunks.
 
+Distribution hygiene has also landed. Bundle pack, unpack, pull, and local
+materialization paths strip `memory.backing` from distributed manifests, and
+durable format docs describe `ram.backing.proof` as local acceleration metadata,
+not distribution authority.
+
 ## Delivery Strategy
 
 ### Slice 1: Proof-Gated Automatic Local Backing
@@ -179,7 +184,7 @@ fresh captures and forks, and let product restore paths automatically use a
 proof-validated local backing fd. Add restore-source reporting in the same slice
 so fast-path misses are visible in tests and operator output.
 
-Status: implemented in this slice.
+Status: landed.
 
 Done when:
 
@@ -193,6 +198,8 @@ Done when:
 - proof validation does not read the 16GiB backing file.
 
 ### Slice 2: Distribution and Lifecycle Hygiene
+
+Status: landed.
 
 Make the local-only boundary explicit everywhere state moves. `spore pack`,
 `spore unpack`, and `spore pull` should ignore or strip proof files the same way
