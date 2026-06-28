@@ -1311,24 +1311,14 @@ fn createGic(vm_fd: std.c.fd_t) !kvm.CreateDevice {
     _ = try kvm.ioctl(vm_fd, kvm.KVM_CREATE_DEVICE, @intFromPtr(&dev), "KVM_CREATE_DEVICE vgicv3");
     var dist = gic_dist_base;
     var redist = gic_redist_base;
-    try setDeviceAttr(dev.fd, kvm.KVM_DEV_ARM_VGIC_GRP_ADDR, kvm.KVM_VGIC_V3_ADDR_TYPE_DIST, &dist, "vgic dist addr");
-    try setDeviceAttr(dev.fd, kvm.KVM_DEV_ARM_VGIC_GRP_ADDR, kvm.KVM_VGIC_V3_ADDR_TYPE_REDIST, &redist, "vgic redist addr");
+    try kvm.setDeviceAttr(@intCast(dev.fd), kvm.KVM_DEV_ARM_VGIC_GRP_ADDR, kvm.KVM_VGIC_V3_ADDR_TYPE_DIST, &dist, "vgic dist addr");
+    try kvm.setDeviceAttr(@intCast(dev.fd), kvm.KVM_DEV_ARM_VGIC_GRP_ADDR, kvm.KVM_VGIC_V3_ADDR_TYPE_REDIST, &redist, "vgic redist addr");
     return dev;
 }
 
 fn initGic(gic_fd: u32) !void {
     var unused: u64 = 0;
-    try setDeviceAttr(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_CTRL, kvm.KVM_DEV_ARM_VGIC_CTRL_INIT, &unused, "vgic init");
-}
-
-fn setDeviceAttr(fd: u32, group: u32, attr_id: u64, value: *u64, op: []const u8) !void {
-    var attr = kvm.DeviceAttr{
-        .flags = 0,
-        .group = group,
-        .attr = attr_id,
-        .addr = @intFromPtr(value),
-    };
-    _ = try kvm.ioctl(@intCast(fd), kvm.KVM_SET_DEVICE_ATTR, @intFromPtr(&attr), op);
+    try kvm.setDeviceAttr(@intCast(gic_fd), kvm.KVM_DEV_ARM_VGIC_GRP_CTRL, kvm.KVM_DEV_ARM_VGIC_CTRL_INIT, &unused, "vgic init");
 }
 
 fn initVcpu(vm_fd: std.c.fd_t, vcpu_fd: std.c.fd_t) !void {

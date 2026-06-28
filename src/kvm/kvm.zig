@@ -257,11 +257,6 @@ pub fn setIrq(vm_fd: std.c.fd_t, intid: u32, level: bool) Error!void {
     _ = try ioctl(vm_fd, KVM_IRQ_LINE, @intFromPtr(&irq), "KVM_IRQ_LINE");
 }
 
-pub fn getDeviceAttr(fd: std.c.fd_t, group: u32, attr_id: u64, value: *anyopaque, op: []const u8) Error!void {
-    var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(value) };
-    _ = try ioctl(fd, KVM_GET_DEVICE_ATTR, @intFromPtr(&attr), op);
-}
-
 pub fn setDeviceAttr(fd: std.c.fd_t, group: u32, attr_id: u64, value: *const anyopaque, op: []const u8) Error!void {
     var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(value) };
     _ = try ioctl(fd, KVM_SET_DEVICE_ATTR, @intFromPtr(&attr), op);
