@@ -285,7 +285,7 @@ fn attachPreloadedRootfsStorage(
 
     const storage = rootfs_cas.storageDescriptor(rootfs.device, preload_result);
     if (rootfs.storage) |existing| {
-        if (!rootfsStorageMatches(existing, storage)) return error.BadManifest;
+        if (!spore.rootfsStorageEql(existing, storage)) return error.BadManifest;
     }
     rootfs.storage = storage;
     manifest.rootfs = rootfs;
@@ -300,17 +300,6 @@ fn attachPreloadedRootfsStorage(
 
     try spore.validateManifest(manifest);
     try spore.saveManifest(allocator, spore_dir, manifest);
-}
-
-fn rootfsStorageMatches(a: spore.RootfsStorage, b: spore.RootfsStorage) bool {
-    return std.mem.eql(u8, a.kind, b.kind) and
-        spore.rootfsDeviceEql(a.device, b.device) and
-        a.logical_size == b.logical_size and
-        a.chunk_size == b.chunk_size and
-        std.mem.eql(u8, a.hash_algorithm, b.hash_algorithm) and
-        std.mem.eql(u8, a.index_digest, b.index_digest) and
-        std.mem.eql(u8, a.base_identity, b.base_identity) and
-        std.mem.eql(u8, a.object_namespace, b.object_namespace);
 }
 
 pub fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8, stdout: *Io.Writer) !ParsedBuildOptions {
