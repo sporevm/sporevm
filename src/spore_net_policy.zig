@@ -2,6 +2,8 @@
 
 const std = @import("std");
 
+const spore = @import("spore.zig");
+
 pub const max_allow_cidrs = 16;
 pub const max_allow_hosts = 16;
 pub const max_exact_rules = 32;
@@ -252,6 +254,57 @@ pub const Config = struct {
         return self.bound_services[0..self.bound_service_count];
     }
 };
+
+pub fn configFromManifestNetwork(allocator: std.mem.Allocator, network: spore.Network) !Config {
+    try spore.validateNetwork(network);
+    var policy = Config{};
+    if (network.default_action) |action| {
+        if (!std.mem.eql(u8, action, spore.network_default_deny)) return error.InvalidNetworkPolicy;
+        policy.default_deny = true;
+    }
+    for (network.allow_cidrs) |cidr| {
+        try policy.addAllowCidr(try allocator.dupe(u8, cidr));
+    }
+    for (network.allow_hosts) |host| {
+        try policy.addAllowHost(try allocator.dupe(u8, host));
+    }
+    for (network.allow_host_ports) |rule| {
+        const host = try allocator.dupe(u8, rule.host);
+        const ports = try allocator.dupe(u16, rule.ports);
+        try policy.addExactHostPorts(host, ports);
+    }
+    if (network.bound_services.len != 0) return error.UnsupportedBoundServiceRestore;
+    return policy;
+}
+
+pub fn manifestNetworkFromConfig(allocator: std.mem.Allocator, policy: *const Config) !spore.Network {
+    const exact_rules = try allocator.alloc(spore.NetworkHostPortRule, policy.exact_rule_count);
+    for (policy.exactRuleSlice(), exact_rules) |*rule, *out| {
+        out.* = .{
+            .host = rule.host,
+            .ports = rule.portSlice(),
+        };
+    }
+    const bound_services = try allocator.alloc(spore.NetworkBoundServiceRequirement, policy.bound_service_count);
+    for (policy.boundServiceSlice(), bound_services) |service, *out| {
+        out.* = .{
+            .name = service.name,
+            .guest_host = service.guest_host,
+            .guest_port = service.guest_port,
+        };
+    }
+    return .{
+        .default_action = if (policy.default_deny) spore.network_default_deny else null,
+        .allow_cidrs = policy.allowCidrSlice(),
+        .allow_hosts = policy.allowHostSlice(),
+        .allow_host_ports = exact_rules,
+        .bound_services = bound_services,
+        .requirements = .{
+            .exact_host_port = policy.default_deny or policy.exact_rule_count != 0,
+            .bound_services = policy.bound_service_count != 0,
+        },
+    };
+}
 
 const LearnedHostIp = struct {
     host_index: usize,
