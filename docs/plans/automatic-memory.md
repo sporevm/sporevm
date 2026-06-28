@@ -225,6 +225,11 @@ best-effort scans.
   at a local spore directory. Resident memory, nonzero chunks, and dirty
   counters remain explicitly unknown until they have cheap runtime metadata or
   monitor sources.
+- The current stats collector deliberately lives in `src/lifecycle.zig`: it only
+  combines lifecycle spec metadata and sparse backing file stats for one list
+  call path. Do not extract a runtime-accounting module until there is another
+  cheap source, such as process resident accounting or monitor-emitted nonzero
+  and dirty counters.
 
 ## Delivery Strategy
 
@@ -290,6 +295,10 @@ Progress:
   from no-follow `ram.backing` file stats when a local resume directory is
   known. Resident bytes, nonzero chunks, and pending dirty chunks still need
   monitor or platform sources.
+- Keep the collector lifecycle-local until resident/process accounting or
+  monitor counters land. Once there are multiple cheap sources, split around a
+  small list-facing collector that preserves the O(number of VMs) contract
+  instead of adding a wrapper around today's single implementation.
 
 ### Slice 4: Measurement Gate for Raising Defaults Further
 
