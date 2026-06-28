@@ -646,10 +646,6 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
     return machine_output.fromZigError(err);
 }
 
-pub fn machineErrorExitCode(err: anyerror) u8 {
-    return machine_output.fromZigError(err).exit_code;
-}
-
 pub const MonitorExit = enum {
     stopped,
     snapshotted,
@@ -1071,20 +1067,6 @@ pub fn resolveRootfsInputDetailed(
     switch (resolution) {
         .resolved => |resolved| return resolved,
         .failure => |failure| return rootfsInputError(failure.code),
-    }
-}
-
-fn resolveRootfsInputForCli(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: RootfsInputOptions,
-) ResolvedRootfsInput {
-    const resolution = resolveRootfsInputDetailedResult(init, allocator, options) catch |err| {
-        failRunSetup("spore {s}: rootfs setup failed: {s}", .{ options.command_name, @errorName(err) });
-    };
-    switch (resolution) {
-        .resolved => |resolved| return resolved,
-        .failure => |failure| failRunSetup("{s}", .{failure.message}),
     }
 }
 
@@ -1861,10 +1843,6 @@ fn readablePath(io: Io, path: []const u8) !bool {
     return accessPath(io, path, .{ .read = true });
 }
 
-fn executablePath(io: Io, path: []const u8) !bool {
-    return accessPath(io, path, .{ .execute = true });
-}
-
 fn accessPath(io: Io, path: []const u8, options: Io.Dir.AccessOptions) !bool {
     if (Io.Dir.path.isAbsolute(path)) {
         Io.Dir.accessAbsolute(io, path, options) catch |err| switch (err) {
@@ -1878,16 +1856,6 @@ fn accessPath(io: Io, path: []const u8, options: Io.Dir.AccessOptions) !bool {
         else => |e| return e,
     };
     return true;
-}
-
-fn writeSetupStderr(_: std.process.Init, bytes: []const u8) !void {
-    if (bytes.len == 0) return;
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const n = std.c.write(2, remaining.ptr, remaining.len);
-        if (n <= 0) return error.StderrWriteFailed;
-        remaining = remaining[@intCast(n)..];
-    }
 }
 
 fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
