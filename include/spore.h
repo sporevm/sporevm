@@ -73,11 +73,11 @@ typedef struct SporeContextImpl *SporeContext;
 #define SPORE_PULL_OPTIONS_VERSION 1u
 #define SPORE_SYSTEM_DF_OPTIONS_VERSION 1u
 #define SPORE_SYSTEM_PRUNE_OPTIONS_VERSION 1u
-#define SPORE_CREATE_NAMED_OPTIONS_VERSION 3u
+#define SPORE_CREATE_NAMED_OPTIONS_VERSION 4u
 #define SPORE_RESUME_NAMED_OPTIONS_VERSION 1u
 #define SPORE_FORK_NAMED_OPTIONS_VERSION 1u
 #define SPORE_EXEC_NAMED_OPTIONS_VERSION 2u
-#define SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION 1u
+#define SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION 2u
 #define SPORE_SUSPEND_NAMED_OPTIONS_VERSION 1u
 #define SPORE_REMOVE_NAMED_OPTIONS_VERSION 1u
 
@@ -152,6 +152,12 @@ typedef struct SporeBoundUnixService {
   SporeString unix_path;
 } SporeBoundUnixService;
 
+/** Opaque manifest annotation key/value. Values are stored without interpretation. */
+typedef struct SporeAnnotation {
+  SporeString key;
+  SporeString value;
+} SporeAnnotation;
+
 /** Options for spore_create_named_json(). */
 typedef struct SporeCreateNamedOptions {
   uint32_t size;
@@ -177,6 +183,8 @@ typedef struct SporeCreateNamedOptions {
   size_t network_rule_count;
   const SporeBoundUnixService *bound_unix_services;
   size_t bound_unix_service_count;
+  const SporeAnnotation *annotations;
+  size_t annotation_count;
 } SporeCreateNamedOptions;
 
 /** Options for spore_exec_named_json(). */
@@ -217,6 +225,8 @@ typedef struct SporeSnapshotNamedOptions {
   SporeString name;
   SporeString out_dir;
   uint8_t continue_after;
+  const SporeAnnotation *annotations;
+  size_t annotation_count;
 } SporeSnapshotNamedOptions;
 
 /** Options for spore_suspend_named_json(). */

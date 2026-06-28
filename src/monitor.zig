@@ -9,6 +9,7 @@ const memory_config = @import("memory.zig");
 const monitor_jail = @import("monitor_jail.zig");
 const net_gateway = @import("net_gateway.zig");
 const run = @import("run.zig");
+const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const vsock = @import("virtio/vsock.zig");
 
@@ -123,6 +124,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     defer if (existing_spec) |*spec| spec.deinit();
     const spec_rootfs = if (existing_spec) |spec| spec.value.rootfs else null;
     const spec_disk = if (existing_spec) |spec| spec.value.disk else null;
+    const spec_annotations = if (existing_spec) |spec| spec.value.annotations else spore.Annotations{};
     const kernel_path = opts.kernel_path orelse run.resolveDefaultKernelPath(init, allocator) catch |err| {
         std.debug.print("spore monitor: kernel setup failed: {s}\n", .{@errorName(err)});
         std.process.exit(2);
@@ -142,6 +144,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .rootfs = spec_rootfs,
         .disk = spec_disk,
         .network = try run.manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy),
+        .annotations = spec_annotations,
         .image_ref = opts.image_ref,
         .resume_dir = opts.resume_dir,
         .memory = opts.memory,
@@ -182,6 +185,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .rootfs = spec_rootfs,
         .disk = spec_disk,
         .resume_dir = opts.resume_dir,
+        .annotations = spec_annotations,
         .command = &.{"/bin/true"},
         .memory = opts.memory,
         .vcpus = opts.vcpus,

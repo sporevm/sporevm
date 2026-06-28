@@ -176,3 +176,40 @@ type RootfsBundleSummary struct {
 	ObjectCount       uint64 `json:"object_count"`
 	PayloadBytes      uint64 `json:"payload_bytes"`
 }
+
+// CreateNamedOptions starts a long-lived named VM.
+type CreateNamedOptions struct {
+	Name            string
+	Backend         string
+	KernelPath      string
+	InitrdPath      string
+	RootfsPath      string
+	ImageRef        string
+	SporeExecutable string
+	MemoryBytes     uint64
+	VCPUs           uint32
+	GuestPort       uint32
+	TimeoutMs       uint64
+	ConsoleLogPath  string
+	Annotations     map[string]string
+}
+
+// SnapshotNamedOptions snapshots a named VM while it keeps running.
+type SnapshotNamedOptions struct {
+	Name        string
+	OutDir      string
+	Continue    bool
+	Annotations map[string]string
+}
+
+// NamedLifecycleResult is the decoded spore.lifecycle.v1 contract.
+type NamedLifecycleResult struct {
+	Schema         string  `json:"schema"`
+	SchemaVersion  uint32  `json:"schema_version"`
+	Action         string  `json:"action"`
+	Name           string  `json:"name"`
+	State          string  `json:"state"`
+	PID            *int64  `json:"pid"`
+	ConsoleLogPath *string `json:"console_log_path"`
+	SporeDir       *string `json:"spore_dir"`
+}

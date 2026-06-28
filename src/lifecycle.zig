@@ -16,7 +16,7 @@ const spore_net_policy = @import("spore_net_policy.zig");
 pub const runtime_dir_env = local_paths.runtime_dir_env;
 pub const max_name_len = 128;
 
-const max_metadata_bytes = 64 * 1024;
+const max_metadata_bytes = 128 * 1024;
 const max_control_response = 128 * 1024;
 const lifecycle_spore_metadata_file = "sporevm-lifecycle.json";
 const diskless_resume_device_count = 4;
@@ -151,6 +151,7 @@ pub const Spec = struct {
     rootfs: ?spore.Rootfs = null,
     disk: ?spore.Disk = null,
     network: ?spore.Network = null,
+    annotations: spore.Annotations = .{},
     image_ref: ?[]const u8 = null,
     resume_dir: ?[]const u8 = null,
     memory: memory_config.Config = .{},
@@ -303,6 +304,7 @@ pub const CreateNamedOptions = struct {
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
     spore_executable: []const u8 = "spore",
+    annotations: spore.Annotations = .{},
 };
 
 pub const ResumeNamedOptions = struct {
@@ -321,6 +323,7 @@ pub const SnapshotNamedOptions = struct {
     name: []const u8,
     out_dir: []const u8,
     continue_after: bool = true,
+    annotations: spore.Annotations = .{},
 };
 
 pub const SuspendNamedOptions = struct {
@@ -408,6 +411,7 @@ fn createNamedWithTiming(
 ) !NamedLifecycleResult {
     if (options.rootfs_path != null and options.image_ref != null) return error.InvalidRootfsInput;
     if (!monitorBackendSupported(options.backend.name())) return error.HostUnsupported;
+    try spore.validateAnnotations(options.annotations);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -427,6 +431,7 @@ fn createNamedWithTiming(
         .guest_port = options.guest_port,
         .timeout_ms = options.timeout_ms,
         .console_log_path = options.console_log_path,
+        .annotations = options.annotations,
     };
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
     const paths_ms = monotonicMs();
@@ -444,7 +449,7 @@ fn createNamedWithTiming(
     spec.rootfs_path = if (rootfs.path) |path| try std.fs.path.resolve(arena, &.{path}) else null;
     spec.rootfs = rootfs.rootfs;
     const rootfs_abspath_ms = monotonicMs();
-    if (spec.rootfs != null) try writeSpec(arena, init.io, paths, spec);
+    if (spec.rootfs != null or !spore.annotationsEmpty(spec.annotations)) try writeSpec(arena, init.io, paths, spec);
 
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (named_network.mode == .spore) &named_network.policy else null;
     try spawnMonitorExecutable(init, arena, spec, options.spore_executable, spawn_policy);
@@ -507,6 +512,7 @@ pub fn resumeNamed(
         .rootfs = rootfs,
         .disk = disk,
         .network = try run_mod.manifestNetworkFromOptions(arena, network_options.network, &network_options.policy),
+        .annotations = manifest.value.annotations,
         .memory = memory,
         .vcpus = 1,
         .guest_port = base.guest_port,
@@ -518,7 +524,7 @@ pub fn resumeNamed(
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
     const state = try classifyVmState(arena, init.io, paths, pidAlive);
     if (state != .absent) return error.NamedVmExists;
-    if (spec.rootfs != null or spec.disk != null) try writeSpec(arena, init.io, paths, spec);
+    if (spec.rootfs != null or spec.disk != null or !spore.annotationsEmpty(spec.annotations)) try writeSpec(arena, init.io, paths, spec);
 
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (network_options.network == .spore) &network_options.policy else null;
     try spawnMonitorExecutable(init, arena, spec, options.spore_executable, spawn_policy);
@@ -563,6 +569,7 @@ pub fn snapshotNamed(
     options: SnapshotNamedOptions,
 ) !NamedLifecycleResult {
     if (!options.continue_after) return error.UnsupportedSnapshotMode;
+    try spore.validateAnnotations(options.annotations);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -581,7 +588,15 @@ pub fn snapshotNamed(
     defer ready.deinit();
     const response = try sendSnapshotRequest(arena, context.io, ready.value.control_socket_path, out_dir);
     if (!try snapshotResponseOk(arena, response)) return error.MonitorRequestFailed;
-    try writeSporeLifecycleSpec(arena, context.io, out_dir, spec.value);
+    var snapshot_spec = spec.value;
+    if (!spore.annotationsEmpty(options.annotations)) {
+        var manifest = try spore.loadManifest(arena, out_dir);
+        defer manifest.deinit();
+        manifest.value.annotations = try spore.mergeAnnotations(arena, manifest.value.annotations, options.annotations);
+        try spore.saveManifest(arena, out_dir, manifest.value);
+        snapshot_spec.annotations = manifest.value.annotations;
+    }
+    try writeSporeLifecycleSpec(arena, context.io, out_dir, snapshot_spec);
     return ownedNamedLifecycleResult(allocator, .{
         .action = "snapshotted",
         .name = options.name,
@@ -1895,6 +1910,7 @@ fn startForkChildExecutable(
         .kernel_path = base.kernel_path,
         .initrd_path = base.initrd_path,
         .resume_dir = spore_dir,
+        .annotations = manifest.value.annotations,
         .memory = memory,
         .vcpus = 1,
         .guest_port = base.guest_port,
@@ -2587,6 +2603,26 @@ test "lifecycle runtime root rejects relative environment paths" {
     _ = env.swapRemove(runtime_dir_env);
     try env.put("XDG_RUNTIME_DIR", "");
     try std.testing.expectError(error.InvalidRuntimeDir, runtimeRootPath(allocator, &env));
+}
+
+test "snapshot validates annotations before touching runtime state" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(runtime_dir_env, "/tmp/sporevm-runtime");
+
+    var annotations = spore.Annotations{};
+    defer annotations.deinit(allocator);
+    try annotations.map.put(allocator, "", "bad");
+
+    try std.testing.expectError(error.BadManifest, snapshotNamed(.{
+        .io = std.testing.io,
+        .environ_map = &env,
+    }, allocator, .{
+        .name = "bench-1",
+        .out_dir = "zig-cache/missing-parent/snapshot.spore",
+        .annotations = annotations,
+    }));
 }
 
 test "lifecycle paths are rooted under vms by name" {

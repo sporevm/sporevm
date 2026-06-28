@@ -13,10 +13,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"unsafe"
 )
 
-const minABIVersion uint32 = 7
+const minABIVersion uint32 = 8
 
 var ErrClosed = errors.New("spore client closed")
 
@@ -192,6 +193,104 @@ func (c *Client) Pull(ctx context.Context, options PullOptions) (PullResult, err
 	return pulled, nil
 }
 
+// CreateNamed starts a long-lived named VM.
+func (c *Client) CreateNamed(ctx context.Context, options CreateNamedOptions) (NamedLifecycleResult, error) {
+	if err := c.ready(ctx); err != nil {
+		return NamedLifecycleResult{}, err
+	}
+	name, freeName := cString(options.Name)
+	defer freeName()
+	backend, freeBackend := cString(options.Backend)
+	defer freeBackend()
+	kernelPath, freeKernelPath := cString(options.KernelPath)
+	defer freeKernelPath()
+	initrdPath, freeInitrdPath := cString(options.InitrdPath)
+	defer freeInitrdPath()
+	rootfsPath, freeRootfsPath := cString(options.RootfsPath)
+	defer freeRootfsPath()
+	imageRef, freeImageRef := cString(options.ImageRef)
+	defer freeImageRef()
+	sporeExecutable, freeSporeExecutable := cString(options.SporeExecutable)
+	defer freeSporeExecutable()
+	consoleLogPath, freeConsoleLogPath := cString(options.ConsoleLogPath)
+	defer freeConsoleLogPath()
+	annotations, freeAnnotations := cAnnotations(options.Annotations)
+	defer freeAnnotations()
+
+	var opts C.SporeCreateNamedOptions
+	C.spore_create_named_options_init(&opts)
+	opts.name = name
+	opts.backend = backend
+	opts.kernel_path = kernelPath
+	opts.initrd_path = initrdPath
+	opts.rootfs_path = rootfsPath
+	opts.image_ref = imageRef
+	opts.spore_executable = sporeExecutable
+	opts.memory_bytes = C.uint64_t(options.MemoryBytes)
+	if options.VCPUs != 0 {
+		opts.vcpus = C.uint32_t(options.VCPUs)
+	}
+	if options.GuestPort != 0 {
+		opts.guest_port = C.uint32_t(options.GuestPort)
+	}
+	if options.TimeoutMs != 0 {
+		opts.timeout_ms = C.uint64_t(options.TimeoutMs)
+	}
+	opts.console_log_path = consoleLogPath
+	if len(annotations) != 0 {
+		opts.annotations = &annotations[0]
+		opts.annotation_count = C.size_t(len(annotations))
+	}
+
+	var out C.SporeOwnedString
+	if result := Result(C.spore_create_named_json(c.ctx, &opts, &out)); result != Success {
+		return NamedLifecycleResult{}, c.callError(result)
+	}
+	defer C.spore_free_string(c.ctx, out)
+	var created NamedLifecycleResult
+	if err := json.Unmarshal(goBytes(out), &created); err != nil {
+		return NamedLifecycleResult{}, fmt.Errorf("decode named lifecycle result: %w", err)
+	}
+	return created, nil
+}
+
+// SnapshotNamed snapshots a named VM. The current libspore mode always keeps
+// the VM running, matching Continue: true.
+func (c *Client) SnapshotNamed(ctx context.Context, options SnapshotNamedOptions) (NamedLifecycleResult, error) {
+	if err := c.ready(ctx); err != nil {
+		return NamedLifecycleResult{}, err
+	}
+	name, freeName := cString(options.Name)
+	defer freeName()
+	outDir, freeOutDir := cString(options.OutDir)
+	defer freeOutDir()
+	annotations, freeAnnotations := cAnnotations(options.Annotations)
+	defer freeAnnotations()
+
+	var opts C.SporeSnapshotNamedOptions
+	C.spore_snapshot_named_options_init(&opts)
+	opts.name = name
+	opts.out_dir = outDir
+	if options.Continue {
+		opts.continue_after = 1
+	}
+	if len(annotations) != 0 {
+		opts.annotations = &annotations[0]
+		opts.annotation_count = C.size_t(len(annotations))
+	}
+
+	var out C.SporeOwnedString
+	if result := Result(C.spore_snapshot_named_json(c.ctx, &opts, &out)); result != Success {
+		return NamedLifecycleResult{}, c.callError(result)
+	}
+	defer C.spore_free_string(c.ctx, out)
+	var snap NamedLifecycleResult
+	if err := json.Unmarshal(goBytes(out), &snap); err != nil {
+		return NamedLifecycleResult{}, fmt.Errorf("decode named lifecycle result: %w", err)
+	}
+	return snap, nil
+}
+
 func (c *Client) ready(ctx context.Context) error {
 	if c == nil || c.ctx == nil {
 		return ErrClosed
@@ -236,4 +335,24 @@ func cCacheRoot(root CacheRoot) (C.SporeCacheRoot, func()) {
 		kind: C.uint32_t(root.Kind),
 		path: path,
 	}, freePath
+}
+
+func cAnnotations(values map[string]string) ([]C.SporeAnnotation, func()) {
+	if len(values) == 0 {
+		return nil, func() {}
+	}
+	annotations := make([]C.SporeAnnotation, 0, len(values))
+	frees := make([]func(), 0, len(values)*2)
+	for key, value := range values {
+		cKey, freeKey := cString(key)
+		cValue, freeValue := cString(value)
+		annotations = append(annotations, C.SporeAnnotation{key: cKey, value: cValue})
+		frees = append(frees, freeKey, freeValue)
+	}
+	return annotations, func() {
+		for _, free := range frees {
+			free()
+		}
+		runtime.KeepAlive(annotations)
+	}
 }

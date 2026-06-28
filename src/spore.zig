@@ -303,9 +303,12 @@ pub const MemoryChunkRange = struct {
 };
 
 pub const GenerationState = generation.State;
+pub const max_annotations_json_bytes = 64 * 1024;
+pub const Annotations = std.json.ArrayHashMap([]const u8);
 
 pub const Manifest = struct {
     version: u32 = format_version,
+    annotations: Annotations = .{},
     platform: Platform,
     machine: MachineState,
     devices: []TransportState,
@@ -1065,6 +1068,7 @@ pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Man
 }
 
 pub fn saveManifestPath(allocator: std.mem.Allocator, path: []const u8, manifest: Manifest) Error!void {
+    try validateAnnotations(manifest.annotations);
     const json = std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
     defer allocator.free(json);
     const path_z = try pathZ(allocator, "{s}", .{path});
@@ -1407,6 +1411,7 @@ fn forkGicState(allocator: std.mem.Allocator, state: gicv3.State) Error!gicv3.St
 
 pub fn validateManifest(manifest: Manifest) Error!void {
     if (manifest.version != format_version) return error.BadManifest;
+    try validateAnnotations(manifest.annotations);
     if (manifest.platform.cpu_profile.len == 0) return error.BadManifest;
     if (manifest.platform.counter_frequency_hz == 0 or
         manifest.platform.counter_frequency_hz > std.math.maxInt(u32))
@@ -1428,6 +1433,64 @@ pub fn validateManifest(manifest: Manifest) Error!void {
         try validateNetwork(network);
     }
     gicv3.validate(manifest.machine.gic) catch return error.BadManifest;
+}
+
+pub fn annotationsEmpty(annotations: Annotations) bool {
+    return annotations.map.count() == 0;
+}
+
+pub fn mergeAnnotations(allocator: std.mem.Allocator, base: Annotations, overlay: Annotations) Error!Annotations {
+    var out = Annotations{};
+    errdefer out.deinit(allocator);
+
+    var base_it = base.map.iterator();
+    while (base_it.next()) |entry| {
+        out.map.put(allocator, entry.key_ptr.*, entry.value_ptr.*) catch return error.OutOfMemory;
+    }
+    var overlay_it = overlay.map.iterator();
+    while (overlay_it.next()) |entry| {
+        out.map.put(allocator, entry.key_ptr.*, entry.value_ptr.*) catch return error.OutOfMemory;
+    }
+    try validateAnnotations(out);
+    return out;
+}
+
+pub fn validateAnnotations(annotations: Annotations) Error!void {
+    var serialized_len: usize = 2;
+    var first = true;
+    var it = annotations.map.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        if (key.len == 0) return error.BadManifest;
+        if (!std.unicode.utf8ValidateSlice(key)) return error.BadManifest;
+        if (!std.unicode.utf8ValidateSlice(value)) return error.BadManifest;
+        if (first) {
+            first = false;
+        } else {
+            serialized_len = std.math.add(usize, serialized_len, 1) catch return error.BadManifest;
+        }
+        const key_size = try jsonStringLiteralSize(key);
+        const value_size = try jsonStringLiteralSize(value);
+        serialized_len = std.math.add(usize, serialized_len, key_size) catch return error.BadManifest;
+        serialized_len = std.math.add(usize, serialized_len, 1) catch return error.BadManifest;
+        serialized_len = std.math.add(usize, serialized_len, value_size) catch return error.BadManifest;
+        if (serialized_len > max_annotations_json_bytes) return error.BadManifest;
+    }
+}
+
+fn jsonStringLiteralSize(value: []const u8) Error!usize {
+    var size: usize = 2;
+    for (value) |byte| {
+        const extra: usize = if (byte == '"' or byte == '\\' or byte == '\n' or byte == '\r' or byte == '\t' or byte == 0x08 or byte == 0x0c)
+            2
+        else if (byte < 0x20)
+            6
+        else
+            1;
+        size = std.math.add(usize, size, extra) catch return error.BadManifest;
+    }
+    return size;
 }
 
 // --- tests ------------------------------------------------------------------
@@ -1749,7 +1812,11 @@ test "manifest json round-trip" {
         .queues = &queues,
     }};
     var sys_regs = [_]SysRegEntry{.{ .name = "sctlr_el1", .value = 0xdeadbeef }};
+    var annotations = Annotations{};
+    try annotations.map.put(arena, "dev.buildkite.cleanroom.policy_hash", "sha256:abc123");
+    try annotations.map.put(arena, "org.opencontainers.image.ref.name", "worker");
     const manifest = Manifest{
+        .annotations = annotations,
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
@@ -1807,6 +1874,24 @@ test "manifest json round-trip" {
     try std.testing.expectEqualStrings(network_kind_spore, parsed.value.network.?.kind);
     try std.testing.expectEqualStrings("93.184.216.34/32", parsed.value.network.?.allow_cidrs[0]);
     try std.testing.expectEqualStrings("example.com", parsed.value.network.?.allow_hosts[0]);
+    try std.testing.expectEqualStrings("sha256:abc123", parsed.value.annotations.map.get("dev.buildkite.cleanroom.policy_hash").?);
+    try std.testing.expectEqualStrings("worker", parsed.value.annotations.map.get("org.opencontainers.image.ref.name").?);
+}
+
+test "manifest rejects oversized annotations" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
+    var manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, 3);
+    var annotations = Annotations{};
+    const value = try arena.alloc(u8, max_annotations_json_bytes);
+    @memset(value, 'x');
+    try annotations.map.put(arena, "dev.buildkite.cleanroom.policy_hash", value);
+    manifest.annotations = annotations;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 }
 
 fn testTransport(device_id: u32) TransportState {

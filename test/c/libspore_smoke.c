@@ -14,7 +14,7 @@ int main(void) {
 
   uint32_t abi_version = 0;
   if (expect_success(spore_build_info(SPORE_BUILD_INFO_ABI_VERSION, &abi_version)) != 0) return 1;
-  if (abi_version != 7) return 1;
+  if (abi_version != 8) return 1;
 
   SporeInspectBundleOptions options;
   spore_inspect_bundle_options_init(&options);
@@ -51,6 +51,7 @@ int main(void) {
   if (create_options.allow_host_count != 0) return 1;
   if (create_options.network_rule_count != 0) return 1;
   if (create_options.bound_unix_service_count != 0) return 1;
+  if (create_options.annotation_count != 0) return 1;
 
   SporeExecNamedOptions exec_options;
   spore_exec_named_options_init(&exec_options);
@@ -73,6 +74,7 @@ int main(void) {
   if (snapshot_options.size != sizeof(snapshot_options)) return 1;
   if (snapshot_options.version != SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION) return 1;
   if (snapshot_options.continue_after != 1) return 1;
+  if (snapshot_options.annotation_count != 0) return 1;
 
   SporeSuspendNamedOptions suspend_options;
   spore_suspend_named_options_init(&suspend_options);

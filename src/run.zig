@@ -114,6 +114,7 @@ pub const Options = struct {
     capture_path: ?[]const u8 = null,
     capture_trigger: capture.Trigger = .exit,
     continue_after_capture: bool = false,
+    annotations: spore.Annotations = .{},
     network: NetworkMode = .disabled,
     network_policy: spore_net_policy.Config = .{},
     network_runtime: ?virtio_net.Runtime = null,
@@ -2056,6 +2057,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
 
     const setup_start = monotonicMs();
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
+    try spore.validateAnnotations(opts.annotations);
 
     const backend = try resolveBackend(opts.backend);
     events.setBackend(backend);
@@ -2146,6 +2148,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
+                .annotations = opts.annotations,
                 .resume_dir = opts.resume_dir,
                 .ram_backing_fd = local_backing.fd,
                 .exec_probe = &stream,
@@ -2171,6 +2174,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
+                .annotations = opts.annotations,
                 .resume_dir = opts.resume_dir,
                 .ram_backing_fd = local_backing.fd,
                 .exec_probe = &stream,
@@ -2232,6 +2236,7 @@ pub fn finishGatewayNetworkEvents(gateway: *net_gateway.Process, gateway_active:
 
 pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
+    try spore.validateAnnotations(opts.annotations);
 
     const backend = try resolveBackend(opts.backend);
     var gateway: net_gateway.Process = undefined;
@@ -2273,6 +2278,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
                 .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
+                .annotations = opts.annotations,
                 .resume_dir = opts.resume_dir,
                 .ram_restore_mode = .eager_chunks,
                 .exec_control = control,
@@ -2292,6 +2298,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
                 .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
+                .annotations = opts.annotations,
                 .resume_dir = opts.resume_dir,
                 .ram_restore_mode = .eager_chunks,
                 .exec_control = control,

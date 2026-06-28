@@ -11,16 +11,16 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 7;
+const c_abi_version: u32 = 8;
 const inspect_bundle_options_version: u32 = 1;
 const pull_options_version: u32 = 1;
 const system_df_options_version: u32 = 1;
 const system_prune_options_version: u32 = 1;
-const create_named_options_version: u32 = 3;
+const create_named_options_version: u32 = 4;
 const resume_named_options_version: u32 = 1;
 const fork_named_options_version: u32 = 1;
 const exec_named_options_version: u32 = 2;
-const snapshot_named_options_version: u32 = 1;
+const snapshot_named_options_version: u32 = 2;
 const suspend_named_options_version: u32 = 1;
 const remove_named_options_version: u32 = 1;
 
@@ -45,6 +45,11 @@ const SporeBoundUnixService = extern struct {
     guest_host: SporeString,
     guest_port: u16,
     unix_path: SporeString,
+};
+
+const SporeAnnotation = extern struct {
+    key: SporeString,
+    value: SporeString,
 };
 
 const SporeInspectBundleOptions = extern struct {
@@ -122,6 +127,8 @@ const SporeCreateNamedOptions = extern struct {
     network_rule_count: usize,
     bound_unix_services: ?[*]const SporeBoundUnixService,
     bound_unix_service_count: usize,
+    annotations: ?[*]const SporeAnnotation,
+    annotation_count: usize,
 };
 
 const SporeExecNamedOptions = extern struct {
@@ -158,6 +165,8 @@ const SporeSnapshotNamedOptions = extern struct {
     name: SporeString,
     out_dir: SporeString,
     continue_after: u8,
+    annotations: ?[*]const SporeAnnotation,
+    annotation_count: usize,
 };
 
 const SporeSuspendNamedOptions = extern struct {
@@ -281,6 +290,8 @@ pub export fn spore_create_named_options_init(options: ?*SporeCreateNamedOptions
         .network_rule_count = 0,
         .bound_unix_services = null,
         .bound_unix_service_count = 0,
+        .annotations = null,
+        .annotation_count = 0,
     };
 }
 
@@ -329,6 +340,8 @@ pub export fn spore_snapshot_named_options_init(options: ?*SporeSnapshotNamedOpt
         .name = .{},
         .out_dir = .{},
         .continue_after = 1,
+        .annotations = null,
+        .annotation_count = 0,
     };
 }
 
@@ -577,6 +590,7 @@ pub export fn spore_create_named_json(
     const allow_hosts = parseStringList(arena, opts.allow_hosts, opts.allow_host_count) catch |err| return fail(ctx, err);
     const network_policy = parseNetworkPolicy(arena, opts.network_rules, opts.network_rule_count) catch |err| return fail(ctx, err);
     const bound_services = parseBoundUnixServices(arena, opts.bound_unix_services, opts.bound_unix_service_count) catch |err| return fail(ctx, err);
+    const annotations = parseAnnotations(arena, opts.annotations, opts.annotation_count) catch |err| return fail(ctx, err);
     const result = libspore.createNamed(init, ctx.allocator, .{
         .name = toSlice(opts.name) catch |err| return fail(ctx, err),
         .backend = parseBackend(optionalSlice(opts.backend) catch |err| return fail(ctx, err)) catch |err| return fail(ctx, err),
@@ -597,6 +611,7 @@ pub export fn spore_create_named_json(
         .timeout_ms = opts.timeout_ms,
         .console_log_path = optionalSlice(opts.console_log_path) catch |err| return fail(ctx, err),
         .spore_executable = (optionalSlice(opts.spore_executable) catch |err| return fail(ctx, err)) orelse "spore",
+        .annotations = annotations,
     }) catch |err| return fail(ctx, err);
     defer libspore.deinitNamedLifecycleResult(ctx.allocator, result);
 
@@ -708,10 +723,15 @@ pub export fn spore_snapshot_named_json(
         return fail(ctx, error.InvalidValue);
     }
 
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const annotations = parseAnnotations(arena, opts.annotations, opts.annotation_count) catch |err| return fail(ctx, err);
     const result = libspore.snapshotNamed(ctx.productContext(), ctx.allocator, .{
         .name = toSlice(opts.name) catch |err| return fail(ctx, err),
         .out_dir = toSlice(opts.out_dir) catch |err| return fail(ctx, err),
         .continue_after = opts.continue_after != 0,
+        .annotations = annotations,
     }) catch |err| return fail(ctx, err);
     defer libspore.deinitNamedLifecycleResult(ctx.allocator, result);
 
@@ -876,6 +896,17 @@ fn parseBoundUnixServices(allocator: std.mem.Allocator, raw: ?[*]const SporeBoun
     return services;
 }
 
+fn parseAnnotations(allocator: std.mem.Allocator, raw: ?[*]const SporeAnnotation, len: usize) !libspore.Annotations {
+    var annotations = libspore.Annotations{};
+    if (len == 0) return annotations;
+    const values = raw orelse return error.InvalidValue;
+    for (values[0..len]) |value| {
+        annotations.map.put(allocator, try toSlice(value.key), try toSlice(value.value)) catch return error.OutOfMemory;
+    }
+    libspore.validateAnnotations(annotations) catch return error.InvalidValue;
+    return annotations;
+}
+
 fn parseArgv(allocator: std.mem.Allocator, raw: ?[*]const SporeString, len: usize) ![]const []const u8 {
     if (len == 0) return error.InvalidValue;
     const values = raw orelse return error.InvalidValue;
@@ -951,6 +982,7 @@ test "named lifecycle options initialize defaults" {
     try std.testing.expectEqual(@as(usize, 0), create.allow_host_count);
     try std.testing.expectEqual(@as(usize, 0), create.network_rule_count);
     try std.testing.expectEqual(@as(usize, 0), create.bound_unix_service_count);
+    try std.testing.expectEqual(@as(usize, 0), create.annotation_count);
 
     var exec: SporeExecNamedOptions = undefined;
     spore_exec_named_options_init(&exec);
@@ -969,6 +1001,7 @@ test "named lifecycle options initialize defaults" {
     spore_snapshot_named_options_init(&snapshot);
     try std.testing.expectEqual(snapshot_named_options_version, snapshot.version);
     try std.testing.expectEqual(@as(u8, 1), snapshot.continue_after);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.annotation_count);
 }
 
 test "C ABI exposes network capabilities JSON" {

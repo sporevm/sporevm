@@ -130,6 +130,8 @@ pub const NetworkRule = spore_net_policy.NetworkRule;
 pub const BoundService = spore_net_policy.BoundService;
 pub const BoundServiceTarget = spore_net_policy.BoundServiceTarget;
 pub const Rootfs = run_mod.Rootfs;
+pub const Annotations = spore.Annotations;
+pub const validateAnnotations = spore.validateAnnotations;
 pub const RootfsBuildOptions = rootfs_mod.BuildRequest;
 pub const RootfsBuildResult = rootfs_mod.BuildResult;
 pub const RootfsCasPreloadOptions = rootfs_mod.CasPreloadRequest;
@@ -196,6 +198,7 @@ pub const RunOptions = struct {
     capture_path: ?[]const u8 = null,
     capture_trigger: CaptureTrigger = .exit,
     continue_after_capture: bool = false,
+    annotations: Annotations = .{},
     network: NetworkMode = .disabled,
     network_policy: NetworkConfig = .{},
     spore_executable: []const u8 = "spore",
@@ -225,6 +228,7 @@ pub const ManagedRunOptions = struct {
     capture_path: ?[]const u8 = null,
     capture_trigger: CaptureTrigger = .exit,
     continue_after_capture: bool = false,
+    annotations: Annotations = .{},
     network: NetworkMode = .disabled,
     network_policy: NetworkConfig = .{},
     spore_executable: []const u8 = "spore",
@@ -411,6 +415,7 @@ pub const SporeInspectResult = struct {
     memory_backing_kind: ?[]const u8,
     memory_backing_size: ?u64,
     gic_kind: []const u8,
+    annotation_keys: []const []const u8 = &.{},
 };
 
 /// Return host facts, backend availability, and cache roots.
@@ -684,6 +689,8 @@ pub fn deinitSporeInspectResult(allocator: std.mem.Allocator, result: SporeInspe
     allocator.free(result.platform.arch);
     allocator.free(result.platform.cpu_profile);
     if (result.memory_backing_kind) |kind| allocator.free(kind);
+    for (result.annotation_keys) |key| allocator.free(key);
+    allocator.free(result.annotation_keys);
 }
 
 /// Map an internal Zig error to the stable failure classification used by
@@ -724,6 +731,7 @@ pub fn run(
         .capture_path = options.capture_path,
         .capture_trigger = options.capture_trigger,
         .continue_after_capture = options.continue_after_capture,
+        .annotations = options.annotations,
         .network = options.network,
         .network_policy = options.network_policy,
         .spore_executable = options.spore_executable,
@@ -775,6 +783,7 @@ pub fn runManaged(
         .capture_path = options.capture_path,
         .capture_trigger = options.capture_trigger,
         .continue_after_capture = options.continue_after_capture,
+        .annotations = options.annotations,
         .network = options.network,
         .network_policy = options.network_policy,
         .spore_executable = options.spore_executable,
@@ -818,6 +827,7 @@ pub fn runFromSpore(
         .capture_path = options.capture_path,
         .capture_trigger = options.capture_trigger,
         .continue_after_capture = options.continue_after_capture,
+        .annotations = manifest.value.annotations,
         .network = network_options.network,
         .network_policy = network_options.policy,
         .spore_executable = options.spore_executable,
@@ -1127,6 +1137,17 @@ fn summarizeSpore(allocator: std.mem.Allocator, manifest: spore.Manifest) !Spore
     for (manifest.memory.chunks) |maybe_chunk| {
         if (maybe_chunk != null) present_chunks += 1;
     }
+    var annotation_keys = try allocator.alloc([]const u8, manifest.annotations.map.count());
+    var annotation_index: usize = 0;
+    errdefer {
+        for (annotation_keys[0..annotation_index]) |key| allocator.free(key);
+        allocator.free(annotation_keys);
+    }
+    var annotation_it = manifest.annotations.map.iterator();
+    while (annotation_it.next()) |entry| {
+        annotation_keys[annotation_index] = try allocator.dupe(u8, entry.key_ptr.*);
+        annotation_index += 1;
+    }
 
     return .{
         .version = manifest.version,
@@ -1146,6 +1167,7 @@ fn summarizeSpore(allocator: std.mem.Allocator, manifest: spore.Manifest) !Spore
         .memory_backing_kind = if (manifest.memory.backing) |backing| try allocator.dupe(u8, backing.kind) else null,
         .memory_backing_size = if (manifest.memory.backing) |backing| backing.size else null,
         .gic_kind = @tagName(manifest.machine.gic.kind),
+        .annotation_keys = annotation_keys,
     };
 }
 

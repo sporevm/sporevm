@@ -148,9 +148,12 @@ Use named lifecycle APIs when an embedder needs long-lived VM handles without
 constructing `spore` command argv or touching the private monitor socket:
 
 ```zig
+var create_annotations = libspore.Annotations{};
+try create_annotations.map.put(allocator, "dev.buildkite.cleanroom.policy_hash", "sha256:abc123");
 const created = try libspore.createNamed(init, allocator, .{
     .name = "worker-1",
     .image_ref = "docker.io/library/alpine:3.20",
+    .annotations = create_annotations,
 });
 defer libspore.deinitNamedLifecycleResult(allocator, created);
 
@@ -160,10 +163,13 @@ const exec = try libspore.execNamed(context, allocator, .{
 });
 defer libspore.deinitExecNamedResult(allocator, exec);
 
+var snapshot_annotations = libspore.Annotations{};
+try snapshot_annotations.map.put(allocator, "dev.buildkite.cleanroom.snapshot", "warm");
 const snap = try libspore.snapshotNamed(context, allocator, .{
     .name = "worker-1",
     .out_dir = "worker-1.spore",
     .continue_after = true,
+    .annotations = snapshot_annotations,
 });
 defer libspore.deinitNamedLifecycleResult(allocator, snap);
 
@@ -425,6 +431,12 @@ SporeBoundUnixService services[] = {
         .unix_path = { .ptr = "/tmp/cleanroom-gateway.sock", .len = 27 },
     },
 };
+SporeAnnotation annotations[] = {
+    {
+        .key = { .ptr = "dev.buildkite.cleanroom.policy_hash", .len = 34 },
+        .value = { .ptr = "sha256:abc123", .len = 13 },
+    },
+};
 create.network_enabled = 1;
 create.allow_cidrs = allow_cidrs;
 create.allow_cidr_count = 1;
@@ -434,6 +446,8 @@ create.network_rules = rules;
 create.network_rule_count = 1;
 create.bound_unix_services = services;
 create.bound_unix_service_count = 1;
+create.annotations = annotations;
+create.annotation_count = 1;
 
 if (spore_create_named_json(context, &create, &json) != SPORE_SUCCESS) return 1;
 spore_free_string(context, json);
@@ -476,16 +490,40 @@ if err != nil {
     return err
 }
 
+created, err := client.CreateNamed(ctx, spore.CreateNamedOptions{
+    Name: "worker",
+    Annotations: map[string]string{
+        "dev.buildkite.cleanroom.policy_hash": "sha256:abc123",
+    },
+})
+if err != nil {
+    return err
+}
+
+snap, err := client.SnapshotNamed(ctx, spore.SnapshotNamedOptions{
+    Name:     "worker",
+    OutDir:   "worker.spore",
+    Continue: true,
+    Annotations: map[string]string{
+        "dev.buildkite.cleanroom.snapshot": "warm",
+    },
+})
+if err != nil {
+    return err
+}
+
 _ = info
 _ = bundle
 _ = pulled
+_ = created
+_ = snap
 ```
 
-The surface covers build info, context lifetime, host-info, inspect-bundle, and
-pull. It decodes the same JSON contracts as the CLI and C ABI, and it requires
-C ABI version 7 or newer. Go context cancellation is checked before entering C
-calls; long-running runtime cancellation is not exposed until the Zig product
-API and C ABI provide it.
+The surface covers build info, context lifetime, host-info, inspect-bundle,
+pull, and named lifecycle create/snapshot. It decodes the same JSON contracts as
+the CLI and C ABI, and it requires C ABI version 8 or newer. Go context
+cancellation is checked before entering C calls; long-running runtime
+cancellation is not exposed until the Zig product API and C ABI provide it.
 
 From a source checkout, build `libspore` first and point Go at the generated
 pkg-config and dynamic library paths:

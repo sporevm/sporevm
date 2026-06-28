@@ -720,6 +720,14 @@ fn writeInspectSummary(writer: *Io.Writer, summary: spore_api.SporeInspectResult
         try writer.writeAll("  Memory backing: none\n");
     }
     try writer.print("  GIC: {s}\n", .{summary.gic_kind});
+    if (summary.annotation_keys.len == 0) {
+        try writer.writeAll("  Annotations: none\n");
+    } else {
+        try writer.print("  Annotations: {d}\n", .{summary.annotation_keys.len});
+        for (summary.annotation_keys) |key| {
+            try writer.print("    - {s}\n", .{key});
+        }
+    }
 }
 
 fn writeForkResult(writer: *Io.Writer, result: spore_api.ForkResult) !void {

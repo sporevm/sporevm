@@ -46,6 +46,7 @@ pub const Config = struct {
     rootfs: ?spore.Rootfs = null,
     /// Requested network capability and policy metadata for snapshots.
     network_manifest: ?spore.Network = null,
+    annotations: spore.Annotations = .{},
     /// Resume from a spore directory instead of booting the kernel.
     resume_dir: ?[]const u8 = null,
     /// Optional pre-refreshed generation state for product resume attach.
@@ -380,7 +381,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 .keep_running => {},
                 .stop => return .monitor_stopped,
                 .snapshot => |request| {
-                    try takeSnapshot(allocator, request.dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                    try takeSnapshot(allocator, request.dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, config.network_manifest, config.annotations, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                     if (!request.continue_after) return .snapshotted;
                     try control.completeSnapshot(request.dir);
                 },
@@ -395,7 +396,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     pending_kvm_completion = false;
                 }
                 const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, config.network_manifest, config.annotations, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
                 if (config.continue_after_capture) {
@@ -432,7 +433,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     if (config.exec_probe_completes_run) {
                         if (config.snapshot_on_probe_complete) {
                             const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                            try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                            try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, config.network_manifest, config.annotations, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                             return .snapshotted;
                         }
                         return .probe_complete;
@@ -459,7 +460,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     pending_kvm_completion = false;
                 }
                 const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, config.network_manifest, config.annotations, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                 return .snapshotted;
             }
         }
@@ -976,6 +977,7 @@ fn takeSnapshot(
     rootfs: ?spore.Rootfs,
     disk_snapshot: ?disk_layer.SnapshotState,
     network_manifest: ?spore.Network,
+    annotations: spore.Annotations,
     dirty_tracker: ?*DirtyTracker,
     environ_map: ?*const std.process.Environ.Map,
 ) !void {
@@ -1035,6 +1037,7 @@ fn takeSnapshot(
         .machine = machine,
         .devices = devices,
         .generation = gen_state,
+        .annotations = annotations,
         .rootfs = rootfs,
         .disk = disk_manifest,
         .network = network_manifest,
