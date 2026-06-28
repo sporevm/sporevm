@@ -20,7 +20,9 @@ Manifest-format-v0 portability is deliberately narrow:
 - vCPU topology: one vCPU.
 - Backends: Linux KVM and Apple Hypervisor.framework.
 - Device model: the frozen SporeVM board contract — virtio-mmio console,
-  optional blk, net, vsock, rng, and the generation MMIO device.
+  optional blk, net, vsock, rng, and the generation MMIO device. Transient
+  grow-only virtio-mem for fresh managed auto runs is outside manifest v0;
+  capture/resume paths disable it rather than serializing hotplug state.
 - Memory: portable restore is chunk-authoritative. Product same-host restore may
   use local proof-backed `ram.backing`, but that is acceleration metadata, not a
   portability authority.
@@ -84,6 +86,7 @@ block identical-host fork/fan-out.
 | Immutable rootfs base | optional exact artifact plus optional `chunked-ext4-rootfs-v0` storage descriptor | yes via `spore run --image` | verifies exact artifact fd or chunked index/chunks | yes via `spore run --image` | verifies exact artifact fd or chunked index/chunks | product resume base |
 | Writable root disk layers | optional `cow-block-v0` chain over the effective immutable rootfs base | yes for local layer store | verifies layer indexes and disk objects | yes for local layer store | verifies layer indexes and disk objects | product resume; bundle materialization unit-covered |
 | Network capability and policy | optional `spore-net-v0` plus allow CIDRs/hosts, exact host-port rules, and bound-service requirements; no live flows or host socket material | yes | fresh gateway | yes | fresh gateway | policy portable; flows dropped; bound services fail closed unless restored |
+| Transient virtio-mem hotplug | not represented | fresh managed run only | n/a | fresh managed run only | n/a | outside manifest v0 |
 | General writable disk contents | not represented | no | reject | no | reject | out of current format |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
 | Access trace | not yet represented | no | no | no | no | local KVM/HVF lazy traces only; not a portability contract |
@@ -164,6 +167,7 @@ These are intentionally not captured in manifest v0:
 - General disk contents and external host files. Rootfs-bound `cow-block-v0`
   layers are captured as described above.
 - Network connections and host-side sockets.
+- Transient virtio-mem plug state and guest hotplug policy.
 - Host paths, credentials, secrets, and runtime policy.
 - Kernel image identity and DTB identity, until the platform contract grows
   pinned kernel fields.

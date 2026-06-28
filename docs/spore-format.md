@@ -154,7 +154,9 @@ under `rootfs.cache`.
   current Apple-M/Graviton common denominator; KVM enforces it by masking RNDR
   before guest boot. Device model version 4 includes the fixed virtio-mmio
   range plus the generation MMIO device at `0x0c001000`, size `0x1000`, SPI 24
-  / INTID 56.
+  / INTID 56. Fresh managed auto-memory runs may attach a transient grow-only
+  virtio-mem device, but current capture/resume paths disable that transient
+  device and do not serialize virtio-mem state into manifest v0.
 - `machine`: normalized architectural state for one vCPU — `gprs` (x0–x30),
   `pc`, `cpsr`, `fpcr`, `fpsr`, `simd` (32 Q registers as u64 pairs),
   `sys_regs` (EL1 context registers by architectural name), `icc_regs`
@@ -260,6 +262,10 @@ under `rootfs.cache`.
 - Live network flows: manifest v0 persists requested network capability and
   policy only. Active TCP flows and learned DNS answers are dropped across
   capture, resume, and fork.
+- Transient virtio-mem state: the first grow-only auto-memory prototype is a
+  fresh managed-run optimization. Manifest v0 records the fixed RAM image that
+  capture/resume can restore, not virtio-mem plug state, unplug state, or guest
+  hotplug policy.
 
 ## Invariants that hold regardless of version
 
