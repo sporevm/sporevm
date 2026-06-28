@@ -140,6 +140,10 @@ const result = try libspore.runFromSpore(context, allocator, .{
 });
 ```
 
+`RunResult.memory_restore_source` and `memory_restore_reason` are populated for
+`runFromSpore` and `resumeSpore`, so embedders can tell whether RAM came from
+`local_backing` or verified `chunks` without parsing logs.
+
 Use `run` only when you already have explicit kernel and rootfs or disk inputs.
 
 ## Named Lifecycle

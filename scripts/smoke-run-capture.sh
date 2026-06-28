@@ -9,6 +9,27 @@ die() {
   exit 1
 }
 
+jsonl_output_contains() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import base64
+import json
+import sys
+
+needle = sys.argv[3].encode()
+with open(sys.argv[1], encoding="utf-8") as f:
+    for line in f:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") != sys.argv[2]:
+            continue
+        if needle in base64.b64decode(event.get("data_base64", "")):
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
 infer_backend() {
   if [[ -n "${SPORE_BACKEND:-}" ]]; then
     echo "${SPORE_BACKEND}"
@@ -124,6 +145,8 @@ grep -Fq '"event":"ready"' "${resume_stdout}" || die "spore resume --events=json
 grep -Fq '"event":"stdout"' "${resume_stdout}" || die "spore resume --events=jsonl did not emit stdout"
 grep -Fq '"event":"exit"' "${resume_stdout}" || die "spore resume --events=jsonl did not emit terminal exit"
 grep -Fq '"exit_code":0' "${resume_stdout}" || die "spore resume --events=jsonl did not report exit_code 0"
+grep -Fq '"memory_restore_source":"local_backing"' "${resume_stdout}" || die "spore resume --events=jsonl did not report local RAM restore"
+grep -Fq '"memory_restore_reason":"proof_valid"' "${resume_stdout}" || die "spore resume --events=jsonl did not report proof-backed restore"
 
 "${spore_bin}" run \
   --backend "${backend}" \
@@ -135,23 +158,29 @@ grep -Fq '"exit_code":0' "${resume_stdout}" || die "spore resume --events=jsonl 
 
 "${spore_bin}" --debug run \
   --backend "${backend}" \
+  --events=jsonl \
   --from "${from_base_dir}" \
   -- /bin/writeout \
   >"${from_stdout}" 2>"${from_stderr}"
-grep -Fq "spore stdout" "${from_stdout}" || {
+jsonl_output_contains "${from_stdout}" stdout "spore stdout" || {
   cat "${from_stdout}" >&2 || true
   cat "${from_stderr}" >&2 || true
-  die "spore run --from did not stream stdout"
+  die "spore run --from did not emit stdout"
 }
-grep -Fq "spore stderr" "${from_stderr}" || {
+jsonl_output_contains "${from_stdout}" stderr "spore stderr" || {
   cat "${from_stdout}" >&2 || true
   cat "${from_stderr}" >&2 || true
-  die "spore run --from did not stream stderr"
+  die "spore run --from did not emit stderr"
 }
-grep -Fq "run --from memory restore source=local_backing reason=proof_valid" "${from_stderr}" || {
+grep -Fq '"memory_restore_source":"local_backing"' "${from_stdout}" || {
   cat "${from_stdout}" >&2 || true
   cat "${from_stderr}" >&2 || true
-  die "spore run --from did not use proof-backed local RAM restore"
+  die "spore run --from did not report local RAM restore"
+}
+grep -Fq '"memory_restore_reason":"proof_valid"' "${from_stdout}" || {
+  cat "${from_stdout}" >&2 || true
+  cat "${from_stderr}" >&2 || true
+  die "spore run --from did not report proof-backed restore"
 }
 
 echo "smoke:run-capture ok backend=${backend}"

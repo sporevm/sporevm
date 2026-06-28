@@ -211,7 +211,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         switch (cause) {
             .guest_off, .guest_reset => {},
             .probe_complete => {
-                const result = try resultFromResumeStream(backend, ram_size, identity_stream);
+                var result = try resultFromResumeStream(backend, ram_size, identity_stream);
+                result = result.withMemoryRestore(local_backing);
                 run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
                 try events.emitExit(result);
                 if (events.write_failed) return error.EventSinkFailed;
@@ -223,7 +224,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         switch (cause) {
             .guest_off, .guest_reset => {},
             .probe_complete => {
-                const result = try resultFromResumeStream(backend, ram_size, identity_stream);
+                var result = try resultFromResumeStream(backend, ram_size, identity_stream);
+                result = result.withMemoryRestore(local_backing);
                 run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
                 try events.emitExit(result);
                 if (events.write_failed) return error.EventSinkFailed;
@@ -237,7 +239,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     if (gateway_failed) return error.NetworkGatewayFailed;
     const connect_ms = if (identity_stream) |stream| stream.connect_ms orelse 0 else 0;
     const response_ms = if (identity_stream) |stream| stream.response_ms orelse 0 else 0;
-    const result = run_mod.Result{
+    var result = run_mod.Result{
         .backend = backend,
         .start_ms = 0,
         .vsock_connect_ms = connect_ms,
@@ -247,6 +249,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .vcpus = 1,
         .memory_bytes = ram_size,
     };
+    result = result.withMemoryRestore(local_backing);
     try events.emitExit(result);
     if (events.write_failed) return error.EventSinkFailed;
     return result;

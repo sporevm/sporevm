@@ -174,10 +174,21 @@ pub const Result = struct {
     memory_bytes: u64,
     captured: bool = false,
     capture_path: ?[]const u8 = null,
+    /// Product restore RAM source, such as `local_backing` or `chunks`.
+    memory_restore_source: ?[]const u8 = null,
+    /// Product restore planner reason, such as `proof_valid` or `proof_unavailable`.
+    memory_restore_reason: ?[]const u8 = null,
 
     pub fn processExitCode(self: Result) u8 {
         std.debug.assert(self.exit_code >= 0 and self.exit_code <= 255);
         return @intCast(self.exit_code);
+    }
+
+    pub fn withMemoryRestore(self: Result, plan: spore.LocalBackingPlan) Result {
+        var result = self;
+        result.memory_restore_source = @tagName(plan.source);
+        result.memory_restore_reason = plan.reason;
+        return result;
     }
 };
 
@@ -213,6 +224,8 @@ pub const ExitEvent = struct {
     memory_bytes: u64,
     captured: bool = false,
     capture_path: ?[]const u8 = null,
+    memory_restore_source: ?[]const u8 = null,
+    memory_restore_reason: ?[]const u8 = null,
     timings: Timings,
 };
 
@@ -374,6 +387,8 @@ fn exitEvent(command: []const u8, result: Result) ExitEvent {
         .memory_bytes = result.memory_bytes,
         .captured = result.captured,
         .capture_path = result.capture_path,
+        .memory_restore_source = result.memory_restore_source,
+        .memory_restore_reason = result.memory_restore_reason,
         .timings = .{
             .start_ms = result.start_ms,
             .vsock_connect_ms = result.vsock_connect_ms,
@@ -512,6 +527,8 @@ pub const EventWriter = struct {
             memory_bytes: u64,
             captured: bool,
             capture_path: ?[]const u8,
+            memory_restore_source: ?[]const u8,
+            memory_restore_reason: ?[]const u8,
             timings: Timings,
         }{
             .command = value.command,
@@ -521,6 +538,8 @@ pub const EventWriter = struct {
             .memory_bytes = value.memory_bytes,
             .captured = value.captured,
             .capture_path = value.capture_path,
+            .memory_restore_source = value.memory_restore_source,
+            .memory_restore_reason = value.memory_restore_reason,
             .timings = value.timings,
         };
         try self.write(event);
@@ -2111,7 +2130,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         },
     }) catch |err| {
         if (capture_plan.isSignalCapture() and capture_request.isCompleted() and isCaptureAborted(err)) {
-            const result = resultFromAbortedSignalCapture(backend, opts, &stream);
+            var result = resultFromAbortedSignalCapture(backend, opts, &stream);
+            if (resuming) result = result.withMemoryRestore(local_backing);
             finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
             try events.emitExit(result);
             if (events.write_failed) return error.EventSinkFailed;
@@ -2132,7 +2152,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     );
     if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
     const signal_capture_observed = capture_plan.isSignalCapture() and capture_request.isCompleted();
-    const result = try switch (cause) {
+    var result = try switch (cause) {
         .probe_complete => resultFromStream(backend, opts, &stream, signal_capture_observed),
         .snapshotted => if (capture_plan.isExitCapture())
             resultFromExitCapture(backend, opts, &stream)
@@ -2140,6 +2160,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             resultFromSignalCapture(backend, opts, &stream),
         else => error.ProbeDidNotComplete,
     };
+    if (resuming) result = result.withMemoryRestore(local_backing);
     finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
     try events.emitExit(result);
     if (events.write_failed) return error.EventSinkFailed;
@@ -2717,6 +2738,8 @@ test "event writer emits JSONL lifecycle and output records" {
         .exit_code = 7,
         .vcpus = 1,
         .memory_bytes = memory_config.auto_bytes,
+        .memory_restore_source = "local_backing",
+        .memory_restore_reason = "proof_valid",
     };
     try sink.emit(.{ .start = .{ .command = "run", .requested_backend = .hvf } });
     try sink.emit(.{ .ready = .{ .command = "run", .backend = .hvf } });
@@ -2736,6 +2759,8 @@ test "event writer emits JSONL lifecycle and output records" {
     try expectJsonStringField(allocator, stdout_line, "event", "stdout");
     try expectJsonStringField(allocator, stdout_line, "data_base64", "aGkK");
     try expectJsonStringField(allocator, exit_line, "event", "exit");
+    try expectJsonStringField(allocator, exit_line, "memory_restore_source", "local_backing");
+    try expectJsonStringField(allocator, exit_line, "memory_restore_reason", "proof_valid");
 }
 
 test "event writer emits exactly one terminal failure" {

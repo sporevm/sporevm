@@ -188,6 +188,10 @@ must re-measure the fd and match the signed digest before mapping. Filesystems o
 kernels without fs-verity support continue to write v1 proofs and preserve the
 Slice 1 fallback behavior.
 
+Product restore results and exit JSON now carry `memory_restore_source` and
+`memory_restore_reason`, so tests and embedders can assert `local_backing` versus
+`chunks` directly instead of scraping debug logs.
+
 The current implementation keeps the host-local proof and restore planner behind
 one internal seam: `openProvenLocalMemoryBacking` and
 `writeLocalMemoryBackingProof` in `src/spore.zig`. That is deliberate for the
@@ -278,8 +282,9 @@ Validation on 2026-06-20:
 - `mise exec -- zig build -Dtarget=aarch64-linux` passed, covering the Linux
   `statx` proof identity branch.
 - `SPORE_SMOKE_FANOUT_COUNT=3 scripts/smoke-counter-fanout.sh` passed on HVF.
-- `scripts/smoke-run-capture.sh` passed on HVF and asserts `spore run --from`
-  logs `source=local_backing reason=proof_valid`.
+- `scripts/smoke-run-capture.sh` passed on HVF; the current smoke asserts
+  resume and `spore run --from` exit JSON report
+  `memory_restore_source=local_backing` and `memory_restore_reason=proof_valid`.
 - A direct product debug resume of a forked 16GiB child logged
   `source=local_backing reason=proof_valid` and backend
   `mode=local_backing ... memory_ms=0`.
