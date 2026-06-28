@@ -1312,22 +1312,7 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
 
     const parent_chunks = try pathZ(allocator, "{s}/chunks", .{options.parent_dir});
     const shared_chunks = try realpathAlloc(allocator, parent_chunks);
-    var shared_backing: ?[]const u8 = null;
-    if (parent.memory.backing) |backing| {
-        if (options.environ_map) |environ| {
-            const parent_backing_plan = try openProvenLocalMemoryBacking(allocator, environ, options.parent_dir, parent.memory, parent.platform.ram_size);
-            defer if (parent_backing_plan.fd) |fd| {
-                _ = std.c.close(fd);
-            };
-            if (parent_backing_plan.source == .local_backing) {
-                const parent_backing = try memoryBackingPath(allocator, options.parent_dir, backing);
-                shared_backing = realpathAlloc(allocator, parent_backing) catch |err| switch (err) {
-                    error.IoFailed => null,
-                    else => |e| return e,
-                };
-            }
-        }
-    }
+    const shared_backing = try provenForkBackingPath(allocator, options.environ_map, options.parent_dir, parent.memory, parent.platform.ram_size);
     var shared_disk_layers: ?[]const u8 = null;
     var shared_disk_objects: ?[]const u8 = null;
     if (parent.disk) |disk| {
@@ -1403,6 +1388,27 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
         .last_generation = parent.generation.generation + options.count,
         .first_child = first_child,
         .last_child = last_child,
+    };
+}
+
+fn provenForkBackingPath(
+    allocator: std.mem.Allocator,
+    maybe_environ: ?*const std.process.Environ.Map,
+    parent_dir: []const u8,
+    memory: MemoryManifest,
+    ram_size: u64,
+) Error!?[]const u8 {
+    const backing = memory.backing orelse return null;
+    const environ = maybe_environ orelse return null;
+    const parent_backing_plan = try openProvenLocalMemoryBacking(allocator, environ, parent_dir, memory, ram_size);
+    defer if (parent_backing_plan.fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    if (parent_backing_plan.source != .local_backing) return null;
+    const parent_backing = try memoryBackingPath(allocator, parent_dir, backing);
+    return realpathAlloc(allocator, parent_backing) catch |err| switch (err) {
+        error.IoFailed => null,
+        else => |e| return e,
     };
 }
 
