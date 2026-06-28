@@ -1062,20 +1062,6 @@ pub const RootfsInputResolution = union(enum) {
     failure: machine_output.CliError,
 };
 
-pub fn resolveRootfsInput(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    rootfs_path: ?[]const u8,
-    image_ref: ?[]const u8,
-    command_name: []const u8,
-) !?[]const u8 {
-    return resolveRootfsInputForCli(init, allocator, .{
-        .rootfs_path = rootfs_path,
-        .image_ref = image_ref,
-        .command_name = command_name,
-    }).path;
-}
-
 pub fn resolveRootfsInputDetailed(
     init: std.process.Init,
     allocator: std.mem.Allocator,
