@@ -569,6 +569,7 @@ pub fn snapshotNamed(
     options: SnapshotNamedOptions,
 ) !NamedLifecycleResult {
     if (!options.continue_after) return error.UnsupportedSnapshotMode;
+    try spore.validateAnnotations(options.annotations);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -2602,6 +2603,26 @@ test "lifecycle runtime root rejects relative environment paths" {
     _ = env.swapRemove(runtime_dir_env);
     try env.put("XDG_RUNTIME_DIR", "");
     try std.testing.expectError(error.InvalidRuntimeDir, runtimeRootPath(allocator, &env));
+}
+
+test "snapshot validates annotations before touching runtime state" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(runtime_dir_env, "/tmp/sporevm-runtime");
+
+    var annotations = spore.Annotations{};
+    defer annotations.deinit(allocator);
+    try annotations.map.put(allocator, "", "bad");
+
+    try std.testing.expectError(error.BadManifest, snapshotNamed(.{
+        .io = std.testing.io,
+        .environ_map = &env,
+    }, allocator, .{
+        .name = "bench-1",
+        .out_dir = "zig-cache/missing-parent/snapshot.spore",
+        .annotations = annotations,
+    }));
 }
 
 test "lifecycle paths are rooted under vms by name" {
