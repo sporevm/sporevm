@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const board = @import("../board.zig");
+const fd_util = @import("../fd.zig");
 const guestmem = @import("../guestmem.zig");
 const hvf = @import("hvf.zig");
 const snapshot = @import("snapshot.zig");
@@ -138,7 +139,7 @@ pub const Pager = struct {
             "hvf lazy RAM map chunk",
         );
         self.mapped[index] = true;
-        if (trace) try writeTrace(self, index, range, len);
+        if (trace) writeTrace(self, index, range, len);
     }
 
     fn materializeDescriptorChain(self: *Pager, ram: guestmem.GuestRam, q: virtqueue.VirtQueue, head: u16) !void {
@@ -177,31 +178,20 @@ fn validateMapping(ram: []const u8) !void {
     if (spore.chunk_size % page_size != 0) return error.BadManifest;
 }
 
-fn writeTrace(pager: *const Pager, index: usize, range: spore.MemoryChunkRange, len: usize) !void {
+fn writeTrace(pager: *const Pager, index: usize, range: spore.MemoryChunkRange, len: usize) void {
     const fd = pager.trace_fd orelse return;
     const now = monotonicMs();
     const fault_ms = if (now >= pager.start_ms) now - pager.start_ms else 0;
     const nonzero: u1 = if (pager.manifest.chunks[index] == null) 0 else 1;
     var buf: [192]u8 = undefined;
-    const line = try std.fmt.bufPrint(&buf, "fault_ms={d} chunk_index={d} guest_offset={d} len={d} nonzero={d}\n", .{
+    const line = std.fmt.bufPrint(&buf, "fault_ms={d} chunk_index={d} guest_offset={d} len={d} nonzero={d}\n", .{
         fault_ms,
         index,
         range.start,
         len,
         nonzero,
-    });
-    try writeAll(fd, line);
-}
-
-fn writeAll(fd: std.c.fd_t, bytes: []const u8) !void {
-    var written: usize = 0;
-    while (written < bytes.len) {
-        const tail = bytes[written..];
-        const rc = std.c.write(fd, tail.ptr, tail.len);
-        if (rc < 0) return error.IoFailed;
-        if (rc == 0) return error.IoFailed;
-        written += @intCast(rc);
-    }
+    }) catch return;
+    fd_util.writeAllBestEffort(fd, line);
 }
 
 fn monotonicMs() u64 {

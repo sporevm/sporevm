@@ -9,6 +9,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const linux = std.os.linux;
+const fd_util = @import("../fd.zig");
 const spore = @import("../spore.zig");
 
 comptime {
@@ -193,7 +194,7 @@ fn handleFault(context: *Context) !void {
     };
     userfaultIoctl(context.uffd, c.UFFDIO_COPY, @intFromPtr(&copy)) catch return error.UserfaultfdCopyFailed;
     if (copy.copy < 0 or @as(usize, @intCast(copy.copy)) != len) return error.UserfaultfdCopyFailed;
-    try writeTrace(context, index, range, len);
+    writeTrace(context, index, range, len);
 }
 
 fn userfaultIoctl(fd: std.c.fd_t, request: u32, arg: usize) !void {
@@ -225,36 +226,20 @@ fn sleepOneMs() void {
     }
 }
 
-fn writeTrace(context: *Context, index: usize, range: spore.MemoryChunkRange, len: usize) !void {
+fn writeTrace(context: *Context, index: usize, range: spore.MemoryChunkRange, len: usize) void {
     const fd = context.trace_fd orelse return;
     const now = monotonicMs() catch context.start_ms;
     const fault_ms = if (now >= context.start_ms) now - context.start_ms else 0;
     const nonzero: u1 = if (context.manifest.chunks[index] == null) 0 else 1;
     var buf: [192]u8 = undefined;
-    const line = try std.fmt.bufPrint(&buf, "fault_ms={d} chunk_index={d} guest_offset={d} len={d} nonzero={d}\n", .{
+    const line = std.fmt.bufPrint(&buf, "fault_ms={d} chunk_index={d} guest_offset={d} len={d} nonzero={d}\n", .{
         fault_ms,
         index,
         range.start,
         len,
         nonzero,
-    });
-    try writeAll(fd, line);
-}
-
-fn writeAll(fd: std.c.fd_t, bytes: []const u8) !void {
-    var written: usize = 0;
-    while (written < bytes.len) {
-        const tail = bytes[written..];
-        const rc = linux.write(fd, tail.ptr, tail.len);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {
-                if (rc == 0) return error.IoFailed;
-                written += @intCast(rc);
-            },
-            .INTR => continue,
-            else => return error.IoFailed,
-        }
-    }
+    }) catch return;
+    fd_util.writeAllBestEffort(fd, line);
 }
 
 fn monotonicMs() !u64 {
