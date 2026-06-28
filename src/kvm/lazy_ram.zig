@@ -4,7 +4,7 @@
 //! loading and verifying the whole spore memory chunk, then `UFFDIO_COPY`ing it
 //! into the registered guest RAM mapping. Readahead, duplicate-fault coalescing,
 //! zero-page optimisation, and graceful cross-thread error propagation are later
-//! Slice 5 work.
+//! work.
 
 const builtin = @import("builtin");
 const std = @import("std");
