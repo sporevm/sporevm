@@ -2,8 +2,8 @@
 
 **Status:** manifest format v0 implemented (`src/spore.zig`), single-vCPU,
 same-host HVF and KVM producers/consumers. Manifest format v1 has data structs,
-validators, and KVM capture/restore for multi-vCPU state; HVF capture/restore
-and bundle production for v1 land in later slices.
+validators, KVM portable capture/restore, and HVF same-backend capture/restore
+for multi-vCPU state; bundle production for v1 lands in a later slice.
 
 Format v0 is still the current SporeVM 1.x manifest and artifact contract.
 Do not rename version or kind strings to v1 for release-label symmetry; use a
@@ -248,8 +248,9 @@ under `rootfs.cache`.
 
 Manifest v1 is the incompatible multi-vCPU machine-state shape. Existing v0
 loaders reject it through the normal unknown-version path. The KVM runtime uses
-v1 for multi-vCPU capture and restore; bundle commands still use the v0 loader
-until the distribution slice lands.
+v1 with portable `gicv3_multi` state for multi-vCPU capture and restore. The
+HVF runtime uses v1 with a tagged same-HVF `backend_private` GIC blob. Bundle
+commands still use the v0 loader until the distribution slice lands.
 
 V1 keeps the v0 memory, device, generation, rootfs, disk, network, and
 annotation contracts. The platform object adds:
@@ -270,7 +271,10 @@ V1 portable GIC state uses `machine.gic.kind: "gicv3_multi"`. It carries global
 distributor registers, per-vCPU redistributor register arrays keyed by MPIDR,
 and line levels where PPIs include an owning MPIDR and SPIs do not. Validation
 rejects unknown register offsets, duplicate redistributors, duplicate line
-records, PPIs without a known owner, and SPIs with an owner.
+records, PPIs without a known owner, and SPIs with an owner. HVF same-backend
+v1 captures instead use `machine.gic.kind: "backend_private"` with
+`backend: "hvf"` and `format: "hv_gic_state_v0"`; other backends must reject
+that blob before mutating VM state.
 
 ## Not Yet Captured By Manifest v0
 
@@ -281,7 +285,8 @@ records, PPIs without a known owner, and SPIs with an owner.
   first-touch traces for measurement, but manifest v0 does not persist access
   traces or prefetch hints.
 - Multi-vCPU machine state in manifest v0. Manifest v1 carries this state for
-  KVM capture/restore; HVF and bundle paths are still later slices.
+  KVM capture/restore and same-HVF capture/restore; bundle paths are still
+  later slices.
 - Kernel identity in the platform contract (pinned-build enforcement).
 - Durable disk/device identity fixup beyond the current diskless helper. The
   product initrd consumes generation params for hostname and applies

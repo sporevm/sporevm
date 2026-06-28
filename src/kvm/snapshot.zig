@@ -535,4 +535,14 @@ test "KVM v1 restore preflight matches local vCPU topology" {
         .gicv3_multi = .{ .dist_regs = &.{}, .redistributors = &one_redist, .line_levels = &.{} },
     };
     try std.testing.expectError(error.PlatformMismatch, validateMachineV1ForKvm(&refs, machine));
+
+    machine.gic = .{
+        .kind = .backend_private,
+        .backend_private = .{
+            .backend = .hvf,
+            .format = gicv3.hvf_backend_private_format,
+            .data_b64 = "AA==",
+        },
+    };
+    try std.testing.expectError(error.PlatformMismatch, validateMachineV1ForKvm(&refs, machine));
 }

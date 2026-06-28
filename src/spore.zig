@@ -148,9 +148,9 @@ pub const VcpuState = struct {
 pub const MachineStateV1 = struct {
     schema_version: u32 = machine_schema_version_v1,
     vcpus: []VcpuState,
-    /// Interrupt controller state. Manifest v1 currently accepts the portable
-    /// multi-vCPU GICv3 shape; backend-private v1 restore can be added when a
-    /// backend actually needs that escape hatch.
+    /// Interrupt controller state. Portable producers use the multi-vCPU GICv3
+    /// shape; same-backend temporary producers must tag private blobs so other
+    /// backends fail closed.
     gic: gicv3.State,
 };
 
@@ -1781,10 +1781,15 @@ fn validateMachineV1(platform: PlatformV1, machine: MachineStateV1) Error!void {
     if (platform.gic_redist_stride == 0) return error.BadManifest;
     _ = board.redistributorRegionSize(platform.gic_redist_stride, platform.vcpu_count) catch return error.BadManifest;
     if (machine.vcpus.len != platform.vcpu_count) return error.BadManifest;
-    if (machine.gic.kind != .gicv3_multi) return error.BadManifest;
     gicv3.validate(machine.gic) catch return error.BadManifest;
-    const gic = machine.gic.gicv3_multi orelse return error.BadManifest;
-    if (gic.redistributors.len != machine.vcpus.len) return error.BadManifest;
+    const gic = switch (machine.gic.kind) {
+        .gicv3_multi => machine.gic.gicv3_multi orelse return error.BadManifest,
+        .backend_private => null,
+        .gicv3 => return error.BadManifest,
+    };
+    if (gic) |multi| {
+        if (multi.redistributors.len != machine.vcpus.len) return error.BadManifest;
+    }
 
     for (machine.vcpus, 0..) |vcpu, i| {
         if (vcpu.index != i) return error.BadManifest;
@@ -1793,7 +1798,9 @@ fn validateMachineV1(platform: PlatformV1, machine: MachineStateV1) Error!void {
         for (machine.vcpus[0..i]) |prev| {
             if (prev.index == vcpu.index or prev.mpidr == vcpu.mpidr) return error.BadManifest;
         }
-        if (!gicHasRedistributor(gic, vcpu.mpidr)) return error.BadManifest;
+        if (gic) |multi| {
+            if (!gicHasRedistributor(multi, vcpu.mpidr)) return error.BadManifest;
+        }
     }
 }
 
@@ -2353,6 +2360,17 @@ test "manifest v1 validates and round-trips multi-vCPU topology" {
     try std.testing.expectEqual(@as(u64, 0x2_0000), parsed.value.platform.gic_redist_stride);
     try std.testing.expectEqual(@as(topology.Mpidr, 0x8000_0001), parsed.value.machine.vcpus[1].mpidr);
     try std.testing.expectEqual(gicv3.StateKind.gicv3_multi, parsed.value.machine.gic.kind);
+
+    var private_manifest = manifest;
+    private_manifest.machine.gic = .{
+        .kind = .backend_private,
+        .backend_private = .{
+            .backend = .hvf,
+            .format = gicv3.hvf_backend_private_format,
+            .data_b64 = "AA==",
+        },
+    };
+    try validateManifestV1(private_manifest);
 }
 
 test "manifest v1 rejects invalid vCPU topology" {
