@@ -1763,7 +1763,7 @@ fn rootfsStorageEntryDescriptor(entry: RootfsStorageEntry) spore.RootfsStorage {
 
 fn rootfsStorageEntryMatches(entry: RootfsStorageEntry, storage: spore.RootfsStorage) bool {
     return std.mem.eql(u8, entry.kind, storage.kind) and
-        rootfsDeviceMatches(entry.device, storage.device) and
+        spore.rootfsDeviceEql(entry.device, storage.device) and
         entry.logical_size == storage.logical_size and
         entry.chunk_size == storage.chunk_size and
         std.mem.eql(u8, entry.hash_algorithm, storage.hash_algorithm) and
@@ -1772,17 +1772,10 @@ fn rootfsStorageEntryMatches(entry: RootfsStorageEntry, storage: spore.RootfsSto
         std.mem.eql(u8, entry.object_namespace, storage.object_namespace);
 }
 
-fn rootfsDeviceMatches(a: spore.RootfsDevice, b: spore.RootfsDevice) bool {
-    return std.mem.eql(u8, a.kind, b.kind) and
-        std.mem.eql(u8, a.role, b.role) and
-        a.virtio_device_id == b.virtio_device_id and
-        a.mmio_slot == b.mmio_slot;
-}
-
 fn validateRootfsStorageForRootfs(storage: spore.RootfsStorage, rootfs: spore.Rootfs) Error!void {
     try spore.validateRootfsStorageDescriptor(storage);
     try validateRootfsDeviceShape(storage.device);
-    if (!rootfsDeviceMatches(storage.device, rootfs.device)) return error.BadManifest;
+    if (!spore.rootfsDeviceEql(storage.device, rootfs.device)) return error.BadManifest;
     if (storage.logical_size != rootfs.artifact.size) return error.BadManifest;
 }
 

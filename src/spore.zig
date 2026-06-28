@@ -733,7 +733,7 @@ fn validateRootfsDevice(device: RootfsDevice, devices: []const TransportState) E
     if (devices[device.mmio_slot].device_id != rootfs_virtio_blk_device_id) return error.BadManifest;
 }
 
-fn rootfsDeviceEql(a: RootfsDevice, b: RootfsDevice) bool {
+pub fn rootfsDeviceEql(a: RootfsDevice, b: RootfsDevice) bool {
     return std.mem.eql(u8, a.kind, b.kind) and
         std.mem.eql(u8, a.role, b.role) and
         a.virtio_device_id == b.virtio_device_id and

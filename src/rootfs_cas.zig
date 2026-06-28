@@ -94,7 +94,7 @@ pub const CasBlockSource = struct {
     ) !CasBlockSource {
         const storage = rootfs.storage orelse return error.BadManifest;
         if (!std.mem.eql(u8, rootfs.artifact.format, spore.rootfs_artifact_format_ext4)) return error.BadManifest;
-        if (!rootfsDeviceMatches(storage.device, rootfs.device)) return error.BadManifest;
+        if (!spore.rootfsDeviceEql(storage.device, rootfs.device)) return error.BadManifest;
         if (storage.logical_size != rootfs.artifact.size) return error.BadManifest;
         const path = try manifestIndexPath(allocator, cache_root, storage.index_digest);
         defer allocator.free(path);
@@ -471,13 +471,6 @@ pub fn storageDescriptor(device: spore.RootfsDevice, result: PreloadResult) spor
 
 fn objectDir(allocator: std.mem.Allocator, cache_root: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/cas/rootfs/blake3/objects", .{cache_root});
-}
-
-fn rootfsDeviceMatches(a: spore.RootfsDevice, b: spore.RootfsDevice) bool {
-    return std.mem.eql(u8, a.kind, b.kind) and
-        std.mem.eql(u8, a.role, b.role) and
-        a.virtio_device_id == b.virtio_device_id and
-        a.mmio_slot == b.mmio_slot;
 }
 
 fn objectPathForDir(allocator: std.mem.Allocator, dir: []const u8, id: chunk.ChunkId) ![]const u8 {
