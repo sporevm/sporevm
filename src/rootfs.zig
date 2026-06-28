@@ -1587,7 +1587,7 @@ fn readCachedRootfsStorage(io: Io, allocator: std.mem.Allocator, metadata_path: 
     defer parsed.deinit();
     const storage = parsed.value.rootfs_storage orelse return null;
     spore.validateRootfsStorageDescriptor(storage) catch return null;
-    return try cloneRootfsStorage(allocator, storage);
+    return try spore.cloneRootfsStorage(allocator, storage);
 }
 
 fn writeCachedRootfsStorage(io: Io, allocator: std.mem.Allocator, metadata_path: []const u8, storage: spore.RootfsStorage) !void {
@@ -1651,24 +1651,6 @@ fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
         else => return false,
     };
     return std.mem.eql(u8, actual, expected);
-}
-
-fn cloneRootfsStorage(allocator: std.mem.Allocator, storage: spore.RootfsStorage) !spore.RootfsStorage {
-    return .{
-        .kind = try allocator.dupe(u8, storage.kind),
-        .device = .{
-            .kind = try allocator.dupe(u8, storage.device.kind),
-            .role = try allocator.dupe(u8, storage.device.role),
-            .virtio_device_id = storage.device.virtio_device_id,
-            .mmio_slot = storage.device.mmio_slot,
-        },
-        .logical_size = storage.logical_size,
-        .chunk_size = storage.chunk_size,
-        .hash_algorithm = try allocator.dupe(u8, storage.hash_algorithm),
-        .index_digest = try allocator.dupe(u8, storage.index_digest),
-        .base_identity = try allocator.dupe(u8, storage.base_identity),
-        .object_namespace = try allocator.dupe(u8, storage.object_namespace),
-    };
 }
 
 fn readablePath(io: Io, path: []const u8) !bool {
