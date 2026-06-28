@@ -219,29 +219,8 @@ fn txFrameFromChain(chain: *const queue.Chain, out: *[max_frame_len]u8) ?[]const
     if (total <= header_len) return null;
     const frame_len = total - header_len;
     if (frame_len > max_frame_len) return null;
-    if (!copyReadableRange(chain, header_len, out[0..frame_len])) return null;
+    if (!chain.copyReadableRange(header_len, out[0..frame_len])) return null;
     return out[0..frame_len];
-}
-
-fn copyReadableRange(chain: *const queue.Chain, skip: usize, out: []u8) bool {
-    if (out.len == 0) return true;
-    var skipped: usize = 0;
-    var copied: usize = 0;
-    for (chain.segments.slice()) |seg| {
-        if (seg.writable) continue;
-        if (skipped + seg.data.len <= skip) {
-            skipped += seg.data.len;
-            continue;
-        }
-        const offset = if (skip > skipped) skip - skipped else 0;
-        const readable = seg.data[offset..];
-        const n = @min(readable.len, out.len - copied);
-        @memcpy(out[copied..][0..n], readable[0..n]);
-        copied += n;
-        if (copied == out.len) return true;
-        skipped += seg.data.len;
-    }
-    return false;
 }
 
 fn writeRxFrameToChain(chain: *const queue.Chain, frame: []const u8) ?u32 {
