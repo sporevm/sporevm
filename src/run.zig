@@ -1544,16 +1544,7 @@ fn cacheRootfsByDigest(
     cache_root: []const u8,
     rootfs_path: []const u8,
 ) !spore.RootfsArtifactRef {
-    return cacheRootfsByDigestPath(init.io, allocator, cache_root, rootfs_path);
-}
-
-fn cacheRootfsByDigestPath(
-    io: Io,
-    allocator: std.mem.Allocator,
-    cache_root: []const u8,
-    rootfs_path: []const u8,
-) !spore.RootfsArtifactRef {
-    return rootfs_cache.cacheByDigestPath(io, allocator, cache_root, rootfs_path);
+    return rootfs_cache.cacheByDigestPath(init.io, allocator, cache_root, rootfs_path);
 }
 
 fn regularFileNoSymlink(io: Io, path: []const u8) !bool {
@@ -1562,10 +1553,6 @@ fn regularFileNoSymlink(io: Io, path: []const u8) !bool {
         else => |e| return e,
     };
     return stat.kind == .file;
-}
-
-fn digestRootfsPath(allocator: std.mem.Allocator, cache_root: []const u8, digest: []const u8) ![]const u8 {
-    return rootfs_cache.digestPath(allocator, cache_root, digest);
 }
 
 fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
@@ -3230,7 +3217,7 @@ test "rootfs digest cache verifies exact bytes" {
     try Io.Dir.cwd().createDirPath(io, tmp);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
-    const artifact = try cacheRootfsByDigestPath(io, arena, cache_root, rootfs_path);
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     try std.testing.expect(std.mem.startsWith(u8, artifact.digest, spore.rootfs_digest_prefix));
     try std.testing.expectEqual(@as(u64, "rootfs bytes".len), artifact.size);
 
@@ -3238,7 +3225,7 @@ test "rootfs digest cache verifies exact bytes" {
     const fd = try rootfs_cache.openVerifiedFromCache(io, arena, cache_root, rootfs);
     _ = std.c.close(fd);
 
-    const digest_path = try digestRootfsPath(arena, cache_root, artifact.digest);
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
     const stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(stat.permissions) & 0o777)));
 
@@ -3294,7 +3281,7 @@ test "explicit rootfs input can record exact immutable identity" {
     try std.testing.expectEqual(@as(u32, 1), resolved.rootfs.?.device.mmio_slot);
     try std.testing.expectEqual(@as(u64, "rootfs bytes".len), resolved.rootfs.?.artifact.size);
 
-    const digest_path = try digestRootfsPath(arena, absolute_cache_root, resolved.rootfs.?.artifact.digest);
+    const digest_path = try rootfs_cache.digestPath(arena, absolute_cache_root, resolved.rootfs.?.artifact.digest);
     try Io.Dir.cwd().access(io, digest_path, .{ .read = true });
     const source_stat = try Io.Dir.cwd().statFile(io, rootfs_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@intFromEnum(source_stat.permissions) & 0o777)));
@@ -3314,14 +3301,14 @@ test "rootfs digest cache rejects unsafe existing paths" {
     try Io.Dir.cwd().createDirPath(io, tmp);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
-    const artifact = try cacheRootfsByDigestPath(io, arena, cache_root, rootfs_path);
-    const digest_path = try digestRootfsPath(arena, cache_root, artifact.digest);
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
     try Io.Dir.cwd().deleteFile(io, digest_path);
     const digest_z = try arena.dupeZ(u8, digest_path);
     const rootfs_z = try arena.dupeZ(u8, rootfs_path);
     if (std.c.symlink(rootfs_z, digest_z) != 0) return error.SkipZigTest;
 
-    try std.testing.expectError(error.RootFSDigestMismatch, cacheRootfsByDigestPath(io, arena, cache_root, rootfs_path));
+    try std.testing.expectError(error.RootFSDigestMismatch, rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path));
 }
 
 test "run image cache creates absolute cache directories" {
