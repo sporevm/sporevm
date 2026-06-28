@@ -51,10 +51,10 @@ pub const Config = struct {
     resume_dir: ?[]const u8 = null,
     /// Optional pre-refreshed generation state for product resume attach.
     resume_generation: ?generation.State = null,
-    /// Proof-validated or harness-supplied same-host RAM backing fd. The fd
-    /// must refer to the manifest's optional RAM backing and is mapped
-    /// MAP_PRIVATE; imported or unproven spores must leave this null so RAM is
-    /// materialized through verified chunks.
+    /// Proof-validated same-host RAM backing fd. The fd must refer to the
+    /// manifest's optional RAM backing and is mapped MAP_PRIVATE; imported or
+    /// unproven spores must leave this null so RAM is materialized through
+    /// verified chunks.
     ram_backing_fd: ?std.c.fd_t = null,
     /// Product callers provide their environment so snapshot code can write
     /// local-only RAM backing proofs under the configured runtime root.
@@ -75,9 +75,9 @@ pub const Config = struct {
     capture_request: ?*capture.Request = null,
     /// Continue running after a host-requested capture instead of stopping.
     continue_after_capture: bool = false,
-    /// Opt-in KVM dirty-log capture path for Slice 7 measurement. When
-    /// enabled, guest writes are collected in epochs and snapshot only needs a
-    /// final dirty-log tail flush instead of a full RAM scan.
+    /// Opt-in KVM dirty-log capture path. When enabled, guest writes are
+    /// collected in epochs and snapshot only needs a final dirty-log tail flush
+    /// instead of a full RAM scan.
     dirty_tracking: DirtyTrackingOptions = .{},
     /// Optional minimal host-initiated vsock stream used by benchmark harnesses.
     exec_probe: ?*vsock.HostStream = null,
