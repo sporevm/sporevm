@@ -47,7 +47,10 @@ load_github_token() {
 
   if [[ -z "${GITHUB_TOKEN:-}" ]]; then
     github_token="$(normalize_secret_value "$(fetch_optional_secret SPOREVM_GITHUB_RELEASE_TOKEN)")"
-    [[ -n "${github_token}" ]] || die "GITHUB_TOKEN or Buildkite secret SPOREVM_GITHUB_RELEASE_TOKEN is required"
+    if [[ -z "${github_token}" ]]; then
+      github_token="$(normalize_secret_value "$(fetch_optional_secret SPOREVM_GITHUB_TOKEN)")"
+    fi
+    [[ -n "${github_token}" ]] || die "GITHUB_TOKEN or Buildkite secret SPOREVM_GITHUB_RELEASE_TOKEN or SPOREVM_GITHUB_TOKEN is required"
     export GITHUB_TOKEN="${github_token}"
   fi
 
