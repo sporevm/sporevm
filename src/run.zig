@@ -1438,7 +1438,7 @@ fn resolvedImageRootfsInput(
         .guest_env = run_config.env,
         .guest_working_dir = run_config.working_dir,
     };
-    const artifact = try cacheRootfsByDigest(init, allocator, cache_root, rootfs_path);
+    const artifact = try rootfs_cache.cacheByDigestPath(init.io, allocator, cache_root, rootfs_path);
     const rootfs_device = spore.RootfsDevice{ .mmio_slot = 1 };
     const storage = try rootfs_mod.ensureImageRootfsStorage(init, allocator, cache_root, resolved, artifact, rootfs_device);
     const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch });
@@ -1536,15 +1536,6 @@ fn monotonicMs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
-}
-
-fn cacheRootfsByDigest(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    cache_root: []const u8,
-    rootfs_path: []const u8,
-) !spore.RootfsArtifactRef {
-    return rootfs_cache.cacheByDigestPath(init.io, allocator, cache_root, rootfs_path);
 }
 
 fn regularFileNoSymlink(io: Io, path: []const u8) !bool {
