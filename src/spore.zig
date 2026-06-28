@@ -134,10 +134,28 @@ pub const LocalBackingRestoreSource = enum {
     chunks,
 };
 
+pub const LocalBackingRestoreReason = enum {
+    not_attempted,
+    no_backing,
+    bad_backing_metadata,
+    backing_unavailable,
+    backing_stat_failed,
+    backing_size_mismatch,
+    proof_unavailable,
+    proof_invalid,
+    key_unavailable,
+    proof_mismatch,
+    proof_mac_invalid,
+    proof_mac_mismatch,
+    verity_unavailable,
+    verity_mismatch,
+    proof_valid,
+};
+
 pub const LocalBackingPlan = struct {
     fd: ?std.c.fd_t = null,
     source: LocalBackingRestoreSource = .chunks,
-    reason: []const u8 = "not_attempted",
+    reason: LocalBackingRestoreReason = .not_attempted,
 };
 
 const LocalBackingProof = struct {
@@ -471,7 +489,7 @@ fn fstatLocalFile(fd: std.c.fd_t) Error!LocalFileStat {
     }
 }
 
-fn localBackingChunksPlan(reason: []const u8) LocalBackingPlan {
+fn localBackingChunksPlan(reason: LocalBackingRestoreReason) LocalBackingPlan {
     return .{ .source = .chunks, .reason = reason };
 }
 
@@ -808,33 +826,33 @@ pub fn openProvenLocalMemoryBacking(
     memory: MemoryManifest,
     expected_size: u64,
 ) Error!LocalBackingPlan {
-    const backing = memory.backing orelse return localBackingChunksPlan("no_backing");
-    validateMemoryBacking(backing, expected_size) catch return localBackingChunksPlan("bad_backing_metadata");
+    const backing = memory.backing orelse return localBackingChunksPlan(.no_backing);
+    validateMemoryBacking(backing, expected_size) catch return localBackingChunksPlan(.bad_backing_metadata);
     const backing_path = try memoryBackingPath(allocator, dir, backing);
-    const fd = openReadOnlyNoFollow(backing_path) catch return localBackingChunksPlan("backing_unavailable");
+    const fd = openReadOnlyNoFollow(backing_path) catch return localBackingChunksPlan(.backing_unavailable);
     var handoff_fd = false;
     defer if (!handoff_fd) {
         _ = std.c.close(fd);
     };
-    const file = (fstatLocalFile(fd) catch return localBackingChunksPlan("backing_stat_failed")).identity();
-    if (file.size != expected_size) return localBackingChunksPlan("backing_size_mismatch");
+    const file = (fstatLocalFile(fd) catch return localBackingChunksPlan(.backing_stat_failed)).identity();
+    if (file.size != expected_size) return localBackingChunksPlan(.backing_size_mismatch);
 
     const proof_path = try pathZ(allocator, "{s}/{s}", .{ dir, ram_backing_proof_path });
-    const proof_bytes = readRegularFileAllNoFollow(allocator, proof_path, local_backing_proof_max_bytes) catch return localBackingChunksPlan("proof_unavailable");
+    const proof_bytes = readRegularFileAllNoFollow(allocator, proof_path, local_backing_proof_max_bytes) catch return localBackingChunksPlan(.proof_unavailable);
     const parsed = std.json.parseFromSlice(LocalBackingProof, allocator, proof_bytes, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
-    }) catch return localBackingChunksPlan("proof_invalid");
+    }) catch return localBackingChunksPlan(.proof_invalid);
     defer parsed.deinit();
 
-    const key = (localBackingKey(allocator, environ, false) catch return localBackingChunksPlan("key_unavailable")) orelse
-        return localBackingChunksPlan("key_unavailable");
+    const key = (localBackingKey(allocator, environ, false) catch return localBackingChunksPlan(.key_unavailable)) orelse
+        return localBackingChunksPlan(.key_unavailable);
     const memory_fingerprint = try memoryFingerprintHex(allocator, memory, expected_size);
     const proof_backing = proofBackingFromManifest(backing);
-    if (!proofFieldsMatch(parsed.value, memory_fingerprint, proof_backing, file)) return localBackingChunksPlan("proof_mismatch");
-    if (parsed.value.mac.len != HmacSha256.mac_length * 2) return localBackingChunksPlan("proof_mac_invalid");
+    if (!proofFieldsMatch(parsed.value, memory_fingerprint, proof_backing, file)) return localBackingChunksPlan(.proof_mismatch);
+    if (parsed.value.mac.len != HmacSha256.mac_length * 2) return localBackingChunksPlan(.proof_mac_invalid);
     var actual_mac: [HmacSha256.mac_length]u8 = undefined;
-    _ = std.fmt.hexToBytes(&actual_mac, parsed.value.mac) catch return localBackingChunksPlan("proof_mac_invalid");
+    _ = std.fmt.hexToBytes(&actual_mac, parsed.value.mac) catch return localBackingChunksPlan(.proof_mac_invalid);
     const expected_mac = try proofMac(
         &key,
         memory_fingerprint,
@@ -844,17 +862,17 @@ pub fn openProvenLocalMemoryBacking(
         local_backing_producer,
         parsed.value.verity,
     );
-    if (!std.crypto.timing_safe.eql([HmacSha256.mac_length]u8, actual_mac, expected_mac)) return localBackingChunksPlan("proof_mac_mismatch");
+    if (!std.crypto.timing_safe.eql([HmacSha256.mac_length]u8, actual_mac, expected_mac)) return localBackingChunksPlan(.proof_mac_mismatch);
     if (parsed.value.verity) |proof_verity| {
-        const measured_verity = (try proofVerityForRead(allocator, fd)) orelse return localBackingChunksPlan("verity_unavailable");
+        const measured_verity = (try proofVerityForRead(allocator, fd)) orelse return localBackingChunksPlan(.verity_unavailable);
         if (!std.mem.eql(u8, measured_verity.algorithm, proof_verity.algorithm) or
             !std.mem.eql(u8, measured_verity.digest, proof_verity.digest))
         {
-            return localBackingChunksPlan("verity_mismatch");
+            return localBackingChunksPlan(.verity_mismatch);
         }
     }
     handoff_fd = true;
-    return .{ .fd = fd, .source = .local_backing, .reason = "proof_valid" };
+    return .{ .fd = fd, .source = .local_backing, .reason = .proof_valid };
 }
 
 pub fn validateMemoryBacking(backing: MemoryBacking, expected_size: u64) Error!void {
@@ -1806,7 +1824,7 @@ test "local memory backing proof opens local fd and falls back safely" {
     };
     try std.testing.expectEqual(LocalBackingRestoreSource.local_backing, plan.source);
     try std.testing.expect(plan.fd != null);
-    try std.testing.expectEqualStrings("proof_valid", plan.reason);
+    try std.testing.expectEqual(LocalBackingRestoreReason.proof_valid, plan.reason);
 
     const proof_path = try pathZ(arena, "{s}/{s}", .{ dir, ram_backing_proof_path });
     try writeFileAll(proof_path, "{}");
@@ -1816,7 +1834,7 @@ test "local memory backing proof opens local fd and falls back safely" {
     };
     try std.testing.expectEqual(LocalBackingRestoreSource.chunks, corrupt_plan.source);
     try std.testing.expect(corrupt_plan.fd == null);
-    try std.testing.expectEqualStrings("proof_invalid", corrupt_plan.reason);
+    try std.testing.expectEqual(LocalBackingRestoreReason.proof_invalid, corrupt_plan.reason);
 
     try writeLocalMemoryBackingProof(arena, &env, dir, mm, ram.len);
     const proof_real_path = try pathZ(arena, "{s}/{s}.real", .{ dir, ram_backing_proof_path });
@@ -1828,7 +1846,7 @@ test "local memory backing proof opens local fd and falls back safely" {
     };
     try std.testing.expectEqual(LocalBackingRestoreSource.chunks, symlink_plan.source);
     try std.testing.expect(symlink_plan.fd == null);
-    try std.testing.expectEqualStrings("proof_unavailable", symlink_plan.reason);
+    try std.testing.expectEqual(LocalBackingRestoreReason.proof_unavailable, symlink_plan.reason);
 }
 
 test "local memory backing proof rejects foreign key and manifest mismatch" {
@@ -1858,7 +1876,7 @@ test "local memory backing proof rejects foreign key and manifest mismatch" {
         _ = std.c.close(fd);
     };
     try std.testing.expectEqual(LocalBackingRestoreSource.chunks, missing_key_plan.source);
-    try std.testing.expectEqualStrings("key_unavailable", missing_key_plan.reason);
+    try std.testing.expectEqual(LocalBackingRestoreReason.key_unavailable, missing_key_plan.reason);
 
     _ = try localBackingKey(arena, &env_b, true);
     const foreign_key_plan = try openProvenLocalMemoryBacking(arena, &env_b, dir, mm, ram.len);
@@ -1866,7 +1884,7 @@ test "local memory backing proof rejects foreign key and manifest mismatch" {
         _ = std.c.close(fd);
     };
     try std.testing.expectEqual(LocalBackingRestoreSource.chunks, foreign_key_plan.source);
-    try std.testing.expectEqualStrings("proof_mac_mismatch", foreign_key_plan.reason);
+    try std.testing.expectEqual(LocalBackingRestoreReason.proof_mac_mismatch, foreign_key_plan.reason);
 
     var refs = try arena.alloc(?[]const u8, mm.chunks.len);
     @memcpy(refs, mm.chunks);
@@ -1878,7 +1896,7 @@ test "local memory backing proof rejects foreign key and manifest mismatch" {
         _ = std.c.close(fd);
     };
     try std.testing.expectEqual(LocalBackingRestoreSource.chunks, mismatch_plan.source);
-    try std.testing.expectEqualStrings("proof_mismatch", mismatch_plan.reason);
+    try std.testing.expectEqual(LocalBackingRestoreReason.proof_mismatch, mismatch_plan.reason);
 }
 
 test "local memory backing proof MAC covers verity digest" {

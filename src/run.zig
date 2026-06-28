@@ -206,7 +206,7 @@ pub const Result = struct {
     pub fn withMemoryRestore(self: Result, plan: spore.LocalBackingPlan) Result {
         var result = self;
         result.memory_restore_source = @tagName(plan.source);
-        result.memory_restore_reason = plan.reason;
+        result.memory_restore_reason = @tagName(plan.reason);
         return result;
     }
 };
@@ -2109,7 +2109,7 @@ fn openRunLocalMemoryBacking(
     const parsed = try spore.loadManifest(allocator, dir);
     defer parsed.deinit();
     const local_backing = try spore.openProvenLocalMemoryBacking(allocator, environ, dir, parsed.value.memory, ram_size);
-    std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(local_backing.source), local_backing.reason });
+    std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(local_backing.source), @tagName(local_backing.reason) });
     return local_backing;
 }
 

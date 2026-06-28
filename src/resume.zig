@@ -167,7 +167,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     defer if (local_backing.fd) |fd| {
         _ = std.c.close(fd);
     };
-    std.log.info("resume memory restore source={s} reason={s}", .{ @tagName(local_backing.source), local_backing.reason });
+    std.log.info("resume memory restore source={s} reason={s}", .{ @tagName(local_backing.source), @tagName(local_backing.reason) });
     const cause = switch (backend) {
         .auto => unreachable,
         .hvf => blk: {
