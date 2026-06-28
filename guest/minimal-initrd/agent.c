@@ -74,7 +74,8 @@ static int64_t t_request_decode = 0;
 static int64_t t_command_start = 0;
 static int64_t t_command_exit = 0;
 static int sigchld_pipe[2] = { -1, -1 };
-static const char memory_pressure_trigger[] = "some 10000 100000\n";
+// PSI monitor windows below 500ms are rejected by the kernel.
+static const char memory_pressure_trigger[] = "some 10000 500000\n";
 
 static int path_is_dir(const char *path);
 
