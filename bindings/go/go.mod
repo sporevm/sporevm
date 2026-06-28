@@ -1,3 +1,3 @@
-module github.com/buildkite/sporevm/bindings/go
+module github.com/sporevm/sporevm/bindings/go
 
 go 1.26
