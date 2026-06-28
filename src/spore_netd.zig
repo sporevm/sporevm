@@ -118,7 +118,6 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     tcp_gateway.init(&policy);
     tcp_gateway.emit_events = true;
     const bound_services = opts.policy.boundServiceSlice();
-    if (bound_services.len == 1) tcp_gateway.bindUnixService(bound_services[0].unix_path);
 
     try writeAllFd(2, "ready\n");
     var in_buf: [max_frame_len]u8 = undefined;
