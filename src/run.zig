@@ -937,55 +937,12 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
 
 pub fn networkOptionsFromManifest(allocator: std.mem.Allocator, manifest_network: ?spore.Network) !NetworkOptions {
     const network = manifest_network orelse return .{};
-    try spore.validateNetwork(network);
-    var policy = spore_net_policy.Config{};
-    if (network.default_action) |action| {
-        if (!std.mem.eql(u8, action, spore.network_default_deny)) return error.InvalidNetworkPolicy;
-        policy.default_deny = true;
-    }
-    for (network.allow_cidrs) |cidr| {
-        try policy.addAllowCidr(try allocator.dupe(u8, cidr));
-    }
-    for (network.allow_hosts) |host| {
-        try policy.addAllowHost(try allocator.dupe(u8, host));
-    }
-    for (network.allow_host_ports) |rule| {
-        const host = try allocator.dupe(u8, rule.host);
-        const ports = try allocator.dupe(u16, rule.ports);
-        try policy.addExactHostPorts(host, ports);
-    }
-    if (network.bound_services.len != 0) return error.UnsupportedBoundServiceRestore;
-    return .{ .network = .spore, .policy = policy };
+    return .{ .network = .spore, .policy = try spore_net_policy.configFromManifestNetwork(allocator, network) };
 }
 
 pub fn manifestNetworkFromOptions(allocator: std.mem.Allocator, network: NetworkMode, policy: *const spore_net_policy.Config) !?spore.Network {
     if (network != .spore) return null;
-    const exact_rules = try allocator.alloc(spore.NetworkHostPortRule, policy.exact_rule_count);
-    for (policy.exactRuleSlice(), exact_rules) |*rule, *out| {
-        out.* = .{
-            .host = rule.host,
-            .ports = rule.portSlice(),
-        };
-    }
-    const bound_services = try allocator.alloc(spore.NetworkBoundServiceRequirement, policy.bound_service_count);
-    for (policy.boundServiceSlice(), bound_services) |service, *out| {
-        out.* = .{
-            .name = service.name,
-            .guest_host = service.guest_host,
-            .guest_port = service.guest_port,
-        };
-    }
-    return .{
-        .default_action = if (policy.default_deny) spore.network_default_deny else null,
-        .allow_cidrs = policy.allowCidrSlice(),
-        .allow_hosts = policy.allowHostSlice(),
-        .allow_host_ports = exact_rules,
-        .bound_services = bound_services,
-        .requirements = .{
-            .exact_host_port = policy.default_deny or policy.exact_rule_count != 0,
-            .bound_services = policy.bound_service_count != 0,
-        },
-    };
+    return try spore_net_policy.manifestNetworkFromConfig(allocator, policy);
 }
 
 pub fn resumeRootfsForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Rootfs {
