@@ -31,31 +31,25 @@ ceiling, while host cost is based on touched pages and dirty chunks. `spore ls`
 should make that visible by showing configured memory next to resident memory,
 sparse backing allocation, chunk counts, and pending dirty work.
 
-The dirty-tracking work has landed the fast caught-up suspend model:
-dirty-tracked KVM and HVF snapshots avoid a suspend-time full-RAM scan when the
-dirty tail is small. The remaining automatic-memory blocker is earlier in the
-lifecycle: initial dirty-tracker seeding must not scan every configured RAM
-chunk before the guest runs.
+The product memory contract, sparse fresh-boot seeding, and caught-up suspend
+path have landed. The remaining automatic-memory work is observability and
+evidence: cheap resident/process accounting, nonzero and dirty chunk counters,
+and real-host measurements that prove the 16GiB default stays sparse in normal
+product flows.
 
 ## Problem
 
-The current product CLI uses `--memory-mib` and defaults to 1024MiB for
-`spore run`, `spore create`, and the monitor path. That keeps early tests small,
-but it pushes capacity decisions onto the user and makes VM reuse feel more
-manual than it needs to be.
+The product CLI now uses `--memory VALUE`; omitted memory records `auto` and
+resolves to a 16GiB guest-visible RAM contract. That is only a good default if
+operators can see the difference between configured RAM and host cost.
 
-The VMM already has many of the right mechanics: fresh boot maps RAM with
-private anonymous `mmap`, same-host restore can map `ram.backing` privately,
-memory manifests elide zero chunks, and Slice 7 dirty tracking keeps chunk refs
-and backing files up to date while the VM runs. The remaining product gap is
-that the public CLI, runtime registry, and `spore ls` do not expose memory as a
-large logical contract with small observed host cost.
-
-There is still a scaling trap: initial dirty-tracking seed paths scan every 2MiB
-chunk to initialize chunk refs and `ram.backing`. That is acceptable for small
-defaults, but it makes `auto=16gb` visibly expensive before the guest can do
-useful work. The product default must not land until fresh-boot seeding is based
-on the kernel/initrd/DTB ranges the VMM actually populated.
+The VMM has the right sparse mechanics: fresh boot maps RAM with private
+anonymous `mmap`, sparse dirty seeding starts from boot-populated ranges,
+same-host restore can use proof-gated `ram.backing`, memory manifests elide zero
+chunks, and dirty tracking keeps chunk refs and backing files up to date while
+the VM runs. The remaining product gap is that `spore ls` still lacks cheap
+resident memory, nonzero chunk, and pending dirty counters, and the plan still
+needs current real-host evidence for the 16GiB product path.
 
 ## Goals
 
@@ -206,7 +200,7 @@ best-effort scans.
 - `spore resume` derives RAM size from `manifest.platform.ram_size`.
 - KVM and HVF backend configs already accept byte-sized `ram_size`.
 - Fresh KVM/HVF boot maps RAM with demand-committed anonymous private mappings.
-- Trusted same-host resume can map a same-sized `ram.backing` fd with
+- Proof-gated same-host resume can map a same-sized `ram.backing` fd with
   `MAP_PRIVATE`.
 - Memory manifests already store byte-sized platform RAM, 2MiB chunk refs, and
   optional local backing metadata.
@@ -386,7 +380,7 @@ Done when:
   units.
 - Runtime specs store both the user policy and byte-sized resolved memory.
 - `spore --json ls` is the stable machine-readable output. The default output
-  can become a human table.
+  is a human table.
 
 ## Deferred Work
 
@@ -398,6 +392,7 @@ Done when:
 
 ## Open Questions
 
-No blocking questions for Slice 1. Later slices need platform-specific choices
-for exact resident-memory accounting, especially on macOS, but unknown values
-can be represented explicitly until a cheap source is proven.
+No blocking questions for the landed slices. Remaining work needs
+platform-specific choices for exact resident-memory accounting, especially on
+macOS, but unknown values can be represented explicitly until a cheap source is
+proven.
