@@ -294,7 +294,7 @@ pub fn inspectBundle(allocator: std.mem.Allocator, options: InspectBundleOptions
     return .{
         .source = options.source,
         .bundle_dir = bundle_dir,
-        .bundle_digest = digestRef(bundle_digest),
+        .bundle_digest = contracts.digestRef(bundle_digest),
         .indexed = false,
         .parent_manifest = parent_manifest,
         .chunkpack_index = chunkpack_index,
@@ -325,7 +325,7 @@ fn inspectIndexedBundle(
     return .{
         .source = options.source,
         .bundle_dir = bundle_dir,
-        .bundle_digest = digestRef(bundle_digest),
+        .bundle_digest = contracts.digestRef(bundle_digest),
         .indexed = true,
         .parent_manifest = parent_manifest,
         .chunkpack_index = chunkpack_index,
@@ -359,10 +359,6 @@ fn ensureInspectableBundlePath(allocator: std.mem.Allocator, bundle_dir: []const
         };
     }
     _ = std.c.close(fd);
-}
-
-fn digestRef(hex: []const u8) DigestRef {
-    return contracts.digestRef(hex);
 }
 
 fn summarizeChunkpack(allocator: std.mem.Allocator, index: Index) Error!ChunkpackSummary {
@@ -931,7 +927,7 @@ fn pullLocalIndexedBundle(
         .source = source,
         .bundle_dir = bundle_dir,
         .out_dir = options.out_dir,
-        .bundle_digest = digestRef(bundle_digest),
+        .bundle_digest = contracts.digestRef(bundle_digest),
         .materialization = .{
             .chunk_count = plan.chunk_count,
             .materialized_chunk_count = materialized.materialized_chunk_count,
