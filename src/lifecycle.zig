@@ -2560,10 +2560,11 @@ fn parseIntArgLifecycleCli(
 pub fn monitorBackendSupported(raw: []const u8) bool {
     const hvf_supported = comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
     const kvm_supported = comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64;
-    if (std.mem.eql(u8, raw, "auto")) return hvf_supported or kvm_supported;
-    if (std.mem.eql(u8, raw, "hvf")) return hvf_supported;
-    if (std.mem.eql(u8, raw, "kvm")) return kvm_supported;
-    return false;
+    return switch (run_mod.Backend.parse(raw) orelse return false) {
+        .auto => hvf_supported or kvm_supported,
+        .hvf => hvf_supported,
+        .kvm => kvm_supported,
+    };
 }
 
 pub fn wantsNamedFork(args: []const []const u8) bool {
