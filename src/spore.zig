@@ -1464,13 +1464,7 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
             try symlinkPath(objects, try pathZ(allocator, "{s}/diskobjects", .{child_dir}));
         }
         var child = parent;
-        if (shared_backing == null) child.memory.backing = null;
-        if (child.memory.backing) |backing| {
-            const backing_link = try pathZ(allocator, "{s}/{s}", .{ child_dir, backing.path });
-            hardlinkPath(shared_backing.?, backing_link) catch {
-                child.memory.backing = null;
-            };
-        }
+        try prepareForkChildBacking(allocator, child_dir, &child, shared_backing, options.environ_map);
 
         const child_generation = parent.generation.generation + i + 1;
         const identity = try childIdentity(allocator, fork_batch_id, i);
@@ -1495,11 +1489,6 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
             .params_b64 = params_b64,
         };
         child.machine.gic = try forkGicState(allocator, parent.machine.gic);
-        if (child.memory.backing != null) {
-            if (options.environ_map) |environ| {
-                writeLocalMemoryBackingProof(allocator, environ, child_dir, child.memory, child.platform.ram_size) catch {};
-            }
-        }
         try saveManifest(allocator, child_dir, child);
     }
 
@@ -1514,6 +1503,38 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
         .last_generation = parent.generation.generation + options.count,
         .first_child = first_child,
         .last_child = last_child,
+    };
+}
+
+fn prepareForkChildBacking(
+    allocator: std.mem.Allocator,
+    child_dir: []const u8,
+    child: *Manifest,
+    shared_backing: ?[]const u8,
+    maybe_environ: ?*const std.process.Environ.Map,
+) Error!void {
+    const backing = child.memory.backing orelse return;
+    const source = shared_backing orelse {
+        child.memory.backing = null;
+        return;
+    };
+    const backing_link = try pathZ(allocator, "{s}/{s}", .{ child_dir, backing.path });
+    hardlinkPath(source, backing_link) catch {
+        child.memory.backing = null;
+        return;
+    };
+    const environ = maybe_environ orelse {
+        _ = std.c.unlink(backing_link.ptr);
+        child.memory.backing = null;
+        return;
+    };
+    writeLocalMemoryBackingProof(allocator, environ, child_dir, child.memory, child.platform.ram_size) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            _ = std.c.unlink(backing_link.ptr);
+            child.memory.backing = null;
+            return;
+        },
     };
 }
 
@@ -2943,6 +2964,35 @@ test "fork does not mint child backing proof from unproven parent backing" {
     @memset(out, 0);
     try loadMemory(arena, child_dir, child.value.memory, out);
     try std.testing.expectEqualSlices(u8, ram, out);
+}
+
+test "fork drops child backing when child proof write fails" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const child_dir = try pathZ(arena, "{s}/child", .{root_dir});
+    const runtime_dir = try pathZ(arena, "{s}/runtime-file", .{root_dir});
+    try ensureNewDir(child_dir);
+    try writeFileAll(runtime_dir, "not a directory");
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.runtime_dir_env, runtime_dir);
+
+    const ram = try arena.alloc(u8, chunk_size);
+    @memset(ram, 0x35);
+    const memory = try saveMemoryWithBacking(arena, parent_dir, ram);
+    var child = testForkManifest(memory, ram.len, 12);
+    const parent_backing = try memoryBackingPath(arena, parent_dir, memory.backing.?);
+    const shared_backing = try realpathAlloc(arena, parent_backing);
+
+    try prepareForkChildBacking(arena, child_dir, &child, shared_backing, &env);
+
+    try std.testing.expect(child.memory.backing == null);
+    try std.testing.expectEqual(@as(c_int, -1), std.c.access(try pathZ(arena, "{s}/{s}", .{ child_dir, ram_backing_path }), 0));
 }
 
 test "fork drops stale optional memory backing" {

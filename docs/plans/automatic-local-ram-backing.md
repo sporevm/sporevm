@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-28
+last_reviewed: 2026-06-29
 spec_refs:
   - docs/memory.md
   - docs/plans/automatic-memory.md
@@ -139,8 +139,8 @@ Capture and fork behavior:
 - `spore fork` first validates the parent's local proof. When it passes and the
   filesystem supports hard links, fork hard-links `ram.backing` into each child
   and writes a child-local proof for the child's manifest.
-- If hard-linking fails, fork should omit child backing metadata and let resume
-  use chunks.
+- If hard-linking or child proof writing fails, fork should omit child backing
+  metadata and let resume use chunks.
 
 ## Safety Model
 
@@ -264,7 +264,7 @@ Done when:
 - Unit tests for memory fingerprinting, proof MAC validation, bad proof fallback,
   wrong manifest fallback, foreign-key fallback, and symlinked proof fallback.
 - Fork tests that children get hard-linked backing plus child-local proof, or no
-  backing metadata when hard-linking is unavailable.
+  backing metadata when hard-linking or child proof writing is unavailable.
 - Tests that proof validation ignores link count and ctime but rejects wrong
   inode, owner, size, memory fingerprint, or MAC.
 - Product smokes:

@@ -35,8 +35,8 @@ can be shared by the host; guest writes fault into private CoW pages. This is
 the same-host fork/fan-out fast path.
 
 `spore fork` hard-links a proof-valid parent backing file into each child and
-writes child-local proofs. If hard-linking or proof validation fails, children
-omit backing metadata and resume from chunks.
+writes child-local proofs. If hard-linking, parent proof validation, or child
+proof writing fails, children omit backing metadata and resume from chunks.
 
 `spore pack`, `spore unpack`, and `spore pull` remain chunk-authoritative.
 Bundles must not treat proof files as distribution authority.
