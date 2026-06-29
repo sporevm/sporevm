@@ -728,7 +728,13 @@ pub const CliOptions = struct {
     network_requested: bool = false,
     network_policy: spore_net_policy.Config = .{},
     event_mode: EventMode = .none,
+    command_mode: CommandMode = .argv,
     command: []const []const u8,
+};
+
+pub const CommandMode = enum {
+    argv,
+    shell,
 };
 
 pub const NetworkOptions = struct {
@@ -738,13 +744,14 @@ pub const NetworkOptions = struct {
 
 pub const cli_usage =
     \\Usage:
+    \\  spore run [--kernel Image] [--initrd root.cpio] [options] 'shell command'
     \\  spore run [--kernel Image] [--initrd root.cpio] [options] -- <argv...>
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --kernel Image          Kernel Image path (default: managed SporeVM kernel)
     \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
-    \\  --from DIR              Resume from an existing spore, then run argv
+    \\  --from DIR              Resume from an existing spore, then run command
     \\  --rootfs rootfs.ext4    Attach local rootfs read-only; capture unsupported
     \\  --image REF             Build or reuse cached OCI rootfs; capture preserves rootfs writes
     \\  --pull=missing|always|never
@@ -764,6 +771,7 @@ pub const cli_usage =
     \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
     \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
+    \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
     \\
 ;
@@ -783,11 +791,13 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var network_requested = false;
     var network_policy = spore_net_policy.Config{};
     var event_mode: EventMode = .none;
+    var command_mode: CommandMode = .shell;
     var command: ?[]const []const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--")) {
+            command_mode = .argv;
             command = args[i + 1 ..];
             break;
         } else if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
@@ -931,7 +941,18 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .network_requested = network_requested,
         .network_policy = network_policy,
         .event_mode = event_mode,
+        .command_mode = command_mode,
         .command = argv,
+    };
+}
+
+pub fn cliGuestCommand(allocator: std.mem.Allocator, opts: CliOptions) ![]const []const u8 {
+    return switch (opts.command_mode) {
+        .argv => opts.command,
+        .shell => {
+            if (opts.command.len != 1) return error.ShellCommandArgumentCountUnsupported;
+            return allocator.dupe([]const u8, &.{ "/bin/sh", "-lc", opts.command[0] });
+        },
     };
 }
 
@@ -2708,8 +2729,48 @@ test "run cli parser accepts command after separator" {
     try std.testing.expectEqual(Backend.hvf, opts.backend);
     try std.testing.expectEqualStrings("Image", opts.shared.kernel_path.?);
     try std.testing.expectEqualStrings("root.cpio", opts.shared.initrd_path.?);
+    try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
+}
+
+test "run cli parser accepts shell command without separator" {
+    const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "echo hi" });
+    try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", opts.image_ref.?);
+    try std.testing.expectEqual(CommandMode.shell, opts.command_mode);
+    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
+    try std.testing.expectEqualStrings("echo hi", opts.command[0]);
+}
+
+test "run cli parser accepts shell command with source spore" {
+    const opts = try parseCliArgs(&.{ "--from", "base.spore", "cat /work-ready" });
+    try std.testing.expectEqualStrings("base.spore", opts.from_spore_dir.?);
+    try std.testing.expectEqual(CommandMode.shell, opts.command_mode);
+    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
+    try std.testing.expectEqualStrings("cat /work-ready", opts.command[0]);
+}
+
+test "run cli guest command wraps shell command" {
+    const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "echo hi" });
+    const argv = try cliGuestCommand(std.testing.allocator, opts);
+    defer std.testing.allocator.free(argv);
+    try std.testing.expectEqual(@as(usize, 3), argv.len);
+    try std.testing.expectEqualStrings("/bin/sh", argv[0]);
+    try std.testing.expectEqualStrings("-lc", argv[1]);
+    try std.testing.expectEqualStrings("echo hi", argv[2]);
+}
+
+test "run cli guest command keeps exact argv" {
+    const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "--", "/bin/echo", "hi" });
+    const argv = try cliGuestCommand(std.testing.allocator, opts);
+    try std.testing.expectEqual(@as(usize, 2), argv.len);
+    try std.testing.expectEqualStrings("/bin/echo", argv[0]);
+    try std.testing.expectEqualStrings("hi", argv[1]);
+}
+
+test "run cli guest command rejects unquoted shell words" {
+    const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "echo", "hi" });
+    try std.testing.expectError(error.ShellCommandArgumentCountUnsupported, cliGuestCommand(std.testing.allocator, opts));
 }
 
 test "run cli parser allows default boot assets" {
@@ -2719,6 +2780,7 @@ test "run cli parser allows default boot assets" {
     try std.testing.expect(opts.shared.initrd_path == null);
     try std.testing.expectEqual(memory_config.Policy.auto, opts.shared.memory.policy);
     try std.testing.expectEqual(memory_config.auto_bytes, opts.shared.memory.bytes);
+    try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
 }
@@ -2778,6 +2840,7 @@ test "run cli parser accepts image ref" {
     try std.testing.expect(opts.rootfs_path == null);
     try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", opts.image_ref.?);
     try std.testing.expectEqual(PullPolicy.missing, opts.pull_policy);
+    try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 2), opts.command.len);
     try std.testing.expectEqualStrings("/bin/echo", opts.command[0]);
     try std.testing.expectEqualStrings("hi", opts.command[1]);
@@ -2841,6 +2904,7 @@ test "run cli parser accepts source spore" {
     try std.testing.expectEqualStrings("base.spore", opts.from_spore_dir.?);
     try std.testing.expect(opts.rootfs_path == null);
     try std.testing.expect(opts.image_ref == null);
+    try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
 }

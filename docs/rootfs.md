@@ -36,16 +36,16 @@ spore run --rootfs rootfs.ext4 -- /bin/echo hi
 ```
 
 For the direct convenience path, ordinary `spore run --image` resolves the image
-ref, builds or reuses a cached ext4 rootfs, and runs the explicit command with
-the rootfs attached read-only:
+ref, builds or reuses a cached ext4 rootfs, and runs a command with the rootfs
+attached read-only:
 
 ```bash
-spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
+spore run --image docker.io/library/alpine:3.20 'echo hi'
 ```
 
-`--image` runs the explicit argv after `--`, with OCI image `Env` and
-`WorkingDir` applied when present. It does not apply OCI Entrypoint, Cmd, or
-User.
+Without `--`, the command runs as `/bin/sh -lc` in the guest. Use
+`-- <argv...>` for exact argv. `--image` applies OCI image `Env` and
+`WorkingDir` when present. It does not apply OCI Entrypoint, Cmd, or User.
 
 Add `--capture` to make rootfs writes part of the spore. The guest still sees a
 normal root filesystem, but writes land in a local COW head and capture seals
@@ -54,9 +54,9 @@ the changed blocks as disk layers:
 ```bash
 spore run --image docker.io/library/alpine:3.20 \
   --capture /tmp/base.spore \
-  -- /bin/sh -lc 'echo warmed > /var/tmp/example'
+  'echo warmed > /var/tmp/example'
 
-spore run --from /tmp/base.spore -- /bin/cat /var/tmp/example
+spore run --from /tmp/base.spore 'cat /var/tmp/example'
 ```
 
 The rootfs cache key includes the resolved digest-pinned image ref, target

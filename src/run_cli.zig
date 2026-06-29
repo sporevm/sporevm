@@ -62,6 +62,11 @@ fn runParsed(
     spore_executable: []const u8,
     debug: bool,
 ) !api.RunResult {
+    const command = run_mod.cliGuestCommand(allocator, parsed) catch |err| switch (err) {
+        error.ShellCommandArgumentCountUnsupported => failRunSetup("spore run: shell command form accepts one command string; quote it or use -- for argv", .{}),
+        else => return err,
+    };
+
     if (parsed.from_spore_dir) |spore_dir| {
         if (parsed.network_requested or parsed.network_policy.hasRules() or parsed.network_policy.hasBoundServices()) {
             failRunSetup("spore run: --from uses the captured network policy; omit --net and network flags", .{});
@@ -72,7 +77,7 @@ fn runParsed(
         }, allocator, .{
             .backend = parsed.backend,
             .spore_dir = spore_dir,
-            .command = parsed.command,
+            .command = command,
             .vcpus = parsed.shared.vcpus,
             .guest_port = parsed.shared.guest_port,
             .timeout_ms = parsed.shared.timeout_ms,
@@ -102,7 +107,7 @@ fn runParsed(
         .rootfs_path = parsed.rootfs_path,
         .image_ref = parsed.image_ref,
         .image_pull_policy = parsed.pull_policy,
-        .command = parsed.command,
+        .command = command,
         .memory = parsed.shared.memory,
         .vcpus = parsed.shared.vcpus,
         .guest_port = parsed.shared.guest_port,

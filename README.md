@@ -120,16 +120,16 @@ Use `spore --debug run ...` for verbose VMM setup and restore logs.
 
 ## Run from an OCI image
 
-Build or reuse a cached ext4 rootfs from an OCI reference, then run an explicit
-argv inside it:
+Build or reuse a cached ext4 rootfs from an OCI reference, then run a shell
+command inside it:
 
 ```bash
-spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
+spore run --image docker.io/library/alpine:3.20 'echo hi'
 ```
 
 `--image` applies OCI `Env` and `WorkingDir` when present. It does not apply
-OCI `Entrypoint`, `Cmd`, or `User`; the command after `--` is always the
-command SporeVM runs.
+OCI `Entrypoint`, `Cmd`, or `User`. Shell commands run as `/bin/sh -lc` in the
+guest. Use `-- <argv...>` when you need exact argv.
 
 Build a reusable rootfs artifact explicitly:
 
@@ -168,16 +168,16 @@ Capture a run when the command exits:
 ```bash
 spore run --image docker.io/library/alpine:3.20 \
   --capture /tmp/base.spore \
-  -- /bin/sh -lc 'echo warmed > /var/tmp/example'
+  'echo warmed > /var/tmp/example'
 ```
 
 Run another command from that completed base spore:
 
 ```bash
-spore run --from /tmp/base.spore -- /bin/cat /var/tmp/example
+spore run --from /tmp/base.spore 'cat /var/tmp/example'
 ```
 
-`--from` resumes the spore and runs a fresh argv through the restored exec
+`--from` resumes the spore and runs a fresh command through the restored exec
 agent. See [docs/filesystem.md](docs/filesystem.md) for rootfs-backed writable
 state and [docs/memory.md](docs/memory.md) for memory restore behavior.
 
