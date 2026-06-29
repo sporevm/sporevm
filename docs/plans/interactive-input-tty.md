@@ -1,6 +1,6 @@
 ---
-status: landed
-last_reviewed: 2026-06-29
+status: active
+last_reviewed: 2026-06-30
 spec_refs:
   - docs/lifecycle.md
   - docs/libspore.md
@@ -155,6 +155,10 @@ different. It must be explicit.
   wrapper over commandless `spore run --from DIR`. Named lifecycle
   `spore attach NAME` remains deferred until the monitor owns retained
   attachable sessions.
+- Implementation is complete locally. The final completion audit on 2026-06-30
+  re-ran `mise run check`, the focused HVF smoke set, and a branch-wide review
+  pass. Cross-backend KVM runtime validation is still pending because the AWS
+  SSO token for the SSM-backed A1/KVM validation path is expired.
 
 ## Target User Model
 
