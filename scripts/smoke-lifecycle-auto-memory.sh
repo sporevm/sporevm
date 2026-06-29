@@ -2,6 +2,7 @@
 set -euo pipefail
 
 die() {
+  failed=1
   echo "error: $*" >&2
   exit 1
 }
@@ -71,7 +72,14 @@ suspended=0
 failed=0
 
 cleanup() {
-  if [[ "${failed}" == "1" || -n "${SPORE_KEEP_SMOKE_WORKDIR:-}" ]]; then
+  local keep=0
+  [[ "${failed}" == "1" || -n "${SPORE_KEEP_SMOKE_WORKDIR:-}" ]] && keep=1
+
+  if [[ "${created}" == "1" && "${suspended}" != "1" && -z "${SPORE_KEEP_SMOKE_WORKDIR:-}" ]]; then
+    env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${keep}" == "1" ]]; then
     echo "smoke:lifecycle-auto-memory kept workdir=${workdir} runtime_dir=${runtime_dir}" >&2
     for log in "${workdir}"/*.stdout "${workdir}"/*.stderr "${workdir}"/*.log; do
       [[ -e "${log}" ]] || continue
@@ -79,9 +87,6 @@ cleanup() {
       tail -120 "${log}" >&2 || true
     done
     return
-  fi
-  if [[ "${created}" == "1" && "${suspended}" != "1" ]]; then
-    env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
   fi
   rm -rf "${runtime_dir}"
   rm -rf "${workdir}"
