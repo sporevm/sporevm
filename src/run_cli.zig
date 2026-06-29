@@ -1,4 +1,4 @@
-//! CLI adapter for `spore run`.
+//! CLI adapters for `spore run` and `spore attach`.
 //!
 //! This module owns argv parsing glue and stdout/stderr serialization. Runtime
 //! behavior flows through `api.zig`.
@@ -18,6 +18,101 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 
     const arena = init.arena.allocator();
     const parsed = try run_mod.parseCliArgs(args);
+    try runParsedCli(init, arena, parsed, stdout);
+}
+
+const attach_usage =
+    \\Usage:
+    \\  spore attach [options] DIR
+    \\
+    \\Options:
+    \\  -i, --interactive       Claim input for a captured stdin-capable session
+    \\  -t, --tty               Attach to a captured terminal session
+    \\  --backend auto|hvf|kvm  Backend to run (default: auto)
+    \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
+    \\  --guest-port N          Guest vsock listen port (default: 10700)
+    \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
+    \\  -h, --help              Show this help
+    \\
+;
+
+pub fn attachCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    if (args.len == 1 and (std.mem.eql(u8, args[0], "help") or std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help"))) {
+        try stdout.writeAll(attach_usage);
+        return;
+    }
+
+    const arena = init.arena.allocator();
+    const run_args = attachRunArgs(arena, args) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => failRunSetup("spore attach: expected options followed by one spore directory\n\n{s}", .{attach_usage}),
+    };
+
+    const parsed = try run_mod.parseCliArgs(run_args);
+    if (parsed.command.len != 0) {
+        failRunSetup("spore attach: commands are not supported; use spore run --from DIR 'command'\n\n{s}", .{attach_usage});
+    }
+    try runParsedCli(init, arena, parsed, stdout);
+}
+
+const AttachArgError = std.mem.Allocator.Error || error{
+    MissingSporeDir,
+    MissingValue,
+    UnexpectedArgument,
+    UnexpectedSeparator,
+};
+
+fn attachRunArgs(allocator: std.mem.Allocator, args: []const []const u8) AttachArgError![]const []const u8 {
+    if (args.len == 0) return error.MissingSporeDir;
+
+    const spore_dir = args[args.len - 1];
+    if (std.mem.startsWith(u8, spore_dir, "-")) return error.MissingSporeDir;
+
+    var i: usize = 0;
+    while (i < args.len - 1) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--")) return error.UnexpectedSeparator;
+        if (isAttachBooleanOption(arg)) continue;
+        if (isAttachEqualsOption(arg)) continue;
+        if (isAttachValueOption(arg)) {
+            i += 1;
+            if (i >= args.len - 1) return error.MissingValue;
+            continue;
+        }
+        return error.UnexpectedArgument;
+    }
+
+    const run_args = try allocator.alloc([]const u8, args.len + 1);
+    run_args[0] = "--from";
+    run_args[1] = spore_dir;
+    @memcpy(run_args[2..], args[0 .. args.len - 1]);
+    return run_args;
+}
+
+fn isAttachBooleanOption(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-i") or
+        std.mem.eql(u8, arg, "--interactive") or
+        std.mem.eql(u8, arg, "-t") or
+        std.mem.eql(u8, arg, "--tty") or
+        std.mem.eql(u8, arg, "-it") or
+        std.mem.eql(u8, arg, "-ti");
+}
+
+fn isAttachValueOption(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--backend") or
+        std.mem.eql(u8, arg, "--timeout-ms") or
+        std.mem.eql(u8, arg, "--guest-port") or
+        std.mem.eql(u8, arg, "--events");
+}
+
+fn isAttachEqualsOption(arg: []const u8) bool {
+    return std.mem.startsWith(u8, arg, "--backend=") or
+        std.mem.startsWith(u8, arg, "--timeout-ms=") or
+        std.mem.startsWith(u8, arg, "--guest-port=") or
+        std.mem.startsWith(u8, arg, "--events=");
+}
+
+fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mod.CliOptions, stdout: *Io.Writer) !void {
     var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "run");
     var raw_output = RawOutputSink{};
     const events: ?api.EventSink = switch (parsed.event_mode) {
@@ -186,4 +281,30 @@ fn runtimeDebugEnabled(args: []const []const u8) bool {
         if (std.mem.eql(u8, arg, "--debug")) return true;
     }
     return false;
+}
+
+test "attach args adapt to commandless run from" {
+    const args = try attachRunArgs(std.testing.allocator, &.{ "--backend", "hvf", "-it", "--events=jsonl", "live.spore" });
+    defer std.testing.allocator.free(args);
+
+    try std.testing.expectEqual(@as(usize, 6), args.len);
+    try std.testing.expectEqualStrings("--from", args[0]);
+    try std.testing.expectEqualStrings("live.spore", args[1]);
+    try std.testing.expectEqualStrings("--backend", args[2]);
+    try std.testing.expectEqualStrings("hvf", args[3]);
+    try std.testing.expectEqualStrings("-it", args[4]);
+    try std.testing.expectEqualStrings("--events=jsonl", args[5]);
+
+    const parsed = try run_mod.parseCliArgs(args);
+    try std.testing.expectEqualStrings("live.spore", parsed.from_spore_dir.?);
+    try std.testing.expect(parsed.interactive);
+    try std.testing.expect(parsed.tty);
+    try std.testing.expectEqual(run_mod.EventMode.jsonl, parsed.event_mode);
+    try std.testing.expectEqual(@as(usize, 0), parsed.command.len);
+}
+
+test "attach args reject commands and separators" {
+    try std.testing.expectError(error.UnexpectedArgument, attachRunArgs(std.testing.allocator, &.{ "live.spore", "echo hi" }));
+    try std.testing.expectError(error.UnexpectedSeparator, attachRunArgs(std.testing.allocator, &.{ "--", "live.spore" }));
+    try std.testing.expectError(error.MissingSporeDir, attachRunArgs(std.testing.allocator, &.{}));
 }

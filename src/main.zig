@@ -28,6 +28,8 @@ const usage =
     \\  rootfs              Build rootfs images from OCI images
     \\  run [options] 'shell command'
     \\                      Boot a throwaway VM and run one command
+    \\  attach [options] <spore-dir>
+    \\                      Attach to a captured live spore session
     \\  resume <spore-dir> [--name NAME]
     \\                      Resume one spore, or resume it as a named VM
     \\  create NAME [options] ['shell command']
@@ -126,6 +128,8 @@ fn runCommand(
         try spore_internal.rootfs_cli.run(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "run")) {
         try spore_internal.run_cli.cli(init, command_args, stdout);
+    } else if (std.mem.eql(u8, command, "attach")) {
+        try spore_internal.run_cli.attachCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "resume")) {
         if (wantsNamedResume(command_args)) {
             try spore_internal.lifecycle.resumeCli(init, command_args, stdout, stderr, mode);
@@ -843,6 +847,7 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "--debug") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "rootfs") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "attach") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "resume") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "create") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "exec") != null);
@@ -901,6 +906,7 @@ test "stable lifecycle commands support global json where output is one document
     try std.testing.expect(supportsJson("rm"));
     try std.testing.expect(supportsJson("resume"));
     try std.testing.expect(supportsJson("suspend"));
+    try std.testing.expect(!supportsJson("attach"));
     try std.testing.expect(!supportsJson("exec"));
 }
 

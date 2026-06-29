@@ -1,5 +1,5 @@
 ---
-status: active
+status: landed
 last_reviewed: 2026-06-29
 spec_refs:
   - docs/lifecycle.md
@@ -109,6 +109,9 @@ different. It must be explicit.
 - The named monitor already has a backend-neutral wake/poll hook that can attach
   a `HostStream` to a running VM. That hook should be reused for later streaming
   named exec instead of adding a second monitor transport.
+- Named create starts detached guest commands with stdio redirected to
+  `/dev/null`; named attach needs a retained session model before it can be a
+  public contract.
 - `guest/minimal-initrd/agent.c` starts children with separate stdout/stderr
   pipes or a resumed file-backed fallback. It does not create a stdin pipe or a
   PTY.
@@ -148,7 +151,10 @@ different. It must be explicit.
   `mise run smoke:lifecycle`, `mise run smoke:lifecycle-tty`, `mise run
   smoke:run-stdin`, `mise run smoke:run-tty`, `mise run smoke:run-attach`, and
   a manual `expect` check for `spore exec -it box -- /bin/sh`.
-- Public `spore attach` remains a future slice.
+- Slice 5 is implemented as `spore attach [options] DIR`, a public convenience
+  wrapper over commandless `spore run --from DIR`. Named lifecycle
+  `spore attach NAME` remains deferred until the monitor owns retained
+  attachable sessions.
 
 ## Target User Model
 
@@ -224,8 +230,10 @@ omitted. Input-capable attach should only work for sessions that were started
 with stdin or TTY support:
 
 ```bash
-spore run -it --from live-shell.spore
+spore attach -it live-shell.spore
 ```
+
+`spore attach DIR` is shorthand for commandless `spore run --from DIR`.
 
 If the captured session used non-interactive `/dev/null` stdin, `-i` or `-t`
 attach should fail with a clear error. This keeps capture/fork semantics honest:
@@ -551,7 +559,7 @@ Scope:
 Done when:
 
 - a shell started with `spore run -it --capture-on USR1 --continue-after-capture`
-  can be captured and later attached with `spore run -it --from DIR`;
+  can be captured and later attached with `spore attach -it DIR`;
 - a non-interactive captured command rejects `-i --from DIR` with a clear
   message;
 - forked children can be attached independently, with host attachment state
@@ -586,11 +594,14 @@ Add `spore attach` only after the lower-level attach semantics are proven.
 
 Scope:
 
-- `spore attach NAME` attaches output to the VM's active default session when
-  one exists;
-- `spore attach -i NAME` claims input ownership if the session supports stdin;
-- `spore attach -it NAME` attaches to an active PTY session;
-- output-only attach does not steal input from another client.
+- `spore attach DIR` attaches output to a captured product spore's default
+  session;
+- `spore attach -i DIR` claims input ownership if the captured session supports
+  stdin;
+- `spore attach -it DIR` attaches to a captured PTY session;
+- commands remain explicit through `spore run --from DIR 'command'`;
+- named lifecycle `spore attach NAME` is deferred because current named create
+  stdio is detached and there is no retained default session to attach to.
 
 Done when the command is only a thin CLI wrapper over already-tested attach
 contracts.
