@@ -381,6 +381,14 @@ const ExecServer = struct {
         return run.execRequestWithSession(self.allocator, argv, session_id);
     }
 
+    fn detachedExecRequest(self: *ExecServer, argv: []const []const u8) ![]const u8 {
+        var id_buf: [64]u8 = undefined;
+        const session_id = try std.fmt.bufPrint(&id_buf, "lifecycle-{d}", .{self.next_session_id});
+        self.next_session_id +%= 1;
+        if (self.next_session_id == 0) self.next_session_id = 1;
+        return run.detachedExecRequestWithSession(self.allocator, argv, session_id);
+    }
+
     fn resetExecCapture(self: *ExecServer) void {
         self.stdout_capture_len = 0;
         self.stdout_truncated = false;
@@ -665,18 +673,25 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         try writeAll(server.io, stream, response);
         return false;
     }
-    if (!std.mem.eql(u8, parsed.value.type, "exec")) {
+    const detached = std.mem.eql(u8, parsed.value.type, "start");
+    if (!detached and !std.mem.eql(u8, parsed.value.type, "exec")) {
         try writeControlError(server.io, stream, "unknown control request");
         return false;
     }
     const argv = parsed.value.argv orelse {
-        try writeControlError(server.io, stream, "exec request missing argv");
+        try writeControlError(server.io, stream, "command request missing argv");
         return false;
     };
-    const request = server.execRequest(argv) catch {
-        try writeControlError(server.io, stream, "invalid argv");
-        return false;
-    };
+    const request = if (detached)
+        server.detachedExecRequest(argv) catch {
+            try writeControlError(server.io, stream, "invalid argv");
+            return false;
+        }
+    else
+        server.execRequest(argv) catch {
+            try writeControlError(server.io, stream, "invalid argv");
+            return false;
+        };
     defer server.allocator.free(request);
     const response = server.submitExec(request) catch {
         try writeControlError(server.io, stream, "monitor busy");

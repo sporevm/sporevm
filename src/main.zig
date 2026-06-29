@@ -26,18 +26,18 @@ const usage =
     \\Commands:
     \\  system             Inspect and prune local SporeVM system state
     \\  rootfs              Build rootfs images from OCI images
-    \\  run [--kernel Image] [--initrd root.cpio] [--net] [--allow-cidr CIDR] [--allow-host HOST] -- <argv...>
+    \\  run [options] 'shell command'
     \\                      Boot a throwaway VM and run one command
     \\  resume <spore-dir> [--name NAME]
     \\                      Resume one spore, or resume it as a named VM
-    \\  create NAME [options]
+    \\  create NAME [options] ['shell command']
     \\                      Create a named VM lifecycle target
-    \\  exec NAME -- <argv...>
+    \\  exec NAME 'shell command'
     \\                      Execute a command in a named VM
     \\  rm NAME             Remove a named VM
     \\  suspend NAME --out DIR
     \\                      Checkpoint a named VM into a spore
-    \\  ls                  List named VMs in the local runtime registry
+    \\  ls, ps              List named VMs in the local runtime registry
     \\  version             Print the spore version
     \\  host-info           Print this host's platform facts
     \\  inspect <spore-dir> Print a spore manifest summary
@@ -144,7 +144,7 @@ fn runCommand(
         try spore_internal.lifecycle.rmCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "suspend")) {
         try spore_internal.lifecycle.suspendCli(init, command_args, stdout, stderr, mode);
-    } else if (std.mem.eql(u8, command, "ls")) {
+    } else if (std.mem.eql(u8, command, "ls") or std.mem.eql(u8, command, "ps")) {
         try spore_internal.lifecycle.lsCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "monitor")) {
         try spore_internal.monitor.cli(init, command_args, stdout);
@@ -319,6 +319,7 @@ fn supportsJson(command: []const u8) bool {
         std.mem.eql(u8, command, "host-info") or
         std.mem.eql(u8, command, "inspect") or
         std.mem.eql(u8, command, "ls") or
+        std.mem.eql(u8, command, "ps") or
         std.mem.eql(u8, command, "fork") or
         std.mem.eql(u8, command, "pack") or
         std.mem.eql(u8, command, "unpack") or
@@ -896,6 +897,7 @@ test "stable lifecycle commands support global json where output is one document
     try std.testing.expect(supportsJson("create"));
     try std.testing.expect(supportsJson("fork"));
     try std.testing.expect(supportsJson("ls"));
+    try std.testing.expect(supportsJson("ps"));
     try std.testing.expect(supportsJson("rm"));
     try std.testing.expect(supportsJson("resume"));
     try std.testing.expect(supportsJson("suspend"));

@@ -37,6 +37,7 @@
 #define MAX_WORKDIR_LEN 256
 #define MAX_REQUEST 8192
 #define MAX_FRAME_PAYLOAD 4096
+#define MAX_DETACHED_CHILDREN 32
 #define REPLAY_CAP 65536
 #define SESSION_ID "default"
 #define GEN_PARAMS_MAX 4096
@@ -108,6 +109,11 @@ struct client {
   int fd;
   uint64_t stdout_offset;
   uint64_t stderr_offset;
+};
+
+struct detached_children {
+  pid_t pids[MAX_DETACHED_CHILDREN];
+  int count;
 };
 
 struct generation_monitor {
@@ -996,6 +1002,7 @@ struct run_request {
   uint64_t stderr_offset;
   uint64_t resume_time_unix_ns;
   int memory_pressure;
+  int detached;
   char generation_params[GEN_PARAMS_MAX];
   char arg_storage[MAX_ARGC][MAX_ARG_LEN];
   char *argv[MAX_ARGC + 1];
@@ -1096,6 +1103,10 @@ static int parse_request(const char *req, struct run_request *out) {
     int memory_pressure_rc = parse_bool_field(req, "memory_pressure", &memory_pressure);
     if (memory_pressure_rc < 0) return -1;
     if (memory_pressure_rc > 0) out->memory_pressure = memory_pressure;
+    int detached = 0;
+    int detached_rc = parse_bool_field(req, "detached", &detached);
+    if (detached_rc < 0) return -1;
+    if (detached_rc > 0) out->detached = detached;
   }
   return 0;
 }
@@ -1250,6 +1261,132 @@ static int start_session(struct session *session, const char *session_id, char *
   return 0;
 }
 
+static void wait_child_blocking(pid_t pid) {
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+}
+
+static void reap_detached_children(struct detached_children *children) {
+  int i = 0;
+  while (i < children->count) {
+    int status = 0;
+    pid_t rc = waitpid(children->pids[i], &status, WNOHANG);
+    if (rc == children->pids[i] || (rc < 0 && errno == ECHILD)) {
+      children->count--;
+      if (i < children->count) {
+        children->pids[i] = children->pids[children->count];
+      }
+      continue;
+    }
+    if (rc < 0 && errno == EINTR) continue;
+    i++;
+  }
+}
+
+static void close_fd_if_open(int *fd) {
+  if (*fd >= 0) {
+    close(*fd);
+    *fd = -1;
+  }
+}
+
+static void close_pipe_if_open(int pipefd[2]) {
+  close_fd_if_open(&pipefd[0]);
+  close_fd_if_open(&pipefd[1]);
+}
+
+static void detached_child_fail(int status_fd) {
+  if (status_fd >= 0) {
+    (void)write_all(status_fd, "!", 1);
+  }
+  _exit(127);
+}
+
+static int start_detached(char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, struct detached_children *children) {
+  t_command_start = now_ms();
+  reap_detached_children(children);
+  if (children->count >= MAX_DETACHED_CHILDREN) {
+    t_command_exit = now_ms();
+    return 127;
+  }
+
+  int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+  int start_pipe[2] = { -1, -1 };
+  int exec_pipe[2] = { -1, -1 };
+  if (devnull < 0 || pipe2(start_pipe, O_CLOEXEC) != 0 || pipe2(exec_pipe, O_CLOEXEC) != 0) {
+    close_fd_if_open(&devnull);
+    close_pipe_if_open(start_pipe);
+    close_pipe_if_open(exec_pipe);
+    t_command_exit = now_ms();
+    return 127;
+  }
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(start_pipe[1]);
+    close(exec_pipe[0]);
+    char start_byte = 0;
+    ssize_t sr = 0;
+    do {
+      sr = read(start_pipe[0], &start_byte, 1);
+    } while (sr < 0 && errno == EINTR);
+    if (sr != 1 || start_byte != 1) detached_child_fail(exec_pipe[1]);
+    close(start_pipe[0]);
+    if (dup2(devnull, STDIN_FILENO) < 0 ||
+        dup2(devnull, STDOUT_FILENO) < 0 ||
+        dup2(devnull, STDERR_FILENO) < 0) {
+      detached_child_fail(exec_pipe[1]);
+    }
+    close(devnull);
+    if (use_rootfs) {
+      if (chroot("/mnt/rootfs") != 0) detached_child_fail(exec_pipe[1]);
+    }
+    const char *cwd = working_dir[0] != '\0' ? working_dir : "/";
+    if (chdir(cwd) != 0) detached_child_fail(exec_pipe[1]);
+    char *const empty_env[] = { NULL };
+    execve(argv[0], argv, envp[0] != NULL ? envp : empty_env);
+    detached_child_fail(exec_pipe[1]);
+  }
+
+  close_fd_if_open(&devnull);
+  close_fd_if_open(&start_pipe[0]);
+  close_fd_if_open(&exec_pipe[1]);
+  if (pid < 0) {
+    close_pipe_if_open(start_pipe);
+    close_pipe_if_open(exec_pipe);
+    t_command_exit = now_ms();
+    return 127;
+  }
+
+  if (write_all(start_pipe[1], "\1", 1) != 0) {
+    close_pipe_if_open(start_pipe);
+    close_pipe_if_open(exec_pipe);
+    (void)kill(pid, SIGKILL);
+    wait_child_blocking(pid);
+    t_command_exit = now_ms();
+    return 127;
+  }
+  close_fd_if_open(&start_pipe[1]);
+
+  char failure = 0;
+  ssize_t n = 0;
+  do {
+    n = read(exec_pipe[0], &failure, 1);
+  } while (n < 0 && errno == EINTR);
+  close_fd_if_open(&exec_pipe[0]);
+  if (n != 0) {
+    (void)kill(pid, SIGKILL);
+    wait_child_blocking(pid);
+    t_command_exit = now_ms();
+    return 127;
+  }
+
+  children->pids[children->count++] = pid;
+  t_command_exit = now_ms();
+  return 0;
+}
+
 static int session_finished(const struct session *session) {
   return session->started && session->exited && !session->stdout_open && !session->stderr_open;
 }
@@ -1399,7 +1536,7 @@ static void maybe_send_memory_pressure(struct session *session, struct client *c
   }
 }
 
-static void accept_request(int listener, struct session *session, struct client *client, int use_rootfs, int rootfs_ready, const char *rootfs_error, int network_requested, int network_ready, const char *network_error) {
+static void accept_request(int listener, struct session *session, struct client *client, struct detached_children *detached, int use_rootfs, int rootfs_ready, const char *rootfs_error, int network_requested, int network_ready, const char *network_error) {
   int conn = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
   if (conn < 0) {
     if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -1445,6 +1582,28 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (request.kind == REQUEST_START) {
+    if (use_rootfs && !rootfs_ready) {
+      (void)send_error_exit(client->fd, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
+      close_client(client);
+      return;
+    }
+    if (network_requested && !network_ready) {
+      (void)send_error_exit(client->fd, 126, network_error[0] != '\0' ? network_error : "spore run: network unavailable\n");
+      close_client(client);
+      return;
+    }
+    apply_resume_clock(request.resume_time_unix_ns);
+    if (request.detached) {
+      int rc = start_detached(request.argv, request.envp, request.working_dir, use_rootfs, detached);
+      if (rc != 0) {
+        (void)send_error_exit(client->fd, rc, "spore run: exec setup failed\n");
+        close_client(client);
+        return;
+      }
+      (void)send_exit_frame(client->fd, 0);
+      close_client(client);
+      return;
+    }
     int file_stdio = 0;
     if (session->started) {
       if (strcmp(request.session_id, session->session_id) == 0) {
@@ -1460,17 +1619,6 @@ static void accept_request(int listener, struct session *session, struct client 
       file_stdio = 1;
       reset_session(session);
     }
-    if (use_rootfs && !rootfs_ready) {
-      (void)send_error_exit(client->fd, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
-      close_client(client);
-      return;
-    }
-    if (network_requested && !network_ready) {
-      (void)send_error_exit(client->fd, 126, network_error[0] != '\0' ? network_error : "spore run: network unavailable\n");
-      close_client(client);
-      return;
-    }
-    apply_resume_clock(request.resume_time_unix_ns);
     int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs, file_stdio, request.memory_pressure);
     if (rc != 0) {
       (void)send_error_exit(client->fd, rc, "spore run: exec setup failed\n");
@@ -1560,12 +1708,15 @@ int main(void) {
   struct client client;
   memset(&client, 0, sizeof(client));
   client.fd = -1;
+  struct detached_children detached;
+  memset(&detached, 0, sizeof(detached));
   struct generation_monitor generation;
   memset(&generation, 0, sizeof(generation));
   generation.last_generation = UINT64_MAX;
   const char *generation_root = generation_root_path(use_rootfs, rootfs_ready);
 
   for (;;) {
+    reap_detached_children(&detached);
     if (!use_rootfs || rootfs_ready) {
       poll_generation(&generation, generation_root);
     }
@@ -1619,7 +1770,7 @@ int main(void) {
       for (nfds_t i = 0; i < nfds; i++) {
         if (fds[i].revents == 0) continue;
         if (roles[i] == 0 && (fds[i].revents & POLLIN)) {
-          accept_request(listener, &session, &client, use_rootfs, rootfs_ready, rootfs_error, use_network, network_ready, network_error);
+          accept_request(listener, &session, &client, &detached, use_rootfs, rootfs_ready, rootfs_error, use_network, network_ready, network_error);
         } else if (roles[i] == 1 && (fds[i].revents & (POLLHUP | POLLERR))) {
           close_client(&client);
         } else if (roles[i] == 2) {
@@ -1628,6 +1779,7 @@ int main(void) {
           pump_session_stream(&session, &client, 0);
         } else if (roles[i] == 4) {
           drain_sigchld_wakeup();
+          reap_detached_children(&detached);
         } else if (roles[i] == 5 && (fds[i].revents & (POLLPRI | POLLERR))) {
           maybe_send_memory_pressure(&session, &client);
         }

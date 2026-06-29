@@ -238,15 +238,16 @@ pub const ManagedRunOptions = struct {
     events: ?EventSink = null,
 };
 
-/// Run a command from a captured spore directory.
+/// Run a command from a captured spore directory, or attach to its default session.
 ///
 /// This is the product API for `spore run --from`: it reads the manifest,
 /// restores machine/rootfs/disk policy from the capture, then executes a new
-/// guest command.
+/// guest command. Empty `command` attaches to the captured default session.
 pub const RunFromSporeOptions = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
     /// Guest command and arguments. The first element is the executable.
+    /// Leave empty to attach to the captured default session.
     command: []const []const u8,
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
@@ -796,7 +797,7 @@ pub fn runManaged(
 }
 
 /// Restore machine inputs from an existing spore directory and execute a new
-/// guest command.
+/// guest command, or attach when the command is empty.
 pub fn runFromSpore(
     context: Context,
     allocator: std.mem.Allocator,

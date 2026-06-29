@@ -5,7 +5,7 @@ a closed endpoint. With `--net`, SporeVM starts a hidden `spore-netd` helper and
 connects the existing virtio-net device to a SporeVM-owned userspace gateway.
 
 ```bash
-spore run --net --image docker.io/library/alpine:3.20 -- /bin/wget -qO- https://example.com
+spore run --net --image docker.io/library/alpine:3.20 'wget -qO- https://example.com'
 ```
 
 There is no TAP, bridge, host NAT, or published-port contract in the default

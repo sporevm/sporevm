@@ -746,12 +746,14 @@ pub const cli_usage =
     \\Usage:
     \\  spore run [--kernel Image] [--initrd root.cpio] [options] 'shell command'
     \\  spore run [--kernel Image] [--initrd root.cpio] [options] -- <argv...>
+    \\  spore run --from DIR [options] ['shell command']
+    \\  spore run --from DIR [options] -- <argv...>
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --kernel Image          Kernel Image path (default: managed SporeVM kernel)
     \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
-    \\  --from DIR              Resume from an existing spore, then run command
+    \\  --from DIR              Resume from an existing spore; omit command to attach
     \\  --rootfs rootfs.ext4    Attach local rootfs read-only; capture unsupported
     \\  --image REF             Build or reuse cached OCI rootfs; capture preserves rootfs writes
     \\  --pull=missing|always|never
@@ -792,12 +794,14 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var network_policy = spore_net_policy.Config{};
     var event_mode: EventMode = .none;
     var command_mode: CommandMode = .shell;
+    var command_had_delimiter = false;
     var command: ?[]const []const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--")) {
             command_mode = .argv;
+            command_had_delimiter = true;
             command = args[i + 1 ..];
             break;
         } else if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
@@ -880,7 +884,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     }
 
     const argv = command orelse &.{};
-    if (argv.len == 0) {
+    if (argv.len == 0 and (from_spore_dir == null or command_had_delimiter)) {
         std.debug.print("{s}", .{cli_usage});
         std.process.exit(2);
     }
@@ -947,11 +951,15 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
 }
 
 pub fn cliGuestCommand(allocator: std.mem.Allocator, opts: CliOptions) ![]const []const u8 {
-    return switch (opts.command_mode) {
-        .argv => opts.command,
+    return cliGuestCommandFromMode(allocator, opts.command_mode, opts.command);
+}
+
+pub fn cliGuestCommandFromMode(allocator: std.mem.Allocator, mode: CommandMode, command: []const []const u8) ![]const []const u8 {
+    return switch (mode) {
+        .argv => command,
         .shell => {
-            if (opts.command.len != 1) return error.ShellCommandArgumentCountUnsupported;
-            return allocator.dupe([]const u8, &.{ "/bin/sh", "-lc", opts.command[0] });
+            if (command.len != 1) return error.ShellCommandArgumentCountUnsupported;
+            return allocator.dupe([]const u8, &.{ "/bin/sh", "-lc", command[0] });
         },
     };
 }
@@ -2190,6 +2198,7 @@ pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]co
 
 fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options, memory_pressure: bool) ![]const u8 {
     const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(context.io).nanoseconds);
+    if (opts.resume_dir != null and opts.command.len == 0) return attachRequest(allocator);
     if (opts.resume_dir == null) return execRequestWithSessionOptions(allocator, opts.command, "default", .{
         .env = opts.guest_env,
         .working_dir = opts.guest_working_dir,
@@ -2208,8 +2217,42 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
     });
 }
 
+fn attachRequest(allocator: std.mem.Allocator) ![]const u8 {
+    const payload = struct {
+        type: []const u8 = "attach",
+        session_id: []const u8 = "default",
+        stdout_offset: u64 = 0,
+        stderr_offset: u64 = 0,
+    }{};
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+}
+
 pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8) ![]const u8 {
     return execRequestWithSessionOptions(allocator, argv, session_id, .{});
+}
+
+pub fn detachedExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8) ![]const u8 {
+    try validateGuestArgv(argv);
+    const payload = struct {
+        type: []const u8 = "start",
+        session_id: []const u8,
+        resume_time_unix_ns: u64 = 0,
+        argv: []const []const u8,
+        env: []const []const u8 = &.{},
+        working_dir: []const u8 = "",
+        memory_pressure: bool = false,
+        detached: bool = true,
+        closed_env: bool = true,
+    }{
+        .session_id = session_id,
+        .argv = argv,
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
+    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
 const GuestExecOptions = struct {
@@ -2458,6 +2501,12 @@ test "run request can encode explicit session id" {
     const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42");
     defer std.testing.allocator.free(request);
     try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"closed_env\":true}\n", request);
+}
+
+test "run detached exec request asks guest to start without waiting" {
+    const request = try detachedExecRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-1");
+    defer std.testing.allocator.free(request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"detached\":true,\"closed_env\":true}\n", request);
 }
 
 test "run request encodes image env and working directory" {
@@ -2750,6 +2799,13 @@ test "run cli parser accepts shell command with source spore" {
     try std.testing.expectEqualStrings("cat /work-ready", opts.command[0]);
 }
 
+test "run cli parser accepts commandless source spore" {
+    const opts = try parseCliArgs(&.{ "--from", "live.spore" });
+    try std.testing.expectEqualStrings("live.spore", opts.from_spore_dir.?);
+    try std.testing.expectEqual(CommandMode.shell, opts.command_mode);
+    try std.testing.expectEqual(@as(usize, 0), opts.command.len);
+}
+
 test "run cli guest command wraps shell command" {
     const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "echo hi" });
     const argv = try cliGuestCommand(std.testing.allocator, opts);
@@ -2771,6 +2827,12 @@ test "run cli guest command keeps exact argv" {
 test "run cli guest command rejects unquoted shell words" {
     const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "echo", "hi" });
     try std.testing.expectError(error.ShellCommandArgumentCountUnsupported, cliGuestCommand(std.testing.allocator, opts));
+}
+
+test "run attach request resumes default session" {
+    const request = try attachRequest(std.testing.allocator);
+    defer std.testing.allocator.free(request);
+    try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", request);
 }
 
 test "run cli parser allows default boot assets" {

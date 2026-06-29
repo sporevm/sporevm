@@ -138,7 +138,7 @@ spore rootfs build docker.io/library/alpine:3.20 \
   --platform linux/arm64 \
   --output alpine.ext4
 
-spore run --rootfs alpine.ext4 -- /bin/echo hi
+spore run --rootfs alpine.ext4 'echo hi'
 ```
 
 See [docs/rootfs.md](docs/rootfs.md) for cache behavior, local OCI layout
@@ -161,51 +161,60 @@ and allow flags on resumed runs.
 See [docs/networking.md](docs/networking.md) for policy, bound-service, and
 resume limits.
 
+## Fork a live VM
+
+Start a named VM with a running process:
+
+```bash
+spore create counter --image docker.io/library/alpine:3.20 \
+  'i=0; while true; do echo "$i" > /tick; i=$((i + 1)); sleep 1; done'
+```
+
+Fork it while that process is still running:
+
+```bash
+spore fork --vm counter --count 2 --name child-%d
+```
+
+Both children keep running from the fork point:
+
+```bash
+spore exec child-0 'cat /tick; sleep 1; cat /tick'
+spore exec child-1 'cat /tick; sleep 1; cat /tick'
+```
+
+`spore create`, `spore run`, and `spore exec` run shell commands as
+`/bin/sh -lc`. Use `-- <argv...>` when you need exact argv.
+
 ## Capture and resume
 
 Capture a run when the command exits:
 
 ```bash
 spore run --image docker.io/library/alpine:3.20 \
-  --capture /tmp/base.spore \
+  --capture base.spore \
   'echo warmed > /var/tmp/example'
 ```
 
-Run another command from that completed base spore:
+Run another command from that completed base spore, or omit the command to
+attach to the captured default session:
 
 ```bash
-spore run --from /tmp/base.spore 'cat /var/tmp/example'
+spore run --from base.spore 'cat /var/tmp/example'
+spore run --from base.spore
 ```
 
-`--from` resumes the spore and runs a fresh command through the restored exec
-agent. See [docs/filesystem.md](docs/filesystem.md) for rootfs-backed writable
-state and [docs/memory.md](docs/memory.md) for memory restore behavior.
-
-Capture a running workload on a host signal:
-
-```bash
-spore run \
-  --capture /tmp/live.spore \
-  --capture-on USR1 \
-  -- /bin/sleeper &
-run_pid=$!
-
-kill -USR1 "$run_pid"
-wait "$run_pid"
-spore resume /tmp/live.spore
-```
-
-With plain `--capture DIR`, SporeVM captures after guest command exit. With
-`--capture-on SIGNAL`, the first matching host signal writes the spore and
-exits zero. Add `--continue-after-capture` to keep the original run alive after
-a signal-triggered capture.
+`--from` resumes the spore and either attaches to the captured default session
+or runs a fresh command through the restored exec agent. See
+[docs/filesystem.md](docs/filesystem.md) for rootfs-backed writable state and
+[docs/memory.md](docs/memory.md) for memory restore behavior.
 
 ## Fork and fan out
 
 Fork an existing spore:
 
 ```bash
-spore fork /tmp/base.spore --count 100 --out /tmp/forks
+spore fork base.spore --count 100 --out forks
 ```
 
 Children are named `000000`, `000001`, and so on. They share verified content
@@ -214,7 +223,7 @@ and get distinct generation metadata.
 Resume forked children locally with prefixed output:
 
 ```bash
-spore fanout /tmp/forks --parallel --for 20s
+spore fanout forks --parallel --for 20s
 ```
 
 See [docs/fanout.md](docs/fanout.md) for the child identity contract and
@@ -225,14 +234,14 @@ See [docs/fanout.md](docs/fanout.md) for the child identity contract and
 Pack a spore, optionally with forked children:
 
 ```bash
-spore pack /tmp/base.spore --children /tmp/forks --out /tmp/base.bundle
+spore pack base.spore --children forks --out base.bundle
 ```
 
 Unpack or pull one selected child before resume:
 
 ```bash
-spore unpack /tmp/base.bundle --child 000042 --out /tmp/child.spore
-spore resume /tmp/child.spore
+spore unpack base.bundle --child 000042 --out child.spore
+spore resume child.spore
 ```
 
 Remote pulls are digest-pinned:
@@ -240,7 +249,7 @@ Remote pulls are digest-pinned:
 ```bash
 spore pull s3://bucket/path/base.bundle@sha256:<bundle-digest> \
   --child 000042 \
-  --out /tmp/child.spore
+  --out child.spore
 ```
 
 `spore pack`, `spore unpack`, `spore push`, and `spore pull` carry the
@@ -256,10 +265,10 @@ Named VM lifecycle is stable on supported HVF/KVM backends:
 export SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
 
 spore create bench-1 --image docker.io/library/alpine:3.20
-spore exec bench-1 -- /bin/echo hi
+spore exec bench-1 'echo hi'
 spore suspend bench-1 --out bench-1.spore
 spore resume bench-1.spore --name bench-2
-spore ls
+spore ps
 spore rm bench-2
 ```
 

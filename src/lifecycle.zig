@@ -62,7 +62,8 @@ const darwin_process = if (builtin.os.tag.isDarwin()) struct {
 
 const create_usage =
     \\Usage:
-    \\  spore create NAME [options]
+    \\  spore create NAME [options] ['shell command']
+    \\  spore create NAME [options] -- <argv...>
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
@@ -80,15 +81,18 @@ const create_usage =
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
+    \\  -- <argv...>            Start exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
     \\
 ;
 
 const exec_usage =
     \\Usage:
+    \\  spore exec NAME 'shell command'
     \\  spore exec NAME -- <argv...>
     \\
     \\Options:
+    \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
     \\
 ;
@@ -139,12 +143,14 @@ const resume_usage =
 const ls_usage =
     \\Usage:
     \\  spore ls
+    \\  spore ps
     \\
     \\Options:
     \\  -h, --help              Show this help
     \\
     \\Machine output:
     \\  spore --json ls         Emit the VM list as JSON
+    \\  spore --json ps         Same as ls
     \\
 ;
 
@@ -291,10 +297,13 @@ const CreateOptions = struct {
     image_pull_policy: run_mod.PullPolicy = .missing,
     network: run_mod.NetworkMode = .disabled,
     network_policy: run_mod.NetworkPolicy = .{},
+    command_mode: run_mod.CommandMode = .shell,
+    command: []const []const u8 = &.{},
 };
 
 const ExecOptions = struct {
     name: []const u8,
+    command_mode: run_mod.CommandMode = .shell,
     command: []const []const u8,
 };
 
@@ -610,6 +619,27 @@ pub fn execNamed(
     return parseExecNamedResponse(allocator, arena, response);
 }
 
+fn startNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: ExecNamedOptions,
+) !ExecNamedResult {
+    if (options.command.len == 0) return error.InvalidGuestCommand;
+    if (options.network_policy != null) return error.UnsupportedNetworkPolicyUpdate;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const paths = try apiPaths(context, arena, options.name);
+    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    if (state != .ready) return error.NamedVmNotReady;
+    var ready = try readReady(arena, context.io, paths);
+    defer ready.deinit();
+    const response = try sendStartRequest(arena, context.io, ready.value.control_socket_path, options.command);
+    return parseExecNamedResponse(allocator, arena, response);
+}
+
 pub fn snapshotNamed(
     context: Context,
     allocator: std.mem.Allocator,
@@ -863,6 +893,16 @@ pub fn createCli(
     const parsed = try parseCreateArgs(args, allocator, stderr, mode);
     const parsed_ms = monotonicMs();
     const spec = parsed.spec;
+    const start_command: ?[]const []const u8 = if (parsed.command.len == 0)
+        null
+    else
+        run_mod.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| switch (err) {
+            error.ShellCommandArgumentCountUnsupported => {
+                const message = "spore create: shell command form accepts one command string; quote it or use -- for argv";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            },
+            else => |e| return e,
+        };
     const full_args = try init.minimal.args.toSlice(allocator);
     const result = createNamedWithTiming(init, allocator, .{
         .name = spec.name,
@@ -911,8 +951,35 @@ pub fn createCli(
         else => |e| return e,
     };
     defer deinitNamedLifecycleResult(allocator, result);
+    if (start_command) |command| {
+        const initial = startNamed(.{
+            .io = init.io,
+            .environ_map = init.environ_map,
+        }, allocator, .{
+            .name = spec.name,
+            .command = command,
+        }) catch |err| switch (err) {
+            error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "create", err),
+            error.NamedVmNotReady => {
+                const message = allocLifecycleMessage(allocator, "spore create: VM is not ready after create: {s}", .{spec.name});
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "create"), message);
+            },
+            error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+                const message = allocLifecycleMessage(allocator, "spore create: initial command failed for VM {s}: {s}", .{ spec.name, @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "create"), message);
+            },
+            else => |e| return e,
+        };
+        defer deinitExecNamedResult(allocator, initial);
+        if (initial.exit_code != 0) {
+            const message = allocLifecycleMessage(allocator, "spore create: initial command exited {d}", .{initial.exit_code});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "create"), message);
+        }
+    }
     if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, result);
+    } else {
+        try writeNamedLifecycleResult(stdout, result);
     }
 }
 
@@ -923,12 +990,19 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     }
     const parsed = parseExecArgs(args);
     const allocator = init.arena.allocator();
+    const command = run_mod.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| switch (err) {
+        error.ShellCommandArgumentCountUnsupported => {
+            std.debug.print("spore exec: shell command form accepts one command string; quote it or use -- for argv\n", .{});
+            std.process.exit(2);
+        },
+        else => return err,
+    };
     const result = execNamed(.{
         .io = init.io,
         .environ_map = init.environ_map,
     }, allocator, .{
         .name = parsed.name,
-        .command = parsed.command,
+        .command = command,
     }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir => cliRuntimePathExit("exec", err),
         error.NamedVmNotReady => {
@@ -985,6 +1059,8 @@ pub fn rmCli(
     defer deinitNamedLifecycleResult(allocator, result);
     if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, result);
+    } else {
+        try writeNamedLifecycleResult(stdout, result);
     }
 }
 
@@ -1038,6 +1114,8 @@ pub fn suspendCli(
     defer deinitNamedLifecycleResult(allocator, result);
     if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, result);
+    } else {
+        try writeNamedLifecycleResult(stdout, result);
     }
 }
 
@@ -1200,6 +1278,8 @@ pub fn resumeCli(
     defer deinitNamedLifecycleResult(allocator, result);
     if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, result);
+    } else {
+        try writeNamedLifecycleResult(stdout, result);
     }
 }
 
@@ -1687,10 +1767,16 @@ fn parseCreateArgs(
     var image_pull_policy: run_mod.PullPolicy = .missing;
     var network: run_mod.NetworkMode = .disabled;
     var network_policy = run_mod.NetworkPolicy{};
+    var command_mode: run_mod.CommandMode = .shell;
+    var command: ?[]const []const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--backend")) {
+        if (std.mem.eql(u8, args[i], "--")) {
+            command_mode = .argv;
+            command = args[i + 1 ..];
+            break;
+        } else if (std.mem.eql(u8, args[i], "--backend")) {
             spec.backend = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
             if (run_mod.Backend.parse(spec.backend) == null) {
                 const message = "--backend must be auto, hvf, or kvm";
@@ -1762,8 +1848,8 @@ fn parseCreateArgs(
             name = args[i];
             spec.name = args[i];
         } else {
-            const message = allocLifecycleMessage(allocator, "unexpected create argument: {s}", .{args[i]});
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            command = args[i..];
+            break;
         }
     }
 
@@ -1775,6 +1861,17 @@ fn parseCreateArgs(
             machine_output.usageMissingArgument("usage: spore create NAME [options]", "create"),
             create_usage,
         );
+    }
+    if (command) |argv| {
+        if (argv.len == 0) {
+            exitLifecycleCliError(
+                allocator,
+                stderr,
+                mode,
+                machine_output.usageMissingArgument("usage: spore create NAME [options] -- <argv...>", "create"),
+                create_usage,
+            );
+        }
     }
     if (spec.rootfs_path != null and spec.image_ref != null) {
         const message = "spore create: --rootfs and --image are mutually exclusive";
@@ -1793,15 +1890,21 @@ fn parseCreateArgs(
         .image_pull_policy = image_pull_policy,
         .network = network,
         .network_policy = network_policy,
+        .command_mode = command_mode,
+        .command = command orelse &.{},
     };
 }
 
 fn parseExecArgs(args: []const []const u8) ExecOptions {
-    if (args.len < 3 or !std.mem.eql(u8, args[1], "--")) usageExit(exec_usage);
+    if (args.len < 2) usageExit(exec_usage);
     validateNameOrExit("exec", args[0]) catch unreachable;
-    const command = args[2..];
+    var command_mode: run_mod.CommandMode = .shell;
+    const command = if (std.mem.eql(u8, args[1], "--")) blk: {
+        command_mode = .argv;
+        break :blk args[2..];
+    } else args[1..];
     if (command.len == 0) usageExit(exec_usage);
-    return .{ .name = args[0], .command = command };
+    return .{ .name = args[0], .command_mode = command_mode, .command = command };
 }
 
 fn parseRmArgs(args: []const []const u8, allocator: std.mem.Allocator, stderr: *Io.Writer, mode: machine_output.Mode) []const u8 {
@@ -2127,11 +2230,22 @@ fn cleanupStartedChildren(init: std.process.Init, allocator: std.mem.Allocator, 
 }
 
 fn writeNamedForkResult(writer: *Io.Writer, result: NamedForkResult) !void {
-    try writer.writeAll("Named fork complete\n");
-    try writer.print("  Source: {s}\n", .{result.source});
-    try writer.print("  Children: {d}\n", .{result.count});
-    for (result.children) |name| {
-        try writer.print("  - {s}\n", .{name});
+    try writer.writeAll("forked");
+    for (result.children) |name| try writer.print(" {s}", .{name});
+    try writer.writeByte('\n');
+}
+
+fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !void {
+    if (std.mem.eql(u8, result.action, "created")) {
+        try writer.print("created vm {s}\n", .{result.name});
+    } else if (std.mem.eql(u8, result.action, "resumed")) {
+        try writer.print("resumed vm {s}\n", .{result.name});
+    } else if (std.mem.eql(u8, result.action, "suspended")) {
+        try writer.print("captured {s}\n", .{result.spore_dir orelse result.name});
+    } else if (std.mem.eql(u8, result.action, "removed")) {
+        try writer.print("removed vm {s}\n", .{result.name});
+    } else {
+        try writer.print("{s} vm {s}\n", .{ result.action, result.name });
     }
 }
 
@@ -2259,6 +2373,16 @@ fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeou
 fn sendExecRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8) ![]const u8 {
     const payload = struct {
         type: []const u8 = "exec",
+        argv: []const []const u8,
+    }{ .argv = argv };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    return sendControlJson(allocator, io, socket_path, json);
+}
+
+fn sendStartRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8) ![]const u8 {
+    const payload = struct {
+        type: []const u8 = "start",
         argv: []const []const u8,
     }{ .argv = argv };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
@@ -2881,6 +3005,37 @@ test "create parser accepts memory policy" {
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), explicit_opts.spec.memory.bytes);
 }
 
+test "create parser accepts shell and exact commands" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    const shell_opts = try parseCreateArgs(&.{ "counter", "--image", "alpine:3.20", "echo hi" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(run_mod.CommandMode.shell, shell_opts.command_mode);
+    try std.testing.expectEqual(@as(usize, 1), shell_opts.command.len);
+    try std.testing.expectEqualStrings("echo hi", shell_opts.command[0]);
+
+    const argv_opts = try parseCreateArgs(&.{ "counter", "--", "/bin/echo", "hi" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(run_mod.CommandMode.argv, argv_opts.command_mode);
+    try std.testing.expectEqual(@as(usize, 2), argv_opts.command.len);
+    try std.testing.expectEqualStrings("/bin/echo", argv_opts.command[0]);
+    try std.testing.expectEqualStrings("hi", argv_opts.command[1]);
+}
+
+test "exec parser accepts shell and exact commands" {
+    const shell_opts = parseExecArgs(&.{ "counter", "cat /tick" });
+    try std.testing.expectEqualStrings("counter", shell_opts.name);
+    try std.testing.expectEqual(run_mod.CommandMode.shell, shell_opts.command_mode);
+    try std.testing.expectEqual(@as(usize, 1), shell_opts.command.len);
+    try std.testing.expectEqualStrings("cat /tick", shell_opts.command[0]);
+
+    const argv_opts = parseExecArgs(&.{ "counter", "--", "/bin/cat", "/tick" });
+    try std.testing.expectEqual(run_mod.CommandMode.argv, argv_opts.command_mode);
+    try std.testing.expectEqual(@as(usize, 2), argv_opts.command.len);
+    try std.testing.expectEqualStrings("/bin/cat", argv_opts.command[0]);
+    try std.testing.expectEqualStrings("/tick", argv_opts.command[1]);
+}
+
 test "create parser accepts image pull policy" {
     const allocator = std.testing.allocator;
     var stderr: Io.Writer.Allocating = .init(allocator);
@@ -3101,6 +3256,36 @@ test "lifecycle list entries render human table" {
     out.clearRetainingCapacity();
     try writeListEntries(&out.writer, &.{});
     try std.testing.expectEqualStrings("No VMs\n", out.written());
+}
+
+test "lifecycle human results render terse status lines" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try writeNamedLifecycleResult(&out.writer, .{
+        .action = "created",
+        .name = "counter",
+        .state = "ready",
+    });
+    try std.testing.expectEqualStrings("created vm counter\n", out.written());
+
+    out.clearRetainingCapacity();
+    try writeNamedLifecycleResult(&out.writer, .{
+        .action = "suspended",
+        .name = "counter",
+        .state = "ready",
+        .spore_dir = "counter.spore",
+    });
+    try std.testing.expectEqualStrings("captured counter.spore\n", out.written());
+
+    out.clearRetainingCapacity();
+    try writeNamedForkResult(&out.writer, .{
+        .source = "counter",
+        .count = 2,
+        .children = &.{ "child-0", "child-1" },
+    });
+    try std.testing.expectEqualStrings("forked child-0 child-1\n", out.written());
 }
 
 test "lifecycle list JSON exposes memory and nullable stats" {

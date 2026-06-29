@@ -62,15 +62,17 @@ fn runParsed(
     spore_executable: []const u8,
     debug: bool,
 ) !api.RunResult {
-    const command = run_mod.cliGuestCommand(allocator, parsed) catch |err| switch (err) {
-        error.ShellCommandArgumentCountUnsupported => failRunSetup("spore run: shell command form accepts one command string; quote it or use -- for argv", .{}),
-        else => return err,
-    };
-
     if (parsed.from_spore_dir) |spore_dir| {
         if (parsed.network_requested or parsed.network_policy.hasRules() or parsed.network_policy.hasBoundServices()) {
             failRunSetup("spore run: --from uses the captured network policy; omit --net and network flags", .{});
         }
+        const command = if (parsed.command.len == 0)
+            &.{}
+        else
+            run_mod.cliGuestCommand(allocator, parsed) catch |err| switch (err) {
+                error.ShellCommandArgumentCountUnsupported => failRunSetup("spore run: shell command form accepts one command string; quote it or use -- for argv", .{}),
+                else => return err,
+            };
         return api.runFromSpore(.{
             .io = init.io,
             .environ_map = init.environ_map,
@@ -99,6 +101,11 @@ fn runParsed(
     if (parsed.capture_path != null and parsed.network_policy.hasBoundServices()) {
         failRunSetup("spore run: --bind-service with --capture needs manifest support first", .{});
     }
+
+    const command = run_mod.cliGuestCommand(allocator, parsed) catch |err| switch (err) {
+        error.ShellCommandArgumentCountUnsupported => failRunSetup("spore run: shell command form accepts one command string; quote it or use -- for argv", .{}),
+        else => return err,
+    };
 
     return api.runManaged(init, allocator, .{
         .backend = parsed.backend,

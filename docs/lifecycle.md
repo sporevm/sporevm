@@ -7,16 +7,16 @@ new name, and remove it without learning the monitor socket protocol.
 ## User Contract
 
 ```bash
-spore create bench-1 --image docker.io/library/alpine:3.20
-spore exec bench-1 -- /bin/echo hi
+spore create bench-1 --image docker.io/library/alpine:3.20 'sleep 30'
+spore exec bench-1 'echo hi'
 spore suspend bench-1 --out bench-1.spore
 spore resume bench-1.spore --name bench-2
-spore ls
+spore ps
 spore rm bench-2
 ```
 
 `spore run` remains the one-shot command. The stable named surface is
-`create`, `exec`, `suspend`, `resume --name`, `fork --vm`, `ls`, and `rm` on
+`create`, `exec`, `suspend`, `resume --name`, `fork --vm`, `ls`/`ps`, and `rm` on
 supported HVF and KVM hosts.
 
 Machine callers use global `--json` for single-result lifecycle commands:
@@ -26,7 +26,11 @@ spore --json create bench-1 --image docker.io/library/alpine:3.20
 spore --json ls
 ```
 
-`spore exec` forwards guest stdout and stderr as workload streams.
+`spore create`, `spore exec`, and `spore run` accept a shell command by default
+and `-- <argv...>` for exact argv. A command passed to `spore create` is
+started in the guest and detached; stdout and stderr are discarded so the named
+VM is immediately available for `fork`, `exec`, `suspend`, and `rm`. `spore
+exec` forwards guest stdout and stderr as workload streams.
 
 ## Runtime State
 
@@ -60,10 +64,10 @@ network gateway, and a local newline-delimited JSON control socket.
 snapshot-and-continue monitor action so the source VM keeps running:
 
 ```bash
-spore create golden
-spore exec golden -- /bin/true
-spore fork --vm golden --count 2 --name worker-%d
-spore exec worker-0 -- /bin/writeout
+spore create counter --image docker.io/library/alpine:3.20 \
+  'i=0; while true; do echo "$i" > /tick; i=$((i + 1)); sleep 1; done'
+spore fork --vm counter --count 2 --name worker-%d
+spore exec worker-0 'cat /tick; sleep 1; cat /tick'
 ```
 
 `--name` is required with `--vm`. For `--count > 1`, it must contain exactly one

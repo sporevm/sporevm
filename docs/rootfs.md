@@ -13,7 +13,7 @@ zig-out/bin/spore rootfs build docker.io/library/alpine:3.20 \
   --platform linux/arm64 \
   --output alpine.ext4
 
-zig-out/bin/spore run --rootfs alpine.ext4 -- /bin/echo hi
+zig-out/bin/spore run --rootfs alpine.ext4 'echo hi'
 ```
 
 The input can be either a digest-pinned ref or a registry tag:
@@ -29,10 +29,10 @@ spore rootfs build ghcr.io/org/image:latest \
   --output rootfs.ext4
 ```
 
-Run an explicit argv from a built rootfs by attaching it read-only:
+Run a command from a built rootfs by attaching it read-only:
 
 ```bash
-spore run --rootfs rootfs.ext4 -- /bin/echo hi
+spore run --rootfs rootfs.ext4 'echo hi'
 ```
 
 For the direct convenience path, ordinary `spore run --image` resolves the image
@@ -53,10 +53,10 @@ the changed blocks as disk layers:
 
 ```bash
 spore run --image docker.io/library/alpine:3.20 \
-  --capture /tmp/base.spore \
+  --capture base.spore \
   'echo warmed > /var/tmp/example'
 
-spore run --from /tmp/base.spore 'cat /var/tmp/example'
+spore run --from base.spore 'cat /var/tmp/example'
 ```
 
 The rootfs cache key includes the resolved digest-pinned image ref, target
@@ -86,7 +86,7 @@ spore rootfs import-oci /tmp/sporevm-app.oci \
   --ref local/sporevm-app:dev \
   --platform linux/arm64
 
-spore run --image local/sporevm-app:dev -- /bin/echo hi
+spore run --image local/sporevm-app:dev 'echo hi'
 ```
 
 `import-oci` accepts either an OCI layout directory or an uncompressed OCI layout
