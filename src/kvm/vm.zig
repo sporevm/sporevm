@@ -787,14 +787,10 @@ const DirtyTracker = struct {
     vm_fd: std.c.fd_t,
     slot: u32,
     bitmap: []usize,
-    epoch_ms: u64,
+    core: dirty_ram.TrackerCore,
     mutex: SpinLock = .{},
-    stop: std.atomic.Value(bool) = .init(false),
-    worker_thread: ?std.Thread = null,
     stop_read_fd: std.c.fd_t = -1,
     stop_write_fd: std.c.fd_t = -1,
-    worker_failed: bool = false,
-    tracking_start_ms: u64 = 0,
     stats: DirtyStats = .{},
 
     const Options = struct {
@@ -807,19 +803,10 @@ const DirtyTracker = struct {
     };
 
     const DirtyStats = struct {
-        dirty_epoch_ms: u64 = 0,
-        dirty_epoch_count: u64 = 0,
         dirty_pages_total: u64 = 0,
         dirty_pages_tail: u64 = 0,
         get_dirty_log_ms: u64 = 0,
         get_dirty_log_cpu_ms: u64 = 0,
-        worker_epoch_max_ms: u64 = 0,
-        worker_cadence_lag_max_ms: u64 = 0,
-        worker_cadence_lag_total_ms: u64 = 0,
-        worker_epoch_overrun_count: u64 = 0,
-        worker_epoch_overrun_ms: u64 = 0,
-        worker_join_ms: u64 = 0,
-        finish_worker_stop_ms: u64 = 0,
         dirty_pages_per_sec: u64 = 0,
     };
 
@@ -842,16 +829,15 @@ const DirtyTracker = struct {
             .vm_fd = options.vm_fd,
             .slot = options.slot,
             .bitmap = try allocator.alloc(usize, bitmap_word_count),
-            .epoch_ms = options.epoch_ms,
+            .core = dirty_ram.TrackerCore.init(options.epoch_ms),
         };
-        tracker.stats.dirty_epoch_ms = options.epoch_ms;
 
         // Some kernels conservatively mark a logging memslot dirty at
         // creation. Drop that baseline after the host has loaded the kernel,
         // initrd, and DTB so subsequent epochs measure guest writes only.
         _ = try tracker.collectDirtyLog(false);
         tracker.resetDirtyStatsAfterBaseline();
-        tracker.tracking_start_ms = try monotonicMs();
+        tracker.core.tracking_start_ms = try monotonicMs();
 
         std.log.info(
             "kvm dirty tracking started: mode=dirty-log ram_mib={d} chunks={d} seed_nonzero_chunks={d} seed_ms={d} epoch_ms={d}",
@@ -866,7 +852,7 @@ const DirtyTracker = struct {
     }
 
     fn startWorker(self: *DirtyTracker) !void {
-        if (self.epoch_ms == 0) return;
+        if (!self.core.shouldStartWorker()) return;
         var stop_pipe: [2]std.c.fd_t = undefined;
         try linuxCall(linux.pipe2(&stop_pipe, .{ .CLOEXEC = true }));
         errdefer closeFd(stop_pipe[0]);
@@ -879,20 +865,20 @@ const DirtyTracker = struct {
             self.stop_read_fd = -1;
             self.stop_write_fd = -1;
         }
-        self.worker_thread = try std.Thread.spawn(.{}, dirtyWorker, .{self});
-        std.log.info("kvm dirty tracking worker started: epoch_ms={d}", .{self.epoch_ms});
+        self.core.worker_thread = try std.Thread.spawn(.{}, dirtyWorker, .{self});
+        std.log.info("kvm dirty tracking worker started: epoch_ms={d}", .{self.core.epoch_ms});
     }
 
     fn stopWorker(self: *DirtyTracker) void {
-        if (self.worker_thread) |thread| {
+        if (self.core.worker_thread) |thread| {
             const join_start = monotonicMs() catch 0;
-            self.stop.store(true, .release);
+            self.core.stop.store(true, .release);
             var byte: [1]u8 = .{1};
             if (self.stop_write_fd >= 0) _ = linux.write(self.stop_write_fd, &byte, byte.len);
             thread.join();
-            self.worker_thread = null;
+            self.core.worker_thread = null;
             const join_end = monotonicMs() catch join_start;
-            self.stats.worker_join_ms += join_end - join_start;
+            self.core.stats.worker_join_ms += join_end - join_start;
         }
         if (self.stop_read_fd >= 0) {
             closeFd(self.stop_read_fd);
@@ -905,9 +891,9 @@ const DirtyTracker = struct {
     }
 
     fn dirtyWorker(self: *DirtyTracker) void {
-        var next_deadline = (monotonicMs() catch 0) +| self.epoch_ms;
+        var next_deadline = (monotonicMs() catch 0) +| self.core.epoch_ms;
         while (true) {
-            if (self.stop.load(.acquire)) return;
+            if (self.core.stop.load(.acquire)) return;
             const now = monotonicMs() catch 0;
             const wait_ms = if (next_deadline > now) next_deadline - now else 0;
             const timeout_ms: i32 = if (wait_ms > std.math.maxInt(i32)) std.math.maxInt(i32) else @intCast(wait_ms);
@@ -922,7 +908,7 @@ const DirtyTracker = struct {
                 },
             }
             if (rc > 0 and fds[0].revents != 0) return;
-            if (self.stop.load(.acquire)) return;
+            if (self.core.stop.load(.acquire)) return;
             const epoch_start = monotonicMs() catch 0;
             self.flushDirty(false) catch {
                 self.markWorkerFailed();
@@ -930,43 +916,33 @@ const DirtyTracker = struct {
             };
             const epoch_end = monotonicMs() catch epoch_start;
             self.recordWorkerEpochTiming(epoch_start, epoch_end, next_deadline);
-            next_deadline = epoch_start +| self.epoch_ms;
+            next_deadline = epoch_start +| self.core.epoch_ms;
         }
     }
 
     fn markWorkerFailed(self: *DirtyTracker) void {
         self.mutex.lock();
-        self.worker_failed = true;
+        self.core.markWorkerFailed();
         self.mutex.unlock();
     }
 
     fn recordWorkerEpochTiming(self: *DirtyTracker, epoch_start: u64, epoch_end: u64, deadline_ms: u64) void {
-        const epoch_ms = epoch_end -| epoch_start;
-        const lag_ms = if (epoch_start > deadline_ms) epoch_start - deadline_ms else 0;
-        const overrun_ms = if (epoch_ms > self.epoch_ms) epoch_ms - self.epoch_ms else 0;
-
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (epoch_ms > self.stats.worker_epoch_max_ms) self.stats.worker_epoch_max_ms = epoch_ms;
-        if (lag_ms > self.stats.worker_cadence_lag_max_ms) self.stats.worker_cadence_lag_max_ms = lag_ms;
-        self.stats.worker_cadence_lag_total_ms +|= lag_ms;
-        if (overrun_ms != 0) {
-            self.stats.worker_epoch_overrun_count +|= 1;
-            self.stats.worker_epoch_overrun_ms +|= overrun_ms;
-        }
+        self.core.recordWorkerEpochTiming(epoch_start, epoch_end, deadline_ms);
     }
 
     fn finish(self: *DirtyTracker) !spore.MemoryManifest {
         const worker_stop_start = try monotonicMs();
         self.stopWorker();
-        self.stats.finish_worker_stop_ms = (try monotonicMs()) - worker_stop_start;
-        if (self.worker_failed) return error.KvmDirtyWorkerFailed;
+        self.core.stats.finish_worker_stop_ms = (try monotonicMs()) - worker_stop_start;
+        if (self.core.worker_failed) return error.KvmDirtyWorkerFailed;
 
         const tail_start = try monotonicMs();
         try self.flushDirty(true);
         self.sealer.stats.tail_flush_ms = (try monotonicMs()) - tail_start;
         const now_ms = try monotonicMs();
-        self.sealer.finishRates(self.tracking_start_ms, now_ms);
+        self.sealer.finishRates(self.core.tracking_start_ms, now_ms);
         self.stats.dirty_pages_per_sec = ratePerSec(self.stats.dirty_pages_total, self.sealer.stats.tracking_ms);
         return try self.sealer.finishBacking();
     }
@@ -982,7 +958,7 @@ const DirtyTracker = struct {
         if (dirty_pages == 0 and !self.sealer.hasDirtyChunks()) return;
         _ = try self.sealer.flushMarked(.{
             .tail = tail,
-            .stop = &self.stop,
+            .stop = &self.core.stop,
             .record_cpu = true,
         });
     }
@@ -998,7 +974,7 @@ const DirtyTracker = struct {
         _ = try kvm.ioctl(self.vm_fd, kvm.KVM_GET_DIRTY_LOG, @intFromPtr(&log), "KVM_GET_DIRTY_LOG");
         self.stats.get_dirty_log_ms += (try monotonicMs()) - log_start;
         self.stats.get_dirty_log_cpu_ms += elapsedCpuMs(log_cpu_start);
-        if (!tail) self.stats.dirty_epoch_count += 1;
+        if (!tail) self.core.stats.dirty_epoch_count += 1;
 
         var dirty_pages: u64 = 0;
         const page_count = (self.sealer.ram.len + std.heap.page_size_min - 1) / std.heap.page_size_min;
@@ -1040,19 +1016,12 @@ const DirtyTracker = struct {
     }
 
     fn resetDirtyStatsAfterBaseline(self: *DirtyTracker) void {
-        self.stats.dirty_epoch_count = 0;
         self.stats.dirty_pages_total = 0;
         self.stats.dirty_pages_tail = 0;
         self.stats.get_dirty_log_ms = 0;
         self.stats.get_dirty_log_cpu_ms = 0;
-        self.stats.worker_epoch_max_ms = 0;
-        self.stats.worker_cadence_lag_max_ms = 0;
-        self.stats.worker_cadence_lag_total_ms = 0;
-        self.stats.worker_epoch_overrun_count = 0;
-        self.stats.worker_epoch_overrun_ms = 0;
-        self.stats.worker_join_ms = 0;
-        self.stats.finish_worker_stop_ms = 0;
         self.stats.dirty_pages_per_sec = 0;
+        self.core.resetStatsAfterBaseline();
         self.sealer.resetStatsAfterBaseline();
         @memset(self.bitmap, 0);
     }
@@ -1151,6 +1120,7 @@ fn takeSnapshot(
     const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
     if (dirty_tracker) |tracker| {
         const stats = tracker.stats;
+        const core_stats = tracker.core.stats;
         const ram_stats = tracker.sealer.stats;
         var metrics_head_buf: [2048]u8 = undefined;
         var metrics_tail_buf: [3072]u8 = undefined;
@@ -1168,8 +1138,8 @@ fn takeSnapshot(
                 manifest_ms,
                 snapshot_total_ms,
                 snapshot_total_ms,
-                stats.dirty_epoch_ms,
-                stats.dirty_epoch_count,
+                core_stats.dirty_epoch_ms,
+                core_stats.dirty_epoch_count,
                 stats.dirty_pages_total,
                 stats.dirty_pages_tail,
                 ram_stats.dirty_chunks_total,
@@ -1197,13 +1167,13 @@ fn takeSnapshot(
                 ram_stats.sealBackingWriteMs(),
                 ram_stats.seal_parallel_flush_count,
                 ram_stats.seal_parallel_workers_max,
-                stats.worker_epoch_max_ms,
-                stats.worker_cadence_lag_max_ms,
-                stats.worker_cadence_lag_total_ms,
-                stats.worker_epoch_overrun_count,
-                stats.worker_epoch_overrun_ms,
-                stats.worker_join_ms,
-                stats.finish_worker_stop_ms,
+                core_stats.worker_epoch_max_ms,
+                core_stats.worker_cadence_lag_max_ms,
+                core_stats.worker_cadence_lag_total_ms,
+                core_stats.worker_epoch_overrun_count,
+                core_stats.worker_epoch_overrun_ms,
+                core_stats.worker_join_ms,
+                core_stats.finish_worker_stop_ms,
                 ram_stats.finish_fchmod_ms,
                 ram_stats.finish_close_ms,
                 ram_stats.finish_close_deferred,

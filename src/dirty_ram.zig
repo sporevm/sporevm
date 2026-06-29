@@ -103,6 +103,60 @@ pub const FlushOptions = struct {
     before_seal_ctx: ?*anyopaque = null,
 };
 
+pub const TrackerCore = struct {
+    pub const Stats = struct {
+        dirty_epoch_ms: u64 = 0,
+        dirty_epoch_count: u64 = 0,
+        worker_epoch_max_ms: u64 = 0,
+        worker_cadence_lag_max_ms: u64 = 0,
+        worker_cadence_lag_total_ms: u64 = 0,
+        worker_epoch_overrun_count: u64 = 0,
+        worker_epoch_overrun_ms: u64 = 0,
+        worker_join_ms: u64 = 0,
+        finish_worker_stop_ms: u64 = 0,
+    };
+
+    epoch_ms: u64,
+    stop: std.atomic.Value(bool) = .init(false),
+    worker_thread: ?std.Thread = null,
+    worker_failed: bool = false,
+    tracking_start_ms: u64 = 0,
+    stats: @This().Stats = .{},
+
+    pub fn init(epoch_ms: u64) TrackerCore {
+        return .{
+            .epoch_ms = epoch_ms,
+            .stats = .{ .dirty_epoch_ms = epoch_ms },
+        };
+    }
+
+    pub fn shouldStartWorker(self: *const TrackerCore) bool {
+        return self.epoch_ms != 0;
+    }
+
+    pub fn markWorkerFailed(self: *TrackerCore) void {
+        self.worker_failed = true;
+    }
+
+    pub fn resetStatsAfterBaseline(self: *TrackerCore) void {
+        self.stats = .{ .dirty_epoch_ms = self.epoch_ms };
+    }
+
+    pub fn recordWorkerEpochTiming(self: *TrackerCore, epoch_start: u64, epoch_end: u64, deadline_ms: u64) void {
+        const epoch_ms = epoch_end -| epoch_start;
+        const lag_ms = if (epoch_start > deadline_ms) epoch_start - deadline_ms else 0;
+        const overrun_ms = if (epoch_ms > self.epoch_ms) epoch_ms - self.epoch_ms else 0;
+
+        self.stats.worker_epoch_max_ms = @max(self.stats.worker_epoch_max_ms, epoch_ms);
+        self.stats.worker_cadence_lag_max_ms = @max(self.stats.worker_cadence_lag_max_ms, lag_ms);
+        self.stats.worker_cadence_lag_total_ms +|= lag_ms;
+        if (overrun_ms != 0) {
+            self.stats.worker_epoch_overrun_count +|= 1;
+            self.stats.worker_epoch_overrun_ms +|= overrun_ms;
+        }
+    }
+};
+
 pub const Sealer = struct {
     allocator: std.mem.Allocator,
     alloc_mutex: SpinLock = .{},
@@ -706,6 +760,31 @@ fn readFileAllForTest(allocator: std.mem.Allocator, path: [:0]const u8, max: usi
         done += @intCast(n);
     }
     return buf;
+}
+
+test "dirty tracker core records worker timing and resets baseline stats" {
+    var core = TrackerCore.init(250);
+    try std.testing.expect(core.shouldStartWorker());
+    try std.testing.expectEqual(@as(u64, 250), core.stats.dirty_epoch_ms);
+
+    core.stats.dirty_epoch_count = 3;
+    core.recordWorkerEpochTiming(1200, 1500, 1000);
+    try std.testing.expectEqual(@as(u64, 300), core.stats.worker_epoch_max_ms);
+    try std.testing.expectEqual(@as(u64, 200), core.stats.worker_cadence_lag_max_ms);
+    try std.testing.expectEqual(@as(u64, 200), core.stats.worker_cadence_lag_total_ms);
+    try std.testing.expectEqual(@as(u64, 1), core.stats.worker_epoch_overrun_count);
+    try std.testing.expectEqual(@as(u64, 50), core.stats.worker_epoch_overrun_ms);
+
+    core.recordWorkerEpochTiming(2000, 2100, 2200);
+    try std.testing.expectEqual(@as(u64, 300), core.stats.worker_epoch_max_ms);
+    try std.testing.expectEqual(@as(u64, 200), core.stats.worker_cadence_lag_max_ms);
+    try std.testing.expectEqual(@as(u64, 200), core.stats.worker_cadence_lag_total_ms);
+    try std.testing.expectEqual(@as(u64, 1), core.stats.worker_epoch_overrun_count);
+
+    core.resetStatsAfterBaseline();
+    try std.testing.expectEqual(@as(u64, 250), core.stats.dirty_epoch_ms);
+    try std.testing.expectEqual(@as(u64, 0), core.stats.dirty_epoch_count);
+    try std.testing.expectEqual(@as(u64, 0), core.stats.worker_epoch_max_ms);
 }
 
 test "dirty RAM sealer seeds zero-elided chunks and finalizes backing" {
