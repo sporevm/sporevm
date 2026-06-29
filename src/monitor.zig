@@ -11,6 +11,7 @@ const net_gateway = @import("net_gateway.zig");
 const run = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
+const topology = @import("topology.zig");
 const vsock = @import("virtio/vsock.zig");
 
 const max_control_request = 4096;
@@ -38,6 +39,7 @@ const monitor_usage =
     \\  --bound-unix-service NAME HOST PORT PATH
     \\                          With --net, expose a host Unix socket as HOST:PORT
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
+    \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
@@ -56,7 +58,7 @@ const MonitorOptions = struct {
     network: run.NetworkMode = .disabled,
     network_policy: run.NetworkPolicy = .{},
     memory: memory_config.Config = .{},
-    vcpus: u32 = 1,
+    vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
@@ -106,6 +108,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         std.debug.print("spore monitor: direct --resume with --rootfs is not supported; use lifecycle metadata for disk-backed named resume\n", .{});
         std.process.exit(2);
     }
+    topology.validateVcpuCount(opts.vcpus) catch {
+        std.debug.print("spore monitor: unsupported vCPU count\n", .{});
+        std.process.exit(2);
+    };
     const full_args = try init.minimal.args.toSlice(allocator);
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
@@ -796,7 +802,7 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
         } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
             memory_config.rejectMemoryMiBFlag("spore monitor");
         } else if (std.mem.eql(u8, args[i], "--vcpus")) {
-            opts.vcpus = try parsePositive(u32, args[i], takeValue(args, &i, args[i]));
+            opts.vcpus = run.parseVcpuCountOrExit(args[i], takeValue(args, &i, args[i]));
         } else if (std.mem.eql(u8, args[i], "--guest-port")) {
             opts.guest_port = try parsePositive(u32, args[i], takeValue(args, &i, args[i]));
         } else if (std.mem.eql(u8, args[i], "--timeout-ms")) {
@@ -861,4 +867,9 @@ test "monitor parser accepts network allow policy" {
     try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
     try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
     try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
+}
+
+test "monitor parser accepts bounded vcpu count" {
+    const opts = try parseMonitorArgs(&.{ "bench-1", "--vcpus", "2" });
+    try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.vcpus);
 }

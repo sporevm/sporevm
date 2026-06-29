@@ -163,6 +163,7 @@ pub fn usageMissingArgument(message: []const u8, source: []const u8) CliError {
 pub fn fromZigError(err: anyerror) CliError {
     return switch (err) {
         error.InvalidRootfsInput,
+        error.UnsupportedVcpuCount,
         error.BadManagedKernelRepository,
         error.BadManagedKernelVersion,
         error.BadManagedKernelAsset,

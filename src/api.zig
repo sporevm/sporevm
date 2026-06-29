@@ -807,12 +807,26 @@ pub fn runFromSpore(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const manifest = try spore.loadManifest(arena, options.spore_dir);
-    defer manifest.deinit();
+    var manifest = spore.loadManifest(arena, options.spore_dir) catch |err| switch (err) {
+        error.BadManifest => null,
+        else => |e| return e,
+    };
+    defer if (manifest) |*parsed| parsed.deinit();
+    var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
+    defer if (manifest_v1) |*parsed| parsed.deinit();
+    if (manifest == null) manifest_v1 = try spore.loadManifestV1(arena, options.spore_dir);
 
-    const rootfs = try run_mod.resumeRootfsForRun(arena, manifest.value);
-    const disk = try run_mod.resumeDiskForRun(arena, manifest.value);
-    const network_options = try run_mod.networkOptionsFromManifest(arena, manifest.value.network);
+    const rootfs = if (manifest) |parsed|
+        try run_mod.resumeRootfsForRun(arena, parsed.value)
+    else
+        try run_mod.resumeRootfsForRunV1(arena, manifest_v1.?.value);
+    const disk = if (manifest) |parsed|
+        try run_mod.resumeDiskForRun(arena, parsed.value)
+    else
+        try run_mod.resumeDiskForRunV1(arena, manifest_v1.?.value);
+    const network_options = try run_mod.networkOptionsFromManifest(arena, if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network);
+    const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else options.vcpus;
+    if (manifest_v1 != null and options.vcpus != 1 and options.vcpus != manifest_vcpus) return error.PlatformMismatch;
 
     return run_mod.execute(context, arena, .{
         .backend = options.backend,
@@ -823,15 +837,15 @@ pub fn runFromSpore(
         .disk = disk,
         .resume_dir = options.spore_dir,
         .command = options.command,
-        .memory = try memory_config.fromManifestBytes(manifest.value.platform.ram_size),
-        .vcpus = options.vcpus,
+        .memory = try memory_config.fromManifestBytes(if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size),
+        .vcpus = manifest_vcpus,
         .guest_port = options.guest_port,
         .timeout_ms = options.timeout_ms,
         .stream_output = false,
         .capture_path = options.capture_path,
         .capture_trigger = options.capture_trigger,
         .continue_after_capture = options.continue_after_capture,
-        .annotations = manifest.value.annotations,
+        .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
         .network = network_options.network,
         .network_policy = network_options.policy,
         .spore_executable = options.spore_executable,

@@ -52,6 +52,10 @@ description = "Smoke product spore run automatic memory growth"
 run = "mise run build && scripts/smoke-run-capture.sh"
 description = "Smoke product spore run signal capture and resume"
 
+[tasks."smoke:multi-vcpu"]
+run = "mise run build && scripts/smoke-multi-vcpu.sh"
+description = "Smoke multi-vCPU boot, capture, run-from, and resume"
+
 [tasks."smoke:lifecycle"]
 run = "mise run build && scripts/smoke-lifecycle.sh"
 description = "Smoke named lifecycle create, exec, ls, and rm"

@@ -1,7 +1,10 @@
 # Spore Format
 
 **Status:** manifest format v0 implemented (`src/spore.zig`), single-vCPU,
-same-host HVF and KVM producers/consumers.
+same-host HVF and KVM producers/consumers. Manifest format v1 has data structs,
+validators, KVM portable capture/restore, and HVF same-backend capture/restore
+for multi-vCPU state. Bundle production, pull, and local materialization
+preserve manifest v1.
 
 Format v0 is still the current SporeVM 1.x manifest and artifact contract.
 Do not rename version or kind strings to v1 for release-label symmetry; use a
@@ -196,9 +199,12 @@ under `rootfs.cache`.
   remain the portable verified source of truth; unsupported backends and
   imported/cold spores materialize from chunks instead. Product restore paths
   (`spore resume` and `spore run --from`) may automatically map `ram.backing`
-  only when the local `ram.backing.proof` validates against the manifest memory
-  fingerprint, backing metadata, opened file identity, and host-local runtime
-  key. A missing, corrupt, foreign-key, or mismatched proof falls back to chunks.
+  for single-vCPU manifests only when the local `ram.backing.proof` validates
+  against the manifest memory fingerprint, backing metadata, opened file
+  identity, and host-local runtime key. Multi-vCPU manifests materialize from
+  chunks until the local backing fast path has backend smoke coverage. A
+  missing, corrupt, foreign-key, mismatched proof, or unsupported topology falls
+  back to chunks.
   The proof is local provenance metadata; it is not a portable trust root and
   does not prove every RAM byte still matches the manifest's chunk refs. KVM and
   HVF map a validated fd
@@ -242,6 +248,39 @@ under `rootfs.cache`.
   must attach a fresh gateway that satisfies the recorded `requirements` and
   policy or fail closed.
 
+## Manifest Format v1
+
+Manifest v1 is the incompatible multi-vCPU machine-state shape. Existing v0
+loaders reject it through the normal unknown-version path. The KVM runtime uses
+v1 with portable `gicv3_multi` state for multi-vCPU capture and restore. The
+HVF runtime uses v1 with a tagged same-HVF `backend_private` GIC blob. Bundle
+commands preserve v1 manifests through production, pull, and local
+materialization.
+
+V1 keeps the v0 memory, device, generation, rootfs, disk, network, and
+annotation contracts. The platform object adds:
+
+- `vcpu_count`: bounded by the shared SporeVM topology cap.
+- `gic_redist_stride`: the redistributor frame stride used to validate the
+  exposed GIC layout.
+
+The v1 `machine` object has `schema_version: 1`, `vcpus`, and `gic`.
+
+Each `machine.vcpus[]` entry records one normalized aarch64 vCPU state:
+`index`, `mpidr`, `gprs`, `pc`, `cpsr`, `fpcr`, `fpsr`, `simd`, `sys_regs`,
+`icc_regs`, and `vtimer`. The validator requires stable array order
+(`index == array position`), unique indexes, unique MPIDRs, and the normalized
+MPIDR mapping from `src/topology.zig`.
+
+V1 portable GIC state uses `machine.gic.kind: "gicv3_multi"`. It carries global
+distributor registers, per-vCPU redistributor register arrays keyed by MPIDR,
+and line levels where PPIs include an owning MPIDR and SPIs do not. Validation
+rejects unknown register offsets, duplicate redistributors, duplicate line
+records, PPIs without a known owner, and SPIs with an owner. HVF same-backend
+v1 captures instead use `machine.gic.kind: "backend_private"` with
+`backend: "hvf"` and `format: "hv_gic_state_v0"`; other backends must reject
+that blob before mutating VM state.
+
 ## Not Yet Captured By Manifest v0
 
 - General block-device state is still incomplete. The current writable disk
@@ -250,7 +289,8 @@ under `rootfs.cache`.
 - Access traces: the KVM and HVF lazy-restore harnesses can write local
   first-touch traces for measurement, but manifest v0 does not persist access
   traces or prefetch hints.
-- Multi-vCPU machine state.
+- Multi-vCPU machine state in manifest v0. Manifest v1 carries this state for
+  KVM capture/restore and same-HVF capture/restore.
 - Kernel identity in the platform contract (pinned-build enforcement).
 - Durable disk/device identity fixup beyond the current diskless helper. The
   product initrd consumes generation params for hostname and applies

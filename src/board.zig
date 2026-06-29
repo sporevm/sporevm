@@ -8,6 +8,7 @@
 const std = @import("std");
 const fdt = @import("fdt.zig");
 const generation = @import("generation.zig");
+const topology = @import("topology.zig");
 
 /// Device model version recorded in spore manifests.
 pub const device_model_version = 4;
@@ -48,7 +49,7 @@ pub const InitrdRange = struct {
 
 pub const Config = struct {
     ram_size: u64,
-    cpu_count: u32,
+    cpu_count: topology.VcpuCount,
     gic: GicLayout,
     virtio_count: u32,
     bootargs: []const u8,
@@ -71,9 +72,15 @@ pub fn generationIntid() u32 {
     return spi_base_intid + generation_spi;
 }
 
+pub fn redistributorRegionSize(stride: u64, cpu_count: topology.VcpuCount) !u64 {
+    try topology.validateVcpuCount(cpu_count);
+    return std.math.mul(u64, stride, cpu_count);
+}
+
 /// Build the boot DTB. Caller owns the returned blob.
 pub fn buildDtb(allocator: std.mem.Allocator, config: Config) ![]u8 {
     std.debug.assert(config.virtio_count <= max_virtio_devices);
+    try topology.validateVcpuCount(config.cpu_count);
 
     var f = fdt.Fdt.init(allocator);
     defer f.deinit();
@@ -223,6 +230,29 @@ test "dtb builds and addresses are consistent" {
     try std.testing.expect(std.mem.indexOf(u8, blob, "arm,gic-v3") != null);
     try std.testing.expect(std.mem.indexOf(u8, blob, "virtio,mmio") != null);
     try std.testing.expect(std.mem.indexOf(u8, blob, "sporevm,generation-v1") != null);
+}
+
+test "dtb builds one cpu node per configured vcpu" {
+    const redist_size = try redistributorRegionSize(0x2_0000, 2);
+    try std.testing.expectEqual(@as(u64, 0x4_0000), redist_size);
+
+    const blob = try buildDtb(std.testing.allocator, .{
+        .ram_size = 512 * 1024 * 1024,
+        .cpu_count = 2,
+        .gic = .{
+            .distributor_base = 0x0800_0000,
+            .distributor_size = 0x1_0000,
+            .redistributor_base = 0x0802_0000,
+            .redistributor_size = redist_size,
+        },
+        .virtio_count = 1,
+        .bootargs = "console=hvc0",
+    });
+    defer std.testing.allocator.free(blob);
+
+    try std.testing.expect(std.mem.indexOf(u8, blob, "cpu@0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blob, "cpu@1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blob, "cpu@2") == null);
 }
 
 test "virtio addressing helpers" {

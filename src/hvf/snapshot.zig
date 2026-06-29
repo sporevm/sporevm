@@ -10,6 +10,12 @@ const hvf = @import("hvf.zig");
 const board = @import("../board.zig");
 const gicv3 = @import("../gicv3.zig");
 const spore = @import("../spore.zig");
+const topology = @import("../topology.zig");
+
+pub const VcpuRef = struct {
+    index: topology.VcpuIndex,
+    handle: hvf.VcpuHandle,
+};
 
 /// EL1 context registers captured into the spore, by architectural name.
 /// Order is part of the v0 format only insofar as names must round-trip.
@@ -56,19 +62,47 @@ pub fn hostCounterFreq() u64 {
 }
 
 pub fn captureMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle) !spore.MachineState {
-    var state: spore.MachineState = undefined;
+    const vcpu_state = try captureVcpuState(allocator, .{ .index = 0, .handle = vcpu });
+    return .{
+        .gprs = vcpu_state.gprs,
+        .pc = vcpu_state.pc,
+        .cpsr = vcpu_state.cpsr,
+        .fpcr = vcpu_state.fpcr,
+        .fpsr = vcpu_state.fpsr,
+        .simd = vcpu_state.simd,
+        .sys_regs = vcpu_state.sys_regs,
+        .icc_regs = vcpu_state.icc_regs,
+        .vtimer = vcpu_state.vtimer,
+        .gic = try captureGicState(allocator),
+    };
+}
+
+pub fn captureMachineV1(allocator: std.mem.Allocator, vcpus: []spore.VcpuState) !spore.MachineStateV1 {
+    if (vcpus.len == 0 or vcpus.len > topology.max_vcpus) return error.PlatformMismatch;
+    const machine = spore.MachineStateV1{
+        .vcpus = vcpus,
+        .gic = try captureGicState(allocator),
+    };
+    try gicv3.validate(machine.gic);
+    return machine;
+}
+
+pub fn captureVcpuState(allocator: std.mem.Allocator, vcpu: VcpuRef) !spore.VcpuState {
+    var state: spore.VcpuState = undefined;
+    state.index = vcpu.index;
+    state.mpidr = topology.mpidrForIndex(vcpu.index);
 
     for (0..31) |i| {
-        try hvf.check(hvf.hv_vcpu_get_reg(vcpu, @enumFromInt(@as(u32, @intCast(i))), &state.gprs[i]), "get gpr");
+        try hvf.check(hvf.hv_vcpu_get_reg(vcpu.handle, @enumFromInt(@as(u32, @intCast(i))), &state.gprs[i]), "get gpr");
     }
-    try hvf.check(hvf.hv_vcpu_get_reg(vcpu, .pc, &state.pc), "get pc");
-    try hvf.check(hvf.hv_vcpu_get_reg(vcpu, .cpsr, &state.cpsr), "get cpsr");
-    try hvf.check(hvf.hv_vcpu_get_reg(vcpu, .fpcr, &state.fpcr), "get fpcr");
-    try hvf.check(hvf.hv_vcpu_get_reg(vcpu, .fpsr, &state.fpsr), "get fpsr");
+    try hvf.check(hvf.hv_vcpu_get_reg(vcpu.handle, .pc, &state.pc), "get pc");
+    try hvf.check(hvf.hv_vcpu_get_reg(vcpu.handle, .cpsr, &state.cpsr), "get cpsr");
+    try hvf.check(hvf.hv_vcpu_get_reg(vcpu.handle, .fpcr, &state.fpcr), "get fpcr");
+    try hvf.check(hvf.hv_vcpu_get_reg(vcpu.handle, .fpsr, &state.fpsr), "get fpsr");
 
     for (0..32) |i| {
         var q: hvf.SimdReg = undefined;
-        try hvf.check(hvf.hv_vcpu_get_simd_fp_reg(vcpu, @intCast(i), &q), "get simd");
+        try hvf.check(hvf.hv_vcpu_get_simd_fp_reg(vcpu.handle, @intCast(i), &q), "get simd");
         state.simd[i][0] = std.mem.readInt(u64, q.bytes[0..8], .little);
         state.simd[i][1] = std.mem.readInt(u64, q.bytes[8..16], .little);
     }
@@ -76,18 +110,18 @@ pub fn captureMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle) !spore
     const regs = try allocator.alloc(spore.SysRegEntry, saved_sys_regs.len);
     for (saved_sys_regs, 0..) |reg, i| {
         var value: u64 = undefined;
-        try hvf.check(hvf.hv_vcpu_get_sys_reg(vcpu, reg, &value), "get sysreg");
+        try hvf.check(hvf.hv_vcpu_get_sys_reg(vcpu.handle, reg, &value), "get sysreg");
         regs[i] = .{ .name = @tagName(reg), .value = value };
     }
     state.sys_regs = regs;
 
     // Virtual timer: normalize to the guest's virtual counter value.
     var voff: u64 = 0;
-    try hvf.check(hvf.hv_vcpu_get_vtimer_offset(vcpu, &voff), "get vtimer offset");
+    try hvf.check(hvf.hv_vcpu_get_vtimer_offset(vcpu.handle, &voff), "get vtimer offset");
     var cntv_ctl: u64 = 0;
     var cntv_cval: u64 = 0;
-    try hvf.check(hvf.hv_vcpu_get_sys_reg(vcpu, .cntv_ctl_el0, &cntv_ctl), "get cntv_ctl");
-    try hvf.check(hvf.hv_vcpu_get_sys_reg(vcpu, .cntv_cval_el0, &cntv_cval), "get cntv_cval");
+    try hvf.check(hvf.hv_vcpu_get_sys_reg(vcpu.handle, .cntv_ctl_el0, &cntv_ctl), "get cntv_ctl");
+    try hvf.check(hvf.hv_vcpu_get_sys_reg(vcpu.handle, .cntv_cval_el0, &cntv_cval), "get cntv_cval");
     state.vtimer = .{
         .cntvct = hostCounter() -% voff,
         .cntv_ctl = cntv_ctl,
@@ -108,25 +142,34 @@ pub fn captureMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle) !spore
     const icc = try allocator.alloc(spore.SysRegEntry, icc_save.len);
     for (icc_save, 0..) |reg, i| {
         var value: u64 = 0;
-        try hvf.check(hvf.hv_gic_get_icc_reg(vcpu, reg, &value), "get icc reg");
+        try hvf.check(hvf.hv_gic_get_icc_reg(vcpu.handle, reg, &value), "get icc reg");
         icc[i] = .{ .name = @tagName(reg), .value = value };
     }
     state.icc_regs = icc;
 
-    state.gic = .{
-        .kind = .backend_private,
-        .backend_private = .{
-            .backend = .hvf,
-            .format = gicv3.hvf_backend_private_format,
-            .data_b64 = try captureGic(allocator),
-        },
-    };
     return state;
 }
 
 pub fn applyMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle, state: spore.MachineState) !void {
     // GIC state first: must be applied before the vCPU runs.
-    try applyGic(allocator, vcpu, state.gic);
+    try applyGicState(allocator, vcpu, state.gic);
+    try applyVcpuState(vcpu, .{
+        .index = 0,
+        .mpidr = topology.mpidrForIndex(0),
+        .gprs = state.gprs,
+        .pc = state.pc,
+        .cpsr = state.cpsr,
+        .fpcr = state.fpcr,
+        .fpsr = state.fpsr,
+        .simd = state.simd,
+        .sys_regs = state.sys_regs,
+        .icc_regs = state.icc_regs,
+        .vtimer = state.vtimer,
+    });
+}
+
+pub fn applyVcpuState(vcpu: hvf.VcpuHandle, state: spore.VcpuState) !void {
+    if (state.mpidr != topology.mpidrForIndex(state.index)) return error.PlatformMismatch;
 
     for (0..31) |i| {
         try hvf.check(hvf.hv_vcpu_set_reg(vcpu, @enumFromInt(@as(u32, @intCast(i))), state.gprs[i]), "set gpr");
@@ -168,6 +211,17 @@ pub fn applyMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle, state: s
     try hvf.check(hvf.hv_vcpu_set_vtimer_mask(vcpu, false), "vtimer unmask");
 }
 
+fn captureGicState(allocator: std.mem.Allocator) !gicv3.State {
+    return .{
+        .kind = .backend_private,
+        .backend_private = .{
+            .backend = .hvf,
+            .format = gicv3.hvf_backend_private_format,
+            .data_b64 = try captureGic(allocator),
+        },
+    };
+}
+
 fn captureGic(allocator: std.mem.Allocator) ![]const u8 {
     const state = hvf.hv_gic_state_create() orelse return error.HvCallFailed;
     defer hvf.os_release(state);
@@ -183,7 +237,7 @@ fn captureGic(allocator: std.mem.Allocator) ![]const u8 {
     return out;
 }
 
-fn applyGic(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle, state: gicv3.State) !void {
+pub fn applyGicState(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle, state: gicv3.State) !void {
     try gicv3.validate(state);
     if (state.kind == .gicv3) {
         return applyPortableGic(vcpu, state.gicv3.?);

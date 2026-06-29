@@ -115,10 +115,16 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     try events.emitStart(opts.backend);
     errdefer |err| events.emitFailure(err) catch {};
 
-    const parsed = try spore.loadManifest(allocator, opts.spore_dir);
-    defer parsed.deinit();
+    var parsed: ?std.json.Parsed(spore.Manifest) = spore.loadManifest(allocator, opts.spore_dir) catch |err| blk: {
+        if (err != error.BadManifest) return @errorCast(err);
+        break :blk null;
+    };
+    defer if (parsed) |*manifest| manifest.deinit();
+    var parsed_v1: ?std.json.Parsed(spore.ManifestV1) = null;
+    defer if (parsed_v1) |*manifest| manifest.deinit();
+    if (parsed == null) parsed_v1 = try spore.loadManifestV1(allocator, opts.spore_dir);
 
-    const network_options = run_mod.networkOptionsFromManifest(allocator, parsed.value.network) catch {
+    const network_options = run_mod.networkOptionsFromManifest(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network) catch {
         failResumeSetup("spore resume: invalid network policy in manifest", .{});
     };
     var gateway: net_gateway.Process = undefined;
@@ -131,10 +137,13 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
     errdefer run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
 
-    validateResumeDiskManifest(parsed.value);
+    const devices = if (parsed) |manifest| manifest.value.devices else parsed_v1.?.value.devices;
+    const rootfs = if (parsed) |manifest| manifest.value.rootfs else parsed_v1.?.value.rootfs;
+    const disk = if (parsed) |manifest| manifest.value.disk else parsed_v1.?.value.disk;
+    validateResumeDiskManifestParts(devices, rootfs, disk);
     var runtime_disk_state = try runtime_disk.open(context, allocator, .{
-        .rootfs = parsed.value.rootfs,
-        .disk = parsed.value.disk,
+        .rootfs = rootfs,
+        .disk = disk,
         .spore_dir = opts.spore_dir,
     });
     defer runtime_disk_state.deinit();
@@ -146,7 +155,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         }
     else
         null;
-    const attach = try prepareResumeAttach(allocator, parsed.value, generation_params);
+    const manifest_generation = if (parsed) |manifest| manifest.value.generation else parsed_v1.?.value.generation;
+    const attach = try prepareResumeAttach(allocator, manifest_generation, generation_params);
     defer attach.deinit(allocator);
     var identity_stream: ?vsock.HostStream = try vsock.HostStream.init(default_resume_guest_port, attach.request);
     if (identity_stream) |*stream| {
@@ -162,8 +172,10 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
 
     const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
-    const ram_size = parsed.value.platform.ram_size;
-    const local_backing = try spore.openProvenLocalMemoryBacking(allocator, context.environ_map, opts.spore_dir, parsed.value.memory, ram_size);
+    const ram_size = if (parsed) |manifest| manifest.value.platform.ram_size else parsed_v1.?.value.platform.ram_size;
+    const vcpu_count = if (parsed) |_| @as(u32, 1) else parsed_v1.?.value.platform.vcpu_count;
+    const memory = if (parsed) |manifest| manifest.value.memory else parsed_v1.?.value.memory;
+    const local_backing = try spore.openProvenLocalMemoryBackingForVcpuCount(allocator, context.environ_map, opts.spore_dir, memory, ram_size, vcpu_count);
     defer if (local_backing.fd) |fd| {
         _ = std.c.close(fd);
     };
@@ -179,6 +191,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .disk_backend = runtime_disk_state.backend(),
                 .resume_dir = opts.spore_dir,
                 .resume_generation = attach.generation_state,
+                .vcpus = vcpu_count,
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
@@ -197,6 +210,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .disk_backend = runtime_disk_state.backend(),
                 .resume_dir = opts.spore_dir,
                 .resume_generation = attach.generation_state,
+                .vcpus = vcpu_count,
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
@@ -210,7 +224,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     switch (cause) {
         .guest_off, .guest_reset => {},
         .probe_complete => {
-            var result = try resultFromResumeStream(backend, ram_size, identity_stream);
+            var result = try resultFromResumeStream(backend, ram_size, vcpu_count, identity_stream);
             result = result.withMemoryRestore(local_backing);
             run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
             try events.emitExit(result);
@@ -231,7 +245,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .exec_response_ms = response_ms,
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = 0,
-        .vcpus = 1,
+        .vcpus = vcpu_count,
         .memory_bytes = ram_size,
     };
     result = result.withMemoryRestore(local_backing);
@@ -275,7 +289,7 @@ fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) T {
     return parsed;
 }
 
-fn resultFromResumeStream(backend: Backend, ram_size: u64, identity_stream: ?vsock.HostStream) !run_mod.Result {
+fn resultFromResumeStream(backend: Backend, ram_size: u64, vcpu_count: u32, identity_stream: ?vsock.HostStream) !run_mod.Result {
     const stream = identity_stream orelse return error.UnexpectedResumeExit;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
@@ -286,7 +300,7 @@ fn resultFromResumeStream(backend: Backend, ram_size: u64, identity_stream: ?vso
         .exec_response_ms = response_ms,
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
-        .vcpus = 1,
+        .vcpus = vcpu_count,
         .memory_bytes = ram_size,
     };
 }
@@ -307,11 +321,11 @@ fn loadGenerationParams(io: Io, allocator: std.mem.Allocator, path: []const u8) 
     return params;
 }
 
-fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest, generation_params: ?[]const u8) !PreparedResumeAttach {
+fn prepareResumeAttach(allocator: std.mem.Allocator, manifest_generation: spore.GenerationState, generation_params: ?[]const u8) !PreparedResumeAttach {
     var gen_dev = generation.Device{};
-    try gen_dev.restore(allocator, manifest.generation);
+    try gen_dev.restore(allocator, manifest_generation);
     if (generation_params) |params| {
-        _ = try gen_dev.setResume(manifest.generation.generation, params);
+        _ = try gen_dev.setResume(manifest_generation.generation, params);
     } else {
         try spore.refreshResumeParams(allocator, &gen_dev);
     }
@@ -351,20 +365,20 @@ fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest, g
     };
 }
 
-fn validateResumeDiskManifest(manifest: spore.Manifest) void {
-    const disk_count = spore.countBlockDevices(manifest.devices);
+fn validateResumeDiskManifestParts(devices: []const spore.TransportState, rootfs_opt: ?spore.Rootfs, disk_opt: ?spore.Disk) void {
+    const disk_count = spore.countBlockDevices(devices);
     if (disk_count == 0) return;
     if (disk_count != 1) {
         failResumeSetup("spore resume: only one immutable rootfs disk is supported; found {d} block devices", .{disk_count});
     }
-    const rootfs = manifest.rootfs orelse {
+    const rootfs = rootfs_opt orelse {
         failResumeSetup("spore resume: disk-backed spore has no immutable rootfs artifact; capture with spore run --image or use the backend harness with the original disk", .{});
     };
-    spore.validateRootfs(rootfs, manifest.devices) catch {
+    spore.validateRootfs(rootfs, devices) catch {
         failResumeSetup("spore resume: invalid immutable rootfs metadata in manifest", .{});
     };
-    if (manifest.disk) |disk| {
-        spore.validateDisk(disk, rootfs, manifest.devices) catch {
+    if (disk_opt) |writable_disk| {
+        spore.validateDisk(writable_disk, rootfs, devices) catch {
             failResumeSetup("spore resume: invalid writable disk metadata in manifest", .{});
         };
     }
@@ -398,7 +412,7 @@ test "resume cli parser accepts generation file" {
 test "resume attach request omits empty generation params" {
     const allocator = std.testing.allocator;
     const manifest = testDiskGuardManifest(&.{}, false);
-    const attach = try prepareResumeAttach(allocator, manifest, null);
+    const attach = try prepareResumeAttach(allocator, manifest.generation, null);
     defer attach.deinit(allocator);
     try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", attach.request);
     try std.testing.expectEqualStrings("", attach.generation_state.params_b64);
@@ -415,7 +429,7 @@ test "resume attach request carries refreshed generation params" {
     manifest.generation = try gen_dev.capture(allocator);
     defer allocator.free(manifest.generation.params_b64);
 
-    const attach = try prepareResumeAttach(allocator, manifest, null);
+    const attach = try prepareResumeAttach(allocator, manifest.generation, null);
     defer attach.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"type\":\"attach\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"params_json\":\"") != null);
@@ -448,7 +462,7 @@ test "resume attach request accepts explicit generation params" {
     try generation.validateFanoutParams(allocator, params);
 
     const manifest = testDiskGuardManifest(&.{}, false);
-    const attach = try prepareResumeAttach(allocator, manifest, params);
+    const attach = try prepareResumeAttach(allocator, manifest.generation, params);
     defer attach.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"run_id\\\":\\\"rails-rspec-1\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"parallel_index\\\":7") != null);
@@ -517,6 +531,8 @@ test "resume accepts writable disk manifests for layered runtime setup" {
         .interrupt_status = 0,
         .queues = &.{},
     }};
-    validateResumeDiskManifest(testDiskGuardManifest(&devices, false));
-    validateResumeDiskManifest(testDiskGuardManifest(&devices, true));
+    const without_disk = testDiskGuardManifest(&devices, false);
+    validateResumeDiskManifestParts(without_disk.devices, without_disk.rootfs, without_disk.disk);
+    const with_disk = testDiskGuardManifest(&devices, true);
+    validateResumeDiskManifestParts(with_disk.devices, with_disk.rootfs, with_disk.disk);
 }
