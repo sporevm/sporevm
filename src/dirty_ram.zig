@@ -103,25 +103,25 @@ pub const FlushOptions = struct {
     before_seal_ctx: ?*anyopaque = null,
 };
 
-pub const TrackerStats = struct {
-    dirty_epoch_ms: u64 = 0,
-    dirty_epoch_count: u64 = 0,
-    worker_epoch_max_ms: u64 = 0,
-    worker_cadence_lag_max_ms: u64 = 0,
-    worker_cadence_lag_total_ms: u64 = 0,
-    worker_epoch_overrun_count: u64 = 0,
-    worker_epoch_overrun_ms: u64 = 0,
-    worker_join_ms: u64 = 0,
-    finish_worker_stop_ms: u64 = 0,
-};
-
 pub const TrackerCore = struct {
+    pub const Stats = struct {
+        dirty_epoch_ms: u64 = 0,
+        dirty_epoch_count: u64 = 0,
+        worker_epoch_max_ms: u64 = 0,
+        worker_cadence_lag_max_ms: u64 = 0,
+        worker_cadence_lag_total_ms: u64 = 0,
+        worker_epoch_overrun_count: u64 = 0,
+        worker_epoch_overrun_ms: u64 = 0,
+        worker_join_ms: u64 = 0,
+        finish_worker_stop_ms: u64 = 0,
+    };
+
     epoch_ms: u64,
     stop: std.atomic.Value(bool) = .init(false),
     worker_thread: ?std.Thread = null,
     worker_failed: bool = false,
     tracking_start_ms: u64 = 0,
-    stats: TrackerStats = .{},
+    stats: @This().Stats = .{},
 
     pub fn init(epoch_ms: u64) TrackerCore {
         return .{
