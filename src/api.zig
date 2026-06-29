@@ -254,6 +254,7 @@ pub const RunFromSporeOptions = struct {
     /// Leave empty to attach to the captured default session.
     command: []const []const u8,
     interactive: bool = false,
+    tty: bool = false,
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
@@ -847,6 +848,7 @@ pub fn runFromSpore(
         .resume_dir = options.spore_dir,
         .command = options.command,
         .interactive = options.interactive,
+        .tty = options.tty,
         .memory = try memory_config.fromManifestBytes(if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size),
         .vcpus = manifest_vcpus,
         .guest_port = options.guest_port,

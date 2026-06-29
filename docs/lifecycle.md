@@ -97,8 +97,10 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
 - `spore run -t` allocates a guest PTY for one-shot runs, and `spore run -it`
   forwards host terminal input in raw mode. TTY mode has one merged terminal
   output stream; JSONL emits it as `event:"terminal"`.
-- `spore run -t --from` and named interactive `spore exec -it` are not
-  implemented yet.
+- `spore run -i --from` and `spore run -t --from` can attach to captured live
+  sessions only when that session was originally started with interactive stdin
+  or a PTY. `spore run -t --from <command>` and named interactive
+  `spore exec -it` are not implemented yet.
 - No multi-vCPU named live fork yet.
 - No disk-backed or networked named live fork yet.
 - No live network-flow checkpointing.

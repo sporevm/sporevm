@@ -140,6 +140,11 @@ const result = try libspore.runFromSpore(context, allocator, .{
 });
 ```
 
+Leave `.command` empty to attach to the captured default session. Set
+`.interactive = true` or `.tty = true` only when that captured session was
+started with interactive stdin or a PTY; unsupported input attach returns a
+guest exit error instead of silently downgrading to output-only attach.
+
 `RunResult.memory_restore_source` and `memory_restore_reason` are populated for
 `runFromSpore` and `resumeSpore`, so embedders can tell whether RAM came from
 `local_backing` or verified `chunks` without parsing logs.

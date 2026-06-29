@@ -220,6 +220,17 @@ spore run --from base.spore 'cat /var/tmp/example'
 spore run --from base.spore
 ```
 
+If the captured session was still running with a guest terminal, reattach with
+the same explicit terminal flags:
+
+```bash
+spore run -it --from live-shell.spore
+```
+
+Input attach fails closed when the captured session was not started with
+interactive stdin or a terminal. The spore contains guest process and PTY
+state, not the original host terminal connection.
+
 `--from` resumes the spore and either attaches to the captured default session
 or runs a fresh command through the restored exec agent. See
 [docs/filesystem.md](docs/filesystem.md) for rootfs-backed writable state and
@@ -318,6 +329,7 @@ Useful focused checks:
 mise run smoke:run
 mise run smoke:run-stdin
 mise run smoke:run-tty
+mise run smoke:run-attach
 mise run smoke:run-capture
 mise run smoke:rootfs-fanout
 mise run smoke:writable-rootfs

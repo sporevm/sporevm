@@ -120,24 +120,25 @@ different. It must be explicit.
   or attach semantics.
 - The minimal initrd mounts `/proc`, `sysfs`, cgroup2, `devtmpfs`, and devpts
   for one-shot PTY allocation.
-- `docs/lifecycle.md` now documents `spore run -i` pipe-style stdin and
-  `spore run -t/-it` one-shot TTY mode. Named interactive exec and TTY attach
-  remain future work.
+- `docs/lifecycle.md` now documents `spore run -i` pipe-style stdin,
+  `spore run -t/-it` one-shot TTY mode, and input/TTY attach for captured live
+  `spore run --from` sessions. Named interactive exec remains future work.
 
 ## Progress Snapshot
 
 - Slice 1 is implemented, locally reviewed, and committed on
   `lox/tty-input-plan`.
-- Slice 2 is implemented locally. `spore run -t` requests `stdio:"tty"`,
+- Slice 2 is implemented and committed. `spore run -t` requests `stdio:"tty"`,
   allocates a guest PTY, streams terminal output on SPIO stream 4, emits JSONL
   `terminal` events, applies resize frames, and uses raw host stdin for `-it`.
-- The CLI rejects `-t --from` until the attach slice owns restored-session input
-  semantics.
+- Slice 3 is implemented locally. `spore run --from` still uses legacy
+  output-only attach by default; `-i` or `-t` selects `attach-v1`, validates the
+  restored guest session capability, and starts host attachment state fresh for
+  each restored spore or forked child.
 - Validation passed with `mise run test`, `mise run build`, `git diff --check`,
-  `mise run smoke:run`, `mise run smoke:run-stdin`, and
-  `mise run smoke:run-tty`.
-- Interactive attach, streaming named exec, and public `spore attach` remain
-  future slices.
+  `mise run smoke:run`, `mise run smoke:run-stdin`, `mise run smoke:run-tty`,
+  and `mise run smoke:run-attach`.
+- Streaming named exec and public `spore attach` remain future slices.
 
 ## Target User Model
 
@@ -603,6 +604,7 @@ mise run smoke:run
 mise run smoke:lifecycle
 scripts/smoke-run-stdin.sh
 scripts/smoke-run-tty.sh
+scripts/smoke-run-attach.sh
 scripts/smoke-lifecycle-tty.sh
 ```
 

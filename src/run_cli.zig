@@ -79,12 +79,10 @@ fn runParsed(
                 error.ShellCommandArgumentCountUnsupported => failRunSetup("spore run: shell command form accepts one command string; quote it or use -- for argv", .{}),
                 else => return err,
             };
-        if (parsed.interactive and command.len == 0) {
-            failRunSetup("spore run: -i with --from output attach is not supported yet; pass a command or omit -i", .{});
+        if (parsed.tty and command.len != 0) {
+            failRunSetup("spore run: -t with --from command execution is not supported yet; omit the command to attach", .{});
         }
-        if (parsed.tty) {
-            failRunSetup("spore run: -t with --from is not supported yet", .{});
-        }
+        validateTerminalPolicy(parsed);
         return api.runFromSpore(.{
             .io = init.io,
             .environ_map = init.environ_map,
@@ -93,6 +91,7 @@ fn runParsed(
             .spore_dir = spore_dir,
             .command = command,
             .interactive = parsed.interactive,
+            .tty = parsed.tty,
             .vcpus = parsed.shared.vcpus,
             .guest_port = parsed.shared.guest_port,
             .timeout_ms = parsed.shared.timeout_ms,

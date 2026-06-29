@@ -113,6 +113,7 @@ struct session {
   int stdout_open;
   int stderr_open;
   int stdin_open;
+  int stdin_capable;
   int stdin_close_pending;
   int tty;
   int terminal_close_pending;
@@ -141,6 +142,8 @@ struct client {
   uint64_t stdin_offset;
   uint64_t terminal_offset;
   uint64_t terminal_input_offset;
+  int stdin_input_owner;
+  int terminal_input_owner;
   unsigned char v1_header[SPIO_HEADER_LEN];
   size_t v1_header_len;
   uint8_t v1_type;
@@ -947,6 +950,8 @@ static void close_client(struct client *client) {
   client->stdin_offset = 0;
   client->terminal_offset = 0;
   client->terminal_input_offset = 0;
+  client->stdin_input_owner = 0;
+  client->terminal_input_owner = 0;
   client->v1_header_len = 0;
   client->v1_type = 0;
   client->v1_stream_id = 0;
@@ -1162,6 +1167,7 @@ struct run_request {
   int protocol_v1;
   int stdin_enabled;
   int tty;
+  int interactive;
   uint16_t terminal_rows;
   uint16_t terminal_cols;
   int memory_pressure;
@@ -1226,6 +1232,9 @@ static int parse_request(const char *req, struct run_request *out) {
       out->protocol_v1 = 1;
     } else if (strcmp(type, "attach") == 0) {
       out->kind = REQUEST_ATTACH;
+    } else if (strcmp(type, "attach-v1") == 0) {
+      out->kind = REQUEST_ATTACH;
+      out->protocol_v1 = 1;
     } else if (strcmp(type, "generation") == 0) {
       out->kind = REQUEST_GENERATION;
     } else {
@@ -1261,6 +1270,30 @@ static int parse_request(const char *req, struct run_request *out) {
     if (out->kind == REQUEST_GENERATION && params_rc <= 0) return -1;
     if (params_rc < 0) return -1;
   }
+  if (out->protocol_v1 && (out->kind == REQUEST_START || out->kind == REQUEST_ATTACH)) {
+    char stdio[16];
+    int stdio_rc = parse_string_field(req, "stdio", stdio, sizeof(stdio));
+    if (stdio_rc <= 0) return -1;
+    if (strcmp(stdio, "pipe") == 0) {
+      out->stdin_enabled = 1;
+    } else if (strcmp(stdio, "tty") == 0) {
+      out->tty = 1;
+      uint64_t rows = 0;
+      uint64_t cols = 0;
+      int rows_rc = parse_u64_field(req, "terminal_rows", &rows);
+      int cols_rc = parse_u64_field(req, "terminal_cols", &cols);
+      if (rows_rc < 0 || cols_rc < 0) return -1;
+      if (rows_rc > 0 && rows > 0 && rows <= UINT16_MAX) out->terminal_rows = (uint16_t)rows;
+      if (cols_rc > 0 && cols > 0 && cols <= UINT16_MAX) out->terminal_cols = (uint16_t)cols;
+    } else {
+      return -1;
+    }
+    int interactive = 0;
+    int interactive_rc = parse_bool_field(req, "interactive", &interactive);
+    if (interactive_rc < 0) return -1;
+    if (interactive_rc > 0) out->interactive = interactive;
+    if (out->kind == REQUEST_ATTACH && out->stdin_enabled && !out->interactive) return -1;
+  }
   if (out->kind == REQUEST_START) {
     if (parse_argv(req, out->arg_storage, out->argv) <= 0) return -1;
     if (parse_env(req, out->env_storage, out->envp) < 0) return -1;
@@ -1276,23 +1309,6 @@ static int parse_request(const char *req, struct run_request *out) {
     if (detached_rc < 0) return -1;
     if (detached_rc > 0) out->detached = detached;
     if (out->protocol_v1) {
-      char stdio[16];
-      int stdio_rc = parse_string_field(req, "stdio", stdio, sizeof(stdio));
-      if (stdio_rc <= 0) return -1;
-      if (strcmp(stdio, "pipe") == 0) {
-        out->stdin_enabled = 1;
-      } else if (strcmp(stdio, "tty") == 0) {
-        out->tty = 1;
-        uint64_t rows = 0;
-        uint64_t cols = 0;
-        int rows_rc = parse_u64_field(req, "terminal_rows", &rows);
-        int cols_rc = parse_u64_field(req, "terminal_cols", &cols);
-        if (rows_rc < 0 || cols_rc < 0) return -1;
-        if (rows_rc > 0 && rows > 0 && rows <= UINT16_MAX) out->terminal_rows = (uint16_t)rows;
-        if (cols_rc > 0 && cols > 0 && cols <= UINT16_MAX) out->terminal_cols = (uint16_t)cols;
-      } else {
-        return -1;
-      }
       if (out->detached) return -1;
     }
   }
@@ -1313,6 +1329,13 @@ static int send_client_error_exit(struct client *client, int code, const char *m
     if (send_spio_data(client->fd, SPIO_STDERR_STREAM, client->stderr_offset, (const unsigned char *)message, len) != 0) return -1;
     client->stderr_offset += len;
   }
+  if (send_spio_timing_frame(client->fd) != 0) return -1;
+  return send_spio_exit(client->fd, code);
+}
+
+static int send_client_exit(struct client *client, int code) {
+  if (client->fd < 0) return -1;
+  if (!client->protocol_v1) return send_exit_frame(client->fd, code);
   if (send_spio_timing_frame(client->fd) != 0) return -1;
   return send_spio_exit(client->fd, code);
 }
@@ -1557,6 +1580,7 @@ static int start_session(struct session *session, const char *session_id, char *
   session->stdout_fd = tty ? pty_master : stdout_pipe[0];
   session->stderr_fd = stderr_pipe[0];
   session->stdin_open = stdin_pipe[1] >= 0;
+  session->stdin_capable = stdin_enabled;
   session->tty = tty;
   session->stdout_open = tty ? pty_master >= 0 : 1;
   session->stderr_open = tty ? 0 : 1;
@@ -1718,9 +1742,7 @@ static int send_replay(struct client *client, const struct replay_buffer *replay
   if (*client_offset >= replay_end) return 0;
   size_t start = (size_t)(*client_offset - replay->base_offset);
   size_t len = replay->len - start;
-  if (send_stream_data(client->fd, name, *client_offset, replay->data + start, len) != 0) return -1;
-  *client_offset += len;
-  return 0;
+  return send_client_output(client, name, client_offset, *client_offset, replay->data + start, len);
 }
 
 static int attach_client(struct session *session, struct client *client, uint64_t stdout_offset, uint64_t stderr_offset) {
@@ -1728,12 +1750,12 @@ static int attach_client(struct session *session, struct client *client, uint64_
   client->stderr_offset = stderr_offset;
   if (send_replay(client, &session->stdout_replay, "stdout", &client->stdout_offset, session->stdout_offset) != 0 ||
       send_replay(client, &session->stderr_replay, "stderr", &client->stderr_offset, session->stderr_offset) != 0) {
-    (void)send_error_exit(client->fd, 125, "spore run: requested replay offset is unavailable\n");
+    (void)send_client_error_exit(client, 125, "spore run: requested replay offset is unavailable\n");
     close_client(client);
     return -1;
   }
   if (session->exited && !session->stdout_open && !session->stderr_open) {
-    (void)send_exit_frame(client->fd, session->exit_code);
+    (void)send_client_exit(client, session->exit_code);
     close_client(client);
   }
   return 0;
@@ -1782,11 +1804,10 @@ static void pump_session_terminal(struct session *session, struct client *client
   for (;;) {
     ssize_t n = read(session->terminal_fd, buf, sizeof(buf));
     if (n > 0) {
-      uint64_t frame_offset = session->terminal_offset;
       (void)write_all(STDOUT_FILENO, buf, (size_t)n);
       session->terminal_offset += (uint64_t)n;
       if (client->fd >= 0) {
-        (void)send_client_terminal_output(client, frame_offset, buf, (size_t)n);
+        (void)send_client_terminal_output(client, client->terminal_offset, buf, (size_t)n);
       }
       continue;
     }
@@ -1892,6 +1913,7 @@ static int handle_spio_frame(struct session *session, struct client *client) {
   if (client->v1_type == SPIO_DATA) {
     if (client->v1_stream_id == SPIO_TERMINAL_STREAM) {
       if (!session->tty || session->terminal_fd < 0) return -1;
+      if (!client->terminal_input_owner) return -1;
       if (client->v1_offset != client->terminal_input_offset) return -1;
       if (session->terminal_pending_len != 0) return -1;
       memcpy(session->terminal_pending, client->v1_payload, client->v1_payload_len);
@@ -1903,6 +1925,7 @@ static int handle_spio_frame(struct session *session, struct client *client) {
       return 0;
     }
     if (client->v1_stream_id != SPIO_STDIN_STREAM) return -1;
+    if (!client->stdin_input_owner) return -1;
     if (!session->stdin_open) return -1;
     if (client->v1_offset != client->stdin_offset) return -1;
     if (session->stdin_pending_len != 0) return -1;
@@ -1917,11 +1940,13 @@ static int handle_spio_frame(struct session *session, struct client *client) {
   if (client->v1_type == SPIO_CLOSE) {
     if (client->v1_stream_id == SPIO_TERMINAL_STREAM) {
       if (!session->tty || client->v1_payload_len != 0) return -1;
+      if (!client->terminal_input_owner) return -1;
       if (client->v1_offset != client->terminal_input_offset) return -1;
       close_session_terminal_input(session);
       return 0;
     }
     if (client->v1_stream_id != SPIO_STDIN_STREAM || client->v1_payload_len != 0) return -1;
+    if (!client->stdin_input_owner) return -1;
     if (client->v1_offset != client->stdin_offset) return -1;
     if (session->stdin_pending_len == 0) {
       close_session_stdin(session);
@@ -2112,6 +2137,8 @@ static void accept_request(int listener, struct session *session, struct client 
   client->stdout_offset = 0;
   client->stderr_offset = 0;
   client->stdin_offset = 0;
+  client->stdin_input_owner = request.protocol_v1 && request.stdin_enabled;
+  client->terminal_input_owner = request.protocol_v1 && request.tty && (request.kind == REQUEST_START || request.interactive);
 
   if (request.kind == REQUEST_GENERATION) {
     if (use_rootfs && !rootfs_ready) {
@@ -2199,6 +2226,42 @@ static void accept_request(int listener, struct session *session, struct client 
       return;
     }
     apply_generation_identity(request.generation_params);
+  }
+  if (request.protocol_v1) {
+    if (request.stdin_enabled) {
+      if (!session->stdin_capable) {
+        (void)send_client_error_exit(client, 2, "spore run: captured session has no interactive stdin\n");
+        close_client(client);
+        return;
+      }
+      if (!session->stdin_open) {
+        (void)send_client_error_exit(client, 2, "spore run: captured session stdin is closed\n");
+        close_client(client);
+        return;
+      }
+      (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
+      return;
+    }
+    if (request.tty) {
+      if (!session->tty) {
+        (void)send_client_error_exit(client, 2, "spore run: captured session has no terminal\n");
+        close_client(client);
+        return;
+      }
+      if (request.interactive && session->terminal_fd < 0) {
+        (void)send_client_error_exit(client, 2, "spore run: captured session terminal is closed\n");
+        close_client(client);
+        return;
+      }
+      if (session->terminal_fd >= 0) {
+        (void)apply_terminal_size(session->terminal_fd, request.terminal_rows, request.terminal_cols);
+      }
+      if (session->exited && !session->stdout_open) {
+        (void)send_client_exit(client, session->exit_code);
+        close_client(client);
+      }
+      return;
+    }
   }
   (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
 }

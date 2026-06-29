@@ -44,6 +44,10 @@ description = "Smoke product spore run interactive stdin forwarding"
 run = "mise run build && scripts/smoke-run-tty.sh"
 description = "Smoke product spore run one-shot TTY mode"
 
+[tasks."smoke:run-attach"]
+run = "mise run build && scripts/smoke-run-attach.sh"
+description = "Smoke product spore run interactive attach"
+
 [tasks."smoke:run-file-locking"]
 run = "mise run build && scripts/smoke-run-file-locking.sh"
 description = "Smoke product spore run guest file locking support"

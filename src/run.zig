@@ -678,7 +678,7 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
     if (err == error.TtyRunFromSporeUnsupported) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: -t with --from is not supported yet",
+            "spore run: -t with --from command execution is not supported yet; omit the command to attach",
             @errorName(err),
         );
     }
@@ -2149,7 +2149,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const setup_start = monotonicMs();
     try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
-    if (opts.tty and opts.resume_dir != null) return error.TtyRunFromSporeUnsupported;
+    if (opts.tty and opts.resume_dir != null and opts.command.len != 0) return error.TtyRunFromSporeUnsupported;
 
     const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
@@ -2559,7 +2559,17 @@ fn terminalSizeFd() std.c.fd_t {
 
 fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options, memory_pressure: bool) ![]const u8 {
     const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(context.io).nanoseconds);
-    if (opts.resume_dir != null and opts.command.len == 0) return attachRequest(allocator);
+    if (opts.resume_dir != null and opts.command.len == 0) {
+        if (opts.interactive or opts.tty) {
+            return attachV1Request(allocator, .{
+                .interactive = opts.interactive,
+                .tty = opts.tty,
+                .terminal_name = terminalName(context.environ_map),
+                .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
+            });
+        }
+        return attachRequest(allocator);
+    }
     if (opts.resume_dir == null) return execRequestWithSessionOptions(allocator, opts.command, "default", .{
         .env = opts.guest_env,
         .working_dir = opts.guest_working_dir,
@@ -2595,6 +2605,37 @@ fn attachRequest(allocator: std.mem.Allocator) ![]const u8 {
     }{};
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
+    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+}
+
+const AttachV1Options = struct {
+    interactive: bool = false,
+    tty: bool = false,
+    terminal_name: []const u8 = "xterm",
+    terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
+};
+
+fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) ![]const u8 {
+    const payload = struct {
+        type: []const u8 = "attach-v1",
+        session_id: []const u8 = "default",
+        stdout_offset: u64 = 0,
+        stderr_offset: u64 = 0,
+        stdio: []const u8,
+        interactive: bool,
+        term: []const u8,
+        terminal_rows: u16,
+        terminal_cols: u16,
+    }{
+        .stdio = if (options.tty) "tty" else "pipe",
+        .interactive = options.interactive,
+        .term = options.terminal_name,
+        .terminal_rows = options.terminal_size.rows,
+        .terminal_cols = options.terminal_size.cols,
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
@@ -3324,6 +3365,29 @@ test "run attach request resumes default session" {
     const request = try attachRequest(std.testing.allocator);
     defer std.testing.allocator.free(request);
     try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", request);
+}
+
+test "interactive run attach request uses v1 pipe stdio" {
+    const request = try attachV1Request(std.testing.allocator, .{ .interactive = true });
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"attach-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"pipe\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"interactive\":true") != null);
+}
+
+test "tty run attach request uses v1 terminal metadata" {
+    const request = try attachV1Request(std.testing.allocator, .{
+        .interactive = true,
+        .tty = true,
+        .terminal_name = "xterm-256color",
+        .terminal_size = .{ .rows = 40, .cols = 120 },
+    });
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"attach-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"tty\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"term\":\"xterm-256color\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_rows\":40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_cols\":120") != null);
 }
 
 test "run cli parser allows default boot assets" {
