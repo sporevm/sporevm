@@ -1,5 +1,5 @@
 ---
-status: active
+status: landed
 last_reviewed: 2026-06-30
 spec_refs:
   - docs/lifecycle.md
@@ -155,10 +155,14 @@ different. It must be explicit.
   wrapper over commandless `spore run --from DIR`. Named lifecycle
   `spore attach NAME` remains deferred until the monitor owns retained
   attachable sessions.
-- Implementation is complete locally. The final completion audit on 2026-06-30
-  re-ran `mise run check`, the focused HVF smoke set, and a branch-wide review
-  pass. Cross-backend KVM runtime validation is still pending because the AWS
-  SSO token for the SSM-backed A1/KVM validation path is expired.
+- Implementation is complete and validated. The final completion audit on
+  2026-06-30 re-ran `mise run check`, the focused HVF smoke set, and a
+  branch-wide review pass. KVM validation passed on
+  `i-08fa4a14319c9c1b5` (`sporevm-ci-apse2-linux-arm64`, c7gd.metal) with SSM
+  command `5946c280-a69f-4486-aed8-53d7dbafb7ab`: `smoke:run-stdin ok`,
+  `smoke:run-tty ok`, `smoke:run-attach ok backend=kvm`,
+  `smoke:lifecycle-tty ok`, and the raw pty checks reported
+  `interactive-tty-kvm-smoke ok`.
 
 ## Target User Model
 
