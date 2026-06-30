@@ -366,9 +366,13 @@ DYLD_LIBRARY_PATH="$PWD/$asset/lib:${DYLD_LIBRARY_PATH:-}" ./my_program
 To build and install the same layout from source:
 
 ```bash
-zig build --release=safe --prefix /path/to/prefix
+zig build -Dtarget=aarch64-macos.13.0 --release=safe --prefix /path/to/prefix
 export PKG_CONFIG_PATH="/path/to/prefix/lib/pkgconfig"
 ```
+
+On Linux ARM64, use `-Dtarget=aarch64-linux-musl` instead. Plain local macOS
+builds default to the same stable deployment target so cgo clients do not link
+a test binary for an older macOS version than `libspore.dylib`.
 
 Returned JSON strings are NUL-terminated for C convenience. The reported length
 excludes the trailing NUL and includes the final newline, matching CLI JSON
@@ -591,7 +595,7 @@ mise run build
 cd bindings/go
 PKG_CONFIG_PATH="$PWD/../../zig-out/lib/pkgconfig" \
 DYLD_LIBRARY_PATH="$PWD/../../zig-out/lib" \
-go test ./...
+go test -a ./...
 ```
 
 Use `LD_LIBRARY_PATH` instead of `DYLD_LIBRARY_PATH` on Linux.

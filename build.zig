@@ -1,8 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const macos_deployment_target = std.SemanticVersion{ .major = 13, .minor = 0, .patch = 0 };
+
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const target = b.standardTargetOptions(.{
+        .default_target = defaultTarget(),
+    });
     const target_os = target.result.os.tag;
     const target_arch = target.result.cpu.arch;
     const target_is_hvf = target_os == .macos and target_arch == .aarch64;
@@ -292,11 +296,42 @@ pub fn build(b: *std.Build) void {
 }
 
 fn macosFrameworkPath(b: *std.Build) ?std.Build.LazyPath {
-    const sdkroot = b.graph.environ_map.get("SDKROOT") orelse return null;
+    const sdkroot = macosSdkRoot(b) orelse return null;
     if (sdkroot.len == 0) {
         return null;
     }
     return .{ .cwd_relative = b.pathJoin(&.{ sdkroot, "System/Library/Frameworks" }) };
+}
+
+fn macosSdkRoot(b: *std.Build) ?[]const u8 {
+    if (b.graph.environ_map.get("SDKROOT")) |sdkroot| {
+        if (sdkroot.len != 0) {
+            return sdkroot;
+        }
+    }
+    if (builtin.os.tag != .macos) {
+        return null;
+    }
+
+    var code: u8 = undefined;
+    const stdout = b.runAllowFail(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }, &code, .ignore) catch return null;
+    const sdkroot = std.mem.trim(u8, stdout, " \t\r\n");
+    if (sdkroot.len == 0) {
+        return null;
+    }
+    return sdkroot;
+}
+
+fn defaultTarget() std.Target.Query {
+    if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) {
+        return .{
+            .cpu_arch = .aarch64,
+            .cpu_model = .native,
+            .os_tag = .macos,
+            .os_version_min = .{ .semver = macos_deployment_target },
+        };
+    }
+    return .{};
 }
 
 fn linkHypervisor(mod: *std.Build.Module, framework_path: ?std.Build.LazyPath) void {

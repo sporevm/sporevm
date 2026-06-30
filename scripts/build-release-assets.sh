@@ -67,7 +67,7 @@ build_target() {
       lib_archive_name="${lib_asset_dir}.tar.gz"
       ;;
     darwin-arm64)
-      zig_target="aarch64-macos"
+      zig_target="aarch64-macos.13.0"
       asset_dir="spore_Darwin_arm64"
       archive_name="${asset_dir}.tar.gz"
       lib_asset_dir="libspore_Darwin_arm64"
