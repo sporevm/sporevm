@@ -105,15 +105,15 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
   output stream; JSONL emits it as `event:"terminal"`.
 - `spore run -i --from` and `spore run -t --from` can attach to captured live
   sessions only when that session was originally started with interactive stdin
-  or a PTY. `spore attach [-i|-t|-it] <spore-dir>` is the public shorthand for
-  the commandless attach form. `spore run -t --from <command>` is not
+  or a PTY. Commandless `spore run --from <spore-dir>` resumes the captured
+  default session. `spore run -t --from <spore-dir> <command>` is not
   implemented yet.
 - `spore exec -i/-t` uses a streaming monitor request. The public bounded
   `execNamed` embedding API rejects interactive flags until a streaming
   embedding API exists.
-- `spore attach NAME` for named lifecycle VMs is not implemented yet. Named
-  create starts detached commands with stdio redirected to `/dev/null`, so there
-  is no retained default terminal session to attach to.
+- There is no public `spore attach` command yet. Reserve that spelling for
+  connecting to already-running named VMs once monitors own retained attachable
+  sessions.
 - No multi-vCPU named live fork yet.
 - No disk-backed or networked named live fork yet.
 - No live network-flow checkpointing.

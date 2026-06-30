@@ -151,10 +151,10 @@ different. It must be explicit.
   `mise run smoke:lifecycle`, `mise run smoke:lifecycle-tty`, `mise run
   smoke:run-stdin`, `mise run smoke:run-tty`, `mise run smoke:run-attach`, and
   a manual `expect` check for `spore exec -it box -- /bin/sh`.
-- Slice 5 is implemented as `spore attach [options] DIR`, a public convenience
-  wrapper over commandless `spore run --from DIR`. Named lifecycle
-  `spore attach NAME` remains deferred until the monitor owns retained
-  attachable sessions.
+- The public `spore attach` convenience wrapper is deferred. The name should be
+  reserved for connecting to an already-running VM; commandless
+  `spore run --from DIR` remains the explicit resume-and-attach path for
+  captured live sessions.
 - Implementation is complete and validated. The final completion audit on
   2026-06-30 re-ran `mise run check`, the focused HVF smoke set, and a
   branch-wide review pass. KVM validation passed on
@@ -238,10 +238,8 @@ omitted. Input-capable attach should only work for sessions that were started
 with stdin or TTY support:
 
 ```bash
-spore attach -it live-shell.spore
+spore run -it --from live-shell.spore
 ```
-
-`spore attach DIR` is shorthand for commandless `spore run --from DIR`.
 
 If the captured session used non-interactive `/dev/null` stdin, `-i` or `-t`
 attach should fail with a clear error. This keeps capture/fork semantics honest:
@@ -355,8 +353,8 @@ leave the later TTY work obvious.
 The first implementation should add one host-side module for the frame codec
 and stream state, for example `src/spore_stream.zig`, plus a small C equivalent
 inside the minimal initrd agent. The codec should be independent of `spore run`
-CLI parsing so `spore exec -it`, `spore attach`, JSONL output, and embedders can
-reuse it.
+CLI parsing so `spore exec -it`, commandless `spore run --from`, JSONL output,
+and embedders can reuse it.
 
 ### Host Stream Integration
 
@@ -567,7 +565,7 @@ Scope:
 Done when:
 
 - a shell started with `spore run -it --capture-on USR1 --continue-after-capture`
-  can be captured and later attached with `spore attach -it DIR`;
+  can be captured and later attached with `spore run -it --from DIR`;
 - a non-interactive captured command rejects `-i --from DIR` with a clear
   message;
 - forked children can be attached independently, with host attachment state
@@ -596,23 +594,22 @@ Done when:
 - `mise run smoke:lifecycle` still passes and a new interactive lifecycle smoke
   covers the streaming path.
 
-### Slice 5: Public `spore attach` Convenience
+### Deferred: Public `spore attach`
 
-Add `spore attach` only after the lower-level attach semantics are proven.
+Do not add `spore attach` as shorthand for `spore run --from`. The command name
+reads as "connect to an already-running VM", so keeping it out of this PR avoids
+shipping a counter-intuitive alias.
 
 Scope:
 
-- `spore attach DIR` attaches output to a captured product spore's default
-  session;
-- `spore attach -i DIR` claims input ownership if the captured session supports
-  stdin;
-- `spore attach -it DIR` attaches to a captured PTY session;
-- commands remain explicit through `spore run --from DIR 'command'`;
-- named lifecycle `spore attach NAME` is deferred because current named create
-  stdio is detached and there is no retained default session to attach to.
+- commandless `spore run --from DIR` remains the explicit way to resume a
+  captured spore and attach to its default session;
+- commands remain explicit through `spore run --from DIR 'command'`; and
+- future `spore attach NAME` should connect to already-running named VMs once
+  monitors own retained attachable sessions.
 
-Done when the command is only a thin CLI wrapper over already-tested attach
-contracts.
+Done when the public command semantics are redesigned around running VMs rather
+than captured spore directories.
 
 ## Verification
 

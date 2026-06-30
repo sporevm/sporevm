@@ -224,17 +224,15 @@ default session:
 
 ```bash
 spore run --from base.spore 'cat /var/tmp/example'
-spore attach base.spore
+spore run --from base.spore
 ```
 
 If the captured session was still running with a guest terminal, reattach with
 the same explicit terminal flags:
 
 ```bash
-spore attach -it live-shell.spore
+spore run -it --from live-shell.spore
 ```
-
-`spore attach DIR` is shorthand for commandless `spore run --from DIR`.
 
 Input attach fails closed when the captured session was not started with
 interactive stdin or a terminal. The spore contains guest process and PTY

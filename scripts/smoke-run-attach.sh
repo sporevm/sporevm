@@ -145,11 +145,11 @@ done
   die "live TTY capture did not write a manifest"
 }
 
-"${timeout_bin}" 60s "${spore_bin}" attach \
+"${timeout_bin}" 60s "${spore_bin}" run \
   --backend "${backend}" \
   -t \
   --events=jsonl \
-  "${tty_capture}" \
+  --from "${tty_capture}" \
   >"${tty_attach_jsonl}" 2>"${tty_attach_stderr}"
 
 jsonl_terminal_succeeds "${tty_attach_jsonl}" "tty-attach-tick:" || {
@@ -177,11 +177,11 @@ set -e
 [[ -f "${noninteractive_capture}/manifest.json" ]] || die "non-interactive capture did not write a manifest"
 
 set +e
-printf 'input\n' | "${timeout_bin}" 30s "${spore_bin}" attach \
+printf 'input\n' | "${timeout_bin}" 30s "${spore_bin}" run \
   --backend "${backend}" \
   -i \
   --events=jsonl \
-  "${noninteractive_capture}" \
+  --from "${noninteractive_capture}" \
   >"${reject_jsonl}" 2>"${reject_stderr}"
 reject_rc="$?"
 set -e
