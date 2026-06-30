@@ -5,7 +5,7 @@
 //! modules stay behind the in-repo implementation module.
 
 const api = @import("api.zig");
-pub const version = "1.3.0";
+pub const version = "1.4.0";
 
 pub const Backend = api.Backend;
 pub const CacheRoot = api.CacheRoot;
