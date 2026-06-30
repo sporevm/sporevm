@@ -129,7 +129,6 @@ write_checksums() {
 }
 
 create_or_update_release() {
-  local notes_path="docs/releases/${BUILDKITE_TAG}.md"
   local release_flags=()
 
   if [[ "${BUILDKITE_TAG}" == v0.* ]]; then
@@ -139,36 +138,19 @@ create_or_update_release() {
   fi
 
   if gh release view "${BUILDKITE_TAG}" --repo "${GITHUB_REPOSITORY_NAME}" >/dev/null 2>&1; then
-    if [[ -f "${notes_path}" ]]; then
-      gh release edit "${BUILDKITE_TAG}" \
-        --repo "${GITHUB_REPOSITORY_NAME}" \
-        --title "SporeVM ${BUILDKITE_TAG}" \
-        --notes-file "${notes_path}" \
-        "${release_flags[@]}"
-    else
-      gh release edit "${BUILDKITE_TAG}" \
-        --repo "${GITHUB_REPOSITORY_NAME}" \
-        --title "SporeVM ${BUILDKITE_TAG}" \
-        "${release_flags[@]}"
-    fi
+    gh release edit "${BUILDKITE_TAG}" \
+      --repo "${GITHUB_REPOSITORY_NAME}" \
+      --title "SporeVM ${BUILDKITE_TAG}" \
+      "${release_flags[@]}"
     return
   fi
 
-  if [[ -f "${notes_path}" ]]; then
-    gh release create "${BUILDKITE_TAG}" \
-      --repo "${GITHUB_REPOSITORY_NAME}" \
-      --verify-tag \
-      --title "SporeVM ${BUILDKITE_TAG}" \
-      --notes-file "${notes_path}" \
-      "${release_flags[@]}"
-  else
-    gh release create "${BUILDKITE_TAG}" \
-      --repo "${GITHUB_REPOSITORY_NAME}" \
-      --verify-tag \
-      --title "SporeVM ${BUILDKITE_TAG}" \
-      --generate-notes \
-      "${release_flags[@]}"
-  fi
+  gh release create "${BUILDKITE_TAG}" \
+    --repo "${GITHUB_REPOSITORY_NAME}" \
+    --verify-tag \
+    --title "SporeVM ${BUILDKITE_TAG}" \
+    --generate-notes \
+    "${release_flags[@]}"
 }
 
 upload_release_assets() {

@@ -309,8 +309,8 @@ mise run smoke:monitor-failure-modes
 ```
 
 Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).
-The release notes in [docs/releases/v1.3.0.md](docs/releases/v1.3.0.md) list
-the A1/KVM release gate.
+Release notes and release-gate summaries live on
+[GitHub releases](https://github.com/sporevm/sporevm/releases).
 
 ## Release
 
