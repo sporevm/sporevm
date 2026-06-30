@@ -104,6 +104,133 @@ func TestPull(t *testing.T) {
 	}
 }
 
+func TestExecNamedArgvMarshaling(t *testing.T) {
+	argv, freeArgv := cStringList([]string{"/bin/echo", "hello world"})
+	defer freeArgv()
+
+	if len(argv) != 2 {
+		t.Fatalf("argv len = %d", len(argv))
+	}
+	if got := goString(argv[0]); got != "/bin/echo" {
+		t.Fatalf("argv[0] = %q", got)
+	}
+	if got := goString(argv[1]); got != "hello world" {
+		t.Fatalf("argv[1] = %q", got)
+	}
+}
+
+func TestDecodeExecNamedResult(t *testing.T) {
+	result, err := decodeJSON[ExecNamedResult]([]byte(`{
+		"exit_code": 7,
+		"stdout": "ok\n",
+		"stderr": "err\n",
+		"network_events_jsonl": "{\"event\":\"network_decision\"}\n",
+		"stdout_truncated": false,
+		"stderr_truncated": true
+	}`), "exec named result")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode != 7 {
+		t.Fatalf("exit code = %d", result.ExitCode)
+	}
+	if result.Stdout != "ok\n" {
+		t.Fatalf("stdout = %q", result.Stdout)
+	}
+	if result.Stderr != "err\n" {
+		t.Fatalf("stderr = %q", result.Stderr)
+	}
+	if result.NetworkEventsJSONL != "{\"event\":\"network_decision\"}\n" {
+		t.Fatalf("network events = %q", result.NetworkEventsJSONL)
+	}
+	if result.StdoutTruncated {
+		t.Fatal("stdout unexpectedly truncated")
+	}
+	if !result.StderrTruncated {
+		t.Fatal("stderr truncation not decoded")
+	}
+
+	binary, err := decodeJSON[ExecNamedResult]([]byte(`{
+		"exit_code": 0,
+		"stdout": [255, 0, 65],
+		"stderr": [],
+		"network_events_jsonl": "",
+		"stdout_truncated": false,
+		"stderr_truncated": false
+	}`), "exec named result")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binary.Stdout != string([]byte{255, 0, 65}) {
+		t.Fatalf("binary stdout = %q", binary.Stdout)
+	}
+}
+
+func TestDecodeNamedList(t *testing.T) {
+	entries, err := decodeJSON[[]NamedListEntry]([]byte(`[
+		{
+			"name": "worker",
+			"state": "ready",
+			"pid": 42,
+			"memory": {"policy": "auto", "bytes": 17179869184},
+			"stats": {
+				"resident_bytes": 4096,
+				"backing_logical_bytes": null,
+				"backing_allocated_bytes": null,
+				"chunk_size": 2097152,
+				"chunks_total": 8,
+				"chunks_nonzero": 1,
+				"dirty_chunks_pending": 0
+			}
+		}
+	]`), "named list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entry count = %d", len(entries))
+	}
+	entry := entries[0]
+	if entry.Name != "worker" || entry.State != "ready" {
+		t.Fatalf("entry = %#v", entry)
+	}
+	if entry.PID == nil || *entry.PID != 42 {
+		t.Fatalf("pid = %#v", entry.PID)
+	}
+	if entry.Memory == nil || entry.Memory.Policy != "auto" || entry.Memory.Bytes != 17179869184 {
+		t.Fatalf("memory = %#v", entry.Memory)
+	}
+	if entry.Stats.ResidentBytes == nil || *entry.Stats.ResidentBytes != 4096 {
+		t.Fatalf("resident bytes = %#v", entry.Stats.ResidentBytes)
+	}
+	if entry.Stats.DirtyChunksPending == nil || *entry.Stats.DirtyChunksPending != 0 {
+		t.Fatalf("dirty chunks = %#v", entry.Stats.DirtyChunksPending)
+	}
+}
+
+func TestListNamedEmptyRuntime(t *testing.T) {
+	client, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	if err := os.Mkdir(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetEnv(context.Background(), "SPOREVM_RUNTIME_DIR", runtimeDir); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := client.ListNamed(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("entries = %#v", entries)
+	}
+}
+
 func writeInspectBundleFixture(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()

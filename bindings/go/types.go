@@ -202,6 +202,24 @@ type SnapshotNamedOptions struct {
 	Annotations map[string]string
 }
 
+// ExecNamedOptions runs an exact argv in a named VM.
+type ExecNamedOptions struct {
+	Name string
+	Argv []string
+}
+
+// ResumeNamedOptions starts a named VM from a spore checkpoint directory.
+type ResumeNamedOptions struct {
+	SporeDir        string
+	Name            string
+	SporeExecutable string
+}
+
+// RemoveNamedOptions destroys a named VM and removes its local lifecycle state.
+type RemoveNamedOptions struct {
+	Name string
+}
+
 // NamedLifecycleResult is the decoded spore.lifecycle.v1 contract.
 type NamedLifecycleResult struct {
 	Schema         string  `json:"schema"`
@@ -212,4 +230,38 @@ type NamedLifecycleResult struct {
 	PID            *int64  `json:"pid"`
 	ConsoleLogPath *string `json:"console_log_path"`
 	SporeDir       *string `json:"spore_dir"`
+}
+
+// ExecNamedResult is the decoded named exec result contract.
+type ExecNamedResult struct {
+	ExitCode           uint8  `json:"exit_code"`
+	Stdout             string `json:"stdout"`
+	Stderr             string `json:"stderr"`
+	NetworkEventsJSONL string `json:"network_events_jsonl"`
+	StdoutTruncated    bool   `json:"stdout_truncated"`
+	StderrTruncated    bool   `json:"stderr_truncated"`
+}
+
+// NamedListEntry describes one VM returned by ListNamed.
+type NamedListEntry struct {
+	Name   string           `json:"name"`
+	State  string           `json:"state"`
+	PID    *int64           `json:"pid"`
+	Memory *NamedListMemory `json:"memory"`
+	Stats  NamedListStats   `json:"stats"`
+}
+
+type NamedListMemory struct {
+	Policy string `json:"policy"`
+	Bytes  uint64 `json:"bytes"`
+}
+
+type NamedListStats struct {
+	ResidentBytes         *uint64 `json:"resident_bytes"`
+	BackingLogicalBytes   *uint64 `json:"backing_logical_bytes"`
+	BackingAllocatedBytes *uint64 `json:"backing_allocated_bytes"`
+	ChunkSize             *uint64 `json:"chunk_size"`
+	ChunksTotal           *uint64 `json:"chunks_total"`
+	ChunksNonzero         *uint64 `json:"chunks_nonzero"`
+	DirtyChunksPending    *uint64 `json:"dirty_chunks_pending"`
 }
