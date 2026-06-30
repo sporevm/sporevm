@@ -272,9 +272,27 @@ is true.
 
 `ExecNamedResult.network_events_jsonl` contains decoded JSONL network events
 captured during the exec window. Bound service declarations are recorded in
-captured manifests as restore-time requirements without host socket paths; a
-manifest with bound services fails closed on restore unless live bindings are
-provided by a future API.
+captured manifests as restore-time requirements without host socket paths. On
+restore, callers provide fresh live bindings keyed by service name:
+
+```zig
+const resumed = try libspore.resumeNamed(init, allocator, .{
+    .spore_dir = "cr-test.spore",
+    .name = "cr-test-resumed",
+    .bound_services = &.{.{
+        .name = "cleanroom-gateway",
+        .target = .{ .unix = "/tmp/fresh-cleanroom-gateway.sock" },
+    }},
+});
+defer libspore.deinitNamedLifecycleResult(allocator, resumed);
+```
+
+The manifest remains portable: it records the service name, guest host, and
+guest port, while the restore option supplies only the current host socket path.
+Restore fails closed if any declared service lacks a live binding, if a binding
+does not match a declared service name, or if duplicate bindings are supplied.
+The Zig `runFromSpore` and `resumeSpore` options use the same `.bound_services`
+restore field.
 
 ## Events
 
@@ -476,6 +494,22 @@ create.annotation_count = 1;
 
 if (spore_create_named_json(context, &create, &json) != SPORE_SUCCESS) return 1;
 spore_free_string(context, json);
+
+SporeResumeNamedOptions resume;
+spore_resume_named_options_init(&resume);
+resume.spore_dir = (SporeString){ .ptr = "worker-1.spore", .len = 14 };
+resume.name = (SporeString){ .ptr = "worker-2", .len = 8 };
+SporeBoundUnixServiceBinding bindings[] = {
+    {
+        .name = { .ptr = "cleanroom-gateway", .len = 17 },
+        .unix_path = { .ptr = "/tmp/fresh-cleanroom-gateway.sock", .len = 33 },
+    },
+};
+resume.bound_unix_services = bindings;
+resume.bound_unix_service_count = 1;
+
+if (spore_resume_named_json(context, &resume, &json) != SPORE_SUCCESS) return 1;
+spore_free_string(context, json);
 ```
 
 Set `SPOREVM_RUNTIME_DIR`, cache roots, and similar process settings with
@@ -521,6 +555,13 @@ if err != nil {
 
 created, err := client.CreateNamed(ctx, spore.CreateNamedOptions{
     Name: "worker",
+    NetworkEnabled: true,
+    BoundServices: []spore.BoundUnixService{{
+        Name:      "cleanroom-gateway",
+        GuestHost: "gateway.cleanroom.internal",
+        GuestPort: 8170,
+        UnixPath:  "/tmp/cleanroom-gateway.sock",
+    }},
     Annotations: map[string]string{
         "dev.buildkite.cleanroom.policy_hash": "sha256:abc123",
     },
@@ -552,6 +593,10 @@ if err != nil {
 resumed, err := client.ResumeNamed(ctx, spore.ResumeNamedOptions{
     SporeDir: "worker.spore",
     Name:     "worker-resumed",
+    BoundServiceBindings: []spore.BoundUnixServiceBinding{{
+        Name:     "cleanroom-gateway",
+        UnixPath: "/tmp/fresh-cleanroom-gateway.sock",
+    }},
 })
 if err != nil {
     return err
@@ -596,7 +641,7 @@ When setting `SPOREVM_RUNTIME_DIR`, pass an absolute directory that exists and
 is private to the current user, matching the named lifecycle registry rules.
 
 The Go binding decodes the same JSON contracts as the CLI and C ABI, and it
-requires C ABI version 8 or newer. Go context cancellation is checked before
+requires C ABI version 9 or newer. Go context cancellation is checked before
 entering C calls; long-running runtime cancellation is not exposed until the Zig
 product API and C ABI provide it.
 

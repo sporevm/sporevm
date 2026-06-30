@@ -41,6 +41,7 @@ pub const ForkNamedOptions = api.ForkNamedOptions;
 pub const ExecNamedOptions = api.ExecNamedOptions;
 pub const ExecNamedResult = api.ExecNamedResult;
 pub const BoundService = api.BoundService;
+pub const BoundServiceBinding = api.BoundServiceBinding;
 pub const BoundServiceTarget = api.BoundServiceTarget;
 pub const NamedNetworkOptions = api.NamedNetworkOptions;
 pub const NetworkCapabilities = api.NetworkCapabilities;

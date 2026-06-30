@@ -23,6 +23,9 @@ pub const ParseError = error{
     InvalidBoundServiceName,
     InvalidBoundServiceTarget,
     UnsupportedBoundServiceTarget,
+    MissingBoundServiceBinding,
+    UnexpectedBoundServiceBinding,
+    DuplicateBoundServiceBinding,
     TooManyAllowCidrs,
     TooManyAllowHosts,
     TooManyExactRules,
@@ -76,6 +79,11 @@ pub const BoundService = struct {
     name: []const u8,
     guest_host: []const u8,
     guest_port: u16,
+    target: BoundServiceTarget,
+};
+
+pub const BoundServiceBinding = struct {
+    name: []const u8,
     target: BoundServiceTarget,
 };
 
@@ -257,6 +265,14 @@ pub const Config = struct {
 };
 
 pub fn configFromManifestNetwork(allocator: std.mem.Allocator, network: spore.Network) !Config {
+    return configFromManifestNetworkWithBindings(allocator, network, &.{});
+}
+
+pub fn configFromManifestNetworkWithBindings(
+    allocator: std.mem.Allocator,
+    network: spore.Network,
+    bindings: []const BoundServiceBinding,
+) !Config {
     try spore.validateNetwork(network);
     var policy = Config{};
     if (network.default_action) |action| {
@@ -274,8 +290,59 @@ pub fn configFromManifestNetwork(allocator: std.mem.Allocator, network: spore.Ne
         const ports = try allocator.dupe(u16, rule.ports);
         try policy.addExactHostPorts(host, ports);
     }
-    if (network.bound_services.len != 0) return error.UnsupportedBoundServiceRestore;
+    try addManifestBoundServices(allocator, &policy, network.bound_services, bindings);
     return policy;
+}
+
+fn addManifestBoundServices(
+    allocator: std.mem.Allocator,
+    policy: *Config,
+    requirements: []const spore.NetworkBoundServiceRequirement,
+    bindings: []const BoundServiceBinding,
+) !void {
+    if (bindings.len > max_bound_services) return error.TooManyBoundServices;
+    for (bindings, 0..) |binding, index| {
+        try validateServiceName(binding.name);
+        switch (binding.target) {
+            .unix => |path| try validateUnixSocketPath(path),
+            .tcp => return error.UnsupportedBoundServiceTarget,
+        }
+        for (bindings[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.name, binding.name)) return error.DuplicateBoundServiceBinding;
+        }
+    }
+    if (requirements.len == 0) {
+        if (bindings.len != 0) return error.UnexpectedBoundServiceBinding;
+        return;
+    }
+    if (bindings.len == 0) return error.MissingBoundServiceBinding;
+
+    var matched = [_]bool{false} ** max_bound_services;
+    for (requirements) |requirement| {
+        const binding_index = findBoundServiceBinding(bindings, requirement.name) orelse return error.MissingBoundServiceBinding;
+        matched[binding_index] = true;
+        const binding = bindings[binding_index];
+        const unix_path = switch (binding.target) {
+            .unix => |path| path,
+            .tcp => unreachable,
+        };
+        try policy.addBoundUnixService(
+            try allocator.dupe(u8, requirement.name),
+            try allocator.dupe(u8, requirement.guest_host),
+            requirement.guest_port,
+            try allocator.dupe(u8, unix_path),
+        );
+    }
+    for (bindings, 0..) |_, index| {
+        if (!matched[index]) return error.UnexpectedBoundServiceBinding;
+    }
+}
+
+fn findBoundServiceBinding(bindings: []const BoundServiceBinding, name: []const u8) ?usize {
+    for (bindings, 0..) |binding, index| {
+        if (std.mem.eql(u8, binding.name, name)) return index;
+    }
+    return null;
 }
 
 pub fn manifestNetworkFromConfig(allocator: std.mem.Allocator, policy: *const Config) !spore.Network {

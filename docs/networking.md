@@ -58,9 +58,9 @@ The first CLI shape is deliberately capped at one service, guest port 80, and a
 Unix stream socket target. Bound services are guest-exposed inputs; service
 providers must treat bytes on the socket as guest-controlled.
 
-`--bind-service` with `--capture` is rejected until the manifest can record a
-rebind contract. Manifests that carry bound-service requirements fail closed on
-restore unless a future API provides live bindings.
+Captured manifests record bound-service requirements by name, guest host, and
+guest port, but never durable host socket paths. Restore fails closed unless a
+caller supplies fresh live bindings for each declared service through libspore.
 
 ## Capture And Resume
 

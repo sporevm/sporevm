@@ -129,6 +129,7 @@ pub const NetworkDefault = spore_net_policy.NetworkDefault;
 pub const NetworkPolicy = spore_net_policy.NetworkPolicy;
 pub const NetworkRule = spore_net_policy.NetworkRule;
 pub const BoundService = spore_net_policy.BoundService;
+pub const BoundServiceBinding = spore_net_policy.BoundServiceBinding;
 pub const BoundServiceTarget = spore_net_policy.BoundServiceTarget;
 pub const Rootfs = run_mod.Rootfs;
 pub const Annotations = spore.Annotations;
@@ -263,6 +264,8 @@ pub const RunFromSporeOptions = struct {
     continue_after_capture: bool = false,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
+    /// Live host-side bindings for manifest-declared bound services.
+    bound_services: []const BoundServiceBinding = &.{},
     /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
 };
@@ -275,6 +278,8 @@ pub const ResumeOptions = struct {
     timeout_ms: u64 = 30_000,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
+    /// Live host-side bindings for manifest-declared bound services.
+    bound_services: []const BoundServiceBinding = &.{},
     /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
 };
@@ -834,7 +839,7 @@ pub fn runFromSpore(
         try run_mod.resumeDiskForRun(arena, parsed.value)
     else
         try run_mod.resumeDiskForRunV1(arena, manifest_v1.?.value);
-    const network_options = try run_mod.networkOptionsFromManifest(arena, if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network);
+    const network_options = try run_mod.networkOptionsFromManifestWithBindings(arena, if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network, options.bound_services);
     const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else options.vcpus;
     if (manifest_v1 != null and options.vcpus != 1 and options.vcpus != manifest_vcpus) return error.PlatformMismatch;
 
@@ -879,6 +884,7 @@ pub fn resumeSpore(
         .timeout_ms = options.timeout_ms,
         .spore_executable = options.spore_executable,
         .debug = options.debug,
+        .bound_services = options.bound_services,
         .events = options.events,
     });
 }

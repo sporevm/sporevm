@@ -372,6 +372,7 @@ pub const ResumeNamedOptions = struct {
     spore_dir: []const u8,
     name: []const u8,
     spore_executable: []const u8 = "spore",
+    bound_services: []const spore_net_policy.BoundServiceBinding = &.{},
 };
 
 pub const ExecNamedOptions = struct {
@@ -563,7 +564,16 @@ pub fn resumeNamed(
     if (manifest == null) {
         manifest_v1 = spore.loadManifestV1(arena, spore_dir) catch return error.InvalidSporeDir;
     }
-    const network_options = run_mod.networkOptionsFromManifest(arena, if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network) catch return error.InvalidNetworkPolicy;
+    const network_options = run_mod.networkOptionsFromManifestWithBindings(arena, if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network, options.bound_services) catch |err| switch (err) {
+        error.MissingBoundServiceBinding,
+        error.UnexpectedBoundServiceBinding,
+        error.DuplicateBoundServiceBinding,
+        error.InvalidBoundService,
+        error.InvalidBoundServiceTarget,
+        error.UnsupportedBoundServiceTarget,
+        => return err,
+        else => return error.InvalidNetworkPolicy,
+    };
     const rootfs = if (manifest) |parsed|
         try run_mod.resumeRootfsForRun(arena, parsed.value)
     else
@@ -1337,6 +1347,22 @@ pub fn resumeCli(
         },
         error.InvalidNetworkPolicy => {
             const message = "spore resume: invalid network policy in manifest";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.MissingBoundServiceBinding => {
+            const message = "spore resume: manifest requires live bound Unix service bindings";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.UnexpectedBoundServiceBinding => {
+            const message = "spore resume: live bound Unix service bindings do not match the manifest";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.DuplicateBoundServiceBinding => {
+            const message = "spore resume: duplicate live bound Unix service binding";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+        },
+        error.InvalidBoundService, error.InvalidBoundServiceTarget, error.UnsupportedBoundServiceTarget => {
+            const message = "spore resume: invalid live bound Unix service binding";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
         },
         error.UnsupportedLifecycleDeviceModel => {

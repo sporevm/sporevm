@@ -14,7 +14,7 @@ int main(void) {
 
   uint32_t abi_version = 0;
   if (expect_success(spore_build_info(SPORE_BUILD_INFO_ABI_VERSION, &abi_version)) != 0) return 1;
-  if (abi_version != 8) return 1;
+  if (abi_version != 9) return 1;
 
   SporeInspectBundleOptions options;
   spore_inspect_bundle_options_init(&options);
@@ -63,6 +63,7 @@ int main(void) {
   spore_resume_named_options_init(&resume_options);
   if (resume_options.size != sizeof(resume_options)) return 1;
   if (resume_options.version != SPORE_RESUME_NAMED_OPTIONS_VERSION) return 1;
+  if (resume_options.bound_unix_service_count != 0) return 1;
 
   SporeForkNamedOptions fork_options;
   spore_fork_named_options_init(&fork_options);

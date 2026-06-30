@@ -16,7 +16,7 @@ import (
 	"unsafe"
 )
 
-const minABIVersion uint32 = 8
+const minABIVersion uint32 = 9
 
 var ErrClosed = errors.New("spore client closed")
 
@@ -216,6 +216,14 @@ func (c *Client) CreateNamed(ctx context.Context, options CreateNamedOptions) (N
 	defer freeSporeExecutable()
 	consoleLogPath, freeConsoleLogPath := cString(options.ConsoleLogPath)
 	defer freeConsoleLogPath()
+	allowCIDRs, freeAllowCIDRs := cStringList(options.AllowCIDRs)
+	defer freeAllowCIDRs()
+	allowHosts, freeAllowHosts := cStringList(options.AllowHosts)
+	defer freeAllowHosts()
+	networkRules, freeNetworkRules := cNetworkRules(options.NetworkRules)
+	defer freeNetworkRules()
+	boundServices, freeBoundServices := cBoundUnixServices(options.BoundServices)
+	defer freeBoundServices()
 	annotations, freeAnnotations := cAnnotations(options.Annotations)
 	defer freeAnnotations()
 
@@ -239,6 +247,25 @@ func (c *Client) CreateNamed(ctx context.Context, options CreateNamedOptions) (N
 		opts.timeout_ms = C.uint64_t(options.TimeoutMs)
 	}
 	opts.console_log_path = consoleLogPath
+	if options.NetworkEnabled {
+		opts.network_enabled = 1
+	}
+	if len(allowCIDRs) != 0 {
+		opts.allow_cidrs = &allowCIDRs[0]
+		opts.allow_cidr_count = C.size_t(len(allowCIDRs))
+	}
+	if len(allowHosts) != 0 {
+		opts.allow_hosts = &allowHosts[0]
+		opts.allow_host_count = C.size_t(len(allowHosts))
+	}
+	if len(networkRules) != 0 {
+		opts.network_rules = &networkRules[0]
+		opts.network_rule_count = C.size_t(len(networkRules))
+	}
+	if len(boundServices) != 0 {
+		opts.bound_unix_services = &boundServices[0]
+		opts.bound_unix_service_count = C.size_t(len(boundServices))
+	}
 	if len(annotations) != 0 {
 		opts.annotations = &annotations[0]
 		opts.annotation_count = C.size_t(len(annotations))
@@ -290,12 +317,18 @@ func (c *Client) ResumeNamed(ctx context.Context, options ResumeNamedOptions) (N
 	defer freeName()
 	sporeExecutable, freeSporeExecutable := cString(options.SporeExecutable)
 	defer freeSporeExecutable()
+	boundServices, freeBoundServices := cBoundUnixServiceBindings(options.BoundServiceBindings)
+	defer freeBoundServices()
 
 	var opts C.SporeResumeNamedOptions
 	C.spore_resume_named_options_init(&opts)
 	opts.spore_dir = sporeDir
 	opts.name = name
 	opts.spore_executable = sporeExecutable
+	if len(boundServices) != 0 {
+		opts.bound_unix_services = &boundServices[0]
+		opts.bound_unix_service_count = C.size_t(len(boundServices))
+	}
 
 	var out C.SporeOwnedString
 	if result := Result(C.spore_resume_named_json(c.ctx, &opts, &out)); result != Success {
@@ -497,6 +530,103 @@ func cCacheRoot(root CacheRoot) (C.SporeCacheRoot, func()) {
 		kind: C.uint32_t(root.Kind),
 		path: path,
 	}, freePath
+}
+
+func cNetworkRules(values []NetworkRule) ([]C.SporeNetworkRule, func()) {
+	if len(values) == 0 {
+		return nil, func() {}
+	}
+	ptr := C.malloc(C.size_t(len(values)) * C.size_t(unsafe.Sizeof(C.SporeNetworkRule{})))
+	if ptr == nil {
+		panic("spore: out of memory")
+	}
+	out := unsafe.Slice((*C.SporeNetworkRule)(ptr), len(values))
+	frees := make([]func(), 0, len(values))
+	for i, value := range values {
+		host, freeHost := cString(value.Host)
+		rule := C.SporeNetworkRule{
+			host:       host,
+			port_count: C.size_t(len(value.Ports)),
+		}
+		if len(value.Ports) != 0 {
+			bytes := C.size_t(len(value.Ports)) * C.size_t(unsafe.Sizeof(C.uint16_t(0)))
+			ports := (*C.uint16_t)(C.malloc(bytes))
+			if ports == nil {
+				panic("spore: out of memory")
+			}
+			portSlice := unsafe.Slice(ports, len(value.Ports))
+			for i, port := range value.Ports {
+				portSlice[i] = C.uint16_t(port)
+			}
+			rule.ports = ports
+			frees = append(frees, func() { C.free(unsafe.Pointer(ports)) })
+		}
+		out[i] = rule
+		frees = append(frees, freeHost)
+	}
+	return out, func() {
+		for _, free := range frees {
+			free()
+		}
+		C.free(ptr)
+	}
+}
+
+func cBoundUnixServices(values []BoundUnixService) ([]C.SporeBoundUnixService, func()) {
+	if len(values) == 0 {
+		return nil, func() {}
+	}
+	ptr := C.malloc(C.size_t(len(values)) * C.size_t(unsafe.Sizeof(C.SporeBoundUnixService{})))
+	if ptr == nil {
+		panic("spore: out of memory")
+	}
+	out := unsafe.Slice((*C.SporeBoundUnixService)(ptr), len(values))
+	frees := make([]func(), 0, len(values)*3)
+	for i, value := range values {
+		name, freeName := cString(value.Name)
+		guestHost, freeGuestHost := cString(value.GuestHost)
+		unixPath, freeUnixPath := cString(value.UnixPath)
+		out[i] = C.SporeBoundUnixService{
+			name:       name,
+			guest_host: guestHost,
+			guest_port: C.uint16_t(value.GuestPort),
+			unix_path:  unixPath,
+		}
+		frees = append(frees, freeName, freeGuestHost, freeUnixPath)
+	}
+	return out, func() {
+		for _, free := range frees {
+			free()
+		}
+		C.free(ptr)
+	}
+}
+
+func cBoundUnixServiceBindings(values []BoundUnixServiceBinding) ([]C.SporeBoundUnixServiceBinding, func()) {
+	if len(values) == 0 {
+		return nil, func() {}
+	}
+	ptr := C.malloc(C.size_t(len(values)) * C.size_t(unsafe.Sizeof(C.SporeBoundUnixServiceBinding{})))
+	if ptr == nil {
+		panic("spore: out of memory")
+	}
+	out := unsafe.Slice((*C.SporeBoundUnixServiceBinding)(ptr), len(values))
+	frees := make([]func(), 0, len(values)*2)
+	for i, value := range values {
+		name, freeName := cString(value.Name)
+		unixPath, freeUnixPath := cString(value.UnixPath)
+		out[i] = C.SporeBoundUnixServiceBinding{
+			name:      name,
+			unix_path: unixPath,
+		}
+		frees = append(frees, freeName, freeUnixPath)
+	}
+	return out, func() {
+		for _, free := range frees {
+			free()
+		}
+		C.free(ptr)
+	}
 }
 
 func cAnnotations(values map[string]string) ([]C.SporeAnnotation, func()) {

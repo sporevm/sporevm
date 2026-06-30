@@ -74,7 +74,7 @@ typedef struct SporeContextImpl *SporeContext;
 #define SPORE_SYSTEM_DF_OPTIONS_VERSION 1u
 #define SPORE_SYSTEM_PRUNE_OPTIONS_VERSION 1u
 #define SPORE_CREATE_NAMED_OPTIONS_VERSION 4u
-#define SPORE_RESUME_NAMED_OPTIONS_VERSION 1u
+#define SPORE_RESUME_NAMED_OPTIONS_VERSION 2u
 #define SPORE_FORK_NAMED_OPTIONS_VERSION 1u
 #define SPORE_EXEC_NAMED_OPTIONS_VERSION 2u
 #define SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION 2u
@@ -152,6 +152,12 @@ typedef struct SporeBoundUnixService {
   SporeString unix_path;
 } SporeBoundUnixService;
 
+/** Restore-time Unix socket binding for a manifest-declared bound service. */
+typedef struct SporeBoundUnixServiceBinding {
+  SporeString name;
+  SporeString unix_path;
+} SporeBoundUnixServiceBinding;
+
 /** Opaque manifest annotation key/value. Values are stored without interpretation. */
 typedef struct SporeAnnotation {
   SporeString key;
@@ -206,6 +212,8 @@ typedef struct SporeResumeNamedOptions {
   SporeString spore_dir;
   SporeString name;
   SporeString spore_executable;
+  const SporeBoundUnixServiceBinding *bound_unix_services;
+  size_t bound_unix_service_count;
 } SporeResumeNamedOptions;
 
 /** Options for spore_fork_named_json(). */
@@ -359,7 +367,15 @@ SPORE_API SporeResult spore_exec_named_json(SporeContext context,
                                             const SporeExecNamedOptions *options,
                                             SporeOwnedString *out_json);
 
-/** Resume a named VM from a spore checkpoint and return `spore.lifecycle.v1` JSON. */
+/**
+ * Resume a named VM from a spore checkpoint and return `spore.lifecycle.v1`
+ * JSON.
+ *
+ * If the manifest declares bound Unix services, `bound_unix_services` must
+ * provide one live socket path for each declared service name. Host paths are
+ * used only for this resume attempt and are not written into the spore
+ * manifest.
+ */
 SPORE_API SporeResult spore_resume_named_json(SporeContext context,
                                               const SporeResumeNamedOptions *options,
                                               SporeOwnedString *out_json);

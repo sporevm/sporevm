@@ -104,6 +104,41 @@ func TestPull(t *testing.T) {
 	}
 }
 
+func TestNamedLifecycleOptionsCarryBoundServices(t *testing.T) {
+	create := CreateNamedOptions{
+		Name:           "worker",
+		NetworkEnabled: true,
+		NetworkRules: []NetworkRule{{
+			Host:  "github.com",
+			Ports: []uint16{443},
+		}},
+		BoundServices: []BoundUnixService{{
+			Name:      "cleanroom-gateway",
+			GuestHost: "gateway.cleanroom.internal",
+			GuestPort: 8170,
+			UnixPath:  "/tmp/cleanroom-gateway.sock",
+		}},
+	}
+	if !create.NetworkEnabled {
+		t.Fatal("expected network enabled")
+	}
+	if got := create.BoundServices[0].UnixPath; got != "/tmp/cleanroom-gateway.sock" {
+		t.Fatalf("bound service path = %q", got)
+	}
+
+	resume := ResumeNamedOptions{
+		SporeDir: "worker.spore",
+		Name:     "worker-resumed",
+		BoundServiceBindings: []BoundUnixServiceBinding{{
+			Name:     "cleanroom-gateway",
+			UnixPath: "/tmp/fresh-cleanroom-gateway.sock",
+		}},
+	}
+	if got := resume.BoundServiceBindings[0].UnixPath; got != "/tmp/fresh-cleanroom-gateway.sock" {
+		t.Fatalf("resume binding path = %q", got)
+	}
+}
+
 func TestExecNamedArgvMarshaling(t *testing.T) {
 	argv, freeArgv := cStringList([]string{"/bin/echo", "hello world"})
 	defer freeArgv()

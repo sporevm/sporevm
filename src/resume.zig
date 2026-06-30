@@ -16,6 +16,7 @@ const generation = @import("generation.zig");
 const run_mod = @import("run.zig");
 const runtime_disk = @import("runtime_disk.zig");
 const spore = @import("spore.zig");
+const spore_net_policy = @import("spore_net_policy.zig");
 const virtio_net = @import("virtio/net.zig");
 const vsock = @import("virtio/vsock.zig");
 
@@ -34,6 +35,7 @@ pub const Options = struct {
     spore_executable: []const u8 = "spore",
     debug: bool = false,
     timeout_ms: u64 = default_resume_attach_timeout_ms,
+    bound_services: []const spore_net_policy.BoundServiceBinding = &.{},
 };
 
 pub const cli_usage =
@@ -124,8 +126,11 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     defer if (parsed_v1) |*manifest| manifest.deinit();
     if (parsed == null) parsed_v1 = try spore.loadManifestV1(allocator, opts.spore_dir);
 
-    const network_options = run_mod.networkOptionsFromManifest(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network) catch {
-        failResumeSetup("spore resume: invalid network policy in manifest", .{});
+    const network_options = run_mod.networkOptionsFromManifestWithBindings(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network, opts.bound_services) catch |err| switch (err) {
+        error.MissingBoundServiceBinding => failResumeSetup("spore resume: manifest requires live bound Unix service bindings", .{}),
+        error.UnexpectedBoundServiceBinding => failResumeSetup("spore resume: live bound Unix service bindings do not match the manifest", .{}),
+        error.DuplicateBoundServiceBinding => failResumeSetup("spore resume: duplicate live bound Unix service binding", .{}),
+        else => failResumeSetup("spore resume: invalid network policy in manifest", .{}),
     };
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;

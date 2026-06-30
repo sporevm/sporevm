@@ -1007,8 +1007,19 @@ pub fn cliGuestCommandFromMode(allocator: std.mem.Allocator, mode: CommandMode, 
 }
 
 pub fn networkOptionsFromManifest(allocator: std.mem.Allocator, manifest_network: ?spore.Network) !NetworkOptions {
-    const network = manifest_network orelse return .{};
-    return .{ .network = .spore, .policy = try spore_net_policy.configFromManifestNetwork(allocator, network) };
+    return networkOptionsFromManifestWithBindings(allocator, manifest_network, &.{});
+}
+
+pub fn networkOptionsFromManifestWithBindings(
+    allocator: std.mem.Allocator,
+    manifest_network: ?spore.Network,
+    bound_services: []const spore_net_policy.BoundServiceBinding,
+) !NetworkOptions {
+    const network = manifest_network orelse {
+        if (bound_services.len != 0) return error.UnexpectedBoundServiceBinding;
+        return .{};
+    };
+    return .{ .network = .spore, .policy = try spore_net_policy.configFromManifestNetworkWithBindings(allocator, network, bound_services) };
 }
 
 pub fn manifestNetworkFromOptions(allocator: std.mem.Allocator, network: NetworkMode, policy: *const spore_net_policy.Config) !?spore.Network {
@@ -3654,7 +3665,58 @@ test "run refuses to restore captured bound services without live bindings" {
         .requirements = .{ .bound_services = true },
     };
 
-    try std.testing.expectError(error.UnsupportedBoundServiceRestore, networkOptionsFromManifest(arena, manifest_network));
+    try std.testing.expectError(error.MissingBoundServiceBinding, networkOptionsFromManifest(arena, manifest_network));
+}
+
+test "run restores captured bound services with live bindings" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const manifest_network = spore.Network{
+        .bound_services = &.{.{
+            .name = "cleanroom-gateway",
+            .guest_host = "gateway.cleanroom.internal",
+            .guest_port = 8170,
+        }},
+        .requirements = .{ .bound_services = true },
+    };
+
+    const opts = try networkOptionsFromManifestWithBindings(arena, manifest_network, &.{.{
+        .name = "cleanroom-gateway",
+        .target = .{ .unix = "/tmp/fresh-cleanroom-gateway.sock" },
+    }});
+    try std.testing.expectEqual(NetworkMode.spore, opts.network);
+    try std.testing.expectEqual(@as(usize, 1), opts.policy.bound_service_count);
+    try std.testing.expectEqualStrings("cleanroom-gateway", opts.policy.bound_services[0].name);
+    try std.testing.expectEqualStrings("gateway.cleanroom.internal", opts.policy.bound_services[0].guest_host);
+    try std.testing.expectEqual(@as(u16, 8170), opts.policy.bound_services[0].guest_port);
+    try std.testing.expectEqualStrings("/tmp/fresh-cleanroom-gateway.sock", opts.policy.bound_services[0].unix_path);
+}
+
+test "run rejects live bound service bindings that do not match manifest" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const manifest_network = spore.Network{
+        .bound_services = &.{.{
+            .name = "cleanroom-gateway",
+            .guest_host = "gateway.cleanroom.internal",
+            .guest_port = 8170,
+        }},
+        .requirements = .{ .bound_services = true },
+    };
+
+    try std.testing.expectError(error.MissingBoundServiceBinding, networkOptionsFromManifestWithBindings(arena, manifest_network, &.{.{
+        .name = "wrong-service",
+        .target = .{ .unix = "/tmp/wrong.sock" },
+    }}));
+
+    try std.testing.expectError(error.UnexpectedBoundServiceBinding, networkOptionsFromManifestWithBindings(arena, null, &.{.{
+        .name = "cleanroom-gateway",
+        .target = .{ .unix = "/tmp/fresh-cleanroom-gateway.sock" },
+    }}));
 }
 
 test "run network gateway errors are reported clearly" {

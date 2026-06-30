@@ -11,13 +11,13 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 8;
+const c_abi_version: u32 = 9;
 const inspect_bundle_options_version: u32 = 1;
 const pull_options_version: u32 = 1;
 const system_df_options_version: u32 = 1;
 const system_prune_options_version: u32 = 1;
 const create_named_options_version: u32 = 4;
-const resume_named_options_version: u32 = 1;
+const resume_named_options_version: u32 = 2;
 const fork_named_options_version: u32 = 1;
 const exec_named_options_version: u32 = 2;
 const snapshot_named_options_version: u32 = 2;
@@ -44,6 +44,11 @@ const SporeBoundUnixService = extern struct {
     name: SporeString,
     guest_host: SporeString,
     guest_port: u16,
+    unix_path: SporeString,
+};
+
+const SporeBoundUnixServiceBinding = extern struct {
+    name: SporeString,
     unix_path: SporeString,
 };
 
@@ -148,6 +153,8 @@ const SporeResumeNamedOptions = extern struct {
     spore_dir: SporeString,
     name: SporeString,
     spore_executable: SporeString,
+    bound_unix_services: ?[*]const SporeBoundUnixServiceBinding,
+    bound_unix_service_count: usize,
 };
 
 const SporeForkNamedOptions = extern struct {
@@ -317,6 +324,8 @@ pub export fn spore_resume_named_options_init(options: ?*SporeResumeNamedOptions
         .spore_dir = .{},
         .name = .{},
         .spore_executable = .{},
+        .bound_unix_services = null,
+        .bound_unix_service_count = 0,
     };
 }
 
@@ -668,11 +677,14 @@ pub export fn spore_resume_named_json(
 
     var process_arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer process_arena.deinit();
+    const arena = process_arena.allocator();
     const init = cInit(ctx, &process_arena);
+    const bound_services = parseBoundUnixServiceBindings(arena, opts.bound_unix_services, opts.bound_unix_service_count) catch |err| return fail(ctx, err);
     const result = libspore.resumeNamed(init, ctx.allocator, .{
         .spore_dir = toSlice(opts.spore_dir) catch |err| return fail(ctx, err),
         .name = toSlice(opts.name) catch |err| return fail(ctx, err),
         .spore_executable = (optionalSlice(opts.spore_executable) catch |err| return fail(ctx, err)) orelse "spore",
+        .bound_services = bound_services,
     }) catch |err| return fail(ctx, err);
     defer libspore.deinitNamedLifecycleResult(ctx.allocator, result);
 
@@ -896,6 +908,19 @@ fn parseBoundUnixServices(allocator: std.mem.Allocator, raw: ?[*]const SporeBoun
     return services;
 }
 
+fn parseBoundUnixServiceBindings(allocator: std.mem.Allocator, raw: ?[*]const SporeBoundUnixServiceBinding, len: usize) ![]const libspore.BoundServiceBinding {
+    if (len == 0) return &.{};
+    const values = raw orelse return error.InvalidValue;
+    const services = try allocator.alloc(libspore.BoundServiceBinding, len);
+    for (services, values[0..len]) |*out, value| {
+        out.* = .{
+            .name = try toSlice(value.name),
+            .target = .{ .unix = try toSlice(value.unix_path) },
+        };
+    }
+    return services;
+}
+
 fn parseAnnotations(allocator: std.mem.Allocator, raw: ?[*]const SporeAnnotation, len: usize) !libspore.Annotations {
     var annotations = libspore.Annotations{};
     if (len == 0) return annotations;
@@ -992,6 +1017,7 @@ test "named lifecycle options initialize defaults" {
     var resume_options: SporeResumeNamedOptions = undefined;
     spore_resume_named_options_init(&resume_options);
     try std.testing.expectEqual(resume_named_options_version, resume_options.version);
+    try std.testing.expectEqual(@as(usize, 0), resume_options.bound_unix_service_count);
 
     var fork_options: SporeForkNamedOptions = undefined;
     spore_fork_named_options_init(&fork_options);

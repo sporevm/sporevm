@@ -177,6 +177,27 @@ type RootfsBundleSummary struct {
 	PayloadBytes      uint64 `json:"payload_bytes"`
 }
 
+// NetworkRule allows one exact guest egress host and port set.
+type NetworkRule struct {
+	Host  string
+	Ports []uint16
+}
+
+// BoundUnixService declares a host Unix socket exposed to the guest.
+type BoundUnixService struct {
+	Name      string
+	GuestHost string
+	GuestPort uint16
+	UnixPath  string
+}
+
+// BoundUnixServiceBinding supplies a fresh host socket path for a
+// manifest-declared bound service at restore time.
+type BoundUnixServiceBinding struct {
+	Name     string
+	UnixPath string
+}
+
 // CreateNamedOptions starts a long-lived named VM.
 type CreateNamedOptions struct {
 	Name            string
@@ -191,6 +212,11 @@ type CreateNamedOptions struct {
 	GuestPort       uint32
 	TimeoutMs       uint64
 	ConsoleLogPath  string
+	NetworkEnabled  bool
+	AllowCIDRs      []string
+	AllowHosts      []string
+	NetworkRules    []NetworkRule
+	BoundServices   []BoundUnixService
 	Annotations     map[string]string
 }
 
@@ -210,9 +236,10 @@ type ExecNamedOptions struct {
 
 // ResumeNamedOptions starts a named VM from a spore checkpoint directory.
 type ResumeNamedOptions struct {
-	SporeDir        string
-	Name            string
-	SporeExecutable string
+	SporeDir             string
+	Name                 string
+	SporeExecutable      string
+	BoundServiceBindings []BoundUnixServiceBinding
 }
 
 // RemoveNamedOptions destroys a named VM and removes its local lifecycle state.
