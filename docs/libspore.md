@@ -366,9 +366,13 @@ DYLD_LIBRARY_PATH="$PWD/$asset/lib:${DYLD_LIBRARY_PATH:-}" ./my_program
 To build and install the same layout from source:
 
 ```bash
-zig build --release=safe --prefix /path/to/prefix
+zig build -Dtarget=aarch64-macos.13.0 --release=safe --prefix /path/to/prefix
 export PKG_CONFIG_PATH="/path/to/prefix/lib/pkgconfig"
 ```
+
+On Linux ARM64, use `-Dtarget=aarch64-linux-musl` instead. Plain local macOS
+builds default to the same stable deployment target so cgo clients do not link
+a test binary for an older macOS version than `libspore.dylib`.
 
 Returned JSON strings are NUL-terminated for C convenience. The reported length
 excludes the trailing NUL and includes the final newline, matching CLI JSON
@@ -477,6 +481,10 @@ if err != nil {
 }
 defer client.Close()
 
+if err := client.SetEnv(ctx, "SPOREVM_RUNTIME_DIR", runtimeDir); err != nil {
+    return err
+}
+
 info, err := client.HostInfo(ctx)
 if err != nil {
     return err
@@ -508,6 +516,14 @@ if err != nil {
     return err
 }
 
+exec, err := client.ExecNamed(ctx, spore.ExecNamedOptions{
+    Name: "worker",
+    Argv: []string{"/bin/true"},
+})
+if err != nil {
+    return err
+}
+
 snap, err := client.SnapshotNamed(ctx, spore.SnapshotNamedOptions{
     Name:     "worker",
     OutDir:   "worker.spore",
@@ -520,18 +536,56 @@ if err != nil {
     return err
 }
 
+resumed, err := client.ResumeNamed(ctx, spore.ResumeNamedOptions{
+    SporeDir: "worker.spore",
+    Name:     "worker-resumed",
+})
+if err != nil {
+    return err
+}
+
+named, err := client.ListNamed(ctx)
+if err != nil {
+    return err
+}
+
+removed, err := client.RemoveNamed(ctx, spore.RemoveNamedOptions{
+    Name: "worker-resumed",
+})
+if err != nil {
+    return err
+}
+
 _ = info
 _ = bundle
 _ = pulled
 _ = created
+_ = exec.ExitCode
+_ = exec.Stdout
+_ = exec.Stderr
+_ = exec.NetworkEventsJSONL
 _ = snap
+_ = resumed
+_ = named
+_ = removed
 ```
 
 The surface covers build info, context lifetime, host-info, inspect-bundle,
-pull, and named lifecycle create/snapshot. It decodes the same JSON contracts as
-the CLI and C ABI, and it requires C ABI version 8 or newer. Go context
-cancellation is checked before entering C calls; long-running runtime
-cancellation is not exposed until the Zig product API and C ABI provide it.
+pull, context-local environment variables through `SetEnv`, and named lifecycle
+`CreateNamed`, `ExecNamed`, `SnapshotNamed`, `ResumeNamed`, `RemoveNamed`, and
+`ListNamed`. `ExecNamedResult` includes the exit code, stdout, stderr, decoded
+network event JSONL, and truncation flags returned by the C JSON payload. The
+Go binding intentionally omits per-exec network policy updates in this slice;
+the underlying named lifecycle API still fails closed if that unsupported C
+option is set.
+
+When setting `SPOREVM_RUNTIME_DIR`, pass an absolute directory that exists and
+is private to the current user, matching the named lifecycle registry rules.
+
+The Go binding decodes the same JSON contracts as the CLI and C ABI, and it
+requires C ABI version 8 or newer. Go context cancellation is checked before
+entering C calls; long-running runtime cancellation is not exposed until the Zig
+product API and C ABI provide it.
 
 From a source checkout, build `libspore` first and point Go at the generated
 pkg-config and dynamic library paths:
@@ -541,7 +595,7 @@ mise run build
 cd bindings/go
 PKG_CONFIG_PATH="$PWD/../../zig-out/lib/pkgconfig" \
 DYLD_LIBRARY_PATH="$PWD/../../zig-out/lib" \
-go test ./...
+go test -a ./...
 ```
 
 Use `LD_LIBRARY_PATH` instead of `DYLD_LIBRARY_PATH` on Linux.

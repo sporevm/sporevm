@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"runtime"
 	"unsafe"
 )
 
@@ -99,6 +98,21 @@ func Build() (BuildInfo, error) {
 	}, nil
 }
 
+// SetEnv sets a context-local environment variable used by libspore operations.
+func (c *Client) SetEnv(ctx context.Context, name, value string) error {
+	if err := c.ready(ctx); err != nil {
+		return err
+	}
+	cName, freeName := cString(name)
+	defer freeName()
+	cValue, freeValue := cString(value)
+	defer freeValue()
+	if result := Result(C.spore_context_set_env(c.ctx, cName, cValue)); result != Success {
+		return c.callError(result)
+	}
+	return nil
+}
+
 // HostInfo returns host capability and cache-root facts.
 func (c *Client) HostInfo(ctx context.Context) (HostInfo, error) {
 	if err := c.ready(ctx); err != nil {
@@ -109,11 +123,7 @@ func (c *Client) HostInfo(ctx context.Context) (HostInfo, error) {
 		return HostInfo{}, c.callError(result)
 	}
 	defer C.spore_free_string(c.ctx, out)
-	var info HostInfo
-	if err := json.Unmarshal(goBytes(out), &info); err != nil {
-		return HostInfo{}, fmt.Errorf("decode host info: %w", err)
-	}
-	return info, nil
+	return decodeJSON[HostInfo](goBytes(out), "host info")
 }
 
 // InspectBundle returns metadata for a local bundle reference.
@@ -141,11 +151,7 @@ func (c *Client) InspectBundle(ctx context.Context, options InspectBundleOptions
 		return InspectBundleResult{}, c.callError(result)
 	}
 	defer C.spore_free_string(c.ctx, out)
-	var inspected InspectBundleResult
-	if err := json.Unmarshal(goBytes(out), &inspected); err != nil {
-		return InspectBundleResult{}, fmt.Errorf("decode inspect bundle: %w", err)
-	}
-	return inspected, nil
+	return decodeJSON[InspectBundleResult](goBytes(out), "inspect bundle")
 }
 
 // Pull materializes a bundle into a local spore directory.
@@ -186,11 +192,7 @@ func (c *Client) Pull(ctx context.Context, options PullOptions) (PullResult, err
 		return PullResult{}, c.callError(result)
 	}
 	defer C.spore_free_string(c.ctx, out)
-	var pulled PullResult
-	if err := json.Unmarshal(goBytes(out), &pulled); err != nil {
-		return PullResult{}, fmt.Errorf("decode pull result: %w", err)
-	}
-	return pulled, nil
+	return decodeJSON[PullResult](goBytes(out), "pull result")
 }
 
 // CreateNamed starts a long-lived named VM.
@@ -247,11 +249,60 @@ func (c *Client) CreateNamed(ctx context.Context, options CreateNamedOptions) (N
 		return NamedLifecycleResult{}, c.callError(result)
 	}
 	defer C.spore_free_string(c.ctx, out)
-	var created NamedLifecycleResult
-	if err := json.Unmarshal(goBytes(out), &created); err != nil {
-		return NamedLifecycleResult{}, fmt.Errorf("decode named lifecycle result: %w", err)
+	return decodeJSON[NamedLifecycleResult](goBytes(out), "named lifecycle result")
+}
+
+// ExecNamed runs an exact argv in a named VM and returns captured stdout,
+// stderr, exit code, and network decision events.
+func (c *Client) ExecNamed(ctx context.Context, options ExecNamedOptions) (ExecNamedResult, error) {
+	if err := c.ready(ctx); err != nil {
+		return ExecNamedResult{}, err
 	}
-	return created, nil
+	name, freeName := cString(options.Name)
+	defer freeName()
+	argv, freeArgv := cStringList(options.Argv)
+	defer freeArgv()
+
+	var opts C.SporeExecNamedOptions
+	C.spore_exec_named_options_init(&opts)
+	opts.name = name
+	if len(argv) != 0 {
+		opts.argv = &argv[0]
+		opts.argc = C.size_t(len(argv))
+	}
+
+	var out C.SporeOwnedString
+	if result := Result(C.spore_exec_named_json(c.ctx, &opts, &out)); result != Success {
+		return ExecNamedResult{}, c.callError(result)
+	}
+	defer C.spore_free_string(c.ctx, out)
+	return decodeJSON[ExecNamedResult](goBytes(out), "exec named result")
+}
+
+// ResumeNamed starts a named VM from a spore checkpoint directory.
+func (c *Client) ResumeNamed(ctx context.Context, options ResumeNamedOptions) (NamedLifecycleResult, error) {
+	if err := c.ready(ctx); err != nil {
+		return NamedLifecycleResult{}, err
+	}
+	sporeDir, freeSporeDir := cString(options.SporeDir)
+	defer freeSporeDir()
+	name, freeName := cString(options.Name)
+	defer freeName()
+	sporeExecutable, freeSporeExecutable := cString(options.SporeExecutable)
+	defer freeSporeExecutable()
+
+	var opts C.SporeResumeNamedOptions
+	C.spore_resume_named_options_init(&opts)
+	opts.spore_dir = sporeDir
+	opts.name = name
+	opts.spore_executable = sporeExecutable
+
+	var out C.SporeOwnedString
+	if result := Result(C.spore_resume_named_json(c.ctx, &opts, &out)); result != Success {
+		return NamedLifecycleResult{}, c.callError(result)
+	}
+	defer C.spore_free_string(c.ctx, out)
+	return decodeJSON[NamedLifecycleResult](goBytes(out), "named lifecycle result")
 }
 
 // SnapshotNamed snapshots a named VM. The current libspore mode always keeps
@@ -284,11 +335,41 @@ func (c *Client) SnapshotNamed(ctx context.Context, options SnapshotNamedOptions
 		return NamedLifecycleResult{}, c.callError(result)
 	}
 	defer C.spore_free_string(c.ctx, out)
-	var snap NamedLifecycleResult
-	if err := json.Unmarshal(goBytes(out), &snap); err != nil {
-		return NamedLifecycleResult{}, fmt.Errorf("decode named lifecycle result: %w", err)
+	return decodeJSON[NamedLifecycleResult](goBytes(out), "named lifecycle result")
+}
+
+// RemoveNamed destroys a named VM and removes its local lifecycle state.
+func (c *Client) RemoveNamed(ctx context.Context, options RemoveNamedOptions) (NamedLifecycleResult, error) {
+	if err := c.ready(ctx); err != nil {
+		return NamedLifecycleResult{}, err
 	}
-	return snap, nil
+	name, freeName := cString(options.Name)
+	defer freeName()
+
+	var opts C.SporeRemoveNamedOptions
+	C.spore_remove_named_options_init(&opts)
+	opts.name = name
+
+	var out C.SporeOwnedString
+	if result := Result(C.spore_remove_named_json(c.ctx, &opts, &out)); result != Success {
+		return NamedLifecycleResult{}, c.callError(result)
+	}
+	defer C.spore_free_string(c.ctx, out)
+	return decodeJSON[NamedLifecycleResult](goBytes(out), "named lifecycle result")
+}
+
+// ListNamed returns the current local named VM registry.
+func (c *Client) ListNamed(ctx context.Context) ([]NamedListEntry, error) {
+	if err := c.ready(ctx); err != nil {
+		return nil, err
+	}
+
+	var out C.SporeOwnedString
+	if result := Result(C.spore_list_named_json(c.ctx, &out)); result != Success {
+		return nil, c.callError(result)
+	}
+	defer C.spore_free_string(c.ctx, out)
+	return decodeJSON[[]NamedListEntry](goBytes(out), "named list")
 }
 
 func (c *Client) ready(ctx context.Context) error {
@@ -319,6 +400,64 @@ func goBytes(s C.SporeOwnedString) []byte {
 	return C.GoBytes(unsafe.Pointer(s.ptr), C.int(s.len))
 }
 
+func decodeJSON[T any](data []byte, description string) (T, error) {
+	var value T
+	if err := json.Unmarshal(data, &value); err != nil {
+		return value, fmt.Errorf("decode %s: %w", description, err)
+	}
+	return value, nil
+}
+
+func (r *ExecNamedResult) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ExitCode           uint8           `json:"exit_code"`
+		Stdout             json.RawMessage `json:"stdout"`
+		Stderr             json.RawMessage `json:"stderr"`
+		NetworkEventsJSONL json.RawMessage `json:"network_events_jsonl"`
+		StdoutTruncated    bool            `json:"stdout_truncated"`
+		StderrTruncated    bool            `json:"stderr_truncated"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	stdout, err := decodeOutputField(raw.Stdout, "stdout")
+	if err != nil {
+		return err
+	}
+	stderr, err := decodeOutputField(raw.Stderr, "stderr")
+	if err != nil {
+		return err
+	}
+	networkEvents, err := decodeOutputField(raw.NetworkEventsJSONL, "network_events_jsonl")
+	if err != nil {
+		return err
+	}
+	*r = ExecNamedResult{
+		ExitCode:           raw.ExitCode,
+		Stdout:             stdout,
+		Stderr:             stderr,
+		NetworkEventsJSONL: networkEvents,
+		StdoutTruncated:    raw.StdoutTruncated,
+		StderrTruncated:    raw.StderrTruncated,
+	}
+	return nil
+}
+
+func decodeOutputField(data json.RawMessage, field string) (string, error) {
+	if len(data) == 0 || string(data) == "null" {
+		return "", nil
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		return text, nil
+	}
+	var bytes []byte
+	if err := json.Unmarshal(data, &bytes); err != nil {
+		return "", fmt.Errorf("decode exec named %s: %w", field, err)
+	}
+	return string(bytes), nil
+}
+
 func cString(s string) (C.SporeString, func()) {
 	if s == "" {
 		return C.SporeString{}, func() {}
@@ -326,6 +465,29 @@ func cString(s string) (C.SporeString, func()) {
 	ptr := C.CString(s)
 	return C.SporeString{ptr: ptr, len: C.size_t(len(s))}, func() {
 		C.free(unsafe.Pointer(ptr))
+	}
+}
+
+func cStringList(values []string) ([]C.SporeString, func()) {
+	if len(values) == 0 {
+		return nil, func() {}
+	}
+	ptr := C.malloc(C.size_t(len(values)) * C.size_t(unsafe.Sizeof(C.SporeString{})))
+	if ptr == nil {
+		panic("spore: out of memory")
+	}
+	strings := unsafe.Slice((*C.SporeString)(ptr), len(values))
+	frees := make([]func(), 0, len(values))
+	for i, value := range values {
+		cValue, freeValue := cString(value)
+		strings[i] = cValue
+		frees = append(frees, freeValue)
+	}
+	return strings, func() {
+		for _, free := range frees {
+			free()
+		}
+		C.free(ptr)
 	}
 }
 
@@ -341,18 +503,24 @@ func cAnnotations(values map[string]string) ([]C.SporeAnnotation, func()) {
 	if len(values) == 0 {
 		return nil, func() {}
 	}
-	annotations := make([]C.SporeAnnotation, 0, len(values))
+	ptr := C.malloc(C.size_t(len(values)) * C.size_t(unsafe.Sizeof(C.SporeAnnotation{})))
+	if ptr == nil {
+		panic("spore: out of memory")
+	}
+	annotations := unsafe.Slice((*C.SporeAnnotation)(ptr), len(values))
 	frees := make([]func(), 0, len(values)*2)
+	i := 0
 	for key, value := range values {
 		cKey, freeKey := cString(key)
 		cValue, freeValue := cString(value)
-		annotations = append(annotations, C.SporeAnnotation{key: cKey, value: cValue})
+		annotations[i] = C.SporeAnnotation{key: cKey, value: cValue}
 		frees = append(frees, freeKey, freeValue)
+		i++
 	}
 	return annotations, func() {
 		for _, free := range frees {
 			free()
 		}
-		runtime.KeepAlive(annotations)
+		C.free(ptr)
 	}
 }
