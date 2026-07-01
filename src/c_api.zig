@@ -11,8 +11,9 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 9;
+const c_abi_version: u32 = 10;
 const inspect_bundle_options_version: u32 = 1;
+const inspect_spore_options_version: u32 = 1;
 const pull_options_version: u32 = 1;
 const system_df_options_version: u32 = 1;
 const system_prune_options_version: u32 = 1;
@@ -65,6 +66,12 @@ const SporeInspectBundleOptions = extern struct {
     has_child_range: u8,
     child_range_start: u32,
     child_range_end: u32,
+};
+
+const SporeInspectSporeOptions = extern struct {
+    size: u32,
+    version: u32,
+    spore_dir: SporeString,
 };
 
 const cache_root_env: u32 = 0;
@@ -227,6 +234,15 @@ pub export fn spore_inspect_bundle_options_init(options: ?*SporeInspectBundleOpt
         .has_child_range = 0,
         .child_range_start = 0,
         .child_range_end = 0,
+    };
+}
+
+pub export fn spore_inspect_spore_options_init(options: ?*SporeInspectSporeOptions) void {
+    const out = options orelse return;
+    out.* = .{
+        .size = @sizeOf(SporeInspectSporeOptions),
+        .version = inspect_spore_options_version,
+        .spore_dir = .{},
     };
 }
 
@@ -486,6 +502,31 @@ pub export fn spore_inspect_bundle_json(
         .child_range = child_range,
     }) catch |err| return fail(ctx, err);
     defer libspore.deinitInspectBundleResult(ctx.allocator, result);
+
+    out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_inspect_spore_json(
+    context: ?*SporeContextImpl,
+    options: ?*const SporeInspectSporeOptions,
+    out_json: ?*SporeOwnedString,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    const out = out_json orelse return fail(ctx, error.InvalidValue);
+    out.* = .{};
+    ctx.clearLastError();
+
+    if (opts.version != inspect_spore_options_version or opts.size < @sizeOf(SporeInspectSporeOptions)) {
+        return fail(ctx, error.InvalidValue);
+    }
+
+    const spore_dir = toSlice(opts.spore_dir) catch |err| return fail(ctx, err);
+    if (spore_dir.len == 0) return fail(ctx, error.InvalidValue);
+
+    const result = libspore.inspectSpore(ctx.allocator, spore_dir) catch |err| return fail(ctx, err);
+    defer libspore.deinitSporeInspectResult(ctx.allocator, result);
 
     out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
     return result_success;
@@ -973,6 +1014,11 @@ test "inspect bundle options initialize size and version" {
     try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeInspectBundleOptions))), options.size);
     try std.testing.expectEqual(inspect_bundle_options_version, options.version);
 
+    var inspect_spore_options: SporeInspectSporeOptions = undefined;
+    spore_inspect_spore_options_init(&inspect_spore_options);
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeInspectSporeOptions))), inspect_spore_options.size);
+    try std.testing.expectEqual(inspect_spore_options_version, inspect_spore_options.version);
+
     var pull_options: SporePullOptions = undefined;
     spore_pull_options_init(&pull_options);
     try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporePullOptions))), pull_options.size);
@@ -1041,6 +1087,31 @@ test "C ABI exposes network capabilities JSON" {
     try std.testing.expect(std.mem.indexOf(u8, json.ptr.?[0..json.len], "\"exact_host_port\": true") != null);
 }
 
+test "C ABI inspect spore JSON includes annotation values" {
+    var context: ?*SporeContextImpl = null;
+    try std.testing.expectEqual(result_success, spore_context_new(&context));
+    defer spore_context_free(context);
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer std.testing.allocator.free(dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "manifest.json", .data = inspect_spore_manifest_json });
+
+    var options: SporeInspectSporeOptions = undefined;
+    spore_inspect_spore_options_init(&options);
+    options.spore_dir = borrowString(dir);
+
+    var json: SporeOwnedString = .{};
+    try std.testing.expectEqual(result_success, spore_inspect_spore_json(context, &options, &json));
+    defer spore_free_string(context, json);
+    const data = json.ptr.?[0..json.len];
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"annotations\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"cleanroom.workspace\": \"/workspaces/app\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"cleanroom.provenance\": \"sha256:abc123\"") != null);
+}
+
 test "pull rejects missing required options at ABI boundary" {
     var context: ?*SporeContextImpl = null;
     try std.testing.expectEqual(result_success, spore_context_new(&context));
@@ -1067,3 +1138,41 @@ test "C ABI can list named VMs from context runtime env" {
     defer spore_free_string(context, json);
     try std.testing.expectEqualStrings("[]\n", json.ptr.?[0..json.len]);
 }
+
+const inspect_spore_manifest_json =
+    \\{
+    \\  "version": 0,
+    \\  "annotations": {
+    \\    "cleanroom.workspace": "/workspaces/app",
+    \\    "cleanroom.provenance": "sha256:abc123"
+    \\  },
+    \\  "platform": {
+    \\    "arch": "aarch64",
+    \\    "cpu_profile": "sporevm-aarch64-v0",
+    \\    "device_model_version": 4,
+    \\    "ram_base": 2147483648,
+    \\    "ram_size": 1,
+    \\    "gic_dist_base": 134217728,
+    \\    "gic_redist_base": 134283264,
+    \\    "counter_frequency_hz": 24000000
+    \\  },
+    \\  "machine": {
+    \\    "gprs": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    \\    "pc": 0,
+    \\    "cpsr": 0,
+    \\    "fpcr": 0,
+    \\    "fpsr": 0,
+    \\    "simd": [[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],
+    \\    "sys_regs": [],
+    \\    "icc_regs": [],
+    \\    "vtimer": {"cntvct":0,"cntv_ctl":0,"cntv_cval":0},
+    \\    "gic": {"kind":"gicv3","gicv3":{"schema_version":0,"dist_regs":[{"offset":24832,"width_bits":64,"value":0}],"redist_regs":[{"offset":65664,"width_bits":32,"value":0}],"line_levels":[{"intid":16,"asserted":false}]}}
+    \\  },
+    \\  "devices": [],
+    \\  "generation": {"generation":0,"interrupt_status":0,"params_b64":""},
+    \\  "rootfs": null,
+    \\  "disk": null,
+    \\  "network": null,
+    \\  "memory": {"chunk_size":2097152,"chunks":[null],"backing":null}
+    \\}
+;

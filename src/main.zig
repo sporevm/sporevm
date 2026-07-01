@@ -760,12 +760,13 @@ fn writeInspectSummary(writer: *Io.Writer, summary: spore_api.SporeInspectResult
         try writer.writeAll("  Memory backing: none\n");
     }
     try writer.print("  GIC: {s}\n", .{summary.gic_kind});
-    if (summary.annotation_keys.len == 0) {
+    if (summary.annotations.map.count() == 0) {
         try writer.writeAll("  Annotations: none\n");
     } else {
-        try writer.print("  Annotations: {d}\n", .{summary.annotation_keys.len});
-        for (summary.annotation_keys) |key| {
-            try writer.print("    - {s}\n", .{key});
+        try writer.print("  Annotations: {d}\n", .{summary.annotations.map.count()});
+        var annotation_it = summary.annotations.map.iterator();
+        while (annotation_it.next()) |entry| {
+            try writer.print("    - {s}={s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
     }
 }

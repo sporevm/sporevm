@@ -428,6 +428,7 @@ pub const SporeInspectResult = struct {
     memory_backing_kind: ?[]const u8,
     memory_backing_size: ?u64,
     gic_kind: []const u8,
+    annotations: Annotations = .{},
     annotation_keys: []const []const u8 = &.{},
 };
 
@@ -691,7 +692,11 @@ pub fn inspectSpore(
     allocator: std.mem.Allocator,
     spore_dir: []const u8,
 ) !SporeInspectResult {
-    const manifest = try spore.loadManifest(allocator, spore_dir);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const manifest = try spore.loadManifest(arena, spore_dir);
     defer manifest.deinit();
     return summarizeSpore(allocator, manifest.value);
 }
@@ -701,8 +706,9 @@ pub fn deinitSporeInspectResult(allocator: std.mem.Allocator, result: SporeInspe
     allocator.free(result.platform.arch);
     allocator.free(result.platform.cpu_profile);
     if (result.memory_backing_kind) |kind| allocator.free(kind);
-    for (result.annotation_keys) |key| allocator.free(key);
     allocator.free(result.annotation_keys);
+    var annotations = result.annotations;
+    deinitOwnedAnnotations(allocator, &annotations);
 }
 
 /// Map an internal Zig error to the stable failure classification used by
@@ -1173,15 +1179,24 @@ fn summarizeSpore(allocator: std.mem.Allocator, manifest: spore.Manifest) !Spore
     for (manifest.memory.chunks) |maybe_chunk| {
         if (maybe_chunk != null) present_chunks += 1;
     }
-    var annotation_keys = try allocator.alloc([]const u8, manifest.annotations.map.count());
-    var annotation_index: usize = 0;
-    errdefer {
-        for (annotation_keys[0..annotation_index]) |key| allocator.free(key);
-        allocator.free(annotation_keys);
-    }
+
+    var annotations = spore.Annotations{};
+    errdefer deinitOwnedAnnotations(allocator, &annotations);
     var annotation_it = manifest.annotations.map.iterator();
     while (annotation_it.next()) |entry| {
-        annotation_keys[annotation_index] = try allocator.dupe(u8, entry.key_ptr.*);
+        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key);
+        const value = try allocator.dupe(u8, entry.value_ptr.*);
+        errdefer allocator.free(value);
+        annotations.map.put(allocator, key, value) catch return error.OutOfMemory;
+    }
+
+    var annotation_keys = try allocator.alloc([]const u8, annotations.map.count());
+    errdefer allocator.free(annotation_keys);
+    var annotation_index: usize = 0;
+    var copied_annotation_it = annotations.map.iterator();
+    while (copied_annotation_it.next()) |entry| {
+        annotation_keys[annotation_index] = entry.key_ptr.*;
         annotation_index += 1;
     }
 
@@ -1203,7 +1218,75 @@ fn summarizeSpore(allocator: std.mem.Allocator, manifest: spore.Manifest) !Spore
         .memory_backing_kind = if (manifest.memory.backing) |backing| try allocator.dupe(u8, backing.kind) else null,
         .memory_backing_size = if (manifest.memory.backing) |backing| backing.size else null,
         .gic_kind = @tagName(manifest.machine.gic.kind),
+        .annotations = annotations,
         .annotation_keys = annotation_keys,
+    };
+}
+
+fn deinitOwnedAnnotations(allocator: std.mem.Allocator, annotations: *spore.Annotations) void {
+    var it = annotations.map.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.*);
+    }
+    annotations.deinit(allocator);
+}
+
+test "inspect spore returns annotation values from saved manifest" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    var annotations = spore.Annotations{};
+    try annotations.map.put(arena, "cleanroom.create", "created");
+    try annotations.map.put(arena, "cleanroom.snapshot", "warm");
+    var memory_chunks = [_]?[]const u8{null};
+    try spore.saveManifest(arena, dir, annotationTestManifest(annotations, &memory_chunks));
+
+    const inspected = try inspectSpore(allocator, dir);
+    defer deinitSporeInspectResult(allocator, inspected);
+    try std.testing.expectEqualStrings("created", inspected.annotations.map.get("cleanroom.create").?);
+    try std.testing.expectEqualStrings("warm", inspected.annotations.map.get("cleanroom.snapshot").?);
+}
+
+fn annotationTestManifest(annotations: spore.Annotations, memory_chunks: []?[]const u8) spore.Manifest {
+    return .{
+        .annotations = annotations,
+        .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
+            .device_model_version = 4,
+            .ram_base = 0x8000_0000,
+            .ram_size = 1,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0801_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{
+            .gprs = [_]u64{0} ** 31,
+            .pc = 0,
+            .cpsr = 0,
+            .fpcr = 0,
+            .fpsr = 0,
+            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .sys_regs = &.{},
+            .icc_regs = &.{},
+            .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+            .gic = .{
+                .kind = .gicv3,
+                .gicv3 = .{
+                    .dist_regs = &.{},
+                    .redist_regs = &.{},
+                    .line_levels = &.{},
+                },
+            },
+        },
+        .devices = &.{},
+        .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
+        .memory = .{ .chunk_size = spore.chunk_size, .chunks = memory_chunks },
     };
 }
 

@@ -150,6 +150,10 @@ under `rootfs.cache`.
   such as `dev.buildkite.cleanroom.policy_hash`. Keys and values are UTF-8
   strings, values are not interpreted by SporeVM, and the serialized annotation
   object is capped at 64 KiB. Restore ignores annotations it does not know.
+  `libspore.inspectSpore`, `spore_inspect_spore_json`, and the Go
+  `InspectSpore` binding return these key/value pairs from local `.spore`
+  artifacts after the same manifest validation, so embedders can recover
+  opaque metadata without sidecar files.
 - `platform`: contract the restoring host must satisfy exactly — `arch`
   (aarch64), `cpu_profile`, `device_model_version`, `ram_base`, `ram_size`,
   `gic_dist_base`, `gic_redist_base`, and `counter_frequency_hz`. Restore

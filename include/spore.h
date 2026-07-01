@@ -80,6 +80,7 @@ typedef struct SporeContextImpl *SporeContext;
 #define SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION 2u
 #define SPORE_SUSPEND_NAMED_OPTIONS_VERSION 1u
 #define SPORE_REMOVE_NAMED_OPTIONS_VERSION 1u
+#define SPORE_INSPECT_SPORE_OPTIONS_VERSION 1u
 
 #define SPORE_CACHE_ROOT_ENV 0u
 #define SPORE_CACHE_ROOT_NONE 1u
@@ -95,6 +96,13 @@ typedef struct SporeInspectBundleOptions {
   uint32_t child_range_start;
   uint32_t child_range_end;
 } SporeInspectBundleOptions;
+
+/** Options for spore_inspect_spore_json(). */
+typedef struct SporeInspectSporeOptions {
+  uint32_t size;
+  uint32_t version;
+  SporeString spore_dir;
+} SporeInspectSporeOptions;
 
 /** Cache-root selection for operations that can use SporeVM caches. */
 typedef struct SporeCacheRoot {
@@ -255,6 +263,9 @@ typedef struct SporeRemoveNamedOptions {
 /** Initialize inspect-bundle options with the current ABI size and version. */
 SPORE_API void spore_inspect_bundle_options_init(SporeInspectBundleOptions *options);
 
+/** Initialize inspect-spore options with the current ABI size and version. */
+SPORE_API void spore_inspect_spore_options_init(SporeInspectSporeOptions *options);
+
 /** Initialize pull options with defaults. */
 SPORE_API void spore_pull_options_init(SporePullOptions *options);
 
@@ -334,6 +345,17 @@ SPORE_API SporeResult spore_network_capabilities_json(SporeContext context, Spor
 SPORE_API SporeResult spore_inspect_bundle_json(SporeContext context,
                                                 const SporeInspectBundleOptions *options,
                                                 SporeOwnedString *out_json);
+
+/**
+ * Inspect a local spore artifact and return JSON including annotation
+ * key/value pairs.
+ *
+ * The returned string is NUL-terminated for C convenience. `len` excludes the
+ * trailing NUL and includes the final newline, matching CLI JSON output.
+ */
+SPORE_API SporeResult spore_inspect_spore_json(SporeContext context,
+                                               const SporeInspectSporeOptions *options,
+                                               SporeOwnedString *out_json);
 
 /**
  * Pull a bundle into a local spore directory and return `spore.pull.result.v1`

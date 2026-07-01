@@ -73,6 +73,24 @@ Use the matching helper for owned results:
 `run`, `runManaged`, `runFromSpore`, and `resumeSpore` return value results and
 do not need deinit.
 
+## Local Spore Inspection
+
+Use `inspectSpore` to read metadata from a local `.spore` directory without
+resuming it or manually parsing `manifest.json`:
+
+```zig
+const inspected = try libspore.inspectSpore(allocator, "worker.spore");
+defer libspore.deinitSporeInspectResult(allocator, inspected);
+
+const workspace = inspected.annotations.map.get("cleanroom.workspace");
+```
+
+`SporeInspectResult.annotations` is an opaque key/value map copied out of the
+validated manifest. SporeVM does not interpret namespaces such as
+`cleanroom.*`; callers own their schema. The same manifest annotation rules
+apply on read and write: keys and values must be UTF-8 strings, keys cannot be
+empty, and the serialized annotation object is capped at 64 KiB.
+
 ## Local System
 
 Use `systemDf` and `systemPrune` for rootfs cache inspection and cleanup without
@@ -362,7 +380,7 @@ The generated Zig API docs are installed under
 The C ABI is declared in [`include/spore.h`](../include/spore.h). The current
 surface exposes context management, build info, context-local environment
 overrides, context-local last errors, owned string cleanup, host-info JSON,
-inspect-bundle JSON, pull JSON, and named lifecycle JSON.
+inspect-bundle JSON, inspect-spore JSON, pull JSON, and named lifecycle JSON.
 
 Release builds publish separate `libspore_Linux_arm64` and
 `libspore_Darwin_arm64` archives so CLI-only installs do not carry development
@@ -427,6 +445,18 @@ their matching helper:
 SporeInspectBundleOptions options;
 spore_inspect_bundle_options_init(&options);
 options.source = (SporeString){ .ptr = "file:///tmp/base.bundle", .len = 23 };
+```
+
+Inspecting a local `.spore` returns the same manifest summary as the Zig API,
+including annotation key/value pairs:
+
+```c
+SporeInspectSporeOptions inspect;
+spore_inspect_spore_options_init(&inspect);
+inspect.spore_dir = (SporeString){ .ptr = "worker.spore", .len = 12 };
+
+if (spore_inspect_spore_json(context, &inspect, &json) != SPORE_SUCCESS) return 1;
+spore_free_string(context, json);
 ```
 
 `spore_pull_json` follows the same owned-string contract and returns the
@@ -604,6 +634,14 @@ if err != nil {
     return err
 }
 
+inspected, err := client.InspectSpore(ctx, spore.InspectSporeOptions{
+    SporeDir: "worker.spore",
+})
+if err != nil {
+    return err
+}
+workspace := inspected.Annotations["cleanroom.workspace"]
+
 resumed, err := client.ResumeNamed(ctx, spore.ResumeNamedOptions{
     SporeDir: "worker.spore",
     Name:     "worker-resumed",
@@ -638,20 +676,21 @@ _ = exec.Stdout
 _ = exec.Stderr
 _ = exec.NetworkEventsJSONL
 _ = snap
+_ = workspace
 _ = resumed
 _ = named
 _ = removed
 ```
 
 The surface covers build info, context lifetime, host-info, network
-capabilities, inspect-bundle, pull, context-local environment variables through
-`SetEnv`, and named lifecycle `CreateNamed`, `ExecNamed`, `SnapshotNamed`,
-`ResumeNamed`, `RemoveNamed`, and `ListNamed`. `CreateNamedOptions` exposes the
-create-time network policy supported by the C ABI: `NetworkEnabled`,
-`AllowCIDRs`, `AllowHosts`, exact host/port `NetworkRules`, and
-`BoundServices` for host Unix sockets exposed to the guest. Passing CIDRs,
-hosts, exact rules, or bound services while `NetworkEnabled` is false is
-rejected by libspore instead of being silently ignored.
+capabilities, inspect-bundle, inspect-spore, pull, context-local environment
+variables through `SetEnv`, and named lifecycle `CreateNamed`, `ExecNamed`,
+`SnapshotNamed`, `ResumeNamed`, `RemoveNamed`, and `ListNamed`.
+`CreateNamedOptions` exposes the create-time network policy supported by the C
+ABI: `NetworkEnabled`, `AllowCIDRs`, `AllowHosts`, exact host/port
+`NetworkRules`, and `BoundServices` for host Unix sockets exposed to the guest.
+Passing CIDRs, hosts, exact rules, or bound services while `NetworkEnabled` is
+false is rejected by libspore instead of being silently ignored.
 
 `NetworkCapabilities` is the typed wrapper around
 `spore_network_capabilities_json`. Call it before accepting a higher-level
@@ -667,7 +706,7 @@ When setting `SPOREVM_RUNTIME_DIR`, pass an absolute directory that exists and
 is private to the current user, matching the named lifecycle registry rules.
 
 The Go binding decodes the same JSON contracts as the CLI and C ABI, and it
-requires C ABI version 9 or newer. Go context cancellation is checked before
+requires C ABI version 10 or newer. Go context cancellation is checked before
 entering C calls; long-running runtime cancellation is not exposed until the Zig
 product API and C ABI provide it.
 

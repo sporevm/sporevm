@@ -2,9 +2,11 @@ package spore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"unsafe"
 )
@@ -104,6 +106,32 @@ func TestInspectBundle(t *testing.T) {
 	}
 	if got := result.Selection.Children[0].ID; got != "000001" {
 		t.Fatalf("selected child = %q", got)
+	}
+}
+
+func TestInspectSporeAnnotations(t *testing.T) {
+	client, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	dir := writeSporeFixture(t, map[string]string{
+		"cleanroom.workspace":  "/workspaces/app",
+		"cleanroom.provenance": "sha256:abc123",
+	})
+	result, err := client.InspectSpore(context.Background(), InspectSporeOptions{SporeDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Annotations["cleanroom.workspace"]; got != "/workspaces/app" {
+		t.Fatalf("cleanroom.workspace = %q", got)
+	}
+	if got := result.Annotations["cleanroom.provenance"]; got != "sha256:abc123" {
+		t.Fatalf("cleanroom.provenance = %q", got)
+	}
+	if len(result.AnnotationKeys) != 2 {
+		t.Fatalf("annotation keys = %#v", result.AnnotationKeys)
 	}
 }
 
@@ -428,6 +456,18 @@ func writeInspectBundleFixture(t *testing.T) string {
 	mustWrite(t, filepath.Join(dir, "bundle.json"), `{"version":0,"parent_manifest":"manifests/parent.json","children":[{"id":"000001","manifest":"manifests/children/000001.json"}],"chunkpack_index":"chunkpack.index.json","rootfs_index":null}`)
 	mustWrite(t, filepath.Join(dir, "manifests", "parent.json"), tinyManifest)
 	mustWrite(t, filepath.Join(dir, "manifests", "children", "000001.json"), tinyManifest)
+	return dir
+}
+
+func writeSporeFixture(t *testing.T, annotations map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	annotationJSON, err := json.Marshal(annotations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := strings.Replace(tinyManifest, `  "platform": {`, `  "annotations": `+string(annotationJSON)+","+"\n"+`  "platform": {`, 1)
+	mustWrite(t, filepath.Join(dir, "manifest.json"), manifest)
 	return dir
 }
 

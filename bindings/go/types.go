@@ -66,6 +66,36 @@ type ChildRange struct {
 	End   uint32
 }
 
+// InspectSporeOptions selects a local spore artifact to inspect.
+type InspectSporeOptions struct {
+	SporeDir string
+}
+
+// SporeInspectResult is the decoded local spore inspection result.
+type SporeInspectResult struct {
+	Version                 uint32               `json:"version"`
+	Platform                SporePlatformSummary `json:"platform"`
+	DeviceCount             uint64               `json:"device_count"`
+	MemoryChunkCount        uint64               `json:"memory_chunk_count"`
+	PresentMemoryChunkCount uint64               `json:"present_memory_chunk_count"`
+	MemoryBackingKind       *string              `json:"memory_backing_kind"`
+	MemoryBackingSize       *uint64              `json:"memory_backing_size"`
+	GICKind                 string               `json:"gic_kind"`
+	Annotations             map[string]string    `json:"annotations"`
+	AnnotationKeys          []string             `json:"annotation_keys"`
+}
+
+type SporePlatformSummary struct {
+	Arch               string `json:"arch"`
+	CPUProfile         string `json:"cpu_profile"`
+	DeviceModelVersion uint32 `json:"device_model_version"`
+	RAMBase            uint64 `json:"ram_base"`
+	RAMSize            uint64 `json:"ram_size"`
+	GICDistBase        uint64 `json:"gic_dist_base"`
+	GICRedistBase      uint64 `json:"gic_redist_base"`
+	CounterFrequencyHz uint64 `json:"counter_frequency_hz"`
+}
+
 // CacheRootKind selects how libspore resolves a cache root.
 type CacheRootKind uint32
 

@@ -16,7 +16,7 @@ import (
 	"unsafe"
 )
 
-const minABIVersion uint32 = 9
+const minABIVersion uint32 = 10
 
 var ErrClosed = errors.New("spore client closed")
 
@@ -165,6 +165,26 @@ func (c *Client) InspectBundle(ctx context.Context, options InspectBundleOptions
 	}
 	defer C.spore_free_string(c.ctx, out)
 	return decodeJSON[InspectBundleResult](goBytes(out), "inspect bundle")
+}
+
+// InspectSpore returns metadata and annotations for a local spore artifact.
+func (c *Client) InspectSpore(ctx context.Context, options InspectSporeOptions) (SporeInspectResult, error) {
+	if err := c.ready(ctx); err != nil {
+		return SporeInspectResult{}, err
+	}
+	sporeDir, freeSporeDir := cString(options.SporeDir)
+	defer freeSporeDir()
+
+	var opts C.SporeInspectSporeOptions
+	C.spore_inspect_spore_options_init(&opts)
+	opts.spore_dir = sporeDir
+
+	var out C.SporeOwnedString
+	if result := Result(C.spore_inspect_spore_json(c.ctx, &opts, &out)); result != Success {
+		return SporeInspectResult{}, c.callError(result)
+	}
+	defer C.spore_free_string(c.ctx, out)
+	return decodeJSON[SporeInspectResult](goBytes(out), "inspect spore")
 }
 
 // Pull materializes a bundle into a local spore directory.
