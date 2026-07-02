@@ -90,11 +90,6 @@ pub const Config = struct {
     /// Optional minimal host-initiated vsock stream used by benchmark harnesses.
     exec_probe: ?*vsock.HostStream = null,
     exec_probe_timeout_ms: u64 = 30_000,
-    /// Delay initial host-stream RX delivery after resume. Restored guests may
-    /// have userland ready to run but stale virtio-vsock session state from the
-    /// capture host; giving the vCPU a short grace period avoids injecting an
-    /// immediate synthetic RX interrupt into that restored state.
-    exec_probe_initial_rx_delay_ms: u64 = 0,
     exec_probe_completes_run: bool = true,
     exec_probe_failure_fatal: bool = true,
     /// Optional virtio-net frame backend. The default remains closed.
@@ -406,12 +401,6 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     }
     config.network.setWake(.{ .context = &vcpu, .wakeFn = wakeNetworkVcpu });
     defer config.network.clearWake();
-    var exec_probe_wake_stop = std.atomic.Value(bool).init(false);
-    var exec_probe_wake_thread: ?std.Thread = null;
-    defer {
-        exec_probe_wake_stop.store(true, .release);
-        if (exec_probe_wake_thread) |thread| thread.join();
-    }
 
     try hvf.check(hvf.hv_vcpu_set_sys_reg(vcpu, .mpidr_el1, topology.mpidrForIndex(0)), "set mpidr");
     var vcpu_redist_base: hvf.Ipa = 0;
@@ -538,21 +527,12 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             },
         );
     }
-    var exec_probe_rx_enabled = config.exec_probe_initial_rx_delay_ms == 0;
-    // Under host load, the delayed wake can cancel the vCPU before the restored
-    // guest has actually run. Wait for a real guest exit before delivering RX.
-    var exec_probe_guest_exited = exec_probe_rx_enabled;
     var attach_probe_ms: u64 = 0;
     if (config.exec_probe) |probe| {
         const attach_probe_start = monotonicMs();
         try vsock_dev.attachHostStream(probe);
-        if (!exec_probe_rx_enabled) {
-            exec_probe_wake_thread = try std.Thread.spawn(.{}, wakeVcpuAfterMs, .{ vcpu, config.exec_probe_initial_rx_delay_ms, &exec_probe_wake_stop });
-        }
-        if (exec_probe_rx_enabled) {
-            probe.markStarted();
-            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
-        }
+        probe.markStarted();
+        try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
         attach_probe_ms = monotonicMs() - attach_probe_start;
     }
     if (config.resume_dir == null) {
@@ -582,15 +562,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var did_capture_request = false;
     while (true) {
         if (config.exec_probe != null and !exec_probe_done) {
-            if (!exec_probe_rx_enabled and exec_probe_guest_exited and monotonicMs() -| start_ms >= config.exec_probe_initial_rx_delay_ms) {
-                exec_probe_rx_enabled = true;
-                // The timeout measures guest-visible probe delivery time. A
-                // restored guest can run for a while before its first exit.
-                config.exec_probe.?.markStarted();
-            }
-            if (exec_probe_rx_enabled) {
-                try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
-            }
+            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
         }
         if (mem_transport_index != null) {
             if (config.exec_probe) |probe| {
@@ -671,7 +643,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
-                if (!exec_probe_done and exec_probe_rx_enabled and probe.elapsedMs() > config.exec_probe_timeout_ms) {
+                if (!exec_probe_done and probe.elapsedMs() > config.exec_probe_timeout_ms) {
                     if (config.exec_probe_failure_fatal) return error.VsockProbeTimedOut;
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;
@@ -696,7 +668,6 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         }
         try hvf.check(hvf.hv_vcpu_run(vcpu), "hv_vcpu_run");
         if (config.exec_probe != null and !exec_probe_done and exit.reason != .canceled) {
-            exec_probe_guest_exited = true;
             if (config.resume_dir != null and !logged_first_guest_exit) {
                 logged_first_guest_exit = true;
                 std.log.debug(
@@ -1220,14 +1191,11 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
     }
 
     var attach_probe_ms: u64 = 0;
-    var exec_probe_rx_enabled = options.config.exec_probe_initial_rx_delay_ms == 0;
     if (options.config.exec_probe) |probe| {
         const attach_probe_start = monotonicMs();
         try options.vsock_dev.attachHostStream(probe);
-        if (exec_probe_rx_enabled) {
-            probe.markStarted();
-            try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, @intCast(options.vsock_transport_index));
-        }
+        probe.markStarted();
+        try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, @intCast(options.vsock_transport_index));
         attach_probe_ms = monotonicMs() - attach_probe_start;
     }
     const start_ms = monotonicMs();
@@ -1293,22 +1261,16 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                 },
             }
         }
-        const elapsed_ms = monotonicMs() -| start_ms;
-        if (options.config.exec_probe != null and !exec_probe_rx_enabled and elapsed_ms >= options.config.exec_probe_initial_rx_delay_ms) {
-            exec_probe_rx_enabled = true;
-            options.config.exec_probe.?.markStarted();
-            try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, @intCast(options.vsock_transport_index));
-        }
         if (options.config.exec_probe) |probe| {
             if (!exec_probe_done) {
-                if (exec_probe_rx_enabled and probe.state == .failed) {
+                if (probe.state == .failed) {
                     if (options.config.exec_probe_failure_fatal) {
                         state.finish(.{ .err = error.VsockProbeFailed });
                         continue;
                     }
                     exec_probe_done = true;
                 }
-                if (exec_probe_rx_enabled and probe.state == .complete) {
+                if (probe.state == .complete) {
                     std.log.debug("hvf multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
                     if (options.config.exec_probe_completes_run) {
                         if (options.config.snapshot_on_probe_complete) {
@@ -1319,7 +1281,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                     }
                     exec_probe_done = true;
                 }
-                if (exec_probe_rx_enabled and !exec_probe_done and probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
+                if (!exec_probe_done and probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
                     if (options.config.exec_probe_failure_fatal) {
                         state.finish(.{ .err = error.VsockProbeTimedOut });
                         continue;
@@ -1338,7 +1300,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
             }
         }
         if (options.config.snapshot_after_ms) |after_ms| {
-            if (elapsed_ms >= after_ms) {
+            if (monotonicMs() -| start_ms >= after_ms) {
                 return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), null, null);
             }
         }
@@ -2413,19 +2375,6 @@ fn wakeVcpu(context: *anyopaque) void {
 fn wakeVcpuSet(context: *anyopaque) void {
     const wake_set: *HvfVcpuWakeSet = @ptrCast(@alignCast(context));
     wake_set.wakeAll();
-}
-
-fn wakeVcpuAfterMs(vcpu: hvf.VcpuHandle, delay_ms: u64, stop: *std.atomic.Value(bool)) void {
-    var slept_ms: u64 = 0;
-    while (slept_ms < delay_ms) {
-        if (stop.load(.acquire)) return;
-        const slice_ms = @min(delay_ms - slept_ms, 10);
-        sleepMs(slice_ms);
-        slept_ms += slice_ms;
-    }
-    if (stop.load(.acquire)) return;
-    var vcpus = [_]hvf.VcpuHandle{vcpu};
-    _ = hvf.hv_vcpus_exit(&vcpus, vcpus.len);
 }
 
 fn flushVsockRx(vsock_dev: *vsock.Vsock, transport: *mmio.Transport, ram: guestmem.GuestRam, transport_index: u32) !void {

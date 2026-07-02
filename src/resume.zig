@@ -22,9 +22,7 @@ const vsock = @import("virtio/vsock.zig");
 
 pub const Backend = run_mod.Backend;
 const default_resume_guest_port: u32 = 10700;
-const resume_attach_host_port: u32 = 49153;
 const default_resume_attach_timeout_ms: u64 = 30_000;
-const hvf_resume_attach_rx_delay_ms: u64 = 25;
 
 pub const Options = struct {
     backend: Backend = .auto,
@@ -165,7 +163,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     defer attach.deinit(allocator);
     var identity_stream: ?vsock.HostStream = try vsock.HostStream.init(default_resume_guest_port, attach.request);
     if (identity_stream) |*stream| {
-        stream.host_port = resume_attach_host_port;
+        stream.host_port = vsock.HostStream.deriveHostPort(attach.request);
         if (opts.events != null) {
             stream.setLifecycleSink(&events, resumeEventLifecycleSink);
             stream.setOutputSink(&events, resumeEventOutputSink);
@@ -202,7 +200,6 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .network = network,
                 .exec_probe = identity_probe,
                 .exec_probe_timeout_ms = opts.timeout_ms,
-                .exec_probe_initial_rx_delay_ms = hvf_resume_attach_rx_delay_ms,
                 .exec_probe_completes_run = true,
                 .exec_probe_failure_fatal = true,
             });
