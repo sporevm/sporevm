@@ -2632,11 +2632,70 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
     }
     _ = try std.process.spawn(init.io, .{
         .argv = argv.items,
+        .environ_map = init.environ_map,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
         .pgid = if (builtin.os.tag == .windows) null else 0,
     });
+}
+
+test "lifecycle monitor spawn receives context environment" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-monitor-env"});
+    defer allocator.free(root);
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try ensureDirPath(io, root);
+
+    const script_path = try std.fs.path.resolve(allocator, &.{ root, "monitor-env.sh" });
+    defer allocator.free(script_path);
+    const out_path = try std.fs.path.resolve(allocator, &.{ root, "home.txt" });
+    defer allocator.free(out_path);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = script_path,
+        .data = "#!/bin/sh\nprintf '%s' \"$HOME\" > \"$SPOREVM_TEST_ENV_OUT\"\n",
+    });
+    try Io.Dir.cwd().setFilePermissions(io, script_path, @enumFromInt(0o755), .{});
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("HOME", "/tmp/sporevm-context-home");
+    try env.put("SPOREVM_TEST_ENV_OUT", out_path);
+
+    var spawn_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer spawn_arena_state.deinit();
+    const spawn_arena = spawn_arena_state.allocator();
+
+    try spawnMonitorExecutable(.{
+        .minimal = undefined,
+        .arena = undefined,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    }, spawn_arena, .{
+        .name = "env-probe",
+        .backend = "auto",
+    }, script_path, null);
+
+    var observed: ?[]u8 = null;
+    defer if (observed) |bytes| allocator.free(bytes);
+    const start = monotonicMs();
+    while (monotonicMs() - start < 2_000) {
+        observed = Io.Dir.cwd().readFileAlloc(io, out_path, allocator, .limited(4096)) catch |err| switch (err) {
+            error.FileNotFound => {
+                sleepMs(20);
+                continue;
+            },
+            else => |e| return e,
+        };
+        break;
+    }
+    try std.testing.expect(observed != null);
+    try std.testing.expectEqualStrings("/tmp/sporevm-context-home", observed.?);
 }
 
 fn appendMonitorNetworkPolicyArgs(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), policy: *const run_mod.NetworkPolicy) !void {
