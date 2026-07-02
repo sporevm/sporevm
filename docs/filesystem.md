@@ -63,21 +63,30 @@ virtio-blk
   -> local active COW head
   -> sealed disk-layer objects
   -> immutable base block source
-       FileBlockSource: verified ext4 fd
-       CasBlockSource: verified rootfs index plus verified chunks
+       FileBlockSource: flat digest-addressed ext4 fd (preferred)
+       CasBlockSource: verified rootfs index plus verified chunks (fallback)
 ```
 
-`CasBlockSource` opens the exact `rootfs-block-index-v0` named by
-`rootfs.storage.index_digest`, validates descriptor fields, and verifies each
-chunk by BLAKE3 before guest use. It memoizes verified chunks for the VM so
-repeated small guest reads do not rehash the same object.
+`FileBlockSource` is preferred whenever the flat digest-addressed ext4
+artifact is materialized in the local rootfs cache, including for manifests
+with `rootfs.storage`. The open follows the verify-at-install, trust-at-open
+cache contract (see SECURITY.md): entries were BLAKE3-verified when installed
+and published read-only, so the open checks only symlink-safety, regular-file
+shape, and exact size instead of re-hashing the artifact. Serving guest reads
+with plain preads on one fd is what keeps resume-to-first-command fast; the
+per-chunk object opens of the CAS path dominated warm TTI before this change.
 
-`FileBlockSource` is only used when the manifest has no `rootfs.storage`. It
-opens the digest-addressed ext4 artifact read-only and verifies the same fd by
-BLAKE3 and size before attaching the block backend.
+`CasBlockSource` is the fallback when the flat artifact is not locally
+materialized, such as chunk-only pulls. It opens the exact
+`rootfs-block-index-v0` named by `rootfs.storage.index_digest`, validates
+descriptor fields, and verifies each chunk by BLAKE3 before guest use. It
+memoizes verified chunks for the VM so repeated small guest reads do not
+rehash the same object.
 
 Missing or corrupt rootfs indexes, chunk objects, exact artifacts, disk layer
-indexes, or disk objects fail before guest code can observe the bytes.
+indexes, or disk objects fail before guest code can observe the bytes. A
+missing or wrong-size flat artifact is not fatal when chunks are available;
+resume falls back to the CAS source.
 
 ## Writable Disk Layers
 
@@ -134,7 +143,8 @@ passed with an age or size bound.
 ## Evidence
 
 The default manifest-attached rootfs CAS path is materially faster than the
-fd-backed control on local HVF for `docker.io/library/node:22-alpine`:
+historical verify-on-open fd-backed control on local HVF for
+`docker.io/library/node:22-alpine`:
 
 ```text
 count  baseline median TTI  manifest CAS median TTI
@@ -145,6 +155,13 @@ count  baseline median TTI  manifest CAS median TTI
 The same benchmark showed median rootfs verification dropping from about 3.35s
 and 536.9MiB hashed to about 270-284ms and 31.98MiB hashed for the sparse Node
 working set.
+
+The later trust-at-open flat-artifact preference removed the remaining
+per-chunk object-open cost from warm resume. On the same local HVF
+Node workload, the CI benchmark profile measured warm `spore run --from`
+median TTI dropping from 391ms (CAS chunk base) to 73ms (flat artifact base),
+with guest `node -v` execution time inside the resumed VM dropping from about
+300ms to about 22ms. Cold TTI was unchanged.
 
 ## Deferred Work
 

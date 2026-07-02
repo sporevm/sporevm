@@ -243,7 +243,10 @@ def parse_run_stderr_metrics(path: Path) -> dict[str, object]:
             event = json.loads(stripped)
         except json.JSONDecodeError:
             continue
-        if isinstance(event, dict) and event.get("event") == "rootfs_open_verified":
+        # "rootfs_open" is the current trace event; "rootfs_open_verified" is
+        # accepted for older logs. The metric keys keep the historical names
+        # so trend series stay continuous across the trust-at-open change.
+        if isinstance(event, dict) and event.get("event") in ("rootfs_open", "rootfs_open_verified"):
             elapsed_ms = parse_int_field(event.get("elapsed_ms"))
             metrics["rootfs_open_verified_ms"] = elapsed_ms
             metrics["rootfs_verification_elapsed_ms"] = elapsed_ms
@@ -1094,7 +1097,7 @@ def self_test() -> None:
         stderr = Path(tmp) / "run.stderr"
         stderr.write_text(
             "\n".join([
-                '{"event":"rootfs_open_verified","digest":"abc","size":4096,"elapsed_ms":7}',
+                '{"event":"rootfs_open","digest":"abc","size":4096,"elapsed_ms":7}',
                 "kvm restore metrics: mode=local_backing ram_mib=512 chunks=4 nonzero_chunks=2 manifest_ms=1 map_ram_ms=2 memory_ms=3 state_ms=4 pre_run_ms=10",
                 "run exec probe timing: attach_ms=1 connect_request_delivered_ms=2 connect_ms=3 request_delivered_ms=4 first_output_ms=5 guest_timing_ms=6 response_ms=8",
                 "run backend timing: elapsed_ms=12 stream_response_ms=8 tail_ms=4 cause=probe_complete",
