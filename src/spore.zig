@@ -362,6 +362,30 @@ pub const Network = struct {
     requirements: NetworkRequirements = .{},
 };
 
+pub const default_session_id = "default";
+pub const session_kind_process = "process";
+pub const max_sessions = 16;
+pub const max_session_id_len = 63;
+
+pub const SessionStreams = struct {
+    stdin: bool = false,
+    stdout: bool = true,
+    stderr: bool = true,
+    terminal: bool = false,
+};
+
+pub const Session = struct {
+    id: []const u8 = default_session_id,
+    kind: []const u8 = session_kind_process,
+    streams: SessionStreams = .{},
+};
+
+pub const SessionAttachRequest = struct {
+    id: []const u8 = default_session_id,
+    stdin: bool = false,
+    terminal: bool = false,
+};
+
 pub const MemoryPlan = struct {
     chunk_size: usize,
     chunk_count: usize,
@@ -387,6 +411,7 @@ pub const Manifest = struct {
     rootfs: ?Rootfs = null,
     disk: ?Disk = null,
     network: ?Network = null,
+    sessions: []const Session = &.{},
     memory: MemoryManifest,
 };
 
@@ -400,6 +425,7 @@ pub const ManifestV1 = struct {
     rootfs: ?Rootfs = null,
     disk: ?Disk = null,
     network: ?Network = null,
+    sessions: []const Session = &.{},
     memory: MemoryManifest,
 };
 
@@ -1348,6 +1374,7 @@ pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Man
 
 pub fn saveManifestPath(allocator: std.mem.Allocator, path: []const u8, manifest: Manifest) Error!void {
     try validateAnnotations(manifest.annotations);
+    try validateSessions(manifest.sessions);
     const json = std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
     defer allocator.free(json);
     const path_z = try pathZ(allocator, "{s}", .{path});
@@ -1764,6 +1791,7 @@ pub fn validateManifest(manifest: Manifest) Error!void {
         manifest.rootfs,
         manifest.disk,
         manifest.network,
+        manifest.sessions,
         manifest.memory,
     );
     gicv3.validate(manifest.machine.gic) catch return error.BadManifest;
@@ -1780,6 +1808,7 @@ pub fn validateManifestV1(manifest: ManifestV1) Error!void {
         manifest.rootfs,
         manifest.disk,
         manifest.network,
+        manifest.sessions,
         manifest.memory,
     );
     try validateMachineV1(manifest.platform, manifest.machine);
@@ -1794,9 +1823,11 @@ fn validateManifestCommon(
     rootfs: ?Rootfs,
     disk: ?Disk,
     network: ?Network,
+    sessions: []const Session,
     memory: MemoryManifest,
 ) Error!void {
     try validateAnnotations(annotations);
+    try validateSessions(sessions);
     if (cpu_profile.len == 0) return error.BadManifest;
     if (counter_frequency_hz == 0 or
         counter_frequency_hz > std.math.maxInt(u32))
@@ -1816,6 +1847,58 @@ fn validateManifestCommon(
     }
     if (network) |n| {
         try validateNetwork(n);
+    }
+}
+
+pub fn processSession(id: []const u8, interactive: bool, tty: bool) Session {
+    return .{
+        .id = id,
+        .streams = .{
+            .stdin = interactive and !tty,
+            .stdout = !tty,
+            .stderr = !tty,
+            .terminal = tty,
+        },
+    };
+}
+
+pub fn defaultAttachSessionId(sessions: []const Session) []const u8 {
+    for (sessions) |session| {
+        if (std.mem.eql(u8, session.id, default_session_id)) return default_session_id;
+    }
+    return if (sessions.len == 1) sessions[0].id else default_session_id;
+}
+
+pub fn validateSessionAttach(sessions: []const Session, request: SessionAttachRequest) !void {
+    if (sessions.len == 0) return;
+    const session = findSession(sessions, request.id) orelse return error.CapturedSessionUnavailable;
+    if (request.stdin and !session.streams.stdin) return error.CapturedSessionHasNoInteractiveStdin;
+    if (request.terminal and !session.streams.terminal) return error.CapturedSessionHasNoTerminal;
+}
+
+fn findSession(sessions: []const Session, id: []const u8) ?Session {
+    for (sessions) |session| {
+        if (std.mem.eql(u8, session.id, id)) return session;
+    }
+    return null;
+}
+
+fn validateSessions(sessions: []const Session) Error!void {
+    if (sessions.len > max_sessions) return error.BadManifest;
+    for (sessions, 0..) |session, i| {
+        try validateSessionId(session.id);
+        if (!std.mem.eql(u8, session.kind, session_kind_process)) return error.BadManifest;
+        for (sessions[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.id, session.id)) return error.BadManifest;
+        }
+    }
+}
+
+fn validateSessionId(id: []const u8) Error!void {
+    if (id.len == 0 or id.len > max_session_id_len) return error.BadManifest;
+    for (id) |byte| {
+        const ok = std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.';
+        if (!ok) return error.BadManifest;
     }
 }
 
@@ -2367,6 +2450,7 @@ test "manifest json round-trip" {
             .interrupt_status = generation.irq_generation_changed,
             .params_b64 = "",
         },
+        .sessions = &.{processSession(default_session_id, true, false)},
         .network = .{
             .allow_cidrs = &.{"93.184.216.34/32"},
             .allow_hosts = &.{"example.com"},
@@ -2386,12 +2470,35 @@ test "manifest json round-trip" {
     try std.testing.expectEqual(@as(u32, gicv3.distRouterOffset(32)), parsed.value.machine.gic.gicv3.?.dist_regs[0].offset);
     try std.testing.expectEqual(@as(u16, 64), parsed.value.devices[0].queues[0].size);
     try std.testing.expectEqual(@as(u64, 7), parsed.value.generation.generation);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.sessions.len);
+    try std.testing.expectEqualStrings(default_session_id, parsed.value.sessions[0].id);
+    try std.testing.expect(parsed.value.sessions[0].streams.stdin);
+    try std.testing.expect(!parsed.value.sessions[0].streams.terminal);
     try std.testing.expect(parsed.value.network != null);
     try std.testing.expectEqualStrings(network_kind_spore, parsed.value.network.?.kind);
     try std.testing.expectEqualStrings("93.184.216.34/32", parsed.value.network.?.allow_cidrs[0]);
     try std.testing.expectEqualStrings("example.com", parsed.value.network.?.allow_hosts[0]);
     try std.testing.expectEqualStrings("sha256:abc123", parsed.value.annotations.map.get("dev.buildkite.cleanroom.policy_hash").?);
     try std.testing.expectEqualStrings("worker", parsed.value.annotations.map.get("org.opencontainers.image.ref.name").?);
+}
+
+test "session attach validation rejects unavailable input streams" {
+    const sessions = [_]Session{processSession(default_session_id, false, false)};
+
+    try validateSessionAttach(&sessions, .{ .id = default_session_id });
+    try std.testing.expectError(error.CapturedSessionHasNoInteractiveStdin, validateSessionAttach(&sessions, .{
+        .id = default_session_id,
+        .stdin = true,
+    }));
+    try std.testing.expectError(error.CapturedSessionHasNoTerminal, validateSessionAttach(&sessions, .{
+        .id = default_session_id,
+        .terminal = true,
+    }));
+}
+
+test "single non-default session becomes the attach handle" {
+    const sessions = [_]Session{processSession("run-1234", true, false)};
+    try std.testing.expectEqualStrings("run-1234", defaultAttachSessionId(&sessions));
 }
 
 test "manifest v1 validates and round-trips multi-vCPU topology" {

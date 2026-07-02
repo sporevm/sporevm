@@ -198,6 +198,7 @@ pub const Spec = struct {
     disk: ?spore.Disk = null,
     network: ?spore.Network = null,
     annotations: spore.Annotations = .{},
+    sessions: []const spore.Session = &.{},
     image_ref: ?[]const u8 = null,
     resume_dir: ?[]const u8 = null,
     memory: memory_config.Config = .{},
@@ -595,6 +596,7 @@ pub fn resumeNamed(
     const devices_len = if (manifest) |parsed| parsed.value.devices.len else manifest_v1.?.value.devices.len;
     if (rootfs == null and devices_len != diskless_resume_device_count) return error.UnsupportedLifecycleDeviceModel;
     const ram_size = if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size;
+    const sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions;
     const memory = memory_config.fromManifestBytes(ram_size) catch return error.InvalidMemorySize;
     const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else @as(topology.VcpuCount, 1);
 
@@ -615,6 +617,7 @@ pub fn resumeNamed(
         .disk = disk,
         .network = try run_mod.manifestNetworkFromOptions(arena, network_options.network, &network_options.policy),
         .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
+        .sessions = sessions,
         .memory = memory,
         .vcpus = manifest_vcpus,
         .guest_port = base.guest_port,
@@ -626,7 +629,7 @@ pub fn resumeNamed(
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
     const state = try classifyVmState(arena, init.io, paths, pidAlive);
     if (state != .absent) return error.NamedVmExists;
-    if (spec.rootfs != null or spec.disk != null or !spore.annotationsEmpty(spec.annotations)) try writeSpec(arena, init.io, paths, spec);
+    if (spec.rootfs != null or spec.disk != null or !spore.annotationsEmpty(spec.annotations) or spec.sessions.len != 0) try writeSpec(arena, init.io, paths, spec);
 
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (network_options.network == .spore) &network_options.policy else null;
     try spawnMonitorExecutable(init, arena, spec, options.spore_executable, spawn_policy);
@@ -2371,6 +2374,7 @@ fn startForkChildExecutable(
         .initrd_path = base.initrd_path,
         .resume_dir = spore_dir,
         .annotations = manifest.value.annotations,
+        .sessions = manifest.value.sessions,
         .memory = memory,
         .vcpus = 1,
         .guest_port = base.guest_port,

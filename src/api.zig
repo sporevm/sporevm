@@ -136,6 +136,8 @@ pub const PortForwardConfig = spore_net_policy.PortForwardConfig;
 pub const Rootfs = run_mod.Rootfs;
 pub const Annotations = spore.Annotations;
 pub const validateAnnotations = spore.validateAnnotations;
+pub const Session = spore.Session;
+pub const SessionStreams = spore.SessionStreams;
 pub const RootfsBuildOptions = rootfs_mod.BuildRequest;
 pub const RootfsBuildResult = rootfs_mod.BuildResult;
 pub const RootfsCasPreloadOptions = rootfs_mod.CasPreloadRequest;
@@ -435,6 +437,7 @@ pub const SporeInspectResult = struct {
     memory_backing_kind: ?[]const u8,
     memory_backing_size: ?u64,
     gic_kind: []const u8,
+    sessions: []Session = &.{},
     annotations: Annotations = .{},
     annotation_keys: []const []const u8 = &.{},
 };
@@ -713,6 +716,7 @@ pub fn deinitSporeInspectResult(allocator: std.mem.Allocator, result: SporeInspe
     allocator.free(result.platform.arch);
     allocator.free(result.platform.cpu_profile);
     if (result.memory_backing_kind) |kind| allocator.free(kind);
+    freeSessions(allocator, result.sessions);
     allocator.free(result.annotation_keys);
     var annotations = result.annotations;
     deinitOwnedAnnotations(allocator, &annotations);
@@ -858,6 +862,7 @@ pub fn runFromSpore(
     const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else options.vcpus;
     if (manifest_v1 != null and options.vcpus != 1 and options.vcpus != manifest_vcpus) return error.PlatformMismatch;
     const manifest_generation = if (manifest) |parsed| parsed.value.generation else manifest_v1.?.value.generation;
+    const sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions;
     var resume_generation: ?generation.State = null;
     var start_generation_params: ?[]const u8 = null;
     if (manifest_generation.params_b64.len != 0) {
@@ -877,6 +882,8 @@ pub fn runFromSpore(
         .disk = disk,
         .resume_dir = options.spore_dir,
         .resume_generation = resume_generation,
+        .resume_sessions = sessions,
+        .attach_session_id = spore.defaultAttachSessionId(sessions),
         .start_generation_params = start_generation_params,
         .require_generation_ready = start_generation_params != null,
         .command = options.command,
@@ -1221,6 +1228,8 @@ fn summarizeSpore(allocator: std.mem.Allocator, manifest: spore.Manifest) !Spore
         annotation_keys[annotation_index] = entry.key_ptr.*;
         annotation_index += 1;
     }
+    const sessions = try ownSessions(allocator, manifest.sessions);
+    errdefer freeSessions(allocator, sessions);
 
     return .{
         .version = manifest.version,
@@ -1240,9 +1249,45 @@ fn summarizeSpore(allocator: std.mem.Allocator, manifest: spore.Manifest) !Spore
         .memory_backing_kind = if (manifest.memory.backing) |backing| try allocator.dupe(u8, backing.kind) else null,
         .memory_backing_size = if (manifest.memory.backing) |backing| backing.size else null,
         .gic_kind = @tagName(manifest.machine.gic.kind),
+        .sessions = sessions,
         .annotations = annotations,
         .annotation_keys = annotation_keys,
     };
+}
+
+fn ownSessions(allocator: std.mem.Allocator, sessions: []const spore.Session) ![]Session {
+    const out = try allocator.alloc(Session, sessions.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeSessionFields(allocator, out[0..initialized]);
+        allocator.free(out);
+    }
+    for (sessions, 0..) |session, i| {
+        const id = allocator.dupe(u8, session.id) catch |err| return err;
+        const kind = allocator.dupe(u8, session.kind) catch |err| {
+            allocator.free(id);
+            return err;
+        };
+        out[i] = .{
+            .id = id,
+            .kind = kind,
+            .streams = session.streams,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeSessions(allocator: std.mem.Allocator, sessions: []const Session) void {
+    freeSessionFields(allocator, sessions);
+    allocator.free(sessions);
+}
+
+fn freeSessionFields(allocator: std.mem.Allocator, sessions: []const Session) void {
+    for (sessions) |session| {
+        allocator.free(session.id);
+        allocator.free(session.kind);
+    }
 }
 
 fn deinitOwnedAnnotations(allocator: std.mem.Allocator, annotations: *spore.Annotations) void {
@@ -1273,6 +1318,9 @@ test "inspect spore returns annotation values from saved manifest" {
     defer deinitSporeInspectResult(allocator, inspected);
     try std.testing.expectEqualStrings("created", inspected.annotations.map.get("cleanroom.create").?);
     try std.testing.expectEqualStrings("warm", inspected.annotations.map.get("cleanroom.snapshot").?);
+    try std.testing.expectEqual(@as(usize, 1), inspected.sessions.len);
+    try std.testing.expectEqualStrings(spore.default_session_id, inspected.sessions[0].id);
+    try std.testing.expect(inspected.sessions[0].streams.terminal);
 }
 
 fn annotationTestManifest(annotations: spore.Annotations, memory_chunks: []?[]const u8) spore.Manifest {
@@ -1308,9 +1356,19 @@ fn annotationTestManifest(annotations: spore.Annotations, memory_chunks: []?[]co
         },
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
+        .sessions = &annotation_test_sessions,
         .memory = .{ .chunk_size = spore.chunk_size, .chunks = memory_chunks },
     };
 }
+
+const annotation_test_sessions = [_]spore.Session{.{
+    .id = spore.default_session_id,
+    .streams = .{
+        .stdout = false,
+        .stderr = false,
+        .terminal = true,
+    },
+}};
 
 fn pathFact(fact: platform.PathFact) PathFact {
     return .{

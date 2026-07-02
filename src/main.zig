@@ -760,6 +760,20 @@ fn writeInspectSummary(writer: *Io.Writer, summary: spore_api.SporeInspectResult
         try writer.writeAll("  Memory backing: none\n");
     }
     try writer.print("  GIC: {s}\n", .{summary.gic_kind});
+    if (summary.sessions.len == 0) {
+        try writer.writeAll("  Sessions: none\n");
+    } else {
+        try writer.print("  Sessions: {d}\n", .{summary.sessions.len});
+        for (summary.sessions) |session| {
+            try writer.print("    - {s}: stdin={s} stdout={s} stderr={s} terminal={s}\n", .{
+                session.id,
+                yesNo(session.streams.stdin),
+                yesNo(session.streams.stdout),
+                yesNo(session.streams.stderr),
+                yesNo(session.streams.terminal),
+            });
+        }
+    }
     if (summary.annotations.map.count() == 0) {
         try writer.writeAll("  Annotations: none\n");
     } else {
