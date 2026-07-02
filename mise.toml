@@ -5,7 +5,11 @@ zig = "0.16.0"
 
 [tasks.build]
 run = "zig build"
-description = "Build sporevm"
+description = "Build sporevm (Debug; use build:release for shipped settings)"
+
+[tasks."build:release"]
+run = "zig build --release=safe"
+description = "Build sporevm with the shipped ReleaseSafe settings"
 
 [tasks.install]
 run = "zig build --release=safe --prefix \"$HOME\""
@@ -137,7 +141,7 @@ run = "mise run build && scripts/smoke-writable-rootfs.sh"
 description = "Smoke writable rootfs disk layer capture and run-from replay"
 
 [tasks."benchmark:writable-rootfs"]
-run = "mise run build && scripts/benchmark-writable-rootfs.sh --iterations 1"
+run = "mise run build:release && scripts/benchmark-writable-rootfs.sh --iterations 1"
 description = "Benchmark writable rootfs COW, sealed append, and replay paths"
 
 [tasks."smoke:local-pull"]
@@ -153,19 +157,19 @@ run = "mise run build && scripts/smoke-run.sh && scripts/smoke-run-capture.sh"
 description = "Run product smoke tests"
 
 [tasks."benchmark:smoke"]
-run = "mise run build && scripts/benchmark-sporevm-suite.py --profile smoke --no-build"
+run = "mise run build:release && scripts/benchmark-sporevm-suite.py --profile smoke --no-build"
 description = "Run a quick benchmark-suite smoke profile"
 
 [tasks."benchmark:ci"]
-run = "mise run build && scripts/benchmark-sporevm-suite.py --profile ci --no-build"
+run = "mise run build:release && scripts/benchmark-sporevm-suite.py --profile ci --no-build"
 description = "Run the short CI benchmark profile and write comparable JSON output"
 
 [tasks."benchmark:comparison"]
-run = "mise run build && scripts/benchmark-sporevm-suite.py --profile comparison --no-build"
+run = "mise run build:release && scripts/benchmark-sporevm-suite.py --profile comparison --no-build"
 description = "Run the heavier all-dimension comparison benchmark profile"
 
 [tasks."benchmark:full"]
-run = "mise run build && scripts/benchmark-sporevm-suite.py --profile full --no-build"
+run = "mise run build:release && scripts/benchmark-sporevm-suite.py --profile full --no-build"
 description = "Run the full benchmark suite"
 
 [tasks."benchmark:compare"]

@@ -78,6 +78,12 @@ iterations, sequential/staggered/burst) and is intended for scheduled or manual
 runs rather than per-merge builds. Override with `SPOREVM_BENCHMARK_IMAGE`,
 `SPOREVM_BENCHMARK_COMMAND`, and `SPOREVM_BENCHMARK_PROFILE`.
 
+Benchmark builds use the shipped `--release=safe` settings (`mise run
+build:release`); a default Debug `zig build` understates TTI by roughly 40
+percent and must not feed published trends. The suite records
+`spore version` output (which includes the optimize mode) in each run's
+config so build-mode changes are attributable in the series.
+
 ## Benchmarks
 
 ### Cold TTI
