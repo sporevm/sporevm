@@ -41,10 +41,6 @@ steps:
       branch: "${BUILDKITE_BRANCH}"
       commit: "${BUILDKITE_COMMIT}"
       message: "${BUILDKITE_MESSAGE}"
-      env:
-        SPOREVM_BENCHMARK_PROFILE: "ci"
-        SPOREVM_BENCHMARK_IMAGE: "quay.io/prometheus/busybox:latest"
-        SPOREVM_BENCHMARK_COMMAND: "/bin/sh -lc true"
 
   - wait
 

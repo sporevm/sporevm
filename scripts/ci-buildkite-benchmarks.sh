@@ -128,10 +128,13 @@ if [[ -z "${benchmark_profile}" ]]; then
     benchmark_profile="ci"
   fi
 fi
-if [[ "${BUILDKITE_BRANCH:-}" != "main" ]]; then
-  benchmark_image="${benchmark_image:-quay.io/prometheus/busybox:latest}"
-  benchmark_command="${benchmark_command:-/bin/sh -lc true}"
-fi
+# Default to the Docker Official node image via the AWS public ECR mirror so
+# benchmark builds match the public sandbox TTI shape (node runtime, `node -v`
+# first command, per https://www.computesdk.com/benchmarks/sandboxes/) without
+# depending on Docker Hub rate limits. The suite resolves the tag once before
+# timed loops, and the resolve fallback plus the persistent rootfs cache keep
+# builds working through registry blips.
+benchmark_image="${benchmark_image:-public.ecr.aws/docker/library/node:22-alpine}"
 benchmark_args=(--profile "${benchmark_profile}" --no-build)
 if [[ -n "${benchmark_image}" ]]; then
   benchmark_args+=(--image "${benchmark_image}")
