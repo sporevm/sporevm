@@ -72,6 +72,11 @@ fn runParsed(
     spore_executable: []const u8,
     debug: bool,
 ) !api.RunResult {
+    const injected_files = run_mod.readInjectedFileSources(init.io, allocator, parsed.injected_file_sources.slice()) catch |err| switch (err) {
+        error.InjectedFileOpenFailed => failRunSetup("spore run: injected file setup failed", .{}),
+        error.InjectedFileTooLarge => failRunSetup("spore run: injected files exceed 16MiB total", .{}),
+        else => return err,
+    };
     if (parsed.from_spore_dir) |spore_dir| {
         if (parsed.network_requested or parsed.network_policy.hasRules() or parsed.network_policy.hasBoundServices()) {
             failRunSetup("spore run: --from uses the captured network policy; omit --net and network flags", .{});
@@ -130,6 +135,7 @@ fn runParsed(
         .image_ref = parsed.image_ref,
         .image_pull_policy = parsed.pull_policy,
         .command = command,
+        .injected_files = injected_files,
         .interactive = parsed.interactive,
         .tty = parsed.tty,
         .memory = parsed.shared.memory,

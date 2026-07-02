@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -48,6 +49,8 @@
 #define SPORE_NET_RESOLV_CONF "nameserver 100.96.0.1\n"
 #define FILE_STDOUT_PATH "/tmp/spore-run.stdout"
 #define FILE_STDERR_PATH "/tmp/spore-run.stderr"
+#define SPORE_INJECTED_INITRD_DIR "/run/sporevm/injected"
+#define SPORE_INJECTED_ROOTFS_DIR "/mnt/rootfs/run/sporevm/injected"
 #define SPIO_MAGIC "SPIO"
 #define SPIO_VERSION 1
 #define SPIO_HEADER_LEN 24
@@ -92,6 +95,7 @@ static const uint64_t memory_high_step_bytes = 1073741824ULL;
 static const char memory_high_limit[] = "268435456\n";
 
 static int path_is_dir(const char *path);
+static int copy_injected_files_to_rootfs(char *error, size_t cap);
 
 struct replay_buffer {
   unsigned char data[REPLAY_CAP];
@@ -294,6 +298,7 @@ static int setup_rootfs(int writable, char *error, size_t cap) {
   mount_cgroup2_if_dir("/mnt/rootfs/sys/fs/cgroup");
   if (mount_if_dir("tmpfs", "/mnt/rootfs/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755", error, cap) != 0) return -1;
   if (mount_if_dir("tmpfs", "/mnt/rootfs/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777", error, cap) != 0) return -1;
+  if (copy_injected_files_to_rootfs(error, cap) != 0) return -1;
   return 0;
 }
 
@@ -504,6 +509,94 @@ static int write_all(int fd, const void *raw, size_t len) {
     }
     buf += n;
     len -= (size_t)n;
+  }
+  return 0;
+}
+
+static int valid_injected_file_id(const char *id) {
+  size_t len = strlen(id);
+  if (len == 0 || len > 96) return 0;
+  if (strcmp(id, ".") == 0 || strcmp(id, "..") == 0) return 0;
+  for (size_t i = 0; i < len; i++) {
+    char c = id[i];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') continue;
+    return 0;
+  }
+  return 1;
+}
+
+static int copy_injected_file(const char *src, const char *dst) {
+  int in = open(src, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (in < 0) return -1;
+  struct stat st;
+  if (fstat(in, &st) != 0 || !S_ISREG(st.st_mode)) {
+    close(in);
+    return -1;
+  }
+  int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0400);
+  if (out < 0) {
+    close(in);
+    return -1;
+  }
+  char buf[4096];
+  int rc = 0;
+  for (;;) {
+    ssize_t n = read(in, buf, sizeof(buf));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      rc = -1;
+      break;
+    }
+    if (n == 0) break;
+    if (write_all(out, buf, (size_t)n) != 0) {
+      rc = -1;
+      break;
+    }
+  }
+  if (fchmod(out, 0400) != 0) rc = -1;
+  if (close(out) != 0) rc = -1;
+  if (close(in) != 0) rc = -1;
+  return rc;
+}
+
+static int copy_injected_files_to_rootfs(char *error, size_t cap) {
+  DIR *dir = opendir(SPORE_INJECTED_INITRD_DIR);
+  if (dir == NULL) {
+    if (errno == ENOENT) return 0;
+    snprintf(error, cap, "injected file setup failed: open injected dir errno=%d", errno);
+    return -1;
+  }
+  if (mkdir_p(SPORE_INJECTED_ROOTFS_DIR, 0700) != 0) {
+    snprintf(error, cap, "injected file setup failed: create rootfs dir errno=%d", errno);
+    closedir(dir);
+    return -1;
+  }
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+    if (!valid_injected_file_id(entry->d_name)) {
+      snprintf(error, cap, "injected file setup failed: invalid injected id");
+      closedir(dir);
+      return -1;
+    }
+    char src[192];
+    char dst[192];
+    int src_len = snprintf(src, sizeof(src), "%s/%s", SPORE_INJECTED_INITRD_DIR, entry->d_name);
+    int dst_len = snprintf(dst, sizeof(dst), "%s/%s", SPORE_INJECTED_ROOTFS_DIR, entry->d_name);
+    if (src_len <= 0 || (size_t)src_len >= sizeof(src) || dst_len <= 0 || (size_t)dst_len >= sizeof(dst)) {
+      snprintf(error, cap, "injected file setup failed: path too long");
+      closedir(dir);
+      return -1;
+    }
+    if (copy_injected_file(src, dst) != 0) {
+      snprintf(error, cap, "injected file setup failed: copy %s errno=%d", entry->d_name, errno);
+      closedir(dir);
+      return -1;
+    }
+  }
+  if (closedir(dir) != 0) {
+    snprintf(error, cap, "injected file setup failed: close injected dir errno=%d", errno);
+    return -1;
   }
   return 0;
 }

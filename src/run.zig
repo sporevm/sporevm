@@ -41,6 +41,9 @@ const max_guest_env_len = 255;
 const max_guest_working_dir_len = 255;
 const max_guest_request_len = 8191;
 const max_guest_port = 65535;
+const max_injected_files = 16;
+const max_injected_file_id_len = 96;
+const max_injected_file_total_bytes = 16 * 1024 * 1024;
 const embedded_run_initrd = run_assets.minimal_exec_initrd;
 const default_kernel_repository = "sporevm/kernels";
 const default_kernel_release = "v0.6.2";
@@ -135,6 +138,7 @@ pub const Options = struct {
     command: []const []const u8,
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
+    injected_files: []const InjectedFile = &.{},
     interactive: bool = false,
     tty: bool = false,
     memory: memory_config.Config = .{},
@@ -153,6 +157,36 @@ pub const Options = struct {
     events: ?EventSink = null,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
+};
+
+pub const InjectedFile = struct {
+    id: []const u8,
+    bytes: []const u8,
+};
+
+pub const InjectedFileSource = struct {
+    id: []const u8,
+    path: []const u8,
+};
+
+pub const InjectedFileSourceList = struct {
+    items: [max_injected_files]InjectedFileSource = undefined,
+    len: usize = 0,
+
+    pub fn append(self: *InjectedFileSourceList, input: InjectedFileSource) !void {
+        if (self.len >= max_injected_files) return error.TooManyInjectedFiles;
+        try validateInjectedFileId(input.id);
+        if (input.path.len == 0) return error.BadInjectedFilePath;
+        for (self.items[0..self.len]) |existing| {
+            if (std.mem.eql(u8, existing.id, input.id)) return error.DuplicateInjectedFile;
+        }
+        self.items[self.len] = input;
+        self.len += 1;
+    }
+
+    pub fn slice(self: *const InjectedFileSourceList) []const InjectedFileSource {
+        return self.items[0..self.len];
+    }
 };
 
 pub const NetworkMode = enum {
@@ -868,6 +902,7 @@ pub const CliOptions = struct {
     event_mode: EventMode = .none,
     interactive: bool = false,
     tty: bool = false,
+    injected_file_sources: InjectedFileSourceList = .{},
     command_mode: CommandMode = .argv,
     command: []const []const u8,
 };
@@ -915,6 +950,7 @@ pub const cli_usage =
     \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
     \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
+    \\  --inject ID=PATH        Inject PATH as /run/sporevm/injected/ID for this run
     \\  -i, --interactive       Keep stdin open and forward it to the guest process
     \\  -t, --tty               Allocate a guest terminal for the process
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
@@ -939,6 +975,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var event_mode: EventMode = .none;
     var interactive = false;
     var tty = false;
+    var injected_file_sources = InjectedFileSourceList{};
     var command_mode: CommandMode = .shell;
     var command_had_delimiter = false;
     var command: ?[]const []const u8 = null;
@@ -1004,6 +1041,15 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         } else if (std.mem.eql(u8, args[i], "-it") or std.mem.eql(u8, args[i], "-ti")) {
             interactive = true;
             tty = true;
+        } else if (std.mem.eql(u8, args[i], "--inject")) {
+            const raw = takeValue(args, &i, args[i]);
+            injected_file_sources.append(parseInjectedFileSource(raw) catch |err| {
+                std.debug.print("spore run: invalid --inject {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            }) catch |err| {
+                std.debug.print("spore run: invalid --inject {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, args[i], "--net")) {
             network = .spore;
             network_requested = true;
@@ -1056,6 +1102,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.process.exit(2);
     }
     if (from_spore_dir != null) {
+        if (injected_file_sources.len != 0) {
+            std.debug.print("spore run: --inject is not supported with --from; injected files are fresh-run only\n", .{});
+            std.process.exit(2);
+        }
         if (rootfs_path != null or image_ref != null) {
             std.debug.print("spore run: --from is mutually exclusive with --rootfs and --image\n", .{});
             std.process.exit(2);
@@ -1079,6 +1129,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     }
     if (continue_after_capture and capture_trigger.isExit()) {
         std.debug.print("spore run: --continue-after-capture requires a signal capture trigger\n", .{});
+        std.process.exit(2);
+    }
+    if (capture_path != null and injected_file_sources.len != 0) {
+        std.debug.print("spore run: --inject with --capture is not supported; injected files are intentionally not persisted\n", .{});
         std.process.exit(2);
     }
     if (network == .disabled and network_policy.hasRules()) {
@@ -1106,9 +1160,19 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .event_mode = event_mode,
         .interactive = interactive,
         .tty = tty,
+        .injected_file_sources = injected_file_sources,
         .command_mode = command_mode,
         .command = argv,
     };
+}
+
+fn parseInjectedFileSource(raw: []const u8) !InjectedFileSource {
+    const eq = std.mem.indexOfScalar(u8, raw, '=') orelse return error.BadInjectedFile;
+    const id = raw[0..eq];
+    const path = raw[eq + 1 ..];
+    try validateInjectedFileId(id);
+    if (path.len == 0) return error.BadInjectedFilePath;
+    return .{ .id = id, .path = path };
 }
 
 pub fn cliGuestCommand(allocator: std.mem.Allocator, opts: CliOptions) ![]const []const u8 {
@@ -1991,11 +2055,110 @@ fn chmodFileWritable(allocator: std.mem.Allocator, path: []const u8) !void {
     if (std.c.chmod(pathz, 0o644) != 0) return error.ChmodFailed;
 }
 
-fn loadRunInitrd(io: Io, allocator: std.mem.Allocator, path: ?[]const u8) ![]const u8 {
+fn loadRunInitrd(io: Io, allocator: std.mem.Allocator, path: ?[]const u8, injected_files: []const InjectedFile) ![]const u8 {
+    try validateInjectedFiles(injected_files);
     if (path) |initrd_path| {
-        return try std.Io.Dir.cwd().readFileAlloc(io, initrd_path, allocator, .limited(max_file_size));
+        const base = try std.Io.Dir.cwd().readFileAlloc(io, initrd_path, allocator, .limited(max_file_size));
+        return try initrdWithInjectedFiles(allocator, base, injected_files);
     }
-    return embedded_run_initrd;
+    return try initrdWithInjectedFiles(allocator, embedded_run_initrd, injected_files);
+}
+
+pub fn readInjectedFileSources(io: Io, allocator: std.mem.Allocator, files: []const InjectedFileSource) ![]const InjectedFile {
+    if (files.len == 0) return &.{};
+    const injected = try allocator.alloc(InjectedFile, files.len);
+    var total: usize = 0;
+    for (files, injected) |file, *out| {
+        try validateInjectedFileId(file.id);
+        if (file.path.len == 0) return error.BadInjectedFilePath;
+        const remaining = max_injected_file_total_bytes -| total;
+        const bytes = try readInjectedFileSource(allocator, io, file.path, remaining);
+        total += bytes.len;
+        if (total > max_injected_file_total_bytes) return error.InjectedFileTooLarge;
+        out.* = .{ .id = file.id, .bytes = bytes };
+    }
+    try validateInjectedFiles(injected);
+    return injected;
+}
+
+fn readInjectedFileSource(allocator: std.mem.Allocator, io: Io, path: []const u8, max_bytes: usize) ![]const u8 {
+    const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.InjectedFileOpenFailed;
+    defer _ = std.c.close(fd);
+
+    const file = Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = file.stat(io) catch return error.InjectedFileOpenFailed;
+    if (stat.kind != .file) return error.InjectedFileOpenFailed;
+    if (stat.size > max_bytes) return error.InjectedFileTooLarge;
+    const len: usize = @intCast(stat.size);
+    const bytes = try allocator.alloc(u8, len);
+    var off: usize = 0;
+    while (off < len) {
+        const n = std.c.read(fd, bytes[off..].ptr, len - off);
+        if (n < 0) return error.InjectedFileOpenFailed;
+        if (n == 0) return error.InjectedFileOpenFailed;
+        off += @intCast(n);
+    }
+    return bytes;
+}
+
+fn initrdWithInjectedFiles(allocator: std.mem.Allocator, base: []const u8, injected_files: []const InjectedFile) ![]const u8 {
+    if (injected_files.len == 0) return base;
+    var out: Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(base);
+    try padCpio(&out);
+    var ino: u32 = 0x5000;
+    try appendCpioDir(&out, &ino, "run/sporevm");
+    try appendCpioDir(&out, &ino, "run/sporevm/injected");
+    for (injected_files) |file| {
+        const path = try std.fmt.allocPrint(allocator, "run/sporevm/injected/{s}", .{file.id});
+        defer allocator.free(path);
+        try appendCpioFile(&out, &ino, path, file.bytes);
+    }
+    try appendCpioEntry(&out, &ino, "TRAILER!!!", 0, 1, "");
+    return try out.toOwnedSlice();
+}
+
+fn appendCpioDir(out: *Io.Writer.Allocating, ino: *u32, name: []const u8) !void {
+    try appendCpioEntry(out, ino, name, 0o040700, 2, "");
+}
+
+fn appendCpioFile(out: *Io.Writer.Allocating, ino: *u32, name: []const u8, bytes: []const u8) !void {
+    try appendCpioEntry(out, ino, name, 0o100400, 1, bytes);
+}
+
+fn appendCpioEntry(out: *Io.Writer.Allocating, ino: *u32, name: []const u8, mode: u32, nlink: u32, bytes: []const u8) !void {
+    ino.* += 1;
+    try out.writer.print(
+        "070701{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}",
+        .{
+            ino.*,
+            mode,
+            @as(u32, 0),
+            @as(u32, 0),
+            nlink,
+            @as(u32, 0),
+            @as(u32, @intCast(bytes.len)),
+            @as(u32, 0),
+            @as(u32, 0),
+            @as(u32, 0),
+            @as(u32, 0),
+            @as(u32, @intCast(name.len + 1)),
+            @as(u32, 0),
+        },
+    );
+    try out.writer.writeAll(name);
+    try out.writer.writeByte(0);
+    try padCpio(out);
+    try out.writer.writeAll(bytes);
+    try padCpio(out);
+}
+
+fn padCpio(out: *Io.Writer.Allocating) !void {
+    while (out.written().len % 4 != 0) try out.writer.writeByte(0);
 }
 
 fn readablePath(io: Io, path: []const u8) !bool {
@@ -2315,7 +2478,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(context.io, opts.kernel_path, allocator, .limited(max_file_size));
     const kernel_ms = monotonicMs() -| kernel_start;
     const initrd_start = monotonicMs();
-    const initrd: ?[]const u8 = if (resuming) null else try loadRunInitrd(context.io, allocator, opts.initrd_path);
+    if (resuming and opts.injected_files.len != 0) return error.InjectedFileResumeUnsupported;
+    if (opts.capture_path != null and opts.injected_files.len != 0) return error.InjectedFileCaptureUnsupported;
+    const initrd: ?[]const u8 = if (resuming) null else try loadRunInitrd(context.io, allocator, opts.initrd_path, opts.injected_files);
     const initrd_ms = monotonicMs() -| initrd_start;
     const disk_start = monotonicMs();
     var runtime_disk = try runtime_disk_mod.open(context, allocator, .{
@@ -2526,7 +2691,8 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
     defer if (gateway_active) gateway.deinit();
     const network_manifest = try manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy);
     const kernel = try std.Io.Dir.cwd().readFileAlloc(context.io, opts.kernel_path, allocator, .limited(max_file_size));
-    const initrd = try loadRunInitrd(context.io, allocator, opts.initrd_path);
+    if (opts.injected_files.len != 0) return error.InjectedFileMonitorUnsupported;
+    const initrd = try loadRunInitrd(context.io, allocator, opts.initrd_path, &.{});
     var runtime_disk = try runtime_disk_mod.open(context, allocator, .{
         .rootfs_path = opts.rootfs_path,
         .rootfs = opts.rootfs,
@@ -3081,6 +3247,28 @@ fn validateGuestExecOptions(options: GuestExecOptions) !void {
     }
 }
 
+fn validateInjectedFiles(injected_files: []const InjectedFile) !void {
+    if (injected_files.len > max_injected_files) return error.TooManyInjectedFiles;
+    var total: usize = 0;
+    for (injected_files, 0..) |file, i| {
+        try validateInjectedFileId(file.id);
+        if (file.bytes.len > max_injected_file_total_bytes -| total) return error.InjectedFileTooLarge;
+        total += file.bytes.len;
+        for (injected_files[0..i]) |existing| {
+            if (std.mem.eql(u8, existing.id, file.id)) return error.DuplicateInjectedFile;
+        }
+    }
+}
+
+fn validateInjectedFileId(id: []const u8) !void {
+    if (id.len == 0 or id.len > max_injected_file_id_len) return error.BadInjectedFileId;
+    if (std.mem.eql(u8, id, ".") or std.mem.eql(u8, id, "..")) return error.BadInjectedFileId;
+    for (id) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-') continue;
+        return error.BadInjectedFileId;
+    }
+}
+
 fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize) !bool {
     const name = args[i.*];
     if (std.mem.eql(u8, name, "--kernel")) {
@@ -3514,6 +3702,29 @@ test "run cli parser accepts command after separator" {
     try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
+}
+
+test "run cli parser accepts injected files" {
+    const opts = try parseCliArgs(&.{ "--inject", "config=host-config.json", "--", "/bin/true" });
+    try std.testing.expectEqual(@as(usize, 1), opts.injected_file_sources.len);
+    try std.testing.expectEqualStrings("config", opts.injected_file_sources.items[0].id);
+    try std.testing.expectEqualStrings("host-config.json", opts.injected_file_sources.items[0].path);
+}
+
+test "injected file initrd overlay contains the file" {
+    const initrd = try initrdWithInjectedFiles(std.testing.allocator, "base-cpio", &.{
+        .{ .id = "config.json", .bytes = "{\"ok\":true}\n" },
+    });
+    defer std.testing.allocator.free(initrd);
+    try std.testing.expect(std.mem.indexOf(u8, initrd, "base-cpio") != null);
+    try std.testing.expect(std.mem.indexOf(u8, initrd, "run/sporevm/injected/config.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, initrd, "{\"ok\":true}\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, initrd, "TRAILER!!!") != null);
+}
+
+test "injected file ids reject paths" {
+    try std.testing.expectError(error.BadInjectedFileId, validateInjectedFileId("../secret"));
+    try std.testing.expectError(error.BadInjectedFileId, validateInjectedFileId("nested/path"));
 }
 
 test "run cli parser accepts interactive stdin" {

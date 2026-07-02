@@ -145,9 +145,14 @@ Use `runManaged` for the high-level `spore run` path:
 ```zig
 const result = try libspore.runManaged(init, allocator, .{
     .image_ref = "docker.io/library/alpine:3.20",
+    .injected_files = &.{.{ .id = "config", .bytes = "{\"ok\":true}\n" }},
     .command = &.{ "/bin/true" },
 });
 ```
+
+Injected files are fresh-run only and appear under `/run/sporevm/injected`.
+Spore rejects them with capture and `runFromSpore` so caller-provided bytes do
+not accidentally become persisted spore state.
 
 Use `runFromSpore` for `spore run --from` semantics:
 

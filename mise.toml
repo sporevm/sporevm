@@ -48,6 +48,10 @@ description = "Smoke product spore run one-shot TTY mode"
 run = "mise run build && scripts/smoke-run-attach.sh"
 description = "Smoke product spore run interactive attach"
 
+[tasks."smoke:run-inject"]
+run = "mise run build && scripts/smoke-run-inject.sh"
+description = "Smoke product spore run injected files"
+
 [tasks."smoke:run-file-locking"]
 run = "mise run build && scripts/smoke-run-file-locking.sh"
 description = "Smoke product spore run guest file locking support"

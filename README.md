@@ -118,6 +118,18 @@ host stdin:
 printf 'hello\n' | spore run -i -- /bin/cat
 ```
 
+Inject a caller-provided file into the run with `--inject ID=PATH`. The guest
+sees it at `/run/sporevm/injected/ID`; the file is carried by the run
+initrd and copied into rootfs `/run` tmpfs, so it is not added to the image
+rootfs cache. `--inject` is rejected with `--capture` and `--from` because file
+persistence would otherwise be ambiguous:
+
+```bash
+spore run --inject config=./config.json \
+  --image docker.io/library/alpine:3.20 \
+  -- /bin/cat /run/sporevm/injected/config
+```
+
 Allocate a guest terminal explicitly with `-t`. Use `-it` for an interactive
 shell; TTY output is a single terminal byte stream, so stdout and stderr are not
 separated in this mode:
