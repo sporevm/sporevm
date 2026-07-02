@@ -297,9 +297,10 @@ that blob before mutating VM state.
   KVM capture/restore and same-HVF capture/restore.
 - Kernel identity in the platform contract (pinned-build enforcement).
 - Durable disk/device identity fixup beyond the current diskless helper. The
-  product initrd consumes generation params for hostname and applies
-  host-provided start/resume time to the guest clock, but machine-id, MAC,
-  entropy, and other disk-backed workload fixups are not final.
+  product initrd consumes generation params for hostname, mixes
+  `resume_entropy_seed` into the kernel RNG, and applies host-provided
+  start/resume time to the guest clock, but machine-id, MAC, and other
+  disk-backed workload fixups are not final.
 - Cross-frequency architected timer restore: manifest v0 records and enforces
   the counter frequency, but cannot translate a running Linux guest between
   different `CNTFRQ_EL0` domains.

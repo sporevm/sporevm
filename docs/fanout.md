@@ -70,6 +70,12 @@ require `SPORE_FORK_BATCH_ID`, `SPORE_PARALLEL_JOB`,
 SPORE_PARENT_GENERATION`. Harnesses that can read the child manifest can compare
 the exact expected generation.
 
+The guest agent mixes the resume-time entropy seed into the kernel RNG before a
+forked `spore run --from` command starts. Live-forked processes can still carry
+process-local RNG state copied from the parent, so entropy-sensitive workloads
+must reexec, reseed their own runtime, or wait behind an application-level
+after-restore hook before generating secrets.
+
 `spore fanout` orchestrates child resumes and prefixes output. It does not prove
 that arbitrary already-running workloads consumed the metadata; workload
 harnesses own the identity-before-work barrier. `spore run --from` remains the

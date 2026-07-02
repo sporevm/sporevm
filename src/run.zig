@@ -9,6 +9,7 @@ const capture = @import("capture.zig");
 const Context = @import("context.zig").Context;
 const disk_layer = @import("disk_layer.zig");
 const fd_util = @import("fd.zig");
+const generation = @import("generation.zig");
 const hvf = @import("hvf/hvf.zig");
 const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
@@ -128,6 +129,9 @@ pub const Options = struct {
     rootfs: ?spore.Rootfs = null,
     disk: ?spore.Disk = null,
     resume_dir: ?[]const u8 = null,
+    resume_generation: ?generation.State = null,
+    start_generation_params: ?[]const u8 = null,
+    require_generation_ready: bool = false,
     command: []const []const u8,
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
@@ -2263,6 +2267,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
                 .resume_dir = opts.resume_dir,
+                .resume_generation = opts.resume_generation,
                 .ram_backing_fd = local_backing.fd,
                 .exec_probe = &stream,
                 .exec_control = exec_control,
@@ -2292,6 +2297,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
                 .resume_dir = opts.resume_dir,
+                .resume_generation = opts.resume_generation,
                 .ram_backing_fd = local_backing.fd,
                 .exec_probe = &stream,
                 .exec_control = exec_control,
@@ -2427,6 +2433,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
                 .resume_dir = opts.resume_dir,
+                .resume_generation = opts.resume_generation,
                 .ram_restore_mode = .eager_chunks,
                 .exec_control = control,
                 .network = network,
@@ -2448,6 +2455,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
                 .resume_dir = opts.resume_dir,
+                .resume_generation = opts.resume_generation,
                 .ram_restore_mode = .eager_chunks,
                 .exec_control = control,
                 .network = network,
@@ -2604,6 +2612,8 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
         .tty = opts.tty,
         .terminal_name = terminalName(context.environ_map),
         .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
+        .generation_params = opts.start_generation_params,
+        .require_generation_ready = opts.require_generation_ready,
     });
 }
 
@@ -2701,12 +2711,15 @@ const GuestExecOptions = struct {
     tty: bool = false,
     terminal_name: []const u8 = "xterm",
     terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
+    generation_params: ?[]const u8 = null,
+    require_generation_ready: bool = false,
 };
 
 fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: GuestExecOptions) ![]const u8 {
     try validateGuestArgv(argv);
     try validateGuestExecOptions(options);
     if (options.interactive or options.tty) return execV1RequestWithSessionOptions(allocator, argv, session_id, options);
+    const working_dir = options.working_dir orelse "";
 
     const payload = struct {
         type: []const u8 = "start",
@@ -2716,14 +2729,18 @@ fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []c
         env: []const []const u8,
         working_dir: []const u8,
         memory_pressure: bool,
+        params_json: []const u8,
+        require_generation_ready: bool,
         closed_env: bool = true,
     }{
         .session_id = session_id,
         .resume_time_unix_ns = options.resume_time_unix_ns,
         .argv = argv,
         .env = options.env,
-        .working_dir = options.working_dir orelse "",
+        .working_dir = working_dir,
         .memory_pressure = options.memory_pressure,
+        .params_json = options.generation_params orelse "",
+        .require_generation_ready = options.require_generation_ready,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
@@ -2744,6 +2761,8 @@ fn execV1RequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const [
         terminal_rows: u16,
         terminal_cols: u16,
         memory_pressure: bool,
+        params_json: []const u8,
+        require_generation_ready: bool,
         closed_env: bool = true,
     }{
         .session_id = session_id,
@@ -2756,6 +2775,8 @@ fn execV1RequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const [
         .terminal_rows = options.terminal_size.rows,
         .terminal_cols = options.terminal_size.cols,
         .memory_pressure = options.memory_pressure,
+        .params_json = options.generation_params orelse "",
+        .require_generation_ready = options.require_generation_ready,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
@@ -2976,13 +2997,13 @@ fn takeValue(args: []const []const u8, i: *usize, name: []const u8) []const u8 {
 test "run request encodes argv" {
     const request = try execRequest(std.testing.allocator, &.{ "/bin/echo", "hello world" });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/echo\",\"hello world\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/echo\",\"hello world\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"closed_env\":true}\n", request);
 }
 
 test "run request can encode explicit session id" {
     const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42");
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"closed_env\":true}\n", request);
 }
 
 test "run detached exec request asks guest to start without waiting" {
@@ -2997,9 +3018,11 @@ test "run request encodes image env and working directory" {
         .working_dir = "/app",
         .resume_time_unix_ns = 123,
         .memory_pressure = true,
+        .generation_params = "{\"resume_entropy_seed\":\"abcd\"}",
+        .require_generation_ready = true,
     });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":123,\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"memory_pressure\":true,\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":123,\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"memory_pressure\":true,\"params_json\":\"{\\\"resume_entropy_seed\\\":\\\"abcd\\\"}\",\"require_generation_ready\":true,\"closed_env\":true}\n", request);
 }
 
 test "image rootfs metadata supplies run env and working directory" {
