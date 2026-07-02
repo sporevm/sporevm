@@ -69,31 +69,28 @@ Product resume builds one root disk backend:
 virtio-blk
   -> local active COW head
   -> sealed disk-layer objects
-  -> immutable base block source
-       FileBlockSource: flat digest-addressed ext4 fd (preferred)
-       CasBlockSource: verified rootfs index plus verified chunks (fallback)
+  -> immutable base: flat digest-addressed ext4 fd (FileBlockSource)
 ```
 
-`FileBlockSource` is preferred whenever the flat digest-addressed ext4
-artifact is materialized in the local rootfs cache, including for manifests
-with `rootfs.storage`. The open follows the verify-at-install, trust-at-open
-cache contract (see SECURITY.md): entries were BLAKE3-verified when installed
-and published read-only, so the open checks only symlink-safety, regular-file
-shape, and exact size instead of re-hashing the artifact. Serving guest reads
-with plain preads on one fd is what keeps resume-to-first-command fast; the
-per-chunk object opens of the CAS path dominated warm TTI before this change.
+The flat digest-addressed ext4 artifact is the only runtime base source. The
+open follows the verify-at-install, trust-at-open cache contract (see
+SECURITY.md): entries were BLAKE3-verified when installed and published
+read-only, so the open checks only symlink-safety, regular-file shape, and
+exact size instead of re-hashing the artifact. Serving guest reads with plain
+preads on one fd is what keeps resume-to-first-command fast.
 
-`CasBlockSource` is the fallback when the flat artifact is not locally
-materialized, such as chunk-only pulls. It opens the exact
-`rootfs-block-index-v0` named by `rootfs.storage.index_digest`, validates
-descriptor fields, and verifies each chunk by BLAKE3 before guest use. It
-memoizes verified chunks for the VM so repeated small guest reads do not
-rehash the same object.
+Chunked rootfs storage (`rootfs.storage`) is a distribution and dedupe format,
+not a runtime read path. `spore pull` and `spore unpack` assemble the flat
+artifact from the verified chunk objects at materialization time, and resume
+performs the same assembly once when the flat artifact is missing locally
+(pruned or corrupt cache entries self-heal from chunks). Assembly verifies
+each chunk against the digest-verified index, hashes the assembled bytes, and
+requires them to equal `rootfs.artifact.digest` before atomically publishing
+the entry; an inconsistent artifact/index pairing fails closed instead of
+serving different bytes depending on cache state.
 
 Missing or corrupt rootfs indexes, chunk objects, exact artifacts, disk layer
-indexes, or disk objects fail before guest code can observe the bytes. A
-missing or wrong-size flat artifact is not fatal when chunks are available;
-resume falls back to the CAS source.
+indexes, or disk objects fail before guest code can observe the bytes.
 
 ## Writable Disk Layers
 

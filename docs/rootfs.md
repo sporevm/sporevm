@@ -151,18 +151,17 @@ virtio-blk binding, resolved OCI image identity, platform, and builder version.
 For image-created spores, the manifest also records `rootfs.storage` pointing at
 the chunked rootfs index and CAS object namespace. Any rootfs writes made during
 the run are represented as sealed `disk-layer-v0` entries over that immutable
-base. Product `spore resume` and `spore run --from` prefer the flat
-digest-addressed ext4 artifact when the local rootfs cache has it, opening it
-under the verify-at-install, trust-at-open cache contract (see SECURITY.md)
-without re-hashing it. When the flat artifact is not locally materialized,
-such as after a chunk-only pull, resume uses the `rootfs.storage` descriptor:
-it opens the small verified index and verifies only the chunks the guest
-actually reads. Older spores without `rootfs.storage` use the same trusted
-fd-backed open of the cached ext4 artifact. If the spore has sealed writable
-disk layers, resume also verifies those layer indexes and disk objects before
-attaching the layered COW backend. If the required rootfs data is missing in
-both flat and chunked form, or disk layer data is missing or tampered with,
-resume refuses to boot.
+base. Product `spore resume` and `spore run --from` always serve the root
+disk base from the flat digest-addressed ext4 artifact, opened under the
+verify-at-install, trust-at-open cache contract (see SECURITY.md) without
+re-hashing it. `spore pull` and `spore unpack` assemble that artifact from
+verified chunk objects at materialization time; if the flat entry is missing
+or corrupt at resume (for example after pruning), resume assembles it once
+from the locally installed chunks and fails closed when chunks are missing or
+the assembled bytes mismatch the manifest artifact digest. Spores without
+`rootfs.storage` use the same trusted fd-backed open. If the spore has sealed
+writable disk layers, resume also verifies those layer indexes and disk
+objects before attaching the layered COW backend.
 
 `spore pack` follows the manifest. Spores without `rootfs.storage` include exact
 rootfs bytes under `rootfs/blake3/<hex>.ext4`; spores with `rootfs.storage`

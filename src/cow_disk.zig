@@ -20,7 +20,7 @@ pub const Error = error{
 
 pub const CowDisk = struct {
     allocator: std.mem.Allocator,
-    base: block_source.BlockSource,
+    base: block_source.FileBlockSource,
     overlay_fd: std.c.fd_t,
     size: u64,
     cluster_size: u64,
@@ -28,7 +28,7 @@ pub const CowDisk = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        base: block_source.BlockSource,
+        base: block_source.FileBlockSource,
         overlay_fd: std.c.fd_t,
         size: u64,
         cluster_size: u64,
@@ -207,7 +207,7 @@ test "partial write preserves untouched bytes from base" {
     for (&base_bytes, 0..) |*byte, i| byte.* = @truncate(i);
     try base.writeStreamingAll(io, &base_bytes);
 
-    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len).source();
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
     var disk = try CowDisk.init(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 4096);
     defer disk.deinit();
 
@@ -236,7 +236,7 @@ test "writes spanning clusters seed and read from overlay" {
     @memset(&base_bytes, 0x11);
     try base.writeStreamingAll(io, &base_bytes);
 
-    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len).source();
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
     var disk = try CowDisk.init(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 4096);
     defer disk.deinit();
 
@@ -266,7 +266,7 @@ test "cow disk matches byte model across partial writes" {
     var model = base_bytes;
     try base.writeStreamingAll(io, &base_bytes);
 
-    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len).source();
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
     var disk = try CowDisk.init(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 512);
     defer disk.deinit();
 
@@ -321,7 +321,7 @@ test "range and cluster validation fail closed" {
     var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
     defer overlay.close(io);
     try base.writeStreamingAll(io, &([_]u8{0} ** 4096));
-    const base_source = block_source.FileBlockSource.init(base.handle, 4096).source();
+    const base_source = block_source.FileBlockSource.init(base.handle, 4096);
 
     try std.testing.expectError(error.BadClusterSize, CowDisk.init(std.testing.allocator, base_source, overlay.handle, 4096, 1000));
     const oversized = @as(u64, @intCast(std.math.maxInt(std.c.off_t))) + 1;
@@ -345,7 +345,7 @@ test "failed clean-cluster write does not mark dirty" {
     var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
     try base.writeStreamingAll(io, &([_]u8{0x11} ** 4096));
 
-    const base_source = block_source.FileBlockSource.init(base.handle, 4096).source();
+    const base_source = block_source.FileBlockSource.init(base.handle, 4096);
     var disk = try CowDisk.init(std.testing.allocator, base_source, overlay.handle, 4096, 4096);
     defer disk.deinit();
     overlay.close(io);
