@@ -901,7 +901,7 @@ pub const cli_usage =
     \\  --net                   Experimental SporeVM-managed networking
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
-    \\  --bind-service NAME=unix:/path.sock
+    \\  --bind-service NAME[:PORT]=unix:/path.sock
     \\                          With --net, declare a guest-local Unix service
     \\  --capture DIR           Snapshot to DIR; defaults to --capture-on EXIT
     \\  --capture-on WHEN       Capture trigger: EXIT, INT, TERM, HUP, USR1, or USR2
@@ -3774,14 +3774,19 @@ test "run cli parser accepts network bind services" {
         "--net",
         "--bind-service",
         "metadata=unix:/tmp/metadata.sock",
+        "--bind-service",
+        "cache:8080=unix:/tmp/cache.sock",
         "--",
         "/bin/true",
     });
     try std.testing.expectEqual(NetworkMode.spore, opts.network);
     try std.testing.expect(opts.network_requested);
-    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.bound_service_count);
+    try std.testing.expectEqual(@as(usize, 2), opts.network_policy.bound_service_count);
     try std.testing.expectEqualStrings("metadata", opts.network_policy.bound_services[0].name);
     try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.network_policy.bound_services[0].unix_path);
+    try std.testing.expectEqualStrings("cache", opts.network_policy.bound_services[1].name);
+    try std.testing.expectEqual(@as(u16, 8080), opts.network_policy.bound_services[1].guest_port);
+    try std.testing.expectEqualStrings("/tmp/cache.sock", opts.network_policy.bound_services[1].unix_path);
 }
 
 test "run restores network options from manifest policy" {

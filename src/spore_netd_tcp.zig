@@ -761,6 +761,36 @@ test "spore-netd TCP routes bound service SYNs before gateway hard-floor denial"
     try std.testing.expectEqual(@as(usize, 1), gateway.stats.connect_attempts);
 }
 
+test "spore-netd TCP routes two bound services independently and rejects duplicates" {
+    var config = spore_net_policy.Config{};
+    try config.addBindService("metadata=unix:/tmp/metadata.sock");
+    try std.testing.expectError(error.DuplicateBoundService, config.addBindService("metadata:8080=unix:/tmp/metadata-2.sock"));
+    try std.testing.expectError(error.DuplicateBoundService, config.addBindService("cache=unix:/tmp/cache.sock"));
+    try config.addBindService("cache:8080=unix:/tmp/cache.sock");
+
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    gateway.init(&policy);
+
+    const metadata = gateway.targetForRequest(testForwardRequest(spore_net.gateway_ipv4, 80)) orelse return error.TestUnexpectedResult;
+    switch (metadata) {
+        .bound_unix => |bound| {
+            try std.testing.expectEqualStrings("metadata", bound.name);
+            try std.testing.expectEqualStrings("/tmp/metadata.sock", bound.unix_path);
+        },
+        .tcp => return error.TestUnexpectedResult,
+    }
+
+    const cache = gateway.targetForRequest(testForwardRequest(spore_net.gateway_ipv4, 8080)) orelse return error.TestUnexpectedResult;
+    switch (cache) {
+        .bound_unix => |bound| {
+            try std.testing.expectEqualStrings("cache", bound.name);
+            try std.testing.expectEqualStrings("/tmp/cache.sock", bound.unix_path);
+        },
+        .tcp => return error.TestUnexpectedResult,
+    }
+}
+
 test "spore-netd TCP opens bound Unix stream sockets" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_z = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-unix-test-{d}.sock", .{std.c.getpid()});

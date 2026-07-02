@@ -46,17 +46,20 @@ exact host plus port rules and exposes capability facts through
 
 ## Bound Services
 
-One-shot runs can expose one declared host Unix socket to the guest:
+One-shot runs can expose declared host Unix sockets to the guest:
 
 ```bash
 spore run --net \
   --bind-service metadata=unix:/tmp/metadata.sock \
+  --bind-service cache:8080=unix:/tmp/cache.sock \
   -- /bin/wget -qO- http://metadata.spore.internal/
 ```
 
-The first CLI shape is deliberately capped at one service, guest port 80, and a
-Unix stream socket target. Bound services are guest-exposed inputs; service
-providers must treat bytes on the socket as guest-controlled.
+The CLI shape is deliberately small: up to 16 named Unix stream socket targets.
+`NAME=unix:/path.sock` exposes `NAME.spore.internal:80`; `NAME:PORT=unix:/path.sock`
+uses a custom guest port. Service names and guest ports must be unique. Bound
+services are guest-exposed inputs; service providers must treat bytes on the
+socket as guest-controlled.
 
 Captured manifests record bound-service requirements by name, guest host, and
 guest port, but never durable host socket paths. Restore fails closed unless a
@@ -90,8 +93,8 @@ Current limits:
 - No IPv6, general UDP, DHCP, published ports, or multiple NICs.
 - No live flow preservation across capture, resume, or fork.
 - No per-exec policy replacement for a running named VM.
-- No TCP loopback targets, custom guest ports, multiple bound services, or
-  per-connection bound-service availability events in the CLI path.
+- No TCP loopback targets or per-connection bound-service availability events
+  in the CLI path.
 
 ## Validation
 
