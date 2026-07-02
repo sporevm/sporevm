@@ -114,6 +114,11 @@ pub const Process = struct {
                 argv.append(service.unix_path) catch return error.OutOfMemory;
             }
         }
+        for (policy.portForwardSlice()) |forward| {
+            const value = std.fmt.allocPrint(allocator, "127.0.0.1:{d}:{d}", .{ forward.host_port, forward.guest_port }) catch return error.OutOfMemory;
+            argv.append("--forward") catch return error.OutOfMemory;
+            argv.append(value) catch return error.OutOfMemory;
+        }
         const child = std.process.spawn(io, .{
             .argv = argv.items,
             .stdin = .pipe,

@@ -903,6 +903,8 @@ pub const cli_usage =
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
     \\  --bind-service NAME[:PORT]=unix:/path.sock
     \\                          With --net, declare a guest-local Unix service
+    \\  --forward 127.0.0.1:HOST_PORT:GUEST_PORT
+    \\                          With --net, forward host loopback TCP to a guest port
     \\  --capture DIR           Snapshot to DIR; defaults to --capture-on EXIT
     \\  --capture-on WHEN       Capture trigger: EXIT, INT, TERM, HUP, USR1, or USR2
     \\  --continue-after-capture
@@ -1023,6 +1025,12 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
                 std.debug.print("spore run: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, args[i], "--forward")) {
+            const raw = takeValue(args, &i, args[i]);
+            network_policy.addPortForward(raw) catch |err| {
+                std.debug.print("spore run: invalid --forward {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
         } else if (try parseSharedOption(&shared, args, &i)) {
             continue;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
@@ -1074,7 +1082,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.process.exit(2);
     }
     if (network == .disabled and network_policy.hasRules()) {
-        std.debug.print("spore run: --allow-cidr and --allow-host require --net\n", .{});
+        std.debug.print("spore run: network flags require --net\n", .{});
         std.process.exit(2);
     }
     if (network == .disabled and network_policy.hasBoundServices()) {
@@ -3787,6 +3795,21 @@ test "run cli parser accepts network bind services" {
     try std.testing.expectEqualStrings("cache", opts.network_policy.bound_services[1].name);
     try std.testing.expectEqual(@as(u16, 8080), opts.network_policy.bound_services[1].guest_port);
     try std.testing.expectEqualStrings("/tmp/cache.sock", opts.network_policy.bound_services[1].unix_path);
+}
+
+test "run cli parser accepts network port forwards" {
+    const opts = try parseCliArgs(&.{
+        "--net",
+        "--forward",
+        "127.0.0.1:8080:80",
+        "--",
+        "/bin/true",
+    });
+    try std.testing.expectEqual(NetworkMode.spore, opts.network);
+    try std.testing.expect(opts.network_requested);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.port_forward_count);
+    try std.testing.expectEqual(@as(u16, 8080), opts.network_policy.port_forwards[0].host_port);
+    try std.testing.expectEqual(@as(u16, 80), opts.network_policy.port_forwards[0].guest_port);
 }
 
 test "run restores network options from manifest policy" {

@@ -28,12 +28,15 @@ const tcp_stack_ipv4: ipv4.Address = .{ 100, 96, 0, 3 };
 const tcp_stack_prefix_len: u8 = 31;
 
 pub const max_flows = 8;
+pub const max_port_forwards = spore_net_policy.max_port_forwards;
 pub const flow_buffer_len = 8 * 1024;
 pub const tcp_rx_buffer_len = 16 * 1024;
 pub const tcp_tx_buffer_len = 16 * 1024;
 pub const output_queue_len = 32;
 pub const connect_timeout_ms = 10_000;
 pub const flow_idle_timeout_ms = 120_000;
+const first_forward_local_port: u16 = 49152;
+const last_forward_local_port: u16 = 60999;
 
 const TcpSock = tcp_socket.Socket(ipv4, 4);
 const Device = stack_mod.LoopbackDevice(output_queue_len);
@@ -154,6 +157,28 @@ const Flow = struct {
         self.initSocket();
     }
 
+    fn startPortForward(self: *Flow, host_fd: std.c.fd_t, guest_port: u16, local_port: u16, now: Instant) bool {
+        self.closeFd();
+        self.in_use = true;
+        self.state = .connected;
+        self.fd = host_fd;
+        self.to_host.reset();
+        self.to_guest.reset();
+        self.guest_fin = false;
+        self.host_eof = false;
+        self.host_write_shutdown = false;
+        self.poll_revents = 0;
+        self.connect_deadline = now.add(Duration.fromMillis(connect_timeout_ms));
+        self.idle_deadline = now.add(Duration.fromMillis(flow_idle_timeout_ms));
+        self.initSocket();
+        self.sock.connect(spore_net.guest_ipv4, guest_port, spore_net.gateway_ipv4, local_port) catch {
+            self.closeFd();
+            self.in_use = false;
+            return false;
+        };
+        return true;
+    }
+
     fn closeFd(self: *Flow) void {
         if (self.fd >= 0) {
             _ = std.c.close(self.fd);
@@ -163,6 +188,19 @@ const Flow = struct {
 
     fn refreshIdle(self: *Flow, now: Instant) void {
         self.idle_deadline = now.add(Duration.fromMillis(flow_idle_timeout_ms));
+    }
+};
+
+const PortForward = struct {
+    fd: std.c.fd_t = -1,
+    guest_port: u16 = 0,
+    poll_revents: i16 = 0,
+
+    fn close(self: *PortForward) void {
+        if (self.fd >= 0) {
+            _ = std.c.close(self.fd);
+            self.fd = -1;
+        }
     }
 };
 
@@ -199,20 +237,26 @@ const OutputQueue = struct {
 pub const Gateway = struct {
     device: Device = Device.init(),
     flows: [max_flows]Flow = undefined,
+    port_forwards: [max_port_forwards]PortForward = [_]PortForward{.{}} ** max_port_forwards,
+    port_forward_count: usize = 0,
     sock_ptrs: [max_flows]*TcpSock = undefined,
     forwarder: Forwarder = undefined,
     stack: TcpStack = undefined,
     policy: *spore_net_policy.Runtime = undefined,
     output: OutputQueue = .{},
     current_now: Instant = Instant.ZERO,
+    next_forward_local_port: u16 = first_forward_local_port,
     stats: Stats = .{},
     emit_events: bool = false,
 
-    pub fn init(self: *Gateway, policy: *spore_net_policy.Runtime) void {
+    pub fn init(self: *Gateway, policy: *spore_net_policy.Runtime, port_forwards: []const spore_net_policy.PortForwardConfig) !void {
         self.device = Device.init();
         self.policy = policy;
+        self.port_forwards = [_]PortForward{.{}} ** max_port_forwards;
+        self.port_forward_count = 0;
         self.output.reset();
         self.current_now = Instant.ZERO;
+        self.next_forward_local_port = first_forward_local_port;
         self.stats = .{};
         self.emit_events = false;
         for (&self.flows, 0..) |*flow, i| {
@@ -225,6 +269,31 @@ pub const Gateway = struct {
             .tcp4_forwarder = &self.forwarder,
         });
         self.stack.iface.v4.addIpAddr(.{ .address = tcp_stack_ipv4, .prefix_len = tcp_stack_prefix_len });
+        errdefer self.deinit();
+        for (port_forwards) |forward| {
+            try self.addPortForward(forward);
+        }
+    }
+
+    pub fn deinit(self: *Gateway) void {
+        for (self.port_forwards[0..self.port_forward_count]) |*forward| {
+            forward.close();
+        }
+        self.port_forward_count = 0;
+        for (&self.flows) |*flow| {
+            flow.closeFd();
+        }
+    }
+
+    fn addPortForward(self: *Gateway, config: spore_net_policy.PortForwardConfig) !void {
+        if (config.host_port == 0 or config.guest_port == 0) return error.InvalidPortForward;
+        if (self.port_forward_count >= max_port_forwards) return error.PortForwardListenFailed;
+        const fd = try openLoopbackListener(config.host_port);
+        self.port_forwards[self.port_forward_count] = .{
+            .fd = fd,
+            .guest_port = config.guest_port,
+        };
+        self.port_forward_count += 1;
     }
 
     pub fn receiveFrame(self: *Gateway, frame: []const u8, now: Instant) bool {
@@ -237,6 +306,10 @@ pub const Gateway = struct {
 
     pub fn service(self: *Gateway, now: Instant) void {
         self.current_now = now;
+        if (self.port_forward_count != 0) {
+            self.stack.iface.neighbor_cache.fill(spore_net.guest_ipv4, spore_net.guest_mac, now);
+        }
+        self.acceptPortForwards(now);
         for (&self.flows) |*flow| {
             self.serviceFlow(flow, now);
         }
@@ -248,6 +321,11 @@ pub const Gateway = struct {
 
     pub fn fillPollFds(self: *Gateway, fds: []std.posix.pollfd) usize {
         var count: usize = 0;
+        for (self.port_forwards[0..self.port_forward_count]) |*forward| {
+            if (forward.fd < 0 or count >= fds.len) continue;
+            fds[count] = .{ .fd = forward.fd, .events = std.c.POLL.IN, .revents = 0 };
+            count += 1;
+        }
         for (&self.flows) |*flow| {
             if (!flow.in_use or flow.fd < 0) continue;
             var events: i16 = 0;
@@ -263,6 +341,13 @@ pub const Gateway = struct {
 
     pub fn servicePoll(self: *Gateway, fds: []const std.posix.pollfd) void {
         var count: usize = 0;
+        for (self.port_forwards[0..self.port_forward_count]) |*forward| {
+            forward.poll_revents = 0;
+            if (forward.fd < 0) continue;
+            if (count >= fds.len) break;
+            forward.poll_revents = fds[count].revents;
+            count += 1;
+        }
         for (&self.flows) |*flow| {
             flow.poll_revents = 0;
             if (!flow.in_use or flow.fd < 0) continue;
@@ -290,6 +375,42 @@ pub const Gateway = struct {
 
     pub fn dequeueFrame(self: *Gateway) ?[]const u8 {
         return self.output.pop();
+    }
+
+    fn acceptPortForwards(self: *Gateway, now: Instant) void {
+        for (self.port_forwards[0..self.port_forward_count]) |*forward| {
+            if ((forward.poll_revents & (std.c.POLL.IN | std.c.POLL.ERR | std.c.POLL.HUP)) == 0) continue;
+            accept_loop: while (true) {
+                const fd = std.c.accept(forward.fd, null, null);
+                if (fd < 0) {
+                    switch (std.c.errno(fd)) {
+                        .INTR => continue,
+                        .AGAIN => break :accept_loop,
+                        else => break :accept_loop,
+                    }
+                }
+                if (!setNonBlocking(fd)) {
+                    _ = std.c.close(fd);
+                    continue;
+                }
+                const flow = self.freeFlow() orelse {
+                    self.stats.flow_limit_drops += 1;
+                    _ = std.c.close(fd);
+                    break :accept_loop;
+                };
+                if (!flow.startPortForward(fd, forward.guest_port, self.nextForwardLocalPort(), now)) {
+                    self.stats.connect_failed += 1;
+                    continue;
+                }
+                self.stats.accepted += 1;
+            }
+        }
+    }
+
+    fn nextForwardLocalPort(self: *Gateway) u16 {
+        const port = self.next_forward_local_port;
+        self.next_forward_local_port = if (port >= last_forward_local_port) first_forward_local_port else port + 1;
+        return port;
     }
 
     fn offer(self: *Gateway, request: ForwardRequest) ?*TcpSock {
@@ -400,6 +521,16 @@ pub const Gateway = struct {
         }
 
         if (flow.state != .connected) return;
+
+        if (flow.sock.getState() == .syn_sent and now.greaterThanOrEqual(flow.connect_deadline)) {
+            self.abortFlow(flow);
+            return;
+        }
+        if (flow.sock.getState() == .closed and flow.to_host.len == 0) {
+            flow.closeFd();
+            flow.host_eof = true;
+            return;
+        }
 
         self.drainGuestToHost(flow, now);
         self.flushHostWrite(flow, now);
@@ -529,6 +660,24 @@ const OpenResult = union(enum) {
     connecting: std.c.fd_t,
     failed,
 };
+
+fn openLoopbackListener(port: u16) error{PortForwardListenFailed}!std.c.fd_t {
+    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, std.c.IPPROTO.TCP);
+    if (fd < 0) return error.PortForwardListenFailed;
+    errdefer _ = std.c.close(fd);
+
+    var reuse: c_int = 1;
+    _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &reuse, @sizeOf(c_int));
+    if (!setNonBlocking(fd)) return error.PortForwardListenFailed;
+
+    var sockaddr = std.c.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+    };
+    if (std.c.bind(fd, @ptrCast(&sockaddr), @sizeOf(std.c.sockaddr.in)) != 0) return error.PortForwardListenFailed;
+    if (std.c.listen(fd, 16) != 0) return error.PortForwardListenFailed;
+    return fd;
+}
 
 fn openHostSocket(addr: ipv4.Address, port: u16) OpenResult {
     const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, std.c.IPPROTO.TCP);
@@ -712,7 +861,7 @@ test "spore-netd TCP policy blocks host and control-plane destinations" {
 test "spore-netd TCP denies blocked SYN before host socket open" {
     var policy = try spore_net_policy.Runtime.init(.{});
     var gateway: Gateway = undefined;
-    gateway.init(&policy);
+    try gateway.init(&policy, &.{});
 
     const blocked = [_]ipv4.Address{
         .{ 169, 254, 169, 254 },
@@ -740,7 +889,7 @@ test "spore-netd TCP routes bound service SYNs before gateway hard-floor denial"
     try config.addBindService("metadata=unix:/tmp/sporevm-netd-missing-bound-service.sock");
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
-    gateway.init(&policy);
+    try gateway.init(&policy, &.{});
 
     var frame_buf: [spore_net.max_frame_len]u8 = undefined;
     const service_syn = buildTcpSynFrame(spore_net.gateway_ipv4, 80, &frame_buf);
@@ -770,7 +919,7 @@ test "spore-netd TCP routes two bound services independently and rejects duplica
 
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
-    gateway.init(&policy);
+    try gateway.init(&policy, &.{});
 
     const metadata = gateway.targetForRequest(testForwardRequest(spore_net.gateway_ipv4, 80)) orelse return error.TestUnexpectedResult;
     switch (metadata) {
@@ -838,7 +987,7 @@ test "spore-netd TCP enforces exact learned host ports" {
     try std.testing.expectEqual(@as(usize, 1), policy.noteDnsResponse(query, response));
 
     var gateway: Gateway = undefined;
-    gateway.init(&policy);
+    try gateway.init(&policy, &.{});
     try std.testing.expect(gateway.targetForRequest(testForwardRequest(.{ 203, 0, 113, 10 }, 443)) != null);
     try std.testing.expect(gateway.targetForRequest(testForwardRequest(.{ 203, 0, 113, 10 }, 80)) == null);
 }
@@ -848,7 +997,7 @@ test "spore-netd TCP routes configured bound service ports to Unix sockets" {
     try config.addBoundUnixService("cleanroom-gateway", "gateway.cleanroom.internal", 8170, "/tmp/missing-cleanroom.sock");
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
-    gateway.init(&policy);
+    try gateway.init(&policy, &.{});
 
     const target = gateway.targetForRequest(testForwardRequest(spore_net.gateway_ipv4, 8170)) orelse return error.TestUnexpectedResult;
     switch (target) {

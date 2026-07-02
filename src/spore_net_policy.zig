@@ -10,6 +10,7 @@ pub const max_allow_hosts = 16;
 pub const max_exact_rules = 32;
 pub const max_rule_ports = 16;
 pub const max_bound_services = 16;
+pub const max_port_forwards = 1;
 pub const max_learned_host_ips = 64;
 pub const max_bound_service_name_len = 63;
 pub const max_unix_socket_path_len = 103;
@@ -18,6 +19,7 @@ pub const ParseError = error{
     InvalidCidr,
     InvalidHost,
     InvalidPort,
+    InvalidPortForward,
     InvalidNetworkPolicy,
     InvalidBoundService,
     InvalidBoundServiceName,
@@ -31,6 +33,7 @@ pub const ParseError = error{
     TooManyExactRules,
     TooManyRulePorts,
     TooManyBoundServices,
+    TooManyPortForwards,
     DuplicateBoundService,
 };
 
@@ -136,6 +139,11 @@ pub const BoundServiceConfig = struct {
     unix_path: []const u8 = "",
 };
 
+pub const PortForwardConfig = struct {
+    host_port: u16 = 0,
+    guest_port: u16 = 0,
+};
+
 pub const Config = struct {
     default_deny: bool = false,
     allow_cidrs: [max_allow_cidrs][]const u8 = [_][]const u8{""} ** max_allow_cidrs,
@@ -146,6 +154,8 @@ pub const Config = struct {
     exact_rule_count: usize = 0,
     bound_services: [max_bound_services]BoundServiceConfig = [_]BoundServiceConfig{.{}} ** max_bound_services,
     bound_service_count: usize = 0,
+    port_forwards: [max_port_forwards]PortForwardConfig = [_]PortForwardConfig{.{}} ** max_port_forwards,
+    port_forward_count: usize = 0,
 
     pub fn addAllowCidr(self: *Config, raw: []const u8) ParseError!void {
         _ = try parseCidr(raw);
@@ -246,12 +256,20 @@ pub const Config = struct {
         self.bound_service_count += 1;
     }
 
+    pub fn addPortForward(self: *Config, raw: []const u8) ParseError!void {
+        const forward = try parsePortForward(raw);
+        if (self.port_forward_count >= max_port_forwards) return error.TooManyPortForwards;
+        self.port_forwards[self.port_forward_count] = forward;
+        self.port_forward_count += 1;
+    }
+
     pub fn hasRules(self: Config) bool {
         return self.default_deny or
             self.allow_cidr_count != 0 or
             self.allow_host_count != 0 or
             self.exact_rule_count != 0 or
-            self.bound_service_count != 0;
+            self.bound_service_count != 0 or
+            self.port_forward_count != 0;
     }
 
     pub fn hasBoundServices(self: Config) bool {
@@ -272,6 +290,10 @@ pub const Config = struct {
 
     pub fn boundServiceSlice(self: *const Config) []const BoundServiceConfig {
         return self.bound_services[0..self.bound_service_count];
+    }
+
+    pub fn portForwardSlice(self: *const Config) []const PortForwardConfig {
+        return self.port_forwards[0..self.port_forward_count];
     }
 };
 
@@ -615,6 +637,34 @@ pub fn parseHostPort(raw: []const u8) ParseError!HostPort {
     return .{ .host = host, .port = port };
 }
 
+pub fn parsePortForward(raw: []const u8) ParseError!PortForwardConfig {
+    var parts = std.mem.splitScalar(u8, raw, ':');
+    const first = parts.next() orelse return error.InvalidPortForward;
+    const second = parts.next() orelse return error.InvalidPortForward;
+    const third = parts.next();
+    if (parts.next() != null) return error.InvalidPortForward;
+
+    var host_port_raw = first;
+    var guest_port_raw = second;
+    if (third) |value| {
+        if (!std.mem.eql(u8, first, "127.0.0.1")) return error.InvalidPortForward;
+        host_port_raw = second;
+        guest_port_raw = value;
+    }
+
+    return .{
+        .host_port = try parseNonZeroPort(host_port_raw),
+        .guest_port = try parseNonZeroPort(guest_port_raw),
+    };
+}
+
+fn parseNonZeroPort(raw: []const u8) ParseError!u16 {
+    if (raw.len == 0) return error.InvalidPortForward;
+    const port = std.fmt.parseUnsigned(u16, raw, 10) catch return error.InvalidPortForward;
+    if (port == 0) return error.InvalidPortForward;
+    return port;
+}
+
 pub fn validateHost(raw: []const u8) ParseError!void {
     if (raw.len == 0 or raw.len > 253) return error.InvalidHost;
     var label_len: usize = 0;
@@ -888,6 +938,18 @@ test "spore-net policy parses host port values" {
     try std.testing.expectError(error.InvalidPort, parseHostPort("github.com"));
     try std.testing.expectError(error.InvalidPort, parseHostPort("github.com:0"));
     try std.testing.expectError(error.InvalidHost, parseHostPort("-github.com:443"));
+}
+
+test "spore-net policy parses loopback port forwards" {
+    try std.testing.expectEqual(PortForwardConfig{ .host_port = 8080, .guest_port = 80 }, try parsePortForward("8080:80"));
+    try std.testing.expectEqual(PortForwardConfig{ .host_port = 8443, .guest_port = 443 }, try parsePortForward("127.0.0.1:8443:443"));
+
+    var config = Config{};
+    try config.addPortForward("8080:80");
+    try std.testing.expectEqual(@as(usize, 1), config.port_forward_count);
+    try std.testing.expectError(error.TooManyPortForwards, config.addPortForward("8081:81"));
+    try std.testing.expectError(error.InvalidPortForward, parsePortForward("0:80"));
+    try std.testing.expectError(error.InvalidPortForward, parsePortForward("127.0.0.2:8080:80"));
 }
 
 test "spore-net exact policy learns A records and enforces host plus port" {
