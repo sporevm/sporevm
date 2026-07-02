@@ -954,7 +954,68 @@ pub fn openProvenLocalMemoryBacking(
         }
     }
     handoff_fd = true;
+    prechargeBackingReadahead(fd);
     return .{ .fd = fd, .source = .local_backing, .reason = .proof_valid };
+}
+
+/// Ask the kernel to read the backing file's data extents into the page cache
+/// so first-touch guest RAM faults after restore hit memory instead of disk.
+/// The first resume after the host evicts these pages otherwise pays scattered
+/// synchronous reads (measured ~130ms extra on a 512MiB/32MiB-dense backing).
+///
+/// Only data extents are advised: readahead over holes materializes zero
+/// pages in the page cache, which would bloat memory for large sparse
+/// auto-memory backings. Purely advisory; every failure is ignored.
+fn prechargeBackingReadahead(fd: std.c.fd_t) void {
+    const seek_data: c_int = if (builtin.os.tag == .macos) 4 else 3;
+    const seek_hole: c_int = if (builtin.os.tag == .macos) 3 else 4;
+    const max_extents = 1024;
+
+    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (end <= 0) return;
+    defer _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
+
+    var offset: std.c.off_t = 0;
+    var extents: usize = 0;
+    var advised_bytes: u64 = 0;
+    while (offset < end and extents < max_extents) {
+        const data_start = std.c.lseek(fd, offset, seek_data);
+        if (data_start < 0) break; // ENXIO past last data, or unsupported.
+        var data_end = std.c.lseek(fd, data_start, seek_hole);
+        if (data_end < 0) data_end = end;
+        if (data_end <= data_start) break;
+        adviseRead(fd, data_start, data_end - data_start);
+        advised_bytes += @intCast(data_end - data_start);
+        extents += 1;
+        offset = data_end;
+    }
+    if (extents > 0) {
+        std.log.debug("backing readahead precharge: extents={d} bytes={d}", .{ extents, advised_bytes });
+    }
+}
+
+fn adviseRead(fd: std.c.fd_t, offset: std.c.off_t, len: std.c.off_t) void {
+    switch (builtin.os.tag) {
+        .macos => {
+            const Radvisory = extern struct {
+                ra_offset: std.c.off_t,
+                ra_count: c_int,
+            };
+            var remaining = len;
+            var cursor = offset;
+            while (remaining > 0) {
+                const span: c_int = @intCast(@min(remaining, std.math.maxInt(c_int)));
+                var ra = Radvisory{ .ra_offset = cursor, .ra_count = span };
+                if (std.c.fcntl(fd, std.c.F.RDADVISE, @intFromPtr(&ra)) == -1) return;
+                cursor += span;
+                remaining -= span;
+            }
+        },
+        .linux => {
+            _ = std.os.linux.fadvise(fd, offset, len, std.os.linux.POSIX_FADV.WILLNEED);
+        },
+        else => {},
+    }
 }
 
 pub fn openProvenLocalMemoryBackingForVcpuCount(
@@ -3269,4 +3330,36 @@ test "manifest rejects invalid network policy" {
 
     manifest.network = .{ .allow_hosts = &.{"bad host"} };
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+}
+
+test "backing readahead precharge tolerates sparse and empty files and restores position" {
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-spore-precharge";
+    defer std.Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, tmp);
+
+    // Sparse file: 1MiB data, 8MiB hole, 1MiB data.
+    const sparse_path = tmp ++ "/sparse.backing";
+    {
+        const pathz = sparse_path ++ "";
+        const fd = std.c.open(pathz, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(c_uint, 0o644));
+        try std.testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        var chunk: [1024 * 1024]u8 = undefined;
+        @memset(&chunk, 0xAB);
+        try std.testing.expect(std.c.pwrite(fd, &chunk, chunk.len, 0) == chunk.len);
+        try std.testing.expect(std.c.pwrite(fd, &chunk, chunk.len, 9 * 1024 * 1024) == chunk.len);
+        prechargeBackingReadahead(fd);
+        // Position must be restored so later fd users see a rewound file.
+        try std.testing.expectEqual(@as(std.c.off_t, 0), std.c.lseek(fd, 0, std.c.SEEK.CUR));
+    }
+
+    // Empty file: must be a no-op.
+    const empty_path = tmp ++ "/empty.backing";
+    {
+        const fd = std.c.open(empty_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(c_uint, 0o644));
+        try std.testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        prechargeBackingReadahead(fd);
+    }
 }
