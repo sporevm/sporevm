@@ -55,6 +55,47 @@ user-supplied rootfs paths are always copied into the cache, never
 hardlinked. After this change the next dominant warm-TTI slice is the
 ~15ms resumed vsock accept delay plus `spore` CLI process startup.
 
+## Adopted: Trust-At-Open Managed Kernel Cache
+
+**Status:** shipped. Cold `spore run --image` dropped ~20-25ms per run.
+
+### Question
+
+How much of the remaining cold-start host overhead was the managed kernel
+cache hit path, which re-hashed the cached kernel image on every run?
+
+### Hypothesis
+
+`managedKernelCacheHit` ran a full SHA-256 of the 7.3MiB cached Image plus
+sidecar reads on every cache hit, verified against a `.sha256` file in the
+same cache directory — corruption detection, not tamper resistance, since an
+attacker who can replace the kernel can replace the sidecar. Skipping the
+re-hash should recover the cost with no security regression under the
+verify-at-install, trust-at-open cache contract.
+
+### Method
+
+A/B on local HVF with a cached `node:22-alpine` rootfs: five `spore run`
+cold runs with the default managed-kernel resolution versus five with
+`SPOREVM_KERNEL_IMAGE` pointing at the same cached Image (which bypasses the
+cache-hit verification entirely), then re-measure after removing the re-hash.
+
+### Result
+
+Baseline 70-80ms wall clock per cold run; bypass 50ms consistently. After
+removing the re-hash, cold runs match the bypass at ~50ms across ten runs.
+The config-symbol check stays on cache hits because the required symbol list
+belongs to the running binary, which may demand more symbols than the binary
+that installed the cache entry. Warm resume is unaffected: `run --from` never
+resolves the managed kernel.
+
+### Decision
+
+Adopted. The kernel cache follows the same verify-at-install, trust-at-open
+contract as the rootfs cache: download verifies the release checksum and
+config symbols before atomically installing read-only files; cache hits check
+shape (read-only, regular, no symlink) plus config symbols only.
+
 ## Rejected: Host-Side Hot Resume Handoff Optimizations
 
 **Status:** recorded after the

@@ -1700,7 +1700,12 @@ fn managedKernelCacheHit(io: Io, allocator: std.mem.Allocator, image_path: []con
     if (!try readOnlyRegularFileNoSymlink(io, sha_path)) return false;
     if (!try readOnlyRegularFileNoSymlink(io, config_path)) return false;
 
-    if (!try verifiedManagedKernelPath(io, allocator, image_path, sha_path)) return false;
+    // Managed kernel assets are verified against the release checksum before
+    // being atomically installed read-only, then trusted on later opens
+    // (verify-at-install, trust-at-open; see SECURITY.md). The config-symbol
+    // check is not content re-verification and stays: the required symbol
+    // list belongs to the running binary, which may demand more symbols than
+    // the binary that installed this cache entry.
     if (!try managedRunKernelConfigHasRequiredSymbols(io, allocator, config_path)) return false;
     return true;
 }
@@ -4066,13 +4071,26 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
     try chmodFileReadOnly(allocator, config_path);
     try std.testing.expect(try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
 
+    // Trust-at-open contract: cache hits do not re-hash installed content, so
+    // a same-shape content change or a garbage checksum sidecar is trusted.
+    // Content integrity is enforced at install time; see SECURITY.md.
     try chmodFileWritable(allocator, image_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "tampered kernel bytes" });
     try chmodFileReadOnly(allocator, image_path);
-    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
+    try std.testing.expect(try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
 
     try chmodFileReadOnly(allocator, bad_sha_path);
-    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, bad_sha_path, config_path));
+    try std.testing.expect(try managedKernelCacheHit(io, allocator, image_path, bad_sha_path, config_path));
+
+    // A writable image is not trusted, and missing required config symbols
+    // still miss so a newer binary re-fetches a suitable kernel.
+    try chmodFileWritable(allocator, image_path);
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
+    try chmodFileReadOnly(allocator, image_path);
+    const sparse_config_path = tmp ++ "/Image.sparse.config";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = sparse_config_path, .data = "CONFIG_FILE_LOCKING=y\n" });
+    try chmodFileReadOnly(allocator, sparse_config_path);
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, sparse_config_path));
 }
 
 test "managed run kernel config requires Docker and virtio-mem runtime symbols" {
