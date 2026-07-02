@@ -110,7 +110,9 @@ cd "${REPO_ROOT}"
 trap finish_benchmark_step EXIT
 
 mise install
-mise run build
+# Benchmarks must measure the shipped ReleaseSafe build settings; a default
+# Debug build understates TTI by roughly 40 percent.
+mise run build:release
 prepare_benchmark_scratch
 if [[ -z "${benchmark_rootfs_cache_dir}" ]]; then
   benchmark_rootfs_cache_dir="$(default_rootfs_cache_dir)"

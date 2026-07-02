@@ -4,6 +4,7 @@
 //! local monitor processes; see docs/lifecycle.md.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const spore_internal = @import("spore_internal");
 const spore_api = spore_internal.api;
@@ -155,7 +156,7 @@ fn runCommand(
             try stdout.writeAll("usage: spore version\n");
             return;
         }
-        try stdout.print("spore {s}\n", .{spore_internal.version});
+        try stdout.print("spore {s} ({t})\n", .{ spore_internal.version, builtin.mode });
     } else if (std.mem.eql(u8, command, "host-info")) {
         if (wantsCommandHelp(command_args)) {
             try stdout.writeAll("usage: spore host-info\n");

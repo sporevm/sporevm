@@ -272,6 +272,7 @@ def export_run(summary: dict[str, object], source: Path) -> dict[str, object]:
             "requested_image": config.get("requested_image"),
             "command": config.get("command"),
             "platform": config.get("platform"),
+            "spore_version": config.get("spore_version"),
         },
         "results": results,
     }

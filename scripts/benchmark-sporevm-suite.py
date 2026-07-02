@@ -496,11 +496,19 @@ class BenchmarkRunner:
             "prewarm_rootfs": self.args.prewarm_rootfs,
             "prewarm_memory": self.args.prewarm_memory,
             "spore_bin": str(self.spore_bin),
+            "spore_version": self.spore_version(),
             "output_dir": str(self.run_dir),
             "scratch_dir": str(self.scratch_run_dir),
             "rootfs_cache_dir": str(self.rootfs_cache_dir),
             "bundle_cache_dir": str(self.bundle_cache_dir),
         }
+
+    def spore_version(self) -> str | None:
+        try:
+            out = subprocess.run([str(self.spore_bin), "version"], capture_output=True, text=True, timeout=10)
+            return out.stdout.strip() or None
+        except Exception:
+            return None
 
     def emit(self, row: dict[str, object]) -> dict[str, object]:
         enriched = {
