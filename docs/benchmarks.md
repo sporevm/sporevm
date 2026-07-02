@@ -23,10 +23,15 @@ That converts `latest-summary.json` into:
 
 - `zig-cache/sporevm-benchmarks/site/data.json`
 - `zig-cache/sporevm-benchmarks/site/data.js`
+- `zig-cache/sporevm-benchmarks/site/homepage-summary.json`
+- `zig-cache/sporevm-benchmarks/site/homepage-summary.js`
 
 The JavaScript artifact assigns `window.SPOREVM_BENCHMARK_DATA`, so a static
 page can render the latest run plus any retained history without learning the
-runner's raw artifact layout.
+runner's raw artifact layout. The homepage summary assigns
+`window.SPOREVM_HOMEPAGE_BENCHMARK_DATA` and contains only the latest selected
+runner, cold/warm/warm-burst medians, success rate, build metadata, available
+runner labels, and recent warm-child median points.
 
 ## Profiles
 
@@ -248,6 +253,8 @@ Buildkite publishes the website projection to:
 ```text
 s3://sporevm-benchmarks/site/data.json
 s3://sporevm-benchmarks/site/data.js
+s3://sporevm-benchmarks/site/homepage-summary.json
+s3://sporevm-benchmarks/site/homepage-summary.js
 ```
 
 Only successful `main` benchmark builds update those files. The publisher merges
@@ -255,7 +262,8 @@ the macOS and Linux ARM64 per-build exports, canonicalizes run IDs by
 build/commit/platform, and keeps the chart series split by runner queue so the
 website can show `main` progress without mixing hardware classes.
 The writer role needs `GetObject` for those exported per-build files and
-`PutObject` for `site/data.json` and `site/data.js`.
+`PutObject` for `site/data.json`, `site/data.js`, and the homepage summary
+files.
 
 ## Buildkite
 

@@ -18,6 +18,8 @@ EXPORT_VERSION = "1.0"
 DEFAULT_OUTPUT_DIR = Path("zig-cache/sporevm-benchmarks/site")
 DEFAULT_MAX_RUNS = 500
 JS_GLOBAL = "window.SPOREVM_BENCHMARK_DATA"
+HOMEPAGE_JS_GLOBAL = "window.SPOREVM_HOMEPAGE_BENCHMARK_DATA"
+HOMEPAGE_HISTORY_LIMIT = 30
 
 LABELS = {
     "cold_tti": "Cold TTI",
@@ -69,10 +71,10 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def write_js(path: Path, value: object) -> None:
+def write_js(path: Path, value: object, global_name: str = JS_GLOBAL) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(value, indent=2, sort_keys=True)
-    path.write_text(f"{JS_GLOBAL} = {payload};\n", encoding="utf-8")
+    path.write_text(f"{global_name} = {payload};\n", encoding="utf-8")
 
 
 def git_value(args: list[str]) -> str | None:
@@ -345,6 +347,87 @@ def build_series(runs: list[dict[str, object]]) -> list[dict[str, object]]:
     return sorted(series.values(), key=lambda item: str(item.get("name")))
 
 
+def result_by_name(run: dict[str, object], name: str) -> dict[str, object] | None:
+    for result in run.get("results", []):
+        if isinstance(result, dict) and result.get("name") == name:
+            return result
+    return None
+
+
+def result_value(run: dict[str, object], name: str) -> float | None:
+    result = result_by_name(run, name)
+    return number(result.get("value")) if result else None
+
+
+def runner_queue(run: dict[str, object]) -> str:
+    runner = run.get("runner") if isinstance(run.get("runner"), dict) else {}
+    return str(runner.get("queue") or "")
+
+
+def build_homepage_summary(data: dict[str, object]) -> dict[str, object]:
+    runs = [run for run in data.get("runs", []) if isinstance(run, dict)]
+    arches = sorted({runner_queue(run) for run in runs if runner_queue(run)})
+    latest = next(
+        (
+            run for run in reversed(runs)
+            if result_value(run, "warm_spore_tti/sequential") is not None
+            and result_value(run, "cold_tti/sequential") is not None
+            and result_value(run, "warm_spore_tti/burst") is not None
+        ),
+        None,
+    )
+    default_arch = runner_queue(latest) if latest is not None else (arches[0] if arches else "")
+    warm_history: list[dict[str, object]] = []
+    for series in data.get("series", []):
+        if not isinstance(series, dict):
+            continue
+        if series.get("result_name") != "warm_spore_tti/sequential":
+            continue
+        runner = series.get("runner") if isinstance(series.get("runner"), dict) else {}
+        if default_arch and runner.get("queue") != default_arch:
+            continue
+        points = [point for point in series.get("points", []) if isinstance(point, dict)]
+        warm_history = [
+            {
+                "build_number": point.get("build_number"),
+                "value": point.get("value"),
+                "p95": point.get("p95"),
+            }
+            for point in points[-HOMEPAGE_HISTORY_LIMIT:]
+        ]
+        break
+
+    summary: dict[str, object] = {
+        "updated_at": data.get("updated_at"),
+        "default_arch": default_arch,
+        "arches": [{"key": key, "label": RUNNER_LABELS.get(key, key)} for key in arches],
+        "latest": None,
+        "warm_history": warm_history,
+    }
+    if latest is None:
+        return summary
+
+    runner = latest.get("runner") if isinstance(latest.get("runner"), dict) else {}
+    build = latest.get("build") if isinstance(latest.get("build"), dict) else {}
+    commit = latest.get("commit") if isinstance(latest.get("commit"), dict) else {}
+    config = latest.get("config") if isinstance(latest.get("config"), dict) else {}
+    warm = result_by_name(latest, "warm_spore_tti/sequential")
+    summary["latest"] = {
+        "arch": default_arch,
+        "build_number": build.get("number") or runner.get("build_number"),
+        "build_url": build.get("url") or runner.get("build_url"),
+        "backend": runner.get("backend") or config.get("backend"),
+        "profile": runner.get("profile") or config.get("profile"),
+        "commit_sha": commit.get("sha"),
+        "generated_at": latest.get("generated_at"),
+        "warm_ms": result_value(latest, "warm_spore_tti/sequential"),
+        "cold_ms": result_value(latest, "cold_tti/sequential"),
+        "warm_burst_ms": result_value(latest, "warm_spore_tti/burst"),
+        "success_rate": warm.get("success_rate") if warm else None,
+    }
+    return summary
+
+
 def export(args: argparse.Namespace) -> dict[str, object]:
     summary = load_json(args.summary)
     json_out = args.json_out or args.output_dir / "data.json"
@@ -361,6 +444,9 @@ def export(args: argparse.Namespace) -> dict[str, object]:
     }
     write_json(json_out, data)
     write_js(js_out, data)
+    homepage = build_homepage_summary(data)
+    write_json(json_out.with_name("homepage-summary.json"), homepage)
+    write_js(js_out.with_name("homepage-summary.js"), homepage, HOMEPAGE_JS_GLOBAL)
     print(f"benchmark data exported: json={json_out} js={js_out} runs={len(runs)}")
     return data
 
@@ -393,7 +479,25 @@ def self_test() -> None:
                     "vsock_connect_ms": {"median": 5.0, "p95": 6.0, "p99": 7.0},
                     "exec_response_ms": {"median": 8.0, "p95": 9.0, "p99": 10.0},
                 },
-            }
+            },
+            {
+                "benchmark": "warm_spore_tti",
+                "mode": "sequential",
+                "count": 4,
+                "success_count": 4,
+                "success_rate": 1.0,
+                "samples": [60, 64, 70],
+                "tti_ms": {"median": 64.0, "p95": 70.0, "p99": 71.0},
+            },
+            {
+                "benchmark": "warm_spore_tti",
+                "mode": "burst",
+                "count": 4,
+                "success_count": 4,
+                "success_rate": 1.0,
+                "samples": [66, 70, 75],
+                "tti_ms": {"median": 70.0, "p95": 75.0, "p99": 76.0},
+            },
         ],
     }
     with tempfile.TemporaryDirectory() as tmp:
@@ -419,19 +523,26 @@ def self_test() -> None:
         assert data["series"][0]["points"][0]["p95"] == 130.0
         assert data["series"][0]["points"][0]["p99"] == 131.0
         assert data["series"][0]["points"][0]["phase_values"]["exec_response_ms"] == 8.0
+        homepage = build_homepage_summary(data)
+        assert homepage["latest"]["cold_ms"] == 123.0
+        assert homepage["latest"]["warm_ms"] == 64.0
+        assert homepage["latest"]["warm_burst_ms"] == 70.0
+        assert homepage["warm_history"][-1]["value"] == 64.0
         partitioned = build_series([
             {"run_id": "mac", "generated_at": "2026-06-26T00:00:00Z", "runner": {"queue": "sporevm-mac"}, "results": data["runs"][0]["results"]},
             {"run_id": "linux", "generated_at": "2026-06-26T00:01:00Z", "runner": {"queue": "sporevm-linux-arm64"}, "results": data["runs"][0]["results"]},
         ])
-        assert len(partitioned) == 2
-        assert {item["label"] for item in partitioned} == {"Cold TTI / sequential / macOS", "Cold TTI / sequential / Linux ARM64"}
+        assert len(partitioned) == 6
+        assert {"Cold TTI / sequential / macOS", "Cold TTI / sequential / Linux ARM64"} <= {item["label"] for item in partitioned}
         summary["results"][0]["tti_ms"]["median"] = 111.0
         write_json(summary_path, summary)
         data = export(args)
         assert len(data["runs"]) == 1
         assert data["series"][0]["points"][0]["value"] == 111.0
         js = (root / "data.js").read_text(encoding="utf-8")
+        homepage_js = (root / "homepage-summary.js").read_text(encoding="utf-8")
         assert js.startswith(f"{JS_GLOBAL} = ")
+        assert homepage_js.startswith(f"{HOMEPAGE_JS_GLOBAL} = ")
     print("self-test ok")
 
 

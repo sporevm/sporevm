@@ -154,14 +154,27 @@ def download_inputs(args: argparse.Namespace, work_dir: Path) -> tuple[Path | No
 def publish_outputs(args: argparse.Namespace, data: dict[str, object]) -> None:
     json_out = args.output_dir / "data.json"
     js_out = args.output_dir / "data.js"
+    homepage_json_out = args.output_dir / "homepage-summary.json"
+    homepage_js_out = args.output_dir / "homepage-summary.js"
+    homepage = exporter.build_homepage_summary(data)
     exporter.write_json(json_out, data)
     exporter.write_js(js_out, data)
+    exporter.write_json(homepage_json_out, homepage)
+    exporter.write_js(homepage_js_out, homepage, exporter.HOMEPAGE_JS_GLOBAL)
     run_aws([
         "s3", "cp", str(json_out), s3_uri(args.bucket, args.site_prefix, "data.json"),
         "--no-progress", "--content-type", "application/json; charset=utf-8", "--cache-control", "public, max-age=60",
     ])
     run_aws([
         "s3", "cp", str(js_out), s3_uri(args.bucket, args.site_prefix, "data.js"),
+        "--no-progress", "--content-type", "text/javascript; charset=utf-8", "--cache-control", "public, max-age=60",
+    ])
+    run_aws([
+        "s3", "cp", str(homepage_json_out), s3_uri(args.bucket, args.site_prefix, "homepage-summary.json"),
+        "--no-progress", "--content-type", "application/json; charset=utf-8", "--cache-control", "public, max-age=60",
+    ])
+    run_aws([
+        "s3", "cp", str(homepage_js_out), s3_uri(args.bucket, args.site_prefix, "homepage-summary.js"),
         "--no-progress", "--content-type", "text/javascript; charset=utf-8", "--cache-control", "public, max-age=60",
     ])
     print(f"published benchmark site data: {s3_uri(args.bucket, args.site_prefix)} runs={len(data['runs'])} series={len(data['series'])}")
@@ -233,6 +246,7 @@ def self_test() -> None:
         "cold_tti/sequential@sporevm-mac",
         "cold_tti/sequential@sporevm-linux-arm64",
     }
+    assert exporter.build_homepage_summary(data)["latest"] is None
     print("self-test ok")
 
 
