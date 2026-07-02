@@ -36,6 +36,13 @@ path. Combining one-shot `spore run --rootfs PATH` with `--capture` is rejected
 until an import path can record chunked portable rootfs identity for arbitrary
 local images.
 
+`spore run --inject ID=PATH` injects caller-provided bytes into
+`/run/sporevm/injected/ID` for a fresh run. The bytes are appended to the run
+initrd and, when a rootfs is attached, copied into the rootfs `/run` tmpfs
+before the command starts. They are not installed into the image rootfs cache or
+the immutable rootfs artifact. Spore rejects `--inject` with `--capture` and
+`--from` so injected bytes are not accidentally captured into a persisted spore.
+
 ## Manifest Authority
 
 The manifest, not a path, tag, cache entry, or bundle index, is the restore

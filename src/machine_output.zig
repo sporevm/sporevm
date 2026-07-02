@@ -167,6 +167,15 @@ pub fn fromZigError(err: anyerror) CliError {
         error.BadManagedKernelRepository,
         error.BadManagedKernelVersion,
         error.BadManagedKernelAsset,
+        error.BadInjectedFileId,
+        error.BadInjectedFilePath,
+        error.BadInjectedFile,
+        error.TooManyInjectedFiles,
+        error.DuplicateInjectedFile,
+        error.InjectedFileTooLarge,
+        error.InjectedFileCaptureUnsupported,
+        error.InjectedFileResumeUnsupported,
+        error.InjectedFileMonitorUnsupported,
         => CliError.init(.usage_invalid_argument, ErrorCode.usage_invalid_argument.defaultMessage(), @errorName(err)),
         error.FileNotFound => CliError.init(.object_not_found, ErrorCode.object_not_found.defaultMessage(), @errorName(err)),
         error.AccessDenied,
@@ -224,6 +233,8 @@ test "stable error code table matches the plan" {
 
 test "setup errors classify for API callers" {
     try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.InvalidRootfsInput).code);
+    try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.InjectedFileCaptureUnsupported).code);
+    try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.InjectedFileTooLarge).code);
     try std.testing.expectEqual(ErrorCode.object_invalid, fromZigError(error.MissingRootfsArtifact).code);
     try std.testing.expectEqual(ErrorCode.cache_integrity_failed, fromZigError(error.ManagedKernelChecksumMismatch).code);
 }

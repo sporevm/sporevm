@@ -61,6 +61,7 @@ pub const PackResult = api.PackResult;
 pub const PathFact = api.PathFact;
 pub const PullOptions = api.PullOptions;
 pub const PullResult = api.PullResult;
+pub const InjectedFile = api.InjectedFile;
 pub const PushOptions = api.PushOptions;
 pub const PushResult = api.PushResult;
 pub const ReadyEvent = api.ReadyEvent;

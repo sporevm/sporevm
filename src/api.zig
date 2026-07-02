@@ -144,6 +144,7 @@ pub const RootfsImportOciResult = rootfs_mod.ImportOciResult;
 pub const RootfsPlatform = rootfs_mod.Platform;
 pub const RootfsResolveOptions = rootfs_mod.ResolveRequest;
 pub const Disk = run_mod.Disk;
+pub const InjectedFile = run_mod.InjectedFile;
 pub const RunResult = run_mod.Result;
 pub const ResumeResult = run_mod.Result;
 pub const RunEvent = run_mod.RunEvent;
@@ -194,6 +195,8 @@ pub const RunOptions = struct {
     command: []const []const u8,
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
+    /// Ephemeral files made available under /run/sporevm/injected for this fresh run.
+    injected_files: []const InjectedFile = &.{},
     interactive: bool = false,
     tty: bool = false,
     memory: MemoryConfig = .{},
@@ -226,6 +229,8 @@ pub const ManagedRunOptions = struct {
     image_pull_policy: ImagePullPolicy = .missing,
     /// Guest command and arguments. The first element is the executable.
     command: []const []const u8,
+    /// Ephemeral files made available under /run/sporevm/injected for this fresh run.
+    injected_files: []const InjectedFile = &.{},
     interactive: bool = false,
     tty: bool = false,
     memory: MemoryConfig = .{},
@@ -742,6 +747,7 @@ pub fn run(
         .command = options.command,
         .guest_env = options.guest_env,
         .guest_working_dir = options.guest_working_dir,
+        .injected_files = options.injected_files,
         .interactive = options.interactive,
         .tty = options.tty,
         .memory = options.memory,
@@ -797,6 +803,7 @@ pub fn runManaged(
         .rootfs_path = rootfs.path,
         .rootfs = rootfs.rootfs,
         .command = options.command,
+        .injected_files = options.injected_files,
         .interactive = options.interactive,
         .tty = options.tty,
         .guest_env = rootfs.guest_env,
