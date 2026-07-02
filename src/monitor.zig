@@ -39,6 +39,8 @@ const monitor_usage =
     \\                          With --net, allow only DNS-learned HOST on PORT
     \\  --bound-unix-service NAME HOST PORT PATH
     \\                          With --net, expose a host Unix socket as HOST:PORT
+    \\  --forward 127.0.0.1:HOST_PORT:GUEST_PORT
+    \\                          With --net, forward host loopback TCP to a guest port
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
@@ -1227,6 +1229,12 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
                 std.debug.print("spore monitor: invalid --bound-unix-service {s}: {s}\n", .{ name, @errorName(err) });
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, args[i], "--forward")) {
+            const raw = takeValue(args, &i, args[i]);
+            opts.network_policy.addPortForward(raw) catch |err| {
+                std.debug.print("spore monitor: invalid --forward {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, args[i], "--memory")) {
             opts.memory = memory_config.parseCliOrExit("spore monitor", takeValue(args, &i, args[i]));
         } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
@@ -1245,7 +1253,7 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
         }
     }
     if (opts.network == .disabled and opts.network_policy.hasRules()) {
-        std.debug.print("spore monitor: --allow-cidr and --allow-host require --net\n", .{});
+        std.debug.print("spore monitor: network flags require --net\n", .{});
         std.process.exit(2);
     }
     return opts;
@@ -1290,6 +1298,8 @@ test "monitor parser accepts network allow policy" {
         "93.184.216.34/32",
         "--allow-host",
         "example.com",
+        "--forward",
+        "127.0.0.1:8080:80",
     });
 
     try std.testing.expectEqual(run.NetworkMode.spore, opts.network);
@@ -1297,6 +1307,9 @@ test "monitor parser accepts network allow policy" {
     try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
     try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
     try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.port_forward_count);
+    try std.testing.expectEqual(@as(u16, 8080), opts.network_policy.port_forwards[0].host_port);
+    try std.testing.expectEqual(@as(u16, 80), opts.network_policy.port_forwards[0].guest_port);
 }
 
 test "monitor parser accepts bounded vcpu count" {

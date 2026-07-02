@@ -40,7 +40,7 @@ const max_dns_payload_len = max_frame_len - ethernet_header_len - ipv4_header_mi
 
 const fallback_dns_ipv4: [4]u8 = .{ 1, 1, 1, 1 };
 
-const netd_usage = "usage: spore netd --stdio [--allow-cidr CIDR] [--allow-host HOST] [--allow-host-port HOST:PORT] [--bind-service NAME[:PORT]=unix:/path.sock] [--bound-unix-service NAME HOST PORT PATH]\n";
+const netd_usage = "usage: spore netd --stdio [--allow-cidr CIDR] [--allow-host HOST] [--allow-host-port HOST:PORT] [--bind-service NAME[:PORT]=unix:/path.sock] [--bound-unix-service NAME HOST PORT PATH] [--forward 127.0.0.1:HOST_PORT:GUEST_PORT]\n";
 
 pub const FrameIoError = error{
     EndOfStream,
@@ -118,14 +118,18 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     };
     const dns_forwarder = host_dns.forwarder();
     var tcp_gateway: spore_netd_tcp.Gateway = undefined;
-    tcp_gateway.init(&policy);
+    tcp_gateway.init(&policy, opts.policy.portForwardSlice()) catch |err| {
+        std.debug.print("spore netd: forward setup failed: {s}\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
+    defer tcp_gateway.deinit();
     tcp_gateway.emit_events = true;
     try writeAllFd(2, "ready\n");
     var in_buf: [max_frame_len]u8 = undefined;
     var reply_buf: [max_frame_len]u8 = undefined;
     while (true) {
         const now = tcpNow();
-        var fds: [1 + spore_netd_tcp.max_flows]std.posix.pollfd = undefined;
+        var fds: [1 + spore_netd_tcp.max_port_forwards + spore_netd_tcp.max_flows]std.posix.pollfd = undefined;
         fds[0] = .{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 };
         const host_fd_count = tcp_gateway.fillPollFds(fds[1..]);
         const poll_fds = fds[0 .. 1 + host_fd_count];
@@ -204,6 +208,12 @@ fn parseCliArgs(args: []const []const u8) CliOptions {
             };
             opts.policy.addBoundUnixService(name, guest_host, guest_port, unix_path) catch |err| {
                 std.debug.print("spore netd: invalid --bound-unix-service {s}: {s}\n", .{ name, @errorName(err) });
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, args[i], "--forward")) {
+            const raw = takeValue(args, &i, args[i]);
+            opts.policy.addPortForward(raw) catch |err| {
+                std.debug.print("spore netd: invalid --forward {s}: {s}\n", .{ raw, @errorName(err) });
                 std.process.exit(2);
             };
         } else {

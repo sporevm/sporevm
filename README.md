@@ -174,8 +174,11 @@ Use `--allow-host` or `--allow-cidr` to open egress beyond the built-in deny
 floor. Captured network policy is replayed by `spore run --from`; omit `--net`
 and allow flags on resumed runs.
 
-See [docs/networking.md](docs/networking.md) for policy, bound-service, and
-resume limits.
+Use `--forward 127.0.0.1:HOST_PORT:GUEST_PORT` to expose one live guest TCP
+port on host loopback while the run or named VM monitor is alive.
+
+See [docs/networking.md](docs/networking.md) for policy, bound-service,
+port-forward, and resume limits.
 
 ## Fork a live VM
 

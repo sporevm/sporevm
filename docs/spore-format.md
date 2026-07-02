@@ -248,9 +248,9 @@ under `rootfs.cache`.
   port rules and `bound_services` records restore-time guest service
   requirements by name, guest host, and guest port. The manifest does not carry
   live gateway state, TCP flows, DNS response caches, host socket paths,
-  credential material, or helper process state. Resume and `spore run --from`
-  must attach a fresh gateway that satisfies the recorded `requirements` and
-  policy or fail closed.
+  host port forwards, credential material, or helper process state. Resume and
+  `spore run --from` must attach a fresh gateway that satisfies the recorded
+  `requirements` and policy or fail closed.
 
 ## Manifest Format v1
 
@@ -304,9 +304,9 @@ that blob before mutating VM state.
 - Cross-frequency architected timer restore: manifest v0 records and enforces
   the counter frequency, but cannot translate a running Linux guest between
   different `CNTFRQ_EL0` domains.
-- Live network flows: manifest v0 persists requested network capability and
-  policy only. Active TCP flows and learned DNS answers are dropped across
-  capture, resume, and fork.
+- Live network flows and host port forwards: manifest v0 persists requested
+  network capability and policy only. Active TCP flows, learned DNS answers, and
+  host loopback listeners are dropped across capture, resume, and fork.
 - Transient virtio-mem state: the first grow-only auto-memory prototype is a
   fresh managed-run optimization. Manifest v0 records the fixed RAM image that
   capture/resume can restore, not virtio-mem plug state, unplug state, or guest

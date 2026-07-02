@@ -18,6 +18,7 @@ requiring distro networking tools in the initrd.
 one A-record query to the configured resolver and prints the first IPv4 answer.
 `wget.c` is a narrow HTTP-only smoke helper for outbound TCP proxying; it
 supports `-qO-` and streams bounded response bodies to stdout.
+`httpd.c` is a one-shot HTTP responder for host-to-guest TCP forwarding smokes.
 `flockcheck.c` verifies guest `flock(2)` behavior for runtime paths such as
 Docker and containerd metadata databases.
 `cgroupcheck.c` verifies the cgroup2 mount behavior Docker expects before daemon

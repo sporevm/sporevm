@@ -249,9 +249,10 @@ if (!caps.supported or !caps.exact_host_port) return error.UnsupportedNetworkPol
 ```
 
 The first networking slice supports TCP IPv4, DNS A-record learning, exact
-host-plus-port policy, default deny policy, bound Unix services, and named exec
-decision-event capture. It does not support IPv6, UDP egress, wildcard hosts,
-CIDR in Cleanroom policy, SNI/HTTP matching, or live per-exec policy updates.
+host-plus-port policy, default deny policy, bound Unix services, one create-time
+host loopback port forward for named VMs, and named exec decision-event capture.
+It does not support IPv6, UDP egress, wildcard hosts, CIDR in Cleanroom policy,
+SNI/HTTP matching, or live per-exec policy updates.
 
 Create a named VM with exact egress and a bound host service:
 
@@ -270,6 +271,11 @@ const service = libspore.BoundService{
     .target = .{ .unix = "/tmp/cleanroom-gateway.sock" },
 };
 
+const forward = libspore.PortForwardConfig{
+    .host_port = 18080,
+    .guest_port = 8080,
+};
+
 const created = try libspore.createNamed(init, allocator, .{
     .name = "cr-test",
     .image_ref = "docker.io/library/alpine:3.20",
@@ -277,10 +283,14 @@ const created = try libspore.createNamed(init, allocator, .{
         .enabled = true,
         .policy = policy,
         .bound_services = &.{service},
+        .port_forwards = &.{forward},
     },
 });
 defer libspore.deinitNamedLifecycleResult(allocator, created);
 ```
+
+Port forwards are live monitor state. They are closed when the named VM exits
+and are not recorded in captured spore manifests.
 
 `execNamed(.{ .network_policy = ... })` is part of the API contract but returns
 `error.UnsupportedNetworkPolicyUpdate` in this slice. Callers that need

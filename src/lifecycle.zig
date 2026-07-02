@@ -78,6 +78,8 @@ const create_usage =
     \\  --net                   Experimental SporeVM-managed networking
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
+    \\  --forward 127.0.0.1:HOST_PORT:GUEST_PORT
+    \\                          With --net, forward host loopback TCP to a guest port
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
@@ -348,6 +350,7 @@ pub const NamedNetworkOptions = struct {
     allow_hosts: []const []const u8 = &.{},
     policy: spore_net_policy.NetworkPolicy = .{},
     bound_services: []const spore_net_policy.BoundService = &.{},
+    port_forwards: []const spore_net_policy.PortForwardConfig = &.{},
 };
 
 pub const CreateNamedOptions = struct {
@@ -431,7 +434,8 @@ fn namedNetworkConfig(options: NamedNetworkOptions) !NamedNetworkConfig {
         if (options.allow_cidrs.len != 0 or
             options.allow_hosts.len != 0 or
             options.policy.allow.len != 0 or
-            options.bound_services.len != 0) return error.InvalidNetworkPolicy;
+            options.bound_services.len != 0 or
+            options.port_forwards.len != 0) return error.InvalidNetworkPolicy;
         return .{};
     }
     var config = run_mod.NetworkPolicy{};
@@ -446,6 +450,12 @@ fn namedNetworkConfig(options: NamedNetworkOptions) !NamedNetworkConfig {
     }
     for (options.bound_services) |service| {
         try config.addBoundService(service);
+    }
+    for (options.port_forwards) |forward| {
+        if (forward.host_port == 0 or forward.guest_port == 0) return error.InvalidPortForward;
+        if (config.port_forward_count >= spore_net_policy.max_port_forwards) return error.TooManyPortForwards;
+        config.port_forwards[config.port_forward_count] = forward;
+        config.port_forward_count += 1;
     }
     return .{ .mode = .spore, .policy = config };
 }
@@ -976,6 +986,7 @@ pub fn createCli(
             .enabled = parsed.network == .spore,
             .allow_cidrs = if (parsed.network == .spore) parsed.network_policy.allowCidrSlice() else &.{},
             .allow_hosts = if (parsed.network == .spore) parsed.network_policy.allowHostSlice() else &.{},
+            .port_forwards = if (parsed.network == .spore) parsed.network_policy.portForwardSlice() else &.{},
         },
         .memory = spec.memory,
         .vcpus = spec.vcpus,
@@ -1936,6 +1947,12 @@ fn parseCreateArgs(
                 const message = allocLifecycleMessage(allocator, "spore create: invalid --allow-host {s}: {s}", .{ raw, @errorName(err) });
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             };
+        } else if (std.mem.eql(u8, args[i], "--forward")) {
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+            network_policy.addPortForward(raw) catch |err| {
+                const message = allocLifecycleMessage(allocator, "spore create: invalid --forward {s}: {s}", .{ raw, @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            };
         } else if (std.mem.eql(u8, args[i], "--memory")) {
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
             spec.memory = memory_config.parse(raw) catch |err| {
@@ -2002,7 +2019,7 @@ fn parseCreateArgs(
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
     }
     if (network == .disabled and network_policy.hasRules()) {
-        const message = "spore create: --allow-cidr and --allow-host require --net";
+        const message = "spore create: network flags require --net";
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
     }
     return .{
@@ -2470,6 +2487,10 @@ fn appendMonitorNetworkPolicyArgs(allocator: std.mem.Allocator, argv: *std.array
         try argv.append(service.guest_host);
         try argv.append(try std.fmt.allocPrint(allocator, "{d}", .{service.guest_port}));
         try argv.append(service.unix_path);
+    }
+    for (policy.portForwardSlice()) |forward| {
+        try argv.append("--forward");
+        try argv.append(try std.fmt.allocPrint(allocator, "127.0.0.1:{d}:{d}", .{ forward.host_port, forward.guest_port }));
     }
 }
 
@@ -3560,6 +3581,8 @@ test "create parser accepts network allow policy" {
         "93.184.216.34/32",
         "--allow-host",
         "example.com",
+        "--forward",
+        "127.0.0.1:8080:80",
     }, allocator, &stderr.writer, .human);
 
     try std.testing.expectEqual(run_mod.NetworkMode.spore, opts.network);
@@ -3567,6 +3590,9 @@ test "create parser accepts network allow policy" {
     try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
     try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
     try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.port_forward_count);
+    try std.testing.expectEqual(@as(u16, 8080), opts.network_policy.port_forwards[0].host_port);
+    try std.testing.expectEqual(@as(u16, 80), opts.network_policy.port_forwards[0].guest_port);
 }
 
 test "named network config accepts create cli policy" {
@@ -3574,6 +3600,7 @@ test "named network config accepts create cli policy" {
         .enabled = true,
         .allow_cidrs = &.{"93.184.216.34/32"},
         .allow_hosts = &.{"example.com"},
+        .port_forwards = &.{.{ .host_port = 8080, .guest_port = 80 }},
     });
 
     try std.testing.expectEqual(run_mod.NetworkMode.spore, config.mode);
@@ -3581,6 +3608,9 @@ test "named network config accepts create cli policy" {
     try std.testing.expectEqualStrings("93.184.216.34/32", config.policy.allow_cidrs[0]);
     try std.testing.expectEqual(@as(usize, 1), config.policy.allow_host_count);
     try std.testing.expectEqualStrings("example.com", config.policy.allow_hosts[0]);
+    try std.testing.expectEqual(@as(usize, 1), config.policy.port_forward_count);
+    try std.testing.expectEqual(@as(u16, 8080), config.policy.port_forwards[0].host_port);
+    try std.testing.expectEqual(@as(u16, 80), config.policy.port_forwards[0].guest_port);
 }
 
 test "named network config keeps bare network unrestricted" {

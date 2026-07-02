@@ -132,6 +132,7 @@ pub const NetworkRule = spore_net_policy.NetworkRule;
 pub const BoundService = spore_net_policy.BoundService;
 pub const BoundServiceBinding = spore_net_policy.BoundServiceBinding;
 pub const BoundServiceTarget = spore_net_policy.BoundServiceTarget;
+pub const PortForwardConfig = spore_net_policy.PortForwardConfig;
 pub const Rootfs = run_mod.Rootfs;
 pub const Annotations = spore.Annotations;
 pub const validateAnnotations = spore.validateAnnotations;

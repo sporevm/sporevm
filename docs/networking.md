@@ -8,8 +8,8 @@ connects the existing virtio-net device to a SporeVM-owned userspace gateway.
 spore run --net --image docker.io/library/alpine:3.20 'wget -qO- https://example.com'
 ```
 
-There is no TAP, bridge, host NAT, or published-port contract in the default
-path. The guest-visible device model stays the same across HVF and KVM.
+There is no TAP, bridge, host NAT, or implicit published-port contract in the
+default path. The guest-visible device model stays the same across HVF and KVM.
 
 ## Guest Network
 
@@ -65,12 +65,26 @@ Captured manifests record bound-service requirements by name, guest host, and
 guest port, but never durable host socket paths. Restore fails closed unless a
 caller supplies fresh live bindings for each declared service through libspore.
 
+## Host Port Forwards
+
+One live guest TCP port can be forwarded to host loopback for the lifetime of a
+`spore run` or named VM monitor:
+
+```bash
+spore run --net --forward 127.0.0.1:18080:8080 -- /bin/httpd 8080
+```
+
+This maps `127.0.0.1:18080` on the host to `100.96.0.2:8080` in the guest. The
+listener is owned by `spore-netd` and is closed when the run or monitor exits.
+Port forwards are live process state only; they are not written into captured
+spore manifests.
+
 ## Capture And Resume
 
 Captured network spores persist requested capability and policy, not live TCP
-flows, DNS caches, helper state, host socket paths, or credentials. `spore
-resume` and `spore run --from` attach a fresh gateway under the recorded policy
-or fail closed.
+flows, DNS caches, helper state, host socket paths, host port forwards, or
+credentials. `spore resume` and `spore run --from` attach a fresh gateway under
+the recorded policy or fail closed.
 
 When running from a captured spore, omit `--net` and network flags:
 
@@ -90,11 +104,13 @@ Unix socket path.
 Current limits:
 
 - IPv4 TCP and DNS only.
-- No IPv6, general UDP, DHCP, published ports, or multiple NICs.
+- No IPv6, general UDP, DHCP, arbitrary published ports, or multiple NICs.
 - No live flow preservation across capture, resume, or fork.
 - No per-exec policy replacement for a running named VM.
-- No TCP loopback targets or per-connection bound-service availability events
-  in the CLI path.
+- Host port forwards are limited to one host loopback TCP listener with an
+  explicit guest port.
+- No TCP loopback egress targets or per-connection bound-service availability
+  events in the CLI path.
 
 ## Validation
 
@@ -107,4 +123,5 @@ mise run smoke:run-net-http
 mise run smoke:run-net-deny
 mise run smoke:run-net-capture
 mise run smoke:run-net-bind-service
+mise run smoke:run-net-forward
 ```
