@@ -189,27 +189,35 @@ Result: operationally useful, no performance claim. `--timeout-ms` helps avoid
 rebuilding for long or tight probe windows, but it does not reduce hot resume
 TTI.
 
-### Pending: Agent-Ready Snapshot Point
+### Rejected: Agent-Ready Snapshot Point
 
 Hypothesis: the current benchmark base is a completed session. Resuming from it
 forces the agent through the completed-session path before starting the next
 command. Capturing at "agent ready, no session" could avoid that baggage while
 keeping `run --from` as a fresh-session contract.
 
-Smallest experiment: add a hidden ready request that validates rootfs/network
-readiness, returns success, closes the client, and leaves `session` untouched.
-Then reuse the existing snapshot-on-probe-complete backend path. The only extra
-care is ensuring the host observes client close before snapshotting, so the
-guest is not captured halfway through the ready RPC.
+Result: rejected by measurement before implementation, after the flat-artifact
+rootfs change removed the disk-dominated warm cost. Phase timings on local HVF
+(`node:22-alpine`, 512mb) show the guest-side window this experiment targets —
+request accept through process spawn, including completed-session bookkeeping
+and generation apply — is under 1ms. On a quiet host with settled forks, the
+host vsock connect completes in 0-1ms and hot `run --from` lands around 30ms
+backend elapsed, of which ~6ms is restore and ~22ms is the guest `node -v`
+execution itself. Moving the snapshot point has nothing left to remove.
 
-Expected readout: if this still lands around 12-13 ms, the remaining gap is
-probably the guest fork/exec/userspace path rather than snapshot restore or
-vsock setup.
+The 15-25ms "connect delay" that motivated this experiment reproduces only in
+two transient conditions: resuming a child within roughly a second of `spore
+fork` writing it (all I/O in the run slows, including the guest's rootfs
+reads, consistent with filesystem write-back contention from the fresh fork
+artifacts), and general host load. Neither is addressed by a different
+snapshot point.
 
 ### Decision
 
-Do not keep optimizing the host-side vsock connect path unless a new profile
-shows it has become dominant again. The useful next experiment is the
-agent-ready/no-session snapshot point. If that fails to move the median, focus
-on guest process startup mechanics or accept low-teens ms as the current
-general-purpose hot-resume floor.
+Do not build the agent-ready snapshot. The general-purpose hot-resume floor on
+quiet hardware is ~30ms backend elapsed, dominated by restore (~6ms) and the
+guest command's own execution. If fork-then-immediately-resume latency matters
+for a real workload, the follow-up is fork artifact write-back behavior, not
+vsock or snapshot-point mechanics. The `spore resume` interactive path still
+carries `hvf_resume_attach_rx_delay_ms = 25`; leave it unless a profile shows
+the interactive attach path matters.
