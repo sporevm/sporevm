@@ -243,6 +243,32 @@ pub const OutputEvent = struct {
     bytes: []const u8,
 };
 
+pub const PortForwardKind = enum {
+    bound_unix_service,
+
+    pub fn name(self: PortForwardKind) []const u8 {
+        return switch (self) {
+            .bound_unix_service => "bound_unix_service",
+        };
+    }
+};
+
+pub const PortForwardEvent = struct {
+    command: []const u8,
+    backend: ?Backend,
+    kind: PortForwardKind,
+    name: []const u8,
+    guest_host: ?[]const u8,
+    guest_port: u16,
+    target: []const u8,
+};
+
+pub const CaptureEvent = struct {
+    command: []const u8,
+    backend: Backend,
+    capture_path: []const u8,
+};
+
 pub const ExitEvent = struct {
     command: []const u8,
     backend: Backend,
@@ -268,10 +294,12 @@ pub const FailureEvent = struct {
 pub const RunEvent = union(enum) {
     start: StartEvent,
     ready: ReadyEvent,
+    port_forward: PortForwardEvent,
     network: NetworkAuditEvent,
     stdout: OutputEvent,
     stderr: OutputEvent,
     terminal: OutputEvent,
+    capture: CaptureEvent,
     exit: ExitEvent,
     failure: FailureEvent,
 };
@@ -364,10 +392,20 @@ pub const EventEmitter = struct {
         try sink.emit(.{ .network = networkAuditEvent(self.command, self.backend, event) });
     }
 
+    pub fn emitPortForwards(self: *EventEmitter, policy: *const spore_net_policy.Config) !void {
+        const sink = self.sink orelse return;
+        for (policy.boundServiceSlice()) |service| {
+            try sink.emit(.{ .port_forward = portForwardEvent(self.command, self.backend, service) });
+        }
+    }
+
     pub fn emitExit(self: *EventEmitter, result: Result) !void {
         if (self.terminal_emitted) return;
         self.setBackend(result.backend);
         try self.emitReady();
+        if (self.sink) |sink| {
+            if (captureEvent(self.command, result)) |event| try sink.emit(.{ .capture = event });
+        }
         self.terminal_emitted = true;
         if (self.sink) |sink| try sink.emit(.{ .exit = exitEvent(self.command, result) });
     }
@@ -407,6 +445,27 @@ fn networkAuditEvent(command: []const u8, backend: ?Backend, event: net_gateway.
         .destination_ip = event.destination_ip,
         .destination_port = event.destination_port,
         .reason = event.reason.name(),
+    };
+}
+
+fn portForwardEvent(command: []const u8, backend: ?Backend, service: spore_net_policy.BoundServiceConfig) PortForwardEvent {
+    return .{
+        .command = command,
+        .backend = backend,
+        .kind = .bound_unix_service,
+        .name = service.name,
+        .guest_host = if (service.guest_host.len == 0) null else service.guest_host,
+        .guest_port = service.guest_port,
+        .target = "unix",
+    };
+}
+
+fn captureEvent(command: []const u8, result: Result) ?CaptureEvent {
+    if (!result.captured) return null;
+    return .{
+        .command = command,
+        .backend = result.backend,
+        .capture_path = result.capture_path orelse return null,
     };
 }
 
@@ -466,10 +525,12 @@ pub const EventWriter = struct {
                 if (value.backend) |backend| self.setBackend(backend);
                 try self.emitReady();
             },
+            .port_forward => |value| try self.emitPortForwardEvent(value),
             .network => |value| try self.emitNetworkEvent(value),
             .stdout => |value| try self.emitOutputEvent("stdout", value),
             .stderr => |value| try self.emitOutputEvent("stderr", value),
             .terminal => |value| try self.emitOutputEvent("terminal", value),
+            .capture => |value| try self.emitCaptureEvent(value),
             .exit => |value| try self.emitExitEvent(value),
             .failure => |value| try self.emitFailure(value.classified),
         }
@@ -515,6 +576,31 @@ pub const EventWriter = struct {
         try self.write(event);
     }
 
+    fn emitPortForwardEvent(self: *EventWriter, value: PortForwardEvent) !void {
+        if (value.backend) |backend| self.setBackend(backend);
+        const event = struct {
+            schema: []const u8 = machine_output.run_events_schema,
+            schema_version: u32 = machine_output.run_events_schema_version,
+            event: []const u8 = "port_forward",
+            command: []const u8,
+            backend: ?[]const u8,
+            type: []const u8,
+            name: []const u8,
+            guest_host: ?[]const u8,
+            guest_port: u16,
+            target: []const u8,
+        }{
+            .command = value.command,
+            .backend = self.backend,
+            .type = value.kind.name(),
+            .name = value.name,
+            .guest_host = value.guest_host,
+            .guest_port = value.guest_port,
+            .target = value.target,
+        };
+        try self.write(event);
+    }
+
     fn emitNetworkEvent(self: *EventWriter, value: NetworkAuditEvent) !void {
         if (value.backend) |backend| self.setBackend(backend);
         try self.emitReady();
@@ -541,6 +627,23 @@ pub const EventWriter = struct {
             .destination_ip = destination_ip,
             .destination_port = value.destination_port,
             .reason = value.reason,
+        };
+        try self.write(event);
+    }
+
+    fn emitCaptureEvent(self: *EventWriter, value: CaptureEvent) !void {
+        self.setBackend(value.backend);
+        const event = struct {
+            schema: []const u8 = machine_output.run_events_schema,
+            schema_version: u32 = machine_output.run_events_schema_version,
+            event: []const u8 = "capture",
+            command: []const u8,
+            backend: []const u8,
+            capture_path: []const u8,
+        }{
+            .command = value.command,
+            .backend = value.backend.name(),
+            .capture_path = value.capture_path,
         };
         try self.write(event);
     }
@@ -636,6 +739,10 @@ pub const EventWriter = struct {
     }
 
     pub fn emitExit(self: *EventWriter, result: Result) !void {
+        if (self.terminal_emitted) return;
+        self.setBackend(result.backend);
+        try self.emitReady();
+        if (captureEvent(self.command, result)) |event| try self.emitCaptureEvent(event);
         try self.emitExitEvent(exitEvent(self.command, result));
     }
 
@@ -2180,6 +2287,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         gateway_active = true;
     }
     defer if (gateway_active) gateway.deinit();
+    if (gateway_active) try events.emitPortForwards(&opts.network_policy);
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
     errdefer finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
     const network_manifest = try manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy);
@@ -3226,6 +3334,59 @@ test "event writer emits network denied events" {
     try expectJsonStringField(allocator, network_line, "destination_ip", "169.254.169.254");
     try expectJsonIntegerField(allocator, network_line, "destination_port", 80);
     try expectJsonStringField(allocator, network_line, "reason", "hard-floor");
+}
+
+test "event writer emits port forward events" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = EventWriter.init(allocator, &out.writer, "run");
+    var events = EventEmitter.init(writer.sink(), "run");
+    events.setBackend(.hvf);
+    var policy = spore_net_policy.Config{};
+    try policy.addBoundUnixService("gateway", "gateway.internal", 8170, "/tmp/gateway.sock");
+
+    try events.emitPortForwards(&policy);
+
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    const port_forward_line = lines.next().?;
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try std.testing.expectEqualStrings(
+        "{\"schema\":\"spore.run-events.v1\",\"schema_version\":1,\"event\":\"port_forward\",\"command\":\"run\",\"backend\":\"hvf\",\"type\":\"bound_unix_service\",\"name\":\"gateway\",\"guest_host\":\"gateway.internal\",\"guest_port\":8170,\"target\":\"unix\"}",
+        port_forward_line,
+    );
+}
+
+test "event writer emits capture events before exit" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var events = EventWriter.init(allocator, &out.writer, "run");
+
+    try events.emitExit(.{
+        .backend = .hvf,
+        .start_ms = 1,
+        .vsock_connect_ms = 2,
+        .exec_response_ms = 3,
+        .probe_duration_ms = 1,
+        .exit_code = 0,
+        .vcpus = 1,
+        .memory_bytes = memory_config.auto_bytes,
+        .captured = true,
+        .capture_path = "out.spore",
+    });
+
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    const ready_line = lines.next().?;
+    const capture_line = lines.next().?;
+    const exit_line = lines.next().?;
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try expectJsonStringField(allocator, ready_line, "event", "ready");
+    try std.testing.expectEqualStrings(
+        "{\"schema\":\"spore.run-events.v1\",\"schema_version\":1,\"event\":\"capture\",\"command\":\"run\",\"backend\":\"hvf\",\"capture_path\":\"out.spore\"}",
+        capture_line,
+    );
+    try expectJsonStringField(allocator, exit_line, "event", "exit");
 }
 
 fn failingEventSink(_: ?*anyopaque, _: RunEvent) !void {

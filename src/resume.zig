@@ -177,6 +177,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
 
     const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
+    if (gateway_active) try events.emitPortForwards(&network_options.policy);
     const ram_size = if (parsed) |manifest| manifest.value.platform.ram_size else parsed_v1.?.value.platform.ram_size;
     const vcpu_count = if (parsed) |_| @as(u32, 1) else parsed_v1.?.value.platform.vcpu_count;
     const memory = if (parsed) |manifest| manifest.value.memory else parsed_v1.?.value.memory;
