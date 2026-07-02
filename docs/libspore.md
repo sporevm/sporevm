@@ -91,6 +91,11 @@ validated manifest. SporeVM does not interpret namespaces such as
 apply on read and write: keys and values must be UTF-8 strings, keys cannot be
 empty, and the serialized annotation object is capped at 64 KiB.
 
+`SporeInspectResult.sessions` exposes the manifest's generic session handles as
+`Session` values with `SessionStreams` capabilities. These handles identify
+reattachable guest process sessions only; host stdin, PTY ownership, terminal
+mode, and currently attached clients are not serialized.
+
 ## Local System
 
 Use `systemDf` and `systemPrune` for rootfs cache inspection and cleanup without
@@ -161,7 +166,10 @@ const result = try libspore.runFromSpore(context, allocator, .{
 Leave `.command` empty to attach to the captured default session. Set
 `.interactive = true` or `.tty = true` only when that captured session was
 started with interactive stdin or a PTY; unsupported input attach returns a
-guest exit error instead of silently downgrading to output-only attach.
+usage error before restore instead of silently downgrading to output-only
+attach. If the manifest has exactly one non-default session, `runFromSpore`
+targets that handle for commandless attach; running a new command from a spore
+creates a new process session.
 
 `RunResult.memory_restore_source` and `memory_restore_reason` are populated for
 `runFromSpore` and `resumeSpore`, so embedders can tell whether RAM came from

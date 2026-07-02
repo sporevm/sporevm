@@ -130,6 +130,8 @@ pub const Options = struct {
     disk: ?spore.Disk = null,
     resume_dir: ?[]const u8 = null,
     resume_generation: ?generation.State = null,
+    resume_sessions: []const spore.Session = &.{},
+    attach_session_id: []const u8 = spore.default_session_id,
     start_generation_params: ?[]const u8 = null,
     require_generation_ready: bool = false,
     command: []const []const u8,
@@ -690,6 +692,27 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
         return machine_output.CliError.init(
             .runtime_start_failed,
             "spore run: interactive stream protocol failed; ensure the guest initrd supports start-v1 or omit -i/-t",
+            @errorName(err),
+        );
+    }
+    if (err == error.CapturedSessionHasNoInteractiveStdin) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: captured session has no interactive stdin",
+            @errorName(err),
+        );
+    }
+    if (err == error.CapturedSessionHasNoTerminal) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: captured session has no terminal",
+            @errorName(err),
+        );
+    }
+    if (err == error.CapturedSessionUnavailable) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: captured session handle is unavailable",
             @errorName(err),
         );
     }
@@ -2165,6 +2188,13 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
     if (opts.tty and opts.resume_dir != null and opts.command.len != 0) return error.TtyRunFromSporeUnsupported;
+    if (opts.resume_dir != null and opts.command.len == 0) {
+        try spore.validateSessionAttach(opts.resume_sessions, .{
+            .id = opts.attach_session_id,
+            .stdin = opts.interactive and !opts.tty,
+            .terminal = opts.tty,
+        });
+    }
 
     const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
@@ -2208,9 +2238,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, rootfsWritable(opts), opts.network);
     const request_start = monotonicMs();
     const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
-    var stream = try vsock.HostStream.initWithProtocol(opts.guest_port, request, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
+    var stream = try vsock.HostStream.initWithProtocol(opts.guest_port, request.bytes, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
     const request_ms = monotonicMs() -| request_start;
-    if (resuming) stream.host_port = vsock.HostStream.deriveHostPort(request);
+    if (resuming) stream.host_port = vsock.HostStream.deriveHostPort(request.bytes);
     if (opts.events != null) {
         stream.setLifecycleSink(&events, runEventLifecycleSink);
         stream.setOutputSink(&events, runEventOutputSink);
@@ -2231,6 +2261,13 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         .request = &capture_request,
         .continue_after_capture = opts.continue_after_capture,
     });
+    var captured_session_buf: [1]spore.Session = undefined;
+    const captured_sessions = if (request.attaches_existing and opts.resume_sessions.len != 0)
+        opts.resume_sessions
+    else blk: {
+        captured_session_buf[0] = spore.processSession(request.session_id, opts.interactive, opts.tty);
+        break :blk captured_session_buf[0..1];
+    };
     if (capture_plan.signal) |signal| {
         signal_registration = capture.SignalRegistration.install(signal, capture_plan.request.?);
     }
@@ -2266,6 +2303,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
+                .sessions = captured_sessions,
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
                 .ram_backing_fd = local_backing.fd,
@@ -2296,6 +2334,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
+                .sessions = captured_sessions,
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
                 .ram_backing_fd = local_backing.fd,
@@ -2432,6 +2471,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
+                .sessions = opts.resume_sessions,
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
                 .ram_restore_mode = .eager_chunks,
@@ -2454,6 +2494,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
+                .sessions = opts.resume_sessions,
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
                 .ram_restore_mode = .eager_chunks,
@@ -2576,60 +2617,87 @@ fn terminalSizeFd() std.c.fd_t {
     return if (std.c.isatty(1) != 0) 1 else if (std.c.isatty(0) != 0) 0 else 1;
 }
 
-fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options, memory_pressure: bool) ![]const u8 {
+const RunRequestInfo = struct {
+    bytes: []const u8,
+    session_id: []const u8,
+    attaches_existing: bool = false,
+};
+
+fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options, memory_pressure: bool) !RunRequestInfo {
     const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(context.io).nanoseconds);
     if (opts.resume_dir != null and opts.command.len == 0) {
         if (opts.interactive or opts.tty) {
-            return attachV1Request(allocator, .{
-                .interactive = opts.interactive,
-                .tty = opts.tty,
-                .terminal_name = terminalName(context.environ_map),
-                .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
-            });
+            return .{
+                .bytes = try attachV1Request(allocator, .{
+                    .session_id = opts.attach_session_id,
+                    .interactive = opts.interactive,
+                    .tty = opts.tty,
+                    .terminal_name = terminalName(context.environ_map),
+                    .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
+                }),
+                .session_id = opts.attach_session_id,
+                .attaches_existing = true,
+            };
         }
-        return attachRequest(allocator);
+        return .{
+            .bytes = try attachRequest(allocator, opts.attach_session_id),
+            .session_id = opts.attach_session_id,
+            .attaches_existing = true,
+        };
     }
-    if (opts.resume_dir == null) return execRequestWithSessionOptions(allocator, opts.command, "default", .{
-        .env = opts.guest_env,
-        .working_dir = opts.guest_working_dir,
-        .resume_time_unix_ns = resume_time_unix_ns,
-        .memory_pressure = memory_pressure,
-        .interactive = opts.interactive,
-        .tty = opts.tty,
-        .terminal_name = terminalName(context.environ_map),
-        .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
-    });
+    if (opts.resume_dir == null) return .{
+        .bytes = try execRequestWithSessionOptions(allocator, opts.command, spore.default_session_id, .{
+            .env = opts.guest_env,
+            .working_dir = opts.guest_working_dir,
+            .resume_time_unix_ns = resume_time_unix_ns,
+            .memory_pressure = memory_pressure,
+            .interactive = opts.interactive,
+            .tty = opts.tty,
+            .terminal_name = terminalName(context.environ_map),
+            .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
+        }),
+        .session_id = spore.default_session_id,
+    };
 
+    const session_id = try randomRunSessionId(context, allocator);
+    return .{
+        .bytes = try execRequestWithSessionOptions(allocator, opts.command, session_id, .{
+            .resume_time_unix_ns = resume_time_unix_ns,
+            .memory_pressure = memory_pressure,
+            .interactive = opts.interactive,
+            .tty = opts.tty,
+            .terminal_name = terminalName(context.environ_map),
+            .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
+            .generation_params = opts.start_generation_params,
+            .require_generation_ready = opts.require_generation_ready,
+        }),
+        .session_id = session_id,
+    };
+}
+
+fn randomRunSessionId(context: Context, allocator: std.mem.Allocator) ![]const u8 {
     const now = Io.Clock.real.now(context.io).nanoseconds;
     var nonce_bytes: [8]u8 = undefined;
     context.io.random(&nonce_bytes);
     const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
-    const session_id = try std.fmt.allocPrint(allocator, "run-{x}-{x}", .{ now, nonce });
-    return execRequestWithSessionOptions(allocator, opts.command, session_id, .{
-        .resume_time_unix_ns = resume_time_unix_ns,
-        .memory_pressure = memory_pressure,
-        .interactive = opts.interactive,
-        .tty = opts.tty,
-        .terminal_name = terminalName(context.environ_map),
-        .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
-        .generation_params = opts.start_generation_params,
-        .require_generation_ready = opts.require_generation_ready,
-    });
+    return std.fmt.allocPrint(allocator, "run-{x}-{x}", .{ now, nonce });
 }
 
-fn attachRequest(allocator: std.mem.Allocator) ![]const u8 {
+fn attachRequest(allocator: std.mem.Allocator, session_id: []const u8) ![]const u8 {
     const payload = struct {
         type: []const u8 = "attach",
-        session_id: []const u8 = "default",
+        session_id: []const u8,
         stdout_offset: u64 = 0,
         stderr_offset: u64 = 0,
-    }{};
+    }{ .session_id = session_id };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
+    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
 const AttachV1Options = struct {
+    session_id: []const u8 = spore.default_session_id,
     interactive: bool = false,
     tty: bool = false,
     terminal_name: []const u8 = "xterm",
@@ -2639,7 +2707,7 @@ const AttachV1Options = struct {
 fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) ![]const u8 {
     const payload = struct {
         type: []const u8 = "attach-v1",
-        session_id: []const u8 = "default",
+        session_id: []const u8,
         stdout_offset: u64 = 0,
         stderr_offset: u64 = 0,
         stdio: []const u8,
@@ -2648,6 +2716,7 @@ fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) ![]co
         terminal_rows: u16,
         terminal_cols: u16,
     }{
+        .session_id = options.session_id,
         .stdio = if (options.tty) "tty" else "pipe",
         .interactive = options.interactive,
         .term = options.terminal_name,
@@ -3170,6 +3239,12 @@ test "interactive stream protocol failure has a clear public message" {
     try std.testing.expect(std.mem.indexOf(u8, classified.message, "omit -i/-t") != null);
 }
 
+test "captured session attach failures are usage errors" {
+    const classified = classifyFailure(error.CapturedSessionHasNoInteractiveStdin);
+    try std.testing.expectEqual(machine_output.ErrorCode.usage_invalid_argument, classified.code);
+    try std.testing.expect(std.mem.indexOf(u8, classified.message, "no interactive stdin") != null);
+}
+
 test "tty run-from unsupported failure has a clear public message" {
     const classified = classifyFailure(error.TtyRunFromSporeUnsupported);
     try std.testing.expectEqual(machine_output.ErrorCode.usage_invalid_argument, classified.code);
@@ -3412,9 +3487,15 @@ test "run cli guest command rejects unquoted shell words" {
 }
 
 test "run attach request resumes default session" {
-    const request = try attachRequest(std.testing.allocator);
+    const request = try attachRequest(std.testing.allocator, spore.default_session_id);
     defer std.testing.allocator.free(request);
     try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", request);
+}
+
+test "run attach request can target recorded session id" {
+    const request = try attachRequest(std.testing.allocator, "run-1234");
+    defer std.testing.allocator.free(request);
+    try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"run-1234\",\"stdout_offset\":0,\"stderr_offset\":0}\n", request);
 }
 
 test "interactive run attach request uses v1 pipe stdio" {

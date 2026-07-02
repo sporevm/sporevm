@@ -1,6 +1,6 @@
 ---
 status: landed
-last_reviewed: 2026-06-30
+last_reviewed: 2026-07-02
 spec_refs:
   - docs/lifecycle.md
   - docs/libspore.md
@@ -139,6 +139,12 @@ different. It must be explicit.
   output-only attach by default; `-i` or `-t` selects `attach-v1`, validates the
   restored guest session capability, and starts host attachment state fresh for
   each restored spore or forked child.
+- The follow-up thin session primitive is implemented as generic manifest
+  `sessions` metadata. Captured process sessions record only an id, `kind:
+  "process"`, and stream capabilities; commandless `spore run --from` targets
+  `default` or the sole recorded handle and rejects unsupported stdin/terminal
+  attach before restore. It intentionally does not add `spore attach`, workflow
+  policy, repo sync, or credential mediation.
 - Slice 4 is implemented and validated locally. `spore exec -i/-t` uses a
   streaming monitor control request over the local Unix socket, while regular
   `spore exec NAME 'command'` stays on the bounded request/response path. The

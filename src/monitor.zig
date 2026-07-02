@@ -132,6 +132,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     const spec_rootfs = if (existing_spec) |spec| spec.value.rootfs else null;
     const spec_disk = if (existing_spec) |spec| spec.value.disk else null;
     const spec_annotations = if (existing_spec) |spec| spec.value.annotations else spore.Annotations{};
+    const spec_sessions = if (existing_spec) |spec|
+        if (spec.value.sessions.len != 0) spec.value.sessions else sessionHandlesForResume(allocator, opts.resume_dir)
+    else
+        sessionHandlesForResume(allocator, opts.resume_dir);
     const kernel_path = opts.kernel_path orelse run.resolveDefaultKernelPath(init, allocator) catch |err| {
         std.debug.print("spore monitor: kernel setup failed: {s}\n", .{@errorName(err)});
         std.process.exit(2);
@@ -152,6 +156,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .disk = spec_disk,
         .network = try run.manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy),
         .annotations = spec_annotations,
+        .sessions = spec_sessions,
         .image_ref = opts.image_ref,
         .resume_dir = opts.resume_dir,
         .memory = opts.memory,
@@ -192,6 +197,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .rootfs = spec_rootfs,
         .disk = spec_disk,
         .resume_dir = opts.resume_dir,
+        .resume_sessions = spec_sessions,
         .annotations = spec_annotations,
         .command = &.{"/bin/true"},
         .memory = opts.memory,
@@ -1165,6 +1171,21 @@ fn writeAll(io: Io, stream: net.Stream, bytes: []const u8) !void {
     var writer = stream.writer(io, &write_buffer);
     try writer.interface.writeAll(bytes);
     try writer.interface.flush();
+}
+
+fn sessionHandlesForResume(allocator: std.mem.Allocator, maybe_resume_dir: ?[]const u8) []const spore.Session {
+    const resume_dir = maybe_resume_dir orelse return &.{};
+    if (spore.loadManifest(allocator, resume_dir)) |manifest| {
+        return manifest.value.sessions;
+    } else |err| switch (err) {
+        error.BadManifest => {},
+        else => return &.{},
+    }
+    if (spore.loadManifestV1(allocator, resume_dir)) |manifest| {
+        return manifest.value.sessions;
+    } else |_| {
+        return &.{};
+    }
 }
 
 fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {

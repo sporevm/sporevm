@@ -63,6 +63,30 @@ Each VM has one monitor process. The monitor owns the hypervisor VM, vCPU loop,
 virtio state, rootfs fd, writable disk state, console log, vsock state, optional
 network gateway, and a local newline-delimited JSON control socket.
 
+## Session Handles
+
+Spore session handles are low-level process/session handles, not workflow
+state. Captured manifests can record `sessions`: an `id`, `kind: "process"`,
+and stream capabilities for `stdin`, `stdout`, `stderr`, and `terminal`.
+Fresh `spore run` captures record the `default` session. Commands started from
+an existing spore record a generated `run-*` session id, so a capture of that
+resumed command can be reattached without pretending it is the original default
+process.
+
+Commandless `spore run --from DIR` attaches to the `default` handle when
+present, or to the sole recorded handle when a capture only has one non-default
+session. `spore fork` preserves the recorded handles in each child. The handle
+records guest-side capability only: host stdin, the host-side PTY owner, raw
+terminal mode, window ownership, and any currently attached client are not part
+of a spore.
+
+If `spore run -i --from DIR` or `spore run -t --from DIR` asks for input that
+the recorded handle cannot support, SporeVM rejects the request before restore.
+Starting a new command with `spore run --from DIR <command>` starts a new
+process session instead of reattaching to an existing handle; `-t` for that
+new-command path remains deferred. Named VM names remain lifecycle monitor
+handles, and there is still no public `spore attach` command.
+
 ## Checkpoints And Forks
 
 `spore suspend NAME --out DIR` consumes the named VM and writes a spore.
@@ -106,8 +130,8 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
 - `spore run -i --from` and `spore run -t --from` can attach to captured live
   sessions only when that session was originally started with interactive stdin
   or a PTY. Commandless `spore run --from <spore-dir>` resumes the captured
-  default session. `spore run -t --from <spore-dir> <command>` is not
-  implemented yet.
+  default or sole recorded session. `spore run -t --from <spore-dir> <command>`
+  is not implemented yet.
 - `spore exec -i/-t` uses a streaming monitor request. The public bounded
   `execNamed` embedding API rejects interactive flags until a streaming
   embedding API exists.

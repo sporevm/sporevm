@@ -81,8 +81,22 @@ type SporeInspectResult struct {
 	MemoryBackingKind       *string              `json:"memory_backing_kind"`
 	MemoryBackingSize       *uint64              `json:"memory_backing_size"`
 	GICKind                 string               `json:"gic_kind"`
+	Sessions                []Session            `json:"sessions"`
 	Annotations             map[string]string    `json:"annotations"`
 	AnnotationKeys          []string             `json:"annotation_keys"`
+}
+
+type Session struct {
+	ID      string         `json:"id"`
+	Kind    string         `json:"kind"`
+	Streams SessionStreams `json:"streams"`
+}
+
+type SessionStreams struct {
+	Stdin    bool `json:"stdin"`
+	Stdout   bool `json:"stdout"`
+	Stderr   bool `json:"stderr"`
+	Terminal bool `json:"terminal"`
 }
 
 type SporePlatformSummary struct {

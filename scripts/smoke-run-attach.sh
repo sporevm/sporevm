@@ -65,19 +65,19 @@ if exit_code != 0:
 PY
 }
 
-jsonl_stderr_contains() {
+jsonl_failure_contains() {
   python3 - "$1" "$2" <<'PY'
-import base64
 import json
 import sys
 
-needle = sys.argv[2].encode()
+needle = sys.argv[2]
 with open(sys.argv[1], encoding="utf-8") as f:
     for line in f:
         event = json.loads(line)
-        if event.get("event") != "stderr":
+        if event.get("event") != "failure":
             continue
-        if needle in base64.b64decode(event.get("data_base64", "")):
+        message = event.get("error", {}).get("message", "")
+        if needle in message:
             sys.exit(0)
 sys.exit(1)
 PY
@@ -190,7 +190,7 @@ set -e
   cat "${reject_stderr}" >&2 || true
   die "non-interactive -i attach exited ${reject_rc}, expected 2"
 }
-jsonl_stderr_contains "${reject_jsonl}" "captured session has no interactive stdin" || {
+jsonl_failure_contains "${reject_jsonl}" "captured session has no interactive stdin" || {
   cat "${reject_jsonl}" >&2 || true
   cat "${reject_stderr}" >&2 || true
   die "non-interactive -i attach did not report the expected error"

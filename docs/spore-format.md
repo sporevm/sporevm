@@ -196,6 +196,15 @@ under `rootfs.cache`.
   restore refreshes the params page at actual resume time with volatile
   `resume_time_unix_ns` and `resume_entropy_seed` values before reasserting the
   generation interrupt.
+- `sessions`: optional low-level process/session handles captured with the VM.
+  A handle is generic: `id`, `kind: "process"`, and stream capabilities for
+  `stdin`, `stdout`, `stderr`, and `terminal`. `spore run --from` uses the
+  `default` handle when present, or the sole recorded handle for captures of a
+  resumed command that was started under a generated `run-*` id. The handle
+  records guest-side capability only. Host stdin, PTY ownership, terminal mode,
+  and the currently attached client are never part of the spore. Producers must
+  write at most 16 handles; ids are 1-63 ASCII alphanumeric, dash, underscore,
+  or dot characters.
 - `memory`: `chunk_size` plus one entry per chunk — a blake3-hex chunk
   reference, or null for an all-zero chunk. `backing` is optional local
   acceleration metadata for same-host KVM/HVF fork/fan-out: `kind:
