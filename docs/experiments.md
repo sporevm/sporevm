@@ -13,6 +13,48 @@ should use this shape:
 Keep titles outcome-first so another agent can scan this file without reading
 every paragraph.
 
+## Adopted: Flat Artifact Base For Warm Resume (Trust-At-Open)
+
+**Status:** shipped. Warm `run --from` TTI dropped about 5x on local HVF.
+
+### Question
+
+Why was warm `run --from` TTI (391ms median, CI profile, HVF,
+`node:22-alpine`) three times slower than cold `spore run --image` (124ms),
+when restore itself took only ~6ms?
+
+### Hypothesis
+
+Phase timings put the cost inside the guest: `node -v` took ~300ms in a
+resumed guest versus ~15ms cold. `SPOREVM_ROOTFS_TRACE` showed the resumed
+guest issuing ~7,000 4KiB virtio-blk reads served by `CasBlockSource`, with
+487 chunk misses each paying a path alloc + `open()` + 64KiB read + BLAKE3 +
+heap copy while the vCPU was blocked. Cold runs served the same reads with
+plain preads on the flat cached ext4 fd. Preferring the flat digest-addressed
+artifact as the COW base should recover cold-path read performance.
+
+### Method
+
+`mise run benchmark:ci` before and after changing `runtime_disk.open` to
+prefer the flat by-digest artifact (trust-at-open: symlink-safe, regular
+file, exact size; no re-hash) with CAS chunks as the fallback for chunk-only
+pulls. Same host, same image, same profile.
+
+### Result
+
+Warm `warm_spore_tti/sequential` median 391ms -> 73ms; burst 453ms -> 78ms;
+guest `node -v` in the resumed VM ~300ms -> ~22ms; cold TTI unchanged. This
+also removed the historical full-file re-hash for spores without
+`rootfs.storage` (previously ~3.35s for a 512MiB artifact on verify-on-open).
+
+### Decision
+
+Adopted, with the cache contract changed to verify-at-install,
+trust-at-open (SECURITY.md). Install boundaries still verify all bytes;
+user-supplied rootfs paths are always copied into the cache, never
+hardlinked. After this change the next dominant warm-TTI slice is the
+~15ms resumed vsock accept delay plus `spore` CLI process startup.
+
 ## Rejected: Host-Side Hot Resume Handoff Optimizations
 
 **Status:** recorded after the

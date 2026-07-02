@@ -171,7 +171,7 @@ def summarize_trace(path: Path) -> dict[str, object]:
 
     for row in load_jsonl(path):
         event = row.get("event")
-        if event == "rootfs_open_verified":
+        if event in ("rootfs_open", "rootfs_open_verified"):
             rootfs_open_ms = row.get("elapsed_ms")
             rootfs_open_size = row.get("size")
         elif event == "rootfs_cas_index_open":
@@ -652,13 +652,36 @@ class ManifestCasGate:
             "raw_results": str(self.raw_path),
         }
 
+    def flat_artifact_path(self, base_dir: Path) -> Path | None:
+        manifest = json.loads((base_dir / "manifest.json").read_text(encoding="utf-8"))
+        rootfs = manifest.get("rootfs") or {}
+        artifact = rootfs.get("artifact") if isinstance(rootfs, dict) else None
+        digest = artifact.get("digest") if isinstance(artifact, dict) else None
+        if not isinstance(digest, str) or not digest.startswith("blake3:"):
+            return None
+        hex_digest = digest[len("blake3:"):]
+        return self.rootfs_cache_dir / "by-digest" / "blake3" / f"{hex_digest}.ext4"
+
     def run(self) -> None:
         self.setup()
         base_dir = self.capture_base()
         storage = self.default_storage(base_dir)
         baseline_dir = self.fd_baseline_copy(base_dir)
         self.run_variant_counts(baseline_dir, "baseline", self.args.baseline_counts)
-        self.run_variant_counts(base_dir, "manifest_cas", self.args.cas_counts)
+        # Resume prefers the flat digest-addressed artifact when the cache has
+        # it, which would make this variant measure the flat path instead of
+        # CAS chunks. Move the flat artifact aside so manifest_cas actually
+        # exercises the chunked source, and restore it afterwards.
+        flat_path = self.flat_artifact_path(base_dir)
+        hidden_path = None
+        if flat_path is not None and flat_path.exists():
+            hidden_path = flat_path.with_name(flat_path.name + ".cas-benchmark-hidden")
+            flat_path.rename(hidden_path)
+        try:
+            self.run_variant_counts(base_dir, "manifest_cas", self.args.cas_counts)
+        finally:
+            if hidden_path is not None:
+                hidden_path.rename(flat_path)
         summary = self.summary(storage)
         write_json(self.summary_path, summary)
         write_json(self.output_dir / "latest-manifest-rootfs-cas-summary.json", summary)

@@ -4,6 +4,15 @@
 //! spore manifest. Callers may copy bytes from different sources, but the cache
 //! path is valid only after the bytes have been verified against that manifest
 //! digest and size.
+//!
+//! The cache contract is verify-at-install, trust-at-open: every write into
+//! the cache verifies the bytes against the expected digest before publishing
+//! them (`installExpectedPath*`, `cacheByDigestPath*`, `copyVerifiedPath`),
+//! entries are installed read-only, and product open paths
+//! (`openTrustedFromCache`) do not re-hash them. The cache lives in the same
+//! host trust domain as the spore binary and kernel cache; see SECURITY.md.
+//! `openVerifiedFromCache` remains for boundaries that must prove cache
+//! contents to a third party, such as metadata-only bundle materialization.
 
 const std = @import("std");
 const spore = @import("spore.zig");
@@ -26,6 +35,34 @@ pub const InstallResult = struct {
     bytes_fetched: u64,
 };
 
+/// Opens a digest-addressed cache entry without re-hashing its contents.
+///
+/// Cache entries are verified against the manifest digest when they are
+/// installed and are immutable (read-only, atomically published) afterwards,
+/// so opens trust that install-time verification. This still fails closed on
+/// symlinked or non-regular entries and on size mismatch, which catch cache
+/// management bugs and truncation without a full BLAKE3 pass on every resume.
+pub fn openTrustedFromCache(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    rootfs: spore.Rootfs,
+) !std.c.fd_t {
+    const path = try digestPath(allocator, cache_root, rootfs.artifact.digest);
+    defer allocator.free(path);
+    if (!try regularFileNoSymlink(io, path)) return error.RootFSDigestCacheMiss;
+    const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.RootFSDigestCacheMiss;
+    errdefer _ = std.c.close(fd);
+    const file = Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = file.stat(io) catch return error.RootFSDigestCacheMiss;
+    if (stat.kind != .file) return error.RootFSDigestCacheMiss;
+    if (stat.size != rootfs.artifact.size) return error.RootFSDigestMismatch;
+    return fd;
+}
+
 pub fn openVerifiedFromCache(
     io: Io,
     allocator: std.mem.Allocator,
@@ -47,6 +84,11 @@ pub fn openVerifiedFromCache(
     return fd;
 }
 
+/// Installs by hardlink when possible. Because opens trust install-time
+/// verification, hardlink sources must be cache-internal immutable files
+/// (for example the image-keyed materialized ext4); a hardlink to a
+/// caller-owned path would let later edits alias the cache entry. Use
+/// `cacheByDigestPathCopy` for any user-supplied path.
 pub fn cacheByDigestPath(
     io: Io,
     allocator: std.mem.Allocator,
@@ -217,6 +259,7 @@ pub fn digestPath(allocator: std.mem.Allocator, cache_root: []const u8, digest: 
     try spore.validateRootfsDigest(digest);
     const hex = digest[spore.rootfs_digest_prefix.len..];
     const file_name = try std.fmt.allocPrint(allocator, "{s}.ext4", .{hex});
+    defer allocator.free(file_name);
     return std.fs.path.join(allocator, &.{ cache_root, "by-digest", "blake3", file_name });
 }
 
@@ -347,6 +390,76 @@ test "digest cache installs rootfs bytes atomically and verifies final content" 
 
     try Io.Dir.cwd().deleteFile(io, digest_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
+    try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedFromCache(io, arena, cache_root, rootfs));
+}
+
+test "trusted open accepts installed entry and fails closed on size and shape" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-cache-trusted-open";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+
+    const artifact = try cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
+
+    const fd = try openTrustedFromCache(io, arena, cache_root, rootfs);
+    var readback: [12]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 12), std.c.pread(fd, &readback, readback.len, 0));
+    try std.testing.expectEqualStrings("rootfs bytes", &readback);
+    _ = std.c.close(fd);
+
+    // Size mismatch fails closed.
+    const digest_path = try digestPath(arena, cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "short" });
+    try std.testing.expectError(error.RootFSDigestMismatch, openTrustedFromCache(io, arena, cache_root, rootfs));
+
+    // Missing entry is a cache miss.
+    try Io.Dir.cwd().deleteFile(io, digest_path);
+    try std.testing.expectError(error.RootFSDigestCacheMiss, openTrustedFromCache(io, arena, cache_root, rootfs));
+
+    // Symlinked entry is rejected even when it points at matching bytes.
+    const digest_z = try arena.dupeZ(u8, digest_path);
+    const rootfs_z = try arena.dupeZ(u8, rootfs_path);
+    if (std.c.symlink(rootfs_z, digest_z) != 0) return error.SkipZigTest;
+    try std.testing.expectError(error.RootFSDigestCacheMiss, openTrustedFromCache(io, arena, cache_root, rootfs));
+}
+
+test "trusted open trusts install-time verification for same-size entries" {
+    // Pin the trust-at-open contract: a same-size content change to an
+    // installed cache entry is NOT detected at open time. Integrity is
+    // enforced when bytes enter the cache, not on every resume; SECURITY.md
+    // documents the cache as host-local trusted state.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-cache-trusted-open-same-size";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+
+    const artifact = try cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
+
+    const digest_path = try digestPath(arena, cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "ROOTFS BYTES" });
+
+    const fd = try openTrustedFromCache(io, arena, cache_root, rootfs);
+    _ = std.c.close(fd);
     try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedFromCache(io, arena, cache_root, rootfs));
 }
 
