@@ -206,18 +206,19 @@ backend elapsed, of which ~6ms is restore and ~22ms is the guest `node -v`
 execution itself. Moving the snapshot point has nothing left to remove.
 
 The 15-25ms "connect delay" that motivated this experiment reproduces only in
-two transient conditions: resuming a child within roughly a second of `spore
-fork` writing it (all I/O in the run slows, including the guest's rootfs
-reads, consistent with filesystem write-back contention from the fresh fork
-artifacts), and general host load. Neither is addressed by a different
-snapshot point.
+two transient conditions: the first resume after the host page cache has
+evicted the flat rootfs artifact and RAM backing pages (a 20-minute-old fork
+showed 161ms on its first resume and 32ms on an immediate second resume, and
+fork itself only writes ~200KB per child — the backing is a hardlink), and
+general host load. Neither is addressed by a different snapshot point.
 
 ### Decision
 
 Do not build the agent-ready snapshot. The general-purpose hot-resume floor on
 quiet hardware is ~30ms backend elapsed, dominated by restore (~6ms) and the
-guest command's own execution. If fork-then-immediately-resume latency matters
-for a real workload, the follow-up is fork artifact write-back behavior, not
-vsock or snapshot-point mechanics. The `spore resume` interactive path still
-carries `hvf_resume_attach_rx_delay_ms = 25`; leave it unless a profile shows
-the interactive attach path matters.
+guest command's own execution. If first-resume-after-idle latency matters for
+a real workload, the follow-up is page-cache readahead on the RAM backing and
+rootfs artifact at restore, not vsock or snapshot-point mechanics. The
+`spore resume` interactive path still carries
+`hvf_resume_attach_rx_delay_ms = 25`; leave it unless a profile shows the
+interactive attach path matters.
