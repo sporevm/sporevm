@@ -40,7 +40,7 @@ const max_dns_payload_len = max_frame_len - ethernet_header_len - ipv4_header_mi
 
 const fallback_dns_ipv4: [4]u8 = .{ 1, 1, 1, 1 };
 
-const netd_usage = "usage: spore netd --stdio [--allow-cidr CIDR] [--allow-host HOST] [--allow-host-port HOST:PORT] [--bind-service NAME=unix:/path.sock] [--bound-unix-service NAME HOST PORT PATH]\n";
+const netd_usage = "usage: spore netd --stdio [--allow-cidr CIDR] [--allow-host HOST] [--allow-host-port HOST:PORT] [--bind-service NAME[:PORT]=unix:/path.sock] [--bound-unix-service NAME HOST PORT PATH]\n";
 
 pub const FrameIoError = error{
     EndOfStream,
@@ -120,8 +120,6 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     var tcp_gateway: spore_netd_tcp.Gateway = undefined;
     tcp_gateway.init(&policy);
     tcp_gateway.emit_events = true;
-    const bound_services = opts.policy.boundServiceSlice();
-
     try writeAllFd(2, "ready\n");
     var in_buf: [max_frame_len]u8 = undefined;
     var reply_buf: [max_frame_len]u8 = undefined;
@@ -142,7 +140,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
                 else => |e| return e,
             };
             std.log.debug("spore-netd rx frame len={d}", .{frame.len});
-            if (frameReply(frame, &reply_buf, dns_forwarder, &policy, if (bound_services.len == 1) bound_services[0] else null)) |reply| {
+            if (frameReply(frame, &reply_buf, dns_forwarder, &policy)) |reply| {
                 try writeFrameFd(1, reply);
             } else if (!tcp_gateway.receiveFrame(frame, after_poll)) {
                 std.log.debug("spore-netd dropped unsupported frame len={d}", .{frame.len});
@@ -217,10 +215,6 @@ fn parseCliArgs(args: []const []const u8) CliOptions {
         std.debug.print("{s}", .{netd_usage});
         std.process.exit(2);
     }
-    if (opts.policy.bound_service_count > 1) {
-        std.debug.print("spore netd: --bind-service supports exactly one service for now\n", .{});
-        std.process.exit(2);
-    }
     return opts;
 }
 
@@ -277,9 +271,9 @@ pub fn readFrameFd(fd: std.c.fd_t, out: *[max_frame_len]u8) FrameIoError![]const
     return out[0..len];
 }
 
-fn frameReply(frame: []const u8, out: *[max_frame_len]u8, dns_forwarder: DnsForwarder, policy: ?*spore_net_policy.Runtime, bound_service: ?spore_net_policy.BoundServiceConfig) ?[]const u8 {
+fn frameReply(frame: []const u8, out: *[max_frame_len]u8, dns_forwarder: DnsForwarder, policy: ?*spore_net_policy.Runtime) ?[]const u8 {
     if (arpReply(frame, out)) |reply| return reply;
-    return dnsReply(frame, out, dns_forwarder, policy, bound_service);
+    return dnsReply(frame, out, dns_forwarder, policy);
 }
 
 pub fn arpReply(frame: []const u8, out: *[max_frame_len]u8) ?[]const u8 {
@@ -309,13 +303,8 @@ const DnsUdpRequest = struct {
     question_end: usize,
 };
 
-fn dnsReply(frame: []const u8, out: *[max_frame_len]u8, dns_forwarder: DnsForwarder, policy: ?*spore_net_policy.Runtime, bound_service: ?spore_net_policy.BoundServiceConfig) ?[]const u8 {
+fn dnsReply(frame: []const u8, out: *[max_frame_len]u8, dns_forwarder: DnsForwarder, policy: ?*spore_net_policy.Runtime) ?[]const u8 {
     const request = parseDnsUdpRequest(frame) orelse return null;
-
-    var local_response_buf: [max_dns_payload_len]u8 = undefined;
-    if (boundServiceDnsResponse(request.payload, request.question_end, bound_service, &local_response_buf)) |response| {
-        return buildDnsUdpFrame(request, response, out);
-    }
 
     var forward_buf: [max_dns_payload_len]u8 = undefined;
     var response_buf: [max_dns_payload_len]u8 = undefined;
@@ -336,56 +325,6 @@ fn dnsReply(frame: []const u8, out: *[max_frame_len]u8, dns_forwarder: DnsForwar
     } else buildDnsServfail(request.payload, request.question_end, &response_buf);
 
     return buildDnsUdpFrame(request, dns_payload, out);
-}
-
-fn boundServiceDnsResponse(packet: []const u8, question_end: usize, bound_service: ?spore_net_policy.BoundServiceConfig, out: *[max_dns_payload_len]u8) ?[]const u8 {
-    const service = bound_service orelse return null;
-    const matched = if (service.guest_host.len != 0)
-        dnsNameMatchesHost(packet, dns_header_len, service.guest_host)
-    else
-        dnsNameMatchesBoundService(packet, dns_header_len, service.name);
-    if (!matched) return null;
-    return if (dnsQuestionIsAIn(packet, question_end))
-        buildBoundServiceDnsResponse(packet, question_end, out)
-    else
-        buildDnsServfail(packet, question_end, out);
-}
-
-fn dnsNameMatchesBoundService(packet: []const u8, start: usize, service_name: []const u8) bool {
-    var offset = start;
-    if (!dnsLabelEquals(packet, &offset, service_name)) return false;
-    if (!dnsLabelEquals(packet, &offset, "spore")) return false;
-    if (!dnsLabelEquals(packet, &offset, "internal")) return false;
-    return offset < packet.len and packet[offset] == 0;
-}
-
-fn dnsNameMatchesHost(packet: []const u8, start: usize, host: []const u8) bool {
-    var offset = start;
-    var labels = std.mem.splitScalar(u8, host, '.');
-    while (labels.next()) |label| {
-        if (!dnsLabelEquals(packet, &offset, label)) return false;
-    }
-    return offset < packet.len and packet[offset] == 0;
-}
-
-fn dnsLabelEquals(packet: []const u8, offset: *usize, expected: []const u8) bool {
-    if (offset.* >= packet.len) return false;
-    const len = packet[offset.*];
-    if ((len & 0xc0) != 0 or len != expected.len) return false;
-    offset.* += 1;
-    if (offset.* + len > packet.len) return false;
-    defer offset.* += len;
-    return std.ascii.eqlIgnoreCase(packet[offset.*..][0..len], expected);
-}
-
-fn buildDnsNoAnswer(query: []const u8, question_end: usize, out: *[max_dns_payload_len]u8) []const u8 {
-    @memcpy(out[0..question_end], query[0..question_end]);
-    std.mem.writeInt(u16, out[2..4], 0x8180, .big);
-    std.mem.writeInt(u16, out[4..6], 1, .big);
-    std.mem.writeInt(u16, out[6..8], 0, .big);
-    std.mem.writeInt(u16, out[8..10], 0, .big);
-    std.mem.writeInt(u16, out[10..12], 0, .big);
-    return out[0..question_end];
 }
 
 fn dnsQuestionIsAIn(query: []const u8, question_end: usize) bool {
@@ -756,7 +695,7 @@ test "spore-netd proxies bounded UDP DNS queries" {
     var forwarder = TestDnsForwarder{ .response = response };
 
     var out: [max_frame_len]u8 = undefined;
-    const reply = frameReply(frame, &out, forwarder.forwarder(), null, null).?;
+    const reply = frameReply(frame, &out, forwarder.forwarder(), null).?;
 
     try std.testing.expectEqual(query.len, forwarder.query_len);
     try std.testing.expectEqual(@as(u16, 0x1234), forwarder.query_id);
@@ -779,15 +718,12 @@ test "spore-netd resolves bound services to the gateway" {
     var frame_buf: [max_frame_len]u8 = undefined;
     const frame = testDnsFrame(query, &frame_buf);
     var forwarder = TestDnsForwarder{ .fail = true };
-    const service = spore_net_policy.BoundServiceConfig{
-        .declaration = "metadata=unix:/tmp/metadata.sock",
-        .name = "metadata",
-        .guest_port = 80,
-        .unix_path = "/tmp/metadata.sock",
-    };
+    var config = spore_net_policy.Config{};
+    try config.addBindService("metadata=unix:/tmp/metadata.sock");
+    var policy = try spore_net_policy.Runtime.init(config);
 
     var out: [max_frame_len]u8 = undefined;
-    const reply = frameReply(frame, &out, forwarder.forwarder(), null, service).?;
+    const reply = frameReply(frame, &out, forwarder.forwarder(), &policy).?;
     try std.testing.expectEqual(@as(usize, 0), forwarder.query_len);
 
     const udp = reply[ethernet_header_len + ipv4_header_min_len ..];
@@ -806,15 +742,12 @@ test "spore-netd forwards ordinary DNS when a bound service exists" {
     var frame_buf: [max_frame_len]u8 = undefined;
     const frame = testDnsFrame(query, &frame_buf);
     var forwarder = TestDnsForwarder{ .response = response };
-    const service = spore_net_policy.BoundServiceConfig{
-        .declaration = "metadata=unix:/tmp/metadata.sock",
-        .name = "metadata",
-        .guest_port = 80,
-        .unix_path = "/tmp/metadata.sock",
-    };
+    var config = spore_net_policy.Config{};
+    try config.addBindService("metadata=unix:/tmp/metadata.sock");
+    var policy = try spore_net_policy.Runtime.init(config);
 
     var out: [max_frame_len]u8 = undefined;
-    _ = frameReply(frame, &out, forwarder.forwarder(), null, service).?;
+    _ = frameReply(frame, &out, forwarder.forwarder(), &policy).?;
     try std.testing.expectEqual(query.len, forwarder.query_len);
 }
 
@@ -826,7 +759,7 @@ test "spore-netd returns DNS SERVFAIL when host forwarding fails" {
     var forwarder = TestDnsForwarder{ .fail = true };
 
     var out: [max_frame_len]u8 = undefined;
-    const reply = frameReply(frame, &out, forwarder.forwarder(), null, null).?;
+    const reply = frameReply(frame, &out, forwarder.forwarder(), null).?;
     const udp = reply[ethernet_header_len + ipv4_header_min_len ..];
     const dns = udp[udp_header_len..];
 
@@ -849,7 +782,7 @@ test "spore-netd answers bound service DNS locally" {
     var policy = try spore_net_policy.Runtime.init(config);
 
     var out: [max_frame_len]u8 = undefined;
-    const reply = frameReply(frame, &out, forwarder.forwarder(), &policy, null).?;
+    const reply = frameReply(frame, &out, forwarder.forwarder(), &policy).?;
     try std.testing.expectEqual(@as(usize, 0), forwarder.query_len);
 
     const udp = reply[ethernet_header_len + ipv4_header_min_len ..];
@@ -877,13 +810,13 @@ test "spore-netd drops malformed DNS compression and bad IPv4 checksums" {
     const frame = testDnsFrame(query, &frame_buf);
     var forwarder = TestDnsForwarder{};
     var out: [max_frame_len]u8 = undefined;
-    try std.testing.expect(frameReply(frame, &out, forwarder.forwarder(), null, null) == null);
+    try std.testing.expect(frameReply(frame, &out, forwarder.forwarder(), null) == null);
 
     var good_query_buf: [512]u8 = undefined;
     const good_query = testDnsQuery(0x2222, "example.com", &good_query_buf);
     const bad_frame = testDnsFrame(good_query, &frame_buf);
     frame_buf[ethernet_header_len + 8] ^= 1;
-    try std.testing.expect(frameReply(bad_frame, &out, forwarder.forwarder(), null, null) == null);
+    try std.testing.expect(frameReply(bad_frame, &out, forwarder.forwarder(), null) == null);
 }
 
 test "spore-netd parses host resolver nameserver lines" {
@@ -953,36 +886,33 @@ fn fuzzFrameStreamAndArp(_: void, s: *std.testing.Smith) !void {
     const len = @min(s.slice(&bytes), bytes.len);
     var out: [max_frame_len]u8 = undefined;
     var forwarder = TestDnsForwarder{ .fail = true };
-    const bound_service = spore_net_policy.BoundServiceConfig{
-        .declaration = "metadata=unix:/tmp/metadata.sock",
-        .name = "metadata",
-        .guest_port = 80,
-        .unix_path = "/tmp/metadata.sock",
-    };
+    var config = spore_net_policy.Config{};
+    try config.addBindService("metadata=unix:/tmp/metadata.sock");
+    var policy = try spore_net_policy.Runtime.init(config);
 
     _ = arpReply(bytes[0..len], &out);
-    _ = frameReply(bytes[0..len], &out, forwarder.forwarder(), null, null);
-    _ = frameReply(bytes[0..len], &out, forwarder.forwarder(), null, bound_service);
+    _ = frameReply(bytes[0..len], &out, forwarder.forwarder(), null);
+    _ = frameReply(bytes[0..len], &out, forwarder.forwarder(), &policy);
 
     var query_buf: [512]u8 = undefined;
     const query = testDnsQuery(0x4545, "metadata.spore.internal", &query_buf);
     var frame_buf: [max_frame_len]u8 = undefined;
     const service_frame = testDnsFrame(query, &frame_buf);
-    _ = frameReply(service_frame, &out, forwarder.forwarder(), null, bound_service);
+    _ = frameReply(service_frame, &out, forwarder.forwarder(), &policy);
 
     var mutated_buf: [max_frame_len]u8 = undefined;
     @memcpy(mutated_buf[0..service_frame.len], service_frame);
     for (bytes[0..@min(len, service_frame.len)], 0..) |byte, i| {
         mutated_buf[i] ^= byte;
     }
-    _ = frameReply(mutated_buf[0..service_frame.len], &out, forwarder.forwarder(), null, bound_service);
+    _ = frameReply(mutated_buf[0..service_frame.len], &out, forwarder.forwarder(), &policy);
 
     if (len < frame_header_len) return;
     const frame_len = decodeFrameLen(bytes[0..frame_header_len]) catch return;
     if (frame_header_len + frame_len > len) return;
     _ = arpReply(bytes[frame_header_len..][0..frame_len], &out);
-    _ = frameReply(bytes[frame_header_len..][0..frame_len], &out, forwarder.forwarder(), null, null);
-    _ = frameReply(bytes[frame_header_len..][0..frame_len], &out, forwarder.forwarder(), null, bound_service);
+    _ = frameReply(bytes[frame_header_len..][0..frame_len], &out, forwarder.forwarder(), null);
+    _ = frameReply(bytes[frame_header_len..][0..frame_len], &out, forwarder.forwarder(), &policy);
 }
 
 test "fuzz spore-netd frame stream, ARP, IPv4, UDP, and DNS handling" {

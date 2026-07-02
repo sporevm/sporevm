@@ -164,7 +164,14 @@ pub const Config = struct {
     pub fn addBindService(self: *Config, raw: []const u8) ParseError!void {
         const eq = std.mem.indexOfScalar(u8, raw, '=') orelse return error.InvalidBoundService;
         if (std.mem.indexOfScalar(u8, raw[eq + 1 ..], '=') != null) return error.InvalidBoundService;
-        const name = raw[0..eq];
+        const name_port = raw[0..eq];
+        const colon = std.mem.lastIndexOfScalar(u8, name_port, ':');
+        const name = if (colon) |index| name_port[0..index] else name_port;
+        const guest_port = if (colon) |index| port: {
+            const parsed = std.fmt.parseUnsigned(u16, name_port[index + 1 ..], 10) catch return error.InvalidPort;
+            if (parsed == 0) return error.InvalidPort;
+            break :port parsed;
+        } else 80;
         const target = raw[eq + 1 ..];
         try validateBoundServiceName(name);
 
@@ -174,10 +181,14 @@ pub const Config = struct {
         try validateUnixSocketPath(path);
 
         if (self.bound_service_count >= max_bound_services) return error.TooManyBoundServices;
+        for (self.boundServiceSlice()) |existing| {
+            if (std.mem.eql(u8, existing.name, name)) return error.DuplicateBoundService;
+            if (existing.guest_port == guest_port) return error.DuplicateBoundService;
+        }
         self.bound_services[self.bound_service_count] = .{
             .declaration = raw,
             .name = name,
-            .guest_port = 80,
+            .guest_port = guest_port,
             .unix_path = path,
         };
         self.bound_service_count += 1;
@@ -504,7 +515,13 @@ pub const Runtime = struct {
 
     pub fn boundServiceForDnsQuery(self: *const Runtime, packet: []const u8, name_offset: usize) ?*const BoundServiceConfig {
         for (self.bound_services[0..self.bound_service_count]) |*service| {
-            if (dnsNameMatchesHost(packet, name_offset, service.guest_host)) return service;
+            if (service.guest_host.len != 0) {
+                if (dnsNameMatchesHost(packet, name_offset, service.guest_host)) return service;
+            } else {
+                var host_buf: [max_bound_service_name_len + ".spore.internal".len]u8 = undefined;
+                const host = std.fmt.bufPrint(&host_buf, "{s}.spore.internal", .{service.name}) catch unreachable;
+                if (dnsNameMatchesHost(packet, name_offset, host)) return service;
+            }
         }
         return null;
     }
@@ -822,19 +839,33 @@ test "spore-net policy DNS rebinding answers cannot override hard floor" {
 test "spore-net policy parses bound unix service declarations" {
     var config = Config{};
     try config.addBindService("metadata=unix:/tmp/metadata.sock");
+    try config.addBindService("cache:8080=unix:/tmp/cache.sock");
 
     try std.testing.expect(config.hasBoundServices());
-    try std.testing.expectEqual(@as(usize, 1), config.bound_service_count);
+    try std.testing.expectEqual(@as(usize, 2), config.bound_service_count);
     try std.testing.expectEqualStrings("metadata=unix:/tmp/metadata.sock", config.bound_services[0].declaration);
     try std.testing.expectEqualStrings("metadata", config.bound_services[0].name);
     try std.testing.expectEqual(@as(u16, 80), config.bound_services[0].guest_port);
     try std.testing.expectEqualStrings("/tmp/metadata.sock", config.bound_services[0].unix_path);
+    try std.testing.expectEqualStrings("cache:8080=unix:/tmp/cache.sock", config.bound_services[1].declaration);
+    try std.testing.expectEqualStrings("cache", config.bound_services[1].name);
+    try std.testing.expectEqual(@as(u16, 8080), config.bound_services[1].guest_port);
+    try std.testing.expectEqualStrings("/tmp/cache.sock", config.bound_services[1].unix_path);
+
+    const policy = try Runtime.init(config);
+    var metadata_query_buf: [512]u8 = undefined;
+    const metadata_query = testDnsQuery(0x1234, "metadata.spore.internal", &metadata_query_buf);
+    try std.testing.expectEqualStrings("metadata", (policy.boundServiceForDnsQuery(metadata_query, dns_header_len) orelse return error.TestUnexpectedResult).name);
+    var cache_query_buf: [512]u8 = undefined;
+    const cache_query = testDnsQuery(0x1235, "cache.spore.internal", &cache_query_buf);
+    try std.testing.expectEqualStrings("cache", (policy.boundServiceForDnsQuery(cache_query, dns_header_len) orelse return error.TestUnexpectedResult).name);
 }
 
 test "spore-net policy rejects invalid bound service declarations" {
     var config = Config{};
     try std.testing.expectError(error.InvalidBoundService, config.addBindService("metadata"));
     try std.testing.expectError(error.InvalidBoundServiceName, config.addBindService("MetaData=unix:/tmp/metadata.sock"));
+    try std.testing.expectError(error.InvalidPort, config.addBindService("metadata:0=unix:/tmp/metadata.sock"));
     try std.testing.expectError(error.UnsupportedBoundServiceTarget, config.addBindService("metadata=tcp:127.0.0.1:8080"));
     try std.testing.expectError(error.InvalidBoundServiceTarget, config.addBindService("metadata=unix:relative.sock"));
 }
