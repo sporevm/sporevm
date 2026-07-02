@@ -68,6 +68,7 @@ typedef struct SporeOwnedString {
 
 /** Opaque process context for libspore C ABI calls. */
 typedef struct SporeContextImpl *SporeContext;
+typedef struct SporeExecNamedStreamImpl *SporeExecNamedStream;
 
 #define SPORE_INSPECT_BUNDLE_OPTIONS_VERSION 1u
 #define SPORE_PULL_OPTIONS_VERSION 1u
@@ -77,6 +78,7 @@ typedef struct SporeContextImpl *SporeContext;
 #define SPORE_RESUME_NAMED_OPTIONS_VERSION 2u
 #define SPORE_FORK_NAMED_OPTIONS_VERSION 1u
 #define SPORE_EXEC_NAMED_OPTIONS_VERSION 2u
+#define SPORE_EXEC_NAMED_STREAM_OPTIONS_VERSION 1u
 #define SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION 2u
 #define SPORE_SUSPEND_NAMED_OPTIONS_VERSION 1u
 #define SPORE_REMOVE_NAMED_OPTIONS_VERSION 1u
@@ -85,6 +87,12 @@ typedef struct SporeContextImpl *SporeContext;
 #define SPORE_CACHE_ROOT_ENV 0u
 #define SPORE_CACHE_ROOT_NONE 1u
 #define SPORE_CACHE_ROOT_PATH 2u
+
+#define SPORE_EXEC_NAMED_STREAM_STDOUT 1
+#define SPORE_EXEC_NAMED_STREAM_STDERR 2
+#define SPORE_EXEC_NAMED_STREAM_TERMINAL 3
+#define SPORE_EXEC_NAMED_STREAM_EXIT 4
+#define SPORE_EXEC_NAMED_STREAM_ERROR 5
 
 /** Options for spore_inspect_bundle_json(). */
 typedef struct SporeInspectBundleOptions {
@@ -213,6 +221,32 @@ typedef struct SporeExecNamedOptions {
   size_t network_rule_count;
 } SporeExecNamedOptions;
 
+/** Options for spore_exec_named_stream_open(). */
+typedef struct SporeExecNamedStreamOptions {
+  uint32_t size;
+  uint32_t version;
+  SporeString name;
+  const SporeString *argv;
+  size_t argc;
+  uint8_t interactive;
+  uint8_t tty;
+  SporeString terminal_name;
+  uint16_t terminal_rows;
+  uint16_t terminal_cols;
+} SporeExecNamedStreamOptions;
+
+/**
+ * Streaming exec event.
+ *
+ * `bytes` is borrowed from the stream and remains valid until the next
+ * operation on that stream or until the stream is freed.
+ */
+typedef struct SporeExecNamedStreamEvent {
+  int type;
+  SporeString bytes;
+  uint8_t exit_code;
+} SporeExecNamedStreamEvent;
+
 /** Options for spore_resume_named_json(). */
 typedef struct SporeResumeNamedOptions {
   uint32_t size;
@@ -280,6 +314,9 @@ SPORE_API void spore_create_named_options_init(SporeCreateNamedOptions *options)
 
 /** Initialize exec-named options with defaults. */
 SPORE_API void spore_exec_named_options_init(SporeExecNamedOptions *options);
+
+/** Initialize streaming exec options with defaults. */
+SPORE_API void spore_exec_named_stream_options_init(SporeExecNamedStreamOptions *options);
 
 /** Initialize resume-named options with defaults. */
 SPORE_API void spore_resume_named_options_init(SporeResumeNamedOptions *options);
@@ -388,6 +425,44 @@ SPORE_API SporeResult spore_create_named_json(SporeContext context,
 SPORE_API SporeResult spore_exec_named_json(SporeContext context,
                                             const SporeExecNamedOptions *options,
                                             SporeOwnedString *out_json);
+
+/** Open a streaming exec session in a named VM. Free with spore_exec_named_stream_free(). */
+SPORE_API SporeResult spore_exec_named_stream_open(SporeContext context,
+                                                   const SporeExecNamedStreamOptions *options,
+                                                   SporeExecNamedStream *out_stream);
+
+/** Read the next stdout, stderr, terminal, exit, or error event. */
+SPORE_API SporeResult spore_exec_named_stream_next(SporeContext context,
+                                                   SporeExecNamedStream stream,
+                                                   SporeExecNamedStreamEvent *out_event);
+
+/** Send pipe stdin bytes to a streaming exec session. */
+SPORE_API SporeResult spore_exec_named_stream_write_stdin(SporeContext context,
+                                                          SporeExecNamedStream stream,
+                                                          SporeString bytes);
+
+/** Send terminal input bytes to a streaming exec session. */
+SPORE_API SporeResult spore_exec_named_stream_write_terminal(SporeContext context,
+                                                             SporeExecNamedStream stream,
+                                                             SporeString bytes);
+
+/** Close pipe stdin for a streaming exec session. */
+SPORE_API SporeResult spore_exec_named_stream_close_stdin(SporeContext context,
+                                                          SporeExecNamedStream stream);
+
+/** Close terminal input for a streaming exec session. */
+SPORE_API SporeResult spore_exec_named_stream_close_terminal(SporeContext context,
+                                                             SporeExecNamedStream stream);
+
+/** Resize the guest terminal for a streaming exec session. */
+SPORE_API SporeResult spore_exec_named_stream_resize_terminal(SporeContext context,
+                                                              SporeExecNamedStream stream,
+                                                              uint16_t rows,
+                                                              uint16_t cols);
+
+/** Free a streaming exec session. */
+SPORE_API void spore_exec_named_stream_free(SporeContext context,
+                                            SporeExecNamedStream stream);
 
 /**
  * Resume a named VM from a spore checkpoint and return `spore.lifecycle.v1`

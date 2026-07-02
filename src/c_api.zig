@@ -11,7 +11,7 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 10;
+const c_abi_version: u32 = 11;
 const inspect_bundle_options_version: u32 = 1;
 const inspect_spore_options_version: u32 = 1;
 const pull_options_version: u32 = 1;
@@ -21,9 +21,16 @@ const create_named_options_version: u32 = 4;
 const resume_named_options_version: u32 = 2;
 const fork_named_options_version: u32 = 1;
 const exec_named_options_version: u32 = 2;
+const exec_named_stream_options_version: u32 = 1;
 const snapshot_named_options_version: u32 = 2;
 const suspend_named_options_version: u32 = 1;
 const remove_named_options_version: u32 = 1;
+
+const stream_event_stdout: c_int = 1;
+const stream_event_stderr: c_int = 2;
+const stream_event_terminal: c_int = 3;
+const stream_event_exit: c_int = 4;
+const stream_event_error: c_int = 5;
 
 const SporeString = extern struct {
     ptr: ?[*]const u8 = null,
@@ -154,6 +161,25 @@ const SporeExecNamedOptions = extern struct {
     network_rule_count: usize,
 };
 
+const SporeExecNamedStreamOptions = extern struct {
+    size: u32,
+    version: u32,
+    name: SporeString,
+    argv: ?[*]const SporeString,
+    argc: usize,
+    interactive: u8,
+    tty: u8,
+    terminal_name: SporeString,
+    terminal_rows: u16,
+    terminal_cols: u16,
+};
+
+const SporeExecNamedStreamEvent = extern struct {
+    type: c_int,
+    bytes: SporeString,
+    exit_code: u8,
+};
+
 const SporeResumeNamedOptions = extern struct {
     size: u32,
     version: u32,
@@ -194,6 +220,10 @@ const SporeRemoveNamedOptions = extern struct {
     size: u32,
     version: u32,
     name: SporeString,
+};
+
+const SporeExecNamedStreamImpl = struct {
+    stream: libspore.ExecNamedStream,
 };
 
 const SporeContextImpl = struct {
@@ -329,6 +359,22 @@ pub export fn spore_exec_named_options_init(options: ?*SporeExecNamedOptions) vo
         .has_network_policy = 0,
         .network_rules = null,
         .network_rule_count = 0,
+    };
+}
+
+pub export fn spore_exec_named_stream_options_init(options: ?*SporeExecNamedStreamOptions) void {
+    const out = options orelse return;
+    out.* = .{
+        .size = @sizeOf(SporeExecNamedStreamOptions),
+        .version = exec_named_stream_options_version,
+        .name = .{},
+        .argv = null,
+        .argc = 0,
+        .interactive = 0,
+        .tty = 0,
+        .terminal_name = .{},
+        .terminal_rows = 24,
+        .terminal_cols = 80,
     };
 }
 
@@ -702,6 +748,139 @@ pub export fn spore_exec_named_json(
     return result_success;
 }
 
+pub export fn spore_exec_named_stream_open(
+    context: ?*SporeContextImpl,
+    options: ?*const SporeExecNamedStreamOptions,
+    out_stream: ?*?*SporeExecNamedStreamImpl,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    const out = out_stream orelse return fail(ctx, error.InvalidValue);
+    out.* = null;
+    ctx.clearLastError();
+    if (opts.version != exec_named_stream_options_version or opts.size < @sizeOf(SporeExecNamedStreamOptions)) {
+        return fail(ctx, error.InvalidValue);
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const argv = parseArgv(arena, opts.argv, opts.argc) catch |err| return fail(ctx, err);
+    const stream = libspore.openExecNamedStream(ctx.productContext(), ctx.allocator, .{
+        .name = toSlice(opts.name) catch |err| return fail(ctx, err),
+        .command = argv,
+        .interactive = opts.interactive != 0,
+        .tty = opts.tty != 0,
+        .terminal_name = (optionalSlice(opts.terminal_name) catch |err| return fail(ctx, err)) orelse "xterm",
+        .terminal_size = .{
+            .rows = if (opts.terminal_rows == 0) 24 else opts.terminal_rows,
+            .cols = if (opts.terminal_cols == 0) 80 else opts.terminal_cols,
+        },
+    }) catch |err| return fail(ctx, err);
+    errdefer {
+        var cleanup = stream;
+        cleanup.deinit();
+    }
+    const handle = ctx.allocator.create(SporeExecNamedStreamImpl) catch |err| return fail(ctx, err);
+    handle.* = .{ .stream = stream };
+    out.* = handle;
+    return result_success;
+}
+
+pub export fn spore_exec_named_stream_next(
+    context: ?*SporeContextImpl,
+    stream: ?*SporeExecNamedStreamImpl,
+    out_event: ?*SporeExecNamedStreamEvent,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const handle = stream orelse return fail(ctx, error.InvalidValue);
+    const out = out_event orelse return fail(ctx, error.InvalidValue);
+    out.* = .{ .type = 0, .bytes = .{}, .exit_code = 0 };
+    ctx.clearLastError();
+
+    const event = handle.stream.next() catch |err| return fail(ctx, err);
+    switch (event) {
+        .stdout => |bytes| out.* = .{ .type = stream_event_stdout, .bytes = borrowString(bytes), .exit_code = 0 },
+        .stderr => |bytes| out.* = .{ .type = stream_event_stderr, .bytes = borrowString(bytes), .exit_code = 0 },
+        .terminal => |bytes| out.* = .{ .type = stream_event_terminal, .bytes = borrowString(bytes), .exit_code = 0 },
+        .exit => |code| out.* = .{ .type = stream_event_exit, .bytes = .{}, .exit_code = code },
+        .err => |bytes| out.* = .{ .type = stream_event_error, .bytes = borrowString(bytes), .exit_code = 0 },
+    }
+    return result_success;
+}
+
+pub export fn spore_exec_named_stream_write_stdin(
+    context: ?*SporeContextImpl,
+    stream: ?*SporeExecNamedStreamImpl,
+    bytes: SporeString,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const handle = stream orelse return fail(ctx, error.InvalidValue);
+    ctx.clearLastError();
+    handle.stream.writeStdin(toSlice(bytes) catch |err| return fail(ctx, err)) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_exec_named_stream_write_terminal(
+    context: ?*SporeContextImpl,
+    stream: ?*SporeExecNamedStreamImpl,
+    bytes: SporeString,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const handle = stream orelse return fail(ctx, error.InvalidValue);
+    ctx.clearLastError();
+    handle.stream.writeTerminal(toSlice(bytes) catch |err| return fail(ctx, err)) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_exec_named_stream_close_stdin(
+    context: ?*SporeContextImpl,
+    stream: ?*SporeExecNamedStreamImpl,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const handle = stream orelse return fail(ctx, error.InvalidValue);
+    ctx.clearLastError();
+    handle.stream.closeStdin() catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_exec_named_stream_close_terminal(
+    context: ?*SporeContextImpl,
+    stream: ?*SporeExecNamedStreamImpl,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const handle = stream orelse return fail(ctx, error.InvalidValue);
+    ctx.clearLastError();
+    handle.stream.closeTerminal() catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_exec_named_stream_resize_terminal(
+    context: ?*SporeContextImpl,
+    stream: ?*SporeExecNamedStreamImpl,
+    rows: u16,
+    cols: u16,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const handle = stream orelse return fail(ctx, error.InvalidValue);
+    ctx.clearLastError();
+    handle.stream.resizeTerminal(.{
+        .rows = if (rows == 0) 24 else rows,
+        .cols = if (cols == 0) 80 else cols,
+    }) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_exec_named_stream_free(
+    context: ?*SporeContextImpl,
+    stream: ?*SporeExecNamedStreamImpl,
+) void {
+    const ctx = context orelse return;
+    const handle = stream orelse return;
+    handle.stream.deinit();
+    ctx.allocator.destroy(handle);
+}
+
 pub export fn spore_resume_named_json(
     context: ?*SporeContextImpl,
     options: ?*const SporeResumeNamedOptions,
@@ -1059,6 +1238,12 @@ test "named lifecycle options initialize defaults" {
     spore_exec_named_options_init(&exec);
     try std.testing.expectEqual(exec_named_options_version, exec.version);
     try std.testing.expectEqual(@as(u8, 0), exec.has_network_policy);
+
+    var stream: SporeExecNamedStreamOptions = undefined;
+    spore_exec_named_stream_options_init(&stream);
+    try std.testing.expectEqual(exec_named_stream_options_version, stream.version);
+    try std.testing.expectEqual(@as(u16, 24), stream.terminal_rows);
+    try std.testing.expectEqual(@as(u16, 80), stream.terminal_cols);
 
     var resume_options: SporeResumeNamedOptions = undefined;
     spore_resume_named_options_init(&resume_options);

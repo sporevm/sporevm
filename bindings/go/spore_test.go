@@ -1,11 +1,17 @@
 package spore
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"unsafe"
@@ -381,6 +387,85 @@ func TestDecodeExecNamedResult(t *testing.T) {
 	}
 }
 
+func TestExecNamedStreamFakeMonitor(t *testing.T) {
+	client, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	baseDir, err := os.MkdirTemp("/tmp", "spore-go-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(baseDir)
+	runtimeDir := filepath.Join(baseDir, "runtime")
+	vmDir := filepath.Join(runtimeDir, "vms", "stream-box")
+	mustMkdirMode(t, runtimeDir, 0o700)
+	mustMkdirMode(t, filepath.Join(runtimeDir, "vms"), 0o700)
+	mustMkdirMode(t, vmDir, 0o700)
+	controlSocket := filepath.Join(vmDir, "control.sock")
+	consoleLog := filepath.Join(vmDir, "console.log")
+	mustWrite(t, filepath.Join(vmDir, "spec.json"), `{"name":"stream-box"}`)
+	mustWrite(t, filepath.Join(vmDir, "ready.json"), `{"pid":`+strconv.Itoa(os.Getpid())+`,"control_socket_path":`+jsonString(t, controlSocket)+`,"console_log_path":`+jsonString(t, consoleLog)+`}`)
+	mustWrite(t, filepath.Join(vmDir, "pid"), strconv.Itoa(os.Getpid())+"\n")
+
+	listener, err := net.Listen("unix", controlSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- serveExecStreamFakeMonitor(listener)
+	}()
+
+	if err := client.SetEnv(context.Background(), "SPOREVM_RUNTIME_DIR", runtimeDir); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := client.OpenExecNamedStream(context.Background(), ExecNamedStreamOptions{
+		Name:         "stream-box",
+		Argv:         []string{"/bin/sh"},
+		Interactive:  true,
+		TTY:          true,
+		TerminalName: "xterm-256color",
+		TerminalRows: 40,
+		TerminalCols: 120,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	if err := stream.WriteTerminal(context.Background(), []byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.ResizeTerminal(context.Background(), 50, 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CloseTerminal(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	event, err := stream.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != ExecNamedStreamTerminal || string(event.Bytes) != "pong" {
+		t.Fatalf("terminal event = %#v", event)
+	}
+	event, err = stream.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != ExecNamedStreamExit || event.ExitCode != 7 {
+		t.Fatalf("exit event = %#v", event)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDecodeNamedList(t *testing.T) {
 	entries, err := decodeJSON[[]NamedListEntry]([]byte(`[
 		{
@@ -446,6 +531,139 @@ func TestListNamedEmptyRuntime(t *testing.T) {
 	}
 }
 
+const (
+	spioHeaderLen       = 24
+	spioMaxPayload      = 4096
+	spioData       byte = 1
+	spioClose      byte = 2
+	spioExit       byte = 3
+	spioResize     byte = 4
+	spioControl         = 0
+	spioTerminal        = 4
+)
+
+type spioFrame struct {
+	Type     byte
+	StreamID uint32
+	Offset   uint64
+	Payload  []byte
+}
+
+func serveExecStreamFakeMonitor(listener net.Listener) error {
+	conn, err := listener.Accept()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	requestLine, err := reader.ReadBytes('\n')
+	if err != nil {
+		return err
+	}
+	var request struct {
+		Type         string   `json:"type"`
+		Argv         []string `json:"argv"`
+		Stdio        string   `json:"stdio"`
+		Interactive  bool     `json:"interactive"`
+		Term         string   `json:"term"`
+		TerminalRows uint16   `json:"terminal_rows"`
+		TerminalCols uint16   `json:"terminal_cols"`
+	}
+	if err := json.Unmarshal(requestLine, &request); err != nil {
+		return err
+	}
+	if request.Type != "exec-stream-v1" || request.Stdio != "tty" || !request.Interactive {
+		return fmt.Errorf("bad stream request: %#v", request)
+	}
+	if len(request.Argv) != 1 || request.Argv[0] != "/bin/sh" {
+		return fmt.Errorf("bad argv: %#v", request.Argv)
+	}
+	if request.Term != "xterm-256color" || request.TerminalRows != 40 || request.TerminalCols != 120 {
+		return fmt.Errorf("bad terminal metadata: %#v", request)
+	}
+
+	frame, err := readSPIOFrame(reader)
+	if err != nil {
+		return err
+	}
+	if frame.Type != spioData || frame.StreamID != spioTerminal || frame.Offset != 0 || string(frame.Payload) != "hi" {
+		return fmt.Errorf("bad terminal data frame: %#v", frame)
+	}
+	frame, err = readSPIOFrame(reader)
+	if err != nil {
+		return err
+	}
+	if frame.Type != spioResize || frame.StreamID != spioTerminal || frame.Offset != 0 || len(frame.Payload) != 4 ||
+		binary.LittleEndian.Uint16(frame.Payload[0:2]) != 50 || binary.LittleEndian.Uint16(frame.Payload[2:4]) != 100 {
+		return fmt.Errorf("bad resize frame: %#v", frame)
+	}
+	frame, err = readSPIOFrame(reader)
+	if err != nil {
+		return err
+	}
+	if frame.Type != spioClose || frame.StreamID != spioTerminal || frame.Offset != 2 || len(frame.Payload) != 0 {
+		return fmt.Errorf("bad terminal close frame: %#v", frame)
+	}
+
+	if err := writeSPIOFrame(conn, spioData, spioTerminal, 0, []byte("pong")); err != nil {
+		return err
+	}
+	var exitPayload [4]byte
+	binary.LittleEndian.PutUint32(exitPayload[:], 7)
+	return writeSPIOFrame(conn, spioExit, spioControl, 0, exitPayload[:])
+}
+
+func readSPIOFrame(reader io.Reader) (spioFrame, error) {
+	var header [spioHeaderLen]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil {
+		return spioFrame{}, err
+	}
+	if string(header[0:4]) != "SPIO" || header[4] != 1 {
+		return spioFrame{}, fmt.Errorf("bad spio header: %q", header[0:5])
+	}
+	if flags := binary.LittleEndian.Uint16(header[6:8]); flags != 0 {
+		return spioFrame{}, fmt.Errorf("bad spio flags: %d", flags)
+	}
+	payloadLen := binary.LittleEndian.Uint32(header[20:24])
+	if payloadLen > spioMaxPayload {
+		return spioFrame{}, fmt.Errorf("payload too large: %d", payloadLen)
+	}
+	payload := make([]byte, payloadLen)
+	if payloadLen != 0 {
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			return spioFrame{}, err
+		}
+	}
+	return spioFrame{
+		Type:     header[5],
+		StreamID: binary.LittleEndian.Uint32(header[8:12]),
+		Offset:   binary.LittleEndian.Uint64(header[12:20]),
+		Payload:  payload,
+	}, nil
+}
+
+func writeSPIOFrame(writer io.Writer, typ byte, streamID uint32, offset uint64, payload []byte) error {
+	if len(payload) > spioMaxPayload {
+		return fmt.Errorf("payload too large: %d", len(payload))
+	}
+	var header [spioHeaderLen]byte
+	copy(header[0:4], "SPIO")
+	header[4] = 1
+	header[5] = typ
+	binary.LittleEndian.PutUint32(header[8:12], streamID)
+	binary.LittleEndian.PutUint64(header[12:20], offset)
+	binary.LittleEndian.PutUint32(header[20:24], uint32(len(payload)))
+	if _, err := writer.Write(header[:]); err != nil {
+		return err
+	}
+	if len(payload) != 0 {
+		_, err := writer.Write(payload)
+		return err
+	}
+	return nil
+}
+
 func writeInspectBundleFixture(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -478,11 +696,27 @@ func mustMkdir(t *testing.T, path string) {
 	}
 }
 
+func mustMkdirMode(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Mkdir(path, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func mustWrite(t *testing.T, path, contents string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func jsonString(t *testing.T, value string) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 func supportsNamedLifecycle(t *testing.T, client *Client) bool {

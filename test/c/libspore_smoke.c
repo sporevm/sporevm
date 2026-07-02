@@ -14,7 +14,7 @@ int main(void) {
 
   uint32_t abi_version = 0;
   if (expect_success(spore_build_info(SPORE_BUILD_INFO_ABI_VERSION, &abi_version)) != 0) return 1;
-  if (abi_version != 10) return 1;
+  if (abi_version != 11) return 1;
 
   SporeInspectBundleOptions options;
   spore_inspect_bundle_options_init(&options);
@@ -63,6 +63,13 @@ int main(void) {
   if (exec_options.size != sizeof(exec_options)) return 1;
   if (exec_options.version != SPORE_EXEC_NAMED_OPTIONS_VERSION) return 1;
   if (exec_options.has_network_policy != 0) return 1;
+
+  SporeExecNamedStreamOptions stream_options;
+  spore_exec_named_stream_options_init(&stream_options);
+  if (stream_options.size != sizeof(stream_options)) return 1;
+  if (stream_options.version != SPORE_EXEC_NAMED_STREAM_OPTIONS_VERSION) return 1;
+  if (stream_options.terminal_rows != 24) return 1;
+  if (stream_options.terminal_cols != 80) return 1;
 
   SporeResumeNamedOptions resume_options;
   spore_resume_named_options_init(&resume_options);

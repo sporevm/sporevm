@@ -16,9 +16,10 @@ import (
 	"unsafe"
 )
 
-const minABIVersion uint32 = 10
+const minABIVersion uint32 = 11
 
 var ErrClosed = errors.New("spore client closed")
+var ErrStreamClosed = errors.New("spore exec stream closed")
 
 // Result is a libspore C ABI result code.
 type Result int
@@ -52,6 +53,12 @@ type BuildInfo struct {
 // Client owns a libspore process context.
 type Client struct {
 	ctx C.SporeContext
+}
+
+// ExecNamedStream owns a streaming named exec session.
+type ExecNamedStream struct {
+	client *Client
+	stream C.SporeExecNamedStream
 }
 
 // New creates a libspore client and verifies the loaded C ABI is new enough.
@@ -339,6 +346,133 @@ func (c *Client) ExecNamed(ctx context.Context, options ExecNamedOptions) (ExecN
 	return decodeJSON[ExecNamedResult](goBytes(out), "exec named result")
 }
 
+// OpenExecNamedStream opens a bidirectional streaming exec session.
+func (c *Client) OpenExecNamedStream(ctx context.Context, options ExecNamedStreamOptions) (*ExecNamedStream, error) {
+	if err := c.ready(ctx); err != nil {
+		return nil, err
+	}
+	name, freeName := cString(options.Name)
+	defer freeName()
+	argv, freeArgv := cStringList(options.Argv)
+	defer freeArgv()
+	terminalName, freeTerminalName := cString(options.TerminalName)
+	defer freeTerminalName()
+
+	var opts C.SporeExecNamedStreamOptions
+	C.spore_exec_named_stream_options_init(&opts)
+	opts.name = name
+	if len(argv) != 0 {
+		opts.argv = &argv[0]
+		opts.argc = C.size_t(len(argv))
+	}
+	if options.Interactive {
+		opts.interactive = 1
+	}
+	if options.TTY {
+		opts.tty = 1
+	}
+	opts.terminal_name = terminalName
+	if options.TerminalRows != 0 {
+		opts.terminal_rows = C.uint16_t(options.TerminalRows)
+	}
+	if options.TerminalCols != 0 {
+		opts.terminal_cols = C.uint16_t(options.TerminalCols)
+	}
+
+	var stream C.SporeExecNamedStream
+	if result := Result(C.spore_exec_named_stream_open(c.ctx, &opts, &stream)); result != Success {
+		return nil, c.callError(result)
+	}
+	return &ExecNamedStream{client: c, stream: stream}, nil
+}
+
+// Next returns the next stdout, stderr, terminal, exit, or error event.
+func (s *ExecNamedStream) Next(ctx context.Context) (ExecNamedStreamEvent, error) {
+	if err := s.ready(ctx); err != nil {
+		return ExecNamedStreamEvent{}, err
+	}
+	var event C.SporeExecNamedStreamEvent
+	if result := Result(C.spore_exec_named_stream_next(s.client.ctx, s.stream, &event)); result != Success {
+		return ExecNamedStreamEvent{}, s.client.callError(result)
+	}
+	return ExecNamedStreamEvent{
+		Type:     ExecNamedStreamEventType(event._type),
+		Bytes:    goBorrowedBytes(event.bytes),
+		ExitCode: uint8(event.exit_code),
+	}, nil
+}
+
+// WriteStdin sends pipe stdin bytes to the guest process.
+func (s *ExecNamedStream) WriteStdin(ctx context.Context, data []byte) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
+	if result := Result(C.spore_exec_named_stream_write_stdin(s.client.ctx, s.stream, bytesString(data))); result != Success {
+		return s.client.callError(result)
+	}
+	return nil
+}
+
+// WriteTerminal sends terminal input bytes to the guest process.
+func (s *ExecNamedStream) WriteTerminal(ctx context.Context, data []byte) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
+	if result := Result(C.spore_exec_named_stream_write_terminal(s.client.ctx, s.stream, bytesString(data))); result != Success {
+		return s.client.callError(result)
+	}
+	return nil
+}
+
+// CloseStdin closes pipe stdin for the guest process.
+func (s *ExecNamedStream) CloseStdin(ctx context.Context) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
+	if result := Result(C.spore_exec_named_stream_close_stdin(s.client.ctx, s.stream)); result != Success {
+		return s.client.callError(result)
+	}
+	return nil
+}
+
+// CloseTerminal closes terminal input for the guest process.
+func (s *ExecNamedStream) CloseTerminal(ctx context.Context) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
+	if result := Result(C.spore_exec_named_stream_close_terminal(s.client.ctx, s.stream)); result != Success {
+		return s.client.callError(result)
+	}
+	return nil
+}
+
+// ResizeTerminal resizes the guest terminal.
+func (s *ExecNamedStream) ResizeTerminal(ctx context.Context, rows, cols uint16) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
+	if result := Result(C.spore_exec_named_stream_resize_terminal(s.client.ctx, s.stream, C.uint16_t(rows), C.uint16_t(cols))); result != Success {
+		return s.client.callError(result)
+	}
+	return nil
+}
+
+// Close frees the stream handle. It does not signal guest stdin.
+func (s *ExecNamedStream) Close() {
+	if s == nil || s.stream == nil {
+		return
+	}
+	C.spore_exec_named_stream_free(s.client.ctx, s.stream)
+	s.stream = nil
+}
+
+func (s *ExecNamedStream) ready(ctx context.Context) error {
+	if s == nil || s.client == nil || s.stream == nil {
+		return ErrStreamClosed
+	}
+	return s.client.ready(ctx)
+}
+
 // ResumeNamed starts a named VM from a spore checkpoint directory.
 func (c *Client) ResumeNamed(ctx context.Context, options ResumeNamedOptions) (NamedLifecycleResult, error) {
 	if err := c.ready(ctx); err != nil {
@@ -464,6 +598,20 @@ func goBytes(s C.SporeOwnedString) []byte {
 		return nil
 	}
 	return C.GoBytes(unsafe.Pointer(s.ptr), C.int(s.len))
+}
+
+func goBorrowedBytes(s C.SporeString) []byte {
+	if s.ptr == nil || s.len == 0 {
+		return nil
+	}
+	return C.GoBytes(unsafe.Pointer(s.ptr), C.int(s.len))
+}
+
+func bytesString(b []byte) C.SporeString {
+	if len(b) == 0 {
+		return C.SporeString{}
+	}
+	return C.SporeString{ptr: (*C.char)(unsafe.Pointer(&b[0])), len: C.size_t(len(b))}
 }
 
 func decodeJSON[T any](data []byte, description string) (T, error) {

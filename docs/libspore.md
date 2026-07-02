@@ -237,6 +237,7 @@ The named surface is:
 - `resumeNamed`
 - `forkNamed`
 - `execNamed`
+- `openExecNamedStream`
 - `snapshotNamed`
 - `suspendNamed`
 - `removeNamed`
@@ -246,8 +247,32 @@ The named surface is:
 `deinitNamedLifecycleResult`, `deinitExecNamedResult`,
 `deinitNamedForkResult`, and `deinitNamedList` for owned results.
 `execNamed` returns a bounded stdout/stderr result, so `.interactive = true` or
-`.tty = true` returns `error.UnsupportedInteractiveExec` in this slice. Use the
-CLI for streaming named exec until a streaming embedder API is added.
+`.tty = true` returns `error.UnsupportedInteractiveExec`. Use
+`openExecNamedStream` for `spore exec -i/-t` semantics:
+
+```zig
+var stream = try libspore.openExecNamedStream(context, allocator, .{
+    .name = "worker-1",
+    .command = &.{ "/bin/sh" },
+    .interactive = true,
+    .tty = true,
+    .terminal_size = .{ .rows = 40, .cols = 120 },
+});
+defer stream.deinit();
+
+try stream.writeTerminal("echo hi\n");
+try stream.resizeTerminal(.{ .rows = 50, .cols = 100 });
+while (true) {
+    switch (try stream.next()) {
+        .terminal => |bytes| try handleTerminal(bytes),
+        .exit => |code| return code,
+        .err => |bytes| return handleMonitorError(bytes),
+        else => {},
+    }
+}
+```
+
+Stream event byte slices are borrowed until the next stream operation.
 
 ## Networking
 
@@ -733,7 +758,7 @@ When setting `SPOREVM_RUNTIME_DIR`, pass an absolute directory that exists and
 is private to the current user, matching the named lifecycle registry rules.
 
 The Go binding decodes the same JSON contracts as the CLI and C ABI, and it
-requires C ABI version 10 or newer. Go context cancellation is checked before
+requires C ABI version 11 or newer. Go context cancellation is checked before
 entering C calls; long-running runtime cancellation is not exposed until the Zig
 product API and C ABI provide it.
 
