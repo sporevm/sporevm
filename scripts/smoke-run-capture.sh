@@ -56,12 +56,15 @@ trap 'rm -rf "${workdir}"' EXIT
 capture_dir="${workdir}/captured.spore"
 fork_dir="${workdir}/children"
 from_base_dir="${workdir}/from-base.spore"
+from_base_fork_dir="${workdir}/from-base-children"
 run_stdout="${workdir}/run.stdout"
 run_stderr="${workdir}/run.stderr"
 resume_stdout="${workdir}/resume.stdout"
 resume_stderr="${workdir}/resume.stderr"
 from_stdout="${workdir}/from.stdout"
 from_stderr="${workdir}/from.stderr"
+from_child_stdout="${workdir}/from-child.stdout"
+from_child_stderr="${workdir}/from-child.stderr"
 from_base_stdout="${workdir}/from-base.stdout"
 from_base_stderr="${workdir}/from-base.stderr"
 smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
@@ -118,8 +121,12 @@ grep -Fq "captured snapshot at ${capture_dir}" "${run_stderr}" || {
 }
 
 "${spore_bin}" fork "${capture_dir}" --count 1 --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
-child_dir="$(find "${fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort | head -n 1)"
-[[ -n "${child_dir}" ]] || die "fork did not create a child spore"
+children=()
+while IFS= read -r child; do
+  children+=("${child}")
+done < <(find "${fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort)
+[[ "${#children[@]}" -eq 1 ]] || die "fork did not create one child spore"
+child_dir="${children[0]}"
 
 "${spore_bin}" resume --events=jsonl --backend "${backend}" "${child_dir}" >"${resume_stdout}" 2>"${resume_stderr}" &
 resume_pid="$!"
@@ -155,6 +162,30 @@ grep -Fq '"memory_restore_reason":"proof_valid"' "${resume_stdout}" || die "spor
   -- /bin/true \
   >"${from_base_stdout}" 2>"${from_base_stderr}"
 [[ -f "${from_base_dir}/manifest.json" ]] || die "run --from base capture did not write ${from_base_dir}/manifest.json"
+
+"${spore_bin}" fork "${from_base_dir}" --count 1 --out "${from_base_fork_dir}" >"${workdir}/from-base-fork.stdout" 2>"${workdir}/from-base-fork.stderr"
+from_child_dir="$(find "${from_base_fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort | head -n 1)"
+[[ -n "${from_child_dir}" ]] || die "forked run --from base did not create a child spore"
+
+"${spore_bin}" run \
+  --backend "${backend}" \
+  --from "${from_child_dir}" \
+  -- /bin/gencheck \
+  >"${from_child_stdout}" 2>"${from_child_stderr}" || {
+  cat "${from_child_stdout}" >&2 || true
+  cat "${from_child_stderr}" >&2 || true
+  die "forked spore run --from generation check failed"
+}
+grep -Fq "spore generation ready " "${from_child_stdout}" || {
+  cat "${from_child_stdout}" >&2 || true
+  cat "${from_child_stderr}" >&2 || true
+  die "forked spore run --from did not start after generation metadata"
+}
+grep -Fq "entropy_len=32" "${from_child_stdout}" || {
+  cat "${from_child_stdout}" >&2 || true
+  cat "${from_child_stderr}" >&2 || true
+  die "forked spore run --from did not expose resume entropy"
+}
 
 "${spore_bin}" --debug run \
   --backend "${backend}" \

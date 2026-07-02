@@ -51,7 +51,7 @@ trap 'rm -rf "${workdir}"' EXIT
 mkdir -p "${workdir}/root/bin" "${workdir}/root/dev" "${workdir}/root/proc" "${workdir}/root/run" "${workdir}/root/tmp"
 
 source_dir="${REPO_ROOT}/guest/minimal-initrd"
-sources=(agent true false writeout sleeper finite counter nproc netcheck nslookup wget flockcheck cgroupcheck)
+sources=(agent true false writeout sleeper finite counter nproc gencheck netcheck nslookup wget flockcheck cgroupcheck)
 for src in "${sources[@]}"; do
   if [[ ! -f "${source_dir}/${src}.c" ]]; then
     echo "error: missing minimal initrd source: ${source_dir}/${src}.c" >&2
@@ -73,12 +73,13 @@ compile_static sleeper "${workdir}/root/bin/sleeper"
 compile_static finite "${workdir}/root/bin/finite"
 compile_static counter "${workdir}/root/bin/counter"
 compile_static nproc "${workdir}/root/bin/nproc"
+compile_static gencheck "${workdir}/root/bin/gencheck"
 compile_static netcheck "${workdir}/root/bin/netcheck"
 compile_static nslookup "${workdir}/root/bin/nslookup"
 compile_static wget "${workdir}/root/bin/wget"
 compile_static flockcheck "${workdir}/root/bin/flockcheck"
 compile_static cgroupcheck "${workdir}/root/bin/cgroupcheck"
-chmod 0755 "${workdir}/root/init" "${workdir}/root/bin/true" "${workdir}/root/bin/false" "${workdir}/root/bin/writeout" "${workdir}/root/bin/sleeper" "${workdir}/root/bin/finite" "${workdir}/root/bin/counter" "${workdir}/root/bin/nproc" "${workdir}/root/bin/netcheck" "${workdir}/root/bin/nslookup" "${workdir}/root/bin/wget" "${workdir}/root/bin/flockcheck" "${workdir}/root/bin/cgroupcheck"
+chmod 0755 "${workdir}/root/init" "${workdir}/root/bin/true" "${workdir}/root/bin/false" "${workdir}/root/bin/writeout" "${workdir}/root/bin/sleeper" "${workdir}/root/bin/finite" "${workdir}/root/bin/counter" "${workdir}/root/bin/nproc" "${workdir}/root/bin/gencheck" "${workdir}/root/bin/netcheck" "${workdir}/root/bin/nslookup" "${workdir}/root/bin/wget" "${workdir}/root/bin/flockcheck" "${workdir}/root/bin/cgroupcheck"
 chmod 1777 "${workdir}/root/tmp"
 
 mkdir -p "$(dirname "${out}")"

@@ -644,34 +644,54 @@ static void mmio_write32(volatile uint8_t *base, unsigned offset, uint32_t value
   *p = value;
 }
 
-static void apply_generation_identity(const char *params) {
-  char hostname[128];
-  if (parse_string_field(params, "hostname", hostname, sizeof(hostname)) > 0 && hostname[0] != '\0') {
-    (void)sethostname(hostname, strlen(hostname));
-  }
-  uint64_t resume_time_unix_ns = 0;
-  if (parse_u64_field(params, "resume_time_unix_ns", &resume_time_unix_ns) > 0) {
-    apply_resume_clock(resume_time_unix_ns);
-  }
+static int mix_resume_entropy(const char *params) {
+  char entropy_seed[80];
+  int rc = parse_string_field(params, "resume_entropy_seed", entropy_seed, sizeof(entropy_seed));
+  if (rc < 0) return -1;
+  if (rc == 0 || entropy_seed[0] == '\0') return 0;
+
+  if (mknod("/dev/urandom", S_IFCHR | 0600, makedev(1, 9)) != 0 && errno != EEXIST) return -1;
+  int fd = open("/dev/urandom", O_WRONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  int write_rc = write_all(fd, entropy_seed, strlen(entropy_seed));
+  if (close(fd) != 0) write_rc = -1;
+  return write_rc;
 }
 
-static void poll_generation(struct generation_monitor *monitor, const char *root) {
-  if (monitor->unavailable) return;
+static int apply_generation_identity(const char *params) {
+  char hostname[128];
+  int hostname_rc = parse_string_field(params, "hostname", hostname, sizeof(hostname));
+  if (hostname_rc < 0) return -1;
+  if (hostname_rc > 0 && hostname[0] != '\0') {
+    (void)sethostname(hostname, strlen(hostname));
+  }
+  if (mix_resume_entropy(params) != 0) return -1;
+  uint64_t resume_time_unix_ns = 0;
+  int resume_time_rc = parse_u64_field(params, "resume_time_unix_ns", &resume_time_unix_ns);
+  if (resume_time_rc < 0) return -1;
+  if (resume_time_rc > 0) {
+    apply_resume_clock(resume_time_unix_ns);
+  }
+  return 0;
+}
+
+static int poll_generation(struct generation_monitor *monitor, const char *root) {
+  if (monitor->unavailable) return 0;
   if (monitor->base == NULL) {
     monitor->base = generation_map();
     if (monitor->base == NULL) {
       monitor->unavailable = 1;
-      return;
+      return 0;
     }
   }
 
-  if (mmio_read32(monitor->base, REG_MAGIC) != GEN_MAGIC) return;
+  if (mmio_read32(monitor->base, REG_MAGIC) != GEN_MAGIC) return 0;
   uint32_t params_offset = mmio_read32(monitor->base, REG_PARAMS_OFFSET);
   uint32_t params_size = mmio_read32(monitor->base, REG_PARAMS_SIZE);
-  if (params_offset >= GEN_WINDOW_SIZE || params_size > GEN_WINDOW_SIZE - params_offset) return;
+  if (params_offset >= GEN_WINDOW_SIZE || params_size > GEN_WINDOW_SIZE - params_offset) return 0;
 
   uint64_t generation = mmio_read64(monitor->base, REG_GENERATION);
-  if (generation == monitor->last_generation) return;
+  if (generation == monitor->last_generation) return 0;
 
   char params[GEN_PARAMS_MAX];
   size_t limit = params_size;
@@ -682,15 +702,39 @@ static void poll_generation(struct generation_monitor *monitor, const char *root
     if (params[i] == '\0') break;
   }
   params[i] = '\0';
-  if (params[0] == '\0') return;
+  if (params[0] == '\0') return 0;
 
-  if (write_generation_files(root, params) == 0) {
-    uint32_t irq_status = mmio_read32(monitor->base, REG_IRQ_STATUS);
-    apply_generation_identity(params);
-    monitor->last_generation = generation;
-    if ((irq_status & GEN_IRQ_GENERATION_CHANGED) != 0) {
-      mmio_write32(monitor->base, REG_IRQ_ACK, GEN_IRQ_GENERATION_CHANGED);
+  if (write_generation_files(root, params) != 0) return -1;
+  uint32_t irq_status = mmio_read32(monitor->base, REG_IRQ_STATUS);
+  if (apply_generation_identity(params) != 0) return -1;
+  monitor->last_generation = generation;
+  if ((irq_status & GEN_IRQ_GENERATION_CHANGED) != 0) {
+    mmio_write32(monitor->base, REG_IRQ_ACK, GEN_IRQ_GENERATION_CHANGED);
+  }
+  return 0;
+}
+
+static int ensure_generation_ready(struct generation_monitor *monitor, const char *root) {
+  if (poll_generation(monitor, root) != 0) return -1;
+  return monitor->last_generation == UINT64_MAX ? -1 : 0;
+}
+
+static void ack_applied_generation(struct generation_monitor *monitor, const char *params) {
+  uint64_t applied_generation = 0;
+  int generation_rc = parse_u64_field(params, "generation", &applied_generation);
+  if (generation_rc <= 0 || monitor->unavailable) return;
+  if (monitor->base == NULL) {
+    monitor->base = generation_map();
+    if (monitor->base == NULL) {
+      monitor->unavailable = 1;
+      return;
     }
+  }
+  if (mmio_read32(monitor->base, REG_MAGIC) != GEN_MAGIC) return;
+  if (mmio_read64(monitor->base, REG_GENERATION) != applied_generation) return;
+  monitor->last_generation = applied_generation;
+  if ((mmio_read32(monitor->base, REG_IRQ_STATUS) & GEN_IRQ_GENERATION_CHANGED) != 0) {
+    mmio_write32(monitor->base, REG_IRQ_ACK, GEN_IRQ_GENERATION_CHANGED);
   }
 }
 
@@ -1172,6 +1216,7 @@ struct run_request {
   uint16_t terminal_cols;
   int memory_pressure;
   int detached;
+  int require_generation_ready;
   char generation_params[GEN_PARAMS_MAX];
   char arg_storage[MAX_ARGC][MAX_ARG_LEN];
   char *argv[MAX_ARGC + 1];
@@ -1265,7 +1310,7 @@ static int parse_request(const char *req, struct run_request *out) {
   if (resume_time_rc < 0) return -1;
   if (resume_time_rc > 0) out->resume_time_unix_ns = resume_time_unix_ns;
 
-  if (out->kind == REQUEST_GENERATION || out->kind == REQUEST_ATTACH) {
+  if (out->kind == REQUEST_GENERATION || out->kind == REQUEST_ATTACH || out->kind == REQUEST_START) {
     int params_rc = parse_string_field(req, "params_json", out->generation_params, sizeof(out->generation_params));
     if (out->kind == REQUEST_GENERATION && params_rc <= 0) return -1;
     if (params_rc < 0) return -1;
@@ -1308,6 +1353,10 @@ static int parse_request(const char *req, struct run_request *out) {
     int detached_rc = parse_bool_field(req, "detached", &detached);
     if (detached_rc < 0) return -1;
     if (detached_rc > 0) out->detached = detached;
+    int require_generation_ready = 0;
+    int generation_ready_rc = parse_bool_field(req, "require_generation_ready", &require_generation_ready);
+    if (generation_ready_rc < 0) return -1;
+    if (generation_ready_rc > 0) out->require_generation_ready = require_generation_ready;
     if (out->protocol_v1) {
       if (out->detached) return -1;
     }
@@ -2107,7 +2156,14 @@ static void maybe_send_memory_pressure(struct session *session, struct client *c
   }
 }
 
-static void accept_request(int listener, struct session *session, struct client *client, struct detached_children *detached, int use_rootfs, int rootfs_ready, const char *rootfs_error, int network_requested, int network_ready, const char *network_error) {
+static const char *apply_request_generation(struct generation_monitor *generation, const char *root, const char *params) {
+  if (write_generation_files(root, params) != 0) return "spore run: generation helper write failed\n";
+  if (apply_generation_identity(params) != 0) return "spore run: generation helper apply failed\n";
+  ack_applied_generation(generation, params);
+  return NULL;
+}
+
+static void accept_request(int listener, struct session *session, struct client *client, struct detached_children *detached, struct generation_monitor *generation, const char *generation_root, int use_rootfs, int rootfs_ready, const char *rootfs_error, int network_requested, int network_ready, const char *network_error) {
   int conn = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
   if (conn < 0) {
     if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -2147,12 +2203,12 @@ static void accept_request(int listener, struct session *session, struct client 
       return;
     }
     const char *root = generation_root_path(use_rootfs, rootfs_ready);
-    if (write_generation_files(root, request.generation_params) != 0) {
-      (void)send_client_error_exit(client, 126, "spore run: generation helper write failed\n");
+    const char *generation_error = apply_request_generation(generation, root, request.generation_params);
+    if (generation_error != NULL) {
+      (void)send_client_error_exit(client, 126, generation_error);
       close_client(client);
       return;
     }
-    apply_generation_identity(request.generation_params);
     (void)send_exit_frame(client->fd, 0);
     close_client(client);
     return;
@@ -2166,6 +2222,19 @@ static void accept_request(int listener, struct session *session, struct client 
     }
     if (network_requested && !network_ready) {
       (void)send_client_error_exit(client, 126, network_error[0] != '\0' ? network_error : "spore run: network unavailable\n");
+      close_client(client);
+      return;
+    }
+    if (request.generation_params[0] != '\0') {
+      const char *root = generation_root_path(use_rootfs, rootfs_ready);
+      const char *generation_error = apply_request_generation(generation, root, request.generation_params);
+      if (generation_error != NULL) {
+        (void)send_client_error_exit(client, 126, generation_error);
+        close_client(client);
+        return;
+      }
+    } else if (request.require_generation_ready && ensure_generation_ready(generation, generation_root) != 0) {
+      (void)send_client_error_exit(client, 126, "spore run: generation metadata unavailable\n");
       close_client(client);
       return;
     }
@@ -2220,12 +2289,12 @@ static void accept_request(int listener, struct session *session, struct client 
       return;
     }
     const char *root = generation_root_path(use_rootfs, rootfs_ready);
-    if (write_generation_files(root, request.generation_params) != 0) {
-      (void)send_client_error_exit(client, 126, "spore run: generation helper write failed\n");
+    const char *generation_error = apply_request_generation(generation, root, request.generation_params);
+    if (generation_error != NULL) {
+      (void)send_client_error_exit(client, 126, generation_error);
       close_client(client);
       return;
     }
-    apply_generation_identity(request.generation_params);
   }
   if (request.protocol_v1) {
     if (request.stdin_enabled) {
@@ -2333,7 +2402,7 @@ int main(void) {
   for (;;) {
     reap_detached_children(&detached);
     if (!use_rootfs || rootfs_ready) {
-      poll_generation(&generation, generation_root);
+      (void)poll_generation(&generation, generation_root);
     }
     if (session.file_stdio && !session.exited) {
       pump_session_file(&session, &client, 1);
@@ -2392,7 +2461,7 @@ int main(void) {
       for (nfds_t i = 0; i < nfds; i++) {
         if (fds[i].revents == 0) continue;
         if (roles[i] == 0 && (fds[i].revents & POLLIN)) {
-          accept_request(listener, &session, &client, &detached, use_rootfs, rootfs_ready, rootfs_error, use_network, network_ready, network_error);
+          accept_request(listener, &session, &client, &detached, &generation, generation_root, use_rootfs, rootfs_ready, rootfs_error, use_network, network_ready, network_error);
         } else if (roles[i] == 1) {
           if (fds[i].revents & POLLIN) {
             pump_client_v1(&session, &client);

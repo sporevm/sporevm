@@ -22,6 +22,8 @@ supports `-qO-` and streams bounded response bodies to stdout.
 Docker and containerd metadata databases.
 `cgroupcheck.c` verifies the cgroup2 mount behavior Docker expects before daemon
 startup.
+`gencheck.c` verifies forked `spore run --from` commands start after generation
+metadata and resume entropy are visible in `/run/sporevm/env`.
 
 Keep this directory source-only. `scripts/make-minimal-exec-initrd.sh` owns
 compiling these files into static aarch64 binaries and packing the initrd.

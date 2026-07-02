@@ -9,6 +9,7 @@ const std = @import("std");
 const bundle = @import("bundle.zig");
 const contracts = @import("contracts.zig");
 const context_mod = @import("context.zig");
+const generation = @import("generation.zig");
 const lifecycle = @import("lifecycle.zig");
 const local_paths = @import("local_paths.zig");
 const memory_config = @import("memory.zig");
@@ -848,6 +849,16 @@ pub fn runFromSpore(
     const network_options = try run_mod.networkOptionsFromManifestWithBindings(arena, if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network, options.bound_services);
     const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else options.vcpus;
     if (manifest_v1 != null and options.vcpus != 1 and options.vcpus != manifest_vcpus) return error.PlatformMismatch;
+    const manifest_generation = if (manifest) |parsed| parsed.value.generation else manifest_v1.?.value.generation;
+    var resume_generation: ?generation.State = null;
+    var start_generation_params: ?[]const u8 = null;
+    if (manifest_generation.params_b64.len != 0) {
+        var gen_dev = generation.Device{};
+        try gen_dev.restore(arena, manifest_generation);
+        try spore.refreshResumeParams(arena, &gen_dev);
+        resume_generation = try gen_dev.capture(arena);
+        start_generation_params = try arena.dupe(u8, gen_dev.paramsPayload());
+    }
 
     return run_mod.execute(context, arena, .{
         .backend = options.backend,
@@ -857,6 +868,9 @@ pub fn runFromSpore(
         .rootfs = rootfs,
         .disk = disk,
         .resume_dir = options.spore_dir,
+        .resume_generation = resume_generation,
+        .start_generation_params = start_generation_params,
+        .require_generation_ready = start_generation_params != null,
         .command = options.command,
         .interactive = options.interactive,
         .tty = options.tty,

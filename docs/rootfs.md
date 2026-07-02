@@ -251,6 +251,12 @@ batch, parallel fields, and `SPORE_GENERATION > SPORE_PARENT_GENERATION`.
 Harnesses that can read the child manifest can compare the exact expected
 generation.
 
+The guest agent mixes the resume-time entropy seed into the kernel RNG before a
+forked `spore run --from` command starts. Live-forked processes can still carry
+process-local RNG state copied from the parent, so entropy-sensitive workloads
+must reexec, reseed their own runtime, or wait behind an application-level
+after-restore hook before generating secrets.
+
 Validate the tag-to-rootfs-to-run path with the local smoke script:
 
 ```bash
