@@ -58,6 +58,21 @@ TTI profiles default to `--memory 512mb` so startup comparisons measure the hot
 launch path rather than the first-slice `auto` memory contract. Pass
 `--memory auto` when intentionally measuring the 16GiB automatic-memory path.
 
+## CI Defaults
+
+CI benchmark builds (`scripts/ci-buildkite-benchmarks.sh`, triggered from the
+main pipeline) default to `public.ecr.aws/docker/library/node:22-alpine` with
+the suite's default `node -v` first command, on every branch. This keeps the
+published trends like-for-like with the public
+[ComputeSDK sandbox TTI benchmark](https://www.computesdk.com/benchmarks/sandboxes/)
+(node runtime, `node -v` as the timed first command) while sourcing the image
+from the AWS public ECR mirror of Docker Official Images instead of Docker Hub,
+which rate-limits anonymous CI pulls. Main builds run the `comparison` profile;
+other branches run `ci`. The `full` profile is the exact public shape (100
+iterations, sequential/staggered/burst) and is intended for scheduled or manual
+runs rather than per-merge builds. Override with `SPOREVM_BENCHMARK_IMAGE`,
+`SPOREVM_BENCHMARK_COMMAND`, and `SPOREVM_BENCHMARK_PROFILE`.
+
 ## Benchmarks
 
 ### Cold TTI
