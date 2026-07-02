@@ -596,6 +596,7 @@ spore_free_string(context, json);
 
 Set `SPOREVM_RUNTIME_DIR`, cache roots, and similar process settings with
 `spore_context_set_env` before calling lifecycle functions.
+Named lifecycle monitor subprocesses inherit the context environment.
 
 ## Go Binding
 
