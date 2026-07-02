@@ -25,7 +25,9 @@ pub const Options = struct {
 
 pub const RuntimeDisk = struct {
     allocator: ?std.mem.Allocator = null,
-    trace_path: ?[:0]const u8 = null,
+    /// Owned trace fd, opened once from SPOREVM_ROOTFS_TRACE (O_APPEND) so
+    /// per-read trace events do not pay an open/close each.
+    trace_fd: ?std.c.fd_t = null,
     rootfs_fd: ?std.c.fd_t = null,
     cas_rootfs: ?*rootfs_cas.CasBlockSource = null,
     overlay: ?disk_layer.TempOverlay = null,
@@ -56,23 +58,21 @@ pub const RuntimeDisk = struct {
             source.deinit();
             if (self.allocator) |alloc| alloc.destroy(source);
         }
-        if (self.trace_path) |path| {
-            if (self.allocator) |alloc| alloc.free(path);
-        }
+        if (self.trace_fd) |fd| _ = std.c.close(fd);
         self.* = .{};
     }
 
     fn baseSource(self: *RuntimeDisk, size: u64) !block_source.BlockSource {
         if (self.cas_rootfs) |source| return .{ .cas = source };
         const fd = self.rootfs_fd orelse return error.BadManifest;
-        return block_source.FileBlockSource.initWithTrace(fd, size, self.trace_path).source();
+        return block_source.FileBlockSource.initWithTrace(fd, size, self.trace_fd).source();
     }
 };
 
 pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !RuntimeDisk {
     var runtime = RuntimeDisk{ .allocator = allocator };
     errdefer runtime.deinit();
-    runtime.trace_path = try rootfsTracePath(context, allocator);
+    runtime.trace_fd = try openRootfsTraceFd(context, allocator);
 
     if (options.rootfs) |rootfs| {
         if (rootfs.storage != null) {
@@ -82,15 +82,15 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             // command time. The chunked CAS source remains the fallback for
             // spores whose flat artifact was never materialized locally,
             // such as chunk-only pulls.
-            if (try openCachedFlatRootfs(context, allocator, rootfs, runtime.trace_path)) |fd| {
+            if (try openCachedFlatRootfs(context, allocator, rootfs, runtime.trace_fd)) |fd| {
                 runtime.rootfs_fd = fd;
                 std.log.debug("runtime disk rootfs base: flat artifact {s}", .{rootfs.artifact.digest});
             } else {
-                runtime.cas_rootfs = try openManifestCasRootfs(context, allocator, rootfs, runtime.trace_path);
+                runtime.cas_rootfs = try openManifestCasRootfs(context, allocator, rootfs, runtime.trace_fd);
                 std.log.debug("runtime disk rootfs base: cas chunks {s}", .{rootfs.artifact.digest});
             }
         } else {
-            runtime.rootfs_fd = try openTrustedRootfs(context, allocator, rootfs, runtime.trace_path);
+            runtime.rootfs_fd = try openTrustedRootfs(context, allocator, rootfs, runtime.trace_fd);
         }
     } else {
         runtime.rootfs_fd = try openRootfsDisk(allocator, options.rootfs_path);
@@ -138,13 +138,13 @@ fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.
     return fd;
 }
 
-fn openTrustedRootfs(context: Context, allocator: std.mem.Allocator, rootfs: spore.Rootfs, trace_path: ?[:0]const u8) !std.c.fd_t {
+fn openTrustedRootfs(context: Context, allocator: std.mem.Allocator, rootfs: spore.Rootfs, trace_fd: ?std.c.fd_t) !std.c.fd_t {
     const cache_root = try rootfsCacheRootPath(context, allocator);
     defer allocator.free(cache_root);
     const start_ms = monotonicMs();
     const fd = try rootfs_cache.openTrustedFromCache(context.io, allocator, cache_root, rootfs);
-    if (trace_path) |path| {
-        appendRootfsTrace(allocator, path, rootfs, monotonicMs() -| start_ms) catch {};
+    if (trace_fd) |trace| {
+        appendRootfsTrace(allocator, trace, rootfs, monotonicMs() -| start_ms) catch {};
     }
     return fd;
 }
@@ -152,8 +152,8 @@ fn openTrustedRootfs(context: Context, allocator: std.mem.Allocator, rootfs: spo
 /// Best-effort open of the flat digest-addressed artifact for a chunked
 /// rootfs. Returns null when the artifact is not usable so callers can fall
 /// back to the fully verified CAS chunk source instead of failing the run.
-fn openCachedFlatRootfs(context: Context, allocator: std.mem.Allocator, rootfs: spore.Rootfs, trace_path: ?[:0]const u8) !?std.c.fd_t {
-    return openTrustedRootfs(context, allocator, rootfs, trace_path) catch |err| switch (err) {
+fn openCachedFlatRootfs(context: Context, allocator: std.mem.Allocator, rootfs: spore.Rootfs, trace_fd: ?std.c.fd_t) !?std.c.fd_t {
+    return openTrustedRootfs(context, allocator, rootfs, trace_fd) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => null,
     };
@@ -163,13 +163,13 @@ fn openManifestCasRootfs(
     context: Context,
     allocator: std.mem.Allocator,
     rootfs: spore.Rootfs,
-    trace_path: ?[:0]const u8,
+    trace_fd: ?std.c.fd_t,
 ) !*rootfs_cas.CasBlockSource {
     const cache_root = try rootfsCacheRootPath(context, allocator);
     defer allocator.free(cache_root);
     const source = try allocator.create(rootfs_cas.CasBlockSource);
     errdefer allocator.destroy(source);
-    source.* = try rootfs_cas.CasBlockSource.openManifest(allocator, cache_root, rootfs, trace_path);
+    source.* = try rootfs_cas.CasBlockSource.openManifest(allocator, cache_root, rootfs, trace_fd);
     return source;
 }
 
@@ -180,15 +180,19 @@ fn rootfsCacheRootPath(context: Context, allocator: std.mem.Allocator) ![]const 
     };
 }
 
-fn rootfsTracePath(context: Context, allocator: std.mem.Allocator) !?[:0]const u8 {
+fn openRootfsTraceFd(context: Context, allocator: std.mem.Allocator) !?std.c.fd_t {
     const path = context.environ_map.get(rootfs_trace_env) orelse return null;
     if (path.len == 0) return null;
-    return try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
+    if (fd < 0) return null;
+    return fd;
 }
 
 fn appendRootfsTrace(
     allocator: std.mem.Allocator,
-    path: [:0]const u8,
+    fd: std.c.fd_t,
     rootfs: spore.Rootfs,
     elapsed_ms: u64,
 ) !void {
@@ -198,9 +202,6 @@ fn appendRootfsTrace(
         .{ rootfs.artifact.digest, rootfs.artifact.size, elapsed_ms },
     );
     defer allocator.free(line);
-    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
-    if (fd < 0) return;
-    defer _ = std.c.close(fd);
     fd_util.writeAllBestEffort(fd, line);
 }
 

@@ -37,7 +37,9 @@ pub const FileBlockSource = struct {
     /// and fd lifetime.
     fd: std.c.fd_t,
     size: u64,
-    trace_path: ?[:0]const u8 = null,
+    /// Non-owning trace fd opened once by the runtime (O_APPEND). Kept open
+    /// so per-read tracing does not pay an open/close per guest block read.
+    trace_fd: ?std.c.fd_t = null,
 
     pub fn init(fd: std.c.fd_t, size: u64) FileBlockSource {
         return .{
@@ -46,11 +48,11 @@ pub const FileBlockSource = struct {
         };
     }
 
-    pub fn initWithTrace(fd: std.c.fd_t, size: u64, trace_path: ?[:0]const u8) FileBlockSource {
+    pub fn initWithTrace(fd: std.c.fd_t, size: u64, trace_fd: ?std.c.fd_t) FileBlockSource {
         return .{
             .fd = fd,
             .size = size,
-            .trace_path = trace_path,
+            .trace_fd = trace_fd,
         };
     }
 
@@ -75,17 +77,13 @@ pub const FileBlockSource = struct {
             if (n <= 0) return error.ShortRead;
             done += @intCast(n);
         }
-        if (self.trace_path) |trace_path| {
-            appendTraceRead(trace_path, offset, buf.len, monotonicMs() -| start_ms);
+        if (self.trace_fd) |trace_fd| {
+            appendTraceRead(trace_fd, offset, buf.len, monotonicMs() -| start_ms);
         }
     }
 };
 
-fn appendTraceRead(path: [:0]const u8, offset: u64, len: usize, elapsed_ms: u64) void {
-    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
-    if (fd < 0) return;
-    defer _ = std.c.close(fd);
-
+fn appendTraceRead(fd: std.c.fd_t, offset: u64, len: usize, elapsed_ms: u64) void {
     var line_buf: [256]u8 = undefined;
     const line = std.fmt.bufPrint(
         &line_buf,

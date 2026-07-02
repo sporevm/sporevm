@@ -83,14 +83,16 @@ pub const CasBlockSource = struct {
     index: LoadedIndex,
     object_dir: []const u8,
     verified: []?[]u8,
-    trace_path: ?[:0]const u8 = null,
+    /// Non-owning trace fd opened once by the runtime (O_APPEND). Kept open
+    /// so per-read tracing does not pay an open/close per guest block read.
+    trace_fd: ?std.c.fd_t = null,
     stats: Stats = .{},
 
     pub fn openManifest(
         allocator: std.mem.Allocator,
         cache_root: []const u8,
         rootfs: spore.Rootfs,
-        trace_path: ?[:0]const u8,
+        trace_fd: ?std.c.fd_t,
     ) !CasBlockSource {
         const storage = rootfs.storage orelse return error.BadManifest;
         if (!std.mem.eql(u8, rootfs.artifact.format, spore.rootfs_artifact_format_ext4)) return error.BadManifest;
@@ -100,7 +102,7 @@ pub const CasBlockSource = struct {
         defer allocator.free(path);
         const start_ms = monotonicMs();
         const index = try loadManifestIndex(allocator, path, storage);
-        if (trace_path) |trace| appendIndexOpenTrace(trace, storage, index, monotonicMs() -| start_ms);
+        if (trace_fd) |trace| appendIndexOpenTrace(trace, storage, index, monotonicMs() -| start_ms);
         errdefer {
             var mutable_index = index;
             mutable_index.deinit(allocator);
@@ -114,7 +116,7 @@ pub const CasBlockSource = struct {
             .index = index,
             .object_dir = object_dir,
             .verified = verified,
-            .trace_path = trace_path,
+            .trace_fd = trace_fd,
         };
     }
 
@@ -158,8 +160,8 @@ pub const CasBlockSource = struct {
             }
             cursor += span_len;
         }
-        if (self.trace_path) |path| {
-            appendTraceRead(path, offset, buf.len, monotonicMs() -| start_ms);
+        if (self.trace_fd) |fd| {
+            appendTraceRead(fd, offset, buf.len, monotonicMs() -| start_ms);
         }
     }
 
@@ -189,10 +191,7 @@ pub const CasBlockSource = struct {
     }
 
     fn appendStatsTrace(self: CasBlockSource) void {
-        const trace_path = self.trace_path orelse return;
-        const fd = std.c.open(trace_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
-        if (fd < 0) return;
-        defer _ = std.c.close(fd);
+        const fd = self.trace_fd orelse return;
         var line_buf: [512]u8 = undefined;
         const line = std.fmt.bufPrint(
             &line_buf,
@@ -656,10 +655,7 @@ fn ensureDirPath(io: Io, path: []const u8) !void {
     existing.close(io);
 }
 
-fn appendTraceRead(path: [:0]const u8, offset: u64, len: usize, elapsed_ms: u64) void {
-    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
-    if (fd < 0) return;
-    defer _ = std.c.close(fd);
+fn appendTraceRead(fd: std.c.fd_t, offset: u64, len: usize, elapsed_ms: u64) void {
     var line_buf: [256]u8 = undefined;
     const line = std.fmt.bufPrint(
         &line_buf,
@@ -670,14 +666,11 @@ fn appendTraceRead(path: [:0]const u8, offset: u64, len: usize, elapsed_ms: u64)
 }
 
 fn appendIndexOpenTrace(
-    path: [:0]const u8,
+    fd: std.c.fd_t,
     storage: spore.RootfsStorage,
     index: LoadedIndex,
     elapsed_ms: u64,
 ) void {
-    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
-    if (fd < 0) return;
-    defer _ = std.c.close(fd);
     var line_buf: [1024]u8 = undefined;
     const line = std.fmt.bufPrint(
         &line_buf,
@@ -722,11 +715,14 @@ test "preload builds an index and cached source verifies chunks once" {
 
     const trace_path = tmp ++ "/cas-trace.jsonl";
     const trace_path_z = try arena.dupeZ(u8, trace_path);
+    const trace_fd = std.c.open(trace_path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
+    try std.testing.expect(trace_fd >= 0);
+    defer _ = std.c.close(trace_fd);
     var source = try CasBlockSource.openManifest(allocator, cache_root, .{
         .device = .{ .mmio_slot = 1 },
         .artifact = artifact,
         .storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
-    }, trace_path_z);
+    }, trace_fd);
     defer source.deinit();
 
     var readback: [4]u8 = undefined;
