@@ -29,9 +29,9 @@ That converts `latest-summary.json` into:
 The JavaScript artifact assigns `window.SPOREVM_BENCHMARK_DATA`, so a static
 page can render the latest run plus any retained history without learning the
 runner's raw artifact layout. The homepage summary assigns
-`window.SPOREVM_HOMEPAGE_BENCHMARK_DATA` and contains only the latest selected
-runner, cold/warm/warm-burst medians, success rate, build metadata, available
-runner labels, and recent warm-child median points.
+`window.SPOREVM_HOMEPAGE_BENCHMARK_DATA` and contains a small homepage-focused
+projection: public runner labels, default-runner latest metrics/history, and
+per-runner latest metrics/history for the public macOS and Linux ARM64 options.
 
 ## Profiles
 

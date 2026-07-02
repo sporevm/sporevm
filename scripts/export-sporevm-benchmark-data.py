@@ -364,19 +364,54 @@ def runner_queue(run: dict[str, object]) -> str:
     return str(runner.get("queue") or "")
 
 
+def has_homepage_metrics(run: dict[str, object]) -> bool:
+    return (
+        result_value(run, "warm_spore_tti/sequential") is not None
+        and result_value(run, "cold_tti/sequential") is not None
+        and result_value(run, "warm_spore_tti/burst") is not None
+    )
+
+
+def homepage_latest(run: dict[str, object], arch: str) -> dict[str, object]:
+    runner = run.get("runner") if isinstance(run.get("runner"), dict) else {}
+    build = run.get("build") if isinstance(run.get("build"), dict) else {}
+    commit = run.get("commit") if isinstance(run.get("commit"), dict) else {}
+    config = run.get("config") if isinstance(run.get("config"), dict) else {}
+    warm = result_by_name(run, "warm_spore_tti/sequential")
+    return {
+        "arch": arch,
+        "build_number": build.get("number") or runner.get("build_number"),
+        "build_url": build.get("url") or runner.get("build_url"),
+        "backend": runner.get("backend") or config.get("backend"),
+        "profile": runner.get("profile") or config.get("profile"),
+        "commit_sha": commit.get("sha"),
+        "generated_at": run.get("generated_at"),
+        "warm_ms": result_value(run, "warm_spore_tti/sequential"),
+        "cold_ms": result_value(run, "cold_tti/sequential"),
+        "warm_burst_ms": result_value(run, "warm_spore_tti/burst"),
+        "success_rate": warm.get("success_rate") if warm else None,
+    }
+
+
 def build_homepage_summary(data: dict[str, object]) -> dict[str, object]:
     runs = [run for run in data.get("runs", []) if isinstance(run, dict)]
-    arches = sorted({runner_queue(run) for run in runs if runner_queue(run)})
-    latest = next(
-        (
-            run for run in reversed(runs)
-            if result_value(run, "warm_spore_tti/sequential") is not None
-            and result_value(run, "cold_tti/sequential") is not None
-            and result_value(run, "warm_spore_tti/burst") is not None
-        ),
-        None,
-    )
-    default_arch = runner_queue(latest) if latest is not None else (arches[0] if arches else "")
+    public_arches = sorted({runner_queue(run) for run in runs if runner_queue(run) in RUNNER_LABELS})
+    if public_arches:
+        arches = public_arches
+    else:
+        arches = sorted({runner_queue(run) for run in runs if runner_queue(run)})
+
+    latest_by_arch: dict[str, dict[str, object]] = {}
+    for run in reversed(runs):
+        arch = runner_queue(run)
+        if not arch or arch not in arches or arch in latest_by_arch or not has_homepage_metrics(run):
+            continue
+        latest_by_arch[arch] = homepage_latest(run, arch)
+
+    latest = next((run for run in reversed(runs) if has_homepage_metrics(run)), None)
+    latest_arch = next((runner_queue(run) for run in reversed(runs) if runner_queue(run) in latest_by_arch), "")
+    default_arch = latest_arch or (arches[0] if arches else "")
+    warm_history_by_arch: dict[str, list[dict[str, object]]] = {}
     warm_history: list[dict[str, object]] = []
     for series in data.get("series", []):
         if not isinstance(series, dict):
@@ -384,10 +419,11 @@ def build_homepage_summary(data: dict[str, object]) -> dict[str, object]:
         if series.get("result_name") != "warm_spore_tti/sequential":
             continue
         runner = series.get("runner") if isinstance(series.get("runner"), dict) else {}
-        if default_arch and runner.get("queue") != default_arch:
+        arch = str(runner.get("queue") or "")
+        if arches and arch not in arches:
             continue
         points = [point for point in series.get("points", []) if isinstance(point, dict)]
-        warm_history = [
+        history = [
             {
                 "build_number": point.get("build_number"),
                 "value": point.get("value"),
@@ -395,35 +431,19 @@ def build_homepage_summary(data: dict[str, object]) -> dict[str, object]:
             }
             for point in points[-HOMEPAGE_HISTORY_LIMIT:]
         ]
-        break
+        if arch in arches:
+            warm_history_by_arch[arch] = history
+        if arch == default_arch or (not arches and not arch):
+            warm_history = history
 
     summary: dict[str, object] = {
         "updated_at": data.get("updated_at"),
         "default_arch": default_arch,
         "arches": [{"key": key, "label": RUNNER_LABELS.get(key, key)} for key in arches],
-        "latest": None,
+        "latest": latest_by_arch.get(default_arch) if default_arch else (homepage_latest(latest, "") if latest else None),
+        "latest_by_arch": latest_by_arch,
         "warm_history": warm_history,
-    }
-    if latest is None:
-        return summary
-
-    runner = latest.get("runner") if isinstance(latest.get("runner"), dict) else {}
-    build = latest.get("build") if isinstance(latest.get("build"), dict) else {}
-    commit = latest.get("commit") if isinstance(latest.get("commit"), dict) else {}
-    config = latest.get("config") if isinstance(latest.get("config"), dict) else {}
-    warm = result_by_name(latest, "warm_spore_tti/sequential")
-    summary["latest"] = {
-        "arch": default_arch,
-        "build_number": build.get("number") or runner.get("build_number"),
-        "build_url": build.get("url") or runner.get("build_url"),
-        "backend": runner.get("backend") or config.get("backend"),
-        "profile": runner.get("profile") or config.get("profile"),
-        "commit_sha": commit.get("sha"),
-        "generated_at": latest.get("generated_at"),
-        "warm_ms": result_value(latest, "warm_spore_tti/sequential"),
-        "cold_ms": result_value(latest, "cold_tti/sequential"),
-        "warm_burst_ms": result_value(latest, "warm_spore_tti/burst"),
-        "success_rate": warm.get("success_rate") if warm else None,
+        "warm_history_by_arch": warm_history_by_arch,
     }
     return summary
 
@@ -529,11 +549,28 @@ def self_test() -> None:
         assert homepage["latest"]["warm_burst_ms"] == 70.0
         assert homepage["warm_history"][-1]["value"] == 64.0
         partitioned = build_series([
+            {"run_id": "cleanroom", "generated_at": "2026-06-26T00:02:00Z", "runner": {"queue": "cleanroom-linux-arm64"}, "results": data["runs"][0]["results"]},
             {"run_id": "mac", "generated_at": "2026-06-26T00:00:00Z", "runner": {"queue": "sporevm-mac"}, "results": data["runs"][0]["results"]},
             {"run_id": "linux", "generated_at": "2026-06-26T00:01:00Z", "runner": {"queue": "sporevm-linux-arm64"}, "results": data["runs"][0]["results"]},
         ])
-        assert len(partitioned) == 6
+        assert len(partitioned) == 9
         assert {"Cold TTI / sequential / macOS", "Cold TTI / sequential / Linux ARM64"} <= {item["label"] for item in partitioned}
+        partitioned_homepage = build_homepage_summary({
+            "updated_at": "2026-06-26T00:02:00Z",
+            "runs": [
+                {"run_id": "mac", "generated_at": "2026-06-26T00:00:00Z", "runner": {"queue": "sporevm-mac"}, "results": data["runs"][0]["results"]},
+                {"run_id": "linux", "generated_at": "2026-06-26T00:01:00Z", "runner": {"queue": "sporevm-linux-arm64"}, "results": data["runs"][0]["results"]},
+                {"run_id": "cleanroom", "generated_at": "2026-06-26T00:02:00Z", "runner": {"queue": "cleanroom-linux-arm64"}, "results": data["runs"][0]["results"]},
+            ],
+            "series": partitioned,
+        })
+        assert {arch["key"] for arch in partitioned_homepage["arches"]} == {"sporevm-mac", "sporevm-linux-arm64"}
+        assert set(partitioned_homepage["latest_by_arch"]) == {"sporevm-mac", "sporevm-linux-arm64"}
+        assert partitioned_homepage["latest_by_arch"]["sporevm-mac"]["warm_ms"] == 64.0
+        assert partitioned_homepage["latest_by_arch"]["sporevm-linux-arm64"]["cold_ms"] == 123.0
+        assert set(partitioned_homepage["warm_history_by_arch"]) == {"sporevm-mac", "sporevm-linux-arm64"}
+        assert partitioned_homepage["latest"] == partitioned_homepage["latest_by_arch"][partitioned_homepage["default_arch"]]
+        assert partitioned_homepage["warm_history"] == partitioned_homepage["warm_history_by_arch"][partitioned_homepage["default_arch"]]
         summary["results"][0]["tti_ms"]["median"] = 111.0
         write_json(summary_path, summary)
         data = export(args)
