@@ -328,6 +328,8 @@ fn emit(ctx: ?*anyopaque, event: libspore.RunEvent) anyerror!void {
             // TTY mode merges stdout and stderr into one terminal stream.
             _ = output.bytes;
         },
+        .port_forward => |forward| _ = forward.guest_port,
+        .capture => |capture| _ = capture.capture_path,
         .exit => |exit| _ = exit.exit_code,
         else => {},
     }
@@ -342,8 +344,10 @@ const result = try libspore.runFromSpore(context, allocator, .{
 
 Event callbacks run synchronously. Output byte slices are callback-scoped; copy
 them if they must outlive the callback. TTY output arrives as `.terminal`
-events. Every run emits at most one completion event: `exit` for guest
-completion or `failure` for a SporeVM failure.
+events. Bound Unix services emit `.port_forward` setup events without durable
+host socket paths, and successful snapshots emit `.capture` before `.exit`.
+Every run emits at most one completion event: `exit` for guest completion or
+`failure` for a SporeVM failure.
 
 ## Bundles
 

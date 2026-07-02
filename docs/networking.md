@@ -80,6 +80,10 @@ spore run --from net-enabled.spore -- /bin/wget -qO- https://example.com
 Denied TCP egress can emit JSONL audit events through `--events=jsonl`. Events
 include destination, port, and denial reason, not guest payload bytes.
 
+Bound Unix services emit a setup `port_forward` event with the service name,
+guest host, guest port, and target kind. The event does not include the host
+Unix socket path.
+
 Current limits:
 
 - IPv4 TCP and DNS only.
@@ -87,7 +91,7 @@ Current limits:
 - No live flow preservation across capture, resume, or fork.
 - No per-exec policy replacement for a running named VM.
 - No TCP loopback targets, custom guest ports, multiple bound services, or
-  bound-service availability events in the CLI path.
+  per-connection bound-service availability events in the CLI path.
 
 ## Validation
 
