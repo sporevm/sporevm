@@ -29,7 +29,6 @@ pub const RuntimeDisk = struct {
     /// per-read trace events do not pay an open/close each.
     trace_fd: ?std.c.fd_t = null,
     rootfs_fd: ?std.c.fd_t = null,
-    cas_rootfs: ?*rootfs_cas.CasBlockSource = null,
     overlay: ?disk_layer.TempOverlay = null,
     cow: ?cow_disk.CowDisk = null,
     layered_cow: ?disk_layer.LayeredCowDisk = null,
@@ -54,18 +53,13 @@ pub const RuntimeDisk = struct {
         if (self.cow) |*disk| disk.deinit();
         if (self.overlay) |*overlay| overlay.deinit();
         if (self.rootfs_fd) |fd| _ = std.c.close(fd);
-        if (self.cas_rootfs) |source| {
-            source.deinit();
-            if (self.allocator) |alloc| alloc.destroy(source);
-        }
         if (self.trace_fd) |fd| _ = std.c.close(fd);
         self.* = .{};
     }
 
-    fn baseSource(self: *RuntimeDisk, size: u64) !block_source.BlockSource {
-        if (self.cas_rootfs) |source| return .{ .cas = source };
+    fn baseSource(self: *RuntimeDisk, size: u64) !block_source.FileBlockSource {
         const fd = self.rootfs_fd orelse return error.BadManifest;
-        return block_source.FileBlockSource.initWithTrace(fd, size, self.trace_fd).source();
+        return block_source.FileBlockSource.initWithTrace(fd, size, self.trace_fd);
     }
 };
 
@@ -76,18 +70,19 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
 
     if (options.rootfs) |rootfs| {
         if (rootfs.storage != null) {
-            // Prefer the flat digest-addressed ext4 artifact when the local
-            // cache has it: it serves guest reads with plain preads instead
-            // of per-chunk object opens, which dominates resume-to-first-
-            // command time. The chunked CAS source remains the fallback for
-            // spores whose flat artifact was never materialized locally,
-            // such as chunk-only pulls.
+            // The flat digest-addressed ext4 artifact is the only runtime
+            // base source. When it is not materialized locally (chunk-only
+            // pull caches, pruned or corrupt entries), assemble it once from
+            // the locally installed verified chunks; missing chunks or an
+            // artifact-digest mismatch fail the run closed.
             if (try openCachedFlatRootfs(context, allocator, rootfs, runtime.trace_fd)) |fd| {
                 runtime.rootfs_fd = fd;
                 std.log.debug("runtime disk rootfs base: flat artifact {s}", .{rootfs.artifact.digest});
             } else {
-                runtime.cas_rootfs = try openManifestCasRootfs(context, allocator, rootfs, runtime.trace_fd);
-                std.log.debug("runtime disk rootfs base: cas chunks {s}", .{rootfs.artifact.digest});
+                const materialize_start = monotonicMs();
+                try materializeFlatRootfs(context, allocator, rootfs);
+                runtime.rootfs_fd = try openTrustedRootfs(context, allocator, rootfs, runtime.trace_fd);
+                std.log.debug("runtime disk rootfs base: assembled flat artifact {s} elapsed_ms={d}", .{ rootfs.artifact.digest, monotonicMs() -| materialize_start });
             }
         } else {
             runtime.rootfs_fd = try openTrustedRootfs(context, allocator, rootfs, runtime.trace_fd);
@@ -96,7 +91,7 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         runtime.rootfs_fd = try openRootfsDisk(allocator, options.rootfs_path);
     }
 
-    if (runtime.rootfs_fd == null and runtime.cas_rootfs == null) return runtime;
+    if (runtime.rootfs_fd == null) return runtime;
 
     if (options.disk) |disk| {
         const rootfs = options.rootfs orelse return error.BadManifest;
@@ -159,18 +154,10 @@ fn openCachedFlatRootfs(context: Context, allocator: std.mem.Allocator, rootfs: 
     };
 }
 
-fn openManifestCasRootfs(
-    context: Context,
-    allocator: std.mem.Allocator,
-    rootfs: spore.Rootfs,
-    trace_fd: ?std.c.fd_t,
-) !*rootfs_cas.CasBlockSource {
+fn materializeFlatRootfs(context: Context, allocator: std.mem.Allocator, rootfs: spore.Rootfs) !void {
     const cache_root = try rootfsCacheRootPath(context, allocator);
     defer allocator.free(cache_root);
-    const source = try allocator.create(rootfs_cas.CasBlockSource);
-    errdefer allocator.destroy(source);
-    source.* = try rootfs_cas.CasBlockSource.openManifest(allocator, cache_root, rootfs, trace_fd);
-    return source;
+    try rootfs_cas.materializeFlatFromChunks(context.io, allocator, cache_root, rootfs);
 }
 
 fn rootfsCacheRootPath(context: Context, allocator: std.mem.Allocator) ![]const u8 {
@@ -308,7 +295,6 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
     defer runtime.deinit();
 
     try std.testing.expect(runtime.rootfs_fd != null);
-    try std.testing.expect(runtime.cas_rootfs == null);
     try std.testing.expect(runtime.cow != null);
     var readback: [4]u8 = undefined;
     try runtime.cow.?.readAt(&readback, 0);
@@ -319,7 +305,7 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
     try std.testing.expect(std.mem.indexOf(u8, trace_bytes, "\"event\":\"rootfs_open\"") != null);
 }
 
-test "runtime disk falls back to rootfs cas chunks when flat artifact is missing" {
+test "runtime disk assembles the flat artifact from chunks when it is missing" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -356,18 +342,16 @@ test "runtime disk falls back to rootfs cas chunks when flat artifact is missing
     });
     defer runtime.deinit();
 
-    try std.testing.expect(runtime.rootfs_fd == null);
-    try std.testing.expect(runtime.cas_rootfs != null);
+    try std.testing.expect(runtime.rootfs_fd != null);
     try std.testing.expect(runtime.cow != null);
     var readback: [4]u8 = undefined;
     try runtime.cow.?.readAt(&readback, 0);
     try std.testing.expectEqualStrings("abcd", &readback);
-    try std.testing.expectEqual(@as(u64, 1), runtime.cas_rootfs.?.stats.cache_misses);
-    try runtime.cow.?.readAt(&readback, 0);
-    try std.testing.expectEqual(@as(u64, 1), runtime.cas_rootfs.?.stats.cache_hits);
+    // The assembled flat artifact is republished into the by-digest cache.
+    try std.testing.expect(try rootfs_cache.regularFileNoSymlink(io, digest_path));
 }
 
-test "runtime disk falls back to rootfs cas chunks when flat artifact size mismatches" {
+test "runtime disk reassembles the flat artifact when the cached entry is the wrong size" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -405,12 +389,14 @@ test "runtime disk falls back to rootfs cas chunks when flat artifact size misma
     });
     defer runtime.deinit();
 
-    try std.testing.expect(runtime.rootfs_fd == null);
-    try std.testing.expect(runtime.cas_rootfs != null);
+    try std.testing.expect(runtime.rootfs_fd != null);
     try std.testing.expect(runtime.cow != null);
     var readback: [4]u8 = undefined;
     try runtime.cow.?.readAt(&readback, 0);
     try std.testing.expectEqualStrings("abcd", &readback);
+    // Rename-over publication self-healed the corrupt cache entry.
+    const healed = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(1 << 20));
+    try std.testing.expectEqual(rootfs_bytes.len, healed.len);
 }
 
 test "runtime disk manifest rootfs cas fails closed without index" {

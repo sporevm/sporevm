@@ -325,7 +325,7 @@ test "cow backend serves dirty writes without mutating base" {
     var base_bytes = [_]u8{0x11} ** (2 * sector_size);
     try base.writeStreamingAll(io, &base_bytes);
 
-    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len).source();
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
     var cow = try cow_disk.CowDisk.init(std.testing.allocator, base_source, overlay.handle, base_bytes.len, sector_size);
     defer cow.deinit();
     var blk = Blk.init(.{ .cow = &cow });

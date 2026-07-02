@@ -6,30 +6,12 @@
 
 const std = @import("std");
 const fd_util = @import("fd.zig");
-const rootfs_cas = @import("rootfs_cas.zig");
 
-pub const Error = rootfs_cas.SourceError || error{
+pub const Error = error{
     OutOfRange,
     ShortRead,
-};
-
-pub const BlockSource = union(enum) {
-    file: FileBlockSource,
-    cas: *rootfs_cas.CasBlockSource,
-
-    pub fn capacityBytes(self: BlockSource) u64 {
-        return switch (self) {
-            .file => |source| source.capacityBytes(),
-            .cas => |source| source.capacityBytes(),
-        };
-    }
-
-    pub fn readAt(self: BlockSource, buf: []u8, offset: u64) Error!void {
-        return switch (self) {
-            .file => |source| source.readAt(buf, offset),
-            .cas => |source| source.readAt(buf, offset),
-        };
-    }
+    IoFailed,
+    OutOfMemory,
 };
 
 pub const FileBlockSource = struct {
@@ -54,10 +36,6 @@ pub const FileBlockSource = struct {
             .size = size,
             .trace_fd = trace_fd,
         };
-    }
-
-    pub fn source(self: FileBlockSource) BlockSource {
-        return .{ .file = self };
     }
 
     pub fn capacityBytes(self: FileBlockSource) u64 {
@@ -110,7 +88,7 @@ test "file source reports capacity and reads ranges" {
     const bytes = [_]u8{ 0x10, 0x11, 0x12, 0x13, 0x14 };
     try file.writeStreamingAll(io, &bytes);
 
-    const source = FileBlockSource.init(file.handle, bytes.len).source();
+    const source = FileBlockSource.init(file.handle, bytes.len);
     try std.testing.expectEqual(@as(u64, bytes.len), source.capacityBytes());
 
     var readback: [3]u8 = undefined;
@@ -127,7 +105,7 @@ test "file source range checks against logical size" {
     defer file.close(io);
     try file.writeStreamingAll(io, &([_]u8{0x44} ** 4096));
 
-    const source = FileBlockSource.init(file.handle, 1024).source();
+    const source = FileBlockSource.init(file.handle, 1024);
     var buf: [1]u8 = undefined;
     try std.testing.expectError(error.OutOfRange, source.readAt(&buf, 1024));
 }

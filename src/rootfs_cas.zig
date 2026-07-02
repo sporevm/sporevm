@@ -11,6 +11,7 @@ const rootfs_index = @import("rootfs_index.zig");
 const spore = @import("spore.zig");
 
 const Io = std.Io;
+const Blake3 = std.crypto.hash.Blake3;
 
 pub const default_chunk_size: u64 = 64 * 1024;
 pub const max_index_bytes: usize = 64 * 1024 * 1024;
@@ -49,15 +50,6 @@ pub const InstallResult = struct {
     bytes_fetched: u64,
 };
 
-pub const Stats = struct {
-    chunk_accesses: u64 = 0,
-    cache_hits: u64 = 0,
-    cache_misses: u64 = 0,
-    object_opens: u64 = 0,
-    bytes_hashed: u64 = 0,
-    zero_fills: u64 = 0,
-};
-
 const LoadedIndex = struct {
     chunk_ids: []?chunk.ChunkId,
     logical_size: u64,
@@ -78,137 +70,95 @@ const LoadedIndex = struct {
     }
 };
 
-pub const CasBlockSource = struct {
+/// Assemble the flat digest-addressed ext4 artifact from locally installed
+/// chunk objects and publish it into the by-digest cache. Chunks are
+/// BLAKE3-verified against the (digest-verified) index as they are read, the
+/// assembled bytes are hashed and must equal `rootfs.artifact.digest` before
+/// publication, and the publish is an atomic rename. The artifact digest and
+/// the chunk index are separate authorities in the manifest; an inconsistent
+/// pairing fails closed here instead of poisoning the digest cache or serving
+/// different bytes depending on cache state. Rename-over publication also
+/// self-heals a corrupt or truncated existing cache entry.
+pub fn materializeFlatFromChunks(
+    io: Io,
     allocator: std.mem.Allocator,
-    index: LoadedIndex,
-    object_dir: []const u8,
-    verified: []?[]u8,
-    /// Non-owning trace fd opened once by the runtime (O_APPEND). Kept open
-    /// so per-read tracing does not pay an open/close per guest block read.
-    trace_fd: ?std.c.fd_t = null,
-    stats: Stats = .{},
+    cache_root: []const u8,
+    rootfs: spore.Rootfs,
+) !void {
+    const storage = rootfs.storage orelse return error.BadManifest;
+    if (!std.mem.eql(u8, rootfs.artifact.format, spore.rootfs_artifact_format_ext4)) return error.BadManifest;
+    if (!spore.rootfsDeviceEql(storage.device, rootfs.device)) return error.BadManifest;
+    if (storage.logical_size != rootfs.artifact.size) return error.BadManifest;
 
-    pub fn openManifest(
-        allocator: std.mem.Allocator,
-        cache_root: []const u8,
-        rootfs: spore.Rootfs,
-        trace_fd: ?std.c.fd_t,
-    ) !CasBlockSource {
-        const storage = rootfs.storage orelse return error.BadManifest;
-        if (!std.mem.eql(u8, rootfs.artifact.format, spore.rootfs_artifact_format_ext4)) return error.BadManifest;
-        if (!spore.rootfsDeviceEql(storage.device, rootfs.device)) return error.BadManifest;
-        if (storage.logical_size != rootfs.artifact.size) return error.BadManifest;
-        const path = try manifestIndexPath(allocator, cache_root, storage.index_digest);
-        defer allocator.free(path);
-        const start_ms = monotonicMs();
-        const index = try loadManifestIndex(allocator, path, storage);
-        if (trace_fd) |trace| appendIndexOpenTrace(trace, storage, index, monotonicMs() -| start_ms);
-        errdefer {
-            var mutable_index = index;
-            mutable_index.deinit(allocator);
-        }
-        const object_dir = try objectDir(allocator, cache_root);
-        errdefer allocator.free(object_dir);
-        const verified = try allocator.alloc(?[]u8, index.chunk_ids.len);
-        @memset(verified, null);
-        return .{
-            .allocator = allocator,
-            .index = index,
-            .object_dir = object_dir,
-            .verified = verified,
-            .trace_fd = trace_fd,
-        };
-    }
+    // Already materialized and shaped correctly: nothing to do.
+    if (rootfs_cache.openTrustedFromCache(io, allocator, cache_root, rootfs)) |fd| {
+        _ = std.c.close(fd);
+        return;
+    } else |_| {}
 
-    pub fn deinit(self: *CasBlockSource) void {
-        self.appendStatsTrace();
-        for (self.verified) |maybe_data| {
-            if (maybe_data) |data| self.allocator.free(data);
-        }
-        self.allocator.free(self.verified);
-        self.allocator.free(self.object_dir);
-        self.index.deinit(self.allocator);
-        self.* = undefined;
-    }
+    const index_path = try manifestIndexPath(allocator, cache_root, storage.index_digest);
+    defer allocator.free(index_path);
+    var index = try loadManifestIndex(allocator, index_path, storage);
+    defer index.deinit(allocator);
 
-    pub fn capacityBytes(self: CasBlockSource) u64 {
-        return self.index.size();
-    }
+    const object_dir_path = try objectDir(allocator, cache_root);
+    defer allocator.free(object_dir_path);
 
-    pub fn readAt(self: *CasBlockSource, buf: []u8, offset: u64) SourceError!void {
-        const end = std.math.add(u64, offset, buf.len) catch return error.OutOfRange;
-        if (end > self.index.size()) return error.OutOfRange;
+    const dest_path = try rootfs_cache.digestPath(allocator, cache_root, rootfs.artifact.digest);
+    defer allocator.free(dest_path);
+    const dest_dir = std.fs.path.dirname(dest_path) orelse return error.IoFailed;
+    try ensureDirPath(io, dest_dir);
 
-        const start_ms = monotonicMs();
-        var cursor: usize = 0;
-        while (cursor < buf.len) {
-            const absolute = offset + cursor;
-            const chunk_index_u64 = absolute / self.index.chunkSize();
-            if (chunk_index_u64 > std.math.maxInt(usize)) return error.OutOfRange;
-            const chunk_index: usize = @intCast(chunk_index_u64);
-            const chunk_offset = absolute % self.index.chunkSize();
-            const chunk_len = try self.chunkLen(chunk_index);
-            const span_len = @min(buf.len - cursor, chunk_len - @as(usize, @intCast(chunk_offset)));
-            const target = buf[cursor..][0..span_len];
-            self.stats.chunk_accesses += 1;
-            if (self.index.chunk_ids[chunk_index]) |_| {
-                const data = try self.verifiedChunk(chunk_index);
-                @memcpy(target, data[@intCast(chunk_offset)..][0..span_len]);
-            } else {
-                @memset(target, 0);
-                self.stats.zero_fills += 1;
-            }
-            cursor += span_len;
-        }
-        if (self.trace_fd) |fd| {
-            appendTraceRead(fd, offset, buf.len, monotonicMs() -| start_ms);
+    var nonce_bytes: [8]u8 = undefined;
+    io.random(&nonce_bytes);
+    const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
+    const temp_path = try std.fmt.allocPrintSentinel(allocator, "{s}.{x}.assemble.tmp", .{ dest_path, nonce }, 0);
+    defer allocator.free(temp_path);
+    defer _ = std.c.unlink(temp_path.ptr);
+
+    const temp_fd = std.c.open(temp_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(c_uint, 0o444));
+    if (temp_fd < 0) return error.IoFailed;
+    defer _ = std.c.close(temp_fd);
+
+    const chunk_size = std.math.cast(usize, storage.chunk_size) orelse return error.BadManifest;
+    const logical_len = std.math.cast(std.c.off_t, storage.logical_size) orelse return error.BadManifest;
+    // Sparse output: size the file up front and write only data chunks, so
+    // zero chunks stay holes on disk instead of 512MiB of zero writes.
+    if (std.c.ftruncate(temp_fd, logical_len) != 0) return error.IoFailed;
+    const zero_buf = try allocator.alloc(u8, chunk_size);
+    defer allocator.free(zero_buf);
+    @memset(zero_buf, 0);
+    var hasher = Blake3.init(.{});
+    for (index.chunk_ids, 0..) |maybe_id, i| {
+        const len = try storageChunkLen(storage, @intCast(i));
+        if (maybe_id) |id| {
+            const object_path = try objectPathForDir(allocator, object_dir_path, id);
+            defer allocator.free(object_path);
+            const object = readFileExact(allocator, object_path, len) catch |err| switch (err) {
+                error.ShortRead, error.OutOfRange, error.IoFailed => return error.MissingChunk,
+                else => |e| return e,
+            };
+            defer allocator.free(object);
+            if (!id.matches(object)) return error.BadChunk;
+            hasher.update(object);
+            try pwriteAll(temp_fd, object, @as(u64, @intCast(i)) * storage.chunk_size);
+        } else {
+            hasher.update(zero_buf[0..len]);
         }
     }
 
-    fn verifiedChunk(self: *CasBlockSource, chunk_index: usize) SourceError![]const u8 {
-        if (self.verified[chunk_index]) |data| {
-            self.stats.cache_hits += 1;
-            return data;
-        }
-        const id = self.index.chunk_ids[chunk_index] orelse return error.MissingChunk;
-        const len = try self.chunkLen(chunk_index);
-        const path = try objectPathForDir(self.allocator, self.object_dir, id);
-        defer self.allocator.free(path);
-        self.stats.cache_misses += 1;
-        self.stats.object_opens += 1;
-        const data = try readFileExact(self.allocator, path, len);
-        errdefer self.allocator.free(data);
-        self.stats.bytes_hashed += data.len;
-        if (!id.matches(data)) return error.BadChunk;
-        self.verified[chunk_index] = data;
-        return data;
-    }
+    var digest: [Blake3.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const expected_hex = rootfs.artifact.digest[spore.rootfs_digest_prefix.len..];
+    if (!std.mem.eql(u8, &hex, expected_hex)) return error.RootFSDigestMismatch;
 
-    fn chunkLen(self: CasBlockSource, chunk_index: usize) SourceError!usize {
-        const start = std.math.mul(u64, @as(u64, @intCast(chunk_index)), self.index.chunkSize()) catch return error.OutOfRange;
-        const len = @min(self.index.chunkSize(), self.index.size() - start);
-        return std.math.cast(usize, len) orelse error.OutOfRange;
-    }
-
-    fn appendStatsTrace(self: CasBlockSource) void {
-        const fd = self.trace_fd orelse return;
-        var line_buf: [512]u8 = undefined;
-        const line = std.fmt.bufPrint(
-            &line_buf,
-            "{{\"event\":\"rootfs_cas_stats\",\"chunk_size\":{d},\"chunk_accesses\":{d},\"cache_hits\":{d},\"cache_misses\":{d},\"object_opens\":{d},\"bytes_hashed\":{d},\"zero_fills\":{d}}}\n",
-            .{
-                self.index.chunkSize(),
-                self.stats.chunk_accesses,
-                self.stats.cache_hits,
-                self.stats.cache_misses,
-                self.stats.object_opens,
-                self.stats.bytes_hashed,
-                self.stats.zero_fills,
-            },
-        ) catch return;
-        writeAll(fd, line) catch {};
-    }
-};
+    if (std.c.fchmod(temp_fd, 0o444) != 0) return error.IoFailed;
+    const dest_z = try allocator.dupeZ(u8, dest_path);
+    defer allocator.free(dest_z);
+    if (std.c.rename(temp_path.ptr, dest_z.ptr) != 0) return error.IoFailed;
+    std.log.debug("materialized flat rootfs artifact from chunks: digest={s} size={d}", .{ rootfs.artifact.digest, rootfs.artifact.size });
+}
 
 pub fn preload(
     io: Io,
@@ -655,29 +605,15 @@ fn ensureDirPath(io: Io, path: []const u8) !void {
     existing.close(io);
 }
 
-fn appendTraceRead(fd: std.c.fd_t, offset: u64, len: usize, elapsed_ms: u64) void {
-    var line_buf: [256]u8 = undefined;
-    const line = std.fmt.bufPrint(
-        &line_buf,
-        "{{\"event\":\"block_source_read\",\"source\":\"cas\",\"offset\":{d},\"len\":{d},\"elapsed_ms\":{d}}}\n",
-        .{ offset, len, elapsed_ms },
-    ) catch return;
-    writeAll(fd, line) catch {};
-}
-
-fn appendIndexOpenTrace(
-    fd: std.c.fd_t,
-    storage: spore.RootfsStorage,
-    index: LoadedIndex,
-    elapsed_ms: u64,
-) void {
-    var line_buf: [1024]u8 = undefined;
-    const line = std.fmt.bufPrint(
-        &line_buf,
-        "{{\"event\":\"rootfs_cas_index_open\",\"index_digest\":\"{s}\",\"logical_size\":{d},\"chunk_size\":{d},\"chunk_count\":{d},\"index_bytes\":{d},\"elapsed_ms\":{d}}}\n",
-        .{ storage.index_digest, index.logical_size, index.chunkSize(), index.chunk_ids.len, index.index_bytes, elapsed_ms },
-    ) catch return;
-    writeAll(fd, line) catch {};
+fn pwriteAll(fd: std.c.fd_t, bytes: []const u8, offset: u64) SourceError!void {
+    var done: usize = 0;
+    while (done < bytes.len) {
+        const absolute = std.math.add(u64, offset, done) catch return error.OutOfRange;
+        const file_offset = std.math.cast(std.c.off_t, absolute) orelse return error.OutOfRange;
+        const n = std.c.pwrite(fd, bytes.ptr + done, bytes.len - done, file_offset);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
 }
 
 fn writeAll(fd: std.c.fd_t, bytes: []const u8) SourceError!void {
@@ -694,15 +630,14 @@ fn monotonicMs() u64 {
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
-
-test "preload builds an index and cached source verifies chunks once" {
+test "materialize assembles the flat artifact from verified chunks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cas-source";
+    const tmp = "zig-cache/test-rootfs-cas-materialize";
     const rootfs_path = tmp ++ "/source.ext4";
     const cache_root = tmp ++ "/cache";
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
@@ -711,44 +646,34 @@ test "preload builds an index and cached source verifies chunks once" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = bytes });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     const preload_result = try preload(io, arena, cache_root, artifact.digest, 4096);
-    try std.testing.expect(std.mem.startsWith(u8, preload_result.index_digest, spore.rootfs_digest_prefix));
-
-    const trace_path = tmp ++ "/cas-trace.jsonl";
-    const trace_path_z = try arena.dupeZ(u8, trace_path);
-    const trace_fd = std.c.open(trace_path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
-    try std.testing.expect(trace_fd >= 0);
-    defer _ = std.c.close(trace_fd);
-    var source = try CasBlockSource.openManifest(allocator, cache_root, .{
+    const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
         .artifact = artifact,
         .storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
-    }, trace_fd);
-    defer source.deinit();
+    };
 
-    var readback: [4]u8 = undefined;
-    try source.readAt(&readback, 0);
-    try source.readAt(&readback, 0);
-    try std.testing.expectEqualStrings("abcd", &readback);
-    try std.testing.expectEqual(@as(u64, 2), source.stats.chunk_accesses);
-    try std.testing.expectEqual(@as(u64, 1), source.stats.cache_misses);
-    try std.testing.expectEqual(@as(u64, 1), source.stats.cache_hits);
+    // Remove the flat entry so materialize actually assembles from chunks.
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
 
-    try source.readAt(&readback, 4100);
-    try std.testing.expectEqualStrings("efgh", &readback);
+    try materializeFlatFromChunks(io, allocator, cache_root, rootfs);
+    const assembled = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(1 << 20));
+    try std.testing.expectEqualSlices(u8, bytes, assembled);
+    const stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(stat.permissions) & 0o777)));
 
-    const trace_bytes = try Io.Dir.cwd().readFileAlloc(io, trace_path, arena, .limited(4096));
-    try std.testing.expect(std.mem.indexOf(u8, trace_bytes, "\"event\":\"rootfs_cas_index_open\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, trace_bytes, "\"index_digest\":\"") != null);
+    // Idempotent: a second call with a valid entry present is a no-op.
+    try materializeFlatFromChunks(io, allocator, cache_root, rootfs);
 }
 
-test "cas source reads match byte model across chunk boundaries" {
+test "materialize reproduces exact bytes across chunk boundaries and zero chunks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cas-model";
+    const tmp = "zig-cache/test-rootfs-cas-materialize-model";
     const rootfs_path = tmp ++ "/source.ext4";
     const cache_root = tmp ++ "/cache";
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
@@ -762,33 +687,27 @@ test "cas source reads match byte model across chunk boundaries" {
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     const preload_result = try preload(io, arena, cache_root, artifact.digest, 512);
-    var source = try CasBlockSource.openManifest(allocator, cache_root, .{
+    const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
         .artifact = artifact,
         .storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
-    }, null);
-    defer source.deinit();
+    };
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
 
-    const read_lengths = [_]usize{ 0, 1, 17, 511, 512, 513, 900 };
-    var readback: [900]u8 = undefined;
-    var offset: usize = 0;
-    while (offset < model.len) : (offset += 137) {
-        for (read_lengths) |len| {
-            if (offset + len > model.len) continue;
-            try source.readAt(readback[0..len], offset);
-            try std.testing.expectEqualSlices(u8, model[offset..][0..len], readback[0..len]);
-        }
-    }
+    try materializeFlatFromChunks(io, allocator, cache_root, rootfs);
+    const assembled = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(1 << 20));
+    try std.testing.expectEqualSlices(u8, &model, assembled);
 }
 
-test "cas source rejects corrupt chunk objects" {
+test "materialize fails closed on corrupt chunk objects without publishing" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cas-corrupt";
+    const tmp = "zig-cache/test-rootfs-cas-materialize-corrupt";
     const rootfs_path = tmp ++ "/source.ext4";
     const cache_root = tmp ++ "/cache";
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
@@ -796,13 +715,13 @@ test "cas source rejects corrupt chunk objects" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "abcd" });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     const preload_result = try preload(io, arena, cache_root, artifact.digest, 4096);
-
-    var source = try CasBlockSource.openManifest(allocator, cache_root, .{
+    const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
         .artifact = artifact,
         .storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
-    }, null);
-    defer source.deinit();
+    };
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
 
     const id = chunk.ChunkId.fromContents("abcd");
     const object_dir_path = try objectDir(arena, cache_root);
@@ -810,8 +729,44 @@ test "cas source rejects corrupt chunk objects" {
     try Io.Dir.cwd().deleteFile(io, object_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = object_path, .data = "wxyz" });
 
-    var readback: [4]u8 = undefined;
-    try std.testing.expectError(error.BadChunk, source.readAt(&readback, 0));
+    try std.testing.expectError(error.BadChunk, materializeFlatFromChunks(io, allocator, cache_root, rootfs));
+    try std.testing.expect(!try rootfs_cache.pathExistsNoSymlink(io, digest_path));
+}
+
+test "materialize fails closed when assembled bytes mismatch the artifact digest" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-cas-materialize-mismatch";
+    const a_path = tmp ++ "/a.ext4";
+    const b_path = tmp ++ "/b.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = a_path, .data = "aaaa" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = b_path, .data = "bbbb" });
+
+    const a_artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, a_path);
+    const b_artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, b_path);
+    const a_preload = try preload(io, arena, cache_root, a_artifact.digest, 4096);
+
+    // Manifest pairing B's artifact digest with A's chunk index: the artifact
+    // digest and the chunk index are separate authorities, and an
+    // inconsistent pairing must fail instead of publishing A-bytes under B's
+    // name or silently serving different bytes depending on cache state.
+    const inconsistent = spore.Rootfs{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = b_artifact,
+        .storage = storageDescriptor(.{ .mmio_slot = 1 }, a_preload),
+    };
+    const b_digest_path = try rootfs_cache.digestPath(arena, cache_root, b_artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, b_digest_path);
+
+    try std.testing.expectError(error.RootFSDigestMismatch, materializeFlatFromChunks(io, allocator, cache_root, inconsistent));
+    try std.testing.expect(!try rootfs_cache.pathExistsNoSymlink(io, b_digest_path));
 }
 
 test "preload repairs corrupt existing chunk objects" {
@@ -839,14 +794,14 @@ test "preload repairs corrupt existing chunk objects" {
     const repaired = try preload(io, arena, cache_root, artifact.digest, 4096);
     try std.testing.expectEqual(@as(usize, 1), repaired.objects_written);
 
-    var source = try CasBlockSource.openManifest(allocator, cache_root, .{
+    const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
         .artifact = artifact,
         .storage = storageDescriptor(.{ .mmio_slot = 1 }, repaired),
-    }, null);
-    defer source.deinit();
-
-    var readback: [4]u8 = undefined;
-    try source.readAt(&readback, 0);
-    try std.testing.expectEqualStrings("abcd", &readback);
+    };
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
+    try materializeFlatFromChunks(io, allocator, cache_root, rootfs);
+    const assembled = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(4096));
+    try std.testing.expectEqualStrings("abcd", assembled);
 }

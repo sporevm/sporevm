@@ -1776,6 +1776,10 @@ fn unpackRootfsStorageIndexed(
     if (entry.object_count != object_count or
         entry.object_bytes != object_bytes or
         entry.index_bytes != @as(u64, @intCast(index_bytes.len))) return error.BadManifest;
+    // The flat digest-addressed artifact is the only runtime base source;
+    // assemble it eagerly from the just-installed verified chunks so the
+    // first resume of a pulled child does not pay the assembly cost.
+    rootfs_cas.materializeFlatFromChunks(options.io, allocator, cache_root, rootfs) catch |err| return rootfsError(err);
     return result;
 }
 
@@ -3289,7 +3293,7 @@ fn attachTestDiskLayer(
     const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
     defer _ = std.c.close(overlay_fd);
 
-    const base_source = block_source.FileBlockSource.init(base_fd, rootfs.artifact.size).source();
+    const base_source = block_source.FileBlockSource.init(base_fd, rootfs.artifact.size);
     var cow = try cow_disk.CowDisk.init(allocator, base_source, overlay_fd, rootfs.artifact.size, disk_layer.default_cluster_size);
     defer cow.deinit();
     try cow.writeAt(payload, write_offset);
@@ -4657,21 +4661,19 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     try std.testing.expectEqual(pulled.rootfs.payload_bytes, pulled_cached.rootfs.cache.bytes_reused);
     try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled_cached.materialization.cache.bytes_reused);
 
+    // Chunked pulls eagerly assemble the flat digest-addressed artifact from
+    // the installed verified chunks; it is the only runtime base source.
     const exact_cache_path = try rootfs_cache.digestPath(arena, pull_rootfs_cache, artifact.digest);
-    try std.testing.expect(!try pathExistsNoSymlink(io, exact_cache_path));
+    try std.testing.expect(try pathExistsNoSymlink(io, exact_cache_path));
     const restored_manifest = try spore.loadManifest(arena, out_dir);
     defer restored_manifest.deinit();
     const restored_rootfs = restored_manifest.value.rootfs orelse return error.BadManifest;
     try std.testing.expect(restored_rootfs.storage != null);
-    var source = try rootfs_cas.CasBlockSource.openManifest(allocator, pull_rootfs_cache, restored_rootfs, null);
-    defer source.deinit();
-    var first_byte: [1]u8 = undefined;
-    try source.readAt(&first_byte, 0);
-    try std.testing.expectEqual(@as(u8, 0x11), first_byte[0]);
-    try source.readAt(&first_byte, 4096);
-    try std.testing.expectEqual(@as(u8, 0), first_byte[0]);
-    try source.readAt(&first_byte, 2 * 4096 + 3);
-    try std.testing.expectEqual(@as(u8, 0x22), first_byte[0]);
+    const exact_cache_path_z = try arena.dupeZ(u8, exact_cache_path);
+    const assembled = try readFileAll(arena, exact_cache_path_z, 1 << 20);
+    try std.testing.expectEqual(@as(u8, 0x11), assembled[0]);
+    try std.testing.expectEqual(@as(u8, 0), assembled[4096]);
+    try std.testing.expectEqual(@as(u8, 0x22), assembled[2 * 4096 + 3]);
 
     const storage = rootfsStorageEntryDescriptor(storage_entry);
     const parsed_block_index = try loadRootfsBlockIndexForEntry(arena, bundle_dir, storage_entry, storage);

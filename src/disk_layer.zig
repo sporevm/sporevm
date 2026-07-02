@@ -42,7 +42,7 @@ pub const TempOverlay = struct {
 pub const LayeredCowDisk = struct {
     allocator: std.mem.Allocator,
     dir: []const u8,
-    base: block_source.BlockSource,
+    base: block_source.FileBlockSource,
     overlay_fd: std.c.fd_t,
     size: u64,
     cluster_size: u64,
@@ -52,7 +52,7 @@ pub const LayeredCowDisk = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         dir: []const u8,
-        base: block_source.BlockSource,
+        base: block_source.FileBlockSource,
         overlay_fd: std.c.fd_t,
         disk: spore.Disk,
         layers: []const spore.DiskLayer,
@@ -488,7 +488,7 @@ pub fn copyLayerChain(allocator: std.mem.Allocator, source_dir: []const u8, targ
 pub fn readAt(
     allocator: std.mem.Allocator,
     dir: []const u8,
-    base: block_source.BlockSource,
+    base: block_source.FileBlockSource,
     layers: []const spore.DiskLayer,
     buf: []u8,
     offset: u64,
@@ -537,7 +537,7 @@ pub fn diskLayerPath(allocator: std.mem.Allocator, dir: []const u8, layer_ref: [
 fn readClusterFromChain(
     allocator: std.mem.Allocator,
     dir: []const u8,
-    base: block_source.BlockSource,
+    base: block_source.FileBlockSource,
     layers: []const spore.DiskLayer,
     logical_cluster: u64,
     target: []u8,
@@ -720,7 +720,7 @@ test "sealed cow layer reads over immutable base" {
     const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
     defer _ = std.c.close(overlay_fd);
 
-    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len).source();
+    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len);
     var disk = try cow_disk.CowDisk.init(arena, base_source, overlay_fd, base_bytes.len, default_cluster_size);
     defer disk.deinit();
 
@@ -759,7 +759,7 @@ test "zero dirty cluster overrides nonzero base" {
     const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
     defer _ = std.c.close(overlay_fd);
 
-    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len).source();
+    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len);
     var disk = try cow_disk.CowDisk.init(arena, base_source, overlay_fd, base_bytes.len, default_cluster_size);
     defer disk.deinit();
     const zeros = [_]u8{0} ** 4096;
@@ -796,7 +796,7 @@ test "layered cow appends only the new active head" {
     defer _ = std.c.close(base_fd);
     const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
     defer _ = std.c.close(overlay_fd);
-    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len).source();
+    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len);
 
     const base_disk = spore.Disk{
         .device = .{ .mmio_slot = 0 },
@@ -874,7 +874,7 @@ test "sealing rejects corrupt preexisting objects" {
     const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
     defer _ = std.c.close(overlay_fd);
 
-    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len).source();
+    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len);
     var disk = try cow_disk.CowDisk.init(arena, base_source, overlay_fd, base_bytes.len, default_cluster_size);
     defer disk.deinit();
     const patch = [_]u8{0x44} ** 4096;
@@ -933,7 +933,7 @@ test "corrupt disk objects and layer indexes fail closed" {
     const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
     defer _ = std.c.close(overlay_fd);
 
-    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len).source();
+    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len);
     var disk = try cow_disk.CowDisk.init(arena, base_source, overlay_fd, base_bytes.len, default_cluster_size);
     defer disk.deinit();
     const patch = [_]u8{0x22} ** 4096;
