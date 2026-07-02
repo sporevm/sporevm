@@ -165,6 +165,10 @@ pub const CreateNamedOptions = lifecycle.CreateNamedOptions;
 pub const ResumeNamedOptions = lifecycle.ResumeNamedOptions;
 pub const ForkNamedOptions = lifecycle.ForkNamedOptions;
 pub const ExecNamedOptions = lifecycle.ExecNamedOptions;
+pub const ExecNamedStreamOptions = lifecycle.ExecNamedStreamOptions;
+pub const ExecNamedStream = lifecycle.ExecNamedStream;
+pub const ExecNamedStreamEvent = lifecycle.ExecNamedStreamEvent;
+pub const TerminalSize = lifecycle.TerminalSize;
 pub const NamedNetworkOptions = lifecycle.NamedNetworkOptions;
 pub const SnapshotNamedOptions = lifecycle.SnapshotNamedOptions;
 pub const SuspendNamedOptions = lifecycle.SuspendNamedOptions;
@@ -958,6 +962,15 @@ pub fn execNamed(
     options: ExecNamedOptions,
 ) !ExecNamedResult {
     return lifecycle.execNamed(context, allocator, options);
+}
+
+/// Open a bidirectional streaming exec inside a ready named VM.
+pub fn openExecNamedStream(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: ExecNamedStreamOptions,
+) !ExecNamedStream {
+    return lifecycle.openExecNamedStream(context, allocator, options);
 }
 
 /// Snapshot a named VM while it keeps running.

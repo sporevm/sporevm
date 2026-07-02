@@ -290,6 +290,35 @@ type ExecNamedOptions struct {
 	Argv []string
 }
 
+// ExecNamedStreamOptions opens a streaming exact argv in a named VM.
+type ExecNamedStreamOptions struct {
+	Name         string
+	Argv         []string
+	Interactive  bool
+	TTY          bool
+	TerminalName string
+	TerminalRows uint16
+	TerminalCols uint16
+}
+
+// ExecNamedStreamEventType identifies a streaming exec event.
+type ExecNamedStreamEventType int
+
+const (
+	ExecNamedStreamStdout ExecNamedStreamEventType = iota + 1
+	ExecNamedStreamStderr
+	ExecNamedStreamTerminal
+	ExecNamedStreamExit
+	ExecNamedStreamError
+)
+
+// ExecNamedStreamEvent carries one streaming exec event.
+type ExecNamedStreamEvent struct {
+	Type     ExecNamedStreamEventType
+	Bytes    []byte
+	ExitCode uint8
+}
+
 // ResumeNamedOptions starts a named VM from a spore checkpoint directory.
 type ResumeNamedOptions struct {
 	SporeDir             string

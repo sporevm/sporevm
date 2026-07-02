@@ -425,6 +425,150 @@ pub const ExecNamedResult = struct {
     stderr_truncated: bool = false,
 };
 
+pub const TerminalSize = spore_stream.Resize;
+
+pub const ExecNamedStreamOptions = struct {
+    name: []const u8,
+    command: []const []const u8,
+    interactive: bool = false,
+    tty: bool = false,
+    terminal_name: []const u8 = "xterm",
+    terminal_size: TerminalSize = .{ .rows = 24, .cols = 80 },
+};
+
+pub const ExecNamedStreamEvent = union(enum) {
+    stdout: []const u8,
+    stderr: []const u8,
+    terminal: []const u8,
+    exit: u8,
+    err: []const u8,
+};
+
+pub const ExecNamedStream = struct {
+    io: Io,
+    stream: net.Stream,
+    closed: bool = false,
+    stdin_offset: u64 = 0,
+    terminal_input_offset: u64 = 0,
+    stdout_offset: u64 = 0,
+    stderr_offset: u64 = 0,
+    terminal_offset: u64 = 0,
+    payload: [spore_stream.max_payload_len]u8 = undefined,
+
+    pub fn deinit(self: *ExecNamedStream) void {
+        if (self.closed) return;
+        self.stream.close(self.io);
+        self.closed = true;
+    }
+
+    /// Return the next output, terminal, exit, or monitor-error frame.
+    ///
+    /// Byte slices are borrowed from the stream and valid until the next call.
+    pub fn next(self: *ExecNamedStream) !ExecNamedStreamEvent {
+        while (true) {
+            var header_buf: [spore_stream.header_len]u8 = undefined;
+            try readFdExact(self.stream.socket.handle, &header_buf);
+            const header = try spore_stream.readHeader(&header_buf);
+            if (header.flags != 0 or header.payload_len > self.payload.len) return error.BadMonitorResponse;
+            const payload = self.payload[0..header.payload_len];
+            if (payload.len > 0) try readFdExact(self.stream.socket.handle, payload);
+            switch (header.frame_type) {
+                .data => {
+                    const expected = switch (header.stream_id) {
+                        .stdout => self.stdout_offset,
+                        .stderr => self.stderr_offset,
+                        .terminal => self.terminal_offset,
+                        else => return error.BadMonitorResponse,
+                    };
+                    if (header.offset != expected) return error.BadMonitorResponse;
+                    const len: u64 = @intCast(payload.len);
+                    switch (header.stream_id) {
+                        .stdout => {
+                            self.stdout_offset += len;
+                            return .{ .stdout = payload };
+                        },
+                        .stderr => {
+                            self.stderr_offset += len;
+                            return .{ .stderr = payload };
+                        },
+                        .terminal => {
+                            self.terminal_offset += len;
+                            return .{ .terminal = payload };
+                        },
+                        else => unreachable,
+                    }
+                },
+                .exit => {
+                    if (header.stream_id != .control or header.offset != 0) return error.BadMonitorResponse;
+                    const code = try spore_stream.readExitPayload(payload);
+                    if (code > 255) return error.BadMonitorResponse;
+                    return .{ .exit = @intCast(code) };
+                },
+                .err => {
+                    if (header.stream_id != .control) return error.BadMonitorResponse;
+                    return .{ .err = payload };
+                },
+                .event => continue,
+                else => return error.BadMonitorResponse,
+            }
+        }
+    }
+
+    pub fn writeStdin(self: *ExecNamedStream, bytes: []const u8) !void {
+        try self.writeInputData(.stdin, bytes);
+    }
+
+    pub fn writeTerminal(self: *ExecNamedStream, bytes: []const u8) !void {
+        try self.writeInputData(.terminal, bytes);
+    }
+
+    pub fn closeStdin(self: *ExecNamedStream) !void {
+        try self.writeInputFrame(.close, .stdin, "");
+    }
+
+    pub fn closeTerminal(self: *ExecNamedStream) !void {
+        try self.writeInputFrame(.close, .terminal, "");
+    }
+
+    pub fn resizeTerminal(self: *ExecNamedStream, size: TerminalSize) !void {
+        var payload: [4]u8 = undefined;
+        spore_stream.writeResizePayload(&payload, size);
+        try self.writeInputFrame(.resize, .terminal, &payload);
+    }
+
+    fn writeInputData(self: *ExecNamedStream, stream_id: spore_stream.StreamId, bytes: []const u8) !void {
+        var remaining = bytes;
+        while (remaining.len > 0) {
+            const take = @min(remaining.len, spore_stream.max_payload_len);
+            try self.writeInputFrame(.data, stream_id, remaining[0..take]);
+            remaining = remaining[take..];
+        }
+    }
+
+    fn writeInputFrame(self: *ExecNamedStream, frame_type: spore_stream.FrameType, stream_id: spore_stream.StreamId, payload: []const u8) !void {
+        const offset = switch (stream_id) {
+            .stdin => self.stdin_offset,
+            .terminal => self.terminal_input_offset,
+            else => 0,
+        };
+        var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
+        const frame = try spore_stream.writeFrame(&frame_buf, .{
+            .frame_type = frame_type,
+            .stream_id = stream_id,
+            .offset = if (frame_type == .resize) 0 else offset,
+        }, payload);
+        try writeFdAll(self.stream.socket.handle, frame);
+        if (frame_type == .data) {
+            const len: u64 = @intCast(payload.len);
+            switch (stream_id) {
+                .stdin => self.stdin_offset += len,
+                .terminal => self.terminal_input_offset += len,
+                else => {},
+            }
+        }
+    }
+};
+
 const NamedNetworkConfig = struct {
     mode: run_mod.NetworkMode = .disabled,
     policy: run_mod.NetworkPolicy = .{},
@@ -669,6 +813,25 @@ pub fn execNamed(
     return parseExecNamedResponse(allocator, arena, response);
 }
 
+pub fn openExecNamedStream(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: ExecNamedStreamOptions,
+) !ExecNamedStream {
+    if (options.command.len == 0) return error.InvalidGuestCommand;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const paths = try apiPaths(context, arena, options.name);
+    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    if (state != .ready) return error.NamedVmNotReady;
+    var ready = try readReady(arena, context.io, paths);
+    defer ready.deinit();
+    return openExecNamedStreamAt(context, arena, ready.value.control_socket_path, options);
+}
+
 fn execNamedStreaming(
     context: Context,
     allocator: std.mem.Allocator,
@@ -687,7 +850,14 @@ fn execNamedStreaming(
     if (state != .ready) return error.NamedVmNotReady;
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
-    return execStreamControl(context, arena, ready.value.control_socket_path, options);
+    return execStreamControl(context, arena, ready.value.control_socket_path, .{
+        .name = options.name,
+        .command = options.command,
+        .interactive = options.interactive,
+        .tty = options.tty,
+        .terminal_name = terminalName(context.environ_map),
+        .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
+    });
 }
 
 fn startNamed(
@@ -2555,8 +2725,7 @@ fn sendExecRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8
     return sendControlJson(allocator, io, socket_path, json);
 }
 
-fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path: []const u8, options: ExecNamedOptions) !u8 {
-    const terminal_size = terminalSizeOrDefault(terminalSizeFd());
+fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_path: []const u8, options: ExecNamedStreamOptions) !ExecNamedStream {
     const payload = struct {
         type: []const u8 = "exec-stream-v1",
         argv: []const []const u8,
@@ -2569,19 +2738,24 @@ fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path
         .argv = options.command,
         .stdio = if (options.tty) "tty" else "pipe",
         .interactive = options.interactive,
-        .term = terminalName(context.environ_map),
-        .terminal_rows = terminal_size.rows,
-        .terminal_cols = terminal_size.cols,
+        .term = options.terminal_name,
+        .terminal_rows = options.terminal_size.rows,
+        .terminal_cols = options.terminal_size.cols,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
 
     const address = try net.UnixAddress.init(socket_path);
     const stream = address.connect(context.io) catch return error.MonitorUnavailable;
-    defer stream.close(context.io);
+    errdefer stream.close(context.io);
     writeAll(context.io, stream, json) catch return error.MonitorUnavailable;
     writeAll(context.io, stream, "\n") catch return error.MonitorUnavailable;
+    return .{ .io = context.io, .stream = stream };
+}
 
+fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path: []const u8, options: ExecNamedStreamOptions) !u8 {
+    var stream = try openExecNamedStreamAt(context, allocator, socket_path, options);
+    defer stream.deinit();
     var raw_terminal: ?ExecRawTerminal = null;
     if (options.tty and options.interactive) raw_terminal = try ExecRawTerminal.enable();
     defer if (raw_terminal) |*raw| raw.deinit();
@@ -2594,7 +2768,7 @@ fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path
     defer if (resize_registration) |*registration| registration.deinit();
 
     var pump = ExecStreamPump{
-        .fd = stream.socket.handle,
+        .stream = &stream,
         .interactive = options.interactive,
         .tty = options.tty,
     };
@@ -2650,23 +2824,17 @@ fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8
 }
 
 const ExecStreamPump = struct {
-    fd: std.c.fd_t,
+    stream: *ExecNamedStream,
     interactive: bool,
     tty: bool,
     stdin_closed: bool = false,
-    stdin_offset: u64 = 0,
-    terminal_input_offset: u64 = 0,
-    stdout_offset: u64 = 0,
-    stderr_offset: u64 = 0,
-    terminal_offset: u64 = 0,
     resize_seen: u32 = 0,
-    payload: [spore_stream.max_payload_len]u8 = undefined,
 
     fn run(self: *ExecStreamPump) !u8 {
         while (true) {
             try self.maybeSendResize();
             var fds = [_]std.posix.pollfd{
-                .{ .fd = self.fd, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
+                .{ .fd = self.stream.stream.socket.handle, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
                 .{ .fd = if (self.interactive) 0 else -1, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
             };
             const ready = std.posix.poll(&fds, 100) catch return error.MonitorUnavailable;
@@ -2683,49 +2851,21 @@ const ExecStreamPump = struct {
     }
 
     fn readOutputFrame(self: *ExecStreamPump) !?u8 {
-        var header_buf: [spore_stream.header_len]u8 = undefined;
-        try readFdExact(self.fd, &header_buf);
-        const header = try spore_stream.readHeader(&header_buf);
-        if (header.flags != 0 or header.payload_len > self.payload.len) return error.BadMonitorResponse;
-        const payload = self.payload[0..header.payload_len];
-        if (payload.len > 0) try readFdExact(self.fd, payload);
-        switch (header.frame_type) {
-            .data => {
-                const expected = switch (header.stream_id) {
-                    .stdout => self.stdout_offset,
-                    .stderr => self.stderr_offset,
-                    .terminal => self.terminal_offset,
-                    else => return error.BadMonitorResponse,
-                };
-                if (header.offset != expected) return error.BadMonitorResponse;
-                const out_fd: std.c.fd_t = switch (header.stream_id) {
-                    .stderr => 2,
-                    else => 1,
-                };
-                try writeFdAll(out_fd, payload);
-                const len: u64 = @intCast(payload.len);
-                switch (header.stream_id) {
-                    .stdout => self.stdout_offset += len,
-                    .stderr => self.stderr_offset += len,
-                    .terminal => self.terminal_offset += len,
-                    else => unreachable,
-                }
+        switch (try self.stream.next()) {
+            .stdout, .terminal => |bytes| {
+                try writeFdAll(1, bytes);
                 return null;
             },
-            .exit => {
-                if (header.stream_id != .control or header.offset != 0) return error.BadMonitorResponse;
-                const code = try spore_stream.readExitPayload(payload);
-                if (code > 255) return error.BadMonitorResponse;
-                return @intCast(code);
+            .stderr => |bytes| {
+                try writeFdAll(2, bytes);
+                return null;
             },
-            .err => {
-                if (header.stream_id != .control) return error.BadMonitorResponse;
-                try writeFdAll(2, payload);
-                if (payload.len != 0 and payload[payload.len - 1] != '\n') try writeFdAll(2, "\n");
+            .exit => |code| return code,
+            .err => |bytes| {
+                try writeFdAll(2, bytes);
+                if (bytes.len != 0 and bytes[bytes.len - 1] != '\n') try writeFdAll(2, "\n");
                 return error.MonitorRequestFailed;
             },
-            .event => return null,
-            else => return error.BadMonitorResponse,
         }
     }
 
@@ -2741,11 +2881,19 @@ const ExecStreamPump = struct {
         }
         const input_stream: spore_stream.StreamId = if (self.tty) .terminal else .stdin;
         if (n == 0) {
-            try self.writeInputFrame(.close, input_stream, "");
+            switch (input_stream) {
+                .stdin => try self.stream.closeStdin(),
+                .terminal => try self.stream.closeTerminal(),
+                else => unreachable,
+            }
             self.stdin_closed = true;
             return;
         }
-        try self.writeInputData(input_stream, buf[0..@intCast(n)]);
+        switch (input_stream) {
+            .stdin => try self.stream.writeStdin(buf[0..@intCast(n)]),
+            .terminal => try self.stream.writeTerminal(buf[0..@intCast(n)]),
+            else => unreachable,
+        }
     }
 
     fn maybeSendResize(self: *ExecStreamPump) !void {
@@ -2753,41 +2901,7 @@ const ExecStreamPump = struct {
         const count = exec_resize_count.load(.acquire);
         if (count == self.resize_seen) return;
         self.resize_seen = count;
-        var payload: [4]u8 = undefined;
-        spore_stream.writeResizePayload(&payload, terminalSizeOrDefault(terminalSizeFd()));
-        try self.writeInputFrame(.resize, .terminal, &payload);
-    }
-
-    fn writeInputData(self: *ExecStreamPump, stream_id: spore_stream.StreamId, bytes: []const u8) !void {
-        var remaining = bytes;
-        while (remaining.len > 0) {
-            const take = @min(remaining.len, spore_stream.max_payload_len);
-            try self.writeInputFrame(.data, stream_id, remaining[0..take]);
-            remaining = remaining[take..];
-        }
-    }
-
-    fn writeInputFrame(self: *ExecStreamPump, frame_type: spore_stream.FrameType, stream_id: spore_stream.StreamId, payload: []const u8) !void {
-        const offset = switch (stream_id) {
-            .stdin => self.stdin_offset,
-            .terminal => self.terminal_input_offset,
-            else => 0,
-        };
-        var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
-        const frame = try spore_stream.writeFrame(&frame_buf, .{
-            .frame_type = frame_type,
-            .stream_id = stream_id,
-            .offset = if (frame_type == .resize) 0 else offset,
-        }, payload);
-        try writeFdAll(self.fd, frame);
-        if (frame_type == .data) {
-            const len: u64 = @intCast(payload.len);
-            switch (stream_id) {
-                .stdin => self.stdin_offset += len,
-                .terminal => self.terminal_input_offset += len,
-                else => {},
-            }
-        }
+        try self.stream.resizeTerminal(terminalSizeOrDefault(terminalSizeFd()));
     }
 };
 

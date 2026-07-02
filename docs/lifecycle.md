@@ -132,9 +132,9 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
   or a PTY. Commandless `spore run --from <spore-dir>` resumes the captured
   default or sole recorded session. `spore run -t --from <spore-dir> <command>`
   is not implemented yet.
-- `spore exec -i/-t` uses a streaming monitor request. The public bounded
-  `execNamed` embedding API rejects interactive flags until a streaming
-  embedding API exists.
+- `spore exec -i/-t` uses a streaming monitor request. Embedders use
+  `openExecNamedStream` for the same stdin, terminal, resize, exit, and
+  monitor-error surface.
 - There is no public `spore attach` command yet. Reserve that spelling for
   connecting to already-running named VMs once monitors own retained attachable
   sessions.
