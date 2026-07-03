@@ -84,6 +84,7 @@ typedef struct SporeExecNamedStreamImpl *SporeExecNamedStream;
 #define SPORE_SUSPEND_NAMED_OPTIONS_VERSION 1u
 #define SPORE_REMOVE_NAMED_OPTIONS_VERSION 1u
 #define SPORE_INSPECT_SPORE_OPTIONS_VERSION 1u
+#define SPORE_REEXEC_CONTRACT_VERSION 1u
 
 #define SPORE_CACHE_ROOT_ENV 0u
 #define SPORE_CACHE_ROOT_NONE 1u
@@ -354,6 +355,16 @@ SPORE_API void spore_remove_named_options_init(SporeRemoveNamedOptions *options)
  * - SPORE_BUILD_INFO_ABI_VERSION: uint32_t*
  */
 SPORE_API SporeResult spore_build_info(SporeBuildInfo field, void *out);
+
+/**
+ * Run a hidden SporeVM re-exec role selected by SPORE_REEXEC_ROLE.
+ *
+ * Returns SPORE_INVALID_VALUE when argv or environment do not describe a
+ * SporeVM re-exec child. On success, out_exit_code is the role exit code.
+ */
+SPORE_API SporeResult spore_reexec_main(int argc,
+                                        const char *const *argv,
+                                        int *out_exit_code);
 
 /** Create a libspore context. */
 SPORE_API SporeResult spore_context_new(SporeContext *out_context);

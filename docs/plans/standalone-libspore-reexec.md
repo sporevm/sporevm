@@ -125,6 +125,14 @@ after the VM has been classified as stale.
   sending their operation-specific control request.
 - `rm` intentionally remains cleanup-oriented: it sends `shutdown` without a
   prior `hello` check so an old or mismatched monitor can still be removed.
+- Slice 2 is implemented on the same branch. The C ABI now exports
+  `spore_reexec_main` with `SPORE_REEXEC_CONTRACT_VERSION`, and the CLI and C
+  ABI call shared internal monitor/netd role entrypoints.
+- Re-exec children are gated by `SPORE_REEXEC_ROLE`,
+  `SPORE_REEXEC_CONTRACT`, and `argv[1]`. Unsupported contracts, missing
+  markers, and role mismatches fail closed before monitor or netd code runs.
+- The dispatcher unsets the re-exec markers and closes unexpected file
+  descriptors greater than `2` before entering the role body.
 
 ## Recommended Design
 
@@ -320,6 +328,8 @@ This slice protects users immediately and does not require Go trampoline work.
 Export `spore_reexec_main`, add `SPORE_REEXEC_CONTRACT_VERSION` to
 `include/spore.h`, and refactor hidden monitor/netd entrypoints so the CLI and
 C ABI share role code.
+
+Status: implemented on `lox/libspore-helper-handshake`.
 
 Definition of done:
 
