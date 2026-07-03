@@ -147,6 +147,10 @@ after the VM has been classified as stale.
   `SPORE_REEXEC_CONTRACT` to the helper child environment. The CLI helper path
   still works because hidden `spore monitor` / `spore netd` commands ignore the
   markers, while Go embedders consume them in package init.
+- Slice 5 is implemented in `docs/libspore.md`. The Go docs describe the
+  default self re-exec behavior, C/Zig docs keep the explicit-helper contract,
+  and troubleshooting covers version skew, PATH fallback, macOS entitlements,
+  and dynamic library loading for re-execed children.
 
 ## Recommended Design
 
@@ -391,6 +395,8 @@ Definition of done:
 ### Slice 5: Consumer Documentation
 
 Update `docs/libspore.md` and the Go binding examples.
+
+Status: implemented on `lox/libspore-helper-handshake`.
 
 Definition of done:
 
