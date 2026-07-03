@@ -133,6 +133,12 @@ after the VM has been classified as stale.
   markers, and role mismatches fail closed before monitor or netd code runs.
 - The dispatcher unsets the re-exec markers and closes unexpected file
   descriptors greater than `2` before entering the role body.
+- Slice 3 is implemented in the Go binding. Package init dispatches
+  `SPORE_REEXEC_ROLE` children through `spore_reexec_main`, and empty
+  `CreateNamedOptions.SporeExecutable` / `ResumeNamedOptions.SporeExecutable`
+  now default to the resolved current executable path.
+- The Go tests cover the netd re-exec trampoline by spawning the test binary
+  as `netd --help`, plus the empty-default and explicit-helper paths.
 
 ## Recommended Design
 
@@ -346,6 +352,8 @@ Definition of done:
 Teach `bindings/go` to dispatch re-exec children in package init and to fill
 empty `SporeExecutable` with the current executable path for named lifecycle
 operations.
+
+Status: implemented on `lox/libspore-helper-handshake`.
 
 Definition of done:
 

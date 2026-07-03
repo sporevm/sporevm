@@ -263,6 +263,17 @@ The named surface is:
 trees and reject symlinks, special files, and overwrite. They do not perform
 workspace sync.
 
+The Go binding installs the SporeVM re-exec trampoline during package init. If
+`CreateNamedOptions.SporeExecutable` or `ResumeNamedOptions.SporeExecutable` is
+empty, the binding passes the current executable path to libspore, so monitor
+and `netd` child processes re-exec the same linked embedder instead of looking
+up `spore` on `PATH`. Set `SporeExecutable` explicitly to keep using an
+external helper during migration or debugging.
+
+On macOS, standalone Go embedders that use HVF must sign the final executable
+with `com.apple.security.hypervisor`. Signing only `libspore.dylib` is not
+enough because the monitor role is the embedder process.
+
 `execNamed` returns a bounded stdout/stderr result, so `.interactive = true` or
 `.tty = true` returns `error.UnsupportedInteractiveExec`. Use
 `openExecNamedStream` for `spore exec -i/-t` semantics:

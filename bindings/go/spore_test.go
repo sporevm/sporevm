@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -27,6 +28,49 @@ func TestBuildInfo(t *testing.T) {
 	}
 	if info.ABIVersion < minABIVersion {
 		t.Fatalf("ABI version %d < %d", info.ABIVersion, minABIVersion)
+	}
+}
+
+func TestReexecTrampolineNetdHelp(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "netd", "--help")
+	cmd.Env = append(withoutEnv(os.Environ(), reexecRoleEnv, reexecContractEnv),
+		reexecRoleEnv+"=netd",
+		fmt.Sprintf("%s=%d", reexecContractEnv, reexecContractVersion),
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("reexec netd help failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "usage: spore netd --stdio") {
+		t.Fatalf("unexpected reexec output:\n%s", out)
+	}
+}
+
+func TestNamedSporeExecutableDefaultAndOverride(t *testing.T) {
+	current, err := currentExecutablePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultValue, freeDefault, err := cNamedSporeExecutable("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer freeDefault()
+	if got := goString(defaultValue); got != current {
+		t.Fatalf("default spore executable = %q, want %q", got, current)
+	}
+
+	overrideValue, freeOverride, err := cNamedSporeExecutable("/tmp/spore-helper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer freeOverride()
+	if got := goString(overrideValue); got != "/tmp/spore-helper" {
+		t.Fatalf("override spore executable = %q", got)
 	}
 }
 
@@ -561,6 +605,10 @@ type spioFrame struct {
 }
 
 func serveExecStreamFakeMonitor(listener net.Listener) error {
+	if err := serveFakeMonitorHello(listener); err != nil {
+		return err
+	}
+
 	conn, err := listener.Accept()
 	if err != nil {
 		return err
@@ -623,6 +671,50 @@ func serveExecStreamFakeMonitor(listener net.Listener) error {
 	var exitPayload [4]byte
 	binary.LittleEndian.PutUint32(exitPayload[:], 7)
 	return writeSPIOFrame(conn, spioExit, spioControl, 0, exitPayload[:])
+}
+
+func serveFakeMonitorHello(listener net.Listener) error {
+	conn, err := listener.Accept()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	requestLine, err := reader.ReadBytes('\n')
+	if err != nil {
+		return err
+	}
+	var request struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(requestLine, &request); err != nil {
+		return err
+	}
+	if request.Type != "hello" {
+		return fmt.Errorf("bad hello request: %#v", request)
+	}
+	info, err := Build()
+	if err != nil {
+		return err
+	}
+	response, err := json.Marshal(struct {
+		Type           string `json:"type"`
+		Schema         string `json:"schema"`
+		SporeVersion   string `json:"spore_version"`
+		HelperContract uint32 `json:"helper_contract"`
+	}{
+		Type:           "hello",
+		Schema:         "spore.monitor.hello.v1",
+		SporeVersion:   info.Version,
+		HelperContract: 1,
+	})
+	if err != nil {
+		return err
+	}
+	response = append(response, '\n')
+	_, err = conn.Write(response)
+	return err
 }
 
 func readSPIOFrame(reader io.Reader) (spioFrame, error) {
@@ -728,6 +820,22 @@ func jsonString(t *testing.T, value string) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+func withoutEnv(env []string, keys ...string) []string {
+	skip := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		skip[key] = struct{}{}
+	}
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, ok := skip[key]; ok {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 func supportsNamedLifecycle(t *testing.T, client *Client) bool {
