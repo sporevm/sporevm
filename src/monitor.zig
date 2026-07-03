@@ -13,6 +13,7 @@ const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
 const topology = @import("topology.zig");
+const version = @import("version.zig");
 const vsock = @import("virtio/vsock.zig");
 
 const max_control_request = 4096;
@@ -923,6 +924,14 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         try writeControlOk(server.io, stream);
         return true;
     }
+    if (std.mem.eql(u8, parsed.value.type, "hello")) {
+        const payload = struct {
+            type: []const u8 = "hello",
+            version: []const u8 = version.string,
+        }{};
+        try writeControlJson(server.allocator, server.io, stream, payload);
+        return false;
+    }
     if (std.mem.eql(u8, parsed.value.type, "suspend")) {
         const out_dir = parsed.value.out_dir orelse {
             try writeControlError(server.io, stream, "suspend request missing out_dir");
@@ -1203,6 +1212,13 @@ fn readFdExact(fd: std.c.fd_t, buf: []u8) !void {
 
 fn writeControlOk(io: Io, stream: net.Stream) !void {
     try writeAll(io, stream, "{\"type\":\"ok\"}\n");
+}
+
+fn writeControlJson(allocator: std.mem.Allocator, io: Io, stream: net.Stream, payload: anytype) !void {
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    try writeAll(io, stream, json);
+    try writeAll(io, stream, "\n");
 }
 
 fn writeControlError(io: Io, stream: net.Stream, message: []const u8) !void {

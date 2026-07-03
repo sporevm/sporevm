@@ -212,6 +212,15 @@ func TestNamedLifecycleOptionsCarryBoundServices(t *testing.T) {
 	}
 }
 
+func TestSporeExecutableOptionDefaults(t *testing.T) {
+	if got := sporeExecutableOption(""); got != "spore" {
+		t.Fatalf("default spore executable = %q", got)
+	}
+	if got := sporeExecutableOption("/tmp/spore"); got != "/tmp/spore" {
+		t.Fatalf("explicit spore executable = %q", got)
+	}
+}
+
 func TestCreateNamedNetworkMarshaling(t *testing.T) {
 	allowCIDRs, freeAllowCIDRs := cStringList([]string{"93.184.216.34/32"})
 	defer freeAllowCIDRs()

@@ -17,6 +17,7 @@ import (
 )
 
 const minABIVersion uint32 = 12
+const defaultSporeExecutable = "spore"
 
 var ErrClosed = errors.New("spore client closed")
 var ErrStreamClosed = errors.New("spore exec stream closed")
@@ -252,7 +253,7 @@ func (c *Client) CreateNamed(ctx context.Context, options CreateNamedOptions) (N
 	defer freeRootfsPath()
 	imageRef, freeImageRef := cString(options.ImageRef)
 	defer freeImageRef()
-	sporeExecutable, freeSporeExecutable := cString(options.SporeExecutable)
+	sporeExecutable, freeSporeExecutable := cString(sporeExecutableOption(options.SporeExecutable))
 	defer freeSporeExecutable()
 	consoleLogPath, freeConsoleLogPath := cString(options.ConsoleLogPath)
 	defer freeConsoleLogPath()
@@ -530,7 +531,7 @@ func (c *Client) ResumeNamed(ctx context.Context, options ResumeNamedOptions) (N
 	defer freeSporeDir()
 	name, freeName := cString(options.Name)
 	defer freeName()
-	sporeExecutable, freeSporeExecutable := cString(options.SporeExecutable)
+	sporeExecutable, freeSporeExecutable := cString(sporeExecutableOption(options.SporeExecutable))
 	defer freeSporeExecutable()
 	boundServices, freeBoundServices := cBoundUnixServiceBindings(options.BoundServiceBindings)
 	defer freeBoundServices()
@@ -632,6 +633,13 @@ func (c *Client) ready(ctx context.Context) error {
 
 func (c *Client) callError(code Result) error {
 	return &CallError{Code: code, Message: goString(C.spore_context_last_error(c.ctx))}
+}
+
+func sporeExecutableOption(value string) string {
+	if value == "" {
+		return defaultSporeExecutable
+	}
+	return value
 }
 
 func goString(s C.SporeString) string {

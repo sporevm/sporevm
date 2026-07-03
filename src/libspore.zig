@@ -5,7 +5,7 @@
 //! modules stay behind the in-repo implementation module.
 
 const api = @import("api.zig");
-pub const version = "1.5.0";
+pub const version = @import("version.zig").string;
 
 pub const Backend = api.Backend;
 pub const CacheRoot = api.CacheRoot;
@@ -110,6 +110,7 @@ pub const UnpackOptions = api.UnpackOptions;
 pub const UnpackResult = api.UnpackResult;
 
 pub const classifyFailure = api.classifyFailure;
+pub const clearLastLifecycleError = api.clearLastLifecycleError;
 pub const copyInNamed = api.copyInNamed;
 pub const copyOutNamed = api.copyOutNamed;
 pub const createNamed = api.createNamed;
@@ -137,6 +138,7 @@ pub const forkNamed = api.forkNamed;
 pub const hostInfo = api.hostInfo;
 pub const inspectBundle = api.inspectBundle;
 pub const inspectSpore = api.inspectSpore;
+pub const lastLifecycleErrorMessage = api.lastLifecycleErrorMessage;
 pub const validateAnnotations = api.validateAnnotations;
 pub const listNamed = api.listNamed;
 pub const networkCapabilities = api.networkCapabilities;
