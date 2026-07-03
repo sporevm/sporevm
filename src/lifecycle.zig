@@ -20,6 +20,9 @@ pub const runtime_dir_env = local_paths.runtime_dir_env;
 pub const max_name_len = 128;
 pub const monitor_hello_schema = "spore.monitor.hello.v1";
 pub const monitor_helper_contract: u32 = 1;
+const reexec_role_env = "SPORE_REEXEC_ROLE";
+const reexec_contract_env = "SPORE_REEXEC_CONTRACT";
+const reexec_contract_value = "1";
 
 const max_metadata_bytes = 128 * 1024;
 const max_control_response = 128 * 1024;
@@ -2844,9 +2847,12 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
         try argv.append("--console-log");
         try argv.append(path);
     }
+    var child_env = try init.environ_map.clone(allocator);
+    try child_env.put(reexec_role_env, "monitor");
+    try child_env.put(reexec_contract_env, reexec_contract_value);
     _ = try std.process.spawn(init.io, .{
         .argv = argv.items,
-        .environ_map = init.environ_map,
+        .environ_map = &child_env,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -2870,7 +2876,7 @@ test "lifecycle monitor spawn receives context environment" {
     defer allocator.free(out_path);
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = script_path,
-        .data = "#!/bin/sh\nprintf '%s' \"$HOME\" > \"$SPOREVM_TEST_ENV_OUT\"\n",
+        .data = "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$HOME\" \"$SPORE_REEXEC_ROLE\" \"$SPORE_REEXEC_CONTRACT\" > \"$SPOREVM_TEST_ENV_OUT\"\n",
     });
     try Io.Dir.cwd().setFilePermissions(io, script_path, @enumFromInt(0o755), .{});
 
@@ -2909,7 +2915,7 @@ test "lifecycle monitor spawn receives context environment" {
         break;
     }
     try std.testing.expect(observed != null);
-    try std.testing.expectEqualStrings("/tmp/sporevm-context-home", observed.?);
+    try std.testing.expectEqualStrings("/tmp/sporevm-context-home\nmonitor\n1\n", observed.?);
 }
 
 fn appendMonitorNetworkPolicyArgs(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), policy: *const run_mod.NetworkPolicy) !void {

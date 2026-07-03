@@ -139,6 +139,14 @@ after the VM has been classified as stale.
   now default to the resolved current executable path.
 - The Go tests cover the netd re-exec trampoline by spawning the test binary
   as `netd --help`, plus the empty-default and explicit-helper paths.
+- Slice 4 is implemented with `mise run smoke:libspore-standalone-go`. The
+  smoke builds a tiny Go embedder, signs it with the HVF entitlement on macOS,
+  runs with a `PATH` that cannot resolve `spore`, and proves both plain and
+  network-enabled named lifecycle create/exec/remove flows.
+- Monitor and netd spawns now add `SPORE_REEXEC_ROLE` and
+  `SPORE_REEXEC_CONTRACT` to the helper child environment. The CLI helper path
+  still works because hidden `spore monitor` / `spore netd` commands ignore the
+  markers, while Go embedders consume them in package init.
 
 ## Recommended Design
 
@@ -368,6 +376,8 @@ Definition of done:
 
 Add an integration smoke that builds a tiny Go embedder, starts a named VM
 without `spore` on `PATH`, executes a command, and removes the VM.
+
+Status: implemented on `lox/libspore-helper-handshake`.
 
 Definition of done:
 
