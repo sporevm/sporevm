@@ -11,7 +11,7 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 11;
+const c_abi_version: u32 = 12;
 const inspect_bundle_options_version: u32 = 1;
 const inspect_spore_options_version: u32 = 1;
 const pull_options_version: u32 = 1;
@@ -22,6 +22,7 @@ const resume_named_options_version: u32 = 2;
 const fork_named_options_version: u32 = 1;
 const exec_named_options_version: u32 = 2;
 const exec_named_stream_options_version: u32 = 1;
+const copy_named_options_version: u32 = 1;
 const snapshot_named_options_version: u32 = 2;
 const suspend_named_options_version: u32 = 1;
 const remove_named_options_version: u32 = 1;
@@ -178,6 +179,14 @@ const SporeExecNamedStreamEvent = extern struct {
     type: c_int,
     bytes: SporeString,
     exit_code: u8,
+};
+
+const SporeCopyNamedOptions = extern struct {
+    size: u32,
+    version: u32,
+    name: SporeString,
+    host_path: SporeString,
+    guest_path: SporeString,
 };
 
 const SporeResumeNamedOptions = extern struct {
@@ -375,6 +384,17 @@ pub export fn spore_exec_named_stream_options_init(options: ?*SporeExecNamedStre
         .terminal_name = .{},
         .terminal_rows = 24,
         .terminal_cols = 80,
+    };
+}
+
+pub export fn spore_copy_named_options_init(options: ?*SporeCopyNamedOptions) void {
+    const out = options orelse return;
+    out.* = .{
+        .size = @sizeOf(SporeCopyNamedOptions),
+        .version = copy_named_options_version,
+        .name = .{},
+        .host_path = .{},
+        .guest_path = .{},
     };
 }
 
@@ -881,6 +901,44 @@ pub export fn spore_exec_named_stream_free(
     ctx.allocator.destroy(handle);
 }
 
+pub export fn spore_copy_in_named(
+    context: ?*SporeContextImpl,
+    options: ?*const SporeCopyNamedOptions,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    ctx.clearLastError();
+    if (opts.version != copy_named_options_version or opts.size < @sizeOf(SporeCopyNamedOptions)) {
+        return fail(ctx, error.InvalidValue);
+    }
+
+    libspore.copyInNamed(ctx.productContext(), ctx.allocator, .{
+        .name = toSlice(opts.name) catch |err| return fail(ctx, err),
+        .host_path = toSlice(opts.host_path) catch |err| return fail(ctx, err),
+        .guest_path = toSlice(opts.guest_path) catch |err| return fail(ctx, err),
+    }) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_copy_out_named(
+    context: ?*SporeContextImpl,
+    options: ?*const SporeCopyNamedOptions,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    ctx.clearLastError();
+    if (opts.version != copy_named_options_version or opts.size < @sizeOf(SporeCopyNamedOptions)) {
+        return fail(ctx, error.InvalidValue);
+    }
+
+    libspore.copyOutNamed(ctx.productContext(), ctx.allocator, .{
+        .name = toSlice(opts.name) catch |err| return fail(ctx, err),
+        .host_path = toSlice(opts.host_path) catch |err| return fail(ctx, err),
+        .guest_path = toSlice(opts.guest_path) catch |err| return fail(ctx, err),
+    }) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
 pub export fn spore_resume_named_json(
     context: ?*SporeContextImpl,
     options: ?*const SporeResumeNamedOptions,
@@ -1244,6 +1302,11 @@ test "named lifecycle options initialize defaults" {
     try std.testing.expectEqual(exec_named_stream_options_version, stream.version);
     try std.testing.expectEqual(@as(u16, 24), stream.terminal_rows);
     try std.testing.expectEqual(@as(u16, 80), stream.terminal_cols);
+
+    var copy: SporeCopyNamedOptions = undefined;
+    spore_copy_named_options_init(&copy);
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeCopyNamedOptions))), copy.size);
+    try std.testing.expectEqual(copy_named_options_version, copy.version);
 
     var resume_options: SporeResumeNamedOptions = undefined;
     spore_resume_named_options_init(&resume_options);

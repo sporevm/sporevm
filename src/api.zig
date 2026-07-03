@@ -169,6 +169,7 @@ pub const ExecNamedStreamOptions = lifecycle.ExecNamedStreamOptions;
 pub const ExecNamedStream = lifecycle.ExecNamedStream;
 pub const ExecNamedStreamEvent = lifecycle.ExecNamedStreamEvent;
 pub const TerminalSize = lifecycle.TerminalSize;
+pub const CopyNamedOptions = lifecycle.CopyNamedOptions;
 pub const NamedNetworkOptions = lifecycle.NamedNetworkOptions;
 pub const SnapshotNamedOptions = lifecycle.SnapshotNamedOptions;
 pub const SuspendNamedOptions = lifecycle.SuspendNamedOptions;
@@ -971,6 +972,24 @@ pub fn openExecNamedStream(
     options: ExecNamedStreamOptions,
 ) !ExecNamedStream {
     return lifecycle.openExecNamedStream(context, allocator, options);
+}
+
+/// Copy an explicit host file or directory into a ready named VM.
+pub fn copyInNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: CopyNamedOptions,
+) !void {
+    return lifecycle.copyInNamed(context, allocator, options);
+}
+
+/// Copy an explicit guest file or directory out of a ready named VM.
+pub fn copyOutNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: CopyNamedOptions,
+) !void {
+    return lifecycle.copyOutNamed(context, allocator, options);
 }
 
 /// Snapshot a named VM while it keeps running.

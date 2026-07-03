@@ -39,6 +39,7 @@ pub const CreateNamedOptions = api.CreateNamedOptions;
 pub const ResumeNamedOptions = api.ResumeNamedOptions;
 pub const ForkNamedOptions = api.ForkNamedOptions;
 pub const ExecNamedOptions = api.ExecNamedOptions;
+pub const CopyNamedOptions = api.CopyNamedOptions;
 pub const ExecNamedResult = api.ExecNamedResult;
 pub const ExecNamedStream = api.ExecNamedStream;
 pub const ExecNamedStreamEvent = api.ExecNamedStreamEvent;
@@ -109,6 +110,8 @@ pub const UnpackOptions = api.UnpackOptions;
 pub const UnpackResult = api.UnpackResult;
 
 pub const classifyFailure = api.classifyFailure;
+pub const copyInNamed = api.copyInNamed;
+pub const copyOutNamed = api.copyOutNamed;
 pub const createNamed = api.createNamed;
 pub const deinitExecNamedResult = api.deinitExecNamedResult;
 pub const deinitForkResult = api.deinitForkResult;

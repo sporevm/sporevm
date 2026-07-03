@@ -84,6 +84,10 @@ description = "Smoke multi-vCPU boot, capture, run-from, and resume"
 run = "mise run build && scripts/smoke-lifecycle.sh"
 description = "Smoke named lifecycle create, exec, ls, and rm"
 
+[tasks."smoke:lifecycle-copy"]
+run = "mise run build && scripts/smoke-lifecycle-copy.sh"
+description = "Smoke named lifecycle copy-in and copy-out"
+
 [tasks."smoke:lifecycle-tty"]
 run = "mise run build && scripts/smoke-lifecycle-tty.sh"
 description = "Smoke named lifecycle interactive exec streaming"

@@ -203,6 +203,17 @@ const exec = try libspore.execNamed(context, allocator, .{
 });
 defer libspore.deinitExecNamedResult(allocator, exec);
 
+try libspore.copyInNamed(context, allocator, .{
+    .name = "worker-1",
+    .host_path = "./local.txt",
+    .guest_path = "/tmp/local.txt",
+});
+try libspore.copyOutNamed(context, allocator, .{
+    .name = "worker-1",
+    .guest_path = "/tmp/local.txt",
+    .host_path = "./roundtrip.txt",
+});
+
 var snapshot_annotations = libspore.Annotations{};
 try snapshot_annotations.map.put(allocator, "dev.buildkite.cleanroom.snapshot", "warm");
 const snap = try libspore.snapshotNamed(context, allocator, .{
@@ -238,6 +249,8 @@ The named surface is:
 - `forkNamed`
 - `execNamed`
 - `openExecNamedStream`
+- `copyInNamed`
+- `copyOutNamed`
 - `snapshotNamed`
 - `suspendNamed`
 - `removeNamed`
@@ -246,6 +259,10 @@ The named surface is:
 `snapshotNamed` currently supports snapshot-and-continue only. Use
 `deinitNamedLifecycleResult`, `deinitExecNamedResult`,
 `deinitNamedForkResult`, and `deinitNamedList` for owned results.
+`copyInNamed` and `copyOutNamed` transfer explicit regular files or directory
+trees and reject symlinks, special files, and overwrite. They do not perform
+workspace sync.
+
 `execNamed` returns a bounded stdout/stderr result, so `.interactive = true` or
 `.tty = true` returns `error.UnsupportedInteractiveExec`. Use
 `openExecNamedStream` for `spore exec -i/-t` semantics:
@@ -432,7 +449,8 @@ The generated Zig API docs are installed under
 The C ABI is declared in [`include/spore.h`](../include/spore.h). The current
 surface exposes context management, build info, context-local environment
 overrides, context-local last errors, owned string cleanup, host-info JSON,
-inspect-bundle JSON, inspect-spore JSON, pull JSON, and named lifecycle JSON.
+inspect-bundle JSON, inspect-spore JSON, pull JSON, named lifecycle JSON, and
+named copy side-effect calls.
 
 Release builds publish separate `libspore_Linux_arm64` and
 `libspore_Darwin_arm64` archives so CLI-only installs do not carry development
@@ -594,6 +612,19 @@ if (spore_resume_named_json(context, &resume, &json) != SPORE_SUCCESS) return 1;
 spore_free_string(context, json);
 ```
 
+Named copy calls return only a result code and write details to the context last
+error:
+
+```c
+SporeCopyNamedOptions copy;
+spore_copy_named_options_init(&copy);
+copy.name = (SporeString){ .ptr = "worker", .len = 6 };
+copy.host_path = (SporeString){ .ptr = "./local.txt", .len = 11 };
+copy.guest_path = (SporeString){ .ptr = "/tmp/local.txt", .len = 14 };
+
+if (spore_copy_in_named(context, &copy) != SPORE_SUCCESS) return 1;
+```
+
 Set `SPOREVM_RUNTIME_DIR`, cache roots, and similar process settings with
 `spore_context_set_env` before calling lifecycle functions.
 Named lifecycle monitor subprocesses inherit the context environment.
@@ -675,6 +706,14 @@ if err != nil {
     return err
 }
 
+if err := client.CopyInNamed(ctx, spore.CopyNamedOptions{
+    Name:      "worker",
+    HostPath:  "./local.txt",
+    GuestPath: "/tmp/local.txt",
+}); err != nil {
+    return err
+}
+
 snap, err := client.SnapshotNamed(ctx, spore.SnapshotNamedOptions{
     Name:     "worker",
     OutDir:   "worker.spore",
@@ -738,7 +777,8 @@ _ = removed
 The surface covers build info, context lifetime, host-info, network
 capabilities, inspect-bundle, inspect-spore, pull, context-local environment
 variables through `SetEnv`, and named lifecycle `CreateNamed`, `ExecNamed`,
-`SnapshotNamed`, `ResumeNamed`, `RemoveNamed`, and `ListNamed`.
+`OpenExecNamedStream`, `CopyInNamed`, `CopyOutNamed`, `SnapshotNamed`,
+`ResumeNamed`, `RemoveNamed`, and `ListNamed`.
 `CreateNamedOptions` exposes the create-time network policy supported by the C
 ABI: `NetworkEnabled`, `AllowCIDRs`, `AllowHosts`, exact host/port
 `NetworkRules`, and `BoundServices` for host Unix sockets exposed to the guest.
@@ -758,8 +798,9 @@ the C JSON payload.
 When setting `SPOREVM_RUNTIME_DIR`, pass an absolute directory that exists and
 is private to the current user, matching the named lifecycle registry rules.
 
-The Go binding decodes the same JSON contracts as the CLI and C ABI, and it
-requires C ABI version 11 or newer. Go context cancellation is checked before
+The Go binding decodes the same JSON contracts as the CLI and C ABI where calls
+return JSON, and exposes named copy as error-returning side-effect methods. It
+requires C ABI version 12 or newer. Go context cancellation is checked before
 entering C calls; long-running runtime cancellation is not exposed until the Zig
 product API and C ABI provide it.
 

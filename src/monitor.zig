@@ -404,6 +404,9 @@ const ExecServer = struct {
         if (request.len > self.request.len) return error.ControlRequestTooLarge;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        while (self.state == .done) {
+            self.cond.waitUncancelable(self.io, &self.mutex);
+        }
         if (self.state != .idle) return error.ControlBusy;
         @memcpy(self.request[0..request.len], request);
         self.request_len = request.len;
@@ -426,6 +429,9 @@ const ExecServer = struct {
         if (request.len > self.request.len) return error.ControlRequestTooLarge;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        while (self.state == .done) {
+            self.cond.waitUncancelable(self.io, &self.mutex);
+        }
         if (self.state != .idle) return error.ControlBusy;
         @memcpy(self.request[0..request.len], request);
         self.request_len = request.len;
@@ -441,12 +447,6 @@ const ExecServer = struct {
         while (self.state == .pending_exec) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
-        if (self.state == .done) {
-            self.active_streaming_exec = false;
-            self.streaming_client_fd = -1;
-            self.state = .idle;
-            return error.MonitorRequestFailed;
-        }
     }
 
     fn finishStreamingExec(self: *ExecServer) void {
@@ -457,7 +457,10 @@ const ExecServer = struct {
         }
         self.active_streaming_exec = false;
         self.streaming_client_fd = -1;
-        if (self.state == .done) self.state = .idle;
+        if (self.state == .done) {
+            self.state = .idle;
+            self.cond.broadcast(self.io);
+        }
     }
 
     fn streamingDone(self: *ExecServer) bool {
@@ -493,6 +496,25 @@ const ExecServer = struct {
         self.next_session_id +%= 1;
         if (self.next_session_id == 0) self.next_session_id = 1;
         return run.detachedExecRequestWithSession(self.allocator, argv, session_id);
+    }
+
+    fn copyRequest(self: *ExecServer, request_type: []const u8, path: []const u8) ![]const u8 {
+        var id_buf: [64]u8 = undefined;
+        const session_id = try std.fmt.bufPrint(&id_buf, "lifecycle-{d}", .{self.next_session_id});
+        self.next_session_id +%= 1;
+        if (self.next_session_id == 0) self.next_session_id = 1;
+        const payload = struct {
+            type: []const u8,
+            session_id: []const u8,
+            path: []const u8,
+        }{
+            .type = request_type,
+            .session_id = session_id,
+            .path = path,
+        };
+        const json = try std.json.Stringify.valueAlloc(self.allocator, payload, .{});
+        defer self.allocator.free(json);
+        return std.fmt.allocPrint(self.allocator, "{s}\n", .{json});
     }
 
     fn resetExecCapture(self: *ExecServer) void {
@@ -628,6 +650,9 @@ const ExecServer = struct {
         if (out_dir.len == 0 or out_dir.len > self.suspend_dir.len) return error.InvalidSuspendDir;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        while (self.state == .done) {
+            self.cond.waitUncancelable(self.io, &self.mutex);
+        }
         if (self.state != .idle) return error.ControlBusy;
         @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
         self.suspend_dir_len = out_dir.len;
@@ -645,6 +670,9 @@ const ExecServer = struct {
         if (out_dir.len == 0 or out_dir.len > self.suspend_dir.len) return error.InvalidSuspendDir;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        while (self.state == .done) {
+            self.cond.waitUncancelable(self.io, &self.mutex);
+        }
         if (self.state != .idle) return error.ControlBusy;
         @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
         self.suspend_dir_len = out_dir.len;
@@ -961,6 +989,26 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         proxyStreamingInput(server, stream.socket.handle, if (tty) .terminal else .stdin) catch {};
         return false;
     }
+    if (std.mem.eql(u8, parsed.value.type, "copy-in-v1") or std.mem.eql(u8, parsed.value.type, "copy-out-v1")) {
+        const path = parsed.value.path orelse {
+            try writeStreamingControlError(stream.socket.handle, "copy request missing path");
+            return false;
+        };
+        const request = server.copyRequest(parsed.value.type, path) catch {
+            try writeStreamingControlError(stream.socket.handle, "invalid copy request");
+            return false;
+        };
+        defer server.allocator.free(request);
+        server.submitStreamingExec(request, stream.socket.handle) catch {
+            try writeStreamingControlError(stream.socket.handle, "monitor busy");
+            return false;
+        };
+        defer server.finishStreamingExec();
+        if (std.mem.eql(u8, parsed.value.type, "copy-in-v1")) {
+            proxyStreamingInput(server, stream.socket.handle, .stdin) catch {};
+        }
+        return false;
+    }
     const detached = std.mem.eql(u8, parsed.value.type, "start");
     if (!detached and !std.mem.eql(u8, parsed.value.type, "exec")) {
         try writeControlError(server.io, stream, "unknown control request");
@@ -1012,6 +1060,7 @@ const ControlRequest = struct {
     type: []const u8,
     argv: ?[]const []const u8 = null,
     out_dir: ?[]const u8 = null,
+    path: ?[]const u8 = null,
     @"continue": ?bool = null,
     stdio: ?[]const u8 = null,
     interactive: ?bool = null,

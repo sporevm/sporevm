@@ -79,6 +79,7 @@ typedef struct SporeExecNamedStreamImpl *SporeExecNamedStream;
 #define SPORE_FORK_NAMED_OPTIONS_VERSION 1u
 #define SPORE_EXEC_NAMED_OPTIONS_VERSION 2u
 #define SPORE_EXEC_NAMED_STREAM_OPTIONS_VERSION 1u
+#define SPORE_COPY_NAMED_OPTIONS_VERSION 1u
 #define SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION 2u
 #define SPORE_SUSPEND_NAMED_OPTIONS_VERSION 1u
 #define SPORE_REMOVE_NAMED_OPTIONS_VERSION 1u
@@ -247,6 +248,15 @@ typedef struct SporeExecNamedStreamEvent {
   uint8_t exit_code;
 } SporeExecNamedStreamEvent;
 
+/** Options for spore_copy_in_named() and spore_copy_out_named(). */
+typedef struct SporeCopyNamedOptions {
+  uint32_t size;
+  uint32_t version;
+  SporeString name;
+  SporeString host_path;
+  SporeString guest_path;
+} SporeCopyNamedOptions;
+
 /** Options for spore_resume_named_json(). */
 typedef struct SporeResumeNamedOptions {
   uint32_t size;
@@ -317,6 +327,9 @@ SPORE_API void spore_exec_named_options_init(SporeExecNamedOptions *options);
 
 /** Initialize streaming exec options with defaults. */
 SPORE_API void spore_exec_named_stream_options_init(SporeExecNamedStreamOptions *options);
+
+/** Initialize named copy options with defaults. */
+SPORE_API void spore_copy_named_options_init(SporeCopyNamedOptions *options);
 
 /** Initialize resume-named options with defaults. */
 SPORE_API void spore_resume_named_options_init(SporeResumeNamedOptions *options);
@@ -463,6 +476,14 @@ SPORE_API SporeResult spore_exec_named_stream_resize_terminal(SporeContext conte
 /** Free a streaming exec session. */
 SPORE_API void spore_exec_named_stream_free(SporeContext context,
                                             SporeExecNamedStream stream);
+
+/** Copy an explicit host file or directory into a named VM. */
+SPORE_API SporeResult spore_copy_in_named(SporeContext context,
+                                          const SporeCopyNamedOptions *options);
+
+/** Copy an explicit guest file or directory out of a named VM. */
+SPORE_API SporeResult spore_copy_out_named(SporeContext context,
+                                           const SporeCopyNamedOptions *options);
 
 /**
  * Resume a named VM from a spore checkpoint and return `spore.lifecycle.v1`

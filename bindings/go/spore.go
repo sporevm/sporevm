@@ -16,7 +16,7 @@ import (
 	"unsafe"
 )
 
-const minABIVersion uint32 = 11
+const minABIVersion uint32 = 12
 
 var ErrClosed = errors.New("spore client closed")
 var ErrStreamClosed = errors.New("spore exec stream closed")
@@ -344,6 +344,54 @@ func (c *Client) ExecNamed(ctx context.Context, options ExecNamedOptions) (ExecN
 	}
 	defer C.spore_free_string(c.ctx, out)
 	return decodeJSON[ExecNamedResult](goBytes(out), "exec named result")
+}
+
+// CopyInNamed copies an explicit host file or directory into a named VM.
+func (c *Client) CopyInNamed(ctx context.Context, options CopyNamedOptions) error {
+	if err := c.ready(ctx); err != nil {
+		return err
+	}
+	name, freeName := cString(options.Name)
+	defer freeName()
+	hostPath, freeHostPath := cString(options.HostPath)
+	defer freeHostPath()
+	guestPath, freeGuestPath := cString(options.GuestPath)
+	defer freeGuestPath()
+
+	var opts C.SporeCopyNamedOptions
+	C.spore_copy_named_options_init(&opts)
+	opts.name = name
+	opts.host_path = hostPath
+	opts.guest_path = guestPath
+
+	if result := Result(C.spore_copy_in_named(c.ctx, &opts)); result != Success {
+		return c.callError(result)
+	}
+	return nil
+}
+
+// CopyOutNamed copies an explicit guest file or directory out of a named VM.
+func (c *Client) CopyOutNamed(ctx context.Context, options CopyNamedOptions) error {
+	if err := c.ready(ctx); err != nil {
+		return err
+	}
+	name, freeName := cString(options.Name)
+	defer freeName()
+	hostPath, freeHostPath := cString(options.HostPath)
+	defer freeHostPath()
+	guestPath, freeGuestPath := cString(options.GuestPath)
+	defer freeGuestPath()
+
+	var opts C.SporeCopyNamedOptions
+	C.spore_copy_named_options_init(&opts)
+	opts.name = name
+	opts.host_path = hostPath
+	opts.guest_path = guestPath
+
+	if result := Result(C.spore_copy_out_named(c.ctx, &opts)); result != Success {
+		return c.callError(result)
+	}
+	return nil
 }
 
 // OpenExecNamedStream opens a bidirectional streaming exec session.

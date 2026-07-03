@@ -49,7 +49,7 @@ fuzz targets from the slice that introduces it:
 | `spore run --inject` files | caller-provided local files | host validates flat injected file ids and regular non-symlink source files, appends bytes to the existing initrd as `newc` entries, and the initrd agent copies only flat regular files into `/run/sporevm/injected` tmpfs before exec. The bytes are not rootfs cache inputs, and injection is rejected with `--capture` and `--from` to avoid ambiguous persistence |
 | OCI manifest, OCI layout, and layer decode | registry, local OCI layout | rootfs builder only, outside the monitor process; mutable tags are resolved into digest-pinned refs before build materialization, local refs resolve to digest-pinned local identities, blobs are verified, layout tar extraction and layer tar application are path-safe, PAX xattr handling is bounded and limited to deliberately supported capability records, and JSON/tar fuzz targets cover parser inputs |
 | Generation device inputs | guest | MMIO register surface and fork/resume params schema are fuzz/unit covered |
-| Control socket JSON and named exec SPIO stream | local consumers | local-only lifecycle monitor protocol is implemented for HVF and KVM, including fixed-RAM multi-vCPU create, exec, suspend, and named resume; interactive named exec uses a streaming control request plus the same bounded SPIO frame parser for stdin, terminal input, resize, terminal output, and exit; monitor processes deny child process execution through an embedded macOS sandbox profile or Linux seccomp filter; malformed requests fail closed and the socket is protected by private runtime-directory permissions |
+| Control socket JSON and named exec/copy SPIO stream | local consumers | local-only lifecycle monitor protocol is implemented for HVF and KVM, including fixed-RAM multi-vCPU create, exec, file copy, suspend, and named resume; interactive named exec and named file copy use streaming control requests plus the same bounded SPIO frame parser for stdin, terminal input, resize, terminal output, and exit; copy requests accept explicit regular files or directory trees, reject non-absolute guest paths plus `.`/`..` components, reject symlinks and special files, publish copy-in through no-overwrite temp paths, and create copy-out host destinations with no-overwrite flags; monitor processes deny child process execution through an embedded macOS sandbox profile or Linux seccomp filter; malformed requests fail closed and the socket is protected by private runtime-directory permissions |
 
 ## Structural Rules
 
@@ -63,7 +63,7 @@ fuzz targets from the slice that introduces it:
 - **The stable monitor scope is local named lifecycle.** `spore create`,
   `spore exec`, `spore suspend`, `spore resume --name`, `spore ls`, and
   `spore rm` are available on supported backends, with fixed-RAM multi-vCPU
-  create, exec, suspend, and named resume. Monitor processes deny child process
+  create, exec, explicit file/directory copy, suspend, and named resume. Monitor processes deny child process
   execution through an embedded macOS sandbox profile or Linux seccomp filter
   after optional startup helpers are spawned, covered by
   `mise run smoke:monitor-jail`. Disk-backed named checkpointing preserves

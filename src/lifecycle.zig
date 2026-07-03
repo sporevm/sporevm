@@ -103,6 +103,24 @@ const exec_usage =
     \\
 ;
 
+const copy_in_usage =
+    \\Usage:
+    \\  spore copy-in NAME HOST_PATH GUEST_PATH
+    \\
+    \\Copies one host file or directory into a running named VM. The guest path
+    \\must be absolute and must not already exist.
+    \\
+;
+
+const copy_out_usage =
+    \\Usage:
+    \\  spore copy-out NAME GUEST_PATH HOST_PATH
+    \\
+    \\Copies one guest file or directory out of a running named VM. The host path must
+    \\not already exist.
+    \\
+;
+
 const rm_usage =
     \\Usage:
     \\  spore rm NAME
@@ -385,6 +403,12 @@ pub const ExecNamedOptions = struct {
     network_policy: ?spore_net_policy.NetworkPolicy = null,
     interactive: bool = false,
     tty: bool = false,
+};
+
+pub const CopyNamedOptions = struct {
+    name: []const u8,
+    host_path: []const u8,
+    guest_path: []const u8,
 };
 
 pub const SnapshotNamedOptions = struct {
@@ -832,6 +856,50 @@ pub fn openExecNamedStream(
     return openExecNamedStreamAt(context, arena, ready.value.control_socket_path, options);
 }
 
+pub fn copyInNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: CopyNamedOptions,
+) !void {
+    var archive = try createCopyArchive(allocator, context.io, options.host_path);
+    defer archive.deinit(context.io);
+
+    const source_fd = try openHostFileRead(allocator, context.io, archive.path);
+    defer _ = std.c.close(source_fd);
+
+    const exit_code = try copyNamedStreaming(context, allocator, options, "copy-in-v1", .{
+        .input_fd = source_fd,
+        .stdout_fd = -1,
+        .stderr_fd = -1,
+    });
+    if (exit_code != 0) return error.GuestCopyFailed;
+}
+
+pub fn copyOutNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: CopyNamedOptions,
+) !void {
+    var archive = try createEmptyCopyArchive(allocator, context.io);
+    defer archive.deinit(context.io);
+
+    const archive_fd = try openHostFileCreate(allocator, archive.path);
+    var archive_fd_open = true;
+    defer {
+        if (archive_fd_open) _ = std.c.close(archive_fd);
+    }
+
+    const exit_code = try copyNamedStreaming(context, allocator, options, "copy-out-v1", .{
+        .stdout_fd = archive_fd,
+        .stderr_fd = -1,
+    });
+    _ = std.c.close(archive_fd);
+    archive_fd_open = false;
+
+    if (exit_code != 0) return error.GuestCopyFailed;
+    try extractCopyArchive(allocator, context.io, archive.path, options.host_path);
+}
+
 fn execNamedStreaming(
     context: Context,
     allocator: std.mem.Allocator,
@@ -858,6 +926,25 @@ fn execNamedStreaming(
         .terminal_name = terminalName(context.environ_map),
         .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
     });
+}
+
+fn copyNamedStreaming(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: CopyNamedOptions,
+    request_type: []const u8,
+    fds: CopyStreamFds,
+) !u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const paths = try apiPaths(context, arena, options.name);
+    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    if (state != .ready) return error.NamedVmNotReady;
+    var ready = try readReady(arena, context.io, paths);
+    defer ready.deinit();
+    return copyStreamControl(context, arena, ready.value.control_socket_path, request_type, options.guest_path, fds);
 }
 
 fn startNamed(
@@ -1297,6 +1384,98 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     defer deinitExecNamedResult(allocator, result);
     try writeExecNamedResult(stdout, result);
     if (result.exit_code != 0) std.process.exit(result.exit_code);
+}
+
+pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    if (wantsHelp(args)) {
+        try stdout.writeAll(copy_in_usage);
+        return;
+    }
+    const parsed = parseCopyInArgs(args);
+    const allocator = init.arena.allocator();
+
+    var archive = createCopyArchive(allocator, init.io, parsed.host_path) catch |err| {
+        std.debug.print("spore copy-in: cannot archive host path {s}: {s}\n", .{ parsed.host_path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer archive.deinit(init.io);
+
+    const source_fd = openHostFileRead(allocator, init.io, archive.path) catch |err| {
+        std.debug.print("spore copy-in: cannot read transfer archive: {s}\n", .{@errorName(err)});
+        exitAfterCopyArchiveCleanup(&archive, init.io, 1);
+    };
+    defer _ = std.c.close(source_fd);
+
+    const exit_code = copyNamedStreaming(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, allocator, parsed, "copy-in-v1", .{ .input_fd = source_fd }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => {
+            archive.deinit(init.io);
+            cliRuntimePathExit("copy-in", err);
+        },
+        error.NamedVmNotReady => {
+            std.debug.print("spore copy-in: VM is not ready: {s}\n", .{parsed.name});
+            exitAfterCopyArchiveCleanup(&archive, init.io, 2);
+        },
+        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+            std.debug.print("spore copy-in: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) });
+            exitAfterCopyArchiveCleanup(&archive, init.io, 1);
+        },
+        else => |e| return e,
+    };
+    if (exit_code != 0) exitAfterCopyArchiveCleanup(&archive, init.io, exit_code);
+}
+
+pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    if (wantsHelp(args)) {
+        try stdout.writeAll(copy_out_usage);
+        return;
+    }
+    const parsed = parseCopyOutArgs(args);
+    const allocator = init.arena.allocator();
+
+    var archive = createEmptyCopyArchive(allocator, init.io) catch |err| {
+        std.debug.print("spore copy-out: cannot create transfer archive: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer archive.deinit(init.io);
+
+    const archive_fd = openHostFileCreate(allocator, archive.path) catch |err| {
+        std.debug.print("spore copy-out: cannot open transfer archive: {s}\n", .{@errorName(err)});
+        exitAfterCopyArchiveCleanup(&archive, init.io, 1);
+    };
+    var archive_fd_open = true;
+    defer {
+        if (archive_fd_open) _ = std.c.close(archive_fd);
+    }
+
+    const exit_code = copyNamedStreaming(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, allocator, parsed, "copy-out-v1", .{ .stdout_fd = archive_fd }) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir => {
+            archive.deinit(init.io);
+            cliRuntimePathExit("copy-out", err);
+        },
+        error.NamedVmNotReady => {
+            std.debug.print("spore copy-out: VM is not ready: {s}\n", .{parsed.name});
+            exitAfterCopyArchiveCleanup(&archive, init.io, 2);
+        },
+        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+            std.debug.print("spore copy-out: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) });
+            exitAfterCopyArchiveCleanup(&archive, init.io, 1);
+        },
+        else => |e| return e,
+    };
+    _ = std.c.close(archive_fd);
+    archive_fd_open = false;
+
+    if (exit_code != 0) exitAfterCopyArchiveCleanup(&archive, init.io, exit_code);
+    extractCopyArchive(allocator, init.io, archive.path, parsed.host_path) catch |err| {
+        std.debug.print("spore copy-out: cannot write host path {s}: {s}\n", .{ parsed.host_path, @errorName(err) });
+        exitAfterCopyArchiveCleanup(&archive, init.io, 1);
+    };
 }
 
 fn validateExecTerminalPolicy(parsed: ExecOptions) void {
@@ -2247,6 +2426,26 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
     };
 }
 
+fn parseCopyInArgs(args: []const []const u8) CopyNamedOptions {
+    if (args.len != 3) usageExit(copy_in_usage);
+    validateNameOrExit("copy-in", args[0]) catch unreachable;
+    return .{
+        .name = args[0],
+        .host_path = args[1],
+        .guest_path = args[2],
+    };
+}
+
+fn parseCopyOutArgs(args: []const []const u8) CopyNamedOptions {
+    if (args.len != 3) usageExit(copy_out_usage);
+    validateNameOrExit("copy-out", args[0]) catch unreachable;
+    return .{
+        .name = args[0],
+        .guest_path = args[1],
+        .host_path = args[2],
+    };
+}
+
 fn parseRmArgs(args: []const []const u8, allocator: std.mem.Allocator, stderr: *Io.Writer, mode: machine_output.Mode) []const u8 {
     if (args.len != 1) {
         exitLifecycleCliError(
@@ -2834,6 +3033,53 @@ fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path
     return pump.run();
 }
 
+fn copyStreamControl(
+    context: Context,
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    request_type: []const u8,
+    guest_path: []const u8,
+    fds: CopyStreamFds,
+) !u8 {
+    var stream = try openCopyNamedStreamAt(context, allocator, socket_path, request_type, guest_path);
+    defer stream.deinit();
+
+    var pump = ExecStreamPump{
+        .stream = &stream,
+        .interactive = std.mem.eql(u8, request_type, "copy-in-v1"),
+        .tty = false,
+        .input_fd = fds.input_fd,
+        .stdout_fd = fds.stdout_fd,
+        .stderr_fd = fds.stderr_fd,
+    };
+    return pump.run();
+}
+
+fn openCopyNamedStreamAt(
+    context: Context,
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    request_type: []const u8,
+    guest_path: []const u8,
+) !ExecNamedStream {
+    const payload = struct {
+        type: []const u8,
+        path: []const u8,
+    }{
+        .type = request_type,
+        .path = guest_path,
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+
+    const address = try net.UnixAddress.init(socket_path);
+    const stream = address.connect(context.io) catch return error.MonitorUnavailable;
+    errdefer stream.close(context.io);
+    writeAll(context.io, stream, json) catch return error.MonitorUnavailable;
+    writeAll(context.io, stream, "\n") catch return error.MonitorUnavailable;
+    return .{ .io = context.io, .stream = stream };
+}
+
 fn sendStartRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8) ![]const u8 {
     const payload = struct {
         type: []const u8 = "start",
@@ -2882,10 +3128,19 @@ fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8
     return allocator.dupe(u8, line);
 }
 
+const CopyStreamFds = struct {
+    input_fd: std.c.fd_t = 0,
+    stdout_fd: std.c.fd_t = 1,
+    stderr_fd: std.c.fd_t = 2,
+};
+
 const ExecStreamPump = struct {
     stream: *ExecNamedStream,
     interactive: bool,
     tty: bool,
+    input_fd: std.c.fd_t = 0,
+    stdout_fd: std.c.fd_t = 1,
+    stderr_fd: std.c.fd_t = 2,
     stdin_closed: bool = false,
     resize_seen: u32 = 0,
 
@@ -2894,14 +3149,18 @@ const ExecStreamPump = struct {
             try self.maybeSendResize();
             var fds = [_]std.posix.pollfd{
                 .{ .fd = self.stream.stream.socket.handle, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
-                .{ .fd = if (self.interactive) 0 else -1, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
+                .{ .fd = if (self.interactive) self.input_fd else -1, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
             };
             const ready = std.posix.poll(&fds, 100) catch return error.MonitorUnavailable;
             if (ready == 0) continue;
+            var read_control_frame = false;
             if ((fds[0].revents & std.c.POLL.IN) != 0) {
+                read_control_frame = true;
                 if (try self.readOutputFrame()) |exit_code| return exit_code;
             }
-            if ((fds[0].revents & (std.c.POLL.HUP | std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) return error.MonitorUnavailable;
+            if (!read_control_frame and (fds[0].revents & (std.c.POLL.HUP | std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) {
+                return error.MonitorUnavailable;
+            }
             if (self.interactive and (fds[1].revents & (std.c.POLL.IN | std.c.POLL.HUP)) != 0) {
                 try self.forwardStdin();
             }
@@ -2912,17 +3171,19 @@ const ExecStreamPump = struct {
     fn readOutputFrame(self: *ExecStreamPump) !?u8 {
         switch (try self.stream.next()) {
             .stdout, .terminal => |bytes| {
-                try writeFdAll(1, bytes);
+                if (self.stdout_fd >= 0) try writeFdAll(self.stdout_fd, bytes);
                 return null;
             },
             .stderr => |bytes| {
-                try writeFdAll(2, bytes);
+                if (self.stderr_fd >= 0) try writeFdAll(self.stderr_fd, bytes);
                 return null;
             },
             .exit => |code| return code,
             .err => |bytes| {
-                try writeFdAll(2, bytes);
-                if (bytes.len != 0 and bytes[bytes.len - 1] != '\n') try writeFdAll(2, "\n");
+                if (self.stderr_fd >= 0) {
+                    try writeFdAll(self.stderr_fd, bytes);
+                    if (bytes.len != 0 and bytes[bytes.len - 1] != '\n') try writeFdAll(self.stderr_fd, "\n");
+                }
                 return error.MonitorRequestFailed;
             },
         }
@@ -2931,7 +3192,7 @@ const ExecStreamPump = struct {
     fn forwardStdin(self: *ExecStreamPump) !void {
         if (self.stdin_closed) return;
         var buf: [4096]u8 = undefined;
-        const n = std.c.read(0, &buf, buf.len);
+        const n = std.c.read(self.input_fd, &buf, buf.len);
         if (n < 0) {
             switch (std.c.errno(n)) {
                 .INTR => return,
@@ -3215,6 +3476,311 @@ fn decodeControlOutput(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 
     return decoded;
 }
 
+const copy_archive_magic = "SPCP1\n\x00\n";
+const copy_record_header_len = 16;
+const max_copy_archive_path = 512;
+
+const CopyArchiveKind = enum(u8) {
+    file = 'F',
+    directory = 'D',
+    end = 'E',
+};
+
+const CopyArchive = struct {
+    allocator: std.mem.Allocator,
+    dir: [:0]u8,
+    path: []const u8,
+
+    fn deinit(self: *CopyArchive, io: Io) void {
+        Io.Dir.cwd().deleteTree(io, self.dir) catch {};
+        self.allocator.free(self.path);
+        self.allocator.free(self.dir);
+    }
+};
+
+fn exitAfterCopyArchiveCleanup(archive: *CopyArchive, io: Io, code: u8) noreturn {
+    archive.deinit(io);
+    std.process.exit(code);
+}
+
+const CopyRecord = struct {
+    kind: CopyArchiveKind,
+    path: []const u8,
+    mode: u32,
+    size: u64,
+};
+
+extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
+
+fn createCopyArchive(allocator: std.mem.Allocator, io: Io, host_path: []const u8) !CopyArchive {
+    var archive = try createEmptyCopyArchive(allocator, io);
+    errdefer archive.deinit(io);
+
+    var file = try Io.Dir.createFileAbsolute(io, archive.path, .{
+        .exclusive = true,
+        .permissions = @enumFromInt(0o600),
+    });
+    defer file.close(io);
+
+    try file.writeStreamingAll(io, copy_archive_magic);
+    try writeHostPathArchive(allocator, io, file, host_path);
+    try writeCopyRecordHeader(file, io, .end, "", 0, 0);
+    return archive;
+}
+
+fn createEmptyCopyArchive(allocator: std.mem.Allocator, io: Io) !CopyArchive {
+    _ = io;
+    const tmpl = "/tmp/sporevm-copy-XXXXXX";
+    const dir = try allocator.dupeZ(u8, tmpl);
+    errdefer allocator.free(dir);
+    if (mkdtemp(dir) == null) return error.IoFailed;
+    const path = try std.fmt.allocPrint(allocator, "{s}/payload.spcp", .{std.mem.sliceTo(dir, 0)});
+    errdefer allocator.free(path);
+    return .{ .allocator = allocator, .dir = dir, .path = path };
+}
+
+fn writeHostPathArchive(allocator: std.mem.Allocator, io: Io, archive: Io.File, host_path: []const u8) !void {
+    const stat = try Io.Dir.cwd().statFile(io, host_path, .{ .follow_symlinks = false });
+    switch (stat.kind) {
+        .file => try writeHostFileRecord(io, archive, Io.Dir.cwd(), host_path, "", stat),
+        .directory => {
+            try writeCopyRecordHeader(archive, io, .directory, "", modeFromStat(stat), 0);
+            var dir = try openDirPath(io, host_path, .{ .iterate = true, .follow_symlinks = false });
+            defer dir.close(io);
+            var walker = try dir.walk(allocator);
+            defer walker.deinit();
+            while (try walker.next(io)) |entry| {
+                try validateCopyArchivePath(entry.path, false);
+                const entry_stat = try entry.dir.statFile(io, entry.basename, .{ .follow_symlinks = false });
+                switch (entry.kind) {
+                    .file => try writeHostFileRecord(io, archive, entry.dir, entry.basename, entry.path, entry_stat),
+                    .directory => try writeCopyRecordHeader(archive, io, .directory, entry.path, modeFromStat(entry_stat), 0),
+                    else => return error.UnsupportedCopyEntry,
+                }
+            }
+        },
+        else => return error.UnsupportedCopyEntry,
+    }
+}
+
+fn writeHostFileRecord(
+    io: Io,
+    archive: Io.File,
+    source_dir: Io.Dir,
+    source_path: []const u8,
+    archive_path: []const u8,
+    stat: Io.File.Stat,
+) !void {
+    if (stat.kind != .file) return error.UnsupportedCopyEntry;
+    try writeCopyRecordHeader(archive, io, .file, archive_path, modeFromStat(stat), stat.size);
+    const open_options: Io.Dir.OpenFileOptions = .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    };
+    var source = if (Io.Dir.path.isAbsolute(source_path))
+        try Io.Dir.openFileAbsolute(io, source_path, open_options)
+    else
+        try source_dir.openFile(io, source_path, open_options);
+    defer source.close(io);
+    var buf: [64 * 1024]u8 = undefined;
+    var remaining = stat.size;
+    while (remaining > 0) {
+        const want: usize = @intCast(@min(remaining, buf.len));
+        const n = source.readStreaming(io, &.{buf[0..want]}) catch |err| switch (err) {
+            error.EndOfStream => return error.ShortRead,
+            else => |e| return e,
+        };
+        if (n == 0) return error.ShortRead;
+        try archive.writeStreamingAll(io, buf[0..n]);
+        remaining -= n;
+    }
+}
+
+fn writeCopyRecordHeader(
+    archive: Io.File,
+    io: Io,
+    kind: CopyArchiveKind,
+    archive_path: []const u8,
+    mode: u32,
+    size: u64,
+) !void {
+    if (kind != .end) try validateCopyArchivePath(archive_path, true);
+    if (archive_path.len > max_copy_archive_path) return error.NameTooLong;
+    var header: [copy_record_header_len]u8 = undefined;
+    header[0] = @intFromEnum(kind);
+    std.mem.writeInt(u16, header[1..3], @intCast(archive_path.len), .little);
+    std.mem.writeInt(u32, header[3..7], mode & 0o777, .little);
+    std.mem.writeInt(u64, header[7..15], size, .little);
+    header[15] = 0;
+    try archive.writeStreamingAll(io, &header);
+    if (archive_path.len != 0) try archive.writeStreamingAll(io, archive_path);
+}
+
+fn extractCopyArchive(allocator: std.mem.Allocator, io: Io, archive_path: []const u8, host_path: []const u8) !void {
+    var archive = try Io.Dir.openFileAbsolute(io, archive_path, .{ .mode = .read_only, .allow_directory = false });
+    defer archive.close(io);
+
+    var magic: [copy_archive_magic.len]u8 = undefined;
+    try readArchiveExact(archive, io, &magic);
+    if (!std.mem.eql(u8, &magic, copy_archive_magic)) return error.BadCopyArchive;
+
+    var path_buf: [max_copy_archive_path]u8 = undefined;
+    const root = try readCopyRecord(archive, io, &path_buf);
+    if (root.path.len != 0) return error.BadCopyArchive;
+    switch (root.kind) {
+        .file => {
+            const fd = try createHostOutputFile(allocator, host_path, root.mode);
+            var keep = false;
+            defer {
+                _ = std.c.close(fd);
+                if (!keep) Io.Dir.cwd().deleteFile(io, host_path) catch {};
+            }
+            try copyArchiveFileToFd(archive, io, fd, root.size);
+            try expectCopyArchiveEnd(archive, io, &path_buf);
+            try expectCopyArchiveEof(archive, io);
+            keep = true;
+        },
+        .directory => {
+            try createHostOutputDir(allocator, host_path, root.mode);
+            var keep = false;
+            defer if (!keep) Io.Dir.cwd().deleteTree(io, host_path) catch {};
+            while (true) {
+                const record = try readCopyRecord(archive, io, &path_buf);
+                if (record.kind == .end) break;
+                if (record.path.len == 0) return error.BadCopyArchive;
+                const target = try std.fs.path.join(allocator, &.{ host_path, record.path });
+                defer allocator.free(target);
+                switch (record.kind) {
+                    .file => {
+                        const fd = try createHostOutputFile(allocator, target, record.mode);
+                        defer _ = std.c.close(fd);
+                        try copyArchiveFileToFd(archive, io, fd, record.size);
+                    },
+                    .directory => try createHostOutputDir(allocator, target, record.mode),
+                    .end => unreachable,
+                }
+            }
+            try expectCopyArchiveEof(archive, io);
+            keep = true;
+        },
+        .end => return error.BadCopyArchive,
+    }
+}
+
+fn readCopyRecord(archive: Io.File, io: Io, path_buf: *[max_copy_archive_path]u8) !CopyRecord {
+    var header: [copy_record_header_len]u8 = undefined;
+    try readArchiveExact(archive, io, &header);
+    const kind: CopyArchiveKind = switch (header[0]) {
+        @intFromEnum(CopyArchiveKind.file) => .file,
+        @intFromEnum(CopyArchiveKind.directory) => .directory,
+        @intFromEnum(CopyArchiveKind.end) => .end,
+        else => return error.BadCopyArchive,
+    };
+    const path_len = std.mem.readInt(u16, header[1..3], .little);
+    const mode = std.mem.readInt(u32, header[3..7], .little);
+    const size = std.mem.readInt(u64, header[7..15], .little);
+    if (header[15] != 0 or path_len > path_buf.len or (mode & ~@as(u32, 0o777)) != 0) return error.BadCopyArchive;
+    const path = path_buf[0..path_len];
+    if (path.len != 0) try readArchiveExact(archive, io, path);
+    if (kind == .end) {
+        if (path.len != 0 or mode != 0 or size != 0) return error.BadCopyArchive;
+    } else {
+        try validateCopyArchivePath(path, true);
+        if (kind == .directory and size != 0) return error.BadCopyArchive;
+    }
+    return .{ .kind = kind, .path = path, .mode = mode & 0o777, .size = size };
+}
+
+fn expectCopyArchiveEnd(archive: Io.File, io: Io, path_buf: *[max_copy_archive_path]u8) !void {
+    const record = try readCopyRecord(archive, io, path_buf);
+    if (record.kind != .end) return error.BadCopyArchive;
+}
+
+fn expectCopyArchiveEof(archive: Io.File, io: Io) !void {
+    var byte: [1]u8 = undefined;
+    const n = archive.readStreaming(io, &.{byte[0..]}) catch |err| switch (err) {
+        error.EndOfStream => return,
+        else => |e| return e,
+    };
+    if (n == 0) return;
+    return error.BadCopyArchive;
+}
+
+fn readArchiveExact(archive: Io.File, io: Io, buf: []u8) !void {
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = archive.readStreaming(io, &.{buf[filled..]}) catch |err| switch (err) {
+            error.EndOfStream => return error.BadCopyArchive,
+            else => |e| return e,
+        };
+        if (n == 0) return error.BadCopyArchive;
+        filled += n;
+    }
+}
+
+fn copyArchiveFileToFd(archive: Io.File, io: Io, fd: std.c.fd_t, size: u64) !void {
+    var remaining = size;
+    var buf: [64 * 1024]u8 = undefined;
+    while (remaining > 0) {
+        const want: usize = @intCast(@min(remaining, buf.len));
+        try readArchiveExact(archive, io, buf[0..want]);
+        try writeFdAll(fd, buf[0..want]);
+        remaining -= want;
+    }
+}
+
+fn validateCopyArchivePath(path: []const u8, allow_root: bool) !void {
+    if (path.len == 0) {
+        if (allow_root) return;
+        return error.BadCopyArchivePath;
+    }
+    if (path.len > max_copy_archive_path or path[0] == '/' or path[path.len - 1] == '/') return error.BadCopyArchivePath;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |part| {
+        if (part.len == 0) return error.BadCopyArchivePath;
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.BadCopyArchivePath;
+        if (std.mem.indexOfScalar(u8, part, 0) != null) return error.BadCopyArchivePath;
+    }
+}
+
+fn createHostOutputFile(allocator: std.mem.Allocator, path: []const u8, mode: u32) !std.c.fd_t {
+    const fd = try openHostFileCreate(allocator, path);
+    if (std.c.fchmod(fd, @intCast(mode & 0o777)) != 0) {
+        _ = std.c.close(fd);
+        return error.ChmodFailed;
+    }
+    return fd;
+}
+
+fn createHostOutputDir(allocator: std.mem.Allocator, path: []const u8, mode: u32) !void {
+    const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
+    if (std.c.mkdir(pathz, @intCast((mode & 0o777) | 0o700)) != 0) return error.CreateDirFailed;
+}
+
+fn modeFromStat(stat: Io.File.Stat) u32 {
+    return @intCast(@intFromEnum(stat.permissions) & 0o777);
+}
+
+fn openHostFileRead(allocator: std.mem.Allocator, io: Io, path: []const u8) !std.c.fd_t {
+    const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    if (stat.kind != .file) return error.NotRegularFile;
+    const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.OpenFailed;
+    return fd;
+}
+
+fn openHostFileCreate(allocator: std.mem.Allocator, path: []const u8) !std.c.fd_t {
+    const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
+    if (fd < 0) return error.OpenFailed;
+    return fd;
+}
+
 fn writeRawStderr(bytes: []const u8) !void {
     var remaining = bytes;
     while (remaining.len > 0) {
@@ -3472,6 +4038,56 @@ test "lifecycle validates VM names" {
     try std.testing.expectError(error.InvalidVMName, validateName("."));
     try std.testing.expectError(error.InvalidVMName, validateName("bad/name"));
     try std.testing.expectError(error.InvalidVMName, validateName("bad name"));
+}
+
+test "copy archive paths reject traversal" {
+    try validateCopyArchivePath("", true);
+    try validateCopyArchivePath("dir/file.txt", false);
+    try validateCopyArchivePath("one-two/three_four", false);
+
+    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("", false));
+    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("/absolute", true));
+    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("dir/", true));
+    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("dir//file", true));
+    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath(".", true));
+    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("dir/..", true));
+    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("dir/./file", true));
+    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("dir\x00/file", true));
+}
+
+test "copy archive extraction writes children under read-only directories" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const pid = if (comptime builtin.os.tag == .windows) 1 else std.c.getpid();
+    const root = try std.fmt.allocPrint(allocator, "/tmp/sporevm-test-copy-archive-readonly-{d}", .{pid});
+    defer allocator.free(root);
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = try Io.Dir.cwd().createDirPathStatus(io, root, @enumFromInt(0o755));
+
+    const archive_path = try std.fs.path.join(allocator, &.{ root, "payload.spcp" });
+    defer allocator.free(archive_path);
+    const out_path = try std.fs.path.join(allocator, &.{ root, "out" });
+    defer allocator.free(out_path);
+    const child_path = try std.fs.path.join(allocator, &.{ out_path, "child.txt" });
+    defer allocator.free(child_path);
+
+    {
+        var archive = try Io.Dir.createFileAbsolute(io, archive_path, .{
+            .exclusive = true,
+            .permissions = @enumFromInt(0o600),
+        });
+        defer archive.close(io);
+        try archive.writeStreamingAll(io, copy_archive_magic);
+        try writeCopyRecordHeader(archive, io, .directory, "", 0o555, 0);
+        try writeCopyRecordHeader(archive, io, .file, "child.txt", 0o644, 8);
+        try archive.writeStreamingAll(io, "readonly");
+        try writeCopyRecordHeader(archive, io, .end, "", 0, 0);
+    }
+
+    try extractCopyArchive(allocator, io, archive_path, out_path);
+    const data = try Io.Dir.cwd().readFileAlloc(io, child_path, allocator, .limited(32));
+    defer allocator.free(data);
+    try std.testing.expectEqualStrings("readonly", data);
 }
 
 test "lifecycle result carries stable schema" {
