@@ -139,11 +139,20 @@ reimportable image-rootfs files that are not hardlinked to digest-addressed
 artifacts.
 
 `spore system df --rootfs` also reports rootfs CAS index and object bytes.
-`spore system prune --rootfs` does not delete digest-addressed exact artifacts
-or rootfs CAS files by default because those bytes can be required by existing
-captured spores and metadata-only bundles. Add `--include-digest-artifacts`
-only when you are comfortable making affected spores fail closed until their
-exact rootfs bytes or rootfs CAS bytes are restored.
+`spore system prune --rootfs` does not delete digest-addressed artifacts or
+rootfs CAS files by default. The two are distinct data classes with distinct
+prune selectors:
+
+- `--include-digest-artifacts` prunes the flat digest-addressed ext4 artifacts,
+  which are the resume authority. Removing one makes affected spores fail
+  closed until their rootfs bytes are restored (re-pull, or re-materialized
+  from surviving chunks).
+- `--include-rootfs-chunks` prunes the derived rootfs CAS index and chunk
+  objects. This is safe when the flat artifact remains: resume serves the flat
+  artifact directly, and `spore pack` re-derives missing chunks from it. Use
+  this to reclaim the chunk footprint (roughly the rootfs size per unique
+  image) on hosts that pulled chunked spores but do not need to re-share them
+  immediately.
 
 When `spore run --image ... --capture SPORE` captures a VM, the spore manifest
 records an immutable rootfs artifact: the ext4 content BLAKE3 digest, size,

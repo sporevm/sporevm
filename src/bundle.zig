@@ -1595,6 +1595,17 @@ fn packRootfsStorageIndexed(
         return 0;
     }
 
+    // Chunk objects and the block index are derived data: they can be pruned
+    // from the cache once the flat digest-addressed artifact exists (see
+    // `spore system prune --rootfs --include-digest-artifacts`). Re-derive
+    // them from the flat artifact when missing so pack does not depend on the
+    // chunk store surviving a prune. The regenerated index must reproduce the
+    // manifest's index digest, or the artifact and descriptor disagree.
+    if (!(rootfs_cas.storageComplete(options.io, allocator, cache_root, storage) catch |err| return rootfsError(err))) {
+        const regenerated = rootfs_cas.preload(options.io, allocator, cache_root, rootfs.artifact.digest, storage.chunk_size) catch |err| return rootfsError(err);
+        if (!std.mem.eql(u8, regenerated.index_digest, storage.index_digest)) return error.BadManifest;
+    }
+
     const source_index_path = rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
     const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
     defer allocator.free(index_bytes);

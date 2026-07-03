@@ -140,9 +140,11 @@ artifacts, rootfs CAS indexes, rootfs CAS objects, ref records, and temporary
 entries.
 
 Default `spore system prune --rootfs` only selects rebuildable image rootfs
-entries. Exact digest artifacts and rootfs CAS files can be required by existing
-captured spores, so they are skipped unless `--include-digest-artifacts` is
-passed with an age or size bound.
+entries. Flat digest artifacts (the resume authority) are skipped unless
+`--include-digest-artifacts` is passed with an age or size bound. Derived
+rootfs CAS chunks are skipped unless `--include-rootfs-chunks` is passed;
+pruning them is safe when the flat artifact remains because resume serves the
+flat artifact and `spore pack` re-derives chunks from it.
 
 ## Evidence
 
