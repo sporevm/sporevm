@@ -73,10 +73,17 @@ published trends like-for-like with the public
 (node runtime, `node -v` as the timed first command) while sourcing the image
 from the AWS public ECR mirror of Docker Official Images instead of Docker Hub,
 which rate-limits anonymous CI pulls. Main builds run the `comparison` profile;
-other branches run `ci`. The `full` profile is the exact public shape (100
-iterations, sequential/staggered/burst) and is intended for scheduled or manual
-runs rather than per-merge builds. Override with `SPOREVM_BENCHMARK_IMAGE`,
-`SPOREVM_BENCHMARK_COMMAND`, and `SPOREVM_BENCHMARK_PROFILE`.
+other branches run `ci`. A nightly Buildkite schedule on the
+`sporevm-benchmarks` pipeline runs the `full` profile (the exact public shape:
+100 iterations, sequential/staggered/burst) by setting
+`SPOREVM_BENCHMARK_PROFILE=full`, so the published series carry statistically
+robust p95/p99 alongside the per-merge regression points. Override with
+`SPOREVM_BENCHMARK_IMAGE`, `SPOREVM_BENCHMARK_COMMAND`, and
+`SPOREVM_BENCHMARK_PROFILE`.
+
+Every published series point records its `profile` and `sample_count`, so
+consumers can separate high-iteration nightly `full` points from small-N
+per-merge `comparison` points that share a `benchmark/mode` series.
 
 Benchmark builds use the shipped `--release=safe` settings (`mise run
 build:release`); a default Debug `zig build` understates TTI by roughly 40

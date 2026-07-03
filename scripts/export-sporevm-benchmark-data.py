@@ -297,6 +297,8 @@ def build_series(runs: list[dict[str, object]]) -> list[dict[str, object]]:
     for run in runs:
         runner = run.get("runner") if isinstance(run.get("runner"), dict) else {}
         commit = run.get("commit") if isinstance(run.get("commit"), dict) else {}
+        config = run.get("config") if isinstance(run.get("config"), dict) else {}
+        profile = config.get("profile")
         runner_key = str(runner.get("queue") or "")
         runner_label = RUNNER_LABELS.get(runner_key, runner_key)
         for raw_result in run.get("results", []):
@@ -341,6 +343,11 @@ def build_series(runs: list[dict[str, object]]) -> list[dict[str, object]]:
                 "p95": stats.get("p95"),
                 "p99": stats.get("p99"),
                 "success_rate": raw_result.get("success_rate"),
+                # Profile and sample count let consumers separate high-N
+                # nightly `full` points (statistically robust p95/p99) from
+                # small-N per-merge `comparison` points in the same series.
+                "profile": profile,
+                "sample_count": raw_result.get("count"),
             }
             if phase_values:
                 point["phase_values"] = phase_values
@@ -544,6 +551,8 @@ def self_test() -> None:
         assert data["series"][0]["points"][0]["p95"] == 130.0
         assert data["series"][0]["points"][0]["p99"] == 131.0
         assert data["series"][0]["points"][0]["phase_values"]["exec_response_ms"] == 8.0
+        assert data["series"][0]["points"][0]["profile"] == "ci"
+        assert data["series"][0]["points"][0]["sample_count"] == 3
         homepage = build_homepage_summary(data)
         assert homepage["latest"]["cold_ms"] == 123.0
         assert homepage["latest"]["warm_ms"] == 64.0
