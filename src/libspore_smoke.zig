@@ -106,6 +106,13 @@ test "external import can name managed run-from and named lifecycle APIs" {
     };
     try std.testing.expectEqual(@as(usize, 1), exec.command.len);
 
+    const copy = libspore.CopyNamedOptions{
+        .name = "dev-vm",
+        .host_path = "./local.txt",
+        .guest_path = "/tmp/local.txt",
+    };
+    try std.testing.expectEqualStrings("/tmp/local.txt", copy.guest_path);
+
     const snapshot = libspore.SnapshotNamedOptions{
         .name = "dev-vm",
         .out_dir = "dev.spore",
@@ -115,6 +122,8 @@ test "external import can name managed run-from and named lifecycle APIs" {
 
     _ = libspore.createNamed;
     _ = libspore.execNamed;
+    _ = libspore.copyInNamed;
+    _ = libspore.copyOutNamed;
     _ = libspore.networkCapabilities;
     _ = libspore.snapshotNamed;
     _ = libspore.suspendNamed;

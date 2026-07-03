@@ -319,6 +319,13 @@ type ExecNamedStreamEvent struct {
 	ExitCode uint8
 }
 
+// CopyNamedOptions selects one explicit host and guest path for named VM copy.
+type CopyNamedOptions struct {
+	Name      string
+	HostPath  string
+	GuestPath string
+}
+
 // ResumeNamedOptions starts a named VM from a spore checkpoint directory.
 type ResumeNamedOptions struct {
 	SporeDir             string

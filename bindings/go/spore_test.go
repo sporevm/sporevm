@@ -340,6 +340,17 @@ func TestExecNamedArgvMarshaling(t *testing.T) {
 	}
 }
 
+func TestCopyNamedOptions(t *testing.T) {
+	options := CopyNamedOptions{
+		Name:      "worker",
+		HostPath:  "/tmp/host.txt",
+		GuestPath: "/tmp/guest.txt",
+	}
+	if options.Name != "worker" || options.HostPath == "" || options.GuestPath == "" {
+		t.Fatalf("copy options = %#v", options)
+	}
+}
+
 func TestDecodeExecNamedResult(t *testing.T) {
 	result, err := decodeJSON[ExecNamedResult]([]byte(`{
 		"exit_code": 7,

@@ -35,6 +35,10 @@ const usage =
     \\                      Create a named VM lifecycle target
     \\  exec NAME 'shell command'
     \\                      Execute a command in a named VM
+    \\  copy-in NAME HOST_PATH GUEST_PATH
+    \\                      Copy one host file or directory into a named VM
+    \\  copy-out NAME GUEST_PATH HOST_PATH
+    \\                      Copy one guest file or directory out of a named VM
     \\  rm NAME             Remove a named VM
     \\  suspend NAME --out DIR
     \\                      Checkpoint a named VM into a spore
@@ -141,6 +145,10 @@ fn runCommand(
         try spore_internal.lifecycle.createCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "exec")) {
         try spore_internal.lifecycle.execCli(init, command_args, stdout);
+    } else if (std.mem.eql(u8, command, "copy-in")) {
+        try spore_internal.lifecycle.copyInCli(init, command_args, stdout);
+    } else if (std.mem.eql(u8, command, "copy-out")) {
+        try spore_internal.lifecycle.copyOutCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "rm")) {
         try spore_internal.lifecycle.rmCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "suspend")) {

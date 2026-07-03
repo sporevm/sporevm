@@ -16,8 +16,8 @@ spore rm bench-2
 ```
 
 `spore run` remains the one-shot command. The stable named surface is
-`create`, `exec`, `suspend`, `resume --name`, `fork --vm`, `ls`/`ps`, and `rm` on
-supported HVF and KVM hosts.
+`create`, `exec`, `copy-in`, `copy-out`, `suspend`, `resume --name`,
+`fork --vm`, `ls`/`ps`, and `rm` on supported HVF and KVM hosts.
 
 Machine callers use global `--json` for single-result lifecycle commands:
 
@@ -37,6 +37,20 @@ guest terminal for the exec. The usual shell spelling is:
 ```bash
 spore exec -it bench-1 -- /bin/sh
 ```
+
+Named VMs also support explicit path transfer through the same local
+monitor boundary:
+
+```bash
+spore copy-in bench-1 ./local.txt /tmp/local.txt
+spore copy-out bench-1 /tmp/local.txt ./roundtrip.txt
+spore copy-in bench-1 ./src /tmp/src
+spore copy-out bench-1 /tmp/src ./src-roundtrip
+```
+
+Copy paths are explicit on both sides. Guest paths must be absolute, `.` and
+`..` components are rejected, sources must be regular files or directories, and
+destinations must not already exist. Symlinks and special files are rejected.
 
 ## Runtime State
 
@@ -135,6 +149,10 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
 - `spore exec -i/-t` uses a streaming monitor request. Embedders use
   `openExecNamedStream` for the same stdin, terminal, resize, exit, and
   monitor-error surface.
+- `spore copy-in` and `spore copy-out` transfer explicit regular files or
+  directory trees. Symlinks, special files, overwrite, and workspace sync are
+  intentionally outside this primitive. Embedders use the matching
+  `copyInNamed`/`copyOutNamed` libspore API.
 - There is no public `spore attach` command yet. Reserve that spelling for
   connecting to already-running named VMs once monitors own retained attachable
   sessions.
@@ -149,6 +167,7 @@ Useful focused checks:
 
 ```bash
 mise run smoke:lifecycle
+mise run smoke:lifecycle-copy
 mise run smoke:lifecycle-tty
 mise run smoke:lifecycle-auto-memory
 mise run smoke:monitor-jail

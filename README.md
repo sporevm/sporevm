@@ -221,6 +221,15 @@ printf 'hello\n' | spore exec -i child-0 -- /bin/cat
 spore exec -it child-0 -- /bin/sh
 ```
 
+Copy explicit files or directories into or out of a named VM:
+
+```bash
+spore copy-in child-0 ./local.txt /tmp/local.txt
+spore copy-out child-0 /tmp/local.txt ./roundtrip.txt
+spore copy-in child-0 ./src /tmp/src
+spore copy-out child-0 /tmp/src ./src-roundtrip
+```
+
 `spore create`, `spore run`, and `spore exec` run shell commands as
 `/bin/sh -lc`. Use `-- <argv...>` when you need exact argv.
 
