@@ -2045,7 +2045,9 @@ static void execve_or_report(char *const argv[], char *const envp[], int use_roo
   char *const empty_env[] = { NULL };
   execve(argv[0], argv, envp[0] != NULL ? envp : empty_env);
   int err = errno;
-  if (!use_rootfs && (err == ENOENT || err == ENOTDIR)) {
+  if ((err == ENOENT || err == ENOTDIR) && strchr(argv[0], '/') == NULL) {
+    dprintf(STDERR_FILENO, "spore run: exact argv command \"%s\" was not found.\nExact argv mode does not run through /bin/sh or PATH lookup. Use shell command form or pass an absolute guest path.\n", argv[0]);
+  } else if (!use_rootfs && (err == ENOENT || err == ENOTDIR)) {
     dprintf(STDERR_FILENO, "spore run: initrd cannot execute %s: not found; use --image, --rootfs, or provide an initrd containing the command\n", argv[0]);
   } else {
     dprintf(STDERR_FILENO, "spore run: exec %s failed: %s\n", argv[0], strerror(err));

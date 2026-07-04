@@ -5,6 +5,7 @@ const Io = std.Io;
 
 const fd_util = @import("fd.zig");
 const run_mod = @import("run.zig");
+const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 
 pub const Backend = run_mod.Backend;
@@ -129,6 +130,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     if (children.len == 0) {
         failCli("spore fanout: no child spore directories found in {s}", .{opts.children_dir});
     }
+    try requireCapturedSessions(allocator, children);
 
     const argv0 = blk: {
         const full_args = try init.minimal.args.toSlice(allocator);
@@ -282,6 +284,36 @@ fn listChildren(allocator: std.mem.Allocator, io: Io, children_dir: []const u8) 
     return out;
 }
 
+fn requireCapturedSessions(allocator: std.mem.Allocator, children: []const ChildSpec) !void {
+    for (children) |child| {
+        const sessions = childSessionCount(allocator, child.path) catch |err| {
+            failCli("spore fanout: child {s} has an invalid spore manifest: {s}", .{ child.name, @errorName(err) });
+        };
+        if (sessions == 0) {
+            failCli(
+                \\spore fanout: child {s} has no captured session.
+                \\This checkpoint can still run new commands with:
+                \\  spore run --from {s} '...'
+                \\To fan out the original running command, create the checkpoint with:
+                \\  spore run --capture checkpoint --capture-on TERM '...'
+            , .{ child.name, child.path });
+        }
+    }
+}
+
+fn childSessionCount(allocator: std.mem.Allocator, spore_dir: []const u8) !usize {
+    var manifest = spore.loadManifest(allocator, spore_dir) catch |err| switch (err) {
+        error.BadManifest => null,
+        else => return err,
+    };
+    defer if (manifest) |*parsed| parsed.deinit();
+    if (manifest) |parsed| return parsed.value.sessions.len;
+
+    var manifest_v1 = try spore.loadManifestV1(allocator, spore_dir);
+    defer manifest_v1.deinit();
+    return manifest_v1.value.sessions.len;
+}
+
 fn lessChildSpec(_: void, a: ChildSpec, b: ChildSpec) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
@@ -420,7 +452,7 @@ fn sleepMs(ms: u64) void {
 }
 
 fn writeStderr(comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
+    var buf: [2048]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
     fd_util.writeAllBestEffort(2, msg);
 }
@@ -452,4 +484,59 @@ test "fanout duration parser accepts common suffixes" {
     try std.testing.expectEqual(@as(u64, 60_000), try parseDurationMs("1m"));
     try std.testing.expectEqual(@as(u64, 5_000), try parseDurationMs("5"));
     try std.testing.expectError(error.InvalidDuration, parseDurationMs("0s"));
+}
+
+fn testManifest(sessions: []const spore.Session) spore.Manifest {
+    return .{
+        .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
+            .device_model_version = 4,
+            .ram_base = 0x8000_0000,
+            .ram_size = 0,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0801_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{
+            .gprs = [_]u64{0} ** 31,
+            .pc = 0,
+            .cpsr = 0,
+            .fpcr = 0,
+            .fpsr = 0,
+            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .sys_regs = &.{},
+            .icc_regs = &.{},
+            .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+            .gic = .{
+                .kind = .gicv3,
+                .gicv3 = .{ .dist_regs = &.{}, .redist_regs = &.{}, .line_levels = &.{} },
+            },
+        },
+        .devices = &.{},
+        .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
+        .sessions = sessions,
+        .memory = .{ .chunk_size = spore.chunk_size, .chunks = &.{} },
+    };
+}
+
+test "fanout preflight reads captured session presence" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const no_session_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/no-session", .{tmp.sub_path[0..]});
+    const session_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/session", .{tmp.sub_path[0..]});
+    try Io.Dir.cwd().createDirPath(io, no_session_dir);
+    try Io.Dir.cwd().createDirPath(io, session_dir);
+
+    try spore.saveManifest(arena, no_session_dir, testManifest(&.{}));
+    try std.testing.expectEqual(@as(usize, 0), try childSessionCount(arena, no_session_dir));
+
+    const sessions = [_]spore.Session{spore.processSession(spore.default_session_id, false, false)};
+    try spore.saveManifest(arena, session_dir, testManifest(&sessions));
+    try std.testing.expectEqual(@as(usize, 1), try childSessionCount(arena, session_dir));
 }

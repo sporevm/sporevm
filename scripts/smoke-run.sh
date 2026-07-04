@@ -75,9 +75,9 @@ set -e
   cat "${workdir}/bare.stderr" >&2 || true
   die "spore run bare echo exited ${bare_rc}, expected 127"
 }
-grep -Fq "spore run: initrd cannot execute echo: not found; use --image, --rootfs, or provide an initrd containing the command" "${workdir}/bare.stderr" || {
+grep -Fq "spore run: exact argv command \"echo\" was not found." "${workdir}/bare.stderr" || {
   cat "${workdir}/bare.stderr" >&2 || true
-  die "spore run bare echo did not preserve no-PATH diagnostic"
+  die "spore run bare echo did not explain exact argv lookup"
 }
 
 set +e

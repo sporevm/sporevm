@@ -16,6 +16,17 @@ distributed offset/range partitioning is deferred.
 source captured with `--vcpus 4` mints children that also resume with 4 vCPUs;
 fork does not downshift an already-booted guest to a smaller CPU topology.
 
+Fan-out resumes the captured process session. Machine-only checkpoints can
+still start new commands with `spore run --from`, but they cannot fan out the
+original command stream:
+
+| Checkpoint source | Sessions | Good for fanout | Good for `run --from <cmd>` |
+| --- | --- | --- | --- |
+| `spore suspend NAME` | none | no | yes |
+| `spore run --capture` | captured session | yes | yes |
+| `spore fork checkpoint` | inherits parent | if parent has one | yes |
+| `spore unpack bundle --child N` | inherits bundled child | if child has one | yes |
+
 If the parent manifest declares bound services, fan-out supplies one fresh host
 socket binding per service and applies the same binding to every child:
 
