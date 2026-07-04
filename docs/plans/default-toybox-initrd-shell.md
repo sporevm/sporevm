@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: active
 last_reviewed: 2026-07-04
 spec_refs:
   - README.md
@@ -161,17 +161,21 @@ symlinks should be created from SporeVM's explicit supported list.
 
 ## Current State
 
+- The plan document is committed on `lox/toybox-initrd-spike`.
 - `src/run.zig` wraps shell-form commands as `/bin/sh -lc`.
-- The current default initrd is built by `scripts/make-minimal-exec-initrd.sh`
-  from source-only SporeVM helper binaries.
+- The default initrd is built by `scripts/make-minimal-exec-initrd.sh` from
+  source-only SporeVM helper binaries plus the pinned Toybox source dependency.
 - `guest/minimal-initrd/agent.c` uses `execve(argv[0], ...)` and does no guest
   PATH lookup.
-- `scripts/smoke-run.sh` currently asserts `/bin/echo` fails in the default
-  initrd with exit 127 and the clearer diagnostic added for the helper-only
-  path.
+- `guest/minimal-initrd/toybox.config` enables only the first supported applet
+  set, and `guest/minimal-initrd/toybox-sh.c` maps `/bin/sh -lc` to Toybox
+  `sh -c`.
+- `scripts/smoke-run.sh` checks shell-string `echo`, exact `/bin/echo`, bare
+  `echo` no-PATH failure, and a truly missing command.
 - A local spike on `lox/toybox-initrd-spike` proved the runtime path with
-  Toybox 0.8.14 built static for `aarch64-linux-musl`. The default cpio was
-  about 427K, and the Toybox-enabled cpio was about 1.3M.
+  Toybox 0.8.14 built static for `aarch64-linux-musl`. The initial defconfig
+  Toybox cpio was about 1.3M; the implemented minimal-config cpio is about
+  692K.
 - The spike proved `spore run -- /bin/echo spore-smoke` and
   `spore run 'echo spore-shell-smoke'` on HVF.
 - The spike also found Toybox `sh` rejects `-lc`; a tiny `/bin/sh` wrapper fixed

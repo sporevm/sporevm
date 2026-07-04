@@ -12,6 +12,14 @@ to a guest PTY. PTY mode mounts devpts, gives the child a controlling terminal,
 streams terminal bytes on SPIO stream 4, and applies resize frames with
 `TIOCSWINSZ`. The other programs are fixed helper binaries used by product and
 lifecycle smokes.
+
+The default embedded initrd also carries a minimal Toybox build for `/bin/sh`
+and basic applets such as `echo`, `cat`, `env`, `printf`, `pwd`, `test`,
+`uname`, `ls`, `mkdir`, `rm`, `touch`, and `sleep`. `toybox-sh.c` is a small
+compatibility wrapper for SporeVM's `/bin/sh -lc` shell-command argv. It maps
+that to Toybox `sh -c` without changing the guest agent's exact-argv
+`execve(argv[0], ...)` behavior.
+
 `netcheck.c` verifies the static `spore run --net` guest link setup without
 requiring distro networking tools in the initrd.
 `nslookup.c` is a tiny smoke helper for the SporeVM-managed DNS proxy; it sends
@@ -27,4 +35,5 @@ startup.
 metadata and resume entropy are visible in `/run/sporevm/env`.
 
 Keep this directory source-only. `scripts/make-minimal-exec-initrd.sh` owns
-compiling these files into static aarch64 binaries and packing the initrd.
+compiling these files, building the pinned Toybox source dependency into a
+static aarch64 binary, and packing the initrd.

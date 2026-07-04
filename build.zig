@@ -29,19 +29,22 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .link_libc = true,
     });
+    const toybox_dep = b.dependency("toybox", .{});
     const minimal_exec_assets = b.addSystemCommand(&.{
         "bash",
         "-c",
         \\set -euo pipefail
-        \\scripts/make-minimal-exec-initrd.sh "$1"
+        \\scripts/make-minimal-exec-initrd.sh --toybox-source "$3" "$1"
         \\printf '%s\n' 'pub const minimal_exec_initrd = @embedFile("minimal-exec-initrd.cpio");' >"$2"
         ,
         "sporevm-initrd-assets",
     });
     _ = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.cpio");
     const minimal_exec_initrd_module = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.zig");
+    minimal_exec_assets.addDirectoryArg(toybox_dep.path(""));
     minimal_exec_assets.addFileInput(b.path("scripts/make-minimal-exec-initrd.sh"));
-    const minimal_exec_sources = [_][]const u8{ "agent", "true", "false", "writeout", "sleeper", "finite", "counter", "nproc", "gencheck", "netcheck", "nslookup", "wget", "httpd", "flockcheck", "cgroupcheck" };
+    minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/toybox.config"));
+    const minimal_exec_sources = [_][]const u8{ "agent", "true", "false", "writeout", "sleeper", "finite", "counter", "nproc", "gencheck", "netcheck", "nslookup", "wget", "httpd", "flockcheck", "cgroupcheck", "toybox-sh" };
     for (minimal_exec_sources) |src| {
         minimal_exec_assets.addFileInput(b.path(b.fmt("guest/minimal-initrd/{s}.c", .{src})));
     }

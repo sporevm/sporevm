@@ -28,8 +28,10 @@ spore --json ls
 
 `spore create`, `spore exec`, and `spore run` accept a shell command by default
 and `-- <argv...>` for exact argv. Shell-form commands require a guest
-environment with `/bin/sh`; use `--image`, `--rootfs`, or a command-capable
-initrd for general distro commands. A command passed to `spore create` is
+environment with `/bin/sh`; the managed default initrd provides a small Toybox
+shell environment, while image, rootfs, and custom-initrd guests provide their
+own command environment. Use `--image` or `--rootfs` for general distro
+commands. A command passed to `spore create` is
 started in the guest and detached; stdout and stderr are discarded so the named
 VM is immediately available for `fork`, `exec`, `suspend`, and `rm`. `spore
 exec` forwards guest stdout and stderr as workload streams. Pass `-i` to stream
@@ -39,6 +41,10 @@ guest terminal for the exec. The usual shell spelling is:
 ```bash
 spore exec -it bench-1 -- /bin/sh
 ```
+
+Exact argv does not perform guest PATH lookup. Use `-- /bin/echo hi`, not
+`-- echo hi`, unless the guest environment itself can execute `echo` at that
+exact path.
 
 Named create exposes the same create-time annotation and networking options as
 the lifecycle library:

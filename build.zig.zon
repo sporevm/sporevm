@@ -8,6 +8,10 @@
             .url = "git+https://github.com/sporevm/zmoltcp.git#v0.2.12",
             .hash = "zmoltcp-0.2.12-AMqcQdNmEgBmqyDeqKFN_33x810C4rmJlmzFMDAzYvNk",
         },
+        .toybox = .{
+            .url = "git+https://github.com/landley/toybox.git?ref=0.8.14#b7ec52ac35e075caffca5d330995d44e8dbfc8c3",
+            .hash = "N-V-__8AAMT-YgCxzRpDdaYTxRXOU0GdT-2awlXDV6zKodut",
+        },
     },
     .paths = .{
         "build.zig",
