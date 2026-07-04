@@ -115,9 +115,9 @@ download_release_archives() {
   mkdir -p "${ASSET_DIR}"
 
   download_release_archive "spore_Darwin_arm64.tar.gz" "release-darwin-arm64" cli
-  download_release_archive "libspore_Darwin_arm64.tar.gz" "release-darwin-arm64" libspore
+  download_release_archive "libspore_Darwin.tar.gz" "release-darwin-arm64" libspore
   download_release_archive "spore_Linux_arm64.tar.gz" "release-linux-arm64" cli
-  download_release_archive "libspore_Linux_arm64.tar.gz" "release-linux-arm64" libspore
+  download_release_archive "libspore_Linux.tar.gz" "release-linux-arm64" libspore
 }
 
 write_checksums() {
@@ -162,10 +162,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ASSET_DIR="${REPO_ROOT}/dist"
 GITHUB_REPOSITORY_NAME="${SPOREVM_GITHUB_REPOSITORY:-sporevm/sporevm}"
 EXPECTED_ASSETS=(
-  libspore_Darwin_arm64.tar.gz
-  libspore_Linux_arm64.tar.gz
   spore_Darwin_arm64.tar.gz
   spore_Linux_arm64.tar.gz
+  libspore_Darwin.tar.gz
+  libspore_Linux.tar.gz
 )
 
 require_command buildkite-agent

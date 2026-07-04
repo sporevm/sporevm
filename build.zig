@@ -198,6 +198,13 @@ pub fn build(b: *std.Build) void {
     });
     const run_c_smoke = b.addRunArtifact(c_smoke);
 
+    // ponytail: test artifacts share fixed zig-cache paths; serialize until tests use per-process temp dirs.
+    run_libspore_smoke_tests.step.dependOn(&run_libspore_tests.step);
+    run_c_api_tests.step.dependOn(&run_libspore_smoke_tests.step);
+    run_internal_tests.step.dependOn(&run_c_api_tests.step);
+    run_exe_tests.step.dependOn(&run_internal_tests.step);
+    run_c_smoke.step.dependOn(&run_exe_tests.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_libspore_tests.step);
     test_step.dependOn(&run_libspore_smoke_tests.step);
