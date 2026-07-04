@@ -131,11 +131,7 @@ write_checksums() {
 create_or_update_release() {
   local release_flags=()
 
-  if [[ "${BUILDKITE_TAG}" == v0.* ]]; then
-    release_flags=(--prerelease --latest=false)
-  else
-    release_flags=(--prerelease=false --latest)
-  fi
+  release_flags=(--prerelease=false --latest)
 
   if gh release view "${BUILDKITE_TAG}" --repo "${GITHUB_REPOSITORY_NAME}" >/dev/null 2>&1; then
     gh release edit "${BUILDKITE_TAG}" \
