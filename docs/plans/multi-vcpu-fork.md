@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: active
 last_reviewed: 2026-07-04
 spec_refs:
   - docs/fanout.md
@@ -9,6 +9,8 @@ spec_refs:
   - SECURITY.md
   - src/spore.zig
   - src/lifecycle.zig
+  - src/hvf/vm.zig
+  - src/kvm/vm.zig
   - src/run.zig
   - src/resume.zig
 related_plans:
@@ -20,32 +22,31 @@ related_plans:
 
 ## Summary
 
-SporeVM can already boot, capture, inspect, run-from, and resume multi-vCPU
-spores through manifest v1. Fork/fan-out is the remaining gap: `spore fork`
-still mints only manifest v0 children, and named live fork rejects multi-vCPU
-sources before snapshotting.
+SporeVM can boot, capture, inspect, run-from, resume, fork, and named-fork
+multi-vCPU spores through manifest v1. Fork remains N-to-N: a source captured
+with N vCPUs mints children with the same vCPU count and topology.
 
-The target outcome is boring: a source captured with N vCPUs can produce N-vCPU
-children with the same process, memory, device, and topology state, while fork
-continues to rewrite only child identity and generation-device state. Until that
-is true, users should bake fan-out sources with one vCPU.
+Fork rewrites only child identity, generation counters, generation params, and
+the generation interrupt state needed for the guest agent to observe the child
+identity. It does not downshift an already-booted guest to a different CPU
+topology.
 
 ## Problem
 
-Cleanroom and Buildkite use warm spores as fan-out bases. The current guidance
-is to leave `resources.vcpus` unset for fan-out bakes, which keeps fork working
-but is surprising because dependency installation and build-time warmup are the
-phase where extra CPUs help.
+Cleanroom and Buildkite use warm spores as fan-out bases. The old guidance was
+to leave `resources.vcpus` unset for fan-out bakes, which kept fork working but
+was surprising because dependency installation and build-time warmup are where
+extra CPUs help.
 
-The implementation has an explicit v1 stop. `src/spore.zig` tries manifest v0
-first, recognizes valid manifest v1 only to reject it, and returns
-`UnsupportedVcpuCount` before child directories are written. Named live fork has
-the same product limit in `src/lifecycle.zig`: it checks the source VM spec and
-rejects `vcpus != 1`; the child monitor start path also hardcodes `.vcpus = 1`.
+The former implementation had an explicit v1 stop: `src/spore.zig` parsed v0
+first, recognized valid manifest v1 only to reject it, and returned
+`UnsupportedVcpuCount`. Named live fork had the same product limit in
+`src/lifecycle.zig`: it rejected `vcpus != 1`, and child monitor startup
+hardcoded `.vcpus = 1`.
 
 ## Current State
 
-Already handles N vCPUs:
+Already handles N vCPUs outside fork:
 
 - Fresh KVM and HVF runs create multi-vCPU guests.
 - Suspend, `run --from`, and resume restore manifest v1 captures on compatible
@@ -54,44 +55,35 @@ Already handles N vCPUs:
   state, per-vCPU timer/ICC/sysreg state, and multi-vCPU GIC state.
 - `inspectSpore` accepts both v0 and v1 and reports the vCPU count.
 - Bundle, pull, and local materialization preserve v1 manifests.
-- Product restore can fall back to verified chunks for multi-vCPU spores.
+- Product restore can use proof-validated local backing for valid vCPU counts
+  and falls back to verified chunks when proofs are missing or stale.
 
-Still fork-specific:
+Fork-specific support now in place:
 
-- `spore.fork` copies only the v0 `Manifest` shape.
-- `forkGicState` only knows how to reassert the generation interrupt in v0
-  `gicv3` state.
-- HVF v1 can carry `backend_private` GIC state, which cannot be safely edited by
-  the manifest-level fork helper today.
-- Local `ram.backing` acceleration is intentionally single-vCPU until backend
-  smoke coverage proves multi-vCPU mappings.
-- Named fork starts child monitors with `.vcpus = 1`.
+- `spore.fork` dispatches to a v0 or v1 child minting path based on the source
+  manifest.
+- v1 fork preserves all vCPU state, `platform.vcpu_count`, chunks, optional
+  disk/rootfs metadata, annotations, network metadata, and sessions.
+- Portable `gicv3_multi` state gets a child generation SPI line asserted as a
+  global line.
+- HVF `backend_private` GIC state is preserved unchanged; HVF resume already
+  raises the generation SPI from generation-device state after applying the
+  backend-private GIC blob.
+- Named live fork snapshots multi-vCPU diskless sources with
+  snapshot-and-continue, mints v1 children, and starts child monitors with the
+  child manifest's vCPU count.
+- v1 fork children keep proof-validated local `ram.backing` acceleration and
+  fall back to chunks if the parent proof cannot be trusted.
 
-## Goals
+Still out of scope:
 
-- Support direct `spore fork <v1-spore> --count N --out DIR` for N-to-N
-  children.
-- Preserve source chunks and optional disk/rootfs metadata exactly as v0 fork
-  does.
-- Rewrite only child identity, generation counter, generation params, and the
-  interrupt state needed for the guest agent to observe new identity.
-- Keep unsupported GIC forms, backend combinations, and local backing shapes
-  fail-closed before writing partial child state.
-- Extend named live fork only after direct v1 child minting and resume/fan-out
-  validation are solid.
-
-## Non-Goals
-
-- No mixed-topology fork in the first full slice.
-- No public downshift option until restoring an N-vCPU Linux guest with fewer
-  vCPUs is proven safe.
-- No local `ram.backing` fast path for multi-vCPU children until KVM and HVF
-  smoke cover it.
-- No cross-backend portability expansion beyond the existing manifest v1 rules.
+- Disk-backed or networked named live fork.
+- Cross-backend portability beyond the existing manifest v1 rules.
+- N-to-1 fork/downshift of an already-booted guest.
 
 ## Target Model
 
-The main contract is N-to-N:
+Direct fan-out is N-to-N:
 
 ```bash
 spore run --vcpus 4 --capture warm.spore -- ./warmup
@@ -99,108 +91,105 @@ spore fork warm.spore --count 20 --out children/
 spore fanout children/ --parallel
 ```
 
-Each child remains a manifest v1 spore with `platform.vcpu_count == 4` and the
-same normalized vCPU topology as the source. Child memory chunks are shared by
+Each child is a manifest v1 spore with `platform.vcpu_count == 4` and the same
+normalized vCPU topology as the source. Child memory chunks are shared by
 reference just like v0. Child resume state differs only where fork already has
 semantics: generation count, fork indexes, batch id, VM id, hostname, MAC seed,
-MAC address, resume-time entropy, and the generation interrupt line.
+MAC address, resume-time entropy, and the generation interrupt signal.
 
-Named live fork should eventually preserve the same source vCPU count:
+Named live fork preserves the same count:
 
 ```bash
 spore create warm --vcpus 4 --image docker.io/library/alpine:3.20 ./warmup
 spore fork --vm warm --count 20 --name worker-%02d
 ```
 
-## Memory Sharing Implications
+## Memory Sharing
 
-Chunks are already topology-neutral. A v1 child can share the parent's chunk
-directory exactly as v0 children do because chunk refs describe RAM bytes, not
-which vCPU dirtied them.
+Chunks are topology-neutral. A v1 child can share the parent's chunk directory
+exactly as v0 children do because chunk refs describe RAM bytes, not which vCPU
+dirtied them.
 
-Local `ram.backing` is different. The current product docs restrict automatic
-local backing restore to single-vCPU manifests; multi-vCPU restore uses verified
-chunks. The first v1 fork slice should therefore omit backing metadata from
-multi-vCPU children and rely on chunks. Reintroduce local backing only after
-`openProvenLocalMemoryBackingForVcpuCount` and backend mapping have explicit
-KVM and HVF fork/fan-out smoke coverage.
+Local `ram.backing` is an optimization, not the portable contract. Fork keeps it
+only when the parent backing proof validates under the current runtime trust
+key. Each child receives a hardlink to the parent backing plus a child-local
+proof; any missing, stale, foreign, or unprovable backing drops to verified
+chunks before the child manifest is written.
 
-## Candidate Downshift Slice
+The first implementation briefly treated multi-vCPU local backing as a later
+slice, because an older HVF note warned that map-private backing restore could
+stall without smoke coverage. That restriction is lifted here after exercising
+multi-vCPU fork, `run --from`, named fork, suspend, inspect, and resume on HVF.
 
-Cleanroom's narrow need is "bake with N vCPUs, run one-vCPU children." That is
-tempting but not obviously cheaper. A suspended Linux guest has already observed
-an N-vCPU topology through DTB, MPIDRs, scheduler state, interrupts, and per-CPU
-kernel data. Dropping secondary vCPU state or resuming the same guest with a
-different topology can hang or corrupt the restored workload unless the guest
-cooperates.
+## Downshift Decision
 
-Keep N-to-1 as a candidate only if a later proof shows a safe warm-base
-contract, such as an explicit guest offlining/quiesce step before capture. That
-would be a separate mode with its own validation, not a shortcut inside normal
-process-state fork.
+Cleanroom's narrow need could be phrased as "bake with N vCPUs, run one-vCPU
+children", but that is not the smallest safe first slice. A suspended Linux
+guest has already observed an N-vCPU topology through DTB, MPIDRs, scheduler
+state, interrupts, and per-CPU kernel data. Dropping secondary vCPU state or
+resuming with a different topology can hang or corrupt the restored workload
+unless the guest cooperates.
 
-## Delivery Strategy
+N-to-1 remains a separate candidate only if a later proof defines a safe warm
+base contract, such as an explicit guest offlining/quiesce step before capture.
 
-### Slice 1: Direct v1 N-to-N fork for portable GIC
+## Delivery Record
 
-Teach `spore.fork` to mint manifest v1 children when the source uses portable
-`gicv3_multi` state. Share chunks, drop local backing metadata, copy all vCPU
-states, rewrite generation identity, and update the generation interrupt as a
-global SPI. Keep HVF `backend_private` GIC rejected with the current clean CLI
-message.
+### Slice 1: Clean Failure and Documentation
 
-Done when:
+Implemented a clean one-line CLI error for unsupported multi-vCPU fork paths
+while the restriction existed, suppressed misleading manifest parse fallback
+noise, documented the temporary limitation, and added an exact smoke assertion.
 
-- a KVM v1 source forks into v1 children with matching `vcpu_count`;
-- `spore run --from children/000000 -- /bin/true` works;
-- `spore fanout children/ --parallel` works for a small count;
-- malformed or unsupported v1 GIC state fails before child directories are
-  written.
+That slice has been superseded by the full implementation, but the CLI still
+keeps the cleaner error handling for any future unsupported fork state.
 
-### Slice 2: HVF backend-private GIC fork support or portable HVF GIC
+### Slice 2: Direct v1 N-to-N Fork
 
-Either produce portable `gicv3_multi` state for HVF captures or add a narrow
-backend-owned helper that can update the tagged HVF GIC blob for the generation
-interrupt without exposing raw HVF structs in the manifest contract.
+Implemented direct v1 child minting for portable `gicv3_multi` state. The child
+manifest preserves vCPU state and topology, shares chunks and disk stores,
+rewrites generation identity, and asserts the generation SPI as a global line.
 
-Done when HVF v1 sources can fork and resume children on the same host, and KVM
-continues to reject HVF-private state before VM mutation.
+### Slice 3: HVF Backend-Private GIC
 
-### Slice 3: Named live fork
+Implemented same-host HVF support by preserving `backend_private` GIC state and
+relying on the existing HVF resume hook that raises the generation SPI after
+generation-device restore. This avoids parsing or mutating raw HVF GIC blobs in
+the manifest layer.
 
-Remove the named fork vCPU guard after direct v1 fork is proven. Start child
-monitors with the source spec's vCPU count instead of hardcoded `1`, and keep
-disk/network restrictions unchanged unless separate plans lift them.
+### Slice 4: Named Live Fork
 
-Done when `spore fork --vm` works for a diskless multi-vCPU named source and
-every child reaches monitor readiness with the same vCPU count.
+Removed the named source vCPU guard, taught child startup to read v0 or v1
+children, and started child monitors with the child manifest's vCPU count.
+Multi-vCPU HVF and KVM run loops now support live snapshot-and-continue by
+pausing all vCPUs, writing the v1 snapshot, publishing the monitor response,
+and resuming the source VM.
 
-### Slice 4: Local backing acceleration
+### Slice 5: Local Backing Acceleration
 
-Re-enable local `ram.backing` metadata for multi-vCPU fork children only after
-the backing proof and backend map-private restore path have direct fan-out smoke
-coverage on KVM and HVF.
+Lifted the local backing proof opener to validated vCPU counts and reused the
+existing fork backing hardlink/proof flow for v1 children. Children still fail
+closed to chunks when proof validation or proof writing fails.
 
-Done when multi-vCPU children can choose `local_backing` with proof validation
-and fall back to chunks on missing, stale, or foreign proofs.
+## Validation
 
-## Verification
+- Unit tests cover v1 child manifest minting, generation params, portable GIC
+  interrupt mutation, HVF backend-private preservation, multi-vCPU local backing
+  proof opening, and v1 child backing hardlinks/proofs.
+- `scripts/smoke-multi-vcpu.sh` covers direct v1 fork, child `run --from`,
+  v1 inspect, resume, and optional named lifecycle.
+- `SPORE_SMOKE_NAMED_LIFECYCLE=1 scripts/smoke-multi-vcpu.sh` covers
+  multi-vCPU `spore fork --vm`, child readiness, child exec, named suspend,
+  inspect, named resume, and post-resume exec on HVF.
+- KVM should run the same smoke on the ARM64 CI host before landing if CI
+  capacity is available.
 
-- Unit tests for v1 child manifest minting, generation params, GIC interrupt
-  mutation, rejection before partial writes, and backing metadata omission.
-- `scripts/smoke-multi-vcpu.sh` extended to fork and fan out a v1 source.
-- KVM smoke on the ARM64 CI host for direct fork, `run --from`, `resume`, and
-  fan-out.
-- HVF smoke on Apple Silicon for the same cases once HVF GIC support lands.
-- Negative smoke for unsupported HVF-private or malformed v1 GIC state until
-  that slice lands.
+## Key Learnings
 
-## Key Learnings From Pressure-Testing
-
-- The first useful implementation should be N-to-N, not N-to-1. Downshift looks
-  smaller but changes guest-visible topology after the guest has booted.
-- Local backing is an optimization, not the fork contract. Chunks are the
-  smallest safe first path for multi-vCPU children.
-- HVF `backend_private` GIC state is the risky part. The plan keeps it out of
-  Slice 1 so portable KVM v1 fork can land without smuggling raw backend state
-  into the manifest layer.
+- N-to-N was smaller and safer than N-to-1 because it preserves guest-visible
+  topology after boot.
+- HVF did not need manifest-layer mutation of backend-private GIC state; the
+  existing post-restore generation interrupt raise is the right backend-owned
+  boundary.
+- Local backing remains an optimization. Keeping the chunk fallback path as the
+  source of truth makes backing proof failure safe for fork children.

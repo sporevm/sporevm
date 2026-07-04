@@ -197,10 +197,9 @@ pausing the source VM.
 
 Named checkpoints support diskless VMs, image-created writable rootfs state, and
 explicit `--rootfs PATH` checkpoints backed by exact immutable rootfs artifacts.
-Supported backends can create, suspend, and resume fixed-RAM multi-vCPU named
-VMs. Named live fork is currently single-vCPU and diskless-only. Create named
-VMs intended for `spore fork --vm` with `--vcpus 1`; multi-vCPU sources are
-rejected before child VMs are started.
+Supported backends can create, suspend, resume, and live-fork fixed-RAM
+multi-vCPU named VMs. Named live fork is still diskless-only; child VMs preserve
+the source VM's vCPU count.
 
 ## Monitor Boundary
 
@@ -249,7 +248,6 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
 - There is no public `spore attach` command yet. Reserve that spelling for
   connecting to already-running named VMs once monitors own retained attachable
   sessions.
-- No multi-vCPU named live fork yet.
 - No disk-backed or networked named live fork yet.
 - No live network-flow checkpointing.
 - No OCI `Entrypoint`, `Cmd`, or `User` semantics. Callers pass explicit argv.

@@ -1176,10 +1176,6 @@ pub fn forkNamed(
         return error.UnsupportedNamedForkDisk;
     }
     if (source_spec.value.network != null) return error.UnsupportedNamedForkNetwork;
-    if (source_spec.value.vcpus != 1) {
-        setLastError("{s}", .{machine_output.forkUnsupportedVcpuBody(arena, source_spec.value.vcpus)});
-        return error.UnsupportedNamedForkVcpu;
-    }
 
     for (child_names) |child_name| {
         const child_paths = try apiPaths(context, arena, child_name);
@@ -1799,7 +1795,7 @@ pub fn forkCli(
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
         },
         error.UnsupportedNamedForkVcpu => {
-            const message = allocLifecycleLastErrorMessage(allocator, "fork", "spore fork: source has multiple vCPUs; fork currently supports only 1-vCPU sources. Bake or create the fork source with --vcpus 1.");
+            const message = allocLifecycleLastErrorMessage(allocator, "fork", "spore fork: source uses a fork topology or GIC state this backend cannot mint safely yet");
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
         },
         error.NamedVmExists => {
@@ -3128,21 +3124,34 @@ fn startForkChildExecutable(
     base: Spec,
     spore_executable: []const u8,
 ) !void {
-    var manifest = try spore.loadManifest(allocator, spore_dir);
-    defer manifest.deinit();
-    if (manifest.value.network != null) return error.UnsupportedNamedForkNetwork;
-    if (manifest.value.devices.len != diskless_resume_device_count) return error.UnsupportedNamedForkDisk;
-    const memory = try memory_config.fromManifestBytes(manifest.value.platform.ram_size);
+    var manifest = spore.loadManifest(allocator, spore_dir) catch |err| switch (err) {
+        error.BadManifest => null,
+        else => return error.InvalidSporeDir,
+    };
+    defer if (manifest) |*parsed| parsed.deinit();
+    var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
+    defer if (manifest_v1) |*parsed| parsed.deinit();
+    if (manifest == null) {
+        manifest_v1 = spore.loadManifestV1(allocator, spore_dir) catch return error.InvalidSporeDir;
+    }
+
+    const network = if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network;
+    if (network != null) return error.UnsupportedNamedForkNetwork;
+    const devices_len = if (manifest) |parsed| parsed.value.devices.len else manifest_v1.?.value.devices.len;
+    if (devices_len != diskless_resume_device_count) return error.UnsupportedNamedForkDisk;
+    const ram_size = if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size;
+    const memory = try memory_config.fromManifestBytes(ram_size);
+    const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else @as(topology.VcpuCount, 1);
     const spec = Spec{
         .name = child_name,
         .backend = base.backend,
         .kernel_path = base.kernel_path,
         .initrd_path = base.initrd_path,
         .resume_dir = spore_dir,
-        .annotations = manifest.value.annotations,
-        .sessions = manifest.value.sessions,
+        .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
+        .sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions,
         .memory = memory,
-        .vcpus = 1,
+        .vcpus = manifest_vcpus,
         .guest_port = base.guest_port,
         .timeout_ms = base.timeout_ms,
         .console_log_path = null,

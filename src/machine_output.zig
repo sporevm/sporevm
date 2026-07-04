@@ -163,9 +163,9 @@ pub fn usageMissingArgument(message: []const u8, source: []const u8) CliError {
 pub fn forkUnsupportedVcpuBody(allocator: std.mem.Allocator, vcpu_count: u32) []const u8 {
     return std.fmt.allocPrint(
         allocator,
-        "source has {d} vCPUs; fork currently supports only 1-vCPU sources. Bake or create the fork source with --vcpus 1.",
+        "source has {d} vCPUs but uses a fork topology or GIC state this backend cannot mint safely yet. Capture the fork source with a supported backend and manifest v1 GIC state.",
         .{vcpu_count},
-    ) catch "source has multiple vCPUs; fork currently supports only 1-vCPU sources. Bake or create the fork source with --vcpus 1.";
+    ) catch "source uses a fork topology or GIC state this backend cannot mint safely yet. Capture the fork source with a supported backend and manifest v1 GIC state.";
 }
 
 pub fn forkUnsupportedVcpuMessage(allocator: std.mem.Allocator, vcpu_count: u32) []const u8 {
