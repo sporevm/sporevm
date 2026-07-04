@@ -33,7 +33,7 @@ pub const Options = struct {
     spore_executable: []const u8 = "spore",
     debug: bool = false,
     timeout_ms: u64 = default_resume_attach_timeout_ms,
-    bound_services: []const spore_net_policy.BoundServiceBinding = &.{},
+    bound_services: run_mod.BoundServiceBindingList = .{},
 };
 
 pub const cli_usage =
@@ -43,6 +43,8 @@ pub const cli_usage =
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --generation FILE       Inject fan-out identity JSON before resume
+    \\  --bind-service NAME=unix:/path.sock
+    \\                          Bind a manifest-declared service to a host socket
     \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
     \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
     \\  -h, --help              Show this help
@@ -55,6 +57,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var generation_path: ?[]const u8 = null;
     var event_mode: run_mod.EventMode = .none;
     var timeout_ms: u64 = default_resume_attach_timeout_ms;
+    var bound_services = run_mod.BoundServiceBindingList{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -69,6 +72,15 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             generation_path = args[i];
         } else if (std.mem.startsWith(u8, args[i], "--generation=")) {
             generation_path = args[i]["--generation=".len..];
+        } else if (std.mem.eql(u8, args[i], "--bind-service") and i + 1 < args.len) {
+            i += 1;
+            bound_services.append(spore_net_policy.parseBoundServiceBinding(args[i]) catch |err| {
+                std.debug.print("spore resume: invalid --bind-service {s}: {s}\n", .{ args[i], @errorName(err) });
+                std.process.exit(2);
+            }) catch |err| {
+                std.debug.print("spore resume: invalid --bind-service {s}: {s}\n", .{ args[i], @errorName(err) });
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
             i += 1;
             event_mode = run_mod.EventMode.parse(args[i]) orelse {
@@ -107,6 +119,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             std.process.exit(2);
         },
         .timeout_ms = timeout_ms,
+        .bound_services = bound_services,
     };
 }
 
@@ -124,7 +137,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     defer if (parsed_v1) |*manifest| manifest.deinit();
     if (parsed == null) parsed_v1 = try spore.loadManifestV1(allocator, opts.spore_dir);
 
-    const network_options = run_mod.networkOptionsFromManifestWithBindings(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network, opts.bound_services) catch |err| switch (err) {
+    const network_options = run_mod.networkOptionsFromManifestWithBindings(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network, opts.bound_services.slice()) catch |err| switch (err) {
         error.MissingBoundServiceBinding => failResumeSetup("spore resume: manifest requires live bound Unix service bindings", .{}),
         error.UnexpectedBoundServiceBinding => failResumeSetup("spore resume: live bound Unix service bindings do not match the manifest", .{}),
         error.DuplicateBoundServiceBinding => failResumeSetup("spore resume: duplicate live bound Unix service binding", .{}),
@@ -410,6 +423,14 @@ test "resume cli parser accepts generation file" {
     try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
     try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
+}
+
+test "resume cli parser accepts bound service bindings" {
+    const opts = try parseCliArgs(&.{ "--bind-service", "metadata=unix:/tmp/metadata.sock", "child.spore" });
+    try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
+    try std.testing.expectEqual(@as(usize, 1), opts.bound_services.len);
+    try std.testing.expectEqualStrings("metadata", opts.bound_services.items[0].name);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.bound_services.items[0].target.unix);
 }
 
 test "resume attach request omits empty generation params" {

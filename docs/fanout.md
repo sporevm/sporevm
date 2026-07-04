@@ -12,6 +12,17 @@ Children are named `000000` through zero-padded `N-1` and share the parent's
 chunk store. `spore fanout` is local orchestration over child spore directories;
 distributed offset/range partitioning is deferred.
 
+If the parent manifest declares bound services, fan-out supplies one fresh host
+socket binding per service and applies the same binding to every child:
+
+```bash
+spore fanout children/ --parallel \
+  --bind-service metadata=unix:/tmp/metadata.sock
+```
+
+`spore fork` still only mints child spore directories; live host socket paths
+are not written into child manifests.
+
 When the parent has a proof-validated local `ram.backing` file, `spore fork`
 hard-links that file into each child and writes a child-local
 `ram.backing.proof`. If the parent proof is missing or stale, children omit

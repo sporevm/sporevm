@@ -73,13 +73,19 @@ const create_usage =
     \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs
+    \\  --options @file.json    Read create options from a JSON file
     \\  --pull=missing|always|never
     \\                          Pull policy for mutable --image refs (default: missing)
     \\  --net                   Experimental SporeVM-managed networking
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
+    \\  --allow-host-port HOST:PORT
+    \\                          With --net, restrict public egress to this exact host and port
+    \\  --bind-service NAME[:PORT]=unix:/path.sock
+    \\                          With --net, declare a guest-local Unix service
     \\  --forward 127.0.0.1:HOST_PORT:GUEST_PORT
     \\                          With --net, forward host loopback TCP to a guest port
+    \\  --annotation KEY=VALUE  Add a create-time annotation to captured manifests
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
@@ -136,6 +142,7 @@ const suspend_usage =
     \\
     \\Options:
     \\  --out DIR              Write a spore checkpoint to DIR
+    \\  --annotation KEY=VALUE Merge an annotation into the checkpoint manifest
     \\  -h, --help             Show this help
     \\
 ;
@@ -160,6 +167,8 @@ const resume_usage =
     \\
     \\Options:
     \\  --name NAME            Name for the resumed VM
+    \\  --bind-service NAME=unix:/path.sock
+    \\                         Bind a manifest-declared service to a host socket
     \\  -h, --help             Show this help
     \\
 ;
@@ -319,11 +328,57 @@ pub const LifecycleResult = struct {
 
 const CreateOptions = struct {
     spec: Spec,
+    options_path: ?[]const u8 = null,
     image_pull_policy: run_mod.PullPolicy = .missing,
     network: run_mod.NetworkMode = .disabled,
     network_policy: run_mod.NetworkPolicy = .{},
     command_mode: run_mod.CommandMode = .shell,
     command: []const []const u8 = &.{},
+};
+
+const CreateOptionsFile = struct {
+    schema_version: u32 = 1,
+    name: ?[]const u8 = null,
+    backend: ?[]const u8 = null,
+    kernel: ?[]const u8 = null,
+    kernel_path: ?[]const u8 = null,
+    initrd: ?[]const u8 = null,
+    initrd_path: ?[]const u8 = null,
+    rootfs: ?[]const u8 = null,
+    rootfs_path: ?[]const u8 = null,
+    image: ?[]const u8 = null,
+    image_ref: ?[]const u8 = null,
+    pull: ?[]const u8 = null,
+    image_pull_policy: ?[]const u8 = null,
+    memory: ?[]const u8 = null,
+    memory_bytes: ?u64 = null,
+    vcpus: ?topology.VcpuCount = null,
+    guest_port: ?u32 = null,
+    timeout_ms: ?u64 = null,
+    console_log_path: ?[]const u8 = null,
+    network: ?CreateOptionsFileNetwork = null,
+    annotations: spore.Annotations = .{},
+};
+
+const CreateOptionsFileNetwork = struct {
+    enabled: bool = false,
+    allow_cidrs: []const []const u8 = &.{},
+    allow_hosts: []const []const u8 = &.{},
+    allow_host_ports: []const CreateOptionsFileNetworkRule = &.{},
+    network_rules: []const CreateOptionsFileNetworkRule = &.{},
+    bound_services: []const CreateOptionsFileBoundService = &.{},
+};
+
+const CreateOptionsFileNetworkRule = struct {
+    host: []const u8,
+    ports: []const u16,
+};
+
+const CreateOptionsFileBoundService = struct {
+    name: []const u8,
+    guest_host: ?[]const u8 = null,
+    guest_port: u16 = 80,
+    unix_path: []const u8,
 };
 
 const ExecOptions = struct {
@@ -337,6 +392,7 @@ const ExecOptions = struct {
 const SuspendOptions = struct {
     name: []const u8,
     out_dir: []const u8,
+    annotations: spore.Annotations = .{},
 };
 
 const ForkOptions = struct {
@@ -348,6 +404,7 @@ const ForkOptions = struct {
 const ResumeOptions = struct {
     spore_dir: []const u8,
     name: []const u8,
+    bound_services: run_mod.BoundServiceBindingList = .{},
 };
 
 pub const NamedForkResult = struct {
@@ -421,6 +478,7 @@ pub const SnapshotNamedOptions = struct {
 pub const SuspendNamedOptions = struct {
     name: []const u8,
     out_dir: []const u8,
+    annotations: spore.Annotations = .{},
 };
 
 pub const RemoveNamedOptions = struct {
@@ -1018,6 +1076,8 @@ pub fn suspendNamed(
     allocator: std.mem.Allocator,
     options: SuspendNamedOptions,
 ) !NamedLifecycleResult {
+    try spore.validateAnnotations(options.annotations);
+
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1041,7 +1101,15 @@ pub fn suspendNamed(
         waitForPidExit(ready.value.pid, 5_000);
         Io.Dir.cwd().deleteTree(context.io, paths.vm_dir) catch {};
     };
-    try writeSporeLifecycleSpec(arena, context.io, out_dir, spec.value);
+    var suspend_spec = spec.value;
+    if (!spore.annotationsEmpty(options.annotations)) {
+        var manifest = try spore.loadManifest(arena, out_dir);
+        defer manifest.deinit();
+        manifest.value.annotations = try spore.mergeAnnotations(arena, manifest.value.annotations, options.annotations);
+        try spore.saveManifest(arena, out_dir, manifest.value);
+        suspend_spec.annotations = manifest.value.annotations;
+    }
+    try writeSporeLifecycleSpec(arena, context.io, out_dir, suspend_spec);
     cleanup_after_suspend = false;
     waitForPidExit(ready.value.pid, 5_000);
     try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
@@ -1220,9 +1288,12 @@ pub fn createCli(
     }
 
     const allocator = init.arena.allocator();
-    const parsed = try parseCreateArgs(args, allocator, stderr, mode);
+    var parsed = try parseCreateArgs(args, allocator, stderr, mode);
+    parsed = try applyCreateOptionsFileLifecycleCli(init.io, allocator, stderr, mode, parsed);
     const parsed_ms = monotonicMs();
     const spec = parsed.spec;
+    const network_rules = try createNetworkRulesFromConfig(allocator, &parsed.network_policy);
+    const bound_services = try createBoundServicesFromConfig(allocator, &parsed.network_policy);
     const start_command: ?[]const []const u8 = if (parsed.command.len == 0)
         null
     else
@@ -1246,6 +1317,8 @@ pub fn createCli(
             .enabled = parsed.network == .spore,
             .allow_cidrs = if (parsed.network == .spore) parsed.network_policy.allowCidrSlice() else &.{},
             .allow_hosts = if (parsed.network == .spore) parsed.network_policy.allowHostSlice() else &.{},
+            .policy = if (parsed.network == .spore) .{ .allow = network_rules } else .{},
+            .bound_services = if (parsed.network == .spore) bound_services else &.{},
             .port_forwards = if (parsed.network == .spore) parsed.network_policy.portForwardSlice() else &.{},
         },
         .memory = spec.memory,
@@ -1254,6 +1327,7 @@ pub fn createCli(
         .timeout_ms = spec.timeout_ms,
         .console_log_path = spec.console_log_path,
         .spore_executable = full_args[0],
+        .annotations = spec.annotations,
     }, .{
         .start_ms = start_ms,
         .parsed_ms = parsed_ms,
@@ -1559,6 +1633,7 @@ pub fn suspendCli(
     }, allocator, .{
         .name = parsed.name,
         .out_dir = parsed.out_dir,
+        .annotations = parsed.annotations,
     }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "suspend", err),
         error.NamedVmNotReady => {
@@ -1698,6 +1773,7 @@ pub fn resumeCli(
         .spore_dir = parsed.spore_dir,
         .name = parsed.name,
         .spore_executable = full_args[0],
+        .bound_services = parsed.bound_services.slice(),
     }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "resume", err),
         error.FileNotFound => {
@@ -2239,6 +2315,162 @@ fn writeOptionalCount(writer: *Io.Writer, value: ?u64) !void {
     }
 }
 
+fn createNetworkRulesFromConfig(
+    allocator: std.mem.Allocator,
+    policy: *const run_mod.NetworkPolicy,
+) ![]const spore_net_policy.NetworkRule {
+    const exact_rules = policy.exactRuleSlice();
+    if (exact_rules.len == 0) return &.{};
+    const rules = try allocator.alloc(spore_net_policy.NetworkRule, exact_rules.len);
+    for (exact_rules, rules) |rule, *out| {
+        out.* = .{
+            .host = rule.host,
+            .ports = rule.portSlice(),
+        };
+    }
+    return rules;
+}
+
+fn createBoundServicesFromConfig(
+    allocator: std.mem.Allocator,
+    policy: *const run_mod.NetworkPolicy,
+) ![]const spore_net_policy.BoundService {
+    const cli_services = policy.boundServiceSlice();
+    if (cli_services.len == 0) return &.{};
+    const services = try allocator.alloc(spore_net_policy.BoundService, cli_services.len);
+    for (cli_services, services) |service, *out| {
+        const guest_host = if (service.guest_host.len != 0)
+            service.guest_host
+        else
+            try std.fmt.allocPrint(allocator, "{s}.spore.internal", .{service.name});
+        out.* = .{
+            .name = service.name,
+            .guest_host = guest_host,
+            .guest_port = service.guest_port,
+            .target = .{ .unix = service.unix_path },
+        };
+    }
+    return services;
+}
+
+fn addAnnotationArgLifecycleCli(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    annotations: *spore.Annotations,
+    raw: []const u8,
+) void {
+    const eq = std.mem.indexOfScalar(u8, raw, '=') orelse {
+        const message = allocLifecycleMessage(allocator, "spore {s}: invalid --annotation {s}", .{ command, raw });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
+    };
+    annotations.map.put(allocator, raw[0..eq], raw[eq + 1 ..]) catch |err| {
+        const message = allocLifecycleMessage(allocator, "spore {s}: invalid --annotation {s}: {s}", .{ command, raw, @errorName(err) });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
+    };
+    spore.validateAnnotations(annotations.*) catch {
+        const message = allocLifecycleMessage(allocator, "spore {s}: invalid --annotation {s}", .{ command, raw });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
+    };
+}
+
+fn readCreateOptionsFile(io: Io, allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    if (raw.len < 2 or raw[0] != '@') return error.InvalidOptionsFile;
+    const path = raw[1..];
+    if (path.len == 0) return error.InvalidOptionsFile;
+    return Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_metadata_bytes));
+}
+
+fn applyCreateOptionsFileLifecycleCli(
+    io: Io,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    parsed: CreateOptions,
+) !CreateOptions {
+    const raw_path = parsed.options_path orelse return parsed;
+    const data = readCreateOptionsFile(io, allocator, raw_path) catch |err| {
+        const message = allocLifecycleMessage(allocator, "spore create: cannot read --options {s}: {s}", .{ raw_path, @errorName(err) });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+    };
+    return parseCreateOptionsFile(allocator, parsed, data) catch |err| {
+        const message = allocLifecycleMessage(allocator, "spore create: invalid --options {s}: {s}", .{ raw_path, @errorName(err) });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+    };
+}
+
+fn parseCreateOptionsFile(
+    allocator: std.mem.Allocator,
+    base: CreateOptions,
+    data: []const u8,
+) !CreateOptions {
+    const parsed = try std.json.parseFromSlice(CreateOptionsFile, allocator, data, .{
+        .allocate = .alloc_always,
+    });
+    const file = parsed.value;
+    if (file.schema_version != 1) return error.UnsupportedOptionsFile;
+    if (file.name) |name| {
+        if (!std.mem.eql(u8, name, base.spec.name)) return error.ConflictingOptions;
+    }
+
+    var out = base;
+    out.options_path = null;
+    out.spec = .{ .name = base.spec.name };
+    if (file.backend) |backend| {
+        if (run_mod.Backend.parse(backend) == null) return error.InvalidBackend;
+        out.spec.backend = backend;
+    }
+    out.spec.kernel_path = try chooseCreateOptionsAlias(file.kernel_path, file.kernel);
+    out.spec.initrd_path = try chooseCreateOptionsAlias(file.initrd_path, file.initrd);
+    out.spec.rootfs_path = try chooseCreateOptionsAlias(file.rootfs_path, file.rootfs);
+    out.spec.image_ref = try chooseCreateOptionsAlias(file.image_ref, file.image);
+    if (file.image_pull_policy != null and file.pull != null) return error.ConflictingOptions;
+    if (file.image_pull_policy orelse file.pull) |pull| {
+        out.image_pull_policy = run_mod.PullPolicy.parse(pull) orelse return error.InvalidPullPolicy;
+    }
+    if (file.memory != null and file.memory_bytes != null) return error.ConflictingOptions;
+    if (file.memory) |memory| {
+        out.spec.memory = try memory_config.parse(memory);
+    } else if (file.memory_bytes) |bytes| {
+        out.spec.memory = try memory_config.fromManifestBytes(bytes);
+    }
+    if (file.vcpus) |vcpus| out.spec.vcpus = vcpus;
+    if (file.guest_port) |port| out.spec.guest_port = port;
+    if (file.timeout_ms) |timeout| out.spec.timeout_ms = timeout;
+    out.spec.console_log_path = file.console_log_path;
+    out.spec.annotations = file.annotations;
+    try spore.validateAnnotations(out.spec.annotations);
+
+    if (file.network) |network| {
+        const has_network_fields = network.allow_cidrs.len != 0 or
+            network.allow_hosts.len != 0 or
+            network.allow_host_ports.len != 0 or
+            network.network_rules.len != 0 or
+            network.bound_services.len != 0;
+        if (!network.enabled and has_network_fields) return error.InvalidNetworkPolicy;
+        if (network.enabled) {
+            out.network = .spore;
+            for (network.allow_cidrs) |cidr| try out.network_policy.addAllowCidr(cidr);
+            for (network.allow_hosts) |host| try out.network_policy.addAllowHost(host);
+            for (network.allow_host_ports) |rule| try out.network_policy.addExactHostPorts(rule.host, rule.ports);
+            for (network.network_rules) |rule| try out.network_policy.addExactHostPorts(rule.host, rule.ports);
+            for (network.bound_services) |service| {
+                const guest_host = service.guest_host orelse try std.fmt.allocPrint(allocator, "{s}.spore.internal", .{service.name});
+                try out.network_policy.addBoundUnixService(service.name, guest_host, service.guest_port, service.unix_path);
+            }
+        }
+    }
+    if (out.spec.rootfs_path != null and out.spec.image_ref != null) return error.InvalidRootfsInput;
+    if (out.spec.image_ref == null and out.image_pull_policy != .missing) return error.InvalidPullPolicy;
+    return out;
+}
+
+fn chooseCreateOptionsAlias(primary: ?[]const u8, alias: ?[]const u8) !?[]const u8 {
+    if (primary != null and alias != null) return error.ConflictingOptions;
+    return primary orelse alias;
+}
+
 fn parseCreateArgs(
     args: []const []const u8,
     allocator: std.mem.Allocator,
@@ -2247,6 +2479,8 @@ fn parseCreateArgs(
 ) !CreateOptions {
     var name: ?[]const u8 = null;
     var spec = Spec{ .name = "" };
+    var options_path: ?[]const u8 = null;
+    var field_flag_seen = false;
     var image_pull_policy: run_mod.PullPolicy = .missing;
     var network: run_mod.NetworkMode = .disabled;
     var network_policy = run_mod.NetworkPolicy{};
@@ -2260,52 +2494,88 @@ fn parseCreateArgs(
             command = args[i + 1 ..];
             break;
         } else if (std.mem.eql(u8, args[i], "--backend")) {
+            field_flag_seen = true;
             spec.backend = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
             if (run_mod.Backend.parse(spec.backend) == null) {
                 const message = "--backend must be auto, hvf, or kvm";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             }
         } else if (std.mem.eql(u8, args[i], "--kernel")) {
+            field_flag_seen = true;
             spec.kernel_path = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--initrd")) {
+            field_flag_seen = true;
             spec.initrd_path = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--rootfs")) {
+            field_flag_seen = true;
             spec.rootfs_path = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
+            field_flag_seen = true;
             spec.image_ref = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--options")) {
+            if (options_path != null) {
+                const message = "spore create: --options may be supplied once";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            }
+            options_path = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--pull")) {
+            field_flag_seen = true;
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
             image_pull_policy = run_mod.PullPolicy.parse(raw) orelse {
                 const message = "spore create: --pull must be missing, always, or never";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             };
         } else if (std.mem.startsWith(u8, args[i], "--pull=")) {
+            field_flag_seen = true;
             const raw = args[i]["--pull=".len..];
             image_pull_policy = run_mod.PullPolicy.parse(raw) orelse {
                 const message = "spore create: --pull must be missing, always, or never";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             };
         } else if (std.mem.eql(u8, args[i], "--net")) {
+            field_flag_seen = true;
             network = .spore;
         } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
+            field_flag_seen = true;
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
             network_policy.addAllowCidr(raw) catch |err| {
                 const message = allocLifecycleMessage(allocator, "spore create: invalid --allow-cidr {s}: {s}", .{ raw, @errorName(err) });
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             };
         } else if (std.mem.eql(u8, args[i], "--allow-host")) {
+            field_flag_seen = true;
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
             network_policy.addAllowHost(raw) catch |err| {
                 const message = allocLifecycleMessage(allocator, "spore create: invalid --allow-host {s}: {s}", .{ raw, @errorName(err) });
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             };
+        } else if (std.mem.eql(u8, args[i], "--allow-host-port")) {
+            field_flag_seen = true;
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+            const parsed = spore_net_policy.parseHostPort(raw) catch |err| {
+                const message = allocLifecycleMessage(allocator, "spore create: invalid --allow-host-port {s}: {s}", .{ raw, @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            };
+            network_policy.addExactHostPorts(parsed.host, &.{parsed.port}) catch |err| {
+                const message = allocLifecycleMessage(allocator, "spore create: invalid --allow-host-port {s}: {s}", .{ raw, @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            };
+        } else if (std.mem.eql(u8, args[i], "--bind-service")) {
+            field_flag_seen = true;
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+            network_policy.addBindService(raw) catch |err| {
+                const message = allocLifecycleMessage(allocator, "spore create: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            };
         } else if (std.mem.eql(u8, args[i], "--forward")) {
+            field_flag_seen = true;
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
             network_policy.addPortForward(raw) catch |err| {
                 const message = allocLifecycleMessage(allocator, "spore create: invalid --forward {s}: {s}", .{ raw, @errorName(err) });
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             };
         } else if (std.mem.eql(u8, args[i], "--memory")) {
+            field_flag_seen = true;
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
             spec.memory = memory_config.parse(raw) catch |err| {
                 const message = allocLifecycleMessage(
@@ -2319,16 +2589,23 @@ fn parseCreateArgs(
             const message = "spore create: --memory-mib has been replaced by --memory";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
         } else if (std.mem.eql(u8, args[i], "--vcpus")) {
+            field_flag_seen = true;
             const flag = args[i];
             spec.vcpus = parseVcpuCountLifecycleCli(allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
         } else if (std.mem.eql(u8, args[i], "--guest-port")) {
+            field_flag_seen = true;
             const flag = args[i];
             spec.guest_port = parseIntArgLifecycleCli(u32, allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
         } else if (std.mem.eql(u8, args[i], "--timeout-ms")) {
+            field_flag_seen = true;
             const flag = args[i];
             spec.timeout_ms = parseIntArgLifecycleCli(u64, allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
         } else if (std.mem.eql(u8, args[i], "--console-log")) {
+            field_flag_seen = true;
             spec.console_log_path = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--annotation")) {
+            field_flag_seen = true;
+            addAnnotationArgLifecycleCli(allocator, stderr, mode, "create", &spec.annotations, takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]));
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             const message = allocLifecycleMessage(allocator, "unknown create argument: {s}", .{args[i]});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
@@ -2362,6 +2639,10 @@ fn parseCreateArgs(
             );
         }
     }
+    if (options_path != null and field_flag_seen) {
+        const message = "spore create: --options cannot be combined with create option flags";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+    }
     if (spec.rootfs_path != null and spec.image_ref != null) {
         const message = "spore create: --rootfs and --image are mutually exclusive";
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
@@ -2376,6 +2657,7 @@ fn parseCreateArgs(
     }
     return .{
         .spec = spec,
+        .options_path = options_path,
         .image_pull_policy = image_pull_policy,
         .network = network,
         .network_policy = network_policy,
@@ -2468,11 +2750,14 @@ fn parseSuspendArgs(
 ) SuspendOptions {
     var name: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
+    var annotations = spore.Annotations{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out")) {
             out_dir = takeValueLifecycleCli(allocator, stderr, mode, "suspend", args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--annotation")) {
+            addAnnotationArgLifecycleCli(allocator, stderr, mode, "suspend", &annotations, takeValueLifecycleCli(allocator, stderr, mode, "suspend", args, &i, args[i]));
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             const message = allocLifecycleMessage(allocator, "unknown suspend argument: {s}", .{args[i]});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "suspend"), message);
@@ -2494,7 +2779,7 @@ fn parseSuspendArgs(
             suspend_usage,
         );
     }
-    return .{ .name = name.?, .out_dir = out_dir.? };
+    return .{ .name = name.?, .out_dir = out_dir.?, .annotations = annotations };
 }
 
 fn parseForkArgs(
@@ -2554,12 +2839,22 @@ fn parseResumeArgs(
 ) ResumeOptions {
     var spore_dir: ?[]const u8 = null;
     var name: ?[]const u8 = null;
+    var bound_services = run_mod.BoundServiceBindingList{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--name")) {
             name = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, args[i]);
             validateNameLifecycleCli(allocator, stderr, mode, "resume", name.?);
+        } else if (std.mem.eql(u8, args[i], "--bind-service")) {
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, args[i]);
+            bound_services.append(spore_net_policy.parseBoundServiceBinding(raw) catch |err| {
+                const message = allocLifecycleMessage(allocator, "spore resume: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            }) catch |err| {
+                const message = allocLifecycleMessage(allocator, "spore resume: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            };
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             const message = allocLifecycleMessage(allocator, "unknown resume argument: {s}", .{args[i]});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
@@ -2580,7 +2875,7 @@ fn parseResumeArgs(
             resume_usage,
         );
     }
-    return .{ .spore_dir = spore_dir.?, .name = name.? };
+    return .{ .spore_dir = spore_dir.?, .name = name.?, .bound_services = bound_services };
 }
 
 fn apiPaths(context: Context, allocator: std.mem.Allocator, name: []const u8) !Paths {
@@ -4388,11 +4683,104 @@ test "create parser accepts network allow policy" {
     try std.testing.expectEqual(@as(u16, 80), opts.network_policy.port_forwards[0].guest_port);
 }
 
+test "create parser accepts annotations exact host ports and bound services" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    var opts = try parseCreateArgs(&.{
+        "bench-1",
+        "--net",
+        "--annotation",
+        "cleanroom.stage=compile=fast",
+        "--allow-host-port",
+        "github.com:443",
+        "--bind-service",
+        "metadata:8170=unix:/tmp/metadata.sock",
+    }, allocator, &stderr.writer, .human);
+    defer opts.spec.annotations.deinit(allocator);
+
+    try std.testing.expectEqualStrings("compile=fast", opts.spec.annotations.map.get("cleanroom.stage").?);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.exact_rule_count);
+    try std.testing.expectEqualStrings("github.com", opts.network_policy.exact_rules[0].host);
+    try std.testing.expectEqual(@as(u16, 443), opts.network_policy.exact_rules[0].ports[0]);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.bound_service_count);
+    try std.testing.expectEqualStrings("metadata", opts.network_policy.bound_services[0].name);
+    try std.testing.expectEqual(@as(u16, 8170), opts.network_policy.bound_services[0].guest_port);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.network_policy.bound_services[0].unix_path);
+}
+
+test "create options file maps to create options" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const base = CreateOptions{ .spec = .{ .name = "bench-1" } };
+    const opts = try parseCreateOptionsFile(arena, base,
+        \\{
+        \\  "schema_version": 1,
+        \\  "image_ref": "docker.io/library/alpine:3.20",
+        \\  "memory": "512mb",
+        \\  "vcpus": 2,
+        \\  "timeout_ms": 120000,
+        \\  "network": {
+        \\    "enabled": true,
+        \\    "allow_cidrs": ["93.184.216.34/32"],
+        \\    "allow_hosts": ["example.com"],
+        \\    "network_rules": [{"host": "github.com", "ports": [443]}],
+        \\    "bound_services": [{"name": "metadata", "guest_host": "metadata.cleanroom.internal", "guest_port": 8170, "unix_path": "/tmp/metadata.sock"}]
+        \\  },
+        \\  "annotations": {"cleanroom.stage": "compile"}
+        \\}
+    );
+
+    try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", opts.spec.image_ref.?);
+    try std.testing.expectEqual(memory_config.Policy.explicit, opts.spec.memory.policy);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), opts.spec.memory.bytes);
+    try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.spec.vcpus);
+    try std.testing.expectEqual(@as(u64, 120_000), opts.spec.timeout_ms);
+    try std.testing.expectEqual(run_mod.NetworkMode.spore, opts.network);
+    try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
+    try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
+    try std.testing.expectEqualStrings("github.com", opts.network_policy.exact_rules[0].host);
+    try std.testing.expectEqual(@as(u16, 443), opts.network_policy.exact_rules[0].ports[0]);
+    try std.testing.expectEqualStrings("metadata", opts.network_policy.bound_services[0].name);
+    try std.testing.expectEqualStrings("metadata.cleanroom.internal", opts.network_policy.bound_services[0].guest_host);
+    try std.testing.expectEqual(@as(u16, 8170), opts.network_policy.bound_services[0].guest_port);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.network_policy.bound_services[0].unix_path);
+    const services = try createBoundServicesFromConfig(arena, &opts.network_policy);
+    try std.testing.expectEqualStrings("metadata.cleanroom.internal", services[0].guest_host);
+    try std.testing.expectEqualStrings("compile", opts.spec.annotations.map.get("cleanroom.stage").?);
+}
+
+fn fuzzCreateOptionsFile(_: void, s: *std.testing.Smith) !void {
+    var buf: [4096]u8 = undefined;
+    const len = s.slice(&buf);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const base = CreateOptions{ .spec = .{ .name = "bench-1" } };
+    _ = parseCreateOptionsFile(arena_state.allocator(), base, buf[0..len]) catch return;
+}
+
+test "fuzz create options file parsing" {
+    try std.testing.fuzz({}, fuzzCreateOptionsFile, .{});
+}
+
 test "named network config accepts create cli policy" {
     const config = try namedNetworkConfig(.{
         .enabled = true,
         .allow_cidrs = &.{"93.184.216.34/32"},
         .allow_hosts = &.{"example.com"},
+        .policy = .{ .allow = &.{.{
+            .host = "github.com",
+            .ports = &.{443},
+        }} },
+        .bound_services = &.{.{
+            .name = "metadata",
+            .guest_host = "metadata.spore.internal",
+            .guest_port = 8170,
+            .target = .{ .unix = "/tmp/metadata.sock" },
+        }},
         .port_forwards = &.{.{ .host_port = 8080, .guest_port = 80 }},
     });
 
@@ -4401,6 +4789,14 @@ test "named network config accepts create cli policy" {
     try std.testing.expectEqualStrings("93.184.216.34/32", config.policy.allow_cidrs[0]);
     try std.testing.expectEqual(@as(usize, 1), config.policy.allow_host_count);
     try std.testing.expectEqualStrings("example.com", config.policy.allow_hosts[0]);
+    try std.testing.expectEqual(@as(usize, 1), config.policy.exact_rule_count);
+    try std.testing.expectEqualStrings("github.com", config.policy.exact_rules[0].host);
+    try std.testing.expectEqual(@as(u16, 443), config.policy.exact_rules[0].ports[0]);
+    try std.testing.expectEqual(@as(usize, 1), config.policy.bound_service_count);
+    try std.testing.expectEqualStrings("metadata", config.policy.bound_services[0].name);
+    try std.testing.expectEqualStrings("metadata.spore.internal", config.policy.bound_services[0].guest_host);
+    try std.testing.expectEqual(@as(u16, 8170), config.policy.bound_services[0].guest_port);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", config.policy.bound_services[0].unix_path);
     try std.testing.expectEqual(@as(usize, 1), config.policy.port_forward_count);
     try std.testing.expectEqual(@as(u16, 8080), config.policy.port_forwards[0].host_port);
     try std.testing.expectEqual(@as(u16, 80), config.policy.port_forwards[0].guest_port);
@@ -4412,6 +4808,31 @@ test "named network config keeps bare network unrestricted" {
     try std.testing.expectEqual(run_mod.NetworkMode.spore, config.mode);
     try std.testing.expect(!config.policy.default_deny);
     try std.testing.expect(!config.policy.hasRules());
+}
+
+test "suspend parser accepts annotations" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    var opts = parseSuspendArgs(&.{ "bench-1", "--out", "bench-1.spore", "--annotation", "captured=true=1" }, allocator, &stderr.writer, .human);
+    defer opts.annotations.deinit(allocator);
+    try std.testing.expectEqualStrings("bench-1", opts.name);
+    try std.testing.expectEqualStrings("bench-1.spore", opts.out_dir);
+    try std.testing.expectEqualStrings("true=1", opts.annotations.map.get("captured").?);
+}
+
+test "named resume parser accepts bound service bindings" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    const opts = parseResumeArgs(&.{ "bench-1.spore", "--name", "bench-2", "--bind-service", "metadata=unix:/tmp/metadata.sock" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqualStrings("bench-1.spore", opts.spore_dir);
+    try std.testing.expectEqualStrings("bench-2", opts.name);
+    try std.testing.expectEqual(@as(usize, 1), opts.bound_services.len);
+    try std.testing.expectEqualStrings("metadata", opts.bound_services.items[0].name);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.bound_services.items[0].target.unix);
 }
 
 test "lifecycle detects incomplete ready and stale pid state" {

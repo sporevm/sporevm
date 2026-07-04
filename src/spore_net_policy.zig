@@ -637,6 +637,23 @@ pub fn parseHostPort(raw: []const u8) ParseError!HostPort {
     return .{ .host = host, .port = port };
 }
 
+pub fn parseBoundServiceBinding(raw: []const u8) ParseError!BoundServiceBinding {
+    const eq = std.mem.indexOfScalar(u8, raw, '=') orelse return error.InvalidBoundService;
+    if (std.mem.indexOfScalar(u8, raw[eq + 1 ..], '=') != null) return error.InvalidBoundService;
+    const name = raw[0..eq];
+    const target = raw[eq + 1 ..];
+    try validateServiceName(name);
+
+    const unix_prefix = "unix:";
+    if (!std.mem.startsWith(u8, target, unix_prefix)) return error.UnsupportedBoundServiceTarget;
+    const path = target[unix_prefix.len..];
+    try validateUnixSocketPath(path);
+    return .{
+        .name = name,
+        .target = .{ .unix = path },
+    };
+}
+
 pub fn parsePortForward(raw: []const u8) ParseError!PortForwardConfig {
     var parts = std.mem.splitScalar(u8, raw, ':');
     const first = parts.next() orelse return error.InvalidPortForward;
@@ -909,6 +926,17 @@ test "spore-net policy parses bound unix service declarations" {
     var cache_query_buf: [512]u8 = undefined;
     const cache_query = testDnsQuery(0x1235, "cache.spore.internal", &cache_query_buf);
     try std.testing.expectEqualStrings("cache", (policy.boundServiceForDnsQuery(cache_query, dns_header_len) orelse return error.TestUnexpectedResult).name);
+}
+
+test "spore-net policy parses bound unix service bindings" {
+    const binding = try parseBoundServiceBinding("metadata=unix:/tmp/metadata.sock");
+    try std.testing.expectEqualStrings("metadata", binding.name);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", binding.target.unix);
+    try std.testing.expectError(error.InvalidBoundService, parseBoundServiceBinding("metadata"));
+    try std.testing.expectError(error.InvalidBoundService, parseBoundServiceBinding("metadata=unix:/tmp/a=bad.sock"));
+    try std.testing.expectError(error.InvalidBoundService, parseBoundServiceBinding("MetaData=unix:/tmp/metadata.sock"));
+    try std.testing.expectError(error.UnsupportedBoundServiceTarget, parseBoundServiceBinding("metadata=tcp:127.0.0.1:8080"));
+    try std.testing.expectError(error.InvalidBoundServiceTarget, parseBoundServiceBinding("metadata=unix:relative.sock"));
 }
 
 test "spore-net policy rejects invalid bound service declarations" {

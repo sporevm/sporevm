@@ -78,7 +78,7 @@ fn runParsed(
         else => return err,
     };
     if (parsed.from_spore_dir) |spore_dir| {
-        if (parsed.network_requested or parsed.network_policy.hasRules() or parsed.network_policy.hasBoundServices()) {
+        if (parsed.network_requested or parsed.network_policy.hasRules()) {
             failRunSetup("spore run: --from uses the captured network policy; omit --net and network flags", .{});
         }
         const command = if (parsed.command.len == 0)
@@ -109,6 +109,7 @@ fn runParsed(
             .continue_after_capture = parsed.continue_after_capture,
             .spore_executable = spore_executable,
             .debug = debug,
+            .bound_services = parsed.bound_services.slice(),
             .events = events,
         });
     }
