@@ -1294,7 +1294,8 @@ fn runReexecRole(
 ) !c_int {
     if (argv.len < 2 or argv[0].len == 0) return error.InvalidValue;
     const parsed_role = parseReexecRole(role) orelse return error.InvalidValue;
-    if (!std.mem.eql(u8, role, argv[1])) return error.InvalidValue;
+    const role_index: usize = if (std.mem.eql(u8, argv[1], "--debug")) 2 else 1;
+    if (argv.len <= role_index or !std.mem.eql(u8, role, argv[role_index])) return error.InvalidValue;
     const parsed_contract = std.fmt.parseUnsigned(u32, contract, 10) catch return error.InvalidValue;
     if (parsed_contract != reexec_contract_version) return error.InvalidValue;
 
@@ -1322,14 +1323,14 @@ fn runReexecRole(
     if (options.discard_stdout) {
         var stdout_buffer: [1024]u8 = undefined;
         var stdout_discarding: std.Io.Writer.Discarding = .init(&stdout_buffer);
-        try runReexecRoleWithWriter(init, parsed_role, argv, &stdout_discarding.writer);
+        try runReexecRoleWithWriter(init, parsed_role, argv[role_index + 1 ..], argv[0], &stdout_discarding.writer);
         try stdout_discarding.writer.flush();
         return 0;
     }
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
-    try runReexecRoleWithWriter(init, parsed_role, argv, &stdout_file_writer.interface);
+    try runReexecRoleWithWriter(init, parsed_role, argv[role_index + 1 ..], argv[0], &stdout_file_writer.interface);
     try stdout_file_writer.interface.flush();
     return 0;
 }
@@ -1343,12 +1344,13 @@ fn parseReexecRole(role: []const u8) ?ReexecRole {
 fn runReexecRoleWithWriter(
     init: std.process.Init,
     role: ReexecRole,
-    argv: []const []const u8,
+    role_args: []const []const u8,
+    spore_executable: []const u8,
     stdout: *std.Io.Writer,
 ) !void {
     switch (role) {
-        .monitor => try spore_internal.monitor.runRole(init, argv[2..], stdout, argv[0]),
-        .netd => try spore_internal.spore_netd.runRole(init, argv[2..], stdout),
+        .monitor => try spore_internal.monitor.runRole(init, role_args, stdout, spore_executable),
+        .netd => try spore_internal.spore_netd.runRole(init, role_args, stdout),
     }
 }
 
@@ -1432,6 +1434,7 @@ test "reexec role validation fails closed" {
     try std.testing.expectError(error.InvalidValue, runReexecRole(allocator, "netd", "1", &.{ "embedder", "monitor", "--help" }, options));
     try std.testing.expectError(error.InvalidValue, runReexecRole(allocator, "netd", "2", &.{ "embedder", "netd", "--help" }, options));
     try std.testing.expectError(error.InvalidValue, runReexecRole(allocator, "unknown", "1", &.{ "embedder", "unknown" }, options));
+    try std.testing.expectError(error.InvalidValue, runReexecRole(allocator, "netd", "1", &.{ "embedder", "--debug" }, options));
 }
 
 test "reexec dispatcher reaches hidden role parsers" {
@@ -1439,6 +1442,7 @@ test "reexec dispatcher reaches hidden role parsers" {
     const options = ReexecOptions{ .cleanup_fds = false, .unset_env = false, .discard_stdout = true };
 
     try std.testing.expectEqual(@as(c_int, 0), try runReexecRole(allocator, "netd", "1", &.{ "embedder", "netd", "--help" }, options));
+    try std.testing.expectEqual(@as(c_int, 0), try runReexecRole(allocator, "netd", "1", &.{ "embedder", "--debug", "netd", "--help" }, options));
     try std.testing.expectEqual(@as(c_int, 0), try runReexecRole(allocator, "monitor", "1", &.{ "embedder", "monitor", "--help" }, options));
 }
 

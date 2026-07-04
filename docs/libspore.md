@@ -855,6 +855,8 @@ flows through the re-exec trampoline.
 
 - `MonitorVersionMismatch` means libspore reached a monitor helper, but the
   helper did not report the same SporeVM version and monitor helper contract.
+  The match is exact, including patch releases, because the helper argv/control
+  contract is private to one SporeVM build.
   Use the Go default self re-exec path, or point `SporeExecutable` /
   `spore_executable` at a matching `spore` binary.
 - `spore` not found during C or Zig named lifecycle means the default
