@@ -132,6 +132,10 @@ description = "Smoke product spore run hard-floor egress denial"
 run = "mise run build && scripts/smoke-run-net-bind-service.sh"
 description = "Smoke product spore run bound Unix service proxying"
 
+[tasks."smoke:run-net-bind-service-oci"]
+run = "mise run build && scripts/smoke-run-net-bind-service-oci.sh"
+description = "Smoke OCI guest bound Unix service DNS and proxying"
+
 [tasks."smoke:run-net-forward"]
 run = "mise run build && scripts/smoke-run-net-forward.sh"
 description = "Smoke product spore run host-to-guest TCP forwarding"
