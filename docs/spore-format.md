@@ -212,12 +212,10 @@ under `rootfs.cache`.
   remain the portable verified source of truth; unsupported backends and
   imported/cold spores materialize from chunks instead. Product restore paths
   (`spore resume` and `spore run --from`) may automatically map `ram.backing`
-  for single-vCPU manifests only when the local `ram.backing.proof` validates
-  against the manifest memory fingerprint, backing metadata, opened file
-  identity, and host-local runtime key. Multi-vCPU manifests materialize from
-  chunks until the local backing fast path has backend smoke coverage. A
-  missing, corrupt, foreign-key, mismatched proof, or unsupported topology falls
-  back to chunks.
+  when the manifest vCPU count is supported and the local `ram.backing.proof`
+  validates against the manifest memory fingerprint, backing metadata, opened
+  file identity, and host-local runtime key. A missing, corrupt, foreign-key,
+  mismatched proof, or unsupported topology falls back to chunks.
   The proof is local provenance metadata; it is not a portable trust root and
   does not prove every RAM byte still matches the manifest's chunk refs. KVM and
   HVF map a validated fd

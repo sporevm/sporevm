@@ -135,6 +135,31 @@ if ! "${spore_bin}" run \
 fi
 expect_manifest_v1 "${from_base_dir}"
 
+fork_dir="${workdir}/v1-children"
+fork_child_stdout="${workdir}/fork-child.stdout"
+fork_child_stderr="${workdir}/fork-child.stderr"
+if ! "${spore_bin}" fork "${from_base_dir}" --count 2 --out "${fork_dir}" \
+  >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"; then
+  cat "${workdir}/fork.stdout" >&2 || true
+  cat "${workdir}/fork.stderr" >&2 || true
+  die "multi-vCPU fork failed"
+fi
+expect_manifest_v1 "${fork_dir}/000000"
+expect_manifest_v1 "${fork_dir}/000001"
+
+if ! "${spore_bin}" run \
+  --backend "${backend}" \
+  --events=jsonl \
+  --from "${fork_dir}/000000" \
+  -- /bin/writeout \
+  >"${fork_child_stdout}" 2>"${fork_child_stderr}"; then
+  cat "${fork_child_stdout}" >&2 || true
+  cat "${fork_child_stderr}" >&2 || true
+  die "multi-vCPU fork child run --from failed"
+fi
+jsonl_output_contains "${fork_child_stdout}" stdout "spore stdout" || die "multi-vCPU fork child run --from did not emit stdout"
+jsonl_output_contains "${fork_child_stdout}" stderr "spore stderr" || die "multi-vCPU fork child run --from did not emit stderr"
+
 if ! "${spore_bin}" run \
   --backend "${backend}" \
   --events=jsonl \
@@ -199,6 +224,7 @@ grep -Fq '"exit_code":0' "${resume_stdout}" || die "multi-vCPU resume did not re
 
 if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   vm_name="mvcpus-${backend}"
+  forked_name="${vm_name}-forked"
   resumed_name="${vm_name}-resumed"
   named_dir="${workdir}/named.spore"
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${vm_name}" --backend "${backend}" --vcpus "${vcpus}" --memory "${memory}" --timeout-ms "${create_timeout_ms}" >"${workdir}/create.stdout" 2>"${workdir}/create.stderr"; then
@@ -212,6 +238,18 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     die "multi-vCPU named exec nproc failed"
   fi
   expect_nproc_equals "${workdir}/exec-nproc.stdout"
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" fork --vm "${vm_name}" --count 1 --name "${forked_name}" >"${workdir}/named-fork.stdout" 2>"${workdir}/named-fork.stderr"; then
+    cat "${workdir}/named-fork.stdout" >&2 || true
+    cat "${workdir}/named-fork.stderr" >&2 || true
+    die "multi-vCPU named fork failed"
+  fi
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${forked_name}" -- /bin/nproc >"${workdir}/forked-nproc.stdout" 2>"${workdir}/forked-nproc.stderr"; then
+    cat "${workdir}/forked-nproc.stdout" >&2 || true
+    cat "${workdir}/forked-nproc.stderr" >&2 || true
+    die "multi-vCPU named fork child exec nproc failed"
+  fi
+  expect_nproc_equals "${workdir}/forked-nproc.stdout"
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${forked_name}" >/dev/null
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" suspend "${vm_name}" --out "${named_dir}" >"${workdir}/suspend.stdout" 2>"${workdir}/suspend.stderr"; then
     cat "${workdir}/suspend.stdout" >&2 || true
     cat "${workdir}/suspend.stderr" >&2 || true
@@ -234,12 +272,12 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     cat "${workdir}/named-resume.stderr" >&2 || true
     die "multi-vCPU named resume failed"
   fi
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${resumed_name}" -- /bin/writeout >"${workdir}/named-exec.stdout" 2>"${workdir}/named-exec.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${resumed_name}" -- /bin/nproc >"${workdir}/named-exec.stdout" 2>"${workdir}/named-exec.stderr"; then
     cat "${workdir}/named-exec.stdout" >&2 || true
     cat "${workdir}/named-exec.stderr" >&2 || true
     die "multi-vCPU named exec after resume failed"
   fi
-  grep -Fxq "spore stdout" "${workdir}/named-exec.stdout" || die "multi-vCPU named exec did not emit stdout after resume"
+  expect_nproc_equals "${workdir}/named-exec.stdout"
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${resumed_name}" >/dev/null
 fi
 

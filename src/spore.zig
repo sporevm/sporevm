@@ -1026,9 +1026,7 @@ pub fn openProvenLocalMemoryBackingForVcpuCount(
     expected_size: u64,
     vcpu_count: topology.VcpuCount,
 ) Error!LocalBackingPlan {
-    // ponytail: multi-vCPU MAP_PRIVATE backing restore currently stalls HVF;
-    // keep the proven chunk path until backend smoke covers local backing.
-    if (vcpu_count != 1) return localBackingChunksPlan(.unsupported_topology);
+    try topology.validateVcpuCount(vcpu_count);
     return openProvenLocalMemoryBacking(allocator, environ, dir, memory, expected_size);
 }
 
@@ -1514,28 +1512,21 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
 
     const parsed = loadManifest(allocator, options.parent_dir) catch |err| switch (err) {
         error.BadManifest => {
-            var parsed_v1 = loadManifestV1(allocator, options.parent_dir) catch return error.BadManifest;
-            parsed_v1.deinit();
-            return error.UnsupportedVcpuCount;
+            const parsed_v1 = loadManifestV1(allocator, options.parent_dir) catch return error.BadManifest;
+            defer parsed_v1.deinit();
+            return forkV1(allocator, options, parsed_v1.value);
         },
         else => |e| return e,
     };
     defer parsed.deinit();
-    const parent = parsed.value;
+    return forkV0(allocator, options, parsed.value);
+}
+
+fn forkV0(allocator: std.mem.Allocator, options: ForkOptions, parent: Manifest) Error!ForkResult {
     if (parent.generation.generation > std.math.maxInt(u64) - options.count) return error.BadForkCount;
 
-    const parent_chunks = try pathZ(allocator, "{s}/chunks", .{options.parent_dir});
-    const shared_chunks = try realpathAlloc(allocator, parent_chunks);
-    const shared_backing = try provenForkBackingPath(allocator, options.environ_map, options.parent_dir, parent.memory, parent.platform.ram_size);
-    var shared_disk_layers: ?[]const u8 = null;
-    var shared_disk_objects: ?[]const u8 = null;
-    if (parent.disk) |disk| {
-        if (disk.layers.len > 0) {
-            shared_disk_layers = try realpathAlloc(allocator, try pathZ(allocator, "{s}/disklayers", .{options.parent_dir}));
-            shared_disk_objects = try realpathAlloc(allocator, try pathZ(allocator, "{s}/diskobjects", .{options.parent_dir}));
-        }
-    }
-    try ensureDir(try pathZ(allocator, "{s}", .{options.out_dir}));
+    const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.disk);
+    const shared_backing = try provenForkBackingPath(allocator, options.environ_map, options.parent_dir, parent.memory, parent.platform.ram_size, 1);
 
     const fork_batch_id = try randomHex(allocator, 16);
 
@@ -1543,16 +1534,9 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
     while (i < options.count) : (i += 1) {
         const child_dir = try pathZ(allocator, "{s}/{d:0>6}", .{ options.out_dir, i });
         try ensureNewDir(child_dir);
-        const chunks_link = try pathZ(allocator, "{s}/chunks", .{child_dir});
-        try symlinkPath(shared_chunks, chunks_link);
-        if (shared_disk_layers) |layers| {
-            try symlinkPath(layers, try pathZ(allocator, "{s}/disklayers", .{child_dir}));
-        }
-        if (shared_disk_objects) |objects| {
-            try symlinkPath(objects, try pathZ(allocator, "{s}/diskobjects", .{child_dir}));
-        }
+        try linkForkSharedStores(allocator, child_dir, shared);
         var child = parent;
-        try prepareForkChildBacking(allocator, child_dir, &child, shared_backing, options.environ_map);
+        try prepareForkChildBacking(allocator, child_dir, &child.memory, child.platform.ram_size, shared_backing, options.environ_map);
 
         const child_generation = parent.generation.generation + i + 1;
         const identity = try childIdentity(allocator, fork_batch_id, i);
@@ -1580,15 +1564,94 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
         try saveManifest(allocator, child_dir, child);
     }
 
+    return forkResult(allocator, options, parent.generation.generation);
+}
+
+fn forkV1(allocator: std.mem.Allocator, options: ForkOptions, parent: ManifestV1) Error!ForkResult {
+    if (parent.generation.generation > std.math.maxInt(u64) - options.count) return error.BadForkCount;
+
+    const child_gic = try forkGicStateV1(allocator, parent.machine.gic);
+    const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.disk);
+    const shared_backing = try provenForkBackingPath(allocator, options.environ_map, options.parent_dir, parent.memory, parent.platform.ram_size, parent.platform.vcpu_count);
+    const fork_batch_id = try randomHex(allocator, 16);
+
+    var i: usize = 0;
+    while (i < options.count) : (i += 1) {
+        const child_dir = try pathZ(allocator, "{s}/{d:0>6}", .{ options.out_dir, i });
+        try ensureNewDir(child_dir);
+        try linkForkSharedStores(allocator, child_dir, shared);
+        var child = parent;
+        try prepareForkChildBacking(allocator, child_dir, &child.memory, child.platform.ram_size, shared_backing, options.environ_map);
+
+        const child_generation = parent.generation.generation + i + 1;
+        const identity = try childIdentity(allocator, fork_batch_id, i);
+        const params_b64 = try forkParamsB64(allocator, .{
+            .schema_version = 0,
+            .parent_generation = parent.generation.generation,
+            .generation = child_generation,
+            .fork_index = i,
+            .fork_count = options.count,
+            .parallel_index = i,
+            .parallel_count = options.count,
+            .fork_batch_id = fork_batch_id,
+            .vm_id = identity.vm_id,
+            .hostname = identity.hostname,
+            .mac_seed = identity.mac_seed,
+            .mac_address = identity.mac_address,
+        });
+        defer allocator.free(params_b64);
+        child.generation = .{
+            .generation = child_generation,
+            .interrupt_status = generation.irq_generation_changed,
+            .params_b64 = params_b64,
+        };
+        child.machine.gic = child_gic;
+        try saveManifestV1(allocator, child_dir, child);
+    }
+
+    return forkResult(allocator, options, parent.generation.generation);
+}
+
+const ForkSharedStores = struct {
+    chunks: []const u8,
+    disk_layers: ?[]const u8 = null,
+    disk_objects: ?[]const u8 = null,
+};
+
+fn prepareForkSharedStores(allocator: std.mem.Allocator, parent_dir: []const u8, out_dir: []const u8, disk: ?Disk) Error!ForkSharedStores {
+    const parent_chunks = try pathZ(allocator, "{s}/chunks", .{parent_dir});
+    const shared_chunks = try realpathAlloc(allocator, parent_chunks);
+    var stores = ForkSharedStores{ .chunks = shared_chunks };
+    if (disk) |parent_disk| {
+        if (parent_disk.layers.len > 0) {
+            stores.disk_layers = try realpathAlloc(allocator, try pathZ(allocator, "{s}/disklayers", .{parent_dir}));
+            stores.disk_objects = try realpathAlloc(allocator, try pathZ(allocator, "{s}/diskobjects", .{parent_dir}));
+        }
+    }
+    try ensureDir(try pathZ(allocator, "{s}", .{out_dir}));
+    return stores;
+}
+
+fn linkForkSharedStores(allocator: std.mem.Allocator, child_dir: []const u8, stores: ForkSharedStores) Error!void {
+    try symlinkPath(stores.chunks, try pathZ(allocator, "{s}/chunks", .{child_dir}));
+    if (stores.disk_layers) |layers| {
+        try symlinkPath(layers, try pathZ(allocator, "{s}/disklayers", .{child_dir}));
+    }
+    if (stores.disk_objects) |objects| {
+        try symlinkPath(objects, try pathZ(allocator, "{s}/diskobjects", .{child_dir}));
+    }
+}
+
+fn forkResult(allocator: std.mem.Allocator, options: ForkOptions, parent_generation: u64) Error!ForkResult {
     const first_child = try std.fmt.allocPrint(allocator, "{s}/{d:0>6}", .{ options.out_dir, 0 });
     const last_child = try std.fmt.allocPrint(allocator, "{s}/{d:0>6}", .{ options.out_dir, options.count - 1 });
     return .{
         .parent = options.parent_dir,
         .out_dir = options.out_dir,
         .count = options.count,
-        .parent_generation = parent.generation.generation,
-        .first_generation = parent.generation.generation + 1,
-        .last_generation = parent.generation.generation + options.count,
+        .parent_generation = parent_generation,
+        .first_generation = parent_generation + 1,
+        .last_generation = parent_generation + options.count,
         .first_child = first_child,
         .last_child = last_child,
     };
@@ -1597,30 +1660,31 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
 fn prepareForkChildBacking(
     allocator: std.mem.Allocator,
     child_dir: []const u8,
-    child: *Manifest,
+    memory: *MemoryManifest,
+    ram_size: u64,
     shared_backing: ?[]const u8,
     maybe_environ: ?*const std.process.Environ.Map,
 ) Error!void {
-    const backing = child.memory.backing orelse return;
+    const backing = memory.backing orelse return;
     const source = shared_backing orelse {
-        child.memory.backing = null;
+        memory.backing = null;
         return;
     };
     const backing_link = try pathZ(allocator, "{s}/{s}", .{ child_dir, backing.path });
     hardlinkPath(source, backing_link) catch {
-        child.memory.backing = null;
+        memory.backing = null;
         return;
     };
     const environ = maybe_environ orelse {
         _ = std.c.unlink(backing_link.ptr);
-        child.memory.backing = null;
+        memory.backing = null;
         return;
     };
-    writeLocalMemoryBackingProof(allocator, environ, child_dir, child.memory, child.platform.ram_size) catch |err| switch (err) {
+    writeLocalMemoryBackingProof(allocator, environ, child_dir, memory.*, ram_size) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             _ = std.c.unlink(backing_link.ptr);
-            child.memory.backing = null;
+            memory.backing = null;
             return;
         },
     };
@@ -1632,10 +1696,11 @@ fn provenForkBackingPath(
     parent_dir: []const u8,
     memory: MemoryManifest,
     ram_size: u64,
+    vcpu_count: topology.VcpuCount,
 ) Error!?[]const u8 {
     const backing = memory.backing orelse return null;
     const environ = maybe_environ orelse return null;
-    const parent_backing_plan = try openProvenLocalMemoryBacking(allocator, environ, parent_dir, memory, ram_size);
+    const parent_backing_plan = try openProvenLocalMemoryBackingForVcpuCount(allocator, environ, parent_dir, memory, ram_size, vcpu_count);
     defer if (parent_backing_plan.fd) |fd| {
         _ = std.c.close(fd);
     };
@@ -1836,6 +1901,42 @@ fn forkGicState(allocator: std.mem.Allocator, state: gicv3.State) Error!gicv3.St
             .schema_version = gic.schema_version,
             .dist_regs = gic.dist_regs,
             .redist_regs = gic.redist_regs,
+            .line_levels = line_levels,
+        },
+    };
+}
+
+fn forkGicStateV1(allocator: std.mem.Allocator, state: gicv3.State) Error!gicv3.State {
+    if (state.kind == .backend_private) return state;
+    if (state.kind != .gicv3_multi) return error.UnsupportedVcpuCount;
+
+    const gic = state.gicv3_multi orelse return error.BadManifest;
+    var has_generation_line = false;
+    for (gic.line_levels) |line| {
+        if (line.intid == board.generationIntid()) {
+            has_generation_line = true;
+            break;
+        }
+    }
+
+    const next_len = gic.line_levels.len + @intFromBool(!has_generation_line);
+    const line_levels = allocator.alloc(gicv3.MultiLineLevel, next_len) catch return error.OutOfMemory;
+    for (gic.line_levels, 0..) |line, i| {
+        line_levels[i] = if (line.intid == board.generationIntid()) .{
+            .intid = line.intid,
+            .asserted = true,
+        } else line;
+    }
+    if (!has_generation_line) {
+        line_levels[gic.line_levels.len] = .{ .intid = board.generationIntid(), .asserted = true };
+    }
+
+    return .{
+        .kind = .gicv3_multi,
+        .gicv3_multi = .{
+            .schema_version = gic.schema_version,
+            .dist_regs = gic.dist_regs,
+            .redistributors = gic.redistributors,
             .line_levels = line_levels,
         },
     };
@@ -2198,20 +2299,31 @@ test "local memory backing proof opens local fd and falls back safely" {
     try std.testing.expectEqual(LocalBackingRestoreReason.proof_unavailable, symlink_plan.reason);
 }
 
-test "multi-vCPU restore falls back from local backing to chunks" {
+test "multi-vCPU restore opens proven local backing" {
     const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const dir = try pathZ(arena, "{s}/spore", .{root_dir});
+    const runtime_dir = try pathZ(arena, "{s}/runtime", .{root_dir});
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
+    try env.put(local_paths.runtime_dir_env, runtime_dir);
 
-    var chunks = [_]?[]const u8{null};
-    const plan = try openProvenLocalMemoryBackingForVcpuCount(allocator, &env, "/definitely/missing", .{
-        .chunk_size = chunk_size,
-        .chunks = &chunks,
-        .backing = .{ .kind = ram_backing_kind, .path = ram_backing_path, .size = chunk_size },
-    }, chunk_size, 2);
-    try std.testing.expectEqual(LocalBackingRestoreSource.chunks, plan.source);
-    try std.testing.expect(plan.fd == null);
-    try std.testing.expectEqual(LocalBackingRestoreReason.unsupported_topology, plan.reason);
+    const ram = try arena.alloc(u8, chunk_size);
+    @memset(ram, 0x4D);
+    const mm = try saveMemoryWithBacking(arena, dir, ram);
+    try writeLocalMemoryBackingProof(arena, &env, dir, mm, ram.len);
+
+    const plan = try openProvenLocalMemoryBackingForVcpuCount(arena, &env, dir, mm, ram.len, 2);
+    defer if (plan.fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    try std.testing.expectEqual(LocalBackingRestoreSource.local_backing, plan.source);
+    try std.testing.expect(plan.fd != null);
+    try std.testing.expectEqual(LocalBackingRestoreReason.proof_valid, plan.reason);
 }
 
 test "local memory backing proof rejects foreign key and manifest mismatch" {
@@ -3157,7 +3269,7 @@ test "fork drops child backing when child proof write fails" {
     const parent_backing = try memoryBackingPath(arena, parent_dir, memory.backing.?);
     const shared_backing = try realpathAlloc(arena, parent_backing);
 
-    try prepareForkChildBacking(arena, child_dir, &child, shared_backing, &env);
+    try prepareForkChildBacking(arena, child_dir, &child.memory, child.platform.ram_size, shared_backing, &env);
 
     try std.testing.expect(child.memory.backing == null);
     try std.testing.expectEqual(@as(c_int, -1), std.c.access(try pathZ(arena, "{s}/{s}", .{ child_dir, ram_backing_path }), 0));
@@ -3199,7 +3311,111 @@ test "fork rejects empty count" {
     }));
 }
 
-test "fork rejects manifest v1 before writing children" {
+test "fork mints manifest v1 child manifests with shared chunks and pending generation" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/children", .{root_dir});
+
+    const ram = try arena.alloc(u8, chunk_size);
+    @memset(ram, 0xA5);
+    const memory = try saveMemoryWithBacking(arena, parent_dir, ram);
+    const runtime_dir = try pathZ(arena, "{s}/runtime", .{root_dir});
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.runtime_dir_env, runtime_dir);
+    try writeLocalMemoryBackingProof(arena, &env, parent_dir, memory, ram.len);
+    var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
+    const redists = [_]gicv3.RedistributorState{
+        .{ .mpidr = topology.mpidrForIndex(0), .regs = &.{} },
+        .{ .mpidr = topology.mpidrForIndex(1), .regs = &.{} },
+    };
+    var parent_manifest = testManifestV1(memory, ram.len, &vcpus, &redists);
+    var devices = [_]TransportState{
+        testTransport(3),
+        testTransport(rootfs_virtio_blk_device_id),
+    };
+    parent_manifest.devices = &devices;
+    parent_manifest.rootfs = testRootfs(1);
+    parent_manifest.disk = testDisk(1);
+    parent_manifest.generation = .{ .generation = 51, .interrupt_status = 0, .params_b64 = "" };
+    try ensureDir(try pathZ(arena, "{s}/disklayers", .{parent_dir}));
+    try ensureDir(try pathZ(arena, "{s}/diskobjects", .{parent_dir}));
+    try saveManifestV1(arena, parent_dir, parent_manifest);
+
+    const result = try fork(arena, .{
+        .parent_dir = parent_dir,
+        .out_dir = out_dir,
+        .count = 2,
+        .environ_map = &env,
+    });
+    try std.testing.expectEqual(@as(usize, 2), result.count);
+    try std.testing.expectEqual(@as(u64, 51), result.parent_generation);
+    try std.testing.expectEqual(@as(u64, 52), result.first_generation);
+    try std.testing.expectEqual(@as(u64, 53), result.last_generation);
+
+    const first_child_dir = try pathZ(arena, "{s}/000000", .{out_dir});
+    try std.testing.expectError(error.BadManifest, loadManifest(arena, first_child_dir));
+    const first = try loadManifestV1(arena, first_child_dir);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u32, 1), first.value.version);
+    try std.testing.expectEqual(@as(topology.VcpuCount, 2), first.value.platform.vcpu_count);
+    try std.testing.expectEqual(@as(u64, 52), first.value.generation.generation);
+    try std.testing.expectEqual(@as(u32, generation.irq_generation_changed), first.value.generation.interrupt_status);
+    try std.testing.expect(first.value.generation.params_b64.len > 0);
+    try std.testing.expectEqual(gicv3.StateKind.gicv3_multi, first.value.machine.gic.kind);
+    const first_gic = first.value.machine.gic.gicv3_multi.?;
+    try std.testing.expectEqual(@as(usize, 1), first_gic.line_levels.len);
+    try std.testing.expectEqual(board.generationIntid(), first_gic.line_levels[0].intid);
+    try std.testing.expect(first_gic.line_levels[0].asserted);
+    try std.testing.expect(first_gic.line_levels[0].mpidr == null);
+    const first_backing = first.value.memory.backing orelse return error.BadManifest;
+    try std.testing.expectEqualStrings(ram_backing_path, first_backing.path);
+    const first_backing_path = try memoryBackingPath(arena, first_child_dir, first_backing);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.access(first_backing_path, 0));
+    const first_backing_plan = try openProvenLocalMemoryBackingForVcpuCount(arena, &env, first_child_dir, first.value.memory, first.value.platform.ram_size, first.value.platform.vcpu_count);
+    defer if (first_backing_plan.fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    try std.testing.expectEqual(LocalBackingRestoreSource.local_backing, first_backing_plan.source);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.access(try pathZ(arena, "{s}/chunks", .{first_child_dir}), 0));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.access(try pathZ(arena, "{s}/disklayers", .{first_child_dir}), 0));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.access(try pathZ(arena, "{s}/diskobjects", .{first_child_dir}), 0));
+
+    const dec = std.base64.standard.Decoder;
+    const decoded_size = try dec.calcSizeForSlice(first.value.generation.params_b64);
+    const decoded = try arena.alloc(u8, decoded_size);
+    try dec.decode(decoded, first.value.generation.params_b64);
+    const stable = try std.json.parseFromSlice(ForkStableParams, arena, decoded, .{ .allocate = .alloc_always });
+    defer stable.deinit();
+    try std.testing.expectEqual(@as(u64, 51), stable.value.parent_generation);
+    try std.testing.expectEqual(@as(u64, 52), stable.value.generation);
+    try std.testing.expectEqual(@as(usize, 0), stable.value.fork_index);
+    try std.testing.expectEqual(@as(usize, 2), stable.value.fork_count);
+
+    const out = try arena.alloc(u8, ram.len);
+    @memset(out, 0);
+    try loadMemory(arena, first_child_dir, first.value.memory, out);
+    try std.testing.expectEqualSlices(u8, ram, out);
+
+    const parent_backing_path = try memoryBackingPath(arena, parent_dir, memory.backing.?);
+    const parent_backing_fd = try openReadOnlyNoFollow(parent_backing_path);
+    defer _ = std.c.close(parent_backing_fd);
+    const child_backing_fd = try openReadOnlyNoFollow(first_backing_path);
+    defer _ = std.c.close(child_backing_fd);
+    try std.testing.expectEqual((try fstatLocalFile(parent_backing_fd)).inode, (try fstatLocalFile(child_backing_fd)).inode);
+
+    const second_child_dir = try pathZ(arena, "{s}/000001", .{out_dir});
+    const second = try loadManifestV1(arena, second_child_dir);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u64, 53), second.value.generation.generation);
+}
+
+test "fork preserves backend-private manifest v1 gic state" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -3217,14 +3433,34 @@ test "fork rejects manifest v1 before writing children" {
         .{ .mpidr = topology.mpidrForIndex(0), .regs = &.{} },
         .{ .mpidr = topology.mpidrForIndex(1), .regs = &.{} },
     };
-    try saveManifestV1(arena, parent_dir, testManifestV1(memory, ram.len, &vcpus, &redists));
+    var manifest = testManifestV1(memory, ram.len, &vcpus, &redists);
+    manifest.machine.gic = .{
+        .kind = .backend_private,
+        .backend_private = .{
+            .backend = .hvf,
+            .format = gicv3.hvf_backend_private_format,
+            .data_b64 = "AA==",
+        },
+    };
+    const backend_gic = manifest.machine.gic.backend_private.?;
+    try saveManifestV1(arena, parent_dir, manifest);
 
-    try std.testing.expectError(error.UnsupportedVcpuCount, fork(arena, .{
+    const result = try fork(arena, .{
         .parent_dir = parent_dir,
         .out_dir = out_dir,
         .count = 1,
-    }));
-    try std.testing.expectEqual(@as(c_int, -1), std.c.access(try pathZ(arena, "{s}", .{out_dir}), 0));
+    });
+    try std.testing.expectEqual(@as(usize, 1), result.count);
+
+    const child_dir = try pathZ(arena, "{s}/000000", .{out_dir});
+    const child = try loadManifestV1(arena, child_dir);
+    defer child.deinit();
+    try std.testing.expectEqual(gicv3.StateKind.backend_private, child.value.machine.gic.kind);
+    const child_gic = child.value.machine.gic.backend_private.?;
+    try std.testing.expectEqual(backend_gic.backend, child_gic.backend);
+    try std.testing.expectEqualStrings(backend_gic.format, child_gic.format);
+    try std.testing.expectEqualStrings(backend_gic.data_b64, child_gic.data_b64);
+    try std.testing.expectEqual(@as(u32, generation.irq_generation_changed), child.value.generation.interrupt_status);
 }
 
 test "backend-private GIC state json round-trip" {

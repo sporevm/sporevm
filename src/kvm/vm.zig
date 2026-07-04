@@ -670,6 +670,7 @@ const KvmVcpu = struct {
     run_mapped: bool = false,
     wake: KvmRunWake = undefined,
     thread: ?std.Thread = null,
+    snapshot_paused: std.atomic.Value(bool) = .init(false),
 
     fn init(self: *KvmVcpu, vm_fd: std.c.fd_t, run_size: usize, index: topology.VcpuIndex) !void {
         const fd: std.c.fd_t = @intCast(try kvm.ioctl(vm_fd, kvm.KVM_CREATE_VCPU, @intCast(index), "KVM_CREATE_VCPU"));
@@ -794,10 +795,23 @@ const MultiKvmResult = union(enum) {
 const MultiKvmRunState = struct {
     mutex: SpinLock = .{},
     stop: std.atomic.Value(bool) = .init(false),
+    snapshot_requested: std.atomic.Value(bool) = .init(false),
     result_value: ?MultiKvmResult = null,
 
     fn stopped(self: *MultiKvmRunState) bool {
         return self.stop.load(.acquire);
+    }
+
+    fn requestSnapshot(self: *MultiKvmRunState) void {
+        self.snapshot_requested.store(true, .release);
+    }
+
+    fn snapshotRequested(self: *MultiKvmRunState) bool {
+        return self.snapshot_requested.load(.acquire);
+    }
+
+    fn clearSnapshot(self: *MultiKvmRunState) void {
+        self.snapshot_requested.store(false, .release);
     }
 
     fn finish(self: *MultiKvmRunState, new_result: MultiKvmResult) void {
@@ -946,7 +960,19 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
                 },
                 .snapshot => |request| {
                     if (request.continue_after) {
-                        state.finish(.{ .err = error.UnsupportedSnapshotMode });
+                        snapshotMultiKvmAndContinue(
+                            allocator,
+                            options,
+                            &state,
+                            request.dir,
+                        ) catch |err| {
+                            state.finish(.{ .err = err });
+                            continue;
+                        };
+                        control.completeSnapshot(request.dir) catch |err| {
+                            state.finish(.{ .err = err });
+                            continue;
+                        };
                         continue;
                     }
                     state.finish(.{ .snapshot = request.dir });
@@ -994,6 +1020,35 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
     }
 }
 
+fn snapshotMultiKvmAndContinue(
+    allocator: std.mem.Allocator,
+    options: MultiKvmRunOptions,
+    state: *MultiKvmRunState,
+    snapshot_dir: []const u8,
+) !void {
+    try pauseKvmVcpusForSnapshot(options.vcpus, state, options.wake_set);
+    errdefer state.clearSnapshot();
+    try takeSnapshotV1(
+        allocator,
+        snapshot_dir,
+        options.gic_fd,
+        options.vcpus,
+        options.transports,
+        options.gen_dev,
+        options.vsock_dev,
+        options.ram_bytes,
+        options.ram_size,
+        options.rootfs,
+        options.disk_snapshot,
+        options.network_manifest,
+        options.annotations,
+        options.config.sessions,
+        options.dirty_tracker,
+        options.environ_map,
+    );
+    state.clearSnapshot();
+}
+
 fn finishMultiKvmResult(result: MultiKvmResult) !ExitCause {
     return switch (result) {
         .exit => |cause| cause,
@@ -1015,12 +1070,22 @@ fn joinKvmVcpuThreads(vcpus: []KvmVcpu) void {
 fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
     ctx.vcpu.wake.thread_id = linux.gettid();
     while (!ctx.state.stopped()) {
+        if (ctx.state.snapshotRequested()) {
+            ctx.vcpu.snapshot_paused.store(true, .release);
+            sleepMs(1);
+            continue;
+        }
+        ctx.vcpu.snapshot_paused.store(false, .release);
         const run_result = kvm.runVcpu(ctx.vcpu.fd) catch |err| {
             ctx.state.finish(.{ .err = err });
             return;
         };
         const stopped_for_wake = ctx.vcpu.run_bytes[kvm.RunLayout.immediate_exit] != 0;
         _ = consumeCaptureWake(null, ctx.vcpu.run_bytes);
+        if (ctx.state.snapshotRequested() and (run_result == .interrupted or stopped_for_wake)) {
+            ctx.vcpu.snapshot_paused.store(true, .release);
+            continue;
+        }
         const stop_requested = ctx.state.stopped();
         if (stop_requested and (run_result == .interrupted or stopped_for_wake)) continue;
 
@@ -1072,6 +1137,22 @@ fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
                 ctx.state.finish(.{ .err = error.UnexpectedExit });
             },
         }
+    }
+}
+
+fn pauseKvmVcpusForSnapshot(vcpus: []KvmVcpu, state: *MultiKvmRunState, wake_set: *KvmRunWakeSet) !void {
+    for (vcpus) |*vcpu| vcpu.snapshot_paused.store(false, .release);
+    state.requestSnapshot();
+    wake_set.wakeAll();
+    while (true) {
+        if (state.stopped()) return error.CaptureAborted;
+        var paused_count: usize = 0;
+        for (vcpus) |*vcpu| {
+            if (!vcpu.snapshot_paused.load(.acquire)) break;
+            paused_count += 1;
+        }
+        if (paused_count == vcpus.len) return;
+        sleepMs(1);
     }
 }
 

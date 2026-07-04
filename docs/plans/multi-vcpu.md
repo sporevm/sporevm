@@ -426,11 +426,8 @@ Status: implemented in this branch slice on 2026-06-28. Validation: `mise run
 test`, `mise run build`, `git diff --check`, and live Apple Silicon smoke with
 `spore create --backend hvf --vcpus 2`, `spore exec`, `spore suspend`,
 manifest v1 inspection, named `spore resume --name`, and post-resume `spore
-exec`. Named live fork keeps the product-level multi-vCPU rejection before
-child state is written; direct `spore.fork` now rejects manifest v1 before
-creating the output directory. Multi-vCPU product restore uses verified chunks
-rather than the same-host `ram.backing` acceleration until local backing has
-explicit backend smoke coverage.
+exec`. The follow-up multi-vCPU fork plan lifts the remaining fork/fan-out and
+proof-gated local backing limits.
 
 ### Slice 8: Documentation, Release Notes, and Runtime Evidence
 

@@ -1020,6 +1020,10 @@ const MultiHvfRunState = struct {
         return self.snapshot_requested.load(.acquire);
     }
 
+    fn clearSnapshot(self: *MultiHvfRunState) void {
+        self.snapshot_requested.store(false, .release);
+    }
+
     fn finish(self: *MultiHvfRunState, new_result: MultiHvfResult) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1254,7 +1258,33 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                 },
                 .snapshot => |request| {
                     if (request.continue_after) {
-                        state.finish(.{ .err = error.UnsupportedSnapshotMode });
+                        takeSnapshotV1(
+                            allocator,
+                            request.dir,
+                            vcpus,
+                            &state,
+                            &wake_set,
+                            options.transports,
+                            options.gen_dev,
+                            options.vsock_dev,
+                            options.ram_bytes,
+                            .{ .dist_base = options.dist_base, .redist_base = redist_window.base, .redist_stride = @intCast(redist_stride), .ram_size = options.config.ram_size },
+                            options.rootfs,
+                            options.disk_snapshot,
+                            options.network_manifest,
+                            options.annotations,
+                            options.config.sessions,
+                            options.environ_map,
+                        ) catch |err| {
+                            state.clearSnapshot();
+                            state.finish(.{ .err = err });
+                            continue;
+                        };
+                        state.clearSnapshot();
+                        control.completeSnapshot(request.dir) catch |err| {
+                            state.finish(.{ .err = err });
+                            continue;
+                        };
                         continue;
                     }
                     return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), request.dir, null);
@@ -1391,6 +1421,7 @@ fn joinHvfVcpuThreads(vcpus: []HvfVcpu, wake_set: *HvfVcpuWakeSet) void {
 }
 
 fn pauseHvfVcpusForSnapshot(vcpus: []HvfVcpu, state: *MultiHvfRunState, wake_set: *HvfVcpuWakeSet) !void {
+    for (vcpus) |*vcpu| vcpu.snapshot_paused.store(false, .release);
     state.requestSnapshot();
     wake_set.wakeAll();
     while (true) {

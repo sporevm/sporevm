@@ -160,6 +160,19 @@ pub fn usageMissingArgument(message: []const u8, source: []const u8) CliError {
     return CliError.init(.usage_missing_argument, message, source);
 }
 
+pub fn forkUnsupportedVcpuBody(allocator: std.mem.Allocator, vcpu_count: u32) []const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "source has {d} vCPUs but uses a fork topology or GIC state this backend cannot mint safely yet. Capture the fork source with a supported backend and manifest v1 GIC state.",
+        .{vcpu_count},
+    ) catch "source uses a fork topology or GIC state this backend cannot mint safely yet. Capture the fork source with a supported backend and manifest v1 GIC state.";
+}
+
+pub fn forkUnsupportedVcpuMessage(allocator: std.mem.Allocator, vcpu_count: u32) []const u8 {
+    const body = forkUnsupportedVcpuBody(allocator, vcpu_count);
+    return std.fmt.allocPrint(allocator, "spore fork: {s}", .{body}) catch body;
+}
+
 pub fn fromZigError(err: anyerror) CliError {
     return switch (err) {
         error.InvalidRootfsInput,
