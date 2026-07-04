@@ -61,6 +61,10 @@ fuzz targets from the slice that introduces it:
   parsed. A malicious peer can deny service, never inject state.
 - **Fail closed.** Unknown manifest versions, unsatisfiable platform
   contracts, and unverifiable chunks are errors, never degraded behavior.
+- **Caller-influenced paths are validated before use.** Platform limits such
+  as the 104-byte macOS `sun_path` bound are enforced with actionable errors
+  before spawning helpers or binding sockets; unvalidated path input must
+  never reach a code path that can panic.
 - **The stable monitor scope is local named lifecycle.** `spore create`,
   `spore exec`, `spore suspend`, `spore resume --name`, `spore ls`, and
   `spore rm` are available on supported backends, with fixed-RAM multi-vCPU

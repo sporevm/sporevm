@@ -1365,7 +1365,7 @@ pub fn createCli(
         .start_ms = start_ms,
         .parsed_ms = parsed_ms,
     }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "create", err),
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "create", err),
         error.HostUnsupported => {
             const message = "spore create: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "create"), message);
@@ -1402,7 +1402,7 @@ pub fn createCli(
             .name = spec.name,
             .command = command,
         }) catch |err| switch (err) {
-            error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "create", err),
+            error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "create", err),
             error.NamedVmNotReady => {
                 const fallback = allocLifecycleMessage(allocator, "spore create: VM is not ready after create: {s}", .{spec.name});
                 const message = allocLifecycleLastErrorMessage(allocator, "create", fallback);
@@ -1453,7 +1453,7 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
             .interactive = parsed.interactive,
             .tty = parsed.tty,
         }) catch |err| switch (err) {
-            error.InvalidRuntimeDir, error.InsecureRuntimeDir => cliRuntimePathExit("exec", err),
+            error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => cliRuntimePathExit("exec", err),
             error.NamedVmNotReady => {
                 const detail = lastErrorMessage();
                 if (detail.len != 0) {
@@ -1485,7 +1485,7 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .name = parsed.name,
         .command = command,
     }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir => cliRuntimePathExit("exec", err),
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => cliRuntimePathExit("exec", err),
         error.NamedVmNotReady => {
             const detail = lastErrorMessage();
             if (detail.len != 0) {
@@ -1536,7 +1536,7 @@ pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
         .io = init.io,
         .environ_map = init.environ_map,
     }, allocator, parsed, "copy-in-v1", .{ .input_fd = source_fd }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir => {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => {
             archive.deinit(init.io);
             cliRuntimePathExit("copy-in", err);
         },
@@ -1590,7 +1590,7 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
         .io = init.io,
         .environ_map = init.environ_map,
     }, allocator, parsed, "copy-out-v1", .{ .stdout_fd = archive_fd }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir => {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => {
             archive.deinit(init.io);
             cliRuntimePathExit("copy-out", err);
         },
@@ -1707,7 +1707,7 @@ pub fn suspendCli(
         .out_dir = parsed.out_dir,
         .annotations = parsed.annotations,
     }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "suspend", err),
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "suspend", err),
         error.NamedVmNotReady => {
             const fallback = allocLifecycleMessage(allocator, "spore suspend: VM is not ready: {s}", .{parsed.name});
             const message = allocLifecycleLastErrorMessage(allocator, "suspend", fallback);
@@ -1765,7 +1765,7 @@ pub fn forkCli(
         .name_pattern = parsed.name_pattern,
         .spore_executable = full_args[0],
     }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "fork", err),
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "fork", err),
         error.InvalidForkNamePattern => {
             const message = "spore fork: --name must contain at most one %d or %0Nd placeholder";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
@@ -1850,7 +1850,7 @@ pub fn resumeCli(
         .spore_executable = full_args[0],
         .bound_services = parsed.bound_services.slice(),
     }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "resume", err),
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "resume", err),
         error.FileNotFound => {
             const message = "spore resume: spore directory is not available";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "resume"), message);
@@ -2013,6 +2013,34 @@ pub fn validateName(name: []const u8) !void {
     for (name[1..]) |c| {
         if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-')) return error.InvalidVMName;
     }
+}
+
+/// Maximum control socket path length the platform's sockaddr_un can hold.
+/// macOS sun_path is 104 bytes and Linux is 108, minus one for the
+/// terminating NUL. Zig's UnixAddress accepts up to 108 bytes on every
+/// POSIX target, so paths in the 104-108 range crash inside the socket
+/// address conversion on macOS instead of failing cleanly; SporeVM must
+/// enforce the real platform limit itself.
+pub const max_control_socket_path_len: usize = if (builtin.os.tag.isDarwin()) 103 else 107;
+
+/// Fail closed, with an actionable message, when the control socket path
+/// cannot fit a sockaddr_un. Validated before the monitor is spawned so the
+/// caller sees the real problem instead of a readiness timeout. Stale
+/// registry entries with oversized paths stay listable and removable:
+/// only spawn and connect enforce the limit, not path construction.
+pub fn validateControlSocketPath(path: []const u8) error{ControlSocketPathTooLong}!void {
+    if (path.len <= max_control_socket_path_len) return;
+    setLastError(
+        "control socket path {s} is {d} bytes but the platform limit is {d}; shorten the VM name or set {s} to a shorter path",
+        .{ path, path.len, max_control_socket_path_len, runtime_dir_env },
+    );
+    return error.ControlSocketPathTooLong;
+}
+
+/// Build a validated control socket address for connecting to a monitor.
+fn controlSocketAddress(socket_path: []const u8) !net.UnixAddress {
+    try validateControlSocketPath(socket_path);
+    return net.UnixAddress.init(socket_path);
 }
 
 pub fn runtimeRootPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
@@ -3156,6 +3184,9 @@ fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !
 }
 
 fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, paths: Paths, spec: Spec, exe: []const u8, network_policy: ?*const run_mod.NetworkPolicy) ![]const u8 {
+    // Fail before spawning: an oversized socket path would otherwise only
+    // surface as a monitor readiness timeout.
+    try validateControlSocketPath(paths.control_socket_path);
     try ensureVmDir(init.io, paths);
     const resolved_exe = try resolveSpawnExecutable(allocator, init.io, init.environ_map, exe);
     errdefer allocator.free(resolved_exe);
@@ -3725,7 +3756,7 @@ fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_
     defer allocator.free(json);
 
     try verifyMonitorHello(allocator, context.io, socket_path);
-    const address = try net.UnixAddress.init(socket_path);
+    const address = try controlSocketAddress(socket_path);
     const stream = address.connect(context.io) catch return error.MonitorUnavailable;
     errdefer stream.close(context.io);
     writeAll(context.io, stream, json) catch return error.MonitorUnavailable;
@@ -3795,7 +3826,7 @@ fn openCopyNamedStreamAt(
     defer allocator.free(json);
 
     try verifyMonitorHello(allocator, context.io, socket_path);
-    const address = try net.UnixAddress.init(socket_path);
+    const address = try controlSocketAddress(socket_path);
     const stream = address.connect(context.io) catch return error.MonitorUnavailable;
     errdefer stream.close(context.io);
     writeAll(context.io, stream, json) catch return error.MonitorUnavailable;
@@ -3844,7 +3875,7 @@ fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8
 }
 
 fn sendControlJsonRaw(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, json: []const u8) ![]const u8 {
-    const address = try net.UnixAddress.init(socket_path);
+    const address = try controlSocketAddress(socket_path);
     const stream = address.connect(io) catch return error.MonitorUnavailable;
     defer stream.close(io);
     writeAll(io, stream, json) catch return error.MonitorUnavailable;
@@ -4640,6 +4671,11 @@ fn exitLifecycleRuntimePathError(
     const message = switch (err) {
         error.InvalidRuntimeDir => allocLifecycleMessage(allocator, "spore {s}: invalid runtime directory; set {s} or XDG_RUNTIME_DIR to an absolute path", .{ command, runtime_dir_env }),
         error.InsecureRuntimeDir => allocLifecycleMessage(allocator, "spore {s}: insecure runtime directory; registry directories must be private to the current user", .{command}),
+        error.ControlSocketPathTooLong => allocLifecycleLastErrorMessage(
+            allocator,
+            command,
+            allocLifecycleMessage(allocator, "spore {s}: control socket path exceeds the platform limit; shorten the VM name or set {s} to a shorter path", .{ command, runtime_dir_env }),
+        ),
         else => allocLifecycleMessage(allocator, "spore {s}: runtime directory error: {s}", .{ command, @errorName(err) }),
     };
     exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
@@ -4675,6 +4711,17 @@ fn cliRuntimePathExit(command: []const u8, err: anyerror) noreturn {
             "spore {s}: insecure runtime directory; registry directories must be private to the current user\n",
             .{command},
         ),
+        error.ControlSocketPathTooLong => {
+            const detail = lastErrorMessage();
+            if (detail.len != 0) {
+                std.debug.print("spore {s}: {s}\n", .{ command, detail });
+            } else {
+                std.debug.print(
+                    "spore {s}: control socket path exceeds the platform limit; shorten the VM name or set {s} to a shorter path\n",
+                    .{ command, runtime_dir_env },
+                );
+            }
+        },
         else => std.debug.print("spore {s}: runtime directory error: {s}\n", .{ command, @errorName(err) }),
     }
     std.process.exit(2);
@@ -4813,6 +4860,36 @@ pub fn pidAlive(pid: i64) bool {
 
 fn lessListEntry(_: void, a: ListEntry, b: ListEntry) bool {
     return std.mem.lessThan(u8, a.name, b.name);
+}
+
+test "lifecycle rejects control socket paths that overflow sockaddr_un" {
+    const allocator = std.testing.allocator;
+
+    // A deep runtime root plus a long VM name overflows the platform's
+    // sun_path limit. Path construction still succeeds so stale registry
+    // entries stay listable and removable, but the spawn/connect validation
+    // must fail closed with an actionable message instead of timing out or
+    // crashing in the monitor.
+    const deep_root = "/var/folders/ab/c012345678901234567890123456789/T/deep-runtime-dir";
+    const long_name = "a-very-long-vm-name-that-overflows-sun-path";
+    var long_paths = try pathsFromRoot(allocator, deep_root, long_name);
+    defer long_paths.deinit(allocator);
+    try std.testing.expect(long_paths.control_socket_path.len > max_control_socket_path_len);
+
+    clearLastError();
+    try std.testing.expectError(
+        error.ControlSocketPathTooLong,
+        validateControlSocketPath(long_paths.control_socket_path),
+    );
+    const message = lastErrorMessage();
+    try std.testing.expect(std.mem.indexOf(u8, message, "control socket path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "shorten the VM name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, runtime_dir_env) != null);
+
+    try validateControlSocketPath("/tmp/ok.sock");
+    const at_limit = "/" ++ ("a" ** (max_control_socket_path_len - 1));
+    try validateControlSocketPath(at_limit);
+    try std.testing.expectError(error.ControlSocketPathTooLong, validateControlSocketPath(at_limit ++ "b"));
 }
 
 test "lifecycle validates VM names" {

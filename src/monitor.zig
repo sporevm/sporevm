@@ -272,6 +272,17 @@ const ExecServer = struct {
     closed: std.atomic.Value(bool) = .init(false),
 
     fn init(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, stats_path: []const u8, guest_port: u32, timeout_ms: u64) !ExecServer {
+        // Zig's UnixAddress accepts 108-byte paths everywhere, but macOS
+        // sun_path holds only 104; enforce the real platform limit before
+        // listen so an oversized path fails with a clear log line instead
+        // of crashing in the socket address conversion.
+        lifecycle.validateControlSocketPath(socket_path) catch |err| {
+            std.debug.print(
+                "monitor: control socket path {s} is {d} bytes but the platform limit is {d}; shorten the VM name or set {s} to a shorter path\n",
+                .{ socket_path, socket_path.len, lifecycle.max_control_socket_path_len, lifecycle.runtime_dir_env },
+            );
+            return err;
+        };
         Io.Dir.cwd().deleteFile(io, socket_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => |e| return e,
