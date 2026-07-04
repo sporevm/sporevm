@@ -176,7 +176,7 @@ done < <(find "${fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort)
 [[ "${#children[@]}" == "${count}" ]] || die "expected ${count} child spores, found ${#children[@]}"
 
 set +e
-"${spore_bin}" fanout --backend "${backend}" "${fork_dir}" --parallel --for "${SPORE_SMOKE_FANOUT_DURATION:-20s}" \
+"${spore_bin}" fanout --backend "${backend}" "${fork_dir}" --for "${SPORE_SMOKE_FANOUT_DURATION:-20s}" \
   >"${fanout_stdout}" 2>"${fanout_stderr}"
 fanout_rc="$?"
 set -e
