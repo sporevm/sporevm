@@ -2942,7 +2942,7 @@ pub fn closeConsoleLog() void {
 }
 
 pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
-    return execRequestWithSession(allocator, argv, "default");
+    return execRequestWithSession(allocator, argv, "default", 0);
 }
 
 fn terminalName(environ: *const std.process.Environ.Map) []const u8 {
@@ -3083,8 +3083,10 @@ fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) ![]co
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
-pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8) ![]const u8 {
-    return execRequestWithSessionOptions(allocator, argv, session_id, .{});
+pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, resume_time_unix_ns: u64) ![]const u8 {
+    return execRequestWithSessionOptions(allocator, argv, session_id, .{
+        .resume_time_unix_ns = resume_time_unix_ns,
+    });
 }
 
 pub const InteractiveExecRequestOptions = struct {
@@ -3092,6 +3094,7 @@ pub const InteractiveExecRequestOptions = struct {
     tty: bool = false,
     terminal_name: []const u8 = "xterm",
     terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
+    resume_time_unix_ns: u64 = 0,
 };
 
 pub fn interactiveExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: InteractiveExecRequestOptions) ![]const u8 {
@@ -3100,15 +3103,16 @@ pub fn interactiveExecRequestWithSession(allocator: std.mem.Allocator, argv: []c
         .tty = options.tty,
         .terminal_name = options.terminal_name,
         .terminal_size = options.terminal_size,
+        .resume_time_unix_ns = options.resume_time_unix_ns,
     });
 }
 
-pub fn detachedExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8) ![]const u8 {
+pub fn detachedExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, resume_time_unix_ns: u64) ![]const u8 {
     try validateGuestArgv(argv);
     const payload = struct {
         type: []const u8 = "start",
         session_id: []const u8,
-        resume_time_unix_ns: u64 = 0,
+        resume_time_unix_ns: u64,
         argv: []const []const u8,
         env: []const []const u8 = &.{},
         working_dir: []const u8 = "",
@@ -3117,6 +3121,7 @@ pub fn detachedExecRequestWithSession(allocator: std.mem.Allocator, argv: []cons
         closed_env: bool = true,
     }{
         .session_id = session_id,
+        .resume_time_unix_ns = resume_time_unix_ns,
         .argv = argv,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
@@ -3446,15 +3451,15 @@ test "run request encodes argv" {
 }
 
 test "run request can encode explicit session id" {
-    const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42");
+    const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42", 1_700_000_000_000_000_000);
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":1700000000000000000,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"closed_env\":true}\n", request);
 }
 
 test "run detached exec request asks guest to start without waiting" {
-    const request = try detachedExecRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-1");
+    const request = try detachedExecRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-1", 1_700_000_000_000_000_000);
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"detached\":true,\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":1700000000000000000,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"detached\":true,\"closed_env\":true}\n", request);
 }
 
 test "run request encodes image env and working directory" {

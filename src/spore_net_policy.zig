@@ -555,6 +555,15 @@ pub const Runtime = struct {
         if (offset + 4 > response.len) return 0;
         offset += 4;
 
+        // Names reachable from the query name through in-order CNAME records
+        // contained in this response. A records are only learned when their
+        // owner is in this set, so unrelated answers stuffed into the same
+        // packet still cannot open egress.
+        var accepted_storage: [1 + max_cname_chain][max_dns_name_text]u8 = undefined;
+        var accepted_names: [1 + max_cname_chain][]const u8 = undefined;
+        accepted_names[0] = decodeDnsName(query, dns_header_len, &accepted_storage[0]) orelse return 0;
+        var accepted_count: usize = 1;
+
         var learned: usize = 0;
         const answer_count = std.mem.readInt(u16, response[6..8], .big);
         var i: usize = 0;
@@ -569,16 +578,28 @@ pub const Runtime = struct {
             const data_end = data_start + @as(usize, data_len);
             if (data_end > response.len) return learned;
 
-            if (answer_type == dns_type_a and answer_class == dns_class_in and data_len == 4) {
-                var addr: [4]u8 = undefined;
-                @memcpy(&addr, response[data_start..data_end]);
-                if (legacy_host_index) |host_index| {
-                    const host = self.allow_hosts[host_index];
-                    if (dnsNameMatchesHost(response, name_start, host) and self.recordLearnedHostIp(host_index, addr)) learned += 1;
-                }
-                for (exact_matches[0..exact_match_count]) |rule_index| {
-                    const host = self.exact_rules[rule_index].host;
-                    if (dnsNameMatchesHost(response, name_start, host) and self.recordLearnedExactHostIp(rule_index, addr)) learned += 1;
+            if (answer_class == dns_class_in and (answer_type == dns_type_a or answer_type == dns_type_cname)) {
+                var owner_buf: [max_dns_name_text]u8 = undefined;
+                const owner = decodeDnsName(response, name_start, &owner_buf) orelse return learned;
+                const owner_accepted = nameInSet(accepted_names[0..accepted_count], owner);
+
+                if (answer_type == dns_type_a and data_len == 4 and owner_accepted) {
+                    var addr: [4]u8 = undefined;
+                    @memcpy(&addr, response[data_start..data_end]);
+                    if (legacy_host_index) |host_index| {
+                        if (self.recordLearnedHostIp(host_index, addr)) learned += 1;
+                    }
+                    for (exact_matches[0..exact_match_count]) |rule_index| {
+                        if (self.recordLearnedExactHostIp(rule_index, addr)) learned += 1;
+                    }
+                } else if (answer_type == dns_type_cname and owner_accepted and accepted_count < accepted_names.len) {
+                    // The rdata must be exactly one well-formed name.
+                    if (spore_net.skipDnsName(response, data_start) != data_end) return learned;
+                    const target = decodeDnsName(response, data_start, &accepted_storage[accepted_count]) orelse return learned;
+                    if (!nameInSet(accepted_names[0..accepted_count], target)) {
+                        accepted_names[accepted_count] = target;
+                        accepted_count += 1;
+                    }
                 }
             }
             offset = data_end;
@@ -662,7 +683,58 @@ pub const Runtime = struct {
 
 const dns_header_len = 12;
 const dns_type_a = 1;
+const dns_type_cname = 5;
 const dns_class_in = 1;
+/// CNAME hops honored per response. Real resolver chains are 1-3 hops;
+/// anything longer fails closed by ignoring the tail of the chain.
+const max_cname_chain = 8;
+/// Dotted text form of a maximal 255-byte wire name.
+const max_dns_name_text = 253;
+
+/// Decode a (possibly compressed) DNS name into lowercase dotted text.
+/// Bounded to the wire-format name limits; returns null on malformed input.
+fn decodeDnsName(packet: []const u8, start: usize, out: *[max_dns_name_text]u8) ?[]const u8 {
+    var offset = start;
+    var jumps: usize = 0;
+    var len: usize = 0;
+    var first_label = true;
+    while (true) {
+        if (offset >= packet.len) return null;
+        const label_len = packet[offset];
+        if ((label_len & 0xc0) == 0xc0) {
+            if (offset + 1 >= packet.len) return null;
+            const pointer = (@as(usize, label_len & 0x3f) << 8) | packet[offset + 1];
+            if (pointer >= packet.len) return null;
+            jumps += 1;
+            if (jumps > 16) return null;
+            offset = pointer;
+            continue;
+        }
+        if ((label_len & 0xc0) != 0 or label_len > 63) return null;
+        offset += 1;
+        if (label_len == 0) return out[0..len];
+        if (offset + label_len > packet.len) return null;
+        const needed = @as(usize, label_len) + @intFromBool(!first_label);
+        if (len + needed > out.len) return null;
+        if (!first_label) {
+            out[len] = '.';
+            len += 1;
+        }
+        first_label = false;
+        for (packet[offset..][0..label_len]) |c| {
+            out[len] = std.ascii.toLower(c);
+            len += 1;
+        }
+        offset += label_len;
+    }
+}
+
+fn nameInSet(names: []const []const u8, candidate: []const u8) bool {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
 
 pub fn parseCidr(raw: []const u8) ParseError!Cidr {
     const slash = std.mem.indexOfScalar(u8, raw, '/') orelse return error.InvalidCidr;
@@ -889,6 +961,228 @@ pub fn testDnsResponse(query: []const u8, answer_owner: []const u8, answers: []c
         len += 4;
     }
     return out[0..len];
+}
+
+pub const TestDnsRecord = struct {
+    owner: []const u8,
+    kind: enum { a, cname },
+    addr: [4]u8 = .{ 0, 0, 0, 0 },
+    target: []const u8 = "",
+};
+
+/// Build a DNS response with arbitrary answer records, including CNAMEs, so
+/// tests can model resolver responses for CDN-backed hosts.
+pub fn testDnsResponseRecords(query: []const u8, records: []const TestDnsRecord, out: *[512]u8) []const u8 {
+    @memcpy(out[0..query.len], query);
+    std.mem.writeInt(u16, out[2..4], 0x8180, .big);
+    std.mem.writeInt(u16, out[6..8], @intCast(records.len), .big);
+    var len = query.len;
+    for (records) |record| {
+        len += writeDnsTestName(out, len, record.owner);
+        const rtype: u16 = switch (record.kind) {
+            .a => dns_type_a,
+            .cname => dns_type_cname,
+        };
+        std.mem.writeInt(u16, out[len..][0..2], rtype, .big);
+        len += 2;
+        std.mem.writeInt(u16, out[len..][0..2], dns_class_in, .big);
+        len += 2;
+        std.mem.writeInt(u32, out[len..][0..4], 60, .big);
+        len += 4;
+        switch (record.kind) {
+            .a => {
+                std.mem.writeInt(u16, out[len..][0..2], 4, .big);
+                len += 2;
+                @memcpy(out[len..][0..4], &record.addr);
+                len += 4;
+            },
+            .cname => {
+                const name_len = dnsTestNameLen(record.target);
+                std.mem.writeInt(u16, out[len..][0..2], @intCast(name_len), .big);
+                len += 2;
+                len += writeDnsTestName(out, len, record.target);
+            },
+        }
+    }
+    return out[0..len];
+}
+
+fn writeDnsTestName(out: *[512]u8, start: usize, name: []const u8) usize {
+    var len = start;
+    if (name.len != 0) {
+        var labels = std.mem.splitScalar(u8, name, '.');
+        while (labels.next()) |label| {
+            out[len] = @intCast(label.len);
+            len += 1;
+            @memcpy(out[len..][0..label.len], label);
+            len += label.len;
+        }
+    }
+    out[len] = 0;
+    len += 1;
+    return len - start;
+}
+
+fn dnsTestNameLen(name: []const u8) usize {
+    if (name.len == 0) return 1;
+    return name.len + 2;
+}
+
+test "spore-net policy allow host learns A records behind a CNAME chain" {
+    var config = Config{};
+    try config.addAllowHost("dl-cdn.alpinelinux.org");
+    var policy = try Runtime.init(config);
+
+    var query_buf: [512]u8 = undefined;
+    const query = testDnsQuery(0x1234, "dl-cdn.alpinelinux.org", &query_buf);
+    var response_buf: [512]u8 = undefined;
+    const response = testDnsResponseRecords(query, &.{
+        .{ .owner = "dl-cdn.alpinelinux.org", .kind = .cname, .target = "dualstack.j.sni.global.fastly.net" },
+        .{ .owner = "dualstack.j.sni.global.fastly.net", .kind = .a, .addr = .{ 151, 101, 2, 132 } },
+        .{ .owner = "dualstack.j.sni.global.fastly.net", .kind = .a, .addr = .{ 151, 101, 66, 132 } },
+    }, &response_buf);
+    try std.testing.expectEqual(@as(usize, 2), policy.noteDnsResponse(query, response));
+    try std.testing.expectEqual(Decision.allow, policy.decideIpv4(.{ 151, 101, 2, 132 }));
+    try std.testing.expectEqual(Decision.allow, policy.decideIpv4(.{ 151, 101, 66, 132 }));
+}
+
+test "spore-net exact policy learns A records behind a CNAME chain" {
+    var config = Config{};
+    try config.addExactHostPorts("dl-cdn.alpinelinux.org", &.{443});
+    var policy = try Runtime.init(config);
+
+    var query_buf: [512]u8 = undefined;
+    const query = testDnsQuery(0x1234, "dl-cdn.alpinelinux.org", &query_buf);
+    var response_buf: [512]u8 = undefined;
+    const response = testDnsResponseRecords(query, &.{
+        .{ .owner = "dl-cdn.alpinelinux.org", .kind = .cname, .target = "cdn.fastly.net" },
+        .{ .owner = "cdn.fastly.net", .kind = .a, .addr = .{ 151, 101, 2, 132 } },
+    }, &response_buf);
+    try std.testing.expectEqual(@as(usize, 1), policy.noteDnsResponse(query, response));
+    try std.testing.expectEqual(Decision.allow, policy.decideIpv4Port(.{ 151, 101, 2, 132 }, 443));
+    try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 151, 101, 2, 132 }, 80));
+}
+
+test "spore-net policy follows multi-hop CNAME chains" {
+    var config = Config{};
+    try config.addAllowHost("example.com");
+    var policy = try Runtime.init(config);
+
+    var query_buf: [512]u8 = undefined;
+    const query = testDnsQuery(0x1234, "example.com", &query_buf);
+    var response_buf: [512]u8 = undefined;
+    const response = testDnsResponseRecords(query, &.{
+        .{ .owner = "example.com", .kind = .cname, .target = "edge.cdn.example" },
+        .{ .owner = "edge.cdn.example", .kind = .cname, .target = "pop.cdn.example" },
+        .{ .owner = "pop.cdn.example", .kind = .a, .addr = .{ 93, 184, 216, 34 } },
+    }, &response_buf);
+    try std.testing.expectEqual(@as(usize, 1), policy.noteDnsResponse(query, response));
+    try std.testing.expectEqual(Decision.allow, policy.decideIpv4(.{ 93, 184, 216, 34 }));
+}
+
+test "spore-net policy ignores A records not chained from the query name" {
+    var config = Config{};
+    try config.addAllowHost("example.com");
+    var policy = try Runtime.init(config);
+
+    var query_buf: [512]u8 = undefined;
+    const query = testDnsQuery(0x1234, "example.com", &query_buf);
+    var response_buf: [512]u8 = undefined;
+    // The CNAME chain covers cdn.example, but the stuffed A record's owner
+    // is unrelated: it must not be learned.
+    const response = testDnsResponseRecords(query, &.{
+        .{ .owner = "example.com", .kind = .cname, .target = "cdn.example" },
+        .{ .owner = "attacker.example", .kind = .a, .addr = .{ 93, 184, 216, 34 } },
+    }, &response_buf);
+    try std.testing.expectEqual(@as(usize, 0), policy.noteDnsResponse(query, response));
+    try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4(.{ 93, 184, 216, 34 }));
+}
+
+test "spore-net policy ignores CNAME records not chained from the query name" {
+    var config = Config{};
+    try config.addAllowHost("example.com");
+    var policy = try Runtime.init(config);
+
+    var query_buf: [512]u8 = undefined;
+    const query = testDnsQuery(0x1234, "example.com", &query_buf);
+    var response_buf: [512]u8 = undefined;
+    // A CNAME whose owner is unrelated to the query must not extend the
+    // accepted chain.
+    const response = testDnsResponseRecords(query, &.{
+        .{ .owner = "attacker.example", .kind = .cname, .target = "victim.example" },
+        .{ .owner = "victim.example", .kind = .a, .addr = .{ 93, 184, 216, 34 } },
+    }, &response_buf);
+    try std.testing.expectEqual(@as(usize, 0), policy.noteDnsResponse(query, response));
+    try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4(.{ 93, 184, 216, 34 }));
+}
+
+test "spore-net policy bounds CNAME chain length" {
+    var config = Config{};
+    try config.addAllowHost("h.example");
+    var policy = try Runtime.init(config);
+
+    var query_buf: [512]u8 = undefined;
+    const query = testDnsQuery(0x1234, "h.example", &query_buf);
+    var response_buf: [512]u8 = undefined;
+    // Chain longer than the accepted-name bound: the tail A record past the
+    // bound must not be learned, and parsing must stay well behaved.
+    const response = testDnsResponseRecords(query, &.{
+        .{ .owner = "h.example", .kind = .cname, .target = "c1.example" },
+        .{ .owner = "c1.example", .kind = .cname, .target = "c2.example" },
+        .{ .owner = "c2.example", .kind = .cname, .target = "c3.example" },
+        .{ .owner = "c3.example", .kind = .cname, .target = "c4.example" },
+        .{ .owner = "c4.example", .kind = .cname, .target = "c5.example" },
+        .{ .owner = "c5.example", .kind = .cname, .target = "c6.example" },
+        .{ .owner = "c6.example", .kind = .cname, .target = "c7.example" },
+        .{ .owner = "c7.example", .kind = .cname, .target = "c8.example" },
+        .{ .owner = "c8.example", .kind = .cname, .target = "c9.example" },
+        .{ .owner = "c9.example", .kind = .a, .addr = .{ 93, 184, 216, 34 } },
+    }, &response_buf);
+    _ = policy.noteDnsResponse(query, response);
+    try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4(.{ 93, 184, 216, 34 }));
+}
+
+test "spore-net policy CNAME loops terminate and learn nothing extra" {
+    var config = Config{};
+    try config.addAllowHost("example.com");
+    var policy = try Runtime.init(config);
+
+    var query_buf: [512]u8 = undefined;
+    const query = testDnsQuery(0x1234, "example.com", &query_buf);
+    var response_buf: [512]u8 = undefined;
+    const response = testDnsResponseRecords(query, &.{
+        .{ .owner = "example.com", .kind = .cname, .target = "a.example" },
+        .{ .owner = "a.example", .kind = .cname, .target = "example.com" },
+        .{ .owner = "a.example", .kind = .a, .addr = .{ 93, 184, 216, 34 } },
+    }, &response_buf);
+    try std.testing.expectEqual(@as(usize, 1), policy.noteDnsResponse(query, response));
+    try std.testing.expectEqual(Decision.allow, policy.decideIpv4(.{ 93, 184, 216, 34 }));
+}
+
+fn fuzzNoteDnsResponse(_: void, s: *std.testing.Smith) !void {
+    var config = Config{};
+    config.addAllowHost("example.com") catch return;
+    config.addExactHostPorts("cdn.example.com", &.{443}) catch return;
+    var policy = Runtime.init(config) catch return;
+
+    var query_buf: [512]u8 = undefined;
+    const query = testDnsQuery(0x1234, "example.com", &query_buf);
+    var response_buf: [512]u8 = undefined;
+    @memcpy(response_buf[0..query.len], query);
+    var fuzz_tail: [512 - 64]u8 = undefined;
+    const tail_len = s.slice(&fuzz_tail);
+    const response_len = @min(query.len + tail_len, response_buf.len);
+    @memcpy(response_buf[query.len..response_len], fuzz_tail[0 .. response_len - query.len]);
+    _ = policy.noteDnsResponse(query, response_buf[0..response_len]);
+
+    // Also fuzz both buffers wholesale for header/name parsing paths.
+    var raw_query: [128]u8 = undefined;
+    const raw_query_len = s.slice(&raw_query);
+    _ = policy.noteDnsResponse(raw_query[0..raw_query_len], response_buf[0..response_len]);
+}
+
+test "fuzz spore-net policy DNS answer learning" {
+    try std.testing.fuzz({}, fuzzNoteDnsResponse, .{});
 }
 
 test "spore-net policy default allows public and blocks hard floor" {

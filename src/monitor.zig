@@ -488,12 +488,21 @@ const ExecServer = struct {
         return self.state == .done or self.state == .idle;
     }
 
+    /// Host wall clock carried on session starts so the guest agent can set
+    /// CLOCK_REALTIME. Guests have no RTC in the device model and otherwise
+    /// boot at the epoch, which breaks TLS certificate validation.
+    fn wallClockUnixNs(self: *ExecServer) u64 {
+        const ns = Io.Clock.real.now(self.io).nanoseconds;
+        if (ns <= 0) return 0;
+        return @intCast(ns);
+    }
+
     fn execRequest(self: *ExecServer, argv: []const []const u8) ![]const u8 {
         var id_buf: [64]u8 = undefined;
         const session_id = try std.fmt.bufPrint(&id_buf, "lifecycle-{d}", .{self.next_session_id});
         self.next_session_id +%= 1;
         if (self.next_session_id == 0) self.next_session_id = 1;
-        return run.execRequestWithSession(self.allocator, argv, session_id);
+        return run.execRequestWithSession(self.allocator, argv, session_id, self.wallClockUnixNs());
     }
 
     fn interactiveExecRequest(self: *ExecServer, argv: []const []const u8, interactive: bool, tty: bool, terminal_name: []const u8, terminal_size: spore_stream.Resize) ![]const u8 {
@@ -506,6 +515,7 @@ const ExecServer = struct {
             .tty = tty,
             .terminal_name = terminal_name,
             .terminal_size = terminal_size,
+            .resume_time_unix_ns = self.wallClockUnixNs(),
         });
     }
 
@@ -514,7 +524,7 @@ const ExecServer = struct {
         const session_id = try std.fmt.bufPrint(&id_buf, "lifecycle-{d}", .{self.next_session_id});
         self.next_session_id +%= 1;
         if (self.next_session_id == 0) self.next_session_id = 1;
-        return run.detachedExecRequestWithSession(self.allocator, argv, session_id);
+        return run.detachedExecRequestWithSession(self.allocator, argv, session_id, self.wallClockUnixNs());
     }
 
     fn copyRequest(self: *ExecServer, request_type: []const u8, path: []const u8) ![]const u8 {

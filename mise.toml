@@ -120,6 +120,10 @@ description = "Smoke product spore run DNS proxying"
 run = "mise run build && scripts/smoke-run-net-http.sh"
 description = "Smoke product spore run outbound HTTP proxying"
 
+[tasks."smoke:net-egress"]
+run = "mise run build && scripts/smoke-net-egress.sh"
+description = "Smoke real public HTTPS egress with allow rules (gated by SPORE_SMOKE_EGRESS=1)"
+
 [tasks."smoke:run-net-deny"]
 run = "mise run build && scripts/smoke-run-net-deny.sh"
 description = "Smoke product spore run hard-floor egress denial"
