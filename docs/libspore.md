@@ -85,6 +85,10 @@ defer libspore.deinitSporeInspectResult(allocator, inspected);
 const workspace = inspected.annotations.map.get("cleanroom.workspace");
 ```
 
+`inspectSpore` accepts every manifest format version that resume accepts:
+format v0 (single-vCPU) and format v1 (multi-vCPU) manifests both summarize,
+and `SporeInspectResult.vcpu_count` reports the vCPU count (1 for v0).
+
 `SporeInspectResult.annotations` is an opaque key/value map copied out of the
 validated manifest. SporeVM does not interpret namespaces such as
 `cleanroom.*`; callers own their schema. The same manifest annotation rules
