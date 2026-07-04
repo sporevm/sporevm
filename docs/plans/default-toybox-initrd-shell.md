@@ -180,6 +180,16 @@ symlinks should be created from SporeVM's explicit supported list.
   `spore run 'echo spore-shell-smoke'` on HVF.
 - The spike also found Toybox `sh` rejects `-lc`; a tiny `/bin/sh` wrapper fixed
   compatibility without changing the rootfs shell contract.
+- Local release archive proof passed on 2026-07-04:
+  `mise exec -- scripts/build-release-assets.sh --target darwin-arm64 --output
+  /tmp/sporevm-toybox-dist-darwin` and `mise exec --
+  scripts/build-release-assets.sh --target linux-arm64 --output
+  /tmp/sporevm-toybox-dist-linux`.
+- Remote KVM release validation was not run locally because
+  `SPOREVM_REMOTE_SOURCE_INSTANCE`, `SPOREVM_REMOTE_DEST_INSTANCE`,
+  `SPOREVM_REMOTE_BUCKET`, and `SPOREVM_REMOTE_SOURCE_PEER_IP` were unset in
+  this shell. It remains the pre-merge or release-candidate proof for supported
+  Linux arm64 hosts.
 
 ## Delivery Strategy
 
@@ -207,21 +217,25 @@ Definition of done:
 - the embedded initrd size stays under 2MiB unless the PR explains the measured
   increase.
 
-### PR 2: Cross-Host Release Proof
+### PR 2: Cross-Target Release Proof
 
 Scope:
 
-- run the same default Toybox smoke path on Linux/KVM;
 - confirm macOS and Linux release archive builds include the same pinned Toybox
   inputs;
-- add a small release-note entry describing the new default initrd behavior;
+- describe the user-visible release-note text in the PR body because this repo
+  does not carry a committed changelog file;
 - record the final size and cold-run timing delta in the plan or release notes.
 
 Definition of done:
 
 - required Buildkite `buildkite/sporevm` check passes;
-- focused HVF and KVM smokes prove shell-form and exact `/bin/echo`;
+- focused HVF smokes prove shell-form and exact `/bin/echo`;
 - release archive build does not rely on unpinned host-installed Toybox.
+
+Remote KVM validation stays required before treating the release candidate as
+fully shipped, but it is not a local PR-construction blocker without the SSM and
+S3 inputs.
 
 ### Follow-Up: Applet Set Review
 
