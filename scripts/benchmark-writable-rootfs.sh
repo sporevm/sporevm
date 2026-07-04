@@ -18,7 +18,7 @@ Options:
   --workload NAME               sqlite, package, or all (default: all)
   -n, --iterations N            Iterations per workload (default: 3)
   --memory-mib N                Guest memory in MiB (default: 1024)
-  --timeout-ms N                Per-run timeout in milliseconds (default: 180000)
+  --timeout DURATION           Per-run timeout (default: 3m)
   --output PATH                 JSONL output path
   --spore-bin PATH              Spore binary path (default: zig-out/bin/spore)
   --raw-rootfs PATH             Optional read-only raw virtio-blk baseline rootfs
@@ -52,6 +52,30 @@ positive_int() {
   local opt="$1"
   local value="$2"
   [[ "${value}" =~ ^[0-9]+$ && "${value}" -gt 0 ]] || die "${opt} must be a positive integer"
+}
+
+duration_ms() {
+  local opt="$1"
+  local value="$2"
+  local number=""
+  local multiplier=1000
+  if [[ "${value}" =~ ^([0-9]+)ms$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    multiplier=1
+  elif [[ "${value}" =~ ^([0-9]+)s$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    multiplier=1000
+  elif [[ "${value}" =~ ^([0-9]+)m$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    multiplier=60000
+  elif [[ "${value}" =~ ^([0-9]+)$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    multiplier=1000
+  else
+    die "${opt} expects a duration like 60s, 500ms, or 1m"
+  fi
+  [[ "${number}" -gt 0 ]] || die "${opt} expects a positive duration"
+  printf '%d\n' "$((number * multiplier))"
 }
 
 now_ms() {
@@ -140,6 +164,11 @@ while [[ $# -gt 0 ]]; do
       memory_mib="$2"
       shift 2
       ;;
+    --timeout)
+      need_value "$1" "${2-}"
+      timeout_ms="$(duration_ms "$1" "$2")"
+      shift 2
+      ;;
     --timeout-ms)
       need_value "$1" "${2-}"
       timeout_ms="$2"
@@ -187,7 +216,7 @@ case "${workload}" in
 esac
 positive_int "--iterations" "${iterations}"
 positive_int "--memory-mib" "${memory_mib}"
-positive_int "--timeout-ms" "${timeout_ms}"
+positive_int "--timeout" "${timeout_ms}"
 
 if [[ "${build}" == "1" ]]; then
   (cd "${REPO_ROOT}" && mise run build)
@@ -212,8 +241,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-spore_image_common=(--backend "${backend}" --memory "${memory_mib}mb" --timeout-ms "${timeout_ms}")
-spore_from_common=(--backend "${backend}" --timeout-ms "${timeout_ms}")
+spore_image_common=(--backend "${backend}" --memory "${memory_mib}mb" --timeout "${timeout_ms}ms")
+spore_from_common=(--backend "${backend}" --timeout "${timeout_ms}ms")
 
 resolve_image() {
   local ref="$1"

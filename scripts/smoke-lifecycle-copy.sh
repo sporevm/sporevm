@@ -51,7 +51,7 @@ env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
   "${spore_bin}" create "${vm_name}" \
     --backend "${backend}" \
     --memory "${SPORE_SMOKE_MEMORY:-256mib}" \
-    --timeout-ms "${SPORE_SMOKE_LIFECYCLE_TIMEOUT_MS:-60000}" \
+    --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT_MS:-60000}ms" \
     --console-log "${workdir}/console.log"
 created=1
 

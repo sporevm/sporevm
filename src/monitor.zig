@@ -47,7 +47,7 @@ const monitor_usage =
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
-    \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
+    \\  --timeout DURATION      Exec timeout (default: 30s; e.g. 500ms, 1m)
     \\  --console-log PATH      Write guest console output to PATH
     \\  -h, --help              Show this help
     \\
@@ -90,7 +90,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 
 pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, spore_executable: []const u8) !void {
     const start_ms = lifecycle.monotonicMs();
-    if (args.len == 1 and (std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "help"))) {
+    if (wantsHelp(args)) {
         try stdout.writeAll(monitor_usage);
         try stdout.flush();
         return;
@@ -1365,6 +1365,11 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
             opts.vcpus = run.parseVcpuCountOrExit(args[i], takeValue(args, &i, args[i]));
         } else if (std.mem.eql(u8, args[i], "--guest-port")) {
             opts.guest_port = try parsePositive(u32, args[i], takeValue(args, &i, args[i]));
+        } else if (std.mem.eql(u8, args[i], "--timeout")) {
+            opts.timeout_ms = run.parseDurationMs(takeValue(args, &i, args[i])) catch {
+                std.debug.print("--timeout expects a duration like 30s, 500ms, or 1m\n", .{});
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, args[i], "--timeout-ms")) {
             opts.timeout_ms = try parsePositive(u64, args[i], takeValue(args, &i, args[i]));
         } else if (std.mem.eql(u8, args[i], "--console-log")) {
@@ -1395,6 +1400,18 @@ fn takeValue(args: []const []const u8, i: *usize, flag: []const u8) []const u8 {
     return args[i.*];
 }
 
+fn wantsHelp(args: []const []const u8) bool {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or
+            std.mem.eql(u8, arg, "--help"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) !T {
     const parsed = std.fmt.parseInt(T, raw, 10) catch {
         std.debug.print("{s} must be a positive integer\n", .{name});
@@ -1410,6 +1427,13 @@ fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) !T {
 fn currentPid() i64 {
     if (comptime @import("builtin").os.tag == .windows) return 1;
     return @intCast(std.c.getpid());
+}
+
+test "monitor cli help accepts help after name" {
+    try std.testing.expect(wantsHelp(&.{"--help"}));
+    try std.testing.expect(wantsHelp(&.{ "bench-1", "--help" }));
+    try std.testing.expect(!wantsHelp(&.{"bench-1"}));
+    try std.testing.expect(!wantsHelp(&.{ "help", "--backend", "auto" }));
 }
 
 test "monitor parser accepts network allow policy" {

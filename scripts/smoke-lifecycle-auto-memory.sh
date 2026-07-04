@@ -110,7 +110,7 @@ if run_capture "${create_stdout}" "${create_stderr}" \
   "${spore_bin}" create "${vm_name}" \
     --backend "${backend}" \
     --memory auto \
-    --timeout-ms "${SPORE_SMOKE_LIFECYCLE_AUTO_MEMORY_TIMEOUT_MS:-60000}" \
+    --timeout "${SPORE_SMOKE_LIFECYCLE_AUTO_MEMORY_TIMEOUT_MS:-60000}ms" \
     --console-log "${console_log}"; then
   created=1
 else

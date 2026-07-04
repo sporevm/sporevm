@@ -185,7 +185,7 @@ s3://cleanroom-dev-apse2-arm-ap-southeast-2-724772075326/sporevm/remote-benchmar
 Hypothesis: slow dev hosts and larger fanout reproductions need a tunable resume
 probe timeout.
 
-Result: operationally useful, no performance claim. `--timeout-ms` helps avoid
+Result: operationally useful, no performance claim. `--timeout` helps avoid
 rebuilding for long or tight probe windows, but it does not reduce hot resume
 TTI.
 

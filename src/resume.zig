@@ -46,7 +46,7 @@ pub const cli_usage =
     \\  --bind-service NAME=unix:/path.sock
     \\                          Bind a manifest-declared service to a host socket
     \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
-    \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
+    \\  --timeout DURATION      Probe timeout (default: 30s; e.g. 500ms, 1m)
     \\  -h, --help              Show this help
     \\
 ;
@@ -91,6 +91,12 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             const raw = args[i]["--events=".len..];
             event_mode = run_mod.EventMode.parse(raw) orelse {
                 std.debug.print("--events must be jsonl\n", .{});
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
+            i += 1;
+            timeout_ms = run_mod.parseDurationMs(args[i]) catch {
+                std.debug.print("--timeout expects a duration like 30s, 500ms, or 1m\n", .{});
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, args[i], "--timeout-ms") and i + 1 < args.len) {
@@ -414,8 +420,14 @@ fn failResumeSetup(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 test "resume cli parser accepts one spore dir" {
-    const opts = try parseCliArgs(&.{ "--backend", "hvf", "--timeout-ms", "120000", "child.spore" });
+    const opts = try parseCliArgs(&.{ "--backend", "hvf", "--timeout", "120s", "child.spore" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
+    try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
+    try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
+}
+
+test "resume cli parser accepts hidden timeout-ms compatibility spelling" {
+    const opts = try parseCliArgs(&.{ "--timeout-ms", "120000", "child.spore" });
     try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }

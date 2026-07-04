@@ -92,7 +92,7 @@ if run_capture "${create_stdout}" "${create_stderr}" \
     --backend "${backend}" \
     --image "${image}" \
     --memory "${smoke_memory}" \
-    --timeout-ms "${timeout_ms}" \
+    --timeout "${timeout_ms}ms" \
     --console-log "${console_log}"; then
   created=1
 else

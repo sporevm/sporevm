@@ -64,6 +64,8 @@ Status: landed in this branch.
   where that does not conflict with exact argv after `--`.
 - Hide `fanout --parallel` from help and public docs while keeping parser
   compatibility.
+- Prefer duration-shaped timeout flags (`--timeout 30s`, `--timeout 500ms`)
+  over millisecond-specific public spellings.
 
 Validation:
 
@@ -80,6 +82,26 @@ Validation:
 - `zig-out/bin/spore rootfs --help` omits `cas-preload`
 - unit coverage for preserving guest `--help` after the exact argv delimiter
   and keeping repair commands out of aggregate help
+
+### Slice 2: Timeout Flag Consistency
+
+Status: landed in this branch.
+
+- Advertise `--timeout DURATION` for `run`, `create`, `resume`, `fanout`, and
+  the hidden monitor helper.
+- Parse flexible timeout values such as `500ms`, `30s`, and `1m` through a
+  shared duration helper.
+- Keep `--timeout-ms` accepted as a hidden compatibility spelling for existing
+  scripts and callers.
+- Update smoke and benchmark wrappers to pass the new spelling when invoking
+  `spore`.
+
+Validation:
+
+- `mise run build`
+- `mise run test`
+- `bash -n` for touched shell smoke and benchmark scripts
+- targeted CLI help samples show `--timeout DURATION` and omit `--timeout-ms`
 
 ### Follow-Up: Product Convenience Commands
 

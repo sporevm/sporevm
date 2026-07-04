@@ -72,7 +72,7 @@ env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
   "${spore_bin}" create "${vm_name}" \
     --image "${image}" \
     --net --allow-host-port "${allow_host}:443" \
-    --timeout-ms "${SPORE_SMOKE_LIFECYCLE_TIMEOUT_MS:-60000}" >/dev/null
+    --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT_MS:-60000}ms" >/dev/null
 fetch_and_assert "${vm_name}" "allow-host-port"
 assert_denied "${vm_name}" "allow-host-port"
 env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null
@@ -83,7 +83,7 @@ env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
   "${spore_bin}" create "${vm_name}" \
     --image "${image}" \
     --net --allow-host "${allow_host}" \
-    --timeout-ms "${SPORE_SMOKE_LIFECYCLE_TIMEOUT_MS:-60000}" >/dev/null
+    --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT_MS:-60000}ms" >/dev/null
 fetch_and_assert "${vm_name}" "allow-host"
 assert_denied "${vm_name}" "allow-host"
 env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null
