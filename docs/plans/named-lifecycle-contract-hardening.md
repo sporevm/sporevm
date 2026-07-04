@@ -261,14 +261,16 @@ Scope:
 - add or tighten a snapshot annotation merge test, including overlay-wins key
   collision semantics;
 - document no guest PATH lookup for exact exec argv;
-- add the cheapest exit-127 hint that does not perform PATH lookup, likely in
-  CLI output handling after an exact argv exec returns 127 with empty stderr.
+- keep exit-127 hints in the guest `execve` failure path without host PATH
+  lookup, so both shell-form and exact argv failures stream useful stderr.
 
 Definition of done:
 
 - docs state the annotation guarantee and PATH behavior directly;
 - tests pin overlay-wins merge semantics;
 - bare `sh` failure remains a guest failure, not a host-side resolver feature;
+- missing initrd commands explain that callers need `--image`, `--rootfs`, or a
+  command-capable initrd;
 - `mise run test` and `mise run build` pass.
 
 ## Verification
