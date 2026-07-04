@@ -58,19 +58,20 @@ build_target() {
   local zig_target asset_dir archive_name lib_asset_dir lib_archive_name prefix staging lib_staging binary
   local -a shared_libs
 
+  # ponytail: lib archives are arm64-only today; omit arch so old mise picks the CLI archive.
   case "${target_key}" in
     linux-arm64)
       zig_target="aarch64-linux-musl"
       asset_dir="spore_Linux_arm64"
       archive_name="${asset_dir}.tar.gz"
-      lib_asset_dir="libspore_Linux_arm64"
+      lib_asset_dir="libspore_Linux"
       lib_archive_name="${lib_asset_dir}.tar.gz"
       ;;
     darwin-arm64)
       zig_target="aarch64-macos.13.0"
       asset_dir="spore_Darwin_arm64"
       archive_name="${asset_dir}.tar.gz"
-      lib_asset_dir="libspore_Darwin_arm64"
+      lib_asset_dir="libspore_Darwin"
       lib_archive_name="${lib_asset_dir}.tar.gz"
       resolve_macos_sdkroot
       require_command codesign
@@ -194,7 +195,9 @@ require_command zig
 mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
 rm -f \
+  "${OUTPUT_DIR}/libspore_Darwin.tar.gz" \
   "${OUTPUT_DIR}/libspore_Darwin_arm64.tar.gz" \
+  "${OUTPUT_DIR}/libspore_Linux.tar.gz" \
   "${OUTPUT_DIR}/libspore_Linux_arm64.tar.gz" \
   "${OUTPUT_DIR}/spore_Darwin_arm64.tar.gz" \
   "${OUTPUT_DIR}/spore_Linux_arm64.tar.gz" \
