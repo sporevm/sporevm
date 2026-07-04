@@ -14,6 +14,26 @@ require_command() {
 require_command git
 require_command svu
 
+source_version() {
+  sed -nE 's/^pub const value = "([^"]+)";$/\1/p' src/version.zig
+}
+
+require_source_version() {
+  local version="$1"
+  local source
+
+  source="$(source_version)"
+  [[ "${source}" == "${version}" ]] \
+    || die "src/version.zig version must be ${version} before tagging v${version}"
+  grep -Fq "Version: ${version}" zig-out/lib/pkgconfig/libspore.pc \
+    || die "zig-out/lib/pkgconfig/libspore.pc must be ${version}; run mise run check"
+  [[ -x zig-out/bin/spore ]] \
+    || die "zig-out/bin/spore is missing; run mise run check"
+  if ! zig-out/bin/spore version | grep -Fq "spore ${version} "; then
+    die "zig-out/bin/spore version must report ${version}; run mise run check"
+  fi
+}
+
 [[ -z "$(git status --porcelain)" ]] || die "working tree must be clean before tagging"
 
 CURRENT="$(svu current)"
@@ -27,9 +47,7 @@ if [[ "${NEXT}" == "${CURRENT}" ]]; then
 fi
 
 VERSION="${NEXT#v}"
-if ! grep -Fq "pub const version = \"${VERSION}\";" src/root.zig; then
-  die "src/root.zig version must be ${VERSION} before tagging ${NEXT}"
-fi
+require_source_version "${VERSION}"
 
 if git rev-parse --verify --quiet "refs/tags/${NEXT}" >/dev/null; then
   die "tag already exists locally: ${NEXT}"

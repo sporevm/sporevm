@@ -217,6 +217,15 @@ for target in "${EXPANDED_TARGETS[@]}"; do
   build_target "${target}"
 done
 
+for archive_name in "${ARCHIVE_NAMES[@]}"; do
+  [[ -f "${OUTPUT_DIR}/${archive_name}" ]] || die "missing release archive: ${archive_name}"
+  case "${archive_name}" in
+    libspore_*_arm64.tar.gz)
+      die "libspore release archives must omit arch to keep old mise on CLI assets: ${archive_name}"
+      ;;
+  esac
+done
+
 echo "--- :fingerprint: Write checksums"
 (
   cd "${OUTPUT_DIR}"
