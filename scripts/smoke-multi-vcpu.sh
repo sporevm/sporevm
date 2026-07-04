@@ -95,13 +95,21 @@ runtime_parent="${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}"
 mkdir -p "${runtime_parent}"
 runtime_dir="$(mktemp -d "${runtime_parent%/}/svm-mvcpu.XXXXXX")"
 chmod 700 "${runtime_dir}"
+vm_name="mvcpus-${backend}"
+forked_name="${vm_name}-forked"
+resumed_name="${vm_name}-resumed"
 cleanup() {
   local status="$?"
+  if [[ -d "${runtime_dir}" ]]; then
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${forked_name}" >/dev/null 2>&1 || true
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${resumed_name}" >/dev/null 2>&1 || true
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
+  fi
   if [[ "${SPORE_SMOKE_KEEP_WORKDIR:-0}" == "1" || "${status}" != "0" ]]; then
-    echo "kept smoke workdir: ${workdir}" >&2
+    echo "kept smoke workdir: ${workdir} runtime_dir=${runtime_dir}" >&2
     exit "${status}"
   fi
-  rm -rf "${workdir}"
+  rm -rf "${runtime_dir}" "${workdir}"
 }
 trap cleanup EXIT
 
@@ -223,9 +231,6 @@ jsonl_output_contains "${resume_stdout}" stdout "spore finite" || {
 grep -Fq '"exit_code":0' "${resume_stdout}" || die "multi-vCPU attach did not report exit_code 0"
 
 if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
-  vm_name="mvcpus-${backend}"
-  forked_name="${vm_name}-forked"
-  resumed_name="${vm_name}-resumed"
   named_dir="${workdir}/named.spore"
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${vm_name}" --backend "${backend}" --vcpus "${vcpus}" --memory "${memory}" --timeout "${create_timeout_ms}ms" >"${workdir}/create.stdout" 2>"${workdir}/create.stderr"; then
     cat "${workdir}/create.stdout" >&2 || true
