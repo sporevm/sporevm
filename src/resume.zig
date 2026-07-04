@@ -332,10 +332,17 @@ const PreparedResumeAttach = struct {
     }
 };
 
-fn loadGenerationParams(io: Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+pub fn loadGenerationParams(io: Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     const params = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(generation.params_size));
     try generation.validateFanoutParams(allocator, params);
     return params;
+}
+
+pub fn prepareResumeGenerationState(allocator: std.mem.Allocator, manifest_generation: spore.GenerationState, generation_params: []const u8) !generation.State {
+    var gen_dev = generation.Device{};
+    try gen_dev.restore(allocator, manifest_generation);
+    _ = try gen_dev.setResume(manifest_generation.generation, generation_params);
+    return gen_dev.capture(allocator);
 }
 
 fn prepareResumeAttach(allocator: std.mem.Allocator, manifest_generation: spore.GenerationState, generation_params: ?[]const u8) !PreparedResumeAttach {

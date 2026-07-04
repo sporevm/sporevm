@@ -9,6 +9,8 @@ const Context = @import("context.zig").Context;
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
+const generation = @import("generation.zig");
+const resume_mod = @import("resume.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
@@ -189,9 +191,12 @@ const resume_usage =
     \\  spore resume DIR --name NAME
     \\
     \\Options:
+    \\  --backend auto|hvf|kvm  Backend to run (default: captured lifecycle metadata)
+    \\  --generation FILE       Inject fan-out identity JSON before resume
     \\  --name NAME            Name for the resumed VM
     \\  --bind-service NAME=unix:/path.sock
     \\                         Bind a manifest-declared service to a host socket
+    \\  --events=jsonl         Emit lifecycle events as JSONL on stdout
     \\  -h, --help             Show this help
     \\
 ;
@@ -253,6 +258,7 @@ pub const Spec = struct {
     sessions: []const spore.Session = &.{},
     image_ref: ?[]const u8 = null,
     resume_dir: ?[]const u8 = null,
+    resume_generation: ?generation.State = null,
     memory: memory_config.Config = .{},
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
@@ -423,6 +429,9 @@ const ForkOptions = struct {
 const ResumeOptions = struct {
     spore_dir: []const u8,
     name: []const u8,
+    backend: ?run_mod.Backend = null,
+    generation_path: ?[]const u8 = null,
+    event_mode: run_mod.EventMode = .none,
     bound_services: run_mod.BoundServiceBindingList = .{},
 };
 
@@ -469,6 +478,8 @@ pub const CreateNamedOptions = struct {
 pub const ResumeNamedOptions = struct {
     spore_dir: []const u8,
     name: []const u8,
+    backend: ?run_mod.Backend = null,
+    generation_path: ?[]const u8 = null,
     spore_executable: []const u8 = "spore",
     bound_services: []const spore_net_policy.BoundServiceBinding = &.{},
 };
@@ -843,6 +854,16 @@ pub fn resumeNamed(
     const devices_len = if (manifest) |parsed| parsed.value.devices.len else manifest_v1.?.value.devices.len;
     if (rootfs == null and devices_len != diskless_resume_device_count) return error.UnsupportedLifecycleDeviceModel;
     const ram_size = if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size;
+    const manifest_generation = if (manifest) |parsed| parsed.value.generation else manifest_v1.?.value.generation;
+    const resume_generation = if (options.generation_path) |path| blk: {
+        const params = resume_mod.loadGenerationParams(init.io, arena, path) catch |err| switch (err) {
+            error.BadGenerationPayload => return error.BadGenerationPayload,
+            error.StreamTooLong => return error.GenerationPayloadTooLarge,
+            error.FileNotFound => return error.GenerationFileNotFound,
+            else => return error.GenerationFileInvalid,
+        };
+        break :blk try resume_mod.prepareResumeGenerationState(arena, manifest_generation, params);
+    } else null;
     const sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions;
     const memory = memory_config.fromManifestBytes(ram_size) catch return error.InvalidMemorySize;
     const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else @as(topology.VcpuCount, 1);
@@ -856,10 +877,11 @@ pub fn resumeNamed(
     const base = if (lifecycle_spec) |spec| spec.value else Spec{ .name = options.name };
     const spec = Spec{
         .name = options.name,
-        .backend = base.backend,
+        .backend = if (options.backend) |backend| backend.name() else base.backend,
         .kernel_path = base.kernel_path,
         .initrd_path = base.initrd_path,
         .resume_dir = spore_dir,
+        .resume_generation = resume_generation,
         .rootfs = rootfs,
         .disk = disk,
         .network = try run_mod.manifestNetworkFromOptions(arena, network_options.network, &network_options.policy),
@@ -876,7 +898,7 @@ pub fn resumeNamed(
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
     const state = try classifyVmState(arena, init.io, paths, pidAlive);
     if (state != .absent) return namedVmExists(arena, init.io, paths, "resume", spec.name, state);
-    if (spec.rootfs != null or spec.disk != null or !spore.annotationsEmpty(spec.annotations) or spec.sessions.len != 0) try writeSpec(arena, init.io, paths, spec);
+    if (spec.rootfs != null or spec.disk != null or spec.resume_generation != null or !spore.annotationsEmpty(spec.annotations) or spec.sessions.len != 0) try writeSpec(arena, init.io, paths, spec);
 
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (network_options.network == .spore) &network_options.policy else null;
     const spore_executable_path = try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, spawn_policy);
@@ -1843,78 +1865,118 @@ pub fn resumeCli(
     const allocator = init.arena.allocator();
     const parsed = parseResumeArgs(args, allocator, stderr, mode);
     const full_args = try init.minimal.args.toSlice(allocator);
+    var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "resume");
+    if (parsed.event_mode == .jsonl) try event_writer.emitStart(parsed.backend orelse .auto);
     const result = resumeNamed(init, allocator, .{
         .spore_dir = parsed.spore_dir,
         .name = parsed.name,
+        .backend = parsed.backend,
+        .generation_path = parsed.generation_path,
         .spore_executable = full_args[0],
         .bound_services = parsed.bound_services.slice(),
-    }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "resume", err),
-        error.FileNotFound => {
-            const message = "spore resume: spore directory is not available";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "resume"), message);
-        },
-        error.InvalidSporeDir => {
-            const message = allocLifecycleMessage(allocator, "spore resume: invalid spore directory: {s}", .{parsed.spore_dir});
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-        },
-        error.InvalidNetworkPolicy => {
-            const message = "spore resume: invalid network policy in manifest";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-        },
-        error.MissingBoundServiceBinding => {
-            const message = "spore resume: manifest requires live bound Unix service bindings";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-        },
-        error.UnexpectedBoundServiceBinding => {
-            const message = "spore resume: live bound Unix service bindings do not match the manifest";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-        },
-        error.DuplicateBoundServiceBinding => {
-            const message = "spore resume: duplicate live bound Unix service binding";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-        },
-        error.InvalidBoundService, error.InvalidBoundServiceTarget, error.UnsupportedBoundServiceTarget => {
-            const message = "spore resume: invalid live bound Unix service binding";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-        },
-        error.UnsupportedLifecycleDeviceModel => {
-            const message = "spore resume: unsupported lifecycle device model";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-        },
-        error.InvalidMemorySize => {
-            const message = "spore resume: invalid spore memory size";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-        },
-        error.InvalidLifecycleMetadata => {
-            const message = "spore resume: invalid lifecycle metadata";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-        },
-        error.UnsupportedLifecycleMetadata => {
-            const message = "spore resume: lifecycle metadata does not match the spore topology";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-        },
-        error.HostUnsupported => {
-            const message = "spore resume: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "resume"), message);
-        },
-        error.NamedVmExists => {
-            const fallback = allocLifecycleMessage(allocator, "spore resume: VM already exists or has stale state: {s}", .{parsed.name});
-            const message = allocLifecycleLastErrorMessage(allocator, "resume", fallback);
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
-        },
-        error.MonitorReadyTimeout, error.MonitorVersionMismatch, error.SporeExecutableVersionUnavailable => {
-            const message = allocLifecycleLastErrorMessage(allocator, "resume", "spore resume: timed out waiting for monitor readiness");
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "resume"), message);
-        },
-        else => |e| return e,
+    }) catch |err| {
+        emitResumeFailureEvent(&event_writer, parsed.event_mode, err);
+        switch (err) {
+            error.BadGenerationPayload => {
+                const message = "spore resume: invalid --generation payload; required JSON fields: run_id, child_id, parallel_index, parallel_count, fork_index, fork_count, fork_batch_id, vm_id";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            },
+            error.GenerationPayloadTooLarge => {
+                const message = allocLifecycleMessage(allocator, "spore resume: --generation payload exceeds {d} bytes", .{generation.params_size});
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            },
+            error.GenerationFileNotFound, error.GenerationFileInvalid => {
+                const message = allocLifecycleMessage(allocator, "spore resume: cannot read --generation {s}: {s}", .{ parsed.generation_path orelse "", @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            },
+            error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "resume", err),
+            error.FileNotFound => {
+                const message = "spore resume: spore directory is not available";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "resume"), message);
+            },
+            error.InvalidSporeDir => {
+                const message = allocLifecycleMessage(allocator, "spore resume: invalid spore directory: {s}", .{parsed.spore_dir});
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+            },
+            error.InvalidNetworkPolicy => {
+                const message = "spore resume: invalid network policy in manifest";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+            },
+            error.MissingBoundServiceBinding => {
+                const message = "spore resume: manifest requires live bound Unix service bindings";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+            },
+            error.UnexpectedBoundServiceBinding => {
+                const message = "spore resume: live bound Unix service bindings do not match the manifest";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+            },
+            error.DuplicateBoundServiceBinding => {
+                const message = "spore resume: duplicate live bound Unix service binding";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+            },
+            error.InvalidBoundService, error.InvalidBoundServiceTarget, error.UnsupportedBoundServiceTarget => {
+                const message = "spore resume: invalid live bound Unix service binding";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+            },
+            error.UnsupportedLifecycleDeviceModel => {
+                const message = "spore resume: unsupported lifecycle device model";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+            },
+            error.InvalidMemorySize => {
+                const message = "spore resume: invalid spore memory size";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+            },
+            error.InvalidLifecycleMetadata => {
+                const message = "spore resume: invalid lifecycle metadata";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+            },
+            error.UnsupportedLifecycleMetadata => {
+                const message = "spore resume: lifecycle metadata does not match the spore topology";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+            },
+            error.HostUnsupported => {
+                const message = "spore resume: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "resume"), message);
+            },
+            error.NamedVmExists => {
+                const fallback = allocLifecycleMessage(allocator, "spore resume: VM already exists or has stale state: {s}", .{parsed.name});
+                const message = allocLifecycleLastErrorMessage(allocator, "resume", fallback);
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            },
+            error.MonitorReadyTimeout, error.MonitorVersionMismatch, error.SporeExecutableVersionUnavailable => {
+                const message = allocLifecycleLastErrorMessage(allocator, "resume", "spore resume: timed out waiting for monitor readiness");
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "resume"), message);
+            },
+            else => |e| return e,
+        }
     };
     defer deinitNamedLifecycleResult(allocator, result);
-    if (mode == .json) {
+    if (parsed.event_mode == .jsonl) {
+        const requested_backend: run_mod.Backend = parsed.backend orelse .auto;
+        const backend = requested_backend.resolveForHost() catch requested_backend;
+        try emitNamedResumeExit(&event_writer, backend);
+    } else if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, result);
     } else {
         try writeNamedLifecycleResult(stdout, result);
     }
+}
+
+fn emitNamedResumeExit(event_writer: *run_mod.EventWriter, backend: run_mod.Backend) !void {
+    try event_writer.emitExit(.{
+        .backend = backend,
+        .start_ms = 0,
+        .vsock_connect_ms = 0,
+        .exec_response_ms = 0,
+        .probe_duration_ms = 0,
+        .exit_code = 0,
+        .vcpus = 1,
+        .memory_bytes = 0,
+    });
+}
+
+fn emitResumeFailureEvent(event_writer: *run_mod.EventWriter, event_mode: run_mod.EventMode, err: anyerror) void {
+    if (event_mode == .jsonl) event_writer.emitFailure(run_mod.classifyFailure(err)) catch {};
 }
 
 pub fn lsCli(
@@ -2937,15 +2999,50 @@ fn parseResumeArgs(
 ) ResumeOptions {
     var spore_dir: ?[]const u8 = null;
     var name: ?[]const u8 = null;
+    var backend: ?run_mod.Backend = null;
+    var generation_path: ?[]const u8 = null;
+    var event_mode: run_mod.EventMode = .none;
     var bound_services = run_mod.BoundServiceBindingList{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--name")) {
-            name = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, args[i]);
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--backend")) {
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, arg);
+            backend = run_mod.Backend.parse(raw) orelse {
+                const message = "--backend must be auto, hvf, or kvm";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            };
+        } else if (std.mem.startsWith(u8, arg, "--backend=")) {
+            const raw = arg["--backend=".len..];
+            backend = run_mod.Backend.parse(raw) orelse {
+                const message = "--backend must be auto, hvf, or kvm";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            };
+        } else if (std.mem.eql(u8, arg, "--generation")) {
+            generation_path = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, arg);
+        } else if (std.mem.startsWith(u8, arg, "--generation=")) {
+            generation_path = arg["--generation=".len..];
+        } else if (std.mem.eql(u8, arg, "--events")) {
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, arg);
+            event_mode = run_mod.EventMode.parse(raw) orelse {
+                const message = "--events must be jsonl";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            };
+        } else if (std.mem.startsWith(u8, arg, "--events=")) {
+            const raw = arg["--events=".len..];
+            event_mode = run_mod.EventMode.parse(raw) orelse {
+                const message = "--events must be jsonl";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            };
+        } else if (std.mem.eql(u8, arg, "--name")) {
+            name = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, arg);
             validateNameLifecycleCli(allocator, stderr, mode, "resume", name.?);
-        } else if (std.mem.eql(u8, args[i], "--bind-service")) {
-            const raw = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--name=")) {
+            name = arg["--name=".len..];
+            validateNameLifecycleCli(allocator, stderr, mode, "resume", name.?);
+        } else if (std.mem.eql(u8, arg, "--bind-service")) {
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, arg);
             bound_services.append(spore_net_policy.parseBoundServiceBinding(raw) catch |err| {
                 const message = allocLifecycleMessage(allocator, "spore resume: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
@@ -2953,13 +3050,13 @@ fn parseResumeArgs(
                 const message = allocLifecycleMessage(allocator, "spore resume: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
             };
-        } else if (std.mem.startsWith(u8, args[i], "--")) {
-            const message = allocLifecycleMessage(allocator, "unknown resume argument: {s}", .{args[i]});
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            const message = allocLifecycleMessage(allocator, "unknown resume argument: {s}", .{arg});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
         } else if (spore_dir == null) {
-            spore_dir = args[i];
+            spore_dir = arg;
         } else {
-            const message = allocLifecycleMessage(allocator, "unexpected resume argument: {s}", .{args[i]});
+            const message = allocLifecycleMessage(allocator, "unexpected resume argument: {s}", .{arg});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
         }
     }
@@ -2973,7 +3070,14 @@ fn parseResumeArgs(
             resume_usage,
         );
     }
-    return .{ .spore_dir = spore_dir.?, .name = name.?, .bound_services = bound_services };
+    return .{
+        .spore_dir = spore_dir.?,
+        .name = name.?,
+        .backend = backend,
+        .generation_path = generation_path,
+        .event_mode = event_mode,
+        .bound_services = bound_services,
+    };
 }
 
 fn apiPaths(context: Context, allocator: std.mem.Allocator, name: []const u8) !Paths {
@@ -3010,6 +3114,7 @@ fn writeSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8
     const path = try std.fs.path.resolve(allocator, &.{ dir, lifecycle_spore_metadata_file });
     var metadata = spec;
     metadata.resume_dir = null;
+    metadata.resume_generation = null;
     const json = try std.json.Stringify.valueAlloc(allocator, metadata, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
@@ -5466,6 +5571,33 @@ test "named resume parser accepts bound service bindings" {
     try std.testing.expectEqual(@as(usize, 1), opts.bound_services.len);
     try std.testing.expectEqualStrings("metadata", opts.bound_services.items[0].name);
     try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.bound_services.items[0].target.unix);
+}
+
+test "named resume parser accepts k8s child command product flags" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    const opts = parseResumeArgs(&.{ "--events=jsonl", "--backend", "kvm", "--generation", "generation.json", "child.spore", "--name=sporevm-child-42" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
+    try std.testing.expectEqual(run_mod.Backend.kvm, opts.backend.?);
+    try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
+    try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
+    try std.testing.expectEqualStrings("sporevm-child-42", opts.name);
+}
+
+test "named resume event mode emits terminal run event" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    var events = run_mod.EventWriter.init(allocator, &out.writer, "resume");
+    try events.emitStart(.kvm);
+    try emitNamedResumeExit(&events, .kvm);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"event\":\"exit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"command\":\"resume\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"exit_code\":0") != null);
 }
 
 test "lifecycle detects incomplete ready and stale pid state" {

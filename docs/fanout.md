@@ -102,7 +102,10 @@ Fleet adapters that materialize one child and call `spore resume` directly can
 inject the same guest-visible identity surface without running local fan-out:
 
 ```bash
-spore resume child.spore --generation generation.json --events=jsonl
+spore resume child.spore \
+  --name sporevm-child-42 \
+  --generation generation.json \
+  --events=jsonl
 ```
 
 `generation.json` is copied through the existing generation attach path and the
