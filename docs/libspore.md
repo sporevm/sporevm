@@ -495,9 +495,9 @@ overrides, context-local last errors, owned string cleanup, host-info JSON,
 inspect-bundle JSON, inspect-spore JSON, pull JSON, named lifecycle JSON, and
 named copy side-effect calls.
 
-Release builds publish separate `libspore_Linux_arm64` and
-`libspore_Darwin_arm64` archives so CLI-only installs do not carry development
-files. Each libspore archive contains:
+Release builds publish separate `libspore_Linux` and `libspore_Darwin`
+archives so CLI-only installs do not carry development files. Each libspore
+archive contains:
 
 - `include/spore.h`
 - `lib/libspore.a`
@@ -508,7 +508,7 @@ files. Each libspore archive contains:
 Use the archive that matches the target platform:
 
 ```bash
-asset=libspore_Darwin_arm64 # or libspore_Linux_arm64
+asset=libspore_Darwin # or libspore_Linux
 tar -xzf "$asset.tar.gz"
 export PKG_CONFIG_PATH="$PWD/$asset/lib/pkgconfig"
 cc my_program.c -o my_program $(pkg-config --cflags --libs libspore)

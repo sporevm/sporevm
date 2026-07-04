@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
         .preferred_optimize_mode = .ReleaseSafe,
     });
     const macos_framework_path = macosFrameworkPath(b);
-    const libspore_version = std.SemanticVersion{ .major = 1, .minor = 5, .patch = 0 };
+    const libspore_version = std.SemanticVersion{ .major = 0, .minor = 3, .patch = 0 };
 
     const libspore_mod = b.addModule("libspore", .{
         .root_source_file = b.path("src/libspore.zig"),
@@ -98,7 +98,7 @@ pub fn build(b: *std.Build) void {
         \\
         \\Name: libspore
         \\Description: SporeVM C ABI
-        \\Version: 1.5.0
+        \\Version: 0.3.0
         \\Libs: -L${libdir} -lspore
         \\Cflags: -I${includedir}
         \\
@@ -197,6 +197,13 @@ pub fn build(b: *std.Build) void {
         .root_module = c_smoke_mod,
     });
     const run_c_smoke = b.addRunArtifact(c_smoke);
+
+    // ponytail: test artifacts share fixed zig-cache paths; serialize until tests use per-process temp dirs.
+    run_libspore_smoke_tests.step.dependOn(&run_libspore_tests.step);
+    run_c_api_tests.step.dependOn(&run_libspore_smoke_tests.step);
+    run_internal_tests.step.dependOn(&run_c_api_tests.step);
+    run_exe_tests.step.dependOn(&run_internal_tests.step);
+    run_c_smoke.step.dependOn(&run_exe_tests.step);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_libspore_tests.step);
