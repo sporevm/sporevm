@@ -1170,7 +1170,7 @@ pub fn forkNamed(
     const state = try classifyVmState(arena, init.io, source_paths, pidAlive);
     if (state != .ready) return namedVmNotReady(arena, init.io, source_paths, "fork", options.source_name, state);
 
-    var source_spec = readSpec(arena, init.io, source_paths) catch return namedVmNotReady(arena, init.io, source_paths, "fork", options.source_name, state);
+    var source_spec = readSpec(arena, init.io, source_paths) catch return namedVmNotReady(arena, init.io, source_paths, "fork", options.source_name, .incomplete);
     defer source_spec.deinit();
     if (source_spec.value.rootfs_path != null or source_spec.value.image_ref != null or source_spec.value.rootfs != null or source_spec.value.disk != null) {
         return error.UnsupportedNamedForkDisk;
@@ -1184,7 +1184,7 @@ pub fn forkNamed(
         if (child_state != .absent) return namedVmExists(arena, init.io, child_paths, "fork", child_name, child_state);
     }
 
-    var ready = readReady(arena, init.io, source_paths) catch return namedVmNotReady(arena, init.io, source_paths, "fork", options.source_name, state);
+    var ready = readReady(arena, init.io, source_paths) catch return namedVmNotReady(arena, init.io, source_paths, "fork", options.source_name, .incomplete);
     defer ready.deinit();
 
     const batch_dir = try hiddenForkBatchDir(arena, source_paths.runtime_root, options.source_name);
@@ -1409,7 +1409,8 @@ pub fn createCli(
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "create"), message);
             },
             error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
-                const message = allocLifecycleMessage(allocator, "spore create: initial command failed for VM {s}: {s}", .{ spec.name, @errorName(err) });
+                const fallback = allocLifecycleMessage(allocator, "spore create: initial command failed for VM {s}: {s}", .{ spec.name, @errorName(err) });
+                const message = allocLifecycleLastErrorMessage(allocator, "create", fallback);
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "create"), message);
             },
             else => |e| return e,
@@ -1463,7 +1464,10 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
                 std.process.exit(2);
             },
             error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
-                switch (err) {
+                const detail = lastErrorMessage();
+                if (detail.len != 0) {
+                    std.debug.print("spore exec: {s}\n", .{detail});
+                } else switch (err) {
                     error.MonitorUnavailable => std.debug.print("spore exec: monitor is unavailable for VM: {s}\n", .{parsed.name}),
                     else => std.debug.print("spore exec: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
                 }
@@ -1492,7 +1496,10 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
             std.process.exit(2);
         },
         error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
-            switch (err) {
+            const detail = lastErrorMessage();
+            if (detail.len != 0) {
+                std.debug.print("spore exec: {s}\n", .{detail});
+            } else switch (err) {
                 error.MonitorUnavailable => std.debug.print("spore exec: monitor is unavailable for VM: {s}\n", .{parsed.name}),
                 else => std.debug.print("spore exec: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
             }
@@ -1543,7 +1550,12 @@ pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
             exitAfterCopyArchiveCleanup(&archive, init.io, 2);
         },
         error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
-            std.debug.print("spore copy-in: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) });
+            const detail = lastErrorMessage();
+            if (detail.len != 0) {
+                std.debug.print("spore copy-in: {s}\n", .{detail});
+            } else {
+                std.debug.print("spore copy-in: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) });
+            }
             exitAfterCopyArchiveCleanup(&archive, init.io, 1);
         },
         else => |e| return e,
@@ -1592,7 +1604,12 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
             exitAfterCopyArchiveCleanup(&archive, init.io, 2);
         },
         error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
-            std.debug.print("spore copy-out: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) });
+            const detail = lastErrorMessage();
+            if (detail.len != 0) {
+                std.debug.print("spore copy-out: {s}\n", .{detail});
+            } else {
+                std.debug.print("spore copy-out: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) });
+            }
             exitAfterCopyArchiveCleanup(&archive, init.io, 1);
         },
         else => |e| return e,
@@ -1701,10 +1718,11 @@ pub fn suspendCli(
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
         },
         error.MonitorUnavailable, error.MonitorRequestFailed, error.MonitorVersionMismatch => {
-            const message = switch (err) {
+            const fallback = switch (err) {
                 error.MonitorUnavailable => allocLifecycleMessage(allocator, "spore suspend: monitor is unavailable for VM: {s}", .{parsed.name}),
                 else => allocLifecycleMessage(allocator, "spore suspend: monitor request failed for VM {s}: {s}", .{ parsed.name, @errorName(err) }),
             };
+            const message = allocLifecycleLastErrorMessage(allocator, "suspend", fallback);
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "suspend"), message);
         },
         else => |e| return e,
@@ -3374,7 +3392,12 @@ fn resolveSpawnExecutable(allocator: std.mem.Allocator, io: Io, environ: *const 
 fn isSelfExecutable(io: Io, allocator: std.mem.Allocator, resolved_exe: []const u8) bool {
     const self_path = std.process.executablePathAlloc(io, allocator) catch return false;
     defer allocator.free(self_path);
-    return std.mem.eql(u8, self_path, resolved_exe);
+    if (std.mem.eql(u8, self_path, resolved_exe)) return true;
+    // resolveSpawnExecutable is lexical, so compare through symlinks too:
+    // an embedder may hand us its own path via a symlink.
+    const real_exe = Io.Dir.cwd().realPathFileAlloc(io, resolved_exe, allocator) catch return false;
+    defer allocator.free(real_exe);
+    return std.mem.eql(u8, self_path, real_exe);
 }
 
 fn querySporeExecutableVersion(init: std.process.Init, allocator: std.mem.Allocator, exe: []const u8) ![]const u8 {
@@ -3468,14 +3491,16 @@ fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeou
             continue;
         }
         verifyMonitorHelloWithPath(allocator, io, ready.value.control_socket_path, spore_executable_path) catch |err| switch (err) {
-            error.MonitorUnavailable => {
+            error.MonitorVersionMismatch => {
+                ready.deinit();
+                return err;
+            },
+            // Transient failures (socket races, monitor mid-start, garbage
+            // responders) retry until the diagnosed readiness timeout.
+            else => {
                 ready.deinit();
                 sleepMs(20);
                 continue;
-            },
-            else => |e| {
-                ready.deinit();
-                return e;
             },
         };
         ready.deinit();
