@@ -259,7 +259,10 @@ under `rootfs.cache`.
   live gateway state, TCP flows, DNS response caches, host socket paths,
   host port forwards, credential material, or helper process state. Resume and
   `spore run --from` must attach a fresh gateway that satisfies the recorded
-  `requirements` and policy or fail closed.
+  `requirements` and policy or fail closed. `libspore.inspectSpore`,
+  `spore_inspect_spore_json`, and the Go `InspectSpore` binding expose the
+  network kind, requirements, and bound-service requirements so callers can
+  preflight restore-time bindings without parsing `manifest.json` directly.
 
 ## Manifest Format v1
 

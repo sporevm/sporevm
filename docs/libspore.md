@@ -96,6 +96,10 @@ empty, and the serialized annotation object is capped at 64 KiB.
 reattachable guest process sessions only; host stdin, PTY ownership, terminal
 mode, and currently attached clients are not serialized.
 
+`SporeInspectResult.network` exposes the manifest network kind, capability
+requirements, and bound-service requirements so callers can discover restore-time
+bindings before calling `resumeSpore` or `runFromSpore`.
+
 ## Local System
 
 Use `systemDf` and `systemPrune` for rootfs cache inspection and cleanup without

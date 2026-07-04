@@ -48,6 +48,13 @@ pub const NetworkCapabilities = struct {
     decision_events: bool,
 };
 
+pub const BoundServiceBindingDiagnostic = struct {
+    missing_name: ?[]const u8 = null,
+    unexpected_name: ?[]const u8 = null,
+    duplicate_name: ?[]const u8 = null,
+    name_buffer: [max_bound_service_name_len]u8 = undefined,
+};
+
 pub fn capabilities() NetworkCapabilities {
     return .{
         .supported = true,
@@ -306,6 +313,16 @@ pub fn configFromManifestNetworkWithBindings(
     network: spore.Network,
     bindings: []const BoundServiceBinding,
 ) !Config {
+    return configFromManifestNetworkWithBindingDiagnostic(allocator, network, bindings, null);
+}
+
+pub fn configFromManifestNetworkWithBindingDiagnostic(
+    allocator: std.mem.Allocator,
+    network: spore.Network,
+    bindings: []const BoundServiceBinding,
+    diagnostic: ?*BoundServiceBindingDiagnostic,
+) !Config {
+    if (diagnostic) |diag| diag.* = .{};
     try spore.validateNetwork(network);
     var policy = Config{};
     if (network.default_action) |action| {
@@ -323,7 +340,7 @@ pub fn configFromManifestNetworkWithBindings(
         const ports = try allocator.dupe(u16, rule.ports);
         try policy.addExactHostPorts(host, ports);
     }
-    try addManifestBoundServices(allocator, &policy, network.bound_services, bindings);
+    try addManifestBoundServices(allocator, &policy, network.bound_services, bindings, diagnostic);
     return policy;
 }
 
@@ -332,6 +349,7 @@ fn addManifestBoundServices(
     policy: *Config,
     requirements: []const spore.NetworkBoundServiceRequirement,
     bindings: []const BoundServiceBinding,
+    diagnostic: ?*BoundServiceBindingDiagnostic,
 ) !void {
     if (bindings.len > max_bound_services) return error.TooManyBoundServices;
     for (bindings, 0..) |binding, index| {
@@ -341,18 +359,30 @@ fn addManifestBoundServices(
             .tcp => return error.UnsupportedBoundServiceTarget,
         }
         for (bindings[0..index]) |previous| {
-            if (std.mem.eql(u8, previous.name, binding.name)) return error.DuplicateBoundServiceBinding;
+            if (std.mem.eql(u8, previous.name, binding.name)) {
+                setDuplicateBindingName(diagnostic, binding.name);
+                return error.DuplicateBoundServiceBinding;
+            }
         }
     }
     if (requirements.len == 0) {
-        if (bindings.len != 0) return error.UnexpectedBoundServiceBinding;
+        if (bindings.len != 0) {
+            setUnexpectedBindingName(diagnostic, bindings[0].name);
+            return error.UnexpectedBoundServiceBinding;
+        }
         return;
     }
-    if (bindings.len == 0) return error.MissingBoundServiceBinding;
+    if (bindings.len == 0) {
+        setMissingBindingName(diagnostic, requirements[0].name);
+        return error.MissingBoundServiceBinding;
+    }
 
     var matched = [_]bool{false} ** max_bound_services;
     for (requirements) |requirement| {
-        const binding_index = findBoundServiceBinding(bindings, requirement.name) orelse return error.MissingBoundServiceBinding;
+        const binding_index = findBoundServiceBinding(bindings, requirement.name) orelse {
+            setMissingBindingName(diagnostic, requirement.name);
+            return error.MissingBoundServiceBinding;
+        };
         matched[binding_index] = true;
         const binding = bindings[binding_index];
         const unix_path = switch (binding.target) {
@@ -366,9 +396,30 @@ fn addManifestBoundServices(
             try allocator.dupe(u8, unix_path),
         );
     }
-    for (bindings, 0..) |_, index| {
-        if (!matched[index]) return error.UnexpectedBoundServiceBinding;
+    for (bindings, 0..) |binding, index| {
+        if (!matched[index]) {
+            setUnexpectedBindingName(diagnostic, binding.name);
+            return error.UnexpectedBoundServiceBinding;
+        }
     }
+}
+
+fn setMissingBindingName(diagnostic: ?*BoundServiceBindingDiagnostic, name: []const u8) void {
+    if (diagnostic) |diag| diag.missing_name = copyDiagnosticName(diag, name);
+}
+
+fn setUnexpectedBindingName(diagnostic: ?*BoundServiceBindingDiagnostic, name: []const u8) void {
+    if (diagnostic) |diag| diag.unexpected_name = copyDiagnosticName(diag, name);
+}
+
+fn setDuplicateBindingName(diagnostic: ?*BoundServiceBindingDiagnostic, name: []const u8) void {
+    if (diagnostic) |diag| diag.duplicate_name = copyDiagnosticName(diag, name);
+}
+
+fn copyDiagnosticName(diagnostic: *BoundServiceBindingDiagnostic, name: []const u8) []const u8 {
+    std.debug.assert(name.len <= diagnostic.name_buffer.len);
+    @memcpy(diagnostic.name_buffer[0..name.len], name);
+    return diagnostic.name_buffer[0..name.len];
 }
 
 fn findBoundServiceBinding(bindings: []const BoundServiceBinding, name: []const u8) ?usize {

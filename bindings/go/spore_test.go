@@ -139,6 +139,18 @@ func TestInspectSporeAnnotations(t *testing.T) {
 	if len(result.AnnotationKeys) != 2 {
 		t.Fatalf("annotation keys = %#v", result.AnnotationKeys)
 	}
+	if result.Network == nil {
+		t.Fatal("expected network requirements")
+	}
+	if !result.Network.Requirements.BoundServices {
+		t.Fatal("expected bound service requirement")
+	}
+	if len(result.Network.BoundServices) != 1 {
+		t.Fatalf("bound services = %#v", result.Network.BoundServices)
+	}
+	if got := result.Network.BoundServices[0].Name; got != "cleanroom-gateway" {
+		t.Fatalf("bound service name = %q", got)
+	}
 }
 
 func TestPull(t *testing.T) {
@@ -696,6 +708,7 @@ func writeSporeFixture(t *testing.T, annotations map[string]string) string {
 		t.Fatal(err)
 	}
 	manifest := strings.Replace(tinyManifest, `  "platform": {`, `  "annotations": `+string(annotationJSON)+","+"\n"+`  "platform": {`, 1)
+	manifest = strings.Replace(manifest, `"network": null`, `"network": {"bound_services":[{"name":"cleanroom-gateway","guest_host":"gateway.cleanroom.internal","guest_port":8170}],"requirements":{"tcp_ipv4":true,"exact_host_port":false,"bound_services":true}}`, 1)
 	mustWrite(t, filepath.Join(dir, "manifest.json"), manifest)
 	return dir
 }

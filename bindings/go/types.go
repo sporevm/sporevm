@@ -82,8 +82,27 @@ type SporeInspectResult struct {
 	MemoryBackingSize       *uint64              `json:"memory_backing_size"`
 	GICKind                 string               `json:"gic_kind"`
 	Sessions                []Session            `json:"sessions"`
+	Network                 *SporeNetworkSummary `json:"network"`
 	Annotations             map[string]string    `json:"annotations"`
 	AnnotationKeys          []string             `json:"annotation_keys"`
+}
+
+type SporeNetworkSummary struct {
+	Kind          string                           `json:"kind"`
+	Requirements  NetworkRequirements              `json:"requirements"`
+	BoundServices []NetworkBoundServiceRequirement `json:"bound_services"`
+}
+
+type NetworkRequirements struct {
+	TCPIPv4       bool `json:"tcp_ipv4"`
+	ExactHostPort bool `json:"exact_host_port"`
+	BoundServices bool `json:"bound_services"`
+}
+
+type NetworkBoundServiceRequirement struct {
+	Name      string `json:"name"`
+	GuestHost string `json:"guest_host"`
+	GuestPort uint16 `json:"guest_port"`
 }
 
 type Session struct {
