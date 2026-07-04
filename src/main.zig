@@ -759,6 +759,7 @@ fn writeInspectSummary(writer: *Io.Writer, summary: spore_api.SporeInspectResult
     try writer.writeAll("Spore manifest\n");
     try writer.print("  Version: {d}\n", .{summary.version});
     try writer.print("  Platform: {s}/{s}, {d} bytes RAM\n", .{ summary.platform.arch, summary.platform.cpu_profile, summary.platform.ram_size });
+    try writer.print("  vCPUs: {d}\n", .{summary.vcpu_count});
     try writer.print("  Devices: {d}\n", .{summary.device_count});
     try writer.print("  Memory chunks: {d} present of {d}\n", .{ summary.present_memory_chunk_count, summary.memory_chunk_count });
     if (summary.memory_backing_kind) |kind| {

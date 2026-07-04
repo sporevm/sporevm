@@ -97,6 +97,13 @@ printf 'writable rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}
   die "base capture did not record one writable disk layer"
 }
 
+# Anything resume can restore must also pass inspect; disk-backed captures
+# once tripped BadManifest in the inspect parser.
+"${spore_bin}" --json inspect "${base_dir}" >"${workdir}/inspect.json" || {
+  cat "${workdir}/inspect.json" >&2 || true
+  die "spore inspect rejected a disk-backed capture that resume accepts"
+}
+
 "${spore_bin}" fork "${base_dir}" --count 4 --out "${fork_dir}" >"${workdir}/fork.json" || {
   cat "${workdir}/fork.json" >&2 || true
   die "writable rootfs fork failed"

@@ -89,8 +89,11 @@ vcpus="${SPORE_SMOKE_VCPUS:-2}"
 memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-512}mib}"
 create_timeout_ms="${SPORE_SMOKE_CREATE_TIMEOUT_MS:-120000}"
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-multi-vcpu.XXXXXX")"
-runtime_dir="${workdir}/runtime"
-mkdir -p "${runtime_dir}"
+# Keep the runtime dir short: control socket paths must fit the 104-byte
+# macOS sun_path limit, and macOS TMPDIR lives under a deep /var/folders path.
+runtime_parent="${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}"
+mkdir -p "${runtime_parent}"
+runtime_dir="$(mktemp -d "${runtime_parent%/}/svm-mvcpu.XXXXXX")"
 chmod 700 "${runtime_dir}"
 cleanup() {
   local status="$?"
@@ -215,6 +218,17 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     die "multi-vCPU named suspend failed"
   fi
   expect_manifest_v1 "${named_dir}"
+  # Multi-vCPU suspends write v1 manifests; inspect must accept everything
+  # resume accepts.
+  if ! "${spore_bin}" --json inspect "${named_dir}" >"${workdir}/inspect.json" 2>"${workdir}/inspect.stderr"; then
+    cat "${workdir}/inspect.json" >&2 || true
+    cat "${workdir}/inspect.stderr" >&2 || true
+    die "spore inspect rejected a multi-vCPU suspend that resume accepts"
+  fi
+  grep -Eq '"vcpu_count": *'"${vcpus}" "${workdir}/inspect.json" || {
+    cat "${workdir}/inspect.json" >&2 || true
+    die "spore inspect did not report the suspended vCPU count"
+  }
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" resume "${named_dir}" --name "${resumed_name}" >"${workdir}/named-resume.stdout" 2>"${workdir}/named-resume.stderr"; then
     cat "${workdir}/named-resume.stdout" >&2 || true
     cat "${workdir}/named-resume.stderr" >&2 || true

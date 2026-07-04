@@ -17,8 +17,10 @@ const platform = @import("platform.zig");
 const resume_mod = @import("resume.zig");
 const rootfs_mod = @import("rootfs.zig");
 const run_mod = @import("run.zig");
+const gicv3 = @import("gicv3.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
+const topology = @import("topology.zig");
 const system = @import("system.zig");
 
 /// Process context shared by product operations.
@@ -446,6 +448,7 @@ pub const SporeNetworkSummary = struct {
 /// Owned string fields must be released with `deinitSporeInspectResult`.
 pub const SporeInspectResult = struct {
     version: u32,
+    vcpu_count: u32,
     platform: SporePlatformSummary,
     device_count: usize,
     memory_chunk_count: usize,
@@ -723,9 +726,17 @@ pub fn inspectSpore(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const manifest = try spore.loadManifest(arena, spore_dir);
+    // Multi-vCPU spores carry a v1 manifest; try the same version fallback
+    // resume uses so inspect accepts everything resume can restore.
+    if (spore.loadManifest(arena, spore_dir)) |manifest| {
+        defer manifest.deinit();
+        return summarizeSpore(allocator, manifest.value, 1);
+    } else |err| {
+        if (err != error.BadManifest) return err;
+    }
+    const manifest = try spore.loadManifestV1(arena, spore_dir);
     defer manifest.deinit();
-    return summarizeSpore(allocator, manifest.value);
+    return summarizeSpore(allocator, manifest.value, manifest.value.platform.vcpu_count);
 }
 
 /// Release memory owned by a `SporeInspectResult`.
@@ -1253,7 +1264,9 @@ pub fn deinitPullResult(allocator: std.mem.Allocator, result: PullResult) void {
     contracts.deinitPullResult(allocator, result);
 }
 
-fn summarizeSpore(allocator: std.mem.Allocator, manifest: spore.Manifest) !SporeInspectResult {
+/// Summarize either manifest version; the fields read here are shared
+/// between `spore.Manifest` and `spore.ManifestV1`.
+fn summarizeSpore(allocator: std.mem.Allocator, manifest: anytype, vcpu_count: u32) !SporeInspectResult {
     var present_chunks: usize = 0;
     for (manifest.memory.chunks) |maybe_chunk| {
         if (maybe_chunk != null) present_chunks += 1;
@@ -1285,6 +1298,7 @@ fn summarizeSpore(allocator: std.mem.Allocator, manifest: spore.Manifest) !Spore
 
     return .{
         .version = manifest.version,
+        .vcpu_count = vcpu_count,
         .platform = .{
             .arch = try allocator.dupe(u8, manifest.platform.arch),
             .cpu_profile = try allocator.dupe(u8, manifest.platform.cpu_profile),
@@ -1482,6 +1496,77 @@ const annotation_test_sessions = [_]spore.Session{.{
         .terminal = true,
     },
 }};
+
+test "inspect spore summarizes multi-vcpu v1 manifests" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    var annotations = spore.Annotations{};
+    try annotations.map.put(arena, "cleanroom.bake", "warm");
+    var memory_chunks = [_]?[]const u8{null};
+    var vcpus = [_]spore.VcpuState{ testVcpuState(0), testVcpuState(1) };
+    const redists = [_]gicv3.RedistributorState{
+        .{ .mpidr = vcpus[0].mpidr, .regs = &.{} },
+        .{ .mpidr = vcpus[1].mpidr, .regs = &.{} },
+    };
+    const manifest = spore.ManifestV1{
+        .annotations = annotations,
+        .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
+            .device_model_version = 4,
+            .vcpu_count = 2,
+            .ram_base = 0x8000_0000,
+            .ram_size = 1,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0802_0000,
+            .gic_redist_stride = 0x2_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{
+            .vcpus = &vcpus,
+            .gic = .{
+                .kind = .gicv3_multi,
+                .gicv3_multi = .{
+                    .dist_regs = &.{},
+                    .redistributors = &redists,
+                    .line_levels = &.{},
+                },
+            },
+        },
+        .devices = &.{},
+        .generation = .{ .generation = 1, .interrupt_status = 0, .params_b64 = "" },
+        .memory = .{ .chunk_size = spore.chunk_size, .chunks = &memory_chunks },
+    };
+    try spore.saveManifestV1(arena, dir, manifest);
+
+    const inspected = try inspectSpore(allocator, dir);
+    defer deinitSporeInspectResult(allocator, inspected);
+    try std.testing.expectEqual(@as(u32, spore.format_version_v1), inspected.version);
+    try std.testing.expectEqual(@as(u32, 2), inspected.vcpu_count);
+    try std.testing.expectEqualStrings("gicv3_multi", inspected.gic_kind);
+    try std.testing.expectEqualStrings("warm", inspected.annotations.map.get("cleanroom.bake").?);
+}
+
+fn testVcpuState(index: u32) spore.VcpuState {
+    return .{
+        .index = index,
+        .mpidr = topology.mpidrForIndex(index),
+        .gprs = [_]u64{0} ** 31,
+        .pc = 0,
+        .cpsr = 0,
+        .fpcr = 0,
+        .fpsr = 0,
+        .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+        .sys_regs = &.{},
+        .icc_regs = &.{},
+        .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+    };
+}
 
 fn pathFact(fact: platform.PathFact) PathFact {
     return .{
