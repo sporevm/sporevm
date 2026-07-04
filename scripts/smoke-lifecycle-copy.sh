@@ -111,6 +111,19 @@ env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
 diff -r "${workdir}/source-dir" "${workdir}/roundtrip-dir" >/dev/null || die "copy directory roundtrip mismatch"
 [[ -x "${workdir}/roundtrip-dir/nested/run.sh" ]] || die "copy directory did not preserve executable file mode"
 
+# Bulk transfers: over 1MiB must round-trip byte-exact through copy-in and
+# copy-out. Historically the SPIO transport broke above one vsock packet, so
+# tiny fixtures cannot cover this path. Bulk exec stdio coverage lives in
+# smoke-lifecycle-tty.sh, which boots an image with a shell.
+bulk_bytes=$((1536 * 1024))
+head -c "${bulk_bytes}" /dev/urandom >"${workdir}/bulk.bin"
+
+env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" copy-in "${vm_name}" "${workdir}/bulk.bin" /tmp/spore-copy-bulk.bin
+env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" copy-out "${vm_name}" /tmp/spore-copy-bulk.bin "${workdir}/bulk-roundtrip.bin"
+cmp -s "${workdir}/bulk.bin" "${workdir}/bulk-roundtrip.bin" || die "bulk copy-in/copy-out roundtrip mismatch"
+
 cat >"${workdir}/copy-api.c" <<'C'
 #include <stdio.h>
 #include <string.h>

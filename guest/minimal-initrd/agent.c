@@ -103,6 +103,9 @@ static const char memory_high_limit[] = "268435456\n";
 
 static int path_is_dir(const char *path);
 static int copy_injected_files_to_rootfs(char *error, size_t cap);
+struct session;
+struct client;
+static void close_client_input_lost(struct session *session, struct client *client);
 
 struct replay_buffer {
   unsigned char data[REPLAY_CAP];
@@ -1119,7 +1122,7 @@ static void close_client(struct client *client) {
   client->v1_payload_read = 0;
 }
 
-static int send_client_output(struct client *client, const char *name, uint64_t *client_offset, uint64_t offset, const unsigned char *buf, size_t len) {
+static int send_client_output(struct session *session, struct client *client, const char *name, uint64_t *client_offset, uint64_t offset, const unsigned char *buf, size_t len) {
   if (client->fd < 0) return -1;
   if (*client_offset != offset) return 0;
   int rc;
@@ -1130,18 +1133,18 @@ static int send_client_output(struct client *client, const char *name, uint64_t 
     rc = send_stream_data(client->fd, name, offset, buf, len);
   }
   if (rc != 0) {
-    close_client(client);
+    close_client_input_lost(session, client);
     return -1;
   }
   *client_offset += len;
   return 0;
 }
 
-static int send_client_terminal_output(struct client *client, uint64_t offset, const unsigned char *buf, size_t len) {
+static int send_client_terminal_output(struct session *session, struct client *client, uint64_t offset, const unsigned char *buf, size_t len) {
   if (client->fd < 0 || !client->protocol_v1) return -1;
   if (client->terminal_offset != offset) return 0;
   if (send_spio_data(client->fd, SPIO_TERMINAL_STREAM, offset, buf, len) != 0) {
-    close_client(client);
+    close_client_input_lost(session, client);
     return -1;
   }
   client->terminal_offset += len;
@@ -1974,7 +1977,7 @@ static void pump_session_file(struct session *session, struct client *client, in
       uint64_t frame_offset = *offset;
       mirror_console(is_stdout, buf, (size_t)n);
       *offset += (uint64_t)n;
-      if (client->fd >= 0) (void)send_client_output(client, name, client_offset, frame_offset, buf, (size_t)n);
+      if (client->fd >= 0) (void)send_client_output(session, client, name, client_offset, frame_offset, buf, (size_t)n);
       continue;
     }
     if (n == 0) return;
@@ -2357,20 +2360,20 @@ static int replay_available(const struct replay_buffer *replay, uint64_t offset,
   return offset >= replay->base_offset && offset <= end_offset;
 }
 
-static int send_replay(struct client *client, const struct replay_buffer *replay, const char *name, uint64_t *client_offset, uint64_t end_offset) {
+static int send_replay(struct session *session, struct client *client, const struct replay_buffer *replay, const char *name, uint64_t *client_offset, uint64_t end_offset) {
   if (!replay_available(replay, *client_offset, end_offset)) return -1;
   uint64_t replay_end = replay->base_offset + replay->len;
   if (*client_offset >= replay_end) return 0;
   size_t start = (size_t)(*client_offset - replay->base_offset);
   size_t len = replay->len - start;
-  return send_client_output(client, name, client_offset, *client_offset, replay->data + start, len);
+  return send_client_output(session, client, name, client_offset, *client_offset, replay->data + start, len);
 }
 
 static int attach_client(struct session *session, struct client *client, uint64_t stdout_offset, uint64_t stderr_offset) {
   client->stdout_offset = stdout_offset;
   client->stderr_offset = stderr_offset;
-  if (send_replay(client, &session->stdout_replay, "stdout", &client->stdout_offset, session->stdout_offset) != 0 ||
-      send_replay(client, &session->stderr_replay, "stderr", &client->stderr_offset, session->stderr_offset) != 0) {
+  if (send_replay(session, client, &session->stdout_replay, "stdout", &client->stdout_offset, session->stdout_offset) != 0 ||
+      send_replay(session, client, &session->stderr_replay, "stderr", &client->stderr_offset, session->stderr_offset) != 0) {
     (void)send_client_error_exit(client, 125, "spore run: requested replay offset is unavailable\n");
     close_client(client);
     return -1;
@@ -2400,7 +2403,7 @@ static void pump_session_stream(struct session *session, struct client *client, 
       replay_append(replay, frame_offset, buf, (size_t)n);
       *offset += (uint64_t)n;
       if (client->fd >= 0) {
-        (void)send_client_output(client, name, client_offset, frame_offset, buf, (size_t)n);
+        (void)send_client_output(session, client, name, client_offset, frame_offset, buf, (size_t)n);
       }
       continue;
     }
@@ -2428,7 +2431,7 @@ static void pump_session_terminal(struct session *session, struct client *client
       (void)write_all(STDOUT_FILENO, buf, (size_t)n);
       session->terminal_offset += (uint64_t)n;
       if (client->fd >= 0) {
-        (void)send_client_terminal_output(client, client->terminal_offset, buf, (size_t)n);
+        (void)send_client_terminal_output(session, client, client->terminal_offset, buf, (size_t)n);
       }
       continue;
     }
@@ -2587,6 +2590,19 @@ static int handle_spio_frame(struct session *session, struct client *client) {
   return -1;
 }
 
+// The v1 client owning session input disconnected or violated the stream
+// protocol, so its stdin/terminal ownership can never produce more input.
+// Close the session's input pipes so the child observes EOF and can finish;
+// otherwise the session blocks forever and later execs fail with "session
+// already started".
+static void close_client_input_lost(struct session *session, struct client *client) {
+  if (session->started && !session->exited) {
+    if (client->stdin_input_owner) close_session_stdin(session);
+    if (client->terminal_input_owner) close_session_terminal_input(session);
+  }
+  close_client(client);
+}
+
 static void pump_client_v1(struct session *session, struct client *client) {
   if (client->fd < 0 || !client->protocol_v1) return;
   if (session->stdin_pending_len != 0 || session->terminal_pending_len != 0) return;
@@ -2598,21 +2614,21 @@ static void pump_client_v1(struct session *session, struct client *client) {
         client->v1_header_len += (size_t)n;
         if (client->v1_header_len < SPIO_HEADER_LEN) return;
         if (parse_spio_header(client) != 0) {
-          close_client(client);
+          close_client_input_lost(session, client);
           return;
         }
         if (client->v1_payload_len == 0) {
-          if (handle_spio_frame(session, client) != 0) close_client(client);
+          if (handle_spio_frame(session, client) != 0) close_client_input_lost(session, client);
           client->v1_header_len = 0;
           return;
         }
       } else if (n == 0) {
-        close_client(client);
+        close_client_input_lost(session, client);
         return;
       } else {
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-        close_client(client);
+        close_client_input_lost(session, client);
         return;
       }
     }
@@ -2624,17 +2640,17 @@ static void pump_client_v1(struct session *session, struct client *client) {
         continue;
       }
       if (n == 0) {
-        close_client(client);
+        close_client_input_lost(session, client);
         return;
       }
       if (errno == EINTR) continue;
       if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-      close_client(client);
+      close_client_input_lost(session, client);
       return;
     }
 
     if (handle_spio_frame(session, client) != 0) {
-      close_client(client);
+      close_client_input_lost(session, client);
       return;
     }
     client->v1_header_len = 0;

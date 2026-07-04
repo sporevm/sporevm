@@ -134,6 +134,10 @@ pub const HostStream = struct {
     guest_timing_ms: ?u64 = null,
     received_bytes: u32 = 0,
     sent_bytes: u32 = 0,
+    credit_fwd_cnt_sent: u32 = 0,
+    peer_buf_alloc: u32 = 0,
+    peer_fwd_cnt: u32 = 0,
+    request_sent: bool = false,
     exit_code: ?i32 = null,
     header_buf: [max_frame_header]u8 = undefined,
     header_len: usize = 0,
@@ -225,7 +229,7 @@ pub const HostStream = struct {
         }
 
         const inc: u32 = if (data.len > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(data.len);
-        self.received_bytes +|= inc;
+        self.received_bytes +%= inc;
 
         var rest = data;
         while (rest.len > 0 and self.state != .failed and self.state != .complete) {
@@ -344,7 +348,7 @@ pub const HostStream = struct {
 
     fn appendOutputV1(self: *HostStream, data: []const u8) void {
         const inc: u32 = if (data.len > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(data.len);
-        self.received_bytes +|= inc;
+        self.received_bytes +%= inc;
 
         var rest = data;
         while (rest.len > 0 and self.state != .failed and self.state != .complete) {
@@ -572,17 +576,28 @@ pub const HostStream = struct {
         self.outbound_count += 1;
     }
 
-    fn dequeueOutbound(self: *HostStream, out: *[max_payload]u8) ?[]const u8 {
+    /// Dequeue the next outbound frame only if it fits within `limit` bytes,
+    /// so the caller can respect the guest's advertised credit window.
+    fn dequeueOutboundWithin(self: *HostStream, out: *[max_payload]u8, limit: usize) ?[]const u8 {
         self.outbound_lock.lock();
         defer self.outbound_lock.unlock();
         if (self.outbound_count == 0) return null;
         const frame = &self.outbound_frames[self.outbound_head];
         const len = frame.len;
+        if (len > limit) return null;
         @memcpy(out[0..len], frame.data[0..len]);
         frame.len = 0;
         self.outbound_head = (self.outbound_head + 1) % self.outbound_frames.len;
         self.outbound_count -= 1;
         return out[0..len];
+    }
+
+    /// Bytes the guest can still accept: its advertised receive buffer minus
+    /// stream data the host has sent that the guest has not yet consumed.
+    fn txWindowFree(self: *const HostStream) u32 {
+        const inflight = self.sent_bytes -% self.peer_fwd_cnt;
+        if (inflight >= self.peer_buf_alloc) return 0;
+        return self.peer_buf_alloc - inflight;
     }
 
     pub fn fail(self: *HostStream) void {
@@ -662,6 +677,29 @@ pub const Vsock = struct {
         try self.enqueueHostConnectRequest(stream);
     }
 
+    /// Detach the current host stream and tell the guest the connection is
+    /// gone. Without the reset, a guest blocked writing stream data waits
+    /// forever for credit on a connection the host has abandoned, wedging
+    /// the guest agent and every subsequent exec.
+    pub fn resetHostStream(self: *Vsock) void {
+        const stream = self.host_stream orelse return;
+        self.host_stream = null;
+        if (stream.state == .complete) return;
+        // Drop packets queued for the dead stream so the reset always fits.
+        self.pending_len = 0;
+        self.enqueuePacket(.{
+            .src_cid = host_cid,
+            .dst_cid = self.guest_cid,
+            .src_port = stream.host_port,
+            .dst_port = stream.guest_port,
+            .len = 0,
+            .packet_type = packet_type_stream,
+            .op = op_rst,
+            .buf_alloc = host_stream_credit,
+            .fwd_cnt = stream.received_bytes,
+        }, "") catch {};
+    }
+
     pub fn flushPendingRx(self: *Vsock, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
         return self.flushRx(&queues[rx_queue], ram);
     }
@@ -724,6 +762,11 @@ pub const Vsock = struct {
             tx.pushUsed(ram, chain.head, 0) catch return did_work;
             did_work = true;
         }
+        // Guest packets may have grown the credit window; move deferred
+        // outbound frames before delivering pending receive packets.
+        if (self.host_stream) |stream| {
+            _ = self.flushHostStreamOutboundFor(stream) catch stream.fail();
+        }
         return self.flushRx(&queues[rx_queue], ram) or did_work;
     }
 
@@ -742,8 +785,12 @@ pub const Vsock = struct {
             }
         }
 
-        if (h.op != op_request or h.packet_type != packet_type_stream) return;
         if (h.dst_cid != host_cid or h.src_cid != self.guest_cid) return;
+        // Connection requests are refused, and packets for unknown or
+        // abandoned connections are reset (virtio 1.2 §5.10.6.6) so guests
+        // blocked on a stale stream unblock instead of waiting forever.
+        // Never answer a reset with a reset.
+        if (h.op == op_rst) return;
         self.enqueuePacket(.{
             .src_cid = h.dst_cid,
             .dst_cid = h.src_cid,
@@ -756,11 +803,13 @@ pub const Vsock = struct {
     }
 
     fn handleHostStreamPacket(self: *Vsock, stream: *HostStream, h: Header, payload: []const u8) void {
+        // Every guest packet carries the guest's current receive window.
+        stream.peer_buf_alloc = h.buf_alloc;
+        stream.peer_fwd_cnt = h.fwd_cnt;
         switch (h.op) {
             op_response => {
                 if (stream.state == .connecting) {
                     stream.markConnected();
-                    self.enqueueHostPacket(stream, op_rw, stream.request[0..stream.request_len]) catch stream.fail();
                     _ = self.flushHostStreamOutboundFor(stream) catch stream.fail();
                 }
             },
@@ -779,6 +828,9 @@ pub const Vsock = struct {
             },
             else => {},
         }
+        // Volunteer a credit update on any guest activity so an update
+        // skipped while the pending queue was full is retried.
+        self.maybeUpdateCredit(stream);
     }
 
     fn enqueueHostPacket(self: *Vsock, stream: *HostStream, op: u16, payload: []const u8) !void {
@@ -793,8 +845,20 @@ pub const Vsock = struct {
             .buf_alloc = host_stream_credit,
             .fwd_cnt = stream.received_bytes,
         }, payload);
+        stream.credit_fwd_cnt_sent = stream.received_bytes;
         const inc: u32 = if (payload.len > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(payload.len);
-        stream.sent_bytes +|= inc;
+        stream.sent_bytes +%= inc;
+    }
+
+    /// Send a credit update once the guest has consumed enough of the
+    /// advertised window that it risks stalling. The guest driver blocks
+    /// without requesting credit when its window fills, so the host must
+    /// volunteer updates as it consumes stream data.
+    fn maybeUpdateCredit(self: *Vsock, stream: *HostStream) void {
+        if (stream.state != .connected) return;
+        const consumed = stream.received_bytes -% stream.credit_fwd_cnt_sent;
+        if (consumed < host_stream_credit / 2) return;
+        self.enqueueHostPacket(stream, op_credit_update, "") catch {};
     }
 
     pub fn flushHostStreamOutbound(self: *Vsock) !bool {
@@ -805,9 +869,16 @@ pub const Vsock = struct {
     fn flushHostStreamOutboundFor(self: *Vsock, stream: *HostStream) !bool {
         if (stream.state != .connected) return false;
         var did_work = false;
+        if (!stream.request_sent) {
+            if (stream.request_len > stream.txWindowFree()) return did_work;
+            if (self.pending_len >= self.pending.len) return did_work;
+            try self.enqueueHostPacket(stream, op_rw, stream.request[0..stream.request_len]);
+            stream.request_sent = true;
+            did_work = true;
+        }
         while (self.pending_len < self.pending.len) {
             var payload_buf: [max_payload]u8 = undefined;
-            const payload = stream.dequeueOutbound(&payload_buf) orelse break;
+            const payload = stream.dequeueOutboundWithin(&payload_buf, stream.txWindowFree()) orelse break;
             try self.enqueueHostPacket(stream, op_rw, payload);
             did_work = true;
         }
@@ -829,12 +900,47 @@ pub const Vsock = struct {
         while (self.pending_len > 0) {
             const maybe_chain = rx.popAvail(ram) catch return did_work;
             const chain = maybe_chain orelse break;
-            const packet = self.pending[0];
-            const written = writePacketToChain(&chain, packet.header, packet.data[0..packet.data_len]) orelse 0;
+            const packet = &self.pending[0];
+            const capacity = chainWritableCapacity(&chain);
+            // Stream data (op_rw) carries no per-packet boundaries, so a
+            // payload larger than the guest buffer is legally delivered as
+            // multiple smaller packets. Other packets must fit whole, and a
+            // split fragment must make at least one byte of progress.
+            const take = @min(packet.data_len, capacity -| header_len);
+            const deliverable = capacity >= header_len and
+                (take == packet.data_len or (packet.header.op == op_rw and take > 0));
+            if (!deliverable) {
+                // The guest posted a buffer too small for this packet.
+                // Consume the undersized buffer but keep the packet pending;
+                // dropping it would corrupt the stream. Progress is bounded
+                // by the guest's available ring.
+                chain.markWritableDirty(ram);
+                rx.pushUsed(ram, chain.head, 0) catch return did_work;
+                did_work = true;
+                continue;
+            }
+            var fragment_header = packet.header;
+            fragment_header.len = @intCast(take);
+            const written = writePacketToChain(&chain, fragment_header, packet.data[0..take]) orelse {
+                // Capacity was verified above, so this is unreachable; if it
+                // ever fires, keep the packet pending rather than dropping
+                // stream data.
+                chain.markWritableDirty(ram);
+                rx.pushUsed(ram, chain.head, 0) catch return did_work;
+                did_work = true;
+                continue;
+            };
             chain.markWritableDirty(ram);
             rx.pushUsed(ram, chain.head, written) catch return did_work;
-            self.recordHostDelivery(packet.header);
-            self.dropFirstPending();
+            if (take < packet.data_len) {
+                const rest = packet.data_len - take;
+                std.mem.copyForwards(u8, packet.data[0..rest], packet.data[take..packet.data_len]);
+                packet.data_len = rest;
+                packet.header.len = @intCast(rest);
+            } else {
+                self.recordHostDelivery(packet.header);
+                self.dropFirstPending();
+            }
             did_work = true;
         }
         return did_work;
@@ -860,6 +966,14 @@ pub const Vsock = struct {
         self.pending_len -= 1;
     }
 };
+
+fn chainWritableCapacity(chain: *const queue.Chain) usize {
+    var n: usize = 0;
+    for (chain.segments.slice()) |seg| {
+        if (seg.writable) n += seg.data.len;
+    }
+    return n;
+}
 
 fn parsePacketFromChain(chain: *const queue.Chain) ?Packet {
     var buf: [header_len]u8 = undefined;
@@ -1142,7 +1256,7 @@ test "host stream queues stdin v1 frames with offsets" {
     try std.testing.expect(try stream.enqueueStdinCloseBlocking(&stop));
 
     var payload_buf: [max_payload]u8 = undefined;
-    const data_frame = stream.dequeueOutbound(&payload_buf).?;
+    const data_frame = stream.dequeueOutboundWithin(&payload_buf, max_payload).?;
     var header_buf: [spore_stream.header_len]u8 = undefined;
     @memcpy(&header_buf, data_frame[0..spore_stream.header_len]);
     const data_header = try spore_stream.readHeader(&header_buf);
@@ -1151,14 +1265,14 @@ test "host stream queues stdin v1 frames with offsets" {
     try std.testing.expectEqual(@as(u64, 0), data_header.offset);
     try std.testing.expectEqualStrings("hi", data_frame[spore_stream.header_len..]);
 
-    const close_frame = stream.dequeueOutbound(&payload_buf).?;
+    const close_frame = stream.dequeueOutboundWithin(&payload_buf, max_payload).?;
     @memcpy(&header_buf, close_frame[0..spore_stream.header_len]);
     const close_header = try spore_stream.readHeader(&header_buf);
     try std.testing.expectEqual(spore_stream.FrameType.close, close_header.frame_type);
     try std.testing.expectEqual(spore_stream.StreamId.stdin, close_header.stream_id);
     try std.testing.expectEqual(@as(u64, 2), close_header.offset);
     try std.testing.expectEqual(@as(u32, 0), close_header.payload_len);
-    try std.testing.expect(stream.dequeueOutbound(&payload_buf) == null);
+    try std.testing.expect(stream.dequeueOutboundWithin(&payload_buf, max_payload) == null);
 }
 
 test "host stream queues terminal v1 frames and resize" {
@@ -1169,7 +1283,7 @@ test "host stream queues terminal v1 frames and resize" {
     try std.testing.expect(try stream.enqueueTerminalCloseBlocking(&stop));
 
     var payload_buf: [max_payload]u8 = undefined;
-    const data_frame = stream.dequeueOutbound(&payload_buf).?;
+    const data_frame = stream.dequeueOutboundWithin(&payload_buf, max_payload).?;
     var header_buf: [spore_stream.header_len]u8 = undefined;
     @memcpy(&header_buf, data_frame[0..spore_stream.header_len]);
     const data_header = try spore_stream.readHeader(&header_buf);
@@ -1178,7 +1292,7 @@ test "host stream queues terminal v1 frames and resize" {
     try std.testing.expectEqual(@as(u64, 0), data_header.offset);
     try std.testing.expectEqualStrings("ab", data_frame[spore_stream.header_len..]);
 
-    const resize_frame = stream.dequeueOutbound(&payload_buf).?;
+    const resize_frame = stream.dequeueOutboundWithin(&payload_buf, max_payload).?;
     @memcpy(&header_buf, resize_frame[0..spore_stream.header_len]);
     const resize_header = try spore_stream.readHeader(&header_buf);
     try std.testing.expectEqual(spore_stream.FrameType.resize, resize_header.frame_type);
@@ -1187,13 +1301,13 @@ test "host stream queues terminal v1 frames and resize" {
     try std.testing.expectEqual(@as(u16, 40), resize.rows);
     try std.testing.expectEqual(@as(u16, 120), resize.cols);
 
-    const close_frame = stream.dequeueOutbound(&payload_buf).?;
+    const close_frame = stream.dequeueOutboundWithin(&payload_buf, max_payload).?;
     @memcpy(&header_buf, close_frame[0..spore_stream.header_len]);
     const close_header = try spore_stream.readHeader(&header_buf);
     try std.testing.expectEqual(spore_stream.FrameType.close, close_header.frame_type);
     try std.testing.expectEqual(spore_stream.StreamId.terminal, close_header.stream_id);
     try std.testing.expectEqual(@as(u64, 2), close_header.offset);
-    try std.testing.expect(stream.dequeueOutbound(&payload_buf) == null);
+    try std.testing.expect(stream.dequeueOutboundWithin(&payload_buf, max_payload) == null);
 }
 
 test "host stream connects, sends request, and parses streamed frames" {
@@ -1276,6 +1390,7 @@ test "host stream connects, sends request, and parses streamed frames" {
         .len = 0,
         .packet_type = packet_type_stream,
         .op = op_response,
+        .buf_alloc = 64 * 1024,
     });
     @memcpy(buf[tx_buf_response..][0..header_len], &response);
     try setDesc(ram, tx_desc, 1, tx_buf_response, header_len, 0);
@@ -1345,6 +1460,266 @@ test "host stream connects, sends request, and parses streamed frames" {
     try std.testing.expectEqual(@as(i32, 7), stream.exit_code.?);
     try std.testing.expectEqualStrings("hello\n", capture.stdout[0..capture.stdout_len]);
     try std.testing.expectEqualStrings("err\n", capture.stderr[0..capture.stderr_len]);
+}
+
+test "rx delivery splits stream data across small guest buffers" {
+    var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
+    var t = mmio.Transport.init(dev.device());
+    var buf: [32 * 1024]u8 = [_]u8{0} ** (32 * 1024);
+    const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
+
+    const rx_desc = 0x000;
+    const rx_avail = 0x400;
+    const rx_used = 0x800;
+    const rx_bufs = 0x2000;
+    // Each guest receive buffer only has room for the packet header plus 100
+    // payload bytes, mirroring guests whose receive buffers are smaller than
+    // one full host frame.
+    const rx_buf_len: u32 = header_len + 100;
+
+    configureQueue(&t, rx_queue, rx_desc, rx_avail, rx_used, ram);
+
+    var stream = try HostStream.init(10700, "{}\n");
+    stream.state = .connected;
+    dev.host_stream = &stream;
+
+    var payload: [250]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+    try dev.enqueueHostPacket(&stream, op_rw, &payload);
+
+    var i: u16 = 0;
+    while (i < 3) : (i += 1) {
+        try setDesc(ram, rx_desc, i, rx_bufs + @as(u64, i) * 0x200, rx_buf_len, 2); // VIRTQ_DESC_F_WRITE
+        try pushAvail(ram, rx_avail, 8, i);
+    }
+    try std.testing.expect(t.write(0x050, rx_queue, ram));
+
+    // All three buffers hold one op_rw fragment each; nothing is dropped.
+    try std.testing.expectEqual(@as(u16, 3), try ram.read(u16, rx_used + 2));
+
+    var received: [250]u8 = undefined;
+    var received_len: usize = 0;
+    i = 0;
+    while (i < 3) : (i += 1) {
+        const base = rx_bufs + @as(u64, i) * 0x200;
+        const fragment = parseHeader(buf[base..][0..header_len]);
+        try std.testing.expectEqual(op_rw, fragment.op);
+        try std.testing.expectEqual(host_cid, fragment.src_cid);
+        try std.testing.expectEqual(default_guest_cid, fragment.dst_cid);
+        const fragment_len: usize = @intCast(fragment.len);
+        try std.testing.expect(fragment_len > 0);
+        try std.testing.expect(received_len + fragment_len <= payload.len);
+        @memcpy(received[received_len..][0..fragment_len], buf[base + header_len ..][0..fragment_len]);
+        received_len += fragment_len;
+    }
+    try std.testing.expectEqual(payload.len, received_len);
+    try std.testing.expectEqualSlices(u8, &payload, &received);
+    try std.testing.expectEqual(@as(usize, 0), dev.pending_len);
+}
+
+test "rx delivery makes no empty fragments for header-only guest buffers" {
+    var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
+    var t = mmio.Transport.init(dev.device());
+    var buf: [32 * 1024]u8 = [_]u8{0} ** (32 * 1024);
+    const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
+
+    const rx_desc = 0x000;
+    const rx_avail = 0x400;
+    const rx_used = 0x800;
+    const rx_buf_tiny = 0x2000;
+    const rx_buf_ok = 0x2200;
+
+    configureQueue(&t, rx_queue, rx_desc, rx_avail, rx_used, ram);
+
+    var stream = try HostStream.init(10700, "{}\n");
+    stream.state = .connected;
+    dev.host_stream = &stream;
+
+    try dev.enqueueHostPacket(&stream, op_rw, "hello");
+
+    // A buffer holding exactly the packet header would only fit an empty
+    // fragment; the packet must stay pending until a useful buffer arrives.
+    try setDesc(ram, rx_desc, 0, rx_buf_tiny, header_len, 2); // VIRTQ_DESC_F_WRITE
+    try pushAvail(ram, rx_avail, 8, 0);
+    try setDesc(ram, rx_desc, 1, rx_buf_ok, header_len + 5, 2); // VIRTQ_DESC_F_WRITE
+    try pushAvail(ram, rx_avail, 8, 1);
+    try std.testing.expect(t.write(0x050, rx_queue, ram));
+
+    try std.testing.expectEqual(@as(u16, 2), try ram.read(u16, rx_used + 2));
+    const delivered = parseHeader(buf[rx_buf_ok..][0..header_len]);
+    try std.testing.expectEqual(op_rw, delivered.op);
+    try std.testing.expectEqual(@as(u32, 5), delivered.len);
+    try std.testing.expectEqualStrings("hello", buf[rx_buf_ok + header_len ..][0..5]);
+    try std.testing.expectEqual(@as(usize, 0), dev.pending_len);
+}
+
+test "rx delivery keeps packets pending when a guest buffer cannot hold the header" {
+    var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
+    var t = mmio.Transport.init(dev.device());
+    var buf: [32 * 1024]u8 = [_]u8{0} ** (32 * 1024);
+    const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
+
+    const rx_desc = 0x000;
+    const rx_avail = 0x400;
+    const rx_used = 0x800;
+    const rx_buf_small = 0x2000;
+    const rx_buf_ok = 0x2200;
+
+    configureQueue(&t, rx_queue, rx_desc, rx_avail, rx_used, ram);
+
+    var stream = try HostStream.init(10700, "{}\n");
+    stream.state = .connected;
+    dev.host_stream = &stream;
+
+    try dev.enqueueHostPacket(&stream, op_rw, "hello");
+
+    // First buffer cannot even hold the 44-byte packet header; the packet must
+    // survive and land in the next adequate buffer.
+    try setDesc(ram, rx_desc, 0, rx_buf_small, header_len - 1, 2); // VIRTQ_DESC_F_WRITE
+    try pushAvail(ram, rx_avail, 8, 0);
+    try setDesc(ram, rx_desc, 1, rx_buf_ok, header_len + 5, 2); // VIRTQ_DESC_F_WRITE
+    try pushAvail(ram, rx_avail, 8, 1);
+    try std.testing.expect(t.write(0x050, rx_queue, ram));
+
+    try std.testing.expectEqual(@as(u16, 2), try ram.read(u16, rx_used + 2));
+    const delivered = parseHeader(buf[rx_buf_ok..][0..header_len]);
+    try std.testing.expectEqual(op_rw, delivered.op);
+    try std.testing.expectEqual(@as(u32, 5), delivered.len);
+    try std.testing.expectEqualStrings("hello", buf[rx_buf_ok + header_len ..][0..5]);
+    try std.testing.expectEqual(@as(usize, 0), dev.pending_len);
+}
+
+test "host proactively updates credit while consuming guest stream data" {
+    var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
+    var t = mmio.Transport.init(dev.device());
+    var buf = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(buf);
+    @memset(buf, 0);
+    const ram = guestmem.GuestRam{ .bytes = buf, .base = 0 };
+
+    const rx_desc = 0x000;
+    const rx_avail = 0x400;
+    const rx_used = 0x800;
+    const tx_desc = 0x1000;
+    const tx_avail = 0x1400;
+    const tx_used = 0x1800;
+    const rx_buf = 0x2000;
+    const tx_buf = 0x2200;
+
+    configureQueue(&t, rx_queue, rx_desc, rx_avail, rx_used, ram);
+    configureQueue(&t, tx_queue, tx_desc, tx_avail, tx_used, ram);
+
+    var stream = try HostStream.init(10700, "{}\n");
+    stream.state = .connected;
+    dev.host_stream = &stream;
+
+    // 16-byte lines the legacy frame parser consumes without failing.
+    const line = "timing 12345678\n";
+    var payload: [4096]u8 = undefined;
+    var off: usize = 0;
+    while (off < payload.len) : (off += line.len) {
+        @memcpy(payload[off..][0..line.len], line);
+    }
+
+    // The guest sends half the advertised credit without the host ever writing
+    // back; the host must volunteer a credit update or the guest stalls.
+    var header: [header_len]u8 = undefined;
+    var sent: usize = 0;
+    var head: u16 = 0;
+    while (sent < host_stream_credit / 2) : (head += 1) {
+        writeHeader(&header, .{
+            .src_cid = default_guest_cid,
+            .dst_cid = host_cid,
+            .src_port = 10700,
+            .dst_port = default_host_port,
+            .len = payload.len,
+            .packet_type = packet_type_stream,
+            .op = op_rw,
+        });
+        @memcpy(buf[tx_buf..][0..header_len], &header);
+        @memcpy(buf[tx_buf + header_len ..][0..payload.len], &payload);
+        try setDesc(ram, tx_desc, head % 8, tx_buf, header_len + payload.len, 0);
+        try pushAvail(ram, tx_avail, 8, head % 8);
+        try std.testing.expect(t.write(0x050, tx_queue, ram));
+        sent += payload.len;
+    }
+    try std.testing.expectEqual(HostStreamState.connected, stream.state);
+
+    try setDesc(ram, rx_desc, 0, rx_buf, header_len, 2); // VIRTQ_DESC_F_WRITE
+    try pushAvail(ram, rx_avail, 8, 0);
+    try std.testing.expect(t.write(0x050, rx_queue, ram));
+
+    try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, rx_used + 2));
+    const update = parseHeader(buf[rx_buf..][0..header_len]);
+    try std.testing.expectEqual(op_credit_update, update.op);
+    try std.testing.expectEqual(@as(u32, host_stream_credit), update.buf_alloc);
+    try std.testing.expectEqual(@as(u32, host_stream_credit / 2), update.fwd_cnt);
+}
+
+test "host defers stream data until the guest advertises credit" {
+    var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
+    var t = mmio.Transport.init(dev.device());
+    var buf: [32 * 1024]u8 = [_]u8{0} ** (32 * 1024);
+    const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
+
+    const rx_desc = 0x000;
+    const rx_avail = 0x400;
+    const rx_used = 0x800;
+    const tx_desc = 0x1000;
+    const tx_avail = 0x1400;
+    const tx_used = 0x1800;
+    const rx_buf = 0x2000;
+    const rx_buf_second = 0x2400;
+    const tx_buf = 0x2800;
+
+    configureQueue(&t, rx_queue, rx_desc, rx_avail, rx_used, ram);
+    configureQueue(&t, tx_queue, tx_desc, tx_avail, tx_used, ram);
+
+    var stream = try HostStream.init(10700, "{}\n");
+    stream.state = .connected;
+    stream.request_sent = true;
+    // The guest has advertised only 8 bytes of receive buffer.
+    stream.peer_buf_alloc = 8;
+    dev.host_stream = &stream;
+
+    var stop = std.atomic.Value(bool).init(false);
+    try std.testing.expect(try stream.enqueueStdinDataBlocking("hello", &stop));
+
+    try setDesc(ram, rx_desc, 0, rx_buf, 0x200, 2); // VIRTQ_DESC_F_WRITE
+    try pushAvail(ram, rx_avail, 8, 0);
+    _ = t.write(0x050, rx_queue, ram);
+    _ = try dev.flushHostStreamOutbound();
+    _ = t.write(0x050, rx_queue, ram);
+
+    // The stdin frame exceeds the guest's window, so nothing may be sent yet.
+    try std.testing.expectEqual(@as(u16, 0), try ram.read(u16, rx_used + 2));
+
+    // The guest consumes its buffer and advertises a realistic window.
+    var credit: [header_len]u8 = undefined;
+    writeHeader(&credit, .{
+        .src_cid = default_guest_cid,
+        .dst_cid = host_cid,
+        .src_port = 10700,
+        .dst_port = default_host_port,
+        .len = 0,
+        .packet_type = packet_type_stream,
+        .op = op_credit_update,
+        .buf_alloc = 64 * 1024,
+        .fwd_cnt = 0,
+    });
+    @memcpy(buf[tx_buf..][0..header_len], &credit);
+    try setDesc(ram, tx_desc, 0, tx_buf, header_len, 0);
+    try pushAvail(ram, tx_avail, 8, 0);
+    try setDesc(ram, rx_desc, 1, rx_buf_second, 0x200, 2); // VIRTQ_DESC_F_WRITE
+    try pushAvail(ram, rx_avail, 8, 1);
+    try std.testing.expect(t.write(0x050, tx_queue, ram));
+
+    try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, rx_used + 2));
+    const delivered = parseHeader(buf[rx_buf..][0..header_len]);
+    try std.testing.expectEqual(op_rw, delivered.op);
+    const frame_len = spore_stream.header_len + 5;
+    try std.testing.expectEqual(@as(u32, frame_len), delivered.len);
+    try std.testing.expectEqualStrings("hello", buf[rx_buf + header_len + spore_stream.header_len ..][0..5]);
 }
 
 test "request-derived host ports are stable dynamic ports" {
@@ -1439,6 +1814,33 @@ fn fuzzVsockTx(_: void, s: *std.testing.Smith) !void {
 
 test "fuzz vsock tx handling" {
     try std.testing.fuzz({}, fuzzVsockTx, .{});
+}
+
+fn fuzzVsockRxDelivery(_: void, s: *std.testing.Smith) !void {
+    var dev = Vsock.init(.{});
+    var t = mmio.Transport.init(dev.device());
+    var buf: [8192]u8 = [_]u8{0} ** 8192;
+    _ = s.slice(&buf);
+    const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
+    t.queues[rx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x1000, .avail_addr = 0x1200, .used_addr = 0x1400 };
+    t.queues[tx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x0000, .avail_addr = 0x0400, .used_addr = 0x0800 };
+
+    var stream = HostStream.init(10700, "{}\n") catch return;
+    stream.state = .connected;
+    dev.host_stream = &stream;
+
+    var payload: [max_payload]u8 = undefined;
+    const payload_len: usize = s.valueRangeAtMost(u16, 0, max_payload);
+    @memset(payload[0..payload_len], 0xa5);
+    dev.enqueueHostPacket(&stream, op_rw, payload[0..payload_len]) catch return;
+
+    // Guest-controlled descriptor layouts drive the RX split path.
+    _ = t.write(0x050, rx_queue, ram);
+    _ = t.write(0x050, rx_queue, ram);
+}
+
+test "fuzz vsock rx delivery splitting" {
+    try std.testing.fuzz({}, fuzzVsockRxDelivery, .{});
 }
 
 fn fuzzHostStreamFrames(_: void, s: *std.testing.Smith) !void {
