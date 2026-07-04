@@ -157,4 +157,43 @@ grep -Fq "requires stdout to be a terminal" "${tty_stderr}" || {
   die "spore exec -t did not explain the terminal policy failure"
 }
 
+# Bulk exec stdio: over 1MiB must round-trip byte-exact through interactive
+# exec stdin and streamed exec stdout. Historically the SPIO transport broke
+# above one vsock packet, so tiny fixtures cannot cover this path.
+bulk_bytes=$((1536 * 1024))
+head -c "${bulk_bytes}" /dev/urandom >"${workdir}/bulk.bin"
+
+env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" exec -i "${vm_name}" -- /bin/sh -c 'cat > /tmp/spore-exec-bulk.bin' \
+  <"${workdir}/bulk.bin" || {
+  failed=1
+  die "bulk exec stdin transfer failed"
+}
+env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" exec -i "${vm_name}" -- /bin/cat /tmp/spore-exec-bulk.bin \
+  </dev/null >"${workdir}/bulk-stdout.bin" || {
+  failed=1
+  die "bulk exec stdout transfer failed"
+}
+cmp -s "${workdir}/bulk.bin" "${workdir}/bulk-stdout.bin" || {
+  failed=1
+  die "bulk exec stdio roundtrip mismatch"
+}
+
+# A deliberately failed stream must leave the VM usable: kill the CLI mid
+# bulk stdin transfer, then require a follow-up exec to succeed.
+( exec env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+    "${spore_bin}" exec -i "${vm_name}" -- /bin/sh -c 'cat > /dev/null' \
+    < <(head -c $((64 * 1024 * 1024)) /dev/zero) ) &
+failed_stream_pid=$!
+sleep 1
+kill -KILL "${failed_stream_pid}" 2>/dev/null || true
+wait "${failed_stream_pid}" 2>/dev/null || true
+after_failed_stream="$(env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" exec "${vm_name}" -- /bin/sh -c 'echo usable')"
+[[ "${after_failed_stream}" == "usable" ]] || {
+  failed=1
+  die "VM unusable after deliberately failed stream"
+}
+
 echo "smoke:lifecycle-tty ok"

@@ -365,6 +365,7 @@ const ExecServer = struct {
                     } else {
                         try self.storeErrorLocked("guest vsock stream failed");
                     }
+                    dev.resetHostStream();
                     self.state = .done;
                     self.cond.broadcast(self.io);
                 },
@@ -375,6 +376,7 @@ const ExecServer = struct {
                         } else {
                             try self.storeErrorLocked("guest exec missing exit code");
                         }
+                        dev.resetHostStream();
                         self.state = .done;
                         self.cond.broadcast(self.io);
                         return .keep_running;
@@ -384,6 +386,7 @@ const ExecServer = struct {
                     } else {
                         try self.storeExecResultLocked(exit_code);
                     }
+                    dev.resetHostStream();
                     self.state = .done;
                     self.cond.broadcast(self.io);
                 },
@@ -394,6 +397,7 @@ const ExecServer = struct {
                         } else {
                             try self.storeErrorLocked("guest exec timed out");
                         }
+                        dev.resetHostStream();
                         self.state = .done;
                         self.cond.broadcast(self.io);
                     }
@@ -417,6 +421,7 @@ const ExecServer = struct {
         self.active_stream_protocol = .legacy_text;
         self.active_streaming_exec = false;
         self.streaming_client_fd = -1;
+        self.streaming_write_failed = false;
         if (self.network_events) |events| events.clearEvents();
         self.state = .pending_exec;
         if (self.wake) |wake| wake.wake();

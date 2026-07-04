@@ -3914,9 +3914,10 @@ const ExecStreamPump = struct {
     fn run(self: *ExecStreamPump) !u8 {
         while (true) {
             try self.maybeSendResize();
+            const poll_stdin = self.interactive and !self.stdin_closed;
             var fds = [_]std.posix.pollfd{
                 .{ .fd = self.stream.stream.socket.handle, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
-                .{ .fd = if (self.interactive) self.input_fd else -1, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
+                .{ .fd = if (poll_stdin) self.input_fd else -1, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
             };
             const ready = std.posix.poll(&fds, 100) catch return error.MonitorUnavailable;
             if (ready == 0) continue;
@@ -3928,10 +3929,16 @@ const ExecStreamPump = struct {
             if (!read_control_frame and (fds[0].revents & (std.c.POLL.HUP | std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) {
                 return error.MonitorUnavailable;
             }
-            if (self.interactive and (fds[1].revents & (std.c.POLL.IN | std.c.POLL.HUP)) != 0) {
+            if (poll_stdin and (fds[1].revents & (std.c.POLL.IN | std.c.POLL.HUP)) != 0) {
                 try self.forwardStdin();
             }
-            if (self.interactive and (fds[1].revents & (std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) return error.MonitorUnavailable;
+            if (poll_stdin and !self.stdin_closed and (fds[1].revents & (std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) {
+                // macOS poll() reports POLLNVAL for some device files such as
+                // /dev/null. An unpollable or errored stdin means no more
+                // input will arrive; close the input stream and keep pumping
+                // output instead of failing the exec.
+                try self.closeInput();
+            }
         }
     }
 
@@ -3956,6 +3963,16 @@ const ExecStreamPump = struct {
         }
     }
 
+    fn closeInput(self: *ExecStreamPump) !void {
+        if (self.stdin_closed) return;
+        if (self.tty) {
+            try self.stream.closeTerminal();
+        } else {
+            try self.stream.closeStdin();
+        }
+        self.stdin_closed = true;
+    }
+
     fn forwardStdin(self: *ExecStreamPump) !void {
         if (self.stdin_closed) return;
         var buf: [4096]u8 = undefined;
@@ -3963,19 +3980,14 @@ const ExecStreamPump = struct {
         if (n < 0) {
             switch (std.c.errno(n)) {
                 .INTR => return,
-                else => return error.MonitorUnavailable,
+                else => return try self.closeInput(),
             }
         }
-        const input_stream: spore_stream.StreamId = if (self.tty) .terminal else .stdin;
         if (n == 0) {
-            switch (input_stream) {
-                .stdin => try self.stream.closeStdin(),
-                .terminal => try self.stream.closeTerminal(),
-                else => unreachable,
-            }
-            self.stdin_closed = true;
+            try self.closeInput();
             return;
         }
+        const input_stream: spore_stream.StreamId = if (self.tty) .terminal else .stdin;
         switch (input_stream) {
             .stdin => try self.stream.writeStdin(buf[0..@intCast(n)]),
             .terminal => try self.stream.writeTerminal(buf[0..@intCast(n)]),
