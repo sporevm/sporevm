@@ -22,11 +22,10 @@ pub const Options = struct {
 
 const cli_usage =
     \\Usage:
-    \\  spore fanout [--backend auto|hvf|kvm] [--parallel] [--for DURATION] <children-dir>
+    \\  spore fanout [--backend auto|hvf|kvm] [--for DURATION] <children-dir>
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
-    \\  --parallel              Resume all child spores concurrently (default)
     \\  --for DURATION          Stop resumed children after DURATION, e.g. 10s, 500ms, 1m
     \\  --timeout-ms N          Per-child resume probe timeout in milliseconds (default: 30000)
     \\  --bind-service NAME=unix:/path.sock
@@ -62,7 +61,7 @@ const OutputLock = struct {
 };
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (args.len == 0 or std.mem.eql(u8, args[0], "help") or std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help")) {
+    if (args.len == 0 or wantsHelp(args)) {
         try stdout.writeAll(cli_usage);
         return;
     }
@@ -462,12 +461,30 @@ fn failCli(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
+fn wantsHelp(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "help") or
+            std.mem.eql(u8, arg, "-h") or
+            std.mem.eql(u8, arg, "--help"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 test "fanout cli parser accepts requested demo shape" {
     const opts = try parseCliArgs(&.{ "children", "--parallel", "--for", "10s", "--backend", "hvf", "--timeout-ms", "120000" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
     try std.testing.expectEqualStrings("children", opts.children_dir);
     try std.testing.expectEqual(@as(?u64, 10_000), opts.duration_ms);
     try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
+}
+
+test "fanout cli help accepts help after options" {
+    try std.testing.expect(wantsHelp(&.{"--help"}));
+    try std.testing.expect(wantsHelp(&.{ "children", "--for", "10s", "--help" }));
+    try std.testing.expect(!wantsHelp(&.{"children"}));
 }
 
 test "fanout cli parser accepts bound service bindings" {

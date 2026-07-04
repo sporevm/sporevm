@@ -5,7 +5,7 @@ with prefixed output:
 
 ```bash
 spore fork warm.spore --count 5 --out children/
-spore fanout children/ --parallel
+spore fanout children/
 ```
 
 Children are named `000000` through zero-padded `N-1` and share the parent's
@@ -31,7 +31,7 @@ If the parent manifest declares bound services, fan-out supplies one fresh host
 socket binding per service and applies the same binding to every child:
 
 ```bash
-spore fanout children/ --parallel \
+spore fanout children/ \
   --bind-service metadata=unix:/tmp/metadata.sock
 ```
 

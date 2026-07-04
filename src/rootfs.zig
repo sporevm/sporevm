@@ -37,6 +37,7 @@ pub const usage =
     \\  import-oci <layout-dir|layout.tar> --ref local/name:tag
     \\  resolve <image:tag>
     \\  cas-preload <blake3:digest> [--chunk-size BYTES] [--attach-spore DIR]
+    \\      Repair/debug path for exact-rootfs spores
     \\
     \\Options:
     \\  --platform <os/arch>       Target platform (default: linux/arm64)

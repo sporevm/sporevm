@@ -26,6 +26,8 @@ const monitor_usage =
     \\Usage:
     \\  spore monitor NAME [options]
     \\
+    \\Internal helper for named VM lifecycle monitors.
+    \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --kernel Image          Kernel Image path
