@@ -448,9 +448,9 @@ fn failCli(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 fn wantsHelp(args: []const []const u8) bool {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
     for (args) |arg| {
-        if (std.mem.eql(u8, arg, "help") or
-            std.mem.eql(u8, arg, "-h") or
+        if (std.mem.eql(u8, arg, "-h") or
             std.mem.eql(u8, arg, "--help"))
         {
             return true;
@@ -476,6 +476,7 @@ test "fanout cli help accepts help after options" {
     try std.testing.expect(wantsHelp(&.{"--help"}));
     try std.testing.expect(wantsHelp(&.{ "children", "--for", "10s", "--help" }));
     try std.testing.expect(!wantsHelp(&.{"children"}));
+    try std.testing.expect(!wantsHelp(&.{ "help", "--for", "10s" }));
 }
 
 test "fanout cli parser accepts bound service bindings" {

@@ -483,16 +483,16 @@ fn wantsNamedResume(args: []const []const u8) bool {
 }
 
 fn wantsCommandHelp(args: []const []const u8) bool {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--")) return false;
-        if (isHelpArg(arg)) return true;
+        if (isHelpFlag(arg)) return true;
     }
     return false;
 }
 
-fn isHelpArg(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "help") or
-        std.mem.eql(u8, arg, "-h") or
+fn isHelpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-h") or
         std.mem.eql(u8, arg, "--help");
 }
 
@@ -1002,6 +1002,7 @@ test "command help accepts standard help spellings" {
     try std.testing.expect(wantsCommandHelp(&.{"help"}));
     try std.testing.expect(wantsCommandHelp(&.{ "base.spore", "--help" }));
     try std.testing.expect(!wantsCommandHelp(&.{}));
+    try std.testing.expect(!wantsCommandHelp(&.{ "help", "--out", "bundle" }));
     try std.testing.expect(!wantsCommandHelp(&.{ "--", "--help" }));
 }
 

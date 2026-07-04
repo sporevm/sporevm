@@ -184,9 +184,9 @@ fn casPreload(init: std.process.Init, args: []const []const u8, stdout: *Io.Writ
 }
 
 fn wantsHelp(args: []const []const u8) bool {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
     for (args) |arg| {
-        if (std.mem.eql(u8, arg, "help") or
-            std.mem.eql(u8, arg, "-h") or
+        if (std.mem.eql(u8, arg, "-h") or
             std.mem.eql(u8, arg, "--help"))
         {
             return true;
@@ -205,6 +205,7 @@ test "rootfs cli help accepts standard help spellings" {
     try std.testing.expect(wantsHelp(&.{"help"}));
     try std.testing.expect(!wantsHelp(&.{}));
     try std.testing.expect(wantsHelp(&.{ "registry.example/repo:latest", "--help" }));
+    try std.testing.expect(!wantsHelp(&.{ "help", "--output", "rootfs.ext4" }));
     try std.testing.expect(wantsTopLevelHelp(&.{"--help"}));
     try std.testing.expect(!wantsTopLevelHelp(&.{ "build", "--help" }));
     try std.testing.expect(std.mem.indexOf(u8, rootfs_mod.usage, "cas-preload") == null);

@@ -4745,10 +4745,10 @@ pub fn monotonicMs() u64 {
 }
 
 fn wantsHelp(args: []const []const u8) bool {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--")) return false;
-        if (std.mem.eql(u8, arg, "help") or
-            std.mem.eql(u8, arg, "-h") or
+        if (std.mem.eql(u8, arg, "-h") or
             std.mem.eql(u8, arg, "--help"))
         {
             return true;
@@ -5176,6 +5176,7 @@ test "lifecycle fork help routes through named fork cli" {
     try std.testing.expect(wantsNamedFork(&.{"-h"}));
     try std.testing.expect(wantsNamedFork(&.{"help"}));
     try std.testing.expect(wantsHelp(&.{ "bench-1", "--help" }));
+    try std.testing.expect(!wantsHelp(&.{ "help", "--image", "alpine" }));
     try std.testing.expect(!wantsHelp(&.{ "bench-1", "--", "/bin/true", "--help" }));
     try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fork <spore-dir> --count N --out DIR") != null);
     try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fork --vm NAME --count N --name PATTERN") != null);

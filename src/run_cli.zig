@@ -204,10 +204,10 @@ fn runtimeDebugEnabled(args: []const []const u8) bool {
 }
 
 fn wantsHelp(args: []const []const u8) bool {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--")) return false;
-        if (std.mem.eql(u8, arg, "help") or
-            std.mem.eql(u8, arg, "-h") or
+        if (std.mem.eql(u8, arg, "-h") or
             std.mem.eql(u8, arg, "--help"))
         {
             return true;
@@ -219,5 +219,6 @@ fn wantsHelp(args: []const []const u8) bool {
 test "run cli help accepts help before argv delimiter only" {
     try std.testing.expect(wantsHelp(&.{"--help"}));
     try std.testing.expect(wantsHelp(&.{ "--image", "alpine", "--help" }));
+    try std.testing.expect(!wantsHelp(&.{ "help", "--image", "alpine" }));
     try std.testing.expect(!wantsHelp(&.{ "--", "/bin/true", "--help" }));
 }
