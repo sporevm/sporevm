@@ -5,6 +5,7 @@ const Io = std.Io;
 
 const fd_util = @import("fd.zig");
 const run_mod = @import("run.zig");
+const spore_net_policy = @import("spore_net_policy.zig");
 
 pub const Backend = run_mod.Backend;
 const max_pending_line_bytes = 64 * 1024;
@@ -15,6 +16,7 @@ pub const Options = struct {
     children_dir: []const u8,
     duration_ms: ?u64 = null,
     timeout_ms: u64 = default_resume_timeout_ms,
+    bound_services: run_mod.BoundServiceBindingList = .{},
 };
 
 const cli_usage =
@@ -26,6 +28,8 @@ const cli_usage =
     \\  --parallel              Resume all child spores concurrently (default)
     \\  --for DURATION          Stop resumed children after DURATION, e.g. 10s, 500ms, 1m
     \\  --timeout-ms N          Per-child resume probe timeout in milliseconds (default: 30000)
+    \\  --bind-service NAME=unix:/path.sock
+    \\                          Bind a manifest-declared service in every child
     \\  -h, --help              Show this help
     \\
 ;
@@ -71,6 +75,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var children_dir: ?[]const u8 = null;
     var duration_ms: ?u64 = null;
     var timeout_ms: u64 = default_resume_timeout_ms;
+    var bound_services = run_mod.BoundServiceBindingList{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -92,6 +97,13 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             timeout_ms = parsePositiveInteger(args[i]) catch {
                 failCli("--timeout-ms must be a positive integer", .{});
             };
+        } else if (std.mem.eql(u8, args[i], "--bind-service") and i + 1 < args.len) {
+            i += 1;
+            bound_services.append(spore_net_policy.parseBoundServiceBinding(args[i]) catch |err| {
+                failCli("spore fanout: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
+            }) catch |err| {
+                failCli("spore fanout: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
+            };
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             failCli("unknown fanout argument: {s}\n\n{s}", .{ args[i], cli_usage });
         } else if (children_dir == null) {
@@ -108,6 +120,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         },
         .duration_ms = duration_ms,
         .timeout_ms = timeout_ms,
+        .bound_services = bound_services,
     };
 }
 
@@ -127,7 +140,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     errdefer cleanupRunning(init.io, running.items);
 
     for (children) |child| {
-        const run = try startRunningChild(init, allocator, argv0, opts.backend, opts.timeout_ms, child, &output_lock);
+        const run = try startRunningChild(init, allocator, argv0, opts.backend, opts.timeout_ms, opts.bound_services.slice(), child, &output_lock);
         running.append(run) catch |err| {
             var single = [_]RunningChild{run};
             cleanupRunning(init.io, single[0..]);
@@ -170,13 +183,24 @@ fn spawnResume(
     argv0: []const u8,
     backend: Backend,
     timeout_ms: u64,
+    bound_services: []const spore_net_policy.BoundServiceBinding,
     spore_dir: []const u8,
 ) !std.process.Child {
     const backend_arg = @tagName(backend);
     const timeout_arg = try std.fmt.allocPrint(allocator, "{d}", .{timeout_ms});
-    const argv = try allocator.dupe([]const u8, &.{ argv0, "resume", "--backend", backend_arg, "--timeout-ms", timeout_arg, spore_dir });
+    var argv = std.array_list.Managed([]const u8).init(allocator);
+    try argv.appendSlice(&.{ argv0, "resume", "--backend", backend_arg, "--timeout-ms", timeout_arg });
+    for (bound_services) |binding| {
+        const unix_path = switch (binding.target) {
+            .unix => |path| path,
+            .tcp => return error.UnsupportedBoundServiceTarget,
+        };
+        try argv.append("--bind-service");
+        try argv.append(try std.fmt.allocPrint(allocator, "{s}=unix:{s}", .{ binding.name, unix_path }));
+    }
+    try argv.append(spore_dir);
     return std.process.spawn(init.io, .{
-        .argv = argv,
+        .argv = argv.items,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -189,10 +213,11 @@ fn startRunningChild(
     argv0: []const u8,
     backend: Backend,
     timeout_ms: u64,
+    bound_services: []const spore_net_policy.BoundServiceBinding,
     child: ChildSpec,
     output_lock: *OutputLock,
 ) !RunningChild {
-    var proc = try spawnResume(init, allocator, argv0, backend, timeout_ms, child.path);
+    var proc = try spawnResume(init, allocator, argv0, backend, timeout_ms, bound_services, child.path);
     const stdout_fd = proc.stdout.?.handle;
     const stderr_fd = proc.stderr.?.handle;
     proc.stdout = null;
@@ -411,6 +436,14 @@ test "fanout cli parser accepts requested demo shape" {
     try std.testing.expectEqualStrings("children", opts.children_dir);
     try std.testing.expectEqual(@as(?u64, 10_000), opts.duration_ms);
     try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
+}
+
+test "fanout cli parser accepts bound service bindings" {
+    const opts = try parseCliArgs(&.{ "children", "--bind-service", "metadata=unix:/tmp/metadata.sock" });
+    try std.testing.expectEqualStrings("children", opts.children_dir);
+    try std.testing.expectEqual(@as(usize, 1), opts.bound_services.len);
+    try std.testing.expectEqualStrings("metadata", opts.bound_services.items[0].name);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.bound_services.items[0].target.unix);
 }
 
 test "fanout duration parser accepts common suffixes" {

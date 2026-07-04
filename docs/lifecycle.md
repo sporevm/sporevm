@@ -38,6 +38,64 @@ guest terminal for the exec. The usual shell spelling is:
 spore exec -it bench-1 -- /bin/sh
 ```
 
+Named create exposes the same create-time annotation and networking options as
+the lifecycle library:
+
+```bash
+spore create bench-1 \
+  --image docker.io/library/alpine:3.20 \
+  --annotation cleanroom.stage=compile \
+  --net \
+  --allow-host-port github.com:443 \
+  --bind-service metadata:8170=unix:/tmp/metadata.sock
+```
+
+`--annotation KEY=VALUE` can be repeated. `--allow-host-port HOST:PORT` adds an
+exact DNS-learned host plus TCP port egress rule. `--bind-service
+NAME[:PORT]=unix:/path.sock` exposes a host Unix stream socket to the guest as
+`NAME.spore.internal`, defaulting to port 80 when `PORT` is omitted. Host socket
+paths are live monitor state only; captured manifests record the service name,
+guest host, and guest port as restore-time requirements.
+
+Tooling can provide the same create options as JSON:
+
+```bash
+spore create bench-1 --options @create-options.json
+```
+
+```json
+{
+  "schema_version": 1,
+  "image": "docker.io/library/alpine:3.20",
+  "memory": "512mb",
+  "vcpus": 2,
+  "timeout_ms": 120000,
+  "network": {
+    "enabled": true,
+    "allow_cidrs": ["93.184.216.34/32"],
+    "allow_hosts": ["example.com"],
+    "network_rules": [{ "host": "github.com", "ports": [443] }],
+    "bound_services": [
+      {
+        "name": "metadata",
+        "guest_host": "metadata.spore.internal",
+        "guest_port": 8170,
+        "unix_path": "/tmp/metadata.sock"
+      }
+    ]
+  },
+  "annotations": {
+    "cleanroom.stage": "compile"
+  }
+}
+```
+
+The file uses the same spellings as the CLI flags: `image`, `rootfs`, `kernel`,
+`initrd`, `pull`, and `memory`. Unknown fields fail closed, `schema_version`
+must be `1`, and `--options` cannot be combined with individual create option
+flags. Bound services default `guest_host` to `NAME.spore.internal` when it is
+omitted.
+
 Named VMs also support explicit path transfer through the same local
 monitor boundary:
 
@@ -104,6 +162,21 @@ handles, and there is still no public `spore attach` command.
 ## Checkpoints And Forks
 
 `spore suspend NAME --out DIR` consumes the named VM and writes a spore.
+Repeated `--annotation KEY=VALUE` flags merge capture-time annotations into the
+manifest without dropping create-time annotations:
+
+```bash
+spore suspend bench-1 --out bench-1.spore --annotation captured=true
+```
+
+If a captured manifest declares bound services, named resume requires fresh host
+socket bindings:
+
+```bash
+spore resume bench-1.spore --name bench-2 \
+  --bind-service metadata=unix:/tmp/fresh-metadata.sock
+```
+
 `spore snapshot` is not a public command; live named fork uses an internal
 snapshot-and-continue monitor action so the source VM keeps running:
 

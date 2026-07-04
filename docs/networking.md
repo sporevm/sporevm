@@ -63,7 +63,20 @@ socket as guest-controlled.
 
 Captured manifests record bound-service requirements by name, guest host, and
 guest port, but never durable host socket paths. Restore fails closed unless a
-caller supplies fresh live bindings for each declared service through libspore.
+caller supplies fresh live bindings for each declared service through libspore
+or the CLI:
+
+```bash
+spore resume net-enabled.spore \
+  --bind-service metadata=unix:/tmp/fresh-metadata.sock
+spore run --from net-enabled.spore \
+  --bind-service metadata=unix:/tmp/fresh-metadata.sock
+spore fanout children/ \
+  --bind-service metadata=unix:/tmp/fresh-metadata.sock
+```
+
+For fan-out, the same host socket can be shared by every child in the local
+batch. The service provider owns any lineage-level multiplexing or isolation.
 
 ## Host Port Forwards
 
@@ -86,7 +99,9 @@ flows, DNS caches, helper state, host socket paths, host port forwards, or
 credentials. `spore resume` and `spore run --from` attach a fresh gateway under
 the recorded policy or fail closed.
 
-When running from a captured spore, omit `--net` and network flags:
+When running from a captured spore, omit `--net` and policy flags. Bound-service
+bindings are allowed because they satisfy already-captured policy; they do not
+change the manifest:
 
 ```bash
 spore run --from net-enabled.spore -- /bin/wget -qO- https://example.com

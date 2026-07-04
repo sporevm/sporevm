@@ -324,10 +324,18 @@ export SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
 
 spore create bench-1 --image docker.io/library/alpine:3.20
 spore exec bench-1 'echo hi'
-spore suspend bench-1 --out bench-1.spore
+spore suspend bench-1 --out bench-1.spore --annotation captured=true
 spore resume bench-1.spore --name bench-2
 spore ps
 spore rm bench-2
+```
+
+Create-time annotations and named lifecycle network policy can be passed as
+flags or through a JSON options file:
+
+```bash
+spore create bench-net \
+  --options @create-options.json
 ```
 
 Machine callers can use global `--json` for structured lifecycle state. See

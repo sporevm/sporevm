@@ -917,6 +917,8 @@ pub fn resumeSpore(
     allocator: std.mem.Allocator,
     options: ResumeOptions,
 ) !ResumeResult {
+    var bound_services = run_mod.BoundServiceBindingList{};
+    for (options.bound_services) |binding| try bound_services.append(binding);
     return resume_mod.execute(context, allocator, .{
         .backend = options.backend,
         .spore_dir = options.spore_dir,
@@ -924,7 +926,7 @@ pub fn resumeSpore(
         .timeout_ms = options.timeout_ms,
         .spore_executable = options.spore_executable,
         .debug = options.debug,
-        .bound_services = options.bound_services,
+        .bound_services = bound_services,
         .events = options.events,
     });
 }

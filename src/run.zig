@@ -191,6 +191,36 @@ pub const InjectedFileSourceList = struct {
     }
 };
 
+pub const BoundServiceArgList = struct {
+    items: [spore_net_policy.max_bound_services][]const u8 = undefined,
+    len: usize = 0,
+
+    pub fn append(self: *BoundServiceArgList, raw: []const u8) !void {
+        if (self.len >= spore_net_policy.max_bound_services) return error.TooManyBoundServices;
+        self.items[self.len] = raw;
+        self.len += 1;
+    }
+
+    pub fn slice(self: *const BoundServiceArgList) []const []const u8 {
+        return self.items[0..self.len];
+    }
+};
+
+pub const BoundServiceBindingList = struct {
+    items: [spore_net_policy.max_bound_services]spore_net_policy.BoundServiceBinding = undefined,
+    len: usize = 0,
+
+    pub fn append(self: *BoundServiceBindingList, binding: spore_net_policy.BoundServiceBinding) !void {
+        if (self.len >= spore_net_policy.max_bound_services) return error.TooManyBoundServices;
+        self.items[self.len] = binding;
+        self.len += 1;
+    }
+
+    pub fn slice(self: *const BoundServiceBindingList) []const spore_net_policy.BoundServiceBinding {
+        return self.items[0..self.len];
+    }
+};
+
 pub const NetworkMode = enum {
     disabled,
     spore,
@@ -922,6 +952,7 @@ pub const CliOptions = struct {
     network: NetworkMode = .disabled,
     network_requested: bool = false,
     network_policy: spore_net_policy.Config = .{},
+    bound_services: BoundServiceBindingList = .{},
     event_mode: EventMode = .none,
     interactive: bool = false,
     tty: bool = false,
@@ -961,6 +992,8 @@ pub const cli_usage =
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
     \\  --bind-service NAME[:PORT]=unix:/path.sock
     \\                          With --net, declare a guest-local Unix service
+    \\  --bind-service NAME=unix:/path.sock
+    \\                          With --from, bind a manifest-declared service
     \\  --forward 127.0.0.1:HOST_PORT:GUEST_PORT
     \\                          With --net, forward host loopback TCP to a guest port
     \\  --capture DIR           Snapshot to DIR; defaults to --capture-on EXIT
@@ -995,6 +1028,8 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var network: NetworkMode = .disabled;
     var network_requested = false;
     var network_policy = spore_net_policy.Config{};
+    var bind_service_args = BoundServiceArgList{};
+    var bound_services = BoundServiceBindingList{};
     var event_mode: EventMode = .none;
     var interactive = false;
     var tty = false;
@@ -1090,7 +1125,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             };
         } else if (std.mem.eql(u8, args[i], "--bind-service")) {
             const raw = takeValue(args, &i, args[i]);
-            network_policy.addBindService(raw) catch |err| {
+            bind_service_args.append(raw) catch |err| {
                 std.debug.print("spore run: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
                 std.process.exit(2);
             };
@@ -1125,6 +1160,15 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.process.exit(2);
     }
     if (from_spore_dir != null) {
+        for (bind_service_args.slice()) |raw| {
+            bound_services.append(spore_net_policy.parseBoundServiceBinding(raw) catch |err| {
+                std.debug.print("spore run: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            }) catch |err| {
+                std.debug.print("spore run: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
+        }
         if (injected_file_sources.len != 0) {
             std.debug.print("spore run: --inject is not supported with --from; injected files are fresh-run only\n", .{});
             std.process.exit(2);
@@ -1140,6 +1184,13 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         if (shared.memory_set) {
             std.debug.print("spore run: --from uses the spore manifest memory size; omit --memory\n", .{});
             std.process.exit(2);
+        }
+    } else {
+        for (bind_service_args.slice()) |raw| {
+            network_policy.addBindService(raw) catch |err| {
+                std.debug.print("spore run: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
         }
     }
     if (capture_trigger_set and capture_path == null) {
@@ -1180,6 +1231,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .network = network,
         .network_requested = network_requested,
         .network_policy = network_policy,
+        .bound_services = bound_services,
         .event_mode = event_mode,
         .interactive = interactive,
         .tty = tty,
@@ -4040,6 +4092,20 @@ test "run cli parser accepts source spore" {
     try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
+}
+
+test "run cli parser accepts source spore bound service bindings" {
+    const opts = try parseCliArgs(&.{
+        "--from",
+        "base.spore",
+        "--bind-service",
+        "metadata=unix:/tmp/metadata.sock",
+    });
+    try std.testing.expectEqualStrings("base.spore", opts.from_spore_dir.?);
+    try std.testing.expectEqual(@as(usize, 1), opts.bound_services.len);
+    try std.testing.expectEqualStrings("metadata", opts.bound_services.items[0].name);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.bound_services.items[0].target.unix);
+    try std.testing.expect(!opts.network_policy.hasRules());
 }
 
 test "run cli parser accepts net flag" {
