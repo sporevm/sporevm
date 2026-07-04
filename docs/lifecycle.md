@@ -66,7 +66,7 @@ spore create bench-1 --options @create-options.json
 ```json
 {
   "schema_version": 1,
-  "image_ref": "docker.io/library/alpine:3.20",
+  "image": "docker.io/library/alpine:3.20",
   "memory": "512mb",
   "vcpus": 2,
   "timeout_ms": 120000,
@@ -90,13 +90,11 @@ spore create bench-1 --options @create-options.json
 }
 ```
 
-The file maps directly to create options. Supported aliases are `image` for
-`image_ref`, `rootfs` for `rootfs_path`, `kernel` for `kernel_path`, `initrd`
-for `initrd_path`, and `pull` for `image_pull_policy`. `memory` uses the same
-spelling as `--memory`; `memory_bytes` is also accepted. Unknown fields fail
-closed, `schema_version` must be `1`, and `--options` cannot be combined with
-individual create option flags. Bound services default `guest_host` to
-`NAME.spore.internal` when it is omitted.
+The file uses the same spellings as the CLI flags: `image`, `rootfs`, `kernel`,
+`initrd`, `pull`, and `memory`. Unknown fields fail closed, `schema_version`
+must be `1`, and `--options` cannot be combined with individual create option
+flags. Bound services default `guest_host` to `NAME.spore.internal` when it is
+omitted.
 
 Named VMs also support explicit path transfer through the same local
 monitor boundary:

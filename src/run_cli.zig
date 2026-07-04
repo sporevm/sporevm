@@ -111,7 +111,12 @@ fn runParsed(
             .debug = debug,
             .bound_services = parsed.bound_services.slice(),
             .events = events,
-        });
+        }) catch |err| switch (err) {
+            error.MissingBoundServiceBinding => failRunSetup("spore run: manifest requires live bound Unix service bindings", .{}),
+            error.UnexpectedBoundServiceBinding => failRunSetup("spore run: live bound Unix service bindings do not match the manifest", .{}),
+            error.DuplicateBoundServiceBinding => failRunSetup("spore run: duplicate live bound Unix service binding", .{}),
+            else => return err,
+        };
     }
 
     validateTerminalPolicy(parsed);

@@ -341,17 +341,11 @@ const CreateOptionsFile = struct {
     name: ?[]const u8 = null,
     backend: ?[]const u8 = null,
     kernel: ?[]const u8 = null,
-    kernel_path: ?[]const u8 = null,
     initrd: ?[]const u8 = null,
-    initrd_path: ?[]const u8 = null,
     rootfs: ?[]const u8 = null,
-    rootfs_path: ?[]const u8 = null,
     image: ?[]const u8 = null,
-    image_ref: ?[]const u8 = null,
     pull: ?[]const u8 = null,
-    image_pull_policy: ?[]const u8 = null,
     memory: ?[]const u8 = null,
-    memory_bytes: ?u64 = null,
     vcpus: ?topology.VcpuCount = null,
     guest_port: ?u32 = null,
     timeout_ms: ?u64 = null,
@@ -2325,7 +2319,7 @@ fn createNetworkRulesFromConfig(
     for (exact_rules, rules) |rule, *out| {
         out.* = .{
             .host = rule.host,
-            .ports = rule.portSlice(),
+            .ports = try allocator.dupe(u16, rule.portSlice()),
         };
     }
     return rules;
@@ -2421,19 +2415,15 @@ fn parseCreateOptionsFile(
         if (run_mod.Backend.parse(backend) == null) return error.InvalidBackend;
         out.spec.backend = backend;
     }
-    out.spec.kernel_path = try chooseCreateOptionsAlias(file.kernel_path, file.kernel);
-    out.spec.initrd_path = try chooseCreateOptionsAlias(file.initrd_path, file.initrd);
-    out.spec.rootfs_path = try chooseCreateOptionsAlias(file.rootfs_path, file.rootfs);
-    out.spec.image_ref = try chooseCreateOptionsAlias(file.image_ref, file.image);
-    if (file.image_pull_policy != null and file.pull != null) return error.ConflictingOptions;
-    if (file.image_pull_policy orelse file.pull) |pull| {
+    out.spec.kernel_path = file.kernel;
+    out.spec.initrd_path = file.initrd;
+    out.spec.rootfs_path = file.rootfs;
+    out.spec.image_ref = file.image;
+    if (file.pull) |pull| {
         out.image_pull_policy = run_mod.PullPolicy.parse(pull) orelse return error.InvalidPullPolicy;
     }
-    if (file.memory != null and file.memory_bytes != null) return error.ConflictingOptions;
     if (file.memory) |memory| {
         out.spec.memory = try memory_config.parse(memory);
-    } else if (file.memory_bytes) |bytes| {
-        out.spec.memory = try memory_config.fromManifestBytes(bytes);
     }
     if (file.vcpus) |vcpus| out.spec.vcpus = vcpus;
     if (file.guest_port) |port| out.spec.guest_port = port;
@@ -2464,11 +2454,6 @@ fn parseCreateOptionsFile(
     if (out.spec.rootfs_path != null and out.spec.image_ref != null) return error.InvalidRootfsInput;
     if (out.spec.image_ref == null and out.image_pull_policy != .missing) return error.InvalidPullPolicy;
     return out;
-}
-
-fn chooseCreateOptionsAlias(primary: ?[]const u8, alias: ?[]const u8) !?[]const u8 {
-    if (primary != null and alias != null) return error.ConflictingOptions;
-    return primary orelse alias;
 }
 
 fn parseCreateArgs(
@@ -4719,7 +4704,7 @@ test "create options file maps to create options" {
     const opts = try parseCreateOptionsFile(arena, base,
         \\{
         \\  "schema_version": 1,
-        \\  "image_ref": "docker.io/library/alpine:3.20",
+        \\  "image": "docker.io/library/alpine:3.20",
         \\  "memory": "512mb",
         \\  "vcpus": 2,
         \\  "timeout_ms": 120000,
@@ -4751,6 +4736,36 @@ test "create options file maps to create options" {
     const services = try createBoundServicesFromConfig(arena, &opts.network_policy);
     try std.testing.expectEqualStrings("metadata.cleanroom.internal", services[0].guest_host);
     try std.testing.expectEqualStrings("compile", opts.spec.annotations.map.get("cleanroom.stage").?);
+}
+
+test "create options file rejects invalid contract inputs" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const base = CreateOptions{ .spec = .{ .name = "bench-1" } };
+    try std.testing.expectError(error.UnknownField, parseCreateOptionsFile(arena, base, "{\"schema_version\":1,\"image_ref\":\"alpine\"}"));
+    try std.testing.expectError(error.UnsupportedOptionsFile, parseCreateOptionsFile(arena, base, "{\"schema_version\":2}"));
+    try std.testing.expectError(error.ConflictingOptions, parseCreateOptionsFile(arena, base, "{\"schema_version\":1,\"name\":\"other\"}"));
+    try std.testing.expectError(error.InvalidPullPolicy, parseCreateOptionsFile(arena, base, "{\"schema_version\":1,\"pull\":\"always\"}"));
+}
+
+test "create cli network rule conversion owns port slices" {
+    var policy = run_mod.NetworkPolicy{};
+    try policy.addExactHostPorts("github.com", &.{443});
+    try policy.addExactHostPorts("example.com", &.{8443});
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rules = try createNetworkRulesFromConfig(arena, &policy);
+
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    try std.testing.expectEqualStrings("github.com", rules[0].host);
+    try std.testing.expectEqual(@as(u16, 443), rules[0].ports[0]);
+    try std.testing.expectEqualStrings("example.com", rules[1].host);
+    try std.testing.expectEqual(@as(u16, 8443), rules[1].ports[0]);
+    try std.testing.expect(rules[0].ports.ptr != policy.exact_rules[0].portSlice().ptr);
 }
 
 fn fuzzCreateOptionsFile(_: void, s: *std.testing.Smith) !void {
