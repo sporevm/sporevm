@@ -1005,7 +1005,7 @@ pub const cli_usage =
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --vcpus N               Guest vCPU count (1-8; capture/resume backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
-    \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
+    \\  --timeout DURATION      Probe timeout (default: 30s; e.g. 500ms, 1m)
     \\  --console-log PATH      Write guest console output to PATH
     \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
     \\  --inject ID=PATH        Inject PATH as /run/sporevm/injected/ID for this run
@@ -3352,6 +3352,39 @@ fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) !T {
     return parsed;
 }
 
+pub fn parseDurationMs(raw: []const u8) !u64 {
+    if (raw.len == 0) return error.InvalidDuration;
+    if (std.mem.endsWith(u8, raw, "ms")) {
+        return parsePositiveDuration(raw[0 .. raw.len - 2], 1);
+    }
+    if (std.mem.endsWith(u8, raw, "s")) {
+        return parsePositiveDuration(raw[0 .. raw.len - 1], std.time.ms_per_s);
+    }
+    if (std.mem.endsWith(u8, raw, "m")) {
+        return parsePositiveDuration(raw[0 .. raw.len - 1], std.time.ms_per_min);
+    }
+    return parsePositiveDuration(raw, std.time.ms_per_s);
+}
+
+fn parseDurationMsOrExit(name: []const u8, raw: []const u8) u64 {
+    return parseDurationMs(raw) catch {
+        std.debug.print("{s} expects a duration like 30s, 500ms, or 1m\n", .{name});
+        std.process.exit(2);
+    };
+}
+
+fn parsePositiveDuration(number: []const u8, multiplier: u64) !u64 {
+    const value = try parsePositiveDurationInteger(number);
+    return try std.math.mul(u64, value, multiplier);
+}
+
+fn parsePositiveDurationInteger(raw: []const u8) !u64 {
+    if (raw.len == 0) return error.InvalidDuration;
+    const value = try std.fmt.parseInt(u64, raw, 10);
+    if (value == 0) return error.InvalidDuration;
+    return value;
+}
+
 pub fn parseVcpuCountOrExit(name: []const u8, raw: []const u8) topology.VcpuCount {
     return topology.parseVcpuCount(raw) catch {
         std.debug.print("{s} must be an integer from 1 to {d}\n", .{ name, topology.max_vcpus });
@@ -3425,6 +3458,8 @@ fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize
         shared.vcpus = parseVcpuCountOrExit(name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--guest-port")) {
         shared.guest_port = try parseGuestPort(name, takeValue(args, i, name));
+    } else if (std.mem.eql(u8, name, "--timeout")) {
+        shared.timeout_ms = parseDurationMsOrExit(name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--timeout-ms")) {
         shared.timeout_ms = try parsePositive(u64, name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--console-log")) {
@@ -3849,6 +3884,24 @@ test "run cli parser accepts command after separator" {
     try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
+}
+
+test "run cli parser accepts flexible timeout duration" {
+    const opts = try parseCliArgs(&.{ "--timeout", "120s", "--", "/bin/true" });
+    try std.testing.expectEqual(@as(u64, 120_000), opts.shared.timeout_ms);
+}
+
+test "run cli parser accepts hidden timeout-ms compatibility spelling" {
+    const opts = try parseCliArgs(&.{ "--timeout-ms", "120000", "--", "/bin/true" });
+    try std.testing.expectEqual(@as(u64, 120_000), opts.shared.timeout_ms);
+}
+
+test "run duration parser accepts common suffixes" {
+    try std.testing.expectEqual(@as(u64, 500), try parseDurationMs("500ms"));
+    try std.testing.expectEqual(@as(u64, 10_000), try parseDurationMs("10s"));
+    try std.testing.expectEqual(@as(u64, 60_000), try parseDurationMs("1m"));
+    try std.testing.expectEqual(@as(u64, 5_000), try parseDurationMs("5"));
+    try std.testing.expectError(error.InvalidDuration, parseDurationMs("0s"));
 }
 
 test "run cli parser accepts injected files" {

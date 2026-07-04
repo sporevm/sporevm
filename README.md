@@ -291,7 +291,7 @@ and get distinct generation metadata.
 Resume forked children locally with prefixed output:
 
 ```bash
-spore fanout forks --parallel --for 20s
+spore fanout forks --for 20s
 ```
 
 See [docs/fanout.md](docs/fanout.md) for the child identity contract and

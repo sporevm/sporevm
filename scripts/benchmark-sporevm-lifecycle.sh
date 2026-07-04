@@ -22,7 +22,7 @@ Options:
   --kernel PATH            Kernel Image path to pass through to create.
   --initrd PATH            Initrd path to pass through to create.
   --memory VALUE           Guest memory: auto, 512mb, 2gb, ... (default: auto).
-  --timeout-ms N           Exec/create timeout in milliseconds (default: 60000).
+  --timeout DURATION       Exec/create timeout (default: 60s).
   --identity-command CMD   First command run in the VM (default: boot_id probe).
   --workload-command CMD   Second command run in the VM (default: node -v).
   --no-build               Do not run mise/zig build before benchmarking.
@@ -143,6 +143,30 @@ positive_int() {
   [[ "${value}" =~ ^[0-9]+$ && "${value}" -gt 0 ]] || die "${opt} must be a positive integer"
 }
 
+duration_ms() {
+  local opt="$1"
+  local value="$2"
+  local number=""
+  local multiplier=1000
+  if [[ "${value}" =~ ^([0-9]+)ms$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    multiplier=1
+  elif [[ "${value}" =~ ^([0-9]+)s$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    multiplier=1000
+  elif [[ "${value}" =~ ^([0-9]+)m$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    multiplier=60000
+  elif [[ "${value}" =~ ^([0-9]+)$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    multiplier=1000
+  else
+    die "${opt} expects a duration like 60s, 500ms, or 1m"
+  fi
+  [[ "${number}" -gt 0 ]] || die "${opt} expects a positive duration"
+  printf '%d\n' "$((number * multiplier))"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 if [[ -f "${REPO_ROOT}/mise.toml" ]]; then
@@ -229,6 +253,11 @@ while [[ $# -gt 0 ]]; do
     --memory-mib)
       die "--memory-mib has been replaced by --memory"
       ;;
+    --timeout)
+      need_value "$1" "${2-}"
+      timeout_ms="$(duration_ms "$1" "$2")"
+      shift 2
+      ;;
     --timeout-ms)
       need_value "$1" "${2-}"
       timeout_ms="$2"
@@ -263,7 +292,7 @@ done
 [[ -n "${image}" ]] || { usage >&2; exit 2; }
 positive_int "--iterations" "${iterations}"
 [[ -n "${memory}" ]] || die "--memory requires a value"
-positive_int "--timeout-ms" "${timeout_ms}"
+positive_int "--timeout" "${timeout_ms}"
 case "${backend}" in
   auto|hvf|kvm) ;;
   *) die "--backend must be auto, hvf, or kvm" ;;
@@ -337,7 +366,7 @@ fi
 if [[ -n "${initrd_path}" ]]; then
   create_base+=(--initrd "${initrd_path}")
 fi
-create_base+=(--image "${effective_image}" --memory "${memory}" --timeout-ms "${timeout_ms}")
+create_base+=(--image "${effective_image}" --memory "${memory}" --timeout "${timeout_ms}ms")
 
 for i in $(seq 1 "${iterations}"); do
   vm_name="spore-life-${timestamp}-${i}"

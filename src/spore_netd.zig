@@ -40,7 +40,13 @@ const max_dns_payload_len = max_frame_len - ethernet_header_len - ipv4_header_mi
 
 const fallback_dns_ipv4: [4]u8 = .{ 1, 1, 1, 1 };
 
-const netd_usage = "usage: spore netd --stdio [--allow-cidr CIDR] [--allow-host HOST] [--allow-host-port HOST:PORT] [--bind-service NAME[:PORT]=unix:/path.sock] [--bound-unix-service NAME HOST PORT PATH] [--forward 127.0.0.1:HOST_PORT:GUEST_PORT]\n";
+const netd_usage =
+    \\Usage:
+    \\  spore netd --stdio [--allow-cidr CIDR] [--allow-host HOST] [--allow-host-port HOST:PORT] [--bind-service NAME[:PORT]=unix:/path.sock] [--bound-unix-service NAME HOST PORT PATH] [--forward 127.0.0.1:HOST_PORT:GUEST_PORT]
+    \\
+    \\Internal helper for SporeVM-managed networking.
+    \\
+;
 
 pub const FrameIoError = error{
     EndOfStream,

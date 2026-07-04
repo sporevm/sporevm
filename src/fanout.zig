@@ -22,13 +22,12 @@ pub const Options = struct {
 
 const cli_usage =
     \\Usage:
-    \\  spore fanout [--backend auto|hvf|kvm] [--parallel] [--for DURATION] <children-dir>
+    \\  spore fanout [--backend auto|hvf|kvm] [--for DURATION] <children-dir>
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
-    \\  --parallel              Resume all child spores concurrently (default)
     \\  --for DURATION          Stop resumed children after DURATION, e.g. 10s, 500ms, 1m
-    \\  --timeout-ms N          Per-child resume probe timeout in milliseconds (default: 30000)
+    \\  --timeout DURATION      Per-child resume probe timeout (default: 30s)
     \\  --bind-service NAME=unix:/path.sock
     \\                          Bind a manifest-declared service in every child
     \\  -h, --help              Show this help
@@ -62,7 +61,7 @@ const OutputLock = struct {
 };
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (args.len == 0 or std.mem.eql(u8, args[0], "help") or std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help")) {
+    if (args.len == 0 or wantsHelp(args)) {
         try stdout.writeAll(cli_usage);
         return;
     }
@@ -90,8 +89,13 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             // the demo command self-describing without adding a second mode.
         } else if (std.mem.eql(u8, args[i], "--for") and i + 1 < args.len) {
             i += 1;
-            duration_ms = parseDurationMs(args[i]) catch {
+            duration_ms = run_mod.parseDurationMs(args[i]) catch {
                 failCli("--for expects a duration like 10s, 500ms, or 1m", .{});
+            };
+        } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
+            i += 1;
+            timeout_ms = run_mod.parseDurationMs(args[i]) catch {
+                failCli("--timeout expects a duration like 30s, 500ms, or 1m", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--timeout-ms") and i + 1 < args.len) {
             i += 1;
@@ -189,9 +193,9 @@ fn spawnResume(
     spore_dir: []const u8,
 ) !std.process.Child {
     const backend_arg = @tagName(backend);
-    const timeout_arg = try std.fmt.allocPrint(allocator, "{d}", .{timeout_ms});
+    const timeout_arg = try std.fmt.allocPrint(allocator, "{d}ms", .{timeout_ms});
     var argv = std.array_list.Managed([]const u8).init(allocator);
-    try argv.appendSlice(&.{ argv0, "resume", "--backend", backend_arg, "--timeout-ms", timeout_arg });
+    try argv.appendSlice(&.{ argv0, "resume", "--backend", backend_arg, "--timeout", timeout_arg });
     for (bound_services) |binding| {
         const unix_path = switch (binding.target) {
             .unix => |path| path,
@@ -417,25 +421,6 @@ fn termName(term: std.process.Child.Term) []const u8 {
     };
 }
 
-fn parseDurationMs(raw: []const u8) !u64 {
-    if (raw.len == 0) return error.InvalidDuration;
-    if (std.mem.endsWith(u8, raw, "ms")) {
-        return parsePositiveDuration(raw[0 .. raw.len - 2], 1);
-    }
-    if (std.mem.endsWith(u8, raw, "s")) {
-        return parsePositiveDuration(raw[0 .. raw.len - 1], std.time.ms_per_s);
-    }
-    if (std.mem.endsWith(u8, raw, "m")) {
-        return parsePositiveDuration(raw[0 .. raw.len - 1], std.time.ms_per_min);
-    }
-    return parsePositiveDuration(raw, std.time.ms_per_s);
-}
-
-fn parsePositiveDuration(number: []const u8, multiplier: u64) !u64 {
-    const value = try parsePositiveInteger(number);
-    return try std.math.mul(u64, value, multiplier);
-}
-
 fn parsePositiveInteger(raw: []const u8) !u64 {
     if (raw.len == 0) return error.InvalidDuration;
     const value = try std.fmt.parseInt(u64, raw, 10);
@@ -462,12 +447,36 @@ fn failCli(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
+fn wantsHelp(args: []const []const u8) bool {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or
+            std.mem.eql(u8, arg, "--help"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 test "fanout cli parser accepts requested demo shape" {
-    const opts = try parseCliArgs(&.{ "children", "--parallel", "--for", "10s", "--backend", "hvf", "--timeout-ms", "120000" });
+    const opts = try parseCliArgs(&.{ "children", "--parallel", "--for", "10s", "--backend", "hvf", "--timeout", "120s" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
     try std.testing.expectEqualStrings("children", opts.children_dir);
     try std.testing.expectEqual(@as(?u64, 10_000), opts.duration_ms);
     try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
+}
+
+test "fanout cli parser accepts hidden timeout-ms compatibility spelling" {
+    const opts = try parseCliArgs(&.{ "children", "--timeout-ms", "120000" });
+    try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
+}
+
+test "fanout cli help accepts help after options" {
+    try std.testing.expect(wantsHelp(&.{"--help"}));
+    try std.testing.expect(wantsHelp(&.{ "children", "--for", "10s", "--help" }));
+    try std.testing.expect(!wantsHelp(&.{"children"}));
+    try std.testing.expect(!wantsHelp(&.{ "help", "--for", "10s" }));
 }
 
 test "fanout cli parser accepts bound service bindings" {
@@ -479,11 +488,11 @@ test "fanout cli parser accepts bound service bindings" {
 }
 
 test "fanout duration parser accepts common suffixes" {
-    try std.testing.expectEqual(@as(u64, 500), try parseDurationMs("500ms"));
-    try std.testing.expectEqual(@as(u64, 10_000), try parseDurationMs("10s"));
-    try std.testing.expectEqual(@as(u64, 60_000), try parseDurationMs("1m"));
-    try std.testing.expectEqual(@as(u64, 5_000), try parseDurationMs("5"));
-    try std.testing.expectError(error.InvalidDuration, parseDurationMs("0s"));
+    try std.testing.expectEqual(@as(u64, 500), try run_mod.parseDurationMs("500ms"));
+    try std.testing.expectEqual(@as(u64, 10_000), try run_mod.parseDurationMs("10s"));
+    try std.testing.expectEqual(@as(u64, 60_000), try run_mod.parseDurationMs("1m"));
+    try std.testing.expectEqual(@as(u64, 5_000), try run_mod.parseDurationMs("5"));
+    try std.testing.expectError(error.InvalidDuration, run_mod.parseDurationMs("0s"));
 }
 
 fn testManifest(sessions: []const spore.Session) spore.Manifest {

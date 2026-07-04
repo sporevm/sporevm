@@ -174,7 +174,7 @@ for i in $(seq 0 $((count - 1))); do
 done
 
 set +e
-SPOREVM_ROOTFS_CACHE_DIR="${pull_rootfs_cache}" "${spore_bin}" fanout --backend "${backend}" "${pulled_dir}" --parallel --for "${SPORE_SMOKE_LOCAL_PULL_FANOUT_DURATION:-20s}" \
+SPOREVM_ROOTFS_CACHE_DIR="${pull_rootfs_cache}" "${spore_bin}" fanout --backend "${backend}" "${pulled_dir}" --for "${SPORE_SMOKE_LOCAL_PULL_FANOUT_DURATION:-20s}" \
   >"${fanout_stdout}" 2>"${fanout_stderr}"
 fanout_rc="$?"
 set -e

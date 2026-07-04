@@ -97,7 +97,7 @@ if run_capture "${workdir}/create.out" "${workdir}/create.err" \
   run_spore create "${rootfs_vm}" \
     --backend "${backend}" \
     --memory "${memory}" \
-    --timeout-ms "${timeout_ms}" \
+    --timeout "${timeout_ms}ms" \
     --console-log "${console_log}" \
     --image "${image}"; then
   rootfs_created=1
@@ -164,7 +164,7 @@ fi
 rootfs_created=0
 
 if run_capture "${workdir}/dead-create.out" "${workdir}/dead-create.err" \
-  run_spore create "${dead_vm}" --backend "${backend}" --memory "${dead_memory}" --timeout-ms 60000; then
+  run_spore create "${dead_vm}" --backend "${backend}" --memory "${dead_memory}" --timeout 60s; then
   dead_created=1
 else
   failed=1

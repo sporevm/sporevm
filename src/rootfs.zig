@@ -36,7 +36,6 @@ pub const usage =
     \\  build <image@sha256:...|image:tag> --output <rootfs.ext4>
     \\  import-oci <layout-dir|layout.tar> --ref local/name:tag
     \\  resolve <image:tag>
-    \\  cas-preload <blake3:digest> [--chunk-size BYTES] [--attach-spore DIR]
     \\
     \\Options:
     \\  --platform <os/arch>       Target platform (default: linux/arm64)

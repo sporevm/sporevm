@@ -22,47 +22,115 @@ const usage =
     \\
     \\Global options:
     \\  --debug             Show verbose VMM and restore logs
-    \\  --json              Emit one JSON result for supported single-result commands
+    \\  --json              Emit one JSON result for supported state and bundle commands
+    \\                      Use --events=jsonl for run/resume stream events
     \\
     \\Commands:
-    \\  system             Inspect and prune local SporeVM system state
-    \\  rootfs              Build rootfs images from OCI images
-    \\  run [options] 'shell command'
-    \\                      Boot a throwaway VM and run one command
-    \\  resume <spore-dir> [--name NAME]
-    \\                      Resume one spore, or resume it as a named VM
-    \\  create NAME [options] ['shell command']
-    \\                      Create a named VM lifecycle target
-    \\  exec NAME 'shell command'
-    \\                      Execute a command in a named VM
-    \\  copy-in NAME HOST_PATH GUEST_PATH
-    \\                      Copy one host file or directory into a named VM
-    \\  copy-out NAME GUEST_PATH HOST_PATH
-    \\                      Copy one guest file or directory out of a named VM
-    \\  rm NAME             Remove a named VM
-    \\  suspend NAME --out DIR
-    \\                      Checkpoint a named VM into a spore
-    \\  ls, ps              List named VMs in the local runtime registry
-    \\  version             Print the spore version
-    \\  host-info           Print this host's platform facts
-    \\  inspect <spore-dir> Print a spore manifest summary
-    \\  fork <spore-dir> --count N --out DIR
-    \\                      Mint child spores that share parent chunks
-    \\  fork --vm NAME --count N --name PATTERN
-    \\                      Snapshot-and-continue a named VM into named children
-    \\  fanout <children-dir> [--for DURATION]
-    \\                      Resume forked children concurrently with prefixed output
-    \\  pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR
-    \\                      Pack portable spore chunks into a local bundle
-    \\  unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR
-    \\                      Unpack a local spore bundle into a spore dir
-    \\  push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]
-    \\                      Push an indexed bundle to an object store
-    \\  inspect-bundle <bundle-ref> [--child ID|--child-range START..END]
-    \\                      Inspect bundle metadata without materializing it
-    \\  pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]
-    \\                      Pull one child into a spore dir
-    \\  help                Show this help
+    \\  One-shot VMs:
+    \\    run [options] 'shell command'
+    \\                        Boot a throwaway VM and run one command
+    \\    resume <spore-dir>
+    \\                        Resume one spore directly
+    \\
+    \\  Named VMs:
+    \\    create NAME [options] ['shell command']
+    \\                        Create a named VM lifecycle target
+    \\    exec NAME 'shell command'
+    \\                        Execute a command in a named VM
+    \\    copy-in NAME HOST_PATH GUEST_PATH
+    \\                        Copy one host file or directory into a named VM
+    \\    copy-out NAME GUEST_PATH HOST_PATH
+    \\                        Copy one guest file or directory out of a named VM
+    \\    suspend NAME --out DIR
+    \\                        Checkpoint a named VM into a spore
+    \\    resume <spore-dir> --name NAME
+    \\                        Resume a spore as a named VM
+    \\    fork --vm NAME --count N --name PATTERN
+    \\                        Snapshot-and-continue a named VM into named children
+    \\    ls, ps              List named VMs in the local runtime registry
+    \\    rm NAME             Remove a named VM
+    \\
+    \\  Spore artifacts:
+    \\    inspect <spore-dir> Print a spore manifest summary
+    \\    fork <spore-dir> --count N --out DIR
+    \\                        Mint child spores that share parent chunks
+    \\    fanout <children-dir> [--for DURATION]
+    \\                        Resume forked children concurrently with prefixed output
+    \\    pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR
+    \\                        Pack portable spore chunks into a local bundle
+    \\    unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR
+    \\                        Unpack a local spore bundle into a spore dir
+    \\    push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]
+    \\                        Push an indexed bundle to an object store
+    \\    inspect-bundle <bundle-ref> [--child ID|--child-range START..END]
+    \\                        Inspect bundle metadata without materializing it
+    \\    pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]
+    \\                        Pull one child into a spore dir
+    \\
+    \\  Rootfs and local system:
+    \\    rootfs              Build rootfs images from OCI images
+    \\    system              Inspect and prune local SporeVM system state
+    \\    host-info           Print this host's platform facts
+    \\    version             Print the spore version
+    \\    help                Show this help
+    \\
+;
+
+const pack_usage =
+    \\Usage:
+    \\  spore pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR
+    \\
+    \\Options:
+    \\  --children DIR        Include forked child spores in the bundle
+    \\  --rootfs POLICY       Rootfs bundle policy: exact or metadata-only
+    \\  --out DIR             Write the local bundle to DIR
+    \\  -h, --help            Show this help
+    \\
+;
+
+const unpack_usage =
+    \\Usage:
+    \\  spore unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR
+    \\
+    \\Options:
+    \\  --child ID                    Materialize one child from the bundle
+    \\  --allow-metadata-only-rootfs  Allow metadata-only rootfs descriptors
+    \\  --out DIR                     Write the unpacked spore to DIR
+    \\  -h, --help                    Show this help
+    \\
+;
+
+const push_usage =
+    \\Usage:
+    \\  spore push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]
+    \\
+    \\Options:
+    \\  --region REGION      AWS region for S3 destinations
+    \\  -h, --help           Show this help
+    \\
+;
+
+const inspect_bundle_usage =
+    \\Usage:
+    \\  spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]
+    \\
+    \\Options:
+    \\  --child ID               Inspect one child entry
+    \\  --child-range START..END Inspect a range of child entries
+    \\  -h, --help               Show this help
+    \\
+;
+
+const pull_usage =
+    \\Usage:
+    \\  spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]
+    \\
+    \\Options:
+    \\  --child ID                    Pull one child from the bundle
+    \\  --allow-metadata-only-rootfs  Allow metadata-only rootfs descriptors
+    \\  --out DIR                     Write the materialized spore to DIR
+    \\  --region REGION              AWS region for S3 sources
+    \\  -h, --help                    Show this help
     \\
 ;
 
@@ -211,7 +279,7 @@ fn runCommand(
         try spore_internal.fanout.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "pack")) {
         if (wantsCommandHelp(command_args)) {
-            try stdout.writeAll("usage: spore pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR\n");
+            try stdout.writeAll(pack_usage);
             return;
         }
         const result = try packCommand(context, arena, stderr, mode, command_args);
@@ -222,7 +290,7 @@ fn runCommand(
         }
     } else if (std.mem.eql(u8, command, "unpack")) {
         if (wantsCommandHelp(command_args)) {
-            try stdout.writeAll("usage: spore unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR\n");
+            try stdout.writeAll(unpack_usage);
             return;
         }
         const result = try unpackCommand(context, arena, stderr, mode, command_args);
@@ -233,7 +301,7 @@ fn runCommand(
         }
     } else if (std.mem.eql(u8, command, "push")) {
         if (wantsCommandHelp(command_args)) {
-            try stdout.writeAll("usage: spore push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]\n");
+            try stdout.writeAll(push_usage);
             return;
         }
         const result = try pushCommand(context, arena, stderr, mode, command_args);
@@ -244,7 +312,7 @@ fn runCommand(
         }
     } else if (std.mem.eql(u8, command, "inspect-bundle")) {
         if (wantsCommandHelp(command_args)) {
-            try stdout.writeAll("usage: spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]\n");
+            try stdout.writeAll(inspect_bundle_usage);
             return;
         }
         const result = try inspectBundleCommand(arena, stderr, mode, command_args);
@@ -255,7 +323,7 @@ fn runCommand(
         }
     } else if (std.mem.eql(u8, command, "pull")) {
         if (wantsCommandHelp(command_args)) {
-            try stdout.writeAll("usage: spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]\n");
+            try stdout.writeAll(pull_usage);
             return;
         }
         const result = try pullCommand(context, arena, stderr, mode, command_args);
@@ -415,10 +483,17 @@ fn wantsNamedResume(args: []const []const u8) bool {
 }
 
 fn wantsCommandHelp(args: []const []const u8) bool {
-    return args.len == 1 and
-        (std.mem.eql(u8, args[0], "help") or
-            std.mem.eql(u8, args[0], "-h") or
-            std.mem.eql(u8, args[0], "--help"));
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (isHelpFlag(arg)) return true;
+    }
+    return false;
+}
+
+fn isHelpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-h") or
+        std.mem.eql(u8, arg, "--help");
 }
 
 fn forkCommand(
@@ -925,8 +1000,10 @@ test "command help accepts standard help spellings" {
     try std.testing.expect(wantsCommandHelp(&.{"--help"}));
     try std.testing.expect(wantsCommandHelp(&.{"-h"}));
     try std.testing.expect(wantsCommandHelp(&.{"help"}));
+    try std.testing.expect(wantsCommandHelp(&.{ "base.spore", "--help" }));
     try std.testing.expect(!wantsCommandHelp(&.{}));
-    try std.testing.expect(!wantsCommandHelp(&.{ "--help", "extra" }));
+    try std.testing.expect(!wantsCommandHelp(&.{ "help", "--out", "bundle" }));
+    try std.testing.expect(!wantsCommandHelp(&.{ "--", "--help" }));
 }
 
 test "stable lifecycle commands support global json where output is one document" {

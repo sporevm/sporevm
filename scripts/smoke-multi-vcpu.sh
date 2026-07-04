@@ -227,7 +227,7 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   forked_name="${vm_name}-forked"
   resumed_name="${vm_name}-resumed"
   named_dir="${workdir}/named.spore"
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${vm_name}" --backend "${backend}" --vcpus "${vcpus}" --memory "${memory}" --timeout-ms "${create_timeout_ms}" >"${workdir}/create.stdout" 2>"${workdir}/create.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${vm_name}" --backend "${backend}" --vcpus "${vcpus}" --memory "${memory}" --timeout "${create_timeout_ms}ms" >"${workdir}/create.stdout" 2>"${workdir}/create.stderr"; then
     cat "${workdir}/create.stdout" >&2 || true
     cat "${workdir}/create.stderr" >&2 || true
     die "multi-vCPU named create failed"

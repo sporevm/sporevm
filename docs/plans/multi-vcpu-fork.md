@@ -88,7 +88,7 @@ Direct fan-out is N-to-N:
 ```bash
 spore run --vcpus 4 --capture warm.spore -- ./warmup
 spore fork warm.spore --count 20 --out children/
-spore fanout children/ --parallel
+spore fanout children/
 ```
 
 Each child is a manifest v1 spore with `platform.vcpu_count == 4` and the same

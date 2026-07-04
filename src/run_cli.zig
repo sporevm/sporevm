@@ -11,7 +11,7 @@ const fd_util = @import("fd.zig");
 const run_mod = @import("run.zig");
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (args.len == 0 or std.mem.eql(u8, args[0], "help") or std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help")) {
+    if (args.len == 0 or wantsHelp(args)) {
         try stdout.writeAll(run_mod.cli_usage);
         return;
     }
@@ -201,4 +201,24 @@ fn runtimeDebugEnabled(args: []const []const u8) bool {
         if (std.mem.eql(u8, arg, "--debug")) return true;
     }
     return false;
+}
+
+fn wantsHelp(args: []const []const u8) bool {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (std.mem.eql(u8, arg, "-h") or
+            std.mem.eql(u8, arg, "--help"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+test "run cli help accepts help before argv delimiter only" {
+    try std.testing.expect(wantsHelp(&.{"--help"}));
+    try std.testing.expect(wantsHelp(&.{ "--image", "alpine", "--help" }));
+    try std.testing.expect(!wantsHelp(&.{ "help", "--image", "alpine" }));
+    try std.testing.expect(!wantsHelp(&.{ "--", "/bin/true", "--help" }));
 }

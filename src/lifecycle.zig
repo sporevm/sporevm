@@ -114,7 +114,7 @@ const create_usage =
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
-    \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
+    \\  --timeout DURATION      Exec timeout (default: 30s; e.g. 500ms, 1m)
     \\  --console-log PATH      Write guest console output to PATH
     \\  -- <argv...>            Start exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
@@ -2756,6 +2756,10 @@ fn parseCreateArgs(
             field_flag_seen = true;
             const flag = args[i];
             spec.guest_port = parseIntArgLifecycleCli(u32, allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
+        } else if (std.mem.eql(u8, args[i], "--timeout")) {
+            field_flag_seen = true;
+            const flag = args[i];
+            spec.timeout_ms = parseDurationArgLifecycleCli(allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
         } else if (std.mem.eql(u8, args[i], "--timeout-ms")) {
             field_flag_seen = true;
             const flag = args[i];
@@ -3369,7 +3373,8 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
     try appendMemoryArg(allocator, &argv, spec.memory);
     try appendIntArg(allocator, &argv, "--vcpus", spec.vcpus);
     try appendIntArg(allocator, &argv, "--guest-port", spec.guest_port);
-    try appendIntArg(allocator, &argv, "--timeout-ms", spec.timeout_ms);
+    try argv.append("--timeout");
+    try argv.append(try std.fmt.allocPrint(allocator, "{d}ms", .{spec.timeout_ms}));
     if (spec.console_log_path) |path| {
         try argv.append("--console-log");
         try argv.append(path);
@@ -4740,10 +4745,16 @@ pub fn monotonicMs() u64 {
 }
 
 fn wantsHelp(args: []const []const u8) bool {
-    return args.len == 1 and
-        (std.mem.eql(u8, args[0], "help") or
-            std.mem.eql(u8, args[0], "-h") or
-            std.mem.eql(u8, args[0], "--help"));
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (std.mem.eql(u8, arg, "-h") or
+            std.mem.eql(u8, arg, "--help"))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn usageExit(comptime text: []const u8) noreturn {
@@ -4881,6 +4892,20 @@ fn parseIntArgLifecycleCli(
 ) T {
     return std.fmt.parseInt(T, raw, 10) catch {
         const message = allocLifecycleMessage(allocator, "{s} must be an integer", .{flag});
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
+    };
+}
+
+fn parseDurationArgLifecycleCli(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    raw: []const u8,
+    flag: []const u8,
+) u64 {
+    return run_mod.parseDurationMs(raw) catch {
+        const message = allocLifecycleMessage(allocator, "{s} expects a duration like 30s, 500ms, or 1m", .{flag});
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     };
 }
@@ -5150,6 +5175,9 @@ test "lifecycle fork help routes through named fork cli" {
     try std.testing.expect(wantsNamedFork(&.{"--help"}));
     try std.testing.expect(wantsNamedFork(&.{"-h"}));
     try std.testing.expect(wantsNamedFork(&.{"help"}));
+    try std.testing.expect(wantsHelp(&.{ "bench-1", "--help" }));
+    try std.testing.expect(!wantsHelp(&.{ "help", "--image", "alpine" }));
+    try std.testing.expect(!wantsHelp(&.{ "bench-1", "--", "/bin/true", "--help" }));
     try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fork <spore-dir> --count N --out DIR") != null);
     try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fork --vm NAME --count N --name PATTERN") != null);
 }
@@ -5348,6 +5376,24 @@ test "create parser accepts bounded vcpu count" {
 
     const opts = try parseCreateArgs(&.{ "bench-1", "--vcpus", "2" }, allocator, &stderr.writer, .human);
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.spec.vcpus);
+}
+
+test "create parser accepts flexible timeout duration" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    const opts = try parseCreateArgs(&.{ "bench-1", "--timeout", "120s" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(@as(u64, 120_000), opts.spec.timeout_ms);
+}
+
+test "create parser accepts hidden timeout-ms compatibility spelling" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    const opts = try parseCreateArgs(&.{ "bench-1", "--timeout-ms", "120000" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(@as(u64, 120_000), opts.spec.timeout_ms);
 }
 
 test "create parser accepts image pull policy" {
