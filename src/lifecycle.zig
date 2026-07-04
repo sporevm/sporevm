@@ -1176,7 +1176,10 @@ pub fn forkNamed(
         return error.UnsupportedNamedForkDisk;
     }
     if (source_spec.value.network != null) return error.UnsupportedNamedForkNetwork;
-    if (source_spec.value.vcpus != 1) return error.UnsupportedNamedForkVcpu;
+    if (source_spec.value.vcpus != 1) {
+        setLastError("{s}", .{machine_output.forkUnsupportedVcpuBody(arena, source_spec.value.vcpus)});
+        return error.UnsupportedNamedForkVcpu;
+    }
 
     for (child_names) |child_name| {
         const child_paths = try apiPaths(context, arena, child_name);
@@ -1796,7 +1799,7 @@ pub fn forkCli(
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
         },
         error.UnsupportedNamedForkVcpu => {
-            const message = "spore fork: multi-vCPU named live fork is not supported yet";
+            const message = allocLifecycleLastErrorMessage(allocator, "fork", "spore fork: source has multiple vCPUs; fork currently supports only 1-vCPU sources. Bake or create the fork source with --vcpus 1.");
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
         },
         error.NamedVmExists => {

@@ -198,7 +198,9 @@ pausing the source VM.
 Named checkpoints support diskless VMs, image-created writable rootfs state, and
 explicit `--rootfs PATH` checkpoints backed by exact immutable rootfs artifacts.
 Supported backends can create, suspend, and resume fixed-RAM multi-vCPU named
-VMs. Named live fork is currently single-vCPU and diskless-only.
+VMs. Named live fork is currently single-vCPU and diskless-only. Create named
+VMs intended for `spore fork --vm` with `--vcpus 1`; multi-vCPU sources are
+rejected before child VMs are started.
 
 ## Monitor Boundary
 

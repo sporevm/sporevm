@@ -12,6 +12,10 @@ Children are named `000000` through zero-padded `N-1` and share the parent's
 chunk store. `spore fanout` is local orchestration over child spore directories;
 distributed offset/range partitioning is deferred.
 
+`spore fork` currently accepts only 1-vCPU source spores. A source captured from
+a multi-vCPU VM is rejected before child directories are written; bake or create
+fan-out sources with `--vcpus 1` until multi-vCPU fork support lands.
+
 If the parent manifest declares bound services, fan-out supplies one fresh host
 socket binding per service and applies the same binding to every child:
 

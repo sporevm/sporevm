@@ -135,6 +135,27 @@ if ! "${spore_bin}" run \
 fi
 expect_manifest_v1 "${from_base_dir}"
 
+unsupported_fork_stdout="${workdir}/unsupported-fork.stdout"
+unsupported_fork_stderr="${workdir}/unsupported-fork.stderr"
+unsupported_fork_out="${workdir}/unsupported-fork-children"
+set +e
+"${spore_bin}" fork "${from_base_dir}" --count 1 --out "${unsupported_fork_out}" \
+  >"${unsupported_fork_stdout}" 2>"${unsupported_fork_stderr}"
+unsupported_fork_status="$?"
+set -e
+expected_fork_error="spore fork: source has ${vcpus} vCPUs; fork currently supports only 1-vCPU sources. Bake or create the fork source with --vcpus 1."
+if [[ "${unsupported_fork_status}" != "2" ]]; then
+  cat "${unsupported_fork_stdout}" >&2 || true
+  cat "${unsupported_fork_stderr}" >&2 || true
+  die "multi-vCPU fork exited ${unsupported_fork_status}, expected 2"
+fi
+actual_fork_error="$(cat "${unsupported_fork_stderr}")"
+if [[ "${actual_fork_error}" != "${expected_fork_error}" ]]; then
+  printf 'expected fork stderr: %s\nactual fork stderr: %s\n' "${expected_fork_error}" "${actual_fork_error}" >&2
+  die "multi-vCPU fork stderr mismatch"
+fi
+[[ ! -s "${unsupported_fork_stdout}" ]] || die "multi-vCPU fork wrote unexpected stdout"
+
 if ! "${spore_bin}" run \
   --backend "${backend}" \
   --events=jsonl \

@@ -458,7 +458,16 @@ fn forkCommand(
         .parent_dir = parent_dir.?,
         .out_dir = out_dir.?,
         .count = count.?,
-    });
+    }) catch |err| switch (err) {
+        error.UnsupportedVcpuCount => {
+            const inspected = spore_api.inspectSpore(allocator, parent_dir.?) catch return err;
+            const vcpu_count = inspected.vcpu_count;
+            spore_api.deinitSporeInspectResult(allocator, inspected);
+            const message = machine_output.forkUnsupportedVcpuMessage(allocator, vcpu_count);
+            exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+        },
+        else => |e| return e,
+    };
 }
 
 fn packCommand(
