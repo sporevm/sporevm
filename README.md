@@ -104,12 +104,21 @@ zig-out/bin/spore version
 Run one command in a throwaway VM:
 
 ```bash
-spore run -- /bin/writeout
+spore run 'echo hi'
 ```
 
 `spore run` uses the managed SporeVM run kernel and the embedded minimal exec
-initrd. The embedded initrd contains SporeVM helper binaries, not a general
-shell; use `--image` or `--rootfs` for distro commands such as `echo hi`.
+initrd. The embedded initrd contains SporeVM helper binaries plus a small
+Toybox shell environment for basic commands such as `echo`, `cat`, `printf`,
+`pwd`, and `uname`. Use `--image` or `--rootfs` for distro behavior, package
+managers, or commands outside that bounded set.
+
+Exact argv after `--` still uses the path you provide without guest PATH
+lookup:
+
+```bash
+spore run -- /bin/echo hi
+```
 
 Forward host stdin explicitly with `-i` when the guest process should read
 input. Without `-i`, runs keep the script-friendly default and do not attach

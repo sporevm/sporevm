@@ -42,14 +42,53 @@ set -e
 }
 
 set +e
-"${spore_bin}" run -- /bin/echo spore-smoke >"${workdir}/missing.stdout" 2>"${workdir}/missing.stderr"
+"${spore_bin}" run -- /bin/echo spore-smoke >"${workdir}/echo.stdout" 2>"${workdir}/echo.stderr"
+echo_rc="$?"
+set -e
+[[ "${echo_rc}" == "0" ]] || {
+  cat "${workdir}/echo.stderr" >&2 || true
+  die "spore run /bin/echo exited ${echo_rc}, expected 0"
+}
+grep -Fxq "spore-smoke" "${workdir}/echo.stdout" || {
+  cat "${workdir}/echo.stdout" >&2 || true
+  die "spore run /bin/echo did not forward guest stdout"
+}
+
+set +e
+"${spore_bin}" run 'echo spore-shell-smoke' >"${workdir}/shell.stdout" 2>"${workdir}/shell.stderr"
+shell_rc="$?"
+set -e
+[[ "${shell_rc}" == "0" ]] || {
+  cat "${workdir}/shell.stderr" >&2 || true
+  die "spore run shell command exited ${shell_rc}, expected 0"
+}
+grep -Fxq "spore-shell-smoke" "${workdir}/shell.stdout" || {
+  cat "${workdir}/shell.stdout" >&2 || true
+  die "spore run shell command did not forward guest stdout"
+}
+
+set +e
+"${spore_bin}" run -- echo spore-smoke >"${workdir}/bare.stdout" 2>"${workdir}/bare.stderr"
+bare_rc="$?"
+set -e
+[[ "${bare_rc}" == "127" ]] || {
+  cat "${workdir}/bare.stderr" >&2 || true
+  die "spore run bare echo exited ${bare_rc}, expected 127"
+}
+grep -Fq "spore run: initrd cannot execute echo: not found; use --image, --rootfs, or provide an initrd containing the command" "${workdir}/bare.stderr" || {
+  cat "${workdir}/bare.stderr" >&2 || true
+  die "spore run bare echo did not preserve no-PATH diagnostic"
+}
+
+set +e
+"${spore_bin}" run -- /bin/not-there >"${workdir}/missing.stdout" 2>"${workdir}/missing.stderr"
 missing_rc="$?"
 set -e
 [[ "${missing_rc}" == "127" ]] || {
   cat "${workdir}/missing.stderr" >&2 || true
   die "spore run missing initrd command exited ${missing_rc}, expected 127"
 }
-grep -Fq "spore run: initrd cannot execute /bin/echo: not found; use --image, --rootfs, or provide an initrd containing the command" "${workdir}/missing.stderr" || {
+grep -Fq "spore run: initrd cannot execute /bin/not-there: not found; use --image, --rootfs, or provide an initrd containing the command" "${workdir}/missing.stderr" || {
   cat "${workdir}/missing.stderr" >&2 || true
   die "spore run missing initrd command did not explain the failure"
 }
