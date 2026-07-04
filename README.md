@@ -387,14 +387,23 @@ Release notes and release-gate summaries live on
 Releases are tag driven:
 
 ```bash
+mise run release:prepare -- vX.Y.Z
+mise run check
+git commit -am "chore: Bump version to vX.Y.Z"
 SPOREVM_RELEASE_VERSION=vX.Y.Z mise run release
 ```
 
-`mise run release` runs local checks, verifies `src/root.zig` matches the target
-version, and pushes the tag. The Buildkite tag build creates Linux ARM64 and
-macOS ARM64 CLI archives plus matching `libspore` archives, writes
-`checksums.txt`, and publishes the GitHub release. Use
-`mise run release:snapshot` to build release archives locally without publishing.
+`release:prepare` updates `src/version.zig`, the libspore shared-library
+version, and pkg-config metadata together. `mise run release` runs local checks,
+verifies the built CLI and pkg-config metadata match the target version, and
+pushes the tag. The Buildkite tag build creates Linux ARM64 and macOS ARM64 CLI
+archives plus matching `libspore` archives, writes `checksums.txt`, and
+publishes the GitHub release. Use `mise run release:snapshot` to build release
+archives locally without publishing.
+
+Buildkite release builds should be triggered by GitHub `push` events only. Do
+not subscribe the Buildkite webhook to GitHub `create` events, or a pushed tag
+can create duplicate tag builds.
 
 ## Security
 

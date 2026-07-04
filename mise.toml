@@ -32,6 +32,10 @@ depends = ["check"]
 run = "scripts/release.sh"
 description = "Tag the next version and push to trigger a Buildkite release"
 
+[tasks."release:prepare"]
+run = "scripts/prepare-release.sh"
+description = "Update source and package versions for a release"
+
 [tasks."release:snapshot"]
 run = "scripts/build-release-assets.sh"
 description = "Build local release archives without publishing"
