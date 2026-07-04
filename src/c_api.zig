@@ -1,8 +1,10 @@
 //! C ABI shim for libspore.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
-const libspore = @import("libspore");
+const spore_internal = @import("spore_internal");
+const libspore = spore_internal.api;
 
 const result_success: c_int = 0;
 const result_out_of_memory: c_int = -1;
@@ -11,7 +13,10 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 12;
+const c_abi_version: u32 = 13;
+const reexec_contract_version: u32 = 1;
+const reexec_role_env = "SPORE_REEXEC_ROLE";
+const reexec_contract_env = "SPORE_REEXEC_CONTRACT";
 const inspect_bundle_options_version: u32 = 1;
 const inspect_spore_options_version: u32 = 1;
 const pull_options_version: u32 = 1;
@@ -32,6 +37,21 @@ const stream_event_stderr: c_int = 2;
 const stream_event_terminal: c_int = 3;
 const stream_event_exit: c_int = 4;
 const stream_event_error: c_int = 5;
+
+const ReexecOptions = struct {
+    cleanup_fds: bool = true,
+    unset_env: bool = true,
+    discard_stdout: bool = false,
+};
+
+const ReexecRole = enum {
+    monitor,
+    netd,
+};
+
+const posix_env = if (builtin.os.tag == .windows) struct {} else struct {
+    extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+};
 
 const SporeString = extern struct {
     ptr: ?[*]const u8 = null,
@@ -460,7 +480,7 @@ pub export fn spore_build_info(field: c_int, out: ?*anyopaque) c_int {
     switch (field) {
         build_info_version_string => {
             const typed: *SporeString = @ptrCast(@alignCast(raw_out));
-            typed.* = borrowString(libspore.version);
+            typed.* = borrowString(spore_internal.version);
             return result_success;
         },
         build_info_abi_version => {
@@ -470,6 +490,23 @@ pub export fn spore_build_info(field: c_int, out: ?*anyopaque) c_int {
         },
         else => return result_invalid_value,
     }
+}
+
+pub export fn spore_reexec_main(
+    argc: c_int,
+    raw_argv: ?[*]const ?[*:0]const u8,
+    out_exit_code: ?*c_int,
+) c_int {
+    const out = out_exit_code orelse return result_invalid_value;
+    out.* = 1;
+
+    const role = getenvSlice(reexec_role_env) orelse return result_invalid_value;
+    const contract = getenvSlice(reexec_contract_env) orelse return result_invalid_value;
+    const argv = cArgvToSlices(std.heap.c_allocator, argc, raw_argv) catch |err| return resultFromError(err);
+    defer std.heap.c_allocator.free(argv);
+
+    out.* = runReexecRole(std.heap.c_allocator, role, contract, argv, .{}) catch |err| return resultFromError(err);
+    return result_success;
 }
 
 pub export fn spore_context_new(out_context: ?*?*SporeContextImpl) c_int {
@@ -1230,6 +1267,147 @@ fn jsonOwned(ctx: *SporeContextImpl, value: anytype) !SporeOwnedString {
     return .{ .ptr = out.ptr, .len = len };
 }
 
+fn getenvSlice(name: [*:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(name) orelse return null;
+    return std.mem.span(value);
+}
+
+fn cArgvToSlices(allocator: std.mem.Allocator, argc: c_int, raw_argv: ?[*]const ?[*:0]const u8) ![][]const u8 {
+    if (argc <= 0) return error.InvalidValue;
+    const raw = raw_argv orelse return error.InvalidValue;
+    const count: usize = @intCast(argc);
+    const argv = try allocator.alloc([]const u8, count);
+    errdefer allocator.free(argv);
+    for (argv, raw[0..count]) |*out, maybe_arg| {
+        const arg = maybe_arg orelse return error.InvalidValue;
+        out.* = std.mem.span(arg);
+    }
+    return argv;
+}
+
+fn runReexecRole(
+    allocator: std.mem.Allocator,
+    role: []const u8,
+    contract: []const u8,
+    argv: []const []const u8,
+    options: ReexecOptions,
+) !c_int {
+    if (argv.len < 2 or argv[0].len == 0) return error.InvalidValue;
+    const parsed_role = parseReexecRole(role) orelse return error.InvalidValue;
+    const role_index: usize = if (std.mem.eql(u8, argv[1], "--debug")) 2 else 1;
+    if (argv.len <= role_index or !std.mem.eql(u8, role, argv[role_index])) return error.InvalidValue;
+    const parsed_contract = std.fmt.parseUnsigned(u32, contract, 10) catch return error.InvalidValue;
+    if (parsed_contract != reexec_contract_version) return error.InvalidValue;
+
+    if (options.unset_env) unsetReexecEnv();
+    if (options.cleanup_fds) closeUnexpectedFds();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    var threaded = std.Io.Threaded.init(allocator, .{ .environ = .{ .block = currentEnvironBlock() } });
+    defer threaded.deinit();
+    var environ_map = try std.process.Environ.createMap(.{ .block = currentEnvironBlock() }, allocator);
+    defer environ_map.deinit();
+    _ = environ_map.swapRemove(reexec_role_env);
+    _ = environ_map.swapRemove(reexec_contract_env);
+
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &arena_state,
+        .gpa = allocator,
+        .io = threaded.io(),
+        .environ_map = &environ_map,
+        .preopens = .empty,
+    };
+
+    if (options.discard_stdout) {
+        var stdout_buffer: [1024]u8 = undefined;
+        var stdout_discarding: std.Io.Writer.Discarding = .init(&stdout_buffer);
+        try runReexecRoleWithWriter(init, parsed_role, argv[role_index + 1 ..], argv[0], &stdout_discarding.writer);
+        try stdout_discarding.writer.flush();
+        return 0;
+    }
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
+    try runReexecRoleWithWriter(init, parsed_role, argv[role_index + 1 ..], argv[0], &stdout_file_writer.interface);
+    try stdout_file_writer.interface.flush();
+    return 0;
+}
+
+fn parseReexecRole(role: []const u8) ?ReexecRole {
+    if (std.mem.eql(u8, role, "monitor")) return .monitor;
+    if (std.mem.eql(u8, role, "netd")) return .netd;
+    return null;
+}
+
+fn runReexecRoleWithWriter(
+    init: std.process.Init,
+    role: ReexecRole,
+    role_args: []const []const u8,
+    spore_executable: []const u8,
+    stdout: *std.Io.Writer,
+) !void {
+    switch (role) {
+        .monitor => try spore_internal.monitor.runRole(init, role_args, stdout, spore_executable),
+        .netd => try spore_internal.spore_netd.runRole(init, role_args, stdout),
+    }
+}
+
+fn currentEnvironBlock() std.process.Environ.Block {
+    if (comptime builtin.os.tag == .windows) return .global;
+
+    var count: usize = 0;
+    while (std.c.environ[count] != null) : (count += 1) {}
+    return .{ .slice = std.c.environ[0..count :null] };
+}
+
+fn unsetReexecEnv() void {
+    if (comptime builtin.os.tag == .windows) return;
+    _ = posix_env.unsetenv(reexec_role_env);
+    _ = posix_env.unsetenv(reexec_contract_env);
+}
+
+fn closeUnexpectedFds() void {
+    if (comptime builtin.os.tag == .linux) {
+        const rc = std.os.linux.close_range(
+            @as(std.os.linux.fd_t, 3),
+            std.math.maxInt(std.os.linux.fd_t),
+            .{},
+        );
+        if (std.os.linux.errno(rc) == .SUCCESS) return;
+    }
+    closeFdLoop(3, maxFdToClose());
+}
+
+fn closeFdLoop(first: std.posix.fd_t, last: std.posix.fd_t) void {
+    if (last < first) return;
+    var fd = first;
+    while (true) {
+        _ = std.c.close(fd);
+        if (fd == last) break;
+        fd += 1;
+    }
+}
+
+fn maxFdToClose() std.posix.fd_t {
+    const fallback: std.posix.fd_t = 1024;
+    const hard_cap: u64 = 65_536;
+    const lim = std.posix.getrlimit(.NOFILE) catch return fallback;
+    const raw_cur: u64 = if (lim.cur == std.posix.RLIM.INFINITY) hard_cap else @intCast(lim.cur);
+    const bounded = @min(raw_cur, hard_cap);
+    if (bounded <= 3) return 2;
+    return @intCast(@min(bounded - 1, @as(u64, @intCast(std.math.maxInt(std.posix.fd_t)))));
+}
+
+fn resultFromError(err: anyerror) c_int {
+    return switch (err) {
+        error.OutOfMemory => result_out_of_memory,
+        error.InvalidValue => result_invalid_value,
+        else => result_error,
+    };
+}
+
 fn fail(ctx: *SporeContextImpl, err: anyerror) c_int {
     ctx.setLastError(@errorName(err));
     return switch (err) {
@@ -1242,7 +1420,39 @@ fn fail(ctx: *SporeContextImpl, err: anyerror) c_int {
 test "build info exposes version" {
     var version: SporeString = .{};
     try std.testing.expectEqual(result_success, spore_build_info(build_info_version_string, &version));
-    try std.testing.expectEqualStrings(libspore.version, version.ptr.?[0..version.len]);
+    try std.testing.expectEqualStrings(spore_internal.version, version.ptr.?[0..version.len]);
+
+    var abi: u32 = 0;
+    try std.testing.expectEqual(result_success, spore_build_info(build_info_abi_version, &abi));
+    try std.testing.expectEqual(c_abi_version, abi);
+}
+
+test "reexec role validation fails closed" {
+    const allocator = std.testing.allocator;
+    const options = ReexecOptions{ .cleanup_fds = false, .unset_env = false };
+
+    try std.testing.expectError(error.InvalidValue, runReexecRole(allocator, "netd", "1", &.{ "embedder", "monitor", "--help" }, options));
+    try std.testing.expectError(error.InvalidValue, runReexecRole(allocator, "netd", "2", &.{ "embedder", "netd", "--help" }, options));
+    try std.testing.expectError(error.InvalidValue, runReexecRole(allocator, "unknown", "1", &.{ "embedder", "unknown" }, options));
+    try std.testing.expectError(error.InvalidValue, runReexecRole(allocator, "netd", "1", &.{ "embedder", "--debug" }, options));
+}
+
+test "reexec dispatcher reaches hidden role parsers" {
+    const allocator = std.testing.allocator;
+    const options = ReexecOptions{ .cleanup_fds = false, .unset_env = false, .discard_stdout = true };
+
+    try std.testing.expectEqual(@as(c_int, 0), try runReexecRole(allocator, "netd", "1", &.{ "embedder", "netd", "--help" }, options));
+    try std.testing.expectEqual(@as(c_int, 0), try runReexecRole(allocator, "netd", "1", &.{ "embedder", "--debug", "netd", "--help" }, options));
+    try std.testing.expectEqual(@as(c_int, 0), try runReexecRole(allocator, "monitor", "1", &.{ "embedder", "monitor", "--help" }, options));
+}
+
+test "reexec fd cleanup closes a bounded range" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const fd = std.c.open("/dev/null", .{});
+    try std.testing.expect(fd >= 3);
+    closeFdLoop(fd, fd);
+    try std.testing.expectEqual(@as(c_int, -1), std.c.fcntl(fd, std.c.F.GETFD));
 }
 
 test "inspect bundle options initialize size and version" {

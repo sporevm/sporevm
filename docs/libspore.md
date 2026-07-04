@@ -267,6 +267,21 @@ The named surface is:
 trees and reject symlinks, special files, and overwrite. They do not perform
 workspace sync.
 
+Zig named lifecycle options still default `.spore_executable` to `"spore"`.
+Set it to a matching helper executable unless the caller has installed its own
+re-exec trampoline. The Go binding is the built-in trampoline today.
+
+The Go binding installs the SporeVM re-exec trampoline during package init. If
+`CreateNamedOptions.SporeExecutable` or `ResumeNamedOptions.SporeExecutable` is
+empty, the binding passes the current executable path to libspore, so monitor
+and `netd` child processes re-exec the same linked embedder instead of looking
+up `spore` on `PATH`. Set `SporeExecutable` explicitly to keep using an
+external helper during migration or debugging.
+
+On macOS, standalone Go embedders that use HVF must sign the final executable
+with `com.apple.security.hypervisor`. Signing only `libspore.dylib` is not
+enough because the monitor role is the embedder process.
+
 `execNamed` returns a bounded stdout/stderr result, so `.interactive = true` or
 `.tty = true` returns `error.UnsupportedInteractiveExec`. Use
 `openExecNamedStream` for `spore exec -i/-t` semantics:
@@ -632,12 +647,21 @@ if (spore_copy_in_named(context, &copy) != SPORE_SUCCESS) return 1;
 Set `SPOREVM_RUNTIME_DIR`, cache roots, and similar process settings with
 `spore_context_set_env` before calling lifecycle functions.
 Named lifecycle monitor subprocesses inherit the context environment.
+The C ABI does not install a re-exec trampoline for the host application. Leave
+`spore_executable` empty only when a matching `spore` CLI is available on
+`PATH`, or set it to an executable that can dispatch SporeVM's hidden helper
+roles.
 
 ## Go Binding
 
 The first Go binding lives in [`bindings/go`](../bindings/go). It is a thin cgo
 adapter over the C ABI, so `libspore` must be installed or discoverable through
-`pkg-config`.
+`pkg-config`. The Go package installs the SporeVM re-exec trampoline in package
+init. `CreateNamedOptions.SporeExecutable` and
+`ResumeNamedOptions.SporeExecutable` normally stay empty; the binding fills
+them with the current executable path so monitor and `netd` helpers re-exec the
+same linked Go binary. Set `SporeExecutable` only when deliberately using an
+external helper binary for migration or debugging.
 
 ```go
 client, err := spore.New()
@@ -804,7 +828,7 @@ is private to the current user, matching the named lifecycle registry rules.
 
 The Go binding decodes the same JSON contracts as the CLI and C ABI where calls
 return JSON, and exposes named copy as error-returning side-effect methods. It
-requires C ABI version 12 or newer. Go context cancellation is checked before
+requires C ABI version 13 or newer. Go context cancellation is checked before
 entering C calls; long-running runtime cancellation is not exposed until the Zig
 product API and C ABI provide it.
 
@@ -820,3 +844,35 @@ go test -a ./...
 ```
 
 Use `LD_LIBRARY_PATH` instead of `DYLD_LIBRARY_PATH` on Linux.
+
+For a standalone named-lifecycle smoke from a checkout, run:
+
+```bash
+mise run smoke:libspore-standalone-go
+```
+
+The smoke builds a tiny Go embedder, signs it with the hypervisor entitlement on
+macOS, removes `spore` from `PATH`, and runs plain plus network-enabled named VM
+flows through the re-exec trampoline.
+
+### Named Lifecycle Troubleshooting
+
+- `MonitorVersionMismatch` means libspore reached a monitor helper, but the
+  helper did not report the same SporeVM version and monitor helper contract.
+  The match is exact, including patch releases, because the helper argv/control
+  contract is private to one SporeVM build.
+  Use the Go default self re-exec path, or point `SporeExecutable` /
+  `spore_executable` at a matching `spore` binary.
+- `spore` not found during C or Zig named lifecycle means the default
+  `spore_executable` resolved through `PATH`. Install a matching CLI helper,
+  set `spore_executable` explicitly, or provide an embedder trampoline
+  equivalent to the Go binding's package init hook.
+- On macOS HVF, sign the final embedder executable with
+  `com.apple.security.hypervisor`. Signing only `libspore.dylib` is not enough
+  because the monitor role is the re-execed embedder process.
+- If a dynamically linked standalone embedder times out waiting for monitor
+  readiness before any VM state appears, verify that the re-execed child can
+  load `libspore`. Install the shared library in a normal loader path, embed an
+  rpath, statically link, or pass the needed `DYLD_LIBRARY_PATH` /
+  `LD_LIBRARY_PATH` through the libspore context environment with `SetEnv` or
+  `spore_context_set_env`.

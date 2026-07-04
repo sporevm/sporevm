@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "libspore", .module = libspore_mod },
+            .{ .name = "spore_internal", .module = internal_mod },
         },
     });
     if (target_is_hvf) {

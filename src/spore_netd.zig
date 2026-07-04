@@ -103,6 +103,10 @@ const HostDnsForwarder = struct {
 };
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    try runRole(init, args, stdout);
+}
+
+pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
     if (wantsHelp(args)) {
         try stdout.writeAll(netd_usage);
         return;

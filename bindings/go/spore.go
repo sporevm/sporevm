@@ -13,13 +13,61 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"unsafe"
 )
 
-const minABIVersion uint32 = 12
+const minABIVersion uint32 = 13
+const reexecContractVersion uint32 = C.SPORE_REEXEC_CONTRACT_VERSION
+const reexecRoleEnv = "SPORE_REEXEC_ROLE"
+const reexecContractEnv = "SPORE_REEXEC_CONTRACT"
 
 var ErrClosed = errors.New("spore client closed")
 var ErrStreamClosed = errors.New("spore exec stream closed")
+
+func init() {
+	if os.Getenv(reexecRoleEnv) == "" {
+		return
+	}
+	exitCode, err := reexecMain(os.Args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "spore: reexec failed: %v\n", err)
+		os.Exit(2)
+	}
+	os.Exit(exitCode)
+}
+
+func reexecMain(args []string) (int, error) {
+	if len(args) == 0 {
+		return 1, errors.New("missing argv")
+	}
+	argv, freeArgv := cArgv(args)
+	defer freeArgv()
+
+	var exitCode C.int
+	if result := Result(C.spore_reexec_main(C.int(len(args)), argv, &exitCode)); result != Success {
+		return 1, &CallError{Code: result}
+	}
+	return int(exitCode), nil
+}
+
+func cArgv(args []string) (**C.char, func()) {
+	ptr := C.malloc(C.size_t(len(args)) * C.size_t(unsafe.Sizeof((*C.char)(nil))))
+	if ptr == nil {
+		panic("spore: out of memory")
+	}
+	argv := unsafe.Slice((**C.char)(ptr), len(args))
+	for i, arg := range args {
+		argv[i] = C.CString(arg)
+	}
+	return (**C.char)(ptr), func() {
+		for _, arg := range argv {
+			C.free(unsafe.Pointer(arg))
+		}
+		C.free(ptr)
+	}
+}
 
 // Result is a libspore C ABI result code.
 type Result int
@@ -252,7 +300,10 @@ func (c *Client) CreateNamed(ctx context.Context, options CreateNamedOptions) (N
 	defer freeRootfsPath()
 	imageRef, freeImageRef := cString(options.ImageRef)
 	defer freeImageRef()
-	sporeExecutable, freeSporeExecutable := cString(options.SporeExecutable)
+	sporeExecutable, freeSporeExecutable, err := cNamedSporeExecutable(options.SporeExecutable)
+	if err != nil {
+		return NamedLifecycleResult{}, err
+	}
 	defer freeSporeExecutable()
 	consoleLogPath, freeConsoleLogPath := cString(options.ConsoleLogPath)
 	defer freeConsoleLogPath()
@@ -530,7 +581,10 @@ func (c *Client) ResumeNamed(ctx context.Context, options ResumeNamedOptions) (N
 	defer freeSporeDir()
 	name, freeName := cString(options.Name)
 	defer freeName()
-	sporeExecutable, freeSporeExecutable := cString(options.SporeExecutable)
+	sporeExecutable, freeSporeExecutable, err := cNamedSporeExecutable(options.SporeExecutable)
+	if err != nil {
+		return NamedLifecycleResult{}, err
+	}
 	defer freeSporeExecutable()
 	boundServices, freeBoundServices := cBoundUnixServiceBindings(options.BoundServiceBindings)
 	defer freeBoundServices()
@@ -728,6 +782,30 @@ func cString(s string) (C.SporeString, func()) {
 	return C.SporeString{ptr: ptr, len: C.size_t(len(s))}, func() {
 		C.free(unsafe.Pointer(ptr))
 	}
+}
+
+func cNamedSporeExecutable(explicit string) (C.SporeString, func(), error) {
+	if explicit != "" {
+		value, free := cString(explicit)
+		return value, free, nil
+	}
+	path, err := currentExecutablePath()
+	if err != nil {
+		return C.SporeString{}, func() {}, err
+	}
+	value, free := cString(path)
+	return value, free, nil
+}
+
+func currentExecutablePath() (string, error) {
+	path, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("discover current executable: %w", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	return path, nil
 }
 
 func cStringList(values []string) ([]C.SporeString, func()) {

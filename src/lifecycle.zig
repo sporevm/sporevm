@@ -14,9 +14,15 @@ const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
 const topology = @import("topology.zig");
+const version = @import("version.zig");
 
 pub const runtime_dir_env = local_paths.runtime_dir_env;
 pub const max_name_len = 128;
+pub const monitor_hello_schema = "spore.monitor.hello.v1";
+pub const monitor_helper_contract: u32 = 1;
+const reexec_role_env = "SPORE_REEXEC_ROLE";
+const reexec_contract_env = "SPORE_REEXEC_CONTRACT";
+const reexec_contract_value = "1";
 
 const max_metadata_bytes = 128 * 1024;
 const max_control_response = 128 * 1024;
@@ -1351,6 +1357,10 @@ pub fn createCli(
             const message = "spore create: timed out waiting for monitor readiness";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "create"), message);
         },
+        error.MonitorVersionMismatch => {
+            const message = "spore create: monitor helper version does not match libspore";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "create"), message);
+        },
         else => |e| return e,
     };
     defer deinitNamedLifecycleResult(allocator, result);
@@ -1367,7 +1377,7 @@ pub fn createCli(
                 const message = allocLifecycleMessage(allocator, "spore create: VM is not ready after create: {s}", .{spec.name});
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "create"), message);
             },
-            error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+            error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
                 const message = allocLifecycleMessage(allocator, "spore create: initial command failed for VM {s}: {s}", .{ spec.name, @errorName(err) });
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "create"), message);
             },
@@ -1416,7 +1426,7 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
                 std.debug.print("spore exec: VM is not ready: {s}\n", .{parsed.name});
                 std.process.exit(2);
             },
-            error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+            error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
                 switch (err) {
                     error.MonitorUnavailable => std.debug.print("spore exec: monitor is unavailable for VM: {s}\n", .{parsed.name}),
                     else => std.debug.print("spore exec: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
@@ -1440,7 +1450,7 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
             std.debug.print("spore exec: VM is not ready: {s}\n", .{parsed.name});
             std.process.exit(2);
         },
-        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
             switch (err) {
                 error.MonitorUnavailable => std.debug.print("spore exec: monitor is unavailable for VM: {s}\n", .{parsed.name}),
                 else => std.debug.print("spore exec: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
@@ -1486,7 +1496,7 @@ pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
             std.debug.print("spore copy-in: VM is not ready: {s}\n", .{parsed.name});
             exitAfterCopyArchiveCleanup(&archive, init.io, 2);
         },
-        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
             std.debug.print("spore copy-in: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) });
             exitAfterCopyArchiveCleanup(&archive, init.io, 1);
         },
@@ -1530,7 +1540,7 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
             std.debug.print("spore copy-out: VM is not ready: {s}\n", .{parsed.name});
             exitAfterCopyArchiveCleanup(&archive, init.io, 2);
         },
-        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
             std.debug.print("spore copy-out: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) });
             exitAfterCopyArchiveCleanup(&archive, init.io, 1);
         },
@@ -1638,7 +1648,7 @@ pub fn suspendCli(
             const message = "spore suspend: disk-backed lifecycle suspend requires recorded immutable rootfs identity";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
         },
-        error.MonitorUnavailable, error.MonitorRequestFailed => {
+        error.MonitorUnavailable, error.MonitorRequestFailed, error.MonitorVersionMismatch => {
             const message = switch (err) {
                 error.MonitorUnavailable => allocLifecycleMessage(allocator, "spore suspend: monitor is unavailable for VM: {s}", .{parsed.name}),
                 else => allocLifecycleMessage(allocator, "spore suspend: monitor request failed for VM {s}: {s}", .{ parsed.name, @errorName(err) }),
@@ -1728,6 +1738,10 @@ pub fn forkCli(
         },
         error.MonitorReadyTimeout => {
             const message = "spore fork: timed out waiting for monitor readiness";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "fork"), message);
+        },
+        error.MonitorVersionMismatch => {
+            const message = "spore fork: monitor helper version does not match libspore";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "fork"), message);
         },
         else => |e| return e,
@@ -1824,6 +1838,10 @@ pub fn resumeCli(
         },
         error.MonitorReadyTimeout => {
             const message = "spore resume: timed out waiting for monitor readiness";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "resume"), message);
+        },
+        error.MonitorVersionMismatch => {
+            const message = "spore resume: monitor helper version does not match libspore";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "resume"), message);
         },
         else => |e| return e,
@@ -3109,9 +3127,12 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
         try argv.append("--console-log");
         try argv.append(path);
     }
+    var child_env = try init.environ_map.clone(allocator);
+    try child_env.put(reexec_role_env, "monitor");
+    try child_env.put(reexec_contract_env, reexec_contract_value);
     _ = try std.process.spawn(init.io, .{
         .argv = argv.items,
-        .environ_map = init.environ_map,
+        .environ_map = &child_env,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -3135,7 +3156,7 @@ test "lifecycle monitor spawn receives context environment" {
     defer allocator.free(out_path);
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = script_path,
-        .data = "#!/bin/sh\nprintf '%s' \"$HOME\" > \"$SPOREVM_TEST_ENV_OUT\"\n",
+        .data = "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$HOME\" \"$SPORE_REEXEC_ROLE\" \"$SPORE_REEXEC_CONTRACT\" > \"$SPOREVM_TEST_ENV_OUT\"\n",
     });
     try Io.Dir.cwd().setFilePermissions(io, script_path, @enumFromInt(0o755), .{});
 
@@ -3174,7 +3195,7 @@ test "lifecycle monitor spawn receives context environment" {
         break;
     }
     try std.testing.expect(observed != null);
-    try std.testing.expectEqualStrings("/tmp/sporevm-context-home", observed.?);
+    try std.testing.expectEqualStrings("/tmp/sporevm-context-home\nmonitor\n1\n", observed.?);
 }
 
 fn appendMonitorNetworkPolicyArgs(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), policy: *const run_mod.NetworkPolicy) !void {
@@ -3247,6 +3268,17 @@ fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeou
             sleepMs(20);
             continue;
         }
+        verifyMonitorHello(allocator, io, ready.value.control_socket_path) catch |err| switch (err) {
+            error.MonitorUnavailable => {
+                ready.deinit();
+                sleepMs(20);
+                continue;
+            },
+            else => |e| {
+                ready.deinit();
+                return e;
+            },
+        };
         ready.deinit();
         return;
     }
@@ -3283,6 +3315,7 @@ fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
 
+    try verifyMonitorHello(allocator, context.io, socket_path);
     const address = try net.UnixAddress.init(socket_path);
     const stream = address.connect(context.io) catch return error.MonitorUnavailable;
     errdefer stream.close(context.io);
@@ -3352,6 +3385,7 @@ fn openCopyNamedStreamAt(
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
 
+    try verifyMonitorHello(allocator, context.io, socket_path);
     const address = try net.UnixAddress.init(socket_path);
     const stream = address.connect(context.io) catch return error.MonitorUnavailable;
     errdefer stream.close(context.io);
@@ -3371,7 +3405,7 @@ fn sendStartRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u
 }
 
 fn sendShutdownRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8) ![]const u8 {
-    return sendControlJson(allocator, io, socket_path, "{\"type\":\"shutdown\"}");
+    return sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"shutdown\"}");
 }
 
 fn sendSuspendRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, out_dir: []const u8) ![]const u8 {
@@ -3396,6 +3430,11 @@ fn sendSnapshotRequest(allocator: std.mem.Allocator, io: Io, socket_path: []cons
 }
 
 fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, json: []const u8) ![]const u8 {
+    try verifyMonitorHello(allocator, io, socket_path);
+    return sendControlJsonRaw(allocator, io, socket_path, json);
+}
+
+fn sendControlJsonRaw(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, json: []const u8) ![]const u8 {
     const address = try net.UnixAddress.init(socket_path);
     const stream = address.connect(io) catch return error.MonitorUnavailable;
     defer stream.close(io);
@@ -3406,6 +3445,31 @@ fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8
     var reader = stream.reader(io, &read_buffer);
     const line = reader.interface.takeDelimiterExclusive('\n') catch return error.MonitorUnavailable;
     return allocator.dupe(u8, line);
+}
+
+const MonitorHelloResponse = struct {
+    type: []const u8,
+    schema: ?[]const u8 = null,
+    spore_version: ?[]const u8 = null,
+    helper_contract: ?u32 = null,
+};
+
+fn verifyMonitorHello(allocator: std.mem.Allocator, io: Io, socket_path: []const u8) !void {
+    const response = try sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"hello\"}");
+    defer allocator.free(response);
+    try validateMonitorHello(allocator, response);
+}
+
+fn validateMonitorHello(allocator: std.mem.Allocator, response: []const u8) !void {
+    var parsed = std.json.parseFromSlice(MonitorHelloResponse, allocator, response, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return error.BadMonitorResponse;
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.type, "hello")) return error.MonitorVersionMismatch;
+    if (!std.mem.eql(u8, parsed.value.schema orelse "", monitor_hello_schema)) return error.MonitorVersionMismatch;
+    if (!std.mem.eql(u8, parsed.value.spore_version orelse "", version.value)) return error.MonitorVersionMismatch;
+    if ((parsed.value.helper_contract orelse 0) != monitor_helper_contract) return error.MonitorVersionMismatch;
 }
 
 const CopyStreamFds = struct {
@@ -4399,6 +4463,27 @@ test "named exec response decodes owned output" {
     try std.testing.expectEqualStrings("{\"event\":\"network_decision\"}\n", result.network_events_jsonl);
     try std.testing.expect(!result.stdout_truncated);
     try std.testing.expect(result.stderr_truncated);
+}
+
+test "monitor hello response validates helper version" {
+    const allocator = std.testing.allocator;
+    const ok = try std.fmt.allocPrint(allocator, "{{\"type\":\"hello\",\"schema\":\"{s}\",\"spore_version\":\"{s}\",\"helper_contract\":{d}}}", .{
+        monitor_hello_schema,
+        version.value,
+        monitor_helper_contract,
+    });
+    defer allocator.free(ok);
+    try validateMonitorHello(allocator, ok);
+
+    try std.testing.expectError(error.MonitorVersionMismatch, validateMonitorHello(allocator,
+        \\{"type":"error","message":"unknown control request"}
+    ));
+    try std.testing.expectError(error.MonitorVersionMismatch, validateMonitorHello(allocator,
+        \\{"type":"hello","schema":"spore.monitor.hello.v1","spore_version":"1.3.0","helper_contract":1}
+    ));
+    try std.testing.expectError(error.MonitorVersionMismatch, validateMonitorHello(allocator,
+        \\{"type":"hello","schema":"spore.monitor.hello.v1","spore_version":"1.5.0","helper_contract":2}
+    ));
 }
 
 test "lifecycle renders fork name patterns" {
