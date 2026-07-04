@@ -1374,7 +1374,7 @@ fn closeUnexpectedFds() void {
         const rc = std.os.linux.close_range(
             @as(std.os.linux.fd_t, 3),
             std.math.maxInt(std.os.linux.fd_t),
-            .{},
+            .{ .UNSHARE = false, .CLOEXEC = false },
         );
         if (std.os.linux.errno(rc) == .SUCCESS) return;
     }
