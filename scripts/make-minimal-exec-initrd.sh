@@ -62,10 +62,6 @@ if ! command -v cpio >/dev/null 2>&1; then
   echo "error: cpio is required to build the minimal exec initrd" >&2
   exit 1
 fi
-if ! command -v make >/dev/null 2>&1; then
-  echo "error: make is required to build Toybox" >&2
-  exit 1
-fi
 if [[ ! -d "${toybox_source}" ]]; then
   echo "error: --toybox-source must name a directory: ${toybox_source}" >&2
   exit 1
@@ -91,6 +87,24 @@ elif command -v mise >/dev/null 2>&1; then
   fi
 else
   cc_cmd=(cc)
+fi
+if command -v zig >/dev/null 2>&1; then
+  hostcc_cmd=(zig cc)
+elif command -v mise >/dev/null 2>&1; then
+  host_zig_path="$(mise which zig 2>/dev/null || true)"
+  if [[ -n "${host_zig_path}" ]]; then
+    hostcc_cmd=("${host_zig_path}" cc)
+  elif command -v cc >/dev/null 2>&1; then
+    hostcc_cmd=(cc)
+  else
+    echo "error: a host C compiler is required to build Toybox" >&2
+    exit 1
+  fi
+elif command -v cc >/dev/null 2>&1; then
+  hostcc_cmd=(cc)
+else
+  echo "error: a host C compiler is required to build Toybox" >&2
+  exit 1
 fi
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-minimal-initrd.XXXXXX")"
@@ -118,21 +132,11 @@ build_toybox() {
   local dst="$2"
   local miniconfig="${source_dir}/toybox.config"
   local toybox_build="${workdir}/toybox-src"
-  local path_with_homebrew="/opt/homebrew/bin:/usr/local/bin:${PATH}"
   local config_log="${workdir}/toybox-config.log"
   local build_log="${workdir}/toybox-build.log"
-  local sed_cmd=""
 
   if [[ ! -f "${miniconfig}" ]]; then
     echo "error: missing Toybox config: ${miniconfig}" >&2
-    exit 1
-  fi
-  if PATH="${path_with_homebrew}" command -v gsed >/dev/null 2>&1; then
-    sed_cmd="gsed"
-  elif sed --version >/dev/null 2>&1; then
-    sed_cmd="sed"
-  else
-    echo "error: GNU sed is required to build Toybox; install gsed or build on Linux" >&2
     exit 1
   fi
 
@@ -143,21 +147,131 @@ build_toybox() {
     printf ' %q' "${cc_cmd[@]}"
     printf ' "$@"\n'
   } >"${workdir}/toybox-cc"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf 'exec'
+    printf ' %q' "${hostcc_cmd[@]}"
+    printf ' "$@"\n'
+  } >"${workdir}/toybox-hostcc"
   chmod 0755 "${workdir}/toybox-cc"
+  chmod 0755 "${workdir}/toybox-hostcc"
 
-  if ! PATH="${path_with_homebrew}" \
+  # Toybox 0.8.14 puts the input file before later -e expressions, which GNU
+  # sed accepts but BSD sed treats as a script file.
+  awk '
+    BEGIN { q = sprintf("%c", 39) }
+    index($0, "$SED -En $KCONFIG_CONFIG >") == 1 {
+      print "$SED -En \\";
+      next;
+    }
+    index($0, "#define CFG_") && index($0, "|| exit 1") {
+      sub(/ \|\| exit 1$/, " \\");
+      print;
+      print "  \"$KCONFIG_CONFIG\" > \"$GENDIR\"/config.h || exit 1";
+      next;
+    }
+    index($0, "done | $SED -n -e ") == 1 && index($0, "t no;:no") {
+      print "done | $SED -n \\";
+      print "  -e " q "s/\" *\"//g" q " \\";
+      print "  -e " q "/^#/d" q " \\";
+      print "  -e " q "t no" q " \\";
+      print "  -e " q ":no" q " \\";
+      print "  -e " q "s/\"/\"/p" q " \\";
+      print "  -e " q "t" q " \\";
+      print "  -e " q "s/\\( [AB] \\).*/\\1 \" \"/p" q " |\\";
+      next;
+    }
+    index($0, "  sort -s | $SED -n -e ") == 1 && index($0, "t pair") {
+      print "  sort -s | $SED -n \\";
+      print "  -e " q "s/ A / /" q " \\";
+      print "  -e " q "t pair" q " \\";
+      print "  -e " q "h" q " \\";
+      print "  -e " q "s/\\([^ ]*\\).*/\\1 \" \"/" q " \\";
+      print "  -e " q "x" q " \\";
+      print "  -e " q "b single" q " \\";
+      print "  -e " q ":pair" q " \\";
+      print "  -e " q "h" q " \\";
+      print "  -e " q "n" q " \\";
+      print "  -e " q ":single" q " \\";
+      print "  -e " q "s/[^ ]* B //" q " \\";
+      print "  -e " q "H" q " \\";
+      print "  -e " q "g" q " \\";
+      print "  -e " q "s/\\n/ /" q " \\";
+      print "  -e " q "p" q " | \\";
+      skip_next = 1;
+      next;
+    }
+    index($0, "  STRUX=\"$($SED -ne ") == 1 {
+      print "  STRUX=\"$($SED -n \\";
+      print "  -e " q "s/^#define[[:space:]]*FOR_\\([^[:space:]]*\\).*/\\1/" q " \\";
+      print "  -e " q "t s1_save" q " \\";
+      print "  -e " q "b s1_done" q " \\";
+      print "  -e " q ":s1_save" q " \\";
+      print "  -e " q "h" q " \\";
+      print "  -e " q ":s1_done" q " \\";
+      print "  -e " q "/^GLOBALS(/,/^)/{" q " \\";
+      print "  -e " q "s/^GLOBALS(//" q " \\";
+      print "  -e " q "t s2_start" q " \\";
+      print "  -e " q "b s2_body" q " \\";
+      print "  -e " q ":s2_start" q " \\";
+      print "  -e " q "g" q " \\";
+      print "  -e " q "s/.*/struct &_data {/" q " \\";
+      print "  -e " q ":s2_body" q " \\";
+      print "  -e " q "s/^)/};/" q " \\";
+      print "  -e " q "p" q " \\";
+      print "  -e " q "}" q " \\";
+      print "  $TOYFILES)\"";
+      skip_next = 2;
+      next;
+    }
+    index($0, "  $SED -n ") == 1 && index($0, "struct \\(.*\\)_data") {
+      print "  $SED -n \\";
+      print "  -e " q "s/^struct \\(.*\\)_data .*/\\1/" q " \\";
+      print "  -e " q "t s3_save" q " \\";
+      print "  -e " q "b" q " \\";
+      print "  -e " q ":s3_save" q " \\";
+      print "  -e " q "s/.*/    struct &_data &;/p" q " \\";
+      next;
+    }
+    index($0, "$SED -ne " q "/TAGGED_ARRAY") == 1 {
+      print "$SED -n \\";
+      print "  -e " q "/TAGGED_ARRAY(/,/^)/{" q " \\";
+      print "  -e " q "s/.*TAGGED_ARRAY[(]\\([^,]*\\),/\\1/p" q " \\";
+      print "  -e " q "s/[^{]*{\"\\([^\"]*\\)\"[^{]*/ _\\1/gp" q " \\";
+      print "  -e " q "}" q " toys/*/*.c | tr " q "[:punct:]" q " _ | \\";
+      skip_next = 1;
+      next;
+    }
+    skip_next {
+      skip_next--;
+      next;
+    }
+    { print }
+  ' "${toybox_build}/scripts/make.sh" >"${workdir}/toybox-make.sh"
+  mv "${workdir}/toybox-make.sh" "${toybox_build}/scripts/make.sh"
+  chmod 0755 "${toybox_build}/scripts/make.sh"
+
+  if ! (
+    cd "${toybox_build}"
     KCONFIG_ALLCONFIG="${miniconfig}" \
-    make -C "${toybox_build}" allnoconfig >"${config_log}" 2>&1; then
+    CC="${workdir}/toybox-hostcc" \
+    HOSTCC="${workdir}/toybox-hostcc" \
+    scripts/genconfig.sh -n
+  ) >"${config_log}" 2>&1; then
     cat "${config_log}" >&2
     exit 1
   fi
-  if ! PATH="${path_with_homebrew}" \
+  if ! (
+    cd "${toybox_build}"
     CC="${workdir}/toybox-cc" \
-    SED="${sed_cmd}" \
+    HOSTCC="${workdir}/toybox-hostcc" \
+    SED="sed" \
     CFLAGS="-Os -static" \
     LDFLAGS="-static" \
     NOSTRIP=1 \
-    make -C "${toybox_build}" -j"${TOYBOX_JOBS:-2}" toybox >"${build_log}" 2>&1; then
+    CPUS="${TOYBOX_JOBS:-2}" \
+    scripts/make.sh
+  ) >"${build_log}" 2>&1; then
     cat "${build_log}" >&2
     exit 1
   fi

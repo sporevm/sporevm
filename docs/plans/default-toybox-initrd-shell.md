@@ -170,6 +170,10 @@ symlinks should be created from SporeVM's explicit supported list.
 - `guest/minimal-initrd/toybox.config` enables only the first supported applet
   set, and `guest/minimal-initrd/toybox-sh.c` maps `/bin/sh -lc` to Toybox
   `sh -c`.
+- The initrd builder invokes Toybox's `scripts/genconfig.sh` and
+  `scripts/make.sh` directly, uses Zig for both target and host C compilation,
+  and patches the copied Toybox 0.8.14 build script so BSD `sed` can build the
+  pinned source without a host-installed GNU sed.
 - `scripts/smoke-run.sh` checks shell-string `echo`, exact `/bin/echo`, bare
   `echo` no-PATH failure, and a truly missing command.
 - A local spike on `lox/toybox-initrd-spike` proved the runtime path with
