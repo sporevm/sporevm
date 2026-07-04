@@ -207,4 +207,6 @@ test "rootfs cli help accepts standard help spellings" {
     try std.testing.expect(wantsHelp(&.{ "registry.example/repo:latest", "--help" }));
     try std.testing.expect(wantsTopLevelHelp(&.{"--help"}));
     try std.testing.expect(!wantsTopLevelHelp(&.{ "build", "--help" }));
+    try std.testing.expect(std.mem.indexOf(u8, rootfs_mod.usage, "cas-preload") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cas_preload_usage, "cas-preload") != null);
 }

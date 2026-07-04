@@ -39,6 +39,8 @@ always parallel.
   `--`.
 - Give rootfs and bundle subcommands command-specific help.
 - Stop advertising `fanout --parallel` while continuing to accept it.
+- Hide repair/internal commands from aggregate help while preserving direct
+  expert invocation.
 
 ## Non-Goals
 
@@ -56,6 +58,8 @@ Status: landed in this branch.
 - Group top-level help into one-shot VMs, named VMs, artifacts, and local
   system/rootfs commands.
 - Add command-specific help for rootfs and bundle subcommands.
+- Hide `rootfs cas-preload` from `spore rootfs --help`; keep
+  `spore rootfs cas-preload --help` for explicit repair/debug use.
 - Recognize `help`, `-h`, and `--help` after options or positional arguments
   where that does not conflict with exact argv after `--`.
 - Hide `fanout --parallel` from help and public docs while keeping parser
@@ -73,7 +77,9 @@ Validation:
   - `zig-out/bin/spore pack --help`
   - `zig-out/bin/spore fanout --help`
   - `zig-out/bin/spore rootfs cas-preload --help`
+- `zig-out/bin/spore rootfs --help` omits `cas-preload`
 - unit coverage for preserving guest `--help` after the exact argv delimiter
+  and keeping repair commands out of aggregate help
 
 ### Follow-Up: Product Convenience Commands
 
