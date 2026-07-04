@@ -203,10 +203,20 @@ fi
   cat "${workdir}/dead-exec.err" >&2 || true
   die "exec against killed monitor returned ${dead_exec_status}, expected 2"
 }
-grep -q "VM is not ready" "${workdir}/dead-exec.err" || {
+grep -q "state=stale" "${workdir}/dead-exec.err" || {
   failed=1
   cat "${workdir}/dead-exec.err" >&2 || true
   die "exec against killed monitor did not report stale VM state"
+}
+grep -q "console_log=" "${workdir}/dead-exec.err" || {
+  failed=1
+  cat "${workdir}/dead-exec.err" >&2 || true
+  die "exec against killed monitor did not report console log path"
+}
+grep -q "monitor_log=" "${workdir}/dead-exec.err" || {
+  failed=1
+  cat "${workdir}/dead-exec.err" >&2 || true
+  die "exec against killed monitor did not report monitor log path"
 }
 
 if ! run_spore rm "${dead_vm}"; then

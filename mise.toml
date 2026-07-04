@@ -100,6 +100,10 @@ description = "Smoke the monitor jail denied-operation path"
 run = "mise run build && scripts/smoke-monitor-failure-modes.sh"
 description = "Smoke monitor signal, guest OOM, and killed-monitor cleanup behavior"
 
+[tasks."smoke:libspore-standalone-go"]
+run = "mise run build && scripts/smoke-libspore-standalone-go.sh"
+description = "Smoke Go libspore named lifecycle without spore on PATH"
+
 [tasks."smoke:run-net-config"]
 run = "mise run build && scripts/smoke-run-net-config.sh"
 description = "Smoke product spore run static network configuration"

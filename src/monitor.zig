@@ -13,6 +13,7 @@ const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
 const topology = @import("topology.zig");
+const version = @import("version.zig");
 const vsock = @import("virtio/vsock.zig");
 
 const max_control_request = 4096;
@@ -80,13 +81,16 @@ const RequestState = enum {
 };
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    const allocator = init.arena.allocator();
+    const full_args = try init.minimal.args.toSlice(allocator);
+    try runRole(init, args, stdout, full_args[0]);
+}
+
+pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, spore_executable: []const u8) !void {
     const start_ms = lifecycle.monotonicMs();
-    _ = stdout;
     if (args.len == 1 and (std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "help"))) {
-        var out_buffer: [1024]u8 = undefined;
-        var out_writer: Io.File.Writer = .init(.stdout(), init.io, &out_buffer);
-        try out_writer.interface.writeAll(monitor_usage);
-        try out_writer.interface.flush();
+        try stdout.writeAll(monitor_usage);
+        try stdout.flush();
         return;
     }
 
@@ -115,11 +119,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         std.debug.print("spore monitor: unsupported vCPU count\n", .{});
         std.process.exit(2);
     };
-    const full_args = try init.minimal.args.toSlice(allocator);
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     if (opts.network == .spore) {
-        try gateway.start(init.io, allocator, full_args[0], false, opts.network_policy);
+        try gateway.start(init.io, allocator, spore_executable, false, opts.network_policy);
         gateway_active = true;
     }
     defer if (gateway_active) gateway.deinit();
@@ -210,7 +213,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .network = opts.network,
         .network_policy = opts.network_policy,
         .network_runtime = if (gateway_active) gateway.runtime() else null,
-        .spore_executable = full_args[0],
+        .spore_executable = spore_executable,
     }, server.control());
     if (result) |monitor_result| {
         switch (monitor_result.exit) {
@@ -918,6 +921,10 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
     };
     defer parsed.deinit();
 
+    if (std.mem.eql(u8, parsed.value.type, "hello")) {
+        try writeControlHello(server.io, stream);
+        return false;
+    }
     if (std.mem.eql(u8, parsed.value.type, "shutdown")) {
         server.requestStop();
         try writeControlOk(server.io, stream);
@@ -1203,6 +1210,20 @@ fn readFdExact(fd: std.c.fd_t, buf: []u8) !void {
 
 fn writeControlOk(io: Io, stream: net.Stream) !void {
     try writeAll(io, stream, "{\"type\":\"ok\"}\n");
+}
+
+fn writeControlHello(io: Io, stream: net.Stream) !void {
+    var buffer: [256]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const payload = struct {
+        type: []const u8 = "hello",
+        schema: []const u8 = lifecycle.monitor_hello_schema,
+        spore_version: []const u8 = version.value,
+        helper_contract: u32 = lifecycle.monitor_helper_contract,
+    }{};
+    const json = try std.json.Stringify.valueAlloc(fixed.allocator(), payload, .{});
+    try writeAll(io, stream, json);
+    try writeAll(io, stream, "\n");
 }
 
 fn writeControlError(io: Io, stream: net.Stream, message: []const u8) !void {

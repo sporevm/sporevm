@@ -124,6 +124,7 @@ $SPOREVM_RUNTIME_DIR/vms/<name>/
   monitor-timing.json
   monitor-stats.json
   console.log
+  monitor.log
 ```
 
 If `SPOREVM_RUNTIME_DIR` is unset, SporeVM uses the platform runtime directory
@@ -132,8 +133,9 @@ user. Stale entries fail closed unless the recorded monitor pid is dead and the
 user removes or recreates the VM.
 
 Each VM has one monitor process. The monitor owns the hypervisor VM, vCPU loop,
-virtio state, rootfs fd, writable disk state, console log, vsock state, optional
-network gateway, and a local newline-delimited JSON control socket.
+virtio state, rootfs fd, writable disk state, console log, monitor log, vsock
+state, optional network gateway, and a local newline-delimited JSON control
+socket.
 
 ## Session Handles
 
@@ -203,6 +205,20 @@ permissions. There is no TCP control socket and no central `spore daemon`.
 Unknown monitor request types fail closed. `spore ls` reads monitor-published
 metadata such as `monitor-stats.json`; unavailable stats render as unknown
 instead of forcing an expensive VM memory scan.
+
+`spore create`, `spore resume --name`, and `spore fork --vm` report success
+only after the monitor has written `ready.json`, the recorded PID is alive, and
+the local `control.sock` answers a `hello` request with the same SporeVM version
+as the linked library. The monitor argv and control protocol are a private
+same-version contract, so matching is exact: a libspore `1.5.0` caller cannot
+use a `spore` executable reporting `1.3.0`, even if PATH resolves that older
+binary. Version mismatch is a startup error that names both versions and the
+resolved executable path.
+
+Named lifecycle failures include the last known lifecycle state, recorded PID
+when present, `console.log`, `monitor.log`, and the control socket path where
+useful. This is the same diagnostic state visible through `spore ls`, carried
+back to the caller that hit the lifecycle error.
 
 Monitor processes deny child process execution through an embedded macOS
 sandbox profile or Linux seccomp filter after optional startup helpers are

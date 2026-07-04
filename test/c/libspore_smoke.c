@@ -14,7 +14,8 @@ int main(void) {
 
   uint32_t abi_version = 0;
   if (expect_success(spore_build_info(SPORE_BUILD_INFO_ABI_VERSION, &abi_version)) != 0) return 1;
-  if (abi_version != 12) return 1;
+  if (abi_version != 13) return 1;
+  if (SPORE_REEXEC_CONTRACT_VERSION != 1u) return 1;
 
   SporeInspectBundleOptions options;
   spore_inspect_bundle_options_init(&options);
