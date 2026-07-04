@@ -34,6 +34,8 @@ steps:
     agents:
       queue: sporevm-mac
 
+  - wait
+
   - trigger: "sporevm-benchmarks"
     label: ":chart_with_upwards_trend: Trigger Benchmark Suite"
     if: build.branch == "main" || build.env("SPOREVM_RUN_BENCHMARKS") == "1"

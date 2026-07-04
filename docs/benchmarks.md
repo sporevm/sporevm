@@ -281,18 +281,23 @@ files.
 ## Buildkite
 
 The main Buildkite pipeline triggers the dedicated `sporevm-benchmarks` pipeline
-on `main` after merge with the short `ci` profile. Non-main builds can opt in
-with:
+after the build/test jobs pass. Non-main builds can opt in with:
 
 ```console
 SPOREVM_RUN_BENCHMARKS=1
 ```
 
 The dedicated benchmark pipeline runs macOS and Linux ARM64 benchmark jobs in
-parallel on `sporevm-mac` and `sporevm-linux-arm64`. It defaults to the
-broader `comparison` profile for manual runs. Override with
+parallel on `sporevm-mac` and `sporevm-linux-arm64`. Each platform job uses a
+per-platform concurrency group so two benchmark builds do not share the same
+runner class at once. It defaults to the broader `comparison` profile on `main`
+and to `ci` otherwise. Override with
 `SPOREVM_BENCHMARK_PROFILE=ci` for a short cold/warm run, or `full` when a build
 should pay for the full benchmark matrix.
+
+Before the timed suite starts, the CI wrapper logs the host load averages and
+CPU count. Set `SPOREVM_BENCHMARK_MAX_LOADAVG_1M` to fail early when the
+one-minute load average is too high for a trustworthy run.
 
 The CI wrapper honors `SPOREVM_BENCHMARK_SCRATCH_ROOT` when set. Otherwise it
 uses `/var/tmp/nvme/sporevm-benchmarks` when that prepared path exists and is

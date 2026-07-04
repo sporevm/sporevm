@@ -39,6 +39,8 @@ steps:
         --exclude "*/work/*" \
         --exclude "*/bundle-cache/*" \
         --exclude "*/rootfs-cache/cas/*"
+    concurrency: 1
+    concurrency_group: "sporevm-benchmarks/macos"
     agents:
       queue: sporevm-mac
 
@@ -78,6 +80,8 @@ steps:
         --exclude "*/work/*" \
         --exclude "*/bundle-cache/*" \
         --exclude "*/rootfs-cache/cas/*"
+    concurrency: 1
+    concurrency_group: "sporevm-benchmarks/linux-arm64"
     agents:
       queue: sporevm-linux-arm64
 

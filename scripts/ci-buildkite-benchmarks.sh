@@ -102,6 +102,40 @@ cleanup_benchmark_scratch() {
   rm -rf "${benchmark_scratch_dir}" || true
 }
 
+check_benchmark_host_load() {
+  python3 - <<'PY'
+import os
+import sys
+
+limit_raw = os.environ.get("SPOREVM_BENCHMARK_MAX_LOADAVG_1M", "")
+try:
+    load1, load5, load15 = os.getloadavg()
+except OSError:
+    if limit_raw:
+        print("error: pre-benchmark loadavg unavailable", file=sys.stderr)
+        sys.exit(1)
+    print("pre-benchmark loadavg: unavailable", file=sys.stderr)
+    sys.exit(0)
+
+cpus = os.cpu_count() or 1
+print(
+    f"pre-benchmark loadavg: 1m={load1:.2f} 5m={load5:.2f} 15m={load15:.2f} "
+    f"cpus={cpus} load1_per_cpu={load1 / cpus:.3f}",
+    file=sys.stderr,
+)
+if not limit_raw:
+    sys.exit(0)
+try:
+    limit = float(limit_raw)
+except ValueError:
+    print(f"error: invalid SPOREVM_BENCHMARK_MAX_LOADAVG_1M={limit_raw!r}", file=sys.stderr)
+    sys.exit(1)
+if load1 > limit:
+    print(f"error: pre-benchmark 1m loadavg {load1:.2f} exceeds {limit:.2f}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
@@ -153,6 +187,7 @@ fi
 if [[ -n "${benchmark_rootfs_cache_dir}" ]]; then
   benchmark_args+=(--rootfs-cache-dir "${benchmark_rootfs_cache_dir}")
 fi
+check_benchmark_host_load
 scripts/benchmark-sporevm-suite.py "${benchmark_args[@]}"
 scripts/export-sporevm-benchmark-data.py zig-cache/sporevm-benchmarks/latest-summary.json
 if [[ -n "${SPOREVM_BENCHMARK_BASELINE:-}" ]]; then
