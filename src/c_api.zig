@@ -1358,6 +1358,9 @@ test "C ABI inspect spore JSON includes annotation values" {
     try std.testing.expect(std.mem.indexOf(u8, data, "\"annotations\": {") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"cleanroom.workspace\": \"/workspaces/app\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"cleanroom.provenance\": \"sha256:abc123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"network\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"bound_services\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"name\": \"cleanroom-gateway\"") != null);
 }
 
 test "pull rejects missing required options at ABI boundary" {
@@ -1420,7 +1423,14 @@ const inspect_spore_manifest_json =
     \\  "generation": {"generation":0,"interrupt_status":0,"params_b64":""},
     \\  "rootfs": null,
     \\  "disk": null,
-    \\  "network": null,
+    \\  "network": {
+    \\    "bound_services": [{
+    \\      "name": "cleanroom-gateway",
+    \\      "guest_host": "gateway.cleanroom.internal",
+    \\      "guest_port": 8170
+    \\    }],
+    \\    "requirements": {"tcp_ipv4":true,"exact_host_port":false,"bound_services":true}
+    \\  },
     \\  "memory": {"chunk_size":2097152,"chunks":[null],"backing":null}
     \\}
 ;

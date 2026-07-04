@@ -137,10 +137,11 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     defer if (parsed_v1) |*manifest| manifest.deinit();
     if (parsed == null) parsed_v1 = try spore.loadManifestV1(allocator, opts.spore_dir);
 
-    const network_options = run_mod.networkOptionsFromManifestWithBindings(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network, opts.bound_services.slice()) catch |err| switch (err) {
-        error.MissingBoundServiceBinding => failResumeSetup("spore resume: manifest requires live bound Unix service bindings", .{}),
-        error.UnexpectedBoundServiceBinding => failResumeSetup("spore resume: live bound Unix service bindings do not match the manifest", .{}),
-        error.DuplicateBoundServiceBinding => failResumeSetup("spore resume: duplicate live bound Unix service binding", .{}),
+    var binding_diagnostic = run_mod.BoundServiceBindingDiagnostic{};
+    const network_options = run_mod.networkOptionsFromManifestWithBindingDiagnostic(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network, opts.bound_services.slice(), &binding_diagnostic) catch |err| switch (err) {
+        error.MissingBoundServiceBinding => failResumeSetup("spore resume: manifest requires live bound Unix service binding '{s}'", .{binding_diagnostic.missing_name orelse "unknown"}),
+        error.UnexpectedBoundServiceBinding => failResumeSetup("spore resume: live bound Unix service binding '{s}' does not match the manifest", .{binding_diagnostic.unexpected_name orelse "unknown"}),
+        error.DuplicateBoundServiceBinding => failResumeSetup("spore resume: duplicate live bound Unix service binding '{s}'", .{binding_diagnostic.duplicate_name orelse "unknown"}),
         else => failResumeSetup("spore resume: invalid network policy in manifest", .{}),
     };
     var gateway: net_gateway.Process = undefined;

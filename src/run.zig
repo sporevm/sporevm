@@ -221,6 +221,8 @@ pub const BoundServiceBindingList = struct {
     }
 };
 
+pub const BoundServiceBindingDiagnostic = spore_net_policy.BoundServiceBindingDiagnostic;
+
 pub const NetworkMode = enum {
     disabled,
     spore,
@@ -1273,11 +1275,24 @@ pub fn networkOptionsFromManifestWithBindings(
     manifest_network: ?spore.Network,
     bound_services: []const spore_net_policy.BoundServiceBinding,
 ) !NetworkOptions {
+    return networkOptionsFromManifestWithBindingDiagnostic(allocator, manifest_network, bound_services, null);
+}
+
+pub fn networkOptionsFromManifestWithBindingDiagnostic(
+    allocator: std.mem.Allocator,
+    manifest_network: ?spore.Network,
+    bound_services: []const spore_net_policy.BoundServiceBinding,
+    diagnostic: ?*BoundServiceBindingDiagnostic,
+) !NetworkOptions {
+    if (diagnostic) |diag| diag.* = .{};
     const network = manifest_network orelse {
-        if (bound_services.len != 0) return error.UnexpectedBoundServiceBinding;
+        if (bound_services.len != 0) {
+            if (diagnostic) |diag| diag.unexpected_name = bound_services[0].name;
+            return error.UnexpectedBoundServiceBinding;
+        }
         return .{};
     };
-    return .{ .network = .spore, .policy = try spore_net_policy.configFromManifestNetworkWithBindings(allocator, network, bound_services) };
+    return .{ .network = .spore, .policy = try spore_net_policy.configFromManifestNetworkWithBindingDiagnostic(allocator, network, bound_services, diagnostic) };
 }
 
 pub fn manifestNetworkFromOptions(allocator: std.mem.Allocator, network: NetworkMode, policy: *const spore_net_policy.Config) !?spore.Network {
@@ -4241,6 +4256,31 @@ test "run refuses to restore captured bound services without live bindings" {
     };
 
     try std.testing.expectError(error.MissingBoundServiceBinding, networkOptionsFromManifest(arena, manifest_network));
+}
+
+test "run binding diagnostics name missing captured bound service" {
+    var diagnostic = BoundServiceBindingDiagnostic{};
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const service_name = try arena.dupe(u8, "cleanroom-gateway");
+        const manifest_network = spore.Network{
+            .bound_services = &.{.{
+                .name = service_name,
+                .guest_host = "gateway.cleanroom.internal",
+                .guest_port = 8170,
+            }},
+            .requirements = .{ .bound_services = true },
+        };
+
+        try std.testing.expectError(
+            error.MissingBoundServiceBinding,
+            networkOptionsFromManifestWithBindingDiagnostic(arena, manifest_network, &.{}, &diagnostic),
+        );
+    }
+    try std.testing.expectEqualStrings("cleanroom-gateway", diagnostic.missing_name.?);
 }
 
 test "run restores captured bound services with live bindings" {

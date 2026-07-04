@@ -92,6 +92,7 @@ fn runParsed(
             failRunSetup("spore run: -t with --from command execution is not supported yet; omit the command to attach", .{});
         }
         validateTerminalPolicy(parsed);
+        var binding_diagnostic = api.BoundServiceBindingDiagnostic{};
         return api.runFromSpore(.{
             .io = init.io,
             .environ_map = init.environ_map,
@@ -110,11 +111,12 @@ fn runParsed(
             .spore_executable = spore_executable,
             .debug = debug,
             .bound_services = parsed.bound_services.slice(),
+            .bound_service_diagnostic = &binding_diagnostic,
             .events = events,
         }) catch |err| switch (err) {
-            error.MissingBoundServiceBinding => failRunSetup("spore run: manifest requires live bound Unix service bindings", .{}),
-            error.UnexpectedBoundServiceBinding => failRunSetup("spore run: live bound Unix service bindings do not match the manifest", .{}),
-            error.DuplicateBoundServiceBinding => failRunSetup("spore run: duplicate live bound Unix service binding", .{}),
+            error.MissingBoundServiceBinding => failRunSetup("spore run: manifest requires live bound Unix service binding '{s}'", .{binding_diagnostic.missing_name orelse "unknown"}),
+            error.UnexpectedBoundServiceBinding => failRunSetup("spore run: live bound Unix service binding '{s}' does not match the manifest", .{binding_diagnostic.unexpected_name orelse "unknown"}),
+            error.DuplicateBoundServiceBinding => failRunSetup("spore run: duplicate live bound Unix service binding '{s}'", .{binding_diagnostic.duplicate_name orelse "unknown"}),
             else => return err,
         };
     }

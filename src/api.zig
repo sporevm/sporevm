@@ -131,11 +131,14 @@ pub const NetworkPolicy = spore_net_policy.NetworkPolicy;
 pub const NetworkRule = spore_net_policy.NetworkRule;
 pub const BoundService = spore_net_policy.BoundService;
 pub const BoundServiceBinding = spore_net_policy.BoundServiceBinding;
+pub const BoundServiceBindingDiagnostic = spore_net_policy.BoundServiceBindingDiagnostic;
 pub const BoundServiceTarget = spore_net_policy.BoundServiceTarget;
 pub const PortForwardConfig = spore_net_policy.PortForwardConfig;
 pub const Rootfs = run_mod.Rootfs;
 pub const Annotations = spore.Annotations;
 pub const validateAnnotations = spore.validateAnnotations;
+pub const NetworkRequirements = spore.NetworkRequirements;
+pub const NetworkBoundServiceRequirement = spore.NetworkBoundServiceRequirement;
 pub const Session = spore.Session;
 pub const SessionStreams = spore.SessionStreams;
 pub const RootfsBuildOptions = rootfs_mod.BuildRequest;
@@ -280,6 +283,8 @@ pub const RunFromSporeOptions = struct {
     debug: bool = false,
     /// Live host-side bindings for manifest-declared bound services.
     bound_services: []const BoundServiceBinding = &.{},
+    /// Optional detail for binding mismatch errors.
+    bound_service_diagnostic: ?*BoundServiceBindingDiagnostic = null,
     /// Optional synchronous event sink. Output byte slices are callback-scoped.
     events: ?EventSink = null,
 };
@@ -430,6 +435,12 @@ pub const SporePlatformSummary = struct {
     counter_frequency_hz: u64,
 };
 
+pub const SporeNetworkSummary = struct {
+    kind: []const u8,
+    requirements: NetworkRequirements,
+    bound_services: []const NetworkBoundServiceRequirement = &.{},
+};
+
 /// Manifest summary returned by `inspectSpore`.
 ///
 /// Owned string fields must be released with `deinitSporeInspectResult`.
@@ -443,6 +454,7 @@ pub const SporeInspectResult = struct {
     memory_backing_size: ?u64,
     gic_kind: []const u8,
     sessions: []Session = &.{},
+    network: ?SporeNetworkSummary = null,
     annotations: Annotations = .{},
     annotation_keys: []const []const u8 = &.{},
 };
@@ -722,6 +734,7 @@ pub fn deinitSporeInspectResult(allocator: std.mem.Allocator, result: SporeInspe
     allocator.free(result.platform.cpu_profile);
     if (result.memory_backing_kind) |kind| allocator.free(kind);
     freeSessions(allocator, result.sessions);
+    if (result.network) |network| freeNetworkSummary(allocator, network);
     allocator.free(result.annotation_keys);
     var annotations = result.annotations;
     deinitOwnedAnnotations(allocator, &annotations);
@@ -863,7 +876,7 @@ pub fn runFromSpore(
         try run_mod.resumeDiskForRun(arena, parsed.value)
     else
         try run_mod.resumeDiskForRunV1(arena, manifest_v1.?.value);
-    const network_options = try run_mod.networkOptionsFromManifestWithBindings(arena, if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network, options.bound_services);
+    const network_options = try run_mod.networkOptionsFromManifestWithBindingDiagnostic(arena, if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network, options.bound_services, options.bound_service_diagnostic);
     const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else options.vcpus;
     if (manifest_v1 != null and options.vcpus != 1 and options.vcpus != manifest_vcpus) return error.PlatformMismatch;
     const manifest_generation = if (manifest) |parsed| parsed.value.generation else manifest_v1.?.value.generation;
@@ -1264,6 +1277,8 @@ fn summarizeSpore(allocator: std.mem.Allocator, manifest: spore.Manifest) !Spore
     }
     const sessions = try ownSessions(allocator, manifest.sessions);
     errdefer freeSessions(allocator, sessions);
+    const network = try ownNetworkSummary(allocator, manifest.network);
+    errdefer if (network) |owned_network| freeNetworkSummary(allocator, owned_network);
 
     return .{
         .version = manifest.version,
@@ -1284,9 +1299,53 @@ fn summarizeSpore(allocator: std.mem.Allocator, manifest: spore.Manifest) !Spore
         .memory_backing_size = if (manifest.memory.backing) |backing| backing.size else null,
         .gic_kind = @tagName(manifest.machine.gic.kind),
         .sessions = sessions,
+        .network = network,
         .annotations = annotations,
         .annotation_keys = annotation_keys,
     };
+}
+
+fn ownNetworkSummary(allocator: std.mem.Allocator, maybe_network: ?spore.Network) !?SporeNetworkSummary {
+    const network = maybe_network orelse return null;
+    const kind = try allocator.dupe(u8, network.kind);
+    errdefer allocator.free(kind);
+    const bound_services = try allocator.alloc(spore.NetworkBoundServiceRequirement, network.bound_services.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeBoundServiceRequirements(allocator, bound_services[0..initialized]);
+        allocator.free(bound_services);
+    }
+    for (network.bound_services, 0..) |service, i| {
+        const name = try allocator.dupe(u8, service.name);
+        const guest_host = allocator.dupe(u8, service.guest_host) catch |err| {
+            allocator.free(name);
+            return err;
+        };
+        bound_services[i] = .{
+            .name = name,
+            .guest_host = guest_host,
+            .guest_port = service.guest_port,
+        };
+        initialized += 1;
+    }
+    return .{
+        .kind = kind,
+        .requirements = network.requirements,
+        .bound_services = bound_services,
+    };
+}
+
+fn freeNetworkSummary(allocator: std.mem.Allocator, network: SporeNetworkSummary) void {
+    allocator.free(network.kind);
+    freeBoundServiceRequirements(allocator, network.bound_services);
+    allocator.free(network.bound_services);
+}
+
+fn freeBoundServiceRequirements(allocator: std.mem.Allocator, services: []const spore.NetworkBoundServiceRequirement) void {
+    for (services) |service| {
+        allocator.free(service.name);
+        allocator.free(service.guest_host);
+    }
 }
 
 fn ownSessions(allocator: std.mem.Allocator, sessions: []const spore.Session) ![]Session {
@@ -1346,7 +1405,16 @@ test "inspect spore returns annotation values from saved manifest" {
     try annotations.map.put(arena, "cleanroom.create", "created");
     try annotations.map.put(arena, "cleanroom.snapshot", "warm");
     var memory_chunks = [_]?[]const u8{null};
-    try spore.saveManifest(arena, dir, annotationTestManifest(annotations, &memory_chunks));
+    var manifest = annotationTestManifest(annotations, &memory_chunks);
+    manifest.network = .{
+        .bound_services = &.{.{
+            .name = "cleanroom-gateway",
+            .guest_host = "gateway.cleanroom.internal",
+            .guest_port = 8170,
+        }},
+        .requirements = .{ .exact_host_port = true, .bound_services = true },
+    };
+    try spore.saveManifest(arena, dir, manifest);
 
     const inspected = try inspectSpore(allocator, dir);
     defer deinitSporeInspectResult(allocator, inspected);
@@ -1355,6 +1423,14 @@ test "inspect spore returns annotation values from saved manifest" {
     try std.testing.expectEqual(@as(usize, 1), inspected.sessions.len);
     try std.testing.expectEqualStrings(spore.default_session_id, inspected.sessions[0].id);
     try std.testing.expect(inspected.sessions[0].streams.terminal);
+    const network = inspected.network orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(spore.network_kind_spore, network.kind);
+    try std.testing.expect(network.requirements.exact_host_port);
+    try std.testing.expect(network.requirements.bound_services);
+    try std.testing.expectEqual(@as(usize, 1), network.bound_services.len);
+    try std.testing.expectEqualStrings("cleanroom-gateway", network.bound_services[0].name);
+    try std.testing.expectEqualStrings("gateway.cleanroom.internal", network.bound_services[0].guest_host);
+    try std.testing.expectEqual(@as(u16, 8170), network.bound_services[0].guest_port);
 }
 
 fn annotationTestManifest(annotations: spore.Annotations, memory_chunks: []?[]const u8) spore.Manifest {
