@@ -409,6 +409,7 @@ fn exitUsage(
 fn wantsNamedResume(args: []const []const u8) bool {
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--name")) return true;
+        if (std.mem.startsWith(u8, arg, "--name=")) return true;
     }
     return false;
 }
@@ -917,6 +918,7 @@ test "rootfs bundle policy parser accepts exact and metadata-only spellings" {
 test "resume dispatch can distinguish product and named lifecycle modes" {
     try std.testing.expect(!wantsNamedResume(&.{"spore-dir"}));
     try std.testing.expect(wantsNamedResume(&.{ "spore-dir", "--name", "bench-1" }));
+    try std.testing.expect(wantsNamedResume(&.{ "spore-dir", "--name=bench-1" }));
 }
 
 test "command help accepts standard help spellings" {

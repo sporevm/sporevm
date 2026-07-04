@@ -136,6 +136,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     defer if (existing_spec) |*spec| spec.deinit();
     const spec_rootfs = if (existing_spec) |spec| spec.value.rootfs else null;
     const spec_disk = if (existing_spec) |spec| spec.value.disk else null;
+    const spec_resume_generation = if (existing_spec) |spec| spec.value.resume_generation else null;
     const spec_annotations = if (existing_spec) |spec| spec.value.annotations else spore.Annotations{};
     const spec_sessions = if (existing_spec) |spec|
         if (spec.value.sessions.len != 0) spec.value.sessions else sessionHandlesForResume(allocator, opts.resume_dir)
@@ -164,6 +165,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .sessions = spec_sessions,
         .image_ref = opts.image_ref,
         .resume_dir = opts.resume_dir,
+        .resume_generation = spec_resume_generation,
         .memory = opts.memory,
         .vcpus = opts.vcpus,
         .guest_port = opts.guest_port,
@@ -202,6 +204,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .rootfs = spec_rootfs,
         .disk = spec_disk,
         .resume_dir = opts.resume_dir,
+        .resume_generation = spec_resume_generation,
         .resume_sessions = spec_sessions,
         .annotations = spec_annotations,
         .command = &.{"/bin/true"},
