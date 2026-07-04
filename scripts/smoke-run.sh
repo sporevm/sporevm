@@ -42,6 +42,19 @@ set -e
 }
 
 set +e
+"${spore_bin}" run -- /bin/echo spore-smoke >"${workdir}/missing.stdout" 2>"${workdir}/missing.stderr"
+missing_rc="$?"
+set -e
+[[ "${missing_rc}" == "127" ]] || {
+  cat "${workdir}/missing.stderr" >&2 || true
+  die "spore run missing initrd command exited ${missing_rc}, expected 127"
+}
+grep -Fq "spore run: initrd cannot execute /bin/echo: not found; use --image, --rootfs, or provide an initrd containing the command" "${workdir}/missing.stderr" || {
+  cat "${workdir}/missing.stderr" >&2 || true
+  die "spore run missing initrd command did not explain the failure"
+}
+
+set +e
 "${spore_bin}" run --json -- /bin/true >"${workdir}/json.stdout" 2>"${workdir}/json.stderr"
 json_rc="$?"
 set -e

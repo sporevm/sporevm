@@ -27,7 +27,9 @@ spore --json ls
 ```
 
 `spore create`, `spore exec`, and `spore run` accept a shell command by default
-and `-- <argv...>` for exact argv. A command passed to `spore create` is
+and `-- <argv...>` for exact argv. Shell-form commands require a guest
+environment with `/bin/sh`; use `--image`, `--rootfs`, or a command-capable
+initrd for general distro commands. A command passed to `spore create` is
 started in the guest and detached; stdout and stderr are discarded so the named
 VM is immediately available for `fork`, `exec`, `suspend`, and `rm`. `spore
 exec` forwards guest stdout and stderr as workload streams. Pass `-i` to stream

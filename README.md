@@ -108,7 +108,8 @@ spore run -- /bin/writeout
 ```
 
 `spore run` uses the managed SporeVM run kernel and the embedded minimal exec
-initrd.
+initrd. The embedded initrd contains SporeVM helper binaries, not a general
+shell; use `--image` or `--rootfs` for distro commands such as `echo hi`.
 
 Forward host stdin explicitly with `-i` when the guest process should read
 input. Without `-i`, runs keep the script-friendly default and do not attach

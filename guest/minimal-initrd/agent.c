@@ -2037,6 +2037,23 @@ static int open_session_pty(int *master_out, int *slave_out, uint16_t rows, uint
   return 0;
 }
 
+static int exec_failure_code(int err) {
+  return err == ENOENT || err == ENOTDIR ? 127 : 126;
+}
+
+static void execve_or_report(char *const argv[], char *const envp[], int use_rootfs, int failure_fd) {
+  char *const empty_env[] = { NULL };
+  execve(argv[0], argv, envp[0] != NULL ? envp : empty_env);
+  int err = errno;
+  if (!use_rootfs && (err == ENOENT || err == ENOTDIR)) {
+    dprintf(STDERR_FILENO, "spore run: initrd cannot execute %s: not found; use --image, --rootfs, or provide an initrd containing the command\n", argv[0]);
+  } else {
+    dprintf(STDERR_FILENO, "spore run: exec %s failed: %s\n", argv[0], strerror(err));
+  }
+  if (failure_fd >= 0) (void)write_all(failure_fd, "!", 1);
+  _exit(exec_failure_code(err));
+}
+
 static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio, int memory_pressure, int stdin_enabled, int tty, uint16_t terminal_rows, uint16_t terminal_cols) {
   t_command_start = now_ms();
   int stdin_pipe[2] = { -1, -1 };
@@ -2159,9 +2176,7 @@ static int start_session(struct session *session, const char *session_id, char *
     }
     const char *cwd = working_dir[0] != '\0' ? working_dir : "/";
     if (chdir(cwd) != 0) _exit(126);
-    char *const empty_env[] = { NULL };
-    execve(argv[0], argv, envp[0] != NULL ? envp : empty_env);
-    _exit(127);
+    execve_or_report(argv, envp, use_rootfs, -1);
   }
   if (stdin_pipe[0] >= 0) close(stdin_pipe[0]);
   if (pty_slave >= 0) close(pty_slave);
@@ -2295,9 +2310,7 @@ static int start_detached(char *const argv[], char *const envp[], const char *wo
     }
     const char *cwd = working_dir[0] != '\0' ? working_dir : "/";
     if (chdir(cwd) != 0) detached_child_fail(exec_pipe[1]);
-    char *const empty_env[] = { NULL };
-    execve(argv[0], argv, envp[0] != NULL ? envp : empty_env);
-    detached_child_fail(exec_pipe[1]);
+    execve_or_report(argv, envp, use_rootfs, exec_pipe[1]);
   }
 
   close_fd_if_open(&devnull);
