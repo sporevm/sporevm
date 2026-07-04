@@ -141,6 +141,7 @@ mise run smoke:run-net-http
 mise run smoke:run-net-deny
 mise run smoke:run-net-capture
 mise run smoke:run-net-bind-service
+mise run smoke:run-net-bind-service-oci
 SPORE_SMOKE_EGRESS=1 mise run smoke:net-egress
 mise run smoke:run-net-forward
 ```
