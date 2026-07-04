@@ -468,3 +468,14 @@ Definition of done:
   distribution and skew fix, not a stricter monitor hardening mode.
 - The handshake should land first because it protects current external-helper
   deployments and gives the trampoline a clear failure mode during rollout.
+
+## Reconciliation With Named Lifecycle Contract Hardening
+
+This plan's hello wire shape won the merge with
+`docs/plans/named-lifecycle-contract-hardening.md`: one monitor hello handler
+returning `spore.monitor.hello.v1` with `spore_version` and `helper_contract`,
+verified at startup and before every control operation except shutdown. The
+hardening plan contributed the pre-spawn `spore version` probe (skipped for
+self-exec, which cannot skew and must not run an embedder's CLI), the
+diagnostics carried on lifecycle errors, and `monitor.log`. The Go binding
+default stays the current executable path.

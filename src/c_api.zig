@@ -275,6 +275,7 @@ const SporeContextImpl = struct {
     fn clearLastError(self: *SporeContextImpl) void {
         if (self.last_error.len != 0) self.allocator.free(self.last_error);
         self.last_error = &.{};
+        libspore.clearLastLifecycleError();
     }
 
     fn setLastError(self: *SporeContextImpl, message: []const u8) void {
@@ -1409,7 +1410,8 @@ fn resultFromError(err: anyerror) c_int {
 }
 
 fn fail(ctx: *SporeContextImpl, err: anyerror) c_int {
-    ctx.setLastError(@errorName(err));
+    const detail = libspore.lastLifecycleErrorMessage();
+    ctx.setLastError(if (detail.len == 0) @errorName(err) else detail);
     return switch (err) {
         error.OutOfMemory => result_out_of_memory,
         error.InvalidPruneSelection, error.InvalidValue => result_invalid_value,
@@ -1598,6 +1600,43 @@ test "C ABI can list named VMs from context runtime env" {
     try std.testing.expectEqual(result_success, spore_list_named_json(context, &json));
     defer spore_free_string(context, json);
     try std.testing.expectEqualStrings("[]\n", json.ptr.?[0..json.len]);
+}
+
+test "C ABI named lifecycle last error carries state and log paths" {
+    var context: ?*SporeContextImpl = null;
+    try std.testing.expectEqual(result_success, spore_context_new(&context));
+    defer spore_context_free(context);
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const runtime = try std.fs.path.resolve(allocator, &.{"/tmp/sporevm-c-api-lifecycle-error"});
+    defer allocator.free(runtime);
+    defer std.Io.Dir.cwd().deleteTree(io, runtime) catch {};
+    try std.testing.expectEqual(result_success, spore_context_set_env(context, borrowString("SPOREVM_RUNTIME_DIR"), borrowString(runtime)));
+    const console_log_path = try std.fs.path.resolve(allocator, &.{ runtime, "vms", "bench-1", "console.log" });
+    defer allocator.free(console_log_path);
+    const monitor_log_path = try std.fs.path.resolve(allocator, &.{ runtime, "vms", "bench-1", "monitor.log" });
+    defer allocator.free(monitor_log_path);
+    const control_socket_path = try std.fs.path.resolve(allocator, &.{ runtime, "vms", "bench-1", "control.sock" });
+    defer allocator.free(control_socket_path);
+
+    var argv = [_]SporeString{borrowString("/bin/true")};
+    var options: SporeExecNamedOptions = undefined;
+    spore_exec_named_options_init(&options);
+    options.name = borrowString("bench-1");
+    options.argv = &argv;
+    options.argc = argv.len;
+
+    var json: SporeOwnedString = .{};
+    try std.testing.expectEqual(result_error, spore_exec_named_json(context, &options, &json));
+    try std.testing.expectEqual(@as(?[*]u8, null), json.ptr);
+
+    const last = spore_context_last_error(context);
+    const detail = last.ptr.?[0..last.len];
+    try std.testing.expect(std.mem.indexOf(u8, detail, "state=absent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, console_log_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, monitor_log_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, control_socket_path) != null);
 }
 
 const inspect_spore_manifest_json =

@@ -246,6 +246,20 @@ For mutable image refs, Zig callers can set `.image_pull_policy` to `.missing`,
 `.always`, or `.never`; the C and Go bindings use the default `.missing`
 policy.
 
+Named startup operations spawn the `spore` executable to run the private monitor
+entry point. When `spore_executable` is omitted or empty, Zig, C, and Go callers
+all use `"spore"`, resolved with the process `PATH` used for the operation.
+Before `createNamed`, `resumeNamed`, or `forkNamed` returns success, libspore
+waits for `ready.json`, confirms the recorded PID is alive, connects to the
+monitor's local `control.sock`, and requires a `hello` response carrying exactly
+the same version as `libspore.version`.
+
+Exact version equality is the compatibility rule. The monitor argv and control
+socket protocol are private same-version contracts, not a stable cross-version
+API. If libspore `1.5.0` resolves and starts a `spore` executable reporting
+`1.3.0`, startup fails with a message naming both versions and the resolved
+executable path.
+
 The named surface is:
 
 - `createNamed`
@@ -276,11 +290,21 @@ The Go binding installs the SporeVM re-exec trampoline during package init. If
 empty, the binding passes the current executable path to libspore, so monitor
 and `netd` child processes re-exec the same linked embedder instead of looking
 up `spore` on `PATH`. Set `SporeExecutable` explicitly to keep using an
-external helper during migration or debugging.
+external helper during migration or debugging. When the resolved executable is
+the current process, the pre-spawn `spore version` probe is skipped: self-exec
+cannot skew, and probing an embedder binary would invoke the embedder's own
+CLI.
 
 On macOS, standalone Go embedders that use HVF must sign the final executable
 with `com.apple.security.hypervisor`. Signing only `libspore.dylib` is not
 enough because the monitor role is the embedder process.
+
+Named lifecycle errors carry diagnostics in addition to the error tag. Zig
+callers can read `lastLifecycleErrorMessage()` after a failed lifecycle call.
+The C ABI copies the same text into `spore_context_last_error`, and the Go
+binding returns it through `CallError`. Startup, already-exists, and not-ready
+diagnostics include the last known VM state, recorded PID when present,
+`console.log`, `monitor.log`, and the control socket path where useful.
 
 `execNamed` returns a bounded stdout/stderr result, so `.interactive = true` or
 `.tty = true` returns `error.UnsupportedInteractiveExec`. Use

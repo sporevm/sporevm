@@ -989,6 +989,9 @@ pub fn openExecNamedStream(
     return lifecycle.openExecNamedStream(context, allocator, options);
 }
 
+pub const clearLastLifecycleError = lifecycle.clearLastError;
+pub const lastLifecycleErrorMessage = lifecycle.lastErrorMessage;
+
 /// Copy an explicit host file or directory into a ready named VM.
 pub fn copyInNamed(
     context: Context,
