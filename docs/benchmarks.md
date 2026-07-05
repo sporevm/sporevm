@@ -287,6 +287,9 @@ after the build/test jobs pass. Non-main builds can opt in with:
 SPOREVM_RUN_BENCHMARKS=1
 ```
 
+The trigger is asynchronous, so the parent `sporevm` build does not wait for the
+benchmark pipeline to finish.
+
 The dedicated benchmark pipeline runs macOS and Linux ARM64 benchmark jobs in
 parallel on `sporevm-mac` and `sporevm-linux-arm64`. Each platform job uses a
 per-platform concurrency group so two benchmark builds do not share the same

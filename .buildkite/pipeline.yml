@@ -38,6 +38,7 @@ steps:
 
   - trigger: "sporevm-benchmarks"
     label: ":chart_with_upwards_trend: Trigger Benchmark Suite"
+    async: true
     if: build.branch == "main" || build.env("SPOREVM_RUN_BENCHMARKS") == "1"
     build:
       branch: "${BUILDKITE_BRANCH}"
