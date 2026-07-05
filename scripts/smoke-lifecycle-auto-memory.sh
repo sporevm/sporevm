@@ -192,12 +192,12 @@ fi
 
 suspend_start_ms="$(now_ms)"
 if run_capture "${suspend_stdout}" "${suspend_stderr}" \
-  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" suspend "${vm_name}" --out "${spore_dir}"; then
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" save "${vm_name}" --out "${spore_dir}" --stop; then
   suspended=1
   created=0
 else
   status=$?
-  require_success "${status}" "spore suspend" "${suspend_stderr}"
+  require_success "${status}" "spore save --stop" "${suspend_stderr}"
 fi
 suspend_ms="$(( $(now_ms) - suspend_start_ms ))"
 

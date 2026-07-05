@@ -83,7 +83,7 @@ printf 'writable rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}
 "${spore_bin}" run \
   --backend "${backend}" \
   --image "${resolved_image_ref}" \
-  --capture "${base_dir}" \
+  --save "${base_dir}" \
   -- /bin/sh -lc 'printf "parent-layer-ok\n" >/var/sporevm-parent && sync' \
   >"${base_stdout}" 2>"${base_stderr}" || {
   cat "${base_stdout}" >&2 || true
@@ -121,7 +121,7 @@ done
 "${spore_bin}" run \
   --backend "${backend}" \
   --from "${fork_dir}/000000" \
-  --capture "${fork_child0_capture_dir}" \
+  --save "${fork_child0_capture_dir}" \
   -- /bin/sh -lc 'test "$(cat /var/sporevm-parent)" = "parent-layer-ok" && printf "fork-child0-layer-ok\n" >/var/sporevm-fork-child && sync' \
   >"${fork_child0_stdout}" 2>"${fork_child0_stderr}" || {
   cat "${fork_child0_stdout}" >&2 || true
@@ -178,7 +178,7 @@ done
 "${spore_bin}" run \
   --backend "${backend}" \
   --from "${base_dir}" \
-  --capture "${child_dir}" \
+  --save "${child_dir}" \
   -- /bin/sh -lc 'test "$(cat /var/sporevm-parent)" = "parent-layer-ok" && printf "child-layer-ok\n" >/var/sporevm-child && sync' \
   >"${child_stdout}" 2>"${child_stderr}" || {
   cat "${child_stdout}" >&2 || true

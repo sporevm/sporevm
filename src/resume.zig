@@ -1,4 +1,4 @@
-//! Product resume support for `spore resume`.
+//! Product attach support for `spore attach`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,6 +17,7 @@ const run_mod = @import("run.zig");
 const runtime_disk = @import("runtime_disk.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
+const spore_stream = @import("spore_stream.zig");
 const virtio_net = @import("virtio/net.zig");
 const vsock = @import("virtio/vsock.zig");
 
@@ -27,6 +28,7 @@ const default_resume_attach_timeout_ms: u64 = 30_000;
 pub const Options = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
+    session_id: ?[]const u8 = null,
     generation_path: ?[]const u8 = null,
     event_mode: run_mod.EventMode = .none,
     events: ?run_mod.EventSink = null,
@@ -34,30 +36,42 @@ pub const Options = struct {
     debug: bool = false,
     timeout_ms: u64 = default_resume_attach_timeout_ms,
     bound_services: run_mod.BoundServiceBindingList = .{},
+    interactive: bool = false,
+    tty: bool = false,
 };
 
 pub const cli_usage =
     \\Usage:
-    \\  spore resume [--backend auto|hvf|kvm] <spore-dir>
+    \\  spore attach [options] <spore-dir>
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
-    \\  --generation FILE       Inject fan-out identity JSON before resume
+    \\  --session ID            Attach to a specific saved session
+    \\  --generation FILE       Inject fan-out identity JSON before attach
     \\  --bind-service NAME=unix:/path.sock
     \\                          Bind a manifest-declared service to a host socket
     \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
     \\  --timeout DURATION      Probe timeout (default: 30s; e.g. 500ms, 1m)
+    \\  -i, --interactive       Forward stdin when the saved session supports it
+    \\  -t, --tty               Attach as a terminal when the saved session has one
     \\  -h, --help              Show this help
+    \\
+    \\Requires a spore with saved sessions. Verify with:
+    \\  spore inspect <spore-dir>
+    \\  # Sessions: 1
     \\
 ;
 
 pub fn parseCliArgs(args: []const []const u8) !Options {
     var backend: Backend = .auto;
     var spore_dir: ?[]const u8 = null;
+    var session_id: ?[]const u8 = null;
     var generation_path: ?[]const u8 = null;
     var event_mode: run_mod.EventMode = .none;
     var timeout_ms: u64 = default_resume_attach_timeout_ms;
     var bound_services = run_mod.BoundServiceBindingList{};
+    var interactive = false;
+    var tty = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -67,6 +81,11 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
                 std.debug.print("--backend must be auto, hvf, or kvm\n", .{});
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, args[i], "--session") and i + 1 < args.len) {
+            i += 1;
+            session_id = args[i];
+        } else if (std.mem.startsWith(u8, args[i], "--session=")) {
+            session_id = args[i]["--session=".len..];
         } else if (std.mem.eql(u8, args[i], "--generation") and i + 1 < args.len) {
             i += 1;
             generation_path = args[i];
@@ -75,10 +94,10 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         } else if (std.mem.eql(u8, args[i], "--bind-service") and i + 1 < args.len) {
             i += 1;
             bound_services.append(spore_net_policy.parseBoundServiceBinding(args[i]) catch |err| {
-                std.debug.print("spore resume: invalid --bind-service {s}: {s}\n", .{ args[i], @errorName(err) });
+                std.debug.print("spore attach: invalid --bind-service {s}: {s}\n", .{ args[i], @errorName(err) });
                 std.process.exit(2);
             }) catch |err| {
-                std.debug.print("spore resume: invalid --bind-service {s}: {s}\n", .{ args[i], @errorName(err) });
+                std.debug.print("spore attach: invalid --bind-service {s}: {s}\n", .{ args[i], @errorName(err) });
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
@@ -102,22 +121,30 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         } else if (std.mem.eql(u8, args[i], "--timeout-ms") and i + 1 < args.len) {
             i += 1;
             timeout_ms = parsePositive(u64, "--timeout-ms", args[i]);
+        } else if (std.mem.eql(u8, args[i], "-i") or std.mem.eql(u8, args[i], "--interactive")) {
+            interactive = true;
+        } else if (std.mem.eql(u8, args[i], "-t") or std.mem.eql(u8, args[i], "--tty")) {
+            tty = true;
+        } else if (std.mem.eql(u8, args[i], "-it") or std.mem.eql(u8, args[i], "-ti")) {
+            interactive = true;
+            tty = true;
         } else if (std.mem.eql(u8, args[i], "--count")) {
-            std.debug.print("spore resume resumes exactly one spore; use spore fork --count N --out DIR, then resume each child\n", .{});
+            std.debug.print("spore attach attaches exactly one spore; use spore fork --count N --out DIR, then attach each child\n", .{});
             std.process.exit(2);
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            std.debug.print("unknown resume argument: {s}\n\n{s}", .{ args[i], cli_usage });
+            std.debug.print("unknown attach argument: {s}\n\n{s}", .{ args[i], cli_usage });
             std.process.exit(2);
         } else if (spore_dir == null) {
             spore_dir = args[i];
         } else {
-            std.debug.print("unexpected resume argument: {s}\n\n{s}", .{ args[i], cli_usage });
+            std.debug.print("unexpected attach argument: {s}\n\n{s}", .{ args[i], cli_usage });
             std.process.exit(2);
         }
     }
 
     return .{
         .backend = backend,
+        .session_id = session_id,
         .generation_path = generation_path,
         .event_mode = event_mode,
         .spore_dir = spore_dir orelse {
@@ -126,11 +153,13 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         },
         .timeout_ms = timeout_ms,
         .bound_services = bound_services,
+        .interactive = interactive,
+        .tty = tty,
     };
 }
 
 pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !run_mod.Result {
-    var events = run_mod.EventEmitter.init(opts.events, "resume");
+    var events = run_mod.EventEmitter.init(opts.events, "attach");
     try events.emitStart(opts.backend);
     errdefer |err| events.emitFailure(err) catch {};
 
@@ -143,12 +172,20 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     defer if (parsed_v1) |*manifest| manifest.deinit();
     if (parsed == null) parsed_v1 = try spore.loadManifestV1(allocator, opts.spore_dir);
 
+    const sessions = if (parsed) |manifest| manifest.value.sessions else parsed_v1.?.value.sessions;
+    const session_id = opts.session_id orelse spore.defaultAttachSessionId(sessions);
+    try spore.validateSessionAttach(sessions, .{
+        .id = session_id,
+        .stdin = opts.interactive and !opts.tty,
+        .terminal = opts.tty,
+    });
+
     var binding_diagnostic = run_mod.BoundServiceBindingDiagnostic{};
     const network_options = run_mod.networkOptionsFromManifestWithBindingDiagnostic(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network, opts.bound_services.slice(), &binding_diagnostic) catch |err| switch (err) {
-        error.MissingBoundServiceBinding => failResumeSetup("spore resume: manifest requires live bound Unix service binding '{s}'", .{binding_diagnostic.missing_name orelse "unknown"}),
-        error.UnexpectedBoundServiceBinding => failResumeSetup("spore resume: live bound Unix service binding '{s}' does not match the manifest", .{binding_diagnostic.unexpected_name orelse "unknown"}),
-        error.DuplicateBoundServiceBinding => failResumeSetup("spore resume: duplicate live bound Unix service binding '{s}'", .{binding_diagnostic.duplicate_name orelse "unknown"}),
-        else => failResumeSetup("spore resume: invalid network policy in manifest", .{}),
+        error.MissingBoundServiceBinding => failAttachSetup("spore attach: manifest requires live bound Unix service binding '{s}'", .{binding_diagnostic.missing_name orelse "unknown"}),
+        error.UnexpectedBoundServiceBinding => failAttachSetup("spore attach: live bound Unix service binding '{s}' does not match the manifest", .{binding_diagnostic.unexpected_name orelse "unknown"}),
+        error.DuplicateBoundServiceBinding => failAttachSetup("spore attach: duplicate live bound Unix service binding '{s}'", .{binding_diagnostic.duplicate_name orelse "unknown"}),
+        else => failAttachSetup("spore attach: invalid network policy in manifest", .{}),
     };
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
@@ -172,16 +209,22 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     defer runtime_disk_state.deinit();
     const generation_params = if (opts.generation_path) |path|
         loadGenerationParams(context.io, allocator, path) catch |err| switch (err) {
-            error.BadGenerationPayload => failResumeSetup("spore resume: invalid --generation payload; required JSON fields: run_id, child_id, parallel_index, parallel_count, fork_index, fork_count, fork_batch_id, vm_id", .{}),
-            error.StreamTooLong => failResumeSetup("spore resume: --generation payload exceeds {d} bytes", .{generation.params_size}),
-            else => |e| failResumeSetup("spore resume: cannot read --generation {s}: {s}", .{ path, @errorName(e) }),
+            error.BadGenerationPayload => failAttachSetup("spore attach: invalid --generation payload; required JSON fields: run_id, child_id, parallel_index, parallel_count, fork_index, fork_count, fork_batch_id, vm_id", .{}),
+            error.StreamTooLong => failAttachSetup("spore attach: --generation payload exceeds {d} bytes", .{generation.params_size}),
+            else => |e| failAttachSetup("spore attach: cannot read --generation {s}: {s}", .{ path, @errorName(e) }),
         }
     else
         null;
     const manifest_generation = if (parsed) |manifest| manifest.value.generation else parsed_v1.?.value.generation;
-    const attach = try prepareResumeAttach(allocator, manifest_generation, generation_params);
+    const attach = try prepareResumeAttach(allocator, manifest_generation, generation_params, .{
+        .session_id = session_id,
+        .interactive = opts.interactive,
+        .tty = opts.tty,
+        .terminal_name = run_mod.terminalName(context.environ_map),
+        .terminal_size = run_mod.terminalSizeOrDefault(run_mod.terminalSizeFd()),
+    });
     defer attach.deinit(allocator);
-    var identity_stream: ?vsock.HostStream = try vsock.HostStream.init(default_resume_guest_port, attach.request);
+    var identity_stream: ?vsock.HostStream = try vsock.HostStream.initWithProtocol(default_resume_guest_port, attach.request, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
     if (identity_stream) |*stream| {
         stream.host_port = vsock.HostStream.deriveHostPort(attach.request);
         if (opts.events != null) {
@@ -192,6 +235,13 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         }
     }
     const identity_probe: ?*vsock.HostStream = if (identity_stream) |*stream| stream else null;
+    var stdin_control = if (identity_stream) |*stream|
+        if (opts.interactive or opts.tty) run_mod.RunStdinControl.init(stream, opts.tty, opts.interactive, run_mod.terminalSizeFd()) else null
+    else
+        null;
+    if (stdin_control) |*control| try control.start(opts.tty and opts.interactive);
+    defer if (stdin_control) |*control| control.deinit();
+    const exec_control = if (stdin_control) |*control| control.control() else null;
 
     const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
@@ -219,6 +269,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
+                .exec_control = exec_control,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .exec_probe_completes_run = true,
                 .exec_probe_failure_fatal = true,
@@ -237,6 +288,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
+                .exec_control = exec_control,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .exec_probe_completes_run = true,
                 .exec_probe_failure_fatal = true,
@@ -338,6 +390,14 @@ const PreparedResumeAttach = struct {
     }
 };
 
+const ResumeAttachOptions = struct {
+    session_id: []const u8,
+    interactive: bool = false,
+    tty: bool = false,
+    terminal_name: []const u8 = "xterm",
+    terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
+};
+
 pub fn loadGenerationParams(io: Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     const params = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(generation.params_size));
     try generation.validateFanoutParams(allocator, params);
@@ -351,7 +411,7 @@ pub fn prepareResumeGenerationState(allocator: std.mem.Allocator, manifest_gener
     return gen_dev.capture(allocator);
 }
 
-fn prepareResumeAttach(allocator: std.mem.Allocator, manifest_generation: spore.GenerationState, generation_params: ?[]const u8) !PreparedResumeAttach {
+fn prepareResumeAttach(allocator: std.mem.Allocator, manifest_generation: spore.GenerationState, generation_params: ?[]const u8, options: ResumeAttachOptions) !PreparedResumeAttach {
     var gen_dev = generation.Device{};
     try gen_dev.restore(allocator, manifest_generation);
     if (generation_params) |params| {
@@ -363,34 +423,21 @@ fn prepareResumeAttach(allocator: std.mem.Allocator, manifest_generation: spore.
     errdefer allocator.free(generation_state.params_b64);
 
     const params_payload = gen_dev.paramsPayload();
-    if (params_payload.len == 0) {
-        const payload = struct {
-            type: []const u8 = "attach",
-            session_id: []const u8 = "default",
-            stdout_offset: u64 = 0,
-            stderr_offset: u64 = 0,
-        }{};
-        const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-        defer allocator.free(json);
+    if (options.interactive or options.tty) {
         return .{
-            .request = try std.fmt.allocPrint(allocator, "{s}\n", .{json}),
+            .request = try run_mod.attachV1Request(allocator, .{
+                .session_id = options.session_id,
+                .interactive = options.interactive,
+                .tty = options.tty,
+                .terminal_name = options.terminal_name,
+                .terminal_size = options.terminal_size,
+                .generation_params = if (params_payload.len == 0) null else params_payload,
+            }),
             .generation_state = generation_state,
         };
     }
-
-    const payload = struct {
-        type: []const u8 = "attach",
-        session_id: []const u8 = "default",
-        stdout_offset: u64 = 0,
-        stderr_offset: u64 = 0,
-        params_json: []const u8,
-    }{
-        .params_json = params_payload,
-    };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
     return .{
-        .request = try std.fmt.allocPrint(allocator, "{s}\n", .{json}),
+        .request = try run_mod.attachRequestWithGeneration(allocator, options.session_id, if (params_payload.len == 0) null else params_payload),
         .generation_state = generation_state,
     };
 }
@@ -399,53 +446,61 @@ fn validateResumeDiskManifestParts(devices: []const spore.TransportState, rootfs
     const disk_count = spore.countBlockDevices(devices);
     if (disk_count == 0) return;
     if (disk_count != 1) {
-        failResumeSetup("spore resume: only one immutable rootfs disk is supported; found {d} block devices", .{disk_count});
+        failAttachSetup("spore attach: only one immutable rootfs disk is supported; found {d} block devices", .{disk_count});
     }
     const rootfs = rootfs_opt orelse {
-        failResumeSetup("spore resume: disk-backed spore has no immutable rootfs artifact; capture with spore run --image or use the backend harness with the original disk", .{});
+        failAttachSetup("spore attach: disk-backed spore has no immutable rootfs artifact; save with spore run --image or use the backend harness with the original disk", .{});
     };
     spore.validateRootfs(rootfs, devices) catch {
-        failResumeSetup("spore resume: invalid immutable rootfs metadata in manifest", .{});
+        failAttachSetup("spore attach: invalid immutable rootfs metadata in manifest", .{});
     };
     if (disk_opt) |writable_disk| {
         spore.validateDisk(writable_disk, rootfs, devices) catch {
-            failResumeSetup("spore resume: invalid writable disk metadata in manifest", .{});
+            failAttachSetup("spore attach: invalid writable disk metadata in manifest", .{});
         };
     }
 }
 
-fn failResumeSetup(comptime fmt: []const u8, args: anytype) noreturn {
+fn failAttachSetup(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print(fmt ++ "\n", args);
     std.process.exit(2);
 }
 
-test "resume cli parser accepts one spore dir" {
+test "attach cli parser accepts one spore dir" {
     const opts = try parseCliArgs(&.{ "--backend", "hvf", "--timeout", "120s", "child.spore" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
     try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }
 
-test "resume cli parser accepts hidden timeout-ms compatibility spelling" {
+test "attach cli parser accepts hidden timeout-ms compatibility spelling" {
     const opts = try parseCliArgs(&.{ "--timeout-ms", "120000", "child.spore" });
     try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }
 
-test "resume cli parser accepts jsonl events" {
+test "attach cli parser accepts jsonl events" {
     const opts = try parseCliArgs(&.{ "--events=jsonl", "child.spore" });
     try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }
 
-test "resume cli parser accepts generation file" {
+test "attach cli parser accepts generation file" {
     const opts = try parseCliArgs(&.{ "--generation", "generation.json", "--events=jsonl", "child.spore" });
     try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
     try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }
 
-test "resume cli parser accepts bound service bindings" {
+test "attach cli parser accepts session and stream options" {
+    const opts = try parseCliArgs(&.{ "--session", "run-1234", "-it", "child.spore" });
+    try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
+    try std.testing.expectEqualStrings("run-1234", opts.session_id.?);
+    try std.testing.expect(opts.interactive);
+    try std.testing.expect(opts.tty);
+}
+
+test "attach cli parser accepts bound service bindings" {
     const opts = try parseCliArgs(&.{ "--bind-service", "metadata=unix:/tmp/metadata.sock", "child.spore" });
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
     try std.testing.expectEqual(@as(usize, 1), opts.bound_services.len);
@@ -453,16 +508,48 @@ test "resume cli parser accepts bound service bindings" {
     try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.bound_services.items[0].target.unix);
 }
 
-test "resume attach request omits empty generation params" {
+test "attach validates saved sessions before bound service bindings" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    var manifest = testDiskGuardManifest(&.{}, false);
+    manifest.rootfs = null;
+    manifest.network = .{
+        .bound_services = &.{.{
+            .name = "metadata",
+            .guest_host = "metadata.spore.internal",
+            .guest_port = 8170,
+        }},
+        .requirements = .{ .bound_services = true },
+    };
+    try spore.saveManifest(arena, dir, manifest);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try std.testing.expectError(error.NoCapturedSession, execute(.{
+        .io = std.testing.io,
+        .environ_map = &env,
+    }, arena, .{
+        .spore_dir = dir,
+    }));
+}
+
+test "attach request omits empty generation params" {
     const allocator = std.testing.allocator;
     const manifest = testDiskGuardManifest(&.{}, false);
-    const attach = try prepareResumeAttach(allocator, manifest.generation, null);
+    const attach = try prepareResumeAttach(allocator, manifest.generation, null, .{ .session_id = spore.default_session_id });
     defer attach.deinit(allocator);
     try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", attach.request);
     try std.testing.expectEqualStrings("", attach.generation_state.params_b64);
 }
 
-test "resume attach request carries refreshed generation params" {
+test "attach request carries refreshed generation params" {
     const allocator = std.testing.allocator;
     var manifest = testDiskGuardManifest(&.{}, false);
     var gen_dev = generation.Device{};
@@ -473,7 +560,7 @@ test "resume attach request carries refreshed generation params" {
     manifest.generation = try gen_dev.capture(allocator);
     defer allocator.free(manifest.generation.params_b64);
 
-    const attach = try prepareResumeAttach(allocator, manifest.generation, null);
+    const attach = try prepareResumeAttach(allocator, manifest.generation, null, .{ .session_id = spore.default_session_id });
     defer attach.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"type\":\"attach\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"params_json\":\"") != null);
@@ -498,7 +585,7 @@ test "resume attach request carries refreshed generation params" {
     try std.testing.expectEqualStrings(params_payload, parsed.value.params_json);
 }
 
-test "resume attach request accepts explicit generation params" {
+test "attach request accepts explicit generation params" {
     const allocator = std.testing.allocator;
     const params =
         \\{"run_id":"rails-rspec-1","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"batch-1","vm_id":"spore-child-7"}
@@ -506,7 +593,7 @@ test "resume attach request accepts explicit generation params" {
     try generation.validateFanoutParams(allocator, params);
 
     const manifest = testDiskGuardManifest(&.{}, false);
-    const attach = try prepareResumeAttach(allocator, manifest.generation, params);
+    const attach = try prepareResumeAttach(allocator, manifest.generation, params, .{ .session_id = spore.default_session_id });
     defer attach.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"run_id\\\":\\\"rails-rspec-1\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"parallel_index\\\":7") != null);

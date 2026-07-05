@@ -21,18 +21,18 @@ $SPOREVM_ROOTFS_CACHE_DIR/
   cas/rootfs/blake3/objects/<id>.chunk
 ```
 
-`spore run --image ... --capture` is the writable-rootfs product path. It
+`spore run --image ... --save` is the writable-rootfs product path. It
 records the immutable ext4 artifact, records `rootfs.storage` from the metadata
 sidecar for image-created spores, and captures rootfs writes as sealed disk
-layers over that base. Older image cache entries are upgraded once when capture
+layers over that base. Older image cache entries are upgraded once when save
 needs portable chunked rootfs identity. `spore rootfs cas-preload --attach-spore`
 remains a repair/debug path for existing exact-rootfs spores; it is not the
 normal producer path.
 
 Plain `spore run --rootfs PATH` is still a local read-only escape hatch. Named
 `spore create --rootfs PATH` records exact immutable rootfs identity in the
-digest cache, so lifecycle checkpoints can resume through the fd-backed rootfs
-path. Combining one-shot `spore run --rootfs PATH` with `--capture` is rejected
+digest cache, so lifecycle saves can restore through the fd-backed rootfs
+path. Combining one-shot `spore run --rootfs PATH` with `--save` is rejected
 until an import path can record chunked portable rootfs identity for arbitrary
 local images.
 
@@ -40,7 +40,7 @@ local images.
 `/run/sporevm/injected/ID` for a fresh run. The bytes are appended to the run
 initrd and, when a rootfs is attached, copied into the rootfs `/run` tmpfs
 before the command starts. They are not installed into the image rootfs cache or
-the immutable rootfs artifact. Spore rejects `--inject` with `--capture` and
+the immutable rootfs artifact. Spore rejects `--inject` with `--save` and
 `--from` so injected bytes are not accidentally captured into a persisted spore.
 
 ## Manifest Authority
@@ -63,7 +63,7 @@ OCI refs and local image ref records are provenance or cache hints only.
 
 ## Runtime Path
 
-Product resume builds one root disk backend:
+Product attach and run-from restore build one root disk backend:
 
 ```text
 virtio-blk

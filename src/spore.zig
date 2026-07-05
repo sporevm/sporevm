@@ -2032,7 +2032,7 @@ pub fn defaultAttachSessionId(sessions: []const Session) []const u8 {
 }
 
 pub fn validateSessionAttach(sessions: []const Session, request: SessionAttachRequest) !void {
-    if (sessions.len == 0) return;
+    if (sessions.len == 0) return error.NoCapturedSession;
     const session = findSession(sessions, request.id) orelse return error.CapturedSessionUnavailable;
     if (request.stdin and !session.streams.stdin) return error.CapturedSessionHasNoInteractiveStdin;
     if (request.terminal and !session.streams.terminal) return error.CapturedSessionHasNoTerminal;
@@ -2658,6 +2658,7 @@ test "manifest json round-trip" {
 test "session attach validation rejects unavailable input streams" {
     const sessions = [_]Session{processSession(default_session_id, false, false)};
 
+    try std.testing.expectError(error.NoCapturedSession, validateSessionAttach(&.{}, .{ .id = default_session_id }));
     try validateSessionAttach(&sessions, .{ .id = default_session_id });
     try std.testing.expectError(error.CapturedSessionHasNoInteractiveStdin, validateSessionAttach(&sessions, .{
         .id = default_session_id,

@@ -11,7 +11,7 @@ Do not rename version or kind strings to v1 for release-label symmetry; use a
 format v1 only for an incompatible on-disk, bundle, or guest-visible contract
 change with a migration decision.
 
-A spore is a sealed, content-addressed checkpoint of a VM. The format, not the
+A spore is sealed, content-addressed VM state. The format, not the
 implementation, is the product: two SporeVM builds on different hypervisors
 interoperate through this document.
 
@@ -34,11 +34,11 @@ A spore is a directory:
 │                           # optional content-addressed disk clusters
 ```
 
-Spores captured from `spore run --image ... --capture` may also require rootfs
+Spores saved from `spore run --image ... --save` may also require rootfs
 storage from the local rootfs cache. The manifest records an immutable ext4
 artifact digest, size, device binding, and provenance. Image-created spores also
 record `rootfs.storage` for the default chunked rootfs CAS path when available.
-Rootfs bytes are not stored inside the spore directory today; `spore resume`
+Rootfs bytes are not stored inside the spore directory today; `spore attach`
 opens and verifies the manifest-selected exact artifact or chunked storage
 before boot.
 
@@ -211,7 +211,7 @@ under `rootfs.cache`.
   "map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks
   remain the portable verified source of truth; unsupported backends and
   imported/cold spores materialize from chunks instead. Product restore paths
-  (`spore resume` and `spore run --from`) may automatically map `ram.backing`
+  (`spore attach` and `spore run --from`) may automatically map `ram.backing`
   when the manifest vCPU count is supported and the local `ram.backing.proof`
   validates against the manifest memory fingerprint, backing metadata, opened
   file identity, and host-local runtime key. A missing, corrupt, foreign-key,

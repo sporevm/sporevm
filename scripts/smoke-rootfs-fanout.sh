@@ -67,7 +67,7 @@ printf 'rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}"
 "${spore_bin}" run \
   --backend "${backend}" \
   --image "${resolved_image_ref}" \
-  --capture "${capture_dir}" \
+  --save "${capture_dir}" \
   -- /bin/true \
   >"${run_stdout}" 2>"${run_stderr}" || {
   cat "${run_stdout}" >&2 || true

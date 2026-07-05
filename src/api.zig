@@ -262,17 +262,20 @@ pub const ManagedRunOptions = struct {
     events: ?EventSink = null,
 };
 
-/// Run a command from a captured spore directory, or attach to its default session.
+/// Run a command from a spore directory, or attach to one of its saved sessions.
 ///
 /// This is the product API for `spore run --from`: it reads the manifest,
-/// restores machine/rootfs/disk policy from the capture, then executes a new
-/// guest command. Empty `command` attaches to the captured default session.
+/// restores machine/rootfs/disk policy from the spore, then executes a new
+/// guest command. Empty `command` attaches to a saved session for lower-level
+/// API compatibility; the CLI spells that path `spore attach`.
 pub const RunFromSporeOptions = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
     /// Guest command and arguments. The first element is the executable.
-    /// Leave empty to attach to the captured default session.
+    /// Leave empty to attach to a saved session.
     command: []const []const u8,
+    /// Saved session to attach when command is empty.
+    attach_session_id: ?[]const u8 = null,
     interactive: bool = false,
     tty: bool = false,
     vcpus: u32 = 1,
@@ -291,14 +294,17 @@ pub const RunFromSporeOptions = struct {
     events: ?EventSink = null,
 };
 
-/// Resume a captured spore to its recorded continuation point.
+/// Attach to a spore's recorded session.
 pub const ResumeOptions = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
+    session_id: ?[]const u8 = null,
     generation_path: ?[]const u8 = null,
     timeout_ms: u64 = 30_000,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
+    interactive: bool = false,
+    tty: bool = false,
     /// Live host-side bindings for manifest-declared bound services.
     bound_services: []const BoundServiceBinding = &.{},
     /// Optional synchronous event sink. Output byte slices are callback-scoped.
@@ -912,7 +918,7 @@ pub fn runFromSpore(
         .resume_dir = options.spore_dir,
         .resume_generation = resume_generation,
         .resume_sessions = sessions,
-        .attach_session_id = spore.defaultAttachSessionId(sessions),
+        .attach_session_id = options.attach_session_id orelse spore.defaultAttachSessionId(sessions),
         .start_generation_params = start_generation_params,
         .require_generation_ready = start_generation_params != null,
         .command = options.command,
@@ -935,7 +941,7 @@ pub fn runFromSpore(
     });
 }
 
-/// Resume a captured spore to its recorded continuation point.
+/// Attach to a spore's recorded session.
 pub fn resumeSpore(
     context: Context,
     allocator: std.mem.Allocator,
@@ -946,11 +952,14 @@ pub fn resumeSpore(
     return resume_mod.execute(context, allocator, .{
         .backend = options.backend,
         .spore_dir = options.spore_dir,
+        .session_id = options.session_id,
         .generation_path = options.generation_path,
         .timeout_ms = options.timeout_ms,
         .spore_executable = options.spore_executable,
         .debug = options.debug,
         .bound_services = bound_services,
+        .interactive = options.interactive,
+        .tty = options.tty,
         .events = options.events,
     });
 }
@@ -964,7 +973,7 @@ pub fn createNamed(
     return lifecycle.createNamed(init, allocator, options);
 }
 
-/// Resume a spore checkpoint as a long-lived named VM.
+/// Restore a spore as a long-lived named VM.
 pub fn resumeNamed(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -1030,7 +1039,7 @@ pub fn snapshotNamed(
     return lifecycle.snapshotNamed(context, allocator, options);
 }
 
-/// Suspend a named VM into a spore checkpoint and remove the live registry entry.
+/// Save a named VM into a spore and remove the live registry entry.
 pub fn suspendNamed(
     context: Context,
     allocator: std.mem.Allocator,

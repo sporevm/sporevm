@@ -126,12 +126,12 @@ if ! "${spore_bin}" run \
   --backend "${backend}" \
   --vcpus "${vcpus}" \
   --memory "${memory}" \
-  --capture "${from_base_dir}" \
+  --save "${from_base_dir}" \
   -- /bin/true \
   >"${workdir}/from-base.stdout" 2>"${workdir}/from-base.stderr"; then
   cat "${workdir}/from-base.stdout" >&2 || true
   cat "${workdir}/from-base.stderr" >&2 || true
-  die "multi-vCPU run --capture base failed"
+  die "multi-vCPU run --save base failed"
 fi
 expect_manifest_v1 "${from_base_dir}"
 
@@ -183,8 +183,8 @@ mkfifo "${capture_events_pipe}"
   --events=jsonl \
   --vcpus "${vcpus}" \
   --memory "${memory}" \
-  --capture "${capture_dir}" \
-  --capture-on USR1 \
+  --save "${capture_dir}" \
+  --save-on USR1 \
   -- /bin/finite \
   >"${capture_events_pipe}" 2>"${capture_stderr}" &
 capture_pid="$!"
@@ -210,17 +210,17 @@ expect_manifest_v1 "${capture_dir}"
 
 resume_stdout="${workdir}/resume.stdout"
 resume_stderr="${workdir}/resume.stderr"
-if ! "${spore_bin}" resume --events=jsonl --backend "${backend}" "${capture_dir}" >"${resume_stdout}" 2>"${resume_stderr}"; then
+if ! "${spore_bin}" attach --events=jsonl --backend "${backend}" "${capture_dir}" >"${resume_stdout}" 2>"${resume_stderr}"; then
   cat "${resume_stdout}" >&2 || true
   cat "${resume_stderr}" >&2 || true
-  die "multi-vCPU resume failed"
+  die "multi-vCPU attach failed"
 fi
 jsonl_output_contains "${resume_stdout}" stdout "spore finite" || {
   cat "${resume_stdout}" >&2 || true
   cat "${resume_stderr}" >&2 || true
-  die "multi-vCPU resume did not continue the captured workload"
+  die "multi-vCPU attach did not continue the saved workload"
 }
-grep -Fq '"exit_code":0' "${resume_stdout}" || die "multi-vCPU resume did not report exit_code 0"
+grep -Fq '"exit_code":0' "${resume_stdout}" || die "multi-vCPU attach did not report exit_code 0"
 
 if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   vm_name="mvcpus-${backend}"
@@ -250,32 +250,32 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   fi
   expect_nproc_equals "${workdir}/forked-nproc.stdout"
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${forked_name}" >/dev/null
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" suspend "${vm_name}" --out "${named_dir}" >"${workdir}/suspend.stdout" 2>"${workdir}/suspend.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" save "${vm_name}" --out "${named_dir}" --stop >"${workdir}/suspend.stdout" 2>"${workdir}/suspend.stderr"; then
     cat "${workdir}/suspend.stdout" >&2 || true
     cat "${workdir}/suspend.stderr" >&2 || true
-    die "multi-vCPU named suspend failed"
+    die "multi-vCPU named save --stop failed"
   fi
   expect_manifest_v1 "${named_dir}"
-  # Multi-vCPU suspends write v1 manifests; inspect must accept everything
-  # resume accepts.
+  # Multi-vCPU stopped saves write v1 manifests; inspect must accept everything
+  # restore accepts.
   if ! "${spore_bin}" --json inspect "${named_dir}" >"${workdir}/inspect.json" 2>"${workdir}/inspect.stderr"; then
     cat "${workdir}/inspect.json" >&2 || true
     cat "${workdir}/inspect.stderr" >&2 || true
-    die "spore inspect rejected a multi-vCPU suspend that resume accepts"
+    die "spore inspect rejected a multi-vCPU save that restore accepts"
   fi
   grep -Eq '"vcpu_count": *'"${vcpus}" "${workdir}/inspect.json" || {
     cat "${workdir}/inspect.json" >&2 || true
-    die "spore inspect did not report the suspended vCPU count"
+    die "spore inspect did not report the saved vCPU count"
   }
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" resume "${named_dir}" --name "${resumed_name}" >"${workdir}/named-resume.stdout" 2>"${workdir}/named-resume.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" restore "${named_dir}" --name "${resumed_name}" >"${workdir}/named-resume.stdout" 2>"${workdir}/named-resume.stderr"; then
     cat "${workdir}/named-resume.stdout" >&2 || true
     cat "${workdir}/named-resume.stderr" >&2 || true
-    die "multi-vCPU named resume failed"
+    die "multi-vCPU named restore failed"
   fi
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${resumed_name}" -- /bin/nproc >"${workdir}/named-exec.stdout" 2>"${workdir}/named-exec.stderr"; then
     cat "${workdir}/named-exec.stdout" >&2 || true
     cat "${workdir}/named-exec.stderr" >&2 || true
-    die "multi-vCPU named exec after resume failed"
+    die "multi-vCPU named exec after restore failed"
   fi
   expect_nproc_equals "${workdir}/named-exec.stdout"
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${resumed_name}" >/dev/null

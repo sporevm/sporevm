@@ -86,8 +86,8 @@ printf 'rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}"
 SPOREVM_ROOTFS_CACHE_DIR="${pack_rootfs_cache}" "${spore_bin}" run \
   --backend "${backend}" \
   --image "${resolved_image_ref}" \
-  --capture "${capture_dir}" \
-  --capture-on USR1 \
+  --save "${capture_dir}" \
+  --save-on USR1 \
   -- /usr/local/bin/ruby \
   -e 'def spore_env; File.readlines("/run/sporevm/env").to_h { |l| l.strip.split("=", 2) }; rescue; {}; end' \
   -e 'STDOUT.sync = true; puts "spore run ready"; printed = false; i = 0' \

@@ -857,7 +857,7 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
     if (err == error.TtyRunFromSporeUnsupported) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: -t with --from command execution is not supported yet; omit the command to attach",
+            "spore run: -t with --from command execution is not supported yet; use `spore attach -t <spore>` to connect to a saved terminal session",
             @errorName(err),
         );
     }
@@ -871,21 +871,28 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
     if (err == error.CapturedSessionHasNoInteractiveStdin) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: captured session has no interactive stdin",
+            "spore run: saved session has no interactive stdin",
             @errorName(err),
         );
     }
     if (err == error.CapturedSessionHasNoTerminal) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: captured session has no terminal",
+            "spore run: saved session has no terminal",
+            @errorName(err),
+        );
+    }
+    if (err == error.NoCapturedSession) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: spore has no saved session; pass a command after --from or use spore run --save to create a session spore",
             @errorName(err),
         );
     }
     if (err == error.CapturedSessionUnavailable) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: captured session handle is unavailable",
+            "spore run: saved session handle is unavailable",
             @errorName(err),
         );
     }
@@ -945,6 +952,7 @@ pub const CliOptions = struct {
     backend: Backend = .auto,
     shared: SharedOptions = .{},
     from_spore_dir: ?[]const u8 = null,
+    attach_session_id: []const u8 = spore.default_session_id,
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
     pull_policy: PullPolicy = .missing,
@@ -977,16 +985,17 @@ pub const cli_usage =
     \\Usage:
     \\  spore run [--kernel Image] [--initrd root.cpio] [options] 'shell command'
     \\  spore run [--kernel Image] [--initrd root.cpio] [options] -- <argv...>
-    \\  spore run --from DIR [options] ['shell command']
+    \\  spore run --from DIR [options] 'shell command'
     \\  spore run --from DIR [options] -- <argv...>
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --kernel Image          Kernel Image path (default: managed SporeVM kernel)
     \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
-    \\  --from DIR              Resume from an existing spore; omit command to attach
-    \\  --rootfs rootfs.ext4    Attach local rootfs read-only; capture unsupported
-    \\  --image REF             Build or reuse cached OCI rootfs; capture preserves rootfs writes
+    \\  --from DIR              Restore VM state from a spore and run a new command
+    \\                          Uses spore memory/device sizing; omit --memory
+    \\  --rootfs rootfs.ext4    Attach local rootfs read-only; save unsupported
+    \\  --image REF             Build or reuse cached OCI rootfs; save preserves rootfs writes
     \\  --pull=missing|always|never
     \\                          Pull policy for mutable --image refs (default: missing)
     \\  --net                   Experimental SporeVM-managed networking
@@ -998,12 +1007,11 @@ pub const cli_usage =
     \\                          With --from, bind a manifest-declared service
     \\  --forward 127.0.0.1:HOST_PORT:GUEST_PORT
     \\                          With --net, forward host loopback TCP to a guest port
-    \\  --capture DIR           Snapshot to DIR; defaults to --capture-on EXIT
-    \\  --capture-on WHEN       Capture trigger: EXIT, INT, TERM, HUP, USR1, or USR2
-    \\  --continue-after-capture
-    \\                          Keep running after a signal-triggered capture
+    \\  --save DIR              Save a spore to DIR; defaults to --save-on EXIT
+    \\  --save-on WHEN          Save trigger: EXIT, INT, TERM, HUP, USR1, or USR2
+    \\  --continue-after-save   Keep running after a signal-triggered save
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
-    \\  --vcpus N               Guest vCPU count (1-8; capture/resume backend-dependent)
+    \\  --vcpus N               Guest vCPU count (1-8; save/restore backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout DURATION      Probe timeout (default: 30s; e.g. 500ms, 1m)
     \\  --console-log PATH      Write guest console output to PATH
@@ -1013,6 +1021,11 @@ pub const cli_usage =
     \\  -t, --tty               Allocate a guest terminal for the process
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
+    \\
+    \\Workflow:
+    \\  spore run --save base.spore --save-on TERM 'while true; do echo tick; sleep 1; done'
+    \\  spore fork base.spore --count 2 --out children
+    \\  spore fanout children --for 10s
     \\
 ;
 
@@ -1071,16 +1084,16 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             };
         } else if (std.mem.eql(u8, args[i], "--from")) {
             from_spore_dir = takeValue(args, &i, args[i]);
-        } else if (std.mem.eql(u8, args[i], "--capture")) {
+        } else if (std.mem.eql(u8, args[i], "--save")) {
             capture_path = takeValue(args, &i, args[i]);
-        } else if (std.mem.eql(u8, args[i], "--capture-on")) {
+        } else if (std.mem.eql(u8, args[i], "--save-on")) {
             const trigger_raw = takeValue(args, &i, args[i]);
             capture_trigger = capture.Trigger.parse(trigger_raw) orelse {
-                std.debug.print("--capture-on must be EXIT, INT, TERM, HUP, USR1, or USR2\n", .{});
+                std.debug.print("--save-on must be EXIT, INT, TERM, HUP, USR1, or USR2\n", .{});
                 std.process.exit(2);
             };
             capture_trigger_set = true;
-        } else if (std.mem.eql(u8, args[i], "--continue-after-capture")) {
+        } else if (std.mem.eql(u8, args[i], "--continue-after-save")) {
             continue_after_capture = true;
         } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
             i += 1;
@@ -1196,19 +1209,19 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         }
     }
     if (capture_trigger_set and capture_path == null) {
-        std.debug.print("spore run: --capture-on requires --capture\n", .{});
+        std.debug.print("spore run: --save-on requires --save\n", .{});
         std.process.exit(2);
     }
     if (continue_after_capture and capture_path == null) {
-        std.debug.print("spore run: --continue-after-capture requires --capture\n", .{});
+        std.debug.print("spore run: --continue-after-save requires --save\n", .{});
         std.process.exit(2);
     }
     if (continue_after_capture and capture_trigger.isExit()) {
-        std.debug.print("spore run: --continue-after-capture requires a signal capture trigger\n", .{});
+        std.debug.print("spore run: --continue-after-save requires a signal save trigger\n", .{});
         std.process.exit(2);
     }
     if (capture_path != null and injected_file_sources.len != 0) {
-        std.debug.print("spore run: --inject with --capture is not supported; injected files are intentionally not persisted\n", .{});
+        std.debug.print("spore run: --inject with --save is not supported; injected files are intentionally not persisted\n", .{});
         std.process.exit(2);
     }
     if (network == .disabled and network_policy.hasRules()) {
@@ -1224,6 +1237,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .backend = backend,
         .shared = shared,
         .from_spore_dir = from_spore_dir,
+        .attach_session_id = spore.default_session_id,
         .rootfs_path = rootfs_path,
         .image_ref = image_ref,
         .pull_policy = pull_policy,
@@ -2275,7 +2289,7 @@ fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
-const RunStdinControl = struct {
+pub const RunStdinControl = struct {
     stream: *vsock.HostStream,
     terminal: bool,
     forward_input: bool,
@@ -2291,7 +2305,7 @@ const RunStdinControl = struct {
     resize_registration: ?TerminalResizeRegistration = null,
     raw_terminal: ?RawTerminal = null,
 
-    fn init(stream: *vsock.HostStream, terminal: bool, forward_input: bool, resize_fd: std.c.fd_t) RunStdinControl {
+    pub fn init(stream: *vsock.HostStream, terminal: bool, forward_input: bool, resize_fd: std.c.fd_t) RunStdinControl {
         return .{
             .stream = stream,
             .terminal = terminal,
@@ -2300,7 +2314,7 @@ const RunStdinControl = struct {
         };
     }
 
-    fn start(self: *RunStdinControl, raw_terminal: bool) !void {
+    pub fn start(self: *RunStdinControl, raw_terminal: bool) !void {
         errdefer self.deinit();
         if (raw_terminal) self.raw_terminal = try RawTerminal.enable();
         if (self.terminal) {
@@ -2313,7 +2327,7 @@ const RunStdinControl = struct {
         }
     }
 
-    fn deinit(self: *RunStdinControl) void {
+    pub fn deinit(self: *RunStdinControl) void {
         self.stop.store(true, .release);
         if (self.stop_pipe[1] >= 0) {
             const byte = [_]u8{1};
@@ -2334,7 +2348,7 @@ const RunStdinControl = struct {
         self.closeStopPipe();
     }
 
-    fn control(self: *RunStdinControl) vsock.Control {
+    pub fn control(self: *RunStdinControl) vsock.Control {
         return .{
             .context = self,
             .pollFn = pollThunk,
@@ -2945,7 +2959,7 @@ pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]co
     return execRequestWithSession(allocator, argv, "default", 0);
 }
 
-fn terminalName(environ: *const std.process.Environ.Map) []const u8 {
+pub fn terminalName(environ: *const std.process.Environ.Map) []const u8 {
     return environ.get("TERM") orelse "xterm";
 }
 
@@ -2954,7 +2968,7 @@ fn ioctlRequest(comptime request: anytype) c_int {
     return @bitCast(raw);
 }
 
-fn terminalSizeOrDefault(fd: std.c.fd_t) spore_stream.Resize {
+pub fn terminalSizeOrDefault(fd: std.c.fd_t) spore_stream.Resize {
     var size: std.posix.winsize = .{
         .row = 0,
         .col = 0,
@@ -2967,7 +2981,7 @@ fn terminalSizeOrDefault(fd: std.c.fd_t) spore_stream.Resize {
     return .{ .rows = 24, .cols = 80 };
 }
 
-fn terminalSizeFd() std.c.fd_t {
+pub fn terminalSizeFd() std.c.fd_t {
     return if (std.c.isatty(1) != 0) 1 else if (std.c.isatty(0) != 0) 0 else 1;
 }
 
@@ -3037,7 +3051,24 @@ fn randomRunSessionId(context: Context, allocator: std.mem.Allocator) ![]const u
     return std.fmt.allocPrint(allocator, "run-{x}-{x}", .{ now, nonce });
 }
 
-fn attachRequest(allocator: std.mem.Allocator, session_id: []const u8) ![]const u8 {
+pub fn attachRequest(allocator: std.mem.Allocator, session_id: []const u8) ![]const u8 {
+    return attachRequestWithGeneration(allocator, session_id, null);
+}
+
+pub fn attachRequestWithGeneration(allocator: std.mem.Allocator, session_id: []const u8, generation_params: ?[]const u8) ![]const u8 {
+    if (generation_params) |params| {
+        const payload = struct {
+            type: []const u8 = "attach",
+            session_id: []const u8,
+            stdout_offset: u64 = 0,
+            stderr_offset: u64 = 0,
+            params_json: []const u8,
+        }{ .session_id = session_id, .params_json = params };
+        const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+        defer allocator.free(json);
+        if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
+        return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    }
     const payload = struct {
         type: []const u8 = "attach",
         session_id: []const u8,
@@ -3050,15 +3081,16 @@ fn attachRequest(allocator: std.mem.Allocator, session_id: []const u8) ![]const 
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
-const AttachV1Options = struct {
+pub const AttachV1Options = struct {
     session_id: []const u8 = spore.default_session_id,
     interactive: bool = false,
     tty: bool = false,
     terminal_name: []const u8 = "xterm",
     terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
+    generation_params: ?[]const u8 = null,
 };
 
-fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) ![]const u8 {
+pub fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) ![]const u8 {
     const payload = struct {
         type: []const u8 = "attach-v1",
         session_id: []const u8,
@@ -3069,6 +3101,7 @@ fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) ![]co
         term: []const u8,
         terminal_rows: u16,
         terminal_cols: u16,
+        params_json: []const u8,
     }{
         .session_id = options.session_id,
         .stdio = if (options.tty) "tty" else "pipe",
@@ -3076,6 +3109,7 @@ fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) ![]co
         .term = options.terminal_name,
         .terminal_rows = options.terminal_size.rows,
         .terminal_cols = options.terminal_size.cols,
+        .params_json = options.generation_params orelse "",
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
@@ -3655,7 +3689,7 @@ test "interactive stream protocol failure has a clear public message" {
     try std.testing.expect(std.mem.indexOf(u8, classified.message, "omit -i/-t") != null);
 }
 
-test "captured session attach failures are usage errors" {
+test "saved session attach failures are usage errors" {
     const classified = classifyFailure(error.CapturedSessionHasNoInteractiveStdin);
     try std.testing.expectEqual(machine_output.ErrorCode.usage_invalid_argument, classified.code);
     try std.testing.expect(std.mem.indexOf(u8, classified.message, "no interactive stdin") != null);
@@ -4401,8 +4435,8 @@ test "run network gateway errors are reported clearly" {
     try std.testing.expect(!isNetworkGatewayError(error.UnsupportedBackend));
 }
 
-test "run cli parser accepts capture flags" {
-    const opts = try parseCliArgs(&.{ "--capture", "out.spore", "--capture-on", "USR1", "--continue-after-capture", "--", "/bin/sleeper" });
+test "run cli parser accepts save flags" {
+    const opts = try parseCliArgs(&.{ "--save", "out.spore", "--save-on", "USR1", "--continue-after-save", "--", "/bin/sleeper" });
     try std.testing.expectEqualStrings("out.spore", opts.capture_path.?);
     try std.testing.expectEqual(capture.Signal.USR1, opts.capture_trigger.signalValue().?);
     try std.testing.expect(opts.continue_after_capture);
@@ -4422,8 +4456,8 @@ test "run cli parser accepts jsonl events" {
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
 }
 
-test "run cli parser defaults capture trigger to exit" {
-    const opts = try parseCliArgs(&.{ "--capture", "out.spore", "--", "/bin/true" });
+test "run cli parser defaults save trigger to exit" {
+    const opts = try parseCliArgs(&.{ "--save", "out.spore", "--", "/bin/true" });
     try std.testing.expectEqualStrings("out.spore", opts.capture_path.?);
     try std.testing.expect(opts.capture_trigger.isExit());
     try std.testing.expect(!opts.continue_after_capture);

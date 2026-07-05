@@ -22,7 +22,7 @@ const topology = @import("topology.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Io = std.Io;
 
-const Error = spore.Error || error{FileNotFound};
+const Error = spore.Error || error{ FileNotFound, UnsupportedMetadataOnlyRootfsStorage };
 
 pub const index_version: u32 = 0;
 pub const bundle_index_version: u32 = 0;
@@ -578,8 +578,7 @@ fn inspectIndexedRootfs(allocator: std.mem.Allocator, bundle_dir: []const u8, bu
 }
 
 pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult {
-    if (options.children_dir != null) return packIndexed(allocator, options);
-    if (options.rootfs_policy != .exact_bytes) return error.BadManifest;
+    if (options.children_dir != null or options.rootfs_policy != .exact_bytes) return packIndexed(allocator, options);
 
     var manifest = try LoadedManifest.loadDir(allocator, options.spore_dir);
     defer manifest.deinit();
@@ -1584,7 +1583,7 @@ fn packRootfsStorageIndexed(
     storage_entries: *std.array_list.Managed(RootfsStorageEntry),
     seen_objects: *std.StringHashMap(void),
 ) Error!u64 {
-    if (options.rootfs_policy == .metadata_only) return error.BadManifest;
+    if (options.rootfs_policy == .metadata_only) return error.UnsupportedMetadataOnlyRootfsStorage;
     const cache_root = options.rootfs_cache_dir orelse return error.IoFailed;
     const storage = rootfs.storage orelse return error.BadManifest;
     try validateRootfsStorageForRootfs(storage, rootfs);
@@ -4580,6 +4579,7 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
     const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
     const single_bundle_dir = try pathZ(arena, "{s}/single-bundle", .{root_dir});
+    const metadata_only_storage_bundle_dir = try pathZ(arena, "{s}/metadata-only-storage-bundle", .{root_dir});
     const single_out_dir = try pathZ(arena, "{s}/single-unpacked", .{root_dir});
     const out_dir = try pathZ(arena, "{s}/pulled-child", .{root_dir});
     const out_cached_dir = try pathZ(arena, "{s}/pulled-cached-child", .{root_dir});
@@ -4605,6 +4605,14 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     var manifest = testRootfsManifest(memory, ram.len, 62, artifact);
     manifest.rootfs.?.storage = rootfs_cas.storageDescriptor(manifest.rootfs.?.device, preload_result);
     try spore.saveManifest(arena, parent_dir, manifest);
+    try std.testing.expectError(error.UnsupportedMetadataOnlyRootfsStorage, pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = metadata_only_storage_bundle_dir,
+        .rootfs_cache_dir = pack_cache_root,
+        .rootfs_policy = .metadata_only,
+    }));
+
     const single_pack = try pack(arena, .{
         .io = io,
         .spore_dir = parent_dir,
@@ -4719,6 +4727,7 @@ test "metadata-only rootfs policy requires explicit prepared cache" {
     const root_dir = try testDir(arena);
     const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
     const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
+    const single_bundle_dir = try pathZ(arena, "{s}/single-bundle", .{root_dir});
     const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
     const out_dir = try pathZ(arena, "{s}/unpacked-child", .{root_dir});
     const out_missing_dir = try pathZ(arena, "{s}/unpacked-missing-child", .{root_dir});
@@ -4738,6 +4747,20 @@ test "metadata-only rootfs policy requires explicit prepared cache" {
     try writeFileAll(rootfs_source_path, "rootfs metadata only bytes");
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
     try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 61, artifact));
+    const single_pack = try pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = single_bundle_dir,
+        .rootfs_cache_dir = pack_cache_root,
+        .rootfs_policy = .metadata_only,
+    });
+    try std.testing.expectEqual(@as(usize, 0), single_pack.child_count);
+    try std.testing.expectEqual(@as(usize, 1), single_pack.rootfs_artifact_count);
+    try std.testing.expectEqual(@as(u64, 0), single_pack.rootfs_payload_bytes);
+    const single_rootfs_index = try loadRootfsIndex(arena, single_bundle_dir);
+    defer single_rootfs_index.deinit();
+    try std.testing.expectEqualStrings(rootfs_policy_metadata_only, single_rootfs_index.value.artifacts[0].policy);
+
     _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 1 });
     _ = try pack(arena, .{
         .io = io,

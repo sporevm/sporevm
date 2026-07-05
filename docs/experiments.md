@@ -219,7 +219,7 @@ quiet hardware is ~30ms backend elapsed, dominated by restore (~6ms) and the
 guest command's own execution. If first-resume-after-idle latency matters for
 a real workload, the follow-up is page-cache readahead on the RAM backing and
 rootfs artifact at restore, not vsock or snapshot-point mechanics. The
-`spore resume` 25ms rx-delay workaround was subsequently removed: it existed to
+`spore attach` 25ms rx-delay workaround was subsequently removed: it existed to
 paper over stale-vsock-tuple collisions from the fixed resume host port, and
 deriving the resume host port from the request (as `run --from` already did)
 removes the collision class the delay was guarding, along with the wake thread

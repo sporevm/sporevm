@@ -72,8 +72,8 @@ smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
 "${spore_bin}" run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
-  --capture "${capture_dir}" \
-  --capture-on USR1 \
+  --save "${capture_dir}" \
+  --save-on USR1 \
   -- /bin/finite \
   >"${run_stdout}" 2>"${run_stderr}" &
 run_pid="$!"
@@ -90,7 +90,7 @@ if [[ "${seen_ready}" != "1" ]]; then
   kill -TERM "${run_pid}" >/dev/null 2>&1 || true
   wait "${run_pid}" >/dev/null 2>&1 || true
   tail -80 "${run_stderr}" >&2 || true
-  die "spore run capture smoke did not reach the long-running command"
+  die "spore run save smoke did not reach the long-running command"
 fi
 
 sleep "${SPORE_SMOKE_CAPTURE_SETTLE_SECONDS:-0.3}"
@@ -112,12 +112,12 @@ wait "${watchdog_pid}" >/dev/null 2>&1 || true
 if [[ "${run_rc}" != "0" ]]; then
   cat "${run_stdout}" >&2 || true
   cat "${run_stderr}" >&2 || true
-  die "spore run capture exited ${run_rc}, expected 0"
+  die "spore run save exited ${run_rc}, expected 0"
 fi
-[[ -f "${capture_dir}/manifest.json" ]] || die "capture did not write ${capture_dir}/manifest.json"
-grep -Fq "captured snapshot at ${capture_dir}" "${run_stderr}" || {
+[[ -f "${capture_dir}/manifest.json" ]] || die "save did not write ${capture_dir}/manifest.json"
+grep -Fq "saved spore at ${capture_dir}" "${run_stderr}" || {
   cat "${run_stderr}" >&2 || true
-  die "spore run capture did not report the capture path"
+  die "spore run save did not report the save path"
 }
 
 "${spore_bin}" fork "${capture_dir}" --count 1 --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
@@ -128,7 +128,7 @@ done < <(find "${fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort)
 [[ "${#children[@]}" -eq 1 ]] || die "fork did not create one child spore"
 child_dir="${children[0]}"
 
-"${spore_bin}" resume --events=jsonl --backend "${backend}" "${child_dir}" >"${resume_stdout}" 2>"${resume_stderr}" &
+"${spore_bin}" attach --events=jsonl --backend "${backend}" "${child_dir}" >"${resume_stdout}" 2>"${resume_stderr}" &
 resume_pid="$!"
 (
   sleep "${SPORE_SMOKE_RESUME_TIMEOUT_SECONDS:-20}"
@@ -146,22 +146,22 @@ wait "${watchdog_pid}" >/dev/null 2>&1 || true
 if [[ "${resume_rc}" != "0" ]]; then
   cat "${resume_stdout}" >&2 || true
   cat "${resume_stderr}" >&2 || true
-  die "spore resume --events=jsonl exited ${resume_rc}, expected 0"
+  die "spore attach --events=jsonl exited ${resume_rc}, expected 0"
 fi
-grep -Fq '"event":"ready"' "${resume_stdout}" || die "spore resume --events=jsonl did not emit ready"
-grep -Fq '"event":"stdout"' "${resume_stdout}" || die "spore resume --events=jsonl did not emit stdout"
-grep -Fq '"event":"exit"' "${resume_stdout}" || die "spore resume --events=jsonl did not emit terminal exit"
-grep -Fq '"exit_code":0' "${resume_stdout}" || die "spore resume --events=jsonl did not report exit_code 0"
-grep -Fq '"memory_restore_source":"local_backing"' "${resume_stdout}" || die "spore resume --events=jsonl did not report local RAM restore"
-grep -Fq '"memory_restore_reason":"proof_valid"' "${resume_stdout}" || die "spore resume --events=jsonl did not report proof-backed restore"
+grep -Fq '"event":"ready"' "${resume_stdout}" || die "spore attach --events=jsonl did not emit ready"
+grep -Fq '"event":"stdout"' "${resume_stdout}" || die "spore attach --events=jsonl did not emit stdout"
+grep -Fq '"event":"exit"' "${resume_stdout}" || die "spore attach --events=jsonl did not emit terminal exit"
+grep -Fq '"exit_code":0' "${resume_stdout}" || die "spore attach --events=jsonl did not report exit_code 0"
+grep -Fq '"memory_restore_source":"local_backing"' "${resume_stdout}" || die "spore attach --events=jsonl did not report local RAM restore"
+grep -Fq '"memory_restore_reason":"proof_valid"' "${resume_stdout}" || die "spore attach --events=jsonl did not report proof-backed restore"
 
 "${spore_bin}" run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
-  --capture "${from_base_dir}" \
+  --save "${from_base_dir}" \
   -- /bin/true \
   >"${from_base_stdout}" 2>"${from_base_stderr}"
-[[ -f "${from_base_dir}/manifest.json" ]] || die "run --from base capture did not write ${from_base_dir}/manifest.json"
+[[ -f "${from_base_dir}/manifest.json" ]] || die "run --from base save did not write ${from_base_dir}/manifest.json"
 
 "${spore_bin}" fork "${from_base_dir}" --count 1 --out "${from_base_fork_dir}" >"${workdir}/from-base-fork.stdout" 2>"${workdir}/from-base-fork.stderr"
 from_child_dir="$(find "${from_base_fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort | head -n 1)"

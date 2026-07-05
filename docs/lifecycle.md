@@ -1,22 +1,22 @@
 # Named Lifecycle
 
 Named lifecycle keeps a VM alive behind one local monitor process so callers can
-create a warmed guest, run repeated commands, checkpoint it, resume it under a
-new name, and remove it without learning the monitor socket protocol.
+create a warmed guest, run repeated commands, save it as a spore, restore it
+under a new name, and remove it without learning the monitor socket protocol.
 
 ## User Contract
 
 ```bash
 spore create bench-1 --image docker.io/library/alpine:3.20 'sleep 30'
 spore exec bench-1 'echo hi'
-spore suspend bench-1 --out bench-1.spore
-spore resume bench-1.spore --name bench-2
+spore save bench-1 --out bench-1.spore --stop
+spore restore bench-1.spore --name bench-2
 spore ps
 spore rm bench-2
 ```
 
 `spore run` remains the one-shot command. The stable named surface is
-`create`, `exec`, `copy-in`, `copy-out`, `suspend`, `resume --name`,
+`create`, `exec`, `copy-in`, `copy-out`, `save`, `restore`,
 `fork --vm`, `ls`/`ps`, and `rm` on supported HVF and KVM hosts.
 
 Machine callers use global `--json` for single-result lifecycle commands:
@@ -33,7 +33,7 @@ shell environment, while image, rootfs, and custom-initrd guests provide their
 own command environment. Use `--image` or `--rootfs` for general distro
 commands. A command passed to `spore create` is
 started in the guest and detached; stdout and stderr are discarded so the named
-VM is immediately available for `fork`, `exec`, `suspend`, and `rm`. `spore
+VM is immediately available for `fork`, `exec`, `save`, and `rm`. `spore
 exec` forwards guest stdout and stderr as workload streams. Pass `-i` to stream
 host stdin through the monitor to the guest process, and pass `-t` to request a
 guest terminal for the exec. The usual shell spelling is:
@@ -62,7 +62,7 @@ spore create bench-1 \
 exact DNS-learned host plus TCP port egress rule. `--bind-service
 NAME[:PORT]=unix:/path.sock` exposes a host Unix stream socket to the guest as
 `NAME.spore.internal`, defaulting to port 80 when `PORT` is omitted. Host socket
-paths are live monitor state only; captured manifests record the service name,
+paths are live monitor state only; saved manifests record the service name,
 guest host, and guest port as restore-time requirements.
 
 Tooling can provide the same create options as JSON:
@@ -148,42 +148,43 @@ socket.
 ## Session Handles
 
 Spore session handles are low-level process/session handles, not workflow
-state. Captured manifests can record `sessions`: an `id`, `kind: "process"`,
+state. Saved manifests can record `sessions`: an `id`, `kind: "process"`,
 and stream capabilities for `stdin`, `stdout`, `stderr`, and `terminal`.
-Fresh `spore run` captures record the `default` session. Commands started from
-an existing spore record a generated `run-*` session id, so a capture of that
-resumed command can be reattached without pretending it is the original default
+Fresh `spore run --save` calls record the `default` session. Commands started from
+an existing spore record a generated `run-*` session id, so a save of that
+restored command can be reattached without pretending it is the original default
 process.
 
-Commandless `spore run --from DIR` attaches to the `default` handle when
-present, or to the sole recorded handle when a capture only has one non-default
-session. `spore fork` preserves the recorded handles in each child. The handle
+`spore attach DIR` attaches to the `default` handle when present, or to the sole
+recorded handle when a spore only has one non-default session. `spore fork`
+preserves the recorded handles in each child. The handle
 records guest-side capability only: host stdin, the host-side PTY owner, raw
 terminal mode, window ownership, and any currently attached client are not part
 of a spore.
 
-If `spore run -i --from DIR` or `spore run -t --from DIR` asks for input that
+If `spore attach -i DIR` or `spore attach -t DIR` asks for input that
 the recorded handle cannot support, SporeVM rejects the request before restore.
 Starting a new command with `spore run --from DIR <command>` starts a new
 process session instead of reattaching to an existing handle; `-t` for that
 new-command path remains deferred. Named VM names remain lifecycle monitor
-handles, and there is still no public `spore attach` command.
+handles.
 
-## Checkpoints And Forks
+## Saves And Forks
 
-`spore suspend NAME --out DIR` consumes the named VM and writes a spore.
-Repeated `--annotation KEY=VALUE` flags merge capture-time annotations into the
-manifest without dropping create-time annotations:
+`spore save NAME --out DIR` writes a spore and leaves the named VM running.
+`spore save NAME --out DIR --stop` writes a spore and removes the named VM from
+the runtime registry. Repeated `--annotation KEY=VALUE` flags merge save-time
+annotations into the manifest without dropping create-time annotations:
 
 ```bash
-spore suspend bench-1 --out bench-1.spore --annotation captured=true
+spore save bench-1 --out bench-1.spore --stop --annotation saved=true
 ```
 
-If a captured manifest declares bound services, named resume requires fresh host
+If a saved manifest declares bound services, named restore requires fresh host
 socket bindings:
 
 ```bash
-spore resume bench-1.spore --name bench-2 \
+spore restore bench-1.spore --name bench-2 \
   --bind-service metadata=unix:/tmp/fresh-metadata.sock
 ```
 
@@ -201,9 +202,9 @@ spore exec worker-0 'cat /tick; sleep 1; cat /tick'
 `%d`-style integer placeholder. SporeVM validates every child name before
 pausing the source VM.
 
-Named checkpoints support diskless VMs, image-created writable rootfs state, and
-explicit `--rootfs PATH` checkpoints backed by exact immutable rootfs artifacts.
-Supported backends can create, suspend, resume, and live-fork fixed-RAM
+Named saves support diskless VMs, image-created writable rootfs state, and
+explicit `--rootfs PATH` saves backed by exact immutable rootfs artifacts.
+Supported backends can create, save, restore, and live-fork fixed-RAM
 multi-vCPU named VMs. Named live fork is still diskless-only; child VMs preserve
 the source VM's vCPU count.
 
@@ -215,7 +216,7 @@ Unknown monitor request types fail closed. `spore ls` reads monitor-published
 metadata such as `monitor-stats.json`; unavailable stats render as unknown
 instead of forcing an expensive VM memory scan.
 
-`spore create`, `spore resume --name`, and `spore fork --vm` report success
+`spore create`, `spore restore --name`, and `spore fork --vm` report success
 only after the monitor has written `ready.json`, the recorded PID is alive, and
 the local `control.sock` answers a `hello` request with the same SporeVM version
 as the linked library. The monitor argv and control protocol are a private
@@ -239,11 +240,10 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
 - `spore run -t` allocates a guest PTY for one-shot runs, and `spore run -it`
   forwards host terminal input in raw mode. TTY mode has one merged terminal
   output stream; JSONL emits it as `event:"terminal"`.
-- `spore run -i --from` and `spore run -t --from` can attach to captured live
-  sessions only when that session was originally started with interactive stdin
-  or a PTY. Commandless `spore run --from <spore-dir>` resumes the captured
-  default or sole recorded session. `spore run -t --from <spore-dir> <command>`
-  is not implemented yet.
+- `spore attach -i` and `spore attach -t` can attach to saved live sessions
+  only when that session was originally started with interactive stdin or a PTY.
+  `spore run --from <spore-dir> <command>` starts a new command from saved VM
+  state. `spore run -t --from <spore-dir> <command>` is not implemented yet.
 - `spore exec -i/-t` uses a streaming monitor request. Embedders use
   `openExecNamedStream` for the same stdin, terminal, resize, exit, and
   monitor-error surface.
@@ -251,11 +251,10 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
   directory trees. Symlinks, special files, overwrite, and workspace sync are
   intentionally outside this primitive. Embedders use the matching
   `copyInNamed`/`copyOutNamed` libspore API.
-- There is no public `spore attach` command yet. Reserve that spelling for
-  connecting to already-running named VMs once monitors own retained attachable
-  sessions.
+- `spore attach` connects to saved sessions in spores. Attaching to an
+  already-running named VM remains outside the public CLI surface.
 - No disk-backed or networked named live fork yet.
-- No live network-flow checkpointing.
+- No live network-flow save/restore.
 - No OCI `Entrypoint`, `Cmd`, or `User` semantics. Callers pass explicit argv.
 
 ## Validation
