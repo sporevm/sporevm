@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 
+const attach_stream = @import("attach_stream.zig");
 const Context = @import("context.zig").Context;
 const fd_util = @import("fd.zig");
 const hvf = @import("hvf/hvf.zig");
@@ -22,8 +23,8 @@ const virtio_net = @import("virtio/net.zig");
 const vsock = @import("virtio/vsock.zig");
 
 pub const Backend = run_mod.Backend;
-const default_resume_guest_port: u32 = 10700;
-const default_resume_attach_timeout_ms: u64 = 30_000;
+const default_attach_guest_port: u32 = 10700;
+const default_attach_timeout_ms: u64 = 30_000;
 
 pub const Options = struct {
     backend: Backend = .auto,
@@ -34,7 +35,7 @@ pub const Options = struct {
     events: ?run_mod.EventSink = null,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
-    timeout_ms: u64 = default_resume_attach_timeout_ms,
+    timeout_ms: u64 = default_attach_timeout_ms,
     bound_services: run_mod.BoundServiceBindingList = .{},
     interactive: bool = false,
     tty: bool = false,
@@ -68,7 +69,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var session_id: ?[]const u8 = null;
     var generation_path: ?[]const u8 = null;
     var event_mode: run_mod.EventMode = .none;
-    var timeout_ms: u64 = default_resume_attach_timeout_ms;
+    var timeout_ms: u64 = default_attach_timeout_ms;
     var bound_services = run_mod.BoundServiceBindingList{};
     var interactive = false;
     var tty = false;
@@ -200,7 +201,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     const devices = if (parsed) |manifest| manifest.value.devices else parsed_v1.?.value.devices;
     const rootfs = if (parsed) |manifest| manifest.value.rootfs else parsed_v1.?.value.rootfs;
     const disk = if (parsed) |manifest| manifest.value.disk else parsed_v1.?.value.disk;
-    validateResumeDiskManifestParts(devices, rootfs, disk);
+    validateAttachDiskManifestParts(devices, rootfs, disk);
     var runtime_disk_state = try runtime_disk.open(context, allocator, .{
         .rootfs = rootfs,
         .disk = disk,
@@ -216,27 +217,27 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     else
         null;
     const manifest_generation = if (parsed) |manifest| manifest.value.generation else parsed_v1.?.value.generation;
-    const attach = try prepareResumeAttach(allocator, manifest_generation, generation_params, .{
+    const attach = try prepareAttach(allocator, manifest_generation, generation_params, .{
         .session_id = session_id,
         .interactive = opts.interactive,
         .tty = opts.tty,
-        .terminal_name = run_mod.terminalName(context.environ_map),
-        .terminal_size = run_mod.terminalSizeOrDefault(run_mod.terminalSizeFd()),
+        .terminal_name = attach_stream.terminalName(context.environ_map),
+        .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
     });
     defer attach.deinit(allocator);
-    var identity_stream: ?vsock.HostStream = try vsock.HostStream.initWithProtocol(default_resume_guest_port, attach.request, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
+    var identity_stream: ?vsock.HostStream = try vsock.HostStream.initWithProtocol(default_attach_guest_port, attach.request, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
     if (identity_stream) |*stream| {
         stream.host_port = vsock.HostStream.deriveHostPort(attach.request);
         if (opts.events != null) {
-            stream.setLifecycleSink(&events, resumeEventLifecycleSink);
-            stream.setOutputSink(&events, resumeEventOutputSink);
+            stream.setLifecycleSink(&events, attachEventLifecycleSink);
+            stream.setOutputSink(&events, attachEventOutputSink);
         } else {
             stream.setOutputSink(null, identityProbeOutputSink);
         }
     }
     const identity_probe: ?*vsock.HostStream = if (identity_stream) |*stream| stream else null;
     var stdin_control = if (identity_stream) |*stream|
-        if (opts.interactive or opts.tty) run_mod.RunStdinControl.init(stream, opts.tty, opts.interactive, run_mod.terminalSizeFd()) else null
+        if (opts.interactive or opts.tty) attach_stream.RunStdinControl.init(stream, opts.tty, opts.interactive, attach_stream.terminalSizeFd()) else null
     else
         null;
     if (stdin_control) |*control| try control.start(opts.tty and opts.interactive);
@@ -253,7 +254,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     defer if (local_backing.fd) |fd| {
         _ = std.c.close(fd);
     };
-    std.log.info("resume memory restore source={s} reason={s}", .{ @tagName(local_backing.source), @tagName(local_backing.reason) });
+    std.log.info("attach memory restore source={s} reason={s}", .{ @tagName(local_backing.source), @tagName(local_backing.reason) });
     const cause = switch (backend) {
         .auto => unreachable,
         .hvf => blk: {
@@ -299,14 +300,14 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     switch (cause) {
         .guest_off, .guest_reset => {},
         .probe_complete => {
-            var result = try resultFromResumeStream(backend, ram_size, vcpu_count, identity_stream);
+            var result = try resultFromAttachStream(backend, ram_size, vcpu_count, identity_stream);
             result = result.withMemoryRestore(local_backing);
             run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
             try events.emitExit(result);
             if (events.write_failed) return error.EventSinkFailed;
             return result;
         },
-        .snapshotted, .monitor_stopped => return error.UnexpectedResumeExit,
+        .snapshotted, .monitor_stopped => return error.UnexpectedAttachExit,
     }
     const gateway_failed = gateway_active and gateway.hasFailed();
     run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
@@ -335,12 +336,12 @@ fn consoleSink(bytes: []const u8) void {
 
 fn discardConsoleSink(_: []const u8) void {}
 
-fn resumeEventOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+fn attachEventOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
     const events: *run_mod.EventEmitter = @ptrCast(@alignCast(context.?));
     events.emitOutputBestEffort(output, bytes);
 }
 
-fn resumeEventLifecycleSink(context: ?*anyopaque, event: vsock.HostStreamLifecycle) void {
+fn attachEventLifecycleSink(context: ?*anyopaque, event: vsock.HostStreamLifecycle) void {
     const events: *run_mod.EventEmitter = @ptrCast(@alignCast(context.?));
     switch (event) {
         .ready => events.emitReadyBestEffort(),
@@ -364,8 +365,8 @@ fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) T {
     return parsed;
 }
 
-fn resultFromResumeStream(backend: Backend, ram_size: u64, vcpu_count: u32, identity_stream: ?vsock.HostStream) !run_mod.Result {
-    const stream = identity_stream orelse return error.UnexpectedResumeExit;
+fn resultFromAttachStream(backend: Backend, ram_size: u64, vcpu_count: u32, identity_stream: ?vsock.HostStream) !run_mod.Result {
+    const stream = identity_stream orelse return error.UnexpectedAttachExit;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
     return .{
@@ -380,17 +381,17 @@ fn resultFromResumeStream(backend: Backend, ram_size: u64, vcpu_count: u32, iden
     };
 }
 
-const PreparedResumeAttach = struct {
+const PreparedAttach = struct {
     request: []const u8,
     generation_state: generation.State,
 
-    fn deinit(self: PreparedResumeAttach, allocator: std.mem.Allocator) void {
+    fn deinit(self: PreparedAttach, allocator: std.mem.Allocator) void {
         allocator.free(self.request);
         allocator.free(self.generation_state.params_b64);
     }
 };
 
-const ResumeAttachOptions = struct {
+const AttachRequestOptions = struct {
     session_id: []const u8,
     interactive: bool = false,
     tty: bool = false,
@@ -404,14 +405,14 @@ pub fn loadGenerationParams(io: Io, allocator: std.mem.Allocator, path: []const 
     return params;
 }
 
-pub fn prepareResumeGenerationState(allocator: std.mem.Allocator, manifest_generation: spore.GenerationState, generation_params: []const u8) !generation.State {
+pub fn prepareRestoreGenerationState(allocator: std.mem.Allocator, manifest_generation: spore.GenerationState, generation_params: []const u8) !generation.State {
     var gen_dev = generation.Device{};
     try gen_dev.restore(allocator, manifest_generation);
     _ = try gen_dev.setResume(manifest_generation.generation, generation_params);
     return gen_dev.capture(allocator);
 }
 
-fn prepareResumeAttach(allocator: std.mem.Allocator, manifest_generation: spore.GenerationState, generation_params: ?[]const u8, options: ResumeAttachOptions) !PreparedResumeAttach {
+fn prepareAttach(allocator: std.mem.Allocator, manifest_generation: spore.GenerationState, generation_params: ?[]const u8, options: AttachRequestOptions) !PreparedAttach {
     var gen_dev = generation.Device{};
     try gen_dev.restore(allocator, manifest_generation);
     if (generation_params) |params| {
@@ -425,7 +426,7 @@ fn prepareResumeAttach(allocator: std.mem.Allocator, manifest_generation: spore.
     const params_payload = gen_dev.paramsPayload();
     if (options.interactive or options.tty) {
         return .{
-            .request = try run_mod.attachV1Request(allocator, .{
+            .request = try attach_stream.attachV1Request(allocator, .{
                 .session_id = options.session_id,
                 .interactive = options.interactive,
                 .tty = options.tty,
@@ -437,12 +438,12 @@ fn prepareResumeAttach(allocator: std.mem.Allocator, manifest_generation: spore.
         };
     }
     return .{
-        .request = try run_mod.attachRequestWithGeneration(allocator, options.session_id, if (params_payload.len == 0) null else params_payload),
+        .request = try attach_stream.attachRequestWithGeneration(allocator, options.session_id, if (params_payload.len == 0) null else params_payload),
         .generation_state = generation_state,
     };
 }
 
-fn validateResumeDiskManifestParts(devices: []const spore.TransportState, rootfs_opt: ?spore.Rootfs, disk_opt: ?spore.Disk) void {
+fn validateAttachDiskManifestParts(devices: []const spore.TransportState, rootfs_opt: ?spore.Rootfs, disk_opt: ?spore.Disk) void {
     const disk_count = spore.countBlockDevices(devices);
     if (disk_count == 0) return;
     if (disk_count != 1) {
@@ -532,7 +533,7 @@ test "attach validates saved sessions before bound service bindings" {
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
-    try std.testing.expectError(error.NoCapturedSession, execute(.{
+    try std.testing.expectError(error.NoSavedSession, execute(.{
         .io = std.testing.io,
         .environ_map = &env,
     }, arena, .{
@@ -543,7 +544,7 @@ test "attach validates saved sessions before bound service bindings" {
 test "attach request omits empty generation params" {
     const allocator = std.testing.allocator;
     const manifest = testDiskGuardManifest(&.{}, false);
-    const attach = try prepareResumeAttach(allocator, manifest.generation, null, .{ .session_id = spore.default_session_id });
+    const attach = try prepareAttach(allocator, manifest.generation, null, .{ .session_id = spore.default_session_id });
     defer attach.deinit(allocator);
     try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", attach.request);
     try std.testing.expectEqualStrings("", attach.generation_state.params_b64);
@@ -560,7 +561,7 @@ test "attach request carries refreshed generation params" {
     manifest.generation = try gen_dev.capture(allocator);
     defer allocator.free(manifest.generation.params_b64);
 
-    const attach = try prepareResumeAttach(allocator, manifest.generation, null, .{ .session_id = spore.default_session_id });
+    const attach = try prepareAttach(allocator, manifest.generation, null, .{ .session_id = spore.default_session_id });
     defer attach.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"type\":\"attach\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"params_json\":\"") != null);
@@ -593,7 +594,7 @@ test "attach request accepts explicit generation params" {
     try generation.validateFanoutParams(allocator, params);
 
     const manifest = testDiskGuardManifest(&.{}, false);
-    const attach = try prepareResumeAttach(allocator, manifest.generation, params, .{ .session_id = spore.default_session_id });
+    const attach = try prepareAttach(allocator, manifest.generation, params, .{ .session_id = spore.default_session_id });
     defer attach.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"run_id\\\":\\\"rails-rspec-1\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"parallel_index\\\":7") != null);
@@ -651,7 +652,7 @@ fn testDiskGuardManifest(devices: []spore.TransportState, with_disk: bool) spore
     };
 }
 
-test "resume accepts writable disk manifests for layered runtime setup" {
+test "attach accepts writable disk manifests for layered runtime setup" {
     var devices = [_]spore.TransportState{.{
         .device_id = spore.rootfs_virtio_blk_device_id,
         .status = 0,
@@ -663,7 +664,7 @@ test "resume accepts writable disk manifests for layered runtime setup" {
         .queues = &.{},
     }};
     const without_disk = testDiskGuardManifest(&devices, false);
-    validateResumeDiskManifestParts(without_disk.devices, without_disk.rootfs, without_disk.disk);
+    validateAttachDiskManifestParts(without_disk.devices, without_disk.rootfs, without_disk.disk);
     const with_disk = testDiskGuardManifest(&devices, true);
-    validateResumeDiskManifestParts(with_disk.devices, with_disk.rootfs, with_disk.disk);
+    validateAttachDiskManifestParts(with_disk.devices, with_disk.rootfs, with_disk.disk);
 }

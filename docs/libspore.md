@@ -19,10 +19,9 @@ streams.
 same product APIs and JSON result schemas; they should not reimplement command
 behavior or depend on CLI parsing.
 
-The CLI-facing vocabulary is `save`, `attach`, and `restore`. Some libspore,
-C ABI, Go binding, and JSON event names still use lower-level `capture`,
-`resume`, and `suspend` names in this release; those are compatibility symbols,
-not new CLI concepts.
+The public vocabulary is `save`, `attach`, and `restore` across Zig, C, and Go.
+JSONL run events keep their original `capture` event and `capture_path` fields
+for schema compatibility.
 
 ## Importing
 
@@ -75,7 +74,7 @@ Use the matching helper for owned results:
 - `deinitRootfsSystemSummary`
 - `deinitRootfsPruneResult`
 
-`run`, `runManaged`, `runFromSpore`, and `resumeSpore` return value results and
+`run`, `runManaged`, `runFromSpore`, and `attachSpore` return value results and
 do not need deinit.
 
 ## Local Spore Inspection
@@ -107,7 +106,7 @@ mode, and currently attached clients are not serialized.
 
 `SporeInspectResult.network` exposes the manifest network kind, capability
 requirements, and bound-service requirements so callers can discover restore-time
-bindings before calling `resumeSpore` for saved-session attach or
+bindings before calling `attachSpore` for saved-session attach or
 `runFromSpore` for new commands.
 
 ## Local System
@@ -192,7 +191,7 @@ for commandless attach; running a new command from a spore creates a new process
 session.
 
 `RunResult.memory_restore_source` and `memory_restore_reason` are populated for
-`runFromSpore` and `resumeSpore`, so embedders can tell whether RAM came from
+`runFromSpore` and `attachSpore`, so embedders can tell whether RAM came from
 `local_backing` or verified `chunks` without parsing logs.
 
 Use `run` only when you already have explicit kernel and rootfs or disk inputs.
@@ -229,21 +228,20 @@ try libspore.copyOutNamed(context, allocator, .{
     .host_path = "./roundtrip.txt",
 });
 
-var snapshot_annotations = libspore.Annotations{};
-try snapshot_annotations.map.put(allocator, "dev.buildkite.cleanroom.snapshot", "warm");
-const snap = try libspore.snapshotNamed(context, allocator, .{
+var save_annotations = libspore.Annotations{};
+try save_annotations.map.put(allocator, "dev.buildkite.cleanroom.save", "warm");
+const saved = try libspore.saveNamed(context, allocator, .{
     .name = "worker-1",
     .out_dir = "worker-1.spore",
-    .continue_after = true,
-    .annotations = snapshot_annotations,
+    .annotations = save_annotations,
 });
-defer libspore.deinitNamedLifecycleResult(allocator, snap);
+defer libspore.deinitNamedLifecycleResult(allocator, saved);
 
-const resumed = try libspore.resumeNamed(init, allocator, .{
+const restored = try libspore.restoreNamed(init, allocator, .{
     .spore_dir = "worker-1.spore",
     .name = "worker-2",
 });
-defer libspore.deinitNamedLifecycleResult(allocator, resumed);
+defer libspore.deinitNamedLifecycleResult(allocator, restored);
 
 const forked = try libspore.forkNamed(init, allocator, .{
     .source_name = "worker-2",
@@ -260,7 +258,7 @@ policy.
 Named startup operations spawn the `spore` executable to run the private monitor
 entry point. When `spore_executable` is omitted or empty, Zig, C, and Go callers
 all use `"spore"`, resolved with the process `PATH` used for the operation.
-Before `createNamed`, `resumeNamed`, or `forkNamed` returns success, libspore
+Before `createNamed`, `restoreNamed`, or `forkNamed` returns success, libspore
 waits for `ready.json`, confirms the recorded PID is alive, connects to the
 monitor's local `control.sock`, and requires a `hello` response carrying exactly
 the same version as `libspore.version`.
@@ -274,18 +272,18 @@ executable path.
 The named surface is:
 
 - `createNamed`
-- `resumeNamed`
+- `restoreNamed`
 - `forkNamed`
 - `execNamed`
 - `openExecNamedStream`
 - `copyInNamed`
 - `copyOutNamed`
-- `snapshotNamed`
-- `suspendNamed`
+- `saveNamed`
 - `removeNamed`
 - `listNamed`
 
-`snapshotNamed` currently supports snapshot-and-continue only. Use
+`saveNamed` saves while keeping the named VM running by default; set
+`SaveNamedOptions.stop = true` to remove the live VM after saving. Use
 `deinitNamedLifecycleResult`, `deinitExecNamedResult`,
 `deinitNamedForkResult`, and `deinitNamedList` for owned results.
 `copyInNamed` and `copyOutNamed` transfer explicit regular files or directory
@@ -297,7 +295,7 @@ Set it to a matching helper executable unless the caller has installed its own
 re-exec trampoline. The Go binding is the built-in trampoline today.
 
 The Go binding installs the SporeVM re-exec trampoline during package init. If
-`CreateNamedOptions.SporeExecutable` or `ResumeNamedOptions.SporeExecutable` is
+`CreateNamedOptions.SporeExecutable` or `RestoreNamedOptions.SporeExecutable` is
 empty, the binding passes the current executable path to libspore, so monitor
 and `netd` child processes re-exec the same linked embedder instead of looking
 up `spore` on `PATH`. Set `SporeExecutable` explicitly to keep using an
@@ -413,27 +411,27 @@ saved manifests as restore-time requirements without host socket paths. On
 restore, callers provide fresh live bindings keyed by service name:
 
 ```zig
-const resumed = try libspore.resumeNamed(init, allocator, .{
+const restored = try libspore.restoreNamed(init, allocator, .{
     .spore_dir = "cr-test.spore",
-    .name = "cr-test-resumed",
+    .name = "cr-test-restored",
     .bound_services = &.{.{
         .name = "cleanroom-gateway",
         .target = .{ .unix = "/tmp/fresh-cleanroom-gateway.sock" },
     }},
 });
-defer libspore.deinitNamedLifecycleResult(allocator, resumed);
+defer libspore.deinitNamedLifecycleResult(allocator, restored);
 ```
 
 The manifest remains portable: it records the service name, guest host, and
 guest port, while the restore option supplies only the current host socket path.
 Restore fails closed if any declared service lacks a live binding, if a binding
 does not match a declared service name, or if duplicate bindings are supplied.
-The Zig `runFromSpore` and `resumeSpore` options use the same `.bound_services`
+The Zig `runFromSpore` and `attachSpore` options use the same `.bound_services`
 restore field.
 
 ## Events
 
-Run and resume calls accept a synchronous `EventSink`:
+Run and attach calls accept a synchronous `EventSink`:
 
 ```zig
 fn emit(ctx: ?*anyopaque, event: libspore.RunEvent) anyerror!void {
@@ -448,7 +446,7 @@ fn emit(ctx: ?*anyopaque, event: libspore.RunEvent) anyerror!void {
             _ = output.bytes;
         },
         .port_forward => |forward| _ = forward.guest_port,
-        .capture => |capture| _ = capture.capture_path,
+        .save => |saved| _ = saved.save_path,
         .exit => |exit| _ = exit.exit_code,
         else => {},
     }
@@ -464,7 +462,7 @@ const result = try libspore.runFromSpore(context, allocator, .{
 Event callbacks run synchronously. Output byte slices are callback-scoped; copy
 them if they must outlive the callback. TTY output arrives as `.terminal`
 events. Bound Unix services emit `.port_forward` setup events without durable
-host socket paths, and successful snapshots emit `.capture` before `.exit`.
+host socket paths, and successful saves emit `.save` before `.exit`.
 Every run emits at most one completion event: `exit` for guest completion or
 `failure` for a SporeVM failure.
 
@@ -649,20 +647,20 @@ create.annotation_count = 1;
 if (spore_create_named_json(context, &create, &json) != SPORE_SUCCESS) return 1;
 spore_free_string(context, json);
 
-SporeResumeNamedOptions resume;
-spore_resume_named_options_init(&resume);
-resume.spore_dir = (SporeString){ .ptr = "worker-1.spore", .len = 14 };
-resume.name = (SporeString){ .ptr = "worker-2", .len = 8 };
+SporeRestoreNamedOptions restore;
+spore_restore_named_options_init(&restore);
+restore.spore_dir = (SporeString){ .ptr = "worker-1.spore", .len = 14 };
+restore.name = (SporeString){ .ptr = "worker-2", .len = 8 };
 SporeBoundUnixServiceBinding bindings[] = {
     {
         .name = { .ptr = "cleanroom-gateway", .len = 17 },
         .unix_path = { .ptr = "/tmp/fresh-cleanroom-gateway.sock", .len = 33 },
     },
 };
-resume.bound_unix_services = bindings;
-resume.bound_unix_service_count = 1;
+restore.bound_unix_services = bindings;
+restore.bound_unix_service_count = 1;
 
-if (spore_resume_named_json(context, &resume, &json) != SPORE_SUCCESS) return 1;
+if (spore_restore_named_json(context, &restore, &json) != SPORE_SUCCESS) return 1;
 spore_free_string(context, json);
 ```
 
@@ -693,7 +691,7 @@ The first Go binding lives in [`bindings/go`](../bindings/go). It is a thin cgo
 adapter over the C ABI, so `libspore` must be installed or discoverable through
 `pkg-config`. The Go package installs the SporeVM re-exec trampoline in package
 init. `CreateNamedOptions.SporeExecutable` and
-`ResumeNamedOptions.SporeExecutable` normally stay empty; the binding fills
+`RestoreNamedOptions.SporeExecutable` normally stay empty; the binding fills
 them with the current executable path so monitor and `netd` helpers re-exec the
 same linked Go binary. Set `SporeExecutable` only when deliberately using an
 external helper binary for migration or debugging.
@@ -777,12 +775,11 @@ if err := client.CopyInNamed(ctx, spore.CopyNamedOptions{
     return err
 }
 
-snap, err := client.SnapshotNamed(ctx, spore.SnapshotNamedOptions{
-    Name:     "worker",
-    OutDir:   "worker.spore",
-    Continue: true,
+saved, err := client.SaveNamed(ctx, spore.SaveNamedOptions{
+    Name:   "worker",
+    OutDir: "worker.spore",
     Annotations: map[string]string{
-        "dev.buildkite.cleanroom.snapshot": "warm",
+        "dev.buildkite.cleanroom.save": "warm",
     },
 })
 if err != nil {
@@ -797,9 +794,9 @@ if err != nil {
 }
 workspace := inspected.Annotations["cleanroom.workspace"]
 
-resumed, err := client.ResumeNamed(ctx, spore.ResumeNamedOptions{
+restored, err := client.RestoreNamed(ctx, spore.RestoreNamedOptions{
     SporeDir: "worker.spore",
-    Name:     "worker-resumed",
+    Name:     "worker-restored",
     BoundServiceBindings: []spore.BoundUnixServiceBinding{{
         Name:     "cleanroom-gateway",
         UnixPath: "/tmp/fresh-cleanroom-gateway.sock",
@@ -815,7 +812,7 @@ if err != nil {
 }
 
 removed, err := client.RemoveNamed(ctx, spore.RemoveNamedOptions{
-    Name: "worker-resumed",
+    Name: "worker-restored",
 })
 if err != nil {
     return err
@@ -830,9 +827,9 @@ _ = exec.ExitCode
 _ = exec.Stdout
 _ = exec.Stderr
 _ = exec.NetworkEventsJSONL
-_ = snap
+_ = saved
 _ = workspace
-_ = resumed
+_ = restored
 _ = named
 _ = removed
 ```
@@ -840,8 +837,8 @@ _ = removed
 The surface covers build info, context lifetime, host-info, network
 capabilities, inspect-bundle, inspect-spore, pull, context-local environment
 variables through `SetEnv`, and named lifecycle `CreateNamed`, `ExecNamed`,
-`OpenExecNamedStream`, `CopyInNamed`, `CopyOutNamed`, `SnapshotNamed`,
-`ResumeNamed`, `RemoveNamed`, and `ListNamed`.
+`OpenExecNamedStream`, `CopyInNamed`, `CopyOutNamed`, `SaveNamed`,
+`RestoreNamed`, `RemoveNamed`, and `ListNamed`.
 `CreateNamedOptions` exposes the create-time network policy supported by the C
 ABI: `NetworkEnabled`, `AllowCIDRs`, `AllowHosts`, exact host/port
 `NetworkRules`, and `BoundServices` for host Unix sockets exposed to the guest.

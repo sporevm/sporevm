@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+const attach_stream = @import("attach_stream.zig");
 const capture = @import("capture.zig");
 const Context = @import("context.zig").Context;
 const disk_layer = @import("disk_layer.zig");
@@ -75,7 +76,7 @@ const max_rootfs_metadata_bytes = 1024 * 1024;
 const auto_boot_memory_bytes: u64 = 512 * 1024 * 1024;
 
 pub const MemoryConfig = memory_config.Config;
-pub const CaptureTrigger = capture.Trigger;
+pub const SaveTrigger = capture.Trigger;
 pub const NetworkPolicy = spore_net_policy.Config;
 pub const Rootfs = spore.Rootfs;
 pub const Disk = spore.Disk;
@@ -149,9 +150,9 @@ pub const Options = struct {
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
     stream_output: bool = true,
-    capture_path: ?[]const u8 = null,
-    capture_trigger: capture.Trigger = .exit,
-    continue_after_capture: bool = false,
+    save_path: ?[]const u8 = null,
+    save_trigger: capture.Trigger = .exit,
+    continue_after_save: bool = false,
     annotations: spore.Annotations = .{},
     network: NetworkMode = .disabled,
     network_policy: spore_net_policy.Config = .{},
@@ -267,8 +268,8 @@ pub const Result = struct {
     exit_code: i32,
     vcpus: topology.VcpuCount,
     memory_bytes: u64,
-    captured: bool = false,
-    capture_path: ?[]const u8 = null,
+    saved: bool = false,
+    save_path: ?[]const u8 = null,
     /// Product restore RAM source, such as `local_backing` or `chunks`.
     memory_restore_source: ?[]const u8 = null,
     /// Product restore planner reason, such as `proof_valid` or `proof_unavailable`.
@@ -331,10 +332,10 @@ pub const PortForwardEvent = struct {
     target: []const u8,
 };
 
-pub const CaptureEvent = struct {
+pub const SaveEvent = struct {
     command: []const u8,
     backend: Backend,
-    capture_path: []const u8,
+    save_path: []const u8,
 };
 
 pub const ExitEvent = struct {
@@ -343,8 +344,8 @@ pub const ExitEvent = struct {
     exit_code: i32,
     vcpus: topology.VcpuCount,
     memory_bytes: u64,
-    captured: bool = false,
-    capture_path: ?[]const u8 = null,
+    saved: bool = false,
+    save_path: ?[]const u8 = null,
     memory_restore_source: ?[]const u8 = null,
     memory_restore_reason: ?[]const u8 = null,
     timings: Timings,
@@ -367,7 +368,7 @@ pub const RunEvent = union(enum) {
     stdout: OutputEvent,
     stderr: OutputEvent,
     terminal: OutputEvent,
-    capture: CaptureEvent,
+    save: SaveEvent,
     exit: ExitEvent,
     failure: FailureEvent,
 };
@@ -472,7 +473,7 @@ pub const EventEmitter = struct {
         self.setBackend(result.backend);
         try self.emitReady();
         if (self.sink) |sink| {
-            if (captureEvent(self.command, result)) |event| try sink.emit(.{ .capture = event });
+            if (saveEvent(self.command, result)) |event| try sink.emit(.{ .save = event });
         }
         self.terminal_emitted = true;
         if (self.sink) |sink| try sink.emit(.{ .exit = exitEvent(self.command, result) });
@@ -528,12 +529,12 @@ fn portForwardEvent(command: []const u8, backend: ?Backend, service: spore_net_p
     };
 }
 
-fn captureEvent(command: []const u8, result: Result) ?CaptureEvent {
-    if (!result.captured) return null;
+fn saveEvent(command: []const u8, result: Result) ?SaveEvent {
+    if (!result.saved) return null;
     return .{
         .command = command,
         .backend = result.backend,
-        .capture_path = result.capture_path orelse return null,
+        .save_path = result.save_path orelse return null,
     };
 }
 
@@ -544,8 +545,8 @@ fn exitEvent(command: []const u8, result: Result) ExitEvent {
         .exit_code = result.exit_code,
         .vcpus = result.vcpus,
         .memory_bytes = result.memory_bytes,
-        .captured = result.captured,
-        .capture_path = result.capture_path,
+        .saved = result.saved,
+        .save_path = result.save_path,
         .memory_restore_source = result.memory_restore_source,
         .memory_restore_reason = result.memory_restore_reason,
         .timings = .{
@@ -598,7 +599,7 @@ pub const EventWriter = struct {
             .stdout => |value| try self.emitOutputEvent("stdout", value),
             .stderr => |value| try self.emitOutputEvent("stderr", value),
             .terminal => |value| try self.emitOutputEvent("terminal", value),
-            .capture => |value| try self.emitCaptureEvent(value),
+            .save => |value| try self.emitSaveEvent(value),
             .exit => |value| try self.emitExitEvent(value),
             .failure => |value| try self.emitFailure(value.classified),
         }
@@ -699,7 +700,7 @@ pub const EventWriter = struct {
         try self.write(event);
     }
 
-    fn emitCaptureEvent(self: *EventWriter, value: CaptureEvent) !void {
+    fn emitSaveEvent(self: *EventWriter, value: SaveEvent) !void {
         self.setBackend(value.backend);
         const event = struct {
             schema: []const u8 = machine_output.run_events_schema,
@@ -711,7 +712,7 @@ pub const EventWriter = struct {
         }{
             .command = value.command,
             .backend = value.backend.name(),
-            .capture_path = value.capture_path,
+            .capture_path = value.save_path,
         };
         try self.write(event);
     }
@@ -741,8 +742,8 @@ pub const EventWriter = struct {
             .exit_code = value.exit_code,
             .vcpus = value.vcpus,
             .memory_bytes = value.memory_bytes,
-            .captured = value.captured,
-            .capture_path = value.capture_path,
+            .captured = value.saved,
+            .capture_path = value.save_path,
             .memory_restore_source = value.memory_restore_source,
             .memory_restore_reason = value.memory_restore_reason,
             .timings = value.timings,
@@ -810,7 +811,7 @@ pub const EventWriter = struct {
         if (self.terminal_emitted) return;
         self.setBackend(result.backend);
         try self.emitReady();
-        if (captureEvent(self.command, result)) |event| try self.emitCaptureEvent(event);
+        if (saveEvent(self.command, result)) |event| try self.emitSaveEvent(event);
         try self.emitExitEvent(exitEvent(self.command, result));
     }
 
@@ -868,28 +869,28 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
             @errorName(err),
         );
     }
-    if (err == error.CapturedSessionHasNoInteractiveStdin) {
+    if (err == error.SavedSessionHasNoInteractiveStdin) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
             "spore run: saved session has no interactive stdin",
             @errorName(err),
         );
     }
-    if (err == error.CapturedSessionHasNoTerminal) {
+    if (err == error.SavedSessionHasNoTerminal) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
             "spore run: saved session has no terminal",
             @errorName(err),
         );
     }
-    if (err == error.NoCapturedSession) {
+    if (err == error.NoSavedSession) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
             "spore run: spore has no saved session; pass a command after --from or use spore run --save to create a session spore",
             @errorName(err),
         );
     }
-    if (err == error.CapturedSessionUnavailable) {
+    if (err == error.SavedSessionUnavailable) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
             "spore run: saved session handle is unavailable",
@@ -952,13 +953,12 @@ pub const CliOptions = struct {
     backend: Backend = .auto,
     shared: SharedOptions = .{},
     from_spore_dir: ?[]const u8 = null,
-    attach_session_id: []const u8 = spore.default_session_id,
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
     pull_policy: PullPolicy = .missing,
-    capture_path: ?[]const u8 = null,
-    capture_trigger: capture.Trigger = .exit,
-    continue_after_capture: bool = false,
+    save_path: ?[]const u8 = null,
+    save_trigger: capture.Trigger = .exit,
+    continue_after_save: bool = false,
     network: NetworkMode = .disabled,
     network_requested: bool = false,
     network_policy: spore_net_policy.Config = .{},
@@ -1044,10 +1044,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var rootfs_path: ?[]const u8 = null;
     var image_ref: ?[]const u8 = null;
     var pull_policy: PullPolicy = .missing;
-    var capture_path: ?[]const u8 = null;
-    var capture_trigger: capture.Trigger = .exit;
-    var capture_trigger_set = false;
-    var continue_after_capture = false;
+    var save_path: ?[]const u8 = null;
+    var save_trigger: capture.Trigger = .exit;
+    var save_trigger_set = false;
+    var continue_after_save = false;
     var network: NetworkMode = .disabled;
     var network_requested = false;
     var network_policy = spore_net_policy.Config{};
@@ -1093,16 +1093,16 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         } else if (std.mem.eql(u8, args[i], "--from")) {
             from_spore_dir = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--save")) {
-            capture_path = takeValue(args, &i, args[i]);
+            save_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--save-on")) {
             const trigger_raw = takeValue(args, &i, args[i]);
-            capture_trigger = capture.Trigger.parse(trigger_raw) orelse {
+            save_trigger = capture.Trigger.parse(trigger_raw) orelse {
                 std.debug.print("--save-on must be EXIT, INT, TERM, HUP, USR1, or USR2\n", .{});
                 std.process.exit(2);
             };
-            capture_trigger_set = true;
+            save_trigger_set = true;
         } else if (std.mem.eql(u8, args[i], "--continue-after-save")) {
-            continue_after_capture = true;
+            continue_after_save = true;
         } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
             i += 1;
             event_mode = EventMode.parse(args[i]) orelse {
@@ -1219,19 +1219,19 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             };
         }
     }
-    if (capture_trigger_set and capture_path == null) {
+    if (save_trigger_set and save_path == null) {
         std.debug.print("spore run: --save-on requires --save\n", .{});
         std.process.exit(2);
     }
-    if (continue_after_capture and capture_path == null) {
+    if (continue_after_save and save_path == null) {
         std.debug.print("spore run: --continue-after-save requires --save\n", .{});
         std.process.exit(2);
     }
-    if (continue_after_capture and capture_trigger.isExit()) {
+    if (continue_after_save and save_trigger.isExit()) {
         std.debug.print("spore run: --continue-after-save requires a signal save trigger\n", .{});
         std.process.exit(2);
     }
-    if (capture_path != null and injected_file_sources.len != 0) {
+    if (save_path != null and injected_file_sources.len != 0) {
         std.debug.print("spore run: --inject with --save is not supported; injected files are intentionally not persisted\n", .{});
         std.process.exit(2);
     }
@@ -1248,13 +1248,12 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .backend = backend,
         .shared = shared,
         .from_spore_dir = from_spore_dir,
-        .attach_session_id = spore.default_session_id,
         .rootfs_path = rootfs_path,
         .image_ref = image_ref,
         .pull_policy = pull_policy,
-        .capture_path = capture_path,
-        .capture_trigger = capture_trigger,
-        .continue_after_capture = continue_after_capture,
+        .save_path = save_path,
+        .save_trigger = save_trigger,
+        .continue_after_save = continue_after_save,
         .network = network,
         .network_requested = network_requested,
         .network_policy = network_policy,
@@ -2300,260 +2299,6 @@ fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
-pub const RunStdinControl = struct {
-    stream: *vsock.HostStream,
-    terminal: bool,
-    forward_input: bool,
-    resize_fd: std.c.fd_t,
-    thread: ?std.Thread = null,
-    stop_pipe: [2]std.c.fd_t = .{ -1, -1 },
-    stop: std.atomic.Value(bool) = .init(false),
-    failed: std.atomic.Value(bool) = .init(false),
-    resize_count: std.atomic.Value(u32) = .init(0),
-    resize_seen: u32 = 0,
-    wake_context_addr: std.atomic.Value(usize) = .init(0),
-    wake_fn_addr: std.atomic.Value(usize) = .init(0),
-    resize_registration: ?TerminalResizeRegistration = null,
-    raw_terminal: ?RawTerminal = null,
-
-    pub fn init(stream: *vsock.HostStream, terminal: bool, forward_input: bool, resize_fd: std.c.fd_t) RunStdinControl {
-        return .{
-            .stream = stream,
-            .terminal = terminal,
-            .forward_input = forward_input,
-            .resize_fd = resize_fd,
-        };
-    }
-
-    pub fn start(self: *RunStdinControl, raw_terminal: bool) !void {
-        errdefer self.deinit();
-        if (raw_terminal) self.raw_terminal = try RawTerminal.enable();
-        if (self.terminal) {
-            self.resize_registration = TerminalResizeRegistration.install(self);
-            self.notifyResize();
-        }
-        if (self.forward_input) {
-            if (std.c.pipe(&self.stop_pipe) != 0) return error.StdinPumpStartFailed;
-            self.thread = try std.Thread.spawn(.{}, stdinThreadMain, .{self});
-        }
-    }
-
-    pub fn deinit(self: *RunStdinControl) void {
-        self.stop.store(true, .release);
-        if (self.stop_pipe[1] >= 0) {
-            const byte = [_]u8{1};
-            _ = std.c.write(self.stop_pipe[1], &byte, byte.len);
-        }
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
-        }
-        if (self.resize_registration) |*registration| {
-            registration.deinit();
-            self.resize_registration = null;
-        }
-        if (self.raw_terminal) |*raw| {
-            raw.deinit();
-            self.raw_terminal = null;
-        }
-        self.closeStopPipe();
-    }
-
-    pub fn control(self: *RunStdinControl) vsock.Control {
-        return .{
-            .context = self,
-            .pollFn = pollThunk,
-            .setWakeFn = setWakeThunk,
-            .completeSnapshotFn = completeSnapshotThunk,
-            .reportStatsFn = reportStatsThunk,
-        };
-    }
-
-    fn closeStopPipe(self: *RunStdinControl) void {
-        if (self.stop_pipe[0] >= 0) {
-            _ = std.c.close(self.stop_pipe[0]);
-            self.stop_pipe[0] = -1;
-        }
-        if (self.stop_pipe[1] >= 0) {
-            _ = std.c.close(self.stop_pipe[1]);
-            self.stop_pipe[1] = -1;
-        }
-    }
-
-    fn stdinThreadMain(self: *RunStdinControl) void {
-        var buf: [4096]u8 = undefined;
-        while (!self.stop.load(.acquire)) {
-            var fds = [_]std.posix.pollfd{
-                .{ .fd = 0, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
-                .{ .fd = self.stop_pipe[0], .events = std.c.POLL.IN, .revents = 0 },
-            };
-            const ready = std.posix.poll(&fds, -1) catch {
-                self.markFailed();
-                return;
-            };
-            if (ready == 0) continue;
-            if ((fds[1].revents & std.c.POLL.IN) != 0 or self.stop.load(.acquire)) return;
-            if ((fds[0].revents & (std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) {
-                self.markFailed();
-                return;
-            }
-            if ((fds[0].revents & (std.c.POLL.IN | std.c.POLL.HUP)) == 0) continue;
-            const n = std.c.read(0, &buf, buf.len);
-            if (n < 0) {
-                switch (std.c.errno(n)) {
-                    .INTR => continue,
-                    else => {
-                        self.markFailed();
-                        return;
-                    },
-                }
-            }
-            if (n == 0) {
-                const queued = if (self.terminal)
-                    self.stream.enqueueTerminalCloseBlocking(&self.stop)
-                else
-                    self.stream.enqueueStdinCloseBlocking(&self.stop);
-                _ = queued catch {
-                    self.markFailed();
-                    return;
-                };
-                self.wakeBackend();
-                return;
-            }
-            const bytes = buf[0..@intCast(n)];
-            const queued = (if (self.terminal)
-                self.stream.enqueueTerminalDataBlocking(bytes, &self.stop)
-            else
-                self.stream.enqueueStdinDataBlocking(bytes, &self.stop)) catch {
-                self.markFailed();
-                return;
-            };
-            if (!queued) return;
-            self.wakeBackend();
-        }
-    }
-
-    fn markFailed(self: *RunStdinControl) void {
-        self.failed.store(true, .release);
-        self.wakeBackend();
-    }
-
-    fn notifyResize(self: *RunStdinControl) void {
-        _ = self.resize_count.fetchAdd(1, .acq_rel);
-        self.wakeBackend();
-    }
-
-    fn wakeBackend(self: *RunStdinControl) void {
-        const wake_fn_addr = self.wake_fn_addr.load(.acquire);
-        if (wake_fn_addr == 0) return;
-        const wake_context_addr = self.wake_context_addr.load(.acquire);
-        const wake = vsock.Wake{
-            .context = @ptrFromInt(wake_context_addr),
-            .wakeFn = @ptrFromInt(wake_fn_addr),
-        };
-        wake.wake();
-    }
-
-    fn poll(self: *RunStdinControl, dev: *vsock.Vsock) !vsock.ControlAction {
-        if (self.failed.load(.acquire)) self.stream.fail();
-        if (self.terminal) {
-            const count = self.resize_count.load(.acquire);
-            if (count != self.resize_seen) {
-                self.resize_seen = count;
-                const resize = terminalSizeOrDefault(self.resize_fd);
-                _ = try self.stream.enqueueResizeBlocking(resize, &self.stop);
-            }
-        }
-        _ = try dev.flushHostStreamOutbound();
-        return .keep_running;
-    }
-
-    fn setWake(self: *RunStdinControl, wake: vsock.Wake) void {
-        self.wake_context_addr.store(@intFromPtr(wake.context), .release);
-        self.wake_fn_addr.store(@intFromPtr(wake.wakeFn), .release);
-    }
-
-    fn completeSnapshot(_: *RunStdinControl, _: []const u8) !void {}
-
-    fn reportStats(_: *RunStdinControl, _: vsock.ControlStats) void {}
-
-    fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock.ControlAction {
-        const self: *RunStdinControl = @ptrCast(@alignCast(context));
-        return self.poll(dev);
-    }
-
-    fn setWakeThunk(context: *anyopaque, wake: vsock.Wake) void {
-        const self: *RunStdinControl = @ptrCast(@alignCast(context));
-        self.setWake(wake);
-    }
-
-    fn completeSnapshotThunk(context: *anyopaque, dir: []const u8) !void {
-        const self: *RunStdinControl = @ptrCast(@alignCast(context));
-        try self.completeSnapshot(dir);
-    }
-
-    fn reportStatsThunk(context: *anyopaque, stats: vsock.ControlStats) void {
-        const self: *RunStdinControl = @ptrCast(@alignCast(context));
-        self.reportStats(stats);
-    }
-};
-
-const RawTerminal = struct {
-    saved: std.c.termios,
-    active: bool = true,
-
-    fn enable() !RawTerminal {
-        var current: std.c.termios = undefined;
-        if (std.c.tcgetattr(0, &current) != 0) return error.TerminalRawModeFailed;
-        var raw = current;
-        raw.iflag.ICRNL = false;
-        raw.iflag.IXON = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.ECHO = false;
-        raw.lflag.ISIG = false;
-        raw.oflag.OPOST = false;
-        if (std.c.tcsetattr(0, .NOW, &raw) != 0) return error.TerminalRawModeFailed;
-        return .{ .saved = current };
-    }
-
-    fn deinit(self: *RawTerminal) void {
-        if (!self.active) return;
-        var saved = self.saved;
-        _ = std.c.tcsetattr(0, .NOW, &saved);
-        self.active = false;
-    }
-};
-
-var active_terminal_resize: ?*RunStdinControl = null;
-
-const TerminalResizeRegistration = struct {
-    old_action: std.posix.Sigaction,
-    active: bool = true,
-
-    fn install(control: *RunStdinControl) TerminalResizeRegistration {
-        active_terminal_resize = control;
-        var old_action: std.posix.Sigaction = undefined;
-        const action = std.posix.Sigaction{
-            .handler = .{ .sigaction = handleTerminalResize },
-            .mask = std.posix.sigemptyset(),
-            .flags = std.posix.SA.SIGINFO,
-        };
-        std.posix.sigaction(.WINCH, &action, &old_action);
-        return .{ .old_action = old_action };
-    }
-
-    fn deinit(self: *TerminalResizeRegistration) void {
-        if (!self.active) return;
-        std.posix.sigaction(.WINCH, &self.old_action, null);
-        if (active_terminal_resize != null) active_terminal_resize = null;
-        self.active = false;
-    }
-};
-
-fn handleTerminalResize(_: std.posix.SIG, _: *const std.posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
-    if (active_terminal_resize) |control| control.notifyResize();
-}
-
 pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !Result {
     var events = EventEmitter.init(opts.events, "run");
     try events.emitStart(opts.backend);
@@ -2587,7 +2332,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
 
     const resuming = opts.resume_dir != null;
     const memory_plan = runMemoryPlan(opts.memory, .{
-        .fixed_ram = resuming or opts.capture_path != null or opts.vcpus != 1,
+        .fixed_ram = resuming or opts.save_path != null or opts.vcpus != 1,
         .auto_hotplug_capable = opts.auto_memory_hotplug_capable,
     });
     const local_backing_start = monotonicMs();
@@ -2601,7 +2346,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const kernel_ms = monotonicMs() -| kernel_start;
     const initrd_start = monotonicMs();
     if (resuming and opts.injected_files.len != 0) return error.InjectedFileResumeUnsupported;
-    if (opts.capture_path != null and opts.injected_files.len != 0) return error.InjectedFileCaptureUnsupported;
+    if (opts.save_path != null and opts.injected_files.len != 0) return error.InjectedFileCaptureUnsupported;
     const initrd: ?[]const u8 = if (resuming) null else try loadRunInitrd(context.io, allocator, opts.initrd_path, opts.injected_files);
     const initrd_ms = monotonicMs() -| initrd_start;
     const disk_start = monotonicMs();
@@ -2625,7 +2370,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     } else if (opts.stream_output) {
         stream.setOutputSink(null, runOutputSink);
     }
-    var stdin_control = if (opts.interactive or opts.tty) RunStdinControl.init(&stream, opts.tty, opts.interactive, terminalSizeFd()) else null;
+    var stdin_control = if (opts.interactive or opts.tty) attach_stream.RunStdinControl.init(&stream, opts.tty, opts.interactive, attach_stream.terminalSizeFd()) else null;
     if (stdin_control) |*control| try control.start(opts.tty and opts.interactive);
     defer if (stdin_control) |*control| control.deinit();
     const exec_control = if (stdin_control) |*control| control.control() else null;
@@ -2633,18 +2378,18 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     var signal_registration: ?capture.SignalRegistration = null;
     defer if (signal_registration) |*registration| registration.deinit();
     const capture_plan = capture.Plan.productRun(.{
-        .capture_path = opts.capture_path,
-        .trigger = opts.capture_trigger,
+        .capture_path = opts.save_path,
+        .trigger = opts.save_trigger,
         .resume_dir = opts.resume_dir,
         .request = &capture_request,
-        .continue_after_capture = opts.continue_after_capture,
+        .continue_after_capture = opts.continue_after_save,
     });
-    var captured_session_buf: [1]spore.Session = undefined;
-    const captured_sessions = if (request.attaches_existing and opts.resume_sessions.len != 0)
+    var saved_session_buf: [1]spore.Session = undefined;
+    const saved_sessions = if (request.attaches_existing and opts.resume_sessions.len != 0)
         opts.resume_sessions
     else blk: {
-        captured_session_buf[0] = spore.processSession(request.session_id, opts.interactive, opts.tty);
-        break :blk captured_session_buf[0..1];
+        saved_session_buf[0] = spore.processSession(request.session_id, opts.interactive, opts.tty);
+        break :blk saved_session_buf[0..1];
     };
     if (capture_plan.signal) |signal| {
         signal_registration = capture.SignalRegistration.install(signal, capture_plan.request.?);
@@ -2681,7 +2426,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
-                .sessions = captured_sessions,
+                .sessions = saved_sessions,
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
                 .ram_backing_fd = local_backing.fd,
@@ -2712,7 +2457,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
-                .sessions = captured_sessions,
+                .sessions = saved_sessions,
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
                 .ram_backing_fd = local_backing.fd,
@@ -2970,32 +2715,6 @@ pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]co
     return execRequestWithSession(allocator, argv, "default", 0);
 }
 
-pub fn terminalName(environ: *const std.process.Environ.Map) []const u8 {
-    return environ.get("TERM") orelse "xterm";
-}
-
-fn ioctlRequest(comptime request: anytype) c_int {
-    const raw: u32 = @truncate(@as(usize, request));
-    return @bitCast(raw);
-}
-
-pub fn terminalSizeOrDefault(fd: std.c.fd_t) spore_stream.Resize {
-    var size: std.posix.winsize = .{
-        .row = 0,
-        .col = 0,
-        .xpixel = 0,
-        .ypixel = 0,
-    };
-    if (std.c.ioctl(fd, ioctlRequest(std.posix.T.IOCGWINSZ), &size) == 0 and size.row > 0 and size.col > 0) {
-        return .{ .rows = size.row, .cols = size.col };
-    }
-    return .{ .rows = 24, .cols = 80 };
-}
-
-pub fn terminalSizeFd() std.c.fd_t {
-    return if (std.c.isatty(1) != 0) 1 else if (std.c.isatty(0) != 0) 0 else 1;
-}
-
 const RunRequestInfo = struct {
     bytes: []const u8,
     session_id: []const u8,
@@ -3007,19 +2726,19 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
     if (opts.resume_dir != null and opts.command.len == 0) {
         if (opts.interactive or opts.tty) {
             return .{
-                .bytes = try attachV1Request(allocator, .{
+                .bytes = try attach_stream.attachV1Request(allocator, .{
                     .session_id = opts.attach_session_id,
                     .interactive = opts.interactive,
                     .tty = opts.tty,
-                    .terminal_name = terminalName(context.environ_map),
-                    .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
+                    .terminal_name = attach_stream.terminalName(context.environ_map),
+                    .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
                 }),
                 .session_id = opts.attach_session_id,
                 .attaches_existing = true,
             };
         }
         return .{
-            .bytes = try attachRequest(allocator, opts.attach_session_id),
+            .bytes = try attach_stream.attachRequest(allocator, opts.attach_session_id),
             .session_id = opts.attach_session_id,
             .attaches_existing = true,
         };
@@ -3032,8 +2751,8 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
             .memory_pressure = memory_pressure,
             .interactive = opts.interactive,
             .tty = opts.tty,
-            .terminal_name = terminalName(context.environ_map),
-            .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
+            .terminal_name = attach_stream.terminalName(context.environ_map),
+            .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
         }),
         .session_id = spore.default_session_id,
     };
@@ -3045,8 +2764,8 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
             .memory_pressure = memory_pressure,
             .interactive = opts.interactive,
             .tty = opts.tty,
-            .terminal_name = terminalName(context.environ_map),
-            .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
+            .terminal_name = attach_stream.terminalName(context.environ_map),
+            .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
             .generation_params = opts.start_generation_params,
             .require_generation_ready = opts.require_generation_ready,
         }),
@@ -3060,72 +2779,6 @@ fn randomRunSessionId(context: Context, allocator: std.mem.Allocator) ![]const u
     context.io.random(&nonce_bytes);
     const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
     return std.fmt.allocPrint(allocator, "run-{x}-{x}", .{ now, nonce });
-}
-
-pub fn attachRequest(allocator: std.mem.Allocator, session_id: []const u8) ![]const u8 {
-    return attachRequestWithGeneration(allocator, session_id, null);
-}
-
-pub fn attachRequestWithGeneration(allocator: std.mem.Allocator, session_id: []const u8, generation_params: ?[]const u8) ![]const u8 {
-    if (generation_params) |params| {
-        const payload = struct {
-            type: []const u8 = "attach",
-            session_id: []const u8,
-            stdout_offset: u64 = 0,
-            stderr_offset: u64 = 0,
-            params_json: []const u8,
-        }{ .session_id = session_id, .params_json = params };
-        const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-        defer allocator.free(json);
-        if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
-        return std.fmt.allocPrint(allocator, "{s}\n", .{json});
-    }
-    const payload = struct {
-        type: []const u8 = "attach",
-        session_id: []const u8,
-        stdout_offset: u64 = 0,
-        stderr_offset: u64 = 0,
-    }{ .session_id = session_id };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
-    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
-}
-
-pub const AttachV1Options = struct {
-    session_id: []const u8 = spore.default_session_id,
-    interactive: bool = false,
-    tty: bool = false,
-    terminal_name: []const u8 = "xterm",
-    terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
-    generation_params: ?[]const u8 = null,
-};
-
-pub fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) ![]const u8 {
-    const payload = struct {
-        type: []const u8 = "attach-v1",
-        session_id: []const u8,
-        stdout_offset: u64 = 0,
-        stderr_offset: u64 = 0,
-        stdio: []const u8,
-        interactive: bool,
-        term: []const u8,
-        terminal_rows: u16,
-        terminal_cols: u16,
-        params_json: []const u8,
-    }{
-        .session_id = options.session_id,
-        .stdio = if (options.tty) "tty" else "pipe",
-        .interactive = options.interactive,
-        .term = options.terminal_name,
-        .terminal_rows = options.terminal_size.rows,
-        .terminal_cols = options.terminal_size.cols,
-        .params_json = options.generation_params orelse "",
-    };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
-    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
 pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, resume_time_unix_ns: u64) ![]const u8 {
@@ -3292,7 +2945,7 @@ pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, root
     );
 }
 
-fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostStream, captured: bool) !Result {
+fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostStream, saved: bool) !Result {
     const start_ms = stream.start_ms orelse 0;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
@@ -3317,8 +2970,8 @@ fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostSt
         .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
         .vcpus = opts.vcpus,
         .memory_bytes = opts.memory.bytes,
-        .captured = captured,
-        .capture_path = if (captured) opts.capture_path else null,
+        .saved = saved,
+        .save_path = if (saved) opts.save_path else null,
     };
 }
 
@@ -3343,8 +2996,8 @@ fn resultFromSignalCaptureExitCode(backend: Backend, opts: Options, stream: *con
         .exit_code = exit_code,
         .vcpus = opts.vcpus,
         .memory_bytes = opts.memory.bytes,
-        .captured = true,
-        .capture_path = opts.capture_path,
+        .saved = true,
+        .save_path = opts.save_path,
     };
 }
 
@@ -3361,8 +3014,8 @@ fn resultFromExitCapture(backend: Backend, opts: Options, stream: *const vsock.H
         .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
         .vcpus = opts.vcpus,
         .memory_bytes = opts.memory.bytes,
-        .captured = true,
-        .capture_path = opts.capture_path,
+        .saved = true,
+        .save_path = opts.save_path,
     };
 }
 
@@ -3708,7 +3361,7 @@ test "interactive stream protocol failure has a clear public message" {
 }
 
 test "saved session attach failures are usage errors" {
-    const classified = classifyFailure(error.CapturedSessionHasNoInteractiveStdin);
+    const classified = classifyFailure(error.SavedSessionHasNoInteractiveStdin);
     try std.testing.expectEqual(machine_output.ErrorCode.usage_invalid_argument, classified.code);
     try std.testing.expect(std.mem.indexOf(u8, classified.message, "no interactive stdin") != null);
 }
@@ -3802,8 +3455,8 @@ test "event writer emits capture events before exit" {
         .exit_code = 0,
         .vcpus = 1,
         .memory_bytes = memory_config.auto_bytes,
-        .captured = true,
-        .capture_path = "out.spore",
+        .saved = true,
+        .save_path = "out.spore",
     });
 
     var lines = std.mem.splitScalar(u8, out.written(), '\n');
@@ -4046,41 +3699,6 @@ test "run cli guest command keeps exact argv" {
 test "run cli guest command rejects unquoted shell words" {
     const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "echo", "hi" });
     try std.testing.expectError(error.ShellCommandArgumentCountUnsupported, cliGuestCommand(std.testing.allocator, opts));
-}
-
-test "run attach request resumes default session" {
-    const request = try attachRequest(std.testing.allocator, spore.default_session_id);
-    defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", request);
-}
-
-test "run attach request can target recorded session id" {
-    const request = try attachRequest(std.testing.allocator, "run-1234");
-    defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"run-1234\",\"stdout_offset\":0,\"stderr_offset\":0}\n", request);
-}
-
-test "interactive run attach request uses v1 pipe stdio" {
-    const request = try attachV1Request(std.testing.allocator, .{ .interactive = true });
-    defer std.testing.allocator.free(request);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"attach-v1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"pipe\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"interactive\":true") != null);
-}
-
-test "tty run attach request uses v1 terminal metadata" {
-    const request = try attachV1Request(std.testing.allocator, .{
-        .interactive = true,
-        .tty = true,
-        .terminal_name = "xterm-256color",
-        .terminal_size = .{ .rows = 40, .cols = 120 },
-    });
-    defer std.testing.allocator.free(request);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"attach-v1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"tty\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"term\":\"xterm-256color\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_rows\":40") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_cols\":120") != null);
 }
 
 test "run cli parser allows default boot assets" {
@@ -4351,7 +3969,7 @@ test "run builds manifest network from active policy" {
     try std.testing.expect((try manifestNetworkFromOptions(std.testing.allocator, .disabled, &policy)) == null);
 }
 
-test "run refuses to restore captured bound services without live bindings" {
+test "run refuses to restore saved bound services without live bindings" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4368,7 +3986,7 @@ test "run refuses to restore captured bound services without live bindings" {
     try std.testing.expectError(error.MissingBoundServiceBinding, networkOptionsFromManifest(arena, manifest_network));
 }
 
-test "run binding diagnostics name missing captured bound service" {
+test "run binding diagnostics name missing saved bound service" {
     var diagnostic = BoundServiceBindingDiagnostic{};
     {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -4393,7 +4011,7 @@ test "run binding diagnostics name missing captured bound service" {
     try std.testing.expectEqualStrings("cleanroom-gateway", diagnostic.missing_name.?);
 }
 
-test "run restores captured bound services with live bindings" {
+test "run restores saved bound services with live bindings" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4463,9 +4081,9 @@ test "removed capture flags map to save rename hints" {
 
 test "run cli parser accepts save flags" {
     const opts = try parseCliArgs(&.{ "--save", "out.spore", "--save-on", "USR1", "--continue-after-save", "--", "/bin/sleeper" });
-    try std.testing.expectEqualStrings("out.spore", opts.capture_path.?);
-    try std.testing.expectEqual(capture.Signal.USR1, opts.capture_trigger.signalValue().?);
-    try std.testing.expect(opts.continue_after_capture);
+    try std.testing.expectEqualStrings("out.spore", opts.save_path.?);
+    try std.testing.expectEqual(capture.Signal.USR1, opts.save_trigger.signalValue().?);
+    try std.testing.expect(opts.continue_after_save);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/sleeper", opts.command[0]);
 }
@@ -4484,12 +4102,12 @@ test "run cli parser accepts jsonl events" {
 
 test "run cli parser defaults save trigger to exit" {
     const opts = try parseCliArgs(&.{ "--save", "out.spore", "--", "/bin/true" });
-    try std.testing.expectEqualStrings("out.spore", opts.capture_path.?);
-    try std.testing.expect(opts.capture_trigger.isExit());
-    try std.testing.expect(!opts.continue_after_capture);
+    try std.testing.expectEqualStrings("out.spore", opts.save_path.?);
+    try std.testing.expect(opts.save_trigger.isExit());
+    try std.testing.expect(!opts.continue_after_save);
 }
 
-test "captured run result exits zero" {
+test "saved run result exits zero" {
     const result = Result{
         .backend = .hvf,
         .start_ms = 1,
@@ -4499,13 +4117,13 @@ test "captured run result exits zero" {
         .exit_code = 0,
         .vcpus = 1,
         .memory_bytes = memory_config.auto_bytes,
-        .captured = true,
-        .capture_path = "out.spore",
+        .saved = true,
+        .save_path = "out.spore",
     };
     try std.testing.expectEqual(@as(u8, 0), result.processExitCode());
 }
 
-test "captured run result preserves stored exit code" {
+test "saved run result preserves stored exit code" {
     const result = Result{
         .backend = .hvf,
         .start_ms = 1,
@@ -4515,8 +4133,8 @@ test "captured run result preserves stored exit code" {
         .exit_code = 7,
         .vcpus = 1,
         .memory_bytes = memory_config.auto_bytes,
-        .captured = true,
-        .capture_path = "out.spore",
+        .saved = true,
+        .save_path = "out.spore",
     };
     try std.testing.expectEqual(@as(u8, 7), result.processExitCode());
 }

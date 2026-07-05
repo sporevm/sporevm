@@ -13,7 +13,7 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 13;
+const c_abi_version: u32 = 14;
 const reexec_contract_version: u32 = 1;
 const reexec_role_env = "SPORE_REEXEC_ROLE";
 const reexec_contract_env = "SPORE_REEXEC_CONTRACT";
@@ -23,13 +23,12 @@ const pull_options_version: u32 = 1;
 const system_df_options_version: u32 = 1;
 const system_prune_options_version: u32 = 1;
 const create_named_options_version: u32 = 4;
-const resume_named_options_version: u32 = 2;
+const restore_named_options_version: u32 = 1;
 const fork_named_options_version: u32 = 1;
 const exec_named_options_version: u32 = 2;
 const exec_named_stream_options_version: u32 = 1;
 const copy_named_options_version: u32 = 1;
-const snapshot_named_options_version: u32 = 2;
-const suspend_named_options_version: u32 = 1;
+const save_named_options_version: u32 = 1;
 const remove_named_options_version: u32 = 1;
 
 const stream_event_stdout: c_int = 1;
@@ -209,7 +208,7 @@ const SporeCopyNamedOptions = extern struct {
     guest_path: SporeString,
 };
 
-const SporeResumeNamedOptions = extern struct {
+const SporeRestoreNamedOptions = extern struct {
     size: u32,
     version: u32,
     spore_dir: SporeString,
@@ -228,21 +227,14 @@ const SporeForkNamedOptions = extern struct {
     spore_executable: SporeString,
 };
 
-const SporeSnapshotNamedOptions = extern struct {
+const SporeSaveNamedOptions = extern struct {
     size: u32,
     version: u32,
     name: SporeString,
     out_dir: SporeString,
-    continue_after: u8,
+    stop: u8,
     annotations: ?[*]const SporeAnnotation,
     annotation_count: usize,
-};
-
-const SporeSuspendNamedOptions = extern struct {
-    size: u32,
-    version: u32,
-    name: SporeString,
-    out_dir: SporeString,
 };
 
 const SporeRemoveNamedOptions = extern struct {
@@ -419,11 +411,11 @@ pub export fn spore_copy_named_options_init(options: ?*SporeCopyNamedOptions) vo
     };
 }
 
-pub export fn spore_resume_named_options_init(options: ?*SporeResumeNamedOptions) void {
+pub export fn spore_restore_named_options_init(options: ?*SporeRestoreNamedOptions) void {
     const out = options orelse return;
     out.* = .{
-        .size = @sizeOf(SporeResumeNamedOptions),
-        .version = resume_named_options_version,
+        .size = @sizeOf(SporeRestoreNamedOptions),
+        .version = restore_named_options_version,
         .spore_dir = .{},
         .name = .{},
         .spore_executable = .{},
@@ -444,26 +436,16 @@ pub export fn spore_fork_named_options_init(options: ?*SporeForkNamedOptions) vo
     };
 }
 
-pub export fn spore_snapshot_named_options_init(options: ?*SporeSnapshotNamedOptions) void {
+pub export fn spore_save_named_options_init(options: ?*SporeSaveNamedOptions) void {
     const out = options orelse return;
     out.* = .{
-        .size = @sizeOf(SporeSnapshotNamedOptions),
-        .version = snapshot_named_options_version,
+        .size = @sizeOf(SporeSaveNamedOptions),
+        .version = save_named_options_version,
         .name = .{},
         .out_dir = .{},
-        .continue_after = 1,
+        .stop = 0,
         .annotations = null,
         .annotation_count = 0,
-    };
-}
-
-pub export fn spore_suspend_named_options_init(options: ?*SporeSuspendNamedOptions) void {
-    const out = options orelse return;
-    out.* = .{
-        .size = @sizeOf(SporeSuspendNamedOptions),
-        .version = suspend_named_options_version,
-        .name = .{},
-        .out_dir = .{},
     };
 }
 
@@ -977,9 +959,9 @@ pub export fn spore_copy_out_named(
     return result_success;
 }
 
-pub export fn spore_resume_named_json(
+pub export fn spore_restore_named_json(
     context: ?*SporeContextImpl,
-    options: ?*const SporeResumeNamedOptions,
+    options: ?*const SporeRestoreNamedOptions,
     out_json: ?*SporeOwnedString,
 ) c_int {
     const ctx = context orelse return result_invalid_value;
@@ -987,7 +969,7 @@ pub export fn spore_resume_named_json(
     const out = out_json orelse return fail(ctx, error.InvalidValue);
     out.* = .{};
     ctx.clearLastError();
-    if (opts.version != resume_named_options_version or opts.size < @sizeOf(SporeResumeNamedOptions)) {
+    if (opts.version != restore_named_options_version or opts.size < @sizeOf(SporeRestoreNamedOptions)) {
         return fail(ctx, error.InvalidValue);
     }
 
@@ -996,7 +978,7 @@ pub export fn spore_resume_named_json(
     const arena = process_arena.allocator();
     const init = cInit(ctx, &process_arena);
     const bound_services = parseBoundUnixServiceBindings(arena, opts.bound_unix_services, opts.bound_unix_service_count) catch |err| return fail(ctx, err);
-    const result = libspore.resumeNamed(init, ctx.allocator, .{
+    const result = libspore.restoreNamed(init, ctx.allocator, .{
         .spore_dir = toSlice(opts.spore_dir) catch |err| return fail(ctx, err),
         .name = toSlice(opts.name) catch |err| return fail(ctx, err),
         .spore_executable = (optionalSlice(opts.spore_executable) catch |err| return fail(ctx, err)) orelse "spore",
@@ -1037,9 +1019,9 @@ pub export fn spore_fork_named_json(
     return result_success;
 }
 
-pub export fn spore_snapshot_named_json(
+pub export fn spore_save_named_json(
     context: ?*SporeContextImpl,
-    options: ?*const SporeSnapshotNamedOptions,
+    options: ?*const SporeSaveNamedOptions,
     out_json: ?*SporeOwnedString,
 ) c_int {
     const ctx = context orelse return result_invalid_value;
@@ -1047,7 +1029,7 @@ pub export fn spore_snapshot_named_json(
     const out = out_json orelse return fail(ctx, error.InvalidValue);
     out.* = .{};
     ctx.clearLastError();
-    if (opts.version != snapshot_named_options_version or opts.size < @sizeOf(SporeSnapshotNamedOptions)) {
+    if (opts.version != save_named_options_version or opts.size < @sizeOf(SporeSaveNamedOptions)) {
         return fail(ctx, error.InvalidValue);
     }
 
@@ -1055,35 +1037,11 @@ pub export fn spore_snapshot_named_json(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const annotations = parseAnnotations(arena, opts.annotations, opts.annotation_count) catch |err| return fail(ctx, err);
-    const result = libspore.snapshotNamed(ctx.productContext(), ctx.allocator, .{
+    const result = libspore.saveNamed(ctx.productContext(), ctx.allocator, .{
         .name = toSlice(opts.name) catch |err| return fail(ctx, err),
         .out_dir = toSlice(opts.out_dir) catch |err| return fail(ctx, err),
-        .continue_after = opts.continue_after != 0,
+        .stop = opts.stop != 0,
         .annotations = annotations,
-    }) catch |err| return fail(ctx, err);
-    defer libspore.deinitNamedLifecycleResult(ctx.allocator, result);
-
-    out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
-    return result_success;
-}
-
-pub export fn spore_suspend_named_json(
-    context: ?*SporeContextImpl,
-    options: ?*const SporeSuspendNamedOptions,
-    out_json: ?*SporeOwnedString,
-) c_int {
-    const ctx = context orelse return result_invalid_value;
-    const opts = options orelse return fail(ctx, error.InvalidValue);
-    const out = out_json orelse return fail(ctx, error.InvalidValue);
-    out.* = .{};
-    ctx.clearLastError();
-    if (opts.version != suspend_named_options_version or opts.size < @sizeOf(SporeSuspendNamedOptions)) {
-        return fail(ctx, error.InvalidValue);
-    }
-
-    const result = libspore.suspendNamed(ctx.productContext(), ctx.allocator, .{
-        .name = toSlice(opts.name) catch |err| return fail(ctx, err),
-        .out_dir = toSlice(opts.out_dir) catch |err| return fail(ctx, err),
     }) catch |err| return fail(ctx, err);
     defer libspore.deinitNamedLifecycleResult(ctx.allocator, result);
 
@@ -1520,20 +1478,20 @@ test "named lifecycle options initialize defaults" {
     try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeCopyNamedOptions))), copy.size);
     try std.testing.expectEqual(copy_named_options_version, copy.version);
 
-    var resume_options: SporeResumeNamedOptions = undefined;
-    spore_resume_named_options_init(&resume_options);
-    try std.testing.expectEqual(resume_named_options_version, resume_options.version);
-    try std.testing.expectEqual(@as(usize, 0), resume_options.bound_unix_service_count);
+    var restore_options: SporeRestoreNamedOptions = undefined;
+    spore_restore_named_options_init(&restore_options);
+    try std.testing.expectEqual(restore_named_options_version, restore_options.version);
+    try std.testing.expectEqual(@as(usize, 0), restore_options.bound_unix_service_count);
 
     var fork_options: SporeForkNamedOptions = undefined;
     spore_fork_named_options_init(&fork_options);
     try std.testing.expectEqual(fork_named_options_version, fork_options.version);
 
-    var snapshot: SporeSnapshotNamedOptions = undefined;
-    spore_snapshot_named_options_init(&snapshot);
-    try std.testing.expectEqual(snapshot_named_options_version, snapshot.version);
-    try std.testing.expectEqual(@as(u8, 1), snapshot.continue_after);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.annotation_count);
+    var save: SporeSaveNamedOptions = undefined;
+    spore_save_named_options_init(&save);
+    try std.testing.expectEqual(save_named_options_version, save.version);
+    try std.testing.expectEqual(@as(u8, 0), save.stop);
+    try std.testing.expectEqual(@as(usize, 0), save.annotation_count);
 }
 
 test "C ABI exposes network capabilities JSON" {

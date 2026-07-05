@@ -295,11 +295,11 @@ type CreateNamedOptions struct {
 	Annotations     map[string]string
 }
 
-// SnapshotNamedOptions snapshots a named VM while it keeps running.
-type SnapshotNamedOptions struct {
+// SaveNamedOptions writes a named VM to a spore.
+type SaveNamedOptions struct {
 	Name        string
 	OutDir      string
-	Continue    bool
+	Stop        bool
 	Annotations map[string]string
 }
 
@@ -345,8 +345,8 @@ type CopyNamedOptions struct {
 	GuestPath string
 }
 
-// ResumeNamedOptions starts a named VM from a spore checkpoint directory.
-type ResumeNamedOptions struct {
+// RestoreNamedOptions starts a named VM from a spore directory.
+type RestoreNamedOptions struct {
 	SporeDir             string
 	Name                 string
 	SporeExecutable      string

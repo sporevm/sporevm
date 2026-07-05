@@ -10,7 +10,7 @@ const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
 const generation = @import("generation.zig");
-const resume_mod = @import("resume.zig");
+const attach_mod = @import("attach.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
@@ -439,7 +439,7 @@ const ForkOptions = struct {
     name_pattern: []const u8,
 };
 
-const ResumeOptions = struct {
+const RestoreOptions = struct {
     spore_dir: []const u8,
     name: []const u8,
     backend: ?run_mod.Backend = null,
@@ -488,7 +488,7 @@ pub const CreateNamedOptions = struct {
     annotations: spore.Annotations = .{},
 };
 
-pub const ResumeNamedOptions = struct {
+pub const RestoreNamedOptions = struct {
     spore_dir: []const u8,
     name: []const u8,
     backend: ?run_mod.Backend = null,
@@ -511,16 +511,16 @@ pub const CopyNamedOptions = struct {
     guest_path: []const u8,
 };
 
-pub const SnapshotNamedOptions = struct {
+const SaveContinueNamedOptions = struct {
     name: []const u8,
     out_dir: []const u8,
-    continue_after: bool = true,
     annotations: spore.Annotations = .{},
 };
 
-pub const SuspendNamedOptions = struct {
+pub const SaveNamedOptions = struct {
     name: []const u8,
     out_dir: []const u8,
+    stop: bool = false,
     annotations: spore.Annotations = .{},
 };
 
@@ -826,10 +826,10 @@ fn createNamedWithTiming(
     });
 }
 
-pub fn resumeNamed(
+pub fn restoreNamed(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    options: ResumeNamedOptions,
+    options: RestoreNamedOptions,
 ) !NamedLifecycleResult {
     clearLastError();
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -870,13 +870,13 @@ pub fn resumeNamed(
     const ram_size = if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size;
     const manifest_generation = if (manifest) |parsed| parsed.value.generation else manifest_v1.?.value.generation;
     const resume_generation = if (options.generation_path) |path| blk: {
-        const params = resume_mod.loadGenerationParams(init.io, arena, path) catch |err| switch (err) {
+        const params = attach_mod.loadGenerationParams(init.io, arena, path) catch |err| switch (err) {
             error.BadGenerationPayload => return error.BadGenerationPayload,
             error.StreamTooLong => return error.GenerationPayloadTooLarge,
             error.FileNotFound => return error.GenerationFileNotFound,
             else => return error.GenerationFileInvalid,
         };
-        break :blk try resume_mod.prepareResumeGenerationState(arena, manifest_generation, params);
+        break :blk try attach_mod.prepareRestoreGenerationState(arena, manifest_generation, params);
     } else null;
     const sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions;
     const memory = memory_config.fromManifestBytes(ram_size) catch return error.InvalidMemorySize;
@@ -911,7 +911,7 @@ pub fn resumeNamed(
 
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
     const state = try classifyVmState(arena, init.io, paths, pidAlive);
-    if (state != .absent) return namedVmExists(arena, init.io, paths, "resume", spec.name, state);
+    if (state != .absent) return namedVmExists(arena, init.io, paths, "restore", spec.name, state);
     if (spec.rootfs != null or spec.disk != null or spec.resume_generation != null or !spore.annotationsEmpty(spec.annotations) or spec.sessions.len != 0) try writeSpec(arena, init.io, paths, spec);
 
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (network_options.network == .spore) &network_options.policy else null;
@@ -1091,13 +1091,12 @@ fn startNamed(
     return parseExecNamedResponse(allocator, arena, response);
 }
 
-pub fn snapshotNamed(
+fn saveContinueNamed(
     context: Context,
     allocator: std.mem.Allocator,
-    options: SnapshotNamedOptions,
+    options: SaveContinueNamedOptions,
 ) !NamedLifecycleResult {
     clearLastError();
-    if (!options.continue_after) return error.UnsupportedSnapshotMode;
     try spore.validateAnnotations(options.annotations);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1107,7 +1106,7 @@ pub fn snapshotNamed(
     const out_dir = try resolveNewOutputDirApi(arena, context.io, options.out_dir);
     const paths = try apiPaths(context, arena, options.name);
     const state = try classifyVmState(arena, context.io, paths, pidAlive);
-    if (state != .ready) return namedVmNotReady(arena, context.io, paths, "snapshot", options.name, state);
+    if (state != .ready) return namedVmNotReady(arena, context.io, paths, "save", options.name, state);
     var spec = try readSpec(arena, context.io, paths);
     defer spec.deinit();
     if (spec.value.vcpus != 1) return error.UnsupportedSnapshotMode;
@@ -1128,7 +1127,7 @@ pub fn snapshotNamed(
     }
     try writeSporeLifecycleSpec(arena, context.io, out_dir, snapshot_spec);
     return ownedNamedLifecycleResult(allocator, .{
-        .action = "snapshotted",
+        .action = "saved",
         .name = options.name,
         .state = "ready",
         .pid = ready.value.pid,
@@ -1139,9 +1138,10 @@ pub fn snapshotNamed(
 pub fn saveNamed(
     context: Context,
     allocator: std.mem.Allocator,
-    options: SnapshotNamedOptions,
+    options: SaveNamedOptions,
 ) !NamedLifecycleResult {
     clearLastError();
+    if (options.stop) return saveStopNamed(context, allocator, options);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1152,13 +1152,12 @@ pub fn saveNamed(
     var cleanup_temp = true;
     defer if (cleanup_temp) Io.Dir.cwd().deleteTree(context.io, temp_dir) catch {};
 
-    const snapshot = try snapshotNamed(context, allocator, .{
+    const saved = try saveContinueNamed(context, allocator, .{
         .name = options.name,
         .out_dir = temp_dir,
-        .continue_after = options.continue_after,
         .annotations = options.annotations,
     });
-    defer deinitNamedLifecycleResult(allocator, snapshot);
+    defer deinitNamedLifecycleResult(allocator, saved);
 
     try Io.Dir.renameAbsolute(temp_dir, out_dir, context.io);
     cleanup_temp = false;
@@ -1166,15 +1165,15 @@ pub fn saveNamed(
         .action = "saved",
         .name = options.name,
         .state = "ready",
-        .pid = snapshot.pid,
+        .pid = saved.pid,
         .spore_dir = out_dir,
     });
 }
 
-pub fn suspendNamed(
+fn saveStopNamed(
     context: Context,
     allocator: std.mem.Allocator,
-    options: SuspendNamedOptions,
+    options: SaveNamedOptions,
 ) !NamedLifecycleResult {
     clearLastError();
     try spore.validateAnnotations(options.annotations);
@@ -1186,7 +1185,7 @@ pub fn suspendNamed(
     const out_dir = try resolveNewOutputDirApi(arena, context.io, options.out_dir);
     const paths = try apiPaths(context, arena, options.name);
     const state = try classifyVmState(arena, context.io, paths, pidAlive);
-    if (state != .ready) return namedVmNotReady(arena, context.io, paths, "suspend", options.name, state);
+    if (state != .ready) return namedVmNotReady(arena, context.io, paths, "save", options.name, state);
     var spec = try readSpec(arena, context.io, paths);
     defer spec.deinit();
     if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
@@ -1776,18 +1775,12 @@ pub fn saveCli(
     const allocator = init.arena.allocator();
     const parsed = parseSaveArgs(args, allocator, stderr, mode);
     const context = Context{ .io = init.io, .environ_map = init.environ_map };
-    const result = (if (parsed.stop)
-        suspendNamed(context, allocator, .{
-            .name = parsed.name,
-            .out_dir = parsed.out_dir,
-            .annotations = parsed.annotations,
-        })
-    else
-        saveNamed(context, allocator, .{
-            .name = parsed.name,
-            .out_dir = parsed.out_dir,
-            .annotations = parsed.annotations,
-        })) catch |err| switch (err) {
+    const result = saveNamed(context, allocator, .{
+        .name = parsed.name,
+        .out_dir = parsed.out_dir,
+        .stop = parsed.stop,
+        .annotations = parsed.annotations,
+    }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "save", err),
         error.NamedVmNotReady => {
             const fallback = allocLifecycleMessage(allocator, "spore save: VM is not ready: {s}", .{parsed.name});
@@ -1935,11 +1928,11 @@ pub fn restoreCli(
         return;
     }
     const allocator = init.arena.allocator();
-    const parsed = parseResumeArgs(args, allocator, stderr, mode);
+    const parsed = parseRestoreArgs(args, allocator, stderr, mode);
     const full_args = try init.minimal.args.toSlice(allocator);
     var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "restore");
     if (parsed.event_mode == .jsonl) try event_writer.emitStart(parsed.backend orelse .auto);
-    const result = resumeNamed(init, allocator, .{
+    const result = restoreNamed(init, allocator, .{
         .spore_dir = parsed.spore_dir,
         .name = parsed.name,
         .backend = parsed.backend,
@@ -1947,7 +1940,7 @@ pub fn restoreCli(
         .spore_executable = full_args[0],
         .bound_services = parsed.bound_services.slice(),
     }) catch |err| {
-        emitResumeFailureEvent(&event_writer, parsed.event_mode, err);
+        emitRestoreFailureEvent(&event_writer, parsed.event_mode, err);
         switch (err) {
             error.BadGenerationPayload => {
                 const message = "spore restore: invalid --generation payload; required JSON fields: run_id, child_id, parallel_index, parallel_count, fork_index, fork_count, fork_batch_id, vm_id";
@@ -2026,7 +2019,7 @@ pub fn restoreCli(
     if (parsed.event_mode == .jsonl) {
         const requested_backend: run_mod.Backend = parsed.backend orelse .auto;
         const backend = requested_backend.resolveForHost() catch requested_backend;
-        try emitNamedResumeExit(&event_writer, backend);
+        try emitNamedRestoreExit(&event_writer, backend);
     } else if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, result);
     } else {
@@ -2034,7 +2027,7 @@ pub fn restoreCli(
     }
 }
 
-fn emitNamedResumeExit(event_writer: *run_mod.EventWriter, backend: run_mod.Backend) !void {
+fn emitNamedRestoreExit(event_writer: *run_mod.EventWriter, backend: run_mod.Backend) !void {
     try event_writer.emitExit(.{
         .backend = backend,
         .start_ms = 0,
@@ -2047,7 +2040,7 @@ fn emitNamedResumeExit(event_writer: *run_mod.EventWriter, backend: run_mod.Back
     });
 }
 
-fn emitResumeFailureEvent(event_writer: *run_mod.EventWriter, event_mode: run_mod.EventMode, err: anyerror) void {
+fn emitRestoreFailureEvent(event_writer: *run_mod.EventWriter, event_mode: run_mod.EventMode, err: anyerror) void {
     if (event_mode == .jsonl) event_writer.emitFailure(run_mod.classifyFailure(err)) catch {};
 }
 
@@ -3088,12 +3081,12 @@ fn parseForkArgs(
     };
 }
 
-fn parseResumeArgs(
+fn parseRestoreArgs(
     args: []const []const u8,
     allocator: std.mem.Allocator,
     stderr: *Io.Writer,
     mode: machine_output.Mode,
-) ResumeOptions {
+) RestoreOptions {
     var spore_dir: ?[]const u8 = null;
     var name: ?[]const u8 = null;
     var backend: ?run_mod.Backend = null;
@@ -5354,7 +5347,7 @@ test "lifecycle runtime root rejects relative environment paths" {
     try std.testing.expectError(error.InvalidRuntimeDir, runtimeRootPath(allocator, &env));
 }
 
-test "snapshot validates annotations before touching runtime state" {
+test "save validates annotations before touching runtime state" {
     const allocator = std.testing.allocator;
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -5364,12 +5357,12 @@ test "snapshot validates annotations before touching runtime state" {
     defer annotations.deinit(allocator);
     try annotations.map.put(allocator, "", "bad");
 
-    try std.testing.expectError(error.BadManifest, snapshotNamed(.{
+    try std.testing.expectError(error.BadManifest, saveContinueNamed(.{
         .io = std.testing.io,
         .environ_map = &env,
     }, allocator, .{
         .name = "bench-1",
-        .out_dir = "zig-cache/missing-parent/snapshot.spore",
+        .out_dir = "zig-cache/missing-parent/save.spore",
         .annotations = annotations,
     }));
 }
@@ -5760,7 +5753,7 @@ test "named restore parser accepts bound service bindings" {
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
 
-    const opts = parseResumeArgs(&.{ "bench-1.spore", "--name", "bench-2", "--bind-service", "metadata=unix:/tmp/metadata.sock" }, allocator, &stderr.writer, .human);
+    const opts = parseRestoreArgs(&.{ "bench-1.spore", "--name", "bench-2", "--bind-service", "metadata=unix:/tmp/metadata.sock" }, allocator, &stderr.writer, .human);
     try std.testing.expectEqualStrings("bench-1.spore", opts.spore_dir);
     try std.testing.expectEqualStrings("bench-2", opts.name);
     try std.testing.expectEqual(@as(usize, 1), opts.bound_services.len);
@@ -5773,7 +5766,7 @@ test "named restore parser accepts k8s child command product flags" {
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
 
-    const opts = parseResumeArgs(&.{ "--events=jsonl", "--backend", "kvm", "--generation", "generation.json", "child.spore", "--name=sporevm-child-42" }, allocator, &stderr.writer, .human);
+    const opts = parseRestoreArgs(&.{ "--events=jsonl", "--backend", "kvm", "--generation", "generation.json", "child.spore", "--name=sporevm-child-42" }, allocator, &stderr.writer, .human);
     try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
     try std.testing.expectEqual(run_mod.Backend.kvm, opts.backend.?);
     try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
@@ -5788,7 +5781,7 @@ test "named restore event mode emits terminal run event" {
 
     var events = run_mod.EventWriter.init(allocator, &out.writer, "restore");
     try events.emitStart(.kvm);
-    try emitNamedResumeExit(&events, .kvm);
+    try emitNamedRestoreExit(&events, .kvm);
 
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"event\":\"exit\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"command\":\"restore\"") != null);

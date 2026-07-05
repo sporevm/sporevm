@@ -9,7 +9,7 @@ spec_refs:
   - docs/spore-format.md
   - src/main.zig
   - src/run.zig
-  - src/resume.zig
+  - src/attach.zig
   - src/lifecycle.zig
   - src/monitor.zig
   - src/fanout.zig
@@ -314,15 +314,17 @@ Scope:
 - rename human CLI output first;
 - keep existing JSONL schema fields such as `event:"capture"` under the current
   `run-events.v1` schema;
-- keep C/Go/libspore symbols such as `suspendNamed` as lower-level
-  implementation terms for this PR;
+- rename public Zig, C, and Go libspore symbols to the same `save`, `restore`,
+  and `attach` vocabulary;
+- keep lower-level backend and snapshot/capture implementation terms where they
+  describe internal machine-state capture rather than public API;
 - keep manifest `sessions` unchanged.
 
 Definition of done:
 
 - machine-output compatibility is explicit rather than accidentally renamed;
-- public library docs match the final CLI vocabulary where possible and explain
-  any lower-level internal term that remains;
+- public library docs match the final CLI vocabulary and old public symbols have
+  no compatibility aliases;
 - release notes state that human CLI naming changed while the current JSONL
   schema names did not.
 
@@ -398,6 +400,10 @@ transition.
   - `spore suspend`
   - `spore resume`
   - `resume .*--name`
+  - `resumeSpore`
+  - `resumeNamed`
+  - `snapshotNamed`
+  - `suspendNamed`
   - user-facing `checkpoint`
   Exclude this plan and release migration notes from the stale-term gate when
   they intentionally mention old spellings.
@@ -412,14 +418,16 @@ transition.
 - `restore` means "turn a spore back into a named VM".
 - `attach` means "restore VM state and connect to a saved session".
 - `resume` is not a public CLI verb.
+- Public Zig, C, and Go libspore APIs use `saveNamed`, `restoreNamed`,
+  `attachSpore`, `SaveNamedOptions`, `RestoreNamedOptions`, `AttachOptions`, and
+  `SaveTrigger`; old public `snapshot`, `suspend`, `resume`, and `capture`
+  spellings are removed rather than aliased.
 - Breaking CLI changes are acceptable; compatibility aliases are not part of
   the default plan. Removed spellings (`resume`, `suspend`, `run --capture*`)
   fail with a redirect hint naming the replacement; they never execute.
 
 ## Deferred Work
 
-- Rename libspore/C/Go symbols only after the CLI rename is settled. The CLI
-  wording can move first because it is the sharpest UX surface.
 - Multi-vCPU non-destructive named `save` can follow after the first public
   rename. The single rename PR should fail closed instead of silently falling
   back to a consuming save.

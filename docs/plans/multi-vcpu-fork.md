@@ -12,7 +12,7 @@ spec_refs:
   - src/hvf/vm.zig
   - src/kvm/vm.zig
   - src/run.zig
-  - src/resume.zig
+  - src/attach.zig
 related_plans:
   - docs/plans/multi-vcpu.md
   - docs/plans/automatic-local-ram-backing.md
@@ -86,7 +86,7 @@ Still out of scope:
 Direct fan-out is N-to-N:
 
 ```bash
-spore run --vcpus 4 --capture warm.spore -- ./warmup
+spore run --vcpus 4 --save warm.spore -- ./warmup
 spore fork warm.spore --count 20 --out children/
 spore fanout children/
 ```

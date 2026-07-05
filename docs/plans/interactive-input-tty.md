@@ -570,7 +570,7 @@ Scope:
 
 Done when:
 
-- a shell started with `spore run -it --capture-on USR1 --continue-after-capture`
+- a shell started with `spore run -it --save-on USR1 --continue-after-save`
   can be captured and later attached with `spore run -it --from DIR`;
 - a non-interactive captured command rejects `-i --from DIR` with a clear
   message;

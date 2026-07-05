@@ -7,7 +7,7 @@ spec_refs:
   - docs/spore-format.md
   - docs/fanout.md
   - SECURITY.md
-  - src/resume.zig
+  - src/attach.zig
   - src/fanout.zig
   - src/spore.zig
 related_plans:
@@ -55,7 +55,7 @@ provenance plus fallback, not as content verification of the whole backing file.
 ## Goals
 
 - No user-facing `trust` flag, mode, or policy parameter.
-- Product restore paths (`spore resume` and `spore run --from`) automatically
+- Product restore paths (`spore attach`, `spore restore`, and `spore run --from`) automatically
   map local `ram.backing` only when local proof validates.
 - `spore fanout` gets the fast path by using normal resume behavior.
 - Invalid, missing, foreign, or stale proofs fall back to chunk restore rather
@@ -161,8 +161,9 @@ not kernel-enforced page integrity.
 Slice 1 is implemented in the active code path: product captures write
 `ram.backing.proof` when a runtime key is available, `spore fork` validates the
 parent proof before hard-linking local backing into children and writing
-child-local proofs, and product restore paths (`spore resume` and
-`spore run --from`) automatically choose between `local_backing` and `chunks`.
+child-local proofs, and product restore paths (`spore attach`, `spore restore`,
+and `spore run --from`) automatically choose between `local_backing` and
+`chunks`.
 
 The proof is validated with bounded metadata-scale work. It is opened without
 following symlinks, must be a regular file, and is capped at 16KiB before JSON
@@ -195,7 +196,7 @@ Product restore results and exit JSON now carry `memory_restore_source` and
 The current implementation keeps the host-local proof and restore planner behind
 one internal seam: `openProvenLocalMemoryBacking` and
 `writeLocalMemoryBackingProof` in `src/spore.zig`. That is deliberate for the
-landed slices. Product restore callers (`src/resume.zig` and `src/run.zig`) use
+landed slices. Product restore callers (`src/attach.zig` and `src/run.zig`) use
 the planner result, while `spore.fork` still rewrites child manifests, backing
 links, and child proofs in one place. Do not extract a separate local-backing
 module just to move code around; before fs-verity there is only one concrete
@@ -216,7 +217,7 @@ Status: landed.
 
 Done when:
 
-- product `spore resume` and `spore run --from` have no user-visible trust flag;
+- product `spore attach`, `spore restore`, and `spore run --from` have no user-visible trust flag;
 - product `spore fanout` no longer passes a trust flag;
 - same-host fan-out still maps local backing and passes the default counter
   fan-out smoke;

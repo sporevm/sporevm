@@ -2032,10 +2032,10 @@ pub fn defaultAttachSessionId(sessions: []const Session) []const u8 {
 }
 
 pub fn validateSessionAttach(sessions: []const Session, request: SessionAttachRequest) !void {
-    if (sessions.len == 0) return error.NoCapturedSession;
-    const session = findSession(sessions, request.id) orelse return error.CapturedSessionUnavailable;
-    if (request.stdin and !session.streams.stdin) return error.CapturedSessionHasNoInteractiveStdin;
-    if (request.terminal and !session.streams.terminal) return error.CapturedSessionHasNoTerminal;
+    if (sessions.len == 0) return error.NoSavedSession;
+    const session = findSession(sessions, request.id) orelse return error.SavedSessionUnavailable;
+    if (request.stdin and !session.streams.stdin) return error.SavedSessionHasNoInteractiveStdin;
+    if (request.terminal and !session.streams.terminal) return error.SavedSessionHasNoTerminal;
 }
 
 fn findSession(sessions: []const Session, id: []const u8) ?Session {
@@ -2658,13 +2658,13 @@ test "manifest json round-trip" {
 test "session attach validation rejects unavailable input streams" {
     const sessions = [_]Session{processSession(default_session_id, false, false)};
 
-    try std.testing.expectError(error.NoCapturedSession, validateSessionAttach(&.{}, .{ .id = default_session_id }));
+    try std.testing.expectError(error.NoSavedSession, validateSessionAttach(&.{}, .{ .id = default_session_id }));
     try validateSessionAttach(&sessions, .{ .id = default_session_id });
-    try std.testing.expectError(error.CapturedSessionHasNoInteractiveStdin, validateSessionAttach(&sessions, .{
+    try std.testing.expectError(error.SavedSessionHasNoInteractiveStdin, validateSessionAttach(&sessions, .{
         .id = default_session_id,
         .stdin = true,
     }));
-    try std.testing.expectError(error.CapturedSessionHasNoTerminal, validateSessionAttach(&sessions, .{
+    try std.testing.expectError(error.SavedSessionHasNoTerminal, validateSessionAttach(&sessions, .{
         .id = default_session_id,
         .terminal = true,
     }));

@@ -8,7 +8,7 @@ spec_refs:
   - docs/rootfs.md
   - src/main.zig
   - src/run_cli.zig
-  - src/resume_cli.zig
+  - src/attach_cli.zig
   - src/lifecycle.zig
   - src/rootfs_cli.zig
   - src/fanout.zig

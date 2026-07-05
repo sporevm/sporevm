@@ -1237,11 +1237,11 @@ writable_rootfs_json=false
 if [[ "\${writable_rootfs}" == "1" ]]; then
   writable_rootfs_json=true
 fi
-resume_mode="lazy-ram"
+restore_mode="lazy-ram"
 if [[ "\${writable_rootfs}" == "1" ]]; then
-  resume_mode="kvm-run-from-writable-rootfs"
+  restore_mode="kvm-run-from-writable-rootfs"
 elif [[ "\${workload}" == "rootfs" ]]; then
-  resume_mode="materialized-rootfs-cache"
+  restore_mode="materialized-rootfs-cache"
 fi
 
 cat >"\${workdir}/dest-result.json" <<JSON
@@ -1274,9 +1274,9 @@ cat >"\${workdir}/dest-result.json" <<JSON
   "cache_misses": \${cache_misses},
   "corrupt_bundle_rejections": \${corrupt_bundle_rejections},
   "corrupt_rootfs_rejections": \${corrupt_rootfs_rejections},
-  "resume_count": \${dest_repeat},
+  "restore_count": \${dest_repeat},
   "unpacked_chunks": \${unpacked_chunks},
-  "resume_mode": "\${resume_mode}",
+  "restore_mode": "\${restore_mode}",
   "iterations": [\${iteration_json}]
 }
 JSON
@@ -1494,7 +1494,7 @@ total_rootfs_bytes_fetched = sum(int(d.get("rootfs_bytes_fetched", 0)) for d in 
 total_rootfs_bytes_reused = sum(int(d.get("rootfs_bytes_reused", 0)) for d in dests)
 total_rootfs_cache_hits = sum(int(d.get("rootfs_cache_hits", 0)) for d in dests)
 total_rootfs_cache_misses = sum(int(d.get("rootfs_cache_misses", 0)) for d in dests)
-total_resume_count = sum(int(d.get("resume_count", 1)) for d in dests)
+total_restore_count = sum(int(d.get("restore_count", 1)) for d in dests)
 total_cache_hits = sum(int(d.get("cache_hits", 0)) for d in dests)
 total_cache_misses = sum(int(d.get("cache_misses", 0)) for d in dests)
 total_corrupt_bundle_rejections = sum(int(d.get("corrupt_bundle_rejections", 0)) for d in dests)
@@ -1536,7 +1536,7 @@ if workload == "rootfs":
         raise SystemExit("rootfs workload did not publish bundled rootfs bytes")
     if total_rootfs_bytes_fetched <= 0 or total_rootfs_cache_misses <= 0:
         raise SystemExit("rootfs workload did not prove cold destination rootfs fetch")
-    if total_resume_count > len(dests) and total_rootfs_bytes_reused <= 0:
+    if total_restore_count > len(dests) and total_rootfs_bytes_reused <= 0:
         raise SystemExit("rootfs workload did not prove warm destination rootfs reuse")
     if total_corrupt_rootfs_rejections <= 0:
         raise SystemExit("rootfs workload did not reject a corrupt rootfs payload")
@@ -1560,7 +1560,7 @@ json.dump({
     "destination_count": len(dests),
     "relay_count": len(relays),
     "leaf_count": len(leaves),
-    "destination_resume_count": total_resume_count,
+    "destination_restore_count": total_restore_count,
     "destination_instances": [d["instance_id"] for d in dests],
     "writable_rootfs": writable_rootfs,
     "bundle_bytes": bundle_bytes,
@@ -1593,7 +1593,7 @@ json.dump({
     "peer_multiplier_vs_bundle": ratio(total_destination_peer_bytes, bundle_bytes),
     "origin_multiplier_vs_bundle": ratio(total_destination_origin_bytes, bundle_bytes),
     "origin_multiplier_vs_unique_chunks": ratio(total_destination_origin_bytes, unique_chunk_bytes),
-    "origin_multiplier_vs_resume_bundle": ratio(total_destination_origin_bytes, bundle_bytes * total_resume_count),
+    "origin_multiplier_vs_restore_bundle": ratio(total_destination_origin_bytes, bundle_bytes * total_restore_count),
     "origin_egress_multiplier_vs_bundle": ratio(origin_egress_bytes, bundle_bytes),
     "origin_egress_multiplier_vs_unique_content": ratio(origin_egress_bytes, unique_content_bytes),
     "origin_mode": origin_mode,

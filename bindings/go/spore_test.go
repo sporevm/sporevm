@@ -255,16 +255,21 @@ func TestNamedLifecycleOptionsCarryBoundServices(t *testing.T) {
 		t.Fatalf("bound service path = %q", got)
 	}
 
-	resume := ResumeNamedOptions{
+	restore := RestoreNamedOptions{
 		SporeDir: "worker.spore",
-		Name:     "worker-resumed",
+		Name:     "worker-restored",
 		BoundServiceBindings: []BoundUnixServiceBinding{{
 			Name:     "cleanroom-gateway",
 			UnixPath: "/tmp/fresh-cleanroom-gateway.sock",
 		}},
 	}
-	if got := resume.BoundServiceBindings[0].UnixPath; got != "/tmp/fresh-cleanroom-gateway.sock" {
-		t.Fatalf("resume binding path = %q", got)
+	if got := restore.BoundServiceBindings[0].UnixPath; got != "/tmp/fresh-cleanroom-gateway.sock" {
+		t.Fatalf("restore binding path = %q", got)
+	}
+
+	save := SaveNamedOptions{Name: "worker", OutDir: "worker.spore", Stop: true}
+	if !save.Stop {
+		t.Fatal("expected save stop flag")
 	}
 }
 

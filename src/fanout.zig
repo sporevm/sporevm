@@ -143,7 +143,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     if (children.len == 0) {
         failCli("spore fanout: no child spore directories found in {s}", .{opts.children_dir});
     }
-    try requireCapturedSessions(allocator, children);
+    try requireSavedSessions(allocator, children);
 
     const argv0 = blk: {
         const full_args = try init.minimal.args.toSlice(allocator);
@@ -192,7 +192,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     if (failed) std.process.exit(1);
 }
 
-fn spawnResume(
+fn spawnAttach(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     argv0: []const u8,
@@ -232,7 +232,7 @@ fn startRunningChild(
     child: ChildSpec,
     output_lock: *OutputLock,
 ) !RunningChild {
-    var proc = try spawnResume(init, allocator, argv0, backend, timeout_ms, bound_services, child.path);
+    var proc = try spawnAttach(init, allocator, argv0, backend, timeout_ms, bound_services, child.path);
     const stdout_fd = proc.stdout.?.handle;
     const stderr_fd = proc.stderr.?.handle;
     proc.stdout = null;
@@ -297,7 +297,7 @@ fn listChildren(allocator: std.mem.Allocator, io: Io, children_dir: []const u8) 
     return out;
 }
 
-fn requireCapturedSessions(allocator: std.mem.Allocator, children: []const ChildSpec) !void {
+fn requireSavedSessions(allocator: std.mem.Allocator, children: []const ChildSpec) !void {
     for (children) |child| {
         const sessions = childSessionCount(allocator, child.path) catch |err| {
             failCli("spore fanout: child {s} has an invalid spore manifest: {s}", .{ child.name, @errorName(err) });

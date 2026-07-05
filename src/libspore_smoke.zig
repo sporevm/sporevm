@@ -82,14 +82,14 @@ test "external import can name managed run-from and named lifecycle APIs" {
         .name = "cleanroom-gateway",
         .target = .{ .unix = "/tmp/fresh-gateway.sock" },
     };
-    const resumed = libspore.ResumeNamedOptions{
+    const restored = libspore.RestoreNamedOptions{
         .spore_dir = "dev.spore",
-        .name = "resumed-vm",
+        .name = "restored-vm",
         .bound_services = &.{bound_service_binding},
     };
-    try std.testing.expectEqualStrings("resumed-vm", resumed.name);
-    try std.testing.expectEqual(@as(usize, 1), resumed.bound_services.len);
-    _ = libspore.resumeNamed;
+    try std.testing.expectEqualStrings("restored-vm", restored.name);
+    try std.testing.expectEqual(@as(usize, 1), restored.bound_services.len);
+    _ = libspore.restoreNamed;
 
     const forked = libspore.ForkNamedOptions{
         .source_name = "dev-vm",
@@ -113,20 +113,18 @@ test "external import can name managed run-from and named lifecycle APIs" {
     };
     try std.testing.expectEqualStrings("/tmp/local.txt", copy.guest_path);
 
-    const snapshot = libspore.SnapshotNamedOptions{
+    const save = libspore.SaveNamedOptions{
         .name = "dev-vm",
         .out_dir = "dev.spore",
-        .continue_after = true,
     };
-    try std.testing.expect(snapshot.continue_after);
+    try std.testing.expect(!save.stop);
 
     _ = libspore.createNamed;
     _ = libspore.execNamed;
     _ = libspore.copyInNamed;
     _ = libspore.copyOutNamed;
     _ = libspore.networkCapabilities;
-    _ = libspore.snapshotNamed;
-    _ = libspore.suspendNamed;
+    _ = libspore.saveNamed;
     _ = libspore.removeNamed;
     _ = libspore.listNamed;
 
