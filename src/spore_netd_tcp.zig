@@ -835,6 +835,11 @@ fn buildTcpSynFrame(dst_addr: ipv4.Address, dst_port: u16, out: *[spore_net.max_
         .dst_addr = dst_addr,
     }, out[ethernet.HEADER_LEN..][0..ipv4.HEADER_LEN]) catch unreachable;
 
+    const tcp = out[ethernet.HEADER_LEN + ipv4.HEADER_LEN ..][0..tcp_len];
+    const tcp_checksum = tcp_wire.computeChecksum(spore_net.guest_ipv4, dst_addr, tcp);
+    tcp[16] = @truncate(tcp_checksum >> 8);
+    tcp[17] = @truncate(tcp_checksum & 0xFF);
+
     return out[0 .. ethernet.HEADER_LEN + ipv4.HEADER_LEN + tcp_len];
 }
 

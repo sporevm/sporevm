@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zmoltcp = .{
-            .url = "git+https://github.com/sporevm/zmoltcp.git#v0.2.12",
-            .hash = "zmoltcp-0.2.12-AMqcQdNmEgBmqyDeqKFN_33x810C4rmJlmzFMDAzYvNk",
+            .url = "git+https://github.com/sporevm/zmoltcp.git#v0.3.0",
+            .hash = "zmoltcp-0.3.0-AMqcQe-lEwC2lJYPeDLWPW92MKk8HupiihlX0HghL9c8",
         },
         .toybox = .{
             .url = "git+https://github.com/landley/toybox.git?ref=0.8.14#b7ec52ac35e075caffca5d330995d44e8dbfc8c3",
