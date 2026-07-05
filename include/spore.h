@@ -75,13 +75,12 @@ typedef struct SporeExecNamedStreamImpl *SporeExecNamedStream;
 #define SPORE_SYSTEM_DF_OPTIONS_VERSION 1u
 #define SPORE_SYSTEM_PRUNE_OPTIONS_VERSION 1u
 #define SPORE_CREATE_NAMED_OPTIONS_VERSION 4u
-#define SPORE_RESUME_NAMED_OPTIONS_VERSION 2u
+#define SPORE_RESTORE_NAMED_OPTIONS_VERSION 1u
 #define SPORE_FORK_NAMED_OPTIONS_VERSION 1u
 #define SPORE_EXEC_NAMED_OPTIONS_VERSION 2u
 #define SPORE_EXEC_NAMED_STREAM_OPTIONS_VERSION 1u
 #define SPORE_COPY_NAMED_OPTIONS_VERSION 1u
-#define SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION 2u
-#define SPORE_SUSPEND_NAMED_OPTIONS_VERSION 1u
+#define SPORE_SAVE_NAMED_OPTIONS_VERSION 1u
 #define SPORE_REMOVE_NAMED_OPTIONS_VERSION 1u
 #define SPORE_INSPECT_SPORE_OPTIONS_VERSION 1u
 #define SPORE_REEXEC_CONTRACT_VERSION 1u
@@ -258,8 +257,8 @@ typedef struct SporeCopyNamedOptions {
   SporeString guest_path;
 } SporeCopyNamedOptions;
 
-/** Options for spore_resume_named_json(). */
-typedef struct SporeResumeNamedOptions {
+/** Options for spore_restore_named_json(). */
+typedef struct SporeRestoreNamedOptions {
   uint32_t size;
   uint32_t version;
   SporeString spore_dir;
@@ -267,7 +266,7 @@ typedef struct SporeResumeNamedOptions {
   SporeString spore_executable;
   const SporeBoundUnixServiceBinding *bound_unix_services;
   size_t bound_unix_service_count;
-} SporeResumeNamedOptions;
+} SporeRestoreNamedOptions;
 
 /** Options for spore_fork_named_json(). */
 typedef struct SporeForkNamedOptions {
@@ -279,24 +278,16 @@ typedef struct SporeForkNamedOptions {
   SporeString spore_executable;
 } SporeForkNamedOptions;
 
-/** Options for spore_snapshot_named_json(). */
-typedef struct SporeSnapshotNamedOptions {
+/** Options for spore_save_named_json(). */
+typedef struct SporeSaveNamedOptions {
   uint32_t size;
   uint32_t version;
   SporeString name;
   SporeString out_dir;
-  uint8_t continue_after;
+  uint8_t stop;
   const SporeAnnotation *annotations;
   size_t annotation_count;
-} SporeSnapshotNamedOptions;
-
-/** Options for spore_suspend_named_json(). */
-typedef struct SporeSuspendNamedOptions {
-  uint32_t size;
-  uint32_t version;
-  SporeString name;
-  SporeString out_dir;
-} SporeSuspendNamedOptions;
+} SporeSaveNamedOptions;
 
 /** Options for spore_remove_named_json(). */
 typedef struct SporeRemoveNamedOptions {
@@ -332,17 +323,14 @@ SPORE_API void spore_exec_named_stream_options_init(SporeExecNamedStreamOptions 
 /** Initialize named copy options with defaults. */
 SPORE_API void spore_copy_named_options_init(SporeCopyNamedOptions *options);
 
-/** Initialize resume-named options with defaults. */
-SPORE_API void spore_resume_named_options_init(SporeResumeNamedOptions *options);
+/** Initialize restore-named options with defaults. */
+SPORE_API void spore_restore_named_options_init(SporeRestoreNamedOptions *options);
 
 /** Initialize fork-named options with defaults. */
 SPORE_API void spore_fork_named_options_init(SporeForkNamedOptions *options);
 
-/** Initialize snapshot-named options with defaults. */
-SPORE_API void spore_snapshot_named_options_init(SporeSnapshotNamedOptions *options);
-
-/** Initialize suspend-named options with defaults. */
-SPORE_API void spore_suspend_named_options_init(SporeSuspendNamedOptions *options);
+/** Initialize save-named options with defaults. */
+SPORE_API void spore_save_named_options_init(SporeSaveNamedOptions *options);
 
 /** Initialize remove-named options with defaults. */
 SPORE_API void spore_remove_named_options_init(SporeRemoveNamedOptions *options);
@@ -497,32 +485,27 @@ SPORE_API SporeResult spore_copy_out_named(SporeContext context,
                                            const SporeCopyNamedOptions *options);
 
 /**
- * Resume a named VM from a spore checkpoint and return `spore.lifecycle.v1`
+ * Restore a named VM from a spore and return `spore.lifecycle.v1`
  * JSON.
  *
  * If the manifest declares bound Unix services, `bound_unix_services` must
  * provide one live socket path for each declared service name. Host paths are
- * used only for this resume attempt and are not written into the spore
+ * used only for this restore attempt and are not written into the spore
  * manifest.
  */
-SPORE_API SporeResult spore_resume_named_json(SporeContext context,
-                                              const SporeResumeNamedOptions *options,
-                                              SporeOwnedString *out_json);
+SPORE_API SporeResult spore_restore_named_json(SporeContext context,
+                                               const SporeRestoreNamedOptions *options,
+                                               SporeOwnedString *out_json);
 
 /** Fork a named VM and return JSON output. */
 SPORE_API SporeResult spore_fork_named_json(SporeContext context,
                                             const SporeForkNamedOptions *options,
                                             SporeOwnedString *out_json);
 
-/** Snapshot a named VM and return `spore.lifecycle.v1` JSON. */
-SPORE_API SporeResult spore_snapshot_named_json(SporeContext context,
-                                                const SporeSnapshotNamedOptions *options,
-                                                SporeOwnedString *out_json);
-
-/** Suspend a named VM and return `spore.lifecycle.v1` JSON. */
-SPORE_API SporeResult spore_suspend_named_json(SporeContext context,
-                                               const SporeSuspendNamedOptions *options,
-                                               SporeOwnedString *out_json);
+/** Save a named VM and return `spore.lifecycle.v1` JSON. */
+SPORE_API SporeResult spore_save_named_json(SporeContext context,
+                                            const SporeSaveNamedOptions *options,
+                                            SporeOwnedString *out_json);
 
 /** Remove a named VM and return `spore.lifecycle.v1` JSON. */
 SPORE_API SporeResult spore_remove_named_json(SporeContext context,

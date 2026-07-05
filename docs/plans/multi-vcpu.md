@@ -71,7 +71,7 @@ state. That would break the product contract.
   guest is resumed.
 - Record enough topology in the manifest to reject mismatched vCPU count,
   MPIDR mapping, redistributor layout, device model, and timer frequency.
-- Keep `spore run --from`, `spore resume`, named resume, and fork/fan-out
+- Keep `spore run --from`, `spore attach`, named restore, and fork/fan-out
   semantics explicit rather than treating multi-vCPU as best effort.
 
 ## Non-Goals
@@ -99,9 +99,9 @@ Product commands accept bounded positive vCPU counts:
 
 ```console
 spore run --vcpus 2 --image docker.io/library/alpine:latest -- nproc
-spore run --vcpus 4 --capture base.spore -- ./parallel-test
+spore run --vcpus 4 --save base.spore -- ./parallel-test
 spore run --from base.spore -- ./next-command
-spore resume base.spore resumed-vm
+spore restore base.spore --name resumed-vm
 ```
 
 Single-vCPU captures continue to write manifest v0 unless another incompatible
@@ -111,7 +111,7 @@ consumers reject v1 through the existing unknown-version path.
 If a backend does not yet support multi-vCPU, the error remains
 `UnsupportedVcpuCount` or a more specific setup error before VM creation. If a
 capture path has not yet landed for a backend, fresh multi-vCPU boot may be
-enabled only when `--capture`, `--from`, `resume`, and lifecycle restore remain
+enabled only when `--save`, `--from`, `attach`, and lifecycle restore remain
 fail-closed for `vcpus != 1`.
 
 ### Manifest v1 Shape
@@ -251,22 +251,22 @@ limit.
   backend configs.
 - KVM backend configs carry `vcpus`, feed it into DTB construction, and can run
   fresh multi-vCPU guests with one host thread per vCPU. KVM multi-vCPU
-  capture/resume now uses manifest v1 for fixed-RAM run paths. Monitor
-  exec-control is wired for named create/resume/suspend; continue-after capture
+  capture/restore now uses manifest v1 for fixed-RAM run paths. Monitor
+  exec-control is wired for named create/restore/save; continue-after save
   and transient virtio-mem still fail closed for `vcpus != 1`.
 - HVF backend configs carry `vcpus`, feed it into DTB construction, and can run
-  fresh and fixed-RAM capture/resume multi-vCPU guests with one owner thread per
-  vCPU. HVF monitor exec-control is wired for named create/resume/suspend;
-  dirty-tracked capture, `--continue-after-capture`, and transient virtio-mem
+  fresh and fixed-RAM capture/restore multi-vCPU guests with one owner thread per
+  vCPU. HVF monitor exec-control is wired for named create/restore/save;
+  dirty-tracked capture, `--continue-after-save`, and transient virtio-mem
   still fail closed for `vcpus != 1`.
-- Lifecycle metadata records `vcpus`; named create and named resume support
+- Lifecycle metadata records `vcpus`; named create and named restore support
   manifest v1 multi-vCPU captures on supported backends, multi-vCPU restore
   materializes from chunks instead of local RAM backing, continue-after named
   snapshots fail before monitor mutation, and named fork rejects multi-vCPU
   live fork before child state is written.
 - `board.buildDtb` emits one CPU node per `cpu_count`, and DTB tests cover
   multi-node CPU topology plus redistributor region sizing.
-- HVF single-vCPU capture/resume still creates one main-thread-owned vCPU; the
+- HVF single-vCPU capture/restore still creates one main-thread-owned vCPU; the
   multi-vCPU path creates vCPUs on their owning host threads and uses
   owner-thread commands for PSCI starts, cross-redistributor MMIO, and v1
   capture/restore register access.
@@ -319,7 +319,7 @@ Done when:
   guest on an aarch64 KVM host;
 - system-off/reset exits stop every vCPU thread cleanly;
 - network, vsock exec, rootfs, and rng still pass existing KVM smoke coverage;
-- `--capture` with `--vcpus 2` fails with the planned unsupported-capture error.
+- `--save` with `--vcpus 2` fails with the planned unsupported-capture error.
 
 ### Slice 3: HVF Fresh Multi-vCPU Boot
 
@@ -335,14 +335,14 @@ Done when:
 - secondary vCPUs start only through PSCI and shut down cleanly;
 - redistributor MMIO for every exposed CPU frame is routed to the matching HVF
   vCPU owner thread;
-- `--capture` with `--vcpus 2` fails with `UnsupportedVcpuCount`.
+- `--save` with `--vcpus 2` fails with `UnsupportedVcpuCount`.
 
 Status: implemented for fresh HVF runs. Validation on Apple Silicon:
 `zig-out/bin/spore run --backend hvf --vcpus 2 -- /bin/true`,
 `zig-out/bin/spore run --backend hvf --vcpus 2 --image
 docker.io/library/alpine:3.20 -- /bin/sh -lc "grep -c '^processor'
 /proc/cpuinfo"` returned `2`, and `zig-out/bin/spore run --backend hvf
---vcpus 2 --capture <dir>/base.spore -- /bin/true` failed before guest boot
+--vcpus 2 --save <dir>/base.spore -- /bin/true` failed before guest boot
 with `UnsupportedVcpuCount`.
 
 ### Slice 4: Manifest v1 Data Model and Validators
@@ -374,9 +374,9 @@ vCPUs, applies topology and GIC state, then releases vCPU threads.
 
 Done when:
 
-- a KVM `--vcpus 2 --capture` writes manifest v1;
+- a KVM `--vcpus 2 --save` writes manifest v1;
 - `spore run --from` can execute a new command from the captured base;
-- `spore resume` can resume an active multi-vCPU capture on a compatible KVM
+- `spore attach` can attach an active multi-vCPU capture on a compatible KVM
   host;
 - stale or incompatible vCPU topology fails at manifest/platform validation.
 
@@ -393,8 +393,8 @@ restore rejected.
 
 Done when:
 
-- a HVF `--vcpus 2 --capture` writes manifest v1;
-- same-host HVF `spore run --from` and `spore resume` work for multi-vCPU
+- a HVF `--vcpus 2 --save` writes manifest v1;
+- same-host HVF `spore run --from` and `spore attach` work for multi-vCPU
   captures;
 - KVM rejects any HVF-private multi-vCPU GIC state before VM mutation;
 - portable HVF GIC production gaps are documented in `docs/state-portability.md`.
@@ -402,9 +402,9 @@ Done when:
 Status: implemented in this branch slice on 2026-06-28 with same-HVF
 `backend_private` GIC state and full-RAM capture. Validation: `git diff
 --check`, `mise run test`, `mise run build`,
-`zig-out/bin/spore run --backend hvf --vcpus 2 --capture <dir>/base.spore --
+`zig-out/bin/spore run --backend hvf --vcpus 2 --save <dir>/base.spore --
 /bin/true`, `zig-out/bin/spore run --backend hvf --from <dir>/base.spore --
-/bin/true`, and `zig-out/bin/spore resume --backend hvf <dir>/base.spore`.
+/bin/true`, and `zig-out/bin/spore attach --backend hvf <dir>/base.spore`.
 
 ### Slice 7: Lifecycle, Fork, Fan-Out, and Distribution
 
@@ -416,7 +416,7 @@ local RAM backing proof behavior fail-closed.
 Done when:
 
 - named create can start multi-vCPU monitors on supported backends;
-- named resume accepts manifest v1 multi-vCPU captures;
+- named restore accepts manifest v1 multi-vCPU captures;
 - named fork/fan-out either works for v1 captures or fails with a product-level
   reason before child state is written;
 - bundles, pulls, and local materialization preserve v1 manifests and reject
@@ -424,8 +424,8 @@ Done when:
 
 Status: implemented in this branch slice on 2026-06-28. Validation: `mise run
 test`, `mise run build`, `git diff --check`, and live Apple Silicon smoke with
-`spore create --backend hvf --vcpus 2`, `spore exec`, `spore suspend`,
-manifest v1 inspection, named `spore resume --name`, and post-resume `spore
+`spore create --backend hvf --vcpus 2`, `spore exec`, `spore save --stop`,
+manifest v1 inspection, named `spore restore --name`, and post-restore `spore
 exec`. The follow-up multi-vCPU fork plan lifts the remaining fork/fan-out and
 proof-gated local backing limits.
 

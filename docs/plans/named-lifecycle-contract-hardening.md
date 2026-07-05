@@ -22,7 +22,7 @@ related_plans:
 SporeVM named lifecycle calls should fail before reporting success when the
 spawned monitor is not the monitor the caller can safely use. The monitor
 startup contract needs to prove three things before `createNamed`,
-`resumeNamed`, or named fork children return: the process is alive, the control
+`restoreNamed`, or named fork children return: the process is alive, the control
 socket is accepting requests, and the spawned `spore` executable is the same
 version as the linked `libspore`.
 
@@ -43,7 +43,7 @@ The named lifecycle monitor protocol is a private same-version agreement between
 loaded library. That can produce a monitor that gets far enough to leave runtime
 state behind but not far enough to support the current control protocol.
 
-The current code already has a startup wait in `createNamed`, `resumeNamed`, and
+The current code already has a startup wait in `createNamed`, `restoreNamed`, and
 fork-child startup, but that wait only proves a readable `ready.json` and a live
 PID. It does not prove that `control.sock` speaks the same protocol version as
 the library. Follow-up failures then collapse into `NamedVmNotReady` without the
@@ -158,7 +158,7 @@ decoder for older libraries.
 
 ### Format Documentation
 
-`snapshotNamed` merges overlay annotations into the captured manifest
+`saveNamed` merges overlay annotations into the captured manifest
 annotations. This is a contract:
 
 - create-time annotations survive snapshots;
@@ -190,7 +190,7 @@ form.
 - `build.zig.zon` is package metadata at `0.0.0`; it is not the handshake
   source.
 - PR 1 is implemented locally on `lox/named-lifecycle-readiness`: `createNamed`,
-  `resumeNamed`, and `startForkChildExecutable` all wait for a live PID plus a
+  `restoreNamed`, and `startForkChildExecutable` all wait for a live PID plus a
   versioned monitor `hello` response before reporting success.
 - `spawnMonitorExecutable` resolves the requested `spore_executable`, probes
   `spore version`, exact-matches it against `libspore.version`, and captures
@@ -203,7 +203,7 @@ form.
 - `openExecNamedStream` and the matching C/Go stream APIs already exist.
 - The monitor's bounded exec response is internally base64, while the public
   JSON shape still exposes `stdout` and `stderr` as text-like fields.
-- `snapshotNamed` already merges annotation overlays into captured manifests.
+- `saveNamed` already merges annotation overlays into captured manifests.
 - The guest agent uses `execve(argv[0], ...)` and therefore performs no PATH
   search.
 

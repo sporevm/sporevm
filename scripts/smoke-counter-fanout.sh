@@ -176,19 +176,19 @@ fi
 grep -Fq '"event":"ready"' "${generation_resume_stdout}" || die "spore attach --generation --events=jsonl did not emit ready"
 grep -Fq '"event":"stdout"' "${generation_resume_stdout}" || die "spore attach --generation --events=jsonl did not emit stdout"
 
-if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" resume --events=jsonl --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" --name "${named_vm}" \
+if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" restore --events=jsonl --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" --name "${named_vm}" \
   >"${named_resume_stdout}" 2>"${named_resume_stderr}"; then
   cat "${named_resume_stdout}" >&2 || true
   cat "${named_resume_stderr}" >&2 || true
-  die "named spore resume --generation failed"
+  die "named spore restore --generation failed"
 fi
-grep -Fq '"event":"ready"' "${named_resume_stdout}" || die "named spore resume --generation --events=jsonl did not emit ready"
-grep -Fq '"event":"exit"' "${named_resume_stdout}" || die "named spore resume --generation --events=jsonl did not emit exit"
+grep -Fq '"event":"ready"' "${named_resume_stdout}" || die "named spore restore --generation --events=jsonl did not emit ready"
+grep -Fq '"event":"exit"' "${named_resume_stdout}" || die "named spore restore --generation --events=jsonl did not emit exit"
 if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${named_vm}" -- /bin/gencheck \
   >"${named_exec_stdout}" 2>"${named_exec_stderr}"; then
   cat "${named_exec_stdout}" >&2 || true
   cat "${named_exec_stderr}" >&2 || true
-  die "named resumed child exec generation check failed"
+  die "named restored child exec generation check failed"
 fi
 grep -Fq "spore generation ready " "${named_exec_stdout}" || {
   cat "${named_exec_stdout}" >&2 || true

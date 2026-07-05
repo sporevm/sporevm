@@ -9,6 +9,7 @@ const Io = std.Io;
 const api = @import("api.zig");
 const fd_util = @import("fd.zig");
 const run_mod = @import("run.zig");
+const spore = @import("spore.zig");
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
     if (args.len == 0 or wantsHelp(args)) {
@@ -57,8 +58,8 @@ fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mo
         }
         return err;
     };
-    if (result.captured and parsed.event_mode != .jsonl) {
-        if (result.capture_path) |path| {
+    if (result.saved and parsed.event_mode != .jsonl) {
+        if (result.save_path) |path| {
             const message = try std.fmt.allocPrint(arena, "spore run: saved spore at {s}\n", .{path});
             writeStderr(message);
         }
@@ -106,15 +107,15 @@ fn runParsed(
             .backend = parsed.backend,
             .spore_dir = spore_dir,
             .command = command,
-            .attach_session_id = parsed.attach_session_id,
+            .attach_session_id = spore.default_session_id,
             .interactive = parsed.interactive,
             .tty = parsed.tty,
             .vcpus = parsed.shared.vcpus,
             .guest_port = parsed.shared.guest_port,
             .timeout_ms = parsed.shared.timeout_ms,
-            .capture_path = parsed.capture_path,
-            .capture_trigger = parsed.capture_trigger,
-            .continue_after_capture = parsed.continue_after_capture,
+            .save_path = parsed.save_path,
+            .save_trigger = parsed.save_trigger,
+            .continue_after_save = parsed.continue_after_save,
             .spore_executable = spore_executable,
             .debug = debug,
             .bound_services = parsed.bound_services.slice(),
@@ -130,10 +131,10 @@ fn runParsed(
 
     validateTerminalPolicy(parsed);
 
-    if (parsed.capture_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
+    if (parsed.save_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
         failRunSetup("spore run: --rootfs with --save is not portable yet; use --image so save can record immutable rootfs identity", .{});
     }
-    if (parsed.capture_path != null and parsed.network_policy.hasBoundServices()) {
+    if (parsed.save_path != null and parsed.network_policy.hasBoundServices()) {
         failRunSetup("spore run: --bind-service with --save needs manifest support first", .{});
     }
 
@@ -157,9 +158,9 @@ fn runParsed(
         .vcpus = parsed.shared.vcpus,
         .guest_port = parsed.shared.guest_port,
         .timeout_ms = parsed.shared.timeout_ms,
-        .capture_path = parsed.capture_path,
-        .capture_trigger = parsed.capture_trigger,
-        .continue_after_capture = parsed.continue_after_capture,
+        .save_path = parsed.save_path,
+        .save_trigger = parsed.save_trigger,
+        .continue_after_save = parsed.continue_after_save,
         .network = parsed.network,
         .network_policy = parsed.network_policy,
         .spore_executable = spore_executable,

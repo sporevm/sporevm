@@ -18,7 +18,7 @@ import (
 	"unsafe"
 )
 
-const minABIVersion uint32 = 13
+const minABIVersion uint32 = 14
 const reexecContractVersion uint32 = C.SPORE_REEXEC_CONTRACT_VERSION
 const reexecRoleEnv = "SPORE_REEXEC_ROLE"
 const reexecContractEnv = "SPORE_REEXEC_CONTRACT"
@@ -572,8 +572,8 @@ func (s *ExecNamedStream) ready(ctx context.Context) error {
 	return s.client.ready(ctx)
 }
 
-// ResumeNamed starts a named VM from a spore checkpoint directory.
-func (c *Client) ResumeNamed(ctx context.Context, options ResumeNamedOptions) (NamedLifecycleResult, error) {
+// RestoreNamed starts a named VM from a spore directory.
+func (c *Client) RestoreNamed(ctx context.Context, options RestoreNamedOptions) (NamedLifecycleResult, error) {
 	if err := c.ready(ctx); err != nil {
 		return NamedLifecycleResult{}, err
 	}
@@ -589,8 +589,8 @@ func (c *Client) ResumeNamed(ctx context.Context, options ResumeNamedOptions) (N
 	boundServices, freeBoundServices := cBoundUnixServiceBindings(options.BoundServiceBindings)
 	defer freeBoundServices()
 
-	var opts C.SporeResumeNamedOptions
-	C.spore_resume_named_options_init(&opts)
+	var opts C.SporeRestoreNamedOptions
+	C.spore_restore_named_options_init(&opts)
 	opts.spore_dir = sporeDir
 	opts.name = name
 	opts.spore_executable = sporeExecutable
@@ -600,16 +600,15 @@ func (c *Client) ResumeNamed(ctx context.Context, options ResumeNamedOptions) (N
 	}
 
 	var out C.SporeOwnedString
-	if result := Result(C.spore_resume_named_json(c.ctx, &opts, &out)); result != Success {
+	if result := Result(C.spore_restore_named_json(c.ctx, &opts, &out)); result != Success {
 		return NamedLifecycleResult{}, c.callError(result)
 	}
 	defer C.spore_free_string(c.ctx, out)
 	return decodeJSON[NamedLifecycleResult](goBytes(out), "named lifecycle result")
 }
 
-// SnapshotNamed snapshots a named VM. The current libspore mode always keeps
-// the VM running, matching Continue: true.
-func (c *Client) SnapshotNamed(ctx context.Context, options SnapshotNamedOptions) (NamedLifecycleResult, error) {
+// SaveNamed writes a named VM to a spore. Set Stop to remove the live VM.
+func (c *Client) SaveNamed(ctx context.Context, options SaveNamedOptions) (NamedLifecycleResult, error) {
 	if err := c.ready(ctx); err != nil {
 		return NamedLifecycleResult{}, err
 	}
@@ -620,12 +619,12 @@ func (c *Client) SnapshotNamed(ctx context.Context, options SnapshotNamedOptions
 	annotations, freeAnnotations := cAnnotations(options.Annotations)
 	defer freeAnnotations()
 
-	var opts C.SporeSnapshotNamedOptions
-	C.spore_snapshot_named_options_init(&opts)
+	var opts C.SporeSaveNamedOptions
+	C.spore_save_named_options_init(&opts)
 	opts.name = name
 	opts.out_dir = outDir
-	if options.Continue {
-		opts.continue_after = 1
+	if options.Stop {
+		opts.stop = 1
 	}
 	if len(annotations) != 0 {
 		opts.annotations = &annotations[0]
@@ -633,7 +632,7 @@ func (c *Client) SnapshotNamed(ctx context.Context, options SnapshotNamedOptions
 	}
 
 	var out C.SporeOwnedString
-	if result := Result(C.spore_snapshot_named_json(c.ctx, &opts, &out)); result != Success {
+	if result := Result(C.spore_save_named_json(c.ctx, &opts, &out)); result != Success {
 		return NamedLifecycleResult{}, c.callError(result)
 	}
 	defer C.spore_free_string(c.ctx, out)

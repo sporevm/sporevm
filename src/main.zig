@@ -205,7 +205,7 @@ fn runCommand(
             const message = "spore --json attach is not supported; use --events=jsonl for attach stream events";
             exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "attach"), message);
         }
-        try spore_internal.resume_cli.cli(init, command_args, stdout);
+        try spore_internal.attach_cli.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "create")) {
         try spore_internal.lifecycle.createCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "exec")) {

@@ -14,7 +14,7 @@ const lifecycle = @import("lifecycle.zig");
 const local_paths = @import("local_paths.zig");
 const memory_config = @import("memory.zig");
 const platform = @import("platform.zig");
-const resume_mod = @import("resume.zig");
+const attach_mod = @import("attach.zig");
 const rootfs_mod = @import("rootfs.zig");
 const run_mod = @import("run.zig");
 const gicv3 = @import("gicv3.zig");
@@ -123,7 +123,7 @@ pub const InspectBundleResult = contracts.InspectBundleResult;
 
 pub const Backend = run_mod.Backend;
 pub const MemoryConfig = run_mod.MemoryConfig;
-pub const CaptureTrigger = run_mod.CaptureTrigger;
+pub const SaveTrigger = run_mod.SaveTrigger;
 pub const ImagePullPolicy = run_mod.PullPolicy;
 pub const NetworkMode = run_mod.NetworkMode;
 pub const NetworkConfig = run_mod.NetworkPolicy;
@@ -154,7 +154,7 @@ pub const RootfsResolveOptions = rootfs_mod.ResolveRequest;
 pub const Disk = run_mod.Disk;
 pub const InjectedFile = run_mod.InjectedFile;
 pub const RunResult = run_mod.Result;
-pub const ResumeResult = run_mod.Result;
+pub const AttachResult = run_mod.Result;
 pub const RunEvent = run_mod.RunEvent;
 pub const EventSink = run_mod.EventSink;
 pub const ClassifiedFailure = run_mod.ClassifiedFailure;
@@ -164,10 +164,11 @@ pub const Timings = run_mod.Timings;
 pub const StartEvent = run_mod.StartEvent;
 pub const ReadyEvent = run_mod.ReadyEvent;
 pub const OutputEvent = run_mod.OutputEvent;
+pub const SaveEvent = run_mod.SaveEvent;
 pub const ExitEvent = run_mod.ExitEvent;
 pub const FailureEvent = run_mod.FailureEvent;
 pub const CreateNamedOptions = lifecycle.CreateNamedOptions;
-pub const ResumeNamedOptions = lifecycle.ResumeNamedOptions;
+pub const RestoreNamedOptions = lifecycle.RestoreNamedOptions;
 pub const ForkNamedOptions = lifecycle.ForkNamedOptions;
 pub const ExecNamedOptions = lifecycle.ExecNamedOptions;
 pub const ExecNamedStreamOptions = lifecycle.ExecNamedStreamOptions;
@@ -176,8 +177,7 @@ pub const ExecNamedStreamEvent = lifecycle.ExecNamedStreamEvent;
 pub const TerminalSize = lifecycle.TerminalSize;
 pub const CopyNamedOptions = lifecycle.CopyNamedOptions;
 pub const NamedNetworkOptions = lifecycle.NamedNetworkOptions;
-pub const SnapshotNamedOptions = lifecycle.SnapshotNamedOptions;
-pub const SuspendNamedOptions = lifecycle.SuspendNamedOptions;
+pub const SaveNamedOptions = lifecycle.SaveNamedOptions;
 pub const RemoveNamedOptions = lifecycle.RemoveNamedOptions;
 pub const ListNamedOptions = lifecycle.ListNamedOptions;
 pub const NamedLifecycleResult = lifecycle.NamedLifecycleResult;
@@ -216,9 +216,9 @@ pub const RunOptions = struct {
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
-    capture_path: ?[]const u8 = null,
-    capture_trigger: CaptureTrigger = .exit,
-    continue_after_capture: bool = false,
+    save_path: ?[]const u8 = null,
+    save_trigger: SaveTrigger = .exit,
+    continue_after_save: bool = false,
     annotations: Annotations = .{},
     network: NetworkMode = .disabled,
     network_policy: NetworkConfig = .{},
@@ -250,9 +250,9 @@ pub const ManagedRunOptions = struct {
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
-    capture_path: ?[]const u8 = null,
-    capture_trigger: CaptureTrigger = .exit,
-    continue_after_capture: bool = false,
+    save_path: ?[]const u8 = null,
+    save_trigger: SaveTrigger = .exit,
+    continue_after_save: bool = false,
     annotations: Annotations = .{},
     network: NetworkMode = .disabled,
     network_policy: NetworkConfig = .{},
@@ -281,9 +281,9 @@ pub const RunFromSporeOptions = struct {
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
-    capture_path: ?[]const u8 = null,
-    capture_trigger: CaptureTrigger = .exit,
-    continue_after_capture: bool = false,
+    save_path: ?[]const u8 = null,
+    save_trigger: SaveTrigger = .exit,
+    continue_after_save: bool = false,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
     /// Live host-side bindings for manifest-declared bound services.
@@ -295,7 +295,7 @@ pub const RunFromSporeOptions = struct {
 };
 
 /// Attach to a spore's recorded session.
-pub const ResumeOptions = struct {
+pub const AttachOptions = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
     session_id: ?[]const u8 = null,
@@ -795,9 +795,9 @@ pub fn run(
         .guest_port = options.guest_port,
         .timeout_ms = options.timeout_ms,
         .stream_output = false,
-        .capture_path = options.capture_path,
-        .capture_trigger = options.capture_trigger,
-        .continue_after_capture = options.continue_after_capture,
+        .save_path = options.save_path,
+        .save_trigger = options.save_trigger,
+        .continue_after_save = options.continue_after_save,
         .annotations = options.annotations,
         .network = options.network,
         .network_policy = options.network_policy,
@@ -815,7 +815,7 @@ pub fn runManaged(
     allocator: std.mem.Allocator,
     options: ManagedRunOptions,
 ) !RunResult {
-    if (options.capture_path != null and options.rootfs_path != null and options.image_ref == null) {
+    if (options.save_path != null and options.rootfs_path != null and options.image_ref == null) {
         return error.InvalidRootfsInput;
     }
 
@@ -828,7 +828,7 @@ pub fn runManaged(
         .image_ref = options.image_ref,
         .pull_policy = options.image_pull_policy,
         .command_name = "run",
-        .record_artifact = options.capture_path != null,
+        .record_artifact = options.save_path != null,
     });
     const default_kernel = options.kernel_path == null and init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null;
     const default_initrd = options.initrd_path == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null;
@@ -853,9 +853,9 @@ pub fn runManaged(
         .guest_port = options.guest_port,
         .timeout_ms = options.timeout_ms,
         .stream_output = false,
-        .capture_path = options.capture_path,
-        .capture_trigger = options.capture_trigger,
-        .continue_after_capture = options.continue_after_capture,
+        .save_path = options.save_path,
+        .save_trigger = options.save_trigger,
+        .continue_after_save = options.continue_after_save,
         .annotations = options.annotations,
         .network = options.network,
         .network_policy = options.network_policy,
@@ -929,9 +929,9 @@ pub fn runFromSpore(
         .guest_port = options.guest_port,
         .timeout_ms = options.timeout_ms,
         .stream_output = false,
-        .capture_path = options.capture_path,
-        .capture_trigger = options.capture_trigger,
-        .continue_after_capture = options.continue_after_capture,
+        .save_path = options.save_path,
+        .save_trigger = options.save_trigger,
+        .continue_after_save = options.continue_after_save,
         .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
         .network = network_options.network,
         .network_policy = network_options.policy,
@@ -942,14 +942,14 @@ pub fn runFromSpore(
 }
 
 /// Attach to a spore's recorded session.
-pub fn resumeSpore(
+pub fn attachSpore(
     context: Context,
     allocator: std.mem.Allocator,
-    options: ResumeOptions,
-) !ResumeResult {
+    options: AttachOptions,
+) !AttachResult {
     var bound_services = run_mod.BoundServiceBindingList{};
     for (options.bound_services) |binding| try bound_services.append(binding);
-    return resume_mod.execute(context, allocator, .{
+    return attach_mod.execute(context, allocator, .{
         .backend = options.backend,
         .spore_dir = options.spore_dir,
         .session_id = options.session_id,
@@ -974,12 +974,12 @@ pub fn createNamed(
 }
 
 /// Restore a spore as a long-lived named VM.
-pub fn resumeNamed(
+pub fn restoreNamed(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    options: ResumeNamedOptions,
+    options: RestoreNamedOptions,
 ) !NamedLifecycleResult {
-    return lifecycle.resumeNamed(init, allocator, options);
+    return lifecycle.restoreNamed(init, allocator, options);
 }
 
 /// Fork a ready diskless named VM into ready named child VMs.
@@ -1030,22 +1030,13 @@ pub fn copyOutNamed(
     return lifecycle.copyOutNamed(context, allocator, options);
 }
 
-/// Snapshot a named VM while it keeps running.
-pub fn snapshotNamed(
+/// Save a named VM into a spore. Set `stop` to remove the live registry entry.
+pub fn saveNamed(
     context: Context,
     allocator: std.mem.Allocator,
-    options: SnapshotNamedOptions,
+    options: SaveNamedOptions,
 ) !NamedLifecycleResult {
-    return lifecycle.snapshotNamed(context, allocator, options);
-}
-
-/// Save a named VM into a spore and remove the live registry entry.
-pub fn suspendNamed(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: SuspendNamedOptions,
-) !NamedLifecycleResult {
-    return lifecycle.suspendNamed(context, allocator, options);
+    return lifecycle.saveNamed(context, allocator, options);
 }
 
 /// Remove a named VM registry entry, stopping the monitor when it is ready.

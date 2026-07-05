@@ -14,7 +14,7 @@ int main(void) {
 
   uint32_t abi_version = 0;
   if (expect_success(spore_build_info(SPORE_BUILD_INFO_ABI_VERSION, &abi_version)) != 0) return 1;
-  if (abi_version != 13) return 1;
+  if (abi_version != 14) return 1;
   if (SPORE_REEXEC_CONTRACT_VERSION != 1u) return 1;
 
   SporeInspectBundleOptions options;
@@ -77,28 +77,23 @@ int main(void) {
   if (copy_options.size != sizeof(copy_options)) return 1;
   if (copy_options.version != SPORE_COPY_NAMED_OPTIONS_VERSION) return 1;
 
-  SporeResumeNamedOptions resume_options;
-  spore_resume_named_options_init(&resume_options);
-  if (resume_options.size != sizeof(resume_options)) return 1;
-  if (resume_options.version != SPORE_RESUME_NAMED_OPTIONS_VERSION) return 1;
-  if (resume_options.bound_unix_service_count != 0) return 1;
+  SporeRestoreNamedOptions restore_options;
+  spore_restore_named_options_init(&restore_options);
+  if (restore_options.size != sizeof(restore_options)) return 1;
+  if (restore_options.version != SPORE_RESTORE_NAMED_OPTIONS_VERSION) return 1;
+  if (restore_options.bound_unix_service_count != 0) return 1;
 
   SporeForkNamedOptions fork_options;
   spore_fork_named_options_init(&fork_options);
   if (fork_options.size != sizeof(fork_options)) return 1;
   if (fork_options.version != SPORE_FORK_NAMED_OPTIONS_VERSION) return 1;
 
-  SporeSnapshotNamedOptions snapshot_options;
-  spore_snapshot_named_options_init(&snapshot_options);
-  if (snapshot_options.size != sizeof(snapshot_options)) return 1;
-  if (snapshot_options.version != SPORE_SNAPSHOT_NAMED_OPTIONS_VERSION) return 1;
-  if (snapshot_options.continue_after != 1) return 1;
-  if (snapshot_options.annotation_count != 0) return 1;
-
-  SporeSuspendNamedOptions suspend_options;
-  spore_suspend_named_options_init(&suspend_options);
-  if (suspend_options.size != sizeof(suspend_options)) return 1;
-  if (suspend_options.version != SPORE_SUSPEND_NAMED_OPTIONS_VERSION) return 1;
+  SporeSaveNamedOptions save_options;
+  spore_save_named_options_init(&save_options);
+  if (save_options.size != sizeof(save_options)) return 1;
+  if (save_options.version != SPORE_SAVE_NAMED_OPTIONS_VERSION) return 1;
+  if (save_options.stop != 0) return 1;
+  if (save_options.annotation_count != 0) return 1;
 
   SporeRemoveNamedOptions remove_options;
   spore_remove_named_options_init(&remove_options);

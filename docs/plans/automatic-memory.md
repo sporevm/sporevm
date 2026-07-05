@@ -210,7 +210,8 @@ best-effort scans.
   `auto` resolves to a 16GiB byte-sized RAM contract.
 - Lifecycle specs persist `memory.policy` plus resolved `memory.bytes` instead
   of `memory_mib`.
-- `spore resume` derives RAM size from `manifest.platform.ram_size`.
+- `spore attach`, `spore restore`, and `spore run --from` derive RAM size from
+  `manifest.platform.ram_size`.
 - KVM and HVF backend configs already accept byte-sized `ram_size`.
 - Fresh KVM/HVF boot maps RAM with demand-committed anonymous private mappings.
 - Proof-gated same-host resume can map a same-sized `ram.backing` fd with
@@ -227,7 +228,7 @@ best-effort scans.
   dirty RAM sealer accepts optional seed ranges; fresh KVM and HVF boot paths
   pass those ranges into dirty tracking. Resume paths deliberately keep the old
   full seed until a separate sparse-resume seed source exists.
-- Fresh product `spore run --capture` paths now enable backend dirty tracking
+- Fresh product `spore run --save` paths now enable backend dirty tracking
   for base captures. Product capture uses tail-only sealing for the final dirty
   set, which avoids the 16GiB full-RAM scan while preserving coherent
   run-bridge/vsock state for forked children.
@@ -337,7 +338,7 @@ Progress:
   `MemTotal` of 1556284 KiB, above the 1.5GiB growth floor. This validates the
   default-kernel/default-initrd grow-only virtio-mem path on HVF.
 - 2026-06-28 local HVF named lifecycle boundary check: `spore create --memory
-  auto`, two `spore exec` calls, `spore --json ls`, and `spore suspend`
+  auto`, two `spore exec` calls, `spore --json ls`, and `spore save --stop`
   completed with a 16GiB manifest (`8192` 2MiB chunks). Create wall time was
   539ms; monitor-reported ready time was 40ms; `spore ls` reported
   `resident_bytes=351420416` and `chunks_total=8192`; suspend wall time was
@@ -356,7 +357,7 @@ Progress:
 - 2026-06-29 Buildkite Linux ARM64 KVM named lifecycle boundary check:
   `scripts/smoke-lifecycle-auto-memory.sh` passed on build 151 for commit
   `66aea21` on the `sporevm-linux-arm64` queue. `spore create --memory auto`,
-  two `spore exec` calls, `spore --json ls`, and `spore suspend` completed with
+  two `spore exec` calls, `spore --json ls`, and `spore save --stop` completed with
   a 16GiB manifest (`8192` 2MiB chunks). Create wall time was 121ms; suspend
   wall time was 68.244s; `spore ls` reported `resident_bytes=null` because no
   live process resident source was available at list time; the suspended
@@ -400,7 +401,7 @@ Done when:
 - Product lifecycle smoke: create, exec, `spore ls`, suspend or rm.
 - Same-host fork/fan-out smoke reporting declared RAM versus aggregate PSS/RSS.
 - HVF product capture validation on 2026-06-20: a mostly-idle 16GiB
-  `spore run --backend hvf --memory auto --capture <base.spore> --capture-on
+  `spore run --backend hvf --memory auto --save <base.spore> --save-on
   USR1 -- /bin/counter` baseline took 25.724s from `USR1` to exit with the
   full-scan path. Enabling product dirty tracking with tail-only sealing reduced
   the same measurement to 1.870s, with 8192 chunks, 132 populated refs, 8060

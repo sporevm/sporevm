@@ -26,7 +26,7 @@ own executable, with a small re-exec trampoline that dispatches hidden SporeVM
 roles before the embedder's normal main logic runs.
 
 This makes the monitor, `spore-netd`, and library code come from one linked
-artifact. The private argv contract between `createNamed`/`resumeNamed`, the
+artifact. The private argv contract between `createNamed`/`restoreNamed`, the
 monitor, and `netd` can stay private because both ends are the same version.
 Existing CLI behavior stays unchanged: the `spore` binary can still execute
 `spore monitor ...` and `spore netd ...` through `src/main.zig`.
@@ -67,7 +67,7 @@ after the VM has been classified as stale.
 - Let Go embedders run named lifecycle without installing a separate `spore`
   binary on `PATH`.
 - Keep the monitor and netd as real child processes with a fresh exec boundary.
-- Cover `createNamed`, `resumeNamed`, and named fork children because they all
+- Cover `createNamed`, `restoreNamed`, and named fork children because they all
   route through `spawnMonitorExecutable` or `startForkChildExecutable`.
 - Cover managed networking because monitors and one-shot run/resume paths start
   `spore-netd` through `net_gateway.Process.start`.
@@ -97,12 +97,12 @@ after the VM has been classified as stale.
 - `src/main.zig` dispatches hidden `monitor` and `netd` commands to
   `spore_internal.monitor.cli` and `spore_internal.spore_netd.cli`.
 - `src/lifecycle.zig` defaults `CreateNamedOptions.spore_executable`,
-  `ResumeNamedOptions.spore_executable`, and `ForkNamedOptions.spore_executable`
+  `RestoreNamedOptions.spore_executable`, and `ForkNamedOptions.spore_executable`
   to `"spore"`.
 - The C ABI exposes `spore_build_info`, currently with version string and C ABI
   version fields, and the Go binding checks the loaded ABI is new enough during
   `spore.New()`.
-- `resumeNamed` in this checkout already calls `waitForReadyResult` after
+- `restoreNamed` in this checkout already calls `waitForReadyResult` after
   spawning the monitor. The incident behavior where resume returned success
   while the VM stayed stale should be treated as fixed in current code, but the
   version handshake still belongs in this plan because readiness does not prove
@@ -118,7 +118,7 @@ after the VM has been classified as stale.
 - Slice 1 is implemented on `lox/libspore-helper-handshake`. Current monitors
   answer a `hello` control request with the shared SporeVM version and helper
   contract.
-- `createNamed`, `resumeNamed`, and named fork children verify `hello` during
+- `createNamed`, `restoreNamed`, and named fork children verify `hello` during
   readiness waiting. Missing support, wrong schema, wrong version, or wrong
   helper contract fail closed as `MonitorVersionMismatch`.
 - Exec, copy, suspend, snapshot, and streaming exec/copy verify `hello` before
@@ -135,7 +135,7 @@ after the VM has been classified as stale.
   descriptors greater than `2` before entering the role body.
 - Slice 3 is implemented in the Go binding. Package init dispatches
   `SPORE_REEXEC_ROLE` children through `spore_reexec_main`, and empty
-  `CreateNamedOptions.SporeExecutable` / `ResumeNamedOptions.SporeExecutable`
+  `CreateNamedOptions.SporeExecutable` / `RestoreNamedOptions.SporeExecutable`
   now default to the resolved current executable path.
 - The Go tests cover the netd re-exec trampoline by spawning the test binary
   as `netd --help`, plus the empty-default and explicit-helper paths.
@@ -228,7 +228,7 @@ The Go binding should provide the default trampoline for Go embedders:
 - If unset, init returns normally.
 - If set, init builds a C argv from `os.Args`, calls `spore_reexec_main`, and
   exits the process with the returned role exit code.
-- `CreateNamed`, `ResumeNamed`, and `ForkNamed` fill `SporeExecutable` with the
+- `CreateNamed`, `RestoreNamed`, and `ForkNamed` fill `SporeExecutable` with the
   current executable path when the caller leaves it empty.
 - Callers can still set `SporeExecutable` explicitly to use an external helper
   during migration or debugging.
@@ -314,7 +314,7 @@ Response:
 `waitForReadyResult` should wait for the ready file, connect to the control
 socket, send `hello`, and fail closed when the version or helper contract does
 not match the libspore build. Missing `hello` support is a mismatch. That makes
-new libspore plus old PATH helper fail during `createNamed`, `resumeNamed`, and
+new libspore plus old PATH helper fail during `createNamed`, `restoreNamed`, and
 named fork child startup.
 
 Existing already-running monitors should also be checked before exec, copy,
@@ -332,7 +332,7 @@ Add the monitor `hello` request and require it in lifecycle control paths.
 
 Definition of done:
 
-- `createNamed`, `resumeNamed`, and named fork children fail with a clear
+- `createNamed`, `restoreNamed`, and named fork children fail with a clear
   version mismatch when the spawned monitor omits or reports the wrong version.
 - Exec/copy/suspend/snapshot paths reject already-running mismatched monitors
   before sending operation-specific requests; `rm` remains cleanup-only.
@@ -369,7 +369,7 @@ Status: implemented on `lox/libspore-helper-handshake`.
 
 Definition of done:
 
-- Go `CreateNamed`, `ResumeNamed`, and named fork use the embedder path when the
+- Go `CreateNamed`, `RestoreNamed`, and named fork use the embedder path when the
   caller leaves `SporeExecutable` empty.
 - Explicit `SporeExecutable` continues to override the default.
 - A small Go test binary can spawn itself in netd re-exec role and observe the
@@ -429,7 +429,7 @@ Definition of done:
 - Make Go standalone behavior the default when `SporeExecutable` is empty.
 - Keep explicit `SporeExecutable` as the escape hatch for external helper mode.
 - Ship the version handshake before the trampoline.
-- Treat current `resumeNamed` readiness waiting as already fixed in this
+- Treat current `restoreNamed` readiness waiting as already fixed in this
   checkout; do not create a separate resume-readiness plan unless testing finds
   another path that returns before readiness.
 

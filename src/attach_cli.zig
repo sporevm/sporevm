@@ -7,21 +7,21 @@ const std = @import("std");
 const Io = std.Io;
 
 const api = @import("api.zig");
-const resume_mod = @import("resume.zig");
+const attach_mod = @import("attach.zig");
 const run_mod = @import("run.zig");
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
     if (args.len == 0 or wantsHelp(args)) {
-        try stdout.writeAll(resume_mod.cli_usage);
+        try stdout.writeAll(attach_mod.cli_usage);
         return;
     }
 
-    const opts = try resume_mod.parseCliArgs(args);
+    const opts = try attach_mod.parseCliArgs(args);
     var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "attach");
     const events: ?api.EventSink = if (opts.event_mode == .jsonl) event_writer.sink() else null;
     const arena = init.arena.allocator();
     const full_args = try init.minimal.args.toSlice(arena);
-    const result = api.resumeSpore(.{
+    const result = api.attachSpore(.{
         .io = init.io,
         .environ_map = init.environ_map,
     }, arena, .{
@@ -40,22 +40,22 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         if (opts.event_mode == .jsonl) {
             std.process.exit(api.classifyFailure(err).exit_code);
         }
-        if (err == error.NoCapturedSession) {
+        if (err == error.NoSavedSession) {
             std.debug.print(
                 "spore attach: spore has no saved session; run new commands with `spore run --from {s} ...`, or create one with `spore run --save <spore> --save-on TERM ...`; verify with `spore inspect {s}` and `Sessions: 1`\n",
                 .{ opts.spore_dir, opts.spore_dir },
             );
             std.process.exit(2);
         }
-        if (err == error.CapturedSessionUnavailable) {
+        if (err == error.SavedSessionUnavailable) {
             std.debug.print("spore attach: saved session is not available: {s}\n", .{opts.session_id orelse "default"});
             std.process.exit(2);
         }
-        if (err == error.CapturedSessionHasNoInteractiveStdin) {
+        if (err == error.SavedSessionHasNoInteractiveStdin) {
             std.debug.print("spore attach: saved session has no interactive stdin: {s}\n", .{opts.session_id orelse "default"});
             std.process.exit(2);
         }
-        if (err == error.CapturedSessionHasNoTerminal) {
+        if (err == error.SavedSessionHasNoTerminal) {
             std.debug.print("spore attach: saved session has no terminal: {s}\n", .{opts.session_id orelse "default"});
             std.process.exit(2);
         }
