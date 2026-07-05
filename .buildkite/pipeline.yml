@@ -1,5 +1,6 @@
 steps:
   - label: ":zig: Build & Test (Linux)"
+    key: "test-linux"
     command: |
       mise install
       mise exec -- zig build test --summary all
@@ -18,6 +19,7 @@ steps:
       queue: sporevm-linux-arm64
 
   - label: ":zig: Build & Test (macOS)"
+    key: "test-macos"
     command: |
       mise install
       mise exec -- zig build test --summary all
@@ -33,19 +35,6 @@ steps:
       name: "mise-cache"
     agents:
       queue: sporevm-mac
-
-  - wait
-
-  - trigger: "sporevm-benchmarks"
-    label: ":chart_with_upwards_trend: Trigger Benchmark Suite"
-    async: true
-    if: build.branch == "main" || build.env("SPOREVM_RUN_BENCHMARKS") == "1"
-    build:
-      branch: "${BUILDKITE_BRANCH}"
-      commit: "${BUILDKITE_COMMIT}"
-      message: "${BUILDKITE_MESSAGE}"
-
-  - wait
 
   - label: ":package: Build Linux ARM64 release archive"
     key: "release-linux-arm64"
@@ -91,9 +80,24 @@ steps:
     agents:
       queue: sporevm-mac
 
+  - wait
+
+  - trigger: "sporevm-benchmarks"
+    label: ":chart_with_upwards_trend: Trigger Benchmark Suite"
+    async: true
+    if: build.branch == "main" || build.env("SPOREVM_RUN_BENCHMARKS") == "1"
+    build:
+      branch: "${BUILDKITE_BRANCH}"
+      commit: "${BUILDKITE_COMMIT}"
+      message: "${BUILDKITE_MESSAGE}"
+
+  - wait
+
   - label: ":rocket: Publish release"
     key: "release-publish"
     depends_on:
+      - "test-linux"
+      - "test-macos"
       - "release-linux-arm64"
       - "release-darwin-arm64"
     if: build.tag != null
