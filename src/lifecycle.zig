@@ -539,6 +539,7 @@ pub const NamedLifecycleResult = struct {
     pid: ?i64 = null,
     console_log_path: ?[]const u8 = null,
     spore_dir: ?[]const u8 = null,
+    saved_sessions: ?usize = null,
 };
 
 pub const ExecNamedResult = struct {
@@ -1210,6 +1211,11 @@ pub fn suspendNamed(
         suspend_spec.annotations = manifest.value.annotations;
     }
     try writeSporeLifecycleSpec(arena, context.io, out_dir, suspend_spec);
+    const saved_sessions: usize = blk: {
+        var manifest = spore.loadManifest(arena, out_dir) catch break :blk 0;
+        defer manifest.deinit();
+        break :blk manifest.value.sessions.len;
+    };
     cleanup_after_suspend = false;
     waitForPidExit(ready.value.pid, 5_000);
     try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
@@ -1219,6 +1225,7 @@ pub fn suspendNamed(
         .state = "stopped",
         .pid = ready.value.pid,
         .spore_dir = out_dir,
+        .saved_sessions = saved_sessions,
     });
 }
 
@@ -1789,6 +1796,14 @@ pub fn saveCli(
         },
         error.UnsupportedSnapshotMode => {
             const message = "spore save: non-destructive save is not supported for this VM yet; use `spore save NAME --out DIR --stop`";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
+        },
+        error.OutputDirExists => {
+            const message = allocLifecycleMessage(allocator, "spore save: output directory already exists: {s}; choose a new --out DIR", .{parsed.out_dir});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
+        },
+        error.InvalidOutputDir => {
+            const message = allocLifecycleMessage(allocator, "spore save: invalid --out directory: {s}; the parent directory must exist", .{parsed.out_dir});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
         },
         error.MissingRootfsIdentity => {
@@ -3171,10 +3186,26 @@ fn apiPaths(context: Context, allocator: std.mem.Allocator, name: []const u8) !P
 fn resolveNewOutputDirApi(allocator: std.mem.Allocator, io: Io, raw: []const u8) ![]const u8 {
     const path = try std.fs.path.resolve(allocator, &.{raw});
     if (try pathExists(io, path)) return error.OutputDirExists;
-    const parent = std.fs.path.dirname(path) orelse return error.InvalidOutputDir;
-    const stat = try Io.Dir.cwd().statFile(io, parent, .{ .follow_symlinks = true });
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const stat = Io.Dir.cwd().statFile(io, parent, .{ .follow_symlinks = true }) catch |err| switch (err) {
+        error.FileNotFound => return error.InvalidOutputDir,
+        else => |e| return e,
+    };
     if (stat.kind != Io.File.Kind.directory) return error.InvalidOutputDir;
-    return path;
+    if (std.fs.path.isAbsolute(path)) return path;
+    // Output directories cross process boundaries (the monitor receives them
+    // over the control socket and resolves them against its own cwd), so a
+    // relative --out must become absolute before it leaves this process.
+    const abs_parent = try absoluteExistingDirPath(allocator, parent);
+    return std.fs.path.join(allocator, &.{ abs_parent, std.fs.path.basename(path) });
+}
+
+fn absoluteExistingDirPath(allocator: std.mem.Allocator, path: []const u8) error{ OutOfMemory, InvalidOutputDir }![]const u8 {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    var buf: [std.c.PATH_MAX]u8 = undefined;
+    const resolved = std.c.realpath(path_z, &buf) orelse return error.InvalidOutputDir;
+    return allocator.dupe(u8, std.mem.span(resolved));
 }
 
 fn temporarySiblingOutputDir(allocator: std.mem.Allocator, io: Io, out_dir: []const u8) ![]const u8 {
@@ -3390,7 +3421,11 @@ fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !
         try writer.print("saved {s}; vm {s} is still running\n", .{ result.spore_dir orelse result.name, result.name });
     } else if (std.mem.eql(u8, result.action, "saved_stopped")) {
         try writer.print("saved {s} and stopped vm {s}\n", .{ result.spore_dir orelse result.name, result.name });
-        try writer.writeAll("spore has no saved session; use `spore run --from <spore> ...` to run new commands, or `spore run --save <spore> --save-on TERM ...` if you want fanout to attach to the original command.\n");
+        if ((result.saved_sessions orelse 0) > 0) {
+            try writer.writeAll("spore has a saved session; use `spore attach <spore>` to reconnect, or `spore run --from <spore> ...` to run new commands.\n");
+        } else {
+            try writer.writeAll("spore has no saved session; use `spore run --from <spore> ...` to run new commands, or `spore run --save <spore> --save-on TERM ...` if you want fanout to attach to the original command.\n");
+        }
     } else if (std.mem.eql(u8, result.action, "removed")) {
         try writer.print("removed vm {s}\n", .{result.name});
     } else {
@@ -4432,6 +4467,7 @@ fn ownedNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycl
         .pid = result.pid,
         .console_log_path = console_log_path,
         .spore_dir = spore_dir,
+        .saved_sessions = result.saved_sessions,
     };
 }
 
@@ -5691,6 +5727,21 @@ test "named network config keeps bare network unrestricted" {
     try std.testing.expect(!config.policy.hasRules());
 }
 
+test "new output dirs resolve to absolute paths" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+
+    const resolved = try resolveNewOutputDirApi(arena, io, "lifecycle-test-does-not-exist.spore");
+    try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    try std.testing.expect(std.mem.endsWith(u8, resolved, "/lifecycle-test-does-not-exist.spore"));
+
+    try std.testing.expectError(error.OutputDirExists, resolveNewOutputDirApi(arena, io, "."));
+    try std.testing.expectError(error.InvalidOutputDir, resolveNewOutputDirApi(arena, io, "lifecycle-test-missing-parent/child.spore"));
+}
+
 test "save parser accepts annotations and stop" {
     const allocator = std.testing.allocator;
     var stderr: Io.Writer.Allocating = .init(allocator);
@@ -5939,6 +5990,20 @@ test "lifecycle human results render terse status lines" {
     try std.testing.expectEqualStrings(
         "saved counter.spore and stopped vm counter\n" ++
             "spore has no saved session; use `spore run --from <spore> ...` to run new commands, or `spore run --save <spore> --save-on TERM ...` if you want fanout to attach to the original command.\n",
+        out.written(),
+    );
+
+    out.clearRetainingCapacity();
+    try writeNamedLifecycleResult(&out.writer, .{
+        .action = "saved_stopped",
+        .name = "counter",
+        .state = "stopped",
+        .spore_dir = "counter.spore",
+        .saved_sessions = 1,
+    });
+    try std.testing.expectEqualStrings(
+        "saved counter.spore and stopped vm counter\n" ++
+            "spore has a saved session; use `spore attach <spore>` to reconnect, or `spore run --from <spore> ...` to run new commands.\n",
         out.written(),
     );
 
