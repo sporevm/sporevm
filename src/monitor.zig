@@ -4,6 +4,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 
+const generation = @import("generation.zig");
 const lifecycle = @import("lifecycle.zig");
 const memory_config = @import("memory.zig");
 const monitor_jail = @import("monitor_jail.zig");
@@ -139,6 +140,11 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     const spec_rootfs = if (existing_spec) |spec| spec.value.rootfs else null;
     const spec_disk = if (existing_spec) |spec| spec.value.disk else null;
     const spec_resume_generation = if (existing_spec) |spec| spec.value.resume_generation else null;
+    const spec_resume_generation_params = if (spec_resume_generation) |state| blk: {
+        var gen_dev = generation.Device{};
+        try gen_dev.restore(allocator, state);
+        break :blk try allocator.dupe(u8, gen_dev.paramsPayload());
+    } else null;
     const spec_annotations = if (existing_spec) |spec| spec.value.annotations else spore.Annotations{};
     const spec_sessions = if (existing_spec) |spec|
         if (spec.value.sessions.len != 0) spec.value.sessions else sessionHandlesForResume(allocator, opts.resume_dir)
@@ -176,7 +182,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     });
     try lifecycle.writePid(allocator, init.io, paths, currentPid());
 
-    var server = try ExecServer.init(allocator, init.io, paths.control_socket_path, paths.monitor_stats_path, opts.guest_port, opts.timeout_ms);
+    var server = try ExecServer.init(allocator, init.io, paths.control_socket_path, paths.monitor_stats_path, opts.guest_port, opts.timeout_ms, spec_resume_generation_params);
     if (gateway_active) server.network_events = &gateway;
     const thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
     const metadata_ms = lifecycle.monotonicMs();
@@ -243,6 +249,7 @@ const ExecServer = struct {
     guest_port: u32,
     timeout_ms: u64,
     server: net.Server,
+    generation_params: ?[]const u8,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
     state: RequestState = .idle,
@@ -269,14 +276,13 @@ const ExecServer = struct {
     stderr_truncated: bool = false,
     network_events: ?*net_gateway.Process = null,
     next_session_id: u64 = 1,
-    next_host_port: u32 = 49152,
     wake: ?vsock.Wake = null,
     stats_written: bool = false,
     stats_written_value: vsock.ControlStats = .{},
     stats_write_ms: u64 = 0,
     closed: std.atomic.Value(bool) = .init(false),
 
-    fn init(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, stats_path: []const u8, guest_port: u32, timeout_ms: u64) !ExecServer {
+    fn init(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, stats_path: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8) !ExecServer {
         // Zig's UnixAddress accepts 108-byte paths everywhere, but macOS
         // sun_path holds only 104; enforce the real platform limit before
         // listen so an oversized path fails with a clear log line instead
@@ -301,6 +307,7 @@ const ExecServer = struct {
             .guest_port = guest_port,
             .timeout_ms = timeout_ms,
             .server = try address.listen(io, .{ .kernel_backlog = 8 }),
+            .generation_params = generation_params,
         };
     }
 
@@ -359,9 +366,10 @@ const ExecServer = struct {
                 } else {
                     self.active_stream.setOutputSink(self, captureOutputThunk);
                 }
-                self.active_stream.host_port = self.next_host_port;
-                self.next_host_port +%= 1;
-                if (self.next_host_port < 49152) self.next_host_port = 49152;
+                // Resumed product-run guests can carry the original default
+                // host port in serialized vsock state; use the same dynamic
+                // port scheme as one-shot resume probes for monitor requests.
+                self.active_stream.host_port = vsock.HostStream.deriveHostPort(self.request[0..self.request_len]);
                 try dev.attachHostStream(&self.active_stream);
                 self.active_stream.markStarted();
                 self.active_stream_valid = true;
@@ -507,6 +515,9 @@ const ExecServer = struct {
         const session_id = try std.fmt.bufPrint(&id_buf, "lifecycle-{d}", .{self.next_session_id});
         self.next_session_id +%= 1;
         if (self.next_session_id == 0) self.next_session_id = 1;
+        if (self.generation_params) |params| {
+            return run.execRequestWithSessionGenerationParams(self.allocator, argv, session_id, self.wallClockUnixNs(), params);
+        }
         return run.execRequestWithSession(self.allocator, argv, session_id, self.wallClockUnixNs());
     }
 

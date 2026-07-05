@@ -2759,6 +2759,66 @@ static void maybe_send_memory_pressure(struct session *session, struct client *c
   }
 }
 
+static void run_transient_exec(struct client *client, const struct run_request *request, int use_rootfs) {
+  if (request->protocol_v1 || request->stdin_enabled || request->tty || request->interactive || request->memory_pressure) {
+    (void)send_client_error_exit(client, 2, "spore run: session already started\n");
+    close_client(client);
+    return;
+  }
+
+  struct session transient;
+  int rc = start_session(&transient, request->session_id, request->argv, request->envp, request->working_dir, use_rootfs, 0, 0, 0, 0, request->terminal_rows, request->terminal_cols);
+  if (rc != 0) {
+    (void)send_client_error_exit(client, rc, "spore run: exec setup failed\n");
+    close_client(client);
+    return;
+  }
+
+  while (client->fd >= 0 && (!transient.exited || transient.stdout_open || transient.stderr_open)) {
+    struct pollfd fds[3];
+    int roles[3];
+    nfds_t nfds = 0;
+    if (transient.stdout_open) {
+      fds[nfds].fd = transient.stdout_fd;
+      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
+      fds[nfds].revents = 0;
+      roles[nfds++] = 1;
+    }
+    if (transient.stderr_open) {
+      fds[nfds].fd = transient.stderr_fd;
+      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
+      fds[nfds].revents = 0;
+      roles[nfds++] = 2;
+    }
+    fds[nfds].fd = client->fd;
+    fds[nfds].events = POLLHUP | POLLERR;
+    fds[nfds].revents = 0;
+    roles[nfds++] = 3;
+
+    int pr = poll(fds, nfds, 100);
+    if (pr > 0) {
+      for (nfds_t i = 0; i < nfds; i++) {
+        if (fds[i].revents == 0) continue;
+        if (roles[i] == 1) {
+          pump_session_stream(&transient, client, 1);
+        } else if (roles[i] == 2) {
+          pump_session_stream(&transient, client, 0);
+        } else if (roles[i] == 3 && (fds[i].revents & (POLLHUP | POLLERR))) {
+          close_client(client);
+        }
+      }
+    }
+    poll_session_exit(&transient, client);
+    maybe_send_session_exit(&transient, client);
+  }
+
+  if (client->fd < 0 && transient.started && !transient.exited) {
+    (void)kill(transient.pid, SIGKILL);
+    wait_child_blocking(transient.pid);
+  }
+  reset_session(&transient);
+}
+
 static const char *apply_request_generation(struct generation_monitor *generation, const char *root, const char *params) {
   if (write_generation_files(root, params) != 0) return "spore run: generation helper write failed\n";
   if (apply_generation_identity(params) != 0) return "spore run: generation helper apply failed\n";
@@ -2876,8 +2936,7 @@ static void accept_request(int listener, struct session *session, struct client 
         return;
       }
       if (!session_finished(session)) {
-        (void)send_client_error_exit(client, 2, "spore run: session already started\n");
-        close_client(client);
+        run_transient_exec(client, &request, use_rootfs);
         return;
       }
       // ponytail: completed-base resumes lose pipe wakeups under ReleaseSafe; keep the file fallback resumed-only.
