@@ -3089,6 +3089,13 @@ pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []cons
     });
 }
 
+pub fn execRequestWithSessionGenerationParams(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, resume_time_unix_ns: u64, generation_params: []const u8) ![]const u8 {
+    return execRequestWithSessionOptions(allocator, argv, session_id, .{
+        .resume_time_unix_ns = resume_time_unix_ns,
+        .generation_params = generation_params,
+    });
+}
+
 pub const InteractiveExecRequestOptions = struct {
     interactive: bool = false,
     tty: bool = false,

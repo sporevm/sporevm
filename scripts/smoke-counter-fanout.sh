@@ -58,10 +58,14 @@ esac
 [[ "${count}" != "0" ]] || die "SPORE_SMOKE_FANOUT_COUNT must be greater than zero"
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-counter-fanout.XXXXXX")"
+runtime_dir="$(mktemp -d "/tmp/sporevm-counter-life.XXXXXX")"
+chmod 700 "${runtime_dir}" 2>/dev/null || true
+named_vm="cf-$$"
 run_pid=""
 resume_pid=""
 watchdog_pid=""
 cleanup() {
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${named_vm}" >/dev/null 2>&1 || true
   if [[ -n "${run_pid}" ]]; then
     kill -TERM "${run_pid}" >/dev/null 2>&1 || true
     wait "${run_pid}" >/dev/null 2>&1 || true
@@ -74,6 +78,7 @@ cleanup() {
     kill "${watchdog_pid}" >/dev/null 2>&1 || true
     wait "${watchdog_pid}" >/dev/null 2>&1 || true
   fi
+  rm -rf "${runtime_dir}"
   rm -rf "${workdir}"
 }
 trap cleanup EXIT
@@ -84,6 +89,10 @@ generation_fork_dir="${workdir}/generation-children"
 generation_json="${workdir}/generation.json"
 generation_resume_stdout="${workdir}/generation-resume.stdout"
 generation_resume_stderr="${workdir}/generation-resume.stderr"
+named_resume_stdout="${workdir}/named-resume.stdout"
+named_resume_stderr="${workdir}/named-resume.stderr"
+named_exec_stdout="${workdir}/named-exec.stdout"
+named_exec_stderr="${workdir}/named-exec.stderr"
 run_stdout="${workdir}/run.stdout"
 run_stderr="${workdir}/run.stderr"
 fanout_stdout="${workdir}/fanout.stdout"
@@ -137,7 +146,7 @@ fi
 
 "${spore_bin}" fork "${capture_dir}" --count 1 --out "${generation_fork_dir}" >"${workdir}/generation-fork.stdout" 2>"${workdir}/generation-fork.stderr"
 cat >"${generation_json}" <<'JSON'
-{"run_id":"counter-smoke","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"counter-smoke-batch","vm_id":"spore-counter-smoke-7"}
+{"run_id":"counter-smoke","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"counter-smoke-batch","vm_id":"spore-counter-smoke-7","generation":7,"resume_entropy_seed":"0123456789abcdef0123456789abcdef"}
 JSON
 
 "${spore_bin}" resume --events=jsonl --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" \
@@ -166,6 +175,27 @@ if [[ "${seen_generation}" != "1" ]]; then
 fi
 grep -Fq '"event":"ready"' "${generation_resume_stdout}" || die "spore resume --generation --events=jsonl did not emit ready"
 grep -Fq '"event":"stdout"' "${generation_resume_stdout}" || die "spore resume --generation --events=jsonl did not emit stdout"
+
+if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" resume --events=jsonl --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" --name "${named_vm}" \
+  >"${named_resume_stdout}" 2>"${named_resume_stderr}"; then
+  cat "${named_resume_stdout}" >&2 || true
+  cat "${named_resume_stderr}" >&2 || true
+  die "named spore resume --generation failed"
+fi
+grep -Fq '"event":"ready"' "${named_resume_stdout}" || die "named spore resume --generation --events=jsonl did not emit ready"
+grep -Fq '"event":"exit"' "${named_resume_stdout}" || die "named spore resume --generation --events=jsonl did not emit exit"
+if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${named_vm}" -- /bin/gencheck \
+  >"${named_exec_stdout}" 2>"${named_exec_stderr}"; then
+  cat "${named_exec_stdout}" >&2 || true
+  cat "${named_exec_stderr}" >&2 || true
+  die "named resumed child exec generation check failed"
+fi
+grep -Fq "spore generation ready " "${named_exec_stdout}" || {
+  cat "${named_exec_stdout}" >&2 || true
+  cat "${named_exec_stderr}" >&2 || true
+  die "named resumed child exec did not observe generation metadata"
+}
+env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${named_vm}" >/dev/null
 
 "${spore_bin}" fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
 
