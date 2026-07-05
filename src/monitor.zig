@@ -22,6 +22,7 @@ const max_control_response = 128 * 1024;
 const max_exec_output = 16 * 1024;
 const max_suspend_path = 4096;
 const stats_write_interval_ms = 250;
+const registry_check_interval_ms = 1_000;
 
 const monitor_usage =
     \\Usage:
@@ -182,7 +183,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     });
     try lifecycle.writePid(allocator, init.io, paths, currentPid());
 
-    var server = try ExecServer.init(allocator, init.io, paths.control_socket_path, paths.monitor_stats_path, opts.guest_port, opts.timeout_ms, spec_resume_generation_params);
+    var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.control_socket_path, paths.monitor_stats_path, opts.guest_port, opts.timeout_ms, spec_resume_generation_params);
     if (gateway_active) server.network_events = &gateway;
     const thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
     const metadata_ms = lifecycle.monotonicMs();
@@ -244,6 +245,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
 const ExecServer = struct {
     allocator: std.mem.Allocator,
     io: Io,
+    vm_dir: []const u8,
     socket_path: []const u8,
     stats_path: []const u8,
     guest_port: u32,
@@ -280,9 +282,10 @@ const ExecServer = struct {
     stats_written: bool = false,
     stats_written_value: vsock.ControlStats = .{},
     stats_write_ms: u64 = 0,
+    last_registry_check_ms: u64 = 0,
     closed: std.atomic.Value(bool) = .init(false),
 
-    fn init(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, stats_path: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8) !ExecServer {
+    fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, socket_path: []const u8, stats_path: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8) !ExecServer {
         // Zig's UnixAddress accepts 108-byte paths everywhere, but macOS
         // sun_path holds only 104; enforce the real platform limit before
         // listen so an oversized path fails with a clear log line instead
@@ -307,6 +310,7 @@ const ExecServer = struct {
         return .{
             .allocator = allocator,
             .io = io,
+            .vm_dir = vm_dir,
             .socket_path = socket_path,
             .stats_path = stats_path,
             .guest_port = guest_port,
@@ -345,6 +349,11 @@ const ExecServer = struct {
     fn poll(self: *ExecServer, dev: *vsock.Vsock) !vsock.ControlAction {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+
+        if (self.registryDirGone()) {
+            self.failOutstandingLocked("monitor registry disappeared");
+            return .stop;
+        }
 
         switch (self.state) {
             .idle, .done => return .keep_running,
@@ -434,6 +443,14 @@ const ExecServer = struct {
             }
         }
         return .keep_running;
+    }
+
+    fn registryDirGone(self: *ExecServer) bool {
+        const now = lifecycle.monotonicMs();
+        if (now - self.last_registry_check_ms < registry_check_interval_ms) return false;
+        self.last_registry_check_ms = now;
+        // ponytail: one stat per second, kqueue/inotify only if cleanup latency matters.
+        return registryDirMissing(self.io, self.vm_dir);
     }
 
     fn submitExec(self: *ExecServer, request: []const u8) ![]const u8 {
@@ -789,11 +806,19 @@ const ExecServer = struct {
     fn failOutstanding(self: *ExecServer, message: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        self.failOutstandingLocked(message);
+    }
+
+    fn failOutstandingLocked(self: *ExecServer, message: []const u8) void {
         switch (self.state) {
             .pending_exec, .active_exec, .pending_suspend, .active_suspend, .pending_snapshot, .active_snapshot => {
-                self.storeErrorLocked(message) catch {
-                    self.response_len = 0;
-                };
+                if (self.active_streaming_exec) {
+                    self.sendStreamingErrorLocked(message);
+                } else {
+                    self.storeErrorLocked(message) catch {
+                        self.response_len = 0;
+                    };
+                }
                 self.state = .done;
                 self.cond.broadcast(self.io);
             },
@@ -895,6 +920,14 @@ const ExecServer = struct {
         self.streamOutput(output, bytes);
     }
 };
+
+fn registryDirMissing(io: Io, vm_dir: []const u8) bool {
+    const stat = Io.Dir.cwd().statFile(io, vm_dir, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        else => return false,
+    };
+    return stat.kind != .directory;
+}
 
 fn base64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const enc = std.base64.standard.Encoder;
@@ -1477,4 +1510,17 @@ test "monitor parser accepts network allow policy" {
 test "monitor parser accepts bounded vcpu count" {
     const opts = try parseMonitorArgs(&.{ "bench-1", "--vcpus", "2" });
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.vcpus);
+}
+
+test "monitor registry detector notices deleted vm dir" {
+    const io = std.testing.io;
+    const root = "zig-cache/test-monitor-registry-gone";
+    const vm_dir = root ++ "/vms/bench-1";
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    _ = try Io.Dir.cwd().createDirPathStatus(io, vm_dir, .default_dir);
+    try std.testing.expect(!registryDirMissing(io, vm_dir));
+    try Io.Dir.cwd().deleteTree(io, vm_dir);
+    try std.testing.expect(registryDirMissing(io, vm_dir));
 }
