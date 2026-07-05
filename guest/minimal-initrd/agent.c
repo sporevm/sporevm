@@ -232,14 +232,19 @@ static void prepare_dev(void) {
   }
 }
 
-static uint32_t resolve_port(void) {
-  char buf[1024];
+static void read_cmdline(char *buf, size_t cap) {
+  if (cap == 0) return;
+  buf[0] = '\0';
   int fd = open("/proc/cmdline", O_RDONLY);
-  if (fd < 0) return 10700;
-  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  if (fd < 0) return;
+  ssize_t n = read(fd, buf, cap - 1);
   close(fd);
-  if (n <= 0) return 10700;
+  if (n <= 0) return;
   buf[n] = '\0';
+}
+
+static uint32_t resolve_port_from_cmdline(const char *buf) {
+  if (buf[0] == '\0') return 10700;
   const char *key = "cleanroom_guest_port=";
   char *p = strstr(buf, key);
   if (p == NULL) return 10700;
@@ -249,14 +254,7 @@ static uint32_t resolve_port(void) {
   return (uint32_t)value;
 }
 
-static int cmdline_has_flag(const char *flag) {
-  char buf[1024];
-  int fd = open("/proc/cmdline", O_RDONLY);
-  if (fd < 0) return 0;
-  ssize_t n = read(fd, buf, sizeof(buf) - 1);
-  close(fd);
-  if (n <= 0) return 0;
-  buf[n] = '\0';
+static int cmdline_has_flag_in(const char *buf, const char *flag) {
   return strstr(buf, flag) != NULL;
 }
 
@@ -3020,9 +3018,19 @@ int main(void) {
   mount_cgroup2_if_dir("/sys/fs/cgroup");
   prepare_dev();
   mkdir("/run", 0755);
-  int use_rootfs = cmdline_has_flag("spore_rootfs=1");
-  int rootfs_writable = cmdline_has_flag("spore_rootfs_rw=1");
-  int use_network = cmdline_has_flag("spore_net=1");
+  char cmdline[1024];
+  read_cmdline(cmdline, sizeof(cmdline));
+  int use_rootfs = cmdline_has_flag_in(cmdline, "spore_rootfs=1");
+  int rootfs_writable = cmdline_has_flag_in(cmdline, "spore_rootfs_rw=1");
+  int use_network = cmdline_has_flag_in(cmdline, "spore_net=1");
+  int listener = listen_vsock(resolve_port_from_cmdline(cmdline));
+  if (listener < 0) {
+    dprintf(2, "listen vsock failed: errno=%d\n", errno);
+    return 1;
+  }
+  (void)set_nonblock(listener);
+  t_listen_ready = now_ms();
+
   int rootfs_ready = 1;
   char rootfs_error[128];
   rootfs_error[0] = '\0';
@@ -3047,14 +3055,6 @@ int main(void) {
       network_error[len + 1] = '\0';
     }
   }
-
-  int listener = listen_vsock(resolve_port());
-  if (listener < 0) {
-    dprintf(2, "listen vsock failed: errno=%d\n", errno);
-    return 1;
-  }
-  (void)set_nonblock(listener);
-  t_listen_ready = now_ms();
   if (setup_sigchld_wakeup() != 0) {
     dprintf(2, "sigchld wakeup setup failed: errno=%d\n", errno);
     return 1;
