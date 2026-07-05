@@ -413,7 +413,8 @@ transition.
 - `attach` means "restore VM state and connect to a saved session".
 - `resume` is not a public CLI verb.
 - Breaking CLI changes are acceptable; compatibility aliases are not part of
-  the default plan.
+  the default plan. Removed spellings (`resume`, `suspend`, `run --capture*`)
+  fail with a redirect hint naming the replacement; they never execute.
 
 ## Deferred Work
 
