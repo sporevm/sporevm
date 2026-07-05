@@ -74,15 +74,15 @@ description = "Smoke product spore run automatic memory growth"
 
 [tasks."smoke:lifecycle-auto-memory"]
 run = "mise run build && scripts/smoke-lifecycle-auto-memory.sh"
-description = "Smoke named lifecycle automatic memory backing and suspend stats"
+description = "Smoke named lifecycle automatic memory backing and save stats"
 
 [tasks."smoke:run-capture"]
 run = "mise run build && scripts/smoke-run-capture.sh"
-description = "Smoke product spore run signal capture and resume"
+description = "Smoke product spore run signal save and attach"
 
 [tasks."smoke:multi-vcpu"]
 run = "mise run build && scripts/smoke-multi-vcpu.sh"
-description = "Smoke multi-vCPU boot, capture, run-from, and resume"
+description = "Smoke multi-vCPU boot, save, run-from, and attach"
 
 [tasks."smoke:lifecycle"]
 run = "mise run build && scripts/smoke-lifecycle.sh"
@@ -142,23 +142,23 @@ description = "Smoke product spore run host-to-guest TCP forwarding"
 
 [tasks."smoke:run-net-capture"]
 run = "mise run build && scripts/smoke-run-net-capture.sh"
-description = "Smoke network policy persistence across capture and run --from"
+description = "Smoke network policy persistence across save and run --from"
 
 [tasks."smoke:counter-fanout"]
 run = "mise run build && scripts/smoke-counter-fanout.sh"
-description = "Smoke capture, fork, and resume counter fan-out"
+description = "Smoke save, fork, and attach counter fan-out"
 
 [tasks."smoke:rootfs-fanout"]
 run = "mise run build && scripts/smoke-rootfs-fanout.sh"
-description = "Smoke OCI rootfs capture, fork, and run-from child execution"
+description = "Smoke OCI rootfs save, fork, and run-from child execution"
 
 [tasks."smoke:live-rootfs-fanout"]
 run = "mise run build && bash scripts/smoke-live-rootfs-fanout.sh"
-description = "Smoke live OCI rootfs capture, fork, and resume child identity"
+description = "Smoke live OCI rootfs save, fork, and attach child identity"
 
 [tasks."smoke:writable-rootfs"]
 run = "mise run build && scripts/smoke-writable-rootfs.sh"
-description = "Smoke writable rootfs disk layer capture and run-from replay"
+description = "Smoke writable rootfs disk layer save and run-from replay"
 
 [tasks."benchmark:writable-rootfs"]
 run = "mise run build:release && scripts/benchmark-writable-rootfs.sh --iterations 1"
@@ -166,7 +166,7 @@ description = "Benchmark writable rootfs COW, sealed append, and replay paths"
 
 [tasks."smoke:local-pull"]
 run = "mise run build && scripts/smoke-local-pull.sh"
-description = "Smoke local file:// pull materialization and resumed rootfs fan-out"
+description = "Smoke local file:// pull materialization and restored rootfs fan-out"
 
 [tasks."validate:release-a1-kvm"]
 run = "bash scripts/validate-release-a1-kvm.sh"

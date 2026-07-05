@@ -1,7 +1,7 @@
 //! Internal SporeVM implementation module root.
 //!
-//! A spore is a sealed, content-addressed checkpoint of a VM: a manifest of
-//! memory chunks, guest machine state, and eventually disk state. This module
+//! A spore is sealed VM state: a manifest of memory chunks, guest machine
+//! state, and storage identity or data. This module
 //! exposes backend, device, storage, daemon, and CLI implementation modules for
 //! in-repo tools. Product callers should import `libspore`, not this module.
 

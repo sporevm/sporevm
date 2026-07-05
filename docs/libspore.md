@@ -19,6 +19,11 @@ streams.
 same product APIs and JSON result schemas; they should not reimplement command
 behavior or depend on CLI parsing.
 
+The CLI-facing vocabulary is `save`, `attach`, and `restore`. Some libspore,
+C ABI, Go binding, and JSON event names still use lower-level `capture`,
+`resume`, and `suspend` names in this release; those are compatibility symbols,
+not new CLI concepts.
+
 ## Importing
 
 Add the module from this package in your `build.zig` dependency graph, then:
@@ -76,7 +81,7 @@ do not need deinit.
 ## Local Spore Inspection
 
 Use `inspectSpore` to read metadata from a local `.spore` directory without
-resuming it or manually parsing `manifest.json`:
+restoring or attaching to it, and without manually parsing `manifest.json`:
 
 ```zig
 const inspected = try libspore.inspectSpore(allocator, "worker.spore");
@@ -85,7 +90,7 @@ defer libspore.deinitSporeInspectResult(allocator, inspected);
 const workspace = inspected.annotations.map.get("cleanroom.workspace");
 ```
 
-`inspectSpore` accepts every manifest format version that resume accepts:
+`inspectSpore` accepts every manifest format version that restore paths accept:
 format v0 (single-vCPU) and format v1 (multi-vCPU) manifests both summarize,
 and `SporeInspectResult.vcpu_count` reports the vCPU count (1 for v0).
 
@@ -102,7 +107,8 @@ mode, and currently attached clients are not serialized.
 
 `SporeInspectResult.network` exposes the manifest network kind, capability
 requirements, and bound-service requirements so callers can discover restore-time
-bindings before calling `resumeSpore` or `runFromSpore`.
+bindings before calling `resumeSpore` for saved-session attach or
+`runFromSpore` for new commands.
 
 ## Local System
 
@@ -164,8 +170,8 @@ const result = try libspore.runManaged(init, allocator, .{
 ```
 
 Injected files are fresh-run only and appear under `/run/sporevm/injected`.
-Spore rejects them with capture and `runFromSpore` so caller-provided bytes do
-not accidentally become persisted spore state.
+Spore rejects them with saved runs and `runFromSpore` so caller-provided bytes
+do not accidentally become persisted spore state.
 
 Use `runFromSpore` for `spore run --from` semantics:
 
@@ -176,13 +182,14 @@ const result = try libspore.runFromSpore(context, allocator, .{
 });
 ```
 
-Leave `.command` empty to attach to the captured default session. Set
-`.interactive = true` or `.tty = true` only when that captured session was
-started with interactive stdin or a PTY; unsupported input attach returns a
-usage error before restore instead of silently downgrading to output-only
-attach. If the manifest has exactly one non-default session, `runFromSpore`
-targets that handle for commandless attach; running a new command from a spore
-creates a new process session.
+Leave `.command` empty to attach to a saved session through the lower-level API
+compatibility path. The CLI spells this as `spore attach`. Set `.interactive =
+true` or `.tty = true` only when that saved session was started with
+interactive stdin or a PTY; unsupported input attach returns a usage error
+before restore instead of silently downgrading to output-only attach. If the
+manifest has exactly one non-default session, `runFromSpore` targets that handle
+for commandless attach; running a new command from a spore creates a new process
+session.
 
 `RunResult.memory_restore_source` and `memory_restore_reason` are populated for
 `runFromSpore` and `resumeSpore`, so embedders can tell whether RAM came from
@@ -392,7 +399,7 @@ defer libspore.deinitNamedLifecycleResult(allocator, created);
 ```
 
 Port forwards are live monitor state. They are closed when the named VM exits
-and are not recorded in captured spore manifests.
+and are not recorded in saved spore manifests.
 
 `execNamed(.{ .network_policy = ... })` is part of the API contract but returns
 `error.UnsupportedNetworkPolicyUpdate` in this slice. Callers that need
@@ -401,8 +408,8 @@ reject stage-scoped policy until `networkCapabilities().stage_policy_update`
 is true.
 
 `ExecNamedResult.network_events_jsonl` contains decoded JSONL network events
-captured during the exec window. Bound service declarations are recorded in
-captured manifests as restore-time requirements without host socket paths. On
+recorded during the exec window. Bound service declarations are recorded in
+saved manifests as restore-time requirements without host socket paths. On
 restore, callers provide fresh live bindings keyed by service name:
 
 ```zig

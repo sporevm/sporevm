@@ -22,6 +22,12 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 }
 
 fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mod.CliOptions, stdout: *Io.Writer) !void {
+    if (parsed.from_spore_dir) |spore_dir| {
+        if (parsed.command.len == 0) {
+            failRunSetup("spore run: --from runs a new command from a spore; use `spore attach {s}` to connect to a saved session", .{spore_dir});
+        }
+    }
+
     var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "run");
     var raw_output = RawOutputSink{};
     const events: ?api.EventSink = switch (parsed.event_mode) {
@@ -53,7 +59,7 @@ fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mo
     };
     if (result.captured and parsed.event_mode != .jsonl) {
         if (result.capture_path) |path| {
-            const message = try std.fmt.allocPrint(arena, "spore run: captured snapshot at {s}\n", .{path});
+            const message = try std.fmt.allocPrint(arena, "spore run: saved spore at {s}\n", .{path});
             writeStderr(message);
         }
     }
@@ -79,7 +85,7 @@ fn runParsed(
     };
     if (parsed.from_spore_dir) |spore_dir| {
         if (parsed.network_requested or parsed.network_policy.hasRules()) {
-            failRunSetup("spore run: --from uses the captured network policy; omit --net and network flags", .{});
+            failRunSetup("spore run: --from uses the saved network policy; omit --net and network flags", .{});
         }
         const command = if (parsed.command.len == 0)
             &.{}
@@ -89,7 +95,7 @@ fn runParsed(
                 else => return err,
             };
         if (parsed.tty and command.len != 0) {
-            failRunSetup("spore run: -t with --from command execution is not supported yet; omit the command to attach", .{});
+            failRunSetup("spore run: -t with --from command execution is not supported yet; use `spore attach -t {s}` to connect to a saved terminal session", .{spore_dir});
         }
         validateTerminalPolicy(parsed);
         var binding_diagnostic = api.BoundServiceBindingDiagnostic{};
@@ -100,6 +106,7 @@ fn runParsed(
             .backend = parsed.backend,
             .spore_dir = spore_dir,
             .command = command,
+            .attach_session_id = parsed.attach_session_id,
             .interactive = parsed.interactive,
             .tty = parsed.tty,
             .vcpus = parsed.shared.vcpus,
@@ -124,10 +131,10 @@ fn runParsed(
     validateTerminalPolicy(parsed);
 
     if (parsed.capture_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
-        failRunSetup("spore run: --rootfs with --capture is not portable yet; use --image so capture can record immutable rootfs identity", .{});
+        failRunSetup("spore run: --rootfs with --save is not portable yet; use --image so save can record immutable rootfs identity", .{});
     }
     if (parsed.capture_path != null and parsed.network_policy.hasBoundServices()) {
-        failRunSetup("spore run: --bind-service with --capture needs manifest support first", .{});
+        failRunSetup("spore run: --bind-service with --save needs manifest support first", .{});
     }
 
     const command = run_mod.cliGuestCommand(allocator, parsed) catch |err| switch (err) {
@@ -221,4 +228,6 @@ test "run cli help accepts help before argv delimiter only" {
     try std.testing.expect(wantsHelp(&.{ "--image", "alpine", "--help" }));
     try std.testing.expect(!wantsHelp(&.{ "help", "--image", "alpine" }));
     try std.testing.expect(!wantsHelp(&.{ "--", "/bin/true", "--help" }));
+    try std.testing.expect(std.mem.indexOf(u8, run_mod.cli_usage, "spore run --save base.spore --save-on TERM") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run_mod.cli_usage, "Uses spore memory/device sizing; omit --memory") != null);
 }

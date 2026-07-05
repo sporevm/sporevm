@@ -47,13 +47,13 @@ Without `--`, the command runs as `/bin/sh -lc` in the guest. Use
 `-- <argv...>` for exact argv. `--image` applies OCI image `Env` and
 `WorkingDir` when present. It does not apply OCI Entrypoint, Cmd, or User.
 
-Add `--capture` to make rootfs writes part of the spore. The guest still sees a
-normal root filesystem, but writes land in a local COW head and capture seals
+Add `--save` to make rootfs writes part of the spore. The guest still sees a
+normal root filesystem, but writes land in a local COW head and save seals
 the changed blocks as disk layers:
 
 ```bash
 spore run --image docker.io/library/alpine:3.20 \
-  --capture base.spore \
+  --save base.spore \
   'echo warmed > /var/tmp/example'
 
 spore run --from base.spore 'cat /var/tmp/example'
@@ -67,10 +67,10 @@ previously validated rootfs instead of re-resolving the tag on every invocation.
 `--pull=missing|always|never` controls whether mutable refs may use that local
 record, force registry refresh, or fail without one. If the ref record or
 referenced rootfs is missing or mismatched, SporeVM falls back to the registry
-path and updates the record after the rootfs cache is valid. Captured image runs
+path and updates the record after the rootfs cache is valid. Saved image runs
 also require manifest-bound chunked rootfs storage. New builds write it
 immediately; older cache entries are upgraded once when
-`spore run --image ... --capture` needs to record portable rootfs identity.
+`spore run --image ... --save` needs to record portable rootfs identity.
 
 For local Docker buildx workflows, SporeVM consumes an OCI layout instead of the
 Docker daemon or socket. Buildx writes the layout, then `spore rootfs
@@ -97,7 +97,7 @@ and writes the deterministic ext4 output under the resolved image cache key.
 
 Local refs use the `local/<name>:<tag>` form and are host-local mutable pointers
 only. The imported rootfs metadata records a digest-pinned local resolved
-identity, `local/<name>@sha256:<manifest>`. Captured image-created spores record
+identity, `local/<name>@sha256:<manifest>`. Saved image-created spores record
 the ext4 BLAKE3 artifact digest and size plus manifest-attached
 `rootfs.storage` when available. `spore run --image local/...` resolves from the
 local ref cache and does not fall back to a network registry.
@@ -154,13 +154,13 @@ prune selectors:
   image) on hosts that pulled chunked spores but do not need to re-share them
   immediately.
 
-When `spore run --image ... --capture SPORE` captures a VM, the spore manifest
+When `spore run --image ... --save SPORE` saves a VM, the spore manifest
 records an immutable rootfs artifact: the ext4 content BLAKE3 digest, size,
 virtio-blk binding, resolved OCI image identity, platform, and builder version.
 For image-created spores, the manifest also records `rootfs.storage` pointing at
 the chunked rootfs index and CAS object namespace. Any rootfs writes made during
 the run are represented as sealed `disk-layer-v0` entries over that immutable
-base. Product `spore resume` and `spore run --from` always serve the root
+base. Product `spore attach` and `spore run --from` always serve the root
 disk base from the flat digest-addressed ext4 artifact, opened under the
 verify-at-install, trust-at-open cache contract (see SECURITY.md) without
 re-hashing it. `spore pull` and `spore unpack` assemble that artifact from
@@ -218,8 +218,8 @@ cache is not refetching or reinstalling rootfs bytes.
 
 Plain `spore run --rootfs PATH` remains a local read-only run escape hatch.
 Named `spore create --rootfs PATH` records exact immutable rootfs identity in
-the digest cache for lifecycle checkpoints. Combining one-shot `spore run
---rootfs PATH` with `--capture` is rejected until an import/preload command can
+the digest cache for lifecycle saves. Combining one-shot `spore run
+--rootfs PATH` with `--save` is rejected until an import/preload command can
 record chunked portable rootfs identity for arbitrary local images.
 
 Validate OCI rootfs capture, fork, and parallel `spore run --from` execution

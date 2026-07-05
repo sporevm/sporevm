@@ -26,11 +26,20 @@ const cli_usage =
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
-    \\  --for DURATION          Stop resumed children after DURATION, e.g. 10s, 500ms, 1m
-    \\  --timeout DURATION      Per-child resume probe timeout (default: 30s)
+    \\  --for DURATION          Stop attached children after DURATION, e.g. 10s, 500ms, 1m
+    \\  --timeout DURATION      Per-child attach probe timeout (default: 30s)
     \\  --bind-service NAME=unix:/path.sock
     \\                          Bind a manifest-declared service in every child
     \\  -h, --help              Show this help
+    \\
+    \\Requires child spores with saved sessions. Verify one with:
+    \\  spore inspect children/000000
+    \\  # Sessions: 1
+    \\
+    \\Workflow:
+    \\  spore run --save base.spore --save-on TERM 'while true; do echo tick; sleep 1; done'
+    \\  spore fork base.spore --count 2 --out children
+    \\  spore fanout children --for 10s
     \\
 ;
 
@@ -195,7 +204,7 @@ fn spawnResume(
     const backend_arg = @tagName(backend);
     const timeout_arg = try std.fmt.allocPrint(allocator, "{d}ms", .{timeout_ms});
     var argv = std.array_list.Managed([]const u8).init(allocator);
-    try argv.appendSlice(&.{ argv0, "resume", "--backend", backend_arg, "--timeout", timeout_arg });
+    try argv.appendSlice(&.{ argv0, "attach", "--backend", backend_arg, "--timeout", timeout_arg });
     for (bound_services) |binding| {
         const unix_path = switch (binding.target) {
             .unix => |path| path,
@@ -295,11 +304,11 @@ fn requireCapturedSessions(allocator: std.mem.Allocator, children: []const Child
         };
         if (sessions == 0) {
             failCli(
-                \\spore fanout: child {s} has no captured session.
-                \\This checkpoint can still run new commands with:
+                \\spore fanout: child {s} has no saved session.
+                \\This spore can still run new commands with:
                 \\  spore run --from {s} '...'
-                \\To fan out the original running command, create the checkpoint with:
-                \\  spore run --capture checkpoint --capture-on TERM '...'
+                \\To fan out the original running command, create the spore with:
+                \\  spore run --save base.spore --save-on TERM '...'
             , .{ child.name, child.path });
         }
     }
@@ -477,6 +486,9 @@ test "fanout cli help accepts help after options" {
     try std.testing.expect(wantsHelp(&.{ "children", "--for", "10s", "--help" }));
     try std.testing.expect(!wantsHelp(&.{"children"}));
     try std.testing.expect(!wantsHelp(&.{ "help", "--for", "10s" }));
+    try std.testing.expect(std.mem.indexOf(u8, cli_usage, "Requires child spores with saved sessions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cli_usage, "spore inspect children/000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cli_usage, "spore fanout children --for 10s") != null);
 }
 
 test "fanout cli parser accepts bound service bindings" {
@@ -528,7 +540,7 @@ fn testManifest(sessions: []const spore.Session) spore.Manifest {
     };
 }
 
-test "fanout preflight reads captured session presence" {
+test "fanout preflight reads saved session presence" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);

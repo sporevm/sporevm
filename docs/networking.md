@@ -64,13 +64,13 @@ uses a custom guest port. Service names and guest ports must be unique. Bound
 services are guest-exposed inputs; service providers must treat bytes on the
 socket as guest-controlled.
 
-Captured manifests record bound-service requirements by name, guest host, and
+Saved manifests record bound-service requirements by name, guest host, and
 guest port, but never durable host socket paths. Restore fails closed unless a
 caller supplies fresh live bindings for each declared service through libspore
 or the CLI:
 
 ```bash
-spore resume net-enabled.spore \
+spore attach net-enabled.spore \
   --bind-service metadata=unix:/tmp/fresh-metadata.sock
 spore run --from net-enabled.spore \
   --bind-service metadata=unix:/tmp/fresh-metadata.sock
@@ -95,15 +95,15 @@ listener is owned by `spore-netd` and is closed when the run or monitor exits.
 Port forwards are live process state only; they are not written into captured
 spore manifests.
 
-## Capture And Resume
+## Save And Attach
 
-Captured network spores persist requested capability and policy, not live TCP
+Saved network spores persist requested capability and policy, not live TCP
 flows, DNS caches, helper state, host socket paths, host port forwards, or
-credentials. `spore resume` and `spore run --from` attach a fresh gateway under
+credentials. `spore attach` and `spore run --from` attach a fresh gateway under
 the recorded policy or fail closed.
 
-When running from a captured spore, omit `--net` and policy flags. Bound-service
-bindings are allowed because they satisfy already-captured policy; they do not
+When running from a saved spore, omit `--net` and policy flags. Bound-service
+bindings are allowed because they satisfy already-saved policy; they do not
 change the manifest:
 
 ```bash

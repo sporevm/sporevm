@@ -46,7 +46,7 @@ smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
   --memory "${smoke_memory}" \
   --net \
   --allow-host example.com \
-  --capture "${capture_dir}" \
+  --save "${capture_dir}" \
   -- /bin/true \
   >"${capture_stdout}" 2>"${capture_stderr}"
 

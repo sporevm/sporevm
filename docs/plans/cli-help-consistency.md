@@ -108,8 +108,8 @@ Validation:
 Status: deferred.
 
 Consider `spore system doctor` or `spore logs NAME` only after repeated user
-need. Do not add `spore attach` unless `run --from` stops covering the session
-attach workflow cleanly.
+need. `spore attach` is now owned by
+`docs/plans/spore-naming-cli-ux.md`.
 
 ## Key Learnings From Pressure-Testing
 
@@ -117,3 +117,14 @@ The useful first slice is help-only. Adding aliases or moving commands would
 create compatibility and documentation work without fixing the immediate UX
 roughness. The parser change needs the exact-argv delimiter guard so guest
 commands can still receive `--help` unchanged.
+
+## 0.5.1 Hands-On Follow-Up
+
+Status: landed in this branch.
+
+- Add save/fork/fanout workflow examples to `run`, `fork`, and `fanout`
+  help.
+- Make session requirements visible before `fanout`.
+- Keep metadata-only rootfs storage explicit: flat cached rootfs can use
+  metadata-only bundles, but chunked image/rootfs storage still needs
+  `--rootfs=exact`.

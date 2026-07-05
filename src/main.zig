@@ -23,14 +23,14 @@ const usage =
     \\Global options:
     \\  --debug             Show verbose VMM and restore logs
     \\  --json              Emit one JSON result for supported state and bundle commands
-    \\                      Use --events=jsonl for run/resume stream events
+    \\                      Use --events=jsonl for run/attach stream events
     \\
     \\Commands:
     \\  One-shot VMs:
     \\    run [options] 'shell command'
     \\                        Boot a throwaway VM and run one command
-    \\    resume <spore-dir>
-    \\                        Resume one spore directly
+    \\    attach <spore-dir>
+    \\                        Restore a spore and attach to a saved session
     \\
     \\  Named VMs:
     \\    create NAME [options] ['shell command']
@@ -41,12 +41,12 @@ const usage =
     \\                        Copy one host file or directory into a named VM
     \\    copy-out NAME GUEST_PATH HOST_PATH
     \\                        Copy one guest file or directory out of a named VM
-    \\    suspend NAME --out DIR
-    \\                        Checkpoint a named VM into a spore
-    \\    resume <spore-dir> --name NAME
-    \\                        Resume a spore as a named VM
+    \\    save NAME --out DIR [--stop]
+    \\                        Save a named VM into a spore; --stop removes the VM
+    \\    restore <spore-dir> --name NAME
+    \\                        Restore a spore as a named VM
     \\    fork --vm NAME --count N --name PATTERN
-    \\                        Snapshot-and-continue a named VM into named children
+    \\                        Fork a running named VM into named children
     \\    ls, ps              List named VMs in the local runtime registry
     \\    rm NAME             Remove a named VM
     \\
@@ -55,7 +55,7 @@ const usage =
     \\    fork <spore-dir> --count N --out DIR
     \\                        Mint child spores that share parent chunks
     \\    fanout <children-dir> [--for DURATION]
-    \\                        Resume forked children concurrently with prefixed output
+    \\                        Attach forked children concurrently with prefixed output
     \\    pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR
     \\                        Pack portable spore chunks into a local bundle
     \\    unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR
@@ -83,6 +83,7 @@ const pack_usage =
     \\Options:
     \\  --children DIR        Include forked child spores in the bundle
     \\  --rootfs POLICY       Rootfs bundle policy: exact or metadata-only
+    \\                        metadata-only requires the same rootfs cache on unpack
     \\  --out DIR             Write the local bundle to DIR
     \\  -h, --help            Show this help
     \\
@@ -116,7 +117,7 @@ const inspect_bundle_usage =
     \\
     \\Options:
     \\  --child ID               Inspect one child entry
-    \\  --child-range START..END Inspect a range of child entries
+    \\  --child-range START..END Inspect an inclusive range of child entries
     \\  -h, --help               Show this help
     \\
 ;
@@ -199,16 +200,12 @@ fn runCommand(
         try spore_internal.rootfs_cli.run(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "run")) {
         try spore_internal.run_cli.cli(init, command_args, stdout);
-    } else if (std.mem.eql(u8, command, "resume")) {
-        if (wantsNamedResume(command_args)) {
-            try spore_internal.lifecycle.resumeCli(init, command_args, stdout, stderr, mode);
-        } else {
-            if (mode == .json) {
-                const message = "spore --json resume requires named lifecycle mode with --name; use --events jsonl for product resume";
-                exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
-            }
-            try spore_internal.resume_cli.cli(init, command_args, stdout);
+    } else if (std.mem.eql(u8, command, "attach")) {
+        if (mode == .json) {
+            const message = "spore --json attach is not supported; use --events=jsonl for attach stream events";
+            exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "attach"), message);
         }
+        try spore_internal.resume_cli.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "create")) {
         try spore_internal.lifecycle.createCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "exec")) {
@@ -219,8 +216,10 @@ fn runCommand(
         try spore_internal.lifecycle.copyOutCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "rm")) {
         try spore_internal.lifecycle.rmCli(init, command_args, stdout, stderr, mode);
-    } else if (std.mem.eql(u8, command, "suspend")) {
-        try spore_internal.lifecycle.suspendCli(init, command_args, stdout, stderr, mode);
+    } else if (std.mem.eql(u8, command, "save")) {
+        try spore_internal.lifecycle.saveCli(init, command_args, stdout, stderr, mode);
+    } else if (std.mem.eql(u8, command, "restore")) {
+        try spore_internal.lifecycle.restoreCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "ls") or std.mem.eql(u8, command, "ps")) {
         try spore_internal.lifecycle.lsCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "monitor")) {
@@ -334,10 +333,27 @@ fn runCommand(
         }
     } else if (std.mem.eql(u8, command, "help")) {
         try stdout.writeAll(usage);
+    } else if (renamedCommandHint(command)) |hint| {
+        const message = allocMessage(arena, "spore {s} was renamed; {s}", .{ command, hint });
+        exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "CommandDispatch"), message);
     } else {
         const message = allocMessage(arena, "unknown command: {s}", .{command});
         exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "CommandDispatch"), messageWithUsage(arena, message));
     }
+}
+
+/// Redirect hints for command spellings removed in the spore/saved-session
+/// rename. The old commands stay non-functional so the new vocabulary is
+/// unambiguous, but users get pointed at the replacement instead of a
+/// generic unknown-command error.
+fn renamedCommandHint(command: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, command, "resume")) {
+        return "use `spore attach <spore-dir>` to attach a saved session, or `spore restore <spore-dir> --name NAME` to restore a named VM";
+    }
+    if (std.mem.eql(u8, command, "suspend")) {
+        return "use `spore save NAME --out DIR --stop`";
+    }
+    return null;
 }
 
 fn logFn(
@@ -391,8 +407,8 @@ fn supportsJson(command: []const u8) bool {
     return std.mem.eql(u8, command, "system") or
         std.mem.eql(u8, command, "create") or
         std.mem.eql(u8, command, "rm") or
-        std.mem.eql(u8, command, "resume") or
-        std.mem.eql(u8, command, "suspend") or
+        std.mem.eql(u8, command, "restore") or
+        std.mem.eql(u8, command, "save") or
         std.mem.eql(u8, command, "host-info") or
         std.mem.eql(u8, command, "inspect") or
         std.mem.eql(u8, command, "ls") or
@@ -472,14 +488,6 @@ fn exitUsage(
     usage_line: []const u8,
 ) noreturn {
     exitWithCliError(allocator, stderr, mode, machine_output.usageMissingArgument(usage_line, command), usage_line);
-}
-
-fn wantsNamedResume(args: []const []const u8) bool {
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--name")) return true;
-        if (std.mem.startsWith(u8, arg, "--name=")) return true;
-    }
-    return false;
 }
 
 fn wantsCommandHelp(args: []const []const u8) bool {
@@ -594,7 +602,13 @@ fn packCommand(
         .out_dir = out_dir.?,
         .children_dir = children_dir,
         .rootfs_policy = rootfs_policy,
-    });
+    }) catch |err| switch (err) {
+        error.UnsupportedMetadataOnlyRootfsStorage => {
+            const message = "spore pack: --rootfs=metadata-only cannot pack chunked image/rootfs storage yet; use --rootfs=exact";
+            exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "pack"), message);
+        },
+        else => |e| return e,
+    };
 }
 
 fn unpackCommand(
@@ -931,6 +945,9 @@ fn writeInspectBundleResult(writer: *Io.Writer, result: spore_api.InspectBundleR
     try writer.print("  Children: {d}\n", .{result.child_count});
     if (result.selection.selected_count > 0) {
         try writer.print("  Selection: {s}, {d} children\n", .{ result.selection.kind, result.selection.selected_count });
+        try writer.writeAll("  Selected children:");
+        for (result.selection.children) |child| try writer.print(" {s}", .{child.id});
+        try writer.writeByte('\n');
     }
     if (result.rootfs.artifact_count > 0) {
         try writer.print("  Rootfs artifacts: {d}, {d} exact-byte artifacts, {d} metadata-only artifacts\n", .{ result.rootfs.artifact_count, result.rootfs.exact_bytes_count, result.rootfs.metadata_only_count });
@@ -953,12 +970,12 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "--debug") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "rootfs") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "run") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage, "resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "attach") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "create") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "exec") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "rm") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage, "suspend") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage, "resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "save") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "restore") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "ls") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "version") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "host-info") != null);
@@ -977,10 +994,33 @@ test "parse inspect bundle child range" {
     const range = parseChildRange("7..42") orelse return error.BadManifest;
     try std.testing.expectEqual(@as(u32, 7), range.start);
     try std.testing.expectEqual(@as(u32, 42), range.end);
+    try std.testing.expect(std.mem.indexOf(u8, inspect_bundle_usage, "inclusive range") != null);
     try std.testing.expect(parseChildRange("42..7") == null);
     try std.testing.expect(parseChildRange("7.") == null);
     try std.testing.expect(parseChildRange("7..") == null);
     try std.testing.expect(parseChildRange("..42") == null);
+}
+
+test "inspect bundle output lists selected child ids" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    const selected = [_]spore_api.BundleChildSummary{
+        .{ .id = "000001", .manifest = "manifests/children/000001.json" },
+    };
+    try writeInspectBundleResult(&out.writer, .{
+        .source = "bundle",
+        .bundle_dir = "/tmp/bundle",
+        .bundle_digest = .{ .hex = "abc" },
+        .indexed = true,
+        .parent_manifest = "manifests/parent.json",
+        .chunkpack_index = "chunkpack.index.json",
+        .chunkpack = .{ .chunk_count = 1, .pack_count = 1, .payload_bytes = 4096 },
+        .child_count = 2,
+        .selection = .{ .kind = "child_range", .selected_count = selected.len, .children = &selected },
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Selected children: 000001") != null);
 }
 
 test "rootfs bundle policy parser accepts exact and metadata-only spellings" {
@@ -990,10 +1030,12 @@ test "rootfs bundle policy parser accepts exact and metadata-only spellings" {
     try std.testing.expect(parseRootfsBundlePolicy("bad") == null);
 }
 
-test "resume dispatch can distinguish product and named lifecycle modes" {
-    try std.testing.expect(!wantsNamedResume(&.{"spore-dir"}));
-    try std.testing.expect(wantsNamedResume(&.{ "spore-dir", "--name", "bench-1" }));
-    try std.testing.expect(wantsNamedResume(&.{ "spore-dir", "--name=bench-1" }));
+test "removed commands map to rename hints" {
+    try std.testing.expect(std.mem.indexOf(u8, renamedCommandHint("resume").?, "spore attach") != null);
+    try std.testing.expect(std.mem.indexOf(u8, renamedCommandHint("resume").?, "spore restore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, renamedCommandHint("suspend").?, "spore save NAME --out DIR --stop") != null);
+    try std.testing.expect(renamedCommandHint("attach") == null);
+    try std.testing.expect(renamedCommandHint("bogus") == null);
 }
 
 test "command help accepts standard help spellings" {
@@ -1012,8 +1054,8 @@ test "stable lifecycle commands support global json where output is one document
     try std.testing.expect(supportsJson("ls"));
     try std.testing.expect(supportsJson("ps"));
     try std.testing.expect(supportsJson("rm"));
-    try std.testing.expect(supportsJson("resume"));
-    try std.testing.expect(supportsJson("suspend"));
+    try std.testing.expect(supportsJson("restore"));
+    try std.testing.expect(supportsJson("save"));
     try std.testing.expect(!supportsJson("attach"));
     try std.testing.expect(!supportsJson("exec"));
 }

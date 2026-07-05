@@ -66,8 +66,8 @@ if grep -R -a -F -q "${token}" "${rootfs_cache}"; then
   die "injected file leaked into the rootfs cache"
 fi
 
-if "${spore_bin}" run --inject payload="${payload}" --capture "${workdir}/bad.spore" -- /bin/true >"${workdir}/capture.stdout" 2>"${capture_stderr}"; then
-  die "spore run accepted --inject with --capture"
+if "${spore_bin}" run --inject payload="${payload}" --save "${workdir}/bad.spore" -- /bin/true >"${workdir}/capture.stdout" 2>"${capture_stderr}"; then
+  die "spore run accepted --inject with --save"
 fi
 grep -Fq "injected files are intentionally not persisted" "${capture_stderr}" || {
   cat "${capture_stderr}" >&2 || true

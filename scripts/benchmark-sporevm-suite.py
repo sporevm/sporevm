@@ -612,7 +612,7 @@ class BenchmarkRunner:
             self.effective_image,
             "--memory",
             self.args.memory,
-            "--capture",
+            "--save",
             str(base_dir),
             "--",
             "/bin/true",

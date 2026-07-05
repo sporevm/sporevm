@@ -9,10 +9,10 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig 0.16.0](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](mise.toml)
 
-SporeVM is a small aarch64 virtual machine monitor for forkable Linux microVM
-checkpoints.
+SporeVM is a small aarch64 virtual machine monitor for saving and forking Linux
+microVM state.
 
-A spore is a sealed VM checkpoint with normalized machine state, device state,
+A spore is sealed VM state with normalized machine state, device state,
 verified memory chunks, optional rootfs state, and a platform contract that
 fails closed when a host cannot restore it honestly.
 
@@ -20,13 +20,13 @@ The useful shape is:
 
 1. Start a runtime once.
 2. Warm it up until the expensive boring work is done.
-3. Capture it at a clean point.
+3. Save it at a clean point.
 4. Fork cheap child spores.
-5. Resume the children on compatible aarch64 hosts without copying all RAM for
+5. Attach the children on compatible aarch64 hosts without copying all RAM for
    every child.
 
-SporeVM 1.0 expects spores to resume on the same backend and compatible host
-class they were captured for: KVM/aarch64 to KVM/aarch64, or Apple Silicon HVF
+SporeVM 1.0 expects spores to restore on the same backend and compatible host
+class they were saved for: KVM/aarch64 to KVM/aarch64, or Apple Silicon HVF
 to Apple Silicon HVF. The repo still keeps KVM/HVF restore checks because they
 catch backend-specific state leaking into the spore format, but users should
 not plan distribution around moving one running machine between those
@@ -88,8 +88,8 @@ mise run install
 `mise run check` runs unit tests, the product build, and diff hygiene.
 `mise run install` builds an optimized `spore` and installs it into `~/bin`,
 with runtime assets under `~/share/sporevm`.
-`mise run smoke` builds once, then runs the default product run, run-capture,
-and resume smokes. Focused smoke commands are listed under
+`mise run smoke` builds once, then runs the default product run, signal-save,
+and attach smokes. Focused smoke commands are listed under
 [Validation](#validation).
 
 For local iteration:
@@ -131,7 +131,7 @@ printf 'hello\n' | spore run -i -- /bin/cat
 Inject a caller-provided file into the run with `--inject ID=PATH`. The guest
 sees it at `/run/sporevm/injected/ID`; the file is carried by the run
 initrd and copied into rootfs `/run` tmpfs, so it is not added to the image
-rootfs cache. `--inject` is rejected with `--capture` and `--from` because file
+rootfs cache. `--inject` is rejected with `--save` and `--from` because file
 persistence would otherwise be ambiguous:
 
 ```bash
@@ -193,14 +193,14 @@ spore run --net --allow-host example.com \
 ```
 
 Use `--allow-host` or `--allow-cidr` to open egress beyond the built-in deny
-floor. Captured network policy is replayed by `spore run --from`; omit `--net`
-and allow flags on resumed runs.
+floor. Saved network policy is replayed by `spore run --from`; omit `--net`
+and allow flags on run-from commands.
 
 Use `--forward 127.0.0.1:HOST_PORT:GUEST_PORT` to expose one live guest TCP
 port on host loopback while the run or named VM monitor is alive.
 
 See [docs/networking.md](docs/networking.md) for policy, bound-service,
-port-forward, and resume limits.
+port-forward, and restore or attach limits.
 
 ## Fork a live VM
 
@@ -243,37 +243,37 @@ spore copy-out child-0 /tmp/src ./src-roundtrip
 `spore create`, `spore run`, and `spore exec` run shell commands as
 `/bin/sh -lc`. Use `-- <argv...>` when you need exact argv.
 
-## Capture and resume
+## Save and attach
 
-Capture a run when the command exits:
+Save a run when the command exits:
 
 ```bash
 spore run --image docker.io/library/alpine:3.20 \
-  --capture base.spore \
+  --save base.spore \
   'echo warmed > /var/tmp/example'
 ```
 
-Run another command from that completed base spore, or attach to the captured
-default session:
+Run another command from that completed base spore, or attach to a saved
+session:
 
 ```bash
 spore run --from base.spore 'cat /var/tmp/example'
-spore run --from base.spore
+spore attach live-shell.spore
 ```
 
-If the captured session was still running with a guest terminal, reattach with
+If the saved session was still running with a guest terminal, reattach with
 the same explicit terminal flags:
 
 ```bash
-spore run -it --from live-shell.spore
+spore attach -it live-shell.spore
 ```
 
-Input attach fails closed when the captured session was not started with
+Input attach fails closed when the saved session was not started with
 interactive stdin or a terminal. The spore contains guest process and PTY
 state, not the original host terminal connection.
 
-`--from` resumes the spore and either attaches to the captured default session
-or runs a fresh command through the restored exec agent. See
+`--from` restores the spore and runs a fresh command through the restored exec
+agent. `attach` restores the spore and connects to a saved session. See
 [docs/filesystem.md](docs/filesystem.md) for rootfs-backed writable state and
 [docs/memory.md](docs/memory.md) for memory restore behavior.
 
@@ -288,7 +288,7 @@ spore fork base.spore --count 100 --out forks
 Children are named `000000`, `000001`, and so on. They share verified content
 and get distinct generation metadata.
 
-Resume forked children locally with prefixed output:
+Attach forked children locally with prefixed output:
 
 ```bash
 spore fanout forks --for 20s
@@ -305,11 +305,11 @@ Pack a spore, optionally with forked children:
 spore pack base.spore --children forks --out base.bundle
 ```
 
-Unpack or pull one selected child before resume:
+Unpack or pull one selected child before attach:
 
 ```bash
 spore unpack base.bundle --child 000042 --out child.spore
-spore resume child.spore
+spore attach child.spore
 ```
 
 Remote pulls are digest-pinned:
@@ -334,8 +334,8 @@ export SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
 
 spore create bench-1 --image docker.io/library/alpine:3.20
 spore exec bench-1 'echo hi'
-spore suspend bench-1 --out bench-1.spore --annotation captured=true
-spore resume bench-1.spore --name bench-2
+spore save bench-1 --out bench-1.spore --stop --annotation saved=true
+spore restore bench-1.spore --name bench-2
 spore ps
 spore rm bench-2
 ```
@@ -354,7 +354,7 @@ named live fork, and limits.
 
 ## Current scope
 
-SporeVM supports one-shot runs, capture/resume, local fork/fan-out, rootfs-backed
+SporeVM supports one-shot runs, save/attach, local fork/fan-out, rootfs-backed
 runs, local and remote bundle materialization, explicit guest networking, and
 named lifecycle on supported aarch64 HVF/KVM hosts.
 
@@ -379,7 +379,7 @@ mise run smoke:run
 mise run smoke:run-stdin
 mise run smoke:run-tty
 mise run smoke:run-attach
-mise run smoke:run-capture
+mise run smoke:run-capture  # signal-save workflow
 mise run smoke:lifecycle-tty
 mise run smoke:rootfs-fanout
 mise run smoke:writable-rootfs

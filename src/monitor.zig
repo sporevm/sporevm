@@ -288,10 +288,15 @@ const ExecServer = struct {
         // listen so an oversized path fails with a clear log line instead
         // of crashing in the socket address conversion.
         lifecycle.validateControlSocketPath(socket_path) catch |err| {
-            std.debug.print(
-                "monitor: control socket path {s} is {d} bytes but the platform limit is {d}; shorten the VM name or set {s} to a shorter path\n",
-                .{ socket_path, socket_path.len, lifecycle.max_control_socket_path_len, lifecycle.runtime_dir_env },
-            );
+            const detail = lifecycle.lastErrorMessage();
+            if (detail.len != 0) {
+                std.debug.print("monitor: {s}\n", .{detail});
+            } else {
+                std.debug.print(
+                    "monitor: control socket path {s} is {d} bytes but the platform limit is {d}; shorten the VM name or set {s} to a shorter path\n",
+                    .{ socket_path, socket_path.len, lifecycle.max_control_socket_path_len, lifecycle.runtime_dir_env },
+                );
+            }
             return err;
         };
         Io.Dir.cwd().deleteFile(io, socket_path) catch |err| switch (err) {

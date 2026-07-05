@@ -110,9 +110,9 @@ reject_stderr="${workdir}/reject.stderr"
   -t \
   --events=jsonl \
   --image "${image}" \
-  --capture "${tty_capture}" \
-  --capture-on USR1 \
-  --continue-after-capture \
+  --save "${tty_capture}" \
+  --save-on USR1 \
+  --continue-after-save \
   -- /bin/sh -lc 'i=0; while [ "$i" -lt 8 ]; do echo "tty-attach-tick:$i"; i=$((i + 1)); sleep 1; done' \
   >"${tty_run_jsonl}" 2>"${tty_run_stderr}" &
 run_pid="$!"
@@ -145,11 +145,11 @@ done
   die "live TTY capture did not write a manifest"
 }
 
-"${timeout_bin}" 60s "${spore_bin}" run \
+"${timeout_bin}" 60s "${spore_bin}" attach \
   --backend "${backend}" \
   -t \
   --events=jsonl \
-  --from "${tty_capture}" \
+  "${tty_capture}" \
   >"${tty_attach_jsonl}" 2>"${tty_attach_stderr}"
 
 jsonl_terminal_succeeds "${tty_attach_jsonl}" "tty-attach-tick:" || {
@@ -171,17 +171,17 @@ set -e
 "${spore_bin}" run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
-  --capture "${noninteractive_capture}" \
+  --save "${noninteractive_capture}" \
   -- /bin/true \
   >"${workdir}/noninteractive.stdout" 2>"${workdir}/noninteractive.stderr"
 [[ -f "${noninteractive_capture}/manifest.json" ]] || die "non-interactive capture did not write a manifest"
 
 set +e
-printf 'input\n' | "${timeout_bin}" 30s "${spore_bin}" run \
+printf 'input\n' | "${timeout_bin}" 30s "${spore_bin}" attach \
   --backend "${backend}" \
   -i \
   --events=jsonl \
-  --from "${noninteractive_capture}" \
+  "${noninteractive_capture}" \
   >"${reject_jsonl}" 2>"${reject_stderr}"
 reject_rc="$?"
 set -e
@@ -190,7 +190,7 @@ set -e
   cat "${reject_stderr}" >&2 || true
   die "non-interactive -i attach exited ${reject_rc}, expected 2"
 }
-jsonl_failure_contains "${reject_jsonl}" "captured session has no interactive stdin" || {
+jsonl_failure_contains "${reject_jsonl}" "saved session has no interactive stdin" || {
   cat "${reject_jsonl}" >&2 || true
   cat "${reject_stderr}" >&2 || true
   die "non-interactive -i attach did not report the expected error"

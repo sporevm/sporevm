@@ -581,7 +581,7 @@ if [[ "\${writable_rootfs}" == "1" ]]; then
   zig-out/bin/spore run \
     --backend kvm \
     --image "\${resolved_writable_image}" \
-    --capture "\${workdir}/spore" \
+    --save "\${workdir}/spore" \
     -- /bin/sh -lc 'printf "remote-parent-layer-ok\n" >/var/sporevm-remote-parent && sync'
 elif [[ "\${workload}" == "initrd" ]]; then
   mise exec -- env CC='zig cc -target aarch64-linux-musl' scripts/make-smoke-initrd.sh "\${workdir}/ticker.cpio"

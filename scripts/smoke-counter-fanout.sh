@@ -100,8 +100,8 @@ fanout_stderr="${workdir}/fanout.stderr"
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --capture "${capture_dir}" \
-  --capture-on USR1 \
+  --save "${capture_dir}" \
+  --save-on USR1 \
   -- /bin/counter \
   >"${run_stdout}" 2>"${run_stderr}" &
 run_pid="$!"
@@ -149,7 +149,7 @@ cat >"${generation_json}" <<'JSON'
 {"run_id":"counter-smoke","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"counter-smoke-batch","vm_id":"spore-counter-smoke-7","generation":7,"resume_entropy_seed":"0123456789abcdef0123456789abcdef"}
 JSON
 
-"${spore_bin}" resume --events=jsonl --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" \
+"${spore_bin}" attach --events=jsonl --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" \
   >"${generation_resume_stdout}" 2>"${generation_resume_stderr}" &
 resume_pid="$!"
 
@@ -171,10 +171,10 @@ resume_pid=""
 if [[ "${seen_generation}" != "1" ]]; then
   cat "${generation_resume_stdout}" >&2 || true
   cat "${generation_resume_stderr}" >&2 || true
-  die "spore resume --generation did not inject guest fan-out identity"
+  die "spore attach --generation did not inject guest fan-out identity"
 fi
-grep -Fq '"event":"ready"' "${generation_resume_stdout}" || die "spore resume --generation --events=jsonl did not emit ready"
-grep -Fq '"event":"stdout"' "${generation_resume_stdout}" || die "spore resume --generation --events=jsonl did not emit stdout"
+grep -Fq '"event":"ready"' "${generation_resume_stdout}" || die "spore attach --generation --events=jsonl did not emit ready"
+grep -Fq '"event":"stdout"' "${generation_resume_stdout}" || die "spore attach --generation --events=jsonl did not emit stdout"
 
 if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" resume --events=jsonl --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" --name "${named_vm}" \
   >"${named_resume_stdout}" 2>"${named_resume_stderr}"; then

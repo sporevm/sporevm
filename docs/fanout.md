@@ -1,6 +1,6 @@
 # Fan-Out
 
-`spore fork` mints local child spores, and `spore fanout` resumes those children
+`spore fork` mints local child spores, and `spore fanout` attaches those children
 with prefixed output:
 
 ```bash
@@ -13,18 +13,18 @@ chunk store. `spore fanout` is local orchestration over child spore directories;
 distributed offset/range partitioning is deferred.
 
 `spore fork` preserves the source spore's manifest version and vCPU count. A
-source captured with `--vcpus 4` mints children that also resume with 4 vCPUs;
+source saved with `--vcpus 4` mints children that also restore with 4 vCPUs;
 fork does not downshift an already-booted guest to a smaller CPU topology.
 
-Fan-out resumes the captured process session. Machine-only checkpoints can
+Fan-out attaches to the saved process session. Machine-only spores can
 still start new commands with `spore run --from`, but they cannot fan out the
 original command stream:
 
-| Checkpoint source | Sessions | Good for fanout | Good for `run --from <cmd>` |
+| Spore source | Sessions | Good for fanout | Good for `run --from <cmd>` |
 | --- | --- | --- | --- |
-| `spore suspend NAME` | none | no | yes |
-| `spore run --capture` | captured session | yes | yes |
-| `spore fork checkpoint` | inherits parent | if parent has one | yes |
+| `spore save NAME --stop` | none | no | yes |
+| `spore run --save` | saved session | yes | yes |
+| `spore fork base.spore` | inherits parent | if parent has one | yes |
 | `spore unpack bundle --child N` | inherits bundled child | if child has one | yes |
 
 If the parent manifest declares bound services, fan-out supplies one fresh host
@@ -41,8 +41,8 @@ are not written into child manifests.
 When the parent has a proof-validated local `ram.backing` file, `spore fork`
 hard-links that file into each child and writes a child-local
 `ram.backing.proof`. If the parent proof is missing or stale, children omit
-backing metadata and resume from chunks. `spore fanout` does not need a trust
-flag or special mode: each child uses normal product restore (`spore resume`, or
+backing metadata and restore from chunks. `spore fanout` does not need a trust
+flag or special mode: each child uses normal product attach (`spore attach`, or
 `spore run --from` for run/rootfs children), which maps local backing only when
 the proof validates and otherwise restores from verified chunks.
 
@@ -84,13 +84,13 @@ resumes. `fork_index` and `fork_count` are batch-local metadata and match the
 parallel fields for this local-only slice. Do not infer global shard positions
 from these fields.
 
-For live captures, already-running processes do not get a new environment block
-on resume. `/run/sporevm` is a runtime metadata surface backed by guest runtime
-state, not rootfs image content; a live snapshot can contain older files until
-the guest agent refreshes them from the generation device. Workloads that need
+For live saves, already-running processes do not get a new environment block
+on attach. `/run/sporevm` is a runtime metadata surface backed by guest runtime
+state, not rootfs image content; a live save can contain older files until the
+guest agent refreshes them from the generation device. Workloads that need
 shard identity must read `/run/sporevm/env` or `/run/sporevm/generation.json`
 after fan-out and wait for child generation metadata before starting sharded
-work. For a parent captured before `spore fork`, a practical barrier is to
+work. For a parent saved before `spore fork`, a practical barrier is to
 require `SPORE_FORK_BATCH_ID`, `SPORE_PARALLEL_JOB`,
 `SPORE_PARALLEL_JOB_COUNT`, and `SPORE_GENERATION >
 SPORE_PARENT_GENERATION`. Harnesses that can read the child manifest can compare
@@ -102,19 +102,18 @@ process-local RNG state copied from the parent, so entropy-sensitive workloads
 must reexec, reseed their own runtime, or wait behind an application-level
 after-restore hook before generating secrets.
 
-`spore fanout` orchestrates child resumes and prefixes output. It does not prove
+`spore fanout` orchestrates child attaches and prefixes output. It does not prove
 that arbitrary already-running workloads consumed the metadata; workload
 harnesses own the identity-before-work barrier. `spore run --from` remains the
 completed-base path for starting a fresh command inside a child spore.
 
-## Single-Child Resume Identity
+## Single-Child Attach Identity
 
-Fleet adapters that materialize one child and call `spore resume` directly can
+Fleet adapters that materialize one child and call `spore attach` directly can
 inject the same guest-visible identity surface without running local fan-out:
 
 ```bash
-spore resume child.spore \
-  --name sporevm-child-42 \
+spore attach child.spore \
   --generation generation.json \
   --events=jsonl
 ```

@@ -81,8 +81,8 @@ ruby_args=(
 "${spore_bin}" run \
   --backend "${backend}" \
   --image "${resolved_image_ref}" \
-  --capture "${capture_dir}" \
-  --capture-on USR1 \
+  --save "${capture_dir}" \
+  --save-on USR1 \
   -- "${ruby_args[@]}" \
   >"${run_stdout}" 2>"${run_stderr}" &
 run_pid="$!"

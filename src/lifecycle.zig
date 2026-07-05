@@ -110,7 +110,7 @@ const create_usage =
     \\                          With --net, declare a guest-local Unix service
     \\  --forward 127.0.0.1:HOST_PORT:GUEST_PORT
     \\                          With --net, forward host loopback TCP to a guest port
-    \\  --annotation KEY=VALUE  Add a create-time annotation to captured manifests
+    \\  --annotation KEY=VALUE  Add a create-time annotation to saved manifests
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
@@ -161,14 +161,18 @@ const rm_usage =
     \\
 ;
 
-const suspend_usage =
+const save_usage =
     \\Usage:
-    \\  spore suspend NAME --out DIR
+    \\  spore save NAME --out DIR [--stop]
     \\
     \\Options:
-    \\  --out DIR              Write a spore checkpoint to DIR
-    \\  --annotation KEY=VALUE Merge an annotation into the checkpoint manifest
+    \\  --out DIR              Write a spore to DIR
+    \\  --stop                 Stop and remove the named VM after saving
+    \\  --annotation KEY=VALUE Merge an annotation into the spore manifest
     \\  -h, --help             Show this help
+    \\
+    \\By default save is non-destructive: the named VM keeps running. Use
+    \\--stop when you want a consuming save that removes the named VM.
     \\
 ;
 
@@ -184,16 +188,24 @@ const fork_usage =
     \\  --name PATTERN        Child VM name or pattern, e.g. worker-%d
     \\  -h, --help            Show this help
     \\
+    \\Notes:
+    \\  Live --vm fork does not support disk-backed, --image, or --rootfs VMs yet.
+    \\
+    \\Workflow:
+    \\  spore run --save base.spore --save-on TERM 'while true; do echo tick; sleep 1; done'
+    \\  spore fork base.spore --count 2 --out children
+    \\  spore fanout children --for 10s
+    \\
 ;
 
-const resume_usage =
+const restore_usage =
     \\Usage:
-    \\  spore resume DIR --name NAME
+    \\  spore restore DIR --name NAME
     \\
     \\Options:
-    \\  --backend auto|hvf|kvm  Backend to run (default: captured lifecycle metadata)
-    \\  --generation FILE       Inject fan-out identity JSON before resume
-    \\  --name NAME            Name for the resumed VM
+    \\  --backend auto|hvf|kvm  Backend to run (default: saved lifecycle metadata)
+    \\  --generation FILE       Inject fan-out identity JSON before restore
+    \\  --name NAME            Name for the restored VM
     \\  --bind-service NAME=unix:/path.sock
     \\                         Bind a manifest-declared service to a host socket
     \\  --events=jsonl         Emit lifecycle events as JSONL on stdout
@@ -414,9 +426,10 @@ const ExecOptions = struct {
     tty: bool = false,
 };
 
-const SuspendOptions = struct {
+const SaveOptions = struct {
     name: []const u8,
     out_dir: []const u8,
+    stop: bool = false,
     annotations: spore.Annotations = .{},
 };
 
@@ -526,6 +539,7 @@ pub const NamedLifecycleResult = struct {
     pid: ?i64 = null,
     console_log_path: ?[]const u8 = null,
     spore_dir: ?[]const u8 = null,
+    saved_sessions: ?usize = null,
 };
 
 pub const ExecNamedResult = struct {
@@ -907,7 +921,7 @@ pub fn resumeNamed(
     var ready = try readReady(arena, init.io, paths);
     defer ready.deinit();
     return ownedNamedLifecycleResult(allocator, .{
-        .action = "resumed",
+        .action = "restored",
         .name = spec.name,
         .state = "ready",
         .pid = ready.value.pid,
@@ -1122,6 +1136,41 @@ pub fn snapshotNamed(
     });
 }
 
+pub fn saveNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: SnapshotNamedOptions,
+) !NamedLifecycleResult {
+    clearLastError();
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const out_dir = try resolveNewOutputDirApi(arena, context.io, options.out_dir);
+    const temp_dir = try temporarySiblingOutputDir(arena, context.io, out_dir);
+    var cleanup_temp = true;
+    defer if (cleanup_temp) Io.Dir.cwd().deleteTree(context.io, temp_dir) catch {};
+
+    const snapshot = try snapshotNamed(context, allocator, .{
+        .name = options.name,
+        .out_dir = temp_dir,
+        .continue_after = options.continue_after,
+        .annotations = options.annotations,
+    });
+    defer deinitNamedLifecycleResult(allocator, snapshot);
+
+    try Io.Dir.renameAbsolute(temp_dir, out_dir, context.io);
+    cleanup_temp = false;
+    return ownedNamedLifecycleResult(allocator, .{
+        .action = "saved",
+        .name = options.name,
+        .state = "ready",
+        .pid = snapshot.pid,
+        .spore_dir = out_dir,
+    });
+}
+
 pub fn suspendNamed(
     context: Context,
     allocator: std.mem.Allocator,
@@ -1162,15 +1211,21 @@ pub fn suspendNamed(
         suspend_spec.annotations = manifest.value.annotations;
     }
     try writeSporeLifecycleSpec(arena, context.io, out_dir, suspend_spec);
+    const saved_sessions: usize = blk: {
+        var manifest = spore.loadManifest(arena, out_dir) catch break :blk 0;
+        defer manifest.deinit();
+        break :blk manifest.value.sessions.len;
+    };
     cleanup_after_suspend = false;
     waitForPidExit(ready.value.pid, 5_000);
     try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
     return ownedNamedLifecycleResult(allocator, .{
-        .action = "suspended",
+        .action = "saved_stopped",
         .name = options.name,
-        .state = "checkpointed",
+        .state = "stopped",
         .pid = ready.value.pid,
         .spore_dir = out_dir,
+        .saved_sessions = saved_sessions,
     });
 }
 
@@ -1698,7 +1753,7 @@ pub fn rmCli(
     }
 }
 
-pub fn suspendCli(
+pub fn saveCli(
     init: std.process.Init,
     args: []const []const u8,
     stdout: *Io.Writer,
@@ -1711,40 +1766,57 @@ pub fn suspendCli(
                 init.arena.allocator(),
                 stderr,
                 mode,
-                machine_output.usageInvalidArgument("spore --json suspend does not support help output", "suspend"),
-                "spore --json suspend does not support help output",
+                machine_output.usageInvalidArgument("spore --json save does not support help output", "save"),
+                "spore --json save does not support help output",
             );
         }
-        try stdout.writeAll(suspend_usage);
+        try stdout.writeAll(save_usage);
         return;
     }
     const allocator = init.arena.allocator();
-    const parsed = parseSuspendArgs(args, allocator, stderr, mode);
-    const result = suspendNamed(.{
-        .io = init.io,
-        .environ_map = init.environ_map,
-    }, allocator, .{
-        .name = parsed.name,
-        .out_dir = parsed.out_dir,
-        .annotations = parsed.annotations,
-    }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "suspend", err),
+    const parsed = parseSaveArgs(args, allocator, stderr, mode);
+    const context = Context{ .io = init.io, .environ_map = init.environ_map };
+    const result = (if (parsed.stop)
+        suspendNamed(context, allocator, .{
+            .name = parsed.name,
+            .out_dir = parsed.out_dir,
+            .annotations = parsed.annotations,
+        })
+    else
+        saveNamed(context, allocator, .{
+            .name = parsed.name,
+            .out_dir = parsed.out_dir,
+            .annotations = parsed.annotations,
+        })) catch |err| switch (err) {
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "save", err),
         error.NamedVmNotReady => {
-            const fallback = allocLifecycleMessage(allocator, "spore suspend: VM is not ready: {s}", .{parsed.name});
-            const message = allocLifecycleLastErrorMessage(allocator, "suspend", fallback);
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
+            const fallback = allocLifecycleMessage(allocator, "spore save: VM is not ready: {s}", .{parsed.name});
+            const message = allocLifecycleLastErrorMessage(allocator, "save", fallback);
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "save"), message);
+        },
+        error.UnsupportedSnapshotMode => {
+            const message = "spore save: non-destructive save is not supported for this VM yet; use `spore save NAME --out DIR --stop`";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
+        },
+        error.OutputDirExists => {
+            const message = allocLifecycleMessage(allocator, "spore save: output directory already exists: {s}; choose a new --out DIR", .{parsed.out_dir});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
+        },
+        error.InvalidOutputDir => {
+            const message = allocLifecycleMessage(allocator, "spore save: invalid --out directory: {s}; the parent directory must exist", .{parsed.out_dir});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
         },
         error.MissingRootfsIdentity => {
-            const message = "spore suspend: disk-backed lifecycle suspend requires recorded immutable rootfs identity";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "suspend"), message);
+            const message = "spore save: disk-backed lifecycle save requires recorded immutable rootfs identity";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "save"), message);
         },
         error.MonitorUnavailable, error.MonitorRequestFailed, error.MonitorVersionMismatch => {
             const fallback = switch (err) {
-                error.MonitorUnavailable => allocLifecycleMessage(allocator, "spore suspend: monitor is unavailable for VM: {s}", .{parsed.name}),
-                else => allocLifecycleMessage(allocator, "spore suspend: monitor request failed for VM {s}: {s}", .{ parsed.name, @errorName(err) }),
+                error.MonitorUnavailable => allocLifecycleMessage(allocator, "spore save: monitor is unavailable for VM: {s}", .{parsed.name}),
+                else => allocLifecycleMessage(allocator, "spore save: monitor request failed for VM {s}: {s}", .{ parsed.name, @errorName(err) }),
             };
-            const message = allocLifecycleLastErrorMessage(allocator, "suspend", fallback);
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "suspend"), message);
+            const message = allocLifecycleLastErrorMessage(allocator, "save", fallback);
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "save"), message);
         },
         else => |e| return e,
     };
@@ -1842,7 +1914,7 @@ pub fn forkCli(
     }
 }
 
-pub fn resumeCli(
+pub fn restoreCli(
     init: std.process.Init,
     args: []const []const u8,
     stdout: *Io.Writer,
@@ -1855,17 +1927,17 @@ pub fn resumeCli(
                 init.arena.allocator(),
                 stderr,
                 mode,
-                machine_output.usageInvalidArgument("spore --json resume does not support help output", "resume"),
-                "spore --json resume does not support help output",
+                machine_output.usageInvalidArgument("spore --json restore does not support help output", "restore"),
+                "spore --json restore does not support help output",
             );
         }
-        try stdout.writeAll(resume_usage);
+        try stdout.writeAll(restore_usage);
         return;
     }
     const allocator = init.arena.allocator();
     const parsed = parseResumeArgs(args, allocator, stderr, mode);
     const full_args = try init.minimal.args.toSlice(allocator);
-    var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "resume");
+    var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "restore");
     if (parsed.event_mode == .jsonl) try event_writer.emitStart(parsed.backend orelse .auto);
     const result = resumeNamed(init, allocator, .{
         .spore_dir = parsed.spore_dir,
@@ -1878,74 +1950,74 @@ pub fn resumeCli(
         emitResumeFailureEvent(&event_writer, parsed.event_mode, err);
         switch (err) {
             error.BadGenerationPayload => {
-                const message = "spore resume: invalid --generation payload; required JSON fields: run_id, child_id, parallel_index, parallel_count, fork_index, fork_count, fork_batch_id, vm_id";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+                const message = "spore restore: invalid --generation payload; required JSON fields: run_id, child_id, parallel_index, parallel_count, fork_index, fork_count, fork_batch_id, vm_id";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             },
             error.GenerationPayloadTooLarge => {
-                const message = allocLifecycleMessage(allocator, "spore resume: --generation payload exceeds {d} bytes", .{generation.params_size});
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+                const message = allocLifecycleMessage(allocator, "spore restore: --generation payload exceeds {d} bytes", .{generation.params_size});
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             },
             error.GenerationFileNotFound, error.GenerationFileInvalid => {
-                const message = allocLifecycleMessage(allocator, "spore resume: cannot read --generation {s}: {s}", .{ parsed.generation_path orelse "", @errorName(err) });
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+                const message = allocLifecycleMessage(allocator, "spore restore: cannot read --generation {s}: {s}", .{ parsed.generation_path orelse "", @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             },
-            error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "resume", err),
+            error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "restore", err),
             error.FileNotFound => {
-                const message = "spore resume: spore directory is not available";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "resume"), message);
+                const message = "spore restore: spore directory is not available";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "restore"), message);
             },
             error.InvalidSporeDir => {
-                const message = allocLifecycleMessage(allocator, "spore resume: invalid spore directory: {s}", .{parsed.spore_dir});
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+                const message = allocLifecycleMessage(allocator, "spore restore: invalid spore directory: {s}", .{parsed.spore_dir});
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.InvalidNetworkPolicy => {
-                const message = "spore resume: invalid network policy in manifest";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+                const message = "spore restore: invalid network policy in manifest";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.MissingBoundServiceBinding => {
-                const message = "spore resume: manifest requires live bound Unix service bindings";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+                const message = "spore restore: manifest requires live bound Unix service bindings";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.UnexpectedBoundServiceBinding => {
-                const message = "spore resume: live bound Unix service bindings do not match the manifest";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+                const message = "spore restore: live bound Unix service bindings do not match the manifest";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.DuplicateBoundServiceBinding => {
-                const message = "spore resume: duplicate live bound Unix service binding";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+                const message = "spore restore: duplicate live bound Unix service binding";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.InvalidBoundService, error.InvalidBoundServiceTarget, error.UnsupportedBoundServiceTarget => {
-                const message = "spore resume: invalid live bound Unix service binding";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+                const message = "spore restore: invalid live bound Unix service binding";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.UnsupportedLifecycleDeviceModel => {
-                const message = "spore resume: unsupported lifecycle device model";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+                const message = "spore restore: unsupported lifecycle device model";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.InvalidMemorySize => {
-                const message = "spore resume: invalid spore memory size";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+                const message = "spore restore: invalid spore memory size";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.InvalidLifecycleMetadata => {
-                const message = "spore resume: invalid lifecycle metadata";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+                const message = "spore restore: invalid lifecycle metadata";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.UnsupportedLifecycleMetadata => {
-                const message = "spore resume: lifecycle metadata does not match the spore topology";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
+                const message = "spore restore: lifecycle metadata does not match the spore topology";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.HostUnsupported => {
-                const message = "spore resume: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "resume"), message);
+                const message = "spore restore: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "restore"), message);
             },
             error.NamedVmExists => {
-                const fallback = allocLifecycleMessage(allocator, "spore resume: VM already exists or has stale state: {s}", .{parsed.name});
-                const message = allocLifecycleLastErrorMessage(allocator, "resume", fallback);
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+                const fallback = allocLifecycleMessage(allocator, "spore restore: VM already exists or has stale state: {s}", .{parsed.name});
+                const message = allocLifecycleLastErrorMessage(allocator, "restore", fallback);
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             },
             error.MonitorReadyTimeout, error.MonitorVersionMismatch, error.SporeExecutableVersionUnavailable => {
-                const message = allocLifecycleLastErrorMessage(allocator, "resume", "spore resume: timed out waiting for monitor readiness");
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "resume"), message);
+                const message = allocLifecycleLastErrorMessage(allocator, "restore", "spore restore: timed out waiting for monitor readiness");
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "restore"), message);
             },
             else => |e| return e,
         }
@@ -2091,11 +2163,29 @@ pub const max_control_socket_path_len: usize = if (builtin.os.tag.isDarwin()) 10
 /// only spawn and connect enforce the limit, not path construction.
 pub fn validateControlSocketPath(path: []const u8) error{ControlSocketPathTooLong}!void {
     if (path.len <= max_control_socket_path_len) return;
-    setLastError(
-        "control socket path {s} is {d} bytes but the platform limit is {d}; shorten the VM name or set {s} to a shorter path",
-        .{ path, path.len, max_control_socket_path_len, runtime_dir_env },
-    );
+    if (maxVmNameBytesForControlSocketPath(path)) |max_vm_name_bytes| {
+        setLastError(
+            "control socket path {s} is {d} bytes but the platform limit is {d}; this runtime dir allows VM names up to {d} bytes; shorten the VM name or set {s} to a shorter path",
+            .{ path, path.len, max_control_socket_path_len, max_vm_name_bytes, runtime_dir_env },
+        );
+    } else {
+        setLastError(
+            "control socket path {s} is {d} bytes but the platform limit is {d}; shorten the VM name or set {s} to a shorter path",
+            .{ path, path.len, max_control_socket_path_len, runtime_dir_env },
+        );
+    }
     return error.ControlSocketPathTooLong;
+}
+
+fn maxVmNameBytesForControlSocketPath(path: []const u8) ?usize {
+    const suffix = "/" ++ control_socket_file;
+    if (!std.mem.endsWith(u8, path, suffix)) return null;
+    const vm_dir = path[0 .. path.len - suffix.len];
+    const slash = std.mem.lastIndexOfScalar(u8, vm_dir, '/') orelse return null;
+    const name_len = vm_dir.len - slash - 1;
+    const fixed_len = path.len - name_len;
+    if (fixed_len > max_control_socket_path_len) return 0;
+    return @min(max_name_len, max_control_socket_path_len - fixed_len);
 }
 
 /// Build a validated control socket address for connecting to a monitor.
@@ -2906,31 +2996,34 @@ fn parseRmArgs(args: []const []const u8, allocator: std.mem.Allocator, stderr: *
     return args[0];
 }
 
-fn parseSuspendArgs(
+fn parseSaveArgs(
     args: []const []const u8,
     allocator: std.mem.Allocator,
     stderr: *Io.Writer,
     mode: machine_output.Mode,
-) SuspendOptions {
+) SaveOptions {
     var name: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
+    var stop = false;
     var annotations = spore.Annotations{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out")) {
-            out_dir = takeValueLifecycleCli(allocator, stderr, mode, "suspend", args, &i, args[i]);
+            out_dir = takeValueLifecycleCli(allocator, stderr, mode, "save", args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--stop")) {
+            stop = true;
         } else if (std.mem.eql(u8, args[i], "--annotation")) {
-            addAnnotationArgLifecycleCli(allocator, stderr, mode, "suspend", &annotations, takeValueLifecycleCli(allocator, stderr, mode, "suspend", args, &i, args[i]));
+            addAnnotationArgLifecycleCli(allocator, stderr, mode, "save", &annotations, takeValueLifecycleCli(allocator, stderr, mode, "save", args, &i, args[i]));
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            const message = allocLifecycleMessage(allocator, "unknown suspend argument: {s}", .{args[i]});
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "suspend"), message);
+            const message = allocLifecycleMessage(allocator, "unknown save argument: {s}", .{args[i]});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
         } else if (name == null) {
-            validateNameLifecycleCli(allocator, stderr, mode, "suspend", args[i]);
+            validateNameLifecycleCli(allocator, stderr, mode, "save", args[i]);
             name = args[i];
         } else {
-            const message = allocLifecycleMessage(allocator, "unexpected suspend argument: {s}", .{args[i]});
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "suspend"), message);
+            const message = allocLifecycleMessage(allocator, "unexpected save argument: {s}", .{args[i]});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
         }
     }
 
@@ -2939,11 +3032,11 @@ fn parseSuspendArgs(
             allocator,
             stderr,
             mode,
-            machine_output.usageMissingArgument("usage: spore suspend NAME --out DIR", "suspend"),
-            suspend_usage,
+            machine_output.usageMissingArgument("usage: spore save NAME --out DIR [--stop]", "save"),
+            save_usage,
         );
     }
-    return .{ .name = name.?, .out_dir = out_dir.?, .annotations = annotations };
+    return .{ .name = name.?, .out_dir = out_dir.?, .stop = stop, .annotations = annotations };
 }
 
 fn parseForkArgs(
@@ -3012,56 +3105,56 @@ fn parseResumeArgs(
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--backend")) {
-            const raw = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, arg);
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
             backend = run_mod.Backend.parse(raw) orelse {
                 const message = "--backend must be auto, hvf, or kvm";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             };
         } else if (std.mem.startsWith(u8, arg, "--backend=")) {
             const raw = arg["--backend=".len..];
             backend = run_mod.Backend.parse(raw) orelse {
                 const message = "--backend must be auto, hvf, or kvm";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             };
         } else if (std.mem.eql(u8, arg, "--generation")) {
-            generation_path = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, arg);
+            generation_path = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
         } else if (std.mem.startsWith(u8, arg, "--generation=")) {
             generation_path = arg["--generation=".len..];
         } else if (std.mem.eql(u8, arg, "--events")) {
-            const raw = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, arg);
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
             event_mode = run_mod.EventMode.parse(raw) orelse {
                 const message = "--events must be jsonl";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             };
         } else if (std.mem.startsWith(u8, arg, "--events=")) {
             const raw = arg["--events=".len..];
             event_mode = run_mod.EventMode.parse(raw) orelse {
                 const message = "--events must be jsonl";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             };
         } else if (std.mem.eql(u8, arg, "--name")) {
-            name = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, arg);
-            validateNameLifecycleCli(allocator, stderr, mode, "resume", name.?);
+            name = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
+            validateNameLifecycleCli(allocator, stderr, mode, "restore", name.?);
         } else if (std.mem.startsWith(u8, arg, "--name=")) {
             name = arg["--name=".len..];
-            validateNameLifecycleCli(allocator, stderr, mode, "resume", name.?);
+            validateNameLifecycleCli(allocator, stderr, mode, "restore", name.?);
         } else if (std.mem.eql(u8, arg, "--bind-service")) {
-            const raw = takeValueLifecycleCli(allocator, stderr, mode, "resume", args, &i, arg);
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
             bound_services.append(spore_net_policy.parseBoundServiceBinding(raw) catch |err| {
-                const message = allocLifecycleMessage(allocator, "spore resume: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+                const message = allocLifecycleMessage(allocator, "spore restore: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             }) catch |err| {
-                const message = allocLifecycleMessage(allocator, "spore resume: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+                const message = allocLifecycleMessage(allocator, "spore restore: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             };
         } else if (std.mem.startsWith(u8, arg, "--")) {
-            const message = allocLifecycleMessage(allocator, "unknown resume argument: {s}", .{arg});
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            const message = allocLifecycleMessage(allocator, "unknown restore argument: {s}", .{arg});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
         } else if (spore_dir == null) {
             spore_dir = arg;
         } else {
-            const message = allocLifecycleMessage(allocator, "unexpected resume argument: {s}", .{arg});
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "resume"), message);
+            const message = allocLifecycleMessage(allocator, "unexpected restore argument: {s}", .{arg});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
         }
     }
 
@@ -3070,8 +3163,8 @@ fn parseResumeArgs(
             allocator,
             stderr,
             mode,
-            machine_output.usageMissingArgument("usage: spore resume DIR --name NAME", "resume"),
-            resume_usage,
+            machine_output.usageMissingArgument("usage: spore restore DIR --name NAME", "restore"),
+            restore_usage,
         );
     }
     return .{
@@ -3093,10 +3186,39 @@ fn apiPaths(context: Context, allocator: std.mem.Allocator, name: []const u8) !P
 fn resolveNewOutputDirApi(allocator: std.mem.Allocator, io: Io, raw: []const u8) ![]const u8 {
     const path = try std.fs.path.resolve(allocator, &.{raw});
     if (try pathExists(io, path)) return error.OutputDirExists;
-    const parent = std.fs.path.dirname(path) orelse return error.InvalidOutputDir;
-    const stat = try Io.Dir.cwd().statFile(io, parent, .{ .follow_symlinks = true });
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const stat = Io.Dir.cwd().statFile(io, parent, .{ .follow_symlinks = true }) catch |err| switch (err) {
+        error.FileNotFound => return error.InvalidOutputDir,
+        else => |e| return e,
+    };
     if (stat.kind != Io.File.Kind.directory) return error.InvalidOutputDir;
-    return path;
+    if (std.fs.path.isAbsolute(path)) return path;
+    // Output directories cross process boundaries (the monitor receives them
+    // over the control socket and resolves them against its own cwd), so a
+    // relative --out must become absolute before it leaves this process.
+    const abs_parent = try absoluteExistingDirPath(allocator, parent);
+    return std.fs.path.join(allocator, &.{ abs_parent, std.fs.path.basename(path) });
+}
+
+fn absoluteExistingDirPath(allocator: std.mem.Allocator, path: []const u8) error{ OutOfMemory, InvalidOutputDir }![]const u8 {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    var buf: [std.c.PATH_MAX]u8 = undefined;
+    const resolved = std.c.realpath(path_z, &buf) orelse return error.InvalidOutputDir;
+    return allocator.dupe(u8, std.mem.span(resolved));
+}
+
+fn temporarySiblingOutputDir(allocator: std.mem.Allocator, io: Io, out_dir: []const u8) ![]const u8 {
+    const parent = std.fs.path.dirname(out_dir) orelse return error.InvalidOutputDir;
+    const base = std.fs.path.basename(out_dir);
+    const now: u64 = @intCast(Io.Clock.real.now(io).nanoseconds);
+    var attempt: usize = 0;
+    while (attempt < 16) : (attempt += 1) {
+        const name = try std.fmt.allocPrint(allocator, ".{s}.tmp-{x}-{d}", .{ base, now, attempt });
+        const path = try std.fs.path.resolve(allocator, &.{ parent, name });
+        if (!try pathExists(io, path)) return path;
+    }
+    return error.OutputDirExists;
 }
 
 fn resolveExistingSporeDirApi(allocator: std.mem.Allocator, io: Io, raw: []const u8) ![]const u8 {
@@ -3293,10 +3415,17 @@ fn writeNamedForkResult(writer: *Io.Writer, result: NamedForkResult) !void {
 fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !void {
     if (std.mem.eql(u8, result.action, "created")) {
         try writer.print("created vm {s}\n", .{result.name});
-    } else if (std.mem.eql(u8, result.action, "resumed")) {
-        try writer.print("resumed vm {s}\n", .{result.name});
-    } else if (std.mem.eql(u8, result.action, "suspended")) {
-        try writer.print("captured {s}\n", .{result.spore_dir orelse result.name});
+    } else if (std.mem.eql(u8, result.action, "restored")) {
+        try writer.print("restored vm {s}\n", .{result.name});
+    } else if (std.mem.eql(u8, result.action, "saved")) {
+        try writer.print("saved {s}; vm {s} is still running\n", .{ result.spore_dir orelse result.name, result.name });
+    } else if (std.mem.eql(u8, result.action, "saved_stopped")) {
+        try writer.print("saved {s} and stopped vm {s}\n", .{ result.spore_dir orelse result.name, result.name });
+        if ((result.saved_sessions orelse 0) > 0) {
+            try writer.writeAll("spore has a saved session; use `spore attach <spore>` to reconnect, or `spore run --from <spore> ...` to run new commands.\n");
+        } else {
+            try writer.writeAll("spore has no saved session; use `spore run --from <spore> ...` to run new commands, or `spore run --save <spore> --save-on TERM ...` if you want fanout to attach to the original command.\n");
+        }
     } else if (std.mem.eql(u8, result.action, "removed")) {
         try writer.print("removed vm {s}\n", .{result.name});
     } else {
@@ -4338,6 +4467,7 @@ fn ownedNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycl
         .pid = result.pid,
         .console_log_path = console_log_path,
         .spore_dir = spore_dir,
+        .saved_sessions = result.saved_sessions,
     };
 }
 
@@ -5025,6 +5155,7 @@ test "lifecycle rejects control socket paths that overflow sockaddr_un" {
     );
     const message = lastErrorMessage();
     try std.testing.expect(std.mem.indexOf(u8, message, "control socket path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "allows VM names up to") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "shorten the VM name") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, runtime_dir_env) != null);
 
@@ -5180,6 +5311,8 @@ test "lifecycle fork help routes through named fork cli" {
     try std.testing.expect(!wantsHelp(&.{ "bench-1", "--", "/bin/true", "--help" }));
     try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fork <spore-dir> --count N --out DIR") != null);
     try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fork --vm NAME --count N --name PATTERN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fork_usage, "Live --vm fork does not support disk-backed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fanout children --for 10s") != null);
 }
 
 test "lifecycle monitor backend support is explicit" {
@@ -5594,19 +5727,35 @@ test "named network config keeps bare network unrestricted" {
     try std.testing.expect(!config.policy.hasRules());
 }
 
-test "suspend parser accepts annotations" {
+test "new output dirs resolve to absolute paths" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+
+    const resolved = try resolveNewOutputDirApi(arena, io, "lifecycle-test-does-not-exist.spore");
+    try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    try std.testing.expect(std.mem.endsWith(u8, resolved, "/lifecycle-test-does-not-exist.spore"));
+
+    try std.testing.expectError(error.OutputDirExists, resolveNewOutputDirApi(arena, io, "."));
+    try std.testing.expectError(error.InvalidOutputDir, resolveNewOutputDirApi(arena, io, "lifecycle-test-missing-parent/child.spore"));
+}
+
+test "save parser accepts annotations and stop" {
     const allocator = std.testing.allocator;
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
 
-    var opts = parseSuspendArgs(&.{ "bench-1", "--out", "bench-1.spore", "--annotation", "captured=true=1" }, allocator, &stderr.writer, .human);
+    var opts = parseSaveArgs(&.{ "bench-1", "--out", "bench-1.spore", "--stop", "--annotation", "saved=true=1" }, allocator, &stderr.writer, .human);
     defer opts.annotations.deinit(allocator);
     try std.testing.expectEqualStrings("bench-1", opts.name);
     try std.testing.expectEqualStrings("bench-1.spore", opts.out_dir);
-    try std.testing.expectEqualStrings("true=1", opts.annotations.map.get("captured").?);
+    try std.testing.expect(opts.stop);
+    try std.testing.expectEqualStrings("true=1", opts.annotations.map.get("saved").?);
 }
 
-test "named resume parser accepts bound service bindings" {
+test "named restore parser accepts bound service bindings" {
     const allocator = std.testing.allocator;
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
@@ -5619,7 +5768,7 @@ test "named resume parser accepts bound service bindings" {
     try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.bound_services.items[0].target.unix);
 }
 
-test "named resume parser accepts k8s child command product flags" {
+test "named restore parser accepts k8s child command product flags" {
     const allocator = std.testing.allocator;
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
@@ -5632,17 +5781,17 @@ test "named resume parser accepts k8s child command product flags" {
     try std.testing.expectEqualStrings("sporevm-child-42", opts.name);
 }
 
-test "named resume event mode emits terminal run event" {
+test "named restore event mode emits terminal run event" {
     const allocator = std.testing.allocator;
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    var events = run_mod.EventWriter.init(allocator, &out.writer, "resume");
+    var events = run_mod.EventWriter.init(allocator, &out.writer, "restore");
     try events.emitStart(.kvm);
     try emitNamedResumeExit(&events, .kvm);
 
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"event\":\"exit\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"command\":\"resume\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"command\":\"restore\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"exit_code\":0") != null);
 }
 
@@ -5824,12 +5973,39 @@ test "lifecycle human results render terse status lines" {
 
     out.clearRetainingCapacity();
     try writeNamedLifecycleResult(&out.writer, .{
-        .action = "suspended",
+        .action = "saved",
         .name = "counter",
         .state = "ready",
         .spore_dir = "counter.spore",
     });
-    try std.testing.expectEqualStrings("captured counter.spore\n", out.written());
+    try std.testing.expectEqualStrings("saved counter.spore; vm counter is still running\n", out.written());
+
+    out.clearRetainingCapacity();
+    try writeNamedLifecycleResult(&out.writer, .{
+        .action = "saved_stopped",
+        .name = "counter",
+        .state = "stopped",
+        .spore_dir = "counter.spore",
+    });
+    try std.testing.expectEqualStrings(
+        "saved counter.spore and stopped vm counter\n" ++
+            "spore has no saved session; use `spore run --from <spore> ...` to run new commands, or `spore run --save <spore> --save-on TERM ...` if you want fanout to attach to the original command.\n",
+        out.written(),
+    );
+
+    out.clearRetainingCapacity();
+    try writeNamedLifecycleResult(&out.writer, .{
+        .action = "saved_stopped",
+        .name = "counter",
+        .state = "stopped",
+        .spore_dir = "counter.spore",
+        .saved_sessions = 1,
+    });
+    try std.testing.expectEqualStrings(
+        "saved counter.spore and stopped vm counter\n" ++
+            "spore has a saved session; use `spore attach <spore>` to reconnect, or `spore run --from <spore> ...` to run new commands.\n",
+        out.written(),
+    );
 
     out.clearRetainingCapacity();
     try writeNamedForkResult(&out.writer, .{
