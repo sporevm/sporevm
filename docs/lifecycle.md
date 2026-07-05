@@ -172,11 +172,17 @@ handles.
 ## Saves And Forks
 
 `spore save NAME --out DIR` writes a spore and leaves the named VM running.
-Non-destructive save currently requires a single-vCPU VM; multi-vCPU named VMs
-must use `--stop`. `spore save NAME --out DIR --stop` writes a spore and
-removes the named VM from the runtime registry. Repeated `--annotation
-KEY=VALUE` flags merge save-time annotations into the manifest without
-dropping create-time annotations:
+Non-destructive save supports both single-vCPU and multi-vCPU named VMs on every
+supported backend (KVM and HVF), for diskless, image-created writable rootfs, and
+explicit `--rootfs PATH` VMs: the monitor quiesces every vCPU at one barrier,
+captures manifest-v1 machine state, and resumes the guest. As with `--stop` and
+live fork, KVM writes a portable multi-vCPU spore while HVF writes a
+same-backend spore that restores only on HVF. `spore save NAME --out DIR --stop`
+writes a spore and removes the named VM from the runtime registry. A failed save
+leaves no partial spore at `--out`; if the capture itself fails, the monitor
+stops the VM and the command reports the error (parity with single-vCPU save).
+Repeated `--annotation KEY=VALUE` flags merge save-time annotations into the
+manifest without dropping create-time annotations:
 
 ```bash
 spore save bench-1 --out bench-1.spore --stop --annotation saved=true

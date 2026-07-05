@@ -310,24 +310,29 @@ seal, both shipping today, but must be proven by the extended smoke.
   `SPORE_SMOKE_NAMED_LIFECYCLE` block or a sibling block) and update the
   `smoke:multi-vcpu` task description in `mise.toml`:
   Diskless case:
-  1. `spore create` a multi-vCPU named VM running a ticking workload
+  1. `spore create` a multi-vCPU exec-ready named VM, `spore save NAME --out
+     DIR` **without** `--stop`, assert the source remains registered, restore
+     the spore as `NAME2` while the source remains alive, and assert `nproc`
+     equals the original vCPU count.
+  2. `spore create` a multi-vCPU named VM running a ticking workload
      (monotonic counter to a file, like the fork counter example).
-  2. `spore save NAME --out DIR` **without** `--stop`.
-  3. Assert the VM is still registered/running and still ticking (compare a
+  3. `spore save NAME --out DIR` **without** `--stop`.
+  4. Assert the VM is still registered/running and still ticking (compare a
      later tick to an earlier one via `spore exec`).
-  4. `spore restore DIR --name NAME2` and assert `nproc` equals the original
-     vCPU count and the restored VM ticks.
-  5. Assert single-vCPU non-destructive save is unchanged (regression).
+  5. Remove the source VM, then `spore restore DIR --name NAME2` and assert
+     the saved manifest records the original vCPU count and the restored VM
+     ticks.
+  6. Assert single-vCPU non-destructive save is unchanged (regression).
 
   Disk-backed case (this is the one genuinely new combination — do not skip):
-  6. `spore create` a multi-vCPU named VM with `--image` (writable rootfs) and,
+  7. `spore create` a multi-vCPU named VM with `--image` (writable rootfs) and,
      separately, with `--rootfs PATH` (exact artifact), running a workload that
      writes to disk.
-  7. `spore save NAME --out DIR` without `--stop`, then have the guest write
+  8. `spore save NAME --out DIR` without `--stop`, then have the guest write
      *more* to disk (`spore exec`), then `spore restore DIR --name NAME2` and
      assert the restored VM sees exactly the point-in-time disk contents (the
      post-save writes must NOT appear in the restored spore).
-  8. Take a **second** non-destructive save of the same still-running VM to
+  9. Take a **second** non-destructive save of the same still-running VM to
      exercise the idempotent re-seal path (`sealDisk` never clears the live
      head's dirty flags), and assert both saved spores restore correctly.
 - Run the smoke on real hardware for every platform; report which platforms were
@@ -374,24 +379,26 @@ Slice landed (`feat: multi-vCPU non-destructive spore save`):
   longer claims multi-vCPU is unsupported (that arm is now only reachable for a
   non-CLI `continue_after == false` request).
 - `scripts/smoke-multi-vcpu.sh` + `mise.toml`: the `SPORE_SMOKE_NAMED_LIFECYCLE`
-  block now creates a multi-vCPU named VM running a `/tick` shell workload, saves
-  it **without** `--stop`, asserts the source VM is still registered (`spore ls`)
-  and still ticking, restores the spore under a new name, and asserts the
-  restored VM reports the right `nproc` and keeps ticking. The single-vCPU
-  regression and `save --stop` paths are retained unchanged.
+  block now saves an exec-ready multi-vCPU named VM **without** `--stop`,
+  restores it under a second name while the source remains alive, and asserts
+  the restored VM reports the right `nproc`. It also creates a multi-vCPU VM
+  running a `/tick` shell workload, saves it without `--stop`, asserts the
+  source VM is still registered (`spore ls`) and still ticking, removes the
+  source, restores the saved spore, and asserts the restored VM keeps ticking
+  from the captured workload state. The single-vCPU regression and `save --stop`
+  paths are retained unchanged.
 - Docs: `docs/lifecycle.md` support matrix updated;
   `docs/plans/spore-naming-cli-ux.md` Deferred Work marked landed.
 
-Verified: `mise run build` and `mise run test` green (state-portability/lifecycle
-unit tests unaffected; the only failing unit test on an x86-64 dev host is the
-pre-existing `HostUnsupported` case that requires an aarch64 KVM / Apple HVF
-host, unrelated to this change).
-
-**Not runnable in the current dev orb (x86-64 Linux):** all backend run paths and
-`scripts/smoke-multi-vcpu.sh` require an aarch64 KVM host or Apple Silicon HVF
-host (`Backend.supportedOnHost` is compile-gated to aarch64). The extended smoke
-and the pause-duration measurements must be run on real hardware for each
-backend before release; report which platforms were exercised.
+Verified during implementation: `mise run build` and `mise run test` green.
+Follow-up local Apple Silicon HVF testing on 2026-07-06 exercised the
+non-destructive save path directly: exec-ready multi-vCPU save restores while
+the source remains alive, active-workload multi-vCPU save leaves the source
+registered and ticking after save, and the saved active workload restores after
+the source is removed. After PR #375 stabilized restored file-stdio starts, the
+full `SPORE_SMOKE_NAMED_LIFECYCLE=1 mise run smoke:multi-vcpu` task passes
+repeatedly on Apple Silicon HVF. ARM64 KVM real-hardware coverage and
+pause-duration measurements still need to land before release.
 
 Follow-up (not blocking this slice):
 
@@ -406,6 +413,12 @@ Follow-up (not blocking this slice):
   image/rootfs infra) and should land on real hardware.
 - Pause-duration measurement for a small explicit `--memory` guest and the
   default `--memory auto` (16 GiB) case, recorded in the PR.
+- Concurrent restore of an active multi-vCPU workload while the source VM keeps
+  running. Local HVF testing on 2026-07-06 found the saved artifact restores
+  cleanly after removing the source, but source-and-restored active copies
+  running side by side can leave the restored monitor unable to complete
+  `spore exec` (`MonitorRequestFailed`). Treat that as a separate restore/fork
+  correctness investigation rather than proof for this enablement slice.
 
 ## Deferred / Out Of Scope
 

@@ -428,9 +428,11 @@ transition.
 
 ## Deferred Work
 
-- Multi-vCPU non-destructive named `save` can follow after the first public
-  rename. The single rename PR should fail closed instead of silently falling
-  back to a consuming save.
+- Multi-vCPU non-destructive named `save` — **landed.** The rename PR failed
+  closed with `error.UnsupportedSnapshotMode`; the follow-up removed that
+  vCPU gate in `saveContinueNamed` because both KVM and HVF already implement
+  multi-vCPU snapshot-and-continue (the same path `spore fork --vm` uses). See
+  `docs/plans/multi-vcpu-nondestructive-save.md`.
 - Consider a future `inspect` schema change that reports `VM state` and storage
   mode more explicitly in JSON, after the human output model lands.
 

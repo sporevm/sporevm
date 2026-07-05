@@ -82,7 +82,7 @@ description = "Smoke product spore run signal save and attach"
 
 [tasks."smoke:multi-vcpu"]
 run = "mise run build && scripts/smoke-multi-vcpu.sh"
-description = "Smoke multi-vCPU boot, save, run-from, and attach"
+description = "Smoke multi-vCPU boot, save, run-from, attach, and (with SPORE_SMOKE_NAMED_LIFECYCLE=1) non-destructive named save while still ticking"
 
 [tasks."smoke:lifecycle"]
 run = "mise run build && scripts/smoke-lifecycle.sh"

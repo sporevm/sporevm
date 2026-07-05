@@ -78,6 +78,28 @@ expect_nproc_equals() {
   }
 }
 
+# expect_still_ticking NAME PREFIX -> assert the guest counter advances, proving
+# the VM is still running and executing the workload.
+expect_still_ticking() {
+  local name="$1"
+  local prefix="$2"
+  local out="${workdir}/${prefix}-tick"
+  local before after numbers
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${name}" -- /bin/sh -c 'before="$(cat /tick)"; sleep 3; after="$(cat /tick)"; echo "$before $after"' \
+    >"${out}" 2>"${out}.err" || {
+    cat "${out}" >&2 || true
+    cat "${out}.err" >&2 || true
+    die "failed to observe /tick progress from ${name}"
+  }
+  numbers="$(tr -cs '0-9' ' ' <"${out}")"
+  read -r before after <<<"${numbers}"
+  [[ -n "${before}" && -n "${after}" ]] || {
+    cat "${out}" >&2 || true
+    die "no numeric tick pair observed from ${name}"
+  }
+  (( after > before )) || die "${name} is not ticking (before=${before} after=${after})"
+}
+
 backend="$(infer_backend)"
 case "${backend}" in
   hvf|kvm) ;;
@@ -255,6 +277,84 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   fi
   expect_nproc_equals "${workdir}/forked-nproc.stdout"
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${forked_name}" >/dev/null
+
+  # Non-destructive multi-vCPU save for an exec-ready VM: save it WITHOUT
+  # --stop, confirm the source VM remains registered, then restore the saved
+  # spore under a second name while the source is still alive.
+  concurrent_name="${vm_name}-saved"
+  concurrent_dir="${workdir}/named-live.spore"
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" save "${vm_name}" --out "${concurrent_dir}" >"${workdir}/named-live-save.stdout" 2>"${workdir}/named-live-save.stderr"; then
+    cat "${workdir}/named-live-save.stdout" >&2 || true
+    cat "${workdir}/named-live-save.stderr" >&2 || true
+    die "multi-vCPU named non-destructive save failed"
+  fi
+  expect_manifest_v1 "${concurrent_dir}"
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" ls >"${workdir}/named-live-ls.stdout" 2>"${workdir}/named-live-ls.stderr"; then
+    cat "${workdir}/named-live-ls.stdout" >&2 || true
+    cat "${workdir}/named-live-ls.stderr" >&2 || true
+    die "spore ls failed after multi-vCPU named non-destructive save"
+  fi
+  grep -Fq "${vm_name}" "${workdir}/named-live-ls.stdout" || {
+    cat "${workdir}/named-live-ls.stdout" >&2 || true
+    die "non-destructive save removed ${vm_name} from the registry"
+  }
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" restore "${concurrent_dir}" --name "${concurrent_name}" >"${workdir}/named-live-restore.stdout" 2>"${workdir}/named-live-restore.stderr"; then
+    cat "${workdir}/named-live-restore.stdout" >&2 || true
+    cat "${workdir}/named-live-restore.stderr" >&2 || true
+    die "multi-vCPU restore of non-destructive save failed"
+  fi
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${concurrent_name}" -- /bin/nproc >"${workdir}/named-live-nproc.stdout" 2>"${workdir}/named-live-nproc.stderr"; then
+    cat "${workdir}/named-live-nproc.stdout" >&2 || true
+    cat "${workdir}/named-live-nproc.stderr" >&2 || true
+    die "multi-vCPU exec after non-destructive restore failed"
+  fi
+  expect_nproc_equals "${workdir}/named-live-nproc.stdout"
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${concurrent_name}" >/dev/null
+
+  # Non-destructive multi-vCPU save of an active workload: prove the source VM
+  # stays registered and keeps ticking after save, then remove the source and
+  # verify the point-in-time spore restores and preserves the captured workload
+  # state. `expect_manifest_v1` above verifies the saved vCPU topology; the first
+  # post-restore exec may run under the restored file-stdio affinity gate.
+  live_name="${vm_name}-live"
+  live_restored_name="${vm_name}-live-restored"
+  live_dir="${workdir}/live.spore"
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${live_name}" --backend "${backend}" --vcpus "${vcpus}" --memory "${memory}" --timeout "${create_timeout_ms}ms" 'i=0; while true; do echo "$i" > /tick; i=$((i + 1)); sleep 1; done' >"${workdir}/live-create.stdout" 2>"${workdir}/live-create.stderr"; then
+    cat "${workdir}/live-create.stdout" >&2 || true
+    cat "${workdir}/live-create.stderr" >&2 || true
+    die "multi-vCPU live create failed"
+  fi
+  # The workload must be ticking before the save so the save captures a running guest.
+  expect_still_ticking "${live_name}" "live-pre-save"
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" save "${live_name}" --out "${live_dir}" >"${workdir}/live-save.stdout" 2>"${workdir}/live-save.stderr"; then
+    cat "${workdir}/live-save.stdout" >&2 || true
+    cat "${workdir}/live-save.stderr" >&2 || true
+    die "multi-vCPU non-destructive save failed"
+  fi
+  expect_manifest_v1 "${live_dir}"
+  # The source VM must still be registered as ready after a non-destructive save.
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" ls >"${workdir}/live-ls.stdout" 2>"${workdir}/live-ls.stderr"; then
+    cat "${workdir}/live-ls.stdout" >&2 || true
+    cat "${workdir}/live-ls.stderr" >&2 || true
+    die "spore ls failed after non-destructive save"
+  fi
+  grep -Fq "${live_name}" "${workdir}/live-ls.stdout" || {
+    cat "${workdir}/live-ls.stdout" >&2 || true
+    die "non-destructive save removed ${live_name} from the registry"
+  }
+  # The source VM must still be running the workload after the save.
+  expect_still_ticking "${live_name}" "live-post-save"
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${live_name}" >/dev/null
+  # The saved spore must restore and keep ticking (the running workload was
+  # captured in the spore's memory state).
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" restore "${live_dir}" --name "${live_restored_name}" >"${workdir}/live-restore.stdout" 2>"${workdir}/live-restore.stderr"; then
+    cat "${workdir}/live-restore.stdout" >&2 || true
+    cat "${workdir}/live-restore.stderr" >&2 || true
+    die "multi-vCPU restore of non-destructive save failed"
+  fi
+  expect_still_ticking "${live_restored_name}" "live-restored"
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${live_restored_name}" >/dev/null
+
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" save "${vm_name}" --out "${named_dir}" --stop >"${workdir}/suspend.stdout" 2>"${workdir}/suspend.stderr"; then
     cat "${workdir}/suspend.stdout" >&2 || true
     cat "${workdir}/suspend.stderr" >&2 || true
