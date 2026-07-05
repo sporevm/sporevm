@@ -172,9 +172,11 @@ handles.
 ## Saves And Forks
 
 `spore save NAME --out DIR` writes a spore and leaves the named VM running.
-`spore save NAME --out DIR --stop` writes a spore and removes the named VM from
-the runtime registry. Repeated `--annotation KEY=VALUE` flags merge save-time
-annotations into the manifest without dropping create-time annotations:
+Non-destructive save currently requires a single-vCPU VM; multi-vCPU named VMs
+must use `--stop`. `spore save NAME --out DIR --stop` writes a spore and
+removes the named VM from the runtime registry. Repeated `--annotation
+KEY=VALUE` flags merge save-time annotations into the manifest without
+dropping create-time annotations:
 
 ```bash
 spore save bench-1 --out bench-1.spore --stop --annotation saved=true
@@ -204,9 +206,9 @@ pausing the source VM.
 
 Named saves support diskless VMs, image-created writable rootfs state, and
 explicit `--rootfs PATH` saves backed by exact immutable rootfs artifacts.
-Supported backends can create, save, restore, and live-fork fixed-RAM
-multi-vCPU named VMs. Named live fork is still diskless-only; child VMs preserve
-the source VM's vCPU count.
+Supported backends can create, save with `--stop`, restore, and live-fork
+fixed-RAM multi-vCPU named VMs. Named live fork is still diskless-only; child
+VMs preserve the source VM's vCPU count.
 
 ## Monitor Boundary
 
