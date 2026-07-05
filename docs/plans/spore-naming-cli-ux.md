@@ -78,8 +78,8 @@ Only spores with sessions can attach to or fan out the original command.
 - No spore format change.
 - No manifest field rename from `sessions`.
 - No new VM lifecycle daemon or registry model.
-- No behavior expansion for disk-backed live fork, metadata-only bundles, or
-  network-flow checkpointing.
+- No broad behavior expansion for disk-backed live fork, chunked metadata-only
+  bundles, or network-flow checkpointing.
 - No broad parser framework. Rename the existing command and flag surface in
   place.
 
@@ -217,7 +217,7 @@ fanout requires child spores with sessions
 
 children/000000 has Sessions: none.
 Use `spore inspect children/000000` to check sessions.
-Use `spore run --save base.spore ...` when you want fanout to resume the
+Use `spore run --save base.spore ...` when you want fanout to attach to the
 original command.
 ```
 
