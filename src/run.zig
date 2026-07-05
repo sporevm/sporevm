@@ -1029,6 +1029,14 @@ pub const cli_usage =
     \\
 ;
 
+/// Redirect hints for run flags removed in the spore/saved-session rename.
+fn renamedRunFlagHint(arg: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, arg, "--capture")) return "--save DIR";
+    if (std.mem.eql(u8, arg, "--capture-on")) return "--save-on WHEN";
+    if (std.mem.eql(u8, arg, "--continue-after-capture")) return "--continue-after-save";
+    return null;
+}
+
 pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var backend: Backend = .auto;
     var shared = SharedOptions{};
@@ -1152,6 +1160,9 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             };
         } else if (try parseSharedOption(&shared, args, &i)) {
             continue;
+        } else if (renamedRunFlagHint(args[i])) |replacement| {
+            std.debug.print("spore run: {s} was renamed; use {s}\n", .{ args[i], replacement });
+            std.process.exit(2);
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             std.debug.print("unknown run argument: {s}\n\n{s}", .{ args[i], cli_usage });
             std.process.exit(2);
@@ -4433,6 +4444,14 @@ test "run network gateway errors are reported clearly" {
     try std.testing.expect(isNetworkGatewayError(error.NetdThreadFailed));
     try std.testing.expect(isNetworkGatewayError(error.NetworkGatewayFailed));
     try std.testing.expect(!isNetworkGatewayError(error.UnsupportedBackend));
+}
+
+test "removed capture flags map to save rename hints" {
+    try std.testing.expectEqualStrings("--save DIR", renamedRunFlagHint("--capture").?);
+    try std.testing.expectEqualStrings("--save-on WHEN", renamedRunFlagHint("--capture-on").?);
+    try std.testing.expectEqualStrings("--continue-after-save", renamedRunFlagHint("--continue-after-capture").?);
+    try std.testing.expect(renamedRunFlagHint("--save") == null);
+    try std.testing.expect(renamedRunFlagHint("--unknown") == null);
 }
 
 test "run cli parser accepts save flags" {

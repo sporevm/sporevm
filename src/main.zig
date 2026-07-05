@@ -333,10 +333,27 @@ fn runCommand(
         }
     } else if (std.mem.eql(u8, command, "help")) {
         try stdout.writeAll(usage);
+    } else if (renamedCommandHint(command)) |hint| {
+        const message = allocMessage(arena, "spore {s} was renamed; {s}", .{ command, hint });
+        exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "CommandDispatch"), message);
     } else {
         const message = allocMessage(arena, "unknown command: {s}", .{command});
         exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "CommandDispatch"), messageWithUsage(arena, message));
     }
+}
+
+/// Redirect hints for command spellings removed in the spore/saved-session
+/// rename. The old commands stay non-functional so the new vocabulary is
+/// unambiguous, but users get pointed at the replacement instead of a
+/// generic unknown-command error.
+fn renamedCommandHint(command: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, command, "resume")) {
+        return "use `spore attach <spore-dir>` to attach a saved session, or `spore restore <spore-dir> --name NAME` to restore a named VM";
+    }
+    if (std.mem.eql(u8, command, "suspend")) {
+        return "use `spore save NAME --out DIR --stop`";
+    }
+    return null;
 }
 
 fn logFn(
@@ -1011,6 +1028,14 @@ test "rootfs bundle policy parser accepts exact and metadata-only spellings" {
     try std.testing.expectEqual(spore_api.RootfsBundlePolicy.exact_bytes, parseRootfsBundlePolicy("exact-bytes").?);
     try std.testing.expectEqual(spore_api.RootfsBundlePolicy.metadata_only, parseRootfsBundlePolicy("metadata-only").?);
     try std.testing.expect(parseRootfsBundlePolicy("bad") == null);
+}
+
+test "removed commands map to rename hints" {
+    try std.testing.expect(std.mem.indexOf(u8, renamedCommandHint("resume").?, "spore attach") != null);
+    try std.testing.expect(std.mem.indexOf(u8, renamedCommandHint("resume").?, "spore restore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, renamedCommandHint("suspend").?, "spore save NAME --out DIR --stop") != null);
+    try std.testing.expect(renamedCommandHint("attach") == null);
+    try std.testing.expect(renamedCommandHint("bogus") == null);
 }
 
 test "command help accepts standard help spellings" {
