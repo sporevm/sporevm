@@ -7,6 +7,7 @@
 #include <net/route.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -2056,6 +2057,7 @@ static void execve_or_report(char *const argv[], char *const envp[], int use_roo
   _exit(exec_failure_code(err));
 }
 
+static void pin_to_current_cpu(pid_t pid);
 static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio, int memory_pressure, int stdin_enabled, int tty, uint16_t terminal_rows, uint16_t terminal_cols) {
   t_command_start = now_ms();
   int stdin_pipe[2] = { -1, -1 };
@@ -2064,6 +2066,7 @@ static int start_session(struct session *session, const char *session_id, char *
   int pty_master = -1;
   int pty_slave = -1;
   int start_pipe[2] = { -1, -1 };
+  int ready_pipe[2] = { -1, -1 };
   if (tty) {
     if (open_session_pty(&pty_master, &pty_slave, terminal_rows, terminal_cols) != 0) {
       t_command_exit = now_ms();
@@ -2138,14 +2141,31 @@ static int start_session(struct session *session, const char *session_id, char *
     t_command_exit = now_ms();
     return 127;
   }
+  if (pipe2(ready_pipe, O_CLOEXEC) != 0) {
+    close(start_pipe[0]);
+    close(start_pipe[1]);
+    if (stdin_pipe[0] >= 0) close(stdin_pipe[0]);
+    if (stdin_pipe[1] >= 0) close(stdin_pipe[1]);
+    if (pty_master >= 0) close(pty_master);
+    if (pty_slave >= 0) close(pty_slave);
+    if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
+    if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
+    if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
+    if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
+    t_command_exit = now_ms();
+    return 127;
+  }
 
   pid_t pid = fork();
   if (pid == 0) {
     close(start_pipe[1]);
+    close(ready_pipe[0]);
     char start_byte = 0;
     while (read(start_pipe[0], &start_byte, 1) < 0 && errno == EINTR) {
     }
     if (start_byte != 1) _exit(127);
+    if (write_all(ready_pipe[1], "\1", 1) != 0) _exit(127);
+    close(ready_pipe[1]);
     close(start_pipe[0]);
     if (stdin_pipe[1] >= 0) close(stdin_pipe[1]);
     if (pty_master >= 0) close(pty_master);
@@ -2185,8 +2205,10 @@ static int start_session(struct session *session, const char *session_id, char *
   if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
   if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
   close(start_pipe[0]);
+  close(ready_pipe[1]);
   if (pid < 0) {
     close(start_pipe[1]);
+    close(ready_pipe[0]);
     if (stdin_pipe[1] >= 0) close(stdin_pipe[1]);
     if (pty_master >= 0) close(pty_master);
     if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
@@ -2194,11 +2216,18 @@ static int start_session(struct session *session, const char *session_id, char *
     t_command_exit = now_ms();
     return 127;
   }
+  /*
+   * Completed-session resumes use file-backed stdio after restoring an already
+   * booted guest. Keep that start-gate handoff on the agent's current CPU so a
+   * restored multi-vCPU guest cannot strand the new child behind a lost wakeup.
+   */
+  if (file_stdio) pin_to_current_cpu(pid);
 
   memset(session, 0, sizeof(*session));
   session->memory_pressure_fd = -1;
   if ((memory_pressure && setup_memory_pressure(session, pid) != 0) || write_all(start_pipe[1], "\1", 1) != 0) {
     close(start_pipe[1]);
+    close(ready_pipe[0]);
     (void)kill(pid, SIGKILL);
     int status = 0;
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
@@ -2212,6 +2241,25 @@ static int start_session(struct session *session, const char *session_id, char *
     return 127;
   }
   close(start_pipe[1]);
+  char ready_byte = 0;
+  ssize_t ready_read = 0;
+  do {
+    ready_read = read(ready_pipe[0], &ready_byte, 1);
+  } while (ready_read < 0 && errno == EINTR);
+  close(ready_pipe[0]);
+  if (ready_read != 1 || ready_byte != 1) {
+    (void)kill(pid, SIGKILL);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    if (stdin_pipe[1] >= 0) close(stdin_pipe[1]);
+    if (pty_master >= 0) close(pty_master);
+    if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
+    if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
+    close_memory_pressure(session);
+    t_command_exit = now_ms();
+    return 127;
+  }
 
   session->started = 1;
   snprintf(session->session_id, sizeof(session->session_id), "%s", session_id);
@@ -2233,6 +2281,15 @@ static void wait_child_blocking(pid_t pid) {
   int status = 0;
   while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
   }
+}
+
+static void pin_to_current_cpu(pid_t pid) {
+  int cpu = sched_getcpu();
+  if (cpu < 0 || cpu >= CPU_SETSIZE) return;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(cpu, &set);
+  (void)sched_setaffinity(pid, sizeof(set), &set);
 }
 
 static void reap_detached_children(struct detached_children *children) {
