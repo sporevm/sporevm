@@ -181,8 +181,7 @@ pub fn preload(
         },
     };
     const source_verify_start_ms = monotonicMs();
-    const fd = try rootfs_cache.openVerifiedFromCache(io, allocator, cache_root, rootfs);
-    const source_verify_ms = monotonicMs() -| source_verify_start_ms;
+    const fd = try rootfs_cache.openTrustedFromCache(io, allocator, cache_root, rootfs);
     defer _ = std.c.close(fd);
 
     const object_dir_path = try objectDir(allocator, cache_root);
@@ -193,11 +192,13 @@ pub fn preload(
     if (chunk_count_u64 > std.math.maxInt(usize)) return error.BadManifest;
     const chunk_count: usize = @intCast(chunk_count_u64);
     var manifest_chunks: std.ArrayList(rootfs_index.RootfsBlockChunk) = .empty;
+    try manifest_chunks.ensureTotalCapacity(allocator, chunk_count);
     defer {
         for (manifest_chunks.items) |entry| allocator.free(entry.digest);
         manifest_chunks.deinit(allocator);
     }
     var manifest_zero_chunks: std.ArrayList(u64) = .empty;
+    try manifest_zero_chunks.ensureTotalCapacity(allocator, chunk_count);
     defer manifest_zero_chunks.deinit(allocator);
 
     var zero_chunks: usize = 0;
@@ -206,16 +207,36 @@ pub fn preload(
     var object_bytes_written: u64 = 0;
     var object_check_ms: u64 = 0;
     var object_write_ms: u64 = 0;
+    const MissingObject = struct {
+        logical_chunk: u64,
+        id: chunk.ChunkId,
+    };
+    var missing_objects: std.ArrayList(MissingObject) = .empty;
+    defer missing_objects.deinit(allocator);
     const read_buf = try allocator.alloc(u8, @intCast(chunk_size));
     defer allocator.free(read_buf);
+    const object_buf = try allocator.alloc(u8, @intCast(chunk_size));
+    defer allocator.free(object_buf);
+    const zero_buf = try allocator.alloc(u8, @intCast(chunk_size));
+    defer allocator.free(zero_buf);
+    @memset(zero_buf, 0);
 
+    var source_hasher = Blake3.init(.{});
+    var sparse_scan: SparseScanState = .{};
     const chunk_scan_start_ms = monotonicMs();
     for (0..chunk_count) |i| {
         const start = std.math.mul(u64, @as(u64, @intCast(i)), chunk_size) catch return error.BadManifest;
         const len = @min(chunk_size, stat.size - start);
         const len_usize = std.math.cast(usize, len) orelse return error.BadManifest;
+        if (chunkIsSparseHole(fd, &sparse_scan, start, len, stat.size)) {
+            source_hasher.update(zero_buf[0..len_usize]);
+            zero_chunks += 1;
+            try manifest_zero_chunks.append(allocator, @intCast(i));
+            continue;
+        }
         const data = read_buf[0..len_usize];
         try preadExact(fd, data, start);
+        source_hasher.update(data);
         if (isZero(data)) {
             zero_chunks += 1;
             try manifest_zero_chunks.append(allocator, @intCast(i));
@@ -228,22 +249,43 @@ pub fn preload(
             .logical_chunk = @intCast(i),
             .digest = digest_ref,
         });
-        const object_path = try objectPathForDir(allocator, object_dir_path, id);
+        const object_path = try objectPathZForDir(allocator, object_dir_path, id);
         defer allocator.free(object_path);
         const object_check_start_ms = monotonicMs();
-        const object_exists = try objectMatches(allocator, object_path, id, data.len);
+        const object_exists = try objectEqualsDataZ(object_path, data, object_buf[0..data.len]);
         object_check_ms += monotonicMs() -| object_check_start_ms;
         if (!object_exists) {
-            try removeStaleObject(io, object_path);
-            const object_write_start_ms = monotonicMs();
-            try writeFileAtomic(io, allocator, object_path, data);
-            object_write_ms += monotonicMs() -| object_write_start_ms;
-            objects_written += 1;
-            object_bytes_written += data.len;
+            try missing_objects.append(allocator, .{
+                .logical_chunk = @intCast(i),
+                .id = id,
+            });
         }
         nonzero_chunks += 1;
     }
     const chunk_scan_ms = monotonicMs() -| chunk_scan_start_ms;
+    var source_digest: [Blake3.digest_length]u8 = undefined;
+    source_hasher.final(&source_digest);
+    const source_hex = std.fmt.bytesToHex(source_digest, .lower);
+    const expected_source_hex = rootfs_digest[spore.rootfs_digest_prefix.len..];
+    if (!std.mem.eql(u8, &source_hex, expected_source_hex)) return error.RootFSDigestMismatch;
+    const source_verify_ms = monotonicMs() -| source_verify_start_ms;
+
+    for (missing_objects.items) |missing| {
+        const start = std.math.mul(u64, missing.logical_chunk, chunk_size) catch return error.BadManifest;
+        const len = @min(chunk_size, stat.size - start);
+        const len_usize = std.math.cast(usize, len) orelse return error.BadManifest;
+        const data = read_buf[0..len_usize];
+        try preadExact(fd, data, start);
+        if (!missing.id.matches(data)) return error.BadChunk;
+        const object_path = try objectPathForDir(allocator, object_dir_path, missing.id);
+        defer allocator.free(object_path);
+        try removeStaleObject(io, object_path);
+        const object_write_start_ms = monotonicMs();
+        try writeFileAtomic(io, allocator, object_path, data);
+        object_write_ms += monotonicMs() -| object_write_start_ms;
+        objects_written += 1;
+        object_bytes_written += data.len;
+    }
 
     const index_build_start_ms = monotonicMs();
     const manifest_index = rootfs_index.RootfsBlockIndex{
@@ -427,6 +469,11 @@ fn objectPathForDir(allocator: std.mem.Allocator, dir: []const u8, id: chunk.Chu
     return std.fmt.allocPrint(allocator, "{s}/{s}.chunk", .{ dir, &hex });
 }
 
+fn objectPathZForDir(allocator: std.mem.Allocator, dir: []const u8, id: chunk.ChunkId) ![:0]const u8 {
+    const hex = id.toHex();
+    return std.fmt.allocPrintSentinel(allocator, "{s}/{s}.chunk", .{ dir, &hex }, 0);
+}
+
 fn loadManifestIndex(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -478,6 +525,57 @@ fn isZero(bytes: []const u8) bool {
         if (byte != 0) return false;
     }
     return true;
+}
+
+const SparseScanState = struct {
+    supported: bool = sparseSeekSupported(),
+    have_extent: bool = false,
+    data_start: u64 = 0,
+    data_end: u64 = 0,
+};
+
+fn sparseSeekSupported() bool {
+    return switch (builtin.os.tag) {
+        .linux, .macos => true,
+        else => false,
+    };
+}
+
+fn chunkIsSparseHole(fd: std.c.fd_t, state: *SparseScanState, start: u64, len: u64, file_size: u64) bool {
+    if (!state.supported) return false;
+    if (len == 0) return true;
+    const chunk_end = std.math.add(u64, start, len) catch return false;
+    if (!state.have_extent or start >= state.data_end) {
+        const extent = nextSparseDataExtent(fd, start, file_size) orelse {
+            state.supported = false;
+            return false;
+        };
+        state.have_extent = true;
+        state.data_start = extent.start;
+        state.data_end = extent.end;
+    }
+    return chunk_end <= state.data_start;
+}
+
+const SparseDataExtent = struct {
+    start: u64,
+    end: u64,
+};
+
+fn nextSparseDataExtent(fd: std.c.fd_t, start: u64, file_size: u64) ?SparseDataExtent {
+    if (!sparseSeekSupported()) return null;
+    const seek_data: c_int = if (builtin.os.tag == .macos) 4 else 3;
+    const seek_hole: c_int = if (builtin.os.tag == .macos) 3 else 4;
+    const offset = std.math.cast(std.c.off_t, start) orelse return null;
+    const data_start = std.c.lseek(fd, offset, seek_data);
+    if (data_start < 0) return null;
+    var data_end = std.c.lseek(fd, data_start, seek_hole);
+    if (data_end < 0) data_end = std.math.cast(std.c.off_t, file_size) orelse return null;
+    if (data_end <= data_start) return null;
+    return .{
+        .start = @intCast(data_start),
+        .end = @intCast(data_end),
+    };
 }
 
 fn preadExact(fd: std.c.fd_t, buf: []u8, offset: u64) SourceError!void {
@@ -541,13 +639,21 @@ fn pathExistsNoSymlink(io: Io, path: []const u8) !bool {
     return true;
 }
 
-fn objectMatches(allocator: std.mem.Allocator, path: []const u8, id: chunk.ChunkId, expected_size: usize) !bool {
-    const data = readFileExact(allocator, path, expected_size) catch |err| switch (err) {
+fn objectEqualsDataZ(path: [:0]const u8, expected: []const u8, buf: []u8) !bool {
+    if (buf.len != expected.len) return error.IoFailed;
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return false;
+    defer _ = std.c.close(fd);
+    const size = fstatRegularSize(fd) catch |err| switch (err) {
         error.MissingChunk, error.BadChunk, error.ShortRead => return false,
         else => |e| return e,
     };
-    defer allocator.free(data);
-    return id.matches(data);
+    if (size != expected.len) return false;
+    preadExact(fd, buf, 0) catch |err| switch (err) {
+        error.ShortRead, error.OutOfRange, error.IoFailed => return false,
+        else => |e| return e,
+    };
+    return std.mem.eql(u8, expected, buf);
 }
 
 fn verifyDigestBytes(digest: []const u8, data: []const u8) !void {
