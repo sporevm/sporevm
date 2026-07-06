@@ -15,7 +15,7 @@ every paragraph.
 
 ## Adopted: Sparse-Aware Warm Rootfs CAS Preload
 
-**Status:** pending review. Autoresearch best median: 502ms -> 343ms (-31.6%).
+**Status:** shipped in PR #381. Autoresearch best median: 502ms -> 343ms (-31.6%).
 
 ### Question
 
