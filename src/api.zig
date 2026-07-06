@@ -454,6 +454,8 @@ pub const SporeNetworkSummary = struct {
 /// Owned string fields must be released with `deinitSporeInspectResult`.
 pub const SporeInspectResult = struct {
     version: u32,
+    vm_state_present: bool,
+    storage_mode: []const u8,
     vcpu_count: u32,
     platform: SporePlatformSummary,
     device_count: usize,
@@ -1298,6 +1300,8 @@ fn summarizeSpore(allocator: std.mem.Allocator, manifest: anytype, vcpu_count: u
 
     return .{
         .version = manifest.version,
+        .vm_state_present = true,
+        .storage_mode = inspectStorageMode(manifest),
         .vcpu_count = vcpu_count,
         .platform = .{
             .arch = try allocator.dupe(u8, manifest.platform.arch),
@@ -1320,6 +1324,13 @@ fn summarizeSpore(allocator: std.mem.Allocator, manifest: anytype, vcpu_count: u
         .annotations = annotations,
         .annotation_keys = annotation_keys,
     };
+}
+
+fn inspectStorageMode(manifest: anytype) []const u8 {
+    const rootfs = manifest.rootfs orelse return "memory-only";
+    const writable_disk = manifest.disk != null;
+    if (rootfs.storage != null) return if (writable_disk) "chunked-rootfs-with-writable-disk" else "chunked-rootfs";
+    return if (writable_disk) "exact-rootfs-with-writable-disk" else "exact-rootfs";
 }
 
 fn ownNetworkSummary(allocator: std.mem.Allocator, maybe_network: ?spore.Network) !?SporeNetworkSummary {
@@ -1423,6 +1434,23 @@ test "inspect spore returns annotation values from saved manifest" {
     try annotations.map.put(arena, "cleanroom.snapshot", "warm");
     var memory_chunks = [_]?[]const u8{null};
     var manifest = annotationTestManifest(annotations, &memory_chunks);
+    const rootfs_digest = "blake3:1111111111111111111111111111111111111111111111111111111111111111";
+    const rootfs_device = spore.RootfsDevice{ .mmio_slot = 0 };
+    var rootfs_devices = [_]spore.TransportState{.{
+        .device_id = spore.rootfs_virtio_blk_device_id,
+        .status = 0,
+        .device_features_sel = 0,
+        .driver_features_sel = 0,
+        .driver_features = 0,
+        .queue_sel = 0,
+        .interrupt_status = 0,
+        .queues = &.{},
+    }};
+    manifest.devices = rootfs_devices[0..];
+    manifest.rootfs = .{
+        .device = rootfs_device,
+        .artifact = .{ .digest = rootfs_digest, .size = 4096 },
+    };
     manifest.network = .{
         .bound_services = &.{.{
             .name = "cleanroom-gateway",
@@ -1435,6 +1463,8 @@ test "inspect spore returns annotation values from saved manifest" {
 
     const inspected = try inspectSpore(allocator, dir);
     defer deinitSporeInspectResult(allocator, inspected);
+    try std.testing.expect(inspected.vm_state_present);
+    try std.testing.expectEqualStrings("exact-rootfs", inspected.storage_mode);
     try std.testing.expectEqualStrings("created", inspected.annotations.map.get("cleanroom.create").?);
     try std.testing.expectEqualStrings("warm", inspected.annotations.map.get("cleanroom.snapshot").?);
     try std.testing.expectEqual(@as(usize, 1), inspected.sessions.len);
@@ -1547,6 +1577,8 @@ test "inspect spore summarizes multi-vcpu v1 manifests" {
     const inspected = try inspectSpore(allocator, dir);
     defer deinitSporeInspectResult(allocator, inspected);
     try std.testing.expectEqual(@as(u32, spore.format_version_v1), inspected.version);
+    try std.testing.expect(inspected.vm_state_present);
+    try std.testing.expectEqualStrings("memory-only", inspected.storage_mode);
     try std.testing.expectEqual(@as(u32, 2), inspected.vcpu_count);
     try std.testing.expectEqualStrings("gicv3_multi", inspected.gic_kind);
     try std.testing.expectEqualStrings("warm", inspected.annotations.map.get("cleanroom.bake").?);

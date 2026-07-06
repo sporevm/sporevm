@@ -93,6 +93,12 @@ const workspace = inspected.annotations.map.get("cleanroom.workspace");
 format v0 (single-vCPU) and format v1 (multi-vCPU) manifests both summarize,
 and `SporeInspectResult.vcpu_count` reports the vCPU count (1 for v0).
 
+`SporeInspectResult.vm_state_present` is the product-level VM-state signal for
+callers that should not infer it from chunks, devices, or sessions. Valid local
+spores report `true`. `SporeInspectResult.storage_mode` reports
+`memory-only`, `exact-rootfs`, `chunked-rootfs`, or the same rootfs mode with
+`-with-writable-disk`.
+
 `SporeInspectResult.annotations` is an opaque key/value map copied out of the
 validated manifest. SporeVM does not interpret namespaces such as
 `cleanroom.*`; callers own their schema. The same manifest annotation rules

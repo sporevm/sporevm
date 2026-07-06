@@ -174,6 +174,12 @@ func TestInspectSporeAnnotations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !result.VMStatePresent {
+		t.Fatal("expected VM state")
+	}
+	if result.StorageMode != "memory-only" {
+		t.Fatalf("storage mode = %q", result.StorageMode)
+	}
 	if got := result.Annotations["cleanroom.workspace"]; got != "/workspaces/app" {
 		t.Fatalf("cleanroom.workspace = %q", got)
 	}
