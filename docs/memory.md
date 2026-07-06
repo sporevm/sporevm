@@ -67,10 +67,11 @@ and that tail must stay visible in benchmark and runtime stats.
   monitor-published nonzero and pending dirty chunk counters. Fields
   remain nullable when no cheap runtime source exists.
 - Resume from chunks is portable; local backing is same-host acceleration only.
-- Linux fs-verity could strengthen backing-file integrity later, but it should
-  not become a user-facing mode.
-- Multi-vCPU and access-trace/readahead contracts are outside the current
-  manifest format.
+- On Linux filesystems with fs-verity support, schema v2 local backing proofs
+  sign the kernel verity digest and restore re-measures the opened fd before
+  mapping. Other filesystems keep the v1 local-provenance proof path.
+- Persisted virtio-mem plug/unplug state and access-trace/readahead contracts
+  are outside the current manifest format.
 
 ## Validation
 
