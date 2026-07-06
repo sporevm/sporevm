@@ -74,6 +74,8 @@ type InspectSporeOptions struct {
 // SporeInspectResult is the decoded local spore inspection result.
 type SporeInspectResult struct {
 	Version                 uint32               `json:"version"`
+	VMStatePresent          bool                 `json:"vm_state_present"`
+	StorageMode             string               `json:"storage_mode"`
 	Platform                SporePlatformSummary `json:"platform"`
 	DeviceCount             uint64               `json:"device_count"`
 	MemoryChunkCount        uint64               `json:"memory_chunk_count"`

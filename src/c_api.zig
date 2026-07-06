@@ -1525,6 +1525,8 @@ test "C ABI inspect spore JSON includes annotation values" {
     try std.testing.expectEqual(result_success, spore_inspect_spore_json(context, &options, &json));
     defer spore_free_string(context, json);
     const data = json.ptr.?[0..json.len];
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"vm_state_present\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"storage_mode\": \"memory-only\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"annotations\": {") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"cleanroom.workspace\": \"/workspaces/app\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"cleanroom.provenance\": \"sha256:abc123\"") != null);

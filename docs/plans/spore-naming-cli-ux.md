@@ -433,8 +433,9 @@ transition.
   vCPU gate in `saveContinueNamed` because both KVM and HVF already implement
   multi-vCPU snapshot-and-continue (the same path `spore fork --vm` uses). See
   `docs/plans/multi-vcpu-nondestructive-save.md`.
-- Consider a future `inspect` schema change that reports `VM state` and storage
-  mode more explicitly in JSON, after the human output model lands.
+- `inspect` JSON now reports product-level `vm_state_present` and
+  `storage_mode` fields while keeping the lower-level manifest fields for
+  compatibility.
 
 ## Key Learnings From Pressure-Testing
 
