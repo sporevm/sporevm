@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Sandbox setup for SporeVM: install mise, then the pinned toolchain
+# (zig, gh, svu) from mise.toml.
+set -euo pipefail
+
+# Native build tools required by the minimal exec initrd (Toybox) build.
+if command -v apt-get >/dev/null 2>&1; then
+  sudo apt-get update -y || apt-get update -y || true
+  sudo apt-get install -y cpio make gcc xz-utils \
+    || apt-get install -y cpio make gcc xz-utils || true
+fi
+
+if ! command -v mise >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/mise" ]; then
+  curl -fsSL https://mise.run | sh
+fi
+
+MISE="$(command -v mise || echo "$HOME/.local/bin/mise")"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+"$MISE" install

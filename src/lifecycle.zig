@@ -1109,7 +1109,10 @@ fn saveContinueNamed(
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "save", options.name, state);
     var spec = try readSpec(arena, context.io, paths);
     defer spec.deinit();
-    if (spec.value.vcpus != 1) return error.UnsupportedSnapshotMode;
+    // Non-destructive save supports multi-vCPU VMs: both KVM and HVF quiesce
+    // every vCPU at one barrier, capture manifest-v1 state, and resume the
+    // guest through the monitor snapshot-and-continue path (the same path
+    // `spore fork --vm` uses). No vCPU-count gate is needed here.
     if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
         return error.MissingRootfsIdentity;
     }
@@ -1788,7 +1791,7 @@ pub fn saveCli(
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "save"), message);
         },
         error.UnsupportedSnapshotMode => {
-            const message = "spore save: non-destructive save is not supported for this VM yet; use `spore save NAME --out DIR --stop`";
+            const message = "spore save: this save mode is not supported; use `spore save NAME --out DIR --stop` for a consuming save";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
         },
         error.OutputDirExists => {
