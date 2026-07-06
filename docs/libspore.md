@@ -261,9 +261,11 @@ For mutable image refs, Zig callers can set `.image_pull_policy` to `.missing`,
 `.always`, or `.never`; the C and Go bindings use the default `.missing`
 policy.
 
-Named startup operations spawn the `spore` executable to run the private monitor
-entry point. When `spore_executable` is omitted or empty, Zig, C, and Go callers
-all use `"spore"`, resolved with the process `PATH` used for the operation.
+Named startup operations spawn a helper executable to run the private monitor
+entry point. Zig and C callers default `spore_executable` to `"spore"`,
+resolved with the process `PATH` used for the operation. Go callers default to
+self re-exec through the linked embedder, described below.
+
 Before `createNamed`, `restoreNamed`, or `forkNamed` returns success, libspore
 waits for `ready.json`, confirms the recorded PID is alive, connects to the
 monitor's local `control.sock`, and requires a `hello` response carrying exactly
