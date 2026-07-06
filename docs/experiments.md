@@ -13,6 +13,52 @@ should use this shape:
 Keep titles outcome-first so another agent can scan this file without reading
 every paragraph.
 
+## Adopted: Sparse-Aware Warm Rootfs CAS Preload
+
+**Status:** pending review. Autoresearch best median: 502ms -> 343ms (-31.6%).
+
+### Question
+
+Can warm `spore rootfs cas-preload <digest> --chunk-size 65536` get faster
+without weakening rootfs digest verification, chunk verification, or cache
+publication semantics?
+
+### Hypothesis
+
+The warm path was still paying to scan a 512MiB logical rootfs even though the
+fixture was mostly sparse: 8192 chunks, 8048 zero chunks, and only 144 nonzero
+chunks. Skipping sparse holes during chunk discovery, folding source digest
+verification into that scan, and avoiding redundant warm-object hashing should
+reduce preload time while still failing closed on digest mismatch.
+
+### Method
+
+Autoresearch measured nine warm samples after one untimed warmup of an arm64
+Alpine rootfs fixture. The benchmark emitted `rootfs_cas_preload_ms`, p95/min,
+success rate, `objects_written_max`, and chunk count; checks ran `git diff
+--check`, `mise run test`, `mise run build:release`, and a rootfs CAS smoke.
+
+### Result
+
+Median warm preload improved from 502.1ms to 343.3ms with
+`objects_written_max=0` and 8192 chunks. Kept changes made the scan sparse-file
+aware with cached `SEEK_DATA`/`SEEK_HOLE` extents, preallocated manifest arrays,
+hashed logical zero chunks during the sparse-aware scan, deferred missing-object
+writes until after source digest verification, and verified warm object hits by
+byte equality against the already-read source chunk.
+
+An invalid ceiling probe that skipped sparse-hole zero hashing reached ~34.5ms,
+showing remaining time is dominated by BLAKE3 over logical zero bytes. Oracle
+recommended deferring a BLAKE3 zero-run fast-forward because it would require
+owning or depending on BLAKE3 tree internals at the rootfs integrity boundary.
+
+### Decision
+
+Adopt the sparse-aware preload changes. Do not pursue BLAKE3 zero-run
+fast-forward now; prefer future work that reuses a successfully derived local
+storage descriptor/index keyed by `(rootfs_digest, chunk_size, rootfs_size)` if
+warm preload remains user-visible.
+
 ## Adopted: Flat Artifact Base For Warm Resume (Trust-At-Open)
 
 **Status:** shipped. Warm `run --from` TTI dropped about 5x on local HVF.
