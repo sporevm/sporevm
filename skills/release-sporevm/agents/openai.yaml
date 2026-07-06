@@ -1,4 +1,4 @@
 interface:
   display_name: "Release SporeVM"
-  short_description: "Cut and verify SporeVM releases"
-  default_prompt: "Use $release-sporevm to cut and verify the next SporeVM release."
+  short_description: "Cut, verify, and write SporeVM releases"
+  default_prompt: "Use $release-sporevm to cut, verify, and write notes for the next pre-1.0 SporeVM release."
