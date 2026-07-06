@@ -96,6 +96,45 @@ contract as the rootfs cache: download verifies the release checksum and
 config symbols before atomically installing read-only files; cache hits check
 shape (read-only, regular, no symlink) plus config symbols only.
 
+## Adopted: Early Guest Exec Listener For Cold TTI
+
+**Status:** shipped in PR #373. Local HVF cold TTI best median: 77ms -> 40ms.
+The 10-run confirmation still showed the known harness bucket:
+`73,40,41,74,70,40,71,76,41,40`.
+
+### Question
+
+Can cold TTI improve by binding the guest exec vsock listener before
+rootfs/network setup, while still accepting/handling requests only after setup?
+
+### Hypothesis
+
+Host connect was waiting for avoidable guest setup. Earlier `listen_vsock`
+should overlap connect with setup without changing command execution semantics.
+
+### Method
+
+Autoresearch with `mise run build:release` and `benchmark-sporevm-suite.py
+--profile ci --benchmarks cold_tti --modes sequential --iterations 3 --no-build`.
+Shipped diff reads `/proc/cmdline` once, derives rootfs/net/port settings from
+it, then binds/listens before setup. The poll loop still starts after setup.
+
+### Result
+
+Best 3-run median: 40ms. PR 10-run confirmation: min 40ms, median 55.5ms,
+max 76ms. Diagnostics: rootfs/network setup stopped being critical; remaining
+real variance was boot-to-listener (~12ms fast/~16ms slow) plus host vsock
+connect/ack (~16-17ms fast/~23ms slow), amplified by the harness bucket.
+
+### Decision
+
+Adopt early listener + single cmdline read. `guest_accept_delay_ms` now includes
+setup time between listen and accept. Do not retain discarded micro-opts: vfork,
+fast HVF teardown, explicit process exit, stdout flush skip, raw event bypass,
+manual timing formatter, deterministic host port, BLKRASET, delayed reconnect,
+or Darwin QoS. They regressed/equaled primary `tti_ms`, failed checks, or added
+semantic risk. Keep diagnostic timestamp/initcall probes out of product code.
+
 ## Rejected: Host-Side Hot Resume Handoff Optimizations
 
 **Status:** recorded after the
