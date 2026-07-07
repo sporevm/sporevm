@@ -25,8 +25,9 @@ local ref, and skip immediate rootfs CAS preload when the caller only needs a
 fast local run. The existing chunked rootfs CAS path remains the default and
 remains required for portable saved spores, bundles, pulls, and dedupe.
 
-This is a new rootfs production and cache policy, but not a new guest-visible
-runtime filesystem. Runtime restore already serves the root disk from a flat
+This is not a new guest-visible filesystem: the guest still sees virtio-blk
+ext4. It is a new rootfs production and cache policy inside SporeVM's
+runtime/storage layer. Runtime restore already serves the root disk from a flat
 digest-addressed ext4 artifact, and that should stay true. Chunked
 `rootfs.storage` is distribution and dedupe metadata. The plan is to delay
 paying for that derived metadata until a workflow actually needs it.
@@ -221,6 +222,8 @@ Implementation notes:
 
 ### Slice 2: Lazy Portable Upgrade
 
+Status: implemented in this branch.
+
 Pin the expected behavior when flat imports are later used by portable
 workflows. `spore run --image local/... --save` should derive chunked
 `rootfs.storage` once, update the metadata sidecar, and write the manifest with
@@ -236,6 +239,16 @@ Definition of done:
 - `spore pack` behavior remains unchanged for saved spores: chunked manifests
   bundle chunked storage, and spores without storage use exact rootfs bytes or
   explicit metadata-only policy.
+
+Implementation notes:
+
+- The run-path unit coverage now exercises metadata without `rootfs_storage`,
+  calls the same `resolvedImageRootfsInput` path used when save records an
+  image-created rootfs, and asserts that the returned manifest rootfs includes
+  complete storage.
+- The same test checks that the metadata sidecar is upgraded with
+  `rootfs_storage` and that a follow-up `ensureImageRootfsStorage` call reuses
+  the recorded descriptor.
 
 ### Slice 3: Buildkite Before/After Benchmark
 
@@ -328,6 +341,6 @@ The first implementation slice therefore changes only when derived rootfs CAS is
 created, and the benchmark slice changes only one variable at a time.
 
 The third risk is widening the attack surface. Flat mode does not add a parser
-or a new guest-visible runtime filesystem; it changes when existing verified
-ext4 bytes are scanned into existing chunked storage. That keeps the security
-review focused on metadata optionality and fail-closed upgrade paths.
+or a new guest-visible filesystem; it changes when existing verified ext4 bytes
+are scanned into existing chunked storage. That keeps the security review
+focused on metadata optionality and fail-closed upgrade paths.

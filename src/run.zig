@@ -21,6 +21,7 @@ const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
 const net_gateway = @import("net_gateway.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
+const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
 const runtime_disk_mod = @import("runtime_disk.zig");
 const run_assets = @import("run_assets");
@@ -3536,6 +3537,17 @@ test "image rootfs metadata supplies run env and working directory" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
     const captured = try resolvedImageRootfsInput(init, arena, cache_root, "local/buildkite-spore:ci", resolved, rootfs_path, true);
     try std.testing.expect(captured.rootfs != null);
+    try std.testing.expect(captured.rootfs.?.storage != null);
+    try std.testing.expectEqualStrings(resolved.ref, captured.rootfs.?.source.?.requested_ref);
+    try std.testing.expect(try rootfs_cas.storageComplete(io, arena, cache_root, captured.rootfs.?.storage.?));
+
+    const updated_metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, arena, .limited(1024 * 1024));
+    try std.testing.expect(std.mem.indexOf(u8, updated_metadata, "\"rootfs_storage\"") != null);
+
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, captured.rootfs.?.artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
+    const cached_storage = try rootfs_mod.ensureImageRootfsStorage(init, arena, cache_root, resolved, captured.rootfs.?.artifact, captured.rootfs.?.device);
+    try std.testing.expectEqualStrings(captured.rootfs.?.storage.?.index_digest, cached_storage.index_digest);
     try std.testing.expect(rootfsWritable(.{
         .kernel_path = "",
         .rootfs_path = captured.path,
