@@ -169,6 +169,7 @@ Use `runManaged` for the high-level `spore run` path:
 ```zig
 const result = try libspore.runManaged(init, allocator, .{
     .image_ref = "docker.io/library/alpine:3.20",
+    .guest_env = &.{"SPORE_TEST_ENV=ok"},
     .injected_files = &.{.{ .id = "config", .bytes = "{\"ok\":true}\n" }},
     .command = &.{ "/bin/true" },
 });
@@ -183,6 +184,7 @@ Use `runFromSpore` for `spore run --from` semantics:
 ```zig
 const result = try libspore.runFromSpore(context, allocator, .{
     .spore_dir = "base.spore",
+    .guest_env = &.{"SPORE_TEST_ENV=ok"},
     .command = &.{ "/bin/true" },
 });
 ```

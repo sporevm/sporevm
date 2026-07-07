@@ -120,6 +120,14 @@ lookup:
 spore run -- /bin/echo hi
 ```
 
+Set command environment with repeatable `--env`. `KEY=VALUE` sets a value;
+`KEY` copies it from the host `spore` process environment:
+
+```bash
+spore run --env SPORE_TEST_ENV=ok -- /usr/bin/env
+SPORE_TEST_ENV=ok spore run --env SPORE_TEST_ENV -- /usr/bin/env
+```
+
 Forward host stdin explicitly with `-i` when the guest process should read
 input. Without `-i`, runs keep the script-friendly default and do not attach
 host stdin:

@@ -242,6 +242,7 @@ pub const ManagedRunOptions = struct {
     image_pull_policy: ImagePullPolicy = .missing,
     /// Guest command and arguments. The first element is the executable.
     command: []const []const u8,
+    guest_env: []const []const u8 = &.{},
     /// Ephemeral files made available under /run/sporevm/injected for this fresh run.
     injected_files: []const InjectedFile = &.{},
     interactive: bool = false,
@@ -274,6 +275,7 @@ pub const RunFromSporeOptions = struct {
     /// Guest command and arguments. The first element is the executable.
     /// Leave empty to attach to a saved session.
     command: []const []const u8,
+    guest_env: []const []const u8 = &.{},
     /// Saved session to attach when command is empty.
     attach_session_id: ?[]const u8 = null,
     interactive: bool = false,
@@ -836,6 +838,7 @@ pub fn runManaged(
     const default_initrd = options.initrd_path == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null;
     const kernel_path = options.kernel_path orelse try run_mod.resolveDefaultKernelPath(init, arena);
     const initrd_path = try run_mod.resolveConfiguredInitrdPath(init, options.initrd_path);
+    const guest_env = try run_mod.mergeGuestEnv(arena, rootfs.guest_env, options.guest_env);
 
     return run_mod.execute(.{ .io = init.io, .environ_map = init.environ_map }, arena, .{
         .backend = options.backend,
@@ -848,7 +851,7 @@ pub fn runManaged(
         .injected_files = options.injected_files,
         .interactive = options.interactive,
         .tty = options.tty,
-        .guest_env = rootfs.guest_env,
+        .guest_env = guest_env,
         .guest_working_dir = rootfs.guest_working_dir,
         .memory = options.memory,
         .vcpus = options.vcpus,
@@ -924,6 +927,7 @@ pub fn runFromSpore(
         .start_generation_params = start_generation_params,
         .require_generation_ready = start_generation_params != null,
         .command = options.command,
+        .guest_env = options.guest_env,
         .interactive = options.interactive,
         .tty = options.tty,
         .memory = try memory_config.fromManifestBytes(if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size),

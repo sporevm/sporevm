@@ -172,6 +172,26 @@ pub const InjectedFileSource = struct {
     path: []const u8,
 };
 
+pub const GuestEnvSpec = union(enum) {
+    literal: []const u8,
+    copy: []const u8,
+};
+
+pub const GuestEnvSpecList = struct {
+    items: [max_guest_envc]GuestEnvSpec = undefined,
+    len: usize = 0,
+
+    pub fn append(self: *GuestEnvSpecList, spec: GuestEnvSpec) !void {
+        if (self.len >= max_guest_envc) return error.TooManyRunEnv;
+        self.items[self.len] = spec;
+        self.len += 1;
+    }
+
+    pub fn slice(self: *const GuestEnvSpecList) []const GuestEnvSpec {
+        return self.items[0..self.len];
+    }
+};
+
 pub const InjectedFileSourceList = struct {
     items: [max_injected_files]InjectedFileSource = undefined,
     len: usize = 0,
@@ -966,6 +986,7 @@ pub const CliOptions = struct {
     event_mode: EventMode = .none,
     interactive: bool = false,
     tty: bool = false,
+    guest_env_specs: GuestEnvSpecList = .{},
     injected_file_sources: InjectedFileSourceList = .{},
     command_mode: CommandMode = .argv,
     command: []const []const u8,
@@ -1016,6 +1037,7 @@ pub const cli_usage =
     \\  --timeout DURATION      Probe timeout (default: 30s; e.g. 500ms, 1m)
     \\  --console-log PATH      Write guest console output to PATH
     \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
+    \\  --env KEY[=VALUE]       Set or copy a host env var for the guest command
     \\  --inject ID=PATH        Inject PATH as /run/sporevm/injected/ID for this run
     \\  -i, --interactive       Keep stdin open and forward it to the guest process
     \\  -t, --tty               Allocate a guest terminal for the process
@@ -1056,6 +1078,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var event_mode: EventMode = .none;
     var interactive = false;
     var tty = false;
+    var guest_env_specs = GuestEnvSpecList{};
     var injected_file_sources = InjectedFileSourceList{};
     var command_mode: CommandMode = .shell;
     var command_had_delimiter = false;
@@ -1113,6 +1136,15 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             const raw = args[i]["--events=".len..];
             event_mode = EventMode.parse(raw) orelse {
                 std.debug.print("--events must be jsonl\n", .{});
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, args[i], "--env")) {
+            const raw = takeValue(args, &i, args[i]);
+            guest_env_specs.append(parseGuestEnvSpec(raw) catch |err| {
+                std.debug.print("spore run: invalid --env {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            }) catch |err| {
+                std.debug.print("spore run: invalid --env {s}: {s}\n", .{ raw, @errorName(err) });
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, args[i], "-i") or std.mem.eql(u8, args[i], "--interactive")) {
@@ -1261,10 +1293,100 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .event_mode = event_mode,
         .interactive = interactive,
         .tty = tty,
+        .guest_env_specs = guest_env_specs,
         .injected_file_sources = injected_file_sources,
         .command_mode = command_mode,
         .command = argv,
     };
+}
+
+pub fn parseGuestEnvSpec(raw: []const u8) !GuestEnvSpec {
+    if (std.mem.indexOfScalar(u8, raw, '=')) |eq| {
+        const key = raw[0..eq];
+        try validateGuestEnvKey(key);
+        return .{ .literal = raw };
+    }
+    try validateGuestEnvKey(raw);
+    return .{ .copy = raw };
+}
+
+pub const GuestEnvResolveDiagnostic = struct {
+    missing_key: ?[]const u8 = null,
+};
+
+pub fn resolveCliGuestEnv(
+    allocator: std.mem.Allocator,
+    specs: []const GuestEnvSpec,
+    environ: *const std.process.Environ.Map,
+    diagnostic: ?*GuestEnvResolveDiagnostic,
+) ![]const []const u8 {
+    if (diagnostic) |diag| diag.* = .{};
+    var out = std.array_list.Managed([]const u8).init(allocator);
+    for (specs) |spec| {
+        const entry = switch (spec) {
+            .literal => |entry| entry,
+            .copy => |key| blk: {
+                const value = environ.get(key) orelse {
+                    if (diagnostic) |diag| diag.missing_key = key;
+                    return error.MissingHostEnvironment;
+                };
+                break :blk try std.fmt.allocPrint(allocator, "{s}={s}", .{ key, value });
+            },
+        };
+        if (entry.len > max_guest_env_len) return error.RunEnvTooLong;
+        try upsertGuestEnvEntry(&out, entry);
+    }
+    return out.toOwnedSlice();
+}
+
+pub fn mergeGuestEnv(allocator: std.mem.Allocator, base: []const []const u8, overrides: []const []const u8) ![]const []const u8 {
+    if (base.len == 0) return overrides;
+    if (overrides.len == 0) return base;
+    var out = std.array_list.Managed([]const u8).init(allocator);
+    for (base) |entry| {
+        if (!guestEnvHasKey(overrides, guestEnvEntryKey(entry))) try out.append(entry);
+    }
+    for (overrides) |entry| try out.append(entry);
+    if (out.items.len > max_guest_envc) return error.RunEnvCountUnsupported;
+    return out.toOwnedSlice();
+}
+
+fn upsertGuestEnvEntry(entries: *std.array_list.Managed([]const u8), entry: []const u8) !void {
+    const key = guestEnvEntryKey(entry) orelse return error.BadGuestEnvKey;
+    for (entries.items, 0..) |existing, i| {
+        if (guestEnvKeyEql(guestEnvEntryKey(existing), key)) {
+            entries.items[i] = entry;
+            return;
+        }
+    }
+    if (entries.items.len >= max_guest_envc) return error.RunEnvCountUnsupported;
+    try entries.append(entry);
+}
+
+fn guestEnvHasKey(entries: []const []const u8, key: ?[]const u8) bool {
+    for (entries) |entry| {
+        if (guestEnvKeyEql(guestEnvEntryKey(entry), key)) return true;
+    }
+    return false;
+}
+
+fn guestEnvKeyEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn guestEnvEntryKey(entry: []const u8) ?[]const u8 {
+    const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return null;
+    if (eq == 0) return null;
+    return entry[0..eq];
+}
+
+fn validateGuestEnvKey(key: []const u8) !void {
+    if (key.len == 0) return error.BadGuestEnvKey;
+    for (key, 0..) |c, i| {
+        if (std.ascii.isAlphabetic(c) or c == '_' or (i != 0 and std.ascii.isDigit(c))) continue;
+        return error.BadGuestEnvKey;
+    }
 }
 
 fn parseInjectedFileSource(raw: []const u8) !InjectedFileSource {
@@ -2760,6 +2882,7 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
     const session_id = try randomRunSessionId(context, allocator);
     return .{
         .bytes = try execRequestWithSessionOptions(allocator, opts.command, session_id, .{
+            .env = opts.guest_env,
             .resume_time_unix_ns = resume_time_unix_ns,
             .memory_pressure = memory_pressure,
             .interactive = opts.interactive,
@@ -3215,6 +3338,59 @@ test "run request encodes image env and working directory" {
     try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":123,\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"memory_pressure\":true,\"params_json\":\"{\\\"resume_entropy_seed\\\":\\\"abcd\\\"}\",\"require_generation_ready\":true,\"closed_env\":true}\n", request);
 }
 
+test "run request encodes env for run from spore command" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    const request = try execRequestForRun(.{ .io = std.testing.io, .environ_map = &env }, std.testing.allocator, .{
+        .kernel_path = "",
+        .resume_dir = "base.spore",
+        .command = &.{"/usr/bin/env"},
+        .guest_env = &.{"SPORE_TEST_ENV=ok"},
+    }, false);
+    defer std.testing.allocator.free(request.bytes);
+    defer std.testing.allocator.free(request.session_id);
+    try std.testing.expect(std.mem.indexOf(u8, request.bytes, "\"env\":[\"SPORE_TEST_ENV=ok\"]") != null);
+}
+
+test "cli env specs resolve host copies and last override wins" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("SPORE_TEST_ENV", "from-host");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const literal = try parseGuestEnvSpec("SPORE_TEST_ENV=literal=with-equals");
+    const copy = try parseGuestEnvSpec("SPORE_TEST_ENV");
+    const resolved = try resolveCliGuestEnv(arena, &.{ literal, copy }, &env, null);
+
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+    try std.testing.expectEqualStrings("SPORE_TEST_ENV=from-host", resolved[0]);
+}
+
+test "cli env specs reject empty keys and missing host values" {
+    try std.testing.expectError(error.BadGuestEnvKey, parseGuestEnvSpec("=bad"));
+    try std.testing.expectError(error.BadGuestEnvKey, parseGuestEnvSpec("1BAD=value"));
+    try std.testing.expectError(error.BadGuestEnvKey, parseGuestEnvSpec("BAD-KEY=value"));
+
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var diagnostic = GuestEnvResolveDiagnostic{};
+    const spec = try parseGuestEnvSpec("MISSING_ENV");
+    try std.testing.expectError(error.MissingHostEnvironment, resolveCliGuestEnv(std.testing.allocator, &.{spec}, &env, &diagnostic));
+    try std.testing.expectEqualStrings("MISSING_ENV", diagnostic.missing_key.?);
+}
+
+test "cli env overrides image env by key" {
+    const merged = try mergeGuestEnv(std.testing.allocator, &.{ "PATH=/bin", "KEEP=1" }, &.{ "PATH=/usr/bin", "NEW=2" });
+    defer std.testing.allocator.free(merged);
+
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
+    try std.testing.expectEqualStrings("KEEP=1", merged[0]);
+    try std.testing.expectEqualStrings("PATH=/usr/bin", merged[1]);
+    try std.testing.expectEqualStrings("NEW=2", merged[2]);
+}
+
 test "image rootfs metadata supplies run env and working directory" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3614,6 +3790,13 @@ test "run cli parser accepts injected files" {
     try std.testing.expectEqual(@as(usize, 1), opts.injected_file_sources.len);
     try std.testing.expectEqualStrings("config", opts.injected_file_sources.items[0].id);
     try std.testing.expectEqualStrings("host-config.json", opts.injected_file_sources.items[0].path);
+}
+
+test "run cli parser accepts repeatable env specs" {
+    const opts = try parseCliArgs(&.{ "--env", "SPORE_TEST_ENV=ok", "--env", "HOST_ENV", "--", "/usr/bin/env" });
+    try std.testing.expectEqual(@as(usize, 2), opts.guest_env_specs.len);
+    try std.testing.expectEqualStrings("SPORE_TEST_ENV=ok", opts.guest_env_specs.items[0].literal);
+    try std.testing.expectEqualStrings("HOST_ENV", opts.guest_env_specs.items[1].copy);
 }
 
 test "injected file initrd overlay contains the file" {
