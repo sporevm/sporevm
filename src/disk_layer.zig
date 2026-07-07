@@ -383,17 +383,27 @@ fn sealDisk(allocator: std.mem.Allocator, dir: []const u8, disk: anytype) Error!
     try ensureStoreDirs(allocator, dir);
 
     var extents: std.ArrayList(spore.DiskLayerExtent) = .empty;
-    errdefer extents.deinit(allocator);
+    errdefer {
+        for (extents.items) |extent| allocator.free(extent.digest);
+        extents.deinit(allocator);
+    }
     var zero_clusters: std.ArrayList(u64) = .empty;
     errdefer zero_clusters.deinit(allocator);
+
+    var cluster_buf: ?[]u8 = null;
+    defer if (cluster_buf) |buf| allocator.free(buf);
 
     var cluster_index: usize = 0;
     while (cluster_index < disk.clusterCount()) : (cluster_index += 1) {
         if (!try disk.isDirtyCluster(cluster_index)) continue;
 
         const len = try disk.clusterLen(cluster_index);
-        const buf = try allocator.alloc(u8, len);
-        defer allocator.free(buf);
+        if (cluster_buf == null) {
+            const cluster_size = std.math.cast(usize, disk.clusterSize()) orelse return error.BadManifest;
+            cluster_buf = try allocator.alloc(u8, cluster_size);
+        }
+        if (len > cluster_buf.?.len) return error.BadManifest;
+        const buf = cluster_buf.?[0..len];
         try disk.readCluster(cluster_index, buf);
 
         if (std.mem.allEqual(u8, buf, 0)) {
@@ -402,7 +412,9 @@ fn sealDisk(allocator: std.mem.Allocator, dir: []const u8, disk: anytype) Error!
         }
 
         const digest = try digestRefAlloc(allocator, buf);
+        errdefer allocator.free(digest);
         const object_path = try diskObjectPath(allocator, dir, digest);
+        defer allocator.free(object_path);
         try writeFileAllIfMissing(allocator, object_path, buf);
         try extents.append(allocator, .{
             .logical_cluster = @intCast(cluster_index),
@@ -411,7 +423,10 @@ fn sealDisk(allocator: std.mem.Allocator, dir: []const u8, disk: anytype) Error!
     }
 
     const extent_slice = try extents.toOwnedSlice(allocator);
-    errdefer allocator.free(extent_slice);
+    errdefer {
+        for (extent_slice) |extent| allocator.free(extent.digest);
+        allocator.free(extent_slice);
+    }
     const zero_slice = try zero_clusters.toOwnedSlice(allocator);
     errdefer allocator.free(zero_slice);
 
@@ -426,7 +441,9 @@ fn sealDisk(allocator: std.mem.Allocator, dir: []const u8, disk: anytype) Error!
     const json = std.json.Stringify.valueAlloc(allocator, layer, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
     defer allocator.free(json);
     const layer_ref = try digestRefAlloc(allocator, json);
+    errdefer allocator.free(layer_ref);
     const layer_path = try diskLayerPath(allocator, dir, layer_ref);
+    defer allocator.free(layer_path);
     try writeFileAllIfMissing(allocator, layer_path, json);
 
     return .{
@@ -700,6 +717,74 @@ fn openTestFile(path: [:0]const u8, mode: std.c.O) Error!std.c.fd_t {
     return fd;
 }
 
+const PeakLiveAllocator = struct {
+    backing: std.mem.Allocator,
+    live: usize = 0,
+    peak: usize = 0,
+    limit: usize = std.math.maxInt(usize),
+
+    fn allocator(self: *PeakLiveAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PeakLiveAllocator = @ptrCast(@alignCast(ctx));
+        const next = std.math.add(usize, self.live, len) catch return null;
+        if (next > self.limit) return null;
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live = next;
+        self.peak = @max(self.peak, self.live);
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *PeakLiveAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len == memory.len) return true;
+        if (new_len > memory.len) {
+            const next = std.math.add(usize, self.live, new_len - memory.len) catch return false;
+            if (next > self.limit) return false;
+            if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+            self.live = next;
+            self.peak = @max(self.peak, self.live);
+            return true;
+        }
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.live -= memory.len - new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *PeakLiveAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len == memory.len) return memory.ptr;
+        if (new_len > memory.len) {
+            const next = std.math.add(usize, self.live, new_len - memory.len) catch return null;
+            if (next > self.limit) return null;
+            const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+            self.live = next;
+            self.peak = @max(self.peak, self.live);
+            return ptr;
+        }
+        const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.live -= memory.len - new_len;
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PeakLiveAllocator = @ptrCast(@alignCast(ctx));
+        std.debug.assert(self.live >= memory.len);
+        self.live -= memory.len;
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 test "sealed cow layer reads over immutable base" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -773,6 +858,55 @@ test "zero dirty cluster overrides nonzero base" {
     var readback: [4096]u8 = undefined;
     try readAt(arena, dir, base_source, &layers, &readback, 0);
     try std.testing.expect(std.mem.allEqual(u8, &readback, 0));
+}
+
+test "sealing keeps scratch cluster storage bounded" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cluster_size: usize = 4096;
+    const cluster_count: usize = 6;
+    const disk_size = cluster_size * cluster_count;
+
+    const dir = try testDir(arena);
+    const base_path = try pathZ(arena, "{s}/base.img", .{dir});
+    const overlay_path = try pathZ(arena, "{s}/overlay.img", .{dir});
+
+    const base_bytes = try arena.alloc(u8, disk_size);
+    @memset(base_bytes, 0x11);
+    try writeFileAll(base_path, base_bytes);
+    try writeFileAll(overlay_path, "");
+
+    const base_fd = try openTestFile(base_path, .{ .ACCMODE = .RDONLY });
+    defer _ = std.c.close(base_fd);
+    const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
+    defer _ = std.c.close(overlay_fd);
+
+    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len);
+    var disk = try cow_disk.CowDisk.init(arena, base_source, overlay_fd, base_bytes.len, cluster_size);
+    defer disk.deinit();
+
+    var patch: [cluster_size]u8 = undefined;
+    var cluster_index: usize = 0;
+    while (cluster_index < cluster_count) : (cluster_index += 1) {
+        @memset(&patch, @intCast(cluster_index + 1));
+        try disk.writeAt(&patch, @intCast(cluster_index * cluster_size));
+    }
+
+    var peak_allocator = PeakLiveAllocator{ .backing = arena };
+    const seal_allocator = peak_allocator.allocator();
+    const sealed = try sealCowDisk(seal_allocator, dir, &disk);
+    defer {
+        seal_allocator.free(sealed.layer_ref);
+        for (sealed.layer.extents) |extent| seal_allocator.free(extent.digest);
+        seal_allocator.free(sealed.layer.extents);
+        seal_allocator.free(sealed.layer.zero_clusters);
+    }
+
+    try std.testing.expectEqual(@as(usize, cluster_count), sealed.layer.extents.len);
+    try std.testing.expect(peak_allocator.peak < cluster_size * 3);
 }
 
 test "layered cow appends only the new active head" {
