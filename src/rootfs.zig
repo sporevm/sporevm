@@ -43,8 +43,8 @@ pub const usage =
     \\Options:
     \\  --platform <os/arch>       Target platform (default: linux/arm64)
     \\  --metadata <path>          Metadata sidecar path (default: <output>.json)
-    \\  --mkfs <path>              mkfs.ext4 binary (default: auto-detect)
-    \\  --debugfs <path>           debugfs binary (default: auto-detect)
+    \\  --mkfs <path>              external writer mkfs.ext4 binary (auto-detect)
+    \\  --debugfs <path>           external writer debugfs binary (auto-detect)
     \\
 ;
 
@@ -135,8 +135,8 @@ const BuildOptions = struct {
     output: []const u8,
     metadata: []const u8,
     platform: Platform = .{},
-    mkfs: []const u8,
-    debugfs: []const u8,
+    mkfs: ?[]const u8,
+    debugfs: ?[]const u8,
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: ?[]const u8 = null,
     cache_owned_output: bool = false,
@@ -592,9 +592,9 @@ fn rootfsBuildProfileEnabled(value: ?[]const u8) bool {
 }
 
 fn nativeExt4WriterEnabled(value: ?[]const u8) !bool {
-    const raw = value orelse return false;
-    if (raw.len == 0 or std.mem.eql(u8, raw, "external")) return false;
-    if (std.mem.eql(u8, raw, "native")) return true;
+    const raw = value orelse return true;
+    if (raw.len == 0 or std.mem.eql(u8, raw, "native")) return true;
+    if (std.mem.eql(u8, raw, "external")) return false;
     return error.UnsupportedExt4Writer;
 }
 
@@ -777,8 +777,8 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, request: Buil
         .output = request.output,
         .metadata = request.metadata,
         .platform = request.platform,
-        .mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.mkfs, .mkfs),
-        .debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.debugfs, .debugfs),
+        .mkfs = request.mkfs,
+        .debugfs = request.debugfs,
         .metadata_rootfs_path = request.metadata_rootfs_path,
         .temp_dir_root = request.temp_dir_root,
     };
@@ -836,8 +836,8 @@ pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, req
         .output = temp_rootfs_path,
         .metadata = temp_metadata_path,
         .platform = request.platform,
-        .mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.mkfs, .mkfs),
-        .debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.debugfs, .debugfs),
+        .mkfs = request.mkfs,
+        .debugfs = request.debugfs,
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
         .rootfs_storage = request.rootfs_storage,
@@ -907,8 +907,8 @@ pub fn importTar(init: std.process.Init, allocator: std.mem.Allocator, request: 
         .output = temp_rootfs_path,
         .metadata = temp_metadata_path,
         .platform = request.platform,
-        .mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.mkfs, .mkfs),
-        .debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.debugfs, .debugfs),
+        .mkfs = request.mkfs,
+        .debugfs = request.debugfs,
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
         .rootfs_storage = request.rootfs_storage,
@@ -992,8 +992,8 @@ const LayoutBuildOptions = struct {
     output: []const u8,
     metadata: []const u8,
     platform: Platform = .{},
-    mkfs: []const u8,
-    debugfs: []const u8,
+    mkfs: ?[]const u8,
+    debugfs: ?[]const u8,
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: []const u8,
     rootfs_storage: RootfsStoragePolicy = .chunked,
@@ -1008,8 +1008,8 @@ const TarBuildOptions = struct {
     output: []const u8,
     metadata: []const u8,
     platform: Platform = .{},
-    mkfs: []const u8,
-    debugfs: []const u8,
+    mkfs: ?[]const u8,
+    debugfs: ?[]const u8,
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: []const u8,
     rootfs_storage: RootfsStoragePolicy = .chunked,
@@ -1032,8 +1032,8 @@ const MaterializeOptions = struct {
     layers: []const MaterializeLayer,
     output: []const u8,
     metadata: []const u8,
-    mkfs: []const u8,
-    debugfs: []const u8,
+    mkfs: ?[]const u8,
+    debugfs: ?[]const u8,
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir: []const u8,
     profile: RootfsBuildProfile,
@@ -1416,6 +1416,8 @@ fn materializeRootFSExternal(
     layer_meta: []oci.LayerMetadata,
     deterministic_ext4: ext4.Determinism,
 ) ![chunk.ChunkId.hex_len]u8 {
+    const mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, opts.mkfs, .mkfs);
+    const debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, opts.debugfs, .debugfs);
     const rootfs_dir_path = try std.fmt.allocPrint(allocator, "{s}/rootfs", .{opts.temp_dir});
     var rootfs_dir = try Io.Dir.cwd().createDirPathOpen(init.io, rootfs_dir_path, .{
         .open_options = .{ .access_sub_paths = true, .iterate = true },
@@ -1463,11 +1465,11 @@ fn materializeRootFSExternal(
     try ext4.createEmptyFile(init.io, opts.output, image_size);
     opts.profile.phase("ext4_create_empty", create_start);
     const mkfs_start = opts.profile.start();
-    try ext4.runMkfs(init, allocator, opts.mkfs, rootfs_dir_path, opts.output, deterministic_ext4, inode_count);
+    try ext4.runMkfs(init, allocator, mkfs, rootfs_dir_path, opts.output, deterministic_ext4, inode_count);
     opts.profile.phase("mkfs_ext4", mkfs_start);
     const debugfs_script = try std.fmt.allocPrint(allocator, "{s}/debugfs-ownership.cmds", .{opts.temp_dir});
     const debugfs_start = opts.profile.start();
-    try ext4.runDebugfsFinalize(init, allocator, opts.debugfs, opts.output, debugfs_script, &owners, &xattrs, deterministic_ext4);
+    try ext4.runDebugfsFinalize(init, allocator, debugfs, opts.output, debugfs_script, &owners, &xattrs, deterministic_ext4);
     opts.profile.phase("debugfs_finalize", debugfs_start);
 
     const blake3_start = opts.profile.start();
@@ -1966,8 +1968,8 @@ pub fn buildCachedImageRootfs(
         .output = temp_rootfs_path,
         .metadata = temp_metadata_path,
         .platform = resolved.platform,
-        .mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, null, .mkfs),
-        .debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, null, .debugfs),
+        .mkfs = null,
+        .debugfs = null,
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
         .cache_owned_output = true,
@@ -2354,15 +2356,15 @@ test "rootfs build profile env is opt-in" {
     try std.testing.expect(rootfsBuildProfileEnabled("1"));
 }
 
-test "native ext4 writer env is explicit and fail-closed" {
-    try std.testing.expect(!try nativeExt4WriterEnabled(null));
-    try std.testing.expect(!try nativeExt4WriterEnabled(""));
+test "native ext4 writer env defaults native and fails closed" {
+    try std.testing.expect(try nativeExt4WriterEnabled(null));
+    try std.testing.expect(try nativeExt4WriterEnabled(""));
     try std.testing.expect(!try nativeExt4WriterEnabled("external"));
     try std.testing.expect(try nativeExt4WriterEnabled("native"));
     try std.testing.expectError(error.UnsupportedExt4Writer, nativeExt4WriterEnabled("yes"));
 }
 
-test "materialize rootfs can use native ext4 writer" {
+test "materialize rootfs uses native ext4 writer by default" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const tmp = "zig-cache/test-rootfs-native-materialize";
@@ -2374,7 +2376,6 @@ test "materialize rootfs can use native ext4 writer" {
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
-    try env.put(ext4_writer_env, "native");
     try env.put(local_paths.rootfs_cache_env, tmp ++ "/rootfs-cache");
     var process_arena = std.heap.ArenaAllocator.init(allocator);
     defer process_arena.deinit();
@@ -2487,6 +2488,7 @@ test "native and external rootfs materialization expose matching files" {
 
     const native_output = tmp ++ "/native.ext4";
     const external_output = tmp ++ "/external.ext4";
+    try env.put(ext4_writer_env, "external");
     const base_opts = MaterializeOptions{
         .requested_ref = "local/native:latest",
         .resolved_image_ref = "local/native@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",

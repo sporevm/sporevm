@@ -17,8 +17,8 @@ const build_usage =
     \\  --output <path>        Rootfs ext4 output path
     \\  --metadata <path>      Metadata sidecar path (default: <output>.json)
     \\  --platform <os/arch>   Target platform (default: linux/arm64)
-    \\  --mkfs <path>          mkfs.ext4 binary (default: auto-detect)
-    \\  --debugfs <path>       debugfs binary (default: auto-detect)
+    \\  --mkfs <path>          external writer mkfs.ext4 binary (auto-detect)
+    \\  --debugfs <path>       external writer debugfs binary (auto-detect)
     \\  -h, --help             Show this help
     \\
 ;
@@ -32,8 +32,8 @@ const import_oci_usage =
     \\  --platform <os/arch>   Target platform (default: linux/arm64)
     \\  --rootfs-storage <policy>
     \\                       Rootfs storage: chunked or flat (default: chunked)
-    \\  --mkfs <path>          mkfs.ext4 binary (default: auto-detect)
-    \\  --debugfs <path>       debugfs binary (default: auto-detect)
+    \\  --mkfs <path>          external writer mkfs.ext4 binary (auto-detect)
+    \\  --debugfs <path>       external writer debugfs binary (auto-detect)
     \\  -h, --help             Show this help
     \\
 ;
@@ -47,8 +47,8 @@ const import_tar_usage =
     \\  --platform <os/arch>   Target platform (default: linux/arm64)
     \\  --rootfs-storage <policy>
     \\                       Rootfs storage: chunked or flat (default: chunked)
-    \\  --mkfs <path>          mkfs.ext4 binary (default: auto-detect)
-    \\  --debugfs <path>       debugfs binary (default: auto-detect)
+    \\  --mkfs <path>          external writer mkfs.ext4 binary (auto-detect)
+    \\  --debugfs <path>       external writer debugfs binary (auto-detect)
     \\  -h, --help             Show this help
     \\
 ;

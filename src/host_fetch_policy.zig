@@ -96,6 +96,7 @@ pub fn connectResolvedUri(client: *std.http.Client, uri: std.Uri, address: IpAdd
     var address_buffer: [HostName.max_len]u8 = undefined;
     var logical_host_buffer: [HostName.max_len]u8 = undefined;
     const target = try connectionTarget(uri, address, &address_buffer, &logical_host_buffer);
+    try ensureTlsReady(client, target.protocol);
     return client.connectTcpOptions(.{
         .host = target.connect_host,
         .port = target.port,
@@ -103,6 +104,31 @@ pub fn connectResolvedUri(client: *std.http.Client, uri: std.Uri, address: IpAdd
         .proxied_host = target.logical_host,
         .proxied_port = target.port,
     });
+}
+
+fn ensureTlsReady(client: *std.http.Client, protocol: std.http.Client.Protocol) !void {
+    if (protocol != .tls) return;
+    if (std.http.Client.disable_tls) unreachable;
+
+    {
+        try client.ca_bundle_lock.lockShared(client.io);
+        defer client.ca_bundle_lock.unlockShared(client.io);
+        if (client.now != null) return;
+    }
+
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(client.allocator);
+    const now = Io.Clock.real.now(client.io);
+    bundle.rescan(client.allocator, client.io, now) catch |err| switch (err) {
+        error.Canceled => |e| return e,
+        else => return error.CertificateBundleLoadFailure,
+    };
+
+    try client.ca_bundle_lock.lock(client.io);
+    defer client.ca_bundle_lock.unlock(client.io);
+    if (client.now != null) return;
+    client.now = now;
+    std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
 }
 
 pub fn validateAddress(address: IpAddress) Error!void {
