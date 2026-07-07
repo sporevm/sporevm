@@ -127,6 +127,9 @@ pub const LayeredCowDisk = struct {
 
     pub fn readAt(self: *LayeredCowDisk, buf: []u8, offset: u64) Error!void {
         try self.checkRange(buf.len, offset);
+        var cluster_buf: ?[]u8 = null;
+        defer if (cluster_buf) |scratch| self.allocator.free(scratch);
+
         var cursor: usize = 0;
         while (cursor < buf.len) {
             const absolute = offset + cursor;
@@ -140,11 +143,10 @@ pub const LayeredCowDisk = struct {
                     .zero => @memset(target, 0),
                     .object => |digest| {
                         const cluster_len = try self.clusterLen(span.cluster_index);
-                        const cluster_buf = try self.allocator.alloc(u8, cluster_len);
-                        defer self.allocator.free(cluster_buf);
-                        try readDiskObject(self.allocator, self.dir, digest, cluster_buf);
+                        const scratch = try clusterScratch(self.allocator, &cluster_buf, cluster_len);
+                        try readDiskObject(self.allocator, self.dir, digest, scratch);
                         const cluster_offset: usize = @intCast(absolute % self.cluster_size);
-                        @memcpy(target, cluster_buf[cluster_offset..][0..span.len]);
+                        @memcpy(target, scratch[cluster_offset..][0..span.len]);
                     },
                 }
             }
@@ -455,6 +457,7 @@ fn sealDisk(allocator: std.mem.Allocator, dir: []const u8, disk: anytype) Error!
 
 pub fn loadLayer(allocator: std.mem.Allocator, dir: []const u8, layer_ref: []const u8) Error!std.json.Parsed(spore.DiskLayer) {
     const path = try diskLayerPath(allocator, dir, layer_ref);
+    defer allocator.free(path);
     const bytes = try readFileAll(allocator, path, layer_index_max_bytes);
     defer allocator.free(bytes);
 
@@ -474,32 +477,55 @@ pub fn copyLayerChain(allocator: std.mem.Allocator, source_dir: []const u8, targ
     try ensureStoreDirs(allocator, target_dir);
 
     for (disk.layers) |layer_ref| {
-        const source_layer_path = try diskLayerPath(allocator, source_dir, layer_ref);
-        const layer_bytes = try readFileAll(allocator, source_layer_path, layer_index_max_bytes);
-        defer allocator.free(layer_bytes);
-
-        const layer_id = chunk.ChunkId.fromHex(try spore.diskDigestHex(layer_ref)) catch return error.BadManifest;
-        if (!layer_id.matches(layer_bytes)) return error.BadChunk;
-
-        const parsed = std.json.parseFromSlice(spore.DiskLayer, allocator, layer_bytes, .{
-            .allocate = .alloc_always,
-        }) catch return error.BadManifest;
-        defer parsed.deinit();
-        try spore.validateDiskLayer(parsed.value);
-        if (parsed.value.disk_size != disk.size) return error.BadManifest;
-
-        const target_layer_path = try diskLayerPath(allocator, target_dir, layer_ref);
-        try writeFileAllIfMissing(allocator, target_layer_path, layer_bytes);
-
-        for (parsed.value.extents) |extent| {
-            const len = try spore.diskClusterLen(parsed.value.disk_size, parsed.value.cluster_size, extent.logical_cluster);
-            const data = try allocator.alloc(u8, len);
-            defer allocator.free(data);
-            try readDiskObject(allocator, source_dir, extent.digest, data);
-            const target_object_path = try diskObjectPath(allocator, target_dir, extent.digest);
-            try writeFileAllIfMissing(allocator, target_object_path, data);
-        }
+        try copyLayer(allocator, source_dir, target_dir, layer_ref, disk.size);
     }
+}
+
+fn copyLayer(
+    allocator: std.mem.Allocator,
+    source_dir: []const u8,
+    target_dir: []const u8,
+    layer_ref: []const u8,
+    disk_size: u64,
+) Error!void {
+    const source_layer_path = try diskLayerPath(allocator, source_dir, layer_ref);
+    defer allocator.free(source_layer_path);
+    const layer_bytes = try readFileAll(allocator, source_layer_path, layer_index_max_bytes);
+    defer allocator.free(layer_bytes);
+
+    const layer_id = chunk.ChunkId.fromHex(try spore.diskDigestHex(layer_ref)) catch return error.BadManifest;
+    if (!layer_id.matches(layer_bytes)) return error.BadChunk;
+
+    const parsed = std.json.parseFromSlice(spore.DiskLayer, allocator, layer_bytes, .{
+        .allocate = .alloc_always,
+    }) catch return error.BadManifest;
+    defer parsed.deinit();
+    try spore.validateDiskLayer(parsed.value);
+    if (parsed.value.disk_size != disk_size) return error.BadManifest;
+
+    const target_layer_path = try diskLayerPath(allocator, target_dir, layer_ref);
+    defer allocator.free(target_layer_path);
+    try writeFileAllIfMissing(allocator, target_layer_path, layer_bytes);
+
+    for (parsed.value.extents) |extent| {
+        try copyLayerExtent(allocator, source_dir, target_dir, parsed.value, extent);
+    }
+}
+
+fn copyLayerExtent(
+    allocator: std.mem.Allocator,
+    source_dir: []const u8,
+    target_dir: []const u8,
+    layer: spore.DiskLayer,
+    extent: spore.DiskLayerExtent,
+) Error!void {
+    const len = try spore.diskClusterLen(layer.disk_size, layer.cluster_size, extent.logical_cluster);
+    const data = try allocator.alloc(u8, len);
+    defer allocator.free(data);
+    try readDiskObject(allocator, source_dir, extent.digest, data);
+    const target_object_path = try diskObjectPath(allocator, target_dir, extent.digest);
+    defer allocator.free(target_object_path);
+    try writeFileAllIfMissing(allocator, target_object_path, data);
 }
 
 pub fn readAt(
@@ -524,6 +550,9 @@ pub fn readAt(
         if (layer.disk_size != disk_size or layer.cluster_size != cluster_size) return error.BadManifest;
     }
 
+    var cluster_buf: ?[]u8 = null;
+    defer if (cluster_buf) |scratch| allocator.free(scratch);
+
     var cursor: usize = 0;
     while (cursor < buf.len) {
         const absolute = offset + cursor;
@@ -533,10 +562,9 @@ pub fn readAt(
         const cluster_len = try spore.diskClusterLen(disk_size, cluster_size, logical_cluster);
         const span_len = @min(buf.len - cursor, cluster_len - @as(usize, @intCast(cluster_offset)));
 
-        const cluster_buf = try allocator.alloc(u8, cluster_len);
-        defer allocator.free(cluster_buf);
-        try readClusterFromChain(allocator, dir, base, layers, logical_cluster, cluster_buf);
-        @memcpy(buf[cursor..][0..span_len], cluster_buf[@intCast(cluster_offset)..][0..span_len]);
+        const scratch = try clusterScratch(allocator, &cluster_buf, cluster_len);
+        try readClusterFromChain(allocator, dir, base, layers, logical_cluster, scratch);
+        @memcpy(buf[cursor..][0..span_len], scratch[@intCast(cluster_offset)..][0..span_len]);
         cursor += span_len;
     }
 }
@@ -577,14 +605,28 @@ fn readClusterFromChain(
     try base.readAt(target, offset);
 }
 
+fn clusterScratch(allocator: std.mem.Allocator, scratch: *?[]u8, len: usize) Error![]u8 {
+    if (scratch.*) |buf| {
+        if (buf.len >= len) return buf[0..len];
+        allocator.free(buf);
+        scratch.* = null;
+    }
+    const buf = try allocator.alloc(u8, len);
+    scratch.* = buf;
+    return buf;
+}
+
 fn readDiskObject(allocator: std.mem.Allocator, dir: []const u8, digest: []const u8, target: []u8) Error!void {
     const path = try diskObjectPath(allocator, dir, digest);
-    const data = try readFileAll(allocator, path, target.len);
-    defer allocator.free(data);
-    if (data.len != target.len) return error.BadChunk;
+    defer allocator.free(path);
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    const size = try fstatRegularSize(fd);
+    if (size != target.len) return error.BadChunk;
+    try readExact(fd, target, 0);
     const id = chunk.ChunkId.fromHex(try spore.diskDigestHex(digest)) catch return error.BadManifest;
-    if (!id.matches(data)) return error.BadChunk;
-    @memcpy(target, data);
+    if (!id.matches(target)) return error.BadChunk;
 }
 
 fn digestRefAlloc(allocator: std.mem.Allocator, data: []const u8) Error![]const u8 {
@@ -594,11 +636,17 @@ fn digestRefAlloc(allocator: std.mem.Allocator, data: []const u8) Error![]const 
 }
 
 fn ensureStoreDirs(allocator: std.mem.Allocator, dir: []const u8) Error!void {
-    try ensureDir(try pathZ(allocator, "{s}", .{dir}));
-    try ensureDir(try pathZ(allocator, "{s}/diskobjects", .{dir}));
-    try ensureDir(try pathZ(allocator, "{s}/diskobjects/blake3", .{dir}));
-    try ensureDir(try pathZ(allocator, "{s}/disklayers", .{dir}));
-    try ensureDir(try pathZ(allocator, "{s}/disklayers/blake3", .{dir}));
+    try ensureStoreDir(allocator, "{s}", .{dir});
+    try ensureStoreDir(allocator, "{s}/diskobjects", .{dir});
+    try ensureStoreDir(allocator, "{s}/diskobjects/blake3", .{dir});
+    try ensureStoreDir(allocator, "{s}/disklayers", .{dir});
+    try ensureStoreDir(allocator, "{s}/disklayers/blake3", .{dir});
+}
+
+fn ensureStoreDir(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Error!void {
+    const path = try pathZ(allocator, fmt, args);
+    defer allocator.free(path);
+    try ensureDir(path);
 }
 
 fn ensureDir(path: [:0]const u8) Error!void {
@@ -785,6 +833,82 @@ const PeakLiveAllocator = struct {
     }
 };
 
+fn expectPatternedClusters(bytes: []const u8, cluster_size: usize, cluster_count: usize) !void {
+    var cluster_index: usize = 0;
+    while (cluster_index < cluster_count) : (cluster_index += 1) {
+        const start = cluster_index * cluster_size;
+        const end = start + cluster_size;
+        try std.testing.expect(std.mem.allEqual(u8, bytes[start..end], @intCast(cluster_index + 1)));
+    }
+}
+
+fn writeDiskLayerForTest(allocator: std.mem.Allocator, dir: []const u8, layer: spore.DiskLayer) Error![]const u8 {
+    const json = std.json.Stringify.valueAlloc(allocator, layer, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
+    defer allocator.free(json);
+    const layer_ref = try digestRefAlloc(allocator, json);
+    errdefer allocator.free(layer_ref);
+    const layer_path = try diskLayerPath(allocator, dir, layer_ref);
+    defer allocator.free(layer_path);
+    try writeFileAll(layer_path, json);
+    return layer_ref;
+}
+
+const PatternedLayerFixture = struct {
+    dir: []const u8,
+    base_fd: std.c.fd_t,
+    base_source: block_source.FileBlockSource,
+    sealed: SealResult,
+    disk_size: usize,
+    cluster_size: usize,
+    cluster_count: usize,
+
+    fn deinit(self: *PatternedLayerFixture) void {
+        if (self.base_fd >= 0) {
+            _ = std.c.close(self.base_fd);
+            self.base_fd = -1;
+        }
+    }
+};
+
+fn createPatternedLayerFixture(arena: std.mem.Allocator, cluster_size: usize, cluster_count: usize) !PatternedLayerFixture {
+    const disk_size = cluster_size * cluster_count;
+    const dir = try testDir(arena);
+    const base_path = try pathZ(arena, "{s}/base.img", .{dir});
+    const overlay_path = try pathZ(arena, "{s}/overlay.img", .{dir});
+
+    const base_bytes = try arena.alloc(u8, disk_size);
+    @memset(base_bytes, 0x11);
+    try writeFileAll(base_path, base_bytes);
+    try writeFileAll(overlay_path, "");
+
+    const base_fd = try openTestFile(base_path, .{ .ACCMODE = .RDONLY });
+    errdefer _ = std.c.close(base_fd);
+    const overlay_fd = try openTestFile(overlay_path, .{ .ACCMODE = .RDWR });
+    defer _ = std.c.close(overlay_fd);
+
+    const base_source = block_source.FileBlockSource.init(base_fd, base_bytes.len);
+    var disk = try cow_disk.CowDisk.init(arena, base_source, overlay_fd, base_bytes.len, cluster_size);
+    defer disk.deinit();
+
+    const patch = try arena.alloc(u8, cluster_size);
+    var cluster_index: usize = 0;
+    while (cluster_index < cluster_count) : (cluster_index += 1) {
+        @memset(patch, @intCast(cluster_index + 1));
+        try disk.writeAt(patch, @intCast(cluster_index * cluster_size));
+    }
+
+    const sealed = try sealCowDisk(arena, dir, &disk);
+    return .{
+        .dir = dir,
+        .base_fd = base_fd,
+        .base_source = base_source,
+        .sealed = sealed,
+        .disk_size = disk_size,
+        .cluster_size = cluster_size,
+        .cluster_count = cluster_count,
+    };
+}
+
 test "sealed cow layer reads over immutable base" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -907,6 +1031,134 @@ test "sealing keeps scratch cluster storage bounded" {
 
     try std.testing.expectEqual(@as(usize, cluster_count), sealed.layer.extents.len);
     try std.testing.expect(peak_allocator.peak < cluster_size * 3);
+}
+
+test "package layered reads keep scratch cluster storage bounded" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fixture = try createPatternedLayerFixture(arena, 4096, 6);
+    defer fixture.deinit();
+    const layers = [_]spore.DiskLayer{fixture.sealed.layer};
+    const readback = try arena.alloc(u8, fixture.disk_size);
+
+    var peak_allocator = PeakLiveAllocator{ .backing = arena, .limit = fixture.cluster_size * 3 };
+    try readAt(peak_allocator.allocator(), fixture.dir, fixture.base_source, &layers, readback, 0);
+
+    try std.testing.expectEqual(@as(usize, 0), peak_allocator.live);
+    try std.testing.expect(peak_allocator.peak < fixture.cluster_size * 3);
+    try expectPatternedClusters(readback, fixture.cluster_size, fixture.cluster_count);
+}
+
+test "layered cow reads keep scratch cluster storage bounded" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fixture = try createPatternedLayerFixture(arena, 4096, 6);
+    defer fixture.deinit();
+    const layer_refs = [_][]const u8{fixture.sealed.layer_ref};
+    const layered_disk = spore.Disk{
+        .device = .{ .mmio_slot = 0 },
+        .size = fixture.disk_size,
+        .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .layers = &layer_refs,
+    };
+    const loaded_layers = try loadLayerChain(arena, fixture.dir, layered_disk);
+    var layered_overlay = try createTempOverlay(arena);
+    defer layered_overlay.deinit();
+    var layered = try LayeredCowDisk.init(arena, fixture.dir, fixture.base_source, layered_overlay.fd, layered_disk, loaded_layers);
+    defer layered.deinit();
+
+    const readback = try arena.alloc(u8, fixture.disk_size);
+    var peak_allocator = PeakLiveAllocator{ .backing = arena, .limit = fixture.cluster_size * 3 };
+    const original_allocator = layered.allocator;
+    layered.allocator = peak_allocator.allocator();
+    defer layered.allocator = original_allocator;
+    try layered.readAt(readback, 0);
+
+    try std.testing.expectEqual(@as(usize, 0), peak_allocator.live);
+    try std.testing.expect(peak_allocator.peak < fixture.cluster_size * 3);
+    try expectPatternedClusters(readback, fixture.cluster_size, fixture.cluster_count);
+}
+
+test "copying layer object data keeps scratch storage bounded" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fixture = try createPatternedLayerFixture(arena, 4096, 6);
+    defer fixture.deinit();
+    const target_dir = try pathZ(arena, "{s}/target.spore", .{fixture.dir});
+    const layer_refs = [_][]const u8{fixture.sealed.layer_ref};
+    const manifest_disk = spore.Disk{
+        .device = .{ .mmio_slot = 0 },
+        .size = fixture.disk_size,
+        .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .layers = &layer_refs,
+    };
+
+    var peak_allocator = PeakLiveAllocator{ .backing = arena, .limit = fixture.cluster_size * 3 };
+    try copyLayerChain(peak_allocator.allocator(), fixture.dir, target_dir, manifest_disk);
+
+    try std.testing.expectEqual(@as(usize, 0), peak_allocator.live);
+    try std.testing.expect(peak_allocator.peak < fixture.cluster_size * 3);
+
+    const copied = try loadLayer(arena, target_dir, fixture.sealed.layer_ref);
+    defer copied.deinit();
+    const copied_layers = [_]spore.DiskLayer{copied.value};
+    const readback = try arena.alloc(u8, fixture.disk_size);
+    try readAt(arena, target_dir, fixture.base_source, &copied_layers, readback, 0);
+    try expectPatternedClusters(readback, fixture.cluster_size, fixture.cluster_count);
+}
+
+test "copying layer indexes releases each layer before the next" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cluster_size: usize = 512;
+    const zero_count: usize = 2048;
+    const layer_count: usize = 6;
+    const disk_size: u64 = @intCast(cluster_size * zero_count * layer_count);
+
+    const source_dir = try testDir(arena);
+    const target_dir = try pathZ(arena, "{s}/target.spore", .{source_dir});
+    try ensureStoreDirs(arena, source_dir);
+
+    const layer_refs = try arena.alloc([]const u8, layer_count);
+    var layer_index: usize = 0;
+    while (layer_index < layer_count) : (layer_index += 1) {
+        const zero_clusters = try arena.alloc(u64, zero_count);
+        for (zero_clusters, 0..) |*logical_cluster, zero_index| {
+            logical_cluster.* = @intCast(layer_index * zero_count + zero_index);
+        }
+        const layer = spore.DiskLayer{
+            .cluster_size = cluster_size,
+            .disk_size = disk_size,
+            .zero_clusters = zero_clusters,
+        };
+        layer_refs[layer_index] = try writeDiskLayerForTest(arena, source_dir, layer);
+    }
+
+    const manifest_disk = spore.Disk{
+        .device = .{ .mmio_slot = 0 },
+        .size = disk_size,
+        .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .layers = layer_refs,
+    };
+
+    const live_limit = 1024 * 1024;
+    var peak_allocator = PeakLiveAllocator{ .backing = arena, .limit = live_limit };
+    try copyLayerChain(peak_allocator.allocator(), source_dir, target_dir, manifest_disk);
+
+    try std.testing.expectEqual(@as(usize, 0), peak_allocator.live);
+    try std.testing.expect(peak_allocator.peak < live_limit);
 }
 
 test "layered cow appends only the new active head" {
