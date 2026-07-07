@@ -70,9 +70,11 @@ pub fn openVerifiedFromCache(
     rootfs: spore.Rootfs,
 ) !std.c.fd_t {
     const path = try digestPath(allocator, cache_root, rootfs.artifact.digest);
+    defer allocator.free(path);
     if (!try regularFileNoSymlink(io, path)) return error.RootFSDigestCacheMiss;
     const pathz = try allocator.dupeZ(u8, path);
-    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    defer allocator.free(pathz);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSDigestCacheMiss;
     errdefer _ = std.c.close(fd);
     if (!try fdIsRegularFile(io, fd)) return error.RootFSDigestCacheMiss;
@@ -161,13 +163,20 @@ pub fn installExpectedPathAfterSourceVerified(
     copy_options: CopyOptions,
 ) !InstallResult {
     const digest_path = try digestPath(allocator, cache_root, artifact.digest);
+    defer allocator.free(digest_path);
     const digest_dir = std.fs.path.dirname(digest_path) orelse return error.RootFSOpenFailed;
     try ensureDirPath(io, digest_dir);
 
     if (try pathExistsNoSymlink(io, digest_path)) {
         if (!try regularFileNoSymlink(io, digest_path)) return error.RootFSDigestMismatch;
         try chmodReadOnly(allocator, digest_path);
-        try verifyPath(io, allocator, digest_path, artifact, true);
+        if (!std.mem.eql(u8, artifact.format, spore.rootfs_artifact_format_ext4)) return error.RootFSDigestMismatch;
+        const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
+        const fd = openTrustedFromCache(io, allocator, cache_root, rootfs) catch |err| switch (err) {
+            error.RootFSDigestCacheMiss => return error.RootFSDigestMismatch,
+            else => |e| return e,
+        };
+        _ = std.c.close(fd);
         return .{ .cache_hit = true, .bytes_fetched = 0 };
     } else {
         try copyVerifiedPathAfterSourceVerified(io, allocator, source_path, digest_path, artifact, copy_options);
@@ -201,10 +210,13 @@ fn copyVerifiedPathAfterSourceVerified(
     io.random(&temp_nonce_bytes);
     const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
     const temp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ dest_path, temp_nonce });
+    defer allocator.free(temp_path);
     defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const source_z = try allocator.dupeZ(u8, source_path);
+    defer allocator.free(source_z);
     const temp_z = try allocator.dupeZ(u8, temp_path);
+    defer allocator.free(temp_z);
     const source_fd = std.c.open(source_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (source_fd < 0) return error.RootFSOpenFailed;
     defer _ = std.c.close(source_fd);
@@ -243,12 +255,14 @@ pub fn verifyPath(
     if (must_not_be_symlink and !try regularFileNoSymlink(io, path)) return error.RootFSDigestMismatch;
     if (!std.mem.eql(u8, artifact.format, spore.rootfs_artifact_format_ext4)) return error.RootFSDigestMismatch;
     const actual = try hashPath(io, allocator, path);
+    defer allocator.free(actual.digest);
     if (actual.size != artifact.size) return error.RootFSDigestMismatch;
     if (!std.mem.eql(u8, actual.digest, artifact.digest)) return error.RootFSDigestMismatch;
 }
 
 pub fn hashPath(io: Io, allocator: std.mem.Allocator, path: []const u8) !RootfsHash {
     const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSOpenFailed;
     defer _ = std.c.close(fd);
@@ -287,7 +301,9 @@ fn hardlinkVerifiedPath(
     artifact: spore.RootfsArtifactRef,
 ) !bool {
     const source_z = try allocator.dupeZ(u8, source_path);
+    defer allocator.free(source_z);
     const dest_z = try allocator.dupeZ(u8, dest_path);
+    defer allocator.free(dest_z);
     if (std.c.link(source_z, dest_z) != 0) return false;
     errdefer Io.Dir.cwd().deleteFile(io, dest_path) catch {};
     if (std.c.chmod(dest_z, 0o444) != 0) return error.RootFSOpenFailed;
@@ -327,6 +343,7 @@ fn fdIsRegularFile(io: Io, fd: std.c.fd_t) !bool {
 
 fn chmodReadOnly(allocator: std.mem.Allocator, path: []const u8) !void {
     const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
     if (std.c.chmod(pathz, 0o444) != 0) return error.RootFSOpenFailed;
 }
 

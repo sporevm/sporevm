@@ -3756,16 +3756,23 @@ fn fakeHelloServerMain(fake: *FakeHelloServer) void {
     writeAll(fake.io, stream, "\n") catch return;
 }
 
+fn readyPollSleep(attempt: *u32) void {
+    const delay_ms: u64 = if (attempt.* < 10) 1 else 20;
+    attempt.* +|= 1;
+    sleepMs(delay_ms);
+}
+
 fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: u64, spore_executable_path: []const u8) !void {
     const start = monotonicMs();
+    var sleep_attempt: u32 = 0;
     while (monotonicMs() - start < timeout_ms) {
         var ready = readReady(allocator, io, paths) catch {
-            sleepMs(20);
+            readyPollSleep(&sleep_attempt);
             continue;
         };
         if (!pidAlive(ready.value.pid)) {
             ready.deinit();
-            sleepMs(20);
+            readyPollSleep(&sleep_attempt);
             continue;
         }
         verifyMonitorHelloWithPath(allocator, io, ready.value.control_socket_path, spore_executable_path) catch |err| switch (err) {
@@ -3777,7 +3784,7 @@ fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeou
             // responders) retry until the diagnosed readiness timeout.
             else => {
                 ready.deinit();
-                sleepMs(20);
+                readyPollSleep(&sleep_attempt);
                 continue;
             },
         };
