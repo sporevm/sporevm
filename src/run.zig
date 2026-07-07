@@ -2591,6 +2591,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         .request = &capture_request,
         .continue_after_capture = opts.continue_after_save,
     });
+    if (capture_plan.snapshot_dir) |snapshot_dir| {
+        try spore.createSnapshotRoot(allocator, snapshot_dir);
+    }
     var saved_session_buf: [1]spore.Session = undefined;
     const saved_sessions = if (request.attaches_existing and opts.resume_sessions.len != 0)
         opts.resume_sessions

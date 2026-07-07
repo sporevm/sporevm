@@ -185,8 +185,7 @@ pub const Sealer = struct {
 
         const backing_tmp_path = try pathZ(allocator, "{s}/{s}.tmp", .{ options.dir, spore.ram_backing_path });
         const backing_final_path = try pathZ(allocator, "{s}/{s}", .{ options.dir, spore.ram_backing_path });
-        const backing_fd = std.c.open(backing_tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
-        if (backing_fd < 0) return error.IoFailed;
+        const backing_fd = try createNewFile(backing_tmp_path, 0o644);
         var backing_fd_owned = true;
         errdefer if (backing_fd_owned) {
             _ = std.c.close(backing_fd);
@@ -338,9 +337,13 @@ pub const Sealer = struct {
         if (fchmod_rc != 0) return error.IoFailed;
 
         const rename_start = try monotonicMs();
-        const rename_rc = std.c.rename(self.backing_tmp_path.ptr, self.backing_final_path.ptr);
+        const rename_rc = std.c.link(self.backing_tmp_path.ptr, self.backing_final_path.ptr);
         self.stats.finish_rename_ms = (try monotonicMs()) - rename_start;
         if (rename_rc != 0) return error.IoFailed;
+        if (std.c.unlink(self.backing_tmp_path.ptr) != 0) {
+            _ = std.c.unlink(self.backing_final_path.ptr);
+            return error.IoFailed;
+        }
 
         const close_fd = self.backing_fd;
         if (closeBackingFdDeferred(close_fd)) {
@@ -592,7 +595,7 @@ fn closeBackingFdThread(fd: std.c.fd_t) void {
 }
 
 fn writeFileAll(path: [:0]const u8, data: []const u8) !void {
-    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o644));
     if (fd < 0) return error.IoFailed;
     defer _ = std.c.close(fd);
     var done: usize = 0;
@@ -604,14 +607,13 @@ fn writeFileAll(path: [:0]const u8, data: []const u8) !void {
 }
 
 fn writeFileAllIfMissing(path: [:0]const u8, data: []const u8) !void {
-    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(c_uint, 0o644));
-    if (fd < 0) {
-        if (std.c.errno(fd) == .EXIST) {
+    const fd = createNewFile(path, 0o644) catch |err| switch (err) {
+        error.AlreadyExists => {
             try verifyExistingFile(path, data);
             return;
-        }
-        return error.IoFailed;
-    }
+        },
+        else => |e| return e,
+    };
     defer _ = std.c.close(fd);
     var done: usize = 0;
     while (done < data.len) {
@@ -619,6 +621,17 @@ fn writeFileAllIfMissing(path: [:0]const u8, data: []const u8) !void {
         if (n <= 0) return error.IoFailed;
         done += @intCast(n);
     }
+}
+
+fn createNewFile(path: [:0]const u8, mode: c_uint) !std.c.fd_t {
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, mode);
+    if (fd < 0) {
+        return switch (std.c.errno(fd)) {
+            .EXIST => error.AlreadyExists,
+            else => error.IoFailed,
+        };
+    }
+    return fd;
 }
 
 fn verifyExistingFile(path: [:0]const u8, expected: []const u8) !void {
@@ -673,9 +686,16 @@ fn pwriteFileAll(fd: std.c.fd_t, offset: usize, data: []const u8) !void {
 }
 
 fn ensureDir(path: [:0]const u8) !void {
-    if (std.c.mkdir(path, 0o755) != 0) {
-        if (std.c.access(path, 0) != 0) return error.IoFailed;
+    const rc = std.c.mkdir(path, 0o755);
+    if (rc != 0) {
+        switch (std.c.errno(rc)) {
+            .EXIST => {},
+            else => return error.IoFailed,
+        }
     }
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    _ = std.c.close(fd);
 }
 
 fn pathZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![:0]const u8 {
@@ -824,6 +844,34 @@ test "dirty RAM sealer seeds zero-elided chunks and finalizes backing" {
 
     const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, manifest.chunks[0].? });
     try std.testing.expectEqual(@as(c_int, 0), std.c.access(chunk_path, 0));
+}
+
+test "dirty RAM sealer rejects preexisting symlink temp backing" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const dir = try pathZ(arena, "{s}/spore", .{root_dir});
+    try ensureDir(dir);
+    const victim_path = try pathZ(arena, "{s}/victim", .{root_dir});
+    try writeFileAll(victim_path, "untouched");
+    const tmp_path = try pathZ(arena, "{s}/{s}.tmp", .{ dir, spore.ram_backing_path });
+    if (std.c.symlink(victim_path.ptr, tmp_path.ptr) != 0) return error.IoFailed;
+
+    const ram = try arena.alloc(u8, spore.chunk_size);
+    @memset(ram, 0x61);
+    if (Sealer.start(arena, .{ .dir = dir, .ram = ram })) |sealer| {
+        _ = sealer;
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.AlreadyExists, error.IoFailed => {},
+        else => return err,
+    }
+
+    const victim = try readFileAllForTest(arena, victim_path, 1024);
+    try std.testing.expectEqualStrings("untouched", victim);
 }
 
 test "dirty RAM sealer rejects corrupt preexisting chunks" {

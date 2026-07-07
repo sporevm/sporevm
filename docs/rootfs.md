@@ -59,6 +59,9 @@ spore run --image docker.io/library/alpine:3.20 \
 spore run --from base.spore 'cat /var/tmp/example'
 ```
 
+The `--save` target must be a new path. SporeVM creates the output directory
+itself before writing memory, disk, and manifest files.
+
 The rootfs cache key includes the resolved digest-pinned image ref, target
 platform, and rootfs builder version. Mutable tag inputs also get a small local
 ref record, so a warm `spore run --image docker.io/library/alpine:3.20` or
