@@ -11,17 +11,32 @@ pub const Options = struct {
     require_https: bool = false,
 };
 
+pub const ConnectionTarget = struct {
+    connect_host: HostName,
+    logical_host: HostName,
+    port: u16,
+    protocol: std.http.Client.Protocol,
+};
+
 pub const Error = error{
     UnsupportedRemoteFetchScheme,
     UnsafeRemoteFetchTarget,
 } || HostName.LookupError;
 
 pub fn validateUrl(io: Io, raw_url: []const u8, options: Options) !void {
+    _ = try resolveUrlAddress(io, raw_url, options);
+}
+
+pub fn resolveUrlAddress(io: Io, raw_url: []const u8, options: Options) !IpAddress {
     const uri = try std.Uri.parse(raw_url);
-    try validateUri(io, uri, options);
+    return resolveUriAddress(io, uri, options);
 }
 
 pub fn validateUri(io: Io, uri: std.Uri, options: Options) Error!void {
+    _ = try resolveUriAddress(io, uri, options);
+}
+
+pub fn resolveUriAddress(io: Io, uri: std.Uri, options: Options) Error!IpAddress {
     if (options.require_https) {
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.UnsupportedRemoteFetchScheme;
     } else if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
@@ -31,12 +46,17 @@ pub fn validateUri(io: Io, uri: std.Uri, options: Options) Error!void {
     const port = normalizedPort(uri) orelse return error.UnsupportedRemoteFetchScheme;
     var host_buffer: [HostName.max_len]u8 = undefined;
     const host = uri.getHost(&host_buffer) catch return error.UnsafeRemoteFetchTarget;
-    try validateHost(io, host.bytes, port);
+    return resolveHostAddress(io, host.bytes, port);
 }
 
 pub fn validateHost(io: Io, raw_host: []const u8, port: u16) Error!void {
+    _ = try resolveHostAddress(io, raw_host, port);
+}
+
+pub fn resolveHostAddress(io: Io, raw_host: []const u8, port: u16) Error!IpAddress {
     if (parseIpLiteral(raw_host, port)) |addr| {
-        return validateAddress(addr);
+        try validateAddress(addr);
+        return addr;
     }
 
     const host = HostName.init(raw_host) catch return error.UnsafeRemoteFetchTarget;
@@ -44,19 +64,45 @@ pub fn validateHost(io: Io, raw_host: []const u8, port: u16) Error!void {
     var results: Io.Queue(HostName.LookupResult) = .init(&result_buffer);
     try HostName.lookup(host, io, &results, .{ .port = port });
 
-    var found_address = false;
+    var selected_address: ?IpAddress = null;
     while (results.getOneUncancelable(io)) |result| {
         switch (result) {
             .address => |address| {
-                found_address = true;
                 try validateAddress(address);
+                if (selected_address == null) selected_address = address;
             },
             .canonical_name => {},
         }
     } else |err| switch (err) {
         error.Closed => {},
     }
-    if (!found_address) return error.UnsafeRemoteFetchTarget;
+    return selected_address orelse error.UnsafeRemoteFetchTarget;
+}
+
+pub fn connectionTarget(uri: std.Uri, address: IpAddress, address_buffer: *[HostName.max_len]u8, logical_host_buffer: *[HostName.max_len]u8) Error!ConnectionTarget {
+    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.UnsupportedRemoteFetchScheme;
+    const port = normalizedPort(uri) orelse return error.UnsupportedRemoteFetchScheme;
+    const logical_host = uri.getHost(logical_host_buffer) catch return error.UnsafeRemoteFetchTarget;
+    const connect_host = HostName{ .bytes = formatAddressHost(address, address_buffer) catch return error.UnsafeRemoteFetchTarget };
+    return .{
+        .connect_host = connect_host,
+        .logical_host = logical_host,
+        .port = port,
+        .protocol = protocol,
+    };
+}
+
+pub fn connectResolvedUri(client: *std.http.Client, uri: std.Uri, address: IpAddress) !*std.http.Client.Connection {
+    var address_buffer: [HostName.max_len]u8 = undefined;
+    var logical_host_buffer: [HostName.max_len]u8 = undefined;
+    const target = try connectionTarget(uri, address, &address_buffer, &logical_host_buffer);
+    return client.connectTcpOptions(.{
+        .host = target.connect_host,
+        .port = target.port,
+        .protocol = target.protocol,
+        .proxied_host = target.logical_host,
+        .proxied_port = target.port,
+    });
 }
 
 pub fn validateAddress(address: IpAddress) Error!void {
@@ -72,6 +118,21 @@ fn parseIpLiteral(raw_host: []const u8, port: u16) ?IpAddress {
         return IpAddress.parse(raw_host[1 .. raw_host.len - 1], port) catch null;
     }
     return IpAddress.parse(raw_host, port) catch null;
+}
+
+fn formatAddressHost(address: IpAddress, buffer: *[HostName.max_len]u8) Io.Writer.Error![]const u8 {
+    var writer: Io.Writer = .fixed(buffer);
+    switch (address) {
+        .ip4 => |ip4| {
+            const bytes = ip4.bytes;
+            try writer.print("{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
+        },
+        .ip6 => |ip6| {
+            const unresolved: Io.net.Ip6Address.Unresolved = .{ .bytes = ip6.bytes, .interface_name = null };
+            try unresolved.format(&writer);
+        },
+    }
+    return writer.buffered();
 }
 
 fn normalizedPort(uri: std.Uri) ?u16 {
@@ -153,4 +214,23 @@ test "fetch target policy accepts public literals and enforces https when requir
     try validateUrl(std.testing.io, "https://[2606:4700:4700::1111]/resource", .{ .require_https = true });
     try validateUrl(std.testing.io, "http://1.1.1.1/resource", .{});
     try std.testing.expectError(error.UnsupportedRemoteFetchScheme, validateUrl(std.testing.io, "http://1.1.1.1/resource", .{ .require_https = true }));
+}
+
+test "fetch target policy connects to checked address while preserving logical host" {
+    const uri = try std.Uri.parse("https://rebind.example/path");
+    const address4 = try IpAddress.parse("93.184.216.34", 443);
+
+    var address_buffer: [HostName.max_len]u8 = undefined;
+    var logical_host_buffer: [HostName.max_len]u8 = undefined;
+    const target = try connectionTarget(uri, address4, &address_buffer, &logical_host_buffer);
+
+    try std.testing.expectEqualStrings("93.184.216.34", target.connect_host.bytes);
+    try std.testing.expectEqualStrings("rebind.example", target.logical_host.bytes);
+    try std.testing.expectEqual(@as(u16, 443), target.port);
+    try std.testing.expectEqual(std.http.Client.Protocol.tls, target.protocol);
+
+    const address6 = try IpAddress.parse("2606:4700:4700::1111", 443);
+    const target6 = try connectionTarget(uri, address6, &address_buffer, &logical_host_buffer);
+    try std.testing.expectEqualStrings("2606:4700:4700::1111", target6.connect_host.bytes);
+    try std.testing.expectEqualStrings("rebind.example", target6.logical_host.bytes);
 }
