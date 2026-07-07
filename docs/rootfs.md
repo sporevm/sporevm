@@ -5,7 +5,9 @@ verification contract, see [Filesystem And Root Disk Contract](filesystem.md).
 
 `spore rootfs build` materializes an OCI image into a deterministic ext4 rootfs
 image, installs that image into the local digest cache, and writes chunked
-rootfs CAS objects plus a `rootfs_storage` descriptor into the metadata sidecar.
+rootfs CAS objects plus a `rootfs_storage` descriptor into the metadata
+sidecar. Local image imports do the same by default, or can opt into flat
+local-only storage with `--rootfs-storage=flat`.
 The first OCI-capable run workflow is deliberately two-step:
 
 ```bash
@@ -97,10 +99,46 @@ tar like buildx writes. It verifies all `blobs/sha256/*` files against their
 filename digest, selects the requested platform from `index.json`, rejects
 unsupported manifest/config/layer media types, applies the verified layer tars,
 and writes the deterministic ext4 output under the resolved image cache key.
+By default the import also writes chunked `rootfs.storage` for portable saved
+spores and bundles. For fast local-only iteration, skip that derived CAS pass:
+
+```bash
+spore rootfs import-oci /tmp/sporevm-app.oci \
+  --ref local/sporevm-app:dev \
+  --platform linux/arm64 \
+  --rootfs-storage=flat
+```
+
+Flat imports still install the digest-addressed ext4 artifact and record the
+local ref, so `spore run --image local/...` works normally. A later
+`spore run --image local/... --save` derives chunked `rootfs.storage` once
+before writing a portable image-created spore manifest.
+
+For local BuildKit workflows that do not need OCI metadata, export the final
+root filesystem as an uncompressed tar and import that directly:
+
+```bash
+docker buildx build \
+  --platform linux/arm64 \
+  --output type=tar,dest=/tmp/sporevm-app-rootfs.tar \
+  .
+
+spore rootfs import-tar /tmp/sporevm-app-rootfs.tar \
+  --ref local/sporevm-app:dev \
+  --platform linux/arm64
+```
+
+`import-tar` records the tar SHA256 as the digest-pinned local identity and then
+uses the same deterministic ext4, digest-cache, and `rootfs.storage` path as
+`import-oci`, including `--rootfs-storage=flat` for local-only imports. It
+accepts the BuildKit rootfs tar shape and fails closed on unsupported PAX
+xattrs. It does not record OCI `Env`, `WorkingDir`,
+`Entrypoint`, `Cmd`, or `User`; pass the guest command explicitly when running
+the image.
 
 Local refs use the `local/<name>:<tag>` form and are host-local mutable pointers
 only. The imported rootfs metadata records a digest-pinned local resolved
-identity, `local/<name>@sha256:<manifest>`. Saved image-created spores record
+identity, `local/<name>@sha256:<manifest-or-tar>`. Saved image-created spores record
 the ext4 BLAKE3 artifact digest and size plus manifest-attached
 `rootfs.storage` when available. `spore run --image local/...` resolves from the
 local ref cache and does not fall back to a network registry.

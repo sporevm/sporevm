@@ -69,6 +69,7 @@ Use the matching helper for owned results:
 - `deinitNamedList`
 - `deinitRootfsBuildResult`
 - `deinitRootfsImportOciResult`
+- `deinitRootfsImportTarResult`
 - `deinitRootfsResolveResult`
 - `deinitRootfsCasPreloadResult`
 - `deinitRootfsSystemSummary`
@@ -158,9 +159,12 @@ const resolved = try libspore.rootfsResolve(init, allocator, .{
 defer libspore.deinitRootfsResolveResult(allocator, resolved);
 ```
 
-`rootfsImportOci` imports OCI layouts under local refs. `rootfsCasPreload`
-preloads a rootfs digest into chunked CAS storage and can attach the resulting
-descriptor to an existing spore.
+`rootfsImportOci` imports OCI layouts under local refs, and `rootfsImportTar`
+imports uncompressed rootfs tar files under the same local ref cache. Import
+options default to `.rootfs_storage = .chunked`; set `.rootfs_storage = .flat`
+for local-only imports that should skip immediate chunked rootfs CAS preload.
+`rootfsCasPreload` preloads a rootfs digest into chunked CAS storage and can
+attach the resulting descriptor to an existing spore.
 
 ## Running
 

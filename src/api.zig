@@ -149,8 +149,11 @@ pub const RootfsCasPreloadOptions = rootfs_mod.CasPreloadRequest;
 pub const RootfsCasPreloadResult = rootfs_mod.CasPreloadResult;
 pub const RootfsImportOciOptions = rootfs_mod.ImportOciRequest;
 pub const RootfsImportOciResult = rootfs_mod.ImportOciResult;
+pub const RootfsImportTarOptions = rootfs_mod.ImportTarRequest;
+pub const RootfsImportTarResult = rootfs_mod.ImportTarResult;
 pub const RootfsPlatform = rootfs_mod.Platform;
 pub const RootfsResolveOptions = rootfs_mod.ResolveRequest;
+pub const RootfsStoragePolicy = rootfs_mod.RootfsStoragePolicy;
 pub const Disk = run_mod.Disk;
 pub const InjectedFile = run_mod.InjectedFile;
 pub const RunResult = run_mod.Result;
@@ -614,6 +617,25 @@ pub fn rootfsImportOci(
 /// Release memory owned by a `RootfsImportOciResult`.
 pub fn deinitRootfsImportOciResult(allocator: std.mem.Allocator, result: RootfsImportOciResult) void {
     rootfs_mod.deinitImportOciResult(allocator, result);
+}
+
+/// Import an uncompressed rootfs tar into the local rootfs cache under a local ref.
+///
+/// Release owned result fields with `deinitRootfsImportTarResult`.
+pub fn rootfsImportTar(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: RootfsImportTarOptions,
+) !RootfsImportTarResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const result = try rootfs_mod.importTar(init, arena_state.allocator(), options);
+    return ownRootfsImportOciResult(allocator, result);
+}
+
+/// Release memory owned by a `RootfsImportTarResult`.
+pub fn deinitRootfsImportTarResult(allocator: std.mem.Allocator, result: RootfsImportTarResult) void {
+    rootfs_mod.deinitImportTarResult(allocator, result);
 }
 
 /// Resolve an image tag or local ref to the digest-pinned ref used by SporeVM.
