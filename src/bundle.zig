@@ -1512,10 +1512,7 @@ fn packRootfsArtifact(allocator: std.mem.Allocator, options: PackOptions, rootfs
     const source_path = rootfs_cache.digestPath(allocator, cache_root, rootfs.artifact.digest) catch |err| return rootfsError(err);
     const rel_path = try rootfsArtifactRelPath(allocator, rootfs.artifact);
     const dest_path = try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rel_path });
-    rootfs_cache.copyVerifiedPath(options.io, allocator, source_path, dest_path, rootfs.artifact, .{
-        .source_must_not_be_symlink = true,
-        .allow_hardlink = false,
-    }) catch |err| return rootfsError(err);
+    rootfs_cache.copyTrustedPath(options.io, allocator, source_path, dest_path, rootfs.artifact) catch |err| return rootfsError(err);
     return rootfs.artifact.size;
 }
 
@@ -1561,10 +1558,7 @@ fn packRootfsIndexed(
     const source_path = rootfs_cache.digestPath(allocator, cache_root, rootfs.artifact.digest) catch |err| return rootfsError(err);
     const rel_path = try rootfsArtifactRelPath(allocator, rootfs.artifact);
     const dest_path = try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rel_path });
-    rootfs_cache.copyVerifiedPath(options.io, allocator, source_path, dest_path, rootfs.artifact, .{
-        .source_must_not_be_symlink = true,
-        .allow_hardlink = false,
-    }) catch |err| return rootfsError(err);
+    rootfs_cache.copyTrustedPath(options.io, allocator, source_path, dest_path, rootfs.artifact) catch |err| return rootfsError(err);
     try entries.append(.{
         .digest = digest_copy,
         .size = rootfs.artifact.size,

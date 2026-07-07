@@ -196,6 +196,25 @@ pub fn copyVerifiedPath(
     try copyVerifiedPathAfterSourceVerified(io, allocator, source_path, dest_path, artifact, options);
 }
 
+/// Copy from a source that is already in the local cache trust domain.
+///
+/// This skips the source BLAKE3 pass but still verifies the published
+/// destination bytes against `artifact`. Use this only for cache-internal
+/// immutable sources, not for caller-owned paths or peer/bundle inputs.
+pub fn copyTrustedPath(
+    io: Io,
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    dest_path: []const u8,
+    artifact: spore.RootfsArtifactRef,
+) !void {
+    if (!try regularFileNoSymlink(io, source_path)) return error.RootFSOpenFailed;
+    try copyVerifiedPathAfterSourceVerified(io, allocator, source_path, dest_path, artifact, .{
+        .source_must_not_be_symlink = true,
+        .allow_hardlink = false,
+    });
+}
+
 fn copyVerifiedPathAfterSourceVerified(
     io: Io,
     allocator: std.mem.Allocator,
@@ -534,6 +553,35 @@ test "copy-only digest cache does not chmod source rootfs" {
     const digest_path = try digestPath(arena, cache_root, artifact.digest);
     const cache_stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(cache_stat.permissions) & 0o777)));
+}
+
+test "trusted rootfs copy verifies destination bytes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-cache-trusted-copy";
+    const expected_path = tmp ++ "/expected.ext4";
+    const source_path = tmp ++ "/source.ext4";
+    const dest_path = tmp ++ "/dest.ext4";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = expected_path, .data = "expected rootfs bytes" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "tampered rootfs bytes" });
+
+    const expected = try hashPath(io, arena, expected_path);
+    const artifact = spore.RootfsArtifactRef{
+        .digest = expected.digest,
+        .size = expected.size,
+    };
+    try std.testing.expectError(error.RootFSDigestMismatch, copyTrustedPath(io, arena, source_path, dest_path, artifact));
+    try std.testing.expect(!try pathExistsNoSymlink(io, dest_path));
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "expected rootfs bytes" });
+    try copyTrustedPath(io, arena, source_path, dest_path, artifact);
+    try verifyPath(io, arena, dest_path, artifact, true);
 }
 
 test "install after source verification cleans up bad installed bytes" {
