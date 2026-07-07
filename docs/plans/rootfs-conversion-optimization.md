@@ -369,8 +369,8 @@ Implementation notes:
   exists, or the hardlink cannot be created, materialization falls back to the
   existing verified install path.
 - A profiled 64MiB `import-tar --rootfs-storage=flat` smoke at
-  `/tmp/sporevm-rootfs-fastpath.JJvz8L` reported
-  `rootfs_blake3 ms=3400` and `digest_cache_install ms=1`, proving the duplicate
+  `/tmp/sporevm-rootfs-land-smoke.roBaqr` reported
+  `rootfs_blake3 ms=3357` and `digest_cache_install ms=0`, proving the duplicate
   digest-cache hash was removed for the generated-hardlink path.
 - The next measured target is still `rootfs_cas.preload`, especially its
   `source_verify_ms` and `chunk_scan_ms` sub-phases. The Buildkite benchmark

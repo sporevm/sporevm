@@ -3546,7 +3546,7 @@ test "image rootfs metadata supplies run env and working directory" {
 
     const digest_path = try rootfs_cache.digestPath(arena, cache_root, captured.rootfs.?.artifact.digest);
     try Io.Dir.cwd().deleteFile(io, digest_path);
-    const cached_storage = try rootfs_mod.ensureImageRootfsStorage(init, arena, cache_root, resolved, captured.rootfs.?.artifact, captured.rootfs.?.device);
+    const cached_storage = try rootfs_mod.ensureImageRootfsStorage(init, arena, cache_root, metadata_path, captured.rootfs.?.artifact, captured.rootfs.?.device);
     try std.testing.expectEqualStrings(captured.rootfs.?.storage.?.index_digest, cached_storage.index_digest);
     try std.testing.expect(rootfsWritable(.{
         .kernel_path = "",
