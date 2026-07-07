@@ -110,6 +110,8 @@ fn ensureTlsReady(client: *std.http.Client, protocol: std.http.Client.Protocol) 
     if (protocol != .tls) return;
     if (std.http.Client.disable_tls) unreachable;
 
+    // connectTcpOptions bypasses Client.request's lazy TLS setup. Initialize
+    // the clock and CA bundle here before connecting to a resolved address.
     {
         try client.ca_bundle_lock.lockShared(client.io);
         defer client.ca_bundle_lock.unlockShared(client.io);
@@ -259,4 +261,16 @@ test "fetch target policy connects to checked address while preserving logical h
     const target6 = try connectionTarget(uri, address6, &address_buffer, &logical_host_buffer);
     try std.testing.expectEqualStrings("2606:4700:4700::1111", target6.connect_host.bytes);
     try std.testing.expectEqualStrings("rebind.example", target6.logical_host.bytes);
+}
+
+test "fetch target policy initializes tls state for resolved-address connects" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+
+    try ensureTlsReady(&client, .plain);
+    try std.testing.expect(client.now == null);
+
+    if (std.http.Client.disable_tls) return error.SkipZigTest;
+    try ensureTlsReady(&client, .tls);
+    try std.testing.expect(client.now != null);
 }
