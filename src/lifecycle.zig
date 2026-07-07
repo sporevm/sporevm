@@ -3585,6 +3585,10 @@ test "lifecycle monitor spawn receives context environment" {
 
 fn appendMonitorNetworkPolicyArgs(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), policy: *const run_mod.NetworkPolicy) !void {
     try argv.append("--net");
+    if (policy.default_deny) {
+        try argv.append("--default-action");
+        try argv.append(spore.network_default_deny);
+    }
     for (policy.allowCidrSlice()) |cidr| {
         try argv.append("--allow-cidr");
         try argv.append(cidr);
@@ -3615,6 +3619,11 @@ fn appendMonitorNetworkPolicyArgs(allocator: std.mem.Allocator, argv: *std.array
 fn appendMonitorNetworkManifestArgs(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), network: spore.Network) !void {
     if (network.bound_services.len != 0) return error.UnsupportedBoundServiceRestore;
     try argv.append("--net");
+    if (network.default_action) |action| {
+        if (!std.mem.eql(u8, action, spore.network_default_deny)) return error.InvalidNetworkPolicy;
+        try argv.append("--default-action");
+        try argv.append(action);
+    }
     for (network.allow_cidrs) |cidr| {
         try argv.append("--allow-cidr");
         try argv.append(cidr);
@@ -5721,6 +5730,33 @@ test "named network config keeps bare network unrestricted" {
     try std.testing.expectEqual(run_mod.NetworkMode.spore, config.mode);
     try std.testing.expect(!config.policy.default_deny);
     try std.testing.expect(!config.policy.hasRules());
+}
+
+test "lifecycle monitor policy args preserve default deny" {
+    var argv = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer argv.deinit();
+    const policy = run_mod.NetworkPolicy{ .default_deny = true };
+
+    try appendMonitorNetworkPolicyArgs(std.testing.allocator, &argv, &policy);
+
+    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
+    try std.testing.expectEqualStrings("--net", argv.items[0]);
+    try std.testing.expectEqualStrings("--default-action", argv.items[1]);
+    try std.testing.expectEqualStrings(spore.network_default_deny, argv.items[2]);
+}
+
+test "lifecycle monitor manifest args preserve default action" {
+    var argv = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer argv.deinit();
+
+    try appendMonitorNetworkManifestArgs(std.testing.allocator, &argv, .{
+        .default_action = spore.network_default_deny,
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
+    try std.testing.expectEqualStrings("--net", argv.items[0]);
+    try std.testing.expectEqualStrings("--default-action", argv.items[1]);
+    try std.testing.expectEqualStrings(spore.network_default_deny, argv.items[2]);
 }
 
 test "new output dirs resolve to absolute paths" {

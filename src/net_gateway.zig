@@ -10,6 +10,7 @@ const Io = std.Io;
 const spore_net = @import("spore_net.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_netd = @import("spore_netd.zig");
+const spore = @import("spore.zig");
 const virtio_net = @import("virtio/net.zig");
 
 const ready_timeout_ms = 1_000;
@@ -91,6 +92,10 @@ pub const Process = struct {
         if (debug) argv.append("--debug") catch return error.OutOfMemory;
         argv.append("netd") catch return error.OutOfMemory;
         argv.append("--stdio") catch return error.OutOfMemory;
+        if (policy.default_deny) {
+            argv.append("--default-action") catch return error.OutOfMemory;
+            argv.append(spore.network_default_deny) catch return error.OutOfMemory;
+        }
         for (policy.allowCidrSlice()) |cidr| {
             argv.append("--allow-cidr") catch return error.OutOfMemory;
             argv.append(cidr) catch return error.OutOfMemory;
@@ -607,7 +612,7 @@ test "spore-net gateway spawn marks reexec role" {
     defer allocator.free(out_path);
     const script = try std.fmt.allocPrint(
         allocator,
-        "#!/bin/sh\nprintf '%s\\n%s\\n' \"$SPORE_REEXEC_ROLE\" \"$SPORE_REEXEC_CONTRACT\" > {s}\nprintf 'ready\\n' >&2\ncat >/dev/null\n",
+        "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' \"$SPORE_REEXEC_ROLE\" \"$SPORE_REEXEC_CONTRACT\" \"$1\" \"$2\" \"$3\" \"$4\" > {s}\nprintf 'ready\\n' >&2\ncat >/dev/null\n",
         .{out_path},
     );
     defer allocator.free(script);
@@ -615,12 +620,12 @@ test "spore-net gateway spawn marks reexec role" {
     try Io.Dir.cwd().setFilePermissions(io, script_path, @enumFromInt(0o755), .{});
 
     var process: Process = undefined;
-    try process.start(io, allocator, script_path, false, .{});
+    try process.start(io, allocator, script_path, false, .{ .default_deny = true });
     defer process.deinit();
 
     const observed = try Io.Dir.cwd().readFileAlloc(io, out_path, allocator, .limited(4096));
     defer allocator.free(observed);
-    try std.testing.expectEqualStrings("netd\n1\n", observed);
+    try std.testing.expectEqualStrings("netd\n1\nnetd\n--stdio\n--default-action\ndeny\n", observed);
 }
 
 test "spore-net gateway buffers multiple rx frames" {

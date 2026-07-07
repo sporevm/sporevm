@@ -10,6 +10,7 @@ const Io = std.Io;
 const spore_net = @import("spore_net.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_netd_tcp = @import("spore_netd_tcp.zig");
+const spore = @import("spore.zig");
 
 pub const max_frame_len = spore_net.max_frame_len;
 pub const frame_header_len = 4;
@@ -43,7 +44,7 @@ const fallback_dns_ipv4: [4]u8 = .{ 1, 1, 1, 1 };
 
 const netd_usage =
     \\Usage:
-    \\  spore netd --stdio [--allow-cidr CIDR] [--allow-host HOST] [--allow-host-port HOST:PORT] [--bind-service NAME[:PORT]=unix:/path.sock] [--bound-unix-service NAME HOST PORT PATH] [--forward 127.0.0.1:HOST_PORT:GUEST_PORT]
+    \\  spore netd --stdio [--default-action deny] [--allow-cidr CIDR] [--allow-host HOST] [--allow-host-port HOST:PORT] [--bind-service NAME[:PORT]=unix:/path.sock] [--bound-unix-service NAME HOST PORT PATH] [--forward 127.0.0.1:HOST_PORT:GUEST_PORT]
     \\
     \\Internal helper for SporeVM-managed networking.
     \\
@@ -179,6 +180,13 @@ fn parseCliArgs(args: []const []const u8) CliOptions {
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--stdio")) {
             stdio = true;
+        } else if (std.mem.eql(u8, args[i], "--default-action")) {
+            const raw = takeValue(args, &i, args[i]);
+            if (!std.mem.eql(u8, raw, spore.network_default_deny)) {
+                std.debug.print("spore netd: invalid --default-action {s}\n", .{raw});
+                std.process.exit(2);
+            }
+            opts.policy.default_deny = true;
         } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
             const raw = takeValue(args, &i, args[i]);
             opts.policy.addAllowCidr(raw) catch |err| {
@@ -916,6 +924,17 @@ test "spore-netd cli parser accepts network policy rules" {
     try std.testing.expectEqual(@as(u16, 443), opts.policy.exact_rules[0].ports[0]);
     try std.testing.expectEqual(@as(usize, 1), opts.policy.bound_service_count);
     try std.testing.expectEqualStrings("cleanroom-gateway", opts.policy.bound_services[0].name);
+}
+
+test "spore-netd cli parser preserves default deny policy" {
+    const opts = parseCliArgs(&.{ "--stdio", "--default-action", spore.network_default_deny });
+    try std.testing.expect(opts.policy.default_deny);
+
+    const policy = try spore_net_policy.Runtime.init(opts.policy);
+    try std.testing.expectEqual(
+        spore_net_policy.Decision.deny_not_allowed,
+        policy.decideIpv4Port(.{ 93, 184, 216, 34 }, 443),
+    );
 }
 
 test "spore-netd frame stream round trips bounded frames" {
