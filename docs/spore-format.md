@@ -87,15 +87,16 @@ chunked rootfs indexes and objects, disk layer indexes, and disk objects. It is
 not a replacement for per-chunk, per-rootfs, or per-disk-object verification.
 
 If `manifest.json` records an immutable rootfs artifact, `spore pack` includes
-the exact ext4 bytes at `rootfs/blake3/<hex>.ext4` after verifying the source
-digest-cache entry by BLAKE3 and size. `spore unpack` requires that bundled
-artifact, verifies it against the manifest, then installs it into the local
-rootfs digest cache before writing the unpacked manifest. Indexed bundles record
-that artifact in `rootfs.index.json` with an explicit `exact-bytes` policy by
-default. `spore pack --children ... --rootfs=metadata-only` records the same
-digest and size with `metadata-only` policy and omits the ext4 file; materialized
-unpack and pull accept that policy only with `--allow-metadata-only-rootfs` and
-a trusted shape-compatible hit in the selected rootfs digest cache.
+the exact ext4 bytes at `rootfs/blake3/<hex>.ext4` from a trusted local
+digest-cache entry, then verifies the bundled copy by BLAKE3 and size.
+`spore unpack` requires that bundled artifact, verifies it against the manifest,
+then installs it into the local rootfs digest cache before writing the unpacked
+manifest. Indexed bundles record that artifact in `rootfs.index.json` with an
+explicit `exact-bytes` policy by default. `spore pack --children ...
+--rootfs=metadata-only` records the same digest and size with `metadata-only`
+policy and omits the ext4 file; materialized unpack and pull accept that policy
+only with `--allow-metadata-only-rootfs` and a trusted shape-compatible hit in
+the selected rootfs digest cache.
 
 If `manifest.json` records `rootfs.storage.kind:
 "chunked-ext4-rootfs-v0"`, indexed bundles carry the exact
