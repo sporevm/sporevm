@@ -532,7 +532,8 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         const attach_probe_start = monotonicMs();
         try vsock_dev.attachHostStream(probe);
         probe.markStarted();
-        try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
+        const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
+        try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
         attach_probe_ms = monotonicMs() - attach_probe_start;
     }
     if (config.resume_dir == null) {
@@ -562,7 +563,8 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var did_capture_request = false;
     while (true) {
         if (config.exec_probe != null and !exec_probe_done) {
-            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
+            const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
+            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
         }
         if (mem_transport_index != null) {
             if (config.exec_probe) |probe| {
@@ -600,7 +602,8 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     try control.completeSnapshot(request.dir);
                 },
             }
-            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
+            const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
+            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
         }
         if (config.capture_request) |request_capture| {
             if (request_capture.isAbortRequested()) return error.CaptureAborted;
@@ -1199,7 +1202,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
         const attach_probe_start = monotonicMs();
         try options.vsock_dev.attachHostStream(probe);
         probe.markStarted();
-        try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, @intCast(options.vsock_transport_index));
+        try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, null, @intCast(options.vsock_transport_index));
         attach_probe_ms = monotonicMs() - attach_probe_start;
     }
     const start_ms = monotonicMs();
@@ -1241,6 +1244,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                     options.vsock_dev,
                     &options.transports_buf[options.vsock_transport_index],
                     options.ram,
+                    null,
                     @intCast(options.vsock_transport_index),
                 ) catch |err| {
                     device_lock.unlock();
@@ -2410,7 +2414,14 @@ fn wakeVcpuSet(context: *anyopaque) void {
     wake_set.wakeAll();
 }
 
-fn flushVsockRx(vsock_dev: *vsock.Vsock, transport: *mmio.Transport, ram: guestmem.GuestRam, transport_index: u32) !void {
+fn flushVsockRx(
+    vsock_dev: *vsock.Vsock,
+    transport: *mmio.Transport,
+    ram: guestmem.GuestRam,
+    lazy_pager: ?*lazy_ram.Pager,
+    transport_index: u32,
+) !void {
+    try maybeMaterializeTransportQueues(lazy_pager, transport);
     if (vsock_dev.flushPendingRx(&transport.queues, ram)) {
         transport.interrupt_status |= 1;
         try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(transport_index), true), "raise vsock spi");
@@ -2604,6 +2615,36 @@ test "gic target routes redistributor frame to matching hvf vcpu" {
     try std.testing.expectEqual(gic.Region.redistributor, target.region);
     try std.testing.expectEqual(@as(u64, 0xc), target.offset);
     try std.testing.expectEqual(@as(hvf.VcpuHandle, 22), target.vcpu);
+}
+
+test "vsock rx flush materializes lazy transport queues before delivery" {
+    var refs = [_]?[]const u8{null};
+    var ram_bytes: [spore.chunk_size]u8 align(std.heap.page_size_min) = undefined;
+    @memset(&ram_bytes, 0);
+    var mapped = [_]bool{false};
+    var pager = lazy_ram.Pager{
+        .allocator = std.testing.allocator,
+        .dir = ".",
+        .manifest = .{ .chunk_size = spore.chunk_size, .chunks = &refs },
+        .ram = ram_bytes[0..],
+        .mapped = &mapped,
+        .trace_fd = null,
+        .start_ms = 0,
+    };
+    const ram = guestmem.GuestRam{ .bytes = ram_bytes[0..], .base = board.ram_base };
+    var vsock_dev = vsock.Vsock.init(.{});
+    var transport = mmio.Transport.init(vsock_dev.device());
+
+    transport.queues[0] = .{
+        .ready = true,
+        .size = 1,
+        .desc_addr = std.math.maxInt(u64),
+    };
+
+    try std.testing.expectError(
+        error.BadManifest,
+        flushVsockRx(&vsock_dev, &transport, ram, &pager, 0),
+    );
 }
 
 /// Decode a data-abort exit into an MMIO access and dispatch it to the
