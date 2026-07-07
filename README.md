@@ -261,6 +261,9 @@ spore run --image docker.io/library/alpine:3.20 \
   'echo warmed > /var/tmp/example'
 ```
 
+The `--save` target must not already exist; SporeVM creates the output
+directory before the backend starts writing snapshot files.
+
 Run another command from that completed base spore, or attach to a saved
 session:
 

@@ -431,15 +431,101 @@ pub const ManifestV1 = struct {
 
 // --- file helpers (libc-based; std.Io migration is a later cleanup) ---------
 
+pub fn createSnapshotRoot(allocator: std.mem.Allocator, dir: []const u8) Error!void {
+    const dir_z = try pathZ(allocator, "{s}", .{dir});
+    const rc = std.c.mkdir(dir_z, 0o700);
+    if (rc != 0) {
+        return switch (std.c.errno(rc)) {
+            .EXIST => error.AlreadyExists,
+            else => error.IoFailed,
+        };
+    }
+    const fd = try openDirectoryNoFollow(dir_z);
+    defer _ = std.c.close(fd);
+}
+
+fn openDirectoryNoFollow(path: [:0]const u8) Error!std.c.fd_t {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    return fd;
+}
+
 fn writeFileAll(path: [:0]const u8, data: []const u8) Error!void {
-    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o644));
     if (fd < 0) return error.IoFailed;
     defer _ = std.c.close(fd);
+    try writeAllFd(fd, data);
+}
+
+fn writeNewFileAll(path: [:0]const u8, data: []const u8) Error!void {
+    const fd = try createNewFile(path, 0o644);
+    defer _ = std.c.close(fd);
+    try writeAllFd(fd, data);
+}
+
+fn writeFileAllIfMissing(path: [:0]const u8, data: []const u8) Error!void {
+    const fd = createNewFile(path, 0o644) catch |err| switch (err) {
+        error.AlreadyExists => {
+            try verifyExistingFile(path, data);
+            return;
+        },
+        else => |e| return e,
+    };
+    defer _ = std.c.close(fd);
+    try writeAllFd(fd, data);
+}
+
+fn createNewFile(path: [:0]const u8, mode: c_uint) Error!std.c.fd_t {
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, mode);
+    if (fd < 0) {
+        return switch (std.c.errno(fd)) {
+            .EXIST => error.AlreadyExists,
+            else => error.IoFailed,
+        };
+    }
+    return fd;
+}
+
+fn writeAllFd(fd: std.c.fd_t, data: []const u8) Error!void {
     var done: usize = 0;
     while (done < data.len) {
         const n = std.c.write(fd, data.ptr + done, data.len - done);
         if (n <= 0) return error.IoFailed;
         done += @intCast(n);
+    }
+}
+
+fn verifyExistingFile(path: [:0]const u8, expected: []const u8) Error!void {
+    const fd = try openReadOnlyNoFollow(path);
+    defer _ = std.c.close(fd);
+
+    const stat = try fstatLocalFile(fd);
+    if (stat.identity().size != expected.len) return error.BadChunk;
+
+    var buf: [8192]u8 = undefined;
+    var done: usize = 0;
+    while (done < expected.len) {
+        const len = @min(buf.len, expected.len - done);
+        const offset = std.math.cast(std.c.off_t, done) orelse return error.BadChunk;
+        const n = std.c.pread(fd, buf[0..len].ptr, len, offset);
+        if (n <= 0) return error.BadChunk;
+        const read_len: usize = @intCast(n);
+        if (!std.mem.eql(u8, buf[0..read_len], expected[done..][0..read_len])) return error.BadChunk;
+        done += read_len;
+    }
+}
+
+fn publishFileNoOverwrite(tmp_path: [:0]const u8, final_path: [:0]const u8) Error!void {
+    const rc = std.c.link(tmp_path.ptr, final_path.ptr);
+    if (rc != 0) {
+        return switch (std.c.errno(rc)) {
+            .EXIST => error.AlreadyExists,
+            else => error.IoFailed,
+        };
+    }
+    if (std.c.unlink(tmp_path.ptr) != 0) {
+        _ = std.c.unlink(final_path.ptr);
+        return error.IoFailed;
     }
 }
 
@@ -479,12 +565,15 @@ fn seekFileSize(fd: std.c.fd_t) Error!usize {
 }
 
 fn ensureDir(path: [:0]const u8) Error!void {
-    if (std.c.mkdir(path, 0o755) != 0) {
-        const err = std.posix.errno(@as(isize, -1));
-        _ = err;
-        // Already exists is fine; verify it is usable by probing access.
-        if (std.c.access(path, 0) != 0) return error.IoFailed;
+    const rc = std.c.mkdir(path, 0o755);
+    if (rc != 0) {
+        switch (std.c.errno(rc)) {
+            .EXIST => {},
+            else => return error.IoFailed,
+        }
     }
+    const fd = try openDirectoryNoFollow(path);
+    defer _ = std.c.close(fd);
 }
 
 fn ensureNewDir(path: [:0]const u8) Error!void {
@@ -898,7 +987,7 @@ pub fn writeLocalMemoryBackingProof(
         .emit_null_optional_fields = false,
     }) catch return error.OutOfMemory;
     const proof_path = try pathZ(allocator, "{s}/{s}", .{ dir, ram_backing_proof_path });
-    try writeFileAll(proof_path, json);
+    try writeNewFileAll(proof_path, json);
 }
 
 pub fn openProvenLocalMemoryBacking(
@@ -1318,11 +1407,13 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
 
     var backing_fd: std.c.fd_t = -1;
     var backing_tmp_path: ?[:0]const u8 = null;
+    errdefer if (backing_tmp_path) |tmp_path| {
+        _ = std.c.unlink(tmp_path.ptr);
+    };
     if (with_backing) {
         const tmp_path = try pathZ(allocator, "{s}/{s}.tmp", .{ dir, ram_backing_path });
         backing_tmp_path = tmp_path;
-        backing_fd = std.c.open(tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
-        if (backing_fd < 0) return error.IoFailed;
+        backing_fd = try createNewFile(tmp_path, 0o644);
         if (std.c.ftruncate(backing_fd, @intCast(ram.len)) != 0) return error.IoFailed;
     }
     defer {
@@ -1346,9 +1437,7 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
         const ref = try allocator.dupe(u8, &hex);
         refs[i] = ref;
         const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, ref });
-        if (std.c.access(chunk_path, 0) != 0) {
-            try writeFileAll(chunk_path, data);
-        }
+        try writeFileAllIfMissing(chunk_path, data);
         if (backing_fd >= 0) {
             try pwriteFileAll(backing_fd, start, data);
         }
@@ -1359,7 +1448,8 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
         _ = std.c.close(backing_fd);
         backing_fd = -1;
         const final_path = try pathZ(allocator, "{s}/{s}", .{ dir, ram_backing_path });
-        if (std.c.rename(backing_tmp_path.?.ptr, final_path.ptr) != 0) return error.IoFailed;
+        try publishFileNoOverwrite(backing_tmp_path.?, final_path);
+        backing_tmp_path = null;
         break :blk MemoryBacking{ .path = ram_backing_path, .size = ram.len };
     } else null;
 
@@ -2169,6 +2259,25 @@ fn testDir(allocator: std.mem.Allocator) ![]const u8 {
     return buf;
 }
 
+test "snapshot root creation rejects existing and symlink paths" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const snapshot_dir = try pathZ(arena, "{s}/base.spore", .{root_dir});
+    try createSnapshotRoot(arena, snapshot_dir);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.access(snapshot_dir, 0));
+    try std.testing.expectError(error.AlreadyExists, createSnapshotRoot(arena, snapshot_dir));
+
+    const target_dir = try pathZ(arena, "{s}/target", .{root_dir});
+    try ensureDir(target_dir);
+    const link_dir = try pathZ(arena, "{s}/link.spore", .{root_dir});
+    try symlinkPath(target_dir, link_dir);
+    try std.testing.expectError(error.AlreadyExists, createSnapshotRoot(arena, link_dir));
+}
+
 test "memory round-trips through the chunk store with zero elision" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -2248,6 +2357,59 @@ test "memory backing is sparse local acceleration metadata" {
     try std.testing.expectEqualSlices(u8, ram, out);
 }
 
+test "memory backing rejects preexisting symlink temp file" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const dir = try pathZ(arena, "{s}/spore", .{root_dir});
+    try ensureDir(dir);
+    const victim_path = try pathZ(arena, "{s}/victim", .{root_dir});
+    try writeFileAll(victim_path, "untouched");
+    const tmp_path = try pathZ(arena, "{s}/{s}.tmp", .{ dir, ram_backing_path });
+    try symlinkPath(victim_path, tmp_path);
+
+    const ram = try arena.alloc(u8, chunk_size);
+    @memset(ram, 0x4A);
+    if (saveMemoryWithBacking(arena, dir, ram)) |manifest| {
+        _ = manifest;
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.AlreadyExists, error.IoFailed => {},
+        else => return err,
+    }
+
+    const victim = try readFileAll(arena, victim_path, 1024);
+    try std.testing.expectEqualStrings("untouched", victim);
+}
+
+test "manifest save rejects symlink target" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const victim_path = try pathZ(arena, "{s}/victim", .{dir});
+    try writeFileAll(victim_path, "untouched");
+    const manifest_path = try pathZ(arena, "{s}/manifest.json", .{dir});
+    try symlinkPath(victim_path, manifest_path);
+
+    var memory_chunks = [_]?[]const u8{null};
+    const manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, chunk_size, 1);
+    if (saveManifest(arena, dir, manifest)) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.IoFailed => {},
+        else => return err,
+    }
+
+    const victim = try readFileAll(arena, victim_path, 1024);
+    try std.testing.expectEqualStrings("untouched", victim);
+}
+
 test "local memory backing proof opens local fd and falls back safely" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -2286,6 +2448,7 @@ test "local memory backing proof opens local fd and falls back safely" {
     try std.testing.expect(corrupt_plan.fd == null);
     try std.testing.expectEqual(LocalBackingRestoreReason.proof_invalid, corrupt_plan.reason);
 
+    if (std.c.unlink(proof_path.ptr) != 0) return error.IoFailed;
     try writeLocalMemoryBackingProof(arena, &env, dir, mm, ram.len);
     const proof_real_path = try pathZ(arena, "{s}/{s}.real", .{ dir, ram_backing_proof_path });
     if (std.c.rename(proof_path.ptr, proof_real_path.ptr) != 0) return error.IoFailed;

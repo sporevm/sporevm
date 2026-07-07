@@ -150,8 +150,9 @@ socket.
 Spore session handles are low-level process/session handles, not workflow
 state. Saved manifests can record `sessions`: an `id`, `kind: "process"`,
 and stream capabilities for `stdin`, `stdout`, `stderr`, and `terminal`.
-Fresh `spore run --save` calls record the `default` session. Commands started from
-an existing spore record a generated `run-*` session id, so a save of that
+Fresh `spore run --save` calls create a new output directory and record the
+`default` session. Commands started from an existing spore record a generated
+`run-*` session id, so a save of that
 restored command can be reattached without pretending it is the original default
 process.
 
