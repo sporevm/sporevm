@@ -112,6 +112,10 @@ Landed in this branch:
   plain tar layers use payload offsets directly, gzip layers spool once into the
   materialization temp directory, and the ext4 writer reads source-backed data
   blocks during final image emission.
+- The native planner/metadata-emitter has an integrated fuzz target covering
+  mixed entry trees, parent synthesis, hardlinks, source-backed file blocks,
+  symlinks, device nodes, special files, xattrs, block assignment, and metadata
+  emission.
 - Focused tests cover deterministic output, multi-group images, double-indirect
   files, hardlink ordering, merged-tree whiteouts/hardlinks, explicit writer
   selection, gzip spooling for merged trees, staging-vs-native layer semantics,
@@ -123,7 +127,6 @@ Landed in this branch:
 Still incomplete:
 
 - Guest boot smoke on representative images.
-- Integrated planner/emitter fuzz targets beyond the merged-tree tar parser.
 - Buildkite-image benchmark evidence and default flip.
 
 ## Delivery Strategy
@@ -173,7 +176,7 @@ Definition of done:
 
 ### Slice 4: Evidence And Default Flip
 
-Status: pending.
+Status: active in this branch.
 
 Collect enough evidence to make native the default and keep the external path
 as an escape hatch for at least one release.
@@ -182,7 +185,7 @@ Definition of done:
 
 - Guest boot/read-back smoke passes on representative images.
 - Buildkite image conversion phase table is recorded here.
-- Integrated fuzz targets run in CI with no outstanding findings.
+- Integrated fuzz targets run in rootfs tests with no outstanding findings.
 - The default flips and the fallback is documented for release notes.
 
 ## Verification

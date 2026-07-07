@@ -1332,6 +1332,96 @@ test "native ext4 writer resolves hardlinks after sorted targets" {
     try runE2fsck(allocator, io, path);
 }
 
+fn fuzzNativeExt4PlannerAndMetadataEmitter(_: void, s: *std.testing.Smith) !void {
+    // The native materializer receives trees derived from attacker-influenced
+    // layer metadata. Exercise the same public entry shape through planning,
+    // data block assignment, and metadata emission without depending on fsck.
+    const allocator = std.testing.allocator;
+
+    var inline_data: [8192]u8 = undefined;
+    const inline_len = s.slice(&inline_data);
+
+    var source_data: [96 * 1024]u8 = undefined;
+    @memset(&source_data, 0xa5);
+    const source_len = 1 + (@as(usize, s.value(u32)) % source_data.len);
+
+    var link_target: [96]u8 = undefined;
+    for (&link_target, 0..) |*byte, i| byte.* = 'a' + @as(u8, @intCast(i % 26));
+    _ = s.slice(&link_target);
+    const link_len = 1 + @as(usize, s.value(u8) % link_target.len);
+
+    var cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
+    const cap_fuzz_len = @min(s.slice(&cap), cap.len);
+    if (cap_fuzz_len < cap.len) @memset(cap[cap_fuzz_len..], 0);
+    cap[0..4].* = .{ 1, 0, 0, 2 };
+    const attrs = [_]xattrs_mod.Attribute{.{ .name = xattrs_mod.security_capability_name, .value = cap[0..] }};
+
+    const entries = [_]Entry{
+        .{
+            .path = "etc/config",
+            .kind = .{ .file = inline_data[0..inline_len] },
+            .mode = 0o600 | @as(u16, s.value(u8) & 0o77),
+            .uid = s.value(u16),
+            .gid = s.value(u16),
+            .xattrs = &attrs,
+        },
+        .{
+            .path = "bin/tool",
+            .kind = .{ .file_source = .{ .memory = source_data[0..source_len] } },
+            .mode = 0o700 | @as(u16, s.value(u8) & 0o77),
+            .uid = s.value(u16),
+            .gid = s.value(u16),
+        },
+        .{ .path = "bin/tool-hard", .kind = .{ .hardlink = "bin/tool" } },
+        .{ .path = "run/tool-link", .kind = .{ .symlink = link_target[0..link_len] } },
+        .{
+            .path = "dev/nullish",
+            .kind = .{ .device = .{
+                .kind = if ((s.value(u8) & 1) == 0) .char else .block,
+                .major = s.value(u8),
+                .minor = s.value(u16),
+            } },
+            .mode = 0o600 | @as(u16, s.value(u8) & 0o77),
+        },
+        .{ .path = "run/input", .kind = .fifo, .mode = 0o600 | @as(u16, s.value(u8) & 0o77) },
+        .{ .path = "run/socket", .kind = .socket, .mode = 0o600 | @as(u16, s.value(u8) & 0o77) },
+    };
+
+    const inode_count: u32 = 1024 + @as(u32, s.value(u8) % 4) * 1024;
+    const total_blocks: u32 = min_image_size / block_size;
+
+    var planned = try planImage(allocator, &entries, inode_count);
+    defer planned.deinit(allocator);
+
+    var blocks = BlockStore.init(allocator);
+    defer freeBlockStore(allocator, &blocks);
+    var data_blocks = DataBlockStore.init(allocator);
+    defer data_blocks.deinit();
+
+    const layout = try assignBlocks(allocator, &planned, total_blocks, inode_count, &blocks, &data_blocks);
+    defer allocator.free(layout.groups);
+    try writeMetadataBlocks(allocator, &planned, layout, .{
+        .image_size = min_image_size,
+        .inode_count = inode_count,
+        .determinism = ext4.Determinism.fromDigest("sha256:fuzz-native-ext4-writer"),
+    }, &blocks);
+
+    var block_keys = blocks.keyIterator();
+    while (block_keys.next()) |block| {
+        try std.testing.expect(block.* < total_blocks);
+    }
+    var source_blocks = data_blocks.iterator();
+    while (source_blocks.next()) |entry| {
+        try std.testing.expect(entry.key_ptr.* < total_blocks);
+        const source = entry.value_ptr.*;
+        try std.testing.expect(source.offset + @as(u64, @intCast(source.len)) <= source.source.size());
+    }
+}
+
+test "fuzz native ext4 writer planner and metadata emitter" {
+    try std.testing.fuzz({}, fuzzNativeExt4PlannerAndMetadataEmitter, .{});
+}
+
 fn runE2fsck(allocator: std.mem.Allocator, io: Io, path: []const u8) !void {
     const candidates = [_][]const u8{
         "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
