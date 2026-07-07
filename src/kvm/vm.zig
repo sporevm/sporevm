@@ -1920,7 +1920,7 @@ fn applyTransports(transports: []mmio.Transport, states: []const spore.Transport
         t.queue_sel = s.queue_sel;
         t.interrupt_status = s.interrupt_status;
         for (s.queues, 0..) |qs, qi| {
-            t.queues[qi] = .{
+            const restored: @TypeOf(t.queues[qi]) = .{
                 .size = qs.size,
                 .ready = qs.ready,
                 .desc_addr = qs.desc_addr,
@@ -1929,6 +1929,8 @@ fn applyTransports(transports: []mmio.Transport, states: []const spore.Transport
                 .last_avail = qs.last_avail,
                 .used_idx = qs.used_idx,
             };
+            restored.validateLayout() catch return error.BadManifest;
+            t.queues[qi] = restored;
         }
     }
 }

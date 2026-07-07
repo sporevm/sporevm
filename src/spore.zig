@@ -20,6 +20,7 @@ const gicv3 = @import("gicv3.zig");
 const local_paths = @import("local_paths.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const topology = @import("topology.zig");
+const virtqueue = @import("virtio/queue.zig");
 const Blake3 = std.crypto.hash.Blake3;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -2001,6 +2002,7 @@ fn validateManifestCommon(
     if (memory.backing) |backing| {
         try validateMemoryBacking(backing, ram_size);
     }
+    try validateTransportQueues(devices);
     if (rootfs) |r| {
         try validateRootfs(r, devices);
     }
@@ -2052,6 +2054,23 @@ fn validateSessions(sessions: []const Session) Error!void {
         if (!std.mem.eql(u8, session.kind, session_kind_process)) return error.BadManifest;
         for (sessions[0..i]) |previous| {
             if (std.mem.eql(u8, previous.id, session.id)) return error.BadManifest;
+        }
+    }
+}
+
+fn validateTransportQueues(devices: []const TransportState) Error!void {
+    for (devices) |device| {
+        for (device.queues) |qs| {
+            const q = virtqueue.VirtQueue{
+                .size = qs.size,
+                .ready = qs.ready,
+                .desc_addr = qs.desc_addr,
+                .avail_addr = qs.avail_addr,
+                .used_addr = qs.used_addr,
+                .last_avail = qs.last_avail,
+                .used_idx = qs.used_idx,
+            };
+            q.validateLayout() catch return error.BadManifest;
         }
     }
 }
@@ -2768,6 +2787,34 @@ fn testTransport(device_id: u32) TransportState {
         .interrupt_status = 0,
         .queues = &.{},
     };
+}
+
+test "manifest rejects overflowing virtqueue base addresses" {
+    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
+    var queues = [_]QueueState{.{
+        .size = 8,
+        .ready = true,
+        .desc_addr = 0x1000,
+        .avail_addr = 0x2000,
+        .used_addr = 0x3000,
+        .last_avail = 0,
+        .used_idx = 0,
+    }};
+    var devices = [_]TransportState{testTransport(3)};
+    devices[0].queues = &queues;
+    var manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, 3);
+    manifest.devices = &devices;
+
+    queues[0].desc_addr = std.math.maxInt(u64);
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    queues[0].desc_addr = 0x1000;
+
+    queues[0].avail_addr = std.math.maxInt(u64);
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    queues[0].avail_addr = 0x2000;
+
+    queues[0].used_addr = std.math.maxInt(u64);
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 }
 
 fn testRootfs(mmio_slot: u32) Rootfs {
