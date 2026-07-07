@@ -47,9 +47,9 @@ pub const inspect_bundle_schema = contracts.inspect_bundle_schema;
 pub const pull_result_schema = contracts.pull_result_schema;
 pub const bundle_schema_version = contracts.bundle_schema_version;
 
-const max_http_bundle_metadata_file_bytes: u64 = 64 * 1024 * 1024;
-const max_http_bundle_metadata_bytes: u64 = 256 * 1024 * 1024;
-const max_http_bundle_materialization_bytes: u64 = 128 * 1024 * 1024 * 1024;
+const max_remote_bundle_metadata_file_bytes: u64 = 64 * 1024 * 1024;
+const max_remote_bundle_metadata_bytes: u64 = 256 * 1024 * 1024;
+const max_remote_bundle_materialization_bytes: u64 = 128 * 1024 * 1024 * 1024;
 
 const LoadedManifest = struct {
     v0: ?std.json.Parsed(spore.Manifest) = null,
@@ -341,30 +341,30 @@ const MaterializeResult = struct {
     copied_chunk_count: usize = 0,
 };
 
-const HttpBundleFileClass = enum {
+const RemoteBundleFileClass = enum {
     metadata,
     payload,
 };
 
-const HttpBundleDownloadBudget = struct {
+const RemoteBundleDownloadBudget = struct {
     total_read: u64 = 0,
     metadata_read: u64 = 0,
 
-    fn limitFor(self: HttpBundleDownloadBudget, class: HttpBundleFileClass, file_limit: u64) Error!u64 {
-        if (self.total_read >= max_http_bundle_materialization_bytes) return error.BundleBodyTooLarge;
-        var limit = @min(file_limit, max_http_bundle_materialization_bytes - self.total_read);
+    fn limitFor(self: RemoteBundleDownloadBudget, class: RemoteBundleFileClass, file_limit: u64) Error!u64 {
+        if (self.total_read >= max_remote_bundle_materialization_bytes) return error.BundleBodyTooLarge;
+        var limit = @min(file_limit, max_remote_bundle_materialization_bytes - self.total_read);
         if (class == .metadata) {
-            if (self.metadata_read >= max_http_bundle_metadata_bytes) return error.BundleBodyTooLarge;
-            limit = @min(limit, max_http_bundle_metadata_bytes - self.metadata_read);
+            if (self.metadata_read >= max_remote_bundle_metadata_bytes) return error.BundleBodyTooLarge;
+            limit = @min(limit, max_remote_bundle_metadata_bytes - self.metadata_read);
         }
         return limit;
     }
 
-    fn record(self: *HttpBundleDownloadBudget, class: HttpBundleFileClass, bytes: u64) Error!void {
-        if (bytes > max_http_bundle_materialization_bytes - self.total_read) return error.BundleBodyTooLarge;
+    fn record(self: *RemoteBundleDownloadBudget, class: RemoteBundleFileClass, bytes: u64) Error!void {
+        if (bytes > max_remote_bundle_materialization_bytes - self.total_read) return error.BundleBodyTooLarge;
         self.total_read += bytes;
         if (class == .metadata) {
-            if (bytes > max_http_bundle_metadata_bytes - self.metadata_read) return error.BundleBodyTooLarge;
+            if (bytes > max_remote_bundle_metadata_bytes - self.metadata_read) return error.BundleBodyTooLarge;
             self.metadata_read += bytes;
         }
     }
@@ -2058,6 +2058,11 @@ const S3Location = struct {
     bucket: []const u8,
     prefix: []const u8,
 
+    fn objectKey(self: S3Location, allocator: std.mem.Allocator, rel_path: []const u8) Error![]const u8 {
+        try validateBundleRelPath(rel_path);
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.prefix, rel_path }) catch return error.OutOfMemory;
+    }
+
     fn objectUri(self: S3Location, allocator: std.mem.Allocator, rel_path: []const u8) Error![]const u8 {
         try validateBundleRelPath(rel_path);
         return std.fmt.allocPrint(allocator, "s3://{s}/{s}/{s}", .{ self.bucket, self.prefix, rel_path }) catch return error.OutOfMemory;
@@ -2443,34 +2448,35 @@ fn downloadS3BundleToDir(
     try ensureNewDir(try pathZ(allocator, "{s}", .{bundle_dir}));
 
     var origin_bytes: u64 = 0;
-    origin_bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, bundle_index_path);
+    var budget = RemoteBundleDownloadBudget{};
+    origin_bytes += try downloadS3BundleMetadataFile(allocator, options, location, bundle_dir, bundle_index_path, &budget);
 
     const parsed_bundle = try loadBundleIndex(allocator, bundle_dir);
     defer parsed_bundle.deinit();
     const bundle_index = parsed_bundle.value;
 
-    origin_bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, bundle_index.parent_manifest);
+    origin_bytes += try downloadS3BundleMetadataFile(allocator, options, location, bundle_dir, bundle_index.parent_manifest, &budget);
     for (bundle_index.children) |child| {
-        origin_bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, child.manifest);
+        origin_bytes += try downloadS3BundleMetadataFile(allocator, options, location, bundle_dir, child.manifest, &budget);
     }
-    origin_bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, index_path);
+    origin_bytes += try downloadS3BundleMetadataFile(allocator, options, location, bundle_dir, index_path, &budget);
 
     const parsed_chunk_index = try loadIndex(allocator, bundle_dir);
     defer parsed_chunk_index.deinit();
     _ = parsed_chunk_index.value.chunks.len;
-    origin_bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, pack_path);
+    origin_bytes += try downloadS3BundlePayloadFile(allocator, options, location, bundle_dir, pack_path, &budget, try chunkPackPayloadBytes(parsed_chunk_index.value));
 
     if (bundle_index.rootfs_index) |rootfs_index_rel| {
-        origin_bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, rootfs_index_rel);
+        origin_bytes += try downloadS3BundleMetadataFile(allocator, options, location, bundle_dir, rootfs_index_rel, &budget);
         const parsed_rootfs_index = try loadRootfsIndex(allocator, bundle_dir);
         defer parsed_rootfs_index.deinit();
-        origin_bytes += try downloadS3RootfsIndexPayloadFiles(allocator, options, location, bundle_dir, parsed_rootfs_index.value);
+        origin_bytes += try downloadS3RootfsIndexPayloadFiles(allocator, options, location, bundle_dir, parsed_rootfs_index.value, &budget);
     }
     var seen_disk_files = std.StringHashMap(void).init(allocator);
     defer seen_disk_files.deinit();
-    origin_bytes += try downloadS3DiskFilesForManifestPath(allocator, options, location, bundle_dir, bundle_index.parent_manifest, &seen_disk_files);
+    origin_bytes += try downloadS3DiskFilesForManifestPath(allocator, options, location, bundle_dir, bundle_index.parent_manifest, &seen_disk_files, &budget);
     for (bundle_index.children) |child| {
-        origin_bytes += try downloadS3DiskFilesForManifestPath(allocator, options, location, bundle_dir, child.manifest, &seen_disk_files);
+        origin_bytes += try downloadS3DiskFilesForManifestPath(allocator, options, location, bundle_dir, child.manifest, &seen_disk_files, &budget);
     }
     return origin_bytes;
 }
@@ -2485,7 +2491,7 @@ fn downloadHttpBundleToDir(
     try ensureNewDir(try pathZ(allocator, "{s}", .{bundle_dir}));
 
     var peer_bytes: u64 = 0;
-    var budget = HttpBundleDownloadBudget{};
+    var budget = RemoteBundleDownloadBudget{};
     peer_bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, bundle_index_path, &budget);
 
     const parsed_bundle = try loadBundleIndex(allocator, bundle_dir);
@@ -2524,18 +2530,19 @@ fn downloadS3RootfsIndexPayloadFiles(
     location: S3Location,
     bundle_dir: []const u8,
     index: RootfsIndex,
+    budget: *RemoteBundleDownloadBudget,
 ) Error!u64 {
     var bytes: u64 = 0;
     for (index.artifacts) |artifact| {
         if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
-            bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, artifact.path orelse return error.BadManifest);
+            bytes += try downloadS3BundlePayloadFile(allocator, options, location, bundle_dir, artifact.path orelse return error.BadManifest, budget, artifact.size);
         }
     }
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
     for (index.storages) |storage_entry| {
         if (try markBundleFileSeen(&seen, storage_entry.index_path)) {
-            bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, storage_entry.index_path);
+            bytes += try downloadS3BundleSizedMetadataFile(allocator, options, location, bundle_dir, storage_entry.index_path, budget, storage_entry.index_bytes);
         }
         const storage = rootfsStorageEntryDescriptor(storage_entry);
         const parsed_index = try loadRootfsBlockIndexForEntry(allocator, bundle_dir, storage_entry, storage);
@@ -2543,7 +2550,8 @@ fn downloadS3RootfsIndexPayloadFiles(
         for (parsed_index.value.chunks) |chunk_entry| {
             const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
             if (try markBundleFileSeen(&seen, object_rel)) {
-                bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, object_rel);
+                const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
+                bytes += try downloadS3BundlePayloadFile(allocator, options, location, bundle_dir, object_rel, budget, @intCast(expected_size));
             }
         }
     }
@@ -2557,7 +2565,7 @@ fn downloadHttpRootfsIndexPayloadFiles(
     location: HttpLocation,
     bundle_dir: []const u8,
     index: RootfsIndex,
-    budget: *HttpBundleDownloadBudget,
+    budget: *RemoteBundleDownloadBudget,
 ) Error!u64 {
     var bytes: u64 = 0;
     for (index.artifacts) |artifact| {
@@ -2592,6 +2600,7 @@ fn downloadS3DiskFilesForManifestPath(
     bundle_dir: []const u8,
     manifest_rel: []const u8,
     seen: *std.StringHashMap(void),
+    budget: *RemoteBundleDownloadBudget,
 ) Error!u64 {
     var parsed_manifest = try LoadedManifest.loadPath(
         allocator,
@@ -2603,7 +2612,7 @@ fn downloadS3DiskFilesForManifestPath(
     for (disk.layers) |layer_ref| {
         const layer_rel = try diskLayerRelPath(allocator, layer_ref);
         if (try markBundleFileSeen(seen, layer_rel)) {
-            bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, layer_rel);
+            bytes += try downloadS3BundleMetadataFile(allocator, options, location, bundle_dir, layer_rel, budget);
         }
         const parsed_layer = disk_layer.loadLayer(allocator, bundle_dir, layer_ref) catch |err| return diskLayerError(err);
         defer parsed_layer.deinit();
@@ -2611,7 +2620,8 @@ fn downloadS3DiskFilesForManifestPath(
         for (parsed_layer.value.extents) |extent| {
             const object_rel = try diskObjectRelPath(allocator, extent.digest);
             if (try markBundleFileSeen(seen, object_rel)) {
-                bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, object_rel);
+                const expected_size = try spore.diskClusterLen(parsed_layer.value.disk_size, parsed_layer.value.cluster_size, extent.logical_cluster);
+                bytes += try downloadS3BundlePayloadFile(allocator, options, location, bundle_dir, object_rel, budget, @intCast(expected_size));
             }
         }
     }
@@ -2626,7 +2636,7 @@ fn downloadHttpDiskFilesForManifestPath(
     bundle_dir: []const u8,
     manifest_rel: []const u8,
     seen: *std.StringHashMap(void),
-    budget: *HttpBundleDownloadBudget,
+    budget: *RemoteBundleDownloadBudget,
 ) Error!u64 {
     var parsed_manifest = try LoadedManifest.loadPath(
         allocator,
@@ -2654,19 +2664,71 @@ fn downloadHttpDiskFilesForManifestPath(
     return bytes;
 }
 
+fn downloadS3BundleMetadataFile(
+    allocator: std.mem.Allocator,
+    options: PullOptions,
+    location: S3Location,
+    bundle_dir: []const u8,
+    rel_path: []const u8,
+    budget: *RemoteBundleDownloadBudget,
+) Error!u64 {
+    return downloadS3BundleFile(allocator, options, location, bundle_dir, rel_path, budget, .metadata, max_remote_bundle_metadata_file_bytes);
+}
+
+fn downloadS3BundleSizedMetadataFile(
+    allocator: std.mem.Allocator,
+    options: PullOptions,
+    location: S3Location,
+    bundle_dir: []const u8,
+    rel_path: []const u8,
+    budget: *RemoteBundleDownloadBudget,
+    max_body_bytes: u64,
+) Error!u64 {
+    return downloadS3BundleFile(allocator, options, location, bundle_dir, rel_path, budget, .metadata, max_body_bytes);
+}
+
+fn downloadS3BundlePayloadFile(
+    allocator: std.mem.Allocator,
+    options: PullOptions,
+    location: S3Location,
+    bundle_dir: []const u8,
+    rel_path: []const u8,
+    budget: *RemoteBundleDownloadBudget,
+    max_body_bytes: u64,
+) Error!u64 {
+    return downloadS3BundleFile(allocator, options, location, bundle_dir, rel_path, budget, .payload, max_body_bytes);
+}
+
 fn downloadS3BundleFile(
     allocator: std.mem.Allocator,
     options: PullOptions,
     location: S3Location,
     bundle_dir: []const u8,
     rel_path: []const u8,
+    budget: *RemoteBundleDownloadBudget,
+    file_class: RemoteBundleFileClass,
+    max_body_bytes: u64,
 ) Error!u64 {
     try validateBundleRelPath(rel_path);
     const dest_path = try pathZ(allocator, "{s}/{s}", .{ bundle_dir, rel_path });
     if (std.fs.path.dirname(dest_path)) |parent| try ensureDirPath(options.io, parent);
-    const object_uri = try location.objectUri(allocator, rel_path);
-    try runAwsS3Cp(allocator, options.io, options.aws_executable, object_uri, dest_path, options.aws_region);
-    return fileSizeNoSymlink(options.io, dest_path);
+    errdefer Io.Dir.cwd().deleteFile(options.io, dest_path) catch {};
+
+    const object_key = try location.objectKey(allocator, rel_path);
+    const limit = try budget.limitFor(file_class, max_body_bytes);
+    const object_size = try runAwsS3HeadObjectContentLength(allocator, options.io, options.aws_executable, location.bucket, object_key, options.aws_region);
+    if (object_size > limit) return error.BundleBodyTooLarge;
+
+    if (object_size == 0) {
+        var file = Io.Dir.cwd().createFile(options.io, dest_path, .{}) catch return error.IoFailed;
+        file.close(options.io);
+    } else {
+        try runAwsS3GetObject(allocator, options.io, options.aws_executable, location.bucket, object_key, dest_path, options.aws_region, limit);
+    }
+    const copied = try fileSizeNoSymlink(options.io, dest_path);
+    if (copied != object_size) return error.BadChunk;
+    try budget.record(file_class, copied);
+    return copied;
 }
 
 fn downloadHttpBundleMetadataFile(
@@ -2676,9 +2738,9 @@ fn downloadHttpBundleMetadataFile(
     location: HttpLocation,
     bundle_dir: []const u8,
     rel_path: []const u8,
-    budget: *HttpBundleDownloadBudget,
+    budget: *RemoteBundleDownloadBudget,
 ) Error!u64 {
-    return downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rel_path, budget, .metadata, max_http_bundle_metadata_file_bytes);
+    return downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rel_path, budget, .metadata, max_remote_bundle_metadata_file_bytes);
 }
 
 fn downloadHttpBundleSizedMetadataFile(
@@ -2688,7 +2750,7 @@ fn downloadHttpBundleSizedMetadataFile(
     location: HttpLocation,
     bundle_dir: []const u8,
     rel_path: []const u8,
-    budget: *HttpBundleDownloadBudget,
+    budget: *RemoteBundleDownloadBudget,
     max_body_bytes: u64,
 ) Error!u64 {
     return downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rel_path, budget, .metadata, max_body_bytes);
@@ -2701,7 +2763,7 @@ fn downloadHttpBundlePayloadFile(
     location: HttpLocation,
     bundle_dir: []const u8,
     rel_path: []const u8,
-    budget: *HttpBundleDownloadBudget,
+    budget: *RemoteBundleDownloadBudget,
     max_body_bytes: u64,
 ) Error!u64 {
     return downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rel_path, budget, .payload, max_body_bytes);
@@ -2714,8 +2776,8 @@ fn downloadHttpBundleFile(
     location: HttpLocation,
     bundle_dir: []const u8,
     rel_path: []const u8,
-    budget: *HttpBundleDownloadBudget,
-    file_class: HttpBundleFileClass,
+    budget: *RemoteBundleDownloadBudget,
+    file_class: RemoteBundleFileClass,
     max_body_bytes: u64,
 ) Error!u64 {
     try validateBundleRelPath(rel_path);
@@ -2820,6 +2882,94 @@ fn validateHttpFetchTarget(io: Io, uri: std.Uri) Error!void {
     _ = try resolveHttpFetchTarget(io, uri);
 }
 
+fn appendAwsRegion(argv: *std.array_list.Managed([]const u8), region: ?[]const u8) Error!void {
+    if (region) |value| {
+        if (value.len == 0) return error.BadManifest;
+        argv.append("--region") catch return error.OutOfMemory;
+        argv.append(value) catch return error.OutOfMemory;
+    }
+}
+
+fn runAwsS3HeadObjectContentLength(
+    allocator: std.mem.Allocator,
+    io: Io,
+    aws_executable: []const u8,
+    bucket: []const u8,
+    key: []const u8,
+    region: ?[]const u8,
+) Error!u64 {
+    var argv = std.array_list.Managed([]const u8).init(allocator);
+    argv.append(aws_executable) catch return error.OutOfMemory;
+    argv.append("s3api") catch return error.OutOfMemory;
+    argv.append("head-object") catch return error.OutOfMemory;
+    argv.append("--bucket") catch return error.OutOfMemory;
+    argv.append(bucket) catch return error.OutOfMemory;
+    argv.append("--key") catch return error.OutOfMemory;
+    argv.append(key) catch return error.OutOfMemory;
+    argv.append("--query") catch return error.OutOfMemory;
+    argv.append("ContentLength") catch return error.OutOfMemory;
+    argv.append("--output") catch return error.OutOfMemory;
+    argv.append("text") catch return error.OutOfMemory;
+    try appendAwsRegion(&argv, region);
+
+    const result = std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .stdout_limit = .limited(8 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch return error.IoFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+            if (trimmed.len == 0) return error.BadChunk;
+            return std.fmt.parseInt(u64, trimmed, 10) catch return error.BadChunk;
+        },
+        else => {},
+    }
+    return error.IoFailed;
+}
+
+fn runAwsS3GetObject(
+    allocator: std.mem.Allocator,
+    io: Io,
+    aws_executable: []const u8,
+    bucket: []const u8,
+    key: []const u8,
+    destination: []const u8,
+    region: ?[]const u8,
+    max_body_bytes: u64,
+) Error!void {
+    var argv = std.array_list.Managed([]const u8).init(allocator);
+    argv.append(aws_executable) catch return error.OutOfMemory;
+    argv.append("s3api") catch return error.OutOfMemory;
+    argv.append("get-object") catch return error.OutOfMemory;
+    argv.append("--bucket") catch return error.OutOfMemory;
+    argv.append(bucket) catch return error.OutOfMemory;
+    argv.append("--key") catch return error.OutOfMemory;
+    argv.append(key) catch return error.OutOfMemory;
+    if (max_body_bytes > 0) {
+        const range = std.fmt.allocPrint(allocator, "bytes=0-{d}", .{max_body_bytes - 1}) catch return error.OutOfMemory;
+        argv.append("--range") catch return error.OutOfMemory;
+        argv.append(range) catch return error.OutOfMemory;
+    }
+    try appendAwsRegion(&argv, region);
+    argv.append(destination) catch return error.OutOfMemory;
+
+    const result = std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch return error.IoFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    return error.IoFailed;
+}
+
 fn runAwsS3Cp(
     allocator: std.mem.Allocator,
     io: Io,
@@ -2834,11 +2984,7 @@ fn runAwsS3Cp(
     argv.append("cp") catch return error.OutOfMemory;
     argv.append(source) catch return error.OutOfMemory;
     argv.append(destination) catch return error.OutOfMemory;
-    if (region) |value| {
-        if (value.len == 0) return error.BadManifest;
-        argv.append("--region") catch return error.OutOfMemory;
-        argv.append(value) catch return error.OutOfMemory;
-    }
+    try appendAwsRegion(&argv, region);
     argv.append("--only-show-errors") catch return error.OutOfMemory;
 
     const result = std.process.run(allocator, io, .{
@@ -3402,30 +3548,81 @@ const TestHttpBodyServer = struct {
 };
 
 fn writeFakeAwsScript(allocator: std.mem.Allocator, script_path: [:0]const u8, fake_s3_root: []const u8) !void {
+    try writeFakeAwsScriptWithLog(allocator, script_path, fake_s3_root, null);
+}
+
+fn writeFakeAwsScriptWithLog(
+    allocator: std.mem.Allocator,
+    script_path: [:0]const u8,
+    fake_s3_root: []const u8,
+    log_path: ?[]const u8,
+) !void {
     const script = try std.fmt.allocPrint(
         allocator,
         \\#!/usr/bin/env bash
         \\set -euo pipefail
         \\root="{s}"
-        \\if [[ "$#" -lt 4 || "$1" != "s3" || "$2" != "cp" ]]; then
-        \\  echo "unsupported fake aws invocation: $*" >&2
-        \\  exit 64
+        \\log_path="{s}"
+        \\if [[ -n "$log_path" ]]; then
+        \\  printf '%s\n' "$*" >> "$log_path"
         \\fi
-        \\src="$3"
-        \\dst="$4"
         \\map_path() {{
         \\  case "$1" in
         \\    s3://*) key="$(printf '%s' "$1" | sed 's#^s3://##')"; printf '%s/%s' "$root" "$key" ;;
         \\    *) printf '%s' "$1" ;;
         \\  esac
         \\}}
-        \\src_path="$(map_path "$src")"
-        \\dst_path="$(map_path "$dst")"
-        \\mkdir -p "$(dirname "$dst_path")"
-        \\cp "$src_path" "$dst_path"
+        \\parse_s3api_args() {{
+        \\  bucket=""
+        \\  key=""
+        \\  range=""
+        \\  outfile=""
+        \\  while [[ "$#" -gt 0 ]]; do
+        \\    case "$1" in
+        \\      --bucket) bucket="$2"; shift 2 ;;
+        \\      --key) key="$2"; shift 2 ;;
+        \\      --range) range="$2"; shift 2 ;;
+        \\      --region|--query|--output) shift 2 ;;
+        \\      *) outfile="$1"; shift ;;
+        \\    esac
+        \\  done
+        \\  if [[ -z "$bucket" || -z "$key" ]]; then
+        \\    echo "missing fake aws bucket/key" >&2
+        \\    exit 64
+        \\  fi
+        \\}}
+        \\if [[ "$#" -ge 4 && "$1" == "s3" && "$2" == "cp" ]]; then
+        \\  src="$3"
+        \\  dst="$4"
+        \\  src_path="$(map_path "$src")"
+        \\  dst_path="$(map_path "$dst")"
+        \\  mkdir -p "$(dirname "$dst_path")"
+        \\  cp "$src_path" "$dst_path"
+        \\elif [[ "$#" -ge 2 && "$1" == "s3api" && "$2" == "head-object" ]]; then
+        \\  shift 2
+        \\  parse_s3api_args "$@"
+        \\  src_path="$root/$bucket/$key"
+        \\  wc -c < "$src_path" | tr -d '[:space:]'
+        \\  printf '\n'
+        \\elif [[ "$#" -ge 2 && "$1" == "s3api" && "$2" == "get-object" ]]; then
+        \\  shift 2
+        \\  parse_s3api_args "$@"
+        \\  if [[ -z "$outfile" ]]; then
+        \\    echo "missing fake aws output path" >&2
+        \\    exit 64
+        \\  fi
+        \\  src_path="$root/$bucket/$key"
+        \\  mkdir -p "$(dirname "$outfile")"
+        \\  cp "$src_path" "$outfile"
+        \\  size="$(wc -c < "$outfile" | tr -d '[:space:]')"
+        \\  printf '{{"ContentLength":%s}}\n' "$size"
+        \\else
+        \\  echo "unsupported fake aws invocation: $*" >&2
+        \\  exit 64
+        \\fi
         \\
     ,
-        .{fake_s3_root},
+        .{ fake_s3_root, log_path orelse "" },
     );
     try writeFileAll(script_path, script);
     if (std.c.chmod(script_path, 0o755) != 0) return error.IoFailed;
@@ -4515,6 +4712,129 @@ test "push and pull s3 indexed bundle carries disk layers" {
     }));
 }
 
+test "s3 bundle file uses head-object and bounded get-object range" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const fake_s3_root = try pathZ(arena, "{s}/fake-s3", .{root_dir});
+    const remote_bundle_dir = try pathZ(arena, "{s}/bucket/runs/demo.bundle", .{fake_s3_root});
+    const fake_aws = try pathZ(arena, "{s}/fake-aws", .{root_dir});
+    const log_path = try pathZ(arena, "{s}/fake-aws.log", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/downloaded", .{root_dir});
+    try ensureDirPath(io, remote_bundle_dir);
+    try writeFileAll(try pathZ(arena, "{s}/{s}", .{ remote_bundle_dir, bundle_index_path }), "1234");
+    try writeFakeAwsScriptWithLog(arena, fake_aws, fake_s3_root, log_path);
+
+    const location = try parseS3Location(arena, "s3://bucket/runs/demo.bundle");
+    var budget = RemoteBundleDownloadBudget{};
+    const copied = try downloadS3BundleFile(arena, .{
+        .io = io,
+        .source = "s3://bucket/runs/demo.bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .out_dir = root_dir,
+        .aws_region = "ap-southeast-2",
+        .aws_executable = fake_aws,
+    }, location, bundle_dir, bundle_index_path, &budget, .metadata, 4);
+    try std.testing.expectEqual(@as(u64, 4), copied);
+    try std.testing.expectEqual(@as(u64, 4), budget.total_read);
+    try std.testing.expectEqual(@as(u64, 4), budget.metadata_read);
+
+    const downloaded = try readFileAll(arena, try pathZ(arena, "{s}/{s}", .{ bundle_dir, bundle_index_path }), 16);
+    try std.testing.expectEqualStrings("1234", downloaded);
+    const log = try readFileAll(arena, log_path, 4096);
+    try std.testing.expect(std.mem.indexOf(u8, log, "s3api head-object") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "s3api get-object") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "--range bytes=0-3") != null);
+}
+
+test "s3 bundle file rejects oversized head before get-object" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const fake_s3_root = try pathZ(arena, "{s}/fake-s3", .{root_dir});
+    const remote_bundle_dir = try pathZ(arena, "{s}/bucket/runs/demo.bundle", .{fake_s3_root});
+    const fake_aws = try pathZ(arena, "{s}/fake-aws", .{root_dir});
+    const log_path = try pathZ(arena, "{s}/fake-aws.log", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/downloaded", .{root_dir});
+    try ensureDirPath(io, remote_bundle_dir);
+    try writeFileAll(try pathZ(arena, "{s}/{s}", .{ remote_bundle_dir, bundle_index_path }), "12345");
+    try writeFakeAwsScriptWithLog(arena, fake_aws, fake_s3_root, log_path);
+
+    const location = try parseS3Location(arena, "s3://bucket/runs/demo.bundle");
+    var budget = RemoteBundleDownloadBudget{};
+    try std.testing.expectError(error.BundleBodyTooLarge, downloadS3BundleFile(arena, .{
+        .io = io,
+        .source = "s3://bucket/runs/demo.bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .out_dir = root_dir,
+        .aws_region = "ap-southeast-2",
+        .aws_executable = fake_aws,
+    }, location, bundle_dir, bundle_index_path, &budget, .metadata, 4));
+    try std.testing.expectEqual(@as(u64, 0), budget.total_read);
+    try std.testing.expectEqual(@as(u64, 0), budget.metadata_read);
+    try std.testing.expect(!try pathExistsNoSymlink(io, try pathZ(arena, "{s}/{s}", .{ bundle_dir, bundle_index_path })));
+
+    const log = try readFileAll(arena, log_path, 4096);
+    try std.testing.expect(std.mem.indexOf(u8, log, "s3api head-object") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "s3api get-object") == null);
+}
+
+test "s3 bundle file deletes partial file when observed size changes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const fake_aws = try pathZ(arena, "{s}/fake-aws-racy", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/downloaded", .{root_dir});
+    const script =
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\if [[ "$1" == "s3api" && "$2" == "head-object" ]]; then
+        \\  printf '4\n'
+        \\  exit 0
+        \\fi
+        \\if [[ "$1" == "s3api" && "$2" == "get-object" ]]; then
+        \\  shift 2
+        \\  outfile=""
+        \\  while [[ "$#" -gt 0 ]]; do
+        \\    case "$1" in
+        \\      --bucket|--key|--range|--region) shift 2 ;;
+        \\      *) outfile="$1"; shift ;;
+        \\    esac
+        \\  done
+        \\  mkdir -p "$(dirname "$outfile")"
+        \\  printf '12345' > "$outfile"
+        \\  printf '{"ContentLength":5}\n'
+        \\  exit 0
+        \\fi
+        \\exit 64
+        \\
+    ;
+    try writeFileAll(fake_aws, script);
+    if (std.c.chmod(fake_aws, 0o755) != 0) return error.IoFailed;
+
+    const location = try parseS3Location(arena, "s3://bucket/runs/demo.bundle");
+    var budget = RemoteBundleDownloadBudget{};
+    try std.testing.expectError(error.BadChunk, downloadS3BundleFile(arena, .{
+        .io = io,
+        .source = "s3://bucket/runs/demo.bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .out_dir = root_dir,
+        .aws_region = "ap-southeast-2",
+        .aws_executable = fake_aws,
+    }, location, bundle_dir, bundle_index_path, &budget, .metadata, 8));
+    try std.testing.expect(!try pathExistsNoSymlink(io, try pathZ(arena, "{s}/{s}", .{ bundle_dir, bundle_index_path })));
+    try std.testing.expectEqual(@as(u64, 0), budget.total_read);
+}
+
 test "http bundle pull rejects loopback source before request" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -4536,7 +4856,7 @@ test "http bundle pull rejects loopback source before request" {
     const dest_path = try pathZ(arena, "{s}/downloaded-bundle.json", .{root_dir});
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
-    try std.testing.expectError(error.BadManifest, httpGetToFile(io, &client, url, dest_path, max_http_bundle_metadata_file_bytes));
+    try std.testing.expectError(error.BadManifest, httpGetToFile(io, &client, url, dest_path, max_remote_bundle_metadata_file_bytes));
     try std.testing.expectEqual(@as(usize, 0), server.request_count.load(.monotonic));
 }
 
