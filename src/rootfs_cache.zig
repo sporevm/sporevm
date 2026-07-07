@@ -184,6 +184,39 @@ pub fn installExpectedPathAfterSourceVerified(
     return .{ .cache_hit = false, .bytes_fetched = artifact.size };
 }
 
+/// Installs a caller-verified source by hardlinking it into the digest cache
+/// without a second full-file hash.
+///
+/// Returns null when the fast path is not applicable, so callers can fall back
+/// to `installExpectedPathAfterSourceVerified`. The caller must already have
+/// verified `source_path` against `artifact`; this helper only proves the path
+/// shape and size did not obviously change before linking.
+pub fn installExpectedPathAfterSourceVerifiedByHardlink(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    source_path: []const u8,
+    artifact: spore.RootfsArtifactRef,
+) !?InstallResult {
+    if (!std.mem.eql(u8, artifact.format, spore.rootfs_artifact_format_ext4)) return error.RootFSDigestMismatch;
+
+    const digest_path = try digestPath(allocator, cache_root, artifact.digest);
+    const digest_dir = std.fs.path.dirname(digest_path) orelse return error.RootFSOpenFailed;
+    try ensureDirPath(io, digest_dir);
+
+    if (try pathExistsNoSymlink(io, digest_path)) return null;
+
+    const source_stat = Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return null,
+        else => |e| return e,
+    };
+    if (source_stat.kind != .file) return null;
+    if (source_stat.size != artifact.size) return error.RootFSDigestMismatch;
+
+    if (!try hardlinkTrustedPath(io, allocator, source_path, digest_path, artifact.size)) return null;
+    return .{ .cache_hit = false, .bytes_fetched = artifact.size };
+}
+
 pub fn copyVerifiedPath(
     io: Io,
     allocator: std.mem.Allocator,
@@ -327,6 +360,26 @@ fn hardlinkVerifiedPath(
     errdefer Io.Dir.cwd().deleteFile(io, dest_path) catch {};
     if (std.c.chmod(dest_z, 0o444) != 0) return error.RootFSOpenFailed;
     try verifyPath(io, allocator, dest_path, artifact, true);
+    return true;
+}
+
+fn hardlinkTrustedPath(
+    io: Io,
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    dest_path: []const u8,
+    expected_size: u64,
+) !bool {
+    const source_z = try allocator.dupeZ(u8, source_path);
+    defer allocator.free(source_z);
+    const dest_z = try allocator.dupeZ(u8, dest_path);
+    defer allocator.free(dest_z);
+    if (std.c.link(source_z, dest_z) != 0) return false;
+    errdefer Io.Dir.cwd().deleteFile(io, dest_path) catch {};
+    if (std.c.chmod(dest_z, 0o444) != 0) return error.RootFSOpenFailed;
+    const dest_stat = Io.Dir.cwd().statFile(io, dest_path, .{ .follow_symlinks = false }) catch return error.RootFSOpenFailed;
+    if (dest_stat.kind != .file) return error.RootFSOpenFailed;
+    if (dest_stat.size != expected_size) return error.RootFSDigestMismatch;
     return true;
 }
 
@@ -612,6 +665,40 @@ test "install after source verification cleans up bad installed bytes" {
 
     const digest_path = try digestPath(arena, cache_root, artifact.digest);
     try std.testing.expect(!try pathExistsNoSymlink(io, digest_path));
+}
+
+test "preverified hardlink install skips second hash for regular source" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-cache-preverified-hardlink";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+
+    const source = try hashPath(io, arena, rootfs_path);
+    const artifact = spore.RootfsArtifactRef{
+        .digest = source.digest,
+        .size = source.size,
+        .format = spore.rootfs_artifact_format_ext4,
+    };
+    const installed = (try installExpectedPathAfterSourceVerifiedByHardlink(io, arena, cache_root, rootfs_path, artifact)).?;
+    try std.testing.expect(!installed.cache_hit);
+    try std.testing.expectEqual(source.size, installed.bytes_fetched);
+
+    const digest_path = try digestPath(arena, cache_root, artifact.digest);
+    const digest_stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(source.size, digest_stat.size);
+    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(digest_stat.permissions) & 0o777)));
+    try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedFromCache(io, arena, cache_root, .{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = .{ .digest = source.digest, .size = source.size + 1 },
+    }));
 }
 
 test "digest cache rejects unsafe existing paths" {

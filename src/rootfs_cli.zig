@@ -30,6 +30,23 @@ const import_oci_usage =
     \\Options:
     \\  --ref <name:tag>       Local mutable image ref to record
     \\  --platform <os/arch>   Target platform (default: linux/arm64)
+    \\  --rootfs-storage <policy>
+    \\                       Rootfs storage: chunked or flat (default: chunked)
+    \\  --mkfs <path>          mkfs.ext4 binary (default: auto-detect)
+    \\  --debugfs <path>       debugfs binary (default: auto-detect)
+    \\  -h, --help             Show this help
+    \\
+;
+
+const import_tar_usage =
+    \\Usage:
+    \\  spore rootfs import-tar <rootfs.tar> --ref local/name:tag
+    \\
+    \\Options:
+    \\  --ref <name:tag>       Local mutable image ref to record
+    \\  --platform <os/arch>   Target platform (default: linux/arm64)
+    \\  --rootfs-storage <policy>
+    \\                       Rootfs storage: chunked or flat (default: chunked)
     \\  --mkfs <path>          mkfs.ext4 binary (default: auto-detect)
     \\  --debugfs <path>       debugfs binary (default: auto-detect)
     \\  -h, --help             Show this help
@@ -70,6 +87,10 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     }
     if (std.mem.eql(u8, args[0], "import-oci")) {
         try importOci(init, args[1..], stdout);
+        return;
+    }
+    if (std.mem.eql(u8, args[0], "import-tar")) {
+        try importTar(init, args[1..], stdout);
         return;
     }
     if (std.mem.eql(u8, args[0], "resolve")) {
@@ -121,6 +142,34 @@ fn importOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
         .input = parsed.input,
         .ref = parsed.ref,
         .platform = parsed.platform,
+        .rootfs_storage = parsed.rootfs_storage,
+        .mkfs = parsed.mkfs,
+        .debugfs = parsed.debugfs,
+    });
+    try stdout.print(
+        "rootfs: {s}\nmetadata: {s}\nref: {s}\nresolved: {s}\nrootfs_blake3: {s}\n",
+        .{
+            result.rootfs_path,
+            result.metadata_path,
+            parsed.ref,
+            result.resolved_image_ref,
+            result.rootfs_blake3,
+        },
+    );
+}
+
+fn importTar(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    if (wantsHelp(args)) {
+        try stdout.writeAll(import_tar_usage);
+        return;
+    }
+    const arena = init.arena.allocator();
+    const parsed = try rootfs_mod.parseImportTarOptions(args, stdout);
+    const result = try api.rootfsImportTar(init, arena, .{
+        .input = parsed.input,
+        .ref = parsed.ref,
+        .platform = parsed.platform,
+        .rootfs_storage = parsed.rootfs_storage,
         .mkfs = parsed.mkfs,
         .debugfs = parsed.debugfs,
     });
@@ -209,5 +258,6 @@ test "rootfs cli help accepts standard help spellings" {
     try std.testing.expect(wantsTopLevelHelp(&.{"--help"}));
     try std.testing.expect(!wantsTopLevelHelp(&.{ "build", "--help" }));
     try std.testing.expect(std.mem.indexOf(u8, rootfs_mod.usage, "cas-preload") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rootfs_mod.usage, "import-tar") != null);
     try std.testing.expect(std.mem.indexOf(u8, cas_preload_usage, "cas-preload") != null);
 }
