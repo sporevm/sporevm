@@ -23,6 +23,75 @@ pub const ApplyOptions = struct {
     case_sensitive_staging: bool,
 };
 
+pub const LayerInput = struct {
+    media_type: []const u8,
+    path: []const u8,
+};
+
+pub const MergedEntryKind = enum {
+    directory,
+    file,
+    symlink,
+};
+
+pub const MergedEntry = struct {
+    kind: MergedEntryKind,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    inode_id: u64 = 0,
+    symlink_target: []u8 = &.{},
+    xattrs: []xattrs_mod.Attribute = &.{},
+};
+
+const FileInodeMap = std.AutoHashMap(u64, []u8);
+
+pub const MergedTree = struct {
+    entries: std.StringHashMap(MergedEntry),
+    file_data: FileInodeMap,
+    next_inode_id: u64 = 1,
+
+    pub fn init(allocator: std.mem.Allocator) MergedTree {
+        return .{
+            .entries = std.StringHashMap(MergedEntry).init(allocator),
+            .file_data = FileInodeMap.init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *MergedTree, allocator: std.mem.Allocator) void {
+        var entries = self.entries.iterator();
+        while (entries.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            deinitMergedEntry(allocator, entry.value_ptr.*);
+        }
+        self.entries.deinit();
+
+        var files = self.file_data.valueIterator();
+        while (files.next()) |data| allocator.free(data.*);
+        self.file_data.deinit();
+    }
+
+    pub fn fileData(self: *const MergedTree, inode_id: u64) ![]const u8 {
+        return self.file_data.get(inode_id) orelse error.BadHardlinkTarget;
+    }
+
+    pub fn contentSize(self: *const MergedTree) u64 {
+        var total: u64 = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.kind == .file) {
+                const data = self.file_data.get(entry.value_ptr.inode_id) orelse &.{};
+                total += data.len;
+            }
+        }
+        return total;
+    }
+
+    pub fn entryCount(self: *const MergedTree) u64 {
+        return self.entries.count() + 1;
+    }
+};
+
 pub fn applyLayer(
     allocator: std.mem.Allocator,
     io: Io,
@@ -42,6 +111,88 @@ pub fn applyLayer(
         return;
     }
     return error.UnsupportedLayerMediaType;
+}
+
+pub fn buildMergedTree(
+    allocator: std.mem.Allocator,
+    io: Io,
+    layers: []const LayerInput,
+) !MergedTree {
+    var tree = MergedTree.init(allocator);
+    errdefer tree.deinit(allocator);
+    for (layers) |layer| {
+        try applyLayerToMergedTree(allocator, io, &tree, layer);
+        if (tree.contentSize() > max_content_bytes) return error.RootFSArchiveTooLarge;
+    }
+    return tree;
+}
+
+pub fn applyLayerToMergedTree(
+    allocator: std.mem.Allocator,
+    io: Io,
+    tree: *MergedTree,
+    layer: LayerInput,
+) !void {
+    if (oci.isGzipLayerMediaType(layer.media_type)) {
+        var file = try Io.Dir.cwd().openFile(io, layer.path, .{});
+        defer file.close(io);
+        var file_buf: [64 * 1024]u8 = undefined;
+        var file_reader: Io.File.Reader = .initStreaming(file, io, &file_buf);
+        var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
+        var decompress: std.compress.flate.Decompress = .init(&file_reader.interface, .gzip, &decompress_buf);
+        applyTarLayerToMergedTree(allocator, &decompress.reader, tree) catch |err| switch (err) {
+            error.ReadFailed => return decompress.err orelse err,
+            else => |e| return e,
+        };
+        return;
+    }
+    if (oci.isPlainTarLayerMediaType(layer.media_type)) {
+        var file = try Io.Dir.cwd().openFile(io, layer.path, .{});
+        defer file.close(io);
+        var file_buf: [64 * 1024]u8 = undefined;
+        var file_reader: Io.File.Reader = .initStreaming(file, io, &file_buf);
+        try applyTarLayerToMergedTree(allocator, &file_reader.interface, tree);
+        return;
+    }
+    return error.UnsupportedLayerMediaType;
+}
+
+pub fn ensureMergedDirectory(
+    allocator: std.mem.Allocator,
+    tree: *MergedTree,
+    rel: []const u8,
+    mode: u32,
+    owner: Ownership,
+) !void {
+    try ensureNoMergedSymlinkPath(tree, rel, true);
+    try ensureMergedParent(allocator, tree, parentPath(rel));
+    if (tree.entries.get(rel)) |entry| {
+        if (entry.kind != .directory) return error.RequiredRootFSPathNotDirectory;
+    }
+    try putMergedEntry(allocator, tree, rel, .{
+        .kind = .directory,
+        .mode = @intCast(mode & 0o7777),
+        .uid = owner.uid,
+        .gid = owner.gid,
+    });
+}
+
+pub fn ensureMergedFile(
+    allocator: std.mem.Allocator,
+    tree: *MergedTree,
+    rel: []const u8,
+    data: []const u8,
+    mode: u32,
+    owner: Ownership,
+) !void {
+    if (tree.entries.contains(rel)) return;
+    try ensureNoMergedSymlinkPath(tree, parentPath(rel), false);
+    try ensureMergedParent(allocator, tree, parentPath(rel));
+    const copied = try allocator.dupe(u8, data);
+    errdefer allocator.free(copied);
+    var created = CreatedPathMap.init(allocator);
+    defer deinitCreatedPaths(allocator, &created);
+    try putMergedFile(allocator, tree, &created, rel, copied, mode, owner, &.{});
 }
 
 fn applyGzipLayer(
@@ -260,6 +411,441 @@ fn applyTarLayerWithXattrs(
             },
         }
     }
+}
+
+fn applyTarLayerToMergedTree(
+    allocator: std.mem.Allocator,
+    reader: *Io.Reader,
+    tree: *MergedTree,
+) !void {
+    var limits: LayerLimits = .{};
+    var long_name: ?[]u8 = null;
+    var long_link: ?[]u8 = null;
+    var pax: PendingPax = .{};
+    var global_pax: PendingPax = .{};
+    var created = CreatedPathMap.init(allocator);
+    defer {
+        if (long_name) |p| allocator.free(p);
+        if (long_link) |p| allocator.free(p);
+        pax.clear(allocator);
+        global_pax.clear(allocator);
+        deinitCreatedPaths(allocator, &created);
+    }
+
+    while (true) {
+        var header: [512]u8 = undefined;
+        if (!try readTarHeader(reader, &header)) break;
+        if (isZeroBlock(&header)) break;
+        try verifyTarHeader(&header);
+        const size = try tarSize(&header);
+        const kind = header[156];
+
+        if (kind == 'L') {
+            if (long_name) |p| allocator.free(p);
+            long_name = try readTarString(allocator, reader, size);
+            continue;
+        }
+        if (kind == 'K') {
+            if (long_link) |p| allocator.free(p);
+            long_link = try readTarString(allocator, reader, size);
+            continue;
+        }
+        if (kind == 'x') {
+            pax.clear(allocator);
+            try readPaxHeader(allocator, reader, size, &pax);
+            continue;
+        }
+        if (kind == 'g') {
+            try readPaxHeader(allocator, reader, size, &global_pax);
+            try validateGlobalPax(global_pax);
+            continue;
+        }
+
+        limits.entries += 1;
+        if (limits.entries > max_archive_entries) return error.RootFSArchiveTooManyEntries;
+
+        const raw_name = if (pax.path) |p|
+            p
+        else if (long_name) |p|
+            p
+        else
+            try tarFullName(allocator, &header);
+        defer if (pax.path == null and long_name == null) allocator.free(raw_name);
+        const payload_size = pax.size orelse size;
+        defer {
+            if (long_name) |p| {
+                allocator.free(p);
+                long_name = null;
+            }
+            if (long_link) |p| {
+                allocator.free(p);
+                long_link = null;
+            }
+            pax.clear(allocator);
+        }
+
+        const rel = safeTarPath(allocator, raw_name) catch |err| switch (err) {
+            error.RootTarPath => {
+                if (kind != '5') return error.UnsafeTarPath;
+                try discardTarPayload(reader, payload_size);
+                continue;
+            },
+            else => |e| return e,
+        };
+        defer allocator.free(rel);
+        const entry_ownership = try tarOwnership(&header, pax, global_pax);
+
+        if (std.mem.startsWith(u8, baseName(rel), ".wh.") and pax.xattrs.items.len != 0) {
+            try discardTarPayload(reader, payload_size);
+            return error.UnsupportedTarXattr;
+        }
+        if (try applyMergedWhiteout(allocator, tree, &created, rel)) {
+            try discardTarPayload(reader, payload_size);
+            continue;
+        }
+
+        switch (kind) {
+            0, '0' => {
+                try addContentBytes(&limits, payload_size);
+                try addXattrBytes(&limits, pax.xattrs.items);
+                const data = try readTarPayloadAlloc(allocator, reader, payload_size);
+                errdefer allocator.free(data);
+                try putMergedFile(allocator, tree, &created, rel, data, try tarMode(&header), entry_ownership, pax.xattrs.items);
+            },
+            '5' => {
+                try discardTarPayload(reader, payload_size);
+                if (pax.xattrs.items.len != 0) return error.UnsupportedTarXattr;
+                try putMergedDirectory(allocator, tree, &created, rel, try tarMode(&header), entry_ownership);
+            },
+            '2' => {
+                try discardTarPayload(reader, payload_size);
+                if (pax.xattrs.items.len != 0) return error.UnsupportedTarXattr;
+                const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&header);
+                try putMergedSymlink(allocator, tree, &created, rel, raw_link, entry_ownership);
+            },
+            '1' => {
+                try discardTarPayload(reader, payload_size);
+                try addXattrBytes(&limits, pax.xattrs.items);
+                const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&header);
+                try putMergedHardlink(allocator, tree, &created, rel, raw_link, entry_ownership, pax.xattrs.items);
+            },
+            else => {
+                try discardTarPayload(reader, payload_size);
+                if (pax.xattrs.items.len != 0) return error.UnsupportedTarXattr;
+                return error.UnsupportedTarEntryType;
+            },
+        }
+    }
+}
+
+fn putMergedDirectory(
+    allocator: std.mem.Allocator,
+    tree: *MergedTree,
+    created: *CreatedPathMap,
+    rel: []const u8,
+    mode: u32,
+    owner: Ownership,
+) !void {
+    try ensureNoMergedSymlinkPath(tree, parentPath(rel), false);
+    try ensureMergedParent(allocator, tree, parentPath(rel));
+    try prepareMergedPath(allocator, tree, rel, .directory);
+    try putMergedEntry(allocator, tree, rel, .{
+        .kind = .directory,
+        .mode = @intCast(mode & 0o7777),
+        .uid = owner.uid,
+        .gid = owner.gid,
+    });
+    try recordCreatedPath(allocator, created, rel);
+}
+
+fn putMergedFile(
+    allocator: std.mem.Allocator,
+    tree: *MergedTree,
+    created: *CreatedPathMap,
+    rel: []const u8,
+    data: []u8,
+    mode: u32,
+    owner: Ownership,
+    attrs: []const xattrs_mod.Attribute,
+) !void {
+    try ensureNoMergedSymlinkPath(tree, parentPath(rel), false);
+    try ensureMergedParent(allocator, tree, parentPath(rel));
+    try prepareMergedPath(allocator, tree, rel, .non_directory);
+    const inode_id = tree.next_inode_id;
+    tree.next_inode_id += 1;
+    try tree.file_data.put(inode_id, data);
+    errdefer _ = tree.file_data.remove(inode_id);
+    try putMergedEntry(allocator, tree, rel, .{
+        .kind = .file,
+        .mode = @intCast(mode & 0o7777),
+        .uid = owner.uid,
+        .gid = owner.gid,
+        .inode_id = inode_id,
+        .xattrs = try xattrs_mod.cloneAttributes(allocator, attrs),
+    });
+    try recordCreatedPath(allocator, created, rel);
+}
+
+fn putMergedSymlink(
+    allocator: std.mem.Allocator,
+    tree: *MergedTree,
+    created: *CreatedPathMap,
+    rel: []const u8,
+    raw_link: []const u8,
+    owner: Ownership,
+) !void {
+    try validateSymlinkTarget(allocator, rel, raw_link);
+    try ensureNoMergedSymlinkPath(tree, parentPath(rel), false);
+    try ensureMergedParent(allocator, tree, parentPath(rel));
+    try prepareMergedPath(allocator, tree, rel, .non_directory);
+    try putMergedEntry(allocator, tree, rel, .{
+        .kind = .symlink,
+        .mode = 0o777,
+        .uid = owner.uid,
+        .gid = owner.gid,
+        .symlink_target = try allocator.dupe(u8, raw_link),
+    });
+    try recordCreatedPath(allocator, created, rel);
+}
+
+fn putMergedHardlink(
+    allocator: std.mem.Allocator,
+    tree: *MergedTree,
+    created: *CreatedPathMap,
+    rel: []const u8,
+    raw_link: []const u8,
+    owner: Ownership,
+    attrs: []const xattrs_mod.Attribute,
+) !void {
+    const link_rel = try safeTarPath(allocator, raw_link);
+    defer allocator.free(link_rel);
+    if (std.mem.eql(u8, rel, link_rel)) return error.BadHardlinkTarget;
+    if (isMergedDescendant(rel, link_rel)) return error.BadHardlinkTarget;
+    try ensureNoMergedSymlinkPath(tree, link_rel, false);
+    const target = tree.entries.get(link_rel) orelse return error.BadHardlinkTarget;
+    if (target.kind != .file) return error.BadHardlinkTarget;
+
+    try ensureNoMergedSymlinkPath(tree, parentPath(rel), false);
+    try ensureMergedParent(allocator, tree, parentPath(rel));
+    try prepareMergedPath(allocator, tree, rel, .non_directory);
+
+    const cloned_attrs = if (attrs.len == 0)
+        try xattrs_mod.cloneAttributes(allocator, target.xattrs)
+    else
+        try xattrs_mod.cloneAttributes(allocator, attrs);
+    errdefer xattrs_mod.freeAttributes(allocator, cloned_attrs);
+
+    try putMergedEntry(allocator, tree, rel, .{
+        .kind = .file,
+        .mode = target.mode,
+        .uid = owner.uid,
+        .gid = owner.gid,
+        .inode_id = target.inode_id,
+        .xattrs = cloned_attrs,
+    });
+    try normalizeMergedHardlinkMetadata(allocator, tree, target.inode_id, owner, if (attrs.len == 0) null else attrs);
+    try recordCreatedPath(allocator, created, rel);
+}
+
+fn applyMergedWhiteout(
+    allocator: std.mem.Allocator,
+    tree: *MergedTree,
+    created: *CreatedPathMap,
+    rel: []const u8,
+) !bool {
+    const base = baseName(rel);
+    if (!std.mem.startsWith(u8, base, ".wh.")) return false;
+    const parent = parentPath(rel);
+    if (std.mem.eql(u8, base, ".wh..wh..opq")) {
+        try ensureNoMergedSymlinkPath(tree, parent, true);
+        try removeMergedLowerChildren(allocator, tree, created, parent);
+        return true;
+    }
+    const target_base = base[".wh.".len..];
+    if (target_base.len == 0) return error.BadWhiteout;
+    if (std.mem.eql(u8, target_base, ".") or std.mem.eql(u8, target_base, "..")) return error.BadWhiteout;
+    const target = if (parent.len == 0)
+        try allocator.dupe(u8, target_base)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent, target_base });
+    defer allocator.free(target);
+    try ensureNoMergedSymlinkPath(tree, parent, true);
+    if (created.contains(target) or createdHasDescendant(created, target)) {
+        if (tree.entries.get(target)) |entry| {
+            if (entry.kind == .directory) try removeMergedLowerChildren(allocator, tree, created, target);
+        }
+        return true;
+    }
+    try removeMergedSubtree(allocator, tree, target);
+    try removeCreatedSubtree(allocator, created, target);
+    return true;
+}
+
+fn prepareMergedPath(
+    allocator: std.mem.Allocator,
+    tree: *MergedTree,
+    rel: []const u8,
+    incoming: IncomingEntryKind,
+) !void {
+    if (tree.entries.get(rel)) |entry| {
+        if (incoming == .directory and entry.kind == .directory) return;
+        try removeMergedSubtree(allocator, tree, rel);
+    }
+}
+
+fn ensureMergedParent(allocator: std.mem.Allocator, tree: *MergedTree, parent: []const u8) !void {
+    if (parent.len == 0) return;
+    var accum: Io.Writer.Allocating = .init(allocator);
+    defer accum.deinit();
+    var iter = std.mem.splitScalar(u8, parent, '/');
+    while (iter.next()) |part| {
+        if (part.len == 0) continue;
+        if (accum.written().len != 0) try accum.writer.writeByte('/');
+        try accum.writer.writeAll(part);
+        const current = accum.written();
+        if (tree.entries.get(current)) |entry| {
+            if (entry.kind != .directory) return error.ParentNotDirectory;
+            continue;
+        }
+        try putMergedEntry(allocator, tree, current, .{
+            .kind = .directory,
+            .mode = 0o755,
+            .uid = 0,
+            .gid = 0,
+        });
+    }
+}
+
+fn ensureNoMergedSymlinkPath(tree: *const MergedTree, rel: []const u8, allow_missing_leaf: bool) !void {
+    if (rel.len == 0) return;
+    var split = std.mem.splitScalar(u8, rel, '/');
+    var component_count: usize = 0;
+    while (split.next()) |_| component_count += 1;
+
+    var accum: [Io.Dir.max_path_bytes]u8 = undefined;
+    var len: usize = 0;
+    var iter = std.mem.splitScalar(u8, rel, '/');
+    var index: usize = 0;
+    while (iter.next()) |part| : (index += 1) {
+        if (part.len == 0) continue;
+        if (len != 0) {
+            if (len >= accum.len) return error.NameTooLong;
+            accum[len] = '/';
+            len += 1;
+        }
+        if (part.len > accum.len - len) return error.NameTooLong;
+        @memcpy(accum[len .. len + part.len], part);
+        len += part.len;
+        const is_leaf = index + 1 == component_count;
+        if (tree.entries.get(accum[0..len])) |entry| {
+            if (entry.kind == .symlink) return error.SymlinkTraversal;
+        } else if (is_leaf and allow_missing_leaf) {
+            return;
+        }
+    }
+}
+
+fn putMergedEntry(allocator: std.mem.Allocator, tree: *MergedTree, rel: []const u8, entry: MergedEntry) !void {
+    const key = try allocator.dupe(u8, rel);
+    errdefer allocator.free(key);
+    const result = try tree.entries.getOrPut(key);
+    if (result.found_existing) {
+        allocator.free(key);
+        deinitMergedEntry(allocator, result.value_ptr.*);
+    }
+    result.value_ptr.* = entry;
+}
+
+fn removeMergedSubtree(allocator: std.mem.Allocator, tree: *MergedTree, rel: []const u8) !void {
+    var keys = std.ArrayList([]const u8).empty;
+    defer keys.deinit(allocator);
+    const prefix = try std.fmt.allocPrint(allocator, "{s}/", .{rel});
+    defer allocator.free(prefix);
+
+    var it = tree.entries.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, rel) or std.mem.startsWith(u8, key, prefix)) {
+            try keys.append(allocator, key);
+        }
+    }
+    for (keys.items) |key| try removeMergedPath(allocator, tree, key);
+}
+
+fn removeMergedLowerChildren(
+    allocator: std.mem.Allocator,
+    tree: *MergedTree,
+    created: *CreatedPathMap,
+    rel: []const u8,
+) !void {
+    var keys = std.ArrayList([]const u8).empty;
+    defer keys.deinit(allocator);
+
+    var it = tree.entries.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!isMergedDescendant(rel, key)) continue;
+        if (created.contains(key) or createdHasDescendant(created, key)) continue;
+        try keys.append(allocator, key);
+    }
+    for (keys.items) |key| try removeMergedPath(allocator, tree, key);
+}
+
+fn removeMergedPath(allocator: std.mem.Allocator, tree: *MergedTree, rel: []const u8) !void {
+    const removed = tree.entries.fetchRemove(rel) orelse return;
+    defer allocator.free(removed.key);
+    defer deinitMergedEntry(allocator, removed.value);
+    if (removed.value.kind == .file and !treeHasInode(tree, removed.value.inode_id)) {
+        if (tree.file_data.fetchRemove(removed.value.inode_id)) |data| allocator.free(data.value);
+    }
+}
+
+fn normalizeMergedHardlinkMetadata(
+    allocator: std.mem.Allocator,
+    tree: *MergedTree,
+    inode_id: u64,
+    owner: Ownership,
+    attrs: ?[]const xattrs_mod.Attribute,
+) !void {
+    var it = tree.entries.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.kind != .file or entry.value_ptr.inode_id != inode_id) continue;
+        entry.value_ptr.uid = owner.uid;
+        entry.value_ptr.gid = owner.gid;
+        if (attrs) |source| {
+            const cloned = try xattrs_mod.cloneAttributes(allocator, source);
+            xattrs_mod.freeAttributes(allocator, entry.value_ptr.xattrs);
+            entry.value_ptr.xattrs = cloned;
+        }
+    }
+}
+
+fn deinitMergedEntry(allocator: std.mem.Allocator, entry: MergedEntry) void {
+    if (entry.kind == .symlink) allocator.free(entry.symlink_target);
+    xattrs_mod.freeAttributes(allocator, entry.xattrs);
+}
+
+fn treeHasInode(tree: *const MergedTree, inode_id: u64) bool {
+    var it = tree.entries.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.kind == .file and entry.value_ptr.inode_id == inode_id) return true;
+    }
+    return false;
+}
+
+fn isMergedDescendant(parent: []const u8, path: []const u8) bool {
+    if (parent.len == 0) return path.len != 0;
+    if (path.len <= parent.len) return false;
+    if (!std.mem.startsWith(u8, path, parent)) return false;
+    return path[parent.len] == '/';
+}
+
+fn readTarPayloadAlloc(allocator: std.mem.Allocator, reader: *Io.Reader, size: u64) ![]u8 {
+    if (size > max_content_bytes) return error.RootFSArchiveTooLarge;
+    const data = try reader.readAlloc(allocator, @intCast(size));
+    errdefer allocator.free(data);
+    try discardTarPadding(reader, size);
+    return data;
 }
 
 fn addContentBytes(limits: *LayerLimits, size: u64) !void {
@@ -1087,6 +1673,38 @@ fn writeTarOctal(field: []u8, value: u64) void {
     }
 }
 
+fn appendTestTarEntry(
+    allocator: std.mem.Allocator,
+    bytes: *std.ArrayList(u8),
+    name: []const u8,
+    kind: u8,
+    data: []const u8,
+    link_name: ?[]const u8,
+) !void {
+    const start = bytes.items.len;
+    try bytes.appendNTimes(allocator, 0, 512);
+    makeTarHeader(bytes.items[start .. start + 512], name, kind, data.len);
+    if (link_name) |link| {
+        @memset(bytes.items[start + 157 .. start + 257], 0);
+        @memcpy(bytes.items[start + 157 .. start + 157 + link.len], link);
+        rewriteTestTarChecksum(bytes.items[start .. start + 512]);
+    }
+    try bytes.appendSlice(allocator, data);
+    const padding = (512 - (data.len % 512)) % 512;
+    try bytes.appendNTimes(allocator, 0, padding);
+}
+
+fn finishTestTar(allocator: std.mem.Allocator, bytes: *std.ArrayList(u8)) !void {
+    try bytes.appendNTimes(allocator, 0, 1024);
+}
+
+fn rewriteTestTarChecksum(header: []u8) void {
+    @memset(header[148..156], ' ');
+    var sum: u64 = 0;
+    for (header[0..512]) |b| sum += b;
+    writeTarOctal(header[148..156], sum);
+}
+
 test "safe tar path rejects traversal and absolute entries" {
     const allocator = std.testing.allocator;
     const path = try safeTarPath(allocator, "./usr/bin/tool");
@@ -1450,6 +2068,86 @@ test "hardlink ownership is normalized across shared inode paths" {
     try std.testing.expectEqual(@as(u32, 3), ownership.get("alias").?.gid);
 }
 
+test "merged tree applies whiteouts and hardlinks" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const layer1 = "zig-cache/test-rootfs-merged-tree-1.tar";
+    const layer2 = "zig-cache/test-rootfs-merged-tree-2.tar";
+    defer Io.Dir.cwd().deleteFile(io, layer1) catch {};
+    defer Io.Dir.cwd().deleteFile(io, layer2) catch {};
+
+    var first = std.ArrayList(u8).empty;
+    defer first.deinit(allocator);
+    try appendTestTarEntry(allocator, &first, "etc", '5', "", null);
+    try appendTestTarEntry(allocator, &first, "etc/old", '0', "old", null);
+    try appendTestTarEntry(allocator, &first, "target", '0', "same", null);
+    try finishTestTar(allocator, &first);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer1, .data = first.items });
+
+    var second = std.ArrayList(u8).empty;
+    defer second.deinit(allocator);
+    try appendTestTarEntry(allocator, &second, "etc/.wh.old", '0', "", null);
+    try appendTestTarEntry(allocator, &second, "alias", '1', "", "target");
+    try finishTestTar(allocator, &second);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer2, .data = second.items });
+
+    const layers = [_]LayerInput{
+        .{ .media_type = "application/vnd.oci.image.layer.v1.tar", .path = layer1 },
+        .{ .media_type = "application/vnd.oci.image.layer.v1.tar", .path = layer2 },
+    };
+    var tree = try buildMergedTree(allocator, io, &layers);
+    defer tree.deinit(allocator);
+
+    try std.testing.expect(tree.entries.get("etc/old") == null);
+    const target = tree.entries.get("target") orelse return error.BadManifest;
+    const alias = tree.entries.get("alias") orelse return error.BadManifest;
+    try std.testing.expectEqual(MergedEntryKind.file, target.kind);
+    try std.testing.expectEqual(MergedEntryKind.file, alias.kind);
+    try std.testing.expectEqual(target.inode_id, alias.inode_id);
+    try std.testing.expectEqualStrings("same", try tree.fileData(target.inode_id));
+}
+
+test "merged tree rejects symlink traversal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const layer = "zig-cache/test-rootfs-merged-tree-symlink.tar";
+    defer Io.Dir.cwd().deleteFile(io, layer) catch {};
+
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(allocator);
+    try appendTestTarEntry(allocator, &bytes, "link", '2', "", "/tmp");
+    try appendTestTarEntry(allocator, &bytes, "link/escape", '0', "bad", null);
+    try finishTestTar(allocator, &bytes);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer, .data = bytes.items });
+
+    const layers = [_]LayerInput{.{ .media_type = "application/vnd.oci.image.layer.v1.tar", .path = layer }};
+    var tree = MergedTree.init(allocator);
+    defer tree.deinit(allocator);
+    try std.testing.expectError(error.SymlinkTraversal, applyLayerToMergedTree(allocator, io, &tree, layers[0]));
+}
+
+test "merged tree rejects hardlink that replaces target ancestor" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const layer = "zig-cache/test-rootfs-merged-tree-hardlink-ancestor.tar";
+    defer Io.Dir.cwd().deleteFile(io, layer) catch {};
+
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(allocator);
+    try appendTestTarEntry(allocator, &bytes, "dir", '5', "", null);
+    try appendTestTarEntry(allocator, &bytes, "dir/file", '0', "data", null);
+    try appendTestTarEntry(allocator, &bytes, "dir", '1', "", "dir/file");
+    try finishTestTar(allocator, &bytes);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer, .data = bytes.items });
+
+    var tree = MergedTree.init(allocator);
+    defer tree.deinit(allocator);
+    try std.testing.expectError(
+        error.BadHardlinkTarget,
+        applyLayerToMergedTree(allocator, io, &tree, .{ .media_type = "application/vnd.oci.image.layer.v1.tar", .path = layer }),
+    );
+}
+
 test "regular files clear stale ownership when replacing directories" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1746,4 +2444,24 @@ fn fuzzTarLayer(_: void, s: *std.testing.Smith) !void {
 
 test "fuzz OCI tar layer parsing" {
     try std.testing.fuzz({}, fuzzTarLayer, .{});
+}
+
+fn fuzzMergedTreeTarLayer(_: void, s: *std.testing.Smith) !void {
+    // The native writer consumes the same attacker-influenced tar shape without
+    // a host staging directory. It must fail closed without corrupting the
+    // in-memory tree.
+    var buf: [8192]u8 = undefined;
+    const len = s.slice(&buf);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tree = MergedTree.init(arena_state.allocator());
+    defer tree.deinit(arena_state.allocator());
+
+    var reader: Io.Reader = .fixed(buf[0..len]);
+    applyTarLayerToMergedTree(arena_state.allocator(), &reader, &tree) catch return;
+}
+
+test "fuzz OCI tar layer merged tree parsing" {
+    try std.testing.fuzz({}, fuzzMergedTreeTarLayer, .{});
 }

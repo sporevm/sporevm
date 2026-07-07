@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const chunk = @import("chunk.zig");
 const ext4 = @import("rootfs/ext4.zig");
+pub const ext4_writer = @import("rootfs/ext4_writer.zig");
 const local_paths = @import("local_paths.zig");
 const oci = @import("rootfs/oci.zig");
 const oci_layout = @import("rootfs/oci_layout.zig");
@@ -25,6 +26,7 @@ const Io = std.Io;
 const max_rootfs_layers: usize = 512;
 pub const builder_version = "sporevm-rootfs-v3";
 const rootfs_build_profile_env = "SPOREVM_ROOTFS_BUILD_PROFILE";
+const ext4_writer_env = "SPOREVM_EXT4_WRITER";
 const resolver_placeholder_path = "etc/resolv.conf";
 const resolver_placeholder_bytes =
     "# SporeVM generated placeholder; --net bind-mounts the guest resolver here.\n";
@@ -587,6 +589,13 @@ const RootfsBuildProfile = struct {
 fn rootfsBuildProfileEnabled(value: ?[]const u8) bool {
     const raw = value orelse return false;
     return raw.len != 0;
+}
+
+fn nativeExt4WriterEnabled(value: ?[]const u8) !bool {
+    const raw = value orelse return false;
+    if (raw.len == 0 or std.mem.eql(u8, raw, "external")) return false;
+    if (std.mem.eql(u8, raw, "native")) return true;
+    return error.UnsupportedExt4Writer;
 }
 
 pub fn validateTaggedImageRef(raw_ref: []const u8) !void {
@@ -1286,67 +1295,13 @@ fn runProcess(io: Io, argv: []const []const u8) !void {
 }
 
 fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: MaterializeOptions) !MaterializeResult {
-    const rootfs_dir_path = try std.fmt.allocPrint(allocator, "{s}/rootfs", .{opts.temp_dir});
-    var rootfs_dir = try Io.Dir.cwd().createDirPathOpen(init.io, rootfs_dir_path, .{
-        .open_options = .{ .access_sub_paths = true, .iterate = true },
-    });
-    defer rootfs_dir.close(init.io);
-    var owners = OwnershipMap.init(allocator);
-    defer ownership_mod.deinit(allocator, &owners);
-    var xattrs = XattrMap.init(allocator);
-    defer xattrs_mod.deinit(allocator, &xattrs);
-    const tar_options = tar.ApplyOptions{
-        .case_sensitive_staging = try tar.isCaseSensitiveDirectory(init.io, rootfs_dir),
-    };
-
     if (opts.layers.len > max_rootfs_layers) return error.RootFSTooManyLayers;
-
     const layer_meta = try allocator.alloc(oci.LayerMetadata, opts.layers.len);
-    const extraction_start = opts.profile.start();
-    for (opts.layers, 0..) |layer, i| {
-        if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
-        try tar.applyLayer(allocator, init.io, rootfs_dir, layer.path, layer.media_type, &owners, &xattrs, tar_options);
-        if (try ext4.dirContentSize(init.io, rootfs_dir) > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
-        layer_meta[i] = .{ .media_type = layer.media_type, .digest = layer.digest };
-    }
-    opts.profile.phase("layer_extract_staging", extraction_start);
-
-    const required_dirs_start = opts.profile.start();
-    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "dev", 0o755);
-    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "proc", 0o755);
-    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "run", 0o755);
-    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "sys", 0o755);
-    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "tmp", 0o1777);
-    try ensureResolverPlaceholder(allocator, init.io, rootfs_dir, &owners);
-    try recordImplicitDirectoryOwnership(allocator, init.io, rootfs_dir, &owners, "");
-    opts.profile.phase("rootfs_tree_finalize", required_dirs_start);
-
     const deterministic_ext4 = ext4.Determinism.fromDigest(opts.manifest_digest);
-    const normalize_start = opts.profile.start();
-    try ext4.normalizeHostTreeTimestamps(allocator, init.io, rootfs_dir, rootfs_dir_path);
-    opts.profile.phase("host_metadata_normalize", normalize_start);
-
-    const scan_start = opts.profile.start();
-    const content_size = try ext4.dirContentSize(init.io, rootfs_dir);
-    const inode_count = ext4.computeImageInodes(try ext4.dirEntryCount(init.io, rootfs_dir));
-    const image_size = ext4.computeImageSize(content_size);
-    opts.profile.phase("ext4_size_scan", scan_start);
-
-    const create_start = opts.profile.start();
-    try ext4.ensureParentDir(init.io, opts.output);
-    try ext4.createEmptyFile(init.io, opts.output, image_size);
-    opts.profile.phase("ext4_create_empty", create_start);
-    const mkfs_start = opts.profile.start();
-    try ext4.runMkfs(init, allocator, opts.mkfs, rootfs_dir_path, opts.output, deterministic_ext4, inode_count);
-    opts.profile.phase("mkfs_ext4", mkfs_start);
-    const debugfs_script = try std.fmt.allocPrint(allocator, "{s}/debugfs-ownership.cmds", .{opts.temp_dir});
-    const debugfs_start = opts.profile.start();
-    try ext4.runDebugfsFinalize(init, allocator, opts.debugfs, opts.output, debugfs_script, &owners, &xattrs, deterministic_ext4);
-    opts.profile.phase("debugfs_finalize", debugfs_start);
-
-    const blake3_start = opts.profile.start();
-    const rootfs_blake3 = try ext4.blake3File(init.io, opts.output);
-    opts.profile.phase("rootfs_blake3", blake3_start);
+    const rootfs_blake3 = if (try nativeExt4WriterEnabled(init.environ_map.get(ext4_writer_env)))
+        try materializeRootFSNative(init, allocator, opts, layer_meta, deterministic_ext4)
+    else
+        try materializeRootFSExternal(init, allocator, opts, layer_meta, deterministic_ext4);
     const rootfs_hex = try allocator.dupe(u8, &rootfs_blake3);
     const stat = try Io.Dir.cwd().statFile(init.io, opts.output, .{});
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
@@ -1406,6 +1361,119 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     opts.profile.phase("metadata_write", metadata_start);
 
     return .{ .rootfs_blake3 = rootfs_blake3, .rootfs_storage = rootfs_storage };
+}
+
+fn materializeRootFSNative(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    opts: MaterializeOptions,
+    layer_meta: []oci.LayerMetadata,
+    deterministic_ext4: ext4.Determinism,
+) ![chunk.ChunkId.hex_len]u8 {
+    const native_layers = try allocator.alloc(tar.LayerInput, opts.layers.len);
+    defer allocator.free(native_layers);
+
+    const merge_start = opts.profile.start();
+    for (opts.layers, 0..) |layer, i| {
+        if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
+        layer_meta[i] = .{ .media_type = layer.media_type, .digest = layer.digest };
+        native_layers[i] = .{ .media_type = layer.media_type, .path = layer.path };
+    }
+    var tree = try tar.buildMergedTree(allocator, init.io, native_layers);
+    defer tree.deinit(allocator);
+    opts.profile.phase("tree_merge", merge_start);
+
+    const required_dirs_start = opts.profile.start();
+    try ensureRequiredMergedDir(allocator, &tree, "dev", 0o755);
+    try ensureRequiredMergedDir(allocator, &tree, "proc", 0o755);
+    try ensureRequiredMergedDir(allocator, &tree, "run", 0o755);
+    try ensureRequiredMergedDir(allocator, &tree, "sys", 0o755);
+    try ensureRequiredMergedDir(allocator, &tree, "tmp", 0o1777);
+    try ensureMergedResolverPlaceholder(allocator, &tree);
+    opts.profile.phase("rootfs_tree_finalize", required_dirs_start);
+
+    const scan_start = opts.profile.start();
+    const content_size = tree.contentSize();
+    if (content_size > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
+    const inode_count = ext4.computeImageInodes(tree.entryCount());
+    const image_size = ext4.computeImageSize(content_size);
+    opts.profile.phase("ext4_size_scan", scan_start);
+
+    const native_start = opts.profile.start();
+    const result = try ext4_writer.emitFromMergedTree(allocator, init.io, &tree, opts.output, .{
+        .image_size = image_size,
+        .inode_count = @intCast(inode_count),
+        .determinism = deterministic_ext4,
+    });
+    opts.profile.phase("native_ext4_emit", native_start);
+    return result.blake3;
+}
+
+fn materializeRootFSExternal(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    opts: MaterializeOptions,
+    layer_meta: []oci.LayerMetadata,
+    deterministic_ext4: ext4.Determinism,
+) ![chunk.ChunkId.hex_len]u8 {
+    const rootfs_dir_path = try std.fmt.allocPrint(allocator, "{s}/rootfs", .{opts.temp_dir});
+    var rootfs_dir = try Io.Dir.cwd().createDirPathOpen(init.io, rootfs_dir_path, .{
+        .open_options = .{ .access_sub_paths = true, .iterate = true },
+    });
+    defer rootfs_dir.close(init.io);
+    var owners = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &owners);
+    var xattrs = XattrMap.init(allocator);
+    defer xattrs_mod.deinit(allocator, &xattrs);
+    const tar_options = tar.ApplyOptions{
+        .case_sensitive_staging = try tar.isCaseSensitiveDirectory(init.io, rootfs_dir),
+    };
+
+    const extraction_start = opts.profile.start();
+    for (opts.layers, 0..) |layer, i| {
+        if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
+        try tar.applyLayer(allocator, init.io, rootfs_dir, layer.path, layer.media_type, &owners, &xattrs, tar_options);
+        if (try ext4.dirContentSize(init.io, rootfs_dir) > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
+        layer_meta[i] = .{ .media_type = layer.media_type, .digest = layer.digest };
+    }
+    opts.profile.phase("layer_extract_staging", extraction_start);
+
+    const required_dirs_start = opts.profile.start();
+    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "dev", 0o755);
+    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "proc", 0o755);
+    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "run", 0o755);
+    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "sys", 0o755);
+    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "tmp", 0o1777);
+    try ensureResolverPlaceholder(allocator, init.io, rootfs_dir, &owners);
+    try recordImplicitDirectoryOwnership(allocator, init.io, rootfs_dir, &owners, "");
+    opts.profile.phase("rootfs_tree_finalize", required_dirs_start);
+
+    const normalize_start = opts.profile.start();
+    try ext4.normalizeHostTreeTimestamps(allocator, init.io, rootfs_dir, rootfs_dir_path);
+    opts.profile.phase("host_metadata_normalize", normalize_start);
+
+    const scan_start = opts.profile.start();
+    const content_size = try ext4.dirContentSize(init.io, rootfs_dir);
+    const inode_count = ext4.computeImageInodes(try ext4.dirEntryCount(init.io, rootfs_dir));
+    const image_size = ext4.computeImageSize(content_size);
+    opts.profile.phase("ext4_size_scan", scan_start);
+
+    const create_start = opts.profile.start();
+    try ext4.ensureParentDir(init.io, opts.output);
+    try ext4.createEmptyFile(init.io, opts.output, image_size);
+    opts.profile.phase("ext4_create_empty", create_start);
+    const mkfs_start = opts.profile.start();
+    try ext4.runMkfs(init, allocator, opts.mkfs, rootfs_dir_path, opts.output, deterministic_ext4, inode_count);
+    opts.profile.phase("mkfs_ext4", mkfs_start);
+    const debugfs_script = try std.fmt.allocPrint(allocator, "{s}/debugfs-ownership.cmds", .{opts.temp_dir});
+    const debugfs_start = opts.profile.start();
+    try ext4.runDebugfsFinalize(init, allocator, opts.debugfs, opts.output, debugfs_script, &owners, &xattrs, deterministic_ext4);
+    opts.profile.phase("debugfs_finalize", debugfs_start);
+
+    const blake3_start = opts.profile.start();
+    const rootfs_blake3 = try ext4.blake3File(init.io, opts.output);
+    opts.profile.phase("rootfs_blake3", blake3_start);
+    return rootfs_blake3;
 }
 
 fn trustedDigestHardlinkEligible(cache_owned_output: bool, path: []const u8, cache_root: []const u8) bool {
@@ -2126,6 +2194,15 @@ fn ensureRequiredDir(
     try ownership_mod.record(allocator, ownership, rel, .{ .uid = 0, .gid = 0 });
 }
 
+fn ensureRequiredMergedDir(
+    allocator: std.mem.Allocator,
+    tree: *tar.MergedTree,
+    rel: []const u8,
+    mode: u32,
+) !void {
+    try tar.ensureMergedDirectory(allocator, tree, rel, mode, .{ .uid = 0, .gid = 0 });
+}
+
 fn ensureResolverPlaceholder(
     allocator: std.mem.Allocator,
     io: Io,
@@ -2164,6 +2241,14 @@ fn ensureResolverPlaceholder(
     }
 }
 
+fn ensureMergedResolverPlaceholder(
+    allocator: std.mem.Allocator,
+    tree: *tar.MergedTree,
+) !void {
+    try tar.ensureMergedDirectory(allocator, tree, "etc", 0o755, .{ .uid = 0, .gid = 0 });
+    try tar.ensureMergedFile(allocator, tree, resolver_placeholder_path, resolver_placeholder_bytes, 0o644, .{ .uid = 0, .gid = 0 });
+}
+
 fn recordImplicitDirectoryOwnership(
     allocator: std.mem.Allocator,
     io: Io,
@@ -2198,6 +2283,7 @@ fn permissionsFromMode(mode: u32, fallback: Io.Dir.Permissions) Io.Dir.Permissio
 }
 
 test {
+    std.testing.refAllDecls(ext4_writer);
     std.testing.refAllDecls(oci_layout);
 }
 
@@ -2266,6 +2352,71 @@ test "rootfs build profile env is opt-in" {
     try std.testing.expect(!rootfsBuildProfileEnabled(null));
     try std.testing.expect(!rootfsBuildProfileEnabled(""));
     try std.testing.expect(rootfsBuildProfileEnabled("1"));
+}
+
+test "native ext4 writer env is explicit and fail-closed" {
+    try std.testing.expect(!try nativeExt4WriterEnabled(null));
+    try std.testing.expect(!try nativeExt4WriterEnabled(""));
+    try std.testing.expect(!try nativeExt4WriterEnabled("external"));
+    try std.testing.expect(try nativeExt4WriterEnabled("native"));
+    try std.testing.expectError(error.UnsupportedExt4Writer, nativeExt4WriterEnabled("yes"));
+}
+
+test "materialize rootfs can use native ext4 writer" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-native-materialize";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    const layer_path = tmp ++ "/layer.tar";
+    try writeTestTar(allocator, io, layer_path, "etc/native-writer", "native\n");
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(ext4_writer_env, "native");
+    try env.put(local_paths.rootfs_cache_env, tmp ++ "/rootfs-cache");
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+    const layers = [_]MaterializeLayer{.{
+        .media_type = "application/vnd.oci.image.layer.v1.tar",
+        .digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .path = layer_path,
+    }};
+    const output = tmp ++ "/rootfs.ext4";
+    const metadata = tmp ++ "/rootfs.ext4.json";
+    var materialize_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer materialize_arena_state.deinit();
+    const materialize_arena = materialize_arena_state.allocator();
+    const result = try materializeRootFS(init, materialize_arena, .{
+        .requested_ref = "local/native:latest",
+        .resolved_image_ref = "local/native@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .config_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .config = .{ .architecture = "arm64", .os = "linux" },
+        .layers = &layers,
+        .output = output,
+        .metadata = metadata,
+        .mkfs = "unused-mkfs",
+        .debugfs = "unused-debugfs",
+        .temp_dir = tmp ++ "/materialize",
+        .profile = RootfsBuildProfile.init(&env),
+        .rootfs_storage = .flat,
+    });
+
+    try std.testing.expectEqualSlices(u8, &result.rootfs_blake3, &(try ext4.blake3File(io, output)));
+    try std.testing.expect(result.rootfs_storage == null);
+    const metadata_bytes = try Io.Dir.cwd().readFileAlloc(io, metadata, allocator, .limited(max_rootfs_metadata_bytes));
+    defer allocator.free(metadata_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"rootfs_storage\"") == null);
 }
 
 test "trusted digest hardlink requires internal cache output ownership" {
@@ -3417,4 +3568,46 @@ test "ext4 tool detection checks Homebrew e2fsprogs prefix" {
     const found = try detectToolPath(allocator, io, &env, "debugfs") orelse return error.TestExpectedEqual;
     defer allocator.free(found);
     try std.testing.expectEqualStrings(tool_path, found);
+}
+
+fn writeTestTar(allocator: std.mem.Allocator, io: Io, path: []const u8, name: []const u8, data: []const u8) !void {
+    var tar_bytes = std.ArrayList(u8).empty;
+    defer tar_bytes.deinit(allocator);
+    try tar_bytes.appendNTimes(allocator, 0, 512);
+    writeTestTarHeader(tar_bytes.items[0..512], name, '0', data.len);
+    try tar_bytes.appendSlice(allocator, data);
+    const padding = (512 - (data.len % 512)) % 512;
+    try tar_bytes.appendNTimes(allocator, 0, padding + 1024);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = tar_bytes.items });
+}
+
+fn writeTestTarHeader(header: []u8, name: []const u8, kind: u8, size: u64) void {
+    std.debug.assert(header.len == 512);
+    std.debug.assert(name.len <= 100);
+    @memset(header, 0);
+    @memcpy(header[0..name.len], name);
+    writeTestTarOctal(header[100..108], if (kind == '5') 0o755 else 0o644);
+    writeTestTarOctal(header[108..116], 0);
+    writeTestTarOctal(header[116..124], 0);
+    writeTestTarOctal(header[124..136], size);
+    writeTestTarOctal(header[136..148], 0);
+    @memset(header[148..156], ' ');
+    header[156] = kind;
+    @memcpy(header[257..263], "ustar\x00");
+    @memcpy(header[263..265], "00");
+    var sum: u64 = 0;
+    for (header[0..512]) |b| sum += b;
+    writeTestTarOctal(header[148..156], sum);
+}
+
+fn writeTestTarOctal(field: []u8, value: u64) void {
+    @memset(field, 0);
+    var remaining = value;
+    var index = field.len - 2;
+    while (true) {
+        field[index] = @intCast('0' + (remaining & 7));
+        remaining >>= 3;
+        if (remaining == 0 or index == 0) break;
+        index -= 1;
+    }
 }
