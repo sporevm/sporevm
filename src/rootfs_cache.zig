@@ -480,6 +480,38 @@ test "trusted open trusts install-time verification for same-size entries" {
     try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedFromCache(io, arena, cache_root, rootfs));
 }
 
+test "install trusts existing same-size digest cache hits" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-cache-install-existing-trusted";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+
+    const artifact = try cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
+    const digest_path = try digestPath(arena, cache_root, artifact.digest);
+    try Io.Dir.cwd().deleteFile(io, digest_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "ROOTFS BYTES" });
+
+    const result = try installExpectedPathWithResult(io, arena, cache_root, rootfs_path, artifact, .{
+        .source_must_not_be_symlink = false,
+        .allow_hardlink = false,
+    });
+    try std.testing.expect(result.cache_hit);
+    try std.testing.expectEqual(@as(u64, 0), result.bytes_fetched);
+
+    const fd = try openTrustedFromCache(io, arena, cache_root, rootfs);
+    _ = std.c.close(fd);
+    try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedFromCache(io, arena, cache_root, rootfs));
+}
+
 test "copy-only digest cache does not chmod source rootfs" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
