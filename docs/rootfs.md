@@ -196,10 +196,11 @@ Indexed bundles also support an explicit prepared-cache mode:
 `spore pack SPORE --children CHILDREN --rootfs=metadata-only --out BUNDLE`
 records the immutable rootfs digest and size without embedding the ext4 bytes.
 `spore unpack` and `spore pull` reject those bundles by default. Passing
-`--allow-metadata-only-rootfs` makes materialization verify that the selected
-`SPOREVM_ROOTFS_CACHE_DIR` already contains the exact digest-addressed rootfs
-bytes; it still fails before writing a resumable spore if the cache entry is
-missing or mismatched.
+`--allow-metadata-only-rootfs` makes materialization require that the selected
+`SPOREVM_ROOTFS_CACHE_DIR` already contains a trusted digest-addressed rootfs
+entry with the expected shape. It follows the local verify-at-install,
+trust-at-open cache contract, so it still fails before writing a resumable
+spore if the cache entry is missing, symlinked, non-regular, or size-mismatched.
 
 `spore pull file:///path/to/bundle --child 42 --out child.spore` does the same
 rootfs installation for indexed local bundles while materializing one selected
