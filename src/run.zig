@@ -1589,7 +1589,7 @@ fn resolvePathRootfs(
         else => |e| return e,
     };
     try ensureDirPath(init.io, cache_root);
-    const artifact = rootfs_cache.cacheByDigestPathCopy(init.io, allocator, cache_root, rootfs_path) catch |err| {
+    const artifact = resolvePathRootfsArtifact(init.io, allocator, cache_root, rootfs_path) catch |err| {
         return .{ .failure = rootfsInputFailure(
             allocator,
             machine_output.fromZigError(err).code,
@@ -1605,6 +1605,76 @@ fn resolvePathRootfs(
             .artifact = artifact,
         },
     } };
+}
+
+fn resolvePathRootfsArtifact(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    rootfs_path: []const u8,
+) !spore.RootfsArtifactRef {
+    if (try trustedExplicitCachedRootfsArtifact(io, allocator, cache_root, rootfs_path)) |artifact| return artifact;
+    return rootfs_cache.cacheByDigestPathCopy(io, allocator, cache_root, rootfs_path);
+}
+
+fn trustedExplicitCachedRootfsArtifact(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    rootfs_path: []const u8,
+) !?spore.RootfsArtifactRef {
+    const cache_key = directImageCacheRootfsKey(cache_root, rootfs_path) orelse return null;
+    const metadata_file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{cache_key});
+    defer allocator.free(metadata_file_name);
+    const metadata_path = try std.fs.path.join(allocator, &.{ cache_root, metadata_file_name });
+    defer allocator.free(metadata_path);
+
+    const artifact = (try rootfs_mod.cachedImageRootfsArtifact(io, allocator, metadata_path, rootfs_path)) orelse return null;
+    errdefer allocator.free(artifact.digest);
+
+    const trusted_rootfs = spore.Rootfs{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = artifact,
+    };
+    const fd = rootfs_cache.openTrustedFromCache(io, allocator, cache_root, trusted_rootfs) catch |err| switch (err) {
+        error.RootFSDigestCacheMiss => {
+            allocator.free(artifact.digest);
+            return null;
+        },
+        else => |e| return e,
+    };
+    _ = std.c.close(fd);
+    return artifact;
+}
+
+fn directImageCacheRootfsKey(cache_root: []const u8, rootfs_path: []const u8) ?[]const u8 {
+    if (!Io.Dir.path.isAbsolute(rootfs_path)) return null;
+
+    const file_name = directCacheChildName(cache_root, rootfs_path) orelse return null;
+    if (!std.mem.endsWith(u8, file_name, ".ext4")) return null;
+    const cache_key = file_name[0 .. file_name.len - ".ext4".len];
+    if (cache_key.len != Sha256.digest_length * 2) return null;
+    for (cache_key) |c| {
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return null;
+    }
+    return cache_key;
+}
+
+fn directCacheChildName(cache_root: []const u8, path: []const u8) ?[]const u8 {
+    if (cache_root.len == 0) return null;
+    if (std.mem.eql(u8, cache_root, std.fs.path.sep_str)) {
+        if (path.len <= cache_root.len) return null;
+        const file_name = path[cache_root.len..];
+        if (std.mem.indexOfScalar(u8, file_name, std.fs.path.sep) != null) return null;
+        return file_name;
+    }
+
+    if (!std.mem.startsWith(u8, path, cache_root)) return null;
+    if (path.len <= cache_root.len + 1) return null;
+    if (path[cache_root.len] != std.fs.path.sep) return null;
+    const file_name = path[cache_root.len + 1 ..];
+    if (std.mem.indexOfScalar(u8, file_name, std.fs.path.sep) != null) return null;
+    return file_name;
 }
 
 fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8, command_name: []const u8, pull_policy: PullPolicy, record_artifact: bool) !RootfsInputResolution {
@@ -1815,9 +1885,24 @@ fn resolvedImageRootfsInput(
         .guest_env = run_config.env,
         .guest_working_dir = run_config.working_dir,
     };
-    const artifact = try rootfs_cache.cacheByDigestPath(init.io, allocator, cache_root, rootfs_path);
     const rootfs_device = spore.RootfsDevice{ .mmio_slot = 1 };
-    const storage = try rootfs_mod.ensureImageRootfsStorage(init, allocator, cache_root, resolved, artifact, rootfs_device);
+    const artifact = artifact: {
+        if (try rootfs_mod.cachedImageRootfsArtifact(init.io, allocator, metadata_path, rootfs_path)) |cached_artifact| {
+            errdefer allocator.free(cached_artifact.digest);
+            const trusted_rootfs = spore.Rootfs{ .device = rootfs_device, .artifact = cached_artifact };
+            const fd = rootfs_cache.openTrustedFromCache(init.io, allocator, cache_root, trusted_rootfs) catch |err| switch (err) {
+                error.RootFSDigestCacheMiss => {
+                    allocator.free(cached_artifact.digest);
+                    break :artifact try rootfs_cache.cacheByDigestPath(init.io, allocator, cache_root, rootfs_path);
+                },
+                else => |e| return e,
+            };
+            _ = std.c.close(fd);
+            break :artifact cached_artifact;
+        }
+        break :artifact try rootfs_cache.cacheByDigestPath(init.io, allocator, cache_root, rootfs_path);
+    };
+    const storage = try rootfs_mod.ensureImageRootfsStorage(init, allocator, cache_root, metadata_path, artifact, rootfs_device);
     const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch });
     const manifest_requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved.ref else requested_ref;
     return .{
@@ -4404,6 +4489,103 @@ test "explicit rootfs input can record exact immutable identity" {
     try Io.Dir.cwd().access(io, digest_path, .{ .read = true });
     const source_stat = try Io.Dir.cwd().statFile(io, rootfs_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@intFromEnum(source_stat.permissions) & 0o777)));
+}
+
+test "direct image cache rootfs key requires exact cache child shape" {
+    const cache_root = "/tmp/cache";
+    const cache_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    try std.testing.expectEqualStrings(cache_key, directImageCacheRootfsKey(cache_root, "/tmp/cache/" ++ cache_key ++ ".ext4").?);
+    try std.testing.expect(directImageCacheRootfsKey(cache_root, "/tmp/cache-other/" ++ cache_key ++ ".ext4") == null);
+    try std.testing.expect(directImageCacheRootfsKey(cache_root, "/tmp/cache/by-digest/" ++ cache_key ++ ".ext4") == null);
+    try std.testing.expect(directImageCacheRootfsKey(cache_root, "/tmp/cache/0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef.ext4") == null);
+    try std.testing.expect(directImageCacheRootfsKey(cache_root, "/tmp/cache/" ++ cache_key ++ ".raw") == null);
+    try std.testing.expect(directImageCacheRootfsKey(cache_root, "tmp/cache/" ++ cache_key ++ ".ext4") == null);
+}
+
+test "explicit rootfs input trusts direct image cache rootfs metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-explicit-rootfs-cache-fast-path";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, cache_root);
+    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const cache_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ absolute_cache_root, cache_key });
+    const metadata_path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ absolute_cache_root, cache_key });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, absolute_cache_root, rootfs_path);
+    const metadata = .{
+        .rootfs_path = rootfs_path,
+        .rootfs_size = artifact.size,
+        .rootfs_blake3 = artifact.digest[spore.rootfs_digest_prefix.len..],
+    };
+    const metadata_json = try std.json.Stringify.valueAlloc(arena, metadata, .{});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata_json });
+
+    const result = try resolveRootfsInputDetailedResult(init, arena, .{
+        .rootfs_path = rootfs_path,
+        .image_ref = null,
+        .command_name = "create",
+        .record_artifact = true,
+    });
+    const resolved = switch (result) {
+        .resolved => |resolved| resolved,
+        .failure => return error.ExpectedRootfsRecord,
+    };
+    try std.testing.expectEqualStrings(rootfs_path, resolved.path.?);
+    try std.testing.expect(resolved.rootfs != null);
+    try std.testing.expectEqualStrings(artifact.digest, resolved.rootfs.?.artifact.digest);
+    try std.testing.expectEqual(artifact.size, resolved.rootfs.?.artifact.size);
+
+    const fallback_cache_key = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const fallback_rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ absolute_cache_root, fallback_cache_key });
+    const fallback_metadata_path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ absolute_cache_root, fallback_cache_key });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = fallback_rootfs_path, .data = "fallback rootfs bytes" });
+    const bogus_blake3 = "0000000000000000000000000000000000000000000000000000000000000000";
+    const fallback_metadata = .{
+        .rootfs_path = fallback_rootfs_path,
+        .rootfs_size = @as(u64, "fallback rootfs bytes".len),
+        .rootfs_blake3 = bogus_blake3,
+    };
+    const fallback_metadata_json = try std.json.Stringify.valueAlloc(arena, fallback_metadata, .{});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = fallback_metadata_path, .data = fallback_metadata_json });
+    const fallback_expected = try rootfs_cache.hashPath(io, arena, fallback_rootfs_path);
+
+    const fallback_result = try resolveRootfsInputDetailedResult(init, arena, .{
+        .rootfs_path = fallback_rootfs_path,
+        .image_ref = null,
+        .command_name = "create",
+        .record_artifact = true,
+    });
+    const fallback_resolved = switch (fallback_result) {
+        .resolved => |value| value,
+        .failure => return error.ExpectedRootfsRecord,
+    };
+    try std.testing.expect(fallback_resolved.rootfs != null);
+    try std.testing.expectEqualStrings(fallback_expected.digest, fallback_resolved.rootfs.?.artifact.digest);
+    try std.testing.expectEqual(fallback_expected.size, fallback_resolved.rootfs.?.artifact.size);
+    try std.testing.expect(!std.mem.eql(u8, "blake3:" ++ bogus_blake3, fallback_resolved.rootfs.?.artifact.digest));
 }
 
 test "rootfs digest cache rejects unsafe existing paths" {
