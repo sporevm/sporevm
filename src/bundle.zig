@@ -23,7 +23,7 @@ const topology = @import("topology.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Io = std.Io;
 
-const Error = spore.Error || error{ FileNotFound, UnsupportedMetadataOnlyRootfsStorage };
+const Error = spore.Error || error{ FileNotFound, UnsupportedMetadataOnlyRootfsStorage, BundleBodyTooLarge };
 
 pub const index_version: u32 = 0;
 pub const bundle_index_version: u32 = 0;
@@ -46,6 +46,10 @@ pub const disk_objects_blake3_dir_path = "diskobjects/blake3";
 pub const inspect_bundle_schema = contracts.inspect_bundle_schema;
 pub const pull_result_schema = contracts.pull_result_schema;
 pub const bundle_schema_version = contracts.bundle_schema_version;
+
+const max_http_bundle_metadata_file_bytes: u64 = 64 * 1024 * 1024;
+const max_http_bundle_metadata_bytes: u64 = 256 * 1024 * 1024;
+const max_http_bundle_materialization_bytes: u64 = 128 * 1024 * 1024 * 1024;
 
 const LoadedManifest = struct {
     v0: ?std.json.Parsed(spore.Manifest) = null,
@@ -335,6 +339,35 @@ const MaterializeResult = struct {
     cache_reused_bytes: u64 = 0,
     linked_chunk_count: usize = 0,
     copied_chunk_count: usize = 0,
+};
+
+const HttpBundleFileClass = enum {
+    metadata,
+    payload,
+};
+
+const HttpBundleDownloadBudget = struct {
+    total_read: u64 = 0,
+    metadata_read: u64 = 0,
+
+    fn limitFor(self: HttpBundleDownloadBudget, class: HttpBundleFileClass, file_limit: u64) Error!u64 {
+        if (self.total_read >= max_http_bundle_materialization_bytes) return error.BundleBodyTooLarge;
+        var limit = @min(file_limit, max_http_bundle_materialization_bytes - self.total_read);
+        if (class == .metadata) {
+            if (self.metadata_read >= max_http_bundle_metadata_bytes) return error.BundleBodyTooLarge;
+            limit = @min(limit, max_http_bundle_metadata_bytes - self.metadata_read);
+        }
+        return limit;
+    }
+
+    fn record(self: *HttpBundleDownloadBudget, class: HttpBundleFileClass, bytes: u64) Error!void {
+        if (bytes > max_http_bundle_materialization_bytes - self.total_read) return error.BundleBodyTooLarge;
+        self.total_read += bytes;
+        if (class == .metadata) {
+            if (bytes > max_http_bundle_metadata_bytes - self.metadata_read) return error.BundleBodyTooLarge;
+            self.metadata_read += bytes;
+        }
+    }
 };
 
 const RootfsMaterializeResult = struct {
@@ -1288,6 +1321,15 @@ fn validateChunk(entry: IndexChunk) Error!void {
     if (entry.sha256.len != Sha256.digest_length * 2) return error.BadManifest;
     var digest: [Sha256.digest_length]u8 = undefined;
     _ = std.fmt.hexToBytes(&digest, entry.sha256) catch return error.BadManifest;
+}
+
+fn chunkPackPayloadBytes(index: Index) Error!u64 {
+    var max_end: u64 = 0;
+    for (index.chunks) |entry| {
+        const end = std.math.add(u64, entry.offset, entry.size) catch return error.BadManifest;
+        max_end = @max(max_end, end);
+    }
+    return max_end;
 }
 
 fn indexById(allocator: std.mem.Allocator, index: Index) Error!std.StringHashMap(IndexChunk) {
@@ -2443,34 +2485,35 @@ fn downloadHttpBundleToDir(
     try ensureNewDir(try pathZ(allocator, "{s}", .{bundle_dir}));
 
     var peer_bytes: u64 = 0;
-    peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, bundle_index_path);
+    var budget = HttpBundleDownloadBudget{};
+    peer_bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, bundle_index_path, &budget);
 
     const parsed_bundle = try loadBundleIndex(allocator, bundle_dir);
     defer parsed_bundle.deinit();
     const bundle_index = parsed_bundle.value;
 
-    peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, bundle_index.parent_manifest);
+    peer_bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, bundle_index.parent_manifest, &budget);
     for (bundle_index.children) |child| {
-        peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, child.manifest);
+        peer_bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, child.manifest, &budget);
     }
-    peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, index_path);
+    peer_bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, index_path, &budget);
 
     const parsed_chunk_index = try loadIndex(allocator, bundle_dir);
     defer parsed_chunk_index.deinit();
     _ = parsed_chunk_index.value.chunks.len;
-    peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, pack_path);
+    peer_bytes += try downloadHttpBundlePayloadFile(allocator, options, client, location, bundle_dir, pack_path, &budget, try chunkPackPayloadBytes(parsed_chunk_index.value));
 
     if (bundle_index.rootfs_index) |rootfs_index_rel| {
-        peer_bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rootfs_index_rel);
+        peer_bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, rootfs_index_rel, &budget);
         const parsed_rootfs_index = try loadRootfsIndex(allocator, bundle_dir);
         defer parsed_rootfs_index.deinit();
-        peer_bytes += try downloadHttpRootfsIndexPayloadFiles(allocator, options, client, location, bundle_dir, parsed_rootfs_index.value);
+        peer_bytes += try downloadHttpRootfsIndexPayloadFiles(allocator, options, client, location, bundle_dir, parsed_rootfs_index.value, &budget);
     }
     var seen_disk_files = std.StringHashMap(void).init(allocator);
     defer seen_disk_files.deinit();
-    peer_bytes += try downloadHttpDiskFilesForManifestPath(allocator, options, client, location, bundle_dir, bundle_index.parent_manifest, &seen_disk_files);
+    peer_bytes += try downloadHttpDiskFilesForManifestPath(allocator, options, client, location, bundle_dir, bundle_index.parent_manifest, &seen_disk_files, &budget);
     for (bundle_index.children) |child| {
-        peer_bytes += try downloadHttpDiskFilesForManifestPath(allocator, options, client, location, bundle_dir, child.manifest, &seen_disk_files);
+        peer_bytes += try downloadHttpDiskFilesForManifestPath(allocator, options, client, location, bundle_dir, child.manifest, &seen_disk_files, &budget);
     }
     return peer_bytes;
 }
@@ -2514,18 +2557,19 @@ fn downloadHttpRootfsIndexPayloadFiles(
     location: HttpLocation,
     bundle_dir: []const u8,
     index: RootfsIndex,
+    budget: *HttpBundleDownloadBudget,
 ) Error!u64 {
     var bytes: u64 = 0;
     for (index.artifacts) |artifact| {
         if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
-            bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, artifact.path orelse return error.BadManifest);
+            bytes += try downloadHttpBundlePayloadFile(allocator, options, client, location, bundle_dir, artifact.path orelse return error.BadManifest, budget, artifact.size);
         }
     }
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
     for (index.storages) |storage_entry| {
         if (try markBundleFileSeen(&seen, storage_entry.index_path)) {
-            bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, storage_entry.index_path);
+            bytes += try downloadHttpBundleSizedMetadataFile(allocator, options, client, location, bundle_dir, storage_entry.index_path, budget, storage_entry.index_bytes);
         }
         const storage = rootfsStorageEntryDescriptor(storage_entry);
         const parsed_index = try loadRootfsBlockIndexForEntry(allocator, bundle_dir, storage_entry, storage);
@@ -2533,7 +2577,8 @@ fn downloadHttpRootfsIndexPayloadFiles(
         for (parsed_index.value.chunks) |chunk_entry| {
             const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
             if (try markBundleFileSeen(&seen, object_rel)) {
-                bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, object_rel);
+                const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
+                bytes += try downloadHttpBundlePayloadFile(allocator, options, client, location, bundle_dir, object_rel, budget, @intCast(expected_size));
             }
         }
     }
@@ -2581,6 +2626,7 @@ fn downloadHttpDiskFilesForManifestPath(
     bundle_dir: []const u8,
     manifest_rel: []const u8,
     seen: *std.StringHashMap(void),
+    budget: *HttpBundleDownloadBudget,
 ) Error!u64 {
     var parsed_manifest = try LoadedManifest.loadPath(
         allocator,
@@ -2592,7 +2638,7 @@ fn downloadHttpDiskFilesForManifestPath(
     for (disk.layers) |layer_ref| {
         const layer_rel = try diskLayerRelPath(allocator, layer_ref);
         if (try markBundleFileSeen(seen, layer_rel)) {
-            bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, layer_rel);
+            bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, layer_rel, budget);
         }
         const parsed_layer = disk_layer.loadLayer(allocator, bundle_dir, layer_ref) catch |err| return diskLayerError(err);
         defer parsed_layer.deinit();
@@ -2600,7 +2646,8 @@ fn downloadHttpDiskFilesForManifestPath(
         for (parsed_layer.value.extents) |extent| {
             const object_rel = try diskObjectRelPath(allocator, extent.digest);
             if (try markBundleFileSeen(seen, object_rel)) {
-                bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, object_rel);
+                const expected_size = try spore.diskClusterLen(parsed_layer.value.disk_size, parsed_layer.value.cluster_size, extent.logical_cluster);
+                bytes += try downloadHttpBundlePayloadFile(allocator, options, client, location, bundle_dir, object_rel, budget, @intCast(expected_size));
             }
         }
     }
@@ -2622,6 +2669,44 @@ fn downloadS3BundleFile(
     return fileSizeNoSymlink(options.io, dest_path);
 }
 
+fn downloadHttpBundleMetadataFile(
+    allocator: std.mem.Allocator,
+    options: PullOptions,
+    client: *std.http.Client,
+    location: HttpLocation,
+    bundle_dir: []const u8,
+    rel_path: []const u8,
+    budget: *HttpBundleDownloadBudget,
+) Error!u64 {
+    return downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rel_path, budget, .metadata, max_http_bundle_metadata_file_bytes);
+}
+
+fn downloadHttpBundleSizedMetadataFile(
+    allocator: std.mem.Allocator,
+    options: PullOptions,
+    client: *std.http.Client,
+    location: HttpLocation,
+    bundle_dir: []const u8,
+    rel_path: []const u8,
+    budget: *HttpBundleDownloadBudget,
+    max_body_bytes: u64,
+) Error!u64 {
+    return downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rel_path, budget, .metadata, max_body_bytes);
+}
+
+fn downloadHttpBundlePayloadFile(
+    allocator: std.mem.Allocator,
+    options: PullOptions,
+    client: *std.http.Client,
+    location: HttpLocation,
+    bundle_dir: []const u8,
+    rel_path: []const u8,
+    budget: *HttpBundleDownloadBudget,
+    max_body_bytes: u64,
+) Error!u64 {
+    return downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rel_path, budget, .payload, max_body_bytes);
+}
+
 fn downloadHttpBundleFile(
     allocator: std.mem.Allocator,
     options: PullOptions,
@@ -2629,12 +2714,18 @@ fn downloadHttpBundleFile(
     location: HttpLocation,
     bundle_dir: []const u8,
     rel_path: []const u8,
+    budget: *HttpBundleDownloadBudget,
+    file_class: HttpBundleFileClass,
+    max_body_bytes: u64,
 ) Error!u64 {
     try validateBundleRelPath(rel_path);
     const dest_path = try pathZ(allocator, "{s}/{s}", .{ bundle_dir, rel_path });
     if (std.fs.path.dirname(dest_path)) |parent| try ensureDirPath(options.io, parent);
     const url = try location.objectUrl(allocator, rel_path);
-    return httpGetToFile(options.io, client, url, dest_path);
+    const limit = try budget.limitFor(file_class, max_body_bytes);
+    const copied = try httpGetToFile(options.io, client, url, dest_path, limit);
+    try budget.record(file_class, copied);
+    return copied;
 }
 
 fn httpGetToFile(
@@ -2642,9 +2733,21 @@ fn httpGetToFile(
     client: *std.http.Client,
     url: []const u8,
     path: []const u8,
+    max_body_bytes: u64,
 ) Error!u64 {
     const uri = std.Uri.parse(url) catch return error.BadManifest;
     const target_address = resolveHttpFetchTarget(client.io, uri) catch |err| return err;
+    return httpGetToFileAfterPolicy(io, client, uri, target_address, path, max_body_bytes);
+}
+
+fn httpGetToFileAfterPolicy(
+    io: Io,
+    client: *std.http.Client,
+    uri: std.Uri,
+    target_address: Io.net.IpAddress,
+    path: []const u8,
+    max_body_bytes: u64,
+) Error!u64 {
     var file = Io.Dir.cwd().createFile(io, path, .{}) catch return error.IoFailed;
     errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
     defer file.close(io);
@@ -2667,6 +2770,9 @@ fn httpGetToFile(
     var header_buffer: [8 * 1024]u8 = undefined;
     var response = req.receiveHead(&header_buffer) catch return error.IoFailed;
     if (response.head.status != .ok) return error.BadChunk;
+    if (try httpContentLength(response.head.bytes)) |content_length| {
+        if (content_length > max_body_bytes) return error.BundleBodyTooLarge;
+    }
 
     var transfer_buffer: [64 * 1024]u8 = undefined;
     var body = response.reader(&transfer_buffer);
@@ -2676,12 +2782,29 @@ fn httpGetToFile(
         const n = body.readSliceShort(&copy_buffer) catch return error.IoFailed;
         if (n == 0) break;
         const n_u64: u64 = @intCast(n);
-        if (copied > std.math.maxInt(u64) - n_u64) return error.BadChunk;
+        if (n_u64 > max_body_bytes - copied) return error.BundleBodyTooLarge;
         copied += n_u64;
         file_writer.interface.writeAll(copy_buffer[0..n]) catch return error.IoFailed;
     }
     file_writer.interface.flush() catch return error.IoFailed;
     return copied;
+}
+
+fn httpContentLength(head: []const u8) Error!?u64 {
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    _ = lines.first();
+    var found: ?u64 = null;
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const header_name = line[0..colon];
+        if (!std.ascii.eqlIgnoreCase(header_name, "content-length")) continue;
+        if (found != null) return error.BadChunk;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (value.len == 0) return error.BadChunk;
+        found = std.fmt.parseInt(u64, value, 10) catch return error.BadChunk;
+    }
+    return found;
 }
 
 fn resolveHttpFetchTarget(io: Io, uri: std.Uri) Error!Io.net.IpAddress {
@@ -3184,6 +3307,96 @@ const StaticHttpBundleServer = struct {
             "HTTP/1.1 {d} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             .{status},
         );
+        try writer.interface.flush();
+    }
+};
+
+const TestHttpBodyServer = struct {
+    const Mode = enum {
+        content_length,
+        chunked,
+    };
+
+    io: Io,
+    server: std.Io.net.Server,
+    thread: std.Thread,
+    closed: std.atomic.Value(bool),
+    request_count: std.atomic.Value(usize),
+    body: []const u8,
+    mode: Mode,
+    content_length: ?u64,
+
+    fn init(self: *TestHttpBodyServer, io: Io, body: []const u8, mode: Mode, content_length: ?u64) !void {
+        var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        self.* = .{
+            .io = io,
+            .server = try address.listen(io, .{ .kernel_backlog = 8, .reuse_address = true }),
+            .thread = undefined,
+            .closed = .init(false),
+            .request_count = .init(0),
+            .body = body,
+            .mode = mode,
+            .content_length = content_length,
+        };
+        self.thread = try std.Thread.spawn(.{}, TestHttpBodyServer.serveThread, .{self});
+    }
+
+    fn deinit(self: *TestHttpBodyServer) void {
+        const wake_address = self.server.socket.address;
+        self.closed.store(true, .release);
+        if (wake_address.connect(self.io, .{ .mode = .stream })) |stream| {
+            stream.close(self.io);
+        } else |_| {}
+        self.server.deinit(self.io);
+        self.thread.join();
+    }
+
+    fn url(self: *TestHttpBodyServer, allocator: std.mem.Allocator) ![]const u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/body", .{self.server.socket.address.getPort()});
+    }
+
+    fn serveThread(self: *TestHttpBodyServer) void {
+        while (!self.closed.load(.acquire)) {
+            var stream = self.server.accept(self.io) catch {
+                if (self.closed.load(.acquire)) return;
+                continue;
+            };
+            self.handle(stream) catch {};
+            stream.close(self.io);
+        }
+    }
+
+    fn handle(self: *TestHttpBodyServer, stream: std.Io.net.Stream) !void {
+        _ = self.request_count.fetchAdd(1, .monotonic);
+        var read_buffer: [8 * 1024]u8 = undefined;
+        var reader = stream.reader(self.io, &read_buffer);
+        _ = reader.interface.takeDelimiterExclusive('\n') catch return;
+        while (true) {
+            const header_raw = reader.interface.takeDelimiterExclusive('\n') catch return;
+            const header = std.mem.trimEnd(u8, header_raw, "\r");
+            if (header.len == 0) break;
+        }
+
+        var write_buffer: [8 * 1024]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        switch (self.mode) {
+            .content_length => {
+                try writer.interface.print(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+                    .{self.content_length orelse self.body.len},
+                );
+                try writer.interface.writeAll(self.body);
+            },
+            .chunked => {
+                try writer.interface.writeAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                if (self.body.len > 0) {
+                    try writer.interface.print("{x}\r\n", .{self.body.len});
+                    try writer.interface.writeAll(self.body);
+                    try writer.interface.writeAll("\r\n");
+                }
+                try writer.interface.writeAll("0\r\n\r\n");
+            },
+        }
         try writer.interface.flush();
     }
 };
@@ -4323,8 +4536,54 @@ test "http bundle pull rejects loopback source before request" {
     const dest_path = try pathZ(arena, "{s}/downloaded-bundle.json", .{root_dir});
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
-    try std.testing.expectError(error.BadManifest, httpGetToFile(io, &client, url, dest_path));
+    try std.testing.expectError(error.BadManifest, httpGetToFile(io, &client, url, dest_path, max_http_bundle_metadata_file_bytes));
     try std.testing.expectEqual(@as(usize, 0), server.request_count.load(.monotonic));
+}
+
+test "http bundle file rejects oversized content length before writing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const dest_path = try pathZ(arena, "{s}/oversized-body", .{root_dir});
+    var server: TestHttpBodyServer = undefined;
+    try server.init(io, "", .content_length, 17);
+    defer server.deinit();
+
+    const url = try server.url(arena);
+    const uri = try std.Uri.parse(url);
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    try std.testing.expectError(error.BundleBodyTooLarge, httpGetToFileAfterPolicy(io, &client, uri, server.server.socket.address, dest_path, 16));
+    try std.testing.expect(!try pathExistsNoSymlink(io, dest_path));
+    try std.testing.expectEqual(@as(usize, 1), server.request_count.load(.monotonic));
+}
+
+test "http bundle file stops chunked bodies at the streaming limit" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = try arena.alloc(u8, 128 * 1024);
+    @memset(body, 0xAB);
+    const root_dir = try testDir(arena);
+    const dest_path = try pathZ(arena, "{s}/oversized-chunked-body", .{root_dir});
+    var server: TestHttpBodyServer = undefined;
+    try server.init(io, body, .chunked, null);
+    defer server.deinit();
+
+    const url = try server.url(arena);
+    const uri = try std.Uri.parse(url);
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    try std.testing.expectError(error.BundleBodyTooLarge, httpGetToFileAfterPolicy(io, &client, uri, server.server.socket.address, dest_path, 16 * 1024));
+    try std.testing.expect(!try pathExistsNoSymlink(io, dest_path));
+    try std.testing.expectEqual(@as(usize, 1), server.request_count.load(.monotonic));
 }
 
 test "pull fails closed on corrupt chunk cache entries" {
