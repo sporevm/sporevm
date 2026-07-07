@@ -9,264 +9,210 @@ spec_refs:
   - src/rootfs/tar.zig
   - src/rootfs/ext4_writer.zig
 related_plans:
-  - docs/plans/rootfs-conversion-optimization.md
-  - docs/plans/spore-build.md
+  - docs/plans/unified-chunk-disk.md
 ---
 
 # Native Zig Tar-To-Ext4 Writer
 
 ## Summary
 
-Replace the external `mke2fs -d` plus `debugfs -w` rootfs materialization path
-with a native Zig writer that creates a fresh ext4 image, sets deterministic
-metadata itself, and computes the rootfs BLAKE3 while emitting image bytes.
+Replace the external `mke2fs -d` plus `debugfs -w` rootfs materialization
+pipeline with a native Zig writer that serializes a merged OCI layer tree into
+a fresh ext4 image, sets deterministic metadata itself, and computes the rootfs
+BLAKE3 inline as image bytes are emitted.
 
-The intended end state is a direct layer-to-ext4 pipeline: parse each layer,
-merge OCI tar semantics into an in-memory tree, plan the image, then stream the
-image bytes without depending on host e2fsprogs behavior. The rollout remains
-fail-closed: the external path stays the default until the native path has
-semantic, boot, fuzz, and benchmark evidence.
+This writer is now scoped as the U4 import producer for
+[Unified Chunk-Mapped Disk](unified-chunk-disk.md): today it emits the flat
+ext4 artifact and rootfs BLAKE3; the next storage slice extends the same
+sequential emission loop to produce 64 KiB chunk digests and a
+`spore-disk-index-v1` inline. It stays create-only. Incremental/in-place
+mutation and snapshot persistence belong to U3's chunk sealer.
 
 ## Problem
 
-`materializeRootFS` currently stages layers into a host directory, invokes
-`mke2fs -d`, runs `debugfs` to repair deterministic metadata that the host tree
-cannot represent directly, then reads the entire image again for BLAKE3. That
-pipeline is slow on large images and depends on the installed e2fsprogs version
-for details of the emitted filesystem.
+The external materialization path stages layers into a host directory, invokes
+e2fsprogs to create the ext4 image, runs `debugfs` to repair deterministic
+metadata that the host tree cannot represent, then reads the image again for
+BLAKE3 and rootfs CAS chunking.
 
-The native writer is meant to remove the host-tool dependency and collapse the
-serializer/hash passes while preserving the existing cache and metadata
-contracts.
+That pipeline has three costs:
+
+- It depends on host e2fsprogs behavior for bytes that are supposed to be
+  deterministic.
+- It pays for a host staging tree even though the guest only consumes the final
+  block device.
+- It cannot emit the future U4 chunk index inline because the serializer is an
+  opaque external process.
+
+The native writer removes the runtime e2fsprogs dependency and makes the
+serializer the point where flat bytes, rootfs digest, and future chunk-index
+identity are produced together.
 
 ## Goals
 
-- Produce fsck-clean ext4 images without runtime e2fsprogs.
-- Keep output deterministic for identical layer inputs and manifest digest.
-- Preserve digest-cache, metadata sidecar, and `rootfs.storage` behavior.
-- Preserve current tar semantics: path safety, whiteouts, opaque directories,
-  modes, ownership, symlinks, hardlinks, and bounded `security.capability`.
-- Keep the external writer available until the native path has enough evidence
-  to become the default.
+- Produce deterministic, fsck-clean ext4 images without runtime e2fsprogs.
+- Preserve OCI layer semantics: path safety, whiteouts, opaque directories,
+  modes, ownership, symlinks, hardlinks, and bounded `security.capability`
+  xattrs.
+- Keep the existing digest-cache, metadata sidecar, and rootfs storage behavior
+  until U4 replaces post-hoc rootfs CAS chunking.
+- Keep the writer loop sequential and content-source backed so a second
+  per-64KiB hasher can be added without another full-image pass.
+- Keep the external writer available with `SPOREVM_EXT4_WRITER=external`.
 
 ## Non-Goals
 
-- No general ext4 library. This is write-only and create-only.
-- No journal, `metadata_csum`, `orphan_file`, or `dir_index` in the first
-  native profile.
-- No guest-visible rootfs format change.
-- No default flip before semantic comparison, guest boot, fuzz, and benchmark
-  evidence exist.
+- No general ext4 library. This is write-only and create-only: no reading,
+  appending, or modifying existing images.
+- No journal, `metadata_csum`, `orphan_file`, `dir_index`, extents, or
+  triple-indirect support in the first native profile.
+- No new guest-visible rootfs format. The VM still sees one virtio-blk ext4
+  disk.
+- No investment in `rootfs_cas_preload`, storage-upgrade paths, or
+  chunked-to-flat assembly. U4 deletes that post-hoc path and replaces it with
+  inline `spore-disk-index-v1` emission.
 
 ## Target Model
 
-The final pipeline has two logical passes:
+The native path has two passes:
 
-1. Parse and merge layer tar metadata into an in-memory tree. Regular files
-   record content identity and location instead of being copied into a staging
-   directory.
-2. Plan and emit a fixed ext4 layout while hashing the emitted bytes inline.
+1. Parse layer tar metadata into an in-memory merged tree. Regular files record
+   content source identity and byte ranges instead of being copied into a
+   staging directory. Plain tar layers are seekable; gzip layers spool once into
+   the materialization temp dir.
+2. Plan and emit a fixed ext4 layout while hashing emitted bytes inline. The
+   same loop is intentionally shaped to add U4 chunk hashing:
+   rootfs BLAKE3 over all bytes today, then per-64KiB chunk BLAKE3 plus index
+   construction next.
 
-The current branch uses a direct merged tar tree by default. It no longer feeds
-the native writer from the host staging directory. Regular files are recorded
-as content sources and emitted block-by-block from seekable tar layer offsets or
-spooled gzip layers. Set `SPOREVM_EXT4_WRITER=external` to use the old
-e2fsprogs path.
-
-## Ext4 Profile
-
-- 4096-byte blocks, 256-byte inodes, sparse superblocks, filetype entries,
-  external xattr blocks, no journal, no checksums, no extents yet.
-- Block-mapped files support direct, single-indirect, and double-indirect data
-  blocks. Larger files fail closed until triple-indirect or extents are added.
-- Symlinks up to 60 bytes are stored inline; longer symlinks use data blocks.
-- Directories are linear and deterministic by path sort.
-- Device nodes, FIFOs, sockets, uid/gid high bits, hardlinks, and
-  `security.capability` xattrs are represented in the synthetic emitter API.
+The current profile uses 4096-byte blocks, 256-byte inodes, sparse
+superblocks, filetype directory entries, external xattr blocks, inline symlinks
+up to 60 bytes, and block-mapped regular files with direct, single-indirect,
+and double-indirect blocks. Larger files fail closed until extents or
+triple-indirect blocks are added.
 
 ## Safety Model
 
-OCI layers and local rootfs tars are attacker-influenced input. New parsing or
-tree-merge logic must fail closed and carry fuzz coverage in the same slice.
-The writer itself re-checks path safety, inode counts, image size, link counts,
-xattr bounds, and unsupported file sizes before writing an image.
+OCI layers and local rootfs tars are attacker-influenced input. The merged-tree
+path rejects unsafe paths, symlink traversal, invalid hardlinks, unsupported
+xattrs, and size/count limit violations. The writer re-checks path safety,
+inode counts, image size, link counts, xattr bounds, and unsupported file sizes
+before writing.
 
-The native writer is the default. The external writer remains available with
-`SPOREVM_EXT4_WRITER=external`. Unknown writer names return
-`UnsupportedExt4Writer`; there is no silent fallback from a requested writer
-path.
+The default native flip is a flag-day cache break: `builder_version` is
+`sporevm-rootfs-v4`, so old `v3` rootfs cache entries are abandoned and rebuilt.
+The by-digest cache is not split by writer. Rootfs metadata records the selected
+writer, and cache validation rejects a metadata/artifact pair produced by the
+other writer so `SPOREVM_EXT4_WRITER=external` remains an effective escape
+hatch.
 
 ## Current State
 
-Landed in this branch:
+Implemented in this branch:
 
-- `src/rootfs/ext4_writer.zig` can emit deterministic, fsck-clean ext4 images
-  for synthetic trees and merged layer trees.
-- `src/rootfs/tar.zig` can build an in-memory merged tree from supported layer
-  tars, including whiteouts, hardlinks, symlink traversal checks, ownership, and
-  bounded `security.capability` xattrs.
-- `materializeRootFS` defaults to the native emitter; `SPOREVM_EXT4_WRITER`
-  remains as an internal selector and `external` keeps the e2fsprogs path
-  available as an escape hatch.
-- Native materialization keeps the existing digest-cache and metadata behavior
-  and computes BLAKE3 inline during emission.
-- Regular file contents in the native path are replayed from source locations:
-  plain tar layers use payload offsets directly, gzip layers spool once into the
-  materialization temp directory, and the ext4 writer reads source-backed data
-  blocks during final image emission.
-- The native planner/metadata-emitter has an integrated fuzz target covering
-  mixed entry trees, parent synthesis, hardlinks, source-backed file blocks,
-  symlinks, device nodes, special files, xattrs, block assignment, and metadata
-  emission.
-- `scripts/benchmark-rootfs-writers.py` compares native and external writer
-  conversion phases from the existing `SPOREVM_ROOTFS_BUILD_PROFILE=1` output
-  and writes JSON plus a Markdown phase table.
-- Guest boot/read-back smokes pass for a native-built Alpine rootfs and a
-  native-built Buildkite agent rootfs.
-- A Buildkite agent image conversion phase table is recorded below; native is
-  correct and dependency-free but currently slower in the emit phase on this
-  macOS run, so the external fallback remains documented.
-- Focused tests cover deterministic output, multi-group images, double-indirect
-  files, hardlink ordering, merged-tree whiteouts/hardlinks, explicit writer
-  selection, gzip spooling for merged trees, staging-vs-native layer semantics,
-  native-vs-external debugfs read-back for materialized images, repeated native
-  determinism, and a small `materializeRootFS` native import.
-- A merged-tree tar fuzz target runs alongside the existing staging tar fuzz
-  target.
+| Area | Status | Evidence |
+| --- | --- | --- |
+| Synthetic ext4 emission | Done | Deterministic images, multi-group images, hardlinks, device/special files, xattrs, large double-indirect files, and fsck checks in `src/rootfs/ext4_writer.zig` tests. |
+| Merged tree from layer tars | Done | `src/rootfs/tar.zig` builds source-backed merged trees and compares them with staging semantics for whiteouts, hardlinks, symlinks, ownership, xattrs, implicit dirs, and content. |
+| Native materialization wiring | Done | `materializeRootFS` selects native by default, external by `SPOREVM_EXT4_WRITER=external`, and writes `ext4_writer` into rootfs metadata. |
+| Native/external semantic parity | Done | Focused debugfs read-back test materializes the same layer through both writers and compares guest-visible file contents; repeated native output has the same BLAKE3. |
+| Determinism | Done | Duplicate native emits and repeated native materialization produce stable BLAKE3 for the tested inputs. |
+| Fuzz coverage | Done | Existing tar fuzzing is extended with merged-tree fuzzing, and the native planner/metadata emitter has an integrated fuzz target. |
+| Cache identity | Done | Builder version bumped to `sporevm-rootfs-v4`; cache validation includes the selected writer metadata without hashing writer selection into the cache key. |
+| Guest boot smoke | Done | Native-default OCI smoke built and booted Alpine with `builder_version: sporevm-rootfs-v4`, `ext4_writer: native`, and guest output `native-rootfs-smoke`. |
+| Writer benchmark | Done | Post-v4 native vs external phase table recorded below; native output is byte-identical to the pre-v4 run and the emit-throughput gap is a documented follow-up, not a flip blocker. |
 
-Follow-up after the default flip:
+## Rollout Gates
 
-- Native writer throughput optimization; the default flip keeps the external
-  e2fsprogs path available while `native_ext4_emit` is tuned.
+Before merge:
 
-## Delivery Strategy
+- Native-default OCI boot smoke passes and is recorded here.
+- Focused native/external parity, cache, and TLS tests pass after the v4
+  re-scope.
+- Full `zig test src/rootfs.zig`, `mise run test`, and `mise run build` pass.
 
-### Slice 1: Ext4 Emitter Core
+Before removing the external fallback:
 
-Status: active in this branch.
+- U4 inline chunk-index emission exists, replacing the post-hoc
+  `rootfs_cas_preload` full-image re-read.
+- Native writer throughput is acceptable on representative large images.
+- The first profile either supports extents/triple-indirect blocks or the
+  `UnsupportedExt4FileSize` fallback remains documented and tested.
 
-Definition of done:
+## Boot Evidence
 
-- Synthetic trees emit fsck-clean images.
-- Duplicate emits are byte-identical and inline BLAKE3 matches a post-hoc
-  `blake3File`.
-- Planner arithmetic and hardlink/link-count behavior fail closed.
-- Coverage includes block-group boundaries and large regular files.
+Recorded on 2026-07-08 in this worktree:
 
-### Slice 2: Merged Tree From Layer Tars
+```bash
+tmp_cache="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-native-smoke-cache.XXXXXX")" &&
+env -u SPOREVM_EXT4_WRITER SPOREVM_ROOTFS_CACHE_DIR="$tmp_cache" \
+  scripts/smoke-run-oci-rootfs.sh --no-build \
+  --image public.ecr.aws/docker/library/alpine:3.20 \
+  -- /bin/echo native-rootfs-smoke
+```
 
-Status: complete in this branch.
+Observed:
 
-`src/rootfs/tar.zig` now has a native metadata tree builder with source-backed
-regular files. A staging-vs-native fixture covers ownership, xattrs, whiteouts,
-hardlinks, symlinks, implicit dirs, and regular file content; the merged-tree
-fuzz target covers adversarial tar metadata.
+- Metadata recorded `builder_version: sporevm-rootfs-v4`.
+- Metadata recorded `ext4_writer: native`.
+- Resolved image:
+  `public.ecr.aws/docker/library/alpine@sha256:45e09956dc667c5eff3583c9d94830261fb1ca0be10a0a7db36266edf5de9e1d`.
+- Rootfs BLAKE3:
+  `56f376dcf47aebd6470acf731f90ed2883537d609417adcf86186db62d88844c`.
+- Guest output: `native-rootfs-smoke`.
 
-Definition of done:
+## Benchmark Evidence
 
-- Existing tar whiteout, path-safety, ownership, hardlink, and xattr tests pass.
-- Fixture layer stacks produce semantically identical staging and in-memory
-  trees.
-- Fuzz coverage lands for tree merge shapes and adversarial tar metadata.
-
-### Slice 3: Wire Direct Native Writer Into `materializeRootFS`
-
-Status: complete in this branch.
-
-The writer selector exists and native selection bypasses staging. A focused
-debugfs read-back test now materializes the same layer through external and
-native writers, compares guest-visible file contents, and verifies repeated
-native imports produce the same BLAKE3.
-
-Definition of done:
-
-- Small OCI and rootfs-tar fixtures materialize through the direct native path.
-- Native output is fsck-clean and semantically equal to the external output.
-- Two native imports of the same input produce the same BLAKE3.
-
-### Slice 4: Evidence And Default Flip
-
-Status: complete in this branch.
-
-Collect enough evidence to make native the default and keep the external path
-as an escape hatch for at least one release.
-
-Definition of done:
-
-- Guest boot/read-back smoke passes on representative images.
-- Buildkite image conversion phase table is recorded here.
-- Integrated fuzz targets run in rootfs tests with no outstanding findings.
-- The default flips and the fallback is documented for release notes.
-
-Evidence collected on 2026-07-08 from this branch on macOS arm64/HVF:
-
-- Default native guest smoke:
-  `scripts/smoke-run-oci-rootfs.sh --no-build --image public.ecr.aws/docker/library/alpine:3.20 -- /bin/echo native-rootfs-smoke`
-  built `public.ecr.aws/docker/library/alpine@sha256:45e09956dc667c5eff3583c9d94830261fb1ca0be10a0a7db36266edf5de9e1d`
-  and printed `native-rootfs-smoke`.
-- Native benchmark-image boot:
-  `zig-out/bin/spore run --rootfs zig-cache/rootfs-writer-benchmarks/rootfs-native.ext4 -- /usr/local/bin/node -v`
-  printed `v22.23.1`.
-- Native Buildkite agent image boot:
-  `zig-out/bin/spore run --rootfs zig-cache/rootfs-writer-benchmarks-buildkite-agent/rootfs-native.ext4 -- /bin/sh -lc 'buildkite-agent --version >/tmp/agent-version 2>&1 || true; cat /tmp/agent-version; echo buildkite-agent-rootfs-ok'`
-  printed `buildkite-agent version 3.131.0+13069.88329801c4c284e44fd849ce8b0a2e74179ba24d`
-  and `buildkite-agent-rootfs-ok`.
-
-Buildkite agent rootfs conversion table:
+Recorded on 2026-07-08 in this worktree after the v4/default-flip diff, using
+`scripts/benchmark-rootfs-writers.py --no-build --image docker.io/buildkite/agent:3`
+on macOS arm64/HVF:
 
 | Writer | Status | Total | Conversion phases | Rootfs size | BLAKE3 prefix |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `external` | 0 | 59.86s | 17.76s | 620756992 | `67a866b5de6680c8` |
-| `native` | 0 | 61.74s | 29.42s | 620756992 | `9828e4be2475afb2` |
+| `external` | 0 | 50.93s | 16.98s | 620756992 | `67a866b5de6680c8` |
+| `native` | 0 | 61.77s | 29.48s | 620756992 | `9828e4be2475afb2` |
 
 | Phase | External | Native |
 | --- | ---: | ---: |
-| `tree_merge` | - | 8.37s |
-| `layer_extract_staging` | 12.36s | - |
+| `tree_merge` | - | 8.34s |
+| `layer_extract_staging` | 11.94s | - |
 | `rootfs_tree_finalize` | 13ms | 0ms |
-| `host_metadata_normalize` | 143ms | - |
-| `ext4_size_scan` | 34ms | 1ms |
-| `ext4_create_empty` | 0ms | - |
-| `mkfs_ext4` | 785ms | - |
-| `debugfs_finalize` | 575ms | - |
-| `rootfs_blake3` | 3.85s | - |
-| `native_ext4_emit` | - | 21.05s |
+| `host_metadata_normalize` | 126ms | - |
+| `ext4_size_scan` | 35ms | 1ms |
+| `ext4_create_empty` | 1ms | - |
+| `mkfs_ext4` | 509ms | - |
+| `debugfs_finalize` | 546ms | - |
+| `rootfs_blake3` | 3.82s | - |
+| `native_ext4_emit` | - | 21.14s |
 
-## Verification
+Native BLAKE3 matches the pre-v4 run exactly, confirming the review-response
+diff did not change emitted bytes. Native conversion is currently ~12.5s slower
+than external on this image, dominated by `native_ext4_emit`; the default flip
+proceeds on correctness, determinism, and dependency-freedom, with emit
+batching tracked under Known Limits as the throughput follow-up.
 
-- `zig test src/rootfs.zig --test-filter "native ext4 writer"`.
-- Full rootfs tests: `zig test src/rootfs.zig`.
-- Repo validation: `mise run test`, `mise run build`, `git diff --check`.
-- `e2fsck -f -n` on emitted test images when e2fsprogs is available.
-- Later slices: guest boot/read-back and `SPOREVM_ROOTFS_BUILD_PROFILE=1`
-  benchmarks with `scripts/benchmark-rootfs-writers.py`.
+## Next: Inline Chunk Index Emission For U4
 
-## Resolved Decisions
+The next real storage slice is not more rootfs CAS plumbing. It is extending the
+native writer emission loop so every 64 KiB of logical image bytes also feeds a
+chunk hasher and writes/records the corresponding CAS object for
+`spore-disk-index-v1`.
 
-- The first native profile is deliberately simpler than mke2fs output and does
-  not attempt byte-identical output with the external serializer.
-- `SPOREVM_EXT4_WRITER` remains an internal fallback selector, not a durable
-  user interface yet.
-- The staging-tree bridge is acceptable only as an emitter/integration slice;
-  it does not satisfy the direct tar-to-ext4 goal by itself.
+Keep the current writer loop friendly to that change:
 
-## Deferred Work
+- Preserve the sequential block walk in `writeImage`.
+- Avoid adding new callers that depend on the current `Result{ blake3, size }`
+  shape as the durable writer API.
+- Do not expand `ensureImageRootfsStorage`, storage upgrade, or chunked-to-flat
+  assembly paths; those are deleted by U4.
 
-- Improve source-backed native emission throughput; the 2026-07-08 Buildkite
-  agent benchmark showed `native_ext4_emit` slower than the external
-  extract/mkfs/debugfs/hash sequence on macOS.
-- Deterministic extents or triple-indirect support for very large files.
-- Deterministic `dir_index` if large-directory guest lookup performance needs
-  it.
-- `metadata_csum` if a future kernel policy requires it.
-- Parallel layer-content streaming if direct native emission is I/O-bound.
+## Known Limits
 
-## Key Learnings From Pressure-Testing
-
-The smallest useful slice is the create-only emitter plus an internal
-`materializeRootFS` selector. It proves the filesystem bytes, cache contract,
-and inline hash path before taking on the higher-risk tar merge refactor.
-
-The main remaining risk is semantic drift between native tree merging and the
-existing staging applier. Slice 2 must either share the merge oracle directly or
-add strong differential tests that make drift visible before the default flips.
+- A single regular file larger than direct + single-indirect + double-indirect
+  coverage, roughly 4 GiB with 4 KiB blocks, fails closed with
+  `UnsupportedExt4FileSize`. Use `SPOREVM_EXT4_WRITER=external` for images with
+  larger files until extents or triple-indirect support lands.
+- Large-directory lookup is linear because `dir_index` is not emitted.
+- Native emission is currently one positional read/write per 4 KiB data block;
+  batching is the likely throughput follow-up if benchmarks show emit-bound
+  behavior.

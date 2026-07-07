@@ -189,6 +189,7 @@ pub fn fromZigError(err: anyerror) CliError {
         error.InjectedFileCaptureUnsupported,
         error.InjectedFileResumeUnsupported,
         error.InjectedFileMonitorUnsupported,
+        error.UnsupportedExt4Writer,
         => CliError.init(.usage_invalid_argument, ErrorCode.usage_invalid_argument.defaultMessage(), @errorName(err)),
         error.FileNotFound => CliError.init(.object_not_found, ErrorCode.object_not_found.defaultMessage(), @errorName(err)),
         error.AccessDenied,
@@ -204,6 +205,7 @@ pub fn fromZigError(err: anyerror) CliError {
         error.ManagedKernelConfigMissing,
         error.ManagedKernelHTTPStatus,
         error.ManagedKernelBodyTooLarge,
+        error.UnsupportedExt4FileSize,
         => CliError.init(.object_invalid, ErrorCode.object_invalid.defaultMessage(), @errorName(err)),
         error.UnsupportedHost,
         error.UnsupportedBackend,
@@ -246,9 +248,11 @@ test "stable error code table matches the plan" {
 
 test "setup errors classify for API callers" {
     try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.InvalidRootfsInput).code);
+    try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.UnsupportedExt4Writer).code);
     try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.InjectedFileCaptureUnsupported).code);
     try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.InjectedFileTooLarge).code);
     try std.testing.expectEqual(ErrorCode.object_invalid, fromZigError(error.MissingRootfsArtifact).code);
+    try std.testing.expectEqual(ErrorCode.object_invalid, fromZigError(error.UnsupportedExt4FileSize).code);
     try std.testing.expectEqual(ErrorCode.cache_integrity_failed, fromZigError(error.ManagedKernelChecksumMismatch).code);
 }
 

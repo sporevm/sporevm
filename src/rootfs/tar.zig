@@ -166,6 +166,9 @@ pub fn applyLayerToMergedTree(
             try applySeekableTarLayerToMergedTree(allocator, io, tree, spooled);
             return;
         }
+        // Test-only streaming fallback. Production native materialization passes
+        // a spill dir so regular file payloads stay source-backed instead of
+        // buffering gzip contents in memory.
         var file = try Io.Dir.cwd().openFile(io, layer.path, .{});
         defer file.close(io);
         var file_buf: [64 * 1024]u8 = undefined;
