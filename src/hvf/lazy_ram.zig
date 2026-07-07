@@ -98,7 +98,7 @@ pub const Pager = struct {
     /// pull those chunks through the pager before calling device code.
     pub fn materializeVirtQueue(self: *Pager, q: virtqueue.VirtQueue) !void {
         if (!q.ready or q.size == 0) return;
-        if (q.size > virtqueue.max_queue_size) return error.BadManifest;
+        q.validateLayout() catch return error.BadManifest;
 
         const qsz: usize = q.size;
         try self.materializeGuestRange(q.desc_addr, qsz * desc_size);
@@ -106,13 +106,15 @@ pub const Pager = struct {
         try self.materializeGuestRange(q.used_addr, 6 + qsz * 8);
 
         const ram = guestmem.GuestRam{ .bytes = self.ram, .base = board.ram_base };
-        const avail_idx = ram.read(u16, q.avail_addr + 2) catch return error.BadManifest;
+        const avail_idx_addr = virtqueue.availIdxAddr(q.avail_addr) catch return error.BadManifest;
+        const avail_idx = ram.read(u16, avail_idx_addr) catch return error.BadManifest;
         var cur = q.last_avail;
         var budget: usize = virtqueue.max_queue_size;
         while (cur != avail_idx) {
             if (budget == 0) return error.BadManifest;
             const slot = cur % q.size;
-            const head = ram.read(u16, q.avail_addr + 4 + 2 * @as(u64, slot)) catch return error.BadManifest;
+            const head_addr = virtqueue.availRingAddr(q.avail_addr, slot) catch return error.BadManifest;
+            const head = ram.read(u16, head_addr) catch return error.BadManifest;
             try self.materializeDescriptorChain(ram, q, head);
             cur +%= 1;
             budget -= 1;
@@ -150,11 +152,14 @@ pub const Pager = struct {
             if (hops >= virtqueue.max_chain_len) return error.BadManifest;
             hops += 1;
 
-            const base = try checkedAdd(q.desc_addr, @as(u64, desc_size) * @as(u64, idx));
+            const base = virtqueue.descAddr(q.desc_addr, idx) catch return error.BadManifest;
             const addr = ram.read(u64, base) catch return error.BadManifest;
-            const len = ram.read(u32, base + 8) catch return error.BadManifest;
-            const flags = ram.read(u16, base + 12) catch return error.BadManifest;
-            const next = ram.read(u16, base + 14) catch return error.BadManifest;
+            const len_addr = virtqueue.descFieldAddr(base, 8) catch return error.BadManifest;
+            const flags_addr = virtqueue.descFieldAddr(base, 12) catch return error.BadManifest;
+            const next_addr = virtqueue.descFieldAddr(base, 14) catch return error.BadManifest;
+            const len = ram.read(u32, len_addr) catch return error.BadManifest;
+            const flags = ram.read(u16, flags_addr) catch return error.BadManifest;
+            const next = ram.read(u16, next_addr) catch return error.BadManifest;
 
             if (flags & flag_indirect != 0) return error.BadManifest;
             try self.materializeGuestRange(addr, @intCast(len));
@@ -164,11 +169,6 @@ pub const Pager = struct {
         }
     }
 };
-
-fn checkedAdd(a: u64, b: u64) !u64 {
-    if (std.math.maxInt(u64) - a < b) return error.BadManifest;
-    return a + b;
-}
 
 fn validateMapping(ram: []const u8) !void {
     const page_size = std.heap.page_size_min;

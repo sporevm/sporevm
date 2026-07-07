@@ -214,8 +214,7 @@ pub const Blk = struct {
                         moved = std.math.add(u32, moved, written) catch return failStatus(status);
                     }
                 }
-                status.data[0] = status_ok;
-                return moved + 1;
+                return okStatus(status, moved);
             },
             req_flush => {
                 if (!self.backend.flush()) return failStatus(status);
@@ -227,14 +226,14 @@ pub const Blk = struct {
                 const id = "sporevm-blk0";
                 for (data) |seg| {
                     if (!seg.writable) return failStatus(status);
+                    const written = std.math.cast(u32, seg.data.len) orelse return failStatus(status);
+                    if (written > std.math.maxInt(u32) - 1 - moved) return failStatus(status);
+                    moved += written;
                     @memset(seg.data, 0);
                     const n = @min(seg.data.len, id.len);
                     @memcpy(seg.data[0..n], id[0..n]);
-                    const written = std.math.cast(u32, seg.data.len) orelse return failStatus(status);
-                    moved = std.math.add(u32, moved, written) catch return failStatus(status);
                 }
-                status.data[0] = status_ok;
-                return moved + 1;
+                return okStatus(status, moved);
             },
             else => {
                 status.data[0] = status_unsupp;
@@ -243,6 +242,12 @@ pub const Blk = struct {
         }
     }
 };
+
+fn okStatus(status: queue.Segment, moved: u32) u32 {
+    const written = std.math.add(u32, moved, 1) catch return failStatus(status);
+    status.data[0] = status_ok;
+    return written;
+}
 
 fn failStatus(status: queue.Segment) u32 {
     if (status.writable and status.data.len >= 1) {
@@ -427,6 +432,27 @@ test "huge sector fails closed" {
     });
     _ = blk.handleRequest(&chain);
     try std.testing.expectEqual(status_ioerr, status[0]);
+}
+
+test "GET_ID rejects max u32 writable byte count" {
+    var disk = [_]u8{0} ** sector_size;
+    var blk = Blk.init(.{ .memory = &disk });
+
+    var header: [16]u8 = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, header[0..4], req_get_id, .little);
+    var scratch: [1]u8 = .{0xaa};
+    const huge_data = scratch[0..].ptr[0..std.math.maxInt(u32)];
+    var status: [1]u8 = .{0xff};
+
+    const chain = makeChain(&.{
+        .{ .data = &header, .writable = false },
+        .{ .data = huge_data, .writable = true },
+        .{ .data = &status, .writable = true },
+    });
+    const written = blk.handleRequest(&chain);
+    try std.testing.expectEqual(@as(u32, 1), written);
+    try std.testing.expectEqual(status_ioerr, status[0]);
+    try std.testing.expectEqual(@as(u8, 0xaa), scratch[0]);
 }
 
 fn fuzzBlkRequest(_: void, s: *std.testing.Smith) !void {

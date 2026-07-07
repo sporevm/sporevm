@@ -133,6 +133,7 @@ pub const Transport = struct {
                 if (value < self.dev.queue_count) {
                     const q = &self.queues[@intCast(value)];
                     if (q.ready) {
+                        q.validateLayout() catch return false;
                         if (self.dev.notifyFn(self.dev.context, @intCast(value), &self.queues, ram)) {
                             self.interrupt_status |= 1;
                             return true;
@@ -257,6 +258,21 @@ test "notify routes to device and latches interrupt until ack" {
     td.notified = null;
     try std.testing.expect(!t.write(0x050, 0, ram));
     try std.testing.expect(!t.write(0x050, 99, ram));
+    try std.testing.expectEqual(@as(?u8, null), td.notified);
+}
+
+test "notify ignores queues with overflowing ring addresses" {
+    var td = TestDev{};
+    var t = Transport.init(td.dev());
+    var buf: [16]u8 = undefined;
+    const ram = testRam(&buf);
+
+    _ = t.write(0x030, 1, ram);
+    _ = t.write(0x038, 8, ram);
+    _ = t.write(0x080, std.math.maxInt(u32), ram);
+    _ = t.write(0x084, std.math.maxInt(u32), ram);
+    _ = t.write(0x044, 1, ram);
+    try std.testing.expect(!t.write(0x050, 1, ram));
     try std.testing.expectEqual(@as(?u8, null), td.notified);
 }
 

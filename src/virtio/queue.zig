@@ -15,6 +15,7 @@ pub const max_chain_len = 64;
 
 pub const Error = error{
     QueueNotReady,
+    InvalidQueueSize,
     BadDescriptorIndex,
     ChainTooLong,
     OutOfBounds,
@@ -110,16 +111,27 @@ pub const VirtQueue = struct {
         self.* = .{};
     }
 
+    pub fn validateLayout(self: *const VirtQueue) Error!void {
+        if (self.size > max_queue_size) return error.InvalidQueueSize;
+        if (!self.ready or self.size == 0) return;
+
+        const qsz: u64 = self.size;
+        _ = try checkedAdd(self.desc_addr, try checkedMul(desc_size, qsz));
+        _ = try checkedAdd(self.avail_addr, try checkedAdd(4, try checkedMul(2, qsz)));
+        _ = try checkedAdd(self.used_addr, try checkedAdd(4, try checkedMul(8, qsz)));
+    }
+
     /// Pop the next available descriptor chain, or null when the ring is
     /// empty. The returned segments alias guest RAM directly.
     pub fn popAvail(self: *VirtQueue, ram: guestmem.GuestRam) Error!?Chain {
         if (!self.ready or self.size == 0) return error.QueueNotReady;
+        try self.validateLayout();
 
-        const avail_idx = ram.read(u16, self.avail_addr + 2) catch return error.OutOfBounds;
+        const avail_idx = ram.read(u16, try availIdxAddr(self.avail_addr)) catch return error.OutOfBounds;
         if (avail_idx == self.last_avail) return null;
 
         const slot = self.last_avail % self.size;
-        const head = ram.read(u16, self.avail_addr + 4 + 2 * @as(u64, slot)) catch return error.OutOfBounds;
+        const head = ram.read(u16, try availRingAddr(self.avail_addr, slot)) catch return error.OutOfBounds;
         self.last_avail +%= 1;
 
         var chain = Chain{ .head = head, .segments = .{} };
@@ -130,11 +142,11 @@ pub const VirtQueue = struct {
             if (hops >= max_chain_len) return error.ChainTooLong;
             hops += 1;
 
-            const base = self.desc_addr + desc_size * @as(u64, idx);
+            const base = try descAddr(self.desc_addr, idx);
             const addr = ram.read(u64, base) catch return error.OutOfBounds;
-            const len = ram.read(u32, base + 8) catch return error.OutOfBounds;
-            const flags = ram.read(u16, base + 12) catch return error.OutOfBounds;
-            const next = ram.read(u16, base + 14) catch return error.OutOfBounds;
+            const len = ram.read(u32, try descFieldAddr(base, 8)) catch return error.OutOfBounds;
+            const flags = ram.read(u16, try descFieldAddr(base, 12)) catch return error.OutOfBounds;
+            const next = ram.read(u16, try descFieldAddr(base, 14)) catch return error.OutOfBounds;
 
             // Indirect descriptors are not offered as a feature; reject.
             if (flags & flag_indirect != 0) return error.BadDescriptorIndex;
@@ -156,14 +168,54 @@ pub const VirtQueue = struct {
     /// bytes the device wrote into device-writable segments.
     pub fn pushUsed(self: *VirtQueue, ram: guestmem.GuestRam, head: u16, written: u32) Error!void {
         if (!self.ready or self.size == 0) return error.QueueNotReady;
+        try self.validateLayout();
+
         const slot = self.used_idx % self.size;
-        const elem = self.used_addr + 4 + 8 * @as(u64, slot);
+        const elem = try usedRingAddr(self.used_addr, slot);
         ram.write(u32, elem, head) catch return error.OutOfBounds;
-        ram.write(u32, elem + 4, written) catch return error.OutOfBounds;
+        ram.write(u32, try checkedAdd(elem, 4), written) catch return error.OutOfBounds;
         self.used_idx +%= 1;
-        ram.write(u16, self.used_addr + 2, self.used_idx) catch return error.OutOfBounds;
+        ram.write(u16, try usedIdxAddr(self.used_addr), self.used_idx) catch return error.OutOfBounds;
     }
 };
+
+pub fn availIdxAddr(avail_addr: u64) Error!u64 {
+    return checkedAdd(avail_addr, 2);
+}
+
+pub fn availRingAddr(avail_addr: u64, slot: u16) Error!u64 {
+    return ringAddr(avail_addr, 4, 2, slot);
+}
+
+pub fn descAddr(desc_addr: u64, idx: u16) Error!u64 {
+    return ringAddr(desc_addr, 0, desc_size, idx);
+}
+
+pub fn descFieldAddr(desc_base: u64, offset: u64) Error!u64 {
+    return checkedAdd(desc_base, offset);
+}
+
+pub fn usedIdxAddr(used_addr: u64) Error!u64 {
+    return checkedAdd(used_addr, 2);
+}
+
+pub fn usedRingAddr(used_addr: u64, slot: u16) Error!u64 {
+    return ringAddr(used_addr, 4, 8, slot);
+}
+
+fn ringAddr(base: u64, header: u64, elem_size: u64, slot: u16) Error!u64 {
+    const elem_off = try checkedMul(elem_size, slot);
+    const offset = try checkedAdd(header, elem_off);
+    return checkedAdd(base, offset);
+}
+
+fn checkedAdd(a: u64, b: u64) Error!u64 {
+    return std.math.add(u64, a, b) catch error.OutOfBounds;
+}
+
+fn checkedMul(a: u64, b: u64) Error!u64 {
+    return std.math.mul(u64, a, b) catch error.OutOfBounds;
+}
 
 // --- test helpers -----------------------------------------------------------
 
@@ -306,6 +358,20 @@ test "hostile descriptor fields are rejected" {
     t4.setDesc(0, TestRing.data_base, 16, flag_indirect, 0);
     t4.pushAvail(0);
     try std.testing.expectError(error.BadDescriptorIndex, t4.q.popAvail(t4.ram()));
+}
+
+test "overflowing queue ring addresses fail closed" {
+    var avail = TestRing.init(8);
+    avail.q.avail_addr = std.math.maxInt(u64);
+    try std.testing.expectError(error.OutOfBounds, avail.q.popAvail(avail.ram()));
+
+    var desc = TestRing.init(8);
+    desc.q.desc_addr = std.math.maxInt(u64);
+    try std.testing.expectError(error.OutOfBounds, desc.q.popAvail(desc.ram()));
+
+    var used = TestRing.init(8);
+    used.q.used_addr = std.math.maxInt(u64);
+    try std.testing.expectError(error.OutOfBounds, used.q.pushUsed(used.ram(), 0, 0));
 }
 
 test "used ring round-trip" {
