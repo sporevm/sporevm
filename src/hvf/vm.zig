@@ -1530,8 +1530,19 @@ fn hvfVcpuThreadMain(ctx: *MultiHvfThreadContext) void {
                         ctx.state.finish(.{ .err = error.UnhandledGuestException });
                     },
                     hvf.ec_data_abort => {
+                        // Redistributor MMIO can forward to another vCPU and wait
+                        // for completion, so keep it out of the global device lock.
+                        const access = decodeMmioAccess(ctx.vcpu.exit) catch |err| {
+                            ctx.state.finish(.{ .err = err });
+                            return;
+                        };
+                        const handled_gic = handleGicMmioAccess(ctx.vcpu.handle, access, ctx.gic_windows, ctx.vcpu) catch |err| {
+                            ctx.state.finish(.{ .err = err });
+                            return;
+                        };
+                        if (handled_gic) continue;
                         ctx.device_lock.lock();
-                        handleMmio(ctx.vcpu.handle, ctx.vcpu.exit, ctx.transports, ctx.gen_dev, ctx.ram, null, ctx.gic_windows, ctx.vcpu) catch |err| {
+                        handleDeviceMmioAccess(ctx.vcpu.handle, access, ctx.transports, ctx.gen_dev, ctx.ram, null) catch |err| {
                             ctx.device_lock.unlock();
                             ctx.state.finish(.{ .err = err });
                             return;
@@ -2515,6 +2526,28 @@ const GicMmioTarget = struct {
     owner: ?*HvfVcpu = null,
 };
 
+const MmioAccess = struct {
+    sas: u2,
+    srt: u5,
+    is_write: bool,
+    ipa: u64,
+};
+
+fn decodeMmioAccess(exit: *const hvf.VcpuExit) !MmioAccess {
+    const syndrome = exit.exception.syndrome;
+    const isv = syndrome & (1 << 24) != 0;
+    if (!isv) {
+        std.log.err("data abort without ISV at ipa=0x{x}", .{exit.exception.physical_address});
+        return error.UnhandledMmio;
+    }
+    return .{
+        .sas = @truncate(syndrome >> 22),
+        .srt = @truncate(syndrome >> 16),
+        .is_write = syndrome & (1 << 6) != 0,
+        .ipa = exit.exception.physical_address,
+    };
+}
+
 const RedistributorFrame = struct {
     index: usize,
     offset: u64,
@@ -2572,6 +2605,49 @@ fn writeGicMmioTarget(current_owner: ?*HvfVcpu, target: GicMmioTarget, value: u6
         return;
     }
     gic.mmioWrite(target.region, target.vcpu, target.offset, value);
+}
+
+fn handleGicMmioAccess(
+    vcpu: hvf.VcpuHandle,
+    access: MmioAccess,
+    gic_windows: GicWindows,
+    current_owner: ?*HvfVcpu,
+) !bool {
+    const g = (try gicMmioTarget(vcpu, access.ipa, gic_windows)) orelse return false;
+    if (access.is_write) {
+        var value: u64 = 0;
+        if (access.srt < 31) {
+            try hvf.check(hvf.hv_vcpu_get_reg(vcpu, @enumFromInt(@as(u32, access.srt)), &value), "gic read xt");
+        }
+        try writeGicMmioTarget(current_owner, g, value);
+    } else if (access.srt < 31) {
+        const value = try readGicMmioTarget(current_owner, g, access.sas);
+        const masked: u64 = switch (access.sas) {
+            0 => value & 0xff,
+            1 => value & 0xffff,
+            2 => value & 0xffff_ffff,
+            3 => value,
+        };
+        try hvf.check(hvf.hv_vcpu_set_reg(vcpu, @enumFromInt(@as(u32, access.srt)), masked), "gic write xt");
+    }
+    try advancePc(vcpu);
+    return true;
+}
+
+fn dataAbortExitForTest(ipa: u64, sas: u2, srt: u5, is_write: bool) hvf.VcpuExit {
+    var syndrome = (@as(u64, @intCast(hvf.ec_data_abort)) << 26) |
+        (@as(u64, 1) << 24) |
+        (@as(u64, @intCast(sas)) << 22) |
+        (@as(u64, @intCast(srt)) << 16);
+    if (is_write) syndrome |= @as(u64, 1) << 6;
+    return .{
+        .reason = .exception,
+        .exception = .{
+            .syndrome = syndrome,
+            .virtual_address = ipa,
+            .physical_address = ipa,
+        },
+    };
 }
 
 test "psci target index accepts normalized mpidr affinity" {
@@ -2647,6 +2723,31 @@ test "vsock rx flush materializes lazy transport queues before delivery" {
     );
 }
 
+test "gic data-abort classification routes remote redistributor before device lock" {
+    var vcpus = [_]HvfVcpu{
+        .{ .index = 0, .handle = 11, .redist_base = 0x0802_0000 },
+        .{ .index = 1, .handle = 22, .redist_base = 0x0804_0000 },
+    };
+    var exit = dataAbortExitForTest(0x0802_0000 + 0x2_0000 + 0xc, 2, 3, false);
+    const access = try decodeMmioAccess(&exit);
+    try std.testing.expectEqual(@as(u2, 2), access.sas);
+    try std.testing.expectEqual(@as(u5, 3), access.srt);
+    try std.testing.expect(!access.is_write);
+
+    const target = (try gicMmioTarget(11, access.ipa, .{
+        .dist_base = 0x0800_0000,
+        .dist_size = 0x1_0000,
+        .redist_base = 0x0802_0000,
+        .redist_size = 0x4_0000,
+        .redist_stride = 0x2_0000,
+        .redist_vcpus = vcpus[0..],
+    })).?;
+    try std.testing.expectEqual(gic.Region.redistributor, target.region);
+    try std.testing.expectEqual(@as(u64, 0xc), target.offset);
+    try std.testing.expectEqual(@as(hvf.VcpuHandle, 22), target.vcpu);
+    try std.testing.expectEqual(@as(topology.VcpuIndex, 1), target.owner.?.index);
+}
+
 /// Decode a data-abort exit into an MMIO access and dispatch it to the
 /// GIC frames or virtio-mmio windows. ESR ISS layout per Arm ARM D17.2.37.
 fn handleMmio(
@@ -2659,38 +2760,23 @@ fn handleMmio(
     gic_windows: GicWindows,
     current_owner: ?*HvfVcpu,
 ) !void {
-    const syndrome = exit.exception.syndrome;
-    const isv = syndrome & (1 << 24) != 0;
-    if (!isv) {
-        std.log.err("data abort without ISV at ipa=0x{x}", .{exit.exception.physical_address});
-        return error.UnhandledMmio;
-    }
-    const sas: u2 = @truncate(syndrome >> 22); // access size = 1 << sas
-    const srt: u5 = @truncate(syndrome >> 16); // register transfer number
-    const is_write = syndrome & (1 << 6) != 0;
-    const ipa = exit.exception.physical_address;
+    const access = try decodeMmioAccess(exit);
+    if (try handleGicMmioAccess(vcpu, access, gic_windows, current_owner)) return;
+    try handleDeviceMmioAccess(vcpu, access, transports, gen_dev, ram, lazy_pager);
+}
 
-    // GIC distributor / redistributor frames.
-    if (try gicMmioTarget(vcpu, ipa, gic_windows)) |g| {
-        if (is_write) {
-            var value: u64 = 0;
-            if (srt < 31) {
-                try hvf.check(hvf.hv_vcpu_get_reg(vcpu, @enumFromInt(@as(u32, srt)), &value), "gic read xt");
-            }
-            try writeGicMmioTarget(current_owner, g, value);
-        } else if (srt < 31) {
-            const value = try readGicMmioTarget(current_owner, g, sas);
-            const masked: u64 = switch (sas) {
-                0 => value & 0xff,
-                1 => value & 0xffff,
-                2 => value & 0xffff_ffff,
-                3 => value,
-            };
-            try hvf.check(hvf.hv_vcpu_set_reg(vcpu, @enumFromInt(@as(u32, srt)), masked), "gic write xt");
-        }
-        try advancePc(vcpu);
-        return;
-    }
+fn handleDeviceMmioAccess(
+    vcpu: hvf.VcpuHandle,
+    access: MmioAccess,
+    transports: []mmio.Transport,
+    gen_dev: *generation.Device,
+    ram: guestmem.GuestRam,
+    lazy_pager: ?*lazy_ram.Pager,
+) !void {
+    const sas = access.sas;
+    const srt = access.srt;
+    const is_write = access.is_write;
+    const ipa = access.ipa;
 
     if (ipa >= board.generation_base and ipa < board.generation_base + board.generation_size) {
         const offset = ipa - board.generation_base;
