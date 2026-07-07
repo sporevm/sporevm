@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-07
+last_reviewed: 2026-07-08
 spec_refs:
   - docs/filesystem.md
   - docs/rootfs.md
@@ -69,8 +69,8 @@ The final pipeline has two logical passes:
 
 The current branch uses a direct merged tar tree when
 `SPOREVM_EXT4_WRITER=native` is set. It no longer feeds the native writer from
-the host staging directory, but it still stores regular file bytes in memory
-rather than recording layer offsets for a second streaming content pass.
+the host staging directory. Regular files are recorded as content sources and
+emitted block-by-block from seekable tar layer offsets or spooled gzip layers.
 
 ## Ext4 Profile
 
@@ -108,16 +108,19 @@ Landed in this branch:
   keeps the e2fsprogs path.
 - Native materialization keeps the existing digest-cache and metadata behavior
   and computes BLAKE3 inline during emission.
+- Regular file contents in the native path are replayed from source locations:
+  plain tar layers use payload offsets directly, gzip layers spool once into the
+  materialization temp directory, and the ext4 writer reads source-backed data
+  blocks during final image emission.
 - Focused tests cover deterministic output, multi-group images, double-indirect
   files, hardlink ordering, merged-tree whiteouts/hardlinks, explicit writer
-  selection, and a small `materializeRootFS` native import.
+  selection, gzip spooling for merged trees, and a small `materializeRootFS`
+  native import.
 - A merged-tree tar fuzz target runs alongside the existing staging tar fuzz
   target.
 
 Still incomplete:
 
-- Streaming content replay by layer offset. The direct path currently copies
-  regular file contents into memory during merge.
 - A single shared merge oracle for staging and native tree construction. The
   native tree builder reuses tar parsing helpers and has targeted differential
   semantics tests, but it is still a separate merge implementation.
@@ -141,10 +144,10 @@ Definition of done:
 
 ### Slice 2: Merged Tree From Layer Tars
 
-Status: active in this branch.
+Status: partial.
 
-`src/rootfs/tar.zig` now has a native in-memory tree builder, but it still needs
-streaming content locations and broader differential/fuzz evidence before this
+`src/rootfs/tar.zig` now has a native metadata tree builder with source-backed
+regular files. It still needs broader differential/fuzz evidence before this
 slice should be treated as complete.
 
 Definition of done:

@@ -64,6 +64,7 @@ pub const Device = struct {
 pub const EntryKind = union(enum) {
     directory,
     file: []const u8,
+    file_source: tar.FileSource,
     symlink: []const u8,
     hardlink: []const u8,
     device: Device,
@@ -110,6 +111,7 @@ const InodePlan = struct {
     size: u64 = 0,
     links: u16 = 1,
     data: []const u8 = &.{},
+    file_source: ?tar.FileSource = null,
     symlink_target: []const u8 = &.{},
     device: ?Device = null,
     xattrs: []const xattrs_mod.Attribute = &.{},
@@ -157,6 +159,40 @@ const PlannedImage = struct {
 };
 
 const BlockStore = std.AutoHashMap(u32, []u8);
+const DataBlockStore = std.AutoHashMap(u32, DataBlockSource);
+
+const DataBlockSource = struct {
+    source: tar.FileSource,
+    offset: u64,
+    len: usize,
+};
+
+const SourceFile = struct {
+    path: []const u8,
+    file: Io.File,
+};
+
+const SourceFileCache = struct {
+    files: std.ArrayList(SourceFile) = .empty,
+
+    fn deinit(self: *SourceFileCache, allocator: std.mem.Allocator, io: Io) void {
+        for (self.files.items) |item| item.file.close(io);
+        self.files.deinit(allocator);
+    }
+
+    fn open(self: *SourceFileCache, allocator: std.mem.Allocator, io: Io, path: []const u8) !Io.File {
+        for (self.files.items) |item| {
+            if (std.mem.eql(u8, item.path, path)) return item.file;
+        }
+        const file = if (Io.Dir.path.isAbsolute(path))
+            try Io.Dir.openFileAbsolute(io, path, .{})
+        else
+            try Io.Dir.cwd().openFile(io, path, .{});
+        errdefer file.close(io);
+        try self.files.append(allocator, .{ .path = path, .file = file });
+        return file;
+    }
+};
 
 pub fn emit(
     allocator: std.mem.Allocator,
@@ -176,11 +212,13 @@ pub fn emit(
 
     var blocks = BlockStore.init(allocator);
     defer freeBlockStore(allocator, &blocks);
+    var data_blocks = DataBlockStore.init(allocator);
+    defer data_blocks.deinit();
 
-    const layout = try assignBlocks(allocator, &planned, total_blocks, options.inode_count, &blocks);
+    const layout = try assignBlocks(allocator, &planned, total_blocks, options.inode_count, &blocks, &data_blocks);
     defer allocator.free(layout.groups);
     try writeMetadataBlocks(allocator, &planned, layout, options, &blocks);
-    return try writeImage(io, output_path, options.image_size, total_blocks, &blocks);
+    return try writeImage(allocator, io, output_path, options.image_size, total_blocks, &blocks, &data_blocks);
 }
 
 pub fn emitFromMergedTree(
@@ -241,7 +279,7 @@ pub fn emitFromMergedTree(
                 canonical.value_ptr.* = ref.path;
                 try entries.append(allocator, .{
                     .path = ref.path,
-                    .kind = .{ .file = try tree.fileData(ref.entry.inode_id) },
+                    .kind = .{ .file_source = try tree.fileSource(ref.entry.inode_id) },
                     .mode = ref.entry.mode,
                     .uid = ref.entry.uid,
                     .gid = ref.entry.gid,
@@ -396,6 +434,16 @@ fn entryInodePlan(entry: Entry, normalized: []const u8, inode_no: u32) !InodePla
             .data = data,
             .xattrs = entry.xattrs,
         },
+        .file_source => |source| .{
+            .ino = inode_no,
+            .kind = .file,
+            .mode = s_ifreg | (entry.mode & 0o7777),
+            .uid = entry.uid,
+            .gid = entry.gid,
+            .size = source.size(),
+            .file_source = source,
+            .xattrs = entry.xattrs,
+        },
         .symlink => |target| .{
             .ino = inode_no,
             .kind = .symlink,
@@ -489,6 +537,7 @@ fn assignBlocks(
     total_blocks: u32,
     inode_count: u32,
     blocks: *BlockStore,
+    data_blocks: *DataBlockStore,
 ) !Layout {
     const group_count = divCeilU32(total_blocks, blocks_per_group);
     const descriptor_blocks = divCeilU32(group_count * group_descriptor_size, block_size);
@@ -533,7 +582,11 @@ fn assignBlocks(
             inode.size = bytes.len;
             try allocatePayloadBlocks(allocator, inode, bytes, &used, blocks);
         } else if (inode.kind == .file) {
-            try allocatePayloadBlocks(allocator, inode, inode.data, &used, blocks);
+            if (inode.file_source) |source| {
+                try allocateSourcePayloadBlocks(allocator, inode, source, &used, data_blocks);
+            } else {
+                try allocatePayloadBlocks(allocator, inode, inode.data, &used, blocks);
+            }
         } else if (inode.kind == .symlink and inode.symlink_target.len > 60) {
             try allocatePayloadBlocks(allocator, inode, inode.symlink_target, &used, blocks);
         }
@@ -573,6 +626,30 @@ fn assignBlocks(
         .free_inodes = total_inode_count - usedInodeCount(planned),
         .groups = groups,
     };
+}
+
+fn allocateSourcePayloadBlocks(
+    allocator: std.mem.Allocator,
+    inode: *InodePlan,
+    source: tar.FileSource,
+    used: *std.DynamicBitSetUnmanaged,
+    data_blocks: *DataBlockStore,
+) !void {
+    const size = source.size();
+    if (size == 0) return;
+    const count = divCeilU64(size, block_size);
+    inode.data_blocks = try allocator.alloc(u32, @intCast(count));
+    var offset: u64 = 0;
+    for (inode.data_blocks) |*block| {
+        block.* = try allocateBlock(used);
+        const take: usize = @intCast(@min(size - offset, block_size));
+        try data_blocks.put(block.*, .{
+            .source = source,
+            .offset = offset,
+            .len = take,
+        });
+        offset += take;
+    }
 }
 
 fn allocatePayloadBlocks(
@@ -908,7 +985,15 @@ fn xattrBlock(allocator: std.mem.Allocator, attrs: []const xattrs_mod.Attribute)
     return block;
 }
 
-fn writeImage(io: Io, output_path: []const u8, image_size: u64, total_blocks: u32, blocks: *BlockStore) !Result {
+fn writeImage(
+    allocator: std.mem.Allocator,
+    io: Io,
+    output_path: []const u8,
+    image_size: u64,
+    total_blocks: u32,
+    blocks: *BlockStore,
+    data_blocks: *DataBlockStore,
+) !Result {
     try ext4.ensureParentDir(io, output_path);
     try ext4.createEmptyFile(io, output_path, image_size);
     var file = if (Io.Dir.path.isAbsolute(output_path))
@@ -919,12 +1004,19 @@ fn writeImage(io: Io, output_path: []const u8, image_size: u64, total_blocks: u3
 
     var hasher = Blake3.init(.{});
     const zero = [_]u8{0} ** block_size;
+    var source_block: [block_size]u8 = undefined;
+    var source_files = SourceFileCache{};
+    defer source_files.deinit(allocator, io);
     for (0..total_blocks) |block_index| {
         const block_no: u32 = @intCast(block_index);
         const offset = @as(u64, block_no) * block_size;
         if (blocks.get(block_no)) |block| {
             try file.writePositionalAll(io, block, offset);
             hasher.update(block);
+        } else if (data_blocks.get(block_no)) |source| {
+            try readDataBlock(allocator, io, &source_files, source, &source_block);
+            try file.writePositionalAll(io, &source_block, offset);
+            hasher.update(&source_block);
         } else {
             hasher.update(&zero);
         }
@@ -935,6 +1027,28 @@ fn writeImage(io: Io, output_path: []const u8, image_size: u64, total_blocks: u3
         .blake3 = std.fmt.bytesToHex(raw, .lower),
         .size = image_size,
     };
+}
+
+fn readDataBlock(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache: *SourceFileCache,
+    block: DataBlockSource,
+    out: *[block_size]u8,
+) !void {
+    @memset(out, 0);
+    switch (block.source) {
+        .memory => |data| {
+            const start: usize = @intCast(block.offset);
+            @memcpy(out[0..block.len], data[start .. start + block.len]);
+        },
+        .file => |slice| {
+            const file = try cache.open(allocator, io, slice.path);
+            const source_offset = try std.math.add(u64, slice.offset, block.offset);
+            const n = try file.readPositionalAll(io, out[0..block.len], source_offset);
+            if (n != block.len) return error.UnexpectedEndOfStream;
+        },
+    }
 }
 
 fn freeBlockStore(allocator: std.mem.Allocator, blocks: *BlockStore) void {
@@ -1051,6 +1165,10 @@ fn divCeilUsize(n: usize, d: usize) usize {
 }
 
 fn divCeilU32(n: u32, d: u32) u32 {
+    return (n + d - 1) / d;
+}
+
+fn divCeilU64(n: u64, d: u64) u64 {
     return (n + d - 1) / d;
 }
 

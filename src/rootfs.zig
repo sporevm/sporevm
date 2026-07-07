@@ -1377,7 +1377,7 @@ fn materializeRootFSNative(
     for (opts.layers, 0..) |layer, i| {
         if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
         layer_meta[i] = .{ .media_type = layer.media_type, .digest = layer.digest };
-        native_layers[i] = .{ .media_type = layer.media_type, .path = layer.path };
+        native_layers[i] = .{ .media_type = layer.media_type, .path = layer.path, .spill_dir = opts.temp_dir };
     }
     var tree = try tar.buildMergedTree(allocator, init.io, native_layers);
     defer tree.deinit(allocator);
