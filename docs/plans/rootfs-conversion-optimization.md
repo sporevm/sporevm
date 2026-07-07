@@ -252,6 +252,8 @@ Implementation notes:
 
 ### Slice 3: Buildkite Before/After Benchmark
 
+Status: implemented in this branch.
+
 Run the same Buildkite workload that produced the OCI versus tar comparison,
 but keep the BuildKit export as OCI and change only the import storage policy:
 
@@ -281,6 +283,64 @@ Definition of done:
   ref is useful.
 - Run a save from the flat-imported ref to measure the deferred upgrade cost
   separately from first-run import cost.
+
+Implementation notes:
+
+- Benchmark directory:
+  `/tmp/buildkite-sporevm-storage-policy-bench.pH7O2D`.
+  The logs, copied metadata, and saved manifest remain there; the temporary
+  chunked rootfs cache was pruned after recording its size to keep enough disk
+  headroom for the flat import and save run.
+- The benchmark generated one 3.4G OCI artifact from the current
+  `buildkite-sporevm` wrapper context, then imported that same artifact twice:
+  once with default chunked storage and once with `--rootfs-storage=flat`.
+- Both imports resolved to
+  `local/buildkite-spore@sha256:201f8788083bbddfd87ad1c5d4f247fe58b82f7d52e0a189cd5637898ceb05ee`
+  and produced the same rootfs BLAKE3
+  `ba57826b194e8e22620f90871074d0913edebdd756d53c89573faf014c4a656d`.
+- BuildKit output for the shared OCI artifact took 71.61s wall-clock, with
+  `sending tarball 18.8s`, and the artifact was 3.4G.
+
+| Policy | Import profile total | Import wall | `rootfs_cas_preload` | Cache after import |
+| --- | ---: | ---: | ---: | ---: |
+| `chunked` | 405.15s | 434.43s | 114.42s | 8.9G |
+| `flat` | 371.70s | 407.68s | skipped | 4.5G |
+
+The flat import saved 33.46s of profile time and 26.75s of wall time in this
+run. It removed the 114.42s CAS preload phase, but the second import was noisier
+in earlier phases (`layer_extract_staging`, `rootfs_blake3`, and
+`digest_cache_install` were slower), so the observed wall-clock win was smaller
+than the skipped phase cost. That argues for keeping the default unchanged until
+the duplicate-pass work below removes more variance and full-file rescans.
+
+Both imported refs passed a warm run smoke:
+
+```bash
+SPOREVM_ROOTFS_CACHE_DIR=/tmp/buildkite-sporevm-storage-policy-bench.pH7O2D/chunked-rootfs \
+  spore run --events=jsonl --image local/buildkite-spore:bench-chunked \
+    --pull=never -- /bin/true
+
+SPOREVM_ROOTFS_CACHE_DIR=/tmp/buildkite-sporevm-storage-policy-bench.pH7O2D/flat-rootfs \
+  spore run --events=jsonl --image local/buildkite-spore:bench-flat \
+    --pull=never -- /bin/true
+```
+
+Both emitted `ready` and `exit_code: 0` events under `hvf`.
+
+The flat save smoke paid the deferred upgrade cost separately:
+
+```bash
+SPOREVM_ROOTFS_CACHE_DIR=/tmp/buildkite-sporevm-storage-policy-bench.pH7O2D/flat-rootfs \
+  spore run --events=jsonl --image local/buildkite-spore:bench-flat \
+    --pull=never --save /tmp/buildkite-sporevm-storage-policy-bench.pH7O2D/flat-save.spore \
+    -- /bin/true
+```
+
+That save took 283.84s wall-clock, grew the flat rootfs cache from 4.5G to
+8.9G, produced a 644M spore, and wrote matching
+`rootfs.storage.index_digest =
+blake3:87832e9e5832e10d2b0da002cf81344f9151b5c783e76ac96bfd87e48cf752a0`
+into the upgraded metadata sidecar and saved manifest.
 
 ### Slice 4: Reduce Duplicate Passes
 
