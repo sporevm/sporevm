@@ -1594,16 +1594,7 @@ fn packRootfsStorageIndexed(
         return 0;
     }
 
-    // Chunk objects and the block index are derived data: they can be pruned
-    // from the cache once the flat digest-addressed artifact exists (see
-    // `spore system prune --rootfs --include-digest-artifacts`). Re-derive
-    // them from the flat artifact when missing so pack does not depend on the
-    // chunk store surviving a prune. The regenerated index must reproduce the
-    // manifest's index digest, or the artifact and descriptor disagree.
-    if (!(rootfs_cas.storageComplete(options.io, allocator, cache_root, storage) catch |err| return rootfsError(err))) {
-        const regenerated = rootfs_cas.preload(options.io, allocator, cache_root, rootfs.artifact.digest, storage.chunk_size) catch |err| return rootfsError(err);
-        if (!std.mem.eql(u8, regenerated.index_digest, storage.index_digest)) return error.BadManifest;
-    }
+    try ensureRootfsStorageMatchesArtifact(allocator, options, cache_root, rootfs, storage);
 
     const source_index_path = rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
     const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
@@ -1654,6 +1645,42 @@ fn packRootfsStorageIndexed(
         .object_bytes = object_bytes,
     });
     return payload_bytes;
+}
+
+fn ensureRootfsStorageMatchesArtifact(
+    allocator: std.mem.Allocator,
+    options: PackOptions,
+    cache_root: []const u8,
+    rootfs: spore.Rootfs,
+    storage: spore.RootfsStorage,
+) Error!void {
+    // storageComplete proves only that the descriptor-named index and chunk
+    // objects are locally present and well-formed. It does not prove that the
+    // descriptor was derived from this rootfs artifact digest, so regenerate the
+    // index from the flat artifact before emitting chunked rootfs storage.
+    const regenerated = rootfs_cas.preload(
+        options.io,
+        allocator,
+        cache_root,
+        rootfs.artifact.digest,
+        storage.chunk_size,
+    ) catch |err| switch (err) {
+        error.RootFSDigestCacheMiss => blk: {
+            rootfs_cas.materializeFlatFromChunks(options.io, allocator, cache_root, rootfs) catch |materialize_err| return rootfsError(materialize_err);
+            break :blk rootfs_cas.preload(
+                options.io,
+                allocator,
+                cache_root,
+                rootfs.artifact.digest,
+                storage.chunk_size,
+            ) catch |preload_err| return rootfsError(preload_err);
+        },
+        else => |preload_err| return rootfsError(preload_err),
+    };
+    defer allocator.free(regenerated.index_path);
+    defer allocator.free(regenerated.index_digest);
+
+    if (!std.mem.eql(u8, regenerated.index_digest, storage.index_digest)) return error.BadManifest;
 }
 
 fn unpackRootfsArtifact(allocator: std.mem.Allocator, options: UnpackOptions, rootfs_opt: ?spore.Rootfs) Error!RootfsMaterializeResult {
@@ -4715,6 +4742,52 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
         .child_id = "000000",
     }));
     try std.testing.expect(!try pathExistsNoSymlink(io, out_bad_dir));
+}
+
+test "pack rejects chunked rootfs storage derived from different artifact" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
+    const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
+    const rootfs_a_path = try pathZ(arena, "{s}/rootfs-a.ext4", .{root_dir});
+    const rootfs_b_path = try pathZ(arena, "{s}/rootfs-b.ext4", .{root_dir});
+
+    const ram = try arena.alloc(u8, 4096);
+    @memset(ram, 0x74);
+    const memory = try spore.saveMemory(arena, parent_dir, ram);
+
+    const rootfs_a = try arena.alloc(u8, 4096);
+    @memset(rootfs_a, 0);
+    rootfs_a[0] = 0xa1;
+    const rootfs_b = try arena.alloc(u8, 4096);
+    @memset(rootfs_b, 0);
+    rootfs_b[0] = 0xb2;
+    try writeFileAll(rootfs_a_path, rootfs_a);
+    try writeFileAll(rootfs_b_path, rootfs_b);
+
+    const artifact_a = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_a_path);
+    const artifact_b = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_b_path);
+    try std.testing.expectEqual(artifact_a.size, artifact_b.size);
+    try std.testing.expect(!std.mem.eql(u8, artifact_a.digest, artifact_b.digest));
+
+    const preload_b = try rootfs_cas.preload(io, arena, pack_cache_root, artifact_b.digest, 4096);
+    var manifest = testRootfsManifest(memory, ram.len, 73, artifact_a);
+    manifest.rootfs.?.storage = rootfs_cas.storageDescriptor(manifest.rootfs.?.device, preload_b);
+    try spore.saveManifest(arena, parent_dir, manifest);
+
+    try std.testing.expect(rootfs_cas.storageComplete(io, arena, pack_cache_root, manifest.rootfs.?.storage.?) catch |err| return rootfsError(err));
+    try std.testing.expectError(error.BadManifest, pack(arena, .{
+        .io = io,
+        .spore_dir = parent_dir,
+        .out_dir = bundle_dir,
+        .rootfs_cache_dir = pack_cache_root,
+    }));
 }
 
 test "metadata-only rootfs policy requires explicit prepared cache" {
