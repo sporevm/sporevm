@@ -111,6 +111,12 @@ pub const Decision = enum {
     }
 };
 
+pub const DnsForwardDecision = enum {
+    forward,
+    no_data,
+    refuse,
+};
+
 pub const Cidr = struct {
     network: [4]u8,
     prefix_len: u8,
@@ -607,6 +613,19 @@ pub const Runtime = struct {
         return learned;
     }
 
+    pub fn dnsForwardDecision(self: *const Runtime, packet: []const u8, name_offset: usize, qtype: u16, qclass: u16) DnsForwardDecision {
+        if (!self.restrictsPublicEgress()) return .forward;
+        const allowed_name = if (self.allowedHostIndexForDnsName(packet, name_offset) != null)
+            true
+        else allowed: {
+            var exact_matches: [max_exact_rules]usize = undefined;
+            break :allowed self.exactRuleIndicesForDnsName(packet, name_offset, &exact_matches) != 0;
+        };
+        if (!allowed_name) return .refuse;
+
+        return if (qtype == dns_type_a and qclass == dns_class_in) .forward else .no_data;
+    }
+
     pub fn boundServiceForDnsQuery(self: *const Runtime, packet: []const u8, name_offset: usize) ?*const BoundServiceConfig {
         for (self.bound_services[0..self.bound_service_count]) |*service| {
             if (service.guest_host.len != 0) {
@@ -641,6 +660,10 @@ pub const Runtime = struct {
 
     fn hasAllowRules(self: *const Runtime) bool {
         return self.allow_cidr_count != 0 or self.allow_host_count != 0 or self.exact_rule_count != 0;
+    }
+
+    fn restrictsPublicEgress(self: *const Runtime) bool {
+        return self.default_deny or self.hasAllowRules();
     }
 
     fn allowedHostIndexForDnsName(self: *const Runtime, packet: []const u8, offset: usize) ?usize {

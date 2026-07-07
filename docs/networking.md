@@ -33,10 +33,12 @@ gateway range. DNS answers cannot override that floor.
 
 With plain `--net`, public IPv4 TCP egress is allowed after the hard floor.
 Adding `--allow-cidr` or `--allow-host` restricts public egress to those CIDRs
-or DNS A answers learned through the SporeVM DNS proxy. Answer learning
-follows bounded in-order CNAME chains within a single response, so CDN-backed
-hosts whose A records are owned by the CNAME target still resolve into
-allowed IPs; records not chained from the queried name are ignored:
+or DNS A answers learned through the SporeVM DNS proxy. When egress is
+restricted, the proxy forwards only A/IN queries for configured `--allow-host`
+and `--allow-host-port` names; unrelated names are refused locally. Answer
+learning follows bounded in-order CNAME chains within a single response, so
+CDN-backed hosts whose A records are owned by the CNAME target still resolve
+into allowed IPs; records not chained from the queried name are ignored:
 
 ```bash
 spore run --net --allow-host example.com -- /bin/wget -qO- https://example.com
