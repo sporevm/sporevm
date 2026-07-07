@@ -114,16 +114,13 @@ Landed in this branch:
   blocks during final image emission.
 - Focused tests cover deterministic output, multi-group images, double-indirect
   files, hardlink ordering, merged-tree whiteouts/hardlinks, explicit writer
-  selection, gzip spooling for merged trees, and a small `materializeRootFS`
-  native import.
+  selection, gzip spooling for merged trees, staging-vs-native layer semantics,
+  and a small `materializeRootFS` native import.
 - A merged-tree tar fuzz target runs alongside the existing staging tar fuzz
   target.
 
 Still incomplete:
 
-- A single shared merge oracle for staging and native tree construction. The
-  native tree builder reuses tar parsing helpers and has targeted differential
-  semantics tests, but it is still a separate merge implementation.
 - Guest boot/read-back validation and native-vs-external semantic comparison.
 - Integrated planner/emitter fuzz targets beyond the merged-tree tar parser.
 - Buildkite-image benchmark evidence and default flip.
@@ -144,11 +141,12 @@ Definition of done:
 
 ### Slice 2: Merged Tree From Layer Tars
 
-Status: partial.
+Status: complete in this branch.
 
 `src/rootfs/tar.zig` now has a native metadata tree builder with source-backed
-regular files. It still needs broader differential/fuzz evidence before this
-slice should be treated as complete.
+regular files. A staging-vs-native fixture covers ownership, xattrs, whiteouts,
+hardlinks, symlinks, implicit dirs, and regular file content; the merged-tree
+fuzz target covers adversarial tar metadata.
 
 Definition of done:
 

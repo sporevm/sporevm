@@ -1987,6 +1987,127 @@ fn gzipTestBytes(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     return allocator.dupe(u8, writer.buffered());
 }
 
+const PathSet = std.StringHashMap(void);
+
+fn deinitPathSet(allocator: std.mem.Allocator, paths: *PathSet) void {
+    var it = paths.iterator();
+    while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+    paths.deinit();
+}
+
+fn collectStagedPaths(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Io.Dir,
+    rel: []const u8,
+    paths: *PathSet,
+) !void {
+    var dir = if (rel.len == 0)
+        root
+    else
+        try root.openDir(io, rel, .{
+            .iterate = true,
+            .access_sub_paths = true,
+            .follow_symlinks = false,
+        });
+    defer if (rel.len != 0) dir.close(io);
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        const child = if (rel.len == 0)
+            try allocator.dupe(u8, entry.name)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel, entry.name });
+        const result = paths.getOrPut(child) catch |err| {
+            allocator.free(child);
+            return err;
+        };
+        if (result.found_existing) {
+            allocator.free(child);
+            continue;
+        }
+        if (entry.kind == .directory) try collectStagedPaths(allocator, io, root, child, paths);
+    }
+}
+
+fn expectAttributesEqual(expected: []const xattrs_mod.Attribute, actual: []const xattrs_mod.Attribute) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |a, b| {
+        try std.testing.expectEqualStrings(a.name, b.name);
+        try std.testing.expectEqualSlices(u8, a.value, b.value);
+    }
+}
+
+fn expectMergedTreeMatchesStaging(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Io.Dir,
+    ownership: *const OwnershipMap,
+    xattrs: *const XattrMap,
+    tree: *const MergedTree,
+) !void {
+    var staged_paths = PathSet.init(allocator);
+    defer deinitPathSet(allocator, &staged_paths);
+    try collectStagedPaths(allocator, io, root, "", &staged_paths);
+
+    var file_inodes = std.AutoHashMap(u64, Io.File.INode).init(allocator);
+    defer file_inodes.deinit();
+
+    var tree_it = tree.entries.iterator();
+    while (tree_it.next()) |tree_entry| {
+        const rel = tree_entry.key_ptr.*;
+        const entry = tree_entry.value_ptr.*;
+        try std.testing.expect(staged_paths.contains(rel));
+        const stat = try root.statFile(io, rel, .{ .follow_symlinks = false });
+        if (ownership.get(rel)) |owner| {
+            try std.testing.expectEqual(owner.uid, entry.uid);
+            try std.testing.expectEqual(owner.gid, entry.gid);
+        }
+        if (xattrs.get(rel)) |attrs| {
+            try expectAttributesEqual(entry.xattrs, attrs.attrs);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), entry.xattrs.len);
+        }
+
+        switch (entry.kind) {
+            .directory => {
+                try std.testing.expectEqual(Io.File.Kind.directory, stat.kind);
+                if (permissionsToMode(stat.permissions)) |mode| {
+                    try std.testing.expectEqual(@as(u32, entry.mode), mode & 0o7777);
+                }
+            },
+            .file => {
+                try std.testing.expectEqual(Io.File.Kind.file, stat.kind);
+                const staged_data = try root.readFileAlloc(io, rel, allocator, .limited(max_content_bytes));
+                defer allocator.free(staged_data);
+                const tree_data = try readFileSourceAlloc(allocator, io, try tree.fileSource(entry.inode_id));
+                defer allocator.free(tree_data);
+                try std.testing.expectEqualSlices(u8, staged_data, tree_data);
+                if (permissionsToMode(stat.permissions)) |mode| {
+                    try std.testing.expectEqual(@as(u32, entry.mode), mode & 0o7777);
+                }
+                const mapped = try file_inodes.getOrPut(entry.inode_id);
+                if (mapped.found_existing) {
+                    try std.testing.expectEqual(mapped.value_ptr.*, stat.inode);
+                } else {
+                    mapped.value_ptr.* = stat.inode;
+                }
+            },
+            .symlink => {
+                try std.testing.expectEqual(Io.File.Kind.sym_link, stat.kind);
+                var target: [Io.Dir.max_path_bytes]u8 = undefined;
+                const len = try root.readLink(io, rel, &target);
+                try std.testing.expectEqualStrings(entry.symlink_target, target[0..len]);
+            },
+        }
+    }
+
+    var staged_it = staged_paths.iterator();
+    while (staged_it.next()) |path| {
+        try std.testing.expect(tree.entries.contains(path.key_ptr.*));
+    }
+}
+
 fn rewriteTestTarChecksum(header: []u8) void {
     @memset(header[148..156], ' ');
     var sum: u64 = 0;
@@ -2431,6 +2552,67 @@ test "merged tree spools gzip layers to file sources" {
     const data = try readFileSourceAlloc(allocator, io, source);
     defer allocator.free(data);
     try std.testing.expectEqualStrings("compressed\n", data);
+}
+
+test "merged tree matches staging layer semantics" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-merged-tree-staging-compare";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    const layer1 = tmp ++ "/layer1.tar";
+    const layer2 = tmp ++ "/layer2.tar";
+
+    var first = std.ArrayList(u8).empty;
+    defer first.deinit(allocator);
+    var global_pax = [_]u8{0} ** 512;
+    var global_pax_len: usize = 0;
+    global_pax_len += writePaxRecord(global_pax[global_pax_len..], "uid", "1000");
+    global_pax_len += writePaxRecord(global_pax[global_pax_len..], "gid", "1001");
+    try appendTestTarEntry(allocator, &first, "global-pax", 'g', global_pax[0..global_pax_len], null);
+    try appendTestTarEntry(allocator, &first, "etc", '5', "", null);
+    try appendTestTarEntry(allocator, &first, "etc/old", '0', "old\n", null);
+    try appendTestTarEntry(allocator, &first, "bin/tool", '0', "tool\n", null);
+    try appendTestTarEntry(allocator, &first, "bin/tool-link", '2', "", "tool");
+    const cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
+    var xattr_pax = [_]u8{0} ** 512;
+    const xattr_pax_len = writePaxRecord(&xattr_pax, "SCHILY.xattr.security.capability", &cap);
+    try appendTestTarEntry(allocator, &first, "pax", 'x', xattr_pax[0..xattr_pax_len], null);
+    try appendTestTarEntry(allocator, &first, "bin/ping", '0', "ping", null);
+    try finishTestTar(allocator, &first);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer1, .data = first.items });
+
+    var second = std.ArrayList(u8).empty;
+    defer second.deinit(allocator);
+    try appendTestTarEntry(allocator, &second, "etc/.wh.old", '0', "", null);
+    try appendTestTarEntry(allocator, &second, "target", '0', "same\n", null);
+    try appendTestTarEntry(allocator, &second, "alias", '1', "", "target");
+    try appendTestTarEntry(allocator, &second, "var/lib", '5', "", null);
+    try appendTestTarEntry(allocator, &second, "var/lib/state", '0', "state\n", null);
+    try finishTestTar(allocator, &second);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer2, .data = second.items });
+
+    const staging_path = tmp ++ "/staging";
+    var staging = try Io.Dir.cwd().createDirPathOpen(io, staging_path, .{
+        .open_options = .{ .iterate = true, .access_sub_paths = true },
+    });
+    defer staging.close(io);
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+    var xattrs = XattrMap.init(allocator);
+    defer xattrs_mod.deinit(allocator, &xattrs);
+    const layers = [_]LayerInput{
+        .{ .media_type = "application/vnd.oci.image.layer.v1.tar", .path = layer1 },
+        .{ .media_type = "application/vnd.oci.image.layer.v1.tar", .path = layer2 },
+    };
+    for (layers) |layer| {
+        try applyLayer(allocator, io, staging, layer.path, layer.media_type, &ownership, &xattrs, case_sensitive_test_options);
+    }
+
+    var tree = try buildMergedTree(allocator, io, &layers);
+    defer tree.deinit(allocator);
+    try expectMergedTreeMatchesStaging(allocator, io, staging, &ownership, &xattrs, &tree);
 }
 
 test "merged tree rejects symlink traversal" {
