@@ -115,13 +115,14 @@ Landed in this branch:
 - Focused tests cover deterministic output, multi-group images, double-indirect
   files, hardlink ordering, merged-tree whiteouts/hardlinks, explicit writer
   selection, gzip spooling for merged trees, staging-vs-native layer semantics,
-  and a small `materializeRootFS` native import.
+  native-vs-external debugfs read-back for materialized images, repeated native
+  determinism, and a small `materializeRootFS` native import.
 - A merged-tree tar fuzz target runs alongside the existing staging tar fuzz
   target.
 
 Still incomplete:
 
-- Guest boot/read-back validation and native-vs-external semantic comparison.
+- Guest boot smoke on representative images.
 - Integrated planner/emitter fuzz targets beyond the merged-tree tar parser.
 - Buildkite-image benchmark evidence and default flip.
 
@@ -157,11 +158,12 @@ Definition of done:
 
 ### Slice 3: Wire Direct Native Writer Into `materializeRootFS`
 
-Status: partial.
+Status: complete in this branch.
 
-The writer selector exists and native selection bypasses staging. This slice is
-not complete until native output has semantic comparison and guest read-back
-evidence.
+The writer selector exists and native selection bypasses staging. A focused
+debugfs read-back test now materializes the same layer through external and
+native writers, compares guest-visible file contents, and verifies repeated
+native imports produce the same BLAKE3.
 
 Definition of done:
 
