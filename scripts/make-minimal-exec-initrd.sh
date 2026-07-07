@@ -110,7 +110,7 @@ fi
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-minimal-initrd.XXXXXX")"
 trap 'rm -rf "${workdir}"' EXIT
 
-mkdir -p "${workdir}/root/bin" "${workdir}/root/dev" "${workdir}/root/proc" "${workdir}/root/run" "${workdir}/root/tmp"
+mkdir -p "${workdir}/root/bin" "${workdir}/root/dev" "${workdir}/root/proc" "${workdir}/root/run" "${workdir}/root/tmp" "${workdir}/root/usr/bin"
 
 source_dir="${REPO_ROOT}/guest/minimal-initrd"
 sources=(agent true false writeout sleeper finite counter nproc gencheck netcheck nslookup wget httpd flockcheck cgroupcheck toybox-sh)
@@ -302,6 +302,7 @@ chmod 1777 "${workdir}/root/tmp"
 for applet in echo cat env ls mkdir printf pwd rm sleep test touch uname; do
   [[ -e "${workdir}/root/bin/${applet}" ]] || ln -s toybox "${workdir}/root/bin/${applet}"
 done
+ln -s ../../bin/env "${workdir}/root/usr/bin/env"
 
 mkdir -p "$(dirname "${out}")"
 (

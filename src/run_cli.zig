@@ -84,6 +84,13 @@ fn runParsed(
         error.InjectedFileTooLarge => failRunSetup("spore run: injected files exceed 16MiB total", .{}),
         else => return err,
     };
+    var env_diagnostic = run_mod.GuestEnvResolveDiagnostic{};
+    const guest_env = run_mod.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| switch (err) {
+        error.MissingHostEnvironment => failRunSetup("spore run: --env {s} is not set in the host environment", .{env_diagnostic.missing_key orelse "unknown"}),
+        error.RunEnvTooLong => failRunSetup("spore run: --env entry exceeds 255 bytes", .{}),
+        error.RunEnvCountUnsupported => failRunSetup("spore run: too many --env entries", .{}),
+        else => return err,
+    };
     if (parsed.from_spore_dir) |spore_dir| {
         if (parsed.network_requested or parsed.network_policy.hasRules()) {
             failRunSetup("spore run: --from uses the saved network policy; omit --net and network flags", .{});
@@ -110,6 +117,7 @@ fn runParsed(
             .attach_session_id = spore.default_session_id,
             .interactive = parsed.interactive,
             .tty = parsed.tty,
+            .guest_env = guest_env,
             .vcpus = parsed.shared.vcpus,
             .guest_port = parsed.shared.guest_port,
             .timeout_ms = parsed.shared.timeout_ms,
@@ -151,6 +159,7 @@ fn runParsed(
         .image_ref = parsed.image_ref,
         .image_pull_policy = parsed.pull_policy,
         .command = command,
+        .guest_env = guest_env,
         .injected_files = injected_files,
         .interactive = parsed.interactive,
         .tty = parsed.tty,
