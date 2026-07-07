@@ -344,6 +344,8 @@ into the upgraded metadata sidecar and saved manifest.
 
 ### Slice 4: Reduce Duplicate Passes
 
+Status: implemented in this branch.
+
 After flat import is measured, attack the next bottleneck with evidence. Likely
 candidates are duplicate full-file hashing between `rootfs_blake3`,
 `digest_cache_install`, and `rootfs_cas.preload`, and expensive ext4
@@ -352,6 +354,28 @@ finalization on large trees.
 This slice should not start with a broad abstraction. It should start by adding
 or improving phase evidence so each optimization removes one measured full pass
 or one measured tool invocation.
+
+Implementation notes:
+
+- Added a digest-cache fast path for cache-owned generated rootfs artifacts:
+  `installExpectedPathAfterSourceVerifiedByHardlink`. It is only used when
+  SporeVM has just hashed an ext4 output under its configured rootfs cache,
+  the private materializer marked the output as cache-owned, and SporeVM built
+  the expected artifact descriptor.
+- The fast path proves source and destination shape/size, installs the
+  digest-addressed cache entry by hardlink, and avoids re-hashing the same ext4
+  during `digest_cache_install`.
+- If the source is not a regular non-symlink file, the digest path already
+  exists, or the hardlink cannot be created, materialization falls back to the
+  existing verified install path.
+- A profiled 64MiB `import-tar --rootfs-storage=flat` smoke at
+  `/tmp/sporevm-rootfs-fastpath.JJvz8L` reported
+  `rootfs_blake3 ms=3400` and `digest_cache_install ms=1`, proving the duplicate
+  digest-cache hash was removed for the generated-hardlink path.
+- The next measured target is still `rootfs_cas.preload`, especially its
+  `source_verify_ms` and `chunk_scan_ms` sub-phases. The Buildkite benchmark
+  measured 114.42s in CAS preload for chunked import, including 53.11s source
+  verification and 61.15s chunk scanning.
 
 ## Verification
 

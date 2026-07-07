@@ -137,6 +137,7 @@ const BuildOptions = struct {
     debugfs: []const u8,
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: ?[]const u8 = null,
+    cache_owned_output: bool = false,
 };
 
 pub const ResolvedImage = struct {
@@ -820,6 +821,7 @@ pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, req
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
         .rootfs_storage = request.rootfs_storage,
+        .cache_owned_output = true,
     });
     try Io.Dir.renameAbsolute(temp_rootfs_path, rootfs_path, init.io);
     try Io.Dir.renameAbsolute(temp_metadata_path, metadata_path, init.io);
@@ -879,6 +881,7 @@ pub fn importTar(init: std.process.Init, allocator: std.mem.Allocator, request: 
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
         .rootfs_storage = request.rootfs_storage,
+        .cache_owned_output = true,
     });
     try Io.Dir.renameAbsolute(temp_rootfs_path, rootfs_path, init.io);
     try Io.Dir.renameAbsolute(temp_metadata_path, metadata_path, init.io);
@@ -963,6 +966,7 @@ const LayoutBuildOptions = struct {
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: []const u8,
     rootfs_storage: RootfsStoragePolicy = .chunked,
+    cache_owned_output: bool = false,
 };
 
 const TarBuildOptions = struct {
@@ -978,6 +982,7 @@ const TarBuildOptions = struct {
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: []const u8,
     rootfs_storage: RootfsStoragePolicy = .chunked,
+    cache_owned_output: bool = false,
 };
 
 const MaterializeLayer = struct {
@@ -1002,6 +1007,7 @@ const MaterializeOptions = struct {
     temp_dir: []const u8,
     profile: RootfsBuildProfile,
     rootfs_storage: RootfsStoragePolicy = .chunked,
+    cache_owned_output: bool = false,
 };
 
 fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: BuildOptions) !BuildResult {
@@ -1079,6 +1085,7 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
         .temp_dir = materialize_temp.path,
         .profile = profile,
         .rootfs_storage = .chunked,
+        .cache_owned_output = opts.cache_owned_output,
     });
     const cleanup_start = profile.start();
     materialize_temp.deinit(init.io);
@@ -1138,6 +1145,7 @@ fn buildRootFSFromLayout(init: std.process.Init, allocator: std.mem.Allocator, o
         .temp_dir = materialize_temp.path,
         .profile = profile,
         .rootfs_storage = opts.rootfs_storage,
+        .cache_owned_output = opts.cache_owned_output,
     });
     const cleanup_start = profile.start();
     materialize_temp.deinit(init.io);
@@ -1187,6 +1195,7 @@ fn buildRootFSFromTar(init: std.process.Init, allocator: std.mem.Allocator, opts
         .temp_dir = materialize_temp.path,
         .profile = profile,
         .rootfs_storage = opts.rootfs_storage,
+        .cache_owned_output = opts.cache_owned_output,
     });
     const cleanup_start = profile.start();
     materialize_temp.deinit(init.io);
@@ -1326,10 +1335,16 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
         .format = spore.rootfs_artifact_format_ext4,
     };
     const cache_start = opts.profile.start();
-    _ = try rootfs_cache.installExpectedPathAfterSourceVerified(init.io, allocator, cache_root, opts.output, artifact, .{
-        .source_must_not_be_symlink = false,
-        .allow_hardlink = true,
-    });
+    const fast_install = if (trustedDigestHardlinkEligible(opts.cache_owned_output, opts.output, cache_root))
+        try rootfs_cache.installExpectedPathAfterSourceVerifiedByHardlink(init.io, allocator, cache_root, opts.output, artifact)
+    else
+        null;
+    if (fast_install) |_| {} else {
+        _ = try rootfs_cache.installExpectedPathAfterSourceVerified(init.io, allocator, cache_root, opts.output, artifact, .{
+            .source_must_not_be_symlink = false,
+            .allow_hardlink = true,
+        });
+    }
     opts.profile.phase("digest_cache_install", cache_start);
     const rootfs_storage: ?spore.RootfsStorage = switch (opts.rootfs_storage) {
         .chunked => blk: {
@@ -1369,6 +1384,17 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     opts.profile.phase("metadata_write", metadata_start);
 
     return .{ .rootfs_blake3 = rootfs_blake3, .rootfs_storage = rootfs_storage };
+}
+
+fn trustedDigestHardlinkEligible(cache_owned_output: bool, path: []const u8, cache_root: []const u8) bool {
+    return cache_owned_output and cacheOwnedPath(path, cache_root);
+}
+
+fn cacheOwnedPath(path: []const u8, cache_root: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, cache_root)) return false;
+    if (path.len == cache_root.len) return true;
+    if (cache_root.len > 0 and cache_root[cache_root.len - 1] == std.fs.path.sep) return true;
+    return path[cache_root.len] == std.fs.path.sep;
 }
 
 fn monotonicMs() u64 {
@@ -1778,13 +1804,16 @@ pub fn buildCachedImageRootfs(
     defer Io.Dir.cwd().deleteFile(init.io, temp_metadata_path) catch {};
 
     std.log.debug("spore rootfs: building cached rootfs for {s}", .{resolved.ref});
-    _ = try build(init, allocator, .{
+    _ = try buildRootFS(init, allocator, .{
         .ref = resolved.ref,
         .output = temp_rootfs_path,
         .metadata = temp_metadata_path,
         .platform = resolved.platform,
+        .mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, null, .mkfs),
+        .debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, null, .debugfs),
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
+        .cache_owned_output = true,
     });
     try renameCachePath(init.io, temp_rootfs_path, rootfs_path);
     try renameCachePath(init.io, temp_metadata_path, metadata_path);
@@ -2148,6 +2177,12 @@ test "rootfs build profile env is opt-in" {
     try std.testing.expect(!rootfsBuildProfileEnabled(null));
     try std.testing.expect(!rootfsBuildProfileEnabled(""));
     try std.testing.expect(rootfsBuildProfileEnabled("1"));
+}
+
+test "trusted digest hardlink requires internal cache output ownership" {
+    try std.testing.expect(!trustedDigestHardlinkEligible(false, "/tmp/sporevm-rootfs/user.ext4", "/tmp/sporevm-rootfs"));
+    try std.testing.expect(trustedDigestHardlinkEligible(true, "/tmp/sporevm-rootfs/.image.ext4.tmp", "/tmp/sporevm-rootfs"));
+    try std.testing.expect(!trustedDigestHardlinkEligible(true, "/tmp/sporevm-rootfs-sibling/.image.ext4.tmp", "/tmp/sporevm-rootfs"));
 }
 
 test "rootfs metadata omits absent rootfs storage" {
