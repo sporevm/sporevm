@@ -1,4 +1,5 @@
 const std = @import("std");
+const fetch_policy = @import("../host_fetch_policy.zig");
 const oci = @import("oci.zig");
 
 const Io = std.Io;
@@ -190,16 +191,31 @@ fn httpGetToFile(
     path: []const u8,
     max_body_bytes: u64,
 ) !HTTPGetResult {
+    try validateRegistryFetchUrl(client.io, url);
     var file = try Io.Dir.cwd().createFile(io, path, .{});
+    errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
     defer file.close(io);
     var buffer: [64 * 1024]u8 = undefined;
     var file_writer: Io.File.Writer = .initStreaming(file, io, &buffer);
-    const result = try httpGetToWriter(allocator, client, url, accept, bearer_token, &file_writer.interface, max_body_bytes);
+    const result = try httpGetToWriterAfterPolicy(allocator, client, url, accept, bearer_token, &file_writer.interface, max_body_bytes);
     try file_writer.interface.flush();
     return result;
 }
 
 fn httpGetToWriter(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    url: []const u8,
+    accept: []const u8,
+    bearer_token: ?[]const u8,
+    writer: *Io.Writer,
+    max_body_bytes: u64,
+) !HTTPGetResult {
+    try validateRegistryFetchUrl(client.io, url);
+    return httpGetToWriterAfterPolicy(allocator, client, url, accept, bearer_token, writer, max_body_bytes);
+}
+
+fn httpGetToWriterAfterPolicy(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     url: []const u8,
@@ -224,6 +240,7 @@ fn httpGetToWriter(
         .headers = request_headers,
         .extra_headers = extra_headers,
         .redirect_behavior = .unhandled,
+        .keep_alive = false,
     });
     defer req.deinit();
     try req.sendBodiless();
@@ -242,6 +259,10 @@ fn httpGetToWriter(
         try streamRemainingLimited(body, writer, max_body_bytes, &response);
     }
     return .{ .status = response.head.status, .auth_header = auth, .location = location, .content_digest = content_digest };
+}
+
+fn validateRegistryFetchUrl(io: Io, url: []const u8) !void {
+    try fetch_policy.validateUrl(io, url, .{ .require_https = true });
 }
 
 fn fetchBearerToken(allocator: std.mem.Allocator, client: *std.http.Client, resource_url: []const u8, auth_header: []const u8) ![]const u8 {
@@ -455,6 +476,45 @@ test "redirect resolution tracks cross-origin hops" {
     );
     defer allocator.free(relative);
     try std.testing.expect(try sameOrigin("https://ghcr.io/v2/a", relative));
+}
+
+test "registry redirect target policy rejects internal egress" {
+    const allocator = std.testing.allocator;
+
+    const loopback = try resolveRedirectUrl(
+        allocator,
+        "https://ghcr.io/v2/buildkite/base/blobs/sha256:abc",
+        "https://127.0.0.1/blob",
+    );
+    defer allocator.free(loopback);
+    try std.testing.expectError(error.UnsafeRemoteFetchTarget, validateRegistryFetchUrl(std.testing.io, loopback));
+
+    const link_local = try resolveRedirectUrl(
+        allocator,
+        "https://ghcr.io/v2/buildkite/base/blobs/sha256:abc",
+        "https://169.254.169.254/latest/meta-data/",
+    );
+    defer allocator.free(link_local);
+    try std.testing.expectError(error.UnsafeRemoteFetchTarget, validateRegistryFetchUrl(std.testing.io, link_local));
+
+    const private = try resolveRedirectUrl(
+        allocator,
+        "https://ghcr.io/v2/buildkite/base/blobs/sha256:abc",
+        "https://10.0.0.10/blob",
+    );
+    defer allocator.free(private);
+    try std.testing.expectError(error.UnsafeRemoteFetchTarget, validateRegistryFetchUrl(std.testing.io, private));
+}
+
+test "registry redirect target policy requires https" {
+    const allocator = std.testing.allocator;
+    const downgraded = try resolveRedirectUrl(
+        allocator,
+        "https://ghcr.io/v2/buildkite/base/blobs/sha256:abc",
+        "http://1.1.1.1/blob",
+    );
+    defer allocator.free(downgraded);
+    try std.testing.expectError(error.UnsupportedRemoteFetchScheme, validateRegistryFetchUrl(std.testing.io, downgraded));
 }
 
 test "token realm validation rejects cross-origin realms" {

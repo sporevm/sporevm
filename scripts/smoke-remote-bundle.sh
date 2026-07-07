@@ -24,9 +24,11 @@ it can validate local changes before they are committed without copying stray
 untracked files. Pass `--include-untracked` only when the local untracked files
 are intentionally part of the smoke. Destinations fetch directly from S3 by
 default; pass `--source-peer-ip IP` to have destinations use digest-pinned
-`spore pull` against a temporary HTTP seed on the source host instead. Pass
-`--cache-dir` and `--dest-repeat N` to prove repeated restores on one host can
-reuse a host-local bundle cache without refetching from S3 or the source peer.
+`spore pull` against a temporary HTTP seed on the source host instead. The HTTP
+peer IP must be public; loopback, link-local, private, multicast, and reserved
+targets are rejected by `spore pull`. Pass `--cache-dir` and `--dest-repeat N`
+to prove repeated restores on one host can reuse a host-local bundle cache
+without refetching from S3 or the source peer.
 Each destination also corrupts a fetched bundle copy and asserts `spore unpack`
 rejects it before the normal restore path is counted successful. Pass
 `--tree-relay INSTANCE_ID:IP` one or more times to make relays pull from the
@@ -52,7 +54,7 @@ Options:
   --resume-seconds N          seconds to let resumed VM tick (default: 5)
   --dest-repeat N             restore each destination N times (default: 1)
   --cache-dir DIR             remote host-local bundle cache directory
-  --source-peer-ip IP         source host IP destinations use for HTTP bundle pulls
+  --source-peer-ip IP         public source host IP destinations use for HTTP bundle pulls
   --source-peer-port N        source host HTTP port (default: 20000)
   --writable-rootfs           capture a rootfs-backed writable disk spore instead of
                               the low-level ticker initrd spore

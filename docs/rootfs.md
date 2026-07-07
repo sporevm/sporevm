@@ -208,7 +208,8 @@ s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out child.spore` and
 `spore pull http://peer:20000/spore.bundle@sha256:<bundle_digest> --child 42
 --out child.spore`, first verify the remote bundle identity, then install any
 bundled exact rootfs bytes or chunked rootfs CAS bytes through the same verified
-materialization boundary. Use
+materialization boundary. HTTP peer hosts must resolve only to public IP
+addresses before fetch. Use
 `SPOREVM_ROOTFS_CACHE_DIR` to choose the destination rootfs cache and
 `SPOREVM_BUNDLE_CACHE_DIR` to choose the node-local bundle and memory chunk
 caches used by pull. Pull JSON reports `rootfs.cache.hit_count`,

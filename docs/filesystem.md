@@ -126,7 +126,9 @@ layouts, but exact block replay remains authority.
 resume. They verify bundle identity, selected manifests, RAM chunks, rootfs
 artifacts or CAS bytes, and disk objects before writing a resumable spore.
 Direct S3 and digest-pinned HTTP peer pulls are byte sources only; they never
-become restore authority.
+become restore authority. HTTP peer hosts must resolve only to public IP
+addresses; loopback, link-local, private, multicast, and reserved targets are
+rejected before a GET is issued.
 
 Metadata-only exact-rootfs bundles are an explicit prepared-cache opt-out:
 `--rootfs=metadata-only` on pack and `--allow-metadata-only-rootfs` on
