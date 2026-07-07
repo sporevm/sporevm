@@ -337,14 +337,25 @@ fn dnsReply(frame: []const u8, out: *[max_frame_len]u8, dns_forwarder: DnsForwar
 
     var forward_buf: [max_dns_payload_len]u8 = undefined;
     var response_buf: [max_dns_payload_len]u8 = undefined;
+    const question = dnsQuestionTypeClass(request.payload, request.question_end) orelse return null;
     if (policy) |policy_runtime| {
         if (policy_runtime.boundServiceForDnsQuery(request.payload, dns_header_len)) |_| {
-            const question = dnsQuestionTypeClass(request.payload, request.question_end) orelse return null;
             const dns_payload = if (question.qtype == dns_type_a and question.qclass == dns_class_in)
                 buildBoundServiceDnsResponse(request.payload, request.question_end, &response_buf)
             else
                 buildDnsNoData(request.payload, request.question_end, &response_buf);
             return buildDnsUdpFrame(request, dns_payload, out);
+        }
+        switch (policy_runtime.dnsForwardDecision(request.payload, dns_header_len, question.qtype, question.qclass)) {
+            .forward => {},
+            .no_data => {
+                const dns_payload = buildDnsNoData(request.payload, request.question_end, &response_buf);
+                return buildDnsUdpFrame(request, dns_payload, out);
+            },
+            .refuse => {
+                const dns_payload = buildDnsRefused(request.payload, request.question_end, &response_buf);
+                return buildDnsUdpFrame(request, dns_payload, out);
+            },
         }
     }
     const forwarded = dns_forwarder.forward(request.payload, &forward_buf) catch null;
@@ -466,6 +477,10 @@ fn validDnsResponse(query: []const u8, response: []const u8) bool {
 
 fn buildDnsServfail(query: []const u8, question_end: usize, out: *[max_dns_payload_len]u8) []const u8 {
     return buildDnsEmptyResponse(query, question_end, out, 2);
+}
+
+fn buildDnsRefused(query: []const u8, question_end: usize, out: *[max_dns_payload_len]u8) []const u8 {
+    return buildDnsEmptyResponse(query, question_end, out, 5);
 }
 
 fn buildDnsNoData(query: []const u8, question_end: usize, out: *[max_dns_payload_len]u8) []const u8 {
@@ -700,6 +715,16 @@ fn testDnsFrame(dns_payload: []const u8, out: *[max_frame_len]u8) []const u8 {
     return frame;
 }
 
+fn expectDnsRcode(reply: []const u8, expected: u16) !void {
+    const udp = reply[ethernet_header_len + ipv4_header_min_len ..];
+    const dns = udp[udp_header_len..];
+    const flags = std.mem.readInt(u16, dns[2..4], .big);
+    try std.testing.expect((flags & 0x8000) != 0);
+    try std.testing.expectEqual(expected, flags & 0x000f);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, dns[4..6], .big));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, dns[6..8], .big));
+}
+
 test "spore-netd answers ARP for the gateway" {
     const sender_mac: [6]u8 = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee };
     const sender_ip: [4]u8 = .{ 100, 96, 0, 2 };
@@ -820,6 +845,96 @@ test "spore-netd forwards ordinary DNS when a bound service exists" {
     var out: [max_frame_len]u8 = undefined;
     _ = frameReply(frame, &out, forwarder.forwarder(), &policy).?;
     try std.testing.expectEqual(query.len, forwarder.query_len);
+}
+
+test "spore-netd allow-host policy forwards only matching DNS names" {
+    var config = spore_net_policy.Config{};
+    try config.addAllowHost("example.com");
+    var policy = try spore_net_policy.Runtime.init(config);
+
+    var allowed_query_buf: [512]u8 = undefined;
+    const allowed_query = testDnsQuery(0x9191, "example.com", &allowed_query_buf);
+    var allowed_response_buf: [512]u8 = undefined;
+    const allowed_response = testDnsResponse(allowed_query, &allowed_response_buf);
+    var allowed_frame_buf: [max_frame_len]u8 = undefined;
+    const allowed_frame = testDnsFrame(allowed_query, &allowed_frame_buf);
+    var allowed_forwarder = TestDnsForwarder{ .response = allowed_response };
+    var out: [max_frame_len]u8 = undefined;
+    _ = frameReply(allowed_frame, &out, allowed_forwarder.forwarder(), &policy).?;
+    try std.testing.expectEqual(allowed_query.len, allowed_forwarder.query_len);
+
+    var aaaa_query_buf: [512]u8 = undefined;
+    const aaaa_query = testDnsQuery(0x9392, "example.com", &aaaa_query_buf);
+    std.mem.writeInt(u16, aaaa_query_buf[aaaa_query.len - 4 ..][0..2], dns_type_aaaa, .big);
+    var aaaa_frame_buf: [max_frame_len]u8 = undefined;
+    const aaaa_frame = testDnsFrame(aaaa_query, &aaaa_frame_buf);
+    var aaaa_forwarder = TestDnsForwarder{ .fail = true };
+    const aaaa_reply = frameReply(aaaa_frame, &out, aaaa_forwarder.forwarder(), &policy).?;
+    try std.testing.expectEqual(@as(usize, 0), aaaa_forwarder.query_len);
+    try expectDnsRcode(aaaa_reply, 0);
+
+    var denied_query_buf: [512]u8 = undefined;
+    const denied_query = testDnsQuery(0x9292, "leak.attacker.example", &denied_query_buf);
+    var denied_frame_buf: [max_frame_len]u8 = undefined;
+    const denied_frame = testDnsFrame(denied_query, &denied_frame_buf);
+    var denied_forwarder = TestDnsForwarder{ .fail = true };
+    const denied_reply = frameReply(denied_frame, &out, denied_forwarder.forwarder(), &policy).?;
+
+    try std.testing.expectEqual(@as(usize, 0), denied_forwarder.query_len);
+    try expectDnsRcode(denied_reply, 5);
+}
+
+test "spore-netd exact host-port policy forwards only matching DNS names" {
+    var config = spore_net_policy.Config{};
+    try config.addExactHostPorts("github.com", &.{443});
+    var policy = try spore_net_policy.Runtime.init(config);
+
+    var allowed_query_buf: [512]u8 = undefined;
+    const allowed_query = testDnsQuery(0x9393, "github.com", &allowed_query_buf);
+    var allowed_response_buf: [512]u8 = undefined;
+    const allowed_response = testDnsResponse(allowed_query, &allowed_response_buf);
+    var allowed_frame_buf: [max_frame_len]u8 = undefined;
+    const allowed_frame = testDnsFrame(allowed_query, &allowed_frame_buf);
+    var allowed_forwarder = TestDnsForwarder{ .response = allowed_response };
+    var out: [max_frame_len]u8 = undefined;
+    _ = frameReply(allowed_frame, &out, allowed_forwarder.forwarder(), &policy).?;
+    try std.testing.expectEqual(allowed_query.len, allowed_forwarder.query_len);
+
+    var denied_query_buf: [512]u8 = undefined;
+    const denied_query = testDnsQuery(0x9494, "api.github.com", &denied_query_buf);
+    var denied_frame_buf: [max_frame_len]u8 = undefined;
+    const denied_frame = testDnsFrame(denied_query, &denied_frame_buf);
+    var denied_forwarder = TestDnsForwarder{ .fail = true };
+    const denied_reply = frameReply(denied_frame, &out, denied_forwarder.forwarder(), &policy).?;
+
+    try std.testing.expectEqual(@as(usize, 0), denied_forwarder.query_len);
+    try expectDnsRcode(denied_reply, 5);
+}
+
+test "spore-netd restricted policies refuse DNS names that cannot open egress" {
+    var deny_config = spore_net_policy.Config{};
+    try deny_config.addNetworkPolicy(.{});
+    var deny_policy = try spore_net_policy.Runtime.init(deny_config);
+
+    var deny_query_buf: [512]u8 = undefined;
+    const deny_query = testDnsQuery(0x9595, "example.com", &deny_query_buf);
+    var deny_frame_buf: [max_frame_len]u8 = undefined;
+    const deny_frame = testDnsFrame(deny_query, &deny_frame_buf);
+    var deny_forwarder = TestDnsForwarder{ .fail = true };
+    var out: [max_frame_len]u8 = undefined;
+    const deny_reply = frameReply(deny_frame, &out, deny_forwarder.forwarder(), &deny_policy).?;
+
+    try std.testing.expectEqual(@as(usize, 0), deny_forwarder.query_len);
+    try expectDnsRcode(deny_reply, 5);
+
+    var cidr_config = spore_net_policy.Config{};
+    try cidr_config.addAllowCidr("93.184.216.0/24");
+    var cidr_policy = try spore_net_policy.Runtime.init(cidr_config);
+    var cidr_forwarder = TestDnsForwarder{ .fail = true };
+    const cidr_reply = frameReply(deny_frame, &out, cidr_forwarder.forwarder(), &cidr_policy).?;
+
+    try std.testing.expectEqual(@as(usize, 0), cidr_forwarder.query_len);
+    try expectDnsRcode(cidr_reply, 5);
 }
 
 test "spore-netd returns DNS SERVFAIL when host forwarding fails" {
