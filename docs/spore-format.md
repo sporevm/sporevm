@@ -95,7 +95,7 @@ that artifact in `rootfs.index.json` with an explicit `exact-bytes` policy by
 default. `spore pack --children ... --rootfs=metadata-only` records the same
 digest and size with `metadata-only` policy and omits the ext4 file; materialized
 unpack and pull accept that policy only with `--allow-metadata-only-rootfs` and
-a verified hit in the selected rootfs digest cache.
+a trusted shape-compatible hit in the selected rootfs digest cache.
 
 If `manifest.json` records `rootfs.storage.kind:
 "chunked-ext4-rootfs-v0"`, indexed bundles carry the exact

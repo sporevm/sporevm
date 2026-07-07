@@ -1545,9 +1545,8 @@ fn packRootfsIndexed(
     const digest_copy = allocator.dupe(u8, rootfs.artifact.digest) catch return error.OutOfMemory;
     seen_artifacts.put(digest_copy, {}) catch return error.OutOfMemory;
 
-    const source_path = rootfs_cache.digestPath(allocator, cache_root, rootfs.artifact.digest) catch |err| return rootfsError(err);
     if (options.rootfs_policy == .metadata_only) {
-        const fd = rootfs_cache.openVerifiedFromCache(options.io, allocator, cache_root, .{ .device = rootfs.device, .artifact = rootfs.artifact }) catch |err| return rootfsError(err);
+        const fd = rootfs_cache.openTrustedFromCache(options.io, allocator, cache_root, .{ .device = rootfs.device, .artifact = rootfs.artifact }) catch |err| return rootfsError(err);
         _ = std.c.close(fd);
         try entries.append(.{
             .digest = digest_copy,
@@ -1559,6 +1558,7 @@ fn packRootfsIndexed(
         return 0;
     }
 
+    const source_path = rootfs_cache.digestPath(allocator, cache_root, rootfs.artifact.digest) catch |err| return rootfsError(err);
     const rel_path = try rootfsArtifactRelPath(allocator, rootfs.artifact);
     const dest_path = try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rel_path });
     rootfs_cache.copyVerifiedPath(options.io, allocator, source_path, dest_path, rootfs.artifact, .{
@@ -1729,7 +1729,7 @@ fn unpackRootfsArtifactIndexed(
     if (!std.mem.eql(u8, entry.format, rootfs.artifact.format)) return error.BadManifest;
     if (std.mem.eql(u8, entry.policy, rootfs_policy_metadata_only)) {
         if (!options.allow_metadata_only_rootfs) return error.BadManifest;
-        const fd = rootfs_cache.openVerifiedFromCache(options.io, allocator, cache_root, rootfs) catch |err| return rootfsError(err);
+        const fd = rootfs_cache.openTrustedFromCache(options.io, allocator, cache_root, rootfs) catch |err| return rootfsError(err);
         _ = std.c.close(fd);
         return .{
             .artifact_count = 1,
@@ -4817,7 +4817,10 @@ test "metadata-only rootfs policy requires explicit prepared cache" {
     const ram = try arena.alloc(u8, 4096);
     @memset(ram, 0x45);
     const memory = try spore.saveMemory(arena, parent_dir, ram);
-    try writeFileAll(rootfs_source_path, "rootfs metadata only bytes");
+    const rootfs_bytes = "rootfs metadata only bytes";
+    const trusted_rootfs_bytes = "ROOTFS METADATA ONLY BYTES";
+    try std.testing.expectEqual(rootfs_bytes.len, trusted_rootfs_bytes.len);
+    try writeFileAll(rootfs_source_path, rootfs_bytes);
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
     try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 61, artifact));
     const single_pack = try pack(arena, .{
@@ -4891,7 +4894,11 @@ test "metadata-only rootfs policy requires explicit prepared cache" {
     }));
     try std.testing.expect(!try pathExistsNoSymlink(io, out_pull_missing_dir));
 
-    try rootfs_cache.installExpectedPath(io, arena, unpack_cache_root, rootfs_source_path, artifact, .{});
+    const trusted_cache_path = try rootfs_cache.digestPath(arena, unpack_cache_root, artifact.digest);
+    const trusted_cache_parent = std.fs.path.dirname(trusted_cache_path) orelse return error.BadManifest;
+    try ensureDirPath(io, trusted_cache_parent);
+    const trusted_cache_path_z = try pathZ(arena, "{s}", .{trusted_cache_path});
+    try writeFileAll(trusted_cache_path_z, trusted_rootfs_bytes);
     const unpacked = try unpack(arena, .{
         .io = io,
         .bundle_dir = bundle_dir,
