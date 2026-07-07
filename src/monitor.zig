@@ -38,6 +38,7 @@ const monitor_usage =
     \\  --image REF             Original OCI image ref for metadata
     \\  --resume DIR            Resume from a spore directory
     \\  --net                   Experimental SporeVM-managed networking
+    \\  --default-action deny   With --net, deny public egress unless allowed
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
     \\  --allow-host-port HOST:PORT
@@ -1364,6 +1365,13 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
             opts.resume_dir = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--net")) {
             opts.network = .spore;
+        } else if (std.mem.eql(u8, args[i], "--default-action")) {
+            const raw = takeValue(args, &i, args[i]);
+            if (!std.mem.eql(u8, raw, spore.network_default_deny)) {
+                std.debug.print("spore monitor: invalid --default-action {s}\n", .{raw});
+                std.process.exit(2);
+            }
+            opts.network_policy.default_deny = true;
         } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
             const raw = takeValue(args, &i, args[i]);
             opts.network_policy.addAllowCidr(raw) catch |err| {
@@ -1489,6 +1497,8 @@ test "monitor parser accepts network allow policy" {
     const opts = try parseMonitorArgs(&.{
         "bench-1",
         "--net",
+        "--default-action",
+        "deny",
         "--allow-cidr",
         "93.184.216.34/32",
         "--allow-host",
@@ -1498,6 +1508,7 @@ test "monitor parser accepts network allow policy" {
     });
 
     try std.testing.expectEqual(run.NetworkMode.spore, opts.network);
+    try std.testing.expect(opts.network_policy.default_deny);
     try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_cidr_count);
     try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
     try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
