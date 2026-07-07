@@ -13,6 +13,7 @@ const contracts = @import("contracts.zig");
 const chunklib = @import("chunk.zig");
 const cow_disk = @import("cow_disk.zig");
 const disk_layer = @import("disk_layer.zig");
+const fetch_policy = @import("host_fetch_policy.zig");
 const gicv3 = @import("gicv3.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -2643,6 +2644,7 @@ fn httpGetToFile(
     path: []const u8,
 ) Error!u64 {
     const uri = std.Uri.parse(url) catch return error.BadManifest;
+    validateHttpFetchTarget(client.io, uri) catch |err| return err;
     var file = Io.Dir.cwd().createFile(io, path, .{}) catch return error.IoFailed;
     errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
     defer file.close(io);
@@ -2653,6 +2655,7 @@ fn httpGetToFile(
         .headers = .{ .accept_encoding = .omit },
         .extra_headers = &.{std.http.Header{ .name = "accept", .value = "application/octet-stream" }},
         .redirect_behavior = .unhandled,
+        .keep_alive = false,
     }) catch return error.IoFailed;
     defer req.deinit();
     req.sendBodiless() catch return error.IoFailed;
@@ -2674,6 +2677,15 @@ fn httpGetToFile(
     }
     file_writer.interface.flush() catch return error.IoFailed;
     return copied;
+}
+
+fn validateHttpFetchTarget(io: Io, uri: std.Uri) Error!void {
+    fetch_policy.validateUri(io, uri, .{}) catch |err| switch (err) {
+        error.UnsupportedRemoteFetchScheme,
+        error.UnsafeRemoteFetchTarget,
+        => return error.BadManifest,
+        else => return error.IoFailed,
+    };
 }
 
 fn runAwsS3Cp(
@@ -4281,7 +4293,7 @@ test "push and pull s3 indexed bundle carries disk layers" {
     }));
 }
 
-test "pull http indexed bundle through verified peer cache" {
+test "http bundle pull rejects loopback source before request" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -4289,106 +4301,21 @@ test "pull http indexed bundle through verified peer cache" {
     const arena = arena_state.allocator();
 
     const root_dir = try testDir(arena);
-    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
-    const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
     const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
-    const out0_dir = try pathZ(arena, "{s}/http-pulled-0", .{root_dir});
-    const out1_dir = try pathZ(arena, "{s}/http-pulled-1", .{root_dir});
-    const out_bad_dir = try pathZ(arena, "{s}/http-pulled-bad", .{root_dir});
-    const pack_cache_root = try pathZ(arena, "{s}/pack-rootfs-cache", .{root_dir});
-    const pull_rootfs_cache = try pathZ(arena, "{s}/pull-rootfs-cache", .{root_dir});
-    const peer_cache_dir = try pathZ(arena, "{s}/peer-cache", .{root_dir});
-    const bad_peer_cache_dir = try pathZ(arena, "{s}/bad-peer-cache", .{root_dir});
-    const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
-
-    const ram = try arena.alloc(u8, spore.chunk_size + 23);
-    @memset(ram, 0);
-    ram[13] = 0x97;
-    ram[spore.chunk_size + 11] = 0x38;
-    const memory = try spore.saveMemory(arena, parent_dir, ram);
-    try writeFileAll(rootfs_source_path, "http peer rootfs artifact bytes");
-    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
-    try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 111, artifact));
-    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
-
-    const pack_result = try pack(arena, .{
-        .io = io,
-        .spore_dir = parent_dir,
-        .out_dir = bundle_dir,
-        .rootfs_cache_dir = pack_cache_root,
-        .children_dir = children_dir,
-    });
-    var expected_peer_bytes: u64 = 0;
-    const files = try indexedBundleFiles(arena, bundle_dir);
-    for (files) |rel_path| {
-        expected_peer_bytes += try fileSizeNoSymlink(io, try pathZ(arena, "{s}/{s}", .{ bundle_dir, rel_path }));
-    }
+    try ensureDirPath(io, bundle_dir);
+    try writeFileAll(try pathZ(arena, "{s}/{s}", .{ bundle_dir, bundle_index_path }), "{}");
 
     var server: StaticHttpBundleServer = undefined;
     try server.init(arena, io, bundle_dir, "spore.bundle");
     defer server.deinit();
 
     const base_url = try server.baseUrl(arena);
-    const source_uri = try std.fmt.allocPrint(arena, "{s}@sha256:{s}", .{ base_url, pack_result.bundle_digest });
-    const pulled0 = try pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out0_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = peer_cache_dir,
-        .child_id = "0",
-    });
-    try std.testing.expectEqualStrings("000000", pulled0.children.selected_child.?);
-    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled0.bundle_digest.hex);
-    try std.testing.expect(!pulled0.remote.cache_hit);
-    try std.testing.expectEqual(@as(u64, 0), pulled0.remote.origin_bytes_read);
-    try std.testing.expectEqual(expected_peer_bytes, pulled0.remote.peer_bytes_read);
-    try std.testing.expectEqual(@as(usize, 2), pulled0.materialization.cache.miss_count);
-    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.materialization.cache.bytes_fetched);
-    try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs.cache.hit_count);
-    try std.testing.expectEqual(@as(usize, 1), pulled0.rootfs.cache.miss_count);
-    try std.testing.expectEqual(artifact.size, pulled0.rootfs.cache.bytes_fetched);
-
-    const pulled1 = try pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out1_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = peer_cache_dir,
-        .child_id = "1",
-    });
-    try std.testing.expectEqualStrings("000001", pulled1.children.selected_child.?);
-    try std.testing.expect(pulled1.remote.cache_hit);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.remote.origin_bytes_read);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.remote.peer_bytes_read);
-    try std.testing.expectEqual(@as(usize, 2), pulled1.materialization.cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.materialization.cache.bytes_fetched);
-    try std.testing.expectEqual(@as(usize, 1), pulled1.rootfs.cache.hit_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled1.rootfs.cache.miss_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.rootfs.cache.bytes_fetched);
-
-    const restored_manifest = try spore.loadManifest(arena, out1_dir);
-    defer restored_manifest.deinit();
-    const restored_rootfs = restored_manifest.value.rootfs orelse return error.BadManifest;
-    const fd = try rootfs_cache.openVerifiedFromCache(io, arena, pull_rootfs_cache, restored_rootfs);
-    _ = std.c.close(fd);
-    const out = try arena.alloc(u8, ram.len);
-    @memset(out, 0xCC);
-    try spore.loadMemory(arena, out1_dir, restored_manifest.value.memory, out);
-    try std.testing.expectEqualSlices(u8, ram, out);
-
-    const remote_pack_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, pack_path });
-    const data = try readFileAll(arena, remote_pack_path, 2 * spore.chunk_size);
-    data[0] ^= 0x22;
-    try writeFileAll(remote_pack_path, data);
-    try std.testing.expectError(error.BadChunk, pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out_bad_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = bad_peer_cache_dir,
-        .child_id = "1",
-    }));
+    const url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ base_url, bundle_index_path });
+    const dest_path = try pathZ(arena, "{s}/downloaded-bundle.json", .{root_dir});
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    try std.testing.expectError(error.BadManifest, httpGetToFile(io, &client, url, dest_path));
+    try std.testing.expectEqual(@as(usize, 0), server.request_count.load(.monotonic));
 }
 
 test "pull fails closed on corrupt chunk cache entries" {
@@ -4484,6 +4411,12 @@ test "http uri parser requires immutable digest and path-safe source" {
     defer allocator.free(parsed.expected_digest);
     try std.testing.expectEqualStrings("http://127.0.0.1:20000/spore.bundle", parsed.location.base_url);
     try std.testing.expectEqualStrings(digest, parsed.expected_digest);
+}
+
+test "http fetch target policy rejects private bundle sources" {
+    try std.testing.expectError(error.BadManifest, validateHttpFetchTarget(std.testing.io, try std.Uri.parse("https://127.0.0.1/spore.bundle")));
+    try std.testing.expectError(error.BadManifest, validateHttpFetchTarget(std.testing.io, try std.Uri.parse("https://169.254.169.254/spore.bundle")));
+    try std.testing.expectError(error.BadManifest, validateHttpFetchTarget(std.testing.io, try std.Uri.parse("https://10.0.0.1/spore.bundle")));
 }
 
 test "s3 uri parser requires immutable digest for sources" {

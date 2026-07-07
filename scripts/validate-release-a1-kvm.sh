@@ -20,7 +20,7 @@ Checks:
      corrupt bundle rejection, and source-host KVM networking smokes.
   2. Direct S3 chunked-rootfs remote bundle pull with destination rootfs CAS
      materialization/cache reuse and corrupt rootfs rejection.
-  3. HTTP peer chunked-rootfs remote bundle pull with destination rootfs CAS
+  3. Public-address HTTP peer chunked-rootfs remote bundle pull with destination rootfs CAS
      materialization/cache reuse and corrupt rootfs rejection.
 
 Environment defaults:
@@ -41,7 +41,7 @@ Options:
   --source-instance ID        SSM instance ID for capture/pack
   --dest-instance ID          SSM instance ID for pull/resume (repeatable)
   --bucket BUCKET             S3 bucket used as the staging origin
-  --source-peer-ip IP         source host IP used for HTTP peer pulls
+  --source-peer-ip IP         public source host IP used for HTTP peer pulls
   --source-peer-port N        source host HTTP port (default: 20000)
   --prefix PREFIX             S3 prefix (default: sporevm/release-a1-kvm)
   --cache-dir DIR             remote host cache root (default: /tmp/sporevm-release-a1-kvm-RUN_ID)
