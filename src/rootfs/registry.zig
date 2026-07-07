@@ -191,13 +191,13 @@ fn httpGetToFile(
     path: []const u8,
     max_body_bytes: u64,
 ) !HTTPGetResult {
-    try validateRegistryFetchUrl(client.io, url);
+    const target_address = try resolveRegistryFetchUrl(client.io, url);
     var file = try Io.Dir.cwd().createFile(io, path, .{});
     errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
     defer file.close(io);
     var buffer: [64 * 1024]u8 = undefined;
     var file_writer: Io.File.Writer = .initStreaming(file, io, &buffer);
-    const result = try httpGetToWriterAfterPolicy(allocator, client, url, accept, bearer_token, &file_writer.interface, max_body_bytes);
+    const result = try httpGetToWriterAfterPolicy(allocator, client, url, target_address, accept, bearer_token, &file_writer.interface, max_body_bytes);
     try file_writer.interface.flush();
     return result;
 }
@@ -211,14 +211,15 @@ fn httpGetToWriter(
     writer: *Io.Writer,
     max_body_bytes: u64,
 ) !HTTPGetResult {
-    try validateRegistryFetchUrl(client.io, url);
-    return httpGetToWriterAfterPolicy(allocator, client, url, accept, bearer_token, writer, max_body_bytes);
+    const target_address = try resolveRegistryFetchUrl(client.io, url);
+    return httpGetToWriterAfterPolicy(allocator, client, url, target_address, accept, bearer_token, writer, max_body_bytes);
 }
 
 fn httpGetToWriterAfterPolicy(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     url: []const u8,
+    target_address: Io.net.IpAddress,
     accept: []const u8,
     bearer_token: ?[]const u8,
     writer: *Io.Writer,
@@ -236,12 +237,17 @@ fn httpGetToWriterAfterPolicy(
         request_headers.authorization = .{ .override = auth_value.? };
     }
 
-    var req = try client.request(.GET, uri, .{
+    const connection = try fetch_policy.connectResolvedUri(client, uri, target_address);
+    var req = client.request(.GET, uri, .{
         .headers = request_headers,
         .extra_headers = extra_headers,
         .redirect_behavior = .unhandled,
         .keep_alive = false,
-    });
+        .connection = connection,
+    }) catch |err| {
+        client.connection_pool.release(connection, client.io);
+        return err;
+    };
     defer req.deinit();
     try req.sendBodiless();
     var redirect_buffer: [8 * 1024]u8 = undefined;
@@ -261,8 +267,12 @@ fn httpGetToWriterAfterPolicy(
     return .{ .status = response.head.status, .auth_header = auth, .location = location, .content_digest = content_digest };
 }
 
+fn resolveRegistryFetchUrl(io: Io, url: []const u8) !Io.net.IpAddress {
+    return fetch_policy.resolveUrlAddress(io, url, .{ .require_https = true });
+}
+
 fn validateRegistryFetchUrl(io: Io, url: []const u8) !void {
-    try fetch_policy.validateUrl(io, url, .{ .require_https = true });
+    _ = try resolveRegistryFetchUrl(io, url);
 }
 
 fn fetchBearerToken(allocator: std.mem.Allocator, client: *std.http.Client, resource_url: []const u8, auth_header: []const u8) ![]const u8 {

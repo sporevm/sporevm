@@ -2644,19 +2644,24 @@ fn httpGetToFile(
     path: []const u8,
 ) Error!u64 {
     const uri = std.Uri.parse(url) catch return error.BadManifest;
-    validateHttpFetchTarget(client.io, uri) catch |err| return err;
+    const target_address = resolveHttpFetchTarget(client.io, uri) catch |err| return err;
     var file = Io.Dir.cwd().createFile(io, path, .{}) catch return error.IoFailed;
     errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
     defer file.close(io);
 
     var file_buffer: [64 * 1024]u8 = undefined;
     var file_writer: Io.File.Writer = .initStreaming(file, io, &file_buffer);
+    const connection = fetch_policy.connectResolvedUri(client, uri, target_address) catch return error.IoFailed;
     var req = client.request(.GET, uri, .{
         .headers = .{ .accept_encoding = .omit },
         .extra_headers = &.{std.http.Header{ .name = "accept", .value = "application/octet-stream" }},
         .redirect_behavior = .unhandled,
         .keep_alive = false,
-    }) catch return error.IoFailed;
+        .connection = connection,
+    }) catch {
+        client.connection_pool.release(connection, client.io);
+        return error.IoFailed;
+    };
     defer req.deinit();
     req.sendBodiless() catch return error.IoFailed;
     var header_buffer: [8 * 1024]u8 = undefined;
@@ -2679,13 +2684,17 @@ fn httpGetToFile(
     return copied;
 }
 
-fn validateHttpFetchTarget(io: Io, uri: std.Uri) Error!void {
-    fetch_policy.validateUri(io, uri, .{}) catch |err| switch (err) {
+fn resolveHttpFetchTarget(io: Io, uri: std.Uri) Error!Io.net.IpAddress {
+    return fetch_policy.resolveUriAddress(io, uri, .{}) catch |err| switch (err) {
         error.UnsupportedRemoteFetchScheme,
         error.UnsafeRemoteFetchTarget,
         => return error.BadManifest,
         else => return error.IoFailed,
     };
+}
+
+fn validateHttpFetchTarget(io: Io, uri: std.Uri) Error!void {
+    _ = try resolveHttpFetchTarget(io, uri);
 }
 
 fn runAwsS3Cp(
