@@ -3,8 +3,7 @@
 //! This is deliberately small: one handler thread resolves missing faults by
 //! loading and verifying the whole spore memory chunk, then `UFFDIO_COPY`ing it
 //! into the registered guest RAM mapping. Readahead, duplicate-fault coalescing,
-//! zero-page optimisation, and graceful cross-thread error propagation are later
-//! work.
+//! and zero-page optimisation are later work.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -29,6 +28,13 @@ pub const Options = struct {
     manifest: spore.MemoryManifest,
     ram: []u8,
     trace_fd: ?std.c.fd_t = null,
+};
+
+pub const WakeFn = *const fn (?*anyopaque) void;
+
+pub const FailureWake = struct {
+    context: ?*anyopaque,
+    wakeFn: WakeFn,
 };
 
 pub const Pager = struct {
@@ -60,6 +66,9 @@ pub const Pager = struct {
             .ram_len = options.ram.len,
             .trace_fd = options.trace_fd,
             .start_ms = monotonicMs() catch 0,
+            .failed = .init(false),
+            .failure_wake_fn = .init(0),
+            .failure_wake_context = .init(0),
         };
 
         const thread = try std.Thread.spawn(.{}, faultThread, .{context});
@@ -76,6 +85,16 @@ pub const Pager = struct {
         closeFd(self.context.stop_write_fd);
         std.heap.c_allocator.destroy(self.context);
     }
+
+    pub fn setFailureWake(self: *Pager, wake: FailureWake) void {
+        const context_addr: usize = if (wake.context) |ctx| @intFromPtr(ctx) else 0;
+        self.context.failure_wake_context.store(context_addr, .release);
+        self.context.failure_wake_fn.store(@intFromPtr(wake.wakeFn), .release);
+    }
+
+    pub fn checkFailed(self: *const Pager) !void {
+        if (self.context.failed.load(.acquire)) return error.LazyRamPagerFailed;
+    }
 };
 
 const Context = struct {
@@ -88,6 +107,9 @@ const Context = struct {
     ram_len: usize,
     trace_fd: ?std.c.fd_t,
     start_ms: u64,
+    failed: std.atomic.Value(bool),
+    failure_wake_fn: std.atomic.Value(usize),
+    failure_wake_context: std.atomic.Value(usize),
 };
 
 fn validateMapping(ram: []const u8) !void {
@@ -139,12 +161,16 @@ fn faultThread(context: *Context) void {
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
-            else => fail("userfaultfd poll failed", .{}),
+            else => {
+                failPager(context, "userfaultfd poll failed", .{});
+                return;
+            },
         }
 
         if ((fds[1].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR)) != 0) return;
         if ((fds[0].revents & linux.POLL.IN) != 0) handleFault(context) catch |err| {
-            fail("lazy RAM fault handling failed: {s}", .{@errorName(err)});
+            failPager(context, "lazy RAM fault handling failed: {s}", .{@errorName(err)});
+            return;
         };
         if ((fds[0].revents & (linux.POLL.ERR | linux.POLL.HUP)) != 0) {
             // Linux can report POLLERR on an otherwise usable userfaultfd even
@@ -252,9 +278,16 @@ fn monotonicMs() !u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
-fn fail(comptime fmt: []const u8, args: anytype) noreturn {
+fn failPager(context: *Context, comptime fmt: []const u8, args: anytype) void {
     std.log.err(fmt, args);
-    std.process.exit(1);
+    context.failed.store(true, .release);
+    const wake_fn_addr = context.failure_wake_fn.load(.acquire);
+    if (wake_fn_addr == 0) return;
+
+    const wake_fn: WakeFn = @ptrFromInt(wake_fn_addr);
+    const wake_context_addr = context.failure_wake_context.load(.acquire);
+    const wake_context: ?*anyopaque = if (wake_context_addr == 0) null else @ptrFromInt(wake_context_addr);
+    wake_fn(wake_context);
 }
 
 test "fault address maps to memory chunk range" {
