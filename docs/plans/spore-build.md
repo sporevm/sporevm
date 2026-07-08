@@ -1,6 +1,6 @@
 ---
-status: proposed
-last_reviewed: 2026-07-07
+status: deferred
+last_reviewed: 2026-07-08
 spec_refs:
   - docs/rootfs.md
   - docs/filesystem.md
@@ -14,6 +14,27 @@ related_plans:
 ---
 
 # Spore-Native Dockerfile Subset Builder (`spore build`)
+
+> **Deferred** (re-sequenced 2026-07-08). This plan was drafted when the
+> buildx→import-tar boundary cost minutes even fully cached. Since then the
+> native ext4 writer landed (import conversion ~24s → ~7.8s on the reference
+> benchmark, `docs/plans/native-ext4-writer.md`), an imported-rootfs cache
+> fast path made repeat imports resolve without re-conversion, and
+> `docs/plans/unified-chunk-disk.md` became the active storage workstream.
+> That plan's U4 (inline chunk+index emission at import, no separate
+> full-image hash) and U7 (partial materialization — cold `--image` start
+> bounded by boot working set, not image size) attack the same boundary this
+> builder was designed to bypass.
+>
+> Revisit only if the buildx + `spore rootfs import-tar` path still hurts
+> after U4/U7 land. If revived, rebuild M2's executor on the unified
+> primitives instead of this plan's bespoke flat-file machinery: the
+> persistent-session checkpoints become `ChunkMappedDisk` overlay state, the
+> online guest `fsfreeze` protocol (which the unified plan's v1 explicitly
+> defers to here) is this plan's to deliver, and finalize becomes one
+> `snapshot()` per the unified plan's durable-index invariant — no terminal
+> full-image hash. The cache model, parser subset, COPY semantics, and
+> fail-closed contract below remain valid as written.
 
 ## Summary
 
