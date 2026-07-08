@@ -14,6 +14,7 @@ const Io = std.Io;
 const max_layout_metadata_bytes: usize = 32 << 20;
 const max_layout_config_bytes: usize = 64 << 20;
 const max_layout_tar_entries: u64 = 1_000_000;
+const max_layout_tar_payload_bytes: u64 = tar.max_content_bytes;
 
 pub const LayerBlob = struct {
     media_type: []const u8,
@@ -121,7 +122,7 @@ fn extractTarReaderToDir(
     dest: Io.Dir,
     reader: *Io.Reader,
 ) !void {
-    var entries: u64 = 0;
+    var limits: LayoutTarLimits = .{};
 
     while (true) {
         var header: [512]u8 = undefined;
@@ -129,10 +130,8 @@ fn extractTarReaderToDir(
         if (isZeroBlock(&header)) break;
         try verifyTarHeader(&header);
 
-        entries += 1;
-        if (entries > max_layout_tar_entries) return error.OciLayoutTarTooManyEntries;
-
         const size = try tarSize(&header);
+        try accountLayoutTarEntry(&limits, size);
         const kind = header[156];
         const raw_name = try tarFullName(allocator, &header);
         defer allocator.free(raw_name);
@@ -154,6 +153,19 @@ fn extractTarReaderToDir(
             },
         }
     }
+}
+
+const LayoutTarLimits = struct {
+    entries: u64 = 0,
+    payload_bytes: u64 = 0,
+};
+
+fn accountLayoutTarEntry(limits: *LayoutTarLimits, payload_size: u64) !void {
+    if (limits.entries >= max_layout_tar_entries) return error.OciLayoutTarTooManyEntries;
+    if (payload_size > max_layout_tar_payload_bytes - limits.payload_bytes) return error.RootFSArchiveTooLarge;
+
+    limits.entries += 1;
+    limits.payload_bytes += payload_size;
 }
 
 fn validateLayoutFile(allocator: std.mem.Allocator, io: Io, layout_dir: []const u8) !void {
@@ -517,6 +529,20 @@ test "OCI layout tar extraction rejects duplicate paths" {
         error.DuplicateOciLayoutTarPath,
         extractTarReaderToDir(arena_state.allocator(), std.testing.io, tmp.dir, &reader),
     );
+}
+
+test "OCI layout tar extraction counts aggregate payload bytes" {
+    var limits: LayoutTarLimits = .{};
+
+    try accountLayoutTarEntry(&limits, 5);
+    try std.testing.expectEqual(@as(u64, 1), limits.entries);
+    try std.testing.expectEqual(@as(u64, 5), limits.payload_bytes);
+
+    limits = .{ .entries = max_layout_tar_entries };
+    try std.testing.expectError(error.OciLayoutTarTooManyEntries, accountLayoutTarEntry(&limits, 0));
+
+    limits = .{ .payload_bytes = max_layout_tar_payload_bytes - 1 };
+    try std.testing.expectError(error.RootFSArchiveTooLarge, accountLayoutTarEntry(&limits, 2));
 }
 
 fn fuzzOciLayoutIndexJson(_: void, s: *std.testing.Smith) !void {
