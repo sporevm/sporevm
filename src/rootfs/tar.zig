@@ -264,7 +264,7 @@ fn applyTarFileLayer(
 }
 
 const LayerLimits = struct {
-    content_bytes: u64 = 0,
+    payload_bytes: u64 = 0,
     entries: u64 = 0,
     xattrs: u64 = 0,
     xattr_value_bytes: u64 = 0,
@@ -337,28 +337,31 @@ fn applyTarLayerWithXattrs(
         const kind = header[156];
 
         if (kind == 'L') {
+            try accountTarMetadataRecord(&limits, size);
             if (long_name) |p| allocator.free(p);
             long_name = try readTarString(allocator, reader, size);
             continue;
         }
         if (kind == 'K') {
+            try accountTarMetadataRecord(&limits, size);
             if (long_link) |p| allocator.free(p);
             long_link = try readTarString(allocator, reader, size);
             continue;
         }
         if (kind == 'x') {
+            try accountTarMetadataRecord(&limits, size);
             pax.clear(allocator);
             try readPaxHeader(allocator, reader, size, &pax);
             continue;
         }
         if (kind == 'g') {
+            try accountTarMetadataRecord(&limits, size);
             try readPaxHeader(allocator, reader, size, &global_pax);
             try validateGlobalPax(global_pax);
             continue;
         }
 
-        limits.entries += 1;
-        if (limits.entries > max_archive_entries) return error.RootFSArchiveTooManyEntries;
+        try accountTarEntry(&limits);
 
         const raw_name = if (pax.path) |p|
             p
@@ -472,28 +475,31 @@ fn applyTarLayerToMergedTree(
         const kind = header[156];
 
         if (kind == 'L') {
+            try accountTarMetadataRecord(&limits, size);
             if (long_name) |p| allocator.free(p);
             long_name = try readTarString(allocator, reader, size);
             continue;
         }
         if (kind == 'K') {
+            try accountTarMetadataRecord(&limits, size);
             if (long_link) |p| allocator.free(p);
             long_link = try readTarString(allocator, reader, size);
             continue;
         }
         if (kind == 'x') {
+            try accountTarMetadataRecord(&limits, size);
             pax.clear(allocator);
             try readPaxHeader(allocator, reader, size, &pax);
             continue;
         }
         if (kind == 'g') {
+            try accountTarMetadataRecord(&limits, size);
             try readPaxHeader(allocator, reader, size, &global_pax);
             try validateGlobalPax(global_pax);
             continue;
         }
 
-        limits.entries += 1;
-        if (limits.entries > max_archive_entries) return error.RootFSArchiveTooManyEntries;
+        try accountTarEntry(&limits);
 
         const raw_name = if (pax.path) |p|
             p
@@ -604,32 +610,35 @@ fn applySeekableTarLayerToMergedTree(
         const payload_offset = offset;
 
         if (kind == 'L') {
+            try accountTarMetadataRecord(&limits, size);
             if (long_name) |p| allocator.free(p);
             long_name = try readTarStringAt(allocator, file, io, payload_offset, size);
             offset = try tarPayloadEnd(payload_offset, size);
             continue;
         }
         if (kind == 'K') {
+            try accountTarMetadataRecord(&limits, size);
             if (long_link) |p| allocator.free(p);
             long_link = try readTarStringAt(allocator, file, io, payload_offset, size);
             offset = try tarPayloadEnd(payload_offset, size);
             continue;
         }
         if (kind == 'x') {
+            try accountTarMetadataRecord(&limits, size);
             pax.clear(allocator);
             try readPaxHeaderAt(allocator, file, io, payload_offset, size, &pax);
             offset = try tarPayloadEnd(payload_offset, size);
             continue;
         }
         if (kind == 'g') {
+            try accountTarMetadataRecord(&limits, size);
             try readPaxHeaderAt(allocator, file, io, payload_offset, size, &global_pax);
             try validateGlobalPax(global_pax);
             offset = try tarPayloadEnd(payload_offset, size);
             continue;
         }
 
-        limits.entries += 1;
-        if (limits.entries > max_archive_entries) return error.RootFSArchiveTooManyEntries;
+        try accountTarEntry(&limits);
 
         const raw_name = if (pax.path) |p|
             p
@@ -1125,9 +1134,23 @@ fn readTarPayloadAlloc(allocator: std.mem.Allocator, reader: *Io.Reader, size: u
     return data;
 }
 
+fn accountTarEntry(limits: *LayerLimits) !void {
+    if (limits.entries >= max_archive_entries) return error.RootFSArchiveTooManyEntries;
+    limits.entries += 1;
+}
+
+fn accountTarPayloadBytes(limits: *LayerLimits, size: u64) !void {
+    if (size > max_content_bytes - limits.payload_bytes) return error.RootFSArchiveTooLarge;
+    limits.payload_bytes += size;
+}
+
+fn accountTarMetadataRecord(limits: *LayerLimits, size: u64) !void {
+    try accountTarEntry(limits);
+    try accountTarPayloadBytes(limits, size);
+}
+
 fn addContentBytes(limits: *LayerLimits, size: u64) !void {
-    if (size > max_content_bytes - limits.content_bytes) return error.RootFSArchiveTooLarge;
-    limits.content_bytes += size;
+    try accountTarPayloadBytes(limits, size);
 }
 
 fn addXattrBytes(limits: *LayerLimits, attrs: []const xattrs_mod.Attribute) !void {
@@ -2116,6 +2139,19 @@ fn rewriteTestTarChecksum(header: []u8) void {
     var sum: u64 = 0;
     for (header[0..512]) |b| sum += b;
     writeTarOctal(header[148..156], sum);
+}
+
+test "tar metadata records count against layer limits" {
+    var limits: LayerLimits = .{};
+    try accountTarMetadataRecord(&limits, 5);
+    try std.testing.expectEqual(@as(u64, 1), limits.entries);
+    try std.testing.expectEqual(@as(u64, 5), limits.payload_bytes);
+
+    limits = .{ .entries = max_archive_entries };
+    try std.testing.expectError(error.RootFSArchiveTooManyEntries, accountTarMetadataRecord(&limits, 0));
+
+    limits = .{ .payload_bytes = max_content_bytes - 1 };
+    try std.testing.expectError(error.RootFSArchiveTooLarge, accountTarMetadataRecord(&limits, 2));
 }
 
 test "safe tar path rejects traversal and absolute entries" {
