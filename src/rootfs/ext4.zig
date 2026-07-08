@@ -12,6 +12,9 @@ const min_rootfs_inodes: u64 = 65_536;
 const rootfs_inode_headroom: u64 = 4096;
 const rootfs_headroom_bytes: u64 = 128 << 20;
 const rootfs_align_bytes: u64 = 4 << 20;
+pub const rootfs_ext4_block_size: u32 = 4096;
+pub const rootfs_ext4_inode_size: u16 = 256;
+pub const rootfs_ext4_inodes_per_block: u32 = rootfs_ext4_block_size / @as(u32, rootfs_ext4_inode_size);
 const ext4_superblock_offset: u64 = 1024;
 const ext4_superblock_size: usize = 1024;
 const ext4_feature_sparse_super: u32 = 0x0001;
@@ -81,7 +84,11 @@ pub fn computeImageSize(content_bytes: u64) u64 {
 
 pub fn computeImageInodes(entry_count: u64) u64 {
     const with_headroom = entry_count + (entry_count / 10) + rootfs_inode_headroom;
-    return @max(min_rootfs_inodes, with_headroom);
+    const target = @max(min_rootfs_inodes, with_headroom);
+    const inodes_per_block: u64 = rootfs_ext4_inodes_per_block;
+    const remainder = target % inodes_per_block;
+    if (remainder == 0) return target;
+    return target + (inodes_per_block - remainder);
 }
 
 pub fn ensureParentDir(io: Io, path: []const u8) !void {
@@ -601,6 +608,12 @@ test "compute rootfs image size keeps minimum and alignment" {
 test "compute rootfs inode count keeps minimum and headroom" {
     try std.testing.expectEqual(@as(u64, min_rootfs_inodes), computeImageInodes(1));
     try std.testing.expectEqual(@as(u64, 114_096), computeImageInodes(100_000));
+}
+
+test "compute rootfs inode count aligns for native writer packing" {
+    const inode_count = computeImageInodes(100_001);
+    try std.testing.expectEqual(@as(u64, 114_112), inode_count);
+    try std.testing.expectEqual(@as(u64, 0), inode_count % rootfs_ext4_inodes_per_block);
 }
 
 test "directory entry count includes directories and files" {
