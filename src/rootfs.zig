@@ -830,7 +830,7 @@ pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, req
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
     const metadata_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
-    if (try cachedImportedRootfsBlake3(init, allocator, cache_root, resolved, rootfs_path, metadata_path, request.rootfs_storage)) |rootfs_blake3| {
+    if (try cachedImportedRootfsBlake3(init, allocator, cache_root, resolved, rootfs_path, metadata_path, request.rootfs_storage, ext4_writer_choice)) |rootfs_blake3| {
         const local_ref_path = try writeLocalRefCache(init.io, allocator, cache_root, request.ref, resolved);
         return .{
             .rootfs_path = rootfs_path,
@@ -898,7 +898,7 @@ pub fn importTar(init: std.process.Init, allocator: std.mem.Allocator, request: 
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
     const metadata_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
-    if (try cachedImportedRootfsBlake3(init, allocator, cache_root, resolved, rootfs_path, metadata_path, request.rootfs_storage)) |rootfs_blake3| {
+    if (try cachedImportedRootfsBlake3(init, allocator, cache_root, resolved, rootfs_path, metadata_path, request.rootfs_storage, ext4_writer_choice)) |rootfs_blake3| {
         const local_ref_path = try writeLocalRefCache(init.io, allocator, cache_root, request.ref, resolved);
         return .{
             .rootfs_path = rootfs_path,
@@ -1799,8 +1799,9 @@ fn cachedImportedRootfsBlake3(
     rootfs_path: []const u8,
     metadata_path: []const u8,
     storage_policy: RootfsStoragePolicy,
+    ext4_writer_choice: Ext4Writer,
 ) !?[chunk.ChunkId.hex_len]u8 {
-    if (!try cachedRootfsMetadataMatches(init.io, allocator, metadata_path, resolved)) return null;
+    if (!try cachedRootfsMetadataMatches(init.io, allocator, metadata_path, resolved, ext4_writer_choice)) return null;
     const artifact = (try cachedImageRootfsArtifact(init.io, allocator, metadata_path, rootfs_path)) orelse return null;
     defer allocator.free(artifact.digest);
     if (!try readablePath(init.io, rootfs_path)) return null;
@@ -3201,6 +3202,7 @@ test "imported rootfs flat cache hit reuses metadata without rootfs storage" {
     const metadata_json = try std.fmt.allocPrint(arena,
         \\{{
         \\  "builder_version": "{s}",
+        \\  "ext4_writer": "native",
         \\  "image_ref": "local/example:dev",
         \\  "resolved_image_ref": "{s}",
         \\  "image_manifest_digest": "{s}",
@@ -3225,8 +3227,9 @@ test "imported rootfs flat cache hit reuses metadata without rootfs storage" {
         .preopens = .empty,
     };
 
-    const hit = (try cachedImportedRootfsBlake3(init, arena, cache_root, resolved, rootfs_path, metadata_path, .flat)).?;
+    const hit = (try cachedImportedRootfsBlake3(init, arena, cache_root, resolved, rootfs_path, metadata_path, .flat, .native)).?;
     try std.testing.expectEqualSlices(u8, expected[0..], hit[0..]);
+    try std.testing.expect((try cachedImportedRootfsBlake3(init, arena, cache_root, resolved, rootfs_path, metadata_path, .flat, .external)) == null);
     const updated_metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, arena, .limited(max_rootfs_metadata_bytes));
     try std.testing.expect(std.mem.indexOf(u8, updated_metadata, "\"rootfs_storage\"") == null);
 
@@ -3263,6 +3266,7 @@ test "imported rootfs chunked cache hit upgrades flat metadata storage" {
     const metadata_json = try std.fmt.allocPrint(arena,
         \\{{
         \\  "builder_version": "{s}",
+        \\  "ext4_writer": "native",
         \\  "image_ref": "local/example:dev",
         \\  "resolved_image_ref": "{s}",
         \\  "image_manifest_digest": "{s}",
@@ -3287,7 +3291,7 @@ test "imported rootfs chunked cache hit upgrades flat metadata storage" {
         .preopens = .empty,
     };
 
-    const hit = (try cachedImportedRootfsBlake3(init, arena, cache_root, resolved, rootfs_path, metadata_path, .chunked)).?;
+    const hit = (try cachedImportedRootfsBlake3(init, arena, cache_root, resolved, rootfs_path, metadata_path, .chunked, .native)).?;
     try std.testing.expectEqualSlices(u8, expected[0..], hit[0..]);
     const updated_metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, arena, .limited(max_rootfs_metadata_bytes));
     try std.testing.expect(std.mem.indexOf(u8, updated_metadata, "\"rootfs_storage\"") != null);
@@ -3328,6 +3332,7 @@ test "imported rootfs cache treats metadata identity mismatch as miss" {
     const metadata_json = try std.fmt.allocPrint(arena,
         \\{{
         \\  "builder_version": "{s}",
+        \\  "ext4_writer": "native",
         \\  "image_ref": "local/example:dev",
         \\  "resolved_image_ref": "{s}",
         \\  "image_manifest_digest": "{s}",
@@ -3352,7 +3357,7 @@ test "imported rootfs cache treats metadata identity mismatch as miss" {
         .preopens = .empty,
     };
 
-    try std.testing.expect((try cachedImportedRootfsBlake3(init, arena, cache_root, requested_resolved, rootfs_path, metadata_path, .chunked)) == null);
+    try std.testing.expect((try cachedImportedRootfsBlake3(init, arena, cache_root, requested_resolved, rootfs_path, metadata_path, .chunked, .native)) == null);
     const updated_metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, arena, .limited(max_rootfs_metadata_bytes));
     try std.testing.expect(std.mem.indexOf(u8, updated_metadata, "\"rootfs_storage\"") == null);
     const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
