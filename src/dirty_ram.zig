@@ -5,8 +5,8 @@
 //! same-host RAM backing file.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const chunk = @import("chunk.zig");
+const chunk_sealer = @import("chunk_sealer.zig");
 const spore = @import("spore.zig");
 
 pub const Stats = struct {
@@ -52,23 +52,7 @@ pub const Stats = struct {
     }
 };
 
-const SealWorkStats = struct {
-    sealed_chunks: u64 = 0,
-    zero_scan_ns: u64 = 0,
-    hash_ns: u64 = 0,
-    chunk_write_ns: u64 = 0,
-    backing_write_ns: u64 = 0,
-    cpu_ns: u64 = 0,
-
-    fn add(self: *SealWorkStats, other: SealWorkStats) void {
-        self.sealed_chunks +|= other.sealed_chunks;
-        self.zero_scan_ns +|= other.zero_scan_ns;
-        self.hash_ns +|= other.hash_ns;
-        self.chunk_write_ns +|= other.chunk_write_ns;
-        self.backing_write_ns +|= other.backing_write_ns;
-        self.cpu_ns +|= other.cpu_ns;
-    }
-};
+const SealWorkStats = chunk_sealer.WorkStats;
 
 const SpinLock = struct {
     locked: std.atomic.Value(bool) = .init(false),
@@ -456,40 +440,30 @@ pub const Sealer = struct {
         const range = self.chunkRange(index);
         const data = self.ram[range.start..range.end];
 
-        const zero_scan_start = try monotonicNs();
-        const is_zero = std.mem.allEqual(u8, data, 0);
-        work_stats.zero_scan_ns +|= try elapsedMonotonicNs(zero_scan_start);
-
-        if (is_zero) {
-            if (self.refs[index] != null) {
-                const backing_write_start = try monotonicNs();
-                try pwriteFileAll(self.backing_fd, range.start, data);
-                work_stats.backing_write_ns +|= try elapsedMonotonicNs(backing_write_start);
-                self.refs[index] = null;
-                _ = self.nonzero_chunks.fetchSub(1, .monotonic);
+        switch (try chunk_sealer.sealBytes(data, work_stats)) {
+            .zero => {
+                if (self.refs[index] != null) {
+                    try chunk_sealer.pwriteFileAllTimed(self.backing_fd, range.start, data, work_stats);
+                    self.refs[index] = null;
+                    _ = self.nonzero_chunks.fetchSub(1, .monotonic);
+                    if (count_dirty_seal) work_stats.sealed_chunks += 1;
+                }
+                return false;
+            },
+            .data => |id| {
+                const hex = id.toHex();
+                const existing = self.refs[index];
+                if (existing == null or !std.mem.eql(u8, existing.?, &hex)) {
+                    const ref, const chunk_path = try self.allocChunkRefAndPath(&hex);
+                    try chunk_sealer.writeFileAllIfMissingTimed(chunk_path, data, work_stats);
+                    self.refs[index] = ref;
+                    if (existing == null) _ = self.nonzero_chunks.fetchAdd(1, .monotonic);
+                }
+                try chunk_sealer.pwriteFileAllTimed(self.backing_fd, range.start, data, work_stats);
                 if (count_dirty_seal) work_stats.sealed_chunks += 1;
-            }
-            return false;
+                return true;
+            },
         }
-
-        const hash_start = try monotonicNs();
-        const id = chunk.ChunkId.fromContents(data);
-        work_stats.hash_ns +|= try elapsedMonotonicNs(hash_start);
-        const hex = id.toHex();
-        const existing = self.refs[index];
-        if (existing == null or !std.mem.eql(u8, existing.?, &hex)) {
-            const ref, const chunk_path = try self.allocChunkRefAndPath(&hex);
-            const chunk_write_start = try monotonicNs();
-            try writeFileAllIfMissing(chunk_path, data);
-            work_stats.chunk_write_ns +|= try elapsedMonotonicNs(chunk_write_start);
-            self.refs[index] = ref;
-            if (existing == null) _ = self.nonzero_chunks.fetchAdd(1, .monotonic);
-        }
-        const backing_write_start = try monotonicNs();
-        try pwriteFileAll(self.backing_fd, range.start, data);
-        work_stats.backing_write_ns +|= try elapsedMonotonicNs(backing_write_start);
-        if (count_dirty_seal) work_stats.sealed_chunks += 1;
-        return true;
     }
 
     fn seedInitial(self: *Sealer, maybe_ranges: ?[]const ChunkRange) !void {
@@ -606,23 +580,6 @@ fn writeFileAll(path: [:0]const u8, data: []const u8) !void {
     }
 }
 
-fn writeFileAllIfMissing(path: [:0]const u8, data: []const u8) !void {
-    const fd = createNewFile(path, 0o644) catch |err| switch (err) {
-        error.AlreadyExists => {
-            try verifyExistingFile(path, data);
-            return;
-        },
-        else => |e| return e,
-    };
-    defer _ = std.c.close(fd);
-    var done: usize = 0;
-    while (done < data.len) {
-        const n = std.c.write(fd, data.ptr + done, data.len - done);
-        if (n <= 0) return error.IoFailed;
-        done += @intCast(n);
-    }
-}
-
 fn createNewFile(path: [:0]const u8, mode: c_uint) !std.c.fd_t {
     const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, mode);
     if (fd < 0) {
@@ -632,57 +589,6 @@ fn createNewFile(path: [:0]const u8, mode: c_uint) !std.c.fd_t {
         };
     }
     return fd;
-}
-
-fn verifyExistingFile(path: [:0]const u8, expected: []const u8) !void {
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
-    if (fd < 0) return error.BadChunk;
-    defer _ = std.c.close(fd);
-
-    const size = try fstatRegularSize(fd);
-    if (size != expected.len) return error.BadChunk;
-
-    var buf: [8192]u8 = undefined;
-    var done: usize = 0;
-    while (done < expected.len) {
-        const len = @min(buf.len, expected.len - done);
-        const offset = std.math.cast(std.c.off_t, done) orelse return error.BadChunk;
-        const n = std.c.pread(fd, buf[0..len].ptr, len, offset);
-        if (n <= 0) return error.BadChunk;
-        const read_len: usize = @intCast(n);
-        if (!std.mem.eql(u8, buf[0..read_len], expected[done..][0..read_len])) return error.BadChunk;
-        done += read_len;
-    }
-}
-
-fn fstatRegularSize(fd: std.c.fd_t) !usize {
-    if (comptime builtin.os.tag == .linux) {
-        const linux = std.os.linux;
-        var statx_buf: linux.Statx = undefined;
-        const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{
-            .TYPE = true,
-            .MODE = true,
-            .SIZE = true,
-        }, &statx_buf);
-        if (linux.errno(rc) != .SUCCESS) return error.IoFailed;
-        if (!linux.S.ISREG(statx_buf.mode)) return error.BadChunk;
-        return std.math.cast(usize, statx_buf.size) orelse error.BadChunk;
-    } else {
-        var stat: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &stat) != 0) return error.IoFailed;
-        if (!std.c.S.ISREG(stat.mode)) return error.BadChunk;
-        if (stat.size < 0) return error.IoFailed;
-        return std.math.cast(usize, stat.size) orelse error.BadChunk;
-    }
-}
-
-fn pwriteFileAll(fd: std.c.fd_t, offset: usize, data: []const u8) !void {
-    var done: usize = 0;
-    while (done < data.len) {
-        const n = std.c.pwrite(fd, data.ptr + done, data.len - done, @intCast(offset + done));
-        if (n <= 0) return error.IoFailed;
-        done += @intCast(n);
-    }
 }
 
 fn ensureDir(path: [:0]const u8) !void {
@@ -706,18 +612,6 @@ fn monotonicMs() !u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return error.ClockFailed;
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
-}
-
-fn monotonicNs() !u64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return error.ClockFailed;
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
-
-fn elapsedMonotonicNs(start_ns: u64) !u64 {
-    const end_ns = try monotonicNs();
-    if (end_ns <= start_ns) return 0;
-    return end_ns - start_ns;
 }
 
 fn threadCpuNs() u64 {

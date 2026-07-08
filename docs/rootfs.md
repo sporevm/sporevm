@@ -209,22 +209,27 @@ records an immutable rootfs artifact: the ext4 content BLAKE3 digest, size,
 virtio-blk binding, resolved OCI image identity, platform, and builder version.
 For image-created spores, the manifest also records `rootfs.storage` pointing at
 the chunked rootfs index and CAS object namespace. Any rootfs writes made during
-the run are represented as sealed `disk-layer-v0` entries over that immutable
-base. Product `spore attach` and `spore run --from` always serve the root
-disk base from the flat digest-addressed ext4 artifact, opened under the
-verify-at-install, trust-at-open cache contract (see SECURITY.md) without
-re-hashing it. `spore pull` and `spore unpack` assemble that artifact from
-verified chunk objects at materialization time; if the flat entry is missing
-or corrupt at resume (for example after pruning), resume assembles it once
-from the locally installed chunks and fails closed when chunks are missing or
-the assembled bytes mismatch the manifest artifact digest. Spores without
-`rootfs.storage` use the same trusted fd-backed open. If the spore has sealed
-writable disk layers, resume also verifies those layer indexes and disk
-objects before attaching the layered COW backend.
+the run are represented as a `chunk-index-disk-v0` disk: `disk.base` names a
+`spore-disk-index-v1` under `cas/rootfs/blake3/indexes/`, and each nonzero
+writable chunk is stored under `cas/rootfs/blake3/objects/`. Product
+`spore attach` and `spore run --from` serve immutable rootfs bases from the
+flat digest-addressed ext4 artifact, opened under the verify-at-install,
+trust-at-open cache contract (see SECURITY.md) without re-hashing it. Saved
+writable disks are materialized from their verified disk index and chunk
+objects before virtio-blk attach; old `disk-layer-v0` chains are no longer
+opened by the runtime restore path. `spore pull` and `spore unpack` assemble
+the immutable artifact from verified chunk objects at materialization time; if
+the flat entry is missing or corrupt at resume (for example after pruning),
+resume assembles it once from the locally installed chunks and fails closed
+when chunks are missing or the assembled bytes mismatch the manifest artifact
+digest. Spores without `rootfs.storage` use the same trusted fd-backed open.
 
 `spore pack` follows the manifest. Spores without `rootfs.storage` include exact
 rootfs bytes under `rootfs/blake3/<hex>.ext4`; spores with `rootfs.storage`
 include the descriptor-bound index and referenced chunk objects instead.
+Spores with a `chunk-index-disk-v0` writable disk include that disk index under
+`rootfs/blake3/indexes/<hex>.json` and its referenced nonzero disk chunks under
+`rootfs/blake3/objects/<hex>.chunk`.
 `spore unpack` verifies whichever form the manifest selected before writing a
 resumable spore.
 

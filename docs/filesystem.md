@@ -55,9 +55,10 @@ authority.
   base. The descriptor binds device, logical size, chunk size, hash algorithm,
   object namespace, `index_digest`, and `base_identity`. For this storage kind,
   `base_identity == index_digest`.
-- `disk.kind: "cow-block-v0"` records sealed writable root disk layers over the
-  effective rootfs base. For fd-backed rootfs, `disk.base` is the ext4 artifact
-  digest. For chunked rootfs, `disk.base` is `rootfs.storage.base_identity`.
+- `disk.kind: "chunk-index-disk-v0"` records sealed writable root disk bytes as
+  a `spore-disk-index-v1` in the rootfs CAS namespace. `disk.base` is the index
+  digest; `chunk_size`, `hash_algorithm`, and `object_namespace` bind the
+  descriptor used to open and verify the index and objects.
 
 OCI refs and local image ref records are provenance or cache hints only.
 
@@ -67,17 +68,19 @@ Product attach and run-from restore build one root disk backend:
 
 ```text
 virtio-blk
-  -> local active COW head
-  -> sealed disk-layer objects
-  -> immutable base: flat digest-addressed ext4 fd (FileBlockSource)
+  -> one-level chunk map
+  -> sparse local overlay for writes
+  -> flat materialized base fd rebuilt from the selected disk/rootfs index
 ```
 
-The flat digest-addressed ext4 artifact is the only runtime base source. The
-open follows the verify-at-install, trust-at-open cache contract (see
-SECURITY.md): entries were BLAKE3-verified when installed and published
+The flat materialization is the hot runtime base source. For immutable rootfs
+artifacts, the open follows the verify-at-install, trust-at-open cache contract
+(see SECURITY.md): entries were BLAKE3-verified when installed and published
 read-only, so the open checks only symlink-safety, regular-file shape, and
-exact size instead of re-hashing the artifact. Serving guest reads with plain
-preads on one fd is what keeps resume-to-first-command fast.
+exact size instead of re-hashing the artifact. Writable disk indexes are
+materialized into a temporary flat fd by verifying the index and each referenced
+chunk object first. Serving guest reads with plain preads on one fd is what
+keeps resume-to-first-command fast.
 
 Chunked rootfs storage (`rootfs.storage`) is a distribution and dedupe format,
 not a runtime read path. `spore pull` and `spore unpack` assemble the flat

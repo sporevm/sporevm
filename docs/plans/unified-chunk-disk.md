@@ -413,11 +413,34 @@ from `cow_disk.zig`.
 
 ### U3 — Snapshot operation and save/restore switch (format break)
 
+Status: active in branch. The runtime snapshot/restore switch is implemented
+as the first U3 step; U3 is not complete until the remaining exit criteria
+below are closed.
+
 Extract the shared `chunk_sealer.zig` core from `dirty_ram.zig` (RAM path
 refactored onto it, behavior-identical); implement `snapshot()` on that
 core; cut `spore save` to emit index + chunks + v2 manifest; cut
 restore/resume to open indexes. Delete `LayeredCowDisk`, layer chains,
 `spore.DiskLayer`.
+
+Landed behavior: RAM sealing and disk snapshotting share
+`src/chunk_sealer.zig` for zero elision, BLAKE3 chunk identity, and verified
+write-if-missing CAS publication. `ChunkMappedDisk.snapshotIndex()` writes
+nonzero chunks and a `spore-disk-index-v1` under the rootfs CAS namespace and
+returns a `chunk-index-disk-v0` manifest disk. Runtime restore materializes
+`chunk-index-disk-v0` manifests from the saved index and chunk objects before
+attaching virtio-blk; old layer chains are no longer opened by
+`runtime_disk.open`.
+
+Validation: `mise run test` covers the RAM sealer on the shared core, direct
+disk snapshot index/object emission, and runtime restore of a chunk-index disk
+manifest preserving guest-visible bytes.
+
+Remaining before U3 is complete: `snapshotIndex()` still scans the full mapped
+disk because parent index digests are not yet retained in `ChunkMappedDisk`;
+the O(dirty) snapshot path lands with the parent-index identity work. Legacy
+`disk-layer-v0` parser helpers also remain isolated until the cleanup pass
+deletes old format support.
 
 Done when: save→restore round trip preserves guest-visible disk state
 (existing lifecycle tests, rewritten for v2); the RAM sealer's existing

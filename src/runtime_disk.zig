@@ -3,8 +3,10 @@
 const std = @import("std");
 
 const block_source = @import("block_source.zig");
+const chunk = @import("chunk.zig");
 const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
 const Context = @import("context.zig").Context;
+const disk_index = @import("disk_index.zig");
 const disk_layer = @import("disk_layer.zig");
 const fd_util = @import("fd.zig");
 const local_paths = @import("local_paths.zig");
@@ -31,11 +33,9 @@ pub const RuntimeDisk = struct {
     rootfs_fd: ?std.c.fd_t = null,
     overlay: ?disk_layer.TempOverlay = null,
     chunk_mapped: ?chunk_mapped_disk.ChunkMappedDisk = null,
-    layered_cow: ?disk_layer.LayeredCowDisk = null,
     base_disk: ?spore.Disk = null,
 
     pub fn backend(self: *RuntimeDisk) ?virtio_blk.Backend {
-        if (self.layered_cow) |*disk| return .{ .layered_cow = disk };
         if (self.chunk_mapped) |*disk| return .{ .chunk_mapped = disk };
         if (self.rootfs_fd) |fd| return .{ .file = fd };
         return null;
@@ -43,13 +43,11 @@ pub const RuntimeDisk = struct {
 
     pub fn snapshot(self: *RuntimeDisk) ?disk_layer.SnapshotState {
         const base = self.base_disk orelse return null;
-        if (self.layered_cow) |*disk| return .{ .base = base, .active = .{ .layered_cow = disk } };
         if (self.chunk_mapped) |*disk| return .{ .base = base, .active = .{ .chunk_mapped = disk } };
         return null;
     }
 
     pub fn deinit(self: *RuntimeDisk) void {
-        if (self.layered_cow) |*disk| disk.deinit();
         if (self.chunk_mapped) |*disk| disk.deinit();
         if (self.overlay) |*overlay| overlay.deinit();
         if (self.rootfs_fd) |fd| _ = std.c.close(fd);
@@ -96,19 +94,31 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
     if (options.disk) |disk| {
         const rootfs = options.rootfs orelse return error.BadManifest;
         const spore_dir = options.spore_dir orelse return error.BadManifest;
+        const is_chunk_index = std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index);
+        const is_cow_block = std.mem.eql(u8, disk.kind, spore.disk_kind_cow_block);
+        if (!is_chunk_index and !is_cow_block) return error.BadManifest;
+        if (!spore.rootfsDeviceEql(disk.device, rootfs.device)) return error.BadManifest;
+        if (is_chunk_index and disk.layers.len != 0) return error.BadManifest;
         if (disk.size != spore.effectiveRootfsLogicalSize(rootfs) or
-            !std.mem.eql(u8, disk.base, spore.effectiveRootfsBaseIdentity(rootfs))) return error.BadManifest;
+            (is_cow_block and
+                !std.mem.eql(u8, disk.base, spore.effectiveRootfsBaseIdentity(rootfs)))) return error.BadManifest;
+        if (is_chunk_index) {
+            if (runtime.rootfs_fd) |fd| {
+                _ = std.c.close(fd);
+                runtime.rootfs_fd = null;
+            }
+            runtime.rootfs_fd = try materializeDiskIndexToTemp(context, allocator, spore_dir, disk);
+            runtime.overlay = try disk_layer.createTempOverlay(allocator);
+            const base_source = try runtime.baseSource(disk.size);
+            runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, disk.size, disk.chunk_size);
+            runtime.base_disk = disk;
+            return runtime;
+        }
         const base_source = try runtime.baseSource(disk.size);
         runtime.overlay = try disk_layer.createTempOverlay(allocator);
-        if (disk.layers.len == 0) {
-            runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, disk.size, rootfs_cas.default_chunk_size);
-            runtime.base_disk = disk;
-        } else {
-            const layers = try disk_layer.loadLayerChain(allocator, spore_dir, disk);
-            errdefer disk_layer.freeLayerChain(allocator, layers);
-            runtime.layered_cow = try disk_layer.LayeredCowDisk.init(allocator, spore_dir, base_source, runtime.overlay.?.fd, disk, layers);
-            runtime.base_disk = disk;
-        }
+        if (disk.layers.len != 0) return error.BadManifest;
+        runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, disk.size, rootfs_cas.default_chunk_size);
+        runtime.base_disk = disk;
         return runtime;
     }
 
@@ -147,6 +157,68 @@ fn fdSize(fd: std.c.fd_t) !u64 {
     if (std.c.lseek(fd, cur, std.c.SEEK.SET) < 0) return error.BadManifest;
     if (end == 0) return error.BadManifest;
     return @intCast(end);
+}
+
+fn materializeDiskIndexToTemp(context: Context, allocator: std.mem.Allocator, spore_dir: []const u8, disk: spore.Disk) !std.c.fd_t {
+    const storage = spore.RootfsStorage{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = disk.device,
+        .logical_size = disk.size,
+        .chunk_size = disk.chunk_size,
+        .hash_algorithm = disk.hash_algorithm,
+        .index_digest = disk.base,
+        .base_identity = disk.base,
+        .object_namespace = disk.object_namespace,
+    };
+    try spore.validateRootfsStorageDescriptor(storage);
+
+    var temp = try disk_layer.createTempOverlay(allocator);
+    errdefer temp.deinit();
+    const logical_size = std.math.cast(std.c.off_t, disk.size) orelse return error.BadManifest;
+    if (std.c.ftruncate(temp.fd, logical_size) != 0) return error.IoFailed;
+
+    const index_path = try rootfs_cas.manifestIndexPath(allocator, spore_dir, disk.base);
+    defer allocator.free(index_path);
+    const index_bytes = Io.Dir.cwd().readFileAlloc(context.io, index_path, allocator, .limited(disk_index.max_index_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return error.BadManifest,
+        else => |e| return e,
+    };
+    defer allocator.free(index_bytes);
+    const parsed = try disk_index.parseDiskIndex(allocator, index_bytes, storage);
+    defer parsed.deinit();
+
+    for (parsed.value.chunks) |entry| {
+        const object_path = try rootfs_cas.manifestObjectPath(allocator, spore_dir, entry.digest);
+        defer allocator.free(object_path);
+        const len = try rootfs_cas.storageChunkLen(storage, entry.logical_chunk);
+        const limit = std.math.add(usize, len, 1) catch return error.BadManifest;
+        const object = Io.Dir.cwd().readFileAlloc(context.io, object_path, allocator, .limited(limit)) catch |err| switch (err) {
+            error.FileNotFound, error.StreamTooLong => return error.BadManifest,
+            else => |e| return e,
+        };
+        defer allocator.free(object);
+        if (object.len != len) return error.BadManifest;
+        const hex = try spore.diskDigestHex(entry.digest);
+        const id = chunk.ChunkId.fromHex(hex) catch return error.BadManifest;
+        if (!id.matches(object)) return error.BadManifest;
+        const offset = std.math.mul(u64, entry.logical_chunk, storage.chunk_size) catch return error.BadManifest;
+        try pwriteAll(temp.fd, object, offset);
+    }
+
+    const fd = temp.fd;
+    temp.fd = -1;
+    return fd;
+}
+
+fn pwriteAll(fd: std.c.fd_t, bytes: []const u8, offset: u64) !void {
+    var done: usize = 0;
+    while (done < bytes.len) {
+        const absolute = std.math.add(u64, offset, done) catch return error.BadManifest;
+        const file_offset = std.math.cast(std.c.off_t, absolute) orelse return error.BadManifest;
+        const n = std.c.pwrite(fd, bytes.ptr + done, bytes.len - done, file_offset);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
 }
 
 fn openTrustedRootfs(context: Context, allocator: std.mem.Allocator, rootfs: spore.Rootfs, trace_fd: ?std.c.fd_t) !std.c.fd_t {
@@ -453,4 +525,104 @@ test "runtime disk manifest rootfs cas fails closed without index" {
     try std.testing.expectError(error.MissingChunk, open(context, allocator, .{
         .rootfs = rootfs,
     }));
+}
+
+test "runtime disk rejects unknown disk kinds" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-runtime-disk-unknown-kind";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    const spore_dir = tmp ++ "/saved.spore";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, spore_dir);
+
+    const rootfs_bytes = "abcd" ** 1024;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    const context = Context{ .io = io, .environ_map = &env };
+    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
+    const disk = spore.Disk{
+        .kind = "not-a-disk-kind",
+        .device = rootfs.device,
+        .size = rootfs_bytes.len,
+        .base = artifact.digest,
+    };
+
+    try std.testing.expectError(error.BadManifest, open(context, allocator, .{
+        .rootfs = rootfs,
+        .disk = disk,
+        .spore_dir = spore_dir,
+    }));
+}
+
+test "runtime disk restores chunk-index disk manifests" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-runtime-disk-chunk-index-restore";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    const spore_dir = tmp ++ "/saved.spore";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, spore_dir);
+
+    const rootfs_bytes = ("abcd" ** 1024) ++ ("efgh" ** 1024);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+
+    const base_fd = std.c.open(try arena.dupeZ(u8, rootfs_path), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    if (base_fd < 0) return error.IoFailed;
+    defer _ = std.c.close(base_fd);
+    var overlay = try disk_layer.createTempOverlay(arena);
+    defer overlay.deinit();
+
+    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
+    const base_source = block_source.FileBlockSource.init(base_fd, rootfs_bytes.len);
+    var source_disk = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, overlay.fd, rootfs_bytes.len, rootfs_cas.default_chunk_size);
+    defer source_disk.deinit();
+
+    const patch = "chunk-index restore";
+    try source_disk.writeAt(patch, 4096 + 32);
+    const saved_disk = try source_disk.snapshotIndex(spore_dir, rootfs.device);
+    defer {
+        allocator.free(saved_disk.kind);
+        allocator.free(saved_disk.device.kind);
+        allocator.free(saved_disk.device.role);
+        allocator.free(saved_disk.base);
+        allocator.free(saved_disk.hash_algorithm);
+        allocator.free(saved_disk.object_namespace);
+    }
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    const context = Context{ .io = io, .environ_map = &env };
+
+    var runtime = try open(context, allocator, .{
+        .rootfs = rootfs,
+        .disk = saved_disk,
+        .spore_dir = spore_dir,
+    });
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.chunk_mapped != null);
+    var readback: [patch.len]u8 = undefined;
+    try runtime.chunk_mapped.?.readAt(&readback, 4096 + 32);
+    try std.testing.expectEqualStrings(patch, &readback);
 }

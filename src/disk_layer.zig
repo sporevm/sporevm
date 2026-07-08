@@ -252,8 +252,13 @@ pub const SnapshotState = struct {
             try copyLayerChain(allocator, source_dir, dir, self.base);
         }
         if (self.active.dirtyClusterCount() == 0) {
+            if (std.mem.eql(u8, self.base.kind, spore.disk_kind_chunk_index)) return try cloneDisk(allocator, self.base);
             if (self.base.layers.len == 0) return null;
             return try cloneDisk(allocator, self.base);
+        }
+        switch (self.active) {
+            .chunk_mapped => |disk| return try disk.snapshotIndex(dir, self.base.device),
+            else => {},
         }
 
         const sealed = try self.active.seal(allocator, dir);
@@ -272,6 +277,7 @@ pub fn createTempOverlay(allocator: std.mem.Allocator) Error!TempOverlay {
 
 pub fn diskFromRootfs(rootfs: spore.Rootfs) spore.Disk {
     return .{
+        .kind = spore.disk_kind_cow_block,
         .device = rootfs.device,
         .size = spore.effectiveRootfsLogicalSize(rootfs),
         .base = spore.effectiveRootfsBaseIdentity(rootfs),
@@ -290,6 +296,9 @@ pub fn cloneDisk(allocator: std.mem.Allocator, disk: spore.Disk) Error!spore.Dis
         .device = try spore.cloneRootfsDevice(allocator, disk.device),
         .size = disk.size,
         .base = try allocator.dupe(u8, disk.base),
+        .chunk_size = disk.chunk_size,
+        .hash_algorithm = try allocator.dupe(u8, disk.hash_algorithm),
+        .object_namespace = try allocator.dupe(u8, disk.object_namespace),
         .layers = layers,
     };
 }
@@ -339,6 +348,9 @@ fn appendLayer(allocator: std.mem.Allocator, disk: spore.Disk, layer_ref: []cons
         .device = try spore.cloneRootfsDevice(allocator, disk.device),
         .size = disk.size,
         .base = try allocator.dupe(u8, disk.base),
+        .chunk_size = disk.chunk_size,
+        .hash_algorithm = try allocator.dupe(u8, disk.hash_algorithm),
+        .object_namespace = try allocator.dupe(u8, disk.object_namespace),
         .layers = layers,
     };
 }

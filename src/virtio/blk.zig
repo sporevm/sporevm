@@ -8,7 +8,6 @@ const std = @import("std");
 const block_source = @import("../block_source.zig");
 const chunk_mapped_disk = @import("../chunk_mapped_disk.zig");
 const cow_disk = @import("../cow_disk.zig");
-const disk_layer = @import("../disk_layer.zig");
 const guestmem = @import("../guestmem.zig");
 const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
@@ -33,8 +32,6 @@ pub const Backend = union(enum) {
     chunk_mapped: *chunk_mapped_disk.ChunkMappedDisk,
     /// Immutable base plus local sparse writable head.
     cow: *cow_disk.CowDisk,
-    /// Immutable base plus sealed layers plus local sparse writable head.
-    layered_cow: *disk_layer.LayeredCowDisk,
     /// In-memory disk, used by tests.
     memory: []u8,
 
@@ -45,7 +42,6 @@ pub const Backend = union(enum) {
             },
             .chunk_mapped => |disk| return disk.capacityBytes(),
             .cow => |disk| return disk.capacityBytes(),
-            .layered_cow => |disk| return disk.capacityBytes(),
             .memory => |m| return m.len,
         }
     }
@@ -66,10 +62,6 @@ pub const Backend = union(enum) {
                 return true;
             },
             .cow => |disk| {
-                disk.readAt(buf, offset) catch return false;
-                return true;
-            },
-            .layered_cow => |disk| {
                 disk.readAt(buf, offset) catch return false;
                 return true;
             },
@@ -100,10 +92,6 @@ pub const Backend = union(enum) {
                 disk.writeAt(buf, offset) catch return false;
                 return true;
             },
-            .layered_cow => |disk| {
-                disk.writeAt(buf, offset) catch return false;
-                return true;
-            },
             .memory => |m| {
                 if (offset + buf.len > m.len) return false;
                 @memcpy(m[@intCast(offset)..][0..buf.len], buf);
@@ -120,10 +108,6 @@ pub const Backend = union(enum) {
                 return true;
             },
             .cow => |disk| {
-                disk.flush() catch return false;
-                return true;
-            },
-            .layered_cow => |disk| {
                 disk.flush() catch return false;
                 return true;
             },

@@ -2,8 +2,8 @@
 //!
 //! A spore is a directory rooted at `manifest.json`. Guest memory is stored as
 //! fixed-size `chunks/<blake3-hex>` files with all-zero chunks elided; optional
-//! writable disk layers use verified `disklayers/` indexes and `diskobjects/`
-//! clusters. Machine state is normalized architectural aarch64 state — never raw
+//! writable disks use verified chunk indexes and CAS objects. Machine state is
+//! normalized architectural aarch64 state — never raw
 //! hypervisor structures (see docs/spore-format.md). Format v0 is the current
 //! manifest contract; future versions should be deliberate migrations.
 //!
@@ -309,6 +309,7 @@ pub const Rootfs = struct {
 };
 
 pub const disk_kind_cow_block = "cow-block-v0";
+pub const disk_kind_chunk_index = "chunk-index-disk-v0";
 pub const disk_layer_kind = "disk-layer-v0";
 pub const disk_digest_prefix = rootfs_digest_prefix;
 
@@ -316,7 +317,14 @@ pub const Disk = struct {
     kind: []const u8 = disk_kind_cow_block,
     device: RootfsDevice,
     size: u64,
+    /// For `chunk-index-disk-v0`, this is the BLAKE3 digest of the disk index.
+    /// For legacy `cow-block-v0`, this is the immutable rootfs base identity.
     base: []const u8,
+    chunk_size: u64 = 64 * 1024,
+    hash_algorithm: []const u8 = rootfs_storage_hash_algorithm_blake3,
+    object_namespace: []const u8 = rootfs_storage_object_namespace,
+    /// Legacy `cow-block-v0` layer refs. New disk-index manifests keep this
+    /// empty and use `base` as the index identity.
     layers: []const []const u8 = &.{},
 };
 
@@ -1176,24 +1184,44 @@ pub fn rootfsStorageEql(a: RootfsStorage, b: RootfsStorage) bool {
 }
 
 pub fn cloneRootfsDevice(allocator: std.mem.Allocator, device: RootfsDevice) !RootfsDevice {
+    const kind = try allocator.dupe(u8, device.kind);
+    errdefer allocator.free(kind);
+    const role = try allocator.dupe(u8, device.role);
+    errdefer allocator.free(role);
     return .{
-        .kind = try allocator.dupe(u8, device.kind),
-        .role = try allocator.dupe(u8, device.role),
+        .kind = kind,
+        .role = role,
         .virtio_device_id = device.virtio_device_id,
         .mmio_slot = device.mmio_slot,
     };
 }
 
 pub fn cloneRootfsStorage(allocator: std.mem.Allocator, storage: RootfsStorage) !RootfsStorage {
+    const kind = try allocator.dupe(u8, storage.kind);
+    errdefer allocator.free(kind);
+    const device = try cloneRootfsDevice(allocator, storage.device);
+    errdefer {
+        allocator.free(device.kind);
+        allocator.free(device.role);
+    }
+    const hash_algorithm = try allocator.dupe(u8, storage.hash_algorithm);
+    errdefer allocator.free(hash_algorithm);
+    const index_digest = try allocator.dupe(u8, storage.index_digest);
+    errdefer allocator.free(index_digest);
+    const base_identity = try allocator.dupe(u8, storage.base_identity);
+    errdefer allocator.free(base_identity);
+    const object_namespace = try allocator.dupe(u8, storage.object_namespace);
+    errdefer allocator.free(object_namespace);
+
     return .{
-        .kind = try allocator.dupe(u8, storage.kind),
-        .device = try cloneRootfsDevice(allocator, storage.device),
+        .kind = kind,
+        .device = device,
         .logical_size = storage.logical_size,
         .chunk_size = storage.chunk_size,
-        .hash_algorithm = try allocator.dupe(u8, storage.hash_algorithm),
-        .index_digest = try allocator.dupe(u8, storage.index_digest),
-        .base_identity = try allocator.dupe(u8, storage.base_identity),
-        .object_namespace = try allocator.dupe(u8, storage.object_namespace),
+        .hash_algorithm = hash_algorithm,
+        .index_digest = index_digest,
+        .base_identity = base_identity,
+        .object_namespace = object_namespace,
     };
 }
 
@@ -1227,14 +1255,23 @@ pub fn effectiveRootfsLogicalSize(rootfs: Rootfs) u64 {
 
 pub fn validateDisk(disk: Disk, maybe_rootfs: ?Rootfs, devices: []const TransportState) Error!void {
     const rootfs = maybe_rootfs orelse return error.BadManifest;
-    if (!std.mem.eql(u8, disk.kind, disk_kind_cow_block)) return error.BadManifest;
     try validateRootfsDevice(disk.device, devices);
     if (!rootfsDeviceEql(disk.device, rootfs.device)) return error.BadManifest;
     if (disk.size == 0 or disk.size != effectiveRootfsLogicalSize(rootfs)) return error.BadManifest;
-    if (!std.mem.eql(u8, disk.base, effectiveRootfsBaseIdentity(rootfs))) return error.BadManifest;
-    try validateDiskDigest(disk.base);
-    for (disk.layers) |layer_ref| {
-        try validateDiskDigest(layer_ref);
+    if (std.mem.eql(u8, disk.kind, disk_kind_chunk_index)) {
+        try validateDiskDigest(disk.base);
+        if (!validDiskClusterSize(disk.chunk_size)) return error.BadManifest;
+        if (!std.mem.eql(u8, disk.hash_algorithm, rootfs_storage_hash_algorithm_blake3)) return error.BadManifest;
+        if (!std.mem.eql(u8, disk.object_namespace, rootfs_storage_object_namespace)) return error.BadManifest;
+        if (disk.layers.len != 0) return error.BadManifest;
+    } else if (std.mem.eql(u8, disk.kind, disk_kind_cow_block)) {
+        if (!std.mem.eql(u8, disk.base, effectiveRootfsBaseIdentity(rootfs))) return error.BadManifest;
+        try validateDiskDigest(disk.base);
+        for (disk.layers) |layer_ref| {
+            try validateDiskDigest(layer_ref);
+        }
+    } else {
+        return error.BadManifest;
     }
 }
 
@@ -1705,6 +1742,7 @@ fn forkV1(allocator: std.mem.Allocator, options: ForkOptions, parent: ManifestV1
 
 const ForkSharedStores = struct {
     chunks: []const u8,
+    disk_cas: ?[]const u8 = null,
     disk_layers: ?[]const u8 = null,
     disk_objects: ?[]const u8 = null,
 };
@@ -1714,7 +1752,9 @@ fn prepareForkSharedStores(allocator: std.mem.Allocator, parent_dir: []const u8,
     const shared_chunks = try realpathAlloc(allocator, parent_chunks);
     var stores = ForkSharedStores{ .chunks = shared_chunks };
     if (disk) |parent_disk| {
-        if (parent_disk.layers.len > 0) {
+        if (std.mem.eql(u8, parent_disk.kind, disk_kind_chunk_index)) {
+            stores.disk_cas = try realpathAlloc(allocator, try pathZ(allocator, "{s}/cas", .{parent_dir}));
+        } else if (parent_disk.layers.len > 0) {
             stores.disk_layers = try realpathAlloc(allocator, try pathZ(allocator, "{s}/disklayers", .{parent_dir}));
             stores.disk_objects = try realpathAlloc(allocator, try pathZ(allocator, "{s}/diskobjects", .{parent_dir}));
         }
@@ -1725,6 +1765,9 @@ fn prepareForkSharedStores(allocator: std.mem.Allocator, parent_dir: []const u8,
 
 fn linkForkSharedStores(allocator: std.mem.Allocator, child_dir: []const u8, stores: ForkSharedStores) Error!void {
     try symlinkPath(stores.chunks, try pathZ(allocator, "{s}/chunks", .{child_dir}));
+    if (stores.disk_cas) |cas| {
+        try symlinkPath(cas, try pathZ(allocator, "{s}/cas", .{child_dir}));
+    }
     if (stores.disk_layers) |layers| {
         try symlinkPath(layers, try pathZ(allocator, "{s}/disklayers", .{child_dir}));
     }

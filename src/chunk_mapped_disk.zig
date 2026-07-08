@@ -7,6 +7,10 @@
 
 const std = @import("std");
 const block_source = @import("block_source.zig");
+const chunk_sealer = @import("chunk_sealer.zig");
+const disk_index = @import("disk_index.zig");
+const rootfs_cas = @import("rootfs_cas.zig");
+const spore = @import("spore.zig");
 
 pub const Error = error{
     BadClusterSize,
@@ -17,7 +21,7 @@ pub const Error = error{
     ShortWrite,
     ResizeFailed,
     FlushFailed,
-} || block_source.Error || std.mem.Allocator.Error;
+} || chunk_sealer.Error || spore.Error || block_source.Error || std.mem.Allocator.Error;
 
 const Source = enum(u8) {
     base,
@@ -194,6 +198,96 @@ pub const ChunkMappedDisk = struct {
         }
     }
 
+    pub fn snapshotIndex(self: *ChunkMappedDisk, dir: []const u8, device: spore.RootfsDevice) Error!spore.Disk {
+        var chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty;
+        errdefer {
+            for (chunks.items) |entry| self.allocator.free(entry.digest);
+            chunks.deinit(self.allocator);
+        }
+        var zero_chunks: std.ArrayList(u64) = .empty;
+        errdefer zero_chunks.deinit(self.allocator);
+
+        const object_dir = try objectDir(self.allocator, dir);
+        defer self.allocator.free(object_dir);
+        try chunk_sealer.ensureDirPath(self.allocator, object_dir);
+
+        const max_chunk_size = std.math.cast(usize, self.chunk_size) orelse return error.BadClusterSize;
+        const buf = try self.allocator.alloc(u8, max_chunk_size);
+        defer self.allocator.free(buf);
+        var work_stats: chunk_sealer.WorkStats = .{};
+
+        for (0..self.chunkCount()) |chunk_index| {
+            const len = try self.chunkLen(chunk_index);
+            const data = buf[0..len];
+            try self.readChunk(chunk_index, data);
+            switch (try chunk_sealer.sealBytes(data, &work_stats)) {
+                .zero => try zero_chunks.append(self.allocator, @intCast(chunk_index)),
+                .data => |id| {
+                    const hex = id.toHex();
+                    const digest = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, hex[0..] });
+                    errdefer self.allocator.free(digest);
+                    const object_path = try rootfs_cas.manifestObjectPath(self.allocator, dir, digest);
+                    defer self.allocator.free(object_path);
+                    try chunk_sealer.writePathAllIfMissingTimed(self.allocator, object_path, data, &work_stats);
+                    try chunks.append(self.allocator, .{
+                        .logical_chunk = @intCast(chunk_index),
+                        .digest = digest,
+                    });
+                },
+            }
+        }
+
+        const chunk_slice = try chunks.toOwnedSlice(self.allocator);
+        defer {
+            for (chunk_slice) |entry| self.allocator.free(entry.digest);
+            self.allocator.free(chunk_slice);
+        }
+        const zero_slice = try zero_chunks.toOwnedSlice(self.allocator);
+        defer self.allocator.free(zero_slice);
+
+        const index = disk_index.DiskIndex{
+            .kind = disk_index.disk_index_kind,
+            .logical_size = self.size,
+            .chunk_size = self.chunk_size,
+            .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+            .object_namespace = spore.rootfs_storage_object_namespace,
+            .chunks = chunk_slice,
+            .zero_chunks = zero_slice,
+        };
+        const index_json = std.json.Stringify.valueAlloc(self.allocator, index, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
+        defer self.allocator.free(index_json);
+        const index_digest = try disk_index.indexDigestAlloc(self.allocator, index_json);
+        errdefer self.allocator.free(index_digest);
+        const index_path = try rootfs_cas.manifestIndexPath(self.allocator, dir, index_digest);
+        defer self.allocator.free(index_path);
+        const index_dir = std.fs.path.dirname(index_path) orelse return error.IoFailed;
+        try chunk_sealer.ensureDirPath(self.allocator, index_dir);
+        try chunk_sealer.writePathAllIfMissingTimed(self.allocator, index_path, index_json, &work_stats);
+
+        const kind = try self.allocator.dupe(u8, spore.disk_kind_chunk_index);
+        errdefer self.allocator.free(kind);
+        const cloned_device = try spore.cloneRootfsDevice(self.allocator, device);
+        errdefer {
+            self.allocator.free(cloned_device.kind);
+            self.allocator.free(cloned_device.role);
+        }
+        const hash_algorithm = try self.allocator.dupe(u8, spore.rootfs_storage_hash_algorithm_blake3);
+        errdefer self.allocator.free(hash_algorithm);
+        const object_namespace = try self.allocator.dupe(u8, spore.rootfs_storage_object_namespace);
+        errdefer self.allocator.free(object_namespace);
+
+        return .{
+            .kind = kind,
+            .device = cloned_device,
+            .size = self.size,
+            .base = index_digest,
+            .chunk_size = self.chunk_size,
+            .hash_algorithm = hash_algorithm,
+            .object_namespace = object_namespace,
+            .layers = &.{},
+        };
+    }
+
     fn checkRange(self: ChunkMappedDisk, len: usize, offset: u64) Error!void {
         const end = std.math.add(u64, offset, len) catch return error.OutOfRange;
         if (end > self.size) return error.OutOfRange;
@@ -256,6 +350,10 @@ fn writeExact(fd: std.c.fd_t, buf: []const u8, offset: u64) Error!void {
         if (n <= 0) return error.ShortWrite;
         done += @intCast(n);
     }
+}
+
+fn objectDir(allocator: std.mem.Allocator, dir: []const u8) Error![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}/cas/rootfs/blake3/objects", .{dir}) catch return error.OutOfMemory;
 }
 
 test "partial write preserves untouched bytes from base" {
@@ -370,6 +468,71 @@ test "zero chunks seed partial overlay writes from zeroes" {
     try std.testing.expect(std.mem.allEqual(u8, readback[0..10], 0));
     try std.testing.expectEqualSlices(u8, &patch, readback[10..14]);
     try std.testing.expect(std.mem.allEqual(u8, readback[14..], 0));
+}
+
+test "snapshot writes disk index and chunk objects" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const spore_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/spore", .{tmp.sub_path[0..]});
+    defer allocator.free(spore_dir);
+    try std.Io.Dir.cwd().createDirPath(io, spore_dir);
+
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+
+    const base_bytes = [_]u8{0} ** 1024;
+    try base.writeStreamingAll(io, &base_bytes);
+
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
+    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, base_bytes.len, 512);
+    defer disk.deinit();
+
+    const patch = [_]u8{0x5A} ** 16;
+    try disk.writeAt(&patch, 600);
+
+    const manifest_disk = try disk.snapshotIndex(spore_dir, .{ .mmio_slot = 1 });
+    defer {
+        allocator.free(manifest_disk.kind);
+        allocator.free(manifest_disk.device.kind);
+        allocator.free(manifest_disk.device.role);
+        allocator.free(manifest_disk.base);
+        allocator.free(manifest_disk.hash_algorithm);
+        allocator.free(manifest_disk.object_namespace);
+    }
+
+    try std.testing.expectEqualStrings(spore.disk_kind_chunk_index, manifest_disk.kind);
+    try std.testing.expectEqual(@as(u64, 512), manifest_disk.chunk_size);
+    try std.testing.expectEqual(@as(usize, 0), manifest_disk.layers.len);
+
+    const index_path = try rootfs_cas.manifestIndexPath(allocator, spore_dir, manifest_disk.base);
+    defer allocator.free(index_path);
+    const index_bytes = try std.Io.Dir.cwd().readFileAlloc(io, index_path, allocator, .limited(disk_index.max_index_bytes));
+    defer allocator.free(index_bytes);
+    const storage = spore.RootfsStorage{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = manifest_disk.device,
+        .logical_size = manifest_disk.size,
+        .chunk_size = manifest_disk.chunk_size,
+        .hash_algorithm = manifest_disk.hash_algorithm,
+        .index_digest = manifest_disk.base,
+        .base_identity = manifest_disk.base,
+        .object_namespace = manifest_disk.object_namespace,
+    };
+    const parsed = try disk_index.parseDiskIndex(allocator, index_bytes, storage);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.chunks.len);
+    try std.testing.expectEqual(@as(u64, 1), parsed.value.chunks[0].logical_chunk);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.zero_chunks.len);
+    try std.testing.expectEqual(@as(u64, 0), parsed.value.zero_chunks[0]);
+
+    const object_path = try rootfs_cas.manifestObjectPath(allocator, spore_dir, parsed.value.chunks[0].digest);
+    defer allocator.free(object_path);
+    try std.Io.Dir.cwd().access(io, object_path, .{ .read = true });
 }
 
 test "read only disk rejects writes" {

@@ -3870,6 +3870,8 @@ test "run from carries writable disk manifests into runtime options" {
         std.testing.allocator.free(disk.device.kind);
         std.testing.allocator.free(disk.device.role);
         std.testing.allocator.free(disk.base);
+        std.testing.allocator.free(disk.hash_algorithm);
+        std.testing.allocator.free(disk.object_namespace);
         std.testing.allocator.free(disk.layers);
     }
     try std.testing.expectEqualStrings("blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", disk.base);
