@@ -7,6 +7,7 @@ const chunk = @import("chunk.zig");
 const disk_index = @import("disk_index.zig");
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
+const rootfs = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
 const default_prune_max_bytes = 0;
@@ -853,24 +854,33 @@ fn gcRootfsCache(
     io: Io,
     options: GcOptions,
 ) !RootfsGcResult {
+    var cache_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, options.cache_root);
+    defer cache_lock.deinit();
+
     var storage_roots = std.StringHashMap(spore.RootfsStorage).init(allocator);
     var rooted_indexes = std.StringHashMap(void).init(allocator);
     var rooted_objects = std.StringHashMap(void).init(allocator);
+    var conservative_roots = false;
 
-    try collectRootfsStorageRoots(allocator, io, options.cache_root, options.runtime_root, &storage_roots);
-    var storage_it = storage_roots.iterator();
-    while (storage_it.next()) |entry| {
-        const storage = entry.value_ptr.*;
-        try rooted_indexes.put(storage.index_digest, {});
-        const index_path = try rootfs_cas.manifestIndexPath(allocator, options.cache_root, storage.index_digest);
-        const bytes = Io.Dir.cwd().readFileAlloc(io, index_path, allocator, .limited(disk_index.max_index_bytes)) catch |err| switch (err) {
-            error.FileNotFound, error.StreamTooLong => return error.BadManifest,
-            else => |e| return e,
-        };
-        const descriptor = spore.diskIndexDescriptorForStorage(storage) catch return error.BadManifest;
-        const parsed = disk_index.parseDiskIndex(allocator, bytes, descriptor) catch return error.BadManifest;
-        for (parsed.value.chunks) |chunk_entry| {
-            try rooted_objects.put(chunk_entry.digest, {});
+    try collectRootfsStorageRoots(allocator, io, options.cache_root, options.runtime_root, &storage_roots, &conservative_roots);
+    if (conservative_roots) {
+        try markAllGcCasEntriesRooted(allocator, io, options.cache_root, "cas/rootfs/blake3/indexes", ".json", &rooted_indexes);
+        try markAllGcCasEntriesRooted(allocator, io, options.cache_root, "cas/rootfs/blake3/objects", ".chunk", &rooted_objects);
+    } else {
+        var storage_it = storage_roots.iterator();
+        while (storage_it.next()) |entry| {
+            const storage = entry.value_ptr.*;
+            try rooted_indexes.put(storage.index_digest, {});
+            const index_path = try rootfs_cas.manifestIndexPath(allocator, options.cache_root, storage.index_digest);
+            const bytes = Io.Dir.cwd().readFileAlloc(io, index_path, allocator, .limited(disk_index.max_index_bytes)) catch |err| switch (err) {
+                error.FileNotFound, error.StreamTooLong => return error.BadManifest,
+                else => |e| return e,
+            };
+            const descriptor = spore.diskIndexDescriptorForStorage(storage) catch return error.BadManifest;
+            const parsed = disk_index.parseDiskIndex(allocator, bytes, descriptor) catch return error.BadManifest;
+            for (parsed.value.chunks) |chunk_entry| {
+                try rooted_objects.put(chunk_entry.digest, {});
+            }
         }
     }
 
@@ -912,7 +922,7 @@ fn gcRootfsCache(
     return .{
         .cache_root = options.cache_root,
         .dry_run = options.dry_run,
-        .rooted_indexes = storage_roots.count(),
+        .rooted_indexes = rooted_indexes.count(),
         .rooted_objects = rooted_objects.count(),
         .candidate_count = entries.len,
         .candidate_bytes = candidate_bytes,
@@ -928,9 +938,10 @@ fn collectRootfsStorageRoots(
     cache_root: []const u8,
     runtime_root: ?[]const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
+    conservative_roots: *bool,
 ) !void {
-    try collectStorageRootsFromCacheMetadata(allocator, io, cache_root, storage_roots);
-    try collectStorageRootsFromRefRecords(allocator, io, cache_root, storage_roots);
+    try collectStorageRootsFromCacheMetadata(allocator, io, cache_root, storage_roots, conservative_roots);
+    try collectStorageRootsFromRefRecords(allocator, io, cache_root, storage_roots, conservative_roots);
     if (runtime_root) |root| {
         try collectStorageRootsFromRuntimeManifests(allocator, io, root, storage_roots);
     }
@@ -941,6 +952,7 @@ fn collectStorageRootsFromCacheMetadata(
     io: Io,
     cache_root: []const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
+    conservative_roots: *bool,
 ) !void {
     var root = openDirPath(io, cache_root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -952,7 +964,10 @@ fn collectStorageRootsFromCacheMetadata(
     while (try it.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
         const path = try std.fs.path.join(allocator, &.{ cache_root, entry.name });
-        try collectStorageRootFromMetadataPath(allocator, io, path, storage_roots);
+        collectStorageRootFromMetadataPath(allocator, io, path, storage_roots) catch |err| {
+            conservative_roots.* = true;
+            std.log.warn("spore cache gc: treating unrecognized rootfs metadata as a conservative root: path={s} error={s}", .{ path, @errorName(err) });
+        };
     }
 }
 
@@ -961,6 +976,7 @@ fn collectStorageRootsFromRefRecords(
     io: Io,
     cache_root: []const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
+    conservative_roots: *bool,
 ) !void {
     const refs_path = try std.fs.path.join(allocator, &.{ cache_root, "refs" });
     var refs = openDirPath(io, refs_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -968,7 +984,7 @@ fn collectStorageRootsFromRefRecords(
         else => |e| return e,
     };
     defer refs.close(io);
-    try collectStorageRootsFromRefDir(allocator, io, refs_path, refs, cache_root, storage_roots);
+    try collectStorageRootsFromRefDir(allocator, io, refs_path, refs, cache_root, storage_roots, conservative_roots);
 }
 
 fn collectStorageRootsFromRefDir(
@@ -978,6 +994,7 @@ fn collectStorageRootsFromRefDir(
     dir: Io.Dir,
     cache_root: []const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
+    conservative_roots: *bool,
 ) !void {
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
@@ -985,9 +1002,12 @@ fn collectStorageRootsFromRefDir(
         if (entry.kind == .directory) {
             var child = try dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
             defer child.close(io);
-            try collectStorageRootsFromRefDir(allocator, io, path, child, cache_root, storage_roots);
+            try collectStorageRootsFromRefDir(allocator, io, path, child, cache_root, storage_roots, conservative_roots);
         } else if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".json")) {
-            try collectStorageRootFromRefPath(allocator, io, cache_root, path, storage_roots);
+            collectStorageRootFromRefPath(allocator, io, cache_root, path, storage_roots) catch |err| {
+                conservative_roots.* = true;
+                std.log.warn("spore cache gc: treating unrecognized rootfs ref as a conservative root: path={s} error={s}", .{ path, @errorName(err) });
+            };
         }
     }
 }
@@ -1019,9 +1039,8 @@ fn collectStorageRootFromMetadataPath(
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch return error.BadManifest;
-    if (parsed.value.rootfs_storage) |storage| {
-        try addStorageRoot(storage_roots, storage);
-    }
+    const storage = parsed.value.rootfs_storage orelse return error.BadManifest;
+    try addStorageRoot(storage_roots, storage);
 }
 
 fn collectStorageRootFromRefPath(
@@ -1039,7 +1058,7 @@ fn collectStorageRootFromRefPath(
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch return error.BadManifest;
-    const cache_key = parsed.value.rootfs_cache_key orelse return;
+    const cache_key = parsed.value.rootfs_cache_key orelse return error.BadManifest;
     if (!isLowerHexDigest(cache_key)) return error.BadManifest;
     const metadata_name = try std.fmt.allocPrint(allocator, "{s}.json", .{cache_key});
     const metadata_path = try std.fs.path.join(allocator, &.{ cache_root, metadata_name });
@@ -1060,8 +1079,8 @@ fn collectStorageRootFromManifestPath(
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch return error.BadManifest;
-    const rootfs = parsed.value.rootfs orelse return;
-    if (rootfs.storage) |storage| {
+    const rootfs_record = parsed.value.rootfs orelse return;
+    if (rootfs_record.storage) |storage| {
         try addStorageRoot(storage_roots, storage);
     }
 }
@@ -1069,6 +1088,29 @@ fn collectStorageRootFromManifestPath(
 fn addStorageRoot(storage_roots: *std.StringHashMap(spore.RootfsStorage), storage: spore.RootfsStorage) !void {
     try spore.validateRootfsStorageDescriptor(storage);
     try storage_roots.put(storage.index_digest, storage);
+}
+
+fn markAllGcCasEntriesRooted(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    sub_path: []const u8,
+    suffix: []const u8,
+    rooted: *std.StringHashMap(void),
+) !void {
+    const dir_path = try std.fs.path.join(allocator, &.{ cache_root, sub_path });
+    var dir = openDirPath(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, suffix)) continue;
+        const digest = digestFromCacheEntryName(allocator, entry.name, suffix) orelse continue;
+        try rooted.put(digest, {});
+    }
 }
 
 fn collectGcCasEntries(
@@ -1994,6 +2036,56 @@ test "system cache gc preserves rooted disk index objects and deletes CAS orphan
     try std.testing.expect(!try fileExists(io, orphan_index_path));
     try std.testing.expect(!try fileExists(io, orphan_object_path));
     try std.testing.expect(!try fileExists(io, stray_object_path));
+}
+
+test "system cache gc treats unknown rootfs records as conservative roots" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root = "zig-cache/test-system-cache-gc-conservative-roots";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    const orphan = try writeGcStorageFixture(allocator, io, root, null, 0x44);
+    const stray_digest = try writeGcObjectFixture(allocator, io, root, 0x55);
+    const orphan_index_path = try rootfs_cas.manifestIndexPath(allocator, root, orphan.storage.index_digest);
+    const orphan_object_path = try rootfs_cas.manifestObjectPath(allocator, root, orphan.object_digest);
+    const stray_object_path = try rootfs_cas.manifestObjectPath(allocator, root, stray_digest);
+
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = root ++ "/future-metadata.json",
+        .data = "{\"kind\":\"future-rootfs-metadata-v99\"}",
+    });
+    try Io.Dir.cwd().createDirPath(io, root ++ "/refs");
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = root ++ "/refs/future-ref.json",
+        .data = "{\"kind\":\"future-rootfs-ref-v99\"}",
+    });
+
+    const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
+    try std.testing.expectEqual(@as(usize, 1), forced.rooted_indexes);
+    try std.testing.expectEqual(@as(usize, 2), forced.rooted_objects);
+    try std.testing.expectEqual(@as(usize, 0), forced.candidate_count);
+    try std.testing.expectEqual(@as(usize, 0), forced.deleted_count);
+    try std.testing.expect(try fileExists(io, orphan_index_path));
+    try std.testing.expect(try fileExists(io, orphan_object_path));
+    try std.testing.expect(try fileExists(io, stray_object_path));
+}
+
+test "system cache gc lock rejects a concurrent holder" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = "zig-cache/test-system-cache-gc-lock";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    var gc_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
+    defer gc_lock.deinit();
+
+    try std.testing.expectError(error.LockBusy, rootfs.tryLockRootfsCacheExclusive(io, allocator, root));
 }
 
 fn writeGcStorageFixture(

@@ -141,6 +141,7 @@ const BuildOptions = struct {
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: ?[]const u8 = null,
     cache_owned_output: bool = false,
+    rootfs_cache_lock_held: bool = false,
 };
 
 pub const ResolvedImage = struct {
@@ -153,6 +154,10 @@ pub const local_ref_cache_kind = "sporevm-local-rootfs-ref-v1";
 const image_ref_cache_record_version: u32 = 1;
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const max_image_ref_cache_record_bytes = 64 * 1024;
+const rootfs_cache_lock_name = ".sporevm-rootfs-cache.lock";
+const flock_exclusive: c_int = 2;
+const flock_nonblocking: c_int = 4;
+const flock_unlock: c_int = 8;
 
 const LocalRefMetadata = struct {
     kind: []const u8 = local_ref_cache_kind,
@@ -162,6 +167,46 @@ const LocalRefMetadata = struct {
     platform: Platform,
     builder_version: []const u8 = builder_version,
 };
+
+pub const RootfsCacheLock = struct {
+    fd: std.c.fd_t = -1,
+
+    pub fn deinit(self: *RootfsCacheLock) void {
+        if (self.fd >= 0) {
+            _ = std.c.flock(self.fd, flock_unlock);
+            _ = std.c.close(self.fd);
+            self.fd = -1;
+        }
+    }
+};
+
+pub fn lockRootfsCacheExclusive(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) !RootfsCacheLock {
+    return openRootfsCacheLock(io, allocator, cache_root, false);
+}
+
+pub fn tryLockRootfsCacheExclusive(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) !RootfsCacheLock {
+    return openRootfsCacheLock(io, allocator, cache_root, true);
+}
+
+fn openRootfsCacheLock(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, nonblocking: bool) !RootfsCacheLock {
+    try ensureDirPath(io, cache_root);
+    const path = try std.fs.path.join(allocator, &.{ cache_root, rootfs_cache_lock_name });
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
+    if (fd < 0) return error.IoFailed;
+    errdefer _ = std.c.close(fd);
+
+    const op = flock_exclusive | if (nonblocking) flock_nonblocking else @as(c_int, 0);
+    if (std.c.flock(fd, op) != 0) {
+        return switch (std.c.errno(-1)) {
+            .AGAIN => if (nonblocking) error.LockBusy else error.IoFailed,
+            else => error.IoFailed,
+        };
+    }
+    return .{ .fd = fd };
+}
 
 pub fn parseResolveOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedResolveOptions {
     if (args.len == 0) {
@@ -857,24 +902,31 @@ pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, req
     defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
     defer Io.Dir.cwd().deleteFile(init.io, temp_metadata_path) catch {};
 
-    const result = try buildRootFSFromLayout(init, allocator, .{
-        .requested_ref = request.ref,
-        .resolved_image_ref = resolved_image_ref,
-        .manifest_digest = source.manifest_digest,
-        .source = source,
-        .output = temp_rootfs_path,
-        .metadata = temp_metadata_path,
-        .platform = request.platform,
-        .mkfs = request.mkfs,
-        .debugfs = request.debugfs,
-        .ext4_writer = ext4_writer_choice,
-        .metadata_rootfs_path = rootfs_path,
-        .temp_dir_root = temp_dir_root,
-        .rootfs_storage = request.rootfs_storage,
-        .cache_owned_output = true,
-    });
-    try Io.Dir.renameAbsolute(temp_rootfs_path, rootfs_path, init.io);
-    try Io.Dir.renameAbsolute(temp_metadata_path, metadata_path, init.io);
+    const result = blk: {
+        var cache_lock = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
+        defer cache_lock.deinit();
+
+        const build_result = try buildRootFSFromLayout(init, allocator, .{
+            .requested_ref = request.ref,
+            .resolved_image_ref = resolved_image_ref,
+            .manifest_digest = source.manifest_digest,
+            .source = source,
+            .output = temp_rootfs_path,
+            .metadata = temp_metadata_path,
+            .platform = request.platform,
+            .mkfs = request.mkfs,
+            .debugfs = request.debugfs,
+            .ext4_writer = ext4_writer_choice,
+            .metadata_rootfs_path = rootfs_path,
+            .temp_dir_root = temp_dir_root,
+            .rootfs_storage = request.rootfs_storage,
+            .cache_owned_output = true,
+            .rootfs_cache_lock_held = true,
+        });
+        try Io.Dir.renameAbsolute(temp_rootfs_path, rootfs_path, init.io);
+        try Io.Dir.renameAbsolute(temp_metadata_path, metadata_path, init.io);
+        break :blk build_result;
+    };
     const local_ref_path = try writeLocalRefCache(init.io, allocator, cache_root, request.ref, resolved);
 
     return .{
@@ -931,24 +983,31 @@ pub fn importTar(init: std.process.Init, allocator: std.mem.Allocator, request: 
     defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
     defer Io.Dir.cwd().deleteFile(init.io, temp_metadata_path) catch {};
 
-    const result = try buildRootFSFromTar(init, allocator, .{
-        .requested_ref = request.ref,
-        .resolved_image_ref = resolved_image_ref,
-        .manifest_digest = input_digest,
-        .input = request.input,
-        .output = temp_rootfs_path,
-        .metadata = temp_metadata_path,
-        .platform = request.platform,
-        .mkfs = request.mkfs,
-        .debugfs = request.debugfs,
-        .ext4_writer = ext4_writer_choice,
-        .metadata_rootfs_path = rootfs_path,
-        .temp_dir_root = temp_dir_root,
-        .rootfs_storage = request.rootfs_storage,
-        .cache_owned_output = true,
-    });
-    try Io.Dir.renameAbsolute(temp_rootfs_path, rootfs_path, init.io);
-    try Io.Dir.renameAbsolute(temp_metadata_path, metadata_path, init.io);
+    const result = blk: {
+        var cache_lock = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
+        defer cache_lock.deinit();
+
+        const build_result = try buildRootFSFromTar(init, allocator, .{
+            .requested_ref = request.ref,
+            .resolved_image_ref = resolved_image_ref,
+            .manifest_digest = input_digest,
+            .input = request.input,
+            .output = temp_rootfs_path,
+            .metadata = temp_metadata_path,
+            .platform = request.platform,
+            .mkfs = request.mkfs,
+            .debugfs = request.debugfs,
+            .ext4_writer = ext4_writer_choice,
+            .metadata_rootfs_path = rootfs_path,
+            .temp_dir_root = temp_dir_root,
+            .rootfs_storage = request.rootfs_storage,
+            .cache_owned_output = true,
+            .rootfs_cache_lock_held = true,
+        });
+        try Io.Dir.renameAbsolute(temp_rootfs_path, rootfs_path, init.io);
+        try Io.Dir.renameAbsolute(temp_metadata_path, metadata_path, init.io);
+        break :blk build_result;
+    };
     const local_ref_path = try writeLocalRefCache(init.io, allocator, cache_root, request.ref, resolved);
 
     return .{
@@ -1037,6 +1096,7 @@ const LayoutBuildOptions = struct {
     temp_dir_root: []const u8,
     rootfs_storage: RootfsStoragePolicy = .chunked,
     cache_owned_output: bool = false,
+    rootfs_cache_lock_held: bool = false,
 };
 
 const TarBuildOptions = struct {
@@ -1054,6 +1114,7 @@ const TarBuildOptions = struct {
     temp_dir_root: []const u8,
     rootfs_storage: RootfsStoragePolicy = .chunked,
     cache_owned_output: bool = false,
+    rootfs_cache_lock_held: bool = false,
 };
 
 const MaterializeLayer = struct {
@@ -1080,6 +1141,7 @@ const MaterializeOptions = struct {
     profile: RootfsBuildProfile,
     rootfs_storage: RootfsStoragePolicy = .chunked,
     cache_owned_output: bool = false,
+    rootfs_cache_lock_held: bool = false,
 };
 
 fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: BuildOptions) !BuildResult {
@@ -1159,6 +1221,7 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
         .profile = profile,
         .rootfs_storage = .chunked,
         .cache_owned_output = opts.cache_owned_output,
+        .rootfs_cache_lock_held = opts.rootfs_cache_lock_held,
     });
     const cleanup_start = profile.start();
     materialize_temp.deinit(init.io);
@@ -1219,6 +1282,7 @@ fn buildRootFSFromLayout(init: std.process.Init, allocator: std.mem.Allocator, o
         .profile = profile,
         .rootfs_storage = opts.rootfs_storage,
         .cache_owned_output = opts.cache_owned_output,
+        .rootfs_cache_lock_held = opts.rootfs_cache_lock_held,
     });
     const cleanup_start = profile.start();
     materialize_temp.deinit(init.io);
@@ -1270,6 +1334,7 @@ fn buildRootFSFromTar(init: std.process.Init, allocator: std.mem.Allocator, opts
         .profile = profile,
         .rootfs_storage = opts.rootfs_storage,
         .cache_owned_output = opts.cache_owned_output,
+        .rootfs_cache_lock_held = opts.rootfs_cache_lock_held,
     });
     const cleanup_start = profile.start();
     materialize_temp.deinit(init.io);
@@ -1348,6 +1413,12 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     const stat = try Io.Dir.cwd().statFile(init.io, opts.output, .{});
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     defer allocator.free(cache_root);
+    var maybe_cache_lock: ?RootfsCacheLock = if (opts.rootfs_cache_lock_held)
+        null
+    else
+        try lockRootfsCacheExclusive(init.io, allocator, cache_root);
+    defer if (maybe_cache_lock) |*lock| lock.deinit();
+
     const rootfs_storage: spore.RootfsStorage = switch (opts.rootfs_storage) {
         .chunked => blk: {
             const preload_start = opts.profile.start();
@@ -1663,6 +1734,9 @@ pub fn writeLocalRefCache(
 
     const path = try localRefCachePath(allocator, cache_root, raw_ref, resolved.platform);
     try ext4.ensureParentDir(io, path);
+    var cache_lock = try lockRootfsCacheExclusive(io, allocator, cache_root);
+    defer cache_lock.deinit();
+
     var nonce_bytes: [8]u8 = undefined;
     io.random(&nonce_bytes);
     const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
@@ -1903,6 +1977,8 @@ pub fn writeImageRefCacheRecord(
 ) !void {
     const refs_dir = try std.fs.path.join(allocator, &.{ cache_root, "refs" });
     try ensureDirPath(io, refs_dir);
+    var cache_lock = try lockRootfsCacheExclusive(io, allocator, cache_root);
+    defer cache_lock.deinit();
 
     const rootfs_cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const platform = try platformTextAlloc(allocator, resolved.platform);
@@ -1986,6 +2062,9 @@ pub fn buildCachedImageRootfs(
     defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
     defer Io.Dir.cwd().deleteFile(init.io, temp_metadata_path) catch {};
 
+    var cache_lock = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
+    defer cache_lock.deinit();
+
     std.log.debug("spore rootfs: building cached rootfs for {s}", .{resolved.ref});
     _ = try buildRootFS(init, allocator, .{
         .ref = resolved.ref,
@@ -1998,6 +2077,7 @@ pub fn buildCachedImageRootfs(
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
         .cache_owned_output = true,
+        .rootfs_cache_lock_held = true,
     });
     try renameCachePath(init.io, temp_rootfs_path, rootfs_path);
     try renameCachePath(init.io, temp_metadata_path, metadata_path);
