@@ -626,10 +626,19 @@ const RootfsBuildProfile = struct {
     }
 
     fn preloadPhase(self: RootfsBuildProfile, start_ms: u64, result: rootfs_cas.PreloadResult) void {
+        self.casPhase("rootfs_cas_preload", start_ms, result);
+    }
+
+    fn inlineCasPhase(self: RootfsBuildProfile, start_ms: u64, result: rootfs_cas.PreloadResult) void {
+        self.casPhase("rootfs_cas_inline", start_ms, result);
+    }
+
+    fn casPhase(self: RootfsBuildProfile, name: []const u8, start_ms: u64, result: rootfs_cas.PreloadResult) void {
         if (!self.enabled) return;
         std.debug.print(
-            "spore rootfs profile: phase=rootfs_cas_preload ms={d} chunks={d} zero_chunks={d} nonzero_chunks={d} objects_written={d} object_bytes_written={d} index_bytes={d} source_verify_ms={d} chunk_scan_ms={d} object_check_ms={d} object_write_ms={d} index_build_ms={d} index_write_ms={d}\n",
+            "spore rootfs profile: phase={s} ms={d} chunks={d} zero_chunks={d} nonzero_chunks={d} objects_written={d} object_bytes_written={d} index_bytes={d} source_verify_ms={d} chunk_scan_ms={d} object_check_ms={d} object_write_ms={d} index_build_ms={d} index_write_ms={d}\n",
             .{
+                name,
                 monotonicMs() -| start_ms,
                 result.chunk_count,
                 result.zero_chunks,
@@ -1406,24 +1415,29 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     if (opts.layers.len > max_rootfs_layers) return error.RootFSTooManyLayers;
     const layer_meta = try allocator.alloc(oci.LayerMetadata, opts.layers.len);
     const deterministic_ext4 = ext4.Determinism.fromDigest(opts.manifest_digest);
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    defer allocator.free(cache_root);
+    var maybe_cache_lock: ?RootfsCacheLock = null;
+    defer if (maybe_cache_lock) |*lock| lock.deinit();
+    const native_inline_cache_root: ?[]const u8 = if (opts.ext4_writer == .native and opts.rootfs_storage == .chunked) cache_root else null;
+    var native_preload_result: ?rootfs_cas.PreloadResult = null;
     switch (opts.ext4_writer) {
-        .native => try materializeRootFSNative(init, allocator, opts, layer_meta, deterministic_ext4),
+        .native => native_preload_result = try materializeRootFSNative(init, allocator, opts, layer_meta, deterministic_ext4, native_inline_cache_root, &maybe_cache_lock),
         .external => try materializeRootFSExternal(init, allocator, opts, layer_meta, deterministic_ext4),
     }
     const stat = try Io.Dir.cwd().statFile(init.io, opts.output, .{});
-    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    defer allocator.free(cache_root);
-    var maybe_cache_lock: ?RootfsCacheLock = if (opts.rootfs_cache_lock_held)
-        null
-    else
-        try lockRootfsCacheExclusive(init.io, allocator, cache_root);
-    defer if (maybe_cache_lock) |*lock| lock.deinit();
+    if (maybe_cache_lock == null and !opts.rootfs_cache_lock_held) {
+        maybe_cache_lock = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
+    }
 
     const rootfs_storage: spore.RootfsStorage = switch (opts.rootfs_storage) {
         .chunked => blk: {
-            const preload_start = opts.profile.start();
-            const preload_result = try rootfs_cas.preloadPath(init.io, allocator, cache_root, opts.output, rootfs_cas.default_chunk_size);
-            opts.profile.preloadPhase(preload_start, preload_result);
+            const preload_result = native_preload_result orelse fallback: {
+                const preload_start = opts.profile.start();
+                const result = try rootfs_cas.preloadPath(init.io, allocator, cache_root, opts.output, rootfs_cas.default_chunk_size);
+                opts.profile.preloadPhase(preload_start, result);
+                break :fallback result;
+            };
             const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
             if (trustedDigestHardlinkEligible(opts.cache_owned_output, opts.output, cache_root)) {
                 const cache_start = opts.profile.start();
@@ -1478,7 +1492,9 @@ fn materializeRootFSNative(
     opts: MaterializeOptions,
     layer_meta: []oci.LayerMetadata,
     deterministic_ext4: ext4.Determinism,
-) !void {
+    inline_cache_root: ?[]const u8,
+    cache_lock: *?RootfsCacheLock,
+) !?rootfs_cas.PreloadResult {
     const native_layers = try allocator.alloc(tar.LayerInput, opts.layers.len);
     defer allocator.free(native_layers);
 
@@ -1509,12 +1525,20 @@ fn materializeRootFSNative(
     opts.profile.phase("ext4_size_scan", scan_start);
 
     const native_start = opts.profile.start();
-    _ = try ext4_writer.emitFromMergedTree(allocator, init.io, &tree, opts.output, .{
+    if (inline_cache_root) |cache_root| {
+        if (cache_lock.* == null and !opts.rootfs_cache_lock_held) {
+            cache_lock.* = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
+        }
+    }
+    const emit_result = try ext4_writer.emitFromMergedTree(allocator, init.io, &tree, opts.output, .{
         .image_size = image_size,
         .inode_count = @intCast(inode_count),
         .determinism = deterministic_ext4,
+        .cas_cache_root = inline_cache_root,
     });
     opts.profile.phase("native_ext4_emit", native_start);
+    if (emit_result.preload_result) |preload_result| opts.profile.inlineCasPhase(native_start, preload_result);
+    return emit_result.preload_result;
 }
 
 fn materializeRootFSExternal(

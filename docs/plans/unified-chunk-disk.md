@@ -460,6 +460,17 @@ writer's unused flat-image digest have been removed from the rootfs build path.
 full-scan fallback), by-digest cache re-keys, refs/metadata carry index
 identity, `rootfs_blake3` and `ensureImageRootfsStorage` deleted.
 
+Landed behavior: the native ext4 writer now streams emitted bytes through an
+inline rootfs CAS/index writer for chunked storage. It writes missing nonzero
+64 KiB objects durably, records zero chunks without materializing them, and
+publishes the rootfs `spore-disk-index-v1` after objects are durable. The
+external writer keeps the full-scan `rootfs_cas_preload` fallback.
+
+Validation: `src/rootfs/ext4_writer.zig` compares the inline-maintained
+`H(index)` with a materialized file rescanned by `rootfs_cas.preloadPath`.
+`docs/plans/native-ext4-writer.md` records the large-tar import benchmark
+against the external preload baseline.
+
 Done when: import → run → save → restore works end to end on index identity
 with no linear full-image hash anywhere; uncached import of a large
 reference image pays no separate hash pass beyond the inline emission

@@ -4,7 +4,11 @@
 //! mutate existing filesystems.
 
 const std = @import("std");
+const chunk_sealer = @import("../chunk_sealer.zig");
+const disk_index = @import("../disk_index.zig");
 const ext4 = @import("ext4.zig");
+const rootfs_cas = @import("../rootfs_cas.zig");
+const spore = @import("../spore.zig");
 const tar = @import("tar.zig");
 const xattrs_mod = @import("xattrs.zig");
 
@@ -89,10 +93,13 @@ pub const Options = struct {
     image_size: u64 = min_image_size,
     inode_count: u32 = 1024,
     determinism: ext4.Determinism,
+    cas_cache_root: ?[]const u8 = null,
+    cas_chunk_size: u64 = rootfs_cas.default_chunk_size,
 };
 
 pub const Result = struct {
     size: u64,
+    preload_result: ?rootfs_cas.PreloadResult = null,
 };
 
 const InodeKind = enum {
@@ -211,6 +218,185 @@ const SourceFileCache = struct {
     }
 };
 
+const InlineRootfsCas = struct {
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    chunk_size: usize,
+    image_size: u64,
+    chunk_buf: []u8,
+    chunk_fill: usize = 0,
+    logical_chunk: u64 = 0,
+    manifest_chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty,
+    manifest_zero_chunks: std.ArrayList(u64) = .empty,
+    chunk_count: usize = 0,
+    zero_chunks: usize = 0,
+    nonzero_chunks: usize = 0,
+    objects_written: usize = 0,
+    object_bytes_written: u64 = 0,
+    chunk_scan_ms: u64 = 0,
+    object_write_ms: u64 = 0,
+    index_build_ms: u64 = 0,
+    index_write_ms: u64 = 0,
+    work_stats: chunk_sealer.WorkStats = .{},
+
+    fn init(
+        allocator: std.mem.Allocator,
+        cache_root: []const u8,
+        image_size: u64,
+        chunk_size: u64,
+    ) !InlineRootfsCas {
+        if (chunk_size == 0 or chunk_size % block_size != 0 or chunk_size > std.math.maxInt(usize)) return error.BadManifest;
+        const object_dir = try std.fmt.allocPrint(allocator, "{s}/cas/rootfs/blake3/objects", .{cache_root});
+        defer allocator.free(object_dir);
+        try chunk_sealer.ensureDirPath(allocator, object_dir);
+        const chunk_buf = try allocator.alloc(u8, @intCast(chunk_size));
+        errdefer allocator.free(chunk_buf);
+        return .{
+            .allocator = allocator,
+            .cache_root = cache_root,
+            .chunk_size = @intCast(chunk_size),
+            .image_size = image_size,
+            .chunk_buf = chunk_buf,
+        };
+    }
+
+    fn deinit(self: *InlineRootfsCas) void {
+        for (self.manifest_chunks.items) |entry| self.allocator.free(entry.digest);
+        self.manifest_chunks.deinit(self.allocator);
+        self.manifest_zero_chunks.deinit(self.allocator);
+        self.allocator.free(self.chunk_buf);
+        self.* = undefined;
+    }
+
+    fn writeBytes(self: *InlineRootfsCas, bytes: []const u8) !void {
+        var remaining = bytes;
+        while (remaining.len > 0) {
+            const take = @min(remaining.len, self.chunk_size - self.chunk_fill);
+            @memcpy(self.chunk_buf[self.chunk_fill..][0..take], remaining[0..take]);
+            self.chunk_fill += take;
+            remaining = remaining[take..];
+            if (self.chunk_fill == self.chunk_size) try self.flushChunk(self.chunk_buf);
+        }
+    }
+
+    fn writeZeroBytes(self: *InlineRootfsCas, byte_len: usize) !void {
+        var remaining = byte_len;
+        if (self.chunk_fill != 0) {
+            const take = @min(remaining, self.chunk_size - self.chunk_fill);
+            @memset(self.chunk_buf[self.chunk_fill..][0..take], 0);
+            self.chunk_fill += take;
+            remaining -= take;
+            if (self.chunk_fill == self.chunk_size) try self.flushChunk(self.chunk_buf);
+        }
+        while (remaining >= self.chunk_size) {
+            try self.appendZeroChunk();
+            remaining -= self.chunk_size;
+        }
+        if (remaining > 0) {
+            @memset(self.chunk_buf[0..remaining], 0);
+            self.chunk_fill = remaining;
+        }
+    }
+
+    fn finish(self: *InlineRootfsCas) !rootfs_cas.PreloadResult {
+        if (self.chunk_fill != 0) try self.flushChunk(self.chunk_buf[0..self.chunk_fill]);
+        const expected_chunks_u64 = divCeilU64(self.image_size, @intCast(self.chunk_size));
+        if (expected_chunks_u64 > std.math.maxInt(usize)) return error.BadManifest;
+        const expected_chunks: usize = @intCast(expected_chunks_u64);
+        if (self.logical_chunk != expected_chunks_u64 or self.chunk_count != expected_chunks) return error.BadManifest;
+
+        const index_build_start = monotonicMs();
+        const manifest_index = disk_index.DiskIndex{
+            .kind = disk_index.disk_index_kind,
+            .logical_size = self.image_size,
+            .chunk_size = self.chunk_size,
+            .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+            .object_namespace = spore.rootfs_storage_object_namespace,
+            .chunks = self.manifest_chunks.items,
+            .zero_chunks = self.manifest_zero_chunks.items,
+        };
+        const manifest_json = try std.json.Stringify.valueAlloc(self.allocator, manifest_index, .{ .whitespace = .indent_2 });
+        defer self.allocator.free(manifest_json);
+        const index_digest = try disk_index.indexDigestAlloc(self.allocator, manifest_json);
+        errdefer self.allocator.free(index_digest);
+        self.index_build_ms = monotonicMs() -| index_build_start;
+
+        const index_path = try rootfs_cas.manifestIndexPath(self.allocator, self.cache_root, index_digest);
+        errdefer self.allocator.free(index_path);
+        const index_dir = std.fs.path.dirname(index_path) orelse return error.BadManifest;
+        try chunk_sealer.ensureDirPath(self.allocator, index_dir);
+        const index_write_start = monotonicMs();
+        try chunk_sealer.writeFileAtomicDurable(self.allocator, index_path, manifest_json, 0o444);
+        self.index_write_ms = monotonicMs() -| index_write_start;
+
+        const rootfs_digest = try self.allocator.dupe(u8, index_digest);
+        errdefer self.allocator.free(rootfs_digest);
+        return .{
+            .index_path = index_path,
+            .index_digest = index_digest,
+            .rootfs_digest = rootfs_digest,
+            .rootfs_size = self.image_size,
+            .chunk_size = self.chunk_size,
+            .chunk_count = self.chunk_count,
+            .zero_chunks = self.zero_chunks,
+            .nonzero_chunks = self.nonzero_chunks,
+            .objects_written = self.objects_written,
+            .object_bytes_written = self.object_bytes_written,
+            .index_bytes = manifest_json.len,
+            .chunk_scan_ms = self.chunk_scan_ms,
+            .object_write_ms = self.object_write_ms,
+            .index_build_ms = self.index_build_ms,
+            .index_write_ms = self.index_write_ms,
+        };
+    }
+
+    fn appendZeroChunk(self: *InlineRootfsCas) !void {
+        try self.manifest_zero_chunks.append(self.allocator, self.logical_chunk);
+        self.logical_chunk += 1;
+        self.chunk_count += 1;
+        self.zero_chunks += 1;
+        self.chunk_fill = 0;
+    }
+
+    fn flushChunk(self: *InlineRootfsCas, bytes: []const u8) !void {
+        const scan_start = monotonicMs();
+        const sealed = try chunk_sealer.sealBytes(bytes, &self.work_stats);
+        self.chunk_scan_ms += monotonicMs() -| scan_start;
+        switch (sealed) {
+            .zero => try self.appendZeroChunk(),
+            .data => |id| {
+                const hex = id.toHex();
+                const digest = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, hex[0..] });
+                self.manifest_chunks.append(self.allocator, .{
+                    .logical_chunk = self.logical_chunk,
+                    .digest = digest,
+                }) catch |err| {
+                    self.allocator.free(digest);
+                    return err;
+                };
+                errdefer {
+                    const removed = self.manifest_chunks.pop() orelse unreachable;
+                    self.allocator.free(removed.digest);
+                }
+                const object_path = try rootfs_cas.manifestObjectPath(self.allocator, self.cache_root, digest);
+                defer self.allocator.free(object_path);
+                const object_exists = try pathExistsNoSymlink(self.allocator, object_path);
+                const write_start = monotonicMs();
+                try chunk_sealer.writePathAllIfMissingTimed(self.allocator, object_path, bytes, &self.work_stats);
+                self.object_write_ms += monotonicMs() -| write_start;
+                self.logical_chunk += 1;
+                self.chunk_count += 1;
+                self.nonzero_chunks += 1;
+                if (!object_exists) {
+                    self.objects_written += 1;
+                    self.object_bytes_written += bytes.len;
+                }
+                self.chunk_fill = 0;
+            },
+        }
+    }
+};
+
 pub fn emit(
     allocator: std.mem.Allocator,
     io: Io,
@@ -235,7 +421,7 @@ pub fn emit(
     const layout = try assignBlocks(allocator, &planned, total_blocks, options.inode_count, &blocks, &data_blocks);
     defer allocator.free(layout.groups);
     try writeMetadataBlocks(allocator, &planned, layout, options, &blocks);
-    return try writeImage(allocator, io, output_path, options.image_size, total_blocks, &blocks, &data_blocks);
+    return try writeImage(allocator, io, output_path, options.image_size, total_blocks, &blocks, &data_blocks, options.cas_cache_root, options.cas_chunk_size);
 }
 
 pub fn emitFromMergedTree(
@@ -1017,6 +1203,8 @@ fn writeImage(
     total_blocks: u32,
     blocks: *BlockStore,
     data_blocks: *DataBlockStore,
+    cas_cache_root: ?[]const u8,
+    cas_chunk_size: u64,
 ) !Result {
     try ext4.ensureParentDir(io, output_path);
     try ext4.createEmptyFile(io, output_path, image_size);
@@ -1037,6 +1225,11 @@ fn writeImage(
     @memset(zero_buffer, 0);
     var source_files = SourceFileCache{};
     defer source_files.deinit(allocator, io);
+    var maybe_inline_cas: ?InlineRootfsCas = if (cas_cache_root) |cache_root|
+        try InlineRootfsCas.init(allocator, cache_root, image_size, cas_chunk_size)
+    else
+        null;
+    defer if (maybe_inline_cas) |*inline_cas| inline_cas.deinit();
     var block_index: usize = 0;
     while (block_index < total_blocks) {
         const block_no: u32 = @intCast(block_index);
@@ -1044,6 +1237,7 @@ fn writeImage(
         switch (emit_blocks[block_index]) {
             .metadata => |block| {
                 try file.writePositionalAll(io, block, offset);
+                if (maybe_inline_cas) |*inline_cas| try inline_cas.writeBytes(block);
             },
             .data => |source| {
                 const written_blocks = try writeDataRun(
@@ -1057,20 +1251,24 @@ fn writeImage(
                     offset,
                     &source_block,
                     source_buffer,
+                    if (maybe_inline_cas) |*inline_cas| inline_cas else null,
                 );
                 block_index += written_blocks;
                 continue;
             },
             .zero => {
                 const zero_blocks = zeroRunLength(emit_blocks, block_index, zero_buffer.len / block_size);
+                if (maybe_inline_cas) |*inline_cas| try inline_cas.writeZeroBytes(zero_blocks * block_size);
                 block_index += zero_blocks;
                 continue;
             },
         }
         block_index += 1;
     }
+    const preload_result = if (maybe_inline_cas) |*inline_cas| try inline_cas.finish() else null;
     return .{
         .size = image_size,
+        .preload_result = preload_result,
     };
 }
 
@@ -1112,11 +1310,13 @@ fn writeDataRun(
     output_offset: u64,
     fallback_block: *[block_size]u8,
     buffer: []u8,
+    inline_cas: ?*InlineRootfsCas,
 ) !usize {
     const run_blocks = dataRunLength(emit_blocks, first, first_block_no, buffer.len / block_size);
     if (run_blocks <= 1) {
         try readDataBlock(allocator, io, cache, first, fallback_block);
         try output.writePositionalAll(io, fallback_block, output_offset);
+        if (inline_cas) |cas| try cas.writeBytes(fallback_block[0..]);
         return 1;
     }
 
@@ -1138,6 +1338,7 @@ fn writeDataRun(
     }
     if (source_len < byte_len) @memset(buffer[source_len..byte_len], 0);
     try output.writePositionalAll(io, buffer[0..byte_len], output_offset);
+    if (inline_cas) |cas| try cas.writeBytes(buffer[0..byte_len]);
     return run_blocks;
 }
 
@@ -1347,6 +1548,26 @@ fn alignDown(n: usize, a: usize) usize {
     return n & ~(a - 1);
 }
 
+fn monotonicMs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
+
+fn pathExistsNoSymlink(allocator: std.mem.Allocator, path: []const u8) !bool {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd >= 0) {
+        _ = std.c.close(fd);
+        return true;
+    }
+    return switch (std.c.errno(fd)) {
+        .NOENT, .LOOP => false,
+        else => error.IoFailed,
+    };
+}
+
 fn put(comptime T: type, buf: []u8, offset: usize, value: T) void {
     std.mem.writeInt(T, buf[offset..][0..@sizeOf(T)], value, .little);
 }
@@ -1400,6 +1621,50 @@ test "computed rootfs inode counts satisfy native writer packing" {
     const inode_count = ext4.computeImageInodes(100_001);
     try std.testing.expectEqual(@as(u64, 0), inode_count % ext4.rootfs_ext4_inodes_per_block);
     try validateInodeCount(@intCast(inode_count));
+}
+
+test "native ext4 writer inline CAS index matches rescanned image" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-native-ext4-inline-cas";
+    const image_path = tmp ++ "/rootfs.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    const payload = try allocator.alloc(u8, 96 * 1024);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate((i * 31) ^ (i >> 3));
+
+    const entries = [_]Entry{
+        .{ .path = "etc/config", .kind = .{ .file = "inline-cas\n" }, .mode = 0o644 },
+        .{ .path = "var/payload.bin", .kind = .{ .file = payload }, .mode = 0o600 },
+    };
+    const result = try emit(allocator, io, image_path, &entries, .{
+        .image_size = min_image_size,
+        .inode_count = 1024,
+        .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-inline-cas"),
+        .cas_cache_root = cache_root,
+    });
+    const inline_result = result.preload_result orelse return error.BadManifest;
+    defer {
+        allocator.free(inline_result.index_path);
+        allocator.free(inline_result.index_digest);
+        allocator.free(inline_result.rootfs_digest);
+    }
+
+    const rescan = try rootfs_cas.preloadPath(io, allocator, cache_root, image_path, rootfs_cas.default_chunk_size);
+    defer {
+        allocator.free(rescan.index_path);
+        allocator.free(rescan.index_digest);
+        allocator.free(rescan.rootfs_digest);
+    }
+
+    try std.testing.expectEqualStrings(rescan.index_digest, inline_result.index_digest);
+    try std.testing.expectEqual(rescan.chunk_count, inline_result.chunk_count);
+    try std.testing.expectEqual(rescan.zero_chunks, inline_result.zero_chunks);
+    try std.testing.expectEqual(rescan.nonzero_chunks, inline_result.nonzero_chunks);
+    try std.testing.expect(inline_result.objects_written > 0);
 }
 
 fn fuzzNativeExt4PlannerAndMetadataEmitter(_: void, s: *std.testing.Smith) !void {
