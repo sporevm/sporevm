@@ -120,7 +120,7 @@ Implemented in this branch:
 | Fuzz coverage | Done | Existing tar fuzzing is extended with merged-tree fuzzing, and the native planner/metadata emitter has an integrated fuzz target. |
 | Cache identity | Done | Builder version bumped to `sporevm-rootfs-v5`; cache validation includes the selected writer metadata without hashing writer selection into the cache key. |
 | Guest boot smoke | Done | Native-default OCI smoke built and booted Alpine during the v4/default-flip work with `ext4_writer: native` and guest output `native-rootfs-smoke`; v5 invalidates the cache identity for the 60-byte symlink boundary fix. |
-| Writer benchmark | Done | Post-v5 native/external/tar2ext4 comparison recorded below; optimized native output is byte-identical to the plain v5 native writer and e2fsck-clean. |
+| Writer benchmark | Done | Post-v5 native/external/patched-hcsshim tar2ext4 comparison recorded below; all current outputs are e2fsck-clean. |
 
 ## Rollout Gates
 
@@ -172,32 +172,31 @@ Observed:
 
 Recorded on 2026-07-08 with
 `scripts/benchmark/ext4-writer-comparison.py --tar <docker export of buildkite/agent:3>`
-(312 MiB flattened tar, macOS arm64), after the v5 symlink-boundary fix:
+(312 MiB flattened tar for linux/arm64
+`buildkite/agent@sha256:5f259c0f106051d59335ad9c7edb1dc0bfd4fe59ff115d70cbbcdbf813d87fe4`,
+macOS arm64 host), after the v5 symlink-boundary fix and with patched
+hcsshim `tar2ext4` from `/Users/lachlan/Develop/hcsshim` commit
+`a4436aefe3f3` (`microsoft/hcsshim#2811`, inode bitmap padding fix):
 
 | Tool | Wall | Conversion | Output size | e2fsck -fn |
 | --- | ---: | ---: | ---: | --- |
-| `spore (native, v5 baseline)` | 23.99s | 20.75s | 592 MiB | clean |
-| `spore (native, optimized)` | 7.52s | 4.31s | 592 MiB | clean |
-| `spore (external)` | 11.87s | 5.29s | 592 MiB | clean |
-| `tar2ext4` (hcsshim) | 239ms | 239ms | 323 MiB | exit 4 (inode bitmap padding) |
-| `tar2ext4 -inline` (hcsshim) | 176ms | 176ms | 323 MiB | exit 4 (inode bitmap padding) |
+| `spore (native)` | 9.79s | 6.31s | 592 MiB | clean |
+| `spore (external)` | 13.92s | 6.14s | 592 MiB | clean |
+| `tar2ext4` (hcsshim patched) | 651ms | 651ms | 323 MiB | clean |
+| `tar2ext4 -inline` (hcsshim patched) | 183ms | 183ms | 323 MiB | clean |
 
-The optimized native writer is byte-identical to the plain v5 native writer on
-this input: rootfs size `620756992`, BLAKE3
-`6918ebda5875da50487ca4de82002c4594270c968b728b49d7adb223690a684b`. The old
-v4/native benchmark hash is intentionally obsolete because the v5
-symlink-boundary fix stores 60-byte symlink targets in data blocks instead of
-incorrectly inlining them.
+The native v5 run recorded rootfs size `620756992`, BLAKE3
+`f9f0af0c72363592a6bef9a00c0545c72d95cbd9cd7535988d11ac4e2a867808`. The
+external writer produces different ext4 bytes for the same guest-visible tree,
+also fsck-clean and the same padded size.
 
-The single-layer flat-tar path removes multi-layer merge cost, which is why
-external conversion is faster here than in the earlier OCI benchmark. Native
-`native_ext4_emit` dropped from the plain v5 20.61s phase to 4.18s by preserving
-the sequential logical walk while coalescing source reads/writes, classifying
-logical blocks densely, batching zero hashing, avoiding quadratic free-block
-scans during layout planning, indexing path lookups without changing
-deterministic path iteration order, and only zero-filling source-run partial
-tails. hcsshim's compactext4 still shows the next ceiling: sub-second conversion
-is achievable for this size class by streaming a compact ext4 layout.
+The patched hcsshim outputs are now fsck-clean, so compactext4 is a clean
+performance target rather than a fast-but-fsck-noisy reference. The remaining
+gap is mostly architectural: Spore emits and hashes a fixed-size padded block
+device, while hcsshim streams a compact ext4 layout with extents and optional
+inline data. The next ceiling is still sub-second conversion for this size
+class, but getting there means compact layout/extent work rather than more
+rootfs CAS plumbing.
 
 ## Next: Inline Chunk Index Emission For U4
 
