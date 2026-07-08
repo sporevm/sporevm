@@ -25,6 +25,7 @@ Options:
   --timeout DURATION       Exec/create timeout (default: 60s).
   --identity-command CMD   First command run in the VM (default: boot_id probe).
   --workload-command CMD   Second command run in the VM (default: node -v).
+  --max-cleanup-ms N       Fail if any spore rm cleanup exceeds N milliseconds.
   --no-build               Do not run mise/zig build before benchmarking.
   -h, --help               Show this help.
 
@@ -189,6 +190,7 @@ identity_command='cat /proc/sys/kernel/random/boot_id'
 workload_command='node -v'
 build=1
 pin_image_once=1
+max_cleanup_ms=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -271,6 +273,12 @@ while [[ $# -gt 0 ]]; do
     --workload-command)
       need_value "$1" "${2-}"
       workload_command="$2"
+      shift 2
+      ;;
+    --max-cleanup-ms)
+      need_value "$1" "${2-}"
+      positive_int "$1" "$2"
+      max_cleanup_ms="$2"
       shift 2
       ;;
     --no-build)
@@ -442,8 +450,13 @@ for i in $(seq 1 "${iterations}"); do
     rm_status=$?
   fi
   rm_end_ms="$(now_ms)"
+  cleanup_ms="$((rm_end_ms - rm_start_ms))"
+  cleanup_exceeded="false"
+  if [[ -n "${max_cleanup_ms}" && "${cleanup_ms}" -gt "${max_cleanup_ms}" ]]; then
+    cleanup_exceeded="true"
+  fi
 
-  if [[ "${create_status}" != "0" || "${identity_status}" != "0" || "${workload_status}" != "0" || "${rm_status}" != "0" ]]; then
+  if [[ "${create_status}" != "0" || "${identity_status}" != "0" || "${workload_status}" != "0" || "${rm_status}" != "0" || "${cleanup_exceeded}" == "true" ]]; then
     failures=$((failures + 1))
   fi
 
@@ -482,7 +495,13 @@ for i in $(seq 1 "${iterations}"); do
     printf '"monitor_ready_after_start_ms":%s,' "${monitor_ready_after_start_ms}"
     printf '"identity_exec_ms":%d,' "$((identity_end_ms - identity_start_ms))"
     printf '"workload_exec_ms":%d,' "$((workload_end_ms - workload_start_ms))"
-    printf '"cleanup_ms":%d,' "$((rm_end_ms - rm_start_ms))"
+    printf '"cleanup_ms":%d,' "${cleanup_ms}"
+    if [[ -n "${max_cleanup_ms}" ]]; then
+      printf '"max_cleanup_ms":%d,' "${max_cleanup_ms}"
+    else
+      printf '"max_cleanup_ms":null,'
+    fi
+    printf '"cleanup_exceeded":%s,' "$(json_bool "${cleanup_exceeded}")"
     printf '"create_status":%d,' "${create_status}"
     printf '"identity_status":%d,' "${identity_status}"
     printf '"workload_status":%d,' "${workload_status}"
@@ -496,7 +515,7 @@ for i in $(seq 1 "${iterations}"); do
     printf '}\n'
   } >>"${output_path}"
 
-  echo "lifecycle benchmark iteration ${i}/${iterations}: create_to_node_ms=$((workload_end_ms - start_ms)) status=${create_status}/${identity_status}/${workload_status} log=${console_log}" >&2
+  echo "lifecycle benchmark iteration ${i}/${iterations}: create_to_node_ms=$((workload_end_ms - start_ms)) cleanup_ms=${cleanup_ms} status=${create_status}/${identity_status}/${workload_status}/${rm_status} log=${console_log}" >&2
 done
 
 printf 'wrote %s\n' "${output_path}"
@@ -521,7 +540,8 @@ if command -v jq >/dev/null 2>&1; then
     "monitor_asset_resolve_ms " + stat(vals("monitor_asset_resolve_ms")) + "\n" +
     "monitor_ready_after_start_ms " + stat(vals("monitor_ready_after_start_ms")) + "\n" +
     "identity_exec_ms " + stat(map(.identity_exec_ms)) + "\n" +
-    "workload_exec_ms " + stat(map(.workload_exec_ms))
+    "workload_exec_ms " + stat(map(.workload_exec_ms)) + "\n" +
+    "cleanup_ms " + stat(map(.cleanup_ms))
   ' "${output_path}"
 fi
 
