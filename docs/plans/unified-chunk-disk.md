@@ -546,7 +546,7 @@ no-reflink fallback path is exercised in tests.
 
 ### U7 — Partial materialization
 
-Status: landed in branch for local CAS fault-in.
+Status: complete for local CAS fault-in and measured cold-flat startup.
 
 Add the `.cas` map source, fault-in path, background filler, and
 boot-critical chunk ordering (fault-trace a reference boot to derive the
@@ -559,6 +559,10 @@ opens the local object, verifies it against the descriptor-selected BLAKE3
 digest, writes it into the sparse base, and promotes that map entry to `.base`.
 Missing or corrupt objects fail the read before bytes reach the guest. Warm
 flat-cache opens still use the existing read-only materialization path.
+Managed `spore run --image` resolves chunked image-rootfs storage even without
+`--save`, and cache lookup no longer repairs an evicted flat by-digest
+materialization as a side effect, so a warm-CAS/cold-flat image run reaches the
+lazy runtime path.
 
 Decision: a concurrent background filler and boot-critical priority list are
 deferred until fault traces show they are needed. Adding a filler now would
@@ -568,15 +572,35 @@ correct initial ordering for this slice.
 
 Validation: `mise exec -- zig test src/runtime_disk.zig` covers lazy rootfs
 open without publishing a flat cache, wrong-sized flat-cache fallback, CAS
-promotion after the first read, read-time missing-object failure, and
-chunk-index disk restore over the lazy backend.
+promotion after the first read, read-time missing-object failure, induced
+eviction of an already promoted chunk, corrupt unread-object failure without
+torn read data, and chunk-index disk restore over the lazy backend. The
+virtio-blk backend maps `ChunkMappedDisk.readAt` failures to guest I/O error
+status, so these CAS misses and corruptions fail the guest request cleanly.
 
-Done when: cold boot of a large reference image starts the guest before
-full materialization and completes correctly under random read access
-(fault-in correctness test with induced cache eviction); a CAS miss fails
-the guest I/O cleanly rather than hanging; cold `--image` time-to-first-exec
-is measured and reported against the U2 baseline (target: bounded by boot
-working set, not image size).
+Repeatable time-to-first-exec measurement lives in
+`scripts/benchmark/suite.py` as the opt-in `lazy_rootfs_tti` benchmark. Command
+used for the local U7 check:
+
+```sh
+python3 scripts/benchmark/suite.py --profile smoke --benchmarks lazy_rootfs_tti --iterations 1 --modes sequential --output-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs --timeout-s 300
+```
+
+On this macOS/HVF host with `docker.io/library/node:22-alpine` resolved to
+`docker.io/library/node@sha256:d51cff3fa44ab8a368ae8708ae974480165be1b699b19527b7c0d2523433b271`,
+the run at
+`zig-cache/sporevm-benchmarks/u7-lazy-rootfs/20260708T112850Z-80e156b3/`
+evicted one 512 MiB flat materialization and measured:
+
+- lazy warm-CAS/cold-flat `spore run --image`: `rootfs_base_mode=lazy`,
+  `tti_ms=393`, `first_output_ms=271`.
+- restored flat-materialization baseline: `rootfs_base_mode=flat`,
+  `tti_ms=124`, `first_output_ms=36`.
+
+Done when: complete for the local lazy path. Cold-flat startup is bounded by
+the boot working set, not full image assembly; the measured lazy run starts the
+guest before restoring the 512 MiB flat materialization. Background filler and
+boot-priority ordering remain deferred until fault traces show they are needed.
 
 ### U8 — Cleanup and docs
 
@@ -612,11 +636,10 @@ Validation: `mise run test` and `mise run build`.
   writes are drained. An online mid-run snapshot would need the guest
   `fsfreeze` protocol deferred with the spore-build plan.
 - Partial materialization (U7) puts CAS object reads on the guest I/O path
-  for the first time: objects must be digest-verified at fault-in before
-  bytes reach the guest, and a missing/corrupt object must surface as a
-  clean I/O error to the guest, never a hang or silent zero-fill. This is
-  new attacker-adjacent surface (a tampered local store feeding a running
-  guest) and needs its own tests in that slice.
+  for the first time: objects are digest-verified at fault-in before bytes
+  reach the guest, and missing/corrupt objects surface as clean I/O errors
+  to the guest, never hangs or silent zero-fill. U7 tests cover promoted
+  chunk eviction and corrupt unread objects.
 
 ## Resolved Decisions
 

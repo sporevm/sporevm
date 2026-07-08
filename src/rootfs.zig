@@ -1845,7 +1845,6 @@ pub fn cachedImageRootfsPath(
         const storage = (try readCachedRootfsStorage(io, allocator, metadata_path, artifact)) orelse return null;
         defer deinitStorageDigestFields(allocator, storage);
         if (!try rootfs_cas.storageComplete(io, allocator, cache_root, storage)) return null;
-        _ = try rootfs_cache.installTrustedMaterializationByHardlink(io, allocator, cache_root, rootfs_path, storage.index_digest, storage.logical_size);
         std.log.debug("spore rootfs: using cached rootfs {s} for {s}", .{ rootfs_path, resolved.ref });
         return rootfs_path;
     }
@@ -3138,6 +3137,39 @@ test "image rootfs cache can replace same-key artifacts for writer escape hatch"
     try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .external)).?);
     const bytes = try Io.Dir.cwd().readFileAlloc(io, rootfs_path, arena, .limited(32));
     try std.testing.expectEqualStrings("external", bytes);
+}
+
+test "image rootfs cache lookup does not repair evicted flat materialization" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-image-cache-lazy-after-flat-evict";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+
+    const resolved = ResolvedImage{
+        .ref = "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try cachedImageRootfsMetadataPath(arena, cache_root, resolved);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+
+    const storage = try testRootfsStorageFromPath(io, arena, cache_root, rootfs_path);
+    const metadata = try testImageRootfsMetadataJson(arena, resolved, rootfs_path, storage.logical_size, storage, "native");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
+    try std.testing.expect(try rootfs_cas.storageComplete(io, arena, cache_root, storage));
+
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, storage.index_digest);
+    try std.testing.expect(!try rootfs_cache.pathExistsNoSymlink(io, digest_path));
+    try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .native)).?);
+    try std.testing.expect(!try rootfs_cache.pathExistsNoSymlink(io, digest_path));
 }
 
 test "image rootfs metadata supplies cached artifact identity" {

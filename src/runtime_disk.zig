@@ -655,6 +655,79 @@ test "runtime disk reports missing cas object on first read of that chunk" {
     try std.testing.expectError(error.MissingChunk, runtime.chunk_mapped.?.readAt(&readback, spore.disk_chunk_size));
 }
 
+test "runtime disk lazy rootfs survives promoted chunk eviction and rejects corrupt unread chunks" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-runtime-disk-lazy-cas-promoted-and-corrupt";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384) ++ ("ijkl" ** 16384);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
+
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
+    const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
+    Io.Dir.cwd().deleteFile(io, digest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+
+    const index_bytes = try Io.Dir.cwd().readFileAlloc(io, preload_result.index_path, arena, .limited(disk_index.max_index_bytes));
+    const parsed = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
+    defer parsed.deinit();
+    const first_chunk_path = try rootfs_cas.manifestObjectPath(arena, cache_root, parsed.value.chunks[0].digest);
+    const third_chunk_path = try rootfs_cas.manifestObjectPath(arena, cache_root, parsed.value.chunks[2].digest);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    const context = Context{ .io = io, .environ_map = &env };
+
+    const rootfs = spore.Rootfs{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = rootfs_artifact,
+        .storage = storage,
+    };
+    var runtime = try open(context, allocator, .{
+        .rootfs = rootfs,
+    });
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.rootfs_fd != null);
+    try std.testing.expect(runtime.chunk_mapped != null);
+
+    var readback: [4]u8 = undefined;
+    try runtime.chunk_mapped.?.readAt(&readback, 0);
+    try std.testing.expectEqualStrings("abcd", &readback);
+
+    try Io.Dir.cwd().deleteFile(io, first_chunk_path);
+    const corrupt_chunk = try arena.alloc(u8, spore.disk_chunk_size);
+    @memset(corrupt_chunk, 0xee);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = third_chunk_path, .data = corrupt_chunk });
+
+    @memset(&readback, 0);
+    try runtime.chunk_mapped.?.readAt(&readback, 0);
+    try std.testing.expectEqualStrings("abcd", &readback);
+
+    try runtime.chunk_mapped.?.readAt(&readback, spore.disk_chunk_size);
+    try std.testing.expectEqualStrings("efgh", &readback);
+
+    const before_failed_read = [_]u8{0xaa} ** readback.len;
+    readback = before_failed_read;
+    try std.testing.expectError(error.BadChunk, runtime.chunk_mapped.?.readAt(&readback, 2 * spore.disk_chunk_size));
+    try std.testing.expectEqualSlices(u8, &before_failed_read, &readback);
+}
+
 test "runtime disk rejects unknown disk kinds" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
