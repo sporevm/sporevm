@@ -842,13 +842,17 @@ pub fn restoreNamed(
     const spore_dir = try resolveExistingSporeDirApi(arena, init.io, options.spore_dir);
     var manifest = spore.loadManifest(arena, spore_dir) catch |err| switch (err) {
         error.BadManifest => null,
+        error.FormatTooOld => return error.FormatTooOld,
         else => return error.InvalidSporeDir,
     };
     defer if (manifest) |*parsed| parsed.deinit();
     var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
     defer if (manifest_v1) |*parsed| parsed.deinit();
     if (manifest == null) {
-        manifest_v1 = spore.loadManifestV1(arena, spore_dir) catch return error.InvalidSporeDir;
+        manifest_v1 = spore.loadManifestV1(arena, spore_dir) catch |err| switch (err) {
+            error.FormatTooOld => return error.FormatTooOld,
+            else => return error.InvalidSporeDir,
+        };
     }
     const network_options = run_mod.networkOptionsFromManifestWithBindings(arena, if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network, options.bound_services) catch |err| switch (err) {
         error.MissingBoundServiceBinding,
@@ -1973,6 +1977,10 @@ pub fn restoreCli(
             },
             error.InvalidSporeDir => {
                 const message = allocLifecycleMessage(allocator, "spore restore: invalid spore directory: {s}", .{parsed.spore_dir});
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
+            },
+            error.FormatTooOld => {
+                const message = machine_output.format_too_old_message;
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.InvalidNetworkPolicy => {

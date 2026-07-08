@@ -711,7 +711,7 @@ test "snapshot writes disk index and chunk objects" {
     try base.writeStreamingAll(io, &base_bytes);
 
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
-    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, base_bytes.len, 512);
+    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, base_bytes.len, spore.disk_chunk_size);
     defer disk.deinit();
 
     const patch = [_]u8{0x5A} ** 16;
@@ -728,7 +728,7 @@ test "snapshot writes disk index and chunk objects" {
     }
 
     try std.testing.expectEqualStrings(spore.disk_kind_chunk_index, manifest_disk.kind);
-    try std.testing.expectEqual(@as(u64, 512), manifest_disk.chunk_size);
+    try std.testing.expectEqual(@as(u64, spore.disk_chunk_size), manifest_disk.chunk_size);
     try std.testing.expectEqual(@as(usize, 0), manifest_disk.layers.len);
 
     const index_path = try rootfs_cas.manifestIndexPath(allocator, spore_dir, manifest_disk.base);
@@ -748,9 +748,8 @@ test "snapshot writes disk index and chunk objects" {
     const parsed = try disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.chunks.len);
-    try std.testing.expectEqual(@as(u64, 1), parsed.value.chunks[0].logical_chunk);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.zero_chunks.len);
-    try std.testing.expectEqual(@as(u64, 0), parsed.value.zero_chunks[0]);
+    try std.testing.expectEqual(@as(u64, 0), parsed.value.chunks[0].logical_chunk);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.zero_chunks.len);
 
     const object_path = try rootfs_cas.manifestObjectPath(allocator, spore_dir, parsed.value.chunks[0].digest);
     defer allocator.free(object_path);

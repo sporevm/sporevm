@@ -3,7 +3,7 @@
 //! Boots the pinned kernel with the SporeVM board (GICv3 via hv_gic,
 //! virtio-mmio console/blk/net/vsock/rng, generation MMIO), handles MMIO data
 //! aborts, PSCI over HVC, vtimer exits, WFI, and HVF snapshot/resume.
-//! Multi-vCPU capture/resume uses manifest v1 with same-HVF private GIC state.
+//! Multi-vCPU capture/resume uses manifest v3 with same-HVF private GIC state.
 
 const std = @import("std");
 const capture = @import("../capture.zig");

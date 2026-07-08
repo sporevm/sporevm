@@ -1,15 +1,11 @@
 # Spore Format
 
-**Status:** manifest format v0 implemented (`src/spore.zig`), single-vCPU,
-same-host HVF and KVM producers/consumers. Manifest format v1 has data structs,
-validators, KVM portable capture/restore, and HVF same-backend capture/restore
-for multi-vCPU state. Bundle production, pull, and local materialization
-preserve manifest v1.
-
-Format v0 is still the current SporeVM 1.x manifest and artifact contract.
-Do not rename version or kind strings to v1 for release-label symmetry; use a
-format v1 only for an incompatible on-disk, bundle, or guest-visible contract
-change with a migration decision.
+**Status:** manifest format v2 is the current single-vCPU contract
+(`src/spore.zig`) for same-host HVF and KVM producers/consumers. Manifest
+format v3 is the current multi-vCPU contract with KVM portable
+capture/restore and HVF same-backend capture/restore. The v2/v3 flag-day
+break moves rootfs and writable disk identity to chunk indexes; manifest v0
+and v1 are intentionally rejected as too old and must be re-created.
 
 A spore is sealed, content-addressed VM state. The format, not the
 implementation, is the product: two SporeVM builds on different hypervisors
@@ -142,11 +138,13 @@ object-store sources, `remote.peer_bytes_read` for HTTP(S) peer sources,
 `materialization.cache.bytes_reused`, and rootfs cache hit/fetch/reuse counters
 under `rootfs.cache`.
 
-## Manifest Format v0
+## Manifest Format v2
 
 `manifest.json` fields (see `src/spore.zig` for the authoritative shapes):
 
-- `version`: format version, currently 0. Consumers reject unknown versions.
+- `version`: format version, currently 2 for this single-vCPU shape.
+  Consumers reject unknown versions and reject v0/v1 with a format-too-old
+  error.
 - `annotations`: optional opaque string map for namespaced embedder metadata,
   such as `dev.buildkite.cleanroom.policy_hash`. Keys and values are UTF-8
   strings, values are not interpreted by SporeVM, and the serialized annotation
@@ -164,7 +162,7 @@ under `rootfs.cache`.
   range plus the generation MMIO device at `0x0c001000`, size `0x1000`, SPI 24
   / INTID 56. Fresh managed auto-memory runs may attach a transient grow-only
   virtio-mem device, but current capture/resume paths disable that transient
-  device and do not serialize virtio-mem state into manifest v0.
+  device and do not serialize virtio-mem state into manifest v2.
 - `machine`: normalized architectural state for one vCPU — `gprs` (x0–x30),
   `pc`, `cpsr`, `fpcr`, `fpsr`, `simd` (32 Q registers as u64 pairs),
   `sys_regs` (EL1 context registers by architectural name), `icc_regs`
@@ -210,8 +208,8 @@ under `rootfs.cache`.
   `kind: "spore-disk-index-v1"`, `logical_size`, `chunk_size`,
   `hash_algorithm: "blake3"`, `object_namespace: "memory/blake3"`,
   sorted nonzero `chunks` entries (`logical_chunk`, `digest`) and sorted
-  `zero_chunks`. RAM keeps the 2MiB memory chunk size; disk indexes may use
-  smaller chunk sizes. Memory chunk digests are `blake3:<hex>` references to
+  `zero_chunks`. RAM keeps the 2MiB memory chunk size; disk indexes use
+  64KiB chunks. Memory chunk digests are `blake3:<hex>` references to
   portable `chunks/<hex>` files, and validation requires every logical chunk to
   be covered exactly once by either list. `backing` is optional local
   acceleration metadata for same-host KVM/HVF fork/fan-out: `kind:
@@ -246,15 +244,15 @@ under `rootfs.cache`.
   it does not repeat `base_identity` because that would make the index
   self-referential.
 - `disk`: optional sealed writable root disk state for rootfs-backed captures.
-  New saves use `kind: "chunk-index-disk-v0"`; `device` binds the disk to the
+  Saves use `kind: "chunk-index-disk-v0"`; `device` binds the disk to the
   same virtio-mmio rootfs slot, `size` is the full disk size, and `base` is the
   BLAKE3 digest of a `spore-disk-index-v1` index in the rootfs CAS namespace.
   `chunk_size`, `hash_algorithm`, and `object_namespace` mirror the index
   descriptor and must be `64KiB`, `blake3`, and `rootfs/blake3` for the current
   disk backend. The index records sorted non-zero chunk entries plus explicit
-  zero chunks and is restore authority for the writable disk bytes. Legacy
-  `cow-block-v0` manifests with layer refs are not produced by new saves and
-  are rejected by the runtime restore path.
+  zero chunks and is restore authority for the writable disk bytes.
+  `cow-block-v0` manifests are old-format artifacts and are rejected with a
+  format-too-old error.
 - `network`: optional requested network capability and policy. `kind` is
   `spore-net-v0`; `allow_cidrs` and `allow_hosts` record the legacy CLI egress
   allow policy, while `allow_host_ports` records exact DNS-learned host plus
@@ -268,16 +266,16 @@ under `rootfs.cache`.
   network kind, requirements, and bound-service requirements so callers can
   preflight restore-time bindings without parsing `manifest.json` directly.
 
-## Manifest Format v1
+## Manifest Format v3
 
-Manifest v1 is the incompatible multi-vCPU machine-state shape. Existing v0
+Manifest v3 is the incompatible multi-vCPU machine-state shape. Existing v2
 loaders reject it through the normal unknown-version path. The KVM runtime uses
-v1 with portable `gicv3_multi` state for multi-vCPU capture and restore. The
-HVF runtime uses v1 with a tagged same-HVF `backend_private` GIC blob. Bundle
-commands preserve v1 manifests through production, pull, and local
+v3 with portable `gicv3_multi` state for multi-vCPU capture and restore. The
+HVF runtime uses v3 with a tagged same-HVF `backend_private` GIC blob. Bundle
+commands preserve v3 manifests through production, pull, and local
 materialization.
 
-V1 keeps the v0 memory, device, generation, rootfs, disk, network, and
+V3 keeps the v2 memory, device, generation, rootfs, disk, network, and
 annotation contracts. The platform object adds:
 
 - `vcpu_count`: bounded by the shared SporeVM topology cap.
@@ -292,24 +290,23 @@ Each `machine.vcpus[]` entry records one normalized aarch64 vCPU state:
 (`index == array position`), unique indexes, unique MPIDRs, and the normalized
 MPIDR mapping from `src/topology.zig`.
 
-V1 portable GIC state uses `machine.gic.kind: "gicv3_multi"`. It carries global
+V3 portable GIC state uses `machine.gic.kind: "gicv3_multi"`. It carries global
 distributor registers, per-vCPU redistributor register arrays keyed by MPIDR,
 and line levels where PPIs include an owning MPIDR and SPIs do not. Validation
 rejects unknown register offsets, duplicate redistributors, duplicate line
 records, PPIs without a known owner, and SPIs with an owner. HVF same-backend
-v1 captures instead use `machine.gic.kind: "backend_private"` with
-`backend: "hvf"` and `format: "hv_gic_state_v0"`; other backends must reject
-that blob before mutating VM state.
+v3 captures instead use `machine.gic.kind: "backend_private"` with `backend:
+"hvf"` and `format: "hv_gic_state_v0"`; other backends must reject that blob
+before mutating VM state.
 
-## Not Yet Captured By Manifest v0
+## Not Yet Captured By Manifest v2
 
 - General block-device state is still incomplete. The current writable disk
-  contract is one rootfs-bound COW chain over a verified immutable ext4 rootfs
-  artifact.
+  contract is one rootfs-bound chunk index over verified rootfs CAS objects.
 - Access traces: the KVM and HVF lazy-restore harnesses can write local
-  first-touch traces for measurement, but manifest v0 does not persist access
+  first-touch traces for measurement, but manifest v2 does not persist access
   traces or prefetch hints.
-- Multi-vCPU machine state in manifest v0. Manifest v1 carries this state for
+- Multi-vCPU machine state in manifest v2. Manifest v3 carries this state for
   KVM capture/restore and same-HVF capture/restore.
 - Kernel identity in the platform contract (pinned-build enforcement).
 - Durable disk/device identity fixup beyond the current diskless helper. The
@@ -317,14 +314,14 @@ that blob before mutating VM state.
   `resume_entropy_seed` into the kernel RNG, and applies host-provided
   start/resume time to the guest clock, but machine-id, MAC, and other
   disk-backed workload fixups are not final.
-- Cross-frequency architected timer restore: manifest v0 records and enforces
+- Cross-frequency architected timer restore: manifest v2 records and enforces
   the counter frequency, but cannot translate a running Linux guest between
   different `CNTFRQ_EL0` domains.
-- Live network flows and host port forwards: manifest v0 persists requested
+- Live network flows and host port forwards: manifest v2 persists requested
   network capability and policy only. Active TCP flows, learned DNS answers, and
   host loopback listeners are dropped across capture, resume, and fork.
 - Transient virtio-mem state: the first grow-only auto-memory prototype is a
-  fresh managed-run optimization. Manifest v0 records the fixed RAM image that
+  fresh managed-run optimization. Manifest v2 records the fixed RAM image that
   capture/resume can restore, not virtio-mem plug state, unplug state, or guest
   hotplug policy.
 

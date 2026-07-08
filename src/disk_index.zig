@@ -8,12 +8,12 @@ const std = @import("std");
 const chunk = @import("chunk.zig");
 
 pub const disk_index_kind = "spore-disk-index-v1";
-pub const legacy_rootfs_block_index_kind = "rootfs-block-index-v0";
 pub const max_index_bytes: usize = 64 * 1024 * 1024;
 pub const digest_prefix = "blake3:";
 
 pub const Error = error{
     BadManifest,
+    FormatTooOld,
     OutOfMemory,
 };
 
@@ -38,7 +38,6 @@ pub const Descriptor = struct {
     hash_algorithm: []const u8,
     object_namespace: []const u8,
     index_digest: ?[]const u8 = null,
-    allow_legacy_kind: bool = false,
 };
 
 pub fn parseDiskIndex(
@@ -61,9 +60,10 @@ pub fn parseDiskIndex(
 
 pub fn validateDiskIndex(index: DiskIndex, descriptor: Descriptor) Error!void {
     if (descriptor.chunk_size == 0) return error.BadManifest;
-    const kind_ok = std.mem.eql(u8, index.kind, disk_index_kind) or
-        (descriptor.allow_legacy_kind and std.mem.eql(u8, index.kind, legacy_rootfs_block_index_kind));
-    if (!kind_ok) return error.BadManifest;
+    if (!std.mem.eql(u8, index.kind, disk_index_kind)) {
+        if (std.mem.eql(u8, index.kind, "rootfs-block-index-v0")) return error.FormatTooOld;
+        return error.BadManifest;
+    }
     if (index.logical_size != descriptor.logical_size) return error.BadManifest;
     if (index.chunk_size != descriptor.chunk_size) return error.BadManifest;
     if (!std.mem.eql(u8, index.hash_algorithm, descriptor.hash_algorithm)) return error.BadManifest;
@@ -151,7 +151,6 @@ fn testDescriptor(index_digest: []const u8) Descriptor {
         .hash_algorithm = "blake3",
         .index_digest = index_digest,
         .object_namespace = "rootfs/blake3",
-        .allow_legacy_kind = true,
     };
 }
 
@@ -200,7 +199,7 @@ test "manifest-bound disk index validates descriptor digest and canonical covera
     try std.testing.expectEqual(@as(u64, 1), parsed.value.zero_chunks[0]);
 }
 
-test "manifest-bound disk index accepts the legacy rootfs kind during transition" {
+test "manifest-bound disk index rejects the legacy rootfs kind" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -210,9 +209,7 @@ test "manifest-bound disk index accepts the legacy rootfs kind during transition
         \\{"kind":"rootfs-block-index-v0","logical_size":8192,"chunk_size":4096,"hash_algorithm":"blake3","object_namespace":"rootfs/blake3","chunks":[{"logical_chunk":0,"digest":"blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],"zero_chunks":[1]}
     ;
     const digest = try indexDigestAlloc(arena, legacy);
-    const parsed = try parseDiskIndex(arena, legacy, testDescriptor(digest));
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings(legacy_rootfs_block_index_kind, parsed.value.kind);
+    try std.testing.expectError(error.FormatTooOld, parseDiskIndex(arena, legacy, testDescriptor(digest)));
 }
 
 test "manifest-bound disk index rejects digest and descriptor mismatches" {
@@ -313,7 +310,6 @@ fn fuzzDiskIndexParse(_: void, s: *std.testing.Smith) !void {
         .hash_algorithm = "blake3",
         .index_digest = digest,
         .object_namespace = "rootfs/blake3",
-        .allow_legacy_kind = true,
     };
     const parsed = parseDiskIndex(std.testing.allocator, buf[0..len], descriptor) catch return;
     parsed.deinit();

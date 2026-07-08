@@ -355,9 +355,9 @@ Set `SPOREVM_EXT4_WRITER=external` to use the legacy e2fsprogs writer.
 locations, and Homebrew's `e2fsprogs` prefix. Use `--mkfs` and `--debugfs` to
 override the detected binaries for that external fallback.
 
-The native default uses builder version `sporevm-rootfs-v5`; older `v3`/`v4`
+The current native default uses builder version `sporevm-rootfs-v6`; older
 rootfs cache entries are rebuilt once. Rootfs metadata records the selected
-writer, so switching `SPOREVM_EXT4_WRITER` forces a rebuild of the v5 cache
+writer, so switching `SPOREVM_EXT4_WRITER` forces a rebuild of the v6 cache
 entry instead of silently reusing an artifact produced by the other writer.
 
 The first native writer profile uses block maps without extents or

@@ -357,7 +357,7 @@ pub fn storageComplete(
     };
     defer allocator.free(bytes);
     var parsed = parseStorageDiskIndex(allocator, bytes, storage) catch |err| switch (err) {
-        error.BadManifest => return false,
+        error.BadManifest, error.FormatTooOld => return false,
         else => |e| return e,
     };
     defer parsed.deinit();
@@ -768,7 +768,7 @@ test "materialize assembles the flat artifact from verified chunks" {
     const bytes = "abcd" ++ ("\x00" ** 4096) ++ "efgh";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = bytes });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try preload(io, arena, cache_root, artifact.digest, 4096);
+    const preload_result = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
     const storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
     const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const rootfs = spore.Rootfs{
@@ -807,14 +807,14 @@ test "materialize reproduces exact bytes across chunk boundaries and zero chunks
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
     try Io.Dir.cwd().createDirPath(io, tmp);
 
-    var model: [3 * 512 + 73]u8 = undefined;
-    for (model[0..512], 0..) |*byte, i| byte.* = @truncate((i * 17) + 3);
-    @memset(model[512..1024], 0);
-    for (model[1024..], 0..) |*byte, i| byte.* = @truncate((i * 29) + 11);
+    var model: [3 * spore.disk_chunk_size + 73]u8 = undefined;
+    for (model[0..spore.disk_chunk_size], 0..) |*byte, i| byte.* = @truncate((i * 17) + 3);
+    @memset(model[spore.disk_chunk_size .. 2 * spore.disk_chunk_size], 0);
+    for (model[2 * spore.disk_chunk_size ..], 0..) |*byte, i| byte.* = @truncate((i * 29) + 11);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = &model });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try preload(io, arena, cache_root, artifact.digest, 512);
+    const preload_result = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
     const storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
     const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const rootfs = spore.Rootfs{
@@ -847,7 +847,7 @@ test "materialize fails closed on corrupt chunk objects without publishing" {
     try Io.Dir.cwd().createDirPath(io, tmp);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "abcd" });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try preload(io, arena, cache_root, artifact.digest, 4096);
+    const preload_result = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
     const storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
     const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const rootfs = spore.Rootfs{
@@ -889,7 +889,7 @@ test "materialize fails closed when assembled bytes mismatch the artifact digest
 
     const a_artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, a_path);
     const b_artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, b_path);
-    const a_preload = try preload(io, arena, cache_root, a_artifact.digest, 4096);
+    const a_preload = try preload(io, arena, cache_root, a_artifact.digest, spore.disk_chunk_size);
 
     // Manifest pairing B's artifact identity with A's chunk index must fail
     // instead of publishing A-bytes under B's name.
@@ -919,7 +919,7 @@ test "preload repairs corrupt existing chunk objects" {
     try Io.Dir.cwd().createDirPath(io, tmp);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "abcd" });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    _ = try preload(io, arena, cache_root, artifact.digest, 4096);
+    _ = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
 
     const id = chunk.ChunkId.fromContents("abcd");
     const object_dir_path = try objectDir(arena, cache_root);
@@ -927,7 +927,7 @@ test "preload repairs corrupt existing chunk objects" {
     try Io.Dir.cwd().deleteFile(io, object_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = object_path, .data = "wxyz" });
 
-    const repaired = try preload(io, arena, cache_root, artifact.digest, 4096);
+    const repaired = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
     try std.testing.expectEqual(@as(usize, 1), repaired.objects_written);
 
     const storage = storageDescriptor(.{ .mmio_slot = 1 }, repaired);
@@ -943,6 +943,6 @@ test "preload repairs corrupt existing chunk objects" {
         else => |e| return e,
     };
     try materializeFlatFromChunks(io, allocator, cache_root, rootfs);
-    const assembled = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(4096));
+    const assembled = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(spore.disk_chunk_size));
     try std.testing.expectEqualStrings("abcd", assembled);
 }

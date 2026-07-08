@@ -1,11 +1,11 @@
-//! Spore manifest v0 and chunk store.
+//! Spore manifest and chunk store.
 //!
 //! A spore is a directory rooted at `manifest.json`. Guest memory is stored as
 //! fixed-size `chunks/<blake3-hex>` files with all-zero chunks elided; optional
 //! writable disks use verified chunk indexes and CAS objects. Machine state is
 //! normalized architectural aarch64 state — never raw
-//! hypervisor structures (see docs/spore-format.md). Format v0 is the current
-//! manifest contract; future versions should be deliberate migrations.
+//! hypervisor structures (see docs/spore-format.md). Formats v2 and v3 are the
+//! current manifest contracts; future versions should be deliberate migrations.
 //!
 //! Manifests and chunks may come from untrusted storage: parsing is strict,
 //! chunk contents are verified against their ids before use, and restore
@@ -26,8 +26,10 @@ const Blake3 = std.crypto.hash.Blake3;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const format_version: u32 = 0;
-pub const format_version_v1: u32 = 1;
+pub const format_version_legacy_v0: u32 = 0;
+pub const format_version_legacy_v1: u32 = 1;
+pub const format_version: u32 = 2;
+pub const format_version_v1: u32 = 3;
 pub const machine_schema_version_v1: u32 = 1;
 pub const chunk_size: usize = 2 * 1024 * 1024;
 pub const ram_backing_kind = "map-private-file-v0";
@@ -46,6 +48,7 @@ const fs_verity_hash_alg_sha256: u16 = 1;
 
 pub const Error = error{
     BadManifest,
+    FormatTooOld,
     BadChunk,
     BadForkCount,
     UnsupportedVcpuCount,
@@ -273,6 +276,7 @@ pub const rootfs_virtio_blk_device_id: u32 = 2;
 pub const rootfs_storage_kind_chunked_ext4 = "chunked-ext4-rootfs-v0";
 pub const rootfs_storage_hash_algorithm_blake3 = "blake3";
 pub const rootfs_storage_object_namespace = "rootfs/blake3";
+pub const disk_chunk_size: u64 = 64 * 1024;
 
 pub const RootfsDevice = struct {
     kind: []const u8 = rootfs_device_kind_virtio_mmio,
@@ -321,17 +325,15 @@ pub const disk_kind_chunk_index = "chunk-index-disk-v0";
 pub const disk_digest_prefix = rootfs_digest_prefix;
 
 pub const Disk = struct {
-    kind: []const u8 = disk_kind_cow_block,
+    kind: []const u8 = disk_kind_chunk_index,
     device: RootfsDevice,
     size: u64,
-    /// For `chunk-index-disk-v0`, this is the BLAKE3 digest of the disk index.
-    /// For legacy `cow-block-v0`, this is the immutable rootfs base identity.
+    /// BLAKE3 digest of the disk index.
     base: []const u8,
     chunk_size: u64 = 64 * 1024,
     hash_algorithm: []const u8 = rootfs_storage_hash_algorithm_blake3,
     object_namespace: []const u8 = rootfs_storage_object_namespace,
-    /// Legacy `cow-block-v0` layer refs. New disk-index manifests keep this
-    /// empty and use `base` as the index identity.
+    /// Must be empty for chunk-index manifests.
     layers: []const []const u8 = &.{},
 };
 
@@ -697,6 +699,7 @@ fn memoryIndexIdentity(allocator: std.mem.Allocator, memory: MemoryManifest, exp
     defer allocator.free(index_json);
     return disk_index.indexDigestAlloc(allocator, index_json) catch |err| switch (err) {
         error.BadManifest => error.BadManifest,
+        error.FormatTooOld => error.FormatTooOld,
         error.OutOfMemory => error.OutOfMemory,
     };
 }
@@ -1232,7 +1235,7 @@ fn validateRootfsStorage(storage: RootfsStorage, rootfs: Rootfs, devices: []cons
 pub fn validateRootfsStorageDescriptor(storage: RootfsStorage) Error!void {
     if (!std.mem.eql(u8, storage.kind, rootfs_storage_kind_chunked_ext4)) return error.BadManifest;
     if (storage.logical_size == 0 or storage.logical_size > std.math.maxInt(usize)) return error.BadManifest;
-    if (!validDiskClusterSize(storage.chunk_size)) return error.BadManifest;
+    if (storage.chunk_size != disk_chunk_size) return error.BadManifest;
     if (!std.mem.eql(u8, storage.hash_algorithm, rootfs_storage_hash_algorithm_blake3)) return error.BadManifest;
     try validateRootfsDigest(storage.index_digest);
     try validateRootfsDigest(storage.base_identity);
@@ -1248,7 +1251,6 @@ pub fn diskIndexDescriptorForStorage(storage: RootfsStorage) Error!disk_index.De
         .hash_algorithm = storage.hash_algorithm,
         .object_namespace = storage.object_namespace,
         .index_digest = storage.index_digest,
-        .allow_legacy_kind = true,
     };
 }
 
@@ -1269,14 +1271,12 @@ pub fn validateDisk(disk: Disk, maybe_rootfs: ?Rootfs, devices: []const Transpor
     if (disk.size == 0 or disk.size != effectiveRootfsLogicalSize(rootfs)) return error.BadManifest;
     if (std.mem.eql(u8, disk.kind, disk_kind_chunk_index)) {
         try validateDiskDigest(disk.base);
-        if (!validDiskClusterSize(disk.chunk_size)) return error.BadManifest;
+        if (disk.chunk_size != disk_chunk_size) return error.BadManifest;
         if (!std.mem.eql(u8, disk.hash_algorithm, rootfs_storage_hash_algorithm_blake3)) return error.BadManifest;
         if (!std.mem.eql(u8, disk.object_namespace, rootfs_storage_object_namespace)) return error.BadManifest;
         if (disk.layers.len != 0) return error.BadManifest;
     } else if (std.mem.eql(u8, disk.kind, disk_kind_cow_block)) {
-        if (!std.mem.eql(u8, disk.base, effectiveRootfsBaseIdentity(rootfs))) return error.BadManifest;
-        try validateDiskDigest(disk.base);
-        if (disk.layers.len != 0) return error.BadManifest;
+        return error.FormatTooOld;
     } else {
         return error.BadManifest;
     }
@@ -1489,6 +1489,7 @@ pub fn validateMemoryForRam(manifest: MemoryManifest, ram_len: usize) Error!Memo
     const expected_size: u64 = @intCast(ram_len);
     disk_index.validateDiskIndex(memoryIndex(manifest), memoryIndexDescriptor(manifest, expected_size)) catch |err| switch (err) {
         error.BadManifest => return error.BadManifest,
+        error.FormatTooOld => return error.FormatTooOld,
         error.OutOfMemory => return error.OutOfMemory,
     };
     if (manifest.chunk_size != chunk_size) return error.BadManifest;
@@ -1599,9 +1600,16 @@ pub fn loadManifestPath(allocator: std.mem.Allocator, path: []const u8) Error!st
     const parsed = std.json.parseFromSlice(Manifest, allocator, bytes, .{
         // The byte buffer is freed before the parse result is used.
         .allocate = .alloc_always,
-    }) catch return error.BadManifest;
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadManifest,
+    };
     errdefer parsed.deinit();
-    validateManifest(parsed.value) catch return error.BadManifest;
+    validateManifest(parsed.value) catch |err| return switch (err) {
+        error.FormatTooOld => error.FormatTooOld,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadManifest,
+    };
     return parsed;
 }
 
@@ -1617,9 +1625,16 @@ pub fn loadManifestV1Path(allocator: std.mem.Allocator, path: []const u8) Error!
     const parsed = std.json.parseFromSlice(ManifestV1, allocator, bytes, .{
         // The byte buffer is freed before the parse result is used.
         .allocate = .alloc_always,
-    }) catch return error.BadManifest;
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadManifest,
+    };
     errdefer parsed.deinit();
-    validateManifestV1(parsed.value) catch return error.BadManifest;
+    validateManifestV1(parsed.value) catch |err| return switch (err) {
+        error.FormatTooOld => error.FormatTooOld,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadManifest,
+    };
     return parsed;
 }
 
@@ -2072,7 +2087,7 @@ fn forkGicStateV1(allocator: std.mem.Allocator, state: gicv3.State) Error!gicv3.
 }
 
 pub fn validateManifest(manifest: Manifest) Error!void {
-    if (manifest.version != format_version) return error.BadManifest;
+    try validateManifestVersion(manifest.version, format_version);
     try validateManifestCommon(
         manifest.annotations,
         manifest.platform.cpu_profile,
@@ -2089,7 +2104,7 @@ pub fn validateManifest(manifest: Manifest) Error!void {
 }
 
 pub fn validateManifestV1(manifest: ManifestV1) Error!void {
-    if (manifest.version != format_version_v1) return error.BadManifest;
+    try validateManifestVersion(manifest.version, format_version_v1);
     try validateManifestCommon(
         manifest.annotations,
         manifest.platform.cpu_profile,
@@ -2103,6 +2118,12 @@ pub fn validateManifestV1(manifest: ManifestV1) Error!void {
         manifest.memory,
     );
     try validateMachineV1(manifest.platform, manifest.machine);
+}
+
+fn validateManifestVersion(actual: u32, expected: u32) Error!void {
+    if (actual == expected) return;
+    if (actual < expected) return error.FormatTooOld;
+    return error.BadManifest;
 }
 
 fn validateManifestCommon(
@@ -2752,8 +2773,9 @@ test "fuzz manifest parsing" {
 }
 
 fn fuzzManifestV1Parse(_: void, s: *std.testing.Smith) !void {
-    // Manifest v1 adds per-vCPU and per-redistributor arrays at the same trust
-    // boundary as v0; parse plus validation must fail closed.
+    // The multi-vCPU manifest adds per-vCPU and per-redistributor arrays at the
+    // same trust boundary as the single-vCPU manifest; parse plus validation
+    // must fail closed.
     var buf: [4096]u8 = undefined;
     const len = s.slice(&buf);
     const parsed = std.json.parseFromSlice(ManifestV1, std.testing.allocator, buf[0..len], .{
@@ -2864,7 +2886,7 @@ test "manifest json round-trip" {
     try saveManifest(arena, dir, manifest);
     const parsed = try loadManifest(arena, dir);
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 0), parsed.value.version);
+    try std.testing.expectEqual(@as(u32, format_version), parsed.value.version);
     try std.testing.expectEqualStrings("sporevm-aarch64-v0", parsed.value.platform.cpu_profile);
     try std.testing.expectEqual(@as(u64, 0x8000_0000), parsed.value.platform.ram_base);
     try std.testing.expectEqual(@as(u64, 24_000_000), parsed.value.platform.counter_frequency_hz);
@@ -2884,6 +2906,31 @@ test "manifest json round-trip" {
     try std.testing.expectEqualStrings("example.com", parsed.value.network.?.allow_hosts[0]);
     try std.testing.expectEqualStrings("sha256:abc123", parsed.value.annotations.map.get("dev.buildkite.cleanroom.policy_hash").?);
     try std.testing.expectEqualStrings("worker", parsed.value.annotations.map.get("org.opencontainers.image.ref.name").?);
+}
+
+test "manifest loaders preserve format-too-old errors" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const single_dir = try testDir(arena);
+    var single = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
+    single.version = format_version_legacy_v0;
+    try saveManifest(arena, single_dir, single);
+    try std.testing.expectError(error.FormatTooOld, loadManifest(arena, single_dir));
+
+    const multi_dir = try testDir(arena);
+    var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
+    const redists = [_]gicv3.RedistributorState{
+        .{ .mpidr = topology.mpidrForIndex(0), .regs = &.{} },
+        .{ .mpidr = topology.mpidrForIndex(1), .regs = &.{} },
+    };
+    var multi = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &vcpus, &redists);
+    multi.version = format_version_legacy_v1;
+    const multi_json = std.json.Stringify.valueAlloc(arena, multi, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
+    try writeFileAll(try pathZ(arena, "{s}/manifest.json", .{multi_dir}), multi_json);
+    try std.testing.expectError(error.FormatTooOld, loadManifestV1(arena, multi_dir));
 }
 
 test "session attach validation rejects unavailable input streams" {
@@ -2926,7 +2973,7 @@ test "manifest v1 validates and round-trips multi-vCPU topology" {
     try std.testing.expectError(error.BadManifest, loadManifest(arena, dir));
     const parsed = try loadManifestV1(arena, dir);
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 1), parsed.value.version);
+    try std.testing.expectEqual(@as(u32, format_version_v1), parsed.value.version);
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), parsed.value.platform.vcpu_count);
     try std.testing.expectEqual(@as(u64, 0x2_0000), parsed.value.platform.gic_redist_stride);
     try std.testing.expectEqual(@as(topology.Mpidr, 0x8000_0001), parsed.value.machine.vcpus[1].mpidr);
@@ -3126,7 +3173,7 @@ fn testRootfsStorage(mmio_slot: u32) RootfsStorage {
         .kind = rootfs_storage_kind_chunked_ext4,
         .device = .{ .mmio_slot = mmio_slot },
         .logical_size = 4096,
-        .chunk_size = 4096,
+        .chunk_size = disk_chunk_size,
         .hash_algorithm = rootfs_storage_hash_algorithm_blake3,
         .index_digest = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         .base_identity = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -3185,7 +3232,7 @@ test "manifest rootfs artifact validates transport binding" {
     try std.testing.expect(!try rootfsQueuesQuiescent(manifest.rootfs.?, manifest.devices));
 }
 
-test "manifest disk validates rootfs-bound disk identity" {
+test "manifest disk validates rootfs-bound chunk index disk" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -3205,17 +3252,16 @@ test "manifest disk validates rootfs-bound disk identity" {
     const parsed = try loadManifest(arena, dir);
     defer parsed.deinit();
     const disk = parsed.value.disk orelse return error.BadManifest;
-    try std.testing.expectEqualStrings(disk_kind_cow_block, disk.kind);
-    try std.testing.expectEqualStrings(manifest.rootfs.?.artifact.digest, disk.base);
+    try std.testing.expectEqualStrings(disk_kind_chunk_index, disk.kind);
     try std.testing.expectEqual(@as(u64, 4096), disk.size);
     try std.testing.expect(try diskQueuesQuiescent(disk, parsed.value.devices));
 
     manifest.rootfs = null;
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.rootfs = testRootfs(1);
-    manifest.disk.?.base = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    manifest.disk.?.base = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
-    manifest.disk.?.base = manifest.rootfs.?.artifact.digest;
+    manifest.disk.?.base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     manifest.disk.?.device.mmio_slot = 0;
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.disk.?.device.mmio_slot = 1;
@@ -3224,6 +3270,9 @@ test "manifest disk validates rootfs-bound disk identity" {
     manifest.disk.?.size = 4096;
     manifest.disk.?.layers = &.{"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"};
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    manifest.disk.?.layers = &.{};
+    manifest.disk.?.kind = disk_kind_cow_block;
+    try std.testing.expectError(error.FormatTooOld, validateManifest(manifest));
 }
 
 test "manifest disk binds to chunked rootfs storage identity" {
@@ -3343,6 +3392,7 @@ test "fork mints child manifests with shared chunks and pending generation" {
         .allow_cidrs = &.{"93.184.216.0/24"},
         .allow_hosts = &.{"example.com"},
     };
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, try pathZ(arena, "{s}/cas", .{parent_dir}));
     try saveManifest(arena, parent_dir, parent_manifest);
 
     const result = try fork(arena, .{ .parent_dir = parent_dir, .out_dir = out_dir, .count = 2, .environ_map = &env });
@@ -3563,6 +3613,7 @@ test "fork mints manifest v1 child manifests with shared chunks and pending gene
     parent_manifest.rootfs = testRootfs(1);
     parent_manifest.disk = testDisk(1);
     parent_manifest.generation = .{ .generation = 51, .interrupt_status = 0, .params_b64 = "" };
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, try pathZ(arena, "{s}/cas", .{parent_dir}));
     try saveManifestV1(arena, parent_dir, parent_manifest);
 
     const result = try fork(arena, .{
@@ -3580,7 +3631,7 @@ test "fork mints manifest v1 child manifests with shared chunks and pending gene
     try std.testing.expectError(error.BadManifest, loadManifest(arena, first_child_dir));
     const first = try loadManifestV1(arena, first_child_dir);
     defer first.deinit();
-    try std.testing.expectEqual(@as(u32, 1), first.value.version);
+    try std.testing.expectEqual(@as(u32, format_version_v1), first.value.version);
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), first.value.platform.vcpu_count);
     try std.testing.expectEqual(@as(u64, 52), first.value.generation.generation);
     try std.testing.expectEqual(@as(u32, generation.irq_generation_changed), first.value.generation.interrupt_status);

@@ -91,8 +91,8 @@ const workspace = inspected.annotations.map.get("cleanroom.workspace");
 ```
 
 `inspectSpore` accepts every manifest format version that restore paths accept:
-format v0 (single-vCPU) and format v1 (multi-vCPU) manifests both summarize,
-and `SporeInspectResult.vcpu_count` reports the vCPU count (1 for v0).
+format v2 (single-vCPU) and format v3 (multi-vCPU) manifests both summarize,
+and `SporeInspectResult.vcpu_count` reports the vCPU count (1 for v2).
 
 `SporeInspectResult.vm_state_present` is the product-level VM-state signal for
 callers that should not infer it from chunks, devices, or sessions. Valid local

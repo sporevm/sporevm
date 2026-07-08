@@ -3135,6 +3135,7 @@ fn rootfsError(err: anyerror) Error {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.BadManifest => error.BadManifest,
+        error.FormatTooOld => error.FormatTooOld,
         error.BadChunk,
         error.MissingChunk,
         error.ShortRead,
@@ -5187,7 +5188,7 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     rootfs_bytes[2 * 4096 + 3] = 0x22;
     try writeFileAll(rootfs_source_path, rootfs_bytes);
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
-    const preload_result = try rootfs_cas.preload(io, arena, pack_cache_root, artifact.digest, 4096);
+    const preload_result = try rootfs_cas.preload(io, arena, pack_cache_root, artifact.digest, spore.disk_chunk_size);
     var manifest = testRootfsManifest(memory, ram.len, 62, artifact);
     const manifest_storage = rootfs_cas.storageDescriptor(manifest.rootfs.?.device, preload_result);
     _ = try rootfs_cache.installTrustedMaterializationByHardlink(
@@ -5302,7 +5303,7 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     const object_rel_path = try rootfsStorageObjectRelPath(arena, first_chunk.digest);
     const object_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, object_rel_path });
     const clean_digest = try digestHex(arena, bundle_dir);
-    const object_data = try readFileAll(arena, object_path, 4096);
+    const object_data = try readFileAll(arena, object_path, spore.disk_chunk_size);
     object_data[0] ^= 0xff;
     try writeFileAll(object_path, object_data);
     const corrupt_digest = try digestHex(arena, bundle_dir);
@@ -5350,7 +5351,7 @@ test "pack rejects chunked rootfs storage derived from different artifact" {
     try std.testing.expectEqual(artifact_a.size, artifact_b.size);
     try std.testing.expect(!std.mem.eql(u8, artifact_a.digest, artifact_b.digest));
 
-    const preload_b = try rootfs_cas.preload(io, arena, pack_cache_root, artifact_b.digest, 4096);
+    const preload_b = try rootfs_cas.preload(io, arena, pack_cache_root, artifact_b.digest, spore.disk_chunk_size);
     var manifest = testRootfsManifest(memory, ram.len, 73, artifact_a);
     manifest.rootfs.?.storage = rootfs_cas.storageDescriptor(manifest.rootfs.?.device, preload_b);
     try spore.saveManifest(arena, parent_dir, manifest);
@@ -5586,7 +5587,7 @@ test "rootfs index rejects duplicate digests and unsafe exact paths" {
         .{
             .device = .{ .mmio_slot = 0 },
             .logical_size = 4096,
-            .chunk_size = 4096,
+            .chunk_size = spore.disk_chunk_size,
             .index_digest = digest,
             .base_identity = digest,
             .index_path = storage_path,
@@ -5597,7 +5598,7 @@ test "rootfs index rejects duplicate digests and unsafe exact paths" {
         .{
             .device = .{ .mmio_slot = 0 },
             .logical_size = 4096,
-            .chunk_size = 4096,
+            .chunk_size = spore.disk_chunk_size,
             .index_digest = digest,
             .base_identity = digest,
             .index_path = storage_path,
@@ -5613,7 +5614,7 @@ test "rootfs index rejects duplicate digests and unsafe exact paths" {
     var unsafe_storage = [_]RootfsStorageEntry{.{
         .device = .{ .mmio_slot = 0 },
         .logical_size = 4096,
-        .chunk_size = 4096,
+        .chunk_size = spore.disk_chunk_size,
         .index_digest = digest,
         .base_identity = digest,
         .index_path = "../rootfs-index.json",

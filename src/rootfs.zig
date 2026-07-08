@@ -24,7 +24,7 @@ const xattrs_mod = @import("rootfs/xattrs.zig");
 const Io = std.Io;
 
 const max_rootfs_layers: usize = 512;
-pub const builder_version = "sporevm-rootfs-v5";
+pub const builder_version = "sporevm-rootfs-v6";
 const rootfs_build_profile_env = "SPOREVM_ROOTFS_BUILD_PROFILE";
 const ext4_writer_env = "SPOREVM_EXT4_WRITER";
 const resolver_placeholder_path = "etc/resolv.conf";
@@ -2774,7 +2774,7 @@ test "cas preload can attach manifest-bound rootfs storage to a spore" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, 4096);
+    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
     const manifest = try testRootfsAttachManifest(arena, artifact);
     try spore.saveManifest(arena, spore_dir, manifest);
 
@@ -2812,7 +2812,7 @@ test "cas preload attach rejects unexpected disk base" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, 4096);
+    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
     var manifest = try testRootfsAttachManifest(arena, artifact);
     manifest.disk.?.base = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     try spore.saveManifest(arena, spore_dir, manifest);
@@ -3025,7 +3025,7 @@ test "image rootfs cache metadata matches resolved image identity" {
         .sub_path = metadata_path,
         .data =
         \\{
-        \\  "builder_version": "sporevm-rootfs-v5",
+        \\  "builder_version": "sporevm-rootfs-v6",
         \\  "ext4_writer": "native",
         \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -3455,7 +3455,7 @@ test "image ref cache treats mismatched records and missing rootfs as misses" {
         \\  "version": 1,
         \\  "requested_ref": "docker.io/library/alpine:other",
         \\  "platform": "linux/arm64",
-        \\  "builder_version": "sporevm-rootfs-v5",
+        \\  "builder_version": "sporevm-rootfs-v6",
         \\  "resolved_image_ref": "{s}",
         \\  "image_manifest_digest": "{s}",
         \\  "rootfs_cache_key": "{s}",
@@ -3470,7 +3470,7 @@ test "image ref cache treats mismatched records and missing rootfs as misses" {
         \\  "version": 1,
         \\  "requested_ref": "docker.io/library/alpine:3.20",
         \\  "platform": "linux/arm64",
-        \\  "builder_version": "sporevm-rootfs-v5",
+        \\  "builder_version": "sporevm-rootfs-v6",
         \\  "resolved_image_ref": "docker.io/library/alpine:not-a-digest",
         \\  "image_manifest_digest": "{s}",
         \\  "rootfs_cache_key": "{s}",

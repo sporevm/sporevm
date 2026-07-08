@@ -378,9 +378,9 @@ chunk store with roots enumerated from refs/records/manifests.
 
 Landed behavior: existing chunked-rootfs producers now write
 `spore-disk-index-v1` through `src/disk_index.zig`; restore, bundle, pull, and
-CAS preload all validate through that parser. The parser still accepts
-`rootfs-block-index-v0` during this transition so pre-U1 cache entries fail
-closed only on real descriptor/digest mismatches. `spore cache gc` performs a
+CAS preload all validate through that parser. The parser rejects
+`rootfs-block-index-v0` as too old after the flag-day break, so pre-U1 cache
+entries are abandoned rather than migrated. `spore cache gc` performs a
 dry-run-by-default mark/sweep over rootfs CAS indexes and objects, rooting
 descriptor-selected indexes from cache metadata, ref records, and live runtime
 resume manifests.

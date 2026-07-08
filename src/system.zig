@@ -2106,7 +2106,7 @@ fn writeGcStorageFixture(
     const index = disk_index.DiskIndex{
         .kind = disk_index.disk_index_kind,
         .logical_size = 512,
-        .chunk_size = 512,
+        .chunk_size = spore.disk_chunk_size,
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
         .object_namespace = spore.rootfs_storage_object_namespace,
         .chunks = &chunks,
@@ -2117,7 +2117,7 @@ fn writeGcStorageFixture(
         .kind = spore.rootfs_storage_kind_chunked_ext4,
         .device = .{ .mmio_slot = 1 },
         .logical_size = 512,
-        .chunk_size = 512,
+        .chunk_size = spore.disk_chunk_size,
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
         .index_digest = index_digest,
         .base_identity = index_digest,

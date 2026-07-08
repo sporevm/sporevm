@@ -1601,7 +1601,7 @@ test "C ABI named lifecycle last error carries state and log paths" {
 
 const inspect_spore_manifest_json =
     \\{
-    \\  "version": 0,
+    \\  "version": 2,
     \\  "annotations": {
     \\    "cleanroom.workspace": "/workspaces/app",
     \\    "cleanroom.provenance": "sha256:abc123"

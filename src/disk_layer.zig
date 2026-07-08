@@ -2,7 +2,9 @@
 //!
 //! The legacy disk-layer parser and layered COW backend have been removed from
 //! the runtime path. This module keeps the small shared pieces still used while
-//! the manifest carries transitional `cow-block-v0` fields.
+//! rootfs-backed runs use the chunk-mapped backend. The old disk kind appears
+//! only as an internal clean exact-rootfs sentinel and is never accepted from a
+//! persisted manifest.
 
 const std = @import("std");
 const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
@@ -108,7 +110,7 @@ pub fn cloneDisk(allocator: std.mem.Allocator, disk: spore.Disk) Error!spore.Dis
     };
 }
 
-test "snapshot returns null for a clean legacy rootfs disk" {
+test "snapshot returns null for a clean exact-rootfs sentinel disk" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -126,6 +128,7 @@ test "snapshot returns null for a clean legacy rootfs disk" {
     defer disk.deinit();
 
     const base_disk = spore.Disk{
+        .kind = spore.disk_kind_cow_block,
         .device = .{ .mmio_slot = 1 },
         .size = bytes.len,
         .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

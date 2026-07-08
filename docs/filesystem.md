@@ -24,10 +24,10 @@ $SPOREVM_ROOTFS_CACHE_DIR/
 `spore run --image ... --save` is the writable-rootfs product path. It
 records the immutable ext4 artifact, records `rootfs.storage` from the metadata
 sidecar for image-created spores, and captures rootfs writes as a sealed disk
-index over that base. Older image cache entries are upgraded once when save
-needs portable chunked rootfs identity. `spore rootfs cas-preload --attach-spore`
-remains a repair/debug path for existing exact-rootfs spores; it is not the
-normal producer path.
+index over that base. Older image cache entries miss under the flag-day cache
+identity and are rebuilt from the source image rather than migrated. `spore
+rootfs cas-preload --attach-spore` remains a repair/debug path for existing
+exact-rootfs spores; it is not the normal producer path.
 
 Plain `spore run --rootfs PATH` is still a local read-only escape hatch. Named
 `spore create --rootfs PATH` records exact immutable rootfs identity in the

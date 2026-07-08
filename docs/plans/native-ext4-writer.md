@@ -100,7 +100,7 @@ inode counts, image size, link counts, xattr bounds, and unsupported file sizes
 before writing.
 
 The default native flip is a flag-day cache break: `builder_version` is
-`sporevm-rootfs-v5`, so old `v3`/`v4` rootfs cache entries are abandoned and rebuilt.
+`sporevm-rootfs-v6`, so old `v3`/`v4`/`v5` rootfs cache entries are abandoned and rebuilt.
 The by-digest cache is not split by writer. Rootfs metadata records the selected
 writer, and cache validation rejects a metadata/artifact pair produced by the
 other writer so `SPOREVM_EXT4_WRITER=external` remains an effective escape
@@ -118,9 +118,9 @@ Implemented in this branch:
 | Native/external semantic parity | Done | Focused debugfs read-back test in `src/rootfs_slow_tests.zig` imports the same tar through both writers and compares guest-visible file contents; repeated native output has the same BLAKE3. |
 | Determinism | Done | Duplicate native emits and repeated native materialization produce stable BLAKE3 for the tested inputs. |
 | Fuzz coverage | Done | Existing tar fuzzing is extended with merged-tree fuzzing, and the native planner/metadata emitter has an integrated fuzz target. |
-| Cache identity | Done | Builder version bumped to `sporevm-rootfs-v5`; cache validation includes the selected writer metadata without hashing writer selection into the cache key. |
-| Guest boot smoke | Done | Native-default OCI smoke built and booted Alpine during the v4/default-flip work with `ext4_writer: native` and guest output `native-rootfs-smoke`; v5 invalidates the cache identity for the 60-byte symlink boundary fix. |
-| Writer benchmark | Done | Post-v5 native/external/patched-hcsshim tar2ext4 comparison recorded below; all current outputs are e2fsck-clean. |
+| Cache identity | Done | Builder version bumped to `sporevm-rootfs-v6`; cache validation includes the selected writer metadata without hashing writer selection into the cache key. |
+| Guest boot smoke | Done | Native-default OCI smoke built and booted Alpine during the v4/default-flip work with `ext4_writer: native` and guest output `native-rootfs-smoke`; v6 invalidates the cache identity for the chunk-index format break. |
+| Writer benchmark | Done | Post-v5 native/external/tar2ext4 comparison recorded below; optimized native output is byte-identical to the plain v5 native writer and e2fsck-clean. |
 
 ## Rollout Gates
 
