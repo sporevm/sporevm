@@ -100,7 +100,7 @@ the selected rootfs digest cache.
 
 If `manifest.json` records `rootfs.storage.kind:
 "chunked-ext4-rootfs-v0"`, indexed bundles carry the exact
-`rootfs-block-index-v0` bytes named by `rootfs.storage.index_digest` under
+`spore-disk-index-v1` bytes named by `rootfs.storage.index_digest` under
 `rootfs/blake3/indexes/<hex>.json`, plus each referenced nonzero rootfs chunk
 object under `rootfs/blake3/objects/<hex>.chunk`. Unpack and pull verify the
 index against the manifest storage descriptor and verify every chunk by BLAKE3
@@ -235,8 +235,8 @@ under `rootfs.cache`.
   `index_digest`, `base_identity`, and `object_namespace: "rootfs/blake3"`.
   For this first chunked storage kind, `base_identity` must equal
   `index_digest`, and the digest is the BLAKE3 identity of the canonical
-  rootfs block index bytes. The index itself records index version
-  `rootfs-block-index-v0`, logical size, chunk size, hash algorithm, object
+  disk index bytes. The index itself records index version
+  `spore-disk-index-v1`, logical size, chunk size, hash algorithm, object
   namespace, sorted non-zero chunk entries, and sorted explicit zero chunks;
   it does not repeat `base_identity` because that would make the index
   self-referential.
@@ -342,7 +342,7 @@ that blob before mutating VM state.
   chunk cache entries.
 - Rootfs-backed bundles include exact immutable rootfs bytes by default for
   fd-backed rootfs manifests. For manifest-attached chunked rootfs storage, they
-  include the descriptor-bound rootfs block index and BLAKE3 chunk objects.
+  include the descriptor-bound disk index and BLAKE3 chunk objects.
   Bundle unpack refuses missing, symlinked, or digest-mismatched rootfs artifacts
   and rootfs CAS files before writing a resumable spore.
 - Rootfs-backed bundles include referenced writable disk layer indexes and disk
@@ -354,7 +354,7 @@ that blob before mutating VM state.
   only then attaches it to the VM.
 - Manifest-bound chunked rootfs storage descriptors select the rootfs block
   source for product resume. The runtime opens the exact local
-  `rootfs-block-index-v0` named by `rootfs.storage.index_digest`, validates the
+  `spore-disk-index-v1` named by `rootfs.storage.index_digest`, validates the
   index against that descriptor, and serves only BLAKE3-verified local chunk
   objects. Missing or corrupt index/chunk bytes fail before guest use. The
   fd-backed path must not silently ignore `rootfs.storage` and treat the

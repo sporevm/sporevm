@@ -1,13 +1,13 @@
 //! Chunked rootfs cache and block source.
 //!
-//! Runtime restore uses the manifest-bound rootfs block index selected by
+//! Runtime restore uses the manifest-bound disk index selected by
 //! `rootfs.storage`.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const chunk = @import("chunk.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
-const rootfs_index = @import("rootfs_index.zig");
+const disk_index = @import("disk_index.zig");
 const spore = @import("spore.zig");
 
 const Io = std.Io;
@@ -191,7 +191,7 @@ pub fn preload(
     const chunk_count_u64 = try chunkCount(stat.size, chunk_size);
     if (chunk_count_u64 > std.math.maxInt(usize)) return error.BadManifest;
     const chunk_count: usize = @intCast(chunk_count_u64);
-    var manifest_chunks: std.ArrayList(rootfs_index.RootfsBlockChunk) = .empty;
+    var manifest_chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty;
     try manifest_chunks.ensureTotalCapacity(allocator, chunk_count);
     defer {
         for (manifest_chunks.items) |entry| allocator.free(entry.digest);
@@ -288,8 +288,8 @@ pub fn preload(
     }
 
     const index_build_start_ms = monotonicMs();
-    const manifest_index = rootfs_index.RootfsBlockIndex{
-        .kind = rootfs_index.rootfs_block_index_kind,
+    const manifest_index = disk_index.DiskIndex{
+        .kind = disk_index.disk_index_kind,
         .logical_size = stat.size,
         .chunk_size = chunk_size,
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
@@ -299,7 +299,7 @@ pub fn preload(
     };
     const manifest_json = try std.json.Stringify.valueAlloc(allocator, manifest_index, .{ .whitespace = .indent_2 });
     defer allocator.free(manifest_json);
-    const index_digest = try rootfs_index.indexDigestAlloc(allocator, manifest_json);
+    const index_digest = try disk_index.indexDigestAlloc(allocator, manifest_json);
     const index_build_ms = monotonicMs() -| index_build_start_ms;
     errdefer allocator.free(index_digest);
     const manifest_path = try manifestIndexPath(allocator, cache_root, index_digest);
@@ -340,12 +340,12 @@ pub fn storageComplete(
     defer allocator.free(index_path);
     if (!try rootfs_cache.regularFileNoSymlink(io, index_path)) return false;
 
-    const bytes = readFileAll(allocator, index_path, rootfs_index.max_index_bytes) catch |err| switch (err) {
+    const bytes = readFileAll(allocator, index_path, disk_index.max_index_bytes) catch |err| switch (err) {
         error.MissingChunk, error.BadChunk, error.ShortRead => return false,
         else => |e| return e,
     };
     defer allocator.free(bytes);
-    var parsed = rootfs_index.parseRootfsBlockIndex(allocator, bytes, storage) catch |err| switch (err) {
+    var parsed = disk_index.parseDiskIndex(allocator, bytes, storage) catch |err| switch (err) {
         error.BadManifest => return false,
         else => |e| return e,
     };
@@ -370,9 +370,9 @@ pub fn readVerifiedStorageIndexPath(
     path: []const u8,
     storage: spore.RootfsStorage,
 ) ![]u8 {
-    const bytes = try readFileAll(allocator, path, rootfs_index.max_index_bytes);
+    const bytes = try readFileAll(allocator, path, disk_index.max_index_bytes);
     errdefer allocator.free(bytes);
-    var parsed = try rootfs_index.parseRootfsBlockIndex(allocator, bytes, storage);
+    var parsed = try disk_index.parseDiskIndex(allocator, bytes, storage);
     parsed.deinit();
     return bytes;
 }
@@ -403,7 +403,7 @@ pub fn installStorageIndexPath(
         allocator.free(existing);
         return .{ .cache_hit = true, .bytes_fetched = 0 };
     }
-    var parsed = try rootfs_index.parseRootfsBlockIndex(allocator, data, storage);
+    var parsed = try disk_index.parseDiskIndex(allocator, data, storage);
     parsed.deinit();
     try writeFileAtomic(io, allocator, cache_path, data);
     const installed = try readVerifiedStorageIndexPath(allocator, cache_path, storage);
@@ -481,7 +481,7 @@ fn loadManifestIndex(
 ) !LoadedIndex {
     const bytes = try readFileAll(allocator, path, max_index_bytes);
     defer allocator.free(bytes);
-    var parsed = try rootfs_index.parseRootfsBlockIndex(allocator, bytes, storage);
+    var parsed = try disk_index.parseDiskIndex(allocator, bytes, storage);
     errdefer parsed.deinit();
     const expected_chunks = try chunkCount(storage.logical_size, storage.chunk_size);
     if (expected_chunks > std.math.maxInt(usize)) return error.BadManifest;

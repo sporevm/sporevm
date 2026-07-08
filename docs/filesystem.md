@@ -17,7 +17,7 @@ $SPOREVM_ROOTFS_CACHE_DIR/
   <image-cache-key>.ext4
   <image-cache-key>.json              # includes rootfs_storage
   by-digest/blake3/<rootfs>.ext4      # exact fd-backed compatibility path
-  cas/rootfs/blake3/indexes/<id>.json # rootfs-block-index-v0
+  cas/rootfs/blake3/indexes/<id>.json # spore-disk-index-v1
   cas/rootfs/blake3/objects/<id>.chunk
 ```
 
@@ -139,7 +139,9 @@ spores.
 
 `spore system df --rootfs` reports image ext4 files, metadata, exact digest
 artifacts, rootfs CAS indexes, rootfs CAS objects, ref records, and temporary
-entries.
+entries. `spore cache gc --rootfs` performs a mark/sweep of rootfs CAS indexes
+and objects from cache metadata, ref records, and live runtime manifests; it is
+dry-run by default and requires `--force` to delete candidates.
 
 Default `spore system prune --rootfs` only selects rebuildable image rootfs
 entries. Flat digest artifacts (the resume authority) are skipped unless
@@ -177,4 +179,4 @@ with guest `node -v` execution time inside the resumed VM dropping from about
 - Optional file-content indexes if fixed block dedupe leaves measured package or
   model-transfer savings on the table.
 - Lazy remote rootfs reads and scheduler-aware peer selection.
-- Reachability-aware rootfs CAS garbage collection.
+- Packfile support if fault-in measurements show file-per-chunk is too costly.

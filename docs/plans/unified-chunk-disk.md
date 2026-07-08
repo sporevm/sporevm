@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: active
 last_reviewed: 2026-07-08
 spec_refs:
   - docs/spore-format.md
@@ -10,7 +10,7 @@ spec_refs:
   - src/disk_layer.zig
   - src/cow_disk.zig
   - src/rootfs_cas.zig
-  - src/rootfs_index.zig
+  - src/disk_index.zig
   - src/runtime_disk.zig
   - src/dirty_ram.zig
 related_plans:
@@ -81,7 +81,7 @@ granularities, plus a third identity that belongs to neither:
 | Consumer | resume/restore (`LayeredCowDisk`) | flat-file assembly before boot |
 
 `spore.DiskLayer{ extents: [{logical_cluster, digest}], zero_clusters }` and
-`RootfsBlockIndex{ chunks: [{logical_chunk, digest}], zero_chunks }` are the
+`DiskIndex{ chunks: [{logical_chunk, digest}], zero_chunks }` are the
 same structure with different field names. Each has its own parser (both
 restore-authority, both security surface per `SECURITY.md`), its own object
 namespace, its own validation, its own tests.
@@ -168,7 +168,7 @@ identity = blake3(canonical index bytes)
 ```
 
 This is `rootfs-block-index-v0` renamed and promoted: same validation rules
-(coverage equality, strict ordering, range checks — `validateRootfsBlockIndex`
+(coverage equality, strict ordering, range checks — `validateDiskIndex`
 already enforces them), now the *only* way any disk state is named. A base
 image, a checkpoint, a save snapshot, and "the disk of a running VM at freeze
 point" are all just indexes. Deltas are not format objects: the delta between
@@ -371,13 +371,24 @@ requirement and defers with that plan; nothing in U1–U8 needs it.
 
 ### U1 — Unified index type and CAS GC
 
+Status: landed in branch.
+
 Rename/promote `rootfs-block-index-v0` to `spore-disk-index-v1` (one parser,
 shared by all consumers); implement mark-sweep `spore cache gc` over the
 chunk store with roots enumerated from refs/records/manifests.
 
-Done when: GC reclaims orphaned chunks and never a rooted one (property test
-over randomized root sets); both existing consumers (CAS preload, restore
-parsing) use the one parser; fuzz target moved with it.
+Landed behavior: existing chunked-rootfs producers now write
+`spore-disk-index-v1` through `src/disk_index.zig`; restore, bundle, pull, and
+CAS preload all validate through that parser. The parser still accepts
+`rootfs-block-index-v0` during this transition so pre-U1 cache entries fail
+closed only on real descriptor/digest mismatches. `spore cache gc` performs a
+dry-run-by-default mark/sweep over rootfs CAS indexes and objects, rooting
+descriptor-selected indexes from cache metadata, ref records, and live runtime
+resume manifests.
+
+Validation: `mise run test` covers index parser/fuzz coverage and a GC model
+test that preserves a rooted index/object pair while deleting an unrooted index,
+its object, and a stray object.
 
 ### U2 — Chunk-mapped runtime backend
 
@@ -480,12 +491,12 @@ boot/fork behavior.
 
 ## Security
 
-- Net parser reduction: `DiskLayer` and `RootfsBlockIndex` parsing collapse
+- Net parser reduction: `DiskLayer` and `DiskIndex` parsing collapse
   into one hardened, fuzzed index parser. Restore-authority surface shrinks.
 - The chunk map is host-internal state derived from validated values; the
   virtio-blk request parsing is untouched (frozen device model).
 - CAS objects remain verify-at-write, trust-at-open; index digests bind
-  coverage and size exactly as `validateRootfsBlockIndex` does today.
+  coverage and size exactly as `validateDiskIndex` does today.
 - GC is a new destructive operation: it must be root-conservative (unknown
   record kinds are roots, not garbage) and tested against concurrent-ish
   root creation (lock protocol test).

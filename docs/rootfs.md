@@ -170,6 +170,9 @@ spore system prune --force
 spore system prune --rootfs --dry-run --max-bytes 20gb
 spore system prune --rootfs --force --max-bytes 20gb
 spore --json system prune --dry-run
+spore cache gc --rootfs
+spore cache gc --rootfs --force
+spore --json cache gc --rootfs
 ```
 
 These commands render human summaries by default. Put global `--json` before the
@@ -194,6 +197,12 @@ prune selectors:
   this to reclaim the chunk footprint (roughly the rootfs size per unique
   image) on hosts that pulled chunked spores but do not need to re-share them
   immediately.
+
+`spore cache gc --rootfs` is stricter than prune. It roots descriptor-selected
+`spore-disk-index-v1` indexes from cache metadata, image ref records, and live
+runtime manifests, then selects only unrooted CAS indexes and chunk objects. It
+is the preferred command when the goal is to clean chunk garbage without
+discarding reachable chunked storage.
 
 When `spore run --image ... --save SPORE` saves a VM, the spore manifest
 records an immutable rootfs artifact: the ext4 content BLAKE3 digest, size,
@@ -221,7 +230,7 @@ resumable spore.
 
 If a spore manifest has manifest-attached chunked rootfs storage under
 `rootfs.storage`, indexed bundles carry the descriptor-bound
-`rootfs-block-index-v0` under `rootfs/blake3/indexes/<hex>.json` and the
+`spore-disk-index-v1` under `rootfs/blake3/indexes/<hex>.json` and the
 referenced nonzero rootfs chunk objects under
 `rootfs/blake3/objects/<hex>.chunk`. `spore unpack` and `spore pull` verify the
 index against the manifest descriptor, verify each chunk by BLAKE3, and install

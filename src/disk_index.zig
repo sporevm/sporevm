@@ -1,53 +1,55 @@
-//! Manifest-bound chunked rootfs index parsing.
+//! Manifest-bound chunk-mapped disk index parsing.
 //!
-//! This is the portable restore-authority parser for chunked immutable rootfs
-//! storage. Product resume uses it to validate the descriptor-selected local
-//! rootfs CAS index before guest-visible block reads.
+//! This is the portable restore-authority parser for chunked immutable disk
+//! state. U1 routes existing chunked rootfs storage through this parser while
+//! later slices move writable disks and memory manifests onto the same shape.
 
 const std = @import("std");
 const chunk = @import("chunk.zig");
 const spore = @import("spore.zig");
 
-pub const rootfs_block_index_kind = "rootfs-block-index-v0";
+pub const disk_index_kind = "spore-disk-index-v1";
+pub const legacy_rootfs_block_index_kind = "rootfs-block-index-v0";
 pub const max_index_bytes: usize = 64 * 1024 * 1024;
 
-pub const RootfsBlockChunk = struct {
+pub const DiskIndexChunk = struct {
     logical_chunk: u64,
     digest: []const u8,
 };
 
-pub const RootfsBlockIndex = struct {
+pub const DiskIndex = struct {
     kind: []const u8,
     logical_size: u64,
     chunk_size: u64,
     hash_algorithm: []const u8,
     object_namespace: []const u8,
-    chunks: []const RootfsBlockChunk = &.{},
+    chunks: []const DiskIndexChunk = &.{},
     zero_chunks: []const u64 = &.{},
 };
 
-pub fn parseRootfsBlockIndex(
+pub fn parseDiskIndex(
     allocator: std.mem.Allocator,
     bytes: []const u8,
     storage: spore.RootfsStorage,
-) spore.Error!std.json.Parsed(RootfsBlockIndex) {
+) spore.Error!std.json.Parsed(DiskIndex) {
     if (bytes.len == 0 or bytes.len > max_index_bytes) return error.BadManifest;
     try spore.validateRootfsStorageDescriptor(storage);
     try validateIndexDigest(bytes, storage.index_digest);
-    const parsed = std.json.parseFromSlice(RootfsBlockIndex, allocator, bytes, .{
+    const parsed = std.json.parseFromSlice(DiskIndex, allocator, bytes, .{
         .allocate = .alloc_always,
     }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.BadManifest,
     };
     errdefer parsed.deinit();
-    try validateRootfsBlockIndex(parsed.value, storage);
+    try validateDiskIndex(parsed.value, storage);
     return parsed;
 }
 
-fn validateRootfsBlockIndex(index: RootfsBlockIndex, storage: spore.RootfsStorage) spore.Error!void {
+fn validateDiskIndex(index: DiskIndex, storage: spore.RootfsStorage) spore.Error!void {
     try spore.validateRootfsStorageDescriptor(storage);
-    if (!std.mem.eql(u8, index.kind, rootfs_block_index_kind)) return error.BadManifest;
+    if (!std.mem.eql(u8, index.kind, disk_index_kind) and
+        !std.mem.eql(u8, index.kind, legacy_rootfs_block_index_kind)) return error.BadManifest;
     if (index.logical_size != storage.logical_size) return error.BadManifest;
     if (index.chunk_size != storage.chunk_size) return error.BadManifest;
     if (!std.mem.eql(u8, index.hash_algorithm, storage.hash_algorithm)) return error.BadManifest;
@@ -124,9 +126,9 @@ fn testStorage(index_digest: []const u8) spore.RootfsStorage {
     };
 }
 
-fn testIndex(chunks: []const RootfsBlockChunk, zero_chunks: []const u64) RootfsBlockIndex {
+fn testIndex(kind: []const u8, chunks: []const DiskIndexChunk, zero_chunks: []const u64) DiskIndex {
     return .{
-        .kind = rootfs_block_index_kind,
+        .kind = kind,
         .logical_size = 8192,
         .chunk_size = 4096,
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
@@ -138,7 +140,7 @@ fn testIndex(chunks: []const RootfsBlockChunk, zero_chunks: []const u64) RootfsB
 
 fn validIndexJson() []const u8 {
     return
-    \\{"kind":"rootfs-block-index-v0","logical_size":8192,"chunk_size":4096,"hash_algorithm":"blake3","object_namespace":"rootfs/blake3","chunks":[{"logical_chunk":0,"digest":"blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],"zero_chunks":[1]}
+    \\{"kind":"spore-disk-index-v1","logical_size":8192,"chunk_size":4096,"hash_algorithm":"blake3","object_namespace":"rootfs/blake3","chunks":[{"logical_chunk":0,"digest":"blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],"zero_chunks":[1]}
     ;
 }
 
@@ -154,14 +156,14 @@ fn storageAndIndexJson(allocator: std.mem.Allocator) !struct {
     };
 }
 
-test "manifest-bound rootfs block index validates descriptor digest and canonical coverage" {
+test "manifest-bound disk index validates descriptor digest and canonical coverage" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const fixture = try storageAndIndexJson(arena);
-    const parsed = try parseRootfsBlockIndex(arena, fixture.bytes, fixture.storage);
+    const parsed = try parseDiskIndex(arena, fixture.bytes, fixture.storage);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.chunks.len);
     try std.testing.expectEqual(@as(u64, 0), parsed.value.chunks[0].logical_chunk);
@@ -169,53 +171,69 @@ test "manifest-bound rootfs block index validates descriptor digest and canonica
     try std.testing.expectEqual(@as(u64, 1), parsed.value.zero_chunks[0]);
 }
 
-test "manifest-bound rootfs block index rejects digest and descriptor mismatches" {
+test "manifest-bound disk index accepts the legacy rootfs kind during transition" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const legacy =
+        \\{"kind":"rootfs-block-index-v0","logical_size":8192,"chunk_size":4096,"hash_algorithm":"blake3","object_namespace":"rootfs/blake3","chunks":[{"logical_chunk":0,"digest":"blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],"zero_chunks":[1]}
+    ;
+    const digest = try indexDigestAlloc(arena, legacy);
+    const parsed = try parseDiskIndex(arena, legacy, testStorage(digest));
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(legacy_rootfs_block_index_kind, parsed.value.kind);
+}
+
+test "manifest-bound disk index rejects digest and descriptor mismatches" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const fixture = try storageAndIndexJson(arena);
-    try std.testing.expectError(error.BadManifest, parseRootfsBlockIndex(arena, fixture.bytes, testStorage(digest_a)));
+    try std.testing.expectError(error.BadManifest, parseDiskIndex(arena, fixture.bytes, testStorage(digest_a)));
 
     var wrong_size = fixture.storage;
     wrong_size.logical_size = 4096;
-    try std.testing.expectError(error.BadManifest, parseRootfsBlockIndex(arena, fixture.bytes, wrong_size));
+    try std.testing.expectError(error.BadManifest, parseDiskIndex(arena, fixture.bytes, wrong_size));
 
     var wrong_chunk_size = fixture.storage;
     wrong_chunk_size.chunk_size = 8192;
-    try std.testing.expectError(error.BadManifest, parseRootfsBlockIndex(arena, fixture.bytes, wrong_chunk_size));
+    try std.testing.expectError(error.BadManifest, parseDiskIndex(arena, fixture.bytes, wrong_chunk_size));
 
     var wrong_algorithm = fixture.storage;
     wrong_algorithm.hash_algorithm = "sha256";
-    try std.testing.expectError(error.BadManifest, parseRootfsBlockIndex(arena, fixture.bytes, wrong_algorithm));
+    try std.testing.expectError(error.BadManifest, parseDiskIndex(arena, fixture.bytes, wrong_algorithm));
 
     var wrong_namespace = fixture.storage;
     wrong_namespace.object_namespace = "../rootfs";
-    try std.testing.expectError(error.BadManifest, parseRootfsBlockIndex(arena, fixture.bytes, wrong_namespace));
+    try std.testing.expectError(error.BadManifest, parseDiskIndex(arena, fixture.bytes, wrong_namespace));
 
     const missing_kind =
         \\{"logical_size":8192,"chunk_size":4096,"hash_algorithm":"blake3","object_namespace":"rootfs/blake3","chunks":[{"logical_chunk":0,"digest":"blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],"zero_chunks":[1]}
     ;
     const missing_kind_digest = try indexDigestAlloc(arena, missing_kind);
-    try std.testing.expectError(error.BadManifest, parseRootfsBlockIndex(arena, missing_kind, testStorage(missing_kind_digest)));
+    try std.testing.expectError(error.BadManifest, parseDiskIndex(arena, missing_kind, testStorage(missing_kind_digest)));
 
     const storage = testStorage(digest_a);
-    var wrong_kind = testIndex(&.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{1});
+    var wrong_kind = testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{1});
     wrong_kind.kind = "unknown-rootfs-index-v0";
-    try std.testing.expectError(error.BadManifest, validateRootfsBlockIndex(wrong_kind, storage));
+    try std.testing.expectError(error.BadManifest, validateDiskIndex(wrong_kind, storage));
 
-    var wrong_index_algorithm = testIndex(&.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{1});
+    var wrong_index_algorithm = testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{1});
     wrong_index_algorithm.hash_algorithm = "sha256";
-    try std.testing.expectError(error.BadManifest, validateRootfsBlockIndex(wrong_index_algorithm, storage));
+    try std.testing.expectError(error.BadManifest, validateDiskIndex(wrong_index_algorithm, storage));
 
-    var wrong_index_namespace = testIndex(&.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{1});
+    var wrong_index_namespace = testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{1});
     wrong_index_namespace.object_namespace = "../rootfs";
-    try std.testing.expectError(error.BadManifest, validateRootfsBlockIndex(wrong_index_namespace, storage));
+    try std.testing.expectError(error.BadManifest, validateDiskIndex(wrong_index_namespace, storage));
 }
 
-test "manifest-bound rootfs block index rejects non-canonical chunk tables" {
-    try std.testing.expectError(error.BadManifest, validateRootfsBlockIndex(testIndex(
+test "manifest-bound disk index rejects non-canonical chunk tables" {
+    try std.testing.expectError(error.BadManifest, validateDiskIndex(testIndex(
+        disk_index_kind,
         &.{
             .{ .logical_chunk = 0, .digest = digest_b },
             .{ .logical_chunk = 0, .digest = digest_c },
@@ -223,7 +241,8 @@ test "manifest-bound rootfs block index rejects non-canonical chunk tables" {
         &.{},
     ), testStorage(digest_a)));
 
-    try std.testing.expectError(error.BadManifest, validateRootfsBlockIndex(testIndex(
+    try std.testing.expectError(error.BadManifest, validateDiskIndex(testIndex(
+        disk_index_kind,
         &.{
             .{ .logical_chunk = 1, .digest = digest_b },
             .{ .logical_chunk = 0, .digest = digest_c },
@@ -231,29 +250,29 @@ test "manifest-bound rootfs block index rejects non-canonical chunk tables" {
         &.{},
     ), testStorage(digest_a)));
 
-    try std.testing.expectError(error.BadManifest, validateRootfsBlockIndex(
-        testIndex(&.{.{ .logical_chunk = 2, .digest = digest_b }}, &.{0}),
+    try std.testing.expectError(error.BadManifest, validateDiskIndex(
+        testIndex(disk_index_kind, &.{.{ .logical_chunk = 2, .digest = digest_b }}, &.{0}),
         testStorage(digest_a),
     ));
 
-    try std.testing.expectError(error.BadManifest, validateRootfsBlockIndex(
-        testIndex(&.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{0}),
+    try std.testing.expectError(error.BadManifest, validateDiskIndex(
+        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{0}),
         testStorage(digest_a),
     ));
 
-    try std.testing.expectError(error.BadManifest, validateRootfsBlockIndex(
-        testIndex(&.{.{ .logical_chunk = 0, .digest = "sha256:bbbb" }}, &.{1}),
+    try std.testing.expectError(error.BadManifest, validateDiskIndex(
+        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = "sha256:bbbb" }}, &.{1}),
         testStorage(digest_a),
     ));
 
-    try std.testing.expectError(error.BadManifest, validateRootfsBlockIndex(
-        testIndex(&.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{}),
+    try std.testing.expectError(error.BadManifest, validateDiskIndex(
+        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{}),
         testStorage(digest_a),
     ));
 }
 
-fn fuzzRootfsBlockIndexParse(_: void, s: *std.testing.Smith) !void {
-    // Rootfs block indexes may arrive from registries, bundles, or peers. They
+fn fuzzDiskIndexParse(_: void, s: *std.testing.Smith) !void {
+    // Disk indexes may arrive from registries, bundles, or peers. They
     // must either fail closed or validate to a descriptor-bound, canonical map.
     var buf: [4096]u8 = undefined;
     const len = s.slice(&buf);
@@ -269,10 +288,10 @@ fn fuzzRootfsBlockIndexParse(_: void, s: *std.testing.Smith) !void {
         .base_identity = digest,
         .object_namespace = spore.rootfs_storage_object_namespace,
     };
-    const parsed = parseRootfsBlockIndex(std.testing.allocator, buf[0..len], storage) catch return;
+    const parsed = parseDiskIndex(std.testing.allocator, buf[0..len], storage) catch return;
     parsed.deinit();
 }
 
-test "fuzz manifest-bound rootfs block index parser" {
-    try std.testing.fuzz({}, fuzzRootfsBlockIndexParse, .{});
+test "fuzz manifest-bound disk index parser" {
+    try std.testing.fuzz({}, fuzzDiskIndexParse, .{});
 }
