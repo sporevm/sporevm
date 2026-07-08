@@ -7,9 +7,16 @@
 const std = @import("std");
 const block_source = @import("../block_source.zig");
 const chunk_mapped_disk = @import("../chunk_mapped_disk.zig");
+const disk_index = @import("../disk_index.zig");
+const disk_layer = @import("../disk_layer.zig");
 const guestmem = @import("../guestmem.zig");
+const rootfs_cache = @import("../rootfs_cache.zig");
+const rootfs_cas = @import("../rootfs_cas.zig");
+const spore = @import("../spore.zig");
 const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
+
+const Io = std.Io;
 
 pub const device_id: u32 = 2;
 pub const sector_size = 512;
@@ -251,6 +258,90 @@ fn makeChain(segs: []const queue.Segment) queue.Chain {
     return chain;
 }
 
+const TestNotifyResult = struct {
+    did_work: bool,
+    status: u8,
+    used_idx: u16,
+    used_head: u32,
+    used_len: u32,
+};
+
+const TestBlkQueue = struct {
+    buf: [4096]u8 = [_]u8{0} ** 4096,
+    queues: [mmio.max_queues]queue.VirtQueue,
+
+    const desc_base: u64 = 0;
+    const avail_base: u64 = 0x400;
+    const used_base: u64 = 0x800;
+    const header_base: u64 = 0xc00;
+    const data_base: u64 = 0xd00;
+    const status_base: u64 = 0xf40;
+    const desc_size: u64 = 16;
+    const flag_next: u16 = 1;
+    const flag_write: u16 = 2;
+
+    fn init() TestBlkQueue {
+        var queues = [_]queue.VirtQueue{.{}} ** mmio.max_queues;
+        queues[0] = .{
+            .size = 8,
+            .ready = true,
+            .desc_addr = desc_base,
+            .avail_addr = avail_base,
+            .used_addr = used_base,
+        };
+        return .{ .queues = queues };
+    }
+
+    fn ram(self: *TestBlkQueue) guestmem.GuestRam {
+        return .{ .bytes = &self.buf, .base = 0 };
+    }
+
+    fn setDesc(self: *TestBlkQueue, i: u16, addr: u64, len: u32, flags: u16, next_desc: u16) void {
+        const r = self.ram();
+        const base = desc_base + desc_size * @as(u64, i);
+        r.write(u64, base, addr) catch unreachable;
+        r.write(u32, base + 8, len) catch unreachable;
+        r.write(u16, base + 12, flags) catch unreachable;
+        r.write(u16, base + 14, next_desc) catch unreachable;
+    }
+
+    fn pushAvail(self: *TestBlkQueue, head: u16) void {
+        const r = self.ram();
+        const idx = r.read(u16, avail_base + 2) catch unreachable;
+        r.write(u16, avail_base + 4 + 2 * @as(u64, idx % self.queues[0].size), head) catch unreachable;
+        r.write(u16, avail_base + 2, idx +% 1) catch unreachable;
+    }
+
+    fn submitRead(self: *TestBlkQueue, blk: *Blk, sector: u64, fill: u8, out: *[sector_size]u8) !TestNotifyResult {
+        const header_start: usize = @intCast(header_base);
+        const data_start: usize = @intCast(data_base);
+        const status_start: usize = @intCast(status_base);
+        @memset(self.buf[header_start..][0..16], 0);
+        @memset(self.buf[data_start..][0..sector_size], fill);
+        self.buf[status_start] = 0xff;
+
+        const r = self.ram();
+        try r.write(u32, header_base, req_in);
+        try r.write(u64, header_base + 8, sector);
+        self.setDesc(0, header_base, 16, flag_next, 1);
+        self.setDesc(1, data_base, sector_size, flag_next | flag_write, 2);
+        self.setDesc(2, status_base, 1, flag_write, 0);
+
+        const used_slot = self.queues[0].used_idx % self.queues[0].size;
+        self.pushAvail(0);
+        const did_work = Blk.notify(blk, 0, &self.queues, self.ram());
+        @memcpy(out, self.buf[data_start..][0..sector_size]);
+        const used_elem = used_base + 4 + 8 * @as(u64, used_slot);
+        return .{
+            .did_work = did_work,
+            .status = try r.read(u8, status_base),
+            .used_idx = try r.read(u16, used_base + 2),
+            .used_head = try r.read(u32, used_elem),
+            .used_len = try r.read(u32, used_elem + 4),
+        };
+    }
+};
+
 test "read request returns sector data" {
     var disk = [_]u8{0} ** (4 * sector_size);
     disk[sector_size] = 0xAB; // first byte of sector 1
@@ -354,6 +445,101 @@ test "chunk mapped backend serves dirty writes without mutating base" {
     const read = try base.readPositionalAll(io, &base_check, sector_size);
     try std.testing.expectEqual(base_check.len, read);
     try std.testing.expectEqualSlices(u8, base_bytes[sector_size..], &base_check);
+}
+
+const LazyFaultKind = enum {
+    missing,
+    corrupt_same_size,
+};
+
+fn expectLazyFaultInFailureViaVirtio(kind: LazyFaultKind) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = switch (kind) {
+        .missing => "zig-cache/test-blk-lazy-cas-missing-object",
+        .corrupt_same_size => "zig-cache/test-blk-lazy-cas-corrupt-object",
+    };
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/source.ext4", .{tmp});
+    const cache_root = try std.fmt.allocPrint(arena, "{s}/cache", .{tmp});
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384) ++ ("ijkl" ** 16384);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
+
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
+    const index_bytes = try Io.Dir.cwd().readFileAlloc(io, preload_result.index_path, arena, .limited(disk_index.max_index_bytes));
+    var parsed = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
+    defer parsed.deinit();
+    const bad_chunk: usize = switch (kind) {
+        .missing => 1,
+        .corrupt_same_size => 2,
+    };
+    const bad_object_path = try rootfs_cas.manifestObjectPath(arena, cache_root, parsed.value.chunks[bad_chunk].digest);
+
+    var base = try disk_layer.createTempOverlay(arena);
+    defer base.deinit();
+    var overlay = try disk_layer.createTempOverlay(arena);
+    defer overlay.deinit();
+    const logical_size = std.math.cast(std.c.off_t, artifact.size) orelse return error.BadManifest;
+    if (std.c.ftruncate(base.fd, logical_size) != 0) return error.IoFailed;
+
+    const base_source = block_source.FileBlockSource.init(base.fd, artifact.size);
+    var disk = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, overlay.fd, artifact.size, spore.disk_chunk_size);
+    defer disk.deinit();
+    try disk.attachCasIndex(cache_root, parsed.value);
+    var blk = Blk.init(.{ .chunk_mapped = &disk });
+    var ring = TestBlkQueue.init();
+
+    var data: [sector_size]u8 = undefined;
+    const promoted = try ring.submitRead(&blk, 0, 0x00, &data);
+    try std.testing.expect(promoted.did_work);
+    try std.testing.expectEqual(status_ok, promoted.status);
+    try std.testing.expectEqual(@as(u16, 1), promoted.used_idx);
+    try std.testing.expectEqual(@as(u32, 0), promoted.used_head);
+    try std.testing.expectEqual(@as(u32, sector_size + 1), promoted.used_len);
+    try std.testing.expectEqualStrings("abcd", data[0..4]);
+
+    switch (kind) {
+        .missing => try Io.Dir.cwd().deleteFile(io, bad_object_path),
+        .corrupt_same_size => {
+            try Io.Dir.cwd().deleteFile(io, bad_object_path);
+            const corrupt = try arena.alloc(u8, @intCast(spore.disk_chunk_size));
+            @memset(corrupt, 0xee);
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_object_path, .data = corrupt });
+        },
+    }
+
+    const bad_sector = @as(u64, @intCast(bad_chunk)) * (spore.disk_chunk_size / sector_size);
+    const failed = try ring.submitRead(&blk, bad_sector, 0xaa, &data);
+    try std.testing.expect(failed.did_work);
+    try std.testing.expectEqual(status_ioerr, failed.status);
+    try std.testing.expectEqual(@as(u16, 2), failed.used_idx);
+    try std.testing.expectEqual(@as(u32, 0), failed.used_head);
+    try std.testing.expectEqual(@as(u32, 1), failed.used_len);
+    try std.testing.expect(std.mem.allEqual(u8, &data, 0xaa));
+
+    const recovered = try ring.submitRead(&blk, 0, 0x00, &data);
+    try std.testing.expect(recovered.did_work);
+    try std.testing.expectEqual(status_ok, recovered.status);
+    try std.testing.expectEqual(@as(u16, 3), recovered.used_idx);
+    try std.testing.expectEqual(@as(u32, 0), recovered.used_head);
+    try std.testing.expectEqual(@as(u32, sector_size + 1), recovered.used_len);
+    try std.testing.expectEqualStrings("abcd", data[0..4]);
+}
+
+test "lazy chunk mapped missing cas object completes virtio-blk request with ioerr" {
+    try expectLazyFaultInFailureViaVirtio(.missing);
+}
+
+test "lazy chunk mapped corrupt cas object completes virtio-blk request with ioerr" {
+    try expectLazyFaultInFailureViaVirtio(.corrupt_same_size);
 }
 
 test "flush request reports backend failure" {

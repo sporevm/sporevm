@@ -579,33 +579,59 @@ Validation: `mise exec -- zig test src/runtime_disk.zig` covers lazy rootfs
 open without publishing a flat cache, wrong-sized flat-cache fallback, CAS
 promotion after the first read, read-time missing-object failure, induced
 eviction of an already promoted chunk, corrupt unread-object failure without
-torn read data, and chunk-index disk restore over the lazy backend. The
-virtio-blk backend maps `ChunkMappedDisk.readAt` failures to guest I/O error
-status, so these CAS misses and corruptions fail the guest request cleanly.
+torn read data, and chunk-index disk restore over the lazy backend. The same
+test graph also drives virtio-blk descriptor chains over a lazy chunk-mapped
+disk for missing-object and same-size corrupt-object reads: both complete the
+request with `status_ioerr`, advance the used ring, leave the failed read
+buffer unchanged, and then serve a promoted healthy chunk on the same queue.
 
 Repeatable time-to-first-exec measurement lives in
-`scripts/benchmark/suite.py` as the opt-in `lazy_rootfs_tti` benchmark. Command
-used for the local U7 check:
+`scripts/benchmark/suite.py` as the opt-in `lazy_rootfs_tti` benchmark. The
+benchmark reports three rows per iteration:
+
+- `lazy-cold`: evict flat materializations and boot through lazy CAS fault-in.
+- `eager-cold`: restore, evict, then set the internal
+  `SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCHMARK=1` escape hatch so
+  `spore run --image` eagerly materializes the flat artifact from warm CAS
+  before boot.
+- `flat-hot`: reuse the hot flat materialization as the overhead baseline.
+
+Command used for the local U7 check after `mise run build`:
 
 ```sh
-python3 scripts/benchmark/suite.py --profile smoke --benchmarks lazy_rootfs_tti --iterations 1 --modes sequential --output-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs --timeout-s 300
+python3 scripts/benchmark/suite.py --profile smoke --benchmarks lazy_rootfs_tti --iterations 1 --modes sequential --output-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs-followup --timeout-s 300 --no-build
 ```
 
 On this macOS/HVF host with `docker.io/library/node:22-alpine` resolved to
 `docker.io/library/node@sha256:d51cff3fa44ab8a368ae8708ae974480165be1b699b19527b7c0d2523433b271`,
 the run at
-`zig-cache/sporevm-benchmarks/u7-lazy-rootfs/20260708T112850Z-80e156b3/`
-evicted one 512 MiB flat materialization and measured:
+`zig-cache/sporevm-benchmarks/u7-lazy-rootfs-followup/20260708T124036Z-c9b041e2/`
+used the CI-runnable 512 MiB flat image and measured:
 
-- lazy warm-CAS/cold-flat `spore run --image`: `rootfs_base_mode=lazy`,
-  `tti_ms=393`, `first_output_ms=271`.
-- restored flat-materialization baseline: `rootfs_base_mode=flat`,
-  `tti_ms=124`, `first_output_ms=36`.
+- `lazy-cold`: evicted one 512 MiB flat materialization,
+  `rootfs_base_mode=lazy`, `tti_ms=454`, `first_output_ms=283`.
+- `eager-cold`: restored and evicted one 512 MiB flat materialization,
+  `rootfs_base_mode=flat`, `tti_ms=1567`, `first_output_ms=33`.
+- `flat-hot`: reused the hot flat materialization,
+  `rootfs_base_mode=flat`, `tti_ms=182`, `first_output_ms=38`.
 
-Done when: complete for the local lazy path. Cold-flat startup is bounded by
-the boot working set, not full image assembly; the measured lazy run starts the
-guest before restoring the 512 MiB flat materialization. Background filler and
-boot-priority ordering remain deferred until fault traces show they are needed.
+The small node image validates the repeatable benchmark and CI-friendly
+assertions. The meaningful asymptotic demonstration is a large image such as
+the approximately 7.4 GiB `buildkite-sporevm` rootfs: with warm CAS and evicted
+flat materializations, `lazy-cold` should stay bounded by the boot working set
+while `eager-cold` scales with full flat materialization. Run it by hand with:
+
+```sh
+python3 scripts/benchmark/suite.py --profile smoke --benchmarks lazy_rootfs_tti --iterations 1 --modes sequential --image <large-image-ref> --output-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs-large --scratch-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs-large-scratch --timeout-s 900
+```
+
+Done when: complete for the local lazy path, virtio-blk error completion, and
+repeatable lazy/eager/flat TTI measurement. Cold-flat startup is bounded by the
+boot working set, not full image assembly; the measured lazy run starts the
+guest before restoring or rebuilding the 512 MiB flat materialization, while
+the eager-cold baseline pays full materialization before boot. Background
+filler and boot-priority ordering remain deferred until fault traces show they
+are needed.
 
 ### U8 — Cleanup and docs
 

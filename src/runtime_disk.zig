@@ -16,6 +16,7 @@ const virtio_blk = @import("virtio/blk.zig");
 
 const Io = std.Io;
 const rootfs_trace_env = "SPOREVM_ROOTFS_TRACE";
+const rootfs_eager_materialize_env = "SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCHMARK";
 
 pub const Options = struct {
     rootfs_path: ?[]const u8 = null,
@@ -76,6 +77,10 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             // base on demand.
             if (try openCachedFlatRootfs(context, allocator, rootfs, runtime.trace_fd)) |fd| {
                 runtime.rootfs_fd = fd;
+                std.log.debug("runtime disk rootfs base: flat artifact {s}", .{rootfs.artifact.digest});
+            } else if (forceEagerRootfsMaterialization(context)) {
+                try materializeFlatRootfs(context, allocator, rootfs);
+                runtime.rootfs_fd = try openTrustedRootfs(context, allocator, rootfs, runtime.trace_fd);
                 std.log.debug("runtime disk rootfs base: flat artifact {s}", .{rootfs.artifact.digest});
             } else {
                 rootfs_lazy_storage = storage;
@@ -276,6 +281,14 @@ fn openRootfsTraceFd(context: Context, allocator: std.mem.Allocator) !?std.c.fd_
     return fd;
 }
 
+fn forceEagerRootfsMaterialization(context: Context) bool {
+    const raw = context.environ_map.get(rootfs_eager_materialize_env) orelse return false;
+    if (raw.len == 0) return false;
+    if (std.mem.eql(u8, raw, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(raw, "false")) return false;
+    return true;
+}
+
 fn appendRootfsTrace(
     allocator: std.mem.Allocator,
     fd: std.c.fd_t,
@@ -467,6 +480,57 @@ test "runtime disk lazily faults rootfs cas chunks when the flat artifact is mis
     // Lazy fault-in promotes into the sparse runtime base, not the by-digest
     // materialization cache.
     try std.testing.expect(!try rootfs_cache.regularFileNoSymlink(io, digest_path));
+}
+
+test "runtime disk benchmark env eagerly materializes missing flat rootfs from cas" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-runtime-disk-eager-benchmark-env";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
+
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
+    const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
+    Io.Dir.cwd().deleteFile(io, digest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    try env.put(rootfs_eager_materialize_env, "1");
+    const context = Context{ .io = io, .environ_map = &env };
+
+    const rootfs = spore.Rootfs{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = rootfs_artifact,
+        .storage = storage,
+    };
+    var runtime = try open(context, allocator, .{
+        .rootfs = rootfs,
+    });
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.rootfs_fd != null);
+    try std.testing.expect(runtime.chunk_mapped != null);
+    try std.testing.expect(runtime.chunk_mapped.?.cas_root == null);
+    try std.testing.expect(try rootfs_cache.regularFileNoSymlink(io, digest_path));
+    var readback: [4]u8 = undefined;
+    try runtime.chunk_mapped.?.readAt(&readback, spore.disk_chunk_size);
+    try std.testing.expectEqualStrings("efgh", &readback);
 }
 
 test "runtime disk ignores wrong-sized flat cache entries and lazily faults cas chunks" {

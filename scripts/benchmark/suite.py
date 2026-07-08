@@ -25,6 +25,7 @@ SUITE_VERSION = "1.2"
 DEFAULT_IMAGE = "docker.io/library/node:22-alpine"
 DEFAULT_COMMAND = "/usr/local/bin/node -v"
 DEFAULT_PLATFORM = "linux/arm64"
+EAGER_ROOTFS_ENV = "SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCHMARK"
 RESTORE_METRICS_RE = re.compile(r"(?:kvm|hvf) restore metrics: (?P<fields>.+)")
 EXEC_PROBE_TIMING_RE = re.compile(r"run exec probe timing: (?P<fields>.+)")
 BACKEND_TIMING_RE = re.compile(r"run backend timing: (?P<fields>.+)")
@@ -396,6 +397,7 @@ class BenchmarkRunner:
         self.rows: list[dict[str, object]] = []
         self.batch_rows: list[dict[str, object]] = []
         self.env = os.environ.copy()
+        self.env.pop(EAGER_ROOTFS_ENV, None)
         self.env["SPOREVM_ROOTFS_CACHE_DIR"] = str(self.rootfs_cache_dir)
         self.env["SPOREVM_BUNDLE_CACHE_DIR"] = str(self.bundle_cache_dir)
         self.effective_image = args.image
@@ -640,10 +642,21 @@ class BenchmarkRunner:
             count += 1
         return count
 
-    def run_image_tti_once(self, benchmark: str, mode: str, iteration: int, batch_start: int) -> dict[str, object]:
+    def run_image_tti_once(
+        self,
+        benchmark: str,
+        mode: str,
+        iteration: int,
+        batch_start: int,
+        extra_env: dict[str, str] | None = None,
+    ) -> dict[str, object]:
         prefix = self.log_dir / benchmark / mode / f"{iteration:06d}"
         stdout = prefix.with_suffix(".stdout")
         stderr = prefix.with_suffix(".stderr")
+        env = self.env
+        if extra_env:
+            env = self.env.copy()
+            env.update(extra_env)
         argv = [
             str(self.spore_bin),
             "--debug",
@@ -658,7 +671,7 @@ class BenchmarkRunner:
             *self.command,
         ]
         started_at_ms = monotonic_ms() - batch_start
-        status, tti_ms, error = run_command(argv, env=self.env, stdout_path=stdout, stderr_path=stderr, timeout_s=self.args.timeout_s)
+        status, tti_ms, error = run_command(argv, env=env, stdout_path=stdout, stderr_path=stderr, timeout_s=self.args.timeout_s)
         ended_at_ms = monotonic_ms() - batch_start
         return {
             "benchmark": benchmark,
@@ -683,30 +696,52 @@ class BenchmarkRunner:
             die("lazy_rootfs_tti requires a prewarmed chunked image rootfs cache; run with prewarm enabled")
 
         batch_start = monotonic_ms()
-        rows_by_mode: dict[str, list[dict[str, object]]] = {"lazy": [], "flat": []}
+        rows_by_mode: dict[str, list[dict[str, object]]] = {"lazy-cold": [], "eager-cold": [], "flat-hot": []}
         for iteration in range(self.args.iterations):
             evicted_count, evicted_bytes = self.evict_flat_materializations(records)
-            lazy_row = self.run_image_tti_once("lazy_rootfs_tti", "lazy", iteration, batch_start)
+            lazy_row = self.run_image_tti_once("lazy_rootfs_tti", "lazy-cold", iteration, batch_start)
             lazy_row["flat_materializations_evicted"] = evicted_count
             lazy_row["flat_materialization_bytes_evicted"] = evicted_bytes
             lazy_row["success"] = lazy_row["status"] == 0 and lazy_row.get("rootfs_base_mode") == "lazy"
             self.emit(lazy_row)
-            rows_by_mode["lazy"].append(lazy_row)
+            rows_by_mode["lazy-cold"].append(lazy_row)
             print(
-                f"lazy_rootfs_tti lazy iteration={iteration} "
+                f"lazy_rootfs_tti lazy-cold iteration={iteration} "
                 f"{'ok' if lazy_row.get('success') else 'failed'} "
                 f"tti_ms={lazy_row.get('tti_ms')} first_output_ms={lazy_row.get('first_output_ms')}",
                 file=sys.stderr,
             )
 
+            restored_for_eager_count = self.restore_flat_materializations(records)
+            evicted_count, evicted_bytes = self.evict_flat_materializations(records)
+            eager_row = self.run_image_tti_once(
+                "lazy_rootfs_tti",
+                "eager-cold",
+                iteration,
+                batch_start,
+                {EAGER_ROOTFS_ENV: "1"},
+            )
+            eager_row["flat_materializations_evicted"] = evicted_count
+            eager_row["flat_materialization_bytes_evicted"] = evicted_bytes
+            eager_row["flat_materializations_restored_before_evict"] = restored_for_eager_count
+            eager_row["success"] = eager_row["status"] == 0 and eager_row.get("rootfs_base_mode") == "flat"
+            self.emit(eager_row)
+            rows_by_mode["eager-cold"].append(eager_row)
+            print(
+                f"lazy_rootfs_tti eager-cold iteration={iteration} "
+                f"{'ok' if eager_row.get('success') else 'failed'} "
+                f"tti_ms={eager_row.get('tti_ms')} first_output_ms={eager_row.get('first_output_ms')}",
+                file=sys.stderr,
+            )
+
             restored_count = self.restore_flat_materializations(records)
-            flat_row = self.run_image_tti_once("lazy_rootfs_tti", "flat", iteration, batch_start)
+            flat_row = self.run_image_tti_once("lazy_rootfs_tti", "flat-hot", iteration, batch_start)
             flat_row["flat_materializations_restored"] = restored_count
             flat_row["success"] = flat_row["status"] == 0 and flat_row.get("rootfs_base_mode") == "flat"
             self.emit(flat_row)
-            rows_by_mode["flat"].append(flat_row)
+            rows_by_mode["flat-hot"].append(flat_row)
             print(
-                f"lazy_rootfs_tti flat iteration={iteration} "
+                f"lazy_rootfs_tti flat-hot iteration={iteration} "
                 f"{'ok' if flat_row.get('success') else 'failed'} "
                 f"tti_ms={flat_row.get('tti_ms')} first_output_ms={flat_row.get('first_output_ms')}",
                 file=sys.stderr,
@@ -1318,6 +1353,16 @@ def self_test() -> None:
         records = BenchmarkRunner.image_rootfs_cache_records(cache_runner)
         assert len(records) == 1
         assert records[0]["index_digest"] == digest
+        flat_path = Path(str(records[0]["flat_path"]))
+        flat_path.parent.mkdir(parents=True)
+        flat_path.write_bytes(b"rootfs")
+        evicted_count, evicted_bytes = BenchmarkRunner.evict_flat_materializations(cache_runner, records)
+        assert evicted_count == 1
+        assert evicted_bytes == 6
+        assert not flat_path.exists()
+        restored_count = BenchmarkRunner.restore_flat_materializations(cache_runner, records)
+        assert restored_count == 1
+        assert flat_path.read_bytes() == b"rootfs"
         runner = object.__new__(BenchmarkRunner)
         runner.run_id = "self-test"
         runner.raw_path = Path(tmp) / "results.jsonl"
