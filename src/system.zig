@@ -2038,8 +2038,8 @@ fn writeGcStorageFixture(
         const storage_json = try std.json.Stringify.valueAlloc(allocator, storage, .{});
         const metadata = try std.fmt.allocPrint(
             allocator,
-            "{{\"rootfs_size\":512,\"rootfs_blake3\":\"{s}\",\"rootfs_storage\":{s}}}",
-            .{ object_digest[spore.rootfs_digest_prefix.len..], storage_json },
+            "{{\"rootfs_size\":512,\"rootfs_storage\":{s}}}",
+            .{storage_json},
         );
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ cache_root, name }), .data = metadata });
     }

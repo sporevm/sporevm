@@ -4,13 +4,11 @@
 //! mutate existing filesystems.
 
 const std = @import("std");
-const chunk = @import("../chunk.zig");
 const ext4 = @import("ext4.zig");
 const tar = @import("tar.zig");
 const xattrs_mod = @import("xattrs.zig");
 
 const Io = std.Io;
-const Blake3 = std.crypto.hash.Blake3;
 
 const block_size: u32 = ext4.rootfs_ext4_block_size;
 const inode_size: u16 = ext4.rootfs_ext4_inode_size;
@@ -94,7 +92,6 @@ pub const Options = struct {
 };
 
 pub const Result = struct {
-    blake3: [chunk.ChunkId.hex_len]u8,
     size: u64,
 };
 
@@ -1032,7 +1029,6 @@ fn writeImage(
     const emit_blocks = try buildEmitBlocks(allocator, total_blocks, blocks, data_blocks);
     defer allocator.free(emit_blocks);
 
-    var hasher = Blake3.init(.{});
     var source_block: [block_size]u8 = undefined;
     const source_buffer = try allocator.alloc(u8, source_batch_bytes);
     defer allocator.free(source_buffer);
@@ -1048,14 +1044,12 @@ fn writeImage(
         switch (emit_blocks[block_index]) {
             .metadata => |block| {
                 try file.writePositionalAll(io, block, offset);
-                hasher.update(block);
             },
             .data => |source| {
                 const written_blocks = try writeDataRun(
                     allocator,
                     io,
                     &file,
-                    &hasher,
                     &source_files,
                     emit_blocks,
                     source,
@@ -1069,17 +1063,13 @@ fn writeImage(
             },
             .zero => {
                 const zero_blocks = zeroRunLength(emit_blocks, block_index, zero_buffer.len / block_size);
-                hasher.update(zero_buffer[0 .. zero_blocks * block_size]);
                 block_index += zero_blocks;
                 continue;
             },
         }
         block_index += 1;
     }
-    var raw: [chunk.ChunkId.len]u8 = undefined;
-    hasher.final(&raw);
     return .{
-        .blake3 = std.fmt.bytesToHex(raw, .lower),
         .size = image_size,
     };
 }
@@ -1115,7 +1105,6 @@ fn writeDataRun(
     allocator: std.mem.Allocator,
     io: Io,
     output: *Io.File,
-    hasher: *Blake3,
     cache: *SourceFileCache,
     emit_blocks: []const EmitBlock,
     first: DataBlockSource,
@@ -1128,7 +1117,6 @@ fn writeDataRun(
     if (run_blocks <= 1) {
         try readDataBlock(allocator, io, cache, first, fallback_block);
         try output.writePositionalAll(io, fallback_block, output_offset);
-        hasher.update(fallback_block);
         return 1;
     }
 
@@ -1150,7 +1138,6 @@ fn writeDataRun(
     }
     if (source_len < byte_len) @memset(buffer[source_len..byte_len], 0);
     try output.writePositionalAll(io, buffer[0..byte_len], output_offset);
-    hasher.update(buffer[0..byte_len]);
     return run_blocks;
 }
 

@@ -325,7 +325,10 @@ test "runtime disk rejects corrupt rootfs before constructing file block source"
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
-    try Io.Dir.cwd().deleteFile(io, digest_path);
+    Io.Dir.cwd().deleteFile(io, digest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
 
     var env = std.process.Environ.Map.init(allocator);
@@ -361,6 +364,9 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, 4096);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
+    const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
+    _ = try rootfs_cache.installTrustedMaterializationByHardlink(io, arena, cache_root, rootfs_path, rootfs_artifact.digest, rootfs_artifact.size);
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -374,8 +380,8 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
 
     const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
-        .artifact = artifact,
-        .storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
+        .artifact = rootfs_artifact,
+        .storage = storage,
     };
     var runtime = try open(context, allocator, .{
         .rootfs = rootfs,
@@ -410,8 +416,13 @@ test "runtime disk assembles the flat artifact from chunks when it is missing" {
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, 4096);
-    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
-    try Io.Dir.cwd().deleteFile(io, digest_path);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
+    const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
+    Io.Dir.cwd().deleteFile(io, digest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -422,8 +433,8 @@ test "runtime disk assembles the flat artifact from chunks when it is missing" {
 
     const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
-        .artifact = artifact,
-        .storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
+        .artifact = rootfs_artifact,
+        .storage = storage,
     };
     var runtime = try open(context, allocator, .{
         .rootfs = rootfs,
@@ -456,8 +467,13 @@ test "runtime disk reassembles the flat artifact when the cached entry is the wr
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, 4096);
-    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
-    try Io.Dir.cwd().deleteFile(io, digest_path);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
+    const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
+    Io.Dir.cwd().deleteFile(io, digest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "truncated" });
 
     var env = std.process.Environ.Map.init(allocator);
@@ -469,8 +485,8 @@ test "runtime disk reassembles the flat artifact when the cached entry is the wr
 
     const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
-        .artifact = artifact,
-        .storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
+        .artifact = rootfs_artifact,
+        .storage = storage,
     };
     var runtime = try open(context, allocator, .{
         .rootfs = rootfs,
@@ -503,12 +519,17 @@ test "runtime disk manifest rootfs cas fails closed without index" {
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, 4096);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
+    const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const index_path = try rootfs_cas.manifestIndexPath(arena, cache_root, preload_result.index_digest);
     try Io.Dir.cwd().deleteFile(io, index_path);
     // Remove the flat artifact too: with it present, a missing chunk index is
     // survivable because the flat artifact is preferred as the base source.
-    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
-    try Io.Dir.cwd().deleteFile(io, digest_path);
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
+    Io.Dir.cwd().deleteFile(io, digest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -519,8 +540,8 @@ test "runtime disk manifest rootfs cas fails closed without index" {
 
     const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
-        .artifact = artifact,
-        .storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
+        .artifact = rootfs_artifact,
+        .storage = storage,
     };
     try std.testing.expectError(error.MissingChunk, open(context, allocator, .{
         .rootfs = rootfs,

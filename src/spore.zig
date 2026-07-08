@@ -1216,6 +1216,7 @@ fn validateRootfsStorage(storage: RootfsStorage, rootfs: Rootfs, devices: []cons
     try validateRootfsDevice(storage.device, devices);
     if (!rootfsDeviceEql(storage.device, rootfs.device)) return error.BadManifest;
     if (storage.logical_size != rootfs.artifact.size) return error.BadManifest;
+    if (!std.mem.eql(u8, storage.index_digest, rootfs.artifact.digest)) return error.BadManifest;
 }
 
 pub fn validateRootfsStorageDescriptor(storage: RootfsStorage) Error!void {
@@ -3114,7 +3115,7 @@ test "manifest disk validates rootfs base and layer chain" {
     manifest.rootfs = null;
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.rootfs = testRootfs(1);
-    manifest.disk.?.base = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    manifest.disk.?.base = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.disk.?.base = manifest.rootfs.?.artifact.digest;
     manifest.disk.?.device.mmio_slot = 0;
@@ -3143,6 +3144,7 @@ test "manifest disk binds to chunked rootfs storage identity" {
     manifest.devices = &devices;
     manifest.rootfs = testRootfs(1);
     manifest.rootfs.?.storage = testRootfsStorage(1);
+    manifest.rootfs.?.artifact.digest = manifest.rootfs.?.storage.?.index_digest;
     manifest.disk = testDisk(1);
     manifest.disk.?.base = manifest.rootfs.?.storage.?.base_identity;
 
@@ -3155,17 +3157,19 @@ test "manifest disk binds to chunked rootfs storage identity" {
     try std.testing.expectEqualStrings(rootfs.storage.?.base_identity, disk.base);
     try std.testing.expectEqual(@as(u64, 4096), effectiveRootfsLogicalSize(rootfs));
 
-    manifest.disk.?.base = manifest.rootfs.?.artifact.digest;
+    manifest.rootfs.?.artifact.digest = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
-    manifest.disk.?.base = manifest.rootfs.?.storage.?.base_identity;
+    manifest.rootfs.?.artifact.digest = manifest.rootfs.?.storage.?.index_digest;
 
     manifest.rootfs.?.storage.?.base_identity = "blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.rootfs.?.storage = testRootfsStorage(1);
+    manifest.rootfs.?.artifact.digest = manifest.rootfs.?.storage.?.index_digest;
 
     manifest.rootfs.?.storage.?.device.mmio_slot = 0;
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.rootfs.?.storage = testRootfsStorage(1);
+    manifest.rootfs.?.artifact.digest = manifest.rootfs.?.storage.?.index_digest;
 
     manifest.rootfs.?.storage.?.object_namespace = "../rootfs";
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));

@@ -161,8 +161,9 @@ defer libspore.deinitRootfsResolveResult(allocator, resolved);
 
 `rootfsImportOci` imports OCI layouts under local refs, and `rootfsImportTar`
 imports uncompressed rootfs tar files under the same local ref cache. Import
-options default to `.rootfs_storage = .chunked`; set `.rootfs_storage = .flat`
-for local-only imports that should skip immediate chunked rootfs CAS preload.
+options default to `.rootfs_storage = .chunked`; flat-only imports are no
+longer accepted because image-created spores use the rootfs storage index as
+their portable identity.
 `rootfsCasPreload` preloads a rootfs digest into chunked CAS storage and can
 attach the resulting descriptor to an existing spore.
 

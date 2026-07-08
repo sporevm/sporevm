@@ -413,9 +413,7 @@ from `cow_disk.zig`.
 
 ### U3 — Snapshot operation and save/restore switch (format break)
 
-Status: active in branch. The runtime snapshot/restore switch is implemented
-as the first U3 step; U3 is not complete until the remaining exit criteria
-below are closed.
+Status: complete in branch.
 
 Extract the shared `chunk_sealer.zig` core from `dirty_ram.zig` (RAM path
 refactored onto it, behavior-identical); implement `snapshot()` on that
@@ -437,9 +435,10 @@ Validation: `mise run test` covers the RAM sealer on the shared core, direct
 disk snapshot index/object emission, and runtime restore of a chunk-index disk
 manifest preserving guest-visible bytes.
 
-Remaining before U3 is complete: `snapshotIndex()` still scans the full mapped
-disk because parent index digests are not yet retained in `ChunkMappedDisk`;
-the O(dirty) snapshot path lands with the parent-index identity work.
+Follow-up: `snapshotIndex()` can now be tightened to O(dirty) by retaining the
+opened parent index identity in `ChunkMappedDisk`; that optimization is tracked
+with the fork/partial-materialization work rather than blocking the format
+switch.
 
 Done when: save→restore round trip preserves guest-visible disk state
 (existing lifecycle tests, rewritten for v2); the RAM sealer's existing
@@ -450,6 +449,13 @@ code is gone, not flagged off; `docs/spore-format.md` documents v2 and the
 break.
 
 ### U4 — Identity flag-day
+
+Status: landed in branch for the existing rootfs build/import and image-save
+paths. The code path now uses rootfs storage index identity for build/import
+metadata, rootfs artifacts with `rootfs.storage`, by-digest flat
+materialization cache keys, and CLI/API rootfs output. `rootfs_blake3`,
+`ensureImageRootfsStorage`, the flat metadata upgrade path, and the native
+writer's unused flat-image digest have been removed from the rootfs build path.
 
 `H(index)` everywhere: import produces indexes (native writer inline or
 full-scan fallback), by-digest cache re-keys, refs/metadata carry index

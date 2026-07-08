@@ -35,8 +35,9 @@ A spore is a directory:
 
 Spores saved from `spore run --image ... --save` may also require rootfs
 storage from the local rootfs cache. The manifest records an immutable ext4
-artifact digest, size, device binding, and provenance. Image-created spores also
-record `rootfs.storage` for the default chunked rootfs CAS path when available.
+artifact identity, size, device binding, and provenance. For image-created
+spores, that identity is the rootfs storage index digest and the manifest also
+records `rootfs.storage` for the default chunked rootfs CAS path.
 Rootfs bytes are not stored inside the spore directory today; `spore attach`
 opens and verifies the manifest-selected exact artifact or chunked storage
 before boot.
@@ -66,7 +67,7 @@ manifests without duplicating shared memory chunks:
 │   └── children/000042.json
 ├── chunkpack.index.json
 ├── chunkpacks/000000.pack
-├── rootfs.index.json       # optional rootfs digest -> artifact policy
+├── rootfs.index.json       # optional rootfs identity -> artifact policy
 ├── rootfs/blake3/<hex>.ext4
 ├── rootfs/blake3/indexes/<hex>.json
 └── rootfs/blake3/objects/<hex>.chunk
@@ -86,13 +87,13 @@ If `manifest.json` records an immutable rootfs artifact, `spore pack` includes
 the exact ext4 bytes at `rootfs/blake3/<hex>.ext4` from a trusted local
 digest-cache entry, then verifies the bundled copy by BLAKE3 and size.
 `spore unpack` requires that bundled artifact, verifies it against the manifest,
-then installs it into the local rootfs digest cache before writing the unpacked
+then installs it into the local rootfs materialization cache before writing the unpacked
 manifest. Indexed bundles record that artifact in `rootfs.index.json` with an
 explicit `exact-bytes` policy by default. `spore pack --children ...
 --rootfs=metadata-only` records the same digest and size with `metadata-only`
 policy and omits the ext4 file; materialized unpack and pull accept that policy
 only with `--allow-metadata-only-rootfs` and a trusted shape-compatible hit in
-the selected rootfs digest cache.
+the selected rootfs materialization cache.
 
 If `manifest.json` records `rootfs.storage.kind:
 "chunked-ext4-rootfs-v0"`, indexed bundles carry the exact
@@ -226,14 +227,15 @@ under `rootfs.cache`.
   `immutable-ext4-rootfs-v0`, `mode` is `read-only`, `device` binds the
   artifact to the rootfs virtio-mmio slot, `artifact` records a
   `blake3:<hex>` digest, size, and `ext4` format, and `source` records OCI
-  provenance. The digest and size are restore authority for the fd-backed
-  path; OCI metadata is not. Image-created manifests normally also include
+  provenance. For manifests with `rootfs.storage`, the artifact digest is the
+  storage index identity; without storage, the digest and size are restore
+  authority for the exact fd-backed path. Image-created manifests normally also include
   `rootfs.storage` with `kind: "chunked-ext4-rootfs-v0"`, the same rootfs
   device binding, logical size, chunk size, `hash_algorithm: "blake3"`,
   `index_digest`, `base_identity`, and `object_namespace: "rootfs/blake3"`.
-  For this first chunked storage kind, `base_identity` must equal
-  `index_digest`, and the digest is the BLAKE3 identity of the canonical
-  disk index bytes. The index itself records index version
+  For this first chunked storage kind, `base_identity` and
+  `rootfs.artifact.digest` must equal `index_digest`, and the digest is the
+  BLAKE3 identity of the canonical disk index bytes. The index itself records index version
   `spore-disk-index-v1`, logical size, chunk size, hash algorithm, object
   namespace, sorted non-zero chunk entries, and sorted explicit zero chunks;
   it does not repeat `base_identity` because that would make the index
@@ -348,13 +350,14 @@ that blob before mutating VM state.
 - Immutable rootfs artifacts and chunked rootfs storage are portable by digest,
   not by local path. For fd-backed manifests, resume opens the digest-addressed
   rootfs cache entry read-only, verifies the same fd by BLAKE3 and size, and
-  only then attaches it to the VM.
+  only then attaches it to the VM. For chunked manifests, the flat ext4 file is
+  a materialization cache keyed by the storage index digest.
 - Manifest-bound chunked rootfs storage descriptors are the authority for
   bundle/pull CAS installation and for rebuilding a missing flat rootfs cache
   entry. Rebuild opens the exact local `spore-disk-index-v1` named by
   `rootfs.storage.index_digest`, validates the index against that descriptor,
-  reads only BLAKE3-verified local chunk objects, then hashes the assembled
-  flat artifact against `rootfs.artifact.digest` before publication.
+  reads only BLAKE3-verified local chunk objects, then publishes the assembled
+  flat cache entry under the same index identity.
 - Local RAM backing files and `ram.backing.proof` are same-host acceleration
   hints, not portable trust roots. Product restore paths treat a valid proof as
   local provenance for opening a backing fd; invalid or absent proof uses the

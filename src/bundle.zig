@@ -35,9 +35,9 @@ pub const manifests_dir_path = "manifests";
 pub const parent_manifest_path = "manifests/parent.json";
 pub const child_manifests_dir_path = "manifests/children";
 pub const rootfs_dir_path = "rootfs";
-pub const rootfs_blake3_dir_path = "rootfs/blake3";
-pub const rootfs_blake3_indexes_dir_path = "rootfs/blake3/indexes";
-pub const rootfs_blake3_objects_dir_path = "rootfs/blake3/objects";
+pub const rootfs_materializations_dir_path = "rootfs/blake3";
+pub const rootfs_cas_indexes_dir_path = "rootfs/blake3/indexes";
+pub const rootfs_cas_objects_dir_path = "rootfs/blake3/objects";
 pub const rootfs_index_path = "rootfs.index.json";
 pub const rootfs_policy_exact_bytes = "exact-bytes";
 pub const rootfs_policy_metadata_only = "metadata-only";
@@ -697,9 +697,9 @@ fn packIndexed(allocator: std.mem.Allocator, options: PackOptions) Error!PackRes
     try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, child_manifests_dir_path }));
     try ensureNewDir(try pathZ(allocator, "{s}/chunkpacks", .{options.out_dir}));
     try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_dir_path }));
-    try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_blake3_dir_path }));
-    try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_blake3_indexes_dir_path }));
-    try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_blake3_objects_dir_path }));
+    try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_materializations_dir_path }));
+    try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_cas_indexes_dir_path }));
+    try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_cas_objects_dir_path }));
 
     const bundle_pack_path = try pathZ(allocator, "{s}/{s}", .{ options.out_dir, pack_path });
     const pack_fd = std.c.open(bundle_pack_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
@@ -1285,7 +1285,7 @@ fn validateRootfsArtifactEntry(allocator: std.mem.Allocator, entry: RootfsArtifa
     if (std.mem.eql(u8, entry.policy, rootfs_policy_exact_bytes)) {
         const hex = entry.digest[spore.rootfs_digest_prefix.len..];
         var path_buf: [128]u8 = undefined;
-        const expected_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.ext4", .{ rootfs_blake3_dir_path, hex }) catch return error.BadManifest;
+        const expected_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.ext4", .{ rootfs_materializations_dir_path, hex }) catch return error.BadManifest;
         if (!std.mem.eql(u8, entry.path orelse return error.BadManifest, expected_path)) return error.BadManifest;
     } else if (std.mem.eql(u8, entry.policy, rootfs_policy_metadata_only)) {
         if (entry.path != null) return error.BadManifest;
@@ -1549,7 +1549,7 @@ fn packRootfsArtifact(allocator: std.mem.Allocator, options: PackOptions, rootfs
     const rootfs = rootfs_opt orelse return 0;
     const cache_root = options.rootfs_cache_dir orelse return error.IoFailed;
     try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_dir_path }));
-    try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_blake3_dir_path }));
+    try ensureNewDir(try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rootfs_materializations_dir_path }));
     const source_path = rootfs_cache.digestPath(allocator, cache_root, rootfs.artifact.digest) catch |err| return rootfsError(err);
     const rel_path = try rootfsArtifactRelPath(allocator, rootfs.artifact);
     const dest_path = try pathZ(allocator, "{s}/{s}", .{ options.out_dir, rel_path });
@@ -1873,7 +1873,7 @@ fn rootfsArtifactRelPath(allocator: std.mem.Allocator, artifact: spore.RootfsArt
     try spore.validateRootfsDigest(artifact.digest);
     if (!std.mem.eql(u8, artifact.format, spore.rootfs_artifact_format_ext4)) return error.BadManifest;
     const hex = artifact.digest[spore.rootfs_digest_prefix.len..];
-    return std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ rootfs_blake3_dir_path, hex }) catch return error.OutOfMemory;
+    return std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ rootfs_materializations_dir_path, hex }) catch return error.OutOfMemory;
 }
 
 fn rootfsStorageEntryDescriptor(entry: RootfsStorageEntry) spore.RootfsStorage {
@@ -1902,12 +1902,12 @@ fn validateRootfsStorageForRootfs(storage: spore.RootfsStorage, rootfs: spore.Ro
 
 fn rootfsStorageIndexRelPath(allocator: std.mem.Allocator, index_digest: []const u8) Error![]const u8 {
     const hex = try spore.diskDigestHex(index_digest);
-    return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ rootfs_blake3_indexes_dir_path, hex }) catch return error.OutOfMemory;
+    return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ rootfs_cas_indexes_dir_path, hex }) catch return error.OutOfMemory;
 }
 
 fn rootfsStorageObjectRelPath(allocator: std.mem.Allocator, object_digest: []const u8) Error![]const u8 {
     const hex = try spore.diskDigestHex(object_digest);
-    return std.fmt.allocPrint(allocator, "{s}/{s}.chunk", .{ rootfs_blake3_objects_dir_path, hex }) catch return error.OutOfMemory;
+    return std.fmt.allocPrint(allocator, "{s}/{s}.chunk", .{ rootfs_cas_objects_dir_path, hex }) catch return error.OutOfMemory;
 }
 
 fn loadDiskIndexForEntry(
@@ -5182,7 +5182,22 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
     const preload_result = try rootfs_cas.preload(io, arena, pack_cache_root, artifact.digest, 4096);
     var manifest = testRootfsManifest(memory, ram.len, 62, artifact);
-    manifest.rootfs.?.storage = rootfs_cas.storageDescriptor(manifest.rootfs.?.device, preload_result);
+    const manifest_storage = rootfs_cas.storageDescriptor(manifest.rootfs.?.device, preload_result);
+    _ = try rootfs_cache.installTrustedMaterializationByHardlink(
+        io,
+        arena,
+        pack_cache_root,
+        rootfs_source_path,
+        manifest_storage.index_digest,
+        manifest_storage.logical_size,
+    );
+    manifest.rootfs.?.artifact.digest = manifest_storage.index_digest;
+    manifest.rootfs.?.storage = manifest_storage;
+    if (manifest.disk) |disk_value| {
+        var disk = disk_value;
+        disk.base = manifest_storage.index_digest;
+        manifest.disk = disk;
+    }
     try spore.saveManifest(arena, parent_dir, manifest);
     try std.testing.expectError(error.UnsupportedMetadataOnlyRootfsStorage, pack(arena, .{
         .io = io,
@@ -5261,7 +5276,7 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
 
     // Chunked pulls eagerly assemble the flat digest-addressed artifact from
     // the installed verified chunks; it is the only runtime base source.
-    const exact_cache_path = try rootfs_cache.digestPath(arena, pull_rootfs_cache, artifact.digest);
+    const exact_cache_path = try rootfs_cache.digestPath(arena, pull_rootfs_cache, preload_result.index_digest);
     try std.testing.expect(try pathExistsNoSymlink(io, exact_cache_path));
     const restored_manifest = try spore.loadManifest(arena, out_dir);
     defer restored_manifest.deinit();

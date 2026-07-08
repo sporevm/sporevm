@@ -590,7 +590,6 @@ pub fn rootfsBuild(
     defer arena_state.deinit();
     const result = try rootfs_mod.build(init, arena_state.allocator(), options);
     return .{
-        .rootfs_blake3 = result.rootfs_blake3,
         .rootfs_storage = try ownRootfsStorageDigestFields(allocator, result.rootfs_storage),
     };
 }
@@ -704,13 +703,15 @@ fn ownRootfsImportOciResult(allocator: std.mem.Allocator, result: RootfsImportOc
     const resolved_image_ref = try allocator.dupe(u8, result.resolved_image_ref);
     errdefer allocator.free(resolved_image_ref);
     const image_manifest_digest = try allocator.dupe(u8, result.image_manifest_digest);
+    errdefer allocator.free(image_manifest_digest);
+    const rootfs_storage = try ownRootfsStorageDigestFields(allocator, result.rootfs_storage);
     return .{
         .rootfs_path = rootfs_path,
         .metadata_path = metadata_path,
         .local_ref_path = local_ref_path,
         .resolved_image_ref = resolved_image_ref,
         .image_manifest_digest = image_manifest_digest,
-        .rootfs_blake3 = result.rootfs_blake3,
+        .rootfs_storage = rootfs_storage,
     };
 }
 

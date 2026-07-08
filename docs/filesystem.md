@@ -48,9 +48,11 @@ the immutable rootfs artifact. Spore rejects `--inject` with `--save` and
 The manifest, not a path, tag, cache entry, or bundle index, is the restore
 authority.
 
-- `rootfs.artifact` records the exact ext4 artifact digest, size, format, device
-  binding, and OCI provenance. This remains the compatibility path for spores
-  without `rootfs.storage`.
+- `rootfs.artifact` records the ext4 materialization identity, size, format,
+  device binding, and OCI provenance. For spores with `rootfs.storage`, the
+  artifact digest must equal `rootfs.storage.index_digest`; the flat ext4 file
+  is only a cache keyed by that index identity. Spores without
+  `rootfs.storage` keep the older exact fd-backed digest path.
 - `rootfs.storage.kind: "chunked-ext4-rootfs-v0"` selects the chunked rootfs
   base. The descriptor binds device, logical size, chunk size, hash algorithm,
   object namespace, `index_digest`, and `base_identity`. For this storage kind,
@@ -74,23 +76,23 @@ virtio-blk
 ```
 
 The flat materialization is the hot runtime base source. For immutable rootfs
-artifacts, the open follows the verify-at-install, trust-at-open cache contract
-(see SECURITY.md): entries were BLAKE3-verified when installed and published
-read-only, so the open checks only symlink-safety, regular-file shape, and
-exact size instead of re-hashing the artifact. Writable disk indexes are
+materializations, the open follows the verify-at-install, trust-at-open cache
+contract (see SECURITY.md): exact fd-backed entries were BLAKE3-verified when
+installed, while chunked entries were derived from a digest-verified index and
+BLAKE3-verified chunk objects. Opens check symlink-safety, regular-file shape,
+and exact size instead of re-hashing the flat file. Writable disk indexes are
 materialized into a temporary flat fd by verifying the index and each referenced
 chunk object first. Serving guest reads with plain preads on one fd is what
 keeps resume-to-first-command fast.
 
 Chunked rootfs storage (`rootfs.storage`) is a distribution and dedupe format,
 not a runtime read path. `spore pull` and `spore unpack` assemble the flat
-artifact from the verified chunk objects at materialization time, and resume
+materialization from the verified chunk objects at materialization time, and resume
 performs the same assembly once when the flat artifact is missing locally
 (pruned or corrupt cache entries self-heal from chunks). Assembly verifies
-each chunk against the digest-verified index, hashes the assembled bytes, and
-requires them to equal `rootfs.artifact.digest` before atomically publishing
-the entry; an inconsistent artifact/index pairing fails closed instead of
-serving different bytes depending on cache state.
+each chunk against the digest-verified index before atomically publishing the
+entry under the index identity; an inconsistent artifact/index pairing fails
+closed before publication.
 
 Missing or corrupt rootfs indexes, chunk objects, exact artifacts, disk indexes,
 or disk chunk objects fail before guest code can observe the bytes.

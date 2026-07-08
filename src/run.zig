@@ -1905,23 +1905,12 @@ fn resolvedImageRootfsInput(
         .guest_working_dir = run_config.working_dir,
     };
     const rootfs_device = spore.RootfsDevice{ .mmio_slot = 1 };
-    const artifact = artifact: {
-        if (try rootfs_mod.cachedImageRootfsArtifact(init.io, allocator, metadata_path, rootfs_path)) |cached_artifact| {
-            errdefer allocator.free(cached_artifact.digest);
-            const trusted_rootfs = spore.Rootfs{ .device = rootfs_device, .artifact = cached_artifact };
-            const fd = rootfs_cache.openTrustedFromCache(init.io, allocator, cache_root, trusted_rootfs) catch |err| switch (err) {
-                error.RootFSDigestCacheMiss => {
-                    allocator.free(cached_artifact.digest);
-                    break :artifact try rootfs_cache.cacheByDigestPath(init.io, allocator, cache_root, rootfs_path);
-                },
-                else => |e| return e,
-            };
-            _ = std.c.close(fd);
-            break :artifact cached_artifact;
-        }
-        break :artifact try rootfs_cache.cacheByDigestPath(init.io, allocator, cache_root, rootfs_path);
-    };
-    const storage = try rootfs_mod.ensureImageRootfsStorage(init, allocator, cache_root, metadata_path, artifact, rootfs_device);
+    const artifact = (try rootfs_mod.cachedImageRootfsArtifact(init.io, allocator, metadata_path, rootfs_path)) orelse return error.BadManifest;
+    errdefer allocator.free(artifact.digest);
+    var storage = (try rootfs_mod.readCachedRootfsStorage(init.io, allocator, metadata_path, artifact)) orelse return error.BadManifest;
+    errdefer rootfs_mod.deinitRootfsStorageDescriptor(allocator, storage);
+    storage.device = rootfs_device;
+    if (!try rootfs_cas.storageComplete(init.io, allocator, cache_root, storage)) return error.RootFSDigestCacheMiss;
     const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch });
     const manifest_requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved.ref else requested_ref;
     return .{
@@ -3553,6 +3542,26 @@ test "image rootfs metadata supplies run env and working directory" {
     try std.testing.expectEqualStrings("/app", input.guest_working_dir.?);
 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+    const preload = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
+    _ = try rootfs_cache.installTrustedMaterializationByHardlink(io, arena, cache_root, rootfs_path, storage.index_digest, storage.logical_size);
+    const storage_json = try std.json.Stringify.valueAlloc(arena, storage, .{});
+    const rootfs_metadata = try std.fmt.allocPrint(arena,
+        \\{{
+        \\  "rootfs_path": "{s}",
+        \\  "rootfs_size": {d},
+        \\  "rootfs_storage": {s},
+        \\  "config": {{
+        \\    "architecture": "arm64",
+        \\    "os": "linux",
+        \\    "config": {{
+        \\      "Env": ["GEM_HOME=/usr/local/bundle", "BUNDLE_APP_CONFIG=/usr/local/bundle"],
+        \\      "WorkingDir": "/app"
+        \\    }}
+        \\  }}
+        \\}}
+    , .{ rootfs_path, storage.logical_size, storage_json });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = rootfs_metadata });
     const captured = try resolvedImageRootfsInput(init, arena, cache_root, "local/buildkite-spore:ci", resolved, rootfs_path, true);
     try std.testing.expect(captured.rootfs != null);
     try std.testing.expect(captured.rootfs.?.storage != null);
@@ -3564,8 +3573,8 @@ test "image rootfs metadata supplies run env and working directory" {
 
     const digest_path = try rootfs_cache.digestPath(arena, cache_root, captured.rootfs.?.artifact.digest);
     try Io.Dir.cwd().deleteFile(io, digest_path);
-    const cached_storage = try rootfs_mod.ensureImageRootfsStorage(init, arena, cache_root, metadata_path, captured.rootfs.?.artifact, captured.rootfs.?.device);
-    try std.testing.expectEqualStrings(captured.rootfs.?.storage.?.index_digest, cached_storage.index_digest);
+    try std.testing.expect(!try rootfs_cache.regularFileNoSymlink(io, digest_path));
+    try std.testing.expect(try rootfs_cas.storageComplete(io, arena, cache_root, captured.rootfs.?.storage.?));
     try std.testing.expect(rootfsWritable(.{
         .kernel_path = "",
         .rootfs_path = captured.path,
@@ -4538,7 +4547,7 @@ test "direct image cache rootfs key requires exact cache child shape" {
     try std.testing.expect(directImageCacheRootfsKey(cache_root, "tmp/cache/" ++ cache_key ++ ".ext4") == null);
 }
 
-test "explicit rootfs input trusts direct image cache rootfs metadata" {
+test "explicit rootfs input falls back when direct image cache metadata has no storage" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -4573,7 +4582,6 @@ test "explicit rootfs input trusts direct image cache rootfs metadata" {
     const metadata = .{
         .rootfs_path = rootfs_path,
         .rootfs_size = artifact.size,
-        .rootfs_blake3 = artifact.digest[spore.rootfs_digest_prefix.len..],
     };
     const metadata_json = try std.json.Stringify.valueAlloc(arena, metadata, .{});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata_json });
@@ -4597,11 +4605,9 @@ test "explicit rootfs input trusts direct image cache rootfs metadata" {
     const fallback_rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ absolute_cache_root, fallback_cache_key });
     const fallback_metadata_path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ absolute_cache_root, fallback_cache_key });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = fallback_rootfs_path, .data = "fallback rootfs bytes" });
-    const bogus_blake3 = "0000000000000000000000000000000000000000000000000000000000000000";
     const fallback_metadata = .{
         .rootfs_path = fallback_rootfs_path,
         .rootfs_size = @as(u64, "fallback rootfs bytes".len),
-        .rootfs_blake3 = bogus_blake3,
     };
     const fallback_metadata_json = try std.json.Stringify.valueAlloc(arena, fallback_metadata, .{});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = fallback_metadata_path, .data = fallback_metadata_json });
@@ -4620,7 +4626,6 @@ test "explicit rootfs input trusts direct image cache rootfs metadata" {
     try std.testing.expect(fallback_resolved.rootfs != null);
     try std.testing.expectEqualStrings(fallback_expected.digest, fallback_resolved.rootfs.?.artifact.digest);
     try std.testing.expectEqual(fallback_expected.size, fallback_resolved.rootfs.?.artifact.size);
-    try std.testing.expect(!std.mem.eql(u8, "blake3:" ++ bogus_blake3, fallback_resolved.rootfs.?.artifact.digest));
 }
 
 test "rootfs digest cache rejects unsafe existing paths" {

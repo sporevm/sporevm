@@ -1,14 +1,16 @@
 //! Digest-addressed immutable rootfs cache helpers.
 //!
-//! Rootfs artifacts are content addressed by the BLAKE3 digest recorded in the
-//! spore manifest. Callers may copy bytes from different sources, but the cache
-//! path is valid only after the bytes have been verified against that manifest
-//! digest and size.
+//! Rootfs materializations are keyed by the identity recorded in the spore
+//! manifest. For exact fd-backed rootfs manifests, that identity is the BLAKE3
+//! digest of the flat ext4 bytes. For manifests with `rootfs.storage`, it is
+//! the BLAKE3 digest of the verified chunk index, and the flat ext4 file is a
+//! rebuildable materialization under that identity.
 //!
-//! The cache contract is verify-at-install, trust-at-open: every write into
-//! the cache verifies the bytes against the expected digest before publishing
-//! them (`installExpectedPath*`, `cacheByDigestPath*`, `copyVerifiedPath`),
-//! entries are installed read-only, and product open paths
+//! The cache contract is verify-at-install, trust-at-open: exact writes verify
+//! flat bytes against the expected digest before publishing them
+//! (`installExpectedPath*`, `cacheByDigestPath*`, `copyVerifiedPath`), chunked
+//! writes verify the index and chunks before publishing a materialization under
+//! the index identity, entries are installed read-only, and product open paths
 //! (`openTrustedFromCache`) do not re-hash them. The cache lives in the same
 //! host trust domain as the spore binary and kernel cache; see SECURITY.md.
 //! `openVerifiedFromCache` remains for boundaries that must prove cache
@@ -213,6 +215,37 @@ pub fn installExpectedPathAfterSourceVerifiedByHardlink(
 
     if (!try hardlinkTrustedPath(io, allocator, source_path, digest_path, artifact.size)) return null;
     return .{ .cache_hit = false, .bytes_fetched = artifact.size };
+}
+
+/// Installs a cache-internal flat materialization under a non-flat identity.
+///
+/// The caller must already have verified `source_path` by deriving and
+/// publishing the chunk index named by `identity_digest`. This helper only
+/// publishes a read-only hardlink for the flat cache, guarded by shape and size
+/// checks so caller-owned mutable paths cannot alias the trusted cache.
+pub fn installTrustedMaterializationByHardlink(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    source_path: []const u8,
+    identity_digest: []const u8,
+    expected_size: u64,
+) !?InstallResult {
+    const digest_path = try digestPath(allocator, cache_root, identity_digest);
+    defer allocator.free(digest_path);
+    const digest_dir = std.fs.path.dirname(digest_path) orelse return error.RootFSOpenFailed;
+    try ensureDirPath(io, digest_dir);
+
+    if (try pathExistsNoSymlink(io, digest_path)) {
+        if (!try regularFileNoSymlink(io, digest_path)) return error.RootFSDigestMismatch;
+        try chmodReadOnly(allocator, digest_path);
+        const stat = Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false }) catch return error.RootFSDigestMismatch;
+        if (stat.kind != .file or stat.size != expected_size) return error.RootFSDigestMismatch;
+        return .{ .cache_hit = true, .bytes_fetched = 0 };
+    }
+
+    if (!try hardlinkTrustedPath(io, allocator, source_path, digest_path, expected_size)) return null;
+    return .{ .cache_hit = false, .bytes_fetched = expected_size };
 }
 
 pub fn copyVerifiedPath(

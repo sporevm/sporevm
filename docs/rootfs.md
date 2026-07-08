@@ -6,8 +6,7 @@ verification contract, see [Filesystem And Root Disk Contract](filesystem.md).
 `spore rootfs build` materializes an OCI image into a deterministic ext4 rootfs
 image, installs that image into the local digest cache, and writes chunked
 rootfs CAS objects plus a `rootfs_storage` descriptor into the metadata
-sidecar. Local image imports do the same by default, or can opt into flat
-local-only storage with `--rootfs-storage=flat`.
+sidecar. Local image imports use the same chunked rootfs storage path.
 The first OCI-capable run workflow is deliberately two-step:
 
 ```bash
@@ -74,8 +73,8 @@ record, force registry refresh, or fail without one. If the ref record or
 referenced rootfs is missing or mismatched, SporeVM falls back to the registry
 path and updates the record after the rootfs cache is valid. Saved image runs
 also require manifest-bound chunked rootfs storage. New builds write it
-immediately; older cache entries are upgraded once when
-`spore run --image ... --save` needs to record portable rootfs identity.
+immediately; older flat-only cache entries miss and are rebuilt or reimported
+so the saved manifest can record portable rootfs identity.
 
 For local Docker buildx workflows, SporeVM consumes an OCI layout instead of the
 Docker daemon or socket. Buildx writes the layout, then `spore rootfs
@@ -99,20 +98,9 @@ tar like buildx writes. It verifies all `blobs/sha256/*` files against their
 filename digest, selects the requested platform from `index.json`, rejects
 unsupported manifest/config/layer media types, applies the verified layer tars,
 and writes the deterministic ext4 output under the resolved image cache key.
-By default the import also writes chunked `rootfs.storage` for portable saved
-spores and bundles. For fast local-only iteration, skip that derived CAS pass:
-
-```bash
-spore rootfs import-oci /tmp/sporevm-app.oci \
-  --ref local/sporevm-app:dev \
-  --platform linux/arm64 \
-  --rootfs-storage=flat
-```
-
-Flat imports still install the digest-addressed ext4 artifact and record the
-local ref, so `spore run --image local/...` works normally. A later
-`spore run --image local/... --save` derives chunked `rootfs.storage` once
-before writing a portable image-created spore manifest.
+The import also writes chunked `rootfs.storage` for portable saved spores and
+bundles. Flat-only imported metadata is no longer a valid cache hit; reimport
+the image or tar to record the rootfs storage index identity.
 
 For local BuildKit workflows that do not need OCI metadata, export the final
 root filesystem as an uncompressed tar and import that directly:
@@ -130,17 +118,16 @@ spore rootfs import-tar /tmp/sporevm-app-rootfs.tar \
 
 `import-tar` records the tar SHA256 as the digest-pinned local identity and then
 uses the same deterministic ext4, digest-cache, and `rootfs.storage` path as
-`import-oci`, including `--rootfs-storage=flat` for local-only imports. It
-accepts the BuildKit rootfs tar shape and fails closed on unsupported PAX
-xattrs. It does not record OCI `Env`, `WorkingDir`,
+`import-oci`. It accepts the BuildKit rootfs tar shape and fails closed on
+unsupported PAX xattrs. It does not record OCI `Env`, `WorkingDir`,
 `Entrypoint`, `Cmd`, or `User`; pass the guest command explicitly when running
 the image.
 
 Local refs use the `local/<name>:<tag>` form and are host-local mutable pointers
 only. The imported rootfs metadata records a digest-pinned local resolved
 identity, `local/<name>@sha256:<manifest-or-tar>`. Saved image-created spores record
-the ext4 BLAKE3 artifact digest and size plus manifest-attached
-`rootfs.storage` when available. `spore run --image local/...` resolves from the
+the rootfs storage index identity and size plus manifest-attached
+`rootfs.storage`. `spore run --image local/...` resolves from the
 local ref cache and does not fall back to a network registry.
 
 Set `SPOREVM_ROOTFS_CACHE_DIR` to choose the cache directory; otherwise SporeVM
@@ -205,24 +192,27 @@ is the preferred command when the goal is to clean chunk garbage without
 discarding reachable chunked storage.
 
 When `spore run --image ... --save SPORE` saves a VM, the spore manifest
-records an immutable rootfs artifact: the ext4 content BLAKE3 digest, size,
+records an immutable rootfs artifact: the ext4 materialization identity, size,
 virtio-blk binding, resolved OCI image identity, platform, and builder version.
-For image-created spores, the manifest also records `rootfs.storage` pointing at
-the chunked rootfs index and CAS object namespace. Any rootfs writes made during
+For image-created spores, that identity is the `rootfs.storage.index_digest`;
+the flat ext4 file is a rebuildable cache. The manifest also records
+`rootfs.storage` pointing at the chunked rootfs index and CAS object namespace.
+Any rootfs writes made during
 the run are represented as a `chunk-index-disk-v0` disk: `disk.base` names a
 `spore-disk-index-v1` under `cas/rootfs/blake3/indexes/`, and each nonzero
 writable chunk is stored under `cas/rootfs/blake3/objects/`. Product
 `spore attach` and `spore run --from` serve immutable rootfs bases from the
-flat digest-addressed ext4 artifact, opened under the verify-at-install,
+flat materialization cache, opened under the verify-at-install,
 trust-at-open cache contract (see SECURITY.md) without re-hashing it. Saved
 writable disks are materialized from their verified disk index and chunk
 objects before virtio-blk attach; old `disk-layer-v0` chains are no longer
 opened by the runtime restore path. `spore pull` and `spore unpack` assemble
-the immutable artifact from verified chunk objects at materialization time; if
+the immutable materialization from verified chunk objects at materialization time; if
 the flat entry is missing or corrupt at resume (for example after pruning),
 resume assembles it once from the locally installed chunks and fails closed
-when chunks are missing or the assembled bytes mismatch the manifest artifact
-digest. Spores without `rootfs.storage` use the same trusted fd-backed open.
+when chunks are missing or the manifest artifact identity does not match the
+storage index digest. Spores without `rootfs.storage` use the same trusted
+fd-backed open.
 
 `spore pack` follows the manifest. Spores without `rootfs.storage` include exact
 rootfs bytes under `rootfs/blake3/<hex>.ext4`; spores with `rootfs.storage`
@@ -249,11 +239,11 @@ normal image-build or image-capture path.
 
 Indexed bundles also support an explicit prepared-cache mode:
 `spore pack SPORE --children CHILDREN --rootfs=metadata-only --out BUNDLE`
-records the immutable rootfs digest and size without embedding the ext4 bytes.
+records the immutable rootfs identity and size without embedding the ext4 bytes.
 `spore unpack` and `spore pull` reject those bundles by default. Passing
 `--allow-metadata-only-rootfs` makes materialization require that the selected
-`SPOREVM_ROOTFS_CACHE_DIR` already contains a trusted digest-addressed rootfs
-entry with the expected shape. It follows the local verify-at-install,
+`SPOREVM_ROOTFS_CACHE_DIR` already contains a trusted rootfs materialization
+with the expected shape. It follows the local verify-at-install,
 trust-at-open cache contract, so it still fails before writing a resumable
 spore if the cache entry is missing, symlinked, non-regular, or size-mismatched.
 
