@@ -1,1 +1,1 @@
-pub const value = "0.9.1";
+pub const value = "0.10.0";
