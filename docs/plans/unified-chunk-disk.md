@@ -402,9 +402,9 @@ Landed behavior: fresh runtime disks now use `src/chunk_mapped_disk.zig`, a
 one-level 64KiB chunk map over the flat materialized base and an optional sparse
 overlay. Manifest-backed writable rootfs runs, layerless saved disks, and direct
 read-only rootfs attachments all enter virtio-blk through the chunk-mapped
-backend. `LayeredCowDisk` remains only for pre-U3 saved disks that already have
-sealed layer chains, and old layer sealing can still consume the chunk-mapped
-active head until U3 replaces it with `snapshot()`.
+backend. During U2, `LayeredCowDisk` remained only for pre-U3 saved disks; U3
+deleted that legacy parser/backend and replaced layer sealing with
+`snapshotIndex()`.
 
 Validation: `mise run test` covers virtio-blk against the chunk-mapped backend,
 runtime CAS materialization paths through the new backend, read-only write
@@ -430,7 +430,8 @@ nonzero chunks and a `spore-disk-index-v1` under the rootfs CAS namespace and
 returns a `chunk-index-disk-v0` manifest disk. Runtime restore materializes
 `chunk-index-disk-v0` manifests from the saved index and chunk objects before
 attaching virtio-blk; old layer chains are no longer opened by
-`runtime_disk.open`.
+`runtime_disk.open`. `LayeredCowDisk`, `loadLayerChain`, disk-layer sealing,
+and the `spore.DiskLayer` parser have been deleted.
 
 Validation: `mise run test` covers the RAM sealer on the shared core, direct
 disk snapshot index/object emission, and runtime restore of a chunk-index disk
@@ -438,9 +439,7 @@ manifest preserving guest-visible bytes.
 
 Remaining before U3 is complete: `snapshotIndex()` still scans the full mapped
 disk because parent index digests are not yet retained in `ChunkMappedDisk`;
-the O(dirty) snapshot path lands with the parent-index identity work. Legacy
-`disk-layer-v0` parser helpers also remain isolated until the cleanup pass
-deletes old format support.
+the O(dirty) snapshot path lands with the parent-index identity work.
 
 Done when: save→restore round trip preserves guest-visible disk state
 (existing lifecycle tests, rewritten for v2); the RAM sealer's existing
@@ -524,8 +523,8 @@ boot/fork behavior.
 
 ## Security
 
-- Net parser reduction: `DiskLayer` and `DiskIndex` parsing collapse
-  into one hardened, fuzzed index parser. Restore-authority surface shrinks.
+- Net parser reduction: the `DiskLayer` parser is deleted, and writable disks
+  now use the hardened `DiskIndex` parser. Restore-authority surface shrinks.
 - The chunk map is host-internal state derived from validated values; the
   virtio-blk request parsing is untouched (frozen device model).
 - CAS objects remain verify-at-write, trust-at-open; index digests bind

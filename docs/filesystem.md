@@ -92,26 +92,26 @@ requires them to equal `rootfs.artifact.digest` before atomically publishing
 the entry; an inconsistent artifact/index pairing fails closed instead of
 serving different bytes depending on cache state.
 
-Missing or corrupt rootfs indexes, chunk objects, exact artifacts, disk layer
-indexes, or disk objects fail before guest code can observe the bytes.
+Missing or corrupt rootfs indexes, chunk objects, exact artifacts, disk indexes,
+or disk chunk objects fail before guest code can observe the bytes.
 
-## Writable Disk Layers
+## Writable Disk Indexes
 
-Writable rootfs state is represented as sealed block layers:
+Writable rootfs state is represented as a sealed chunk index:
 
 ```text
-disk-layer-v0
-  cluster_size: 4096
-  disk_size: <bytes>
-  extents: logical_cluster -> blake3:<cluster-bytes>
-  zero_clusters: [...]
+chunk-index-disk-v0
+  base: blake3:<spore-disk-index-v1 bytes>
+  chunk_size: 65536
+  chunks: logical_chunk -> blake3:<chunk-bytes>
+  zero_chunks: [...]
 ```
 
-Active writes stay local in a sparse writable head. Capture seals dirty clusters
-into content-addressed disk objects and records the layer index in the manifest.
-Forking preserves sealed parent layers and gives each child a fresh writable
-head. A later file-content index may reduce transfer bytes for shifted package
-layouts, but exact block replay remains authority.
+Active writes stay local in a sparse writable head. Capture writes nonzero
+chunks into `cas/rootfs/blake3/objects/`, writes the canonical
+`spore-disk-index-v1` under `cas/rootfs/blake3/indexes/`, and records that index
+digest in the manifest disk. Restore materializes the verified index and chunk
+objects into a flat temporary fd before attaching virtio-blk.
 
 ## Distribution
 
@@ -122,12 +122,14 @@ layouts, but exact block replay remains authority.
 - spores with `rootfs.storage` include the descriptor-bound index under
   `rootfs/blake3/indexes/<hex>.json` and referenced chunks under
   `rootfs/blake3/objects/<hex>.chunk`;
-- spores with writable disk layers include referenced `disk-layer-v0` indexes
-  and disk cluster objects.
+- spores with writable disk indexes include the `spore-disk-index-v1` named by
+  `disk.base` and referenced nonzero disk chunk objects under the same
+  `rootfs/blake3` index/object paths.
 
 `spore unpack` and `spore pull` fully materialize one selected child before
 resume. They verify bundle identity, selected manifests, RAM chunks, rootfs
-artifacts or CAS bytes, and disk objects before writing a resumable spore.
+artifacts or CAS bytes, and disk index/object bytes before writing a resumable
+spore.
 Direct S3 and digest-pinned HTTP peer pulls are byte sources only; they never
 become restore authority. HTTP peer hosts must resolve only to public IP
 addresses; loopback, link-local, private, multicast, and reserved targets are
