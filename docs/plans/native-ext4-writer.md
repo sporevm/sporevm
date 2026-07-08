@@ -177,7 +177,7 @@ Recorded on 2026-07-08 with
 
 The optimized native writer is byte-identical to the plain v5 native writer on
 this input: rootfs size `620756992`, BLAKE3
-`262630c531a7c86e8a11d8286fe8038dd0b00fd216b462612a040adce2b90756`. The old
+`6918ebda5875da50487ca4de82002c4594270c968b728b49d7adb223690a684b`. The old
 v4/native benchmark hash is intentionally obsolete because the v5
 symlink-boundary fix stores 60-byte symlink targets in data blocks instead of
 incorrectly inlining them.
