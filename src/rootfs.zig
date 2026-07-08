@@ -1346,7 +1346,7 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     if (fast_install) |_| {} else {
         _ = try rootfs_cache.installExpectedPathAfterSourceVerified(init.io, allocator, cache_root, opts.output, artifact, .{
             .source_must_not_be_symlink = false,
-            .allow_hardlink = true,
+            .allow_hardlink = false,
         });
     }
     opts.profile.phase("digest_cache_install", cache_start);

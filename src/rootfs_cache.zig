@@ -86,23 +86,21 @@ pub fn openVerifiedFromCache(
     return fd;
 }
 
-/// Installs by hardlink when possible. Because opens trust install-time
-/// verification, hardlink sources must be cache-internal immutable files
-/// (for example the image-keyed materialized ext4); a hardlink to a
-/// caller-owned path would let later edits alias the cache entry. Use
-/// `cacheByDigestPathCopy` for any user-supplied path.
+/// Installs a caller-owned rootfs path into the digest cache by copying it.
+///
+/// Product opens trust install-time verification, so the digest cache must not
+/// alias paths that callers can later mutate.
 pub fn cacheByDigestPath(
     io: Io,
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     rootfs_path: []const u8,
 ) !spore.RootfsArtifactRef {
-    return cacheByDigestPathWithOptions(io, allocator, cache_root, rootfs_path, .{
-        .source_must_not_be_symlink = false,
-        .allow_hardlink = true,
-    });
+    return cacheByDigestPathCopy(io, allocator, cache_root, rootfs_path);
 }
 
+/// Explicit copy-only spelling for call sites that are crossing a user-input
+/// or peer-input boundary.
 pub fn cacheByDigestPathCopy(
     io: Io,
     allocator: std.mem.Allocator,
@@ -602,6 +600,35 @@ test "copy-only digest cache does not chmod source rootfs" {
     const artifact = try cacheByDigestPathCopy(io, arena, cache_root, rootfs_path);
     const source_stat = try Io.Dir.cwd().statFile(io, rootfs_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@intFromEnum(source_stat.permissions) & 0o777)));
+
+    const digest_path = try digestPath(arena, cache_root, artifact.digest);
+    const cache_stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(cache_stat.permissions) & 0o777)));
+}
+
+test "digest cache default does not alias caller-owned source" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-cache-default-copy";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
+
+    const artifact = try cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
+
+    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "ROOTFS BYTES" });
+
+    const fd = try openVerifiedFromCache(io, arena, cache_root, rootfs);
+    _ = std.c.close(fd);
 
     const digest_path = try digestPath(arena, cache_root, artifact.digest);
     const cache_stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
