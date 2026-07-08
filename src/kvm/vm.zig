@@ -449,6 +449,13 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     }
     defer config.network.clearWake();
     defer if (config.capture_request) |request_capture| request_capture.clearWake();
+    if (lazy_pager) |*pager| {
+        if (config.vcpus == 1) {
+            pager.setFailureWake(.{ .context = &primary_vcpu.wake, .wakeFn = wakeNetworkKvmRun });
+        } else {
+            pager.setFailureWake(.{ .context = &multi_wake, .wakeFn = wakeNetworkKvmRunSet });
+        }
+    }
 
     const start_ms = try monotonicMs();
     if (restore_stats) |*stats| {
@@ -495,6 +502,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             .annotations = config.annotations,
             .dirty_tracker = if (dirty_tracker) |*tracker| tracker else null,
             .environ_map = config.environ_map,
+            .lazy_pager = if (lazy_pager) |*pager| pager else null,
             .start_ms = start_ms,
         });
     }
@@ -504,6 +512,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var pending_kvm_completion = false;
     var did_capture_request = false;
     while (true) {
+        if (lazy_pager) |*pager| try pager.checkFailed();
         if (mem_transport_index != null) {
             if (config.exec_probe) |probe| {
                 const new_pressure_events = probe.memory_pressure_count -| handled_memory_pressure_count;
@@ -849,6 +858,7 @@ const MultiKvmRunOptions = struct {
     annotations: spore.Annotations,
     dirty_tracker: ?*DirtyTracker,
     environ_map: ?*const std.process.Environ.Map,
+    lazy_pager: ?*lazy_ram.Pager,
     start_ms: u64,
 };
 
@@ -893,6 +903,12 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
     }
 
     while (true) {
+        if (options.lazy_pager) |pager| {
+            pager.checkFailed() catch |err| {
+                state.finish(.{ .err = err });
+                continue;
+            };
+        }
         if (state.result()) |result| {
             options.wake_set.wakeAll();
             switch (result) {
