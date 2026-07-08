@@ -40,6 +40,7 @@ pub const ForkCloneMethod = enum {
 
 pub const ForkOptions = struct {
     force_copy: bool = false,
+    quiesced: bool = false,
 };
 
 pub const ForkedDisk = struct {
@@ -234,7 +235,11 @@ pub const ChunkMappedDisk = struct {
         }
     }
 
+    /// Forks the mutable disk head. The caller must have paused the VM and
+    /// proven there are no in-flight virtio-blk requests before cloning the
+    /// source map and overlay fd; this primitive does not drain device queues.
     pub fn fork(self: *ChunkMappedDisk, options: ForkOptions) Error!ForkedDisk {
+        std.debug.assert(options.quiesced);
         const parent_fd = self.overlay_fd orelse return error.ReadOnly;
         const child_sources = try self.allocator.dupe(Source, self.sources);
         errdefer self.allocator.free(child_sources);
@@ -308,7 +313,12 @@ pub const ChunkMappedDisk = struct {
         self.allocator.free(old_sources);
     }
 
-    pub fn snapshotIndex(self: *ChunkMappedDisk, dir: []const u8, device: spore.RootfsDevice) Error!spore.Disk {
+    /// Publishes a durable disk index for the current mutable disk head. The
+    /// caller must have paused the VM and proven there are no in-flight
+    /// virtio-blk requests; this method scans the mutable source map/overlay and
+    /// intentionally fails fast in debug builds if called without that proof.
+    pub fn snapshotIndex(self: *ChunkMappedDisk, dir: []const u8, device: spore.RootfsDevice, quiesced: bool) Error!spore.Disk {
+        std.debug.assert(quiesced);
         var chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty;
         errdefer {
             for (chunks.items) |entry| self.allocator.free(entry.digest);
@@ -717,7 +727,7 @@ test "snapshot writes disk index and chunk objects" {
     const patch = [_]u8{0x5A} ** 16;
     try disk.writeAt(&patch, 600);
 
-    const manifest_disk = try disk.snapshotIndex(spore_dir, .{ .mmio_slot = 1 });
+    const manifest_disk = try disk.snapshotIndex(spore_dir, .{ .mmio_slot = 1 }, true);
     defer {
         allocator.free(manifest_disk.kind);
         allocator.free(manifest_disk.device.kind);
@@ -794,7 +804,7 @@ test "read only disk rejects fork" {
     var disk = try ChunkMappedDisk.initReadOnly(std.testing.allocator, base_source, base_bytes.len, 512);
     defer disk.deinit();
 
-    try std.testing.expectError(error.ReadOnly, disk.fork(.{}));
+    try std.testing.expectError(error.ReadOnly, disk.fork(.{ .quiesced = true }));
 }
 
 test "cas index attach rejects incomplete coverage" {
@@ -859,7 +869,7 @@ test "forced-copy fork isolates parent and child overlays" {
     @memcpy(parent_model[480..][0..first_parent_patch.len], &first_parent_patch);
     @memcpy(child_model[480..][0..first_parent_patch.len], &first_parent_patch);
 
-    var child = try disk.fork(.{ .force_copy = true });
+    var child = try disk.fork(.{ .force_copy = true, .quiesced = true });
     defer child.deinit();
 
     try std.testing.expectEqual(ForkCloneMethod.copy, child.clone_method);
@@ -924,7 +934,7 @@ test "sequential forks keep a flat chunk map" {
 
     var current: *ChunkMappedDisk = &disk;
     while (initialized < forks.len) {
-        forks[initialized] = try current.fork(.{ .force_copy = true });
+        forks[initialized] = try current.fork(.{ .force_copy = true, .quiesced = true });
         initialized += 1;
         const forked = &forks[initialized - 1];
         try std.testing.expectEqual(ForkCloneMethod.copy, forked.clone_method);

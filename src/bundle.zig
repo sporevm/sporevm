@@ -3803,7 +3803,7 @@ fn attachTestDiskIndex(
     defer disk.deinit();
     try disk.writeAt(payload, write_offset);
     try disk.flush();
-    manifest.disk = try disk.snapshotIndex(dir, rootfs.device);
+    manifest.disk = try disk.snapshotIndex(dir, rootfs.device, true);
 }
 
 fn openTestFile(path: [:0]const u8, mode: std.c.O) Error!std.c.fd_t {

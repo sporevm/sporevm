@@ -42,13 +42,16 @@ pub const SnapshotState = struct {
     base: spore.Disk,
     active: ActiveHead,
 
-    pub fn finish(self: SnapshotState, allocator: std.mem.Allocator, dir: []const u8) Error!?spore.Disk {
+    /// Finish a writable disk snapshot after the VMM has paused the guest and
+    /// verified the matching virtio-blk queues have no pending requests.
+    pub fn finish(self: SnapshotState, allocator: std.mem.Allocator, dir: []const u8, quiesced: bool) Error!?spore.Disk {
+        std.debug.assert(quiesced);
         if (self.active.dirtyClusterCount() == 0) {
             if (std.mem.eql(u8, self.base.kind, spore.disk_kind_chunk_index)) return try cloneDisk(allocator, self.base);
             return null;
         }
         return switch (self.active) {
-            .chunk_mapped => |disk| try disk.snapshotIndex(dir, self.base.device),
+            .chunk_mapped => |disk| try disk.snapshotIndex(dir, self.base.device, quiesced),
         };
     }
 };
@@ -136,6 +139,6 @@ test "snapshot returns null for a clean exact-rootfs sentinel disk" {
     const snapshot = try (SnapshotState{
         .base = base_disk,
         .active = .{ .chunk_mapped = &disk },
-    }).finish(allocator, ".");
+    }).finish(allocator, ".", true);
     try std.testing.expect(snapshot == null);
 }

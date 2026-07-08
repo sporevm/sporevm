@@ -726,7 +726,7 @@ test "runtime disk restores chunk-index disk manifests" {
 
     const patch = "chunk-index restore";
     try source_disk.writeAt(patch, 4096 + 32);
-    const saved_disk = try source_disk.snapshotIndex(spore_dir, rootfs.device);
+    const saved_disk = try source_disk.snapshotIndex(spore_dir, rootfs.device, true);
     defer {
         allocator.free(saved_disk.kind);
         allocator.free(saved_disk.device.kind);

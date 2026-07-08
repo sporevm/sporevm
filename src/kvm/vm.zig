@@ -1667,11 +1667,13 @@ fn takeSnapshot(
     const devices_start = try monotonicMs();
     const devices = try captureTransports(arena, transports);
     const devices_ms = (try monotonicMs()) - devices_start;
+    var disk_quiesced = false;
     if (disk_snapshot) |disk_state| {
         if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
             std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
             return error.DeviceStatePending;
         }
+        disk_quiesced = true;
     } else if (rootfs) |rootfs_artifact| {
         if (!try spore.rootfsQueuesQuiescent(rootfs_artifact, devices)) {
             std.log.err("cannot snapshot rootfs-backed VM while virtio-blk has pending requests", .{});
@@ -1692,7 +1694,7 @@ fn takeSnapshot(
             std.log.debug("local RAM backing proof unavailable: {s}", .{@errorName(err)});
         };
     }
-    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir) else null;
+    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir, disk_quiesced) else null;
     const manifest_start = try monotonicMs();
     try spore.saveManifest(arena, dir, .{
         .platform = .{
@@ -1840,11 +1842,13 @@ fn takeSnapshotV1(
     const devices_start = try monotonicMs();
     const devices = try captureTransports(arena, transports);
     const devices_ms = (try monotonicMs()) - devices_start;
+    var disk_quiesced = false;
     if (disk_snapshot) |disk_state| {
         if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
             std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
             return error.DeviceStatePending;
         }
+        disk_quiesced = true;
     } else if (rootfs) |rootfs_artifact| {
         if (!try spore.rootfsQueuesQuiescent(rootfs_artifact, devices)) {
             std.log.err("cannot snapshot rootfs-backed VM while virtio-blk has pending requests", .{});
@@ -1865,7 +1869,7 @@ fn takeSnapshotV1(
             std.log.debug("local RAM backing proof unavailable: {s}", .{@errorName(err)});
         };
     }
-    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir) else null;
+    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir, disk_quiesced) else null;
     const manifest_start = try monotonicMs();
     try spore.saveManifestV1(arena, dir, .{
         .platform = .{

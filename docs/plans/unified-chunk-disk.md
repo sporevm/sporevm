@@ -253,17 +253,20 @@ snapshot(disk) -> DiskIndex:
   identity = blake3(new index); persist index; thaw
 ```
 
-O(dirty) by construction. This operation already exists in the tree for RAM:
-`dirty_ram.zig` seals dirty 2MiB memory chunks into verified chunk refs plus
-a same-host backing file, with parallel workers, zero-scan elision,
-write-if-missing dedupe, and phase-level stats. Disk does not get its own
-sealer: U3 extracts the generic core out of `dirty_ram.zig` into a shared
-module (working name `chunk_sealer.zig`) parameterized by chunk size, dirty
-source, and object-write target, with RAM-specific pieces (backing-file
-writes, the HMAC proof) staying in `dirty_ram.zig` as a thin layer over it.
-The disk `snapshot()` and the RAM sealer are then the same loop with
-different parameters, and sealer improvements (parallelism tuning, stats)
-land once for both.
+Target shape is O(dirty) by construction. The current U3 v1 implementation is
+more conservative: `ChunkMappedDisk.snapshotIndex()` scans all logical chunks
+because it does not yet retain the opened parent index identity. This is an
+accepted v1 deviation, not the end-state performance contract. The operation
+already exists in the tree for RAM: `dirty_ram.zig` seals dirty 2MiB memory
+chunks into verified chunk refs plus a same-host backing file, with parallel
+workers, zero-scan elision, write-if-missing dedupe, and phase-level stats.
+Disk does not get its own sealer: U3 extracts the generic core out of
+`dirty_ram.zig` into a shared module (working name `chunk_sealer.zig`)
+parameterized by chunk size, dirty source, and object-write target, with
+RAM-specific pieces (backing-file writes, the HMAC proof) staying in
+`dirty_ram.zig` as a thin layer over it. The disk `snapshot()` and the RAM
+sealer are then the same loop with different parameters, and sealer
+improvements (parallelism tuning, stats) land once for both.
 
 One invariant governs all producers: **an index is only ever written once
 every chunk it references is durable in a store.** "Index exists" always
@@ -518,8 +521,9 @@ Landed behavior: writable `ChunkMappedDisk` instances can now create a
 `ForkedDisk` by copying the in-memory chunk-source map and giving the child an
 unlinked temp overlay cloned from the parent's overlay. Linux hosts attempt
 `FICLONE`; other hosts or explicit `force_copy` use a plain dirty-chunk copy
-fallback. Read-only disks reject `fork`, and durable child creation remains
-`snapshot()` + open.
+fallback. The primitive asserts its caller has quiesced the VM and has no
+in-flight virtio-blk requests before cloning mutable disk state. Read-only
+disks reject `fork`, and durable child creation remains `snapshot()` + open.
 
 Validation: `mise run test` covers read-only rejection, forced-copy fallback,
 parent/child divergence, and a 32-deep sequential fork chain that keeps the
