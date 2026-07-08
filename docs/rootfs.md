@@ -1,6 +1,6 @@
 # Rootfs Images
 
-For the durable root disk, rootfs CAS, writable layer, bundle, cache, and
+For the durable root disk, rootfs CAS, writable disk index, bundle, cache, and
 verification contract, see [Filesystem And Root Disk Contract](filesystem.md).
 
 `spore rootfs build` materializes an OCI image into a deterministic ext4 rootfs
@@ -49,8 +49,8 @@ Without `--`, the command runs as `/bin/sh -lc` in the guest. Use
 `WorkingDir` when present. It does not apply OCI Entrypoint, Cmd, or User.
 
 Add `--save` to make rootfs writes part of the spore. The guest still sees a
-normal root filesystem, but writes land in a local COW head and save seals
-the changed blocks as disk layers:
+normal root filesystem, but writes land in a local chunk-mapped head and save
+seals the changed chunks as a disk index:
 
 ```bash
 spore run --image docker.io/library/alpine:3.20 \
@@ -210,14 +210,14 @@ writable chunk is stored under `cas/rootfs/blake3/objects/`. Product
 `spore attach` and `spore run --from` serve immutable rootfs bases from the
 flat materialization cache, opened under the verify-at-install,
 trust-at-open cache contract (see SECURITY.md) without re-hashing it. Saved
-writable disks are materialized from their verified disk index and chunk
-objects before virtio-blk attach; old `disk-layer-v0` chains are no longer
-opened by the runtime restore path. `spore pull` and `spore unpack` assemble
-the immutable materialization from verified chunk objects at materialization time; if
-the flat entry is missing or corrupt at resume (for example after pruning),
-resume assembles it once from the locally installed chunks and fails closed
-when chunks are missing or the manifest artifact identity does not match the
-storage index digest. Spores without `rootfs.storage` use the same trusted
+writable disks open from their verified disk index and fault referenced chunk
+objects into the sparse runtime base on first read; old `disk-layer-v0` chains
+are no longer opened by the runtime restore path. `spore pull` and
+`spore unpack` assemble the immutable materialization from verified chunk
+objects at materialization time; if the flat entry is missing or corrupt at
+resume (for example after pruning), resume opens the local index and faults
+chunks on demand, failing closed before unverifiable bytes reach the guest.
+Spores without `rootfs.storage` use the same trusted
 fd-backed open.
 
 `spore pack` follows the manifest. Spores without `rootfs.storage` include exact

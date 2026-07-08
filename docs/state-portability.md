@@ -30,8 +30,8 @@ Manifest-format-v0 portability is deliberately narrow:
 - Disk: a captured `spore run --image` workload may reference one verified
   immutable ext4 rootfs artifact and, for image-created spores, manifest-bound
   chunked rootfs storage. It may also reference an optional sealed writable
-  rootfs-bound COW layer chain. Bundles can carry rootfs CAS bytes, exact
-  rootfs artifacts, layer indexes, and disk objects. General block devices are
+  rootfs-bound disk index. Bundles can carry rootfs CAS bytes, exact
+  rootfs artifacts, disk indexes, and disk chunk objects. General block devices are
   still outside the portable contract.
 
 Cross-ISA restore, portable HVF multi-vCPU GIC production, persisted access
@@ -92,8 +92,8 @@ block identical-host fork/fan-out.
 | Virtio-mmio transport | device ID, feature selectors, negotiated features, status, interrupt status, queue addresses/indices | yes | yes | yes | yes | portable |
 | Virtqueue descriptors and buffers | guest RAM | yes | yes | yes | yes | portable through RAM |
 | Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; fork path populates it |
-| Immutable rootfs base | optional exact artifact plus optional `chunked-ext4-rootfs-v0` storage descriptor | yes via `spore run --image` | trusted flat-artifact open; chunks assemble the artifact when missing | yes via `spore run --image` | trusted flat-artifact open; chunks assemble the artifact when missing | product resume base; cache contract is verify-at-install, trust-at-open |
-| Writable root disk layers | optional `cow-block-v0` chain over the effective immutable rootfs base | yes for local layer store | verifies layer indexes and disk objects | yes for local layer store | verifies layer indexes and disk objects | product resume; bundle materialization unit-covered |
+| Immutable rootfs base | optional exact artifact plus optional `chunked-ext4-rootfs-v0` storage descriptor | yes via `spore run --image` | trusted flat-artifact open; chunks fault in from CAS when the flat cache is missing | yes via `spore run --image` | trusted flat-artifact open; chunks fault in from CAS when the flat cache is missing | product resume base; cache contract is verify-at-install, trust-at-open |
+| Writable root disk index | optional `chunk-index-disk-v0` over the effective immutable rootfs base | yes for local CAS store | verifies disk index and chunk objects | yes for local CAS store | verifies disk index and chunk objects | product resume; bundle materialization unit-covered |
 | Network capability and policy | optional `spore-net-v0` plus allow CIDRs/hosts, exact host-port rules, and bound-service requirements; no live flows, host socket material, or host port forwards | yes | fresh gateway | yes | fresh gateway | policy portable; flows and port forwards dropped; bound services fail closed unless restored |
 | Transient virtio-mem hotplug | not represented | fresh managed run only | n/a | fresh managed run only | n/a | outside manifest v0 |
 | General writable disk contents | not represented | no | reject | no | reject | out of current format |
@@ -177,8 +177,8 @@ escape hatch.
 
 These are intentionally not captured in manifest v0:
 
-- General disk contents and external host files. Rootfs-bound `cow-block-v0`
-  layers are captured as described above.
+- General disk contents and external host files. Rootfs-bound
+  `chunk-index-disk-v0` indexes are captured as described above.
 - Network connections and host-side sockets.
 - Transient virtio-mem plug state and guest hotplug policy.
 - Host paths, credentials, secrets, and runtime policy.
@@ -252,8 +252,8 @@ Current hard failures include:
 - unsupported portable GIC state that is not explicitly documented as a safe
   zero/reset skip;
 - counter-frequency mismatch;
-- missing rootfs cache bytes, missing disk layer objects, corrupt disk objects,
-  or general disk devices outside the rootfs-bound COW contract.
+- missing rootfs cache bytes, missing disk index or chunk objects,
+  or general disk devices outside the rootfs-bound disk-index contract.
 
 ## Smoke contract
 
@@ -270,8 +270,8 @@ Current evidence:
 - Product smokes cover same-host diskless capture/resume, diskless fork/fan-out,
   and OCI-rootfs child execution through `mise run smoke`,
   `mise run smoke:counter-fanout`, and `mise run smoke:rootfs-fanout`.
-- Local writable rootfs layer persistence, fork divergence, and local
-  bundle-carried disk layer replay are covered by `mise run smoke:writable-rootfs`.
+- Local writable rootfs persistence, fork divergence, and local
+  bundle-carried disk index replay are covered by `mise run smoke:writable-rootfs`.
 - Same-class KVM writable-rootfs bundle materialization previously passed with
   `test/remote/bundle.sh --writable-rootfs` on two `a1.metal` hosts
   in run `writable-rootfs-20260619T212758Z`. The repo keeps

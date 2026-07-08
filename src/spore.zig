@@ -3185,7 +3185,7 @@ test "manifest rootfs artifact validates transport binding" {
     try std.testing.expect(!try rootfsQueuesQuiescent(manifest.rootfs.?, manifest.devices));
 }
 
-test "manifest disk validates rootfs base and layer chain" {
+test "manifest disk validates rootfs-bound disk identity" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();

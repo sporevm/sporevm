@@ -7,7 +7,6 @@
 const std = @import("std");
 const block_source = @import("../block_source.zig");
 const chunk_mapped_disk = @import("../chunk_mapped_disk.zig");
-const cow_disk = @import("../cow_disk.zig");
 const guestmem = @import("../guestmem.zig");
 const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
@@ -30,8 +29,6 @@ pub const Backend = union(enum) {
     file: std.c.fd_t,
     /// One-level chunk map over a flat base and optional sparse writable head.
     chunk_mapped: *chunk_mapped_disk.ChunkMappedDisk,
-    /// Immutable base plus local sparse writable head.
-    cow: *cow_disk.CowDisk,
     /// In-memory disk, used by tests.
     memory: []u8,
 
@@ -41,7 +38,6 @@ pub const Backend = union(enum) {
                 return seekFileSize(fd) orelse 0;
             },
             .chunk_mapped => |disk| return disk.capacityBytes(),
-            .cow => |disk| return disk.capacityBytes(),
             .memory => |m| return m.len,
         }
     }
@@ -58,10 +54,6 @@ pub const Backend = union(enum) {
                 return true;
             },
             .chunk_mapped => |disk| {
-                disk.readAt(buf, offset) catch return false;
-                return true;
-            },
-            .cow => |disk| {
                 disk.readAt(buf, offset) catch return false;
                 return true;
             },
@@ -88,10 +80,6 @@ pub const Backend = union(enum) {
                 disk.writeAt(buf, offset) catch return false;
                 return true;
             },
-            .cow => |disk| {
-                disk.writeAt(buf, offset) catch return false;
-                return true;
-            },
             .memory => |m| {
                 if (offset + buf.len > m.len) return false;
                 @memcpy(m[@intCast(offset)..][0..buf.len], buf);
@@ -104,10 +92,6 @@ pub const Backend = union(enum) {
         switch (self) {
             .file => |fd| return std.c.fsync(fd) == 0,
             .chunk_mapped => |disk| {
-                disk.flush() catch return false;
-                return true;
-            },
-            .cow => |disk| {
                 disk.flush() catch return false;
                 return true;
             },
@@ -365,59 +349,6 @@ test "chunk mapped backend serves dirty writes without mutating base" {
     try std.testing.expectEqual(status_ok, status[0]);
     try std.testing.expectEqualSlices(u8, &write_data, &read_data);
     try std.testing.expectEqual(@as(usize, 1), disk.dirtyClusterCount());
-
-    var base_check: [sector_size]u8 = undefined;
-    const read = try base.readPositionalAll(io, &base_check, sector_size);
-    try std.testing.expectEqual(base_check.len, read);
-    try std.testing.expectEqualSlices(u8, base_bytes[sector_size..], &base_check);
-}
-
-test "cow backend serves dirty writes without mutating base" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
-    defer base.close(io);
-    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
-    defer overlay.close(io);
-
-    var base_bytes = [_]u8{0x11} ** (2 * sector_size);
-    try base.writeStreamingAll(io, &base_bytes);
-
-    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
-    var cow = try cow_disk.CowDisk.init(std.testing.allocator, base_source, overlay.handle, base_bytes.len, sector_size);
-    defer cow.deinit();
-    var blk = Blk.init(.{ .cow = &cow });
-
-    var header: [16]u8 = [_]u8{0} ** 16;
-    std.mem.writeInt(u32, header[0..4], req_out, .little);
-    std.mem.writeInt(u64, header[8..16], 1, .little);
-    var write_data: [sector_size]u8 = [_]u8{0x5A} ** sector_size;
-    var status: [1]u8 = .{0xff};
-
-    var chain = makeChain(&.{
-        .{ .data = &header, .writable = false },
-        .{ .data = &write_data, .writable = false },
-        .{ .data = &status, .writable = true },
-    });
-    _ = blk.handleRequest(&chain);
-    try std.testing.expectEqual(status_ok, status[0]);
-
-    var read_data: [sector_size]u8 = undefined;
-    @memset(&read_data, 0);
-    status[0] = 0xff;
-    std.mem.writeInt(u32, header[0..4], req_in, .little);
-    chain = makeChain(&.{
-        .{ .data = &header, .writable = false },
-        .{ .data = &read_data, .writable = true },
-        .{ .data = &status, .writable = true },
-    });
-    const written = blk.handleRequest(&chain);
-    try std.testing.expectEqual(@as(u32, sector_size + 1), written);
-    try std.testing.expectEqual(status_ok, status[0]);
-    try std.testing.expectEqualSlices(u8, &write_data, &read_data);
-    try std.testing.expectEqual(@as(usize, 1), cow.dirtyClusterCount());
 
     var base_check: [sector_size]u8 = undefined;
     const read = try base.readPositionalAll(io, &base_check, sector_size);

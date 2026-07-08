@@ -2,7 +2,7 @@
 
 SporeVM exposes root storage to the guest as a normal `virtio-blk` disk. The
 host may serve that disk from an exact ext4 artifact, a chunked rootfs CAS, or
-sealed writable COW layers, but the guest-visible contract stays block-based.
+sealed writable disk indexes, but the guest-visible contract stays block-based.
 Filesystem-level diffs, FUSE, 9p, NFS, and file-content indexes are not restore
 authority.
 
@@ -23,8 +23,8 @@ $SPOREVM_ROOTFS_CACHE_DIR/
 
 `spore run --image ... --save` is the writable-rootfs product path. It
 records the immutable ext4 artifact, records `rootfs.storage` from the metadata
-sidecar for image-created spores, and captures rootfs writes as sealed disk
-layers over that base. Older image cache entries are upgraded once when save
+sidecar for image-created spores, and captures rootfs writes as a sealed disk
+index over that base. Older image cache entries are upgraded once when save
 needs portable chunked rootfs identity. `spore rootfs cas-preload --attach-spore`
 remains a repair/debug path for existing exact-rootfs spores; it is not the
 normal producer path.

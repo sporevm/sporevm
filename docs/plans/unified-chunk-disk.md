@@ -8,7 +8,6 @@ spec_refs:
   - SECURITY.md
   - src/spore.zig
   - src/disk_layer.zig
-  - src/cow_disk.zig
   - src/rootfs_cas.zig
   - src/disk_index.zig
   - src/runtime_disk.zig
@@ -558,10 +557,20 @@ working set, not image size).
 
 ### U8 — Cleanup and docs
 
+Status: landed in branch.
+
 Remove transitional shims, update `docs/rootfs.md`/`docs/filesystem.md`
 architecture sections, SECURITY.md parser inventory (net reduction: three
 index parsers → one), release notes covering the format break and the new
 boot/fork behavior.
+
+Landed behavior: the unused public `CowDisk` backend and virtio-blk `.cow`
+backend arm are gone; writable COW behavior now lives only inside
+`ChunkMappedDisk`. Durable filesystem, rootfs, state-portability, security, and
+release-note docs describe disk indexes, lazy CAS fault-in, the format break,
+and the fork/runtime behavior.
+
+Validation: `mise run test` and `mise run build`.
 
 ## Security
 

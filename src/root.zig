@@ -18,7 +18,6 @@ pub const chunk = @import("chunk.zig");
 pub const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
 pub const chunk_sealer = @import("chunk_sealer.zig");
 pub const contracts = @import("contracts.zig");
-pub const cow_disk = @import("cow_disk.zig");
 pub const disk_layer = @import("disk_layer.zig");
 pub const fd = @import("fd.zig");
 pub const generation = @import("generation.zig");
@@ -83,7 +82,6 @@ test {
     testing.refAllDecls(chunk_mapped_disk);
     testing.refAllDecls(chunk_sealer);
     testing.refAllDecls(contracts);
-    testing.refAllDecls(cow_disk);
     testing.refAllDecls(disk_layer);
     testing.refAllDecls(fd);
     testing.refAllDecls(fanout);

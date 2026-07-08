@@ -126,7 +126,7 @@ S3 by uploading only the canonical files named by the validated bundle metadata.
 `spore pull s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out
 child.spore` downloads that exact object set into the node-local bundle cache,
 checks the canonical `bundle_digest`, then uses the same chunk and rootfs
-verification path as local pull, including writable disk layer/object
+verification path as local pull, including writable disk index/object
 verification when present. Bare S3 URLs are rejected for pull because the remote
 URL is not restore authority.
 
