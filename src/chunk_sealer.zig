@@ -9,7 +9,6 @@ const builtin = @import("builtin");
 const chunk = @import("chunk.zig");
 
 pub const Error = error{
-    AlreadyExists,
     BadChunk,
     ClockFailed,
     IoFailed,
@@ -39,6 +38,11 @@ pub const SealResult = union(enum) {
     data: chunk.ChunkId,
 };
 
+pub const WriteIfMissingResult = enum {
+    published,
+    reused_existing,
+};
+
 pub fn sealBytes(data: []const u8, work_stats: *WorkStats) Error!SealResult {
     const zero_scan_start = try monotonicNs();
     const is_zero = std.mem.allEqual(u8, data, 0);
@@ -57,9 +61,19 @@ pub fn writeFileAllIfMissingTimed(
     data: []const u8,
     work_stats: *WorkStats,
 ) Error!void {
+    _ = try writeFileAllIfMissingTimedResult(allocator, path, data, work_stats);
+}
+
+pub fn writeFileAllIfMissingTimedResult(
+    allocator: std.mem.Allocator,
+    path: [:0]const u8,
+    data: []const u8,
+    work_stats: *WorkStats,
+) Error!WriteIfMissingResult {
     const start = try monotonicNs();
-    try writeFileAllIfMissing(allocator, path, data);
+    const result = try writeFileAllIfMissingResult(allocator, path, data);
     work_stats.chunk_write_ns +|= try elapsedMonotonicNs(start);
+    return result;
 }
 
 pub fn writePathAllIfMissingTimed(
@@ -68,9 +82,18 @@ pub fn writePathAllIfMissingTimed(
     data: []const u8,
     work_stats: *WorkStats,
 ) Error!void {
+    _ = try writePathAllIfMissingTimedResult(allocator, path, data, work_stats);
+}
+
+pub fn writePathAllIfMissingTimedResult(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    data: []const u8,
+    work_stats: *WorkStats,
+) Error!WriteIfMissingResult {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    try writeFileAllIfMissingTimed(allocator, path_z, data, work_stats);
+    return try writeFileAllIfMissingTimedResult(allocator, path_z, data, work_stats);
 }
 
 pub fn pwriteFileAllTimed(fd: std.c.fd_t, offset: usize, data: []const u8, work_stats: *WorkStats) Error!void {
@@ -82,18 +105,66 @@ pub fn pwriteFileAllTimed(fd: std.c.fd_t, offset: usize, data: []const u8, work_
 /// Durable CAS object write: returns only after the object bytes and containing
 /// directory entry have been fsynced, so a later index can safely reference it.
 pub fn writeFileAllIfMissing(allocator: std.mem.Allocator, path: [:0]const u8, data: []const u8) Error!void {
-    const fd = createNewFile(path, 0o644) catch |err| switch (err) {
-        error.AlreadyExists => {
-            try verifyExistingFile(path, data);
-            try fsyncParentDirPath(allocator, path);
-            return;
-        },
-        else => |e| return e,
-    };
-    defer _ = std.c.close(fd);
-    try writeAll(fd, data);
-    try fsyncFd(fd);
-    try fsyncParentDirPath(allocator, path);
+    _ = try writeFileAllIfMissingResult(allocator, path, data);
+}
+
+/// Durable CAS object write with publication status. The final object path is
+/// created by hard-linking a fully written and fsynced temp inode, so concurrent
+/// writers never expose partially written object bytes at the digest path.
+pub fn writeFileAllIfMissingResult(
+    allocator: std.mem.Allocator,
+    path: [:0]const u8,
+    data: []const u8,
+) Error!WriteIfMissingResult {
+    const existing_fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (existing_fd >= 0) {
+        _ = std.c.close(existing_fd);
+        try verifyExistingFile(path, data);
+        try fsyncParentDirPath(allocator, path[0..path.len]);
+        return .reused_existing;
+    }
+    switch (std.c.errno(existing_fd)) {
+        .NOENT => {},
+        else => return error.IoFailed,
+    }
+
+    const parent = std.fs.path.dirname(path[0..path.len]) orelse ".";
+    try ensureDirPath(allocator, parent);
+
+    var attempt: u8 = 0;
+    while (attempt < 16) : (attempt += 1) {
+        const nonce = (try monotonicNs()) ^ @as(u64, @intCast(std.c.getpid())) ^ @as(u64, @intFromPtr(data.ptr)) ^ attempt;
+        const temp_path = try std.fmt.allocPrintSentinel(allocator, "{s}.{x}.tmp", .{ path[0..path.len], nonce }, 0);
+        defer allocator.free(temp_path);
+
+        const fd = std.c.open(temp_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o644));
+        if (fd < 0) {
+            switch (std.c.errno(fd)) {
+                .EXIST => continue,
+                else => return error.IoFailed,
+            }
+        }
+        defer _ = std.c.close(fd);
+        defer _ = std.c.unlink(temp_path.ptr);
+
+        try writeAll(fd, data);
+        try fsyncFd(fd);
+
+        const link_rc = std.c.link(temp_path.ptr, path.ptr);
+        if (link_rc == 0) {
+            try fsyncParentDirPath(allocator, path[0..path.len]);
+            return .published;
+        }
+        switch (std.c.errno(link_rc)) {
+            .EXIST => {
+                try verifyExistingFile(path, data);
+                try fsyncParentDirPath(allocator, path[0..path.len]);
+                return .reused_existing;
+            },
+            else => return error.IoFailed,
+        }
+    }
+    return error.IoFailed;
 }
 
 /// Durable index publication: write a temp file, fsync it, rename into place,
@@ -137,17 +208,6 @@ pub fn writeFileAtomicDurable(
     try fsyncFd(fd);
     if (std.c.rename(temp_path.ptr, path_z.ptr) != 0) return error.IoFailed;
     try fsyncParentDirPath(allocator, path);
-}
-
-pub fn createNewFile(path: [:0]const u8, mode: c_uint) Error!std.c.fd_t {
-    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, mode);
-    if (fd < 0) {
-        return switch (std.c.errno(fd)) {
-            .EXIST => error.AlreadyExists,
-            else => error.IoFailed,
-        };
-    }
-    return fd;
 }
 
 pub fn ensureDirPath(allocator: std.mem.Allocator, path: []const u8) Error!void {
@@ -260,6 +320,118 @@ fn elapsedMonotonicNs(start_ns: u64) Error!u64 {
     return end_ns - start_ns;
 }
 
+pub fn parallelWorkerCount(item_count: usize) usize {
+    if (item_count == 0) return 0;
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    return @min(@min(cpu_count, 8), item_count);
+}
+
+pub fn ParallelWork(
+    comptime Context: type,
+    comptime workFn: fn (*Context, usize, *WorkStats) anyerror!void,
+) type {
+    return struct {
+        const Self = @This();
+
+        context: *Context,
+        item_count: usize,
+        record_cpu: bool,
+        next_index: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        worker_stats: []WorkStats,
+        worker_errors: []?anyerror,
+
+        pub fn run(
+            allocator: std.mem.Allocator,
+            context: *Context,
+            item_count: usize,
+            requested_workers: usize,
+            record_cpu: bool,
+        ) !WorkStats {
+            const worker_count = @min(requested_workers, item_count);
+            if (worker_count == 0) return .{};
+
+            var threads = try allocator.alloc(std.Thread, worker_count);
+            defer allocator.free(threads);
+            const worker_stats = try allocator.alloc(WorkStats, worker_count);
+            defer allocator.free(worker_stats);
+            const worker_errors = try allocator.alloc(?anyerror, worker_count);
+            defer allocator.free(worker_errors);
+            @memset(worker_stats, .{});
+            @memset(worker_errors, null);
+
+            var queue = Self{
+                .context = context,
+                .item_count = item_count,
+                .record_cpu = record_cpu,
+                .worker_stats = worker_stats,
+                .worker_errors = worker_errors,
+            };
+
+            var started: usize = 0;
+            while (started < worker_count) : (started += 1) {
+                threads[started] = std.Thread.spawn(.{}, worker, .{ &queue, started }) catch |err| {
+                    queue.failed.store(true, .release);
+                    var join_index: usize = 0;
+                    while (join_index < started) : (join_index += 1) threads[join_index].join();
+                    return err;
+                };
+            }
+
+            for (threads) |thread| thread.join();
+            for (worker_errors) |maybe_err| {
+                if (maybe_err) |err| return err;
+            }
+
+            var out: WorkStats = .{};
+            for (worker_stats) |stats| out.add(stats);
+            return out;
+        }
+
+        fn worker(queue: *Self, worker_index: usize) void {
+            var work_stats: WorkStats = .{};
+            const cpu_start = if (queue.record_cpu) threadCpuNs() else 0;
+            defer {
+                if (queue.record_cpu) work_stats.cpu_ns = elapsedCpuNs(cpu_start);
+                queue.worker_stats[worker_index] = work_stats;
+            }
+
+            while (!queue.failed.load(.acquire)) {
+                const item_index = queue.next_index.fetchAdd(1, .monotonic);
+                if (item_index >= queue.item_count) break;
+                workFn(queue.context, item_index, &work_stats) catch |err| {
+                    queue.worker_errors[worker_index] = err;
+                    queue.failed.store(true, .release);
+                    break;
+                };
+            }
+        }
+    };
+}
+
+pub fn nsToMs(ns: u64) u64 {
+    return ns / std.time.ns_per_ms;
+}
+
+pub fn elapsedCpuMs(start_ns: u64) u64 {
+    return nsToMs(elapsedCpuNs(start_ns));
+}
+
+pub fn elapsedCpuNs(start_ns: u64) u64 {
+    if (start_ns == 0) return 0;
+    const end_ns = threadCpuNs();
+    if (end_ns <= start_ns) return 0;
+    return end_ns - start_ns;
+}
+
+pub fn threadCpuNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    const seconds: u64 = @intCast(ts.sec);
+    const nanos: u64 = @intCast(ts.nsec);
+    return seconds * std.time.ns_per_s + nanos;
+}
+
 test "seals zero and data chunks" {
     var stats: WorkStats = .{};
     var zero = [_]u8{0} ** 64;
@@ -285,6 +457,50 @@ test "write-if-missing verifies existing data" {
     try writeFileAllIfMissing(allocator, path_z, "abc");
     try writeFileAllIfMissing(allocator, path_z, "abc");
     try std.testing.expectError(error.BadChunk, writeFileAllIfMissing(allocator, path_z, "def"));
+}
+
+const ConcurrentWriteContext = struct {
+    path: [:0]const u8,
+    data: []const u8,
+    errors: []?anyerror,
+};
+
+fn concurrentWriteWorker(context: *ConcurrentWriteContext, worker_index: usize) void {
+    writeFileAllIfMissing(std.heap.page_allocator, context.path, context.data) catch |err| {
+        context.errors[worker_index] = err;
+    };
+}
+
+test "write-if-missing handles same-digest races" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/chunk", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    const worker_count = @max(parallelWorkerCount(8), @as(usize, 2));
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+    const errors = try allocator.alloc(?anyerror, worker_count);
+    defer allocator.free(errors);
+    @memset(errors, null);
+    const data = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(data);
+    for (data, 0..) |*byte, i| byte.* = @truncate((i * 17) ^ (i >> 5));
+
+    var context = ConcurrentWriteContext{
+        .path = path_z,
+        .data = data,
+        .errors = errors,
+    };
+    for (threads, 0..) |*thread, i| thread.* = try std.Thread.spawn(.{}, concurrentWriteWorker, .{ &context, i });
+    for (threads) |thread| thread.join();
+    for (errors) |maybe_err| {
+        if (maybe_err) |err| return err;
+    }
+    try verifyExistingFile(path_z, data);
 }
 
 test "durable atomic publish verifies existing data" {

@@ -472,15 +472,20 @@ full-scan fallback), by-digest cache re-keys, refs/metadata carry index
 identity, `rootfs_blake3` and `ensureImageRootfsStorage` deleted.
 
 Landed behavior: the native ext4 writer now streams emitted bytes through an
-inline rootfs CAS/index writer for chunked storage. It writes missing nonzero
-64 KiB objects durably, records zero chunks without materializing them, and
-publishes the rootfs `spore-disk-index-v1` after objects are durable. The
-external writer keeps the full-scan `rootfs_cas_preload` fallback.
+inline rootfs CAS/index writer for chunked storage. It records zero chunks
+without materializing them, hands nonzero 64 KiB chunk copies to a bounded
+sealer worker pool, writes missing objects durably with race-safe temp+link
+publication, and publishes the rootfs `spore-disk-index-v1` after every worker
+has joined successfully. The external writer keeps the full-scan
+`rootfs_cas_preload` fallback.
 
 Validation: `src/rootfs/ext4_writer.zig` compares the inline-maintained
-`H(index)` with a materialized file rescanned by `rootfs_cas.preloadPath`.
-`docs/plans/native-ext4-writer.md` records the large-tar import benchmark
-against the external preload baseline.
+`H(index)` with a materialized file rescanned by `rootfs_cas.preloadPath` and
+forces the inline path through two seal workers. `src/chunk_sealer.zig` covers
+same-digest CAS object publication races. `docs/plans/native-ext4-writer.md`
+records the large-tar import benchmark against the external preload baseline;
+the 2026-07-08 rerun on the documented 312 MiB tar cut `rootfs_cas_inline`
+from 3.392s serial to 1.545s with 8 seal workers.
 
 Done when: import → run → save → restore works end to end on index identity
 with no linear full-image hash anywhere; uncached import of a large

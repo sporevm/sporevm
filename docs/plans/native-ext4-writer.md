@@ -207,31 +207,40 @@ Recorded on 2026-07-08 in this worktree with the same 312 MiB flattened
 /usr/bin/time -p env \
   SPOREVM_EXT4_WRITER=native \
   SPOREVM_ROOTFS_BUILD_PROFILE=1 \
-  SPOREVM_ROOTFS_CACHE_DIR="$PWD/zig-cache/ext4-writer-comparison-inline-chunked/spore-native/cache" \
+  SPOREVM_ROOTFS_CACHE_DIR="$PWD/zig-cache/ext4-writer-comparison-inline-parallel-native/cache" \
   zig-out/bin/spore rootfs import-tar \
   /Users/lachlan/Develop/sporevm/zig-cache/rootfs-inputs/buildkite-agent-3-linux-arm64.tar \
-  --ref local/ext4-writer-bench:inline-native \
+  --ref local/ext4-writer-bench:inline-native-parallel \
   --rootfs-storage chunked \
   --platform linux/arm64
 ```
 
 | Writer | Wall | Profile total | Ext4 emit | CAS/index phase | Output size | e2fsck -fn |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `spore (native inline)` | 6.95s | 5.106s | 3.392s | `rootfs_cas_inline` 3.392s | 592 MiB | clean |
-| `spore (external preload)` | 13.58s | 12.417s | 1.098s mkfs/debugfs | `rootfs_cas_preload` 4.870s | 592 MiB | clean |
+| `spore (native inline, 8 seal workers)` | 5.03s | 3.290s | 1.545s | `rootfs_cas_inline` 1.545s | 592 MiB | clean |
+| `spore (external preload)` | 14.14s | 13.055s | 1.049s mkfs/debugfs | `rootfs_cas_preload` 6.144s | 592 MiB | clean |
 
 Native inline emitted 9,472 index chunks: 4,267 zero chunks and 5,205
-nonzero objects, writing 341,114,880 object bytes and a 728,817 byte index.
-The inline CAS/index phase is the same wall interval as `native_ext4_emit`;
-there is no second full-image scan after the native writer finishes. The
-external fallback still pays `rootfs_cas_preload` after e2fsprogs has produced
-the flat image.
+nonzero chunks, writing 5,205 objects, 341,114,880 object bytes, and a
+728,817 byte index. The inline sealer used 8 workers, sealed 5,205 chunks, and
+reported `seal_wall_ms=1237`, `seal_worker_cpu_ms=7069`,
+`chunk_scan_ms=4146`, and `object_write_ms=5313`; the scan/write timings are
+aggregate worker timings and can exceed the 1.545s wall phase. The previous
+serial inline run on the same tar recorded `rootfs_cas_inline` 3.392s, so
+parallel inline sealing cut this measured CAS/index wall interval by about
+54%. The inline CAS/index phase is still the same wall interval as
+`native_ext4_emit`; there is no second full-image scan after the native writer
+finishes. The external fallback still pays `rootfs_cas_preload` after
+e2fsprogs has produced the flat image.
 
 ## Inline Chunk Index Emission For U4
 
 The U4 storage slice extended the native writer emission loop so every 64 KiB of
-logical image bytes also feeds a chunk hasher and writes/records the
-corresponding CAS object for `spore-disk-index-v1`.
+logical image bytes also feeds a bounded inline sealing queue. The ordered emit
+loop records zero chunks inline and hands nonzero chunk copies to a shared CAS
+sealer worker pool; workers hash and durably publish objects concurrently, and
+the writer builds the final `spore-disk-index-v1` in logical-chunk order only
+after every worker has joined successfully.
 
 Keep the current writer loop friendly to future writer work:
 

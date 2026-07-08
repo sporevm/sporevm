@@ -636,7 +636,7 @@ const RootfsBuildProfile = struct {
     fn casPhase(self: RootfsBuildProfile, name: []const u8, start_ms: u64, result: rootfs_cas.PreloadResult) void {
         if (!self.enabled) return;
         std.debug.print(
-            "spore rootfs profile: phase={s} ms={d} chunks={d} zero_chunks={d} nonzero_chunks={d} objects_written={d} object_bytes_written={d} index_bytes={d} source_verify_ms={d} chunk_scan_ms={d} object_check_ms={d} object_write_ms={d} index_build_ms={d} index_write_ms={d}\n",
+            "spore rootfs profile: phase={s} ms={d} chunks={d} zero_chunks={d} nonzero_chunks={d} objects_written={d} object_bytes_written={d} index_bytes={d} source_verify_ms={d} chunk_scan_ms={d} object_check_ms={d} object_write_ms={d} index_build_ms={d} index_write_ms={d} sealed_chunks={d} seal_workers={d} seal_wall_ms={d} seal_worker_cpu_ms={d}\n",
             .{
                 name,
                 monotonicMs() -| start_ms,
@@ -652,6 +652,10 @@ const RootfsBuildProfile = struct {
                 result.object_write_ms,
                 result.index_build_ms,
                 result.index_write_ms,
+                result.sealed_chunks,
+                result.seal_workers,
+                result.seal_wall_ms,
+                result.seal_worker_cpu_ms,
             },
         );
     }

@@ -739,6 +739,10 @@ fn ownRootfsCasPreloadResult(allocator: std.mem.Allocator, result: RootfsCasPrel
         .object_write_ms = result.object_write_ms,
         .index_build_ms = result.index_build_ms,
         .index_write_ms = result.index_write_ms,
+        .sealed_chunks = result.sealed_chunks,
+        .seal_workers = result.seal_workers,
+        .seal_wall_ms = result.seal_wall_ms,
+        .seal_worker_cpu_ms = result.seal_worker_cpu_ms,
     };
 }
 

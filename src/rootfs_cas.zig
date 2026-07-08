@@ -43,6 +43,10 @@ pub const PreloadResult = struct {
     object_write_ms: u64 = 0,
     index_build_ms: u64 = 0,
     index_write_ms: u64 = 0,
+    sealed_chunks: u64 = 0,
+    seal_workers: usize = 0,
+    seal_wall_ms: u64 = 0,
+    seal_worker_cpu_ms: u64 = 0,
 };
 
 pub const InstallResult = struct {
@@ -338,6 +342,7 @@ fn preloadFd(
         .object_write_ms = object_write_ms,
         .index_build_ms = index_build_ms,
         .index_write_ms = index_write_ms,
+        .sealed_chunks = @intCast(nonzero_chunks),
     };
 }
 

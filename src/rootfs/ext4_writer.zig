@@ -4,6 +4,7 @@
 //! mutate existing filesystems.
 
 const std = @import("std");
+const chunk = @import("../chunk.zig");
 const chunk_sealer = @import("../chunk_sealer.zig");
 const disk_index = @import("../disk_index.zig");
 const ext4 = @import("ext4.zig");
@@ -95,6 +96,7 @@ pub const Options = struct {
     determinism: ext4.Determinism,
     cas_cache_root: ?[]const u8 = null,
     cas_chunk_size: u64 = rootfs_cas.default_chunk_size,
+    cas_seal_workers: usize = 0,
 };
 
 pub const Result = struct {
@@ -219,11 +221,38 @@ const SourceFileCache = struct {
 };
 
 const InlineRootfsCas = struct {
+    const SealTask = struct {
+        logical_chunk: usize,
+        data: []u8,
+    };
+
+    const SealResult = struct {
+        id: chunk.ChunkId,
+        bytes_len: usize,
+        published: bool,
+    };
+
     allocator: std.mem.Allocator,
+    io: Io,
     cache_root: []const u8,
     chunk_size: usize,
     image_size: u64,
     chunk_buf: []u8,
+    seal_results: []?SealResult,
+    seal_queue: []?SealTask,
+    seal_threads: []std.Thread,
+    seal_worker_stats: []chunk_sealer.WorkStats,
+    seal_mutex: Io.Mutex = .init,
+    seal_cond: Io.Condition = .init,
+    seal_queue_head: usize = 0,
+    seal_queue_tail: usize = 0,
+    seal_queue_count: usize = 0,
+    seal_queue_closed: bool = false,
+    seal_queue_failed: bool = false,
+    seal_queue_error: ?anyerror = null,
+    seal_workers_started: usize = 0,
+    seal_workers_joined: bool = false,
+    seal_start_ms: u64 = 0,
     chunk_fill: usize = 0,
     logical_chunk: u64 = 0,
     manifest_chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty,
@@ -237,33 +266,67 @@ const InlineRootfsCas = struct {
     object_write_ms: u64 = 0,
     index_build_ms: u64 = 0,
     index_write_ms: u64 = 0,
+    seal_wall_ms: u64 = 0,
+    seal_worker_cpu_ms: u64 = 0,
     work_stats: chunk_sealer.WorkStats = .{},
 
     fn init(
         allocator: std.mem.Allocator,
+        io: Io,
         cache_root: []const u8,
         image_size: u64,
         chunk_size: u64,
+        requested_workers: usize,
     ) !InlineRootfsCas {
         if (chunk_size == 0 or chunk_size % block_size != 0 or chunk_size > std.math.maxInt(usize)) return error.BadManifest;
+        const expected_chunks_u64 = divCeilU64(image_size, chunk_size);
+        if (expected_chunks_u64 > std.math.maxInt(usize)) return error.BadManifest;
+        const expected_chunks: usize = @intCast(expected_chunks_u64);
+        const worker_count = if (requested_workers == 0)
+            chunk_sealer.parallelWorkerCount(expected_chunks)
+        else
+            @min(requested_workers, expected_chunks);
+        const queue_capacity = @max(worker_count * 2, @as(usize, 1));
         const object_dir = try std.fmt.allocPrint(allocator, "{s}/cas/rootfs/blake3/objects", .{cache_root});
         defer allocator.free(object_dir);
         try chunk_sealer.ensureDirPath(allocator, object_dir);
         const chunk_buf = try allocator.alloc(u8, @intCast(chunk_size));
         errdefer allocator.free(chunk_buf);
+        const seal_results = try allocator.alloc(?SealResult, expected_chunks);
+        errdefer allocator.free(seal_results);
+        @memset(seal_results, null);
+        const seal_queue = try allocator.alloc(?SealTask, queue_capacity);
+        errdefer allocator.free(seal_queue);
+        @memset(seal_queue, null);
+        const seal_threads = try allocator.alloc(std.Thread, worker_count);
+        errdefer allocator.free(seal_threads);
+        const seal_worker_stats = try allocator.alloc(chunk_sealer.WorkStats, worker_count);
+        errdefer allocator.free(seal_worker_stats);
+        @memset(seal_worker_stats, .{});
         return .{
             .allocator = allocator,
+            .io = io,
             .cache_root = cache_root,
             .chunk_size = @intCast(chunk_size),
             .image_size = image_size,
             .chunk_buf = chunk_buf,
+            .seal_results = seal_results,
+            .seal_queue = seal_queue,
+            .seal_threads = seal_threads,
+            .seal_worker_stats = seal_worker_stats,
         };
     }
 
     fn deinit(self: *InlineRootfsCas) void {
+        self.stopSealWorkers();
+        self.freeQueuedSealTasks();
         for (self.manifest_chunks.items) |entry| self.allocator.free(entry.digest);
         self.manifest_chunks.deinit(self.allocator);
         self.manifest_zero_chunks.deinit(self.allocator);
+        self.allocator.free(self.seal_worker_stats);
+        self.allocator.free(self.seal_threads);
+        self.allocator.free(self.seal_queue);
+        self.allocator.free(self.seal_results);
         self.allocator.free(self.chunk_buf);
         self.* = undefined;
     }
@@ -304,6 +367,8 @@ const InlineRootfsCas = struct {
         if (expected_chunks_u64 > std.math.maxInt(usize)) return error.BadManifest;
         const expected_chunks: usize = @intCast(expected_chunks_u64);
         if (self.logical_chunk != expected_chunks_u64 or self.chunk_count != expected_chunks) return error.BadManifest;
+        try self.finishSealWorkers();
+        try self.appendSealedManifestChunks(expected_chunks);
 
         const index_build_start = monotonicMs();
         const manifest_index = disk_index.DiskIndex{
@@ -347,6 +412,10 @@ const InlineRootfsCas = struct {
             .object_write_ms = self.object_write_ms,
             .index_build_ms = self.index_build_ms,
             .index_write_ms = self.index_write_ms,
+            .sealed_chunks = self.work_stats.sealed_chunks,
+            .seal_workers = self.seal_workers_started,
+            .seal_wall_ms = self.seal_wall_ms,
+            .seal_worker_cpu_ms = self.seal_worker_cpu_ms,
         };
     }
 
@@ -360,39 +429,186 @@ const InlineRootfsCas = struct {
 
     fn flushChunk(self: *InlineRootfsCas, bytes: []const u8) !void {
         const scan_start = monotonicMs();
-        const sealed = try chunk_sealer.sealBytes(bytes, &self.work_stats);
+        const is_zero = std.mem.allEqual(u8, bytes, 0);
         self.chunk_scan_ms += monotonicMs() -| scan_start;
-        switch (sealed) {
-            .zero => try self.appendZeroChunk(),
+        if (is_zero) {
+            try self.appendZeroChunk();
+            return;
+        }
+        try self.enqueueDataChunk(bytes);
+    }
+
+    fn enqueueDataChunk(self: *InlineRootfsCas, bytes: []const u8) !void {
+        if (self.logical_chunk > std.math.maxInt(usize)) return error.BadManifest;
+        try self.startSealWorkers();
+
+        const data = try std.heap.page_allocator.alloc(u8, bytes.len);
+        errdefer std.heap.page_allocator.free(data);
+        @memcpy(data, bytes);
+        const task = SealTask{
+            .logical_chunk = @intCast(self.logical_chunk),
+            .data = data,
+        };
+
+        self.seal_mutex.lockUncancelable(self.io);
+        defer self.seal_mutex.unlock(self.io);
+        while (self.seal_queue_count == self.seal_queue.len and !self.seal_queue_failed) {
+            self.seal_cond.waitUncancelable(self.io, &self.seal_mutex);
+        }
+        if (self.seal_queue_failed) return self.seal_queue_error orelse error.IoFailed;
+        if (self.seal_queue_closed) return error.BadManifest;
+
+        self.seal_queue[self.seal_queue_tail] = task;
+        self.seal_queue_tail = (self.seal_queue_tail + 1) % self.seal_queue.len;
+        self.seal_queue_count += 1;
+        self.seal_cond.signal(self.io);
+
+        self.logical_chunk += 1;
+        self.chunk_count += 1;
+        self.nonzero_chunks += 1;
+        self.chunk_fill = 0;
+    }
+
+    fn startSealWorkers(self: *InlineRootfsCas) !void {
+        if (self.seal_workers_started != 0 or self.seal_threads.len == 0) return;
+        self.seal_start_ms = monotonicMs();
+        while (self.seal_workers_started < self.seal_threads.len) : (self.seal_workers_started += 1) {
+            self.seal_threads[self.seal_workers_started] = std.Thread.spawn(.{}, sealWorkerMain, .{ self, self.seal_workers_started }) catch |err| {
+                self.failSealQueue(err);
+                self.joinSealWorkers();
+                return err;
+            };
+        }
+    }
+
+    fn finishSealWorkers(self: *InlineRootfsCas) !void {
+        self.closeSealQueue();
+        self.joinSealWorkers();
+        if (self.seal_queue_failed) return self.seal_queue_error orelse error.IoFailed;
+
+        var work_stats: chunk_sealer.WorkStats = .{};
+        for (self.seal_worker_stats[0..self.seal_workers_started]) |stats| work_stats.add(stats);
+        self.work_stats.add(work_stats);
+        self.chunk_scan_ms +|= chunk_sealer.nsToMs(work_stats.zero_scan_ns +| work_stats.hash_ns);
+        self.object_write_ms +|= chunk_sealer.nsToMs(work_stats.chunk_write_ns);
+        self.seal_worker_cpu_ms +|= chunk_sealer.nsToMs(work_stats.cpu_ns);
+        if (self.seal_start_ms != 0) self.seal_wall_ms = monotonicMs() -| self.seal_start_ms;
+    }
+
+    fn closeSealQueue(self: *InlineRootfsCas) void {
+        self.seal_mutex.lockUncancelable(self.io);
+        defer self.seal_mutex.unlock(self.io);
+        self.seal_queue_closed = true;
+        self.seal_cond.broadcast(self.io);
+    }
+
+    fn failSealQueue(self: *InlineRootfsCas, err: anyerror) void {
+        self.seal_mutex.lockUncancelable(self.io);
+        defer self.seal_mutex.unlock(self.io);
+        if (!self.seal_queue_failed) {
+            self.seal_queue_failed = true;
+            self.seal_queue_error = err;
+        }
+        self.seal_cond.broadcast(self.io);
+    }
+
+    fn joinSealWorkers(self: *InlineRootfsCas) void {
+        if (self.seal_workers_joined) return;
+        for (self.seal_threads[0..self.seal_workers_started]) |thread| thread.join();
+        self.seal_workers_joined = true;
+    }
+
+    fn stopSealWorkers(self: *InlineRootfsCas) void {
+        self.closeSealQueue();
+        self.joinSealWorkers();
+    }
+
+    fn takeSealTask(self: *InlineRootfsCas) ?SealTask {
+        self.seal_mutex.lockUncancelable(self.io);
+        defer self.seal_mutex.unlock(self.io);
+        while (self.seal_queue_count == 0 and !self.seal_queue_closed and !self.seal_queue_failed) {
+            self.seal_cond.waitUncancelable(self.io, &self.seal_mutex);
+        }
+        if (self.seal_queue_failed) return null;
+        if (self.seal_queue_count == 0) return null;
+        const task = self.seal_queue[self.seal_queue_head].?;
+        self.seal_queue[self.seal_queue_head] = null;
+        self.seal_queue_head = (self.seal_queue_head + 1) % self.seal_queue.len;
+        self.seal_queue_count -= 1;
+        self.seal_cond.signal(self.io);
+        return task;
+    }
+
+    fn freeQueuedSealTasks(self: *InlineRootfsCas) void {
+        for (self.seal_queue) |maybe_task| {
+            if (maybe_task) |task| std.heap.page_allocator.free(task.data);
+        }
+    }
+
+    fn processSealTask(self: *InlineRootfsCas, task: SealTask, work_stats: *chunk_sealer.WorkStats) !void {
+        switch (try chunk_sealer.sealBytes(task.data, work_stats)) {
+            .zero => return error.BadManifest,
             .data => |id| {
                 const hex = id.toHex();
-                const digest = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, hex[0..] });
-                self.manifest_chunks.append(self.allocator, .{
-                    .logical_chunk = self.logical_chunk,
-                    .digest = digest,
-                }) catch |err| {
-                    self.allocator.free(digest);
-                    return err;
+                const object_path = try std.fmt.allocPrint(
+                    std.heap.page_allocator,
+                    "{s}/cas/rootfs/blake3/objects/{s}.chunk",
+                    .{ self.cache_root, hex[0..] },
+                );
+                defer std.heap.page_allocator.free(object_path);
+                const write_result = try chunk_sealer.writePathAllIfMissingTimedResult(
+                    std.heap.page_allocator,
+                    object_path,
+                    task.data,
+                    work_stats,
+                );
+                self.seal_results[task.logical_chunk] = .{
+                    .id = id,
+                    .bytes_len = task.data.len,
+                    .published = write_result == .published,
                 };
-                errdefer {
-                    const removed = self.manifest_chunks.pop() orelse unreachable;
-                    self.allocator.free(removed.digest);
-                }
-                const object_path = try rootfs_cas.manifestObjectPath(self.allocator, self.cache_root, digest);
-                defer self.allocator.free(object_path);
-                const object_exists = try pathExistsNoSymlink(self.allocator, object_path);
-                const write_start = monotonicMs();
-                try chunk_sealer.writePathAllIfMissingTimed(self.allocator, object_path, bytes, &self.work_stats);
-                self.object_write_ms += monotonicMs() -| write_start;
-                self.logical_chunk += 1;
-                self.chunk_count += 1;
-                self.nonzero_chunks += 1;
-                if (!object_exists) {
-                    self.objects_written += 1;
-                    self.object_bytes_written += bytes.len;
-                }
-                self.chunk_fill = 0;
+                work_stats.sealed_chunks +|= 1;
             },
+        }
+    }
+
+    fn appendSealedManifestChunks(self: *InlineRootfsCas, expected_chunks: usize) !void {
+        var nonzero_results: usize = 0;
+        for (self.seal_results[0..expected_chunks], 0..) |maybe_result, logical_chunk| {
+            const result = maybe_result orelse continue;
+            nonzero_results += 1;
+            const hex = result.id.toHex();
+            const digest = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, hex[0..] });
+            self.manifest_chunks.append(self.allocator, .{
+                .logical_chunk = @intCast(logical_chunk),
+                .digest = digest,
+            }) catch |err| {
+                self.allocator.free(digest);
+                return err;
+            };
+            if (result.published) {
+                self.objects_written += 1;
+                self.object_bytes_written += result.bytes_len;
+            }
+        }
+        if (nonzero_results != self.nonzero_chunks) return error.BadManifest;
+    }
+
+    fn sealWorkerMain(self: *InlineRootfsCas, worker_index: usize) void {
+        var work_stats: chunk_sealer.WorkStats = .{};
+        const cpu_start = chunk_sealer.threadCpuNs();
+        defer {
+            work_stats.cpu_ns = chunk_sealer.elapsedCpuNs(cpu_start);
+            self.seal_worker_stats[worker_index] = work_stats;
+        }
+
+        while (self.takeSealTask()) |task| {
+            self.processSealTask(task, &work_stats) catch |err| {
+                std.heap.page_allocator.free(task.data);
+                self.failSealQueue(err);
+                break;
+            };
+            std.heap.page_allocator.free(task.data);
         }
     }
 };
@@ -421,7 +637,7 @@ pub fn emit(
     const layout = try assignBlocks(allocator, &planned, total_blocks, options.inode_count, &blocks, &data_blocks);
     defer allocator.free(layout.groups);
     try writeMetadataBlocks(allocator, &planned, layout, options, &blocks);
-    return try writeImage(allocator, io, output_path, options.image_size, total_blocks, &blocks, &data_blocks, options.cas_cache_root, options.cas_chunk_size);
+    return try writeImage(allocator, io, output_path, options.image_size, total_blocks, &blocks, &data_blocks, options.cas_cache_root, options.cas_chunk_size, options.cas_seal_workers);
 }
 
 pub fn emitFromMergedTree(
@@ -1205,6 +1421,7 @@ fn writeImage(
     data_blocks: *DataBlockStore,
     cas_cache_root: ?[]const u8,
     cas_chunk_size: u64,
+    cas_seal_workers: usize,
 ) !Result {
     try ext4.ensureParentDir(io, output_path);
     try ext4.createEmptyFile(io, output_path, image_size);
@@ -1226,7 +1443,7 @@ fn writeImage(
     var source_files = SourceFileCache{};
     defer source_files.deinit(allocator, io);
     var maybe_inline_cas: ?InlineRootfsCas = if (cas_cache_root) |cache_root|
-        try InlineRootfsCas.init(allocator, cache_root, image_size, cas_chunk_size)
+        try InlineRootfsCas.init(allocator, io, cache_root, image_size, cas_chunk_size, cas_seal_workers)
     else
         null;
     defer if (maybe_inline_cas) |*inline_cas| inline_cas.deinit();
@@ -1554,20 +1771,6 @@ fn monotonicMs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
-fn pathExistsNoSymlink(allocator: std.mem.Allocator, path: []const u8) !bool {
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
-    if (fd >= 0) {
-        _ = std.c.close(fd);
-        return true;
-    }
-    return switch (std.c.errno(fd)) {
-        .NOENT, .LOOP => false,
-        else => error.IoFailed,
-    };
-}
-
 fn put(comptime T: type, buf: []u8, offset: usize, value: T) void {
     std.mem.writeInt(T, buf[offset..][0..@sizeOf(T)], value, .little);
 }
@@ -1645,6 +1848,7 @@ test "native ext4 writer inline CAS index matches rescanned image" {
         .inode_count = 1024,
         .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-inline-cas"),
         .cas_cache_root = cache_root,
+        .cas_seal_workers = 2,
     });
     const inline_result = result.preload_result orelse return error.BadManifest;
     defer {
@@ -1664,6 +1868,8 @@ test "native ext4 writer inline CAS index matches rescanned image" {
     try std.testing.expectEqual(rescan.chunk_count, inline_result.chunk_count);
     try std.testing.expectEqual(rescan.zero_chunks, inline_result.zero_chunks);
     try std.testing.expectEqual(rescan.nonzero_chunks, inline_result.nonzero_chunks);
+    try std.testing.expectEqual(@as(usize, 2), inline_result.seal_workers);
+    try std.testing.expectEqual(@as(u64, @intCast(inline_result.nonzero_chunks)), inline_result.sealed_chunks);
     try std.testing.expect(inline_result.objects_written > 0);
 }
 
