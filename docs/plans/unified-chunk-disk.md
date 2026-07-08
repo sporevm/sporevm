@@ -1,6 +1,6 @@
 ---
 status: proposed
-last_reviewed: 2026-07-07
+last_reviewed: 2026-07-08
 spec_refs:
   - docs/spore-format.md
   - docs/rootfs.md
@@ -25,9 +25,9 @@ related_plans:
 Collapse SporeVM's two parallel content-addressed disk systems — sealed disk
 layers (4KiB clusters, stacked at restore) and the chunked rootfs CAS (64KiB
 chunks, flat) — into one primitive: **a disk state is a chunk index**, and its
-identity is the BLAKE3 of that index. Base images, build checkpoints, save
-snapshots, and running-VM disks all become values of this one type. Flat ext4
-files demote from format objects to rebuildable materialization caches.
+identity is the BLAKE3 of that index. Base images, save snapshots, and
+running-VM disks all become values of this one type. Flat ext4 files demote
+from format objects to rebuildable materialization caches.
 
 This is the storage architecture for SporeVM's core product goals: **fast
 boot** and **fast fork**, with OCI images (`spore run --image`) as a
@@ -90,8 +90,9 @@ On top of both sits `rootfs_blake3`, a linear hash of flat bytes that no
 delta mechanism can maintain incrementally, forcing full-image scans at every
 mutation-to-artifact boundary.
 
-Left alone, this gets worse before better: `spore build` adds a third
-write-persistence model (write-in-place + reflink checkpoint), and the
+Left alone, this gets worse before better: the (deferred) `spore build`
+plan would add a third write-persistence model (write-in-place + reflink
+checkpoint), and the
 obvious incremental fix — maintaining the existing `rootfs-block-index-v0`
 with a new virtio-blk dirty bitmap and a dual-identity transition — would
 have added a second dirty tracker and a second identity namespace on top.
@@ -106,8 +107,9 @@ of saying "these bytes changed; here is the new state".
 - One runtime backend: an in-memory chunk map with exactly one level of
   indirection — no layer-chain stacking on the read path, ever.
 - One persistence operation — **snapshot**: freeze, hash dirty chunks, write
-  them to the CAS, emit a new index. `spore save`, build checkpoints, build
-  finalize, and import all produce their output through it.
+  them to the CAS, emit a new index. `spore save` and import both produce
+  their output through it (and build finalize would too, if the deferred
+  `spore build` plan is revived).
 - **Fork as a first-class disk operation**: copy the map, fresh overlay,
   constant cost regardless of lineage depth. The disk side of VM fork must
   never be the bottleneck.
@@ -130,8 +132,11 @@ of saying "these bytes changed; here is the new state".
 
 - No latency regression on today's warm paths, and concrete targets only
   where a slice names them (fork and partial-materialization slices carry
-  their own "done when" measurements). The `spore build` cached-rebuild win
-  is delivered by that plan, not this one.
+  their own "done when" measurements). A native Dockerfile builder and its
+  cached-rebuild target belong to the deferred `spore build` plan; this
+  plan's local-iteration wins are fast import (U4: inline chunk emission, no
+  separate full-image hash) and fast cold start (U7: partial
+  materialization).
 - No cross-machine chunk distribution. The unified store and lazy fault-in
   make a remote chunk source natural later; building it is separate work.
 - No memory-state fork. This plan covers the disk side only; VM memory
@@ -241,7 +246,9 @@ cleanly, never hang the guest).
 
 ```
 snapshot(disk) -> DiskIndex:
-  freeze/drain (same guest+VMM quiesce the spore-build plan defines)
+  freeze/drain (v1: at the existing capture/save quiesce points — VM paused,
+                virtio-blk drained; online mid-run snapshot deferred with
+                the spore-build plan)
   for each overlay entry: blake3 chunk, write CAS object if absent
   new index = parent index with those entries replaced
   identity = blake3(new index); persist index; thaw
@@ -269,15 +276,14 @@ Consumers:
 - `spore save`: snapshot, then write a manifest referencing the index
   identity. Restore = open the index (materialize if needed), attach. No
   layer chains, no newest→oldest resolution, no `loadLayerChain`.
-- `spore build` checkpoint: intermediate step checkpoints do **not** get
-  indexes — the step-key-addressed reflink clone of the live flat file is
-  the whole checkpoint artifact, local and disposable. Emitting an index for
-  an intermediate would require making its chunks durable first (the
-  invariant), which would dominate snapshot time for artifacts that are
-  usually thrown away.
-- `spore build` finalize: the one snapshot of the build. Its chunks are
-  written to the CAS, its index identity is the image identity. No terminal
-  full-image hash at all.
+- `spore build` (future consumer, if the deferred plan is revived):
+  intermediate step checkpoints do **not** get indexes — a step-key-addressed
+  reflink clone of the live flat file is the whole checkpoint artifact, local
+  and disposable. Emitting an index for an intermediate would require making
+  its chunks durable first (the invariant), which would dominate snapshot
+  time for artifacts that are usually thrown away. Build finalize would be
+  one snapshot: chunks to the CAS, index identity as image identity, no
+  terminal full-image hash.
 - Import: the native ext4 writer emits chunks and an index inline; the
   fallback path is a full scan producing the same. `ensureImageRootfsStorage`
   and the storage-upgrade dance disappear — storage is always chunked; flat
@@ -346,19 +352,22 @@ At end state:
 
 ## Delivery Strategy
 
-Prerequisite from other plans, unchanged: spore-build M2 (persistent
-session, freeze/drain). Dirty tracking and incremental index maintenance —
-previously drafted as a separate plan — are not prerequisites; they are
-built here, inside U2 (map-is-dirty-state backend) and U3 (shared sealer +
-`snapshot()`). This plan starts only after M2 exists and the `spore build`
-win is banked.
+This plan is the active storage workstream and has no prerequisites from
+other plans. `docs/plans/spore-build.md` is **deferred** (re-sequenced
+2026-07-08): this plan's import improvements — U4's inline chunk emission
+from the native ext4 writer and U7's partial materialization — shrink the
+buildx→import-tar boundary that motivated `spore build` in the first place,
+so the builder is revisited only if that boundary still hurts after U4/U7
+land. Dirty tracking and incremental index maintenance — previously drafted
+as a separate plan — are built here, inside U2 (map-is-dirty-state backend)
+and U3 (shared sealer + `snapshot()`).
 
-Note on scaffolding: spore-build M2's writable-flat-file executor (reflink
-clone + write-in-place + `.ext4` checkpoints) is **transitional** once this
-plan is adopted. Its freeze/drain protocol and session structure carry over
-unchanged; its persistence artifacts (flat checkpoint files, terminal
-full-image hash) are replaced in U4. Build M2 should be written knowing this
-— keep the quiesce logic separable from the checkpoint-file logic.
+Quiesce scope for U3: v1 `snapshot()` runs only at the existing capture/save
+quiesce points, where the VM is paused and virtio-blk writes are drained —
+the same coherence point dirty-RAM sealing uses today (`capture.zig` seals
+the final dirty set at capture time). An online mid-run snapshot (guest
+`fsfreeze` + VMM drain while the VM keeps running) was a spore-build M2
+requirement and defers with that plan; nothing in U1–U8 needs it.
 
 ### U1 — Unified index type and CAS GC
 
@@ -402,14 +411,14 @@ break.
 `H(index)` everywhere: import produces indexes (native writer inline or
 full-scan fallback), by-digest cache re-keys, refs/metadata carry index
 identity, `rootfs_blake3` and `ensureImageRootfsStorage` deleted.
-`spore build` finalize switches from the terminal full-image hash to a
-snapshot identity; intermediate step checkpoints stay index-less flat
-clones per the durable-index invariant.
 
-Done when: import → build → run → save → restore works end to end on index
-identity with no linear full-image hash anywhere; a cached `spore build`
-rebuild of a large reference image still resolves in <1s; equivalence test
-proves `H(index)` of a materialized-then-rescanned file matches the
+Done when: import → run → save → restore works end to end on index identity
+with no linear full-image hash anywhere; uncached import of a large
+reference image pays no separate hash pass beyond the inline emission
+(measured against the native-writer baseline in
+`docs/plans/native-ext4-writer.md`); a repeat import / cached
+`spore run --image` of an unchanged image still resolves in <1s; equivalence
+test proves `H(index)` of a materialized-then-rescanned file matches the
 maintained value.
 
 ### U5 — Memory index parity (format break, batched with U3/U4's)
@@ -480,8 +489,11 @@ boot/fork behavior.
 - GC is a new destructive operation: it must be root-conservative (unknown
   record kinds are roots, not garbage) and tested against concurrent-ish
   root creation (lock protocol test).
-- The snapshot freeze/drain inherits the spore-build plan's quiesce
-  correctness requirements (clean images, no crash-consistent guesses).
+- The snapshot freeze/drain must produce clean images, never
+  crash-consistent guesses. In v1 this is satisfied structurally: snapshots
+  run only at capture/save points where the VM is paused and virtio-blk
+  writes are drained. An online mid-run snapshot would need the guest
+  `fsfreeze` protocol deferred with the spore-build plan.
 - Partial materialization (U7) puts CAS object reads on the guest I/O path
   for the first time: objects must be digest-verified at fault-in before
   bytes reach the guest, and a missing/corrupt object must surface as a
@@ -512,9 +524,10 @@ boot/fork behavior.
 - GC before deletion: no slice that removes an old mechanism lands before
   `spore cache gc` exists.
 - Durable-index invariant: an index is only written once every chunk it
-  references is durable in a store. Consequence for `spore build`:
-  intermediate step checkpoints are local flat clones with no index; only
-  the final snapshot writes chunks + index.
+  references is durable in a store. Consequence for the deferred
+  `spore build` plan, should it be revived: intermediate step checkpoints
+  are local flat clones with no index; only the final snapshot writes
+  chunks + index.
 - Fork and durable-child are two named operations, not one configurable
   mechanism: `fork` = map copy + overlay reflink, ephemeral, no identity;
   durable children come from `snapshot()` + open. Reflink is a host-fs
