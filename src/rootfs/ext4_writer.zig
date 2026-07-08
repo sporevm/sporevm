@@ -22,6 +22,7 @@ const blocks_per_group: u32 = 32768;
 const group_descriptor_size: u32 = 32;
 const max_direct_blocks: usize = 12;
 const pointers_per_block: usize = block_size / @sizeOf(u32);
+const source_batch_bytes: usize = 16 << 20;
 
 const s_ififo: u16 = 0o010000;
 const s_ifchr: u16 = 0o020000;
@@ -170,6 +171,12 @@ const DataBlockSource = struct {
     source: tar.FileSource,
     offset: u64,
     len: usize,
+};
+
+const EmitBlock = union(enum) {
+    zero,
+    metadata: []u8,
+    data: DataBlockSource,
 };
 
 const SourceFile = struct {
@@ -1014,30 +1021,174 @@ fn writeImage(
         try Io.Dir.cwd().openFile(io, output_path, .{ .mode = .read_write });
     defer file.close(io);
 
+    const emit_blocks = try buildEmitBlocks(allocator, total_blocks, blocks, data_blocks);
+    defer allocator.free(emit_blocks);
+
     var hasher = Blake3.init(.{});
-    const zero = [_]u8{0} ** block_size;
     var source_block: [block_size]u8 = undefined;
+    const source_buffer = try allocator.alloc(u8, source_batch_bytes);
+    defer allocator.free(source_buffer);
+    const zero_buffer = try allocator.alloc(u8, source_batch_bytes);
+    defer allocator.free(zero_buffer);
+    @memset(zero_buffer, 0);
     var source_files = SourceFileCache{};
     defer source_files.deinit(allocator, io);
-    for (0..total_blocks) |block_index| {
+    var block_index: usize = 0;
+    while (block_index < total_blocks) {
         const block_no: u32 = @intCast(block_index);
         const offset = @as(u64, block_no) * block_size;
-        if (blocks.get(block_no)) |block| {
-            try file.writePositionalAll(io, block, offset);
-            hasher.update(block);
-        } else if (data_blocks.get(block_no)) |source| {
-            try readDataBlock(allocator, io, &source_files, source, &source_block);
-            try file.writePositionalAll(io, &source_block, offset);
-            hasher.update(&source_block);
-        } else {
-            hasher.update(&zero);
+        switch (emit_blocks[block_index]) {
+            .metadata => |block| {
+                try file.writePositionalAll(io, block, offset);
+                hasher.update(block);
+            },
+            .data => |source| {
+                const written_blocks = try writeDataRun(
+                    allocator,
+                    io,
+                    &file,
+                    &hasher,
+                    &source_files,
+                    emit_blocks,
+                    source,
+                    block_no,
+                    offset,
+                    &source_block,
+                    source_buffer,
+                );
+                block_index += written_blocks;
+                continue;
+            },
+            .zero => {
+                const zero_blocks = zeroRunLength(emit_blocks, block_index, zero_buffer.len / block_size);
+                hasher.update(zero_buffer[0 .. zero_blocks * block_size]);
+                block_index += zero_blocks;
+                continue;
+            },
         }
+        block_index += 1;
     }
     var raw: [chunk.ChunkId.len]u8 = undefined;
     hasher.final(&raw);
     return .{
         .blake3 = std.fmt.bytesToHex(raw, .lower),
         .size = image_size,
+    };
+}
+
+fn buildEmitBlocks(
+    allocator: std.mem.Allocator,
+    total_blocks: u32,
+    blocks: *BlockStore,
+    data_blocks: *DataBlockStore,
+) ![]EmitBlock {
+    const emit_blocks = try allocator.alloc(EmitBlock, total_blocks);
+    @memset(emit_blocks, .zero);
+    var metadata_it = blocks.iterator();
+    while (metadata_it.next()) |entry| {
+        emit_blocks[entry.key_ptr.*] = .{ .metadata = entry.value_ptr.* };
+    }
+    var data_it = data_blocks.iterator();
+    while (data_it.next()) |entry| {
+        emit_blocks[entry.key_ptr.*] = .{ .data = entry.value_ptr.* };
+    }
+    return emit_blocks;
+}
+
+fn zeroRunLength(emit_blocks: []const EmitBlock, first_block_index: usize, max_blocks: usize) usize {
+    var count: usize = 1;
+    while (count < max_blocks and first_block_index + count < emit_blocks.len) : (count += 1) {
+        if (emit_blocks[first_block_index + count] != .zero) break;
+    }
+    return count;
+}
+
+fn writeDataRun(
+    allocator: std.mem.Allocator,
+    io: Io,
+    output: *Io.File,
+    hasher: *Blake3,
+    cache: *SourceFileCache,
+    emit_blocks: []const EmitBlock,
+    first: DataBlockSource,
+    first_block_no: u32,
+    output_offset: u64,
+    fallback_block: *[block_size]u8,
+    buffer: []u8,
+) !usize {
+    const run_blocks = dataRunLength(emit_blocks, first, first_block_no, buffer.len / block_size);
+    if (run_blocks <= 1) {
+        try readDataBlock(allocator, io, cache, first, fallback_block);
+        try output.writePositionalAll(io, fallback_block, output_offset);
+        hasher.update(fallback_block);
+        return 1;
+    }
+
+    const byte_len = run_blocks * block_size;
+    var source_len: usize = undefined;
+    switch (first.source) {
+        .memory => |data| {
+            const start: usize = @intCast(first.offset);
+            source_len = runPayloadLen(emit_blocks, first_block_no, run_blocks);
+            @memcpy(buffer[0..source_len], data[start .. start + source_len]);
+        },
+        .file => |slice| {
+            source_len = runPayloadLen(emit_blocks, first_block_no, run_blocks);
+            const source_offset = try std.math.add(u64, slice.offset, first.offset);
+            const source_file = try cache.open(allocator, io, slice.path);
+            const n = try source_file.readPositionalAll(io, buffer[0..source_len], source_offset);
+            if (n != source_len) return error.UnexpectedEndOfStream;
+        },
+    }
+    if (source_len < byte_len) @memset(buffer[source_len..byte_len], 0);
+    try output.writePositionalAll(io, buffer[0..byte_len], output_offset);
+    hasher.update(buffer[0..byte_len]);
+    return run_blocks;
+}
+
+fn dataRunLength(
+    emit_blocks: []const EmitBlock,
+    first: DataBlockSource,
+    first_block_no: u32,
+    max_blocks: usize,
+) usize {
+    var count: usize = 1;
+    var expected_offset = first.offset + first.len;
+    while (count < max_blocks) : (count += 1) {
+        const block_no = first_block_no + @as(u32, @intCast(count));
+        if (block_no >= emit_blocks.len) break;
+        const next = switch (emit_blocks[block_no]) {
+            .data => |source| source,
+            else => break,
+        };
+        if (!sameSource(first.source, next.source)) break;
+        if (next.offset != expected_offset) break;
+        expected_offset += next.len;
+    }
+    return count;
+}
+
+fn runPayloadLen(emit_blocks: []const EmitBlock, first_block_no: u32, run_blocks: usize) usize {
+    var len: usize = 0;
+    for (0..run_blocks) |i| {
+        len += switch (emit_blocks[first_block_no + @as(u32, @intCast(i))]) {
+            .data => |source| source.len,
+            else => unreachable,
+        };
+    }
+    return len;
+}
+
+fn sameSource(a: tar.FileSource, b: tar.FileSource) bool {
+    return switch (a) {
+        .memory => |a_data| switch (b) {
+            .memory => |b_data| a_data.ptr == b_data.ptr and a_data.len == b_data.len,
+            .file => false,
+        },
+        .file => |a_slice| switch (b) {
+            .memory => false,
+            .file => |b_slice| a_slice.offset == b_slice.offset and a_slice.size == b_slice.size and std.mem.eql(u8, a_slice.path, b_slice.path),
+        },
     };
 }
 
