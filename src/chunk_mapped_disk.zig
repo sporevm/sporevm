@@ -6,11 +6,14 @@
 //! sources and durable index snapshotting on top of the same map.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const block_source = @import("block_source.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
+
+extern "c" fn mkstemp(template: [*:0]u8) c_int;
 
 pub const Error = error{
     BadClusterSize,
@@ -27,6 +30,29 @@ const Source = enum(u8) {
     base,
     overlay,
     zero,
+};
+
+pub const ForkCloneMethod = enum {
+    reflink,
+    copy,
+};
+
+pub const ForkOptions = struct {
+    force_copy: bool = false,
+};
+
+pub const ForkedDisk = struct {
+    disk: ChunkMappedDisk,
+    clone_method: ForkCloneMethod,
+
+    pub fn deinit(self: *ForkedDisk) void {
+        if (self.disk.overlay_fd) |fd| {
+            _ = std.c.close(fd);
+            self.disk.overlay_fd = null;
+        }
+        self.disk.deinit();
+        self.* = undefined;
+    }
 };
 
 pub const ChunkMappedDisk = struct {
@@ -198,6 +224,38 @@ pub const ChunkMappedDisk = struct {
         }
     }
 
+    pub fn fork(self: *ChunkMappedDisk, options: ForkOptions) Error!ForkedDisk {
+        const parent_fd = self.overlay_fd orelse return error.ReadOnly;
+        const child_sources = try self.allocator.dupe(Source, self.sources);
+        errdefer self.allocator.free(child_sources);
+
+        const child_fd = try createTempOverlayFd(self.allocator);
+        var fd_owned = true;
+        errdefer {
+            if (fd_owned) _ = std.c.close(child_fd);
+        }
+
+        const clone_method: ForkCloneMethod = if (!options.force_copy and tryCloneOverlay(parent_fd, child_fd))
+            .reflink
+        else blk: {
+            try self.copyOverlayChunks(parent_fd, child_fd);
+            break :blk .copy;
+        };
+
+        fd_owned = false;
+        return .{
+            .disk = .{
+                .allocator = self.allocator,
+                .base = self.base,
+                .overlay_fd = child_fd,
+                .size = self.size,
+                .chunk_size = self.chunk_size,
+                .sources = child_sources,
+            },
+            .clone_method = clone_method,
+        };
+    }
+
     pub fn snapshotIndex(self: *ChunkMappedDisk, dir: []const u8, device: spore.RootfsDevice) Error!spore.Disk {
         var chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty;
         errdefer {
@@ -318,6 +376,24 @@ pub const ChunkMappedDisk = struct {
         }
         try writeExact(overlay_fd, buf, offset);
     }
+
+    fn copyOverlayChunks(self: *ChunkMappedDisk, parent_fd: std.c.fd_t, child_fd: std.c.fd_t) Error!void {
+        const overlay_size = std.math.cast(std.c.off_t, self.size) orelse return error.BadDiskSize;
+        if (std.c.ftruncate(child_fd, overlay_size) != 0) return error.ResizeFailed;
+
+        const max_chunk_size = std.math.cast(usize, self.chunk_size) orelse return error.BadClusterSize;
+        const buf = try self.allocator.alloc(u8, max_chunk_size);
+        defer self.allocator.free(buf);
+
+        for (self.sources, 0..) |source, chunk_index| {
+            if (source != .overlay) continue;
+            const len = try self.chunkLen(chunk_index);
+            const offset = std.math.mul(u64, chunk_index, self.chunk_size) catch return error.OutOfRange;
+            const data = buf[0..len];
+            try readExact(parent_fd, data, offset);
+            try writeExact(child_fd, data, offset);
+        }
+    }
 };
 
 const Span = struct {
@@ -350,6 +426,24 @@ fn writeExact(fd: std.c.fd_t, buf: []const u8, offset: u64) Error!void {
         if (n <= 0) return error.ShortWrite;
         done += @intCast(n);
     }
+}
+
+fn createTempOverlayFd(allocator: std.mem.Allocator) Error!std.c.fd_t {
+    const template = try allocator.dupeZ(u8, "/tmp/sporevm-disk-fork-XXXXXX");
+    defer allocator.free(template);
+    const fd = mkstemp(template.ptr);
+    if (fd < 0) return error.IoFailed;
+    _ = std.c.unlink(template.ptr);
+    return fd;
+}
+
+fn tryCloneOverlay(parent_fd: std.c.fd_t, child_fd: std.c.fd_t) bool {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const request = linux.IOCTL.IOW(0x94, 9, c_int);
+        return linux.errno(linux.ioctl(child_fd, request, @as(usize, @intCast(parent_fd)))) == .SUCCESS;
+    }
+    return false;
 }
 
 fn objectDir(allocator: std.mem.Allocator, dir: []const u8) Error![]const u8 {
@@ -556,4 +650,135 @@ test "read only disk rejects writes" {
     var readback: [512]u8 = undefined;
     try disk.readAt(&readback, 0);
     try std.testing.expectEqualSlices(u8, &base_bytes, &readback);
+}
+
+test "read only disk rejects fork" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+
+    const base_bytes = [_]u8{0x11} ** 512;
+    try base.writeStreamingAll(io, &base_bytes);
+
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
+    var disk = try ChunkMappedDisk.initReadOnly(std.testing.allocator, base_source, base_bytes.len, 512);
+    defer disk.deinit();
+
+    try std.testing.expectError(error.ReadOnly, disk.fork(.{}));
+}
+
+test "forced-copy fork isolates parent and child overlays" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+
+    var base_bytes: [1536]u8 = undefined;
+    for (&base_bytes, 0..) |*byte, i| byte.* = @truncate((i * 17) + 3);
+    var parent_model = base_bytes;
+    var child_model = base_bytes;
+    try base.writeStreamingAll(io, &base_bytes);
+
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
+    var disk = try ChunkMappedDisk.initWritable(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 512);
+    defer disk.deinit();
+
+    const first_parent_patch = [_]u8{0xA1} ** 48;
+    try disk.writeAt(&first_parent_patch, 480);
+    @memcpy(parent_model[480..][0..first_parent_patch.len], &first_parent_patch);
+    @memcpy(child_model[480..][0..first_parent_patch.len], &first_parent_patch);
+
+    var child = try disk.fork(.{ .force_copy = true });
+    defer child.deinit();
+
+    try std.testing.expectEqual(ForkCloneMethod.copy, child.clone_method);
+    try std.testing.expectEqual(disk.chunkCount(), child.disk.chunkCount());
+    try std.testing.expectEqual(disk.dirtyChunkCount(), child.disk.dirtyChunkCount());
+
+    var readback: [1536]u8 = undefined;
+    try child.disk.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, &child_model, &readback);
+
+    const second_parent_patch = [_]u8{0xB2} ** 32;
+    try disk.writeAt(&second_parent_patch, 32);
+    @memcpy(parent_model[32..][0..second_parent_patch.len], &second_parent_patch);
+
+    try child.disk.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, &child_model, &readback);
+
+    const child_patch = [_]u8{0xC3} ** 40;
+    try child.disk.writeAt(&child_patch, 512 + 24);
+    @memcpy(child_model[512 + 24 ..][0..child_patch.len], &child_patch);
+
+    try disk.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, &parent_model, &readback);
+    try child.disk.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, &child_model, &readback);
+}
+
+test "sequential forks keep a flat chunk map" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+
+    var base_bytes: [2048]u8 = undefined;
+    for (&base_bytes, 0..) |*byte, i| byte.* = @truncate((i * 29) + 11);
+    var parent_model = base_bytes;
+    var final_model = base_bytes;
+    try base.writeStreamingAll(io, &base_bytes);
+
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
+    var disk = try ChunkMappedDisk.initWritable(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 512);
+    defer disk.deinit();
+
+    const parent_patch = [_]u8{0xD4} ** 64;
+    try disk.writeAt(&parent_patch, 700);
+    @memcpy(parent_model[700..][0..parent_patch.len], &parent_patch);
+    @memcpy(final_model[700..][0..parent_patch.len], &parent_patch);
+
+    var forks: [32]ForkedDisk = undefined;
+    var initialized: usize = 0;
+    defer {
+        var i = initialized;
+        while (i > 0) {
+            i -= 1;
+            forks[i].deinit();
+        }
+    }
+
+    var current: *ChunkMappedDisk = &disk;
+    while (initialized < forks.len) {
+        forks[initialized] = try current.fork(.{ .force_copy = true });
+        initialized += 1;
+        const forked = &forks[initialized - 1];
+        try std.testing.expectEqual(ForkCloneMethod.copy, forked.clone_method);
+        try std.testing.expectEqual(disk.chunkCount(), forked.disk.chunkCount());
+        try std.testing.expectEqual(@as(usize, 1), forked.disk.dirtyChunkCount());
+        current = &forked.disk;
+    }
+
+    var readback: [2048]u8 = undefined;
+    try current.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, &final_model, &readback);
+
+    const final_patch = [_]u8{0xE5} ** 96;
+    try current.writeAt(&final_patch, 1200);
+    @memcpy(final_model[1200..][0..final_patch.len], &final_patch);
+
+    try current.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, &final_model, &readback);
+    try disk.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, &parent_model, &readback);
 }

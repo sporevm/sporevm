@@ -496,11 +496,24 @@ structure with two instantiations (RAM 2MiB, disk 64KiB).
 
 ### U6 — Fork
 
+Status: landed in branch for the disk backend.
+
 Implement ephemeral `fork` on `ChunkMappedDisk` (map copy + overlay reflink
-per the Design section), with the snapshot-then-open fallback for hosts
-without reflink. Durable child creation needs no new code — it is
+per the Design section), with a plain dirty-chunk overlay-copy fallback for
+hosts without reflink. Durable child creation needs no new code — it is
 `snapshot()` + open, which exists after U3. Expose `fork` wherever the
 VM-level fork operation lands; this slice owns only the disk side.
+
+Landed behavior: writable `ChunkMappedDisk` instances can now create a
+`ForkedDisk` by copying the in-memory chunk-source map and giving the child an
+unlinked temp overlay cloned from the parent's overlay. Linux hosts attempt
+`FICLONE`; other hosts or explicit `force_copy` use a plain dirty-chunk copy
+fallback. Read-only disks reject `fork`, and durable child creation remains
+`snapshot()` + open.
+
+Validation: `mise run test` covers read-only rejection, forced-copy fallback,
+parent/child divergence, and a 32-deep sequential fork chain that keeps the
+chunk map flat and avoids parent contamination.
 
 Done when: fork of a running writable disk completes in O(map copy) —
 target <100ms for an 8G disk regardless of dirty volume on a reflink-capable
