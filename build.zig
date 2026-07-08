@@ -178,6 +178,13 @@ pub fn build(b: *std.Build) void {
     const run_internal_tests = b.addRunArtifact(internal_tests);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    const rootfs_slow_mod = b.createModule(.{
+        .root_source_file = b.path("src/rootfs_slow_tests.zig"),
+        .target = target,
+        .link_libc = true,
+    });
+    const rootfs_slow_tests = b.addTest(.{ .root_module = rootfs_slow_mod });
+    const run_rootfs_slow_tests = b.addRunArtifact(rootfs_slow_tests);
     const c_smoke_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -215,6 +222,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_internal_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_c_smoke.step);
+
+    const rootfs_slow_test_step = b.step("rootfs-slow-test", "Run slow rootfs/ext4 conformance tests");
+    rootfs_slow_test_step.dependOn(&run_rootfs_slow_tests.step);
 
     // Hypervisor.framework smoke test: host-only, needs entitlement signing.
     // Run with `zig build hvf-smoke` on an Apple Silicon Mac.
