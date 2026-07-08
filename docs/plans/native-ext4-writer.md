@@ -216,3 +216,20 @@ Keep the current writer loop friendly to that change:
 - Native emission is currently one positional read/write per 4 KiB data block;
   batching is the likely throughput follow-up if benchmarks show emit-bound
   behavior.
+
+## Related Implementations
+
+- [hcsshim tar2ext4](https://github.com/microsoft/hcsshim/tree/main/ext4/tar2ext4)
+  / [compactext4](https://github.com/microsoft/hcsshim/tree/main/ext4/internal/compactext4)
+  (Go, MIT): the closest production analog — streams a tar directly into a
+  compact ext4 image for LCOW. Useful reference for extent emission and
+  streamed layout when we lift the 4 GiB file limit. Its sibling
+  [dmverity](https://github.com/microsoft/hcsshim/tree/main/ext4/dmverity)
+  package is relevant to future integrity work.
+- [e2fsprogs / libext2fs](https://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git)
+  (GPL/LGPL): the canonical implementation. `mke2fs -d` backs the external
+  writer path, and `e2fsck` is the correctness oracle in the writer's tests —
+  reference behaviour, not borrowed code.
+- [lwext4](https://github.com/gkostka/lwext4) (mostly BSD): a readable
+  standalone extents implementation. Note `ext4_extents.c` is GPL-licensed —
+  reference only, do not port code from it.
