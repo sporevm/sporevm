@@ -87,7 +87,7 @@ The native path has two passes:
 
 The current profile uses 4096-byte blocks, 256-byte inodes, sparse
 superblocks, filetype directory entries, external xattr blocks, inline symlinks
-up to 60 bytes, and block-mapped regular files with direct, single-indirect,
+shorter than 60 bytes, and block-mapped regular files with direct, single-indirect,
 and double-indirect blocks. Larger files fail closed until extents or
 triple-indirect blocks are added.
 
@@ -100,7 +100,7 @@ inode counts, image size, link counts, xattr bounds, and unsupported file sizes
 before writing.
 
 The default native flip is a flag-day cache break: `builder_version` is
-`sporevm-rootfs-v4`, so old `v3` rootfs cache entries are abandoned and rebuilt.
+`sporevm-rootfs-v5`, so old `v3`/`v4` rootfs cache entries are abandoned and rebuilt.
 The by-digest cache is not split by writer. Rootfs metadata records the selected
 writer, and cache validation rejects a metadata/artifact pair produced by the
 other writer so `SPOREVM_EXT4_WRITER=external` remains an effective escape
@@ -118,16 +118,16 @@ Implemented in this branch:
 | Native/external semantic parity | Done | Focused debugfs read-back test materializes the same layer through both writers and compares guest-visible file contents; repeated native output has the same BLAKE3. |
 | Determinism | Done | Duplicate native emits and repeated native materialization produce stable BLAKE3 for the tested inputs. |
 | Fuzz coverage | Done | Existing tar fuzzing is extended with merged-tree fuzzing, and the native planner/metadata emitter has an integrated fuzz target. |
-| Cache identity | Done | Builder version bumped to `sporevm-rootfs-v4`; cache validation includes the selected writer metadata without hashing writer selection into the cache key. |
-| Guest boot smoke | Done | Native-default OCI smoke built and booted Alpine with `builder_version: sporevm-rootfs-v4`, `ext4_writer: native`, and guest output `native-rootfs-smoke`. |
-| Writer benchmark | Done | Post-v4 native vs external phase table recorded below; native output is byte-identical to the pre-v4 run and the emit-throughput gap is a documented follow-up, not a flip blocker. |
+| Cache identity | Done | Builder version bumped to `sporevm-rootfs-v5`; cache validation includes the selected writer metadata without hashing writer selection into the cache key. |
+| Guest boot smoke | Done | Native-default OCI smoke built and booted Alpine during the v4/default-flip work with `ext4_writer: native` and guest output `native-rootfs-smoke`; v5 invalidates the cache identity for the 60-byte symlink boundary fix. |
+| Writer benchmark | Done | Post-v5 native/external/tar2ext4 comparison recorded below; optimized native output is byte-identical to the plain v5 native writer and e2fsck-clean. |
 
 ## Rollout Gates
 
 Before merge:
 
 - Native-default OCI boot smoke passes and is recorded here.
-- Focused native/external parity, cache, and TLS tests pass after the v4
+- Focused native/external parity, cache, and TLS tests pass after the v5
   re-scope.
 - Full `zig test src/rootfs.zig`, `mise run test`, and `mise run build` pass.
 
@@ -163,59 +163,34 @@ Observed:
 
 ## Benchmark Evidence
 
-Recorded on 2026-07-08 in this worktree after the v4/default-flip diff, using
-`scripts/benchmark-rootfs-writers.py --no-build --image docker.io/buildkite/agent:3`
-on macOS arm64/HVF:
-
-| Writer | Status | Total | Conversion phases | Rootfs size | BLAKE3 prefix |
-| --- | ---: | ---: | ---: | ---: | --- |
-| `external` | 0 | 50.93s | 16.98s | 620756992 | `67a866b5de6680c8` |
-| `native` | 0 | 61.77s | 29.48s | 620756992 | `9828e4be2475afb2` |
-
-| Phase | External | Native |
-| --- | ---: | ---: |
-| `tree_merge` | - | 8.34s |
-| `layer_extract_staging` | 11.94s | - |
-| `rootfs_tree_finalize` | 13ms | 0ms |
-| `host_metadata_normalize` | 126ms | - |
-| `ext4_size_scan` | 35ms | 1ms |
-| `ext4_create_empty` | 1ms | - |
-| `mkfs_ext4` | 509ms | - |
-| `debugfs_finalize` | 546ms | - |
-| `rootfs_blake3` | 3.82s | - |
-| `native_ext4_emit` | - | 21.14s |
-
-Native BLAKE3 matches the pre-v4 run exactly, confirming the review-response
-diff did not change emitted bytes. Native conversion is currently ~12.5s slower
-than external on this image, dominated by `native_ext4_emit`; the default flip
-proceeds on correctness, determinism, and dependency-freedom, with emit
-batching tracked under Known Limits as the throughput follow-up.
-
-Note: the v5 symlink-boundary fix below changes emitted bytes for images
-containing 60-byte symlink targets (including `buildkite/agent:3`), so the
-BLAKE3 prefixes above no longer reproduce on v5.
-
-### OSS Comparison
-
 Recorded on 2026-07-08 with
 `scripts/benchmark-ext4-writer-comparison.py --tar <docker export of buildkite/agent:3>`
-(312 MiB flattened tar, macOS arm64), after the symlink-boundary fix:
+(312 MiB flattened tar, macOS arm64), after the v5 symlink-boundary fix:
 
 | Tool | Wall | Conversion | Output size | e2fsck -fn |
 | --- | ---: | ---: | ---: | --- |
-| `spore (native)` | 23.47s | 20.33s | 592 MiB | clean |
-| `spore (external)` | 11.37s | 4.93s | 592 MiB | clean |
-| `tar2ext4` (hcsshim v0.14.1) | 173ms | 173ms | 323 MiB | exit 4 (bitmap padding nit only) |
+| `spore (native, v5 baseline)` | 23.99s | 20.75s | 592 MiB | clean |
+| `spore (native, optimized)` | 7.52s | 4.31s | 592 MiB | clean |
+| `spore (external)` | 11.87s | 5.29s | 592 MiB | clean |
+| `tar2ext4` (hcsshim) | 239ms | 239ms | 323 MiB | exit 4 (inode bitmap padding) |
+| `tar2ext4 -inline` (hcsshim) | 176ms | 176ms | 323 MiB | exit 4 (inode bitmap padding) |
+
+The optimized native writer is byte-identical to the plain v5 native writer on
+this input: rootfs size `620756992`, BLAKE3
+`262630c531a7c86e8a11d8286fe8038dd0b00fd216b462612a040adce2b90756`. The old
+v4/native benchmark hash is intentionally obsolete because the v5
+symlink-boundary fix stores 60-byte symlink targets in data blocks instead of
+incorrectly inlining them.
 
 The single-layer flat-tar path removes multi-layer merge cost, which is why
-external conversion is faster here than in the table above. The headline is
-tar2ext4: compactext4 converts the same content roughly 100x faster than
-`native_ext4_emit` by buffering and writing sequentially, versus our one
-positional 4 KiB write per data block. That bounds the emit-batching follow-up:
-sub-second conversion is achievable for this size class on this hardware.
-This comparison also caught the 60-byte symlink bug — the harness runs
-`e2fsck -fn` on every output and stays useful as a cross-implementation
-correctness check.
+external conversion is faster here than in the earlier OCI benchmark. Native
+`native_ext4_emit` dropped from the plain v5 20.61s phase to 4.18s by preserving
+the sequential logical walk while coalescing source reads/writes, classifying
+logical blocks densely, batching zero hashing, avoiding quadratic free-block
+scans during layout planning, indexing path lookups without changing
+deterministic path iteration order, and only zero-filling source-run partial
+tails. hcsshim's compactext4 still shows the next ceiling: sub-second conversion
+is achievable for this size class by streaming a compact ext4 layout.
 
 ## Next: Inline Chunk Index Emission For U4
 
@@ -239,9 +214,6 @@ Keep the current writer loop friendly to that change:
   `UnsupportedExt4FileSize`. Use `SPOREVM_EXT4_WRITER=external` for images with
   larger files until extents or triple-indirect support lands.
 - Large-directory lookup is linear because `dir_index` is not emitted.
-- Native emission is currently one positional read/write per 4 KiB data block;
-  batching is the likely throughput follow-up if benchmarks show emit-bound
-  behavior.
 
 ## Related Implementations
 
