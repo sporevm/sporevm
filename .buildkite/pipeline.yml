@@ -36,6 +36,25 @@ steps:
     agents:
       queue: sporevm-mac
 
+  - label: ":ext4: Slow Rootfs Tests (Linux)"
+    key: "rootfs-slow-test-linux"
+    if: build.env("SPOREVM_RUN_ROOTFS_SLOW_TESTS") == "1"
+    command: |
+      mise install
+      mise exec -- zig build rootfs-slow-test --summary all
+    plugins:
+      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          version: "2026.5.12"
+    cache:
+      paths:
+        - "~/.local/share/mise"
+        - "~/.cache/mise"
+        - "~/.local/state/mise"
+      size: "20g"
+      name: "mise-cache"
+    agents:
+      queue: sporevm-linux-arm64
+
   - label: ":package: Build Linux ARM64 release archive"
     key: "release-linux-arm64"
     if: build.tag != null

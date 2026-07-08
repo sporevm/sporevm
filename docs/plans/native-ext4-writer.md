@@ -112,10 +112,10 @@ Implemented in this branch:
 
 | Area | Status | Evidence |
 | --- | --- | --- |
-| Synthetic ext4 emission | Done | Deterministic images, multi-group images, hardlinks, device/special files, xattrs, large double-indirect files, and fsck checks in `src/rootfs/ext4_writer.zig` tests. |
+| Synthetic ext4 emission | Done | Deterministic images, multi-group images, hardlinks, device/special files, xattrs, large double-indirect files, and fsck checks run through `zig build rootfs-slow-test`; planner/fuzz coverage remains in `src/rootfs/ext4_writer.zig`. |
 | Merged tree from layer tars | Done | `src/rootfs/tar.zig` builds source-backed merged trees and compares them with staging semantics for whiteouts, hardlinks, symlinks, ownership, xattrs, implicit dirs, and content. |
 | Native materialization wiring | Done | `materializeRootFS` selects native by default, external by `SPOREVM_EXT4_WRITER=external`, and writes `ext4_writer` into rootfs metadata. |
-| Native/external semantic parity | Done | Focused debugfs read-back test materializes the same layer through both writers and compares guest-visible file contents; repeated native output has the same BLAKE3. |
+| Native/external semantic parity | Done | Focused debugfs read-back test in `src/rootfs_slow_tests.zig` imports the same tar through both writers and compares guest-visible file contents; repeated native output has the same BLAKE3. |
 | Determinism | Done | Duplicate native emits and repeated native materialization produce stable BLAKE3 for the tested inputs. |
 | Fuzz coverage | Done | Existing tar fuzzing is extended with merged-tree fuzzing, and the native planner/metadata emitter has an integrated fuzz target. |
 | Cache identity | Done | Builder version bumped to `sporevm-rootfs-v5`; cache validation includes the selected writer metadata without hashing writer selection into the cache key. |
@@ -124,11 +124,18 @@ Implemented in this branch:
 
 ## Rollout Gates
 
-Before merge:
+Default PR CI:
+
+- `zig build test` keeps parser, cache identity, native writer planner/fuzz, and
+  cheap rootfs coverage in the fast lane.
+
+Slow rootfs gate:
 
 - Native-default OCI boot smoke passes and is recorded here.
-- Focused native/external parity, cache, and TLS tests pass after the v5
-  re-scope.
+- Focused native/external parity runs with `mise run test:rootfs-slow`;
+  Buildkite can run the same slow lane by setting
+  `SPOREVM_RUN_ROOTFS_SLOW_TESTS=1`.
+- Cache and TLS tests pass after the v5 re-scope.
 - Full `zig test src/rootfs.zig`, `mise run test`, and `mise run build` pass.
 
 Before removing the external fallback:

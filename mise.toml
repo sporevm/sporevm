@@ -19,6 +19,10 @@ description = "Install optimized spore into ~/bin"
 run = "zig build test"
 description = "Run unit tests"
 
+[tasks."test:rootfs-slow"]
+run = "zig build rootfs-slow-test"
+description = "Run slow rootfs/ext4 conformance tests"
+
 [tasks.docs]
 run = "zig build docs"
 description = "Generate libspore API documentation"
