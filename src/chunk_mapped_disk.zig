@@ -372,7 +372,9 @@ pub const ChunkMappedDisk = struct {
         defer self.allocator.free(index_path);
         const index_dir = std.fs.path.dirname(index_path) orelse return error.IoFailed;
         try chunk_sealer.ensureDirPath(self.allocator, index_dir);
-        try chunk_sealer.writePathAllIfMissingTimed(self.allocator, index_path, index_json, &work_stats);
+        // Durable-index invariant: all object writes above have fsynced their
+        // data and parent directory; publish the index last via temp/fsync/rename.
+        try chunk_sealer.writeFileAtomicDurable(self.allocator, index_path, index_json, 0o444);
 
         const kind = try self.allocator.dupe(u8, spore.disk_kind_chunk_index);
         errdefer self.allocator.free(kind);

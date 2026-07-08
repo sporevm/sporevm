@@ -478,7 +478,7 @@ pub const Sealer = struct {
                 const existing = self.refs[index];
                 if (existing == null or !std.mem.eql(u8, existing.?, &hex)) {
                     const ref, const chunk_path = try self.allocChunkRefAndPath(&hex);
-                    try chunk_sealer.writeFileAllIfMissingTimed(chunk_path, data, work_stats);
+                    try chunk_sealer.writeFileAllIfMissingTimed(self.allocator, chunk_path, data, work_stats);
                     self.refs[index] = ref;
                     if (existing == null) _ = self.nonzero_chunks.fetchAdd(1, .monotonic);
                 }

@@ -6,6 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const chunk = @import("chunk.zig");
+const chunk_sealer = @import("chunk_sealer.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const disk_index = @import("disk_index.zig");
 const spore = @import("spore.zig");
@@ -263,7 +264,9 @@ fn preloadFd(
         const object_check_start_ms = monotonicMs();
         const object_exists = try objectEqualsDataZ(object_path, data, object_buf[0..data.len]);
         object_check_ms += monotonicMs() -| object_check_start_ms;
-        if (!object_exists) {
+        if (object_exists) {
+            try chunk_sealer.writeFileAllIfMissing(allocator, object_path, data);
+        } else {
             try missing_objects.append(allocator, .{
                 .logical_chunk = @intCast(i),
                 .id = id,
@@ -284,7 +287,8 @@ fn preloadFd(
         defer allocator.free(object_path);
         try removeStaleObject(io, object_path);
         const object_write_start_ms = monotonicMs();
-        try writeFileAtomic(io, allocator, object_path, data);
+        var durable_write_stats: chunk_sealer.WorkStats = .{};
+        try chunk_sealer.writePathAllIfMissingTimed(allocator, object_path, data, &durable_write_stats);
         object_write_ms += monotonicMs() -| object_write_start_ms;
         objects_written += 1;
         object_bytes_written += data.len;
@@ -310,6 +314,8 @@ fn preloadFd(
     const manifest_dir = std.fs.path.dirname(manifest_path) orelse return error.BadManifest;
     try ensureDirPath(io, manifest_dir);
     const index_write_start_ms = monotonicMs();
+    // Durable-index invariant: every referenced object write above fsynced the
+    // object and object directory; publish the index last via temp/fsync/rename.
     try writeFileAtomic(io, allocator, manifest_path, manifest_json);
     const index_write_ms = monotonicMs() -| index_write_start_ms;
     const rootfs_identity = try allocator.dupe(u8, source_identity orelse index_digest);
@@ -697,24 +703,8 @@ fn removeStaleObject(io: Io, path: []const u8) !void {
 }
 
 fn writeFileAtomic(io: Io, allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
-    var temp_nonce_bytes: [8]u8 = undefined;
-    io.random(&temp_nonce_bytes);
-    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ path, temp_nonce });
-    defer allocator.free(temp_path);
-    defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
-    const temp_z = try allocator.dupeZ(u8, temp_path);
-    defer allocator.free(temp_z);
-    const fd = std.c.open(temp_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(c_uint, 0o444));
-    if (fd < 0) return error.IoFailed;
-    defer _ = std.c.close(fd);
-    try writeAll(fd, data);
-    if (std.c.fchmod(fd, 0o444) != 0) return error.IoFailed;
-    if (!Io.Dir.path.isAbsolute(path)) {
-        try Io.Dir.rename(Io.Dir.cwd(), temp_path, Io.Dir.cwd(), path, io);
-    } else {
-        try Io.Dir.renameAbsolute(temp_path, path, io);
-    }
+    _ = io;
+    try chunk_sealer.writeFileAtomicDurable(allocator, path, data, 0o444);
 }
 
 fn ensureDirPath(io: Io, path: []const u8) !void {

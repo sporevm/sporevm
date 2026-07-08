@@ -51,9 +51,14 @@ pub fn sealBytes(data: []const u8, work_stats: *WorkStats) Error!SealResult {
     return .{ .data = id };
 }
 
-pub fn writeFileAllIfMissingTimed(path: [:0]const u8, data: []const u8, work_stats: *WorkStats) Error!void {
+pub fn writeFileAllIfMissingTimed(
+    allocator: std.mem.Allocator,
+    path: [:0]const u8,
+    data: []const u8,
+    work_stats: *WorkStats,
+) Error!void {
     const start = try monotonicNs();
-    try writeFileAllIfMissing(path, data);
+    try writeFileAllIfMissing(allocator, path, data);
     work_stats.chunk_write_ns +|= try elapsedMonotonicNs(start);
 }
 
@@ -65,7 +70,7 @@ pub fn writePathAllIfMissingTimed(
 ) Error!void {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    try writeFileAllIfMissingTimed(path_z, data, work_stats);
+    try writeFileAllIfMissingTimed(allocator, path_z, data, work_stats);
 }
 
 pub fn pwriteFileAllTimed(fd: std.c.fd_t, offset: usize, data: []const u8, work_stats: *WorkStats) Error!void {
@@ -74,16 +79,64 @@ pub fn pwriteFileAllTimed(fd: std.c.fd_t, offset: usize, data: []const u8, work_
     work_stats.backing_write_ns +|= try elapsedMonotonicNs(start);
 }
 
-pub fn writeFileAllIfMissing(path: [:0]const u8, data: []const u8) Error!void {
+/// Durable CAS object write: returns only after the object bytes and containing
+/// directory entry have been fsynced, so a later index can safely reference it.
+pub fn writeFileAllIfMissing(allocator: std.mem.Allocator, path: [:0]const u8, data: []const u8) Error!void {
     const fd = createNewFile(path, 0o644) catch |err| switch (err) {
         error.AlreadyExists => {
             try verifyExistingFile(path, data);
+            try fsyncParentDirPath(allocator, path);
             return;
         },
         else => |e| return e,
     };
     defer _ = std.c.close(fd);
     try writeAll(fd, data);
+    try fsyncFd(fd);
+    try fsyncParentDirPath(allocator, path);
+}
+
+/// Durable index publication: write a temp file, fsync it, rename into place,
+/// then fsync the containing directory. Existing matching files are verified
+/// and fsynced so old cache entries are upgraded to the same durability bar.
+pub fn writeFileAtomicDurable(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    data: []const u8,
+    mode: c_uint,
+) Error!void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    const existing_fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (existing_fd >= 0) {
+        _ = std.c.close(existing_fd);
+        try verifyExistingFile(path_z, data);
+        try fsyncParentDirPath(allocator, path);
+        return;
+    }
+    switch (std.c.errno(existing_fd)) {
+        .NOENT => {},
+        else => return error.IoFailed,
+    }
+
+    const parent = std.fs.path.dirname(path) orelse ".";
+    try ensureDirPath(allocator, parent);
+
+    const nonce = (try monotonicNs()) ^ @as(u64, @intCast(std.c.getpid()));
+    const temp_path = try std.fmt.allocPrintSentinel(allocator, "{s}.{x}.tmp", .{ path, nonce }, 0);
+    defer allocator.free(temp_path);
+    defer _ = std.c.unlink(temp_path.ptr);
+
+    const fd = std.c.open(temp_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, mode);
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+
+    try writeAll(fd, data);
+    if (std.c.fchmod(fd, @intCast(mode)) != 0) return error.IoFailed;
+    try fsyncFd(fd);
+    if (std.c.rename(temp_path.ptr, path_z.ptr) != 0) return error.IoFailed;
+    try fsyncParentDirPath(allocator, path);
 }
 
 pub fn createNewFile(path: [:0]const u8, mode: c_uint) Error!std.c.fd_t {
@@ -130,6 +183,10 @@ fn writeAll(fd: std.c.fd_t, data: []const u8) Error!void {
     }
 }
 
+fn fsyncFd(fd: std.c.fd_t) Error!void {
+    if (std.c.fsync(fd) != 0) return error.IoFailed;
+}
+
 fn verifyExistingFile(path: [:0]const u8, expected: []const u8) Error!void {
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.BadChunk;
@@ -149,6 +206,17 @@ fn verifyExistingFile(path: [:0]const u8, expected: []const u8) Error!void {
         if (!std.mem.eql(u8, buf[0..read_len], expected[done..][0..read_len])) return error.BadChunk;
         done += read_len;
     }
+    try fsyncFd(fd);
+}
+
+pub fn fsyncParentDirPath(allocator: std.mem.Allocator, path: []const u8) Error!void {
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const parent_z = try allocator.dupeZ(u8, parent);
+    defer allocator.free(parent_z);
+    const fd = std.c.open(parent_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    try fsyncFd(fd);
 }
 
 fn fstatRegularSize(fd: std.c.fd_t) Error!usize {
@@ -214,7 +282,19 @@ test "write-if-missing verifies existing data" {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
-    try writeFileAllIfMissing(path_z, "abc");
-    try writeFileAllIfMissing(path_z, "abc");
-    try std.testing.expectError(error.BadChunk, writeFileAllIfMissing(path_z, "def"));
+    try writeFileAllIfMissing(allocator, path_z, "abc");
+    try writeFileAllIfMissing(allocator, path_z, "abc");
+    try std.testing.expectError(error.BadChunk, writeFileAllIfMissing(allocator, path_z, "def"));
+}
+
+test "durable atomic publish verifies existing data" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/index.json", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
+
+    try writeFileAtomicDurable(allocator, path, "abc", 0o444);
+    try writeFileAtomicDurable(allocator, path, "abc", 0o444);
+    try std.testing.expectError(error.BadChunk, writeFileAtomicDurable(allocator, path, "def", 0o444));
 }
