@@ -803,6 +803,17 @@ pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, req
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
     const metadata_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
+    if (try cachedImportedRootfsBlake3(init, allocator, cache_root, resolved, rootfs_path, metadata_path, request.rootfs_storage)) |rootfs_blake3| {
+        const local_ref_path = try writeLocalRefCache(init.io, allocator, cache_root, request.ref, resolved);
+        return .{
+            .rootfs_path = rootfs_path,
+            .metadata_path = metadata_path,
+            .local_ref_path = local_ref_path,
+            .resolved_image_ref = resolved_image_ref,
+            .image_manifest_digest = source.manifest_digest,
+            .rootfs_blake3 = rootfs_blake3,
+        };
+    }
     const temp_rootfs_path = try std.fmt.allocPrint(allocator, "{s}/.{s}.{d}.{x}.ext4.tmp", .{ cache_root, cache_key, temp_id, temp_nonce });
     const temp_metadata_path = try std.fmt.allocPrint(allocator, "{s}/.{s}.{d}.{x}.json.tmp", .{ cache_root, cache_key, temp_id, temp_nonce });
     defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
@@ -848,11 +859,6 @@ pub fn importTar(init: std.process.Init, allocator: std.mem.Allocator, request: 
     const temp_dir_root = try std.fs.path.join(allocator, &.{ cache_root, "tmp" });
     try ensureDirPath(init.io, temp_dir_root);
 
-    const temp_id = Io.Clock.real.now(init.io).nanoseconds;
-    var temp_nonce_bytes: [8]u8 = undefined;
-    init.io.random(&temp_nonce_bytes);
-    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
-
     const input_digest = try sha256FileDigestAlloc(allocator, init.io, request.input);
     const resolved_image_ref = try localResolvedImageRef(allocator, request.ref, input_digest);
     const resolved = ResolvedImage{
@@ -863,6 +869,22 @@ pub fn importTar(init: std.process.Init, allocator: std.mem.Allocator, request: 
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
     const metadata_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
+    if (try cachedImportedRootfsBlake3(init, allocator, cache_root, resolved, rootfs_path, metadata_path, request.rootfs_storage)) |rootfs_blake3| {
+        const local_ref_path = try writeLocalRefCache(init.io, allocator, cache_root, request.ref, resolved);
+        return .{
+            .rootfs_path = rootfs_path,
+            .metadata_path = metadata_path,
+            .local_ref_path = local_ref_path,
+            .resolved_image_ref = resolved_image_ref,
+            .image_manifest_digest = input_digest,
+            .rootfs_blake3 = rootfs_blake3,
+        };
+    }
+
+    const temp_id = Io.Clock.real.now(init.io).nanoseconds;
+    var temp_nonce_bytes: [8]u8 = undefined;
+    init.io.random(&temp_nonce_bytes);
+    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
     const temp_rootfs_path = try std.fmt.allocPrint(allocator, "{s}/.{s}.{d}.{x}.ext4.tmp", .{ cache_root, cache_key, temp_id, temp_nonce });
     const temp_metadata_path = try std.fmt.allocPrint(allocator, "{s}/.{s}.{d}.{x}.json.tmp", .{ cache_root, cache_key, temp_id, temp_nonce });
     defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
@@ -1659,6 +1681,73 @@ pub fn cachedImageRootfsArtifact(
         .size = value.rootfs_size,
         .format = spore.rootfs_artifact_format_ext4,
     };
+}
+
+fn cachedImportedRootfsBlake3(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    resolved: ResolvedImage,
+    rootfs_path: []const u8,
+    metadata_path: []const u8,
+    storage_policy: RootfsStoragePolicy,
+) !?[chunk.ChunkId.hex_len]u8 {
+    if (!try cachedRootfsMetadataMatches(init.io, allocator, metadata_path, resolved)) return null;
+    const artifact = (try cachedImageRootfsArtifact(init.io, allocator, metadata_path, rootfs_path)) orelse return null;
+    defer allocator.free(artifact.digest);
+    if (!try readablePath(init.io, rootfs_path)) return null;
+
+    const rootfs_blake3 = rootfsArtifactDigestHexArray(artifact.digest) orelse return null;
+
+    if (!try ensureImportedRootfsDigestCacheEntry(init.io, allocator, cache_root, rootfs_path, artifact)) return null;
+
+    switch (storage_policy) {
+        .flat => {},
+        .chunked => {
+            var storage_arena_state = std.heap.ArenaAllocator.init(allocator);
+            defer storage_arena_state.deinit();
+            const storage_arena = storage_arena_state.allocator();
+            _ = try ensureImageRootfsStorage(init, storage_arena, cache_root, metadata_path, artifact, .{ .mmio_slot = 1 });
+        },
+    }
+
+    std.log.debug("spore rootfs: using cached imported rootfs {s} for {s}", .{ rootfs_path, resolved.ref });
+    return rootfs_blake3;
+}
+
+fn ensureImportedRootfsDigestCacheEntry(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    rootfs_path: []const u8,
+    artifact: spore.RootfsArtifactRef,
+) !bool {
+    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
+    const fd = rootfs_cache.openTrustedFromCache(io, allocator, cache_root, rootfs) catch |err| switch (err) {
+        error.RootFSDigestCacheMiss => {
+            const installed = try rootfs_cache.cacheByDigestPath(io, allocator, cache_root, rootfs_path);
+            defer allocator.free(installed.digest);
+            return rootfsArtifactRefMatches(installed, artifact);
+        },
+        else => |e| return e,
+    };
+    _ = std.c.close(fd);
+    return true;
+}
+
+fn rootfsArtifactRefMatches(a: spore.RootfsArtifactRef, b: spore.RootfsArtifactRef) bool {
+    return a.size == b.size and
+        std.mem.eql(u8, a.digest, b.digest) and
+        std.mem.eql(u8, a.format, b.format);
+}
+
+fn rootfsArtifactDigestHexArray(artifact_digest: []const u8) ?[chunk.ChunkId.hex_len]u8 {
+    const digest_hex = rootfsArtifactDigestSuffix(artifact_digest) orelse return null;
+    if (digest_hex.len != chunk.ChunkId.hex_len) return null;
+    _ = chunk.ChunkId.fromHex(digest_hex) catch return null;
+    var rootfs_blake3: [chunk.ChunkId.hex_len]u8 = undefined;
+    @memcpy(rootfs_blake3[0..], digest_hex);
+    return rootfs_blake3;
 }
 
 pub const ImageRefCacheHit = struct {
@@ -2681,6 +2770,193 @@ test "image rootfs artifact metadata rejects symlink rootfs path" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata_json });
 
     try std.testing.expect((try cachedImageRootfsArtifact(io, arena, metadata_path, rootfs_path)) == null);
+}
+
+test "imported rootfs flat cache hit reuses metadata without rootfs storage" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-import-cache-flat-hit";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+
+    const resolved = ResolvedImage{
+        .ref = "local/example@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ cache_root, cache_key });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "cached rootfs bytes" });
+
+    const rootfs_hash = try rootfs_cache.hashPath(io, arena, rootfs_path);
+    const artifact = spore.RootfsArtifactRef{ .digest = rootfs_hash.digest, .size = rootfs_hash.size };
+    const expected = rootfsArtifactDigestHexArray(artifact.digest).?;
+    const rootfs_hex = rootfsArtifactDigestSuffix(artifact.digest).?;
+    const metadata_json = try std.fmt.allocPrint(arena,
+        \\{{
+        \\  "builder_version": "{s}",
+        \\  "image_ref": "local/example:dev",
+        \\  "resolved_image_ref": "{s}",
+        \\  "image_manifest_digest": "{s}",
+        \\  "platform": {{"os": "{s}", "arch": "{s}"}},
+        \\  "rootfs_path": "{s}",
+        \\  "rootfs_size": {d},
+        \\  "rootfs_blake3": "{s}"
+        \\}}
+    , .{ builder_version, resolved.ref, resolved.manifest_digest, resolved.platform.os, resolved.platform.arch, rootfs_path, artifact.size, rootfs_hex });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata_json });
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const hit = (try cachedImportedRootfsBlake3(init, arena, cache_root, resolved, rootfs_path, metadata_path, .flat)).?;
+    try std.testing.expectEqualSlices(u8, expected[0..], hit[0..]);
+    const updated_metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, arena, .limited(max_rootfs_metadata_bytes));
+    try std.testing.expect(std.mem.indexOf(u8, updated_metadata, "\"rootfs_storage\"") == null);
+
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
+    try std.testing.expect(try rootfs_cache.regularFileNoSymlink(io, digest_path));
+}
+
+test "imported rootfs chunked cache hit upgrades flat metadata storage" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-import-cache-chunked-upgrade";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+
+    const resolved = ResolvedImage{
+        .ref = "local/example@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ cache_root, cache_key });
+    const rootfs_bytes = ("abcd" ** 1024) ++ ("efgh" ** 1024);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
+
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const expected = rootfsArtifactDigestHexArray(artifact.digest).?;
+    const rootfs_hex = rootfsArtifactDigestSuffix(artifact.digest).?;
+    const metadata_json = try std.fmt.allocPrint(arena,
+        \\{{
+        \\  "builder_version": "{s}",
+        \\  "image_ref": "local/example:dev",
+        \\  "resolved_image_ref": "{s}",
+        \\  "image_manifest_digest": "{s}",
+        \\  "platform": {{"os": "{s}", "arch": "{s}"}},
+        \\  "rootfs_path": "{s}",
+        \\  "rootfs_size": {d},
+        \\  "rootfs_blake3": "{s}"
+        \\}}
+    , .{ builder_version, resolved.ref, resolved.manifest_digest, resolved.platform.os, resolved.platform.arch, rootfs_path, artifact.size, rootfs_hex });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata_json });
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const hit = (try cachedImportedRootfsBlake3(init, arena, cache_root, resolved, rootfs_path, metadata_path, .chunked)).?;
+    try std.testing.expectEqualSlices(u8, expected[0..], hit[0..]);
+    const updated_metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, arena, .limited(max_rootfs_metadata_bytes));
+    try std.testing.expect(std.mem.indexOf(u8, updated_metadata, "\"rootfs_storage\"") != null);
+    const storage = (try readCachedRootfsStorage(io, arena, metadata_path, artifact)).?;
+    try std.testing.expect(try rootfs_cas.storageComplete(io, arena, cache_root, storage));
+}
+
+test "imported rootfs cache treats metadata identity mismatch as miss" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-import-cache-identity-miss";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+
+    const cached_resolved = ResolvedImage{
+        .ref = "local/example@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .manifest_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .platform = .{},
+    };
+    const requested_resolved = ResolvedImage{
+        .ref = "local/example@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        .manifest_digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, requested_resolved);
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ cache_root, cache_key });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "cached rootfs bytes" });
+
+    const rootfs_hash = try rootfs_cache.hashPath(io, arena, rootfs_path);
+    const artifact = spore.RootfsArtifactRef{ .digest = rootfs_hash.digest, .size = rootfs_hash.size };
+    const rootfs_hex = rootfsArtifactDigestSuffix(artifact.digest).?;
+    const metadata_json = try std.fmt.allocPrint(arena,
+        \\{{
+        \\  "builder_version": "{s}",
+        \\  "image_ref": "local/example:dev",
+        \\  "resolved_image_ref": "{s}",
+        \\  "image_manifest_digest": "{s}",
+        \\  "platform": {{"os": "{s}", "arch": "{s}"}},
+        \\  "rootfs_path": "{s}",
+        \\  "rootfs_size": {d},
+        \\  "rootfs_blake3": "{s}"
+        \\}}
+    , .{ builder_version, cached_resolved.ref, cached_resolved.manifest_digest, cached_resolved.platform.os, cached_resolved.platform.arch, rootfs_path, artifact.size, rootfs_hex });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata_json });
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    try std.testing.expect((try cachedImportedRootfsBlake3(init, arena, cache_root, requested_resolved, rootfs_path, metadata_path, .chunked)) == null);
+    const updated_metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, arena, .limited(max_rootfs_metadata_bytes));
+    try std.testing.expect(std.mem.indexOf(u8, updated_metadata, "\"rootfs_storage\"") == null);
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
+    try std.testing.expect(!try rootfs_cache.regularFileNoSymlink(io, digest_path));
 }
 
 test "image rootfs cache treats oversized metadata as a miss" {
