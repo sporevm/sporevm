@@ -536,6 +536,22 @@ const GroupLayout = struct {
     }
 };
 
+const BlockAllocator = struct {
+    used: *std.DynamicBitSetUnmanaged,
+    next: usize = 0,
+
+    fn alloc(self: *BlockAllocator) !u32 {
+        var i = self.next;
+        while (i < self.used.bit_length) : (i += 1) {
+            if (self.used.isSet(i)) continue;
+            self.used.set(i);
+            self.next = i + 1;
+            return @intCast(i);
+        }
+        return error.Ext4ImageTooSmall;
+    }
+};
+
 fn assignBlocks(
     allocator: std.mem.Allocator,
     planned: *PlannedImage,
@@ -580,27 +596,28 @@ fn assignBlocks(
         used.setRangeValue(.{ .start = first_block, .end = group.metadataEnd() }, true);
     }
 
+    var block_allocator = BlockAllocator{ .used = &used };
     for (planned.inodes.items) |*inode| {
         if (inode.kind == .directory) {
             const bytes = try directoryBytes(allocator, planned, inode.*);
             defer allocator.free(bytes);
             inode.size = bytes.len;
-            try allocatePayloadBlocks(allocator, inode, bytes, &used, blocks);
+            try allocatePayloadBlocks(allocator, inode, bytes, &block_allocator, blocks);
         } else if (inode.kind == .file) {
             if (inode.file_source) |source| {
-                try allocateSourcePayloadBlocks(allocator, inode, source, &used, data_blocks);
+                try allocateSourcePayloadBlocks(allocator, inode, source, &block_allocator, data_blocks);
             } else {
-                try allocatePayloadBlocks(allocator, inode, inode.data, &used, blocks);
+                try allocatePayloadBlocks(allocator, inode, inode.data, &block_allocator, blocks);
             }
         } else if (inode.kind == .symlink and inode.symlink_target.len >= fast_symlink_max_len) {
-            try allocatePayloadBlocks(allocator, inode, inode.symlink_target, &used, blocks);
+            try allocatePayloadBlocks(allocator, inode, inode.symlink_target, &block_allocator, blocks);
         }
         if (inode.xattrs.len != 0) {
-            inode.xattr_block = try allocateBlock(&used);
+            inode.xattr_block = try block_allocator.alloc();
             const xattr_block = try xattrBlock(allocator, inode.xattrs);
             try blocks.put(inode.xattr_block, xattr_block);
         }
-        try allocateIndirectBlocks(allocator, inode, &used, blocks);
+        try allocateIndirectBlocks(allocator, inode, &block_allocator, blocks);
     }
 
     var free_blocks: u32 = 0;
@@ -637,7 +654,7 @@ fn allocateSourcePayloadBlocks(
     allocator: std.mem.Allocator,
     inode: *InodePlan,
     source: tar.FileSource,
-    used: *std.DynamicBitSetUnmanaged,
+    block_allocator: *BlockAllocator,
     data_blocks: *DataBlockStore,
 ) !void {
     const size = source.size();
@@ -646,7 +663,7 @@ fn allocateSourcePayloadBlocks(
     inode.data_blocks = try allocator.alloc(u32, @intCast(count));
     var offset: u64 = 0;
     for (inode.data_blocks) |*block| {
-        block.* = try allocateBlock(used);
+        block.* = try block_allocator.alloc();
         const take: usize = @intCast(@min(size - offset, block_size));
         try data_blocks.put(block.*, .{
             .source = source,
@@ -661,7 +678,7 @@ fn allocatePayloadBlocks(
     allocator: std.mem.Allocator,
     inode: *InodePlan,
     payload: []const u8,
-    used: *std.DynamicBitSetUnmanaged,
+    block_allocator: *BlockAllocator,
     blocks: *BlockStore,
 ) !void {
     if (payload.len == 0) return;
@@ -669,7 +686,7 @@ fn allocatePayloadBlocks(
     inode.data_blocks = try allocator.alloc(u32, count);
     var offset: usize = 0;
     for (inode.data_blocks) |*block| {
-        block.* = try allocateBlock(used);
+        block.* = try block_allocator.alloc();
         const data_block = try zeroBlock(allocator);
         const take = @min(payload.len - offset, block_size);
         @memcpy(data_block[0..take], payload[offset .. offset + take]);
@@ -681,7 +698,7 @@ fn allocatePayloadBlocks(
 fn allocateIndirectBlocks(
     allocator: std.mem.Allocator,
     inode: *InodePlan,
-    used: *std.DynamicBitSetUnmanaged,
+    block_allocator: *BlockAllocator,
     blocks: *BlockStore,
 ) !void {
     if (inode.data_blocks.len <= max_direct_blocks) return;
@@ -693,7 +710,7 @@ fn allocateIndirectBlocks(
 
     var data_index: usize = max_direct_blocks;
     if (data_index < inode.data_blocks.len) {
-        inode.single_indirect_block = try allocateBlock(used);
+        inode.single_indirect_block = try block_allocator.alloc();
         try metadata_blocks.append(allocator, inode.single_indirect_block);
         const table = try zeroBlock(allocator);
         const table_count = @min(inode.data_blocks.len - data_index, pointers_per_block);
@@ -705,13 +722,13 @@ fn allocateIndirectBlocks(
     }
 
     if (data_index < inode.data_blocks.len) {
-        inode.double_indirect_block = try allocateBlock(used);
+        inode.double_indirect_block = try block_allocator.alloc();
         try metadata_blocks.append(allocator, inode.double_indirect_block);
         const root = try zeroBlock(allocator);
         var root_index: usize = 0;
         while (data_index < inode.data_blocks.len) : (root_index += 1) {
             if (root_index >= pointers_per_block) return error.UnsupportedExt4FileSize;
-            const leaf_block = try allocateBlock(used);
+            const leaf_block = try block_allocator.alloc();
             try metadata_blocks.append(allocator, leaf_block);
             put(u32, root, root_index * @sizeOf(u32), leaf_block);
             const leaf = try zeroBlock(allocator);
@@ -726,16 +743,6 @@ fn allocateIndirectBlocks(
     }
 
     inode.indirect_blocks = try metadata_blocks.toOwnedSlice(allocator);
-}
-
-fn allocateBlock(used: *std.DynamicBitSetUnmanaged) !u32 {
-    var i: usize = 0;
-    while (i < used.bit_length) : (i += 1) {
-        if (used.isSet(i)) continue;
-        used.set(i);
-        return @intCast(i);
-    }
-    return error.Ext4ImageTooSmall;
 }
 
 fn directoryBytes(allocator: std.mem.Allocator, planned: *const PlannedImage, inode: InodePlan) ![]u8 {
