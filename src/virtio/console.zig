@@ -58,12 +58,14 @@ pub const Console = struct {
         const q = &queues[tx_queue];
 
         var did_work = false;
-        while (true) {
+        var budget: queue.NotifyBudget = .{};
+        while (budget.hasRemaining()) {
             const maybe_chain = q.popAvail(ram) catch {
                 // Hostile ring state: stop processing, never crash.
                 return did_work;
             };
             const chain = maybe_chain orelse break;
+            budget.consume();
             for (chain.segments.slice()) |seg| {
                 if (!seg.writable) self.sink(seg.data);
             }

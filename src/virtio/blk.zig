@@ -163,9 +163,11 @@ pub const Blk = struct {
         const q = &queues[0];
 
         var did_work = false;
-        while (true) {
+        var budget: queue.NotifyBudget = .{};
+        while (budget.hasRemaining()) {
             const maybe_chain = q.popAvail(ram) catch return did_work;
             const chain = maybe_chain orelse break;
+            budget.consume();
             const written = self.handleRequest(&chain);
             chain.markWritableDirty(ram);
             q.pushUsed(ram, chain.head, written) catch return did_work;

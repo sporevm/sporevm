@@ -53,9 +53,11 @@ pub const Rng = struct {
         const q = &queues[request_queue];
 
         var did_work = false;
-        while (true) {
+        var budget: queue.NotifyBudget = .{};
+        while (budget.hasRemaining()) {
             const maybe_chain = q.popAvail(ram) catch return did_work;
             const chain = maybe_chain orelse break;
+            budget.consume();
             const written = self.handleChain(&chain);
             chain.markWritableDirty(ram);
             q.pushUsed(ram, chain.head, written) catch return did_work;
@@ -101,6 +103,13 @@ fn saturatingAddLen(total: *u32, len: usize) void {
 
 fn testFill(buf: []u8) void {
     @memset(buf, 0xA5);
+}
+
+var test_fill_calls: usize = 0;
+
+fn countedTestFill(buf: []u8) void {
+    test_fill_calls += 1;
+    testFill(buf);
 }
 
 fn makeChain(segs: []const queue.Segment) queue.Chain {
@@ -154,6 +163,44 @@ test "queue notification returns entropy buffer used" {
     try std.testing.expect(std.mem.allEqual(u8, buf[data_addr..][0..data_len], 0xA5));
     try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, 0x800 + 2));
     try std.testing.expectEqual(@as(u32, data_len), try ram.read(u32, 0x800 + 8));
+}
+
+test "queue notification caps hostile avail ring delta" {
+    test_fill_calls = 0;
+    var rng = Rng{ .fillFn = countedTestFill };
+    var t = mmio.Transport.init(rng.device());
+
+    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
+
+    _ = t.write(0x030, request_queue, ram);
+    _ = t.write(0x038, 8, ram);
+    _ = t.write(0x080, 0x000, ram);
+    _ = t.write(0x090, 0x400, ram);
+    _ = t.write(0x0a0, 0x800, ram);
+    _ = t.write(0x044, 1, ram);
+
+    const data_addr = 0xc00;
+    const data_len = 16;
+    const flag_write: u16 = 2;
+    try ram.write(u64, 0, data_addr);
+    try ram.write(u32, 8, data_len);
+    try ram.write(u16, 12, flag_write);
+
+    var slot: u16 = 0;
+    while (slot < 8) : (slot += 1) {
+        try ram.write(u16, 0x400 + 4 + 2 * @as(u64, slot), 0);
+    }
+    try ram.write(u16, 0x400 + 2, @as(u16, @intCast(queue.max_notify_chains + 1)));
+
+    try std.testing.expect(t.write(0x050, request_queue, ram));
+    try std.testing.expectEqual(queue.max_notify_chains, test_fill_calls);
+    try std.testing.expectEqual(@as(u16, @intCast(queue.max_notify_chains)), t.queues[request_queue].last_avail);
+
+    test_fill_calls = 0;
+    try std.testing.expect(t.write(0x050, request_queue, ram));
+    try std.testing.expectEqual(@as(usize, 1), test_fill_calls);
+    try std.testing.expectEqual(@as(u16, @intCast(queue.max_notify_chains + 1)), t.queues[request_queue].last_avail);
 }
 
 fn fuzzRngQueue(_: void, s: *std.testing.Smith) !void {
