@@ -2267,11 +2267,11 @@ fn takeSnapshotV1(
     sessions: []const spore.Session,
     environ_map: ?*const std.process.Environ.Map,
 ) !void {
+    try pauseHvfVcpusForSnapshot(vcpus, state, wake_set);
     if (vsock_dev.pending_len != 0) {
         std.log.err("cannot snapshot while virtio-vsock has pending packets", .{});
         return error.DeviceStatePending;
     }
-    try pauseHvfVcpusForSnapshot(vcpus, state, wake_set);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
