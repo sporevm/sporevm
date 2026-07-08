@@ -9,6 +9,9 @@ const std = @import("std");
 const guestmem = @import("../guestmem.zig");
 
 pub const max_queue_size = 256;
+/// Maximum descriptor chains a device notification may consume before
+/// returning to the VMM loop.
+pub const max_notify_chains = max_queue_size;
 /// Upper bound on descriptors in one chain. Bounds device-side buffering;
 /// raise deliberately if a future device needs more.
 pub const max_chain_len = 64;
@@ -94,6 +97,19 @@ pub const Chain = struct {
             if (!seg.writable) continue;
             ram.markDirty(seg.addr, @intCast(seg.data.len));
         }
+    }
+};
+
+pub const NotifyBudget = struct {
+    remaining: usize = max_notify_chains,
+
+    pub fn hasRemaining(self: *const NotifyBudget) bool {
+        return self.remaining != 0;
+    }
+
+    pub fn consume(self: *NotifyBudget) void {
+        std.debug.assert(self.remaining != 0);
+        self.remaining -= 1;
     }
 };
 
@@ -324,6 +340,15 @@ test "copy readable range spans readable descriptors and skips writable descript
     try std.testing.expect(chain.copyReadableRange(1, &out));
     try std.testing.expectEqualStrings("bcde", &out);
     try std.testing.expect(!chain.copyReadableRange(5, out[0..1]));
+}
+
+test "notify budget caps per-notification chain work" {
+    var budget = NotifyBudget{ .remaining = 2 };
+    try std.testing.expect(budget.hasRemaining());
+    budget.consume();
+    try std.testing.expect(budget.hasRemaining());
+    budget.consume();
+    try std.testing.expect(!budget.hasRemaining());
 }
 
 test "descriptor loop is bounded" {

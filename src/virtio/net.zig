@@ -124,7 +124,8 @@ pub const Net = struct {
     }
 
     pub fn flushPendingRx(self: *Net, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
-        return self.flushRx(&queues[rx_queue], ram);
+        var budget: queue.NotifyBudget = .{};
+        return self.flushRx(&queues[rx_queue], ram, &budget);
     }
 
     fn configRead(ctx: *anyopaque, offset: u64) u32 {
@@ -142,22 +143,23 @@ pub const Net = struct {
 
     fn notify(ctx: *anyopaque, queue_index: u8, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
         const self: *Net = @ptrCast(@alignCast(ctx));
+        var budget: queue.NotifyBudget = .{};
         return switch (queue_index) {
             tx_queue => blk: {
-                const did_tx = self.drainTx(&queues[tx_queue], ram);
-                break :blk self.flushRx(&queues[rx_queue], ram) or did_tx;
+                const did_tx = self.drainTx(&queues[tx_queue], ram, &budget);
+                break :blk self.flushRx(&queues[rx_queue], ram, &budget) or did_tx;
             },
-            rx_queue => self.flushRx(&queues[rx_queue], ram),
+            rx_queue => self.flushRx(&queues[rx_queue], ram, &budget),
             else => false,
         };
     }
 
-    fn drainTx(self: *Net, tx: *queue.VirtQueue, ram: guestmem.GuestRam) bool {
+    fn drainTx(self: *Net, tx: *queue.VirtQueue, ram: guestmem.GuestRam, budget: *queue.NotifyBudget) bool {
         var did_work = false;
-        var budget: usize = queue.max_queue_size;
-        while (budget > 0) : (budget -= 1) {
+        while (budget.hasRemaining()) {
             const maybe_chain = tx.popAvail(ram) catch return did_work;
             const chain = maybe_chain orelse break;
+            budget.consume();
             var frame_buf: [max_frame_len]u8 = undefined;
             if (txFrameFromChain(&chain, &frame_buf)) |frame| {
                 self.backend.transmit(frame);
@@ -170,10 +172,9 @@ pub const Net = struct {
         return did_work;
     }
 
-    fn flushRx(self: *Net, rx: *queue.VirtQueue, ram: guestmem.GuestRam) bool {
+    fn flushRx(self: *Net, rx: *queue.VirtQueue, ram: guestmem.GuestRam, budget: *queue.NotifyBudget) bool {
         var did_work = false;
-        var budget: usize = queue.max_queue_size;
-        while (budget > 0) : (budget -= 1) {
+        while (budget.hasRemaining()) {
             const frame = self.backend.peekRx() orelse break;
             if (frame.len == 0 or frame.len > max_frame_len) {
                 self.backend.consumeRx();
@@ -182,6 +183,7 @@ pub const Net = struct {
 
             const maybe_chain = rx.popAvail(ram) catch return did_work;
             const chain = maybe_chain orelse break;
+            budget.consume();
             const written = writeRxFrameToChain(&chain, frame) orelse 0;
             if (written > 0) {
                 chain.markWritableDirty(ram);

@@ -701,7 +701,8 @@ pub const Vsock = struct {
     }
 
     pub fn flushPendingRx(self: *Vsock, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
-        return self.flushRx(&queues[rx_queue], ram);
+        var budget: queue.NotifyBudget = .{};
+        return self.flushRx(&queues[rx_queue], ram, &budget);
     }
 
     fn enqueueHostConnectRequest(self: *Vsock, stream: *HostStream) !void {
@@ -741,21 +742,22 @@ pub const Vsock = struct {
 
     fn notify(ctx: *anyopaque, queue_index: u8, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
         const self: *Vsock = @ptrCast(@alignCast(ctx));
+        var budget: queue.NotifyBudget = .{};
         return switch (queue_index) {
-            tx_queue => self.processTx(queues, ram),
-            rx_queue => self.flushRx(&queues[rx_queue], ram),
+            tx_queue => self.processTx(queues, ram, &budget),
+            rx_queue => self.flushRx(&queues[rx_queue], ram, &budget),
             event_queue => false,
             else => false,
         };
     }
 
-    fn processTx(self: *Vsock, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
+    fn processTx(self: *Vsock, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam, budget: *queue.NotifyBudget) bool {
         const tx = &queues[tx_queue];
         var did_work = false;
-        var budget: usize = queue.max_queue_size;
-        while (budget > 0) : (budget -= 1) {
+        while (budget.hasRemaining()) {
             const maybe_chain = tx.popAvail(ram) catch return did_work;
             const chain = maybe_chain orelse break;
+            budget.consume();
             if (parsePacketFromChain(&chain)) |packet| {
                 self.handleGuestPacket(packet.header, packet.data[0..packet.data_len]);
             }
@@ -767,7 +769,7 @@ pub const Vsock = struct {
         if (self.host_stream) |stream| {
             _ = self.flushHostStreamOutboundFor(stream) catch stream.fail();
         }
-        return self.flushRx(&queues[rx_queue], ram) or did_work;
+        return self.flushRx(&queues[rx_queue], ram, budget) or did_work;
     }
 
     fn handleGuestPacket(self: *Vsock, h: Header, payload: []const u8) void {
@@ -895,11 +897,12 @@ pub const Vsock = struct {
         self.pending_len += 1;
     }
 
-    fn flushRx(self: *Vsock, rx: *queue.VirtQueue, ram: guestmem.GuestRam) bool {
+    fn flushRx(self: *Vsock, rx: *queue.VirtQueue, ram: guestmem.GuestRam, budget: *queue.NotifyBudget) bool {
         var did_work = false;
-        while (self.pending_len > 0) {
+        while (self.pending_len > 0 and budget.hasRemaining()) {
             const maybe_chain = rx.popAvail(ram) catch return did_work;
             const chain = maybe_chain orelse break;
+            budget.consume();
             const packet = &self.pending[0];
             const capacity = chainWritableCapacity(&chain);
             // Stream data (op_rw) carries no per-packet boundaries, so a
