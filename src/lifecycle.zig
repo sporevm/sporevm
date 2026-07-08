@@ -39,6 +39,9 @@ const pid_file = "pid";
 const control_socket_file = "control.sock";
 const console_log_file = "console.log";
 const monitor_log_file = "monitor.log";
+const monitor_shutdown_grace_ms = 1_000;
+const monitor_shutdown_term_ms = 1_000;
+const monitor_shutdown_kill_ms = 1_000;
 const private_dir_permissions: Io.File.Permissions = if (builtin.os.tag == .windows)
     .default_dir
 else
@@ -1201,8 +1204,9 @@ fn saveStopNamed(
 
     var cleanup_after_suspend = true;
     defer if (cleanup_after_suspend) {
-        waitForPidExit(ready.value.pid, 5_000);
-        Io.Dir.cwd().deleteTree(context.io, paths.vm_dir) catch {};
+        if (finishAcceptedMonitorStop(context.io, paths, ready.value.pid)) {
+            Io.Dir.cwd().deleteTree(context.io, paths.vm_dir) catch {};
+        } else |_| {}
     };
     var suspend_spec = spec.value;
     if (!spore.annotationsEmpty(options.annotations)) {
@@ -1219,7 +1223,7 @@ fn saveStopNamed(
         break :blk manifest.value.sessions.len;
     };
     cleanup_after_suspend = false;
-    waitForPidExit(ready.value.pid, 5_000);
+    try finishAcceptedMonitorStop(context.io, paths, ready.value.pid);
     try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
     return ownedNamedLifecycleResult(allocator, .{
         .action = "saved_stopped",
@@ -1320,8 +1324,7 @@ pub fn removeNamed(
             var ready = try readReady(arena, context.io, paths);
             defer ready.deinit();
             removed_pid = ready.value.pid;
-            _ = sendShutdownRequest(arena, context.io, ready.value.control_socket_path) catch {};
-            waitForPidExit(ready.value.pid, 5_000);
+            try stopReadyMonitor(arena, context.io, paths, ready.value);
             try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
         },
         .incomplete, .stale => {
@@ -1745,6 +1748,11 @@ pub fn rmCli(
             const message = allocLifecycleMessage(allocator, "spore rm: VM not found: {s}", .{name});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "rm"), message);
         },
+        error.MonitorShutdownTimedOut => {
+            const fallback = allocLifecycleMessage(allocator, "spore rm: timed out waiting for monitor cleanup: {s}", .{name});
+            const message = allocLifecycleLastErrorMessage(allocator, "rm", fallback);
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "rm"), message);
+        },
         else => |e| return e,
     };
     defer deinitNamedLifecycleResult(allocator, result);
@@ -1806,9 +1814,10 @@ pub fn saveCli(
             const message = "spore save: disk-backed lifecycle save requires recorded immutable rootfs identity";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "save"), message);
         },
-        error.MonitorUnavailable, error.MonitorRequestFailed, error.MonitorVersionMismatch => {
+        error.MonitorUnavailable, error.MonitorRequestFailed, error.MonitorVersionMismatch, error.MonitorShutdownTimedOut => {
             const fallback = switch (err) {
                 error.MonitorUnavailable => allocLifecycleMessage(allocator, "spore save: monitor is unavailable for VM: {s}", .{parsed.name}),
+                error.MonitorShutdownTimedOut => allocLifecycleMessage(allocator, "spore save: timed out waiting for monitor cleanup: {s}", .{parsed.name}),
                 else => allocLifecycleMessage(allocator, "spore save: monitor request failed for VM {s}: {s}", .{ parsed.name, @errorName(err) }),
             };
             const message = allocLifecycleLastErrorMessage(allocator, "save", fallback);
@@ -3395,8 +3404,10 @@ fn cleanupStartedChildren(init: std.process.Init, allocator: std.mem.Allocator, 
             Io.Dir.cwd().deleteTree(init.io, paths.vm_dir) catch {};
             continue;
         };
-        _ = sendShutdownRequest(allocator, init.io, ready.value.control_socket_path) catch {};
-        waitForPidExit(ready.value.pid, 5_000);
+        stopReadyMonitor(allocator, init.io, paths, ready.value) catch {
+            ready.deinit();
+            continue;
+        };
         ready.deinit();
         Io.Dir.cwd().deleteTree(init.io, paths.vm_dir) catch {};
     }
@@ -4864,12 +4875,88 @@ fn writeRawStderr(bytes: []const u8) !void {
     }
 }
 
-fn waitForPidExit(pid: i64, timeout_ms: u64) void {
+const MonitorStopResult = enum {
+    stopped,
+    timed_out,
+};
+
+fn stopReadyMonitor(allocator: std.mem.Allocator, io: Io, paths: Paths, ready: Ready) !void {
+    const shutdown_requested = if (sendShutdownRequest(allocator, io, ready.control_socket_path)) |_| true else |_| false;
+    if (shutdown_requested) return finishAcceptedMonitorStop(io, paths, ready.pid);
+    return finishMonitorPidExit(paths, ready.pid);
+}
+
+fn finishAcceptedMonitorStop(io: Io, paths: Paths, pid: i64) !void {
+    if (waitForAcceptedMonitorStop(io, paths, pid, monitor_shutdown_grace_ms, pidAlive) == .stopped) return;
+
+    signalMonitorProcessGroup(pid, .TERM);
+    if (waitForAcceptedMonitorStop(io, paths, pid, monitor_shutdown_term_ms, pidAlive) == .stopped) return;
+
+    signalMonitorProcessGroup(pid, .KILL);
+    if (waitForAcceptedMonitorStop(io, paths, pid, monitor_shutdown_kill_ms, pidAlive) == .stopped) return;
+
+    setMonitorShutdownError(paths, pid);
+    return error.MonitorShutdownTimedOut;
+}
+
+fn finishMonitorPidExit(paths: Paths, pid: i64) !void {
+    if (waitForPidExit(pid, monitor_shutdown_grace_ms, pidAlive) == .stopped) return;
+
+    signalMonitorProcessGroup(pid, .TERM);
+    if (waitForPidExit(pid, monitor_shutdown_term_ms, pidAlive) == .stopped) return;
+
+    signalMonitorProcessGroup(pid, .KILL);
+    if (waitForPidExit(pid, monitor_shutdown_kill_ms, pidAlive) == .stopped) return;
+
+    setMonitorShutdownError(paths, pid);
+    return error.MonitorShutdownTimedOut;
+}
+
+fn setMonitorShutdownError(paths: Paths, pid: i64) void {
+    setLastError(
+        "timed out waiting for named VM monitor shutdown: name={s} pid={d} monitor_log={s} control_socket={s}",
+        .{ std.fs.path.basename(paths.vm_dir), pid, paths.monitor_log_path, paths.control_socket_path },
+    );
+}
+
+fn waitForAcceptedMonitorStop(io: Io, paths: Paths, pid: i64, timeout_ms: u64, pid_alive: PidAliveFn) MonitorStopResult {
     const start = monotonicMs();
     while (monotonicMs() - start < timeout_ms) {
-        if (!pidAlive(pid)) return;
+        if (!pid_alive(pid)) return .stopped;
+        if (!controlSocketExists(io, paths.control_socket_path)) return .stopped;
         sleepMs(20);
     }
+    if (!pid_alive(pid)) return .stopped;
+    if (!controlSocketExists(io, paths.control_socket_path)) return .stopped;
+    return .timed_out;
+}
+
+fn waitForPidExit(pid: i64, timeout_ms: u64, pid_alive: PidAliveFn) MonitorStopResult {
+    const start = monotonicMs();
+    while (monotonicMs() - start < timeout_ms) {
+        if (!pid_alive(pid)) return .stopped;
+        sleepMs(20);
+    }
+    if (!pid_alive(pid)) return .stopped;
+    return .timed_out;
+}
+
+fn controlSocketExists(io: Io, path: []const u8) bool {
+    _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return true,
+    };
+    return true;
+}
+
+fn signalMonitorProcessGroup(pid: i64, signal: std.posix.SIG) void {
+    if (pid <= 0) return;
+    if (comptime builtin.os.tag == .windows) return;
+
+    const target: std.posix.pid_t = @intCast(pid);
+    std.posix.kill(-target, signal) catch {
+        std.posix.kill(target, signal) catch {};
+    };
 }
 
 fn sleepMs(ms: u64) void {
@@ -5445,6 +5532,36 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
 
     try writePid(allocator, io, paths, 1234);
     try std.testing.expectEqual(@as(i64, 1234), try readPid(allocator, io, paths));
+}
+
+test "lifecycle monitor stop distinguishes accepted socket close from pid exit" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-lifecycle-monitor-stop"});
+    defer allocator.free(root);
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const paths = try pathsFromRoot(allocator, root, "bench-1");
+    defer paths.deinit(allocator);
+
+    try ensureVmDir(io, paths);
+    const start = monotonicMs();
+    try std.testing.expectEqual(
+        MonitorStopResult.stopped,
+        waitForAcceptedMonitorStop(io, paths, 1234, 5_000, alwaysAlive),
+    );
+    try std.testing.expect(monotonicMs() -| start < 100);
+    try std.testing.expectEqual(
+        MonitorStopResult.timed_out,
+        waitForPidExit(1234, 15, alwaysAlive),
+    );
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.control_socket_path, .data = "" });
+    try std.testing.expectEqual(
+        MonitorStopResult.timed_out,
+        waitForAcceptedMonitorStop(io, paths, 1234, 15, alwaysAlive),
+    );
 }
 
 test "create parser accepts memory policy" {
