@@ -1640,6 +1640,6 @@ const inspect_spore_manifest_json =
     \\    }],
     \\    "requirements": {"tcp_ipv4":true,"exact_host_port":false,"bound_services":true}
     \\  },
-    \\  "memory": {"chunk_size":2097152,"chunks":[null],"backing":null}
+    \\  "memory": {"kind":"spore-disk-index-v1","logical_size":1,"chunk_size":2097152,"hash_algorithm":"blake3","object_namespace":"memory/blake3","chunks":[],"zero_chunks":[0],"backing":null}
     \\}
 ;

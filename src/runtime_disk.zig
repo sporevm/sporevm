@@ -184,7 +184,7 @@ fn materializeDiskIndexToTemp(context: Context, allocator: std.mem.Allocator, sp
         else => |e| return e,
     };
     defer allocator.free(index_bytes);
-    const parsed = try disk_index.parseDiskIndex(allocator, index_bytes, storage);
+    const parsed = try disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
     defer parsed.deinit();
 
     for (parsed.value.chunks) |entry| {

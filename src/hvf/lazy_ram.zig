@@ -38,13 +38,13 @@ pub const Pager = struct {
 
     pub fn start(allocator: std.mem.Allocator, options: Options) !Pager {
         try validateMapping(options.ram);
-        _ = try spore.validateMemoryForRam(options.manifest, options.ram.len);
+        const plan = try spore.validateMemoryForRam(options.manifest, options.ram.len);
 
-        const mapped = try allocator.alloc(bool, options.manifest.chunks.len);
+        const mapped = try allocator.alloc(bool, plan.chunk_count);
         errdefer allocator.free(mapped);
         @memset(mapped, false);
 
-        std.log.info("hvf lazy RAM pager armed: bytes={d} chunks={d}", .{ options.ram.len, options.manifest.chunks.len });
+        std.log.info("hvf lazy RAM pager armed: bytes={d} chunks={d}", .{ options.ram.len, plan.chunk_count });
         return .{
             .allocator = allocator,
             .dir = options.dir,
@@ -130,7 +130,7 @@ pub const Pager = struct {
         if (len == 0 or len % std.heap.page_size_min != 0) return error.BadManifest;
 
         const chunk = self.ram[range.start..range.end];
-        if (self.manifest.chunks[index] == null) {
+        if (spore.memoryChunkDigestForIndex(self.manifest, index) == null) {
             @memset(chunk, 0);
         } else {
             try spore.loadMemoryChunk(self.allocator, self.dir, self.manifest, self.ram.len, index, chunk);
@@ -182,7 +182,7 @@ fn writeTrace(pager: *const Pager, index: usize, range: spore.MemoryChunkRange, 
     const fd = pager.trace_fd orelse return;
     const now = monotonicMs();
     const fault_ms = if (now >= pager.start_ms) now - pager.start_ms else 0;
-    const nonzero: u1 = if (pager.manifest.chunks[index] == null) 0 else 1;
+    const nonzero: u1 = if (spore.memoryChunkDigestForIndex(pager.manifest, index) == null) 0 else 1;
     var buf: [192]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "fault_ms={d} chunk_index={d} guest_offset={d} len={d} nonzero={d}\n", .{
         fault_ms,
@@ -201,14 +201,18 @@ fn monotonicMs() u64 {
 }
 
 test "ram fault detection uses guest RAM window" {
-    var refs = [_]?[]const u8{null} ** 2;
+    const zero_chunks = [_]u64{ 0, 1 };
     var ram: [spore.chunk_size * 2]u8 align(std.heap.page_size_min) = undefined;
     @memset(&ram, 0);
     var mapped = [_]bool{false} ** 2;
     const pager = Pager{
         .allocator = std.testing.allocator,
         .dir = ".",
-        .manifest = .{ .chunk_size = spore.chunk_size, .chunks = &refs },
+        .manifest = .{
+            .logical_size = ram.len,
+            .chunk_size = spore.chunk_size,
+            .zero_chunks = &zero_chunks,
+        },
         .ram = ram[0..],
         .mapped = &mapped,
         .trace_fd = null,
@@ -221,14 +225,18 @@ test "ram fault detection uses guest RAM window" {
 }
 
 test "guest range maps to chunk indexes" {
-    var refs = [_]?[]const u8{null} ** 3;
+    const zero_chunks = [_]u64{ 0, 1, 2 };
     var ram: [spore.chunk_size * 3]u8 align(std.heap.page_size_min) = undefined;
     @memset(&ram, 0);
     var mapped = [_]bool{false} ** 3;
     var pager = Pager{
         .allocator = std.testing.allocator,
         .dir = ".",
-        .manifest = .{ .chunk_size = spore.chunk_size, .chunks = &refs },
+        .manifest = .{
+            .logical_size = ram.len,
+            .chunk_size = spore.chunk_size,
+            .zero_chunks = &zero_chunks,
+        },
         .ram = ram[0..],
         .mapped = &mapped,
         .trace_fd = null,

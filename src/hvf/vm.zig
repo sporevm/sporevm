@@ -2694,14 +2694,13 @@ test "gic target routes redistributor frame to matching hvf vcpu" {
 }
 
 test "vsock rx flush materializes lazy transport queues before delivery" {
-    var refs = [_]?[]const u8{null};
     var ram_bytes: [spore.chunk_size]u8 align(std.heap.page_size_min) = undefined;
     @memset(&ram_bytes, 0);
     var mapped = [_]bool{false};
     var pager = lazy_ram.Pager{
         .allocator = std.testing.allocator,
         .dir = ".",
-        .manifest = .{ .chunk_size = spore.chunk_size, .chunks = &refs },
+        .manifest = .{ .logical_size = ram_bytes.len, .chunk_size = spore.chunk_size, .zero_chunks = &.{0} },
         .ram = ram_bytes[0..],
         .mapped = &mapped,
         .trace_fd = null,

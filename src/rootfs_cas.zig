@@ -350,7 +350,7 @@ pub fn storageComplete(
         else => |e| return e,
     };
     defer allocator.free(bytes);
-    var parsed = disk_index.parseDiskIndex(allocator, bytes, storage) catch |err| switch (err) {
+    var parsed = parseStorageDiskIndex(allocator, bytes, storage) catch |err| switch (err) {
         error.BadManifest => return false,
         else => |e| return e,
     };
@@ -377,7 +377,7 @@ pub fn readVerifiedStorageIndexPath(
 ) ![]u8 {
     const bytes = try readFileAll(allocator, path, disk_index.max_index_bytes);
     errdefer allocator.free(bytes);
-    var parsed = try disk_index.parseDiskIndex(allocator, bytes, storage);
+    var parsed = try parseStorageDiskIndex(allocator, bytes, storage);
     parsed.deinit();
     return bytes;
 }
@@ -408,7 +408,7 @@ pub fn installStorageIndexPath(
         allocator.free(existing);
         return .{ .cache_hit = true, .bytes_fetched = 0 };
     }
-    var parsed = try disk_index.parseDiskIndex(allocator, data, storage);
+    var parsed = try parseStorageDiskIndex(allocator, data, storage);
     parsed.deinit();
     try writeFileAtomic(io, allocator, cache_path, data);
     const installed = try readVerifiedStorageIndexPath(allocator, cache_path, storage);
@@ -486,7 +486,7 @@ fn loadManifestIndex(
 ) !LoadedIndex {
     const bytes = try readFileAll(allocator, path, max_index_bytes);
     defer allocator.free(bytes);
-    var parsed = try disk_index.parseDiskIndex(allocator, bytes, storage);
+    var parsed = try parseStorageDiskIndex(allocator, bytes, storage);
     errdefer parsed.deinit();
     const expected_chunks = try chunkCount(storage.logical_size, storage.chunk_size);
     if (expected_chunks > std.math.maxInt(usize)) return error.BadManifest;
@@ -505,6 +505,14 @@ fn loadManifestIndex(
         .chunk_size = storage.chunk_size,
         .index_bytes = bytes.len,
     };
+}
+
+fn parseStorageDiskIndex(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    storage: spore.RootfsStorage,
+) !std.json.Parsed(disk_index.DiskIndex) {
+    return disk_index.parseDiskIndex(allocator, bytes, try spore.diskIndexDescriptorForStorage(storage));
 }
 
 fn rootfsDigestHex(digest: []const u8) ![]const u8 {

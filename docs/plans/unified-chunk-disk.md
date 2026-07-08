@@ -472,6 +472,8 @@ maintained value.
 
 ### U5 — Memory index parity (format break, batched with U3/U4's)
 
+Status: complete in branch.
+
 Converge `MemoryManifest` onto the unified index type: the dense
 optional-ref array becomes a `spore-disk-index-v1`-shaped value (sparse
 extents + zero list, `chunk_size` field already exists) parsed by the one

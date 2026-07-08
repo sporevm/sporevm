@@ -341,9 +341,32 @@ pub const Sealer = struct {
         }
         self.finished = true;
 
+        var chunks = std.array_list.Managed(spore.MemoryChunk).init(self.allocator);
+        errdefer chunks.deinit();
+        var zero_chunks = std.array_list.Managed(u64).init(self.allocator);
+        errdefer zero_chunks.deinit();
+
+        for (self.refs, 0..) |maybe_ref, i| {
+            if (maybe_ref) |ref| {
+                chunks.append(.{
+                    .logical_chunk = @intCast(i),
+                    .digest = try spore.memoryDigestFromHex(self.allocator, ref),
+                }) catch return error.OutOfMemory;
+            } else {
+                zero_chunks.append(@intCast(i)) catch return error.OutOfMemory;
+            }
+        }
+
+        const chunk_slice = chunks.toOwnedSlice() catch return error.OutOfMemory;
+        errdefer self.allocator.free(chunk_slice);
+        const zero_slice = zero_chunks.toOwnedSlice() catch return error.OutOfMemory;
+        errdefer self.allocator.free(zero_slice);
+
         return .{
+            .logical_size = @intCast(self.ram.len),
             .chunk_size = spore.chunk_size,
-            .chunks = self.refs,
+            .chunks = chunk_slice,
+            .zero_chunks = zero_slice,
             .backing = .{ .path = spore.ram_backing_path, .size = self.ram.len },
         };
     }
@@ -736,7 +759,7 @@ test "dirty RAM sealer seeds zero-elided chunks and finalizes backing" {
     const backing = try readFileAllForTest(arena, backing_path, ram.len);
     try std.testing.expectEqualSlices(u8, ram, backing);
 
-    const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, manifest.chunks[0].? });
+    const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, try spore.memoryChunkDigestHex(manifest.chunks[0].digest) });
     try std.testing.expectEqual(@as(c_int, 0), std.c.access(chunk_path, 0));
 }
 

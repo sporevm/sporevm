@@ -206,20 +206,25 @@ under `rootfs.cache`.
   and the currently attached client are never part of the spore. Producers must
   write at most 16 handles; ids are 1-63 ASCII alphanumeric, dash, underscore,
   or dot characters.
-- `memory`: `chunk_size` plus one entry per chunk — a blake3-hex chunk
-  reference, or null for an all-zero chunk. `backing` is optional local
+- `memory`: sparse memory index using the same shape as disk indexes:
+  `kind: "spore-disk-index-v1"`, `logical_size`, `chunk_size`,
+  `hash_algorithm: "blake3"`, `object_namespace: "memory/blake3"`,
+  sorted nonzero `chunks` entries (`logical_chunk`, `digest`) and sorted
+  `zero_chunks`. RAM keeps the 2MiB memory chunk size; disk indexes may use
+  smaller chunk sizes. Memory chunk digests are `blake3:<hex>` references to
+  portable `chunks/<hex>` files, and validation requires every logical chunk to
+  be covered exactly once by either list. `backing` is optional local
   acceleration metadata for same-host KVM/HVF fork/fan-out: `kind:
-  "map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks
-  remain the portable verified source of truth; unsupported backends and
-  imported/cold spores materialize from chunks instead. Product restore paths
-  (`spore attach` and `spore run --from`) may automatically map `ram.backing`
-  when the manifest vCPU count is supported and the local `ram.backing.proof`
-  validates against the manifest memory fingerprint, backing metadata, opened
-  file identity, and host-local runtime key. A missing, corrupt, foreign-key,
-  mismatched proof, or unsupported topology falls back to chunks.
-  The proof is local provenance metadata; it is not a portable trust root and
-  does not prove every RAM byte still matches the manifest's chunk refs. KVM and
-  HVF map a validated fd
+  "map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks remain the
+  portable verified source of truth; unsupported backends and imported/cold
+  spores materialize from chunks instead. Product restore paths (`spore attach`
+  and `spore run --from`) may automatically map `ram.backing` when the manifest
+  vCPU count is supported and the local `ram.backing.proof` validates against
+  the canonical memory index identity, backing metadata, opened file identity,
+  and host-local runtime key. A missing, corrupt, foreign-key, mismatched proof,
+  or unsupported topology falls back to chunks. The proof is local provenance
+  metadata; it is not a portable trust root and does not prove every RAM byte
+  still matches the manifest's chunk refs. KVM and HVF map a validated fd
   `MAP_PRIVATE` to share clean parent pages across fork children while child
   writes fault into private CoW pages.
 - `rootfs`: optional immutable rootfs artifact required by a captured

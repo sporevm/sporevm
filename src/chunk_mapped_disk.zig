@@ -523,7 +523,7 @@ test "snapshot writes disk index and chunk objects" {
         .base_identity = manifest_disk.base,
         .object_namespace = manifest_disk.object_namespace,
     };
-    const parsed = try disk_index.parseDiskIndex(allocator, index_bytes, storage);
+    const parsed = try disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.chunks.len);
     try std.testing.expectEqual(@as(u64, 1), parsed.value.chunks[0].logical_chunk);

@@ -636,13 +636,12 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
     var entry_count: usize = 0;
     var payload_bytes: u64 = 0;
 
-    var i: usize = 0;
-    while (i < plan.chunk_count) : (i += 1) {
-        const ref = memory.chunks[i] orelse continue;
+    for (memory.chunks) |memory_chunk| {
+        const ref = try spore.memoryChunkDigestHex(memory_chunk.digest);
         if (seen.contains(ref)) continue;
         seen.put(ref, {}) catch return error.OutOfMemory;
 
-        const range = chunkRange(plan, @intCast(ram_size), i) catch return error.BadManifest;
+        const range = chunkRange(plan, @intCast(ram_size), @intCast(memory_chunk.logical_chunk)) catch return error.BadManifest;
         const expected_size = range.end - range.start;
         const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ options.spore_dir, ref });
         const data = try readFileAll(allocator, chunk_path, expected_size);
@@ -1357,13 +1356,12 @@ fn materializeChunks(
     defer seen.deinit();
     var result = MaterializeResult{ .chunk_count = plan.chunk_count };
 
-    var i: usize = 0;
-    while (i < plan.chunk_count) : (i += 1) {
-        const ref = memory.chunks[i] orelse continue;
+    for (memory.chunks) |memory_chunk| {
+        const ref = try spore.memoryChunkDigestHex(memory_chunk.digest);
         if (seen.contains(ref)) continue;
         seen.put(ref, {}) catch return error.OutOfMemory;
         const entry = by_id.get(ref) orelse return error.BadManifest;
-        const range = chunkRange(plan, @intCast(ram_size), i) catch return error.BadManifest;
+        const range = chunkRange(plan, @intCast(ram_size), @intCast(memory_chunk.logical_chunk)) catch return error.BadManifest;
         const expected_size = range.end - range.start;
         const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ out_dir, ref });
         if (chunk_cache_dir) |cache_dir| {
@@ -1516,14 +1514,13 @@ fn packManifestChunks(
     payload_bytes: *u64,
 ) Error!spore.MemoryPlan {
     const plan = try spore.validateMemoryForRam(memory, @intCast(ram_size));
-    var i: usize = 0;
-    while (i < plan.chunk_count) : (i += 1) {
-        const ref = memory.chunks[i] orelse continue;
+    for (memory.chunks) |memory_chunk| {
+        const ref = try spore.memoryChunkDigestHex(memory_chunk.digest);
         if (seen.contains(ref)) continue;
         const ref_copy = allocator.dupe(u8, ref) catch return error.OutOfMemory;
         seen.put(ref_copy, {}) catch return error.OutOfMemory;
 
-        const range = chunkRange(plan, @intCast(ram_size), i) catch return error.BadManifest;
+        const range = chunkRange(plan, @intCast(ram_size), @intCast(memory_chunk.logical_chunk)) catch return error.BadManifest;
         const expected_size = range.end - range.start;
         const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ source_dir, ref });
         const data = try readFileAll(allocator, chunk_path, expected_size);
@@ -1634,7 +1631,7 @@ fn packRootfsStorageIndexed(
     const source_index_path = rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
     const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
     defer allocator.free(index_bytes);
-    const parsed_index = disk_index.parseDiskIndex(allocator, index_bytes, storage) catch |err| return rootfsError(err);
+    const parsed_index = try parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
     defer parsed_index.deinit();
 
     const index_rel_path = try rootfsStorageIndexRelPath(allocator, storage.index_digest);
@@ -1807,7 +1804,7 @@ fn unpackRootfsStorageIndexed(
     const source_index_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, entry.index_path });
     const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
     defer allocator.free(index_bytes);
-    const parsed_index = disk_index.parseDiskIndex(allocator, index_bytes, storage) catch |err| return rootfsError(err);
+    const parsed_index = try parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
     defer parsed_index.deinit();
 
     const cache_index_path = rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
@@ -1923,7 +1920,7 @@ fn loadDiskIndexForEntry(
     const bytes = try readFileAllNoSymlink(allocator, path, disk_index.max_index_bytes);
     defer allocator.free(bytes);
     if (entry.index_bytes != @as(u64, @intCast(bytes.len))) return error.BadManifest;
-    const parsed = disk_index.parseDiskIndex(allocator, bytes, storage) catch |err| return rootfsError(err);
+    const parsed = try parseRootfsDiskIndexForStorage(allocator, bytes, storage);
     errdefer parsed.deinit();
     try validateRootfsStoragePayloadStats(entry, storage, parsed.value);
     return parsed;
@@ -1956,7 +1953,7 @@ fn packDiskIndexForManifest(
     const source_index_path = rootfs_cas.manifestIndexPath(allocator, source_dir, storage.index_digest) catch |err| return rootfsError(err);
     const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
     defer allocator.free(index_bytes);
-    const parsed_index = disk_index.parseDiskIndex(allocator, index_bytes, storage) catch |err| return rootfsError(err);
+    const parsed_index = try parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
     defer parsed_index.deinit();
 
     const index_rel_path = try rootfsStorageIndexRelPath(allocator, storage.index_digest);
@@ -1990,7 +1987,7 @@ fn unpackDiskIndexForManifest(
     const source_index_path = try pathZ(allocator, "{s}/{s}", .{ bundle_dir, index_rel_path });
     const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
     defer allocator.free(index_bytes);
-    const parsed_index = disk_index.parseDiskIndex(allocator, index_bytes, storage) catch |err| return rootfsError(err);
+    const parsed_index = try parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
     defer parsed_index.deinit();
 
     const dest_index_path = rootfs_cas.manifestIndexPath(allocator, out_dir, storage.index_digest) catch |err| return rootfsError(err);
@@ -2075,7 +2072,7 @@ fn loadDiskIndexForDisk(
     const disk_index_path = try pathZ(allocator, "{s}/{s}", .{ bundle_dir, index_rel });
     const index_bytes = try readFileAllNoSymlink(allocator, disk_index_path, disk_index.max_index_bytes);
     defer allocator.free(index_bytes);
-    return disk_index.parseDiskIndex(allocator, index_bytes, storage) catch |err| return rootfsError(err);
+    return parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
 }
 
 fn childManifestRelPath(allocator: std.mem.Allocator, child_id: []const u8) Error![]const u8 {
@@ -3148,6 +3145,15 @@ fn rootfsError(err: anyerror) Error {
         => error.BadChunk,
         else => error.IoFailed,
     };
+}
+
+fn parseRootfsDiskIndexForStorage(
+    allocator: std.mem.Allocator,
+    index_bytes: []const u8,
+    storage: spore.RootfsStorage,
+) Error!std.json.Parsed(disk_index.DiskIndex) {
+    const descriptor = spore.diskIndexDescriptorForStorage(storage) catch |err| return rootfsError(err);
+    return disk_index.parseDiskIndex(allocator, index_bytes, descriptor) catch |err| return rootfsError(err);
 }
 
 fn chunkRange(plan: spore.MemoryPlan, ram_len: usize, index: usize) Error!spore.MemoryChunkRange {
@@ -4980,7 +4986,8 @@ test "pull fails closed on corrupt chunk cache entries" {
 
     const restored_manifest = try spore.loadManifest(arena, out0_dir);
     defer restored_manifest.deinit();
-    const first_ref = restored_manifest.value.memory.chunks[0] orelse return error.BadManifest;
+    if (restored_manifest.value.memory.chunks.len == 0) return error.BadManifest;
+    const first_ref = try spore.memoryChunkDigestHex(restored_manifest.value.memory.chunks[0].digest);
     const cache_path = try chunkCachePath(arena, chunk_cache_dir, first_ref);
     try Io.Dir.cwd().deleteFile(io, cache_path);
     try writeFileAll(try pathZ(arena, "{s}", .{cache_path}), "tampered");

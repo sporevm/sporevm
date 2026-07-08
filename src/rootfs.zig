@@ -2744,8 +2744,6 @@ test "cas preload attach rejects unexpected disk base" {
 }
 
 fn testRootfsAttachManifest(allocator: std.mem.Allocator, artifact: spore.RootfsArtifactRef) !spore.Manifest {
-    const memory_chunks = try allocator.alloc(?[]const u8, 1);
-    memory_chunks[0] = null;
     const devices = try allocator.alloc(spore.TransportState, 2);
     devices[0] = .{
         .device_id = 3,
@@ -2819,7 +2817,7 @@ fn testRootfsAttachManifest(allocator: std.mem.Allocator, artifact: spore.Rootfs
             .base = artifact.digest,
             .layers = &.{},
         },
-        .memory = .{ .chunk_size = spore.chunk_size, .chunks = memory_chunks },
+        .memory = .{ .logical_size = spore.chunk_size, .chunk_size = spore.chunk_size, .zero_chunks = &.{0} },
     };
 }
 

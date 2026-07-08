@@ -867,7 +867,8 @@ fn gcRootfsCache(
             error.FileNotFound, error.StreamTooLong => return error.BadManifest,
             else => |e| return e,
         };
-        const parsed = disk_index.parseDiskIndex(allocator, bytes, storage) catch return error.BadManifest;
+        const descriptor = spore.diskIndexDescriptorForStorage(storage) catch return error.BadManifest;
+        const parsed = disk_index.parseDiskIndex(allocator, bytes, descriptor) catch return error.BadManifest;
         for (parsed.value.chunks) |chunk_entry| {
             try rooted_objects.put(chunk_entry.digest, {});
         }
