@@ -1069,8 +1069,10 @@ fn joinKvmVcpuThreads(vcpus: []KvmVcpu) void {
 
 fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
     ctx.vcpu.wake.thread_id = linux.gettid();
+    var pending_kvm_completion = false;
     while (!ctx.state.stopped()) {
         if (ctx.state.snapshotRequested()) {
+            if (!completePendingKvmExitBeforeSnapshot(ctx, &pending_kvm_completion)) return;
             ctx.vcpu.snapshot_paused.store(true, .release);
             sleepMs(1);
             continue;
@@ -1082,7 +1084,9 @@ fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
         };
         const stopped_for_wake = ctx.vcpu.run_bytes[kvm.RunLayout.immediate_exit] != 0;
         _ = consumeCaptureWake(null, ctx.vcpu.run_bytes);
+        if (run_result == .completed) pending_kvm_completion = false;
         if (ctx.state.snapshotRequested() and (run_result == .interrupted or stopped_for_wake)) {
+            if (!completePendingKvmExitBeforeSnapshot(ctx, &pending_kvm_completion)) return;
             ctx.vcpu.snapshot_paused.store(true, .release);
             continue;
         }
@@ -1118,10 +1122,12 @@ fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
                     return;
                 };
                 ctx.device_lock.unlock();
+                pending_kvm_completion = true;
                 if (ctx.state.stopped()) {
                     kvm.completePendingExit(ctx.vcpu.fd, ctx.vcpu.run_bytes) catch |err| {
                         ctx.state.finish(.{ .err = err });
                     };
+                    pending_kvm_completion = false;
                     return;
                 }
             },
@@ -1138,6 +1144,16 @@ fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
             },
         }
     }
+}
+
+fn completePendingKvmExitBeforeSnapshot(ctx: *MultiKvmThreadContext, pending_kvm_completion: *bool) bool {
+    if (!pending_kvm_completion.*) return true;
+    kvm.completePendingExit(ctx.vcpu.fd, ctx.vcpu.run_bytes) catch |err| {
+        ctx.state.finish(.{ .err = err });
+        return false;
+    };
+    pending_kvm_completion.* = false;
+    return true;
 }
 
 fn pauseKvmVcpusForSnapshot(vcpus: []KvmVcpu, state: *MultiKvmRunState, wake_set: *KvmRunWakeSet) !void {
