@@ -524,9 +524,30 @@ no-reflink fallback path is exercised in tests.
 
 ### U7 — Partial materialization
 
+Status: landed in branch for local CAS fault-in.
+
 Add the `.cas` map source, fault-in path, background filler, and
 boot-critical chunk ordering (fault-trace a reference boot to derive the
 priority set).
+
+Landed behavior: chunk-index disks and chunked rootfs caches can now open over
+a sparse temporary base fd without assembling the full flat image first. The
+chunk map marks nonzero index entries as `.cas`; the first read of a CAS chunk
+opens the local object, verifies it against the descriptor-selected BLAKE3
+digest, writes it into the sparse base, and promotes that map entry to `.base`.
+Missing or corrupt objects fail the read before bytes reach the guest. Warm
+flat-cache opens still use the existing read-only materialization path.
+
+Decision: a concurrent background filler and boot-critical priority list are
+deferred until fault traces show they are needed. Adding a filler now would
+require synchronization around the hot chunk map and would reintroduce eager
+whole-image work in another form. The guest's actual read stream provides the
+correct initial ordering for this slice.
+
+Validation: `mise exec -- zig test src/runtime_disk.zig` covers lazy rootfs
+open without publishing a flat cache, wrong-sized flat-cache fallback, CAS
+promotion after the first read, read-time missing-object failure, and
+chunk-index disk restore over the lazy backend.
 
 Done when: cold boot of a large reference image starts the guest before
 full materialization and completes correctly under random read access

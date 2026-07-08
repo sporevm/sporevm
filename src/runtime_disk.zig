@@ -3,7 +3,6 @@
 const std = @import("std");
 
 const block_source = @import("block_source.zig");
-const chunk = @import("chunk.zig");
 const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
 const Context = @import("context.zig").Context;
 const disk_index = @import("disk_index.zig");
@@ -65,22 +64,22 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
     var runtime = RuntimeDisk{ .allocator = allocator };
     errdefer runtime.deinit();
     runtime.trace_fd = try openRootfsTraceFd(context, allocator);
+    var rootfs_lazy_storage: ?spore.RootfsStorage = null;
 
     if (options.rootfs) |rootfs| {
-        if (rootfs.storage != null) {
+        if (rootfs.storage) |storage| {
+            try validateRuntimeRootfsStorage(rootfs, storage);
             // The flat digest-addressed ext4 artifact is the only runtime
-            // base source. When it is not materialized locally (chunk-only
-            // pull caches, pruned or corrupt entries), assemble it once from
-            // the locally installed verified chunks; missing chunks or an
-            // artifact-digest mismatch fail the run closed.
+            // base source on warm paths. When it is not materialized locally
+            // (chunk-only pull caches, pruned entries), defer assembly and let
+            // the chunk-mapped backend fault verified CAS objects into a sparse
+            // base on demand.
             if (try openCachedFlatRootfs(context, allocator, rootfs, runtime.trace_fd)) |fd| {
                 runtime.rootfs_fd = fd;
                 std.log.debug("runtime disk rootfs base: flat artifact {s}", .{rootfs.artifact.digest});
             } else {
-                const materialize_start = monotonicMs();
-                try materializeFlatRootfs(context, allocator, rootfs);
-                runtime.rootfs_fd = try openTrustedRootfs(context, allocator, rootfs, runtime.trace_fd);
-                std.log.debug("runtime disk rootfs base: assembled flat artifact {s} elapsed_ms={d}", .{ rootfs.artifact.digest, monotonicMs() -| materialize_start });
+                rootfs_lazy_storage = storage;
+                std.log.debug("runtime disk rootfs base: lazy chunk index {s}", .{rootfs.artifact.digest});
             }
         } else {
             runtime.rootfs_fd = try openTrustedRootfs(context, allocator, rootfs, runtime.trace_fd);
@@ -89,7 +88,7 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         runtime.rootfs_fd = try openRootfsDisk(allocator, options.rootfs_path);
     }
 
-    if (runtime.rootfs_fd == null) return runtime;
+    if (runtime.rootfs_fd == null and rootfs_lazy_storage == null) return runtime;
 
     if (options.disk) |disk| {
         const rootfs = options.rootfs orelse return error.BadManifest;
@@ -107,12 +106,19 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
                 _ = std.c.close(fd);
                 runtime.rootfs_fd = null;
             }
-            runtime.rootfs_fd = try materializeDiskIndexToTemp(context, allocator, spore_dir, disk);
+            runtime.rootfs_fd = try createSparseTempFd(allocator, disk.size);
             runtime.overlay = try disk_layer.createTempOverlay(allocator);
             const base_source = try runtime.baseSource(disk.size);
             runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, disk.size, disk.chunk_size);
+            var parsed = try readDiskIndex(context, allocator, spore_dir, diskStorageDescriptor(disk));
+            defer parsed.deinit();
+            try runtime.chunk_mapped.?.attachCasIndex(spore_dir, parsed.value);
             runtime.base_disk = disk;
             return runtime;
+        }
+        if (runtime.rootfs_fd == null and rootfs_lazy_storage != null) {
+            try materializeFlatRootfs(context, allocator, rootfs);
+            runtime.rootfs_fd = try openTrustedRootfs(context, allocator, rootfs, runtime.trace_fd);
         }
         const base_source = try runtime.baseSource(disk.size);
         runtime.overlay = try disk_layer.createTempOverlay(allocator);
@@ -124,9 +130,23 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
 
     if (options.rootfs) |rootfs| {
         runtime.overlay = try disk_layer.createTempOverlay(allocator);
-        const base = disk_layer.diskFromRootfs(rootfs);
+        const base = diskFromRootfs(rootfs);
+        if (runtime.rootfs_fd == null) {
+            const storage = rootfs_lazy_storage orelse return error.BadManifest;
+            runtime.rootfs_fd = try createSparseTempFd(allocator, storage.logical_size);
+            const cache_root = try rootfsCacheRootPath(context, allocator);
+            defer allocator.free(cache_root);
+            const base_source = try runtime.baseSource(storage.logical_size);
+            runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, storage.logical_size, storage.chunk_size);
+            var parsed = try readDiskIndex(context, allocator, cache_root, storage);
+            defer parsed.deinit();
+            try runtime.chunk_mapped.?.attachCasIndex(cache_root, parsed.value);
+            runtime.base_disk = base;
+            return runtime;
+        }
         const base_source = try runtime.baseSource(base.size);
-        runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, base.size, rootfs_cas.default_chunk_size);
+        const chunk_size = if (std.mem.eql(u8, base.kind, spore.disk_kind_chunk_index)) base.chunk_size else rootfs_cas.default_chunk_size;
+        runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, base.size, chunk_size);
         runtime.base_disk = base;
         return runtime;
     }
@@ -159,8 +179,34 @@ fn fdSize(fd: std.c.fd_t) !u64 {
     return @intCast(end);
 }
 
-fn materializeDiskIndexToTemp(context: Context, allocator: std.mem.Allocator, spore_dir: []const u8, disk: spore.Disk) !std.c.fd_t {
-    const storage = spore.RootfsStorage{
+fn createSparseTempFd(allocator: std.mem.Allocator, size: u64) !std.c.fd_t {
+    var temp = try disk_layer.createTempOverlay(allocator);
+    errdefer temp.deinit();
+    const logical_size = std.math.cast(std.c.off_t, size) orelse return error.BadManifest;
+    if (std.c.ftruncate(temp.fd, logical_size) != 0) return error.IoFailed;
+    const fd = temp.fd;
+    temp.fd = -1;
+    return fd;
+}
+
+fn diskFromRootfs(rootfs: spore.Rootfs) spore.Disk {
+    if (rootfs.storage) |storage| {
+        return .{
+            .kind = spore.disk_kind_chunk_index,
+            .device = storage.device,
+            .size = storage.logical_size,
+            .base = storage.index_digest,
+            .chunk_size = storage.chunk_size,
+            .hash_algorithm = storage.hash_algorithm,
+            .object_namespace = storage.object_namespace,
+            .layers = &.{},
+        };
+    }
+    return disk_layer.diskFromRootfs(rootfs);
+}
+
+fn diskStorageDescriptor(disk: spore.Disk) spore.RootfsStorage {
+    return .{
         .kind = spore.rootfs_storage_kind_chunked_ext4,
         .device = disk.device,
         .logical_size = disk.size,
@@ -170,55 +216,31 @@ fn materializeDiskIndexToTemp(context: Context, allocator: std.mem.Allocator, sp
         .base_identity = disk.base,
         .object_namespace = disk.object_namespace,
     };
+}
+
+fn validateRuntimeRootfsStorage(rootfs: spore.Rootfs, storage: spore.RootfsStorage) !void {
+    if (!std.mem.eql(u8, rootfs.artifact.format, spore.rootfs_artifact_format_ext4)) return error.BadManifest;
+    if (!spore.rootfsDeviceEql(storage.device, rootfs.device)) return error.BadManifest;
+    if (storage.logical_size != rootfs.artifact.size) return error.BadManifest;
+    if (!std.mem.eql(u8, storage.index_digest, rootfs.artifact.digest)) return error.BadManifest;
     try spore.validateRootfsStorageDescriptor(storage);
+}
 
-    var temp = try disk_layer.createTempOverlay(allocator);
-    errdefer temp.deinit();
-    const logical_size = std.math.cast(std.c.off_t, disk.size) orelse return error.BadManifest;
-    if (std.c.ftruncate(temp.fd, logical_size) != 0) return error.IoFailed;
-
-    const index_path = try rootfs_cas.manifestIndexPath(allocator, spore_dir, disk.base);
+fn readDiskIndex(
+    context: Context,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    storage: spore.RootfsStorage,
+) !std.json.Parsed(disk_index.DiskIndex) {
+    try spore.validateRootfsStorageDescriptor(storage);
+    const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
     defer allocator.free(index_path);
     const index_bytes = Io.Dir.cwd().readFileAlloc(context.io, index_path, allocator, .limited(disk_index.max_index_bytes)) catch |err| switch (err) {
         error.FileNotFound, error.StreamTooLong => return error.BadManifest,
         else => |e| return e,
     };
     defer allocator.free(index_bytes);
-    const parsed = try disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
-    defer parsed.deinit();
-
-    for (parsed.value.chunks) |entry| {
-        const object_path = try rootfs_cas.manifestObjectPath(allocator, spore_dir, entry.digest);
-        defer allocator.free(object_path);
-        const len = try rootfs_cas.storageChunkLen(storage, entry.logical_chunk);
-        const limit = std.math.add(usize, len, 1) catch return error.BadManifest;
-        const object = Io.Dir.cwd().readFileAlloc(context.io, object_path, allocator, .limited(limit)) catch |err| switch (err) {
-            error.FileNotFound, error.StreamTooLong => return error.BadManifest,
-            else => |e| return e,
-        };
-        defer allocator.free(object);
-        if (object.len != len) return error.BadManifest;
-        const hex = try spore.diskDigestHex(entry.digest);
-        const id = chunk.ChunkId.fromHex(hex) catch return error.BadManifest;
-        if (!id.matches(object)) return error.BadManifest;
-        const offset = std.math.mul(u64, entry.logical_chunk, storage.chunk_size) catch return error.BadManifest;
-        try pwriteAll(temp.fd, object, offset);
-    }
-
-    const fd = temp.fd;
-    temp.fd = -1;
-    return fd;
-}
-
-fn pwriteAll(fd: std.c.fd_t, bytes: []const u8, offset: u64) !void {
-    var done: usize = 0;
-    while (done < bytes.len) {
-        const absolute = std.math.add(u64, offset, done) catch return error.BadManifest;
-        const file_offset = std.math.cast(std.c.off_t, absolute) orelse return error.BadManifest;
-        const n = std.c.pwrite(fd, bytes.ptr + done, bytes.len - done, file_offset);
-        if (n <= 0) return error.IoFailed;
-        done += @intCast(n);
-    }
+    return disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
 }
 
 fn openTrustedRootfs(context: Context, allocator: std.mem.Allocator, rootfs: spore.Rootfs, trace_fd: ?std.c.fd_t) !std.c.fd_t {
@@ -399,7 +421,7 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
     try std.testing.expect(std.mem.indexOf(u8, trace_bytes, "\"event\":\"rootfs_open\"") != null);
 }
 
-test "runtime disk assembles the flat artifact from chunks when it is missing" {
+test "runtime disk lazily faults rootfs cas chunks when the flat artifact is missing" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -423,6 +445,10 @@ test "runtime disk assembles the flat artifact from chunks when it is missing" {
         error.FileNotFound => {},
         else => |e| return e,
     };
+    const index_bytes = try Io.Dir.cwd().readFileAlloc(io, preload_result.index_path, arena, .limited(disk_index.max_index_bytes));
+    const parsed = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
+    defer parsed.deinit();
+    const first_chunk_path = try rootfs_cas.manifestObjectPath(arena, cache_root, parsed.value.chunks[0].digest);
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -446,11 +472,15 @@ test "runtime disk assembles the flat artifact from chunks when it is missing" {
     var readback: [4]u8 = undefined;
     try runtime.chunk_mapped.?.readAt(&readback, 0);
     try std.testing.expectEqualStrings("abcd", &readback);
-    // The assembled flat artifact is republished into the by-digest cache.
-    try std.testing.expect(try rootfs_cache.regularFileNoSymlink(io, digest_path));
+    try Io.Dir.cwd().deleteFile(io, first_chunk_path);
+    try runtime.chunk_mapped.?.readAt(&readback, 0);
+    try std.testing.expectEqualStrings("abcd", &readback);
+    // Lazy fault-in promotes into the sparse runtime base, not the by-digest
+    // materialization cache.
+    try std.testing.expect(!try rootfs_cache.regularFileNoSymlink(io, digest_path));
 }
 
-test "runtime disk reassembles the flat artifact when the cached entry is the wrong size" {
+test "runtime disk ignores wrong-sized flat cache entries and lazily faults cas chunks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -498,9 +528,8 @@ test "runtime disk reassembles the flat artifact when the cached entry is the wr
     var readback: [4]u8 = undefined;
     try runtime.chunk_mapped.?.readAt(&readback, 0);
     try std.testing.expectEqualStrings("abcd", &readback);
-    // Rename-over publication self-healed the corrupt cache entry.
-    const healed = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(1 << 20));
-    try std.testing.expectEqual(rootfs_bytes.len, healed.len);
+    const stale = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(1 << 20));
+    try std.testing.expectEqualStrings("truncated", stale);
 }
 
 test "runtime disk manifest rootfs cas fails closed without index" {
@@ -543,9 +572,98 @@ test "runtime disk manifest rootfs cas fails closed without index" {
         .artifact = rootfs_artifact,
         .storage = storage,
     };
-    try std.testing.expectError(error.MissingChunk, open(context, allocator, .{
+    try std.testing.expectError(error.BadManifest, open(context, allocator, .{
         .rootfs = rootfs,
     }));
+}
+
+test "runtime disk lazy rootfs validates storage against artifact" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-runtime-disk-lazy-storage-mismatch";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
+
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, 4096);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    const context = Context{ .io = io, .environ_map = &env };
+
+    const rootfs = spore.Rootfs{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = .{ .digest = storage.index_digest, .size = artifact.size + 1 },
+        .storage = storage,
+    };
+    try std.testing.expectError(error.BadManifest, open(context, allocator, .{
+        .rootfs = rootfs,
+    }));
+}
+
+test "runtime disk reports missing cas object on first read of that chunk" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-runtime-disk-lazy-cas-missing-object";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    const rootfs_bytes = ("abcd" ** 1024) ++ ("efgh" ** 1024);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
+
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, 4096);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
+    const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
+    Io.Dir.cwd().deleteFile(io, digest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+
+    const index_bytes = try Io.Dir.cwd().readFileAlloc(io, preload_result.index_path, arena, .limited(disk_index.max_index_bytes));
+    const parsed = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
+    defer parsed.deinit();
+    const second_chunk_path = try rootfs_cas.manifestObjectPath(arena, cache_root, parsed.value.chunks[1].digest);
+    try Io.Dir.cwd().deleteFile(io, second_chunk_path);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    const context = Context{ .io = io, .environ_map = &env };
+
+    const rootfs = spore.Rootfs{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = rootfs_artifact,
+        .storage = storage,
+    };
+    var runtime = try open(context, allocator, .{
+        .rootfs = rootfs,
+    });
+    defer runtime.deinit();
+
+    var readback: [4]u8 = undefined;
+    try runtime.chunk_mapped.?.readAt(&readback, 0);
+    try std.testing.expectEqualStrings("abcd", &readback);
+    try std.testing.expectError(error.MissingChunk, runtime.chunk_mapped.?.readAt(&readback, 4096));
 }
 
 test "runtime disk rejects unknown disk kinds" {

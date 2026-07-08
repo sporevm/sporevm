@@ -24,12 +24,13 @@ pub const Error = error{
     ShortWrite,
     ResizeFailed,
     FlushFailed,
-} || chunk_sealer.Error || spore.Error || block_source.Error || std.mem.Allocator.Error;
+} || chunk_sealer.Error || rootfs_cas.SourceError || spore.Error || block_source.Error || std.mem.Allocator.Error;
 
 const Source = enum(u8) {
     base,
     overlay,
     zero,
+    cas,
 };
 
 pub const ForkCloneMethod = enum {
@@ -62,6 +63,8 @@ pub const ChunkMappedDisk = struct {
     size: u64,
     chunk_size: u64,
     sources: []Source,
+    cas_root: ?[]const u8 = null,
+    cas_digests: []?[]const u8 = &.{},
 
     pub fn initReadOnly(
         allocator: std.mem.Allocator,
@@ -113,6 +116,7 @@ pub const ChunkMappedDisk = struct {
     }
 
     pub fn deinit(self: *ChunkMappedDisk) void {
+        self.deinitCasState();
         self.allocator.free(self.sources);
         self.* = undefined;
     }
@@ -171,6 +175,7 @@ pub const ChunkMappedDisk = struct {
 
     pub fn markZeroChunk(self: *ChunkMappedDisk, chunk_index: usize) Error!void {
         if (chunk_index >= self.sources.len) return error.OutOfRange;
+        self.clearCasDigest(chunk_index);
         self.sources[chunk_index] = .zero;
     }
 
@@ -196,6 +201,10 @@ pub const ChunkMappedDisk = struct {
                 .base => try self.base.readAt(target, absolute),
                 .overlay => try readExact(self.overlay_fd orelse return error.ShortRead, target, absolute),
                 .zero => @memset(target, 0),
+                .cas => {
+                    try self.faultCasChunk(span.chunk_index);
+                    try self.base.readAt(target, absolute);
+                },
             }
             cursor += span.len;
         }
@@ -213,6 +222,7 @@ pub const ChunkMappedDisk = struct {
                 try self.seedChunk(span.chunk_index, overlay_fd);
             }
             try writeExact(overlay_fd, buf[cursor..][0..span.len], absolute);
+            self.clearCasDigest(span.chunk_index);
             self.sources[span.chunk_index] = .overlay;
             cursor += span.len;
         }
@@ -228,6 +238,8 @@ pub const ChunkMappedDisk = struct {
         const parent_fd = self.overlay_fd orelse return error.ReadOnly;
         const child_sources = try self.allocator.dupe(Source, self.sources);
         errdefer self.allocator.free(child_sources);
+        const child_cas = try self.cloneCasState();
+        errdefer child_cas.deinit(self.allocator);
 
         const child_fd = try createTempOverlayFd(self.allocator);
         var fd_owned = true;
@@ -251,9 +263,49 @@ pub const ChunkMappedDisk = struct {
                 .size = self.size,
                 .chunk_size = self.chunk_size,
                 .sources = child_sources,
+                .cas_root = child_cas.root,
+                .cas_digests = child_cas.digests,
             },
             .clone_method = clone_method,
         };
+    }
+
+    pub fn attachCasIndex(self: *ChunkMappedDisk, cache_root: []const u8, index: disk_index.DiskIndex) Error!void {
+        if (self.cas_root != null or self.cas_digests.len != 0) return error.BadManifest;
+        if (index.logical_size != self.size or index.chunk_size != self.chunk_size) return error.BadManifest;
+        try disk_index.validateDiskIndex(index, .{
+            .logical_size = self.size,
+            .chunk_size = self.chunk_size,
+            .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+            .object_namespace = spore.rootfs_storage_object_namespace,
+        });
+
+        const next_sources = try self.allocator.alloc(Source, self.sources.len);
+        errdefer self.allocator.free(next_sources);
+        @memset(next_sources, .zero);
+
+        const next_digests = try self.allocator.alloc(?[]const u8, self.sources.len);
+        @memset(next_digests, null);
+        errdefer freeCasDigests(self.allocator, next_digests);
+
+        const next_root = try self.allocator.dupe(u8, cache_root);
+        errdefer self.allocator.free(next_root);
+
+        for (index.chunks) |entry| {
+            if (entry.logical_chunk >= self.sources.len) return error.BadManifest;
+            const chunk_index: usize = @intCast(entry.logical_chunk);
+            next_digests[chunk_index] = try self.allocator.dupe(u8, entry.digest);
+            next_sources[chunk_index] = .cas;
+        }
+        for (index.zero_chunks) |logical_chunk| {
+            if (logical_chunk >= self.sources.len) return error.BadManifest;
+        }
+
+        const old_sources = self.sources;
+        self.sources = next_sources;
+        self.cas_root = next_root;
+        self.cas_digests = next_digests;
+        self.allocator.free(old_sources);
     }
 
     pub fn snapshotIndex(self: *ChunkMappedDisk, dir: []const u8, device: spore.RootfsDevice) Error!spore.Disk {
@@ -373,8 +425,65 @@ pub const ChunkMappedDisk = struct {
             .base => try self.base.readAt(buf, offset),
             .overlay => return,
             .zero => @memset(buf, 0),
+            .cas => {
+                try self.faultCasChunk(chunk_index);
+                try self.base.readAt(buf, offset);
+            },
         }
         try writeExact(overlay_fd, buf, offset);
+    }
+
+    fn faultCasChunk(self: *ChunkMappedDisk, chunk_index: usize) Error!void {
+        if (chunk_index >= self.sources.len) return error.OutOfRange;
+        if (self.sources[chunk_index] != .cas) return;
+        const cache_root = self.cas_root orelse return error.BadManifest;
+        if (self.cas_digests.len != self.sources.len) return error.BadManifest;
+        const digest = self.cas_digests[chunk_index] orelse return error.BadManifest;
+        const len = try self.chunkLen(chunk_index);
+        const data = try rootfs_cas.readVerifiedManifestObject(self.allocator, cache_root, digest, len);
+        defer self.allocator.free(data);
+        const offset = std.math.mul(u64, chunk_index, self.chunk_size) catch return error.OutOfRange;
+        try writeExact(self.base.fd, data, offset);
+        self.clearCasDigest(chunk_index);
+        self.sources[chunk_index] = .base;
+    }
+
+    fn clearCasDigest(self: *ChunkMappedDisk, chunk_index: usize) void {
+        if (self.cas_digests.len == 0) return;
+        if (self.cas_digests[chunk_index]) |digest| {
+            self.allocator.free(digest);
+            self.cas_digests[chunk_index] = null;
+        }
+    }
+
+    fn deinitCasState(self: *ChunkMappedDisk) void {
+        if (self.cas_root) |root| {
+            self.allocator.free(root);
+            self.cas_root = null;
+        }
+        if (self.cas_digests.len != 0) {
+            freeCasDigests(self.allocator, self.cas_digests);
+            self.cas_digests = &.{};
+        }
+    }
+
+    fn cloneCasState(self: ChunkMappedDisk) Error!CasClone {
+        const root = if (self.cas_root) |cas_root| try self.allocator.dupe(u8, cas_root) else null;
+        errdefer if (root) |cas_root| self.allocator.free(cas_root);
+        if (self.cas_digests.len == 0) return .{ .root = root };
+        if (self.cas_digests.len != self.sources.len) return error.BadManifest;
+
+        const digests = try self.allocator.alloc(?[]const u8, self.cas_digests.len);
+        @memset(digests, null);
+        errdefer freeCasDigests(self.allocator, digests);
+        for (self.cas_digests, 0..) |maybe_digest, i| {
+            if (maybe_digest) |digest| {
+                digests[i] = try self.allocator.dupe(u8, digest);
+            } else if (self.sources[i] == .cas) {
+                return error.BadManifest;
+            }
+        }
+        return .{ .root = root, .digests = digests };
     }
 
     fn copyOverlayChunks(self: *ChunkMappedDisk, parent_fd: std.c.fd_t, child_fd: std.c.fd_t) Error!void {
@@ -401,6 +510,23 @@ const Span = struct {
     chunk_offset: usize,
     len: usize,
 };
+
+const CasClone = struct {
+    root: ?[]const u8 = null,
+    digests: []?[]const u8 = &.{},
+
+    fn deinit(self: CasClone, allocator: std.mem.Allocator) void {
+        if (self.root) |root| allocator.free(root);
+        if (self.digests.len != 0) freeCasDigests(allocator, self.digests);
+    }
+};
+
+fn freeCasDigests(allocator: std.mem.Allocator, digests: []?[]const u8) void {
+    for (digests) |maybe_digest| {
+        if (maybe_digest) |digest| allocator.free(digest);
+    }
+    allocator.free(digests);
+}
 
 fn computeChunkCount(size: u64, chunk_size: u64) Error!u64 {
     return std.math.divCeil(u64, size, chunk_size) catch return error.BadDiskSize;
@@ -668,6 +794,43 @@ test "read only disk rejects fork" {
     defer disk.deinit();
 
     try std.testing.expectError(error.ReadOnly, disk.fork(.{}));
+}
+
+test "cas index attach rejects incomplete coverage" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+
+    const base_bytes = [_]u8{0x33} ** 1024;
+    try base.writeStreamingAll(io, &base_bytes);
+
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
+    var disk = try ChunkMappedDisk.initWritable(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 512);
+    defer disk.deinit();
+
+    const chunks = [_]disk_index.DiskIndexChunk{.{
+        .logical_chunk = 0,
+        .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }};
+    const incomplete = disk_index.DiskIndex{
+        .kind = disk_index.disk_index_kind,
+        .logical_size = base_bytes.len,
+        .chunk_size = 512,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+        .chunks = &chunks,
+        .zero_chunks = &.{},
+    };
+    try std.testing.expectError(error.BadManifest, disk.attachCasIndex("/missing-cache", incomplete));
+
+    var readback: [1024]u8 = undefined;
+    try disk.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, &base_bytes, &readback);
 }
 
 test "forced-copy fork isolates parent and child overlays" {

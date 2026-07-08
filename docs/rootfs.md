@@ -76,6 +76,12 @@ also require manifest-bound chunked rootfs storage. New builds write it
 immediately; older flat-only cache entries miss and are rebuilt or reimported
 so the saved manifest can record portable rootfs identity.
 
+When a chunked rootfs has its index and objects but no usable flat
+materialization, `spore run` can start from the index directly. The runtime
+opens a sparse base fd, verifies each chunk object on first read, and promotes
+the verified bytes into that base for subsequent reads instead of rebuilding the
+whole ext4 file before boot.
+
 For local Docker buildx workflows, SporeVM consumes an OCI layout instead of the
 Docker daemon or socket. Buildx writes the layout, then `spore rootfs
 import-oci` imports it into the same deterministic rootfs cache:

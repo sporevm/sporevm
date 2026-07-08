@@ -452,6 +452,20 @@ pub fn manifestObjectPath(allocator: std.mem.Allocator, cache_root: []const u8, 
     return objectPathForDir(allocator, dir, id);
 }
 
+pub fn readVerifiedManifestObject(
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    object_digest: []const u8,
+    expected_size: usize,
+) (SourceError || spore.Error)![]u8 {
+    const object_path = try manifestObjectPath(allocator, cache_root, object_digest);
+    defer allocator.free(object_path);
+    const object = try readFileExact(allocator, object_path, expected_size);
+    errdefer allocator.free(object);
+    try verifyDigestBytes(object_digest, object);
+    return object;
+}
+
 pub fn storageDescriptor(device: spore.RootfsDevice, result: PreloadResult) spore.RootfsStorage {
     return .{
         .kind = spore.rootfs_storage_kind_chunked_ext4,

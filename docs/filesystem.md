@@ -72,7 +72,7 @@ Product attach and run-from restore build one root disk backend:
 virtio-blk
   -> one-level chunk map
   -> sparse local overlay for writes
-  -> flat materialized base fd rebuilt from the selected disk/rootfs index
+  -> flat or sparse base fd selected by disk/rootfs index
 ```
 
 The flat materialization is the hot runtime base source. For immutable rootfs
@@ -80,22 +80,24 @@ materializations, the open follows the verify-at-install, trust-at-open cache
 contract (see SECURITY.md): exact fd-backed entries were BLAKE3-verified when
 installed, while chunked entries were derived from a digest-verified index and
 BLAKE3-verified chunk objects. Opens check symlink-safety, regular-file shape,
-and exact size instead of re-hashing the flat file. Writable disk indexes are
-materialized into a temporary flat fd by verifying the index and each referenced
-chunk object first. Serving guest reads with plain preads on one fd is what
-keeps resume-to-first-command fast.
+and exact size instead of re-hashing the flat file. When the flat cache is
+missing or stale, the runtime opens the selected disk/rootfs index over a
+sparse temporary base fd. Nonzero index entries start as `.cas` map entries;
+the first read verifies the local chunk object against the descriptor-selected
+BLAKE3 digest, writes it into the sparse base, and promotes the map entry to
+the hot `.base` path. Serving repeated guest reads with plain preads on one fd
+is what keeps resume-to-first-command fast.
 
 Chunked rootfs storage (`rootfs.storage`) is a distribution and dedupe format,
-not a runtime read path. `spore pull` and `spore unpack` assemble the flat
-materialization from the verified chunk objects at materialization time, and resume
-performs the same assembly once when the flat artifact is missing locally
-(pruned or corrupt cache entries self-heal from chunks). Assembly verifies
-each chunk against the digest-verified index before atomically publishing the
-entry under the index identity; an inconsistent artifact/index pairing fails
-closed before publication.
+and now also the local cold-start fallback when a flat materialization is not
+available. `spore pull` and `spore unpack` can still assemble flat
+materializations from verified chunk objects, but `spore run` and restore do
+not need to publish a flat by-digest cache entry before boot. An inconsistent
+artifact/index pairing fails closed when the index is opened; missing or
+corrupt chunk objects fail the specific read before bytes reach the guest.
 
 Missing or corrupt rootfs indexes, chunk objects, exact artifacts, disk indexes,
-or disk chunk objects fail before guest code can observe the bytes.
+or disk chunk objects fail before guest code can observe unverifiable bytes.
 
 ## Writable Disk Indexes
 
@@ -112,8 +114,9 @@ chunk-index-disk-v0
 Active writes stay local in a sparse writable head. Capture writes nonzero
 chunks into `cas/rootfs/blake3/objects/`, writes the canonical
 `spore-disk-index-v1` under `cas/rootfs/blake3/indexes/`, and records that index
-digest in the manifest disk. Restore materializes the verified index and chunk
-objects into a flat temporary fd before attaching virtio-blk.
+digest in the manifest disk. Restore attaches the verified index to the
+chunk-mapped backend; referenced chunk objects fault into the sparse base fd on
+first read and then use the same hot `.base` path as a materialized image.
 
 ## Distribution
 
