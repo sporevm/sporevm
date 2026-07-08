@@ -12,8 +12,8 @@ const xattrs_mod = @import("xattrs.zig");
 const Io = std.Io;
 const Blake3 = std.crypto.hash.Blake3;
 
-const block_size: u32 = 4096;
-const inode_size: u16 = 256;
+const block_size: u32 = ext4.rootfs_ext4_block_size;
+const inode_size: u16 = ext4.rootfs_ext4_inode_size;
 const first_non_reserved_inode: u32 = 11;
 const root_inode: u32 = 2;
 const lost_found_inode: u32 = 11;
@@ -225,7 +225,7 @@ pub fn emit(
     const total_blocks_u64 = options.image_size / block_size;
     if (total_blocks_u64 == 0 or total_blocks_u64 > std.math.maxInt(u32)) return error.UnsupportedExt4ImageSize;
     const total_blocks: u32 = @intCast(total_blocks_u64);
-    if (options.inode_count < first_non_reserved_inode or options.inode_count % inodesPerBlock() != 0) return error.InvalidExt4InodeCount;
+    try validateInodeCount(options.inode_count);
 
     var planned = try planImage(allocator, entries, options.inode_count);
     defer planned.deinit(allocator);
@@ -1324,7 +1324,11 @@ fn direntLen(name_len: usize) usize {
 }
 
 fn inodesPerBlock() u32 {
-    return block_size / inode_size;
+    return ext4.rootfs_ext4_inodes_per_block;
+}
+
+fn validateInodeCount(inode_count: u32) !void {
+    if (inode_count < first_non_reserved_inode or inode_count % inodesPerBlock() != 0) return error.InvalidExt4InodeCount;
 }
 
 fn divCeilUsize(n: usize, d: usize) usize {
@@ -1524,6 +1528,12 @@ test "native ext4 writer resolves hardlinks after sorted targets" {
     });
     try std.testing.expectEqualSlices(u8, &result.blake3, &(try ext4.blake3File(io, path)));
     try runE2fsck(allocator, io, path);
+}
+
+test "computed rootfs inode counts satisfy native writer packing" {
+    const inode_count = ext4.computeImageInodes(100_001);
+    try std.testing.expectEqual(@as(u64, 0), inode_count % ext4.rootfs_ext4_inodes_per_block);
+    try validateInodeCount(@intCast(inode_count));
 }
 
 fn fuzzNativeExt4PlannerAndMetadataEmitter(_: void, s: *std.testing.Smith) !void {
