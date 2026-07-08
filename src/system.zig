@@ -125,11 +125,22 @@ pub const RootfsGcResult = struct {
     dry_run: bool,
     rooted_indexes: usize = 0,
     rooted_objects: usize = 0,
+    unparseable_metadata_count: usize = 0,
+    unparseable_ref_count: usize = 0,
     candidate_count: usize = 0,
     candidate_bytes: u64 = 0,
     deleted_count: usize = 0,
     deleted_bytes: u64 = 0,
     entries: []const RootfsGcEntry = &.{},
+};
+
+const GcConservativeRootStats = struct {
+    metadata_count: usize = 0,
+    ref_count: usize = 0,
+
+    fn any(self: GcConservativeRootStats) bool {
+        return self.metadata_count != 0 or self.ref_count != 0;
+    }
 };
 
 pub const RuntimeForkPruneEntry = struct {
@@ -860,10 +871,10 @@ fn gcRootfsCache(
     var storage_roots = std.StringHashMap(spore.RootfsStorage).init(allocator);
     var rooted_indexes = std.StringHashMap(void).init(allocator);
     var rooted_objects = std.StringHashMap(void).init(allocator);
-    var conservative_roots = false;
+    var conservative_roots = GcConservativeRootStats{};
 
     try collectRootfsStorageRoots(allocator, io, options.cache_root, options.runtime_root, &storage_roots, &conservative_roots);
-    if (conservative_roots) {
+    if (conservative_roots.any()) {
         try markAllGcCasEntriesRooted(allocator, io, options.cache_root, "cas/rootfs/blake3/indexes", ".json", &rooted_indexes);
         try markAllGcCasEntriesRooted(allocator, io, options.cache_root, "cas/rootfs/blake3/objects", ".chunk", &rooted_objects);
     } else {
@@ -924,6 +935,8 @@ fn gcRootfsCache(
         .dry_run = options.dry_run,
         .rooted_indexes = rooted_indexes.count(),
         .rooted_objects = rooted_objects.count(),
+        .unparseable_metadata_count = conservative_roots.metadata_count,
+        .unparseable_ref_count = conservative_roots.ref_count,
         .candidate_count = entries.len,
         .candidate_bytes = candidate_bytes,
         .deleted_count = deleted_count,
@@ -938,7 +951,7 @@ fn collectRootfsStorageRoots(
     cache_root: []const u8,
     runtime_root: ?[]const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
-    conservative_roots: *bool,
+    conservative_roots: *GcConservativeRootStats,
 ) !void {
     try collectStorageRootsFromCacheMetadata(allocator, io, cache_root, storage_roots, conservative_roots);
     try collectStorageRootsFromRefRecords(allocator, io, cache_root, storage_roots, conservative_roots);
@@ -952,7 +965,7 @@ fn collectStorageRootsFromCacheMetadata(
     io: Io,
     cache_root: []const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
-    conservative_roots: *bool,
+    conservative_roots: *GcConservativeRootStats,
 ) !void {
     var root = openDirPath(io, cache_root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -964,9 +977,8 @@ fn collectStorageRootsFromCacheMetadata(
     while (try it.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
         const path = try std.fs.path.join(allocator, &.{ cache_root, entry.name });
-        collectStorageRootFromMetadataPath(allocator, io, path, storage_roots) catch |err| {
-            conservative_roots.* = true;
-            std.log.warn("spore cache gc: treating unrecognized rootfs metadata as a conservative root: path={s} error={s}", .{ path, @errorName(err) });
+        collectStorageRootFromMetadataPath(allocator, io, path, storage_roots) catch {
+            conservative_roots.metadata_count += 1;
         };
     }
 }
@@ -976,7 +988,7 @@ fn collectStorageRootsFromRefRecords(
     io: Io,
     cache_root: []const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
-    conservative_roots: *bool,
+    conservative_roots: *GcConservativeRootStats,
 ) !void {
     const refs_path = try std.fs.path.join(allocator, &.{ cache_root, "refs" });
     var refs = openDirPath(io, refs_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -994,7 +1006,7 @@ fn collectStorageRootsFromRefDir(
     dir: Io.Dir,
     cache_root: []const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
-    conservative_roots: *bool,
+    conservative_roots: *GcConservativeRootStats,
 ) !void {
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
@@ -1004,9 +1016,8 @@ fn collectStorageRootsFromRefDir(
             defer child.close(io);
             try collectStorageRootsFromRefDir(allocator, io, path, child, cache_root, storage_roots, conservative_roots);
         } else if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".json")) {
-            collectStorageRootFromRefPath(allocator, io, cache_root, path, storage_roots) catch |err| {
-                conservative_roots.* = true;
-                std.log.warn("spore cache gc: treating unrecognized rootfs ref as a conservative root: path={s} error={s}", .{ path, @errorName(err) });
+            collectStorageRootFromRefPath(allocator, io, cache_root, path, storage_roots) catch {
+                conservative_roots.ref_count += 1;
             };
         }
     }
@@ -1659,6 +1670,12 @@ fn writeRootfsGcResult(writer: *Io.Writer, result: RootfsGcResult) !void {
     try writer.print("  Cache: {s}\n", .{result.cache_root});
     try writer.print("  Rooted indexes: {d}\n", .{result.rooted_indexes});
     try writer.print("  Rooted objects: {d}\n", .{result.rooted_objects});
+    if (result.unparseable_metadata_count != 0 or result.unparseable_ref_count != 0) {
+        try writer.print("  Warning: {d} unrecognized rootfs metadata records and {d} unrecognized rootfs ref records found; retained all rootfs CAS entries.\n", .{
+            result.unparseable_metadata_count,
+            result.unparseable_ref_count,
+        });
+    }
     if (result.dry_run) {
         try writer.print("  Would delete: {d} entries\n", .{result.candidate_count});
         try writer.writeAll("  Would reclaim: ");
@@ -2067,11 +2084,18 @@ test "system cache gc treats unknown rootfs records as conservative roots" {
     const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
     try std.testing.expectEqual(@as(usize, 1), forced.rooted_indexes);
     try std.testing.expectEqual(@as(usize, 2), forced.rooted_objects);
+    try std.testing.expectEqual(@as(usize, 1), forced.unparseable_metadata_count);
+    try std.testing.expectEqual(@as(usize, 1), forced.unparseable_ref_count);
     try std.testing.expectEqual(@as(usize, 0), forced.candidate_count);
     try std.testing.expectEqual(@as(usize, 0), forced.deleted_count);
     try std.testing.expect(try fileExists(io, orphan_index_path));
     try std.testing.expect(try fileExists(io, orphan_object_path));
     try std.testing.expect(try fileExists(io, stray_object_path));
+
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeRootfsGcResult(&out.writer, forced);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Warning: 1 unrecognized rootfs metadata records and 1 unrecognized rootfs ref records found; retained all rootfs CAS entries.") != null);
 }
 
 test "system cache gc lock rejects a concurrent holder" {
