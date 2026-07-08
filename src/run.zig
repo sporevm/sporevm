@@ -1507,7 +1507,6 @@ pub const RootfsInputOptions = struct {
     pull_policy: PullPolicy = .missing,
     command_name: []const u8,
     record_artifact: bool = false,
-    require_storage_complete: bool = true,
 };
 
 pub const ResolvedRootfsInput = struct {
@@ -1551,7 +1550,7 @@ pub fn resolveRootfsInputDetailedResult(
     const resolved = if (options.rootfs_path) |path|
         try resolvePathRootfs(init, allocator, path, options.command_name, options.record_artifact)
     else if (options.image_ref) |ref|
-        try resolveImageRootfs(init, allocator, ref, options.command_name, options.pull_policy, options.record_artifact, options.require_storage_complete)
+        try resolveImageRootfs(init, allocator, ref, options.command_name, options.pull_policy, options.record_artifact)
     else
         RootfsInputResolution{ .resolved = .{ .path = null } };
     switch (resolved) {
@@ -1686,7 +1685,6 @@ fn resolveImageRootfs(
     command_name: []const u8,
     pull_policy: PullPolicy,
     record_artifact: bool,
-    require_storage_complete: bool,
 ) !RootfsInputResolution {
     const cache_root = local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
         error.MissingHome => return .{ .failure = rootfsInputFailure(
@@ -1721,7 +1719,7 @@ fn resolveImageRootfs(
                 .{ command_name, image_ref, @errorName(err) },
             ) };
         };
-        if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved, ext4_writer_choice, !require_storage_complete) catch |err| {
+        if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved, ext4_writer_choice) catch |err| {
             return .{ .failure = rootfsInputFailure(
                 allocator,
                 .cache_integrity_failed,
@@ -1742,7 +1740,7 @@ fn resolveImageRootfs(
     }
 
     if (digest_pinned) |resolved| {
-        if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved, ext4_writer_choice, !require_storage_complete) catch |err| {
+        if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved, ext4_writer_choice) catch |err| {
             return .{ .failure = rootfsInputFailure(
                 allocator,
                 .cache_integrity_failed,
@@ -1764,7 +1762,7 @@ fn resolveImageRootfs(
             ) };
         };
         if (useMutableImageRefCache(pull_policy)) {
-            if (rootfs_mod.cachedImageRefRootfsPath(init.io, allocator, cache_root, image_ref, direct_image_platform, ext4_writer_choice, !require_storage_complete) catch |err| {
+            if (rootfs_mod.cachedImageRefRootfsPath(init.io, allocator, cache_root, image_ref, direct_image_platform, ext4_writer_choice) catch |err| {
                 return .{ .failure = rootfsInputFailure(
                     allocator,
                     .cache_integrity_failed,
@@ -1796,7 +1794,7 @@ fn resolveImageRootfs(
             .{ command_name, image_ref, @errorName(err) },
         ) };
     };
-    if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved, ext4_writer_choice, !require_storage_complete) catch |err| {
+    if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved, ext4_writer_choice) catch |err| {
         return .{ .failure = rootfsInputFailure(
             allocator,
             .cache_integrity_failed,
@@ -1921,7 +1919,7 @@ fn resolvedImageRootfsInput(
     var storage = (try rootfs_mod.readCachedRootfsStorage(init.io, allocator, metadata_path, artifact)) orelse return error.BadManifest;
     errdefer rootfs_mod.deinitRootfsStorageDescriptor(allocator, storage);
     storage.device = rootfs_device;
-    if (!storage_prevalidated and !try rootfs_cas.storageComplete(init.io, allocator, cache_root, storage)) return error.RootFSDigestCacheMiss;
+    if (!storage_prevalidated and !try rootfs_cas.storageMarkedComplete(init.io, allocator, cache_root, storage)) return error.RootFSDigestCacheMiss;
     const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch });
     const manifest_requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved.ref else requested_ref;
     return .{

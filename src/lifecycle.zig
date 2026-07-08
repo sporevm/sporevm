@@ -795,7 +795,6 @@ fn createNamedWithTiming(
         .pull_policy = options.image_pull_policy,
         .command_name = "create",
         .record_artifact = spec.rootfs_path != null or spec.image_ref != null,
-        .require_storage_complete = spec.rootfs_path != null or spec.image_ref != null,
     });
     const rootfs_resolved_ms = monotonicMs();
     spec.rootfs_path = if (rootfs.path) |path| try std.fs.path.resolve(arena, &.{path}) else null;

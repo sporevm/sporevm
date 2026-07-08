@@ -102,6 +102,32 @@ pub const Options = struct {
 pub const Result = struct {
     size: u64,
     preload_result: ?rootfs_cas.PreloadResult = null,
+    profile: EmitProfile = .{},
+};
+
+pub const EmitProfile = struct {
+    plan_ms: u64 = 0,
+    assign_ms: u64 = 0,
+    metadata_build_ms: u64 = 0,
+    file_create_ms: u64 = 0,
+    emit_map_ms: u64 = 0,
+    metadata_write_ms: u64 = 0,
+    source_read_ms: u64 = 0,
+    data_write_ms: u64 = 0,
+    zero_ms: u64 = 0,
+    zero_write_ms: u64 = 0,
+    inline_cas_metadata_ms: u64 = 0,
+    inline_cas_data_ms: u64 = 0,
+    inline_cas_zero_ms: u64 = 0,
+    inline_cas_finish_ms: u64 = 0,
+    file_sync_ms: u64 = 0,
+    file_close_ms: u64 = 0,
+    metadata_blocks: u64 = 0,
+    data_blocks: u64 = 0,
+    zero_blocks: u64 = 0,
+    metadata_bytes_written: u64 = 0,
+    data_bytes_written: u64 = 0,
+    zero_bytes_skipped: u64 = 0,
 };
 
 const InodeKind = enum {
@@ -393,6 +419,7 @@ const InlineRootfsCas = struct {
         const index_write_start = monotonicMs();
         try chunk_sealer.writeFileAtomicDurable(self.allocator, index_path, manifest_json, 0o444);
         self.index_write_ms = monotonicMs() -| index_write_start;
+        try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, index_digest);
 
         const rootfs_digest = try self.allocator.dupe(u8, index_digest);
         errdefer self.allocator.free(rootfs_digest);
@@ -626,7 +653,10 @@ pub fn emit(
     const total_blocks: u32 = @intCast(total_blocks_u64);
     try validateInodeCount(options.inode_count);
 
+    var profile: EmitProfile = .{};
+    const plan_start = monotonicMs();
     var planned = try planImage(allocator, entries, options.inode_count);
+    profile.plan_ms = monotonicMs() -| plan_start;
     defer planned.deinit(allocator);
 
     var blocks = BlockStore.init(allocator);
@@ -634,10 +664,14 @@ pub fn emit(
     var data_blocks = DataBlockStore.init(allocator);
     defer data_blocks.deinit();
 
+    const assign_start = monotonicMs();
     const layout = try assignBlocks(allocator, &planned, total_blocks, options.inode_count, &blocks, &data_blocks);
+    profile.assign_ms = monotonicMs() -| assign_start;
     defer allocator.free(layout.groups);
+    const metadata_build_start = monotonicMs();
     try writeMetadataBlocks(allocator, &planned, layout, options, &blocks);
-    return try writeImage(allocator, io, output_path, options.image_size, total_blocks, &blocks, &data_blocks, options.cas_cache_root, options.cas_chunk_size, options.cas_seal_workers);
+    profile.metadata_build_ms = monotonicMs() -| metadata_build_start;
+    return try writeImage(allocator, io, output_path, options.image_size, total_blocks, &blocks, &data_blocks, options.cas_cache_root, options.cas_chunk_size, options.cas_seal_workers, &profile);
 }
 
 pub fn emitFromMergedTree(
@@ -1422,16 +1456,22 @@ fn writeImage(
     cas_cache_root: ?[]const u8,
     cas_chunk_size: u64,
     cas_seal_workers: usize,
+    profile: *EmitProfile,
 ) !Result {
+    const file_create_start = monotonicMs();
     try ext4.ensureParentDir(io, output_path);
     try ext4.createEmptyFile(io, output_path, image_size);
     var file = if (Io.Dir.path.isAbsolute(output_path))
         try Io.Dir.openFileAbsolute(io, output_path, .{ .mode = .read_write })
     else
         try Io.Dir.cwd().openFile(io, output_path, .{ .mode = .read_write });
-    defer file.close(io);
+    profile.file_create_ms +|= monotonicMs() -| file_create_start;
+    var file_closed = false;
+    defer if (!file_closed) file.close(io);
 
+    const emit_map_start = monotonicMs();
     const emit_blocks = try buildEmitBlocks(allocator, total_blocks, blocks, data_blocks);
+    profile.emit_map_ms +|= monotonicMs() -| emit_map_start;
     defer allocator.free(emit_blocks);
 
     var source_block: [block_size]u8 = undefined;
@@ -1453,8 +1493,16 @@ fn writeImage(
         const offset = @as(u64, block_no) * block_size;
         switch (emit_blocks[block_index]) {
             .metadata => |block| {
+                const write_start = monotonicMs();
                 try file.writePositionalAll(io, block, offset);
-                if (maybe_inline_cas) |*inline_cas| try inline_cas.writeBytes(block);
+                profile.metadata_write_ms +|= monotonicMs() -| write_start;
+                profile.metadata_blocks +|= 1;
+                profile.metadata_bytes_written +|= @intCast(block.len);
+                if (maybe_inline_cas) |*inline_cas| {
+                    const cas_start = monotonicMs();
+                    try inline_cas.writeBytes(block);
+                    profile.inline_cas_metadata_ms +|= monotonicMs() -| cas_start;
+                }
             },
             .data => |source| {
                 const written_blocks = try writeDataRun(
@@ -1469,23 +1517,42 @@ fn writeImage(
                     &source_block,
                     source_buffer,
                     if (maybe_inline_cas) |*inline_cas| inline_cas else null,
+                    profile,
                 );
                 block_index += written_blocks;
                 continue;
             },
             .zero => {
+                const zero_start = monotonicMs();
                 const zero_blocks = zeroRunLength(emit_blocks, block_index, zero_buffer.len / block_size);
-                if (maybe_inline_cas) |*inline_cas| try inline_cas.writeZeroBytes(zero_blocks * block_size);
+                profile.zero_blocks +|= @intCast(zero_blocks);
+                profile.zero_bytes_skipped +|= @as(u64, @intCast(zero_blocks)) * block_size;
+                if (maybe_inline_cas) |*inline_cas| {
+                    const cas_start = monotonicMs();
+                    try inline_cas.writeZeroBytes(zero_blocks * block_size);
+                    profile.inline_cas_zero_ms +|= monotonicMs() -| cas_start;
+                }
+                profile.zero_ms +|= monotonicMs() -| zero_start;
                 block_index += zero_blocks;
                 continue;
             },
         }
         block_index += 1;
     }
-    const preload_result = if (maybe_inline_cas) |*inline_cas| try inline_cas.finish() else null;
+    const preload_result = if (maybe_inline_cas) |*inline_cas| blk: {
+        const cas_finish_start = monotonicMs();
+        const result = try inline_cas.finish();
+        profile.inline_cas_finish_ms +|= monotonicMs() -| cas_finish_start;
+        break :blk result;
+    } else null;
+    const close_start = monotonicMs();
+    file.close(io);
+    file_closed = true;
+    profile.file_close_ms +|= monotonicMs() -| close_start;
     return .{
         .size = image_size,
         .preload_result = preload_result,
+        .profile = profile.*,
     };
 }
 
@@ -1528,17 +1595,29 @@ fn writeDataRun(
     fallback_block: *[block_size]u8,
     buffer: []u8,
     inline_cas: ?*InlineRootfsCas,
+    profile: *EmitProfile,
 ) !usize {
     const run_blocks = dataRunLength(emit_blocks, first, first_block_no, buffer.len / block_size);
     if (run_blocks <= 1) {
+        const read_start = monotonicMs();
         try readDataBlock(allocator, io, cache, first, fallback_block);
+        profile.source_read_ms +|= monotonicMs() -| read_start;
+        const write_start = monotonicMs();
         try output.writePositionalAll(io, fallback_block, output_offset);
-        if (inline_cas) |cas| try cas.writeBytes(fallback_block[0..]);
+        profile.data_write_ms +|= monotonicMs() -| write_start;
+        profile.data_blocks +|= 1;
+        profile.data_bytes_written +|= @intCast(block_size);
+        if (inline_cas) |cas| {
+            const cas_start = monotonicMs();
+            try cas.writeBytes(fallback_block[0..]);
+            profile.inline_cas_data_ms +|= monotonicMs() -| cas_start;
+        }
         return 1;
     }
 
     const byte_len = run_blocks * block_size;
     var source_len: usize = undefined;
+    const read_start = monotonicMs();
     switch (first.source) {
         .memory => |data| {
             const start: usize = @intCast(first.offset);
@@ -1553,9 +1632,18 @@ fn writeDataRun(
             if (n != source_len) return error.UnexpectedEndOfStream;
         },
     }
+    profile.source_read_ms +|= monotonicMs() -| read_start;
     if (source_len < byte_len) @memset(buffer[source_len..byte_len], 0);
+    const write_start = monotonicMs();
     try output.writePositionalAll(io, buffer[0..byte_len], output_offset);
-    if (inline_cas) |cas| try cas.writeBytes(buffer[0..byte_len]);
+    profile.data_write_ms +|= monotonicMs() -| write_start;
+    profile.data_blocks +|= @intCast(run_blocks);
+    profile.data_bytes_written +|= @intCast(byte_len);
+    if (inline_cas) |cas| {
+        const cas_start = monotonicMs();
+        try cas.writeBytes(buffer[0..byte_len]);
+        profile.inline_cas_data_ms +|= monotonicMs() -| cas_start;
+    }
     return run_blocks;
 }
 
