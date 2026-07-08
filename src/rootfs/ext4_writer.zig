@@ -153,6 +153,7 @@ const DirChild = struct {
 const PlannedImage = struct {
     inodes: std.ArrayList(InodePlan) = .empty,
     paths: std.ArrayList(PathRef) = .empty,
+    path_index: std.StringHashMap(usize),
 
     fn deinit(self: *PlannedImage, allocator: std.mem.Allocator) void {
         for (self.inodes.items) |inode| {
@@ -161,6 +162,13 @@ const PlannedImage = struct {
         }
         self.inodes.deinit(allocator);
         self.paths.deinit(allocator);
+        self.path_index.deinit();
+    }
+
+    fn appendPath(self: *PlannedImage, allocator: std.mem.Allocator, path: []const u8, inode_index: usize) !void {
+        try self.paths.append(allocator, .{ .path = path, .inode_index = inode_index });
+        errdefer _ = self.paths.pop();
+        try self.path_index.put(path, inode_index);
     }
 };
 
@@ -313,7 +321,7 @@ fn lessMergedPathRef(_: void, a: MergedPathRef, b: MergedPathRef) bool {
 }
 
 fn planImage(allocator: std.mem.Allocator, entries: []const Entry, inode_count: u32) !PlannedImage {
-    var planned = PlannedImage{};
+    var planned = PlannedImage{ .path_index = std.StringHashMap(usize).init(allocator) };
     errdefer planned.deinit(allocator);
 
     try planned.inodes.append(allocator, .{
@@ -323,7 +331,7 @@ fn planImage(allocator: std.mem.Allocator, entries: []const Entry, inode_count: 
         .uid = 0,
         .gid = 0,
     });
-    try planned.paths.append(allocator, .{ .path = "", .inode_index = 0 });
+    try planned.appendPath(allocator, "", 0);
 
     _ = try ensureDirectoryPath(allocator, &planned, "lost+found", 0o700, 0, 0, lost_found_inode);
 
@@ -348,10 +356,10 @@ fn planImage(allocator: std.mem.Allocator, entries: []const Entry, inode_count: 
             },
             .hardlink => unreachable,
             else => {
-                if (pathIndex(planned.paths.items, normalized) != null) return error.DuplicateRootFSEntry;
+                if (pathIndex(&planned, normalized) != null) return error.DuplicateRootFSEntry;
                 if (next_inode > inode_count) return error.RootFSTooManyInodes;
                 try planned.inodes.append(allocator, try entryInodePlan(entry, normalized, next_inode));
-                try planned.paths.append(allocator, .{ .path = normalized, .inode_index = planned.inodes.items.len - 1 });
+                try planned.appendPath(allocator, normalized, planned.inodes.items.len - 1);
                 next_inode += 1;
             },
         }
@@ -366,11 +374,11 @@ fn planImage(allocator: std.mem.Allocator, entries: []const Entry, inode_count: 
         if (std.mem.eql(u8, normalized, "lost+found")) return error.DuplicateRootFSEntry;
         try ensureParents(allocator, &planned, normalized, &next_inode, inode_count);
         const target_path = try validatePath(target);
-        const target_path_index = pathIndex(planned.paths.items, target_path) orelse return error.BadHardlinkTarget;
+        const target_path_index = pathIndex(&planned, target_path) orelse return error.BadHardlinkTarget;
         const target_inode = planned.inodes.items[target_path_index.inode_index];
         if (target_inode.kind != .file) return error.BadHardlinkTarget;
-        if (pathIndex(planned.paths.items, normalized) != null) return error.DuplicateRootFSEntry;
-        try planned.paths.append(allocator, .{ .path = normalized, .inode_index = target_path_index.inode_index });
+        if (pathIndex(&planned, normalized) != null) return error.DuplicateRootFSEntry;
+        try planned.appendPath(allocator, normalized, target_path_index.inode_index);
     }
 
     try computeLinkCounts(&planned);
@@ -390,7 +398,7 @@ fn ensureDirectoryPath(
     gid: u32,
     inode_no: u32,
 ) !bool {
-    if (pathIndex(planned.paths.items, path)) |existing| {
+    if (pathIndex(planned, path)) |existing| {
         const inode = &planned.inodes.items[existing.inode_index];
         if (inode.kind != .directory) return error.ParentNotDirectory;
         inode.mode = s_ifdir | (mode & 0o7777);
@@ -405,7 +413,7 @@ fn ensureDirectoryPath(
         .uid = uid,
         .gid = gid,
     });
-    try planned.paths.append(allocator, .{ .path = path, .inode_index = planned.inodes.items.len - 1 });
+    try planned.appendPath(allocator, path, planned.inodes.items.len - 1);
     return true;
 }
 
@@ -419,7 +427,7 @@ fn ensureParents(
     var slash_index: usize = 0;
     while (std.mem.indexOfScalarPos(u8, path, slash_index, '/')) |slash| {
         const parent = path[0..slash];
-        if (parent.len != 0 and pathIndex(planned.paths.items, parent) == null) {
+        if (parent.len != 0 and pathIndex(planned, parent) == null) {
             if (next_inode.* > inode_count) return error.RootFSTooManyInodes;
             if (try ensureDirectoryPath(allocator, planned, parent, 0o755, 0, 0, next_inode.*)) {
                 next_inode.* += 1;
@@ -501,7 +509,7 @@ fn computeLinkCounts(planned: *PlannedImage) !void {
         if (path_ref.path.len == 0) continue;
         const inode = &planned.inodes.items[path_ref.inode_index];
         if (inode.kind == .directory) {
-            if (parentPathIndex(planned.paths.items, path_ref.path)) |parent| {
+            if (parentPathIndex(planned, path_ref.path)) |parent| {
                 planned.inodes.items[parent.inode_index].links = try addLink(planned.inodes.items[parent.inode_index].links);
             }
         } else {
@@ -772,7 +780,7 @@ fn directoryBytes(allocator: std.mem.Allocator, planned: *const PlannedImage, in
     const parent_inode = if (self_path.len == 0)
         inode.ino
     else blk: {
-        const parent = parentPathIndex(planned.paths.items, self_path) orelse return error.BadExt4Tree;
+        const parent = parentPathIndex(planned, self_path) orelse return error.BadExt4Tree;
         break :blk planned.inodes.items[parent.inode_index].ino;
     };
     try appendDirent(allocator, &out, parent_inode, "..", file_type_dir, false);
@@ -1257,19 +1265,15 @@ fn setBitmapTail(bitmap: []u8, valid_bits: u32) void {
     }
 }
 
-fn pathIndex(paths: []const PathRef, path: []const u8) ?PathLookup {
-    for (paths) |path_ref| {
-        if (std.mem.eql(u8, path_ref.path, path)) return .{ .inode_index = path_ref.inode_index };
-    }
-    return null;
+fn pathIndex(planned: *const PlannedImage, path: []const u8) ?PathLookup {
+    const inode_index = planned.path_index.get(path) orelse return null;
+    return .{ .inode_index = inode_index };
 }
 
-fn parentPathIndex(paths: []const PathRef, path: []const u8) ?PathRef {
+fn parentPathIndex(planned: *const PlannedImage, path: []const u8) ?PathRef {
     const parent = parentPath(path);
-    for (paths) |path_ref| {
-        if (std.mem.eql(u8, path_ref.path, parent)) return path_ref;
-    }
-    return null;
+    const inode_index = planned.path_index.get(parent) orelse return null;
+    return .{ .path = parent, .inode_index = inode_index };
 }
 
 fn pathForInode(planned: *const PlannedImage, inode_no: u32) ?[]const u8 {
