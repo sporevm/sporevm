@@ -191,6 +191,32 @@ than external on this image, dominated by `native_ext4_emit`; the default flip
 proceeds on correctness, determinism, and dependency-freedom, with emit
 batching tracked under Known Limits as the throughput follow-up.
 
+Note: the v5 symlink-boundary fix below changes emitted bytes for images
+containing 60-byte symlink targets (including `buildkite/agent:3`), so the
+BLAKE3 prefixes above no longer reproduce on v5.
+
+### OSS Comparison
+
+Recorded on 2026-07-08 with
+`scripts/benchmark-ext4-writer-comparison.py --tar <docker export of buildkite/agent:3>`
+(312 MiB flattened tar, macOS arm64), after the symlink-boundary fix:
+
+| Tool | Wall | Conversion | Output size | e2fsck -fn |
+| --- | ---: | ---: | ---: | --- |
+| `spore (native)` | 23.47s | 20.33s | 592 MiB | clean |
+| `spore (external)` | 11.37s | 4.93s | 592 MiB | clean |
+| `tar2ext4` (hcsshim v0.14.1) | 173ms | 173ms | 323 MiB | exit 4 (bitmap padding nit only) |
+
+The single-layer flat-tar path removes multi-layer merge cost, which is why
+external conversion is faster here than in the table above. The headline is
+tar2ext4: compactext4 converts the same content roughly 100x faster than
+`native_ext4_emit` by buffering and writing sequentially, versus our one
+positional 4 KiB write per data block. That bounds the emit-batching follow-up:
+sub-second conversion is achievable for this size class on this hardware.
+This comparison also caught the 60-byte symlink bug — the harness runs
+`e2fsck -fn` on every output and stays useful as a cross-implementation
+correctness check.
+
 ## Next: Inline Chunk Index Emission For U4
 
 The next real storage slice is not more rootfs CAS plumbing. It is extending the
