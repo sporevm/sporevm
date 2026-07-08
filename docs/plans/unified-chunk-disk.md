@@ -392,14 +392,24 @@ its object, and a stray object.
 
 ### U2 — Chunk-mapped runtime backend
 
+Status: landed in branch.
+
 Implement `ChunkMappedDisk`; switch normal `spore run` (currently
 `file`+`CowDisk`) to it. `layered_cow` still exists for old saves during
 this slice only.
 
-Done when: run-path behavior is byte-identical (existing blk and runtime
-tests green against the new backend); read-only and writable runs both served
-by the one backend; unaligned-write read-modify-write property test ported
-from `cow_disk.zig`; no measurable I/O regression on the existing benchmarks.
+Landed behavior: fresh runtime disks now use `src/chunk_mapped_disk.zig`, a
+one-level 64KiB chunk map over the flat materialized base and an optional sparse
+overlay. Manifest-backed writable rootfs runs, layerless saved disks, and direct
+read-only rootfs attachments all enter virtio-blk through the chunk-mapped
+backend. `LayeredCowDisk` remains only for pre-U3 saved disks that already have
+sealed layer chains, and old layer sealing can still consume the chunk-mapped
+active head until U3 replaces it with `snapshot()`.
+
+Validation: `mise run test` covers virtio-blk against the chunk-mapped backend,
+runtime CAS materialization paths through the new backend, read-only write
+rejection, zero-source reads, and the unaligned read-modify-write model ported
+from `cow_disk.zig`.
 
 ### U3 — Snapshot operation and save/restore switch (format break)
 

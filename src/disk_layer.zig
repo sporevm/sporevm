@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const block_source = @import("block_source.zig");
+const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
 const chunk = @import("chunk.zig");
 const cow_disk = @import("cow_disk.zig");
 const spore = @import("spore.zig");
@@ -17,7 +18,7 @@ pub const layer_index_max_bytes: usize = 64 * 1024 * 1024;
 
 extern "c" fn mkstemp(template: [*:0]u8) c_int;
 
-pub const Error = spore.Error || cow_disk.Error || error{
+pub const Error = spore.Error || chunk_mapped_disk.Error || cow_disk.Error || error{
     ShortRead,
     ShortWrite,
 };
@@ -213,11 +214,13 @@ pub const LayeredCowDisk = struct {
 };
 
 pub const ActiveHead = union(enum) {
+    chunk_mapped: *chunk_mapped_disk.ChunkMappedDisk,
     cow: *cow_disk.CowDisk,
     layered_cow: *LayeredCowDisk,
 
     pub fn dirtyClusterCount(self: ActiveHead) usize {
         return switch (self) {
+            .chunk_mapped => |disk| disk.dirtyClusterCount(),
             .cow => |disk| disk.dirtyClusterCount(),
             .layered_cow => |disk| disk.dirtyClusterCount(),
         };
@@ -225,6 +228,7 @@ pub const ActiveHead = union(enum) {
 
     pub fn seal(self: ActiveHead, allocator: std.mem.Allocator, dir: []const u8) Error!SealResult {
         return switch (self) {
+            .chunk_mapped => |disk| sealDisk(allocator, dir, disk),
             .cow => |disk| sealDisk(allocator, dir, disk),
             .layered_cow => |disk| sealDisk(allocator, dir, disk),
         };
@@ -232,6 +236,7 @@ pub const ActiveHead = union(enum) {
 
     pub fn sourceDir(self: ActiveHead) ?[]const u8 {
         return switch (self) {
+            .chunk_mapped => null,
             .cow => null,
             .layered_cow => |disk| disk.dir,
         };

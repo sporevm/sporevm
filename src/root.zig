@@ -15,6 +15,7 @@ pub const boot_harness = @import("boot_harness.zig");
 pub const bundle = @import("bundle.zig");
 pub const capture = @import("capture.zig");
 pub const chunk = @import("chunk.zig");
+pub const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
 pub const contracts = @import("contracts.zig");
 pub const cow_disk = @import("cow_disk.zig");
 pub const disk_layer = @import("disk_layer.zig");
@@ -78,6 +79,7 @@ test {
     testing.refAllDecls(block_source);
     testing.refAllDecls(bundle);
     testing.refAllDecls(capture);
+    testing.refAllDecls(chunk_mapped_disk);
     testing.refAllDecls(contracts);
     testing.refAllDecls(cow_disk);
     testing.refAllDecls(disk_layer);

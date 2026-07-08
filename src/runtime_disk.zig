@@ -3,8 +3,8 @@
 const std = @import("std");
 
 const block_source = @import("block_source.zig");
+const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
 const Context = @import("context.zig").Context;
-const cow_disk = @import("cow_disk.zig");
 const disk_layer = @import("disk_layer.zig");
 const fd_util = @import("fd.zig");
 const local_paths = @import("local_paths.zig");
@@ -30,13 +30,13 @@ pub const RuntimeDisk = struct {
     trace_fd: ?std.c.fd_t = null,
     rootfs_fd: ?std.c.fd_t = null,
     overlay: ?disk_layer.TempOverlay = null,
-    cow: ?cow_disk.CowDisk = null,
+    chunk_mapped: ?chunk_mapped_disk.ChunkMappedDisk = null,
     layered_cow: ?disk_layer.LayeredCowDisk = null,
     base_disk: ?spore.Disk = null,
 
     pub fn backend(self: *RuntimeDisk) ?virtio_blk.Backend {
         if (self.layered_cow) |*disk| return .{ .layered_cow = disk };
-        if (self.cow) |*disk| return .{ .cow = disk };
+        if (self.chunk_mapped) |*disk| return .{ .chunk_mapped = disk };
         if (self.rootfs_fd) |fd| return .{ .file = fd };
         return null;
     }
@@ -44,13 +44,13 @@ pub const RuntimeDisk = struct {
     pub fn snapshot(self: *RuntimeDisk) ?disk_layer.SnapshotState {
         const base = self.base_disk orelse return null;
         if (self.layered_cow) |*disk| return .{ .base = base, .active = .{ .layered_cow = disk } };
-        if (self.cow) |*disk| return .{ .base = base, .active = .{ .cow = disk } };
+        if (self.chunk_mapped) |*disk| return .{ .base = base, .active = .{ .chunk_mapped = disk } };
         return null;
     }
 
     pub fn deinit(self: *RuntimeDisk) void {
         if (self.layered_cow) |*disk| disk.deinit();
-        if (self.cow) |*disk| disk.deinit();
+        if (self.chunk_mapped) |*disk| disk.deinit();
         if (self.overlay) |*overlay| overlay.deinit();
         if (self.rootfs_fd) |fd| _ = std.c.close(fd);
         if (self.trace_fd) |fd| _ = std.c.close(fd);
@@ -101,7 +101,7 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         const base_source = try runtime.baseSource(disk.size);
         runtime.overlay = try disk_layer.createTempOverlay(allocator);
         if (disk.layers.len == 0) {
-            runtime.cow = try cow_disk.CowDisk.init(allocator, base_source, runtime.overlay.?.fd, disk.size, disk_layer.default_cluster_size);
+            runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, disk.size, rootfs_cas.default_chunk_size);
             runtime.base_disk = disk;
         } else {
             const layers = try disk_layer.loadLayerChain(allocator, spore_dir, disk);
@@ -116,9 +116,15 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         runtime.overlay = try disk_layer.createTempOverlay(allocator);
         const base = disk_layer.diskFromRootfs(rootfs);
         const base_source = try runtime.baseSource(base.size);
-        runtime.cow = try cow_disk.CowDisk.init(allocator, base_source, runtime.overlay.?.fd, base.size, disk_layer.default_cluster_size);
+        runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, base.size, rootfs_cas.default_chunk_size);
         runtime.base_disk = base;
         return runtime;
+    }
+
+    if (runtime.rootfs_fd) |fd| {
+        const size = try fdSize(fd);
+        const base_source = try runtime.baseSource(size);
+        runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initReadOnly(allocator, base_source, size, rootfs_cas.default_chunk_size);
     }
 
     return runtime;
@@ -131,6 +137,16 @@ fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSOpenFailed;
     return fd;
+}
+
+fn fdSize(fd: std.c.fd_t) !u64 {
+    const cur = std.c.lseek(fd, 0, std.c.SEEK.CUR);
+    if (cur < 0) return error.BadManifest;
+    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (end < 0) return error.BadManifest;
+    if (std.c.lseek(fd, cur, std.c.SEEK.SET) < 0) return error.BadManifest;
+    if (end == 0) return error.BadManifest;
+    return @intCast(end);
 }
 
 fn openTrustedRootfs(context: Context, allocator: std.mem.Allocator, rootfs: spore.Rootfs, trace_fd: ?std.c.fd_t) !std.c.fd_t {
@@ -295,11 +311,11 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
     defer runtime.deinit();
 
     try std.testing.expect(runtime.rootfs_fd != null);
-    try std.testing.expect(runtime.cow != null);
+    try std.testing.expect(runtime.chunk_mapped != null);
     var readback: [4]u8 = undefined;
-    try runtime.cow.?.readAt(&readback, 0);
+    try runtime.chunk_mapped.?.readAt(&readback, 0);
     try std.testing.expectEqualStrings("abcd", &readback);
-    try runtime.cow.?.readAt(&readback, rootfs_bytes.len - 4);
+    try runtime.chunk_mapped.?.readAt(&readback, rootfs_bytes.len - 4);
     try std.testing.expectEqualStrings("efgh", &readback);
     const trace_bytes = try Io.Dir.cwd().readFileAlloc(io, trace_path, arena, .limited(4096));
     try std.testing.expect(std.mem.indexOf(u8, trace_bytes, "\"event\":\"rootfs_open\"") != null);
@@ -343,9 +359,9 @@ test "runtime disk assembles the flat artifact from chunks when it is missing" {
     defer runtime.deinit();
 
     try std.testing.expect(runtime.rootfs_fd != null);
-    try std.testing.expect(runtime.cow != null);
+    try std.testing.expect(runtime.chunk_mapped != null);
     var readback: [4]u8 = undefined;
-    try runtime.cow.?.readAt(&readback, 0);
+    try runtime.chunk_mapped.?.readAt(&readback, 0);
     try std.testing.expectEqualStrings("abcd", &readback);
     // The assembled flat artifact is republished into the by-digest cache.
     try std.testing.expect(try rootfs_cache.regularFileNoSymlink(io, digest_path));
@@ -390,9 +406,9 @@ test "runtime disk reassembles the flat artifact when the cached entry is the wr
     defer runtime.deinit();
 
     try std.testing.expect(runtime.rootfs_fd != null);
-    try std.testing.expect(runtime.cow != null);
+    try std.testing.expect(runtime.chunk_mapped != null);
     var readback: [4]u8 = undefined;
-    try runtime.cow.?.readAt(&readback, 0);
+    try runtime.chunk_mapped.?.readAt(&readback, 0);
     try std.testing.expectEqualStrings("abcd", &readback);
     // Rename-over publication self-healed the corrupt cache entry.
     const healed = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(1 << 20));
