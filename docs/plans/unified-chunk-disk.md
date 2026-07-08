@@ -253,13 +253,19 @@ snapshot(disk) -> DiskIndex:
   identity = blake3(new index); persist index; thaw
 ```
 
-Target shape is O(dirty) by construction. The current U3 v1 implementation is
-more conservative: `ChunkMappedDisk.snapshotIndex()` scans all logical chunks
-because it does not yet retain the opened parent index identity. This is an
-accepted v1 deviation, not the end-state performance contract. The operation
-already exists in the tree for RAM: `dirty_ram.zig` seals dirty 2MiB memory
-chunks into verified chunk refs plus a same-host backing file, with parallel
-workers, zero-scan elision, write-if-missing dedupe, and phase-level stats.
+Target shape is O(dirty) by construction. `ChunkMappedDisk` retains the
+opened parent index identity when a disk is opened from a chunk index, so
+`snapshotIndex()` can seal only overlay-backed dirty chunks and emit the new
+index as the parent index with dirty entries replaced. Clean chunks keep their
+parent digest or zero entry without reading or hashing the materialized bytes
+when the new index is published into the same CAS root that already holds the
+parent objects. Disks opened without a parent index, or snapshots published
+into a different CAS root, still use the full-scan path because there is no
+self-contained prior identity to preserve in that destination store. The
+operation already exists in the tree for RAM: `dirty_ram.zig` seals dirty 2MiB
+memory chunks into verified chunk refs plus a same-host backing file, with
+parallel workers, zero-scan elision, write-if-missing dedupe, and phase-level
+stats.
 Disk does not get its own sealer: U3 extracts the generic core out of
 `dirty_ram.zig` into a shared module (working name `chunk_sealer.zig`)
 parameterized by chunk size, dirty source, and object-write target, with
@@ -425,22 +431,24 @@ restore/resume to open indexes. Delete `LayeredCowDisk`, layer chains,
 
 Landed behavior: RAM sealing and disk snapshotting share
 `src/chunk_sealer.zig` for zero elision, BLAKE3 chunk identity, and verified
-write-if-missing CAS publication. `ChunkMappedDisk.snapshotIndex()` writes
-nonzero chunks and a `spore-disk-index-v1` under the rootfs CAS namespace and
-returns a `chunk-index-disk-v0` manifest disk. Runtime restore materializes
-`chunk-index-disk-v0` manifests from the saved index and chunk objects before
-attaching virtio-blk; old layer chains are no longer opened by
-`runtime_disk.open`. `LayeredCowDisk`, `loadLayerChain`, disk-layer sealing,
-and the `spore.DiskLayer` parser have been deleted.
+write-if-missing CAS publication. `ChunkMappedDisk.snapshotIndex()` retains
+the parent index for index-opened disks, seals only overlay-backed dirty chunks
+when publishing into the same CAS root, writes nonzero dirty chunks and a
+`spore-disk-index-v1` under the rootfs CAS namespace, and returns a
+`chunk-index-disk-v0` manifest disk. Disks opened without a parent index, or
+snapshots published into a different CAS root, keep the full-scan snapshot
+path. Runtime restore materializes `chunk-index-disk-v0` manifests from the
+saved index and chunk objects before attaching virtio-blk; old layer chains are
+no longer opened by `runtime_disk.open`. `LayeredCowDisk`, `loadLayerChain`,
+disk-layer sealing, and the `spore.DiskLayer` parser have been deleted.
 
 Validation: `mise run test` covers the RAM sealer on the shared core, direct
 disk snapshot index/object emission, and runtime restore of a chunk-index disk
-manifest preserving guest-visible bytes.
-
-Follow-up: `snapshotIndex()` can now be tightened to O(dirty) by retaining the
-opened parent index identity in `ChunkMappedDisk`; that optimization is tracked
-with the fork/partial-materialization work rather than blocking the format
-switch.
+manifest preserving guest-visible bytes. `src/chunk_mapped_disk.zig` also
+compares O(dirty) snapshot output from an index-opened fork chain against a
+full rescan of the materialized image, including dirty zero chunks and chunks
+rewritten back to their parent content, and asserts the sealer work count
+matches the dirty chunk count rather than total logical chunks.
 
 Done when: save→restore round trip preserves guest-visible disk state
 (existing lifecycle tests, rewritten for v2); the RAM sealer's existing
