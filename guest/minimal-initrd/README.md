@@ -34,6 +34,6 @@ startup.
 `gencheck.c` verifies forked `spore run --from` commands start after generation
 metadata and resume entropy are visible in `/run/sporevm/env`.
 
-Keep this directory source-only. `scripts/make-minimal-exec-initrd.sh` owns
+Keep this directory source-only. `scripts/kernel/make-minimal-exec-initrd.sh` owns
 compiling these files, building the pinned Toybox source dependency into a
 static aarch64 binary, and packing the initrd.

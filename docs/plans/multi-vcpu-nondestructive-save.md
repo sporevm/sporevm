@@ -4,8 +4,8 @@ last_reviewed: 2026-07-06
 spec_refs:
   - docs/lifecycle.md
   - docs/state-portability.md
-  - scripts/smoke-multi-vcpu.sh
-  - scripts/smoke-writable-rootfs.sh
+  - test/smoke/fanout/multi-vcpu.sh
+  - test/smoke/rootfs/writable.sh
   - src/lifecycle.zig
 ---
 
@@ -36,7 +36,7 @@ fails closed instead of silently falling back to `--stop`.
 
 ## Done When
 
-- `scripts/smoke-writable-rootfs.sh` or a focused sibling covers disk-backed
+- `test/smoke/rootfs/writable.sh` or a focused sibling covers disk-backed
   multi-vCPU non-destructive save point-in-time behavior.
 - KVM and HVF pause numbers are recorded in the PR or a durable docs note.
 - KVM named lifecycle smoke passes with the multi-vCPU non-destructive save

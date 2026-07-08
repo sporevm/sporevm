@@ -36,10 +36,10 @@ per-runner latest metrics/history for the public macOS and Linux ARM64 options.
 ## Profiles
 
 ```console
-scripts/benchmark-sporevm-suite.py --profile smoke
-scripts/benchmark-sporevm-suite.py --profile ci
-scripts/benchmark-sporevm-suite.py --profile comparison
-scripts/benchmark-sporevm-suite.py --profile full
+scripts/benchmark/suite.py --profile smoke
+scripts/benchmark/suite.py --profile ci
+scripts/benchmark/suite.py --profile comparison
+scripts/benchmark/suite.py --profile full
 ```
 
 - `smoke`: one sequential iteration plus a tiny warm/distribution pass and one
@@ -65,7 +65,7 @@ launch path rather than the first-slice `auto` memory contract. Pass
 
 ## CI Defaults
 
-CI benchmark builds (`scripts/ci-buildkite-benchmarks.sh`, triggered from the
+CI benchmark builds (`scripts/ci/buildkite-benchmarks.sh`, triggered from the
 main pipeline) default to `public.ecr.aws/docker/library/node:22-alpine` with
 the suite's default `node -v` first command, on every branch. This keeps the
 published trends like-for-like with the public
@@ -140,7 +140,7 @@ staggered/burst modes too.
 Writable rootfs benchmarks wrap the product-path helper:
 
 ```text
-scripts/benchmark-writable-rootfs.sh --no-build --output writable-rootfs.jsonl
+scripts/benchmark/writable-rootfs.sh --no-build --output writable-rootfs.jsonl
 ```
 
 The suite adapts that JSONL into the same summary and comparison format as the
@@ -162,7 +162,7 @@ Profile defaults keep this bounded because writable-rootfs work is much heavier
 than the Node startup loops. Override with:
 
 ```console
-scripts/benchmark-sporevm-suite.py \
+scripts/benchmark/suite.py \
   --benchmarks writable_rootfs \
   --writable-rootfs-iterations 3 \
   --writable-rootfs-workloads sqlite,package
@@ -188,7 +188,7 @@ Use the standalone memory-throughput probe when the question is guest copy speed
 rather than startup time:
 
 ```console
-scripts/benchmark-memory-throughput.py --iterations 5
+scripts/benchmark/memory-throughput.py --iterations 5
 ```
 
 It runs the same Node `Buffer.copy` workload natively and through one-shot
@@ -212,7 +212,7 @@ offsets, and log paths. Batch rows include `wall_clock_ms` and
 Compare two summary files with:
 
 ```console
-scripts/compare-sporevm-benchmarks.py baseline-summary.json candidate-summary.json
+scripts/benchmark/compare.py baseline-summary.json candidate-summary.json
 ```
 
 Defaults fail when:
@@ -250,7 +250,7 @@ frames expose listen, request accept/decode, spawn, and exit slices.
 Append to an existing published history with:
 
 ```console
-scripts/export-sporevm-benchmark-data.py \
+scripts/benchmark/export-site-data.py \
   zig-cache/sporevm-benchmarks/latest-summary.json \
   --history public-benchmarks/data.json \
   --json-out public-benchmarks/data.json \
@@ -258,8 +258,8 @@ scripts/export-sporevm-benchmark-data.py \
 ```
 
 Keep separate histories for different hardware classes or profiles. A `ci`
-profile on a busy shared runner and a `full` profile on fixed A1 hardware answer
-different questions.
+profile on a busy shared runner and a `full` profile on fixed Linux/KVM hardware
+answer different questions.
 
 Buildkite publishes the website projection to:
 

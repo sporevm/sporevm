@@ -374,6 +374,16 @@ state only, diskless named live fork, and no hardened public-cloud
 multi-tenant isolation claim. The detailed contracts are in the docs linked
 above.
 
+## Repository layout
+
+- `src/`: SporeVM implementation, including backend-specific and shared device
+  model code.
+- `guest/`: source for guest initrd assets embedded by the build.
+- `test/`: unit smoke fixtures, product smoke tests, and remote hardware
+  validation harnesses.
+- `scripts/`: CI, release, benchmark, kernel asset, and internal helper
+  automation.
+
 ## Validation
 
 Most local changes should start here:
