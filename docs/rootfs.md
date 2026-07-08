@@ -332,14 +332,26 @@ spore rootfs resolve ghcr.io/org/image:latest --platform linux/arm64
 ```
 
 The builder verifies fetched blobs against their SHA256 descriptors, applies OCI
-whiteouts, rejects unsafe tar paths, and shells out to `mkfs.ext4 -F -d` plus
-`debugfs` for the final filesystem.
+whiteouts, rejects unsafe tar paths, and writes the final deterministic ext4
+filesystem with SporeVM's native writer.
 
 The generated ext4 image uses UUID and directory hash seeds derived from the
 selected OCI manifest digest, normalizes filesystem and inode timestamps to the
 Unix epoch, and omits the ext4 journal and metadata checksum features so
 repeated builds of the same resolved image produce identical bytes.
 
-`mkfs.ext4` and `debugfs` are auto-detected from `PATH`, common Linux
+Set `SPOREVM_EXT4_WRITER=external` to use the legacy e2fsprogs writer.
+`mkfs.ext4` and `debugfs` are then auto-detected from `PATH`, common Linux
 locations, and Homebrew's `e2fsprogs` prefix. Use `--mkfs` and `--debugfs` to
-override the detected binaries.
+override the detected binaries for that external fallback.
+
+The first native default uses builder version `sporevm-rootfs-v4`; older `v3`
+rootfs cache entries are rebuilt once. Rootfs metadata records the selected
+writer, so switching `SPOREVM_EXT4_WRITER` forces a rebuild of the v4 cache
+entry instead of silently reusing an artifact produced by the other writer.
+
+The first native writer profile uses block maps without extents or
+triple-indirect blocks, so a single regular file larger than about 4 GiB fails
+closed with `UnsupportedExt4FileSize`. Set `SPOREVM_EXT4_WRITER=external` for
+images that need such files until native extents or triple-indirect support
+lands.

@@ -200,6 +200,10 @@ description = "Run the full benchmark suite"
 run = "scripts/compare-sporevm-benchmarks.py"
 description = "Compare two benchmark summary JSON files"
 
+[tasks."benchmark:rootfs-writers"]
+run = "mise run build && scripts/benchmark-rootfs-writers.py --no-build"
+description = "Compare native and external rootfs writer phase timings"
+
 [tasks."benchmark:export"]
 run = "scripts/export-sporevm-benchmark-data.py zig-cache/sporevm-benchmarks/latest-summary.json"
 description = "Export latest benchmark summary as static trend data"

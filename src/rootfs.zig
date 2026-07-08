@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const chunk = @import("chunk.zig");
 const ext4 = @import("rootfs/ext4.zig");
+pub const ext4_writer = @import("rootfs/ext4_writer.zig");
 const local_paths = @import("local_paths.zig");
 const oci = @import("rootfs/oci.zig");
 const oci_layout = @import("rootfs/oci_layout.zig");
@@ -23,8 +24,9 @@ const xattrs_mod = @import("rootfs/xattrs.zig");
 const Io = std.Io;
 
 const max_rootfs_layers: usize = 512;
-pub const builder_version = "sporevm-rootfs-v3";
+pub const builder_version = "sporevm-rootfs-v5";
 const rootfs_build_profile_env = "SPOREVM_ROOTFS_BUILD_PROFILE";
+const ext4_writer_env = "SPOREVM_EXT4_WRITER";
 const resolver_placeholder_path = "etc/resolv.conf";
 const resolver_placeholder_bytes =
     "# SporeVM generated placeholder; --net bind-mounts the guest resolver here.\n";
@@ -41,8 +43,8 @@ pub const usage =
     \\Options:
     \\  --platform <os/arch>       Target platform (default: linux/arm64)
     \\  --metadata <path>          Metadata sidecar path (default: <output>.json)
-    \\  --mkfs <path>              mkfs.ext4 binary (default: auto-detect)
-    \\  --debugfs <path>           debugfs binary (default: auto-detect)
+    \\  --mkfs <path>              external writer mkfs.ext4 binary (auto-detect)
+    \\  --debugfs <path>           external writer debugfs binary (auto-detect)
     \\
 ;
 
@@ -133,8 +135,9 @@ const BuildOptions = struct {
     output: []const u8,
     metadata: []const u8,
     platform: Platform = .{},
-    mkfs: []const u8,
-    debugfs: []const u8,
+    mkfs: ?[]const u8,
+    debugfs: ?[]const u8,
+    ext4_writer: Ext4Writer,
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: ?[]const u8 = null,
     cache_owned_output: bool = false,
@@ -536,6 +539,15 @@ const MaterializeResult = struct {
     rootfs_storage: ?spore.RootfsStorage,
 };
 
+pub const Ext4Writer = enum {
+    native,
+    external,
+
+    fn text(self: Ext4Writer) []const u8 {
+        return @tagName(self);
+    }
+};
+
 const RootfsBuildProfile = struct {
     enabled: bool,
     total_start_ms: u64,
@@ -589,6 +601,17 @@ fn rootfsBuildProfileEnabled(value: ?[]const u8) bool {
     return raw.len != 0;
 }
 
+fn ext4WriterFromEnvValue(value: ?[]const u8) !Ext4Writer {
+    const raw = value orelse return .native;
+    if (raw.len == 0 or std.mem.eql(u8, raw, "native")) return .native;
+    if (std.mem.eql(u8, raw, "external")) return .external;
+    return error.UnsupportedExt4Writer;
+}
+
+pub fn selectedExt4Writer(environ: *const std.process.Environ.Map) !Ext4Writer {
+    return ext4WriterFromEnvValue(environ.get(ext4_writer_env));
+}
+
 pub fn validateTaggedImageRef(raw_ref: []const u8) !void {
     _ = try ImageTag.parse(raw_ref);
 }
@@ -603,6 +626,7 @@ const BuildImageSource = struct {
 
 const RootFSMetadata = struct {
     builder_version: []const u8,
+    ext4_writer: []const u8,
     image_ref: []const u8,
     resolved_image_ref: []const u8,
     image_manifest_digest: []const u8,
@@ -763,13 +787,15 @@ fn validateManifestConfigPlatform(
 }
 
 pub fn build(init: std.process.Init, allocator: std.mem.Allocator, request: BuildRequest) !BuildResult {
+    const ext4_writer_choice = try selectedExt4Writer(init.environ_map);
     const opts = BuildOptions{
         .ref = request.ref,
         .output = request.output,
         .metadata = request.metadata,
         .platform = request.platform,
-        .mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.mkfs, .mkfs),
-        .debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.debugfs, .debugfs),
+        .mkfs = request.mkfs,
+        .debugfs = request.debugfs,
+        .ext4_writer = ext4_writer_choice,
         .metadata_rootfs_path = request.metadata_rootfs_path,
         .temp_dir_root = request.temp_dir_root,
     };
@@ -778,6 +804,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, request: Buil
 
 pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, request: ImportOciRequest) !ImportOciResult {
     _ = try parseLocalTagRef(request.ref);
+    const ext4_writer_choice = try selectedExt4Writer(init.environ_map);
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     defer allocator.free(cache_root);
     try ensureDirPath(init.io, cache_root);
@@ -803,7 +830,7 @@ pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, req
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
     const metadata_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
-    if (try cachedImportedRootfsBlake3(init, allocator, cache_root, resolved, rootfs_path, metadata_path, request.rootfs_storage)) |rootfs_blake3| {
+    if (try cachedImportedRootfsBlake3(init, allocator, cache_root, resolved, rootfs_path, metadata_path, request.rootfs_storage, ext4_writer_choice)) |rootfs_blake3| {
         const local_ref_path = try writeLocalRefCache(init.io, allocator, cache_root, request.ref, resolved);
         return .{
             .rootfs_path = rootfs_path,
@@ -827,8 +854,9 @@ pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, req
         .output = temp_rootfs_path,
         .metadata = temp_metadata_path,
         .platform = request.platform,
-        .mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.mkfs, .mkfs),
-        .debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.debugfs, .debugfs),
+        .mkfs = request.mkfs,
+        .debugfs = request.debugfs,
+        .ext4_writer = ext4_writer_choice,
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
         .rootfs_storage = request.rootfs_storage,
@@ -850,6 +878,7 @@ pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, req
 
 pub fn importTar(init: std.process.Init, allocator: std.mem.Allocator, request: ImportTarRequest) !ImportTarResult {
     _ = try parseLocalTagRef(request.ref);
+    const ext4_writer_choice = try selectedExt4Writer(init.environ_map);
     const input_stat = try Io.Dir.cwd().statFile(init.io, request.input, .{ .follow_symlinks = false });
     if (input_stat.kind != .file) return error.UnsupportedRootFSTarInput;
 
@@ -869,7 +898,7 @@ pub fn importTar(init: std.process.Init, allocator: std.mem.Allocator, request: 
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
     const metadata_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
-    if (try cachedImportedRootfsBlake3(init, allocator, cache_root, resolved, rootfs_path, metadata_path, request.rootfs_storage)) |rootfs_blake3| {
+    if (try cachedImportedRootfsBlake3(init, allocator, cache_root, resolved, rootfs_path, metadata_path, request.rootfs_storage, ext4_writer_choice)) |rootfs_blake3| {
         const local_ref_path = try writeLocalRefCache(init.io, allocator, cache_root, request.ref, resolved);
         return .{
             .rootfs_path = rootfs_path,
@@ -898,8 +927,9 @@ pub fn importTar(init: std.process.Init, allocator: std.mem.Allocator, request: 
         .output = temp_rootfs_path,
         .metadata = temp_metadata_path,
         .platform = request.platform,
-        .mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.mkfs, .mkfs),
-        .debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.debugfs, .debugfs),
+        .mkfs = request.mkfs,
+        .debugfs = request.debugfs,
+        .ext4_writer = ext4_writer_choice,
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
         .rootfs_storage = request.rootfs_storage,
@@ -983,8 +1013,9 @@ const LayoutBuildOptions = struct {
     output: []const u8,
     metadata: []const u8,
     platform: Platform = .{},
-    mkfs: []const u8,
-    debugfs: []const u8,
+    mkfs: ?[]const u8,
+    debugfs: ?[]const u8,
+    ext4_writer: Ext4Writer,
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: []const u8,
     rootfs_storage: RootfsStoragePolicy = .chunked,
@@ -999,8 +1030,9 @@ const TarBuildOptions = struct {
     output: []const u8,
     metadata: []const u8,
     platform: Platform = .{},
-    mkfs: []const u8,
-    debugfs: []const u8,
+    mkfs: ?[]const u8,
+    debugfs: ?[]const u8,
+    ext4_writer: Ext4Writer,
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: []const u8,
     rootfs_storage: RootfsStoragePolicy = .chunked,
@@ -1023,8 +1055,9 @@ const MaterializeOptions = struct {
     layers: []const MaterializeLayer,
     output: []const u8,
     metadata: []const u8,
-    mkfs: []const u8,
-    debugfs: []const u8,
+    mkfs: ?[]const u8,
+    debugfs: ?[]const u8,
+    ext4_writer: Ext4Writer,
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir: []const u8,
     profile: RootfsBuildProfile,
@@ -1103,6 +1136,7 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
         .metadata = opts.metadata,
         .mkfs = opts.mkfs,
         .debugfs = opts.debugfs,
+        .ext4_writer = opts.ext4_writer,
         .metadata_rootfs_path = opts.metadata_rootfs_path,
         .temp_dir = materialize_temp.path,
         .profile = profile,
@@ -1163,6 +1197,7 @@ fn buildRootFSFromLayout(init: std.process.Init, allocator: std.mem.Allocator, o
         .metadata = opts.metadata,
         .mkfs = opts.mkfs,
         .debugfs = opts.debugfs,
+        .ext4_writer = opts.ext4_writer,
         .metadata_rootfs_path = opts.metadata_rootfs_path,
         .temp_dir = materialize_temp.path,
         .profile = profile,
@@ -1213,6 +1248,7 @@ fn buildRootFSFromTar(init: std.process.Init, allocator: std.mem.Allocator, opts
         .metadata = opts.metadata,
         .mkfs = opts.mkfs,
         .debugfs = opts.debugfs,
+        .ext4_writer = opts.ext4_writer,
         .metadata_rootfs_path = opts.metadata_rootfs_path,
         .temp_dir = materialize_temp.path,
         .profile = profile,
@@ -1286,67 +1322,13 @@ fn runProcess(io: Io, argv: []const []const u8) !void {
 }
 
 fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: MaterializeOptions) !MaterializeResult {
-    const rootfs_dir_path = try std.fmt.allocPrint(allocator, "{s}/rootfs", .{opts.temp_dir});
-    var rootfs_dir = try Io.Dir.cwd().createDirPathOpen(init.io, rootfs_dir_path, .{
-        .open_options = .{ .access_sub_paths = true, .iterate = true },
-    });
-    defer rootfs_dir.close(init.io);
-    var owners = OwnershipMap.init(allocator);
-    defer ownership_mod.deinit(allocator, &owners);
-    var xattrs = XattrMap.init(allocator);
-    defer xattrs_mod.deinit(allocator, &xattrs);
-    const tar_options = tar.ApplyOptions{
-        .case_sensitive_staging = try tar.isCaseSensitiveDirectory(init.io, rootfs_dir),
-    };
-
     if (opts.layers.len > max_rootfs_layers) return error.RootFSTooManyLayers;
-
     const layer_meta = try allocator.alloc(oci.LayerMetadata, opts.layers.len);
-    const extraction_start = opts.profile.start();
-    for (opts.layers, 0..) |layer, i| {
-        if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
-        try tar.applyLayer(allocator, init.io, rootfs_dir, layer.path, layer.media_type, &owners, &xattrs, tar_options);
-        if (try ext4.dirContentSize(init.io, rootfs_dir) > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
-        layer_meta[i] = .{ .media_type = layer.media_type, .digest = layer.digest };
-    }
-    opts.profile.phase("layer_extract_staging", extraction_start);
-
-    const required_dirs_start = opts.profile.start();
-    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "dev", 0o755);
-    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "proc", 0o755);
-    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "run", 0o755);
-    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "sys", 0o755);
-    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "tmp", 0o1777);
-    try ensureResolverPlaceholder(allocator, init.io, rootfs_dir, &owners);
-    try recordImplicitDirectoryOwnership(allocator, init.io, rootfs_dir, &owners, "");
-    opts.profile.phase("rootfs_tree_finalize", required_dirs_start);
-
     const deterministic_ext4 = ext4.Determinism.fromDigest(opts.manifest_digest);
-    const normalize_start = opts.profile.start();
-    try ext4.normalizeHostTreeTimestamps(allocator, init.io, rootfs_dir, rootfs_dir_path);
-    opts.profile.phase("host_metadata_normalize", normalize_start);
-
-    const scan_start = opts.profile.start();
-    const content_size = try ext4.dirContentSize(init.io, rootfs_dir);
-    const inode_count = ext4.computeImageInodes(try ext4.dirEntryCount(init.io, rootfs_dir));
-    const image_size = ext4.computeImageSize(content_size);
-    opts.profile.phase("ext4_size_scan", scan_start);
-
-    const create_start = opts.profile.start();
-    try ext4.ensureParentDir(init.io, opts.output);
-    try ext4.createEmptyFile(init.io, opts.output, image_size);
-    opts.profile.phase("ext4_create_empty", create_start);
-    const mkfs_start = opts.profile.start();
-    try ext4.runMkfs(init, allocator, opts.mkfs, rootfs_dir_path, opts.output, deterministic_ext4, inode_count);
-    opts.profile.phase("mkfs_ext4", mkfs_start);
-    const debugfs_script = try std.fmt.allocPrint(allocator, "{s}/debugfs-ownership.cmds", .{opts.temp_dir});
-    const debugfs_start = opts.profile.start();
-    try ext4.runDebugfsFinalize(init, allocator, opts.debugfs, opts.output, debugfs_script, &owners, &xattrs, deterministic_ext4);
-    opts.profile.phase("debugfs_finalize", debugfs_start);
-
-    const blake3_start = opts.profile.start();
-    const rootfs_blake3 = try ext4.blake3File(init.io, opts.output);
-    opts.profile.phase("rootfs_blake3", blake3_start);
+    const rootfs_blake3 = switch (opts.ext4_writer) {
+        .native => try materializeRootFSNative(init, allocator, opts, layer_meta, deterministic_ext4),
+        .external => try materializeRootFSExternal(init, allocator, opts, layer_meta, deterministic_ext4),
+    };
     const rootfs_hex = try allocator.dupe(u8, &rootfs_blake3);
     const stat = try Io.Dir.cwd().statFile(init.io, opts.output, .{});
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
@@ -1383,6 +1365,7 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     try rejectMetadataOutputAlias(init.io, opts.output, opts.metadata);
     const metadata = RootFSMetadata{
         .builder_version = builder_version,
+        .ext4_writer = opts.ext4_writer.text(),
         .image_ref = opts.requested_ref,
         .resolved_image_ref = opts.resolved_image_ref,
         .image_manifest_digest = opts.manifest_digest,
@@ -1406,6 +1389,121 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     opts.profile.phase("metadata_write", metadata_start);
 
     return .{ .rootfs_blake3 = rootfs_blake3, .rootfs_storage = rootfs_storage };
+}
+
+fn materializeRootFSNative(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    opts: MaterializeOptions,
+    layer_meta: []oci.LayerMetadata,
+    deterministic_ext4: ext4.Determinism,
+) ![chunk.ChunkId.hex_len]u8 {
+    const native_layers = try allocator.alloc(tar.LayerInput, opts.layers.len);
+    defer allocator.free(native_layers);
+
+    const merge_start = opts.profile.start();
+    for (opts.layers, 0..) |layer, i| {
+        if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
+        layer_meta[i] = .{ .media_type = layer.media_type, .digest = layer.digest };
+        native_layers[i] = .{ .media_type = layer.media_type, .path = layer.path, .spill_dir = opts.temp_dir };
+    }
+    var tree = try tar.buildMergedTree(allocator, init.io, native_layers);
+    defer tree.deinit(allocator);
+    opts.profile.phase("tree_merge", merge_start);
+
+    const required_dirs_start = opts.profile.start();
+    try ensureRequiredMergedDir(allocator, &tree, "dev", 0o755);
+    try ensureRequiredMergedDir(allocator, &tree, "proc", 0o755);
+    try ensureRequiredMergedDir(allocator, &tree, "run", 0o755);
+    try ensureRequiredMergedDir(allocator, &tree, "sys", 0o755);
+    try ensureRequiredMergedDir(allocator, &tree, "tmp", 0o1777);
+    try ensureMergedResolverPlaceholder(allocator, &tree);
+    opts.profile.phase("rootfs_tree_finalize", required_dirs_start);
+
+    const scan_start = opts.profile.start();
+    const content_size = tree.contentSize();
+    if (content_size > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
+    const inode_count = ext4.computeImageInodes(tree.entryCount());
+    const image_size = ext4.computeImageSize(content_size);
+    opts.profile.phase("ext4_size_scan", scan_start);
+
+    const native_start = opts.profile.start();
+    const result = try ext4_writer.emitFromMergedTree(allocator, init.io, &tree, opts.output, .{
+        .image_size = image_size,
+        .inode_count = @intCast(inode_count),
+        .determinism = deterministic_ext4,
+    });
+    opts.profile.phase("native_ext4_emit", native_start);
+    return result.blake3;
+}
+
+fn materializeRootFSExternal(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    opts: MaterializeOptions,
+    layer_meta: []oci.LayerMetadata,
+    deterministic_ext4: ext4.Determinism,
+) ![chunk.ChunkId.hex_len]u8 {
+    const mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, opts.mkfs, .mkfs);
+    const debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, opts.debugfs, .debugfs);
+    const rootfs_dir_path = try std.fmt.allocPrint(allocator, "{s}/rootfs", .{opts.temp_dir});
+    var rootfs_dir = try Io.Dir.cwd().createDirPathOpen(init.io, rootfs_dir_path, .{
+        .open_options = .{ .access_sub_paths = true, .iterate = true },
+    });
+    defer rootfs_dir.close(init.io);
+    var owners = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &owners);
+    var xattrs = XattrMap.init(allocator);
+    defer xattrs_mod.deinit(allocator, &xattrs);
+    const tar_options = tar.ApplyOptions{
+        .case_sensitive_staging = try tar.isCaseSensitiveDirectory(init.io, rootfs_dir),
+    };
+
+    const extraction_start = opts.profile.start();
+    for (opts.layers, 0..) |layer, i| {
+        if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
+        try tar.applyLayer(allocator, init.io, rootfs_dir, layer.path, layer.media_type, &owners, &xattrs, tar_options);
+        if (try ext4.dirContentSize(init.io, rootfs_dir) > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
+        layer_meta[i] = .{ .media_type = layer.media_type, .digest = layer.digest };
+    }
+    opts.profile.phase("layer_extract_staging", extraction_start);
+
+    const required_dirs_start = opts.profile.start();
+    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "dev", 0o755);
+    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "proc", 0o755);
+    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "run", 0o755);
+    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "sys", 0o755);
+    try ensureRequiredDir(allocator, init.io, rootfs_dir, &owners, "tmp", 0o1777);
+    try ensureResolverPlaceholder(allocator, init.io, rootfs_dir, &owners);
+    try recordImplicitDirectoryOwnership(allocator, init.io, rootfs_dir, &owners, "");
+    opts.profile.phase("rootfs_tree_finalize", required_dirs_start);
+
+    const normalize_start = opts.profile.start();
+    try ext4.normalizeHostTreeTimestamps(allocator, init.io, rootfs_dir, rootfs_dir_path);
+    opts.profile.phase("host_metadata_normalize", normalize_start);
+
+    const scan_start = opts.profile.start();
+    const content_size = try ext4.dirContentSize(init.io, rootfs_dir);
+    const inode_count = ext4.computeImageInodes(try ext4.dirEntryCount(init.io, rootfs_dir));
+    const image_size = ext4.computeImageSize(content_size);
+    opts.profile.phase("ext4_size_scan", scan_start);
+
+    const create_start = opts.profile.start();
+    try ext4.ensureParentDir(init.io, opts.output);
+    try ext4.createEmptyFile(init.io, opts.output, image_size);
+    opts.profile.phase("ext4_create_empty", create_start);
+    const mkfs_start = opts.profile.start();
+    try ext4.runMkfs(init, allocator, mkfs, rootfs_dir_path, opts.output, deterministic_ext4, inode_count);
+    opts.profile.phase("mkfs_ext4", mkfs_start);
+    const debugfs_script = try std.fmt.allocPrint(allocator, "{s}/debugfs-ownership.cmds", .{opts.temp_dir});
+    const debugfs_start = opts.profile.start();
+    try ext4.runDebugfsFinalize(init, allocator, debugfs, opts.output, debugfs_script, &owners, &xattrs, deterministic_ext4);
+    opts.profile.phase("debugfs_finalize", debugfs_start);
+
+    const blake3_start = opts.profile.start();
+    const rootfs_blake3 = try ext4.blake3File(init.io, opts.output);
+    opts.profile.phase("rootfs_blake3", blake3_start);
+    return rootfs_blake3;
 }
 
 fn trustedDigestHardlinkEligible(cache_owned_output: bool, path: []const u8, cache_root: []const u8) bool {
@@ -1578,7 +1676,12 @@ pub fn writeLocalRefCache(
     return path;
 }
 
-pub fn localRefCachePath(allocator: std.mem.Allocator, cache_root: []const u8, raw_ref: []const u8, platform: Platform) ![]u8 {
+pub fn localRefCachePath(
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    raw_ref: []const u8,
+    platform: Platform,
+) ![]u8 {
     _ = try parseLocalTagRef(raw_ref);
     var h = Sha256.init(.{});
     h.update(local_ref_cache_kind);
@@ -1615,7 +1718,11 @@ pub fn rootfsCacheKeyAlloc(allocator: std.mem.Allocator, resolved: ResolvedImage
     return allocator.dupe(u8, &hex);
 }
 
-pub fn cachedImageRootfsMetadataPath(allocator: std.mem.Allocator, cache_root: []const u8, resolved: ResolvedImage) ![]const u8 {
+pub fn cachedImageRootfsMetadataPath(
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    resolved: ResolvedImage,
+) ![]const u8 {
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
 }
@@ -1625,11 +1732,12 @@ pub fn cachedImageRootfsPath(
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     resolved: ResolvedImage,
+    ext4_writer_choice: Ext4Writer,
 ) !?[]const u8 {
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
     const metadata_path = try cachedImageRootfsMetadataPath(allocator, cache_root, resolved);
-    if (try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved) and try readablePath(io, rootfs_path)) {
+    if (try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved, ext4_writer_choice) and try readablePath(io, rootfs_path)) {
         std.log.debug("spore rootfs: using cached rootfs {s} for {s}", .{ rootfs_path, resolved.ref });
         return rootfs_path;
     }
@@ -1691,8 +1799,9 @@ fn cachedImportedRootfsBlake3(
     rootfs_path: []const u8,
     metadata_path: []const u8,
     storage_policy: RootfsStoragePolicy,
+    ext4_writer_choice: Ext4Writer,
 ) !?[chunk.ChunkId.hex_len]u8 {
-    if (!try cachedRootfsMetadataMatches(init.io, allocator, metadata_path, resolved)) return null;
+    if (!try cachedRootfsMetadataMatches(init.io, allocator, metadata_path, resolved, ext4_writer_choice)) return null;
     const artifact = (try cachedImageRootfsArtifact(init.io, allocator, metadata_path, rootfs_path)) orelse return null;
     defer allocator.free(artifact.digest);
     if (!try readablePath(init.io, rootfs_path)) return null;
@@ -1772,6 +1881,7 @@ pub fn cachedImageRefRootfsPath(
     cache_root: []const u8,
     requested_ref: []const u8,
     platform: Platform,
+    ext4_writer_choice: Ext4Writer,
 ) !?ImageRefCacheHit {
     const record_path = try imageRefCacheRecordPath(allocator, cache_root, requested_ref, platform);
     if (!try rootfs_cache.regularFileNoSymlink(io, record_path)) return null;
@@ -1800,7 +1910,7 @@ pub fn cachedImageRefRootfsPath(
     const expected_cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     if (!std.mem.eql(u8, record.rootfs_cache_key, expected_cache_key)) return null;
 
-    const rootfs_path = (try cachedImageRootfsPath(io, allocator, cache_root, resolved)) orelse return null;
+    const rootfs_path = (try cachedImageRootfsPath(io, allocator, cache_root, resolved, ext4_writer_choice)) orelse return null;
     std.log.debug("spore rootfs: using cached image ref {s} -> {s}", .{ requested_ref, resolved.ref });
     return .{ .path = rootfs_path, .resolved = resolved };
 }
@@ -1852,7 +1962,11 @@ fn imageRefCacheRecordPath(
     return std.fs.path.join(allocator, &.{ cache_root, "refs", filename });
 }
 
-fn imageRefCacheKeyAlloc(allocator: std.mem.Allocator, requested_ref: []const u8, platform: Platform) ![]u8 {
+fn imageRefCacheKeyAlloc(
+    allocator: std.mem.Allocator,
+    requested_ref: []const u8,
+    platform: Platform,
+) ![]u8 {
     var h = Sha256.init(.{});
     h.update("sporevm-rootfs-ref-v1\n");
     h.update(builder_version);
@@ -1877,6 +1991,7 @@ pub fn buildCachedImageRootfs(
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     resolved: ResolvedImage,
+    ext4_writer_choice: Ext4Writer,
 ) ![]const u8 {
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
@@ -1898,8 +2013,9 @@ pub fn buildCachedImageRootfs(
         .output = temp_rootfs_path,
         .metadata = temp_metadata_path,
         .platform = resolved.platform,
-        .mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, null, .mkfs),
-        .debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, null, .debugfs),
+        .mkfs = null,
+        .debugfs = null,
+        .ext4_writer = ext4_writer_choice,
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
         .cache_owned_output = true,
@@ -2024,7 +2140,13 @@ fn writeFileAtomicPath(io: Io, allocator: std.mem.Allocator, path: []const u8, d
     try renameCachePath(io, temp_path, path);
 }
 
-fn cachedRootfsMetadataMatches(io: Io, allocator: std.mem.Allocator, metadata_path: []const u8, resolved: ResolvedImage) !bool {
+fn cachedRootfsMetadataMatches(
+    io: Io,
+    allocator: std.mem.Allocator,
+    metadata_path: []const u8,
+    resolved: ResolvedImage,
+    ext4_writer_choice: Ext4Writer,
+) !bool {
     const metadata = Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes)) catch |err| switch (err) {
         error.FileNotFound, error.StreamTooLong => return false,
         else => |e| return e,
@@ -2037,6 +2159,7 @@ fn cachedRootfsMetadataMatches(io: Io, allocator: std.mem.Allocator, metadata_pa
         else => return false,
     };
     if (!jsonStringEquals(object.get("builder_version"), builder_version)) return false;
+    if (!jsonStringEquals(object.get("ext4_writer"), ext4_writer_choice.text())) return false;
     if (!jsonStringEquals(object.get("resolved_image_ref"), resolved.ref)) return false;
     if (!jsonStringEquals(object.get("image_manifest_digest"), resolved.manifest_digest)) return false;
     const platform_value = object.get("platform") orelse return false;
@@ -2126,6 +2249,15 @@ fn ensureRequiredDir(
     try ownership_mod.record(allocator, ownership, rel, .{ .uid = 0, .gid = 0 });
 }
 
+fn ensureRequiredMergedDir(
+    allocator: std.mem.Allocator,
+    tree: *tar.MergedTree,
+    rel: []const u8,
+    mode: u32,
+) !void {
+    try tar.ensureMergedDirectory(allocator, tree, rel, mode, .{ .uid = 0, .gid = 0 });
+}
+
 fn ensureResolverPlaceholder(
     allocator: std.mem.Allocator,
     io: Io,
@@ -2164,6 +2296,14 @@ fn ensureResolverPlaceholder(
     }
 }
 
+fn ensureMergedResolverPlaceholder(
+    allocator: std.mem.Allocator,
+    tree: *tar.MergedTree,
+) !void {
+    try tar.ensureMergedDirectory(allocator, tree, "etc", 0o755, .{ .uid = 0, .gid = 0 });
+    try tar.ensureMergedFile(allocator, tree, resolver_placeholder_path, resolver_placeholder_bytes, 0o644, .{ .uid = 0, .gid = 0 });
+}
+
 fn recordImplicitDirectoryOwnership(
     allocator: std.mem.Allocator,
     io: Io,
@@ -2198,6 +2338,7 @@ fn permissionsFromMode(mode: u32, fallback: Io.Dir.Permissions) Io.Dir.Permissio
 }
 
 test {
+    std.testing.refAllDecls(ext4_writer);
     std.testing.refAllDecls(oci_layout);
 }
 
@@ -2268,6 +2409,202 @@ test "rootfs build profile env is opt-in" {
     try std.testing.expect(rootfsBuildProfileEnabled("1"));
 }
 
+test "native ext4 writer env defaults native and fails closed" {
+    try std.testing.expectEqual(Ext4Writer.native, try ext4WriterFromEnvValue(null));
+    try std.testing.expectEqual(Ext4Writer.native, try ext4WriterFromEnvValue(""));
+    try std.testing.expectEqual(Ext4Writer.external, try ext4WriterFromEnvValue("external"));
+    try std.testing.expectEqual(Ext4Writer.native, try ext4WriterFromEnvValue("native"));
+    try std.testing.expectError(error.UnsupportedExt4Writer, ext4WriterFromEnvValue("yes"));
+}
+
+test "materialize rootfs uses native ext4 writer by default" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-native-materialize";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    const layer_path = tmp ++ "/layer.tar";
+    try writeTestTar(allocator, io, layer_path, "etc/native-writer", "native\n");
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, tmp ++ "/rootfs-cache");
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+    const layers = [_]MaterializeLayer{.{
+        .media_type = "application/vnd.oci.image.layer.v1.tar",
+        .digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .path = layer_path,
+    }};
+    const output = tmp ++ "/rootfs.ext4";
+    const metadata = tmp ++ "/rootfs.ext4.json";
+    var materialize_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer materialize_arena_state.deinit();
+    const materialize_arena = materialize_arena_state.allocator();
+    const result = try materializeRootFS(init, materialize_arena, .{
+        .requested_ref = "local/native:latest",
+        .resolved_image_ref = "local/native@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .config_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .config = .{ .architecture = "arm64", .os = "linux" },
+        .layers = &layers,
+        .output = output,
+        .metadata = metadata,
+        .mkfs = "unused-mkfs",
+        .debugfs = "unused-debugfs",
+        .ext4_writer = .native,
+        .temp_dir = tmp ++ "/materialize",
+        .profile = RootfsBuildProfile.init(&env),
+        .rootfs_storage = .flat,
+    });
+
+    try std.testing.expectEqualSlices(u8, &result.rootfs_blake3, &(try ext4.blake3File(io, output)));
+    try std.testing.expect(result.rootfs_storage == null);
+    const metadata_bytes = try Io.Dir.cwd().readFileAlloc(io, metadata, allocator, .limited(max_rootfs_metadata_bytes));
+    defer allocator.free(metadata_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"rootfs_storage\"") == null);
+}
+
+fn debugfsCat(
+    allocator: std.mem.Allocator,
+    io: Io,
+    debugfs: []const u8,
+    image: []const u8,
+    path: []const u8,
+) ![]u8 {
+    const command = try std.fmt.allocPrint(allocator, "cat {s}", .{path});
+    defer allocator.free(command);
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ debugfs, "-R", command, image },
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    });
+    defer allocator.free(result.stderr);
+    const ok = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) {
+        allocator.free(result.stdout);
+        return error.DebugfsFailed;
+    }
+    return result.stdout;
+}
+
+test "native and external rootfs materialization expose matching files" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-native-external-semantic";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, tmp ++ "/rootfs-cache");
+    const mkfs = resolveExt4Tool(allocator, io, &env, null, .mkfs) catch |err| switch (err) {
+        error.MkfsNotFound => return error.SkipZigTest,
+        else => |e| return e,
+    };
+    defer allocator.free(mkfs);
+    const debugfs = resolveExt4Tool(allocator, io, &env, null, .debugfs) catch |err| switch (err) {
+        error.DebugfsNotFound => return error.SkipZigTest,
+        else => |e| return e,
+    };
+    defer allocator.free(debugfs);
+
+    const layer_path = tmp ++ "/layer.tar";
+    try writeTestTar(allocator, io, layer_path, "etc/native-writer", "native\n");
+    const layers = [_]MaterializeLayer{.{
+        .media_type = "application/vnd.oci.image.layer.v1.tar",
+        .digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .path = layer_path,
+    }};
+
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const native_output = tmp ++ "/native.ext4";
+    const external_output = tmp ++ "/external.ext4";
+    try env.put(ext4_writer_env, "external");
+    const base_opts = MaterializeOptions{
+        .requested_ref = "local/native:latest",
+        .resolved_image_ref = "local/native@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .config_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .config = .{ .architecture = "arm64", .os = "linux" },
+        .layers = &layers,
+        .output = external_output,
+        .metadata = tmp ++ "/external.json",
+        .mkfs = mkfs,
+        .debugfs = debugfs,
+        .ext4_writer = .external,
+        .temp_dir = tmp ++ "/external-materialize",
+        .profile = RootfsBuildProfile.init(&env),
+        .rootfs_storage = .flat,
+    };
+
+    var external_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer external_arena_state.deinit();
+    const external_result = try materializeRootFS(init, external_arena_state.allocator(), base_opts);
+    try std.testing.expectEqualSlices(u8, &external_result.rootfs_blake3, &(try ext4.blake3File(io, external_output)));
+
+    try env.put(ext4_writer_env, "native");
+    var native_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer native_arena_state.deinit();
+    var native_opts = base_opts;
+    native_opts.output = native_output;
+    native_opts.metadata = tmp ++ "/native.json";
+    native_opts.temp_dir = tmp ++ "/native-materialize";
+    native_opts.profile = RootfsBuildProfile.init(&env);
+    native_opts.ext4_writer = .native;
+    const native_result = try materializeRootFS(init, native_arena_state.allocator(), native_opts);
+    try std.testing.expectEqualSlices(u8, &native_result.rootfs_blake3, &(try ext4.blake3File(io, native_output)));
+
+    var native_repeat_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer native_repeat_arena_state.deinit();
+    var native_repeat_opts = native_opts;
+    native_repeat_opts.output = tmp ++ "/native-repeat.ext4";
+    native_repeat_opts.metadata = tmp ++ "/native-repeat.json";
+    native_repeat_opts.temp_dir = tmp ++ "/native-repeat-materialize";
+    native_repeat_opts.profile = RootfsBuildProfile.init(&env);
+    const native_repeat_result = try materializeRootFS(init, native_repeat_arena_state.allocator(), native_repeat_opts);
+    try std.testing.expectEqualSlices(u8, &native_result.rootfs_blake3, &native_repeat_result.rootfs_blake3);
+    try std.testing.expectEqualSlices(u8, &native_repeat_result.rootfs_blake3, &(try ext4.blake3File(io, native_repeat_opts.output)));
+
+    const paths = [_]struct {
+        path: []const u8,
+        expected: []const u8,
+    }{
+        .{ .path = "/etc/native-writer", .expected = "native\n" },
+        .{ .path = "/" ++ resolver_placeholder_path, .expected = resolver_placeholder_bytes },
+    };
+    for (paths) |entry| {
+        const external = try debugfsCat(allocator, io, debugfs, external_output, entry.path);
+        defer allocator.free(external);
+        const native = try debugfsCat(allocator, io, debugfs, native_output, entry.path);
+        defer allocator.free(native);
+        try std.testing.expectEqualStrings(entry.expected, external);
+        try std.testing.expectEqualStrings(external, native);
+    }
+}
+
 test "trusted digest hardlink requires internal cache output ownership" {
     try std.testing.expect(!trustedDigestHardlinkEligible(false, "/tmp/sporevm-rootfs/user.ext4", "/tmp/sporevm-rootfs"));
     try std.testing.expect(trustedDigestHardlinkEligible(true, "/tmp/sporevm-rootfs/.image.ext4.tmp", "/tmp/sporevm-rootfs"));
@@ -2278,6 +2615,7 @@ test "rootfs metadata omits absent rootfs storage" {
     const allocator = std.testing.allocator;
     const metadata = RootFSMetadata{
         .builder_version = builder_version,
+        .ext4_writer = Ext4Writer.native.text(),
         .image_ref = "local/sporevm-app:dev",
         .resolved_image_ref = "local/sporevm-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .image_manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -2662,28 +3000,91 @@ test "image rootfs cache metadata matches resolved image identity" {
         .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .platform = .{},
     };
-    try std.testing.expect(!try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved));
+    try std.testing.expect(!try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved, .native));
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = metadata_path,
         .data =
         \\{
-        \\  "builder_version": "sporevm-rootfs-v3",
+        \\  "builder_version": "sporevm-rootfs-v5",
+        \\  "ext4_writer": "native",
         \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "platform": {"os": "linux", "arch": "arm64"}
         \\}
         ,
     });
-    try std.testing.expect(try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved));
+    try std.testing.expect(try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved, .native));
+    try std.testing.expect(!try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved, .external));
 
     try std.testing.expect(!try cachedRootfsMetadataMatches(io, allocator, metadata_path, .{
         .ref = "docker.io/library/alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         .manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         .platform = .{},
-    }));
+    }, .native));
 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = "not json" });
-    try std.testing.expect(!try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved));
+    try std.testing.expect(!try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved, .native));
+}
+
+test "image rootfs cache can replace same-key artifacts for writer escape hatch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-image-cache-writer-replace";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+
+    const resolved = ResolvedImage{
+        .ref = "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try cachedImageRootfsMetadataPath(arena, cache_root, resolved);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "native" });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = metadata_path,
+        .data =
+        \\{
+        \\  "builder_version": "sporevm-rootfs-v5",
+        \\  "ext4_writer": "native",
+        \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "platform": {"os": "linux", "arch": "arm64"}
+        \\}
+        ,
+    });
+
+    try std.testing.expect((try cachedImageRootfsPath(io, arena, cache_root, resolved, .native)) != null);
+    try std.testing.expect((try cachedImageRootfsPath(io, arena, cache_root, resolved, .external)) == null);
+
+    const temp_rootfs_path = tmp ++ "/external.ext4.tmp";
+    const temp_metadata_path = tmp ++ "/external.json.tmp";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = temp_rootfs_path, .data = "external" });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = temp_metadata_path,
+        .data =
+        \\{
+        \\  "builder_version": "sporevm-rootfs-v5",
+        \\  "ext4_writer": "external",
+        \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "platform": {"os": "linux", "arch": "arm64"}
+        \\}
+        ,
+    });
+    try renameCachePath(io, temp_rootfs_path, rootfs_path);
+    try renameCachePath(io, temp_metadata_path, metadata_path);
+
+    try std.testing.expect((try cachedImageRootfsPath(io, arena, cache_root, resolved, .native)) == null);
+    try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .external)).?);
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, rootfs_path, arena, .limited(32));
+    try std.testing.expectEqualStrings("external", bytes);
 }
 
 test "image rootfs metadata supplies cached artifact identity" {
@@ -2801,6 +3202,7 @@ test "imported rootfs flat cache hit reuses metadata without rootfs storage" {
     const metadata_json = try std.fmt.allocPrint(arena,
         \\{{
         \\  "builder_version": "{s}",
+        \\  "ext4_writer": "native",
         \\  "image_ref": "local/example:dev",
         \\  "resolved_image_ref": "{s}",
         \\  "image_manifest_digest": "{s}",
@@ -2825,8 +3227,9 @@ test "imported rootfs flat cache hit reuses metadata without rootfs storage" {
         .preopens = .empty,
     };
 
-    const hit = (try cachedImportedRootfsBlake3(init, arena, cache_root, resolved, rootfs_path, metadata_path, .flat)).?;
+    const hit = (try cachedImportedRootfsBlake3(init, arena, cache_root, resolved, rootfs_path, metadata_path, .flat, .native)).?;
     try std.testing.expectEqualSlices(u8, expected[0..], hit[0..]);
+    try std.testing.expect((try cachedImportedRootfsBlake3(init, arena, cache_root, resolved, rootfs_path, metadata_path, .flat, .external)) == null);
     const updated_metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, arena, .limited(max_rootfs_metadata_bytes));
     try std.testing.expect(std.mem.indexOf(u8, updated_metadata, "\"rootfs_storage\"") == null);
 
@@ -2863,6 +3266,7 @@ test "imported rootfs chunked cache hit upgrades flat metadata storage" {
     const metadata_json = try std.fmt.allocPrint(arena,
         \\{{
         \\  "builder_version": "{s}",
+        \\  "ext4_writer": "native",
         \\  "image_ref": "local/example:dev",
         \\  "resolved_image_ref": "{s}",
         \\  "image_manifest_digest": "{s}",
@@ -2887,7 +3291,7 @@ test "imported rootfs chunked cache hit upgrades flat metadata storage" {
         .preopens = .empty,
     };
 
-    const hit = (try cachedImportedRootfsBlake3(init, arena, cache_root, resolved, rootfs_path, metadata_path, .chunked)).?;
+    const hit = (try cachedImportedRootfsBlake3(init, arena, cache_root, resolved, rootfs_path, metadata_path, .chunked, .native)).?;
     try std.testing.expectEqualSlices(u8, expected[0..], hit[0..]);
     const updated_metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, arena, .limited(max_rootfs_metadata_bytes));
     try std.testing.expect(std.mem.indexOf(u8, updated_metadata, "\"rootfs_storage\"") != null);
@@ -2928,6 +3332,7 @@ test "imported rootfs cache treats metadata identity mismatch as miss" {
     const metadata_json = try std.fmt.allocPrint(arena,
         \\{{
         \\  "builder_version": "{s}",
+        \\  "ext4_writer": "native",
         \\  "image_ref": "local/example:dev",
         \\  "resolved_image_ref": "{s}",
         \\  "image_manifest_digest": "{s}",
@@ -2952,7 +3357,7 @@ test "imported rootfs cache treats metadata identity mismatch as miss" {
         .preopens = .empty,
     };
 
-    try std.testing.expect((try cachedImportedRootfsBlake3(init, arena, cache_root, requested_resolved, rootfs_path, metadata_path, .chunked)) == null);
+    try std.testing.expect((try cachedImportedRootfsBlake3(init, arena, cache_root, requested_resolved, rootfs_path, metadata_path, .chunked, .native)) == null);
     const updated_metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, arena, .limited(max_rootfs_metadata_bytes));
     try std.testing.expect(std.mem.indexOf(u8, updated_metadata, "\"rootfs_storage\"") == null);
     const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
@@ -2976,7 +3381,7 @@ test "image rootfs cache treats oversized metadata as a miss" {
         .ref = "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .platform = .{},
-    }));
+    }, .native));
 }
 
 test "image ref cache key is deterministic and scoped to requested tag" {
@@ -3022,7 +3427,8 @@ test "image ref cache maps tag to verified rootfs path" {
         .sub_path = metadata_path,
         .data =
         \\{
-        \\  "builder_version": "sporevm-rootfs-v3",
+        \\  "builder_version": "sporevm-rootfs-v5",
+        \\  "ext4_writer": "native",
         \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "platform": {"os": "linux", "arch": "arm64"}
@@ -3031,7 +3437,7 @@ test "image ref cache maps tag to verified rootfs path" {
     });
 
     try writeImageRefCacheRecord(io, arena, cache_root, "docker.io/library/alpine:3.20", resolved);
-    const hit = (try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{})).?;
+    const hit = (try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{}, .native)).?;
     try std.testing.expectEqualStrings(rootfs_path, hit.path);
     try std.testing.expectEqualStrings(resolved.ref, hit.resolved.ref);
     try std.testing.expectEqualStrings(resolved.manifest_digest, hit.resolved.manifest_digest);
@@ -3062,7 +3468,7 @@ test "image ref cache treats mismatched records and missing rootfs as misses" {
         \\  "version": 1,
         \\  "requested_ref": "docker.io/library/alpine:other",
         \\  "platform": "linux/arm64",
-        \\  "builder_version": "sporevm-rootfs-v3",
+        \\  "builder_version": "sporevm-rootfs-v5",
         \\  "resolved_image_ref": "{s}",
         \\  "image_manifest_digest": "{s}",
         \\  "rootfs_cache_key": "{s}",
@@ -3070,14 +3476,14 @@ test "image ref cache treats mismatched records and missing rootfs as misses" {
         \\}}
     , .{ resolved.ref, resolved.manifest_digest, cache_key });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = record_path, .data = bad_record });
-    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{})) == null);
+    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{}, .native)) == null);
 
     const bad_resolved_ref_record = try std.fmt.allocPrint(arena,
         \\{{
         \\  "version": 1,
         \\  "requested_ref": "docker.io/library/alpine:3.20",
         \\  "platform": "linux/arm64",
-        \\  "builder_version": "sporevm-rootfs-v3",
+        \\  "builder_version": "sporevm-rootfs-v5",
         \\  "resolved_image_ref": "docker.io/library/alpine:not-a-digest",
         \\  "image_manifest_digest": "{s}",
         \\  "rootfs_cache_key": "{s}",
@@ -3085,10 +3491,10 @@ test "image ref cache treats mismatched records and missing rootfs as misses" {
         \\}}
     , .{ resolved.manifest_digest, cache_key });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = record_path, .data = bad_resolved_ref_record });
-    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{})) == null);
+    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{}, .native)) == null);
 
     try writeImageRefCacheRecord(io, arena, cache_root, "docker.io/library/alpine:3.20", resolved);
-    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{})) == null);
+    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{}, .native)) == null);
 }
 
 test "image rootfs storage is recorded and reused without the digest artifact" {
@@ -3117,7 +3523,7 @@ test "image rootfs storage is recorded and reused without the digest artifact" {
         .sub_path = metadata_path,
         .data =
         \\{
-        \\  "builder_version": "sporevm-rootfs-v3",
+        \\  "builder_version": "sporevm-rootfs-v5",
         \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "platform": {"os": "linux", "arch": "arm64"}
@@ -3417,4 +3823,46 @@ test "ext4 tool detection checks Homebrew e2fsprogs prefix" {
     const found = try detectToolPath(allocator, io, &env, "debugfs") orelse return error.TestExpectedEqual;
     defer allocator.free(found);
     try std.testing.expectEqualStrings(tool_path, found);
+}
+
+fn writeTestTar(allocator: std.mem.Allocator, io: Io, path: []const u8, name: []const u8, data: []const u8) !void {
+    var tar_bytes = std.ArrayList(u8).empty;
+    defer tar_bytes.deinit(allocator);
+    try tar_bytes.appendNTimes(allocator, 0, 512);
+    writeTestTarHeader(tar_bytes.items[0..512], name, '0', data.len);
+    try tar_bytes.appendSlice(allocator, data);
+    const padding = (512 - (data.len % 512)) % 512;
+    try tar_bytes.appendNTimes(allocator, 0, padding + 1024);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = tar_bytes.items });
+}
+
+fn writeTestTarHeader(header: []u8, name: []const u8, kind: u8, size: u64) void {
+    std.debug.assert(header.len == 512);
+    std.debug.assert(name.len <= 100);
+    @memset(header, 0);
+    @memcpy(header[0..name.len], name);
+    writeTestTarOctal(header[100..108], if (kind == '5') 0o755 else 0o644);
+    writeTestTarOctal(header[108..116], 0);
+    writeTestTarOctal(header[116..124], 0);
+    writeTestTarOctal(header[124..136], size);
+    writeTestTarOctal(header[136..148], 0);
+    @memset(header[148..156], ' ');
+    header[156] = kind;
+    @memcpy(header[257..263], "ustar\x00");
+    @memcpy(header[263..265], "00");
+    var sum: u64 = 0;
+    for (header[0..512]) |b| sum += b;
+    writeTestTarOctal(header[148..156], sum);
+}
+
+fn writeTestTarOctal(field: []u8, value: u64) void {
+    @memset(field, 0);
+    var remaining = value;
+    var index = field.len - 2;
+    while (true) {
+        field[index] = @intCast('0' + (remaining & 7));
+        remaining >>= 3;
+        if (remaining == 0 or index == 0) break;
+        index -= 1;
+    }
 }
