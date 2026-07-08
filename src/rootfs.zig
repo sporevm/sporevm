@@ -1839,6 +1839,7 @@ pub fn cachedImageRootfsPath(
     cache_root: []const u8,
     resolved: ResolvedImage,
     ext4_writer_choice: Ext4Writer,
+    allow_flat_materialization: bool,
 ) !?[]const u8 {
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
@@ -1848,11 +1849,34 @@ pub fn cachedImageRootfsPath(
         defer allocator.free(artifact.digest);
         const storage = (try readCachedRootfsStorage(io, allocator, metadata_path, artifact)) orelse return null;
         defer deinitStorageDigestFields(allocator, storage);
-        if (!try rootfs_cas.storageComplete(io, allocator, cache_root, storage)) return null;
+        const storage_usable = if (allow_flat_materialization)
+            try cachedRootfsStorageUsable(io, allocator, cache_root, artifact, storage)
+        else
+            try rootfs_cas.storageComplete(io, allocator, cache_root, storage);
+        if (!storage_usable) return null;
         std.log.debug("spore rootfs: using cached rootfs {s} for {s}", .{ rootfs_path, resolved.ref });
         return rootfs_path;
     }
     return null;
+}
+
+fn cachedRootfsStorageUsable(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    artifact: spore.RootfsArtifactRef,
+    storage: spore.RootfsStorage,
+) !bool {
+    const flat = spore.Rootfs{
+        .device = storage.device,
+        .artifact = artifact,
+    };
+    const fd = rootfs_cache.openTrustedFromCache(io, allocator, cache_root, flat) catch |err| switch (err) {
+        error.RootFSDigestCacheMiss, error.RootFSDigestMismatch => return rootfs_cas.storageComplete(io, allocator, cache_root, storage),
+        else => |e| return e,
+    };
+    _ = std.c.close(fd);
+    return true;
 }
 
 pub fn cachedImageRootfsArtifact(
@@ -1962,6 +1986,7 @@ pub fn cachedImageRefRootfsPath(
     requested_ref: []const u8,
     platform: Platform,
     ext4_writer_choice: Ext4Writer,
+    allow_flat_materialization: bool,
 ) !?ImageRefCacheHit {
     const record_path = try imageRefCacheRecordPath(allocator, cache_root, requested_ref, platform);
     if (!try rootfs_cache.regularFileNoSymlink(io, record_path)) return null;
@@ -1990,7 +2015,7 @@ pub fn cachedImageRefRootfsPath(
     const expected_cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     if (!std.mem.eql(u8, record.rootfs_cache_key, expected_cache_key)) return null;
 
-    const rootfs_path = (try cachedImageRootfsPath(io, allocator, cache_root, resolved, ext4_writer_choice)) orelse return null;
+    const rootfs_path = (try cachedImageRootfsPath(io, allocator, cache_root, resolved, ext4_writer_choice, allow_flat_materialization)) orelse return null;
     std.log.debug("spore rootfs: using cached image ref {s} -> {s}", .{ requested_ref, resolved.ref });
     return .{ .path = rootfs_path, .resolved = resolved };
 }
@@ -3125,8 +3150,8 @@ test "image rootfs cache can replace same-key artifacts for writer escape hatch"
     const native_metadata = try testImageRootfsMetadataJson(arena, resolved, rootfs_path, "native".len, native_storage, "native");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = native_metadata });
 
-    try std.testing.expect((try cachedImageRootfsPath(io, arena, cache_root, resolved, .native)) != null);
-    try std.testing.expect((try cachedImageRootfsPath(io, arena, cache_root, resolved, .external)) == null);
+    try std.testing.expect((try cachedImageRootfsPath(io, arena, cache_root, resolved, .native, false)) != null);
+    try std.testing.expect((try cachedImageRootfsPath(io, arena, cache_root, resolved, .external, false)) == null);
 
     const temp_rootfs_path = tmp ++ "/external.ext4.tmp";
     const temp_metadata_path = tmp ++ "/external.json.tmp";
@@ -3137,8 +3162,8 @@ test "image rootfs cache can replace same-key artifacts for writer escape hatch"
     try renameCachePath(io, temp_rootfs_path, rootfs_path);
     try renameCachePath(io, temp_metadata_path, metadata_path);
 
-    try std.testing.expect((try cachedImageRootfsPath(io, arena, cache_root, resolved, .native)) == null);
-    try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .external)).?);
+    try std.testing.expect((try cachedImageRootfsPath(io, arena, cache_root, resolved, .native, false)) == null);
+    try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .external, false)).?);
     const bytes = try Io.Dir.cwd().readFileAlloc(io, rootfs_path, arena, .limited(32));
     try std.testing.expectEqualStrings("external", bytes);
 }
@@ -3172,8 +3197,41 @@ test "image rootfs cache lookup does not repair evicted flat materialization" {
 
     const digest_path = try rootfs_cache.digestPath(arena, cache_root, storage.index_digest);
     try std.testing.expect(!try rootfs_cache.pathExistsNoSymlink(io, digest_path));
-    try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .native)).?);
+    try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .native, true)).?);
     try std.testing.expect(!try rootfs_cache.pathExistsNoSymlink(io, digest_path));
+}
+
+test "image rootfs cache lookup trusts existing flat materialization before cas walk" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-image-cache-flat-before-cas";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+
+    const resolved = ResolvedImage{
+        .ref = "docker.io/library/alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try cachedImageRootfsMetadataPath(arena, cache_root, resolved);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+
+    const storage = try testRootfsStorageFromPath(io, arena, cache_root, rootfs_path);
+    const metadata = try testImageRootfsMetadataJson(arena, resolved, rootfs_path, storage.logical_size, storage, "native");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
+    _ = try rootfs_cache.installTrustedMaterializationByHardlink(io, arena, cache_root, rootfs_path, storage.index_digest, storage.logical_size);
+
+    const index_path = try rootfs_cas.manifestIndexPath(arena, cache_root, storage.index_digest);
+    try Io.Dir.cwd().deleteFile(io, index_path);
+    try std.testing.expect(!try rootfs_cas.storageComplete(io, arena, cache_root, storage));
+    try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .native, true)).?);
 }
 
 test "image rootfs metadata supplies cached artifact identity" {
@@ -3484,7 +3542,7 @@ test "image ref cache maps tag to verified rootfs path" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata_json });
 
     try writeImageRefCacheRecord(io, arena, cache_root, "docker.io/library/alpine:3.20", resolved);
-    const hit = (try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{}, .native)).?;
+    const hit = (try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{}, .native, false)).?;
     try std.testing.expectEqualStrings(rootfs_path, hit.path);
     try std.testing.expectEqualStrings(resolved.ref, hit.resolved.ref);
     try std.testing.expectEqualStrings(resolved.manifest_digest, hit.resolved.manifest_digest);
@@ -3523,7 +3581,7 @@ test "image ref cache treats mismatched records and missing rootfs as misses" {
         \\}}
     , .{ resolved.ref, resolved.manifest_digest, cache_key });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = record_path, .data = bad_record });
-    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{}, .native)) == null);
+    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{}, .native, false)) == null);
 
     const bad_resolved_ref_record = try std.fmt.allocPrint(arena,
         \\{{
@@ -3538,10 +3596,10 @@ test "image ref cache treats mismatched records and missing rootfs as misses" {
         \\}}
     , .{ resolved.manifest_digest, cache_key });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = record_path, .data = bad_resolved_ref_record });
-    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{}, .native)) == null);
+    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{}, .native, false)) == null);
 
     try writeImageRefCacheRecord(io, arena, cache_root, "docker.io/library/alpine:3.20", resolved);
-    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{}, .native)) == null);
+    try std.testing.expect((try cachedImageRefRootfsPath(io, arena, cache_root, "docker.io/library/alpine:3.20", .{}, .native, false)) == null);
 }
 
 test "image rootfs storage is recorded and reused without the digest artifact" {

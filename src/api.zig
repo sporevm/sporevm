@@ -860,6 +860,7 @@ pub fn runManaged(
         .pull_policy = options.image_pull_policy,
         .command_name = "run",
         .record_artifact = options.save_path != null or options.image_ref != null,
+        .require_storage_complete = options.save_path != null,
     });
     const default_kernel = options.kernel_path == null and init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null;
     const default_initrd = options.initrd_path == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null;

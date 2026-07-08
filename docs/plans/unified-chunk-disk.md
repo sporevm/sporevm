@@ -487,6 +487,19 @@ records the large-tar import benchmark against the external preload baseline;
 the 2026-07-08 rerun on the documented 312 MiB tar cut `rootfs_cas_inline`
 from 3.392s serial to 1.545s with 8 seal workers.
 
+Follow-up benchmark on latest `main` after PR #421, commit
+`7a031e9c205f7f9aa7f31c0205a6d31a043e99b3`, showed the large
+buildkite-sporevm image still importing in roughly the same time as #420, but
+regressed warm `spore run --image ... -- /bin/true` from about 0.38s to
+1.73-1.76s. The extra wall time was before guest ready
+(`vsock_connect_ms=17`, `exec_response_ms=33`) and came from walking the
+complete 74k-object CAS index on flat-hot run setup. The follow-up fix makes
+plain `run --image` trust the existing digest-addressed flat materialization
+before the CAS completeness walk, while durable run/save and named lifecycle
+paths still require complete chunk storage. On the same isolated benchmark
+cache, the fixed ReleaseSafe binary measured 0.09s warm repeated
+`run --image ... -- /bin/true` after the initial kernel/cache probe.
+
 Done when: import → run → save → restore works end to end on index identity
 with no linear full-image hash anywhere; uncached import of a large
 reference image pays no separate hash pass beyond the inline emission
