@@ -253,13 +253,19 @@ snapshot(disk) -> DiskIndex:
   identity = blake3(new index); persist index; thaw
 ```
 
-Target shape is O(dirty) by construction. The current U3 v1 implementation is
-more conservative: `ChunkMappedDisk.snapshotIndex()` scans all logical chunks
-because it does not yet retain the opened parent index identity. This is an
-accepted v1 deviation, not the end-state performance contract. The operation
-already exists in the tree for RAM: `dirty_ram.zig` seals dirty 2MiB memory
-chunks into verified chunk refs plus a same-host backing file, with parallel
-workers, zero-scan elision, write-if-missing dedupe, and phase-level stats.
+Target shape is O(dirty) by construction. `ChunkMappedDisk` retains the
+opened parent index identity when a disk is opened from a chunk index, so
+`snapshotIndex()` can seal only overlay-backed dirty chunks and emit the new
+index as the parent index with dirty entries replaced. Clean chunks keep their
+parent digest or zero entry without reading or hashing the materialized bytes
+when the new index is published into the same CAS root that already holds the
+parent objects. Disks opened without a parent index, or snapshots published
+into a different CAS root, still use the full-scan path because there is no
+self-contained prior identity to preserve in that destination store. The
+operation already exists in the tree for RAM: `dirty_ram.zig` seals dirty 2MiB
+memory chunks into verified chunk refs plus a same-host backing file, with
+parallel workers, zero-scan elision, write-if-missing dedupe, and phase-level
+stats.
 Disk does not get its own sealer: U3 extracts the generic core out of
 `dirty_ram.zig` into a shared module (working name `chunk_sealer.zig`)
 parameterized by chunk size, dirty source, and object-write target, with
@@ -425,22 +431,24 @@ restore/resume to open indexes. Delete `LayeredCowDisk`, layer chains,
 
 Landed behavior: RAM sealing and disk snapshotting share
 `src/chunk_sealer.zig` for zero elision, BLAKE3 chunk identity, and verified
-write-if-missing CAS publication. `ChunkMappedDisk.snapshotIndex()` writes
-nonzero chunks and a `spore-disk-index-v1` under the rootfs CAS namespace and
-returns a `chunk-index-disk-v0` manifest disk. Runtime restore materializes
-`chunk-index-disk-v0` manifests from the saved index and chunk objects before
-attaching virtio-blk; old layer chains are no longer opened by
-`runtime_disk.open`. `LayeredCowDisk`, `loadLayerChain`, disk-layer sealing,
-and the `spore.DiskLayer` parser have been deleted.
+write-if-missing CAS publication. `ChunkMappedDisk.snapshotIndex()` retains
+the parent index for index-opened disks, seals only overlay-backed dirty chunks
+when publishing into the same CAS root, writes nonzero dirty chunks and a
+`spore-disk-index-v1` under the rootfs CAS namespace, and returns a
+`chunk-index-disk-v0` manifest disk. Disks opened without a parent index, or
+snapshots published into a different CAS root, keep the full-scan snapshot
+path. Runtime restore materializes `chunk-index-disk-v0` manifests from the
+saved index and chunk objects before attaching virtio-blk; old layer chains are
+no longer opened by `runtime_disk.open`. `LayeredCowDisk`, `loadLayerChain`,
+disk-layer sealing, and the `spore.DiskLayer` parser have been deleted.
 
 Validation: `mise run test` covers the RAM sealer on the shared core, direct
 disk snapshot index/object emission, and runtime restore of a chunk-index disk
-manifest preserving guest-visible bytes.
-
-Follow-up: `snapshotIndex()` can now be tightened to O(dirty) by retaining the
-opened parent index identity in `ChunkMappedDisk`; that optimization is tracked
-with the fork/partial-materialization work rather than blocking the format
-switch.
+manifest preserving guest-visible bytes. `src/chunk_mapped_disk.zig` also
+compares O(dirty) snapshot output from an index-opened fork chain against a
+full rescan of the materialized image, including dirty zero chunks and chunks
+rewritten back to their parent content, and asserts the sealer work count
+matches the dirty chunk count rather than total logical chunks.
 
 Done when: save→restore round trip preserves guest-visible disk state
 (existing lifecycle tests, rewritten for v2); the RAM sealer's existing
@@ -464,15 +472,20 @@ full-scan fallback), by-digest cache re-keys, refs/metadata carry index
 identity, `rootfs_blake3` and `ensureImageRootfsStorage` deleted.
 
 Landed behavior: the native ext4 writer now streams emitted bytes through an
-inline rootfs CAS/index writer for chunked storage. It writes missing nonzero
-64 KiB objects durably, records zero chunks without materializing them, and
-publishes the rootfs `spore-disk-index-v1` after objects are durable. The
-external writer keeps the full-scan `rootfs_cas_preload` fallback.
+inline rootfs CAS/index writer for chunked storage. It records zero chunks
+without materializing them, hands nonzero 64 KiB chunk copies to a bounded
+sealer worker pool, writes missing objects durably with race-safe temp+link
+publication, and publishes the rootfs `spore-disk-index-v1` after every worker
+has joined successfully. The external writer keeps the full-scan
+`rootfs_cas_preload` fallback.
 
 Validation: `src/rootfs/ext4_writer.zig` compares the inline-maintained
-`H(index)` with a materialized file rescanned by `rootfs_cas.preloadPath`.
-`docs/plans/native-ext4-writer.md` records the large-tar import benchmark
-against the external preload baseline.
+`H(index)` with a materialized file rescanned by `rootfs_cas.preloadPath` and
+forces the inline path through two seal workers. `src/chunk_sealer.zig` covers
+same-digest CAS object publication races. `docs/plans/native-ext4-writer.md`
+records the large-tar import benchmark against the external preload baseline;
+the 2026-07-08 rerun on the documented 312 MiB tar cut `rootfs_cas_inline`
+from 3.392s serial to 1.545s with 8 seal workers.
 
 Done when: import → run → save → restore works end to end on index identity
 with no linear full-image hash anywhere; uncached import of a large
@@ -538,7 +551,7 @@ no-reflink fallback path is exercised in tests.
 
 ### U7 — Partial materialization
 
-Status: landed in branch for local CAS fault-in.
+Status: complete for local CAS fault-in and measured cold-flat startup.
 
 Add the `.cas` map source, fault-in path, background filler, and
 boot-critical chunk ordering (fault-trace a reference boot to derive the
@@ -551,6 +564,10 @@ opens the local object, verifies it against the descriptor-selected BLAKE3
 digest, writes it into the sparse base, and promotes that map entry to `.base`.
 Missing or corrupt objects fail the read before bytes reach the guest. Warm
 flat-cache opens still use the existing read-only materialization path.
+Managed `spore run --image` resolves chunked image-rootfs storage even without
+`--save`, and cache lookup no longer repairs an evicted flat by-digest
+materialization as a side effect, so a warm-CAS/cold-flat image run reaches the
+lazy runtime path.
 
 Decision: a concurrent background filler and boot-critical priority list are
 deferred until fault traces show they are needed. Adding a filler now would
@@ -560,15 +577,61 @@ correct initial ordering for this slice.
 
 Validation: `mise exec -- zig test src/runtime_disk.zig` covers lazy rootfs
 open without publishing a flat cache, wrong-sized flat-cache fallback, CAS
-promotion after the first read, read-time missing-object failure, and
-chunk-index disk restore over the lazy backend.
+promotion after the first read, read-time missing-object failure, induced
+eviction of an already promoted chunk, corrupt unread-object failure without
+torn read data, and chunk-index disk restore over the lazy backend. The same
+test graph also drives virtio-blk descriptor chains over a lazy chunk-mapped
+disk for missing-object and same-size corrupt-object reads: both complete the
+request with `status_ioerr`, advance the used ring, leave the failed read
+buffer unchanged, and then serve a promoted healthy chunk on the same queue.
 
-Done when: cold boot of a large reference image starts the guest before
-full materialization and completes correctly under random read access
-(fault-in correctness test with induced cache eviction); a CAS miss fails
-the guest I/O cleanly rather than hanging; cold `--image` time-to-first-exec
-is measured and reported against the U2 baseline (target: bounded by boot
-working set, not image size).
+Repeatable time-to-first-exec measurement lives in
+`scripts/benchmark/suite.py` as the opt-in `lazy_rootfs_tti` benchmark. The
+benchmark reports three rows per iteration:
+
+- `lazy-cold`: evict flat materializations and boot through lazy CAS fault-in.
+- `eager-cold`: restore, evict, then set the internal
+  `SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCHMARK=1` escape hatch so
+  `spore run --image` eagerly materializes the flat artifact from warm CAS
+  before boot.
+- `flat-hot`: reuse the hot flat materialization as the overhead baseline.
+
+Command used for the local U7 check after `mise run build`:
+
+```sh
+python3 scripts/benchmark/suite.py --profile smoke --benchmarks lazy_rootfs_tti --iterations 1 --modes sequential --output-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs-followup --timeout-s 300 --no-build
+```
+
+On this macOS/HVF host with `docker.io/library/node:22-alpine` resolved to
+`docker.io/library/node@sha256:d51cff3fa44ab8a368ae8708ae974480165be1b699b19527b7c0d2523433b271`,
+the run at
+`zig-cache/sporevm-benchmarks/u7-lazy-rootfs-followup/20260708T124036Z-c9b041e2/`
+used the CI-runnable 512 MiB flat image and measured:
+
+- `lazy-cold`: evicted one 512 MiB flat materialization,
+  `rootfs_base_mode=lazy`, `tti_ms=454`, `first_output_ms=283`.
+- `eager-cold`: restored and evicted one 512 MiB flat materialization,
+  `rootfs_base_mode=flat`, `tti_ms=1567`, `first_output_ms=33`.
+- `flat-hot`: reused the hot flat materialization,
+  `rootfs_base_mode=flat`, `tti_ms=182`, `first_output_ms=38`.
+
+The small node image validates the repeatable benchmark and CI-friendly
+assertions. The meaningful asymptotic demonstration is a large image such as
+the approximately 7.4 GiB `buildkite-sporevm` rootfs: with warm CAS and evicted
+flat materializations, `lazy-cold` should stay bounded by the boot working set
+while `eager-cold` scales with full flat materialization. Run it by hand with:
+
+```sh
+python3 scripts/benchmark/suite.py --profile smoke --benchmarks lazy_rootfs_tti --iterations 1 --modes sequential --image <large-image-ref> --output-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs-large --scratch-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs-large-scratch --timeout-s 900
+```
+
+Done when: complete for the local lazy path, virtio-blk error completion, and
+repeatable lazy/eager/flat TTI measurement. Cold-flat startup is bounded by the
+boot working set, not full image assembly; the measured lazy run starts the
+guest before restoring or rebuilding the 512 MiB flat materialization, while
+the eager-cold baseline pays full materialization before boot. Background
+filler and boot-priority ordering remain deferred until fault traces show they
+are needed.
 
 ### U8 — Cleanup and docs
 
@@ -604,11 +667,10 @@ Validation: `mise run test` and `mise run build`.
   writes are drained. An online mid-run snapshot would need the guest
   `fsfreeze` protocol deferred with the spore-build plan.
 - Partial materialization (U7) puts CAS object reads on the guest I/O path
-  for the first time: objects must be digest-verified at fault-in before
-  bytes reach the guest, and a missing/corrupt object must surface as a
-  clean I/O error to the guest, never a hang or silent zero-fill. This is
-  new attacker-adjacent surface (a tampered local store feeding a running
-  guest) and needs its own tests in that slice.
+  for the first time: objects are digest-verified at fault-in before bytes
+  reach the guest, and missing/corrupt objects surface as clean I/O errors
+  to the guest, never hangs or silent zero-fill. U7 tests cover promoted
+  chunk eviction and corrupt unread objects.
 
 ## Resolved Decisions
 

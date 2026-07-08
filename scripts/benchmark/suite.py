@@ -21,10 +21,11 @@ import time
 import uuid
 
 
-SUITE_VERSION = "1.1"
+SUITE_VERSION = "1.2"
 DEFAULT_IMAGE = "docker.io/library/node:22-alpine"
 DEFAULT_COMMAND = "/usr/local/bin/node -v"
 DEFAULT_PLATFORM = "linux/arm64"
+EAGER_ROOTFS_ENV = "SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCHMARK"
 RESTORE_METRICS_RE = re.compile(r"(?:kvm|hvf) restore metrics: (?P<fields>.+)")
 EXEC_PROBE_TIMING_RE = re.compile(r"run exec probe timing: (?P<fields>.+)")
 BACKEND_TIMING_RE = re.compile(r"run backend timing: (?P<fields>.+)")
@@ -303,6 +304,17 @@ def parse_run_stderr_metrics(path: Path) -> dict[str, object]:
     return {key: value for key, value in metrics.items() if value is not None}
 
 
+def parse_rootfs_base_mode(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if "runtime disk rootfs base: lazy chunk index" in text:
+        return "lazy"
+    if "runtime disk rootfs base: flat artifact" in text:
+        return "flat"
+    return None
+
+
 def file_allocated_bytes(path: Path) -> int | None:
     try:
         return path.stat().st_blocks * 512
@@ -318,6 +330,16 @@ def directory_size(path: Path) -> int:
         if child.is_file():
             total += child.stat().st_size
     return total
+
+
+def rootfs_digest_cache_path(cache_root: Path, digest: str) -> Path:
+    prefix = "blake3:"
+    if not digest.startswith(prefix):
+        die(f"unsupported rootfs digest for cache path: {digest}")
+    hex_digest = digest[len(prefix):]
+    if len(hex_digest) != 64 or any(c not in "0123456789abcdef" for c in hex_digest):
+        die(f"invalid rootfs digest for cache path: {digest}")
+    return cache_root / "by-digest" / "blake3" / f"{hex_digest}.ext4"
 
 
 def memory_economics(spore_dir: Path) -> dict[str, object]:
@@ -375,6 +397,7 @@ class BenchmarkRunner:
         self.rows: list[dict[str, object]] = []
         self.batch_rows: list[dict[str, object]] = []
         self.env = os.environ.copy()
+        self.env.pop(EAGER_ROOTFS_ENV, None)
         self.env["SPOREVM_ROOTFS_CACHE_DIR"] = str(self.rootfs_cache_dir)
         self.env["SPOREVM_BUNDLE_CACHE_DIR"] = str(self.bundle_cache_dir)
         self.effective_image = args.image
@@ -527,6 +550,8 @@ class BenchmarkRunner:
 
     def run(self) -> None:
         self.setup()
+        if "lazy_rootfs_tti" in self.args.benchmarks:
+            self.run_lazy_rootfs_tti()
         if "cold_tti" in self.args.benchmarks:
             for mode in self.args.modes:
                 self.run_cold_tti(mode)
@@ -557,6 +582,181 @@ class BenchmarkRunner:
         output_cache_dir.mkdir(parents=True, exist_ok=True)
         for metadata_path in self.rootfs_cache_dir.glob("*.json"):
             shutil.copy2(metadata_path, output_cache_dir / metadata_path.name)
+
+    def image_rootfs_cache_records(self) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for metadata_path in sorted(self.rootfs_cache_dir.glob("*.json")):
+            data = parse_json_file(metadata_path)
+            if not isinstance(data, dict):
+                continue
+            rootfs_path_raw = data.get("rootfs_path")
+            rootfs_size = data.get("rootfs_size")
+            storage = data.get("rootfs_storage")
+            if not isinstance(rootfs_path_raw, str) or not isinstance(rootfs_size, int) or not isinstance(storage, dict):
+                continue
+            index_digest = storage.get("index_digest")
+            if not isinstance(index_digest, str) or not index_digest.startswith("blake3:"):
+                continue
+            rootfs_path = Path(rootfs_path_raw)
+            if not rootfs_path.is_absolute():
+                rootfs_path = (metadata_path.parent / rootfs_path).resolve()
+            if not rootfs_path.is_file():
+                continue
+            records.append({
+                "metadata_path": str(metadata_path),
+                "rootfs_path": str(rootfs_path),
+                "rootfs_size": rootfs_size,
+                "index_digest": index_digest,
+                "flat_path": str(rootfs_digest_cache_path(self.rootfs_cache_dir, index_digest)),
+            })
+        return records
+
+    def evict_flat_materializations(self, records: list[dict[str, object]]) -> tuple[int, int]:
+        count = 0
+        bytes_removed = 0
+        for record in records:
+            flat_path = Path(str(record["flat_path"]))
+            try:
+                stat = flat_path.stat()
+                flat_path.unlink()
+            except FileNotFoundError:
+                continue
+            count += 1
+            bytes_removed += stat.st_size
+        return count, bytes_removed
+
+    def restore_flat_materializations(self, records: list[dict[str, object]]) -> int:
+        count = 0
+        for record in records:
+            source_path = Path(str(record["rootfs_path"]))
+            flat_path = Path(str(record["flat_path"]))
+            if flat_path.exists():
+                continue
+            flat_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(source_path, flat_path)
+            except FileExistsError:
+                continue
+            except OSError:
+                shutil.copy2(source_path, flat_path)
+            count += 1
+        return count
+
+    def run_image_tti_once(
+        self,
+        benchmark: str,
+        mode: str,
+        iteration: int,
+        batch_start: int,
+        extra_env: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        prefix = self.log_dir / benchmark / mode / f"{iteration:06d}"
+        stdout = prefix.with_suffix(".stdout")
+        stderr = prefix.with_suffix(".stderr")
+        env = self.env
+        if extra_env:
+            env = self.env.copy()
+            env.update(extra_env)
+        argv = [
+            str(self.spore_bin),
+            "--debug",
+            "run",
+            "--backend",
+            self.backend,
+            "--image",
+            self.effective_image,
+            "--memory",
+            self.args.memory,
+            "--",
+            *self.command,
+        ]
+        started_at_ms = monotonic_ms() - batch_start
+        status, tti_ms, error = run_command(argv, env=env, stdout_path=stdout, stderr_path=stderr, timeout_s=self.args.timeout_s)
+        ended_at_ms = monotonic_ms() - batch_start
+        return {
+            "benchmark": benchmark,
+            "mode": mode,
+            "iteration": iteration,
+            "tti_ms": tti_ms,
+            "success": status == 0,
+            "status": status,
+            "error": error,
+            "rootfs_base_mode": parse_rootfs_base_mode(stderr),
+            "stdout_first_line": first_output_line(stdout),
+            "stdout_path": str(stdout),
+            "stderr_path": str(stderr),
+            "started_at_ms": started_at_ms,
+            "ended_at_ms": ended_at_ms,
+            **parse_run_stderr_metrics(stderr),
+        }
+
+    def run_lazy_rootfs_tti(self) -> None:
+        records = self.image_rootfs_cache_records()
+        if not records:
+            die("lazy_rootfs_tti requires a prewarmed chunked image rootfs cache; run with prewarm enabled")
+
+        batch_start = monotonic_ms()
+        rows_by_mode: dict[str, list[dict[str, object]]] = {"lazy-cold": [], "eager-cold": [], "flat-hot": []}
+        for iteration in range(self.args.iterations):
+            evicted_count, evicted_bytes = self.evict_flat_materializations(records)
+            lazy_row = self.run_image_tti_once("lazy_rootfs_tti", "lazy-cold", iteration, batch_start)
+            lazy_row["flat_materializations_evicted"] = evicted_count
+            lazy_row["flat_materialization_bytes_evicted"] = evicted_bytes
+            lazy_row["success"] = lazy_row["status"] == 0 and lazy_row.get("rootfs_base_mode") == "lazy"
+            self.emit(lazy_row)
+            rows_by_mode["lazy-cold"].append(lazy_row)
+            print(
+                f"lazy_rootfs_tti lazy-cold iteration={iteration} "
+                f"{'ok' if lazy_row.get('success') else 'failed'} "
+                f"tti_ms={lazy_row.get('tti_ms')} first_output_ms={lazy_row.get('first_output_ms')}",
+                file=sys.stderr,
+            )
+
+            restored_for_eager_count = self.restore_flat_materializations(records)
+            evicted_count, evicted_bytes = self.evict_flat_materializations(records)
+            eager_row = self.run_image_tti_once(
+                "lazy_rootfs_tti",
+                "eager-cold",
+                iteration,
+                batch_start,
+                {EAGER_ROOTFS_ENV: "1"},
+            )
+            eager_row["flat_materializations_evicted"] = evicted_count
+            eager_row["flat_materialization_bytes_evicted"] = evicted_bytes
+            eager_row["flat_materializations_restored_before_evict"] = restored_for_eager_count
+            eager_row["success"] = eager_row["status"] == 0 and eager_row.get("rootfs_base_mode") == "flat"
+            self.emit(eager_row)
+            rows_by_mode["eager-cold"].append(eager_row)
+            print(
+                f"lazy_rootfs_tti eager-cold iteration={iteration} "
+                f"{'ok' if eager_row.get('success') else 'failed'} "
+                f"tti_ms={eager_row.get('tti_ms')} first_output_ms={eager_row.get('first_output_ms')}",
+                file=sys.stderr,
+            )
+
+            restored_count = self.restore_flat_materializations(records)
+            flat_row = self.run_image_tti_once("lazy_rootfs_tti", "flat-hot", iteration, batch_start)
+            flat_row["flat_materializations_restored"] = restored_count
+            flat_row["success"] = flat_row["status"] == 0 and flat_row.get("rootfs_base_mode") == "flat"
+            self.emit(flat_row)
+            rows_by_mode["flat-hot"].append(flat_row)
+            print(
+                f"lazy_rootfs_tti flat-hot iteration={iteration} "
+                f"{'ok' if flat_row.get('success') else 'failed'} "
+                f"tti_ms={flat_row.get('tti_ms')} first_output_ms={flat_row.get('first_output_ms')}",
+                file=sys.stderr,
+            )
+
+        for mode, rows in rows_by_mode.items():
+            success_rows = [row for row in rows if row.get("success")]
+            self.emit({
+                "benchmark": "lazy_rootfs_tti",
+                "mode": f"{mode}_batch",
+                "success": len(success_rows) == len(rows),
+                "count": len(rows),
+                "wall_clock_ms": monotonic_ms() - batch_start,
+                "time_to_first_ready_ms": min((row.get("tti_ms") for row in success_rows), default=None),
+            })
 
     def run_cold_tti(self, mode: str) -> None:
         count = self.count_for_mode(mode)
@@ -1131,6 +1331,38 @@ def self_test() -> None:
         assert metrics["kvm_pending_exit_completion_ms"] == 2
         assert metrics["exec_response_ms"] == 8
         assert summarize_field([metrics], "exec_response_ms")["median"] == 8.0
+        stderr.write_text("debug: runtime disk rootfs base: lazy chunk index blake3:abc\n", encoding="utf-8")
+        assert parse_rootfs_base_mode(stderr) == "lazy"
+        stderr.write_text("debug: runtime disk rootfs base: flat artifact blake3:abc\n", encoding="utf-8")
+        assert parse_rootfs_base_mode(stderr) == "flat"
+        cache_root = Path(tmp) / "cache"
+        cache_root.mkdir()
+        digest = "blake3:" + ("a" * 64)
+        assert rootfs_digest_cache_path(cache_root, digest) == cache_root / "by-digest" / "blake3" / f"{'a' * 64}.ext4"
+        rootfs_path = cache_root / "image.ext4"
+        rootfs_path.write_bytes(b"rootfs")
+        (cache_root / "image.json").write_text(json.dumps({
+            "rootfs_path": str(rootfs_path),
+            "rootfs_size": 6,
+            "rootfs_storage": {
+                "index_digest": digest,
+            },
+        }), encoding="utf-8")
+        cache_runner = object.__new__(BenchmarkRunner)
+        cache_runner.rootfs_cache_dir = cache_root
+        records = BenchmarkRunner.image_rootfs_cache_records(cache_runner)
+        assert len(records) == 1
+        assert records[0]["index_digest"] == digest
+        flat_path = Path(str(records[0]["flat_path"]))
+        flat_path.parent.mkdir(parents=True)
+        flat_path.write_bytes(b"rootfs")
+        evicted_count, evicted_bytes = BenchmarkRunner.evict_flat_materializations(cache_runner, records)
+        assert evicted_count == 1
+        assert evicted_bytes == 6
+        assert not flat_path.exists()
+        restored_count = BenchmarkRunner.restore_flat_materializations(cache_runner, records)
+        assert restored_count == 1
+        assert flat_path.read_bytes() == b"rootfs"
         runner = object.__new__(BenchmarkRunner)
         runner.run_id = "self-test"
         runner.raw_path = Path(tmp) / "results.jsonl"
@@ -1177,7 +1409,7 @@ def apply_profile_defaults(args: argparse.Namespace) -> None:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=sorted(PROFILES), default="ci")
-    parser.add_argument("--benchmarks", help="Comma-separated subset: cold_tti,warm_spore_tti,distribution_tti,writable_rootfs")
+    parser.add_argument("--benchmarks", help="Comma-separated subset: cold_tti,warm_spore_tti,distribution_tti,writable_rootfs,lazy_rootfs_tti")
     parser.add_argument("--modes", help="Comma-separated subset: sequential,staggered,burst")
     parser.add_argument("--iterations", type=int, help="Sequential iterations")
     parser.add_argument("--concurrency", type=int, help="Staggered/burst concurrency")
@@ -1210,7 +1442,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         if mode not in ("sequential", "staggered", "burst"):
             die(f"unknown mode: {mode}")
     for benchmark in args.benchmarks:
-        if benchmark not in ("cold_tti", "warm_spore_tti", "distribution_tti", "writable_rootfs"):
+        if benchmark not in ("cold_tti", "warm_spore_tti", "distribution_tti", "writable_rootfs", "lazy_rootfs_tti"):
             die(f"unknown benchmark: {benchmark}")
     if args.iterations <= 0:
         die("--iterations must be positive")

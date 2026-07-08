@@ -391,7 +391,7 @@ pub const Sealer = struct {
         _ = self;
         if (!options.tail) return false;
         if (options.before_seal != null) return false;
-        return dirty_count >= 4 and parallelWorkerCount(dirty_count) > 1;
+        return dirty_count >= 4 and chunk_sealer.parallelWorkerCount(dirty_count) > 1;
     }
 
     fn flushIndicesSerial(self: *Sealer, indices: []const usize, options: FlushOptions, work_stats: *SealWorkStats) !void {
@@ -411,44 +411,16 @@ pub const Sealer = struct {
     }
 
     fn flushIndicesParallel(self: *Sealer, indices: []const usize, record_cpu: bool) !SealWorkStats {
-        const worker_count = parallelWorkerCount(indices.len);
-        var threads = try self.allocator.alloc(std.Thread, worker_count);
-        defer self.allocator.free(threads);
-        const worker_stats = try self.allocator.alloc(SealWorkStats, worker_count);
-        defer self.allocator.free(worker_stats);
-        const worker_errors = try self.allocator.alloc(?anyerror, worker_count);
-        defer self.allocator.free(worker_errors);
-        @memset(worker_stats, .{});
-        @memset(worker_errors, null);
-
+        const worker_count = chunk_sealer.parallelWorkerCount(indices.len);
         var context = ParallelSealContext{
             .sealer = self,
             .indices = indices,
-            .record_cpu = record_cpu,
-            .worker_stats = worker_stats,
-            .worker_errors = worker_errors,
         };
 
-        var started: usize = 0;
-        while (started < worker_count) : (started += 1) {
-            threads[started] = std.Thread.spawn(.{}, parallelSealWorker, .{ &context, started }) catch |err| {
-                context.failed.store(true, .release);
-                var join_index: usize = 0;
-                while (join_index < started) : (join_index += 1) threads[join_index].join();
-                return err;
-            };
-        }
         self.stats.seal_parallel_flush_count +|= 1;
         self.stats.seal_parallel_workers_max = @max(self.stats.seal_parallel_workers_max, worker_count);
-
-        for (threads) |thread| thread.join();
-        for (worker_errors) |maybe_err| {
-            if (maybe_err) |err| return err;
-        }
-
-        var out: SealWorkStats = .{};
-        for (worker_stats) |stats| out.add(stats);
-        return out;
+        const ParallelSeal = chunk_sealer.ParallelWork(ParallelSealContext, parallelSealWorker);
+        return try ParallelSeal.run(self.allocator, &context, indices.len, worker_count, record_cpu);
     }
 
     fn recordSealWork(self: *Sealer, work_stats: SealWorkStats) void {
@@ -547,38 +519,15 @@ pub const Sealer = struct {
 const ParallelSealContext = struct {
     sealer: *Sealer,
     indices: []const usize,
-    record_cpu: bool,
-    next_index: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    worker_stats: []SealWorkStats,
-    worker_errors: []?anyerror,
 };
 
-fn parallelSealWorker(context: *ParallelSealContext, worker_index: usize) void {
-    var work_stats: SealWorkStats = .{};
-    const cpu_start = if (context.record_cpu) threadCpuNs() else 0;
-    defer {
-        if (context.record_cpu) work_stats.cpu_ns = elapsedCpuNs(cpu_start);
-        context.worker_stats[worker_index] = work_stats;
-    }
-
-    while (!context.failed.load(.acquire)) {
-        const next = context.next_index.fetchAdd(1, .monotonic);
-        if (next >= context.indices.len) break;
-        const chunk_index = context.indices[next];
-        context.sealer.clearDirtyChunk(chunk_index);
-        _ = context.sealer.sealChunk(chunk_index, true, &work_stats) catch |err| {
-            context.sealer.markDirtyChunk(chunk_index);
-            context.worker_errors[worker_index] = err;
-            context.failed.store(true, .release);
-            break;
-        };
-    }
-}
-
-fn parallelWorkerCount(dirty_count: usize) usize {
-    const cpu_count = std.Thread.getCpuCount() catch 1;
-    return @min(@min(cpu_count, 8), dirty_count);
+fn parallelSealWorker(context: *ParallelSealContext, item_index: usize, work_stats: *SealWorkStats) anyerror!void {
+    const chunk_index = context.indices[item_index];
+    context.sealer.clearDirtyChunk(chunk_index);
+    _ = context.sealer.sealChunk(chunk_index, true, work_stats) catch |err| {
+        context.sealer.markDirtyChunk(chunk_index);
+        return err;
+    };
 }
 
 fn closeBackingFdDeferred(fd: std.c.fd_t) bool {
@@ -1080,7 +1029,7 @@ test "dirty RAM sealer can flush a dirty tail in parallel" {
     try std.testing.expectEqual(@as(usize, 8), sealer.nonzeroChunkCount());
     try std.testing.expectEqual(@as(usize, 0), sealer.dirtyChunksPending());
 
-    const expected_workers = parallelWorkerCount(8);
+    const expected_workers = chunk_sealer.parallelWorkerCount(8);
     if (expected_workers > 1) {
         try std.testing.expectEqual(@as(u64, 1), sealer.stats.seal_parallel_flush_count);
         try std.testing.expectEqual(@as(u64, @intCast(expected_workers)), sealer.stats.seal_parallel_workers_max);
