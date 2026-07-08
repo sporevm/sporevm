@@ -277,6 +277,6 @@ mise run smoke:lifecycle-tty
 mise run smoke:lifecycle-auto-memory
 mise run smoke:monitor-jail
 mise run smoke:monitor-failure-modes
-scripts/benchmark-sporevm-lifecycle.sh
-scripts/benchmark-sporevm-lifecycle.sh --backend kvm --image docker.io/library/node:22-bookworm-slim -n 3 --max-cleanup-ms 1000
+scripts/benchmark/sporevm-lifecycle.sh
+scripts/benchmark/sporevm-lifecycle.sh --backend kvm --image docker.io/library/node:22-bookworm-slim -n 3 --max-cleanup-ms 1000
 ```

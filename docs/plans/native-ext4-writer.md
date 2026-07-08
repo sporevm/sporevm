@@ -153,7 +153,7 @@ Recorded on 2026-07-08 in this worktree:
 ```bash
 tmp_cache="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-native-smoke-cache.XXXXXX")" &&
 env -u SPOREVM_EXT4_WRITER SPOREVM_ROOTFS_CACHE_DIR="$tmp_cache" \
-  scripts/smoke-run-oci-rootfs.sh --no-build \
+  test/smoke/rootfs/oci-run.sh --no-build \
   --image public.ecr.aws/docker/library/alpine:3.20 \
   -- /bin/echo native-rootfs-smoke
 ```
@@ -171,7 +171,7 @@ Observed:
 ## Benchmark Evidence
 
 Recorded on 2026-07-08 with
-`scripts/benchmark-ext4-writer-comparison.py --tar <docker export of buildkite/agent:3>`
+`scripts/benchmark/ext4-writer-comparison.py --tar <docker export of buildkite/agent:3>`
 (312 MiB flattened tar, macOS arm64), after the v5 symlink-boundary fix:
 
 | Tool | Wall | Conversion | Output size | e2fsck -fn |

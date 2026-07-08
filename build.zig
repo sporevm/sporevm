@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
         "bash",
         "-c",
         \\set -euo pipefail
-        \\scripts/make-minimal-exec-initrd.sh --toybox-source "$3" "$1"
+        \\scripts/kernel/make-minimal-exec-initrd.sh --toybox-source "$3" "$1"
         \\printf '%s\n' 'pub const minimal_exec_initrd = @embedFile("minimal-exec-initrd.cpio");' >"$2"
         ,
         "sporevm-initrd-assets",
@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
     _ = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.cpio");
     const minimal_exec_initrd_module = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.zig");
     minimal_exec_assets.addDirectoryArg(toybox_dep.path(""));
-    minimal_exec_assets.addFileInput(b.path("scripts/make-minimal-exec-initrd.sh"));
+    minimal_exec_assets.addFileInput(b.path("scripts/kernel/make-minimal-exec-initrd.sh"));
     minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/toybox.config"));
     const minimal_exec_sources = [_][]const u8{ "agent", "true", "false", "writeout", "sleeper", "finite", "counter", "nproc", "gencheck", "netcheck", "nslookup", "wget", "httpd", "flockcheck", "cgroupcheck", "toybox-sh" };
     for (minimal_exec_sources) |src| {

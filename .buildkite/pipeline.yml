@@ -60,7 +60,7 @@ steps:
     if: build.tag != null
     command: |
       mise install
-      scripts/build-release-assets.sh --target linux-arm64 --output dist
+      scripts/release/build-assets.sh --target linux-arm64 --output dist
     artifact_paths:
       - "dist/spore_Linux_arm64.tar.gz"
       - "dist/libspore_Linux.tar.gz"
@@ -82,7 +82,7 @@ steps:
     if: build.tag != null
     command: |
       mise install
-      scripts/build-release-assets.sh --target darwin-arm64 --output dist
+      scripts/release/build-assets.sh --target darwin-arm64 --output dist
     artifact_paths:
       - "dist/spore_Darwin_arm64.tar.gz"
       - "dist/libspore_Darwin.tar.gz"
@@ -122,7 +122,7 @@ steps:
     if: build.tag != null
     command: |
       mise install
-      scripts/ci-buildkite-release.sh
+      scripts/ci/buildkite-release.sh
     plugins:
       - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
           version: "2026.5.12"

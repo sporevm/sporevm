@@ -6,8 +6,8 @@ description: Cut, publish, or assess pre-1.0 SporeVM releases from the sporevm/s
 # Release SporeVM
 
 Release from fresh `origin/main`, not from whatever branch is checked out.
-The repo's release path is already in `mise.toml`, `scripts/release.sh`,
-`scripts/prepare-release.sh`, and `.buildkite/pipeline.yml`; use those instead
+The repo's release path is already in `mise.toml`, `scripts/release/tag.sh`,
+`scripts/release/prepare.sh`, and `.buildkite/pipeline.yml`; use those instead
 of inventing release commands.
 
 SporeVM is intentionally staying pre-1.0 for now. Do not cut `v1.0.0` or any

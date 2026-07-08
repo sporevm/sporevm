@@ -272,22 +272,25 @@ Current evidence:
   `mise run smoke:counter-fanout`, and `mise run smoke:rootfs-fanout`.
 - Local writable rootfs layer persistence, fork divergence, and local
   bundle-carried disk layer replay are covered by `mise run smoke:writable-rootfs`.
-- Same-class KVM writable-rootfs bundle materialization passed with
-  `scripts/smoke-remote-bundle.sh --writable-rootfs` on two `a1.metal` hosts
-  in run `writable-rootfs-20260619T212758Z`.
+- Same-class KVM writable-rootfs bundle materialization previously passed with
+  `test/remote/bundle.sh --writable-rootfs` on two `a1.metal` hosts
+  in run `writable-rootfs-20260619T212758Z`. The repo keeps
+  `test/remote/bundle.sh` for host-level remote diagnostics; release validation
+  should target the deployed Kubernetes stack when that harness exists.
 - KVM→HVF with an `m7g.metal` producer is a negative test: the spore records
   `counter_frequency_hz = 1_050_000_000` and HVF exposes 24MHz, so restore must
   reject it before running guest code.
-- A ten-host `a1.metal` probe reported `CNTFRQ_EL0 = 83_333_333` on every host.
-  That makes A1 useful for cheaper same-class KVM distribution tests, but it is
-  not a timer-compatible producer for current Apple HVF hosts.
+- A historical ten-host `a1.metal` probe reported `CNTFRQ_EL0 = 83_333_333` on
+  every host. That remains evidence for same-class KVM behavior, but A1 is not
+  the current remote validation target and is not a timer-compatible producer
+  for current Apple HVF hosts.
 - HVF v1 multi-vCPU same-backend capture, `run --from`, and `resume` passed
   locally with `--backend hvf --vcpus 2` on Apple Silicon.
 - KVM v1 multi-vCPU fresh boot, capture, `run --from`, and `resume` passed on
   the `sporevm-ops` ARM64 Linux CI host
   `i-08fa4a14319c9c1b5` (`sporevm-ci-apse2-linux-arm64`, `c7gd.metal`) via SSM
   command `595ad080-f9ba-4b48-a3d4-49b4dc46df24`, which ran
-  `scripts/smoke-multi-vcpu.sh` with `SPORE_BACKEND=kvm` and reported
+  `test/smoke/fanout/multi-vcpu.sh` with `SPORE_BACKEND=kvm` and reported
   `smoke:multi-vcpu ok backend=kvm vcpus=2`.
 
 ## Next contract work

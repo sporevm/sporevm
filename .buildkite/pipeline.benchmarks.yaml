@@ -23,7 +23,7 @@ steps:
       name: "mise-cache"
     command: |
       set -euo pipefail
-      scripts/ci-buildkite-benchmarks.sh
+      scripts/ci/buildkite-benchmarks.sh
       aws s3 sync zig-cache/sporevm-benchmarks/ "s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/macos/" \
         --no-progress \
         --exclude "*" \
@@ -64,7 +64,7 @@ steps:
       name: "mise-cache"
     command: |
       set -euo pipefail
-      scripts/ci-buildkite-benchmarks.sh
+      scripts/ci/buildkite-benchmarks.sh
       aws s3 sync zig-cache/sporevm-benchmarks/ "s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/linux-arm64/" \
         --no-progress \
         --exclude "*" \
@@ -101,6 +101,6 @@ steps:
     concurrency_group: "sporevm-benchmarks/site-data"
     command: |
       set -euo pipefail
-      scripts/publish-sporevm-benchmark-site-data.py
+      scripts/benchmark/publish-site-data.py
     agents:
       queue: sporevm-linux-arm64

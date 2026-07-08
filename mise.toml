@@ -33,181 +33,177 @@ description = "Run unit tests, build, and diff hygiene"
 
 [tasks.release]
 depends = ["check"]
-run = "scripts/release.sh"
+run = "scripts/release/tag.sh"
 description = "Tag the next version and push to trigger a Buildkite release"
 
 [tasks."release:prepare"]
-run = "scripts/prepare-release.sh"
+run = "scripts/release/prepare.sh"
 description = "Update source and package versions for a release"
 
 [tasks."release:snapshot"]
-run = "scripts/build-release-assets.sh"
+run = "scripts/release/build-assets.sh"
 description = "Build local release archives without publishing"
 
 [tasks."smoke:run"]
-run = "mise run build && scripts/smoke-run.sh"
+run = "mise run build && test/smoke/run/basic.sh"
 description = "Smoke product spore run streaming and exit status"
 
 [tasks."smoke:run-stdin"]
-run = "mise run build && scripts/smoke-run-stdin.sh"
+run = "mise run build && test/smoke/run/stdin.sh"
 description = "Smoke product spore run interactive stdin forwarding"
 
 [tasks."smoke:run-env"]
-run = "mise run build && scripts/smoke-run-env.sh"
+run = "mise run build && test/smoke/run/env.sh"
 description = "Smoke product spore run command environment"
 
 [tasks."smoke:run-tty"]
-run = "mise run build && scripts/smoke-run-tty.sh"
+run = "mise run build && test/smoke/run/tty.sh"
 description = "Smoke product spore run one-shot TTY mode"
 
 [tasks."smoke:run-attach"]
-run = "mise run build && scripts/smoke-run-attach.sh"
+run = "mise run build && test/smoke/run/attach.sh"
 description = "Smoke product spore run interactive attach"
 
 [tasks."smoke:run-inject"]
-run = "mise run build && scripts/smoke-run-inject.sh"
+run = "mise run build && test/smoke/run/inject.sh"
 description = "Smoke product spore run injected files"
 
 [tasks."smoke:run-file-locking"]
-run = "mise run build && scripts/smoke-run-file-locking.sh"
+run = "mise run build && test/smoke/run/file-locking.sh"
 description = "Smoke product spore run guest file locking support"
 
 [tasks."smoke:run-cgroup"]
-run = "mise run build && scripts/smoke-run-cgroup.sh"
+run = "mise run build && test/smoke/run/cgroup.sh"
 description = "Smoke product spore run guest cgroup2 support"
 
 [tasks."smoke:run-auto-memory"]
-run = "mise run build && scripts/smoke-run-auto-memory.sh"
+run = "mise run build && test/smoke/run/auto-memory.sh"
 description = "Smoke product spore run automatic memory growth"
 
 [tasks."smoke:lifecycle-auto-memory"]
-run = "mise run build && scripts/smoke-lifecycle-auto-memory.sh"
+run = "mise run build && test/smoke/lifecycle/auto-memory.sh"
 description = "Smoke named lifecycle automatic memory backing and save stats"
 
 [tasks."smoke:run-capture"]
-run = "mise run build && scripts/smoke-run-capture.sh"
+run = "mise run build && test/smoke/run/capture.sh"
 description = "Smoke product spore run signal save and attach"
 
 [tasks."smoke:multi-vcpu"]
-run = "mise run build && scripts/smoke-multi-vcpu.sh"
+run = "mise run build && test/smoke/fanout/multi-vcpu.sh"
 description = "Smoke multi-vCPU boot, save, run-from, attach, and (with SPORE_SMOKE_NAMED_LIFECYCLE=1) non-destructive named save while still ticking"
 
 [tasks."smoke:lifecycle"]
-run = "mise run build && scripts/smoke-lifecycle.sh"
+run = "mise run build && test/smoke/lifecycle/basic.sh"
 description = "Smoke named lifecycle create, exec, ls, and rm"
 
 [tasks."smoke:lifecycle-copy"]
-run = "mise run build && scripts/smoke-lifecycle-copy.sh"
+run = "mise run build && test/smoke/lifecycle/copy.sh"
 description = "Smoke named lifecycle copy-in and copy-out"
 
 [tasks."smoke:lifecycle-tty"]
-run = "mise run build && scripts/smoke-lifecycle-tty.sh"
+run = "mise run build && test/smoke/lifecycle/tty.sh"
 description = "Smoke named lifecycle interactive exec streaming"
 
 [tasks."smoke:monitor-jail"]
-run = "mise run build && scripts/smoke-monitor-jail.sh"
+run = "mise run build && test/smoke/monitor/jail.sh"
 description = "Smoke the monitor jail denied-operation path"
 
 [tasks."smoke:monitor-failure-modes"]
-run = "mise run build && scripts/smoke-monitor-failure-modes.sh"
+run = "mise run build && test/smoke/monitor/failure-modes.sh"
 description = "Smoke monitor signal, guest OOM, and killed-monitor cleanup behavior"
 
 [tasks."smoke:libspore-standalone-go"]
-run = "mise run build && scripts/smoke-libspore-standalone-go.sh"
+run = "mise run build && test/smoke/libspore/standalone-go.sh"
 description = "Smoke Go libspore named lifecycle without spore on PATH"
 
 [tasks."smoke:run-net-config"]
-run = "mise run build && scripts/smoke-run-net-config.sh"
+run = "mise run build && test/smoke/network/config.sh"
 description = "Smoke product spore run static network configuration"
 
 [tasks."smoke:run-net-dns"]
-run = "mise run build && scripts/smoke-run-net-dns.sh"
+run = "mise run build && test/smoke/network/dns.sh"
 description = "Smoke product spore run DNS proxying"
 
 [tasks."smoke:run-net-http"]
-run = "mise run build && scripts/smoke-run-net-http.sh"
+run = "mise run build && test/smoke/network/http.sh"
 description = "Smoke product spore run outbound HTTP proxying"
 
 [tasks."smoke:net-egress"]
-run = "mise run build && scripts/smoke-net-egress.sh"
+run = "mise run build && test/smoke/network/egress.sh"
 description = "Smoke real public HTTPS egress with allow rules (gated by SPORE_SMOKE_EGRESS=1)"
 
 [tasks."smoke:run-net-deny"]
-run = "mise run build && scripts/smoke-run-net-deny.sh"
+run = "mise run build && test/smoke/network/deny.sh"
 description = "Smoke product spore run hard-floor egress denial"
 
 [tasks."smoke:run-net-bind-service"]
-run = "mise run build && scripts/smoke-run-net-bind-service.sh"
+run = "mise run build && test/smoke/network/bind-service.sh"
 description = "Smoke product spore run bound Unix service proxying"
 
 [tasks."smoke:run-net-bind-service-oci"]
-run = "mise run build && scripts/smoke-run-net-bind-service-oci.sh"
+run = "mise run build && test/smoke/network/bind-service-oci.sh"
 description = "Smoke OCI guest bound Unix service DNS and proxying"
 
 [tasks."smoke:run-net-forward"]
-run = "mise run build && scripts/smoke-run-net-forward.sh"
+run = "mise run build && test/smoke/network/forward.sh"
 description = "Smoke product spore run host-to-guest TCP forwarding"
 
 [tasks."smoke:run-net-capture"]
-run = "mise run build && scripts/smoke-run-net-capture.sh"
+run = "mise run build && test/smoke/network/capture.sh"
 description = "Smoke network policy persistence across save and run --from"
 
 [tasks."smoke:counter-fanout"]
-run = "mise run build && scripts/smoke-counter-fanout.sh"
+run = "mise run build && test/smoke/fanout/counter.sh"
 description = "Smoke save, fork, and attach counter fan-out"
 
 [tasks."smoke:rootfs-fanout"]
-run = "mise run build && scripts/smoke-rootfs-fanout.sh"
+run = "mise run build && test/smoke/fanout/rootfs.sh"
 description = "Smoke OCI rootfs save, fork, and run-from child execution"
 
 [tasks."smoke:live-rootfs-fanout"]
-run = "mise run build && bash scripts/smoke-live-rootfs-fanout.sh"
+run = "mise run build && bash test/smoke/fanout/live-rootfs.sh"
 description = "Smoke live OCI rootfs save, fork, and attach child identity"
 
 [tasks."smoke:writable-rootfs"]
-run = "mise run build && scripts/smoke-writable-rootfs.sh"
+run = "mise run build && test/smoke/rootfs/writable.sh"
 description = "Smoke writable rootfs disk layer save and run-from replay"
 
 [tasks."benchmark:writable-rootfs"]
-run = "mise run build:release && scripts/benchmark-writable-rootfs.sh --iterations 1"
+run = "mise run build:release && scripts/benchmark/writable-rootfs.sh --iterations 1"
 description = "Benchmark writable rootfs COW, sealed append, and replay paths"
 
 [tasks."smoke:local-pull"]
-run = "mise run build && scripts/smoke-local-pull.sh"
+run = "mise run build && test/smoke/fanout/local-pull.sh"
 description = "Smoke local file:// pull materialization and restored rootfs fan-out"
 
-[tasks."validate:release-a1-kvm"]
-run = "bash scripts/validate-release-a1-kvm.sh"
-description = "Run repeatable A1/KVM release validation over SSM remote hosts"
-
 [tasks.smoke]
-run = "mise run build && scripts/smoke-run.sh && scripts/smoke-run-capture.sh"
+run = "mise run build && test/smoke/run/basic.sh && test/smoke/run/capture.sh"
 description = "Run product smoke tests"
 
 [tasks."benchmark:smoke"]
-run = "mise run build:release && scripts/benchmark-sporevm-suite.py --profile smoke --no-build"
+run = "mise run build:release && scripts/benchmark/suite.py --profile smoke --no-build"
 description = "Run a quick benchmark-suite smoke profile"
 
 [tasks."benchmark:ci"]
-run = "mise run build:release && scripts/benchmark-sporevm-suite.py --profile ci --no-build"
+run = "mise run build:release && scripts/benchmark/suite.py --profile ci --no-build"
 description = "Run the short CI benchmark profile and write comparable JSON output"
 
 [tasks."benchmark:comparison"]
-run = "mise run build:release && scripts/benchmark-sporevm-suite.py --profile comparison --no-build"
+run = "mise run build:release && scripts/benchmark/suite.py --profile comparison --no-build"
 description = "Run the heavier all-dimension comparison benchmark profile"
 
 [tasks."benchmark:full"]
-run = "mise run build:release && scripts/benchmark-sporevm-suite.py --profile full --no-build"
+run = "mise run build:release && scripts/benchmark/suite.py --profile full --no-build"
 description = "Run the full benchmark suite"
 
 [tasks."benchmark:compare"]
-run = "scripts/compare-sporevm-benchmarks.py"
+run = "scripts/benchmark/compare.py"
 description = "Compare two benchmark summary JSON files"
 
 [tasks."benchmark:rootfs-writers"]
-run = "mise run build && scripts/benchmark-rootfs-writers.py --no-build"
+run = "mise run build && scripts/benchmark/rootfs-writers.py --no-build"
 description = "Compare native and external rootfs writer phase timings"
 
 [tasks."benchmark:export"]
-run = "scripts/export-sporevm-benchmark-data.py zig-cache/sporevm-benchmarks/latest-summary.json"
+run = "scripts/benchmark/export-site-data.py zig-cache/sporevm-benchmarks/latest-summary.json"
 description = "Export latest benchmark summary as static trend data"

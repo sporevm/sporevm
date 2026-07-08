@@ -314,7 +314,7 @@ after-restore hook before generating secrets.
 Validate the tag-to-rootfs-to-run path with the local smoke script:
 
 ```bash
-scripts/smoke-run-oci-rootfs.sh -- /bin/echo hi
+test/smoke/rootfs/oci-run.sh -- /bin/echo hi
 ```
 
 The smoke prints the metadata path and `resolved_image_ref` so tag-based runs
