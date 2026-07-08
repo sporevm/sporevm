@@ -69,6 +69,7 @@ const usage =
     \\
     \\  Rootfs and local system:
     \\    rootfs              Build rootfs images from OCI images
+    \\    cache               Inspect and collect local content-addressed caches
     \\    system              Inspect and prune local SporeVM system state
     \\    host-info           Print this host's platform facts
     \\    version             Print the spore version
@@ -196,6 +197,8 @@ fn runCommand(
 
     if (std.mem.eql(u8, command, "system")) {
         try spore_internal.system.run(init, command_args, stdout, stderr, mode);
+    } else if (std.mem.eql(u8, command, "cache")) {
+        try spore_internal.system.cacheRun(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "rootfs")) {
         try spore_internal.rootfs_cli.run(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "run")) {
@@ -405,6 +408,7 @@ fn parseGlobalArgs(args: []const []const u8) GlobalArgs {
 
 fn supportsJson(command: []const u8) bool {
     return std.mem.eql(u8, command, "system") or
+        std.mem.eql(u8, command, "cache") or
         std.mem.eql(u8, command, "create") or
         std.mem.eql(u8, command, "rm") or
         std.mem.eql(u8, command, "restore") or

@@ -590,7 +590,6 @@ pub fn rootfsBuild(
     defer arena_state.deinit();
     const result = try rootfs_mod.build(init, arena_state.allocator(), options);
     return .{
-        .rootfs_blake3 = result.rootfs_blake3,
         .rootfs_storage = try ownRootfsStorageDigestFields(allocator, result.rootfs_storage),
     };
 }
@@ -704,13 +703,15 @@ fn ownRootfsImportOciResult(allocator: std.mem.Allocator, result: RootfsImportOc
     const resolved_image_ref = try allocator.dupe(u8, result.resolved_image_ref);
     errdefer allocator.free(resolved_image_ref);
     const image_manifest_digest = try allocator.dupe(u8, result.image_manifest_digest);
+    errdefer allocator.free(image_manifest_digest);
+    const rootfs_storage = try ownRootfsStorageDigestFields(allocator, result.rootfs_storage);
     return .{
         .rootfs_path = rootfs_path,
         .metadata_path = metadata_path,
         .local_ref_path = local_ref_path,
         .resolved_image_ref = resolved_image_ref,
         .image_manifest_digest = image_manifest_digest,
-        .rootfs_blake3 = result.rootfs_blake3,
+        .rootfs_storage = rootfs_storage,
     };
 }
 
@@ -1295,10 +1296,7 @@ pub fn deinitPullResult(allocator: std.mem.Allocator, result: PullResult) void {
 /// Summarize either manifest version; the fields read here are shared
 /// between `spore.Manifest` and `spore.ManifestV1`.
 fn summarizeSpore(allocator: std.mem.Allocator, manifest: anytype, vcpu_count: u32) !SporeInspectResult {
-    var present_chunks: usize = 0;
-    for (manifest.memory.chunks) |maybe_chunk| {
-        if (maybe_chunk != null) present_chunks += 1;
-    }
+    const present_chunks = manifest.memory.chunks.len;
 
     var annotations = spore.Annotations{};
     errdefer deinitOwnedAnnotations(allocator, &annotations);
@@ -1458,8 +1456,7 @@ test "inspect spore returns annotation values from saved manifest" {
     var annotations = spore.Annotations{};
     try annotations.map.put(arena, "cleanroom.create", "created");
     try annotations.map.put(arena, "cleanroom.snapshot", "warm");
-    var memory_chunks = [_]?[]const u8{null};
-    var manifest = annotationTestManifest(annotations, &memory_chunks);
+    var manifest = annotationTestManifest(annotations);
     const rootfs_digest = "blake3:1111111111111111111111111111111111111111111111111111111111111111";
     const rootfs_device = spore.RootfsDevice{ .mmio_slot = 0 };
     var rootfs_devices = [_]spore.TransportState{.{
@@ -1506,7 +1503,7 @@ test "inspect spore returns annotation values from saved manifest" {
     try std.testing.expectEqual(@as(u16, 8170), network.bound_services[0].guest_port);
 }
 
-fn annotationTestManifest(annotations: spore.Annotations, memory_chunks: []?[]const u8) spore.Manifest {
+fn annotationTestManifest(annotations: spore.Annotations) spore.Manifest {
     return .{
         .annotations = annotations,
         .platform = .{
@@ -1540,7 +1537,7 @@ fn annotationTestManifest(annotations: spore.Annotations, memory_chunks: []?[]co
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
         .sessions = &annotation_test_sessions,
-        .memory = .{ .chunk_size = spore.chunk_size, .chunks = memory_chunks },
+        .memory = .{ .logical_size = 1, .chunk_size = spore.chunk_size, .zero_chunks = &.{0} },
     };
 }
 
@@ -1564,7 +1561,6 @@ test "inspect spore summarizes multi-vcpu v1 manifests" {
 
     var annotations = spore.Annotations{};
     try annotations.map.put(arena, "cleanroom.bake", "warm");
-    var memory_chunks = [_]?[]const u8{null};
     var vcpus = [_]spore.VcpuState{ testVcpuState(0), testVcpuState(1) };
     const redists = [_]gicv3.RedistributorState{
         .{ .mpidr = vcpus[0].mpidr, .regs = &.{} },
@@ -1596,7 +1592,7 @@ test "inspect spore summarizes multi-vcpu v1 manifests" {
         },
         .devices = &.{},
         .generation = .{ .generation = 1, .interrupt_status = 0, .params_b64 = "" },
-        .memory = .{ .chunk_size = spore.chunk_size, .chunks = &memory_chunks },
+        .memory = .{ .logical_size = 1, .chunk_size = spore.chunk_size, .zero_chunks = &.{0} },
     };
     try spore.saveManifestV1(arena, dir, manifest);
 

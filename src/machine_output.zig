@@ -7,6 +7,7 @@ pub const error_schema = "spore.error.v1";
 pub const error_schema_version: u32 = 1;
 pub const run_events_schema = "spore.run-events.v1";
 pub const run_events_schema_version: u32 = 1;
+pub const format_too_old_message = "format too old: re-create this spore/image";
 
 pub const Mode = enum {
     human,
@@ -163,9 +164,9 @@ pub fn usageMissingArgument(message: []const u8, source: []const u8) CliError {
 pub fn forkUnsupportedVcpuBody(allocator: std.mem.Allocator, vcpu_count: u32) []const u8 {
     return std.fmt.allocPrint(
         allocator,
-        "source has {d} vCPUs but uses a fork topology or GIC state this backend cannot mint safely yet. Capture the fork source with a supported backend and manifest v1 GIC state.",
+        "source has {d} vCPUs but uses a fork topology or GIC state this backend cannot mint safely yet. Capture the fork source with a supported backend and manifest v3 GIC state.",
         .{vcpu_count},
-    ) catch "source uses a fork topology or GIC state this backend cannot mint safely yet. Capture the fork source with a supported backend and manifest v1 GIC state.";
+    ) catch "source uses a fork topology or GIC state this backend cannot mint safely yet. Capture the fork source with a supported backend and manifest v3 GIC state.";
 }
 
 pub fn forkUnsupportedVcpuMessage(allocator: std.mem.Allocator, vcpu_count: u32) []const u8 {
@@ -199,6 +200,7 @@ pub fn fromZigError(err: anyerror) CliError {
         error.IsDir,
         error.InvalidManifest,
         error.BadManifest,
+        error.FormatTooOld,
         error.PlatformMismatch,
         error.MissingRootfsArtifact,
         error.UnsupportedRootfsDeviceCount,
@@ -206,7 +208,7 @@ pub fn fromZigError(err: anyerror) CliError {
         error.ManagedKernelHTTPStatus,
         error.ManagedKernelBodyTooLarge,
         error.UnsupportedExt4FileSize,
-        => CliError.init(.object_invalid, ErrorCode.object_invalid.defaultMessage(), @errorName(err)),
+        => CliError.init(.object_invalid, if (err == error.FormatTooOld) format_too_old_message else ErrorCode.object_invalid.defaultMessage(), @errorName(err)),
         error.UnsupportedHost,
         error.UnsupportedBackend,
         => CliError.init(.host_unsupported, ErrorCode.host_unsupported.defaultMessage(), @errorName(err)),

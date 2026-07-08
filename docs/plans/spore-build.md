@@ -40,7 +40,7 @@ related_plans:
 
 Add a `spore build` command that executes a narrow Dockerfile subset directly
 against Spore rootfs artifacts, with a deterministic per-instruction cache, so
-that a fully cached rebuild resolves the final rootfs digest and updates the
+that a fully cached rebuild resolves the final rootfs identity and updates the
 local image ref without booting anything, exporting anything, or touching
 BuildKit.
 
@@ -65,25 +65,25 @@ The current `bin/buildkite-spore build` flow is:
 1. `docker buildx build --build-context base=oci-layout://… --output
    type=tar,dest=…` (47.3s reported, all Dockerfile steps cached; 44.6s of that
    is "exporting to client tarball").
-2. `spore rootfs import-tar … --rootfs-storage flat` (~179s: 64s staging
-   extraction, 47s mkfs, 39s debugfs, 10s blake3).
+2. `spore rootfs import-tar …` (~179s in the old flat-import measurement: 64s
+   staging extraction, 47s mkfs, 39s debugfs, 10s blake3).
 3. `spore run --image local/buildkite-spore:dev …`.
 
 Even when every Dockerfile step is cached, the pipeline serializes a ~4.1G tar
 out of BuildKit and rebuilds an ~8G ext4 from scratch. The rootfs it produces
-(`rootfs_blake3 e02b8385…`, 7,969,177,600 bytes) is byte-identical to the one
-built last time. Roughly 300s of the 347s wall clock is spent proving that.
+is byte-identical to the one built last time. Roughly 300s of the 347s wall
+clock is spent proving that.
 
-No amount of import optimization fixes this: the flat-storage work in the
-related plan removed the CAS preload pass and duplicate hashing, and the
-remaining phases (`layer_extract_staging`, `mkfs_ext4`, `debugfs_finalize`) are
-the irreducible cost of converting a tar into an ext4. The only way to make the
-cached path fast is to not produce the tar at all.
+No amount of import optimization fixes this: the remaining phases
+(`layer_extract_staging`, `mkfs_ext4`, `debugfs_finalize`, and final rootfs
+CAS indexing) are the irreducible cost of converting a tar into an ext4 and
+publishing it as a Spore rootfs. The only way to make the cached path fast is
+to not produce the tar at all.
 
 ## Goals
 
 - A fully cached `spore build` of the `buildkite-sporevm` Dockerfile completes
-  in under one second: hash inputs, resolve the final rootfs digest from the
+  in under one second: hash inputs, resolve the final rootfs identity from the
   step cache, refresh the local ref, exit.
 - A partially cached rebuild (one changed trailing instruction) pays only for
   the changed steps, not for re-exporting or re-importing the base.
@@ -92,8 +92,8 @@ cached path fast is to not produce the tar at all.
   existing digest cache and local ref machinery with no new run-path formats.
 - Fail closed on unsupported Dockerfile features with an error naming the
   instruction and a hint pointing at the BuildKit path.
-- linux/arm64 only, flat rootfs storage only, single-stage Dockerfiles only in
-  the first implementation.
+- linux/arm64 only and single-stage Dockerfiles only in the first
+  implementation.
 
 ## Non-Goals
 
@@ -108,12 +108,12 @@ cached path fast is to not produce the tar at all.
   `--build-context`.
 - No OCI image/layer output. `spore build` produces Spore rootfs artifacts and
   local refs, not pushable OCI images.
-- No content hashing of intermediate checkpoints, and no dirty-extent /
-  incremental hashing in v1. Only the final rootfs is hashed (one full BLAKE3
-  pass, ~10s at 8G, once per uncached build); dirty-extent tracking and
-  incremental CAS maintenance are a scheduled follow-up (M5).
+- No content hashing or indexing of intermediate checkpoints, and no
+  dirty-extent / incremental indexing in v1. Only the final rootfs is indexed
+  once per uncached build; dirty-extent tracking and incremental CAS maintenance
+  are a scheduled follow-up (M5).
 - No cross-machine or shared build cache. The step cache is local, same trust
-  model as the existing rootfs digest cache.
+  model as the existing rootfs materialization cache.
 - No `.dockerignore` in the first milestones. The wrapper's generated context
   contains only explicitly copied files. `.dockerignore` lands with the
   general-ergonomics milestone.
@@ -128,7 +128,6 @@ cached path fast is to not produce the tar at all.
 spore build \
   -t local/buildkite-spore:dev \
   --platform linux/arm64 \
-  --rootfs-storage flat \
   --build-context base=oci-layout:///path/to/base-oci \
   /path/to/context
 ```
@@ -144,10 +143,6 @@ Options for the first implementation:
   Only the `oci-layout://` scheme is supported initially. `FROM NAME` resolves
   through the existing `importOciLayout` pipeline, cached by manifest digest.
 - `--build-arg KEY=VALUE` (repeatable): supplies `ARG` values.
-- `--rootfs-storage flat|chunked`: default `flat`. `spore build` is a new
-  command optimized for local iteration; portable use goes through the
-  existing lazy `ensureImageRootfsStorage` upgrade on save, exactly as flat
-  imports do today.
 - `--network spore|none`: network policy for `RUN` steps. Default `spore`
   (Docker builds assume network). `none` gives hermetic builds.
 - `--disk-headroom SIZE`: free ext4 space guaranteed at build-session start
@@ -248,7 +243,7 @@ The orchestrator threads a `BuildState` through the instruction list:
 
 ```zig
 const BuildState = struct {
-    rootfs_blake3: [64]u8,      // current parent rootfs digest
+    rootfs_identity: [64]u8,    // current parent rootfs index identity
     step_key: [64]u8,           // current chain key
     env: []const EnvPair,       // base config Env, then ENV accumulation
     args: []const ArgPair,      // declared ARG values
@@ -262,7 +257,7 @@ metadata sidecar already carries it): `env` starts as the base config `Env`
 (so `RUN` sees the base's `PATH`, `RUBYOPT`, etc., as Docker does), `workdir`
 starts as the base `WorkingDir` (default `/`), and `cmd` starts as the base
 `Cmd` so an override-free Dockerfile inherits it. Base config values need no
-extra keying: they are a pure function of the base rootfs digest that already
+extra keying: they are a pure function of the base rootfs identity that already
 roots the chain.
 
 Metadata-only instructions (`ENV`, `ARG`, `WORKDIR`, `CMD`) advance `step_key`
@@ -275,8 +270,8 @@ Reused existing machinery, unchanged:
   oci-layout bases, cached by manifest digest — a base that was imported last
   build is a cache hit.
 - `rootfs_cache` (`src/rootfs_cache.zig`) stores every intermediate and final
-  rootfs at `<cache_root>/by-digest/blake3/<hex>.ext4`, verify-at-install,
-  trust-at-open, including the hardlink fast path.
+  rootfs materialization at `<cache_root>/by-digest/blake3/<hex>.ext4`,
+  verify-at-install, trust-at-open, including the hardlink fast path.
 - Local ref records (`refs/local/<sha256>.json`, `writeLocalRefCache`) and the
   image-keyed `<cache_key>.ext4`/`.json` pair make the result visible to
   `spore run --image` with no run-path changes.
@@ -302,9 +297,9 @@ The three jobs Docker layers perform are covered separately:
   unmodified blocks physically, so N checkpoints of an 8G image cost 8G plus
   the blocks each step wrote (APFS/reflink filesystems; plain-copy fallback
   documented under GC in M5).
-- **Distribution/dedupe**: the existing chunked rootfs CAS (fixed 64KiB
-  chunks, `rootfs-block-index-v0`), derived lazily when a portable artifact
-  is actually requested — layers are never needed as the dedupe unit.
+- **Distribution/dedupe**: the existing rootfs CAS (fixed 64KiB chunks,
+  `spore-disk-index-v1`), derived for the final published image — layers are
+  never needed as the dedupe unit.
 
 Accepted one-way door: built images cannot be exported back to Docker (there
 are no layers to emit). Checkpoint granularity is whole-image logical / dirty
@@ -317,16 +312,16 @@ Each instruction produces a deterministic step key:
 
 ```
 step_key_0   = blake3("sporevm-build-v0" || builder_version || platform
-                      || base_rootfs_blake3)
+                      || base_rootfs_identity)
 step_key_i   = blake3(step_key_{i-1} || instruction_kind
                       || canonical_instruction || input_digest)
 ```
 
 Per-instruction inputs:
 
-- `FROM`: the resolved base **rootfs blake3** (not the ref, not the manifest
-  digest). Re-importing the same OCI layout yields the same rootfs digest and
-  the same chain; a changed base image invalidates everything.
+- `FROM`: the resolved base **rootfs identity** (not the ref, not the manifest
+  digest). Re-importing the same OCI layout yields the same rootfs index
+  identity and the same chain; a changed base image invalidates everything.
 - `RUN`: the exact command string, the effective environment (accumulated
   `ENV` plus every declared `ARG` as exported at that point, sorted
   canonical `K=V` list), the current `WORKDIR`, and the network mode.
@@ -380,28 +375,28 @@ clone succeeds:
   "parent_step_key": "…",
   "instruction": "RUN apt-get update && …",
   "checkpoint_size": 7969177600,
-  "rootfs_blake3": null,
+  "rootfs_identity": null,
   "created_unix": 1783732000
 }
 ```
 
-`rootfs_blake3` is a memo, not a promise: it is filled in the first time that
-checkpoint is published as a final image (hashed once, then reused), so a
-fully cached rebuild publishes refs without rehashing anything. A checkpoint
-that was intermediate in one build and final in a shorter Dockerfile pays the
-hash once at first publication.
+`rootfs_identity` is a memo, not a promise: it is filled in the first time that
+checkpoint is published as a final image (indexed once, then reused), so a
+fully cached rebuild publishes refs without rescanning the flat checkpoint. A
+checkpoint that was intermediate in one build and final in a shorter Dockerfile
+pays the index pass once at first publication.
 
 A cache hit requires the record to parse, `kind`/`builder_version`/`platform`
 to match, and `build/steps/<step_key>.ext4` to exist as a regular readable
 file. A record pointing at a pruned checkpoint is treated as a miss and
 rewritten.
 
-Final rootfs digests are **recorded outcomes, not recomputed promises**. Guest
+Final rootfs identities are **recorded outcomes, not recomputed promises**. Guest
 writes (inode allocation, timestamps) are not deterministic, so the same step
-key can map to different rootfs bytes on different machines or after a cache
+key can map to different rootfs indexes on different machines or after a cache
 wipe. That is the same model Docker uses: cache keys are deterministic, the
-artifact digest is whatever the execution produced. Nothing downstream assumes
-reproducibility of the ext4 bytes.
+artifact identity is whatever the execution produced. Nothing downstream
+assumes reproducibility of the ext4 bytes.
 
 ### Final image identity
 
@@ -413,7 +408,7 @@ config document:
   "kind": "sporevm-built-image-v0",
   "builder_version": "…",
   "platform": {"os": "linux", "arch": "arm64"},
-  "rootfs_blake3": "blake3:…",
+  "rootfs_identity": "blake3:…",
   "config": {"Env": […], "Cmd": […], "WorkingDir": "…"}
 }
 ```
@@ -422,7 +417,8 @@ Its SHA256 becomes the image's "manifest digest", giving `local/name@sha256:…`
 through the existing `localResolvedImageRef` shape. Publication then follows
 the import path exactly:
 
-1. hardlink the by-digest ext4 to `<image_cache_key>.ext4`
+1. install or hardlink the flat materialization under the rootfs index identity
+   and to `<image_cache_key>.ext4`
    (`rootfsCacheKeyAlloc` over builder version, platform, synthesized digest,
    resolved ref);
 2. write an `RootFSMetadata`-compatible `.json` sidecar: `config` carries
@@ -434,8 +430,8 @@ the import path exactly:
 3. `writeLocalRefCache` for the mutable tag.
 
 Result: `spore run --image local/buildkite-spore:dev` works today's way, and
-`--save` gets portable chunked storage through the existing lazy
-`ensureImageRootfsStorage` upgrade.
+`--save` records portable chunked storage immediately because the cache
+metadata already carries the rootfs storage index.
 
 ## RUN Execution And Snapshot
 
@@ -569,7 +565,6 @@ Docker semantic contract, tested explicitly:
 "${spore_bin}" build \
   -t "${image}" \
   --platform "${platform}" \
-  --rootfs-storage "${rootfs_storage}" \
   --build-context "base=oci-layout://${base_oci_dir}" \
   "${context}"
 ```
@@ -798,11 +793,9 @@ running the Rails spec smoke.
 - Writable clone instead of COW overlay for the session disk: reflink makes
   the clone free, removes the flatten pass, and reuses the existing
   `spore_rootfs_rw` guest behavior.
-- Hash the final rootfs only; intermediates are addressed by step key, not
-  content digest. Child digests are recorded outcomes; no determinism
+- Index the final rootfs only; intermediates are addressed by step key, not
+  content identity. Child identities are recorded outcomes; no determinism
   requirement on guest writes. Cache keys, not artifacts, carry determinism.
-- Default `--rootfs-storage flat` for `spore build` (new command, local-first
-  purpose; portability via existing lazy upgrade).
 - Default `--network spore` for RUN (Docker parity; the target Dockerfile
   needs apt/curl). `--network none` for hermetic builds.
 - `/bin/sh -c` for RUN, not `-lc` (Docker parity).

@@ -2,7 +2,7 @@
 
 SporeVM exposes root storage to the guest as a normal `virtio-blk` disk. The
 host may serve that disk from an exact ext4 artifact, a chunked rootfs CAS, or
-sealed writable COW layers, but the guest-visible contract stays block-based.
+sealed writable disk indexes, but the guest-visible contract stays block-based.
 Filesystem-level diffs, FUSE, 9p, NFS, and file-content indexes are not restore
 authority.
 
@@ -17,17 +17,17 @@ $SPOREVM_ROOTFS_CACHE_DIR/
   <image-cache-key>.ext4
   <image-cache-key>.json              # includes rootfs_storage
   by-digest/blake3/<rootfs>.ext4      # exact fd-backed compatibility path
-  cas/rootfs/blake3/indexes/<id>.json # rootfs-block-index-v0
+  cas/rootfs/blake3/indexes/<id>.json # spore-disk-index-v1
   cas/rootfs/blake3/objects/<id>.chunk
 ```
 
 `spore run --image ... --save` is the writable-rootfs product path. It
 records the immutable ext4 artifact, records `rootfs.storage` from the metadata
-sidecar for image-created spores, and captures rootfs writes as sealed disk
-layers over that base. Older image cache entries are upgraded once when save
-needs portable chunked rootfs identity. `spore rootfs cas-preload --attach-spore`
-remains a repair/debug path for existing exact-rootfs spores; it is not the
-normal producer path.
+sidecar for image-created spores, and captures rootfs writes as a sealed disk
+index over that base. Older image cache entries miss under the flag-day cache
+identity and are rebuilt from the source image rather than migrated. `spore
+rootfs cas-preload --attach-spore` remains a repair/debug path for existing
+exact-rootfs spores; it is not the normal producer path.
 
 Plain `spore run --rootfs PATH` is still a local read-only escape hatch. Named
 `spore create --rootfs PATH` records exact immutable rootfs identity in the
@@ -48,16 +48,19 @@ the immutable rootfs artifact. Spore rejects `--inject` with `--save` and
 The manifest, not a path, tag, cache entry, or bundle index, is the restore
 authority.
 
-- `rootfs.artifact` records the exact ext4 artifact digest, size, format, device
-  binding, and OCI provenance. This remains the compatibility path for spores
-  without `rootfs.storage`.
+- `rootfs.artifact` records the ext4 materialization identity, size, format,
+  device binding, and OCI provenance. For spores with `rootfs.storage`, the
+  artifact digest must equal `rootfs.storage.index_digest`; the flat ext4 file
+  is only a cache keyed by that index identity. Spores without
+  `rootfs.storage` keep the older exact fd-backed digest path.
 - `rootfs.storage.kind: "chunked-ext4-rootfs-v0"` selects the chunked rootfs
   base. The descriptor binds device, logical size, chunk size, hash algorithm,
   object namespace, `index_digest`, and `base_identity`. For this storage kind,
   `base_identity == index_digest`.
-- `disk.kind: "cow-block-v0"` records sealed writable root disk layers over the
-  effective rootfs base. For fd-backed rootfs, `disk.base` is the ext4 artifact
-  digest. For chunked rootfs, `disk.base` is `rootfs.storage.base_identity`.
+- `disk.kind: "chunk-index-disk-v0"` records sealed writable root disk bytes as
+  a `spore-disk-index-v1` in the rootfs CAS namespace. `disk.base` is the index
+  digest; `chunk_size`, `hash_algorithm`, and `object_namespace` bind the
+  descriptor used to open and verify the index and objects.
 
 OCI refs and local image ref records are provenance or cache hints only.
 
@@ -67,48 +70,53 @@ Product attach and run-from restore build one root disk backend:
 
 ```text
 virtio-blk
-  -> local active COW head
-  -> sealed disk-layer objects
-  -> immutable base: flat digest-addressed ext4 fd (FileBlockSource)
+  -> one-level chunk map
+  -> sparse local overlay for writes
+  -> flat or sparse base fd selected by disk/rootfs index
 ```
 
-The flat digest-addressed ext4 artifact is the only runtime base source. The
-open follows the verify-at-install, trust-at-open cache contract (see
-SECURITY.md): entries were BLAKE3-verified when installed and published
-read-only, so the open checks only symlink-safety, regular-file shape, and
-exact size instead of re-hashing the artifact. Serving guest reads with plain
-preads on one fd is what keeps resume-to-first-command fast.
+The flat materialization is the hot runtime base source. For immutable rootfs
+materializations, the open follows the verify-at-install, trust-at-open cache
+contract (see SECURITY.md): exact fd-backed entries were BLAKE3-verified when
+installed, while chunked entries were derived from a digest-verified index and
+BLAKE3-verified chunk objects. Opens check symlink-safety, regular-file shape,
+and exact size instead of re-hashing the flat file. When the flat cache is
+missing or stale, the runtime opens the selected disk/rootfs index over a
+sparse temporary base fd. Nonzero index entries start as `.cas` map entries;
+the first read verifies the local chunk object against the descriptor-selected
+BLAKE3 digest, writes it into the sparse base, and promotes the map entry to
+the hot `.base` path. Serving repeated guest reads with plain preads on one fd
+is what keeps resume-to-first-command fast.
 
 Chunked rootfs storage (`rootfs.storage`) is a distribution and dedupe format,
-not a runtime read path. `spore pull` and `spore unpack` assemble the flat
-artifact from the verified chunk objects at materialization time, and resume
-performs the same assembly once when the flat artifact is missing locally
-(pruned or corrupt cache entries self-heal from chunks). Assembly verifies
-each chunk against the digest-verified index, hashes the assembled bytes, and
-requires them to equal `rootfs.artifact.digest` before atomically publishing
-the entry; an inconsistent artifact/index pairing fails closed instead of
-serving different bytes depending on cache state.
+and now also the local cold-start fallback when a flat materialization is not
+available. `spore pull` and `spore unpack` can still assemble flat
+materializations from verified chunk objects, but `spore run` and restore do
+not need to publish a flat by-digest cache entry before boot. An inconsistent
+artifact/index pairing fails closed when the index is opened; missing or
+corrupt chunk objects fail the specific read before bytes reach the guest.
 
-Missing or corrupt rootfs indexes, chunk objects, exact artifacts, disk layer
-indexes, or disk objects fail before guest code can observe the bytes.
+Missing or corrupt rootfs indexes, chunk objects, exact artifacts, disk indexes,
+or disk chunk objects fail before guest code can observe unverifiable bytes.
 
-## Writable Disk Layers
+## Writable Disk Indexes
 
-Writable rootfs state is represented as sealed block layers:
+Writable rootfs state is represented as a sealed chunk index:
 
 ```text
-disk-layer-v0
-  cluster_size: 4096
-  disk_size: <bytes>
-  extents: logical_cluster -> blake3:<cluster-bytes>
-  zero_clusters: [...]
+chunk-index-disk-v0
+  base: blake3:<spore-disk-index-v1 bytes>
+  chunk_size: 65536
+  chunks: logical_chunk -> blake3:<chunk-bytes>
+  zero_chunks: [...]
 ```
 
-Active writes stay local in a sparse writable head. Capture seals dirty clusters
-into content-addressed disk objects and records the layer index in the manifest.
-Forking preserves sealed parent layers and gives each child a fresh writable
-head. A later file-content index may reduce transfer bytes for shifted package
-layouts, but exact block replay remains authority.
+Active writes stay local in a sparse writable head. Capture writes nonzero
+chunks into `cas/rootfs/blake3/objects/`, writes the canonical
+`spore-disk-index-v1` under `cas/rootfs/blake3/indexes/`, and records that index
+digest in the manifest disk. Restore attaches the verified index to the
+chunk-mapped backend; referenced chunk objects fault into the sparse base fd on
+first read and then use the same hot `.base` path as a materialized image.
 
 ## Distribution
 
@@ -119,12 +127,14 @@ layouts, but exact block replay remains authority.
 - spores with `rootfs.storage` include the descriptor-bound index under
   `rootfs/blake3/indexes/<hex>.json` and referenced chunks under
   `rootfs/blake3/objects/<hex>.chunk`;
-- spores with writable disk layers include referenced `disk-layer-v0` indexes
-  and disk cluster objects.
+- spores with writable disk indexes include the `spore-disk-index-v1` named by
+  `disk.base` and referenced nonzero disk chunk objects under the same
+  `rootfs/blake3` index/object paths.
 
 `spore unpack` and `spore pull` fully materialize one selected child before
 resume. They verify bundle identity, selected manifests, RAM chunks, rootfs
-artifacts or CAS bytes, and disk objects before writing a resumable spore.
+artifacts or CAS bytes, and disk index/object bytes before writing a resumable
+spore.
 Direct S3 and digest-pinned HTTP peer pulls are byte sources only; they never
 become restore authority. HTTP peer hosts must resolve only to public IP
 addresses; loopback, link-local, private, multicast, and reserved targets are
@@ -139,7 +149,9 @@ spores.
 
 `spore system df --rootfs` reports image ext4 files, metadata, exact digest
 artifacts, rootfs CAS indexes, rootfs CAS objects, ref records, and temporary
-entries.
+entries. `spore cache gc --rootfs` performs a mark/sweep of rootfs CAS indexes
+and objects from cache metadata, ref records, and live runtime manifests; it is
+dry-run by default and requires `--force` to delete candidates.
 
 Default `spore system prune --rootfs` only selects rebuildable image rootfs
 entries. Flat digest artifacts (the resume authority) are skipped unless
@@ -177,4 +189,4 @@ with guest `node -v` execution time inside the resumed VM dropping from about
 - Optional file-content indexes if fixed block dedupe leaves measured package or
   model-transfer savings on the table.
 - Lazy remote rootfs reads and scheduler-aware peer selection.
-- Reachability-aware rootfs CAS garbage collection.
+- Packfile support if fault-in measurements show file-per-chunk is too costly.

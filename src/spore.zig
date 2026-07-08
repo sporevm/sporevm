@@ -1,11 +1,11 @@
-//! Spore manifest v0 and chunk store.
+//! Spore manifest and chunk store.
 //!
 //! A spore is a directory rooted at `manifest.json`. Guest memory is stored as
 //! fixed-size `chunks/<blake3-hex>` files with all-zero chunks elided; optional
-//! writable disk layers use verified `disklayers/` indexes and `diskobjects/`
-//! clusters. Machine state is normalized architectural aarch64 state — never raw
-//! hypervisor structures (see docs/spore-format.md). Format v0 is the current
-//! manifest contract; future versions should be deliberate migrations.
+//! writable disks use verified chunk indexes and CAS objects. Machine state is
+//! normalized architectural aarch64 state — never raw
+//! hypervisor structures (see docs/spore-format.md). Formats v2 and v3 are the
+//! current manifest contracts; future versions should be deliberate migrations.
 //!
 //! Manifests and chunks may come from untrusted storage: parsing is strict,
 //! chunk contents are verified against their ids before use, and restore
@@ -15,6 +15,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const board = @import("board.zig");
 const chunklib = @import("chunk.zig");
+const disk_index = @import("disk_index.zig");
 const generation = @import("generation.zig");
 const gicv3 = @import("gicv3.zig");
 const local_paths = @import("local_paths.zig");
@@ -25,13 +26,16 @@ const Blake3 = std.crypto.hash.Blake3;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const format_version: u32 = 0;
-pub const format_version_v1: u32 = 1;
+pub const format_version_legacy_v0: u32 = 0;
+pub const format_version_legacy_v1: u32 = 1;
+pub const format_version: u32 = 2;
+pub const format_version_v1: u32 = 3;
 pub const machine_schema_version_v1: u32 = 1;
 pub const chunk_size: usize = 2 * 1024 * 1024;
 pub const ram_backing_kind = "map-private-file-v0";
 pub const ram_backing_path = "ram.backing";
 pub const ram_backing_proof_path = "ram.backing.proof";
+pub const memory_object_namespace = "memory/blake3";
 
 const local_backing_proof_version_v1: u32 = 1;
 const local_backing_proof_version_v2: u32 = 2;
@@ -44,6 +48,7 @@ const fs_verity_hash_alg_sha256: u16 = 1;
 
 pub const Error = error{
     BadManifest,
+    FormatTooOld,
     BadChunk,
     BadForkCount,
     UnsupportedVcpuCount,
@@ -162,10 +167,16 @@ pub const MemoryBacking = struct {
     size: u64,
 };
 
+pub const MemoryChunk = disk_index.DiskIndexChunk;
+
 pub const MemoryManifest = struct {
+    kind: []const u8 = disk_index.disk_index_kind,
+    logical_size: u64,
     chunk_size: u64,
-    /// One entry per chunk; null means all zeroes.
-    chunks: []?[]const u8,
+    hash_algorithm: []const u8 = rootfs_storage_hash_algorithm_blake3,
+    object_namespace: []const u8 = memory_object_namespace,
+    chunks: []const MemoryChunk = &.{},
+    zero_chunks: []const u64 = &.{},
     /// Optional same-host acceleration hint. Chunks remain the portable,
     /// verified source of truth; backends may ignore this and materialize
     /// from chunks instead.
@@ -265,6 +276,7 @@ pub const rootfs_virtio_blk_device_id: u32 = 2;
 pub const rootfs_storage_kind_chunked_ext4 = "chunked-ext4-rootfs-v0";
 pub const rootfs_storage_hash_algorithm_blake3 = "blake3";
 pub const rootfs_storage_object_namespace = "rootfs/blake3";
+pub const disk_chunk_size: u64 = 64 * 1024;
 
 pub const RootfsDevice = struct {
     kind: []const u8 = rootfs_device_kind_virtio_mmio,
@@ -309,28 +321,20 @@ pub const Rootfs = struct {
 };
 
 pub const disk_kind_cow_block = "cow-block-v0";
-pub const disk_layer_kind = "disk-layer-v0";
+pub const disk_kind_chunk_index = "chunk-index-disk-v0";
 pub const disk_digest_prefix = rootfs_digest_prefix;
 
 pub const Disk = struct {
-    kind: []const u8 = disk_kind_cow_block,
+    kind: []const u8 = disk_kind_chunk_index,
     device: RootfsDevice,
     size: u64,
+    /// BLAKE3 digest of the disk index.
     base: []const u8,
+    chunk_size: u64 = 64 * 1024,
+    hash_algorithm: []const u8 = rootfs_storage_hash_algorithm_blake3,
+    object_namespace: []const u8 = rootfs_storage_object_namespace,
+    /// Must be empty for chunk-index manifests.
     layers: []const []const u8 = &.{},
-};
-
-pub const DiskLayerExtent = struct {
-    logical_cluster: u64,
-    digest: []const u8,
-};
-
-pub const DiskLayer = struct {
-    kind: []const u8 = disk_layer_kind,
-    cluster_size: u64,
-    disk_size: u64,
-    extents: []const DiskLayerExtent = &.{},
-    zero_clusters: []const u64 = &.{},
 };
 
 pub const network_kind_spore = "spore-net-v0";
@@ -665,36 +669,39 @@ fn localBackingChunksPlan(reason: LocalBackingRestoreReason) LocalBackingPlan {
     return .{ .source = .chunks, .reason = reason };
 }
 
-fn memoryFingerprintHex(allocator: std.mem.Allocator, memory: MemoryManifest, expected_size: u64) Error![]const u8 {
+fn memoryIndex(manifest: MemoryManifest) disk_index.DiskIndex {
+    return .{
+        .kind = manifest.kind,
+        .logical_size = manifest.logical_size,
+        .chunk_size = manifest.chunk_size,
+        .hash_algorithm = manifest.hash_algorithm,
+        .object_namespace = manifest.object_namespace,
+        .chunks = manifest.chunks,
+        .zero_chunks = manifest.zero_chunks,
+    };
+}
+
+fn memoryIndexDescriptor(_: MemoryManifest, expected_size: u64) disk_index.Descriptor {
+    return .{
+        .logical_size = expected_size,
+        .chunk_size = chunk_size,
+        .hash_algorithm = rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = memory_object_namespace,
+    };
+}
+
+fn memoryIndexIdentity(allocator: std.mem.Allocator, memory: MemoryManifest, expected_size: u64) Error![]const u8 {
     if (expected_size > std.math.maxInt(usize)) return error.BadManifest;
-    const plan = try validateMemoryForRam(memory, @intCast(expected_size));
-    var h = Blake3.init(.{});
-    h.update("sporevm-memory-fingerprint-v1");
-    hashU64(&h, expected_size);
-    hashU64(&h, memory.chunk_size);
-    hashU64(&h, plan.chunk_count);
-    for (memory.chunks) |maybe_ref| {
-        if (maybe_ref) |ref| {
-            h.update(&.{1});
-            hashBytes(&h, ref);
-        } else {
-            h.update(&.{0});
-        }
-    }
-    var digest: [Blake3.digest_length]u8 = undefined;
-    h.final(&digest);
-    return hexAlloc(allocator, &digest);
-}
-
-fn hashU64(hasher: *Blake3, value: u64) void {
-    var bytes: [8]u8 = undefined;
-    std.mem.writeInt(u64, &bytes, value, .little);
-    hasher.update(&bytes);
-}
-
-fn hashBytes(hasher: *Blake3, value: []const u8) void {
-    hashU64(hasher, value.len);
-    hasher.update(value);
+    _ = try validateMemoryForRam(memory, @intCast(expected_size));
+    const index_json = std.json.Stringify.valueAlloc(allocator, memoryIndex(memory), .{
+        .emit_null_optional_fields = false,
+    }) catch return error.OutOfMemory;
+    defer allocator.free(index_json);
+    return disk_index.indexDigestAlloc(allocator, index_json) catch |err| switch (err) {
+        error.BadManifest => error.BadManifest,
+        error.FormatTooOld => error.FormatTooOld,
+        error.OutOfMemory => error.OutOfMemory,
+    };
 }
 
 fn proofMac(
@@ -966,7 +973,7 @@ pub fn writeLocalMemoryBackingProof(
     const initial_file = (try fstatLocalFile(fd)).identity();
     if (initial_file.size != expected_size) return error.BadManifest;
     const key = (try localBackingKey(allocator, environ, true)) orelse return error.IoFailed;
-    const memory_fingerprint = try memoryFingerprintHex(allocator, memory, expected_size);
+    const memory_fingerprint = try memoryIndexIdentity(allocator, memory, expected_size);
     const proof_backing = proofBackingFromManifest(backing);
     const verity = try proofVerityForWrite(allocator, fd);
     const file = (try fstatLocalFile(fd)).identity();
@@ -1019,7 +1026,7 @@ pub fn openProvenLocalMemoryBacking(
 
     const key = (localBackingKey(allocator, environ, false) catch return localBackingChunksPlan(.key_unavailable)) orelse
         return localBackingChunksPlan(.key_unavailable);
-    const memory_fingerprint = try memoryFingerprintHex(allocator, memory, expected_size);
+    const memory_fingerprint = try memoryIndexIdentity(allocator, memory, expected_size);
     const proof_backing = proofBackingFromManifest(backing);
     if (!proofFieldsMatch(parsed.value, memory_fingerprint, proof_backing, file)) return localBackingChunksPlan(.proof_mismatch);
     if (parsed.value.mac.len != HmacSha256.mac_length * 2) return localBackingChunksPlan(.proof_mac_invalid);
@@ -1176,24 +1183,44 @@ pub fn rootfsStorageEql(a: RootfsStorage, b: RootfsStorage) bool {
 }
 
 pub fn cloneRootfsDevice(allocator: std.mem.Allocator, device: RootfsDevice) !RootfsDevice {
+    const kind = try allocator.dupe(u8, device.kind);
+    errdefer allocator.free(kind);
+    const role = try allocator.dupe(u8, device.role);
+    errdefer allocator.free(role);
     return .{
-        .kind = try allocator.dupe(u8, device.kind),
-        .role = try allocator.dupe(u8, device.role),
+        .kind = kind,
+        .role = role,
         .virtio_device_id = device.virtio_device_id,
         .mmio_slot = device.mmio_slot,
     };
 }
 
 pub fn cloneRootfsStorage(allocator: std.mem.Allocator, storage: RootfsStorage) !RootfsStorage {
+    const kind = try allocator.dupe(u8, storage.kind);
+    errdefer allocator.free(kind);
+    const device = try cloneRootfsDevice(allocator, storage.device);
+    errdefer {
+        allocator.free(device.kind);
+        allocator.free(device.role);
+    }
+    const hash_algorithm = try allocator.dupe(u8, storage.hash_algorithm);
+    errdefer allocator.free(hash_algorithm);
+    const index_digest = try allocator.dupe(u8, storage.index_digest);
+    errdefer allocator.free(index_digest);
+    const base_identity = try allocator.dupe(u8, storage.base_identity);
+    errdefer allocator.free(base_identity);
+    const object_namespace = try allocator.dupe(u8, storage.object_namespace);
+    errdefer allocator.free(object_namespace);
+
     return .{
-        .kind = try allocator.dupe(u8, storage.kind),
-        .device = try cloneRootfsDevice(allocator, storage.device),
+        .kind = kind,
+        .device = device,
         .logical_size = storage.logical_size,
         .chunk_size = storage.chunk_size,
-        .hash_algorithm = try allocator.dupe(u8, storage.hash_algorithm),
-        .index_digest = try allocator.dupe(u8, storage.index_digest),
-        .base_identity = try allocator.dupe(u8, storage.base_identity),
-        .object_namespace = try allocator.dupe(u8, storage.object_namespace),
+        .hash_algorithm = hash_algorithm,
+        .index_digest = index_digest,
+        .base_identity = base_identity,
+        .object_namespace = object_namespace,
     };
 }
 
@@ -1202,17 +1229,29 @@ fn validateRootfsStorage(storage: RootfsStorage, rootfs: Rootfs, devices: []cons
     try validateRootfsDevice(storage.device, devices);
     if (!rootfsDeviceEql(storage.device, rootfs.device)) return error.BadManifest;
     if (storage.logical_size != rootfs.artifact.size) return error.BadManifest;
+    if (!std.mem.eql(u8, storage.index_digest, rootfs.artifact.digest)) return error.BadManifest;
 }
 
 pub fn validateRootfsStorageDescriptor(storage: RootfsStorage) Error!void {
     if (!std.mem.eql(u8, storage.kind, rootfs_storage_kind_chunked_ext4)) return error.BadManifest;
     if (storage.logical_size == 0 or storage.logical_size > std.math.maxInt(usize)) return error.BadManifest;
-    if (!validDiskClusterSize(storage.chunk_size)) return error.BadManifest;
+    if (storage.chunk_size != disk_chunk_size) return error.BadManifest;
     if (!std.mem.eql(u8, storage.hash_algorithm, rootfs_storage_hash_algorithm_blake3)) return error.BadManifest;
     try validateRootfsDigest(storage.index_digest);
     try validateRootfsDigest(storage.base_identity);
     if (!std.mem.eql(u8, storage.base_identity, storage.index_digest)) return error.BadManifest;
     if (!std.mem.eql(u8, storage.object_namespace, rootfs_storage_object_namespace)) return error.BadManifest;
+}
+
+pub fn diskIndexDescriptorForStorage(storage: RootfsStorage) Error!disk_index.Descriptor {
+    try validateRootfsStorageDescriptor(storage);
+    return .{
+        .logical_size = storage.logical_size,
+        .chunk_size = storage.chunk_size,
+        .hash_algorithm = storage.hash_algorithm,
+        .object_namespace = storage.object_namespace,
+        .index_digest = storage.index_digest,
+    };
 }
 
 pub fn effectiveRootfsBaseIdentity(rootfs: Rootfs) []const u8 {
@@ -1227,45 +1266,19 @@ pub fn effectiveRootfsLogicalSize(rootfs: Rootfs) u64 {
 
 pub fn validateDisk(disk: Disk, maybe_rootfs: ?Rootfs, devices: []const TransportState) Error!void {
     const rootfs = maybe_rootfs orelse return error.BadManifest;
-    if (!std.mem.eql(u8, disk.kind, disk_kind_cow_block)) return error.BadManifest;
     try validateRootfsDevice(disk.device, devices);
     if (!rootfsDeviceEql(disk.device, rootfs.device)) return error.BadManifest;
     if (disk.size == 0 or disk.size != effectiveRootfsLogicalSize(rootfs)) return error.BadManifest;
-    if (!std.mem.eql(u8, disk.base, effectiveRootfsBaseIdentity(rootfs))) return error.BadManifest;
-    try validateDiskDigest(disk.base);
-    for (disk.layers) |layer_ref| {
-        try validateDiskDigest(layer_ref);
-    }
-}
-
-pub fn validateDiskLayer(layer: DiskLayer) Error!void {
-    if (!std.mem.eql(u8, layer.kind, disk_layer_kind)) return error.BadManifest;
-    const cluster_count = try diskClusterCount(layer.disk_size, layer.cluster_size);
-
-    var previous_extent: ?u64 = null;
-    for (layer.extents) |extent| {
-        if (extent.logical_cluster >= cluster_count) return error.BadManifest;
-        if (previous_extent) |previous| {
-            if (extent.logical_cluster <= previous) return error.BadManifest;
-        }
-        try validateDiskDigest(extent.digest);
-        previous_extent = extent.logical_cluster;
-    }
-
-    var extent_index: usize = 0;
-    var previous_zero: ?u64 = null;
-    for (layer.zero_clusters) |logical_cluster| {
-        if (logical_cluster >= cluster_count) return error.BadManifest;
-        if (previous_zero) |previous| {
-            if (logical_cluster <= previous) return error.BadManifest;
-        }
-        while (extent_index < layer.extents.len and layer.extents[extent_index].logical_cluster < logical_cluster) {
-            extent_index += 1;
-        }
-        if (extent_index < layer.extents.len and layer.extents[extent_index].logical_cluster == logical_cluster) {
-            return error.BadManifest;
-        }
-        previous_zero = logical_cluster;
+    if (std.mem.eql(u8, disk.kind, disk_kind_chunk_index)) {
+        try validateDiskDigest(disk.base);
+        if (disk.chunk_size != disk_chunk_size) return error.BadManifest;
+        if (!std.mem.eql(u8, disk.hash_algorithm, rootfs_storage_hash_algorithm_blake3)) return error.BadManifest;
+        if (!std.mem.eql(u8, disk.object_namespace, rootfs_storage_object_namespace)) return error.BadManifest;
+        if (disk.layers.len != 0) return error.BadManifest;
+    } else if (std.mem.eql(u8, disk.kind, disk_kind_cow_block)) {
+        return error.FormatTooOld;
+    } else {
+        return error.BadManifest;
     }
 }
 
@@ -1289,22 +1302,6 @@ pub fn diskClusterLen(disk_size: u64, cluster_size: u64, logical_cluster: u64) E
     if (start >= disk_size) return error.BadManifest;
     const len = @min(cluster_size, disk_size - start);
     return std.math.cast(usize, len) orelse return error.BadManifest;
-}
-
-pub fn findDiskExtent(layer: DiskLayer, logical_cluster: u64) ?DiskLayerExtent {
-    for (layer.extents) |extent| {
-        if (extent.logical_cluster == logical_cluster) return extent;
-        if (extent.logical_cluster > logical_cluster) return null;
-    }
-    return null;
-}
-
-pub fn diskLayerHasZeroCluster(layer: DiskLayer, logical_cluster: u64) bool {
-    for (layer.zero_clusters) |zero_cluster| {
-        if (zero_cluster == logical_cluster) return true;
-        if (zero_cluster > logical_cluster) return false;
-    }
-    return false;
 }
 
 pub fn validateNetwork(network: Network) Error!void {
@@ -1422,7 +1419,10 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
     }
 
     const count = (ram.len + chunk_size - 1) / chunk_size;
-    const refs = try allocator.alloc(?[]const u8, count);
+    var chunks = std.array_list.Managed(MemoryChunk).init(allocator);
+    errdefer chunks.deinit();
+    var zero_chunks = std.array_list.Managed(u64).init(allocator);
+    errdefer zero_chunks.deinit();
 
     var i: usize = 0;
     while (i < count) : (i += 1) {
@@ -1430,14 +1430,14 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
         const end = @min(start + chunk_size, ram.len);
         const data = ram[start..end];
         if (std.mem.allEqual(u8, data, 0)) {
-            refs[i] = null;
+            zero_chunks.append(@intCast(i)) catch return error.OutOfMemory;
             continue;
         }
         const id = chunklib.ChunkId.fromContents(data);
         const hex = id.toHex();
-        const ref = try allocator.dupe(u8, &hex);
-        refs[i] = ref;
-        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, ref });
+        const digest = try memoryDigestFromHex(allocator, hex[0..]);
+        chunks.append(.{ .logical_chunk = @intCast(i), .digest = digest }) catch return error.OutOfMemory;
+        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, hex[0..] });
         try writeFileAllIfMissing(chunk_path, data);
         if (backing_fd >= 0) {
             try pwriteFileAll(backing_fd, start, data);
@@ -1454,7 +1454,17 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
         break :blk MemoryBacking{ .path = ram_backing_path, .size = ram.len };
     } else null;
 
-    return .{ .chunk_size = chunk_size, .chunks = refs, .backing = backing };
+    const chunk_slice = chunks.toOwnedSlice() catch return error.OutOfMemory;
+    errdefer allocator.free(chunk_slice);
+    const zero_slice = zero_chunks.toOwnedSlice() catch return error.OutOfMemory;
+    errdefer allocator.free(zero_slice);
+    return .{
+        .logical_size = @intCast(ram.len),
+        .chunk_size = chunk_size,
+        .chunks = chunk_slice,
+        .zero_chunks = zero_slice,
+        .backing = backing,
+    };
 }
 
 /// Materialize guest memory from the chunk store. Verifies every chunk
@@ -1462,27 +1472,34 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
 pub fn loadMemory(allocator: std.mem.Allocator, dir: []const u8, manifest: MemoryManifest, ram: []u8) Error!void {
     const plan = try validateMemoryForRam(manifest, ram.len);
 
+    var nonzero_index: usize = 0;
     var i: usize = 0;
     while (i < plan.chunk_count) : (i += 1) {
         const range = memoryChunkRangeFromPlan(plan, ram.len, i) catch return error.BadManifest;
-        try loadMemoryChunkRef(allocator, dir, manifest.chunks[i], ram[range.start..range.end]);
+        const digest: ?[]const u8 = if (nonzero_index < manifest.chunks.len and manifest.chunks[nonzero_index].logical_chunk == i) blk: {
+            const value = manifest.chunks[nonzero_index].digest;
+            nonzero_index += 1;
+            break :blk value;
+        } else null;
+        try loadMemoryChunkDigest(allocator, dir, digest, ram[range.start..range.end]);
     }
 }
 
 pub fn validateMemoryForRam(manifest: MemoryManifest, ram_len: usize) Error!MemoryPlan {
+    const expected_size: u64 = @intCast(ram_len);
+    disk_index.validateDiskIndex(memoryIndex(manifest), memoryIndexDescriptor(manifest, expected_size)) catch |err| switch (err) {
+        error.BadManifest => return error.BadManifest,
+        error.FormatTooOld => return error.FormatTooOld,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     if (manifest.chunk_size != chunk_size) return error.BadManifest;
-    const csize: usize = chunk_size;
-    const expected = (ram_len + csize - 1) / csize;
-    if (manifest.chunks.len != expected) return error.BadManifest;
-
-    var nonzero: usize = 0;
-    for (manifest.chunks) |maybe_ref| {
-        if (maybe_ref) |ref| {
-            _ = chunklib.ChunkId.fromHex(ref) catch return error.BadManifest;
-            nonzero += 1;
-        }
-    }
-    return .{ .chunk_size = csize, .chunk_count = manifest.chunks.len, .nonzero_chunk_count = nonzero };
+    const chunk_count = try diskClusterCount(expected_size, manifest.chunk_size);
+    if (chunk_count > std.math.maxInt(usize)) return error.BadManifest;
+    return .{
+        .chunk_size = chunk_size,
+        .chunk_count = @intCast(chunk_count),
+        .nonzero_chunk_count = manifest.chunks.len,
+    };
 }
 
 pub fn memoryChunkRange(manifest: MemoryManifest, ram_len: usize, index: usize) Error!MemoryChunkRange {
@@ -1493,7 +1510,7 @@ pub fn memoryChunkRange(manifest: MemoryManifest, ram_len: usize, index: usize) 
 pub fn loadMemoryChunk(allocator: std.mem.Allocator, dir: []const u8, manifest: MemoryManifest, ram_len: usize, index: usize, target: []u8) Error!void {
     const range = try memoryChunkRange(manifest, ram_len, index);
     if (target.len != range.end - range.start) return error.BadManifest;
-    try loadMemoryChunkRef(allocator, dir, manifest.chunks[index], target);
+    try loadMemoryChunkDigest(allocator, dir, memoryChunkDigestForIndex(manifest, index), target);
 }
 
 fn memoryChunkRangeFromPlan(plan: MemoryPlan, ram_len: usize, index: usize) !MemoryChunkRange {
@@ -1503,10 +1520,11 @@ fn memoryChunkRangeFromPlan(plan: MemoryPlan, ram_len: usize, index: usize) !Mem
     return .{ .start = start, .end = end };
 }
 
-fn loadMemoryChunkRef(allocator: std.mem.Allocator, dir: []const u8, maybe_ref: ?[]const u8, target: []u8) Error!void {
-    if (maybe_ref) |ref| {
-        const id = chunklib.ChunkId.fromHex(ref) catch return error.BadManifest;
-        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, ref });
+fn loadMemoryChunkDigest(allocator: std.mem.Allocator, dir: []const u8, maybe_digest: ?[]const u8, target: []u8) Error!void {
+    if (maybe_digest) |digest| {
+        const hex = try memoryChunkDigestHex(digest);
+        const id = chunklib.ChunkId.fromHex(hex) catch return error.BadManifest;
+        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, hex });
         const data = try readFileAll(allocator, chunk_path, target.len);
         defer allocator.free(data);
         if (data.len != target.len) return error.BadChunk;
@@ -1515,6 +1533,32 @@ fn loadMemoryChunkRef(allocator: std.mem.Allocator, dir: []const u8, maybe_ref: 
     } else {
         @memset(target, 0);
     }
+}
+
+pub fn memoryChunkDigestForIndex(manifest: MemoryManifest, index: usize) ?[]const u8 {
+    const target: u64 = @intCast(index);
+    var lo: usize = 0;
+    var hi: usize = manifest.chunks.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const logical_chunk = manifest.chunks[mid].logical_chunk;
+        if (logical_chunk == target) return manifest.chunks[mid].digest;
+        if (logical_chunk < target) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return null;
+}
+
+pub fn memoryChunkDigestHex(digest: []const u8) Error![]const u8 {
+    return diskDigestHex(digest);
+}
+
+pub fn memoryDigestFromHex(allocator: std.mem.Allocator, hex: []const u8) Error![]const u8 {
+    _ = chunklib.ChunkId.fromHex(hex) catch return error.BadManifest;
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ disk_index.digest_prefix, hex }) catch return error.OutOfMemory;
 }
 
 pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Manifest) Error!void {
@@ -1556,9 +1600,16 @@ pub fn loadManifestPath(allocator: std.mem.Allocator, path: []const u8) Error!st
     const parsed = std.json.parseFromSlice(Manifest, allocator, bytes, .{
         // The byte buffer is freed before the parse result is used.
         .allocate = .alloc_always,
-    }) catch return error.BadManifest;
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadManifest,
+    };
     errdefer parsed.deinit();
-    validateManifest(parsed.value) catch return error.BadManifest;
+    validateManifest(parsed.value) catch |err| return switch (err) {
+        error.FormatTooOld => error.FormatTooOld,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadManifest,
+    };
     return parsed;
 }
 
@@ -1574,9 +1625,16 @@ pub fn loadManifestV1Path(allocator: std.mem.Allocator, path: []const u8) Error!
     const parsed = std.json.parseFromSlice(ManifestV1, allocator, bytes, .{
         // The byte buffer is freed before the parse result is used.
         .allocate = .alloc_always,
-    }) catch return error.BadManifest;
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadManifest,
+    };
     errdefer parsed.deinit();
-    validateManifestV1(parsed.value) catch return error.BadManifest;
+    validateManifestV1(parsed.value) catch |err| return switch (err) {
+        error.FormatTooOld => error.FormatTooOld,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadManifest,
+    };
     return parsed;
 }
 
@@ -1705,8 +1763,7 @@ fn forkV1(allocator: std.mem.Allocator, options: ForkOptions, parent: ManifestV1
 
 const ForkSharedStores = struct {
     chunks: []const u8,
-    disk_layers: ?[]const u8 = null,
-    disk_objects: ?[]const u8 = null,
+    disk_cas: ?[]const u8 = null,
 };
 
 fn prepareForkSharedStores(allocator: std.mem.Allocator, parent_dir: []const u8, out_dir: []const u8, disk: ?Disk) Error!ForkSharedStores {
@@ -1714,9 +1771,8 @@ fn prepareForkSharedStores(allocator: std.mem.Allocator, parent_dir: []const u8,
     const shared_chunks = try realpathAlloc(allocator, parent_chunks);
     var stores = ForkSharedStores{ .chunks = shared_chunks };
     if (disk) |parent_disk| {
-        if (parent_disk.layers.len > 0) {
-            stores.disk_layers = try realpathAlloc(allocator, try pathZ(allocator, "{s}/disklayers", .{parent_dir}));
-            stores.disk_objects = try realpathAlloc(allocator, try pathZ(allocator, "{s}/diskobjects", .{parent_dir}));
+        if (std.mem.eql(u8, parent_disk.kind, disk_kind_chunk_index)) {
+            stores.disk_cas = try realpathAlloc(allocator, try pathZ(allocator, "{s}/cas", .{parent_dir}));
         }
     }
     try ensureDir(try pathZ(allocator, "{s}", .{out_dir}));
@@ -1725,11 +1781,8 @@ fn prepareForkSharedStores(allocator: std.mem.Allocator, parent_dir: []const u8,
 
 fn linkForkSharedStores(allocator: std.mem.Allocator, child_dir: []const u8, stores: ForkSharedStores) Error!void {
     try symlinkPath(stores.chunks, try pathZ(allocator, "{s}/chunks", .{child_dir}));
-    if (stores.disk_layers) |layers| {
-        try symlinkPath(layers, try pathZ(allocator, "{s}/disklayers", .{child_dir}));
-    }
-    if (stores.disk_objects) |objects| {
-        try symlinkPath(objects, try pathZ(allocator, "{s}/diskobjects", .{child_dir}));
+    if (stores.disk_cas) |cas| {
+        try symlinkPath(cas, try pathZ(allocator, "{s}/cas", .{child_dir}));
     }
 }
 
@@ -2034,7 +2087,7 @@ fn forkGicStateV1(allocator: std.mem.Allocator, state: gicv3.State) Error!gicv3.
 }
 
 pub fn validateManifest(manifest: Manifest) Error!void {
-    if (manifest.version != format_version) return error.BadManifest;
+    try validateManifestVersion(manifest.version, format_version);
     try validateManifestCommon(
         manifest.annotations,
         manifest.platform.cpu_profile,
@@ -2051,7 +2104,7 @@ pub fn validateManifest(manifest: Manifest) Error!void {
 }
 
 pub fn validateManifestV1(manifest: ManifestV1) Error!void {
-    if (manifest.version != format_version_v1) return error.BadManifest;
+    try validateManifestVersion(manifest.version, format_version_v1);
     try validateManifestCommon(
         manifest.annotations,
         manifest.platform.cpu_profile,
@@ -2065,6 +2118,12 @@ pub fn validateManifestV1(manifest: ManifestV1) Error!void {
         manifest.memory,
     );
     try validateMachineV1(manifest.platform, manifest.machine);
+}
+
+fn validateManifestVersion(actual: u32, expected: u32) Error!void {
+    if (actual == expected) return;
+    if (actual < expected) return error.FormatTooOld;
+    return error.BadManifest;
 }
 
 fn validateManifestCommon(
@@ -2312,11 +2371,16 @@ test "memory round-trips through the chunk store with zero elision" {
     ram[ram.len - 1] = 0xEE; // tail chunk non-zero
 
     const mm = try saveMemory(arena, dir, ram);
-    try std.testing.expectEqual(@as(usize, 6), mm.chunks.len);
-    try std.testing.expect(mm.chunks[0] != null);
-    try std.testing.expect(mm.chunks[1] == null);
-    try std.testing.expect(mm.chunks[3] != null);
-    try std.testing.expect(mm.chunks[5] != null);
+    try std.testing.expectEqualStrings(disk_index.disk_index_kind, mm.kind);
+    try std.testing.expectEqual(@as(u64, ram.len), mm.logical_size);
+    try std.testing.expectEqual(@as(usize, 3), mm.chunks.len);
+    try std.testing.expectEqual(@as(u64, 0), mm.chunks[0].logical_chunk);
+    try std.testing.expectEqual(@as(u64, 3), mm.chunks[1].logical_chunk);
+    try std.testing.expectEqual(@as(u64, 5), mm.chunks[2].logical_chunk);
+    try std.testing.expectEqual(@as(usize, 3), mm.zero_chunks.len);
+    try std.testing.expectEqual(@as(u64, 1), mm.zero_chunks[0]);
+    try std.testing.expectEqual(@as(u64, 2), mm.zero_chunks[1]);
+    try std.testing.expectEqual(@as(u64, 4), mm.zero_chunks[2]);
     const plan = try validateMemoryForRam(mm, ram.len);
     try std.testing.expectEqual(@as(usize, chunk_size), plan.chunk_size);
     try std.testing.expectEqual(@as(usize, 6), plan.chunk_count);
@@ -2416,8 +2480,7 @@ test "manifest save rejects symlink target" {
     const manifest_path = try pathZ(arena, "{s}/manifest.json", .{dir});
     try symlinkPath(victim_path, manifest_path);
 
-    var memory_chunks = [_]?[]const u8{null};
-    const manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, chunk_size, 1);
+    const manifest = testForkManifest(testZeroMemoryManifest(chunk_size), chunk_size, 1);
     if (saveManifest(arena, dir, manifest)) |_| {
         return error.TestUnexpectedResult;
     } else |err| switch (err) {
@@ -2545,9 +2608,8 @@ test "local memory backing proof rejects foreign key and manifest mismatch" {
     try std.testing.expectEqual(LocalBackingRestoreSource.chunks, foreign_key_plan.source);
     try std.testing.expectEqual(LocalBackingRestoreReason.proof_mac_mismatch, foreign_key_plan.reason);
 
-    var refs = try arena.alloc(?[]const u8, mm.chunks.len);
-    @memcpy(refs, mm.chunks);
-    refs[0] = null;
+    var refs = try arena.dupe(MemoryChunk, mm.chunks);
+    refs[0].digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     var changed = mm;
     changed.chunks = refs;
     const mismatch_plan = try openProvenLocalMemoryBacking(arena, &env_a, dir, changed, ram.len);
@@ -2656,9 +2718,16 @@ test "memory manifest validation rejects non-canonical chunks" {
     wrong_size.chunk_size = chunk_size / 2;
     try std.testing.expectError(error.BadManifest, validateMemoryForRam(wrong_size, ram.len));
 
-    var malformed_refs = try arena.alloc(?[]const u8, mm.chunks.len);
-    @memcpy(malformed_refs, mm.chunks);
-    malformed_refs[0] = "not-a-blake3-id";
+    var wrong_algorithm = mm;
+    wrong_algorithm.hash_algorithm = "sha256";
+    try std.testing.expectError(error.BadManifest, validateMemoryForRam(wrong_algorithm, ram.len));
+
+    var wrong_namespace = mm;
+    wrong_namespace.object_namespace = rootfs_storage_object_namespace;
+    try std.testing.expectError(error.BadManifest, validateMemoryForRam(wrong_namespace, ram.len));
+
+    var malformed_refs = try arena.dupe(MemoryChunk, mm.chunks);
+    malformed_refs[0].digest = "not-a-blake3-id";
     var malformed = mm;
     malformed.chunks = malformed_refs;
     try std.testing.expectError(error.BadManifest, validateMemoryForRam(malformed, ram.len));
@@ -2677,7 +2746,7 @@ test "corrupted chunk fails closed" {
     const mm = try saveMemory(arena, dir, ram);
 
     // Corrupt the stored chunk.
-    const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, mm.chunks[0].? });
+    const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, try memoryChunkDigestHex(mm.chunks[0].digest) });
     const data = try readFileAll(arena, chunk_path, chunk_size);
     data[100] ^= 0xFF;
     try writeFileAll(chunk_path, data);
@@ -2704,8 +2773,9 @@ test "fuzz manifest parsing" {
 }
 
 fn fuzzManifestV1Parse(_: void, s: *std.testing.Smith) !void {
-    // Manifest v1 adds per-vCPU and per-redistributor arrays at the same trust
-    // boundary as v0; parse plus validation must fail closed.
+    // The multi-vCPU manifest adds per-vCPU and per-redistributor arrays at the
+    // same trust boundary as the single-vCPU manifest; parse plus validation
+    // must fail closed.
     var buf: [4096]u8 = undefined;
     const len = s.slice(&buf);
     const parsed = std.json.parseFromSlice(ManifestV1, std.testing.allocator, buf[0..len], .{
@@ -2725,11 +2795,13 @@ fn fuzzMemoryManifest(_: void, s: *std.testing.Smith) !void {
     var ram: [4096]u8 = undefined;
     var ref_buf: [128]u8 = undefined;
     const ref_len = s.slice(&ref_buf);
-    var refs: [4]?[]const u8 = .{ null, null, null, null };
-    if (ref_len > 0) refs[0] = ref_buf[0..ref_len];
+    var refs = [_]MemoryChunk{.{ .logical_chunk = s.value(u64), .digest = ref_buf[0..ref_len] }};
+    var zero_chunks = [_]u64{ 0, 1, 2 };
     const mm = MemoryManifest{
+        .logical_size = s.value(u64),
         .chunk_size = s.value(u64),
         .chunks = &refs,
+        .zero_chunks = &zero_chunks,
     };
     _ = loadMemory(std.testing.allocator, "/nonexistent-spore", mm, &ram) catch return;
 }
@@ -2745,7 +2817,6 @@ test "manifest json round-trip" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
-    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
     var queues = [_]QueueState{.{
         .size = 64,
         .ready = true,
@@ -2810,12 +2881,12 @@ test "manifest json round-trip" {
             .allow_cidrs = &.{"93.184.216.34/32"},
             .allow_hosts = &.{"example.com"},
         },
-        .memory = .{ .chunk_size = chunk_size, .chunks = &memory_chunks },
+        .memory = testZeroMemoryManifest(1 << 29),
     };
     try saveManifest(arena, dir, manifest);
     const parsed = try loadManifest(arena, dir);
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 0), parsed.value.version);
+    try std.testing.expectEqual(@as(u32, format_version), parsed.value.version);
     try std.testing.expectEqualStrings("sporevm-aarch64-v0", parsed.value.platform.cpu_profile);
     try std.testing.expectEqual(@as(u64, 0x8000_0000), parsed.value.platform.ram_base);
     try std.testing.expectEqual(@as(u64, 24_000_000), parsed.value.platform.counter_frequency_hz);
@@ -2835,6 +2906,31 @@ test "manifest json round-trip" {
     try std.testing.expectEqualStrings("example.com", parsed.value.network.?.allow_hosts[0]);
     try std.testing.expectEqualStrings("sha256:abc123", parsed.value.annotations.map.get("dev.buildkite.cleanroom.policy_hash").?);
     try std.testing.expectEqualStrings("worker", parsed.value.annotations.map.get("org.opencontainers.image.ref.name").?);
+}
+
+test "manifest loaders preserve format-too-old errors" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const single_dir = try testDir(arena);
+    var single = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
+    single.version = format_version_legacy_v0;
+    try saveManifest(arena, single_dir, single);
+    try std.testing.expectError(error.FormatTooOld, loadManifest(arena, single_dir));
+
+    const multi_dir = try testDir(arena);
+    var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
+    const redists = [_]gicv3.RedistributorState{
+        .{ .mpidr = topology.mpidrForIndex(0), .regs = &.{} },
+        .{ .mpidr = topology.mpidrForIndex(1), .regs = &.{} },
+    };
+    var multi = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &vcpus, &redists);
+    multi.version = format_version_legacy_v1;
+    const multi_json = std.json.Stringify.valueAlloc(arena, multi, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
+    try writeFileAll(try pathZ(arena, "{s}/manifest.json", .{multi_dir}), multi_json);
+    try std.testing.expectError(error.FormatTooOld, loadManifestV1(arena, multi_dir));
 }
 
 test "session attach validation rejects unavailable input streams" {
@@ -2864,21 +2960,20 @@ test "manifest v1 validates and round-trips multi-vCPU topology" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
-    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
     var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
     var redist_regs = [_]gicv3.MmioReg{.{ .offset = 0x10080, .width_bits = 32, .value = 0 }};
     var redists = [_]gicv3.RedistributorState{
         .{ .mpidr = topology.mpidrForIndex(0), .regs = &redist_regs },
         .{ .mpidr = topology.mpidrForIndex(1), .regs = &redist_regs },
     };
-    const manifest = testManifestV1(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, &vcpus, &redists);
+    const manifest = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &vcpus, &redists);
 
     try validateManifestV1(manifest);
     try saveManifestV1(arena, dir, manifest);
     try std.testing.expectError(error.BadManifest, loadManifest(arena, dir));
     const parsed = try loadManifestV1(arena, dir);
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 1), parsed.value.version);
+    try std.testing.expectEqual(@as(u32, format_version_v1), parsed.value.version);
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), parsed.value.platform.vcpu_count);
     try std.testing.expectEqual(@as(u64, 0x2_0000), parsed.value.platform.gic_redist_stride);
     try std.testing.expectEqual(@as(topology.Mpidr, 0x8000_0001), parsed.value.machine.vcpus[1].mpidr);
@@ -2897,29 +2992,28 @@ test "manifest v1 validates and round-trips multi-vCPU topology" {
 }
 
 test "manifest v1 rejects invalid vCPU topology" {
-    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
     var redists = [_]gicv3.RedistributorState{
         .{ .mpidr = topology.mpidrForIndex(0), .regs = &.{} },
         .{ .mpidr = topology.mpidrForIndex(1), .regs = &.{} },
     };
 
     var count_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
-    var manifest = testManifestV1(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, &count_vcpus, &redists);
+    var manifest = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &count_vcpus, &redists);
     manifest.platform.vcpu_count = 3;
     try std.testing.expectError(error.BadManifest, validateManifestV1(manifest));
 
     var duplicate_index_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
-    manifest = testManifestV1(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, &duplicate_index_vcpus, &redists);
+    manifest = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &duplicate_index_vcpus, &redists);
     manifest.machine.vcpus[1].index = 0;
     try std.testing.expectError(error.BadManifest, validateManifestV1(manifest));
 
     var duplicate_mpidr_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
-    manifest = testManifestV1(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, &duplicate_mpidr_vcpus, &redists);
+    manifest = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &duplicate_mpidr_vcpus, &redists);
     manifest.machine.vcpus[1].mpidr = manifest.machine.vcpus[0].mpidr;
     try std.testing.expectError(error.BadManifest, validateManifestV1(manifest));
 
     var missing_redist_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
-    manifest = testManifestV1(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, &missing_redist_vcpus, redists[0..1]);
+    manifest = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &missing_redist_vcpus, redists[0..1]);
     try std.testing.expectError(error.BadManifest, validateManifestV1(manifest));
 }
 
@@ -2929,8 +3023,7 @@ test "manifest rejects oversized annotations" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
-    var manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, 3);
+    var manifest = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
     var annotations = Annotations{};
     const value = try arena.alloc(u8, max_annotations_json_bytes);
     @memset(value, 'x');
@@ -2953,7 +3046,6 @@ fn testTransport(device_id: u32) TransportState {
 }
 
 test "manifest rejects overflowing virtqueue base addresses" {
-    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
     var queues = [_]QueueState{.{
         .size = 8,
         .ready = true,
@@ -2965,7 +3057,7 @@ test "manifest rejects overflowing virtqueue base addresses" {
     }};
     var devices = [_]TransportState{testTransport(3)};
     devices[0].queues = &queues;
-    var manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, 3);
+    var manifest = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
     manifest.devices = &devices;
 
     queues[0].desc_addr = std.math.maxInt(u64);
@@ -2997,12 +3089,36 @@ fn testRootfs(mmio_slot: u32) Rootfs {
     };
 }
 
+const test_zero_memory_size: usize = 1 << 29;
+const test_zero_memory_chunks = initTestZeroMemoryChunks();
+const test_single_zero_memory_chunk = [_]u64{0};
+
+fn initTestZeroMemoryChunks() [test_zero_memory_size / chunk_size]u64 {
+    var out: [test_zero_memory_size / chunk_size]u64 = undefined;
+    for (&out, 0..) |*entry, i| entry.* = i;
+    return out;
+}
+
+fn testZeroMemoryManifest(ram_size: u64) MemoryManifest {
+    const zero_chunks = if (ram_size == test_zero_memory_size)
+        test_zero_memory_chunks[0..]
+    else if (ram_size == chunk_size)
+        test_single_zero_memory_chunk[0..]
+    else
+        &.{};
+    return .{
+        .logical_size = ram_size,
+        .chunk_size = chunk_size,
+        .chunks = &.{},
+        .zero_chunks = zero_chunks,
+    };
+}
+
 fn testDisk(mmio_slot: u32) Disk {
     return .{
         .device = .{ .mmio_slot = mmio_slot },
         .size = 4096,
         .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .layers = &.{"blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
     };
 }
 
@@ -3057,7 +3173,7 @@ fn testRootfsStorage(mmio_slot: u32) RootfsStorage {
         .kind = rootfs_storage_kind_chunked_ext4,
         .device = .{ .mmio_slot = mmio_slot },
         .logical_size = 4096,
-        .chunk_size = 4096,
+        .chunk_size = disk_chunk_size,
         .hash_algorithm = rootfs_storage_hash_algorithm_blake3,
         .index_digest = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         .base_identity = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -3080,12 +3196,11 @@ test "manifest rootfs artifact validates transport binding" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
-    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
     var devices = [_]TransportState{
         testTransport(3),
         testTransport(rootfs_virtio_blk_device_id),
     };
-    var manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, 3);
+    var manifest = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
     manifest.devices = &devices;
     manifest.rootfs = testRootfs(1);
 
@@ -3117,19 +3232,18 @@ test "manifest rootfs artifact validates transport binding" {
     try std.testing.expect(!try rootfsQueuesQuiescent(manifest.rootfs.?, manifest.devices));
 }
 
-test "manifest disk validates rootfs base and layer chain" {
+test "manifest disk validates rootfs-bound chunk index disk" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
-    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
     var devices = [_]TransportState{
         testTransport(3),
         testTransport(rootfs_virtio_blk_device_id),
     };
-    var manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, 3);
+    var manifest = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
     manifest.devices = &devices;
     manifest.rootfs = testRootfs(1);
     manifest.disk = testDisk(1);
@@ -3138,17 +3252,16 @@ test "manifest disk validates rootfs base and layer chain" {
     const parsed = try loadManifest(arena, dir);
     defer parsed.deinit();
     const disk = parsed.value.disk orelse return error.BadManifest;
-    try std.testing.expectEqualStrings(disk_kind_cow_block, disk.kind);
-    try std.testing.expectEqualStrings(manifest.rootfs.?.artifact.digest, disk.base);
+    try std.testing.expectEqualStrings(disk_kind_chunk_index, disk.kind);
     try std.testing.expectEqual(@as(u64, 4096), disk.size);
     try std.testing.expect(try diskQueuesQuiescent(disk, parsed.value.devices));
 
     manifest.rootfs = null;
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.rootfs = testRootfs(1);
-    manifest.disk.?.base = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    manifest.disk.?.base = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
-    manifest.disk.?.base = manifest.rootfs.?.artifact.digest;
+    manifest.disk.?.base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     manifest.disk.?.device.mmio_slot = 0;
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.disk.?.device.mmio_slot = 1;
@@ -3157,6 +3270,9 @@ test "manifest disk validates rootfs base and layer chain" {
     manifest.disk.?.size = 4096;
     manifest.disk.?.layers = &.{"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"};
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    manifest.disk.?.layers = &.{};
+    manifest.disk.?.kind = disk_kind_cow_block;
+    try std.testing.expectError(error.FormatTooOld, validateManifest(manifest));
 }
 
 test "manifest disk binds to chunked rootfs storage identity" {
@@ -3166,15 +3282,15 @@ test "manifest disk binds to chunked rootfs storage identity" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
-    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
     var devices = [_]TransportState{
         testTransport(3),
         testTransport(rootfs_virtio_blk_device_id),
     };
-    var manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, 3);
+    var manifest = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
     manifest.devices = &devices;
     manifest.rootfs = testRootfs(1);
     manifest.rootfs.?.storage = testRootfsStorage(1);
+    manifest.rootfs.?.artifact.digest = manifest.rootfs.?.storage.?.index_digest;
     manifest.disk = testDisk(1);
     manifest.disk.?.base = manifest.rootfs.?.storage.?.base_identity;
 
@@ -3187,76 +3303,22 @@ test "manifest disk binds to chunked rootfs storage identity" {
     try std.testing.expectEqualStrings(rootfs.storage.?.base_identity, disk.base);
     try std.testing.expectEqual(@as(u64, 4096), effectiveRootfsLogicalSize(rootfs));
 
-    manifest.disk.?.base = manifest.rootfs.?.artifact.digest;
+    manifest.rootfs.?.artifact.digest = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
-    manifest.disk.?.base = manifest.rootfs.?.storage.?.base_identity;
+    manifest.rootfs.?.artifact.digest = manifest.rootfs.?.storage.?.index_digest;
 
     manifest.rootfs.?.storage.?.base_identity = "blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.rootfs.?.storage = testRootfsStorage(1);
+    manifest.rootfs.?.artifact.digest = manifest.rootfs.?.storage.?.index_digest;
 
     manifest.rootfs.?.storage.?.device.mmio_slot = 0;
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.rootfs.?.storage = testRootfsStorage(1);
+    manifest.rootfs.?.artifact.digest = manifest.rootfs.?.storage.?.index_digest;
 
     manifest.rootfs.?.storage.?.object_namespace = "../rootfs";
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
-}
-
-test "disk layer index validation fails closed" {
-    const digest_a = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const digest_b = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    var layer = DiskLayer{
-        .cluster_size = 4096,
-        .disk_size = 8192,
-        .extents = &.{
-            .{ .logical_cluster = 0, .digest = digest_a },
-            .{ .logical_cluster = 1, .digest = digest_b },
-        },
-        .zero_clusters = &.{},
-    };
-    try validateDiskLayer(layer);
-    try std.testing.expectEqual(@as(u64, 2), try diskClusterCount(layer.disk_size, layer.cluster_size));
-    try std.testing.expectEqual(@as(usize, 4096), try diskClusterLen(layer.disk_size, layer.cluster_size, 1));
-    try std.testing.expect(findDiskExtent(layer, 1) != null);
-    try std.testing.expect(!diskLayerHasZeroCluster(layer, 1));
-
-    layer.extents = &.{
-        .{ .logical_cluster = 1, .digest = digest_b },
-        .{ .logical_cluster = 0, .digest = digest_a },
-    };
-    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
-
-    layer.extents = &.{
-        .{ .logical_cluster = 1, .digest = digest_a },
-        .{ .logical_cluster = 1, .digest = digest_b },
-    };
-    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
-
-    layer.extents = &.{.{ .logical_cluster = 2, .digest = digest_a }};
-    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
-
-    layer.extents = &.{.{ .logical_cluster = 0, .digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }};
-    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
-
-    layer.extents = &.{.{ .logical_cluster = 0, .digest = digest_a }};
-    layer.zero_clusters = &.{0};
-    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
-
-    layer.extents = &.{};
-    layer.zero_clusters = &.{ 1, 1 };
-    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
-
-    layer.zero_clusters = &.{2};
-    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
-
-    layer.zero_clusters = &.{};
-    layer.cluster_size = 1000;
-    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
-
-    layer.cluster_size = 4096;
-    layer.disk_size = 0;
-    try std.testing.expectError(error.BadManifest, validateDiskLayer(layer));
 }
 
 const test_fork_line_levels = [_]gicv3.LineLevel{.{ .intid = board.generationIntid(), .asserted = false }};
@@ -3330,8 +3392,7 @@ test "fork mints child manifests with shared chunks and pending generation" {
         .allow_cidrs = &.{"93.184.216.0/24"},
         .allow_hosts = &.{"example.com"},
     };
-    try ensureDir(try pathZ(arena, "{s}/disklayers", .{parent_dir}));
-    try ensureDir(try pathZ(arena, "{s}/diskobjects", .{parent_dir}));
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, try pathZ(arena, "{s}/cas", .{parent_dir}));
     try saveManifest(arena, parent_dir, parent_manifest);
 
     const result = try fork(arena, .{ .parent_dir = parent_dir, .out_dir = out_dir, .count = 2, .environ_map = &env });
@@ -3353,9 +3414,7 @@ test "fork mints child manifests with shared chunks and pending generation" {
     try std.testing.expectEqualStrings(parent_manifest.rootfs.?.artifact.digest, first.value.rootfs.?.artifact.digest);
     try std.testing.expect(first.value.disk != null);
     try std.testing.expectEqualStrings(parent_manifest.disk.?.base, first.value.disk.?.base);
-    try std.testing.expectEqualStrings(parent_manifest.disk.?.layers[0], first.value.disk.?.layers[0]);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.access(try pathZ(arena, "{s}/disklayers", .{first_child_dir}), 0));
-    try std.testing.expectEqual(@as(c_int, 0), std.c.access(try pathZ(arena, "{s}/diskobjects", .{first_child_dir}), 0));
+    try std.testing.expectEqual(@as(usize, 0), first.value.disk.?.layers.len);
     try std.testing.expect(first.value.network != null);
     try std.testing.expectEqualStrings(network_kind_spore, first.value.network.?.kind);
     try std.testing.expectEqualStrings(parent_manifest.network.?.allow_cidrs[0], first.value.network.?.allow_cidrs[0]);
@@ -3554,8 +3613,7 @@ test "fork mints manifest v1 child manifests with shared chunks and pending gene
     parent_manifest.rootfs = testRootfs(1);
     parent_manifest.disk = testDisk(1);
     parent_manifest.generation = .{ .generation = 51, .interrupt_status = 0, .params_b64 = "" };
-    try ensureDir(try pathZ(arena, "{s}/disklayers", .{parent_dir}));
-    try ensureDir(try pathZ(arena, "{s}/diskobjects", .{parent_dir}));
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, try pathZ(arena, "{s}/cas", .{parent_dir}));
     try saveManifestV1(arena, parent_dir, parent_manifest);
 
     const result = try fork(arena, .{
@@ -3573,7 +3631,7 @@ test "fork mints manifest v1 child manifests with shared chunks and pending gene
     try std.testing.expectError(error.BadManifest, loadManifest(arena, first_child_dir));
     const first = try loadManifestV1(arena, first_child_dir);
     defer first.deinit();
-    try std.testing.expectEqual(@as(u32, 1), first.value.version);
+    try std.testing.expectEqual(@as(u32, format_version_v1), first.value.version);
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), first.value.platform.vcpu_count);
     try std.testing.expectEqual(@as(u64, 52), first.value.generation.generation);
     try std.testing.expectEqual(@as(u32, generation.irq_generation_changed), first.value.generation.interrupt_status);
@@ -3594,8 +3652,6 @@ test "fork mints manifest v1 child manifests with shared chunks and pending gene
     };
     try std.testing.expectEqual(LocalBackingRestoreSource.local_backing, first_backing_plan.source);
     try std.testing.expectEqual(@as(c_int, 0), std.c.access(try pathZ(arena, "{s}/chunks", .{first_child_dir}), 0));
-    try std.testing.expectEqual(@as(c_int, 0), std.c.access(try pathZ(arena, "{s}/disklayers", .{first_child_dir}), 0));
-    try std.testing.expectEqual(@as(c_int, 0), std.c.access(try pathZ(arena, "{s}/diskobjects", .{first_child_dir}), 0));
 
     const dec = std.base64.standard.Decoder;
     const decoded_size = try dec.calcSizeForSlice(first.value.generation.params_b64);
@@ -3681,7 +3737,6 @@ test "backend-private GIC state json round-trip" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
-    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
     const manifest = Manifest{
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
@@ -3713,7 +3768,7 @@ test "backend-private GIC state json round-trip" {
         },
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
-        .memory = .{ .chunk_size = chunk_size, .chunks = &memory_chunks },
+        .memory = testZeroMemoryManifest(1 << 29),
     };
     try saveManifest(arena, dir, manifest);
     const parsed = try loadManifest(arena, dir);
@@ -3755,7 +3810,7 @@ test "manifest rejects invalid counter frequency" {
         },
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
-        .memory = .{ .chunk_size = chunk_size, .chunks = &.{} },
+        .memory = testZeroMemoryManifest(1 << 29),
     };
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.platform.counter_frequency_hz = @as(u64, std.math.maxInt(u32)) + 1;
@@ -3766,8 +3821,7 @@ test "manifest rejects invalid counter frequency" {
 }
 
 test "manifest rejects invalid network policy" {
-    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
-    var manifest = testForkManifest(.{ .chunk_size = chunk_size, .chunks = &memory_chunks }, 1 << 29, 3);
+    var manifest = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
 
     manifest.network = .{ .kind = "future-net-v0" };
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));

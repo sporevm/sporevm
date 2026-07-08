@@ -91,8 +91,8 @@ const workspace = inspected.annotations.map.get("cleanroom.workspace");
 ```
 
 `inspectSpore` accepts every manifest format version that restore paths accept:
-format v0 (single-vCPU) and format v1 (multi-vCPU) manifests both summarize,
-and `SporeInspectResult.vcpu_count` reports the vCPU count (1 for v0).
+format v2 (single-vCPU) and format v3 (multi-vCPU) manifests both summarize,
+and `SporeInspectResult.vcpu_count` reports the vCPU count (1 for v2).
 
 `SporeInspectResult.vm_state_present` is the product-level VM-state signal for
 callers that should not infer it from chunks, devices, or sessions. Valid local
@@ -161,8 +161,9 @@ defer libspore.deinitRootfsResolveResult(allocator, resolved);
 
 `rootfsImportOci` imports OCI layouts under local refs, and `rootfsImportTar`
 imports uncompressed rootfs tar files under the same local ref cache. Import
-options default to `.rootfs_storage = .chunked`; set `.rootfs_storage = .flat`
-for local-only imports that should skip immediate chunked rootfs CAS preload.
+options default to `.rootfs_storage = .chunked`; flat-only imports are no
+longer accepted because image-created spores use the rootfs storage index as
+their portable identity.
 `rootfsCasPreload` preloads a rootfs digest into chunked CAS storage and can
 attach the resulting descriptor to an existing spore.
 

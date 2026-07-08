@@ -1601,7 +1601,7 @@ test "C ABI named lifecycle last error carries state and log paths" {
 
 const inspect_spore_manifest_json =
     \\{
-    \\  "version": 0,
+    \\  "version": 2,
     \\  "annotations": {
     \\    "cleanroom.workspace": "/workspaces/app",
     \\    "cleanroom.provenance": "sha256:abc123"
@@ -1640,6 +1640,6 @@ const inspect_spore_manifest_json =
     \\    }],
     \\    "requirements": {"tcp_ipv4":true,"exact_host_port":false,"bound_services":true}
     \\  },
-    \\  "memory": {"chunk_size":2097152,"chunks":[null],"backing":null}
+    \\  "memory": {"kind":"spore-disk-index-v1","logical_size":1,"chunk_size":2097152,"hash_algorithm":"blake3","object_namespace":"memory/blake3","chunks":[],"zero_chunks":[0],"backing":null}
     \\}
 ;

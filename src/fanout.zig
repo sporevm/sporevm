@@ -513,7 +513,7 @@ fn testManifest(sessions: []const spore.Session) spore.Manifest {
             .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
             .ram_base = 0x8000_0000,
-            .ram_size = 0,
+            .ram_size = 1,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
             .counter_frequency_hz = 24_000_000,
@@ -536,7 +536,7 @@ fn testManifest(sessions: []const spore.Session) spore.Manifest {
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
         .sessions = sessions,
-        .memory = .{ .chunk_size = spore.chunk_size, .chunks = &.{} },
+        .memory = .{ .logical_size = 1, .chunk_size = spore.chunk_size, .zero_chunks = &.{0} },
     };
 }
 

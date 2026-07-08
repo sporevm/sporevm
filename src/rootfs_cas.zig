@@ -1,17 +1,17 @@
 //! Chunked rootfs cache and block source.
 //!
-//! Runtime restore uses the manifest-bound rootfs block index selected by
+//! Runtime restore uses the manifest-bound disk index selected by
 //! `rootfs.storage`.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const chunk = @import("chunk.zig");
+const chunk_sealer = @import("chunk_sealer.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
-const rootfs_index = @import("rootfs_index.zig");
+const disk_index = @import("disk_index.zig");
 const spore = @import("spore.zig");
 
 const Io = std.Io;
-const Blake3 = std.crypto.hash.Blake3;
 
 pub const default_chunk_size: u64 = 64 * 1024;
 pub const max_index_bytes: usize = 64 * 1024 * 1024;
@@ -70,15 +70,11 @@ const LoadedIndex = struct {
     }
 };
 
-/// Assemble the flat digest-addressed ext4 artifact from locally installed
-/// chunk objects and publish it into the by-digest cache. Chunks are
-/// BLAKE3-verified against the (digest-verified) index as they are read, the
-/// assembled bytes are hashed and must equal `rootfs.artifact.digest` before
-/// publication, and the publish is an atomic rename. The artifact digest and
-/// the chunk index are separate authorities in the manifest; an inconsistent
-/// pairing fails closed here instead of poisoning the digest cache or serving
-/// different bytes depending on cache state. Rename-over publication also
-/// self-heals a corrupt or truncated existing cache entry.
+/// Assemble the flat ext4 materialization cache from locally installed chunk
+/// objects and publish it under the rootfs identity. Chunks are BLAKE3-verified
+/// against the digest-verified index as they are read, and the publish is an
+/// atomic rename. The flat file is only a cache; the manifest identity is the
+/// index digest.
 pub fn materializeFlatFromChunks(
     io: Io,
     allocator: std.mem.Allocator,
@@ -89,6 +85,7 @@ pub fn materializeFlatFromChunks(
     if (!std.mem.eql(u8, rootfs.artifact.format, spore.rootfs_artifact_format_ext4)) return error.BadManifest;
     if (!spore.rootfsDeviceEql(storage.device, rootfs.device)) return error.BadManifest;
     if (storage.logical_size != rootfs.artifact.size) return error.BadManifest;
+    if (!std.mem.eql(u8, storage.index_digest, rootfs.artifact.digest)) return error.BadManifest;
 
     // Already materialized and shaped correctly: nothing to do.
     if (rootfs_cache.openTrustedFromCache(io, allocator, cache_root, rootfs)) |fd| {
@@ -120,15 +117,10 @@ pub fn materializeFlatFromChunks(
     if (temp_fd < 0) return error.IoFailed;
     defer _ = std.c.close(temp_fd);
 
-    const chunk_size = std.math.cast(usize, storage.chunk_size) orelse return error.BadManifest;
     const logical_len = std.math.cast(std.c.off_t, storage.logical_size) orelse return error.BadManifest;
     // Sparse output: size the file up front and write only data chunks, so
     // zero chunks stay holes on disk instead of 512MiB of zero writes.
     if (std.c.ftruncate(temp_fd, logical_len) != 0) return error.IoFailed;
-    const zero_buf = try allocator.alloc(u8, chunk_size);
-    defer allocator.free(zero_buf);
-    @memset(zero_buf, 0);
-    var hasher = Blake3.init(.{});
     for (index.chunk_ids, 0..) |maybe_id, i| {
         const len = try storageChunkLen(storage, @intCast(i));
         if (maybe_id) |id| {
@@ -140,18 +132,9 @@ pub fn materializeFlatFromChunks(
             };
             defer allocator.free(object);
             if (!id.matches(object)) return error.BadChunk;
-            hasher.update(object);
             try pwriteAll(temp_fd, object, @as(u64, @intCast(i)) * storage.chunk_size);
-        } else {
-            hasher.update(zero_buf[0..len]);
         }
     }
-
-    var digest: [Blake3.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    const expected_hex = rootfs.artifact.digest[spore.rootfs_digest_prefix.len..];
-    if (!std.mem.eql(u8, &hex, expected_hex)) return error.RootFSDigestMismatch;
 
     if (std.c.fchmod(temp_fd, 0o444) != 0) return error.IoFailed;
     const dest_z = try allocator.dupeZ(u8, dest_path);
@@ -183,15 +166,49 @@ pub fn preload(
     const source_verify_start_ms = monotonicMs();
     const fd = try rootfs_cache.openTrustedFromCache(io, allocator, cache_root, rootfs);
     defer _ = std.c.close(fd);
+    var result = try preloadFd(io, allocator, cache_root, fd, stat.size, rootfs_digest, chunk_size);
+    result.source_verify_ms = monotonicMs() -| source_verify_start_ms;
+    return result;
+}
+
+pub fn preloadPath(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    path: []const u8,
+    chunk_size: u64,
+) !PreloadResult {
+    if (chunk_size == 0 or chunk_size % 512 != 0 or chunk_size > std.math.maxInt(usize)) return error.BadManifest;
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.RootFSOpenFailed;
+    defer _ = std.c.close(fd);
+    const file = Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.RootFSOpenFailed;
+    return preloadFd(io, allocator, cache_root, fd, stat.size, null, chunk_size);
+}
+
+fn preloadFd(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    fd: std.c.fd_t,
+    size: u64,
+    source_identity: ?[]const u8,
+    chunk_size: u64,
+) !PreloadResult {
+    if (std.c.lseek(fd, 0, std.c.SEEK.SET) < 0) return error.RootFSOpenFailed;
 
     const object_dir_path = try objectDir(allocator, cache_root);
     defer allocator.free(object_dir_path);
     try ensureDirPath(io, object_dir_path);
 
-    const chunk_count_u64 = try chunkCount(stat.size, chunk_size);
+    const chunk_count_u64 = try chunkCount(size, chunk_size);
     if (chunk_count_u64 > std.math.maxInt(usize)) return error.BadManifest;
     const chunk_count: usize = @intCast(chunk_count_u64);
-    var manifest_chunks: std.ArrayList(rootfs_index.RootfsBlockChunk) = .empty;
+    var manifest_chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty;
     try manifest_chunks.ensureTotalCapacity(allocator, chunk_count);
     defer {
         for (manifest_chunks.items) |entry| allocator.free(entry.digest);
@@ -217,26 +234,19 @@ pub fn preload(
     defer allocator.free(read_buf);
     const object_buf = try allocator.alloc(u8, @intCast(chunk_size));
     defer allocator.free(object_buf);
-    const zero_buf = try allocator.alloc(u8, @intCast(chunk_size));
-    defer allocator.free(zero_buf);
-    @memset(zero_buf, 0);
-
-    var source_hasher = Blake3.init(.{});
     var sparse_scan: SparseScanState = .{};
     const chunk_scan_start_ms = monotonicMs();
     for (0..chunk_count) |i| {
         const start = std.math.mul(u64, @as(u64, @intCast(i)), chunk_size) catch return error.BadManifest;
-        const len = @min(chunk_size, stat.size - start);
+        const len = @min(chunk_size, size - start);
         const len_usize = std.math.cast(usize, len) orelse return error.BadManifest;
-        if (chunkIsSparseHole(fd, &sparse_scan, start, len, stat.size)) {
-            source_hasher.update(zero_buf[0..len_usize]);
+        if (chunkIsSparseHole(fd, &sparse_scan, start, len, size)) {
             zero_chunks += 1;
             try manifest_zero_chunks.append(allocator, @intCast(i));
             continue;
         }
         const data = read_buf[0..len_usize];
         try preadExact(fd, data, start);
-        source_hasher.update(data);
         if (isZero(data)) {
             zero_chunks += 1;
             try manifest_zero_chunks.append(allocator, @intCast(i));
@@ -254,7 +264,9 @@ pub fn preload(
         const object_check_start_ms = monotonicMs();
         const object_exists = try objectEqualsDataZ(object_path, data, object_buf[0..data.len]);
         object_check_ms += monotonicMs() -| object_check_start_ms;
-        if (!object_exists) {
+        if (object_exists) {
+            try chunk_sealer.writeFileAllIfMissing(allocator, object_path, data);
+        } else {
             try missing_objects.append(allocator, .{
                 .logical_chunk = @intCast(i),
                 .id = id,
@@ -263,16 +275,10 @@ pub fn preload(
         nonzero_chunks += 1;
     }
     const chunk_scan_ms = monotonicMs() -| chunk_scan_start_ms;
-    var source_digest: [Blake3.digest_length]u8 = undefined;
-    source_hasher.final(&source_digest);
-    const source_hex = std.fmt.bytesToHex(source_digest, .lower);
-    const expected_source_hex = rootfs_digest[spore.rootfs_digest_prefix.len..];
-    if (!std.mem.eql(u8, &source_hex, expected_source_hex)) return error.RootFSDigestMismatch;
-    const source_verify_ms = monotonicMs() -| source_verify_start_ms;
 
     for (missing_objects.items) |missing| {
         const start = std.math.mul(u64, missing.logical_chunk, chunk_size) catch return error.BadManifest;
-        const len = @min(chunk_size, stat.size - start);
+        const len = @min(chunk_size, size - start);
         const len_usize = std.math.cast(usize, len) orelse return error.BadManifest;
         const data = read_buf[0..len_usize];
         try preadExact(fd, data, start);
@@ -281,16 +287,17 @@ pub fn preload(
         defer allocator.free(object_path);
         try removeStaleObject(io, object_path);
         const object_write_start_ms = monotonicMs();
-        try writeFileAtomic(io, allocator, object_path, data);
+        var durable_write_stats: chunk_sealer.WorkStats = .{};
+        try chunk_sealer.writePathAllIfMissingTimed(allocator, object_path, data, &durable_write_stats);
         object_write_ms += monotonicMs() -| object_write_start_ms;
         objects_written += 1;
         object_bytes_written += data.len;
     }
 
     const index_build_start_ms = monotonicMs();
-    const manifest_index = rootfs_index.RootfsBlockIndex{
-        .kind = rootfs_index.rootfs_block_index_kind,
-        .logical_size = stat.size,
+    const manifest_index = disk_index.DiskIndex{
+        .kind = disk_index.disk_index_kind,
+        .logical_size = size,
         .chunk_size = chunk_size,
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
         .object_namespace = spore.rootfs_storage_object_namespace,
@@ -299,7 +306,7 @@ pub fn preload(
     };
     const manifest_json = try std.json.Stringify.valueAlloc(allocator, manifest_index, .{ .whitespace = .indent_2 });
     defer allocator.free(manifest_json);
-    const index_digest = try rootfs_index.indexDigestAlloc(allocator, manifest_json);
+    const index_digest = try disk_index.indexDigestAlloc(allocator, manifest_json);
     const index_build_ms = monotonicMs() -| index_build_start_ms;
     errdefer allocator.free(index_digest);
     const manifest_path = try manifestIndexPath(allocator, cache_root, index_digest);
@@ -307,13 +314,17 @@ pub fn preload(
     const manifest_dir = std.fs.path.dirname(manifest_path) orelse return error.BadManifest;
     try ensureDirPath(io, manifest_dir);
     const index_write_start_ms = monotonicMs();
+    // Durable-index invariant: every referenced object write above fsynced the
+    // object and object directory; publish the index last via temp/fsync/rename.
     try writeFileAtomic(io, allocator, manifest_path, manifest_json);
     const index_write_ms = monotonicMs() -| index_write_start_ms;
+    const rootfs_identity = try allocator.dupe(u8, source_identity orelse index_digest);
+    errdefer allocator.free(rootfs_identity);
     return .{
         .index_path = manifest_path,
         .index_digest = index_digest,
-        .rootfs_digest = rootfs_digest,
-        .rootfs_size = stat.size,
+        .rootfs_digest = rootfs_identity,
+        .rootfs_size = size,
         .chunk_size = chunk_size,
         .chunk_count = chunk_count,
         .zero_chunks = zero_chunks,
@@ -321,7 +332,7 @@ pub fn preload(
         .objects_written = objects_written,
         .object_bytes_written = object_bytes_written,
         .index_bytes = manifest_json.len,
-        .source_verify_ms = source_verify_ms,
+        .source_verify_ms = 0,
         .chunk_scan_ms = chunk_scan_ms,
         .object_check_ms = object_check_ms,
         .object_write_ms = object_write_ms,
@@ -340,13 +351,13 @@ pub fn storageComplete(
     defer allocator.free(index_path);
     if (!try rootfs_cache.regularFileNoSymlink(io, index_path)) return false;
 
-    const bytes = readFileAll(allocator, index_path, rootfs_index.max_index_bytes) catch |err| switch (err) {
+    const bytes = readFileAll(allocator, index_path, disk_index.max_index_bytes) catch |err| switch (err) {
         error.MissingChunk, error.BadChunk, error.ShortRead => return false,
         else => |e| return e,
     };
     defer allocator.free(bytes);
-    var parsed = rootfs_index.parseRootfsBlockIndex(allocator, bytes, storage) catch |err| switch (err) {
-        error.BadManifest => return false,
+    var parsed = parseStorageDiskIndex(allocator, bytes, storage) catch |err| switch (err) {
+        error.BadManifest, error.FormatTooOld => return false,
         else => |e| return e,
     };
     defer parsed.deinit();
@@ -370,9 +381,9 @@ pub fn readVerifiedStorageIndexPath(
     path: []const u8,
     storage: spore.RootfsStorage,
 ) ![]u8 {
-    const bytes = try readFileAll(allocator, path, rootfs_index.max_index_bytes);
+    const bytes = try readFileAll(allocator, path, disk_index.max_index_bytes);
     errdefer allocator.free(bytes);
-    var parsed = try rootfs_index.parseRootfsBlockIndex(allocator, bytes, storage);
+    var parsed = try parseStorageDiskIndex(allocator, bytes, storage);
     parsed.deinit();
     return bytes;
 }
@@ -403,7 +414,7 @@ pub fn installStorageIndexPath(
         allocator.free(existing);
         return .{ .cache_hit = true, .bytes_fetched = 0 };
     }
-    var parsed = try rootfs_index.parseRootfsBlockIndex(allocator, data, storage);
+    var parsed = try parseStorageDiskIndex(allocator, data, storage);
     parsed.deinit();
     try writeFileAtomic(io, allocator, cache_path, data);
     const installed = try readVerifiedStorageIndexPath(allocator, cache_path, storage);
@@ -447,6 +458,20 @@ pub fn manifestObjectPath(allocator: std.mem.Allocator, cache_root: []const u8, 
     return objectPathForDir(allocator, dir, id);
 }
 
+pub fn readVerifiedManifestObject(
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    object_digest: []const u8,
+    expected_size: usize,
+) (SourceError || spore.Error)![]u8 {
+    const object_path = try manifestObjectPath(allocator, cache_root, object_digest);
+    defer allocator.free(object_path);
+    const object = try readFileExact(allocator, object_path, expected_size);
+    errdefer allocator.free(object);
+    try verifyDigestBytes(object_digest, object);
+    return object;
+}
+
 pub fn storageDescriptor(device: spore.RootfsDevice, result: PreloadResult) spore.RootfsStorage {
     return .{
         .kind = spore.rootfs_storage_kind_chunked_ext4,
@@ -481,7 +506,7 @@ fn loadManifestIndex(
 ) !LoadedIndex {
     const bytes = try readFileAll(allocator, path, max_index_bytes);
     defer allocator.free(bytes);
-    var parsed = try rootfs_index.parseRootfsBlockIndex(allocator, bytes, storage);
+    var parsed = try parseStorageDiskIndex(allocator, bytes, storage);
     errdefer parsed.deinit();
     const expected_chunks = try chunkCount(storage.logical_size, storage.chunk_size);
     if (expected_chunks > std.math.maxInt(usize)) return error.BadManifest;
@@ -500,6 +525,14 @@ fn loadManifestIndex(
         .chunk_size = storage.chunk_size,
         .index_bytes = bytes.len,
     };
+}
+
+fn parseStorageDiskIndex(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    storage: spore.RootfsStorage,
+) !std.json.Parsed(disk_index.DiskIndex) {
+    return disk_index.parseDiskIndex(allocator, bytes, try spore.diskIndexDescriptorForStorage(storage));
 }
 
 fn rootfsDigestHex(digest: []const u8) ![]const u8 {
@@ -670,24 +703,8 @@ fn removeStaleObject(io: Io, path: []const u8) !void {
 }
 
 fn writeFileAtomic(io: Io, allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
-    var temp_nonce_bytes: [8]u8 = undefined;
-    io.random(&temp_nonce_bytes);
-    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ path, temp_nonce });
-    defer allocator.free(temp_path);
-    defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
-    const temp_z = try allocator.dupeZ(u8, temp_path);
-    defer allocator.free(temp_z);
-    const fd = std.c.open(temp_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(c_uint, 0o444));
-    if (fd < 0) return error.IoFailed;
-    defer _ = std.c.close(fd);
-    try writeAll(fd, data);
-    if (std.c.fchmod(fd, 0o444) != 0) return error.IoFailed;
-    if (!Io.Dir.path.isAbsolute(path)) {
-        try Io.Dir.rename(Io.Dir.cwd(), temp_path, Io.Dir.cwd(), path, io);
-    } else {
-        try Io.Dir.renameAbsolute(temp_path, path, io);
-    }
+    _ = io;
+    try chunk_sealer.writeFileAtomicDurable(allocator, path, data, 0o444);
 }
 
 fn ensureDirPath(io: Io, path: []const u8) !void {
@@ -751,16 +768,21 @@ test "materialize assembles the flat artifact from verified chunks" {
     const bytes = "abcd" ++ ("\x00" ** 4096) ++ "efgh";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = bytes });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try preload(io, arena, cache_root, artifact.digest, 4096);
+    const preload_result = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
+    const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
-        .artifact = artifact,
-        .storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
+        .artifact = rootfs_artifact,
+        .storage = storage,
     };
 
     // Remove the flat entry so materialize actually assembles from chunks.
-    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
-    try Io.Dir.cwd().deleteFile(io, digest_path);
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
+    Io.Dir.cwd().deleteFile(io, digest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
 
     try materializeFlatFromChunks(io, allocator, cache_root, rootfs);
     const assembled = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(1 << 20));
@@ -785,21 +807,26 @@ test "materialize reproduces exact bytes across chunk boundaries and zero chunks
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
     try Io.Dir.cwd().createDirPath(io, tmp);
 
-    var model: [3 * 512 + 73]u8 = undefined;
-    for (model[0..512], 0..) |*byte, i| byte.* = @truncate((i * 17) + 3);
-    @memset(model[512..1024], 0);
-    for (model[1024..], 0..) |*byte, i| byte.* = @truncate((i * 29) + 11);
+    var model: [3 * spore.disk_chunk_size + 73]u8 = undefined;
+    for (model[0..spore.disk_chunk_size], 0..) |*byte, i| byte.* = @truncate((i * 17) + 3);
+    @memset(model[spore.disk_chunk_size .. 2 * spore.disk_chunk_size], 0);
+    for (model[2 * spore.disk_chunk_size ..], 0..) |*byte, i| byte.* = @truncate((i * 29) + 11);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = &model });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try preload(io, arena, cache_root, artifact.digest, 512);
+    const preload_result = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
+    const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
-        .artifact = artifact,
-        .storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
+        .artifact = rootfs_artifact,
+        .storage = storage,
     };
-    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
-    try Io.Dir.cwd().deleteFile(io, digest_path);
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
+    Io.Dir.cwd().deleteFile(io, digest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
 
     try materializeFlatFromChunks(io, allocator, cache_root, rootfs);
     const assembled = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(1 << 20));
@@ -820,14 +847,19 @@ test "materialize fails closed on corrupt chunk objects without publishing" {
     try Io.Dir.cwd().createDirPath(io, tmp);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "abcd" });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try preload(io, arena, cache_root, artifact.digest, 4096);
+    const preload_result = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
+    const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
-        .artifact = artifact,
-        .storage = storageDescriptor(.{ .mmio_slot = 1 }, preload_result),
+        .artifact = rootfs_artifact,
+        .storage = storage,
     };
-    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
-    try Io.Dir.cwd().deleteFile(io, digest_path);
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
+    Io.Dir.cwd().deleteFile(io, digest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
 
     const id = chunk.ChunkId.fromContents("abcd");
     const object_dir_path = try objectDir(arena, cache_root);
@@ -857,12 +889,10 @@ test "materialize fails closed when assembled bytes mismatch the artifact digest
 
     const a_artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, a_path);
     const b_artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, b_path);
-    const a_preload = try preload(io, arena, cache_root, a_artifact.digest, 4096);
+    const a_preload = try preload(io, arena, cache_root, a_artifact.digest, spore.disk_chunk_size);
 
-    // Manifest pairing B's artifact digest with A's chunk index: the artifact
-    // digest and the chunk index are separate authorities, and an
-    // inconsistent pairing must fail instead of publishing A-bytes under B's
-    // name or silently serving different bytes depending on cache state.
+    // Manifest pairing B's artifact identity with A's chunk index must fail
+    // instead of publishing A-bytes under B's name.
     const inconsistent = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
         .artifact = b_artifact,
@@ -871,7 +901,7 @@ test "materialize fails closed when assembled bytes mismatch the artifact digest
     const b_digest_path = try rootfs_cache.digestPath(arena, cache_root, b_artifact.digest);
     try Io.Dir.cwd().deleteFile(io, b_digest_path);
 
-    try std.testing.expectError(error.RootFSDigestMismatch, materializeFlatFromChunks(io, allocator, cache_root, inconsistent));
+    try std.testing.expectError(error.BadManifest, materializeFlatFromChunks(io, allocator, cache_root, inconsistent));
     try std.testing.expect(!try rootfs_cache.pathExistsNoSymlink(io, b_digest_path));
 }
 
@@ -889,7 +919,7 @@ test "preload repairs corrupt existing chunk objects" {
     try Io.Dir.cwd().createDirPath(io, tmp);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "abcd" });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    _ = try preload(io, arena, cache_root, artifact.digest, 4096);
+    _ = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
 
     const id = chunk.ChunkId.fromContents("abcd");
     const object_dir_path = try objectDir(arena, cache_root);
@@ -897,17 +927,22 @@ test "preload repairs corrupt existing chunk objects" {
     try Io.Dir.cwd().deleteFile(io, object_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = object_path, .data = "wxyz" });
 
-    const repaired = try preload(io, arena, cache_root, artifact.digest, 4096);
+    const repaired = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
     try std.testing.expectEqual(@as(usize, 1), repaired.objects_written);
 
+    const storage = storageDescriptor(.{ .mmio_slot = 1 }, repaired);
+    const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const rootfs = spore.Rootfs{
         .device = .{ .mmio_slot = 1 },
-        .artifact = artifact,
-        .storage = storageDescriptor(.{ .mmio_slot = 1 }, repaired),
+        .artifact = rootfs_artifact,
+        .storage = storage,
     };
-    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
-    try Io.Dir.cwd().deleteFile(io, digest_path);
+    const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
+    Io.Dir.cwd().deleteFile(io, digest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
     try materializeFlatFromChunks(io, allocator, cache_root, rootfs);
-    const assembled = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(4096));
+    const assembled = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(spore.disk_chunk_size));
     try std.testing.expectEqualStrings("abcd", assembled);
 }

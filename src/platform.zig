@@ -261,7 +261,7 @@ test "manifest platform check accepts exact match" {
         },
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
-        .memory = .{ .chunk_size = spore.chunk_size, .chunks = &.{} },
+        .memory = .{ .logical_size = 1, .chunk_size = spore.chunk_size, .zero_chunks = &.{0} },
     };
     const expected = Expected{
         .ram_size = manifest.platform.ram_size,

@@ -17,7 +17,7 @@ spec_refs:
 
 The implementation has landed. Product restore paths automatically map
 same-host `ram.backing` only when `ram.backing.proof` validates against the
-manifest memory fingerprint, opened file identity, backing metadata, and the
+canonical memory index identity, opened file identity, backing metadata, and the
 host-local runtime key. Missing, stale, foreign, symlinked, corrupt, or
 mismatched proofs fall back to verified chunks.
 

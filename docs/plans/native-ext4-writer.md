@@ -18,14 +18,15 @@ related_plans:
 
 Replace the external `mke2fs -d` plus `debugfs -w` rootfs materialization
 pipeline with a native Zig writer that serializes a merged OCI layer tree into
-a fresh ext4 image, sets deterministic metadata itself, and computes the rootfs
-BLAKE3 inline as image bytes are emitted.
+a fresh ext4 image, sets deterministic metadata itself, and emits the rootfs
+CAS index inline as image bytes are written.
 
 This writer is now scoped as the U4 import producer for
-[Unified Chunk-Mapped Disk](unified-chunk-disk.md): today it emits the flat
-ext4 artifact and rootfs BLAKE3; the next storage slice extends the same
-sequential emission loop to produce 64 KiB chunk digests and a
-`spore-disk-index-v1` inline. It stays create-only. Incremental/in-place
+[Unified Chunk-Mapped Disk](unified-chunk-disk.md): for chunked rootfs storage
+it emits the flat ext4 artifact, 64 KiB CAS objects, and the rootfs
+`spore-disk-index-v1` in the same sequential emission loop. The external
+writer remains as an escape hatch and still uses the post-hoc full-image
+preload fallback. The native writer stays create-only. Incremental/in-place
 mutation and snapshot persistence belong to U3's chunk sealer.
 
 ## Problem
@@ -41,11 +42,11 @@ That pipeline has three costs:
   deterministic.
 - It pays for a host staging tree even though the guest only consumes the final
   block device.
-- It cannot emit the future U4 chunk index inline because the serializer is an
+- It cannot emit the rootfs chunk index inline because the serializer is an
   opaque external process.
 
 The native writer removes the runtime e2fsprogs dependency and makes the
-serializer the point where flat bytes, rootfs digest, and future chunk-index
+serializer the point where flat bytes, rootfs objects, and rootfs index
 identity are produced together.
 
 ## Goals
@@ -54,10 +55,11 @@ identity are produced together.
 - Preserve OCI layer semantics: path safety, whiteouts, opaque directories,
   modes, ownership, symlinks, hardlinks, and bounded `security.capability`
   xattrs.
-- Keep the existing digest-cache, metadata sidecar, and rootfs storage behavior
-  until U4 replaces post-hoc rootfs CAS chunking.
-- Keep the writer loop sequential and content-source backed so a second
-  per-64KiB hasher can be added without another full-image pass.
+- Keep the existing metadata sidecar and rootfs storage behavior while making
+  native chunked imports produce `H(index)` inline.
+- Keep the writer loop sequential and content-source backed so flat bytes,
+  64 KiB chunk objects, and index identity are produced without another
+  full-image pass.
 - Keep the external writer available with `SPOREVM_EXT4_WRITER=external`.
 
 ## Non-Goals
@@ -68,9 +70,9 @@ identity are produced together.
   triple-indirect support in the first native profile.
 - No new guest-visible rootfs format. The VM still sees one virtio-blk ext4
   disk.
-- No investment in `rootfs_cas_preload`, storage-upgrade paths, or
-  chunked-to-flat assembly. U4 deletes that post-hoc path and replaces it with
-  inline `spore-disk-index-v1` emission.
+- No investment in expanding `rootfs_cas_preload`, storage-upgrade paths, or
+  chunked-to-flat assembly. `rootfs_cas_preload` remains only as the external
+  writer fallback.
 
 ## Target Model
 
@@ -80,10 +82,10 @@ The native path has two passes:
    content source identity and byte ranges instead of being copied into a
    staging directory. Plain tar layers are seekable; gzip layers spool once into
    the materialization temp dir.
-2. Plan and emit a fixed ext4 layout while hashing emitted bytes inline. The
-   same loop is intentionally shaped to add U4 chunk hashing:
-   rootfs BLAKE3 over all bytes today, then per-64KiB chunk BLAKE3 plus index
-   construction next.
+2. Plan and emit a fixed ext4 layout while feeding the same emitted bytes into
+   the inline rootfs CAS writer. The CAS writer classifies zero chunks, writes
+   missing nonzero objects durably, and publishes the `spore-disk-index-v1`
+   after every referenced object is durable.
 
 The current profile uses 4096-byte blocks, 256-byte inodes, sparse
 superblocks, filetype directory entries, external xattr blocks, inline symlinks
@@ -100,7 +102,7 @@ inode counts, image size, link counts, xattr bounds, and unsupported file sizes
 before writing.
 
 The default native flip is a flag-day cache break: `builder_version` is
-`sporevm-rootfs-v5`, so old `v3`/`v4` rootfs cache entries are abandoned and rebuilt.
+`sporevm-rootfs-v6`, so old `v3`/`v4`/`v5` rootfs cache entries are abandoned and rebuilt.
 The by-digest cache is not split by writer. Rootfs metadata records the selected
 writer, and cache validation rejects a metadata/artifact pair produced by the
 other writer so `SPOREVM_EXT4_WRITER=external` remains an effective escape
@@ -118,9 +120,9 @@ Implemented in this branch:
 | Native/external semantic parity | Done | Focused debugfs read-back test in `src/rootfs_slow_tests.zig` imports the same tar through both writers and compares guest-visible file contents; repeated native output has the same BLAKE3. |
 | Determinism | Done | Duplicate native emits and repeated native materialization produce stable BLAKE3 for the tested inputs. |
 | Fuzz coverage | Done | Existing tar fuzzing is extended with merged-tree fuzzing, and the native planner/metadata emitter has an integrated fuzz target. |
-| Cache identity | Done | Builder version bumped to `sporevm-rootfs-v5`; cache validation includes the selected writer metadata without hashing writer selection into the cache key. |
-| Guest boot smoke | Done | Native-default OCI smoke built and booted Alpine during the v4/default-flip work with `ext4_writer: native` and guest output `native-rootfs-smoke`; v5 invalidates the cache identity for the 60-byte symlink boundary fix. |
-| Writer benchmark | Done | Post-v5 native/external/patched-hcsshim tar2ext4 comparison recorded below; all current outputs are e2fsck-clean. |
+| Cache identity | Done | Builder version bumped to `sporevm-rootfs-v6`; cache validation includes the selected writer metadata without hashing writer selection into the cache key. |
+| Guest boot smoke | Done | Native-default OCI smoke built and booted Alpine during the v4/default-flip work with `ext4_writer: native` and guest output `native-rootfs-smoke`; v6 invalidates the cache identity for the chunk-index format break. |
+| Writer benchmark | Done | Post-v5 native/external/tar2ext4 comparison and U4 chunked inline-index import comparison recorded below; optimized native output is e2fsck-clean. |
 
 ## Rollout Gates
 
@@ -140,8 +142,6 @@ Slow rootfs gate:
 
 Before removing the external fallback:
 
-- U4 inline chunk-index emission exists, replacing the post-hoc
-  `rootfs_cas_preload` full-image re-read.
 - Native writer throughput is acceptable on representative large images.
 - The first profile either supports extents/triple-indirect blocks or the
   `UnsupportedExt4FileSize` fallback remains documented and tested.
@@ -198,20 +198,48 @@ inline data. The next ceiling is still sub-second conversion for this size
 class, but getting there means compact layout/extent work rather than more
 rootfs CAS plumbing.
 
-## Next: Inline Chunk Index Emission For U4
+### U4 Inline Chunk Index
 
-The next real storage slice is not more rootfs CAS plumbing. It is extending the
-native writer emission loop so every 64 KiB of logical image bytes also feeds a
-chunk hasher and writes/records the corresponding CAS object for
-`spore-disk-index-v1`.
+Recorded on 2026-07-08 in this worktree with the same 312 MiB flattened
+`buildkite/agent:3` tar, chunked rootfs storage, and:
 
-Keep the current writer loop friendly to that change:
+```bash
+/usr/bin/time -p env \
+  SPOREVM_EXT4_WRITER=native \
+  SPOREVM_ROOTFS_BUILD_PROFILE=1 \
+  SPOREVM_ROOTFS_CACHE_DIR="$PWD/zig-cache/ext4-writer-comparison-inline-chunked/spore-native/cache" \
+  zig-out/bin/spore rootfs import-tar \
+  /Users/lachlan/Develop/sporevm/zig-cache/rootfs-inputs/buildkite-agent-3-linux-arm64.tar \
+  --ref local/ext4-writer-bench:inline-native \
+  --rootfs-storage chunked \
+  --platform linux/arm64
+```
+
+| Writer | Wall | Profile total | Ext4 emit | CAS/index phase | Output size | e2fsck -fn |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `spore (native inline)` | 6.95s | 5.106s | 3.392s | `rootfs_cas_inline` 3.392s | 592 MiB | clean |
+| `spore (external preload)` | 13.58s | 12.417s | 1.098s mkfs/debugfs | `rootfs_cas_preload` 4.870s | 592 MiB | clean |
+
+Native inline emitted 9,472 index chunks: 4,267 zero chunks and 5,205
+nonzero objects, writing 341,114,880 object bytes and a 728,817 byte index.
+The inline CAS/index phase is the same wall interval as `native_ext4_emit`;
+there is no second full-image scan after the native writer finishes. The
+external fallback still pays `rootfs_cas_preload` after e2fsprogs has produced
+the flat image.
+
+## Inline Chunk Index Emission For U4
+
+The U4 storage slice extended the native writer emission loop so every 64 KiB of
+logical image bytes also feeds a chunk hasher and writes/records the
+corresponding CAS object for `spore-disk-index-v1`.
+
+Keep the current writer loop friendly to future writer work:
 
 - Preserve the sequential block walk in `writeImage`.
-- Avoid adding new callers that depend on the current `Result{ blake3, size }`
-  shape as the durable writer API.
+- Avoid adding new callers that depend on the current `Result` shape as the
+  durable writer API.
 - Do not expand `ensureImageRootfsStorage`, storage upgrade, or chunked-to-flat
-  assembly paths; those are deleted by U4.
+  assembly paths; those remain outside the native writer contract.
 
 ## Known Limits
 

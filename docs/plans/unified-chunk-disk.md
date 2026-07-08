@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: active
 last_reviewed: 2026-07-08
 spec_refs:
   - docs/spore-format.md
@@ -8,9 +8,8 @@ spec_refs:
   - SECURITY.md
   - src/spore.zig
   - src/disk_layer.zig
-  - src/cow_disk.zig
   - src/rootfs_cas.zig
-  - src/rootfs_index.zig
+  - src/disk_index.zig
   - src/runtime_disk.zig
   - src/dirty_ram.zig
 related_plans:
@@ -81,7 +80,7 @@ granularities, plus a third identity that belongs to neither:
 | Consumer | resume/restore (`LayeredCowDisk`) | flat-file assembly before boot |
 
 `spore.DiskLayer{ extents: [{logical_cluster, digest}], zero_clusters }` and
-`RootfsBlockIndex{ chunks: [{logical_chunk, digest}], zero_chunks }` are the
+`DiskIndex{ chunks: [{logical_chunk, digest}], zero_chunks }` are the
 same structure with different field names. Each has its own parser (both
 restore-authority, both security surface per `SECURITY.md`), its own object
 namespace, its own validation, its own tests.
@@ -168,7 +167,7 @@ identity = blake3(canonical index bytes)
 ```
 
 This is `rootfs-block-index-v0` renamed and promoted: same validation rules
-(coverage equality, strict ordering, range checks — `validateRootfsBlockIndex`
+(coverage equality, strict ordering, range checks — `validateDiskIndex`
 already enforces them), now the *only* way any disk state is named. A base
 image, a checkpoint, a save snapshot, and "the disk of a running VM at freeze
 point" are all just indexes. Deltas are not format objects: the delta between
@@ -254,17 +253,20 @@ snapshot(disk) -> DiskIndex:
   identity = blake3(new index); persist index; thaw
 ```
 
-O(dirty) by construction. This operation already exists in the tree for RAM:
-`dirty_ram.zig` seals dirty 2MiB memory chunks into verified chunk refs plus
-a same-host backing file, with parallel workers, zero-scan elision,
-write-if-missing dedupe, and phase-level stats. Disk does not get its own
-sealer: U3 extracts the generic core out of `dirty_ram.zig` into a shared
-module (working name `chunk_sealer.zig`) parameterized by chunk size, dirty
-source, and object-write target, with RAM-specific pieces (backing-file
-writes, the HMAC proof) staying in `dirty_ram.zig` as a thin layer over it.
-The disk `snapshot()` and the RAM sealer are then the same loop with
-different parameters, and sealer improvements (parallelism tuning, stats)
-land once for both.
+Target shape is O(dirty) by construction. The current U3 v1 implementation is
+more conservative: `ChunkMappedDisk.snapshotIndex()` scans all logical chunks
+because it does not yet retain the opened parent index identity. This is an
+accepted v1 deviation, not the end-state performance contract. The operation
+already exists in the tree for RAM: `dirty_ram.zig` seals dirty 2MiB memory
+chunks into verified chunk refs plus a same-host backing file, with parallel
+workers, zero-scan elision, write-if-missing dedupe, and phase-level stats.
+Disk does not get its own sealer: U3 extracts the generic core out of
+`dirty_ram.zig` into a shared module (working name `chunk_sealer.zig`)
+parameterized by chunk size, dirty source, and object-write target, with
+RAM-specific pieces (backing-file writes, the HMAC proof) staying in
+`dirty_ram.zig` as a thin layer over it. The disk `snapshot()` and the RAM
+sealer are then the same loop with different parameters, and sealer
+improvements (parallelism tuning, stats) land once for both.
 
 One invariant governs all producers: **an index is only ever written once
 every chunk it references is durable in a store.** "Index exists" always
@@ -371,32 +373,74 @@ requirement and defers with that plan; nothing in U1–U8 needs it.
 
 ### U1 — Unified index type and CAS GC
 
+Status: landed in branch.
+
 Rename/promote `rootfs-block-index-v0` to `spore-disk-index-v1` (one parser,
 shared by all consumers); implement mark-sweep `spore cache gc` over the
 chunk store with roots enumerated from refs/records/manifests.
 
-Done when: GC reclaims orphaned chunks and never a rooted one (property test
-over randomized root sets); both existing consumers (CAS preload, restore
-parsing) use the one parser; fuzz target moved with it.
+Landed behavior: existing chunked-rootfs producers now write
+`spore-disk-index-v1` through `src/disk_index.zig`; restore, bundle, pull, and
+CAS preload all validate through that parser. The parser rejects
+`rootfs-block-index-v0` as too old after the flag-day break, so pre-U1 cache
+entries are abandoned rather than migrated. `spore cache gc` performs a
+dry-run-by-default mark/sweep over rootfs CAS indexes and objects, rooting
+descriptor-selected indexes from cache metadata, ref records, and live runtime
+resume manifests.
+
+Validation: `mise run test` covers index parser/fuzz coverage and a GC model
+test that preserves a rooted index/object pair while deleting an unrooted index,
+its object, and a stray object.
 
 ### U2 — Chunk-mapped runtime backend
+
+Status: landed in branch.
 
 Implement `ChunkMappedDisk`; switch normal `spore run` (currently
 `file`+`CowDisk`) to it. `layered_cow` still exists for old saves during
 this slice only.
 
-Done when: run-path behavior is byte-identical (existing blk and runtime
-tests green against the new backend); read-only and writable runs both served
-by the one backend; unaligned-write read-modify-write property test ported
-from `cow_disk.zig`; no measurable I/O regression on the existing benchmarks.
+Landed behavior: fresh runtime disks now use `src/chunk_mapped_disk.zig`, a
+one-level 64KiB chunk map over the flat materialized base and an optional sparse
+overlay. Manifest-backed writable rootfs runs, layerless saved disks, and direct
+read-only rootfs attachments all enter virtio-blk through the chunk-mapped
+backend. During U2, `LayeredCowDisk` remained only for pre-U3 saved disks; U3
+deleted that legacy parser/backend and replaced layer sealing with
+`snapshotIndex()`.
+
+Validation: `mise run test` covers virtio-blk against the chunk-mapped backend,
+runtime CAS materialization paths through the new backend, read-only write
+rejection, zero-source reads, and the unaligned read-modify-write model ported
+from `cow_disk.zig`.
 
 ### U3 — Snapshot operation and save/restore switch (format break)
+
+Status: complete in branch.
 
 Extract the shared `chunk_sealer.zig` core from `dirty_ram.zig` (RAM path
 refactored onto it, behavior-identical); implement `snapshot()` on that
 core; cut `spore save` to emit index + chunks + v2 manifest; cut
 restore/resume to open indexes. Delete `LayeredCowDisk`, layer chains,
 `spore.DiskLayer`.
+
+Landed behavior: RAM sealing and disk snapshotting share
+`src/chunk_sealer.zig` for zero elision, BLAKE3 chunk identity, and verified
+write-if-missing CAS publication. `ChunkMappedDisk.snapshotIndex()` writes
+nonzero chunks and a `spore-disk-index-v1` under the rootfs CAS namespace and
+returns a `chunk-index-disk-v0` manifest disk. Runtime restore materializes
+`chunk-index-disk-v0` manifests from the saved index and chunk objects before
+attaching virtio-blk; old layer chains are no longer opened by
+`runtime_disk.open`. `LayeredCowDisk`, `loadLayerChain`, disk-layer sealing,
+and the `spore.DiskLayer` parser have been deleted.
+
+Validation: `mise run test` covers the RAM sealer on the shared core, direct
+disk snapshot index/object emission, and runtime restore of a chunk-index disk
+manifest preserving guest-visible bytes.
+
+Follow-up: `snapshotIndex()` can now be tightened to O(dirty) by retaining the
+opened parent index identity in `ChunkMappedDisk`; that optimization is tracked
+with the fork/partial-materialization work rather than blocking the format
+switch.
 
 Done when: save→restore round trip preserves guest-visible disk state
 (existing lifecycle tests, rewritten for v2); the RAM sealer's existing
@@ -408,9 +452,27 @@ break.
 
 ### U4 — Identity flag-day
 
+Status: landed in branch for the existing rootfs build/import and image-save
+paths. The code path now uses rootfs storage index identity for build/import
+metadata, rootfs artifacts with `rootfs.storage`, by-digest flat
+materialization cache keys, and CLI/API rootfs output. `rootfs_blake3`,
+`ensureImageRootfsStorage`, the flat metadata upgrade path, and the native
+writer's unused flat-image digest have been removed from the rootfs build path.
+
 `H(index)` everywhere: import produces indexes (native writer inline or
 full-scan fallback), by-digest cache re-keys, refs/metadata carry index
 identity, `rootfs_blake3` and `ensureImageRootfsStorage` deleted.
+
+Landed behavior: the native ext4 writer now streams emitted bytes through an
+inline rootfs CAS/index writer for chunked storage. It writes missing nonzero
+64 KiB objects durably, records zero chunks without materializing them, and
+publishes the rootfs `spore-disk-index-v1` after objects are durable. The
+external writer keeps the full-scan `rootfs_cas_preload` fallback.
+
+Validation: `src/rootfs/ext4_writer.zig` compares the inline-maintained
+`H(index)` with a materialized file rescanned by `rootfs_cas.preloadPath`.
+`docs/plans/native-ext4-writer.md` records the large-tar import benchmark
+against the external preload baseline.
 
 Done when: import → run → save → restore works end to end on index identity
 with no linear full-image hash anywhere; uncached import of a large
@@ -422,6 +484,8 @@ test proves `H(index)` of a materialized-then-rescanned file matches the
 maintained value.
 
 ### U5 — Memory index parity (format break, batched with U3/U4's)
+
+Status: complete in branch.
 
 Converge `MemoryManifest` onto the unified index type: the dense
 optional-ref array becomes a `spore-disk-index-v1`-shaped value (sparse
@@ -445,11 +509,25 @@ structure with two instantiations (RAM 2MiB, disk 64KiB).
 
 ### U6 — Fork
 
+Status: landed in branch for the disk backend.
+
 Implement ephemeral `fork` on `ChunkMappedDisk` (map copy + overlay reflink
-per the Design section), with the snapshot-then-open fallback for hosts
-without reflink. Durable child creation needs no new code — it is
+per the Design section), with a plain dirty-chunk overlay-copy fallback for
+hosts without reflink. Durable child creation needs no new code — it is
 `snapshot()` + open, which exists after U3. Expose `fork` wherever the
 VM-level fork operation lands; this slice owns only the disk side.
+
+Landed behavior: writable `ChunkMappedDisk` instances can now create a
+`ForkedDisk` by copying the in-memory chunk-source map and giving the child an
+unlinked temp overlay cloned from the parent's overlay. Linux hosts attempt
+`FICLONE`; other hosts or explicit `force_copy` use a plain dirty-chunk copy
+fallback. The primitive asserts its caller has quiesced the VM and has no
+in-flight virtio-blk requests before cloning mutable disk state. Read-only
+disks reject `fork`, and durable child creation remains `snapshot()` + open.
+
+Validation: `mise run test` covers read-only rejection, forced-copy fallback,
+parent/child divergence, and a 32-deep sequential fork chain that keeps the
+chunk map flat and avoids parent contamination.
 
 Done when: fork of a running writable disk completes in O(map copy) —
 target <100ms for an 8G disk regardless of dirty volume on a reflink-capable
@@ -460,9 +538,30 @@ no-reflink fallback path is exercised in tests.
 
 ### U7 — Partial materialization
 
+Status: landed in branch for local CAS fault-in.
+
 Add the `.cas` map source, fault-in path, background filler, and
 boot-critical chunk ordering (fault-trace a reference boot to derive the
 priority set).
+
+Landed behavior: chunk-index disks and chunked rootfs caches can now open over
+a sparse temporary base fd without assembling the full flat image first. The
+chunk map marks nonzero index entries as `.cas`; the first read of a CAS chunk
+opens the local object, verifies it against the descriptor-selected BLAKE3
+digest, writes it into the sparse base, and promotes that map entry to `.base`.
+Missing or corrupt objects fail the read before bytes reach the guest. Warm
+flat-cache opens still use the existing read-only materialization path.
+
+Decision: a concurrent background filler and boot-critical priority list are
+deferred until fault traces show they are needed. Adding a filler now would
+require synchronization around the hot chunk map and would reintroduce eager
+whole-image work in another form. The guest's actual read stream provides the
+correct initial ordering for this slice.
+
+Validation: `mise exec -- zig test src/runtime_disk.zig` covers lazy rootfs
+open without publishing a flat cache, wrong-sized flat-cache fallback, CAS
+promotion after the first read, read-time missing-object failure, and
+chunk-index disk restore over the lazy backend.
 
 Done when: cold boot of a large reference image starts the guest before
 full materialization and completes correctly under random read access
@@ -473,19 +572,29 @@ working set, not image size).
 
 ### U8 — Cleanup and docs
 
+Status: landed in branch.
+
 Remove transitional shims, update `docs/rootfs.md`/`docs/filesystem.md`
 architecture sections, SECURITY.md parser inventory (net reduction: three
 index parsers → one), release notes covering the format break and the new
 boot/fork behavior.
 
+Landed behavior: the unused public `CowDisk` backend and virtio-blk `.cow`
+backend arm are gone; writable COW behavior now lives only inside
+`ChunkMappedDisk`. Durable filesystem, rootfs, state-portability, security, and
+release-note docs describe disk indexes, lazy CAS fault-in, the format break,
+and the fork/runtime behavior.
+
+Validation: `mise run test` and `mise run build`.
+
 ## Security
 
-- Net parser reduction: `DiskLayer` and `RootfsBlockIndex` parsing collapse
-  into one hardened, fuzzed index parser. Restore-authority surface shrinks.
+- Net parser reduction: the `DiskLayer` parser is deleted, and writable disks
+  now use the hardened `DiskIndex` parser. Restore-authority surface shrinks.
 - The chunk map is host-internal state derived from validated values; the
   virtio-blk request parsing is untouched (frozen device model).
 - CAS objects remain verify-at-write, trust-at-open; index digests bind
-  coverage and size exactly as `validateRootfsBlockIndex` does today.
+  coverage and size exactly as `validateDiskIndex` does today.
 - GC is a new destructive operation: it must be root-conservative (unknown
   record kinds are roots, not garbage) and tested against concurrent-ish
   root creation (lock protocol test).

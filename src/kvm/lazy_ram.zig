@@ -43,6 +43,7 @@ pub const Pager = struct {
 
     pub fn start(options: Options) !Pager {
         try validateMapping(options.ram);
+        const plan = try spore.validateMemoryForRam(options.manifest, options.ram.len);
 
         const uffd = try openUserfaultfd();
         errdefer closeFd(uffd);
@@ -72,7 +73,7 @@ pub const Pager = struct {
         };
 
         const thread = try std.Thread.spawn(.{}, faultThread, .{context});
-        std.log.info("kvm lazy RAM pager registered: bytes={d} chunks={d}", .{ options.ram.len, options.manifest.chunks.len });
+        std.log.info("kvm lazy RAM pager registered: bytes={d} chunks={d}", .{ options.ram.len, plan.chunk_count });
         return .{ .context = context, .thread = thread };
     }
 
@@ -256,7 +257,7 @@ fn writeTrace(context: *Context, index: usize, range: spore.MemoryChunkRange, le
     const fd = context.trace_fd orelse return;
     const now = monotonicMs() catch context.start_ms;
     const fault_ms = if (now >= context.start_ms) now - context.start_ms else 0;
-    const nonzero: u1 = if (context.manifest.chunks[index] == null) 0 else 1;
+    const nonzero: u1 = if (spore.memoryChunkDigestForIndex(context.manifest, index) == null) 0 else 1;
     var buf: [192]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "fault_ms={d} chunk_index={d} guest_offset={d} len={d} nonzero={d}\n", .{
         fault_ms,
@@ -291,9 +292,13 @@ fn failPager(context: *Context, comptime fmt: []const u8, args: anytype) void {
 }
 
 test "fault address maps to memory chunk range" {
-    var refs = [_]?[]const u8{null} ** 3;
-    const manifest = spore.MemoryManifest{ .chunk_size = spore.chunk_size, .chunks = &refs };
-    const ram_len = refs.len * spore.chunk_size;
+    const zero_chunks = [_]u64{ 0, 1, 2 };
+    const manifest = spore.MemoryManifest{
+        .logical_size = zero_chunks.len * spore.chunk_size,
+        .chunk_size = spore.chunk_size,
+        .zero_chunks = &zero_chunks,
+    };
+    const ram_len = zero_chunks.len * spore.chunk_size;
     const range = try spore.memoryChunkRange(manifest, ram_len, 2);
     try std.testing.expectEqual(@as(usize, 2 * spore.chunk_size), range.start);
     try std.testing.expectEqual(@as(usize, 3 * spore.chunk_size), range.end);

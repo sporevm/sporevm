@@ -1,6 +1,6 @@
 # Spore State Portability Contract
 
-**Status:** current implementation for manifest format v0, plus manifest-v1
+**Status:** current implementation for manifest format v2, plus manifest-v3
 capture/restore for multi-vCPU state on KVM and same-backend HVF. This document
 records what SporeVM can capture, map, translate, and reject when restoring an
 aarch64 spore across the KVM and Hypervisor.framework backends.
@@ -15,14 +15,14 @@ failed runs and keep backend-private state out of the spore contract.
 
 ## Scope
 
-Manifest-format-v0 portability is deliberately narrow:
+Manifest-format-v2 portability is deliberately narrow:
 
 - Guest ISA: aarch64 only.
 - vCPU topology: one vCPU.
 - Backends: Linux KVM and Apple Hypervisor.framework.
 - Device model: the frozen SporeVM board contract — virtio-mmio console,
   optional blk, net, vsock, rng, and the generation MMIO device. Transient
-  grow-only virtio-mem for fresh managed auto runs is outside manifest v0;
+  grow-only virtio-mem for fresh managed auto runs is outside manifest v2;
   capture/resume paths disable it rather than serializing hotplug state.
 - Memory: portable restore is chunk-authoritative. Product same-host restore may
   use local proof-backed `ram.backing`, but that is acceleration metadata, not a
@@ -30,14 +30,14 @@ Manifest-format-v0 portability is deliberately narrow:
 - Disk: a captured `spore run --image` workload may reference one verified
   immutable ext4 rootfs artifact and, for image-created spores, manifest-bound
   chunked rootfs storage. It may also reference an optional sealed writable
-  rootfs-bound COW layer chain. Bundles can carry rootfs CAS bytes, exact
-  rootfs artifacts, layer indexes, and disk objects. General block devices are
+  rootfs-bound disk index. Bundles can carry rootfs CAS bytes, exact
+  rootfs artifacts, disk indexes, and disk chunk objects. General block devices are
   still outside the portable contract.
 
 Cross-ISA restore, portable HVF multi-vCPU GIC production, persisted access
 traces, general volumes, and broader disk/device fixups are later slices.
 
-Manifest format v1 is now reserved for multi-vCPU machine state. It records a
+Manifest format v3 is reserved for multi-vCPU machine state. It records a
 bounded `vcpu_count`, per-vCPU normalized aarch64 state keyed by stable
 `index`/`mpidr`, and either portable `gicv3_multi` state with global
 distributor, per-MPIDR redistributors, and owner-tagged PPI line levels, or a
@@ -87,15 +87,15 @@ block identical-host fork/fan-out.
 | GIC redistributor/register state | GICv3 MMIO offsets | yes | yes | no | partial apply | producer gap on HVF |
 | GIC line levels | INTID plus asserted bit | PPI/SPI | yes | no | SPI only; asserted PPI rejected | asymmetric |
 | GIC CPU interface | ICC register names and values | yes | yes | yes | yes | portable |
-| Multi-vCPU machine state | manifest v1 per-vCPU arrays plus `gicv3_multi` or HVF-private GIC | yes | yes | same-HVF only | same-HVF only | HVF not portable |
+| Multi-vCPU machine state | manifest v3 per-vCPU arrays plus `gicv3_multi` or HVF-private GIC | yes | yes | same-HVF only | same-HVF only | HVF not portable |
 | HVF GIC blob | tagged `backend_private` escape hatch | no | reject | same-HVF only | same-HVF only | not portable |
 | Virtio-mmio transport | device ID, feature selectors, negotiated features, status, interrupt status, queue addresses/indices | yes | yes | yes | yes | portable |
 | Virtqueue descriptors and buffers | guest RAM | yes | yes | yes | yes | portable through RAM |
 | Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; fork path populates it |
-| Immutable rootfs base | optional exact artifact plus optional `chunked-ext4-rootfs-v0` storage descriptor | yes via `spore run --image` | trusted flat-artifact open; chunks assemble the artifact when missing | yes via `spore run --image` | trusted flat-artifact open; chunks assemble the artifact when missing | product resume base; cache contract is verify-at-install, trust-at-open |
-| Writable root disk layers | optional `cow-block-v0` chain over the effective immutable rootfs base | yes for local layer store | verifies layer indexes and disk objects | yes for local layer store | verifies layer indexes and disk objects | product resume; bundle materialization unit-covered |
+| Immutable rootfs base | optional exact artifact plus optional `chunked-ext4-rootfs-v0` storage descriptor | yes via `spore run --image` | trusted flat-artifact open; chunks fault in from CAS when the flat cache is missing | yes via `spore run --image` | trusted flat-artifact open; chunks fault in from CAS when the flat cache is missing | product resume base; cache contract is verify-at-install, trust-at-open |
+| Writable root disk index | optional `chunk-index-disk-v0` over the effective immutable rootfs base | yes for local CAS store | verifies disk index and chunk objects | yes for local CAS store | verifies disk index and chunk objects | product resume; bundle materialization unit-covered |
 | Network capability and policy | optional `spore-net-v0` plus allow CIDRs/hosts, exact host-port rules, and bound-service requirements; no live flows, host socket material, or host port forwards | yes | fresh gateway | yes | fresh gateway | policy portable; flows and port forwards dropped; bound services fail closed unless restored |
-| Transient virtio-mem hotplug | not represented | fresh managed run only | n/a | fresh managed run only | n/a | outside manifest v0 |
+| Transient virtio-mem hotplug | not represented | fresh managed run only | n/a | fresh managed run only | n/a | outside manifest v2 |
 | General writable disk contents | not represented | no | reject | no | reject | out of current format |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
 | Access trace | not yet represented | no | no | no | no | local KVM/HVF lazy traces only; not a portability contract |
@@ -132,7 +132,7 @@ The value is guest-visible but chosen by the board/backend contract rather than
 by the suspended workload.
 
 - `mpidr_el1` is captured for inspection but skipped on apply. The board owns
-  CPU identity: manifest v0 is single-vCPU, and manifest v1 validates stable
+  CPU identity: manifest v2 is single-vCPU, and manifest v3 validates stable
   `index`/`mpidr` topology while each backend sets MPIDR during vCPU bring-up.
 - GIC base addresses are not translated. They are platform fields and must
   match because the guest has already observed and mapped them.
@@ -142,7 +142,7 @@ by the suspended workload.
 The value is controlled by the CPU profile at guest creation, not by saving raw
 backend feature registers.
 
-- ID registers such as `ID_AA64*` are not serialized in manifest v0.
+- ID registers such as `ID_AA64*` are not serialized in manifest v2.
 - KVM masks `ID_AA64ISAR0_EL1.RNDR` so Linux does not patch in RNDR/RNDRRS
   instructions unavailable on Apple Hypervisor.framework guests.
 - Restore checks `cpu_profile` instead of trying to reconcile raw host feature
@@ -168,17 +168,17 @@ escape hatch.
 - HVF same-host/same-backend GIC restore may use `backend_private` with
   `backend: "hvf"` and `format: "hv_gic_state_v0"`.
 - Other backends must reject it.
-- Portable cross-backend restore must use `kind: "gicv3"` for manifest v0 or
-  `kind: "gicv3_multi"` for manifest v1.
-- Manifest v1 also accepts tagged HVF `backend_private` GIC state for
+- Portable cross-backend restore must use `kind: "gicv3"` for manifest v2 or
+  `kind: "gicv3_multi"` for manifest v3.
+- Manifest v3 also accepts tagged HVF `backend_private` GIC state for
   same-HVF multi-vCPU restore; other backends must reject it.
 
 ### Outside the spore
 
-These are intentionally not captured in manifest v0:
+These are intentionally not captured in manifest v2:
 
-- General disk contents and external host files. Rootfs-bound `cow-block-v0`
-  layers are captured as described above.
+- General disk contents and external host files. Rootfs-bound
+  `chunk-index-disk-v0` indexes are captured as described above.
 - Network connections and host-side sockets.
 - Transient virtio-mem plug state and guest hotplug policy.
 - Host paths, credentials, secrets, and runtime policy.
@@ -192,7 +192,7 @@ format. The manifest form is architectural: distributor and redistributor MMIO
 offsets plus ICC register names. Backend handles, object references, and raw
 kernel/HVF structs must not cross the format boundary.
 
-For manifest v1, `gicv3_multi` keeps distributor state global, stores one
+For manifest v3, `gicv3_multi` keeps distributor state global, stores one
 redistributor register set per MPIDR, and requires per-vCPU PPIs to name their
 owning MPIDR. SPIs remain global and must not name an owner.
 
@@ -230,8 +230,8 @@ Current HVF gaps:
 
 | Direction | Current status | Gate before declaring green |
 | --- | --- | --- |
-| KVM→KVM | Manifest v0 passes same-host smoke on the `m7g.metal` KVM host. Manifest v1 multi-vCPU capture, `run --from`, and `resume` pass on the `sporevm-ops` ARM64 KVM CI host. | Keep v0 and v1 as regression coverage. |
-| HVF→HVF | Passes same-host v0 smoke locally, including HVF lazy RAM and file-backed fork smokes. Manifest v1 multi-vCPU same-backend capture, `run --from`, and `resume` pass on Apple Silicon with private GIC state. | Keep v0 and v1 as regression coverage. |
+| KVM→KVM | Manifest v2 passes same-host smoke on the `m7g.metal` KVM host. Manifest v3 multi-vCPU capture, `run --from`, and `resume` pass on the `sporevm-ops` ARM64 KVM CI host. | Keep v2 and v3 as regression coverage. |
+| HVF→HVF | Passes same-host v2 smoke locally, including HVF lazy RAM and file-backed fork smokes. Manifest v3 multi-vCPU same-backend capture, `run --from`, and `resume` pass on Apple Silicon with private GIC state. | Keep v2 and v3 as regression coverage. |
 | KVM→HVF | Portable vCPU, virtio, generation, GIC apply, and CPU profile machinery exist. `m7g.metal` and `a1.metal` spores fail closed on counter-frequency mismatch. | Need a KVM producer whose guest counter frequency matches HVF's 24MHz, or a designed cross-frequency timer contract. |
 | HVF→KVM | Blocked because HVF still produces backend-private GIC state. Timer compatibility still applies. | Make HVF produce portable GICv3 state, then run with compatible counter frequency. |
 
@@ -252,8 +252,8 @@ Current hard failures include:
 - unsupported portable GIC state that is not explicitly documented as a safe
   zero/reset skip;
 - counter-frequency mismatch;
-- missing rootfs cache bytes, missing disk layer objects, corrupt disk objects,
-  or general disk devices outside the rootfs-bound COW contract.
+- missing rootfs cache bytes, missing disk index or chunk objects,
+  or general disk devices outside the rootfs-bound disk-index contract.
 
 ## Smoke contract
 
@@ -270,8 +270,8 @@ Current evidence:
 - Product smokes cover same-host diskless capture/resume, diskless fork/fan-out,
   and OCI-rootfs child execution through `mise run smoke`,
   `mise run smoke:counter-fanout`, and `mise run smoke:rootfs-fanout`.
-- Local writable rootfs layer persistence, fork divergence, and local
-  bundle-carried disk layer replay are covered by `mise run smoke:writable-rootfs`.
+- Local writable rootfs persistence, fork divergence, and local
+  bundle-carried disk index replay are covered by `mise run smoke:writable-rootfs`.
 - Same-class KVM writable-rootfs bundle materialization previously passed with
   `test/remote/bundle.sh --writable-rootfs` on two `a1.metal` hosts
   in run `writable-rootfs-20260619T212758Z`. The repo keeps

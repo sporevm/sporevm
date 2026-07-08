@@ -610,7 +610,7 @@ fn testDiskGuardManifest(devices: []spore.TransportState, with_disk: bool) spore
             .cpu_profile = "test",
             .device_model_version = 1,
             .ram_base = 0x8000_0000,
-            .ram_size = 0,
+            .ram_size = 4096,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
             .counter_frequency_hz = 24_000_000,
@@ -648,7 +648,7 @@ fn testDiskGuardManifest(devices: []spore.TransportState, with_disk: bool) spore
             .size = 4096,
             .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         } else null,
-        .memory = .{ .chunk_size = spore.chunk_size, .chunks = &.{} },
+        .memory = .{ .logical_size = 4096, .chunk_size = spore.chunk_size, .zero_chunks = &.{0} },
     };
 }
 

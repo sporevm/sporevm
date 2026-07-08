@@ -6,8 +6,7 @@
 
 const std = @import("std");
 const block_source = @import("../block_source.zig");
-const cow_disk = @import("../cow_disk.zig");
-const disk_layer = @import("../disk_layer.zig");
+const chunk_mapped_disk = @import("../chunk_mapped_disk.zig");
 const guestmem = @import("../guestmem.zig");
 const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
@@ -28,10 +27,8 @@ pub const Backend = union(enum) {
     /// Host file descriptor. Read-only fds are valid for immutable rootfs
     /// attachments; guest write requests then return an I/O error.
     file: std.c.fd_t,
-    /// Immutable base plus local sparse writable head.
-    cow: *cow_disk.CowDisk,
-    /// Immutable base plus sealed layers plus local sparse writable head.
-    layered_cow: *disk_layer.LayeredCowDisk,
+    /// One-level chunk map over a flat base and optional sparse writable head.
+    chunk_mapped: *chunk_mapped_disk.ChunkMappedDisk,
     /// In-memory disk, used by tests.
     memory: []u8,
 
@@ -40,8 +37,7 @@ pub const Backend = union(enum) {
             .file => |fd| {
                 return seekFileSize(fd) orelse 0;
             },
-            .cow => |disk| return disk.capacityBytes(),
-            .layered_cow => |disk| return disk.capacityBytes(),
+            .chunk_mapped => |disk| return disk.capacityBytes(),
             .memory => |m| return m.len,
         }
     }
@@ -57,11 +53,7 @@ pub const Backend = union(enum) {
                 }
                 return true;
             },
-            .cow => |disk| {
-                disk.readAt(buf, offset) catch return false;
-                return true;
-            },
-            .layered_cow => |disk| {
+            .chunk_mapped => |disk| {
                 disk.readAt(buf, offset) catch return false;
                 return true;
             },
@@ -84,11 +76,7 @@ pub const Backend = union(enum) {
                 }
                 return true;
             },
-            .cow => |disk| {
-                disk.writeAt(buf, offset) catch return false;
-                return true;
-            },
-            .layered_cow => |disk| {
+            .chunk_mapped => |disk| {
                 disk.writeAt(buf, offset) catch return false;
                 return true;
             },
@@ -103,11 +91,7 @@ pub const Backend = union(enum) {
     fn flush(self: Backend) bool {
         switch (self) {
             .file => |fd| return std.c.fsync(fd) == 0,
-            .cow => |disk| {
-                disk.flush() catch return false;
-                return true;
-            },
-            .layered_cow => |disk| {
+            .chunk_mapped => |disk| {
                 disk.flush() catch return false;
                 return true;
             },
@@ -319,7 +303,7 @@ test "write request persists and out-of-range is io error" {
     try std.testing.expectEqual(status_ioerr, status[0]);
 }
 
-test "cow backend serves dirty writes without mutating base" {
+test "chunk mapped backend serves dirty writes without mutating base" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -333,9 +317,9 @@ test "cow backend serves dirty writes without mutating base" {
     try base.writeStreamingAll(io, &base_bytes);
 
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
-    var cow = try cow_disk.CowDisk.init(std.testing.allocator, base_source, overlay.handle, base_bytes.len, sector_size);
-    defer cow.deinit();
-    var blk = Blk.init(.{ .cow = &cow });
+    var disk = try chunk_mapped_disk.ChunkMappedDisk.initWritable(std.testing.allocator, base_source, overlay.handle, base_bytes.len, sector_size);
+    defer disk.deinit();
+    var blk = Blk.init(.{ .chunk_mapped = &disk });
 
     var header: [16]u8 = [_]u8{0} ** 16;
     std.mem.writeInt(u32, header[0..4], req_out, .little);
@@ -364,7 +348,7 @@ test "cow backend serves dirty writes without mutating base" {
     try std.testing.expectEqual(@as(u32, sector_size + 1), written);
     try std.testing.expectEqual(status_ok, status[0]);
     try std.testing.expectEqualSlices(u8, &write_data, &read_data);
-    try std.testing.expectEqual(@as(usize, 1), cow.dirtyClusterCount());
+    try std.testing.expectEqual(@as(usize, 1), disk.dirtyClusterCount());
 
     var base_check: [sector_size]u8 = undefined;
     const read = try base.readPositionalAll(io, &base_check, sector_size);

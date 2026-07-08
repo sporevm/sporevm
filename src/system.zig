@@ -3,10 +3,17 @@
 const std = @import("std");
 const Io = std.Io;
 
+const chunk = @import("chunk.zig");
+const disk_index = @import("disk_index.zig");
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
+const rootfs = @import("rootfs.zig");
+const rootfs_cas = @import("rootfs_cas.zig");
+const spore = @import("spore.zig");
 const default_prune_max_bytes = 0;
 const max_runtime_spec_bytes = 64 * 1024;
+const max_rootfs_metadata_bytes = 1024 * 1024;
+const max_root_record_bytes = 1024 * 1024;
 
 const usage =
     \\Usage:
@@ -26,6 +33,18 @@ const usage =
     \\Defaults:
     \\  prune selects all default-prunable rootfs entries when no age or size limit is set
     \\  unreferenced runtime fork batches are selected only when --older-than is set
+    \\
+;
+
+const cache_usage =
+    \\Usage:
+    \\  spore cache gc [--rootfs] [--dry-run|--force]
+    \\
+    \\Options:
+    \\  --rootfs    Collect only the rootfs CAS cache (currently the only CAS scope)
+    \\  --dry-run   Report garbage without deleting it (default)
+    \\  --force     Delete unrooted CAS indexes and chunk objects
+    \\  -h, --help  Show this help
     \\
 ;
 
@@ -95,6 +114,35 @@ pub const RootfsPruneResult = struct {
     runtime_forks: ?RuntimeForkPruneResult = null,
 };
 
+pub const RootfsGcEntry = struct {
+    kind: []const u8,
+    path: []const u8,
+    bytes: u64,
+};
+
+pub const RootfsGcResult = struct {
+    cache_root: []const u8,
+    dry_run: bool,
+    rooted_indexes: usize = 0,
+    rooted_objects: usize = 0,
+    unparseable_metadata_count: usize = 0,
+    unparseable_ref_count: usize = 0,
+    candidate_count: usize = 0,
+    candidate_bytes: u64 = 0,
+    deleted_count: usize = 0,
+    deleted_bytes: u64 = 0,
+    entries: []const RootfsGcEntry = &.{},
+};
+
+const GcConservativeRootStats = struct {
+    metadata_count: usize = 0,
+    ref_count: usize = 0,
+
+    fn any(self: GcConservativeRootStats) bool {
+        return self.metadata_count != 0 or self.ref_count != 0;
+    }
+};
+
 pub const RuntimeForkPruneEntry = struct {
     path: []const u8,
     bytes: u64,
@@ -125,6 +173,12 @@ pub const PruneOptions = struct {
     older_than_seconds: ?u64 = null,
     max_bytes: ?u64 = null,
     rootfs_only: bool = false,
+};
+
+pub const GcOptions = struct {
+    cache_root: []const u8,
+    runtime_root: ?[]const u8 = null,
+    dry_run: bool = true,
 };
 
 const PrunePlanOptions = struct {
@@ -167,6 +221,22 @@ const RuntimeVmSpecRef = struct {
     resume_dir: ?[]const u8 = null,
 };
 
+const RootfsStorageRoot = struct {
+    rootfs_storage: ?spore.RootfsStorage = null,
+};
+
+const ManifestRoot = struct {
+    rootfs: ?ManifestRootfs = null,
+};
+
+const ManifestRootfs = struct {
+    storage: ?spore.RootfsStorage = null,
+};
+
+const ImageRefRoot = struct {
+    rootfs_cache_key: ?[]const u8 = null,
+};
+
 pub fn df(allocator: std.mem.Allocator, io: Io, options: DfOptions) !RootfsSystemSummary {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -201,6 +271,19 @@ pub fn prune(
     return ownRootfsPruneResult(allocator, result);
 }
 
+pub fn gc(
+    allocator: std.mem.Allocator,
+    io: Io,
+    options: GcOptions,
+) !RootfsGcResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const result = try gcRootfsCache(arena, io, options);
+    return ownRootfsGcResult(allocator, result);
+}
+
 pub fn deinitRootfsPruneResult(allocator: std.mem.Allocator, result: RootfsPruneResult) void {
     allocator.free(result.cache_root);
     for (result.entries) |entry| {
@@ -211,6 +294,14 @@ pub fn deinitRootfsPruneResult(allocator: std.mem.Allocator, result: RootfsPrune
     if (result.runtime_forks) |runtime_forks| {
         deinitRuntimeForkPruneResult(allocator, runtime_forks);
     }
+}
+
+pub fn deinitRootfsGcResult(allocator: std.mem.Allocator, result: RootfsGcResult) void {
+    allocator.free(result.cache_root);
+    for (result.entries) |entry| {
+        allocator.free(entry.path);
+    }
+    allocator.free(result.entries);
 }
 
 pub fn run(
@@ -245,6 +336,34 @@ pub fn run(
 
     const message = allocMessage(init.arena.allocator(), "unknown system command: {s}", .{args[0]});
     exitWithCliError(init.arena.allocator(), stderr, mode, machine_output.usageInvalidArgument(message, "system"), messageWithUsage(init.arena.allocator(), message));
+}
+
+pub fn cacheRun(
+    init: std.process.Init,
+    args: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) !void {
+    if (args.len == 0 or wantsHelp(args[0])) {
+        if (mode == .json and args.len == 0) {
+            exitWithCliError(
+                init.arena.allocator(),
+                stderr,
+                mode,
+                machine_output.usageMissingArgument("usage: spore cache <gc>", "cache"),
+                "usage: spore cache <gc>",
+            );
+        }
+        try stdout.writeAll(cache_usage);
+        return;
+    }
+    if (std.mem.eql(u8, args[0], "gc")) {
+        try cacheGcCli(init, args[1..], stdout, stderr, mode);
+        return;
+    }
+    const message = allocMessage(init.arena.allocator(), "unknown cache command: {s}", .{args[0]});
+    exitWithCliError(init.arena.allocator(), stderr, mode, machine_output.usageInvalidArgument(message, "cache"), messageWithCacheUsage(init.arena.allocator(), message));
 }
 
 fn dfCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
@@ -369,12 +488,71 @@ fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
     }
 }
 
+fn cacheGcCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
+    var dry_run = true;
+
+    for (args) |arg| {
+        if (wantsHelp(arg)) {
+            if (mode == .json) {
+                exitWithCliError(
+                    init.arena.allocator(),
+                    stderr,
+                    mode,
+                    machine_output.usageInvalidArgument("spore --json cache gc does not support help output", "cache gc"),
+                    "spore --json cache gc does not support help output",
+                );
+            }
+            try stdout.writeAll(cache_usage);
+            return;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            exitLocalJsonUnsupported(init.arena.allocator(), stderr, mode, "cache gc");
+        } else if (std.mem.eql(u8, arg, "--rootfs")) {
+            // The rootfs CAS is the only cache scope in U1.
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            dry_run = false;
+        } else {
+            exitUnknownArgument(init.arena.allocator(), stderr, mode, "cache gc", arg);
+        }
+    }
+
+    const allocator = init.arena.allocator();
+    const cache_root = local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
+        error.MissingHome => {
+            exitWithCliError(
+                allocator,
+                stderr,
+                mode,
+                machine_output.CliError.init(.cache_unavailable, "cannot resolve rootfs cache directory; set SPOREVM_ROOTFS_CACHE_DIR or HOME", "MissingHome"),
+                "spore cache gc: cannot resolve rootfs cache directory; set SPOREVM_ROOTFS_CACHE_DIR or HOME",
+            );
+        },
+        else => |e| return e,
+    };
+    const runtime_root = local_paths.runtimeRootPath(allocator, init.environ_map) catch null;
+    const result = try gc(allocator, init.io, .{
+        .cache_root = cache_root,
+        .runtime_root = runtime_root,
+        .dry_run = dry_run,
+    });
+    if (mode == .json) {
+        try machine_output.writeJson(allocator, stdout, result);
+    } else {
+        try writeRootfsGcResult(stdout, result);
+    }
+}
+
 fn allocMessage(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(allocator, fmt, args) catch "CLI argument error";
 }
 
 fn messageWithUsage(allocator: std.mem.Allocator, message: []const u8) []const u8 {
     return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ message, usage }) catch message;
+}
+
+fn messageWithCacheUsage(allocator: std.mem.Allocator, message: []const u8) []const u8 {
+    return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ message, cache_usage }) catch message;
 }
 
 fn exitWithCliError(
@@ -495,6 +673,27 @@ fn ownRootfsPruneResult(allocator: std.mem.Allocator, result: RootfsPruneResult)
         out.runtime_forks = try ownRuntimeForkPruneResult(allocator, runtime_forks);
         runtime_owned = true;
     }
+    return out;
+}
+
+fn ownRootfsGcResult(allocator: std.mem.Allocator, result: RootfsGcResult) !RootfsGcResult {
+    var out = result;
+    out.cache_root = try allocator.dupe(u8, result.cache_root);
+    errdefer allocator.free(out.cache_root);
+
+    const entries = try allocator.alloc(RootfsGcEntry, result.entries.len);
+    var owned_entry_count: usize = 0;
+    errdefer {
+        for (entries[0..owned_entry_count]) |entry| allocator.free(entry.path);
+        allocator.free(entries);
+    }
+    for (entries, result.entries) |*dest, source| {
+        dest.* = source;
+        dest.path = "";
+        dest.path = try allocator.dupe(u8, source.path);
+        owned_entry_count += 1;
+    }
+    out.entries = entries;
     return out;
 }
 
@@ -659,6 +858,330 @@ fn pruneRootfsCache(
         .deleted_reclaimable_bytes = deleted_reclaimable_bytes,
         .entries = entries,
     };
+}
+
+fn gcRootfsCache(
+    allocator: std.mem.Allocator,
+    io: Io,
+    options: GcOptions,
+) !RootfsGcResult {
+    var cache_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, options.cache_root);
+    defer cache_lock.deinit();
+
+    var storage_roots = std.StringHashMap(spore.RootfsStorage).init(allocator);
+    var rooted_indexes = std.StringHashMap(void).init(allocator);
+    var rooted_objects = std.StringHashMap(void).init(allocator);
+    var conservative_roots = GcConservativeRootStats{};
+
+    try collectRootfsStorageRoots(allocator, io, options.cache_root, options.runtime_root, &storage_roots, &conservative_roots);
+    if (conservative_roots.any()) {
+        try markAllGcCasEntriesRooted(allocator, io, options.cache_root, "cas/rootfs/blake3/indexes", ".json", &rooted_indexes);
+        try markAllGcCasEntriesRooted(allocator, io, options.cache_root, "cas/rootfs/blake3/objects", ".chunk", &rooted_objects);
+    } else {
+        var storage_it = storage_roots.iterator();
+        while (storage_it.next()) |entry| {
+            const storage = entry.value_ptr.*;
+            try rooted_indexes.put(storage.index_digest, {});
+            const index_path = try rootfs_cas.manifestIndexPath(allocator, options.cache_root, storage.index_digest);
+            const bytes = Io.Dir.cwd().readFileAlloc(io, index_path, allocator, .limited(disk_index.max_index_bytes)) catch |err| switch (err) {
+                error.FileNotFound, error.StreamTooLong => return error.BadManifest,
+                else => |e| return e,
+            };
+            const descriptor = spore.diskIndexDescriptorForStorage(storage) catch return error.BadManifest;
+            const parsed = disk_index.parseDiskIndex(allocator, bytes, descriptor) catch return error.BadManifest;
+            for (parsed.value.chunks) |chunk_entry| {
+                try rooted_objects.put(chunk_entry.digest, {});
+            }
+        }
+    }
+
+    var result_entries = std.array_list.Managed(RootfsGcEntry).init(allocator);
+    var candidate_bytes: u64 = 0;
+    var deleted_count: usize = 0;
+    var deleted_bytes: u64 = 0;
+
+    try collectGcCasEntries(
+        allocator,
+        io,
+        options.cache_root,
+        "cas/rootfs/blake3/indexes",
+        ".json",
+        "rootfs-cas-index",
+        &rooted_indexes,
+        options.dry_run,
+        &result_entries,
+        &candidate_bytes,
+        &deleted_count,
+        &deleted_bytes,
+    );
+    try collectGcCasEntries(
+        allocator,
+        io,
+        options.cache_root,
+        "cas/rootfs/blake3/objects",
+        ".chunk",
+        "rootfs-cas-object",
+        &rooted_objects,
+        options.dry_run,
+        &result_entries,
+        &candidate_bytes,
+        &deleted_count,
+        &deleted_bytes,
+    );
+
+    const entries = try result_entries.toOwnedSlice();
+    return .{
+        .cache_root = options.cache_root,
+        .dry_run = options.dry_run,
+        .rooted_indexes = rooted_indexes.count(),
+        .rooted_objects = rooted_objects.count(),
+        .unparseable_metadata_count = conservative_roots.metadata_count,
+        .unparseable_ref_count = conservative_roots.ref_count,
+        .candidate_count = entries.len,
+        .candidate_bytes = candidate_bytes,
+        .deleted_count = deleted_count,
+        .deleted_bytes = deleted_bytes,
+        .entries = entries,
+    };
+}
+
+fn collectRootfsStorageRoots(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    runtime_root: ?[]const u8,
+    storage_roots: *std.StringHashMap(spore.RootfsStorage),
+    conservative_roots: *GcConservativeRootStats,
+) !void {
+    try collectStorageRootsFromCacheMetadata(allocator, io, cache_root, storage_roots, conservative_roots);
+    try collectStorageRootsFromRefRecords(allocator, io, cache_root, storage_roots, conservative_roots);
+    if (runtime_root) |root| {
+        try collectStorageRootsFromRuntimeManifests(allocator, io, root, storage_roots);
+    }
+}
+
+fn collectStorageRootsFromCacheMetadata(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    storage_roots: *std.StringHashMap(spore.RootfsStorage),
+    conservative_roots: *GcConservativeRootStats,
+) !void {
+    var root = openDirPath(io, cache_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer root.close(io);
+
+    var it = root.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const path = try std.fs.path.join(allocator, &.{ cache_root, entry.name });
+        collectStorageRootFromMetadataPath(allocator, io, path, storage_roots) catch {
+            conservative_roots.metadata_count += 1;
+        };
+    }
+}
+
+fn collectStorageRootsFromRefRecords(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    storage_roots: *std.StringHashMap(spore.RootfsStorage),
+    conservative_roots: *GcConservativeRootStats,
+) !void {
+    const refs_path = try std.fs.path.join(allocator, &.{ cache_root, "refs" });
+    var refs = openDirPath(io, refs_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer refs.close(io);
+    try collectStorageRootsFromRefDir(allocator, io, refs_path, refs, cache_root, storage_roots, conservative_roots);
+}
+
+fn collectStorageRootsFromRefDir(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir_path: []const u8,
+    dir: Io.Dir,
+    cache_root: []const u8,
+    storage_roots: *std.StringHashMap(spore.RootfsStorage),
+    conservative_roots: *GcConservativeRootStats,
+) !void {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        const path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        if (entry.kind == .directory) {
+            var child = try dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
+            defer child.close(io);
+            try collectStorageRootsFromRefDir(allocator, io, path, child, cache_root, storage_roots, conservative_roots);
+        } else if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".json")) {
+            collectStorageRootFromRefPath(allocator, io, cache_root, path, storage_roots) catch {
+                conservative_roots.ref_count += 1;
+            };
+        }
+    }
+}
+
+fn collectStorageRootsFromRuntimeManifests(
+    allocator: std.mem.Allocator,
+    io: Io,
+    runtime_root: []const u8,
+    storage_roots: *std.StringHashMap(spore.RootfsStorage),
+) !void {
+    const refs = try collectRuntimeForkRefs(allocator, io, runtime_root);
+    for (refs) |resume_dir| {
+        const manifest_path = try std.fs.path.join(allocator, &.{ resume_dir, "manifest.json" });
+        try collectStorageRootFromManifestPath(allocator, io, manifest_path, storage_roots);
+    }
+}
+
+fn collectStorageRootFromMetadataPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    storage_roots: *std.StringHashMap(spore.RootfsStorage),
+) !void {
+    const data = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_rootfs_metadata_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return error.BadManifest,
+        else => |e| return e,
+    };
+    const parsed = std.json.parseFromSlice(RootfsStorageRoot, allocator, data, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return error.BadManifest;
+    const storage = parsed.value.rootfs_storage orelse return error.BadManifest;
+    try addStorageRoot(storage_roots, storage);
+}
+
+fn collectStorageRootFromRefPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    path: []const u8,
+    storage_roots: *std.StringHashMap(spore.RootfsStorage),
+) !void {
+    const data = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_root_record_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return error.BadManifest,
+        else => |e| return e,
+    };
+    const parsed = std.json.parseFromSlice(ImageRefRoot, allocator, data, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return error.BadManifest;
+    const cache_key = parsed.value.rootfs_cache_key orelse return error.BadManifest;
+    if (!isLowerHexDigest(cache_key)) return error.BadManifest;
+    const metadata_name = try std.fmt.allocPrint(allocator, "{s}.json", .{cache_key});
+    const metadata_path = try std.fs.path.join(allocator, &.{ cache_root, metadata_name });
+    try collectStorageRootFromMetadataPath(allocator, io, metadata_path, storage_roots);
+}
+
+fn collectStorageRootFromManifestPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    storage_roots: *std.StringHashMap(spore.RootfsStorage),
+) !void {
+    const data = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_root_record_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return error.BadManifest,
+        else => |e| return e,
+    };
+    const parsed = std.json.parseFromSlice(ManifestRoot, allocator, data, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return error.BadManifest;
+    const rootfs_record = parsed.value.rootfs orelse return;
+    if (rootfs_record.storage) |storage| {
+        try addStorageRoot(storage_roots, storage);
+    }
+}
+
+fn addStorageRoot(storage_roots: *std.StringHashMap(spore.RootfsStorage), storage: spore.RootfsStorage) !void {
+    try spore.validateRootfsStorageDescriptor(storage);
+    try storage_roots.put(storage.index_digest, storage);
+}
+
+fn markAllGcCasEntriesRooted(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    sub_path: []const u8,
+    suffix: []const u8,
+    rooted: *std.StringHashMap(void),
+) !void {
+    const dir_path = try std.fs.path.join(allocator, &.{ cache_root, sub_path });
+    var dir = openDirPath(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, suffix)) continue;
+        const digest = digestFromCacheEntryName(allocator, entry.name, suffix) orelse continue;
+        try rooted.put(digest, {});
+    }
+}
+
+fn collectGcCasEntries(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    sub_path: []const u8,
+    suffix: []const u8,
+    kind: []const u8,
+    rooted: *std.StringHashMap(void),
+    dry_run: bool,
+    entries: *std.array_list.Managed(RootfsGcEntry),
+    candidate_bytes: *u64,
+    deleted_count: *usize,
+    deleted_bytes: *u64,
+) !void {
+    const dir_path = try std.fs.path.join(allocator, &.{ cache_root, sub_path });
+    var dir = openDirPath(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, suffix)) continue;
+        const digest = digestFromCacheEntryName(allocator, entry.name, suffix) orelse continue;
+        if (rooted.contains(digest)) continue;
+        const stat = try dir.statFile(io, entry.name, .{ .follow_symlinks = false });
+        if (stat.kind != .file) continue;
+        const path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        try entries.append(.{
+            .kind = kind,
+            .path = path,
+            .bytes = stat.size,
+        });
+        candidate_bytes.* += stat.size;
+        if (!dry_run) {
+            try Io.Dir.cwd().deleteFile(io, path);
+            deleted_count.* += 1;
+            deleted_bytes.* += stat.size;
+        }
+    }
+}
+
+fn digestFromCacheEntryName(allocator: std.mem.Allocator, name: []const u8, suffix: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, name, suffix)) return null;
+    const hex = name[0 .. name.len - suffix.len];
+    if (hex.len != chunk.ChunkId.hex_len) return null;
+    _ = chunk.ChunkId.fromHex(hex) catch return null;
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, hex }) catch return null;
+}
+
+fn isLowerHexDigest(value: []const u8) bool {
+    if (value.len != chunk.ChunkId.hex_len) return false;
+    for (value) |byte| {
+        if ((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f')) continue;
+        return false;
+    }
+    return true;
 }
 
 fn pruneRuntimeForkBatches(
@@ -1138,6 +1661,57 @@ fn writeRootfsPruneResult(writer: *Io.Writer, result: RootfsPruneResult) !void {
     try writer.writeAll("Use spore --json system prune for exact paths and byte counts.\n");
 }
 
+fn writeRootfsGcResult(writer: *Io.Writer, result: RootfsGcResult) !void {
+    if (result.dry_run) {
+        try writer.writeAll("Rootfs cache GC dry run\n");
+    } else {
+        try writer.writeAll("Rootfs cache GC\n");
+    }
+    try writer.print("  Cache: {s}\n", .{result.cache_root});
+    try writer.print("  Rooted indexes: {d}\n", .{result.rooted_indexes});
+    try writer.print("  Rooted objects: {d}\n", .{result.rooted_objects});
+    if (result.unparseable_metadata_count != 0 or result.unparseable_ref_count != 0) {
+        try writer.print("  Warning: {d} unrecognized rootfs metadata records and {d} unrecognized rootfs ref records found; retained all rootfs CAS entries.\n", .{
+            result.unparseable_metadata_count,
+            result.unparseable_ref_count,
+        });
+    }
+    if (result.dry_run) {
+        try writer.print("  Would delete: {d} entries\n", .{result.candidate_count});
+        try writer.writeAll("  Would reclaim: ");
+        try writeHumanBytes(writer, result.candidate_bytes);
+        try writer.writeByte('\n');
+    } else {
+        try writer.print("  Deleted: {d} entries\n", .{result.deleted_count});
+        try writer.writeAll("  Reclaimed: ");
+        try writeHumanBytes(writer, result.deleted_bytes);
+        try writer.writeByte('\n');
+    }
+
+    if (result.entries.len == 0) {
+        try writer.writeAll("\nNo CAS garbage found.\n");
+    } else {
+        try writer.writeByte('\n');
+        try writer.writeAll(if (result.dry_run) "Candidates\n" else "Deleted\n");
+        const visible_count = @min(result.entries.len, 20);
+        for (result.entries[0..visible_count]) |entry| {
+            try writer.print("  - {s} ", .{entry.kind});
+            try writeDisplayPath(writer, entry.path);
+            try writer.writeAll(": ");
+            try writeHumanBytes(writer, entry.bytes);
+            try writer.writeByte('\n');
+        }
+        if (result.entries.len > visible_count) {
+            try writer.print("  ... {d} more entries omitted; use spore --json cache gc for the full list.\n", .{result.entries.len - visible_count});
+        }
+    }
+
+    if (result.dry_run and result.candidate_count > 0) {
+        try writer.writeAll("\nRun again with --force to delete the selected entries.\n");
+    }
+    try writer.writeAll("Use spore --json cache gc for exact paths and byte counts.\n");
+}
+
 fn writeRuntimeForkPruneResult(writer: *Io.Writer, result: RuntimeForkPruneResult) !void {
     if (result.dry_run) {
         try writer.writeAll("Runtime fork prune dry run\n");
@@ -1438,6 +2012,180 @@ test "system prunes only unreferenced runtime fork batches" {
     try std.testing.expectEqual(@as(usize, 1), forced.deleted_count);
     try std.testing.expect(try fileExists(io, try std.fs.path.join(allocator, &.{ root, "forks", "live" })));
     try std.testing.expect(!try fileExists(io, try std.fs.path.join(allocator, &.{ root, "forks", "dead" })));
+}
+
+test "system cache gc preserves rooted disk index objects and deletes CAS orphans" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root = "zig-cache/test-system-cache-gc";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    const rooted = try writeGcStorageFixture(allocator, io, root, "rooted.json", 0x11);
+    const orphan = try writeGcStorageFixture(allocator, io, root, null, 0x22);
+    const stray_digest = try writeGcObjectFixture(allocator, io, root, 0x33);
+
+    const rooted_index_path = try rootfs_cas.manifestIndexPath(allocator, root, rooted.storage.index_digest);
+    const rooted_object_path = try rootfs_cas.manifestObjectPath(allocator, root, rooted.object_digest);
+    const orphan_index_path = try rootfs_cas.manifestIndexPath(allocator, root, orphan.storage.index_digest);
+    const orphan_object_path = try rootfs_cas.manifestObjectPath(allocator, root, orphan.object_digest);
+    const stray_object_path = try rootfs_cas.manifestObjectPath(allocator, root, stray_digest);
+
+    const dry_run = try gcRootfsCache(allocator, io, .{ .cache_root = root });
+    try std.testing.expect(dry_run.dry_run);
+    try std.testing.expectEqual(@as(usize, 1), dry_run.rooted_indexes);
+    try std.testing.expectEqual(@as(usize, 1), dry_run.rooted_objects);
+    try std.testing.expectEqual(@as(usize, 3), dry_run.candidate_count);
+    try std.testing.expect(try fileExists(io, rooted_index_path));
+    try std.testing.expect(try fileExists(io, rooted_object_path));
+    try std.testing.expect(try fileExists(io, orphan_index_path));
+    try std.testing.expect(try fileExists(io, orphan_object_path));
+    try std.testing.expect(try fileExists(io, stray_object_path));
+
+    const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
+    try std.testing.expect(!forced.dry_run);
+    try std.testing.expectEqual(@as(usize, 3), forced.deleted_count);
+    try std.testing.expect(try fileExists(io, rooted_index_path));
+    try std.testing.expect(try fileExists(io, rooted_object_path));
+    try std.testing.expect(!try fileExists(io, orphan_index_path));
+    try std.testing.expect(!try fileExists(io, orphan_object_path));
+    try std.testing.expect(!try fileExists(io, stray_object_path));
+}
+
+test "system cache gc treats unknown rootfs records as conservative roots" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root = "zig-cache/test-system-cache-gc-conservative-roots";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    const orphan = try writeGcStorageFixture(allocator, io, root, null, 0x44);
+    const stray_digest = try writeGcObjectFixture(allocator, io, root, 0x55);
+    const orphan_index_path = try rootfs_cas.manifestIndexPath(allocator, root, orphan.storage.index_digest);
+    const orphan_object_path = try rootfs_cas.manifestObjectPath(allocator, root, orphan.object_digest);
+    const stray_object_path = try rootfs_cas.manifestObjectPath(allocator, root, stray_digest);
+
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = root ++ "/future-metadata.json",
+        .data = "{\"kind\":\"future-rootfs-metadata-v99\"}",
+    });
+    try Io.Dir.cwd().createDirPath(io, root ++ "/refs");
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = root ++ "/refs/future-ref.json",
+        .data = "{\"kind\":\"future-rootfs-ref-v99\"}",
+    });
+
+    const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
+    try std.testing.expectEqual(@as(usize, 1), forced.rooted_indexes);
+    try std.testing.expectEqual(@as(usize, 2), forced.rooted_objects);
+    try std.testing.expectEqual(@as(usize, 1), forced.unparseable_metadata_count);
+    try std.testing.expectEqual(@as(usize, 1), forced.unparseable_ref_count);
+    try std.testing.expectEqual(@as(usize, 0), forced.candidate_count);
+    try std.testing.expectEqual(@as(usize, 0), forced.deleted_count);
+    try std.testing.expect(try fileExists(io, orphan_index_path));
+    try std.testing.expect(try fileExists(io, orphan_object_path));
+    try std.testing.expect(try fileExists(io, stray_object_path));
+
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeRootfsGcResult(&out.writer, forced);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Warning: 1 unrecognized rootfs metadata records and 1 unrecognized rootfs ref records found; retained all rootfs CAS entries.") != null);
+}
+
+test "system cache gc lock rejects a concurrent holder" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = "zig-cache/test-system-cache-gc-lock";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    var gc_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
+    defer gc_lock.deinit();
+
+    try std.testing.expectError(error.LockBusy, rootfs.tryLockRootfsCacheExclusive(io, allocator, root));
+}
+
+fn writeGcStorageFixture(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    metadata_name: ?[]const u8,
+    seed: u8,
+) !struct {
+    storage: spore.RootfsStorage,
+    object_digest: []const u8,
+} {
+    const object_digest = try writeGcObjectFixture(allocator, io, cache_root, seed);
+    const chunks = [_]disk_index.DiskIndexChunk{.{
+        .logical_chunk = 0,
+        .digest = object_digest,
+    }};
+    const index = disk_index.DiskIndex{
+        .kind = disk_index.disk_index_kind,
+        .logical_size = 512,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+        .chunks = &chunks,
+    };
+    const index_json = try std.json.Stringify.valueAlloc(allocator, index, .{ .whitespace = .indent_2 });
+    const index_digest = try disk_index.indexDigestAlloc(allocator, index_json);
+    const storage = spore.RootfsStorage{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = .{ .mmio_slot = 1 },
+        .logical_size = 512,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .index_digest = index_digest,
+        .base_identity = index_digest,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+    };
+    const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, index_digest);
+    try ensureParentDir(io, index_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = index_path, .data = index_json });
+
+    if (metadata_name) |name| {
+        const storage_json = try std.json.Stringify.valueAlloc(allocator, storage, .{});
+        const metadata = try std.fmt.allocPrint(
+            allocator,
+            "{{\"rootfs_size\":512,\"rootfs_storage\":{s}}}",
+            .{storage_json},
+        );
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ cache_root, name }), .data = metadata });
+    }
+    return .{
+        .storage = storage,
+        .object_digest = object_digest,
+    };
+}
+
+fn writeGcObjectFixture(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    seed: u8,
+) ![]const u8 {
+    const payload = try allocator.alloc(u8, 512);
+    for (payload, 0..) |*byte, i| byte.* = seed +% @as(u8, @truncate(i));
+    const id = chunk.ChunkId.fromContents(payload);
+    const hex = id.toHex();
+    const digest = try std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, hex[0..] });
+    const path = try rootfs_cas.manifestObjectPath(allocator, cache_root, digest);
+    try ensureParentDir(io, path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = payload });
+    return digest;
+}
+
+fn ensureParentDir(io: Io, path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return;
+    try Io.Dir.cwd().createDirPath(io, parent);
 }
 
 fn fileExists(io: Io, path: []const u8) !bool {

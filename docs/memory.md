@@ -6,17 +6,26 @@ backing is acceleration metadata.
 
 ## Manifest Authority
 
-`manifest.memory` records fixed-size BLAKE3-addressed chunks. A chunk entry is
-either a `blake3:<hex>` reference or `null` for an all-zero chunk. Every chunk
-loaded from disk, a bundle, a cache, S3, or HTTP(S) is verified against its
-digest before guest use.
+`manifest.memory` records fixed-size BLAKE3-addressed chunks as the same sparse
+index shape used for disk data. `chunks` contains sorted nonzero entries with
+`logical_chunk` and `digest`; `zero_chunks` lists sorted all-zero logical chunk
+numbers. RAM uses 2MiB chunks and the `memory/blake3` namespace. Every nonzero
+chunk loaded from disk, a bundle, a cache, S3, or HTTP(S) is verified against
+its digest before guest use.
 
 `manifest.memory.backing` may name a local `ram.backing` file:
 
 ```text
 memory:
+  kind: spore-disk-index-v1
+  logical_size: <ram_size>
   chunk_size: 2097152
-  chunks: [null, "blake3:...", ...]
+  hash_algorithm: blake3
+  object_namespace: memory/blake3
+  chunks:
+    - logical_chunk: 0
+      digest: blake3:...
+  zero_chunks: [1, 2, ...]
   backing:
     kind: map-private-file-v0
     path: ram.backing
@@ -24,8 +33,8 @@ memory:
 ```
 
 The backing file is never portable restore authority. Product restore maps it
-only when `ram.backing.proof` validates against the manifest memory fingerprint,
-opened file identity, backing metadata, and host-local runtime key. Missing,
+only when `ram.backing.proof` validates against the canonical memory index
+identity, opened file identity, backing metadata, and host-local runtime key. Missing,
 corrupt, foreign-key, symlinked, or mismatched proofs fall back to chunks.
 
 ## Local CoW

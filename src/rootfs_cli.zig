@@ -31,7 +31,7 @@ const import_oci_usage =
     \\  --ref <name:tag>       Local mutable image ref to record
     \\  --platform <os/arch>   Target platform (default: linux/arm64)
     \\  --rootfs-storage <policy>
-    \\                       Rootfs storage: chunked or flat (default: chunked)
+    \\                       Rootfs storage: chunked (default: chunked)
     \\  --mkfs <path>          external writer mkfs.ext4 binary (auto-detect)
     \\  --debugfs <path>       external writer debugfs binary (auto-detect)
     \\  -h, --help             Show this help
@@ -46,7 +46,7 @@ const import_tar_usage =
     \\  --ref <name:tag>       Local mutable image ref to record
     \\  --platform <os/arch>   Target platform (default: linux/arm64)
     \\  --rootfs-storage <policy>
-    \\                       Rootfs storage: chunked or flat (default: chunked)
+    \\                       Rootfs storage: chunked (default: chunked)
     \\  --mkfs <path>          external writer mkfs.ext4 binary (auto-detect)
     \\  --debugfs <path>       external writer debugfs binary (auto-detect)
     \\  -h, --help             Show this help
@@ -122,11 +122,11 @@ fn build(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !
         .mkfs = parsed.mkfs,
         .debugfs = parsed.debugfs,
     }) catch |err| return rootfsBuildError(err);
-    try stdout.print("rootfs: {s}\nmetadata: {s}\nsource: {s}\nrootfs_blake3: {s}\nrootfs_storage: {s}\n", .{
+    try stdout.print("rootfs: {s}\nmetadata: {s}\nsource: {s}\nrootfs_identity: {s}\nrootfs_storage: {s}\n", .{
         parsed.output,
         parsed.metadata,
         parsed.ref,
-        result.rootfs_blake3,
+        result.rootfs_storage.index_digest,
         result.rootfs_storage.index_digest,
     });
 }
@@ -147,13 +147,13 @@ fn importOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
         .debugfs = parsed.debugfs,
     }) catch |err| return rootfsBuildError(err);
     try stdout.print(
-        "rootfs: {s}\nmetadata: {s}\nref: {s}\nresolved: {s}\nrootfs_blake3: {s}\n",
+        "rootfs: {s}\nmetadata: {s}\nref: {s}\nresolved: {s}\nrootfs_identity: {s}\n",
         .{
             result.rootfs_path,
             result.metadata_path,
             parsed.ref,
             result.resolved_image_ref,
-            result.rootfs_blake3,
+            result.rootfs_storage.index_digest,
         },
     );
 }
@@ -174,13 +174,13 @@ fn importTar(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
         .debugfs = parsed.debugfs,
     }) catch |err| return rootfsBuildError(err);
     try stdout.print(
-        "rootfs: {s}\nmetadata: {s}\nref: {s}\nresolved: {s}\nrootfs_blake3: {s}\n",
+        "rootfs: {s}\nmetadata: {s}\nref: {s}\nresolved: {s}\nrootfs_identity: {s}\n",
         .{
             result.rootfs_path,
             result.metadata_path,
             parsed.ref,
             result.resolved_image_ref,
-            result.rootfs_blake3,
+            result.rootfs_storage.index_digest,
         },
     );
 }
