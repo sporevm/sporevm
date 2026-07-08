@@ -39,6 +39,11 @@ const file_type_fifo: u8 = 5;
 const file_type_sock: u8 = 6;
 const file_type_symlink: u8 = 7;
 
+/// A symlink target is stored inline in i_block ("fast symlink") only when it
+/// is strictly shorter than the 60-byte i_block area; a 60-byte target must
+/// live in a data block, matching the kernel's `i_size < sizeof(i_data)` rule.
+const fast_symlink_max_len: usize = 60;
+
 const feature_compat_ext_attr: u32 = 0x0008;
 const feature_incompat_filetype: u32 = 0x0002;
 const feature_ro_compat_sparse_super: u32 = 0x0001;
@@ -587,7 +592,7 @@ fn assignBlocks(
             } else {
                 try allocatePayloadBlocks(allocator, inode, inode.data, &used, blocks);
             }
-        } else if (inode.kind == .symlink and inode.symlink_target.len > 60) {
+        } else if (inode.kind == .symlink and inode.symlink_target.len >= fast_symlink_max_len) {
             try allocatePayloadBlocks(allocator, inode, inode.symlink_target, &used, blocks);
         }
         if (inode.xattrs.len != 0) {
@@ -934,7 +939,7 @@ fn writeInode(buf: []u8, inode: InodePlan) void {
 
     switch (inode.kind) {
         .symlink => {
-            if (inode.symlink_target.len <= 60) {
+            if (inode.symlink_target.len < fast_symlink_max_len) {
                 @memcpy(buf[0x28 .. 0x28 + inode.symlink_target.len], inode.symlink_target);
             } else {
                 writeBlockPointers(buf[0x28..0x64], inode);
@@ -1287,6 +1292,33 @@ test "native ext4 writer emits fsck-clean multi-group image" {
         .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-multigroup"),
     });
     try std.testing.expectEqual(@as(u64, 512 << 20), result.size);
+    try std.testing.expectEqualSlices(u8, &result.blake3, &(try ext4.blake3File(io, path)));
+    try runE2fsck(allocator, io, path);
+}
+
+test "native ext4 writer emits fsck-clean symlinks at the fast/slow boundary" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "zig-cache/test-native-ext4-symlink-boundary.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // ext4 stores a symlink target inline in i_block only when its length is
+    // strictly less than 60 bytes; a 60-byte target needs a data block.
+    const prefix = "/usr/share/ca-certificates/mozilla/";
+    const target_59 = prefix ++ "a" ** (59 - prefix.len);
+    const target_60 = prefix ++ "b" ** (60 - prefix.len);
+    const target_61 = prefix ++ "c" ** (61 - prefix.len);
+
+    const entries = [_]Entry{
+        .{ .path = "etc/link-59", .kind = .{ .symlink = target_59 } },
+        .{ .path = "etc/link-60", .kind = .{ .symlink = target_60 } },
+        .{ .path = "etc/link-61", .kind = .{ .symlink = target_61 } },
+    };
+    const result = try emit(allocator, io, path, &entries, .{
+        .image_size = min_image_size,
+        .inode_count = 1024,
+        .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-symlink-boundary"),
+    });
     try std.testing.expectEqualSlices(u8, &result.blake3, &(try ext4.blake3File(io, path)));
     try runE2fsck(allocator, io, path);
 }

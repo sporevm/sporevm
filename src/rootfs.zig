@@ -24,7 +24,7 @@ const xattrs_mod = @import("rootfs/xattrs.zig");
 const Io = std.Io;
 
 const max_rootfs_layers: usize = 512;
-pub const builder_version = "sporevm-rootfs-v4";
+pub const builder_version = "sporevm-rootfs-v5";
 const rootfs_build_profile_env = "SPOREVM_ROOTFS_BUILD_PROFILE";
 const ext4_writer_env = "SPOREVM_EXT4_WRITER";
 const resolver_placeholder_path = "etc/resolv.conf";
@@ -3005,7 +3005,7 @@ test "image rootfs cache metadata matches resolved image identity" {
         .sub_path = metadata_path,
         .data =
         \\{
-        \\  "builder_version": "sporevm-rootfs-v4",
+        \\  "builder_version": "sporevm-rootfs-v5",
         \\  "ext4_writer": "native",
         \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -3051,7 +3051,7 @@ test "image rootfs cache can replace same-key artifacts for writer escape hatch"
         .sub_path = metadata_path,
         .data =
         \\{
-        \\  "builder_version": "sporevm-rootfs-v4",
+        \\  "builder_version": "sporevm-rootfs-v5",
         \\  "ext4_writer": "native",
         \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -3070,7 +3070,7 @@ test "image rootfs cache can replace same-key artifacts for writer escape hatch"
         .sub_path = temp_metadata_path,
         .data =
         \\{
-        \\  "builder_version": "sporevm-rootfs-v4",
+        \\  "builder_version": "sporevm-rootfs-v5",
         \\  "ext4_writer": "external",
         \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -3427,7 +3427,7 @@ test "image ref cache maps tag to verified rootfs path" {
         .sub_path = metadata_path,
         .data =
         \\{
-        \\  "builder_version": "sporevm-rootfs-v4",
+        \\  "builder_version": "sporevm-rootfs-v5",
         \\  "ext4_writer": "native",
         \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -3468,7 +3468,7 @@ test "image ref cache treats mismatched records and missing rootfs as misses" {
         \\  "version": 1,
         \\  "requested_ref": "docker.io/library/alpine:other",
         \\  "platform": "linux/arm64",
-        \\  "builder_version": "sporevm-rootfs-v4",
+        \\  "builder_version": "sporevm-rootfs-v5",
         \\  "resolved_image_ref": "{s}",
         \\  "image_manifest_digest": "{s}",
         \\  "rootfs_cache_key": "{s}",
@@ -3483,7 +3483,7 @@ test "image ref cache treats mismatched records and missing rootfs as misses" {
         \\  "version": 1,
         \\  "requested_ref": "docker.io/library/alpine:3.20",
         \\  "platform": "linux/arm64",
-        \\  "builder_version": "sporevm-rootfs-v4",
+        \\  "builder_version": "sporevm-rootfs-v5",
         \\  "resolved_image_ref": "docker.io/library/alpine:not-a-digest",
         \\  "image_manifest_digest": "{s}",
         \\  "rootfs_cache_key": "{s}",
@@ -3523,7 +3523,7 @@ test "image rootfs storage is recorded and reused without the digest artifact" {
         .sub_path = metadata_path,
         .data =
         \\{
-        \\  "builder_version": "sporevm-rootfs-v4",
+        \\  "builder_version": "sporevm-rootfs-v5",
         \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "platform": {"os": "linux", "arch": "arm64"}
