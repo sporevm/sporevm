@@ -633,6 +633,39 @@ const RootfsBuildProfile = struct {
         self.casPhase("rootfs_cas_inline", start_ms, result);
     }
 
+    fn nativeExt4EmitPhase(self: RootfsBuildProfile, start_ms: u64, result: ext4_writer.Result) void {
+        if (!self.enabled) return;
+        const profile = result.profile;
+        std.debug.print(
+            "spore rootfs profile: phase=native_ext4_emit ms={d} plan_ms={d} assign_ms={d} metadata_build_ms={d} file_create_ms={d} emit_map_ms={d} metadata_write_ms={d} source_read_ms={d} data_write_ms={d} zero_ms={d} zero_write_ms={d} inline_cas_metadata_ms={d} inline_cas_data_ms={d} inline_cas_zero_ms={d} inline_cas_finish_ms={d} file_sync_ms={d} file_close_ms={d} metadata_blocks={d} data_blocks={d} zero_blocks={d} metadata_bytes_written={d} data_bytes_written={d} zero_bytes_skipped={d}\n",
+            .{
+                monotonicMs() -| start_ms,
+                profile.plan_ms,
+                profile.assign_ms,
+                profile.metadata_build_ms,
+                profile.file_create_ms,
+                profile.emit_map_ms,
+                profile.metadata_write_ms,
+                profile.source_read_ms,
+                profile.data_write_ms,
+                profile.zero_ms,
+                profile.zero_write_ms,
+                profile.inline_cas_metadata_ms,
+                profile.inline_cas_data_ms,
+                profile.inline_cas_zero_ms,
+                profile.inline_cas_finish_ms,
+                profile.file_sync_ms,
+                profile.file_close_ms,
+                profile.metadata_blocks,
+                profile.data_blocks,
+                profile.zero_blocks,
+                profile.metadata_bytes_written,
+                profile.data_bytes_written,
+                profile.zero_bytes_skipped,
+            },
+        );
+    }
+
     fn casPhase(self: RootfsBuildProfile, name: []const u8, start_ms: u64, result: rootfs_cas.PreloadResult) void {
         if (!self.enabled) return;
         std.debug.print(
@@ -1540,7 +1573,7 @@ fn materializeRootFSNative(
         .determinism = deterministic_ext4,
         .cas_cache_root = inline_cache_root,
     });
-    opts.profile.phase("native_ext4_emit", native_start);
+    opts.profile.nativeExt4EmitPhase(native_start, emit_result);
     if (emit_result.preload_result) |preload_result| opts.profile.inlineCasPhase(native_start, preload_result);
     return emit_result.preload_result;
 }
@@ -1848,7 +1881,7 @@ pub fn cachedImageRootfsPath(
         defer allocator.free(artifact.digest);
         const storage = (try readCachedRootfsStorage(io, allocator, metadata_path, artifact)) orelse return null;
         defer deinitStorageDigestFields(allocator, storage);
-        if (!try rootfs_cas.storageComplete(io, allocator, cache_root, storage)) return null;
+        if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, storage)) return null;
         std.log.debug("spore rootfs: using cached rootfs {s} for {s}", .{ rootfs_path, resolved.ref });
         return rootfs_path;
     }
@@ -3163,7 +3196,8 @@ test "image rootfs cache lookup does not repair evicted flat materialization" {
     const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
     const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
     const metadata_path = try cachedImageRootfsMetadataPath(arena, cache_root, resolved);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+    const rootfs_bytes = ("abcd" ** 1024) ++ ("efgh" ** 1024);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const storage = try testRootfsStorageFromPath(io, arena, cache_root, rootfs_path);
     const metadata = try testImageRootfsMetadataJson(arena, resolved, rootfs_path, storage.logical_size, storage, "native");
@@ -3174,6 +3208,82 @@ test "image rootfs cache lookup does not repair evicted flat materialization" {
     try std.testing.expect(!try rootfs_cache.pathExistsNoSymlink(io, digest_path));
     try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .native)).?);
     try std.testing.expect(!try rootfs_cache.pathExistsNoSymlink(io, digest_path));
+}
+
+test "image rootfs cache lookup repairs missing complete stamp" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-image-cache-repair-complete-stamp";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+
+    const resolved = ResolvedImage{
+        .ref = "docker.io/library/alpine@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .manifest_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try cachedImageRootfsMetadataPath(arena, cache_root, resolved);
+    const rootfs_bytes = ("abcd" ** 1024) ++ ("efgh" ** 1024);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
+
+    const storage = try testRootfsStorageFromPath(io, arena, cache_root, rootfs_path);
+    const metadata = try testImageRootfsMetadataJson(arena, resolved, rootfs_path, storage.logical_size, storage, "native");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, cache_root, storage));
+
+    try rootfs_cas.removeStorageCompleteStamp(io, arena, cache_root, storage.index_digest);
+    try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, arena, cache_root, storage));
+    try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .native)).?);
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, cache_root, storage));
+}
+
+test "image rootfs cache lookup uses complete stamp without per-object stat" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-image-cache-flat-before-cas";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+
+    const resolved = ResolvedImage{
+        .ref = "docker.io/library/alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try cachedImageRootfsMetadataPath(arena, cache_root, resolved);
+    const rootfs_bytes = ("abcd" ** 1024) ++ ("efgh" ** 1024);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
+
+    const storage = try testRootfsStorageFromPath(io, arena, cache_root, rootfs_path);
+    const metadata = try testImageRootfsMetadataJson(arena, resolved, rootfs_path, storage.logical_size, storage, "native");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
+    _ = try rootfs_cache.installTrustedMaterializationByHardlink(io, arena, cache_root, rootfs_path, storage.index_digest, storage.logical_size);
+
+    const object_id = chunk.ChunkId.fromContents(rootfs_bytes);
+    const object_hex = object_id.toHex();
+    const object_digest = try std.fmt.allocPrint(arena, "{s}{s}", .{ spore.rootfs_digest_prefix, object_hex[0..] });
+    const object_path = try rootfs_cas.manifestObjectPath(arena, cache_root, object_digest);
+    try Io.Dir.cwd().deleteFile(io, object_path);
+    try std.testing.expect(!try rootfs_cas.storageComplete(io, arena, cache_root, storage));
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, cache_root, storage));
+    try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .native)).?);
+
+    try rootfs_cas.removeStorageCompleteStampsReferencingObject(io, arena, cache_root, object_digest);
+    try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, arena, cache_root, storage));
+    try std.testing.expect((try cachedImageRootfsPath(io, arena, cache_root, resolved, .native)) == null);
 }
 
 test "image rootfs metadata supplies cached artifact identity" {

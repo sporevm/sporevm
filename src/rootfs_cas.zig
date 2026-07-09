@@ -15,6 +15,7 @@ const Io = std.Io;
 
 pub const default_chunk_size: u64 = 64 * 1024;
 pub const max_index_bytes: usize = 64 * 1024 * 1024;
+const complete_stamp_contents = "spore-rootfs-cas-complete-v1\n";
 
 pub const SourceError = error{
     OutOfRange,
@@ -322,6 +323,7 @@ fn preloadFd(
     // object and object directory; publish the index last via temp/fsync/rename.
     try writeFileAtomic(io, allocator, manifest_path, manifest_json);
     const index_write_ms = monotonicMs() -| index_write_start_ms;
+    try markStorageComplete(io, allocator, cache_root, index_digest);
     const rootfs_identity = try allocator.dupe(u8, source_identity orelse index_digest);
     errdefer allocator.free(rootfs_identity);
     return .{
@@ -346,6 +348,8 @@ fn preloadFd(
     };
 }
 
+/// Verifies the index and every referenced chunk object. On success this also
+/// writes or repairs the complete stamp for callers that upgrade an older cache.
 pub fn storageComplete(
     io: Io,
     allocator: std.mem.Allocator,
@@ -378,7 +382,128 @@ pub fn storageComplete(
         const expected_size = try storageChunkLen(storage, entry.logical_chunk);
         if (stat.size != @as(u64, @intCast(expected_size))) return false;
     }
+    try markStorageComplete(io, allocator, cache_root, storage.index_digest);
     return true;
+}
+
+pub fn storageCompleteWithStampRepair(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    storage: spore.RootfsStorage,
+) !bool {
+    if (try storageMarkedComplete(io, allocator, cache_root, storage)) return true;
+    return storageComplete(io, allocator, cache_root, storage);
+}
+
+pub fn storageMarkedComplete(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    storage: spore.RootfsStorage,
+) !bool {
+    const stamp_path = try storageCompleteStampPath(allocator, cache_root, storage.index_digest);
+    defer allocator.free(stamp_path);
+    if (!try rootfs_cache.regularFileNoSymlink(io, stamp_path)) return false;
+    const stamp_bytes = readFileAll(allocator, stamp_path, complete_stamp_contents.len) catch |err| switch (err) {
+        error.MissingChunk, error.BadChunk, error.ShortRead => return false,
+        else => |e| return e,
+    };
+    defer allocator.free(stamp_bytes);
+    if (!std.mem.eql(u8, stamp_bytes, complete_stamp_contents)) return false;
+
+    const index_path = try manifestIndexPath(allocator, cache_root, storage.index_digest);
+    defer allocator.free(index_path);
+    const index_bytes = readVerifiedStorageIndexPath(allocator, index_path, storage) catch |err| switch (err) {
+        error.MissingChunk, error.BadChunk, error.ShortRead, error.BadManifest, error.FormatTooOld => return false,
+        else => |e| return e,
+    };
+    allocator.free(index_bytes);
+    return true;
+}
+
+pub fn markStorageComplete(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    index_digest: []const u8,
+) !void {
+    const stamp_path = try storageCompleteStampPath(allocator, cache_root, index_digest);
+    defer allocator.free(stamp_path);
+    const stamp_dir = std.fs.path.dirname(stamp_path) orelse return error.BadManifest;
+    try ensureDirPath(io, stamp_dir);
+    try writeFileAtomic(io, allocator, stamp_path, complete_stamp_contents);
+}
+
+pub fn removeStorageCompleteStamp(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    index_digest: []const u8,
+) !void {
+    const stamp_path = try storageCompleteStampPath(allocator, cache_root, index_digest);
+    defer allocator.free(stamp_path);
+    Io.Dir.cwd().deleteFile(io, stamp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+}
+
+pub fn removeStorageCompleteStampsReferencingObject(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    object_digest: []const u8,
+) !void {
+    var object_digests = std.StringHashMap(void).init(allocator);
+    defer object_digests.deinit();
+    try object_digests.put(object_digest, {});
+    try removeStorageCompleteStampsReferencingObjects(io, allocator, cache_root, object_digests);
+}
+
+pub fn removeStorageCompleteStampsReferencingObjects(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    object_digests: std.StringHashMap(void),
+) !void {
+    if (object_digests.count() == 0) return;
+
+    const indexes_dir_path = try std.fmt.allocPrint(allocator, "{s}/cas/rootfs/blake3/indexes", .{cache_root});
+    defer allocator.free(indexes_dir_path);
+    var indexes_dir = openDirPath(io, indexes_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer indexes_dir.close(io);
+
+    var it = indexes_dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const index_digest = (try storageIndexDigestFromEntryName(allocator, entry.name)) orelse continue;
+        defer allocator.free(index_digest);
+        const index_path = try std.fs.path.join(allocator, &.{ indexes_dir_path, entry.name });
+        defer allocator.free(index_path);
+        const bytes = readFileAll(allocator, index_path, max_index_bytes) catch |err| switch (err) {
+            error.MissingChunk, error.BadChunk, error.ShortRead => continue,
+            else => |e| return e,
+        };
+        defer allocator.free(bytes);
+        const parsed = std.json.parseFromSlice(disk_index.DiskIndex, allocator, bytes, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        defer parsed.deinit();
+        for (parsed.value.chunks) |chunk_entry| {
+            if (object_digests.contains(chunk_entry.digest)) {
+                try removeStorageCompleteStamp(io, allocator, cache_root, index_digest);
+                break;
+            }
+        }
+    }
 }
 
 pub fn readVerifiedStorageIndexPath(
@@ -461,6 +586,19 @@ pub fn manifestObjectPath(allocator: std.mem.Allocator, cache_root: []const u8, 
     const dir = try objectDir(allocator, cache_root);
     defer allocator.free(dir);
     return objectPathForDir(allocator, dir, id);
+}
+
+pub fn storageCompleteStampPath(allocator: std.mem.Allocator, cache_root: []const u8, index_digest: []const u8) ![]const u8 {
+    const hex = try rootfsDigestHex(index_digest);
+    return std.fmt.allocPrint(allocator, "{s}/cas/rootfs/blake3/complete/{s}.complete", .{ cache_root, hex });
+}
+
+fn storageIndexDigestFromEntryName(allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
+    if (!std.mem.endsWith(u8, name, ".json")) return null;
+    const hex = name[0 .. name.len - ".json".len];
+    if (hex.len != chunk.ChunkId.hex_len) return null;
+    _ = chunk.ChunkId.fromHex(hex) catch return null;
+    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, hex });
 }
 
 pub fn readVerifiedManifestObject(
@@ -731,6 +869,11 @@ fn ensureDirPath(io: Io, path: []const u8) !void {
         else => |e| return e,
     };
     existing.close(io);
+}
+
+fn openDirPath(io: Io, path: []const u8, options: Io.Dir.OpenOptions) !Io.Dir {
+    if (Io.Dir.path.isAbsolute(path)) return Io.Dir.openDirAbsolute(io, path, options);
+    return Io.Dir.cwd().openDir(io, path, options);
 }
 
 fn pwriteAll(fd: std.c.fd_t, bytes: []const u8, offset: u64) SourceError!void {

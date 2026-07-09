@@ -1678,7 +1678,14 @@ fn directCacheChildName(cache_root: []const u8, path: []const u8) ?[]const u8 {
     return file_name;
 }
 
-fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8, command_name: []const u8, pull_policy: PullPolicy, record_artifact: bool) !RootfsInputResolution {
+fn resolveImageRootfs(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    image_ref: []const u8,
+    command_name: []const u8,
+    pull_policy: PullPolicy,
+    record_artifact: bool,
+) !RootfsInputResolution {
     const cache_root = local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
         error.MissingHome => return .{ .failure = rootfsInputFailure(
             allocator,
@@ -1721,7 +1728,7 @@ fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, imag
                 .{ command_name, @errorName(err) },
             ) };
         }) |path| {
-            return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, path, command_name, record_artifact);
+            return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, path, command_name, record_artifact, true);
         }
         return .{ .failure = rootfsInputFailure(
             allocator,
@@ -1742,7 +1749,7 @@ fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, imag
                 .{ command_name, @errorName(err) },
             ) };
         }) |path| {
-            return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, path, command_name, record_artifact);
+            return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, path, command_name, record_artifact, true);
         }
     } else {
         rootfs_mod.validateTaggedImageRef(image_ref) catch |err| {
@@ -1764,7 +1771,7 @@ fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, imag
                     .{ command_name, @errorName(err) },
                 ) };
             }) |hit| {
-                return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, hit.resolved, hit.path, command_name, record_artifact);
+                return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, hit.resolved, hit.path, command_name, record_artifact, true);
             }
         }
         if (pull_policy == .never) {
@@ -1805,7 +1812,7 @@ fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, imag
                 .{ command_name, @errorName(err) },
             ) };
         };
-        return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, path, command_name, record_artifact);
+        return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, path, command_name, record_artifact, true);
     }
     const path = rootfs_mod.buildCachedImageRootfs(init, allocator, cache_root, resolved, ext4_writer_choice) catch |err| {
         if (err == error.UnsupportedExt4FileSize) {
@@ -1834,7 +1841,7 @@ fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, imag
             .{ command_name, @errorName(err) },
         ) };
     };
-    return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, path, command_name, record_artifact);
+    return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, path, command_name, record_artifact, false);
 }
 
 fn resolvedImageRootfsInputResult(
@@ -1846,8 +1853,9 @@ fn resolvedImageRootfsInputResult(
     rootfs_path: []const u8,
     command_name: []const u8,
     record_artifact: bool,
+    storage_prevalidated: bool,
 ) !RootfsInputResolution {
-    const input = resolvedImageRootfsInput(init, allocator, cache_root, requested_ref, resolved, rootfs_path, record_artifact) catch |err| {
+    const input = resolvedImageRootfsInput(init, allocator, cache_root, requested_ref, resolved, rootfs_path, record_artifact, storage_prevalidated) catch |err| {
         return .{ .failure = rootfsInputFailure(
             allocator,
             machine_output.fromZigError(err).code,
@@ -1896,6 +1904,7 @@ fn resolvedImageRootfsInput(
     resolved: rootfs_mod.ResolvedImage,
     rootfs_path: []const u8,
     record_artifact: bool,
+    storage_prevalidated: bool,
 ) !ResolvedRootfsInput {
     const metadata_path = try rootfs_mod.cachedImageRootfsMetadataPath(allocator, cache_root, resolved);
     const run_config = try readCachedImageRunConfig(init.io, allocator, metadata_path);
@@ -1910,7 +1919,7 @@ fn resolvedImageRootfsInput(
     var storage = (try rootfs_mod.readCachedRootfsStorage(init.io, allocator, metadata_path, artifact)) orelse return error.BadManifest;
     errdefer rootfs_mod.deinitRootfsStorageDescriptor(allocator, storage);
     storage.device = rootfs_device;
-    if (!try rootfs_cas.storageComplete(init.io, allocator, cache_root, storage)) return error.RootFSDigestCacheMiss;
+    if (!storage_prevalidated and !try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, cache_root, storage)) return error.RootFSDigestCacheMiss;
     const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch });
     const manifest_requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved.ref else requested_ref;
     return .{
@@ -3535,7 +3544,7 @@ test "image rootfs metadata supplies run env and working directory" {
     };
 
     const rootfs_path = tmp ++ "/rootfs.ext4";
-    const input = try resolvedImageRootfsInput(init, arena, cache_root, "local/buildkite-spore:ci", resolved, rootfs_path, false);
+    const input = try resolvedImageRootfsInput(init, arena, cache_root, "local/buildkite-spore:ci", resolved, rootfs_path, false, false);
     try std.testing.expectEqual(@as(usize, 2), input.guest_env.len);
     try std.testing.expectEqualStrings("GEM_HOME=/usr/local/bundle", input.guest_env[0]);
     try std.testing.expectEqualStrings("BUNDLE_APP_CONFIG=/usr/local/bundle", input.guest_env[1]);
@@ -3562,7 +3571,7 @@ test "image rootfs metadata supplies run env and working directory" {
         \\}}
     , .{ rootfs_path, storage.logical_size, storage_json });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = rootfs_metadata });
-    const captured = try resolvedImageRootfsInput(init, arena, cache_root, "local/buildkite-spore:ci", resolved, rootfs_path, true);
+    const captured = try resolvedImageRootfsInput(init, arena, cache_root, "local/buildkite-spore:ci", resolved, rootfs_path, true, false);
     try std.testing.expect(captured.rootfs != null);
     try std.testing.expect(captured.rootfs.?.storage != null);
     try std.testing.expectEqualStrings(resolved.ref, captured.rootfs.?.source.?.requested_ref);

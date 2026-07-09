@@ -487,6 +487,38 @@ records the large-tar import benchmark against the external preload baseline;
 the 2026-07-08 rerun on the documented 312 MiB tar cut `rootfs_cas_inline`
 from 3.392s serial to 1.545s with 8 seal workers.
 
+Follow-up benchmark on latest `main` after PR #421, commit
+`7a031e9c205f7f9aa7f31c0205a6d31a043e99b3`, showed the large
+buildkite-sporevm image still importing in roughly the same time as #420, but
+regressed warm `spore run --image ... -- /bin/true` from about 0.38s to
+1.73-1.76s. The extra wall time was before guest ready
+(`vsock_connect_ms=17`, `exec_response_ms=33`) and came from walking the
+complete 74k-object CAS index on flat-hot run setup. The follow-up fix writes a
+digest-keyed `complete` stamp when rootfs CAS sealing finishes, makes cached
+image/ref resolution check that stamp plus the index instead of statting every
+object, and has GC/prune remove stamps before deleting an index or referenced
+object. The prevalidated run path also skips its duplicate completeness check.
+On an exact rebuild/import through `buildkite-sporevm/bin/buildkite-spore` with
+this branch's ReleaseSafe binary, warm
+`spore run --image local/buildkite-spore:dev -- /bin/true` measured
+`real=0.10s user=0.08s sys=0.01s`.
+
+The same exact buildkite-sporevm import rerun added the native emit split:
+`native_ext4_emit ms=94139 plan_ms=214 assign_ms=73834 metadata_build_ms=176
+file_create_ms=1 emit_map_ms=48 metadata_write_ms=793 source_read_ms=1688
+data_write_ms=4754 zero_ms=7 zero_write_ms=0 inline_cas_metadata_ms=204
+inline_cas_data_ms=11840 inline_cas_zero_ms=3 inline_cas_finish_ms=42
+file_sync_ms=0 file_close_ms=16 metadata_blocks=44384 data_blocks=1149892
+zero_blocks=751324 metadata_bytes_written=181796864
+data_bytes_written=4709957632 zero_bytes_skipped=3077423104`.
+`rootfs_cas_inline` for the same run was `ms=94139`, `seal_workers=8`,
+`seal_wall_ms=19337`, and `seal_worker_cpu_ms=77342`. The main-thread problem
+is therefore block assignment/metadata planning, not tar reads or writing zero
+blocks; zero ext4 blocks are skipped on the output path. Follow-up after the
+run-image readiness PR lands: profile inside `assignBlocks` for O(n^2) behavior
+or allocation churn over the roughly 2M-block buildkite image before doing any
+more sealer work.
+
 Done when: import → run → save → restore works end to end on index identity
 with no linear full-image hash anywhere; uncached import of a large
 reference image pays no separate hash pass beyond the inline emission
