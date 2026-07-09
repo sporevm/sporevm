@@ -43,6 +43,7 @@
 #define MAX_COPY_PATH_LEN 512
 #define MAX_COPY_FULL_PATH_LEN 1024
 #define COPY_ARCHIVE_HEADER_LEN 16
+#define SPORE_COPY_HEADER_LEN 17
 #define MAX_DETACHED_CHILDREN 32
 #define REPLAY_CAP 65536
 #define SESSION_ID "default"
@@ -71,7 +72,10 @@
 #define SPIO_TERMINAL_STREAM 4
 #define COPY_KIND_FILE 'F'
 #define COPY_KIND_DIR 'D'
+#define COPY_KIND_SYMLINK 'L'
 #define COPY_KIND_END 'E'
+#define MAX_SPORE_COPY_ENTRIES 65536ULL
+#define MAX_SPORE_COPY_CONTENT_LEN 1073741824ULL
 #ifndef FIFREEZE
 #define FIFREEZE _IOWR('X', 119, int)
 #endif
@@ -1325,6 +1329,7 @@ enum request_kind {
   REQUEST_GENERATION,
   REQUEST_COPY_IN,
   REQUEST_COPY_OUT,
+  REQUEST_SPORE_COPY,
   REQUEST_FSFREEZE,
   REQUEST_FSTHAW,
 };
@@ -1345,7 +1350,9 @@ struct run_request {
   int detached;
   int require_generation_ready;
   char generation_params[GEN_PARAMS_MAX];
-  char copy_path[MAX_COPY_PATH_LEN];
+  char copy_path[MAX_COPY_PATH_LEN + 1];
+  char copy_dest[MAX_COPY_PATH_LEN + 1];
+  uint64_t copy_entry_count;
   char arg_storage[MAX_ARGC][MAX_ARG_LEN];
   char *argv[MAX_ARGC + 1];
   char env_storage[MAX_ENVC][MAX_ENV_LEN];
@@ -1416,6 +1423,9 @@ static int parse_request(const char *req, struct run_request *out) {
     } else if (strcmp(type, "copy-out-v1") == 0) {
       out->kind = REQUEST_COPY_OUT;
       out->protocol_v1 = 1;
+    } else if (strcmp(type, "spore-copy-v1") == 0) {
+      out->kind = REQUEST_SPORE_COPY;
+      out->protocol_v1 = 1;
     } else if (strcmp(type, "fsfreeze-v1") == 0) {
       out->kind = REQUEST_FSFREEZE;
       out->protocol_v1 = 1;
@@ -1458,6 +1468,14 @@ static int parse_request(const char *req, struct run_request *out) {
   if (out->kind == REQUEST_COPY_IN || out->kind == REQUEST_COPY_OUT) {
     int path_rc = parse_string_field(req, "path", out->copy_path, sizeof(out->copy_path));
     if (path_rc <= 0) return -1;
+  }
+  if (out->kind == REQUEST_SPORE_COPY) {
+    int dest_rc = parse_string_field(req, "dest", out->copy_dest, sizeof(out->copy_dest));
+    if (dest_rc <= 0) return -1;
+    uint64_t entry_count = 0;
+    int count_rc = parse_u64_field(req, "entry_count", &entry_count);
+    if (count_rc <= 0 || entry_count > MAX_SPORE_COPY_ENTRIES) return -1;
+    out->copy_entry_count = entry_count;
   }
   if (out->protocol_v1 && (out->kind == REQUEST_START || out->kind == REQUEST_ATTACH)) {
     char stdio[16];
@@ -1536,7 +1554,7 @@ static int send_client_exit(struct client *client, int code) {
 static int validate_copy_path(const char *path) {
   if (path[0] != '/' || path[1] == '\0') return -1;
   size_t len = strlen(path);
-  if (len >= MAX_COPY_PATH_LEN || path[len - 1] == '/') return -1;
+  if (len > MAX_COPY_PATH_LEN || path[len - 1] == '/') return -1;
   const char *p = path + 1;
   while (*p != '\0') {
     const char *start = p;
@@ -1974,6 +1992,156 @@ static int copy_out_file(struct client *client, const char *root, const char *gu
       send_copy_record(client, COPY_KIND_END, "", 0, 0) != 0) {
     return send_client_error_exit(client, 1, "spore copy-out: cannot read guest path\n");
   }
+  return send_client_exit(client, 0);
+}
+
+static int validate_spore_copy_entry_path(const char *path) {
+  if (path[0] != '/' || path[1] == '\0') return -1;
+  size_t len = strlen(path);
+  if (len > MAX_COPY_PATH_LEN || path[len - 1] == '/') return -1;
+  const char *p = path + 1;
+  while (*p != '\0') {
+    const char *start = p;
+    while (*p != '\0' && *p != '/') {
+      if (*p == '\0') return -1;
+      p++;
+    }
+    size_t part_len = (size_t)(p - start);
+    if (part_len == 0) return -1;
+    if (part_len == 1 && start[0] == '.') return -1;
+    if (part_len == 2 && start[0] == '.' && start[1] == '.') return -1;
+    if (*p == '/') p++;
+  }
+  return 0;
+}
+
+static int ensure_parent_dirs(const char *path) {
+  char tmp[MAX_COPY_FULL_PATH_LEN];
+  size_t len = strlen(path);
+  if (len == 0 || len >= sizeof(tmp)) return -1;
+  memcpy(tmp, path, len + 1);
+  for (char *p = tmp + 1; *p != '\0'; p++) {
+    if (*p != '/') continue;
+    *p = '\0';
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+    *p = '/';
+  }
+  return 0;
+}
+
+static int prepare_overwrite_path(const char *path, int allow_existing_dir) {
+  struct stat st;
+  if (lstat(path, &st) != 0) {
+    return errno == ENOENT ? 0 : -1;
+  }
+  if (S_ISDIR(st.st_mode)) return allow_existing_dir ? 0 : -1;
+  return unlink(path);
+}
+
+static int apply_spore_copy_dir(const char *path, mode_t mode) {
+  if (ensure_parent_dirs(path) != 0) return -1;
+  if (prepare_overwrite_path(path, 1) != 0) return -1;
+  if (mkdir(path, mode & 07777) != 0 && errno != EEXIST) return -1;
+  return chmod(path, mode & 07777);
+}
+
+static int apply_spore_copy_file(int archive_fd, const char *path, mode_t mode, uint64_t size) {
+  if (ensure_parent_dirs(path) != 0) return -1;
+  if (prepare_overwrite_path(path, 0) != 0) return -1;
+  int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode & 07777);
+  if (fd < 0) return -1;
+  int rc = copy_archive_file_to_fd(archive_fd, fd, size);
+  if (rc == 0 && fchmod(fd, mode & 07777) != 0) rc = -1;
+  if (close(fd) != 0) rc = -1;
+  if (rc != 0) unlink(path);
+  return rc;
+}
+
+static int apply_spore_copy_symlink(int archive_fd, const char *path, uint64_t size) {
+  if (size > MAX_COPY_PATH_LEN) return -1;
+  char target[MAX_COPY_PATH_LEN + 1];
+  if (read_exact(archive_fd, target, (size_t)size) != 0) return -1;
+  target[size] = '\0';
+  if (ensure_parent_dirs(path) != 0) return -1;
+  if (prepare_overwrite_path(path, 0) != 0) return -1;
+  return symlink(target, path);
+}
+
+static int read_spore_copy_record(int fd, struct copy_record *record) {
+  unsigned char header[SPORE_COPY_HEADER_LEN];
+  if (read_exact(fd, header, sizeof(header)) != 0) return -1;
+  record->kind = header[0];
+  record->mode = read_le32(header + 1);
+  record->path_len = read_le32(header + 5);
+  record->size = read_le64(header + 9);
+  if (record->path_len == 0 || record->path_len > MAX_COPY_PATH_LEN) return -1;
+  if ((record->mode & ~07777U) != 0) return -1;
+  if (record->size > MAX_SPORE_COPY_CONTENT_LEN) return -1;
+  if (read_exact(fd, record->path, record->path_len) != 0) return -1;
+  record->path[record->path_len] = '\0';
+  if (validate_spore_copy_entry_path(record->path) != 0) return -1;
+  if (record->kind == COPY_KIND_DIR && record->size != 0) return -1;
+  if (record->kind != COPY_KIND_FILE && record->kind != COPY_KIND_DIR && record->kind != COPY_KIND_SYMLINK) return -1;
+  return 0;
+}
+
+static int apply_spore_copy_archive(const char *archive_path, const char *root, uint64_t entry_count) {
+  int fd = open(archive_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) return -1;
+  int rc = 0;
+  for (uint64_t i = 0; i < entry_count && rc == 0; i++) {
+    struct copy_record record;
+    if (read_spore_copy_record(fd, &record) != 0) {
+      rc = -1;
+      break;
+    }
+    char path[MAX_COPY_FULL_PATH_LEN];
+    if (build_copy_path(path, sizeof(path), root, record.path) != 0) {
+      rc = -1;
+      break;
+    }
+    if (record.kind == COPY_KIND_DIR) {
+      rc = apply_spore_copy_dir(path, (mode_t)record.mode);
+    } else if (record.kind == COPY_KIND_FILE) {
+      rc = apply_spore_copy_file(fd, path, (mode_t)record.mode, record.size);
+    } else if (record.kind == COPY_KIND_SYMLINK) {
+      rc = apply_spore_copy_symlink(fd, path, record.size);
+    } else {
+      rc = -1;
+    }
+  }
+  if (rc == 0 && expect_archive_eof(fd) != 0) rc = -1;
+  if (close(fd) != 0) rc = -1;
+  return rc;
+}
+
+static int spore_copy_apply(struct client *client, const char *root, const char *dest, uint64_t entry_count) {
+  if (dest[0] != '/' || (dest[1] != '\0' && validate_spore_copy_entry_path(dest) != 0)) {
+    return send_client_error_exit(client, 2, "spore build: invalid COPY destination\n");
+  }
+  if (entry_count > MAX_SPORE_COPY_ENTRIES) {
+    return send_client_error_exit(client, 2, "spore build: too many COPY entries\n");
+  }
+
+  char tmp_dir[] = "/tmp/spore-build-copy.XXXXXX";
+  if (mkdtemp(tmp_dir) == NULL) {
+    return send_client_error_exit(client, 1, "spore build: cannot create COPY temp dir\n");
+  }
+  char archive_tmp[MAX_COPY_FULL_PATH_LEN];
+  int n = snprintf(archive_tmp, sizeof(archive_tmp), "%s/archive", tmp_dir);
+  if (n <= 0 || (size_t)n >= sizeof(archive_tmp)) {
+    remove_tree(tmp_dir);
+    return send_client_error_exit(client, 1, "spore build: cannot create COPY temp path\n");
+  }
+  if (receive_copy_archive_from_spio(client, archive_tmp) != 0) {
+    remove_tree(tmp_dir);
+    return send_client_error_exit(client, 1, "spore build: COPY transfer failed\n");
+  }
+  if (apply_spore_copy_archive(archive_tmp, root, entry_count) != 0) {
+    remove_tree(tmp_dir);
+    return send_client_error_exit(client, 1, "spore build: COPY apply failed\n");
+  }
+  remove_tree(tmp_dir);
   return send_client_exit(client, 0);
 }
 
@@ -2970,6 +3138,22 @@ static void accept_request(int listener, struct session *session, struct client 
     } else {
       (void)copy_out_file(client, root, request.copy_path);
     }
+    close_client(client);
+    return;
+  }
+
+  if (request.kind == REQUEST_SPORE_COPY) {
+    if (!request.protocol_v1) {
+      (void)send_client_error_exit(client, 2, "spore build: COPY requires v1 protocol\n");
+      close_client(client);
+      return;
+    }
+    if (!use_rootfs || !rootfs_ready) {
+      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore build: rootfs unavailable\n");
+      close_client(client);
+      return;
+    }
+    (void)spore_copy_apply(client, "/mnt/rootfs", request.copy_dest, request.copy_entry_count);
     close_client(client);
     return;
   }

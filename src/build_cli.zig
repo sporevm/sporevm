@@ -19,11 +19,10 @@ pub const usage =
     \\  --no-cache                     Require executor work instead of step-cache hits
     \\  --mkfs PATH                    mkfs helper for OCI layout imports
     \\  --debugfs PATH                 debugfs helper for OCI layout imports
-    \\  --disk-headroom BYTES          Accepted for CLI stability; executor sizing lands in M2
+    \\  --disk-headroom BYTES          Grow the build rootfs by BYTES before the first executed step
     \\  -h, --help                     Show this help
     \\
-    \\The M2 RUN slice executes RUN cache misses. COPY cache misses still fail
-    \\closed until the COPY executor slice lands.
+    \\The M2 executor runs RUN and COPY cache misses in Dockerfile order.
     \\
 ;
 
@@ -36,6 +35,7 @@ const ParsedOptions = struct {
     build_args: std.array_list.Managed(build_mod.BuildArg),
     network: build_mod.NetworkMode = .spore,
     no_cache: bool = false,
+    disk_headroom: u64 = 0,
     mkfs: ?[]const u8 = null,
     debugfs: ?[]const u8 = null,
 };
@@ -79,6 +79,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
         .build_args = parsed.build_args.items,
         .network = parsed.network,
         .no_cache = parsed.no_cache,
+        .disk_headroom = parsed.disk_headroom,
         .mkfs = parsed.mkfs,
         .debugfs = parsed.debugfs,
         .output = stdout,
@@ -147,9 +148,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedOpti
         } else if (std.mem.startsWith(u8, arg, "--debugfs=")) {
             parsed.debugfs = try nonEmptyValue(arg["--debugfs=".len..]);
         } else if (std.mem.eql(u8, arg, "--disk-headroom")) {
-            _ = try std.fmt.parseInt(u64, try nextValue(args, &i, arg), 10);
+            parsed.disk_headroom = try std.fmt.parseInt(u64, try nextValue(args, &i, arg), 10);
         } else if (std.mem.startsWith(u8, arg, "--disk-headroom=")) {
-            _ = try std.fmt.parseInt(u64, try nonEmptyValue(arg["--disk-headroom=".len..]), 10);
+            parsed.disk_headroom = try std.fmt.parseInt(u64, try nonEmptyValue(arg["--disk-headroom=".len..]), 10);
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownArgument;
         } else if (parsed.context_dir == null) {
@@ -247,17 +248,14 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         error.CacheMissRequiresBuildExecutor => {
             try stderr.writeAll("spore build: cache miss requires an executor path that is not implemented yet\n");
         },
-        error.BuildCopyExecutorPending => {
-            try stderr.writeAll("spore build: COPY cache miss requires the M2 COPY executor slice; cached COPY steps before the first RUN miss are still supported\n");
-        },
         error.BuildRunFailed => {
             if (diagnostic.executor.instruction) |instruction| {
-                try stderr.print("spore build: RUN instruction failed: {s}\n", .{instruction});
+                try stderr.print("spore build: instruction failed: {s}\n", .{instruction});
             }
             if (diagnostic.executor.exit_code) |code| {
-                try stderr.print("spore build: RUN failed with exit code {d}\n", .{code});
+                try stderr.print("spore build: executor step failed with exit code {d}\n", .{code});
             } else {
-                try stderr.writeAll("spore build: RUN failed\n");
+                try stderr.writeAll("spore build: executor step failed\n");
             }
             if (diagnostic.executor.output.len != 0) {
                 try stderr.writeAll(diagnostic.executor.output);
@@ -269,6 +267,9 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         },
         error.BuildGuestThawFailed => {
             try stderr.writeAll("spore build: guest fsthaw failed after the step snapshot was recorded\n");
+        },
+        error.BuildGuestResizeFailed => {
+            try stderr.writeAll("spore build: guest resize2fs failed before executing build steps\n");
         },
         error.BuildGuestProtocolFailed => {
             try stderr.writeAll("spore build: guest executor protocol failed\n");
@@ -314,6 +315,18 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         },
         error.UnsupportedCopySourceType => {
             try stderr.writeAll("spore build: COPY source must be a regular file, directory, or symlink\n");
+        },
+        error.CopyDestinationMustBeDirectory => {
+            try stderr.writeAll("spore build: COPY with multiple sources requires a directory destination ending in /\n");
+        },
+        error.CopyDestinationUnsupported => {
+            try stderr.writeAll("spore build: COPY destination must stay inside the guest rootfs and fit executor bounds\n");
+        },
+        error.CopyEntryCountUnsupported => {
+            try stderr.writeAll("spore build: COPY has too many entries for the guest executor\n");
+        },
+        error.CopyPayloadTooLarge => {
+            try stderr.writeAll("spore build: COPY payload is too large for the guest executor\n");
         },
         error.RootFSDigestCacheMiss => {
             try stderr.writeAll("spore build: cached rootfs storage is missing its completeness stamp\n");

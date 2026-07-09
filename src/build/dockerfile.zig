@@ -112,7 +112,11 @@ fn parseInstruction(
         const args = try splitWords(allocator, rest, line, diagnostic);
         if (args.len < 2) return fail(diagnostic, line, "COPY requires at least one source and a destination");
         for (args) |arg| {
-            if (std.mem.startsWith(u8, arg, "--")) return fail(diagnostic, line, "unsupported COPY flag");
+            if (std.mem.startsWith(u8, arg, "--")) {
+                const flag = if (std.mem.indexOfScalar(u8, arg, '=')) |eq| arg[0..eq] else arg;
+                const message = try std.fmt.allocPrint(allocator, "unsupported COPY flag: {s}", .{flag});
+                return fail(diagnostic, line, message);
+            }
         }
         return .{ .copy = .{ .sources = args[0 .. args.len - 1], .dest = args[args.len - 1] } };
     }
@@ -406,7 +410,7 @@ test "Dockerfile parser rejects COPY flags in any position" {
     defer arena_state.deinit();
     var diag: Diagnostic = .{};
     try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nCOPY a --from=other /dest\n", &diag));
-    try std.testing.expectEqualStrings("unsupported COPY flag", diag.message);
+    try std.testing.expectEqualStrings("unsupported COPY flag: --from", diag.message);
 }
 
 test "Dockerfile parser enforces production input bounds" {
