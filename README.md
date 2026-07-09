@@ -287,6 +287,9 @@ state, not the original host terminal connection.
 agent. `attach` restores the spore and connects to a saved session. See
 [docs/filesystem.md](docs/filesystem.md) for rootfs-backed writable state and
 [docs/memory.md](docs/memory.md) for memory restore behavior.
+For one-shot child runs with externally assigned shard identity, add
+`--generation generation.json` to `spore run --from`; the JSON is published to
+the guest before the command starts.
 
 ## Fork and fan out
 

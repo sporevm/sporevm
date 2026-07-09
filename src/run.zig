@@ -975,6 +975,7 @@ pub const CliOptions = struct {
     backend: Backend = .auto,
     shared: SharedOptions = .{},
     from_spore_dir: ?[]const u8 = null,
+    generation_path: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
     pull_policy: PullPolicy = .missing,
@@ -1017,6 +1018,7 @@ pub const cli_usage =
     \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
     \\  --from DIR              Restore VM state from a spore and run a new command
     \\                          Uses spore memory/device sizing; omit --memory
+    \\  --generation FILE       With --from, inject fan-out identity JSON before command
     \\  --rootfs rootfs.ext4    Attach local rootfs read-only; save unsupported
     \\  --image REF             Build or reuse cached OCI rootfs; save preserves rootfs writes
     \\  --pull=missing|always|never
@@ -1065,6 +1067,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var backend: Backend = .auto;
     var shared = SharedOptions{};
     var from_spore_dir: ?[]const u8 = null;
+    var generation_path: ?[]const u8 = null;
     var rootfs_path: ?[]const u8 = null;
     var image_ref: ?[]const u8 = null;
     var pull_policy: PullPolicy = .missing;
@@ -1117,6 +1120,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             };
         } else if (std.mem.eql(u8, args[i], "--from")) {
             from_spore_dir = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--generation")) {
+            generation_path = takeValue(args, &i, args[i]);
+        } else if (std.mem.startsWith(u8, args[i], "--generation=")) {
+            generation_path = args[i]["--generation=".len..];
         } else if (std.mem.eql(u8, args[i], "--save")) {
             save_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--save-on")) {
@@ -1246,6 +1253,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             std.process.exit(2);
         }
     } else {
+        if (generation_path != null) {
+            std.debug.print("spore run: --generation requires --from\n", .{});
+            std.process.exit(2);
+        }
         for (bind_service_args.slice()) |raw| {
             network_policy.addBindService(raw) catch |err| {
                 std.debug.print("spore run: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
@@ -1282,6 +1293,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .backend = backend,
         .shared = shared,
         .from_spore_dir = from_spore_dir,
+        .generation_path = generation_path,
         .rootfs_path = rootfs_path,
         .image_ref = image_ref,
         .pull_policy = pull_policy,
@@ -4227,6 +4239,17 @@ test "run cli parser accepts source spore" {
     try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
+}
+
+test "run cli parser accepts source spore generation file" {
+    const opts = try parseCliArgs(&.{ "--from", "base.spore", "--generation", "generation.json", "--", "/bin/writeout" });
+    try std.testing.expectEqualStrings("base.spore", opts.from_spore_dir.?);
+    try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
+    try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
+    try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
+
+    const equals_opts = try parseCliArgs(&.{ "--from", "base.spore", "--generation=generation.json", "--", "/bin/writeout" });
+    try std.testing.expectEqualStrings("generation.json", equals_opts.generation_path.?);
 }
 
 test "run cli parser accepts source spore bound service bindings" {

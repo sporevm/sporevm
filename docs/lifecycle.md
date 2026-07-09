@@ -167,8 +167,9 @@ If `spore attach -i DIR` or `spore attach -t DIR` asks for input that
 the recorded handle cannot support, SporeVM rejects the request before restore.
 Starting a new command with `spore run --from DIR <command>` starts a new
 process session instead of reattaching to an existing handle; `-t` for that
-new-command path remains deferred. Named VM names remain lifecycle monitor
-handles.
+new-command path remains deferred. `spore run --from DIR --generation FILE <command>`
+publishes run-specific fan-out identity before that fresh command
+starts. Named VM names remain lifecycle monitor handles.
 
 ## Saves And Forks
 
@@ -252,7 +253,8 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
 - `spore attach -i` and `spore attach -t` can attach to saved live sessions
   only when that session was originally started with interactive stdin or a PTY.
   `spore run --from <spore-dir> <command>` starts a new command from saved VM
-  state. `spore run -t --from <spore-dir> <command>` is not implemented yet.
+  state. `--generation FILE` is accepted only with `--from`. `spore run -t
+  --from <spore-dir> <command>` is not implemented yet.
 - `spore exec -i/-t` uses a streaming monitor request. Embedders use
   `openExecNamedStream` for the same stdin, terminal, resize, exit, and
   monitor-error surface.

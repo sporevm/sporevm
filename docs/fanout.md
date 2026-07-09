@@ -107,10 +107,19 @@ that arbitrary already-running workloads consumed the metadata; workload
 harnesses own the identity-before-work barrier. `spore run --from` remains the
 completed-base path for starting a fresh command inside a child spore.
 
-## Single-Child Attach Identity
+## Single-Child Resume Identity
 
-Fleet adapters that materialize one child and call `spore attach` directly can
-inject the same guest-visible identity surface without running local fan-out:
+Fleet adapters that materialize one child can inject the same guest-visible
+identity surface without running local fan-out. Use `spore run --from` when the
+child should run a fresh one-shot command:
+
+```bash
+spore run --from child.spore \
+  --generation generation.json \
+  -- ./bin/test-one-shard
+```
+
+Use `spore attach` when the child should resume an already-saved session:
 
 ```bash
 spore attach child.spore \
@@ -118,9 +127,10 @@ spore attach child.spore \
   --events=jsonl
 ```
 
-`generation.json` is copied through the existing generation attach path and the
-guest agent publishes it at `/run/sporevm/generation.json`, with compatible
-helper lines in `/run/sporevm/env`. The payload must be a JSON object with
+`generation.json` is copied through the existing generation resume path and the
+guest agent publishes it before the command or attached session starts at
+`/run/sporevm/generation.json`, with compatible helper lines in
+`/run/sporevm/env`. The payload must be a JSON object with
 `run_id`, `child_id`, `parallel_index`, `parallel_count`, `fork_index`,
 `fork_count`, `fork_batch_id`, and `vm_id`. Counts must be positive, and index
 values must be smaller than their matching counts. The interface is generic:
