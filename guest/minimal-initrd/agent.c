@@ -2097,7 +2097,55 @@ static int prepend_symlink_target(char *pending, size_t pending_cap, const char 
   return 0;
 }
 
-static int confined_open_existing_fallback(int root_fd, const char *raw_path, int flags) {
+static int open_resolved_path_nofollow(int root_fd, const char *logical, int flags, mode_t mode) {
+  if (logical[0] == '\0') return dup(root_fd);
+
+  char pending[MAX_COPY_FULL_PATH_LEN];
+  int n = snprintf(pending, sizeof(pending), "%s", logical);
+  if (n < 0 || (size_t)n >= sizeof(pending)) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+
+  int dir_fd = dup(root_fd);
+  if (dir_fd < 0) return -1;
+
+  for (;;) {
+    char component[MAX_COPY_PATH_LEN + 1];
+    int next = pop_pending_component(pending, component, sizeof(component));
+    if (next <= 0) {
+      int saved = next < 0 ? errno : EINVAL;
+      close(dir_fd);
+      errno = saved;
+      return -1;
+    }
+
+    if (pending[0] == '\0') {
+      int fd = openat(dir_fd, component, flags | O_NOFOLLOW | O_CLOEXEC, mode);
+      int saved = errno;
+      if (close(dir_fd) != 0 && fd >= 0) {
+        close(fd);
+        return -1;
+      }
+      errno = saved;
+      return fd;
+    }
+
+    int next_fd = openat(dir_fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int saved = errno;
+    if (close(dir_fd) != 0 && next_fd >= 0) {
+      close(next_fd);
+      return -1;
+    }
+    if (next_fd < 0) {
+      errno = saved;
+      return -1;
+    }
+    dir_fd = next_fd;
+  }
+}
+
+static int confined_open_path_fallback(int root_fd, const char *raw_path, int flags, mode_t mode) {
   const char *rel = raw_path[0] == '/' ? raw_path + 1 : raw_path;
   if (rel[0] == '\0') return dup(root_fd);
   if (strlen(rel) > MAX_COPY_PATH_LEN) {
@@ -2131,7 +2179,13 @@ static int confined_open_existing_fallback(int root_fd, const char *raw_path, in
     if (append_path_component(candidate, sizeof(candidate), component, strlen(component)) != 0) return -1;
 
     struct stat st;
-    if (fstatat(root_fd, candidate, &st, AT_SYMLINK_NOFOLLOW) != 0) return -1;
+    if (fstatat(root_fd, candidate, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno == ENOENT && pending[0] == '\0' && (flags & O_CREAT) != 0) {
+        if (append_path_component(logical, sizeof(logical), component, strlen(component)) != 0) return -1;
+        break;
+      }
+      return -1;
+    }
     if (S_ISLNK(st.st_mode)) {
       if (++symlink_depth > MAX_SYMLINK_DEPTH) {
         errno = ELOOP;
@@ -2149,24 +2203,27 @@ static int confined_open_existing_fallback(int root_fd, const char *raw_path, in
     if (append_path_component(logical, sizeof(logical), component, strlen(component)) != 0) return -1;
   }
 
-  if (logical[0] == '\0') return dup(root_fd);
-  return openat(root_fd, logical, flags | O_NOFOLLOW | O_CLOEXEC);
+  return open_resolved_path_nofollow(root_fd, logical, flags, mode);
 }
 
-static int confined_open_existing(int root_fd, const char *path, int flags) {
+static int confined_open_path(int root_fd, const char *path, int flags, mode_t mode) {
   const char *rel = path[0] == '/' ? path + 1 : path;
   if (rel[0] == '\0') return dup(root_fd);
 #ifdef SYS_openat2
   struct open_how how = {
       .flags = (uint64_t)(flags | O_CLOEXEC),
-      .mode = 0,
+      .mode = (uint64_t)mode,
       .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS,
   };
   int fd = (int)syscall(SYS_openat2, root_fd, rel, &how, sizeof(how));
   if (fd >= 0) return fd;
   if (errno != ENOSYS) return -1;
 #endif
-  return confined_open_existing_fallback(root_fd, path, flags);
+  return confined_open_path_fallback(root_fd, path, flags, mode);
+}
+
+static int confined_open_existing(int root_fd, const char *path, int flags) {
+  return confined_open_path(root_fd, path, flags, 0);
 }
 
 static int confined_parent_fd(int root_fd, const char *path, char *name, size_t name_cap) {
@@ -2265,26 +2322,43 @@ static int prepare_overwrite_path(int root_fd, const char *path, int allow_exist
 
 static int apply_spore_copy_dir(int root_fd, const char *path, mode_t mode) {
   if (ensure_parent_dirs(root_fd, path) != 0) return -1;
-  if (prepare_overwrite_path(root_fd, path, 1) != 0) return -1;
   char name[MAX_COPY_PATH_LEN + 1];
   int parent_fd = confined_parent_fd(root_fd, path, name, sizeof(name));
   if (parent_fd < 0) return -1;
   int rc = mkdirat(parent_fd, name, mode & 07777);
   if (rc != 0 && errno == EEXIST) rc = 0;
-  if (rc == 0 && fchmodat(parent_fd, name, mode & 07777, 0) != 0) rc = -1;
   int saved = errno;
   if (close(parent_fd) != 0 && rc == 0) return -1;
+  errno = saved;
+  if (rc != 0) return rc;
+
+  int dir_fd = confined_open_existing(root_fd, path, O_RDONLY | O_DIRECTORY);
+  if (dir_fd < 0) return -1;
+  rc = fchmod(dir_fd, mode & 07777);
+  saved = errno;
+  if (close(dir_fd) != 0 && rc == 0) return -1;
   errno = saved;
   return rc;
 }
 
 static int apply_spore_copy_file(int root_fd, int archive_fd, const char *path, mode_t mode, uint64_t size) {
   if (ensure_parent_dirs(root_fd, path) != 0) return -1;
-  if (prepare_overwrite_path(root_fd, path, 0) != 0) return -1;
   char name[MAX_COPY_PATH_LEN + 1];
   int parent_fd = confined_parent_fd(root_fd, path, name, sizeof(name));
   if (parent_fd < 0) return -1;
-  int fd = openat(parent_fd, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode & 07777);
+
+  struct stat st;
+  int cleanup_on_error = 1;
+  if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+    cleanup_on_error = !S_ISLNK(st.st_mode);
+  } else if (errno != ENOENT) {
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return -1;
+  }
+
+  int fd = confined_open_path(root_fd, path, O_WRONLY | O_CREAT | O_TRUNC, mode & 07777);
   if (fd < 0) {
     int saved = errno;
     close(parent_fd);
@@ -2294,7 +2368,7 @@ static int apply_spore_copy_file(int root_fd, int archive_fd, const char *path, 
   int rc = copy_archive_file_to_fd(archive_fd, fd, size);
   if (rc == 0 && fchmod(fd, mode & 07777) != 0) rc = -1;
   if (close(fd) != 0) rc = -1;
-  if (rc != 0) unlinkat(parent_fd, name, 0);
+  if (rc != 0 && cleanup_on_error) unlinkat(parent_fd, name, 0);
   int saved = errno;
   if (close(parent_fd) != 0 && rc == 0) return -1;
   errno = saved;

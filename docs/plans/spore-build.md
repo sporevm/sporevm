@@ -548,10 +548,14 @@ session as `RUN`, rather than host-side ext4 surgery:
    existing SPIO stdin frames. Each entry has kind (dir/file/symlink), mode,
    absolute guest path, and content bytes for files or symlink targets. The
    agent resolves apply paths relative to an fd for `/mnt/rootfs` with
-   `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`, falling back only to a
-   fail-closed component walk that keeps symlink targets rooted in the rootfs.
-   It applies entries with root ownership, parent creation, directory merge,
-   file overwrite, and symlink preservation.
+   `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`, falling back on
+   kernels without `openat2` to a confined manual component walk that keeps
+   symlink targets rooted in the rootfs. Final-component symlinks are followed
+   under the same confined resolution, so file entries write through them,
+   directory entries merge through symlinked directories, and dangling file
+   symlink targets are created inside the rootfs. It applies entries with root
+   ownership, parent creation, directory merge, file overwrite, and symlink
+   preservation.
 4. Checkpoint exactly as RUN does (freeze, O(dirty) snapshot, complete stamp,
    step record, thaw).
 
@@ -577,6 +581,10 @@ Docker semantic contract, tested explicitly:
 - Multiple sources require a `/`-terminated destination.
 - Relative destinations resolve against the current `WORKDIR`.
 - Copied entries are owned `0:0`; file modes come from the context.
+- Destination symlinks are followed under confined rootfs resolution: file
+  entries write through final symlinks, directory entries merge through
+  symlinked directories, and absolute symlink targets re-root inside the
+  rootfs.
 - Wildcards (`*`, `?`) match with Go-filepath rules per Docker; first
   implementation supports literal paths and `*` globs, rejects the rest.
 
@@ -728,7 +736,7 @@ record. The slice also fixes
 `spore_rootfs=1` even when there is no flat rootfs path.
 The build VM memory is currently a provisional 2 GiB default; promote it to a
 `spore build` option when real workloads such as large `bundle install`-style
-RUN steps need more headroom.
+RUN steps need more memory.
 
 Implementation note (2026-07-09, COPY slice): the executor step list is now a
 tagged RUN/COPY sequence, so the first uncached COPY enters the same persistent
@@ -739,13 +747,13 @@ same build-context resolver as hashing, maps Docker destinations before boot,
 and streams a bounded custom `spore-copy-v1` entry protocol rather than tar.
 The guest agent validates entry count, kind, mode, path length, content length,
 and `..` components, then confines all apply-path resolution to `/mnt/rootfs`
-while preserving Docker-style rootfs-internal symlink traversal. COPY
-checkpoints use the same freeze → snapshot → complete stamp → step record →
-thaw ordering as RUN. Session start uses the deterministic sparse grow policy
-above and includes the resolved grow target in the first executor-written step
-key; the hidden `--disk-headroom` debug override bypasses the policy and uses
-the same key field. A manual Docker-vs-Spore metadata oracle lives at
-`scripts/spore-build-copy-oracle.sh`.
+while preserving Docker-style rootfs-internal and final-component symlink
+traversal. COPY checkpoints use the same freeze → snapshot → complete stamp →
+step record → thaw ordering as RUN. Session start uses the deterministic sparse
+grow policy above and includes the resolved grow target in the first
+executor-written step key; the hidden `--disk-grow-target` debug override
+bypasses the policy and uses the same key field. A manual Docker-vs-Spore
+metadata oracle lives at `scripts/spore-build-copy-oracle.sh`.
 
 Remaining M2 completion work: prove the full `buildkite-sporevm` wrapper path
 against the real Buildkite base end to end and record the measured acceptance
