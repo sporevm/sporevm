@@ -38,6 +38,35 @@ Rootfs bytes are not stored inside the spore directory today; `spore attach`
 opens and verifies the manifest-selected exact artifact or chunked storage
 before boot.
 
+`spore build` uses local build step records under the rootfs cache at
+`build/steps/<step_key>.json`. These records are host-local cache metadata, not
+portable spore format. A `sporevm-build-step-v1` record binds
+`builder_version`, `platform`, `step_key`, `parent_index_digest`,
+`child_index_digest`, `instruction_kind`, canonical Dockerfile instruction text,
+`input_digest`, `env_digest`, `workdir`, and the child's `rootfs_storage`
+descriptor. A cache hit is valid only when the recomputed key matches the
+record, the descriptor passes the normal chunked-rootfs storage validation,
+`base_identity` and `index_digest` both equal `child_index_digest`, and the
+selected rootfs CAS completeness stamp is present or repairable from verified
+CAS contents.
+
+The local image identity published by `spore build` is distinct from the raw
+rootfs storage identity. `spore build` first serializes the final
+`ImageConfig` as canonical JSON with optional null fields omitted and the
+deterministic struct field order used by `src/rootfs/oci.zig`
+(`architecture`, `os`, `config`, then runtime config fields `Env`,
+`Entrypoint`, `Cmd`, `WorkingDir`, `User`). `config_digest` is
+`blake3:<hex>` over two length-prefixed fields: the ASCII domain
+`sporevm-indexed-image-config-v1` and those canonical config JSON bytes. The
+published image digest is `blake3:<hex>` over three length-prefixed fields: the
+ASCII domain `sporevm-indexed-image-v1`, the final `rootfs_storage.index_digest`
+string, and the same canonical config JSON bytes. Each field is framed as an
+unsigned 64-bit little-endian byte length followed by the exact bytes. The
+local resolved ref and metadata path are keyed by that image digest, while the
+metadata's `rootfs_storage` descriptor remains keyed by the raw rootfs index
+digest used to boot the VM. `rootfs_storage` is the local rootfs metadata
+field; portable spore manifests continue to use `rootfs.storage`.
+
 A local single-spore bundle is the first distribution form:
 
 ```text

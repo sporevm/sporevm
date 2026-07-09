@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Blake3 = std.crypto.hash.Blake3;
 const chunk = @import("chunk.zig");
 const ext4 = @import("rootfs/ext4.zig");
 pub const ext4_writer = @import("rootfs/ext4_writer.zig");
@@ -125,6 +126,27 @@ pub const ImportOciResult = struct {
 
 pub const ImportTarResult = ImportOciResult;
 
+pub const PublishIndexedImageRequest = struct {
+    ref: []const u8,
+    platform: Platform = .{},
+    config: ImageConfig = .{},
+    rootfs_storage: spore.RootfsStorage,
+};
+
+pub const PublishIndexedImageResult = struct {
+    metadata_path: []const u8,
+    local_ref_path: []const u8,
+    resolved_image_ref: []const u8,
+    image_manifest_digest: []const u8,
+    rootfs_storage: spore.RootfsStorage,
+};
+
+pub const CachedIndexedRootfs = struct {
+    metadata_path: []const u8,
+    artifact: spore.RootfsArtifactRef,
+    storage: spore.RootfsStorage,
+};
+
 pub const RootfsStoragePolicy = enum {
     chunked,
     flat,
@@ -154,6 +176,7 @@ pub const local_ref_cache_kind = "sporevm-local-rootfs-ref-v1";
 const image_ref_cache_record_version: u32 = 1;
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const max_image_ref_cache_record_bytes = 64 * 1024;
+const indexed_image_identity_domain = "sporevm-indexed-image-v1";
 const rootfs_cache_lock_name = ".sporevm-rootfs-cache.lock";
 const flock_exclusive: c_int = 2;
 const flock_nonblocking: c_int = 4;
@@ -585,7 +608,7 @@ pub const Platform = oci.Platform;
 pub const ImageRef = oci.ImageRef;
 const ImageTag = oci.ImageTag;
 const ImageManifest = oci.ImageManifest;
-const ImageConfig = oci.ImageConfig;
+pub const ImageConfig = oci.ImageConfig;
 
 pub const BuildResult = struct {
     rootfs_storage: spore.RootfsStorage,
@@ -1066,6 +1089,63 @@ pub fn importTar(init: std.process.Init, allocator: std.mem.Allocator, request: 
     };
 }
 
+pub fn publishIndexedImage(init: std.process.Init, allocator: std.mem.Allocator, request: PublishIndexedImageRequest) !PublishIndexedImageResult {
+    _ = try parseLocalTagRef(request.ref);
+    try spore.validateRootfsStorageDescriptor(request.rootfs_storage);
+    if (!std.mem.eql(u8, request.rootfs_storage.index_digest, request.rootfs_storage.base_identity)) return error.BadManifest;
+
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    defer allocator.free(cache_root);
+    try ensureDirPath(init.io, cache_root);
+    if (!try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, cache_root, request.rootfs_storage)) return error.RootFSDigestCacheMiss;
+
+    const canonical_config_json = try canonicalImageConfigJson(allocator, request.config);
+    defer allocator.free(canonical_config_json);
+    const config_digest = try indexedImageConfigDigest(allocator, canonical_config_json);
+    defer allocator.free(config_digest);
+    const image_digest = try indexedImageDigest(allocator, request.rootfs_storage.index_digest, canonical_config_json);
+    const resolved_image_ref = try localResolvedBlake3Ref(allocator, request.ref, image_digest);
+    const resolved = ResolvedImage{
+        .ref = resolved_image_ref,
+        .manifest_digest = image_digest,
+        .platform = request.platform,
+    };
+    const metadata_path = try cachedImageRootfsMetadataPath(allocator, cache_root, resolved);
+    const metadata = RootFSMetadata{
+        .builder_version = builder_version,
+        .ext4_writer = "built-index",
+        .image_ref = request.ref,
+        .resolved_image_ref = resolved_image_ref,
+        .image_manifest_digest = image_digest,
+        .platform = request.platform,
+        .config_digest = config_digest,
+        .config = request.config,
+        .layers = &.{},
+        .deterministic = false,
+        .ext4_uuid = "",
+        .ext4_hash_seed = "",
+        .rootfs_path = "",
+        .rootfs_size = request.rootfs_storage.logical_size,
+        .rootfs_storage = request.rootfs_storage,
+    };
+    const metadata_json = try std.json.Stringify.valueAlloc(allocator, metadata, .{
+        .whitespace = .indent_2,
+        .emit_null_optional_fields = false,
+    });
+    try ext4.ensureParentDir(init.io, metadata_path);
+    try writeFileAtomicPath(init.io, allocator, metadata_path, metadata_json);
+
+    const local_ref_path = try writeLocalRefCacheAnyDigest(init.io, allocator, cache_root, request.ref, resolved);
+    const result_storage = try spore.cloneRootfsStorage(allocator, request.rootfs_storage);
+    return .{
+        .metadata_path = metadata_path,
+        .local_ref_path = local_ref_path,
+        .resolved_image_ref = resolved_image_ref,
+        .image_manifest_digest = image_digest,
+        .rootfs_storage = result_storage,
+    };
+}
+
 pub fn resolveReference(init: std.process.Init, allocator: std.mem.Allocator, request: ResolveRequest) ![]const u8 {
     if (isLocalImageRef(request.ref)) {
         const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
@@ -1103,6 +1183,19 @@ pub fn deinitImportOciResult(allocator: std.mem.Allocator, result: ImportOciResu
 }
 
 pub const deinitImportTarResult = deinitImportOciResult;
+
+pub fn deinitPublishIndexedImageResult(allocator: std.mem.Allocator, result: PublishIndexedImageResult) void {
+    allocator.free(result.metadata_path);
+    allocator.free(result.local_ref_path);
+    allocator.free(result.resolved_image_ref);
+    deinitStorageDigestFields(allocator, result.rootfs_storage);
+}
+
+pub fn deinitCachedIndexedRootfs(allocator: std.mem.Allocator, result: CachedIndexedRootfs) void {
+    allocator.free(result.metadata_path);
+    allocator.free(result.artifact.digest);
+    deinitStorageDigestFields(allocator, result.storage);
+}
 
 pub fn deinitResolvedReference(allocator: std.mem.Allocator, resolved_ref: []const u8) void {
     allocator.free(resolved_ref);
@@ -1682,6 +1775,41 @@ fn validateConfigPlatform(config: ImageConfig, platform: Platform) !void {
     }
 }
 
+fn canonicalImageConfigJson(allocator: std.mem.Allocator, config: ImageConfig) ![]const u8 {
+    return std.json.Stringify.valueAlloc(allocator, config, .{
+        .emit_null_optional_fields = false,
+    });
+}
+
+fn indexedImageConfigDigest(allocator: std.mem.Allocator, canonical_config_json: []const u8) ![]const u8 {
+    var h = Blake3.init(.{});
+    updateFramed(&h, "sporevm-indexed-image-config-v1");
+    updateFramed(&h, canonical_config_json);
+    return blake3DigestAlloc(allocator, &h);
+}
+
+fn indexedImageDigest(allocator: std.mem.Allocator, index_digest: []const u8, canonical_config_json: []const u8) ![]const u8 {
+    var h = Blake3.init(.{});
+    updateFramed(&h, indexed_image_identity_domain);
+    updateFramed(&h, index_digest);
+    updateFramed(&h, canonical_config_json);
+    return blake3DigestAlloc(allocator, &h);
+}
+
+fn updateFramed(h: *Blake3, bytes: []const u8) void {
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, bytes.len, .little);
+    h.update(&len_buf);
+    h.update(bytes);
+}
+
+fn blake3DigestAlloc(allocator: std.mem.Allocator, h: *Blake3) ![]const u8 {
+    var digest: [Blake3.digest_length]u8 = undefined;
+    h.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, &hex });
+}
+
 fn layerBlobPath(allocator: std.mem.Allocator, layers_dir: []const u8, digest: []const u8) ![]u8 {
     if (!oci.isSha256Digest(digest)) return error.UnsupportedDigest;
     return std.fmt.allocPrint(allocator, "{s}/{s}.blob", .{ layers_dir, digest["sha256:".len..] });
@@ -1740,6 +1868,44 @@ fn localResolvedImageRef(allocator: std.mem.Allocator, raw_ref: []const u8, mani
     return std.fmt.allocPrint(allocator, "local/{s}@{s}", .{ tag.repository, manifest_digest });
 }
 
+fn localResolvedBlake3Ref(allocator: std.mem.Allocator, raw_ref: []const u8, digest: []const u8) ![]u8 {
+    if (!std.mem.startsWith(u8, digest, spore.rootfs_digest_prefix)) return error.UnsupportedDigest;
+    const tag = try parseLocalTagRef(raw_ref);
+    return std.fmt.allocPrint(allocator, "local/{s}@{s}", .{ tag.repository, digest });
+}
+
+fn localResolvedRefMatchesDigest(allocator: std.mem.Allocator, raw_ref: []const u8, resolved_ref: []const u8, digest: []const u8) !bool {
+    if (parseLocalDigestRef(resolved_ref)) |image_ref| {
+        return std.mem.eql(u8, image_ref.digest, digest);
+    } else |err| switch (err) {
+        error.UnsupportedDigest => {},
+        else => |e| return e,
+    }
+    if (!std.mem.startsWith(u8, digest, spore.rootfs_digest_prefix)) return false;
+    const tag = try parseLocalTagRef(raw_ref);
+    const expected = try std.fmt.allocPrint(allocator, "local/{s}@{s}", .{ tag.repository, digest });
+    defer allocator.free(expected);
+    return std.mem.eql(u8, resolved_ref, expected);
+}
+
+fn localResolvedBlake3DigestRef(allocator: std.mem.Allocator, raw_ref: []const u8) !?ResolvedImage {
+    const at = std.mem.lastIndexOfScalar(u8, raw_ref, '@') orelse return null;
+    const name = raw_ref[0..at];
+    const digest = raw_ref[at + 1 ..];
+    if (!std.mem.startsWith(u8, digest, spore.rootfs_digest_prefix)) return error.UnsupportedDigest;
+    try spore.validateRootfsDigest(digest);
+
+    const tag_probe = try std.fmt.allocPrint(allocator, "{s}:digest", .{name});
+    defer allocator.free(tag_probe);
+    const tag = try parseLocalTagRef(tag_probe);
+    const resolved_ref = try std.fmt.allocPrint(allocator, "local/{s}@{s}", .{ tag.repository, digest });
+    return .{
+        .ref = resolved_ref,
+        .manifest_digest = digest,
+        .platform = .{},
+    };
+}
+
 pub fn resolveLocalCachedRef(
     io: Io,
     allocator: std.mem.Allocator,
@@ -1756,6 +1922,12 @@ pub fn resolveLocalCachedRef(
         };
     } else |err| switch (err) {
         error.ImageRefMustBeDigestPinned => {},
+        error.UnsupportedDigest => {
+            if (try localResolvedBlake3DigestRef(allocator, raw_ref)) |resolved| {
+                return .{ .ref = resolved.ref, .manifest_digest = resolved.manifest_digest, .platform = platform };
+            }
+            return err;
+        },
         else => |e| return e,
     }
 
@@ -1772,8 +1944,7 @@ pub fn resolveLocalCachedRef(
     if (!std.mem.eql(u8, value.platform.os, platform.os) or !std.mem.eql(u8, value.platform.arch, platform.arch)) {
         return error.UnsupportedPlatform;
     }
-    const image_ref = try parseLocalDigestRef(value.resolved_image_ref);
-    if (!std.mem.eql(u8, image_ref.digest, value.image_manifest_digest)) return error.LocalRefCacheMismatch;
+    if (!try localResolvedRefMatchesDigest(allocator, raw_ref, value.resolved_image_ref, value.image_manifest_digest)) return error.LocalRefCacheMismatch;
 
     return .{
         .ref = try allocator.dupe(u8, value.resolved_image_ref),
@@ -1792,6 +1963,19 @@ pub fn writeLocalRefCache(
     _ = try parseLocalTagRef(raw_ref);
     const resolved_ref = try parseLocalDigestRef(resolved.ref);
     if (!std.mem.eql(u8, resolved_ref.digest, resolved.manifest_digest)) return error.LocalRefCacheMismatch;
+
+    return writeLocalRefCacheAnyDigest(io, allocator, cache_root, raw_ref, resolved);
+}
+
+fn writeLocalRefCacheAnyDigest(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    raw_ref: []const u8,
+    resolved: ResolvedImage,
+) ![]const u8 {
+    _ = try parseLocalTagRef(raw_ref);
+    if (!try localResolvedRefMatchesDigest(allocator, raw_ref, resolved.ref, resolved.manifest_digest)) return error.LocalRefCacheMismatch;
 
     const path = try localRefCachePath(allocator, cache_root, raw_ref, resolved.platform);
     try ext4.ensureParentDir(io, path);
@@ -1886,6 +2070,42 @@ pub fn cachedImageRootfsPath(
         return rootfs_path;
     }
     return null;
+}
+
+pub fn cachedImageIndexedRootfs(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    resolved: ResolvedImage,
+) !?CachedIndexedRootfs {
+    const metadata_path = try cachedImageRootfsMetadataPath(allocator, cache_root, resolved);
+    errdefer allocator.free(metadata_path);
+    if (!try cachedRootfsIdentityMatches(io, allocator, metadata_path, resolved)) {
+        allocator.free(metadata_path);
+        return null;
+    }
+    const storage = (try readCachedRootfsStorageDescriptor(io, allocator, metadata_path)) orelse {
+        allocator.free(metadata_path);
+        return null;
+    };
+    errdefer deinitStorageDigestFields(allocator, storage);
+    if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, storage)) {
+        allocator.free(metadata_path);
+        deinitStorageDigestFields(allocator, storage);
+        return null;
+    }
+    const artifact_digest = try allocator.dupe(u8, storage.index_digest);
+    errdefer allocator.free(artifact_digest);
+    const artifact = spore.RootfsArtifactRef{
+        .digest = artifact_digest,
+        .size = storage.logical_size,
+        .format = spore.rootfs_artifact_format_ext4,
+    };
+    return .{
+        .metadata_path = metadata_path,
+        .artifact = artifact,
+        .storage = storage,
+    };
 }
 
 pub fn cachedImageRootfsArtifact(
@@ -2157,6 +2377,28 @@ const CachedRootfsArtifactMetadata = struct {
     rootfs_storage: ?spore.RootfsStorage = null,
 };
 
+fn readCachedRootfsStorageDescriptor(
+    io: Io,
+    allocator: std.mem.Allocator,
+    metadata_path: []const u8,
+) !?spore.RootfsStorage {
+    const metadata = Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return null,
+        else => |e| return e,
+    };
+    defer allocator.free(metadata);
+    var parsed = std.json.parseFromSlice(CachedRootfsStorageMetadata, allocator, metadata, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    const storage = parsed.value.rootfs_storage orelse return null;
+    spore.validateRootfsStorageDescriptor(storage) catch return null;
+    if (storage.logical_size != parsed.value.rootfs_size) return null;
+    if (!std.mem.eql(u8, storage.index_digest, storage.base_identity)) return null;
+    return try spore.cloneRootfsStorage(allocator, storage);
+}
+
 fn rootfsArtifactDigestSuffix(artifact_digest: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, artifact_digest, spore.rootfs_digest_prefix)) return null;
     return artifact_digest[spore.rootfs_digest_prefix.len..];
@@ -2203,6 +2445,16 @@ fn cachedRootfsMetadataMatches(
     resolved: ResolvedImage,
     ext4_writer_choice: Ext4Writer,
 ) !bool {
+    return (try cachedRootfsIdentityMatches(io, allocator, metadata_path, resolved)) and
+        try cachedRootfsExt4WriterMatches(io, allocator, metadata_path, ext4_writer_choice);
+}
+
+fn cachedRootfsIdentityMatches(
+    io: Io,
+    allocator: std.mem.Allocator,
+    metadata_path: []const u8,
+    resolved: ResolvedImage,
+) !bool {
     const metadata = Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes)) catch |err| switch (err) {
         error.FileNotFound, error.StreamTooLong => return false,
         else => |e| return e,
@@ -2215,7 +2467,6 @@ fn cachedRootfsMetadataMatches(
         else => return false,
     };
     if (!jsonStringEquals(object.get("builder_version"), builder_version)) return false;
-    if (!jsonStringEquals(object.get("ext4_writer"), ext4_writer_choice.text())) return false;
     if (!jsonStringEquals(object.get("resolved_image_ref"), resolved.ref)) return false;
     if (!jsonStringEquals(object.get("image_manifest_digest"), resolved.manifest_digest)) return false;
     const platform_value = object.get("platform") orelse return false;
@@ -2225,6 +2476,26 @@ fn cachedRootfsMetadataMatches(
     };
     return jsonStringEquals(platform_object.get("os"), resolved.platform.os) and
         jsonStringEquals(platform_object.get("arch"), resolved.platform.arch);
+}
+
+fn cachedRootfsExt4WriterMatches(
+    io: Io,
+    allocator: std.mem.Allocator,
+    metadata_path: []const u8,
+    ext4_writer_choice: Ext4Writer,
+) !bool {
+    const metadata = Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return false,
+        else => |e| return e,
+    };
+    defer allocator.free(metadata);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, metadata, .{}) catch return false;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    return jsonStringEquals(object.get("ext4_writer"), ext4_writer_choice.text());
 }
 
 fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
@@ -3010,6 +3281,27 @@ test "local digest ref resolves without mutable ref cache" {
     );
     try std.testing.expectEqualStrings(
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        resolved.manifest_digest,
+    );
+}
+
+test "local indexed digest ref resolves without mutable ref cache" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const resolved = try resolveLocalCachedRef(
+        std.testing.io,
+        allocator,
+        "zig-cache/no-local-ref-cache-needed",
+        "local/sporevm-app@blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .{},
+    );
+    try std.testing.expectEqualStrings(
+        "local/sporevm-app@blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        resolved.ref,
+    );
+    try std.testing.expectEqualStrings(
+        "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         resolved.manifest_digest,
     );
 }

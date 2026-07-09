@@ -68,6 +68,8 @@ const usage =
     \\                        Pull one child into a spore dir
     \\
     \\  Rootfs and local system:
+    \\    build [options] CONTEXT
+    \\                        Build a Spore image from a Dockerfile subset
     \\    rootfs              Build rootfs images from OCI images
     \\    cache               Inspect and collect local content-addressed caches
     \\    system              Inspect and prune local SporeVM system state
@@ -201,6 +203,8 @@ fn runCommand(
         try spore_internal.system.cacheRun(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "rootfs")) {
         try spore_internal.rootfs_cli.run(init, command_args, stdout);
+    } else if (std.mem.eql(u8, command, "build")) {
+        try spore_internal.build_cli.run(init, command_args, stdout, stderr);
     } else if (std.mem.eql(u8, command, "run")) {
         try spore_internal.run_cli.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "attach")) {
@@ -972,6 +976,7 @@ fn writePullResult(writer: *Io.Writer, result: spore_api.PullResult) !void {
 
 test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "--debug") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "build") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "rootfs") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "run") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "attach") != null);
