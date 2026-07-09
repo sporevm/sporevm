@@ -289,6 +289,9 @@ pub const RunFromSporeOptions = struct {
     save_path: ?[]const u8 = null,
     save_trigger: SaveTrigger = .exit,
     continue_after_save: bool = false,
+    /// Optional fan-out identity JSON to deliver before a run-from command starts.
+    /// Only meaningful when `command` starts a fresh process.
+    generation_path: ?[]const u8 = null,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
     /// Live host-side bindings for manifest-declared bound services.
@@ -930,15 +933,14 @@ pub fn runFromSpore(
     if (manifest_v1 != null and options.vcpus != 1 and options.vcpus != manifest_vcpus) return error.PlatformMismatch;
     const manifest_generation = if (manifest) |parsed| parsed.value.generation else manifest_v1.?.value.generation;
     const sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions;
-    var resume_generation: ?generation.State = null;
-    var start_generation_params: ?[]const u8 = null;
-    if (manifest_generation.params_b64.len != 0) {
-        var gen_dev = generation.Device{};
-        try gen_dev.restore(arena, manifest_generation);
-        try spore.refreshResumeParams(arena, &gen_dev);
-        resume_generation = try gen_dev.capture(arena);
-        start_generation_params = try arena.dupe(u8, gen_dev.paramsPayload());
-    }
+    const explicit_generation_params = if (options.generation_path) |path|
+        attach_mod.loadGenerationParams(context.io, arena, path) catch |err| switch (err) {
+            error.BadGenerationPayload, error.StreamTooLong => return err,
+            else => return error.GenerationReadFailed,
+        }
+    else
+        null;
+    const run_generation = try prepareRunFromGenerationState(arena, manifest_generation, explicit_generation_params);
 
     return run_mod.execute(context, arena, .{
         .backend = options.backend,
@@ -948,11 +950,11 @@ pub fn runFromSpore(
         .rootfs = rootfs,
         .disk = disk,
         .resume_dir = options.spore_dir,
-        .resume_generation = resume_generation,
+        .resume_generation = run_generation.resume_generation,
         .resume_sessions = sessions,
         .attach_session_id = options.attach_session_id orelse spore.defaultAttachSessionId(sessions),
-        .start_generation_params = start_generation_params,
-        .require_generation_ready = start_generation_params != null,
+        .start_generation_params = run_generation.start_generation_params,
+        .require_generation_ready = run_generation.start_generation_params != null,
         .command = options.command,
         .guest_env = options.guest_env,
         .interactive = options.interactive,
@@ -972,6 +974,33 @@ pub fn runFromSpore(
         .debug = options.debug,
         .events = options.events,
     });
+}
+
+const RunFromGenerationState = struct {
+    resume_generation: ?generation.State = null,
+    start_generation_params: ?[]const u8 = null,
+};
+
+fn prepareRunFromGenerationState(
+    allocator: std.mem.Allocator,
+    manifest_generation: spore.GenerationState,
+    explicit_generation_params: ?[]const u8,
+) !RunFromGenerationState {
+    if (explicit_generation_params) |params| {
+        return .{
+            .resume_generation = try attach_mod.prepareRestoreGenerationState(allocator, manifest_generation, params),
+            .start_generation_params = params,
+        };
+    }
+    if (manifest_generation.params_b64.len == 0) return .{};
+
+    var gen_dev = generation.Device{};
+    try gen_dev.restore(allocator, manifest_generation);
+    try spore.refreshResumeParams(allocator, &gen_dev);
+    return .{
+        .resume_generation = try gen_dev.capture(allocator),
+        .start_generation_params = try allocator.dupe(u8, gen_dev.paramsPayload()),
+    };
 }
 
 /// Attach to a spore's recorded session.
@@ -1505,6 +1534,38 @@ test "inspect spore returns annotation values from saved manifest" {
     try std.testing.expectEqualStrings("cleanroom-gateway", network.bound_services[0].name);
     try std.testing.expectEqualStrings("gateway.cleanroom.internal", network.bound_services[0].guest_host);
     try std.testing.expectEqual(@as(u16, 8170), network.bound_services[0].guest_port);
+}
+
+test "run from generation state uses explicit params" {
+    const allocator = std.testing.allocator;
+    const params =
+        \\{"run_id":"k8s-run-1","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"batch-1","vm_id":"spore-child-7","generation":99,"resume_entropy_seed":"0123456789abcdef0123456789abcdef"}
+    ;
+    const prepared = try prepareRunFromGenerationState(allocator, .{
+        .generation = 42,
+        .interrupt_status = 0,
+        .params_b64 = "",
+    }, params);
+    const resume_generation = prepared.resume_generation orelse return error.TestUnexpectedResult;
+    defer allocator.free(resume_generation.params_b64);
+
+    try std.testing.expectEqualStrings(params, prepared.start_generation_params.?);
+
+    var restored = generation.Device{};
+    try restored.restore(allocator, resume_generation);
+    try std.testing.expectEqual(@as(u64, 42), restored.generation);
+    try std.testing.expectEqual(@as(u32, generation.irq_generation_changed), restored.interrupt_status);
+    try std.testing.expectEqualStrings(params, restored.paramsPayload());
+}
+
+test "run from generation state omits empty generation when params are absent" {
+    const prepared = try prepareRunFromGenerationState(std.testing.allocator, .{
+        .generation = 0,
+        .interrupt_status = 0,
+        .params_b64 = "",
+    }, null);
+    try std.testing.expect(prepared.resume_generation == null);
+    try std.testing.expect(prepared.start_generation_params == null);
 }
 
 fn annotationTestManifest(annotations: spore.Annotations) spore.Manifest {

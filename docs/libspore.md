@@ -189,10 +189,15 @@ Use `runFromSpore` for `spore run --from` semantics:
 ```zig
 const result = try libspore.runFromSpore(context, allocator, .{
     .spore_dir = "base.spore",
+    .generation_path = "generation.json",
     .guest_env = &.{"SPORE_TEST_ENV=ok"},
     .command = &.{ "/bin/true" },
 });
 ```
+
+Set `.generation_path` when a fork or fleet adapter has run-specific fan-out
+identity JSON to publish before the fresh command starts. Omitting it preserves
+the saved spore's normal generation resume behavior.
 
 Leave `.command` empty to attach to a saved session through the lower-level API
 compatibility path. The CLI spells this as `spore attach`. Set `.interactive =

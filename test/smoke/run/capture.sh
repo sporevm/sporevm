@@ -65,6 +65,9 @@ from_stdout="${workdir}/from.stdout"
 from_stderr="${workdir}/from.stderr"
 from_child_stdout="${workdir}/from-child.stdout"
 from_child_stderr="${workdir}/from-child.stderr"
+from_generation_json="${workdir}/from-generation.json"
+from_generation_stdout="${workdir}/from-generation.stdout"
+from_generation_stderr="${workdir}/from-generation.stderr"
 from_base_stdout="${workdir}/from-base.stdout"
 from_base_stderr="${workdir}/from-base.stderr"
 smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
@@ -185,6 +188,25 @@ grep -Fq "entropy_len=32" "${from_child_stdout}" || {
   cat "${from_child_stdout}" >&2 || true
   cat "${from_child_stderr}" >&2 || true
   die "forked spore run --from did not expose resume entropy"
+}
+
+cat >"${from_generation_json}" <<'JSON'
+{"run_id":"run-from-generation-smoke","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"run-from-generation-batch","vm_id":"spore-run-from-generation-7","generation":7007,"resume_entropy_seed":"0123456789abcdef0123456789abcdef"}
+JSON
+"${spore_bin}" run \
+  --backend "${backend}" \
+  --from "${from_child_dir}" \
+  --generation "${from_generation_json}" \
+  -- /bin/gencheck \
+  >"${from_generation_stdout}" 2>"${from_generation_stderr}" || {
+  cat "${from_generation_stdout}" >&2 || true
+  cat "${from_generation_stderr}" >&2 || true
+  die "forked spore run --from --generation check failed"
+}
+grep -Fq "generation=7007 vm_id=spore-run-from-generation-7 entropy_len=32" "${from_generation_stdout}" || {
+  cat "${from_generation_stdout}" >&2 || true
+  cat "${from_generation_stderr}" >&2 || true
+  die "forked spore run --from --generation did not expose explicit generation metadata"
 }
 
 "${spore_bin}" --debug run \

@@ -8,6 +8,7 @@ const Io = std.Io;
 
 const api = @import("api.zig");
 const fd_util = @import("fd.zig");
+const generation = @import("generation.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 
@@ -124,6 +125,7 @@ fn runParsed(
             .save_path = parsed.save_path,
             .save_trigger = parsed.save_trigger,
             .continue_after_save = parsed.continue_after_save,
+            .generation_path = parsed.generation_path,
             .spore_executable = spore_executable,
             .debug = debug,
             .bound_services = parsed.bound_services.slice(),
@@ -133,6 +135,9 @@ fn runParsed(
             error.MissingBoundServiceBinding => failRunSetup("spore run: manifest requires live bound Unix service binding '{s}'", .{binding_diagnostic.missing_name orelse "unknown"}),
             error.UnexpectedBoundServiceBinding => failRunSetup("spore run: live bound Unix service binding '{s}' does not match the manifest", .{binding_diagnostic.unexpected_name orelse "unknown"}),
             error.DuplicateBoundServiceBinding => failRunSetup("spore run: duplicate live bound Unix service binding '{s}'", .{binding_diagnostic.duplicate_name orelse "unknown"}),
+            error.BadGenerationPayload => failRunSetup("spore run: invalid --generation payload; required JSON fields: run_id, child_id, parallel_index, parallel_count, fork_index, fork_count, fork_batch_id, vm_id", .{}),
+            error.StreamTooLong => failRunSetup("spore run: --generation payload exceeds {d} bytes", .{generation.params_size}),
+            error.GenerationReadFailed => failRunSetup("spore run: cannot read --generation {s}", .{parsed.generation_path orelse ""}),
             else => return err,
         };
     }
@@ -240,4 +245,5 @@ test "run cli help accepts help before argv delimiter only" {
     try std.testing.expect(!wantsHelp(&.{ "--", "/bin/true", "--help" }));
     try std.testing.expect(std.mem.indexOf(u8, run_mod.cli_usage, "spore run --save base.spore --save-on TERM") != null);
     try std.testing.expect(std.mem.indexOf(u8, run_mod.cli_usage, "Uses spore memory/device sizing; omit --memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run_mod.cli_usage, "--generation FILE") != null);
 }
