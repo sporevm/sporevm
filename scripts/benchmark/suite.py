@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import hashlib
 import io
 import json
 import math
@@ -24,11 +25,18 @@ import time
 import uuid
 
 
-SUITE_VERSION = "1.3"
+SUITE_VERSION = "1.4"
 DEFAULT_IMAGE = "docker.io/library/node:22-alpine"
 DEFAULT_COMMAND = "/usr/local/bin/node -v"
 DEFAULT_PLATFORM = "linux/arm64"
 DEFAULT_SYNTHETIC_ROOTFS_REF = "local/sporevm-benchmark-synthetic:nightly"
+DEFAULT_SYNTHETIC_ROOTFS_FILE_COUNT = 16_384
+DEFAULT_SYNTHETIC_ROOTFS_FILE_SIZE = 256
+DEFAULT_SYNTHETIC_ROOTFS_DIR_COUNT = 4_096
+DEFAULT_SYNTHETIC_ROOTFS_SYMLINK_COUNT = 1_024
+DEFAULT_SYNTHETIC_ROOTFS_HARDLINK_COUNT = 1_024
+DEFAULT_SYNTHETIC_ROOTFS_DEPTH = 4
+SYNTHETIC_ROOTFS_SEED = 0x5A17_0F57
 EAGER_ROOTFS_ENV = "SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCHMARK"
 RESTORE_METRICS_RE = re.compile(r"(?:kvm|hvf) restore metrics: (?P<fields>.+)")
 EXEC_PROBE_TIMING_RE = re.compile(r"run exec probe timing: (?P<fields>.+)")
@@ -401,15 +409,26 @@ def parse_rootfs_import_stdout(path: Path) -> dict[str, object]:
         value = value.strip()
         if key and value:
             fields[f"rootfs_import_{key}"] = value
+            if key == "rootfs_identity":
+                fields["rootfs_import_index_digest"] = value
     return fields
 
 
 def deterministic_payload(index: int, size: int) -> bytes:
-    seed = f"sporevm synthetic rootfs fixture file={index:06d}\n".encode("utf-8")
-    return (seed * ((size // len(seed)) + 1))[:size]
+    seed = f"sporevm synthetic rootfs fixture seed={SYNTHETIC_ROOTFS_SEED:x} file={index:06d}\n".encode("utf-8")
+    digest = hashlib.blake2s(seed, digest_size=32).hexdigest().encode("ascii")
+    chunk = seed + digest + b"\n"
+    return (chunk * ((size // len(chunk)) + 1))[:size]
 
 
-def tar_info(name: str, *, size: int = 0, mode: int = 0o644, kind: bytes = tarfile.REGTYPE) -> tarfile.TarInfo:
+def tar_info(
+    name: str,
+    *,
+    size: int = 0,
+    mode: int = 0o644,
+    kind: bytes = tarfile.REGTYPE,
+    linkname: str = "",
+) -> tarfile.TarInfo:
     info = tarfile.TarInfo(name)
     info.size = size
     info.mode = mode
@@ -419,13 +438,70 @@ def tar_info(name: str, *, size: int = 0, mode: int = 0o644, kind: bytes = tarfi
     info.gname = "root"
     info.mtime = 0
     info.type = kind
+    info.linkname = linkname
     return info
 
 
-def write_synthetic_rootfs_tar(path: Path, *, file_count: int, file_size: int) -> None:
+def synthetic_leaf_dir(index: int, depth: int) -> str:
+    depth = max(1, min(depth, 4))
+    parts = [
+        f"tenant-{index // 1024:04d}",
+        f"repo-{(index // 128) % 8:02d}",
+        f"pkg-{(index // 16) % 8:02d}",
+        f"dir-{index % 16:02d}-{index:06d}",
+    ]
+    return "/".join(parts[-depth:])
+
+
+def parent_directories(path: str) -> list[str]:
+    parts = path.split("/")
+    return ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+
+
+def synthetic_rootfs_directories(dir_count: int, depth: int) -> list[str]:
+    root = "var/lib/sporevm-benchmark/tree"
+    dirs: set[str] = {
+        "bin",
+        "etc",
+        "usr",
+        "usr/bin",
+        "var",
+        "var/lib",
+        "var/lib/sporevm-benchmark",
+        root,
+        "var/lib/sporevm-benchmark/links",
+        "var/lib/sporevm-benchmark/links/hardlinks",
+        "var/lib/sporevm-benchmark/links/symlinks",
+    }
+    for index in range(dir_count):
+        leaf = f"{root}/{synthetic_leaf_dir(index, depth)}"
+        dirs.update(parent_directories(leaf))
+    return sorted(dirs, key=lambda item: (item.count("/"), item))
+
+
+def synthetic_file_path(index: int, dir_count: int, depth: int) -> str:
+    leaf_index = index % max(dir_count, 1)
+    leaf = synthetic_leaf_dir(leaf_index, depth)
+    return f"var/lib/sporevm-benchmark/tree/{leaf}/payload-{index:06d}.dat"
+
+
+def deterministic_target_index(index: int, file_count: int) -> int:
+    return (index * 7919 + SYNTHETIC_ROOTFS_SEED) % file_count
+
+
+def write_synthetic_rootfs_tar(
+    path: Path,
+    *,
+    file_count: int,
+    file_size: int,
+    dir_count: int,
+    symlink_count: int,
+    hardlink_count: int,
+    depth: int,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(path, "w", format=tarfile.USTAR_FORMAT) as tar:
-        for directory in ("bin", "etc", "usr", "usr/bin", "var", "var/lib", "var/lib/sporevm-benchmark"):
+        for directory in synthetic_rootfs_directories(dir_count, depth):
             tar.addfile(tar_info(directory, mode=0o755, kind=tarfile.DIRTYPE))
         files = {
             "etc/os-release": b'NAME="SporeVM benchmark fixture"\nID=sporevm-benchmark\n',
@@ -435,8 +511,16 @@ def write_synthetic_rootfs_tar(path: Path, *, file_count: int, file_size: int) -
             tar.addfile(tar_info(name, size=len(data), mode=0o755 if name.startswith("bin/") else 0o644), io.BytesIO(data))
         for index in range(file_count):
             data = deterministic_payload(index, file_size)
-            name = f"var/lib/sporevm-benchmark/file-{index:06d}.dat"
+            name = synthetic_file_path(index, dir_count, depth)
             tar.addfile(tar_info(name, size=len(data)), io.BytesIO(data))
+        for index in range(min(hardlink_count, file_count)):
+            target = synthetic_file_path(deterministic_target_index(index, file_count), dir_count, depth)
+            name = f"var/lib/sporevm-benchmark/links/hardlinks/payload-hardlink-{index:06d}.dat"
+            tar.addfile(tar_info(name, mode=0o644, kind=tarfile.LNKTYPE, linkname=target))
+        for index in range(min(symlink_count, file_count)):
+            target = synthetic_file_path(deterministic_target_index(index + hardlink_count, file_count), dir_count, depth)
+            name = f"var/lib/sporevm-benchmark/links/symlinks/payload-symlink-{index:06d}.dat"
+            tar.addfile(tar_info(name, mode=0o777, kind=tarfile.SYMTYPE, linkname=f"/{target}"))
 
 
 def load_benchmark_expectations(root: Path) -> dict[str, object]:
@@ -661,6 +745,11 @@ class BenchmarkRunner:
             "synthetic_rootfs_ref": self.args.synthetic_rootfs_ref,
             "synthetic_rootfs_file_count": self.args.synthetic_rootfs_file_count,
             "synthetic_rootfs_file_size": self.args.synthetic_rootfs_file_size,
+            "synthetic_rootfs_dir_count": self.args.synthetic_rootfs_dir_count,
+            "synthetic_rootfs_symlink_count": self.args.synthetic_rootfs_symlink_count,
+            "synthetic_rootfs_hardlink_count": self.args.synthetic_rootfs_hardlink_count,
+            "synthetic_rootfs_depth": self.args.synthetic_rootfs_depth,
+            "synthetic_rootfs_seed": SYNTHETIC_ROOTFS_SEED,
             "prewarm_rootfs": self.args.prewarm_rootfs,
             "prewarm_memory": self.args.prewarm_memory,
             "spore_bin": str(self.spore_bin),
@@ -954,6 +1043,10 @@ class BenchmarkRunner:
                 fixture,
                 file_count=self.args.synthetic_rootfs_file_count,
                 file_size=self.args.synthetic_rootfs_file_size,
+                dir_count=self.args.synthetic_rootfs_dir_count,
+                symlink_count=self.args.synthetic_rootfs_symlink_count,
+                hardlink_count=self.args.synthetic_rootfs_hardlink_count,
+                depth=self.args.synthetic_rootfs_depth,
             )
         return fixture
 
@@ -993,6 +1086,13 @@ class BenchmarkRunner:
                 "fixture_tar": str(fixture),
                 "fixture_tar_bytes": fixture.stat().st_size,
                 "synthetic_rootfs_ref": self.args.synthetic_rootfs_ref,
+                "synthetic_rootfs_file_count": self.args.synthetic_rootfs_file_count,
+                "synthetic_rootfs_file_size": self.args.synthetic_rootfs_file_size,
+                "synthetic_rootfs_dir_count": self.args.synthetic_rootfs_dir_count,
+                "synthetic_rootfs_symlink_count": self.args.synthetic_rootfs_symlink_count,
+                "synthetic_rootfs_hardlink_count": self.args.synthetic_rootfs_hardlink_count,
+                "synthetic_rootfs_depth": self.args.synthetic_rootfs_depth,
+                "synthetic_rootfs_seed": SYNTHETIC_ROOTFS_SEED,
                 "stdout_path": str(stdout),
                 "stderr_path": str(stderr),
                 **parse_rootfs_import_stdout(stdout),
@@ -1558,12 +1658,45 @@ def self_test() -> None:
         rootfs_profile = parse_rootfs_profile_metrics(stderr)
         assert rootfs_profile["rootfs_profile_rootfs_cas_inline_ms"] == 42
         assert rootfs_profile["rootfs_profile_rootfs_cas_inline_objects_written"] == 2
+        stdout = Path(tmp) / "import.stdout"
+        stdout.write_text(
+            "rootfs: /tmp/rootfs.ext4\nmetadata: /tmp/rootfs.json\nref: local/test:fixture\nresolved: local/test:fixture@sha256:abc\nrootfs_identity: blake3:"
+            + ("a" * 64)
+            + "\n",
+            encoding="utf-8",
+        )
+        import_fields = parse_rootfs_import_stdout(stdout)
+        assert import_fields["rootfs_import_rootfs_identity"] == "blake3:" + ("a" * 64)
+        assert import_fields["rootfs_import_index_digest"] == "blake3:" + ("a" * 64)
         writable_profile = parse_rootfs_profile_text(
             "spore rootfs profile: phase=native_ext4_emit ms=11 objects_written=4 object_bytes_written=16384\n"
         )
         assert writable_profile["rootfs_profile_native_ext4_emit_ms"] == 11
         assert writable_profile["rootfs_profile_native_ext4_emit_objects_written"] == 4
         assert "writable_rootfs" in PROFILES["nightly"]["benchmarks"]
+        fixture_a = Path(tmp) / "fixture-a.tar"
+        fixture_b = Path(tmp) / "fixture-b.tar"
+        fixture_kwargs = {
+            "file_count": 12,
+            "file_size": 64,
+            "dir_count": 6,
+            "symlink_count": 3,
+            "hardlink_count": 3,
+            "depth": 3,
+        }
+        write_synthetic_rootfs_tar(fixture_a, **fixture_kwargs)
+        write_synthetic_rootfs_tar(fixture_b, **fixture_kwargs)
+        assert fixture_a.read_bytes() == fixture_b.read_bytes()
+        with tarfile.open(fixture_a, "r", format=tarfile.USTAR_FORMAT) as tar:
+            members = tar.getmembers()
+            dirs = [member for member in members if member.isdir()]
+            symlinks = [member for member in members if member.issym()]
+            hardlinks = [member for member in members if member.islnk()]
+            payloads = [member for member in members if member.isfile() and "/payload-" in member.name]
+        assert len(dirs) >= fixture_kwargs["dir_count"]
+        assert len(payloads) == fixture_kwargs["file_count"]
+        assert len(symlinks) == fixture_kwargs["symlink_count"]
+        assert len(hardlinks) == fixture_kwargs["hardlink_count"]
         stderr.write_text("debug: runtime disk rootfs base: lazy chunk index blake3:abc\n", encoding="utf-8")
         assert parse_rootfs_base_mode(stderr) == "lazy"
         stderr.write_text("debug: runtime disk rootfs base: flat artifact blake3:abc\n", encoding="utf-8")
@@ -1661,8 +1794,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--allow-image-resolve-fallback", action="store_true", help="Use the requested image ref when rootfs resolve fails")
     parser.add_argument("--timeout-s", type=int)
     parser.add_argument("--synthetic-rootfs-ref", default=DEFAULT_SYNTHETIC_ROOTFS_REF)
-    parser.add_argument("--synthetic-rootfs-file-count", type=int, default=1024)
-    parser.add_argument("--synthetic-rootfs-file-size", type=int, default=4096)
+    parser.add_argument("--synthetic-rootfs-file-count", type=int, default=DEFAULT_SYNTHETIC_ROOTFS_FILE_COUNT)
+    parser.add_argument("--synthetic-rootfs-file-size", type=int, default=DEFAULT_SYNTHETIC_ROOTFS_FILE_SIZE)
+    parser.add_argument("--synthetic-rootfs-dir-count", type=int, default=DEFAULT_SYNTHETIC_ROOTFS_DIR_COUNT)
+    parser.add_argument("--synthetic-rootfs-symlink-count", type=int, default=DEFAULT_SYNTHETIC_ROOTFS_SYMLINK_COUNT)
+    parser.add_argument("--synthetic-rootfs-hardlink-count", type=int, default=DEFAULT_SYNTHETIC_ROOTFS_HARDLINK_COUNT)
+    parser.add_argument("--synthetic-rootfs-depth", type=int, default=DEFAULT_SYNTHETIC_ROOTFS_DEPTH)
     parser.add_argument("--writable-rootfs-iterations", type=int, help="Writable-rootfs iterations per workload")
     parser.add_argument("--writable-rootfs-workloads", help="Comma-separated subset: sqlite,package")
     parser.add_argument("--writable-rootfs-memory-mib", type=int, default=1024)
@@ -1695,6 +1832,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         die("--synthetic-rootfs-file-count must be positive")
     if args.synthetic_rootfs_file_size <= 0:
         die("--synthetic-rootfs-file-size must be positive")
+    if args.synthetic_rootfs_dir_count <= 0:
+        die("--synthetic-rootfs-dir-count must be positive")
+    if args.synthetic_rootfs_symlink_count < 0:
+        die("--synthetic-rootfs-symlink-count must be non-negative")
+    if args.synthetic_rootfs_hardlink_count < 0:
+        die("--synthetic-rootfs-hardlink-count must be non-negative")
+    if args.synthetic_rootfs_depth <= 0:
+        die("--synthetic-rootfs-depth must be positive")
     for workload in args.writable_rootfs_workloads:
         if workload not in ("sqlite", "package"):
             die(f"unknown writable rootfs workload: {workload}")

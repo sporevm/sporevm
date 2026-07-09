@@ -122,11 +122,18 @@ generate synthetic rootfs tar
 spore rootfs import-tar rootfs.tar --ref local/sporevm-benchmark-synthetic:nightly
 ```
 
-The suite creates a fixed tar from generated files and imports it into a fresh
-per-iteration rootfs cache with `SPOREVM_ROOTFS_BUILD_PROFILE=1`. Each
-`cold_import/synthetic_tar` row stores `elapsed_ms`/`tti_ms` plus rootfs profile
-phase counters such as `rootfs_profile_rootfs_cas_inline_objects_written`,
-chunk counts, object bytes, and native writer emit counters.
+The suite creates a byte-identical tar from a fixed seed and imports it into a
+fresh per-iteration rootfs cache with `SPOREVM_ROOTFS_BUILD_PROFILE=1`. The
+default fixture is topology-realistic rather than flat: thousands of nested
+directories, many payload files per leaf directory, hardlinks, and symlinks,
+with a small data payload so it still fits the nightly budget.
+
+Each `cold_import/synthetic_tar` row stores `elapsed_ms`/`tti_ms`,
+`rootfs_import_index_digest`, and rootfs profile phase counters such as
+`rootfs_profile_native_ext4_emit_assign_ms`,
+`rootfs_profile_rootfs_cas_inline_objects_written`, chunk counts, object bytes,
+and native writer emit counters. The digest is expected to remain stable across
+runs because the tar fixture is deterministic.
 
 ### Warm Spore TTI
 
@@ -285,6 +292,8 @@ Thresholds are metric-class based:
   and batch wall times: warn above 10 percent, fail above 20 percent;
 - counter metrics such as rootfs objects, chunks, bytes, and block counts: warn
   on any change, fail when an increase reaches 2x or moves from zero to nonzero.
+- digest metrics such as `cold_import/synthetic_tar/rootfs_import_index_digest`:
+  fail on any change against compatible history;
 - success-rate metrics derived from raw benchmark rows before failed rows are
   filtered: warn on any decrease, and fail when a benchmark with a 100 percent
   baseline drops below 100 percent.
@@ -354,6 +363,32 @@ spore-benchmark-reset: warm_spore_tti/*,cold_import/synthetic_tar/*
 
 The reset build becomes the new baseline for matching metrics; the reset build
 itself does not fail.
+
+Rootfs digest changes should use the same reset path. For example, a deliberate
+ext4 writer format change that updates the deterministic cold-import digest can
+either bump the durable expectation marker:
+
+```json
+{
+  "version": 1,
+  "metrics": {
+    "cold_import/synthetic_tar/*": {
+      "reset": "2026-07-ext4-format-v2",
+      "reason": "Intentional rootfs format change"
+    }
+  }
+}
+```
+
+or use a one-off commit message line:
+
+```text
+spore-benchmark-reset: cold_import/synthetic_tar/rootfs_import_index_digest
+```
+
+The high-directory fixture introduced in July 2026 uses
+`2026-07-topology-realistic-synthetic-rootfs` as its cold-import reset marker so
+old flat-fixture history does not trip the first scheduled run.
 
 ## Publishing Trends
 
