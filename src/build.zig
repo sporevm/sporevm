@@ -154,7 +154,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         .index_digest = publish.rootfs_storage.index_digest,
         .metadata_path = publish.metadata_path,
         .local_ref_path = publish.local_ref_path,
-        .cache_hit = any_exec_step,
+        .cache_hit = any_exec_step and diagnostic.executor.executed_steps == 0,
     };
 }
 
@@ -712,6 +712,8 @@ test "metadata-only builds with different CMD publish distinct image identities"
 
     try std.testing.expectEqualStrings(base_storage.index_digest, true_result.index_digest);
     try std.testing.expectEqualStrings(base_storage.index_digest, false_result.index_digest);
+    try std.testing.expect(!true_result.cache_hit);
+    try std.testing.expect(!false_result.cache_hit);
     try std.testing.expect(!std.mem.eql(u8, true_result.resolved_image_ref, false_result.resolved_image_ref));
 
     const true_resolved = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, true_result.resolved_image_ref, .{});

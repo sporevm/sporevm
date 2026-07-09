@@ -95,7 +95,13 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
     try stdout.print("  Rootfs index: {s}\n", .{result.index_digest});
     try stdout.print("  Metadata: {s}\n", .{result.metadata_path});
     try stdout.print("  Ref cache: {s}\n", .{result.local_ref_path});
-    try stdout.print("  Cache: {s}\n", .{if (result.cache_hit) "hit" else "metadata-only"});
+    const cache_status = if (result.cache_hit)
+        "hit"
+    else if (diagnostic.executor.executed_steps != 0)
+        "miss"
+    else
+        "metadata-only";
+    try stdout.print("  Cache: {s}\n", .{cache_status});
 }
 
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedOptions {

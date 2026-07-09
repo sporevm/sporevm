@@ -81,6 +81,7 @@ pub fn main(init: std.process.Init) !void {
     });
     if (first_diag.executor.boot_count != 1) return error.ExpectedOneBuildVmBoot;
     if (first_diag.executor.executed_steps != 2) return error.ExpectedTwoRunSteps;
+    if (first.cache_hit) return error.ExpectedFirstBuildCacheMiss;
 
     var cached_diag: build_mod.Diagnostic = .{};
     const cached = try build_mod.build(init, allocator, .{
@@ -93,6 +94,7 @@ pub fn main(init: std.process.Init) !void {
     });
     if (cached_diag.executor.boot_count != 0) return error.ExpectedCachedBuildWithoutBoot;
     if (cached_diag.executor.executed_steps != 0) return error.ExpectedCachedBuildWithoutSteps;
+    if (!cached.cache_hit) return error.ExpectedCachedBuildHit;
     if (!std.mem.eql(u8, first.index_digest, cached.index_digest)) return error.ExpectedCachedRootfsIdentity;
 
     try writeDockerfile(io, dockerfile_path, "step2b");
@@ -107,6 +109,7 @@ pub fn main(init: std.process.Init) !void {
     });
     if (edited_diag.executor.boot_count != 1) return error.ExpectedEditedBuildVmBoot;
     if (edited_diag.executor.executed_steps != 1) return error.ExpectedEditedBuildOneStep;
+    if (edited.cache_hit) return error.ExpectedEditedBuildCacheMiss;
     if (std.mem.eql(u8, first.index_digest, edited.index_digest)) return error.ExpectedEditedRootfsIdentity;
 
     std.debug.print(
