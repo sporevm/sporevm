@@ -236,7 +236,7 @@ Build state machine:
                  ╭──────────────────╮   ╭──────────────────────────────╮
                  │ read final step  │   │ open index k-1 through       │
                  │ record, verify   │   │ ChunkMappedDisk + overlay    │
-                 │ complete stamp   │   │ grow + resize2fs (once)      │
+                 │ complete stamp   │   │ no grow/resize in RUN slice  │
                  ╰────────┬─────────╯   │ boot guest once (rw)         │
                           │             │ for each remaining step:     │
                           │             │   exec via step driver       │
