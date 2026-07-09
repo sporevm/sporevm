@@ -23,7 +23,7 @@ pub const Options = struct {
     rootfs: ?spore.Rootfs = null,
     disk: ?spore.Disk = null,
     spore_dir: ?[]const u8 = null,
-    rootfs_headroom: u64 = 0,
+    rootfs_grow_target: u64 = 0,
 };
 
 pub const RuntimeDisk = struct {
@@ -76,9 +76,9 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             // (chunk-only pull caches, pruned entries), defer assembly and let
             // the chunk-mapped backend fault verified CAS objects into a sparse
             // base on demand.
-            if (options.rootfs_headroom != 0) {
+            if (options.rootfs_grow_target != 0) {
                 rootfs_lazy_storage = storage;
-                std.log.debug("runtime disk rootfs base: lazy chunk index {s} with headroom", .{rootfs.artifact.digest});
+                std.log.debug("runtime disk rootfs base: lazy chunk index {s} with grow target", .{rootfs.artifact.digest});
             } else if (try openCachedFlatRootfs(context, allocator, rootfs, runtime.trace_fd)) |fd| {
                 runtime.rootfs_fd = fd;
                 std.log.debug("runtime disk rootfs base: flat artifact {s}", .{rootfs.artifact.digest});
@@ -132,7 +132,7 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         const base = diskFromRootfs(rootfs);
         if (runtime.rootfs_fd == null) {
             const storage = rootfs_lazy_storage orelse return error.BadManifest;
-            const grown_size = try grownRootfsSize(storage.logical_size, storage.chunk_size, options.rootfs_headroom);
+            const grown_size = try grownRootfsSize(storage.logical_size, storage.chunk_size, options.rootfs_grow_target);
             runtime.rootfs_fd = try createSparseTempFd(allocator, grown_size);
             const cache_root = try rootfsCacheRootPath(context, allocator);
             defer allocator.free(cache_root);
@@ -190,12 +190,12 @@ fn createSparseTempFd(allocator: std.mem.Allocator, size: u64) !std.c.fd_t {
     return fd;
 }
 
-fn grownRootfsSize(logical_size: u64, chunk_size: u64, headroom: u64) !u64 {
-    if (headroom == 0) return logical_size;
-    const raw = std.math.add(u64, logical_size, headroom) catch return error.BadManifest;
-    const remainder = raw % chunk_size;
-    if (remainder == 0) return raw;
-    return std.math.add(u64, raw, chunk_size - remainder) catch return error.BadManifest;
+fn grownRootfsSize(logical_size: u64, chunk_size: u64, grow_target: u64) !u64 {
+    if (grow_target == 0) return logical_size;
+    if (grow_target < logical_size) return error.BadManifest;
+    const remainder = grow_target % chunk_size;
+    if (remainder == 0) return grow_target;
+    return std.math.add(u64, grow_target, chunk_size - remainder) catch return error.BadManifest;
 }
 
 fn diskFromRootfs(rootfs: spore.Rootfs) spore.Disk {

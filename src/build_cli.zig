@@ -19,7 +19,6 @@ pub const usage =
     \\  --no-cache                     Require executor work instead of step-cache hits
     \\  --mkfs PATH                    mkfs helper for OCI layout imports
     \\  --debugfs PATH                 debugfs helper for OCI layout imports
-    \\  --disk-headroom BYTES          Grow the build rootfs by BYTES before the first executed step
     \\  -h, --help                     Show this help
     \\
     \\The M2 executor runs RUN and COPY cache misses in Dockerfile order.
@@ -35,7 +34,7 @@ const ParsedOptions = struct {
     build_args: std.array_list.Managed(build_mod.BuildArg),
     network: build_mod.NetworkMode = .spore,
     no_cache: bool = false,
-    disk_headroom: u64 = 0,
+    disk_grow_target_override: u64 = 0,
     mkfs: ?[]const u8 = null,
     debugfs: ?[]const u8 = null,
 };
@@ -79,7 +78,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
         .build_args = parsed.build_args.items,
         .network = parsed.network,
         .no_cache = parsed.no_cache,
-        .disk_headroom = parsed.disk_headroom,
+        .disk_grow_target_override = parsed.disk_grow_target_override,
         .mkfs = parsed.mkfs,
         .debugfs = parsed.debugfs,
         .output = stdout,
@@ -147,10 +146,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedOpti
             parsed.debugfs = try nextValue(args, &i, arg);
         } else if (std.mem.startsWith(u8, arg, "--debugfs=")) {
             parsed.debugfs = try nonEmptyValue(arg["--debugfs=".len..]);
-        } else if (std.mem.eql(u8, arg, "--disk-headroom")) {
-            parsed.disk_headroom = try std.fmt.parseInt(u64, try nextValue(args, &i, arg), 10);
-        } else if (std.mem.startsWith(u8, arg, "--disk-headroom=")) {
-            parsed.disk_headroom = try std.fmt.parseInt(u64, try nonEmptyValue(arg["--disk-headroom=".len..]), 10);
+        } else if (std.mem.eql(u8, arg, "--disk-grow-target")) {
+            parsed.disk_grow_target_override = try std.fmt.parseInt(u64, try nextValue(args, &i, arg), 10);
+        } else if (std.mem.startsWith(u8, arg, "--disk-grow-target=")) {
+            parsed.disk_grow_target_override = try std.fmt.parseInt(u64, try nonEmptyValue(arg["--disk-grow-target=".len..]), 10);
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownArgument;
         } else if (parsed.context_dir == null) {
@@ -223,7 +222,7 @@ fn writeParseError(stderr: *Io.Writer, err: anyerror) !void {
         error.BadBuildArg => "spore build: --build-arg must be KEY=VALUE",
         error.BadNetworkMode => "spore build: --network must be spore or none",
         error.BadPlatform, error.UnsupportedPlatform => "spore build: --platform must be linux/arm64",
-        error.InvalidCharacter, error.Overflow => "spore build: --disk-headroom must be a base-10 byte count",
+        error.InvalidCharacter, error.Overflow => "spore build: hidden --disk-grow-target override must be a base-10 byte count",
         else => "spore build: invalid arguments",
     };
     try stderr.print("{s}\n", .{message});
@@ -260,6 +259,9 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
             if (diagnostic.executor.output.len != 0) {
                 try stderr.writeAll(diagnostic.executor.output);
                 if (!std.mem.endsWith(u8, diagnostic.executor.output, "\n")) try stderr.writeAll("\n");
+            }
+            if (outputLooksLikeEnospc(diagnostic.executor.output)) {
+                try stderr.writeAll("spore build: build rootfs ran out of space; retry with hidden --disk-grow-target BYTES override\n");
             }
         },
         error.BuildGuestFreezeFailed => {
@@ -337,6 +339,11 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
     }
 }
 
+fn outputLooksLikeEnospc(output: []const u8) bool {
+    return std.mem.indexOf(u8, output, "No space left on device") != null or
+        std.mem.indexOf(u8, output, "ENOSPC") != null;
+}
+
 test "build CLI parses M1 options" {
     const allocator = std.testing.allocator;
     var parsed = try parseArgs(allocator, &.{
@@ -346,6 +353,8 @@ test "build CLI parses M1 options" {
         "base=oci-layout://zig-cache/base",
         "--build-arg",
         "MODE=test",
+        "--disk-grow-target",
+        "67108864",
         ".",
     });
     defer parsed.build_contexts.deinit();
@@ -358,4 +367,6 @@ test "build CLI parses M1 options" {
     try std.testing.expectEqual(@as(usize, 1), parsed.build_args.items.len);
     try std.testing.expectEqualStrings("MODE", parsed.build_args.items[0].key);
     try std.testing.expectEqualStrings("test", parsed.build_args.items[0].value);
+    try std.testing.expectEqual(@as(u64, 67108864), parsed.disk_grow_target_override);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--disk-grow-target") == null);
 }

@@ -1,6 +1,8 @@
+#include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 static void write_str(int fd, const char *data) {
@@ -22,8 +24,17 @@ static int write_file(const char *path, const char *data) {
   return n == (ssize_t)len && close_rc == 0 ? 0 : 1;
 }
 
+static int make_dir(const char *path, mode_t mode) {
+  if (mkdir(path, mode) == 0 || errno == EEXIST) return 0;
+  return 1;
+}
+
 static int file_exists(const char *path) {
-  return access(path, R_OK) == 0;
+  return access(path, F_OK) == 0;
+}
+
+static int path_absent(const char *path) {
+  return access(path, F_OK) != 0 && errno == ENOENT;
 }
 
 static int file_content_is(const char *path, const char *expected) {
@@ -52,6 +63,18 @@ static int mode_is(const char *path, mode_t expected) {
   struct stat st;
   if (stat(path, &st) != 0) return 0;
   return (st.st_mode & 0777) == expected;
+}
+
+static int dir_exists(const char *path) {
+  struct stat st;
+  if (stat(path, &st) != 0) return 0;
+  return S_ISDIR(st.st_mode);
+}
+
+static int owner_is_root(const char *path) {
+  struct stat st;
+  if (stat(path, &st) != 0) return 0;
+  return st.st_uid == 0 && st.st_gid == 0;
 }
 
 static int symlink_target_is(const char *path, const char *expected) {
@@ -93,8 +116,93 @@ static int verify_copy(void) {
     write_str(2, "build-smoke-sh: bad wildcard COPY\n");
     return 4;
   }
+  if (!symlink_target_is("/work/symlinked-dir", "/work/real-internal") ||
+      !file_content_is("/work/real-internal/internal.txt", "internal\n")) {
+    write_str(2, "build-smoke-sh: bad internal symlink COPY\n");
+    return 4;
+  }
+  if (!symlink_target_is("/work/abs-link", "/etc/rootfs-absolute-copy")) {
+    write_str(2, "build-smoke-sh: missing absolute symlink\n");
+    return 4;
+  }
+  if (!file_content_is("/etc/rootfs-absolute-copy/absolute.txt", "absolute\n")) {
+    write_str(2, "build-smoke-sh: bad absolute symlink target file\n");
+    return 4;
+  }
+  if (!dir_exists("/proc/1/root")) {
+    write_str(2, "build-smoke-sh: missing initrd root view\n");
+    return 4;
+  }
+  if (!file_content_is("/escape.txt", "escape\n") ||
+      !path_absent("/proc/1/root/escape.txt")) {
+    write_str(2, "build-smoke-sh: bad confined absolute symlink escape COPY\n");
+    return 4;
+  }
+  if (!symlink_target_is("/work/write-file", "/sentinel.txt") ||
+      !file_content_is("/sentinel.txt", "through\n") ||
+      !mode_is("/sentinel.txt", 0600) ||
+      !path_absent("/proc/1/root/sentinel.txt")) {
+    write_str(2, "build-smoke-sh: bad file symlink write-through COPY\n");
+    return 4;
+  }
+  if (!symlink_target_is("/work/dir-link", "/dir-target") ||
+      !file_content_is("/dir-target/dir-file.txt", "dir\n") ||
+      !dir_exists("/dir-target/empty")) {
+    write_str(2, "build-smoke-sh: bad directory symlink merge COPY\n");
+    return 4;
+  }
+  if (!symlink_target_is("/work/dangling-file", "/dangling-target.txt") ||
+      !file_content_is("/dangling-target.txt", "dangling\n")) {
+    write_str(2, "build-smoke-sh: bad dangling symlink COPY\n");
+    return 4;
+  }
+  if (!owner_is_root("/work/app") ||
+      !owner_is_root("/work/app/mode.txt") ||
+      !owner_is_root("/work/multi") ||
+      !owner_is_root("/escape.txt") ||
+      !owner_is_root("/sentinel.txt") ||
+      !owner_is_root("/dir-target/dir-file.txt") ||
+      !owner_is_root("/dir-target/empty") ||
+      !owner_is_root("/dangling-target.txt")) {
+    write_str(2, "build-smoke-sh: copied entries are not root-owned\n");
+    return 4;
+  }
   write_str(1, "verify-copy\n");
   return write_file("/verified-copy", "ok\n");
+}
+
+static int setup_symlink_targets(void) {
+  if (make_dir("/work", 0755) != 0 ||
+      make_dir("/work/real-internal", 0755) != 0 ||
+      make_dir("/dir-target", 0755) != 0 ||
+      make_dir("/etc/rootfs-absolute-copy", 0755) != 0) {
+    write_str(2, "build-smoke-sh: cannot create symlink targets\n");
+    return 5;
+  }
+  unlink("/work/symlinked-dir");
+  unlink("/work/abs-link");
+  unlink("/work/evil");
+  unlink("/work/write-file");
+  unlink("/work/dir-link");
+  unlink("/work/dangling-file");
+  unlink("/escape.txt");
+  unlink("/sentinel.txt");
+  unlink("/dangling-target.txt");
+  if (write_file("/sentinel.txt", "old\n") != 0) {
+    write_str(2, "build-smoke-sh: cannot create sentinel\n");
+    return 5;
+  }
+  if (symlink("/work/real-internal", "/work/symlinked-dir") != 0 ||
+      symlink("/etc/rootfs-absolute-copy", "/work/abs-link") != 0 ||
+      symlink("/", "/work/evil") != 0 ||
+      symlink("/sentinel.txt", "/work/write-file") != 0 ||
+      symlink("/dir-target", "/work/dir-link") != 0 ||
+      symlink("/dangling-target.txt", "/work/dangling-file") != 0) {
+    write_str(2, "build-smoke-sh: cannot create symlink fixtures\n");
+    return 5;
+  }
+  write_str(1, "setup-symlink-targets\n");
+  return 0;
 }
 
 int main(int argc, char **argv) {
@@ -111,6 +219,9 @@ int main(int argc, char **argv) {
   if (strcmp(cmd, "step1") == 0) {
     write_str(1, "step1\n");
     return write_file("/step1", "one\n");
+  }
+  if (strcmp(cmd, "setup-symlink-targets") == 0) {
+    return setup_symlink_targets();
   }
   if (strcmp(cmd, "verify-copy") == 0) {
     return verify_copy();

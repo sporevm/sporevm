@@ -190,13 +190,14 @@ fn appendSourceMatches(
     roots: *std.array_list.Managed(CopyRoot),
 ) !void {
     try validateRelative(raw_source);
-    if (std.mem.indexOfAny(u8, raw_source, "?[]") != null or std.mem.indexOf(u8, raw_source, "**") != null) {
+    const source = trimTrailingSlashes(raw_source);
+    if (std.mem.indexOfAny(u8, source, "?[]") != null or std.mem.indexOf(u8, source, "**") != null) {
         return error.UnsupportedCopyGlob;
     }
-    if (std.mem.indexOfScalar(u8, raw_source, '*')) |star| {
-        const slash = std.mem.lastIndexOfScalar(u8, raw_source[0..star], '/') orelse 0;
-        const parent_rel = if (slash == 0 and raw_source[0] != '/') "" else raw_source[0..slash];
-        const pattern = raw_source[(if (slash == 0) 0 else slash + 1)..];
+    if (std.mem.indexOfScalar(u8, source, '*')) |star| {
+        const slash = std.mem.lastIndexOfScalar(u8, source[0..star], '/') orelse 0;
+        const parent_rel = if (slash == 0 and source[0] != '/') "" else source[0..slash];
+        const pattern = source[(if (slash == 0) 0 else slash + 1)..];
         const parent_path = if (parent_rel.len == 0)
             try allocator.dupe(u8, context.root)
         else
@@ -215,7 +216,13 @@ fn appendSourceMatches(
         if (!matched) return error.CopySourceNotFound;
         return;
     }
-    try appendPath(allocator, io, context, raw_source, entries, roots, true);
+    try appendPath(allocator, io, context, source, entries, roots, true);
+}
+
+fn trimTrailingSlashes(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 1 and path[end - 1] == '/') end -= 1;
+    return path[0..end];
 }
 
 fn appendPath(
