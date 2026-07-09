@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -20,6 +21,11 @@ static int write_file(const char *path, const char *data) {
   ssize_t n = write(fd, data, len);
   int close_rc = close(fd);
   return n == (ssize_t)len && close_rc == 0 ? 0 : 1;
+}
+
+static int make_dir(const char *path, mode_t mode) {
+  if (mkdir(path, mode) == 0 || errno == EEXIST) return 0;
+  return 1;
 }
 
 static int file_exists(const char *path) {
@@ -93,8 +99,39 @@ static int verify_copy(void) {
     write_str(2, "build-smoke-sh: bad wildcard COPY\n");
     return 4;
   }
+  if (!symlink_target_is("/work/symlinked-dir", "/work/real-internal") ||
+      !file_content_is("/work/real-internal/internal.txt", "internal\n")) {
+    write_str(2, "build-smoke-sh: bad internal symlink COPY\n");
+    return 4;
+  }
+  if (!symlink_target_is("/work/abs-link", "/etc/rootfs-absolute-copy")) {
+    write_str(2, "build-smoke-sh: missing absolute symlink\n");
+    return 4;
+  }
+  if (!file_content_is("/etc/rootfs-absolute-copy/absolute.txt", "absolute\n")) {
+    write_str(2, "build-smoke-sh: bad absolute symlink target file\n");
+    return 4;
+  }
   write_str(1, "verify-copy\n");
   return write_file("/verified-copy", "ok\n");
+}
+
+static int setup_symlink_targets(void) {
+  if (make_dir("/work", 0755) != 0 ||
+      make_dir("/work/real-internal", 0755) != 0 ||
+      make_dir("/etc/rootfs-absolute-copy", 0755) != 0) {
+    write_str(2, "build-smoke-sh: cannot create symlink targets\n");
+    return 5;
+  }
+  unlink("/work/symlinked-dir");
+  unlink("/work/abs-link");
+  if (symlink("/work/real-internal", "/work/symlinked-dir") != 0 ||
+      symlink("/etc/rootfs-absolute-copy", "/work/abs-link") != 0) {
+    write_str(2, "build-smoke-sh: cannot create symlink fixtures\n");
+    return 5;
+  }
+  write_str(1, "setup-symlink-targets\n");
+  return 0;
 }
 
 int main(int argc, char **argv) {
@@ -111,6 +148,9 @@ int main(int argc, char **argv) {
   if (strcmp(cmd, "step1") == 0) {
     write_str(1, "step1\n");
     return write_file("/step1", "one\n");
+  }
+  if (strcmp(cmd, "setup-symlink-targets") == 0) {
+    return setup_symlink_targets();
   }
   if (strcmp(cmd, "verify-copy") == 0) {
     return verify_copy();

@@ -81,18 +81,19 @@ pub const Options = struct {
     base_storage: spore.RootfsStorage,
     steps: []const Step,
     network_enabled: bool,
-    disk_headroom: u64 = 0,
+    disk_grow_target: u64 = 0,
     output: ?*Io.Writer = null,
     diagnostic: ?*Diagnostic = null,
 };
 
-pub fn cacheInputForStep(platform: rootfs_mod.Platform, parent_index_digest: []const u8, step: Step) step_cache.StepInput {
+pub fn cacheInputForStep(platform: rootfs_mod.Platform, parent_index_digest: []const u8, step: Step, disk_grow_target: u64) step_cache.StepInput {
     return switch (step) {
         .run => |run| .{
             .platform = platform,
             .parent_index_digest = parent_index_digest,
             .instruction_kind = "RUN",
             .canonical_instruction = run.canonical_instruction,
+            .disk_grow_target = disk_grow_target,
             .env_digest = run.env_digest,
             .workdir = run.workdir,
         },
@@ -101,6 +102,7 @@ pub fn cacheInputForStep(platform: rootfs_mod.Platform, parent_index_digest: []c
             .parent_index_digest = parent_index_digest,
             .instruction_kind = "COPY",
             .canonical_instruction = copy.canonical_instruction,
+            .disk_grow_target = disk_grow_target,
             .input_digest = copy.input_digest,
             .env_digest = copy.env_digest,
             .workdir = copy.workdir,
@@ -150,7 +152,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
         .rootfs = rootfs,
-        .rootfs_headroom = options.disk_headroom,
+        .rootfs_grow_target = options.disk_grow_target,
         .command = &.{},
         .memory = .{ .policy = .explicit, .bytes = build_vm_memory_bytes },
         .network = if (options.network_enabled) .spore else .disabled,
@@ -187,6 +189,7 @@ const BuildControl = struct {
     steps: []const Step,
     output: ?*Io.Writer,
     current_storage: spore.RootfsStorage,
+    disk_grow_target: u64 = 0,
     step_index: usize = 0,
     phase: Phase = .start_run,
     active_stream: ActiveStream = .run,
@@ -212,7 +215,8 @@ const BuildControl = struct {
             .steps = options.steps,
             .output = options.output,
             .current_storage = try spore.cloneRootfsStorage(allocator, options.base_storage),
-            .phase = if (options.disk_headroom == 0) .start_run else .start_resize,
+            .disk_grow_target = options.disk_grow_target,
+            .phase = if (options.disk_grow_target == 0) .start_run else .start_resize,
             .capture = std.array_list.Managed(u8).init(allocator),
         };
     }
@@ -287,7 +291,8 @@ const BuildControl = struct {
     }
 
     fn stepInput(self: BuildControl, step: Step) step_cache.StepInput {
-        return cacheInputForStep(self.platform, self.current_storage.index_digest, step);
+        const disk_grow_target = if (self.step_index == 0) self.disk_grow_target else 0;
+        return cacheInputForStep(self.platform, self.current_storage.index_digest, step, disk_grow_target);
     }
 
     fn startSimpleControl(self: *BuildControl, dev: *vsock.Vsock, kind: ActiveStream) !void {

@@ -411,6 +411,23 @@ test "Dockerfile parser rejects COPY flags in any position" {
     var diag: Diagnostic = .{};
     try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nCOPY a --from=other /dest\n", &diag));
     try std.testing.expectEqualStrings("unsupported COPY flag: --from", diag.message);
+
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nCOPY --chown=1000:1000 a /dest\n", &diag));
+    try std.testing.expectEqualStrings("unsupported COPY flag: --chown", diag.message);
+
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nCOPY --chmod=0644 a /dest\n", &diag));
+    try std.testing.expectEqualStrings("unsupported COPY flag: --chmod", diag.message);
+
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nCOPY --link a /dest\n", &diag));
+    try std.testing.expectEqualStrings("unsupported COPY flag: --link", diag.message);
+}
+
+test "Dockerfile parser rejects ADD fail closed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD a /dest\n", &diag));
+    try std.testing.expectEqualStrings("unsupported Dockerfile instruction: ADD", diag.message);
 }
 
 test "Dockerfile parser enforces production input bounds" {

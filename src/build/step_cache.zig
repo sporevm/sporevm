@@ -16,6 +16,7 @@ pub const StepInput = struct {
     parent_index_digest: []const u8,
     instruction_kind: []const u8,
     canonical_instruction: []const u8,
+    disk_grow_target: u64 = 0,
     input_digest: []const u8 = "",
     env_digest: []const u8 = "",
     workdir: []const u8 = "/",
@@ -31,6 +32,7 @@ pub const StepRecord = struct {
     rootfs_storage: spore.RootfsStorage,
     instruction_kind: []const u8 = "",
     instruction: []const u8,
+    disk_grow_target: u64 = 0,
     input_digest: []const u8 = "",
     env_digest: []const u8 = "",
     workdir: []const u8 = "/",
@@ -50,6 +52,12 @@ pub fn stepKey(allocator: std.mem.Allocator, input: StepInput) ![]const u8 {
     h.update(input.instruction_kind);
     h.update("\n");
     h.update(input.canonical_instruction);
+    if (input.disk_grow_target != 0) {
+        var grow_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &grow_buf, input.disk_grow_target, .little);
+        h.update("\n");
+        h.update(&grow_buf);
+    }
     h.update("\n");
     h.update(input.input_digest);
     h.update("\n");
@@ -107,6 +115,7 @@ pub fn writeRecord(
         .rootfs_storage = child_storage,
         .instruction_kind = input.instruction_kind,
         .instruction = input.canonical_instruction,
+        .disk_grow_target = input.disk_grow_target,
         .input_digest = input.input_digest,
         .env_digest = input.env_digest,
         .workdir = input.workdir,
@@ -146,6 +155,7 @@ pub fn readHit(
     if (!std.mem.eql(u8, record.parent_index_digest, input.parent_index_digest)) return null;
     if (!std.mem.eql(u8, record.instruction_kind, input.instruction_kind)) return null;
     if (!std.mem.eql(u8, record.instruction, input.canonical_instruction)) return null;
+    if (record.disk_grow_target != input.disk_grow_target) return null;
     if (!std.mem.eql(u8, record.input_digest, input.input_digest)) return null;
     if (!std.mem.eql(u8, record.env_digest, input.env_digest)) return null;
     if (!std.mem.eql(u8, record.workdir, input.workdir)) return null;
@@ -191,4 +201,24 @@ test "step key changes with parent index" {
     });
     defer allocator.free(b);
     try std.testing.expect(!std.mem.eql(u8, a, b));
+}
+
+test "step key changes with disk grow target" {
+    const allocator = std.testing.allocator;
+    const normal = try stepKey(allocator, .{
+        .platform = .{},
+        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .instruction_kind = "RUN",
+        .canonical_instruction = "RUN true",
+    });
+    defer allocator.free(normal);
+    const grown = try stepKey(allocator, .{
+        .platform = .{},
+        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .instruction_kind = "RUN",
+        .canonical_instruction = "RUN true",
+        .disk_grow_target = 9 * 1024 * 1024 * 1024,
+    });
+    defer allocator.free(grown);
+    try std.testing.expect(!std.mem.eql(u8, normal, grown));
 }

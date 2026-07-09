@@ -78,11 +78,10 @@ pub fn main(init: std.process.Init) !void {
         .dockerfile_path = dockerfile_path,
         .platform = .{},
         .network = .none,
-        .disk_headroom = 1 << 20,
         .diagnostic = &first_diag,
     });
     if (first_diag.executor.boot_count != 1) return error.ExpectedOneBuildVmBoot;
-    if (first_diag.executor.executed_steps != 6) return error.ExpectedSixBuildSteps;
+    if (first_diag.executor.executed_steps != 9) return error.ExpectedNineBuildSteps;
     if (first.cache_hit) return error.ExpectedFirstBuildCacheMiss;
 
     var cached_diag: build_mod.Diagnostic = .{};
@@ -92,7 +91,6 @@ pub fn main(init: std.process.Init) !void {
         .dockerfile_path = dockerfile_path,
         .platform = .{},
         .network = .none,
-        .disk_headroom = 1 << 20,
         .diagnostic = &cached_diag,
     });
     if (cached_diag.executor.boot_count != 0) return error.ExpectedCachedBuildWithoutBoot;
@@ -100,34 +98,71 @@ pub fn main(init: std.process.Init) !void {
     if (!cached.cache_hit) return error.ExpectedCachedBuildHit;
     if (!std.mem.eql(u8, first.index_digest, cached.index_digest)) return error.ExpectedCachedRootfsIdentity;
 
-    try writeSmokeContext(allocator, io, context_dir, "beta-edited\n");
-    var edited_diag: build_mod.Diagnostic = .{};
-    const edited = try build_mod.build(init, allocator, .{
+    var override_diag: build_mod.Diagnostic = .{};
+    const override = try build_mod.build(init, allocator, .{
         .tag = "local/build-smoke:dev",
         .context_dir = context_dir,
         .dockerfile_path = dockerfile_path,
         .platform = .{},
         .network = .none,
-        .disk_headroom = 1 << 20,
-        .diagnostic = &edited_diag,
+        .disk_grow_target_override = 64 << 20,
+        .diagnostic = &override_diag,
     });
+    if (override_diag.executor.boot_count != 1) return error.ExpectedOverrideBuildVmBoot;
+    if (override_diag.executor.executed_steps != 9) return error.ExpectedOverrideBuildNineSteps;
+    if (override.cache_hit) return error.ExpectedOverrideBuildCacheMiss;
+    if (std.mem.eql(u8, first.index_digest, override.index_digest)) return error.ExpectedOverrideRootfsIdentity;
+
+    var default_after_override_diag: build_mod.Diagnostic = .{};
+    const default_after_override = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &default_after_override_diag,
+    });
+    if (default_after_override_diag.executor.boot_count != 0) return error.ExpectedDefaultAfterOverrideWithoutBoot;
+    if (default_after_override_diag.executor.executed_steps != 0) return error.ExpectedDefaultAfterOverrideWithoutSteps;
+    if (!default_after_override.cache_hit) return error.ExpectedDefaultAfterOverrideCacheHit;
+    if (!std.mem.eql(u8, first.index_digest, default_after_override.index_digest)) return error.ExpectedDefaultAfterOverrideRootfsIdentity;
+
+    try writeSmokeContext(allocator, io, context_dir, "beta-edited\n");
+    var edited_diag: build_mod.Diagnostic = .{};
+    const edited = build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &edited_diag,
+    }) catch |err| {
+        std.debug.print(
+            "edited build failed: err={s} instruction={?s} exit={?d} output={s}\n",
+            .{ @errorName(err), edited_diag.executor.instruction, edited_diag.executor.exit_code, edited_diag.executor.output },
+        );
+        return err;
+    };
     if (edited_diag.executor.boot_count != 1) return error.ExpectedEditedBuildVmBoot;
     if (edited_diag.executor.executed_steps != 4) return error.ExpectedEditedBuildFourSteps;
     if (edited.cache_hit) return error.ExpectedEditedBuildCacheMiss;
     if (std.mem.eql(u8, first.index_digest, edited.index_digest)) return error.ExpectedEditedRootfsIdentity;
 
     std.debug.print(
-        "spore-build-run-smoke ok: first={s} cached={s} edited={s}\n",
-        .{ first.index_digest, cached.index_digest, edited.index_digest },
+        "spore-build-run-smoke ok: first={s} cached={s} override={s} default-after-override={s} edited={s}\n",
+        .{ first.index_digest, cached.index_digest, override.index_digest, default_after_override.index_digest, edited.index_digest },
     );
 }
 
 fn writeDockerfile(io: Io, path: []const u8, second_step: []const u8) !void {
-    var buf: [256]u8 = undefined;
+    var buf: [512]u8 = undefined;
     const dockerfile = try std.fmt.bufPrint(&buf,
         \\FROM local/build-smoke-base:dev
         \\RUN step1
+        \\RUN setup-symlink-targets
         \\WORKDIR /work
+        \\COPY symlink-internal.txt symlinked-dir/internal.txt
+        \\COPY absolute-link.txt abs-link/absolute.txt
         \\COPY app app/
         \\COPY merge app/
         \\COPY loose.txt multi/
@@ -159,6 +194,10 @@ fn writeSmokeContext(allocator: std.mem.Allocator, io: Io, context_dir: []const 
     defer allocator.free(merge_b_txt);
     const loose_txt = try std.fs.path.join(allocator, &.{ context_dir, "loose.txt" });
     defer allocator.free(loose_txt);
+    const symlink_internal_txt = try std.fs.path.join(allocator, &.{ context_dir, "symlink-internal.txt" });
+    defer allocator.free(symlink_internal_txt);
+    const absolute_link_txt = try std.fs.path.join(allocator, &.{ context_dir, "absolute-link.txt" });
+    defer allocator.free(absolute_link_txt);
     const one_wild = try std.fs.path.join(allocator, &.{ context_dir, "one.wild" });
     defer allocator.free(one_wild);
     const two_wild = try std.fs.path.join(allocator, &.{ context_dir, "two.wild" });
@@ -169,6 +208,8 @@ fn writeSmokeContext(allocator: std.mem.Allocator, io: Io, context_dir: []const 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = merge_a_txt, .data = "merged\n" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = merge_b_txt, .data = beta });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = loose_txt, .data = "loose\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = symlink_internal_txt, .data = "internal\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = absolute_link_txt, .data = "absolute\n" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = one_wild, .data = "one\n" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = two_wild, .data = "two\n" });
     const app_a = try std.fs.path.joinZ(allocator, &.{ context_dir, "app/a.txt" });
