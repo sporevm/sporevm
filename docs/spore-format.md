@@ -47,9 +47,24 @@ portable spore format. A `sporevm-build-step-v1` record binds
 descriptor. A cache hit is valid only when the recomputed key matches the
 record, the descriptor passes the normal chunked-rootfs storage validation,
 `base_identity` and `index_digest` both equal `child_index_digest`, and the
-selected rootfs CAS completeness stamp is present. Full build image identity is
-the final step's `index_digest`, published through the same local image-ref
-metadata path used by `spore rootfs import-tar`.
+selected rootfs CAS completeness stamp is present or repairable from verified
+CAS contents.
+
+The local image identity published by `spore build` is distinct from the raw
+rootfs storage identity. `spore build` first serializes the final
+`ImageConfig` as canonical JSON with optional null fields omitted and the
+deterministic struct field order used by `src/rootfs/oci.zig`
+(`architecture`, `os`, `config`, then runtime config fields `Env`,
+`Entrypoint`, `Cmd`, `WorkingDir`, `User`). `config_digest` is
+`blake3:<hex>` over two length-prefixed fields: the ASCII domain
+`sporevm-indexed-image-config-v1` and those canonical config JSON bytes. The
+published image digest is `blake3:<hex>` over three length-prefixed fields: the
+ASCII domain `sporevm-indexed-image-v1`, the final `rootfs_storage.index_digest`
+string, and the same canonical config JSON bytes. Each field is framed as an
+unsigned 64-bit little-endian byte length followed by the exact bytes. The
+local resolved ref and metadata path are keyed by that image digest, while the
+metadata's `rootfs_storage` descriptor remains keyed by the raw rootfs index
+digest used to boot the VM.
 
 A local single-spore bundle is the first distribution form:
 

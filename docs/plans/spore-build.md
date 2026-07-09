@@ -35,9 +35,10 @@ related_plans:
 > overlay state; each per-instruction checkpoint is one O(dirty)
 > `snapshotIndex()` into the rootfs CAS, producing a child `index_digest`; the
 > guest `fsfreeze` protocol deferred by the unified plan is delivered here;
-> and there is no full-image hash anywhere in the executor. The final image
-> identity is the last step's `index_digest`, registered under the local image
-> ref exactly like `import-tar` does today, with a completeness stamp so
+> and the executor still keys rootfs snapshots by the child `index_digest`.
+> Published local image identity additionally includes the final image config:
+> the local ref points at a digest over the final `index_digest` plus canonical
+> config JSON, with a completeness stamp on the underlying rootfs storage so
 > `spore run --image` takes the 0.10s path. The cache model, parser subset,
 > COPY semantics, and fail-closed contract below remain valid.
 
@@ -153,8 +154,8 @@ Options for the first implementation:
 - `--build-arg KEY=VALUE` (repeatable): supplies `ARG` values.
 - `--network spore|none`: network policy for `RUN` steps. Default `spore`
   (Docker builds assume network). `none` gives hermetic builds.
-- `--disk-headroom SIZE`: free ext4 space guaranteed at build-session start
-  (default `2gb`, see RUN execution below).
+- `--disk-headroom SIZE`: accepted for CLI stability in M1; executor sizing
+  lands with M2.
 - `--no-cache`: ignore step cache reads (still writes).
 - `--mkfs PATH` / `--debugfs PATH`: forwarded to the base-import path, same as
   `spore rootfs import-oci`.
@@ -185,13 +186,16 @@ on a feature error.
 | `ENV K=V` / `ENV K V` | build env + final image config. |
 | `ARG K[=default]` | value from `--build-arg` or default; unset used ARG is an error (stricter than Docker's warning; surfaced as a decision below). |
 | `WORKDIR /path` | affects `RUN` cwd, `COPY` relative dest, final config. Created in the guest if missing, matching Docker. |
-| `CMD ["…"]` / `CMD <shell>` | final image config only. |
+| `CMD ["…"]` / `CMD <shell>` | final image config only; both JSON exec form and shell form are supported. |
 | comments, line continuations, `${VAR}`/`$VAR` substitution in instruction arguments | standard Dockerfile behavior. |
 
 Variable substitution applies to `ENV`, `ARG` defaults, `WORKDIR`, `COPY`
 arguments, and `CMD`, using the declared `ARG`/`ENV` state, as Docker does.
 `RUN` strings are not pre-expanded; the guest shell expands them, with
-`ARG`/`ENV` values exported into the step environment.
+`ARG`/`ENV` values exported into the step environment. Only `$NAME` and
+`${NAME}` substitution are in the subset; parameter-expansion operators such as
+`${NAME:-default}`, `${NAME:+alt}`, `${NAME#prefix}`, and `${NAME%suffix}` fail
+closed.
 
 ## Architecture
 
@@ -410,10 +414,14 @@ assumes reproducibility of the ext4 bytes.
 
 ### Final image identity
 
-The final image's rootfs identity is the last step's `index_digest`. `spore
-build` publishes that identity through the same local-ref path as
+The final image's rootfs identity is the last step's `index_digest`, but the
+published local image identity is a digest over that `index_digest` plus the
+canonical final image config JSON. That keeps two config-only variants with the
+same rootfs from sharing a resolved image ref or metadata path. `spore build`
+publishes the image digest through the same local-ref path as
 `spore rootfs import-tar`, with image config metadata attached for `Env`,
-`Cmd`, and `WorkingDir`.
+`Cmd`, and `WorkingDir`; the exact digest construction is documented in
+`docs/spore-format.md`.
 
 ```json
 {
@@ -434,7 +442,8 @@ Publication follows the import path:
 2. write `RootFSMetadata`-compatible image metadata carrying the rootfs storage
    descriptor and final config so `readCachedImageRunConfig` picks it up at run
    time;
-3. `writeLocalRefCache` for the mutable tag.
+3. compute the image digest from rootfs identity plus config and update the
+   mutable tag with that resolved ref.
 
 Result: `spore run --image local/buildkite-spore:dev` works today's way, and
 `--save` records portable chunked storage immediately because the cache
@@ -618,7 +627,7 @@ single-digit seconds end to end, with the BuildKit tar export removed.
   traversal and absolute sources after substitution).
 - Built-image metadata must not be mistakable for portable OCI provenance:
   `kind: sporevm-built-image-v0`, `layers: []`, and explicit
-  `rootfs.storage` pointing at the final `index_digest`.
+  `rootfs_storage` pointing at the final `index_digest`.
 - Machine state and spore format are untouched. No manifest format changes.
 
 ## Delivery Strategy
@@ -814,11 +823,13 @@ the result and running the Rails spec smoke.
 - Default `--network spore` for RUN (Docker parity; the target Dockerfile
   needs apt/curl). `--network none` for hermetic builds.
 - `/bin/sh -c` for RUN, not `-lc` (Docker parity).
-- The last step's `index_digest` is the final rootfs identity, registered
-  through the existing local-ref machinery rather than inventing a parallel ref
-  namespace.
-- ARG over-invalidation (all declared args key all later exec steps) accepted
-  for v1 simplicity; the target Dockerfile passes no build args.
+- The last step's `index_digest` is the final rootfs identity; the published
+  local image identity additionally hashes that rootfs identity with canonical
+  config JSON and still uses the existing local-ref machinery rather than
+  inventing a parallel ref namespace.
+- ARG over-invalidation (all declared args key all later exec steps, including
+  unused ARGs) accepted for v1 simplicity; the target Dockerfile passes no build
+  args.
 - Grow-only disk headroom in v1; no shrink pass.
 
 ## Open Questions

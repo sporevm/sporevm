@@ -62,8 +62,12 @@ const LogicalLine = struct {
     text: []const u8,
 };
 
+const max_dockerfile_bytes = 1024 * 1024;
+const max_logical_line_bytes = 64 * 1024;
+
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diagnostic: *Diagnostic) !Document {
     diagnostic.* = .{};
+    if (bytes.len > max_dockerfile_bytes) return fail(diagnostic, 1, "Dockerfile is too large");
     var lines = std.array_list.Managed(LogicalLine).init(allocator);
     try logicalLines(allocator, bytes, &lines, diagnostic);
 
@@ -88,6 +92,7 @@ fn parseInstruction(
     rest: []const u8,
     diagnostic: *Diagnostic,
 ) !Instruction.Value {
+    try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
     if (asciiEql(op, "FROM")) {
         const args = try splitWords(allocator, rest, line, diagnostic);
         if (args.len != 1) return fail(diagnostic, line, "unsupported FROM form; expected exactly `FROM <name>`");
@@ -106,7 +111,9 @@ fn parseInstruction(
         if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported COPY heredoc");
         const args = try splitWords(allocator, rest, line, diagnostic);
         if (args.len < 2) return fail(diagnostic, line, "COPY requires at least one source and a destination");
-        if (std.mem.startsWith(u8, args[0], "--")) return fail(diagnostic, line, "unsupported COPY flag");
+        for (args) |arg| {
+            if (std.mem.startsWith(u8, arg, "--")) return fail(diagnostic, line, "unsupported COPY flag");
+        }
         return .{ .copy = .{ .sources = args[0 .. args.len - 1], .dest = args[args.len - 1] } };
     }
     if (asciiEql(op, "ENV")) {
@@ -149,13 +156,20 @@ fn logicalLines(
     while (it.next()) |raw_line| : (line_no += 1) {
         const line = std.mem.trimEnd(u8, raw_line, "\r");
         const trimmed_left = std.mem.trimStart(u8, line, " \t");
-        if (!continuing and (trimmed_left.len == 0 or trimmed_left[0] == '#')) continue;
+        if (!continuing and trimmed_left.len == 0) continue;
+        if (!continuing and trimmed_left[0] == '#') {
+            if (isUnsupportedParserDirective(trimmed_left)) {
+                return fail(diagnostic, line_no, "unsupported Dockerfile parser directive");
+            }
+            continue;
+        }
         if (!continuing) current_line = line_no;
         const trimmed_right = std.mem.trimEnd(u8, line, " \t");
         const has_continuation = trimmed_right.len != 0 and trimmed_right[trimmed_right.len - 1] == '\\';
         const part = if (has_continuation) trimmed_right[0 .. trimmed_right.len - 1] else line;
         if (continuing) try current.append(' ');
         try current.appendSlice(part);
+        if (current.items.len > max_logical_line_bytes) return fail(diagnostic, current_line, "Dockerfile logical line is too long");
         continuing = has_continuation;
         if (!continuing) {
             try lines.append(.{ .line = current_line, .text = try current.toOwnedSlice() });
@@ -163,6 +177,36 @@ fn logicalLines(
         }
     }
     if (continuing) return fail(diagnostic, current_line, "unterminated Dockerfile line continuation");
+}
+
+fn isUnsupportedParserDirective(trimmed_left: []const u8) bool {
+    const body = std.mem.trimStart(u8, trimmed_left[1..], " \t");
+    return asciiStartsWith(body, "syntax=") or asciiStartsWith(body, "escape=");
+}
+
+fn rejectUnsupportedVariableExpansion(input: []const u8, line: usize, diagnostic: *Diagnostic) !void {
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (input[i] != '$') continue;
+        if (i + 1 >= input.len) continue;
+        if (input[i + 1] == '$') {
+            i += 1;
+            continue;
+        }
+        if (input[i + 1] == '{') {
+            const end = std.mem.indexOfScalarPos(u8, input, i + 2, '}') orelse {
+                return fail(diagnostic, line, "unsupported variable expansion");
+            };
+            const name = input[i + 2 .. end];
+            if (!validName(name)) return fail(diagnostic, line, "unsupported variable expansion");
+            i = end;
+            continue;
+        }
+        if (!(std.ascii.isAlphabetic(input[i + 1]) or input[i + 1] == '_')) {
+            return fail(diagnostic, line, "unsupported variable expansion");
+        }
+        while (i + 1 < input.len and (std.ascii.isAlphanumeric(input[i + 1]) or input[i + 1] == '_')) i += 1;
+    }
 }
 
 fn parseEnv(
@@ -273,6 +317,10 @@ fn asciiEql(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
+fn asciiStartsWith(bytes: []const u8, prefix: []const u8) bool {
+    return bytes.len >= prefix.len and std.ascii.eqlIgnoreCase(bytes[0..prefix.len], prefix);
+}
+
 fn validName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name, 0..) |c, i| {
@@ -325,4 +373,53 @@ test "Dockerfile parser fails closed on unsupported features" {
     var diag: Diagnostic = .{};
     try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "RUN --mount=type=cache true\n", &diag));
     try std.testing.expectEqualStrings("unsupported RUN flag", diag.message);
+}
+
+test "Dockerfile parser rejects parser directives" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "# syntax=docker/dockerfile:1\nFROM base\n", &diag));
+    try std.testing.expectEqualStrings("unsupported Dockerfile parser directive", diag.message);
+    try std.testing.expectEqual(@as(usize, 1), diag.line);
+
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "# escape=`\nFROM base\n", &diag));
+    try std.testing.expectEqualStrings("unsupported Dockerfile parser directive", diag.message);
+}
+
+test "Dockerfile parser rejects unsupported variable expansion operators" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nENV A=${VAR:-default}\n", &diag));
+    try std.testing.expectEqualStrings("unsupported variable expansion", diag.message);
+
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nWORKDIR ${VAR#prefix}\n", &diag));
+    try std.testing.expectEqualStrings("unsupported variable expansion", diag.message);
+
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nRUN echo $?\n", &diag));
+    try std.testing.expectEqualStrings("unsupported variable expansion", diag.message);
+}
+
+test "Dockerfile parser rejects COPY flags in any position" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nCOPY a --from=other /dest\n", &diag));
+    try std.testing.expectEqualStrings("unsupported COPY flag", diag.message);
+}
+
+test "Dockerfile parser enforces production input bounds" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var diag: Diagnostic = .{};
+    const large = try allocator.alloc(u8, max_dockerfile_bytes + 1);
+    @memset(large, 'A');
+    try std.testing.expectError(error.DockerfileParseFailed, parse(allocator, large, &diag));
+    try std.testing.expectEqualStrings("Dockerfile is too large", diag.message);
+
+    const long_line = try std.fmt.allocPrint(allocator, "FROM base\nRUN {s}\n", .{"x" ** (max_logical_line_bytes + 1)});
+    try std.testing.expectError(error.DockerfileParseFailed, parse(allocator, long_line, &diag));
+    try std.testing.expectEqualStrings("Dockerfile logical line is too long", diag.message);
 }

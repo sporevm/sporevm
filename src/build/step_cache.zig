@@ -90,7 +90,7 @@ pub fn writeRecord(
 ) ![]const u8 {
     try spore.validateRootfsStorageDescriptor(child_storage);
     if (!std.mem.eql(u8, child_storage.index_digest, child_storage.base_identity)) return error.BadManifest;
-    if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, child_storage)) return error.RootFSDigestCacheMiss;
+    if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, child_storage)) return error.RootFSDigestCacheMiss;
     const computed_key = try stepKey(allocator, input);
     defer allocator.free(computed_key);
     if (!std.mem.eql(u8, computed_key, step_key)) return error.BuildCacheKeyMismatch;
@@ -152,7 +152,7 @@ pub fn readHit(
     if (!std.mem.eql(u8, record.rootfs_storage.index_digest, record.child_index_digest)) return null;
     if (!std.mem.eql(u8, record.rootfs_storage.base_identity, record.child_index_digest)) return null;
     spore.validateRootfsStorageDescriptor(record.rootfs_storage) catch return null;
-    if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, record.rootfs_storage)) return null;
+    if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, record.rootfs_storage)) return null;
     return try spore.cloneRootfsStorage(allocator, record.rootfs_storage);
 }
 

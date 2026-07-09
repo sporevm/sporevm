@@ -49,7 +49,7 @@ pub fn parseDockerignore(allocator: std.mem.Allocator, bytes: []const u8, diagno
             line = line[1..];
             if (line.len == 0) return ignoreFail(diagnostic, line_no, "empty .dockerignore negation");
         }
-        if (std.mem.indexOf(u8, line, "**") != null or std.mem.indexOfAny(u8, line, "[]") != null) {
+        if (std.mem.indexOf(u8, line, "**") != null or std.mem.indexOfAny(u8, line, "[]?") != null) {
             return ignoreFail(diagnostic, line_no, "unsupported .dockerignore pattern");
         }
         var anchored = false;
@@ -89,38 +89,47 @@ pub fn hashCopySources(
     std.mem.sort(Entry, entries.items, {}, entryLessThan);
 
     var h = Blake3.init(.{});
+    var previous_rel: ?[]const u8 = null;
     for (entries.items) |entry| {
-        h.update(entry.rel);
-        h.update("\x00");
-        h.update(@tagName(entry.kind));
-        h.update("\x00");
+        if (previous_rel) |rel| {
+            if (std.mem.eql(u8, rel, entry.rel)) continue;
+        }
+        previous_rel = entry.rel;
+        hashField(&h, entry.rel);
+        hashField(&h, @tagName(entry.kind));
         const path = try std.fs.path.join(allocator, &.{ context.root, entry.rel });
         defer allocator.free(path);
         const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
         var mode_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &mode_buf, @intFromEnum(stat.permissions), .little);
-        h.update(&mode_buf);
-        h.update("\x00");
+        hashField(&h, &mode_buf);
         switch (entry.kind) {
             .file => {
                 const data = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024 * 1024));
                 defer allocator.free(data);
-                h.update(data);
+                hashField(&h, data);
             },
-            .directory => {},
+            .directory => hashField(&h, ""),
             .sym_link => {
+                // Docker COPY preserves symlinks without following them, including targets outside the context.
                 var target_buf: [4096]u8 = undefined;
                 const len = try Io.Dir.cwd().readLink(io, path, &target_buf);
-                h.update(target_buf[0..len]);
+                hashField(&h, target_buf[0..len]);
             },
             else => return error.UnsupportedCopySourceType,
         }
-        h.update("\x00");
     }
     var digest: [Blake3.digest_length]u8 = undefined;
     h.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
     return std.fmt.allocPrint(allocator, "blake3:{s}", .{&hex});
+}
+
+fn hashField(h: *Blake3, bytes: []const u8) void {
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, bytes.len, .little);
+    h.update(&len_buf);
+    h.update(bytes);
 }
 
 fn appendSourceMatches(
@@ -274,4 +283,119 @@ test "context hashing applies dockerignore" {
     const ctx = try load(arena, io, root, &diag);
     const digest = try hashCopySources(arena, io, ctx, &.{"app"});
     try std.testing.expect(std.mem.startsWith(u8, digest, "blake3:"));
+}
+
+test "dockerignore rejects question-mark patterns" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: IgnoreDiagnostic = .{};
+    try std.testing.expectError(error.UnsupportedDockerignorePattern, parseDockerignore(arena_state.allocator(), "file?.txt\n", &diag));
+    try std.testing.expectEqualStrings("unsupported .dockerignore pattern", diag.message);
+    try std.testing.expectEqual(@as(usize, 1), diag.line);
+}
+
+test "context hashing frames fields so payload NULs cannot alias records" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-hash-framing";
+    const one = root ++ "/one";
+    const two = root ++ "/two";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, one);
+    try Io.Dir.cwd().createDirPath(io, two);
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = two ++ "/a", .data = "left" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = two ++ "/b", .data = "right" });
+    const b_stat = try Io.Dir.cwd().statFile(io, two ++ "/b", .{ .follow_symlinks = false });
+    var b_mode: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b_mode, @intFromEnum(b_stat.permissions), .little);
+
+    var payload = std.array_list.Managed(u8).init(arena);
+    try payload.appendSlice("left");
+    try payload.append(0);
+    try payload.appendSlice("b");
+    try payload.append(0);
+    try payload.appendSlice("file");
+    try payload.append(0);
+    try payload.appendSlice(&b_mode);
+    try payload.append(0);
+    try payload.appendSlice("right");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = one ++ "/a", .data = payload.items });
+
+    var diag: IgnoreDiagnostic = .{};
+    const ctx_one = try load(arena, io, one, &diag);
+    const ctx_two = try load(arena, io, two, &diag);
+    const old_one = try oldUnframedHashCopySourcesForTest(arena, io, ctx_one, &.{"a"});
+    const old_two = try oldUnframedHashCopySourcesForTest(arena, io, ctx_two, &.{ "a", "b" });
+    try std.testing.expectEqualStrings(old_one, old_two);
+
+    const framed_one = try hashCopySources(arena, io, ctx_one, &.{"a"});
+    const framed_two = try hashCopySources(arena, io, ctx_two, &.{ "a", "b" });
+    try std.testing.expect(!std.mem.eql(u8, framed_one, framed_two));
+}
+
+test "context hashing deduplicates repeated COPY source matches" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-hash-dedupe";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/a", .data = "same" });
+
+    var diag: IgnoreDiagnostic = .{};
+    const ctx = try load(arena, io, root, &diag);
+    const once = try hashCopySources(arena, io, ctx, &.{"a"});
+    const twice = try hashCopySources(arena, io, ctx, &.{ "a", "a" });
+    try std.testing.expectEqualStrings(once, twice);
+}
+
+fn oldUnframedHashCopySourcesForTest(
+    allocator: std.mem.Allocator,
+    io: Io,
+    context: BuildContext,
+    sources: []const []const u8,
+) ![]const u8 {
+    var entries = std.array_list.Managed(Entry).init(allocator);
+    for (sources) |source| {
+        try appendSourceMatches(allocator, io, context, source, &entries);
+    }
+    std.mem.sort(Entry, entries.items, {}, entryLessThan);
+
+    var h = Blake3.init(.{});
+    for (entries.items) |entry| {
+        h.update(entry.rel);
+        h.update("\x00");
+        h.update(@tagName(entry.kind));
+        h.update("\x00");
+        const path = try std.fs.path.join(allocator, &.{ context.root, entry.rel });
+        const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        var mode_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &mode_buf, @intFromEnum(stat.permissions), .little);
+        h.update(&mode_buf);
+        h.update("\x00");
+        switch (entry.kind) {
+            .file => {
+                const data = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+                h.update(data);
+            },
+            .directory => {},
+            .sym_link => {
+                var target_buf: [4096]u8 = undefined;
+                const len = try Io.Dir.cwd().readLink(io, path, &target_buf);
+                h.update(target_buf[0..len]);
+            },
+            else => return error.UnsupportedCopySourceType,
+        }
+        h.update("\x00");
+    }
+    var digest: [Blake3.digest_length]u8 = undefined;
+    h.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "blake3:{s}", .{&hex});
 }

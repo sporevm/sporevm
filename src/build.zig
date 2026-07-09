@@ -105,7 +105,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                 if (saw_from) return error.UnsupportedMultiStageDockerfile;
                 const source = try substitute(allocator, from.source, pre_from_args.items, &.{});
                 const base = try resolveBase(init, allocator, options, source);
-                if (!try rootfs_cas.storageMarkedComplete(init.io, allocator, base.cache_root, base.storage)) return error.RootFSDigestCacheMiss;
+                if (!try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, base.cache_root, base.storage)) return error.RootFSDigestCacheMiss;
                 state = try stateFromBase(allocator, base.config, base.storage);
                 saw_from = true;
             },
@@ -184,7 +184,7 @@ fn resolveBase(init: std.process.Init, allocator: std.mem.Allocator, options: Op
     const metadata_path = try rootfs_mod.cachedImageRootfsMetadataPath(allocator, cache_root, resolved);
     const metadata = try readCachedMetadata(allocator, init.io, metadata_path);
     const storage = metadata.rootfs_storage orelse return error.RootFSDigestCacheMiss;
-    if (!try rootfs_cas.storageMarkedComplete(init.io, allocator, cache_root, storage)) return error.RootFSDigestCacheMiss;
+    if (!try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, cache_root, storage)) return error.RootFSDigestCacheMiss;
     return .{ .cache_root = cache_root, .storage = storage, .config = metadata.config };
 }
 
@@ -514,16 +514,98 @@ test "fully cached build publishes final indexed image" {
     try std.testing.expect(result.cache_hit);
     try std.testing.expectEqualStrings(child_storage.index_digest, result.index_digest);
     const resolved = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, "local/app:dev", .{});
-    try std.testing.expectEqualStrings(child_storage.index_digest, resolved.manifest_digest);
+    try std.testing.expect(!std.mem.eql(u8, child_storage.index_digest, resolved.manifest_digest));
     const indexed = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_root, resolved)) orelse return error.MissingIndexedRootfs;
     defer rootfs_mod.deinitCachedIndexedRootfs(arena, indexed);
     try std.testing.expectEqualStrings(child_storage.index_digest, indexed.storage.index_digest);
 
     const resolved_direct = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, result.resolved_image_ref, .{});
-    try std.testing.expectEqualStrings(child_storage.index_digest, resolved_direct.manifest_digest);
+    try std.testing.expectEqualStrings(resolved.manifest_digest, resolved_direct.manifest_digest);
     const indexed_direct = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_root, resolved_direct)) orelse return error.MissingIndexedRootfs;
     defer rootfs_mod.deinitCachedIndexedRootfs(arena, indexed_direct);
     try std.testing.expectEqualStrings(child_storage.index_digest, indexed_direct.storage.index_digest);
+}
+
+test "metadata-only builds with different CMD publish distinct image identities" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-spore-build-config-identity";
+    const true_context = tmp ++ "/true-context";
+    const false_context = tmp ++ "/false-context";
+    const cache_dir = tmp ++ "/cache";
+    const base_rootfs = tmp ++ "/base.ext4";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, true_context);
+    try Io.Dir.cwd().createDirPath(io, false_context);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = base_rootfs, .data = "same rootfs bytes" });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = true_context ++ "/Dockerfile",
+        .data =
+        \\FROM local/base:dev
+        \\CMD ["/bin/true"]
+        \\
+        ,
+    });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = false_context ++ "/Dockerfile",
+        .data =
+        \\FROM local/base:dev
+        \\CMD ["/bin/false"]
+        \\
+        ,
+    });
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_dir);
+    const init = testInit(allocator, io, &arena_state, &env);
+    const cache_root = try local_paths.rootfsCacheRootPath(arena, &env);
+
+    const base_preload = try rootfs_cas.preloadPath(io, arena, cache_root, base_rootfs, rootfs_cas.default_chunk_size);
+    const base_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, base_preload);
+    _ = try rootfs_mod.publishIndexedImage(init, arena, .{
+        .ref = "local/base:dev",
+        .platform = .{},
+        .rootfs_storage = base_storage,
+    });
+
+    var diagnostic: Diagnostic = .{};
+    const true_result = try build(init, arena, .{
+        .tag = "local/app:true",
+        .context_dir = true_context,
+        .dockerfile_path = true_context ++ "/Dockerfile",
+        .platform = .{},
+        .diagnostic = &diagnostic,
+    });
+    const false_result = try build(init, arena, .{
+        .tag = "local/app:false",
+        .context_dir = false_context,
+        .dockerfile_path = false_context ++ "/Dockerfile",
+        .platform = .{},
+        .diagnostic = &diagnostic,
+    });
+
+    try std.testing.expectEqualStrings(base_storage.index_digest, true_result.index_digest);
+    try std.testing.expectEqualStrings(base_storage.index_digest, false_result.index_digest);
+    try std.testing.expect(!std.mem.eql(u8, true_result.resolved_image_ref, false_result.resolved_image_ref));
+
+    const true_resolved = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, true_result.resolved_image_ref, .{});
+    const false_resolved = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, false_result.resolved_image_ref, .{});
+    const true_indexed = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_root, true_resolved)) orelse return error.MissingIndexedRootfs;
+    defer rootfs_mod.deinitCachedIndexedRootfs(arena, true_indexed);
+    const false_indexed = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_root, false_resolved)) orelse return error.MissingIndexedRootfs;
+    defer rootfs_mod.deinitCachedIndexedRootfs(arena, false_indexed);
+    try std.testing.expectEqualStrings(base_storage.index_digest, true_indexed.storage.index_digest);
+    try std.testing.expectEqualStrings(base_storage.index_digest, false_indexed.storage.index_digest);
+
+    const true_metadata = try readCachedMetadata(arena, io, true_result.metadata_path);
+    const false_metadata = try readCachedMetadata(arena, io, false_result.metadata_path);
+    try std.testing.expectEqualStrings("/bin/true", true_metadata.config.config.?.Cmd.?[0]);
+    try std.testing.expectEqualStrings("/bin/false", false_metadata.config.config.?.Cmd.?[0]);
 }
 
 fn testInit(

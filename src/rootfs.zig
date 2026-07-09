@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Blake3 = std.crypto.hash.Blake3;
 const chunk = @import("chunk.zig");
 const ext4 = @import("rootfs/ext4.zig");
 pub const ext4_writer = @import("rootfs/ext4_writer.zig");
@@ -175,6 +176,7 @@ pub const local_ref_cache_kind = "sporevm-local-rootfs-ref-v1";
 const image_ref_cache_record_version: u32 = 1;
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const max_image_ref_cache_record_bytes = 64 * 1024;
+const indexed_image_identity_domain = "sporevm-indexed-image-v1";
 const rootfs_cache_lock_name = ".sporevm-rootfs-cache.lock";
 const flock_exclusive: c_int = 2;
 const flock_nonblocking: c_int = 4;
@@ -1095,12 +1097,17 @@ pub fn publishIndexedImage(init: std.process.Init, allocator: std.mem.Allocator,
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     defer allocator.free(cache_root);
     try ensureDirPath(init.io, cache_root);
-    if (!try rootfs_cas.storageMarkedComplete(init.io, allocator, cache_root, request.rootfs_storage)) return error.RootFSDigestCacheMiss;
+    if (!try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, cache_root, request.rootfs_storage)) return error.RootFSDigestCacheMiss;
 
-    const resolved_image_ref = try localResolvedIndexRef(allocator, request.ref, request.rootfs_storage.index_digest);
+    const canonical_config_json = try canonicalImageConfigJson(allocator, request.config);
+    defer allocator.free(canonical_config_json);
+    const config_digest = try indexedImageConfigDigest(allocator, canonical_config_json);
+    defer allocator.free(config_digest);
+    const image_digest = try indexedImageDigest(allocator, request.rootfs_storage.index_digest, canonical_config_json);
+    const resolved_image_ref = try localResolvedBlake3Ref(allocator, request.ref, image_digest);
     const resolved = ResolvedImage{
         .ref = resolved_image_ref,
-        .manifest_digest = request.rootfs_storage.index_digest,
+        .manifest_digest = image_digest,
         .platform = request.platform,
     };
     const metadata_path = try cachedImageRootfsMetadataPath(allocator, cache_root, resolved);
@@ -1109,9 +1116,9 @@ pub fn publishIndexedImage(init: std.process.Init, allocator: std.mem.Allocator,
         .ext4_writer = "built-index",
         .image_ref = request.ref,
         .resolved_image_ref = resolved_image_ref,
-        .image_manifest_digest = request.rootfs_storage.index_digest,
+        .image_manifest_digest = image_digest,
         .platform = request.platform,
-        .config_digest = request.rootfs_storage.index_digest,
+        .config_digest = config_digest,
         .config = request.config,
         .layers = &.{},
         .deterministic = false,
@@ -1134,7 +1141,7 @@ pub fn publishIndexedImage(init: std.process.Init, allocator: std.mem.Allocator,
         .metadata_path = metadata_path,
         .local_ref_path = local_ref_path,
         .resolved_image_ref = resolved_image_ref,
-        .image_manifest_digest = result_storage.index_digest,
+        .image_manifest_digest = image_digest,
         .rootfs_storage = result_storage,
     };
 }
@@ -1768,6 +1775,41 @@ fn validateConfigPlatform(config: ImageConfig, platform: Platform) !void {
     }
 }
 
+fn canonicalImageConfigJson(allocator: std.mem.Allocator, config: ImageConfig) ![]const u8 {
+    return std.json.Stringify.valueAlloc(allocator, config, .{
+        .emit_null_optional_fields = false,
+    });
+}
+
+fn indexedImageConfigDigest(allocator: std.mem.Allocator, canonical_config_json: []const u8) ![]const u8 {
+    var h = Blake3.init(.{});
+    updateFramed(&h, "sporevm-indexed-image-config-v1");
+    updateFramed(&h, canonical_config_json);
+    return blake3DigestAlloc(allocator, &h);
+}
+
+fn indexedImageDigest(allocator: std.mem.Allocator, index_digest: []const u8, canonical_config_json: []const u8) ![]const u8 {
+    var h = Blake3.init(.{});
+    updateFramed(&h, indexed_image_identity_domain);
+    updateFramed(&h, index_digest);
+    updateFramed(&h, canonical_config_json);
+    return blake3DigestAlloc(allocator, &h);
+}
+
+fn updateFramed(h: *Blake3, bytes: []const u8) void {
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, bytes.len, .little);
+    h.update(&len_buf);
+    h.update(bytes);
+}
+
+fn blake3DigestAlloc(allocator: std.mem.Allocator, h: *Blake3) ![]const u8 {
+    var digest: [Blake3.digest_length]u8 = undefined;
+    h.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, &hex });
+}
+
 fn layerBlobPath(allocator: std.mem.Allocator, layers_dir: []const u8, digest: []const u8) ![]u8 {
     if (!oci.isSha256Digest(digest)) return error.UnsupportedDigest;
     return std.fmt.allocPrint(allocator, "{s}/{s}.blob", .{ layers_dir, digest["sha256:".len..] });
@@ -1826,10 +1868,10 @@ fn localResolvedImageRef(allocator: std.mem.Allocator, raw_ref: []const u8, mani
     return std.fmt.allocPrint(allocator, "local/{s}@{s}", .{ tag.repository, manifest_digest });
 }
 
-fn localResolvedIndexRef(allocator: std.mem.Allocator, raw_ref: []const u8, index_digest: []const u8) ![]u8 {
-    if (!std.mem.startsWith(u8, index_digest, spore.rootfs_digest_prefix)) return error.UnsupportedDigest;
+fn localResolvedBlake3Ref(allocator: std.mem.Allocator, raw_ref: []const u8, digest: []const u8) ![]u8 {
+    if (!std.mem.startsWith(u8, digest, spore.rootfs_digest_prefix)) return error.UnsupportedDigest;
     const tag = try parseLocalTagRef(raw_ref);
-    return std.fmt.allocPrint(allocator, "local/{s}@{s}", .{ tag.repository, index_digest });
+    return std.fmt.allocPrint(allocator, "local/{s}@{s}", .{ tag.repository, digest });
 }
 
 fn localResolvedRefMatchesDigest(allocator: std.mem.Allocator, raw_ref: []const u8, resolved_ref: []const u8, digest: []const u8) !bool {
@@ -1846,7 +1888,7 @@ fn localResolvedRefMatchesDigest(allocator: std.mem.Allocator, raw_ref: []const 
     return std.mem.eql(u8, resolved_ref, expected);
 }
 
-fn localResolvedIndexDigestRef(allocator: std.mem.Allocator, raw_ref: []const u8) !?ResolvedImage {
+fn localResolvedBlake3DigestRef(allocator: std.mem.Allocator, raw_ref: []const u8) !?ResolvedImage {
     const at = std.mem.lastIndexOfScalar(u8, raw_ref, '@') orelse return null;
     const name = raw_ref[0..at];
     const digest = raw_ref[at + 1 ..];
@@ -1881,7 +1923,7 @@ pub fn resolveLocalCachedRef(
     } else |err| switch (err) {
         error.ImageRefMustBeDigestPinned => {},
         error.UnsupportedDigest => {
-            if (try localResolvedIndexDigestRef(allocator, raw_ref)) |resolved| {
+            if (try localResolvedBlake3DigestRef(allocator, raw_ref)) |resolved| {
                 return .{ .ref = resolved.ref, .manifest_digest = resolved.manifest_digest, .platform = platform };
             }
             return err;
@@ -2047,12 +2089,7 @@ pub fn cachedImageIndexedRootfs(
         return null;
     };
     errdefer deinitStorageDigestFields(allocator, storage);
-    if (!std.mem.eql(u8, storage.index_digest, resolved.manifest_digest)) {
-        allocator.free(metadata_path);
-        deinitStorageDigestFields(allocator, storage);
-        return null;
-    }
-    if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, storage)) {
+    if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, storage)) {
         allocator.free(metadata_path);
         deinitStorageDigestFields(allocator, storage);
         return null;
