@@ -499,6 +499,24 @@ pub const HostStream = struct {
         return true;
     }
 
+    pub fn enqueueStdinDataNonblocking(self: *HostStream, data: []const u8) !usize {
+        if (data.len == 0) return 0;
+        if (self.state == .complete or self.state == .failed) return 0;
+        const take = @min(data.len, spore_stream.max_payload_len);
+        var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
+        const frame = try spore_stream.writeFrame(&frame_buf, .{
+            .frame_type = .data,
+            .stream_id = .stdin,
+            .offset = self.stdin_offset,
+        }, data[0..take]);
+        self.enqueueOutbound(frame) catch |err| switch (err) {
+            error.OutboundFull => return 0,
+            else => |e| return e,
+        };
+        self.stdin_offset += take;
+        return take;
+    }
+
     pub fn enqueueStdinCloseBlocking(self: *HostStream, stop: *const std.atomic.Value(bool)) !bool {
         var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
         const frame = try spore_stream.writeFrame(&frame_buf, .{
@@ -507,6 +525,21 @@ pub const HostStream = struct {
             .offset = self.stdin_offset,
         }, "");
         return self.enqueueOutboundBlocking(frame, stop);
+    }
+
+    pub fn enqueueStdinCloseNonblocking(self: *HostStream) !bool {
+        if (self.state == .complete or self.state == .failed) return false;
+        var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
+        const frame = try spore_stream.writeFrame(&frame_buf, .{
+            .frame_type = .close,
+            .stream_id = .stdin,
+            .offset = self.stdin_offset,
+        }, "");
+        self.enqueueOutbound(frame) catch |err| switch (err) {
+            error.OutboundFull => return false,
+            else => |e| return e,
+        };
+        return true;
     }
 
     pub fn enqueueTerminalDataBlocking(self: *HostStream, data: []const u8, stop: *const std.atomic.Value(bool)) !bool {

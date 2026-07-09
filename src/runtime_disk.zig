@@ -23,6 +23,7 @@ pub const Options = struct {
     rootfs: ?spore.Rootfs = null,
     disk: ?spore.Disk = null,
     spore_dir: ?[]const u8 = null,
+    rootfs_headroom: u64 = 0,
 };
 
 pub const RuntimeDisk = struct {
@@ -75,7 +76,10 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             // (chunk-only pull caches, pruned entries), defer assembly and let
             // the chunk-mapped backend fault verified CAS objects into a sparse
             // base on demand.
-            if (try openCachedFlatRootfs(context, allocator, rootfs, runtime.trace_fd)) |fd| {
+            if (options.rootfs_headroom != 0) {
+                rootfs_lazy_storage = storage;
+                std.log.debug("runtime disk rootfs base: lazy chunk index {s} with headroom", .{rootfs.artifact.digest});
+            } else if (try openCachedFlatRootfs(context, allocator, rootfs, runtime.trace_fd)) |fd| {
                 runtime.rootfs_fd = fd;
                 std.log.debug("runtime disk rootfs base: flat artifact {s}", .{rootfs.artifact.digest});
             } else if (forceEagerRootfsMaterialization(context)) {
@@ -128,15 +132,18 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         const base = diskFromRootfs(rootfs);
         if (runtime.rootfs_fd == null) {
             const storage = rootfs_lazy_storage orelse return error.BadManifest;
-            runtime.rootfs_fd = try createSparseTempFd(allocator, storage.logical_size);
+            const grown_size = try grownRootfsSize(storage.logical_size, storage.chunk_size, options.rootfs_headroom);
+            runtime.rootfs_fd = try createSparseTempFd(allocator, grown_size);
             const cache_root = try rootfsCacheRootPath(context, allocator);
             defer allocator.free(cache_root);
-            const base_source = try runtime.baseSource(storage.logical_size);
+            const base_source = try runtime.baseSource(grown_size);
             runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, storage.logical_size, storage.chunk_size);
             var parsed = try readDiskIndex(context, allocator, cache_root, storage);
             defer parsed.deinit();
             try runtime.chunk_mapped.?.attachCasIndex(cache_root, parsed.value);
+            try runtime.chunk_mapped.?.grow(grown_size);
             runtime.base_disk = base;
+            runtime.base_disk.?.size = grown_size;
             return runtime;
         }
         const base_source = try runtime.baseSource(base.size);
@@ -181,6 +188,14 @@ fn createSparseTempFd(allocator: std.mem.Allocator, size: u64) !std.c.fd_t {
     const fd = temp.fd;
     temp.fd = -1;
     return fd;
+}
+
+fn grownRootfsSize(logical_size: u64, chunk_size: u64, headroom: u64) !u64 {
+    if (headroom == 0) return logical_size;
+    const raw = std.math.add(u64, logical_size, headroom) catch return error.BadManifest;
+    const remainder = raw % chunk_size;
+    if (remainder == 0) return raw;
+    return std.math.add(u64, raw, chunk_size - remainder) catch return error.BadManifest;
 }
 
 fn diskFromRootfs(rootfs: spore.Rootfs) spore.Disk {

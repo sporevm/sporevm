@@ -132,6 +132,7 @@ pub const Options = struct {
     auto_memory_hotplug_capable: bool = false,
     rootfs_path: ?[]const u8 = null,
     rootfs: ?spore.Rootfs = null,
+    rootfs_headroom: u64 = 0,
     disk: ?spore.Disk = null,
     resume_dir: ?[]const u8 = null,
     resume_generation: ?generation.State = null,
@@ -2642,6 +2643,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     var runtime_disk = try runtime_disk_mod.open(context, allocator, .{
         .rootfs_path = opts.rootfs_path,
         .rootfs = opts.rootfs,
+        .rootfs_headroom = opts.rootfs_headroom,
         .disk = opts.disk,
         .spore_dir = opts.resume_dir,
     });
@@ -2864,6 +2866,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
     var runtime_disk = try runtime_disk_mod.open(context, allocator, .{
         .rootfs_path = opts.rootfs_path,
         .rootfs = opts.rootfs,
+        .rootfs_headroom = opts.rootfs_headroom,
         .disk = opts.disk,
         .spore_dir = opts.resume_dir,
     });

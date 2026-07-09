@@ -163,6 +163,57 @@ pub const ChunkMappedDisk = struct {
         return self.chunkCount();
     }
 
+    pub fn grow(self: *ChunkMappedDisk, new_size: u64) Error!void {
+        const overlay_fd = self.overlay_fd orelse return error.ReadOnly;
+        if (new_size < self.size) return error.BadDiskSize;
+        if (new_size == self.size) return;
+        if (self.size % self.chunk_size != 0) return error.BadDiskSize;
+        if (self.base.capacityBytes() < new_size) return error.BadDiskSize;
+
+        const new_chunk_count = try computeChunkCount(new_size, self.chunk_size);
+        if (new_chunk_count > std.math.maxInt(usize)) return error.BadDiskSize;
+        const old_chunk_count = self.sources.len;
+        const new_sources = try self.allocator.alloc(Source, @intCast(new_chunk_count));
+        @memcpy(new_sources[0..old_chunk_count], self.sources);
+        @memset(new_sources[old_chunk_count..], .zero);
+        errdefer self.allocator.free(new_sources);
+
+        var new_cas_digests: []?[]const u8 = &.{};
+        if (self.cas_digests.len != 0) {
+            const digests = try self.allocator.alloc(?[]const u8, @intCast(new_chunk_count));
+            @memset(digests, null);
+            errdefer freeOptionalDigests(self.allocator, digests);
+            for (self.cas_digests, 0..) |maybe_digest, i| {
+                if (maybe_digest) |digest| digests[i] = try self.allocator.dupe(u8, digest);
+            }
+            new_cas_digests = digests;
+        }
+        errdefer if (self.cas_digests.len != 0) freeOptionalDigests(self.allocator, new_cas_digests);
+
+        var new_parent_digests: []?[]const u8 = &.{};
+        if (self.parent_digests.len != 0) {
+            const digests = try self.allocator.alloc(?[]const u8, @intCast(new_chunk_count));
+            @memset(digests, null);
+            errdefer freeOptionalDigests(self.allocator, digests);
+            for (self.parent_digests, 0..) |maybe_digest, i| {
+                if (maybe_digest) |digest| digests[i] = try self.allocator.dupe(u8, digest);
+            }
+            new_parent_digests = digests;
+        }
+        errdefer if (self.parent_digests.len != 0) freeOptionalDigests(self.allocator, new_parent_digests);
+
+        const overlay_size = std.math.cast(std.c.off_t, new_size) orelse return error.BadDiskSize;
+        if (std.c.ftruncate(overlay_fd, overlay_size) != 0) return error.ResizeFailed;
+
+        self.allocator.free(self.sources);
+        if (self.cas_digests.len != 0) freeOptionalDigests(self.allocator, self.cas_digests);
+        if (self.parent_digests.len != 0) freeOptionalDigests(self.allocator, self.parent_digests);
+        self.sources = new_sources;
+        self.cas_digests = new_cas_digests;
+        self.parent_digests = new_parent_digests;
+        self.size = new_size;
+    }
+
     pub fn chunkLen(self: ChunkMappedDisk, chunk_index: usize) Error!usize {
         if (chunk_index >= self.sources.len) return error.OutOfRange;
         const start = std.math.mul(u64, chunk_index, self.chunk_size) catch return error.OutOfRange;

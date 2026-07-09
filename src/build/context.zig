@@ -19,9 +19,19 @@ const IgnoreRule = struct {
     anchored: bool = false,
 };
 
-const Entry = struct {
+pub const CopyEntry = struct {
     rel: []const u8,
     kind: Io.File.Kind,
+};
+
+pub const CopyRoot = struct {
+    rel: []const u8,
+    kind: Io.File.Kind,
+};
+
+pub const CopyResolution = struct {
+    entries: []const CopyEntry,
+    roots: []const CopyRoot,
 };
 
 pub fn load(allocator: std.mem.Allocator, io: Io, root: []const u8, diagnostic: *IgnoreDiagnostic) !BuildContext {
@@ -81,20 +91,59 @@ pub fn hashCopySources(
     context: BuildContext,
     sources: []const []const u8,
 ) ![]const u8 {
-    var entries = std.array_list.Managed(Entry).init(allocator);
+    const resolution = try resolveCopySources(allocator, io, context, sources);
+    return hashCopyResolution(allocator, io, context, resolution);
+}
+
+pub fn resolveCopySources(
+    allocator: std.mem.Allocator,
+    io: Io,
+    context: BuildContext,
+    sources: []const []const u8,
+) !CopyResolution {
+    var entries = std.array_list.Managed(CopyEntry).init(allocator);
+    var roots = std.array_list.Managed(CopyRoot).init(allocator);
     for (sources) |source| {
-        try appendSourceMatches(allocator, io, context, source, &entries);
+        try appendSourceMatches(allocator, io, context, source, &entries, &roots);
     }
     if (entries.items.len == 0) return error.CopySourceNotFound;
-    std.mem.sort(Entry, entries.items, {}, entryLessThan);
+    std.mem.sort(CopyEntry, entries.items, {}, entryLessThan);
+    std.mem.sort(CopyRoot, roots.items, {}, rootLessThan);
 
-    var h = Blake3.init(.{});
-    var previous_rel: ?[]const u8 = null;
+    var deduped_entries = std.array_list.Managed(CopyEntry).init(allocator);
+    var previous_entry: ?[]const u8 = null;
     for (entries.items) |entry| {
-        if (previous_rel) |rel| {
+        if (previous_entry) |rel| {
             if (std.mem.eql(u8, rel, entry.rel)) continue;
         }
-        previous_rel = entry.rel;
+        previous_entry = entry.rel;
+        try deduped_entries.append(entry);
+    }
+
+    var deduped_roots = std.array_list.Managed(CopyRoot).init(allocator);
+    var previous_root: ?[]const u8 = null;
+    for (roots.items) |root| {
+        if (previous_root) |rel| {
+            if (std.mem.eql(u8, rel, root.rel)) continue;
+        }
+        previous_root = root.rel;
+        try deduped_roots.append(root);
+    }
+
+    return .{
+        .entries = try deduped_entries.toOwnedSlice(),
+        .roots = try deduped_roots.toOwnedSlice(),
+    };
+}
+
+pub fn hashCopyResolution(
+    allocator: std.mem.Allocator,
+    io: Io,
+    context: BuildContext,
+    resolution: CopyResolution,
+) ![]const u8 {
+    var h = Blake3.init(.{});
+    for (resolution.entries) |entry| {
         hashField(&h, entry.rel);
         hashField(&h, @tagName(entry.kind));
         const path = try std.fs.path.join(allocator, &.{ context.root, entry.rel });
@@ -137,7 +186,8 @@ fn appendSourceMatches(
     io: Io,
     context: BuildContext,
     raw_source: []const u8,
-    entries: *std.array_list.Managed(Entry),
+    entries: *std.array_list.Managed(CopyEntry),
+    roots: *std.array_list.Managed(CopyRoot),
 ) !void {
     try validateRelative(raw_source);
     if (std.mem.indexOfAny(u8, raw_source, "?[]") != null or std.mem.indexOf(u8, raw_source, "**") != null) {
@@ -159,13 +209,13 @@ fn appendSourceMatches(
         while (try it.next(io)) |child| {
             if (!starMatch(pattern, child.name)) continue;
             const rel = if (parent_rel.len == 0) try allocator.dupe(u8, child.name) else try std.fs.path.join(allocator, &.{ parent_rel, child.name });
-            try appendPath(allocator, io, context, rel, entries);
+            try appendPath(allocator, io, context, rel, entries, roots, true);
             matched = true;
         }
         if (!matched) return error.CopySourceNotFound;
         return;
     }
-    try appendPath(allocator, io, context, raw_source, entries);
+    try appendPath(allocator, io, context, raw_source, entries, roots, true);
 }
 
 fn appendPath(
@@ -173,12 +223,15 @@ fn appendPath(
     io: Io,
     context: BuildContext,
     rel: []const u8,
-    entries: *std.array_list.Managed(Entry),
+    entries: *std.array_list.Managed(CopyEntry),
+    roots: *std.array_list.Managed(CopyRoot),
+    source_root: bool,
 ) !void {
     if (ignored(context, rel, false)) return;
     const path = try std.fs.path.join(allocator, &.{ context.root, rel });
     defer allocator.free(path);
     const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    if (source_root) try roots.append(.{ .rel = try allocator.dupe(u8, rel), .kind = stat.kind });
     switch (stat.kind) {
         .file, .sym_link => try entries.append(.{ .rel = try allocator.dupe(u8, rel), .kind = stat.kind }),
         .directory => {
@@ -192,7 +245,7 @@ fn appendPath(
             std.mem.sort([]const u8, children.items, {}, stringLessThan);
             for (children.items) |child| {
                 const child_rel = try std.fs.path.join(allocator, &.{ rel, child });
-                try appendPath(allocator, io, context, child_rel, entries);
+                try appendPath(allocator, io, context, child_rel, entries, roots, false);
             }
         },
         else => return error.UnsupportedCopySourceType,
@@ -241,7 +294,11 @@ fn starMatch(pattern: []const u8, value: []const u8) bool {
     return std.mem.startsWith(u8, value, prefix) and std.mem.endsWith(u8, value, suffix) and value.len >= prefix.len + suffix.len;
 }
 
-fn entryLessThan(_: void, a: Entry, b: Entry) bool {
+fn entryLessThan(_: void, a: CopyEntry, b: CopyEntry) bool {
+    return std.mem.lessThan(u8, a.rel, b.rel);
+}
+
+fn rootLessThan(_: void, a: CopyRoot, b: CopyRoot) bool {
     return std.mem.lessThan(u8, a.rel, b.rel);
 }
 
@@ -361,11 +418,12 @@ fn oldUnframedHashCopySourcesForTest(
     context: BuildContext,
     sources: []const []const u8,
 ) ![]const u8 {
-    var entries = std.array_list.Managed(Entry).init(allocator);
+    var entries = std.array_list.Managed(CopyEntry).init(allocator);
+    var roots = std.array_list.Managed(CopyRoot).init(allocator);
     for (sources) |source| {
-        try appendSourceMatches(allocator, io, context, source, &entries);
+        try appendSourceMatches(allocator, io, context, source, &entries, &roots);
     }
-    std.mem.sort(Entry, entries.items, {}, entryLessThan);
+    std.mem.sort(CopyEntry, entries.items, {}, entryLessThan);
 
     var h = Blake3.init(.{});
     for (entries.items) |entry| {

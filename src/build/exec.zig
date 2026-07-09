@@ -19,6 +19,11 @@ const max_guest_arg_len = 255;
 const max_guest_envc = 64;
 const max_guest_env_len = 255;
 const max_guest_working_dir_len = 255;
+pub const max_copy_entries = 65536;
+pub const max_copy_entry_path_len = 512;
+pub const max_copy_entry_content_len: u64 = 1024 * 1024 * 1024;
+const copy_entry_header_len = 17;
+const resize_command = "resize2fs /dev/vda";
 
 pub const Diagnostic = struct {
     instruction: ?[]const u8 = null,
@@ -36,17 +41,76 @@ pub const RunStep = struct {
     workdir: []const u8,
 };
 
+pub const CopyEntryKind = enum(u8) {
+    directory = 'D',
+    file = 'F',
+    sym_link = 'L',
+};
+
+pub const CopyEntry = struct {
+    kind: CopyEntryKind,
+    path: []const u8,
+    mode: u32,
+    content: []const u8 = "",
+};
+
+pub const CopyStep = struct {
+    canonical_instruction: []const u8,
+    dest: []const u8,
+    input_digest: []const u8,
+    env_digest: []const u8,
+    workdir: []const u8,
+    entries: []const CopyEntry,
+};
+
+pub const Step = union(enum) {
+    run: RunStep,
+    copy: CopyStep,
+
+    fn canonicalInstruction(self: Step) []const u8 {
+        return switch (self) {
+            .run => |step| step.canonical_instruction,
+            .copy => |step| step.canonical_instruction,
+        };
+    }
+};
+
 pub const Options = struct {
     platform: rootfs_mod.Platform,
     cache_root: []const u8,
     base_storage: spore.RootfsStorage,
-    steps: []const RunStep,
+    steps: []const Step,
     network_enabled: bool,
+    disk_headroom: u64 = 0,
     output: ?*Io.Writer = null,
     diagnostic: ?*Diagnostic = null,
 };
 
+pub fn cacheInputForStep(platform: rootfs_mod.Platform, parent_index_digest: []const u8, step: Step) step_cache.StepInput {
+    return switch (step) {
+        .run => |run| .{
+            .platform = platform,
+            .parent_index_digest = parent_index_digest,
+            .instruction_kind = "RUN",
+            .canonical_instruction = run.canonical_instruction,
+            .env_digest = run.env_digest,
+            .workdir = run.workdir,
+        },
+        .copy => |copy| .{
+            .platform = platform,
+            .parent_index_digest = parent_index_digest,
+            .instruction_kind = "COPY",
+            .canonical_instruction = copy.canonical_instruction,
+            .input_digest = copy.input_digest,
+            .env_digest = copy.env_digest,
+            .workdir = copy.workdir,
+        },
+    };
+}
+
 const Phase = enum {
+    start_resize,
+    active_resize,
     start_run,
     active_run,
     start_freeze,
@@ -59,12 +123,14 @@ const Phase = enum {
 };
 
 const ActiveStream = enum {
+    resize,
     run,
+    copy,
     freeze,
     thaw,
 };
 
-/// Runs all uncached RUN steps in one build VM session.
+/// Runs all uncached build steps in one build VM session.
 ///
 /// Allocation ownership follows the build path's arena-per-invocation contract:
 /// session ids, request buffers, step keys, storage clones, and current_storage
@@ -84,6 +150,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
         .rootfs = rootfs,
+        .rootfs_headroom = options.disk_headroom,
         .command = &.{},
         .memory = .{ .policy = .explicit, .bytes = build_vm_memory_bytes },
         .network = if (options.network_enabled) .spore else .disabled,
@@ -117,7 +184,7 @@ const BuildControl = struct {
     allocator: std.mem.Allocator,
     platform: rootfs_mod.Platform,
     cache_root: []const u8,
-    steps: []const RunStep,
+    steps: []const Step,
     output: ?*Io.Writer,
     current_storage: spore.RootfsStorage,
     step_index: usize = 0,
@@ -127,6 +194,9 @@ const BuildControl = struct {
     stream_valid: bool = false,
     active_input: ?step_cache.StepInput = null,
     active_step_key: []const u8 = "",
+    active_stdin_payload: []const u8 = "",
+    active_stdin_offset: usize = 0,
+    active_stdin_close_sent: bool = true,
     capture: std.array_list.Managed(u8),
     executed_steps: usize = 0,
     failed_instruction: ?[]const u8 = null,
@@ -142,6 +212,7 @@ const BuildControl = struct {
             .steps = options.steps,
             .output = options.output,
             .current_storage = try spore.cloneRootfsStorage(allocator, options.base_storage),
+            .phase = if (options.disk_headroom == 0) .start_run else .start_resize,
             .capture = std.array_list.Managed(u8).init(allocator),
         };
     }
@@ -163,8 +234,13 @@ const BuildControl = struct {
 
     fn poll(self: *BuildControl, dev: *vsock.Vsock) !vsock.ControlAction {
         switch (self.phase) {
+            .start_resize => {
+                try self.startResize(dev);
+                return .keep_running;
+            },
+            .active_resize => return try self.pollActiveStream(dev),
             .start_run => {
-                try self.startRun(dev);
+                try self.startStep(dev);
                 return .keep_running;
             },
             .active_run => return try self.pollActiveStream(dev),
@@ -183,56 +259,69 @@ const BuildControl = struct {
         }
     }
 
-    fn startRun(self: *BuildControl, dev: *vsock.Vsock) !void {
+    fn startResize(self: *BuildControl, dev: *vsock.Vsock) !void {
+        const request = try runRequest(self.allocator, "spore-build-resize", resize_command, &.{}, "/", self.io);
+        try self.startStream(dev, request, .spore_stream_v1, .resize, "");
+        self.phase = .active_resize;
+    }
+
+    fn startStep(self: *BuildControl, dev: *vsock.Vsock) !void {
         const step = self.steps[self.step_index];
         self.executed_steps += 1;
-        const input = step_cache.StepInput{
-            .platform = self.platform,
-            .parent_index_digest = self.current_storage.index_digest,
-            .instruction_kind = "RUN",
-            .canonical_instruction = step.canonical_instruction,
-            .env_digest = step.env_digest,
-            .workdir = step.workdir,
-        };
+        const input = self.stepInput(step);
         self.active_input = input;
         self.active_step_key = try step_cache.stepKey(self.allocator, input);
         const session_id = try std.fmt.allocPrint(self.allocator, "spore-build-{d}", .{self.step_index + 1});
-        const request = try runRequest(self.allocator, session_id, step.command, step.env, step.workdir, self.io);
-        try self.startStream(dev, request, .spore_stream_v1, .run);
+        switch (step) {
+            .run => |run| {
+                const request = try runRequest(self.allocator, session_id, run.command, run.env, run.workdir, self.io);
+                try self.startStream(dev, request, .spore_stream_v1, .run, "");
+            },
+            .copy => |copy| {
+                const request = try copyRequest(self.allocator, session_id, copy.dest, copy.entries.len);
+                const payload = try encodeCopyPayload(self.allocator, copy.entries);
+                try self.startStream(dev, request, .spore_stream_v1, .copy, payload);
+            },
+        }
         self.phase = .active_run;
+    }
+
+    fn stepInput(self: BuildControl, step: Step) step_cache.StepInput {
+        return cacheInputForStep(self.platform, self.current_storage.index_digest, step);
     }
 
     fn startSimpleControl(self: *BuildControl, dev: *vsock.Vsock, kind: ActiveStream) !void {
         const request = switch (kind) {
             .freeze => try simpleRequest(self.allocator, "fsfreeze-v1", "spore-build-freeze"),
             .thaw => try simpleRequest(self.allocator, "fsthaw-v1", "spore-build-thaw"),
-            .run => unreachable,
+            .resize, .run, .copy => unreachable,
         };
-        try self.startStream(dev, request, .spore_stream_v1, kind);
+        try self.startStream(dev, request, .spore_stream_v1, kind, "");
         self.phase = switch (kind) {
             .freeze => .active_freeze,
             .thaw => .active_thaw,
-            .run => unreachable,
+            .resize, .run, .copy => unreachable,
         };
     }
 
-    fn startStream(self: *BuildControl, dev: *vsock.Vsock, request: []const u8, protocol: vsock.HostStreamProtocol, kind: ActiveStream) !void {
+    fn startStream(self: *BuildControl, dev: *vsock.Vsock, request: []const u8, protocol: vsock.HostStreamProtocol, kind: ActiveStream, stdin_payload: []const u8) !void {
         self.stream = try vsock.HostStream.initWithProtocol(guest_port, request, protocol);
         self.stream.host_port = vsock.HostStream.deriveHostPort(request);
         self.active_stream = kind;
-        if (kind == .run) self.stream.setOutputSink(self, outputSink);
-        if (kind == .run and protocol == .spore_stream_v1) {
-            var stop = std.atomic.Value(bool).init(false);
-            _ = try self.stream.enqueueStdinCloseBlocking(&stop);
-        }
+        if (kind == .run or kind == .copy or kind == .resize) self.stream.setOutputSink(self, outputSink);
+        self.active_stdin_payload = stdin_payload;
+        self.active_stdin_offset = 0;
+        self.active_stdin_close_sent = !(kind == .run or kind == .copy or kind == .resize);
         try dev.attachHostStream(&self.stream);
         self.stream.markStarted();
         self.stream_valid = true;
+        try self.pumpActiveStdin();
         _ = try dev.flushHostStreamOutbound();
     }
 
     fn pollActiveStream(self: *BuildControl, dev: *vsock.Vsock) !vsock.ControlAction {
         if (!self.stream_valid) return .keep_running;
+        try self.pumpActiveStdin();
         _ = try dev.flushHostStreamOutbound();
         switch (self.stream.state) {
             .complete => {
@@ -261,9 +350,18 @@ const BuildControl = struct {
 
     fn finishActiveStream(self: *BuildControl, exit_code: i32) !void {
         switch (self.active_stream) {
-            .run => {
+            .resize => {
                 if (exit_code != 0) {
-                    self.failed_instruction = self.steps[self.step_index].canonical_instruction;
+                    self.failure = error.BuildGuestResizeFailed;
+                    self.phase = .failed;
+                    return;
+                }
+                self.capture.clearRetainingCapacity();
+                self.phase = .start_run;
+            },
+            .run, .copy => {
+                if (exit_code != 0) {
+                    self.failed_instruction = self.steps[self.step_index].canonicalInstruction();
                     self.failed_exit_code = exit_code;
                     self.phase = .failed;
                     return;
@@ -287,18 +385,31 @@ const BuildControl = struct {
                 self.step_index += 1;
                 self.active_input = null;
                 self.active_step_key = "";
+                self.active_stdin_payload = "";
+                self.active_stdin_offset = 0;
+                self.active_stdin_close_sent = true;
                 self.capture.clearRetainingCapacity();
                 self.phase = if (self.step_index >= self.steps.len) .done else .start_run;
             },
         }
     }
 
+    fn pumpActiveStdin(self: *BuildControl) !void {
+        if (self.active_stdin_close_sent) return;
+        while (self.active_stdin_offset < self.active_stdin_payload.len) {
+            const written = try self.stream.enqueueStdinDataNonblocking(self.active_stdin_payload[self.active_stdin_offset..]);
+            if (written == 0) return;
+            self.active_stdin_offset += written;
+        }
+        self.active_stdin_close_sent = try self.stream.enqueueStdinCloseNonblocking();
+    }
+
     fn completeRootfsSnapshot(self: *BuildControl, maybe_disk: ?spore.Disk) !void {
         if (self.phase != .snapshot) return;
         const disk = maybe_disk orelse return error.BadManifest;
         const storage = try storageFromDisk(self.allocator, disk);
-        // A zero-dirty RUN can intentionally yield child digest == parent
-        // digest; the step key still proves which instruction/env was run.
+        // A zero-dirty RUN/COPY can intentionally yield child digest == parent
+        // digest; the step key still proves which instruction/env/input ran.
         try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, storage.index_digest);
         const input = self.active_input orelse return error.BadManifest;
         _ = try step_cache.writeRecord(self.io, self.allocator, self.cache_root, input, self.active_step_key, storage);
@@ -393,6 +504,70 @@ fn runRequest(
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
+fn copyRequest(allocator: std.mem.Allocator, session_id: []const u8, dest: []const u8, entry_count: usize) ![]const u8 {
+    if (dest.len == 0 or dest.len > max_copy_entry_path_len) return error.CopyDestinationUnsupported;
+    if (entry_count > max_copy_entries) return error.CopyEntryCountUnsupported;
+    const payload = struct {
+        type: []const u8 = "spore-copy-v1",
+        session_id: []const u8,
+        dest: []const u8,
+        entry_count: usize,
+    }{
+        .session_id = session_id,
+        .dest = dest,
+        .entry_count = entry_count,
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
+    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+}
+
+pub fn encodeCopyPayload(allocator: std.mem.Allocator, entries: []const CopyEntry) ![]const u8 {
+    if (entries.len > max_copy_entries) return error.CopyEntryCountUnsupported;
+    var total: usize = 0;
+    for (entries) |entry| {
+        try validateCopyEntry(entry);
+        total = std.math.add(usize, total, copy_entry_header_len) catch return error.CopyPayloadTooLarge;
+        total = std.math.add(usize, total, entry.path.len) catch return error.CopyPayloadTooLarge;
+        total = std.math.add(usize, total, entry.content.len) catch return error.CopyPayloadTooLarge;
+    }
+    const payload = try allocator.alloc(u8, total);
+    var offset: usize = 0;
+    for (entries) |entry| {
+        payload[offset] = @intFromEnum(entry.kind);
+        std.mem.writeInt(u32, payload[offset + 1 ..][0..4], entry.mode, .little);
+        std.mem.writeInt(u32, payload[offset + 5 ..][0..4], @intCast(entry.path.len), .little);
+        std.mem.writeInt(u64, payload[offset + 9 ..][0..8], @intCast(entry.content.len), .little);
+        offset += copy_entry_header_len;
+        @memcpy(payload[offset..][0..entry.path.len], entry.path);
+        offset += entry.path.len;
+        @memcpy(payload[offset..][0..entry.content.len], entry.content);
+        offset += entry.content.len;
+    }
+    return payload;
+}
+
+fn validateCopyEntry(entry: CopyEntry) !void {
+    if (entry.path.len == 0 or entry.path.len > max_copy_entry_path_len) return error.CopyDestinationUnsupported;
+    if (!std.fs.path.isAbsolute(entry.path)) return error.CopyDestinationUnsupported;
+    if (std.mem.endsWith(u8, entry.path, "/")) return error.CopyDestinationUnsupported;
+    var it = std.mem.splitScalar(u8, entry.path[1..], '/');
+    while (it.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.CopyDestinationUnsupported;
+    }
+    if (entry.content.len > max_copy_entry_content_len) return error.CopyPayloadTooLarge;
+    switch (entry.kind) {
+        .directory => {
+            if (entry.content.len != 0) return error.CopyPayloadTooLarge;
+        },
+        .file => {},
+        .sym_link => {
+            if (entry.content.len > max_copy_entry_path_len) return error.CopyPayloadTooLarge;
+        },
+    }
+}
+
 fn simpleRequest(allocator: std.mem.Allocator, request_type: []const u8, session_id: []const u8) ![]const u8 {
     const payload = struct {
         type: []const u8,
@@ -443,11 +618,101 @@ fn fuzzSimpleRequest(_: void, s: *std.testing.Smith) !void {
     try std.testing.expect(request.len <= max_guest_request_len);
 }
 
+fn fuzzCopyPayload(_: void, s: *std.testing.Smith) !void {
+    var path_buf: [64]u8 = undefined;
+    const raw_len = s.slice(&path_buf);
+    for (path_buf[0..raw_len]) |*byte| {
+        if (byte.* == 0 or byte.* == '/') byte.* = 'x';
+    }
+    const name = if (raw_len == 0) "x" else path_buf[0..raw_len];
+    var path_storage: [80]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_storage, "/{s}", .{name}) catch return;
+    var content_buf: [128]u8 = undefined;
+    const content_len = s.slice(&content_buf);
+    const payload = encodeCopyPayload(std.testing.allocator, &.{.{
+        .kind = .file,
+        .path = path,
+        .mode = 0o644,
+        .content = content_buf[0..content_len],
+    }}) catch return;
+    defer std.testing.allocator.free(payload);
+    try std.testing.expect(payload.len == copy_entry_header_len + path.len + content_len);
+}
+
 test "build fsfreeze request stays bounded" {
     const request = try simpleRequest(std.testing.allocator, "fsfreeze-v1", "spore-build-freeze");
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.endsWith(u8, request, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, request, "\"fsfreeze-v1\"") != null);
+}
+
+test "build copy request uses spore copy v1" {
+    const request = try copyRequest(std.testing.allocator, "spore-build-1", "/work", 2);
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.endsWith(u8, request, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-copy-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"dest\":\"/work\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"entry_count\":2") != null);
+}
+
+test "build copy payload encodes bounded entries" {
+    const payload = try encodeCopyPayload(std.testing.allocator, &.{
+        .{ .kind = .directory, .path = "/app", .mode = 0o755 },
+        .{ .kind = .file, .path = "/app/file", .mode = 0o640, .content = "data" },
+        .{ .kind = .sym_link, .path = "/app/link", .mode = 0o777, .content = "file" },
+    });
+    defer std.testing.allocator.free(payload);
+    try std.testing.expectEqual(@as(usize, (copy_entry_header_len * 3) + "/app".len + "/app/file".len + 4 + "/app/link".len + 4), payload.len);
+    try std.testing.expectEqual(@as(u8, 'D'), payload[0]);
+    try std.testing.expectEqual(@as(u32, 0o755), std.mem.readInt(u32, payload[1..5], .little));
+    try std.testing.expectEqual(@as(u32, "/app".len), std.mem.readInt(u32, payload[5..9], .little));
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, payload[9..17], .little));
+}
+
+test "build copy payload rejects path escapes" {
+    try std.testing.expectError(error.CopyDestinationUnsupported, encodeCopyPayload(std.testing.allocator, &.{.{
+        .kind = .file,
+        .path = "/app/../secret",
+        .mode = 0o644,
+        .content = "x",
+    }}));
+    try std.testing.expectError(error.CopyDestinationUnsupported, encodeCopyPayload(std.testing.allocator, &.{.{
+        .kind = .file,
+        .path = "relative",
+        .mode = 0o644,
+        .content = "x",
+    }}));
+}
+
+test "build copy payload accepts exact path bound" {
+    const allocator = std.testing.allocator;
+    const path = try allocator.alloc(u8, max_copy_entry_path_len);
+    defer allocator.free(path);
+    path[0] = '/';
+    @memset(path[1..], 'a');
+
+    const payload = try encodeCopyPayload(allocator, &.{.{
+        .kind = .file,
+        .path = path,
+        .mode = 0o644,
+        .content = "x",
+    }});
+    defer allocator.free(payload);
+
+    const request = try copyRequest(allocator, "spore-build-1", path, 1);
+    defer allocator.free(request);
+
+    const too_long = try allocator.alloc(u8, max_copy_entry_path_len + 1);
+    defer allocator.free(too_long);
+    too_long[0] = '/';
+    @memset(too_long[1..], 'b');
+    try std.testing.expectError(error.CopyDestinationUnsupported, encodeCopyPayload(allocator, &.{.{
+        .kind = .file,
+        .path = too_long,
+        .mode = 0o644,
+        .content = "x",
+    }}));
+    try std.testing.expectError(error.CopyDestinationUnsupported, copyRequest(allocator, "spore-build-1", too_long, 1));
 }
 
 test "build run request uses spore stream v1 start" {
@@ -468,4 +733,5 @@ test "build run request rejects guest parser overflow" {
 
 test "fuzz build control request framing" {
     try std.testing.fuzz({}, fuzzSimpleRequest, .{});
+    try std.testing.fuzz({}, fuzzCopyPayload, .{});
 }

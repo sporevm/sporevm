@@ -154,8 +154,9 @@ Options for the first implementation:
 - `--build-arg KEY=VALUE` (repeatable): supplies `ARG` values.
 - `--network spore|none`: network policy for `RUN` steps. Default `spore`
   (Docker builds assume network). `none` gives hermetic builds.
-- `--disk-headroom SIZE`: accepted for CLI stability; grow/resize execution is
-  deferred until after the RUN executor slice and before full M2 completion.
+- `--disk-headroom SIZE`: grows the writable build rootfs by `SIZE` bytes
+  before the first executed cache miss, then runs guest `resize2fs /dev/vda`
+  once before Dockerfile steps resume.
 - `--no-cache`: ignore step cache reads (still writes).
 - `--mkfs PATH` / `--debugfs PATH`: forwarded to the base-import path, same as
   `spore rootfs import-oci`.
@@ -216,9 +217,9 @@ src/build/step_cache.zig step-key computation + on-disk records that map
                          index_digest outcomes
 src/build/exec.zig       persistent build-VM session: boot the deepest
                          cached index writable through ChunkMappedDisk,
-                         drive RUN/COPY steps through an in-guest step
-                         driver, checkpoint (freeze/snapshot/stamp/record/thaw) after
-                         each exec step
+                         drive RUN/COPY through initrd agent requests,
+                         checkpoint (freeze/snapshot/stamp/record/thaw)
+                         after each build step
 ```
 
 Build state machine:
@@ -236,10 +237,10 @@ Build state machine:
                  ╭──────────────────╮   ╭──────────────────────────────╮
                  │ read final step  │   │ open index k-1 through       │
                  │ record, verify   │   │ ChunkMappedDisk + overlay    │
-                 │ complete stamp   │   │ no grow/resize in RUN slice  │
+                 │ complete stamp   │   │ optional grow + resize2fs    │
                  ╰────────┬─────────╯   │ boot guest once (rw)         │
                           │             │ for each remaining step:     │
-                          │             │   exec via step driver       │
+                          │             │   agent request (RUN/COPY)   │
                           │             │   sync+freeze → snapshot →   │
                           │             │   stamp+record → thaw        │
                           │             │ shutdown                     │
@@ -466,32 +467,29 @@ Session lifecycle:
    fully cold build) as the `ChunkMappedDisk` parent and attach build-owned
    writable overlay state. The parent index and complete stamp are verified
    before boot; missing chunks fail closed instead of reaching the guest.
-2. Grow-only headroom is a later M2 completion slice: if the ext4 has less
-   than `--disk-headroom` free, grow the chunk-mapped disk and run host-side
-   `resize2fs` (already implied by the e2fsprogs dependency). The RUN slice
-   accepts the CLI option but uses the existing logical size. No shrink after;
+2. If `--disk-headroom SIZE` is non-zero, grow the writable chunk-mapped rootfs
+   by `SIZE` bytes rounded to the disk chunk size, then run guest
+   `resize2fs /dev/vda` once before the first Dockerfile step. No shrink after;
    later snapshots inherit the larger logical size.
 3. Boot via the existing run stack with a new internal rootfs mode: open the
    chunk-mapped rootfs read-write and pass `spore_rootfs_rw=1`, without
    changing public `spore run` semantics. This is a builder-only option behind
    the hypervisor-neutral disk interface.
-4. The single exec'd guest command is a **step driver**: a self-contained
-   POSIX-sh program passed as the exec command line (no guest install, no
-   injected binary in v1). It speaks a length-framed protocol over the
-   existing vsock exec stdin/stdout stream (`spore_stream_v1` — the same
-   file-backed stdin extension COPY needs):
+4. The host drives the existing initrd agent over bounded `spore_stream_v1`
+   requests:
    - `RUN`: host sends the script plus the step's effective env and workdir;
      driver runs `/bin/sh -c` as root (Docker parity: `-c`, not the `-lc`
      that `spore run`'s shell mode uses), streams output through, reports the
      exit code. Network per `--network` for the whole session.
-   - `COPY`: host sends a byte-counted tar payload; driver extracts it (see
-     COPY Semantics).
-   - `CHECKPOINT`: driver runs `sync` then `fsfreeze -f /` and acknowledges;
+   - `COPY`: host sends a `spore-copy-v1` JSON request with destination and
+     entry count, then length-prefixed dir/file/symlink entries over SPIO stdin;
+     the agent validates bounds and guest paths before applying them under
+     `/mnt/rootfs` (see COPY Semantics).
+   - `CHECKPOINT`: agent handles `fsfreeze-v1` after the step exits;
      the VMM drains/flushes pending virtio-blk writes, the host calls
      `ChunkMappedDisk.snapshotIndex()` into the rootfs CAS, writes/repairs the
      complete stamp, writes the step record with the child `index_digest`, and
-     then tells the driver to thaw. The driver itself only waits on stdin
-     during the freeze, so it never blocks on the frozen root. Because all
+     then sends `fsthaw-v1`. Because all
      step processes have already exited and the filesystem is frozen at
      snapshot time, checkpoints are clean images, not crash-consistent guesses
      — this matters because the rootfs ext4 profile has no journal. Publishing
@@ -510,65 +508,57 @@ Session lifecycle:
    full-image hash or flat install pass.
 
 Overhead on a cache miss, on top of the commands themselves: one boot
-(~1–2s per build), sync+freeze+O(dirty) snapshot per changed step, and
-local-ref publication. The later grow-only headroom slice adds one resize2fs
-(seconds, cold builds only in practice) when the base image lacks enough free
-space.
+(~1–2s per build), optional one-time grow+`resize2fs`, sync+freeze+O(dirty)
+snapshot per changed step, and local-ref publication.
 There is no tar export, no full-image hash, and no flat materialization
 required before the image is runnable. Fixed overhead is one boot plus the
 dirty snapshot work, so uncached builds compete with BuildKit by avoiding
 BuildKit's export and Spore's import boundary entirely.
 
-De-risk fallback, recorded not planned: if the step driver proves gnarly in
-M2, the degenerate mode is one boot-snapshot-shutdown cycle per step (same
-cache records and `index_digest` outcomes, N boots). It costs one boot per
-changed step instead of per build and requires no driver protocol; the plan's
-cache model is identical in both modes.
+De-risk fallback, recorded not planned: if persistent in-guest orchestration
+regresses, the degenerate mode is one boot-snapshot-shutdown cycle per step
+(same cache records and `index_digest` outcomes, N boots). It costs one boot
+per changed step instead of per build; the cache model is identical in both
+modes.
 
 The guest sees exactly what `spore run --image X --save` sees today
-(`spore_rootfs=1 spore_rootfs_rw=1`), so no guest/initrd changes are expected;
-verifying that the init path mounts root rw, that `fsfreeze` is available in
-the target base (util-linux is essential in Debian) is part of the RUN-slice
-definition of done. The later grow-only headroom slice adds the
-`resize2fs`-grown filesystem boot assertion. A base without `fsfreeze` fails
-closed with an error naming the requirement, like the `tar` requirement for
-COPY.
+(`spore_rootfs=1 spore_rootfs_rw=1`). The initrd agent now provides the build
+control verbs (`fsfreeze-v1`, `fsthaw-v1`, `spore-copy-v1`); the target base
+must provide `/bin/sh` for RUN and `resize2fs` when `--disk-headroom` is used.
+A missing guest requirement fails closed through the step's captured output.
 
 ## COPY Semantics
 
 `COPY` goes **through the guest**, inside the same persistent build-VM
 session as `RUN`, rather than host-side ext4 surgery:
 
-1. On the host, resolve sources against the context (no `..` escapes, no
-   absolute sources — fail closed), and pack them into an uncompressed tar
-   stream: entries renamed to their destination paths, uid/gid forced to 0:0,
-   mode bits preserved, symlinks preserved as symlinks, hardlinks preserved,
-   xattrs (`security.capability`) carried through, directory entries included
-   so empty directories survive.
-2. Send the tar to the step driver as a byte-counted `COPY` payload over the
-   existing vsock `spore_stream_v1` exec stdin (flow-controlled stdin frames
-   already exist for interactive runs); the driver runs `tar -xf - -C /`
-   (with Docker merge semantics: existing files overwritten, directories
-   merged, destination parents created). This needs a file-backed stdin
-   source alongside the terminal-backed `RunStdinControl` — a builder-side
-   extension, no protocol or device model change. Rejected transports:
-   `--inject` (capped at 16MiB total) and a second virtio-blk device (the
-   device model is frozen per `SECURITY.md`/`AGENTS.md`).
-3. Checkpoint exactly as RUN does (freeze, O(dirty) snapshot, step record).
+1. On the host, resolve sources against the context with the same walker used
+   by `hashCopySources` (no `..` escapes, no absolute sources, `.dockerignore`
+   already applied). The resolved, sorted, deduped file set is both the cache
+   input digest and the payload source, so keys cannot drift from bytes.
+2. Map Docker destinations on the host: directory sources copy contents,
+   multiple sources require a `/`-terminated destination, relative destinations
+   resolve against `WORKDIR`, and guest paths containing `..` fail closed.
+3. Send a `spore-copy-v1` request plus a length-prefixed entry stream over the
+   existing SPIO stdin frames. Each entry has kind (dir/file/symlink), mode,
+   absolute guest path, and content bytes for files or symlink targets. The
+   agent applies entries under `/mnt/rootfs` with root ownership, parent
+   creation, directory merge, file overwrite, and symlink preservation.
+4. Checkpoint exactly as RUN does (freeze, O(dirty) snapshot, complete stamp,
+   step record, thaw).
 
-Corollary: the parent rootfs must provide `tar` (and a GNU/busybox tar with
-xattr support for the `security.capability` case). The Debian-based target
-base does; a base without it fails the COPY step closed with an error naming
-the requirement.
+Corollary: COPY does not require `tar` in the base image and does not add a tar
+parser to the initrd agent. Hardlinks, xattrs, `--chown`, `--chmod`, `--from`,
+`--link`, `ADD`, and multi-stage builds remain unsupported and fail closed.
 
 Why the guest and not `debugfs` writes or host staging: a real Linux kernel
-applies ownership, modes, symlinks, hardlinks, and xattrs natively and
+applies ownership, modes, symlinks, and directory merge behavior natively and
 correctly, with no root requirement on the host and no macOS case-sensitivity
 or metadata hazards. `debugfs -w` scripting for arbitrary tree merges
 (overwrite-vs-merge, unlink-before-write, hardlinks) is a large correctness
 surface for no architectural payoff. With the persistent session the guest
 boot is already amortized across the whole build, so COPY's marginal cost is
-the tar stream plus one freeze/snapshot checkpoint. Host-side COPY (writing
+the entry stream plus one freeze/snapshot checkpoint. Host-side COPY (writing
 directly into the rootfs without the guest) stays a documented follow-up for
 the case where a COPY is the *only* uncached step; it needs a separate design
 and is not v1.
@@ -618,8 +608,8 @@ single-digit seconds end to end, with the BuildKit tar export removed.
 
 - The Dockerfile parser and context walker are new parsers of user-influenced
   input. Per `SECURITY.md`, they ship with fuzz targets in the same change
-  (M1 for the parser; the tar *writer* in M3 needs bounded-input tests but is
-  not a parser).
+  (M1 for the parser; M2 COPY keeps host payload generation on the same
+  resolver path and bounds the guest entry parser).
 - `RUN` executes arbitrary user commands — inside the SporeVM guest, which is
   the existing isolation boundary. The builder adds no new device model, no
   new virtqueue parsing, and no monitor changes outside the existing
@@ -680,12 +670,12 @@ Definition of done:
 Ceiling proven: cached build resolution and ref publication <1s; base import
 cost paid once.
 
-### M2 — RUN via the persistent build-VM session
+### M2 — RUN/COPY via the persistent build-VM session
 
 The session executor: open the deepest cached index through `ChunkMappedDisk`
 with build-owned overlay state, rw rootfs boot behind the hypervisor-neutral
-disk interface, the step driver over `spore_stream_v1` (file-backed stdin
-source), `/bin/sh -c` steps with env/workdir/network,
+disk interface, bounded agent requests over `spore_stream_v1`, `/bin/sh -c`
+RUN steps with env/workdir/network, `spore-copy-v1` COPY entry streams,
 freeze/snapshot/stamp/record/thaw checkpointing (including the virtio-blk drain),
 complete-stamp publication, streamed step output, and non-zero-exit cleanup.
 Every executed instruction produces exactly one child `index_digest` through
@@ -696,21 +686,22 @@ Definition of done:
 - `FROM base` + `RUN apt-get update && apt-get install -y …` builds against
   the real Buildkite base OCI layout; the result boots; installed packages are
   present.
-- Two consecutive RUNs execute in one guest boot with a checkpoint between
-  them (asserted via profile output).
+- Mixed RUN/COPY Dockerfiles execute in one guest boot with a checkpoint
+  between each executed step.
 - Rebuild without changes: cache hit, no VM boot, <1s.
-- Changing the second RUN string resumes from the first RUN's cached
-  `index_digest` — one boot, one step re-executed.
+- Changing a later RUN string or copied file resumes from the deepest cached
+  `index_digest` — one boot, only the changed step and following steps
+  re-execute.
 - A failing RUN reports the exit code and instruction, leaves no step record
   for the failed step, leaves no live temp files; earlier checkpoints remain
   usable.
 - A checkpoint taken mid-build boots and fsck's clean when opened from its
   published `index_digest` (freeze correctness smoke).
-- grow-only headroom/resize2fs has a later smoke assertion before full M2
-  completion.
+- grow-only headroom/resize2fs is exercised by the gated build smoke before
+  Dockerfile steps execute.
 
-Ceiling proven: uncached RUN build = one boot + command time + O(dirty)
-snapshots; cached RUN ≈ 0.
+Ceiling proven: uncached RUN/COPY build = one boot + optional resize + step
+time + O(dirty) snapshots; cached build ≈ 0.
 
 Implementation note (2026-07-09, RUN slice): the executor now starts at the
 first uncached `RUN`, opens the parent rootfs through the normal writable
@@ -726,17 +717,29 @@ snapshot remains a valid cache resume point. Failed RUNs report the
 instruction, exit code, and captured output without writing the failed step
 record. The slice also fixes
 `spore run --image` for indexed rootfs images so build-published images pass
-`spore_rootfs=1` even when there is no flat rootfs path. COPY cache misses
-still fail closed; COPY application, disk headroom/resize smoke coverage, and
-the broader VM-dependent acceptance matrix remain for the next executor slice.
+`spore_rootfs=1` even when there is no flat rootfs path.
 The build VM memory is currently a provisional 2 GiB default; promote it to a
 `spore build` option when real workloads such as large `bundle install`-style
 RUN steps need more headroom.
 
-### M3 — COPY execution
+Implementation note (2026-07-09, COPY slice): the executor step list is now a
+tagged RUN/COPY sequence, so the first uncached COPY enters the same persistent
+VM path as RUN. COPY write-side keys use the same `StepInput` fields the M1
+resolver reads: parent index, `"COPY"`, raw instruction, build-context input
+digest, environment digest, and workdir. Host payload generation reuses the
+same build-context resolver as hashing, maps Docker destinations before boot,
+and streams a bounded custom `spore-copy-v1` entry protocol rather than tar.
+The guest agent validates entry count, kind, mode, path length, content length,
+and `..` components, then creates parents as root and applies directory merge,
+file overwrite, and symlink preservation under `/mnt/rootfs`. COPY checkpoints
+use the same freeze → snapshot → complete stamp → step record → thaw ordering
+as RUN. `--disk-headroom` now grows the chunk-mapped disk and runs guest
+`resize2fs /dev/vda` once at session start when non-zero. A manual Docker-vs-
+Spore metadata oracle lives at `scripts/spore-build-copy-oracle.sh`.
 
-Tar assembly with forced 0:0 ownership, driver-side extraction with merge
-semantics inside the same session, `*` globs, and step records per COPY.
+Remaining M2 completion work: prove the full `buildkite-sporevm` wrapper path
+against the real Buildkite base end to end and record the measured acceptance
+output here.
 
 Definition of done:
 - The full `buildkite-sporevm` Dockerfile (`FROM base`, apt RUN, five COPYs,
@@ -751,8 +754,8 @@ Definition of done:
   dest, overwrite/merge, symlink, empty dir, mode preservation, exec bit).
 
 Ceiling proven: cached full build (parse + context hash + lookups + ref
-refresh) ≤2s cold-stat, target <1s; uncached COPY ≈ tar-stream + extract +
-one freeze/O(dirty) snapshot, with boot amortized per build.
+refresh) ≤2s cold-stat, target <1s; uncached COPY ≈ entry stream + guest apply
+plus one freeze/O(dirty) snapshot, with boot amortized per build.
 
 ### M4 — Wrapper switch and benchmark
 
@@ -800,7 +803,7 @@ Tests:
   record write).
 - Executor: exit-code propagation, env/workdir application, network
   on/off, headroom growth, failure cleanup.
-- COPY matrix as listed in M3, plus context-escape rejection tests.
+- COPY matrix listed above, plus context-escape rejection tests.
 - End-to-end: small fixture base (tiny OCI layout already used by import
   tests) through FROM+RUN+COPY+CMD, then `spore run` smoke; the real
   `buildkite-sporevm` path as the M4 hardware smoke.

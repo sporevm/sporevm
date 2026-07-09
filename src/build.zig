@@ -34,6 +34,7 @@ pub const Options = struct {
     build_args: []const BuildArg = &.{},
     network: NetworkMode = .spore,
     no_cache: bool = false,
+    disk_headroom: u64 = 0,
     mkfs: ?[]const u8 = null,
     debugfs: ?[]const u8 = null,
     output: ?*Io.Writer = null,
@@ -121,7 +122,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                             any_exec_step = true;
                             s.storage = cachedExecStep(init, allocator, options, s.*, instruction, "") catch |err| switch (err) {
                                 error.CacheMissRequiresBuildExecutor => {
-                                    state = try executeFromMiss(init, allocator, options, diagnostic, pre_from_args.items, doc.instructions[index..], s.*);
+                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, pre_from_args.items, doc.instructions[index..], s.*);
                                     break :instructions;
                                 },
                                 else => |e| return e,
@@ -130,9 +131,13 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                         .copy => |copy| {
                             any_exec_step = true;
                             const resolved_sources = try substituteList(allocator, copy.sources, s.args.items, s.env.items);
-                            const input_digest = try build_context.hashCopySources(allocator, init.io, ctx, resolved_sources);
+                            const resolution = try build_context.resolveCopySources(allocator, init.io, ctx, resolved_sources);
+                            const input_digest = try build_context.hashCopyResolution(allocator, init.io, ctx, resolution);
                             s.storage = cachedExecStep(init, allocator, options, s.*, instruction, input_digest) catch |err| switch (err) {
-                                error.CacheMissRequiresBuildExecutor => return error.BuildCopyExecutorPending,
+                                error.CacheMissRequiresBuildExecutor => {
+                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, pre_from_args.items, doc.instructions[index..], s.*);
+                                    break :instructions;
+                                },
                                 else => |e| return e,
                             };
                         },
@@ -277,27 +282,28 @@ fn executeFromMiss(
     allocator: std.mem.Allocator,
     options: Options,
     diagnostic: *Diagnostic,
+    ctx: build_context.BuildContext,
     pre_from_args: []const ArgValue,
     instructions: []const dockerfile.Instruction,
     initial_state: State,
 ) !State {
     var state = initial_state;
-    var steps = std.array_list.Managed(build_exec.RunStep).init(allocator);
+    var steps = std.array_list.Managed(build_exec.Step).init(allocator);
     for (instructions) |instruction| {
         if (try applyMetadataInstruction(allocator, options, pre_from_args, &state, instruction)) continue;
         switch (instruction.value) {
             .run => |run| {
                 const command = try substitute(allocator, run.shell, state.args.items, state.env.items);
                 const env_digest = try effectiveEnvDigest(allocator, state);
-                try steps.append(.{
+                try steps.append(.{ .run = .{
                     .canonical_instruction = instruction.raw,
                     .command = command,
                     .env = try runEnvironment(allocator, state),
                     .env_digest = env_digest,
                     .workdir = state.workdir,
-                });
+                } });
             },
-            .copy => return error.BuildCopyExecutorPending,
+            .copy => |copy| try steps.append(.{ .copy = try copyStep(allocator, init.io, ctx, state, instruction, copy) }),
             .from => return error.UnsupportedMultiStageDockerfile,
             else => unreachable,
         }
@@ -309,10 +315,161 @@ fn executeFromMiss(
         .base_storage = state.storage,
         .steps = steps.items,
         .network_enabled = options.network == .spore,
+        .disk_headroom = options.disk_headroom,
         .output = options.output,
         .diagnostic = &diagnostic.executor,
     });
     return state;
+}
+
+fn copyStep(
+    allocator: std.mem.Allocator,
+    io: Io,
+    ctx: build_context.BuildContext,
+    state: State,
+    instruction: dockerfile.Instruction,
+    copy: dockerfile.Copy,
+) !build_exec.CopyStep {
+    const resolved_sources = try substituteList(allocator, copy.sources, state.args.items, state.env.items);
+    const resolved_dest = try substitute(allocator, copy.dest, state.args.items, state.env.items);
+    const resolution = try build_context.resolveCopySources(allocator, io, ctx, resolved_sources);
+    const input_digest = try build_context.hashCopyResolution(allocator, io, ctx, resolution);
+    const dest_is_dir = copyDestIsDirectory(resolved_dest, resolution);
+    if (resolution.roots.len > 1 and !copyDestEndsWithSlash(resolved_dest)) return error.CopyDestinationMustBeDirectory;
+    const dest = try normalizeGuestPath(allocator, state.workdir, resolved_dest);
+    const entries = try copyEntries(allocator, io, ctx, resolution, dest, dest_is_dir);
+    return .{
+        .canonical_instruction = instruction.raw,
+        .dest = dest,
+        .input_digest = input_digest,
+        .env_digest = try effectiveEnvDigest(allocator, state),
+        .workdir = state.workdir,
+        .entries = entries,
+    };
+}
+
+fn copyDestIsDirectory(dest: []const u8, resolution: build_context.CopyResolution) bool {
+    if (copyDestEndsWithSlash(dest)) return true;
+    if (resolution.roots.len != 1) return false;
+    return resolution.roots[0].kind == .directory;
+}
+
+fn copyDestEndsWithSlash(dest: []const u8) bool {
+    return dest.len != 0 and dest[dest.len - 1] == '/';
+}
+
+fn copyEntries(
+    allocator: std.mem.Allocator,
+    io: Io,
+    ctx: build_context.BuildContext,
+    resolution: build_context.CopyResolution,
+    dest: []const u8,
+    dest_is_dir: bool,
+) ![]const build_exec.CopyEntry {
+    var out = std.array_list.Managed(build_exec.CopyEntry).init(allocator);
+    for (resolution.entries) |entry| {
+        const root = copyRootForEntry(resolution, entry.rel) orelse return error.CopySourceNotFound;
+        const guest_path = try copyGuestPath(allocator, dest, dest_is_dir, root, entry);
+        if (entry.kind == .directory and std.mem.eql(u8, guest_path, "/")) continue;
+        const path = try std.fs.path.join(allocator, &.{ ctx.root, entry.rel });
+        defer allocator.free(path);
+        const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        const mode: u32 = @intCast(@intFromEnum(stat.permissions) & 0o7777);
+        switch (entry.kind) {
+            .directory => try out.append(.{
+                .kind = .directory,
+                .path = guest_path,
+                .mode = mode,
+            }),
+            .file => {
+                const data = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(build_exec.max_copy_entry_content_len));
+                try out.append(.{
+                    .kind = .file,
+                    .path = guest_path,
+                    .mode = mode,
+                    .content = data,
+                });
+            },
+            .sym_link => {
+                var target_buf: [4096]u8 = undefined;
+                const len = try Io.Dir.cwd().readLink(io, path, &target_buf);
+                try out.append(.{
+                    .kind = .sym_link,
+                    .path = guest_path,
+                    .mode = mode,
+                    .content = try allocator.dupe(u8, target_buf[0..len]),
+                });
+            },
+            else => return error.UnsupportedCopySourceType,
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+fn copyRootForEntry(resolution: build_context.CopyResolution, rel: []const u8) ?build_context.CopyRoot {
+    var best: ?build_context.CopyRoot = null;
+    for (resolution.roots) |root| {
+        const matches = std.mem.eql(u8, rel, root.rel) or
+            (rel.len > root.rel.len and std.mem.startsWith(u8, rel, root.rel) and rel[root.rel.len] == '/');
+        if (!matches) continue;
+        if (best == null or root.rel.len > best.?.rel.len) best = root;
+    }
+    return best;
+}
+
+fn copyGuestPath(
+    allocator: std.mem.Allocator,
+    dest: []const u8,
+    dest_is_dir: bool,
+    root: build_context.CopyRoot,
+    entry: build_context.CopyEntry,
+) ![]const u8 {
+    switch (root.kind) {
+        .directory => {
+            const rel = if (std.mem.eql(u8, entry.rel, root.rel)) "" else entry.rel[root.rel.len + 1 ..];
+            return joinGuestPath(allocator, dest, rel);
+        },
+        .file, .sym_link => {
+            if (dest_is_dir) return joinGuestPath(allocator, dest, std.fs.path.basename(entry.rel));
+            return allocator.dupe(u8, dest);
+        },
+        else => return error.UnsupportedCopySourceType,
+    }
+}
+
+fn normalizeGuestPath(allocator: std.mem.Allocator, workdir: []const u8, raw: []const u8) ![]const u8 {
+    var parts = std.array_list.Managed([]const u8).init(allocator);
+    if (!std.fs.path.isAbsolute(raw)) {
+        try appendGuestPathParts(&parts, workdir);
+    }
+    try appendGuestPathParts(&parts, raw);
+    return guestPathFromParts(allocator, parts.items);
+}
+
+fn joinGuestPath(allocator: std.mem.Allocator, base: []const u8, rel: []const u8) ![]const u8 {
+    var parts = std.array_list.Managed([]const u8).init(allocator);
+    try appendGuestPathParts(&parts, base);
+    if (rel.len != 0) try appendGuestPathParts(&parts, rel);
+    return guestPathFromParts(allocator, parts.items);
+}
+
+fn appendGuestPathParts(parts: *std.array_list.Managed([]const u8), path: []const u8) !void {
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) return error.CopyDestinationUnsupported;
+        try parts.append(part);
+    }
+}
+
+fn guestPathFromParts(allocator: std.mem.Allocator, parts: []const []const u8) ![]const u8 {
+    if (parts.len == 0) return allocator.dupe(u8, "/");
+    var out = std.array_list.Managed(u8).init(allocator);
+    for (parts) |part| {
+        try out.append('/');
+        try out.appendSlice(part);
+    }
+    return out.toOwnedSlice();
 }
 
 fn execStepKey(allocator: std.mem.Allocator, options: Options, state: State, instruction: dockerfile.Instruction, input_digest: []const u8) ![]const u8 {
@@ -566,6 +723,64 @@ test "run environment includes declared args after env" {
     try std.testing.expectEqualStrings("MODE=env", entries[0]);
     try std.testing.expectEqualStrings("APP=/srv/app", entries[1]);
     try std.testing.expectEqualStrings("TARGET=prod", entries[2]);
+}
+
+test "COPY executor step key matches cached read key" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: dockerfile.Diagnostic = .{};
+    const doc = try dockerfile.parse(arena,
+        \\FROM base
+        \\WORKDIR /app
+        \\COPY src/ ./
+        \\
+    , &diag);
+    const instruction = doc.instructions[2];
+    const storage = spore.RootfsStorage{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = .{ .mmio_slot = 1 },
+        .logical_size = 4096,
+        .chunk_size = 4096,
+        .hash_algorithm = "blake3",
+        .index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .object_namespace = "rootfs/blake3",
+    };
+    const state = State{
+        .storage = storage,
+        .env = std.array_list.Managed([]const u8).init(arena),
+        .args = std.array_list.Managed(ArgValue).init(arena),
+        .workdir = "/app",
+    };
+    const options = Options{
+        .tag = "local/app:dev",
+        .context_dir = "unused",
+        .dockerfile_path = "unused",
+    };
+    const input_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const read_key = try execStepKey(arena, options, state, instruction, input_digest);
+    const env_digest = try effectiveEnvDigest(arena, state);
+    const write_input = build_exec.cacheInputForStep(options.platform, storage.index_digest, .{ .copy = .{
+        .canonical_instruction = instruction.raw,
+        .dest = "/app",
+        .input_digest = input_digest,
+        .env_digest = env_digest,
+        .workdir = state.workdir,
+        .entries = &.{},
+    } });
+    const write_key = try step_cache.stepKey(arena, write_input);
+    try std.testing.expectEqualStrings(read_key, write_key);
+}
+
+test "COPY destination rejects guest path escape" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectError(error.CopyDestinationUnsupported, normalizeGuestPath(arena, "/app", "../secret"));
+    try std.testing.expectError(error.CopyDestinationUnsupported, normalizeGuestPath(arena, "/app", "/tmp/../secret"));
+    const resolved = try normalizeGuestPath(arena, "/app", "subdir/.");
+    try std.testing.expectEqualStrings("/app/subdir", resolved);
 }
 
 test "fully cached build publishes final indexed image" {
