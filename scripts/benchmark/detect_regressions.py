@@ -13,7 +13,7 @@ import re
 import socket
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Union
 
 
 LATENCY_WARN = 0.30
@@ -70,7 +70,7 @@ THROUGHPUT_BENCHMARKS = {
     "writable_rootfs",
 }
 ABSOLUTE_MAX_KEYS = ("max", "absolute_max", "ceiling")
-MetricValue = float | str
+MetricValue = Union[float, str]
 
 
 @dataclass

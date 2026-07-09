@@ -568,7 +568,7 @@ def memory_economics(spore_dir: Path) -> dict[str, object]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     memory = manifest.get("memory", {})
     chunks = memory.get("chunks") or []
-    nonzero_chunks = sum(1 for chunk in chunks if chunk is not None)
+    zero_chunks = memory.get("zero_chunks") or []
     backing = memory.get("backing")
     backing_logical_bytes = None
     backing_allocated_bytes = None
@@ -585,9 +585,9 @@ def memory_economics(spore_dir: Path) -> dict[str, object]:
         "manifest_present": True,
         "configured_ram_bytes": manifest.get("platform", {}).get("ram_size"),
         "chunk_size": memory.get("chunk_size"),
-        "chunks_total": len(chunks),
-        "chunks_nonzero": nonzero_chunks,
-        "chunks_zero_elided": len(chunks) - nonzero_chunks,
+        "chunks_total": len(chunks) + len(zero_chunks),
+        "chunks_nonzero": len(chunks),
+        "chunks_zero_elided": len(zero_chunks),
         "chunk_store_bytes": directory_size(spore_dir / "chunks"),
         "backing_logical_bytes": backing_logical_bytes,
         "backing_allocated_bytes": backing_allocated_bytes,
@@ -1658,6 +1658,21 @@ def self_test() -> None:
         rootfs_profile = parse_rootfs_profile_metrics(stderr)
         assert rootfs_profile["rootfs_profile_rootfs_cas_inline_ms"] == 42
         assert rootfs_profile["rootfs_profile_rootfs_cas_inline_objects_written"] == 2
+        memory_spore = Path(tmp) / "memory-spore"
+        memory_spore.mkdir()
+        (memory_spore / "manifest.json").write_text(json.dumps({
+            "platform": {"ram_size": 8},
+            "memory": {
+                "logical_size": 8,
+                "chunk_size": 2,
+                "chunks": [{"logical_chunk": 1, "digest": "blake3:test"}],
+                "zero_chunks": [0, 2, 3],
+            },
+        }), encoding="utf-8")
+        memory_metrics = memory_economics(memory_spore)
+        assert memory_metrics["chunks_total"] == 4
+        assert memory_metrics["chunks_nonzero"] == 1
+        assert memory_metrics["chunks_zero_elided"] == 3
         stdout = Path(tmp) / "import.stdout"
         stdout.write_text(
             "rootfs: /tmp/rootfs.ext4\nmetadata: /tmp/rootfs.json\nref: local/test:fixture\nresolved: local/test:fixture@sha256:abc\nrootfs_identity: blake3:"
