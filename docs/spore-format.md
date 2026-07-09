@@ -38,6 +38,19 @@ Rootfs bytes are not stored inside the spore directory today; `spore attach`
 opens and verifies the manifest-selected exact artifact or chunked storage
 before boot.
 
+`spore build` uses local build step records under the rootfs cache at
+`build/steps/<step_key>.json`. These records are host-local cache metadata, not
+portable spore format. A `sporevm-build-step-v1` record binds
+`builder_version`, `platform`, `step_key`, `parent_index_digest`,
+`child_index_digest`, `instruction_kind`, canonical Dockerfile instruction text,
+`input_digest`, `env_digest`, `workdir`, and the child's `rootfs_storage`
+descriptor. A cache hit is valid only when the recomputed key matches the
+record, the descriptor passes the normal chunked-rootfs storage validation,
+`base_identity` and `index_digest` both equal `child_index_digest`, and the
+selected rootfs CAS completeness stamp is present. Full build image identity is
+the final step's `index_digest`, published through the same local image-ref
+metadata path used by `spore rootfs import-tar`.
+
 A local single-spore bundle is the first distribution form:
 
 ```text

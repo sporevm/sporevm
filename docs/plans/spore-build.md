@@ -637,6 +637,13 @@ stamp, updates the local ref, and exits. On the first cache miss for `RUN` or
 `COPY`, M1 fails closed with "cache miss requires build executor" rather than
 falling back to BuildKit or doing partial work.
 
+Implementation note (2026-07-09): the first M1 implementation slice adds the
+`spore build` CLI, Dockerfile subset parser, `.dockerignore`/COPY context
+hashing, local step-cache read/write helpers, fully cached build resolution, and
+indexed local image publication/run resolution. M2 starts at executor-owned
+cache misses; it should write the same `sporevm-build-step-v1` records after
+each O(dirty) snapshot.
+
 Definition of done:
 - Dockerfile parser unit tests cover the supported subset and exact
   fail-closed errors for unsupported features.

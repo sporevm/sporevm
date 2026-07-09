@@ -12,6 +12,8 @@ pub const board = @import("board.zig");
 pub const block_source = @import("block_source.zig");
 pub const boot = @import("boot.zig");
 pub const boot_harness = @import("boot_harness.zig");
+pub const build = @import("build.zig");
+pub const build_cli = @import("build_cli.zig");
 pub const bundle = @import("bundle.zig");
 pub const capture = @import("capture.zig");
 pub const chunk = @import("chunk.zig");
@@ -77,6 +79,8 @@ test {
     testing.refAllDecls(@This());
     testing.refAllDecls(api);
     testing.refAllDecls(block_source);
+    testing.refAllDecls(build);
+    testing.refAllDecls(build_cli);
     testing.refAllDecls(bundle);
     testing.refAllDecls(capture);
     testing.refAllDecls(chunk_mapped_disk);
