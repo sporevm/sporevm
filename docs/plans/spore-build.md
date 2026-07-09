@@ -390,6 +390,7 @@ cas/rootfs/blake3/complete/<index_digest>.complete  (existing) completeness stam
 build/steps/<step_key>.json                         build step record
 build/context-stat-cache-v1.json                    context content-digest memo
 build/context-disks/<context_disk_digest>.ext4      cached read-only COPY disk
+build/context-disks/<context_disk_digest>.ext4.complete  context disk completeness stamp
 refs/local/<sha256>.json                            (existing) final ref
 <image_cache_key>.json                              (existing) image metadata
 ```
@@ -432,10 +433,11 @@ Context hashing also maintains
 `build/context-stat-cache-v1.json` under the same local cache root. The JSON
 file has `kind: "sporevm-build-context-stat-cache-v1"`, `max_records`,
 `eviction: "least-recently-seen stat tuple"`, and `records` containing
-`path`, `size`, `mtime_ns`, `inode`, `digest`, and `last_seen_unix_ns`. The
-lookup key is `(absolute path, size, mtime nanoseconds, inode)`. A hit reuses
-only the per-file BLAKE3 content digest; the overall COPY/context input digest
-is still rebuilt from the same sorted entry fields a cold hash would use.
+`path`, `size`, `mtime_ns`, `ctime_ns`, `inode`, `digest`, and
+`last_seen_unix_ns`. The lookup key is `(absolute path, size, mtime
+nanoseconds, ctime nanoseconds, inode)`. A hit reuses only the per-file BLAKE3
+content digest; the overall COPY/context input digest is still rebuilt from the
+same sorted entry fields a cold hash would use.
 Missing, corrupt, oversized, or stale stat-cache entries fall back to reading
 and hashing file content, and the build proceeds. The file is capped at
 131,072 records and 32 MiB; save eviction keeps the most recently seen stat
@@ -578,8 +580,10 @@ session as `RUN`, rather than host-side ext4 surgery:
    entries. The disk digest is derived from the sorted entry paths, kinds,
    modes, sizes, file content digests, and symlink targets; it is transport
    identity only and does not enter step-cache semantics. Unchanged contexts
-   reuse the disk image, while changed contexts still mostly dedupe through
-   the rootfs CAS chunks emitted by the native ext4 writer.
+   reuse the disk image only when its completion sidecar is present and valid;
+   the sidecar is published after full disk emission. Changed contexts still
+   mostly dedupe through the rootfs CAS chunks emitted by the native ext4
+   writer.
 4. Send fixed-shape `spore-build-copy-v2` control requests. Each request names
    the context-disk source subtree, destination, source kind, `dest_is_dir`,
    and entry count. The guest enforces path and entry-count bounds, then

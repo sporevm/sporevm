@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const rootfs_cas = @import("../rootfs_cas.zig");
@@ -663,6 +664,74 @@ fn fuzzCopyRequest(_: void, s: *std.testing.Smith) !void {
     }) catch return;
     defer std.testing.allocator.free(request);
     try std.testing.expect(request.len <= max_guest_request_len);
+    if (comptime guest_agent_fuzz_supported) {
+        _ = spore_agent_fuzz_build_request(request.ptr, request.len, path_buf[0..0].ptr, 0);
+    }
+}
+
+const guest_agent_fuzz_supported = builtin.os.tag == .linux and builtin.cpu.arch == .aarch64;
+const guest_agent_fuzz_invalid: c_int = 0;
+const guest_agent_fuzz_run_request: c_int = 1;
+const guest_agent_fuzz_copy_request: c_int = 2;
+const guest_agent_fuzz_run_complete: c_int = 3;
+
+extern fn spore_agent_fuzz_build_request(request: [*]const u8, request_len: usize, stream: [*]const u8, stream_len: usize) c_int;
+
+fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
+    if (comptime guest_agent_fuzz_supported) {
+        var fuzz_bytes: [128]u8 = undefined;
+        const fuzz_len = s.slice(&fuzz_bytes);
+        const mode = if (fuzz_len == 0) 0 else fuzz_bytes[0] % 6;
+        const command = if (fuzz_len <= 1) "x" else fuzz_bytes[1..fuzz_len];
+        var stream: [256]u8 = undefined;
+        var stream_len: usize = 0;
+
+        if (mode == 4) {
+            const request = copyRequest(std.testing.allocator, "spore-build-fuzz", .{
+                .source = "input",
+                .dest = "/output",
+                .source_kind = .file,
+                .dest_is_dir = false,
+                .entry_count = 1,
+            }) catch return;
+            defer std.testing.allocator.free(request);
+            _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
+            return;
+        }
+
+        if (mode == 2) {
+            const request = "{\"type\":\"spore-build-run-v1\",\"command_len\":65537}\n";
+            _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
+            return;
+        }
+
+        if (mode == 5) {
+            const request = if (fuzz_len <= 1) fuzz_bytes[0..0] else fuzz_bytes[1..fuzz_len];
+            _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
+            return;
+        }
+
+        const request = runRequest(std.testing.allocator, "spore-build-fuzz", command, &.{}, "/", std.testing.io) catch return;
+        defer std.testing.allocator.free(request);
+        appendTestSpioFrame(&stream, &stream_len, 1, if (mode == 1) 1 else 0, command);
+        if (mode != 3) appendTestSpioFrame(&stream, &stream_len, 2, command.len, "");
+        _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..stream_len].ptr, stream_len);
+    }
+}
+
+fn appendTestSpioFrame(out: []u8, cursor: *usize, frame_type: u8, offset: u64, payload: []const u8) void {
+    var header: [24]u8 = @splat(0);
+    @memcpy(header[0..4], "SPIO");
+    header[4] = 1;
+    header[5] = frame_type;
+    std.mem.writeInt(u32, header[8..12], 1, .little);
+    std.mem.writeInt(u64, header[12..20], offset, .little);
+    std.mem.writeInt(u32, header[20..24], @intCast(payload.len), .little);
+    std.debug.assert(cursor.* + header.len + payload.len <= out.len);
+    @memcpy(out[cursor.*..][0..header.len], &header);
+    cursor.* += header.len;
+    @memcpy(out[cursor.*..][0..payload.len], payload);
+    cursor.* += payload.len;
 }
 
 test "build fsfreeze request stays bounded" {
@@ -755,7 +824,42 @@ test "build run request accepts multi-kib command and rejects configured bound" 
     try std.testing.expectError(error.RunWorkingDirUnsupported, runRequest(std.testing.allocator, "spore-build-1", "true", &.{}, workdir, std.testing.io));
 }
 
+test "guest build request parser rejects malformed RUN framing and accepts COPY v2" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+
+    const run_request = try runRequest(std.testing.allocator, "spore-build-1", "abc", &.{}, "/", std.testing.io);
+    defer std.testing.allocator.free(run_request);
+    var stream: [128]u8 = undefined;
+    var stream_len: usize = 0;
+    appendTestSpioFrame(&stream, &stream_len, 1, 0, "abc");
+    appendTestSpioFrame(&stream, &stream_len, 2, 3, "");
+    try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(run_request.ptr, run_request.len, stream[0..stream_len].ptr, stream_len));
+
+    stream_len = 0;
+    appendTestSpioFrame(&stream, &stream_len, 1, 1, "abc");
+    appendTestSpioFrame(&stream, &stream_len, 2, 3, "");
+    try std.testing.expectEqual(guest_agent_fuzz_run_request, spore_agent_fuzz_build_request(run_request.ptr, run_request.len, stream[0..stream_len].ptr, stream_len));
+
+    stream_len = 0;
+    appendTestSpioFrame(&stream, &stream_len, 1, 0, "abc");
+    try std.testing.expectEqual(guest_agent_fuzz_run_request, spore_agent_fuzz_build_request(run_request.ptr, run_request.len, stream[0..stream_len].ptr, stream_len));
+
+    const over_limit = "{\"type\":\"spore-build-run-v1\",\"command_len\":65537}\n";
+    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(over_limit.ptr, over_limit.len, stream[0..0].ptr, 0));
+
+    const copy_request = try copyRequest(std.testing.allocator, "spore-build-1", .{
+        .source = "input",
+        .dest = "/output",
+        .source_kind = .file,
+        .dest_is_dir = false,
+        .entry_count = 1,
+    });
+    defer std.testing.allocator.free(copy_request);
+    try std.testing.expectEqual(guest_agent_fuzz_copy_request, spore_agent_fuzz_build_request(copy_request.ptr, copy_request.len, stream[0..0].ptr, 0));
+}
+
 test "fuzz build control request framing" {
     try std.testing.fuzz({}, fuzzSimpleRequest, .{});
     try std.testing.fuzz({}, fuzzCopyRequest, .{});
+    try std.testing.fuzz({}, fuzzGuestBuildRequest, .{});
 }

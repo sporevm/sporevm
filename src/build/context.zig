@@ -111,6 +111,7 @@ const StatCacheRecord = struct {
     path: []const u8,
     size: u64,
     mtime_ns: i128,
+    ctime_ns: i128,
     inode: u64,
     digest: []const u8,
     last_seen_unix_ns: i128 = 0,
@@ -211,7 +212,7 @@ pub const StatCache = struct {
     }
 
     fn putLoaded(self: *StatCache, record: StatCacheRecord) !void {
-        const key = try statCacheKey(self.allocator, record.path, record.size, record.mtime_ns, record.inode);
+        const key = try statCacheKey(self.allocator, record.path, record.size, record.mtime_ns, record.ctime_ns, record.inode);
         errdefer self.allocator.free(key);
         if (self.index.contains(key)) {
             self.allocator.free(key);
@@ -222,6 +223,7 @@ pub const StatCache = struct {
             .path = try self.allocator.dupe(u8, record.path),
             .size = record.size,
             .mtime_ns = record.mtime_ns,
+            .ctime_ns = record.ctime_ns,
             .inode = record.inode,
             .digest = try self.allocator.dupe(u8, record.digest),
             .last_seen_unix_ns = record.last_seen_unix_ns,
@@ -230,7 +232,7 @@ pub const StatCache = struct {
 
     fn get(self: *StatCache, path: []const u8, stat: Io.File.Stat) ?[]const u8 {
         if (!self.enabled) return null;
-        const key = statCacheKey(self.allocator, path, stat.size, stat.mtime.nanoseconds, stat.inode) catch return null;
+        const key = statCacheKey(self.allocator, path, stat.size, stat.mtime.nanoseconds, stat.ctime.nanoseconds, stat.inode) catch return null;
         defer self.allocator.free(key);
         const i = self.index.get(key) orelse return null;
         const record = &self.records.items[i];
@@ -241,7 +243,7 @@ pub const StatCache = struct {
 
     fn put(self: *StatCache, path: []const u8, stat: Io.File.Stat, digest: []const u8) void {
         if (!self.enabled or !validContentDigest(digest)) return;
-        const key = statCacheKey(self.allocator, path, stat.size, stat.mtime.nanoseconds, stat.inode) catch return;
+        const key = statCacheKey(self.allocator, path, stat.size, stat.mtime.nanoseconds, stat.ctime.nanoseconds, stat.inode) catch return;
         if (self.index.get(key)) |i| {
             self.records.items[i].last_seen_unix_ns = self.now_ns;
             self.allocator.free(key);
@@ -266,6 +268,7 @@ pub const StatCache = struct {
             .path = owned_path,
             .size = stat.size,
             .mtime_ns = stat.mtime.nanoseconds,
+            .ctime_ns = stat.ctime.nanoseconds,
             .inode = stat.inode,
             .digest = owned_digest,
             .last_seen_unix_ns = self.now_ns,
@@ -696,8 +699,8 @@ fn statCachePath(allocator: std.mem.Allocator, cache_root: []const u8) ![]const 
     return std.fs.path.join(allocator, &.{ cache_root, "build", "context-stat-cache-v1.json" });
 }
 
-fn statCacheKey(allocator: std.mem.Allocator, path: []const u8, size: u64, mtime_ns: anytype, inode: u64) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}\n{d}\n{d}\n{d}", .{ path, size, mtime_ns, inode });
+fn statCacheKey(allocator: std.mem.Allocator, path: []const u8, size: u64, mtime_ns: anytype, ctime_ns: anytype, inode: u64) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}\n{d}\n{d}\n{d}\n{d}", .{ path, size, mtime_ns, ctime_ns, inode });
 }
 
 fn validContentDigest(digest: []const u8) bool {
@@ -889,6 +892,55 @@ test "context stat cache preserves cold hash identity and warms hits" {
     try std.testing.expectEqualStrings(cold, warm);
     try std.testing.expect(warm_diag.stat_cache_hits >= 2);
     try std.testing.expectEqual(@as(u64, 0), warm_diag.bytes_hashed);
+}
+
+test "context stat cache invalidates same-size rewrites with restored mtime" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-stat-cache-ctime";
+    const cache_root = root ++ "/cache";
+    const context_root = root ++ "/context";
+    const source_path = context_root ++ "/input.txt";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, context_root);
+    try Io.Dir.cwd().createDirPath(io, cache_root);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "alpha" });
+
+    var ignore_diag: IgnoreDiagnostic = .{};
+    const ctx = try load(arena, io, context_root, &ignore_diag);
+    const resolution = try resolveCopySources(arena, io, ctx, &.{"input.txt"});
+
+    var cold_diag: HashDiagnostic = .{};
+    var cold_cache = StatCache.load(arena, io, cache_root, &cold_diag);
+    const cold = try hashCopyResolutionWithOptions(arena, io, ctx, resolution, .{
+        .stat_cache = &cold_cache,
+        .diagnostic = &cold_diag,
+    });
+    cold_cache.save(&cold_diag);
+    const original_stat = try Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "bravo" });
+    try Io.Dir.cwd().setTimestamps(io, source_path, .{
+        .modify_timestamp = .{ .new = original_stat.mtime },
+    });
+    const rewritten_stat = try Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(original_stat.size, rewritten_stat.size);
+    try std.testing.expectEqual(original_stat.mtime.nanoseconds, rewritten_stat.mtime.nanoseconds);
+    try std.testing.expect(original_stat.ctime.nanoseconds != rewritten_stat.ctime.nanoseconds);
+
+    var rewritten_diag: HashDiagnostic = .{};
+    var rewritten_cache = StatCache.load(arena, io, cache_root, &rewritten_diag);
+    const rewritten = try hashCopyResolutionWithOptions(arena, io, ctx, resolution, .{
+        .stat_cache = &rewritten_cache,
+        .diagnostic = &rewritten_diag,
+    });
+    try std.testing.expect(!std.mem.eql(u8, cold, rewritten));
+    try std.testing.expectEqual(@as(u64, 0), rewritten_diag.stat_cache_hits);
+    try std.testing.expectEqual(@as(u64, 1), rewritten_diag.stat_cache_misses);
+    try std.testing.expectEqual(@as(u64, "bravo".len), rewritten_diag.bytes_hashed);
 }
 
 fn oldUnframedHashCopySourcesForTest(

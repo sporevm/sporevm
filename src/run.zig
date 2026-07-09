@@ -2884,7 +2884,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
         .spore_dir = opts.resume_dir,
     });
     defer runtime_disk.deinit();
-    const context_disk_fd = if (opts.context_disk_path) |path| try openReadOnlyDiskFd(allocator, path) else null;
+    const context_disk_fd = if (opts.context_disk_path) |path| try openReadOnlyDiskFd(context.io, allocator, path) else null;
     defer if (context_disk_fd) |fd| {
         _ = std.c.close(fd);
     };
@@ -2949,15 +2949,15 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
     };
 }
 
-fn openReadOnlyDiskFd(allocator: std.mem.Allocator, path: []const u8) !std.c.fd_t {
+fn openReadOnlyDiskFd(io: Io, allocator: std.mem.Allocator, path: []const u8) !std.c.fd_t {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.ContextDiskOpenFailed;
     errdefer _ = std.c.close(fd);
-    var stat: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &stat) != 0) return error.ContextDiskOpenFailed;
-    if (!std.c.S.ISREG(stat.mode) or stat.size < 0) return error.ContextDiskOpenFailed;
+    const file = Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = file.stat(io) catch return error.ContextDiskOpenFailed;
+    if (stat.kind != .file) return error.ContextDiskOpenFailed;
     return fd;
 }
 

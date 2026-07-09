@@ -175,7 +175,23 @@ pub fn build(b: *std.Build) void {
     const run_libspore_smoke_tests = b.addRunArtifact(libspore_smoke_tests);
     const c_api_tests = b.addTest(.{ .root_module = c_api_mod });
     const run_c_api_tests = b.addRunArtifact(c_api_tests);
-    const internal_tests = b.addTest(.{ .root_module = internal_mod });
+    const internal_test_mod = if (target_is_kvm) blk: {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .link_libc = true,
+        });
+        mod.addAnonymousImport("run_assets", .{
+            .root_source_file = minimal_exec_initrd_module,
+        });
+        mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
+        mod.addCSourceFile(.{
+            .file = b.path("guest/minimal-initrd/agent.c"),
+            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-DSPORE_AGENT_REQUEST_FUZZ" },
+        });
+        break :blk mod;
+    } else internal_mod;
+    const internal_tests = b.addTest(.{ .root_module = internal_test_mod });
     const run_internal_tests = b.addRunArtifact(internal_tests);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);

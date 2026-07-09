@@ -10,6 +10,7 @@ const rootfs_cas = @import("../rootfs_cas.zig");
 const tar = @import("../rootfs/tar.zig");
 
 const context_disk_dir = "build/context-disks";
+const complete_stamp_contents = "spore-build-context-disk-complete-v1\n";
 
 pub const Diagnostic = struct {
     entries: u64 = 0,
@@ -67,6 +68,7 @@ pub const Builder = struct {
         const dir = try std.fs.path.join(self.allocator, &.{ cache_root, context_disk_dir });
         try chunk_sealer.ensureDirPath(self.allocator, dir);
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.ext4", .{ dir, disk_digest });
+        const stamp_path = try completeStampPath(self.allocator, path);
 
         diagnostic.entries = self.entries.items.len;
         diagnostic.bytes = content_bytes;
@@ -74,11 +76,12 @@ pub const Builder = struct {
         diagnostic.digest = disk_digest;
         diagnostic.path = path;
 
-        if (try reusableDisk(io, path, image_size)) {
+        if (try reusableDisk(self.allocator, io, path, stamp_path, image_size)) {
             diagnostic.reused = true;
             return path;
         }
 
+        Io.Dir.cwd().deleteFile(io, stamp_path) catch {};
         const start = monotonicNs() catch 0;
         const temp = try std.fmt.allocPrint(self.allocator, "{s}.{d}.tmp", .{ path, std.c.getpid() });
         Io.Dir.cwd().deleteFile(io, temp) catch {};
@@ -94,6 +97,7 @@ pub const Builder = struct {
         });
         try chmodReadOnly(self.allocator, temp);
         try renameReplace(self.allocator, temp, path);
+        try chunk_sealer.writeFileAtomicDurable(self.allocator, stamp_path, complete_stamp_contents, 0o444);
         diagnostic.emit_ns = elapsedNs(start);
         diagnostic.emitted = true;
         return path;
@@ -164,12 +168,27 @@ pub const Builder = struct {
     }
 };
 
-fn reusableDisk(io: Io, path: []const u8, expected_size: u64) !bool {
+fn reusableDisk(allocator: std.mem.Allocator, io: Io, path: []const u8, stamp_path: []const u8, expected_size: u64) !bool {
     const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => |e| return e,
     };
-    return stat.kind == .file and stat.size == expected_size;
+    if (stat.kind != .file or stat.size != expected_size) return false;
+    const stamp_stat = Io.Dir.cwd().statFile(io, stamp_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => |e| return e,
+    };
+    if (stamp_stat.kind != .file or stamp_stat.size != complete_stamp_contents.len) return false;
+    const stamp = Io.Dir.cwd().readFileAlloc(io, stamp_path, allocator, .limited(complete_stamp_contents.len + 1)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return false,
+        else => |e| return e,
+    };
+    defer allocator.free(stamp);
+    return std.mem.eql(u8, stamp, complete_stamp_contents);
+}
+
+fn completeStampPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}.complete", .{path});
 }
 
 fn chmodReadOnly(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -208,4 +227,48 @@ fn elapsedNs(start_ns: u64) u64 {
     const end_ns = monotonicNs() catch return 0;
     if (end_ns <= start_ns) return 0;
     return end_ns - start_ns;
+}
+
+test "context disk requires a complete stamp before reuse" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-disk-complete-stamp";
+    const cache_root = root ++ "/cache";
+    const source_path = root ++ "/source.txt";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, cache_root);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "context disk source" });
+    const source_stat = try Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+
+    var builder = Builder.init(arena);
+    try builder.addResolvedEntries(&.{.{
+        .rel = "source.txt",
+        .source_path = source_path,
+        .kind = .file,
+        .mode = 0o644,
+        .size = source_stat.size,
+        .content_digest = "blake3:context-disk-complete-stamp-test",
+    }});
+    const image_size = ext4.computeImageSize(source_stat.size);
+    const disk_digest = try builder.diskDigest(arena);
+    const disk_dir = try std.fs.path.join(arena, &.{ cache_root, context_disk_dir });
+    try chunk_sealer.ensureDirPath(arena, disk_dir);
+    const disk_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ disk_dir, disk_digest });
+
+    var corrupt = try Io.Dir.cwd().createFile(io, disk_path, .{});
+    try corrupt.setLength(io, image_size);
+    corrupt.close(io);
+
+    var emitted: Diagnostic = .{};
+    _ = try builder.emitOrReuse(io, cache_root, &emitted);
+    try std.testing.expect(emitted.emitted);
+    try std.testing.expect(!emitted.reused);
+
+    var reused: Diagnostic = .{};
+    _ = try builder.emitOrReuse(io, cache_root, &reused);
+    try std.testing.expect(reused.reused);
+    try std.testing.expect(!reused.emitted);
 }

@@ -6,6 +6,7 @@
 #include <net/if.h>
 #include <net/route.h>
 #include <netinet/in.h>
+#include <linux/openat2.h>
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
@@ -111,12 +112,6 @@ struct sockaddr_vm {
   unsigned int svm_port;
   unsigned int svm_cid;
   unsigned char svm_zero[sizeof(struct sockaddr) - sizeof(sa_family_t) - sizeof(unsigned short) - sizeof(unsigned int) - sizeof(unsigned int)];
-};
-
-struct open_how {
-  uint64_t flags;
-  uint64_t mode;
-  uint64_t resolve;
 };
 
 static int64_t t_init_start = 0;
@@ -274,7 +269,7 @@ static void read_cmdline(char *buf, size_t cap) {
 static uint32_t resolve_port_from_cmdline(const char *buf) {
   if (buf[0] == '\0') return 10700;
   const char *key = "cleanroom_guest_port=";
-  char *p = strstr(buf, key);
+  const char *p = strstr(buf, key);
   if (p == NULL) return 10700;
   p += strlen(key);
   unsigned long value = strtoul(p, NULL, 10);
@@ -3923,6 +3918,47 @@ static void accept_request(int listener, struct session *session, struct client 
   (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
 }
 
+#ifdef SPORE_AGENT_REQUEST_FUZZ
+enum spore_agent_fuzz_result {
+  SPORE_AGENT_FUZZ_INVALID = 0,
+  SPORE_AGENT_FUZZ_RUN_REQUEST = 1,
+  SPORE_AGENT_FUZZ_COPY_REQUEST = 2,
+  SPORE_AGENT_FUZZ_RUN_COMPLETE = 3,
+};
+
+__attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
+    const unsigned char *request_bytes, size_t request_len,
+    const unsigned char *stream_bytes, size_t stream_len) {
+  if (request_len >= MAX_REQUEST || stream_len > MAX_FRAME_PAYLOAD) return SPORE_AGENT_FUZZ_INVALID;
+  char request[MAX_REQUEST];
+  memcpy(request, request_bytes, request_len);
+  request[request_len] = '\0';
+
+  struct run_request parsed;
+  if (parse_request(request, &parsed) != 0) return SPORE_AGENT_FUZZ_INVALID;
+  if (parsed.kind == REQUEST_BUILD_COPY) return SPORE_AGENT_FUZZ_COPY_REQUEST;
+  if (parsed.kind != REQUEST_BUILD_RUN) return SPORE_AGENT_FUZZ_INVALID;
+
+  int pipe_fds[2];
+  if (pipe2(pipe_fds, O_CLOEXEC) != 0) return SPORE_AGENT_FUZZ_RUN_REQUEST;
+  if (stream_len > 0 && write_all(pipe_fds[1], stream_bytes, stream_len) != 0) {
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    return SPORE_AGENT_FUZZ_RUN_REQUEST;
+  }
+  close(pipe_fds[1]);
+
+  struct client client;
+  memset(&client, 0, sizeof(client));
+  client.fd = pipe_fds[0];
+  client.protocol_v1 = 1;
+  char command[MAX_BUILD_RUN_COMMAND_LEN + 1];
+  char error[256];
+  int rc = read_build_command_from_spio(&client, parsed.build_command_len, command, sizeof(command), error, sizeof(error));
+  close(pipe_fds[0]);
+  return rc == 0 ? SPORE_AGENT_FUZZ_RUN_COMPLETE : SPORE_AGENT_FUZZ_RUN_REQUEST;
+}
+#else
 int main(void) {
   t_init_start = now_ms();
   mount_proc();
@@ -4101,3 +4137,4 @@ int main(void) {
     maybe_send_session_exit(&session, &client);
   }
 }
+#endif
