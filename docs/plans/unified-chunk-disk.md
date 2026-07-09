@@ -519,6 +519,15 @@ run-image readiness PR lands: profile inside `assignBlocks` for O(n^2) behavior
 or allocation churn over the roughly 2M-block buildkite image before doing any
 more sealer work.
 
+Follow-up result: the assignBlocks hotspot was the directory emission path
+scanning every planned path for every directory on high-directory-count images.
+The ext4 writer now builds a conditional direct-child index for large
+directory/path topologies, keeps source data block mappings as contiguous runs,
+and allocates payload block slices in batches. On the buildkite-sporevm rootfs,
+`assign_ms` fell from roughly 73-80s to 304ms (`emit_map_ms=76`,
+`native_ext4_emit_ms=88957`) with the remaining cold import time dominated by
+inline CAS sealing/object writes rather than block assignment.
+
 Done when: import → run → save → restore works end to end on index identity
 with no linear full-image hash anywhere; uncached import of a large
 reference image pays no separate hash pass beyond the inline emission

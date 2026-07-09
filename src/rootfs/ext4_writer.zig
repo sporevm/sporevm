@@ -142,6 +142,7 @@ const InodeKind = enum {
 
 const InodePlan = struct {
     ino: u32,
+    path: []const u8 = &.{},
     kind: InodeKind,
     mode: u16,
     uid: u32,
@@ -182,10 +183,72 @@ const DirChild = struct {
     inode_index: usize,
 };
 
+const directory_child_index_threshold: usize = 8_000_000;
+
+const DirectoryChildIndex = struct {
+    const none: usize = std.math.maxInt(usize);
+
+    heads: []usize,
+    next: []usize,
+    children: []DirChild,
+    child_count: usize,
+
+    fn build(allocator: std.mem.Allocator, planned: *const PlannedImage) !DirectoryChildIndex {
+        const heads = try allocator.alloc(usize, planned.inodes.items.len);
+        errdefer allocator.free(heads);
+        @memset(heads, none);
+
+        const next = try allocator.alloc(usize, planned.paths.items.len);
+        errdefer allocator.free(next);
+        @memset(next, none);
+
+        const children = try allocator.alloc(DirChild, planned.paths.items.len);
+        errdefer allocator.free(children);
+
+        const tails = try allocator.alloc(usize, planned.inodes.items.len);
+        defer allocator.free(tails);
+        @memset(tails, none);
+
+        var child_count: usize = 0;
+        for (planned.paths.items) |path_ref| {
+            if (path_ref.path.len == 0) continue;
+            const parent = parentPath(path_ref.path);
+            const parent_inode_index = planned.path_index.get(parent) orelse return error.BadExt4Tree;
+            if (planned.inodes.items[parent_inode_index].kind != .directory) return error.ParentNotDirectory;
+            const child_index = child_count;
+            child_count += 1;
+            children[child_index] = .{
+                .name = baseName(path_ref.path),
+                .inode_index = path_ref.inode_index,
+            };
+            if (tails[parent_inode_index] == none) {
+                heads[parent_inode_index] = child_index;
+            } else {
+                next[tails[parent_inode_index]] = child_index;
+            }
+            tails[parent_inode_index] = child_index;
+        }
+
+        return .{
+            .heads = heads,
+            .next = next,
+            .children = children,
+            .child_count = child_count,
+        };
+    }
+
+    fn deinit(self: *DirectoryChildIndex, allocator: std.mem.Allocator) void {
+        allocator.free(self.heads);
+        allocator.free(self.next);
+        allocator.free(self.children);
+    }
+};
+
 const PlannedImage = struct {
     inodes: std.ArrayList(InodePlan) = .empty,
     paths: std.ArrayList(PathRef) = .empty,
     path_index: std.StringHashMap(usize),
+    directory_count: usize = 0,
 
     fn deinit(self: *PlannedImage, allocator: std.mem.Allocator) void {
         for (self.inodes.items) |inode| {
@@ -205,7 +268,15 @@ const PlannedImage = struct {
 };
 
 const BlockStore = std.AutoHashMap(u32, []u8);
-const DataBlockStore = std.AutoHashMap(u32, DataBlockSource);
+const DataBlockStore = std.ArrayList(DataBlockRun);
+
+const DataBlockRun = struct {
+    first_block: u32,
+    block_count: u32,
+    source: tar.FileSource,
+    source_offset: u64,
+    byte_len: u64,
+};
 
 const DataBlockSource = struct {
     source: tar.FileSource,
@@ -661,8 +732,8 @@ pub fn emit(
 
     var blocks = BlockStore.init(allocator);
     defer freeBlockStore(allocator, &blocks);
-    var data_blocks = DataBlockStore.init(allocator);
-    defer data_blocks.deinit();
+    var data_blocks = DataBlockStore.empty;
+    defer data_blocks.deinit(allocator);
 
     const assign_start = monotonicMs();
     const layout = try assignBlocks(allocator, &planned, total_blocks, options.inode_count, &blocks, &data_blocks);
@@ -759,11 +830,13 @@ fn planImage(allocator: std.mem.Allocator, entries: []const Entry, inode_count: 
 
     try planned.inodes.append(allocator, .{
         .ino = root_inode,
+        .path = "",
         .kind = .directory,
         .mode = s_ifdir | 0o755,
         .uid = 0,
         .gid = 0,
     });
+    planned.directory_count += 1;
     try planned.appendPath(allocator, "", 0);
 
     _ = try ensureDirectoryPath(allocator, &planned, "lost+found", 0o700, 0, 0, lost_found_inode);
@@ -815,7 +888,16 @@ fn planImage(allocator: std.mem.Allocator, entries: []const Entry, inode_count: 
     }
 
     try computeLinkCounts(&planned);
+    try validateDirectoryPathCache(&planned);
     return planned;
+}
+
+fn validateDirectoryPathCache(planned: *const PlannedImage) !void {
+    for (planned.inodes.items, 0..) |inode, inode_index| {
+        if (inode.kind != .directory) continue;
+        const path_inode_index = planned.path_index.get(inode.path) orelse return error.BadExt4Tree;
+        if (path_inode_index != inode_index) return error.BadExt4Tree;
+    }
 }
 
 const PathLookup = struct {
@@ -841,11 +923,13 @@ fn ensureDirectoryPath(
     }
     try planned.inodes.append(allocator, .{
         .ino = inode_no,
+        .path = path,
         .kind = .directory,
         .mode = s_ifdir | (mode & 0o7777),
         .uid = uid,
         .gid = gid,
     });
+    planned.directory_count += 1;
     try planned.appendPath(allocator, path, planned.inodes.items.len - 1);
     return true;
 }
@@ -860,10 +944,14 @@ fn ensureParents(
     var slash_index: usize = 0;
     while (std.mem.indexOfScalarPos(u8, path, slash_index, '/')) |slash| {
         const parent = path[0..slash];
-        if (parent.len != 0 and pathIndex(planned, parent) == null) {
-            if (next_inode.* > inode_count) return error.RootFSTooManyInodes;
-            if (try ensureDirectoryPath(allocator, planned, parent, 0o755, 0, 0, next_inode.*)) {
-                next_inode.* += 1;
+        if (parent.len != 0) {
+            if (pathIndex(planned, parent)) |existing| {
+                if (planned.inodes.items[existing.inode_index].kind != .directory) return error.ParentNotDirectory;
+            } else {
+                if (next_inode.* > inode_count) return error.RootFSTooManyInodes;
+                if (try ensureDirectoryPath(allocator, planned, parent, 0o755, 0, 0, next_inode.*)) {
+                    next_inode.* += 1;
+                }
             }
         }
         slash_index = slash + 1;
@@ -871,7 +959,6 @@ fn ensureParents(
 }
 
 fn entryInodePlan(entry: Entry, normalized: []const u8, inode_no: u32) !InodePlan {
-    _ = normalized;
     for (entry.xattrs) |attr| {
         if (!std.mem.eql(u8, attr.name, xattrs_mod.security_capability_name)) return error.UnsupportedTarXattr;
         try xattrs_mod.validateSecurityCapability(attr.value);
@@ -879,6 +966,7 @@ fn entryInodePlan(entry: Entry, normalized: []const u8, inode_no: u32) !InodePla
     return switch (entry.kind) {
         .file => |data| .{
             .ino = inode_no,
+            .path = normalized,
             .kind = .file,
             .mode = s_ifreg | (entry.mode & 0o7777),
             .uid = entry.uid,
@@ -889,6 +977,7 @@ fn entryInodePlan(entry: Entry, normalized: []const u8, inode_no: u32) !InodePla
         },
         .file_source => |source| .{
             .ino = inode_no,
+            .path = normalized,
             .kind = .file,
             .mode = s_ifreg | (entry.mode & 0o7777),
             .uid = entry.uid,
@@ -899,6 +988,7 @@ fn entryInodePlan(entry: Entry, normalized: []const u8, inode_no: u32) !InodePla
         },
         .symlink => |target| .{
             .ino = inode_no,
+            .path = normalized,
             .kind = .symlink,
             .mode = s_iflnk | 0o777,
             .uid = entry.uid,
@@ -909,6 +999,7 @@ fn entryInodePlan(entry: Entry, normalized: []const u8, inode_no: u32) !InodePla
         },
         .device => |dev| .{
             .ino = inode_no,
+            .path = normalized,
             .kind = if (dev.kind == .char) .char_device else .block_device,
             .mode = (if (dev.kind == .char) s_ifchr else s_ifblk) | (entry.mode & 0o7777),
             .uid = entry.uid,
@@ -918,6 +1009,7 @@ fn entryInodePlan(entry: Entry, normalized: []const u8, inode_no: u32) !InodePla
         },
         .fifo => .{
             .ino = inode_no,
+            .path = normalized,
             .kind = .fifo,
             .mode = s_ififo | (entry.mode & 0o7777),
             .uid = entry.uid,
@@ -926,6 +1018,7 @@ fn entryInodePlan(entry: Entry, normalized: []const u8, inode_no: u32) !InodePla
         },
         .socket => .{
             .ino = inode_no,
+            .path = normalized,
             .kind = .socket,
             .mode = s_ifsock | (entry.mode & 0o7777),
             .uid = entry.uid,
@@ -998,6 +1091,27 @@ const BlockAllocator = struct {
         }
         return error.Ext4ImageTooSmall;
     }
+
+    fn allocSlice(self: *BlockAllocator, out: []u32) !void {
+        var filled: usize = 0;
+        while (filled < out.len) {
+            var start = self.next;
+            while (start < self.used.bit_length and self.used.isSet(start)) : (start += 1) {}
+            if (start >= self.used.bit_length) return error.Ext4ImageTooSmall;
+
+            const max_end = @min(self.used.bit_length, start + out.len - filled);
+            var end = start;
+            while (end < max_end and !self.used.isSet(end)) : (end += 1) {}
+            self.used.setRangeValue(.{ .start = start, .end = end }, true);
+            self.next = end;
+
+            var block_no = start;
+            while (block_no < end) : (block_no += 1) {
+                out[filled] = @intCast(block_no);
+                filled += 1;
+            }
+        }
+    }
 };
 
 fn assignBlocks(
@@ -1045,9 +1159,18 @@ fn assignBlocks(
     }
 
     var block_allocator = BlockAllocator{ .used = &used };
-    for (planned.inodes.items) |*inode| {
+    var maybe_directory_children: ?DirectoryChildIndex = if (shouldIndexDirectoryChildren(planned))
+        try DirectoryChildIndex.build(allocator, planned)
+    else
+        null;
+    defer if (maybe_directory_children) |*directory_children| directory_children.deinit(allocator);
+
+    for (planned.inodes.items, 0..) |*inode, inode_index| {
         if (inode.kind == .directory) {
-            const bytes = try directoryBytes(allocator, planned, inode.*);
+            const bytes = if (maybe_directory_children) |*directory_children|
+                try directoryBytesIndexed(allocator, planned, inode.*, inode_index, directory_children)
+            else
+                try directoryBytes(allocator, planned, inode.*);
             defer allocator.free(bytes);
             inode.size = bytes.len;
             try allocatePayloadBlocks(allocator, inode, bytes, &block_allocator, blocks);
@@ -1098,6 +1221,11 @@ fn assignBlocks(
     };
 }
 
+fn shouldIndexDirectoryChildren(planned: *const PlannedImage) bool {
+    return planned.directory_count != 0 and
+        planned.paths.items.len > directory_child_index_threshold / planned.directory_count;
+}
+
 fn allocateSourcePayloadBlocks(
     allocator: std.mem.Allocator,
     inode: *InodePlan,
@@ -1109,17 +1237,50 @@ fn allocateSourcePayloadBlocks(
     if (size == 0) return;
     const count = divCeilU64(size, block_size);
     inode.data_blocks = try allocator.alloc(u32, @intCast(count));
+    try block_allocator.allocSlice(inode.data_blocks);
     var offset: u64 = 0;
-    for (inode.data_blocks) |*block| {
-        block.* = try block_allocator.alloc();
+    var run_first_block: u32 = 0;
+    var run_block_count: u32 = 0;
+    var run_source_offset: u64 = 0;
+    var run_byte_len: u64 = 0;
+    var previous_block: u32 = 0;
+    for (inode.data_blocks) |block| {
         const take: usize = @intCast(@min(size - offset, block_size));
-        try data_blocks.put(block.*, .{
-            .source = source,
-            .offset = offset,
-            .len = take,
-        });
+        if (run_block_count == 0) {
+            run_first_block = block;
+            run_source_offset = offset;
+        } else if (block != previous_block + 1) {
+            try appendDataBlockRun(data_blocks, allocator, run_first_block, run_block_count, source, run_source_offset, run_byte_len);
+            run_first_block = block;
+            run_block_count = 0;
+            run_source_offset = offset;
+            run_byte_len = 0;
+        }
+        run_block_count += 1;
+        run_byte_len += take;
+        previous_block = block;
         offset += take;
     }
+    try appendDataBlockRun(data_blocks, allocator, run_first_block, run_block_count, source, run_source_offset, run_byte_len);
+}
+
+fn appendDataBlockRun(
+    data_blocks: *DataBlockStore,
+    allocator: std.mem.Allocator,
+    first_block: u32,
+    block_count: u32,
+    source: tar.FileSource,
+    source_offset: u64,
+    byte_len: u64,
+) !void {
+    if (block_count == 0) return;
+    try data_blocks.append(allocator, .{
+        .first_block = first_block,
+        .block_count = block_count,
+        .source = source,
+        .source_offset = source_offset,
+        .byte_len = byte_len,
+    });
 }
 
 fn allocatePayloadBlocks(
@@ -1132,13 +1293,13 @@ fn allocatePayloadBlocks(
     if (payload.len == 0) return;
     const count = divCeilUsize(payload.len, block_size);
     inode.data_blocks = try allocator.alloc(u32, count);
+    try block_allocator.allocSlice(inode.data_blocks);
     var offset: usize = 0;
-    for (inode.data_blocks) |*block| {
-        block.* = try block_allocator.alloc();
+    for (inode.data_blocks) |block| {
         const data_block = try zeroBlock(allocator);
         const take = @min(payload.len - offset, block_size);
         @memcpy(data_block[0..take], payload[offset .. offset + take]);
-        try blocks.put(block.*, data_block);
+        try blocks.put(block, data_block);
         offset += take;
     }
 }
@@ -1196,7 +1357,7 @@ fn allocateIndirectBlocks(
 fn directoryBytes(allocator: std.mem.Allocator, planned: *const PlannedImage, inode: InodePlan) ![]u8 {
     var children = std.ArrayList(DirChild).empty;
     defer children.deinit(allocator);
-    const self_path = pathForInode(planned, inode.ino) orelse return error.BadExt4Tree;
+    const self_path = inode.path;
     for (planned.paths.items) |path_ref| {
         if (path_ref.path.len == 0 or std.mem.eql(u8, path_ref.path, self_path)) continue;
         if (!isDirectChild(self_path, path_ref.path)) continue;
@@ -1210,6 +1371,42 @@ fn directoryBytes(allocator: std.mem.Allocator, planned: *const PlannedImage, in
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try appendDirent(allocator, &out, inode.ino, ".", file_type_dir, false);
+    const parent_inode = if (self_path.len == 0)
+        inode.ino
+    else blk: {
+        const parent = parentPathIndex(planned, self_path) orelse return error.BadExt4Tree;
+        break :blk planned.inodes.items[parent.inode_index].ino;
+    };
+    try appendDirent(allocator, &out, parent_inode, "..", file_type_dir, false);
+    for (children.items, 0..) |child, i| {
+        const child_inode = planned.inodes.items[child.inode_index];
+        try appendDirent(allocator, &out, child_inode.ino, child.name, child_inode.fileType(), i + 1 == children.items.len);
+    }
+    if (children.items.len == 0) try finishDirectoryBlock(allocator, &out);
+    return out.toOwnedSlice(allocator);
+}
+
+fn directoryBytesIndexed(
+    allocator: std.mem.Allocator,
+    planned: *const PlannedImage,
+    inode: InodePlan,
+    inode_index: usize,
+    directory_children: *const DirectoryChildIndex,
+) ![]u8 {
+    var children = std.ArrayList(DirChild).empty;
+    defer children.deinit(allocator);
+    var child_index = directory_children.heads[inode_index];
+    while (child_index != DirectoryChildIndex.none) {
+        if (child_index >= directory_children.child_count) return error.BadExt4Tree;
+        try children.append(allocator, directory_children.children[child_index]);
+        child_index = directory_children.next[child_index];
+    }
+    std.mem.sort(DirChild, children.items, planned, lessDirChild);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendDirent(allocator, &out, inode.ino, ".", file_type_dir, false);
+    const self_path = inode.path;
     const parent_inode = if (self_path.len == 0)
         inode.ino
     else blk: {
@@ -1563,14 +1760,39 @@ fn buildEmitBlocks(
     data_blocks: *DataBlockStore,
 ) ![]EmitBlock {
     const emit_blocks = try allocator.alloc(EmitBlock, total_blocks);
+    errdefer allocator.free(emit_blocks);
     @memset(emit_blocks, .zero);
     var metadata_it = blocks.iterator();
     while (metadata_it.next()) |entry| {
         emit_blocks[entry.key_ptr.*] = .{ .metadata = entry.value_ptr.* };
     }
-    var data_it = data_blocks.iterator();
-    while (data_it.next()) |entry| {
-        emit_blocks[entry.key_ptr.*] = .{ .data = entry.value_ptr.* };
+    for (data_blocks.items) |run| {
+        if (run.block_count == 0 or run.byte_len == 0) return error.BadExt4Tree;
+        const end_block = std.math.add(u32, run.first_block, run.block_count) catch return error.Ext4ImageTooSmall;
+        if (end_block > total_blocks) return error.Ext4ImageTooSmall;
+        const max_bytes = try std.math.mul(u64, @as(u64, run.block_count), @as(u64, block_size));
+        const full_prefix_bytes = try std.math.mul(u64, @as(u64, run.block_count - 1), @as(u64, block_size));
+        const min_bytes = full_prefix_bytes + 1;
+        if (run.byte_len < min_bytes or run.byte_len > max_bytes) return error.BadExt4Tree;
+        const source_end = std.math.add(u64, run.source_offset, run.byte_len) catch return error.BadExt4Tree;
+        if (source_end > run.source.size()) return error.BadExt4Tree;
+
+        var remaining = run.byte_len;
+        var source_offset = run.source_offset;
+        var i: u32 = 0;
+        while (i < run.block_count) : (i += 1) {
+            const block = run.first_block + i;
+            if (emit_blocks[block] != .zero) return error.BadExt4Tree;
+            const take: usize = @intCast(@min(remaining, block_size));
+            emit_blocks[block] = .{ .data = .{
+                .source = run.source,
+                .offset = source_offset,
+                .len = take,
+            } };
+            source_offset += take;
+            remaining -= take;
+        }
+        if (remaining != 0) return error.BadExt4Tree;
     }
     return emit_blocks;
 }
@@ -1769,13 +1991,6 @@ fn parentPathIndex(planned: *const PlannedImage, path: []const u8) ?PathRef {
     return .{ .path = parent, .inode_index = inode_index };
 }
 
-fn pathForInode(planned: *const PlannedImage, inode_no: u32) ?[]const u8 {
-    for (planned.paths.items) |path_ref| {
-        if (planned.inodes.items[path_ref.inode_index].ino == inode_no) return path_ref.path;
-    }
-    return null;
-}
-
 fn lessEntryPath(_: void, a: Entry, b: Entry) bool {
     return std.mem.order(u8, a.path, b.path) == .lt;
 }
@@ -1961,6 +2176,92 @@ test "native ext4 writer inline CAS index matches rescanned image" {
     try std.testing.expect(inline_result.objects_written > 0);
 }
 
+test "indexed directory children match scanned directory bytes" {
+    const allocator = std.testing.allocator;
+    const entries = [_]Entry{
+        .{ .path = "alpha/target", .kind = .{ .file = "target\n" } },
+        .{ .path = "beta/target-hard", .kind = .{ .hardlink = "alpha/target" } },
+        .{ .path = "alpha/nested/leaf", .kind = .{ .file = "leaf\n" } },
+        .{ .path = "empty", .kind = .directory },
+        .{ .path = "links/tool", .kind = .{ .symlink = "../alpha/target" } },
+        .{ .path = "dev/nullish", .kind = .{ .device = .{ .kind = .char, .major = 1, .minor = 3 } } },
+    };
+
+    var planned = try planImage(allocator, &entries, 1024);
+    defer planned.deinit(allocator);
+    var directory_children = try DirectoryChildIndex.build(allocator, &planned);
+    defer directory_children.deinit(allocator);
+
+    for (planned.inodes.items, 0..) |inode, inode_index| {
+        if (inode.kind != .directory) continue;
+        const scanned = try directoryBytes(allocator, &planned, inode);
+        defer allocator.free(scanned);
+        const indexed = try directoryBytesIndexed(allocator, &planned, inode, inode_index, &directory_children);
+        defer allocator.free(indexed);
+        try std.testing.expectEqualSlices(u8, scanned, indexed);
+    }
+}
+
+test "planner rejects children below non-directory parents" {
+    const allocator = std.testing.allocator;
+    const entries = [_]Entry{
+        .{ .path = "alpha", .kind = .{ .file = "not a directory\n" } },
+        .{ .path = "alpha/child", .kind = .{ .file = "child\n" } },
+    };
+
+    try std.testing.expectError(error.ParentNotDirectory, planImage(allocator, &entries, 1024));
+}
+
+test "source data runs split across block group metadata gaps" {
+    const allocator = std.testing.allocator;
+    const inode_count: u32 = 1024;
+    const total_blocks: u32 = blocks_per_group * 2;
+    const source_size: u64 = @as(u64, blocks_per_group + 2) * block_size + 123;
+    const source_path: []u8 = @constCast("unused-large-source");
+    const entries = [_]Entry{.{
+        .path = "large.bin",
+        .kind = .{ .file_source = .{ .file = .{
+            .path = source_path,
+            .offset = 0,
+            .size = source_size,
+        } } },
+    }};
+
+    var planned = try planImage(allocator, &entries, inode_count);
+    defer planned.deinit(allocator);
+    var blocks = BlockStore.init(allocator);
+    defer freeBlockStore(allocator, &blocks);
+    var data_blocks = DataBlockStore.empty;
+    defer data_blocks.deinit(allocator);
+
+    const layout = try assignBlocks(allocator, &planned, total_blocks, inode_count, &blocks, &data_blocks);
+    defer allocator.free(layout.groups);
+    try std.testing.expect(data_blocks.items.len >= 2);
+    var saw_gap = false;
+    for (data_blocks.items[1..], 1..) |run, i| {
+        const previous = data_blocks.items[i - 1];
+        if (previous.first_block + previous.block_count != run.first_block) saw_gap = true;
+    }
+    try std.testing.expect(saw_gap);
+
+    const emit_blocks = try buildEmitBlocks(allocator, total_blocks, &blocks, &data_blocks);
+    defer allocator.free(emit_blocks);
+    var large_inode: ?InodePlan = null;
+    for (planned.inodes.items) |inode| {
+        if (inode.kind == .file and inode.file_source != null) {
+            large_inode = inode;
+            break;
+        }
+    }
+    const inode = large_inode orelse return error.BadExt4Tree;
+    const last_block = inode.data_blocks[inode.data_blocks.len - 1];
+    const last_source = switch (emit_blocks[last_block]) {
+        .data => |source| source,
+        else => return error.BadExt4Tree,
+    };
+    try std.testing.expectEqual(@as(usize, 123), last_source.len);
+}
+
 fn fuzzNativeExt4PlannerAndMetadataEmitter(_: void, s: *std.testing.Smith) !void {
     // The native materializer receives trees derived from attacker-influenced
     // layer metadata. Exercise the same public entry shape through planning,
@@ -2024,8 +2325,8 @@ fn fuzzNativeExt4PlannerAndMetadataEmitter(_: void, s: *std.testing.Smith) !void
 
     var blocks = BlockStore.init(allocator);
     defer freeBlockStore(allocator, &blocks);
-    var data_blocks = DataBlockStore.init(allocator);
-    defer data_blocks.deinit();
+    var data_blocks = DataBlockStore.empty;
+    defer data_blocks.deinit(allocator);
 
     const layout = try assignBlocks(allocator, &planned, total_blocks, inode_count, &blocks, &data_blocks);
     defer allocator.free(layout.groups);
@@ -2039,11 +2340,11 @@ fn fuzzNativeExt4PlannerAndMetadataEmitter(_: void, s: *std.testing.Smith) !void
     while (block_keys.next()) |block| {
         try std.testing.expect(block.* < total_blocks);
     }
-    var source_blocks = data_blocks.iterator();
-    while (source_blocks.next()) |entry| {
-        try std.testing.expect(entry.key_ptr.* < total_blocks);
-        const source = entry.value_ptr.*;
-        try std.testing.expect(source.offset + @as(u64, @intCast(source.len)) <= source.source.size());
+    for (data_blocks.items) |run| {
+        try std.testing.expect(run.first_block < total_blocks);
+        try std.testing.expect(run.block_count > 0);
+        try std.testing.expect(run.first_block + run.block_count <= total_blocks);
+        try std.testing.expect(run.source_offset + run.byte_len <= run.source.size());
     }
 }
 
