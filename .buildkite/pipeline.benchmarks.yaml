@@ -30,12 +30,15 @@ steps:
         --include "latest-summary.json" \
         --include "site/*" \
         --include "buildkite-annotation.md" \
+        --include "regression-report.md" \
+        --include "regression-report.json" \
         --include "*/config.json" \
         --include "*/results.jsonl" \
         --include "*/summary.json" \
         --include "*/logs/*" \
         --include "*/logs/**/*" \
         --include "*/rootfs-cache/*.json" \
+        --exclude "history/*" \
         --exclude "*/work/*" \
         --exclude "*/bundle-cache/*" \
         --exclude "*/rootfs-cache/cas/*"
@@ -71,12 +74,15 @@ steps:
         --include "latest-summary.json" \
         --include "site/*" \
         --include "buildkite-annotation.md" \
+        --include "regression-report.md" \
+        --include "regression-report.json" \
         --include "*/config.json" \
         --include "*/results.jsonl" \
         --include "*/summary.json" \
         --include "*/logs/*" \
         --include "*/logs/**/*" \
         --include "*/rootfs-cache/*.json" \
+        --exclude "history/*" \
         --exclude "*/work/*" \
         --exclude "*/bundle-cache/*" \
         --exclude "*/rootfs-cache/cas/*"

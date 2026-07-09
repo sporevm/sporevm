@@ -39,6 +39,7 @@ per-runner latest metrics/history for the public macOS and Linux ARM64 options.
 scripts/benchmark/suite.py --profile smoke
 scripts/benchmark/suite.py --profile ci
 scripts/benchmark/suite.py --profile comparison
+scripts/benchmark/suite.py --profile nightly
 scripts/benchmark/suite.py --profile full
 ```
 
@@ -49,6 +50,10 @@ scripts/benchmark/suite.py --profile full
 - `comparison`: small sequential and burst runs plus one SQLite and
   package-style writable-rootfs pass, suitable for post-merge, manual, or
   nightly comparison artifacts.
+- `nightly`: scheduled guardrail profile with five sequential samples of warm
+  `spore run --image`, synthetic cold rootfs import, fork timing, and
+  distribution save/restore, plus one package-style writable-rootfs pass. This
+  is the profile used for regression detection on Buildkite schedules.
 - `full`: 100-way sequential, staggered, and burst runs matching the public TTI
   shape, plus three writable-rootfs iterations per workload.
 
@@ -72,18 +77,15 @@ published trends like-for-like with the public
 [ComputeSDK sandbox TTI benchmark](https://www.computesdk.com/benchmarks/sandboxes/)
 (node runtime, `node -v` as the timed first command) while sourcing the image
 from the AWS public ECR mirror of Docker Official Images instead of Docker Hub,
-which rate-limits anonymous CI pulls. Main builds run the `comparison` profile;
-other branches run `ci`. A nightly Buildkite schedule on the
-`sporevm-benchmarks` pipeline runs the `full` profile (the exact public shape:
-100 iterations, sequential/staggered/burst) by setting
-`SPOREVM_BENCHMARK_PROFILE=full`, so the published series carry statistically
-robust p95/p99 alongside the per-merge regression points. Override with
+which rate-limits anonymous CI pulls. Scheduled builds run the `nightly`
+profile, main-triggered builds run `comparison`, and other branches run `ci`.
+Override with
 `SPOREVM_BENCHMARK_IMAGE`, `SPOREVM_BENCHMARK_COMMAND`, and
 `SPOREVM_BENCHMARK_PROFILE`.
 
 Every published series point records its `profile` and `sample_count`, so
-consumers can separate high-iteration nightly `full` points from small-N
-per-merge `comparison` points that share a `benchmark/mode` series.
+consumers can separate scheduled guardrail points from small-N per-merge
+`comparison` points that share a `benchmark/mode` series.
 
 Benchmark builds use the shipped `--release=safe` settings (`mise run
 build:release`); a default Debug `zig build` understates TTI by roughly 40
@@ -105,6 +107,26 @@ spore run --image node@sha256:... --memory 512mb -- /usr/local/bin/node -v
 
 This path works on both KVM and HVF today. It is the apples-to-apples startup
 number for sandbox-provider comparisons.
+
+With the default prewarm enabled, `cold_tti` is also the guardrail for warm
+`spore run --image`: the rootfs has already been built outside the timed loop,
+so the timed rows measure the cached image run path that regressed in PR #421.
+
+### Cold Import
+
+Cold import measures deterministic rootfs materialization without depending on
+the `buildkite-sporevm` image or any registry:
+
+```text
+generate synthetic rootfs tar
+spore rootfs import-tar rootfs.tar --ref local/sporevm-benchmark-synthetic:nightly
+```
+
+The suite creates a fixed tar from generated files and imports it into a fresh
+per-iteration rootfs cache with `SPOREVM_ROOTFS_BUILD_PROFILE=1`. Each
+`cold_import/synthetic_tar` row stores `elapsed_ms`/`tti_ms` plus rootfs profile
+phase counters such as `rootfs_profile_rootfs_cas_inline_objects_written`,
+chunk counts, object bytes, and native writer emit counters.
 
 ### Warm Spore TTI
 
@@ -225,6 +247,114 @@ Defaults fail when:
 Thresholds are flags so CI can tighten release gates without changing the
 benchmark data format.
 
+## Regression Detection
+
+Scheduled Buildkite benchmark jobs also run:
+
+```console
+scripts/benchmark/detect_regressions.py \
+  zig-cache/sporevm-benchmarks/latest-summary.json \
+  --history-dir zig-cache/sporevm-benchmarks/history \
+  --markdown-out zig-cache/sporevm-benchmarks/regression-report.md \
+  --json-out zig-cache/sporevm-benchmarks/regression-report.json
+```
+
+The detector compares the current run's per-metric minimum against the minimum
+from a trailing window of prior runs on the same `host_id`. It uses history from
+downloaded Buildkite artifacts when available. Non-scheduled runs tolerate empty
+or missing history so developers can run the same script locally. Scheduled
+Buildkite runs fail when no compatible same-host history exists unless the
+current run declares an intentional reset with `SPOREVM_BENCHMARK_RESET` or a
+`spore-benchmark-reset:` commit-message line. The failure annotation points at
+the likely causes: artifact fetch failure, `host_id` drift, or a fresh pipeline
+that needs an intentional bootstrap.
+
+The detector also checks durable absolute ceilings from
+`benchmarks/expectations.json`. A metric that exceeds its `max` value fails even
+when the rolling trailing window has already ratcheted up to the same slower
+value. These ceilings are the long-lived floor for headline guardrail metrics
+and should be changed deliberately in PRs, unlike the rolling baseline that is
+refreshed from scheduled artifacts.
+
+Thresholds are metric-class based:
+
+- latency metrics such as warm image TTI, warm spore TTI, fork latency,
+  `vsock_connect_ms`, and `exec_response_ms`: warn above 30 percent, fail above
+  60 percent;
+- throughput/import metrics such as synthetic cold import, rootfs emit phases,
+  and batch wall times: warn above 10 percent, fail above 20 percent;
+- counter metrics such as rootfs objects, chunks, bytes, and block counts: warn
+  on any change, fail when an increase reaches 2x or moves from zero to nonzero.
+- success-rate metrics derived from raw benchmark rows before failed rows are
+  filtered: warn on any decrease, and fail when a benchmark with a 100 percent
+  baseline drops below 100 percent.
+
+The Buildkite annotation table shows the current value, trailing baseline, delta,
+verdict, number of history runs used, and threshold for each metric. `warning`
+annotations keep the build green; `error` annotations come from fail-tier
+verdicts and fail the benchmark job.
+
+To run the same detector locally against saved benchmark directories:
+
+```console
+scripts/benchmark/detect_regressions.py \
+  zig-cache/sporevm-benchmarks/latest-summary.json \
+  --history-dir /path/to/prior/benchmark-artifacts
+```
+
+The loader accepts suite `latest-summary.json`, `summary.json`, `results.jsonl`,
+run directories, and older ad hoc benchmark directories containing
+`warm-run-true*.log` plus `system-df-rootfs.log`.
+
+### Resetting History
+
+Intentional benchmark changes should reset history instead of leaving a metric
+red forever. For a durable reset, bump `benchmarks/expectations.json` in the
+same PR:
+
+```json
+{
+  "version": 1,
+  "metrics": {
+    "cold_import/synthetic_tar/rootfs_profile_rootfs_cas_inline_objects_written": {
+      "reset": "2026-07-native-cas-layout",
+      "reason": "CAS object layout changed intentionally"
+    }
+  }
+}
+```
+
+Metric keys support exact names, `benchmark/mode`, and shell-style globs. When
+the current expectation `reset` marker differs from history, older points are
+ignored until new same-reset history accumulates.
+
+Expectation entries can also carry absolute ceilings:
+
+```json
+{
+  "version": 1,
+  "metrics": {
+    "cold_tti/sequential/tti_ms": {
+      "max": 750,
+      "reason": "Warm spore run --image TTI ceiling"
+    }
+  }
+}
+```
+
+The ceiling check is independent of rolling history. Updating a ceiling should
+be a deliberate PR review decision, and scheduled reset builds still check these
+absolute limits even when there is no prior same-host history.
+
+For a one-off reset, include a commit message line:
+
+```text
+spore-benchmark-reset: warm_spore_tti/*,cold_import/synthetic_tar/*
+```
+
+The reset build becomes the new baseline for matching metrics; the reset build
+itself does not fail.
+
 ## Publishing Trends
 
 The export format is intentionally small: each run records commit and runner
@@ -293,10 +423,11 @@ benchmark pipeline to finish.
 The dedicated benchmark pipeline runs macOS and Linux ARM64 benchmark jobs in
 parallel on `sporevm-mac` and `sporevm-linux-arm64`. Each platform job uses a
 per-platform concurrency group so two benchmark builds do not share the same
-runner class at once. It defaults to the broader `comparison` profile on `main`
-and to `ci` otherwise. Override with
-`SPOREVM_BENCHMARK_PROFILE=ci` for a short cold/warm run, or `full` when a build
-should pay for the full benchmark matrix.
+runner class at once. It defaults to `nightly` for Buildkite schedules,
+`comparison` on `main`, and `ci` otherwise. Override with
+`SPOREVM_BENCHMARK_PROFILE=ci` for a short cold/warm run, `nightly` for the
+guardrail selection, or `full` when a build should pay for the full benchmark
+matrix.
 
 Before the timed suite starts, the CI wrapper logs the host load averages and
 CPU count. Set `SPOREVM_BENCHMARK_MAX_LOADAVG_1M` to fail early when the
@@ -326,8 +457,26 @@ and uploads the stable website files under `s3://sporevm-benchmarks/site/`.
 If `SPOREVM_BENCHMARK_BASELINE` points to a summary JSON available in the job
 workspace, the step compares the new `latest-summary.json` against that
 baseline. Baselines should come from the same profile unless the comparator is
-run by hand with a narrower `--only` list. Regardless of comparison result, the
-step exports `site/data.json` and `site/data.js`, uploads benchmark JSON, logs,
-rootfs metadata, and trend data as artifacts and S3 objects, and publishes a
-Buildkite annotation summarizing the latest benchmark run. Generated work
-directories, bundle chunks, and rootfs chunk stores stay out of S3.
+run by hand with a narrower `--only` list.
+
+Before the regression detector runs, the CI wrapper tries to download prior
+`results.jsonl`, `config.json`, and `summary.json` artifacts from recent builds
+of the same benchmark pipeline into `zig-cache/sporevm-benchmarks/history`. If
+`BUILDKITE_API_TOKEN` is available, it resolves prior build UUIDs through the
+Buildkite REST API before calling `buildkite-agent artifact download --build`.
+Without that token it falls back to probing recent build numbers and tolerates
+misses. Set `SPOREVM_BENCHMARK_HISTORY_DIR` to point at a local history
+directory, or `SPOREVM_BENCHMARK_HISTORY_BUILDS` to change the number of prior
+Buildkite builds probed. Missing artifact history is allowed; the detector
+emits `no_history` rows and keeps non-scheduled builds green until comparable
+history exists. Scheduled builds require at least one compatible same-host
+history run unless the current run carries an intentional reset marker, so
+artifact download failures or host-id drift do not silently disable the
+guardrail.
+
+Regardless of comparison result, the step exports `site/data.json` and
+`site/data.js`, uploads benchmark JSON, logs, rootfs metadata, trend data,
+`regression-report.md`, and `regression-report.json` as artifacts and S3
+objects, and publishes Buildkite annotations summarizing both the latest
+benchmark run and regression verdicts. Generated work directories, bundle
+chunks, downloaded history, and rootfs chunk stores stay out of S3.

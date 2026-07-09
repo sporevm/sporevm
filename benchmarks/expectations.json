@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "metrics": {
+    "cold_tti/sequential/tti_ms": {
+      "max": 750,
+      "reason": "Warm spore run --image TTI ceiling for the prewarmed nightly image path."
+    },
+    "cold_import/synthetic_tar/elapsed_ms": {
+      "max": 2500,
+      "reason": "Synthetic rootfs import wall-clock ceiling for the deterministic nightly tar fixture."
+    },
+    "warm_spore_tti/sequential/tti_ms": {
+      "max": 300,
+      "reason": "Warm run from a forked spore directory should remain comfortably sub-second."
+    },
+    "warm_spore_tti/sequential_fork/fork_ms_per_child": {
+      "max": 75,
+      "reason": "Warm fork fan-out latency ceiling for the nightly sequential profile."
+    }
+  }
+}
