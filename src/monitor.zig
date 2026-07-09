@@ -337,6 +337,7 @@ const ExecServer = struct {
             .pollFn = pollThunk,
             .setWakeFn = setWakeThunk,
             .completeSnapshotFn = completeSnapshotThunk,
+            .completeRootfsSnapshotFn = completeRootfsSnapshotThunk,
             .reportStatsFn = reportStatsThunk,
         };
     }
@@ -781,6 +782,8 @@ const ExecServer = struct {
         }
     }
 
+    fn completeRootfsSnapshot(_: *ExecServer, _: ?spore.Disk) !void {}
+
     fn reportStats(self: *ExecServer, stats: vsock.ControlStats) void {
         if (self.stats_written and std.meta.eql(stats, self.stats_written_value)) return;
         const now = lifecycle.monotonicMs();
@@ -904,6 +907,11 @@ const ExecServer = struct {
     fn completeSnapshotThunk(context: *anyopaque, dir: []const u8) !void {
         const self: *ExecServer = @ptrCast(@alignCast(context));
         try self.completeSnapshot(dir);
+    }
+
+    fn completeRootfsSnapshotThunk(context: *anyopaque, disk: ?spore.Disk) !void {
+        const self: *ExecServer = @ptrCast(@alignCast(context));
+        try self.completeRootfsSnapshot(disk);
     }
 
     fn reportStatsThunk(context: *anyopaque, stats: vsock.ControlStats) void {

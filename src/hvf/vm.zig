@@ -601,6 +601,10 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     if (!request.continue_after) return .snapshotted;
                     try control.completeSnapshot(request.dir);
                 },
+                .rootfs_snapshot => |request| {
+                    const disk_manifest = try takeRootfsSnapshot(allocator, request.dir, transports, config.disk_snapshot);
+                    try control.completeRootfsSnapshot(disk_manifest);
+                },
             }
             const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
             try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
@@ -1292,6 +1296,27 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                         continue;
                     }
                     return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), request.dir, null);
+                },
+                .rootfs_snapshot => |request| {
+                    const disk_manifest = takeRootfsSnapshotV1(
+                        allocator,
+                        request.dir,
+                        vcpus,
+                        &state,
+                        &wake_set,
+                        options.transports,
+                        options.disk_snapshot,
+                    ) catch |err| {
+                        state.clearSnapshot();
+                        state.finish(.{ .err = err });
+                        continue;
+                    };
+                    state.clearSnapshot();
+                    control.completeRootfsSnapshot(disk_manifest) catch |err| {
+                        state.finish(.{ .err = err });
+                        continue;
+                    };
+                    continue;
                 },
             }
         }
@@ -2088,6 +2113,27 @@ const SnapshotPlatform = struct {
     ram_size: u64,
 };
 
+fn takeRootfsSnapshot(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    transports: []mmio.Transport,
+    disk_snapshot: ?disk_layer.SnapshotState,
+) !?spore.Disk {
+    // Keep this in sync with src/kvm/vm.zig:takeRootfsSnapshot. The transport
+    // type is backend-local, so only the quiescence/snapshot contract is shared.
+    const disk_state = disk_snapshot orelse return error.BadManifest;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const devices = try captureTransports(arena, transports);
+    if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
+        std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
+        return error.DeviceStatePending;
+    }
+    return try disk_state.finish(allocator, dir, true);
+}
+
 fn takeSnapshot(
     allocator: std.mem.Allocator,
     dir: []const u8,
@@ -2249,6 +2295,19 @@ fn takeSnapshot(
         );
     }
     std.log.info("spore written to {s}", .{dir});
+}
+
+fn takeRootfsSnapshotV1(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    vcpus: []HvfVcpu,
+    state: *MultiHvfRunState,
+    wake_set: *HvfVcpuWakeSet,
+    transports: []mmio.Transport,
+    disk_snapshot: ?disk_layer.SnapshotState,
+) !?spore.Disk {
+    try pauseHvfVcpusForSnapshot(vcpus, state, wake_set);
+    return try takeRootfsSnapshot(allocator, dir, transports, disk_snapshot);
 }
 
 fn takeSnapshotV1(

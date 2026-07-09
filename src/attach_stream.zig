@@ -73,6 +73,7 @@ pub const RunStdinControl = struct {
             .pollFn = pollThunk,
             .setWakeFn = setWakeThunk,
             .completeSnapshotFn = completeSnapshotThunk,
+            .completeRootfsSnapshotFn = completeRootfsSnapshotThunk,
             .reportStatsFn = reportStatsThunk,
         };
     }
@@ -183,6 +184,8 @@ pub const RunStdinControl = struct {
 
     fn completeSnapshot(_: *RunStdinControl, _: []const u8) !void {}
 
+    fn completeRootfsSnapshot(_: *RunStdinControl, _: ?spore.Disk) !void {}
+
     fn reportStats(_: *RunStdinControl, _: vsock.ControlStats) void {}
 
     fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock.ControlAction {
@@ -198,6 +201,11 @@ pub const RunStdinControl = struct {
     fn completeSnapshotThunk(context: *anyopaque, dir: []const u8) !void {
         const self: *RunStdinControl = @ptrCast(@alignCast(context));
         try self.completeSnapshot(dir);
+    }
+
+    fn completeRootfsSnapshotThunk(context: *anyopaque, disk: ?spore.Disk) !void {
+        const self: *RunStdinControl = @ptrCast(@alignCast(context));
+        try self.completeRootfsSnapshot(disk);
     }
 
     fn reportStatsThunk(context: *anyopaque, stats: vsock.ControlStats) void {

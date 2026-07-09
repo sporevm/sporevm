@@ -72,6 +72,12 @@
 #define COPY_KIND_FILE 'F'
 #define COPY_KIND_DIR 'D'
 #define COPY_KIND_END 'E'
+#ifndef FIFREEZE
+#define FIFREEZE _IOWR('X', 119, int)
+#endif
+#ifndef FITHAW
+#define FITHAW _IOWR('X', 120, int)
+#endif
 #define GEN_BASE 0x0c001000ULL
 #define GEN_WINDOW_SIZE 0x1000U
 #define GEN_MAGIC 0x4e475053U
@@ -1319,6 +1325,8 @@ enum request_kind {
   REQUEST_GENERATION,
   REQUEST_COPY_IN,
   REQUEST_COPY_OUT,
+  REQUEST_FSFREEZE,
+  REQUEST_FSTHAW,
 };
 
 struct run_request {
@@ -1407,6 +1415,12 @@ static int parse_request(const char *req, struct run_request *out) {
       out->protocol_v1 = 1;
     } else if (strcmp(type, "copy-out-v1") == 0) {
       out->kind = REQUEST_COPY_OUT;
+      out->protocol_v1 = 1;
+    } else if (strcmp(type, "fsfreeze-v1") == 0) {
+      out->kind = REQUEST_FSFREEZE;
+      out->protocol_v1 = 1;
+    } else if (strcmp(type, "fsthaw-v1") == 0) {
+      out->kind = REQUEST_FSTHAW;
       out->protocol_v1 = 1;
     } else {
       return -1;
@@ -1960,6 +1974,18 @@ static int copy_out_file(struct client *client, const char *root, const char *gu
       send_copy_record(client, COPY_KIND_END, "", 0, 0) != 0) {
     return send_client_error_exit(client, 1, "spore copy-out: cannot read guest path\n");
   }
+  return send_client_exit(client, 0);
+}
+
+static int freeze_or_thaw_rootfs(struct client *client, int freeze) {
+  int fd = open("/mnt/rootfs", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) return send_client_error_exit(client, 126, freeze ? "spore build: rootfs freeze open failed\n" : "spore build: rootfs thaw open failed\n");
+  int arg = 0;
+  int rc = 0;
+  if (freeze) sync();
+  if (ioctl(fd, freeze ? FIFREEZE : FITHAW, &arg) != 0) rc = -1;
+  if (close(fd) != 0) rc = -1;
+  if (rc != 0) return send_client_error_exit(client, 126, freeze ? "spore build: fsfreeze failed\n" : "spore build: fsthaw failed\n");
   return send_client_exit(client, 0);
 }
 
@@ -2944,6 +2970,22 @@ static void accept_request(int listener, struct session *session, struct client 
     } else {
       (void)copy_out_file(client, root, request.copy_path);
     }
+    close_client(client);
+    return;
+  }
+
+  if (request.kind == REQUEST_FSFREEZE || request.kind == REQUEST_FSTHAW) {
+    if (!request.protocol_v1) {
+      (void)send_client_error_exit(client, 2, "spore build: fsfreeze requires v1 protocol\n");
+      close_client(client);
+      return;
+    }
+    if (!use_rootfs || !rootfs_ready) {
+      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore build: rootfs unavailable\n");
+      close_client(client);
+      return;
+    }
+    (void)freeze_or_thaw_rootfs(client, request.kind == REQUEST_FSFREEZE);
     close_client(client);
     return;
   }

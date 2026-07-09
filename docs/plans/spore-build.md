@@ -154,8 +154,8 @@ Options for the first implementation:
 - `--build-arg KEY=VALUE` (repeatable): supplies `ARG` values.
 - `--network spore|none`: network policy for `RUN` steps. Default `spore`
   (Docker builds assume network). `none` gives hermetic builds.
-- `--disk-headroom SIZE`: accepted for CLI stability in M1; executor sizing
-  lands with M2.
+- `--disk-headroom SIZE`: accepted for CLI stability; grow/resize execution is
+  deferred until after the RUN executor slice and before full M2 completion.
 - `--no-cache`: ignore step cache reads (still writes).
 - `--mkfs PATH` / `--debugfs PATH`: forwarded to the base-import path, same as
   `spore rootfs import-oci`.
@@ -217,7 +217,7 @@ src/build/step_cache.zig step-key computation + on-disk records that map
 src/build/exec.zig       persistent build-VM session: boot the deepest
                          cached index writable through ChunkMappedDisk,
                          drive RUN/COPY steps through an in-guest step
-                         driver, checkpoint (freeze/snapshot/thaw) after
+                         driver, checkpoint (freeze/snapshot/stamp/record/thaw) after
                          each exec step
 ```
 
@@ -236,12 +236,12 @@ Build state machine:
                  ╭──────────────────╮   ╭──────────────────────────────╮
                  │ read final step  │   │ open index k-1 through       │
                  │ record, verify   │   │ ChunkMappedDisk + overlay    │
-                 │ complete stamp   │   │ grow + resize2fs (once)      │
+                 │ complete stamp   │   │ no grow/resize in RUN slice  │
                  ╰────────┬─────────╯   │ boot guest once (rw)         │
                           │             │ for each remaining step:     │
                           │             │   exec via step driver       │
                           │             │   sync+freeze → snapshot →   │
-                          │             │   thaw = child index_digest  │
+                          │             │   stamp+record → thaw        │
                           │             │ shutdown                     │
                           │             ╰──────────────┬───────────────╯
                           ╰────────────────┬───────────╯
@@ -466,9 +466,10 @@ Session lifecycle:
    fully cold build) as the `ChunkMappedDisk` parent and attach build-owned
    writable overlay state. The parent index and complete stamp are verified
    before boot; missing chunks fail closed instead of reaching the guest.
-2. Guarantee headroom **once per build**: if the ext4 has less than
-   `--disk-headroom` free, grow the chunk-mapped disk and run host-side
-   `resize2fs` (already implied by the e2fsprogs dependency). No shrink after;
+2. Grow-only headroom is a later M2 completion slice: if the ext4 has less
+   than `--disk-headroom` free, grow the chunk-mapped disk and run host-side
+   `resize2fs` (already implied by the e2fsprogs dependency). The RUN slice
+   accepts the CLI option but uses the existing logical size. No shrink after;
    later snapshots inherit the larger logical size.
 3. Boot via the existing run stack with a new internal rootfs mode: open the
    chunk-mapped rootfs read-write and pass `spore_rootfs_rw=1`, without
@@ -487,15 +488,17 @@ Session lifecycle:
      COPY Semantics).
    - `CHECKPOINT`: driver runs `sync` then `fsfreeze -f /` and acknowledges;
      the VMM drains/flushes pending virtio-blk writes, the host calls
-     `ChunkMappedDisk.snapshotIndex()` into the rootfs CAS, writes the step
-     record with the child `index_digest`, writes/repairs the complete stamp,
-     and then tells the driver to thaw. The driver itself only waits on stdin
+     `ChunkMappedDisk.snapshotIndex()` into the rootfs CAS, writes/repairs the
+     complete stamp, writes the step record with the child `index_digest`, and
+     then tells the driver to thaw. The driver itself only waits on stdin
      during the freeze, so it never blocks on the frozen root. Because all
      step processes have already exited and the filesystem is frozen at
      snapshot time, checkpoints are clean images, not crash-consistent guesses
-     — this matters because the rootfs ext4 profile has no journal. The drain
-     requirement belongs to the existing virtio-blk write path
-     (`src/virtio/blk.zig`).
+     — this matters because the rootfs ext4 profile has no journal. Publishing
+     the stamp and step record before thaw is intentional: a thaw failure
+     fails the active build, but the frozen snapshot is complete and remains a
+     valid resume point for the next build. The drain requirement belongs to
+     the existing virtio-blk write path (`src/virtio/blk.zig`).
    - `DONE`: driver exits; guest shuts down cleanly.
 5. A non-zero step exit fails the build with the exit code and the
    instruction; the session is torn down, live overlay state is deleted, and
@@ -507,8 +510,10 @@ Session lifecycle:
    full-image hash or flat install pass.
 
 Overhead on a cache miss, on top of the commands themselves: one boot
-(~1–2s per build), one resize2fs (seconds, cold builds only in practice),
-sync+freeze+O(dirty) snapshot per changed step, and local-ref publication.
+(~1–2s per build), sync+freeze+O(dirty) snapshot per changed step, and
+local-ref publication. The later grow-only headroom slice adds one resize2fs
+(seconds, cold builds only in practice) when the base image lacks enough free
+space.
 There is no tar export, no full-image hash, and no flat materialization
 required before the image is runnable. Fixed overhead is one boot plus the
 dirty snapshot work, so uncached builds compete with BuildKit by avoiding
@@ -523,10 +528,11 @@ cache model is identical in both modes.
 The guest sees exactly what `spore run --image X --save` sees today
 (`spore_rootfs=1 spore_rootfs_rw=1`), so no guest/initrd changes are expected;
 verifying that the init path mounts root rw, that `fsfreeze` is available in
-the target base (util-linux is essential in Debian), and that
-`resize2fs`-grown filesystems boot cleanly is part of the milestone's
-definition of done. A base without `fsfreeze` fails closed with an error
-naming the requirement, like the `tar` requirement for COPY.
+the target base (util-linux is essential in Debian) is part of the RUN-slice
+definition of done. The later grow-only headroom slice adds the
+`resize2fs`-grown filesystem boot assertion. A base without `fsfreeze` fails
+closed with an error naming the requirement, like the `tar` requirement for
+COPY.
 
 ## COPY Semantics
 
@@ -677,10 +683,10 @@ cost paid once.
 ### M2 — RUN via the persistent build-VM session
 
 The session executor: open the deepest cached index through `ChunkMappedDisk`
-with build-owned overlay state, headroom/resize2fs, rw rootfs boot behind the
-hypervisor-neutral disk interface, the step driver over `spore_stream_v1`
-(file-backed stdin source), `/bin/sh -c` steps with env/workdir/network,
-freeze/snapshot/thaw checkpointing (including the virtio-blk drain),
+with build-owned overlay state, rw rootfs boot behind the hypervisor-neutral
+disk interface, the step driver over `spore_stream_v1` (file-backed stdin
+source), `/bin/sh -c` steps with env/workdir/network,
+freeze/snapshot/stamp/record/thaw checkpointing (including the virtio-blk drain),
 complete-stamp publication, streamed step output, and non-zero-exit cleanup.
 Every executed instruction produces exactly one child `index_digest` through
 `ChunkMappedDisk.snapshotIndex()`; no flat checkpoint and no full-image hash
@@ -700,10 +706,32 @@ Definition of done:
   usable.
 - A checkpoint taken mid-build boots and fsck's clean when opened from its
   published `index_digest` (freeze correctness smoke).
-- resize2fs-grown rootfs boots and fsck's clean (smoke assertion).
+- grow-only headroom/resize2fs has a later smoke assertion before full M2
+  completion.
 
 Ceiling proven: uncached RUN build = one boot + command time + O(dirty)
 snapshots; cached RUN ≈ 0.
+
+Implementation note (2026-07-09, RUN slice): the executor now starts at the
+first uncached `RUN`, opens the parent rootfs through the normal writable
+`ChunkMappedDisk` run path, boots one build VM, and drives each remaining `RUN`
+over `spore_stream_v1` with the step env/workdir applied to `/bin/sh -c`.
+After each successful RUN the guest agent handles `fsfreeze-v1`, the host takes
+a rootfs-only `ChunkMappedDisk` snapshot after the existing virtio-blk
+quiescence check, writes the completeness stamp, writes the
+`sporevm-build-step-v1` record through `step_cache.writeRecord`, then sends
+`fsthaw-v1` before continuing. This publish-before-thaw ordering is
+intentional: if thaw fails, the active build fails but the completed frozen
+snapshot remains a valid cache resume point. Failed RUNs report the
+instruction, exit code, and captured output without writing the failed step
+record. The slice also fixes
+`spore run --image` for indexed rootfs images so build-published images pass
+`spore_rootfs=1` even when there is no flat rootfs path. COPY cache misses
+still fail closed; COPY application, disk headroom/resize smoke coverage, and
+the broader VM-dependent acceptance matrix remain for the next executor slice.
+The build VM memory is currently a provisional 2 GiB default; promote it to a
+`spore build` option when real workloads such as large `bundle install`-style
+RUN steps need more headroom.
 
 ### M3 — COPY execution
 
