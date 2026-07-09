@@ -187,7 +187,7 @@ on a feature error.
 | `ARG K[=default]` | value from `--build-arg` or default; unset used ARG is an error (stricter than Docker's warning; surfaced as a decision below). |
 | `WORKDIR /path` | affects `RUN` cwd, `COPY` relative dest, final config. Created in the guest if missing, matching Docker. |
 | `CMD ["…"]` / `CMD <shell>` | final image config only; both JSON exec form and shell form are supported. |
-| comments, line continuations, `${VAR}`/`$VAR` substitution in instruction arguments | standard Dockerfile behavior. |
+| comments, line continuations, `${VAR}`/`$VAR` substitution in instruction arguments | Parser directives such as `# syntax=` and `# escape=` are rejected anywhere in the file, not only in Docker's leading directive window. |
 
 Variable substitution applies to `ENV`, `ARG` defaults, `WORKDIR`, `COPY`
 arguments, and `CMD`, using the declared `ARG`/`ENV` state, as Docker does.
@@ -349,8 +349,11 @@ Per-instruction inputs:
   `input_digest` is empty.
 - `COPY`: the substituted source patterns and dest, the current `WORKDIR`,
   and `input_digest` = the context content hash of the matched sources:
-  for each matched file in sorted relative-path order,
-  `blake3(rel_path || type || mode || symlink_target || content)`.
+  after sorting by relative path and deduplicating repeated matches, each
+  matched entry contributes length-prefixed fields to one BLAKE3 stream:
+  `u64le(len(path)) || path || u64le(len(type)) || type ||
+  u64le(len(mode)) || mode || u64le(len(payload)) || payload`. The payload is
+  file content, symlink target text, or empty bytes for a directory.
   Ownership is not hashed (COPY forces 0:0). mtimes are not hashed
   (Docker parity).
 - `ENV` / `ARG` / `WORKDIR` / `CMD`: the canonical instruction text after
@@ -627,7 +630,9 @@ single-digit seconds end to end, with the BuildKit tar export removed.
   traversal and absolute sources after substitution).
 - Built-image metadata must not be mistakable for portable OCI provenance:
   `kind: sporevm-built-image-v0`, `layers: []`, and explicit
-  `rootfs_storage` pointing at the final `index_digest`.
+  `rootfs_storage` pointing at the final `index_digest`. This is the local
+  rootfs metadata field name; portable spore manifests continue to use
+  `rootfs.storage`.
 - Machine state and spore format are untouched. No manifest format changes.
 
 ## Delivery Strategy

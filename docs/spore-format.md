@@ -64,7 +64,8 @@ string, and the same canonical config JSON bytes. Each field is framed as an
 unsigned 64-bit little-endian byte length followed by the exact bytes. The
 local resolved ref and metadata path are keyed by that image digest, while the
 metadata's `rootfs_storage` descriptor remains keyed by the raw rootfs index
-digest used to boot the VM.
+digest used to boot the VM. `rootfs_storage` is the local rootfs metadata
+field; portable spore manifests continue to use `rootfs.storage`.
 
 A local single-spore bundle is the first distribution form:
 
