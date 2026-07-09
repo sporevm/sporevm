@@ -705,6 +705,21 @@ Definition of done:
 Ceiling proven: uncached RUN build = one boot + command time + O(dirty)
 snapshots; cached RUN ≈ 0.
 
+Implementation note (2026-07-09, RUN slice): the executor now starts at the
+first uncached `RUN`, opens the parent rootfs through the normal writable
+`ChunkMappedDisk` run path, boots one build VM, and drives each remaining `RUN`
+over `spore_stream_v1` with the step env/workdir applied to `/bin/sh -c`.
+After each successful RUN the guest agent handles `fsfreeze-v1`, the host takes
+a rootfs-only `ChunkMappedDisk` snapshot after the existing virtio-blk
+quiescence check, writes the completeness stamp, writes the
+`sporevm-build-step-v1` record through `step_cache.writeRecord`, then sends
+`fsthaw-v1` before continuing. Failed RUNs report the exit code and captured
+output without writing the failed step record. The slice also fixes
+`spore run --image` for indexed rootfs images so build-published images pass
+`spore_rootfs=1` even when there is no flat rootfs path. COPY cache misses
+still fail closed; COPY application, disk headroom/resize smoke coverage, and
+the broader VM-dependent acceptance matrix remain for the next executor slice.
+
 ### M3 — COPY execution
 
 Tar assembly with forced 0:0 ownership, driver-side extraction with merge

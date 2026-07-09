@@ -15,15 +15,15 @@ pub const usage =
     \\  --build-context NAME=oci-layout://PATH
     \\                                  Named OCI layout base available to FROM NAME
     \\  --build-arg KEY=VALUE          Build argument value
-    \\  --network spore|none           Network mode recorded for the future executor
-    \\  --no-cache                     Require executor work; M1 fails closed on cache miss
+    \\  --network spore|none           Network mode for build RUN execution
+    \\  --no-cache                     Require executor work instead of step-cache hits
     \\  --mkfs PATH                    mkfs helper for OCI layout imports
     \\  --debugfs PATH                 debugfs helper for OCI layout imports
     \\  --disk-headroom BYTES          Accepted for CLI stability; executor sizing lands in M2
     \\  -h, --help                     Show this help
     \\
-    \\M1 only resolves fully cached Dockerfile builds. Cache misses require the
-    \\build executor milestone.
+    \\The M2 RUN slice executes RUN cache misses. COPY cache misses still fail
+    \\closed until the COPY executor slice lands.
     \\
 ;
 
@@ -81,6 +81,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
         .no_cache = parsed.no_cache,
         .mkfs = parsed.mkfs,
         .debugfs = parsed.debugfs,
+        .output = stdout,
         .diagnostic = &diagnostic,
     }) catch |err| {
         try writeBuildError(stderr, err, diagnostic);
@@ -238,7 +239,48 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
             }
         },
         error.CacheMissRequiresBuildExecutor => {
-            try stderr.writeAll("spore build: cache miss requires the build executor; M1 only supports fully cached builds\n");
+            try stderr.writeAll("spore build: cache miss requires an executor path that is not implemented yet\n");
+        },
+        error.BuildCopyExecutorPending => {
+            try stderr.writeAll("spore build: COPY cache miss requires the M2 COPY executor slice; cached COPY steps before the first RUN miss are still supported\n");
+        },
+        error.BuildRunFailed => {
+            if (diagnostic.executor.exit_code) |code| {
+                try stderr.print("spore build: RUN failed with exit code {d}\n", .{code});
+            } else {
+                try stderr.writeAll("spore build: RUN failed\n");
+            }
+            if (diagnostic.executor.output.len != 0) {
+                try stderr.writeAll(diagnostic.executor.output);
+                if (!std.mem.endsWith(u8, diagnostic.executor.output, "\n")) try stderr.writeAll("\n");
+            }
+        },
+        error.BuildGuestFreezeFailed => {
+            try stderr.writeAll("spore build: guest fsfreeze failed before recording a step cache entry\n");
+        },
+        error.BuildGuestThawFailed => {
+            try stderr.writeAll("spore build: guest fsthaw failed after the step snapshot was recorded\n");
+        },
+        error.BuildGuestProtocolFailed => {
+            try stderr.writeAll("spore build: guest executor protocol failed\n");
+        },
+        error.BuildGuestTimedOut => {
+            try stderr.writeAll("spore build: guest executor step timed out\n");
+        },
+        error.RunEnvCountUnsupported => {
+            try stderr.writeAll("spore build: RUN environment has too many entries for the guest executor\n");
+        },
+        error.RunEnvTooLong => {
+            try stderr.writeAll("spore build: RUN environment entry is too long for the guest executor\n");
+        },
+        error.RunRequestTooLarge => {
+            try stderr.writeAll("spore build: RUN request is too large for the guest executor\n");
+        },
+        error.RunCommandTooLong => {
+            try stderr.writeAll("spore build: RUN shell command is too long for the guest executor\n");
+        },
+        error.RunWorkingDirUnsupported => {
+            try stderr.writeAll("spore build: WORKDIR is too long for the guest executor\n");
         },
         error.UnsupportedBuildFrom => {
             try stderr.writeAll("spore build: FROM must be a local image ref or a named --build-context OCI layout in M1\n");

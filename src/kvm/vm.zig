@@ -543,6 +543,10 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     if (!request.continue_after) return .snapshotted;
                     try control.completeSnapshot(request.dir);
                 },
+                .rootfs_snapshot => |request| {
+                    const disk_manifest = try takeRootfsSnapshot(allocator, request.dir, transports, config.disk_snapshot);
+                    try control.completeRootfsSnapshot(disk_manifest);
+                },
             }
             try flushVsockRxKvm(vm_fd, &vsock_dev, &transports_buf[vsock_transport_index], ram, vsock_transport_index);
         }
@@ -994,6 +998,22 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
                     state.finish(.{ .snapshot = request.dir });
                     continue;
                 },
+                .rootfs_snapshot => |request| {
+                    const disk_manifest = takeRootfsSnapshotMulti(
+                        allocator,
+                        options,
+                        &state,
+                        request.dir,
+                    ) catch |err| {
+                        state.finish(.{ .err = err });
+                        continue;
+                    };
+                    control.completeRootfsSnapshot(disk_manifest) catch |err| {
+                        state.finish(.{ .err = err });
+                        continue;
+                    };
+                    continue;
+                },
             }
         }
         if (options.config.exec_probe) |probe| {
@@ -1063,6 +1083,19 @@ fn snapshotMultiKvmAndContinue(
         options.environ_map,
     );
     state.clearSnapshot();
+}
+
+fn takeRootfsSnapshotMulti(
+    allocator: std.mem.Allocator,
+    options: MultiKvmRunOptions,
+    state: *MultiKvmRunState,
+    dir: []const u8,
+) !?spore.Disk {
+    try pauseKvmVcpusForSnapshot(options.vcpus, state, options.wake_set);
+    errdefer state.clearSnapshot();
+    const disk_manifest = try takeRootfsSnapshot(allocator, dir, options.transports, options.disk_snapshot);
+    state.clearSnapshot();
+    return disk_manifest;
 }
 
 fn finishMultiKvmResult(result: MultiKvmResult) !ExitCause {
@@ -1631,6 +1664,25 @@ fn monitorStatsFromDirtyTracker(tracker: ?*DirtyTracker) vsock.ControlStats {
         .chunks_nonzero = @intCast(active.sealer.nonzeroChunkCount()),
         .dirty_chunks_pending = @intCast(active.sealer.dirtyChunksPending()),
     };
+}
+
+fn takeRootfsSnapshot(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    transports: []mmio.Transport,
+    disk_snapshot: ?disk_layer.SnapshotState,
+) !?spore.Disk {
+    const disk_state = disk_snapshot orelse return error.BadManifest;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const devices = try captureTransports(arena, transports);
+    if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
+        std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
+        return error.DeviceStatePending;
+    }
+    return try disk_state.finish(allocator, dir, true);
 }
 
 fn takeSnapshot(

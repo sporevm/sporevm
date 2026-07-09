@@ -11,6 +11,7 @@ const std = @import("std");
 const guestmem = @import("../guestmem.zig");
 const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
+const spore = @import("../spore.zig");
 const spore_stream = @import("../spore_stream.zig");
 
 pub const device_id: u32 = 19;
@@ -610,11 +611,16 @@ pub const ControlAction = union(enum) {
     keep_running,
     stop,
     snapshot: SnapshotAction,
+    rootfs_snapshot: RootfsSnapshotAction,
 };
 
 pub const SnapshotAction = struct {
     dir: []const u8,
     continue_after: bool = false,
+};
+
+pub const RootfsSnapshotAction = struct {
+    dir: []const u8,
 };
 
 pub const ControlStats = struct {
@@ -636,6 +642,7 @@ pub const Control = struct {
     pollFn: *const fn (context: *anyopaque, dev: *Vsock) anyerror!ControlAction,
     setWakeFn: *const fn (context: *anyopaque, wake: Wake) void,
     completeSnapshotFn: *const fn (context: *anyopaque, dir: []const u8) anyerror!void,
+    completeRootfsSnapshotFn: *const fn (context: *anyopaque, disk: ?spore.Disk) anyerror!void,
     reportStatsFn: *const fn (context: *anyopaque, stats: ControlStats) void,
 
     pub fn poll(self: Control, dev: *Vsock) !ControlAction {
@@ -648,6 +655,10 @@ pub const Control = struct {
 
     pub fn completeSnapshot(self: Control, dir: []const u8) !void {
         try self.completeSnapshotFn(self.context, dir);
+    }
+
+    pub fn completeRootfsSnapshot(self: Control, disk: ?spore.Disk) !void {
+        try self.completeRootfsSnapshotFn(self.context, disk);
     }
 
     pub fn reportStats(self: Control, stats: ControlStats) void {

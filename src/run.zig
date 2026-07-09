@@ -2647,7 +2647,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     });
     const disk_ms = monotonicMs() -| disk_start;
     defer runtime_disk.deinit();
-    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, rootfsWritable(opts), opts.network);
+    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), opts.network);
     const request_start = monotonicMs();
     const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
     var stream = try vsock.HostStream.initWithProtocol(opts.guest_port, request.bytes, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
@@ -2868,8 +2868,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
         .spore_dir = opts.resume_dir,
     });
     defer runtime_disk.deinit();
-    const has_rootfs = opts.rootfs_path != null or opts.rootfs != null;
-    const boot_args = try cmdline(allocator, opts.guest_port, has_rootfs, rootfsWritable(opts), opts.network);
+    const boot_args = try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), opts.network);
 
     const cause = switch (backend) {
         .auto => unreachable,
@@ -3225,6 +3224,10 @@ pub fn generationRequest(allocator: std.mem.Allocator, params_json: []const u8) 
 fn rootfsWritable(opts: Options) bool {
     // Manifest-bound rootfs runs get a COW head; plain --rootfs stays local/read-only.
     return opts.rootfs != null or opts.disk != null;
+}
+
+fn hasRootfs(opts: Options) bool {
+    return opts.rootfs_path != null or opts.rootfs != null;
 }
 
 pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, network: NetworkMode) ![]const u8 {
@@ -4760,6 +4763,31 @@ test "run rootfs path stays read-only without manifest rootfs metadata" {
     try std.testing.expect(!rootfsWritable(.{
         .kernel_path = "",
         .rootfs_path = "rootfs.ext4",
+        .command = &.{"/bin/true"},
+    }));
+}
+
+test "indexed rootfs input enables rootfs boot mode" {
+    try std.testing.expect(hasRootfs(.{
+        .kernel_path = "",
+        .rootfs = .{
+            .device = .{ .mmio_slot = 1 },
+            .artifact = .{
+                .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                .size = 4096,
+                .format = spore.rootfs_artifact_format_ext4,
+            },
+            .storage = .{
+                .kind = spore.rootfs_storage_kind_chunked_ext4,
+                .device = .{ .mmio_slot = 1 },
+                .logical_size = 4096,
+                .chunk_size = 4096,
+                .hash_algorithm = "blake3",
+                .index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                .base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                .object_namespace = "rootfs/blake3",
+            },
+        },
         .command = &.{"/bin/true"},
     }));
 }

@@ -3,6 +3,7 @@ const Io = std.Io;
 
 const dockerfile = @import("build/dockerfile.zig");
 const build_context = @import("build/context.zig");
+const build_exec = @import("build/exec.zig");
 const step_cache = @import("build/step_cache.zig");
 const local_paths = @import("local_paths.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -35,12 +36,14 @@ pub const Options = struct {
     no_cache: bool = false,
     mkfs: ?[]const u8 = null,
     debugfs: ?[]const u8 = null,
+    output: ?*Io.Writer = null,
     diagnostic: ?*Diagnostic = null,
 };
 
 pub const Diagnostic = struct {
     dockerfile: dockerfile.Diagnostic = .{},
     dockerignore: build_context.IgnoreDiagnostic = .{},
+    executor: build_exec.Diagnostic = .{},
 };
 
 pub const Result = struct {
@@ -90,7 +93,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
     var pre_from_args = std.array_list.Managed(ArgValue).init(allocator);
     var saw_from = false;
     var any_exec_step = false;
-    for (doc.instructions) |instruction| {
+    instructions: for (doc.instructions, 0..) |instruction, index| {
         switch (instruction.value) {
             .arg => |arg| {
                 if (!saw_from) {
@@ -129,13 +132,22 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                         },
                         .run => {
                             any_exec_step = true;
-                            s.storage = try cachedExecStep(init, allocator, options, s.*, instruction, "");
+                            s.storage = cachedExecStep(init, allocator, options, s.*, instruction, "") catch |err| switch (err) {
+                                error.CacheMissRequiresBuildExecutor => {
+                                    state = try executeFromMiss(init, allocator, options, diagnostic, pre_from_args.items, doc.instructions[index..], s.*);
+                                    break :instructions;
+                                },
+                                else => |e| return e,
+                            };
                         },
                         .copy => |copy| {
                             any_exec_step = true;
                             const resolved_sources = try substituteList(allocator, copy.sources, s.args.items, s.env.items);
                             const input_digest = try build_context.hashCopySources(allocator, init.io, ctx, resolved_sources);
-                            s.storage = try cachedExecStep(init, allocator, options, s.*, instruction, input_digest);
+                            s.storage = cachedExecStep(init, allocator, options, s.*, instruction, input_digest) catch |err| switch (err) {
+                                error.CacheMissRequiresBuildExecutor => return error.BuildCopyExecutorPending,
+                                else => |e| return e,
+                            };
                         },
                         else => unreachable,
                     }
@@ -245,6 +257,62 @@ fn cachedExecStep(
     }, key)) orelse error.CacheMissRequiresBuildExecutor;
 }
 
+fn executeFromMiss(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: Options,
+    diagnostic: *Diagnostic,
+    pre_from_args: []const ArgValue,
+    instructions: []const dockerfile.Instruction,
+    initial_state: State,
+) !State {
+    var state = initial_state;
+    var steps = std.array_list.Managed(build_exec.RunStep).init(allocator);
+    for (instructions) |instruction| {
+        switch (instruction.value) {
+            .env => |env| {
+                for (env.pairs) |pair| {
+                    const key = try substitute(allocator, pair.key, state.args.items, state.env.items);
+                    const value = try substitute(allocator, pair.value, state.args.items, state.env.items);
+                    try putEnv(allocator, &state.env, key, value);
+                }
+            },
+            .workdir => |raw| {
+                const substituted = try substitute(allocator, raw, state.args.items, state.env.items);
+                state.workdir = try resolveWorkdir(allocator, state.workdir, substituted);
+            },
+            .cmd => |cmd| {
+                state.cmd = try resolveCmd(allocator, cmd, state.args.items, state.env.items);
+            },
+            .run => |run| {
+                const command = try substitute(allocator, run.shell, state.args.items, state.env.items);
+                const env_digest = try effectiveEnvDigest(allocator, state);
+                try steps.append(.{
+                    .canonical_instruction = instruction.raw,
+                    .command = command,
+                    .env = try runEnvironment(allocator, state),
+                    .env_digest = env_digest,
+                    .workdir = state.workdir,
+                });
+            },
+            .copy => return error.BuildCopyExecutorPending,
+            .from => return error.UnsupportedMultiStageDockerfile,
+            .arg => |arg| try declareArg(allocator, options.build_args, pre_from_args, &state.args, arg),
+        }
+    }
+
+    state.storage = try build_exec.runSession(init, allocator, .{
+        .platform = options.platform,
+        .cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map),
+        .base_storage = state.storage,
+        .steps = steps.items,
+        .network_enabled = options.network == .spore,
+        .output = options.output,
+        .diagnostic = &diagnostic.executor,
+    });
+    return state;
+}
+
 fn execStepKey(allocator: std.mem.Allocator, options: Options, state: State, instruction: dockerfile.Instruction, input_digest: []const u8) ![]const u8 {
     const env_digest = try effectiveEnvDigest(allocator, state);
     return step_cache.stepKey(allocator, .{
@@ -265,6 +333,26 @@ fn effectiveEnvDigest(allocator: std.mem.Allocator, state: State) ![]const u8 {
         try arg_entries.append(try std.fmt.allocPrint(allocator, "{s}={s}", .{ arg.key, value }));
     }
     return step_cache.envDigest(allocator, state.env.items, arg_entries.items);
+}
+
+fn runEnvironment(allocator: std.mem.Allocator, state: State) ![]const []const u8 {
+    var entries = std.array_list.Managed([]const u8).init(allocator);
+    for (state.env.items) |entry| try entries.append(entry);
+    for (state.args.items) |arg| {
+        const value = arg.value orelse continue;
+        if (envContainsKey(state.env.items, arg.key)) continue;
+        try entries.append(try std.fmt.allocPrint(allocator, "{s}={s}", .{ arg.key, value }));
+    }
+    return entries.toOwnedSlice();
+}
+
+fn envContainsKey(env: []const []const u8, key: []const u8) bool {
+    for (env) |entry| {
+        if (std.mem.indexOfScalar(u8, entry, '=')) |eq| {
+            if (std.mem.eql(u8, entry[0..eq], key)) return true;
+        }
+    }
+    return false;
 }
 
 fn imageConfig(
@@ -445,6 +533,37 @@ test "variable substitution uses env before args" {
     const arena = arena_state.allocator();
     const got = try substitute(arena, "${APP}/$MODE", &.{.{ .key = "MODE", .value = "arg" }}, &.{"APP=/srv"});
     try std.testing.expectEqualStrings("/srv/arg", got);
+}
+
+test "run environment includes declared args after env" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var env = std.array_list.Managed([]const u8).init(arena);
+    try env.append("MODE=env");
+    try env.append("APP=/srv/app");
+    var args = std.array_list.Managed(ArgValue).init(arena);
+    try args.append(.{ .key = "MODE", .value = "arg" });
+    try args.append(.{ .key = "TARGET", .value = "prod" });
+    try args.append(.{ .key = "UNSET", .value = null });
+    const entries = try runEnvironment(arena, .{
+        .storage = .{
+            .kind = spore.rootfs_storage_kind_chunked_ext4,
+            .device = .{ .mmio_slot = 1 },
+            .logical_size = 4096,
+            .chunk_size = 4096,
+            .hash_algorithm = "blake3",
+            .index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .object_namespace = "rootfs/blake3",
+        },
+        .env = env,
+        .args = args,
+    });
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqualStrings("MODE=env", entries[0]);
+    try std.testing.expectEqualStrings("APP=/srv/app", entries[1]);
+    try std.testing.expectEqualStrings("TARGET=prod", entries[2]);
 }
 
 test "fully cached build publishes final indexed image" {
