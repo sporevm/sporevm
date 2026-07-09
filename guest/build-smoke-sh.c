@@ -77,6 +77,12 @@ static int owner_is_root(const char *path) {
   return st.st_uid == 0 && st.st_gid == 0;
 }
 
+static int file_size_is(const char *path, off_t expected) {
+  struct stat st;
+  if (stat(path, &st) != 0) return 0;
+  return S_ISREG(st.st_mode) && st.st_size == expected;
+}
+
 static int symlink_target_is(const char *path, const char *expected) {
   struct stat st;
   if (lstat(path, &st) != 0 || !S_ISLNK(st.st_mode)) return 0;
@@ -205,6 +211,18 @@ static int setup_symlink_targets(void) {
   return 0;
 }
 
+static int verify_large_copy(void) {
+  const off_t size = (off_t)805306368LL;
+  if (!file_size_is("/opt/deps/one.bin", size) ||
+      !file_size_is("/opt/deps/two.bin", size) ||
+      !file_size_is("/opt/deps/three.bin", size)) {
+    write_str(2, "build-smoke-sh: bad large COPY file sizes\n");
+    return 6;
+  }
+  write_str(1, "verify-large-copy\n");
+  return write_file("/verified-large-copy", "ok\n");
+}
+
 int main(int argc, char **argv) {
   if (argc != 3 || strcmp(argv[1], "-c") != 0) {
     write_str(2, "build-smoke-sh: expected -c command\n");
@@ -225,6 +243,9 @@ int main(int argc, char **argv) {
   }
   if (strcmp(cmd, "verify-copy") == 0) {
     return verify_copy();
+  }
+  if (strcmp(cmd, "verify-large-copy") == 0) {
+    return verify_large_copy();
   }
   if (strcmp(cmd, "step2") == 0) {
     if (!file_exists("/step1")) {

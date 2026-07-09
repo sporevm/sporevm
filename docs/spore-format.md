@@ -210,6 +210,10 @@ under `rootfs.cache`.
 - `devices`: ordered virtio-mmio transport states (device id, status,
   feature negotiation registers, interrupt status, and per-queue size/ready/
   ring addresses/indices). Device order is part of the board contract.
+  Builder-only attachments, such as the read-only context disk used by
+  `spore build` COPY execution, reuse the existing virtio-blk device type as
+  additional transient virtio-mmio instances and are not serialized into the
+  manifest.
 - `generation`: non-virtio generation MMIO device state — `generation`
   counter, `interrupt_status`, and `params_b64` (base64-encoded
   resume-parameter bytes with trailing zeroes elided). `spore fork` increments

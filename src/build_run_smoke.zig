@@ -19,10 +19,12 @@ const Io = std.Io;
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    if (args.len != 2) {
-        std.debug.print("usage: build-run-smoke <aarch64-linux-sh-helper>\n", .{});
+    if (args.len < 2 or args.len > 3) {
+        std.debug.print("usage: build-run-smoke <aarch64-linux-sh-helper> [--large-copy]\n", .{});
         return error.InvalidArguments;
     }
+    const large_copy = args.len == 3 and std.mem.eql(u8, args[2], "--large-copy");
+    if (args.len == 3 and !large_copy) return error.InvalidArguments;
 
     const tmp = "zig-cache/spore-build-run-smoke";
     const context_dir = tmp ++ "/context";
@@ -53,8 +55,9 @@ pub fn main(init: std.process.Init) !void {
         .{ .path = "sys", .kind = .directory, .mode = 0o755 },
         .{ .path = "tmp", .kind = .directory, .mode = 0o1777 },
     };
+    const base_image_size: u64 = if (large_copy) 6 * 1024 * 1024 * 1024 else 16 << 20;
     const emitted = try ext4_writer.emit(allocator, io, rootfs_path, &entries, .{
-        .image_size = 16 << 20,
+        .image_size = base_image_size,
         .inode_count = 1024,
         .determinism = ext4.Determinism.fromDigest("sha256:spore-build-run-smoke-base"),
         .cas_cache_root = cache_root,
@@ -70,6 +73,11 @@ pub fn main(init: std.process.Init) !void {
         .rootfs_storage = base_storage,
     });
 
+    if (large_copy) {
+        try runLargeCopySmoke(init, allocator, io, context_dir, dockerfile_path);
+        return;
+    }
+
     try writeDockerfile(io, dockerfile_path, "step2");
     var first_diag: build_mod.Diagnostic = .{};
     const first = try build_mod.build(init, allocator, .{
@@ -83,6 +91,8 @@ pub fn main(init: std.process.Init) !void {
     if (first_diag.executor.boot_count != 1) return error.ExpectedOneBuildVmBoot;
     if (first_diag.executor.executed_steps != 13) return error.ExpectedThirteenBuildSteps;
     if (first.cache_hit) return error.ExpectedFirstBuildCacheMiss;
+    if (!first_diag.context_disk.emitted) return error.ExpectedFirstContextDiskEmit;
+    if (first_diag.context_disk.reused) return error.ExpectedFirstContextDiskNotReused;
 
     var cached_diag: build_mod.Diagnostic = .{};
     const cached = try build_mod.build(init, allocator, .{
@@ -112,6 +122,8 @@ pub fn main(init: std.process.Init) !void {
     if (override_diag.executor.executed_steps != 13) return error.ExpectedOverrideBuildThirteenSteps;
     if (override.cache_hit) return error.ExpectedOverrideBuildCacheMiss;
     if (std.mem.eql(u8, first.index_digest, override.index_digest)) return error.ExpectedOverrideRootfsIdentity;
+    if (!override_diag.context_disk.reused) return error.ExpectedOverrideContextDiskReuse;
+    if (!std.mem.eql(u8, first_diag.context_disk.digest, override_diag.context_disk.digest)) return error.ExpectedOverrideContextDiskIdentity;
 
     var default_after_override_diag: build_mod.Diagnostic = .{};
     const default_after_override = try build_mod.build(init, allocator, .{
@@ -147,11 +159,70 @@ pub fn main(init: std.process.Init) !void {
     if (edited_diag.executor.executed_steps != 4) return error.ExpectedEditedBuildFourSteps;
     if (edited.cache_hit) return error.ExpectedEditedBuildCacheMiss;
     if (std.mem.eql(u8, first.index_digest, edited.index_digest)) return error.ExpectedEditedRootfsIdentity;
+    if (!edited_diag.context_disk.emitted) return error.ExpectedEditedContextDiskEmit;
+    if (std.mem.eql(u8, first_diag.context_disk.digest, edited_diag.context_disk.digest)) return error.ExpectedEditedContextDiskIdentity;
 
     std.debug.print(
-        "spore-build-run-smoke ok: first={s} cached={s} override={s} default-after-override={s} edited={s}\n",
-        .{ first.index_digest, cached.index_digest, override.index_digest, default_after_override.index_digest, edited.index_digest },
+        "spore-build-run-smoke ok: first={s} cached={s} override={s} default-after-override={s} edited={s} context-disk-first=emitted:{d}ms context-disk-override=reused:{d}ms context-disk-edited=emitted:{d}ms\n",
+        .{
+            first.index_digest,
+            cached.index_digest,
+            override.index_digest,
+            default_after_override.index_digest,
+            edited.index_digest,
+            nsToMs(first_diag.context_disk.emit_ns),
+            nsToMs(override_diag.context_disk.emit_ns),
+            nsToMs(edited_diag.context_disk.emit_ns),
+        },
     );
+}
+
+fn runLargeCopySmoke(init: std.process.Init, allocator: std.mem.Allocator, io: Io, context_dir: []const u8, dockerfile_path: []const u8) !void {
+    try writeLargeCopyContext(allocator, io, context_dir);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-base:dev
+        \\COPY deps /opt/deps/
+        \\RUN verify-large-copy
+        \\
+        ,
+    });
+
+    var diagnostic: build_mod.Diagnostic = .{};
+    const result = build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-large-copy:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &diagnostic,
+    }) catch |err| {
+        std.debug.print(
+            "large COPY build failed: err={s} line={d} instruction={?s} exit={?d} output={s}\n",
+            .{ @errorName(err), diagnostic.executor.instruction_line, diagnostic.executor.instruction, diagnostic.executor.exit_code, diagnostic.executor.output },
+        );
+        return err;
+    };
+    if (diagnostic.executor.boot_count != 1) return error.ExpectedLargeCopyBuildVmBoot;
+    if (diagnostic.executor.executed_steps != 2) return error.ExpectedLargeCopyTwoSteps;
+    if (result.cache_hit) return error.ExpectedLargeCopyCacheMiss;
+    if (!diagnostic.context_disk.emitted and !diagnostic.context_disk.reused) return error.ExpectedLargeCopyContextDisk;
+    std.debug.print(
+        "spore-build-large-copy-smoke ok: {s} context-disk={s} entries={d} bytes={d} image={d} emit={d}ms\n",
+        .{
+            result.index_digest,
+            if (diagnostic.context_disk.emitted) "emitted" else "reused",
+            diagnostic.context_disk.entries,
+            diagnostic.context_disk.bytes,
+            diagnostic.context_disk.image_size,
+            nsToMs(diagnostic.context_disk.emit_ns),
+        },
+    );
+}
+
+fn nsToMs(ns: u64) u64 {
+    return ns / std.time.ns_per_ms;
 }
 
 fn writeDockerfile(io: Io, path: []const u8, second_step: []const u8) !void {
@@ -244,4 +315,27 @@ fn writeSmokeContext(allocator: std.mem.Allocator, io: Io, context_dir: []const 
     if (std.c.chmod(through_file, 0o600) != 0) return error.IoFailed;
     Io.Dir.cwd().deleteFile(io, app_link) catch {};
     try Io.Dir.cwd().symLink(io, "a.txt", app_link, .{});
+}
+
+fn writeLargeCopyContext(allocator: std.mem.Allocator, io: Io, context_dir: []const u8) !void {
+    Io.Dir.cwd().deleteTree(io, context_dir) catch {};
+    const deps_dir = try std.fs.path.join(allocator, &.{ context_dir, "deps" });
+    defer allocator.free(deps_dir);
+    const dockerfile_path = try std.fs.path.join(allocator, &.{ context_dir, "Dockerfile" });
+    defer allocator.free(dockerfile_path);
+    try Io.Dir.cwd().createDirPath(io, deps_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dockerfile_path, .data = "" });
+    const size = 768 * 1024 * 1024;
+    inline for (&.{ "one.bin", "two.bin", "three.bin" }) |name| {
+        const path = try std.fs.path.joinZ(allocator, &.{ context_dir, "deps", name });
+        defer allocator.free(path);
+        try createSparseFile(path, size);
+    }
+}
+
+fn createSparseFile(path: [:0]const u8, size: u64) !void {
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, @as(c_uint, 0o644));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    if (std.c.ftruncate(fd, @intCast(size)) != 0) return error.IoFailed;
 }

@@ -286,6 +286,17 @@ pub fn build(b: *std.Build) void {
 
         const build_run_smoke_step = b.step("spore-build-run-smoke", "Run the VM-backed spore build RUN executor smoke test");
         build_run_smoke_step.dependOn(&run_build_smoke.step);
+
+        const run_large_copy_smoke = b.addSystemCommand(&.{
+            b.getInstallPath(.bin, "spore-build-run-smoke"),
+            b.getInstallPath(.bin, "spore-build-smoke-sh"),
+            "--large-copy",
+        });
+        run_large_copy_smoke.step.dependOn(build_run_smoke_ready);
+        run_large_copy_smoke.step.dependOn(&install_build_smoke_shell.step);
+
+        const build_large_copy_smoke_step = b.step("spore-build-large-copy-smoke", "Run the VM-backed multi-GiB spore build COPY smoke test");
+        build_large_copy_smoke_step.dependOn(&run_large_copy_smoke.step);
     }
 
     // Hypervisor.framework smoke test: host-only, needs entitlement signing.
