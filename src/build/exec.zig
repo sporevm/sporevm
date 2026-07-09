@@ -11,6 +11,9 @@ const vsock = @import("../virtio/vsock.zig");
 const guest_port: u32 = 10700;
 const step_timeout_ms: u64 = 30 * 60 * 1000;
 const max_captured_output = 64 * 1024;
+// Provisional build-VM default; make this a `spore build` option when larger
+// workloads such as `bundle install`-style RUN steps need more memory.
+const build_vm_memory_bytes: u64 = 2 * 1024 * 1024 * 1024;
 const max_guest_request_len = 8191;
 const max_guest_arg_len = 255;
 const max_guest_envc = 64;
@@ -61,6 +64,12 @@ const ActiveStream = enum {
     thaw,
 };
 
+/// Runs all uncached RUN steps in one build VM session.
+///
+/// Allocation ownership follows the build path's arena-per-invocation contract:
+/// session ids, request buffers, step keys, storage clones, and current_storage
+/// replacements live until the caller resets its arena. Do not call this with a
+/// long-lived general-purpose allocator.
 pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !spore.RootfsStorage {
     if (options.steps.len == 0) return spore.cloneRootfsStorage(allocator, options.base_storage);
     if (options.diagnostic) |diag| diag.* = .{};
@@ -76,7 +85,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         .initrd_path = initrd_path,
         .rootfs = rootfs,
         .command = &.{},
-        .memory = .{ .policy = .explicit, .bytes = 2 * 1024 * 1024 * 1024 },
+        .memory = .{ .policy = .explicit, .bytes = build_vm_memory_bytes },
         .network = if (options.network_enabled) .spore else .disabled,
         .timeout_ms = step_timeout_ms,
     }, control.control());
@@ -100,6 +109,9 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     return try spore.cloneRootfsStorage(allocator, control.current_storage);
 }
 
+/// Session state is arena-owned; see `runSession` for the allocator lifetime
+/// contract. Fields that are replaced during checkpointing are intentionally not
+/// individually freed.
 const BuildControl = struct {
     io: Io,
     allocator: std.mem.Allocator,
@@ -117,7 +129,6 @@ const BuildControl = struct {
     active_input: ?step_cache.StepInput = null,
     active_step_key: []const u8 = "",
     capture: std.array_list.Managed(u8),
-    output_failed: bool = false,
     executed_steps: usize = 0,
     failed_instruction: ?[]const u8 = null,
     failed_exit_code: ?i32 = null,
@@ -305,12 +316,8 @@ const BuildControl = struct {
 
     fn appendOutput(self: *BuildControl, bytes: []const u8) void {
         if (self.output) |writer| {
-            writer.writeAll(bytes) catch {
-                self.output_failed = true;
-            };
-            writer.flush() catch {
-                self.output_failed = true;
-            };
+            writer.writeAll(bytes) catch {};
+            writer.flush() catch {};
         }
         const remaining = max_captured_output -| self.capture.items.len;
         const take = @min(remaining, bytes.len);

@@ -729,6 +729,9 @@ record. The slice also fixes
 `spore_rootfs=1` even when there is no flat rootfs path. COPY cache misses
 still fail closed; COPY application, disk headroom/resize smoke coverage, and
 the broader VM-dependent acceptance matrix remain for the next executor slice.
+The build VM memory is currently a provisional 2 GiB default; promote it to a
+`spore build` option when real workloads such as large `bundle install`-style
+RUN steps need more headroom.
 
 ### M3 — COPY execution
 

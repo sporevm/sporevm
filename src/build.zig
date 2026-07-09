@@ -101,7 +101,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                     continue;
                 }
                 if (state) |*s| {
-                    try declareArg(allocator, options.build_args, pre_from_args.items, &s.args, arg);
+                    if (!try applyMetadataInstruction(allocator, options, pre_from_args.items, s, instruction)) unreachable;
                 } else unreachable;
             },
             .from => |from| {
@@ -115,21 +115,8 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
             else => {
                 if (!saw_from) return error.MissingDockerfileFrom;
                 if (state) |*s| {
+                    if (try applyMetadataInstruction(allocator, options, pre_from_args.items, s, instruction)) continue;
                     switch (instruction.value) {
-                        .env => |env| {
-                            for (env.pairs) |pair| {
-                                const key = try substitute(allocator, pair.key, s.args.items, s.env.items);
-                                const value = try substitute(allocator, pair.value, s.args.items, s.env.items);
-                                try putEnv(allocator, &s.env, key, value);
-                            }
-                        },
-                        .workdir => |raw| {
-                            const substituted = try substitute(allocator, raw, s.args.items, s.env.items);
-                            s.workdir = try resolveWorkdir(allocator, s.workdir, substituted);
-                        },
-                        .cmd => |cmd| {
-                            s.cmd = try resolveCmd(allocator, cmd, s.args.items, s.env.items);
-                        },
                         .run => {
                             any_exec_step = true;
                             s.storage = cachedExecStep(init, allocator, options, s.*, instruction, "") catch |err| switch (err) {
@@ -216,6 +203,34 @@ fn stateFromBase(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig, s
     return .{ .storage = try spore.cloneRootfsStorage(allocator, storage), .env = env, .args = args };
 }
 
+fn applyMetadataInstruction(
+    allocator: std.mem.Allocator,
+    options: Options,
+    pre_from_args: []const ArgValue,
+    state: *State,
+    instruction: dockerfile.Instruction,
+) !bool {
+    switch (instruction.value) {
+        .env => |env| {
+            for (env.pairs) |pair| {
+                const key = try substitute(allocator, pair.key, state.args.items, state.env.items);
+                const value = try substitute(allocator, pair.value, state.args.items, state.env.items);
+                try putEnv(allocator, &state.env, key, value);
+            }
+        },
+        .workdir => |raw| {
+            const substituted = try substitute(allocator, raw, state.args.items, state.env.items);
+            state.workdir = try resolveWorkdir(allocator, state.workdir, substituted);
+        },
+        .cmd => |cmd| {
+            state.cmd = try resolveCmd(allocator, cmd, state.args.items, state.env.items);
+        },
+        .arg => |arg| try declareArg(allocator, options.build_args, pre_from_args, &state.args, arg),
+        else => return false,
+    }
+    return true;
+}
+
 fn declareArg(
     allocator: std.mem.Allocator,
     cli_args: []const BuildArg,
@@ -269,21 +284,8 @@ fn executeFromMiss(
     var state = initial_state;
     var steps = std.array_list.Managed(build_exec.RunStep).init(allocator);
     for (instructions) |instruction| {
+        if (try applyMetadataInstruction(allocator, options, pre_from_args, &state, instruction)) continue;
         switch (instruction.value) {
-            .env => |env| {
-                for (env.pairs) |pair| {
-                    const key = try substitute(allocator, pair.key, state.args.items, state.env.items);
-                    const value = try substitute(allocator, pair.value, state.args.items, state.env.items);
-                    try putEnv(allocator, &state.env, key, value);
-                }
-            },
-            .workdir => |raw| {
-                const substituted = try substitute(allocator, raw, state.args.items, state.env.items);
-                state.workdir = try resolveWorkdir(allocator, state.workdir, substituted);
-            },
-            .cmd => |cmd| {
-                state.cmd = try resolveCmd(allocator, cmd, state.args.items, state.env.items);
-            },
             .run => |run| {
                 const command = try substitute(allocator, run.shell, state.args.items, state.env.items);
                 const env_digest = try effectiveEnvDigest(allocator, state);
@@ -297,7 +299,7 @@ fn executeFromMiss(
             },
             .copy => return error.BuildCopyExecutorPending,
             .from => return error.UnsupportedMultiStageDockerfile,
-            .arg => |arg| try declareArg(allocator, options.build_args, pre_from_args, &state.args, arg),
+            else => unreachable,
         }
     }
 
