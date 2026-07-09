@@ -245,6 +245,9 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
             try stderr.writeAll("spore build: COPY cache miss requires the M2 COPY executor slice; cached COPY steps before the first RUN miss are still supported\n");
         },
         error.BuildRunFailed => {
+            if (diagnostic.executor.instruction) |instruction| {
+                try stderr.print("spore build: RUN instruction failed: {s}\n", .{instruction});
+            }
             if (diagnostic.executor.exit_code) |code| {
                 try stderr.print("spore build: RUN failed with exit code {d}\n", .{code});
             } else {

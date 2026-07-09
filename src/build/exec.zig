@@ -18,8 +18,11 @@ const max_guest_env_len = 255;
 const max_guest_working_dir_len = 255;
 
 pub const Diagnostic = struct {
+    instruction: ?[]const u8 = null,
     exit_code: ?i32 = null,
     output: []const u8 = "",
+    boot_count: usize = 0,
+    executed_steps: usize = 0,
 };
 
 pub const RunStep = struct {
@@ -80,13 +83,20 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
 
     if (control.failed_exit_code) |exit_code| {
         if (options.diagnostic) |diag| {
+            diag.instruction = control.failed_instruction;
             diag.exit_code = exit_code;
             diag.output = try control.capture.toOwnedSlice();
+            diag.boot_count = 1;
+            diag.executed_steps = control.executed_steps;
         }
         return error.BuildRunFailed;
     }
     if (control.failure) |err| return err;
     if (control.phase != .done) return error.BuildGuestProtocolFailed;
+    if (options.diagnostic) |diag| {
+        diag.boot_count = 1;
+        diag.executed_steps = control.executed_steps;
+    }
     return try spore.cloneRootfsStorage(allocator, control.current_storage);
 }
 
@@ -108,6 +118,8 @@ const BuildControl = struct {
     active_step_key: []const u8 = "",
     capture: std.array_list.Managed(u8),
     output_failed: bool = false,
+    executed_steps: usize = 0,
+    failed_instruction: ?[]const u8 = null,
     failed_exit_code: ?i32 = null,
     failure: ?anyerror = null,
 
@@ -164,6 +176,7 @@ const BuildControl = struct {
 
     fn startRun(self: *BuildControl, dev: *vsock.Vsock) !void {
         const step = self.steps[self.step_index];
+        self.executed_steps += 1;
         const input = step_cache.StepInput{
             .platform = self.platform,
             .parent_index_digest = self.current_storage.index_digest,
@@ -241,6 +254,7 @@ const BuildControl = struct {
         switch (self.active_stream) {
             .run => {
                 if (exit_code != 0) {
+                    self.failed_instruction = self.steps[self.step_index].canonical_instruction;
                     self.failed_exit_code = exit_code;
                     self.phase = .failed;
                     return;
@@ -274,6 +288,8 @@ const BuildControl = struct {
         if (self.phase != .snapshot) return;
         const disk = maybe_disk orelse return error.BadManifest;
         const storage = try storageFromDisk(self.allocator, disk);
+        // A zero-dirty RUN can intentionally yield child digest == parent
+        // digest; the step key still proves which instruction/env was run.
         try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, storage.index_digest);
         const input = self.active_input orelse return error.BadManifest;
         _ = try step_cache.writeRecord(self.io, self.allocator, self.cache_root, input, self.active_step_key, storage);

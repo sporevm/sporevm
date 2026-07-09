@@ -12,6 +12,7 @@ pub fn build(b: *std.Build) void {
     const target_is_hvf = target_os == .macos and target_arch == .aarch64;
     const target_is_kvm = target_os == .linux and target_arch == .aarch64;
     const host_is_hvf = builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
+    const host_is_kvm = builtin.os.tag == .linux and builtin.cpu.arch == .aarch64;
     const optimize = b.standardOptimizeOption(.{
         // Shipping builds are ReleaseSafe only; see SECURITY.md.
         .preferred_optimize_mode = .ReleaseSafe,
@@ -225,6 +226,67 @@ pub fn build(b: *std.Build) void {
 
     const rootfs_slow_test_step = b.step("rootfs-slow-test", "Run slow rootfs/ext4 conformance tests");
     rootfs_slow_test_step.dependOn(&run_rootfs_slow_tests.step);
+
+    // VM-backed `spore build` RUN smoke. Kept out of the default test step so
+    // plain `zig build test` remains hermetic.
+    if ((target_is_hvf and host_is_hvf) or (target_is_kvm and host_is_kvm)) {
+        const linux_arm64_musl = b.resolveTargetQuery(.{
+            .cpu_arch = .aarch64,
+            .os_tag = .linux,
+            .abi = .musl,
+        });
+        const build_smoke_shell_mod = b.createModule(.{
+            .target = linux_arm64_musl,
+            .optimize = .ReleaseSmall,
+            .link_libc = true,
+        });
+        build_smoke_shell_mod.addCSourceFile(.{
+            .file = b.path("guest/build-smoke-sh.c"),
+            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+        });
+        const build_smoke_shell = b.addExecutable(.{
+            .name = "spore-build-smoke-sh",
+            .root_module = build_smoke_shell_mod,
+        });
+        const install_build_smoke_shell = b.addInstallArtifact(build_smoke_shell, .{});
+
+        const build_run_smoke_mod = b.createModule(.{
+            .root_source_file = b.path("src/build_run_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "spore_internal", .module = internal_mod },
+            },
+        });
+        if (target_is_hvf) {
+            linkHypervisor(build_run_smoke_mod, macos_framework_path);
+        }
+        const build_run_smoke = b.addExecutable(.{
+            .name = "spore-build-run-smoke",
+            .root_module = build_run_smoke_mod,
+        });
+        const install_build_run_smoke = b.addInstallArtifact(build_run_smoke, .{});
+
+        const build_run_smoke_ready = if (target_is_hvf) blk: {
+            const sign_build_run_smoke = b.addSystemCommand(&.{
+                "codesign",                                      "--sign", "-", "--force", "--entitlements", "spore.entitlements",
+                b.getInstallPath(.bin, "spore-build-run-smoke"),
+            });
+            sign_build_run_smoke.step.dependOn(&install_build_run_smoke.step);
+            break :blk &sign_build_run_smoke.step;
+        } else &install_build_run_smoke.step;
+
+        const run_build_smoke = b.addSystemCommand(&.{
+            b.getInstallPath(.bin, "spore-build-run-smoke"),
+            b.getInstallPath(.bin, "spore-build-smoke-sh"),
+        });
+        run_build_smoke.step.dependOn(build_run_smoke_ready);
+        run_build_smoke.step.dependOn(&install_build_smoke_shell.step);
+
+        const build_run_smoke_step = b.step("spore-build-run-smoke", "Run the VM-backed spore build RUN executor smoke test");
+        build_run_smoke_step.dependOn(&run_build_smoke.step);
+    }
 
     // Hypervisor.framework smoke test: host-only, needs entitlement signing.
     // Run with `zig build hvf-smoke` on an Apple Silicon Mac.

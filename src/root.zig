@@ -43,6 +43,7 @@ pub const attach_stream = @import("attach_stream.zig");
 pub const attach_cli = @import("attach_cli.zig");
 pub const attach_cmd = @import("attach.zig");
 pub const rootfs = @import("rootfs.zig");
+pub const rootfs_ext4 = @import("rootfs/ext4.zig");
 pub const rootfs_cache = @import("rootfs_cache.zig");
 pub const rootfs_cas = @import("rootfs_cas.zig");
 pub const rootfs_cli = @import("rootfs_cli.zig");
@@ -107,6 +108,7 @@ test {
     testing.refAllDecls(attach_cli);
     testing.refAllDecls(attach_cmd);
     testing.refAllDecls(rootfs_cache);
+    testing.refAllDecls(rootfs_ext4);
     testing.refAllDecls(rootfs_cas);
     testing.refAllDecls(rootfs_cli);
     testing.refAllDecls(disk_index);

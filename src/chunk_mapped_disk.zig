@@ -298,6 +298,11 @@ pub const ChunkMappedDisk = struct {
             .object_namespace = spore.rootfs_storage_object_namespace,
         });
 
+        const next = try self.indexStateFrom(cache_root, index);
+        self.installIndexState(next);
+    }
+
+    fn indexStateFrom(self: *ChunkMappedDisk, cache_root: []const u8, index: disk_index.DiskIndex) Error!IndexState {
         const next_sources = try self.allocator.alloc(Source, self.sources.len);
         errdefer self.allocator.free(next_sources);
         @memset(next_sources, .zero);
@@ -327,13 +332,33 @@ pub const ChunkMappedDisk = struct {
             if (logical_chunk >= self.sources.len) return error.BadManifest;
         }
 
+        return .{
+            .sources = next_sources,
+            .cas_root = next_root,
+            .cas_digests = next_digests,
+            .parent_root = next_parent_root,
+            .parent_digests = next_parent_digests,
+        };
+    }
+
+    fn installIndexState(self: *ChunkMappedDisk, next: IndexState) void {
         const old_sources = self.sources;
-        self.sources = next_sources;
-        self.cas_root = next_root;
-        self.cas_digests = next_digests;
-        self.parent_root = next_parent_root;
-        self.parent_digests = next_parent_digests;
+        const old_cas_root = self.cas_root;
+        const old_cas_digests = self.cas_digests;
+        const old_parent_root = self.parent_root;
+        const old_parent_digests = self.parent_digests;
+
+        self.sources = next.sources;
+        self.cas_root = next.cas_root;
+        self.cas_digests = next.cas_digests;
+        self.parent_root = next.parent_root;
+        self.parent_digests = next.parent_digests;
+
         self.allocator.free(old_sources);
+        if (old_cas_root) |root| self.allocator.free(root);
+        if (old_cas_digests.len != 0) freeOptionalDigests(self.allocator, old_cas_digests);
+        if (old_parent_root) |root| self.allocator.free(root);
+        if (old_parent_digests.len != 0) freeOptionalDigests(self.allocator, old_parent_digests);
     }
 
     /// Publishes a durable disk index for the current mutable disk head. The
@@ -412,6 +437,8 @@ pub const ChunkMappedDisk = struct {
         // Durable-index invariant: all object writes above have fsynced their
         // data and parent directory; publish the index last via temp/fsync/rename.
         try chunk_sealer.writeFileAtomicDurable(self.allocator, index_path, index_json, 0o444);
+        const promoted_state = try self.indexStateFrom(dir, index);
+        self.installIndexState(promoted_state);
         if (stats_out) |out| {
             out.* = .{
                 .full_scan = !use_parent_index,
@@ -647,6 +674,14 @@ const ParentClone = struct {
         if (self.root) |root| allocator.free(root);
         if (self.digests.len != 0) freeOptionalDigests(allocator, self.digests);
     }
+};
+
+const IndexState = struct {
+    sources: []Source,
+    cas_root: []const u8,
+    cas_digests: []?[]const u8,
+    parent_root: []const u8,
+    parent_digests: []?[]const u8,
 };
 
 fn freeOptionalDigests(allocator: std.mem.Allocator, digests: []?[]const u8) void {
@@ -917,6 +952,7 @@ test "snapshot writes disk index and chunk objects" {
     try std.testing.expectEqual(@as(usize, 1), parsed.value.chunks.len);
     try std.testing.expectEqual(@as(u64, 0), parsed.value.chunks[0].logical_chunk);
     try std.testing.expectEqual(@as(usize, 0), parsed.value.zero_chunks.len);
+    try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
 
     const object_path = try rootfs_cas.manifestObjectPath(allocator, spore_dir, parsed.value.chunks[0].digest);
     defer allocator.free(object_path);
@@ -1043,6 +1079,24 @@ test "snapshot from parent index seals only dirty chunks and matches full rescan
     defer snapshot_index.deinit();
     try expectZeroChunk(snapshot_index.value, 1);
     try expectChunkDigest(snapshot_index.value, 2, try digestForChunk(parent_index.value, 2));
+    try std.testing.expectEqual(@as(usize, 0), fork_b.disk.dirtyChunkCount());
+
+    const patch_d = [_]u8{0x71} ** 31;
+    try fork_b.disk.writeAt(&patch_d, 7 * spore.disk_chunk_size + 9);
+    @memcpy(model[7 * chunk_size + 9 ..][0..patch_d.len], &patch_d);
+    try std.testing.expectEqual(@as(usize, 1), fork_b.disk.dirtyChunkCount());
+
+    var second_stats: SnapshotStats = .{};
+    const second_snapshot_disk = try fork_b.disk.snapshotIndexWithStats(snapshot_dir, .{ .mmio_slot = 1 }, true, &second_stats);
+    defer freeTestDisk(allocator, second_snapshot_disk);
+    try std.testing.expect(!second_stats.full_scan);
+    try std.testing.expectEqual(@as(usize, 1), second_stats.sealed_candidate_chunks);
+    try std.testing.expectEqual(@as(u64, 1), second_stats.work.sealed_chunks);
+    try std.testing.expectEqual(@as(usize, 0), fork_b.disk.dirtyChunkCount());
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full_path, .data = model });
+    const second_full_preload = try rootfs_cas.preloadPath(io, arena, full_cache, full_path, spore.disk_chunk_size);
+    try std.testing.expectEqualStrings(second_full_preload.index_digest, second_snapshot_disk.base);
 }
 
 test "read only disk rejects writes" {

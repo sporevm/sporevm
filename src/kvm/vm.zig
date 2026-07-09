@@ -1672,6 +1672,8 @@ fn takeRootfsSnapshot(
     transports: []mmio.Transport,
     disk_snapshot: ?disk_layer.SnapshotState,
 ) !?spore.Disk {
+    // Keep this in sync with src/hvf/vm.zig:takeRootfsSnapshot. The transport
+    // type is backend-local, so only the quiescence/snapshot contract is shared.
     const disk_state = disk_snapshot orelse return error.BadManifest;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();

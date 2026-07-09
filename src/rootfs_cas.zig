@@ -432,7 +432,7 @@ pub fn markStorageComplete(
     defer allocator.free(stamp_path);
     const stamp_dir = std.fs.path.dirname(stamp_path) orelse return error.BadManifest;
     try ensureDirPath(io, stamp_dir);
-    try writeFileAtomic(io, allocator, stamp_path, complete_stamp_contents);
+    try chunk_sealer.writeFileAtomicDurable(allocator, stamp_path, complete_stamp_contents, 0o444);
 }
 
 pub fn removeStorageCompleteStamp(
