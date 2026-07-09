@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import io
 import json
 import math
 import os
@@ -13,24 +14,29 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
 
 
-SUITE_VERSION = "1.2"
+SUITE_VERSION = "1.3"
 DEFAULT_IMAGE = "docker.io/library/node:22-alpine"
 DEFAULT_COMMAND = "/usr/local/bin/node -v"
 DEFAULT_PLATFORM = "linux/arm64"
+DEFAULT_SYNTHETIC_ROOTFS_REF = "local/sporevm-benchmark-synthetic:nightly"
 EAGER_ROOTFS_ENV = "SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCHMARK"
 RESTORE_METRICS_RE = re.compile(r"(?:kvm|hvf) restore metrics: (?P<fields>.+)")
 EXEC_PROBE_TIMING_RE = re.compile(r"run exec probe timing: (?P<fields>.+)")
 BACKEND_TIMING_RE = re.compile(r"run backend timing: (?P<fields>.+)")
 GUEST_TIMING_RE = re.compile(r"vsock host stream guest timing: timing (?P<fields>.+)")
 KVM_PROBE_COMPLETION_RE = re.compile(r"kvm probe completion timing: (?P<fields>.+)")
+ROOTFS_PROFILE_RE = re.compile(r"spore rootfs profile: phase=(?P<phase>\S+) ms=(?P<ms>\d+)(?P<tail>.*)")
+HISTORY_RESET_RE = re.compile(r"(?im)^\s*spore-benchmark-reset:\s*(?P<targets>[^\n]+)")
 
 PHASE_METRIC_FIELDS = (
     "rootfs_open_verified_ms",
@@ -66,6 +72,8 @@ PHASE_METRIC_FIELDS = (
     "kvm_probe_return_ms",
 )
 
+IMAGE_SETUP_BENCHMARKS = {"cold_tti", "warm_spore_tti", "distribution_tti", "lazy_rootfs_tti"}
+
 PROFILES = {
     "smoke": {
         "iterations": 1,
@@ -96,6 +104,16 @@ PROFILES = {
         "writable_rootfs_iterations": 1,
         "writable_rootfs_workloads": ("sqlite", "package"),
         "timeout_s": 240,
+    },
+    "nightly": {
+        "iterations": 5,
+        "concurrency": 8,
+        "stagger_delay_ms": 200,
+        "modes": ("sequential",),
+        "benchmarks": ("cold_tti", "cold_import", "warm_spore_tti", "distribution_tti", "writable_rootfs"),
+        "writable_rootfs_iterations": 1,
+        "writable_rootfs_workloads": ("package",),
+        "timeout_s": 300,
     },
     "full": {
         "iterations": 100,
@@ -231,6 +249,35 @@ def parse_key_value_tail(value: str) -> dict[str, str]:
     return fields
 
 
+def metric_component(value: str) -> str:
+    normalized = []
+    for char in value:
+        if char.isalnum():
+            normalized.append(char.lower())
+        else:
+            normalized.append("_")
+    return re.sub(r"_+", "_", "".join(normalized)).strip("_")
+
+
+def parse_rootfs_profile_text(text: str) -> dict[str, object]:
+    metrics: dict[str, object] = {}
+    for match in ROOTFS_PROFILE_RE.finditer(text):
+        phase = metric_component(match.group("phase"))
+        prefix = f"rootfs_profile_{phase}"
+        metrics[f"{prefix}_ms"] = int(match.group("ms"))
+        for key, raw in parse_key_value_tail(match.group("tail")).items():
+            parsed = parse_int_field(raw)
+            if parsed is not None:
+                metrics[f"{prefix}_{metric_component(key)}"] = parsed
+    return metrics
+
+
+def parse_rootfs_profile_metrics(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    return parse_rootfs_profile_text(path.read_text(encoding="utf-8", errors="replace"))
+
+
 def parse_run_stderr_metrics(path: Path) -> dict[str, object]:
     if not path.exists():
         return {}
@@ -342,6 +389,94 @@ def rootfs_digest_cache_path(cache_root: Path, digest: str) -> Path:
     return cache_root / "by-digest" / "blake3" / f"{hex_digest}.ext4"
 
 
+def parse_rootfs_import_stdout(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    fields: dict[str, object] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = metric_component(key)
+        value = value.strip()
+        if key and value:
+            fields[f"rootfs_import_{key}"] = value
+    return fields
+
+
+def deterministic_payload(index: int, size: int) -> bytes:
+    seed = f"sporevm synthetic rootfs fixture file={index:06d}\n".encode("utf-8")
+    return (seed * ((size // len(seed)) + 1))[:size]
+
+
+def tar_info(name: str, *, size: int = 0, mode: int = 0o644, kind: bytes = tarfile.REGTYPE) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(name)
+    info.size = size
+    info.mode = mode
+    info.uid = 0
+    info.gid = 0
+    info.uname = "root"
+    info.gname = "root"
+    info.mtime = 0
+    info.type = kind
+    return info
+
+
+def write_synthetic_rootfs_tar(path: Path, *, file_count: int, file_size: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(path, "w", format=tarfile.USTAR_FORMAT) as tar:
+        for directory in ("bin", "etc", "usr", "usr/bin", "var", "var/lib", "var/lib/sporevm-benchmark"):
+            tar.addfile(tar_info(directory, mode=0o755, kind=tarfile.DIRTYPE))
+        files = {
+            "etc/os-release": b'NAME="SporeVM benchmark fixture"\nID=sporevm-benchmark\n',
+            "bin/benchmark-fixture": b"#!/bin/sh\nprintf 'sporevm synthetic fixture\\n'\n",
+        }
+        for name, data in files.items():
+            tar.addfile(tar_info(name, size=len(data), mode=0o755 if name.startswith("bin/") else 0o644), io.BytesIO(data))
+        for index in range(file_count):
+            data = deterministic_payload(index, file_size)
+            name = f"var/lib/sporevm-benchmark/file-{index:06d}.dat"
+            tar.addfile(tar_info(name, size=len(data)), io.BytesIO(data))
+
+
+def load_benchmark_expectations(root: Path) -> dict[str, object]:
+    path = root / "benchmarks" / "expectations.json"
+    if not path.exists():
+        return {"version": 1, "metrics": {}}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as err:
+        die(f"invalid benchmark expectations JSON {path}: {err}")
+    if not isinstance(value, dict):
+        die(f"benchmark expectations must be a JSON object: {path}")
+    return value
+
+
+def benchmark_history_reset() -> dict[str, object] | None:
+    raw = os.environ.get("SPOREVM_BENCHMARK_RESET", "").strip()
+    source = "SPOREVM_BENCHMARK_RESET"
+    if not raw:
+        message = os.environ.get("BUILDKITE_MESSAGE", "")
+        match = HISTORY_RESET_RE.search(message)
+        if match:
+            raw = match.group("targets").strip()
+            source = "BUILDKITE_MESSAGE"
+    if not raw:
+        return None
+    targets = [part.strip() for part in re.split(r"[, ]+", raw) if part.strip()]
+    if not targets:
+        targets = ["all"]
+    return {"source": source, "raw": raw, "targets": targets}
+
+
+def default_host_id() -> str:
+    for key in ("SPOREVM_BENCHMARK_HOST_ID", "BUILDKITE_AGENT_NAME"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return socket.gethostname()
+
+
 def memory_economics(spore_dir: Path) -> dict[str, object]:
     manifest_path = spore_dir / "manifest.json"
     if not manifest_path.exists():
@@ -401,6 +536,8 @@ class BenchmarkRunner:
         self.env["SPOREVM_ROOTFS_CACHE_DIR"] = str(self.rootfs_cache_dir)
         self.env["SPOREVM_BUNDLE_CACHE_DIR"] = str(self.bundle_cache_dir)
         self.effective_image = args.image
+        self.expectations = load_benchmark_expectations(self.root)
+        self.history_reset = benchmark_history_reset()
 
     def setup(self) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -412,10 +549,14 @@ class BenchmarkRunner:
             self.build()
         if not self.spore_bin.is_file() or not os.access(self.spore_bin, os.X_OK):
             die(f"spore binary not executable: {self.spore_bin}")
-        self.resolve_image()
-        if self.args.prewarm_rootfs:
+        if self.needs_image_setup():
+            self.resolve_image()
+        if self.needs_image_setup() and self.args.prewarm_rootfs:
             self.prewarm_rootfs()
         json_dump(self.run_dir / "config.json", self.config_json())
+
+    def needs_image_setup(self) -> bool:
+        return any(benchmark in IMAGE_SETUP_BENCHMARKS for benchmark in self.args.benchmarks)
 
     def build(self) -> None:
         cmd = ["mise", "run", "build"] if shutil.which("mise") else ["zig", "build"]
@@ -513,9 +654,13 @@ class BenchmarkRunner:
             "platform": self.args.platform,
             "command": self.command,
             "timeout_s": self.args.timeout_s,
+            "host_id": self.args.host_id,
             "writable_rootfs_iterations": self.args.writable_rootfs_iterations,
             "writable_rootfs_workloads": self.args.writable_rootfs_workloads,
             "writable_rootfs_memory_mib": self.args.writable_rootfs_memory_mib,
+            "synthetic_rootfs_ref": self.args.synthetic_rootfs_ref,
+            "synthetic_rootfs_file_count": self.args.synthetic_rootfs_file_count,
+            "synthetic_rootfs_file_size": self.args.synthetic_rootfs_file_size,
             "prewarm_rootfs": self.args.prewarm_rootfs,
             "prewarm_memory": self.args.prewarm_memory,
             "spore_bin": str(self.spore_bin),
@@ -524,6 +669,8 @@ class BenchmarkRunner:
             "scratch_dir": str(self.scratch_run_dir),
             "rootfs_cache_dir": str(self.rootfs_cache_dir),
             "bundle_cache_dir": str(self.bundle_cache_dir),
+            "benchmark_expectations": self.expectations,
+            "benchmark_history_reset": self.history_reset,
         }
 
     def spore_version(self) -> str | None:
@@ -539,6 +686,7 @@ class BenchmarkRunner:
             "run_id": self.run_id,
             "created_at": utc_now(),
             "backend": self.backend,
+            "host_id": self.args.host_id,
             "memory": self.args.memory,
             "requested_image": self.args.image,
             "image": self.effective_image,
@@ -555,6 +703,8 @@ class BenchmarkRunner:
         if "cold_tti" in self.args.benchmarks:
             for mode in self.args.modes:
                 self.run_cold_tti(mode)
+        if "cold_import" in self.args.benchmarks:
+            self.run_cold_import()
         base_dir: Path | None = None
         if "warm_spore_tti" in self.args.benchmarks or "distribution_tti" in self.args.benchmarks:
             base_dir = self.prepare_base_spore()
@@ -796,6 +946,75 @@ class BenchmarkRunner:
             }
 
         self.run_batch("cold_tti", mode, count, worker)
+
+    def synthetic_rootfs_tar(self) -> Path:
+        fixture = self.work_dir / "synthetic-rootfs" / "rootfs.tar"
+        if not fixture.exists():
+            write_synthetic_rootfs_tar(
+                fixture,
+                file_count=self.args.synthetic_rootfs_file_count,
+                file_size=self.args.synthetic_rootfs_file_size,
+            )
+        return fixture
+
+    def run_cold_import(self) -> None:
+        fixture = self.synthetic_rootfs_tar()
+        for iteration in range(self.args.iterations):
+            prefix = self.log_dir / "cold_import" / "synthetic_tar" / f"{iteration:06d}"
+            stdout = prefix.with_suffix(".stdout")
+            stderr = prefix.with_suffix(".stderr")
+            import_cache = self.work_dir / "cold_import" / f"cache-{iteration:06d}"
+            shutil.rmtree(import_cache, ignore_errors=True)
+            import_cache.mkdir(parents=True, exist_ok=True)
+            env = self.env.copy()
+            env["SPOREVM_ROOTFS_CACHE_DIR"] = str(import_cache)
+            env["SPOREVM_ROOTFS_BUILD_PROFILE"] = "1"
+            argv = [
+                str(self.spore_bin),
+                "rootfs",
+                "import-tar",
+                str(fixture),
+                "--ref",
+                self.args.synthetic_rootfs_ref,
+                "--platform",
+                self.args.platform,
+            ]
+            status, elapsed_ms, error = run_command(argv, env=env, stdout_path=stdout, stderr_path=stderr, timeout_s=self.args.timeout_s)
+            success = status == 0
+            row = self.emit({
+                "benchmark": "cold_import",
+                "mode": "synthetic_tar",
+                "iteration": iteration,
+                "success": success,
+                "status": status,
+                "elapsed_ms": elapsed_ms,
+                "tti_ms": elapsed_ms,
+                "error": error,
+                "fixture_tar": str(fixture),
+                "fixture_tar_bytes": fixture.stat().st_size,
+                "synthetic_rootfs_ref": self.args.synthetic_rootfs_ref,
+                "stdout_path": str(stdout),
+                "stderr_path": str(stderr),
+                **parse_rootfs_import_stdout(stdout),
+                **parse_rootfs_profile_metrics(stderr),
+            })
+            print(
+                f"cold_import synthetic_tar iteration={iteration} "
+                f"{'ok' if row.get('success') else 'failed'} elapsed_ms={row.get('elapsed_ms')}",
+                file=sys.stderr,
+            )
+            if not success:
+                die(f"cold synthetic import failed status={status} stdout={stdout} stderr={stderr}")
+        rows = [
+            row for row in self.rows
+            if row.get("benchmark") == "cold_import" and row.get("mode") == "synthetic_tar" and isinstance(row.get("iteration"), int)
+        ]
+        self.emit({
+            "benchmark": "cold_import",
+            "mode": "synthetic_tar_batch",
+            "success": all(bool(row.get("success")) for row in rows) if rows else False,
+            "count": len(rows),
+        })
 
     def prepare_base_spore(self) -> Path:
         base_dir = self.work_dir / "base.spore"
@@ -1072,6 +1291,7 @@ class BenchmarkRunner:
                 "source_stderr": row.get("stderr"),
                 "source_row": row,
                 "source_jsonl": str(raw_output),
+                **parse_rootfs_profile_text(str(row.get("stderr", ""))),
             }
             self.emit(converted)
         self.emit_writable_rootfs_batches(raw_rows)
@@ -1331,6 +1551,19 @@ def self_test() -> None:
         assert metrics["kvm_pending_exit_completion_ms"] == 2
         assert metrics["exec_response_ms"] == 8
         assert summarize_field([metrics], "exec_response_ms")["median"] == 8.0
+        stderr.write_text(
+            "spore rootfs profile: phase=rootfs_cas_inline ms=42 chunks=3 zero_chunks=1 nonzero_chunks=2 objects_written=2 object_bytes_written=8192 index_bytes=256\n",
+            encoding="utf-8",
+        )
+        rootfs_profile = parse_rootfs_profile_metrics(stderr)
+        assert rootfs_profile["rootfs_profile_rootfs_cas_inline_ms"] == 42
+        assert rootfs_profile["rootfs_profile_rootfs_cas_inline_objects_written"] == 2
+        writable_profile = parse_rootfs_profile_text(
+            "spore rootfs profile: phase=native_ext4_emit ms=11 objects_written=4 object_bytes_written=16384\n"
+        )
+        assert writable_profile["rootfs_profile_native_ext4_emit_ms"] == 11
+        assert writable_profile["rootfs_profile_native_ext4_emit_objects_written"] == 4
+        assert "writable_rootfs" in PROFILES["nightly"]["benchmarks"]
         stderr.write_text("debug: runtime disk rootfs base: lazy chunk index blake3:abc\n", encoding="utf-8")
         assert parse_rootfs_base_mode(stderr) == "lazy"
         stderr.write_text("debug: runtime disk rootfs base: flat artifact blake3:abc\n", encoding="utf-8")
@@ -1409,7 +1642,7 @@ def apply_profile_defaults(args: argparse.Namespace) -> None:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=sorted(PROFILES), default="ci")
-    parser.add_argument("--benchmarks", help="Comma-separated subset: cold_tti,warm_spore_tti,distribution_tti,writable_rootfs,lazy_rootfs_tti")
+    parser.add_argument("--benchmarks", help="Comma-separated subset: cold_tti,cold_import,warm_spore_tti,distribution_tti,writable_rootfs,lazy_rootfs_tti")
     parser.add_argument("--modes", help="Comma-separated subset: sequential,staggered,burst")
     parser.add_argument("--iterations", type=int, help="Sequential iterations")
     parser.add_argument("--concurrency", type=int, help="Staggered/burst concurrency")
@@ -1420,12 +1653,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--rootfs-cache-dir", default="")
     parser.add_argument("--spore-bin", default=str(repo_root() / "zig-out/bin/spore"))
     parser.add_argument("--backend", default=infer_backend(), choices=("auto", "hvf", "kvm"))
+    parser.add_argument("--host-id", default=default_host_id())
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument("--platform", default=DEFAULT_PLATFORM)
     parser.add_argument("--memory", default="512mb")
     parser.add_argument("--command", default=DEFAULT_COMMAND)
     parser.add_argument("--allow-image-resolve-fallback", action="store_true", help="Use the requested image ref when rootfs resolve fails")
     parser.add_argument("--timeout-s", type=int)
+    parser.add_argument("--synthetic-rootfs-ref", default=DEFAULT_SYNTHETIC_ROOTFS_REF)
+    parser.add_argument("--synthetic-rootfs-file-count", type=int, default=1024)
+    parser.add_argument("--synthetic-rootfs-file-size", type=int, default=4096)
     parser.add_argument("--writable-rootfs-iterations", type=int, help="Writable-rootfs iterations per workload")
     parser.add_argument("--writable-rootfs-workloads", help="Comma-separated subset: sqlite,package")
     parser.add_argument("--writable-rootfs-memory-mib", type=int, default=1024)
@@ -1442,7 +1679,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         if mode not in ("sequential", "staggered", "burst"):
             die(f"unknown mode: {mode}")
     for benchmark in args.benchmarks:
-        if benchmark not in ("cold_tti", "warm_spore_tti", "distribution_tti", "writable_rootfs", "lazy_rootfs_tti"):
+        if benchmark not in ("cold_tti", "cold_import", "warm_spore_tti", "distribution_tti", "writable_rootfs", "lazy_rootfs_tti"):
             die(f"unknown benchmark: {benchmark}")
     if args.iterations <= 0:
         die("--iterations must be positive")
@@ -1454,6 +1691,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         die("--writable-rootfs-iterations must be positive")
     if args.writable_rootfs_memory_mib <= 0:
         die("--writable-rootfs-memory-mib must be positive")
+    if args.synthetic_rootfs_file_count <= 0:
+        die("--synthetic-rootfs-file-count must be positive")
+    if args.synthetic_rootfs_file_size <= 0:
+        die("--synthetic-rootfs-file-size must be positive")
     for workload in args.writable_rootfs_workloads:
         if workload not in ("sqlite", "package"):
             die(f"unknown writable rootfs workload: {workload}")

@@ -3,6 +3,8 @@ set -euo pipefail
 
 upload_benchmark_artifacts() {
   buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/latest-summary.json" || true
+  buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/regression-report.md" || true
+  buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/regression-report.json" || true
   buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/site/*" || true
   buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/config.json" || true
   buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/results.jsonl" || true
@@ -26,6 +28,32 @@ annotate_benchmark_results() {
   fi
   buildkite-agent annotate --style "${style}" --context "sporevm-benchmarks" --priority 7 <"${annotation}" || true
   buildkite-agent artifact upload "${annotation}" || true
+}
+
+annotate_regression_results() {
+  local status="$1"
+  local report="zig-cache/sporevm-benchmarks/regression-report.md"
+  local report_json="zig-cache/sporevm-benchmarks/regression-report.json"
+  [[ -f "${report}" ]] || return 0
+
+  local style="info"
+  if [[ "${status}" != "0" ]]; then
+    style="error"
+  elif [[ -f "${report_json}" ]]; then
+    style="$(python3 - "${report_json}" <<'PY'
+import json
+import sys
+
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    print("info")
+else:
+    print(data.get("summary", {}).get("style", "info"))
+PY
+)"
+  fi
+  buildkite-agent annotate --style "${style}" --context "sporevm-benchmark-regressions" --priority 8 <"${report}" || true
 }
 
 finish_benchmark_step() {
@@ -62,6 +90,7 @@ benchmark_rootfs_cache_dir="${SPOREVM_BENCHMARK_ROOTFS_CACHE_DIR:-${SPOREVM_ROOT
 benchmark_profile="${SPOREVM_BENCHMARK_PROFILE:-}"
 benchmark_image="${SPOREVM_BENCHMARK_IMAGE:-}"
 benchmark_command="${SPOREVM_BENCHMARK_COMMAND:-}"
+benchmark_history_dir="${SPOREVM_BENCHMARK_HISTORY_DIR:-}"
 
 default_rootfs_cache_dir() {
   if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
@@ -136,6 +165,128 @@ if load1 > limit:
 PY
 }
 
+download_benchmark_history() {
+  if [[ -n "${benchmark_history_dir}" ]]; then
+    printf '%s\n' "${benchmark_history_dir}"
+    return 0
+  fi
+  [[ -n "${BUILDKITE_BUILD_NUMBER:-}" ]] || return 0
+  command -v buildkite-agent >/dev/null 2>&1 || return 0
+
+  local limit="${SPOREVM_BENCHMARK_HISTORY_BUILDS:-20}"
+  local dest="zig-cache/sporevm-benchmarks/history"
+  mkdir -p "${dest}"
+
+  download_history_build() {
+    local build_ref="$1"
+    local label
+    label="$(printf '%s' "${build_ref}" | tr -c 'A-Za-z0-9_.-' '_')"
+    local build_dest="${dest}/build-${label}"
+    mkdir -p "${build_dest}"
+    buildkite-agent artifact download "zig-cache/sporevm-benchmarks/*/results.jsonl" "${build_dest}" --build "${build_ref}" >/dev/null 2>&1 || true
+    buildkite-agent artifact download "zig-cache/sporevm-benchmarks/*/config.json" "${build_dest}" --build "${build_ref}" >/dev/null 2>&1 || true
+    buildkite-agent artifact download "zig-cache/sporevm-benchmarks/*/summary.json" "${build_dest}" --build "${build_ref}" >/dev/null 2>&1 || true
+  }
+
+  local downloaded=0
+  if [[ -n "${BUILDKITE_API_TOKEN:-}" && -n "${BUILDKITE_ORGANIZATION_SLUG:-}" && -n "${BUILDKITE_PIPELINE_SLUG:-}" ]]; then
+    while IFS= read -r build_id; do
+      [[ -n "${build_id}" ]] || continue
+      download_history_build "${build_id}"
+      downloaded=1
+    done < <(python3 - "${limit}" <<'PY'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+limit = int(sys.argv[1])
+token = os.environ.get("BUILDKITE_API_TOKEN")
+org = os.environ.get("BUILDKITE_ORGANIZATION_SLUG")
+pipeline = os.environ.get("BUILDKITE_PIPELINE_SLUG")
+current_raw = os.environ.get("BUILDKITE_BUILD_NUMBER", "0")
+branch = os.environ.get("BUILDKITE_BRANCH", "")
+try:
+    current = int(current_raw)
+except ValueError:
+    current = 0
+if not token or not org or not pipeline or current <= 0:
+    raise SystemExit(0)
+
+query = {"per_page": str(max(limit * 2, limit))}
+if branch:
+    query["branch"] = branch
+url = (
+    "https://api.buildkite.com/v2/organizations/"
+    + urllib.parse.quote(org)
+    + "/pipelines/"
+    + urllib.parse.quote(pipeline)
+    + "/builds?"
+    + urllib.parse.urlencode(query)
+)
+request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+try:
+    with urllib.request.urlopen(request, timeout=20) as response:
+        builds = json.load(response)
+except Exception:
+    raise SystemExit(0)
+
+emitted = 0
+for build in builds:
+    number = build.get("number")
+    build_id = build.get("id")
+    if not isinstance(number, int) or not isinstance(build_id, str):
+        continue
+    if number >= current:
+        continue
+    print(build_id)
+    emitted += 1
+    if emitted >= limit:
+        break
+PY
+)
+  fi
+
+  if [[ "${downloaded}" == "0" ]]; then
+    local current="${BUILDKITE_BUILD_NUMBER}"
+    local offset build
+    for offset in $(seq 1 "${limit}"); do
+      build=$((current - offset))
+      [[ "${build}" -gt 0 ]] || break
+      download_history_build "${build}"
+    done
+  fi
+  printf '%s\n' "${dest}"
+}
+
+run_regression_detector() {
+  local summary="zig-cache/sporevm-benchmarks/latest-summary.json"
+  [[ -f "${summary}" ]] || return 0
+
+  local history
+  history="$(download_benchmark_history || true)"
+  local args=(
+    "${summary}"
+    --markdown-out "zig-cache/sporevm-benchmarks/regression-report.md"
+    --json-out "zig-cache/sporevm-benchmarks/regression-report.json"
+  )
+  if [[ -n "${history}" && -d "${history}" ]]; then
+    args+=(--history-dir "${history}")
+  fi
+  if [[ "${BUILDKITE_SOURCE:-}" == "schedule" ]]; then
+    args+=(--require-history)
+  fi
+
+  local status=0
+  set +e
+  scripts/benchmark/detect_regressions.py "${args[@]}"
+  status="$?"
+  set -e
+  annotate_regression_results "${status}"
+  return "${status}"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -158,7 +309,9 @@ if [[ "$(uname -s)" == "Linux" ]]; then
   test/smoke/lifecycle/auto-memory.sh
 fi
 if [[ -z "${benchmark_profile}" ]]; then
-  if [[ "${BUILDKITE_BRANCH:-}" == "main" ]]; then
+  if [[ "${BUILDKITE_SOURCE:-}" == "schedule" ]]; then
+    benchmark_profile="nightly"
+  elif [[ "${BUILDKITE_BRANCH:-}" == "main" ]]; then
     benchmark_profile="comparison"
   else
     benchmark_profile="ci"
@@ -190,6 +343,7 @@ fi
 check_benchmark_host_load
 scripts/benchmark/suite.py "${benchmark_args[@]}"
 scripts/benchmark/export-site-data.py zig-cache/sporevm-benchmarks/latest-summary.json
+run_regression_detector
 if [[ -n "${SPOREVM_BENCHMARK_BASELINE:-}" ]]; then
   scripts/benchmark/compare.py "${SPOREVM_BENCHMARK_BASELINE}" zig-cache/sporevm-benchmarks/latest-summary.json
 fi

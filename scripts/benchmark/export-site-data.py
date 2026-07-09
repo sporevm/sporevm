@@ -22,6 +22,7 @@ HOMEPAGE_JS_GLOBAL = "window.SPOREVM_HOMEPAGE_BENCHMARK_DATA"
 HOMEPAGE_HISTORY_LIMIT = 30
 
 LABELS = {
+    "cold_import": "Cold Import",
     "cold_tti": "Cold TTI",
     "warm_spore_tti": "Warm Spore TTI",
     "distribution_tti": "Distribution TTI",

@@ -192,6 +192,10 @@ description = "Run the short CI benchmark profile and write comparable JSON outp
 run = "mise run build:release && scripts/benchmark/suite.py --profile comparison --no-build"
 description = "Run the heavier all-dimension comparison benchmark profile"
 
+[tasks."benchmark:nightly"]
+run = "mise run build:release && scripts/benchmark/suite.py --profile nightly --no-build"
+description = "Run the scheduled benchmark guardrail profile"
+
 [tasks."benchmark:full"]
 run = "mise run build:release && scripts/benchmark/suite.py --profile full --no-build"
 description = "Run the full benchmark suite"
@@ -199,6 +203,10 @@ description = "Run the full benchmark suite"
 [tasks."benchmark:compare"]
 run = "scripts/benchmark/compare.py"
 description = "Compare two benchmark summary JSON files"
+
+[tasks."benchmark:detect-regressions"]
+run = "scripts/benchmark/detect_regressions.py"
+description = "Detect benchmark regressions against trailing history"
 
 [tasks."benchmark:rootfs-writers"]
 run = "mise run build && scripts/benchmark/rootfs-writers.py --no-build"

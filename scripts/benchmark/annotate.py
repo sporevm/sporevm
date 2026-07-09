@@ -89,6 +89,7 @@ def md(value: object) -> str:
 
 def benchmark_label(benchmark: object) -> str:
     labels = {
+        "cold_import": "Cold Import",
         "cold_tti": "Cold TTI",
         "warm_spore_tti": "Warm Spore TTI",
         "distribution_tti": "Distribution TTI",
@@ -101,10 +102,11 @@ def benchmark_label(benchmark: object) -> str:
 def result_sort_key(result: object) -> tuple[str, str]:
     item = as_dict(result)
     order = {
-        "cold_tti": "0",
-        "warm_spore_tti": "1",
-        "distribution_tti": "2",
-        "writable_rootfs": "3",
+        "cold_import": "0",
+        "cold_tti": "1",
+        "warm_spore_tti": "2",
+        "distribution_tti": "3",
+        "writable_rootfs": "4",
     }
     benchmark = text(item.get("benchmark"), "")
     return (order.get(benchmark, benchmark), text(item.get("mode"), ""))
