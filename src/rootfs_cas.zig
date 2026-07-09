@@ -348,6 +348,8 @@ fn preloadFd(
     };
 }
 
+/// Verifies the index and every referenced chunk object. On success this also
+/// writes or repairs the complete stamp for callers that upgrade an older cache.
 pub fn storageComplete(
     io: Io,
     allocator: std.mem.Allocator,
@@ -382,6 +384,16 @@ pub fn storageComplete(
     }
     try markStorageComplete(io, allocator, cache_root, storage.index_digest);
     return true;
+}
+
+pub fn storageCompleteWithStampRepair(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    storage: spore.RootfsStorage,
+) !bool {
+    if (try storageMarkedComplete(io, allocator, cache_root, storage)) return true;
+    return storageComplete(io, allocator, cache_root, storage);
 }
 
 pub fn storageMarkedComplete(
@@ -443,6 +455,20 @@ pub fn removeStorageCompleteStampsReferencingObject(
     cache_root: []const u8,
     object_digest: []const u8,
 ) !void {
+    var object_digests = std.StringHashMap(void).init(allocator);
+    defer object_digests.deinit();
+    try object_digests.put(object_digest, {});
+    try removeStorageCompleteStampsReferencingObjects(io, allocator, cache_root, object_digests);
+}
+
+pub fn removeStorageCompleteStampsReferencingObjects(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    object_digests: std.StringHashMap(void),
+) !void {
+    if (object_digests.count() == 0) return;
+
     const indexes_dir_path = try std.fmt.allocPrint(allocator, "{s}/cas/rootfs/blake3/indexes", .{cache_root});
     defer allocator.free(indexes_dir_path);
     var indexes_dir = openDirPath(io, indexes_dir_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -472,7 +498,7 @@ pub fn removeStorageCompleteStampsReferencingObject(
         };
         defer parsed.deinit();
         for (parsed.value.chunks) |chunk_entry| {
-            if (std.mem.eql(u8, chunk_entry.digest, object_digest)) {
+            if (object_digests.contains(chunk_entry.digest)) {
                 try removeStorageCompleteStamp(io, allocator, cache_root, index_digest);
                 break;
             }

@@ -811,6 +811,13 @@ fn pruneRootfsCache(
     var deleted_bytes: u64 = 0;
     var deleted_reclaimable_bytes: u64 = 0;
 
+    var selected_rootfs_object_digests = std.StringHashMap(void).init(allocator);
+    defer deinitRootfsObjectDigestSet(allocator, &selected_rootfs_object_digests);
+    if (!opts.dry_run) {
+        try collectSelectedRootfsObjectDigests(allocator, plan, &selected_rootfs_object_digests);
+        try rootfs_cas.removeStorageCompleteStampsReferencingObjects(io, allocator, cache_root, selected_rootfs_object_digests);
+    }
+
     for (plan) |entry| {
         if (!entry.selected) continue;
         const logical = entry.logicalBytes();
@@ -876,14 +883,31 @@ fn invalidateRootfsCompleteStampForPruneEntry(
             defer allocator.free(digest);
             try rootfs_cas.removeStorageCompleteStamp(io, allocator, cache_root, digest);
         },
-        .cas_object => {
-            const name = std.fs.path.basename(entry.path);
-            const digest = digestFromCacheEntryName(allocator, name, ".chunk") orelse return;
-            defer allocator.free(digest);
-            try rootfs_cas.removeStorageCompleteStampsReferencingObject(io, allocator, cache_root, digest);
-        },
         else => {},
     }
+}
+
+fn collectSelectedRootfsObjectDigests(
+    allocator: std.mem.Allocator,
+    plan: []const PrunePlanEntry,
+    digests: *std.StringHashMap(void),
+) !void {
+    for (plan) |entry| {
+        if (!entry.selected or entry.kind != .cas_object) continue;
+        const name = std.fs.path.basename(entry.path);
+        const digest = digestFromCacheEntryName(allocator, name, ".chunk") orelse continue;
+        const result = digests.getOrPut(digest) catch |err| {
+            allocator.free(digest);
+            return err;
+        };
+        if (result.found_existing) allocator.free(digest);
+    }
+}
+
+fn deinitRootfsObjectDigestSet(allocator: std.mem.Allocator, digests: *std.StringHashMap(void)) void {
+    var it = digests.iterator();
+    while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+    digests.deinit();
 }
 
 fn gcRootfsCache(
@@ -949,7 +973,7 @@ fn gcRootfsCache(
         ".chunk",
         "rootfs-cas-object",
         &rooted_objects,
-        .object,
+        .none,
         options.dry_run,
         &result_entries,
         &candidate_bytes,
@@ -1192,7 +1216,6 @@ fn collectGcCasEntries(
             switch (stamp_invalidation) {
                 .none => {},
                 .index => try rootfs_cas.removeStorageCompleteStamp(io, allocator, cache_root, digest),
-                .object => try rootfs_cas.removeStorageCompleteStampsReferencingObject(io, allocator, cache_root, digest),
             }
             try Io.Dir.cwd().deleteFile(io, path);
             deleted_count.* += 1;
@@ -1204,7 +1227,6 @@ fn collectGcCasEntries(
 const GcStampInvalidation = enum {
     none,
     index,
-    object,
 };
 
 fn digestFromCacheEntryName(allocator: std.mem.Allocator, name: []const u8, suffix: []const u8) ?[]const u8 {
@@ -2053,6 +2075,74 @@ test "system prunes only unreferenced runtime fork batches" {
     try std.testing.expectEqual(@as(usize, 1), forced.deleted_count);
     try std.testing.expect(try fileExists(io, try std.fs.path.join(allocator, &.{ root, "forks", "live" })));
     try std.testing.expect(!try fileExists(io, try std.fs.path.join(allocator, &.{ root, "forks", "dead" })));
+}
+
+test "system prune removes complete stamp once for multiple referenced rootfs objects" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root = "zig-cache/test-system-prune-rootfs-objects-complete-stamp";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    const first_digest = try writeGcObjectFixture(allocator, io, root, 0x61);
+    const second_digest = try writeGcObjectFixture(allocator, io, root, 0x71);
+    const chunks = [_]disk_index.DiskIndexChunk{
+        .{
+            .logical_chunk = 0,
+            .digest = first_digest,
+        },
+        .{
+            .logical_chunk = 1,
+            .digest = second_digest,
+        },
+    };
+    const index = disk_index.DiskIndex{
+        .kind = disk_index.disk_index_kind,
+        .logical_size = 2 * spore.disk_chunk_size,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+        .chunks = &chunks,
+    };
+    const index_json = try std.json.Stringify.valueAlloc(allocator, index, .{ .whitespace = .indent_2 });
+    const index_digest = try disk_index.indexDigestAlloc(allocator, index_json);
+    const index_path = try rootfs_cas.manifestIndexPath(allocator, root, index_digest);
+    try ensureParentDir(io, index_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = index_path, .data = index_json });
+    try rootfs_cas.markStorageComplete(io, allocator, root, index_digest);
+
+    const first_path = try rootfs_cas.manifestObjectPath(allocator, root, first_digest);
+    const second_path = try rootfs_cas.manifestObjectPath(allocator, root, second_digest);
+    for (&[_][]const u8{ first_path, second_path }) |object_path| {
+        try Io.Dir.cwd().setTimestamps(io, object_path, .{
+            .follow_symlinks = false,
+            .access_timestamp = .{ .new = Io.Timestamp.zero },
+            .modify_timestamp = .{ .new = Io.Timestamp.zero },
+        });
+    }
+    try Io.Dir.cwd().setTimestamps(io, index_path, .{
+        .follow_symlinks = false,
+        .access_timestamp = .{ .new = .{ .nanoseconds = std.time.ns_per_s } },
+        .modify_timestamp = .{ .new = .{ .nanoseconds = std.time.ns_per_s } },
+    });
+
+    const index_stat = try Io.Dir.cwd().statFile(io, index_path, .{ .follow_symlinks = false });
+    const stamp_path = try rootfs_cas.storageCompleteStampPath(allocator, root, index_digest);
+    try std.testing.expect(try fileExists(io, stamp_path));
+
+    const forced = try pruneRootfsCache(allocator, io, root, .{
+        .dry_run = false,
+        .include_rootfs_chunks = true,
+        .max_bytes = index_stat.size,
+    }, 2 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 2), forced.deleted_count);
+    try std.testing.expect(!try fileExists(io, first_path));
+    try std.testing.expect(!try fileExists(io, second_path));
+    try std.testing.expect(try fileExists(io, index_path));
+    try std.testing.expect(!try fileExists(io, stamp_path));
 }
 
 test "system cache gc preserves rooted disk index objects and deletes CAS orphans" {

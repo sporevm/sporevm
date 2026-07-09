@@ -1881,7 +1881,7 @@ pub fn cachedImageRootfsPath(
         defer allocator.free(artifact.digest);
         const storage = (try readCachedRootfsStorage(io, allocator, metadata_path, artifact)) orelse return null;
         defer deinitStorageDigestFields(allocator, storage);
-        if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, storage)) return null;
+        if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, storage)) return null;
         std.log.debug("spore rootfs: using cached rootfs {s} for {s}", .{ rootfs_path, resolved.ref });
         return rootfs_path;
     }
@@ -3208,6 +3208,40 @@ test "image rootfs cache lookup does not repair evicted flat materialization" {
     try std.testing.expect(!try rootfs_cache.pathExistsNoSymlink(io, digest_path));
     try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .native)).?);
     try std.testing.expect(!try rootfs_cache.pathExistsNoSymlink(io, digest_path));
+}
+
+test "image rootfs cache lookup repairs missing complete stamp" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-rootfs-image-cache-repair-complete-stamp";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, cache_root);
+
+    const resolved = ResolvedImage{
+        .ref = "docker.io/library/alpine@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .manifest_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .platform = .{},
+    };
+    const cache_key = try rootfsCacheKeyAlloc(arena, resolved);
+    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try cachedImageRootfsMetadataPath(arena, cache_root, resolved);
+    const rootfs_bytes = ("abcd" ** 1024) ++ ("efgh" ** 1024);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
+
+    const storage = try testRootfsStorageFromPath(io, arena, cache_root, rootfs_path);
+    const metadata = try testImageRootfsMetadataJson(arena, resolved, rootfs_path, storage.logical_size, storage, "native");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, cache_root, storage));
+
+    try rootfs_cas.removeStorageCompleteStamp(io, arena, cache_root, storage.index_digest);
+    try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, arena, cache_root, storage));
+    try std.testing.expectEqualStrings(rootfs_path, (try cachedImageRootfsPath(io, arena, cache_root, resolved, .native)).?);
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, cache_root, storage));
 }
 
 test "image rootfs cache lookup uses complete stamp without per-object stat" {

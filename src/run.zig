@@ -1919,7 +1919,7 @@ fn resolvedImageRootfsInput(
     var storage = (try rootfs_mod.readCachedRootfsStorage(init.io, allocator, metadata_path, artifact)) orelse return error.BadManifest;
     errdefer rootfs_mod.deinitRootfsStorageDescriptor(allocator, storage);
     storage.device = rootfs_device;
-    if (!storage_prevalidated and !try rootfs_cas.storageMarkedComplete(init.io, allocator, cache_root, storage)) return error.RootFSDigestCacheMiss;
+    if (!storage_prevalidated and !try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, cache_root, storage)) return error.RootFSDigestCacheMiss;
     const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch });
     const manifest_requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved.ref else requested_ref;
     return .{

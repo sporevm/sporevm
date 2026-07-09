@@ -514,7 +514,10 @@ data_bytes_written=4709957632 zero_bytes_skipped=3077423104`.
 `rootfs_cas_inline` for the same run was `ms=94139`, `seal_workers=8`,
 `seal_wall_ms=19337`, and `seal_worker_cpu_ms=77342`. The main-thread problem
 is therefore block assignment/metadata planning, not tar reads or writing zero
-blocks; zero ext4 blocks are skipped on the output path.
+blocks; zero ext4 blocks are skipped on the output path. Follow-up after the
+run-image readiness PR lands: profile inside `assignBlocks` for O(n^2) behavior
+or allocation churn over the roughly 2M-block buildkite image before doing any
+more sealer work.
 
 Done when: import → run → save → restore works end to end on index identity
 with no linear full-image hash anywhere; uncached import of a large
