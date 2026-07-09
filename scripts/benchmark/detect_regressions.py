@@ -27,6 +27,7 @@ MISSING_HISTORY_NOTE = (
 )
 
 TIME_RE = re.compile(r"^(real|user|sys)\s+([0-9]+(?:\.[0-9]+)?)$")
+ROOTFS_DIGEST_RE = re.compile(r"^blake3:[0-9a-f]{64}$")
 DF_ENTRY_RE = re.compile(r"^\s*(?P<label>[^:]+):\s+(?P<count>[0-9]+)\s+entries,\s+(?P<size>[0-9]+(?:\.[0-9]+)?)\s+(?P<unit>[A-Za-z]+)$")
 DF_SIZE_RE = re.compile(r"^\s*(?P<label>Known logical data):\s+(?P<size>[0-9]+(?:\.[0-9]+)?)\s+(?P<unit>[A-Za-z]+)")
 
@@ -69,6 +70,7 @@ THROUGHPUT_BENCHMARKS = {
     "writable_rootfs",
 }
 ABSOLUTE_MAX_KEYS = ("max", "absolute_max", "ceiling")
+MetricValue = float | str
 
 
 @dataclass
@@ -85,7 +87,7 @@ class BenchmarkRun:
 class MetricSeries:
     metric_id: str
     metric_class: str
-    values: list[float]
+    values: list[MetricValue]
 
 
 @dataclass
@@ -93,8 +95,8 @@ class Verdict:
     metric_id: str
     metric_class: str
     verdict: str
-    current: float
-    baseline: float | None
+    current: MetricValue
+    baseline: MetricValue | None
     delta: float | None
     delta_pct: float | None
     threshold: str
@@ -333,6 +335,14 @@ def flatten_numbers(value: Any, prefix: str = "") -> dict[str, float]:
     return {prefix: raw} if raw is not None else {}
 
 
+def digest_metric_class(field: str, value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if field == "rootfs_import_index_digest" and ROOTFS_DIGEST_RE.match(value):
+        return "digest"
+    return None
+
+
 def metric_class(benchmark: str, mode: str, field: str, value: float) -> str | None:
     if field in IGNORED_NUMERIC_FIELDS or field.endswith("_status"):
         return None
@@ -371,6 +381,17 @@ def extract_metrics(run: BenchmarkRun) -> dict[str, MetricSeries]:
                 raw = number(value)
                 if raw is not None:
                     flattened[normalize(str(key))] = raw
+                else:
+                    field = normalize(str(key))
+                    cls = digest_metric_class(field, value)
+                    if cls is None:
+                        continue
+                    metric_id = f"{benchmark}/{mode}/{field}"
+                    series = metrics.get(metric_id)
+                    if series is None:
+                        series = MetricSeries(metric_id=metric_id, metric_class=cls, values=[])
+                        metrics[metric_id] = series
+                    series.values.append(str(value))
         for field, value in flattened.items():
             cls = metric_class(benchmark, mode, field, value)
             if cls is None:
@@ -540,16 +561,38 @@ def compare_success_rate(current: float, baseline: float) -> tuple[str, float | 
     return "warn", delta_pct, threshold
 
 
-def current_stat(series: MetricSeries) -> float:
-    if series.metric_class == "success_rate":
-        return min(series.values)
-    return min(series.values)
+def compare_digest(current_values: list[MetricValue], baseline_values: list[MetricValue]) -> tuple[str, str | None, str, str]:
+    threshold = "fail on any digest change"
+    current_set = sorted({str(value) for value in current_values})
+    baseline_set = sorted({str(value) for value in baseline_values})
+    current_display = ",".join(current_set)
+    baseline_display = ",".join(baseline_set) if baseline_set else None
+    if current_set == baseline_set and len(current_set) == 1:
+        return "ok", baseline_display, threshold, ""
+    if len(current_set) != 1:
+        return "fail", baseline_display, threshold, "current run produced multiple rootfs index digests"
+    if len(baseline_set) != 1:
+        return "fail", baseline_display, threshold, "history contains multiple rootfs index digests"
+    return "fail", baseline_display, threshold, "rootfs index digest changed"
 
 
-def history_baseline(metric_class: str, baseline_runs: list[tuple[BenchmarkRun, MetricSeries]]) -> float:
+def numeric_values(values: list[MetricValue]) -> list[float]:
+    return [float(value) for value in values if isinstance(value, (int, float)) and not isinstance(value, bool)]
+
+
+def current_stat(series: MetricSeries) -> MetricValue:
+    if series.metric_class == "digest":
+        return ",".join(sorted({str(value) for value in series.values}))
+    values = numeric_values(series.values)
+    return min(values)
+
+
+def history_baseline(metric_class: str, baseline_runs: list[tuple[BenchmarkRun, MetricSeries]]) -> MetricValue:
+    if metric_class == "digest":
+        return ",".join(sorted({str(value) for _, hist_series in baseline_runs for value in hist_series.values}))
     if metric_class == "success_rate":
-        return max(max(hist_series.values) for _, hist_series in baseline_runs)
-    return min(min(hist_series.values) for _, hist_series in baseline_runs)
+        return max(max(numeric_values(hist_series.values)) for _, hist_series in baseline_runs)
+    return min(min(numeric_values(hist_series.values)) for _, hist_series in baseline_runs)
 
 
 def compatible_history_runs(current: BenchmarkRun, history_runs: list[BenchmarkRun], *, ignore_host: bool) -> list[BenchmarkRun]:
@@ -582,7 +625,12 @@ def evaluate(args: argparse.Namespace) -> tuple[list[Verdict], dict[str, Any]]:
     for metric_id, series in sorted(current_metrics.items()):
         current_value = current_stat(series)
         absolute_max = metric_absolute_max(current, metric_id)
-        ceiling_failed = absolute_max is not None and series.metric_class != "success_rate" and current_value > absolute_max
+        ceiling_failed = (
+            absolute_max is not None
+            and series.metric_class not in ("success_rate", "digest")
+            and isinstance(current_value, (int, float))
+            and current_value > absolute_max
+        )
         if has_explicit_reset(current, metric_id):
             if ceiling_failed:
                 verdicts.append(Verdict(
@@ -646,17 +694,25 @@ def evaluate(args: argparse.Namespace) -> tuple[list[Verdict], dict[str, Any]]:
             ))
             continue
         baseline = history_baseline(series.metric_class, baseline_runs)
-        delta = current_value - baseline
+        delta = current_value - baseline if isinstance(current_value, (int, float)) and isinstance(baseline, (int, float)) else None
         if ceiling_failed:
             verdict, delta_pct, threshold = "fail", ((current_value - baseline) / baseline) * 100.0 if baseline else None, f"absolute max <= {fmt_value(absolute_max, metric_id)}"
             note = "current value exceeds the durable expectation ceiling"
+        elif series.metric_class == "digest":
+            baseline_values = [value for _, hist_series in baseline_runs for value in hist_series.values]
+            verdict, baseline_display, threshold, note = compare_digest(series.values, baseline_values)
+            baseline = baseline_display
+            delta_pct = None
         elif series.metric_class == "counter":
+            assert isinstance(current_value, (int, float)) and isinstance(baseline, (int, float))
             verdict, delta_pct, threshold = compare_counter(current_value, baseline)
             note = ""
         elif series.metric_class == "success_rate":
+            assert isinstance(current_value, (int, float)) and isinstance(baseline, (int, float))
             verdict, delta_pct, threshold = compare_success_rate(current_value, baseline)
             note = ""
         else:
+            assert isinstance(current_value, (int, float)) and isinstance(baseline, (int, float))
             warn = THROUGHPUT_WARN if series.metric_class == "throughput" else LATENCY_WARN
             verdict, delta_pct, threshold = compare_timing(current_value, baseline, warn)
             note = ""
@@ -695,9 +751,13 @@ def evaluate(args: argparse.Namespace) -> tuple[list[Verdict], dict[str, Any]]:
     return verdicts, summary
 
 
-def fmt_value(value: float | None, metric_id: str) -> str:
+def fmt_value(value: MetricValue | None, metric_id: str) -> str:
     if value is None:
         return "-"
+    if isinstance(value, str):
+        if metric_id.endswith("digest") and len(value) > 40:
+            return f"{value[:22]}...{value[-8:]}"
+        return value
     if metric_id.endswith("/success_rate") or metric_id.endswith("_success_rate"):
         return f"{value * 100:.1f}%"
     if metric_id.endswith("_ms"):
@@ -756,7 +816,7 @@ def render_markdown(verdicts: list[Verdict], summary: dict[str, Any]) -> str:
             f"{fmt_delta(item)} | {item.history_runs} | {item.threshold} | {item.note} |"
         )
     lines.append("")
-    lines.append("_Current and baseline values are min-of-run samples for lower-is-better metrics; success_rate uses the trailing best rate. Counters warn on any unexplained change._")
+    lines.append("_Current and baseline values are min-of-run samples for lower-is-better metrics; success_rate uses the trailing best rate. Digest metrics fail on any change. Counters warn on any unexplained change._")
     return "\n".join(lines) + "\n"
 
 
@@ -908,6 +968,44 @@ def self_test() -> None:
         args = parse_args([str(counter / "results.jsonl"), "--history", str(counter_hist)])
         verdicts, summary = evaluate(args)
         assert summary["warnings"] == 1
+
+        digest_a = "blake3:" + ("a" * 64)
+        digest_b = "blake3:" + ("b" * 64)
+        digest_hist = write_fixture_run(
+            tmp,
+            "digest-hist",
+            [{"benchmark": "cold_import", "mode": "synthetic_tar", "rootfs_import_index_digest": digest_a}],
+        )
+        digest_same = write_fixture_run(
+            tmp,
+            "digest-same",
+            [{"benchmark": "cold_import", "mode": "synthetic_tar", "rootfs_import_index_digest": digest_a}],
+        )
+        args = parse_args([str(digest_same / "results.jsonl"), "--history", str(digest_hist)])
+        verdicts, summary = evaluate(args)
+        assert summary["failures"] == 0
+        assert next(item for item in verdicts if item.metric_id == "cold_import/synthetic_tar/rootfs_import_index_digest").verdict == "ok"
+        digest_changed = write_fixture_run(
+            tmp,
+            "digest-changed",
+            [{"benchmark": "cold_import", "mode": "synthetic_tar", "rootfs_import_index_digest": digest_b}],
+        )
+        args = parse_args([str(digest_changed / "results.jsonl"), "--history", str(digest_hist)])
+        verdicts, summary = evaluate(args)
+        assert summary["failures"] == 1
+        changed_item = next(item for item in verdicts if item.metric_id == "cold_import/synthetic_tar/rootfs_import_index_digest")
+        assert changed_item.verdict == "fail"
+        assert changed_item.metric_class == "digest"
+        digest_reset = write_fixture_run(
+            tmp,
+            "digest-reset",
+            [{"benchmark": "cold_import", "mode": "synthetic_tar", "rootfs_import_index_digest": digest_b}],
+            {"benchmark_history_reset": {"source": "self-test", "targets": ["cold_import/synthetic_tar/rootfs_import_index_digest"]}},
+        )
+        args = parse_args([str(digest_reset / "results.jsonl"), "--history", str(digest_hist)])
+        verdicts, summary = evaluate(args)
+        assert summary["failures"] == 0
+        assert next(item for item in verdicts if item.metric_id == "cold_import/synthetic_tar/rootfs_import_index_digest").verdict == "reset"
 
         writable_phase = write_fixture_run(
             tmp,
