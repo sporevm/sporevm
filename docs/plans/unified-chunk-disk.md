@@ -274,13 +274,12 @@ operation already exists in the tree for RAM: `dirty_ram.zig` seals dirty 2MiB
 memory chunks into verified chunk refs plus a same-host backing file, with
 parallel workers, zero-scan elision, write-if-missing dedupe, and phase-level
 stats.
-Disk does not get its own sealer: U3 extracts the generic core out of
-`dirty_ram.zig` into a shared module (working name `chunk_sealer.zig`)
-parameterized by chunk size, dirty source, and object-write target, with
-RAM-specific pieces (backing-file writes, the HMAC proof) staying in
-`dirty_ram.zig` as a thin layer over it. The disk `snapshot()` and the RAM
-sealer are then the same loop with different parameters, and sealer
-improvements (parallelism tuning, stats) land once for both.
+Disk does not duplicate the sealing and publication primitives: U3 extracts
+the generic core out of `dirty_ram.zig` into `chunk_sealer.zig`, with
+RAM-specific backing/proof work and disk-specific dirty-map traversal staying
+in their domain modules. RAM and disk retain separate traversal loops because
+their source and lifecycle semantics differ, while zero classification, chunk
+identity, durable CAS publication, and work accounting stay shared.
 
 One invariant governs all producers: **an index is only ever written once
 every chunk it references is durable in a store.** "Index exists" always
@@ -453,10 +452,10 @@ from `cow_disk.zig`.
 Status: complete in branch.
 
 Extract the shared `chunk_sealer.zig` core from `dirty_ram.zig` (RAM path
-refactored onto it, behavior-identical); implement `snapshot()` on that
-core; cut `spore save` to emit index + chunks + v2 manifest; cut
-restore/resume to open indexes. Delete `LayeredCowDisk`, layer chains,
-`spore.DiskLayer`.
+refactored onto it, behavior-identical); implement
+`ChunkMappedDisk.snapshotIndex()` using those shared primitives; cut
+`spore save` to emit index + chunks + v2 manifest; cut restore/resume to open
+indexes. Delete `LayeredCowDisk`, layer chains, `spore.DiskLayer`.
 
 Landed behavior: RAM sealing and disk snapshotting share
 `src/chunk_sealer.zig` for zero elision, BLAKE3 chunk identity, and verified
@@ -490,7 +489,8 @@ saves retaining the latest disk identity.
 Done when: save→restore round trip preserves guest-visible disk state
 (existing lifecycle tests, rewritten for v2); the RAM sealer's existing
 tests (including `dirty_ram.zig`'s corrupt-chunk rejection) pass unchanged
-on the shared core, and disk `snapshot()` has no sealing loop of its own;
+on the shared core, and disk `snapshot()` uses the shared classification and
+durable-publication primitives while keeping its dirty-map traversal local;
 v0/v1 spores fail closed with a clear "format too old" error; the deleted
 code is gone, not flagged off; `docs/spore-format.md` documents v2 and the
 break.
@@ -766,8 +766,9 @@ benchmark reports canonical index identity plus the current CAS preload phase.
   not a standalone simplification: fork and partial materialization are
   in-plan milestones (U6, U7), not extensions.
 - Memory/disk parity is in-plan, not aspirational: RAM is the reference
-  implementation of the model, disk adopts its sealer (shared core, U3) and
-  its identity scheme, and memory adopts the unified index encoding (U5).
+  implementation of the model, disk adopts its identity plus the shared
+  classification, publication, and work-accounting primitives (U3), and memory
+  adopts the unified index encoding (U5).
   Chunk granularity stays per-domain (RAM 2MiB, disk 64KiB). Only store
   unification remains open.
 - Flat materialization stays the hot steady-state read path; the CAS is
