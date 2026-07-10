@@ -400,11 +400,18 @@ CAS preload all validate through that parser. The parser rejects
 entries are abandoned rather than migrated. `spore cache gc` performs a
 dry-run-by-default mark/sweep over rootfs CAS indexes and objects, rooting
 descriptor-selected indexes from cache metadata, ref records, and live runtime
-resume manifests.
+resume manifests. Valid build step records also root their child index and
+objects; known incomplete records remain cache misses, while unknown future
+record kinds conservatively retain the whole CAS. Builds take the coarse rootfs
+cache lock after resolving `FROM` and hold it through cache lookup and execution,
+so GC cannot sweep objects between step snapshot publication and the durable
+record that roots them.
 
 Validation: `mise run test` covers index parser/fuzz coverage and a GC model
 test that preserves a rooted index/object pair while deleting an unrooted index,
-its object, and a stray object.
+its object, and a stray object. Build-cache GC tests preserve a step-record-only
+root and its subsequent cache hit, ignore a known incomplete record, and retain
+all CAS entries for an unknown build-record kind.
 
 ### U2 — Chunk-mapped runtime backend
 

@@ -101,6 +101,8 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     var stat_cache = build_context.StatCache.load(allocator, init.io, cache_root, &diagnostic.context_hash);
     defer stat_cache.save(&diagnostic.context_hash);
+    var cache_lock: ?rootfs_mod.RootfsCacheLock = null;
+    defer if (cache_lock) |*lock| lock.deinit();
 
     var state: ?State = null;
     var pre_from_args = std.array_list.Managed(ArgValue).init(allocator);
@@ -123,6 +125,10 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                 const base = try resolveBase(init, allocator, options, source);
                 if (!try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, base.cache_root, base.storage)) return error.RootFSDigestCacheMiss;
                 state = try stateFromBase(allocator, base.config, base.storage);
+                // FROM resolution may import and lock the cache itself. Once it
+                // completes, serialize the remaining build against destructive
+                // GC until every resulting storage value has a durable root.
+                cache_lock = try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, cache_root);
                 saw_from = true;
             },
             else => {
@@ -166,6 +172,11 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         }
     }
     const final_state = state orelse return error.MissingDockerfileFrom;
+    // Executed states are rooted by step records; metadata-only builds still
+    // reference their already-rooted base. Release before local-ref publication,
+    // which takes the cache lock through its own writer path.
+    cache_lock.?.deinit();
+    cache_lock = null;
     const publish = try rootfs_mod.publishIndexedImage(init, allocator, .{
         .ref = options.tag,
         .platform = options.platform,

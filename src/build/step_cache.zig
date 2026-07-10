@@ -11,6 +11,16 @@ pub const builder_version = "sporevm-build-v1";
 const record_kind = "sporevm-build-step-v1";
 const max_step_record_bytes = 256 * 1024;
 
+const RecordEnvelope = struct {
+    kind: []const u8,
+};
+
+pub const GcRecordInspection = union(enum) {
+    root: spore.RootfsStorage,
+    stale,
+    unknown,
+};
+
 pub const StepInput = struct {
     platform: rootfs_mod.Platform,
     parent_index_digest: []const u8,
@@ -148,10 +158,9 @@ pub fn readHit(
     }) catch return null;
     defer parsed.deinit();
     const record = parsed.value;
-    if (!std.mem.eql(u8, record.kind, record_kind)) return null;
+    const storage = validChildStorage(record, expected_key) orelse return null;
     if (!std.mem.eql(u8, record.builder_version, builder_version)) return null;
     if (!std.mem.eql(u8, record.platform.os, input.platform.os) or !std.mem.eql(u8, record.platform.arch, input.platform.arch)) return null;
-    if (!std.mem.eql(u8, record.step_key, expected_key)) return null;
     if (!std.mem.eql(u8, record.parent_index_digest, input.parent_index_digest)) return null;
     if (!std.mem.eql(u8, record.instruction_kind, input.instruction_kind)) return null;
     if (!std.mem.eql(u8, record.instruction, input.canonical_instruction)) return null;
@@ -159,11 +168,54 @@ pub fn readHit(
     if (!std.mem.eql(u8, record.input_digest, input.input_digest)) return null;
     if (!std.mem.eql(u8, record.env_digest, input.env_digest)) return null;
     if (!std.mem.eql(u8, record.workdir, input.workdir)) return null;
+    if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, storage)) return null;
+    return try spore.cloneRootfsStorage(allocator, storage);
+}
+
+pub fn inspectRecordForGc(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    path: []const u8,
+    expected_key: []const u8,
+) !GcRecordInspection {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_step_record_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return .stale,
+        error.StreamTooLong => return .unknown,
+        else => |e| return e,
+    };
+    defer allocator.free(bytes);
+    var envelope = std.json.parseFromSlice(RecordEnvelope, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return .unknown;
+    defer envelope.deinit();
+    if (!std.mem.eql(u8, envelope.value.kind, record_kind)) return .unknown;
+
+    var parsed = std.json.parseFromSlice(StepRecord, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return .stale;
+    defer parsed.deinit();
+    // Builder-version mismatches are cache misses for this binary, but the
+    // schema-valid child may still be live for another version. Root it until
+    // explicit step-record retention policy removes the record.
+    const storage = validChildStorage(parsed.value, expected_key) orelse return .stale;
+    // Complete stamps are invalidated before normal CAS deletion, so retain the
+    // O(1) fast path when possible and scan every object only to repair legacy
+    // or interrupted publication.
+    if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, storage) and
+        !try rootfs_cas.storageContentComplete(io, allocator, cache_root, storage)) return .stale;
+    return .{ .root = try spore.cloneRootfsStorage(allocator, storage) };
+}
+
+fn validChildStorage(record: StepRecord, expected_key: []const u8) ?spore.RootfsStorage {
+    if (!std.mem.eql(u8, record.kind, record_kind)) return null;
+    if (!std.mem.eql(u8, record.step_key, expected_key)) return null;
     if (!std.mem.eql(u8, record.rootfs_storage.index_digest, record.child_index_digest)) return null;
     if (!std.mem.eql(u8, record.rootfs_storage.base_identity, record.child_index_digest)) return null;
     spore.validateRootfsStorageDescriptor(record.rootfs_storage) catch return null;
-    if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, record.rootfs_storage)) return null;
-    return try spore.cloneRootfsStorage(allocator, record.rootfs_storage);
+    return record.rootfs_storage;
 }
 
 fn finishHex(allocator: std.mem.Allocator, h: *Blake3) ![]const u8 {
