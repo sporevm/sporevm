@@ -43,6 +43,12 @@ pub const WriteIfMissingResult = enum {
     reused_existing,
 };
 
+pub const PublishTrustedFileResult = enum {
+    linked,
+    reused_existing,
+    copy_required,
+};
+
 pub fn sealBytes(data: []const u8, work_stats: *WorkStats) Error!SealResult {
     const zero_scan_start = try monotonicNs();
     const is_zero = std.mem.allEqual(u8, data, 0);
@@ -100,6 +106,35 @@ pub fn pwriteFileAllTimed(fd: std.c.fd_t, offset: usize, data: []const u8, work_
     const start = try monotonicNs();
     try pwriteFileAll(fd, offset, data);
     work_stats.backing_write_ns +|= try elapsedMonotonicNs(start);
+}
+
+/// Publishes an already-verified, read-only CAS object into another CAS root.
+/// The caller must fsync the destination directory after batching successful
+/// links and before publishing an index that references them.
+pub fn publishTrustedFileIfMissing(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    dest_path: []const u8,
+    expected_size: usize,
+) Error!PublishTrustedFileResult {
+    const source_z = try allocator.dupeZ(u8, source_path);
+    defer allocator.free(source_z);
+    const dest_z = try allocator.dupeZ(u8, dest_path);
+    defer allocator.free(dest_z);
+
+    const source_fd = std.c.open(source_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (source_fd < 0) return error.BadChunk;
+    defer _ = std.c.close(source_fd);
+    if (try fstatRegularSize(source_fd) != expected_size) return error.BadChunk;
+
+    if (std.c.link(source_z.ptr, dest_z.ptr) == 0) return .linked;
+    if (std.c.errno(-1) != .EXIST) return .copy_required;
+
+    const dest_fd = std.c.open(dest_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (dest_fd < 0) return error.BadChunk;
+    defer _ = std.c.close(dest_fd);
+    if (try fstatRegularSize(dest_fd) != expected_size) return error.BadChunk;
+    return .reused_existing;
 }
 
 /// Durable CAS object write: returns only after the object bytes and containing
@@ -271,9 +306,13 @@ fn verifyExistingFile(path: [:0]const u8, expected: []const u8) Error!void {
 
 pub fn fsyncParentDirPath(allocator: std.mem.Allocator, path: []const u8) Error!void {
     const parent = std.fs.path.dirname(path) orelse ".";
-    const parent_z = try allocator.dupeZ(u8, parent);
-    defer allocator.free(parent_z);
-    const fd = std.c.open(parent_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    try fsyncDirPath(allocator, parent);
+}
+
+pub fn fsyncDirPath(allocator: std.mem.Allocator, path: []const u8) Error!void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.IoFailed;
     defer _ = std.c.close(fd);
     try fsyncFd(fd);

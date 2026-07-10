@@ -148,6 +148,13 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         }
         const base_source = try runtime.baseSource(base.size);
         runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, base.size, base.chunk_size);
+        if (rootfs.storage) |storage| {
+            const cache_root = try rootfsCacheRootPath(context, allocator);
+            defer allocator.free(cache_root);
+            var parsed = try readDiskIndex(context, allocator, cache_root, storage);
+            defer parsed.deinit();
+            try runtime.chunk_mapped.?.attachParentIndex(cache_root, parsed.value);
+        }
         runtime.base_disk = base;
         return runtime;
     }
@@ -429,6 +436,9 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
 
     try std.testing.expect(runtime.rootfs_fd != null);
     try std.testing.expect(runtime.chunk_mapped != null);
+    try std.testing.expect(runtime.chunk_mapped.?.cas_root == null);
+    try std.testing.expect(runtime.chunk_mapped.?.parent_root != null);
+    try std.testing.expectEqual(runtime.chunk_mapped.?.chunkCount(), runtime.chunk_mapped.?.parent_digests.len);
     var readback: [4]u8 = undefined;
     try runtime.chunk_mapped.?.readAt(&readback, 0);
     try std.testing.expectEqualStrings("abcd", &readback);

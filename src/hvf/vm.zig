@@ -2198,7 +2198,9 @@ fn takeSnapshot(
             std.log.debug("local RAM backing proof unavailable: {s}", .{@errorName(err)});
         };
     }
+    const disk_start = monotonicMs();
     const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir, disk_quiesced) else null;
+    const disk_ms = monotonicMs() - disk_start;
     const manifest_start = monotonicMs();
     try spore.saveManifest(arena, dir, .{
         .platform = .{
@@ -2231,7 +2233,7 @@ fn takeSnapshot(
         var metrics_tail_buf: [3072]u8 = undefined;
         const metrics_head = std.fmt.bufPrint(
             &metrics_head_buf,
-            "hvf snapshot metrics: mode=write-protect ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} dirty_epoch_ms={d} dirty_epoch_count={d} write_fault_count={d} dirty_chunks_total={d} dirty_chunks_tail={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} seed_protect_ms={d} tail_flush_ms={d}",
+            "hvf snapshot metrics: mode=write-protect ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} dirty_epoch_ms={d} dirty_epoch_count={d} write_fault_count={d} dirty_chunks_total={d} dirty_chunks_tail={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} seed_protect_ms={d} tail_flush_ms={d}",
             .{
                 platform.ram_size / 1024 / 1024,
                 memory_plan.chunk_count,
@@ -2240,6 +2242,7 @@ fn takeSnapshot(
                 devices_ms,
                 generation_ms,
                 memory_ms,
+                disk_ms,
                 manifest_ms,
                 snapshot_total_ms,
                 snapshot_total_ms,
@@ -2289,7 +2292,7 @@ fn takeSnapshot(
         std.log.info("{s}{s}", .{ metrics_head, metrics_tail });
     } else {
         std.log.info(
-            "hvf snapshot metrics: mode=full-scan ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d}",
+            "hvf snapshot metrics: mode=full-scan ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d}",
             .{
                 platform.ram_size / 1024 / 1024,
                 memory_plan.chunk_count,
@@ -2298,6 +2301,7 @@ fn takeSnapshot(
                 devices_ms,
                 generation_ms,
                 memory_ms,
+                disk_ms,
                 manifest_ms,
                 snapshot_total_ms,
                 snapshot_total_ms,
@@ -2380,7 +2384,9 @@ fn takeSnapshotV1(
             std.log.debug("local RAM backing proof unavailable: {s}", .{@errorName(err)});
         };
     }
+    const disk_start = monotonicMs();
     const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir, disk_quiesced) else null;
+    const disk_ms = monotonicMs() - disk_start;
     const manifest_start = monotonicMs();
     try spore.saveManifestV1(arena, dir, .{
         .platform = .{
@@ -2408,7 +2414,7 @@ fn takeSnapshotV1(
     const snapshot_total_ms = monotonicMs() - total_start;
     const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
     std.log.info(
-        "hvf snapshot metrics: version=1 vcpus={d} mode=full-scan ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} manifest_ms={d} snapshot_total_ms={d}",
+        "hvf snapshot metrics: version=1 vcpus={d} mode=full-scan ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_total_ms={d}",
         .{
             vcpus.len,
             platform.ram_size / 1024 / 1024,
@@ -2418,6 +2424,7 @@ fn takeSnapshotV1(
             devices_ms,
             generation_ms,
             memory_ms,
+            disk_ms,
             manifest_ms,
             snapshot_total_ms,
         },
