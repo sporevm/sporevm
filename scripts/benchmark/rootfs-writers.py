@@ -25,7 +25,7 @@ CONVERSION_PHASES = (
     "ext4_create_empty",
     "mkfs_ext4",
     "debugfs_finalize",
-    "rootfs_blake3",
+    "rootfs_cas_preload",
     "native_ext4_emit",
 )
 
@@ -113,18 +113,24 @@ def run_writer(args: argparse.Namespace, writer: str, root: Path) -> dict[str, o
     ]
     status, elapsed_ms = run_command(argv, env, stdout, stderr, args.timeout_s)
     metadata_json = load_metadata(metadata)
+    rootfs_storage = metadata_json.get("rootfs_storage")
+    index_digest = rootfs_storage.get("index_digest") if isinstance(rootfs_storage, dict) else None
+    valid_index_digest = (
+        isinstance(index_digest, str)
+        and re.fullmatch(r"blake3:[0-9a-f]{64}", index_digest) is not None
+    )
     phases = parse_profile(stderr)
     return {
         "writer": writer,
         "status": status,
-        "success": status == 0,
+        "success": status == 0 and valid_index_digest,
         "elapsed_ms": elapsed_ms,
         "output": str(output),
         "metadata": str(metadata),
         "stdout": str(stdout),
         "stderr": str(stderr),
         "rootfs_size": metadata_json.get("rootfs_size"),
-        "rootfs_blake3": metadata_json.get("rootfs_blake3"),
+        "index_digest": index_digest,
         "resolved_image_ref": metadata_json.get("resolved_image_ref"),
         "phases": phases,
         "conversion_ms": conversion_ms(phases),
@@ -152,12 +158,12 @@ def render_markdown(result: dict[str, object]) -> str:
         f"- Platform: `{result['platform']}`",
         f"- Spore binary: `{result['spore_bin']}`",
         "",
-        "| Writer | Status | Total | Conversion phases | Rootfs size | BLAKE3 |",
+        "| Writer | Status | Total | Conversion phases | Rootfs size | Index digest |",
         "|---|---:|---:|---:|---:|---|",
     ]
     for writer in ("external", "native"):
         run = runs.get(writer, {})
-        digest = str(run.get("rootfs_blake3") or "-")
+        digest = str(run.get("index_digest") or "-")
         if len(digest) > 16:
             digest = digest[:16]
         lines.append(

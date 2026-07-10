@@ -110,7 +110,7 @@ enters the manifest.
 The value is guest architectural state and may be copied by name across
 backends.
 
-Current portable manifest-v0 set:
+Current portable single-vCPU machine-state set:
 
 - GPRs: `x0`–`x30`.
 - Control flow: `pc`, `cpsr`.

@@ -4,7 +4,9 @@ const ext4 = @import("rootfs/ext4.zig");
 const ext4_writer = @import("rootfs/ext4_writer.zig");
 const local_paths = @import("local_paths.zig");
 const rootfs = @import("rootfs.zig");
+const rootfs_cas = @import("rootfs_cas.zig");
 const xattrs_mod = @import("rootfs/xattrs.zig");
+const spore = @import("spore.zig");
 
 const Io = std.Io;
 
@@ -43,8 +45,9 @@ test "native ext4 writer emits deterministic fsck-clean image" {
     const first = try ext4_writer.emit(allocator, io, path_a, &entries, opts);
     const second = try ext4_writer.emit(allocator, io, path_b, &entries, opts);
     try std.testing.expectEqual(first.size, second.size);
-    try std.testing.expectEqualSlices(u8, &first.blake3, &second.blake3);
-    try std.testing.expectEqualSlices(u8, &first.blake3, &(try ext4.blake3File(io, path_a)));
+    const first_digest = try ext4.blake3File(io, path_a);
+    const second_digest = try ext4.blake3File(io, path_b);
+    try std.testing.expectEqualSlices(u8, &first_digest, &second_digest);
     try runE2fsck(allocator, io, path_a);
 }
 
@@ -63,7 +66,6 @@ test "native ext4 writer emits fsck-clean multi-group image" {
         .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-multigroup"),
     });
     try std.testing.expectEqual(@as(u64, 512 << 20), result.size);
-    try std.testing.expectEqualSlices(u8, &result.blake3, &(try ext4.blake3File(io, path)));
     try runE2fsck(allocator, io, path);
 }
 
@@ -83,12 +85,11 @@ test "native ext4 writer emits fsck-clean symlinks at the fast/slow boundary" {
         .{ .path = "etc/link-60", .kind = .{ .symlink = target_60 } },
         .{ .path = "etc/link-61", .kind = .{ .symlink = target_61 } },
     };
-    const result = try ext4_writer.emit(allocator, io, path, &entries, .{
+    _ = try ext4_writer.emit(allocator, io, path, &entries, .{
         .image_size = min_native_image_size,
         .inode_count = 1024,
         .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-symlink-boundary"),
     });
-    try std.testing.expectEqualSlices(u8, &result.blake3, &(try ext4.blake3File(io, path)));
     try runE2fsck(allocator, io, path);
 }
 
@@ -105,12 +106,11 @@ test "native ext4 writer supports double indirect regular files" {
     const entries = [_]ext4_writer.Entry{
         .{ .path = "var/big.bin", .kind = .{ .file = data }, .mode = 0o644 },
     };
-    const result = try ext4_writer.emit(allocator, io, path, &entries, .{
+    _ = try ext4_writer.emit(allocator, io, path, &entries, .{
         .image_size = 32 << 20,
         .inode_count = 1024,
         .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-double-indirect"),
     });
-    try std.testing.expectEqualSlices(u8, &result.blake3, &(try ext4.blake3File(io, path)));
     try runE2fsck(allocator, io, path);
 }
 
@@ -124,12 +124,11 @@ test "native ext4 writer resolves hardlinks after sorted targets" {
         .{ .path = "z-target", .kind = .{ .file = "shared\n" }, .mode = 0o644 },
         .{ .path = "a-alias", .kind = .{ .hardlink = "z-target" } },
     };
-    const result = try ext4_writer.emit(allocator, io, path, &entries, .{
+    _ = try ext4_writer.emit(allocator, io, path, &entries, .{
         .image_size = min_native_image_size,
         .inode_count = 1024,
         .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-hardlink-order"),
     });
-    try std.testing.expectEqualSlices(u8, &result.blake3, &(try ext4.blake3File(io, path)));
     try runE2fsck(allocator, io, path);
 }
 
@@ -159,16 +158,16 @@ test "imported tar rootfs uses native ext4 writer by default" {
     const result = try rootfs.importTar(init, import_allocator, .{
         .input = layer_path,
         .ref = "local/native-default:latest",
-        .rootfs_storage = .flat,
     });
     defer rootfs.deinitImportTarResult(import_allocator, result);
 
-    try std.testing.expectEqualSlices(u8, &result.rootfs_blake3, &(try ext4.blake3File(io, result.rootfs_path)));
+    try expectCompleteRootfsStorage(import_allocator, io, cache_root, result.rootfs_storage);
     const metadata_bytes = try Io.Dir.cwd().readFileAlloc(io, result.metadata_path, allocator, .limited(max_rootfs_metadata_bytes));
     defer allocator.free(metadata_bytes);
     try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"ext4_writer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"native\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"rootfs_storage\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"rootfs_storage\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"rootfs_blake3\"") == null);
 }
 
 test "native and external imported rootfs expose matching files" {
@@ -209,34 +208,31 @@ test "native and external imported rootfs expose matching files" {
     const external_result = try rootfs.importTar(init, import_allocator, .{
         .input = layer_path,
         .ref = "local/native-external:external",
-        .rootfs_storage = .flat,
         .mkfs = mkfs,
         .debugfs = debugfs,
     });
     defer rootfs.deinitImportTarResult(import_allocator, external_result);
-    try std.testing.expectEqualSlices(u8, &external_result.rootfs_blake3, &(try ext4.blake3File(io, external_result.rootfs_path)));
+    try expectCompleteRootfsStorage(import_allocator, io, cache_root, external_result.rootfs_storage);
 
     try env.put(ext4_writer_env, "native");
     const native_result = try rootfs.importTar(init, import_allocator, .{
         .input = layer_path,
         .ref = "local/native-external:native",
-        .rootfs_storage = .flat,
         .mkfs = mkfs,
         .debugfs = debugfs,
     });
     defer rootfs.deinitImportTarResult(import_allocator, native_result);
-    try std.testing.expectEqualSlices(u8, &native_result.rootfs_blake3, &(try ext4.blake3File(io, native_result.rootfs_path)));
+    try expectCompleteRootfsStorage(import_allocator, io, cache_root, native_result.rootfs_storage);
 
     const native_repeat_result = try rootfs.importTar(init, import_allocator, .{
         .input = layer_path,
         .ref = "local/native-external:native-repeat",
-        .rootfs_storage = .flat,
         .mkfs = mkfs,
         .debugfs = debugfs,
     });
     defer rootfs.deinitImportTarResult(import_allocator, native_repeat_result);
-    try std.testing.expectEqualSlices(u8, &native_result.rootfs_blake3, &native_repeat_result.rootfs_blake3);
-    try std.testing.expectEqualSlices(u8, &native_repeat_result.rootfs_blake3, &(try ext4.blake3File(io, native_repeat_result.rootfs_path)));
+    try expectCompleteRootfsStorage(import_allocator, io, cache_root, native_repeat_result.rootfs_storage);
+    try std.testing.expectEqualStrings(native_result.rootfs_storage.index_digest, native_repeat_result.rootfs_storage.index_digest);
 
     const paths = [_]struct {
         path: []const u8,
@@ -253,6 +249,17 @@ test "native and external imported rootfs expose matching files" {
         try std.testing.expectEqualStrings(entry.expected, external);
         try std.testing.expectEqualStrings(external, native);
     }
+}
+
+fn expectCompleteRootfsStorage(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    storage: spore.RootfsStorage,
+) !void {
+    try spore.validateRootfsStorageDescriptor(storage);
+    try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, cache_root, storage));
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, storage));
 }
 
 fn testInit(
