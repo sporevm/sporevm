@@ -36,6 +36,27 @@ steps:
     agents:
       queue: sporevm-mac
 
+  - label: ":stopwatch: Named restore readiness (Linux ARM64)"
+    key: "named-restore-readiness-linux-arm64"
+    if: build.env("SPOREVM_RUN_NAMED_RESTORE_BENCHMARK") == "1"
+    command: |
+      mise install
+      scripts/ci/buildkite-named-restore-readiness.sh
+    artifact_paths:
+      - "zig-cache/named-restore-readiness/*.jsonl"
+    plugins:
+      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          version: "2026.5.12"
+    cache:
+      paths:
+        - "~/.local/share/mise"
+        - "~/.cache/mise"
+        - "~/.local/state/mise"
+      size: "20g"
+      name: "mise-cache"
+    agents:
+      queue: sporevm-linux-arm64
+
   - label: ":ext4: Slow Rootfs Tests (Linux)"
     key: "rootfs-slow-test-linux"
     if: build.env("SPOREVM_RUN_ROOTFS_SLOW_TESTS") == "1"

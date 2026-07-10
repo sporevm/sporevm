@@ -95,6 +95,21 @@ config so build-mode changes are attributable in the series.
 
 ## Benchmarks
 
+### Named Restore Readiness
+
+Use an immutable saved parent to measure the persistent named path separately
+from one-shot `run --from`:
+
+```console
+scripts/benchmark/named-restore-readiness.py --spore-dir parent.spore
+```
+
+The benchmark builds SporeVM in ReleaseSafe mode unless `--no-build` is passed.
+Each JSONL row records CLI restore-return wall time, the observed exec-ready
+point and its source, the machine-reported exec-ready wait and total, the first
+`/bin/true` exec, repeated no-op exec samples and median, and cleanup time. The
+input spore is only read and can be reused across iterations.
+
 ### Cold TTI
 
 Cold TTI follows the ComputeSDK benchmark shape: the timer starts before

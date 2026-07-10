@@ -543,6 +543,14 @@ pub const NamedLifecycleResult = struct {
     console_log_path: ?[]const u8 = null,
     spore_dir: ?[]const u8 = null,
     saved_sessions: ?usize = null,
+    timing: ?NamedLifecycleTiming = null,
+};
+
+pub const NamedLifecycleTiming = struct {
+    prepare_ms: u64,
+    spawn_monitor_ms: u64,
+    wait_exec_ready_ms: u64,
+    total_ms: u64,
 };
 
 pub const ExecNamedResult = struct {
@@ -826,6 +834,12 @@ fn createNamedWithTiming(
         .state = "ready",
         .pid = ready.value.pid,
         .console_log_path = ready.value.console_log_path,
+        .timing = .{
+            .prepare_ms = rootfs_abspath_ms - timing.start_ms,
+            .spawn_monitor_ms = monitor_spawned_ms - rootfs_abspath_ms,
+            .wait_exec_ready_ms = ready_ms - monitor_spawned_ms,
+            .total_ms = ready_ms - timing.start_ms,
+        },
     });
 }
 
@@ -834,6 +848,7 @@ pub fn restoreNamed(
     allocator: std.mem.Allocator,
     options: RestoreNamedOptions,
 ) !NamedLifecycleResult {
+    const start_ms = monotonicMs();
     clearLastError();
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -921,9 +936,12 @@ pub fn restoreNamed(
     if (state != .absent) return namedVmExists(arena, init.io, paths, "restore", spec.name, state);
     if (spec.rootfs != null or spec.disk != null or spec.resume_generation != null or !spore.annotationsEmpty(spec.annotations) or spec.sessions.len != 0) try writeSpec(arena, init.io, paths, spec);
 
+    const prepared_ms = monotonicMs();
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (network_options.network == .spore) &network_options.policy else null;
     const spore_executable_path = try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, spawn_policy);
+    const monitor_spawned_ms = monotonicMs();
     try waitForReadyResult(arena, init.io, paths, spec.timeout_ms, spore_executable_path);
+    const ready_ms = monotonicMs();
 
     var ready = try readReady(arena, init.io, paths);
     defer ready.deinit();
@@ -934,6 +952,12 @@ pub fn restoreNamed(
         .pid = ready.value.pid,
         .console_log_path = ready.value.console_log_path,
         .spore_dir = spore_dir,
+        .timing = .{
+            .prepare_ms = prepared_ms - start_ms,
+            .spawn_monitor_ms = monitor_spawned_ms - prepared_ms,
+            .wait_exec_ready_ms = ready_ms - monitor_spawned_ms,
+            .total_ms = ready_ms - start_ms,
+        },
     });
 }
 
@@ -4505,6 +4529,7 @@ fn ownedNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycl
         .console_log_path = console_log_path,
         .spore_dir = spore_dir,
         .saved_sessions = result.saved_sessions,
+        .timing = result.timing,
     };
 }
 
@@ -6196,6 +6221,33 @@ test "lifecycle human results render terse status lines" {
         .children = &.{ "child-0", "child-1" },
     });
     try std.testing.expectEqualStrings("forked child-0 child-1\n", out.written());
+}
+
+test "named restore machine result reports exec readiness timing" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try machine_output.writeJson(allocator, &out.writer, NamedLifecycleResult{
+        .action = "restored",
+        .name = "worker-1",
+        .state = "ready",
+        .pid = 42,
+        .spore_dir = "/tmp/parent.spore",
+        .timing = .{
+            .prepare_ms = 3,
+            .spawn_monitor_ms = 4,
+            .wait_exec_ready_ms = 17,
+            .total_ms = 24,
+        },
+    });
+
+    var parsed = try std.json.parseFromSlice(NamedLifecycleResult, allocator, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("spore.lifecycle.v1", parsed.value.schema);
+    try std.testing.expectEqualStrings("restored", parsed.value.action);
+    try std.testing.expectEqual(@as(u64, 17), parsed.value.timing.?.wait_exec_ready_ms);
+    try std.testing.expectEqual(@as(u64, 24), parsed.value.timing.?.total_ms);
 }
 
 test "lifecycle list JSON exposes memory and nullable stats" {

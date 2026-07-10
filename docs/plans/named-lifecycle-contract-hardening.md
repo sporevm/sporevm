@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-06
+last_reviewed: 2026-07-10
 spec_refs:
   - docs/lifecycle.md
   - docs/libspore.md
@@ -20,6 +20,11 @@ startup waits for `ready.json`, a live PID, and a `control.sock` `hello`
 response with the `spore.monitor.hello.v1` schema, exact SporeVM version, and
 helper contract. Control operations re-check the handshake before sending
 operation-specific requests, except cleanup-oriented shutdown.
+
+The monitor now publishes `ready.json` only after the guest agent answers a
+dedicated readiness request. Named restore therefore returns exec-ready and its
+machine result reports preparation, monitor-spawn, readiness-wait, and total
+timings; callers no longer probe readiness with `exec /bin/true`.
 
 The durable contract lives in:
 

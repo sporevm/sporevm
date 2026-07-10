@@ -289,10 +289,14 @@ entry point. Zig and C callers default `spore_executable` to `"spore"`,
 resolved with the process `PATH` used for the operation. Go callers default to
 self re-exec through the linked embedder, described below.
 
-Before `createNamed`, `restoreNamed`, or `forkNamed` returns success, libspore
+Before `createNamed`, `restoreNamed`, or `forkNamed` returns success, the
+monitor completes a dedicated guest-agent readiness request, then libspore
 waits for `ready.json`, confirms the recorded PID is alive, connects to the
 monitor's local `control.sock`, and requires a `hello` response carrying exactly
-the same version as `libspore.version`.
+the same version as `libspore.version`. Successful startup is therefore
+exec-ready and does not require a caller-issued no-op command. Named lifecycle
+JSON results include preparation, monitor-spawn, exec-ready wait, and total
+timings in milliseconds.
 
 Exact version equality is the compatibility rule. The monitor argv and control
 socket protocol are private same-version contracts, not a stable cross-version

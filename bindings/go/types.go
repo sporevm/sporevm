@@ -362,14 +362,23 @@ type RemoveNamedOptions struct {
 
 // NamedLifecycleResult is the decoded spore.lifecycle.v1 contract.
 type NamedLifecycleResult struct {
-	Schema         string  `json:"schema"`
-	SchemaVersion  uint32  `json:"schema_version"`
-	Action         string  `json:"action"`
-	Name           string  `json:"name"`
-	State          string  `json:"state"`
-	PID            *int64  `json:"pid"`
-	ConsoleLogPath *string `json:"console_log_path"`
-	SporeDir       *string `json:"spore_dir"`
+	Schema         string                `json:"schema"`
+	SchemaVersion  uint32                `json:"schema_version"`
+	Action         string                `json:"action"`
+	Name           string                `json:"name"`
+	State          string                `json:"state"`
+	PID            *int64                `json:"pid"`
+	ConsoleLogPath *string               `json:"console_log_path"`
+	SporeDir       *string               `json:"spore_dir"`
+	Timing         *NamedLifecycleTiming `json:"timing"`
+}
+
+// NamedLifecycleTiming reports named VM startup phases in milliseconds.
+type NamedLifecycleTiming struct {
+	PrepareMs       uint64 `json:"prepare_ms"`
+	SpawnMonitorMs  uint64 `json:"spawn_monitor_ms"`
+	WaitExecReadyMs uint64 `json:"wait_exec_ready_ms"`
+	TotalMs         uint64 `json:"total_ms"`
 }
 
 // ExecNamedResult is the decoded named exec result contract.

@@ -1358,6 +1358,7 @@ static int parse_env(const char *req, char storage[MAX_ENVC][MAX_ENV_LEN], char 
 }
 
 enum request_kind {
+  REQUEST_READY,
   REQUEST_START,
   REQUEST_ATTACH,
   REQUEST_GENERATION,
@@ -1445,7 +1446,9 @@ static int parse_request(const char *req, struct run_request *out) {
   int type_rc = parse_string_field(req, "type", type, sizeof(type));
   if (type_rc < 0) return -1;
   if (type_rc > 0) {
-    if (strcmp(type, "start") == 0) {
+    if (strcmp(type, "ready") == 0) {
+      out->kind = REQUEST_READY;
+    } else if (strcmp(type, "start") == 0) {
       out->kind = REQUEST_START;
     } else if (strcmp(type, "start-v1") == 0) {
       out->kind = REQUEST_START;
@@ -3940,6 +3943,22 @@ static void accept_request(int listener, struct session *session, struct client 
   client->stdin_input_owner = request.protocol_v1 && request.stdin_enabled;
   client->terminal_input_owner = request.protocol_v1 && request.tty && (request.kind == REQUEST_START || request.interactive);
 
+  if (request.kind == REQUEST_READY) {
+    if (use_rootfs && !rootfs_ready) {
+      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
+      close_client(client);
+      return;
+    }
+    if (network_requested && !network_ready) {
+      (void)send_client_error_exit(client, 126, network_error[0] != '\0' ? network_error : "spore run: network unavailable\n");
+      close_client(client);
+      return;
+    }
+    (void)send_exit_frame(client->fd, 0);
+    close_client(client);
+    return;
+  }
+
   if (request.kind == REQUEST_GENERATION) {
     if (use_rootfs && !rootfs_ready) {
       (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
@@ -4163,6 +4182,7 @@ enum spore_agent_fuzz_result {
   SPORE_AGENT_FUZZ_COPY_REQUEST = 2,
   SPORE_AGENT_FUZZ_RUN_COMPLETE = 3,
   SPORE_AGENT_FUZZ_WORKDIR_REQUEST = 4,
+  SPORE_AGENT_FUZZ_READY_REQUEST = 5,
 };
 
 __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
@@ -4175,6 +4195,7 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
 
   struct run_request parsed;
   if (parse_request(request, &parsed) != 0) return SPORE_AGENT_FUZZ_INVALID;
+  if (parsed.kind == REQUEST_READY) return SPORE_AGENT_FUZZ_READY_REQUEST;
   if (parsed.kind == REQUEST_BUILD_COPY) return SPORE_AGENT_FUZZ_COPY_REQUEST;
   if (parsed.kind == REQUEST_BUILD_WORKDIR) return SPORE_AGENT_FUZZ_WORKDIR_REQUEST;
   if (parsed.kind != REQUEST_BUILD_RUN) return SPORE_AGENT_FUZZ_INVALID;
