@@ -565,9 +565,11 @@ through the step's captured output.
 session as `RUN`, rather than host-side ext4 surgery:
 
 1. On the host, resolve sources against the context with the same walker used
-   by hashing (no `..` escapes, no absolute sources, `.dockerignore` already
-   applied). The resolved, sorted, deduped file set is both the cache input
-   digest and the context-disk source, so keys cannot drift from bytes.
+   by hashing. It rejects absolute and `..` paths, opens every parent component
+   fd-relatively without following symlinks, preserves a final symlink as COPY
+   data, and applies `.dockerignore`. The resolved, sorted, deduped file set is
+   both the cache input digest and the context-disk source, so keys cannot drift
+   from bytes.
 2. Map Docker destinations on the host: directory sources copy contents,
    multiple sources require a `/`-terminated destination, relative destinations
    resolve against `WORKDIR`, and guest paths containing `..` fail closed.
@@ -681,8 +683,10 @@ single-digit seconds end to end, with the BuildKit tar export removed.
   indexes/objects. Records that reference missing or malformed indexes, or
   indexes without a complete stamp, are treated as misses and are never
   repaired in place.
-- COPY source resolution must not escape the context directory (reject `..`
-  traversal and absolute sources after substitution).
+- COPY source resolution must not escape the context directory: reject `..`
+  traversal and absolute sources after substitution, and reject symlinks in
+  every intermediate source-path component. A final source symlink remains a
+  symlink entry and is never followed by context discovery.
 - Built-image metadata must not be mistakable for portable OCI provenance:
   `kind: sporevm-built-image-v0`, `layers: []`, and explicit
   `rootfs_storage` pointing at the final `index_digest`. This is the local
@@ -712,6 +716,11 @@ hashing, local step-cache read/write helpers, fully cached build resolution, and
 indexed local image publication/run resolution. M2 starts at executor-owned
 cache misses; it should write the same `sporevm-build-step-v1` records after
 each O(dirty) snapshot.
+
+Implementation note (2026-07-10): COPY discovery opens the canonical context
+root once and walks literal-source parents and glob parents one component at a
+time with no-follow directory handles. This rejects intermediate symlinks while
+retaining Docker's final-symlink preservation semantics.
 
 Definition of done:
 - Dockerfile parser unit tests cover the supported subset and exact
