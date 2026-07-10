@@ -89,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
         .diagnostic = &first_diag,
     });
     if (first_diag.executor.boot_count != 1) return error.ExpectedOneBuildVmBoot;
-    if (first_diag.executor.executed_steps != 15) return error.ExpectedFifteenBuildSteps;
+    if (first_diag.executor.executed_steps != 16) return error.ExpectedSixteenBuildSteps;
     if (first_diag.executor.resize_count != 1) return error.ExpectedOneBuildResize;
     if (first_diag.executor.max_checkpoint_control_ms >= 2000) return error.BuildCheckpointControlTooSlow;
     if (first.cache_hit) return error.ExpectedFirstBuildCacheMiss;
@@ -122,7 +122,7 @@ pub fn main(init: std.process.Init) !void {
         .diagnostic = &override_diag,
     });
     if (override_diag.executor.boot_count != 1) return error.ExpectedOverrideBuildVmBoot;
-    if (override_diag.executor.executed_steps != 15) return error.ExpectedOverrideBuildFifteenSteps;
+    if (override_diag.executor.executed_steps != 16) return error.ExpectedOverrideBuildSixteenSteps;
     if (override_diag.executor.resize_count != 1) return error.ExpectedOverrideBuildOneResize;
     if (override_diag.executor.max_checkpoint_control_ms >= 2000) return error.OverrideBuildCheckpointControlTooSlow;
     if (override.cache_hit) return error.ExpectedOverrideBuildCacheMiss;
@@ -241,8 +241,8 @@ fn writeDockerfile(io: Io, path: []const u8, second_step: []const u8) !void {
         \\RUN spawn-background
         \\RUN verify-background-reaped
         \\RUN step1
-        \\RUN setup-symlink-targets
         \\WORKDIR /work
+        \\RUN setup-symlink-targets
         \\COPY symlink-internal.txt symlinked-dir/internal.txt
         \\COPY absolute-link.txt abs-link/absolute.txt
         \\COPY escape.txt evil/escape.txt
@@ -251,7 +251,7 @@ fn writeDockerfile(io: Io, path: []const u8, second_step: []const u8) !void {
         \\COPY dangling.txt dangling-file
         \\COPY app app/
         \\COPY merge app/
-        \\COPY loose.txt multi/
+        \\COPY loose.txt multi
         \\COPY *.wild wild/
         \\RUN verify-copy
         \\CMD ["/bin/sh","-c","{s}"]

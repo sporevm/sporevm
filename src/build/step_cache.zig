@@ -7,7 +7,7 @@ const spore = @import("../spore.zig");
 const rootfs_mod = @import("../rootfs.zig");
 const chunk_sealer = @import("../chunk_sealer.zig");
 
-pub const builder_version = "sporevm-build-v5";
+pub const builder_version = "sporevm-build-v6";
 const record_kind = "sporevm-build-step-v1";
 const max_step_record_bytes = 256 * 1024;
 
@@ -41,6 +41,7 @@ pub const StepInput = struct {
     pub const Operation = union(enum) {
         run: Run,
         copy: Copy,
+        workdir: Workdir,
     };
 
     pub const Run = struct {
@@ -51,6 +52,12 @@ pub const StepInput = struct {
 
     pub const Copy = struct {
         input_digest: []const u8,
+        env_digest: []const u8 = "",
+        workdir: []const u8 = "/",
+    };
+
+    pub const Workdir = struct {
+        target: []const u8,
         env_digest: []const u8 = "",
         workdir: []const u8 = "/",
     };
@@ -77,6 +84,13 @@ pub const StepInput = struct {
                 .input_digest = copy.input_digest,
                 .env_digest = copy.env_digest,
                 .workdir = copy.workdir,
+                .network_mode = null,
+            },
+            .workdir => |workdir| .{
+                .instruction_kind = "WORKDIR",
+                .input_digest = workdir.target,
+                .env_digest = workdir.env_digest,
+                .workdir = workdir.workdir,
                 .network_mode = null,
             },
         };

@@ -1365,6 +1365,7 @@ enum request_kind {
   REQUEST_COPY_OUT,
   REQUEST_BUILD_RUN,
   REQUEST_BUILD_COPY,
+  REQUEST_BUILD_WORKDIR,
   REQUEST_FSFREEZE,
   REQUEST_FSTHAW,
 };
@@ -1468,6 +1469,9 @@ static int parse_request(const char *req, struct run_request *out) {
     } else if (strcmp(type, "spore-build-copy-v2") == 0) {
       out->kind = REQUEST_BUILD_COPY;
       out->protocol_v1 = 1;
+    } else if (strcmp(type, "spore-build-workdir-v1") == 0) {
+      out->kind = REQUEST_BUILD_WORKDIR;
+      out->protocol_v1 = 1;
     } else if (strcmp(type, "fsfreeze-v1") == 0) {
       out->kind = REQUEST_FSFREEZE;
       out->protocol_v1 = 1;
@@ -1520,6 +1524,10 @@ static int parse_request(const char *req, struct run_request *out) {
     int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
     if (working_dir_rc < 0) return -1;
     if (working_dir_rc == 0) out->working_dir[0] = '\0';
+  }
+  if (out->kind == REQUEST_BUILD_WORKDIR) {
+    int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
+    if (working_dir_rc <= 0 || out->working_dir[0] != '/') return -1;
   }
   if (out->kind == REQUEST_BUILD_COPY) {
     int source_rc = parse_string_field(req, "source", out->copy_source, sizeof(out->copy_source));
@@ -2442,7 +2450,8 @@ static int apply_context_copy_dir(int root_fd, const char *path, mode_t mode) {
 
   int dir_fd = confined_open_existing(root_fd, path, O_RDONLY | O_DIRECTORY);
   if (dir_fd < 0) return -1;
-  rc = fchmod(dir_fd, mode & 07777);
+  rc = fchown(dir_fd, 0, 0);
+  if (rc == 0) rc = fchmod(dir_fd, mode & 07777);
   saved = errno;
   if (close(dir_fd) != 0 && rc == 0) return -1;
   errno = saved;
@@ -2514,6 +2523,7 @@ static int apply_context_copy_file(int root_fd, const char *source_path, const c
     return -1;
   }
   int rc = copy_fd_to_fd(in_fd, fd, path, size, error, cap);
+  if (rc == 0 && fchown(fd, 0, 0) != 0) rc = -1;
   if (rc == 0 && fchmod(fd, mode & 07777) != 0) rc = -1;
   if (close(fd) != 0) rc = -1;
   if (close(in_fd) != 0 && rc == 0) rc = -1;
@@ -2626,6 +2636,40 @@ static int build_context_source_path(char *out, size_t cap, const char *source) 
   return n > 0 && (size_t)n < cap ? 0 : -1;
 }
 
+static int ensure_confined_directory(int root_fd, const char *path, mode_t mode) {
+  int existing_fd = confined_open_existing(root_fd, path, O_RDONLY | O_DIRECTORY);
+  if (existing_fd >= 0) return close(existing_fd);
+  if (errno != ENOENT) return -1;
+  if (ensure_parent_dirs(root_fd, path) != 0) return -1;
+
+  char name[MAX_COPY_PATH_LEN + 1];
+  int parent_fd = confined_parent_fd(root_fd, path, name, sizeof(name));
+  if (parent_fd < 0) return -1;
+  int rc = mkdirat(parent_fd, name, mode);
+  int saved = errno;
+  if (close(parent_fd) != 0 && rc == 0) return -1;
+  if (rc == 0) return 0;
+  errno = saved;
+  if (errno != EEXIST) return -1;
+  existing_fd = confined_open_existing(root_fd, path, O_RDONLY | O_DIRECTORY);
+  if (existing_fd < 0) return -1;
+  return close(existing_fd);
+}
+
+static int build_workdir_apply(struct client *client, const char *root, const char *path) {
+  if (path[0] != '/' || (path[1] != '\0' && validate_spore_copy_entry_path(path) != 0)) {
+    return send_client_error_exit(client, 2, "spore build: invalid WORKDIR path\n");
+  }
+  int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (root_fd < 0) return send_client_error_exit(client, 126, "spore build: rootfs unavailable\n");
+  int rc = ensure_confined_directory(root_fd, path, 0755);
+  int saved = errno;
+  if (close(root_fd) != 0 && rc == 0) rc = -1;
+  errno = saved;
+  if (rc != 0) return send_client_error_exit(client, 1, "spore build: WORKDIR creation failed\n");
+  return send_client_exit(client, 0);
+}
+
 static int build_context_copy_apply(struct client *client, const char *root, const char *source, const char *dest, int source_kind, int dest_is_dir, uint64_t entry_count) {
   if (validate_build_context_source_path(source) != 0) {
     return send_client_error_exit(client, 2, "spore build: invalid COPY source path on context disk\n");
@@ -2664,10 +2708,25 @@ static int build_context_copy_apply(struct client *client, const char *root, con
     return send_client_error_exit(client, 1, msg);
   }
 
+  int resolved_dest_is_dir = dest_is_dir;
+  if (source_kind != COPY_KIND_DIR && !resolved_dest_is_dir) {
+    int dest_fd = confined_open_existing(root_fd, dest, O_RDONLY | O_DIRECTORY);
+    if (dest_fd >= 0) {
+      resolved_dest_is_dir = 1;
+      if (close(dest_fd) != 0) {
+        close(root_fd);
+        return send_client_error_exit(client, 1, "spore build: COPY destination inspection failed\n");
+      }
+    } else if (errno != ENOENT && errno != ENOTDIR) {
+      close(root_fd);
+      return send_client_error_exit(client, 1, "spore build: COPY destination inspection failed\n");
+    }
+  }
+
   char dest_path[MAX_COPY_PATH_LEN + 1];
   if (source_kind == COPY_KIND_DIR) {
     snprintf(dest_path, sizeof(dest_path), "%s", dest);
-  } else if (dest_is_dir) {
+  } else if (resolved_dest_is_dir) {
     const char *base = strrchr(source, '/');
     base = base == NULL ? source : base + 1;
     if (join_dest_path(dest_path, sizeof(dest_path), dest, base) != 0) {
@@ -3950,6 +4009,17 @@ static void accept_request(int listener, struct session *session, struct client 
     return;
   }
 
+  if (request.kind == REQUEST_BUILD_WORKDIR) {
+    if (!use_rootfs || !rootfs_ready) {
+      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore build: rootfs unavailable\n");
+      close_client(client);
+      return;
+    }
+    (void)build_workdir_apply(client, "/mnt/rootfs", request.working_dir);
+    close_client(client);
+    return;
+  }
+
   if (request.kind == REQUEST_FSFREEZE || request.kind == REQUEST_FSTHAW) {
     if (!request.protocol_v1) {
       (void)send_client_error_exit(client, 2, "spore build: fsfreeze requires v1 protocol\n");
@@ -4092,6 +4162,7 @@ enum spore_agent_fuzz_result {
   SPORE_AGENT_FUZZ_RUN_REQUEST = 1,
   SPORE_AGENT_FUZZ_COPY_REQUEST = 2,
   SPORE_AGENT_FUZZ_RUN_COMPLETE = 3,
+  SPORE_AGENT_FUZZ_WORKDIR_REQUEST = 4,
 };
 
 __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
@@ -4105,6 +4176,7 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   struct run_request parsed;
   if (parse_request(request, &parsed) != 0) return SPORE_AGENT_FUZZ_INVALID;
   if (parsed.kind == REQUEST_BUILD_COPY) return SPORE_AGENT_FUZZ_COPY_REQUEST;
+  if (parsed.kind == REQUEST_BUILD_WORKDIR) return SPORE_AGENT_FUZZ_WORKDIR_REQUEST;
   if (parsed.kind != REQUEST_BUILD_RUN) return SPORE_AGENT_FUZZ_INVALID;
 
   int pipe_fds[2];

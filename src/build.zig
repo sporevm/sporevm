@@ -160,6 +160,18 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                                 else => |e| return e,
                             };
                         },
+                        .workdir => |raw| {
+                            any_exec_step = true;
+                            const target = try resolvedWorkdir(allocator, s.*, raw);
+                            s.storage = cachedExecStep(init, allocator, options, s.*, instruction, "") catch |err| switch (err) {
+                                error.CacheMissRequiresBuildExecutor => {
+                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*);
+                                    break :instructions;
+                                },
+                                else => |e| return e,
+                            };
+                            s.workdir = target;
+                        },
                         else => unreachable,
                     }
                 } else unreachable;
@@ -248,10 +260,6 @@ fn applyMetadataInstruction(
                 try putEnv(allocator, &state.env, key, value);
             }
         },
-        .workdir => |raw| {
-            const substituted = try substitute(allocator, raw, state.args.items, state.env.items);
-            state.workdir = try resolveWorkdir(allocator, state.workdir, substituted);
-        },
         .cmd => |cmd| {
             state.cmd = try resolveCmd(allocator, cmd, state.args.items, state.env.items);
         },
@@ -327,6 +335,11 @@ fn executeFromMiss(
                     try steps.append(.{ .copy = try copyStep(allocator, init.io, ctx, stat_cache, snapshot, &context_disk, diagnostic, state, instruction, copy) });
                 } else unreachable;
             },
+            .workdir => |raw| {
+                const step = try workdirStep(allocator, state, instruction, raw);
+                try steps.append(.{ .workdir = step });
+                state.workdir = step.target;
+            },
             .from => return error.UnsupportedMultiStageDockerfile,
             else => unreachable,
         }
@@ -372,6 +385,26 @@ fn runStep(
         .workdir = state.workdir,
         .network_mode = network_mode,
     };
+}
+
+fn workdirStep(
+    allocator: std.mem.Allocator,
+    state: State,
+    instruction: dockerfile.Instruction,
+    raw: []const u8,
+) !build_exec.WorkdirStep {
+    return .{
+        .line = instruction.line,
+        .canonical_instruction = instruction.raw,
+        .target = try resolvedWorkdir(allocator, state, raw),
+        .env_digest = try effectiveEnvDigest(allocator, state),
+        .workdir = state.workdir,
+    };
+}
+
+fn resolvedWorkdir(allocator: std.mem.Allocator, state: State, raw: []const u8) ![]const u8 {
+    const substituted = try substitute(allocator, raw, state.args.items, state.env.items);
+    return resolveWorkdir(allocator, state.workdir, substituted);
 }
 
 fn copyStep(
@@ -531,6 +564,11 @@ fn execStepInput(
             .env_digest = env_digest,
             .workdir = state.workdir,
         } },
+        .workdir => |raw| .{ .workdir = .{
+            .target = try resolvedWorkdir(allocator, state, raw),
+            .env_digest = env_digest,
+            .workdir = state.workdir,
+        } },
         else => unreachable,
     };
     return .{
@@ -614,8 +652,7 @@ fn resolveCmd(allocator: std.mem.Allocator, cmd: dockerfile.Cmd, args: []const A
 }
 
 fn resolveWorkdir(allocator: std.mem.Allocator, current: []const u8, next: []const u8) ![]const u8 {
-    if (std.fs.path.isAbsolute(next)) return allocator.dupe(u8, next);
-    return std.fs.path.join(allocator, &.{ current, next });
+    return normalizeGuestPath(allocator, current, next);
 }
 
 fn substituteList(allocator: std.mem.Allocator, raw: []const []const u8, args: []const ArgValue, env: []const []const u8) ![]const []const u8 {
@@ -879,6 +916,39 @@ test "RUN cache identity includes network mode and matches executor" {
     const none_write_key = try step_cache.stepKey(arena, none_write);
     try std.testing.expectEqualStrings(none_read_key, none_write_key);
     try std.testing.expect(!std.mem.eql(u8, spore_read_key, none_read_key));
+}
+
+test "WORKDIR executor step key matches cached read key" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: dockerfile.Diagnostic = .{};
+    const doc = try dockerfile.parse(arena,
+        \\FROM base
+        \\ENV APP_ROOT=/srv
+        \\WORKDIR ${APP_ROOT}/app
+        \\
+    , &diag);
+    var env = std.array_list.Managed([]const u8).init(arena);
+    try env.append("APP_ROOT=/srv");
+    const state = State{
+        .storage = testStorage(),
+        .env = env,
+        .args = std.array_list.Managed(ArgValue).init(arena),
+        .workdir = "/previous",
+    };
+    const instruction = doc.instructions[2];
+    const options = Options{
+        .tag = "local/app:dev",
+        .context_dir = "unused",
+        .dockerfile_path = "unused",
+    };
+    const grow_target = try buildDiskGrowTarget(options, state.storage);
+    const step = try workdirStep(arena, state, instruction, instruction.value.workdir);
+    try std.testing.expectEqualStrings("/srv/app", step.target);
+    const read_input = try execStepInput(arena, options, state, instruction, "", grow_target);
+    const write_input = build_exec.cacheInputForStep(options.platform, state.storage.index_digest, .{ .workdir = step }, grow_target);
+    try std.testing.expectEqualStrings(try step_cache.stepKey(arena, read_input), try step_cache.stepKey(arena, write_input));
 }
 
 test "COPY executor step key matches cached read key" {
