@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-08
+last_reviewed: 2026-07-10
 spec_refs:
   - docs/spore-format.md
   - docs/rootfs.md
@@ -180,8 +180,11 @@ The `Backend` union's `file`/`cow`/`layered_cow` variants collapse into one:
 ```
 ChunkMappedDisk {
   map: per-chunk entry → .base (offset in materialization)
-                       | .overlay (offset in sparse local overlay)
+                       | .overlay_clean (saved bytes in sparse local overlay)
+                       | .overlay (dirty bytes in sparse local overlay)
                        | .zero
+                       | .zero_dirty
+                       | .cas (verified object fault-in)
   base_fd: flat materialization of the opened index (the hot read path)
   overlay_fd: sparse temp file receiving writes
 }
@@ -248,7 +251,7 @@ snapshot(disk) -> DiskIndex:
   freeze/drain (v1: at the existing capture/save quiesce points — VM paused,
                 virtio-blk drained; online mid-run snapshot deferred with
                 the spore-build plan)
-  for each overlay entry: blake3 chunk, write CAS object if absent
+  for each dirty entry: blake3 chunk, write CAS object if absent
   new index = parent index with those entries replaced
   identity = blake3(new index); persist index; thaw
 ```
@@ -261,7 +264,12 @@ parent digest or zero entry without reading or hashing the materialized bytes
 when the new index is published into the same CAS root that already holds the
 parent objects. Disks opened without a parent index, or snapshots published
 into a different CAS root, still use the full-scan path because there is no
-self-contained prior identity to preserve in that destination store. The
+self-contained prior identity to preserve in that destination store. A
+successful snapshot advances the logical parent digests and marks dirty
+overlay/zero entries clean, but never rebinds live physical reads to the
+snapshot output CAS. This matters for snapshot-and-continue: lifecycle may
+rename the output directory as soon as publication completes, while the VM
+must continue reading its already-open base and overlay fds. The
 operation already exists in the tree for RAM: `dirty_ram.zig` seals dirty 2MiB
 memory chunks into verified chunk refs plus a same-host backing file, with
 parallel workers, zero-scan elision, write-if-missing dedupe, and phase-level
@@ -437,7 +445,13 @@ when publishing into the same CAS root, writes nonzero dirty chunks and a
 `spore-disk-index-v1` under the rootfs CAS namespace, and returns a
 `chunk-index-disk-v0` manifest disk. Disks opened without a parent index, or
 snapshots published into a different CAS root, keep the full-scan snapshot
-path. Runtime restore materializes `chunk-index-disk-v0` manifests from the
+path. Snapshot promotion updates the logical parent index while preserving the
+live physical source of every chunk; clean overlay bytes remain overlay-backed
+rather than faulting through the save output, and grow/explicit-zero mutations
+remain dirty until their new logical size/content is published. A clean save
+after a prior dirty save republishes the current identity into the new output
+instead of returning the runtime's stale initial base descriptor. Runtime
+restore materializes `chunk-index-disk-v0` manifests from the
 saved index and chunk objects before attaching virtio-blk; old layer chains are
 no longer opened by `runtime_disk.open`. `LayeredCowDisk`, `loadLayerChain`,
 disk-layer sealing, and the `spore.DiskLayer` parser have been deleted.
@@ -448,7 +462,9 @@ manifest preserving guest-visible bytes. `src/chunk_mapped_disk.zig` also
 compares O(dirty) snapshot output from an index-opened fork chain against a
 full rescan of the materialized image, including dirty zero chunks and chunks
 rewritten back to their parent content, and asserts the sealer work count
-matches the dirty chunk count rather than total logical chunks.
+matches the dirty chunk count rather than total logical chunks. Snapshot-state
+regressions cover continuing after output publication/rename and repeated clean
+saves retaining the latest disk identity.
 
 Done when: save→restore round trip preserves guest-visible disk state
 (existing lifecycle tests, rewritten for v2); the RAM sealer's existing

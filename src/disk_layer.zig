@@ -7,7 +7,9 @@
 //! persisted manifest.
 
 const std = @import("std");
+const block_source = @import("block_source.zig");
 const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
+const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
 
 extern "c" fn mkstemp(template: [*:0]u8) c_int;
@@ -36,6 +38,12 @@ pub const ActiveHead = union(enum) {
             .chunk_mapped => |disk| disk.dirtyClusterCount(),
         };
     }
+
+    pub fn hasPublishedSnapshot(self: ActiveHead) bool {
+        return switch (self) {
+            .chunk_mapped => |disk| disk.hasPublishedSnapshot(),
+        };
+    }
 };
 
 pub const SnapshotState = struct {
@@ -44,11 +52,10 @@ pub const SnapshotState = struct {
 
     /// Finish a writable disk snapshot after the VMM has paused the guest and
     /// verified the matching virtio-blk queues have no pending requests.
-    pub fn finish(self: SnapshotState, allocator: std.mem.Allocator, dir: []const u8, quiesced: bool) Error!?spore.Disk {
+    pub fn finish(self: SnapshotState, _: std.mem.Allocator, dir: []const u8, quiesced: bool) Error!?spore.Disk {
         std.debug.assert(quiesced);
         if (self.active.dirtyClusterCount() == 0) {
-            if (std.mem.eql(u8, self.base.kind, spore.disk_kind_chunk_index)) return try cloneDisk(allocator, self.base);
-            return null;
+            if (std.mem.eql(u8, self.base.kind, spore.disk_kind_cow_block) and !self.active.hasPublishedSnapshot()) return null;
         }
         return switch (self.active) {
             .chunk_mapped => |disk| try disk.snapshotIndex(dir, self.base.device, quiesced),
@@ -126,7 +133,7 @@ test "snapshot returns null for a clean exact-rootfs sentinel disk" {
     const bytes = [_]u8{0x42} ** 4096;
     try base.writeStreamingAll(io, &bytes);
 
-    const base_source = @import("block_source.zig").FileBlockSource.init(base.handle, bytes.len);
+    const base_source = block_source.FileBlockSource.init(base.handle, bytes.len);
     var disk = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, bytes.len, 512);
     defer disk.deinit();
 
@@ -141,4 +148,84 @@ test "snapshot returns null for a clean exact-rootfs sentinel disk" {
         .active = .{ .chunk_mapped = &disk },
     }).finish(allocator, ".", true);
     try std.testing.expect(snapshot == null);
+}
+
+test "clean chunk-index save publishes its index" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const out_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/saved.spore", .{tmp.sub_path[0..]});
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
+    const bytes = [_]u8{0x62} ** 512;
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    try base.writeStreamingAll(io, &bytes);
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+    const base_source = block_source.FileBlockSource.init(base.handle, bytes.len);
+    var disk = try chunk_mapped_disk.ChunkMappedDisk.initWritable(arena, base_source, overlay.handle, bytes.len, 512);
+    defer disk.deinit();
+
+    const stale_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const saved = (try (SnapshotState{
+        .base = .{
+            .kind = spore.disk_kind_chunk_index,
+            .device = .{ .mmio_slot = 1 },
+            .size = bytes.len,
+            .base = stale_identity,
+            .chunk_size = 512,
+        },
+        .active = .{ .chunk_mapped = &disk },
+    }).finish(arena, out_dir, true)) orelse return error.BadManifest;
+    try std.testing.expect(!std.mem.eql(u8, stale_identity, saved.base));
+
+    const index_path = try rootfs_cas.manifestIndexPath(arena, out_dir, saved.base);
+    try std.Io.Dir.cwd().access(io, index_path, .{ .read = true });
+}
+
+test "clean save after dirty cow snapshot keeps current identity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const first_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/first.spore", .{tmp.sub_path[0..]});
+    const second_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/second.spore", .{tmp.sub_path[0..]});
+    try std.Io.Dir.cwd().createDirPath(io, first_dir);
+    try std.Io.Dir.cwd().createDirPath(io, second_dir);
+    const bytes = [_]u8{0x73} ** 512;
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    try base.writeStreamingAll(io, &bytes);
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+    const base_source = block_source.FileBlockSource.init(base.handle, bytes.len);
+    var disk = try chunk_mapped_disk.ChunkMappedDisk.initWritable(arena, base_source, overlay.handle, bytes.len, 512);
+    defer disk.deinit();
+
+    const patch = [_]u8{0x84} ** 37;
+    try disk.writeAt(&patch, 101);
+    const state = SnapshotState{
+        .base = .{
+            .kind = spore.disk_kind_cow_block,
+            .device = .{ .mmio_slot = 1 },
+            .size = bytes.len,
+            .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+        .active = .{ .chunk_mapped = &disk },
+    };
+    const first = (try state.finish(arena, first_dir, true)) orelse return error.BadManifest;
+    try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
+    const second = (try state.finish(arena, second_dir, true)) orelse return error.BadManifest;
+    try std.testing.expectEqualStrings(first.base, second.base);
+    const second_index = try rootfs_cas.manifestIndexPath(arena, second_dir, second.base);
+    try std.Io.Dir.cwd().access(io, second_index, .{ .read = true });
 }
