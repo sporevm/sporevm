@@ -94,7 +94,9 @@ available. `spore pull` and `spore unpack` can still assemble flat
 materializations from verified chunk objects, but `spore run` and restore do
 not need to publish a flat by-digest cache entry before boot. An inconsistent
 artifact/index pairing fails closed when the index is opened; missing or
-corrupt chunk objects fail the specific read before bytes reach the guest.
+corrupt chunk objects fail a lazy multi-chunk, multi-descriptor read before any
+disk payload bytes are copied; virtio still writes the request's I/O-error
+status byte.
 
 Missing or corrupt rootfs indexes, chunk objects, exact artifacts, disk indexes,
 or disk chunk objects fail before guest code can observe unverifiable bytes.

@@ -24,7 +24,8 @@ Cold starts from chunked rootfs storage no longer need to rebuild the whole
 flat ext4 file before boot. When the flat materialization cache is absent or
 stale, SporeVM opens the verified index over a sparse runtime base and faults
 local CAS chunks in on first read. Missing or corrupt chunk objects fail the
-read before unverifiable bytes reach the guest.
+complete multi-chunk virtio-blk request before any disk payload bytes are copied;
+only the request's I/O-error status byte is written.
 
 The disk backend is now one chunk-mapped implementation with map-copy fork
 support. Forked writable disks get an independent overlay and do not create a

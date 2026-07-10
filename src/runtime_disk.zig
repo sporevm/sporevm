@@ -731,7 +731,10 @@ test "runtime disk reports missing cas object on first read of that chunk" {
     var readback: [4]u8 = undefined;
     try runtime.chunk_mapped.?.readAt(&readback, 0);
     try std.testing.expectEqualStrings("abcd", &readback);
-    try std.testing.expectError(error.MissingChunk, runtime.chunk_mapped.?.readAt(&readback, spore.disk_chunk_size));
+    const failed_read = try arena.alloc(u8, 2 * spore.disk_chunk_size);
+    @memset(failed_read, 0xaa);
+    try std.testing.expectError(error.MissingChunk, runtime.chunk_mapped.?.readAt(failed_read, 0));
+    try std.testing.expect(std.mem.allEqual(u8, failed_read, 0xaa));
 }
 
 test "runtime disk lazy rootfs survives promoted chunk eviction and rejects corrupt unread chunks" {
@@ -801,10 +804,10 @@ test "runtime disk lazy rootfs survives promoted chunk eviction and rejects corr
     try runtime.chunk_mapped.?.readAt(&readback, spore.disk_chunk_size);
     try std.testing.expectEqualStrings("efgh", &readback);
 
-    const before_failed_read = [_]u8{0xaa} ** readback.len;
-    readback = before_failed_read;
-    try std.testing.expectError(error.BadChunk, runtime.chunk_mapped.?.readAt(&readback, 2 * spore.disk_chunk_size));
-    try std.testing.expectEqualSlices(u8, &before_failed_read, &readback);
+    const failed_read = try arena.alloc(u8, 2 * spore.disk_chunk_size);
+    @memset(failed_read, 0xaa);
+    try std.testing.expectError(error.BadChunk, runtime.chunk_mapped.?.readAt(failed_read, spore.disk_chunk_size));
+    try std.testing.expect(std.mem.allEqual(u8, failed_read, 0xaa));
 }
 
 test "runtime disk rejects unknown disk kinds" {
