@@ -356,8 +356,16 @@ pub fn resolveCopySourcesWithDiagnostic(
 ) !CopyResolution {
     var entries = std.array_list.Managed(CopyEntry).init(allocator);
     var roots = std.array_list.Managed(CopyRoot).init(allocator);
+    var context_root = Io.Dir.cwd().openDir(io, context.absolute_root, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.SymLinkLoop => return error.CopySourceEscapesContext,
+        else => |e| return e,
+    };
+    defer context_root.close(io);
     for (sources) |source| {
-        appendSourceMatches(allocator, io, context, source, &entries, &roots) catch |err| {
+        appendSourceMatches(allocator, io, context, context_root, source, &entries, &roots) catch |err| {
             if (err == error.CopySourceNotFound) {
                 if (diagnostic) |diag| diag.source = source;
             }
@@ -559,6 +567,7 @@ fn appendSourceMatches(
     allocator: std.mem.Allocator,
     io: Io,
     context: BuildContext,
+    context_root: Io.Dir,
     raw_source: []const u8,
     entries: *std.array_list.Managed(CopyEntry),
     roots: *std.array_list.Managed(CopyRoot),
@@ -572,25 +581,24 @@ fn appendSourceMatches(
         const slash = std.mem.lastIndexOfScalar(u8, source[0..star], '/') orelse 0;
         const parent_rel = if (slash == 0 and source[0] != '/') "" else source[0..slash];
         const pattern = source[(if (slash == 0) 0 else slash + 1)..];
-        const parent_path = if (parent_rel.len == 0)
-            try allocator.dupe(u8, context.root)
-        else
-            try std.fs.path.join(allocator, &.{ context.root, parent_rel });
-        defer allocator.free(parent_path);
-        var dir = try Io.Dir.cwd().openDir(io, parent_path, .{ .iterate = true, .follow_symlinks = false });
+        var dir = try openContextDir(io, context_root, parent_rel);
         defer dir.close(io);
         var matched = false;
         var it = dir.iterate();
         while (try it.next(io)) |child| {
             if (!starMatch(pattern, child.name)) continue;
             const rel = if (parent_rel.len == 0) try allocator.dupe(u8, child.name) else try std.fs.path.join(allocator, &.{ parent_rel, child.name });
-            try appendPath(allocator, io, context, rel, entries, roots, true);
+            try appendPathAt(allocator, io, context, dir, child.name, rel, entries, roots, true);
             matched = true;
         }
         if (!matched) return error.CopySourceNotFound;
         return;
     }
-    try appendPath(allocator, io, context, source, entries, roots, true);
+    const parent_rel = std.fs.path.dirname(source) orelse "";
+    const basename = std.fs.path.basename(source);
+    var parent = try openContextDir(io, context_root, parent_rel);
+    defer parent.close(io);
+    try appendPathAt(allocator, io, context, parent, basename, source, entries, roots, true);
 }
 
 fn trimTrailingSlashes(path: []const u8) []const u8 {
@@ -599,26 +607,47 @@ fn trimTrailingSlashes(path: []const u8) []const u8 {
     return path[0..end];
 }
 
-fn appendPath(
+fn openContextDir(io: Io, context_root: Io.Dir, rel: []const u8) !Io.Dir {
+    var current = try context_root.openDir(io, ".", .{ .iterate = true, .follow_symlinks = false });
+    errdefer current.close(io);
+    var components = std.mem.splitScalar(u8, rel, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+        const stat = try current.statFile(io, component, .{ .follow_symlinks = false });
+        if (stat.kind == .sym_link) return error.CopySourceEscapesContext;
+        const next = current.openDir(io, component, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+            error.SymLinkLoop => return error.CopySourceEscapesContext,
+            else => |e| return e,
+        };
+        current.close(io);
+        current = next;
+    }
+    return current;
+}
+
+fn appendPathAt(
     allocator: std.mem.Allocator,
     io: Io,
     context: BuildContext,
+    parent: Io.Dir,
+    basename: []const u8,
     rel: []const u8,
     entries: *std.array_list.Managed(CopyEntry),
     roots: *std.array_list.Managed(CopyRoot),
     source_root: bool,
 ) !void {
     if (ignored(context, rel, false)) return;
-    const path = try std.fs.path.join(allocator, &.{ context.root, rel });
-    defer allocator.free(path);
-    const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    const stat = try parent.statFile(io, basename, .{ .follow_symlinks = false });
     if (source_root) try roots.append(.{ .rel = try allocator.dupe(u8, rel), .kind = stat.kind });
     switch (stat.kind) {
         .file, .sym_link => try entries.append(.{ .rel = try allocator.dupe(u8, rel), .kind = stat.kind }),
         .directory => {
             if (ignored(context, rel, true)) return;
             try entries.append(.{ .rel = try allocator.dupe(u8, rel), .kind = .directory });
-            var dir = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
+            var dir = parent.openDir(io, basename, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+                error.SymLinkLoop => return error.CopySourceEscapesContext,
+                else => |e| return e,
+            };
             defer dir.close(io);
             var children = std.array_list.Managed([]const u8).init(allocator);
             var it = dir.iterate();
@@ -629,7 +658,7 @@ fn appendPath(
                     try allocator.dupe(u8, child)
                 else
                     try std.fs.path.join(allocator, &.{ rel, child });
-                try appendPath(allocator, io, context, child_rel, entries, roots, false);
+                try appendPathAt(allocator, io, context, dir, child, child_rel, entries, roots, false);
             }
         },
         else => return error.UnsupportedCopySourceType,
@@ -781,6 +810,62 @@ test "context hashing applies dockerignore" {
     const ctx = try load(arena, io, root, &diag);
     const digest = try hashCopySources(arena, io, ctx, &.{"app"});
     try std.testing.expect(std.mem.startsWith(u8, digest, "blake3:"));
+}
+
+test "COPY source resolution rejects intermediate symlinks" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-intermediate-symlink";
+    const context_root = root ++ "/context";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, context_root ++ "/safe");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/outside");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/outside/secret.txt", .data = "secret" });
+    try Io.Dir.cwd().symLink(io, "../../outside", context_root ++ "/safe/leak", .{});
+    try Io.Dir.cwd().symLink(io, "../outside", context_root ++ "/packages", .{});
+
+    var diag: IgnoreDiagnostic = .{};
+    const ctx = try load(arena, io, context_root, &diag);
+    try std.testing.expectError(
+        error.CopySourceEscapesContext,
+        resolveCopySources(arena, io, ctx, &.{"safe/leak/secret.txt"}),
+    );
+    try std.testing.expectError(
+        error.CopySourceEscapesContext,
+        resolveCopySources(arena, io, ctx, &.{"packages/secret.txt"}),
+    );
+    try std.testing.expectError(
+        error.CopySourceEscapesContext,
+        resolveCopySources(arena, io, ctx, &.{"packages/*.txt"}),
+    );
+}
+
+test "COPY source resolution preserves a final symlink outside the context" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-final-symlink";
+    const context_root = root ++ "/context";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, context_root);
+    try Io.Dir.cwd().createDirPath(io, root ++ "/outside");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/outside/secret.txt", .data = "secret" });
+    try Io.Dir.cwd().symLink(io, "../outside/secret.txt", context_root ++ "/payload", .{});
+
+    var diag: IgnoreDiagnostic = .{};
+    const ctx = try load(arena, io, context_root, &diag);
+    const resolution = try resolveCopySources(arena, io, ctx, &.{"payload"});
+    try std.testing.expectEqual(@as(usize, 1), resolution.entries.len);
+    try std.testing.expectEqual(Io.File.Kind.sym_link, resolution.entries[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), resolution.roots.len);
+    try std.testing.expectEqual(Io.File.Kind.sym_link, resolution.roots[0].kind);
+    const entries = try describeCopyResolutionWithOptions(arena, io, ctx, resolution, .{});
+    try std.testing.expectEqualStrings("../outside/secret.txt", entries[0].symlink_target);
 }
 
 test "dockerignore rejects question-mark patterns" {
@@ -956,8 +1041,10 @@ fn oldUnframedHashCopySourcesForTest(
 ) ![]const u8 {
     var entries = std.array_list.Managed(CopyEntry).init(allocator);
     var roots = std.array_list.Managed(CopyRoot).init(allocator);
+    var context_root = try Io.Dir.cwd().openDir(io, context.absolute_root, .{ .iterate = true, .follow_symlinks = false });
+    defer context_root.close(io);
     for (sources) |source| {
-        try appendSourceMatches(allocator, io, context, source, &entries, &roots);
+        try appendSourceMatches(allocator, io, context, context_root, source, &entries, &roots);
     }
     std.mem.sort(CopyEntry, entries.items, {}, entryLessThan);
 
