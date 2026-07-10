@@ -736,6 +736,8 @@ Validation: `mise run test`, `mise run build`, and the conditional
 completeness for native/external imports. The remote rootfs bundle smoke emits a
 current v2 synthetic manifest with a complete zero-memory index, and the writer
 benchmark reports canonical index identity plus the current CAS preload phase.
+Bundle pack consumes the descriptor-bound canonical index and verified objects
+directly; it does not assemble or rescan the derived flat rootfs cache.
 
 ## Security
 

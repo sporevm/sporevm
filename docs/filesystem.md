@@ -136,6 +136,11 @@ first read and then use the same hot `.base` path as a materialized image.
   `disk.base` and referenced nonzero disk chunk objects under the same
   `rootfs/blake3` index/object paths.
 
+For chunked rootfs storage, pack reads the canonical index and its verified CAS
+objects directly while holding the rootfs cache lock. The manifest already
+binds `rootfs.artifact.digest` to that index identity, so packing neither needs
+nor recreates the derived flat ext4 materialization.
+
 `spore unpack` and `spore pull` fully materialize one selected child before
 resume. They verify bundle identity, selected manifests, RAM chunks, rootfs
 artifacts or CAS bytes, and disk index/object bytes before writing a resumable
@@ -159,11 +164,12 @@ and objects from cache metadata, ref records, and live runtime manifests; it is
 dry-run by default and requires `--force` to delete candidates.
 
 Default `spore system prune --rootfs` only selects rebuildable image rootfs
-entries. Flat digest artifacts (the resume authority) are skipped unless
-`--include-digest-artifacts` is passed with an age or size bound. Derived
-rootfs CAS chunks are skipped unless `--include-rootfs-chunks` is passed;
-pruning them is safe when the flat artifact remains because resume serves the
-flat artifact and `spore pack` re-derives chunks from it.
+entries. Flat digest artifacts are skipped unless `--include-digest-artifacts`
+is passed with an age or size bound. Canonical rootfs CAS chunks are skipped
+unless `--include-rootfs-chunks` is passed.
+That shared namespace also holds writable-disk state: pruning it can break
+resume and pack even when a flat rootfs artifact remains. Use root-aware
+`spore cache gc --rootfs` to preserve reachable state.
 
 ## Evidence
 
