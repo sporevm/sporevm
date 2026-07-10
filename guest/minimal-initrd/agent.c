@@ -313,6 +313,42 @@ static int mount_if_dir(const char *source, const char *target, const char *fsty
   return 0;
 }
 
+static int replace_symlink(const char *target, const char *path, char *error, size_t cap) {
+  if (unlink(path) != 0 && errno != ENOENT) {
+    snprintf(error, cap, "rootfs runtime symlink remove failed: %s errno=%d", path, errno);
+    return -1;
+  }
+  if (symlink(target, path) != 0) {
+    snprintf(error, cap, "rootfs runtime symlink failed: %s errno=%d", path, errno);
+    return -1;
+  }
+  return 0;
+}
+
+static int setup_rootfs_dev(char *error, size_t cap) {
+  const char *dev = "/mnt/rootfs/dev";
+  const char *pts = "/mnt/rootfs/dev/pts";
+  if (!path_is_dir(dev)) return 0;
+  if (mount("devtmpfs", dev, "devtmpfs", MS_NOSUID, "") != 0 && errno != EBUSY) {
+    snprintf(error, cap, "rootfs runtime mount failed: %s errno=%d", dev, errno);
+    return -1;
+  }
+  if (mkdir(pts, 0755) != 0 && errno != EEXIST) {
+    snprintf(error, cap, "rootfs runtime mkdir failed: %s errno=%d", pts, errno);
+    return -1;
+  }
+  if (mount("devpts", pts, "devpts", 0, "mode=0620,ptmxmode=0666") != 0 && errno != EBUSY) {
+    snprintf(error, cap, "rootfs runtime mount failed: %s errno=%d", pts, errno);
+    return -1;
+  }
+  if (replace_symlink("/proc/self/fd", "/mnt/rootfs/dev/fd", error, cap) != 0) return -1;
+  if (replace_symlink("/proc/self/fd/0", "/mnt/rootfs/dev/stdin", error, cap) != 0) return -1;
+  if (replace_symlink("/proc/self/fd/1", "/mnt/rootfs/dev/stdout", error, cap) != 0) return -1;
+  if (replace_symlink("/proc/self/fd/2", "/mnt/rootfs/dev/stderr", error, cap) != 0) return -1;
+  if (replace_symlink("pts/ptmx", "/mnt/rootfs/dev/ptmx", error, cap) != 0) return -1;
+  return 0;
+}
+
 static int setup_rootfs(int writable, char *error, size_t cap) {
   mkdir("/mnt", 0755);
   mkdir("/mnt/rootfs", 0755);
@@ -326,7 +362,7 @@ static int setup_rootfs(int writable, char *error, size_t cap) {
     snprintf(error, cap, "rootfs mount failed: errno=%d", errno);
     return -1;
   }
-  if (mount_if_dir("devtmpfs", "/mnt/rootfs/dev", "devtmpfs", MS_NOSUID, "", error, cap) != 0) return -1;
+  if (setup_rootfs_dev(error, cap) != 0) return -1;
   if (mount_if_dir("proc", "/mnt/rootfs/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, "", error, cap) != 0) return -1;
   if (mount_if_dir("sysfs", "/mnt/rootfs/sys", "sysfs", MS_RDONLY | MS_NOSUID | MS_NOEXEC | MS_NODEV, "", error, cap) != 0) return -1;
   mount_cgroup2_if_dir("/mnt/rootfs/sys/fs/cgroup");
@@ -4007,6 +4043,7 @@ static void accept_request(int listener, struct session *session, struct client 
       close_client(client);
       return;
     }
+    apply_resume_clock(request.resume_time_unix_ns);
     run_build_exec(client, &request, command, use_rootfs);
     close_client(client);
     return;
