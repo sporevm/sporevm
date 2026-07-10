@@ -8,6 +8,7 @@ const generation = @import("generation.zig");
 const lifecycle = @import("lifecycle.zig");
 const memory_config = @import("memory.zig");
 const monitor_jail = @import("monitor_jail.zig");
+const runtime_disk_claim = @import("runtime_disk_claim.zig");
 const net_gateway = @import("net_gateway.zig");
 const run = @import("run.zig");
 const spore = @import("spore.zig");
@@ -114,6 +115,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     if (monitor_jail.wantsSmoke(init.environ_map)) {
         try monitor_jail.applyForMonitor(init.environ_map);
         try monitor_jail.smokeDeniedExec(init.io);
+        try runtime_disk_claim.smokeRoundTrip(allocator);
         return;
     }
 

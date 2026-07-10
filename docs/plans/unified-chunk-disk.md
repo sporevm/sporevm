@@ -614,8 +614,9 @@ structure with two instantiations (RAM 2MiB, disk 64KiB).
 
 ### U6 — Production disk-backed fast fork
 
-Status: backend primitive, post-save baseline authority, and portable runtime
-disk head complete; the one-shot fd-claim transport is the active next slice.
+Status: backend primitive, post-save baseline authority, portable runtime disk
+head, and one-shot fd-claim transport complete; monitor/VMM capture and
+baseline leases are the active next slice.
 
 `ChunkMappedDisk.fork()` can already copy the one-level source map and clone
 an unlinked overlay fd, and its unit tests cover rejection, copy fallback,
@@ -752,7 +753,15 @@ save→rename→fork→save coverage.
    token registry, indexed bounded control requests, exact-length binary
    descriptor framing, receiver validation/ownership, expiry/cancellation,
    and crash cleanup as its own PR. Prove it works after the unchanged monitor
-   jail and that adoption precedes readiness.
+   jail and that adoption precedes readiness. **Complete at the transport
+   boundary:** claims are strict 8KiB JSON lines bound to random one-use tokens,
+   batch, child name/index, and baseline; registry admission enforces every
+   batch/payload cap before ownership moves and closes heads on claim expiry,
+   cancellation, or shutdown. The binary response carries one fd on its first
+   fixed header and rejects truncation, later ancillary data, short/trailing
+   bytes, replay, and binding mismatches. The existing monitor-jail smoke now
+   performs the real fd round trip after applying the unchanged jail. Item 5
+   owns the readiness-order assertion when child startup consumes this API.
 4. **Add the monitor/VMM fork capture.** Keep pause/drain validation
    backend-local in HVF/KVM, but share the request/result and ownership state
    machine. Reuse one RAM/machine capture, prepare all child heads at the same

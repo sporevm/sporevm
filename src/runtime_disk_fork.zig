@@ -6,6 +6,7 @@
 //! overrides needed to reconstruct the live one-level chunk map.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fd_util = @import("fd.zig");
 const spore = @import("spore.zig");
 
@@ -64,12 +65,7 @@ pub const Descriptor = struct {
     }
 
     pub fn encodeAlloc(self: Descriptor, allocator: std.mem.Allocator) Error![]u8 {
-        try validateFields(self);
-        const bitmap_bytes = std.math.mul(usize, self.overlay_chunks.len, 2) catch return error.DescriptorTooLarge;
-        const payload_len = std.math.add(usize, self.baseline.identity.len, bitmap_bytes) catch return error.DescriptorTooLarge;
-        const total_len = std.math.add(usize, header_len, payload_len) catch return error.DescriptorTooLarge;
-        if (total_len > max_descriptor_bytes) return error.DescriptorTooLarge;
-
+        const total_len = try self.encodedLen();
         const out = try allocator.alloc(u8, total_len);
         @memset(out, 0);
         @memcpy(out[0..magic.len], magic);
@@ -89,6 +85,15 @@ pub const Descriptor = struct {
         offset += self.overlay_chunks.len;
         @memcpy(out[offset..][0..self.zero_chunks.len], self.zero_chunks);
         return out;
+    }
+
+    pub fn encodedLen(self: Descriptor) Error!usize {
+        try validateFields(self);
+        const bitmap_bytes = std.math.mul(usize, self.overlay_chunks.len, 2) catch return error.DescriptorTooLarge;
+        const payload_len = std.math.add(usize, self.baseline.identity.len, bitmap_bytes) catch return error.DescriptorTooLarge;
+        const total_len = std.math.add(usize, header_len, payload_len) catch return error.DescriptorTooLarge;
+        if (total_len > max_descriptor_bytes) return error.DescriptorTooLarge;
+        return total_len;
     }
 
     pub fn validate(self: Descriptor) Error!void {
@@ -183,9 +188,22 @@ pub fn validateOverlayFd(fd: std.c.fd_t, logical_size: u64) Error!void {
     if (fd < 0) return error.BadOverlay;
     try fd_util.setCloseOnExec(fd);
 
-    var stat: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &stat) != 0) return error.IoFailed;
-    if (!std.c.S.ISREG(stat.mode) or stat.nlink != 0 or stat.size < 0 or @as(u64, @intCast(stat.size)) != logical_size) return error.BadOverlay;
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var stat: linux.Statx = undefined;
+        const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{
+            .TYPE = true,
+            .MODE = true,
+            .NLINK = true,
+            .SIZE = true,
+        }, &stat);
+        if (linux.errno(rc) != .SUCCESS) return error.IoFailed;
+        if (!linux.S.ISREG(stat.mode) or stat.nlink != 0 or stat.size != logical_size) return error.BadOverlay;
+    } else {
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &stat) != 0) return error.IoFailed;
+        if (!std.c.S.ISREG(stat.mode) or stat.nlink != 0 or stat.size < 0 or @as(u64, @intCast(stat.size)) != logical_size) return error.BadOverlay;
+    }
 
     const raw_status_flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
     if (raw_status_flags < 0) return error.IoFailed;
