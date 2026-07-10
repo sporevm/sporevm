@@ -811,6 +811,13 @@ override bypasses the policy and uses the same key field. A manual
 Docker-vs-Spore metadata oracle lives at
 `scripts/spore-build-copy-oracle.sh`.
 
+Implementation note (2026-07-10, GC coordination): after `FROM` resolution,
+the build holds the rootfs-cache coarse lock across step-cache lookup and VM
+execution, then releases it before final image publication. Valid
+`sporevm-build-step-v1` records are GC roots for their child index and objects;
+known incomplete records are ignored as cache misses, and unknown future record
+kinds retain the CAS conservatively. Record retention/pruning remains M5 work.
+
 Remaining M2 completion work: prove the full `buildkite-sporevm` wrapper path
 against the real Buildkite base end to end and record the measured acceptance
 output here.
@@ -981,8 +988,8 @@ the result and running the Rails spec smoke.
   chunk-index primitives change the shape: the persistent session publishes a
   child `index_digest` after each frozen step, and "layers" collapse into
   cache records over rootfs CAS indexes.
-- Step records can outlive the indexes or objects they name. GC/prune must
-  remove unreachable build records and CAS indexes carefully, with complete
+- Valid step records root the indexes and objects they name. M5 GC/prune must
+  retire unreachable build records before their CAS indexes, with complete
   stamps deleted before referenced indexes or chunks.
 - The cached path must be fast *end to end*, not just inside `spore build`:
   the wrapper's `rm -rf` + 573M context copy would have silently kept the

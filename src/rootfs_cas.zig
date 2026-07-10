@@ -356,6 +356,19 @@ pub fn storageComplete(
     cache_root: []const u8,
     storage: spore.RootfsStorage,
 ) !bool {
+    if (!try storageContentComplete(io, allocator, cache_root, storage)) return false;
+    try markStorageComplete(io, allocator, cache_root, storage.index_digest);
+    return true;
+}
+
+/// Verifies the index and every referenced chunk object without consulting or
+/// mutating the derived completeness stamp.
+pub fn storageContentComplete(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    storage: spore.RootfsStorage,
+) !bool {
     const index_path = try manifestIndexPath(allocator, cache_root, storage.index_digest);
     defer allocator.free(index_path);
     if (!try rootfs_cache.regularFileNoSymlink(io, index_path)) return false;
@@ -382,7 +395,6 @@ pub fn storageComplete(
         const expected_size = try storageChunkLen(storage, entry.logical_chunk);
         if (stat.size != @as(u64, @intCast(expected_size))) return false;
     }
-    try markStorageComplete(io, allocator, cache_root, storage.index_digest);
     return true;
 }
 

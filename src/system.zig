@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 
+const build_step_cache = @import("build/step_cache.zig");
 const chunk = @import("chunk.zig");
 const disk_index = @import("disk_index.zig");
 const local_paths = @import("local_paths.zig");
@@ -128,6 +129,7 @@ pub const RootfsGcResult = struct {
     rooted_objects: usize = 0,
     unparseable_metadata_count: usize = 0,
     unparseable_ref_count: usize = 0,
+    unparseable_step_record_count: usize = 0,
     candidate_count: usize = 0,
     candidate_bytes: u64 = 0,
     deleted_count: usize = 0,
@@ -138,9 +140,10 @@ pub const RootfsGcResult = struct {
 const GcConservativeRootStats = struct {
     metadata_count: usize = 0,
     ref_count: usize = 0,
+    step_record_count: usize = 0,
 
     fn any(self: GcConservativeRootStats) bool {
-        return self.metadata_count != 0 or self.ref_count != 0;
+        return self.metadata_count != 0 or self.ref_count != 0 or self.step_record_count != 0;
     }
 };
 
@@ -989,6 +992,7 @@ fn gcRootfsCache(
         .rooted_objects = rooted_objects.count(),
         .unparseable_metadata_count = conservative_roots.metadata_count,
         .unparseable_ref_count = conservative_roots.ref_count,
+        .unparseable_step_record_count = conservative_roots.step_record_count,
         .candidate_count = entries.len,
         .candidate_bytes = candidate_bytes,
         .deleted_count = deleted_count,
@@ -1007,6 +1011,7 @@ fn collectRootfsStorageRoots(
 ) !void {
     try collectStorageRootsFromCacheMetadata(allocator, io, cache_root, storage_roots, conservative_roots);
     try collectStorageRootsFromRefRecords(allocator, io, cache_root, storage_roots, conservative_roots);
+    try collectStorageRootsFromBuildStepRecords(allocator, io, cache_root, storage_roots, conservative_roots);
     if (runtime_root) |root| {
         try collectStorageRootsFromRuntimeManifests(allocator, io, root, storage_roots);
     }
@@ -1049,6 +1054,33 @@ fn collectStorageRootsFromRefRecords(
     };
     defer refs.close(io);
     try collectStorageRootsFromRefDir(allocator, io, refs_path, refs, cache_root, storage_roots, conservative_roots);
+}
+
+fn collectStorageRootsFromBuildStepRecords(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    storage_roots: *std.StringHashMap(spore.RootfsStorage),
+    conservative_roots: *GcConservativeRootStats,
+) !void {
+    const steps_path = try std.fs.path.join(allocator, &.{ cache_root, "build", "steps" });
+    var steps = openDirPath(io, steps_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer steps.close(io);
+
+    var it = steps.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const path = try std.fs.path.join(allocator, &.{ steps_path, entry.name });
+        const expected_key = entry.name[0 .. entry.name.len - ".json".len];
+        switch (try build_step_cache.inspectRecordForGc(io, allocator, cache_root, path, expected_key)) {
+            .root => |storage| try addStorageRoot(storage_roots, storage),
+            .stale => {},
+            .unknown => conservative_roots.step_record_count += 1,
+        }
+    }
 }
 
 fn collectStorageRootsFromRefDir(
@@ -1733,10 +1765,11 @@ fn writeRootfsGcResult(writer: *Io.Writer, result: RootfsGcResult) !void {
     try writer.print("  Cache: {s}\n", .{result.cache_root});
     try writer.print("  Rooted indexes: {d}\n", .{result.rooted_indexes});
     try writer.print("  Rooted objects: {d}\n", .{result.rooted_objects});
-    if (result.unparseable_metadata_count != 0 or result.unparseable_ref_count != 0) {
-        try writer.print("  Warning: {d} unrecognized rootfs metadata records and {d} unrecognized rootfs ref records found; retained all rootfs CAS entries.\n", .{
+    if (result.unparseable_metadata_count != 0 or result.unparseable_ref_count != 0 or result.unparseable_step_record_count != 0) {
+        try writer.print("  Warning: {d} unrecognized rootfs metadata records, {d} unrecognized rootfs ref records, and {d} unrecognized build step records found; retained all rootfs CAS entries.\n", .{
             result.unparseable_metadata_count,
             result.unparseable_ref_count,
+            result.unparseable_step_record_count,
         });
     }
     if (result.dry_run) {
@@ -2194,6 +2227,85 @@ test "system cache gc preserves rooted disk index objects and deletes CAS orphan
     try std.testing.expect(!try fileExists(io, stray_object_path));
 }
 
+test "system cache gc preserves storage rooted only by a build step record" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root = "zig-cache/test-system-cache-gc-build-step-root";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    const rooted = try writeGcStorageFixture(allocator, io, root, null, 0x34);
+    const orphan = try writeGcStorageFixture(allocator, io, root, null, 0x45);
+    try rootfs_cas.markStorageComplete(io, allocator, root, rooted.storage.index_digest);
+    try rootfs_cas.markStorageComplete(io, allocator, root, orphan.storage.index_digest);
+    const input = build_step_cache.StepInput{
+        .platform = .{},
+        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .instruction_kind = "RUN",
+        .canonical_instruction = "RUN true",
+    };
+    const key = try build_step_cache.stepKey(allocator, input);
+    _ = try build_step_cache.writeRecord(io, allocator, root, input, key, rooted.storage);
+    const rooted_stamp_path = try rootfs_cas.storageCompleteStampPath(allocator, root, rooted.storage.index_digest);
+    try Io.Dir.cwd().deleteFile(io, rooted_stamp_path);
+
+    const rooted_index_path = try rootfs_cas.manifestIndexPath(allocator, root, rooted.storage.index_digest);
+    const rooted_object_path = try rootfs_cas.manifestObjectPath(allocator, root, rooted.object_digest);
+    const orphan_index_path = try rootfs_cas.manifestIndexPath(allocator, root, orphan.storage.index_digest);
+    const orphan_object_path = try rootfs_cas.manifestObjectPath(allocator, root, orphan.object_digest);
+    _ = try gcRootfsCache(allocator, io, .{ .cache_root = root });
+    try std.testing.expect(!try fileExists(io, rooted_stamp_path));
+    const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
+
+    try std.testing.expectEqual(@as(usize, 1), forced.rooted_indexes);
+    try std.testing.expectEqual(@as(usize, 1), forced.rooted_objects);
+    try std.testing.expect(try fileExists(io, rooted_index_path));
+    try std.testing.expect(try fileExists(io, rooted_object_path));
+    try std.testing.expect(!try fileExists(io, orphan_index_path));
+    try std.testing.expect(!try fileExists(io, orphan_object_path));
+    const hit = (try build_step_cache.readHit(io, allocator, root, input, key)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(rooted.storage.index_digest, hit.index_digest);
+    try std.testing.expect(try fileExists(io, rooted_stamp_path));
+}
+
+test "system cache gc ignores known build records with incomplete storage" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root = "zig-cache/test-system-cache-gc-stale-build-step";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    const stale = try writeGcStorageFixture(allocator, io, root, null, 0x56);
+    try rootfs_cas.markStorageComplete(io, allocator, root, stale.storage.index_digest);
+    const input = build_step_cache.StepInput{
+        .platform = .{},
+        .parent_index_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .instruction_kind = "RUN",
+        .canonical_instruction = "RUN false",
+    };
+    const key = try build_step_cache.stepKey(allocator, input);
+    _ = try build_step_cache.writeRecord(io, allocator, root, input, key, stale.storage);
+    const stale_index_path = try rootfs_cas.manifestIndexPath(allocator, root, stale.storage.index_digest);
+    const stale_object_path = try rootfs_cas.manifestObjectPath(allocator, root, stale.object_digest);
+    try Io.Dir.cwd().deleteFile(io, stale_object_path);
+    try rootfs_cas.removeStorageCompleteStamp(io, allocator, root, stale.storage.index_digest);
+    const stray_digest = try writeGcObjectFixture(allocator, io, root, 0x67);
+    const stray_path = try rootfs_cas.manifestObjectPath(allocator, root, stray_digest);
+
+    const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
+    try std.testing.expectEqual(@as(usize, 0), forced.unparseable_step_record_count);
+    try std.testing.expectEqual(@as(usize, 0), forced.rooted_indexes);
+    try std.testing.expect(!try fileExists(io, stale_index_path));
+    try std.testing.expect(!try fileExists(io, stale_object_path));
+    try std.testing.expect(!try fileExists(io, stray_path));
+}
+
 test "system cache gc treats unknown rootfs records as conservative roots" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -2219,12 +2331,18 @@ test "system cache gc treats unknown rootfs records as conservative roots" {
         .sub_path = root ++ "/refs/future-ref.json",
         .data = "{\"kind\":\"future-rootfs-ref-v99\"}",
     });
+    try Io.Dir.cwd().createDirPath(io, root ++ "/build/steps");
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = root ++ "/build/steps/future.json",
+        .data = "{\"kind\":\"future-build-step-v99\"}",
+    });
 
     const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
     try std.testing.expectEqual(@as(usize, 1), forced.rooted_indexes);
     try std.testing.expectEqual(@as(usize, 2), forced.rooted_objects);
     try std.testing.expectEqual(@as(usize, 1), forced.unparseable_metadata_count);
     try std.testing.expectEqual(@as(usize, 1), forced.unparseable_ref_count);
+    try std.testing.expectEqual(@as(usize, 1), forced.unparseable_step_record_count);
     try std.testing.expectEqual(@as(usize, 0), forced.candidate_count);
     try std.testing.expectEqual(@as(usize, 0), forced.deleted_count);
     try std.testing.expect(try fileExists(io, orphan_index_path));
@@ -2234,7 +2352,7 @@ test "system cache gc treats unknown rootfs records as conservative roots" {
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try writeRootfsGcResult(&out.writer, forced);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Warning: 1 unrecognized rootfs metadata records and 1 unrecognized rootfs ref records found; retained all rootfs CAS entries.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Warning: 1 unrecognized rootfs metadata records, 1 unrecognized rootfs ref records, and 1 unrecognized build step records found; retained all rootfs CAS entries.") != null);
 }
 
 test "system cache gc lock rejects a concurrent holder" {
