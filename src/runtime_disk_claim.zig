@@ -24,6 +24,7 @@ pub const max_aggregate_descriptor_bytes: usize = 64 * 1024 * 1024;
 pub const token_bytes: usize = 32;
 pub const token_hex_bytes: usize = token_bytes * 2;
 pub const claim_schema = "spore.disk-fork-claim.v1";
+pub const claim_type = "disk-fork-claim";
 
 const frame_magic = "SPDFD001";
 const frame_version: u16 = 1;
@@ -56,6 +57,7 @@ pub const Error = runtime_disk_fork.Error || std.mem.Allocator.Error || error{
 };
 
 pub const ClaimRequest = struct {
+    type: []const u8,
     schema: []const u8,
     token: []const u8,
     batch: []const u8,
@@ -129,6 +131,13 @@ pub const Registry = struct {
 
     pub fn count(self: Registry) usize {
         return self.entries.items.len;
+    }
+
+    pub fn hasBatch(self: Registry, batch: []const u8) bool {
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.batch, batch)) return true;
+        }
+        return false;
     }
 
     /// Atomically registers a batch. Heads remain in `pending` on error; on
@@ -593,6 +602,7 @@ fn tokenEql(a: Token, b: Token) bool {
 }
 
 fn validateClaimRequest(request: ClaimRequest) Error!void {
+    if (!std.mem.eql(u8, request.type, claim_type)) return error.BadClaimRequest;
     if (!std.mem.eql(u8, request.schema, claim_schema)) return error.BadClaimRequest;
     _ = try parseTokenHex(request.token);
     if (!validBindingName(request.batch, max_batch_name_bytes) or !validBindingName(request.child, max_child_name_bytes)) return error.BadClaimRequest;
@@ -600,7 +610,7 @@ fn validateClaimRequest(request: ClaimRequest) Error!void {
     spore.validateDiskDigest(request.baseline_identity) catch return error.BadClaimRequest;
 }
 
-fn validBindingName(value: []const u8, max_len: usize) bool {
+pub fn validBindingName(value: []const u8, max_len: usize) bool {
     if (value.len == 0 or value.len > max_len or !std.ascii.isAlphanumeric(value[0])) return false;
     for (value[1..]) |byte| {
         if (!(std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '_' or byte == '-')) return false;
@@ -683,6 +693,7 @@ test "claim request is bounded, canonical, and strict" {
     const token = [_]u8{0xAB} ** token_bytes;
     var token_hex: [token_hex_bytes]u8 = undefined;
     const request = ClaimRequest{
+        .type = claim_type,
         .schema = claim_schema,
         .token = formatTokenHex(token, &token_hex),
         .batch = "parent-42-100",
@@ -703,13 +714,13 @@ test "claim request is bounded, canonical, and strict" {
     try std.testing.expectEqualStrings(request.baseline_identity, parsed.value.baseline_identity);
 
     try std.testing.expectError(error.BadClaimRequest, parseClaimBytes(allocator,
-        \\{"token":"abababababababababababababababababababababababababababababababab","batch":"parent","child":"child","child_index":0,"baseline_kind":"rootfs","baseline_identity":"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+        \\{"schema":"spore.disk-fork-claim.v1","token":"abababababababababababababababababababababababababababababababab","batch":"parent","child":"child","child_index":0,"baseline_kind":"rootfs","baseline_identity":"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
     ));
     try std.testing.expectError(error.BadClaimRequest, parseClaimBytes(allocator,
-        \\{"schema":"spore.disk-fork-claim.v1","token":"ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB","batch":"parent","child":"child","child_index":0,"baseline_kind":"rootfs","baseline_identity":"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+        \\{"type":"disk-fork-claim","schema":"spore.disk-fork-claim.v1","token":"ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB","batch":"parent","child":"child","child_index":0,"baseline_kind":"rootfs","baseline_identity":"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
     ));
     try std.testing.expectError(error.BadClaimRequest, parseClaimBytes(allocator,
-        \\{"schema":"spore.disk-fork-claim.v1","token":"abababababababababababababababababababababababababababababababab","batch":"parent","child":"child","child_index":0,"baseline_kind":"rootfs","baseline_identity":"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","extra":true}
+        \\{"type":"disk-fork-claim","schema":"spore.disk-fork-claim.v1","token":"abababababababababababababababababababababababababababababababab","batch":"parent","child":"child","child_index":0,"baseline_kind":"rootfs","baseline_identity":"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","extra":true}
     ));
 }
 
@@ -759,6 +770,7 @@ test "claim registry binds tokens once and closes cancelled or expired heads" {
 
     var token_hex: [token_hex_bytes]u8 = undefined;
     var request = ClaimRequest{
+        .type = claim_type,
         .schema = claim_schema,
         .token = formatTokenHex(registrations[0].token, &token_hex),
         .batch = "batch-1",
@@ -789,6 +801,7 @@ test "claim registry binds tokens once and closes cancelled or expired heads" {
     defer allocator.free(expiring_registration);
     var expired_hex: [token_hex_bytes]u8 = undefined;
     const expired_request = ClaimRequest{
+        .type = claim_type,
         .schema = claim_schema,
         .token = formatTokenHex(expiring_registration[0].token, &expired_hex),
         .batch = "batch-2",
@@ -841,6 +854,7 @@ test "registered claim serves one descriptor and fd end to end" {
     defer allocator.free(registrations);
     var token_hex: [token_hex_bytes]u8 = undefined;
     const request = ClaimRequest{
+        .type = claim_type,
         .schema = claim_schema,
         .token = formatTokenHex(registrations[0].token, &token_hex),
         .batch = "batch",

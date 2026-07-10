@@ -9,6 +9,7 @@ const std = @import("std");
 const capture = @import("../capture.zig");
 const disk_layer = @import("../disk_layer.zig");
 const dirty_ram = @import("../dirty_ram.zig");
+const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const hvf = @import("hvf.zig");
 const gic = @import("gic.zig");
 const lazy_ram = @import("lazy_ram.zig");
@@ -616,7 +617,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
                         .ram_size = config.ram_size,
-                    }, config.rootfs, config.disk_snapshot, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                    }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                     if (!request.continue_after) return .snapshotted;
                     const completed_dir = if (request.publish_dir) |publish_dir| blk: {
                         try control.publishSnapshot(request.dir, publish_dir);
@@ -628,6 +629,25 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                 .rootfs_snapshot => |request| {
                     const disk_manifest = try takeRootfsSnapshot(allocator, request.dir, transports, config.disk_snapshot);
                     try control.completeRootfsSnapshot(disk_manifest);
+                },
+                .disk_fork => |request| {
+                    captureSingleHvfDiskFork(
+                        allocator,
+                        request,
+                        control,
+                        vcpu,
+                        transports,
+                        &gen_dev,
+                        &vsock_dev,
+                        ram_bytes,
+                        .{
+                            .dist_base = dist_base,
+                            .redist_base = vcpu_redist_base,
+                            .ram_size = config.ram_size,
+                        },
+                        config,
+                        if (dirty_tracker) |*tracker| tracker else null,
+                    ) catch |err| control.failDiskFork(err);
                 },
             }
             const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
@@ -641,7 +661,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, config.rootfs, config.disk_snapshot, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
                 if (config.continue_after_capture) {
@@ -666,7 +686,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                                 .dist_base = dist_base,
                                 .redist_base = vcpu_redist_base,
                                 .ram_size = config.ram_size,
-                            }, config.rootfs, config.disk_snapshot, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                            }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                             return .snapshotted;
                         }
                         return .probe_complete;
@@ -689,7 +709,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, config.rootfs, config.disk_snapshot, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                 return .snapshotted;
             }
         }
@@ -1310,6 +1330,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                             .{ .dist_base = options.dist_base, .redist_base = redist_window.base, .redist_stride = @intCast(redist_stride), .ram_size = options.config.ram_size },
                             options.rootfs,
                             options.disk_snapshot,
+                            null,
                             options.network_manifest,
                             options.annotations,
                             options.config.sessions,
@@ -1360,6 +1381,20 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                         state.finish(.{ .err = err });
                         continue;
                     };
+                    continue;
+                },
+                .disk_fork => |request| {
+                    captureMultiHvfDiskFork(
+                        allocator,
+                        options,
+                        vcpus,
+                        &state,
+                        &wake_set,
+                        redist_window.base,
+                        @intCast(redist_stride),
+                        request,
+                        control,
+                    ) catch |err| control.failDiskFork(err);
                     continue;
                 },
             }
@@ -1446,6 +1481,7 @@ fn snapshotMultiHvfAndStop(
         .{ .dist_base = options.dist_base, .redist_base = redist_base, .redist_stride = redist_stride, .ram_size = options.config.ram_size },
         options.rootfs,
         options.disk_snapshot,
+        null,
         options.network_manifest,
         options.annotations,
         options.config.sessions,
@@ -2178,6 +2214,50 @@ fn takeRootfsSnapshot(
     return try disk_state.finish(allocator, dir, true);
 }
 
+fn captureSingleHvfDiskFork(
+    allocator: std.mem.Allocator,
+    request: vsock.DiskForkAction,
+    control: vsock.Control,
+    vcpu: hvf.VcpuHandle,
+    transports: []mmio.Transport,
+    gen_dev: *const generation.Device,
+    vsock_dev: *const vsock.Vsock,
+    ram_bytes: []const u8,
+    platform: SnapshotPlatform,
+    config: Config,
+    dirty_tracker: ?*DirtyTracker,
+) !void {
+    const disk = config.disk_snapshot orelse return error.BadManifest;
+    const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
+    if (vsock_dev.pending_len != 0) return error.DeviceStatePending;
+    try takeSnapshot(
+        allocator,
+        request.dir,
+        vcpu,
+        transports,
+        gen_dev,
+        ram_bytes,
+        platform,
+        config.rootfs,
+        null,
+        disk,
+        config.network_manifest,
+        config.annotations,
+        config.sessions,
+        dirty_tracker,
+        config.environ_map,
+    );
+    const ram_capture_ns = runtime_disk_fork_capture.elapsedSince(pause_started_ns);
+    var batch = try runtime_disk_fork_capture.prepare(allocator, disk, request.count, .{
+        .allow_copy = request.allow_copy,
+        .force_copy = request.force_copy,
+    });
+    defer batch.deinit();
+    batch.pause_started_ns = pause_started_ns;
+    batch.ram_capture_ns = ram_capture_ns;
+    try control.completeDiskFork(&batch);
+}
+
 fn takeSnapshot(
     allocator: std.mem.Allocator,
     dir: []const u8,
@@ -2188,6 +2268,7 @@ fn takeSnapshot(
     platform: SnapshotPlatform,
     rootfs: ?spore.Rootfs,
     disk_snapshot: ?disk_layer.SnapshotState,
+    quiescence_disk: ?disk_layer.SnapshotState,
     network_manifest: ?spore.Network,
     annotations: spore.Annotations,
     sessions: []const spore.Session,
@@ -2206,7 +2287,7 @@ fn takeSnapshot(
     const devices = try captureTransports(arena, transports);
     const devices_ms = monotonicMs() - devices_start;
     var disk_quiesced = false;
-    if (disk_snapshot) |disk_state| {
+    if (disk_snapshot orelse quiescence_disk) |disk_state| {
         if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
             std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
             return error.DeviceStatePending;
@@ -2371,6 +2452,7 @@ fn takeSnapshotV1(
     platform: SnapshotPlatform,
     rootfs: ?spore.Rootfs,
     disk_snapshot: ?disk_layer.SnapshotState,
+    quiescence_disk: ?disk_layer.SnapshotState,
     network_manifest: ?spore.Network,
     annotations: spore.Annotations,
     sessions: []const spore.Session,
@@ -2395,7 +2477,7 @@ fn takeSnapshotV1(
     const devices = try captureTransports(arena, transports);
     const devices_ms = monotonicMs() - devices_start;
     var disk_quiesced = false;
-    if (disk_snapshot) |disk_state| {
+    if (disk_snapshot orelse quiescence_disk) |disk_state| {
         if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
             std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
             return error.DeviceStatePending;
@@ -2464,6 +2546,55 @@ fn takeSnapshotV1(
         },
     );
     std.log.info("spore written to {s}", .{dir});
+}
+
+fn captureMultiHvfDiskFork(
+    allocator: std.mem.Allocator,
+    options: MultiHvfRunOptions,
+    vcpus: []HvfVcpu,
+    state: *MultiHvfRunState,
+    wake_set: *HvfVcpuWakeSet,
+    redist_base: u64,
+    redist_stride: u64,
+    request: vsock.DiskForkAction,
+    control: vsock.Control,
+) !void {
+    const disk = options.disk_snapshot orelse return error.BadManifest;
+    const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
+    defer state.clearSnapshot();
+    try takeSnapshotV1(
+        allocator,
+        request.dir,
+        vcpus,
+        state,
+        wake_set,
+        options.transports,
+        options.gen_dev,
+        options.vsock_dev,
+        options.ram_bytes,
+        .{
+            .dist_base = options.dist_base,
+            .redist_base = redist_base,
+            .redist_stride = redist_stride,
+            .ram_size = options.config.ram_size,
+        },
+        options.rootfs,
+        null,
+        disk,
+        options.network_manifest,
+        options.annotations,
+        options.config.sessions,
+        options.environ_map,
+    );
+    const ram_capture_ns = runtime_disk_fork_capture.elapsedSince(pause_started_ns);
+    var batch = try runtime_disk_fork_capture.prepare(allocator, disk, request.count, .{
+        .allow_copy = request.allow_copy,
+        .force_copy = request.force_copy,
+    });
+    defer batch.deinit();
+    batch.pause_started_ns = pause_started_ns;
+    batch.ram_capture_ns = ram_capture_ns;
+    try control.completeDiskFork(&batch);
 }
 
 fn captureTransports(allocator: std.mem.Allocator, transports: []mmio.Transport) ![]spore.TransportState {

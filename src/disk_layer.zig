@@ -11,11 +11,12 @@ const block_source = @import("block_source.zig");
 const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
 const fd_util = @import("fd.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
+const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const spore = @import("spore.zig");
 
 extern "c" fn mkstemp(template: [*:0]u8) c_int;
 
-pub const Error = spore.Error || chunk_mapped_disk.Error || error{
+pub const Error = spore.Error || chunk_mapped_disk.Error || runtime_disk_fork.Error || error{
     ShortRead,
     ShortWrite,
 };
@@ -101,7 +102,31 @@ pub const SnapshotState = struct {
             .chunk_mapped => |disk| disk.commitSnapshotRoot(expected_root, prepared),
         };
     }
+
+    /// Clones the live writable head without sealing a durable disk index.
+    /// The backend must keep every vCPU paused and validate the virtio-blk
+    /// queue against `base` before calling this method.
+    pub fn exportForkHead(
+        self: SnapshotState,
+        options: chunk_mapped_disk.ExportForkOptions,
+    ) Error!runtime_disk_fork.Head {
+        const baseline = try forkBaseline(self.base);
+        return switch (self.active) {
+            .chunk_mapped => |disk| disk.exportForkHead(baseline, options),
+        };
+    }
 };
+
+pub fn forkBaseline(base: spore.Disk) Error!runtime_disk_fork.Baseline {
+    const kind: runtime_disk_fork.BaselineKind = if (std.mem.eql(u8, base.kind, spore.disk_kind_chunk_index))
+        .disk_index
+    else if (std.mem.eql(u8, base.kind, spore.disk_kind_cow_block))
+        .rootfs
+    else
+        return error.BadManifest;
+    try spore.validateDiskDigest(base.base);
+    return .{ .kind = kind, .identity = base.base };
+}
 
 fn monotonicMs() Error!u64 {
     var ts: std.c.timespec = undefined;

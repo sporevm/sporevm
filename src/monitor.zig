@@ -9,6 +9,9 @@ const lifecycle = @import("lifecycle.zig");
 const memory_config = @import("memory.zig");
 const monitor_jail = @import("monitor_jail.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
+const runtime_disk_fork = @import("runtime_disk_fork.zig");
+const runtime_disk_fork_capture = @import("runtime_disk_fork_capture.zig");
+const runtime_disk_fork_control = @import("runtime_disk_fork_control.zig");
 const net_gateway = @import("net_gateway.zig");
 const run = @import("run.zig");
 const spore = @import("spore.zig");
@@ -24,6 +27,7 @@ const max_exec_output = 16 * 1024;
 const max_suspend_path = 4096;
 const stats_write_interval_ms = 250;
 const registry_check_interval_ms = 1_000;
+const disk_claim_timeout_ns = 5 * 60 * std.time.ns_per_s;
 
 const monitor_usage =
     \\Usage:
@@ -83,6 +87,8 @@ const RequestState = enum {
     active_suspend,
     pending_snapshot,
     active_snapshot,
+    pending_disk_fork,
+    active_disk_fork,
     done,
     stop_requested,
 };
@@ -154,6 +160,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     defer if (gateway_active) gateway.deinit();
     try monitor_jail.applyForMonitor(init.environ_map);
     const spec_disk = if (existing_spec) |spec| spec.value.disk else null;
+    const spec_disk_baseline_lease = if (existing_spec) |spec| spec.value.disk_baseline_lease else null;
     const spec_resume_generation = if (existing_spec) |spec| spec.value.resume_generation else null;
     const spec_resume_generation_params = if (spec_resume_generation) |state| blk: {
         var gen_dev = generation.Device{};
@@ -183,6 +190,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .rootfs_path = opts.rootfs_path,
         .rootfs = spec_rootfs,
         .disk = spec_disk,
+        .disk_baseline_lease = spec_disk_baseline_lease,
         .network = try run.manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy),
         .annotations = spec_annotations,
         .sessions = spec_sessions,
@@ -198,6 +206,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     try lifecycle.writePid(allocator, init.io, paths, currentPid());
 
     var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.control_socket_path, paths.monitor_stats_path, opts.guest_port, opts.timeout_ms, spec_resume_generation_params);
+    defer server.disk_claims.deinit();
     if (gateway_active) server.network_events = &gateway;
     const metadata_ms = lifecycle.monotonicMs();
 
@@ -292,6 +301,14 @@ const ExecServer = struct {
     suspend_dir_len: usize = 0,
     publish_dir: [max_suspend_path]u8 = undefined,
     publish_dir_len: usize = 0,
+    disk_fork_batch: [runtime_disk_claim.max_batch_name_bytes]u8 = undefined,
+    disk_fork_batch_len: usize = 0,
+    disk_fork_children: [runtime_disk_claim.max_children_per_batch][runtime_disk_claim.max_child_name_bytes]u8 = undefined,
+    disk_fork_child_lens: [runtime_disk_claim.max_children_per_batch]u8 = [_]u8{0} ** runtime_disk_claim.max_children_per_batch,
+    disk_fork_count: u8 = 0,
+    disk_fork_allow_copy: bool = false,
+    disk_fork_force_copy: bool = false,
+    disk_claims: runtime_disk_claim.Registry,
     active_stream: vsock.HostStream = undefined,
     active_stream_valid: bool = false,
     active_stream_protocol: vsock.HostStreamProtocol = .legacy_text,
@@ -349,6 +366,7 @@ const ExecServer = struct {
             .timeout_ms = timeout_ms,
             .server = try address.listen(io, .{ .kernel_backlog = 8 }),
             .generation_params = generation_params,
+            .disk_claims = runtime_disk_claim.Registry.init(allocator),
         };
         var nonce_bytes: [8]u8 = undefined;
         io.random(&nonce_bytes);
@@ -394,6 +412,8 @@ const ExecServer = struct {
             .publishSnapshotFn = publishSnapshotThunk,
             .completeSnapshotFn = completeSnapshotThunk,
             .completeRootfsSnapshotFn = completeRootfsSnapshotThunk,
+            .completeDiskForkFn = completeDiskForkThunk,
+            .failDiskForkFn = failDiskForkThunk,
             .reportStatsFn = reportStatsThunk,
         };
     }
@@ -412,6 +432,7 @@ const ExecServer = struct {
             self.failOutstandingLocked("monitor registry disappeared");
             return .stop;
         }
+        _ = self.disk_claims.expire(monotonicNs());
 
         switch (self.state) {
             .idle, .done => return .keep_running,
@@ -430,6 +451,16 @@ const ExecServer = struct {
                 } };
             },
             .active_snapshot => return .keep_running,
+            .pending_disk_fork => {
+                self.state = .active_disk_fork;
+                return .{ .disk_fork = .{
+                    .dir = self.suspend_dir[0..self.suspend_dir_len],
+                    .count = self.disk_fork_count,
+                    .allow_copy = self.disk_fork_allow_copy,
+                    .force_copy = self.disk_fork_force_copy,
+                } };
+            },
+            .active_disk_fork => return .keep_running,
             .pending_exec => {
                 self.active_stream = try vsock.HostStream.initWithProtocol(self.guest_port, self.request[0..self.request_len], self.active_stream_protocol);
                 self.resetExecCapture();
@@ -834,6 +865,54 @@ const ExecServer = struct {
         return self.response[0..self.response_len];
     }
 
+    fn submitDiskFork(
+        self: *ExecServer,
+        out_dir: []const u8,
+        batch: []const u8,
+        children: []const []const u8,
+        allow_copy: bool,
+        force_copy: bool,
+    ) ![]const u8 {
+        try runtime_disk_fork_control.validatePrepare(.{
+            .type = runtime_disk_fork_control.prepare_type,
+            .schema = runtime_disk_fork_control.prepare_schema,
+            .out_dir = out_dir,
+            .batch = batch,
+            .children = children,
+            .allow_copy = allow_copy,
+            .force_copy = force_copy,
+        });
+        if (out_dir.len > self.suspend_dir.len) return error.InvalidSuspendDir;
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (self.state == .done) {
+            self.cond.waitUncancelable(self.io, &self.mutex);
+        }
+        if (self.state != .idle) return error.ControlBusy;
+        if (self.disk_claims.hasBatch(batch)) return error.BatchAlreadyRegistered;
+        @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
+        self.suspend_dir_len = out_dir.len;
+        @memcpy(self.disk_fork_batch[0..batch.len], batch);
+        self.disk_fork_batch_len = batch.len;
+        for (children, 0..) |child, index| {
+            @memcpy(self.disk_fork_children[index][0..child.len], child);
+            self.disk_fork_child_lens[index] = @intCast(child.len);
+        }
+        self.disk_fork_count = @intCast(children.len);
+        self.disk_fork_allow_copy = allow_copy;
+        self.disk_fork_force_copy = force_copy;
+        self.response_len = 0;
+        self.state = .pending_disk_fork;
+        if (self.wake) |wake| wake.wake();
+        self.cond.broadcast(self.io);
+        while (self.state != .done) {
+            self.cond.waitUncancelable(self.io, &self.mutex);
+        }
+        self.state = .idle;
+        return self.response[0..self.response_len];
+    }
+
     fn completeSuspend(self: *ExecServer) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -872,6 +951,79 @@ const ExecServer = struct {
 
     fn completeRootfsSnapshot(_: *ExecServer, _: ?spore.Disk) !void {}
 
+    fn completeDiskFork(self: *ExecServer, batch: *runtime_disk_fork_capture.Batch) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.state != .active_disk_fork or batch.heads.len != self.disk_fork_count) return error.ControlBusy;
+
+        var pending: [runtime_disk_claim.max_children_per_batch]runtime_disk_claim.PendingClaim = undefined;
+        for (batch.heads, 0..) |head, index| {
+            pending[index] = .{
+                .child_name = self.disk_fork_children[index][0..self.disk_fork_child_lens[index]],
+                .child_index = @intCast(index),
+                .head = head,
+            };
+        }
+        const now_ns = monotonicNs();
+        const expires_at_ns = std.math.add(u64, now_ns, disk_claim_timeout_ns) catch std.math.maxInt(u64);
+        const batch_name = self.disk_fork_batch[0..self.disk_fork_batch_len];
+        const baseline = (batch.heads[0] orelse return error.BadBatch).descriptor.baseline;
+        const registrations = try self.disk_claims.registerBatch(batch_name, pending[0..batch.heads.len], now_ns, expires_at_ns);
+        defer self.allocator.free(registrations);
+        for (batch.heads) |*head| head.* = null;
+        errdefer _ = self.disk_claims.cancelBatch(batch_name);
+
+        var token_buffers: [runtime_disk_claim.max_children_per_batch][runtime_disk_claim.token_hex_bytes]u8 = undefined;
+        var claims: [runtime_disk_claim.max_children_per_batch]runtime_disk_fork_control.PreparedClaim = undefined;
+        for (claims[0..registrations.len], registrations, 0..) |*claim, registration, index| {
+            claim.* = .{
+                .child = self.disk_fork_children[index][0..self.disk_fork_child_lens[index]],
+                .child_index = @intCast(index),
+                .token = runtime_disk_claim.formatTokenHex(registration.token, &token_buffers[index]),
+                .baseline_kind = baseline.kind,
+                .baseline_identity = baseline.identity,
+            };
+        }
+        try self.storeJsonLocked(runtime_disk_fork_control.PreparedResponse{
+            .batch = batch_name,
+            .capture_dir = self.suspend_dir[0..self.suspend_dir_len],
+            .claims = claims[0..registrations.len],
+            .ram_capture_ns = batch.ram_capture_ns,
+            .disk_fork_ns = batch.prepare_ns,
+            .source_pause_ns = runtime_disk_fork_capture.elapsedSince(batch.pause_started_ns),
+            .copied_bytes = batch.copied_bytes,
+        });
+        self.state = .done;
+        self.cond.broadcast(self.io);
+    }
+
+    fn failDiskFork(self: *ExecServer, err: anyerror) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.state != .pending_disk_fork and self.state != .active_disk_fork) return;
+        var message_buf: [192]u8 = undefined;
+        const message = std.fmt.bufPrint(&message_buf, "disk fork capture failed: {s}", .{@errorName(err)}) catch "disk fork capture failed";
+        self.storeErrorLocked(message) catch {
+            self.response_len = 0;
+        };
+        self.state = .done;
+        self.cond.broadcast(self.io);
+    }
+
+    fn claimDiskHead(self: *ExecServer, request: runtime_disk_claim.ClaimRequest) !runtime_disk_fork.Head {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const now_ns = monotonicNs();
+        _ = self.disk_claims.expire(now_ns);
+        return self.disk_claims.claim(request, now_ns);
+    }
+
+    fn cancelDiskFork(self: *ExecServer, batch: []const u8) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.disk_claims.cancelBatch(batch);
+    }
+
     fn reportStats(self: *ExecServer, stats: vsock.ControlStats) void {
         if (self.stats_written and std.meta.eql(stats, self.stats_written_value)) return;
         const now = lifecycle.monotonicMs();
@@ -903,7 +1055,7 @@ const ExecServer = struct {
 
     fn failOutstandingLocked(self: *ExecServer, message: []const u8) void {
         switch (self.state) {
-            .active_ready, .pending_exec, .active_exec, .pending_suspend, .active_suspend, .pending_snapshot, .active_snapshot => {
+            .active_ready, .pending_exec, .active_exec, .pending_suspend, .active_suspend, .pending_snapshot, .active_snapshot, .pending_disk_fork, .active_disk_fork => {
                 if (self.active_streaming_exec) {
                     self.sendStreamingErrorLocked(message);
                 } else {
@@ -1005,6 +1157,16 @@ const ExecServer = struct {
     fn completeRootfsSnapshotThunk(context: *anyopaque, disk: ?spore.Disk) !void {
         const self: *ExecServer = @ptrCast(@alignCast(context));
         try self.completeRootfsSnapshot(disk);
+    }
+
+    fn completeDiskForkThunk(context: *anyopaque, batch: *runtime_disk_fork_capture.Batch) !void {
+        const self: *ExecServer = @ptrCast(@alignCast(context));
+        try self.completeDiskFork(batch);
+    }
+
+    fn failDiskForkThunk(context: *anyopaque, err: anyerror) void {
+        const self: *ExecServer = @ptrCast(@alignCast(context));
+        self.failDiskFork(err);
     }
 
     fn reportStatsThunk(context: *anyopaque, stats: vsock.ControlStats) void {
@@ -1115,6 +1277,49 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         server.requestStop();
         try writeControlOk(server.io, stream);
         return true;
+    }
+    if (std.mem.eql(u8, parsed.value.type, runtime_disk_claim.claim_type)) {
+        var claim = runtime_disk_claim.parseClaimBytes(server.allocator, line) catch {
+            try writeControlError(server.io, stream, "bad disk fork claim");
+            return false;
+        };
+        defer claim.deinit();
+        var head = server.claimDiskHead(claim.value) catch |err| {
+            try writeControlError(server.io, stream, @errorName(err));
+            return false;
+        };
+        defer head.deinit();
+        runtime_disk_claim.sendHead(stream.socket.handle, server.allocator, &head) catch return false;
+        return false;
+    }
+    if (std.mem.eql(u8, parsed.value.type, runtime_disk_fork_control.prepare_type)) {
+        var request = runtime_disk_fork_control.parsePrepareBytes(server.allocator, line) catch {
+            try writeControlError(server.io, stream, "bad disk fork prepare request");
+            return false;
+        };
+        defer request.deinit();
+        const response = server.submitDiskFork(
+            request.value.out_dir,
+            request.value.batch,
+            request.value.children,
+            request.value.allow_copy,
+            request.value.force_copy,
+        ) catch |err| {
+            try writeControlError(server.io, stream, @errorName(err));
+            return false;
+        };
+        try writeAll(server.io, stream, response);
+        return false;
+    }
+    if (std.mem.eql(u8, parsed.value.type, runtime_disk_fork_control.cancel_type)) {
+        var request = runtime_disk_fork_control.parseCancelBytes(server.allocator, line) catch {
+            try writeControlError(server.io, stream, "bad disk fork cancel request");
+            return false;
+        };
+        defer request.deinit();
+        _ = server.cancelDiskFork(request.value.batch);
+        try writeControlOk(server.io, stream);
+        return false;
     }
     if (std.mem.eql(u8, parsed.value.type, "suspend")) {
         const out_dir = parsed.value.out_dir orelse {
@@ -1270,6 +1475,10 @@ const ControlRequest = struct {
     terminal_rows: ?u16 = null,
     terminal_cols: ?u16 = null,
 };
+
+fn monotonicNs() u64 {
+    return std.math.mul(u64, lifecycle.monotonicMs(), std.time.ns_per_ms) catch std.math.maxInt(u64);
+}
 
 fn writeStreamingControlError(fd: std.c.fd_t, message: []const u8) !void {
     const payload = if (message.len > spore_stream.max_payload_len) message[0..spore_stream.max_payload_len] else message;

@@ -615,8 +615,8 @@ structure with two instantiations (RAM 2MiB, disk 64KiB).
 ### U6 — Production disk-backed fast fork
 
 Status: backend primitive, post-save baseline authority, portable runtime disk
-head, and one-shot fd-claim transport complete; monitor/VMM capture and
-baseline leases are the active next slice.
+head, one-shot fd-claim transport, and monitor/VMM batch capture complete;
+disk-backed named lifecycle enablement is the active final slice.
 
 `ChunkMappedDisk.fork()` can already copy the one-level source map and clone
 an unlinked overlay fd, and its unit tests cover rejection, copy fallback,
@@ -766,7 +766,18 @@ save→rename→fork→save coverage.
    backend-local in HVF/KVM, but share the request/result and ownership state
    machine. Reuse one RAM/machine capture, prepare all child heads at the same
    epoch, create their baseline leases, and apply the existing per-child
-   identity transformations without sealing disk state.
+   identity transformations without sealing disk state. **Complete at the
+   backend/control boundary:** the bounded internal prepare request now drives
+   single- and multi-vCPU HVF/KVM through one paused epoch, separately checks
+   the live disk queue (and pending vsock data), writes the shared runtime-only
+   RAM/machine capture with no disk manifest, and atomically registers every
+   owned head before resuming the source. Errors close partial batches and are
+   returned without killing the source. The validated baseline-lease schema is
+   now a lifecycle value and protects matching rootfs-cache indexes and objects
+   from GC or destructive prune, and exact artifacts from destructive prune.
+   Item 5 persists the
+   per-child lease and invokes the existing identity transform while consuming
+   this internal result.
 5. **Enable disk-backed named live fork.** Remove the two disk guards only for
    supported one-rootfs-disk shapes, pass each internal claim to its re-exec'd
    monitor, pre-open its runtime disk, and make batch rollback include

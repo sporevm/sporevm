@@ -90,14 +90,7 @@ pub const RuntimeDisk = struct {
 
     fn forkBaseline(self: *RuntimeDisk) !runtime_disk_fork.Baseline {
         const base = self.base_disk orelse return error.ReadOnly;
-        const kind: runtime_disk_fork.BaselineKind = if (std.mem.eql(u8, base.kind, spore.disk_kind_chunk_index))
-            .disk_index
-        else if (std.mem.eql(u8, base.kind, spore.disk_kind_cow_block))
-            .rootfs
-        else
-            return error.BadManifest;
-        try spore.validateDiskDigest(base.base);
-        return .{ .kind = kind, .identity = base.base };
+        return disk_layer.forkBaseline(base);
     }
 };
 

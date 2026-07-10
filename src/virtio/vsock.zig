@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const guestmem = @import("../guestmem.zig");
+const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
 const spore = @import("../spore.zig");
@@ -654,6 +655,7 @@ pub const ControlAction = union(enum) {
     stop,
     snapshot: SnapshotAction,
     rootfs_snapshot: RootfsSnapshotAction,
+    disk_fork: DiskForkAction,
 };
 
 pub const SnapshotAction = struct {
@@ -664,6 +666,13 @@ pub const SnapshotAction = struct {
 
 pub const RootfsSnapshotAction = struct {
     dir: []const u8,
+};
+
+pub const DiskForkAction = struct {
+    dir: []const u8,
+    count: u8,
+    allow_copy: bool = false,
+    force_copy: bool = false,
 };
 
 pub const ControlStats = struct {
@@ -687,6 +696,8 @@ pub const Control = struct {
     publishSnapshotFn: ?*const fn (context: *anyopaque, work_dir: []const u8, publish_dir: []const u8) anyerror!void = null,
     completeSnapshotFn: *const fn (context: *anyopaque, dir: []const u8) anyerror!void,
     completeRootfsSnapshotFn: *const fn (context: *anyopaque, disk: ?spore.Disk) anyerror!void,
+    completeDiskForkFn: ?*const fn (context: *anyopaque, batch: *runtime_disk_fork_capture.Batch) anyerror!void = null,
+    failDiskForkFn: ?*const fn (context: *anyopaque, err: anyerror) void = null,
     reportStatsFn: *const fn (context: *anyopaque, stats: ControlStats) void,
 
     pub fn poll(self: Control, dev: *Vsock) !ControlAction {
@@ -708,6 +719,16 @@ pub const Control = struct {
 
     pub fn completeRootfsSnapshot(self: Control, disk: ?spore.Disk) !void {
         try self.completeRootfsSnapshotFn(self.context, disk);
+    }
+
+    pub fn completeDiskFork(self: Control, batch: *runtime_disk_fork_capture.Batch) !void {
+        const complete = self.completeDiskForkFn orelse return error.UnsupportedDiskFork;
+        try complete(self.context, batch);
+    }
+
+    pub fn failDiskFork(self: Control, err: anyerror) void {
+        const fail = self.failDiskForkFn orelse return;
+        fail(self.context, err);
     }
 
     pub fn reportStats(self: Control, stats: ControlStats) void {

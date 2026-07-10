@@ -9,6 +9,7 @@ const Context = @import("context.zig").Context;
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
+const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const generation = @import("generation.zig");
 const attach_mod = @import("attach.zig");
 const run_mod = @import("run.zig");
@@ -268,6 +269,7 @@ pub const Spec = struct {
     rootfs_path: ?[]const u8 = null,
     rootfs: ?spore.Rootfs = null,
     disk: ?spore.Disk = null,
+    disk_baseline_lease: ?runtime_disk_lease.Lease = null,
     network: ?spore.Network = null,
     annotations: spore.Annotations = .{},
     sessions: []const spore.Session = &.{},
@@ -2264,6 +2266,7 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
 }
 
 pub fn writeSpec(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec) !void {
+    try validateSpec(spec);
     try ensureVmDir(io, paths);
     const json = try std.json.Stringify.valueAlloc(allocator, spec, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
@@ -2273,11 +2276,17 @@ pub fn writeSpec(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec)
 pub fn readSpec(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.Parsed(Spec) {
     const data = try Io.Dir.cwd().readFileAlloc(io, paths.spec_path, allocator, .limited(max_metadata_bytes));
     defer allocator.free(data);
-    const parsed = try std.json.parseFromSlice(Spec, allocator, data, .{
+    var parsed = try std.json.parseFromSlice(Spec, allocator, data, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
+    errdefer parsed.deinit();
+    try validateSpec(parsed.value);
     return parsed;
+}
+
+fn validateSpec(spec: Spec) !void {
+    if (spec.disk_baseline_lease) |lease| try lease.validate();
 }
 
 pub fn writeReady(allocator: std.mem.Allocator, io: Io, paths: Paths, ready: Ready) !void {
@@ -3254,6 +3263,7 @@ fn pathExists(io: Io, path: []const u8) !bool {
 }
 
 fn writeSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8, spec: Spec) !void {
+    try validateSpec(spec);
     const path = try std.fs.path.resolve(allocator, &.{ dir, lifecycle_spore_metadata_file });
     var metadata = spec;
     metadata.resume_dir = null;
@@ -3270,10 +3280,12 @@ pub fn readSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const
         else => |e| return e,
     };
     defer allocator.free(data);
-    const parsed = try std.json.parseFromSlice(Spec, allocator, data, .{
+    var parsed = try std.json.parseFromSlice(Spec, allocator, data, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
+    errdefer parsed.deinit();
+    try validateSpec(parsed.value);
     return parsed;
 }
 
@@ -5546,6 +5558,12 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
             .allow_cidrs = &.{"93.184.216.34/32"},
             .allow_hosts = &.{"example.com"},
         },
+        .disk_baseline_lease = .{
+            .store = .rootfs_cache,
+            .root = "/cache",
+            .baseline_kind = .rootfs,
+            .baseline_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
         .memory = .{ .policy = .explicit, .bytes = 512 * 1024 * 1024 },
     });
     var spec = try readSpec(allocator, io, paths);
@@ -5555,6 +5573,8 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
     try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", spec.value.image_ref.?);
     try std.testing.expectEqualStrings("93.184.216.34/32", spec.value.network.?.allow_cidrs[0]);
     try std.testing.expectEqualStrings("example.com", spec.value.network.?.allow_hosts[0]);
+    try std.testing.expectEqual(runtime_disk_lease.Store.rootfs_cache, spec.value.disk_baseline_lease.?.store);
+    try std.testing.expectEqualStrings("/cache", spec.value.disk_baseline_lease.?.root);
     try std.testing.expectEqual(memory_config.Policy.explicit, spec.value.memory.policy);
     try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), spec.value.memory.bytes);
 
