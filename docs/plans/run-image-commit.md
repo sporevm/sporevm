@@ -1,5 +1,5 @@
 ---
-status: complete
+status: active
 last_reviewed: 2026-07-10
 spec_refs:
   - docs/filesystem.md
@@ -602,9 +602,8 @@ primitive must be planned before widening SporeVM.
 
 #### S2 outcome (2026-07-10)
 
-The downstream pressure test is recorded in
-`buildkite/buildkite-sporevm@285a062` (`docs/compose-cache-layering.md`). It
-confirmed that the existing wrapper has the inverse order: it first builds the
+The downstream pressure test against `buildkite/buildkite-sporevm` confirmed
+that the existing wrapper has the inverse order: it first builds the
 revision-specific `buildkite-spore-ci:local` image, then adds individually
 saved dependency archives, and finally runs `docker load` during guest setup.
 

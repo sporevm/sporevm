@@ -43,6 +43,7 @@ fi
 "${spore_bin}" run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
+  --vcpus 2 \
   --image local/run-disk-size:base \
   --pull=never \
   --disk-size 2gb \
