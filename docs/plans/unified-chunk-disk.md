@@ -640,8 +640,9 @@ a sparse temporary base fd without assembling the full flat image first. The
 chunk map marks nonzero index entries as `.cas`; the first read of a CAS chunk
 opens the local object, verifies it against the descriptor-selected BLAKE3
 digest, writes it into the sparse base, and promotes that map entry to `.base`.
-Missing or corrupt objects fail the read before bytes reach the guest. Warm
-flat-cache opens still use the existing read-only materialization path.
+Missing or corrupt objects fail the complete logical read before caller-visible
+bytes change. Warm flat-cache opens still use the existing read-only
+materialization path.
 Managed `spore run --image` resolves chunked image-rootfs storage even without
 `--save`, and cache lookup no longer repairs an evicted flat by-digest
 materialization as a side effect, so a warm-CAS/cold-flat image run reaches the
@@ -658,10 +659,14 @@ open without publishing a flat cache, wrong-sized flat-cache fallback, CAS
 promotion after the first read, read-time missing-object failure, induced
 eviction of an already promoted chunk, corrupt unread-object failure without
 torn read data, and chunk-index disk restore over the lazy backend. The same
-test graph also drives virtio-blk descriptor chains over a lazy chunk-mapped
-disk for missing-object and same-size corrupt-object reads: both complete the
-request with `status_ioerr`, advance the used ring, leave the failed read
-buffer unchanged, and then serve a promoted healthy chunk on the same queue.
+test graph also drives multi-chunk, multi-descriptor virtio-blk reads over a
+lazy chunk-mapped disk for missing and same-size corrupt objects: both preflight
+the complete logical range, complete the request with `status_ioerr`, advance
+the used ring, copy no disk payload bytes into the guest, and then serve a
+promoted healthy chunk on the same queue. Only the status byte is updated; the
+non-overlapping test data segments remain sentinel-filled. Descriptor validation
+also completes before I/O, so a malformed later segment cannot expose data
+through an earlier valid segment or partially change backend bytes.
 
 Repeatable time-to-first-exec measurement lives in
 `scripts/benchmark/suite.py` as the opt-in `lazy_rootfs_tti` benchmark. The

@@ -263,8 +263,22 @@ pub const ChunkMappedDisk = struct {
         try self.readChunk(chunk_index, buf);
     }
 
+    /// Resolves every lazy CAS source in a read range before caller-visible
+    /// bytes are written. Successfully faulted chunks may remain promoted when
+    /// a later chunk fails; that internal progress is safe to reuse on retry.
+    pub fn prefaultCasRange(self: *ChunkMappedDisk, len: usize, offset: u64) Error!void {
+        try self.checkRange(len, offset);
+        var cursor: usize = 0;
+        while (cursor < len) {
+            const absolute = offset + cursor;
+            const span = try self.spanFor(absolute, len - cursor);
+            if (self.sources[span.chunk_index] == .cas) try self.faultCasChunk(span.chunk_index);
+            cursor += span.len;
+        }
+    }
+
     pub fn readAt(self: *ChunkMappedDisk, buf: []u8, offset: u64) Error!void {
-        try self.checkRange(buf.len, offset);
+        try self.prefaultCasRange(buf.len, offset);
         var cursor: usize = 0;
         while (cursor < buf.len) {
             const absolute = offset + cursor;

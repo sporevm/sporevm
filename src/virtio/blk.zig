@@ -72,6 +72,14 @@ pub const Backend = union(enum) {
         }
     }
 
+    fn prefaultCasRange(self: Backend, len: usize, offset: u64) bool {
+        switch (self) {
+            .chunk_mapped => |disk| disk.prefaultCasRange(len, offset) catch return false,
+            .file, .memory => {},
+        }
+        return true;
+    }
+
     fn writeAt(self: Backend, buf: []const u8, offset: u64) bool {
         switch (self) {
             .file => |fd| {
@@ -188,24 +196,41 @@ pub const Blk = struct {
             req_in, req_out => {
                 const want_writable = req_type == req_in;
                 const capacity_bytes = self.capacity_sectors * sector_size;
-                var offset = std.math.mul(u64, sector, sector_size) catch return failStatus(status);
+                const request_offset = std.math.mul(u64, sector, sector_size) catch return failStatus(status);
+                var offset = request_offset;
                 var moved: u32 = 0;
+                // Validate the complete descriptor set before any payload
+                // buffer or backend disk bytes are changed.
                 for (data) |seg| {
                     if (seg.writable != want_writable) return failStatus(status);
                     if (seg.data.len % sector_size != 0) return failStatus(status);
                     const seg_len = std.math.cast(u64, seg.data.len) orelse return failStatus(status);
                     const end = std.math.add(u64, offset, seg_len) catch return failStatus(status);
                     if (end > capacity_bytes) return failStatus(status);
+                    offset = end;
+                    if (want_writable) {
+                        const written = std.math.cast(u32, seg.data.len) orelse return failStatus(status);
+                        if (written > std.math.maxInt(u32) - 1 - moved) return failStatus(status);
+                        moved += written;
+                    }
+                }
+
+                if (want_writable) {
+                    const total_len = std.math.cast(usize, offset - request_offset) orelse return failStatus(status);
+                    // Each readAt prefaults its own slice for direct callers;
+                    // this request-wide pass is still required so a later
+                    // descriptor cannot fail after an earlier one was copied.
+                    if (!self.backend.prefaultCasRange(total_len, request_offset)) return failStatus(status);
+                }
+
+                offset = request_offset;
+                for (data) |seg| {
                     const ok = if (want_writable)
                         self.backend.readAt(seg.data, offset)
                     else
                         self.backend.writeAt(seg.data, offset);
                     if (!ok) return failStatus(status);
-                    offset = end;
-                    if (want_writable) {
-                        const written = std.math.cast(u32, seg.data.len) orelse return failStatus(status);
-                        moved = std.math.add(u32, moved, written) catch return failStatus(status);
-                    }
+                    offset += seg.data.len;
                 }
                 return okStatus(status, moved);
             },
@@ -364,6 +389,51 @@ test "read request returns sector data" {
     try std.testing.expectEqual(@as(u8, 0xAB), data[0]);
 }
 
+test "read request validates every descriptor before changing guest buffers" {
+    var disk = [_]u8{0x5a} ** (2 * sector_size);
+    var blk = Blk.init(.{ .memory = &disk });
+
+    var header: [16]u8 = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, header[0..4], req_in, .little);
+    var first: [sector_size]u8 = [_]u8{0xaa} ** sector_size;
+    var malformed: [1]u8 = .{0xaa};
+    var status: [1]u8 = .{0xff};
+
+    const chain = makeChain(&.{
+        .{ .data = &header, .writable = false },
+        .{ .data = &first, .writable = true },
+        .{ .data = &malformed, .writable = true },
+        .{ .data = &status, .writable = true },
+    });
+    const written = blk.handleRequest(&chain);
+    try std.testing.expectEqual(@as(u32, 1), written);
+    try std.testing.expectEqual(status_ioerr, status[0]);
+    try std.testing.expect(std.mem.allEqual(u8, &first, 0xaa));
+    try std.testing.expectEqual(@as(u8, 0xaa), malformed[0]);
+}
+
+test "write request validates every descriptor before changing backend bytes" {
+    var disk = [_]u8{0x11} ** (2 * sector_size);
+    var blk = Blk.init(.{ .memory = &disk });
+
+    var header: [16]u8 = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, header[0..4], req_out, .little);
+    var first: [sector_size]u8 = [_]u8{0x5a} ** sector_size;
+    var malformed: [1]u8 = .{0x5a};
+    var status: [1]u8 = .{0xff};
+
+    const chain = makeChain(&.{
+        .{ .data = &header, .writable = false },
+        .{ .data = &first, .writable = false },
+        .{ .data = &malformed, .writable = false },
+        .{ .data = &status, .writable = true },
+    });
+    const written = blk.handleRequest(&chain);
+    try std.testing.expectEqual(@as(u32, 1), written);
+    try std.testing.expectEqual(status_ioerr, status[0]);
+    try std.testing.expect(std.mem.allEqual(u8, &disk, 0x11));
+}
+
 test "write request persists and out-of-range is io error" {
     var disk = [_]u8{0} ** (2 * sector_size);
     var blk = Blk.init(.{ .memory = &disk });
@@ -517,6 +587,25 @@ fn expectLazyFaultInFailureViaVirtio(kind: LazyFaultKind) !void {
     }
 
     const bad_sector = @as(u64, @intCast(bad_chunk)) * (spore.disk_chunk_size / sector_size);
+    const prefix_sector = @as(u64, @intCast(bad_chunk - 1)) * (spore.disk_chunk_size / sector_size);
+    var header: [16]u8 = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, header[0..4], req_in, .little);
+    std.mem.writeInt(u64, header[8..16], prefix_sector, .little);
+    var healthy_prefix: [spore.disk_chunk_size]u8 = [_]u8{0xaa} ** spore.disk_chunk_size;
+    var failing_suffix: [spore.disk_chunk_size]u8 = [_]u8{0xaa} ** spore.disk_chunk_size;
+    var status: [1]u8 = .{0xff};
+    const multi_chunk = makeChain(&.{
+        .{ .data = &header, .writable = false },
+        .{ .data = &healthy_prefix, .writable = true },
+        .{ .data = &failing_suffix, .writable = true },
+        .{ .data = &status, .writable = true },
+    });
+    const multi_chunk_written = blk.handleRequest(&multi_chunk);
+    try std.testing.expectEqual(@as(u32, 1), multi_chunk_written);
+    try std.testing.expectEqual(status_ioerr, status[0]);
+    try std.testing.expect(std.mem.allEqual(u8, &healthy_prefix, 0xaa));
+    try std.testing.expect(std.mem.allEqual(u8, &failing_suffix, 0xaa));
+
     const failed = try ring.submitRead(&blk, bad_sector, 0xaa, &data);
     try std.testing.expect(failed.did_work);
     try std.testing.expectEqual(status_ioerr, failed.status);
