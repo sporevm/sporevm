@@ -197,21 +197,26 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
 
     var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.control_socket_path, paths.monitor_stats_path, opts.guest_port, opts.timeout_ms, spec_resume_generation_params);
     if (gateway_active) server.network_events = &gateway;
-    const thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
     const metadata_ms = lifecycle.monotonicMs();
 
-    server.setStartupMetadata(paths, .{
-        .parse_ms = parsed_ms - start_ms,
-        .paths_ms = paths_ms - parsed_ms,
-        .asset_resolve_ms = assets_ms - paths_ms,
-        .metadata_ms = metadata_ms - assets_ms,
-        .ready_after_start_ms = 0,
-    }, start_ms, .{
-        .pid = currentPid(),
-        .control_socket_path = paths.control_socket_path,
-        .console_log_path = paths.console_log_path,
-    });
+    server.startup = .{
+        .paths = paths,
+        .timing = .{
+            .parse_ms = parsed_ms - start_ms,
+            .paths_ms = paths_ms - parsed_ms,
+            .asset_resolve_ms = assets_ms - paths_ms,
+            .metadata_ms = metadata_ms - assets_ms,
+            .ready_after_start_ms = 0,
+        },
+        .started_ms = start_ms,
+        .ready = .{
+            .pid = currentPid(),
+            .control_socket_path = paths.control_socket_path,
+            .console_log_path = paths.console_log_path,
+        },
+    };
     const readiness_probe = try server.startReadinessProbe();
+    const thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
 
     try run.openConsoleLog(opts.console_log_path);
     defer run.closeConsoleLog();
@@ -252,6 +257,13 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         return err;
     }
 }
+
+const StartupMetadata = struct {
+    paths: lifecycle.Paths,
+    timing: lifecycle.MonitorTiming,
+    started_ms: u64,
+    ready: lifecycle.Ready,
+};
 
 const ExecServer = struct {
     allocator: std.mem.Allocator,
@@ -295,10 +307,7 @@ const ExecServer = struct {
     stats_write_ms: u64 = 0,
     last_registry_check_ms: u64 = 0,
     closed: std.atomic.Value(bool) = .init(false),
-    startup_paths: ?lifecycle.Paths = null,
-    startup_timing: ?lifecycle.MonitorTiming = null,
-    startup_started_ms: u64 = 0,
-    startup_ready: ?lifecycle.Ready = null,
+    startup: ?StartupMetadata = null,
 
     fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, socket_path: []const u8, stats_path: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8) !ExecServer {
         // Zig's UnixAddress accepts 108-byte paths everywhere, but macOS
@@ -352,20 +361,11 @@ const ExecServer = struct {
         return &self.active_stream;
     }
 
-    fn setStartupMetadata(self: *ExecServer, paths: lifecycle.Paths, timing: lifecycle.MonitorTiming, started_ms: u64, ready: lifecycle.Ready) void {
-        self.startup_paths = paths;
-        self.startup_timing = timing;
-        self.startup_started_ms = started_ms;
-        self.startup_ready = ready;
-    }
-
     fn publishReady(self: *ExecServer) !void {
-        const paths = self.startup_paths orelse return error.MissingMonitorStartupMetadata;
-        var timing = self.startup_timing orelse return error.MissingMonitorStartupMetadata;
-        const ready = self.startup_ready orelse return error.MissingMonitorStartupMetadata;
-        timing.ready_after_start_ms = lifecycle.monotonicMs() - self.startup_started_ms;
-        lifecycle.writeMonitorTiming(self.allocator, self.io, paths, timing) catch {};
-        try lifecycle.writeReady(self.allocator, self.io, paths, ready);
+        var startup = self.startup orelse return error.MissingMonitorStartupMetadata;
+        startup.timing.ready_after_start_ms = lifecycle.monotonicMs() - startup.started_ms;
+        lifecycle.writeMonitorTiming(self.allocator, self.io, startup.paths, startup.timing) catch {};
+        try lifecycle.writeReady(self.allocator, self.io, startup.paths, startup.ready);
     }
 
     fn deinit(self: *ExecServer) void {
