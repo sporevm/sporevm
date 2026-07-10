@@ -403,8 +403,8 @@ have a completeness stamp proving all referenced nonzero chunks are present.
 Missing or malformed indexes, missing complete stamps, or bad records are
 treated as misses.
 
-Step record, written atomically (temp + rename) only after `snapshotIndex()`
-has published the index/chunks and the complete stamp exists:
+Step record, written or replaced atomically (temp + rename) only after
+`snapshotIndex()` has published the index/chunks and the complete stamp exists:
 
 ```json
 {
@@ -426,9 +426,12 @@ has published the index/chunks and the complete stamp exists:
 Final rootfs identities are **recorded outcomes, not recomputed promises**. Guest
 writes (inode allocation, timestamps) are not deterministic, so the same step
 key can map to different rootfs indexes on different machines or after a cache
-wipe. That is the same model Docker uses: cache keys are deterministic, the
-artifact identity is whatever the execution produced. Nothing downstream
-assumes reproducibility of the ext4 bytes.
+wipe. A successful `--no-cache` execution may therefore replace an existing
+step record for the same key with its newly produced child index. The step
+record is a derived mapping; rootfs CAS indexes and objects remain immutable.
+That is the same model Docker uses: cache keys are deterministic, the artifact
+identity is whatever the execution produced. Nothing downstream assumes
+reproducibility of the ext4 bytes.
 
 Context hashing also maintains
 `build/context-stat-cache-v1.json` under the same local cache root. The JSON
@@ -912,9 +915,20 @@ execution, then releases it before final image publication. Valid
 known incomplete records are ignored as cache misses, and unknown future record
 kinds retain the CAS conservatively. Record retention/pruning remains M5 work.
 
-Remaining M2 completion work: prove the full `buildkite-sporevm` wrapper path
-against the real Buildkite base end to end and record the measured acceptance
-output here.
+Implementation note (2026-07-10, original workload proof): build RUN requests
+refresh the guest realtime clock before execution, and mounted rootfs images
+receive devpts plus the standard `/dev/fd`, stdio, and `ptmx` links. Named image
+creation accepts the immutable rootfs metadata already recorded by the
+lifecycle parent. The original committed `buildkite-sporevm` Dockerfile context
+at `ad89671` completed its forced `--no-cache` build against the existing
+BuildKit-produced base OCI in 42.59s with no manual disk-headroom override; its
+long apt transaction and Docker package installation both completed. Repeating
+an input key after a forced execution now atomically replaces only the derived
+step mapping, while rootfs CAS indexes and objects retain immutable publication.
+
+Remaining M2 completion work: record the full Docker-vs-Spore file-tree
+equivalence result and the exact trailing-COPY invalidation behavior for the
+real workload.
 
 Definition of done:
 - The full `buildkite-sporevm` Dockerfile (`FROM base`, apt RUN, five COPYs,
@@ -1068,6 +1082,10 @@ the result and running the Rails spec smoke.
 
 ## Key Learnings From Pressure-Testing
 
+- `--no-cache` makes the cache-key/artifact distinction operational, not just
+  conceptual: the same deterministic input key can legitimately produce a new
+  child snapshot. Only the derived step mapping is replaceable; CAS indexes and
+  objects remain immutable and fail closed on conflicting bytes.
 - The ext4 free-space problem is the biggest silent correctness trap: imported
   bases are sized to content, so the first apt-get in a RUN would ENOSPC.
   The plan makes automatic sparse growth a first-class, tested step (open
