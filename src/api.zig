@@ -1069,7 +1069,8 @@ pub fn restoreNamed(
     return lifecycle.restoreNamed(init, allocator, options);
 }
 
-/// Fork a ready diskless named VM into ready named child VMs.
+/// Fork a ready named VM into ready children. One writable rootfs disk is
+/// supported; networked sources remain unsupported.
 pub fn forkNamed(
     init: std.process.Init,
     allocator: std.mem.Allocator,

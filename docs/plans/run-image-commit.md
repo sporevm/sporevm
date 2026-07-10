@@ -401,11 +401,12 @@ The exact stopped/running semantics require a lifecycle design. This follow-up
 would make existing `copy-in` and repeated `exec` operations the large-input and
 interactive composition path without adding application knowledge.
 
-Current named live fork is diskless-only and rejects image-backed or otherwise
-disk-backed VMs. Named commit therefore does not make `spore fork --vm prep`
-work for this use case. The supported fan-out path remains named save to a
-spore followed by offline `spore fork`; disk-backed named live fork is a
-separate lifecycle feature with its own monitor and disk-snapshot requirements.
+Disk-backed named live fork has since landed under
+`docs/plans/unified-chunk-disk.md` for unnetworked VMs with one writable rootfs
+device. The `--net` preparation example above still cannot live-fork because
+networked named fork remains fail-closed, and named commit itself remains a
+separate deferred lifecycle operation. Save followed by offline `spore fork`
+remains the compatible path for unsupported live layouts.
 
 ## Commit Transaction
 
@@ -632,8 +633,9 @@ ownership, filesystem freeze, running-command policy, disk locking, stale
 runtime records, source image config, and stop semantics explicitly.
 
 Do not couple this to disk-backed named live fork. Named commit exports an
-image; named save plus offline fork remains the supported fan-out path until a
-separate plan lands disk-backed monitor fork.
+image; disk-backed monitor fork is a separate lifecycle operation that has
+since landed for the single writable-rootfs shape. Named save plus offline fork
+remains the compatible fan-out path for networked or additional-device layouts.
 
 ## Verification
 
@@ -694,9 +696,10 @@ separate plan lands disk-backed monitor fork.
   workload.
 - Independent runs from a committed image have good storage sharing but still
   cold-boot. Adding `fork --image` would blur that distinction and is rejected.
-- Offline `spore fork` already supports saved writable disks by sharing their
-  CAS, while named live fork currently rejects disk-backed VMs. Named commit
-  must not be presented as unlocking live image-backed fork.
+- Offline `spore fork` supports saved writable disks by sharing their CAS, and
+  named live fork now supports one unnetworked writable rootfs. Named commit
+  still must not be presented as unlocking networked or additional-device live
+  fork.
 - Putting imperative execution under `spore build` would duplicate run options,
   overload the existing cached Dockerfile frontend, and unnecessarily require a
   build context.
@@ -746,10 +749,10 @@ separate plan lands disk-backed monitor fork.
   `--save` versus `--commit` is still confusing.
 - **Named VM commit:** add when inspection, repeated exec, or large `copy-in`
   workflows cannot reasonably be one run command.
-- **Disk-backed named live fork:** plan separately if users need
-  `spore fork --vm` directly from image-backed named VMs; current named live
-  fork is diskless-only, while save plus offline fork already has correct disk
-  sharing semantics.
+- **Disk-backed named live fork:** landed for the single writable-rootfs shape
+  under `docs/plans/unified-chunk-disk.md`; networked or additional-device live
+  layouts remain separate work, while save plus offline fork retains correct
+  disk sharing semantics for unsupported layouts.
 - **Large immutable inputs:** add when the 16 MiB injection limit blocks real
   projects and named lifecycle is too cumbersome.
 - **Image config editing:** design separately when committed images need new

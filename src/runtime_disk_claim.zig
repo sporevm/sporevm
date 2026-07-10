@@ -327,7 +327,7 @@ pub fn parseClaimBytes(allocator: std.mem.Allocator, bytes: []const u8) Error!st
     return parsed;
 }
 
-pub fn serveClaim(registry: *Registry, allocator: std.mem.Allocator, socket_fd: std.c.fd_t, now_ns: u64) Error!void {
+fn serveClaim(registry: *Registry, allocator: std.mem.Allocator, socket_fd: std.c.fd_t, now_ns: u64) Error!void {
     var parsed = try readClaimRequest(allocator, socket_fd);
     defer parsed.deinit();
     var head = try registry.claim(parsed.value, now_ns);
@@ -601,7 +601,7 @@ fn tokenEql(a: Token, b: Token) bool {
     return std.crypto.timing_safe.eql(Token, a, b);
 }
 
-fn validateClaimRequest(request: ClaimRequest) Error!void {
+pub fn validateClaimRequest(request: ClaimRequest) Error!void {
     if (!std.mem.eql(u8, request.type, claim_type)) return error.BadClaimRequest;
     if (!std.mem.eql(u8, request.schema, claim_schema)) return error.BadClaimRequest;
     _ = try parseTokenHex(request.token);

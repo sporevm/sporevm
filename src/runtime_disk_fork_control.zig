@@ -12,6 +12,7 @@ pub const prepared_schema = "spore.disk-fork-prepared.v1";
 pub const cancel_type = "disk-fork-cancel";
 pub const cancel_schema = "spore.disk-fork-cancel.v1";
 pub const max_capture_dir_bytes = 4096;
+pub const max_response_bytes = 128 * 1024;
 
 pub const PrepareRequest = struct {
     type: []const u8,
@@ -38,8 +39,8 @@ pub const PreparedClaim = struct {
 };
 
 pub const PreparedResponse = struct {
-    type: []const u8 = prepared_type,
-    schema: []const u8 = prepared_schema,
+    type: []const u8,
+    schema: []const u8,
     batch: []const u8,
     capture_dir: []const u8,
     claims: []const PreparedClaim,
@@ -48,6 +49,17 @@ pub const PreparedResponse = struct {
     source_pause_ns: u64,
     copied_bytes: u64,
 };
+
+pub fn parsePreparedBytes(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(PreparedResponse) {
+    if (bytes.len == 0 or bytes.len >= max_response_bytes) return error.BadControlResponse;
+    var parsed = std.json.parseFromSlice(PreparedResponse, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return error.BadControlResponse;
+    errdefer parsed.deinit();
+    try validatePrepared(parsed.value);
+    return parsed;
+}
 
 pub fn parsePrepareBytes(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(PrepareRequest) {
     if (bytes.len == 0 or bytes.len >= runtime_disk_claim.max_claim_request_bytes) return error.BadControlRequest;
@@ -79,6 +91,32 @@ pub fn validatePrepare(request: PrepareRequest) !void {
     try validateBindings(request.batch, request.children, request.allow_copy, request.force_copy);
 }
 
+pub fn validatePrepared(response: PreparedResponse) !void {
+    if (!std.mem.eql(u8, response.type, prepared_type) or !std.mem.eql(u8, response.schema, prepared_schema)) return error.BadControlResponse;
+    if (response.capture_dir.len == 0 or response.capture_dir.len > max_capture_dir_bytes) return error.BadControlResponse;
+    if (response.claims.len == 0 or response.claims.len > runtime_disk_claim.max_children_per_batch) return error.BadControlResponse;
+    var child_names: [runtime_disk_claim.max_children_per_batch][]const u8 = undefined;
+    for (response.claims, 0..) |claim, index| {
+        if (claim.child_index != index) return error.BadControlResponse;
+        child_names[index] = claim.child;
+        runtime_disk_claim.validateClaimRequest(.{
+            .type = runtime_disk_claim.claim_type,
+            .schema = runtime_disk_claim.claim_schema,
+            .token = claim.token,
+            .batch = response.batch,
+            .child = claim.child,
+            .child_index = claim.child_index,
+            .baseline_kind = claim.baseline_kind,
+            .baseline_identity = claim.baseline_identity,
+        }) catch return error.BadControlResponse;
+        if (index > 0) {
+            const baseline = response.claims[0];
+            if (claim.baseline_kind != baseline.baseline_kind or !std.mem.eql(u8, claim.baseline_identity, baseline.baseline_identity)) return error.BadControlResponse;
+        }
+    }
+    validateBindings(response.batch, child_names[0..response.claims.len], false, false) catch return error.BadControlResponse;
+}
+
 pub fn validateBindings(batch: []const u8, children: []const []const u8, allow_copy: bool, force_copy: bool) !void {
     if (!runtime_disk_claim.validBindingName(batch, runtime_disk_claim.max_batch_name_bytes)) return error.BadBatch;
     if (children.len == 0 or children.len > runtime_disk_claim.max_children_per_batch) return error.InvalidForkCount;
@@ -108,6 +146,17 @@ test "prepare and cancel requests are strict and versioned" {
         \\{"type":"disk-fork-cancel","schema":"spore.disk-fork-cancel.v1","batch":"batch-1"}
     );
     defer cancel.deinit();
+
+    const token = "abababababababababababababababababababababababababababababababab";
+    const prepared_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"disk-fork-prepared\",\"schema\":\"spore.disk-fork-prepared.v1\",\"batch\":\"batch-1\",\"capture_dir\":\"/tmp/capture\",\"claims\":[{{\"child\":\"child-0\",\"child_index\":0,\"token\":\"{s}\",\"baseline_kind\":\"rootfs\",\"baseline_identity\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}],\"ram_capture_ns\":1,\"disk_fork_ns\":2,\"source_pause_ns\":3,\"copied_bytes\":0}}",
+        .{token},
+    );
+    defer allocator.free(prepared_json);
+    var prepared = try parsePreparedBytes(allocator, prepared_json);
+    defer prepared.deinit();
+    try std.testing.expectEqualStrings("child-0", prepared.value.claims[0].child);
 }
 
 fn fuzzPrepare(_: void, smith: *std.testing.Smith) anyerror!void {

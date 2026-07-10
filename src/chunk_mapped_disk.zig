@@ -1917,6 +1917,113 @@ test "8GiB native disk fork benchmark" {
         try std.testing.expectEqual(runtime_disk_fork.CloneMethod.reflink, head.descriptor.clone_method);
         try std.testing.expect(elapsed_ns < 100 * std.time.ns_per_ms);
     }
+
+    var batch_heads = [_]?runtime_disk_fork.Head{null} ** 32;
+    defer for (&batch_heads) |*head| {
+        if (head.*) |*value| value.deinit();
+    };
+    const batch_start_ns = try monotonicNs();
+    for (&batch_heads) |*head| {
+        head.* = try disk.exportForkHead(.{
+            .kind = .rootfs,
+            .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }, .{ .quiesced = true });
+    }
+    const batch_elapsed_ns = (try monotonicNs()) - batch_start_ns;
+    std.debug.print(
+        "disk-fork-benchmark logical_gib=8 children=32 disk_fork_ms={d:.3}\n",
+        .{@as(f64, @floatFromInt(batch_elapsed_ns)) / std.time.ns_per_ms},
+    );
+    try std.testing.expect(batch_elapsed_ns < std.time.ns_per_s);
+}
+
+fn benchmarkRandomReads(disk: *ChunkMappedDisk, offsets: []const u64, buffer: []u8) !u64 {
+    const start_ns = try monotonicNs();
+    for (offsets) |offset| try disk.readAt(buffer, offset);
+    return (try monotonicNs()) - start_ns;
+}
+
+fn lessU64(_: void, lhs: u64, rhs: u64) bool {
+    return lhs < rhs;
+}
+
+fn p95(samples: []u64) u64 {
+    std.mem.sort(u64, samples, {}, lessU64);
+    return samples[(samples.len * 95 + 99) / 100 - 1];
+}
+
+test "32-generation disk fork benchmark keeps warm random reads flat" {
+    if (std.c.getenv("SPOREVM_DISK_FORK_BENCHMARK") == null) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const disk_size: u64 = 64 * 1024 * 1024;
+    const logical_size: std.c.off_t = @intCast(disk_size);
+    const base_fd = try createTempOverlayFd(allocator);
+    defer _ = std.c.close(base_fd);
+    if (std.c.ftruncate(base_fd, logical_size) != 0) return error.ResizeFailed;
+    const overlay_fd = try createTempOverlayFd(allocator);
+    defer _ = std.c.close(overlay_fd);
+    if (std.c.ftruncate(overlay_fd, logical_size) != 0) return error.ResizeFailed;
+
+    const base_source = block_source.FileBlockSource.init(base_fd, disk_size);
+    var generation_zero = try ChunkMappedDisk.initWritable(allocator, base_source, overlay_fd, disk_size, spore.disk_chunk_size);
+    defer generation_zero.deinit();
+    const fill = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(fill);
+    @memset(fill, 0xA5);
+    var fill_offset: u64 = 0;
+    while (fill_offset < disk_size) : (fill_offset += fill.len) {
+        try generation_zero.writeAt(fill, fill_offset);
+    }
+
+    var generations: [32]ForkedDisk = undefined;
+    var initialized: usize = 0;
+    defer {
+        var i = initialized;
+        while (i > 0) {
+            i -= 1;
+            generations[i].deinit();
+        }
+    }
+    var current = &generation_zero;
+    while (initialized < generations.len) : (initialized += 1) {
+        generations[initialized] = try current.fork(.{ .quiesced = true });
+        current = &generations[initialized].disk;
+    }
+
+    const offsets = try allocator.alloc(u64, 32768);
+    defer allocator.free(offsets);
+    var random: u64 = 0x9e3779b97f4a7c15;
+    for (offsets) |*offset| {
+        random = random *% 6364136223846793005 +% 1442695040888963407;
+        offset.* = (random % (disk_size / 4096)) * 4096;
+    }
+    var read_buffer: [4096]u8 = undefined;
+    _ = try benchmarkRandomReads(&generation_zero, offsets, &read_buffer);
+    _ = try benchmarkRandomReads(current, offsets, &read_buffer);
+
+    var generation_zero_samples: [21]u64 = undefined;
+    var generation_32_samples: [21]u64 = undefined;
+    for (0..generation_zero_samples.len) |i| {
+        if (i % 2 == 0) {
+            generation_zero_samples[i] = try benchmarkRandomReads(&generation_zero, offsets, &read_buffer);
+            generation_32_samples[i] = try benchmarkRandomReads(current, offsets, &read_buffer);
+        } else {
+            generation_32_samples[i] = try benchmarkRandomReads(current, offsets, &read_buffer);
+            generation_zero_samples[i] = try benchmarkRandomReads(&generation_zero, offsets, &read_buffer);
+        }
+    }
+    const generation_zero_p95 = p95(&generation_zero_samples);
+    const generation_32_p95 = p95(&generation_32_samples);
+    std.debug.print(
+        "disk-fork-benchmark random_reads=32768 generation=0 p95_ms={d:.3} generation=32 p95_ms={d:.3} ratio={d:.3}\n",
+        .{
+            @as(f64, @floatFromInt(generation_zero_p95)) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(generation_32_p95)) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(generation_32_p95)) / @as(f64, @floatFromInt(generation_zero_p95)),
+        },
+    );
+    try std.testing.expect(generation_32_p95 <= generation_zero_p95 + generation_zero_p95 / 10);
 }
 
 test "sequential forks keep a flat chunk map" {

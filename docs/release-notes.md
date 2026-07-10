@@ -2,6 +2,23 @@
 
 ## Next
 
+`spore fork --vm` now fast-forks disk-backed named VMs with one writable rootfs
+device. The source monitor pauses once, drains virtio-blk, captures shared
+RAM/machine state, and prepares up to 32 independent disk heads from the same
+epoch without sealing dirty disk state. APFS clone and Linux `FICLONE` are the
+default path; native-clone failure is closed unless the caller explicitly uses
+`--allow-slow-copy`. Networked named fork remains unsupported.
+
+Fork children claim their unlinked overlay fd through a random, one-use,
+child-bound local token and do not publish readiness until they have reopened
+the immutable baseline and adopted the disk head. Durable baseline leases keep
+live children valid after source removal and destructive cache GC/prune, and
+children can fork again or save/restore normally. `spore --json fork` and
+`libspore.NamedForkResult` report RAM capture, disk preparation, source pause,
+and child readiness phases separately. Monitor-generated guest session IDs now
+include a per-process random nonce, preventing a restored or forked guest from
+replaying a source monitor's cached first exec response.
+
 `spore run --image SOURCE --commit local/name:tag -- COMMAND` can now publish a
 successful one-shot run's writable root disk as an indexed local image. The
 commit path freezes the guest filesystem, reuses the quiesced rootfs snapshot

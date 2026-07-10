@@ -16,6 +16,14 @@ distributed offset/range partitioning is deferred.
 source saved with `--vcpus 4` mints children that also restore with 4 vCPUs;
 fork does not downshift an already-booted guest to a smaller CPU topology.
 
+For a running named VM, `spore fork --vm NAME --count N --name PATTERN` creates
+ready named children directly. Disk-backed sources use a queue-drained,
+single-epoch RAM/machine capture plus independent native-cloned disk heads, so
+siblings inherit the same bytes and then diverge without a read-depth chain.
+The supported disk shape is one writable rootfs device; networked live fork
+remains unsupported. See [Named Lifecycle](lifecycle.md#saves-and-forks) for
+the fallback, readiness, and baseline-lease contract.
+
 Fan-out attaches to the saved process session. Machine-only spores can
 still start new commands with `spore run --from`, but they cannot fan out the
 original command stream:

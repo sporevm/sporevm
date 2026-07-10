@@ -168,12 +168,6 @@ pub const Head = struct {
         self.* = undefined;
     }
 
-    pub fn takeOverlayFd(self: *Head) Error!std.c.fd_t {
-        if (self.overlay_fd < 0) return error.BadDescriptor;
-        const fd = self.overlay_fd;
-        self.overlay_fd = -1;
-        return fd;
-    }
 };
 
 pub const HeadStats = struct {

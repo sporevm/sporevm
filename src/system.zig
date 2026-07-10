@@ -483,10 +483,11 @@ fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
     };
     opts.cache_root = cache_root;
     const now = Io.Clock.real.now(init.io).nanoseconds;
-    if (!opts.rootfs_only and opts.older_than_seconds != null) {
-        const runtime_root = local_paths.runtimeRootPath(allocator, init.environ_map) catch null;
-        if (runtime_root) |root| opts.runtime_root = root;
-    }
+    // Runtime leases protect rootfs cache entries even for `--rootfs`-only
+    // pruning. `prune` separately decides whether old runtime fork batches
+    // themselves are in scope.
+    const runtime_root = local_paths.runtimeRootPath(allocator, init.environ_map) catch null;
+    if (runtime_root) |root| opts.runtime_root = root;
     const result = try prune(allocator, init.io, opts, now);
     if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, result);
@@ -1169,7 +1170,11 @@ fn collectStorageRootsFromRuntimeLeases(
         const lease = parsed.value.disk_baseline_lease orelse continue;
         try lease.validate();
         if (lease.store != .rootfs_cache or !try sameResolvedPath(allocator, lease.root, cache_root)) continue;
-        if (lease.rootfs_storage) |storage| try addStorageRoot(storage_roots, storage);
+        if (lease.rootfs_storage) |storage| {
+            // The parsed lease owns these strings. Keep an independent copy in
+            // the root set because Parsed.deinit() runs before GC walks it.
+            try addStorageRoot(storage_roots, try spore.cloneRootfsStorage(allocator, storage));
+        }
     }
 }
 
@@ -1501,7 +1506,7 @@ fn collectRuntimeForkRefs(allocator: std.mem.Allocator, io: Io, runtime_root: []
         var parsed = std.json.parseFromSlice(RuntimeVmSpecRef, allocator, data, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
-        }) catch continue;
+        }) catch return error.BadManifest;
         defer parsed.deinit();
         const resume_dir = parsed.value.resume_dir orelse continue;
         try refs.append(try std.fs.path.resolve(allocator, &.{resume_dir}));
@@ -2228,6 +2233,32 @@ test "system prunes only unreferenced runtime fork batches" {
     try std.testing.expect(!try fileExists(io, try std.fs.path.join(allocator, &.{ root, "forks", "dead" })));
 }
 
+test "system runtime fork prune fails closed on malformed runtime specs" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-system-runtime-fork-prune-malformed-spec"});
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(allocator, &.{ root, "forks", "candidate" }));
+    const vm_dir = try std.fs.path.join(allocator, &.{ root, "vms", "worker" });
+    try Io.Dir.cwd().createDirPath(io, vm_dir);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ vm_dir, "spec.json" }),
+        .data = "{",
+    });
+
+    try std.testing.expectError(error.BadManifest, pruneRuntimeForkBatches(
+        allocator,
+        io,
+        root,
+        .{ .older_than_ns = 1, .older_than_seconds = 1 },
+        std.math.maxInt(i96),
+    ));
+}
+
 test "system prune removes complete stamp once for multiple referenced rootfs objects" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -2361,8 +2392,18 @@ test "runtime disk lease protects its cache baseline from prune and gc" {
     const rooted = try writeGcStorageFixture(allocator, io, root, null, 0x61);
     const prune_orphan = try writeGcStorageFixture(allocator, io, root, null, 0x62);
     const vm_dir = try std.fs.path.join(allocator, &.{ runtime_root, "vms", "child" });
+    const resume_dir = try std.fs.path.join(allocator, &.{ runtime_root, "forks", "batch", "children", "000000" });
     try Io.Dir.cwd().createDirPath(io, vm_dir);
+    try Io.Dir.cwd().createDirPath(io, resume_dir);
+    const manifest_json = try std.json.Stringify.valueAlloc(allocator, ManifestRoot{
+        .rootfs = .{ .storage = rooted.storage },
+    }, .{});
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ resume_dir, "manifest.json" }),
+        .data = manifest_json,
+    });
     const spec_json = try std.json.Stringify.valueAlloc(allocator, RuntimeVmSpecRef{
+        .resume_dir = resume_dir,
         .disk_baseline_lease = .{
             .store = .rootfs_cache,
             .root = root,

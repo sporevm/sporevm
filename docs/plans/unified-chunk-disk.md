@@ -11,9 +11,14 @@ spec_refs:
   - src/rootfs_cas.zig
   - src/disk_index.zig
   - src/runtime_disk.zig
+  - src/runtime_disk_claim.zig
+  - src/runtime_disk_fork.zig
+  - src/runtime_disk_fork_control.zig
+  - src/runtime_disk_lease.zig
   - src/dirty_ram.zig
   - src/monitor.zig
   - src/lifecycle.zig
+  - src/system.zig
   - src/hvf/vm.zig
   - src/kvm/vm.zig
 related_plans:
@@ -42,13 +47,13 @@ mechanisms before both calcify — is how those goals get met with less code,
 not a separate justification. The plan deliberately breaks the on-disk and
 manifest formats to do so.
 
-> **Current next slice (2026-07-10): U6 production disk-backed fast fork.**
-> The backend primitive exists, but `spore fork --vm` still rejects every
-> disk-backed source. The next work wires that primitive through the live
-> monitor/VMM quiescence boundary, adds safe cross-process child handoff, and
-> proves the reflink path on both Linux and macOS. U7's deferred filler and
-> boot-priority work, packfiles, and RAM/disk store convergence are not
-> prerequisites for this slice.
+> **Current state (2026-07-10): U6 is implemented in branch.** Disk-backed
+> `spore fork --vm` now uses the live monitor/VMM quiescence boundary, one-use
+> fd claims, independently rooted child baselines, and readiness-after-adoption.
+> The maintained product smoke passes on APFS/HVF; the same smoke and native
+> clone path still need their final real-hardware Linux/KVM run. U7's deferred
+> filler and boot-priority work, packfiles, and RAM/disk store convergence are
+> separate evidence-gated follow-ups, not incomplete U6 implementation.
 
 ## Product Goals This Serves
 
@@ -380,9 +385,11 @@ At end state:
 
 ## Delivery Strategy
 
-U1–U5, U7, and U8 have landed. The active remaining product slice is U6:
-production disk-backed named fast fork. It has no prerequisite from the
-remaining evidence-gated U7 follow-ups or the open store/packing questions.
+All planned implementation slices have landed in branch. U6, production
+disk-backed named fast fork, is locally proven on APFS/HVF; its remaining
+platform evidence is the maintained product smoke on a reflink-capable
+Linux/KVM host. It has no prerequisite from the remaining evidence-gated U7
+follow-ups or the open store/packing questions.
 `docs/plans/spore-build.md` was revived after the unified storage primitives
 landed and now consumes them as a separate active workstream. Dirty tracking
 and incremental index maintenance — previously drafted as a separate plan —
@@ -614,18 +621,24 @@ structure with two instantiations (RAM 2MiB, disk 64KiB).
 
 ### U6 — Production disk-backed fast fork
 
-Status: backend primitive, post-save baseline authority, portable runtime disk
-head, one-shot fd-claim transport, and monitor/VMM batch capture complete;
-disk-backed named lifecycle enablement is the active final slice.
+Status: implementation complete in branch; APFS/HVF product validation passes,
+with the matching Linux/KVM real-hardware run pending.
 
-`ChunkMappedDisk.fork()` can already copy the one-level source map and clone
+`ChunkMappedDisk.fork()` copies the one-level source map and clones
 an unlinked overlay fd, and its unit tests cover rejection, copy fallback,
-divergence, and flat 32-generation lineage. It has no production caller.
-`spore fork --vm` still rejects every disk-backed source, then uses a durable
-snapshot + open flow for its diskless children. That flow is correct for
-durable identity but is not the fast-fork product path: sealing dirty disk
-chunks before resuming the source would keep fork latency proportional to
-dirty volume.
+divergence, and flat 32-generation lineage. Disk-backed `spore fork --vm` is
+now its production caller. Diskless children retain the existing durable
+snapshot-and-open flow; disk-backed children use runtime heads and never seal
+dirty disk chunks before resuming the source.
+
+Landed behavior supports image-created, explicit-rootfs, restored disk-index,
+and previously forked named VMs with exactly one writable rootfs device. The
+source monitor prepares up to 32 heads at one queue-drained paused epoch. Each
+child receives only a transient claim, independently reopens the lease-bound
+baseline, adopts its fd before readiness, and can outlive the source, fork
+again, or publish a durable save. Networked and unsupported device layouts
+remain fail-closed. Native APFS/Linux cloning is the default; the full-overlay
+copy path requires the explicit `--allow-slow-copy`/Zig API opt-in.
 
 The first product boundary is the existing named live-fork command with one
 supported writable rootfs-bound `ChunkMappedDisk`. It covers image-created,
@@ -783,7 +796,20 @@ save→rename→fork→save coverage.
    monitor, pre-open its runtime disk, and make batch rollback include
    spawned-but-not-ready children. Add HVF/KVM product smokes, nested fork,
    durable child save/restore, docs, release notes, and lineage benchmarks.
-   Keep the network guard.
+   Keep the network guard. **Complete in branch:** lifecycle now validates and
+   roots the source baseline before prepare, consumes the strict prepared
+   batch, writes transient child claims only to runtime specs, and rolls back
+   monitors that spawned but never became ready. Child monitors claim after
+   applying the existing jail, reopen the lease root, adopt before
+   `ready.json`, and erase the token from both the live spec and durable spore
+   metadata. Save/restore adopts stable saved-spore leases; rootfs GC and
+   destructive prune read active leases even in `--rootfs` mode. Monitor exec
+   sessions include a random nonce so the first post-fork command cannot
+   collide with a source guest's replay cache. The cross-backend product smoke
+   covers sibling divergence, identity, nested fork, durable save/restore,
+   source deletion, cache GC/prune, and post-prune fork/save. JSON and Zig
+   results expose the four phase metrics, and the disk benchmark covers 8GiB
+   clone coverage, 32-head preparation, and generation-32 warm reads.
 
 #### Validation and done criteria
 
@@ -817,6 +843,29 @@ save→rename→fork→save coverage.
 - `mise run test`, `mise run build`, the existing monitor-jail smoke, and the
   real HVF/KVM named-fork smokes pass.
 
+Local APFS/HVF product validation used a 512MiB Alpine guest and produced two
+children with `ram_capture_ms=947`, `disk_fork_ms=3`,
+`source_pause_ms=950`, and `child_ready_ms=618`. The first command in both
+children observed the source's paused bytes; parent and siblings then diverged
+independently. Nested fork, non-destructive save/restore, source removal,
+forced cache GC plus `--max-bytes 0` prune, post-prune nested fork, and
+post-prune save/restore all passed. Repeat with:
+
+```sh
+mise run smoke:named-disk-fork
+mise run benchmark:disk-fork
+```
+
+The local ReleaseFast disk benchmark prepared one native 8GiB head in
+`1.220ms`, `5.851ms`, and `6.355ms` at 0%, 50%, and 100% physical-overlay
+coverage. Preparing 32 heads at 100% took `99.839ms`. Warm 32,768-read batches
+measured `22.184ms` p95 at generation 0 and `22.224ms` at generation 32, a
+`1.002x` ratio.
+
+The Linux/KVM path compiles with `zig build -Dtarget=aarch64-linux-musl`, and
+the same smoke selects KVM automatically on an ARM64 Linux host. That
+real-hardware run remains the final U6 platform evidence.
+
 #### Key Learnings From Pressure-Testing
 
 - The production seam is the source monitor's VMM quiescence path, not
@@ -826,10 +875,10 @@ save→rename→fork→save coverage.
   add TOCTOU and stale-file recovery problems, so children claim fds directly
   and the private descriptor remains non-portable. APFS may use a transient
   named clone only until it has opened and unlinked the resulting fd.
-- The existing primitive is not yet a proven portable fast path: it deep-copies
-  digest strings and only attempts reflink on Linux. Stable baseline authority
-  with an independently rooted object store, a transferable head, and APFS
-  cloning are prerequisites to production exposure.
+- The original in-process primitive was not a portable product boundary: it
+  deep-copied digest strings and only attempted reflink on Linux. Stable
+  baseline authority, transferable heads, and APFS cloning were prerequisites;
+  the production path now supplies all three.
 - Fast-disk timing must be measured separately from the existing RAM/machine
   capture and child startup. Calling `snapshotIndex()` would make the wiring
   functionally correct while missing the product goal.
@@ -925,20 +974,19 @@ are needed.
 
 ### U8 — Cleanup and docs
 
-Status: landed for the unified-storage cleanup; U6 owns its production
-named-fork docs and release note.
+Status: landed for the unified-storage cleanup and production named-fork docs.
 
 Remove transitional shims, update `docs/rootfs.md`/`docs/filesystem.md`
 architecture sections, SECURITY.md parser inventory (net reduction: three
-index parsers → one), release notes covering the format break and the new
-boot behavior. Production named-fork documentation lands with U6, not here.
+index parsers → one), release notes covering the format break and the new boot
+behavior. Production named-fork documentation and release notes landed with U6.
 
 Landed behavior: the unused public `CowDisk` backend and virtio-blk `.cow`
 backend arm are gone; writable COW behavior now lives only inside
 `ChunkMappedDisk`. Durable filesystem, rootfs, state-portability, security, and
 release-note docs describe disk indexes, lazy CAS fault-in, the format break,
-and the backend fork/runtime model. They do not imply that disk-backed
-`spore fork --vm` is already exposed.
+and the backend fork/runtime model. The lifecycle and security docs now cover
+the exposed disk-backed `spore fork --vm` path as well.
 
 Validation: `mise run test`, `mise run build`, and the conditional
 `rootfs-slow-test` target. The slow graph validates chunk-index storage and

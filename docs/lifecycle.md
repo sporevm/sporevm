@@ -202,8 +202,9 @@ spore restore bench-1.spore --name bench-2 \
   --bind-service metadata=unix:/tmp/fresh-metadata.sock
 ```
 
-`spore snapshot` is not a public command; live named fork uses an internal
-snapshot-and-continue monitor action so the source VM keeps running:
+`spore snapshot` is not a public command. Live named fork captures RAM and
+machine state once while the source VM is paused, then keeps the source VM
+running:
 
 ```bash
 spore create counter --image docker.io/library/alpine:3.20 \
@@ -214,13 +215,39 @@ spore exec worker-0 'cat /tick; sleep 1; cat /tick'
 
 `--name` is required with `--vm`. For `--count > 1`, it must contain exactly one
 `%d`-style integer placeholder. SporeVM validates every child name before
-pausing the source VM.
+pausing the source VM. A batch contains at most 32 children.
+
+Disk-backed live fork supports the single writable rootfs device used by
+image-created, explicit-rootfs, restored, and previously forked named VMs. The
+source monitor drains the block queue, creates every child disk head at the
+same paused epoch, and resumes the source without sealing a durable disk
+snapshot. Native APFS or Linux reflink cloning is required by default. Use
+`--allow-slow-copy` only when a full dirty-overlay copy is acceptable; without
+that explicit opt-in, unavailable native cloning fails closed.
+
+Each child receives a private one-use disk-head claim plus an independently
+rooted baseline lease. The child reopens that baseline and adopts the claimed
+overlay before it writes `ready.json`, so a successful fork never reports a
+child whose disk handoff can still fail. The lease also means children remain
+readable, forkable, and saveable after the source is removed and rootfs cache
+GC/prune runs. Claims are transient runtime state and are not written into
+durable spores.
+
+Global JSON output exposes the phases separately:
+
+```bash
+spore --json fork --vm counter --count 2 --name worker-%d
+```
+
+The result includes `ram_capture_ms`, `disk_fork_ms`, `source_pause_ms`, and
+`child_ready_ms` for disk-backed forks. Diskless forks return null for those
+phase fields.
 
 Named saves support diskless VMs, image-created writable rootfs state, and
 explicit `--rootfs PATH` saves backed by exact immutable rootfs artifacts.
 Supported backends can create, save with `--stop`, restore, and live-fork
-fixed-RAM multi-vCPU named VMs. Named live fork is still diskless-only; child
-VMs preserve the source VM's vCPU count.
+fixed-RAM multi-vCPU named VMs. Child VMs preserve the source VM's vCPU count.
+Networked named live fork remains unsupported.
 
 ## Monitor Boundary
 
@@ -235,8 +262,10 @@ only after the restored guest agent has answered a dedicated readiness request,
 the monitor has written `ready.json`, the recorded PID is alive, and the local
 `control.sock` answers a `hello` request with the same SporeVM version as the
 linked library. This means a successful named restore is immediately ready for
-`spore exec`; callers do not need to poll with a no-op command. The monitor argv
-and control protocol are a private
+`spore exec`; callers do not need to poll with a no-op command. For disk-backed
+fork children, the baseline and one-shot `SCM_RIGHTS` overlay claim are validated
+and adopted before that guest readiness probe succeeds. The monitor argv and
+control protocol are a private
 same-version contract, so matching is exact: a libspore `1.5.0` caller cannot
 use a `spore` executable reporting `1.3.0`, even if PATH resolves that older
 binary. Version mismatch is a startup error that names both versions and the
@@ -281,7 +310,8 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
   `copyInNamed`/`copyOutNamed` libspore API.
 - `spore attach` connects to saved sessions in spores. Attaching to an
   already-running named VM remains outside the public CLI surface.
-- No disk-backed or networked named live fork yet.
+- Named live fork accepts at most 32 children and one writable rootfs disk.
+  Networked and additional-device layouts remain unsupported.
 - No live network-flow save/restore.
 - No OCI `Entrypoint`, `Cmd`, or `User` semantics. Callers pass explicit argv.
 
@@ -296,6 +326,7 @@ mise run smoke:lifecycle-tty
 mise run smoke:lifecycle-auto-memory
 mise run smoke:monitor-jail
 mise run smoke:monitor-failure-modes
+mise run smoke:named-disk-fork
 scripts/benchmark/sporevm-lifecycle.sh
 scripts/benchmark/sporevm-lifecycle.sh --backend kvm --image docker.io/library/node:22-bookworm-slim -n 3 --max-cleanup-ms 1000
 ```

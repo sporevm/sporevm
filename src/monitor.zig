@@ -12,6 +12,7 @@ const runtime_disk_claim = @import("runtime_disk_claim.zig");
 const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const runtime_disk_fork_capture = @import("runtime_disk_fork_capture.zig");
 const runtime_disk_fork_control = @import("runtime_disk_fork_control.zig");
+const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const net_gateway = @import("net_gateway.zig");
 const run = @import("run.zig");
 const spore = @import("spore.zig");
@@ -103,6 +104,14 @@ fn readinessProbeSucceeded(exit_code: i32, stderr: []const u8) bool {
     return exit_code == 2 and std.mem.eql(u8, stderr, legacy_readiness_error);
 }
 
+fn claimRuntimeDiskHead(io: Io, allocator: std.mem.Allocator, claim: lifecycle.DiskForkClaim) !runtime_disk_fork.Head {
+    const address = try net.UnixAddress.init(claim.source_socket_path);
+    const stream = address.connect(io) catch return error.MonitorUnavailable;
+    defer stream.close(io);
+    try runtime_disk_claim.writeClaimRequest(allocator, stream.socket.handle, claim.request);
+    return runtime_disk_claim.receiveHead(allocator, stream.socket.handle);
+}
+
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
     const allocator = init.arena.allocator();
     const full_args = try init.minimal.args.toSlice(allocator);
@@ -161,6 +170,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     try monitor_jail.applyForMonitor(init.environ_map);
     const spec_disk = if (existing_spec) |spec| spec.value.disk else null;
     const spec_disk_baseline_lease = if (existing_spec) |spec| spec.value.disk_baseline_lease else null;
+    const spec_disk_fork_claim = if (existing_spec) |spec| spec.value.disk_fork_claim else null;
     const spec_resume_generation = if (existing_spec) |spec| spec.value.resume_generation else null;
     const spec_resume_generation_params = if (spec_resume_generation) |state| blk: {
         var gen_dev = generation.Device{};
@@ -182,6 +192,12 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     };
     const assets_ms = lifecycle.monotonicMs();
 
+    try lifecycle.writePid(allocator, init.io, paths, currentPid());
+    var runtime_disk_head: ?runtime_disk_fork.Head = if (spec_disk_fork_claim) |claim|
+        try claimRuntimeDiskHead(init.io, allocator, claim)
+    else
+        null;
+    defer if (runtime_disk_head) |*head| head.deinit();
     try lifecycle.writeSpec(allocator, init.io, paths, .{
         .name = opts.name,
         .backend = opts.backend.name(),
@@ -203,13 +219,11 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .timeout_ms = opts.timeout_ms,
         .console_log_path = opts.console_log_path,
     });
-    try lifecycle.writePid(allocator, init.io, paths, currentPid());
 
     var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.control_socket_path, paths.monitor_stats_path, opts.guest_port, opts.timeout_ms, spec_resume_generation_params);
     defer server.disk_claims.deinit();
     if (gateway_active) server.network_events = &gateway;
     const metadata_ms = lifecycle.monotonicMs();
-
     server.startup = .{
         .paths = paths,
         .timing = .{
@@ -239,6 +253,8 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .rootfs_path = opts.rootfs_path,
         .rootfs = spec_rootfs,
         .disk = spec_disk,
+        .disk_root = if (spec_disk_baseline_lease) |lease| lease.root else null,
+        .runtime_disk_head = if (runtime_disk_head) |*head| head else null,
         .resume_dir = opts.resume_dir,
         .resume_generation = spec_resume_generation,
         .resume_sessions = spec_sessions,
@@ -325,6 +341,7 @@ const ExecServer = struct {
     stderr_capture_len: usize = 0,
     stderr_truncated: bool = false,
     network_events: ?*net_gateway.Process = null,
+    session_nonce: u64,
     next_session_id: u64 = 1,
     wake: ?vsock.Wake = null,
     stats_written: bool = false,
@@ -356,6 +373,8 @@ const ExecServer = struct {
             else => |e| return e,
         };
         const address = try net.UnixAddress.init(socket_path);
+        var session_nonce_bytes: [8]u8 = undefined;
+        io.random(&session_nonce_bytes);
         var server = ExecServer{
             .allocator = allocator,
             .io = io,
@@ -367,6 +386,7 @@ const ExecServer = struct {
             .server = try address.listen(io, .{ .kernel_backlog = 8 }),
             .generation_params = generation_params,
             .disk_claims = runtime_disk_claim.Registry.init(allocator),
+            .session_nonce = std.mem.readInt(u64, &session_nonce_bytes, .little),
         };
         var nonce_bytes: [8]u8 = undefined;
         io.random(&nonce_bytes);
@@ -637,9 +657,7 @@ const ExecServer = struct {
 
     fn execRequest(self: *ExecServer, argv: []const []const u8) ![]const u8 {
         var id_buf: [64]u8 = undefined;
-        const session_id = try std.fmt.bufPrint(&id_buf, "lifecycle-{d}", .{self.next_session_id});
-        self.next_session_id +%= 1;
-        if (self.next_session_id == 0) self.next_session_id = 1;
+        const session_id = try self.nextSessionId(&id_buf);
         if (self.generation_params) |params| {
             return run.execRequestWithSessionGenerationParams(self.allocator, argv, session_id, self.wallClockUnixNs(), params);
         }
@@ -648,9 +666,7 @@ const ExecServer = struct {
 
     fn interactiveExecRequest(self: *ExecServer, argv: []const []const u8, interactive: bool, tty: bool, terminal_name: []const u8, terminal_size: spore_stream.Resize) ![]const u8 {
         var id_buf: [64]u8 = undefined;
-        const session_id = try std.fmt.bufPrint(&id_buf, "lifecycle-{d}", .{self.next_session_id});
-        self.next_session_id +%= 1;
-        if (self.next_session_id == 0) self.next_session_id = 1;
+        const session_id = try self.nextSessionId(&id_buf);
         return run.interactiveExecRequestWithSession(self.allocator, argv, session_id, .{
             .interactive = interactive,
             .tty = tty,
@@ -662,17 +678,13 @@ const ExecServer = struct {
 
     fn detachedExecRequest(self: *ExecServer, argv: []const []const u8) ![]const u8 {
         var id_buf: [64]u8 = undefined;
-        const session_id = try std.fmt.bufPrint(&id_buf, "lifecycle-{d}", .{self.next_session_id});
-        self.next_session_id +%= 1;
-        if (self.next_session_id == 0) self.next_session_id = 1;
+        const session_id = try self.nextSessionId(&id_buf);
         return run.detachedExecRequestWithSession(self.allocator, argv, session_id, self.wallClockUnixNs());
     }
 
     fn copyRequest(self: *ExecServer, request_type: []const u8, path: []const u8) ![]const u8 {
         var id_buf: [64]u8 = undefined;
-        const session_id = try std.fmt.bufPrint(&id_buf, "lifecycle-{d}", .{self.next_session_id});
-        self.next_session_id +%= 1;
-        if (self.next_session_id == 0) self.next_session_id = 1;
+        const session_id = try self.nextSessionId(&id_buf);
         const payload = struct {
             type: []const u8,
             session_id: []const u8,
@@ -685,6 +697,13 @@ const ExecServer = struct {
         const json = try std.json.Stringify.valueAlloc(self.allocator, payload, .{});
         defer self.allocator.free(json);
         return std.fmt.allocPrint(self.allocator, "{s}\n", .{json});
+    }
+
+    fn nextSessionId(self: *ExecServer, buffer: *[64]u8) ![]const u8 {
+        const session_id = try formatSessionId(buffer, self.session_nonce, self.next_session_id);
+        self.next_session_id +%= 1;
+        if (self.next_session_id == 0) self.next_session_id = 1;
+        return session_id;
     }
 
     fn resetExecCapture(self: *ExecServer) void {
@@ -942,10 +961,27 @@ const ExecServer = struct {
     fn publishSnapshot(self: *ExecServer, work_dir: []const u8, publish_dir: []const u8) !void {
         var lifecycle_spec = (try lifecycle.readSporeLifecycleSpec(self.allocator, self.io, work_dir)) orelse return error.BadManifest;
         defer lifecycle_spec.deinit();
-        var manifest = try spore.loadManifest(self.allocator, work_dir);
-        defer manifest.deinit();
-        manifest.value.annotations = lifecycle_spec.value.annotations;
-        try spore.saveManifest(self.allocator, work_dir, manifest.value);
+        var manifest = spore.loadManifest(self.allocator, work_dir) catch |err| switch (err) {
+            error.BadManifest => null,
+            else => |e| return e,
+        };
+        defer if (manifest) |*parsed| parsed.deinit();
+        var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
+        defer if (manifest_v1) |*parsed| parsed.deinit();
+        if (manifest) |*parsed| {
+            parsed.value.annotations = lifecycle_spec.value.annotations;
+            try spore.saveManifest(self.allocator, work_dir, parsed.value);
+        } else {
+            manifest_v1 = try spore.loadManifestV1(self.allocator, work_dir);
+            manifest_v1.?.value.annotations = lifecycle_spec.value.annotations;
+            try spore.saveManifestV1(self.allocator, work_dir, manifest_v1.?.value);
+        }
+        const saved_disk = if (manifest) |parsed| parsed.value.disk else manifest_v1.?.value.disk;
+        if (saved_disk) |disk| {
+            lifecycle_spec.value.disk = disk;
+            lifecycle_spec.value.disk_baseline_lease = try runtime_disk_lease.fromSavedDisk(publish_dir, disk);
+        }
+        try lifecycle.writeSporeLifecycleSpec(self.allocator, self.io, work_dir, lifecycle_spec.value);
         try Io.Dir.renameAbsolute(work_dir, publish_dir, self.io);
     }
 
@@ -985,6 +1021,8 @@ const ExecServer = struct {
             };
         }
         try self.storeJsonLocked(runtime_disk_fork_control.PreparedResponse{
+            .type = runtime_disk_fork_control.prepared_type,
+            .schema = runtime_disk_fork_control.prepared_schema,
             .batch = batch_name,
             .capture_dir = self.suspend_dir[0..self.suspend_dir_len],
             .claims = claims[0..registrations.len],
@@ -1184,6 +1222,10 @@ const ExecServer = struct {
         self.streamOutput(output, bytes);
     }
 };
+
+fn formatSessionId(buffer: *[64]u8, nonce: u64, sequence: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "lifecycle-{x}-{d}", .{ nonce, sequence });
+}
 
 fn registryDirMissing(io: Io, vm_dir: []const u8) bool {
     const stat = Io.Dir.cwd().statFile(io, vm_dir, .{ .follow_symlinks = false }) catch |err| switch (err) {
@@ -1858,6 +1900,15 @@ test "monitor parser accepts network allow policy" {
 test "monitor parser accepts bounded vcpu count" {
     const opts = try parseMonitorArgs(&.{ "bench-1", "--vcpus", "2" });
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.vcpus);
+}
+
+test "monitor session ids cannot replay across restored monitors" {
+    var first: [64]u8 = undefined;
+    var restored: [64]u8 = undefined;
+    const first_id = try formatSessionId(&first, 0x0123456789abcdef, 1);
+    const restored_id = try formatSessionId(&restored, 0xfedcba9876543210, 1);
+    try std.testing.expectEqualStrings("lifecycle-123456789abcdef-1", first_id);
+    try std.testing.expect(!std.mem.eql(u8, first_id, restored_id));
 }
 
 test "monitor registry detector notices deleted vm dir" {

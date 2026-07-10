@@ -43,6 +43,18 @@ pub const Lease = struct {
     }
 };
 
+pub fn fromSavedDisk(root: []const u8, disk: spore.Disk) !Lease {
+    if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index) or disk.layers.len != 0) return error.BadManifest;
+    const lease = Lease{
+        .store = .saved_spore,
+        .root = root,
+        .baseline_kind = .disk_index,
+        .baseline_identity = disk.base,
+    };
+    try lease.validate();
+    return lease;
+}
+
 test "disk baseline lease binds its authority and storage descriptor" {
     const storage = spore.RootfsStorage{
         .kind = spore.rootfs_storage_kind_chunked_ext4,
