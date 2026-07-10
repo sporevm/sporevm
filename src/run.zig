@@ -3223,7 +3223,7 @@ fn runMemoryPlan(memory: memory_config.Config, constraints: RunMemoryConstraints
     };
 }
 
-pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {
+pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control, startup_probe: ?*vsock.HostStream) !MonitorResult {
     try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
 
@@ -3278,6 +3278,9 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
                 .ram_restore_mode = .eager_chunks,
+                .exec_probe = startup_probe,
+                .exec_probe_timeout_ms = opts.timeout_ms,
+                .exec_probe_completes_run = false,
                 .exec_control = control,
                 .network = network,
                 .environ_map = context.environ_map,
@@ -3302,6 +3305,9 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
                 .ram_restore_mode = .eager_chunks,
+                .exec_probe = startup_probe,
+                .exec_probe_timeout_ms = opts.timeout_ms,
+                .exec_probe_completes_run = false,
                 .exec_control = control,
                 .network = network,
                 .environ_map = context.environ_map,

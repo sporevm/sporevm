@@ -74,7 +74,6 @@ const MonitorOptions = struct {
 };
 
 const RequestState = enum {
-    pending_ready,
     active_ready,
     idle,
     pending_exec,
@@ -212,6 +211,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .control_socket_path = paths.control_socket_path,
         .console_log_path = paths.console_log_path,
     });
+    const readiness_probe = try server.startReadinessProbe();
 
     try run.openConsoleLog(opts.console_log_path);
     defer run.closeConsoleLog();
@@ -237,7 +237,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .network_policy = opts.network_policy,
         .network_runtime = if (gateway_active) gateway.runtime() else null,
         .spore_executable = spore_executable,
-    }, server.control());
+    }, server.control(), readiness_probe);
     if (result) |monitor_result| {
         switch (monitor_result.exit) {
             .stopped => {},
@@ -338,8 +338,18 @@ const ExecServer = struct {
         const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
         const request = try std.fmt.bufPrint(&server.request, "{{\"type\":\"ready\",\"nonce\":\"{x}\"}}\n", .{nonce});
         server.request_len = request.len;
-        server.state = .pending_ready;
         return server;
+    }
+
+    fn startReadinessProbe(self: *ExecServer) !*vsock.HostStream {
+        if (self.state != .idle) return error.ControlBusy;
+        self.active_stream = try vsock.HostStream.initWithProtocol(self.guest_port, self.request[0..self.request_len], .legacy_text);
+        self.resetExecCapture();
+        self.active_stream.setOutputSink(self, captureOutputThunk);
+        self.active_stream.host_port = vsock.HostStream.deriveHostPort(self.request[0..self.request_len]);
+        self.active_stream_valid = true;
+        self.state = .active_ready;
+        return &self.active_stream;
     }
 
     fn setStartupMetadata(self: *ExecServer, paths: lifecycle.Paths, timing: lifecycle.MonitorTiming, started_ms: u64, ready: lifecycle.Ready) void {
@@ -410,8 +420,7 @@ const ExecServer = struct {
                 } };
             },
             .active_snapshot => return .keep_running,
-            .pending_ready, .pending_exec => {
-                const readiness_probe = self.state == .pending_ready;
+            .pending_exec => {
                 self.active_stream = try vsock.HostStream.initWithProtocol(self.guest_port, self.request[0..self.request_len], self.active_stream_protocol);
                 self.resetExecCapture();
                 if (self.active_streaming_exec) {
@@ -427,7 +436,7 @@ const ExecServer = struct {
                 try dev.attachHostStream(&self.active_stream);
                 self.active_stream.markStarted();
                 self.active_stream_valid = true;
-                self.state = if (readiness_probe) .active_ready else .active_exec;
+                self.state = .active_exec;
                 self.cond.broadcast(self.io);
             },
             .active_ready, .active_exec => {},
@@ -866,7 +875,7 @@ const ExecServer = struct {
 
     fn failOutstandingLocked(self: *ExecServer, message: []const u8) void {
         switch (self.state) {
-            .pending_ready, .active_ready, .pending_exec, .active_exec, .pending_suspend, .active_suspend, .pending_snapshot, .active_snapshot => {
+            .active_ready, .pending_exec, .active_exec, .pending_suspend, .active_suspend, .pending_snapshot, .active_snapshot => {
                 if (self.active_streaming_exec) {
                     self.sendStreamingErrorLocked(message);
                 } else {

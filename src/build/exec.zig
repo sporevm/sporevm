@@ -202,7 +202,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         .memory = .{ .policy = .explicit, .bytes = build_vm_memory_bytes },
         .network = if (network_mode == .spore) .spore else .disabled,
         .timeout_ms = step_timeout_ms,
-    }, control.control());
+    }, control.control(), null);
 
     if (control.failed_exit_code) |exit_code| {
         if (options.diagnostic) |diag| {
