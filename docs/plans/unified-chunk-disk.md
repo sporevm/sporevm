@@ -12,6 +12,10 @@ spec_refs:
   - src/disk_index.zig
   - src/runtime_disk.zig
   - src/dirty_ram.zig
+  - src/monitor.zig
+  - src/lifecycle.zig
+  - src/hvf/vm.zig
+  - src/kvm/vm.zig
 related_plans:
   - docs/plans/spore-build.md
   - docs/plans/native-ext4-writer.md
@@ -37,6 +41,14 @@ an O(image) hash. The simplification — deleting one of two COW/delta/identity
 mechanisms before both calcify — is how those goals get met with less code,
 not a separate justification. The plan deliberately breaks the on-disk and
 manifest formats to do so.
+
+> **Current next slice (2026-07-10): U6 production disk-backed fast fork.**
+> The backend primitive exists, but `spore fork --vm` still rejects every
+> disk-backed source. The next work wires that primitive through the live
+> monitor/VMM quiescence boundary, adds safe cross-process child handoff, and
+> proves the reflink path on both Linux and macOS. U7's deferred filler and
+> boot-priority work, packfiles, and RAM/disk store convergence are not
+> prerequisites for this slice.
 
 ## Product Goals This Serves
 
@@ -89,12 +101,13 @@ On top of both sits `rootfs_blake3`, a linear hash of flat bytes that no
 delta mechanism can maintain incrementally, forcing full-image scans at every
 mutation-to-artifact boundary.
 
-Left alone, this gets worse before better: the (deferred) `spore build`
-plan would add a third write-persistence model (write-in-place + reflink
-checkpoint), and the
-obvious incremental fix — maintaining the existing `rootfs-block-index-v0`
-with a new virtio-blk dirty bitmap and a dual-identity transition — would
-have added a second dirty tracker and a second identity namespace on top.
+Left alone, this would have got worse before better: the original `spore
+build` design proposed a third write-persistence model (write-in-place +
+reflink checkpoint), and the obvious incremental fix — maintaining the
+existing `rootfs-block-index-v0` with a new virtio-blk dirty bitmap and a
+dual-identity transition — would have added a second dirty tracker and a
+second identity namespace on top. The revived builder instead consumes the
+unified snapshot primitive from this plan.
 (That direction was drafted and deliberately deleted in favor of this plan.)
 Each mechanism is individually justified — and collectively it is four ways
 of saying "these bytes changed; here is the new state".
@@ -107,8 +120,7 @@ of saying "these bytes changed; here is the new state".
   indirection — no layer-chain stacking on the read path, ever.
 - One persistence operation — **snapshot**: freeze, hash dirty chunks, write
   them to the CAS, emit a new index. `spore save` and import both produce
-  their output through it (and build finalize would too, if the deferred
-  `spore build` plan is revived).
+  their output through it, as do `spore build` step checkpoints.
 - **Fork as a first-class disk operation**: copy the map, fresh overlay,
   constant cost regardless of lineage depth. The disk side of VM fork must
   never be the bottleneck.
@@ -131,16 +143,17 @@ of saying "these bytes changed; here is the new state".
 
 - No latency regression on today's warm paths, and concrete targets only
   where a slice names them (fork and partial-materialization slices carry
-  their own "done when" measurements). A native Dockerfile builder and its
-  cached-rebuild target belong to the deferred `spore build` plan; this
+  their own "done when" measurements). The native Dockerfile builder and its
+  cached-rebuild target remain owned by `docs/plans/spore-build.md`; this
   plan's local-iteration wins are fast import (U4: inline chunk emission, no
-  separate full-image hash) and fast cold start (U7: partial
-  materialization).
+  separate full-image hash), fast cold start (U7: partial materialization),
+  and the disk side of live named fork (U6).
 - No cross-machine chunk distribution. The unified store and lazy fault-in
   make a remote chunk source natural later; building it is separate work.
-- No memory-state fork. This plan covers the disk side only; VM memory
-  fork/snapshot is separate work that this plan must not block (see Open
-  Questions on namespace convergence).
+- No new memory-state fork mechanism. U6 reuses the already-landed named-fork
+  RAM/machine capture and per-child identity transformations; this plan owns
+  only replacement of that flow's diskless restriction with a fast disk head
+  (see Open Questions on namespace convergence).
 - No change to the guest-visible device model. One virtio-blk, same
   virtqueue parsing, per the frozen-device-model rule. Only backend
   internals move.
@@ -209,18 +222,21 @@ These are two distinct operations, not one operation with two
 implementations — callers always know which they want:
 
 - **`fork`** (ephemeral, fast): quiesce writes momentarily, copy the child's
-  map from the parent's, reflink the parent's overlay (APFS clone,
-  effectively O(1)) as the child's read-only second source, give the child a
-  fresh empty overlay, resume both. No durable identity is produced; this is
-  the fast-fork product primitive for fan-out. Still one map lookup per read
-  — sources are fds, not a stacked chain.
+  map from the parent's, give the child a private reflink clone of the
+  parent's overlay (APFS clone or Linux `FICLONE`, effectively O(1)), and
+  resume both. The clone becomes the child's writable overlay, so subsequent
+  writes diverge without adding a source layer. No durable identity is
+  produced; this is the fast-fork product primitive for fan-out. Still one
+  map lookup per read — sources are fds, not a stacked chain.
 - **`snapshot` + open** (durable): run `snapshot()` on the parent (O(dirty)
   hashing), open the resulting index for the child. Costs the hash, yields
   an identity — for lineage, caching, and publishing.
 
 Reflink is a host-filesystem capability (APFS, XFS, btrfs), not a universal
-one: on hosts without it, `fork` falls back to snapshot-then-open (or a
-plain overlay copy). A defined fallback, not an assumption.
+one. The production fast-fork command fails closed when a native clone is
+unavailable unless the caller explicitly opts into the slow dirty-chunk copy
+path; tests can force that path. `snapshot()` + open remains the separate
+durable operation. A defined fallback, not an assumption.
 
 Either way the invariant holds: read cost is one map lookup regardless of
 how many forks deep the lineage is. This is the structural difference from
@@ -249,8 +265,8 @@ cleanly, never hang the guest).
 ```
 snapshot(disk) -> DiskIndex:
   freeze/drain (v1: at the existing capture/save quiesce points — VM paused,
-                virtio-blk drained; online mid-run snapshot deferred with
-                the spore-build plan)
+                virtio-blk drained; online build checkpoints additionally use
+                the spore-build guest-fsfreeze protocol)
   for each dirty entry: blake3 chunk, write CAS object if absent
   new index = parent index with those entries replaced
   identity = blake3(new index); persist index; thaw
@@ -291,14 +307,11 @@ Consumers:
 - `spore save`: snapshot, then write a manifest referencing the index
   identity. Restore = open the index (materialize if needed), attach. No
   layer chains, no newest→oldest resolution, no `loadLayerChain`.
-- `spore build` (future consumer, if the deferred plan is revived):
-  intermediate step checkpoints do **not** get indexes — a step-key-addressed
-  reflink clone of the live flat file is the whole checkpoint artifact, local
-  and disposable. Emitting an index for an intermediate would require making
-  its chunks durable first (the invariant), which would dominate snapshot
-  time for artifacts that are usually thrown away. Build finalize would be
-  one snapshot: chunks to the CAS, index identity as image identity, no
-  terminal full-image hash.
+- `spore build`: each instruction checkpoint uses the same O(dirty)
+  `snapshotIndex()` operation and records the resulting child index only after
+  all referenced chunks are durable. The final local image ref binds that
+  index identity plus canonical image configuration; no terminal full-image
+  hash is needed.
 - Import: the native ext4 writer emits chunks and an index inline; the
   fallback path is a full scan producing the same. `ensureImageRootfsStorage`
   and the storage-upgrade dance disappear — storage is always chunked; flat
@@ -367,22 +380,23 @@ At end state:
 
 ## Delivery Strategy
 
-This plan is the active storage workstream and has no prerequisites from
-other plans. `docs/plans/spore-build.md` is **deferred** (re-sequenced
-2026-07-08): this plan's import improvements — U4's inline chunk emission
-from the native ext4 writer and U7's partial materialization — shrink the
-buildx→import-tar boundary that motivated `spore build` in the first place,
-so the builder is revisited only if that boundary still hurts after U4/U7
-land. Dirty tracking and incremental index maintenance — previously drafted
-as a separate plan — are built here, inside U2 (map-is-dirty-state backend)
-and U3 (shared sealer + `snapshot()`).
+U1–U5, U7, and U8 have landed. The active remaining product slice is U6:
+production disk-backed named fast fork. It has no prerequisite from the
+remaining evidence-gated U7 follow-ups or the open store/packing questions.
+`docs/plans/spore-build.md` was revived after the unified storage primitives
+landed and now consumes them as a separate active workstream. Dirty tracking
+and incremental index maintenance — previously drafted as a separate plan —
+live here, inside U2 (map-is-dirty-state backend) and U3 (shared sealer +
+`snapshot()`).
 
 Quiesce scope for U3: v1 `snapshot()` runs only at the existing capture/save
 quiesce points, where the VM is paused and virtio-blk writes are drained —
 the same coherence point dirty-RAM sealing uses today (`capture.zig` seals
-the final dirty set at capture time). An online mid-run snapshot (guest
-`fsfreeze` + VMM drain while the VM keeps running) was a spore-build M2
-requirement and defers with that plan; nothing in U1–U8 needs it.
+the final dirty set at capture time). `spore build` subsequently added its
+guest-`fsfreeze` checkpoint protocol in its own plan. U6 uses a different
+operation: it pauses the complete VM, captures RAM/machine state and every
+child disk head at one VMM-owned queue-drained epoch, then resumes the source.
+It must not call the durable disk sealer on the fast-fork path.
 
 ### U1 — Unified index type and CAS GC
 
@@ -598,34 +612,195 @@ backing-proof path binds to the new identity and its existing
 tamper-rejection tests pass; `docs/spore-format.md` describes one index
 structure with two instantiations (RAM 2MiB, disk 64KiB).
 
-### U6 — Fork
+### U6 — Production disk-backed fast fork
 
-Status: landed in branch for the disk backend.
+Status: backend primitive complete; production named-fork integration is the
+active next slice.
 
-Implement ephemeral `fork` on `ChunkMappedDisk` (map copy + overlay reflink
-per the Design section), with a plain dirty-chunk overlay-copy fallback for
-hosts without reflink. Durable child creation needs no new code — it is
-`snapshot()` + open, which exists after U3. Expose `fork` wherever the
-VM-level fork operation lands; this slice owns only the disk side.
+`ChunkMappedDisk.fork()` can already copy the one-level source map and clone
+an unlinked overlay fd, and its unit tests cover rejection, copy fallback,
+divergence, and flat 32-generation lineage. It has no production caller.
+`spore fork --vm` still rejects every disk-backed source, then uses a durable
+snapshot + open flow for its diskless children. That flow is correct for
+durable identity but is not the fast-fork product path: sealing dirty disk
+chunks before resuming the source would keep fork latency proportional to
+dirty volume.
 
-Landed behavior: writable `ChunkMappedDisk` instances can now create a
-`ForkedDisk` by copying the in-memory chunk-source map and giving the child an
-unlinked temp overlay cloned from the parent's overlay. Linux hosts attempt
-`FICLONE`; other hosts or explicit `force_copy` use a plain dirty-chunk copy
-fallback. The primitive asserts its caller has quiesced the VM and has no
-in-flight virtio-blk requests before cloning mutable disk state. Read-only
-disks reject `fork`, and durable child creation remains `snapshot()` + open.
+The first product boundary is the existing named live-fork command with one
+supported writable rootfs-bound `ChunkMappedDisk`. It covers image-created,
+explicit `--rootfs`, restored disk-index, and previously forked named VMs. A
+child is ephemeral runtime state until an explicit `spore save` gives it a
+durable disk identity; it can diverge, fork again, and be saved/restored
+normally. Networked fork and unsupported device layouts remain fail-closed.
 
-Validation: `mise run test` covers read-only rejection, forced-copy fallback,
-parent/child divergence, and a 32-deep sequential fork chain that keeps the
-chunk map flat and avoids parent contamination.
+#### Runtime state model
 
-Done when: fork of a running writable disk completes in O(map copy) —
-target <100ms for an 8G disk regardless of dirty volume on a reflink-capable
-host; a chain of N sequential forks shows no read-latency growth
-(property/benchmark test, N ≥ 32); parent and child diverge without
-cross-contamination (existing COW divergence tests, generalized); the
-no-reflink fallback path is exercised in tests.
+U6 reuses the existing named-fork RAM/machine capture; it does not add a new
+RAM fork algorithm. The fork-specific hidden capture is runtime-only: it
+contains the shared RAM, machine, device, and rootfs metadata needed to start
+children, but does not call `SnapshotState.finish()` or pretend that the
+parent's dirty disk has acquired a durable manifest identity. Normal
+`spore open`/restore must reject or never observe this incomplete internal
+record.
+
+After the shared capture, every child still receives the transformations that
+`spore.fork` applies today: generation-device and GIC fork state, fork batch
+and child index, VM identity, hostname, and MAC. Extract/reuse that logic rather
+than resuming siblings from byte-identical machine identity.
+
+Index identity alone is not read authority. Every child lifecycle record also
+owns a host-private baseline lease for the exact immutable rootfs/index and
+object root from which non-overridden chunks are reopened. A global-cache
+lease is a GC/prune root; a restored-spore lease points at stable saved-spore
+storage, never the source VM's runtime or fork-batch directory. The lease is
+independent of the source monitor, survives source removal, is inherited by a
+nested fork, and is released only when the child stops or publishes its own
+durable save and atomically adopts the new authority. If that lifetime cannot
+be pinned, fork fails before the source resumes; children never reopen from an
+identity with no live store authority.
+
+#### Coherence and handoff contract
+
+The source monitor owns the live disk pointer and overlay fd, so lifecycle
+must not call `ChunkMappedDisk.fork()` directly. Add a fork-specific VMM
+control action with these invariants:
+
+1. The VMM thread pauses every vCPU and proves the virtio-blk queue has no
+   in-flight request. It captures machine/RAM state once and creates all N
+   disk heads from that same paused epoch, without calling the durable disk
+   sealer.
+2. Each head contains one unlinked overlay fd and a bounded, same-version
+   runtime descriptor: exact baseline lease/identity, logical size, chunk
+   size/count, clone method, a physical-overlay bitmap
+   (`overlay` + `overlay_clean`), and a logical-zero bitmap
+   (`zero` + `zero_dirty`). All other chunks are reopened through the bound
+   baseline lease. Imported `overlay_clean` chunks may be conservatively dirty
+   in the child; extra rehashing on a later save is acceptable, lost state is
+   not.
+3. A child monitor applies the existing exec-deny jail, reads its lifecycle
+   spec, then claims exactly one descriptor and one fd directly from the
+   source monitor over a private Unix socket using `SCM_RIGHTS`. The claim is
+   bound to a random one-use token, batch, child name/index, and baseline
+   identity. The jail is neither weakened nor reordered.
+4. Before adoption, the receiver rejects truncated ancillary data
+   (`MSG_CTRUNC`), missing or multiple fds, and descriptors whose two bitmaps
+   are not exact-length, disjoint, and zero-padded past the final chunk. The
+   sole fd must be a regular file of the exact logical size, open `O_RDWR`
+   without append semantics; set `FD_CLOEXEC` immediately on receipt. Only
+   then may `RuntimeDisk` adopt it.
+5. The child fully reopens and validates the bound baseline, applies the two
+   override maps, and owns its `RuntimeDisk` before publishing `ready.json`.
+   Lifecycle must never report a child ready before a failed claim or baseline
+   open can surface.
+6. The source owns each head until a successful fd transfer; the child has one
+   owner after adoption. Cancellation, expiry, source shutdown, CLI timeout,
+   and partial child startup close every unclaimed fd. Rollback tracks monitors
+   that spawned but did not reach ready, not only earlier ready children. The
+   source VM resumes after the batch is published or rolled back, even when
+   child startup later fails.
+7. The first disk-backed product limit is 32 children per batch, 4KiB total
+   rendered child-name bytes, 2MiB per descriptor, and 64MiB aggregate
+   descriptor payload, checked before allocation. Batch prepare/cancel and the
+   indexed claim request stay within the existing 8,192-byte JSON control
+   bound. Bitmap payloads do not use that line parser: after a small validated
+   claim header, the private socket switches to a fixed-version binary frame
+   with an exact descriptor length and the overlay fd attached once to the
+   first frame. The receiver rejects short reads, trailing bytes, or a second
+   ancillary fd. The separate lineage proof remains 32 sequential one-child
+   generations.
+
+APFS `fclonefileat` needs a destination name. It may create an `O_EXCL` file
+inside a private `0700` directory on the same filesystem as the source
+overlay, open it, and unlink it immediately; the overlay factory must preserve
+that same-filesystem guarantee. No persistent overlay path or linked child
+handoff is permitted. Linux continues to use `FICLONE`. If native cloning is
+unavailable, production fast fork fails closed unless the caller explicitly
+requests the measured slow-copy path.
+
+The baseline binding must survive source history. In particular, a
+non-destructive save currently snapshots into a temporary directory and then
+renames it while the live backend can retain the temporary `parent_root`.
+That stale authority breaks later parent-index reuse and snapshot publication.
+Fix or eliminate it before runtime-head export; add
+save→rename→fork→save coverage.
+
+#### PR-sized delivery
+
+1. **Fix baseline authority after save.** Make the live backend's post-save
+   parent authority stable across lifecycle's temporary-directory rename and
+   cover save→rename→snapshot reuse. This is a standalone correctness PR and a
+   prerequisite for runtime export.
+2. **Add a portable runtime disk head.** Add a separate head export/import path
+   around an already-open fd and the two bounded override bitmaps; do not force
+   the existing in-process `ForkedDisk` to serialize its owned digest tables.
+   Add baseline leases, same-filesystem overlay placement, APFS clone plus
+   Linux `FICLONE`, explicit slow-copy mode, descriptor unit/fuzz tests, and
+   the 8GiB disk-only benchmark. No CLI.
+3. **Add the one-shot fd-claim transport.** Land `SCM_RIGHTS` send/receive,
+   token registry, indexed bounded control requests, exact-length binary
+   descriptor framing, receiver validation/ownership, expiry/cancellation,
+   and crash cleanup as its own PR. Prove it works after the unchanged monitor
+   jail and that adoption precedes readiness.
+4. **Add the monitor/VMM fork capture.** Keep pause/drain validation
+   backend-local in HVF/KVM, but share the request/result and ownership state
+   machine. Reuse one RAM/machine capture, prepare all child heads at the same
+   epoch, create their baseline leases, and apply the existing per-child
+   identity transformations without sealing disk state.
+5. **Enable disk-backed named live fork.** Remove the two disk guards only for
+   supported one-rootfs-disk shapes, pass each internal claim to its re-exec'd
+   monitor, pre-open its runtime disk, and make batch rollback include
+   spawned-but-not-ready children. Add HVF/KVM product smokes, nested fork,
+   durable child save/restore, docs, release notes, and lineage benchmarks.
+   Keep the network guard.
+
+#### Validation and done criteria
+
+- Product smoke: mutate the parent, fork at least two children, verify every
+  child inherited the same paused bytes, diverge parent and siblings without
+  cross-contamination, fork one child again, then save and restore it. Assert
+  distinct generation/GIC state, fork indices, VM IDs, hostnames, and MACs.
+- Remove the source VM, run global cache GC/prune, and prove every live child
+  can still read untouched and overridden chunks, fork again, and save. No
+  child baseline may depend on the source runtime or batch directory.
+- Queue-pending injection rejects before cloning, publishes no claim, and
+  resumes the source. Partial startup and process exits before/after claim
+  leave no fd, token, child-runtime, or batch leaks.
+- Protocol tests reject missing/multiple fds, malformed or oversized bitmaps,
+  overlapping maps, nonzero padding, ancillary truncation, unknown
+  tags/versions, size/chunk-count/baseline mismatches, replayed or cross-child
+  tokens, short/trailing binary frames, and non-regular, read-only,
+  append-mode, or wrongly sized files. The parser has a fuzz target as required
+  for attacker-influenced input.
+- Native clone coverage runs on APFS/HVF and reflink-capable Linux/KVM. Forced
+  copy requires explicit slow-path opt-in, remains correctness-gated, and
+  reports bytes/time, but carries no fast latency promise.
+- For `count=1`, preparing one 8GiB disk head from the queue-drained barrier to
+  head-ready takes <100ms at 0%, 50%, and 100% physical-overlay coverage on a
+  reflink-capable host. At the 32-child cap, disk preparation adds <1s beyond
+  the shared RAM/machine capture. Report `ram_capture_ms`, `disk_fork_ms`,
+  `source_pause_ms`, and `child_ready_ms` separately; this slice does not
+  promise <100ms for the complete `spore fork --vm` command.
+- Generation-32 warm random-read p95 is within 10% of generation 0 under the
+  same workload, proving lineage never becomes a read chain.
+- `mise run test`, `mise run build`, the existing monitor-jail smoke, and the
+  real HVF/KVM named-fork smokes pass.
+
+#### Key Learnings From Pressure-Testing
+
+- The production seam is the source monitor's VMM quiescence path, not
+  lifecycle: only that process owns the live map/fds and can prove the block
+  queue is drained.
+- An unlinked fd is a useful cleanup invariant. A linked runtime handoff would
+  add TOCTOU and stale-file recovery problems, so children claim fds directly
+  and the private descriptor remains non-portable. APFS may use a transient
+  named clone only until it has opened and unlinked the resulting fd.
+- The existing primitive is not yet a proven portable fast path: it deep-copies
+  digest strings and only attempts reflink on Linux. Stable baseline authority
+  with an independently rooted object store, a transferable head, and APFS
+  cloning are prerequisites to production exposure.
+- Fast-disk timing must be measured separately from the existing RAM/machine
+  capture and child startup. Calling `snapshotIndex()` would make the wiring
+  functionally correct while missing the product goal.
 
 ### U7 — Partial materialization
 
@@ -718,18 +893,20 @@ are needed.
 
 ### U8 — Cleanup and docs
 
-Status: landed in branch.
+Status: landed for the unified-storage cleanup; U6 owns its production
+named-fork docs and release note.
 
 Remove transitional shims, update `docs/rootfs.md`/`docs/filesystem.md`
 architecture sections, SECURITY.md parser inventory (net reduction: three
 index parsers → one), release notes covering the format break and the new
-boot/fork behavior.
+boot behavior. Production named-fork documentation lands with U6, not here.
 
 Landed behavior: the unused public `CowDisk` backend and virtio-blk `.cow`
 backend arm are gone; writable COW behavior now lives only inside
 `ChunkMappedDisk`. Durable filesystem, rootfs, state-portability, security, and
 release-note docs describe disk indexes, lazy CAS fault-in, the format break,
-and the fork/runtime behavior.
+and the backend fork/runtime model. They do not imply that disk-backed
+`spore fork --vm` is already exposed.
 
 Validation: `mise run test`, `mise run build`, and the conditional
 `rootfs-slow-test` target. The slow graph validates chunk-index storage and
@@ -754,13 +931,22 @@ directly; it does not assemble or rescan the derived flat rootfs cache.
 - The snapshot freeze/drain must produce clean images, never
   crash-consistent guesses. In v1 this is satisfied structurally: snapshots
   run only at capture/save points where the VM is paused and virtio-blk
-  writes are drained. An online mid-run snapshot would need the guest
-  `fsfreeze` protocol deferred with the spore-build plan.
+  writes are drained. The separate `spore build` work owns its online
+  guest-`fsfreeze` checkpoint protocol; U6 captures complete VM state at one
+  paused device epoch and does not publish a disk snapshot.
 - Partial materialization (U7) puts CAS object reads on the guest I/O path
   for the first time: objects are digest-verified at fault-in before bytes
   reach the guest, and missing/corrupt objects surface as clean I/O errors
   to the guest, never hangs or silent zero-fill. U7 tests cover promoted
   chunk eviction and corrupt unread objects.
+- Production fork handoff is host-private but still parser and fd authority.
+  Its descriptor is strictly bounded and versioned, its single overlay fd is
+  transferred with `SCM_RIGHTS` over a one-use child-bound claim, and bitmap
+  data uses a separate exact-length binary frame rather than the 8KiB JSON line
+  parser. All baseline lifetime, map shape, size, fd mode/type, framing, and
+  ownership checks complete before adoption and before monitor readiness. The
+  parser lands with a fuzz target; the existing monitor jail remains in force
+  and the guest-visible device model does not change.
 
 ## Resolved Decisions
 
@@ -786,26 +972,30 @@ directly; it does not assemble or rescan the derived flat rootfs cache.
 - GC before deletion: no slice that removes an old mechanism lands before
   `spore cache gc` exists.
 - Durable-index invariant: an index is only written once every chunk it
-  references is durable in a store. Consequence for the deferred
-  `spore build` plan, should it be revived: intermediate step checkpoints
-  are local flat clones with no index; only the final snapshot writes
-  chunks + index.
+  references is durable in a store. `spore build` therefore publishes each
+  per-instruction child index only after its O(dirty) chunk publication has
+  completed; cache records never point at half-durable state.
 - Fork and durable-child are two named operations, not one configurable
   mechanism: `fork` = map copy + overlay reflink, ephemeral, no identity;
-  durable children come from `snapshot()` + open. Reflink is a host-fs
-  capability with a defined fallback (snapshot-then-open), not an
-  assumption.
+  durable children come from `snapshot()` + open. A live fork head crosses
+  process boundaries only as a one-use private descriptor plus unlinked fd,
+  backed by an independently rooted baseline lease, never as a new manifest
+  kind or persistent linked overlay path. Reflink is a host-fs capability;
+  fast fork fails closed without it unless the caller explicitly opts into
+  the measured dirty-chunk copy path.
 
 ## Open Questions
 
 - Chunk object packing (many small files vs packfiles). File-per-chunk
-  ships through U6: RAM already runs file-per-chunk at 2MiB without
-  trouble, and incremental snapshots mostly skip writes via
+  has shipped through the unified storage slices: RAM already runs
+  file-per-chunk at 2MiB without trouble, and incremental snapshots mostly
+  skip writes via
   write-if-missing, so the snapshot write path is expected to be fine. The
   access pattern that could force packing is U7 fault-in — an
   open+read+close per 64KiB miss on cold boot (~70K objects for the
-  reference image). Decide at U7 with fault-trace data in hand; do not
-  build packfiles speculatively, since file-per-chunk is what keeps
+  reference image). U7 landed without evidence requiring packing; revisit only
+  if large-image fault traces justify it. Do not build packfiles speculatively,
+  since file-per-chunk is what keeps
   write-if-missing dedupe and unlink-based GC trivial. The index format is
   unaffected either way.
 - Whether RAM and disk chunks should eventually share one *store*. This
