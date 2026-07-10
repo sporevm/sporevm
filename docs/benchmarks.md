@@ -110,6 +110,9 @@ point and its source, the machine-reported exec-ready wait and total, the first
 `/bin/true` exec, repeated no-op exec samples and median, and cleanup time. The
 input spore is only read and can be reused across iterations.
 
+Pass `--include-run-from` to also record one-shot `run --from ... /bin/true`
+wall time against the same parent and host.
+
 ### Cold TTI
 
 Cold TTI follows the ComputeSDK benchmark shape: the timer starts before

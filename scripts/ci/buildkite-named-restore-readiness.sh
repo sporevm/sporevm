@@ -66,6 +66,7 @@ scripts/benchmark/named-restore-readiness.py \
   --repeated-execs "${repeated_execs}" \
   --runtime-dir "${baseline_runtime}" \
   --output "${output_dir}/baseline-${baseline_version}.jsonl" \
+  --include-run-from \
   --no-build
 
 scripts/benchmark/named-restore-readiness.py \
@@ -76,6 +77,7 @@ scripts/benchmark/named-restore-readiness.py \
   --repeated-execs "${repeated_execs}" \
   --runtime-dir "${current_runtime}" \
   --output "${output_dir}/current.jsonl" \
+  --include-run-from \
   --no-build
 
 python3 - "${output_dir}/baseline-${baseline_version}.jsonl" "${output_dir}/current.jsonl" <<'PY'
@@ -86,7 +88,7 @@ import sys
 for path in sys.argv[1:]:
     rows = [json.loads(line) for line in open(path, encoding="utf-8")]
     print(path)
-    for field in ("restore_return_ms", "exec_ready_ms", "exec_ready_wait_ms", "first_noop_exec_ms", "repeated_exec_median_ms"):
+    for field in ("run_from_noop_ms", "restore_return_ms", "exec_ready_ms", "exec_ready_wait_ms", "first_noop_exec_ms", "repeated_exec_median_ms"):
         values = [row[field] for row in rows if isinstance(row.get(field), (int, float))]
         print(f"  {field}: median={statistics.median(values):.3f}ms n={len(values)}" if values else f"  {field}: n=0")
 PY

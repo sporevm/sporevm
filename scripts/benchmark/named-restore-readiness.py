@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeated-execs", type=int, default=5)
     parser.add_argument("--output", type=pathlib.Path, default=pathlib.Path("zig-cache/named-restore-readiness.jsonl"))
     parser.add_argument("--runtime-dir", type=pathlib.Path)
+    parser.add_argument("--include-run-from", action="store_true", help="also time one-shot run --from /bin/true")
     parser.add_argument("--no-build", action="store_true")
     args = parser.parse_args()
     if args.iterations < 1 or args.repeated_execs < 1:
@@ -70,6 +71,14 @@ def main() -> int:
     with output.open("w", encoding="utf-8") as rows:
         for iteration in range(1, args.iterations + 1):
             name = f"readiness-{os.getpid()}-{iteration}"
+            run_from_ms: float | None = None
+            run_from_status: int | None = None
+            run_from_error = ""
+            if args.include_run_from:
+                run_from_argv = [str(spore_bin), "run", "--backend", args.backend, "--from", str(spore_dir), "--", "/bin/true"]
+                one_shot, run_from_ms = run(run_from_argv, env)
+                run_from_status = one_shot.returncode
+                run_from_error = one_shot.stderr.strip()
             restore_argv = [str(spore_bin), "--json", "restore", str(spore_dir), "--name", name]
             if args.backend != "auto":
                 restore_argv.extend(("--backend", args.backend))
@@ -102,7 +111,8 @@ def main() -> int:
             exec_ready_ms = restore_return_ms if has_readiness_contract else (
                 restore_return_ms + first_exec_ms if first_exec_ms is not None else None
             )
-            ok = restored.returncode == 0 and not exec_errors and len(repeated_exec_ms) == args.repeated_execs and removed.returncode == 0
+            ok = (run_from_status in (None, 0) and restored.returncode == 0 and not exec_errors and
+                  len(repeated_exec_ms) == args.repeated_execs and removed.returncode == 0)
             failures += 0 if ok else 1
             row = {
                 "schema": "spore.named-restore-readiness.v1",
@@ -110,6 +120,8 @@ def main() -> int:
                 "backend": args.backend,
                 "spore_version": version,
                 "spore_dir": str(spore_dir),
+                "run_from_noop_ms": run_from_ms,
+                "run_from_status": run_from_status,
                 "restore_return_ms": restore_return_ms,
                 "exec_ready_ms": exec_ready_ms,
                 "exec_ready_source": "restore_contract" if has_readiness_contract else "first_noop_completion",
@@ -121,12 +133,12 @@ def main() -> int:
                 "cleanup_ms": cleanup_ms,
                 "restore_status": restored.returncode,
                 "cleanup_status": removed.returncode,
-                "error": restored.stderr.strip() or "; ".join(exec_errors) or removed.stderr.strip(),
+                "error": run_from_error or restored.stderr.strip() or "; ".join(exec_errors) or removed.stderr.strip(),
             }
             rows.write(json.dumps(row, separators=(",", ":")) + "\n")
             rows.flush()
             print(
-                f"iteration {iteration}/{args.iterations}: restore={restore_return_ms:.3f}ms "
+                f"iteration {iteration}/{args.iterations}: run_from={run_from_ms}ms restore={restore_return_ms:.3f}ms "
                 f"ready={row['exec_ready_wait_ms']}ms first={first_exec_ms}ms "
                 f"repeated_median={row['repeated_exec_median_ms']}ms ok={ok}",
                 file=sys.stderr,
