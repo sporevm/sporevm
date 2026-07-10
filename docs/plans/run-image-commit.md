@@ -1,5 +1,5 @@
 ---
-status: active
+status: complete
 last_reviewed: 2026-07-10
 spec_refs:
   - docs/filesystem.md
@@ -503,7 +503,9 @@ Implementation progress:
 - [x] S1 implementation: absolute chunk-aligned disk sizing, sparse growth,
   pre-command guest resize, shrink rejection, API/docs, and HVF smoke coverage.
 - [x] S1 review/commit.
-- [ ] S2 downstream Compose and fan-out measurements.
+- [x] S2 downstream decision gate: the real Buildkite code image cannot be
+  represented above the committed cache with the current build contracts; the
+  proof stopped before collecting measurements for the wrong layer order.
 
 ### S0 — One-shot `run --commit`
 
@@ -598,6 +600,29 @@ a separate COW cache-disk plan; do not quietly add secondary disks to S2.
 Expected PR boundary: downstream only. Any missing generic input or lifecycle
 primitive must be planned before widening SporeVM.
 
+#### S2 outcome (2026-07-10)
+
+The downstream pressure test is recorded in
+`buildkite/buildkite-sporevm@285a062` (`docs/compose-cache-layering.md`). It
+confirmed that the existing wrapper has the inverse order: it first builds the
+revision-specific `buildkite-spore-ci:local` image, then adds individually
+saved dependency archives, and finally runs `docker load` during guest setup.
+
+The Buildkite CI Dockerfile at
+`2f31a768d9423507e9b864e1634b0064c17cf3da` cannot currently be rebuilt from
+`FROM local/buildkite-compose-cache:dev`. It combines its runtime and code with
+multi-stage output, cross-stage copies, remote and heredoc inputs, BuildKit
+cache/bind/SSH mounts, and COPY flags outside the supported `spore build`
+subset. SporeVM can consume the resulting monolithic image as a base, but
+cannot apply it as a child delta above an already committed cache image.
+
+S2 therefore stopped at its explicit decision gate. No Compose pull or fan-out
+numbers were collected: they would measure a code-first cache whose lifetime
+is invalidated by the common code-only change. No secondary disk or
+Docker-specific feature was added. A follow-up must first prove one generic
+way to put code above the cache: a stable application runtime plus narrow code
+recipe, an independently applicable rootfs delta, or runtime source staging.
+
 ### S3 — Consider named commit
 
 Only after one-shot use demonstrates a need, design `spore commit NAME --tag
@@ -659,9 +684,9 @@ separate plan lands disk-backed monitor fork.
   Existing save/offline-fork remains the machine-state layer; the plan now
   requires their composition as an end-to-end acceptance path.
 - Layer order is as important as dedupe: preparing Docker state above churny
-  code gives the cache the wrong lifetime. The first proof now commits the
-  cache below code and uses existing `FROM local/...` support to add code on
-  top.
+  code gives the cache the wrong lifetime. The downstream proof stopped because
+  the real Buildkite image cannot yet make the committed cache its exact parent;
+  measuring the existing code-first image would validate the wrong design.
 - A secondary COW disk would give stronger cache/rootfs independence, but it
   expands manifest, mount, capture, fork, bundle, and GC contracts. It is a
   fallback behind evidence that inverted rootfs layering cannot serve the real
@@ -709,8 +734,10 @@ separate plan lands disk-backed monitor fork.
 - Defer named commit and large generic inputs until measured use demands them.
 - Do not add `spore fork --image`; images are cold-boot bases, spores are fork
   sources.
-- Defer secondary COW cache disks until a real workload proves code cannot be
-  layered above the committed cache image.
+- Keep secondary COW cache disks out of this change. The Buildkite workload has
+  now hit the code-layering trigger, but any separate plan must still compare a
+  generic cache disk with simpler application-runtime deltas or runtime source
+  staging.
 
 ## Deferred Questions And Triggers
 
@@ -728,11 +755,12 @@ separate plan lands disk-backed monitor fork.
   default command, environment, user, or working directory.
 - **Explicit cache keys:** consider only if multiple callers reimplement the
   same immutable-input reuse contract.
-- **Separate COW cache disks:** consider when stable prepared data must outlive
-  frequent unrelated rootfs changes, or monolithic code images cannot use the
-  prepared cache as their local `FROM` base. A separate plan must cover multiple
-  disk manifests, guest mount policy, private writable heads, commit/save/fork,
-  bundle/distribution, and GC reachability.
+- **Separate COW cache disks:** the Buildkite monolithic-image pressure test has
+  met the original trigger, but it has not selected this design. Compare it
+  first with a stable application runtime, independently applicable rootfs
+  deltas, and runtime source staging. If a cache disk remains necessary, a
+  separate plan must cover multiple disk manifests, guest mount policy, private
+  writable heads, commit/save/fork, bundle/distribution, and GC reachability.
 - **Lazy remote chunks:** consider when fresh-host transfer remains dominant
   after local image reuse and normal bundle distribution.
 
