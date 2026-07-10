@@ -859,6 +859,16 @@ first step that performs growth includes the target, while later steps use
 zero, so valid v5 records remain reusable and incorrectly re-grown records
 fall out of the corrected lookup path without another cache-version bump.
 
+Implementation note (2026-07-10, checkpoint control latency): repeated
+freeze/thaw requests used fixed session identities, which reused the same
+derived host vsock ports before the preceding connection had retired and
+introduced an approximately 8.2-second stall between executed steps. Build
+streams now receive monotonically sequenced dynamic host ports, and checkpoint
+session identities include the step number. The VM smoke records the slowest
+freeze/thaw control and requires it to stay below two seconds; the corrected
+run completed these controls in milliseconds. Snapshot cost remains measured
+separately, including the first checkpoint after disk growth.
+
 Implementation note (2026-07-09, COPY/context-disk slice): the executor step
 list is now a tagged RUN/COPY sequence, so the first uncached COPY enters the
 same persistent VM path as RUN. COPY write-side keys use the same `StepInput`

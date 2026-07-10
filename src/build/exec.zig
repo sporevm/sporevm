@@ -32,6 +32,7 @@ pub const Diagnostic = struct {
     boot_count: usize = 0,
     executed_steps: usize = 0,
     resize_count: usize = 0,
+    max_checkpoint_control_ms: u64 = 0,
 };
 
 pub const RunStep = struct {
@@ -187,6 +188,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
             diag.output = try control.capture.toOwnedSlice();
             diag.boot_count = 1;
             diag.executed_steps = control.executed_steps;
+            diag.max_checkpoint_control_ms = control.max_checkpoint_control_ms;
         }
         return error.BuildRunFailed;
     }
@@ -195,6 +197,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     if (options.diagnostic) |diag| {
         diag.boot_count = 1;
         diag.executed_steps = control.executed_steps;
+        diag.max_checkpoint_control_ms = control.max_checkpoint_control_ms;
     }
     return try spore.cloneRootfsStorage(allocator, control.current_storage);
 }
@@ -231,6 +234,7 @@ const BuildControl = struct {
     active_stream: ActiveStream = .run,
     stream: vsock.HostStream = undefined,
     stream_valid: bool = false,
+    stream_sequence: u64 = 0,
     active_input: ?step_cache.StepInput = null,
     active_step_key: []const u8 = "",
     active_stdin_payload: []const u8 = "",
@@ -243,6 +247,7 @@ const BuildControl = struct {
     failed_instruction_line: usize = 0,
     failed_exit_code: ?i32 = null,
     failure: ?anyerror = null,
+    max_checkpoint_control_ms: u64 = 0,
 
     fn init(io: Io, allocator: std.mem.Allocator, options: Options) !BuildControl {
         return .{
@@ -350,9 +355,10 @@ const BuildControl = struct {
     }
 
     fn startSimpleControl(self: *BuildControl, dev: *vsock.Vsock, kind: ActiveStream) !void {
+        const session_id = try checkpointSessionId(self.allocator, kind, self.step_index);
         const request = switch (kind) {
-            .freeze => try simpleRequest(self.allocator, "fsfreeze-v1", "spore-build-freeze"),
-            .thaw => try simpleRequest(self.allocator, "fsthaw-v1", "spore-build-thaw"),
+            .freeze => try simpleRequest(self.allocator, "fsfreeze-v1", session_id),
+            .thaw => try simpleRequest(self.allocator, "fsthaw-v1", session_id),
             .resize, .run, .copy => unreachable,
         };
         try self.startStream(dev, request, .spore_stream_v1, kind, "");
@@ -365,7 +371,8 @@ const BuildControl = struct {
 
     fn startStream(self: *BuildControl, dev: *vsock.Vsock, request: []const u8, protocol: vsock.HostStreamProtocol, kind: ActiveStream, stdin_payload: []const u8) !void {
         self.stream = try vsock.HostStream.initWithProtocol(guest_port, request, protocol);
-        self.stream.host_port = vsock.HostStream.deriveHostPort(request);
+        self.stream.host_port = vsock.HostStream.hostPortForSequence(self.stream_sequence);
+        self.stream_sequence +%= 1;
         self.active_stream = kind;
         if (kind == .run or kind == .copy or kind == .resize) self.stream.setOutputSink(self, outputSink);
         self.active_stdin_payload = stdin_payload;
@@ -441,6 +448,7 @@ const BuildControl = struct {
                 self.phase = .start_freeze;
             },
             .freeze => {
+                self.max_checkpoint_control_ms = @max(self.max_checkpoint_control_ms, self.stream.elapsedMs());
                 if (exit_code != 0) {
                     self.failure = error.BuildGuestFreezeFailed;
                     self.phase = .failed;
@@ -449,6 +457,7 @@ const BuildControl = struct {
                 self.phase = .snapshot;
             },
             .thaw => {
+                self.max_checkpoint_control_ms = @max(self.max_checkpoint_control_ms, self.stream.elapsedMs());
                 if (exit_code != 0) {
                     self.failure = error.BuildGuestThawFailed;
                     self.phase = .failed;
@@ -536,6 +545,15 @@ const BuildControl = struct {
         self.reportStats(stats);
     }
 };
+
+fn checkpointSessionId(allocator: std.mem.Allocator, kind: ActiveStream, step_index: usize) ![]const u8 {
+    const name = switch (kind) {
+        .freeze => "freeze",
+        .thaw => "thaw",
+        .resize, .run, .copy => unreachable,
+    };
+    return std.fmt.allocPrint(allocator, "spore-build-{s}-{d}", .{ name, step_index + 1 });
+}
 
 fn runRequest(
     allocator: std.mem.Allocator,
@@ -767,10 +785,25 @@ fn appendTestSpioFrame(out: []u8, cursor: *usize, frame_type: u8, offset: u64, p
 }
 
 test "build fsfreeze request stays bounded" {
-    const request = try simpleRequest(std.testing.allocator, "fsfreeze-v1", "spore-build-freeze");
+    const request = try simpleRequest(std.testing.allocator, "fsfreeze-v1", "spore-build-freeze-1");
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.endsWith(u8, request, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, request, "\"fsfreeze-v1\"") != null);
+}
+
+test "checkpoint controls use step-specific vsock identities" {
+    const allocator = std.testing.allocator;
+    const freeze_one = try checkpointSessionId(allocator, .freeze, 0);
+    defer allocator.free(freeze_one);
+    const freeze_two = try checkpointSessionId(allocator, .freeze, 1);
+    defer allocator.free(freeze_two);
+    const thaw_one = try checkpointSessionId(allocator, .thaw, 0);
+    defer allocator.free(thaw_one);
+    const thaw_two = try checkpointSessionId(allocator, .thaw, 1);
+    defer allocator.free(thaw_two);
+
+    try std.testing.expectEqualStrings("spore-build-freeze-1", freeze_one);
+    try std.testing.expectEqualStrings("spore-build-thaw-2", thaw_two);
 }
 
 test "build session network mode derives from RUN steps" {

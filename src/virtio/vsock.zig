@@ -184,6 +184,10 @@ pub const HostStream = struct {
         return dynamic_host_port_first + @as(u32, @intCast(std.hash.Wyhash.hash(0, request) % dynamic_host_port_count));
     }
 
+    pub fn hostPortForSequence(sequence: u64) u32 {
+        return dynamic_host_port_first + @as(u32, @intCast(sequence % dynamic_host_port_count));
+    }
+
     pub fn markStarted(self: *HostStream) void {
         self.started_at_ms = monotonicMs();
         self.start_ms = self.elapsedMs();
@@ -1778,6 +1782,12 @@ test "request-derived host ports are stable dynamic ports" {
     try std.testing.expect(first < dynamic_host_port_first + dynamic_host_port_count);
     try std.testing.expectEqual(first, again);
     try std.testing.expect(first != second);
+}
+
+test "host stream sequences dynamic host ports without early reuse" {
+    try std.testing.expectEqual(dynamic_host_port_first, HostStream.hostPortForSequence(0));
+    try std.testing.expectEqual(dynamic_host_port_first + 1, HostStream.hostPortForSequence(1));
+    try std.testing.expectEqual(dynamic_host_port_first, HostStream.hostPortForSequence(dynamic_host_port_count));
 }
 
 test "host stream frame parser handles split frames" {

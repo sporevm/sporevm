@@ -91,6 +91,7 @@ pub fn main(init: std.process.Init) !void {
     if (first_diag.executor.boot_count != 1) return error.ExpectedOneBuildVmBoot;
     if (first_diag.executor.executed_steps != 15) return error.ExpectedFifteenBuildSteps;
     if (first_diag.executor.resize_count != 1) return error.ExpectedOneBuildResize;
+    if (first_diag.executor.max_checkpoint_control_ms >= 2000) return error.BuildCheckpointControlTooSlow;
     if (first.cache_hit) return error.ExpectedFirstBuildCacheMiss;
     if (!first_diag.context_disk.emitted) return error.ExpectedFirstContextDiskEmit;
     if (first_diag.context_disk.reused) return error.ExpectedFirstContextDiskNotReused;
@@ -123,6 +124,7 @@ pub fn main(init: std.process.Init) !void {
     if (override_diag.executor.boot_count != 1) return error.ExpectedOverrideBuildVmBoot;
     if (override_diag.executor.executed_steps != 15) return error.ExpectedOverrideBuildFifteenSteps;
     if (override_diag.executor.resize_count != 1) return error.ExpectedOverrideBuildOneResize;
+    if (override_diag.executor.max_checkpoint_control_ms >= 2000) return error.OverrideBuildCheckpointControlTooSlow;
     if (override.cache_hit) return error.ExpectedOverrideBuildCacheMiss;
     if (std.mem.eql(u8, first.index_digest, override.index_digest)) return error.ExpectedOverrideRootfsIdentity;
     if (!override_diag.context_disk.reused) return error.ExpectedOverrideContextDiskReuse;
@@ -162,6 +164,7 @@ pub fn main(init: std.process.Init) !void {
     if (edited_diag.executor.boot_count != 1) return error.ExpectedEditedBuildVmBoot;
     if (edited_diag.executor.executed_steps != 4) return error.ExpectedEditedBuildFourSteps;
     if (edited_diag.executor.resize_count != 0) return error.ExpectedEditedBuildWithoutResize;
+    if (edited_diag.executor.max_checkpoint_control_ms >= 2000) return error.EditedBuildCheckpointControlTooSlow;
     if (edited.cache_hit) return error.ExpectedEditedBuildCacheMiss;
     if (std.mem.eql(u8, first.index_digest, edited.index_digest)) return error.ExpectedEditedRootfsIdentity;
     if (!edited_diag.context_disk.emitted) return error.ExpectedEditedContextDiskEmit;
