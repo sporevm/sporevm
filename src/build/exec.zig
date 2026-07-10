@@ -695,6 +695,7 @@ const guest_agent_fuzz_copy_request: c_int = 2;
 const guest_agent_fuzz_run_complete: c_int = 3;
 
 extern fn spore_agent_fuzz_build_request(request: [*]const u8, request_len: usize, stream: [*]const u8, stream_len: usize) c_int;
+extern fn spore_agent_fuzz_proc_stat(stat: [*]const u8, stat_len: usize) c_int;
 
 fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
     if (comptime guest_agent_fuzz_supported) {
@@ -735,6 +736,14 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
         appendTestSpioFrame(&stream, &stream_len, 1, if (mode == 1) 1 else 0, command);
         if (mode != 3) appendTestSpioFrame(&stream, &stream_len, 2, command.len, "");
         _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..stream_len].ptr, stream_len);
+    }
+}
+
+fn fuzzGuestProcStat(_: void, s: *std.testing.Smith) !void {
+    if (comptime guest_agent_fuzz_supported) {
+        var bytes: [256]u8 = undefined;
+        const len = s.slice(&bytes);
+        _ = spore_agent_fuzz_proc_stat(bytes[0..len].ptr, len);
     }
 }
 
@@ -901,8 +910,20 @@ test "guest build request parser rejects malformed RUN framing and accepts COPY 
     try std.testing.expectEqual(guest_agent_fuzz_copy_request, spore_agent_fuzz_build_request(copy_request.ptr, copy_request.len, stream[0..0].ptr, 0));
 }
 
+test "guest proc stat parser identifies kernel threads with adversarial task names" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+
+    const user = "123 (user) S 1 2 3 4 5 0 0 0\n";
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_proc_stat(user.ptr, user.len));
+    const kernel = "2 (name ) with spaces) S 0 0 0 0 0 2097152 0 0\n";
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_proc_stat(kernel.ptr, kernel.len));
+    const malformed = "2 (unterminated S 0 0 0";
+    try std.testing.expectEqual(@as(c_int, -1), spore_agent_fuzz_proc_stat(malformed.ptr, malformed.len));
+}
+
 test "fuzz build control request framing" {
     try std.testing.fuzz({}, fuzzSimpleRequest, .{});
     try std.testing.fuzz({}, fuzzCopyRequest, .{});
     try std.testing.fuzz({}, fuzzGuestBuildRequest, .{});
+    try std.testing.fuzz({}, fuzzGuestProcStat, .{});
 }

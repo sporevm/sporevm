@@ -1,8 +1,12 @@
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static void write_str(int fd, const char *data) {
@@ -35,6 +39,73 @@ static int file_exists(const char *path) {
 
 static int path_absent(const char *path) {
   return access(path, F_OK) != 0 && errno == ENOENT;
+}
+
+static void sleep_ms(long milliseconds) {
+  struct timespec delay = {
+    .tv_sec = milliseconds / 1000,
+    .tv_nsec = (milliseconds % 1000) * 1000000,
+  };
+  while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+  }
+}
+
+static int move_to_root_cgroup(void) {
+  int fd = open("/sys/fs/cgroup/cgroup.procs", O_WRONLY | O_CLOEXEC);
+  if (fd < 0) return 1;
+  char pid[32];
+  int len = snprintf(pid, sizeof(pid), "%ld\n", (long)getpid());
+  ssize_t written = len > 0 && (size_t)len < sizeof(pid) ? write(fd, pid, (size_t)len) : -1;
+  int close_rc = close(fd);
+  return written == len && close_rc == 0 ? 0 : 1;
+}
+
+static int spawn_background_writer(void) {
+  unlink("/background-survived");
+  int ready[2];
+  if (pipe(ready) != 0) return 7;
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(ready[0]);
+    close(ready[1]);
+    return 7;
+  }
+  if (pid == 0) {
+    close(ready[0]);
+    if (setsid() < 0 || move_to_root_cgroup() != 0 || write(ready[1], "1", 1) != 1) _exit(7);
+    close(ready[1]);
+    int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0 ||
+        dup2(null_fd, STDOUT_FILENO) < 0 || dup2(null_fd, STDERR_FILENO) < 0) {
+      _exit(7);
+    }
+    close(null_fd);
+    sleep_ms(250);
+    _exit(write_file("/background-survived", "bad\n"));
+  }
+  close(ready[1]);
+  char moved = 0;
+  ssize_t n;
+  do {
+    n = read(ready[0], &moved, 1);
+  } while (n < 0 && errno == EINTR);
+  close(ready[0]);
+  if (n != 1 || moved != '1') {
+    (void)waitpid(pid, NULL, 0);
+    return 7;
+  }
+  write_str(1, "spawn-background\n");
+  return 0;
+}
+
+static int verify_background_reaped(void) {
+  sleep_ms(500);
+  if (!path_absent("/background-survived")) {
+    write_str(2, "build-smoke-sh: background RUN descendant survived\n");
+    return 7;
+  }
+  write_str(1, "verify-background-reaped\n");
+  return 0;
 }
 
 static int file_content_is(const char *path, const char *expected) {
@@ -233,6 +304,12 @@ int main(int argc, char **argv) {
   if (strcmp(cmd, "resize2fs /dev/vda") == 0) {
     write_str(1, "resize2fs\n");
     return 0;
+  }
+  if (strcmp(cmd, "spawn-background") == 0) {
+    return spawn_background_writer();
+  }
+  if (strcmp(cmd, "verify-background-reaped") == 0) {
+    return verify_background_reaped();
   }
   if (strcmp(cmd, "step1") == 0) {
     write_str(1, "step1\n");

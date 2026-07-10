@@ -76,6 +76,7 @@
 #define MAX_BUILD_RUN_COMMAND_LEN 65536ULL
 #define MAX_BUILD_CONTEXT_COPY_ENTRIES 65536ULL
 #define BUILD_CONTEXT_ROOT "/mnt/build-context"
+#define SPORE_PF_KTHREAD 0x00200000UL
 #ifndef FIFREEZE
 #define FIFREEZE _IOWR('X', 119, int)
 #endif
@@ -121,6 +122,7 @@ static int64_t t_request_decode = 0;
 static int64_t t_command_start = 0;
 static int64_t t_command_exit = 0;
 static int sigchld_pipe[2] = { -1, -1 };
+static int proc_dir_fd = -1;
 static const uint64_t memory_high_step_bytes = 1073741824ULL;
 static const char memory_high_limit[] = "268435456\n";
 
@@ -140,7 +142,8 @@ struct session {
   int started;
   int exited;
   int memory_pressure_fd;
-  char memory_cgroup_path[128];
+  int build_run_isolation;
+  char cgroup_path[128];
   char session_id[64];
   pid_t pid;
   int stdout_fd;
@@ -1080,37 +1083,39 @@ static int cgroup_child_path(char *out, size_t out_len, const char *dir, const c
   return (n > 0 && (size_t)n < out_len) ? 0 : -1;
 }
 
-static void close_memory_pressure(struct session *session) {
+static void close_session_cgroup(struct session *session) {
   if (session->memory_pressure_fd >= 0) {
     close(session->memory_pressure_fd);
     session->memory_pressure_fd = -1;
   }
-  if (session->memory_cgroup_path[0] != '\0') {
-    if (rmdir(session->memory_cgroup_path) == 0 || errno == ENOENT) {
-      session->memory_cgroup_path[0] = '\0';
+  if (session->cgroup_path[0] != '\0') {
+    if (rmdir(session->cgroup_path) == 0 || errno == ENOENT) {
+      session->cgroup_path[0] = '\0';
     }
   }
 }
 
-static int memory_pressure_setup_error(const char *step) {
-  dprintf(2, "memory pressure setup failed: %s errno=%d\n", step, errno);
+static int session_cgroup_setup_error(const char *step) {
+  dprintf(2, "session cgroup setup failed: %s errno=%d\n", step, errno);
   return -1;
 }
 
-static int setup_memory_pressure(struct session *session, pid_t pid) {
-  if (write_text_file("/sys/fs/cgroup/cgroup.subtree_control", "+memory\n") != 0) return memory_pressure_setup_error("enable memory controller");
-  int n = snprintf(session->memory_cgroup_path, sizeof(session->memory_cgroup_path), "/sys/fs/cgroup/spore-run-%ld", (long)pid);
-  if (n <= 0 || (size_t)n >= sizeof(session->memory_cgroup_path)) return memory_pressure_setup_error("format cgroup path");
-  if (mkdir(session->memory_cgroup_path, 0755) != 0) return memory_pressure_setup_error("create cgroup");
+static int setup_session_cgroup(struct session *session, pid_t pid, int memory_pressure) {
+  if (memory_pressure && write_text_file("/sys/fs/cgroup/cgroup.subtree_control", "+memory\n") != 0) return session_cgroup_setup_error("enable memory controller");
+  int n = snprintf(session->cgroup_path, sizeof(session->cgroup_path), "/sys/fs/cgroup/spore-run-%ld", (long)pid);
+  if (n <= 0 || (size_t)n >= sizeof(session->cgroup_path)) return session_cgroup_setup_error("format cgroup path");
+  if (mkdir(session->cgroup_path, 0755) != 0) return session_cgroup_setup_error("create cgroup");
 
   char path[192];
-  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "memory.high") != 0 ||
-      write_text_file(path, memory_high_limit) != 0) return memory_pressure_setup_error("set high limit");
-  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "cgroup.procs") != 0 ||
-      write_pid_file(path, pid) != 0) return memory_pressure_setup_error("move process");
-  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "memory.events") != 0) return memory_pressure_setup_error("format events path");
+  if (memory_pressure &&
+      (cgroup_child_path(path, sizeof(path), session->cgroup_path, "memory.high") != 0 ||
+       write_text_file(path, memory_high_limit) != 0)) return session_cgroup_setup_error("set high limit");
+  if (cgroup_child_path(path, sizeof(path), session->cgroup_path, "cgroup.procs") != 0 ||
+      write_pid_file(path, pid) != 0) return session_cgroup_setup_error("move process");
+  if (!memory_pressure) return 0;
+  if (cgroup_child_path(path, sizeof(path), session->cgroup_path, "memory.events") != 0) return session_cgroup_setup_error("format events path");
   session->memory_pressure_fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-  if (session->memory_pressure_fd < 0) return memory_pressure_setup_error("open events");
+  if (session->memory_pressure_fd < 0) return session_cgroup_setup_error("open events");
   char buf[256];
   (void)read(session->memory_pressure_fd, buf, sizeof(buf));
   return 0;
@@ -1125,11 +1130,11 @@ static void drain_memory_pressure_events(struct session *session) {
 static int rearm_memory_pressure_limit(struct session *session) {
   char path[192];
   uint64_t current = 0;
-  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "memory.current") != 0 ||
+  if (cgroup_child_path(path, sizeof(path), session->cgroup_path, "memory.current") != 0 ||
       read_u64_file(path, &current) != 0) return -1;
   uint64_t next = current + memory_high_step_bytes;
   if (next < current) return -1;
-  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "memory.high") != 0) return -1;
+  if (cgroup_child_path(path, sizeof(path), session->cgroup_path, "memory.high") != 0) return -1;
   char limit[32];
   int n = snprintf(limit, sizeof(limit), "%llu\n", (unsigned long long)next);
   if (n <= 0 || (size_t)n >= sizeof(limit)) return -1;
@@ -2798,7 +2803,7 @@ static void execve_or_report(char *const argv[], char *const envp[], int use_roo
 }
 
 static void pin_to_current_cpu(pid_t pid);
-static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio, int memory_pressure, int stdin_enabled, int tty, uint16_t terminal_rows, uint16_t terminal_cols) {
+static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio, int memory_pressure, int build_run_isolation, int stdin_enabled, int tty, uint16_t terminal_rows, uint16_t terminal_cols) {
   t_command_start = now_ms();
   int stdin_pipe[2] = { -1, -1 };
   int stdout_pipe[2] = { -1, -1 };
@@ -2965,7 +2970,8 @@ static int start_session(struct session *session, const char *session_id, char *
 
   memset(session, 0, sizeof(*session));
   session->memory_pressure_fd = -1;
-  if ((memory_pressure && setup_memory_pressure(session, pid) != 0) || write_all(start_pipe[1], "\1", 1) != 0) {
+  session->build_run_isolation = build_run_isolation;
+  if (((memory_pressure || build_run_isolation) && setup_session_cgroup(session, pid, memory_pressure) != 0) || write_all(start_pipe[1], "\1", 1) != 0) {
     close(start_pipe[1]);
     close(ready_pipe[0]);
     (void)kill(pid, SIGKILL);
@@ -2976,7 +2982,7 @@ static int start_session(struct session *session, const char *session_id, char *
     if (pty_master >= 0) close(pty_master);
     if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
     if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
-    close_memory_pressure(session);
+    close_session_cgroup(session);
     t_command_exit = now_ms();
     return 127;
   }
@@ -2996,7 +3002,7 @@ static int start_session(struct session *session, const char *session_id, char *
     if (pty_master >= 0) close(pty_master);
     if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
     if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
-    close_memory_pressure(session);
+    close_session_cgroup(session);
     t_command_exit = now_ms();
     return 127;
   }
@@ -3021,6 +3027,149 @@ static void wait_child_blocking(pid_t pid) {
   int status = 0;
   while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
   }
+}
+
+static int session_cgroup_populated(struct session *session) {
+  char path[192];
+  if (cgroup_child_path(path, sizeof(path), session->cgroup_path, "cgroup.procs") != 0) return -1;
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  char byte = 0;
+  ssize_t n;
+  do {
+    n = read(fd, &byte, 1);
+  } while (n < 0 && errno == EINTR);
+  close(fd);
+  if (n < 0) return -1;
+  return n == 0 ? 0 : 1;
+}
+
+static void reap_exited_children(void) {
+  for (;;) {
+    int status = 0;
+    pid_t rc = waitpid(-1, &status, WNOHANG);
+    if (rc > 0) continue;
+    if (rc < 0 && errno == EINTR) continue;
+    return;
+  }
+}
+
+static int parse_proc_stat_kernel_thread(const char *stat) {
+  const char *comm_end = strrchr(stat, ')');
+  if (comm_end == NULL) return -1;
+  char state = 0;
+  long ppid = 0;
+  long pgrp = 0;
+  long session = 0;
+  long tty_nr = 0;
+  long tpgid = 0;
+  unsigned long flags = 0;
+  if (sscanf(comm_end + 1, " %c %ld %ld %ld %ld %ld %lu", &state, &ppid, &pgrp, &session, &tty_nr, &tpgid, &flags) != 7) return -1;
+  return (flags & SPORE_PF_KTHREAD) != 0;
+}
+
+static int process_is_kernel_thread(const char *pid_name) {
+  char path[64];
+  int path_len = snprintf(path, sizeof(path), "%s/stat", pid_name);
+  if (path_len <= 0 || (size_t)path_len >= sizeof(path)) return -1;
+  int fd = openat(proc_dir_fd, path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) return errno == ENOENT ? 1 : -1;
+  char stat[4096];
+  ssize_t n;
+  do {
+    n = read(fd, stat, sizeof(stat) - 1);
+  } while (n < 0 && errno == EINTR);
+  close(fd);
+  if (n <= 0) return -1;
+  stat[n] = '\0';
+  return parse_proc_stat_kernel_thread(stat);
+}
+
+static int kill_other_userspace_processes(void) {
+  if (proc_dir_fd < 0) return -1;
+  int scan_fd = openat(proc_dir_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (scan_fd < 0) return -1;
+  DIR *proc = fdopendir(scan_fd);
+  if (proc == NULL) {
+    close(scan_fd);
+    return -1;
+  }
+  pid_t self = getpid();
+  int found = 0;
+  struct dirent *entry;
+  while ((entry = readdir(proc)) != NULL) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(entry->d_name, &end, 10);
+    if (errno != 0 || end == entry->d_name || *end != '\0' || value <= 0 || value > INT32_MAX) continue;
+    pid_t pid = (pid_t)value;
+    if (pid == self) continue;
+    int is_kernel_thread = process_is_kernel_thread(entry->d_name);
+    if (is_kernel_thread != 0) {
+      if (is_kernel_thread > 0) continue;
+      closedir(proc);
+      return -1;
+    }
+    found = 1;
+    if (kill(pid, SIGKILL) != 0 && errno != ESRCH) {
+      closedir(proc);
+      return -1;
+    }
+  }
+  closedir(proc);
+  return found;
+}
+
+static int clean_build_run_processes(struct session *session) {
+  if (session->cgroup_path[0] == '\0') return -1;
+
+  char path[192];
+  if (cgroup_child_path(path, sizeof(path), session->cgroup_path, "cgroup.kill") != 0 ||
+      write_text_file(path, "1\n") != 0) {
+    dprintf(2, "build RUN cleanup failed: kill cgroup errno=%d\n", errno);
+    return -1;
+  }
+
+  int64_t deadline = now_ms() + 5000;
+  for (;;) {
+    int populated = session_cgroup_populated(session);
+    if (populated == 0) break;
+    if (populated < 0) {
+      dprintf(2, "build RUN cleanup failed: read cgroup processes errno=%d\n", errno);
+      return -1;
+    }
+    if (now_ms() >= deadline) {
+      dprintf(2, "build RUN cleanup failed: cgroup remained populated\n");
+      return -1;
+    }
+    usleep(1000);
+  }
+
+  if (!session->exited) {
+    wait_child_blocking(session->pid);
+    session->exited = 1;
+  }
+  for (;;) {
+    reap_exited_children();
+    int found = kill_other_userspace_processes();
+    if (found == 0) break;
+    if (found < 0) {
+      dprintf(2, "build RUN cleanup failed: scan guest processes errno=%d\n", errno);
+      return -1;
+    }
+    if (now_ms() >= deadline) {
+      dprintf(2, "build RUN cleanup failed: guest processes remained alive\n");
+      return -1;
+    }
+    usleep(1000);
+  }
+  reap_exited_children();
+  if (rmdir(session->cgroup_path) != 0 && errno != ENOENT) {
+    dprintf(2, "build RUN cleanup failed: remove cgroup errno=%d\n", errno);
+    return -1;
+  }
+  session->cgroup_path[0] = '\0';
+  return 0;
 }
 
 static void pin_to_current_cpu(pid_t pid) {
@@ -3155,7 +3304,7 @@ static int session_finished(const struct session *session) {
 }
 
 static void reset_session(struct session *session) {
-  close_memory_pressure(session);
+  close_session_cgroup(session);
   if (session->stdout_fd >= 0) close(session->stdout_fd);
   if (session->stderr_fd >= 0) close(session->stderr_fd);
   if (session->stdin_fd >= 0) close(session->stdin_fd);
@@ -3521,7 +3670,7 @@ static void poll_session_exit(struct session *session, struct client *client) {
       session->stderr_open = 0;
     }
   }
-  close_memory_pressure(session);
+  if (!session->build_run_isolation) close_session_cgroup(session);
 }
 
 static void maybe_send_session_exit(struct session *session, struct client *client) {
@@ -3564,7 +3713,7 @@ static void run_transient_exec(struct client *client, const struct run_request *
   }
 
   struct session transient;
-  int rc = start_session(&transient, request->session_id, request->argv, request->envp, request->working_dir, use_rootfs, 0, 0, 0, 0, request->terminal_rows, request->terminal_cols);
+  int rc = start_session(&transient, request->session_id, request->argv, request->envp, request->working_dir, use_rootfs, 0, 0, 0, 0, 0, request->terminal_rows, request->terminal_cols);
   if (rc != 0) {
     (void)send_client_error_exit(client, rc, "spore run: exec setup failed\n");
     close_client(client);
@@ -3624,16 +3773,17 @@ static void run_build_exec(struct client *client, const struct run_request *requ
   argv[3] = NULL;
 
   struct session transient;
-  int rc = start_session(&transient, request->session_id, argv, request->envp, request->working_dir, use_rootfs, 0, 0, 0, 0, request->terminal_rows, request->terminal_cols);
+  int rc = start_session(&transient, request->session_id, argv, request->envp, request->working_dir, use_rootfs, 0, 0, 1, 0, 0, request->terminal_rows, request->terminal_cols);
   if (rc != 0) {
     (void)send_client_error_exit(client, rc, "spore build: RUN exec setup failed\n");
     close_client(client);
     return;
   }
 
+  int descendants_cleaned = 0;
   while (client->fd >= 0 && (!transient.exited || transient.stdout_open || transient.stderr_open)) {
-    struct pollfd fds[3];
-    int roles[3];
+    struct pollfd fds[4];
+    int roles[4];
     nfds_t nfds = 0;
     if (transient.stdout_open) {
       fds[nfds].fd = transient.stdout_fd;
@@ -3646,6 +3796,12 @@ static void run_build_exec(struct client *client, const struct run_request *requ
       fds[nfds].events = POLLIN | POLLHUP | POLLERR;
       fds[nfds].revents = 0;
       roles[nfds++] = 2;
+    }
+    if (sigchld_pipe[0] >= 0) {
+      fds[nfds].fd = sigchld_pipe[0];
+      fds[nfds].events = POLLIN;
+      fds[nfds].revents = 0;
+      roles[nfds++] = 4;
     }
     fds[nfds].fd = client->fd;
     fds[nfds].events = POLLHUP | POLLERR;
@@ -3662,16 +3818,25 @@ static void run_build_exec(struct client *client, const struct run_request *requ
           pump_session_stream(&transient, client, 0);
         } else if (roles[i] == 3 && (fds[i].revents & (POLLHUP | POLLERR))) {
           close_client(client);
+        } else if (roles[i] == 4) {
+          drain_sigchld_wakeup();
         }
       }
     }
     poll_session_exit(&transient, client);
-    maybe_send_session_exit(&transient, client);
+    if (transient.exited && !descendants_cleaned) {
+      if (clean_build_run_processes(&transient) != 0) {
+        (void)send_client_error_exit(client, 125, "spore build: RUN descendant cleanup failed\n");
+        close_client(client);
+        break;
+      }
+      descendants_cleaned = 1;
+    }
+    if (descendants_cleaned) maybe_send_session_exit(&transient, client);
   }
 
-  if (client->fd < 0 && transient.started && !transient.exited) {
-    (void)kill(transient.pid, SIGKILL);
-    wait_child_blocking(transient.pid);
+  if (client->fd < 0 && transient.started && !descendants_cleaned) {
+    (void)clean_build_run_processes(&transient);
   }
   reset_session(&transient);
 }
@@ -3851,7 +4016,7 @@ static void accept_request(int listener, struct session *session, struct client 
       file_stdio = request.tty ? 0 : 1;
       reset_session(session);
     }
-    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs, file_stdio, request.memory_pressure, request.stdin_enabled, request.tty, request.terminal_rows, request.terminal_cols);
+    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs, file_stdio, request.memory_pressure, 0, request.stdin_enabled, request.tty, request.terminal_rows, request.terminal_cols);
     if (rc != 0) {
       (void)send_client_error_exit(client, rc, "spore run: exec setup failed\n");
       close_client(client);
@@ -3961,10 +4126,24 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   close(pipe_fds[0]);
   return rc == 0 ? SPORE_AGENT_FUZZ_RUN_COMPLETE : SPORE_AGENT_FUZZ_RUN_REQUEST;
 }
+
+__attribute__((visibility("hidden"))) int spore_agent_fuzz_proc_stat(
+    const unsigned char *stat_bytes, size_t stat_len) {
+  if (stat_len >= 4096) return -1;
+  char stat[4096];
+  memcpy(stat, stat_bytes, stat_len);
+  stat[stat_len] = '\0';
+  return parse_proc_stat_kernel_thread(stat);
+}
 #else
 int main(void) {
   t_init_start = now_ms();
   mount_proc();
+  proc_dir_fd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (proc_dir_fd < 0) {
+    dprintf(2, "open proc failed: errno=%d\n", errno);
+    return 1;
+  }
   mount_sysfs();
   mount_cgroup2_if_dir("/sys/fs/cgroup");
   prepare_dev();
