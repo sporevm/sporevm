@@ -47,7 +47,7 @@ mechanisms before both calcify — is how those goals get met with less code,
 not a separate justification. The plan deliberately breaks the on-disk and
 manifest formats to do so.
 
-> **Current state (2026-07-10): U6 is implemented in branch.** Disk-backed
+> **Current state (2026-07-10): U6 is complete.** Disk-backed
 > `spore fork --vm` now uses the live monitor/VMM quiescence boundary, one-use
 > fd claims, independently rooted child baselines, and readiness-after-adoption.
 > The maintained product smoke and native clone path pass on APFS/HVF and on a
@@ -385,7 +385,7 @@ At end state:
 
 ## Delivery Strategy
 
-All planned implementation slices have landed in branch. U6, production
+All planned implementation slices are complete. U6, production
 disk-backed named fast fork, is proven on APFS/HVF and by the maintained
 product smoke on a reflink-capable Linux/KVM host. Its platform evidence is
 complete, with no prerequisite from the remaining evidence-gated U7 follow-ups
@@ -407,7 +407,7 @@ It must not call the durable disk sealer on the fast-fork path.
 
 ### U1 — Unified index type and CAS GC
 
-Status: landed in branch.
+Status: landed.
 
 Rename/promote `rootfs-block-index-v0` to `spore-disk-index-v1` (one parser,
 shared by all consumers); implement mark-sweep `spore cache gc` over the
@@ -449,7 +449,7 @@ storage.
 
 ### U2 — Chunk-mapped runtime backend
 
-Status: landed in branch.
+Status: landed.
 
 Implement `ChunkMappedDisk`; switch normal `spore run` (currently
 `file`+`CowDisk`) to it. `layered_cow` still exists for old saves during
@@ -470,7 +470,7 @@ from `cow_disk.zig`.
 
 ### U3 — Snapshot operation and save/restore switch (format break)
 
-Status: complete in branch.
+Status: complete.
 
 Extract the shared `chunk_sealer.zig` core from `dirty_ram.zig` (RAM path
 refactored onto it, behavior-identical); implement
@@ -518,7 +518,7 @@ break.
 
 ### U4 — Identity flag-day
 
-Status: landed in branch for the existing rootfs build/import and image-save
+Status: complete for the existing rootfs build/import and image-save
 paths. The code path now uses rootfs storage index identity for build/import
 metadata, rootfs artifacts with `rootfs.storage`, by-digest flat
 materialization cache keys, and CLI/API rootfs output. `rootfs_blake3`,
@@ -557,7 +557,7 @@ image/ref resolution check that stamp plus the index instead of statting every
 object, and has GC/prune remove stamps before deleting an index or referenced
 object. The prevalidated run path also skips its duplicate completeness check.
 On an exact rebuild/import through `buildkite-sporevm/bin/buildkite-spore` with
-this branch's ReleaseSafe binary, warm
+the resulting ReleaseSafe binary, warm
 `spore run --image local/buildkite-spore:dev -- /bin/true` measured
 `real=0.10s user=0.08s sys=0.01s`.
 
@@ -597,7 +597,7 @@ maintained value.
 
 ### U5 — Memory index parity (format break, batched with U3/U4's)
 
-Status: complete in branch.
+Status: complete.
 
 Converge `MemoryManifest` onto the unified index type: the dense
 optional-ref array becomes a `spore-disk-index-v1`-shaped value (sparse
@@ -621,7 +621,7 @@ structure with two instantiations (RAM 2MiB, disk 64KiB).
 
 ### U6 — Production disk-backed fast fork
 
-Status: complete in branch; APFS/HVF and Linux/KVM product validation pass.
+Status: complete; APFS/HVF and Linux/KVM product validation pass.
 
 `ChunkMappedDisk.fork()` copies the one-level source map and clones
 an unlinked overlay fd, and its unit tests cover rejection, copy fallback,
@@ -795,7 +795,7 @@ save→rename→fork→save coverage.
    monitor, pre-open its runtime disk, and make batch rollback include
    spawned-but-not-ready children. Add HVF/KVM product smokes, nested fork,
    durable child save/restore, docs, release notes, and lineage benchmarks.
-   Keep the network guard. **Complete in branch:** lifecycle now validates and
+   Keep the network guard. **Complete:** lifecycle now validates and
    roots the source baseline before prepare, consumes the strict prepared
    batch, writes transient child claims only to runtime specs, and rolls back
    monitors that spawned but never became ready. Child monitors claim after
