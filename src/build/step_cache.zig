@@ -7,7 +7,7 @@ const spore = @import("../spore.zig");
 const rootfs_mod = @import("../rootfs.zig");
 const chunk_sealer = @import("../chunk_sealer.zig");
 
-pub const builder_version = "sporevm-build-v2";
+pub const builder_version = "sporevm-build-v3";
 const record_kind = "sporevm-build-step-v1";
 const max_step_record_bytes = 256 * 1024;
 
@@ -21,15 +21,66 @@ pub const GcRecordInspection = union(enum) {
     unknown,
 };
 
+pub const NetworkMode = enum {
+    spore,
+    none,
+};
+
+pub const ArgInput = struct {
+    key: []const u8,
+    value: ?[]const u8,
+};
+
 pub const StepInput = struct {
     platform: rootfs_mod.Platform,
     parent_index_digest: []const u8,
-    instruction_kind: []const u8,
     canonical_instruction: []const u8,
     disk_grow_target: u64 = 0,
-    input_digest: []const u8 = "",
-    env_digest: []const u8 = "",
-    workdir: []const u8 = "/",
+    operation: Operation,
+
+    pub const Operation = union(enum) {
+        run: Run,
+        copy: Copy,
+    };
+
+    pub const Run = struct {
+        env_digest: []const u8 = "",
+        workdir: []const u8 = "/",
+        network_mode: NetworkMode,
+    };
+
+    pub const Copy = struct {
+        input_digest: []const u8,
+        env_digest: []const u8 = "",
+        workdir: []const u8 = "/",
+    };
+
+    const FlatFields = struct {
+        instruction_kind: []const u8,
+        input_digest: []const u8,
+        env_digest: []const u8,
+        workdir: []const u8,
+        network_mode: ?NetworkMode,
+    };
+
+    fn flatFields(self: StepInput) FlatFields {
+        return switch (self.operation) {
+            .run => |run| .{
+                .instruction_kind = "RUN",
+                .input_digest = "",
+                .env_digest = run.env_digest,
+                .workdir = run.workdir,
+                .network_mode = run.network_mode,
+            },
+            .copy => |copy| .{
+                .instruction_kind = "COPY",
+                .input_digest = copy.input_digest,
+                .env_digest = copy.env_digest,
+                .workdir = copy.workdir,
+                .network_mode = null,
+            },
+        };
+    }
 };
 
 pub const StepRecord = struct {
@@ -46,10 +97,12 @@ pub const StepRecord = struct {
     input_digest: []const u8 = "",
     env_digest: []const u8 = "",
     workdir: []const u8 = "/",
+    network_mode: ?NetworkMode = null,
     created_unix: i64 = 0,
 };
 
 pub fn stepKey(allocator: std.mem.Allocator, input: StepInput) ![]const u8 {
+    const fields = input.flatFields();
     var h = Blake3.init(.{});
     h.update(builder_version);
     h.update("\n");
@@ -59,7 +112,7 @@ pub fn stepKey(allocator: std.mem.Allocator, input: StepInput) ![]const u8 {
     h.update("\n");
     h.update(input.parent_index_digest);
     h.update("\n");
-    h.update(input.instruction_kind);
+    h.update(fields.instruction_kind);
     h.update("\n");
     h.update(input.canonical_instruction);
     if (input.disk_grow_target != 0) {
@@ -69,25 +122,30 @@ pub fn stepKey(allocator: std.mem.Allocator, input: StepInput) ![]const u8 {
         h.update(&grow_buf);
     }
     h.update("\n");
-    h.update(input.input_digest);
+    h.update(fields.input_digest);
     h.update("\n");
-    h.update(input.env_digest);
+    h.update(fields.env_digest);
     h.update("\n");
-    h.update(input.workdir);
+    h.update(fields.workdir);
+    h.update("\n");
+    if (fields.network_mode) |mode| h.update(@tagName(mode));
     return finishHex(allocator, &h);
 }
 
-pub fn envDigest(allocator: std.mem.Allocator, env: []const []const u8, args: []const []const u8) ![]const u8 {
-    const total = env.len + args.len;
-    const entries = try allocator.alloc([]const u8, total);
-    defer allocator.free(entries);
-    for (env, 0..) |entry, i| entries[i] = entry;
-    for (args, 0..) |entry, i| entries[env.len + i] = entry;
-    std.mem.sort([]const u8, entries, {}, stringLessThan);
+pub fn envDigest(allocator: std.mem.Allocator, env: []const []const u8, args: []const ArgInput) ![]const u8 {
     var h = Blake3.init(.{});
-    for (entries) |entry| {
-        h.update(entry);
-        h.update("\n");
+    hashField(&h, "sporevm-build-env-v2");
+    hashCount(&h, env.len);
+    for (env) |entry| hashField(&h, entry);
+    hashCount(&h, args.len);
+    for (args) |arg| {
+        hashField(&h, arg.key);
+        if (arg.value) |value| {
+            h.update("\x01");
+            hashField(&h, value);
+        } else {
+            h.update("\x00");
+        }
     }
     return finishDigest(allocator, &h);
 }
@@ -106,6 +164,7 @@ pub fn writeRecord(
     step_key: []const u8,
     child_storage: spore.RootfsStorage,
 ) ![]const u8 {
+    const fields = input.flatFields();
     try spore.validateRootfsStorageDescriptor(child_storage);
     if (!std.mem.eql(u8, child_storage.index_digest, child_storage.base_identity)) return error.BadManifest;
     if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, child_storage)) return error.RootFSDigestCacheMiss;
@@ -123,12 +182,13 @@ pub fn writeRecord(
         .parent_index_digest = input.parent_index_digest,
         .child_index_digest = child_storage.index_digest,
         .rootfs_storage = child_storage,
-        .instruction_kind = input.instruction_kind,
+        .instruction_kind = fields.instruction_kind,
         .instruction = input.canonical_instruction,
         .disk_grow_target = input.disk_grow_target,
-        .input_digest = input.input_digest,
-        .env_digest = input.env_digest,
-        .workdir = input.workdir,
+        .input_digest = fields.input_digest,
+        .env_digest = fields.env_digest,
+        .workdir = fields.workdir,
+        .network_mode = fields.network_mode,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, record, .{
         .whitespace = .indent_2,
@@ -145,6 +205,7 @@ pub fn readHit(
     input: StepInput,
     expected_key: []const u8,
 ) !?spore.RootfsStorage {
+    const fields = input.flatFields();
     const path = try recordPath(allocator, cache_root, expected_key);
     defer allocator.free(path);
     const bytes = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_step_record_bytes)) catch |err| switch (err) {
@@ -162,12 +223,13 @@ pub fn readHit(
     if (!std.mem.eql(u8, record.builder_version, builder_version)) return null;
     if (!std.mem.eql(u8, record.platform.os, input.platform.os) or !std.mem.eql(u8, record.platform.arch, input.platform.arch)) return null;
     if (!std.mem.eql(u8, record.parent_index_digest, input.parent_index_digest)) return null;
-    if (!std.mem.eql(u8, record.instruction_kind, input.instruction_kind)) return null;
+    if (!std.mem.eql(u8, record.instruction_kind, fields.instruction_kind)) return null;
     if (!std.mem.eql(u8, record.instruction, input.canonical_instruction)) return null;
     if (record.disk_grow_target != input.disk_grow_target) return null;
-    if (!std.mem.eql(u8, record.input_digest, input.input_digest)) return null;
-    if (!std.mem.eql(u8, record.env_digest, input.env_digest)) return null;
-    if (!std.mem.eql(u8, record.workdir, input.workdir)) return null;
+    if (!std.mem.eql(u8, record.input_digest, fields.input_digest)) return null;
+    if (!std.mem.eql(u8, record.env_digest, fields.env_digest)) return null;
+    if (!std.mem.eql(u8, record.workdir, fields.workdir)) return null;
+    if (record.network_mode != fields.network_mode) return null;
     if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, storage)) return null;
     return try spore.cloneRootfsStorage(allocator, storage);
 }
@@ -232,8 +294,17 @@ fn finishDigest(allocator: std.mem.Allocator, h: *Blake3) ![]const u8 {
     return std.fmt.allocPrint(allocator, "blake3:{s}", .{&hex});
 }
 
-fn stringLessThan(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.lessThan(u8, a, b);
+fn hashField(h: *Blake3, bytes: []const u8) void {
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, bytes.len, .little);
+    h.update(&len_buf);
+    h.update(bytes);
+}
+
+fn hashCount(h: *Blake3, count: usize) void {
+    var count_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &count_buf, count, .little);
+    h.update(&count_buf);
 }
 
 test "step key changes with parent index" {
@@ -241,15 +312,15 @@ test "step key changes with parent index" {
     const a = try stepKey(allocator, .{
         .platform = .{},
         .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .instruction_kind = "RUN",
         .canonical_instruction = "RUN true",
+        .operation = .{ .run = .{ .network_mode = .spore } },
     });
     defer allocator.free(a);
     const b = try stepKey(allocator, .{
         .platform = .{},
         .parent_index_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        .instruction_kind = "RUN",
         .canonical_instruction = "RUN true",
+        .operation = .{ .run = .{ .network_mode = .spore } },
     });
     defer allocator.free(b);
     try std.testing.expect(!std.mem.eql(u8, a, b));
@@ -260,17 +331,50 @@ test "step key changes with disk grow target" {
     const normal = try stepKey(allocator, .{
         .platform = .{},
         .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .instruction_kind = "RUN",
         .canonical_instruction = "RUN true",
+        .operation = .{ .run = .{ .network_mode = .spore } },
     });
     defer allocator.free(normal);
     const grown = try stepKey(allocator, .{
         .platform = .{},
         .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .instruction_kind = "RUN",
         .canonical_instruction = "RUN true",
         .disk_grow_target = 9 * 1024 * 1024 * 1024,
+        .operation = .{ .run = .{ .network_mode = .spore } },
     });
     defer allocator.free(grown);
     try std.testing.expect(!std.mem.eql(u8, normal, grown));
+}
+
+test "environment digest distinguishes unset and empty ARG values" {
+    const allocator = std.testing.allocator;
+    const unset = try envDigest(allocator, &.{}, &.{.{ .key = "MODE", .value = null }});
+    defer allocator.free(unset);
+    const empty = try envDigest(allocator, &.{}, &.{.{ .key = "MODE", .value = "" }});
+    defer allocator.free(empty);
+    try std.testing.expect(!std.mem.eql(u8, unset, empty));
+}
+
+test "environment digest distinguishes ENV and ARG state" {
+    const allocator = std.testing.allocator;
+    const env_wins = try envDigest(allocator, &.{"MODE=env"}, &.{.{ .key = "MODE", .value = "arg" }});
+    defer allocator.free(env_wins);
+    const arg_wins = try envDigest(allocator, &.{"MODE=arg"}, &.{.{ .key = "MODE", .value = "env" }});
+    defer allocator.free(arg_wins);
+    try std.testing.expect(!std.mem.eql(u8, env_wins, arg_wins));
+}
+
+test "environment digest frames entries and preserves order" {
+    const allocator = std.testing.allocator;
+    const embedded = try envDigest(allocator, &.{"A=one\nB=two"}, &.{});
+    defer allocator.free(embedded);
+    const separate = try envDigest(allocator, &.{ "A=one", "B=two" }, &.{});
+    defer allocator.free(separate);
+    try std.testing.expect(!std.mem.eql(u8, embedded, separate));
+
+    const forward = try envDigest(allocator, &.{ "MODE=first", "MODE=second" }, &.{});
+    defer allocator.free(forward);
+    const reverse = try envDigest(allocator, &.{ "MODE=second", "MODE=first" }, &.{});
+    defer allocator.free(reverse);
+    try std.testing.expect(!std.mem.eql(u8, forward, reverse));
 }

@@ -21,10 +21,7 @@ pub const BuildArg = struct {
     value: []const u8,
 };
 
-pub const NetworkMode = enum {
-    spore,
-    none,
-};
+pub const NetworkMode = step_cache.NetworkMode;
 
 pub const Options = struct {
     tag: []const u8,
@@ -70,10 +67,7 @@ const State = struct {
     cmd: ?[]const []const u8 = null,
 };
 
-const ArgValue = struct {
-    key: []const u8,
-    value: ?[]const u8,
-};
+const ArgValue = step_cache.ArgInput;
 
 const CachedMetadata = struct {
     config: rootfs_mod.ImageConfig = .{},
@@ -321,7 +315,7 @@ fn executeFromMiss(
     for (instructions) |instruction| {
         if (try applyMetadataInstruction(allocator, options, pre_from_args, &state, instruction)) continue;
         switch (instruction.value) {
-            .run => |run| try steps.append(.{ .run = try runStep(allocator, diagnostic, state, instruction, run) }),
+            .run => |run| try steps.append(.{ .run = try runStep(allocator, diagnostic, state, instruction, run, options.network) }),
             .copy => |copy| try steps.append(.{ .copy = try copyStep(allocator, init.io, ctx, stat_cache, &context_disk, diagnostic, state, instruction, copy) }),
             .from => return error.UnsupportedMultiStageDockerfile,
             else => unreachable,
@@ -335,7 +329,6 @@ fn executeFromMiss(
         .cache_root = cache_root,
         .base_storage = state.storage,
         .steps = steps.items,
-        .network_enabled = options.network == .spore,
         .disk_grow_target = try buildDiskGrowTarget(options, state.storage),
         .context_disk_path = context_disk_path,
         .output = options.output,
@@ -350,6 +343,7 @@ fn runStep(
     state: State,
     instruction: dockerfile.Instruction,
     run: dockerfile.Run,
+    network_mode: NetworkMode,
 ) !build_exec.RunStep {
     if (run.shell.len > build_exec.max_run_command_len) {
         diagnostic.instruction_line = instruction.line;
@@ -364,6 +358,7 @@ fn runStep(
         .env = try runEnvironment(allocator, state),
         .env_digest = try effectiveEnvDigest(allocator, state),
         .workdir = state.workdir,
+        .network_mode = network_mode,
     };
 }
 
@@ -507,15 +502,25 @@ fn execStepInput(
     disk_grow_target: u64,
 ) !step_cache.StepInput {
     const env_digest = try effectiveEnvDigest(allocator, state);
+    const operation: step_cache.StepInput.Operation = switch (instruction.value) {
+        .run => .{ .run = .{
+            .env_digest = env_digest,
+            .workdir = state.workdir,
+            .network_mode = options.network,
+        } },
+        .copy => .{ .copy = .{
+            .input_digest = input_digest,
+            .env_digest = env_digest,
+            .workdir = state.workdir,
+        } },
+        else => unreachable,
+    };
     return .{
         .platform = options.platform,
         .parent_index_digest = state.storage.index_digest,
-        .instruction_kind = instructionKind(instruction),
         .canonical_instruction = instruction.raw,
         .disk_grow_target = disk_grow_target,
-        .input_digest = input_digest,
-        .env_digest = env_digest,
-        .workdir = state.workdir,
+        .operation = operation,
     };
 }
 
@@ -537,12 +542,7 @@ fn buildDiskGrowTarget(options: Options, storage: spore.RootfsStorage) !u64 {
 }
 
 fn effectiveEnvDigest(allocator: std.mem.Allocator, state: State) ![]const u8 {
-    var arg_entries = std.array_list.Managed([]const u8).init(allocator);
-    for (state.args.items) |arg| {
-        const value = arg.value orelse "";
-        try arg_entries.append(try std.fmt.allocPrint(allocator, "{s}={s}", .{ arg.key, value }));
-    }
-    return step_cache.envDigest(allocator, state.env.items, arg_entries.items);
+    return step_cache.envDigest(allocator, state.env.items, state.args.items);
 }
 
 fn runEnvironment(allocator: std.mem.Allocator, state: State) ![]const []const u8 {
@@ -808,10 +808,54 @@ test "RUN executor preserves shell text for guest expansion" {
         .storage = testStorage(),
         .env = env,
         .args = args,
-    }, instruction, instruction.value.run);
+    }, instruction, instruction.value.run, .spore);
     try std.testing.expectEqualStrings(shell, step.command);
     try std.testing.expectEqualStrings("APP_ENV=test", step.env[0]);
     try std.testing.expectEqualStrings("BUILD_ARG=from-arg", step.env[1]);
+}
+
+test "RUN cache identity includes network mode and matches executor" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: dockerfile.Diagnostic = .{};
+    const doc = try dockerfile.parse(arena,
+        \\FROM base
+        \\RUN fetch-dependency
+        \\
+    , &diag);
+    const instruction = doc.instructions[1];
+    const state = State{
+        .storage = testStorage(),
+        .env = std.array_list.Managed([]const u8).init(arena),
+        .args = std.array_list.Managed(ArgValue).init(arena),
+    };
+    const spore_options = Options{
+        .tag = "local/app:dev",
+        .context_dir = "unused",
+        .dockerfile_path = "unused",
+        .network = .spore,
+    };
+    var none_options = spore_options;
+    none_options.network = .none;
+    var diagnostic: Diagnostic = .{};
+    const step = try runStep(arena, &diagnostic, state, instruction, instruction.value.run, .spore);
+    const grow_target = try buildDiskGrowTarget(spore_options, state.storage);
+
+    const spore_read = try execStepInput(arena, spore_options, state, instruction, "", grow_target);
+    const spore_write = build_exec.cacheInputForStep(spore_options.platform, state.storage.index_digest, .{ .run = step }, grow_target);
+    const spore_read_key = try step_cache.stepKey(arena, spore_read);
+    const spore_write_key = try step_cache.stepKey(arena, spore_write);
+    try std.testing.expectEqualStrings(spore_read_key, spore_write_key);
+
+    const none_read = try execStepInput(arena, none_options, state, instruction, "", grow_target);
+    var none_step = step;
+    none_step.network_mode = .none;
+    const none_write = build_exec.cacheInputForStep(none_options.platform, state.storage.index_digest, .{ .run = none_step }, grow_target);
+    const none_read_key = try step_cache.stepKey(arena, none_read);
+    const none_write_key = try step_cache.stepKey(arena, none_write);
+    try std.testing.expectEqualStrings(none_read_key, none_write_key);
+    try std.testing.expect(!std.mem.eql(u8, spore_read_key, none_read_key));
 }
 
 test "COPY executor step key matches cached read key" {
@@ -852,16 +896,24 @@ test "COPY executor step key matches cached read key" {
     const read_input = try execStepInput(arena, options, state, instruction, input_digest, grow_target);
     const read_key = try step_cache.stepKey(arena, read_input);
     const env_digest = try effectiveEnvDigest(arena, state);
-    const write_input = build_exec.cacheInputForStep(options.platform, storage.index_digest, .{ .copy = .{
+    const copy_step = build_exec.Step{ .copy = .{
         .canonical_instruction = instruction.raw,
         .input_digest = input_digest,
         .env_digest = env_digest,
         .workdir = state.workdir,
         .requests = &.{},
-    } }, grow_target);
+    } };
+    const write_input = build_exec.cacheInputForStep(options.platform, storage.index_digest, copy_step, grow_target);
     const write_key = try step_cache.stepKey(arena, write_input);
     try std.testing.expectEqual(grow_target, write_input.disk_grow_target);
     try std.testing.expectEqualStrings(read_key, write_key);
+
+    var none_options = options;
+    none_options.network = .none;
+    const none_read_input = try execStepInput(arena, none_options, state, instruction, input_digest, grow_target);
+    const none_write_input = build_exec.cacheInputForStep(none_options.platform, storage.index_digest, copy_step, grow_target);
+    try std.testing.expectEqualStrings(read_key, try step_cache.stepKey(arena, none_read_input));
+    try std.testing.expectEqualStrings(write_key, try step_cache.stepKey(arena, none_write_input));
 }
 
 test "build disk grow target uses deterministic sparse policy" {
@@ -1122,7 +1174,6 @@ test "fully cached build publishes final indexed image" {
     const run_input = step_cache.StepInput{
         .platform = .{},
         .parent_index_digest = base_storage.index_digest,
-        .instruction_kind = "RUN",
         .canonical_instruction = "RUN echo cached",
         .disk_grow_target = try buildDiskGrowTarget(.{
             .tag = "local/app:dev",
@@ -1130,8 +1181,11 @@ test "fully cached build publishes final indexed image" {
             .dockerfile_path = dockerfile_path,
             .platform = .{},
         }, base_storage),
-        .env_digest = env_digest,
-        .workdir = "/",
+        .operation = .{ .run = .{
+            .env_digest = env_digest,
+            .workdir = "/",
+            .network_mode = .spore,
+        } },
     };
     const run_key = try step_cache.stepKey(arena, run_input);
     _ = try step_cache.writeRecord(io, arena, cache_root, run_input, run_key, child_storage);

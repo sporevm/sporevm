@@ -2250,8 +2250,8 @@ test "system cache gc preserves storage rooted only by a build step record" {
     const input = build_step_cache.StepInput{
         .platform = .{},
         .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .instruction_kind = "RUN",
         .canonical_instruction = "RUN true",
+        .operation = .{ .run = .{ .network_mode = .spore } },
     };
     const key = try build_step_cache.stepKey(allocator, input);
     _ = try build_step_cache.writeRecord(io, allocator, root, input, key, rooted.storage);
@@ -2292,8 +2292,8 @@ test "system cache gc ignores known build records with incomplete storage" {
     const input = build_step_cache.StepInput{
         .platform = .{},
         .parent_index_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        .instruction_kind = "RUN",
         .canonical_instruction = "RUN false",
+        .operation = .{ .run = .{ .network_mode = .spore } },
     };
     const key = try build_step_cache.stepKey(allocator, input);
     _ = try build_step_cache.writeRecord(io, allocator, root, input, key, stale.storage);
