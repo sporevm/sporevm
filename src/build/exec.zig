@@ -5,6 +5,7 @@ const Io = std.Io;
 const rootfs_cas = @import("../rootfs_cas.zig");
 const rootfs_mod = @import("../rootfs.zig");
 const run_mod = @import("../run.zig");
+const runtime_disk = @import("../runtime_disk.zig");
 const spore = @import("../spore.zig");
 const step_cache = @import("step_cache.zig");
 const vsock = @import("../virtio/vsock.zig");
@@ -384,8 +385,8 @@ const BuildControl = struct {
     fn startSimpleControl(self: *BuildControl, dev: *vsock.Vsock, kind: ActiveStream) !void {
         const session_id = try checkpointSessionId(self.allocator, kind, self.step_index);
         const request = switch (kind) {
-            .freeze => try simpleRequest(self.allocator, "fsfreeze-v1", session_id),
-            .thaw => try simpleRequest(self.allocator, "fsthaw-v1", session_id),
+            .freeze => try run_mod.simpleControlRequest(self.allocator, "fsfreeze-v1", session_id),
+            .thaw => try run_mod.simpleControlRequest(self.allocator, "fsthaw-v1", session_id),
             .resize, .run, .copy, .workdir => unreachable,
         };
         try self.startStream(dev, request, .spore_stream_v1, kind, "");
@@ -516,7 +517,7 @@ const BuildControl = struct {
     fn completeRootfsSnapshot(self: *BuildControl, maybe_disk: ?spore.Disk) !void {
         if (self.phase != .snapshot) return;
         const disk = maybe_disk orelse return error.BadManifest;
-        const storage = try storageFromDisk(self.allocator, disk);
+        const storage = try runtime_disk.storageFromSnapshotDisk(self.allocator, disk);
         // A zero-dirty RUN/COPY/WORKDIR can intentionally yield child digest ==
         // parent digest; the step key still proves which instruction inputs ran.
         try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, storage.index_digest);
@@ -680,20 +681,6 @@ fn validateCopyRequest(request: CopyRequest) !void {
     if (request.entry_count == 0 or request.entry_count > max_copy_entries) return error.CopyEntryCountUnsupported;
 }
 
-fn simpleRequest(allocator: std.mem.Allocator, request_type: []const u8, session_id: []const u8) ![]const u8 {
-    const payload = struct {
-        type: []const u8,
-        session_id: []const u8,
-    }{
-        .type = request_type,
-        .session_id = session_id,
-    };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
-    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
-}
-
 fn rootfsFromStorage(allocator: std.mem.Allocator, storage: spore.RootfsStorage) !spore.Rootfs {
     return .{
         .device = try spore.cloneRootfsDevice(allocator, storage.device),
@@ -706,26 +693,10 @@ fn rootfsFromStorage(allocator: std.mem.Allocator, storage: spore.RootfsStorage)
     };
 }
 
-fn storageFromDisk(allocator: std.mem.Allocator, disk: spore.Disk) !spore.RootfsStorage {
-    if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) return error.BadManifest;
-    if (disk.layers.len != 0) return error.BadManifest;
-    const base = try allocator.dupe(u8, disk.base);
-    return .{
-        .kind = try allocator.dupe(u8, spore.rootfs_storage_kind_chunked_ext4),
-        .device = try spore.cloneRootfsDevice(allocator, disk.device),
-        .logical_size = disk.size,
-        .chunk_size = disk.chunk_size,
-        .hash_algorithm = try allocator.dupe(u8, disk.hash_algorithm),
-        .index_digest = base,
-        .base_identity = try allocator.dupe(u8, disk.base),
-        .object_namespace = try allocator.dupe(u8, disk.object_namespace),
-    };
-}
-
 fn fuzzSimpleRequest(_: void, s: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
     const len = s.slice(&buf);
-    const request = simpleRequest(std.testing.allocator, buf[0..len], "session") catch return;
+    const request = run_mod.simpleControlRequest(std.testing.allocator, buf[0..len], "session") catch return;
     defer std.testing.allocator.free(request);
     try std.testing.expect(request.len <= max_guest_request_len);
 }
@@ -836,7 +807,7 @@ fn appendTestSpioFrame(out: []u8, cursor: *usize, frame_type: u8, offset: u64, p
 }
 
 test "build fsfreeze request stays bounded" {
-    const request = try simpleRequest(std.testing.allocator, "fsfreeze-v1", "spore-build-freeze-1");
+    const request = try run_mod.simpleControlRequest(std.testing.allocator, "fsfreeze-v1", "spore-build-freeze-1");
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.endsWith(u8, request, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, request, "\"fsfreeze-v1\"") != null);

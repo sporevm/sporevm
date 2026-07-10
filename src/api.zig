@@ -168,6 +168,7 @@ pub const StartEvent = run_mod.StartEvent;
 pub const ReadyEvent = run_mod.ReadyEvent;
 pub const OutputEvent = run_mod.OutputEvent;
 pub const SaveEvent = run_mod.SaveEvent;
+pub const ImageCommitEvent = run_mod.ImageCommitEvent;
 pub const ExitEvent = run_mod.ExitEvent;
 pub const FailureEvent = run_mod.FailureEvent;
 pub const CreateNamedOptions = lifecycle.CreateNamedOptions;
@@ -257,6 +258,8 @@ pub const ManagedRunOptions = struct {
     save_path: ?[]const u8 = null,
     save_trigger: SaveTrigger = .exit,
     continue_after_save: bool = false,
+    /// Publish the writable root disk under this local image ref after exit zero.
+    commit_ref: ?[]const u8 = null,
     annotations: Annotations = .{},
     network: NetworkMode = .disabled,
     network_policy: NetworkConfig = .{},
@@ -852,6 +855,12 @@ pub fn runManaged(
     if (options.save_path != null and options.rootfs_path != null and options.image_ref == null) {
         return error.InvalidRootfsInput;
     }
+    if (options.commit_ref) |ref| {
+        try rootfs_mod.validateLocalTagRef(ref);
+        if (options.image_ref == null or options.rootfs_path != null or options.save_path != null or !options.save_trigger.isExit() or options.continue_after_save or options.interactive or options.tty or options.command.len == 0) {
+            return error.InvalidRunCommitOptions;
+        }
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -891,6 +900,10 @@ pub fn runManaged(
         .save_path = options.save_path,
         .save_trigger = options.save_trigger,
         .continue_after_save = options.continue_after_save,
+        .commit = if (options.commit_ref) |ref| .{
+            .ref = ref,
+            .config = rootfs.image_config orelse return error.RunCommitImageConfigUnavailable,
+        } else null,
         .annotations = options.annotations,
         .network = options.network,
         .network_policy = options.network_policy,

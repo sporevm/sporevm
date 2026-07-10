@@ -184,6 +184,14 @@ Injected files are fresh-run only and appear under `/run/sporevm/injected`.
 Spore rejects them with saved runs and `runFromSpore` so caller-provided bytes
 do not accidentally become persisted spore state.
 
+Set `.commit_ref = "local/name:tag"` on `ManagedRunOptions` to publish the
+successful run's root disk as an image. This is available only on the managed
+fresh-image path because it inherits the resolved source image config.
+`RunResult.committed` reports whether publication happened; the synchronous
+`.image_commit` event carries the mutable ref, resolved immutable image ref,
+and rootfs index digest without returning allocator-owned strings from the
+short-lived managed-run arena.
+
 Use `runFromSpore` for `spore run --from` semantics:
 
 ```zig
@@ -467,6 +475,7 @@ fn emit(ctx: ?*anyopaque, event: libspore.RunEvent) anyerror!void {
         },
         .port_forward => |forward| _ = forward.guest_port,
         .save => |saved| _ = saved.save_path,
+        .image_commit => |committed| _ = committed.rootfs_index_digest,
         .exit => |exit| _ = exit.exit_code,
         else => {},
     }
@@ -483,6 +492,7 @@ Event callbacks run synchronously. Output byte slices are callback-scoped; copy
 them if they must outlive the callback. TTY output arrives as `.terminal`
 events. Bound Unix services emit `.port_forward` setup events without durable
 host socket paths, and successful saves emit `.save` before `.exit`.
+Successful image commits emit `.image_commit` before `.exit`.
 Every run emits at most one completion event: `exit` for guest completion or
 `failure` for a SporeVM failure.
 

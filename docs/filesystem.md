@@ -29,6 +29,13 @@ identity and are rebuilt from the source image rather than migrated. `spore
 rootfs cas-preload --attach-spore` remains a repair/debug path for existing
 exact-rootfs spores; it is not the normal producer path.
 
+`spore run --image ... --commit local/name:tag` uses the same writable head but
+publishes its sealed root disk as a new indexed local image after a successful
+guest command. The transaction holds the rootfs cache lock from snapshot
+sealing through the completeness stamp, metadata write, and atomic local-ref
+replacement, so concurrent rootfs collection cannot remove an unpublished CAS
+object. Failed commands and failed snapshots do not update the ref.
+
 Plain `spore run --rootfs PATH` is still a local read-only escape hatch. Named
 `spore create --rootfs PATH` records exact immutable rootfs identity in the
 digest cache, so lifecycle saves can restore through the fd-backed rootfs
@@ -41,7 +48,9 @@ local images.
 initrd and, when a rootfs is attached, copied into the rootfs `/run` tmpfs
 before the command starts. They are not installed into the image rootfs cache or
 the immutable rootfs artifact. Spore rejects `--inject` with `--save` and
-`--from` so injected bytes are not accidentally captured into a persisted spore.
+`--from`; `--commit` allows injection because tmpfs state is outside the root
+disk. A guest command that explicitly copies those bytes onto the root disk is
+deliberately making them persistent.
 
 ## Manifest Authority
 

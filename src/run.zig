@@ -156,6 +156,7 @@ pub const Options = struct {
     save_path: ?[]const u8 = null,
     save_trigger: capture.Trigger = .exit,
     continue_after_save: bool = false,
+    commit: ?CommitOptions = null,
     annotations: spore.Annotations = .{},
     network: NetworkMode = .disabled,
     network_policy: spore_net_policy.Config = .{},
@@ -163,6 +164,12 @@ pub const Options = struct {
     events: ?EventSink = null,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
+};
+
+pub const CommitOptions = struct {
+    ref: []const u8,
+    config: rootfs_mod.ImageConfig,
+    platform: rootfs_mod.Platform = direct_image_platform,
 };
 
 pub const InjectedFile = struct {
@@ -292,6 +299,7 @@ pub const Result = struct {
     vcpus: topology.VcpuCount,
     memory_bytes: u64,
     saved: bool = false,
+    committed: bool = false,
     save_path: ?[]const u8 = null,
     /// Product restore RAM source, such as `local_backing` or `chunks`.
     memory_restore_source: ?[]const u8 = null,
@@ -361,6 +369,14 @@ pub const SaveEvent = struct {
     save_path: []const u8,
 };
 
+pub const ImageCommitEvent = struct {
+    command: []const u8,
+    backend: Backend,
+    ref: []const u8,
+    resolved_image_ref: []const u8,
+    rootfs_index_digest: []const u8,
+};
+
 pub const ExitEvent = struct {
     command: []const u8,
     backend: Backend,
@@ -392,6 +408,7 @@ pub const RunEvent = union(enum) {
     stderr: OutputEvent,
     terminal: OutputEvent,
     save: SaveEvent,
+    image_commit: ImageCommitEvent,
     exit: ExitEvent,
     failure: FailureEvent,
 };
@@ -502,6 +519,10 @@ pub const EventEmitter = struct {
         if (self.sink) |sink| try sink.emit(.{ .exit = exitEvent(self.command, result) });
     }
 
+    pub fn emitImageCommit(self: *EventEmitter, event: ImageCommitEvent) !void {
+        if (self.sink) |sink| try sink.emit(.{ .image_commit = event });
+    }
+
     pub fn emitFailure(self: *EventEmitter, err: anyerror) !void {
         if (self.terminal_emitted) return;
         self.terminal_emitted = true;
@@ -522,6 +543,12 @@ pub const EventEmitter = struct {
 
     pub fn emitNetworkEventBestEffort(self: *EventEmitter, event: net_gateway.NetworkEvent) void {
         self.emitNetworkEvent(event) catch {
+            self.write_failed = true;
+        };
+    }
+
+    pub fn emitImageCommitBestEffort(self: *EventEmitter, event: ImageCommitEvent) void {
+        self.emitImageCommit(event) catch {
             self.write_failed = true;
         };
     }
@@ -623,6 +650,7 @@ pub const EventWriter = struct {
             .stderr => |value| try self.emitOutputEvent("stderr", value),
             .terminal => |value| try self.emitOutputEvent("terminal", value),
             .save => |value| try self.emitSaveEvent(value),
+            .image_commit => |value| try self.emitImageCommitEvent(value),
             .exit => |value| try self.emitExitEvent(value),
             .failure => |value| try self.emitFailure(value.classified),
         }
@@ -736,6 +764,27 @@ pub const EventWriter = struct {
             .command = value.command,
             .backend = value.backend.name(),
             .capture_path = value.save_path,
+        };
+        try self.write(event);
+    }
+
+    fn emitImageCommitEvent(self: *EventWriter, value: ImageCommitEvent) !void {
+        self.setBackend(value.backend);
+        const event = struct {
+            schema: []const u8 = machine_output.run_events_schema,
+            schema_version: u32 = machine_output.run_events_schema_version,
+            event: []const u8 = "image_committed",
+            command: []const u8,
+            backend: []const u8,
+            ref: []const u8,
+            resolved_image_ref: []const u8,
+            rootfs_index_digest: []const u8,
+        }{
+            .command = value.command,
+            .backend = value.backend.name(),
+            .ref = value.ref,
+            .resolved_image_ref = value.resolved_image_ref,
+            .rootfs_index_digest = value.rootfs_index_digest,
         };
         try self.write(event);
     }
@@ -878,6 +927,27 @@ pub const EventWriter = struct {
 };
 
 pub fn classifyFailure(err: anyerror) ClassifiedFailure {
+    if (err == error.InvalidRunCommitOptions or err == error.RunCommitImageConfigUnavailable or err == error.RunCommitRootfsNotSnapshotable) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: --commit requires a fresh non-interactive --image run with a command and cannot be combined with save options",
+            @errorName(err),
+        );
+    }
+    if (err == error.RunCommitGuestFreezeFailed or err == error.RunCommitGuestFreezeTimedOut) {
+        return machine_output.CliError.init(
+            .runtime_execution_failed,
+            "spore run: image commit could not freeze the guest filesystem; the destination ref was not updated",
+            @errorName(err),
+        );
+    }
+    if (err == error.RunCommitDidNotComplete or err == error.DeviceStatePending) {
+        return machine_output.CliError.init(
+            .runtime_execution_failed,
+            "spore run: image commit could not seal a quiescent root disk; the destination ref was not updated",
+            @errorName(err),
+        );
+    }
     if (err == error.TtyRunFromSporeUnsupported) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
@@ -980,6 +1050,7 @@ pub const CliOptions = struct {
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
     pull_policy: PullPolicy = .missing,
+    commit_ref: ?[]const u8 = null,
     save_path: ?[]const u8 = null,
     save_trigger: capture.Trigger = .exit,
     continue_after_save: bool = false,
@@ -1024,6 +1095,7 @@ pub const cli_usage =
     \\  --image REF             Build or reuse cached OCI rootfs; save preserves rootfs writes
     \\  --pull=missing|always|never
     \\                          Pull policy for mutable --image refs (default: missing)
+    \\  --commit LOCAL_REF      On command success, publish the writable root disk as an image
     \\  --net                   Experimental SporeVM-managed networking
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
@@ -1072,6 +1144,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var rootfs_path: ?[]const u8 = null;
     var image_ref: ?[]const u8 = null;
     var pull_policy: PullPolicy = .missing;
+    var commit_ref: ?[]const u8 = null;
     var save_path: ?[]const u8 = null;
     var save_trigger: capture.Trigger = .exit;
     var save_trigger_set = false;
@@ -1107,6 +1180,8 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             rootfs_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
             image_ref = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--commit")) {
+            commit_ref = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--pull")) {
             const raw = takeValue(args, &i, args[i]);
             pull_policy = PullPolicy.parse(raw) orelse {
@@ -1227,6 +1302,32 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.debug.print("spore run: --pull requires --image\n", .{});
         std.process.exit(2);
     }
+    if (commit_ref) |ref| {
+        rootfs_mod.validateLocalTagRef(ref) catch |err| {
+            std.debug.print("spore run: invalid --commit ref {s}: {s}\n", .{ ref, @errorName(err) });
+            std.process.exit(2);
+        };
+        if (image_ref == null) {
+            std.debug.print("spore run: --commit requires --image\n", .{});
+            std.process.exit(2);
+        }
+        if (from_spore_dir != null or rootfs_path != null) {
+            std.debug.print("spore run: --commit supports fresh --image runs only\n", .{});
+            std.process.exit(2);
+        }
+        if (save_path != null or save_trigger_set or continue_after_save) {
+            std.debug.print("spore run: --commit cannot be combined with --save, --save-on, or --continue-after-save\n", .{});
+            std.process.exit(2);
+        }
+        if (interactive or tty) {
+            std.debug.print("spore run: --commit cannot be combined with -i or -t\n", .{});
+            std.process.exit(2);
+        }
+        if (argv.len == 0) {
+            std.debug.print("spore run: --commit requires a command\n", .{});
+            std.process.exit(2);
+        }
+    }
     if (from_spore_dir != null) {
         for (bind_service_args.slice()) |raw| {
             bound_services.append(spore_net_policy.parseBoundServiceBinding(raw) catch |err| {
@@ -1298,6 +1399,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .rootfs_path = rootfs_path,
         .image_ref = image_ref,
         .pull_policy = pull_policy,
+        .commit_ref = commit_ref,
         .save_path = save_path,
         .save_trigger = save_trigger,
         .continue_after_save = continue_after_save,
@@ -1526,6 +1628,7 @@ pub const RootfsInputOptions = struct {
 pub const ResolvedRootfsInput = struct {
     path: ?[]const u8,
     rootfs: ?spore.Rootfs = null,
+    image_config: ?rootfs_mod.ImageConfig = null,
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
 };
@@ -1972,6 +2075,7 @@ fn indexedImageRootfsInput(
         },
         .guest_env = run_config.env,
         .guest_working_dir = run_config.working_dir,
+        .image_config = run_config.image_config,
     };
 }
 
@@ -1991,6 +2095,7 @@ fn resolvedImageRootfsInput(
         .path = rootfs_path,
         .guest_env = run_config.env,
         .guest_working_dir = run_config.working_dir,
+        .image_config = run_config.image_config,
     };
     const rootfs_device = spore.RootfsDevice{ .mmio_slot = 1 };
     const artifact = (try rootfs_mod.cachedImageRootfsArtifact(init.io, allocator, metadata_path, rootfs_path)) orelse return error.BadManifest;
@@ -2017,25 +2122,18 @@ fn resolvedImageRootfsInput(
         },
         .guest_env = run_config.env,
         .guest_working_dir = run_config.working_dir,
+        .image_config = run_config.image_config,
     };
 }
 
 const ImageRunConfig = struct {
     env: []const []const u8 = &.{},
     working_dir: ?[]const u8 = null,
+    image_config: ?rootfs_mod.ImageConfig = null,
 };
 
 const CachedImageRunMetadata = struct {
-    config: ?CachedImageConfig = null,
-};
-
-const CachedImageConfig = struct {
-    config: ?CachedRuntimeConfig = null,
-};
-
-const CachedRuntimeConfig = struct {
-    Env: ?[][]const u8 = null,
-    WorkingDir: ?[]const u8 = null,
+    config: ?rootfs_mod.ImageConfig = null,
 };
 
 fn readCachedImageRunConfig(io: Io, allocator: std.mem.Allocator, metadata_path: []const u8) !ImageRunConfig {
@@ -2050,14 +2148,34 @@ fn readCachedImageRunConfig(io: Io, allocator: std.mem.Allocator, metadata_path:
     }) catch return .{};
     defer parsed.deinit();
 
-    const image_config = parsed.value.config orelse return .{};
-    const runtime = image_config.config orelse return .{};
-    const env = if (runtime.Env) |entries| try cloneStringList(allocator, entries) else &.{};
-    const working_dir = if (runtime.WorkingDir) |dir|
-        if (dir.len == 0) null else try allocator.dupe(u8, dir)
-    else
-        null;
-    return .{ .env = env, .working_dir = working_dir };
+    const source_config = parsed.value.config orelse return .{};
+    const image_config = try cloneImageConfig(allocator, source_config);
+    const runtime = image_config.config orelse return .{ .image_config = image_config };
+    return .{
+        .env = runtime.Env orelse &.{},
+        .working_dir = if (runtime.WorkingDir) |dir| if (dir.len == 0) null else dir else null,
+        .image_config = image_config,
+    };
+}
+
+fn cloneImageConfig(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig) !rootfs_mod.ImageConfig {
+    return .{
+        .architecture = if (config.architecture) |value| try allocator.dupe(u8, value) else null,
+        .os = if (config.os) |value| try allocator.dupe(u8, value) else null,
+        .config = if (config.config) |runtime| .{
+            .Env = if (runtime.Env) |entries| try cloneStringListMutable(allocator, entries) else null,
+            .Entrypoint = if (runtime.Entrypoint) |entries| try cloneStringListMutable(allocator, entries) else null,
+            .Cmd = if (runtime.Cmd) |entries| try cloneStringListMutable(allocator, entries) else null,
+            .WorkingDir = if (runtime.WorkingDir) |value| try allocator.dupe(u8, value) else null,
+            .User = if (runtime.User) |value| try allocator.dupe(u8, value) else null,
+        } else null,
+    };
+}
+
+fn cloneStringListMutable(allocator: std.mem.Allocator, entries: []const []const u8) ![][]const u8 {
+    const cloned = try allocator.alloc([]const u8, entries.len);
+    for (entries, 0..) |entry, i| cloned[i] = try allocator.dupe(u8, entry);
+    return cloned;
 }
 
 fn cloneStringList(allocator: std.mem.Allocator, entries: []const []const u8) ![]const []const u8 {
@@ -2602,6 +2720,122 @@ fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
+const CommitControl = struct {
+    io: Io,
+    allocator: std.mem.Allocator,
+    command_stream: *vsock.HostStream,
+    guest_port: u32,
+    timeout_ms: u64,
+    cache_root: []const u8,
+    phase: Phase = .wait_command,
+    freeze_stream: vsock.HostStream = undefined,
+    storage: ?spore.RootfsStorage = null,
+    cache_lock: ?rootfs_mod.RootfsCacheLock = null,
+
+    const Phase = enum {
+        wait_command,
+        start_freeze,
+        active_freeze,
+        snapshot,
+        done,
+    };
+
+    fn deinit(self: *CommitControl) void {
+        if (self.cache_lock) |*lock| lock.deinit();
+    }
+
+    fn control(self: *CommitControl) vsock.Control {
+        return .{
+            .context = self,
+            .pollFn = pollThunk,
+            .setWakeFn = setWakeThunk,
+            .completeSnapshotFn = completeSnapshotThunk,
+            .completeRootfsSnapshotFn = completeRootfsSnapshotThunk,
+            .reportStatsFn = reportStatsThunk,
+        };
+    }
+
+    fn poll(self: *CommitControl, dev: *vsock.Vsock) !vsock.ControlAction {
+        switch (self.phase) {
+            .wait_command => {
+                if (self.command_stream.state != .complete) return .keep_running;
+                const exit_code = self.command_stream.exit_code orelse return error.BadRunExitFrame;
+                self.phase = if (exit_code == 0) .start_freeze else .done;
+                // The backend detaches the completed exec probe later in this
+                // loop. Start the freeze stream on the following poll.
+                return .keep_running;
+            },
+            .start_freeze => {
+                const request = try simpleControlRequest(self.allocator, "fsfreeze-v1", "spore-run-commit-freeze");
+                self.freeze_stream = try vsock.HostStream.initWithProtocol(self.guest_port, request, .spore_stream_v1);
+                self.freeze_stream.host_port = vsock.HostStream.deriveHostPort(request);
+                try dev.attachHostStream(&self.freeze_stream);
+                self.freeze_stream.markStarted();
+                _ = try dev.flushHostStreamOutbound();
+                self.phase = .active_freeze;
+                return .keep_running;
+            },
+            .active_freeze => {
+                _ = try dev.flushHostStreamOutbound();
+                switch (self.freeze_stream.state) {
+                    .complete => {
+                        const exit_code = self.freeze_stream.exit_code orelse return error.BadRunExitFrame;
+                        dev.resetHostStream();
+                        if (exit_code != 0) return error.RunCommitGuestFreezeFailed;
+                        self.cache_lock = try rootfs_mod.lockRootfsCacheExclusive(self.io, self.allocator, self.cache_root);
+                        self.phase = .snapshot;
+                    },
+                    .failed => {
+                        dev.resetHostStream();
+                        return error.RunCommitGuestFreezeFailed;
+                    },
+                    else => if (self.freeze_stream.elapsedMs() > self.timeout_ms) {
+                        dev.resetHostStream();
+                        return error.RunCommitGuestFreezeTimedOut;
+                    },
+                }
+                return .keep_running;
+            },
+            .snapshot => return .{ .rootfs_snapshot = .{ .dir = self.cache_root } },
+            .done => return .stop,
+        }
+    }
+
+    fn completeRootfsSnapshot(self: *CommitControl, maybe_disk: ?spore.Disk) !void {
+        if (self.phase != .snapshot or self.cache_lock == null) return error.BadManifest;
+        const disk = maybe_disk orelse return error.BadManifest;
+        const storage = try runtime_disk_mod.storageFromSnapshotDisk(self.allocator, disk);
+        try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, storage.index_digest);
+        self.storage = storage;
+        self.phase = .done;
+    }
+
+    fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock.ControlAction {
+        const self: *CommitControl = @ptrCast(@alignCast(context));
+        return self.poll(dev);
+    }
+
+    fn setWakeThunk(_: *anyopaque, _: vsock.Wake) void {}
+    fn completeSnapshotThunk(_: *anyopaque, _: []const u8) !void {}
+
+    fn completeRootfsSnapshotThunk(context: *anyopaque, disk: ?spore.Disk) !void {
+        const self: *CommitControl = @ptrCast(@alignCast(context));
+        try self.completeRootfsSnapshot(disk);
+    }
+
+    fn reportStatsThunk(_: *anyopaque, _: vsock.ControlStats) void {}
+};
+
+pub fn simpleControlRequest(allocator: std.mem.Allocator, request_type: []const u8, session_id: []const u8) ![]const u8 {
+    const json = try std.json.Stringify.valueAlloc(allocator, .{
+        .type = request_type,
+        .session_id = session_id,
+    }, .{});
+    defer allocator.free(json);
+    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
+    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+}
+
 pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !Result {
     var events = EventEmitter.init(opts.events, "run");
     try events.emitStart(opts.backend);
@@ -2610,6 +2844,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const setup_start = monotonicMs();
     try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
+    if (opts.commit != null and (opts.resume_dir != null or opts.save_path != null or !opts.save_trigger.isExit() or opts.continue_after_save or opts.interactive or opts.tty or opts.command.len == 0)) return error.InvalidRunCommitOptions;
     if (opts.tty and opts.resume_dir != null and opts.command.len != 0) return error.TtyRunFromSporeUnsupported;
     if (opts.resume_dir != null and opts.command.len == 0) {
         try spore.validateSessionAttach(opts.resume_sessions, .{
@@ -2677,7 +2912,26 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     var stdin_control = if (opts.interactive or opts.tty) attach_stream.RunStdinControl.init(&stream, opts.tty, opts.interactive, attach_stream.terminalSizeFd()) else null;
     if (stdin_control) |*control| try control.start(opts.tty and opts.interactive);
     defer if (stdin_control) |*control| control.deinit();
-    const exec_control = if (stdin_control) |*control| control.control() else null;
+    const commit_cache_root = if (opts.commit != null)
+        try local_paths.rootfsCacheRootPath(allocator, context.environ_map)
+    else
+        null;
+    var commit_control: ?CommitControl = if (commit_cache_root) |cache_root| .{
+        .io = context.io,
+        .allocator = allocator,
+        .command_stream = &stream,
+        .guest_port = opts.guest_port,
+        .timeout_ms = opts.timeout_ms,
+        .cache_root = cache_root,
+    } else null;
+    defer if (commit_control) |*control| control.deinit();
+    if (commit_control != null and runtime_disk.snapshot() == null) return error.RunCommitRootfsNotSnapshotable;
+    const exec_control = if (commit_control) |*control|
+        control.control()
+    else if (stdin_control) |*control|
+        control.control()
+    else
+        null;
     var capture_request = capture.Request{};
     var signal_registration: ?capture.SignalRegistration = null;
     defer if (signal_registration) |*registration| registration.deinit();
@@ -2738,6 +2992,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .resume_generation = opts.resume_generation,
                 .ram_backing_fd = local_backing.fd,
                 .exec_probe = &stream,
+                .exec_probe_completes_run = opts.commit == null,
                 .exec_control = exec_control,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .snapshot_dir = capture_plan.snapshot_dir,
@@ -2769,6 +3024,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .resume_generation = opts.resume_generation,
                 .ram_backing_fd = local_backing.fd,
                 .exec_probe = &stream,
+                .exec_probe_completes_run = opts.commit == null,
                 .exec_control = exec_control,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .snapshot_dir = capture_plan.snapshot_dir,
@@ -2807,12 +3063,37 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const signal_capture_observed = capture_plan.isSignalCapture() and capture_request.isCompleted();
     var result = try switch (cause) {
         .probe_complete => resultFromStream(backend, opts, &stream, signal_capture_observed),
+        .monitor_stopped => if (opts.commit != null)
+            resultFromStream(backend, opts, &stream, false)
+        else
+            error.ProbeDidNotComplete,
         .snapshotted => if (capture_plan.isExitCapture())
             resultFromExitCapture(backend, opts, &stream)
         else
             resultFromSignalCapture(backend, opts, &stream),
         else => error.ProbeDidNotComplete,
     };
+    if (opts.commit) |commit| {
+        if (result.exit_code == 0) {
+            const control = if (commit_control) |*value| value else return error.RunCommitDidNotComplete;
+            const storage = control.storage orelse return error.RunCommitDidNotComplete;
+            if (control.cache_lock == null) return error.RunCommitDidNotComplete;
+            const published = try rootfs_mod.publishIndexedImageWithCacheLockHeld(context.io, allocator, control.cache_root, .{
+                .ref = commit.ref,
+                .platform = commit.platform,
+                .config = commit.config,
+                .rootfs_storage = storage,
+            });
+            events.emitImageCommitBestEffort(.{
+                .command = "run",
+                .backend = backend,
+                .ref = commit.ref,
+                .resolved_image_ref = published.resolved_image_ref,
+                .rootfs_index_digest = published.rootfs_storage.index_digest,
+            });
+            result.committed = true;
+        }
+    }
     if (resuming) result = result.withMemoryRestore(local_backing);
     finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
     try events.emitExit(result);
@@ -3626,7 +3907,10 @@ test "image rootfs metadata supplies run env and working directory" {
         \\    "os": "linux",
         \\    "config": {
         \\      "Env": ["GEM_HOME=/usr/local/bundle", "BUNDLE_APP_CONFIG=/usr/local/bundle"],
-        \\      "WorkingDir": "/app"
+        \\      "Entrypoint": ["/usr/bin/env"],
+        \\      "Cmd": ["bundle", "exec"],
+        \\      "WorkingDir": "/app",
+        \\      "User": "1000:1000"
         \\    }
         \\  }
         \\}
@@ -3652,6 +3936,11 @@ test "image rootfs metadata supplies run env and working directory" {
     try std.testing.expectEqualStrings("GEM_HOME=/usr/local/bundle", input.guest_env[0]);
     try std.testing.expectEqualStrings("BUNDLE_APP_CONFIG=/usr/local/bundle", input.guest_env[1]);
     try std.testing.expectEqualStrings("/app", input.guest_working_dir.?);
+    try std.testing.expectEqualStrings("arm64", input.image_config.?.architecture.?);
+    try std.testing.expectEqualStrings("linux", input.image_config.?.os.?);
+    try std.testing.expectEqualStrings("/usr/bin/env", input.image_config.?.config.?.Entrypoint.?[0]);
+    try std.testing.expectEqualStrings("bundle", input.image_config.?.config.?.Cmd.?[0]);
+    try std.testing.expectEqualStrings("1000:1000", input.image_config.?.config.?.User.?);
 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
@@ -3740,6 +4029,29 @@ test "event writer emits JSONL lifecycle and output records" {
     try expectJsonStringField(allocator, exit_line, "event", "exit");
     try expectJsonStringField(allocator, exit_line, "memory_restore_source", "local_backing");
     try expectJsonStringField(allocator, exit_line, "memory_restore_reason", "proof_valid");
+}
+
+test "event writer emits image commit identity" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var events = EventWriter.init(allocator, &out.writer, "run");
+
+    try events.emitEvent(.{ .image_commit = .{
+        .command = "run",
+        .backend = .hvf,
+        .ref = "local/example:prepared",
+        .resolved_image_ref = "local/example@blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .rootfs_index_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    } });
+
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    const event_line = lines.next().?;
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try expectJsonStringField(allocator, event_line, "event", "image_committed");
+    try expectJsonStringField(allocator, event_line, "ref", "local/example:prepared");
+    try expectJsonStringField(allocator, event_line, "resolved_image_ref", "local/example@blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    try expectJsonStringField(allocator, event_line, "rootfs_index_digest", "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 }
 
 test "event writer emits exactly one terminal failure" {
@@ -4210,6 +4522,23 @@ test "run cli parser accepts image ref" {
     try std.testing.expectEqual(@as(usize, 2), opts.command.len);
     try std.testing.expectEqualStrings("/bin/echo", opts.command[0]);
     try std.testing.expectEqualStrings("hi", opts.command[1]);
+}
+
+test "run cli parser accepts image commit" {
+    const opts = try parseCliArgs(&.{
+        "--image",
+        "docker.io/library/alpine:3.20",
+        "--commit",
+        "local/example:prepared",
+        "--inject",
+        "setup=prepare.sh",
+        "--",
+        "/bin/sh",
+        "/run/sporevm/injected/setup",
+    });
+    try std.testing.expectEqualStrings("local/example:prepared", opts.commit_ref.?);
+    try std.testing.expectEqual(@as(usize, 1), opts.injected_file_sources.len);
+    try std.testing.expectEqualStrings("/bin/sh", opts.command[0]);
 }
 
 test "run cli parser accepts image pull policy" {

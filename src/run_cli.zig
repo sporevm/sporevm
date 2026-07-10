@@ -57,6 +57,12 @@ fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mo
             writeStderr("\n");
             std.process.exit(classified.exit_code);
         }
+        if (parsed.commit_ref != null) {
+            const classified = api.classifyFailure(err);
+            writeStderr(classified.message);
+            writeStderr("\n");
+            std.process.exit(classified.exit_code);
+        }
         return err;
     };
     if (result.saved and parsed.event_mode != .jsonl) {
@@ -175,6 +181,7 @@ fn runParsed(
         .save_path = parsed.save_path,
         .save_trigger = parsed.save_trigger,
         .continue_after_save = parsed.continue_after_save,
+        .commit_ref = parsed.commit_ref,
         .network = parsed.network,
         .network_policy = parsed.network_policy,
         .spore_executable = spore_executable,
@@ -194,6 +201,10 @@ const RawOutputSink = struct {
             .stdout => |output| fd_util.writeAllBestEffort(1, output.bytes),
             .stderr => |output| fd_util.writeAllBestEffort(2, output.bytes),
             .terminal => |output| fd_util.writeAllBestEffort(1, output.bytes),
+            .image_commit => |commit| std.debug.print(
+                "spore run: committed image {s}\n  resolved: {s}\n  rootfs index: {s}\n",
+                .{ commit.ref, commit.resolved_image_ref, commit.rootfs_index_digest },
+            ),
             else => {},
         }
     }

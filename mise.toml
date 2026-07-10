@@ -68,6 +68,10 @@ description = "Smoke product spore run interactive attach"
 run = "mise run build && test/smoke/run/inject.sh"
 description = "Smoke product spore run injected files"
 
+[tasks."smoke:run-image-commit"]
+run = "mise run build && test/smoke/run/image-commit.sh"
+description = "Smoke image commit, ref stability, and warm two-child fan-out"
+
 [tasks."smoke:run-file-locking"]
 run = "mise run build && test/smoke/run/file-locking.sh"
 description = "Smoke product spore run guest file locking support"

@@ -63,6 +63,37 @@ spore run --from base.spore 'cat /var/tmp/example'
 The `--save` target must be a new path. SporeVM creates the output directory
 itself before writing memory, disk, and manifest files.
 
+Use `--commit local/<name>:<tag>` when the command should produce another
+image instead of a resumable machine:
+
+```bash
+spore run \
+  --image docker.io/library/alpine:3.20 \
+  --commit local/alpine-with-tools:dev \
+  -- /bin/sh -lc 'apk add --no-cache git'
+
+spore run --image local/alpine-with-tools:dev --pull=never -- /usr/bin/git --version
+```
+
+The command runs against a private writable head. Exit zero causes SporeVM to
+sync and freeze the guest filesystem, quiesce the virtio block queues, seal the
+root disk into the rootfs CAS, and atomically update the local ref. A nonzero
+command or commit failure leaves the ref unchanged. The image inherits the full
+source OCI config; run-time environment overrides do not edit it.
+
+Commit retains disk state only. It does not retain memory, processes, network
+state, or injected files under `/run/sporevm/injected`. A command can
+deliberately copy an injected file onto the root disk, in which case the copy is
+ordinary committed disk state. The first version accepts fresh non-interactive
+`--image` runs only and cannot be combined with `--rootfs`, `--from`, or save
+flags. Source and destination may be the same local ref because SporeVM resolves
+the source before publishing the result.
+
+Commit is the storage-preparation layer for fan-out, not the warm-machine
+layer. Prepare stable dependencies or Docker data into an image, put frequently
+changing code above it with `spore build FROM local/...`, then capture one warm
+spore and use `spore fork` plus `spore run --from` for children.
+
 The rootfs cache key includes the resolved digest-pinned image ref, target
 platform, and rootfs builder version. Mutable tag inputs also get a small local
 ref record, so a warm `spore run --image docker.io/library/alpine:3.20` or
