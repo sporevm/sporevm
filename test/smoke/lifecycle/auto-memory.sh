@@ -216,17 +216,43 @@ with open(manifest_path, "r", encoding="utf-8") as fh:
 ram_size = manifest["platform"]["ram_size"]
 memory = manifest["memory"]
 chunks = memory["chunks"]
-chunks_total = len(chunks)
-chunks_nonzero = sum(1 for chunk in chunks if chunk is not None)
+zero_chunks = memory.get("zero_chunks") or []
+logical_size = memory["logical_size"]
+chunk_size = memory["chunk_size"]
+expected_chunks = (logical_size + chunk_size - 1) // chunk_size
+covered_chunks = set()
+for chunk in chunks:
+    logical_chunk = chunk.get("logical_chunk")
+    if not isinstance(logical_chunk, int):
+        raise SystemExit("memory chunk entry missing logical_chunk")
+    if logical_chunk < 0 or logical_chunk >= expected_chunks:
+        raise SystemExit(f"memory chunk {logical_chunk} out of range")
+    if logical_chunk in covered_chunks:
+        raise SystemExit(f"memory chunk {logical_chunk} covered more than once")
+    covered_chunks.add(logical_chunk)
+for logical_chunk in zero_chunks:
+    if not isinstance(logical_chunk, int):
+        raise SystemExit("zero chunk entry is not an integer")
+    if logical_chunk < 0 or logical_chunk >= expected_chunks:
+        raise SystemExit(f"zero chunk {logical_chunk} out of range")
+    if logical_chunk in covered_chunks:
+        raise SystemExit(f"memory chunk {logical_chunk} covered more than once")
+    covered_chunks.add(logical_chunk)
+if len(covered_chunks) != expected_chunks:
+    raise SystemExit(f"memory index covered {len(covered_chunks)} chunks, expected {expected_chunks}")
+chunks_total = len(chunks) + len(zero_chunks)
+chunks_nonzero = len(chunks)
 backing = memory.get("backing") or {}
 st = os.stat(backing_path)
 backing_allocated = getattr(st, "st_blocks", 0) * 512
 
 print(
     f"manifest_ram_size={ram_size} "
-    f"manifest_chunk_size={memory['chunk_size']} "
+    f"manifest_memory_logical_size={logical_size} "
+    f"manifest_chunk_size={chunk_size} "
     f"manifest_chunks_total={chunks_total} "
     f"manifest_chunks_nonzero={chunks_nonzero} "
+    f"manifest_zero_chunks={len(zero_chunks)} "
     f"backing_kind={backing.get('kind')} "
     f"backing_size={backing.get('size')} "
     f"backing_logical_bytes={st.st_size} "
@@ -244,12 +270,14 @@ eval "${manifest_metrics}"
 [[ "${memory_policy}" == "auto" ]] || die "memory policy was ${memory_policy}, expected auto"
 [[ "${memory_bytes}" == "17179869184" ]] || die "memory bytes was ${memory_bytes}, expected 17179869184"
 [[ "${manifest_ram_size}" == "17179869184" ]] || die "manifest ram size was ${manifest_ram_size}, expected 17179869184"
+[[ "${manifest_memory_logical_size}" == "${manifest_ram_size}" ]] || die "manifest memory logical size did not match platform RAM"
 [[ "${chunk_size}" == "2097152" && "${manifest_chunk_size}" == "2097152" ]] || die "unexpected memory chunk size"
 [[ "${chunks_total}" == "8192" && "${manifest_chunks_total}" == "8192" ]] || die "unexpected chunk count"
 if [[ "${resident_bytes}" != "null" ]]; then
   [[ "${resident_bytes}" =~ ^[0-9]+$ && "${resident_bytes}" -gt 0 && "${resident_bytes}" -lt "${memory_bytes}" ]] || die "resident bytes did not distinguish host cost from configured RAM"
 fi
 [[ "${manifest_chunks_nonzero}" =~ ^[0-9]+$ && "${manifest_chunks_nonzero}" -gt 0 && "${manifest_chunks_nonzero}" -lt "${manifest_chunks_total}" ]] || die "manifest chunks were not sparse"
+[[ "${manifest_zero_chunks}" =~ ^[0-9]+$ && "${manifest_zero_chunks}" -gt 0 && "$((manifest_zero_chunks + manifest_chunks_nonzero))" == "${manifest_chunks_total}" ]] || die "manifest zero chunks did not cover sparse memory"
 [[ "${backing_kind}" == "map-private-file-v0" ]] || die "unexpected backing kind: ${backing_kind}"
 [[ "${backing_size}" == "${manifest_ram_size}" && "${backing_logical_bytes}" == "${manifest_ram_size}" ]] || die "backing logical size did not match configured RAM"
 [[ "${backing_allocated_bytes}" =~ ^[0-9]+$ && "${backing_allocated_bytes}" -gt 0 && "${backing_allocated_bytes}" -lt "${backing_logical_bytes}" ]] || die "backing allocation did not stay sparse"
