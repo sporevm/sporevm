@@ -15,6 +15,7 @@ const chunklib = @import("chunk.zig");
 const disk_layer = @import("disk_layer.zig");
 const fetch_policy = @import("host_fetch_policy.zig");
 const gicv3 = @import("gicv3.zig");
+const rootfs_mod = @import("rootfs.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const disk_index = @import("disk_index.zig");
@@ -1626,6 +1627,9 @@ fn packRootfsStorageIndexed(
         return 0;
     }
 
+    // Regeneration and object reads share the cache with destructive GC.
+    var cache_lock = rootfs_mod.lockRootfsCacheExclusive(options.io, allocator, cache_root) catch |err| return rootfsError(err);
+    defer cache_lock.deinit();
     try ensureRootfsStorageMatchesArtifact(allocator, options, cache_root, rootfs, storage);
 
     const source_index_path = rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
@@ -1806,23 +1810,20 @@ fn unpackRootfsStorageIndexed(
     defer allocator.free(index_bytes);
     const parsed_index = try parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
     defer parsed_index.deinit();
+    if (entry.index_bytes != @as(u64, @intCast(index_bytes.len))) return error.BadManifest;
+    try validateRootfsStoragePayloadStats(entry, storage, parsed_index.value);
 
     const cache_index_path = rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
     var result = RootfsMaterializeResult{
         .artifact_count = 1,
         .payload_bytes = @intCast(index_bytes.len),
     };
-    const installed_index = rootfs_cas.installStorageIndexPath(allocator, options.io, cache_index_path, index_bytes, storage) catch |err| return rootfsError(err);
-    if (installed_index.cache_hit) {
-        result.cache_hit_count += 1;
-        result.bytes_reused += @intCast(index_bytes.len);
-    } else {
-        result.cache_miss_count += 1;
-        result.bytes_fetched += installed_index.bytes_fetched;
-    }
+    // Publish into the shared cache as one GC-safe transaction. A failed
+    // object verification may leave verified objects for reuse, but never a
+    // newly visible index or completeness stamp.
+    var cache_lock = rootfs_mod.lockRootfsCacheExclusive(options.io, allocator, cache_root) catch |err| return rootfsError(err);
+    defer cache_lock.deinit();
 
-    var object_count: usize = 0;
-    var object_bytes: u64 = 0;
     for (parsed_index.value.chunks) |chunk_entry| {
         const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
         const source_object_rel_path = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
@@ -1838,13 +1839,18 @@ fn unpackRootfsStorageIndexed(
             result.cache_miss_count += 1;
             result.bytes_fetched += installed_object.bytes_fetched;
         }
-        object_count += 1;
-        object_bytes += @intCast(object_data.len);
         result.payload_bytes += @intCast(object_data.len);
     }
-    if (entry.object_count != object_count or
-        entry.object_bytes != object_bytes or
-        entry.index_bytes != @as(u64, @intCast(index_bytes.len))) return error.BadManifest;
+
+    const installed_index = rootfs_cas.installStorageIndexPath(allocator, options.io, cache_index_path, index_bytes, storage) catch |err| return rootfsError(err);
+    if (installed_index.cache_hit) {
+        result.cache_hit_count += 1;
+        result.bytes_reused += @intCast(index_bytes.len);
+    } else {
+        result.cache_miss_count += 1;
+        result.bytes_fetched += installed_index.bytes_fetched;
+    }
+    rootfs_cas.markStorageComplete(options.io, allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
     // The flat digest-addressed artifact is the only runtime base source;
     // assemble it eagerly from the just-installed verified chunks so the
     // first resume of a pulled child does not pay the assembly cost.
@@ -5182,10 +5188,10 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     const ram = try arena.alloc(u8, 4096);
     @memset(ram, 0x64);
     const memory = try spore.saveMemory(arena, parent_dir, ram);
-    const rootfs_bytes = try arena.alloc(u8, 3 * 4096 + 7);
+    const rootfs_bytes = try arena.alloc(u8, 3 * spore.disk_chunk_size + 7);
     @memset(rootfs_bytes, 0);
     rootfs_bytes[0] = 0x11;
-    rootfs_bytes[2 * 4096 + 3] = 0x22;
+    rootfs_bytes[2 * spore.disk_chunk_size + 3] = 0x22;
     try writeFileAll(rootfs_source_path, rootfs_bytes);
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
     const preload_result = try rootfs_cas.preload(io, arena, pack_cache_root, artifact.digest, spore.disk_chunk_size);
@@ -5252,6 +5258,7 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     const storage_entry = parsed_rootfs_index.value.storages[0];
     try std.testing.expectEqualStrings(preload_result.index_digest, storage_entry.index_digest);
     try std.testing.expectEqual(preload_result.nonzero_chunks, storage_entry.object_count);
+    const storage = rootfsStorageEntryDescriptor(storage_entry);
 
     const source_uri = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
     const pulled = try pull(arena, .{
@@ -5267,6 +5274,7 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     try std.testing.expectEqual(preload_result.nonzero_chunks + 1, pulled.rootfs.cache.miss_count);
     try std.testing.expect(pulled.rootfs.cache.bytes_fetched > 0);
     try std.testing.expectEqual(@as(u64, 0), pulled.rootfs.cache.bytes_reused);
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
 
     const pulled_cached = try pull(arena, .{
         .io = io,
@@ -5293,14 +5301,15 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     const exact_cache_path_z = try arena.dupeZ(u8, exact_cache_path);
     const assembled = try readFileAll(arena, exact_cache_path_z, 1 << 20);
     try std.testing.expectEqual(@as(u8, 0x11), assembled[0]);
-    try std.testing.expectEqual(@as(u8, 0), assembled[4096]);
-    try std.testing.expectEqual(@as(u8, 0x22), assembled[2 * 4096 + 3]);
+    try std.testing.expectEqual(@as(u8, 0), assembled[spore.disk_chunk_size]);
+    try std.testing.expectEqual(@as(u8, 0x22), assembled[2 * spore.disk_chunk_size + 3]);
 
-    const storage = rootfsStorageEntryDescriptor(storage_entry);
     const parsed_block_index = try loadDiskIndexForEntry(arena, bundle_dir, storage_entry, storage);
     defer parsed_block_index.deinit();
+    try std.testing.expect(parsed_block_index.value.chunks.len > 1);
     const first_chunk = parsed_block_index.value.chunks[0];
-    const object_rel_path = try rootfsStorageObjectRelPath(arena, first_chunk.digest);
+    const last_chunk = parsed_block_index.value.chunks[parsed_block_index.value.chunks.len - 1];
+    const object_rel_path = try rootfsStorageObjectRelPath(arena, last_chunk.digest);
     const object_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, object_rel_path });
     const clean_digest = try digestHex(arena, bundle_dir);
     const object_data = try readFileAll(arena, object_path, spore.disk_chunk_size);
@@ -5317,6 +5326,12 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
         .child_id = "000000",
     }));
     try std.testing.expect(!try pathExistsNoSymlink(io, out_bad_dir));
+    const installed_first_object = try rootfs_cas.manifestObjectPath(arena, bad_rootfs_cache, first_chunk.digest);
+    const unpublished_index = try rootfs_cas.manifestIndexPath(arena, bad_rootfs_cache, storage.index_digest);
+    const unpublished_stamp = try rootfs_cas.storageCompleteStampPath(arena, bad_rootfs_cache, storage.index_digest);
+    try std.testing.expect(try pathExistsNoSymlink(io, installed_first_object));
+    try std.testing.expect(!try pathExistsNoSymlink(io, unpublished_index));
+    try std.testing.expect(!try pathExistsNoSymlink(io, unpublished_stamp));
 }
 
 test "pack rejects chunked rootfs storage derived from different artifact" {
