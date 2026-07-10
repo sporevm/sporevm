@@ -477,9 +477,9 @@ const InlineRootfsCas = struct {
             .chunks = self.manifest_chunks.items,
             .zero_chunks = self.manifest_zero_chunks.items,
         };
-        const manifest_json = try std.json.Stringify.valueAlloc(self.allocator, manifest_index, .{ .whitespace = .indent_2 });
-        defer self.allocator.free(manifest_json);
-        const index_digest = try disk_index.indexDigestAlloc(self.allocator, manifest_json);
+        const encoded_index = try disk_index.encodeCanonicalAlloc(self.allocator, manifest_index);
+        defer self.allocator.free(encoded_index.bytes);
+        const index_digest = encoded_index.digest;
         errdefer self.allocator.free(index_digest);
         self.index_build_ms = monotonicMs() -| index_build_start;
 
@@ -488,7 +488,7 @@ const InlineRootfsCas = struct {
         const index_dir = std.fs.path.dirname(index_path) orelse return error.BadManifest;
         try chunk_sealer.ensureDirPath(self.allocator, index_dir);
         const index_write_start = monotonicMs();
-        try chunk_sealer.writeFileAtomicDurable(self.allocator, index_path, manifest_json, 0o444);
+        try chunk_sealer.writeFileAtomicDurable(self.allocator, index_path, encoded_index.bytes, 0o444);
         self.index_write_ms = monotonicMs() -| index_write_start;
         try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, index_digest);
 
@@ -505,7 +505,7 @@ const InlineRootfsCas = struct {
             .nonzero_chunks = self.nonzero_chunks,
             .objects_written = self.objects_written,
             .object_bytes_written = self.object_bytes_written,
-            .index_bytes = manifest_json.len,
+            .index_bytes = encoded_index.bytes.len,
             .chunk_scan_ms = self.chunk_scan_ms,
             .object_write_ms = self.object_write_ms,
             .index_build_ms = self.index_build_ms,

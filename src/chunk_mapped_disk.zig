@@ -495,9 +495,9 @@ pub const ChunkMappedDisk = struct {
             .chunks = chunk_slice,
             .zero_chunks = zero_slice,
         };
-        const index_json = std.json.Stringify.valueAlloc(self.allocator, index, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
-        defer self.allocator.free(index_json);
-        const index_digest = try disk_index.indexDigestAlloc(self.allocator, index_json);
+        const encoded_index = try disk_index.encodeCanonicalAlloc(self.allocator, index);
+        defer self.allocator.free(encoded_index.bytes);
+        const index_digest = encoded_index.digest;
         errdefer self.allocator.free(index_digest);
         const index_path = try rootfs_cas.manifestIndexPath(self.allocator, dir, index_digest);
         defer self.allocator.free(index_path);
@@ -505,7 +505,7 @@ pub const ChunkMappedDisk = struct {
         try chunk_sealer.ensureDirPath(self.allocator, index_dir);
         // Durable-index invariant: all object writes above have fsynced their
         // data and parent directory; publish the index last via temp/fsync/rename.
-        try chunk_sealer.writeFileAtomicDurable(self.allocator, index_path, index_json, 0o444);
+        try chunk_sealer.writeFileAtomicDurable(self.allocator, index_path, encoded_index.bytes, 0o444);
         const next_parent = try self.parentStateFrom(dir, index);
         errdefer next_parent.deinit(self.allocator);
         const kind = try self.allocator.dupe(u8, spore.disk_kind_chunk_index);

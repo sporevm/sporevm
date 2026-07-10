@@ -114,7 +114,10 @@ chunk-index-disk-v0
 Active writes stay local in a sparse writable head. Capture writes nonzero
 chunks into `cas/rootfs/blake3/objects/`, writes the canonical
 `spore-disk-index-v1` under `cas/rootfs/blake3/indexes/`, and records that index
-digest in the manifest disk. Restore attaches the verified index to the
+digest in the manifest disk. Canonical indexes use the exact field order,
+two-space JSON layout, lowercase digest references, and no trailing newline
+specified in `docs/spore-format.md`; differently encoded aliases are rejected.
+Restore attaches the verified index to the
 chunk-mapped backend; referenced chunk objects fault into the sparse base fd on
 first read and then use the same hot `.base` path as a materialized image.
 

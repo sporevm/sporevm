@@ -2146,8 +2146,9 @@ test "system prune removes complete stamp once for multiple referenced rootfs ob
         .object_namespace = spore.rootfs_storage_object_namespace,
         .chunks = &chunks,
     };
-    const index_json = try std.json.Stringify.valueAlloc(allocator, index, .{ .whitespace = .indent_2 });
-    const index_digest = try disk_index.indexDigestAlloc(allocator, index_json);
+    const encoded_index = try disk_index.encodeCanonicalAlloc(allocator, index);
+    const index_json = encoded_index.bytes;
+    const index_digest = encoded_index.digest;
     const index_path = try rootfs_cas.manifestIndexPath(allocator, root, index_digest);
     try ensureParentDir(io, index_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = index_path, .data = index_json });
@@ -2398,8 +2399,9 @@ fn writeGcStorageFixture(
         .object_namespace = spore.rootfs_storage_object_namespace,
         .chunks = &chunks,
     };
-    const index_json = try std.json.Stringify.valueAlloc(allocator, index, .{ .whitespace = .indent_2 });
-    const index_digest = try disk_index.indexDigestAlloc(allocator, index_json);
+    const encoded_index = try disk_index.encodeCanonicalAlloc(allocator, index);
+    const index_json = encoded_index.bytes;
+    const index_digest = encoded_index.digest;
     const storage = spore.RootfsStorage{
         .kind = spore.rootfs_storage_kind_chunked_ext4,
         .device = .{ .mmio_slot = 1 },

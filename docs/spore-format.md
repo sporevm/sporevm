@@ -237,6 +237,18 @@ under `rootfs.cache`.
   and the currently attached client are never part of the spore. Producers must
   write at most 16 handles; ids are 1-63 ASCII alphanumeric, dash, underscore,
   or dot characters.
+
+Every `spore-disk-index-v1` identity is the BLAKE3 digest of one exact canonical
+JSON encoding. The top-level fields appear in this order: `kind`,
+`logical_size`, `chunk_size`, `hash_algorithm`, `object_namespace`, `chunks`,
+then `zero_chunks`; chunk-entry fields are `logical_chunk` then `digest`. The
+encoding uses UTF-8, LF line endings, two-space JSON indentation, `: ` between
+names and values, decimal integers, both arrays even when empty, lowercase
+`blake3:<64 hex>` references, and no trailing newline. Parsers reject equivalent
+JSON with different member order, whitespace, escaping, omitted empty arrays,
+or digest case. This makes the index map—not producer-specific JSON choices—the
+single identity-bearing representation.
+
 - `memory`: sparse memory index using the same shape as disk indexes:
   `kind: "spore-disk-index-v1"`, `logical_size`, `chunk_size`,
   `hash_algorithm: "blake3"`, `object_namespace: "memory/blake3"`,
@@ -271,10 +283,10 @@ under `rootfs.cache`.
   `index_digest`, `base_identity`, and `object_namespace: "rootfs/blake3"`.
   For this first chunked storage kind, `base_identity` and
   `rootfs.artifact.digest` must equal `index_digest`, and the digest is the
-  BLAKE3 identity of the canonical disk index bytes. The index itself records index version
-  `spore-disk-index-v1`, logical size, chunk size, hash algorithm, object
-  namespace, sorted non-zero chunk entries, and sorted explicit zero chunks;
-  it does not repeat `base_identity` because that would make the index
+  BLAKE3 identity of the canonical disk index bytes. The index itself records
+  index version `spore-disk-index-v1`, logical size, chunk size, hash algorithm,
+  object namespace, sorted non-zero chunk entries, and sorted explicit zero
+  chunks; it does not repeat `base_identity` because that would make the index
   self-referential.
 - `disk`: optional sealed writable root disk state for rootfs-backed captures.
   Saves use `kind: "chunk-index-disk-v0"`; `device` binds the disk to the

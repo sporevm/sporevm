@@ -309,9 +309,9 @@ fn preloadFd(
         .chunks = manifest_chunks.items,
         .zero_chunks = manifest_zero_chunks.items,
     };
-    const manifest_json = try std.json.Stringify.valueAlloc(allocator, manifest_index, .{ .whitespace = .indent_2 });
-    defer allocator.free(manifest_json);
-    const index_digest = try disk_index.indexDigestAlloc(allocator, manifest_json);
+    const encoded_index = try disk_index.encodeCanonicalAlloc(allocator, manifest_index);
+    defer allocator.free(encoded_index.bytes);
+    const index_digest = encoded_index.digest;
     const index_build_ms = monotonicMs() -| index_build_start_ms;
     errdefer allocator.free(index_digest);
     const manifest_path = try manifestIndexPath(allocator, cache_root, index_digest);
@@ -321,7 +321,7 @@ fn preloadFd(
     const index_write_start_ms = monotonicMs();
     // Durable-index invariant: every referenced object write above fsynced the
     // object and object directory; publish the index last via temp/fsync/rename.
-    try writeFileAtomic(io, allocator, manifest_path, manifest_json);
+    try writeFileAtomic(io, allocator, manifest_path, encoded_index.bytes);
     const index_write_ms = monotonicMs() -| index_write_start_ms;
     try markStorageComplete(io, allocator, cache_root, index_digest);
     const rootfs_identity = try allocator.dupe(u8, source_identity orelse index_digest);
@@ -337,7 +337,7 @@ fn preloadFd(
         .nonzero_chunks = nonzero_chunks,
         .objects_written = objects_written,
         .object_bytes_written = object_bytes_written,
-        .index_bytes = manifest_json.len,
+        .index_bytes = encoded_index.bytes.len,
         .source_verify_ms = 0,
         .chunk_scan_ms = chunk_scan_ms,
         .object_check_ms = object_check_ms,

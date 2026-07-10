@@ -397,7 +397,10 @@ Landed behavior: existing chunked-rootfs producers now write
 `spore-disk-index-v1` through `src/disk_index.zig`; restore, bundle, pull, and
 CAS preload all validate through that parser. The parser rejects
 `rootfs-block-index-v0` as too old after the flag-day break, so pre-U1 cache
-entries are abandoned rather than migrated. `spore cache gc` performs a
+entries are abandoned rather than migrated. All persisted producers share one
+canonical encoder, and parsing requires the input to match that exact field
+order, indent-2 JSON layout, lowercase digest spelling, and no-final-newline
+encoding. `spore cache gc` performs a
 dry-run-by-default mark/sweep over rootfs CAS indexes and objects, rooting
 descriptor-selected indexes from cache metadata, ref records, and live runtime
 resume manifests. Valid build step records also root their child index and
@@ -415,11 +418,14 @@ publication for removal.
 
 Validation: `mise run test` covers index parser/fuzz coverage and a GC model
 test that preserves a rooted index/object pair while deleting an unrooted index,
-its object, and a stray object. Build-cache GC tests preserve a step-record-only
-root and its subsequent cache hit, ignore a known incomplete record, and retain
-all CAS entries for an unknown build-record kind. Bundle tests prove successful
-pulls publish a completeness stamp and a corrupt final object cannot expose an
-index or stamp for partial storage.
+its object, and a stray object. A golden byte/digest test pins canonical index
+serialization, and parser/fuzz regressions reject compact, reordered, or
+uppercase-digest aliases even when their descriptor names their raw bytes.
+Build-cache GC tests preserve a step-record-only root and its subsequent cache
+hit, ignore a known incomplete record, and retain all CAS entries for an unknown
+build-record kind. Bundle tests prove successful pulls publish a completeness
+stamp and a corrupt final object cannot expose an index or stamp for partial
+storage.
 
 ### U2 — Chunk-mapped runtime backend
 

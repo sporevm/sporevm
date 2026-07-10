@@ -693,15 +693,13 @@ fn memoryIndexDescriptor(_: MemoryManifest, expected_size: u64) disk_index.Descr
 fn memoryIndexIdentity(allocator: std.mem.Allocator, memory: MemoryManifest, expected_size: u64) Error![]const u8 {
     if (expected_size > std.math.maxInt(usize)) return error.BadManifest;
     _ = try validateMemoryForRam(memory, @intCast(expected_size));
-    const index_json = std.json.Stringify.valueAlloc(allocator, memoryIndex(memory), .{
-        .emit_null_optional_fields = false,
-    }) catch return error.OutOfMemory;
-    defer allocator.free(index_json);
-    return disk_index.indexDigestAlloc(allocator, index_json) catch |err| switch (err) {
+    const encoded_index = disk_index.encodeCanonicalAlloc(allocator, memoryIndex(memory)) catch |err| return switch (err) {
         error.BadManifest => error.BadManifest,
         error.FormatTooOld => error.FormatTooOld,
         error.OutOfMemory => error.OutOfMemory,
     };
+    allocator.free(encoded_index.bytes);
+    return encoded_index.digest;
 }
 
 fn proofMac(
