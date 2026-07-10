@@ -500,7 +500,9 @@ Implementation progress:
 - [x] S0 fan-out proof: commit, save, offline two-child fork, and isolated
   per-child writable heads over the committed base.
 - [x] S0 review/commit.
-- [ ] S1 generic disk capacity.
+- [x] S1 implementation: absolute chunk-aligned disk sizing, sparse growth,
+  pre-command guest resize, shrink rejection, API/docs, and HVF smoke coverage.
+- [x] S1 review/commit.
 - [ ] S2 downstream Compose and fan-out measurements.
 
 ### S0 — One-shot `run --commit`

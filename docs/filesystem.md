@@ -35,6 +35,10 @@ guest command. The transaction holds the rootfs cache lock from snapshot
 sealing through the completeness stamp, metadata write, and atomic local-ref
 replacement, so concurrent rootfs collection cannot remove an unpublished CAS
 object. Failed commands and failed snapshots do not update the ref.
+With `--disk-size`, the runtime extends only its private sparse head to the
+requested absolute, chunk-aligned size and requires guest `resize2fs` success
+before starting the user command. The committed rootfs storage descriptor and
+disk index use that grown logical size; the immutable source index is unchanged.
 
 Plain `spore run --rootfs PATH` is still a local read-only escape hatch. Named
 `spore create --rootfs PATH` records exact immutable rootfs identity in the

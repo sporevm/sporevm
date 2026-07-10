@@ -91,6 +91,11 @@ pub const HostStreamState = enum {
     failed,
 };
 
+pub const HostStreamStart = enum {
+    immediate,
+    control,
+};
+
 pub const HostStreamOutput = enum {
     stdout,
     stderr,

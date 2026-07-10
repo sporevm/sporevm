@@ -93,6 +93,7 @@ pub const Config = struct {
     /// Optional minimal host-initiated vsock stream used by benchmark harnesses.
     exec_probe: ?*vsock.HostStream = null,
     exec_probe_timeout_ms: u64 = 30_000,
+    exec_probe_start: vsock.HostStreamStart = .immediate,
     exec_probe_completes_run: bool = true,
     exec_probe_failure_fatal: bool = true,
     /// Optional virtio-net frame backend. The default remains closed.
@@ -210,6 +211,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var config = input_config;
     const setup_start = monotonicMs();
     try topology.validateVcpuCount(config.vcpus);
+    if (config.exec_probe_start == .control and (config.exec_probe == null or config.exec_control == null)) return error.DeferredExecProbeRequiresControl;
     if (config.vcpus != 1 and (config.dirty_tracking.enabled or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
         return error.UnsupportedVcpuCount;
     }
@@ -538,13 +540,15 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         );
     }
     var attach_probe_ms: u64 = 0;
-    if (config.exec_probe) |probe| {
-        const attach_probe_start = monotonicMs();
-        try vsock_dev.attachHostStream(probe);
-        probe.markStarted();
-        const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
-        try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
-        attach_probe_ms = monotonicMs() - attach_probe_start;
+    if (config.exec_probe_start == .immediate) {
+        if (config.exec_probe) |probe| {
+            const attach_probe_start = monotonicMs();
+            try vsock_dev.attachHostStream(probe);
+            probe.markStarted();
+            const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
+            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
+            attach_probe_ms = monotonicMs() - attach_probe_start;
+        }
     }
     if (config.resume_dir == null) {
         std.log.debug(
@@ -660,7 +664,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
-                if (!exec_probe_done and probe.elapsedMs() > config.exec_probe_timeout_ms) {
+                if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > config.exec_probe_timeout_ms) {
                     if (config.exec_probe_failure_fatal) return error.VsockProbeTimedOut;
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;
@@ -1212,12 +1216,14 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
     }
 
     var attach_probe_ms: u64 = 0;
-    if (options.config.exec_probe) |probe| {
-        const attach_probe_start = monotonicMs();
-        try options.vsock_dev.attachHostStream(probe);
-        probe.markStarted();
-        try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, null, @intCast(options.vsock_transport_index));
-        attach_probe_ms = monotonicMs() - attach_probe_start;
+    if (options.config.exec_probe_start == .immediate) {
+        if (options.config.exec_probe) |probe| {
+            const attach_probe_start = monotonicMs();
+            try options.vsock_dev.attachHostStream(probe);
+            probe.markStarted();
+            try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, null, @intCast(options.vsock_transport_index));
+            attach_probe_ms = monotonicMs() - attach_probe_start;
+        }
     }
     const start_ms = monotonicMs();
     std.log.debug(
@@ -1350,7 +1356,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                     }
                     exec_probe_done = true;
                 }
-                if (!exec_probe_done and probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
+                if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
                     if (options.config.exec_probe_failure_fatal) {
                         state.finish(.{ .err = error.VsockProbeTimedOut });
                         continue;

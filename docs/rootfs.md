@@ -89,6 +89,23 @@ ordinary committed disk state. The first version accepts fresh non-interactive
 flags. Source and destination may be the same local ref because SporeVM resolves
 the source before publishing the result.
 
+Image commit can grow the root disk before setup runs:
+
+```bash
+spore run \
+  --image local/docker-capable:base \
+  --disk-size 40gb \
+  --commit local/docker-capable:large \
+  -- /usr/local/bin/prepare
+```
+
+`--disk-size` is an absolute logical size, must be 64 KiB aligned, and cannot
+shrink the source image. The first version requires `--commit`. SporeVM grows
+the sparse block device, runs `resize2fs /dev/vda` inside the guest before the
+user command, and publishes nothing if block growth or filesystem resize fails.
+The source image must provide `/bin/sh` and `resize2fs`; this is the same guest
+tool requirement as an executing `spore build` cache miss.
+
 Commit is the storage-preparation layer for fan-out, not the warm-machine
 layer. Prepare stable dependencies or Docker data into an image, put frequently
 changing code above it with `spore build FROM local/...`, then capture one warm

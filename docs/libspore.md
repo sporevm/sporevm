@@ -191,6 +191,9 @@ fresh-image path because it inherits the resolved source image config.
 `.image_commit` event carries the mutable ref, resolved immutable image ref,
 and rootfs index digest without returning allocator-owned strings from the
 short-lived managed-run arena.
+Set `.disk_size` to a 64 KiB-aligned absolute byte size when that commit needs a
+larger root disk. Values below the source image size are rejected before boot;
+guest filesystem-resize failure leaves the destination ref unchanged.
 
 Use `runFromSpore` for `spore run --from` semantics:
 

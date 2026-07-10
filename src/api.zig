@@ -16,6 +16,7 @@ const memory_config = @import("memory.zig");
 const platform = @import("platform.zig");
 const attach_mod = @import("attach.zig");
 const rootfs_mod = @import("rootfs.zig");
+const rootfs_cas = @import("rootfs_cas.zig");
 const run_mod = @import("run.zig");
 const gicv3 = @import("gicv3.zig");
 const spore = @import("spore.zig");
@@ -260,6 +261,8 @@ pub const ManagedRunOptions = struct {
     continue_after_save: bool = false,
     /// Publish the writable root disk under this local image ref after exit zero.
     commit_ref: ?[]const u8 = null,
+    /// Absolute logical root-disk size for a commit run. Must not shrink the source image.
+    disk_size: ?u64 = null,
     annotations: Annotations = .{},
     network: NetworkMode = .disabled,
     network_policy: NetworkConfig = .{},
@@ -861,6 +864,9 @@ pub fn runManaged(
             return error.InvalidRunCommitOptions;
         }
     }
+    if (options.disk_size) |disk_size| {
+        if (options.commit_ref == null or disk_size == 0 or disk_size % rootfs_cas.default_chunk_size != 0) return error.InvalidRunDiskSize;
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -878,6 +884,11 @@ pub fn runManaged(
     const kernel_path = options.kernel_path orelse try run_mod.resolveDefaultKernelPath(init, arena);
     const initrd_path = try run_mod.resolveConfiguredInitrdPath(init, options.initrd_path);
     const guest_env = try run_mod.mergeGuestEnv(arena, rootfs.guest_env, options.guest_env);
+    const rootfs_grow_target = if (options.disk_size) |target| blk: {
+        const resolved_rootfs = rootfs.rootfs orelse return error.RunCommitRootfsNotSnapshotable;
+        const storage = resolved_rootfs.storage orelse return error.RunCommitRootfsNotSnapshotable;
+        break :blk try run_mod.rootfsGrowTarget(storage.logical_size, target);
+    } else 0;
 
     return run_mod.execute(.{ .io = init.io, .environ_map = init.environ_map }, arena, .{
         .backend = options.backend,
@@ -886,6 +897,7 @@ pub fn runManaged(
         .auto_memory_hotplug_capable = default_kernel and default_initrd,
         .rootfs_path = rootfs.path,
         .rootfs = rootfs.rootfs,
+        .rootfs_grow_target = rootfs_grow_target,
         .command = options.command,
         .injected_files = options.injected_files,
         .interactive = options.interactive,

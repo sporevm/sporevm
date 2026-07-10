@@ -192,6 +192,8 @@ spore run \
 Commit is disk-only and leaves the destination ref unchanged unless the guest
 command and publication both succeed. Save one warm machine from the resulting
 image, then use offline `spore fork` for low-latency fan-out.
+Add `--disk-size 40gb` when preparation needs a larger root disk; commit grows
+the sparse device and runs guest `resize2fs` before the requested command.
 
 Build a reusable rootfs artifact explicitly:
 

@@ -182,6 +182,7 @@ fn runParsed(
         .save_trigger = parsed.save_trigger,
         .continue_after_save = parsed.continue_after_save,
         .commit_ref = parsed.commit_ref,
+        .disk_size = parsed.disk_size,
         .network = parsed.network,
         .network_policy = parsed.network_policy,
         .spore_executable = spore_executable,

@@ -90,6 +90,7 @@ pub const Config = struct {
     /// Optional minimal host-initiated vsock stream used by benchmark harnesses.
     exec_probe: ?*vsock.HostStream = null,
     exec_probe_timeout_ms: u64 = 30_000,
+    exec_probe_start: vsock.HostStreamStart = .immediate,
     exec_probe_completes_run: bool = true,
     exec_probe_failure_fatal: bool = true,
     /// Optional virtio-net frame backend. The default remains closed.
@@ -213,6 +214,7 @@ const SpinLock = struct {
 pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var config = input_config;
     try topology.validateVcpuCount(config.vcpus);
+    if (config.exec_probe_start == .control and (config.exec_probe == null or config.exec_control == null)) return error.DeferredExecProbeRequiresControl;
 
     var resume_parsed: ?std.json.Parsed(spore.Manifest) = null;
     defer if (resume_parsed) |*parsed| parsed.deinit();
@@ -484,10 +486,12 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             },
         );
     }
-    if (config.exec_probe) |probe| {
-        probe.markStarted();
-        try vsock_dev.attachHostStream(probe);
-        try flushVsockRxKvm(vm_fd, &vsock_dev, &transports_buf[vsock_transport_index], ram, vsock_transport_index);
+    if (config.exec_probe_start == .immediate) {
+        if (config.exec_probe) |probe| {
+            probe.markStarted();
+            try vsock_dev.attachHostStream(probe);
+            try flushVsockRxKvm(vm_fd, &vsock_dev, &transports_buf[vsock_transport_index], ram, vsock_transport_index);
+        }
     }
     if (config.vcpus != 1) {
         return runFreshMultiVcpu(allocator, .{
@@ -612,7 +616,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
-                if (!exec_probe_done and probe.elapsedMs() > config.exec_probe_timeout_ms) {
+                if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > config.exec_probe_timeout_ms) {
                     if (config.exec_probe_failure_fatal) return error.VsockProbeTimedOut;
                     if (pending_kvm_completion) {
                         try kvm.completePendingExit(vcpu_fd, run_bytes);
@@ -1039,7 +1043,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
                 state.finish(.{ .exit = .probe_complete });
                 continue;
             }
-            if (probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
+            if (probe.state != .idle and probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
                 state.finish(.{ .err = error.VsockProbeTimedOut });
                 continue;
             }

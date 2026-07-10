@@ -941,6 +941,20 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
             @errorName(err),
         );
     }
+    if (err == error.InvalidRunDiskSize or err == error.RunDiskSizeWouldShrink) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: --disk-size must be a 64KiB-aligned absolute size at least as large as the source image and currently requires --commit",
+            @errorName(err),
+        );
+    }
+    if (err == error.RunCommitGuestResizeFailed or err == error.RunCommitGuestResizeTimedOut) {
+        return machine_output.CliError.init(
+            .runtime_execution_failed,
+            "spore run: image commit could not run guest resize2fs before the command; ensure the source image provides /bin/sh and resize2fs; the destination ref was not updated",
+            @errorName(err),
+        );
+    }
     if (err == error.RunCommitDidNotComplete or err == error.DeviceStatePending) {
         return machine_output.CliError.init(
             .runtime_execution_failed,
@@ -1051,6 +1065,7 @@ pub const CliOptions = struct {
     image_ref: ?[]const u8 = null,
     pull_policy: PullPolicy = .missing,
     commit_ref: ?[]const u8 = null,
+    disk_size: ?u64 = null,
     save_path: ?[]const u8 = null,
     save_trigger: capture.Trigger = .exit,
     continue_after_save: bool = false,
@@ -1096,6 +1111,7 @@ pub const cli_usage =
     \\  --pull=missing|always|never
     \\                          Pull policy for mutable --image refs (default: missing)
     \\  --commit LOCAL_REF      On command success, publish the writable root disk as an image
+    \\  --disk-size SIZE        Grow an image-backed commit disk before the command (e.g. 40gb)
     \\  --net                   Experimental SporeVM-managed networking
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
@@ -1145,6 +1161,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var image_ref: ?[]const u8 = null;
     var pull_policy: PullPolicy = .missing;
     var commit_ref: ?[]const u8 = null;
+    var disk_size: ?u64 = null;
     var save_path: ?[]const u8 = null;
     var save_trigger: capture.Trigger = .exit;
     var save_trigger_set = false;
@@ -1182,6 +1199,17 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             image_ref = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--commit")) {
             commit_ref = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--disk-size")) {
+            const raw = takeValue(args, &i, args[i]);
+            const parsed = memory_config.parse(raw) catch |err| {
+                std.debug.print("spore run: invalid --disk-size {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
+            if (parsed.policy != .explicit or parsed.bytes % rootfs_cas.default_chunk_size != 0) {
+                std.debug.print("spore run: --disk-size must be a positive 64KiB-aligned size like 20gb\n", .{});
+                std.process.exit(2);
+            }
+            disk_size = parsed.bytes;
         } else if (std.mem.eql(u8, args[i], "--pull")) {
             const raw = takeValue(args, &i, args[i]);
             pull_policy = PullPolicy.parse(raw) orelse {
@@ -1302,6 +1330,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.debug.print("spore run: --pull requires --image\n", .{});
         std.process.exit(2);
     }
+    if (disk_size != null and commit_ref == null) {
+        std.debug.print("spore run: --disk-size currently requires --commit\n", .{});
+        std.process.exit(2);
+    }
     if (commit_ref) |ref| {
         rootfs_mod.validateLocalTagRef(ref) catch |err| {
             std.debug.print("spore run: invalid --commit ref {s}: {s}\n", .{ ref, @errorName(err) });
@@ -1400,6 +1432,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .image_ref = image_ref,
         .pull_policy = pull_policy,
         .commit_ref = commit_ref,
+        .disk_size = disk_size,
         .save_path = save_path,
         .save_trigger = save_trigger,
         .continue_after_save = continue_after_save,
@@ -2727,12 +2760,16 @@ const CommitControl = struct {
     guest_port: u32,
     timeout_ms: u64,
     cache_root: []const u8,
-    phase: Phase = .wait_command,
+    phase: Phase,
+    resize_stream: vsock.HostStream = undefined,
     freeze_stream: vsock.HostStream = undefined,
     storage: ?spore.RootfsStorage = null,
     cache_lock: ?rootfs_mod.RootfsCacheLock = null,
 
     const Phase = enum {
+        start_resize,
+        active_resize,
+        start_command,
         wait_command,
         start_freeze,
         active_freeze,
@@ -2757,6 +2794,45 @@ const CommitControl = struct {
 
     fn poll(self: *CommitControl, dev: *vsock.Vsock) !vsock.ControlAction {
         switch (self.phase) {
+            .start_resize => {
+                const now: u64 = @intCast(Io.Clock.real.now(self.io).nanoseconds);
+                const request = try execRequestWithSession(
+                    self.allocator,
+                    &.{ "/bin/sh", "-lc", "resize2fs /dev/vda" },
+                    "spore-run-commit-resize",
+                    now,
+                );
+                self.resize_stream = try vsock.HostStream.init(self.guest_port, request);
+                self.resize_stream.host_port = vsock.HostStream.deriveHostPort(request);
+                try self.startStream(dev, &self.resize_stream);
+                self.phase = .active_resize;
+                return .keep_running;
+            },
+            .active_resize => {
+                _ = try dev.flushHostStreamOutbound();
+                switch (self.resize_stream.state) {
+                    .complete => {
+                        const exit_code = self.resize_stream.exit_code orelse return error.BadRunExitFrame;
+                        dev.resetHostStream();
+                        if (exit_code != 0) return error.RunCommitGuestResizeFailed;
+                        self.phase = .start_command;
+                    },
+                    .failed => {
+                        dev.resetHostStream();
+                        return error.RunCommitGuestResizeFailed;
+                    },
+                    else => if (self.resize_stream.elapsedMs() > self.timeout_ms) {
+                        dev.resetHostStream();
+                        return error.RunCommitGuestResizeTimedOut;
+                    },
+                }
+                return .keep_running;
+            },
+            .start_command => {
+                try self.startStream(dev, self.command_stream);
+                self.phase = .wait_command;
+                return .keep_running;
+            },
             .wait_command => {
                 if (self.command_stream.state != .complete) return .keep_running;
                 const exit_code = self.command_stream.exit_code orelse return error.BadRunExitFrame;
@@ -2799,6 +2875,12 @@ const CommitControl = struct {
             .snapshot => return .{ .rootfs_snapshot = .{ .dir = self.cache_root } },
             .done => return .stop,
         }
+    }
+
+    fn startStream(_: *CommitControl, dev: *vsock.Vsock, stream: *vsock.HostStream) !void {
+        try dev.attachHostStream(stream);
+        stream.markStarted();
+        _ = try dev.flushHostStreamOutbound();
     }
 
     fn completeRootfsSnapshot(self: *CommitControl, maybe_disk: ?spore.Disk) !void {
@@ -2844,6 +2926,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const setup_start = monotonicMs();
     try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
+    if (opts.rootfs_grow_target != 0 and opts.commit == null) return error.InvalidRunDiskSize;
     if (opts.commit != null and (opts.resume_dir != null or opts.save_path != null or !opts.save_trigger.isExit() or opts.continue_after_save or opts.interactive or opts.tty or opts.command.len == 0)) return error.InvalidRunCommitOptions;
     if (opts.tty and opts.resume_dir != null and opts.command.len != 0) return error.TtyRunFromSporeUnsupported;
     if (opts.resume_dir != null and opts.command.len == 0) {
@@ -2923,6 +3006,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         .guest_port = opts.guest_port,
         .timeout_ms = opts.timeout_ms,
         .cache_root = cache_root,
+        .phase = if (opts.rootfs_grow_target != 0) .start_resize else .wait_command,
     } else null;
     defer if (commit_control) |*control| control.deinit();
     if (commit_control != null and runtime_disk.snapshot() == null) return error.RunCommitRootfsNotSnapshotable;
@@ -2992,6 +3076,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .resume_generation = opts.resume_generation,
                 .ram_backing_fd = local_backing.fd,
                 .exec_probe = &stream,
+                .exec_probe_start = if (opts.rootfs_grow_target != 0) .control else .immediate,
                 .exec_probe_completes_run = opts.commit == null,
                 .exec_control = exec_control,
                 .exec_probe_timeout_ms = opts.timeout_ms,
@@ -3024,6 +3109,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .resume_generation = opts.resume_generation,
                 .ram_backing_fd = local_backing.fd,
                 .exec_probe = &stream,
+                .exec_probe_start = if (opts.rootfs_grow_target != 0) .control else .immediate,
                 .exec_probe_completes_run = opts.commit == null,
                 .exec_control = exec_control,
                 .exec_probe_timeout_ms = opts.timeout_ms,
@@ -3543,6 +3629,11 @@ fn rootfsWritable(opts: Options) bool {
 
 fn hasRootfs(opts: Options) bool {
     return opts.rootfs_path != null or opts.rootfs != null;
+}
+
+pub fn rootfsGrowTarget(current_size: u64, requested_size: u64) !u64 {
+    if (requested_size < current_size) return error.RunDiskSizeWouldShrink;
+    return if (requested_size == current_size) 0 else requested_size;
 }
 
 pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, network: NetworkMode, build_context: bool) ![]const u8 {
@@ -4539,6 +4630,26 @@ test "run cli parser accepts image commit" {
     try std.testing.expectEqualStrings("local/example:prepared", opts.commit_ref.?);
     try std.testing.expectEqual(@as(usize, 1), opts.injected_file_sources.len);
     try std.testing.expectEqualStrings("/bin/sh", opts.command[0]);
+}
+
+test "run cli parser accepts commit disk size" {
+    const opts = try parseCliArgs(&.{
+        "--image",
+        "docker.io/library/alpine:3.20",
+        "--commit",
+        "local/example:prepared",
+        "--disk-size",
+        "20gb",
+        "--",
+        "/bin/true",
+    });
+    try std.testing.expectEqual(@as(?u64, 20 * 1024 * 1024 * 1024), opts.disk_size);
+}
+
+test "run disk size is absolute and cannot shrink" {
+    try std.testing.expectEqual(@as(u64, 0), try rootfsGrowTarget(4 * 1024 * 1024, 4 * 1024 * 1024));
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), try rootfsGrowTarget(4 * 1024 * 1024, 8 * 1024 * 1024));
+    try std.testing.expectError(error.RunDiskSizeWouldShrink, rootfsGrowTarget(8 * 1024 * 1024, 4 * 1024 * 1024));
 }
 
 test "run cli parser accepts image pull policy" {
