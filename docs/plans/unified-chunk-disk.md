@@ -614,8 +614,8 @@ structure with two instantiations (RAM 2MiB, disk 64KiB).
 
 ### U6 — Production disk-backed fast fork
 
-Status: backend primitive and post-save baseline authority complete; the
-portable runtime disk head is the active next slice.
+Status: backend primitive, post-save baseline authority, and portable runtime
+disk head complete; the one-shot fd-claim transport is the active next slice.
 
 `ChunkMappedDisk.fork()` can already copy the one-level source map and clone
 an unlinked overlay fd, and its unit tests cover rejection, copy fallback,
@@ -740,7 +740,14 @@ save→rename→fork→save coverage.
    the existing in-process `ForkedDisk` to serialize its owned digest tables.
    Add baseline leases, same-filesystem overlay placement, APFS clone plus
    Linux `FICLONE`, explicit slow-copy mode, descriptor unit/fuzz tests, and
-   the 8GiB disk-only benchmark. No CLI.
+   the 8GiB disk-only benchmark. No CLI. **Complete for the head boundary:**
+   `RuntimeDisk` now exports and adopts a versioned, bounded descriptor plus an
+   owned unlinked fd, validates the independently opened baseline and fd shape,
+   uses native APFS/Linux cloning by default, and exposes a measured explicit
+   copy fallback. Descriptor unit/fuzz coverage and the opt-in 0/50/100% 8GiB
+   benchmark landed with it. The lifecycle record that makes the baseline a
+   GC/prune root lands with item 4, where the record is actually created and
+   can be rollback-tested; the descriptor already binds its kind and identity.
 3. **Add the one-shot fd-claim transport.** Land `SCM_RIGHTS` send/receive,
    token registry, indexed bounded control requests, exact-length binary
    descriptor framing, receiver validation/ownership, expiry/cancellation,

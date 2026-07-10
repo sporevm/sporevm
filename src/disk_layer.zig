@@ -9,6 +9,7 @@
 const std = @import("std");
 const block_source = @import("block_source.zig");
 const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
+const fd_util = @import("fd.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
 
@@ -109,11 +110,13 @@ fn monotonicMs() Error!u64 {
 }
 
 pub fn createTempOverlay(allocator: std.mem.Allocator) Error!TempOverlay {
-    const template = try allocator.dupeZ(u8, "/tmp/sporevm-disk-head-XXXXXX");
+    const template = try allocator.dupeZ(u8, chunk_mapped_disk.runtime_overlay_dir ++ "/sporevm-disk-head-XXXXXX");
     defer allocator.free(template);
     const fd = mkstemp(template.ptr);
     if (fd < 0) return error.IoFailed;
-    _ = std.c.unlink(template.ptr);
+    errdefer _ = std.c.close(fd);
+    if (std.c.unlink(template.ptr) != 0) return error.IoFailed;
+    try fd_util.setCloseOnExec(fd);
     return .{ .fd = fd };
 }
 

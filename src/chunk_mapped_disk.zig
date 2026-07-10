@@ -10,10 +10,18 @@ const builtin = @import("builtin");
 const block_source = @import("block_source.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
+const fd_util = @import("fd.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
+const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const spore = @import("spore.zig");
 
 extern "c" fn mkstemp(template: [*:0]u8) c_int;
+extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
+extern "c" fn fclonefileat(src_fd: c_int, dst_dir_fd: c_int, dst: [*:0]const u8, flags: c_int) c_int;
+
+/// Runtime overlays and transient clone names deliberately share one host
+/// filesystem so APFS `fclonefileat` and Linux `FICLONE` can stay native.
+pub const runtime_overlay_dir = "/tmp";
 
 pub const Error = error{
     BadClusterSize,
@@ -24,7 +32,8 @@ pub const Error = error{
     ShortWrite,
     ResizeFailed,
     FlushFailed,
-} || chunk_sealer.Error || rootfs_cas.SourceError || spore.Error || block_source.Error || std.mem.Allocator.Error;
+    FastForkUnavailable,
+} || chunk_sealer.Error || rootfs_cas.SourceError || runtime_disk_fork.Error || spore.Error || block_source.Error || std.mem.Allocator.Error;
 
 const Source = enum(u8) {
     base,
@@ -39,12 +48,15 @@ fn sourceIsDirty(source: Source) bool {
     return source == .overlay or source == .zero_dirty;
 }
 
-pub const ForkCloneMethod = enum {
-    reflink,
-    copy,
-};
+pub const ForkCloneMethod = runtime_disk_fork.CloneMethod;
 
 pub const ForkOptions = struct {
+    force_copy: bool = false,
+    quiesced: bool = false,
+};
+
+pub const ExportForkOptions = struct {
+    allow_copy: bool = false,
     force_copy: bool = false,
     quiesced: bool = false,
 };
@@ -354,25 +366,13 @@ pub const ChunkMappedDisk = struct {
         const child_parent = try self.cloneParentIndex();
         errdefer child_parent.deinit(self.allocator);
 
-        const child_fd = try createTempOverlayFd(self.allocator);
-        var fd_owned = true;
-        errdefer {
-            if (fd_owned) _ = std.c.close(child_fd);
-        }
-
-        const clone_method: ForkCloneMethod = if (!options.force_copy and tryCloneOverlay(parent_fd, child_fd))
-            .reflink
-        else blk: {
-            try self.copyOverlayChunks(parent_fd, child_fd);
-            break :blk .copy;
-        };
-
-        fd_owned = false;
+        const cloned = try self.cloneOverlay(parent_fd, .{ .allow_copy = true, .force_copy = options.force_copy });
+        errdefer _ = std.c.close(cloned.fd);
         return .{
             .disk = .{
                 .allocator = self.allocator,
                 .base = self.base,
-                .overlay_fd = child_fd,
+                .overlay_fd = cloned.fd,
                 .size = self.size,
                 .chunk_size = self.chunk_size,
                 .sources = child_sources,
@@ -382,8 +382,87 @@ pub const ChunkMappedDisk = struct {
                 .parent_digests = child_parent.digests,
                 .snapshot_published = self.snapshot_published,
             },
-            .clone_method = clone_method,
+            .clone_method = cloned.method,
         };
+    }
+
+    /// Exports the process-independent portion of a live disk head. The
+    /// caller owns quiescence; this method clones only the overlay and records
+    /// two dense override maps, avoiding per-child digest-table duplication.
+    pub fn exportForkHead(
+        self: *ChunkMappedDisk,
+        baseline: runtime_disk_fork.Baseline,
+        options: ExportForkOptions,
+    ) Error!runtime_disk_fork.Head {
+        std.debug.assert(options.quiesced);
+        const prepare_start_ns = monotonicNs() catch 0;
+        const parent_fd = self.overlay_fd orelse return error.ReadOnly;
+        spore.validateDiskDigest(baseline.identity) catch return error.BadManifest;
+        const bitmap_len = try runtime_disk_fork.bitmapLen(@intCast(self.chunkCount()));
+        const overlay_chunks = try self.allocator.alloc(u8, bitmap_len);
+        errdefer self.allocator.free(overlay_chunks);
+        @memset(overlay_chunks, 0);
+        const zero_chunks = try self.allocator.alloc(u8, bitmap_len);
+        errdefer self.allocator.free(zero_chunks);
+        @memset(zero_chunks, 0);
+        for (self.sources, 0..) |source, chunk_index| switch (source) {
+            .overlay, .overlay_clean => runtime_disk_fork.bitmapSet(overlay_chunks, chunk_index),
+            .zero, .zero_dirty => runtime_disk_fork.bitmapSet(zero_chunks, chunk_index),
+            .base, .cas => {},
+        };
+
+        const identity = try self.allocator.dupe(u8, baseline.identity);
+        errdefer self.allocator.free(identity);
+        const cloned = try self.cloneOverlay(parent_fd, .{
+            .allow_copy = options.allow_copy,
+            .force_copy = options.force_copy,
+        });
+        errdefer _ = std.c.close(cloned.fd);
+        return .{
+            .descriptor = .{
+                .allocator = self.allocator,
+                .baseline = .{ .kind = baseline.kind, .identity = identity },
+                .clone_method = cloned.method,
+                .logical_size = self.size,
+                .chunk_size = self.chunk_size,
+                .chunk_count = @intCast(self.chunkCount()),
+                .overlay_chunks = overlay_chunks,
+                .zero_chunks = zero_chunks,
+            },
+            .overlay_fd = cloned.fd,
+            .stats = .{
+                .prepare_ns = elapsedSince(prepare_start_ns),
+                .copied_bytes = cloned.copied_bytes,
+            },
+        };
+    }
+
+    /// Applies a validated runtime descriptor to a disk freshly opened from
+    /// the descriptor-bound immutable baseline. Returns the replaced overlay
+    /// fd so the owning `RuntimeDisk` can complete the ownership transfer.
+    pub fn applyForkDescriptor(
+        self: *ChunkMappedDisk,
+        descriptor: runtime_disk_fork.Descriptor,
+        overlay_fd: std.c.fd_t,
+    ) Error!std.c.fd_t {
+        try descriptor.validate();
+        try runtime_disk_fork.validateOverlayFd(overlay_fd, descriptor.logical_size);
+        const old_overlay_fd = self.overlay_fd orelse return error.ReadOnly;
+        if (descriptor.logical_size != self.size or descriptor.chunk_size != self.chunk_size or descriptor.chunk_count != self.chunkCount()) return error.BadManifest;
+        for (self.sources) |source| {
+            if (source == .overlay or source == .overlay_clean or source == .zero_dirty) return error.BadManifest;
+        }
+        for (self.sources, 0..) |*source, chunk_index| {
+            if (descriptor.overlay(chunk_index)) {
+                source.* = .overlay;
+                self.clearCasDigest(chunk_index);
+            } else if (descriptor.zero(chunk_index)) {
+                source.* = .zero_dirty;
+                self.clearCasDigest(chunk_index);
+            }
+        }
+        self.overlay_fd = overlay_fd;
+        return old_overlay_fd;
     }
 
     pub fn attachCasIndex(self: *ChunkMappedDisk, cache_root: []const u8, index: disk_index.DiskIndex) Error!void {
@@ -850,7 +929,7 @@ pub const ChunkMappedDisk = struct {
         return .{ .root = root, .digests = digests };
     }
 
-    fn copyOverlayChunks(self: *ChunkMappedDisk, parent_fd: std.c.fd_t, child_fd: std.c.fd_t) Error!void {
+    fn copyOverlayChunks(self: *ChunkMappedDisk, parent_fd: std.c.fd_t, child_fd: std.c.fd_t) Error!u64 {
         const overlay_size = std.math.cast(std.c.off_t, self.size) orelse return error.BadDiskSize;
         if (std.c.ftruncate(child_fd, overlay_size) != 0) return error.ResizeFailed;
 
@@ -858,6 +937,7 @@ pub const ChunkMappedDisk = struct {
         const buf = try self.allocator.alloc(u8, max_chunk_size);
         defer self.allocator.free(buf);
 
+        var copied_bytes: u64 = 0;
         for (self.sources, 0..) |source, chunk_index| {
             if (source != .overlay and source != .overlay_clean) continue;
             const len = try self.chunkLen(chunk_index);
@@ -865,7 +945,31 @@ pub const ChunkMappedDisk = struct {
             const data = buf[0..len];
             try readExact(parent_fd, data, offset);
             try writeExact(child_fd, data, offset);
+            copied_bytes += len;
         }
+        return copied_bytes;
+    }
+
+    const CloneOverlayOptions = struct {
+        allow_copy: bool,
+        force_copy: bool,
+    };
+
+    const ClonedOverlay = struct {
+        fd: std.c.fd_t,
+        method: ForkCloneMethod,
+        copied_bytes: u64,
+    };
+
+    fn cloneOverlay(self: *ChunkMappedDisk, parent_fd: std.c.fd_t, options: CloneOverlayOptions) Error!ClonedOverlay {
+        if (!options.force_copy) {
+            if (try cloneOverlayNative(self.allocator, parent_fd)) |fd| return .{ .fd = fd, .method = .reflink, .copied_bytes = 0 };
+        }
+        if (!options.allow_copy) return error.FastForkUnavailable;
+        const child_fd = try createTempOverlayFd(self.allocator);
+        errdefer _ = std.c.close(child_fd);
+        const copied_bytes = try self.copyOverlayChunks(parent_fd, child_fd);
+        return .{ .fd = child_fd, .method = .copy, .copied_bytes = copied_bytes };
     }
 };
 
@@ -951,22 +1055,69 @@ fn writeExact(fd: std.c.fd_t, buf: []const u8, offset: u64) Error!void {
     }
 }
 
+fn monotonicNs() Error!u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return error.IoFailed;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn elapsedSince(start_ns: u64) u64 {
+    if (start_ns == 0) return 0;
+    const end_ns = monotonicNs() catch return 0;
+    return end_ns -| start_ns;
+}
+
 fn createTempOverlayFd(allocator: std.mem.Allocator) Error!std.c.fd_t {
-    const template = try allocator.dupeZ(u8, "/tmp/sporevm-disk-fork-XXXXXX");
+    const template = try allocator.dupeZ(u8, runtime_overlay_dir ++ "/sporevm-disk-fork-XXXXXX");
     defer allocator.free(template);
     const fd = mkstemp(template.ptr);
     if (fd < 0) return error.IoFailed;
-    _ = std.c.unlink(template.ptr);
+    errdefer _ = std.c.close(fd);
+    if (std.c.unlink(template.ptr) != 0) return error.IoFailed;
+    try fd_util.setCloseOnExec(fd);
     return fd;
 }
 
-fn tryCloneOverlay(parent_fd: std.c.fd_t, child_fd: std.c.fd_t) bool {
+fn tryCloneOverlayLinux(parent_fd: std.c.fd_t, child_fd: std.c.fd_t) bool {
     if (comptime builtin.os.tag == .linux) {
         const linux = std.os.linux;
         const request = linux.IOCTL.IOW(0x94, 9, c_int);
         return linux.errno(linux.ioctl(child_fd, request, @as(usize, @intCast(parent_fd)))) == .SUCCESS;
     }
     return false;
+}
+
+fn cloneOverlayNative(allocator: std.mem.Allocator, parent_fd: std.c.fd_t) Error!?std.c.fd_t {
+    if (comptime builtin.os.tag == .linux) {
+        const child_fd = try createTempOverlayFd(allocator);
+        if (tryCloneOverlayLinux(parent_fd, child_fd)) return child_fd;
+        _ = std.c.close(child_fd);
+        return null;
+    }
+    if (comptime builtin.os.tag == .macos) return try cloneOverlayMacos(allocator, parent_fd);
+    return null;
+}
+
+fn cloneOverlayMacos(allocator: std.mem.Allocator, parent_fd: std.c.fd_t) Error!?std.c.fd_t {
+    const dir_template = try allocator.dupeZ(u8, runtime_overlay_dir ++ "/sporevm-disk-fork-XXXXXX");
+    defer allocator.free(dir_template);
+    const dir_ptr = mkdtemp(dir_template.ptr) orelse return error.IoFailed;
+    defer _ = std.c.rmdir(dir_ptr);
+    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/overlay", .{std.mem.span(dir_ptr)}, 0);
+    defer allocator.free(path);
+    if (fclonefileat(parent_fd, std.c.AT.FDCWD, path.ptr, 0) != 0) return null;
+    var linked = true;
+    defer {
+        if (linked) _ = std.c.unlink(path.ptr);
+    }
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    if (std.c.unlink(path.ptr) != 0) {
+        _ = std.c.close(fd);
+        return error.IoFailed;
+    }
+    linked = false;
+    return fd;
 }
 
 fn objectDir(allocator: std.mem.Allocator, dir: []const u8) Error![]const u8 {
@@ -1609,6 +1760,163 @@ test "forced-copy fork isolates parent and child overlays" {
     try std.testing.expectEqualSlices(u8, &parent_model, &readback);
     try child.disk.readAt(&readback, 0);
     try std.testing.expectEqualSlices(u8, &child_model, &readback);
+}
+
+test "portable fork head round trips overlay and zero overrides" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const disk_size = 3 * spore.disk_chunk_size;
+    const base_bytes = try allocator.alloc(u8, disk_size);
+    defer allocator.free(base_bytes);
+    for (base_bytes, 0..) |*byte, i| byte.* = @truncate((i * 17) + 9);
+    var model = try allocator.dupe(u8, base_bytes);
+    defer allocator.free(model);
+
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    try base.writeStreamingAll(io, base_bytes);
+    const base_source = block_source.FileBlockSource.init(base.handle, disk_size);
+
+    const parent_fd = try createTempOverlayFd(allocator);
+    defer _ = std.c.close(parent_fd);
+    var parent = try ChunkMappedDisk.initWritable(allocator, base_source, parent_fd, disk_size, spore.disk_chunk_size);
+    defer parent.deinit();
+    const patch = [_]u8{0xA7} ** 127;
+    try parent.writeAt(&patch, spore.disk_chunk_size - 31);
+    @memcpy(model[spore.disk_chunk_size - 31 ..][0..patch.len], &patch);
+    try parent.markZeroChunk(2);
+    @memset(model[2 * spore.disk_chunk_size ..][0..spore.disk_chunk_size], 0);
+
+    var head = try parent.exportForkHead(.{
+        .kind = .rootfs,
+        .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }, .{ .allow_copy = true, .force_copy = true, .quiesced = true });
+    defer head.deinit();
+    try std.testing.expectEqual(runtime_disk_fork.CloneMethod.copy, head.descriptor.clone_method);
+    try std.testing.expectEqual(@as(u64, 2 * spore.disk_chunk_size), head.stats.copied_bytes);
+    const encoded = try head.descriptor.encodeAlloc(allocator);
+    defer allocator.free(encoded);
+    const parsed = try runtime_disk_fork.Descriptor.parse(allocator, encoded);
+    head.descriptor.deinit();
+    head.descriptor = parsed;
+
+    var child_fd = try createTempOverlayFd(allocator);
+    defer {
+        if (child_fd >= 0) _ = std.c.close(child_fd);
+    }
+    var child = try ChunkMappedDisk.initWritable(allocator, base_source, child_fd, disk_size, spore.disk_chunk_size);
+    defer child.deinit();
+    const claimed_fd = head.overlay_fd;
+    const replaced_fd = try child.applyForkDescriptor(head.descriptor, claimed_fd);
+    try std.testing.expectEqual(child_fd, replaced_fd);
+    _ = std.c.close(replaced_fd);
+    child_fd = claimed_fd;
+    head.overlay_fd = -1;
+
+    const readback = try allocator.alloc(u8, disk_size);
+    defer allocator.free(readback);
+    try child.readAt(readback, 0);
+    try std.testing.expectEqualSlices(u8, model, readback);
+
+    const parent_patch = [_]u8{0xB8} ** 33;
+    try parent.writeAt(&parent_patch, 7);
+    try child.readAt(readback[0..parent_patch.len], 7);
+    try std.testing.expectEqualSlices(u8, model[7..][0..parent_patch.len], readback[0..parent_patch.len]);
+
+    const child_patch = [_]u8{0xC9} ** 41;
+    try child.writeAt(&child_patch, spore.disk_chunk_size + 91);
+    try parent.readAt(readback[0..child_patch.len], spore.disk_chunk_size + 91);
+    try std.testing.expectEqualSlices(u8, model[spore.disk_chunk_size + 91 ..][0..child_patch.len], readback[0..child_patch.len]);
+}
+
+test "native portable fork head uses reflink when the runtime overlay filesystem supports it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    const base_bytes = [_]u8{0x5A} ** spore.disk_chunk_size;
+    try base.writeStreamingAll(io, &base_bytes);
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
+    const overlay_fd = try createTempOverlayFd(allocator);
+    defer _ = std.c.close(overlay_fd);
+    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay_fd, base_bytes.len, spore.disk_chunk_size);
+    defer disk.deinit();
+    try disk.writeAt("reflink", 32);
+
+    var head = disk.exportForkHead(.{
+        .kind = .rootfs,
+        .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }, .{ .quiesced = true }) catch |err| switch (err) {
+        error.FastForkUnavailable => if (builtin.os.tag == .macos) return err else return error.SkipZigTest,
+        else => |e| return e,
+    };
+    defer head.deinit();
+    try std.testing.expectEqual(runtime_disk_fork.CloneMethod.reflink, head.descriptor.clone_method);
+    try runtime_disk_fork.validateOverlayFd(head.overlay_fd, head.descriptor.logical_size);
+}
+
+test "8GiB native disk fork benchmark" {
+    if (std.c.getenv("SPOREVM_DISK_FORK_BENCHMARK") == null) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const disk_size: u64 = 8 * 1024 * 1024 * 1024;
+    const logical_size = std.math.cast(std.c.off_t, disk_size) orelse return error.BadDiskSize;
+    const base_fd = try createTempOverlayFd(allocator);
+    defer _ = std.c.close(base_fd);
+    if (std.c.ftruncate(base_fd, logical_size) != 0) return error.ResizeFailed;
+    const overlay_fd = try createTempOverlayFd(allocator);
+    defer _ = std.c.close(overlay_fd);
+    if (std.c.ftruncate(overlay_fd, logical_size) != 0) return error.ResizeFailed;
+
+    const base_source = block_source.FileBlockSource.init(base_fd, disk_size);
+    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay_fd, disk_size, spore.disk_chunk_size);
+    defer disk.deinit();
+    const write_buf = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(write_buf);
+    @memset(write_buf, 0xA5);
+
+    const coverages = [_]usize{ 0, 50, 100 };
+    var materialized_chunks: usize = 0;
+    for (coverages) |coverage| {
+        const target_chunks = disk.sources.len * coverage / 100;
+        while (materialized_chunks < target_chunks) {
+            const batch_chunks = @min(write_buf.len / spore.disk_chunk_size, target_chunks - materialized_chunks);
+            const batch_bytes = batch_chunks * spore.disk_chunk_size;
+            const offset = @as(u64, @intCast(materialized_chunks)) * spore.disk_chunk_size;
+            try writeExact(overlay_fd, write_buf[0..batch_bytes], offset);
+            @memset(disk.sources[materialized_chunks .. materialized_chunks + batch_chunks], .overlay);
+            materialized_chunks += batch_chunks;
+        }
+
+        const start_ns = try monotonicNs();
+        var head = try disk.exportForkHead(.{
+            .kind = .rootfs,
+            .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }, .{ .quiesced = true });
+        defer head.deinit();
+        const elapsed_ns = (try monotonicNs()) - start_ns;
+        const encoded = try head.descriptor.encodeAlloc(allocator);
+        defer allocator.free(encoded);
+        std.debug.print(
+            "disk-fork-benchmark logical_gib=8 overlay_coverage={d}% disk_fork_ms={d:.3} reported_prepare_ms={d:.3} descriptor_bytes={d} copied_bytes={d} clone_method={s}\n",
+            .{
+                coverage,
+                @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms,
+                @as(f64, @floatFromInt(head.stats.prepare_ns)) / std.time.ns_per_ms,
+                encoded.len,
+                head.stats.copied_bytes,
+                @tagName(head.descriptor.clone_method),
+            },
+        );
+        try std.testing.expectEqual(runtime_disk_fork.CloneMethod.reflink, head.descriptor.clone_method);
+        try std.testing.expect(elapsed_ns < 100 * std.time.ns_per_ms);
+    }
 }
 
 test "sequential forks keep a flat chunk map" {

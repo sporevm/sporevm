@@ -11,6 +11,7 @@ const fd_util = @import("fd.zig");
 const local_paths = @import("local_paths.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
+const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const spore = @import("spore.zig");
 const virtio_blk = @import("virtio/blk.zig");
 
@@ -48,6 +49,32 @@ pub const RuntimeDisk = struct {
         return null;
     }
 
+    /// Clones the live writable head without sealing a durable disk index.
+    /// The VMM remains responsible for pausing vCPUs and draining virtio-blk.
+    pub fn exportForkHead(
+        self: *RuntimeDisk,
+        options: chunk_mapped_disk.ExportForkOptions,
+    ) !runtime_disk_fork.Head {
+        const disk = if (self.chunk_mapped) |*value| value else return error.ReadOnly;
+        return disk.exportForkHead(try self.forkBaseline(), options);
+    }
+
+    /// Adopts a claimed head only after this runtime has independently opened
+    /// the exact immutable baseline named by the descriptor.
+    pub fn adoptForkHead(self: *RuntimeDisk, head: *runtime_disk_fork.Head) !void {
+        const disk = if (self.chunk_mapped) |*value| value else return error.ReadOnly;
+        const overlay = if (self.overlay) |*value| value else return error.ReadOnly;
+        const expected = try self.forkBaseline();
+        if (expected.kind != head.descriptor.baseline.kind or !std.mem.eql(u8, expected.identity, head.descriptor.baseline.identity)) return error.BadDescriptor;
+        if (disk.overlay_fd != overlay.fd) return error.BadManifest;
+
+        const claimed_fd = head.overlay_fd;
+        const replaced_fd = try disk.applyForkDescriptor(head.descriptor, claimed_fd);
+        head.overlay_fd = -1;
+        overlay.fd = claimed_fd;
+        _ = std.c.close(replaced_fd);
+    }
+
     pub fn deinit(self: *RuntimeDisk) void {
         if (self.chunk_mapped) |*disk| disk.deinit();
         if (self.overlay) |*overlay| overlay.deinit();
@@ -59,6 +86,18 @@ pub const RuntimeDisk = struct {
     fn baseSource(self: *RuntimeDisk, size: u64) !block_source.FileBlockSource {
         const fd = self.rootfs_fd orelse return error.BadManifest;
         return block_source.FileBlockSource.initWithTrace(fd, size, self.trace_fd);
+    }
+
+    fn forkBaseline(self: *RuntimeDisk) !runtime_disk_fork.Baseline {
+        const base = self.base_disk orelse return error.ReadOnly;
+        const kind: runtime_disk_fork.BaselineKind = if (std.mem.eql(u8, base.kind, spore.disk_kind_chunk_index))
+            .disk_index
+        else if (std.mem.eql(u8, base.kind, spore.disk_kind_cow_block))
+            .rootfs
+        else
+            return error.BadManifest;
+        try spore.validateDiskDigest(base.base);
+        return .{ .kind = kind, .identity = base.base };
     }
 };
 
@@ -462,6 +501,71 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
     try std.testing.expectEqualStrings("efgh", &readback);
     const trace_bytes = try Io.Dir.cwd().readFileAlloc(io, trace_path, arena, .limited(4096));
     try std.testing.expect(std.mem.indexOf(u8, trace_bytes, "\"event\":\"rootfs_open\"") != null);
+}
+
+test "runtime disk exports and adopts a portable fork head" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-runtime-disk-portable-fork-head";
+    const rootfs_path = tmp ++ "/source.ext4";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384) ++ ("ijkl" ** 16384);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
+    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    const context = Context{ .io = io, .environ_map = &env };
+    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
+
+    var parent = try open(context, allocator, .{ .rootfs = rootfs });
+    defer parent.deinit();
+    var child = try open(context, allocator, .{ .rootfs = rootfs });
+    defer child.deinit();
+
+    const parent_patch = [_]u8{0xA5} ** 97;
+    try parent.chunk_mapped.?.writeAt(&parent_patch, spore.disk_chunk_size - 17);
+    try parent.chunk_mapped.?.markZeroChunk(2);
+    var head = try parent.exportForkHead(.{ .allow_copy = true, .force_copy = true, .quiesced = true });
+    defer head.deinit();
+    const parent_overlay_fd = parent.overlay.?.fd;
+    const replaced_child_fd = child.overlay.?.fd;
+    try child.adoptForkHead(&head);
+    try std.testing.expectEqual(@as(std.c.fd_t, -1), head.overlay_fd);
+    try std.testing.expect(parent.overlay.?.fd == parent_overlay_fd);
+    try std.testing.expect(child.overlay.?.fd != replaced_child_fd);
+    try std.testing.expectEqual(@as(c_int, -1), std.c.fcntl(replaced_child_fd, std.c.F.GETFD, @as(c_int, 0)));
+
+    const parent_bytes = try allocator.alloc(u8, rootfs_bytes.len);
+    defer allocator.free(parent_bytes);
+    const child_bytes = try allocator.alloc(u8, rootfs_bytes.len);
+    defer allocator.free(child_bytes);
+    try parent.chunk_mapped.?.readAt(parent_bytes, 0);
+    try child.chunk_mapped.?.readAt(child_bytes, 0);
+    try std.testing.expectEqualSlices(u8, parent_bytes, child_bytes);
+
+    try parent.chunk_mapped.?.writeAt("parent", 3);
+    try child.chunk_mapped.?.writeAt("child", spore.disk_chunk_size + 1024);
+    var readback: [6]u8 = undefined;
+    try child.chunk_mapped.?.readAt(&readback, 3);
+    try std.testing.expectEqualSlices(u8, rootfs_bytes[3..][0..readback.len], &readback);
+    try parent.chunk_mapped.?.readAt(readback[0..5], spore.disk_chunk_size + 1024);
+    try std.testing.expectEqualSlices(u8, rootfs_bytes[spore.disk_chunk_size + 1024 ..][0..5], readback[0..5]);
+
+    var mismatched = try parent.exportForkHead(.{ .allow_copy = true, .force_copy = true, .quiesced = true });
+    defer mismatched.deinit();
+    const mutable_identity = @constCast(mismatched.descriptor.baseline.identity);
+    mutable_identity[mutable_identity.len - 1] = if (mutable_identity[mutable_identity.len - 1] == 'a') 'b' else 'a';
+    try std.testing.expectError(error.BadDescriptor, child.adoptForkHead(&mismatched));
+    try std.testing.expect(mismatched.overlay_fd >= 0);
 }
 
 test "runtime disk lazily faults rootfs cas chunks when the flat artifact is missing" {

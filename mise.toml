@@ -180,6 +180,10 @@ description = "Smoke writable rootfs disk layer save and run-from replay"
 run = "mise run build:release && scripts/benchmark/writable-rootfs.sh --iterations 1"
 description = "Benchmark writable rootfs COW, sealed append, and replay paths"
 
+[tasks."benchmark:disk-fork"]
+run = "SPOREVM_DISK_FORK_BENCHMARK=1 zig test src/chunk_mapped_disk.zig -O ReleaseFast --test-filter '8GiB native disk fork benchmark'"
+description = "Benchmark 8GiB native disk-head cloning at 0%, 50%, and 100% overlay coverage"
+
 [tasks."smoke:local-pull"]
 run = "mise run build && test/smoke/fanout/local-pull.sh"
 description = "Smoke local file:// pull materialization and restored rootfs fan-out"
