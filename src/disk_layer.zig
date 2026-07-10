@@ -57,11 +57,40 @@ pub const SnapshotState = struct {
         if (self.active.dirtyClusterCount() == 0) {
             if (std.mem.eql(u8, self.base.kind, spore.disk_kind_cow_block) and !self.active.hasPublishedSnapshot()) return null;
         }
-        return switch (self.active) {
-            .chunk_mapped => |disk| try disk.snapshotIndex(dir, self.base.device, quiesced),
+        const start_ms = try monotonicMs();
+        const dirty_chunks = self.active.dirtyClusterCount();
+        var stats: chunk_mapped_disk.SnapshotStats = .{};
+        const result = switch (self.active) {
+            .chunk_mapped => |disk| try disk.snapshotIndexWithStats(dir, self.base.device, quiesced, &stats),
         };
+        std.log.info(
+            "disk snapshot metrics: logical_mib={d} chunks={d} dirty_chunks={d} full_scan={} sealed_chunks={d} parent_chunks_reused={d} parent_objects_linked={d} parent_objects_reused={d} parent_objects_copied={d} parent_object_mib={d} zero_scan_ms={d} hash_ms={d} object_write_ms={d} total_ms={d}",
+            .{
+                result.size / 1024 / 1024,
+                std.math.divCeil(u64, result.size, result.chunk_size) catch 0,
+                dirty_chunks,
+                stats.full_scan,
+                stats.work.sealed_chunks,
+                stats.parent_chunks_reused,
+                stats.parent_objects_linked,
+                stats.parent_objects_reused,
+                stats.parent_objects_copied,
+                stats.parent_object_bytes / 1024 / 1024,
+                stats.work.zero_scan_ns / std.time.ns_per_ms,
+                stats.work.hash_ns / std.time.ns_per_ms,
+                stats.work.chunk_write_ns / std.time.ns_per_ms,
+                (try monotonicMs()) -| start_ms,
+            },
+        );
+        return result;
     }
 };
+
+fn monotonicMs() Error!u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return error.IoFailed;
+    return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
 
 pub fn createTempOverlay(allocator: std.mem.Allocator) Error!TempOverlay {
     const template = try allocator.dupeZ(u8, "/tmp/sporevm-disk-head-XXXXXX");

@@ -182,6 +182,21 @@ TTI rows. Each workload/mode pair becomes a comparable result, for example:
 - `writable_rootfs/package-install:sealed-layer-append`
 - `writable_rootfs/package-install:sealed-layer-replay`
 
+For the Kubernetes parent-preparation shape specifically, use:
+
+```console
+scripts/benchmark/hot-run-save.sh --spore-bin zig-out/bin/spore --backend kvm
+```
+
+This prewarms `node:22-bookworm-slim`, then times fresh
+`spore run --image ... --save ... --save-on USR1` captures triggered by the
+same stdout marker used by the public Kubernetes runtime. Each capture records
+the disk snapshot metrics. The benchmark fails if a hot capture performs a
+full logical-rootfs scan instead of sealing only dirty chunks; use
+`--allow-full-scan` only when comparing historical binaries that predate the
+guardrail. Performance claims from this benchmark require a ReleaseSafe binary
+on Linux ARM64/KVM.
+
 The timed value is the product-path command duration from the underlying script,
 stored in the suite's existing `tti_ms` summary field so the same comparator can
 catch regressions. These rows answer "what does writable rootfs capture, append,
