@@ -34,8 +34,10 @@ memory:
 
 The backing file is never portable restore authority. Product restore maps it
 only when `ram.backing.proof` validates against the canonical memory index
-identity, opened file identity, backing metadata, and host-local runtime key. Missing,
-corrupt, foreign-key, symlinked, or mismatched proofs fall back to chunks.
+identity, opened file identity, backing metadata, and host-local runtime key.
+That fingerprint uses the same canonical `spore-disk-index-v1` byte encoding as
+disk and rootfs indexes. Missing, corrupt, foreign-key, symlinked, or mismatched
+proofs fall back to chunks.
 
 ## Local CoW
 
