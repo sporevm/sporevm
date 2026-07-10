@@ -830,6 +830,19 @@ The build cache version moved to `sporevm-build-v4` so checkpoints created by
 the old split hash/emission path cannot be reused; earlier records remain GC
 roots only.
 
+Implementation note (2026-07-10, WORKDIR and COPY filesystem semantics):
+`WORKDIR` is now a cacheable filesystem step, not metadata-only state. The
+guest creates its normalized absolute path through the same rootfs-confined
+resolution used by COPY, snapshots it, and only then applies it to later RUN
+and relative COPY instructions. COPY resolves an existing destination
+directory at apply time even when the Dockerfile destination has no trailing
+slash, and copied files/directories are explicitly reset to root ownership
+when they replace existing entries. The VM smoke requires WORKDIR creation
+before the following RUN, exercises a no-slash existing-directory COPY, and
+overwrites a deliberately non-root file. The build cache version moved to
+`sporevm-build-v6`; v5 records remain GC roots but cannot represent the new
+WORKDIR checkpoint or corrected ownership outcomes.
+
 Implementation note (2026-07-10, RUN descendant cleanup): every build RUN
 shell is moved into a dedicated cgroup v2 leaf before its start gate opens.
 After the direct shell exits, the guest writes `cgroup.kill`, waits for the

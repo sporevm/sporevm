@@ -68,14 +68,24 @@ pub const CopyStep = struct {
     requests: []const CopyRequest,
 };
 
+pub const WorkdirStep = struct {
+    line: usize = 0,
+    canonical_instruction: []const u8,
+    target: []const u8,
+    env_digest: []const u8,
+    workdir: []const u8,
+};
+
 pub const Step = union(enum) {
     run: RunStep,
     copy: CopyStep,
+    workdir: WorkdirStep,
 
     fn canonicalInstruction(self: Step) []const u8 {
         return switch (self) {
             .run => |step| step.canonical_instruction,
             .copy => |step| step.canonical_instruction,
+            .workdir => |step| step.canonical_instruction,
         };
     }
 
@@ -83,6 +93,7 @@ pub const Step = union(enum) {
         return switch (self) {
             .run => |step| step.line,
             .copy => |step| step.line,
+            .workdir => |step| step.line,
         };
     }
 };
@@ -122,6 +133,17 @@ pub fn cacheInputForStep(platform: rootfs_mod.Platform, parent_index_digest: []c
                 .workdir = copy.workdir,
             } },
         },
+        .workdir => |workdir| .{
+            .platform = platform,
+            .parent_index_digest = parent_index_digest,
+            .canonical_instruction = workdir.canonical_instruction,
+            .disk_grow_target = disk_grow_target,
+            .operation = .{ .workdir = .{
+                .target = workdir.target,
+                .env_digest = workdir.env_digest,
+                .workdir = workdir.workdir,
+            } },
+        },
     };
 }
 
@@ -144,6 +166,7 @@ const ActiveStream = enum {
     resize,
     run,
     copy,
+    workdir,
     freeze,
     thaw,
 };
@@ -212,7 +235,7 @@ fn networkModeForSteps(steps: []const Step) !step_cache.NetworkMode {
                 mode = run.network_mode;
             }
         },
-        .copy => {},
+        .copy, .workdir => {},
     };
     return mode orelse .none;
 }
@@ -333,6 +356,10 @@ const BuildControl = struct {
                 self.active_copy_request_index = 0;
                 try self.startCopyRequest(dev);
             },
+            .workdir => |workdir| {
+                const request = try workdirRequest(self.allocator, session_id, workdir.target);
+                try self.startStream(dev, request, .spore_stream_v1, .workdir, "");
+            },
         }
         self.phase = .active_run;
     }
@@ -340,7 +367,7 @@ const BuildControl = struct {
     fn startCopyRequest(self: *BuildControl, dev: *vsock.Vsock) !void {
         const copy = switch (self.steps[self.step_index]) {
             .copy => |copy| copy,
-            .run => return error.BadManifest,
+            .run, .workdir => return error.BadManifest,
         };
         if (self.active_copy_request_index >= copy.requests.len) return error.BadManifest;
         const session_id = try std.fmt.allocPrint(self.allocator, "spore-build-{d}-{d}", .{ self.step_index + 1, self.active_copy_request_index + 1 });
@@ -359,13 +386,13 @@ const BuildControl = struct {
         const request = switch (kind) {
             .freeze => try simpleRequest(self.allocator, "fsfreeze-v1", session_id),
             .thaw => try simpleRequest(self.allocator, "fsthaw-v1", session_id),
-            .resize, .run, .copy => unreachable,
+            .resize, .run, .copy, .workdir => unreachable,
         };
         try self.startStream(dev, request, .spore_stream_v1, kind, "");
         self.phase = switch (kind) {
             .freeze => .active_freeze,
             .thaw => .active_thaw,
-            .resize, .run, .copy => unreachable,
+            .resize, .run, .copy, .workdir => unreachable,
         };
     }
 
@@ -374,7 +401,7 @@ const BuildControl = struct {
         self.stream.host_port = vsock.HostStream.hostPortForSequence(self.stream_sequence);
         self.stream_sequence +%= 1;
         self.active_stream = kind;
-        if (kind == .run or kind == .copy or kind == .resize) self.stream.setOutputSink(self, outputSink);
+        if (kind == .run or kind == .copy or kind == .workdir or kind == .resize) self.stream.setOutputSink(self, outputSink);
         self.active_stdin_payload = stdin_payload;
         self.active_stdin_offset = 0;
         self.active_stdin_close_sent = !(kind == .run or kind == .resize);
@@ -425,7 +452,7 @@ const BuildControl = struct {
                 self.capture.clearRetainingCapacity();
                 self.phase = .start_run;
             },
-            .run, .copy => {
+            .run, .copy, .workdir => {
                 if (exit_code != 0) {
                     self.failed_instruction = self.steps[self.step_index].canonicalInstruction();
                     self.failed_instruction_line = self.steps[self.step_index].line();
@@ -436,7 +463,7 @@ const BuildControl = struct {
                 if (self.active_stream == .copy) {
                     const copy = switch (self.steps[self.step_index]) {
                         .copy => |copy| copy,
-                        .run => return error.BadManifest,
+                        .run, .workdir => return error.BadManifest,
                     };
                     self.active_copy_request_index += 1;
                     if (self.active_copy_request_index < copy.requests.len) {
@@ -490,8 +517,8 @@ const BuildControl = struct {
         if (self.phase != .snapshot) return;
         const disk = maybe_disk orelse return error.BadManifest;
         const storage = try storageFromDisk(self.allocator, disk);
-        // A zero-dirty RUN/COPY can intentionally yield child digest == parent
-        // digest; the step key still proves which instruction/env/input ran.
+        // A zero-dirty RUN/COPY/WORKDIR can intentionally yield child digest ==
+        // parent digest; the step key still proves which instruction inputs ran.
         try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, storage.index_digest);
         const input = self.active_input orelse return error.BadManifest;
         _ = try step_cache.writeRecord(self.io, self.allocator, self.cache_root, input, self.active_step_key, storage);
@@ -550,7 +577,7 @@ fn checkpointSessionId(allocator: std.mem.Allocator, kind: ActiveStream, step_in
     const name = switch (kind) {
         .freeze => "freeze",
         .thaw => "thaw",
-        .resize, .run, .copy => unreachable,
+        .resize, .run, .copy, .workdir => unreachable,
     };
     return std.fmt.allocPrint(allocator, "spore-build-{s}-{d}", .{ name, step_index + 1 });
 }
@@ -611,6 +638,22 @@ fn copyRequest(allocator: std.mem.Allocator, session_id: []const u8, request: Co
         .source_kind = @tagName(request.source_kind),
         .dest_is_dir = request.dest_is_dir,
         .entry_count = request.entry_count,
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
+    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+}
+
+fn workdirRequest(allocator: std.mem.Allocator, session_id: []const u8, target: []const u8) ![]const u8 {
+    if (target.len == 0 or target.len > max_guest_working_dir_len or !std.fs.path.isAbsolute(target)) return error.RunWorkingDirUnsupported;
+    const payload = struct {
+        type: []const u8 = "spore-build-workdir-v1",
+        session_id: []const u8,
+        working_dir: []const u8,
+    }{
+        .session_id = session_id,
+        .working_dir = target,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
@@ -715,6 +758,7 @@ const guest_agent_fuzz_invalid: c_int = 0;
 const guest_agent_fuzz_run_request: c_int = 1;
 const guest_agent_fuzz_copy_request: c_int = 2;
 const guest_agent_fuzz_run_complete: c_int = 3;
+const guest_agent_fuzz_workdir_request: c_int = 4;
 
 extern fn spore_agent_fuzz_build_request(request: [*]const u8, request_len: usize, stream: [*]const u8, stream_len: usize) c_int;
 extern fn spore_agent_fuzz_proc_stat(stat: [*]const u8, stat_len: usize) c_int;
@@ -723,7 +767,7 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
     if (comptime guest_agent_fuzz_supported) {
         var fuzz_bytes: [128]u8 = undefined;
         const fuzz_len = s.slice(&fuzz_bytes);
-        const mode = if (fuzz_len == 0) 0 else fuzz_bytes[0] % 6;
+        const mode = if (fuzz_len == 0) 0 else fuzz_bytes[0] % 7;
         const command = if (fuzz_len <= 1) "x" else fuzz_bytes[1..fuzz_len];
         var stream: [256]u8 = undefined;
         var stream_len: usize = 0;
@@ -749,6 +793,13 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
 
         if (mode == 5) {
             const request = if (fuzz_len <= 1) fuzz_bytes[0..0] else fuzz_bytes[1..fuzz_len];
+            _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
+            return;
+        }
+
+        if (mode == 6) {
+            const request = workdirRequest(std.testing.allocator, "spore-build-fuzz", "/work") catch return;
+            defer std.testing.allocator.free(request);
             _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
             return;
         }
@@ -847,6 +898,14 @@ test "build copy request names context disk source" {
     try std.testing.expect(std.mem.indexOf(u8, request, "\"entry_count\":2") != null);
 }
 
+test "build workdir request names an absolute target" {
+    const request = try workdirRequest(std.testing.allocator, "spore-build-1", "/work/app");
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-workdir-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"working_dir\":\"/work/app\"") != null);
+    try std.testing.expectError(error.RunWorkingDirUnsupported, workdirRequest(std.testing.allocator, "spore-build-1", "relative"));
+}
+
 test "build copy request rejects path escapes" {
     try std.testing.expectError(error.CopySourceEscapesContext, copyRequest(std.testing.allocator, "spore-build-1", .{
         .source = "../secret",
@@ -913,7 +972,7 @@ test "build run request accepts multi-kib command and rejects configured bound" 
     try std.testing.expectError(error.RunWorkingDirUnsupported, runRequest(std.testing.allocator, "spore-build-1", "true", &.{}, workdir, std.testing.io));
 }
 
-test "guest build request parser rejects malformed RUN framing and accepts COPY v2" {
+test "guest build request parser rejects malformed RUN framing and accepts build controls" {
     if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
 
     const run_request = try runRequest(std.testing.allocator, "spore-build-1", "abc", &.{}, "/", std.testing.io);
@@ -945,6 +1004,10 @@ test "guest build request parser rejects malformed RUN framing and accepts COPY 
     });
     defer std.testing.allocator.free(copy_request);
     try std.testing.expectEqual(guest_agent_fuzz_copy_request, spore_agent_fuzz_build_request(copy_request.ptr, copy_request.len, stream[0..0].ptr, 0));
+
+    const workdir_request = try workdirRequest(std.testing.allocator, "spore-build-1", "/work");
+    defer std.testing.allocator.free(workdir_request);
+    try std.testing.expectEqual(guest_agent_fuzz_workdir_request, spore_agent_fuzz_build_request(workdir_request.ptr, workdir_request.len, stream[0..0].ptr, 0));
 }
 
 test "guest proc stat parser identifies kernel threads with adversarial task names" {

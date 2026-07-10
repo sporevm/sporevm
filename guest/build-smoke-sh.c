@@ -251,6 +251,7 @@ static int verify_copy(void) {
 static int setup_symlink_targets(void) {
   if (make_dir("/work", 0755) != 0 ||
       make_dir("/work/real-internal", 0755) != 0 ||
+      make_dir("/work/multi", 0755) != 0 ||
       make_dir("/dir-target", 0755) != 0 ||
       make_dir("/etc/rootfs-absolute-copy", 0755) != 0) {
     write_str(2, "build-smoke-sh: cannot create symlink targets\n");
@@ -267,6 +268,10 @@ static int setup_symlink_targets(void) {
   unlink("/dangling-target.txt");
   if (write_file("/sentinel.txt", "old\n") != 0) {
     write_str(2, "build-smoke-sh: cannot create sentinel\n");
+    return 5;
+  }
+  if (chown("/sentinel.txt", 123, 456) != 0) {
+    write_str(2, "build-smoke-sh: cannot change sentinel ownership\n");
     return 5;
   }
   if (symlink("/work/real-internal", "/work/symlinked-dir") != 0 ||
