@@ -110,7 +110,7 @@ description = "Smoke named lifecycle copy-in and copy-out"
 
 [tasks."smoke:lifecycle-tty"]
 run = "mise run build && test/smoke/lifecycle/tty.sh"
-description = "Smoke named lifecycle interactive exec streaming"
+description = "Smoke named lifecycle noninteractive, interactive, and TTY exec streaming"
 
 [tasks."smoke:monitor-jail"]
 run = "mise run build && test/smoke/monitor/jail.sh"

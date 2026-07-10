@@ -24,10 +24,10 @@ const vsock = @import("virtio/vsock.zig");
 
 const max_control_request = run.max_guest_request_len + 1;
 const max_control_response = 128 * 1024;
-const max_exec_output = 16 * 1024;
 const max_suspend_path = 4096;
 const stats_write_interval_ms = 250;
 const registry_check_interval_ms = 1_000;
+const streaming_send_deadline_ms = 25;
 const disk_claim_timeout_ns = 5 * 60 * std.time.ns_per_s;
 
 const monitor_usage =
@@ -334,10 +334,10 @@ const ExecServer = struct {
     streaming_stderr_offset: u64 = 0,
     streaming_terminal_offset: u64 = 0,
     streaming_write_failed: bool = false,
-    stdout_capture: [max_exec_output]u8 = undefined,
+    stdout_capture: [lifecycle.exec_named_capture_limit]u8 = undefined,
     stdout_capture_len: usize = 0,
     stdout_truncated: bool = false,
-    stderr_capture: [max_exec_output]u8 = undefined,
+    stderr_capture: [lifecycle.exec_named_capture_limit]u8 = undefined,
     stderr_capture_len: usize = 0,
     stderr_truncated: bool = false,
     network_events: ?*net_gateway.Process = null,
@@ -604,6 +604,7 @@ const ExecServer = struct {
 
     fn submitStreamingExec(self: *ExecServer, request: []const u8, client_fd: std.c.fd_t) !void {
         if (request.len > self.request.len) return error.ControlRequestTooLarge;
+        try setStreamingSendDeadline(client_fd);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         while (self.state == .done) {
@@ -761,7 +762,7 @@ const ExecServer = struct {
             .stderr => self.streaming_stderr_offset,
             .terminal => self.streaming_terminal_offset,
         };
-        if (writeSpioDataFd(fd, stream_id, offset, bytes) != 0) {
+        if (writeSpioDataFdBounded(fd, stream_id, offset, bytes) != 0) {
             self.streaming_write_failed = true;
             if (self.wake) |wake| wake.wake();
             return;
@@ -779,7 +780,7 @@ const ExecServer = struct {
         const code: u32 = if (exit_code < 0) 1 else @intCast(@min(exit_code, 255));
         var payload: [4]u8 = undefined;
         spore_stream.writeExitPayload(&payload, code);
-        if (writeSpioFrameFd(self.streaming_client_fd, .exit, .control, 0, &payload) != 0) {
+        if (writeSpioFrameFdBounded(self.streaming_client_fd, .exit, .control, 0, &payload) != 0) {
             self.streaming_write_failed = true;
         }
     }
@@ -787,7 +788,7 @@ const ExecServer = struct {
     fn sendStreamingErrorLocked(self: *ExecServer, message: []const u8) void {
         if (self.streaming_client_fd < 0 or self.streaming_write_failed) return;
         const payload = if (message.len > spore_stream.max_payload_len) message[0..spore_stream.max_payload_len] else message;
-        if (writeSpioFrameFd(self.streaming_client_fd, .err, .control, 0, payload) != 0) {
+        if (writeSpioFrameFdBounded(self.streaming_client_fd, .err, .control, 0, payload) != 0) {
             self.streaming_write_failed = true;
         }
     }
@@ -1254,6 +1255,42 @@ fn writeSpioDataFd(fd: std.c.fd_t, stream_id: spore_stream.StreamId, offset: u64
     return 0;
 }
 
+/// Streaming control sockets use fail-fast backpressure: a frame that cannot
+/// be accepted within the socket send deadline aborts the exec.
+fn writeSpioDataFdBounded(fd: std.c.fd_t, stream_id: spore_stream.StreamId, offset: u64, bytes: []const u8) c_int {
+    var remaining = bytes;
+    var frame_offset = offset;
+    while (remaining.len > 0) {
+        const take = @min(remaining.len, spore_stream.max_payload_len);
+        if (writeSpioFrameFdBounded(fd, .data, stream_id, frame_offset, remaining[0..take]) != 0) return -1;
+        frame_offset += @intCast(take);
+        remaining = remaining[take..];
+    }
+    return 0;
+}
+
+fn writeSpioFrameFdBounded(fd: std.c.fd_t, frame_type: spore_stream.FrameType, stream_id: spore_stream.StreamId, offset: u64, payload: []const u8) c_int {
+    var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
+    const frame = spore_stream.writeFrame(&frame_buf, .{
+        .frame_type = frame_type,
+        .stream_id = stream_id,
+        .offset = offset,
+    }, payload) catch return -1;
+    const sent = std.c.send(fd, frame.ptr, frame.len, std.c.MSG.NOSIGNAL);
+    if (sent < 0 or sent != frame.len) return -1;
+    return 0;
+}
+
+fn setStreamingSendDeadline(fd: std.c.fd_t) !void {
+    const timeout = std.c.timeval{
+        .sec = 0,
+        .usec = streaming_send_deadline_ms * std.time.us_per_ms,
+    };
+    if (std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.SNDTIMEO, &timeout, @sizeOf(std.c.timeval)) != 0) {
+        return error.MonitorUnavailable;
+    }
+}
+
 fn writeSpioFrameFd(fd: std.c.fd_t, frame_type: spore_stream.FrameType, stream_id: spore_stream.StreamId, offset: u64, payload: []const u8) c_int {
     var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
     const frame = spore_stream.writeFrame(&frame_buf, .{
@@ -1407,10 +1444,6 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
             return false;
         }
         const interactive = parsed.value.interactive orelse false;
-        if (!interactive and !tty) {
-            try writeStreamingControlError(stream.socket.handle, "stream request is not interactive");
-            return false;
-        }
         const terminal_size = spore_stream.Resize{
             .rows = parsed.value.terminal_rows orelse 24,
             .cols = parsed.value.terminal_cols orelse 80,
@@ -1933,4 +1966,24 @@ test "monitor reports actionable guest command request errors" {
         "guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest",
         guestCommandErrorMessage(error.RunRequestTooLarge),
     );
+}
+
+test "streaming output backpressure fails instead of blocking" {
+    var pair: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair) != 0) return error.IoFailed;
+    defer _ = std.c.close(pair[0]);
+    defer _ = std.c.close(pair[1]);
+    try setStreamingSendDeadline(pair[0]);
+
+    var payload: [spore_stream.max_payload_len]u8 = @splat('x');
+    var offset: u64 = 0;
+    var rejected = false;
+    for (0..1024) |_| {
+        if (writeSpioFrameFdBounded(pair[0], .data, .stdout, offset, &payload) != 0) {
+            rejected = true;
+            break;
+        }
+        offset += payload.len;
+    }
+    try std.testing.expect(rejected);
 }
