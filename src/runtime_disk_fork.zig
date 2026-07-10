@@ -167,7 +167,6 @@ pub const Head = struct {
         self.descriptor.deinit();
         self.* = undefined;
     }
-
 };
 
 pub const HeadStats = struct {
