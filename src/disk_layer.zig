@@ -84,6 +84,22 @@ pub const SnapshotState = struct {
         );
         return result;
     }
+
+    pub fn prepareSnapshotRoot(self: SnapshotState, root: []const u8) Error!chunk_mapped_disk.PreparedSnapshotRoot {
+        return switch (self.active) {
+            .chunk_mapped => |disk| disk.prepareSnapshotRoot(root),
+        };
+    }
+
+    pub fn commitSnapshotRoot(
+        self: SnapshotState,
+        expected_root: []const u8,
+        prepared: *chunk_mapped_disk.PreparedSnapshotRoot,
+    ) Error!void {
+        return switch (self.active) {
+            .chunk_mapped => |disk| disk.commitSnapshotRoot(expected_root, prepared),
+        };
+    }
 };
 
 fn monotonicMs() Error!u64 {

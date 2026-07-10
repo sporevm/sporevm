@@ -607,13 +607,23 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                 .keep_running => {},
                 .stop => return .monitor_stopped,
                 .snapshot => |request| {
+                    var prepared_root = if (request.publish_dir) |publish_dir|
+                        if (config.disk_snapshot) |disk_state| try disk_state.prepareSnapshotRoot(publish_dir) else null
+                    else
+                        null;
+                    defer if (prepared_root) |*root| root.deinit();
                     try takeSnapshot(allocator, request.dir, vcpu, transports, &gen_dev, ram_bytes, .{
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
                         .ram_size = config.ram_size,
                     }, config.rootfs, config.disk_snapshot, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                     if (!request.continue_after) return .snapshotted;
-                    try control.completeSnapshot(request.dir);
+                    const completed_dir = if (request.publish_dir) |publish_dir| blk: {
+                        try control.publishSnapshot(request.dir, publish_dir);
+                        if (prepared_root) |*root| try config.disk_snapshot.?.commitSnapshotRoot(request.dir, root);
+                        break :blk publish_dir;
+                    } else request.dir;
+                    try control.completeSnapshot(completed_dir);
                 },
                 .rootfs_snapshot => |request| {
                     const disk_manifest = try takeRootfsSnapshot(allocator, request.dir, transports, config.disk_snapshot);
@@ -1282,6 +1292,11 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                 },
                 .snapshot => |request| {
                     if (request.continue_after) {
+                        var prepared_root = if (request.publish_dir) |publish_dir|
+                            if (options.disk_snapshot) |disk_state| try disk_state.prepareSnapshotRoot(publish_dir) else null
+                        else
+                            null;
+                        defer if (prepared_root) |*root| root.deinit();
                         takeSnapshotV1(
                             allocator,
                             request.dir,
@@ -1304,8 +1319,21 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                             state.finish(.{ .err = err });
                             continue;
                         };
+                        const completed_dir = if (request.publish_dir) |publish_dir| blk: {
+                            control.publishSnapshot(request.dir, publish_dir) catch |err| {
+                                state.clearSnapshot();
+                                state.finish(.{ .err = err });
+                                continue;
+                            };
+                            if (prepared_root) |*root| options.disk_snapshot.?.commitSnapshotRoot(request.dir, root) catch |err| {
+                                state.clearSnapshot();
+                                state.finish(.{ .err = err });
+                                continue;
+                            };
+                            break :blk publish_dir;
+                        } else request.dir;
                         state.clearSnapshot();
-                        control.completeSnapshot(request.dir) catch |err| {
+                        control.completeSnapshot(completed_dir) catch |err| {
                             state.finish(.{ .err = err });
                             continue;
                         };

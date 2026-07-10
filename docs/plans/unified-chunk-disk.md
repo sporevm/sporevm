@@ -614,8 +614,8 @@ structure with two instantiations (RAM 2MiB, disk 64KiB).
 
 ### U6 — Production disk-backed fast fork
 
-Status: backend primitive complete; production named-fork integration is the
-active next slice.
+Status: backend primitive and post-save baseline authority complete; the
+portable runtime disk head is the active next slice.
 
 `ChunkMappedDisk.fork()` can already copy the one-level source map and clone
 an unlinked overlay fd, and its unit tests cover rejection, copy fallback,
@@ -729,7 +729,12 @@ save→rename→fork→save coverage.
 1. **Fix baseline authority after save.** Make the live backend's post-save
    parent authority stable across lifecycle's temporary-directory rename and
    cover save→rename→snapshot reuse. This is a standalone correctness PR and a
-   prerequisite for runtime export.
+   prerequisite for runtime export. **Complete:** non-destructive save now
+   stages lifecycle metadata and save-time annotations beside the snapshot,
+   lets the monitor atomically rename the complete spore while the VMM still
+   owns the disk head, then transfers the prepared final root into
+   `ChunkMappedDisk` without a post-rename allocation. A second incremental
+   snapshot test proves parent objects are reused from the final path.
 2. **Add a portable runtime disk head.** Add a separate head export/import path
    around an already-open fd and the two bounded override bitmaps; do not force
    the existing in-process `ForkedDisk` to serialize its owned digest tables.

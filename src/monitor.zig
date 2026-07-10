@@ -288,6 +288,8 @@ const ExecServer = struct {
     response_len: usize = 0,
     suspend_dir: [max_suspend_path]u8 = undefined,
     suspend_dir_len: usize = 0,
+    publish_dir: [max_suspend_path]u8 = undefined,
+    publish_dir_len: usize = 0,
     active_stream: vsock.HostStream = undefined,
     active_stream_valid: bool = false,
     active_stream_protocol: vsock.HostStreamProtocol = .legacy_text,
@@ -387,6 +389,7 @@ const ExecServer = struct {
             .context = self,
             .pollFn = pollThunk,
             .setWakeFn = setWakeThunk,
+            .publishSnapshotFn = publishSnapshotThunk,
             .completeSnapshotFn = completeSnapshotThunk,
             .completeRootfsSnapshotFn = completeRootfsSnapshotThunk,
             .reportStatsFn = reportStatsThunk,
@@ -420,6 +423,7 @@ const ExecServer = struct {
                 self.state = .active_snapshot;
                 return .{ .snapshot = .{
                     .dir = self.suspend_dir[0..self.suspend_dir_len],
+                    .publish_dir = if (self.publish_dir_len == 0) null else self.publish_dir[0..self.publish_dir_len],
                     .continue_after = true,
                 } };
             },
@@ -799,8 +803,11 @@ const ExecServer = struct {
         return self.response[0..self.response_len];
     }
 
-    fn submitSnapshot(self: *ExecServer, out_dir: []const u8) ![]const u8 {
+    fn submitSnapshot(self: *ExecServer, out_dir: []const u8, publish_dir: ?[]const u8) ![]const u8 {
         if (out_dir.len == 0 or out_dir.len > self.suspend_dir.len) return error.InvalidSuspendDir;
+        if (publish_dir) |dir| {
+            if (dir.len == 0 or dir.len > self.publish_dir.len) return error.InvalidSuspendDir;
+        }
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         while (self.state == .done) {
@@ -809,6 +816,11 @@ const ExecServer = struct {
         if (self.state != .idle) return error.ControlBusy;
         @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
         self.suspend_dir_len = out_dir.len;
+        self.publish_dir_len = 0;
+        if (publish_dir) |dir| {
+            @memcpy(self.publish_dir[0..dir.len], dir);
+            self.publish_dir_len = dir.len;
+        }
         self.response_len = 0;
         self.state = .pending_snapshot;
         if (self.wake) |wake| wake.wake();
@@ -844,6 +856,16 @@ const ExecServer = struct {
             },
             else => {},
         }
+    }
+
+    fn publishSnapshot(self: *ExecServer, work_dir: []const u8, publish_dir: []const u8) !void {
+        var lifecycle_spec = (try lifecycle.readSporeLifecycleSpec(self.allocator, self.io, work_dir)) orelse return error.BadManifest;
+        defer lifecycle_spec.deinit();
+        var manifest = try spore.loadManifest(self.allocator, work_dir);
+        defer manifest.deinit();
+        manifest.value.annotations = lifecycle_spec.value.annotations;
+        try spore.saveManifest(self.allocator, work_dir, manifest.value);
+        try Io.Dir.renameAbsolute(work_dir, publish_dir, self.io);
     }
 
     fn completeRootfsSnapshot(_: *ExecServer, _: ?spore.Disk) !void {}
@@ -966,6 +988,11 @@ const ExecServer = struct {
     fn setWakeThunk(context: *anyopaque, wake: vsock.Wake) void {
         const self: *ExecServer = @ptrCast(@alignCast(context));
         self.setWake(wake);
+    }
+
+    fn publishSnapshotThunk(context: *anyopaque, work_dir: []const u8, publish_dir: []const u8) !void {
+        const self: *ExecServer = @ptrCast(@alignCast(context));
+        try self.publishSnapshot(work_dir, publish_dir);
     }
 
     fn completeSnapshotThunk(context: *anyopaque, dir: []const u8) !void {
@@ -1109,7 +1136,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
             try writeControlError(server.io, stream, "snapshot request must set continue=true");
             return false;
         }
-        const response = server.submitSnapshot(out_dir) catch {
+        const response = server.submitSnapshot(out_dir, parsed.value.publish_dir) catch {
             try writeControlError(server.io, stream, "monitor busy");
             return false;
         };
@@ -1232,6 +1259,7 @@ const ControlRequest = struct {
     type: []const u8,
     argv: ?[]const []const u8 = null,
     out_dir: ?[]const u8 = null,
+    publish_dir: ?[]const u8 = null,
     path: ?[]const u8 = null,
     @"continue": ?bool = null,
     stdio: ?[]const u8 = null,

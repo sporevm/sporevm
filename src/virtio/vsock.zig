@@ -658,6 +658,7 @@ pub const ControlAction = union(enum) {
 
 pub const SnapshotAction = struct {
     dir: []const u8,
+    publish_dir: ?[]const u8 = null,
     continue_after: bool = false,
 };
 
@@ -683,6 +684,7 @@ pub const Control = struct {
     context: *anyopaque,
     pollFn: *const fn (context: *anyopaque, dev: *Vsock) anyerror!ControlAction,
     setWakeFn: *const fn (context: *anyopaque, wake: Wake) void,
+    publishSnapshotFn: ?*const fn (context: *anyopaque, work_dir: []const u8, publish_dir: []const u8) anyerror!void = null,
     completeSnapshotFn: *const fn (context: *anyopaque, dir: []const u8) anyerror!void,
     completeRootfsSnapshotFn: *const fn (context: *anyopaque, disk: ?spore.Disk) anyerror!void,
     reportStatsFn: *const fn (context: *anyopaque, stats: ControlStats) void,
@@ -693,6 +695,11 @@ pub const Control = struct {
 
     pub fn setWake(self: Control, wake: Wake) void {
         self.setWakeFn(self.context, wake);
+    }
+
+    pub fn publishSnapshot(self: Control, work_dir: []const u8, publish_dir: []const u8) !void {
+        const publish = self.publishSnapshotFn orelse return error.UnsupportedSnapshot;
+        try publish(self.context, work_dir, publish_dir);
     }
 
     pub fn completeSnapshot(self: Control, dir: []const u8) !void {

@@ -74,6 +74,16 @@ pub const ForkedDisk = struct {
     }
 };
 
+pub const PreparedSnapshotRoot = struct {
+    allocator: std.mem.Allocator,
+    root: ?[]const u8,
+
+    pub fn deinit(self: *PreparedSnapshotRoot) void {
+        if (self.root) |root| self.allocator.free(root);
+        self.* = undefined;
+    }
+};
+
 pub const ChunkMappedDisk = struct {
     allocator: std.mem.Allocator,
     base: block_source.FileBlockSource,
@@ -404,6 +414,26 @@ pub const ChunkMappedDisk = struct {
         const parent = try self.parentStateFrom(cache_root, index);
         self.parent_root = parent.root;
         self.parent_digests = parent.digests;
+    }
+
+    /// Preallocates a stable snapshot authority before an atomic directory
+    /// rename. `commitSnapshotRoot` transfers this allocation without a
+    /// fallible operation after the rename succeeds.
+    pub fn prepareSnapshotRoot(self: *ChunkMappedDisk, root: []const u8) Error!PreparedSnapshotRoot {
+        return .{ .allocator = self.allocator, .root = try self.allocator.dupe(u8, root) };
+    }
+
+    /// Rebinds a just-published snapshot from its temporary directory to the
+    /// final atomic-publish path. A fresh clean rootfs may not publish a disk
+    /// index; in that case there is no baseline to rebind.
+    pub fn commitSnapshotRoot(self: *ChunkMappedDisk, expected_root: []const u8, prepared: *PreparedSnapshotRoot) Error!void {
+        if (!self.snapshot_published) return;
+        const current = self.parent_root orelse return error.BadManifest;
+        if (!std.mem.eql(u8, current, expected_root)) return error.BadManifest;
+        const next = prepared.root orelse return error.BadManifest;
+        prepared.root = null;
+        self.parent_root = next;
+        self.allocator.free(current);
     }
 
     fn indexStateFrom(self: *ChunkMappedDisk, cache_root: []const u8, index: disk_index.DiskIndex) Error!IndexState {
@@ -1195,6 +1225,8 @@ test "snapshot output does not become live disk storage" {
     defer allocator.free(temp_dir);
     const final_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/final.spore", .{tmp.sub_path[0..]});
     defer allocator.free(final_dir);
+    const second_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/second.spore", .{tmp.sub_path[0..]});
+    defer allocator.free(second_dir);
     try std.Io.Dir.cwd().createDirPath(io, temp_dir);
 
     const chunk_size: usize = 512;
@@ -1222,6 +1254,8 @@ test "snapshot output does not become live disk storage" {
     try disk.writeAt(&first_patch, 17);
     @memcpy(model[17..][0..first_patch.len], &first_patch);
 
+    var prepared_root = try disk.prepareSnapshotRoot(final_dir);
+    defer prepared_root.deinit();
     const saved = try disk.snapshotIndex(temp_dir, .{ .mmio_slot = 1 }, true);
     defer freeTestDisk(allocator, saved);
     try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
@@ -1230,18 +1264,26 @@ test "snapshot output does not become live disk storage" {
     try disk.readAt(readback, 0);
     try std.testing.expectEqualSlices(u8, model, readback);
     try std.Io.Dir.rename(std.Io.Dir.cwd(), temp_dir, std.Io.Dir.cwd(), final_dir, io);
+    try disk.commitSnapshotRoot(temp_dir, &prepared_root);
     try disk.readAt(readback, 0);
     try std.testing.expectEqualSlices(u8, model, readback);
 
     const overlay_patch = [_]u8{0xB2} ** 47;
     try disk.writeAt(&overlay_patch, 101);
     @memcpy(model[101..][0..overlay_patch.len], &overlay_patch);
+    try std.Io.Dir.cwd().createDirPath(io, second_dir);
+    var stats: SnapshotStats = .{};
+    const second = try disk.snapshotIndexWithStats(second_dir, .{ .mmio_slot = 1 }, true, &stats);
+    defer freeTestDisk(allocator, second);
+    try std.testing.expect(!stats.full_scan);
+    try std.testing.expectEqual(@as(usize, 1), stats.parent_chunks_reused);
+
     const base_patch = [_]u8{0xC3} ** 53;
     const base_patch_offset = chunk_size + 23;
     try disk.writeAt(&base_patch, base_patch_offset);
     @memcpy(model[base_patch_offset..][0..base_patch.len], &base_patch);
 
-    try std.testing.expectEqual(@as(usize, 2), disk.dirtyChunkCount());
+    try std.testing.expectEqual(@as(usize, 1), disk.dirtyChunkCount());
     try disk.readAt(readback, 0);
     try std.testing.expectEqualSlices(u8, model, readback);
 }

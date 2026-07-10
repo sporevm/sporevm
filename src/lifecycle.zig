@@ -1135,6 +1135,9 @@ fn saveContinueNamed(
     const arena = arena_state.allocator();
 
     const out_dir = try resolveNewOutputDirApi(arena, context.io, options.out_dir);
+    const temp_dir = try temporarySiblingOutputDir(arena, context.io, out_dir);
+    var cleanup_temp = true;
+    defer if (cleanup_temp) Io.Dir.cwd().deleteTree(context.io, temp_dir) catch {};
     const paths = try apiPaths(context, arena, options.name);
     const state = try classifyVmState(arena, context.io, paths, pidAlive);
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "save", options.name, state);
@@ -1147,19 +1150,17 @@ fn saveContinueNamed(
     if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
         return error.MissingRootfsIdentity;
     }
-    var ready = try readReady(arena, context.io, paths);
-    defer ready.deinit();
-    const response = try sendSnapshotRequest(arena, context.io, ready.value.control_socket_path, out_dir);
-    if (!try snapshotResponseOk(arena, response)) return error.MonitorRequestFailed;
     var snapshot_spec = spec.value;
     if (!spore.annotationsEmpty(options.annotations)) {
-        var manifest = try spore.loadManifest(arena, out_dir);
-        defer manifest.deinit();
-        manifest.value.annotations = try spore.mergeAnnotations(arena, manifest.value.annotations, options.annotations);
-        try spore.saveManifest(arena, out_dir, manifest.value);
-        snapshot_spec.annotations = manifest.value.annotations;
+        snapshot_spec.annotations = try spore.mergeAnnotations(arena, snapshot_spec.annotations, options.annotations);
     }
-    try writeSporeLifecycleSpec(arena, context.io, out_dir, snapshot_spec);
+    try Io.Dir.cwd().createDirPath(context.io, temp_dir);
+    try writeSporeLifecycleSpec(arena, context.io, temp_dir, snapshot_spec);
+    var ready = try readReady(arena, context.io, paths);
+    defer ready.deinit();
+    const response = try sendSnapshotRequest(arena, context.io, ready.value.control_socket_path, temp_dir, out_dir);
+    if (!try snapshotResponseOk(arena, response)) return error.MonitorRequestFailed;
+    cleanup_temp = false;
     return ownedNamedLifecycleResult(allocator, .{
         .action = "saved",
         .name = options.name,
@@ -1176,31 +1177,10 @@ pub fn saveNamed(
 ) !NamedLifecycleResult {
     clearLastError();
     if (options.stop) return saveStopNamed(context, allocator, options);
-
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const out_dir = try resolveNewOutputDirApi(arena, context.io, options.out_dir);
-    const temp_dir = try temporarySiblingOutputDir(arena, context.io, out_dir);
-    var cleanup_temp = true;
-    defer if (cleanup_temp) Io.Dir.cwd().deleteTree(context.io, temp_dir) catch {};
-
-    const saved = try saveContinueNamed(context, allocator, .{
+    return saveContinueNamed(context, allocator, .{
         .name = options.name,
-        .out_dir = temp_dir,
+        .out_dir = options.out_dir,
         .annotations = options.annotations,
-    });
-    defer deinitNamedLifecycleResult(allocator, saved);
-
-    try Io.Dir.renameAbsolute(temp_dir, out_dir, context.io);
-    cleanup_temp = false;
-    return ownedNamedLifecycleResult(allocator, .{
-        .action = "saved",
-        .name = options.name,
-        .state = "ready",
-        .pid = saved.pid,
-        .spore_dir = out_dir,
     });
 }
 
@@ -1304,7 +1284,7 @@ pub fn forkNamed(
     var cleanup_batch = true;
     defer if (cleanup_batch) Io.Dir.cwd().deleteTree(init.io, batch_dir) catch {};
 
-    const response = try sendSnapshotRequest(arena, init.io, ready.value.control_socket_path, snapshot_dir);
+    const response = try sendSnapshotRequest(arena, init.io, ready.value.control_socket_path, snapshot_dir, null);
     if (!(snapshotResponseOk(arena, response) catch return error.BadMonitorResponse)) return error.MonitorRequestFailed;
     try writeSporeLifecycleSpec(arena, init.io, snapshot_dir, source_spec.value);
 
@@ -3283,7 +3263,7 @@ fn writeSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
-fn readSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8) !?std.json.Parsed(Spec) {
+pub fn readSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8) !?std.json.Parsed(Spec) {
     const path = try std.fs.path.resolve(allocator, &.{ dir, lifecycle_spore_metadata_file });
     const data = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_metadata_bytes)) catch |err| switch (err) {
         error.FileNotFound => return null,
@@ -4164,12 +4144,19 @@ fn sendSuspendRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const
     return sendControlJson(allocator, io, socket_path, json);
 }
 
-fn sendSnapshotRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, out_dir: []const u8) ![]const u8 {
+fn sendSnapshotRequest(
+    allocator: std.mem.Allocator,
+    io: Io,
+    socket_path: []const u8,
+    out_dir: []const u8,
+    publish_dir: ?[]const u8,
+) ![]const u8 {
     const payload = struct {
         type: []const u8 = "snapshot",
         out_dir: []const u8,
+        publish_dir: ?[]const u8,
         @"continue": bool = true,
-    }{ .out_dir = out_dir };
+    }{ .out_dir = out_dir, .publish_dir = publish_dir };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
     return sendControlJson(allocator, io, socket_path, json);
