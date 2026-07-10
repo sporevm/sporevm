@@ -1243,16 +1243,12 @@ fn base64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     return out;
 }
 
-fn writeSpioDataFd(fd: std.c.fd_t, stream_id: spore_stream.StreamId, offset: u64, bytes: []const u8) c_int {
-    var remaining = bytes;
-    var frame_offset = offset;
-    while (remaining.len > 0) {
-        const take = @min(remaining.len, spore_stream.max_payload_len);
-        if (writeSpioFrameFd(fd, .data, stream_id, frame_offset, remaining[0..take]) != 0) return -1;
-        frame_offset += @intCast(take);
-        remaining = remaining[take..];
-    }
-    return 0;
+fn encodeSpioFrame(frame_buf: *[spore_stream.max_frame_len]u8, frame_type: spore_stream.FrameType, stream_id: spore_stream.StreamId, offset: u64, payload: []const u8) ?[]const u8 {
+    return spore_stream.writeFrame(frame_buf, .{
+        .frame_type = frame_type,
+        .stream_id = stream_id,
+        .offset = offset,
+    }, payload) catch null;
 }
 
 /// Streaming control sockets use fail-fast backpressure: a frame that cannot
@@ -1271,14 +1267,16 @@ fn writeSpioDataFdBounded(fd: std.c.fd_t, stream_id: spore_stream.StreamId, offs
 
 fn writeSpioFrameFdBounded(fd: std.c.fd_t, frame_type: spore_stream.FrameType, stream_id: spore_stream.StreamId, offset: u64, payload: []const u8) c_int {
     var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
-    const frame = spore_stream.writeFrame(&frame_buf, .{
-        .frame_type = frame_type,
-        .stream_id = stream_id,
-        .offset = offset,
-    }, payload) catch return -1;
-    const sent = std.c.send(fd, frame.ptr, frame.len, std.c.MSG.NOSIGNAL);
-    if (sent < 0 or sent != frame.len) return -1;
-    return 0;
+    const frame = encodeSpioFrame(&frame_buf, frame_type, stream_id, offset, payload) orelse return -1;
+    while (true) {
+        const sent = std.c.send(fd, frame.ptr, frame.len, std.c.MSG.NOSIGNAL);
+        // A signal interrupting the send before any bytes moved says nothing
+        // about consumer progress; retry with a fresh deadline. Partial sends
+        // and deadline expiry are consumer backpressure and abort the exec.
+        if (sent < 0 and std.c.errno(sent) == .INTR) continue;
+        if (sent < 0 or sent != frame.len) return -1;
+        return 0;
+    }
 }
 
 fn setStreamingSendDeadline(fd: std.c.fd_t) !void {
@@ -1293,11 +1291,7 @@ fn setStreamingSendDeadline(fd: std.c.fd_t) !void {
 
 fn writeSpioFrameFd(fd: std.c.fd_t, frame_type: spore_stream.FrameType, stream_id: spore_stream.StreamId, offset: u64, payload: []const u8) c_int {
     var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
-    const frame = spore_stream.writeFrame(&frame_buf, .{
-        .frame_type = frame_type,
-        .stream_id = stream_id,
-        .offset = offset,
-    }, payload) catch return -1;
+    const frame = encodeSpioFrame(&frame_buf, frame_type, stream_id, offset, payload) orelse return -1;
     return writeFdAll(fd, frame);
 }
 
