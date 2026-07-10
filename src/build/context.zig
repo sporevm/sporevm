@@ -922,11 +922,16 @@ test "context stat cache invalidates same-size rewrites with restored mtime" {
     cold_cache.save(&cold_diag);
     const original_stat = try Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
 
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "bravo" });
-    try Io.Dir.cwd().setTimestamps(io, source_path, .{
-        .modify_timestamp = .{ .new = original_stat.mtime },
-    });
-    const rewritten_stat = try Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+    var rewritten_stat = original_stat;
+    for (0..200) |_| {
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "bravo" });
+        try Io.Dir.cwd().setTimestamps(io, source_path, .{
+            .modify_timestamp = .{ .new = original_stat.mtime },
+        });
+        rewritten_stat = try Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+        if (original_stat.ctime.nanoseconds != rewritten_stat.ctime.nanoseconds) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
     try std.testing.expectEqual(original_stat.size, rewritten_stat.size);
     try std.testing.expectEqual(original_stat.mtime.nanoseconds, rewritten_stat.mtime.nanoseconds);
     try std.testing.expect(original_stat.ctime.nanoseconds != rewritten_stat.ctime.nanoseconds);
