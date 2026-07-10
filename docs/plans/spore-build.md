@@ -341,7 +341,7 @@ the prior successful execution.
 step_key = blake3(builder_version || platform || parent_index_digest
                   || instruction_kind || canonical_instruction
                   || disk_grow_target || input_digest || env_digest
-                  || workdir)
+                  || workdir || network_mode)
 ```
 
 Per-instruction inputs:
@@ -349,10 +349,12 @@ Per-instruction inputs:
 - `FROM`: the resolved base `index_digest` (not the ref, not the manifest
   digest). Re-importing the same OCI layout yields the same rootfs index
   identity and the same chain; a changed base image invalidates everything.
-- `RUN`: the exact command string, the effective environment (accumulated
-  `ENV` plus every declared `ARG` as exported at that point, sorted
-  canonical `K=V` list), the current `WORKDIR`, and the network mode.
-  `input_digest` is empty.
+- `RUN`: the exact command string, the current `WORKDIR`, and the network mode.
+  The environment digest is an ordered, length-framed sequence of accumulated
+  `ENV` entries followed by typed `ARG` records (key, presence bit, value),
+  including list counts. It preserves duplicate ENV order, distinguishes ENV
+  from ARG state and unset ARG from an explicitly empty value, and cannot alias
+  embedded newlines with multiple entries. `input_digest` is empty.
 - `COPY`: the substituted source patterns and dest, the current `WORKDIR`,
   and `input_digest` = the context content hash of the matched sources:
   after sorting by relative path and deduplicating repeated matches, each
@@ -362,11 +364,14 @@ Per-instruction inputs:
   file content, symlink target text, or empty bytes for a directory.
   Ownership is not hashed (COPY forces 0:0). mtimes are not hashed
   (Docker parity).
-- `ENV` / `ARG` / `WORKDIR` / `CMD`: the canonical instruction text after
-  substitution. These advance the chain so a changed `ENV` invalidates every
-  later `RUN`/`COPY` (Docker semantics), but a changed `CMD` — last
-  instruction, metadata-only — keeps the same rootfs `index_digest` and costs
-  only a local ref/config re-publish.
+- `ENV` / `ARG` / `WORKDIR` / `CMD`: metadata instructions update the state
+  consumed by later execution keys. A changed `ENV`, `ARG`, or `WORKDIR`
+  invalidates later `RUN`/`COPY` steps, while a final metadata-only `CMD` keeps
+  the same rootfs `index_digest` and costs only a local ref/config re-publish.
+
+`network_mode` is present only for `RUN`; COPY keys are deliberately invariant
+across `--network spore` and `--network none` because COPY never uses the build
+VM network.
 
 `ARG` follows this simplification: a declared ARG's value enters the effective
 environment of every subsequent `RUN`/`COPY`, so changing any declared
@@ -413,6 +418,7 @@ has published the index/chunks and the complete stamp exists:
   "input_digest": "…",
   "env_digest": "…",
   "workdir": "/app",
+  "network_mode": "spore",
   "created_unix": 1783732000
 }
 ```
@@ -799,6 +805,12 @@ the shell owns quoting, command substitution, special parameters, and
 variables created earlier in the same command. The build cache version moved
 to `sporevm-build-v2` to prevent reuse of checkpoints created under the old
 host-substitution behavior.
+
+Implementation note (2026-07-10, cache execution identity): RUN step records
+now key the typed `spore`/`none` network mode, and ENV/ARG state uses ordered,
+length-framed typed records rather than a sorted newline-delimited projection.
+The build cache version moved to `sporevm-build-v3`; v2 records are retained as
+GC roots but cannot be reused by the corrected lookup path.
 
 Implementation note (2026-07-09, COPY/context-disk slice): the executor step
 list is now a tagged RUN/COPY sequence, so the first uncached COPY enters the

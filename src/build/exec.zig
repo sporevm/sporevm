@@ -40,6 +40,7 @@ pub const RunStep = struct {
     env: []const []const u8,
     env_digest: []const u8,
     workdir: []const u8,
+    network_mode: step_cache.NetworkMode,
 };
 
 pub const CopySourceKind = enum {
@@ -89,7 +90,6 @@ pub const Options = struct {
     cache_root: []const u8,
     base_storage: spore.RootfsStorage,
     steps: []const Step,
-    network_enabled: bool,
     disk_grow_target: u64 = 0,
     context_disk_path: ?[]const u8 = null,
     output: ?*Io.Writer = null,
@@ -101,21 +101,24 @@ pub fn cacheInputForStep(platform: rootfs_mod.Platform, parent_index_digest: []c
         .run => |run| .{
             .platform = platform,
             .parent_index_digest = parent_index_digest,
-            .instruction_kind = "RUN",
             .canonical_instruction = run.canonical_instruction,
             .disk_grow_target = disk_grow_target,
-            .env_digest = run.env_digest,
-            .workdir = run.workdir,
+            .operation = .{ .run = .{
+                .env_digest = run.env_digest,
+                .workdir = run.workdir,
+                .network_mode = run.network_mode,
+            } },
         },
         .copy => |copy| .{
             .platform = platform,
             .parent_index_digest = parent_index_digest,
-            .instruction_kind = "COPY",
             .canonical_instruction = copy.canonical_instruction,
             .disk_grow_target = disk_grow_target,
-            .input_digest = copy.input_digest,
-            .env_digest = copy.env_digest,
-            .workdir = copy.workdir,
+            .operation = .{ .copy = .{
+                .input_digest = copy.input_digest,
+                .env_digest = copy.env_digest,
+                .workdir = copy.workdir,
+            } },
         },
     };
 }
@@ -152,6 +155,7 @@ const ActiveStream = enum {
 pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !spore.RootfsStorage {
     if (options.steps.len == 0) return spore.cloneRootfsStorage(allocator, options.base_storage);
     if (options.diagnostic) |diag| diag.* = .{};
+    const network_mode = try networkModeForSteps(options.steps);
 
     var control = try BuildControl.init(init.io, allocator, options);
     defer control.deinit();
@@ -167,7 +171,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         .context_disk_path = options.context_disk_path,
         .command = &.{},
         .memory = .{ .policy = .explicit, .bytes = build_vm_memory_bytes },
-        .network = if (options.network_enabled) .spore else .disabled,
+        .network = if (network_mode == .spore) .spore else .disabled,
         .timeout_ms = step_timeout_ms,
     }, control.control());
 
@@ -189,6 +193,21 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         diag.executed_steps = control.executed_steps;
     }
     return try spore.cloneRootfsStorage(allocator, control.current_storage);
+}
+
+fn networkModeForSteps(steps: []const Step) !step_cache.NetworkMode {
+    var mode: ?step_cache.NetworkMode = null;
+    for (steps) |step| switch (step) {
+        .run => |run| {
+            if (mode) |existing| {
+                if (existing != run.network_mode) return error.BuildNetworkModeMismatch;
+            } else {
+                mode = run.network_mode;
+            }
+        },
+        .copy => {},
+    };
+    return mode orelse .none;
 }
 
 /// Session state is arena-owned; see `runSession` for the allocator lifetime
@@ -739,6 +758,30 @@ test "build fsfreeze request stays bounded" {
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.endsWith(u8, request, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, request, "\"fsfreeze-v1\"") != null);
+}
+
+test "build session network mode derives from RUN steps" {
+    const copy = Step{ .copy = .{
+        .canonical_instruction = "COPY . /app",
+        .input_digest = "blake3:copy",
+        .env_digest = "blake3:env",
+        .workdir = "/",
+        .requests = &.{},
+    } };
+    const spore_run = Step{ .run = .{
+        .canonical_instruction = "RUN fetch",
+        .command = "fetch",
+        .env = &.{},
+        .env_digest = "blake3:env",
+        .workdir = "/",
+        .network_mode = .spore,
+    } };
+    var none_run = spore_run;
+    none_run.run.network_mode = .none;
+
+    try std.testing.expectEqual(step_cache.NetworkMode.none, try networkModeForSteps(&.{copy}));
+    try std.testing.expectEqual(step_cache.NetworkMode.spore, try networkModeForSteps(&.{ copy, spore_run }));
+    try std.testing.expectError(error.BuildNetworkModeMismatch, networkModeForSteps(&.{ spore_run, none_run }));
 }
 
 test "build copy request names context disk source" {
