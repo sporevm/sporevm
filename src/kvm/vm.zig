@@ -919,6 +919,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
         vcpu.thread = try std.Thread.spawn(.{}, kvmVcpuThreadMain, .{ctx});
     }
 
+    var exec_probe_done = false;
     while (true) {
         if (options.lazy_pager) |pager| {
             pager.checkFailed() catch |err| {
@@ -1030,22 +1031,33 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
             }
         }
         if (options.config.exec_probe) |probe| {
-            if (probe.state == .failed) {
-                state.finish(.{ .err = error.VsockProbeFailed });
-                continue;
-            }
-            if (probe.state == .complete) {
-                std.log.debug("kvm multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
-                if (options.config.snapshot_on_probe_complete) {
-                    state.finish(.{ .snapshot = null });
-                    continue;
+            if (!exec_probe_done) {
+                if (probe.state == .failed) {
+                    if (options.config.exec_probe_failure_fatal) {
+                        state.finish(.{ .err = error.VsockProbeFailed });
+                        continue;
+                    }
+                    exec_probe_done = true;
                 }
-                state.finish(.{ .exit = .probe_complete });
-                continue;
-            }
-            if (probe.state != .idle and probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
-                state.finish(.{ .err = error.VsockProbeTimedOut });
-                continue;
+                if (probe.state == .complete) {
+                    std.log.debug("kvm multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
+                    if (options.config.exec_probe_completes_run) {
+                        if (options.config.snapshot_on_probe_complete) {
+                            state.finish(.{ .snapshot = null });
+                            continue;
+                        }
+                        state.finish(.{ .exit = .probe_complete });
+                        continue;
+                    }
+                    exec_probe_done = true;
+                }
+                if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
+                    if (options.config.exec_probe_failure_fatal) {
+                        state.finish(.{ .err = error.VsockProbeTimedOut });
+                        continue;
+                    }
+                    exec_probe_done = true;
+                }
             }
         }
         if (options.config.capture_request) |request_capture| {

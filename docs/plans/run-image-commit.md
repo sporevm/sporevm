@@ -479,16 +479,18 @@ Already landed:
   local image ref.
 - rootfs GC marks chunks from image refs and runtime manifests.
 
-Missing or private:
+Added by S0 and S1:
 
-- `--commit` parsing, compatibility checks, help, and result output;
-- a reusable disk-descriptor-to-`RootfsStorage` helper currently private to the
-  build executor;
-- run-path freeze, snapshot, and publication orchestration after command exit;
-- explicit snapshot-to-ref lock or temporary-GC-root ownership;
-- permission for `--inject` with commit while retaining its rejection with
-  whole-machine save;
-- tests and docs for disk-only run output.
+- `--commit` parsing, compatibility checks, help, result output, and libspore
+  contracts;
+- a shared disk-descriptor-to-`RootfsStorage` conversion used by build and run;
+- run-path freeze, rootfs snapshot, completeness, and local-ref publication;
+- an exclusive cache lock spanning snapshot sealing through ref replacement;
+- transient `--inject` support for disk-only commits while whole-machine save
+  retains its existing rejection;
+- absolute, fail-closed disk growth before the requested command;
+- backend-neutral smoke scripts plus durable rootfs, lifecycle, security, API,
+  and release documentation.
 
 ## Delivery Strategy
 
