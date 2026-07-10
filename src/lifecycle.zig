@@ -4267,11 +4267,7 @@ const ExecStreamPump = struct {
             },
             .exit => |code| return code,
             .err => |bytes| {
-                if (self.stderr_fd >= 0) {
-                    try writeFdAll(self.stderr_fd, bytes);
-                    if (bytes.len != 0 and bytes[bytes.len - 1] != '\n') try writeFdAll(self.stderr_fd, "\n");
-                }
-                return error.MonitorRequestFailed;
+                return monitorRequestFailed(bytes);
             },
         }
     }
@@ -4431,7 +4427,10 @@ fn parseExecNamedResponse(
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.type, "exec_result")) return error.MonitorRequestFailed;
+    if (!std.mem.eql(u8, parsed.value.type, "exec_result")) {
+        if (std.mem.eql(u8, parsed.value.type, "error")) return monitorRequestFailed(parsed.value.message);
+        return error.MonitorRequestFailed;
+    }
     const exit_code = parsed.value.exit_code orelse return error.BadMonitorResponse;
     if (exit_code < 0 or exit_code > 255) return error.BadMonitorResponse;
 
@@ -4452,6 +4451,13 @@ fn parseExecNamedResponse(
         .stdout_truncated = parsed.value.stdout_truncated,
         .stderr_truncated = parsed.value.stderr_truncated,
     };
+}
+
+fn monitorRequestFailed(message: ?[]const u8) error{MonitorRequestFailed} {
+    if (message) |detail| {
+        if (detail.len != 0) setLastError("{s}", .{detail});
+    }
+    return error.MonitorRequestFailed;
 }
 
 fn suspendResponseFailureMessage(allocator: std.mem.Allocator, response: []const u8) !?[]const u8 {
@@ -5361,6 +5367,18 @@ test "named exec response decodes owned output" {
     try std.testing.expectEqualStrings("{\"event\":\"network_decision\"}\n", result.network_events_jsonl);
     try std.testing.expect(!result.stdout_truncated);
     try std.testing.expect(result.stderr_truncated);
+}
+
+test "named exec response preserves monitor error detail" {
+    clearLastError();
+    defer clearLastError();
+    try std.testing.expectError(error.MonitorRequestFailed, parseExecNamedResponse(std.testing.allocator, std.testing.allocator,
+        \\{"type":"error","message":"guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest"}
+    ));
+    try std.testing.expectEqualStrings(
+        "guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest",
+        lastErrorMessage(),
+    );
 }
 
 test "monitor hello response validates helper version" {

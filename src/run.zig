@@ -37,11 +37,11 @@ const max_kernel_asset_size = 256 * 1024 * 1024;
 const max_kernel_config_asset_size = 2 * 1024 * 1024;
 const managed_kernel_download_attempts = 3;
 const max_guest_argc = 16;
-const max_guest_arg_len = 255;
+pub const max_guest_request_len = 8191;
+const max_guest_arg_len = max_guest_request_len;
 const max_guest_envc = 64;
 const max_guest_env_len = 255;
 const max_guest_working_dir_len = 255;
-const max_guest_request_len = 8191;
 const max_guest_port = 65535;
 const max_injected_files = 16;
 const max_injected_file_id_len = 96;
@@ -3911,6 +3911,20 @@ test "run request rejects guest argv count overflow" {
 test "run request rejects guest argv length overflow" {
     var arg = [_]u8{'a'} ** (max_guest_arg_len + 1);
     try std.testing.expectError(error.RunArgTooLong, execRequest(std.testing.allocator, &.{arg[0..]}));
+}
+
+test "run request accepts 256 byte argv at legacy boundary" {
+    var arg = [_]u8{'a'} ** 256;
+    const request = try execRequest(std.testing.allocator, &.{arg[0..]});
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(request.len > arg.len);
+}
+
+test "run request accepts 4096 byte argv within total request limit" {
+    var arg = [_]u8{'a'} ** 4096;
+    const request = try execRequest(std.testing.allocator, &.{arg[0..]});
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(request.len > arg.len);
 }
 
 test "run request rejects encoded line overflow" {
