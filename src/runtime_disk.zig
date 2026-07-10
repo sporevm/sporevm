@@ -62,6 +62,22 @@ pub const RuntimeDisk = struct {
     }
 };
 
+pub fn storageFromSnapshotDisk(allocator: std.mem.Allocator, disk: spore.Disk) !spore.RootfsStorage {
+    if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) return error.BadManifest;
+    if (disk.layers.len != 0) return error.BadManifest;
+    const base = try allocator.dupe(u8, disk.base);
+    return .{
+        .kind = try allocator.dupe(u8, spore.rootfs_storage_kind_chunked_ext4),
+        .device = try spore.cloneRootfsDevice(allocator, disk.device),
+        .logical_size = disk.size,
+        .chunk_size = disk.chunk_size,
+        .hash_algorithm = try allocator.dupe(u8, disk.hash_algorithm),
+        .index_digest = base,
+        .base_identity = try allocator.dupe(u8, disk.base),
+        .object_namespace = try allocator.dupe(u8, disk.object_namespace),
+    };
+}
+
 pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !RuntimeDisk {
     var runtime = RuntimeDisk{ .allocator = allocator };
     errdefer runtime.deinit();

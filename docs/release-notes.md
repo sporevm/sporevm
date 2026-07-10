@@ -2,6 +2,17 @@
 
 ## Next
 
+`spore run --image SOURCE --commit local/name:tag -- COMMAND` can now publish a
+successful one-shot run's writable root disk as an indexed local image. The
+commit path freezes the guest filesystem, reuses the quiesced rootfs snapshot
+and CAS machinery, preserves source OCI config, permits transient `--inject`
+inputs, and leaves the destination ref unchanged on nonzero command exit or
+commit failure. It composes with the existing save/fork path: commit stable disk
+preparation once, save one warm machine, then fork children.
+Image commit also accepts `--disk-size SIZE` to sparsely grow the root block
+device and run guest `resize2fs` before the setup command. The size is absolute,
+cannot shrink the source, and is published only when resize and setup succeed.
+
 This release breaks saved-spore, disk, memory, and rootfs cache formats.
 Existing pre-unified saved spores and old flat/disk-layer cache entries should
 be treated as invalid and rebuilt from source images or recreated from fresh

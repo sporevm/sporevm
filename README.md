@@ -140,7 +140,9 @@ Inject a caller-provided file into the run with `--inject ID=PATH`. The guest
 sees it at `/run/sporevm/injected/ID`; the file is carried by the run
 initrd and copied into rootfs `/run` tmpfs, so it is not added to the image
 rootfs cache. `--inject` is rejected with `--save` and `--from` because file
-persistence would otherwise be ambiguous:
+persistence would otherwise be ambiguous. Disk-only `--commit` allows
+injection; the tmpfs file remains transient unless the guest copies it onto the
+root disk:
 
 ```bash
 spore run --inject config=./config.json \
@@ -176,6 +178,22 @@ spore run --image docker.io/library/alpine:3.20 'echo hi'
 `--image` applies OCI `Env` and `WorkingDir` when present. It does not apply
 OCI `Entrypoint`, `Cmd`, or `User`. Shell commands run as `/bin/sh -lc` in the
 guest. Use `-- <argv...>` when you need exact argv.
+
+Commit the successful run's root disk as another local image when setup is more
+naturally expressed as a command than a Dockerfile:
+
+```bash
+spore run \
+  --image docker.io/library/alpine:3.20 \
+  --commit local/alpine-with-git:dev \
+  -- /bin/sh -lc 'apk add --no-cache git'
+```
+
+Commit is disk-only and leaves the destination ref unchanged unless the guest
+command and publication both succeed. Save one warm machine from the resulting
+image, then use offline `spore fork` for low-latency fan-out.
+Add `--disk-size 40gb` when preparation needs a larger root disk; commit grows
+the sparse device and runs guest `resize2fs` before the requested command.
 
 Build a reusable rootfs artifact explicitly:
 

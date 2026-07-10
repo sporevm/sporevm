@@ -18,6 +18,10 @@ spore rm bench-2
 `spore run` remains the one-shot command. The stable named surface is
 `create`, `exec`, `copy-in`, `copy-out`, `save`, `restore`,
 `fork --vm`, `ls`/`ps`, and `rm` on supported HVF and KVM hosts.
+One-shot `spore run --image SOURCE --commit local/name:tag -- COMMAND` publishes
+successful disk preparation as an image; it does not create or name a live VM.
+Use named `create`/`copy-in`/`exec`/`save` when preparation needs multiple
+interactive lifecycle operations.
 
 Machine callers use global `--json` for single-result lifecycle commands:
 

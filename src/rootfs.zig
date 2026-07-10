@@ -1090,14 +1090,28 @@ pub fn importTar(init: std.process.Init, allocator: std.mem.Allocator, request: 
 }
 
 pub fn publishIndexedImage(init: std.process.Init, allocator: std.mem.Allocator, request: PublishIndexedImageRequest) !PublishIndexedImageResult {
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    defer allocator.free(cache_root);
+    try ensureDirPath(init.io, cache_root);
+    var cache_lock = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
+    defer cache_lock.deinit();
+    return publishIndexedImageWithCacheLockHeld(init.io, allocator, cache_root, request);
+}
+
+/// Publish an indexed image while the caller holds the exclusive rootfs cache
+/// lock. This lets run/build transactions protect newly sealed CAS objects from
+/// pruning until the local ref has been updated.
+pub fn publishIndexedImageWithCacheLockHeld(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    request: PublishIndexedImageRequest,
+) !PublishIndexedImageResult {
     _ = try parseLocalTagRef(request.ref);
     try spore.validateRootfsStorageDescriptor(request.rootfs_storage);
     if (!std.mem.eql(u8, request.rootfs_storage.index_digest, request.rootfs_storage.base_identity)) return error.BadManifest;
 
-    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    defer allocator.free(cache_root);
-    try ensureDirPath(init.io, cache_root);
-    if (!try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, cache_root, request.rootfs_storage)) return error.RootFSDigestCacheMiss;
+    if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, request.rootfs_storage)) return error.RootFSDigestCacheMiss;
 
     const canonical_config_json = try canonicalImageConfigJson(allocator, request.config);
     defer allocator.free(canonical_config_json);
@@ -1132,10 +1146,10 @@ pub fn publishIndexedImage(init: std.process.Init, allocator: std.mem.Allocator,
         .whitespace = .indent_2,
         .emit_null_optional_fields = false,
     });
-    try ext4.ensureParentDir(init.io, metadata_path);
-    try writeFileAtomicPath(init.io, allocator, metadata_path, metadata_json);
+    try ext4.ensureParentDir(io, metadata_path);
+    try writeFileAtomicPath(io, allocator, metadata_path, metadata_json);
 
-    const local_ref_path = try writeLocalRefCacheAnyDigest(init.io, allocator, cache_root, request.ref, resolved);
+    const local_ref_path = try writeLocalRefCacheAnyDigestWithCacheLockHeld(io, allocator, cache_root, request.ref, resolved);
     const result_storage = try spore.cloneRootfsStorage(allocator, request.rootfs_storage);
     return .{
         .metadata_path = metadata_path,
@@ -1850,6 +1864,10 @@ pub fn isLocalImageRef(raw: []const u8) bool {
     return std.mem.startsWith(u8, raw, "local/");
 }
 
+pub fn validateLocalTagRef(raw: []const u8) !void {
+    _ = try parseLocalTagRef(raw);
+}
+
 fn parseLocalTagRef(raw: []const u8) !ImageTag {
     const image_tag = try ImageTag.parse(raw);
     if (!std.mem.eql(u8, image_tag.registry, "local")) return error.LocalRefMustUseLocalRegistry;
@@ -1974,13 +1992,23 @@ fn writeLocalRefCacheAnyDigest(
     raw_ref: []const u8,
     resolved: ResolvedImage,
 ) ![]const u8 {
+    var cache_lock = try lockRootfsCacheExclusive(io, allocator, cache_root);
+    defer cache_lock.deinit();
+    return writeLocalRefCacheAnyDigestWithCacheLockHeld(io, allocator, cache_root, raw_ref, resolved);
+}
+
+fn writeLocalRefCacheAnyDigestWithCacheLockHeld(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    raw_ref: []const u8,
+    resolved: ResolvedImage,
+) ![]const u8 {
     _ = try parseLocalTagRef(raw_ref);
     if (!try localResolvedRefMatchesDigest(allocator, raw_ref, resolved.ref, resolved.manifest_digest)) return error.LocalRefCacheMismatch;
 
     const path = try localRefCachePath(allocator, cache_root, raw_ref, resolved.platform);
     try ext4.ensureParentDir(io, path);
-    var cache_lock = try lockRootfsCacheExclusive(io, allocator, cache_root);
-    defer cache_lock.deinit();
 
     var nonce_bytes: [8]u8 = undefined;
     io.random(&nonce_bytes);

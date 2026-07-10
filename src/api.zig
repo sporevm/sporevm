@@ -16,6 +16,7 @@ const memory_config = @import("memory.zig");
 const platform = @import("platform.zig");
 const attach_mod = @import("attach.zig");
 const rootfs_mod = @import("rootfs.zig");
+const rootfs_cas = @import("rootfs_cas.zig");
 const run_mod = @import("run.zig");
 const gicv3 = @import("gicv3.zig");
 const spore = @import("spore.zig");
@@ -168,6 +169,7 @@ pub const StartEvent = run_mod.StartEvent;
 pub const ReadyEvent = run_mod.ReadyEvent;
 pub const OutputEvent = run_mod.OutputEvent;
 pub const SaveEvent = run_mod.SaveEvent;
+pub const ImageCommitEvent = run_mod.ImageCommitEvent;
 pub const ExitEvent = run_mod.ExitEvent;
 pub const FailureEvent = run_mod.FailureEvent;
 pub const CreateNamedOptions = lifecycle.CreateNamedOptions;
@@ -257,6 +259,10 @@ pub const ManagedRunOptions = struct {
     save_path: ?[]const u8 = null,
     save_trigger: SaveTrigger = .exit,
     continue_after_save: bool = false,
+    /// Publish the writable root disk under this local image ref after exit zero.
+    commit_ref: ?[]const u8 = null,
+    /// Absolute logical root-disk size for a commit run. Must not shrink the source image.
+    disk_size: ?u64 = null,
     annotations: Annotations = .{},
     network: NetworkMode = .disabled,
     network_policy: NetworkConfig = .{},
@@ -852,6 +858,15 @@ pub fn runManaged(
     if (options.save_path != null and options.rootfs_path != null and options.image_ref == null) {
         return error.InvalidRootfsInput;
     }
+    if (options.commit_ref) |ref| {
+        try rootfs_mod.validateLocalTagRef(ref);
+        if (options.image_ref == null or options.rootfs_path != null or options.save_path != null or !options.save_trigger.isExit() or options.continue_after_save or options.interactive or options.tty or options.command.len == 0) {
+            return error.InvalidRunCommitOptions;
+        }
+    }
+    if (options.disk_size) |disk_size| {
+        if (options.commit_ref == null or disk_size == 0 or disk_size % rootfs_cas.default_chunk_size != 0) return error.InvalidRunDiskSize;
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -869,6 +884,11 @@ pub fn runManaged(
     const kernel_path = options.kernel_path orelse try run_mod.resolveDefaultKernelPath(init, arena);
     const initrd_path = try run_mod.resolveConfiguredInitrdPath(init, options.initrd_path);
     const guest_env = try run_mod.mergeGuestEnv(arena, rootfs.guest_env, options.guest_env);
+    const rootfs_grow_target = if (options.disk_size) |target| blk: {
+        const resolved_rootfs = rootfs.rootfs orelse return error.RunCommitRootfsNotSnapshotable;
+        const storage = resolved_rootfs.storage orelse return error.RunCommitRootfsNotSnapshotable;
+        break :blk try run_mod.rootfsGrowTarget(storage.logical_size, target);
+    } else 0;
 
     return run_mod.execute(.{ .io = init.io, .environ_map = init.environ_map }, arena, .{
         .backend = options.backend,
@@ -877,6 +897,7 @@ pub fn runManaged(
         .auto_memory_hotplug_capable = default_kernel and default_initrd,
         .rootfs_path = rootfs.path,
         .rootfs = rootfs.rootfs,
+        .rootfs_grow_target = rootfs_grow_target,
         .command = options.command,
         .injected_files = options.injected_files,
         .interactive = options.interactive,
@@ -891,6 +912,10 @@ pub fn runManaged(
         .save_path = options.save_path,
         .save_trigger = options.save_trigger,
         .continue_after_save = options.continue_after_save,
+        .commit = if (options.commit_ref) |ref| .{
+            .ref = ref,
+            .config = rootfs.image_config orelse return error.RunCommitImageConfigUnavailable,
+        } else null,
         .annotations = options.annotations,
         .network = options.network,
         .network_policy = options.network_policy,
