@@ -312,18 +312,28 @@ fn executeFromMiss(
     var state = initial_state;
     var steps = std.array_list.Managed(build_exec.Step).init(allocator);
     var context_disk = build_context_disk.Builder.init(allocator);
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    var context_snapshot: ?build_context.CopySnapshot = null;
+    defer if (context_snapshot) |*snapshot| snapshot.deinit(init.io);
     for (instructions) |instruction| {
         if (try applyMetadataInstruction(allocator, options, pre_from_args, &state, instruction)) continue;
         switch (instruction.value) {
             .run => |run| try steps.append(.{ .run = try runStep(allocator, diagnostic, state, instruction, run, options.network) }),
-            .copy => |copy| try steps.append(.{ .copy = try copyStep(allocator, init.io, ctx, stat_cache, &context_disk, diagnostic, state, instruction, copy) }),
+            .copy => |copy| {
+                if (context_snapshot == null) context_snapshot = try build_context.CopySnapshot.init(allocator, init.io, cache_root);
+                if (context_snapshot) |*snapshot| {
+                    try steps.append(.{ .copy = try copyStep(allocator, init.io, ctx, stat_cache, snapshot, &context_disk, diagnostic, state, instruction, copy) });
+                } else unreachable;
+            },
             .from => return error.UnsupportedMultiStageDockerfile,
             else => unreachable,
         }
     }
 
-    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    if (context_snapshot) |*snapshot| try snapshot.seal(init.io);
     const context_disk_path = try context_disk.emitOrReuse(init.io, cache_root, &diagnostic.context_disk);
+    if (context_snapshot) |*snapshot| snapshot.deinit(init.io);
+    context_snapshot = null;
     state.storage = try build_exec.runSession(init, allocator, .{
         .platform = options.platform,
         .cache_root = cache_root,
@@ -367,6 +377,7 @@ fn copyStep(
     io: Io,
     ctx: build_context.BuildContext,
     stat_cache: ?*build_context.StatCache,
+    context_snapshot: *build_context.CopySnapshot,
     context_disk: *build_context_disk.Builder,
     diagnostic: *Diagnostic,
     state: State,
@@ -379,19 +390,19 @@ fn copyStep(
         diagnostic.instruction_line = instruction.line;
         return err;
     };
-    const resolved_entries = try build_context.describeCopyResolutionWithOptions(allocator, io, ctx, resolution, .{
+    const resolved_entries = try build_context.captureCopyResolutionWithOptions(allocator, io, ctx, resolution, .{
         .stat_cache = stat_cache,
         .diagnostic = &diagnostic.context_hash,
-    });
+    }, context_snapshot);
     const input_digest = try build_context.hashResolvedCopyEntries(allocator, resolved_entries);
-    try context_disk.addResolvedEntries(resolved_entries);
+    const source_prefix = try context_disk.addCapturedCopy(resolved_entries);
     const dest_is_dir = copyDestIsDirectory(resolved_dest, resolution);
     if (resolution.roots.len > 1 and !copyDestEndsWithSlash(resolved_dest)) {
         diagnostic.instruction_line = instruction.line;
         return error.CopyDestinationMustBeDirectory;
     }
     const dest = try normalizeGuestPath(allocator, state.workdir, resolved_dest);
-    const requests = try copyRequests(allocator, diagnostic, instruction.line, resolution, dest, dest_is_dir);
+    const requests = try copyRequests(allocator, diagnostic, instruction.line, resolution, source_prefix, dest, dest_is_dir);
     return .{
         .line = instruction.line,
         .canonical_instruction = instruction.raw,
@@ -417,6 +428,7 @@ fn copyRequests(
     diagnostic: *Diagnostic,
     instruction_line: usize,
     resolution: build_context.CopyResolution,
+    source_prefix: []const u8,
     dest: []const u8,
     dest_is_dir: bool,
 ) ![]const build_exec.CopyRequest {
@@ -432,8 +444,12 @@ fn copyRequests(
             diagnostic.actual = entry_count;
             return error.CopyEntryCountUnsupported;
         }
+        const source = if (std.mem.eql(u8, root.rel, "."))
+            source_prefix
+        else
+            try std.fs.path.join(allocator, &.{ source_prefix, root.rel });
         try out.append(.{
-            .source = root.rel,
+            .source = source,
             .dest = dest,
             .source_kind = try copySourceKind(root.kind),
             .dest_is_dir = dest_is_dir,
@@ -1052,11 +1068,13 @@ test "COPY file source can target non-slash file destination" {
         .workdir = "/app",
     };
     var diagnostic: Diagnostic = .{};
+    var snapshot = try build_context.CopySnapshot.init(arena, io, root);
+    defer snapshot.deinit(io);
     var context_disk = build_context_disk.Builder.init(arena);
-    const step = try copyStep(arena, io, ctx, null, &context_disk, &diagnostic, state, doc.instructions[2], doc.instructions[2].value.copy);
+    const step = try copyStep(arena, io, ctx, null, &snapshot, &context_disk, &diagnostic, state, doc.instructions[2], doc.instructions[2].value.copy);
     try std.testing.expectEqual(@as(usize, 1), step.requests.len);
     try std.testing.expectEqual(.file, step.requests[0].source_kind);
-    try std.testing.expectEqualStrings("source.txt", step.requests[0].source);
+    try std.testing.expectEqualStrings("s0/source.txt", step.requests[0].source);
     try std.testing.expectEqualStrings("/app/renamed.txt", step.requests[0].dest);
     try std.testing.expect(!step.requests[0].dest_is_dir);
     try std.testing.expect(context_disk.hasEntries());
@@ -1090,8 +1108,10 @@ test "COPY multiple sources require trailing slash destination" {
         .workdir = "/app",
     };
     var diagnostic: Diagnostic = .{};
+    var snapshot = try build_context.CopySnapshot.init(arena, io, root);
+    defer snapshot.deinit(io);
     var context_disk = build_context_disk.Builder.init(arena);
-    try std.testing.expectError(error.CopyDestinationMustBeDirectory, copyStep(arena, io, ctx, null, &context_disk, &diagnostic, state, doc.instructions[2], doc.instructions[2].value.copy));
+    try std.testing.expectError(error.CopyDestinationMustBeDirectory, copyStep(arena, io, ctx, null, &snapshot, &context_disk, &diagnostic, state, doc.instructions[2], doc.instructions[2].value.copy));
 }
 
 test "COPY directory source preserves empty subdirectory entry" {
@@ -1118,11 +1138,13 @@ test "COPY directory source preserves empty subdirectory entry" {
         .args = std.array_list.Managed(ArgValue).init(arena),
     };
     var diagnostic: Diagnostic = .{};
+    var snapshot = try build_context.CopySnapshot.init(arena, io, root);
+    defer snapshot.deinit(io);
     var context_disk = build_context_disk.Builder.init(arena);
-    const step = try copyStep(arena, io, ctx, null, &context_disk, &diagnostic, state, doc.instructions[1], doc.instructions[1].value.copy);
+    const step = try copyStep(arena, io, ctx, null, &snapshot, &context_disk, &diagnostic, state, doc.instructions[1], doc.instructions[1].value.copy);
     try std.testing.expectEqual(@as(usize, 1), step.requests.len);
     try std.testing.expectEqual(.directory, step.requests[0].source_kind);
-    try std.testing.expectEqualStrings("src", step.requests[0].source);
+    try std.testing.expectEqualStrings("s0/src", step.requests[0].source);
     try std.testing.expectEqualStrings("/dest", step.requests[0].dest);
     try std.testing.expectEqual(@as(usize, 2), step.requests[0].entry_count);
 }

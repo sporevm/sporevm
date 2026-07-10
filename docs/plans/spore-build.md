@@ -573,16 +573,19 @@ session as `RUN`, rather than host-side ext4 surgery:
 1. On the host, resolve sources against the context with the same walker used
    by hashing. It rejects absolute and `..` paths, opens every parent component
    fd-relatively without following symlinks, preserves a final symlink as COPY
-   data, and applies `.dockerignore`. The resolved, sorted, deduped file set is
-   both the cache input digest and the context-disk source, so keys cannot drift
-   from bytes.
+   data, and applies `.dockerignore`. Executor misses stream each matched file
+   once into a private sparse spool while hashing those same bytes; modes and
+   symlink targets are captured by value. The immutable captured entries are
+   both the cache input digest and the context-disk source.
 2. Map Docker destinations on the host: directory sources copy contents,
    multiple sources require a `/`-terminated destination, relative destinations
    resolve against `WORKDIR`, and guest paths containing `..` fail closed.
-3. Emit or reuse the cached read-only ext4 context disk from the same resolved
-   entries. The disk digest is derived from the sorted entry paths, kinds,
-   modes, sizes, file content digests, and symlink targets; it is transport
-   identity only and does not enter step-cache semantics. Unchanged contexts
+3. Emit or reuse the cached read-only ext4 context disk from the captured
+   entries. Each COPY step occupies its own short transport namespace, so a
+   later overlapping COPY cannot add files beneath an earlier recursive source.
+   The disk digest is derived from the sorted transport paths, kinds, modes,
+   sizes, file content digests, and symlink targets; it is transport identity
+   only and does not enter step-cache semantics. Unchanged contexts
    reuse the disk image only when its completion sidecar is present and valid;
    the sidecar is published after full disk emission. Changed contexts still
    mostly dedupe through the rootfs CAS chunks emitted by the native ext4
@@ -693,6 +696,9 @@ single-digit seconds end to end, with the BuildKit tar export removed.
   traversal and absolute sources after substitution, and reject symlinks in
   every intermediate source-path component. A final source symlink remains a
   symlink entry and is never followed by context discovery.
+- Executor-side COPY hashing and context-disk emission must consume the same
+  immutable sparse-spool slices. No emitted file may reopen the live build
+  context, and each COPY request sees only its per-step transport namespace.
 - Built-image metadata must not be mistakable for portable OCI provenance:
   `kind: sporevm-built-image-v0`, `layers: []`, and explicit
   `rootfs_storage` pointing at the final `index_digest`. This is the local
@@ -811,6 +817,18 @@ now key the typed `spore`/`none` network mode, and ENV/ARG state uses ordered,
 length-framed typed records rather than a sorted newline-delimited projection.
 The build cache version moved to `sporevm-build-v3`; v2 records are retained as
 GC roots but cannot be reused by the corrected lookup path.
+
+Implementation note (2026-07-10, immutable COPY capture): executor-side COPY
+opens source components fd-relatively without following symlinks, streams file
+bytes once through BLAKE3 into a private 0600 sparse spool, verifies the opened
+file did not change during capture, and seals the spool before ext4 emission.
+Context-disk entries reference only captured spool slices or by-value metadata;
+the original host paths are never reopened. Per-step `sN/` namespaces prevent
+overlapping directory and glob requests from observing another step's unioned
+entries. The spool is deleted after context-disk emission or on every error.
+The build cache version moved to `sporevm-build-v4` so checkpoints created by
+the old split hash/emission path cannot be reused; earlier records remain GC
+roots only.
 
 Implementation note (2026-07-09, COPY/context-disk slice): the executor step
 list is now a tagged RUN/COPY sequence, so the first uncached COPY enters the

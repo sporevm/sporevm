@@ -81,12 +81,105 @@ pub const CopyResolution = struct {
 
 pub const CopyResolvedEntry = struct {
     rel: []const u8,
-    source_path: []const u8,
     kind: Io.File.Kind,
     mode: u32,
     size: u64 = 0,
     content_digest: []const u8 = "",
     symlink_target: []const u8 = "",
+    snapshot_path: []const u8 = "",
+    snapshot_offset: u64 = 0,
+};
+
+const snapshot_dir = "build/context-snapshots";
+
+pub const CopySnapshot = struct {
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    file: ?Io.File,
+    next_offset: u64 = 0,
+
+    pub fn init(allocator: std.mem.Allocator, io: Io, cache_root: []const u8) !CopySnapshot {
+        const dir = try std.fs.path.join(allocator, &.{ cache_root, snapshot_dir });
+        defer allocator.free(dir);
+        try chunk_sealer.ensureDirPath(allocator, dir);
+        const nonce = monotonicNs() catch 0;
+        for (0..100) |attempt| {
+            const path = try std.fmt.allocPrint(allocator, "{s}/snapshot-{d}-{d}-{d}.tmp", .{ dir, std.c.getpid(), nonce, attempt });
+            const file = Io.Dir.cwd().createFile(io, path, .{
+                .read = true,
+                .exclusive = true,
+                .permissions = @enumFromInt(0o600),
+            }) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    allocator.free(path);
+                    continue;
+                },
+                else => |e| {
+                    allocator.free(path);
+                    return e;
+                },
+            };
+            return .{ .allocator = allocator, .path = path, .file = file };
+        }
+        return error.ContextSnapshotCreateFailed;
+    }
+
+    pub fn deinit(self: *CopySnapshot, io: Io) void {
+        if (self.file) |file| {
+            file.close(io);
+            self.file = null;
+        }
+        Io.Dir.cwd().deleteFile(io, self.path) catch {};
+    }
+
+    pub fn seal(self: *CopySnapshot, io: Io) !void {
+        const file = self.file orelse return;
+        file.close(io);
+        self.file = null;
+        try Io.Dir.cwd().setFilePermissions(io, self.path, @enumFromInt(0o400), .{ .follow_symlinks = false });
+    }
+
+    fn captureFile(
+        self: *CopySnapshot,
+        io: Io,
+        source: Io.File,
+        stat: Io.File.Stat,
+        diagnostic: ?*HashDiagnostic,
+    ) !CapturedFile {
+        const snapshot = self.file orelse return error.ContextSnapshotSealed;
+        const start = monotonicNs() catch 0;
+        const snapshot_offset = self.next_offset;
+        const end_offset = std.math.add(u64, snapshot_offset, stat.size) catch return error.ContextSnapshotTooLarge;
+        var h = Blake3.init(.{});
+        var buf: [file_read_chunk_len]u8 = undefined;
+        var source_offset: u64 = 0;
+        while (source_offset < stat.size) {
+            const want: usize = @intCast(@min(stat.size - source_offset, buf.len));
+            const n = try source.readPositionalAll(io, buf[0..want], source_offset);
+            if (n != want) return error.BuildContextChangedDuringSnapshot;
+            const bytes = buf[0..n];
+            h.update(bytes);
+            if (!std.mem.allEqual(u8, bytes, 0)) try snapshot.writePositionalAll(io, bytes, snapshot_offset + source_offset);
+            source_offset += n;
+        }
+        try snapshot.setLength(io, end_offset);
+        const after = try source.stat(io);
+        if (!sameFileStat(stat, after)) return error.BuildContextChangedDuringSnapshot;
+        self.next_offset = end_offset;
+        if (diagnostic) |diag| {
+            diag.bytes_hashed +|= stat.size;
+            diag.content_hash_ns +|= elapsedNs(start);
+        }
+        return .{
+            .offset = snapshot_offset,
+            .digest = try finishDigest(self.allocator, &h),
+        };
+    }
+};
+
+const CapturedFile = struct {
+    offset: u64,
+    digest: []const u8,
 };
 
 pub const HashOptions = struct {
@@ -429,46 +522,113 @@ pub fn describeCopyResolutionWithOptions(
     resolution: CopyResolution,
     options: HashOptions,
 ) ![]const CopyResolvedEntry {
+    return resolveCopyEntries(allocator, io, context, resolution, options, null);
+}
+
+pub fn captureCopyResolutionWithOptions(
+    allocator: std.mem.Allocator,
+    io: Io,
+    context: BuildContext,
+    resolution: CopyResolution,
+    options: HashOptions,
+    snapshot: *CopySnapshot,
+) ![]const CopyResolvedEntry {
+    return resolveCopyEntries(allocator, io, context, resolution, options, snapshot);
+}
+
+fn resolveCopyEntries(
+    allocator: std.mem.Allocator,
+    io: Io,
+    context: BuildContext,
+    resolution: CopyResolution,
+    options: HashOptions,
+    snapshot: ?*CopySnapshot,
+) ![]const CopyResolvedEntry {
     var out = std.array_list.Managed(CopyResolvedEntry).init(allocator);
+    var context_root = Io.Dir.cwd().openDir(io, context.absolute_root, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.SymLinkLoop => return error.CopySourceEscapesContext,
+        else => |e| return e,
+    };
+    defer context_root.close(io);
     for (resolution.entries) |entry| {
         if (options.diagnostic) |diag| diag.entries +|= 1;
-        const path = try std.fs.path.join(allocator, &.{ context.root, entry.rel });
-        errdefer allocator.free(path);
+        const parent_rel = std.fs.path.dirname(entry.rel) orelse "";
+        const basename = std.fs.path.basename(entry.rel);
+        var parent = openContextDir(io, context_root, parent_rel) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir, error.SymLinkLoop => return error.BuildContextChangedDuringSnapshot,
+            else => |e| return e,
+        };
+        defer parent.close(io);
         const stat_start = monotonicNs() catch 0;
-        const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
-        if (options.diagnostic) |diag| diag.stat_ns +|= elapsedNs(stat_start);
-        const mode: u32 = @intCast(@intFromEnum(stat.permissions) & 0o7777);
         switch (entry.kind) {
             .file => {
+                var file = parent.openFile(io, basename, .{
+                    .mode = .read_only,
+                    .allow_directory = false,
+                    .follow_symlinks = false,
+                }) catch |err| switch (err) {
+                    error.FileNotFound, error.NotDir, error.SymLinkLoop, error.IsDir => return error.BuildContextChangedDuringSnapshot,
+                    else => |e| return e,
+                };
+                defer file.close(io);
+                const stat = try file.stat(io);
+                if (stat.kind != .file) return error.BuildContextChangedDuringSnapshot;
+                if (options.diagnostic) |diag| diag.stat_ns +|= elapsedNs(stat_start);
                 if (options.diagnostic) |diag| diag.files +|= 1;
-                const digest = try contentDigestForFile(allocator, io, context, entry.rel, path, stat, options);
+                const captured = if (snapshot) |capture| try capture.captureFile(io, file, stat, options.diagnostic) else null;
+                const digest = if (captured) |value|
+                    value.digest
+                else
+                    try contentDigestForFile(allocator, io, context, entry.rel, file, stat, options);
+                if (captured != null) try updateStatCache(allocator, context, entry.rel, stat, digest, options.stat_cache);
                 try out.append(.{
                     .rel = entry.rel,
-                    .source_path = path,
                     .kind = entry.kind,
-                    .mode = mode,
+                    .mode = @intCast(@intFromEnum(stat.permissions) & 0o7777),
                     .size = stat.size,
                     .content_digest = digest,
+                    .snapshot_path = if (captured != null) snapshot.?.path else "",
+                    .snapshot_offset = if (captured) |value| value.offset else 0,
                 });
             },
             .directory => {
+                var dir = parent.openDir(io, basename, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+                    error.FileNotFound, error.NotDir, error.SymLinkLoop => return error.BuildContextChangedDuringSnapshot,
+                    else => |e| return e,
+                };
+                defer dir.close(io);
+                const stat = try dir.statFile(io, ".", .{ .follow_symlinks = false });
+                if (stat.kind != .directory) return error.BuildContextChangedDuringSnapshot;
+                if (options.diagnostic) |diag| diag.stat_ns +|= elapsedNs(stat_start);
                 if (options.diagnostic) |diag| diag.directories +|= 1;
                 try out.append(.{
                     .rel = entry.rel,
-                    .source_path = path,
                     .kind = entry.kind,
-                    .mode = mode,
+                    .mode = @intCast(@intFromEnum(stat.permissions) & 0o7777),
                 });
             },
             .sym_link => {
+                const stat = parent.statFile(io, basename, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                    error.FileNotFound, error.NotDir, error.SymLinkLoop => return error.BuildContextChangedDuringSnapshot,
+                    else => |e| return e,
+                };
+                if (stat.kind != .sym_link) return error.BuildContextChangedDuringSnapshot;
                 if (options.diagnostic) |diag| diag.symlinks +|= 1;
                 var target_buf: [4096]u8 = undefined;
-                const len = try Io.Dir.cwd().readLink(io, path, &target_buf);
+                const len = parent.readLink(io, basename, &target_buf) catch |err| switch (err) {
+                    error.FileNotFound, error.NotLink => return error.BuildContextChangedDuringSnapshot,
+                    else => |e| return e,
+                };
+                const after = try parent.statFile(io, basename, .{ .follow_symlinks = false });
+                if (!sameFileStat(stat, after)) return error.BuildContextChangedDuringSnapshot;
+                if (options.diagnostic) |diag| diag.stat_ns +|= elapsedNs(stat_start);
                 try out.append(.{
                     .rel = entry.rel,
-                    .source_path = path,
                     .kind = entry.kind,
-                    .mode = mode,
+                    .mode = @intCast(@intFromEnum(stat.permissions) & 0o7777),
                     .symlink_target = try allocator.dupe(u8, target_buf[0..len]),
                 });
             },
@@ -508,7 +668,7 @@ fn contentDigestForFile(
     io: Io,
     context: BuildContext,
     rel: []const u8,
-    path: []const u8,
+    file: Io.File,
     stat: Io.File.Stat,
     options: HashOptions,
 ) ![]const u8 {
@@ -516,44 +676,66 @@ fn contentDigestForFile(
     defer allocator.free(absolute_path);
     if (options.stat_cache) |cache| {
         if (cache.get(absolute_path, stat)) |digest| {
+            const after = try file.stat(io);
+            if (!sameFileStat(stat, after)) return error.BuildContextChangedDuringSnapshot;
             if (options.diagnostic) |diag| diag.stat_cache_hits +|= 1;
             return digest;
         }
         if (options.diagnostic) |diag| diag.stat_cache_misses +|= 1;
     }
-    const digest = try hashFileDigest(allocator, io, path, stat, options.diagnostic);
+    const digest = try hashFileDigest(allocator, io, file, stat, options.diagnostic);
     if (options.stat_cache) |cache| cache.put(absolute_path, stat, digest);
     return digest;
+}
+
+fn updateStatCache(
+    allocator: std.mem.Allocator,
+    context: BuildContext,
+    rel: []const u8,
+    stat: Io.File.Stat,
+    digest: []const u8,
+    maybe_cache: ?*StatCache,
+) !void {
+    const cache = maybe_cache orelse return;
+    const absolute_path = try std.fs.path.join(allocator, &.{ context.absolute_root, rel });
+    defer allocator.free(absolute_path);
+    cache.put(absolute_path, stat, digest);
 }
 
 fn hashFileDigest(
     allocator: std.mem.Allocator,
     io: Io,
-    path: []const u8,
+    file: Io.File,
     stat: Io.File.Stat,
     diagnostic: ?*HashDiagnostic,
 ) ![]const u8 {
     const start = monotonicNs() catch 0;
-    var file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only, .allow_directory = false, .follow_symlinks = false });
-    defer file.close(io);
     var h = Blake3.init(.{});
     var buf: [file_read_chunk_len]u8 = undefined;
-    var remaining = stat.size;
-    while (remaining > 0) {
-        const want: usize = @intCast(@min(remaining, buf.len));
-        const n = file.readStreaming(io, &.{buf[0..want]}) catch |err| switch (err) {
-            error.EndOfStream => return error.ShortRead,
-            else => |e| return e,
-        };
-        if (n == 0) return error.ShortRead;
+    var offset: u64 = 0;
+    while (offset < stat.size) {
+        const want: usize = @intCast(@min(stat.size - offset, buf.len));
+        const n = try file.readPositionalAll(io, buf[0..want], offset);
+        if (n != want) return error.BuildContextChangedDuringSnapshot;
         h.update(buf[0..n]);
-        remaining -= n;
+        offset += n;
     }
+    const after = try file.stat(io);
+    if (!sameFileStat(stat, after)) return error.BuildContextChangedDuringSnapshot;
     if (diagnostic) |diag| {
         diag.bytes_hashed +|= stat.size;
         diag.content_hash_ns +|= elapsedNs(start);
     }
     return finishDigest(allocator, &h);
+}
+
+fn sameFileStat(a: Io.File.Stat, b: Io.File.Stat) bool {
+    return a.kind == b.kind and
+        a.size == b.size and
+        a.permissions == b.permissions and
+        a.inode == b.inode and
+        a.mtime.nanoseconds == b.mtime.nanoseconds and
+        a.ctime.nanoseconds == b.ctime.nanoseconds;
 }
 
 fn hashField(h: *Blake3, bytes: []const u8) void {
@@ -866,6 +1048,90 @@ test "COPY source resolution preserves a final symlink outside the context" {
     try std.testing.expectEqual(Io.File.Kind.sym_link, resolution.roots[0].kind);
     const entries = try describeCopyResolutionWithOptions(arena, io, ctx, resolution, .{});
     try std.testing.expectEqualStrings("../outside/secret.txt", entries[0].symlink_target);
+}
+
+test "COPY snapshot pins file bytes and symlink targets" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-snapshot-payload";
+    const context_root = root ++ "/context";
+    const cache_root = root ++ "/cache";
+    const file_path = context_root ++ "/payload.txt";
+    const link_path = context_root ++ "/link";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, context_root);
+    try Io.Dir.cwd().createDirPath(io, cache_root);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = "alpha" });
+    try Io.Dir.cwd().symLink(io, "target-a", link_path, .{});
+
+    var diag: IgnoreDiagnostic = .{};
+    const ctx = try load(arena, io, context_root, &diag);
+    const resolution = try resolveCopySources(arena, io, ctx, &.{ "payload.txt", "link" });
+    var snapshot = try CopySnapshot.init(arena, io, cache_root);
+    defer snapshot.deinit(io);
+    const captured = try captureCopyResolutionWithOptions(arena, io, ctx, resolution, .{}, &snapshot);
+    const captured_digest = try hashResolvedCopyEntries(arena, captured);
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = "bravo" });
+    try Io.Dir.cwd().deleteFile(io, link_path);
+    try Io.Dir.cwd().symLink(io, "target-b", link_path, .{});
+
+    var captured_file: ?CopyResolvedEntry = null;
+    var captured_link: ?CopyResolvedEntry = null;
+    for (captured) |entry| {
+        if (std.mem.eql(u8, entry.rel, "payload.txt")) captured_file = entry;
+        if (std.mem.eql(u8, entry.rel, "link")) captured_link = entry;
+    }
+    var snapshot_file = try Io.Dir.cwd().openFile(io, captured_file.?.snapshot_path, .{ .mode = .read_only });
+    defer snapshot_file.close(io);
+    var bytes: [5]u8 = undefined;
+    try std.testing.expectEqual(bytes.len, try snapshot_file.readPositionalAll(io, &bytes, captured_file.?.snapshot_offset));
+    try std.testing.expectEqualStrings("alpha", &bytes);
+    try std.testing.expectEqualStrings("target-a", captured_link.?.symlink_target);
+
+    const fresh_resolution = try resolveCopySources(arena, io, ctx, &.{ "payload.txt", "link" });
+    var fresh_snapshot = try CopySnapshot.init(arena, io, cache_root);
+    defer fresh_snapshot.deinit(io);
+    const fresh = try captureCopyResolutionWithOptions(arena, io, ctx, fresh_resolution, .{}, &fresh_snapshot);
+    const fresh_digest = try hashResolvedCopyEntries(arena, fresh);
+    try std.testing.expect(!std.mem.eql(u8, captured_digest, fresh_digest));
+
+    try Io.Dir.cwd().deleteFile(io, file_path);
+    try Io.Dir.cwd().deleteFile(io, link_path);
+    try std.testing.expectEqual(bytes.len, try snapshot_file.readPositionalAll(io, &bytes, captured_file.?.snapshot_offset));
+    try std.testing.expectEqualStrings("alpha", &bytes);
+}
+
+test "COPY snapshot rejects an intermediate symlink swap" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-snapshot-symlink-swap";
+    const context_root = root ++ "/context";
+    const cache_root = root ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, context_root ++ "/safe");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/outside");
+    try Io.Dir.cwd().createDirPath(io, cache_root);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/safe/secret.txt", .data = "inside" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/outside/secret.txt", .data = "outside" });
+
+    var diag: IgnoreDiagnostic = .{};
+    const ctx = try load(arena, io, context_root, &diag);
+    const resolution = try resolveCopySources(arena, io, ctx, &.{"safe/secret.txt"});
+    try Io.Dir.cwd().deleteTree(io, context_root ++ "/safe");
+    try Io.Dir.cwd().symLink(io, "../outside", context_root ++ "/safe", .{});
+    var snapshot = try CopySnapshot.init(arena, io, cache_root);
+    defer snapshot.deinit(io);
+    try std.testing.expectError(
+        error.CopySourceEscapesContext,
+        captureCopyResolutionWithOptions(arena, io, ctx, resolution, .{}, &snapshot),
+    );
 }
 
 test "dockerignore rejects question-mark patterns" {

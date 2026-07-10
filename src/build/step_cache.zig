@@ -7,7 +7,7 @@ const spore = @import("../spore.zig");
 const rootfs_mod = @import("../rootfs.zig");
 const chunk_sealer = @import("../chunk_sealer.zig");
 
-pub const builder_version = "sporevm-build-v3";
+pub const builder_version = "sporevm-build-v4";
 const record_kind = "sporevm-build-step-v1";
 const max_step_record_bytes = 256 * 1024;
 

@@ -365,6 +365,9 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
                 try stderr.writeAll("spore build: COPY source did not match any context path\n");
             }
         },
+        error.BuildContextChangedDuringSnapshot => {
+            try stderr.writeAll("spore build: COPY source changed while the build context was being read; retry the build\n");
+        },
         error.UnsupportedCopyGlob => {
             try stderr.writeAll("spore build: COPY only supports literal paths and single-component * globs\n");
         },

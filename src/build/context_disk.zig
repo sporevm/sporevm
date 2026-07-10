@@ -26,7 +26,7 @@ pub const Diagnostic = struct {
 pub const Builder = struct {
     allocator: std.mem.Allocator,
     entries: std.array_list.Managed(build_context.CopyResolvedEntry),
-    index: std.StringHashMapUnmanaged(void) = .empty,
+    copy_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Builder {
         return .{
@@ -35,12 +35,22 @@ pub const Builder = struct {
         };
     }
 
-    pub fn addResolvedEntries(self: *Builder, entries: []const build_context.CopyResolvedEntry) !void {
+    pub fn addCapturedCopy(self: *Builder, entries: []const build_context.CopyResolvedEntry) ![]const u8 {
+        const prefix = try std.fmt.allocPrint(self.allocator, "s{d}", .{self.copy_count});
+        self.copy_count += 1;
+        try self.entries.append(.{
+            .rel = prefix,
+            .kind = .directory,
+            .mode = 0o755,
+        });
         for (entries) |entry| {
-            if (self.index.contains(entry.rel)) continue;
-            try self.index.put(self.allocator, entry.rel, {});
-            try self.entries.append(entry);
+            if (std.mem.eql(u8, entry.rel, ".")) continue;
+            if (entry.kind == .file and entry.snapshot_path.len == 0) return error.CopySourceNotSnapshotted;
+            var disk_entry = entry;
+            disk_entry.rel = try std.fs.path.join(self.allocator, &.{ prefix, entry.rel });
+            try self.entries.append(disk_entry);
         }
+        return prefix;
     }
 
     pub fn hasEntries(self: Builder) bool {
@@ -141,12 +151,13 @@ pub const Builder = struct {
                     .gid = 0,
                 }),
                 .file => {
-                    const source_path = try self.allocator.dupe(u8, entry.source_path);
+                    if (entry.snapshot_path.len == 0) return error.CopySourceNotSnapshotted;
+                    const source_path = try self.allocator.dupe(u8, entry.snapshot_path);
                     try out.append(.{
                         .path = entry.rel,
                         .kind = .{ .file_source = .{ .file = tar.FileSlice{
                             .path = source_path,
-                            .offset = 0,
+                            .offset = entry.snapshot_offset,
                             .size = entry.size,
                         } } },
                         .mode = @intCast(entry.mode),
@@ -237,22 +248,25 @@ test "context disk requires a complete stamp before reuse" {
     const arena = arena_state.allocator();
     const root = "zig-cache/test-build-context-disk-complete-stamp";
     const cache_root = root ++ "/cache";
-    const source_path = root ++ "/source.txt";
+    const context_root = root ++ "/context";
+    const source_path = context_root ++ "/source.txt";
     defer Io.Dir.cwd().deleteTree(io, root) catch {};
     try Io.Dir.cwd().createDirPath(io, cache_root);
+    try Io.Dir.cwd().createDirPath(io, context_root);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "context disk source" });
-    const source_stat = try Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+
+    var ignore_diag: build_context.IgnoreDiagnostic = .{};
+    const context = try build_context.load(arena, io, context_root, &ignore_diag);
+    const resolution = try build_context.resolveCopySources(arena, io, context, &.{"source.txt"});
+    var snapshot = try build_context.CopySnapshot.init(arena, io, cache_root);
+    defer snapshot.deinit(io);
+    const captured = try build_context.captureCopyResolutionWithOptions(arena, io, context, resolution, .{}, &snapshot);
 
     var builder = Builder.init(arena);
-    try builder.addResolvedEntries(&.{.{
-        .rel = "source.txt",
-        .source_path = source_path,
-        .kind = .file,
-        .mode = 0o644,
-        .size = source_stat.size,
-        .content_digest = "blake3:context-disk-complete-stamp-test",
-    }});
-    const image_size = ext4.computeImageSize(source_stat.size);
+    _ = try builder.addCapturedCopy(captured);
+    try snapshot.seal(io);
+    try Io.Dir.cwd().deleteFile(io, source_path);
+    const image_size = ext4.computeImageSize("context disk source".len);
     const disk_digest = try builder.diskDigest(arena);
     const disk_dir = try std.fs.path.join(arena, &.{ cache_root, context_disk_dir });
     try chunk_sealer.ensureDirPath(arena, disk_dir);
@@ -271,4 +285,25 @@ test "context disk requires a complete stamp before reuse" {
     _ = try builder.emitOrReuse(io, cache_root, &reused);
     try std.testing.expect(reused.reused);
     try std.testing.expect(!reused.emitted);
+}
+
+test "context disk isolates each COPY in its own transport namespace" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var builder = Builder.init(arena);
+    const first = try builder.addCapturedCopy(&.{
+        .{ .rel = "dir", .kind = .directory, .mode = 0o755 },
+        .{ .rel = "dir/a.txt", .kind = .file, .mode = 0o644, .size = 1, .content_digest = "blake3:a", .snapshot_path = "snapshot", .snapshot_offset = 0 },
+    });
+    const second = try builder.addCapturedCopy(&.{
+        .{ .rel = "dir", .kind = .directory, .mode = 0o755 },
+        .{ .rel = "dir/b.txt", .kind = .file, .mode = 0o644, .size = 1, .content_digest = "blake3:b", .snapshot_path = "snapshot", .snapshot_offset = 1 },
+    });
+
+    try std.testing.expectEqualStrings("s0", first);
+    try std.testing.expectEqualStrings("s1", second);
+    try std.testing.expectEqual(@as(usize, 6), builder.entries.items.len);
+    try std.testing.expectEqualStrings("s0/dir/a.txt", builder.entries.items[2].rel);
+    try std.testing.expectEqualStrings("s1/dir/b.txt", builder.entries.items[5].rel);
 }
