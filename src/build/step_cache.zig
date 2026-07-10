@@ -208,7 +208,10 @@ pub fn writeRecord(
         .whitespace = .indent_2,
         .emit_null_optional_fields = false,
     });
-    try chunk_sealer.writeFileAtomicDurable(allocator, path, json, 0o444);
+    // Step keys identify inputs, not immutable outputs. In particular,
+    // `--no-cache` may rerun a networked RUN and produce a different valid
+    // child snapshot for the same key, so atomically replace this derived map.
+    try chunk_sealer.replaceFileAtomicDurable(allocator, path, json, 0o444);
     return path;
 }
 
@@ -391,4 +394,38 @@ test "environment digest frames entries and preserves order" {
     const reverse = try envDigest(allocator, &.{ "MODE=second", "MODE=first" }, &.{});
     defer allocator.free(reverse);
     try std.testing.expect(!std.mem.eql(u8, forward, reverse));
+}
+
+test "rewriting a step record replaces a prior child snapshot" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-build-step-cache-replace";
+    const cache_root = tmp ++ "/cache";
+    const first_rootfs = tmp ++ "/first.ext4";
+    const second_rootfs = tmp ++ "/second.ext4";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = first_rootfs, .data = "first snapshot" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = second_rootfs, .data = "second snapshot" });
+
+    const first_preload = try rootfs_cas.preloadPath(io, arena, cache_root, first_rootfs, rootfs_cas.default_chunk_size);
+    const first_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, first_preload);
+    const second_preload = try rootfs_cas.preloadPath(io, arena, cache_root, second_rootfs, rootfs_cas.default_chunk_size);
+    const second_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, second_preload);
+    const input = StepInput{
+        .platform = .{},
+        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .canonical_instruction = "RUN fetch-current-packages",
+        .operation = .{ .run = .{ .network_mode = .spore } },
+    };
+    const key = try stepKey(arena, input);
+
+    _ = try writeRecord(io, arena, cache_root, input, key, first_storage);
+    _ = try writeRecord(io, arena, cache_root, input, key, second_storage);
+    const hit = (try readHit(io, arena, cache_root, input, key)) orelse return error.MissingBuildCacheRecord;
+    try std.testing.expectEqualStrings(second_storage.index_digest, hit.index_digest);
 }
