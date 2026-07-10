@@ -781,6 +781,12 @@ fn pruneRootfsCache(
     opts: PrunePlanOptions,
     now_ns: i96,
 ) !RootfsPruneResult {
+    // Planning and deletion must observe one stable cache generation. This is
+    // the same lock held by rootfs publishers, so a forced prune cannot select
+    // objects that become part of newly completed storage before deletion.
+    var cache_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, cache_root);
+    defer cache_lock.deinit();
+
     const plan = try collectPruneEntries(allocator, io, cache_root, opts.include_digest_artifacts, opts.include_rootfs_chunks);
     std.mem.sort(PrunePlanEntry, plan, {}, lessPrunePlanEntry);
 
@@ -2355,7 +2361,7 @@ test "system cache gc treats unknown rootfs records as conservative roots" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "Warning: 1 unrecognized rootfs metadata records, 1 unrecognized rootfs ref records, and 1 unrecognized build step records found; retained all rootfs CAS entries.") != null);
 }
 
-test "system cache gc lock rejects a concurrent holder" {
+test "system cache mutation lock rejects a concurrent holder" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const root = "zig-cache/test-system-cache-gc-lock";
