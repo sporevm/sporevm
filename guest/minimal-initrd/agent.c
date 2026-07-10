@@ -34,11 +34,11 @@
 #endif
 
 #define MAX_ARGC 16
-#define MAX_ARG_LEN 256
 #define MAX_ENVC 64
 #define MAX_ENV_LEN 256
 #define MAX_WORKDIR_LEN 256
 #define MAX_REQUEST 8192
+#define MAX_ARG_STORAGE MAX_REQUEST
 #define MAX_FRAME_PAYLOAD 4096
 #define MAX_COPY_PATH_LEN 512
 #define MAX_COPY_FULL_PATH_LEN 1024
@@ -1269,7 +1269,7 @@ static int parse_json_string(const char **cursor, char *out, size_t cap) {
   return 0;
 }
 
-static int parse_argv(const char *req, char storage[MAX_ARGC][MAX_ARG_LEN], char *argv[MAX_ARGC + 1]) {
+static int parse_argv(const char *req, char storage[MAX_ARG_STORAGE], char *argv[MAX_ARGC + 1]) {
   const char *p = strstr(req, "\"argv\"");
   if (p == NULL) p = strstr(req, "\"command\"");
   if (p == NULL) return -1;
@@ -1278,6 +1278,7 @@ static int parse_argv(const char *req, char storage[MAX_ARGC][MAX_ARG_LEN], char
   p++;
 
   int argc = 0;
+  size_t storage_len = 0;
   for (;;) {
     p = skip_ws(p);
     if (*p == ']') {
@@ -1285,8 +1286,10 @@ static int parse_argv(const char *req, char storage[MAX_ARGC][MAX_ARG_LEN], char
       return argc > 0 ? argc : -1;
     }
     if (argc >= MAX_ARGC) return -1;
-    if (parse_json_string(&p, storage[argc], MAX_ARG_LEN) != 0) return -1;
-    argv[argc] = storage[argc];
+    if (storage_len >= MAX_ARG_STORAGE) return -1;
+    argv[argc] = storage + storage_len;
+    if (parse_json_string(&p, argv[argc], MAX_ARG_STORAGE - storage_len) != 0) return -1;
+    storage_len += strlen(argv[argc]) + 1;
     argc++;
 
     p = skip_ws(p);
@@ -1384,7 +1387,7 @@ struct run_request {
   int copy_source_kind;
   int copy_dest_is_dir;
   uint64_t build_command_len;
-  char arg_storage[MAX_ARGC][MAX_ARG_LEN];
+  char arg_storage[MAX_ARG_STORAGE];
   char *argv[MAX_ARGC + 1];
   char env_storage[MAX_ENVC][MAX_ENV_LEN];
   char *envp[MAX_ENVC + 1];

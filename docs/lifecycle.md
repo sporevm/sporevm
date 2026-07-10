@@ -246,6 +246,10 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
 
 ## Limits
 
+- Named exec command requests are bounded to 8,191 encoded bytes including
+  guest framing. There is no smaller per-argument cap; usable command length
+  varies with argv count and JSON escaping. Put larger commands in a guest
+  script.
 - `spore run -i` supports pipe-style stdin forwarding for one-shot runs.
 - `spore run -t` allocates a guest PTY for one-shot runs, and `spore run -it`
   forwards host terminal input in raw mode. TTY mode has one merged terminal

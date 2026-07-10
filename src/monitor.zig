@@ -17,7 +17,7 @@ const topology = @import("topology.zig");
 const version = @import("version.zig");
 const vsock = @import("virtio/vsock.zig");
 
-const max_control_request = 4096;
+const max_control_request = run.max_guest_request_len + 1;
 const max_control_response = 128 * 1024;
 const max_exec_output = 16 * 1024;
 const max_suspend_path = 4096;
@@ -997,8 +997,12 @@ fn controlThreadMain(server: *ExecServer) void {
 
 fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
     var read_buffer: [max_control_request]u8 = undefined;
-    const line = readControlLineFd(stream.socket.handle, &read_buffer) catch {
-        try writeControlError(server.io, stream, "bad control request");
+    const line = readControlLineFd(stream.socket.handle, &read_buffer) catch |err| {
+        const message = if (err == error.ControlRequestTooLarge)
+            "control request exceeds 8191 bytes; shorten the guest command"
+        else
+            "bad control request";
+        try writeControlError(server.io, stream, message);
         return false;
     };
     var parsed = std.json.parseFromSlice(ControlRequest, server.allocator, line, .{
@@ -1072,8 +1076,8 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
             .cols = parsed.value.terminal_cols orelse 80,
         };
         const terminal_name = parsed.value.term orelse "xterm";
-        const request = server.interactiveExecRequest(argv, interactive, tty, terminal_name, terminal_size) catch {
-            try writeStreamingControlError(stream.socket.handle, "invalid argv");
+        const request = server.interactiveExecRequest(argv, interactive, tty, terminal_name, terminal_size) catch |err| {
+            try writeStreamingControlError(stream.socket.handle, guestCommandErrorMessage(err));
             return false;
         };
         defer server.allocator.free(request);
@@ -1115,13 +1119,13 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         return false;
     };
     const request = if (detached)
-        server.detachedExecRequest(argv) catch {
-            try writeControlError(server.io, stream, "invalid argv");
+        server.detachedExecRequest(argv) catch |err| {
+            try writeControlError(server.io, stream, guestCommandErrorMessage(err));
             return false;
         }
     else
-        server.execRequest(argv) catch {
-            try writeControlError(server.io, stream, "invalid argv");
+        server.execRequest(argv) catch |err| {
+            try writeControlError(server.io, stream, guestCommandErrorMessage(err));
             return false;
         };
     defer server.allocator.free(request);
@@ -1131,6 +1135,14 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
     };
     try writeAll(server.io, stream, response);
     return false;
+}
+
+fn guestCommandErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.RunArgCountUnsupported => "guest command must contain between 1 and 16 arguments",
+        error.RunArgTooLong, error.RunRequestTooLarge => "guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest",
+        else => "invalid guest command",
+    };
 }
 
 fn readControlLineFd(fd: std.c.fd_t, buffer: []u8) ![]const u8 {
@@ -1542,4 +1554,15 @@ test "monitor registry detector notices deleted vm dir" {
     try std.testing.expect(!registryDirMissing(io, vm_dir));
     try Io.Dir.cwd().deleteTree(io, vm_dir);
     try std.testing.expect(registryDirMissing(io, vm_dir));
+}
+
+test "monitor reports actionable guest command request errors" {
+    try std.testing.expectEqualStrings(
+        "guest command must contain between 1 and 16 arguments",
+        guestCommandErrorMessage(error.RunArgCountUnsupported),
+    );
+    try std.testing.expectEqualStrings(
+        "guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest",
+        guestCommandErrorMessage(error.RunRequestTooLarge),
+    );
 }

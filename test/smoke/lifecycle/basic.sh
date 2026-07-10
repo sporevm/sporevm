@@ -90,6 +90,10 @@ writeout_stdout="${workdir}/writeout.stdout"
 writeout_stderr="${workdir}/writeout.stderr"
 true_stdout="${workdir}/true.stdout"
 true_stderr="${workdir}/true.stderr"
+long_command_stdout="${workdir}/long-command.stdout"
+long_command_stderr="${workdir}/long-command.stderr"
+oversized_command_stdout="${workdir}/oversized-command.stdout"
+oversized_command_stderr="${workdir}/oversized-command.stderr"
 fork_stdout="${workdir}/fork.stdout"
 fork_stderr="${workdir}/fork.stderr"
 source_after_fork_stdout="${workdir}/source-after-fork.stdout"
@@ -209,6 +213,43 @@ fi
   cat "${true_stdout}" >&2 || true
   die "second spore exec wrote unexpected stdout"
 }
+
+printf -v long_payload '%04096d' 0
+long_command="echo ${long_payload}"
+if run_capture "${long_command_stdout}" "${long_command_stderr}" \
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" exec "${vm_name}" "${long_command}"; then
+  :
+else
+  status=$?
+  require_success "${status}" "long shell-form spore exec" "${long_command_stderr}"
+fi
+grep -Fxq "${long_payload}" "${long_command_stdout}" || {
+  cat "${long_command_stdout}" >&2 || true
+  cat "${long_command_stderr}" >&2 || true
+  die "long shell-form spore exec did not preserve its command"
+}
+
+printf -v oversized_arg '%08000d' 0
+if run_capture "${oversized_command_stdout}" "${oversized_command_stderr}" \
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" exec "${vm_name}" -- /bin/echo "${oversized_arg}"; then
+  die "spore exec accepted a command larger than the guest request limit"
+else
+  status=$?
+  [[ "${status}" == "1" ]] || {
+    cat "${oversized_command_stderr}" >&2 || true
+    die "oversized spore exec exited ${status}, expected 1"
+  }
+fi
+grep -Fxq "spore exec: guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest" "${oversized_command_stderr}" || {
+  cat "${oversized_command_stderr}" >&2 || true
+  die "oversized spore exec did not report the guest request limit"
+}
+if grep -Fq "MonitorRequestFailed" "${oversized_command_stderr}"; then
+  cat "${oversized_command_stderr}" >&2 || true
+  die "oversized spore exec leaked the generic monitor error"
+fi
 
 if run_capture "${fork_stdout}" "${fork_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
