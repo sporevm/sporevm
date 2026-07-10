@@ -101,17 +101,6 @@ steps:
 
   - wait
 
-  - trigger: "sporevm-benchmarks"
-    label: ":chart_with_upwards_trend: Trigger Benchmark Suite"
-    async: true
-    if: build.branch == "main" || build.env("SPOREVM_RUN_BENCHMARKS") == "1"
-    build:
-      branch: "${BUILDKITE_BRANCH}"
-      commit: "${BUILDKITE_COMMIT}"
-      message: "${BUILDKITE_MESSAGE}"
-
-  - wait
-
   - label: ":rocket: Publish release"
     key: "release-publish"
     depends_on:

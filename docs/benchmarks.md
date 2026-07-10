@@ -445,15 +445,8 @@ files.
 
 ## Buildkite
 
-The main Buildkite pipeline triggers the dedicated `sporevm-benchmarks` pipeline
-after the build/test jobs pass. Non-main builds can opt in with:
-
-```console
-SPOREVM_RUN_BENCHMARKS=1
-```
-
-The trigger is asynchronous, so the parent `sporevm` build does not wait for the
-benchmark pipeline to finish.
+The dedicated `sporevm-benchmarks` pipeline is launched manually in Buildkite.
+The main `sporevm` pipeline does not trigger benchmark builds.
 
 The dedicated benchmark pipeline runs macOS and Linux ARM64 benchmark jobs in
 parallel on `sporevm-mac` and `sporevm-linux-arm64`. Each platform job uses a
