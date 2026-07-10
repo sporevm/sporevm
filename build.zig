@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
         .preferred_optimize_mode = .ReleaseSafe,
     });
     const macos_framework_path = macosFrameworkPath(b);
-    const libspore_version = std.SemanticVersion{ .major = 0, .minor = 11, .patch = 1 };
+    const libspore_version = std.SemanticVersion{ .major = 0, .minor = 11, .patch = 2 };
 
     const libspore_mod = b.addModule("libspore", .{
         .root_source_file = b.path("src/libspore.zig"),
@@ -102,7 +102,7 @@ pub fn build(b: *std.Build) void {
         \\
         \\Name: libspore
         \\Description: SporeVM C ABI
-        \\Version: 0.11.1
+        \\Version: 0.11.2
         \\Libs: -L${libdir} -lspore
         \\Cflags: -I${includedir}
         \\
