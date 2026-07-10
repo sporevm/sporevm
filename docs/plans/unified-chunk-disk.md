@@ -731,14 +731,19 @@ backend arm are gone; writable COW behavior now lives only inside
 release-note docs describe disk indexes, lazy CAS fault-in, the format break,
 and the fork/runtime behavior.
 
-Validation: `mise run test` and `mise run build`.
+Validation: `mise run test`, `mise run build`, and the conditional
+`rootfs-slow-test` target. The slow graph validates chunk-index storage and
+completeness for native/external imports. The remote rootfs bundle smoke emits a
+current v2 synthetic manifest with a complete zero-memory index, and the writer
+benchmark reports canonical index identity plus the current CAS preload phase.
 
 ## Security
 
 - Net parser reduction: the `DiskLayer` parser is deleted, and writable disks
   now use the hardened `DiskIndex` parser. Restore-authority surface shrinks.
-- The chunk map is host-internal state derived from validated values; the
-  virtio-blk request parsing is untouched (frozen device model).
+- The chunk map is host-internal state derived from validated values. The
+  virtio-blk wire/device model stays frozen; request validation now completes
+  before I/O and lazy CAS sources prefault before payload copies.
 - CAS objects remain verify-at-write, trust-at-open; index digests bind
   coverage and size exactly as `validateDiskIndex` does today.
 - GC is a new destructive operation: it must be root-conservative (unknown

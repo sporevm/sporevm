@@ -16,8 +16,7 @@ hosts. The default initrd workload exercises the low-level diskless resume path.
 Pass `--workload rootfs` to build an OCI rootfs artifact, include immutable
 rootfs bytes in the bundle, and verify destination materialization without
 booting the child VM. Rootfs workloads use manifest-bound chunked rootfs CAS
-storage by default; pass `--rootfs-storage exact` to exercise the legacy exact
-ext4 artifact path.
+storage.
 
 The script uploads tracked HEAD plus the current tracked/staged diff to S3 so
 it can validate local changes before they are committed without copying stray
@@ -47,9 +46,6 @@ Options:
                               (default: docker.io/library/alpine:3.20)
   --rootfs-platform PLATFORM  OCI platform for --workload rootfs (default: linux/arm64)
   --rootfs-mem-mib N          guest memory for --workload rootfs (default: 2048)
-  --rootfs-storage exact|chunked
-                              rootfs bundle storage for --workload rootfs
-                              (default: chunked)
   --snapshot-after-ms N       capture delay before snapshot (default: 3000)
   --resume-seconds N          seconds to let resumed VM tick (default: 5)
   --dest-repeat N             restore each destination N times (default: 1)
@@ -126,7 +122,7 @@ workload="initrd"
 rootfs_image="${SPORE_SMOKE_ROOTFS_IMAGE:-docker.io/library/alpine:3.20}"
 rootfs_platform="${SPORE_SMOKE_ROOTFS_PLATFORM:-linux/arm64}"
 rootfs_mem_mib="${SPORE_SMOKE_ROOTFS_MEM_MIB:-2048}"
-rootfs_storage="${SPORE_SMOKE_ROOTFS_STORAGE:-}"
+rootfs_storage="exact"
 snapshot_after_ms="3000"
 resume_seconds="5"
 dest_repeat="1"
@@ -220,11 +216,6 @@ while (($#)); do
       rootfs_mem_mib="$2"
       shift 2
       ;;
-    --rootfs-storage)
-      need_value "$1" "${2-}"
-      rootfs_storage="$2"
-      shift 2
-      ;;
     --snapshot-after-ms)
       need_value "$1" "${2-}"
       snapshot_after_ms="$2"
@@ -309,19 +300,8 @@ case "${workload}" in
   initrd|rootfs) ;;
   *) die "--workload must be initrd or rootfs" ;;
 esac
-if [[ -z "${rootfs_storage}" ]]; then
-  if [[ "${workload}" == "rootfs" ]]; then
-    rootfs_storage="chunked"
-  else
-    rootfs_storage="exact"
-  fi
-fi
-case "${rootfs_storage}" in
-  exact|chunked) ;;
-  *) die "--rootfs-storage must be exact or chunked" ;;
-esac
-if [[ "${rootfs_storage}" != "exact" && "${workload}" != "rootfs" ]]; then
-  die "--rootfs-storage ${rootfs_storage} requires --workload rootfs"
+if [[ "${workload}" == "rootfs" ]]; then
+  rootfs_storage="chunked"
 fi
 if [[ "${writable_rootfs}" == "1" && "${workload}" != "initrd" ]]; then
   die "--writable-rootfs cannot be combined with --workload ${workload}"
@@ -602,20 +582,26 @@ else
     --platform "\${rootfs_platform}" \
     --output "\${rootfs_ext4}" \
     --metadata "\${rootfs_metadata}" | tee "\${workdir}/rootfs-build.txt"
-  python3 - "\${rootfs_metadata}" "\${rootfs_cache}" "\${rootfs_ext4}" "\${workdir}/spore/manifest.json" "\${rootfs_mem_mib}" "\${rootfs_storage}" <<'PY'
+  python3 - "\${rootfs_metadata}" "\${rootfs_cache}" "\${rootfs_ext4}" "\${workdir}/spore/manifest.json" "\${rootfs_mem_mib}" <<'PY'
 import json
 import os
 import pathlib
 import shutil
 import sys
 
-metadata_path, cache_root, rootfs_ext4, manifest_path, rootfs_mem_mib, rootfs_storage = sys.argv[1:]
+metadata_path, cache_root, rootfs_ext4, manifest_path, rootfs_mem_mib = sys.argv[1:]
 with open(metadata_path, "r", encoding="utf-8") as f:
     metadata = json.load(f)
 
-rootfs_hex = metadata["rootfs_blake3"]
-rootfs_digest = "blake3:" + rootfs_hex
-rootfs_size = int(metadata["rootfs_size"])
+storage = metadata.get("rootfs_storage")
+if not isinstance(storage, dict):
+    raise SystemExit("rootfs build metadata did not include rootfs_storage")
+storage = dict(storage)
+rootfs_digest = storage.get("index_digest")
+if not isinstance(rootfs_digest, str) or not rootfs_digest.startswith("blake3:"):
+    raise SystemExit("rootfs storage did not include a BLAKE3 index identity")
+rootfs_hex = rootfs_digest.removeprefix("blake3:")
+rootfs_size = int(storage["logical_size"])
 metadata_platform = metadata["platform"]
 if isinstance(metadata_platform, dict):
     platform_text = f"{metadata_platform['os']}/{metadata_platform['arch']}"
@@ -634,7 +620,7 @@ ram_size = int(rootfs_mem_mib) * 1024 * 1024
 chunk_size = 2 * 1024 * 1024
 chunk_count = (ram_size + chunk_size - 1) // chunk_size
 manifest = {
-    "version": 0,
+    "version": 2,
     "platform": {
         "arch": "aarch64",
         "cpu_profile": "sporevm-aarch64-v0",
@@ -700,15 +686,19 @@ manifest = {
         },
     },
     "network": None,
-    "memory": {"chunk_size": chunk_size, "chunks": [None] * chunk_count, "backing": None},
+    "memory": {
+        "kind": "spore-disk-index-v1",
+        "logical_size": ram_size,
+        "chunk_size": chunk_size,
+        "hash_algorithm": "blake3",
+        "object_namespace": "memory/blake3",
+        "chunks": [],
+        "zero_chunks": list(range(chunk_count)),
+        "backing": None,
+    },
 }
-if rootfs_storage == "chunked":
-    storage = metadata.get("rootfs_storage")
-    if not isinstance(storage, dict):
-        raise SystemExit("rootfs build metadata did not include rootfs_storage")
-    storage = dict(storage)
-    storage["device"] = manifest["rootfs"]["device"]
-    manifest["rootfs"]["storage"] = storage
+storage["device"] = manifest["rootfs"]["device"]
+manifest["rootfs"]["storage"] = storage
 manifest_file.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 print(json.dumps({
     "rootfs_digest": rootfs_digest,
@@ -716,16 +706,12 @@ print(json.dumps({
     "resolved_image_ref": metadata["resolved_image_ref"],
     "ram_size": ram_size,
     "chunk_count": chunk_count,
-    "rootfs_storage": rootfs_storage,
+    "rootfs_storage": "chunked",
 }, indent=2))
 PY
   resolved_rootfs_image="\$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["resolved_image_ref"])' "\${rootfs_metadata}")"
-  [[ -f "\${workdir}/spore/manifest.json" ]] || { echo "rootfs synthetic spore did not write manifest" >&2; exit 1; }
-  grep -Fq '"rootfs"' "\${workdir}/spore/manifest.json" || { echo "rootfs synthetic manifest did not record rootfs" >&2; exit 1; }
-  grep -Fq '"digest": "blake3:' "\${workdir}/spore/manifest.json" || { echo "rootfs synthetic manifest did not record digest" >&2; exit 1; }
-  if [[ "\${rootfs_storage}" == "chunked" ]]; then
-    grep -Fq '"storage"' "\${workdir}/spore/manifest.json" || { echo "rootfs manifest did not attach chunked storage" >&2; exit 1; }
-  fi
+  SPOREVM_ROOTFS_CACHE_DIR="\${rootfs_cache}" \
+    zig-out/bin/spore --json inspect "\${workdir}/spore" | tee "\${workdir}/rootfs-inspect.json"
 fi
 
 zig-out/bin/spore --json fork "\${workdir}/spore" --count "\${child_count}" --out "\${workdir}/spore.children" | tee "\${workdir}/fork-result.json"
@@ -1009,65 +995,47 @@ def digest_hex(digest):
     return digest.split(":", 1)[1]
 
 storage = rootfs.get("storage")
-if storage:
-    index_digest = storage["index_digest"]
-    index_hex = digest_hex(index_digest)
-    index_path = pathlib.Path(cache_root) / "cas" / "rootfs" / "blake3" / "indexes" / f"{index_hex}.json"
-    if not index_path.is_file():
-        raise SystemExit(f"rootfs CAS index missing: {index_path}")
-    with open(index_path, "r", encoding="utf-8") as f:
-        index = json.load(f)
-    if index.get("logical_size") != storage.get("logical_size"):
-        raise SystemExit("rootfs CAS index logical_size mismatch")
-    if index.get("chunk_size") != storage.get("chunk_size"):
-        raise SystemExit("rootfs CAS index chunk_size mismatch")
-    object_count = 0
-    object_bytes = 0
-    logical_size = int(storage["logical_size"])
-    chunk_size = int(storage["chunk_size"])
-    for chunk in index.get("chunks", []):
-        digest = chunk["digest"]
-        object_hex = digest_hex(digest)
-        object_path = pathlib.Path(cache_root) / "cas" / "rootfs" / "blake3" / "objects" / f"{object_hex}.chunk"
-        if not object_path.is_file():
-            raise SystemExit(f"rootfs CAS object missing: {object_path}")
-        logical_chunk = int(chunk["logical_chunk"])
-        offset = logical_chunk * chunk_size
-        expected_size = min(chunk_size, logical_size - offset)
-        if expected_size <= 0:
-            raise SystemExit(f"rootfs CAS object offset out of range: chunk {logical_chunk}")
-        actual_size = object_path.stat().st_size
-        if actual_size != expected_size:
-            raise SystemExit(f"rootfs CAS object size mismatch: expected {expected_size}, got {actual_size}")
-        object_count += 1
-        object_bytes += actual_size
-    print(json.dumps({
-        "selected_child": selected_child,
-        "iteration": int(iteration),
-        "rootfs_storage": "chunked",
-        "rootfs_index_digest": index_digest,
-        "rootfs_index_path": str(index_path),
-        "rootfs_object_count": object_count,
-        "rootfs_object_bytes": object_bytes,
-    }, indent=2))
-    sys.exit(0)
-artifact = rootfs["artifact"]
-digest = artifact["digest"]
-hex_digest = digest_hex(digest)
-cache_path = pathlib.Path(cache_root) / "by-digest" / "blake3" / f"{hex_digest}.ext4"
-if not cache_path.is_file():
-    raise SystemExit(f"rootfs cache entry missing: {cache_path}")
-actual_size = cache_path.stat().st_size
-expected_size = int(artifact["size"])
-if actual_size != expected_size:
-    raise SystemExit(f"rootfs cache size mismatch: expected {expected_size}, got {actual_size}")
+if not isinstance(storage, dict):
+    raise SystemExit("materialized rootfs child has no chunked storage descriptor")
+index_digest = storage["index_digest"]
+index_hex = digest_hex(index_digest)
+index_path = pathlib.Path(cache_root) / "cas" / "rootfs" / "blake3" / "indexes" / f"{index_hex}.json"
+if not index_path.is_file():
+    raise SystemExit(f"rootfs CAS index missing: {index_path}")
+with open(index_path, "r", encoding="utf-8") as f:
+    index = json.load(f)
+if index.get("logical_size") != storage.get("logical_size"):
+    raise SystemExit("rootfs CAS index logical_size mismatch")
+if index.get("chunk_size") != storage.get("chunk_size"):
+    raise SystemExit("rootfs CAS index chunk_size mismatch")
+object_count = 0
+object_bytes = 0
+logical_size = int(storage["logical_size"])
+chunk_size = int(storage["chunk_size"])
+for chunk in index.get("chunks", []):
+    digest = chunk["digest"]
+    object_hex = digest_hex(digest)
+    object_path = pathlib.Path(cache_root) / "cas" / "rootfs" / "blake3" / "objects" / f"{object_hex}.chunk"
+    if not object_path.is_file():
+        raise SystemExit(f"rootfs CAS object missing: {object_path}")
+    logical_chunk = int(chunk["logical_chunk"])
+    offset = logical_chunk * chunk_size
+    expected_size = min(chunk_size, logical_size - offset)
+    if expected_size <= 0:
+        raise SystemExit(f"rootfs CAS object offset out of range: chunk {logical_chunk}")
+    actual_size = object_path.stat().st_size
+    if actual_size != expected_size:
+        raise SystemExit(f"rootfs CAS object size mismatch: expected {expected_size}, got {actual_size}")
+    object_count += 1
+    object_bytes += actual_size
 print(json.dumps({
     "selected_child": selected_child,
     "iteration": int(iteration),
-    "rootfs_storage": "exact",
-    "rootfs_digest": digest,
-    "rootfs_size": expected_size,
-    "cache_path": str(cache_path),
+    "rootfs_storage": "chunked",
+    "rootfs_index_digest": index_digest,
+    "rootfs_index_path": str(index_path),
+    "rootfs_object_count": object_count,
+    "rootfs_object_bytes": object_bytes,
 }, indent=2))
 PY
 }

@@ -117,8 +117,8 @@ Implemented in this branch:
 | Synthetic ext4 emission | Done | Deterministic images, multi-group images, hardlinks, device/special files, xattrs, large double-indirect files, and fsck checks run through `zig build rootfs-slow-test`; planner/fuzz coverage remains in `src/rootfs/ext4_writer.zig`. |
 | Merged tree from layer tars | Done | `src/rootfs/tar.zig` builds source-backed merged trees and compares them with staging semantics for whiteouts, hardlinks, symlinks, ownership, xattrs, implicit dirs, and content. |
 | Native materialization wiring | Done | `materializeRootFS` selects native by default, external by `SPOREVM_EXT4_WRITER=external`, and writes `ext4_writer` into rootfs metadata. |
-| Native/external semantic parity | Done | Focused debugfs read-back test in `src/rootfs_slow_tests.zig` imports the same tar through both writers and compares guest-visible file contents; repeated native output has the same BLAKE3. |
-| Determinism | Done | Duplicate native emits and repeated native materialization produce stable BLAKE3 for the tested inputs. |
+| Native/external semantic parity | Done | Focused debugfs read-back test in `src/rootfs_slow_tests.zig` imports the same tar through both writers, validates each chunk-index storage value, and compares guest-visible file contents. |
+| Determinism | Done | Duplicate low-level native emits have the same raw ext4 digest, and repeated native imports have the same canonical rootfs index digest for the tested inputs. |
 | Fuzz coverage | Done | Existing tar fuzzing is extended with merged-tree fuzzing, and the native planner/metadata emitter has an integrated fuzz target. |
 | Cache identity | Done | Builder version bumped to `sporevm-rootfs-v6`; cache validation includes the selected writer metadata without hashing writer selection into the cache key. |
 | Guest boot smoke | Done | Native-default OCI smoke built and booted Alpine during the v4/default-flip work with `ext4_writer: native` and guest output `native-rootfs-smoke`; v6 invalidates the cache identity for the chunk-index format break. |

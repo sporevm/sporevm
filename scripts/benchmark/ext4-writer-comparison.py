@@ -14,8 +14,8 @@ Install tar2ext4 with:
   GOBIN=<dir> go install github.com/Microsoft/hcsshim/cmd/tar2ext4@latest
 
 Caveats recorded in the summary:
-  - spore totals include BLAKE3 hashing, metadata, and local ref writes;
-    conversion phases isolate the writer work.
+  - spore totals include chunk-index publication, metadata, and local ref writes;
+    conversion phases isolate the writer and CAS work.
   - spore emits a fixed-size padded image; compactext4 emits a compact image,
     so sizes are not directly comparable.
 """
@@ -44,6 +44,7 @@ CONVERSION_PHASES = (
     "ext4_create_empty",
     "mkfs_ext4",
     "debugfs_finalize",
+    "rootfs_cas_preload",
     "native_ext4_emit",
 )
 
@@ -118,7 +119,7 @@ def run_spore(args: argparse.Namespace, writer: str) -> dict[str, object]:
         "--ref",
         "local/ext4-writer-bench:comparison",
         "--rootfs-storage",
-        "flat",
+        "chunked",
         "--platform",
         args.platform,
     ]
@@ -195,8 +196,8 @@ def render_markdown(args: argparse.Namespace, tar_size: int, runs: list[dict[str
     lines.extend([
         "",
         "Notes:",
-        "- spore wall time includes BLAKE3 hashing, metadata, and ref writes;",
-        "  the conversion column sums writer-only profile phases.",
+        "- spore wall time includes chunk-index publication, metadata, and ref writes;",
+        "  the conversion column sums writer and CAS profile phases.",
         "- tar2ext4 has no separable phases; wall time is conversion.",
         "- spore emits a fixed-size padded image, compactext4 a compact one, so",
         "  output sizes measure allocation policy, not efficiency of the writer.",
