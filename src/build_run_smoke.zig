@@ -89,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
         .diagnostic = &first_diag,
     });
     if (first_diag.executor.boot_count != 1) return error.ExpectedOneBuildVmBoot;
-    if (first_diag.executor.executed_steps != 13) return error.ExpectedThirteenBuildSteps;
+    if (first_diag.executor.executed_steps != 15) return error.ExpectedFifteenBuildSteps;
     if (first.cache_hit) return error.ExpectedFirstBuildCacheMiss;
     if (!first_diag.context_disk.emitted) return error.ExpectedFirstContextDiskEmit;
     if (first_diag.context_disk.reused) return error.ExpectedFirstContextDiskNotReused;
@@ -119,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
         .diagnostic = &override_diag,
     });
     if (override_diag.executor.boot_count != 1) return error.ExpectedOverrideBuildVmBoot;
-    if (override_diag.executor.executed_steps != 13) return error.ExpectedOverrideBuildThirteenSteps;
+    if (override_diag.executor.executed_steps != 15) return error.ExpectedOverrideBuildFifteenSteps;
     if (override.cache_hit) return error.ExpectedOverrideBuildCacheMiss;
     if (std.mem.eql(u8, first.index_digest, override.index_digest)) return error.ExpectedOverrideRootfsIdentity;
     if (!override_diag.context_disk.reused) return error.ExpectedOverrideContextDiskReuse;
@@ -229,6 +229,8 @@ fn writeDockerfile(io: Io, path: []const u8, second_step: []const u8) !void {
     var buf: [1024]u8 = undefined;
     const dockerfile = try std.fmt.bufPrint(&buf,
         \\FROM local/build-smoke-base:dev
+        \\RUN spawn-background
+        \\RUN verify-background-reaped
         \\RUN step1
         \\RUN setup-symlink-targets
         \\WORKDIR /work

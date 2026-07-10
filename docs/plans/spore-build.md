@@ -830,6 +830,25 @@ The build cache version moved to `sporevm-build-v4` so checkpoints created by
 the old split hash/emission path cannot be reused; earlier records remain GC
 roots only.
 
+Implementation note (2026-07-10, RUN descendant cleanup): every build RUN
+shell is moved into a dedicated cgroup v2 leaf before its start gate opens.
+After the direct shell exits, the guest writes `cgroup.kill`, waits for the
+leaf to become empty, then repeatedly kills and reaps every remaining process
+in the dedicated build guest through a procfs directory descriptor retained
+by PID 1 from boot. RUN processes cannot replace that descriptor or inherit it
+across exec. The agent removes the leaf and sends the SPIO exit frame only
+after the sweep is empty, allowing the host to freeze and checkpoint the
+rootfs. This covers descendants that detach into a new session, process group,
+or ancestor cgroup, even if they alter their mount namespace or overmount
+`/proc`. The bounded `/proc/<pid>/stat` classifier uses the kernel-owned
+`PF_KTHREAD` flag and is unit/fuzz covered for RUN-controlled task names.
+Setup, kill, drain, or removal failures return exit 125 and prevent a
+step-cache record. The VM-backed smoke moves a detached delayed writer out of
+the RUN cgroup and proves it cannot mutate the next step. The build cache
+version moved to
+`sporevm-build-v5`; older records remain GC roots but are not reusable because
+they may capture filesystem state that raced a surviving RUN descendant.
+
 Implementation note (2026-07-09, COPY/context-disk slice): the executor step
 list is now a tagged RUN/COPY sequence, so the first uncached COPY enters the
 same persistent VM path as RUN. COPY write-side keys use the same `StepInput`
