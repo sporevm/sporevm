@@ -131,14 +131,6 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         std.debug.print("spore monitor: unsupported vCPU count\n", .{});
         std.process.exit(2);
     };
-    var gateway: net_gateway.Process = undefined;
-    var gateway_active = false;
-    if (opts.network == .spore) {
-        try gateway.start(init.io, allocator, spore_executable, false, opts.network_policy);
-        gateway_active = true;
-    }
-    defer if (gateway_active) gateway.deinit();
-    try monitor_jail.applyForMonitor(init.environ_map);
     const paths = try lifecycle.pathsFor(allocator, init.environ_map, opts.name);
     const paths_ms = lifecycle.monotonicMs();
     var existing_spec = lifecycle.readSpec(allocator, init.io, paths) catch |err| switch (err) {
@@ -151,6 +143,14 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         std.debug.print("spore monitor: --image requires an explicit --rootfs path or lifecycle rootfs metadata\n", .{});
         std.process.exit(2);
     }
+    var gateway: net_gateway.Process = undefined;
+    var gateway_active = false;
+    if (opts.network == .spore) {
+        try gateway.start(init.io, allocator, spore_executable, false, opts.network_policy);
+        gateway_active = true;
+    }
+    defer if (gateway_active) gateway.deinit();
+    try monitor_jail.applyForMonitor(init.environ_map);
     const spec_disk = if (existing_spec) |spec| spec.value.disk else null;
     const spec_resume_generation = if (existing_spec) |spec| spec.value.resume_generation else null;
     const spec_resume_generation_params = if (spec_resume_generation) |state| blk: {
