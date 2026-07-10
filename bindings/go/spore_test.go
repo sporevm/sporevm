@@ -564,6 +564,29 @@ func TestExecNamedStreamFakeMonitor(t *testing.T) {
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)
 	}
+
+	serverDone = make(chan error, 1)
+	go func() {
+		serverDone <- serveExecStreamDefaultCloseFakeMonitor(listener)
+	}()
+	closedInputStream, err := client.OpenExecNamedStream(context.Background(), ExecNamedStreamOptions{
+		Name: "stream-box",
+		Argv: []string{"/bin/cat"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closedInputStream.Close()
+	event, err = closedInputStream.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != ExecNamedStreamExit || event.ExitCode != 0 {
+		t.Fatalf("default-close exit event = %#v", event)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestDecodeNamedList(t *testing.T) {
@@ -639,6 +662,7 @@ const (
 	spioExit       byte = 3
 	spioResize     byte = 4
 	spioControl         = 0
+	spioStdin           = 1
 	spioTerminal        = 4
 )
 
@@ -715,6 +739,48 @@ func serveExecStreamFakeMonitor(listener net.Listener) error {
 	}
 	var exitPayload [4]byte
 	binary.LittleEndian.PutUint32(exitPayload[:], 7)
+	return writeSPIOFrame(conn, spioExit, spioControl, 0, exitPayload[:])
+}
+
+func serveExecStreamDefaultCloseFakeMonitor(listener net.Listener) error {
+	if err := serveFakeMonitorHello(listener); err != nil {
+		return err
+	}
+
+	conn, err := listener.Accept()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	requestLine, err := reader.ReadBytes('\n')
+	if err != nil {
+		return err
+	}
+	var request struct {
+		Type        string   `json:"type"`
+		Argv        []string `json:"argv"`
+		Stdio       string   `json:"stdio"`
+		Interactive bool     `json:"interactive"`
+	}
+	if err := json.Unmarshal(requestLine, &request); err != nil {
+		return err
+	}
+	if request.Type != "exec-stream-v1" || request.Stdio != "pipe" || request.Interactive ||
+		len(request.Argv) != 1 || request.Argv[0] != "/bin/cat" {
+		return fmt.Errorf("bad default-close stream request: %#v", request)
+	}
+
+	frame, err := readSPIOFrame(reader)
+	if err != nil {
+		return err
+	}
+	if frame.Type != spioClose || frame.StreamID != spioStdin || frame.Offset != 0 || len(frame.Payload) != 0 {
+		return fmt.Errorf("bad default stdin close frame: %#v", frame)
+	}
+
+	var exitPayload [4]byte
 	return writeSPIOFrame(conn, spioExit, spioControl, 0, exitPayload[:])
 }
 

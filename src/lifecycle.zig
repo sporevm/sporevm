@@ -4261,7 +4261,15 @@ fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_
     errdefer stream.close(context.io);
     writeAll(context.io, stream, json) catch return error.MonitorUnavailable;
     writeAll(context.io, stream, "\n") catch return error.MonitorUnavailable;
-    return .{ .io = context.io, .stream = stream };
+    var exec_stream = ExecNamedStream{ .io = context.io, .stream = stream };
+    if (!options.interactive) {
+        if (options.tty) {
+            try exec_stream.closeTerminal();
+        } else {
+            try exec_stream.closeStdin();
+        }
+    }
+    return exec_stream;
 }
 
 fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path: []const u8, options: ExecNamedStreamOptions) !u8 {
@@ -4282,7 +4290,6 @@ fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path
         .stream = &stream,
         .interactive = options.interactive,
         .tty = options.tty,
-        .close_input_on_start = !options.interactive,
     };
     return pump.run();
 }
@@ -4494,11 +4501,9 @@ const ExecStreamPump = struct {
     stdout_fd: std.c.fd_t = 1,
     stderr_fd: std.c.fd_t = 2,
     stdin_closed: bool = false,
-    close_input_on_start: bool = false,
     resize_seen: u32 = 0,
 
     fn run(self: *ExecStreamPump) !u8 {
-        if (self.close_input_on_start) try self.closeInput();
         while (true) {
             try self.maybeSendResize();
             const poll_stdin = self.interactive and !self.stdin_closed;
