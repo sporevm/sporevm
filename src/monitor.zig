@@ -74,6 +74,7 @@ const MonitorOptions = struct {
 };
 
 const RequestState = enum {
+    active_ready,
     idle,
     pending_exec,
     active_exec,
@@ -84,6 +85,16 @@ const RequestState = enum {
     done,
     stop_requested,
 };
+
+const legacy_readiness_error = "spore run: bad request\n";
+
+fn readinessProbeSucceeded(exit_code: i32, stderr: []const u8) bool {
+    if (exit_code == 0) return true;
+    // Saved parents contain the guest agent that created them. Agents from
+    // before the explicit ready request still prove that their accept loop is
+    // live by returning the bounded unknown-request response.
+    return exit_code == 2 and std.mem.eql(u8, stderr, legacy_readiness_error);
+}
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
     const allocator = init.arena.allocator();
@@ -186,22 +197,26 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
 
     var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.control_socket_path, paths.monitor_stats_path, opts.guest_port, opts.timeout_ms, spec_resume_generation_params);
     if (gateway_active) server.network_events = &gateway;
-    const thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
     const metadata_ms = lifecycle.monotonicMs();
 
-    lifecycle.writeMonitorTiming(allocator, init.io, paths, .{
-        .parse_ms = parsed_ms - start_ms,
-        .paths_ms = paths_ms - parsed_ms,
-        .asset_resolve_ms = assets_ms - paths_ms,
-        .metadata_ms = metadata_ms - assets_ms,
-        .ready_after_start_ms = metadata_ms - start_ms,
-    }) catch {};
-
-    try lifecycle.writeReady(allocator, init.io, paths, .{
-        .pid = currentPid(),
-        .control_socket_path = paths.control_socket_path,
-        .console_log_path = paths.console_log_path,
-    });
+    server.startup = .{
+        .paths = paths,
+        .timing = .{
+            .parse_ms = parsed_ms - start_ms,
+            .paths_ms = paths_ms - parsed_ms,
+            .asset_resolve_ms = assets_ms - paths_ms,
+            .metadata_ms = metadata_ms - assets_ms,
+            .ready_after_start_ms = 0,
+        },
+        .started_ms = start_ms,
+        .ready = .{
+            .pid = currentPid(),
+            .control_socket_path = paths.control_socket_path,
+            .console_log_path = paths.console_log_path,
+        },
+    };
+    const readiness_probe = try server.startReadinessProbe();
+    const thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
 
     try run.openConsoleLog(opts.console_log_path);
     defer run.closeConsoleLog();
@@ -227,7 +242,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .network_policy = opts.network_policy,
         .network_runtime = if (gateway_active) gateway.runtime() else null,
         .spore_executable = spore_executable,
-    }, server.control());
+    }, server.control(), readiness_probe);
     if (result) |monitor_result| {
         switch (monitor_result.exit) {
             .stopped => {},
@@ -242,6 +257,13 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         return err;
     }
 }
+
+const StartupMetadata = struct {
+    paths: lifecycle.Paths,
+    timing: lifecycle.MonitorTiming,
+    started_ms: u64,
+    ready: lifecycle.Ready,
+};
 
 const ExecServer = struct {
     allocator: std.mem.Allocator,
@@ -285,6 +307,7 @@ const ExecServer = struct {
     stats_write_ms: u64 = 0,
     last_registry_check_ms: u64 = 0,
     closed: std.atomic.Value(bool) = .init(false),
+    startup: ?StartupMetadata = null,
 
     fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, socket_path: []const u8, stats_path: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8) !ExecServer {
         // Zig's UnixAddress accepts 108-byte paths everywhere, but macOS
@@ -308,7 +331,7 @@ const ExecServer = struct {
             else => |e| return e,
         };
         const address = try net.UnixAddress.init(socket_path);
-        return .{
+        var server = ExecServer{
             .allocator = allocator,
             .io = io,
             .vm_dir = vm_dir,
@@ -319,6 +342,30 @@ const ExecServer = struct {
             .server = try address.listen(io, .{ .kernel_backlog = 8 }),
             .generation_params = generation_params,
         };
+        var nonce_bytes: [8]u8 = undefined;
+        io.random(&nonce_bytes);
+        const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
+        const request = try std.fmt.bufPrint(&server.request, "{{\"type\":\"ready\",\"nonce\":\"{x}\"}}\n", .{nonce});
+        server.request_len = request.len;
+        return server;
+    }
+
+    fn startReadinessProbe(self: *ExecServer) !*vsock.HostStream {
+        if (self.state != .idle) return error.ControlBusy;
+        self.active_stream = try vsock.HostStream.initWithProtocol(self.guest_port, self.request[0..self.request_len], .legacy_text);
+        self.resetExecCapture();
+        self.active_stream.setOutputSink(self, captureOutputThunk);
+        self.active_stream.host_port = vsock.HostStream.deriveHostPort(self.request[0..self.request_len]);
+        self.active_stream_valid = true;
+        self.state = .active_ready;
+        return &self.active_stream;
+    }
+
+    fn publishReady(self: *ExecServer) !void {
+        var startup = self.startup orelse return error.MissingMonitorStartupMetadata;
+        startup.timing.ready_after_start_ms = lifecycle.monotonicMs() - startup.started_ms;
+        lifecycle.writeMonitorTiming(self.allocator, self.io, startup.paths, startup.timing) catch {};
+        try lifecycle.writeReady(self.allocator, self.io, startup.paths, startup.ready);
     }
 
     fn deinit(self: *ExecServer) void {
@@ -392,14 +439,16 @@ const ExecServer = struct {
                 self.state = .active_exec;
                 self.cond.broadcast(self.io);
             },
-            .active_exec => {},
+            .active_ready, .active_exec => {},
         }
 
-        if (self.state == .active_exec and self.active_stream_valid) {
+        if ((self.state == .active_ready or self.state == .active_exec) and self.active_stream_valid) {
+            const readiness_probe = self.state == .active_ready;
             if (self.streaming_write_failed) self.active_stream.fail();
             _ = try dev.flushHostStreamOutbound();
             switch (self.active_stream.state) {
                 .failed => {
+                    if (readiness_probe) return error.GuestReadinessProbeFailed;
                     if (self.active_streaming_exec) {
                         self.sendStreamingErrorLocked("guest vsock stream failed");
                     } else {
@@ -411,6 +460,7 @@ const ExecServer = struct {
                 },
                 .complete => {
                     const exit_code = self.active_stream.exit_code orelse {
+                        if (readiness_probe) return error.GuestReadinessProbeFailed;
                         if (self.active_streaming_exec) {
                             self.sendStreamingErrorLocked("guest exec missing exit code");
                         } else {
@@ -421,6 +471,15 @@ const ExecServer = struct {
                         self.cond.broadcast(self.io);
                         return .keep_running;
                     };
+                    if (readiness_probe) {
+                        if (!readinessProbeSucceeded(exit_code, self.stderr_capture[0..self.stderr_capture_len])) return error.GuestReadinessProbeFailed;
+                        dev.resetHostStream();
+                        self.active_stream_valid = false;
+                        try self.publishReady();
+                        self.state = .idle;
+                        self.cond.broadcast(self.io);
+                        return .keep_running;
+                    }
                     if (self.active_streaming_exec) {
                         self.sendStreamingExitLocked(exit_code);
                     } else {
@@ -432,6 +491,7 @@ const ExecServer = struct {
                 },
                 else => {
                     if (self.active_stream.elapsedMs() > self.timeout_ms) {
+                        if (readiness_probe) return error.GuestReadinessProbeFailed;
                         if (self.active_streaming_exec) {
                             self.sendStreamingErrorLocked("guest exec timed out");
                         } else {
@@ -815,7 +875,7 @@ const ExecServer = struct {
 
     fn failOutstandingLocked(self: *ExecServer, message: []const u8) void {
         switch (self.state) {
-            .pending_exec, .active_exec, .pending_suspend, .active_suspend, .pending_snapshot, .active_snapshot => {
+            .active_ready, .pending_exec, .active_exec, .pending_suspend, .active_suspend, .pending_snapshot, .active_snapshot => {
                 if (self.active_streaming_exec) {
                     self.sendStreamingErrorLocked(message);
                 } else {
@@ -1511,6 +1571,13 @@ test "monitor cli help accepts help after name" {
     try std.testing.expect(wantsHelp(&.{ "bench-1", "--help" }));
     try std.testing.expect(!wantsHelp(&.{"bench-1"}));
     try std.testing.expect(!wantsHelp(&.{ "help", "--backend", "auto" }));
+}
+
+test "readiness probe accepts current and bounded legacy guest replies" {
+    try std.testing.expect(readinessProbeSucceeded(0, ""));
+    try std.testing.expect(readinessProbeSucceeded(2, legacy_readiness_error));
+    try std.testing.expect(!readinessProbeSucceeded(2, "different failure\n"));
+    try std.testing.expect(!readinessProbeSucceeded(126, "spore run: rootfs unavailable\n"));
 }
 
 test "monitor parser accepts network allow policy" {

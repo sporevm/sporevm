@@ -202,7 +202,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         .memory = .{ .policy = .explicit, .bytes = build_vm_memory_bytes },
         .network = if (network_mode == .spore) .spore else .disabled,
         .timeout_ms = step_timeout_ms,
-    }, control.control());
+    }, control.control(), null);
 
     if (control.failed_exit_code) |exit_code| {
         if (options.diagnostic) |diag| {
@@ -730,6 +730,7 @@ const guest_agent_fuzz_run_request: c_int = 1;
 const guest_agent_fuzz_copy_request: c_int = 2;
 const guest_agent_fuzz_run_complete: c_int = 3;
 const guest_agent_fuzz_workdir_request: c_int = 4;
+const guest_agent_fuzz_ready_request: c_int = 5;
 
 extern fn spore_agent_fuzz_build_request(request: [*]const u8, request_len: usize, stream: [*]const u8, stream_len: usize) c_int;
 extern fn spore_agent_fuzz_proc_stat(stat: [*]const u8, stat_len: usize) c_int;
@@ -979,6 +980,9 @@ test "guest build request parser rejects malformed RUN framing and accepts build
     const workdir_request = try workdirRequest(std.testing.allocator, "spore-build-1", "/work");
     defer std.testing.allocator.free(workdir_request);
     try std.testing.expectEqual(guest_agent_fuzz_workdir_request, spore_agent_fuzz_build_request(workdir_request.ptr, workdir_request.len, stream[0..0].ptr, 0));
+
+    const ready_request = "{\"type\":\"ready\",\"nonce\":\"1234\"}\n";
+    try std.testing.expectEqual(guest_agent_fuzz_ready_request, spore_agent_fuzz_build_request(ready_request.ptr, ready_request.len, stream[0..0].ptr, 0));
 }
 
 test "guest proc stat parser identifies kernel threads with adversarial task names" {

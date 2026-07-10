@@ -418,6 +418,28 @@ func TestCopyNamedOptions(t *testing.T) {
 	}
 }
 
+func TestDecodeNamedLifecycleTiming(t *testing.T) {
+	result, err := decodeJSON[NamedLifecycleResult]([]byte(`{
+		"schema": "spore.lifecycle.v1",
+		"schema_version": 1,
+		"action": "restored",
+		"name": "worker",
+		"state": "ready",
+		"timing": {
+			"prepare_ms": 3,
+			"spawn_monitor_ms": 4,
+			"wait_exec_ready_ms": 17,
+			"total_ms": 24
+		}
+	}`), "named lifecycle result")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Timing == nil || result.Timing.WaitExecReadyMs != 17 || result.Timing.TotalMs != 24 {
+		t.Fatalf("timing = %#v", result.Timing)
+	}
+}
+
 func TestDecodeExecNamedResult(t *testing.T) {
 	result, err := decodeJSON[ExecNamedResult]([]byte(`{
 		"exit_code": 7,

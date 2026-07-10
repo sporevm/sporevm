@@ -227,6 +227,7 @@ pub fn fromZigError(err: anyerror) CliError {
 
 pub fn writeJson(allocator: std.mem.Allocator, writer: *Io.Writer, value: anytype) !void {
     const json = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
+    defer allocator.free(json);
     try writer.writeAll(json);
     try writer.writeByte('\n');
 }

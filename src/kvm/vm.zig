@@ -1037,6 +1037,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
                         state.finish(.{ .err = error.VsockProbeFailed });
                         continue;
                     }
+                    options.vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
                 if (probe.state == .complete) {
@@ -1049,6 +1050,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
                         state.finish(.{ .exit = .probe_complete });
                         continue;
                     }
+                    options.vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
                 if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
@@ -1056,6 +1058,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
                         state.finish(.{ .err = error.VsockProbeTimedOut });
                         continue;
                     }
+                    options.vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
             }

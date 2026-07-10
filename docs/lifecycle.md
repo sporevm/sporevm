@@ -231,9 +231,12 @@ metadata such as `monitor-stats.json`; unavailable stats render as unknown
 instead of forcing an expensive VM memory scan.
 
 `spore create`, `spore restore --name`, and `spore fork --vm` report success
-only after the monitor has written `ready.json`, the recorded PID is alive, and
-the local `control.sock` answers a `hello` request with the same SporeVM version
-as the linked library. The monitor argv and control protocol are a private
+only after the restored guest agent has answered a dedicated readiness request,
+the monitor has written `ready.json`, the recorded PID is alive, and the local
+`control.sock` answers a `hello` request with the same SporeVM version as the
+linked library. This means a successful named restore is immediately ready for
+`spore exec`; callers do not need to poll with a no-op command. The monitor argv
+and control protocol are a private
 same-version contract, so matching is exact: a libspore `1.5.0` caller cannot
 use a `spore` executable reporting `1.3.0`, even if PATH resolves that older
 binary. Version mismatch is a startup error that names both versions and the
@@ -243,6 +246,12 @@ Named lifecycle failures include the last known lifecycle state, recorded PID
 when present, `console.log`, `monitor.log`, and the control socket path where
 useful. This is the same diagnostic state visible through `spore ls`, carried
 back to the caller that hit the lifecycle error.
+
+`spore --json restore` includes `timing.prepare_ms`,
+`timing.spawn_monitor_ms`, `timing.wait_exec_ready_ms`, and `timing.total_ms`.
+The command returns after the exec-ready point, so `timing.total_ms` is the
+in-process restore-to-readiness measurement; external callers can separately
+measure CLI process wall time.
 
 Monitor processes deny child process execution through an embedded macOS
 sandbox profile or Linux seccomp filter after optional startup helpers are
