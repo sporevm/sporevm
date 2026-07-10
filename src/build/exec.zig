@@ -31,6 +31,7 @@ pub const Diagnostic = struct {
     output: []const u8 = "",
     boot_count: usize = 0,
     executed_steps: usize = 0,
+    resize_count: usize = 0,
 };
 
 pub const RunStep = struct {
@@ -154,7 +155,10 @@ const ActiveStream = enum {
 /// long-lived general-purpose allocator.
 pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !spore.RootfsStorage {
     if (options.steps.len == 0) return spore.cloneRootfsStorage(allocator, options.base_storage);
-    if (options.diagnostic) |diag| diag.* = .{};
+    if (options.diagnostic) |diag| {
+        diag.* = .{};
+        diag.resize_count = @intFromBool(options.disk_grow_target != 0);
+    }
     const network_mode = try networkModeForSteps(options.steps);
 
     var control = try BuildControl.init(init.io, allocator, options);

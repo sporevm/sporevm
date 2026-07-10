@@ -849,6 +849,16 @@ version moved to
 `sporevm-build-v5`; older records remain GC roots but are not reusable because
 they may capture filesystem state that raced a surviving RUN descendant.
 
+Implementation note (2026-07-10, stable grow target): the automatic sparse
+disk target is computed once from the `FROM` storage and carried with build
+state across cache hits. A miss requests growth only while the current rootfs
+is smaller than that anchored target. Resuming after a cached prefix therefore
+does not recompute the policy from an already-grown child, double the image,
+or add a second `resize2fs` step. Step records keep the existing identity: the
+first step that performs growth includes the target, while later steps use
+zero, so valid v5 records remain reusable and incorrectly re-grown records
+fall out of the corrected lookup path without another cache-version bump.
+
 Implementation note (2026-07-09, COPY/context-disk slice): the executor step
 list is now a tagged RUN/COPY sequence, so the first uncached COPY enters the
 same persistent VM path as RUN. COPY write-side keys use the same `StepInput`
