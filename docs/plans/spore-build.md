@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-09
+last_reviewed: 2026-07-10
 spec_refs:
   - docs/rootfs.md
   - docs/filesystem.md
@@ -338,15 +338,10 @@ address; the record at that address stores the child `index_digest` produced by
 the prior successful execution.
 
 ```
-step_key_0 = blake3("sporevm-build-v1" || builder_version || platform
-                    || base_index_digest)
-step_key_i = blake3("sporevm-build-step-v1" || platform
-                    || parent_index_digest
-                    || instruction_kind
-                    || canonical_instruction
-                    || input_digest
-                    || env_digest
-                    || workdir)
+step_key = blake3(builder_version || platform || parent_index_digest
+                  || instruction_kind || canonical_instruction
+                  || disk_grow_target || input_digest || env_digest
+                  || workdir)
 ```
 
 Per-instruction inputs:
@@ -787,6 +782,14 @@ record. The slice also fixes
 The build VM memory is currently a provisional 2 GiB default; promote it to a
 `spore build` option when real workloads such as large `bundle install`-style
 RUN steps need more memory.
+
+Implementation note (2026-07-10, RUN shell expansion): shell-form RUN is now
+opaque to Dockerfile variable substitution and reaches guest `/bin/sh -c`
+unchanged. ARG and ENV values are exported through the step environment, so
+the shell owns quoting, command substitution, special parameters, and
+variables created earlier in the same command. The build cache version moved
+to `sporevm-build-v2` to prevent reuse of checkpoints created under the old
+host-substitution behavior.
 
 Implementation note (2026-07-09, COPY/context-disk slice): the executor step
 list is now a tagged RUN/COPY sequence, so the first uncached COPY enters the

@@ -92,7 +92,9 @@ fn parseInstruction(
     rest: []const u8,
     diagnostic: *Diagnostic,
 ) !Instruction.Value {
-    try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
+    // RUN is shell input. Its expansions belong to /bin/sh in the guest, not
+    // to the Dockerfile substitution subset below.
+    if (!asciiEql(op, "RUN")) try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
     if (asciiEql(op, "FROM")) {
         const args = try splitWords(allocator, rest, line, diagnostic);
         if (args.len != 1) return fail(diagnostic, line, "unsupported FROM form; expected exactly `FROM <name>`");
@@ -391,7 +393,22 @@ test "Dockerfile parser rejects parser directives" {
     try std.testing.expectEqualStrings("unsupported Dockerfile parser directive", diag.message);
 }
 
-test "Dockerfile parser rejects unsupported variable expansion operators" {
+test "Dockerfile parser leaves RUN shell expansion untouched" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    const doc = try parse(arena_state.allocator(),
+        \\FROM base
+        \\RUN echo $? $(dpkg --print-architecture) "${VERSION_CODENAME}" '$BUILD_ARG' $$
+        \\
+    , &diag);
+    try std.testing.expectEqualStrings(
+        "echo $? $(dpkg --print-architecture) \"${VERSION_CODENAME}\" '$BUILD_ARG' $$",
+        doc.instructions[1].value.run.shell,
+    );
+}
+
+test "Dockerfile parser rejects unsupported non-RUN variable expansion operators" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var diag: Diagnostic = .{};
@@ -399,9 +416,6 @@ test "Dockerfile parser rejects unsupported variable expansion operators" {
     try std.testing.expectEqualStrings("unsupported variable expansion", diag.message);
 
     try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nWORKDIR ${VAR#prefix}\n", &diag));
-    try std.testing.expectEqualStrings("unsupported variable expansion", diag.message);
-
-    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nRUN echo $?\n", &diag));
     try std.testing.expectEqualStrings("unsupported variable expansion", diag.message);
 }
 

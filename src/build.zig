@@ -321,24 +321,7 @@ fn executeFromMiss(
     for (instructions) |instruction| {
         if (try applyMetadataInstruction(allocator, options, pre_from_args, &state, instruction)) continue;
         switch (instruction.value) {
-            .run => |run| {
-                const command = try substitute(allocator, run.shell, state.args.items, state.env.items);
-                if (command.len > build_exec.max_run_command_len) {
-                    diagnostic.instruction_line = instruction.line;
-                    diagnostic.limit = build_exec.max_run_command_len;
-                    diagnostic.actual = command.len;
-                    return error.RunCommandTooLong;
-                }
-                const env_digest = try effectiveEnvDigest(allocator, state);
-                try steps.append(.{ .run = .{
-                    .line = instruction.line,
-                    .canonical_instruction = instruction.raw,
-                    .command = command,
-                    .env = try runEnvironment(allocator, state),
-                    .env_digest = env_digest,
-                    .workdir = state.workdir,
-                } });
-            },
+            .run => |run| try steps.append(.{ .run = try runStep(allocator, diagnostic, state, instruction, run) }),
             .copy => |copy| try steps.append(.{ .copy = try copyStep(allocator, init.io, ctx, stat_cache, &context_disk, diagnostic, state, instruction, copy) }),
             .from => return error.UnsupportedMultiStageDockerfile,
             else => unreachable,
@@ -359,6 +342,29 @@ fn executeFromMiss(
         .diagnostic = &diagnostic.executor,
     });
     return state;
+}
+
+fn runStep(
+    allocator: std.mem.Allocator,
+    diagnostic: *Diagnostic,
+    state: State,
+    instruction: dockerfile.Instruction,
+    run: dockerfile.Run,
+) !build_exec.RunStep {
+    if (run.shell.len > build_exec.max_run_command_len) {
+        diagnostic.instruction_line = instruction.line;
+        diagnostic.limit = build_exec.max_run_command_len;
+        diagnostic.actual = run.shell.len;
+        return error.RunCommandTooLong;
+    }
+    return .{
+        .line = instruction.line,
+        .canonical_instruction = instruction.raw,
+        .command = run.shell,
+        .env = try runEnvironment(allocator, state),
+        .env_digest = try effectiveEnvDigest(allocator, state),
+        .workdir = state.workdir,
+    };
 }
 
 fn copyStep(
@@ -781,6 +787,31 @@ test "run environment includes declared args after env" {
     try std.testing.expectEqualStrings("MODE=env", entries[0]);
     try std.testing.expectEqualStrings("APP=/srv/app", entries[1]);
     try std.testing.expectEqualStrings("TARGET=prod", entries[2]);
+}
+
+test "RUN executor preserves shell text for guest expansion" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var env = std.array_list.Managed([]const u8).init(arena);
+    try env.append("APP_ENV=test");
+    var args = std.array_list.Managed(ArgValue).init(arena);
+    try args.append(.{ .key = "BUILD_ARG", .value = "from-arg" });
+    const shell = "echo '$BUILD_ARG' $? $(dpkg --print-architecture) ${VERSION_CODENAME}";
+    const instruction = dockerfile.Instruction{
+        .line = 2,
+        .raw = "RUN " ++ shell,
+        .value = .{ .run = .{ .shell = shell } },
+    };
+    var diagnostic: Diagnostic = .{};
+    const step = try runStep(arena, &diagnostic, .{
+        .storage = testStorage(),
+        .env = env,
+        .args = args,
+    }, instruction, instruction.value.run);
+    try std.testing.expectEqualStrings(shell, step.command);
+    try std.testing.expectEqualStrings("APP_ENV=test", step.env[0]);
+    try std.testing.expectEqualStrings("BUILD_ARG=from-arg", step.env[1]);
 }
 
 test "COPY executor step key matches cached read key" {
