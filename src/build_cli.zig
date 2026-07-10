@@ -102,6 +102,41 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
     else
         "metadata-only";
     try stdout.print("  Cache: {s}\n", .{cache_status});
+    if (diagnostic.context_hash.entries != 0) {
+        try stdout.print(
+            "  Context: entries={d} files={d} hashed={d} bytes stat-cache={d} hits/{d} misses stat={d}ms hash={d}ms cache-load={d}ms cache-save={d}ms\n",
+            .{
+                diagnostic.context_hash.entries,
+                diagnostic.context_hash.files,
+                diagnostic.context_hash.bytes_hashed,
+                diagnostic.context_hash.stat_cache_hits,
+                diagnostic.context_hash.stat_cache_misses,
+                nsToMs(diagnostic.context_hash.stat_ns),
+                nsToMs(diagnostic.context_hash.content_hash_ns),
+                nsToMs(diagnostic.context_hash.cache_load_ns),
+                nsToMs(diagnostic.context_hash.cache_save_ns),
+            },
+        );
+    }
+    if (diagnostic.context_disk.entries != 0) {
+        const disk_status = if (diagnostic.context_disk.emitted)
+            "emitted"
+        else if (diagnostic.context_disk.reused)
+            "reused"
+        else
+            "prepared";
+        try stdout.print(
+            "  Context disk: {s} entries={d} bytes={d} image={d} digest={s} emit={d}ms\n",
+            .{
+                disk_status,
+                diagnostic.context_disk.entries,
+                diagnostic.context_disk.bytes,
+                diagnostic.context_disk.image_size,
+                diagnostic.context_disk.digest,
+                nsToMs(diagnostic.context_disk.emit_ns),
+            },
+        );
+    }
 }
 
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedOptions {
@@ -249,7 +284,11 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         },
         error.BuildRunFailed => {
             if (diagnostic.executor.instruction) |instruction| {
-                try stderr.print("spore build: instruction failed: {s}\n", .{instruction});
+                if (diagnostic.executor.instruction_line != 0) {
+                    try stderr.print("spore build: Dockerfile line {d}: instruction failed: {s}\n", .{ diagnostic.executor.instruction_line, instruction });
+                } else {
+                    try stderr.print("spore build: instruction failed: {s}\n", .{instruction});
+                }
             }
             if (diagnostic.executor.exit_code) |code| {
                 try stderr.print("spore build: executor step failed with exit code {d}\n", .{code});
@@ -289,7 +328,14 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
             try stderr.writeAll("spore build: RUN request is too large for the guest executor\n");
         },
         error.RunCommandTooLong => {
-            try stderr.writeAll("spore build: RUN shell command is too long for the guest executor\n");
+            if (diagnostic.instruction_line != 0 and diagnostic.limit != 0) {
+                try stderr.print(
+                    "spore build: Dockerfile line {d}: RUN shell command is too long for the guest executor: limit={d} bytes actual={d} bytes\n",
+                    .{ diagnostic.instruction_line, diagnostic.limit, diagnostic.actual },
+                );
+            } else {
+                try stderr.writeAll("spore build: RUN shell command is too long for the guest executor\n");
+            }
         },
         error.RunWorkingDirUnsupported => {
             try stderr.writeAll("spore build: WORKDIR is too long for the guest executor\n");
@@ -310,7 +356,14 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
             try stderr.writeAll("spore build: COPY source escapes the build context\n");
         },
         error.CopySourceNotFound => {
-            try stderr.writeAll("spore build: COPY source did not match any context path\n");
+            if (diagnostic.instruction_line != 0 and diagnostic.copy.source.len != 0) {
+                try stderr.print(
+                    "spore build: Dockerfile line {d}: COPY source did not match any context path: {s}\n",
+                    .{ diagnostic.instruction_line, diagnostic.copy.source },
+                );
+            } else {
+                try stderr.writeAll("spore build: COPY source did not match any context path\n");
+            }
         },
         error.UnsupportedCopyGlob => {
             try stderr.writeAll("spore build: COPY only supports literal paths and single-component * globs\n");
@@ -325,10 +378,14 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
             try stderr.writeAll("spore build: COPY destination must stay inside the guest rootfs and fit executor bounds\n");
         },
         error.CopyEntryCountUnsupported => {
-            try stderr.writeAll("spore build: COPY has too many entries for the guest executor\n");
-        },
-        error.CopyPayloadTooLarge => {
-            try stderr.writeAll("spore build: COPY payload is too large for the guest executor\n");
+            if (diagnostic.instruction_line != 0 and diagnostic.limit != 0) {
+                try stderr.print(
+                    "spore build: Dockerfile line {d}: COPY has too many entries for the guest executor: path={s} limit={d} entries actual={d} entries\n",
+                    .{ diagnostic.instruction_line, if (diagnostic.copy.source.len == 0) "<unknown>" else diagnostic.copy.source, diagnostic.limit, diagnostic.actual },
+                );
+            } else {
+                try stderr.writeAll("spore build: COPY has too many entries for the guest executor\n");
+            }
         },
         error.RootFSDigestCacheMiss => {
             try stderr.writeAll("spore build: cached rootfs storage is missing its completeness stamp\n");
@@ -342,6 +399,10 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
 fn outputLooksLikeEnospc(output: []const u8) bool {
     return std.mem.indexOf(u8, output, "No space left on device") != null or
         std.mem.indexOf(u8, output, "ENOSPC") != null;
+}
+
+fn nsToMs(ns: u64) u64 {
+    return ns / std.time.ns_per_ms;
 }
 
 test "build CLI parses M1 options" {

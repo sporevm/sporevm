@@ -175,7 +175,23 @@ pub fn build(b: *std.Build) void {
     const run_libspore_smoke_tests = b.addRunArtifact(libspore_smoke_tests);
     const c_api_tests = b.addTest(.{ .root_module = c_api_mod });
     const run_c_api_tests = b.addRunArtifact(c_api_tests);
-    const internal_tests = b.addTest(.{ .root_module = internal_mod });
+    const internal_test_mod = if (target_is_kvm) blk: {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .link_libc = true,
+        });
+        mod.addAnonymousImport("run_assets", .{
+            .root_source_file = minimal_exec_initrd_module,
+        });
+        mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
+        mod.addCSourceFile(.{
+            .file = b.path("guest/minimal-initrd/agent.c"),
+            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-DSPORE_AGENT_REQUEST_FUZZ" },
+        });
+        break :blk mod;
+    } else internal_mod;
+    const internal_tests = b.addTest(.{ .root_module = internal_test_mod });
     const run_internal_tests = b.addRunArtifact(internal_tests);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
@@ -286,6 +302,17 @@ pub fn build(b: *std.Build) void {
 
         const build_run_smoke_step = b.step("spore-build-run-smoke", "Run the VM-backed spore build RUN executor smoke test");
         build_run_smoke_step.dependOn(&run_build_smoke.step);
+
+        const run_large_copy_smoke = b.addSystemCommand(&.{
+            b.getInstallPath(.bin, "spore-build-run-smoke"),
+            b.getInstallPath(.bin, "spore-build-smoke-sh"),
+            "--large-copy",
+        });
+        run_large_copy_smoke.step.dependOn(build_run_smoke_ready);
+        run_large_copy_smoke.step.dependOn(&install_build_smoke_shell.step);
+
+        const build_large_copy_smoke_step = b.step("spore-build-large-copy-smoke", "Run the VM-backed multi-GiB spore build COPY smoke test");
+        build_large_copy_smoke_step.dependOn(&run_large_copy_smoke.step);
     }
 
     // Hypervisor.framework smoke test: host-only, needs entitlement signing.

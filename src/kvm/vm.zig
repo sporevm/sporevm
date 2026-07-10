@@ -43,6 +43,9 @@ pub const Config = struct {
     /// Full block backend for writable or layered rootfs runs. Takes
     /// precedence over disk_fd.
     disk_backend: ?blk.Backend = null,
+    /// Optional read-only build context disk. When present with a rootfs disk,
+    /// Linux enumerates it as the second virtio-blk device.
+    context_disk_fd: ?std.c.fd_t = null,
     /// Optional active disk head to seal into a portable manifest layer when
     /// a snapshot is taken.
     disk_snapshot: ?disk_layer.SnapshotState = null,
@@ -289,13 +292,14 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
 
     var con = console.Console{ .sink = config.console_sink };
     var blk_dev: blk.Blk = undefined;
+    var context_blk_dev: blk.Blk = undefined;
     var net_dev = net.Net.init(.{ .backend = config.network.backend });
     defer net_dev.shutdown();
     var rng_dev = rng.Rng{};
     var vsock_dev = vsock.Vsock.init(.{});
     var mem_dev: virtio_mem.Mem = undefined;
     var gen_dev = generation.Device{};
-    var transports_buf: [6]mmio.Transport = undefined;
+    var transports_buf: [board.max_virtio_devices]mmio.Transport = undefined;
     transports_buf[0] = mmio.Transport.init(con.device());
     var transport_count: usize = 1;
     const disk_backend: ?blk.Backend = if (config.disk_backend) |backend| backend else if (config.disk_fd) |fd| .{ .file = fd } else null;
@@ -303,6 +307,11 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         blk_dev = blk.Blk.init(backend);
         transports_buf[1] = mmio.Transport.init(blk_dev.device());
         transport_count = 2;
+    }
+    if (config.context_disk_fd) |fd| {
+        context_blk_dev = blk.Blk.init(.{ .file = fd });
+        transports_buf[transport_count] = mmio.Transport.init(context_blk_dev.device());
+        transport_count += 1;
     }
     const net_transport_index = transport_count;
     transports_buf[transport_count] = mmio.Transport.init(net_dev.device());

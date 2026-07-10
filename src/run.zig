@@ -133,6 +133,7 @@ pub const Options = struct {
     rootfs_path: ?[]const u8 = null,
     rootfs: ?spore.Rootfs = null,
     rootfs_grow_target: u64 = 0,
+    context_disk_path: ?[]const u8 = null,
     disk: ?spore.Disk = null,
     resume_dir: ?[]const u8 = null,
     resume_generation: ?generation.State = null,
@@ -2661,7 +2662,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     });
     const disk_ms = monotonicMs() -| disk_start;
     defer runtime_disk.deinit();
-    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), opts.network);
+    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), opts.network, false);
     const request_start = monotonicMs();
     const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
     var stream = try vsock.HostStream.initWithProtocol(opts.guest_port, request.bytes, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
@@ -2883,7 +2884,11 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
         .spore_dir = opts.resume_dir,
     });
     defer runtime_disk.deinit();
-    const boot_args = try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), opts.network);
+    const context_disk_fd = if (opts.context_disk_path) |path| try openReadOnlyDiskFd(context.io, allocator, path) else null;
+    defer if (context_disk_fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    const boot_args = try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), opts.network, opts.context_disk_path != null);
 
     const cause = switch (backend) {
         .auto => unreachable,
@@ -2897,6 +2902,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
                 .initrd = initrd,
                 .console_sink = consoleSink,
                 .disk_backend = runtime_disk.backend(),
+                .context_disk_fd = context_disk_fd,
                 .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
@@ -2920,6 +2926,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
                 .initrd = initrd,
                 .console_sink = consoleSink,
                 .disk_backend = runtime_disk.backend(),
+                .context_disk_fd = context_disk_fd,
                 .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
@@ -2940,6 +2947,18 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
         .snapshotted => .{ .backend = backend, .exit = .snapshotted },
         else => error.MonitorDidNotStopCleanly,
     };
+}
+
+fn openReadOnlyDiskFd(io: Io, allocator: std.mem.Allocator, path: []const u8) !std.c.fd_t {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.ContextDiskOpenFailed;
+    errdefer _ = std.c.close(fd);
+    const file = Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = file.stat(io) catch return error.ContextDiskOpenFailed;
+    if (stat.kind != .file) return error.ContextDiskOpenFailed;
+    return fd;
 }
 
 fn openRunLocalMemoryBacking(
@@ -3245,14 +3264,15 @@ fn hasRootfs(opts: Options) bool {
     return opts.rootfs_path != null or opts.rootfs != null;
 }
 
-pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, network: NetworkMode) ![]const u8 {
+pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, network: NetworkMode, build_context: bool) ![]const u8 {
     const rootfs_flag = if (rootfs) " spore_rootfs=1" else "";
     const rootfs_rw_flag = if (rootfs and rootfs_writable) " spore_rootfs_rw=1" else "";
     const network_flag = if (network == .spore) " spore_net=1" else "";
+    const build_context_flag = if (build_context) " spore_build_context=1" else "";
     return std.fmt.allocPrint(
         allocator,
-        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}{s}",
-        .{ guest_port, rootfs_flag, rootfs_rw_flag, network_flag },
+        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}{s}{s}",
+        .{ guest_port, rootfs_flag, rootfs_rw_flag, network_flag, build_context_flag },
     );
 }
 
@@ -4769,17 +4789,17 @@ test "run image cache creates absolute cache directories" {
 }
 
 test "run cmdline marks rootfs mode" {
-    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, false, .disabled);
+    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, false, .disabled, false);
     defer std.testing.allocator.free(without_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_rw=1") == null);
 
-    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, false, .disabled);
+    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, false, .disabled, false);
     defer std.testing.allocator.free(with_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_rw=1") == null);
 
-    const with_writable_rootfs = try cmdline(std.testing.allocator, 10700, true, true, .disabled);
+    const with_writable_rootfs = try cmdline(std.testing.allocator, 10700, true, true, .disabled, false);
     defer std.testing.allocator.free(with_writable_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs_rw=1") != null);
@@ -4819,13 +4839,23 @@ test "indexed rootfs input enables rootfs boot mode" {
 }
 
 test "run cmdline marks network mode" {
-    const without_network = try cmdline(std.testing.allocator, 10700, false, false, .disabled);
+    const without_network = try cmdline(std.testing.allocator, 10700, false, false, .disabled, false);
     defer std.testing.allocator.free(without_network);
     try std.testing.expect(std.mem.indexOf(u8, without_network, "spore_net=1") == null);
 
-    const with_network = try cmdline(std.testing.allocator, 10700, false, false, .spore);
+    const with_network = try cmdline(std.testing.allocator, 10700, false, false, .spore, false);
     defer std.testing.allocator.free(with_network);
     try std.testing.expect(std.mem.indexOf(u8, with_network, "spore_net=1") != null);
+}
+
+test "run cmdline marks build context disk only when requested" {
+    const without_context = try cmdline(std.testing.allocator, 10700, true, true, .disabled, false);
+    defer std.testing.allocator.free(without_context);
+    try std.testing.expect(std.mem.indexOf(u8, without_context, "spore_build_context=1") == null);
+
+    const with_context = try cmdline(std.testing.allocator, 10700, true, true, .disabled, true);
+    defer std.testing.allocator.free(with_context);
+    try std.testing.expect(std.mem.indexOf(u8, with_context, "spore_build_context=1") != null);
 }
 
 test "run embeds default initrd" {

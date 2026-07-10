@@ -40,7 +40,9 @@ related_plans:
 > the local ref points at a digest over the final `index_digest` plus canonical
 > config JSON, with a completeness stamp on the underlying rootfs storage so
 > `spore run --image` takes the 0.10s path. The cache model, parser subset,
-> COPY semantics, and fail-closed contract below remain valid.
+> COPY semantics, and fail-closed contract below remain valid. Current large
+> context work adds a stat-cache for content digests and replaces the deleted
+> build COPY entry stream with a cached read-only ext4 context disk.
 
 ## Summary
 
@@ -125,9 +127,11 @@ serialization, is to build directly on Spore's chunk-indexed rootfs artifacts.
   the unified `ChunkMappedDisk` snapshot path.
 - No cross-machine or shared build cache. The step cache is local, same trust
   model as the existing rootfs CAS cache.
-- No new guest device model or monitor protocol. The build VM uses the
-  existing device set and exec stream; the new guest contract is the
-  `fsfreeze` checkpoint handshake driven over that stream.
+- No new device type or monitor protocol. The build VM uses the existing
+  device set, but may attach one additional transient read-only virtio-blk
+  instance for the build context. The new guest contracts are the `fsfreeze`
+  checkpoint handshake plus fixed-shape RUN/COPY build requests over the
+  existing exec stream.
 
 ## Target Model
 
@@ -213,8 +217,11 @@ src/build.zig            orchestrator: plan, cache walk, step execution,
 src/build/dockerfile.zig subset parser -> []Instruction, fail-closed,
                          fuzz target required (new parser of
                          user-influenced input per SECURITY.md)
-src/build/context.zig    .dockerignore-aware context walking + content
-                         hashing for COPY
+src/build/context.zig    .dockerignore-aware context walking, stat-cache
+                         memoization, and content hashing for COPY
+src/build/context_disk.zig
+                         read-only ext4 context disk emission/reuse for
+                         executed COPY steps
 src/build/step_cache.zig step-key computation + on-disk records that map
                          deterministic parent+instruction inputs to child
                          index_digest outcomes
@@ -381,6 +388,9 @@ cas/rootfs/blake3/indexes/<index_digest>.json      (existing) disk index
 cas/rootfs/blake3/objects/<chunk_digest>.chunk      (existing) CAS object
 cas/rootfs/blake3/complete/<index_digest>.complete  (existing) completeness stamp
 build/steps/<step_key>.json                         build step record
+build/context-stat-cache-v1.json                    context content-digest memo
+build/context-disks/<context_disk_digest>.ext4      cached read-only COPY disk
+build/context-disks/<context_disk_digest>.ext4.complete  context disk completeness stamp
 refs/local/<sha256>.json                            (existing) final ref
 <image_cache_key>.json                              (existing) image metadata
 ```
@@ -418,6 +428,20 @@ key can map to different rootfs indexes on different machines or after a cache
 wipe. That is the same model Docker uses: cache keys are deterministic, the
 artifact identity is whatever the execution produced. Nothing downstream
 assumes reproducibility of the ext4 bytes.
+
+Context hashing also maintains
+`build/context-stat-cache-v1.json` under the same local cache root. The JSON
+file has `kind: "sporevm-build-context-stat-cache-v1"`, `max_records`,
+`eviction: "least-recently-seen stat tuple"`, and `records` containing
+`path`, `size`, `mtime_ns`, `ctime_ns`, `inode`, `digest`, and
+`last_seen_unix_ns`. The lookup key is `(absolute path, size, mtime
+nanoseconds, ctime nanoseconds, inode)`. A hit reuses only the per-file BLAKE3
+content digest; the overall COPY/context input digest is still rebuilt from the
+same sorted entry fields a cold hash would use.
+Missing, corrupt, oversized, or stale stat-cache entries fall back to reading
+and hashing file content, and the build proceeds. The file is capped at
+131,072 records and 32 MiB; save eviction keeps the most recently seen stat
+tuples.
 
 ### Final image identity
 
@@ -482,14 +506,20 @@ Session lifecycle:
    the hypervisor-neutral disk interface.
 4. The host drives the existing initrd agent over bounded `spore_stream_v1`
    requests:
-   - `RUN`: host sends the script plus the step's effective env and workdir;
-     driver runs `/bin/sh -c` as root (Docker parity: `-c`, not the `-lc`
-     that `spore run`'s shell mode uses), streams output through, reports the
+   - `RUN`: host sends a fixed-shape `spore-build-run-v1` request with the
+     step's effective env, workdir, and command length, then sends the command
+     text as a length-prefixed payload capped at 64 KiB. The driver runs
+     `/bin/sh -c` as root (Docker parity: `-c`, not the `-lc` that
+     `spore run`'s shell mode uses), streams output through, and reports the
      exit code. Network per `--network` for the whole session.
-   - `COPY`: host sends a `spore-copy-v1` JSON request with destination and
-     entry count, then length-prefixed dir/file/symlink entries over SPIO stdin;
-     the agent validates bounds and guest paths before applying them under
-     `/mnt/rootfs` (see COPY Semantics).
+   - `COPY`: before boot, the host emits the resolved context entries needed
+     by executed COPY steps into a cached read-only ext4 context disk and
+     attaches it as an additional virtio-blk device. Per step, the host sends
+     one or more fixed-shape `spore-build-copy-v2` control requests naming the
+     source subtree on `/mnt/build-context`, destination, source kind, and
+     bounded entry count. The agent recursively copies from the mounted
+     context disk into `/mnt/rootfs` using the confined destination resolver
+     (see COPY Semantics).
    - `CHECKPOINT`: agent handles `fsfreeze-v1` after the step exits;
      the VMM drains/flushes pending virtio-blk writes, the host calls
      `ChunkMappedDisk.snapshotIndex()` into the rootfs CAS, writes/repairs the
@@ -526,11 +556,13 @@ regresses, the degenerate mode is one boot-snapshot-shutdown cycle per step
 per changed step instead of per build; the cache model is identical in both
 modes.
 
-The guest sees exactly what `spore run --image X --save` sees today
-(`spore_rootfs=1 spore_rootfs_rw=1`). The initrd agent now provides the build
-control verbs (`fsfreeze-v1`, `fsthaw-v1`, `spore-copy-v1`); the target base
-must provide `/bin/sh` for RUN and `resize2fs` for executor misses. A missing
-guest requirement fails closed through the step's captured output.
+The guest sees the writable rootfs plus, when COPY steps execute, a mounted
+read-only context disk (`spore_rootfs=1 spore_rootfs_rw=1
+spore_build_context=1`). The initrd agent now provides the build control verbs
+(`fsfreeze-v1`, `fsthaw-v1`, `spore-build-run-v1`,
+`spore-build-copy-v2`); the target base must provide `/bin/sh` for RUN and
+`resize2fs` for executor misses. A missing guest requirement fails closed
+through the step's captured output.
 
 ## COPY Semantics
 
@@ -538,30 +570,40 @@ guest requirement fails closed through the step's captured output.
 session as `RUN`, rather than host-side ext4 surgery:
 
 1. On the host, resolve sources against the context with the same walker used
-   by `hashCopySources` (no `..` escapes, no absolute sources, `.dockerignore`
-   already applied). The resolved, sorted, deduped file set is both the cache
-   input digest and the payload source, so keys cannot drift from bytes.
+   by hashing (no `..` escapes, no absolute sources, `.dockerignore` already
+   applied). The resolved, sorted, deduped file set is both the cache input
+   digest and the context-disk source, so keys cannot drift from bytes.
 2. Map Docker destinations on the host: directory sources copy contents,
    multiple sources require a `/`-terminated destination, relative destinations
    resolve against `WORKDIR`, and guest paths containing `..` fail closed.
-3. Send a `spore-copy-v1` request plus a length-prefixed entry stream over the
-   existing SPIO stdin frames. Each entry has kind (dir/file/symlink), mode,
-   absolute guest path, and content bytes for files or symlink targets. The
-   agent resolves apply paths relative to an fd for `/mnt/rootfs` with
-   `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`, falling back on
-   kernels without `openat2` to a confined manual component walk that keeps
-   symlink targets rooted in the rootfs. Final-component symlinks are followed
-   under the same confined resolution, so file entries write through them,
-   directory entries merge through symlinked directories, and dangling file
-   symlink targets are created inside the rootfs. It applies entries with root
-   ownership, parent creation, directory merge, file overwrite, and symlink
-   preservation.
-4. Checkpoint exactly as RUN does (freeze, O(dirty) snapshot, complete stamp,
+3. Emit or reuse the cached read-only ext4 context disk from the same resolved
+   entries. The disk digest is derived from the sorted entry paths, kinds,
+   modes, sizes, file content digests, and symlink targets; it is transport
+   identity only and does not enter step-cache semantics. Unchanged contexts
+   reuse the disk image only when its completion sidecar is present and valid;
+   the sidecar is published after full disk emission. Changed contexts still
+   mostly dedupe through the rootfs CAS chunks emitted by the native ext4
+   writer.
+4. Send fixed-shape `spore-build-copy-v2` control requests. Each request names
+   the context-disk source subtree, destination, source kind, `dest_is_dir`,
+   and entry count. The guest enforces path and entry-count bounds, then
+   recursively copies from `/mnt/build-context`. Destination paths are resolved
+   relative to an fd for `/mnt/rootfs` with `openat2(RESOLVE_IN_ROOT |
+   RESOLVE_NO_MAGICLINKS)`, falling back on kernels without `openat2` to a
+   confined manual component walk that keeps symlink targets rooted in the
+   rootfs. Final-component symlinks are followed under the same confined
+   resolution, so file entries write through them, directory entries merge
+   through symlinked directories, and dangling file symlink targets are created
+   inside the rootfs. It applies entries with root ownership, parent creation,
+   directory merge, file overwrite, and symlink preservation.
+5. Checkpoint exactly as RUN does (freeze, O(dirty) snapshot, complete stamp,
    step record, thaw).
 
-Corollary: COPY does not require `tar` in the base image and does not add a tar
-parser to the initrd agent. Hardlinks, xattrs, `--chown`, `--chmod`, `--from`,
-`--link`, `ADD`, and multi-stage builds remain unsupported and fail closed.
+Corollary: COPY does not require `tar` in the base image, does not add a tar
+or custom entry-stream parser to the initrd agent, and keeps guest memory usage
+bounded by per-entry copy buffers rather than total COPY size. Hardlinks,
+xattrs, `--chown`, `--chmod`, `--from`, `--link`, `ADD`, and multi-stage builds
+remain unsupported and fail closed.
 
 Why the guest and not `debugfs` writes or host staging: a real Linux kernel
 applies ownership, modes, symlinks, and directory merge behavior natively and
@@ -570,10 +612,13 @@ or metadata hazards. `debugfs -w` scripting for arbitrary tree merges
 (overwrite-vs-merge, unlink-before-write, hardlinks) is a large correctness
 surface for no architectural payoff. With the persistent session the guest
 boot is already amortized across the whole build, so COPY's marginal cost is
-the entry stream plus one freeze/snapshot checkpoint. Host-side COPY (writing
-directly into the rootfs without the guest) stays a documented follow-up for
-the case where a COPY is the *only* uncached step; it needs a separate design
-and is not v1.
+context-disk emission or reuse, in-guest disk-to-disk copy, and one
+freeze/snapshot checkpoint. Host-side COPY (writing directly into the rootfs
+without the guest) stays a documented follow-up for the case where a COPY is
+the *only* uncached step; it is deferred because it would need a separate
+proof that host-side ext4 mutation preserves Docker merge, symlink,
+ownership, and mode semantics without reintroducing an import-style
+correctness surface.
 
 Docker semantic contract, tested explicitly:
 
@@ -624,14 +669,17 @@ single-digit seconds end to end, with the BuildKit tar export removed.
 
 - The Dockerfile parser and context walker are new parsers of user-influenced
   input. Per `SECURITY.md`, they ship with fuzz targets in the same change
-  (M1 for the parser; M2 COPY keeps host payload generation on the same
-  resolver path and bounds the guest entry parser).
+  (M1 for the parser; M2 COPY keeps context-disk emission on the same resolver
+  path and replaces the guest entry-stream parser with fixed-shape control
+  requests plus the guest kernel's ext4 parser for a host-produced read-only
+  disk).
 - `RUN` executes arbitrary user commands — inside the SporeVM guest, which is
-  the existing isolation boundary. The builder adds no new device model, no
-  new virtqueue parsing, and no monitor changes outside the existing
+  the existing isolation boundary. The builder adds no new device type or
+  monitor protocol. It may attach one additional read-only virtio-blk instance
+  containing the context disk, and otherwise stays within the existing
   hypervisor-neutral disk interface. The runtime change is opening a
-  build-owned `ChunkMappedDisk` read-write instead of opening an immutable
-  run image read-only.
+  build-owned `ChunkMappedDisk` read-write instead of opening an immutable run
+  image read-only.
 - Step records under `build/steps/` are trusted local build metadata — same
   trust level as the cache directory that holds them — and never leave
   `build/`. The rootfs artifacts they name are normal rootfs CAS
@@ -690,10 +738,12 @@ cost paid once.
 
 The session executor: open the deepest cached index through `ChunkMappedDisk`
 with build-owned overlay state, rw rootfs boot behind the hypervisor-neutral
-disk interface, bounded agent requests over `spore_stream_v1`, `/bin/sh -c`
-RUN steps with env/workdir/network, `spore-copy-v1` COPY entry streams,
-freeze/snapshot/stamp/record/thaw checkpointing (including the virtio-blk drain),
-complete-stamp publication, streamed step output, and non-zero-exit cleanup.
+disk interface, bounded agent requests over `spore_stream_v1`, length-prefixed
+64 KiB-capped `/bin/sh -c` RUN payloads with env/workdir/network, cached
+read-only ext4 context disks for COPY, fixed-shape `spore-build-copy-v2`
+control requests, freeze/snapshot/stamp/record/thaw checkpointing (including
+the virtio-blk drain), complete-stamp publication, streamed step output, and
+non-zero-exit cleanup.
 Every executed instruction produces exactly one child `index_digest` through
 `ChunkMappedDisk.snapshotIndex()`; no flat checkpoint and no full-image hash
 exist in this path.
@@ -738,22 +788,28 @@ The build VM memory is currently a provisional 2 GiB default; promote it to a
 `spore build` option when real workloads such as large `bundle install`-style
 RUN steps need more memory.
 
-Implementation note (2026-07-09, COPY slice): the executor step list is now a
-tagged RUN/COPY sequence, so the first uncached COPY enters the same persistent
-VM path as RUN. COPY write-side keys use the same `StepInput` fields the M1
-resolver reads: parent index, `"COPY"`, raw instruction, build-context input
-digest, environment digest, and workdir. Host payload generation reuses the
-same build-context resolver as hashing, maps Docker destinations before boot,
-and streams a bounded custom `spore-copy-v1` entry protocol rather than tar.
-The guest agent validates entry count, kind, mode, path length, content length,
-and `..` components, then confines all apply-path resolution to `/mnt/rootfs`
-while preserving Docker-style rootfs-internal and final-component symlink
-traversal. COPY checkpoints use the same freeze → snapshot → complete stamp →
-step record → thaw ordering as RUN. Session start uses the deterministic sparse
-grow policy above and includes the resolved grow target in the first
-executor-written step key; the hidden `--disk-grow-target` debug override
-bypasses the policy and uses the same key field. A manual Docker-vs-Spore
-metadata oracle lives at `scripts/spore-build-copy-oracle.sh`.
+Implementation note (2026-07-09, COPY/context-disk slice): the executor step
+list is now a tagged RUN/COPY sequence, so the first uncached COPY enters the
+same persistent VM path as RUN. COPY write-side keys use the same `StepInput`
+fields the M1 resolver reads: parent index, `"COPY"`, raw instruction,
+build-context input digest, environment digest, and workdir. The same resolved
+context walk feeds both the COPY input digest and the context-disk builder; a
+cold full hash and a warm stat-cache hit path must produce byte-identical step
+keys. The host emits or reuses a cached read-only ext4 image under
+`build/context-disks/`, attaches it as a second virtio-blk instance at boot,
+and sends bounded `spore-build-copy-v2` control messages naming source,
+destination, kind, destination-directory behavior, and entry count. The guest
+agent validates the request shape and count, mounts the context disk read-only,
+and confines all destination apply-path resolution to `/mnt/rootfs` while
+preserving Docker-style rootfs-internal and final-component symlink traversal.
+COPY checkpoints use the same freeze → snapshot → complete stamp → step
+record → thaw ordering as RUN; if any COPY request in a step fails, the build
+fails before snapshot promotion for that step. Session start uses the
+deterministic sparse grow policy above and includes the resolved grow target in
+the first executor-written step key; the hidden `--disk-grow-target` debug
+override bypasses the policy and uses the same key field. A manual
+Docker-vs-Spore metadata oracle lives at
+`scripts/spore-build-copy-oracle.sh`.
 
 Remaining M2 completion work: prove the full `buildkite-sporevm` wrapper path
 against the real Buildkite base end to end and record the measured acceptance
@@ -771,9 +827,10 @@ Definition of done:
 - COPY semantics test matrix passes (dir-contents, multi-source, relative
   dest, overwrite/merge, symlink, empty dir, mode preservation, exec bit).
 
-Ceiling proven: cached full build (parse + context hash + lookups + ref
-refresh) ≤2s cold-stat, target <1s; uncached COPY ≈ entry stream + guest apply
-plus one freeze/O(dirty) snapshot, with boot amortized per build.
+Ceiling proven: cached full build (parse + stat-only context hash + lookups +
+ref refresh) ≤2s warm-stat; uncached COPY ≈ context-disk emit/reuse +
+guest disk-to-disk apply plus one freeze/O(dirty) snapshot, with boot
+amortized per build.
 
 ### M4 — Wrapper switch and benchmark
 
@@ -793,8 +850,6 @@ Definition of done:
 
 ### M5 — Ergonomics and hardening (follow-ups, ordered by need)
 
-- Per-file context hash cache keyed by (path, size, mtime, inode) so warm
-  context hashing is stat-only.
 - `spore build .` with `-f` defaults, once the narrow wrapper path is proven.
 - `spore build prune` / step-cache GC for build records and CAS indexes that
   are no longer reachable from local refs or live build-cache records.
@@ -822,6 +877,8 @@ Tests:
 - Executor: exit-code propagation, env/workdir application, network
   on/off, deterministic disk growth, failure cleanup.
 - COPY matrix listed above, plus context-escape rejection tests.
+- Large COPY: generated sparse fixture with aggregate payload above guest RAM
+  succeeds through context-disk apply and records emitted/reused diagnostics.
 - End-to-end: small fixture base (tiny OCI layout already used by import
   tests) through FROM+RUN+COPY+CMD, then `spore run` smoke; the real
   `buildkite-sporevm` path as the M4 hardware smoke.
@@ -835,6 +892,7 @@ convention, same output shape):
 spore build profile: phase=parse ms=…
 spore build profile: phase=base_resolve ms=…
 spore build profile: phase=context_hash ms=…
+spore build profile: phase=context_disk cache=emitted|reused ms=…
 spore build profile: phase=session_start overlay_ms=… resize_ms=… boot_ms=…
 spore build profile: step=3 kind=RUN cache=miss exec_ms=… freeze_ms=…
   snapshot_ms=… dirty_chunks=… objects_written=… complete_stamp_ms=…
