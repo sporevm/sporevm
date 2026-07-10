@@ -90,6 +90,7 @@ pub fn main(init: std.process.Init) !void {
     });
     if (first_diag.executor.boot_count != 1) return error.ExpectedOneBuildVmBoot;
     if (first_diag.executor.executed_steps != 15) return error.ExpectedFifteenBuildSteps;
+    if (first_diag.executor.resize_count != 1) return error.ExpectedOneBuildResize;
     if (first.cache_hit) return error.ExpectedFirstBuildCacheMiss;
     if (!first_diag.context_disk.emitted) return error.ExpectedFirstContextDiskEmit;
     if (first_diag.context_disk.reused) return error.ExpectedFirstContextDiskNotReused;
@@ -105,6 +106,7 @@ pub fn main(init: std.process.Init) !void {
     });
     if (cached_diag.executor.boot_count != 0) return error.ExpectedCachedBuildWithoutBoot;
     if (cached_diag.executor.executed_steps != 0) return error.ExpectedCachedBuildWithoutSteps;
+    if (cached_diag.executor.resize_count != 0) return error.ExpectedCachedBuildWithoutResize;
     if (!cached.cache_hit) return error.ExpectedCachedBuildHit;
     if (!std.mem.eql(u8, first.index_digest, cached.index_digest)) return error.ExpectedCachedRootfsIdentity;
 
@@ -120,6 +122,7 @@ pub fn main(init: std.process.Init) !void {
     });
     if (override_diag.executor.boot_count != 1) return error.ExpectedOverrideBuildVmBoot;
     if (override_diag.executor.executed_steps != 15) return error.ExpectedOverrideBuildFifteenSteps;
+    if (override_diag.executor.resize_count != 1) return error.ExpectedOverrideBuildOneResize;
     if (override.cache_hit) return error.ExpectedOverrideBuildCacheMiss;
     if (std.mem.eql(u8, first.index_digest, override.index_digest)) return error.ExpectedOverrideRootfsIdentity;
     if (!override_diag.context_disk.reused) return error.ExpectedOverrideContextDiskReuse;
@@ -136,6 +139,7 @@ pub fn main(init: std.process.Init) !void {
     });
     if (default_after_override_diag.executor.boot_count != 0) return error.ExpectedDefaultAfterOverrideWithoutBoot;
     if (default_after_override_diag.executor.executed_steps != 0) return error.ExpectedDefaultAfterOverrideWithoutSteps;
+    if (default_after_override_diag.executor.resize_count != 0) return error.ExpectedDefaultAfterOverrideWithoutResize;
     if (!default_after_override.cache_hit) return error.ExpectedDefaultAfterOverrideCacheHit;
     if (!std.mem.eql(u8, first.index_digest, default_after_override.index_digest)) return error.ExpectedDefaultAfterOverrideRootfsIdentity;
 
@@ -157,6 +161,7 @@ pub fn main(init: std.process.Init) !void {
     };
     if (edited_diag.executor.boot_count != 1) return error.ExpectedEditedBuildVmBoot;
     if (edited_diag.executor.executed_steps != 4) return error.ExpectedEditedBuildFourSteps;
+    if (edited_diag.executor.resize_count != 0) return error.ExpectedEditedBuildWithoutResize;
     if (edited.cache_hit) return error.ExpectedEditedBuildCacheMiss;
     if (std.mem.eql(u8, first.index_digest, edited.index_digest)) return error.ExpectedEditedRootfsIdentity;
     if (!edited_diag.context_disk.emitted) return error.ExpectedEditedContextDiskEmit;
@@ -206,6 +211,7 @@ fn runLargeCopySmoke(init: std.process.Init, allocator: std.mem.Allocator, io: I
     };
     if (diagnostic.executor.boot_count != 1) return error.ExpectedLargeCopyBuildVmBoot;
     if (diagnostic.executor.executed_steps != 2) return error.ExpectedLargeCopyTwoSteps;
+    if (diagnostic.executor.resize_count != 1) return error.ExpectedLargeCopyOneResize;
     if (result.cache_hit) return error.ExpectedLargeCopyCacheMiss;
     if (!diagnostic.context_disk.emitted and !diagnostic.context_disk.reused) return error.ExpectedLargeCopyContextDisk;
     std.debug.print(

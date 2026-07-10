@@ -61,6 +61,7 @@ pub const Result = struct {
 
 const State = struct {
     storage: spore.RootfsStorage,
+    disk_grow_target: u64 = 0,
     env: std.array_list.Managed([]const u8),
     args: std.array_list.Managed(ArgValue),
     workdir: []const u8 = "/",
@@ -118,7 +119,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                 const source = try substitute(allocator, from.source, pre_from_args.items, &.{});
                 const base = try resolveBase(init, allocator, options, source);
                 if (!try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, base.cache_root, base.storage)) return error.RootFSDigestCacheMiss;
-                state = try stateFromBase(allocator, base.config, base.storage);
+                state = try stateFromBase(allocator, base.config, base.storage, try buildDiskGrowTarget(options, base.storage));
                 // FROM resolution may import and lock the cache itself. Once it
                 // completes, serialize the remaining build against destructive
                 // GC until every resulting storage value has a durable root.
@@ -215,20 +216,21 @@ fn resolveBase(init: std.process.Init, allocator: std.mem.Allocator, options: Op
     return .{ .cache_root = cache_root, .storage = storage, .config = metadata.config };
 }
 
-fn stateFromBase(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig, storage: spore.RootfsStorage) !State {
+fn stateFromBase(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig, storage: spore.RootfsStorage, disk_grow_target: u64) !State {
     var env = std.array_list.Managed([]const u8).init(allocator);
     const args = std.array_list.Managed(ArgValue).init(allocator);
     if (config.config) |runtime| {
         if (runtime.Env) |entries| for (entries) |entry| try env.append(try allocator.dupe(u8, entry));
         return .{
             .storage = try spore.cloneRootfsStorage(allocator, storage),
+            .disk_grow_target = disk_grow_target,
             .env = env,
             .args = args,
             .workdir = if (runtime.WorkingDir) |dir| if (dir.len == 0) "/" else try allocator.dupe(u8, dir) else "/",
             .cmd = if (runtime.Cmd) |cmd| try cloneStringList(allocator, cmd) else null,
         };
     }
-    return .{ .storage = try spore.cloneRootfsStorage(allocator, storage), .env = env, .args = args };
+    return .{ .storage = try spore.cloneRootfsStorage(allocator, storage), .disk_grow_target = disk_grow_target, .env = env, .args = args };
 }
 
 fn applyMetadataInstruction(
@@ -287,11 +289,11 @@ fn cachedExecStep(
 ) !spore.RootfsStorage {
     if (options.no_cache) return error.CacheMissRequiresBuildExecutor;
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    const grow_target = try buildDiskGrowTarget(options, state.storage);
+    const grow_target = try pendingDiskGrowTarget(state);
     const grown_input = try execStepInput(allocator, options, state, instruction, input_digest, grow_target);
     const grown_key = try step_cache.stepKey(allocator, grown_input);
     if (try step_cache.readHit(init.io, allocator, cache_root, grown_input, grown_key)) |hit| return hit;
-    if (options.disk_grow_target_override != 0) return error.CacheMissRequiresBuildExecutor;
+    if (grow_target == 0 or options.disk_grow_target_override != 0) return error.CacheMissRequiresBuildExecutor;
 
     const normal_input = try execStepInput(allocator, options, state, instruction, input_digest, 0);
     const normal_key = try step_cache.stepKey(allocator, normal_input);
@@ -339,7 +341,7 @@ fn executeFromMiss(
         .cache_root = cache_root,
         .base_storage = state.storage,
         .steps = steps.items,
-        .disk_grow_target = try buildDiskGrowTarget(options, state.storage),
+        .disk_grow_target = try pendingDiskGrowTarget(state),
         .context_disk_path = context_disk_path,
         .output = options.output,
         .diagnostic = &diagnostic.executor,
@@ -541,7 +543,12 @@ fn execStepInput(
 }
 
 fn execStepKey(allocator: std.mem.Allocator, options: Options, state: State, instruction: dockerfile.Instruction, input_digest: []const u8) ![]const u8 {
-    return step_cache.stepKey(allocator, try execStepInput(allocator, options, state, instruction, input_digest, try buildDiskGrowTarget(options, state.storage)));
+    return step_cache.stepKey(allocator, try execStepInput(allocator, options, state, instruction, input_digest, try pendingDiskGrowTarget(state)));
+}
+
+fn pendingDiskGrowTarget(state: State) !u64 {
+    if (state.disk_grow_target == 0) return error.BadManifest;
+    return if (state.storage.logical_size < state.disk_grow_target) state.disk_grow_target else 0;
 }
 
 fn buildDiskGrowTarget(options: Options, storage: spore.RootfsStorage) !u64 {
@@ -958,6 +965,28 @@ test "build disk grow target uses deterministic sparse policy" {
     try std.testing.expectEqual(@as(u64, 20 * 1024 * 1024 + rootfs_cas.default_chunk_size), try buildDiskGrowTarget(override, storage));
 }
 
+test "build disk grow target remains anchored to FROM storage after a cached prefix" {
+    const options = Options{
+        .tag = "local/app:dev",
+        .context_dir = "unused",
+        .dockerfile_path = "unused",
+    };
+    var state = State{
+        .storage = testStorage(),
+        .disk_grow_target = try buildDiskGrowTarget(options, testStorage()),
+        .env = std.array_list.Managed([]const u8).init(std.testing.allocator),
+        .args = std.array_list.Managed(ArgValue).init(std.testing.allocator),
+    };
+    defer state.env.deinit();
+    defer state.args.deinit();
+
+    try std.testing.expectEqual(state.disk_grow_target, try pendingDiskGrowTarget(state));
+    state.storage.logical_size = state.disk_grow_target;
+    try std.testing.expectEqual(@as(u64, 0), try pendingDiskGrowTarget(state));
+    state.storage.logical_size += state.storage.chunk_size;
+    try std.testing.expectEqual(@as(u64, 0), try pendingDiskGrowTarget(state));
+}
+
 test "hidden disk grow override misses without poisoning default cache" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -996,15 +1025,16 @@ test "hidden disk grow override misses without poisoning default cache" {
         \\
     , &diag);
     const instruction = doc.instructions[1];
-    const state = State{
-        .storage = base_storage,
-        .env = std.array_list.Managed([]const u8).init(arena),
-        .args = std.array_list.Managed(ArgValue).init(arena),
-    };
     const options = Options{
         .tag = "local/app:dev",
         .context_dir = "unused",
         .dockerfile_path = "unused",
+    };
+    const state = State{
+        .storage = base_storage,
+        .disk_grow_target = try buildDiskGrowTarget(options, base_storage),
+        .env = std.array_list.Managed([]const u8).init(arena),
+        .args = std.array_list.Managed(ArgValue).init(arena),
     };
     const default_input = try execStepInput(arena, options, state, instruction, "", try buildDiskGrowTarget(options, base_storage));
     const default_key = try step_cache.stepKey(arena, default_input);
@@ -1019,12 +1049,14 @@ test "hidden disk grow override misses without poisoning default cache" {
         .dockerfile_path = "unused",
         .disk_grow_target_override = try buildDiskGrowTarget(options, base_storage) + rootfs_cas.default_chunk_size,
     };
-    try std.testing.expectError(error.CacheMissRequiresBuildExecutor, cachedExecStep(init, arena, override_options, state, instruction, ""));
+    var override_state = state;
+    override_state.disk_grow_target = try buildDiskGrowTarget(override_options, base_storage);
+    try std.testing.expectError(error.CacheMissRequiresBuildExecutor, cachedExecStep(init, arena, override_options, override_state, instruction, ""));
 
     const override_input = try execStepInput(arena, override_options, state, instruction, "", try buildDiskGrowTarget(override_options, base_storage));
     const override_key = try step_cache.stepKey(arena, override_input);
     _ = try step_cache.writeRecord(io, arena, cache_root, override_input, override_key, override_child_storage);
-    const override_hit = try cachedExecStep(init, arena, override_options, state, instruction, "");
+    const override_hit = try cachedExecStep(init, arena, override_options, override_state, instruction, "");
     try std.testing.expectEqualStrings(override_child_storage.index_digest, override_hit.index_digest);
 
     const default_hit_again = try cachedExecStep(init, arena, options, state, instruction, "");
