@@ -181,15 +181,15 @@ rootfs CAS files by default. The two are distinct data classes with distinct
 prune selectors:
 
 - `--include-digest-artifacts` prunes the flat digest-addressed ext4 artifacts,
-  which are the resume authority. Removing one makes affected spores fail
-  closed until their rootfs bytes are restored (re-pull, or re-materialized
-  from surviving chunks).
-- `--include-rootfs-chunks` prunes the derived rootfs CAS index and chunk
-  objects. This is safe when the flat artifact remains: resume serves the flat
-  artifact directly, and `spore pack` re-derives missing chunks from it. Use
-  this to reclaim the chunk footprint (roughly the rootfs size per unique
-  image) on hosts that pulled chunked spores but do not need to re-share them
-  immediately.
+  which are the hot resume cache for chunked spores and the authority for
+  exact-only spores. Removing one makes chunked spores fall back to verified
+  CAS chunks; exact-only spores fail closed until their rootfs bytes are
+  restored.
+- `--include-rootfs-chunks` prunes the canonical rootfs CAS index and chunk
+  objects, including writable-disk state in the shared namespace. This can
+  break resume and pack even when the flat rootfs artifact remains. Use it only
+  for deliberate destructive reclamation; use the root-aware
+  `spore cache gc --rootfs` command to preserve reachable state.
 
 `spore cache gc --rootfs` is stricter than prune. It roots descriptor-selected
 `spore-disk-index-v1` indexes from cache metadata, image ref records, and live

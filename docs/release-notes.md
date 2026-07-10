@@ -27,6 +27,12 @@ local CAS chunks in on first read. Missing or corrupt chunk objects fail the
 complete multi-chunk virtio-blk request before any disk payload bytes are copied;
 only the request's I/O-error status byte is written.
 
+`spore pack` now emits chunked rootfs bundles directly from the canonical CAS
+index and verified objects. It no longer assembles and rescans a full flat ext4
+materialization before export. Packing chunked storage now requires that
+canonical CAS; a surviving flat materialization does not repair missing index
+or object bytes.
+
 The disk backend is now one chunk-mapped implementation with map-copy fork
 support. Forked writable disks get an independent overlay and do not create a
 read-depth chain; durable children still come from snapshot plus open.
