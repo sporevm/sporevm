@@ -84,6 +84,13 @@ pub fn runtimeRootPath(allocator: std.mem.Allocator, environ: *const std.process
     return std.fs.path.resolve(allocator, &.{ tmp, leaf });
 }
 
+/// Returns the host directory for anonymous runtime disk overlays. Keeping
+/// the live overlay and every transient fork head under the same configured
+/// temp root lets APFS clones and Linux reflinks remain native.
+pub fn runtimeOverlayRootPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
+    return resolveRequiredAbsolute(allocator, environ.get("TMPDIR") orelse "/tmp");
+}
+
 fn resolveRequiredAbsolute(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     try validateAbsoluteRuntimePath(path);
     return std.fs.path.resolve(allocator, &.{path});
@@ -197,4 +204,22 @@ test "runtime root rejects relative environment paths" {
     _ = env.swapRemove(runtime_dir_env);
     try env.put(xdg_runtime_dir_env, "");
     try std.testing.expectError(error.InvalidRuntimeDir, runtimeRootPath(allocator, &env));
+}
+
+test "runtime overlay root follows absolute TMPDIR" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    const fallback = try runtimeOverlayRootPath(allocator, &env);
+    defer allocator.free(fallback);
+    try std.testing.expectEqualStrings("/tmp", fallback);
+
+    try env.put("TMPDIR", "/var/tmp/sporevm-scratch/../sporevm-scratch");
+    const configured = try runtimeOverlayRootPath(allocator, &env);
+    defer allocator.free(configured);
+    try std.testing.expectEqualStrings("/var/tmp/sporevm-scratch", configured);
+
+    try env.put("TMPDIR", "relative");
+    try std.testing.expectError(error.InvalidRuntimeDir, runtimeOverlayRootPath(allocator, &env));
 }

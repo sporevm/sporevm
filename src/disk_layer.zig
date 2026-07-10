@@ -9,12 +9,14 @@
 const std = @import("std");
 const block_source = @import("block_source.zig");
 const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
+const fd_util = @import("fd.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
+const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const spore = @import("spore.zig");
 
 extern "c" fn mkstemp(template: [*:0]u8) c_int;
 
-pub const Error = spore.Error || chunk_mapped_disk.Error || error{
+pub const Error = spore.Error || chunk_mapped_disk.Error || runtime_disk_fork.Error || error{
     ShortRead,
     ShortWrite,
 };
@@ -84,7 +86,47 @@ pub const SnapshotState = struct {
         );
         return result;
     }
+
+    pub fn prepareSnapshotRoot(self: SnapshotState, root: []const u8) Error!chunk_mapped_disk.PreparedSnapshotRoot {
+        return switch (self.active) {
+            .chunk_mapped => |disk| disk.prepareSnapshotRoot(root),
+        };
+    }
+
+    pub fn commitSnapshotRoot(
+        self: SnapshotState,
+        expected_root: []const u8,
+        prepared: *chunk_mapped_disk.PreparedSnapshotRoot,
+    ) Error!void {
+        return switch (self.active) {
+            .chunk_mapped => |disk| disk.commitSnapshotRoot(expected_root, prepared),
+        };
+    }
+
+    /// Clones the live writable head without sealing a durable disk index.
+    /// The backend must keep every vCPU paused and validate the virtio-blk
+    /// queue against `base` before calling this method.
+    pub fn exportForkHead(
+        self: SnapshotState,
+        options: chunk_mapped_disk.ExportForkOptions,
+    ) Error!runtime_disk_fork.Head {
+        const baseline = try forkBaseline(self.base);
+        return switch (self.active) {
+            .chunk_mapped => |disk| disk.exportForkHead(baseline, options),
+        };
+    }
 };
+
+pub fn forkBaseline(base: spore.Disk) Error!runtime_disk_fork.Baseline {
+    const kind: runtime_disk_fork.BaselineKind = if (std.mem.eql(u8, base.kind, spore.disk_kind_chunk_index))
+        .disk_index
+    else if (std.mem.eql(u8, base.kind, spore.disk_kind_cow_block))
+        .rootfs
+    else
+        return error.BadManifest;
+    try spore.validateDiskDigest(base.base);
+    return .{ .kind = kind, .identity = base.base };
+}
 
 fn monotonicMs() Error!u64 {
     var ts: std.c.timespec = undefined;
@@ -93,11 +135,23 @@ fn monotonicMs() Error!u64 {
 }
 
 pub fn createTempOverlay(allocator: std.mem.Allocator) Error!TempOverlay {
-    const template = try allocator.dupeZ(u8, "/tmp/sporevm-disk-head-XXXXXX");
+    return createTempOverlayAt(allocator, chunk_mapped_disk.runtime_overlay_dir);
+}
+
+pub fn createTempOverlayAt(allocator: std.mem.Allocator, dir: []const u8) Error!TempOverlay {
+    if (dir.len == 0) return error.BadOverlay;
+    const template = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/sporevm-disk-head-XXXXXX",
+        .{std.mem.trimEnd(u8, dir, "/")},
+        0,
+    );
     defer allocator.free(template);
     const fd = mkstemp(template.ptr);
     if (fd < 0) return error.IoFailed;
-    _ = std.c.unlink(template.ptr);
+    errdefer _ = std.c.close(fd);
+    if (std.c.unlink(template.ptr) != 0) return error.IoFailed;
+    try fd_util.setCloseOnExec(fd);
     return .{ .fd = fd };
 }
 

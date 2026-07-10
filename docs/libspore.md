@@ -280,6 +280,20 @@ const forked = try libspore.forkNamed(init, allocator, .{
 defer libspore.deinitNamedForkResult(allocator, forked);
 ```
 
+`forkNamed` supports diskless sources and the single writable rootfs disk used
+by image-created, explicit-rootfs, restored, and previously forked named VMs.
+Networked sources remain unsupported, and a batch is capped at 32 children.
+Disk-backed fork requires native APFS/Linux cloning by default; Zig callers can
+set `ForkNamedOptions.allow_slow_copy = true` to permit a full dirty-overlay
+copy when native cloning is unavailable.
+
+For disk-backed sources, `NamedForkResult` reports `ram_capture_ms`,
+`disk_fork_ms`, `source_pause_ms`, and `child_ready_ms`. These phase metrics are
+null for the existing diskless path. Success means every child has reopened its
+baseline, consumed its one-use disk-head claim, and published monitor readiness.
+The source can then be removed without invalidating child reads, nested forks,
+or later saves.
+
 For mutable image refs, Zig callers can set `.image_pull_policy` to `.missing`,
 `.always`, or `.never`; the C and Go bindings use the default `.missing`
 policy.

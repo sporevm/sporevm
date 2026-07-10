@@ -24,6 +24,7 @@ const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
 const runtime_disk_mod = @import("runtime_disk.zig");
+const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const run_assets = @import("run_assets");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
@@ -135,6 +136,8 @@ pub const Options = struct {
     rootfs_grow_target: u64 = 0,
     context_disk_path: ?[]const u8 = null,
     disk: ?spore.Disk = null,
+    disk_root: ?[]const u8 = null,
+    runtime_disk_head: ?*runtime_disk_fork.Head = null,
     resume_dir: ?[]const u8 = null,
     resume_generation: ?generation.State = null,
     resume_sessions: []const spore.Session = &.{},
@@ -3249,8 +3252,10 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
         .rootfs_grow_target = opts.rootfs_grow_target,
         .disk = opts.disk,
         .spore_dir = opts.resume_dir,
+        .disk_root = opts.disk_root,
     });
     defer runtime_disk.deinit();
+    if (opts.runtime_disk_head) |head| try runtime_disk.adoptForkHead(head);
     const context_disk_fd = if (opts.context_disk_path) |path| try openReadOnlyDiskFd(context.io, allocator, path) else null;
     defer if (context_disk_fd) |fd| {
         _ = std.c.close(fd);

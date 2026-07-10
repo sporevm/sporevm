@@ -172,6 +172,10 @@ description = "Smoke OCI rootfs save, fork, and run-from child execution"
 run = "mise run build && bash test/smoke/fanout/live-rootfs.sh"
 description = "Smoke live OCI rootfs save, fork, and attach child identity"
 
+[tasks."smoke:named-disk-fork"]
+run = "mise run build && test/smoke/fanout/named-disk-fork.sh"
+description = "Smoke disk-backed named live fork, divergence, leases, and nested save/restore"
+
 [tasks."smoke:writable-rootfs"]
 run = "mise run build && test/smoke/rootfs/writable.sh"
 description = "Smoke writable rootfs disk layer save and run-from replay"
@@ -179,6 +183,10 @@ description = "Smoke writable rootfs disk layer save and run-from replay"
 [tasks."benchmark:writable-rootfs"]
 run = "mise run build:release && scripts/benchmark/writable-rootfs.sh --iterations 1"
 description = "Benchmark writable rootfs COW, sealed append, and replay paths"
+
+[tasks."benchmark:disk-fork"]
+run = "SPOREVM_DISK_FORK_BENCHMARK=1 zig test src/chunk_mapped_disk.zig -O ReleaseFast -lc --test-filter 'disk fork benchmark'"
+description = "Benchmark native disk-head cloning, 32-child preparation, and generation-32 reads"
 
 [tasks."smoke:local-pull"]
 run = "mise run build && test/smoke/fanout/local-pull.sh"

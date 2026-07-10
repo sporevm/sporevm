@@ -9,6 +9,12 @@ const Context = @import("context.zig").Context;
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
+const rootfs_cache = @import("rootfs_cache.zig");
+const rootfs_cas = @import("rootfs_cas.zig");
+const rootfs_mod = @import("rootfs.zig");
+const runtime_disk_claim = @import("runtime_disk_claim.zig");
+const runtime_disk_fork_control = @import("runtime_disk_fork_control.zig");
+const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const generation = @import("generation.zig");
 const attach_mod = @import("attach.zig");
 const run_mod = @import("run.zig");
@@ -189,10 +195,11 @@ const fork_usage =
     \\  --vm NAME             Running named VM to fork from
     \\  --count N             Number of children to create
     \\  --name PATTERN        Child VM name or pattern, e.g. worker-%d
+    \\  --allow-slow-copy     Permit a full overlay copy when native cloning is unavailable
     \\  -h, --help            Show this help
     \\
     \\Notes:
-    \\  Live --vm fork does not support disk-backed, --image, or --rootfs VMs yet.
+    \\  Live --vm fork supports one writable rootfs disk; networked VMs remain unsupported.
     \\
     \\Workflow:
     \\  spore run --save base.spore --save-on TERM 'while true; do echo tick; sleep 1; done'
@@ -268,6 +275,8 @@ pub const Spec = struct {
     rootfs_path: ?[]const u8 = null,
     rootfs: ?spore.Rootfs = null,
     disk: ?spore.Disk = null,
+    disk_baseline_lease: ?runtime_disk_lease.Lease = null,
+    disk_fork_claim: ?DiskForkClaim = null,
     network: ?spore.Network = null,
     annotations: spore.Annotations = .{},
     sessions: []const spore.Session = &.{},
@@ -279,6 +288,11 @@ pub const Spec = struct {
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
+};
+
+pub const DiskForkClaim = struct {
+    source_socket_path: []const u8,
+    request: runtime_disk_claim.ClaimRequest,
 };
 
 pub const Ready = struct {
@@ -440,6 +454,7 @@ const ForkOptions = struct {
     source_name: []const u8,
     count: usize,
     name_pattern: []const u8,
+    allow_slow_copy: bool = false,
 };
 
 const RestoreOptions = struct {
@@ -455,12 +470,17 @@ pub const NamedForkResult = struct {
     source: []const u8,
     count: usize,
     children: []const []const u8,
+    ram_capture_ms: ?u64 = null,
+    disk_fork_ms: ?u64 = null,
+    source_pause_ms: ?u64 = null,
+    child_ready_ms: ?u64 = null,
 };
 
 pub const ForkNamedOptions = struct {
     source_name: []const u8,
     count: usize,
     name_pattern: []const u8,
+    allow_slow_copy: bool = false,
     spore_executable: []const u8 = "spore",
 };
 
@@ -920,6 +940,13 @@ pub fn restoreNamed(
         .resume_generation = resume_generation,
         .rootfs = rootfs,
         .disk = disk,
+        // Saved-spore authority moves with the spore directory. Rebind it to
+        // the resolved restore path instead of trusting the producer's old
+        // absolute publish path from lifecycle metadata.
+        .disk_baseline_lease = if (disk) |saved_disk|
+            try runtime_disk_lease.fromSavedDisk(spore_dir, saved_disk)
+        else
+            base.disk_baseline_lease,
         .network = try run_mod.manifestNetworkFromOptions(arena, network_options.network, &network_options.policy),
         .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
         .sessions = sessions,
@@ -1135,6 +1162,9 @@ fn saveContinueNamed(
     const arena = arena_state.allocator();
 
     const out_dir = try resolveNewOutputDirApi(arena, context.io, options.out_dir);
+    const temp_dir = try temporarySiblingOutputDir(arena, context.io, out_dir);
+    var cleanup_temp = true;
+    defer if (cleanup_temp) Io.Dir.cwd().deleteTree(context.io, temp_dir) catch {};
     const paths = try apiPaths(context, arena, options.name);
     const state = try classifyVmState(arena, context.io, paths, pidAlive);
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "save", options.name, state);
@@ -1147,19 +1177,17 @@ fn saveContinueNamed(
     if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
         return error.MissingRootfsIdentity;
     }
-    var ready = try readReady(arena, context.io, paths);
-    defer ready.deinit();
-    const response = try sendSnapshotRequest(arena, context.io, ready.value.control_socket_path, out_dir);
-    if (!try snapshotResponseOk(arena, response)) return error.MonitorRequestFailed;
     var snapshot_spec = spec.value;
     if (!spore.annotationsEmpty(options.annotations)) {
-        var manifest = try spore.loadManifest(arena, out_dir);
-        defer manifest.deinit();
-        manifest.value.annotations = try spore.mergeAnnotations(arena, manifest.value.annotations, options.annotations);
-        try spore.saveManifest(arena, out_dir, manifest.value);
-        snapshot_spec.annotations = manifest.value.annotations;
+        snapshot_spec.annotations = try spore.mergeAnnotations(arena, snapshot_spec.annotations, options.annotations);
     }
-    try writeSporeLifecycleSpec(arena, context.io, out_dir, snapshot_spec);
+    try Io.Dir.cwd().createDirPath(context.io, temp_dir);
+    try writeSporeLifecycleSpec(arena, context.io, temp_dir, snapshot_spec);
+    var ready = try readReady(arena, context.io, paths);
+    defer ready.deinit();
+    const response = try sendSnapshotRequest(arena, context.io, ready.value.control_socket_path, temp_dir, out_dir);
+    if (!try snapshotResponseOk(arena, response)) return error.MonitorRequestFailed;
+    cleanup_temp = false;
     return ownedNamedLifecycleResult(allocator, .{
         .action = "saved",
         .name = options.name,
@@ -1176,31 +1204,10 @@ pub fn saveNamed(
 ) !NamedLifecycleResult {
     clearLastError();
     if (options.stop) return saveStopNamed(context, allocator, options);
-
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const out_dir = try resolveNewOutputDirApi(arena, context.io, options.out_dir);
-    const temp_dir = try temporarySiblingOutputDir(arena, context.io, out_dir);
-    var cleanup_temp = true;
-    defer if (cleanup_temp) Io.Dir.cwd().deleteTree(context.io, temp_dir) catch {};
-
-    const saved = try saveContinueNamed(context, allocator, .{
+    return saveContinueNamed(context, allocator, .{
         .name = options.name,
-        .out_dir = temp_dir,
+        .out_dir = options.out_dir,
         .annotations = options.annotations,
-    });
-    defer deinitNamedLifecycleResult(allocator, saved);
-
-    try Io.Dir.renameAbsolute(temp_dir, out_dir, context.io);
-    cleanup_temp = false;
-    return ownedNamedLifecycleResult(allocator, .{
-        .action = "saved",
-        .name = options.name,
-        .state = "ready",
-        .pid = saved.pid,
-        .spore_dir = out_dir,
     });
 }
 
@@ -1237,19 +1244,32 @@ fn saveStopNamed(
         } else |_| {}
     };
     var suspend_spec = spec.value;
+    var manifest = spore.loadManifest(arena, out_dir) catch |err| switch (err) {
+        error.BadManifest => null,
+        else => |e| return e,
+    };
+    defer if (manifest) |*parsed| parsed.deinit();
+    var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
+    defer if (manifest_v1) |*parsed| parsed.deinit();
+    if (manifest == null) manifest_v1 = try spore.loadManifestV1(arena, out_dir);
     if (!spore.annotationsEmpty(options.annotations)) {
-        var manifest = try spore.loadManifest(arena, out_dir);
-        defer manifest.deinit();
-        manifest.value.annotations = try spore.mergeAnnotations(arena, manifest.value.annotations, options.annotations);
-        try spore.saveManifest(arena, out_dir, manifest.value);
-        suspend_spec.annotations = manifest.value.annotations;
+        if (manifest) |*parsed| {
+            parsed.value.annotations = try spore.mergeAnnotations(arena, parsed.value.annotations, options.annotations);
+            try spore.saveManifest(arena, out_dir, parsed.value);
+            suspend_spec.annotations = parsed.value.annotations;
+        } else if (manifest_v1) |*parsed| {
+            parsed.value.annotations = try spore.mergeAnnotations(arena, parsed.value.annotations, options.annotations);
+            try spore.saveManifestV1(arena, out_dir, parsed.value);
+            suspend_spec.annotations = parsed.value.annotations;
+        }
+    }
+    const saved_disk = if (manifest) |parsed| parsed.value.disk else manifest_v1.?.value.disk;
+    if (saved_disk) |disk| {
+        suspend_spec.disk = disk;
+        suspend_spec.disk_baseline_lease = try runtime_disk_lease.fromSavedDisk(out_dir, disk);
     }
     try writeSporeLifecycleSpec(arena, context.io, out_dir, suspend_spec);
-    const saved_sessions: usize = blk: {
-        var manifest = spore.loadManifest(arena, out_dir) catch break :blk 0;
-        defer manifest.deinit();
-        break :blk manifest.value.sessions.len;
-    };
+    const saved_sessions = if (manifest) |parsed| parsed.value.sessions.len else manifest_v1.?.value.sessions.len;
     cleanup_after_suspend = false;
     try finishAcceptedMonitorStop(context.io, paths, ready.value.pid);
     try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
@@ -1269,7 +1289,7 @@ pub fn forkNamed(
     options: ForkNamedOptions,
 ) !NamedForkResult {
     clearLastError();
-    if (options.count == 0) return error.InvalidForkCount;
+    if (options.count == 0 or options.count > runtime_disk_claim.max_children_per_batch) return error.InvalidForkCount;
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1283,9 +1303,8 @@ pub fn forkNamed(
 
     var source_spec = readSpec(arena, init.io, source_paths) catch return namedVmNotReady(arena, init.io, source_paths, "fork", options.source_name, .incomplete);
     defer source_spec.deinit();
-    if (source_spec.value.rootfs_path != null or source_spec.value.image_ref != null or source_spec.value.rootfs != null or source_spec.value.disk != null) {
-        return error.UnsupportedNamedForkDisk;
-    }
+    const disk_backed = source_spec.value.rootfs != null or source_spec.value.rootfs_path != null or source_spec.value.image_ref != null or source_spec.value.disk != null;
+    if (disk_backed and source_spec.value.rootfs == null) return error.UnsupportedNamedForkDisk;
     if (source_spec.value.network != null) return error.UnsupportedNamedForkNetwork;
 
     for (child_names) |child_name| {
@@ -1297,32 +1316,85 @@ pub fn forkNamed(
     var ready = readReady(arena, init.io, source_paths) catch return namedVmNotReady(arena, init.io, source_paths, "fork", options.source_name, .incomplete);
     defer ready.deinit();
 
-    const batch_dir = try hiddenForkBatchDir(arena, source_paths.runtime_root, options.source_name);
+    const batch_dir = try hiddenForkBatchDir(arena, source_paths.runtime_root);
     const snapshot_dir = try std.fs.path.resolve(arena, &.{ batch_dir, "source.spore" });
     const children_dir = try std.fs.path.resolve(arena, &.{ batch_dir, "children" });
     try ensureDirPath(init.io, batch_dir);
     var cleanup_batch = true;
     defer if (cleanup_batch) Io.Dir.cwd().deleteTree(init.io, batch_dir) catch {};
+    var prepared_batch: ?[]const u8 = null;
+    defer if (cleanup_batch) {
+        if (prepared_batch) |batch| sendDiskForkCancelRequest(arena, init.io, ready.value.control_socket_path, batch) catch {};
+    };
 
-    const response = try sendSnapshotRequest(arena, init.io, ready.value.control_socket_path, snapshot_dir);
-    if (!(snapshotResponseOk(arena, response) catch return error.BadMonitorResponse)) return error.MonitorRequestFailed;
-    try writeSporeLifecycleSpec(arena, init.io, snapshot_dir, source_spec.value);
-
-    _ = try spore.fork(arena, .{
-        .parent_dir = snapshot_dir,
-        .out_dir = children_dir,
-        .count = options.count,
-        .environ_map = init.environ_map,
-    });
-
+    var ram_capture_ms: ?u64 = null;
+    var disk_fork_ms: ?u64 = null;
+    var source_pause_ms: ?u64 = null;
+    var child_ready_ms: ?u64 = null;
     var started = std.array_list.Managed([]const u8).init(arena);
-    for (child_names, 0..) |child_name, index| {
-        const spore_dir = try childSporeDir(arena, children_dir, index);
-        startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable) catch |err| {
-            cleanupStartedChildren(init, arena, started.items);
-            return err;
+
+    if (disk_backed) {
+        const lease = try ensureDiskBaselineLease(arena, context, source_paths, &source_spec.value);
+        const batch_name = std.fs.path.basename(batch_dir);
+        const prepare_request = runtime_disk_fork_control.PrepareRequest{
+            .type = runtime_disk_fork_control.prepare_type,
+            .schema = runtime_disk_fork_control.prepare_schema,
+            .out_dir = snapshot_dir,
+            .batch = batch_name,
+            .children = child_names,
+            .allow_copy = options.allow_slow_copy,
         };
-        try started.append(child_name);
+        // Cancellation is idempotent and must cover a response transport
+        // failure after the source has already registered the batch.
+        prepared_batch = batch_name;
+        const response = try sendDiskForkPrepareRequest(arena, init.io, ready.value.control_socket_path, prepare_request);
+        var prepared = try parseDiskForkPreparedResponse(arena, response);
+        defer prepared.deinit();
+        try validatePreparedDiskFork(prepared.value, prepare_request, lease);
+        ram_capture_ms = prepared.value.ram_capture_ns / std.time.ns_per_ms;
+        disk_fork_ms = prepared.value.disk_fork_ns / std.time.ns_per_ms;
+        source_pause_ms = prepared.value.source_pause_ns / std.time.ns_per_ms;
+        const children_start_ms = monotonicMs();
+
+        try writeSporeLifecycleSpec(arena, init.io, snapshot_dir, source_spec.value);
+        _ = try spore.fork(arena, .{
+            .parent_dir = snapshot_dir,
+            .out_dir = children_dir,
+            .count = options.count,
+            .environ_map = init.environ_map,
+        });
+        for (child_names, prepared.value.claims, 0..) |child_name, claim, index| {
+            try started.append(child_name);
+            const spore_dir = try childSporeDir(arena, children_dir, index);
+            startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable, .{
+                .source_socket_path = ready.value.control_socket_path,
+                .batch_name = batch_name,
+                .prepared_claim = claim,
+            }) catch |err| {
+                cleanupStartedChildren(init, arena, started.items);
+                return err;
+            };
+        }
+        child_ready_ms = monotonicMs() -| children_start_ms;
+    } else {
+        const response = try sendSnapshotRequest(arena, init.io, ready.value.control_socket_path, snapshot_dir, null);
+        if (!(snapshotResponseOk(arena, response) catch return error.BadMonitorResponse)) return error.MonitorRequestFailed;
+        try writeSporeLifecycleSpec(arena, init.io, snapshot_dir, source_spec.value);
+
+        _ = try spore.fork(arena, .{
+            .parent_dir = snapshot_dir,
+            .out_dir = children_dir,
+            .count = options.count,
+            .environ_map = init.environ_map,
+        });
+        for (child_names, 0..) |child_name, index| {
+            try started.append(child_name);
+            const spore_dir = try childSporeDir(arena, children_dir, index);
+            startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable, null) catch |err| {
+                cleanupStartedChildren(init, arena, started.items);
+                return err;
+            };
+        }
     }
 
     cleanup_batch = false;
@@ -1330,6 +1402,10 @@ pub fn forkNamed(
         .source = options.source_name,
         .count = options.count,
         .children = child_names,
+        .ram_capture_ms = ram_capture_ms,
+        .disk_fork_ms = disk_fork_ms,
+        .source_pause_ms = source_pause_ms,
+        .child_ready_ms = child_ready_ms,
     });
 }
 
@@ -1889,6 +1965,7 @@ pub fn forkCli(
         .source_name = parsed.source_name,
         .count = parsed.count,
         .name_pattern = parsed.name_pattern,
+        .allow_slow_copy = parsed.allow_slow_copy,
         .spore_executable = full_args[0],
     }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "fork", err),
@@ -1914,7 +1991,7 @@ pub fn forkCli(
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "fork"), message);
         },
         error.UnsupportedNamedForkDisk => {
-            const message = "spore fork: disk-backed named live fork is not supported yet";
+            const message = "spore fork: source does not have the supported single writable rootfs disk shape";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
         },
         error.UnsupportedNamedForkNetwork => {
@@ -1932,6 +2009,14 @@ pub fn forkCli(
         error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
             const message = allocLifecycleMessage(allocator, "spore fork: monitor request failed for VM {s}: {s}", .{ parsed.source_name, @errorName(err) });
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "fork"), message);
+        },
+        error.FastForkUnavailable => {
+            const message = "spore fork: native disk cloning is unavailable; retry with --allow-slow-copy to permit a full overlay copy";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "fork"), message);
+        },
+        error.DiskForkBaselineUnavailable => {
+            const message = "spore fork: the source disk baseline is no longer complete in its bound store";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "fork"), message);
         },
         error.MonitorReadyTimeout, error.MonitorVersionMismatch, error.SporeExecutableVersionUnavailable => {
             const message = allocLifecycleLastErrorMessage(allocator, "fork", "spore fork: timed out waiting for monitor readiness");
@@ -2284,6 +2369,7 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
 }
 
 pub fn writeSpec(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec) !void {
+    try validateSpec(spec);
     try ensureVmDir(io, paths);
     const json = try std.json.Stringify.valueAlloc(allocator, spec, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
@@ -2293,11 +2379,26 @@ pub fn writeSpec(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec)
 pub fn readSpec(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.Parsed(Spec) {
     const data = try Io.Dir.cwd().readFileAlloc(io, paths.spec_path, allocator, .limited(max_metadata_bytes));
     defer allocator.free(data);
-    const parsed = try std.json.parseFromSlice(Spec, allocator, data, .{
+    var parsed = try std.json.parseFromSlice(Spec, allocator, data, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
+    errdefer parsed.deinit();
+    try validateSpec(parsed.value);
     return parsed;
+}
+
+fn validateSpec(spec: Spec) !void {
+    if (spec.disk_baseline_lease) |lease| try lease.validate();
+    if (spec.disk_fork_claim) |claim| {
+        if (!std.fs.path.isAbsolute(claim.source_socket_path)) return error.BadManifest;
+        try validateControlSocketPath(claim.source_socket_path);
+        try runtime_disk_claim.validateClaimRequest(claim.request);
+        const lease = spec.disk_baseline_lease orelse return error.BadManifest;
+        if (!std.mem.eql(u8, claim.request.child, spec.name) or
+            claim.request.baseline_kind != lease.baseline_kind or
+            !std.mem.eql(u8, claim.request.baseline_identity, lease.baseline_identity)) return error.BadManifest;
+    }
 }
 
 pub fn writeReady(allocator: std.mem.Allocator, io: Io, paths: Paths, ready: Ready) !void {
@@ -3085,6 +3186,7 @@ fn parseForkArgs(
     var source_name: ?[]const u8 = null;
     var count: ?usize = null;
     var name_pattern: ?[]const u8 = null;
+    var allow_slow_copy = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -3096,6 +3198,8 @@ fn parseForkArgs(
             count = parseIntArgLifecycleCli(usize, allocator, stderr, mode, "fork", takeValueLifecycleCli(allocator, stderr, mode, "fork", args, &i, flag), flag);
         } else if (std.mem.eql(u8, args[i], "--name")) {
             name_pattern = takeValueLifecycleCli(allocator, stderr, mode, "fork", args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--allow-slow-copy")) {
+            allow_slow_copy = true;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             const message = allocLifecycleMessage(allocator, "unknown fork argument: {s}", .{args[i]});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
@@ -3118,10 +3222,15 @@ fn parseForkArgs(
         const message = "spore fork: --count must be a positive integer";
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
     }
+    if (count.? > runtime_disk_claim.max_children_per_batch) {
+        const message = "spore fork: --count cannot exceed 32";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+    }
     return .{
         .source_name = source_name.?,
         .count = count.?,
         .name_pattern = name_pattern.?,
+        .allow_slow_copy = allow_slow_copy,
     };
 }
 
@@ -3273,27 +3382,32 @@ fn pathExists(io: Io, path: []const u8) !bool {
     return true;
 }
 
-fn writeSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8, spec: Spec) !void {
+pub fn writeSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8, spec: Spec) !void {
+    try validateSpec(spec);
     const path = try std.fs.path.resolve(allocator, &.{ dir, lifecycle_spore_metadata_file });
+    defer allocator.free(path);
     var metadata = spec;
     metadata.resume_dir = null;
     metadata.resume_generation = null;
+    metadata.disk_fork_claim = null;
     const json = try std.json.Stringify.valueAlloc(allocator, metadata, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
-fn readSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8) !?std.json.Parsed(Spec) {
+pub fn readSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8) !?std.json.Parsed(Spec) {
     const path = try std.fs.path.resolve(allocator, &.{ dir, lifecycle_spore_metadata_file });
     const data = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_metadata_bytes)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => |e| return e,
     };
     defer allocator.free(data);
-    const parsed = try std.json.parseFromSlice(Spec, allocator, data, .{
+    var parsed = try std.json.parseFromSlice(Spec, allocator, data, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
+    errdefer parsed.deinit();
+    try validateSpec(parsed.value);
     return parsed;
 }
 
@@ -3374,15 +3488,114 @@ fn renderForkName(
     return out;
 }
 
-fn hiddenForkBatchDir(allocator: std.mem.Allocator, runtime_root: []const u8, source_name: []const u8) ![]const u8 {
-    const pid: i64 = if (comptime builtin.os.tag == .windows) 1 else @intCast(std.c.getpid());
-    const leaf = try std.fmt.allocPrint(allocator, "{s}-{d}-{d}", .{ source_name, pid, monotonicMs() });
-    return std.fs.path.resolve(allocator, &.{ runtime_root, "forks", leaf });
+fn hiddenForkBatchDir(allocator: std.mem.Allocator, runtime_root: []const u8) ![]const u8 {
+    const token = try runtime_disk_claim.randomToken();
+    var token_hex: [runtime_disk_claim.token_hex_bytes]u8 = undefined;
+    var leaf: ["fork-".len + 32]u8 = undefined;
+    @memcpy(leaf[0.."fork-".len], "fork-");
+    @memcpy(leaf["fork-".len..], runtime_disk_claim.formatTokenHex(token, &token_hex)[0..32]);
+    return std.fs.path.resolve(allocator, &.{ runtime_root, "forks", &leaf });
+}
+
+fn ensureDiskBaselineLease(
+    allocator: std.mem.Allocator,
+    context: Context,
+    paths: Paths,
+    spec: *Spec,
+) !runtime_disk_lease.Lease {
+    const rootfs = spec.rootfs orelse return error.UnsupportedNamedForkDisk;
+    const lease: runtime_disk_lease.Lease = spec.disk_baseline_lease orelse if (spec.disk) |disk| blk: {
+        if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index) or disk.layers.len != 0) return error.UnsupportedNamedForkDisk;
+        try spore.validateDiskDigest(disk.base);
+        const resume_dir = spec.resume_dir orelse return error.UnsupportedNamedForkDisk;
+        const root = try std.fs.path.resolve(allocator, &.{resume_dir});
+        const forks_root = try std.fs.path.resolve(allocator, &.{ paths.runtime_root, "forks" });
+        if (pathWithin(forks_root, root)) return error.UnsupportedNamedForkDisk;
+        break :blk .{
+            .store = .saved_spore,
+            .root = root,
+            .baseline_kind = .disk_index,
+            .baseline_identity = disk.base,
+        };
+    } else if (rootfs.storage) |storage| blk: {
+        try spore.validateRootfsStorageDescriptor(storage);
+        const cache_root = try local_paths.rootfsCacheRootPath(allocator, context.environ_map);
+        break :blk .{
+            .store = .rootfs_cache,
+            .root = cache_root,
+            .baseline_kind = .disk_index,
+            .baseline_identity = storage.index_digest,
+            .rootfs_storage = storage,
+        };
+    } else blk: {
+        try spore.validateRootfsDigest(rootfs.artifact.digest);
+        const cache_root = try local_paths.rootfsCacheRootPath(allocator, context.environ_map);
+        break :blk .{
+            .store = .rootfs_cache,
+            .root = cache_root,
+            .baseline_kind = .rootfs,
+            .baseline_identity = rootfs.artifact.digest,
+        };
+    };
+    try lease.validate();
+    spec.disk_baseline_lease = lease;
+    if (lease.store == .rootfs_cache) {
+        var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, lease.root);
+        defer cache_lock.deinit();
+        switch (lease.baseline_kind) {
+            .rootfs => {
+                const fd = rootfs_cache.openTrustedFromCache(context.io, allocator, lease.root, rootfs) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.DiskForkBaselineUnavailable,
+                };
+                _ = std.c.close(fd);
+            },
+            .disk_index => {
+                const storage = lease.rootfs_storage orelse return error.BadManifest;
+                if (!try rootfs_cas.storageMarkedComplete(context.io, allocator, lease.root, storage)) return error.DiskForkBaselineUnavailable;
+            },
+        }
+        // Publish the root while holding the same lock used by GC/prune. A
+        // collector that started first wins and is verified above; every
+        // collector that starts later observes the lease.
+        try writeSpec(allocator, context.io, paths, spec.*);
+    } else {
+        try writeSpec(allocator, context.io, paths, spec.*);
+    }
+    return lease;
+}
+
+fn validatePreparedDiskFork(
+    response: runtime_disk_fork_control.PreparedResponse,
+    request: runtime_disk_fork_control.PrepareRequest,
+    lease: runtime_disk_lease.Lease,
+) !void {
+    if (!std.mem.eql(u8, response.batch, request.batch) or
+        !std.mem.eql(u8, response.capture_dir, request.out_dir) or
+        response.claims.len != request.children.len) return error.BadMonitorResponse;
+    for (response.claims, request.children) |claim, child| {
+        if (!std.mem.eql(u8, claim.child, child) or
+            claim.baseline_kind != lease.baseline_kind or
+            !std.mem.eql(u8, claim.baseline_identity, lease.baseline_identity)) return error.BadMonitorResponse;
+    }
+}
+
+fn pathWithin(parent: []const u8, child: []const u8) bool {
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    if (child.len == parent.len) return true;
+    if (parent.len != 0 and parent[parent.len - 1] == std.fs.path.sep) return true;
+    return child[parent.len] == std.fs.path.sep;
 }
 
 fn childSporeDir(allocator: std.mem.Allocator, children_dir: []const u8, index: usize) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/{d:0>6}", .{ children_dir, index });
 }
+
+const ForkChildDiskClaim = struct {
+    source_socket_path: []const u8,
+    batch_name: []const u8,
+    prepared_claim: runtime_disk_fork_control.PreparedClaim,
+};
 
 fn startForkChildExecutable(
     init: std.process.Init,
@@ -3391,7 +3604,9 @@ fn startForkChildExecutable(
     spore_dir: []const u8,
     base: Spec,
     spore_executable: []const u8,
+    disk_claim: ?ForkChildDiskClaim,
 ) !void {
+    if ((base.rootfs != null) != (disk_claim != null)) return error.UnsupportedNamedForkDisk;
     var manifest = spore.loadManifest(allocator, spore_dir) catch |err| switch (err) {
         error.BadManifest => null,
         else => return error.InvalidSporeDir,
@@ -3406,16 +3621,36 @@ fn startForkChildExecutable(
     const network = if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network;
     if (network != null) return error.UnsupportedNamedForkNetwork;
     const devices_len = if (manifest) |parsed| parsed.value.devices.len else manifest_v1.?.value.devices.len;
-    if (devices_len != diskless_resume_device_count) return error.UnsupportedNamedForkDisk;
+    const expected_devices = diskless_resume_device_count + @as(usize, @intFromBool(base.rootfs != null));
+    if (devices_len != expected_devices) return error.UnsupportedNamedForkDisk;
+    const captured_disk = if (manifest) |parsed| parsed.value.disk else manifest_v1.?.value.disk;
+    if (captured_disk != null) return error.UnsupportedNamedForkDisk;
     const ram_size = if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size;
     const memory = try memory_config.fromManifestBytes(ram_size);
     const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else @as(topology.VcpuCount, 1);
+    const fork_claim: ?DiskForkClaim = if (disk_claim) |claim| .{
+        .source_socket_path = claim.source_socket_path,
+        .request = .{
+            .type = runtime_disk_claim.claim_type,
+            .schema = runtime_disk_claim.claim_schema,
+            .token = claim.prepared_claim.token,
+            .batch = claim.batch_name,
+            .child = claim.prepared_claim.child,
+            .child_index = claim.prepared_claim.child_index,
+            .baseline_kind = claim.prepared_claim.baseline_kind,
+            .baseline_identity = claim.prepared_claim.baseline_identity,
+        },
+    } else null;
     const spec = Spec{
         .name = child_name,
         .backend = base.backend,
         .kernel_path = base.kernel_path,
         .initrd_path = base.initrd_path,
         .resume_dir = spore_dir,
+        .rootfs = base.rootfs,
+        .disk = base.disk,
+        .disk_baseline_lease = base.disk_baseline_lease,
+        .disk_fork_claim = fork_claim,
         .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
         .sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions,
         .memory = memory,
@@ -3425,6 +3660,7 @@ fn startForkChildExecutable(
         .console_log_path = null,
     };
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, allocator, child_name);
+    try writeSpec(allocator, init.io, paths, spec);
     const spore_executable_path = try spawnMonitorExecutable(init, allocator, paths, spec, spore_executable, null);
     try waitForReadyResult(allocator, init.io, paths, spec.timeout_ms, spore_executable_path);
 }
@@ -3433,6 +3669,9 @@ fn cleanupStartedChildren(init: std.process.Init, allocator: std.mem.Allocator, 
     for (names) |name| {
         const paths = pathsFor(allocator, init.environ_map, name) catch continue;
         var ready = readReady(allocator, init.io, paths) catch {
+            if (readPid(allocator, init.io, paths)) |pid| {
+                finishMonitorPidExit(paths, pid) catch {};
+            } else |_| {}
             Io.Dir.cwd().deleteTree(init.io, paths.vm_dir) catch {};
             continue;
         };
@@ -4164,15 +4403,68 @@ fn sendSuspendRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const
     return sendControlJson(allocator, io, socket_path, json);
 }
 
-fn sendSnapshotRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, out_dir: []const u8) ![]const u8 {
+fn sendSnapshotRequest(
+    allocator: std.mem.Allocator,
+    io: Io,
+    socket_path: []const u8,
+    out_dir: []const u8,
+    publish_dir: ?[]const u8,
+) ![]const u8 {
     const payload = struct {
         type: []const u8 = "snapshot",
         out_dir: []const u8,
+        publish_dir: ?[]const u8,
         @"continue": bool = true,
-    }{ .out_dir = out_dir };
+    }{ .out_dir = out_dir, .publish_dir = publish_dir };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
     return sendControlJson(allocator, io, socket_path, json);
+}
+
+fn sendDiskForkPrepareRequest(
+    allocator: std.mem.Allocator,
+    io: Io,
+    socket_path: []const u8,
+    request: runtime_disk_fork_control.PrepareRequest,
+) ![]const u8 {
+    try runtime_disk_fork_control.validatePrepare(request);
+    const json = try std.json.Stringify.valueAlloc(allocator, request, .{});
+    defer allocator.free(json);
+    if (json.len + 1 > runtime_disk_claim.max_claim_request_bytes) return error.ControlRequestTooLarge;
+    return sendControlJson(allocator, io, socket_path, json);
+}
+
+fn sendDiskForkCancelRequest(
+    allocator: std.mem.Allocator,
+    io: Io,
+    socket_path: []const u8,
+    batch: []const u8,
+) !void {
+    const request = runtime_disk_fork_control.CancelRequest{
+        .type = runtime_disk_fork_control.cancel_type,
+        .schema = runtime_disk_fork_control.cancel_schema,
+        .batch = batch,
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, request, .{});
+    defer allocator.free(json);
+    _ = try sendControlJson(allocator, io, socket_path, json);
+}
+
+fn parseDiskForkPreparedResponse(
+    allocator: std.mem.Allocator,
+    response: []const u8,
+) !std.json.Parsed(runtime_disk_fork_control.PreparedResponse) {
+    var envelope = std.json.parseFromSlice(ControlResponse, allocator, response, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return error.BadMonitorResponse;
+    defer envelope.deinit();
+    if (std.mem.eql(u8, envelope.value.type, "error")) {
+        const message = envelope.value.message orelse "monitor request failed";
+        if (std.mem.endsWith(u8, message, "FastForkUnavailable")) return error.FastForkUnavailable;
+        return monitorRequestFailed(message);
+    }
+    return runtime_disk_fork_control.parsePreparedBytes(allocator, response) catch return error.BadMonitorResponse;
 }
 
 fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, json: []const u8) ![]const u8 {
@@ -4550,6 +4842,10 @@ fn ownedNamedForkResult(allocator: std.mem.Allocator, result: NamedForkResult) !
         .source = source,
         .count = result.count,
         .children = children,
+        .ram_capture_ms = result.ram_capture_ms,
+        .disk_fork_ms = result.disk_fork_ms,
+        .source_pause_ms = result.source_pause_ms,
+        .child_ready_ms = result.child_ready_ms,
     };
 }
 
@@ -5452,6 +5748,15 @@ test "lifecycle renders fork name patterns" {
     try std.testing.expectError(error.InvalidVMName, renderForkNames(allocator, "-worker", 1));
 }
 
+test "runtime fork batch paths use bounded claim-safe names" {
+    const allocator = std.testing.allocator;
+    const path = try hiddenForkBatchDir(allocator, "/tmp/sporevm-runtime");
+    defer allocator.free(path);
+    const batch = std.fs.path.basename(path);
+    try std.testing.expect(runtime_disk_claim.validBindingName(batch, runtime_disk_claim.max_batch_name_bytes));
+    try std.testing.expect(std.mem.startsWith(u8, batch, "fork-"));
+}
+
 test "lifecycle fork help routes through named fork cli" {
     try std.testing.expect(wantsNamedFork(&.{"--help"}));
     try std.testing.expect(wantsNamedFork(&.{"-h"}));
@@ -5461,7 +5766,8 @@ test "lifecycle fork help routes through named fork cli" {
     try std.testing.expect(!wantsHelp(&.{ "bench-1", "--", "/bin/true", "--help" }));
     try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fork <spore-dir> --count N --out DIR") != null);
     try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fork --vm NAME --count N --name PATTERN") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fork_usage, "Live --vm fork does not support disk-backed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fork_usage, "supports one writable rootfs disk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fork_usage, "--allow-slow-copy") != null);
     try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fanout children --for 10s") != null);
 }
 
@@ -5559,6 +5865,12 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
             .allow_cidrs = &.{"93.184.216.34/32"},
             .allow_hosts = &.{"example.com"},
         },
+        .disk_baseline_lease = .{
+            .store = .rootfs_cache,
+            .root = "/cache",
+            .baseline_kind = .rootfs,
+            .baseline_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
         .memory = .{ .policy = .explicit, .bytes = 512 * 1024 * 1024 },
     });
     var spec = try readSpec(allocator, io, paths);
@@ -5568,6 +5880,8 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
     try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", spec.value.image_ref.?);
     try std.testing.expectEqualStrings("93.184.216.34/32", spec.value.network.?.allow_cidrs[0]);
     try std.testing.expectEqualStrings("example.com", spec.value.network.?.allow_hosts[0]);
+    try std.testing.expectEqual(runtime_disk_lease.Store.rootfs_cache, spec.value.disk_baseline_lease.?.store);
+    try std.testing.expectEqualStrings("/cache", spec.value.disk_baseline_lease.?.root);
     try std.testing.expectEqual(memory_config.Policy.explicit, spec.value.memory.policy);
     try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), spec.value.memory.bytes);
 
@@ -5583,6 +5897,51 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
 
     try writePid(allocator, io, paths, 1234);
     try std.testing.expectEqual(@as(i64, 1234), try readPid(allocator, io, paths));
+}
+
+test "durable lifecycle metadata drops transient disk fork claims" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/test-lifecycle-transient-disk-fork-claim";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+
+    const digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const token = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    try writeSporeLifecycleSpec(allocator, io, dir, .{
+        .name = "child",
+        .disk_baseline_lease = .{
+            .store = .rootfs_cache,
+            .root = "/cache",
+            .baseline_kind = .rootfs,
+            .baseline_identity = digest,
+        },
+        .disk_fork_claim = .{
+            .source_socket_path = "/tmp/source.sock",
+            .request = .{
+                .type = runtime_disk_claim.claim_type,
+                .schema = runtime_disk_claim.claim_schema,
+                .token = token,
+                .batch = "batch",
+                .child = "child",
+                .child_index = 0,
+                .baseline_kind = .rootfs,
+                .baseline_identity = digest,
+            },
+        },
+    });
+
+    const bytes = try Io.Dir.cwd().readFileAlloc(
+        io,
+        dir ++ "/" ++ lifecycle_spore_metadata_file,
+        allocator,
+        .limited(max_metadata_bytes),
+    );
+    defer allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, token) == null);
+    var parsed = try std.json.parseFromSlice(Spec, allocator, bytes, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.disk_fork_claim == null);
 }
 
 test "lifecycle monitor stop distinguishes accepted socket close from pid exit" {
