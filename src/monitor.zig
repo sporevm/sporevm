@@ -123,10 +123,6 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         std.debug.print("spore monitor: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64\n", .{});
         std.process.exit(2);
     }
-    if (opts.image_ref != null and opts.rootfs_path == null) {
-        std.debug.print("spore monitor: --image is metadata only; pass a resolved --rootfs path\n", .{});
-        std.process.exit(2);
-    }
     if (opts.resume_dir != null and opts.rootfs_path != null) {
         std.debug.print("spore monitor: direct --resume with --rootfs is not supported; use lifecycle metadata for disk-backed named resume\n", .{});
         std.process.exit(2);
@@ -151,6 +147,10 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     };
     defer if (existing_spec) |*spec| spec.deinit();
     const spec_rootfs = if (existing_spec) |spec| spec.value.rootfs else null;
+    if (!monitorImageRootfsAvailable(opts.image_ref, opts.rootfs_path, spec_rootfs != null)) {
+        std.debug.print("spore monitor: --image requires an explicit --rootfs path or lifecycle rootfs metadata\n", .{});
+        std.process.exit(2);
+    }
     const spec_disk = if (existing_spec) |spec| spec.value.disk else null;
     const spec_resume_generation = if (existing_spec) |spec| spec.value.resume_generation else null;
     const spec_resume_generation_params = if (spec_resume_generation) |state| blk: {
@@ -256,6 +256,10 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         thread.join();
         return err;
     }
+}
+
+fn monitorImageRootfsAvailable(image_ref: ?[]const u8, rootfs_path: ?[]const u8, lifecycle_rootfs: bool) bool {
+    return image_ref == null or rootfs_path != null or lifecycle_rootfs;
 }
 
 const StartupMetadata = struct {
@@ -1571,6 +1575,13 @@ test "monitor cli help accepts help after name" {
     try std.testing.expect(wantsHelp(&.{ "bench-1", "--help" }));
     try std.testing.expect(!wantsHelp(&.{"bench-1"}));
     try std.testing.expect(!wantsHelp(&.{ "help", "--backend", "auto" }));
+}
+
+test "monitor image handoff accepts lifecycle rootfs metadata" {
+    try std.testing.expect(monitorImageRootfsAvailable("local/buildkite-spore:dev", null, true));
+    try std.testing.expect(monitorImageRootfsAvailable("local/buildkite-spore:dev", "/tmp/rootfs.ext4", false));
+    try std.testing.expect(!monitorImageRootfsAvailable("local/buildkite-spore:dev", null, false));
+    try std.testing.expect(monitorImageRootfsAvailable(null, null, false));
 }
 
 test "readiness probe accepts current and bounded legacy guest replies" {

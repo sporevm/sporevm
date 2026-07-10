@@ -226,6 +226,22 @@ pub fn writeFileAtomicDurable(
         else => return error.IoFailed,
     }
 
+    try replaceFileAtomicDurable(allocator, path, data, mode);
+}
+
+/// Durable mutable-record publication: write a temp file, fsync it, rename it
+/// over any prior regular file, then fsync the containing directory. Use this
+/// only for derived cache mappings whose value may legitimately change; CAS
+/// objects and indexes must keep using `writeFileAtomicDurable`.
+pub fn replaceFileAtomicDurable(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    data: []const u8,
+    mode: c_uint,
+) Error!void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
     const parent = std.fs.path.dirname(path) orelse ".";
     try ensureDirPath(allocator, parent);
 
@@ -552,4 +568,18 @@ test "durable atomic publish verifies existing data" {
     try writeFileAtomicDurable(allocator, path, "abc", 0o444);
     try writeFileAtomicDurable(allocator, path, "abc", 0o444);
     try std.testing.expectError(error.BadChunk, writeFileAtomicDurable(allocator, path, "def", 0o444));
+}
+
+test "durable atomic replace updates existing data" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/record.json", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
+
+    try replaceFileAtomicDurable(allocator, path, "first", 0o444);
+    try replaceFileAtomicDurable(allocator, path, "second", 0o444);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(64));
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("second", bytes);
 }

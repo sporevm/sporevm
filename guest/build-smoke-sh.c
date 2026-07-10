@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -40,6 +41,8 @@ static int file_exists(const char *path) {
 static int path_absent(const char *path) {
   return access(path, F_OK) != 0 && errno == ENOENT;
 }
+
+static int symlink_target_is(const char *path, const char *expected);
 
 static void sleep_ms(long milliseconds) {
   struct timespec delay = {
@@ -105,6 +108,39 @@ static int verify_background_reaped(void) {
     return 7;
   }
   write_str(1, "verify-background-reaped\n");
+  return 0;
+}
+
+static int verify_clock(void) {
+  struct timespec now;
+  if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec < 1600000000) {
+    write_str(2, "build-smoke-sh: realtime clock was not restored\n");
+    return 7;
+  }
+  write_str(1, "verify-clock\n");
+  return 0;
+}
+
+static int verify_dev(void) {
+  struct statfs fs;
+  if (statfs("/dev/pts", &fs) != 0 || (unsigned long)fs.f_type != 0x1cd1UL) {
+    write_str(2, "build-smoke-sh: /dev/pts is not devpts\n");
+    return 7;
+  }
+  if (!symlink_target_is("/dev/fd", "/proc/self/fd") ||
+      !symlink_target_is("/dev/stdin", "/proc/self/fd/0") ||
+      !symlink_target_is("/dev/stdout", "/proc/self/fd/1") ||
+      !symlink_target_is("/dev/stderr", "/proc/self/fd/2") ||
+      !symlink_target_is("/dev/ptmx", "pts/ptmx")) {
+    write_str(2, "build-smoke-sh: rootfs /dev links are incomplete\n");
+    return 7;
+  }
+  int ptmx = open("/dev/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
+  if (ptmx < 0 || close(ptmx) != 0) {
+    write_str(2, "build-smoke-sh: /dev/ptmx is unusable\n");
+    return 7;
+  }
+  write_str(1, "verify-dev\n");
   return 0;
 }
 
@@ -309,6 +345,12 @@ int main(int argc, char **argv) {
   if (strcmp(cmd, "resize2fs /dev/vda") == 0) {
     write_str(1, "resize2fs\n");
     return 0;
+  }
+  if (strcmp(cmd, "verify-clock") == 0) {
+    return verify_clock();
+  }
+  if (strcmp(cmd, "verify-dev") == 0) {
+    return verify_dev();
   }
   if (strcmp(cmd, "spawn-background") == 0) {
     return spawn_background_writer();
