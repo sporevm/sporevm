@@ -135,7 +135,17 @@ fn monotonicMs() Error!u64 {
 }
 
 pub fn createTempOverlay(allocator: std.mem.Allocator) Error!TempOverlay {
-    const template = try allocator.dupeZ(u8, chunk_mapped_disk.runtime_overlay_dir ++ "/sporevm-disk-head-XXXXXX");
+    return createTempOverlayAt(allocator, chunk_mapped_disk.runtime_overlay_dir);
+}
+
+pub fn createTempOverlayAt(allocator: std.mem.Allocator, dir: []const u8) Error!TempOverlay {
+    if (dir.len == 0) return error.BadOverlay;
+    const template = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/sporevm-disk-head-XXXXXX",
+        .{std.mem.trimEnd(u8, dir, "/")},
+        0,
+    );
     defer allocator.free(template);
     const fd = mkstemp(template.ptr);
     if (fd < 0) return error.IoFailed;

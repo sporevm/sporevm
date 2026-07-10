@@ -185,7 +185,7 @@ run = "mise run build:release && scripts/benchmark/writable-rootfs.sh --iteratio
 description = "Benchmark writable rootfs COW, sealed append, and replay paths"
 
 [tasks."benchmark:disk-fork"]
-run = "SPOREVM_DISK_FORK_BENCHMARK=1 zig test src/chunk_mapped_disk.zig -O ReleaseFast --test-filter 'disk fork benchmark'"
+run = "SPOREVM_DISK_FORK_BENCHMARK=1 zig test src/chunk_mapped_disk.zig -O ReleaseFast -lc --test-filter 'disk fork benchmark'"
 description = "Benchmark native disk-head cloning, 32-child preparation, and generation-32 reads"
 
 [tasks."smoke:local-pull"]

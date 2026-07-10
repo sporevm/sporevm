@@ -1,6 +1,7 @@
 //! Runtime rootfs and writable disk planner shared by run and resume paths.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const block_source = @import("block_source.zig");
 const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
@@ -70,6 +71,7 @@ pub const RuntimeDisk = struct {
         if (disk.overlay_fd != overlay.fd) return error.BadManifest;
 
         const claimed_fd = head.overlay_fd;
+        if (!try sameFilesystem(overlay.fd, claimed_fd)) return error.BadOverlay;
         const replaced_fd = try disk.applyForkDescriptor(head.descriptor, claimed_fd);
         head.overlay_fd = -1;
         overlay.fd = claimed_fd;
@@ -132,10 +134,11 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         if (disk.chunk_size != spore.disk_chunk_size) return error.BadManifest;
         if (!std.mem.eql(u8, disk.hash_algorithm, spore.rootfs_storage_hash_algorithm_blake3)) return error.BadManifest;
         if (!std.mem.eql(u8, disk.object_namespace, spore.rootfs_storage_object_namespace)) return error.BadManifest;
-        runtime.rootfs_fd = try createSparseTempFd(allocator, disk.size);
+        runtime.rootfs_fd = try createSparseTempFd(context, allocator, disk.size);
         const base_source = try runtime.baseSource(disk.size);
-        runtime.overlay = try disk_layer.createTempOverlay(allocator);
-        runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, disk.size, disk.chunk_size);
+        const writable = try openWritable(context, allocator, base_source, disk.size, disk.chunk_size);
+        runtime.overlay = writable.overlay;
+        runtime.chunk_mapped = writable.disk;
         var parsed = try readDiskIndex(context, allocator, disk_root, diskStorageDescriptor(disk));
         defer parsed.deinit();
         try runtime.chunk_mapped.?.attachCasIndex(disk_root, parsed.value);
@@ -176,16 +179,17 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
     if (runtime.rootfs_fd == null and rootfs_lazy_storage == null) return runtime;
 
     if (options.rootfs) |rootfs| {
-        runtime.overlay = try disk_layer.createTempOverlay(allocator);
         const base = diskFromRootfs(rootfs);
         if (runtime.rootfs_fd == null) {
             const storage = rootfs_lazy_storage orelse return error.BadManifest;
             const grown_size = try grownRootfsSize(storage.logical_size, storage.chunk_size, options.rootfs_grow_target);
-            runtime.rootfs_fd = try createSparseTempFd(allocator, grown_size);
+            runtime.rootfs_fd = try createSparseTempFd(context, allocator, grown_size);
             const cache_root = try baselineRootPath(context, allocator, options.disk_root);
             defer allocator.free(cache_root);
             const base_source = try runtime.baseSource(grown_size);
-            runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, storage.logical_size, storage.chunk_size);
+            const writable = try openWritable(context, allocator, base_source, storage.logical_size, storage.chunk_size);
+            runtime.overlay = writable.overlay;
+            runtime.chunk_mapped = writable.disk;
             var parsed = try readDiskIndex(context, allocator, cache_root, storage);
             defer parsed.deinit();
             try runtime.chunk_mapped.?.attachCasIndex(cache_root, parsed.value);
@@ -195,7 +199,9 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             return runtime;
         }
         const base_source = try runtime.baseSource(base.size);
-        runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, runtime.overlay.?.fd, base.size, base.chunk_size);
+        const writable = try openWritable(context, allocator, base_source, base.size, base.chunk_size);
+        runtime.overlay = writable.overlay;
+        runtime.chunk_mapped = writable.disk;
         if (rootfs.storage) |storage| {
             const cache_root = try baselineRootPath(context, allocator, options.disk_root);
             defer allocator.free(cache_root);
@@ -214,6 +220,65 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
     }
 
     return runtime;
+}
+
+const WritableDisk = struct {
+    overlay: disk_layer.TempOverlay,
+    disk: chunk_mapped_disk.ChunkMappedDisk,
+};
+
+fn openWritable(
+    context: Context,
+    allocator: std.mem.Allocator,
+    base: block_source.FileBlockSource,
+    size: u64,
+    chunk_size: u64,
+) !WritableDisk {
+    const overlay_dir = try local_paths.runtimeOverlayRootPath(allocator, context.environ_map);
+    defer allocator.free(overlay_dir);
+    var overlay = try disk_layer.createTempOverlayAt(allocator, overlay_dir);
+    errdefer overlay.deinit();
+    const disk = try chunk_mapped_disk.ChunkMappedDisk.initWritableAt(
+        allocator,
+        base,
+        overlay.fd,
+        overlay_dir,
+        size,
+        chunk_size,
+    );
+    return .{ .overlay = overlay, .disk = disk };
+}
+
+fn sameFilesystem(a: std.c.fd_t, b: std.c.fd_t) !bool {
+    return try filesystemDevice(a) == try filesystemDevice(b);
+}
+
+fn filesystemDevice(fd: std.c.fd_t) !u64 {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var stat: linux.Statx = undefined;
+        const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stat);
+        if (linux.errno(rc) != .SUCCESS) return error.IoFailed;
+        return (@as(u64, stat.dev_major) << 32) | stat.dev_minor;
+    }
+    var stat: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &stat) != 0) return error.IoFailed;
+    return @intCast(stat.dev);
+}
+
+test "filesystem identity distinguishes Linux anonymous backing" {
+    var overlay = try disk_layer.createTempOverlay(std.testing.allocator);
+    defer overlay.deinit();
+    try std.testing.expect(try sameFilesystem(overlay.fd, overlay.fd));
+
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.memfd_create("sporevm-filesystem-test", linux.MFD.CLOEXEC);
+        if (linux.errno(rc) != .SUCCESS) return error.IoFailed;
+        const memfd: std.c.fd_t = @intCast(rc);
+        defer _ = std.c.close(memfd);
+        try std.testing.expect(!try sameFilesystem(overlay.fd, memfd));
+    }
 }
 
 fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.c.fd_t {
@@ -235,8 +300,10 @@ fn fdSize(fd: std.c.fd_t) !u64 {
     return @intCast(end);
 }
 
-fn createSparseTempFd(allocator: std.mem.Allocator, size: u64) !std.c.fd_t {
-    var temp = try disk_layer.createTempOverlay(allocator);
+fn createSparseTempFd(context: Context, allocator: std.mem.Allocator, size: u64) !std.c.fd_t {
+    const overlay_dir = try local_paths.runtimeOverlayRootPath(allocator, context.environ_map);
+    defer allocator.free(overlay_dir);
+    var temp = try disk_layer.createTempOverlayAt(allocator, overlay_dir);
     errdefer temp.deinit();
     const logical_size = std.math.cast(std.c.off_t, size) orelse return error.BadManifest;
     if (std.c.ftruncate(temp.fd, logical_size) != 0) return error.IoFailed;
@@ -533,7 +600,10 @@ test "runtime disk exports and adopts a portable fork head" {
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
     const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const absolute_tmp_root = try std.fs.path.resolve(arena, &.{ cwd, tmp });
     try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    try env.put("TMPDIR", absolute_tmp_root);
     const context = Context{ .io = io, .environ_map = &env };
     const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
 
@@ -541,6 +611,8 @@ test "runtime disk exports and adopts a portable fork head" {
     defer parent.deinit();
     var child = try open(context, allocator, .{ .rootfs = rootfs });
     defer child.deinit();
+    try std.testing.expectEqualStrings(absolute_tmp_root, parent.chunk_mapped.?.overlay_dir.?);
+    try std.testing.expectEqualStrings(absolute_tmp_root, child.chunk_mapped.?.overlay_dir.?);
 
     const parent_patch = [_]u8{0xA5} ** 97;
     try parent.chunk_mapped.?.writeAt(&parent_patch, spore.disk_chunk_size - 17);

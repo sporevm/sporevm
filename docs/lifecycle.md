@@ -225,6 +225,12 @@ snapshot. Native APFS or Linux reflink cloning is required by default. Use
 `--allow-slow-copy` only when a full dirty-overlay copy is acceptable; without
 that explicit opt-in, unavailable native cloning fails closed.
 
+Anonymous writable overlays, fork heads, and lazy sparse rootfs bases use the
+absolute `TMPDIR` when it is set, falling back to `/tmp`. Put `TMPDIR` on the
+reflink-capable scratch filesystem intended for fast fork. SporeVM retains that
+factory root with each live writable disk and rejects a claimed child overlay
+from a different filesystem before publishing readiness.
+
 Each child receives a private one-use disk-head claim plus an independently
 rooted baseline lease. The child reopens that baseline and adopts the claimed
 overlay before it writes `ready.json`, so a successful fork never reports a

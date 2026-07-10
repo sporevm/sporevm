@@ -18,6 +18,9 @@ children can fork again or save/restore normally. `spore --json fork` and
 and child readiness phases separately. Monitor-generated guest session IDs now
 include a per-process random nonce, preventing a restored or forked guest from
 replaying a source monitor's cached first exec response.
+Writable overlays and lazy sparse rootfs bases now follow absolute `TMPDIR`,
+so Linux hosts can place the fast-fork path on reflink-capable scratch storage;
+child adoption rejects a head from a different filesystem before readiness.
 
 `spore run --image SOURCE --commit local/name:tag -- COMMAND` can now publish a
 successful one-shot run's writable root disk as an indexed local image. The

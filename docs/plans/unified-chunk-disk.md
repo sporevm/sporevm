@@ -50,10 +50,10 @@ manifest formats to do so.
 > **Current state (2026-07-10): U6 is implemented in branch.** Disk-backed
 > `spore fork --vm` now uses the live monitor/VMM quiescence boundary, one-use
 > fd claims, independently rooted child baselines, and readiness-after-adoption.
-> The maintained product smoke passes on APFS/HVF; the same smoke and native
-> clone path still need their final real-hardware Linux/KVM run. U7's deferred
-> filler and boot-priority work, packfiles, and RAM/disk store convergence are
-> separate evidence-gated follow-ups, not incomplete U6 implementation.
+> The maintained product smoke and native clone path pass on APFS/HVF and on a
+> real ARM64 Linux/KVM `c7gd.metal` host. U7's deferred filler and boot-priority
+> work, packfiles, and RAM/disk store convergence are separate evidence-gated
+> follow-ups, not incomplete U6 implementation.
 
 ## Product Goals This Serves
 
@@ -386,10 +386,10 @@ At end state:
 ## Delivery Strategy
 
 All planned implementation slices have landed in branch. U6, production
-disk-backed named fast fork, is locally proven on APFS/HVF; its remaining
-platform evidence is the maintained product smoke on a reflink-capable
-Linux/KVM host. It has no prerequisite from the remaining evidence-gated U7
-follow-ups or the open store/packing questions.
+disk-backed named fast fork, is proven on APFS/HVF and by the maintained
+product smoke on a reflink-capable Linux/KVM host. Its platform evidence is
+complete, with no prerequisite from the remaining evidence-gated U7 follow-ups
+or the open store/packing questions.
 `docs/plans/spore-build.md` was revived after the unified storage primitives
 landed and now consumes them as a separate active workstream. Dirty tracking
 and incremental index maintenance — previously drafted as a separate plan —
@@ -621,8 +621,7 @@ structure with two instantiations (RAM 2MiB, disk 64KiB).
 
 ### U6 — Production disk-backed fast fork
 
-Status: implementation complete in branch; APFS/HVF product validation passes,
-with the matching Linux/KVM real-hardware run pending.
+Status: complete in branch; APFS/HVF and Linux/KVM product validation pass.
 
 `ChunkMappedDisk.fork()` copies the one-level source map and clones
 an unlinked overlay fd, and its unit tests cover rejection, copy fallback,
@@ -857,14 +856,28 @@ mise run benchmark:disk-fork
 ```
 
 The local ReleaseFast disk benchmark prepared one native 8GiB head in
-`1.220ms`, `5.851ms`, and `6.355ms` at 0%, 50%, and 100% physical-overlay
-coverage. Preparing 32 heads at 100% took `99.839ms`. Warm 32,768-read batches
-measured `22.184ms` p95 at generation 0 and `22.224ms` at generation 32, a
-`1.002x` ratio.
+`0.774ms`, `3.826ms`, and `3.694ms` at 0%, 50%, and 100% physical-overlay
+coverage. Preparing 32 heads at 100% took `19.827ms`. Warm 32,768-read batches
+measured `27.389ms` p95 at generation 0 and `27.053ms` at generation 32, a
+`0.988x` ratio.
 
-The Linux/KVM path compiles with `zig build -Dtarget=aarch64-linux-musl`, and
-the same smoke selects KVM automatically on an ARM64 Linux host. That
-real-hardware run remains the final U6 platform evidence.
+The Linux/KVM path compiles with `zig build -Dtarget=aarch64-linux-musl`. On
+AWS instance `i-0e02904c4c1d4d9bf` (`c7gd.metal`, Ubuntu 24.04, KVM), the same
+512MiB Alpine smoke produced two native ZFS-backed heads with
+`ram_capture_ms=2281`, `disk_fork_ms=37`, `source_pause_ms=2318`, and
+`child_ready_ms=1295`; divergence, nested fork, save/restore, source removal,
+destructive prune, post-prune fork, and post-prune save/restore all passed.
+
+That host also exposed an important filesystem boundary. Its ZFS scratch
+accepts `FICLONE`, but raw 8GiB sparse reflinks consistently took `151–155ms`;
+the ReleaseFast gate measured `153.482ms` at 0% coverage and correctly failed
+the `<100ms` assertion. The product path now places writable overlays and lazy
+sparse bases under absolute `TMPDIR` rather than hard-coded ext4 `/tmp`, keeps
+that factory root with every disk head, and rejects cross-filesystem adoption.
+APFS remains the measured host for the slice's 8GiB `<100ms` and 32-head `<1s`
+latency gates; the ZFS runner is Linux/KVM correctness coverage, not a Linux
+8GiB latency reference. Requiring the same 8GiB gate on Linux would require a
+faster reflink scratch filesystem or a different Linux clone primitive.
 
 #### Key Learnings From Pressure-Testing
 
@@ -875,6 +888,10 @@ real-hardware run remains the final U6 platform evidence.
   add TOCTOU and stale-file recovery problems, so children claim fds directly
   and the private descriptor remains non-portable. APFS may use a transient
   named clone only until it has opened and unlinked the resulting fd.
+- Runtime overlay placement is part of fast-fork capability. Honoring absolute
+  `TMPDIR` lets operators select a reflink-capable scratch filesystem; retaining
+  that root with the live disk and checking fd filesystem identity prevents a
+  child from becoming ready with a head it cannot natively fork again.
 - The original in-process primitive was not a portable product boundary: it
   deep-copied digest strings and only attempted reflink on Linux. Stable
   baseline authority, transferable heads, and APFS cloning were prerequisites;
