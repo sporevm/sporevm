@@ -83,6 +83,8 @@ interactive_stdout="${workdir}/interactive.stdout"
 interactive_stderr="${workdir}/interactive.stderr"
 bounded_stdout="${workdir}/bounded.stdout"
 bounded_stderr="${workdir}/bounded.stderr"
+streamed_stdout="${workdir}/streamed.stdout"
+streamed_stderr="${workdir}/streamed.stderr"
 tty_stdout="${workdir}/tty.stdout"
 tty_stderr="${workdir}/tty.stderr"
 
@@ -129,32 +131,86 @@ if run_capture "${bounded_stdout}" "${bounded_stderr}" \
 else
   status=$?
   failed=1
-  require_success "${status}" "bounded spore exec after streaming exec" "${bounded_stderr}"
+  require_success "${status}" "plain spore exec after interactive exec" "${bounded_stderr}"
 fi
 grep -Fxq "bounded-ok" "${bounded_stdout}" || {
   failed=1
   cat "${bounded_stdout}" >&2 || true
   cat "${bounded_stderr}" >&2 || true
-  die "bounded spore exec did not work after streaming exec"
+  die "plain spore exec did not work after interactive exec"
 }
+
+# Plain noninteractive exec must stream both output channels before exit and
+# preserve more than 1 MiB byte-exactly on each channel. This reproduces the
+# old buffered 16 KiB truncation failure with redirected automation output.
+bulk_output_bytes=$((1536 * 1024))
+set +e
+env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" exec "${vm_name}" -- /bin/sh -lc \
+  "printf 'stdout-prompt\\n'; printf 'stderr-prompt\\n' >&2; sleep 2; head -c ${bulk_output_bytes} /dev/zero | tr '\\000' A; head -c ${bulk_output_bytes} /dev/zero | tr '\\000' B >&2; exit 7" \
+  >"${streamed_stdout}" 2>"${streamed_stderr}" &
+streamed_pid=$!
+set -e
+
+live_output=0
+for _ in $(seq 1 50); do
+  if grep -Fq "stdout-prompt" "${streamed_stdout}" && grep -Fq "stderr-prompt" "${streamed_stderr}"; then
+    kill -0 "${streamed_pid}" 2>/dev/null || {
+      failed=1
+      die "plain spore exec delayed prompt output until command exit"
+    }
+    live_output=1
+    break
+  fi
+  sleep 0.05
+done
+[[ "${live_output}" == "1" ]] || {
+  failed=1
+  die "plain spore exec did not stream prompt output"
+}
+
+set +e
+wait "${streamed_pid}"
+streamed_status=$?
+set -e
+[[ "${streamed_status}" == "7" ]] || {
+  failed=1
+  cat "${streamed_stderr}" >&2 || true
+  die "plain streamed spore exec exited ${streamed_status}, expected 7"
+}
+python3 - "${streamed_stdout}" "${streamed_stderr}" "${bulk_output_bytes}" <<'PY'
+import sys
+
+stdout_path, stderr_path, size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(stdout_path, "rb") as fh:
+    stdout = fh.read()
+with open(stderr_path, "rb") as fh:
+    stderr = fh.read()
+if stdout != b"stdout-prompt\n" + b"A" * size:
+    raise SystemExit(f"stdout ordering/bytes mismatch: got {len(stdout)} bytes")
+if stderr != b"stderr-prompt\n" + b"B" * size:
+    raise SystemExit(f"stderr ordering/bytes mismatch: got {len(stderr)} bytes")
+PY
 
 if run_capture "${tty_stdout}" "${tty_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-  "${spore_bin}" exec -t "${vm_name}" -- /bin/true; then
-  failed=1
-  die "spore exec -t succeeded while stdout was not a terminal"
+  "${spore_bin}" exec -t "${vm_name}" -- /bin/sh -lc 'printf tty-out; printf tty-err >&2'; then
+  :
 else
   status=$?
-  [[ "${status}" == "2" ]] || {
-    failed=1
-    cat "${tty_stderr}" >&2 || true
-    die "spore exec -t exited ${status}, expected 2 when stdout is not a terminal"
-  }
+  failed=1
+  require_success "${status}" "redirected spore exec -t" "${tty_stderr}"
 fi
-grep -Fq "requires stdout to be a terminal" "${tty_stderr}" || {
+grep -Fq "tty-out" "${tty_stdout}" && grep -Fq "tty-err" "${tty_stdout}" || {
+  failed=1
+  cat "${tty_stdout}" >&2 || true
+  cat "${tty_stderr}" >&2 || true
+  die "spore exec -t did not merge terminal output on redirected stdout"
+}
+[[ ! -s "${tty_stderr}" ]] || {
   failed=1
   cat "${tty_stderr}" >&2 || true
-  die "spore exec -t did not explain the terminal policy failure"
+  die "spore exec -t wrote separate stderr output"
 }
 
 # Bulk exec stdio: over 1MiB must round-trip byte-exact through interactive
@@ -195,5 +251,22 @@ after_failed_stream="$(env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
   failed=1
   die "VM unusable after deliberately failed stream"
 }
+
+env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null || {
+  failed=1
+  die "named VM cleanup after streamed exec failed"
+}
+created=0
+env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json ls >"${workdir}/after-rm.json"
+python3 - "${workdir}/after-rm.json" "${vm_name}" <<'PY'
+import json
+import sys
+
+path, removed = sys.argv[1:]
+with open(path, "r", encoding="utf-8") as fh:
+    entries = json.load(fh)
+if any(entry.get("name") == removed for entry in entries):
+    raise SystemExit(f"removed VM still listed: {removed}")
+PY
 
 echo "smoke:lifecycle-tty ok"

@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-10
+last_reviewed: 2026-07-11
 spec_refs:
   - docs/lifecycle.md
   - docs/libspore.md
@@ -33,9 +33,14 @@ The durable contract lives in:
 - `docs/libspore.md` for Zig/C helper selection and Go self re-exec behavior.
 - `SECURITY.md` for the monitor control-socket attack surface.
 
+Plain attached named exec now uses the existing SPIO streaming request with
+stdin closed by default. `-i` controls stdin forwarding and `-t` controls PTY
+allocation. The bounded compatibility collector fails with
+`ExecOutputTruncated` instead of returning partial output as success.
+
 ## Remaining Work
 
-- Make buffered named exec JSON byte-safe for invalid UTF-8 stdout/stderr. The
+- Make bounded named exec JSON byte-safe for invalid UTF-8 stdout/stderr. The
   monitor already sends `stdout_b64` and `stderr_b64`; the public JSON producer
   still needs a lossless shape, either byte arrays or documented base64 fields.
 - Add a Zig/C/Go round-trip check proving invalid UTF-8 survives buffered named
@@ -48,7 +53,8 @@ The durable contract lives in:
 ## Done When
 
 - Invalid UTF-8 bytes survive monitor, Zig, C JSON, and Go decode.
-- Buffered truncation flags still work for small-command callers.
+- Bounded collection reports truncation as an error rather than partial
+  success.
 - Annotation merge-through-snapshot is pinned by a focused test.
 
 ## Non-Goals

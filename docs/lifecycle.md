@@ -38,13 +38,16 @@ own command environment. Use `--image` or `--rootfs` for general distro
 commands. A command passed to `spore create` is
 started in the guest and detached; stdout and stderr are discarded so the named
 VM is immediately available for `fork`, `exec`, `save`, and `rm`. `spore
-exec` forwards guest stdout and stderr as workload streams. Pass `-i` to stream
-host stdin through the monitor to the guest process, and pass `-t` to request a
-guest terminal for the exec. The usual shell spelling is:
+exec` always streams guest stdout and stderr live as independent ordered
+streams. Stdin is closed by default. Pass `-i` to forward host stdin, and pass
+`-t` to request a guest terminal for the exec. The usual shell spelling is:
 
 ```bash
 spore exec -it bench-1 -- /bin/sh
 ```
+
+`-i` and `-t` are independent: neither flag selects output attachment, and a
+host terminal is not required when PTY output or input is redirected.
 
 Exact argv does not perform guest PATH lookup. Use `-- /bin/echo hi`, not
 `-- echo hi`, unless the guest environment itself can execute `echo` at that
@@ -307,9 +310,12 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
   `spore run --from <spore-dir> <command>` starts a new command from saved VM
   state. `--generation FILE` is accepted only with `--from`. `spore run -t
   --from <spore-dir> <command>` is not implemented yet.
-- `spore exec -i/-t` uses a streaming monitor request. Embedders use
-  `openExecNamedStream` for the same stdin, terminal, resize, exit, and
-  monitor-error surface.
+- Every attached `spore exec` uses the streaming monitor request. Embedders use
+  `openExecNamedStream` for the same separate stdout/stderr, optional stdin,
+  terminal, resize, exit, and monitor-error surface. The monitor uses fail-fast
+  backpressure: a disconnected consumer or local socket that cannot accept a
+  complete frame within the 25 ms send deadline aborts that exec so it cannot
+  block the VM control loop indefinitely.
 - `spore copy-in` and `spore copy-out` transfer explicit regular files or
   directory trees. Symlinks, special files, overwrite, and workspace sync are
   intentionally outside this primitive. Embedders use the matching

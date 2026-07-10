@@ -582,6 +582,10 @@ pub const ExecNamedResult = struct {
     stderr_truncated: bool = false,
 };
 
+/// `execNamed` is a compatibility collector and rejects output beyond this
+/// per-stream limit. Use `openExecNamedStream` for streamed command output.
+pub const exec_named_capture_limit = 16 * 1024;
+
 pub const TerminalSize = spore_stream.Resize;
 
 pub const ExecNamedStreamOptions = struct {
@@ -1084,7 +1088,6 @@ fn execNamedStreaming(
 ) !u8 {
     clearLastError();
     if (options.command.len == 0) return error.InvalidGuestCommand;
-    if (!options.interactive and !options.tty) return error.InvalidGuestCommand;
     if (options.network_policy != null) return error.UnsupportedNetworkPolicyUpdate;
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1627,48 +1630,14 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         },
         else => return err,
     };
-    if (parsed.interactive or parsed.tty) {
-        validateExecTerminalPolicy(parsed);
-        const exit_code = execNamedStreaming(.{
-            .io = init.io,
-            .environ_map = init.environ_map,
-        }, allocator, .{
-            .name = parsed.name,
-            .command = command,
-            .interactive = parsed.interactive,
-            .tty = parsed.tty,
-        }) catch |err| switch (err) {
-            error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => cliRuntimePathExit("exec", err),
-            error.NamedVmNotReady => {
-                const detail = lastErrorMessage();
-                if (detail.len != 0) {
-                    std.debug.print("spore exec: {s}\n", .{detail});
-                } else {
-                    std.debug.print("spore exec: VM is not ready: {s}\n", .{parsed.name});
-                }
-                std.process.exit(2);
-            },
-            error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
-                const detail = lastErrorMessage();
-                if (detail.len != 0) {
-                    std.debug.print("spore exec: {s}\n", .{detail});
-                } else switch (err) {
-                    error.MonitorUnavailable => std.debug.print("spore exec: monitor is unavailable for VM: {s}\n", .{parsed.name}),
-                    else => std.debug.print("spore exec: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
-                }
-                std.process.exit(1);
-            },
-            else => |e| return e,
-        };
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-    const result = execNamed(.{
+    const exit_code = execNamedStreaming(.{
         .io = init.io,
         .environ_map = init.environ_map,
     }, allocator, .{
         .name = parsed.name,
         .command = command,
+        .interactive = parsed.interactive,
+        .tty = parsed.tty,
     }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => cliRuntimePathExit("exec", err),
         error.NamedVmNotReady => {
@@ -1692,9 +1661,7 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         },
         else => |e| return e,
     };
-    defer deinitExecNamedResult(allocator, result);
-    try writeExecNamedResult(stdout, result);
-    if (result.exit_code != 0) std.process.exit(result.exit_code);
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
 pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
@@ -1807,18 +1774,6 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
         std.debug.print("spore copy-out: cannot write host path {s}: {s}\n", .{ parsed.host_path, @errorName(err) });
         exitAfterCopyArchiveCleanup(&archive, init.io, 1);
     };
-}
-
-fn validateExecTerminalPolicy(parsed: ExecOptions) void {
-    if (!parsed.tty) return;
-    if (std.c.isatty(1) == 0) {
-        std.debug.print("spore exec: -t requires stdout to be a terminal\n", .{});
-        std.process.exit(2);
-    }
-    if (parsed.interactive and std.c.isatty(0) == 0) {
-        std.debug.print("spore exec: -it requires stdin to be a terminal\n", .{});
-        std.process.exit(2);
-    }
 }
 
 pub fn rmCli(
@@ -4306,14 +4261,22 @@ fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_
     errdefer stream.close(context.io);
     writeAll(context.io, stream, json) catch return error.MonitorUnavailable;
     writeAll(context.io, stream, "\n") catch return error.MonitorUnavailable;
-    return .{ .io = context.io, .stream = stream };
+    var exec_stream = ExecNamedStream{ .io = context.io, .stream = stream };
+    if (!options.interactive) {
+        if (options.tty) {
+            try exec_stream.closeTerminal();
+        } else {
+            try exec_stream.closeStdin();
+        }
+    }
+    return exec_stream;
 }
 
 fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path: []const u8, options: ExecNamedStreamOptions) !u8 {
     var stream = try openExecNamedStreamAt(context, allocator, socket_path, options);
     defer stream.deinit();
     var raw_terminal: ?ExecRawTerminal = null;
-    if (options.tty and options.interactive) raw_terminal = try ExecRawTerminal.enable();
+    if (options.tty and options.interactive and std.c.isatty(0) != 0) raw_terminal = try ExecRawTerminal.enable();
     defer if (raw_terminal) |*raw| raw.deinit();
 
     var resize_registration: ?ExecResizeRegistration = null;
@@ -4725,14 +4688,6 @@ const ControlResponse = struct {
     message: ?[]const u8 = null,
 };
 
-fn writeExecNamedResult(stdout: *Io.Writer, result: ExecNamedResult) !void {
-    try stdout.writeAll(result.stdout);
-    try stdout.flush();
-    try writeRawStderr(result.stderr);
-    if (result.stdout_truncated) try writeRawStderr("spore exec: stdout truncated after 16384 bytes\n");
-    if (result.stderr_truncated) try writeRawStderr("spore exec: stderr truncated after 16384 bytes\n");
-}
-
 fn parseExecNamedResponse(
     allocator: std.mem.Allocator,
     parse_allocator: std.mem.Allocator,
@@ -4749,6 +4704,19 @@ fn parseExecNamedResponse(
     }
     const exit_code = parsed.value.exit_code orelse return error.BadMonitorResponse;
     if (exit_code < 0 or exit_code > 255) return error.BadMonitorResponse;
+    if (parsed.value.stdout_truncated or parsed.value.stderr_truncated) {
+        const stream_name = if (parsed.value.stdout_truncated and parsed.value.stderr_truncated)
+            "stdout and stderr"
+        else if (parsed.value.stdout_truncated)
+            "stdout"
+        else
+            "stderr";
+        setLastError(
+            "named exec {s} exceeded the bounded {d}-byte collector; use openExecNamedStream",
+            .{ stream_name, exec_named_capture_limit },
+        );
+        return error.ExecOutputTruncated;
+    }
 
     const stdout = try decodeControlOutput(allocator, parsed.value.stdout_b64 orelse return error.BadMonitorResponse);
     errdefer allocator.free(stdout);
@@ -5674,10 +5642,24 @@ test "lifecycle result carries stable schema" {
     try std.testing.expectEqual(@as(?i64, 42), result.pid);
 }
 
-test "named exec response decodes owned output" {
+test "named exec response rejects truncated collector output" {
     const allocator = std.testing.allocator;
+    clearLastError();
+    defer clearLastError();
     const response =
         \\{"type":"exec_result","exit_code":7,"stdout_b64":"b2s=","stderr_b64":"ZXJy","network_events_jsonl_b64":"eyJldmVudCI6Im5ldHdvcmtfZGVjaXNpb24ifQo=","stdout_truncated":false,"stderr_truncated":true}
+    ;
+    try std.testing.expectError(error.ExecOutputTruncated, parseExecNamedResponse(allocator, allocator, response));
+    try std.testing.expectEqualStrings(
+        "named exec stderr exceeded the bounded 16384-byte collector; use openExecNamedStream",
+        lastErrorMessage(),
+    );
+}
+
+test "named exec response decodes complete bounded output" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"type":"exec_result","exit_code":7,"stdout_b64":"b2s=","stderr_b64":"ZXJy","network_events_jsonl_b64":"eyJldmVudCI6Im5ldHdvcmtfZGVjaXNpb24ifQo=","stdout_truncated":false,"stderr_truncated":false}
     ;
     const result = try parseExecNamedResponse(allocator, allocator, response);
     defer deinitExecNamedResult(allocator, result);
@@ -5686,8 +5668,6 @@ test "named exec response decodes owned output" {
     try std.testing.expectEqualStrings("ok", result.stdout);
     try std.testing.expectEqualStrings("err", result.stderr);
     try std.testing.expectEqualStrings("{\"event\":\"network_decision\"}\n", result.network_events_jsonl);
-    try std.testing.expect(!result.stdout_truncated);
-    try std.testing.expect(result.stderr_truncated);
 }
 
 test "named exec response preserves monitor error detail" {

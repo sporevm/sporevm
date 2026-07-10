@@ -3507,13 +3507,16 @@ pub const InteractiveExecRequestOptions = struct {
 };
 
 pub fn interactiveExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: InteractiveExecRequestOptions) ![]const u8 {
-    return execRequestWithSessionOptions(allocator, argv, session_id, .{
+    const exec_options = GuestExecOptions{
         .interactive = options.interactive,
         .tty = options.tty,
         .terminal_name = options.terminal_name,
         .terminal_size = options.terminal_size,
         .resume_time_unix_ns = options.resume_time_unix_ns,
-    });
+    };
+    try validateGuestArgv(argv);
+    try validateGuestExecOptions(exec_options);
+    return execV1RequestWithSessionOptions(allocator, argv, session_id, exec_options);
 }
 
 pub fn detachedExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, resume_time_unix_ns: u64) ![]const u8 {
@@ -4354,6 +4357,13 @@ test "interactive run request uses start v1 pipe stdio" {
     try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"start-v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"pipe\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"argv\":[\"/bin/cat\"]") != null);
+}
+
+test "streaming exec request uses start v1 with closed pipe stdin" {
+    const request = try interactiveExecRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "default", .{});
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"start-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"pipe\"") != null);
 }
 
 test "tty run request uses start v1 terminal metadata" {

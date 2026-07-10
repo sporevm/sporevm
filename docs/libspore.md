@@ -364,9 +364,16 @@ binding returns it through `CallError`. Startup, already-exists, and not-ready
 diagnostics include the last known VM state, recorded PID when present,
 `console.log`, `monitor.log`, and the control socket path where useful.
 
-`execNamed` returns a bounded stdout/stderr result, so `.interactive = true` or
-`.tty = true` returns `error.UnsupportedInteractiveExec`. Use
-`openExecNamedStream` for `spore exec -i/-t` semantics:
+`openExecNamedStream` is the primary named-exec primitive and is also what the
+CLI uses for plain noninteractive exec. It preserves stdout and stderr as
+separate ordered streams, with stdin closed unless `.interactive = true`.
+`execNamed` remains a compatibility collector for small commands: stdout and
+stderr are each bounded to 16 KiB, and exceeding either bound returns
+`error.ExecOutputTruncated` instead of a partial successful result. Interactive
+or TTY collector requests return `error.UnsupportedInteractiveExec`.
+
+Use the stream for output beyond the collector bound and interactive or TTY
+exec:
 
 ```zig
 var stream = try libspore.openExecNamedStream(context, allocator, .{
