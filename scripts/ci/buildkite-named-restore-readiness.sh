@@ -13,8 +13,9 @@ fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${repo_root}"
 
-baseline_version="${SPOREVM_NAMED_RESTORE_BASELINE_VERSION:-v0.11.1}"
+baseline_version="${SPOREVM_NAMED_RESTORE_BASELINE_VERSION:-v0.12.0}"
 image="${SPOREVM_NAMED_RESTORE_IMAGE:-public.ecr.aws/docker/library/node:22-alpine}"
+memory="${SPOREVM_NAMED_RESTORE_MEMORY:-1024mb}"
 iterations="${SPOREVM_NAMED_RESTORE_ITERATIONS:-5}"
 repeated_execs="${SPOREVM_NAMED_RESTORE_REPEATED_EXECS:-5}"
 output_dir="${SPOREVM_NAMED_RESTORE_OUTPUT_DIR:-zig-cache/named-restore-readiness}"
@@ -49,14 +50,10 @@ parent="${workdir}/immutable-parent.spore"
 "${baseline_bin}" run \
   --backend kvm \
   --image "${image}" \
-  --memory 512mb \
+  --memory "${memory}" \
   --save "${parent}" \
   -- /bin/true
 chmod -R a-w "${parent}"
-
-baseline_runtime="${workdir}/baseline-runtime"
-current_runtime="${workdir}/current-runtime"
-mkdir -m 0700 "${baseline_runtime}" "${current_runtime}"
 
 scripts/benchmark/named-restore-readiness.py \
   --spore-dir "${parent}" \
@@ -64,7 +61,7 @@ scripts/benchmark/named-restore-readiness.py \
   --backend kvm \
   --iterations "${iterations}" \
   --repeated-execs "${repeated_execs}" \
-  --runtime-dir "${baseline_runtime}" \
+  --runtime-dir "${capture_runtime}" \
   --output "${output_dir}/baseline-${baseline_version}.jsonl" \
   --include-run-from \
   --no-build
@@ -75,7 +72,7 @@ scripts/benchmark/named-restore-readiness.py \
   --backend kvm \
   --iterations "${iterations}" \
   --repeated-execs "${repeated_execs}" \
-  --runtime-dir "${current_runtime}" \
+  --runtime-dir "${capture_runtime}" \
   --output "${output_dir}/current.jsonl" \
   --include-run-from \
   --no-build
@@ -85,10 +82,15 @@ import json
 import statistics
 import sys
 
-for path in sys.argv[1:]:
+expected_sources = ("eager_chunks", "local_backing")
+for path, expected_source in zip(sys.argv[1:], expected_sources, strict=True):
     rows = [json.loads(line) for line in open(path, encoding="utf-8")]
     print(path)
-    for field in ("run_from_noop_ms", "restore_return_ms", "exec_ready_ms", "exec_ready_wait_ms", "first_noop_exec_ms", "repeated_exec_median_ms"):
+    sources = sorted({row.get("restore_source") for row in rows if row.get("restore_source")})
+    print(f"  restore_source: {','.join(sources) if sources else 'unknown'}")
+    if sources != [expected_source]:
+        raise SystemExit(f"{path}: expected restore_source={expected_source}, got {sources or ['unknown']}")
+    for field in ("run_from_noop_ms", "restore_return_ms", "exec_ready_ms", "exec_ready_wait_ms", "backend_memory_ms", "backend_state_ms", "backend_pre_run_ms", "first_noop_exec_ms", "repeated_exec_median_ms"):
         values = [row[field] for row in rows if isinstance(row.get(field), (int, float))]
         print(f"  {field}: median={statistics.median(values):.3f}ms n={len(values)}" if values else f"  {field}: n=0")
 PY

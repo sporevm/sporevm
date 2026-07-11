@@ -3458,6 +3458,10 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     try spore.validateAnnotations(opts.annotations);
 
     const backend = try opts.backend.resolveForHost();
+    const local_backing = try openLocalMemoryBacking(allocator, context.environ_map, opts.resume_dir, opts.memory.bytes, "named monitor");
+    defer if (local_backing.fd) |fd| {
+        _ = std.c.close(fd);
+    };
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     const network: virtio_net.Runtime = if (opts.network_runtime) |runtime| runtime else blk: {
@@ -3514,6 +3518,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                 .sessions = opts.resume_sessions,
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
+                .ram_backing_fd = local_backing.fd,
                 .ram_restore_mode = .eager_chunks,
                 .exec_probe = startup_probe,
                 .exec_probe_timeout_ms = opts.timeout_ms,
@@ -3542,6 +3547,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                 .sessions = opts.resume_sessions,
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
+                .ram_backing_fd = local_backing.fd,
                 .ram_restore_mode = .eager_chunks,
                 .exec_probe = startup_probe,
                 .exec_probe_timeout_ms = opts.timeout_ms,
@@ -3578,6 +3584,16 @@ fn openRunLocalMemoryBacking(
     resume_dir: ?[]const u8,
     ram_size: u64,
 ) !spore.LocalBackingPlan {
+    return openLocalMemoryBacking(allocator, environ, resume_dir, ram_size, "run --from");
+}
+
+fn openLocalMemoryBacking(
+    allocator: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    resume_dir: ?[]const u8,
+    ram_size: u64,
+    operation: []const u8,
+) !spore.LocalBackingPlan {
     const dir = resume_dir orelse return .{};
     var parsed = spore.loadManifest(allocator, dir) catch |err| switch (err) {
         error.BadManifest => null,
@@ -3586,13 +3602,13 @@ fn openRunLocalMemoryBacking(
     if (parsed) |*manifest| {
         defer manifest.deinit();
         const local_backing = try spore.openProvenLocalMemoryBackingForVcpuCount(allocator, environ, dir, manifest.value.memory, ram_size, 1);
-        std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(local_backing.source), @tagName(local_backing.reason) });
+        std.log.info("{s} memory restore source={s} reason={s}", .{ operation, @tagName(local_backing.source), @tagName(local_backing.reason) });
         return local_backing;
     }
     var manifest = try spore.loadManifestV1(allocator, dir);
     defer manifest.deinit();
     const local_backing = try spore.openProvenLocalMemoryBackingForVcpuCount(allocator, environ, dir, manifest.value.memory, ram_size, manifest.value.platform.vcpu_count);
-    std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(local_backing.source), @tagName(local_backing.reason) });
+    std.log.info("{s} memory restore source={s} reason={s}", .{ operation, @tagName(local_backing.source), @tagName(local_backing.reason) });
     return local_backing;
 }
 
