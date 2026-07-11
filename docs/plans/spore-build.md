@@ -10,10 +10,16 @@ spec_refs:
   - src/rootfs_cas.zig
   - src/disk_index.zig
   - src/chunk_mapped_disk.zig
+  - src/build.zig
+  - src/build/exec.zig
+  - src/build/step_cache.zig
   - src/run.zig
+  - src/runtime_disk.zig
+  - src/virtio/blk.zig
 related_plans:
   - docs/plans/native-ext4-writer.md
   - docs/plans/unified-chunk-disk.md
+  - docs/plans/spore-build-rootfs-capacity.md
 ---
 
 # Spore-Native Dockerfile Subset Builder (`spore build`)
@@ -30,8 +36,9 @@ related_plans:
 >
 > The revival updates M2 onto the unified primitives instead of the original
 > flat-file machinery: persistent-session checkpoints are `ChunkMappedDisk`
-> overlay state; each per-instruction checkpoint is one O(dirty)
-> `snapshotIndex()` into the rootfs CAS, producing a child `index_digest`; the
+> overlay state; each per-instruction checkpoint seals dirty chunks and emits
+> one canonical full index through `snapshotIndex()`, producing a child
+> `index_digest`; the
 > guest `fsfreeze` protocol deferred by the unified plan is delivered here;
 > and the executor still keys rootfs snapshots by the child `index_digest`.
 > Published local image identity additionally includes the final image config:
@@ -41,6 +48,23 @@ related_plans:
 > COPY semantics, and fail-closed contract below remain valid. Current large
 > context work adds a stat-cache for content digests and replaces the deleted
 > build COPY entry stream with a cached read-only ext4 context disk.
+>
+> **Capacity update (2026-07-11).** Build cache v7 separates rootfs capacity
+> preparation from Dockerfile instruction caching. The automatic policy is the
+> idempotent absolute target `max(parent_logical_size, 16 GiB)`: compact images
+> prepare once to 16 GiB, while images already at or above 16 GiB retain their
+> exact size. A typed `PREPARE` record reuses that normalization across
+> Dockerfiles and under `--no-cache`. On a miss, the storage layer appends
+> authoritative sparse zero chunks, the transient growth VM exposes
+> `WRITE_ZEROES`, and the managed initrd calls the ext4 resize ioctl directly
+> before publishing a same-VM checkpoint. There is no recursive growth, hidden
+> capacity override, or guest `resize2fs` dependency.
+>
+> Timing figures retained from the 2026-07-09/10 implementation notes are
+> historical baselines. In particular, measurements of the old combined
+> grow-plus-first-step path describe the superseded v6 implementation, not v7
+> acceptance. Current capacity-specific evidence and gates live in
+> `docs/plans/spore-build-rootfs-capacity.md`.
 
 ## Summary
 
@@ -96,7 +120,7 @@ serialization, is to build directly on Spore's chunk-indexed rootfs artifacts.
   in under one second: hash inputs, resolve the final `index_digest` from the
   step cache, refresh the local ref, exit.
 - A partially cached rebuild (one changed trailing instruction) pays only for
-  the changed steps and their O(dirty) snapshots, not for re-exporting or
+  the changed steps and their dirty-only sealing/full-index checkpoints, not for re-exporting or
   re-importing the base.
 - The built image is a first-class local Spore image: `spore run --image
   local/buildkite-spore:dev -- /bin/true` resolves and boots it through the
@@ -125,11 +149,12 @@ serialization, is to build directly on Spore's chunk-indexed rootfs artifacts.
   the unified `ChunkMappedDisk` snapshot path.
 - No cross-machine or shared build cache. The step cache is local, same trust
   model as the existing rootfs CAS cache.
-- No new device type or monitor protocol. The build VM uses the existing
-  device set, but may attach one additional transient read-only virtio-blk
-  instance for the build context. The new guest contracts are the `fsfreeze`
-  checkpoint handshake plus fixed-shape RUN/COPY build requests over the
-  existing exec stream.
+- No new persistent device type or portable machine-state contract. The build
+  VM uses the existing device set and may attach one transient read-only
+  virtio-blk context disk. A non-resumable rootfs-growth session temporarily
+  offers `VIRTIO_BLK_F_WRITE_ZEROES` on the existing root block device. The
+  guest contracts are `spore-rootfs-grow-v1`, the `fsfreeze` checkpoint
+  handshake, and fixed-shape RUN/COPY requests over the existing exec stream.
 
 ## Target Model
 
@@ -156,15 +181,33 @@ Options for the first implementation:
 - `--build-arg KEY=VALUE` (repeatable): supplies `ARG` values.
 - `--network spore|none`: network policy for `RUN` steps. Default `spore`
   (Docker builds assume network). `none` gives hermetic builds.
-- `--no-cache`: ignore step cache reads (still writes).
+- `--no-cache`: ignore Dockerfile step-cache reads (still writes). It still
+  reads and reuses the infrastructure `PREPARE` record, just as it reuses OCI
+  materialization and other non-Dockerfile normalization.
 - `--mkfs PATH` / `--debugfs PATH`: forwarded to the base-import path, same as
   `spore rootfs import-oci`.
 
-Build rootfs growth is automatic and not user-facing. On the first executor
-miss in a session, the builder grows the writable sparse disk to
-`max(2 * parent_logical_size, parent_logical_size + 8 GiB)`, rounded up to the
-disk chunk size, then runs guest `resize2fs /dev/vda` once before Dockerfile
-steps resume.
+Build rootfs capacity is automatic and not user-facing. The builder computes
+one target from the immutable `FROM` storage:
+
+```text
+automatic_target = max(parent_logical_size, 16 GiB)
+```
+
+The 16 GiB value is both the default and the automatic-growth cap. A compact
+image grows once to exactly 16 GiB; a 16 GiB or larger image is unchanged, so
+reusing a built or committed image never doubles or adds capacity recursively.
+There is no hidden override or public capacity knob. Logical capacity remains
+sparse and does not reserve 16 GiB of physical storage.
+
+Before the first executor-backed instruction, the builder resolves a typed v7
+`PREPARE` key from the parent index, exact target, and the exact managed
+kernel/initrd plus growth-protocol producer identity. A hit becomes the parent
+for ordinary Dockerfile keys. On a miss, the same VM that will execute the
+remaining steps grows the clean-zero chunk map, asks the managed initrd to run
+the ext4 resize ioctl, freezes and snapshots the prepared filesystem, publishes
+the completeness stamp and `PREPARE` record, thaws, and continues with step
+zero. The selected image needs no `/bin/sh` or `resize2fs` for preparation.
 
 `FROM` also accepts existing image refs directly (`FROM local/foo:dev`,
 `FROM local/foo@sha256:…`), resolved through `resolveLocalCachedRef`. Registry
@@ -222,10 +265,12 @@ src/build/context_disk.zig
                          executed COPY steps
 src/build/step_cache.zig step-key computation + on-disk records that map
                          deterministic parent+instruction inputs to child
-                         index_digest outcomes
+                         index_digest outcomes, including the typed v7
+                         PREPARE normalization record
 src/build/exec.zig       persistent build-VM session: boot the deepest
                          cached index writable through ChunkMappedDisk,
-                         drive RUN/COPY through initrd agent requests,
+                         perform direct-ioctl capacity preparation when
+                         needed, drive RUN/COPY through initrd agent requests,
                          checkpoint (freeze/snapshot/stamp/record/thaw)
                          after each build step
 ```
@@ -233,41 +278,43 @@ src/build/exec.zig       persistent build-VM session: boot the deepest
 Build state machine:
 
 ```diagram
-╭────────────╮   ╭──────────────╮   ╭──────────────────╮
-│ parse +    │──▶│ resolve FROM │──▶│ walk instructions │
-│ validate   │   │ → base index │   │ key_i = H(parent, │
-│ Dockerfile │   │   blake3     │   │  instr, inputs)   │
-╰────────────╯   ╰──────────────╯   ╰────────┬─────────╯
-                                             │
-                     all steps cached        │     first cache miss at step k
-                          ╭──────────────────┴──────────────╮
-                          ▼                                 ▼
-                 ╭──────────────────╮   ╭──────────────────────────────╮
-                 │ read final step  │   │ open index k-1 through       │
-                 │ record, verify   │   │ ChunkMappedDisk + overlay    │
-                 │ complete stamp   │   │ deterministic grow+resize2fs │
-                 ╰────────┬─────────╯   │ boot guest once (rw)         │
-                          │             │ for each remaining step:     │
-                          │             │   agent request (RUN/COPY)   │
-                          │             │   sync+freeze → snapshot →   │
-                          │             │   stamp+record → thaw        │
-                          │             │ shutdown                     │
-                          │             ╰──────────────┬───────────────╯
-                          ╰────────────────┬───────────╯
-                                           ▼
-                            ╭──────────────────────────────╮
-                            │ publish image: register last │
-                            │ index_digest + config under  │
-                            │ the local ref                │
-                            ╰──────────────────────────────╯
+╭────────────╮   ╭──────────────╮   ╭──────────────────────────────╮
+│ parse +    │──▶│ resolve FROM │──▶│ first executor instruction:  │
+│ validate   │   │ → base index │   │ target=max(parent, 16 GiB)   │
+│ Dockerfile │   │   blake3     │   │ resolve typed PREPARE key    │
+╰────────────╯   ╰──────────────╯   ╰──────────────┬───────────────╯
+                                                   │
+                 PREPARE hit / already large       │ PREPARE miss
+                     ╭─────────────────────────────┴──────────────╮
+                     ▼                                            ▼
+          ╭────────────────────────╮                ╭────────────────────────╮
+          │ prepared child becomes │                │ boot parent once; clean │
+          │ Dockerfile-key parent  │                │ zero grow + direct ext4 │
+          ╰────────────┬───────────╯                │ ioctl; freeze/snapshot; │
+                       │                            │ stamp + PREPARE; thaw   │
+                       │                            ╰────────────┬───────────╯
+                       ╰─────────────────────────────┬───────────╯
+                                                     ▼
+                                        ╭────────────────────────╮
+                                        │ hit: walk Docker keys; │
+                                        │ boot child on first miss │
+                                        │ miss: execute remaining │
+                                        │ steps in the live VM    │
+                                        ╰────────────┬───────────╯
+                                                     ▼
+                                        ╭────────────────────────╮
+                                        │ step → freeze/snapshot │
+                                        │ → stamp/record → thaw; │
+                                        │ publish final image ref │
+                                        ╰────────────────────────╯
 ```
 
 The orchestrator threads a `BuildState` through the instruction list:
 
 ```zig
 const BuildState = struct {
-    index_digest: [64]u8,       // current parent rootfs index identity
-    step_key: [64]u8,           // current chain key
+    storage: RootfsStorage,      // current parent rootfs index + geometry
+    capacity_target: u64,        // fixed once from immutable FROM storage
     env: []const EnvPair,       // base config Env, then ENV accumulation
     args: []const ArgPair,      // declared ARG values
     workdir: []const u8,        // current WORKDIR
@@ -332,22 +379,47 @@ state, and the cache records are local build metadata over those indexes.
 
 ### Step keys
 
-Each instruction produces a deterministic step key. The key is a cache lookup
-address; the record at that address stores the child `index_digest` produced by
-the prior successful execution.
+Build cache v7 has two typed derivations in the same record namespace. The
+synthetic `PREPARE` operation normalizes capacity before Dockerfile cache keys
+are resolved; RUN, COPY, and WORKDIR then use the prepared child as their
+ordinary parent. A key is a cache lookup address, and the record at that address
+stores the child `index_digest` produced by the prior successful execution.
 
 ```
-step_key = blake3(builder_version || platform || parent_index_digest
-                  || instruction_kind || canonical_instruction
-                  || disk_grow_target || input_digest || env_digest
-                  || workdir || network_mode)
+prepare_key = blake3_framed(builder_version_v7, platform,
+                            parent_index_digest, "PREPARE", exact_target,
+                            producer_identity)
+
+step_key = blake3_framed(builder_version_v7, platform,
+                         prepared_parent_index_digest, instruction_kind,
+                         canonical_instruction, input_digest, env_digest,
+                         workdir, network_mode, executor_identity)
 ```
+
+Every field is length-framed, and optional fields carry an explicit presence
+tag. `disk_grow_target` is absent from v7 Dockerfile inputs and records. The
+producer identity binds the exact kernel and initrd bytes that will boot plus
+the growth request, mount/no-lazy-init policy, transient WRITE_ZEROES contract,
+and preparation host-contract version. The same exact-byte identity is carried
+as `executor_identity` in every RUN/COPY/WORKDIR key: two producers that happen
+to emit the same PREPARE child cannot reuse each other's executor results.
+Paths and hypervisor backend are not identity inputs. For managed defaults,
+the identity uses the canonical SHA-256 from the bounded read-only kernel
+sidecar and the build-generated SHA-256 of the embedded initrd, so a fully
+cached build reads neither artifact body. A later miss opens the kernel once,
+verifies those bytes against the bound digest, and boots the same allocation.
+Explicit kernel/initrd overrides remain eager: the executor loads, hashes,
+retains, and boots those exact bytes.
 
 Per-instruction inputs:
 
 - `FROM`: the resolved base `index_digest` (not the ref, not the manifest
   digest). Re-importing the same OCI layout yields the same rootfs index
   identity and the same chain; a changed base image invalidates everything.
+- `PREPARE`: fixed canonical instruction/kind `PREPARE`, immutable FROM parent
+  `index_digest`, exact target, and producer identity. Its validated child must
+  have the exact requested logical size and preserve the parent's rootfs device,
+  chunk size, hash algorithm, and object namespace.
 - `RUN`: the exact command string, the current `WORKDIR`, and the network mode.
   The environment digest is an ordered, length-framed sequence of accumulated
   `ENV` entries followed by typed `ARG` records (key, presence bit, value),
@@ -375,6 +447,12 @@ Per-instruction inputs:
 across `--network spore` and `--network none` because COPY never uses the build
 VM network.
 
+`--no-cache` bypasses only RUN/COPY/WORKDIR record reads. It deliberately still
+reads `PREPARE`: forcing Dockerfile execution must not repeat stable
+infrastructure normalization, replace the prepared parent with another valid
+kernel-produced index, or reintroduce cold resize cost. An isolated preparation
+benchmark uses a separate cache instead of a user-facing bypass.
+
 `ARG` follows this simplification: a declared ARG's value enters the effective
 environment of every subsequent `RUN`/`COPY`, so changing any declared
 `--build-arg` invalidates subsequent execution steps even if unreferenced.
@@ -401,9 +479,10 @@ Intermediates are input-addressed by their step key, but their artifacts are
 normal rootfs CAS indexes. The step record is not restore authority; it is a
 local memo from deterministic inputs to a child `index_digest`. A cache hit
 requires the child index to parse, validate against the rootfs descriptor, and
-have a completeness stamp proving all referenced nonzero chunks are present.
-Missing or malformed indexes, missing complete stamps, or bad records are
-treated as misses.
+have the already-published completeness stamp. v7 does not repair a missing
+stamp during lookup: missing or malformed indexes, missing complete stamps, or
+bad records are misses. GC continues to parse older records conservatively and
+may retain their complete content, but v6 records cannot hit v7 keys.
 
 Step record, written or replaced atomically (temp + rename) only after
 `snapshotIndex()` has published the index/chunks and the complete stamp exists:
@@ -411,17 +490,62 @@ Step record, written or replaced atomically (temp + rename) only after
 ```json
 {
   "kind": "sporevm-build-step-v1",
-  "builder_version": "…",
+  "builder_version": "sporevm-build-v7",
   "platform": {"os": "linux", "arch": "arm64"},
   "step_key": "…",
   "parent_index_digest": "…",
   "child_index_digest": "…",
+  "rootfs_storage": {
+    "kind": "chunked-ext4-rootfs-v0",
+    "device": {"kind": "virtio-mmio", "role": "rootfs", "virtio_device_id": 2, "mmio_slot": 1},
+    "logical_size": 17179869184,
+    "chunk_size": 65536,
+    "hash_algorithm": "blake3",
+    "index_digest": "blake3:…",
+    "base_identity": "blake3:…",
+    "object_namespace": "rootfs/blake3"
+  },
+  "instruction_kind": "RUN",
   "instruction": "RUN apt-get update && …",
-  "input_digest": "…",
+  "input_digest": "",
   "env_digest": "…",
   "workdir": "/app",
   "network_mode": "spore",
-  "created_unix": 1783732000
+  "executor_identity": "blake3:…",
+  "created_unix": 0
+}
+```
+
+Capacity preparation uses the same bounded parser, atomic writer, CAS objects,
+completeness stamps, and GC roots rather than a second cache subsystem:
+
+```json
+{
+  "kind": "sporevm-build-step-v1",
+  "builder_version": "sporevm-build-v7",
+  "platform": {"os": "linux", "arch": "arm64"},
+  "step_key": "…",
+  "parent_index_digest": "blake3:…",
+  "child_index_digest": "blake3:…",
+  "instruction_kind": "PREPARE",
+  "instruction": "PREPARE",
+  "input_digest": "",
+  "env_digest": "",
+  "workdir": "",
+  "exact_target": 17179869184,
+  "producer_identity": "blake3:…",
+  "executor_identity": "",
+  "rootfs_storage": {
+    "kind": "chunked-ext4-rootfs-v0",
+    "device": {"kind": "virtio-mmio", "role": "rootfs", "virtio_device_id": 2, "mmio_slot": 1},
+    "logical_size": 17179869184,
+    "chunk_size": 65536,
+    "hash_algorithm": "blake3",
+    "index_digest": "blake3:…",
+    "base_identity": "blake3:…",
+    "object_namespace": "rootfs/blake3"
+  },
+  "created_unix": 0
 }
 ```
 
@@ -458,18 +582,35 @@ same rootfs from sharing a resolved image ref or metadata path. `spore build`
 publishes the image digest through the same local-ref path as
 `spore rootfs import-tar`, with image config metadata attached for `Env`,
 `Cmd`, and `WorkingDir`; the exact digest construction is documented in
-`docs/spore-format.md`.
+`docs/spore-format.md`. The cache object is the existing `RootFSMetadata`
+shape; it does not add a new kind or format contract.
 
 ```json
 {
-  "kind": "sporevm-built-image-v0",
-  "builder_version": "…",
+  "builder_version": "sporevm-rootfs-v6",
+  "ext4_writer": "built-index",
+  "image_ref": "local/app:dev",
+  "resolved_image_ref": "local/app@blake3:…",
+  "image_manifest_digest": "blake3:…",
   "platform": {"os": "linux", "arch": "arm64"},
+  "config_digest": "blake3:…",
+  "config": {"config": {"Env": ["A=B"], "Cmd": ["/bin/true"], "WorkingDir": "/app"}},
+  "layers": [],
+  "deterministic": false,
+  "ext4_uuid": "",
+  "ext4_hash_seed": "",
+  "rootfs_path": "",
+  "rootfs_size": 17179869184,
   "rootfs_storage": {
     "kind": "chunked-ext4-rootfs-v0",
-    "index_digest": "…"
-  },
-  "config": {"Env": […], "Cmd": […], "WorkingDir": "…"}
+    "device": {"kind": "virtio-mmio", "role": "rootfs", "virtio_device_id": 2, "mmio_slot": 1},
+    "logical_size": 17179869184,
+    "chunk_size": 65536,
+    "hash_algorithm": "blake3",
+    "index_digest": "blake3:…",
+    "base_identity": "blake3:…",
+    "object_namespace": "rootfs/blake3"
+  }
 }
 ```
 
@@ -488,30 +629,50 @@ metadata already carries the rootfs storage index.
 
 ## RUN Execution And Snapshot
 
-Uncached steps execute in **one persistent build VM per build**, not one VM
-per step. The guest boots once from the deepest cached `index_digest` opened
-through `ChunkMappedDisk` with writable overlay state; every remaining RUN/COPY
-runs inside that session; checkpoints are taken between steps by freezing the
-filesystem, draining virtio-blk, and publishing one O(dirty) rootfs CAS index.
+Uncached steps execute in **one persistent build VM per build**, not one VM per
+step. A preparation miss and all remaining RUN/COPY/WORKDIR instructions share
+that VM. A preparation hit becomes the normal Dockerfile cache parent, so a
+later Dockerfile miss boots directly from the prepared child with no resize.
+Checkpoints freeze the filesystem, drain virtio-blk, seal only changed chunks,
+and enumerate one canonical full rootfs CAS index.
 
 Session lifecycle:
 
-1. Open the deepest cached `index_digest` (or the base `FROM` index for a
-   fully cold build) as the `ChunkMappedDisk` parent and attach build-owned
-   writable overlay state. The parent index and complete stamp are verified
-   before boot; missing chunks fail closed instead of reaching the guest.
-2. Grow the writable chunk-mapped rootfs to
-   `max(2 * parent_logical_size, parent_logical_size + 8 GiB)` rounded to the
-   disk chunk size, then run guest `resize2fs /dev/vda` once before the first
-   Dockerfile step. No shrink after; later snapshots and the final published
-   image inherit the larger logical size deliberately, because run-time
-   workloads also benefit from scratch space and chunk-mapped disks are sparse.
-3. Boot via the existing run stack with a new internal rootfs mode: open the
-   chunk-mapped rootfs read-write and pass `spore_rootfs_rw=1`, without
-   changing public `spore run` semantics. This is a builder-only option behind
-   the hypervisor-neutral disk interface.
-4. The host drives the existing initrd agent over bounded `spore_stream_v1`
-   requests:
+1. Before the first executor-backed instruction, compute the absolute target
+   `max(FROM.logical_size, 16 GiB)`. If no growth is needed, continue directly.
+   Otherwise resolve the v7 `PREPARE` key. A valid hit supplies the prepared
+   child index before any Dockerfile key is calculated, including under
+   `--no-cache`.
+2. On a `PREPARE` miss, open the immutable FROM index as the
+   `ChunkMappedDisk` parent and attach build-owned writable overlay state. Grow
+   the disk to the exact target by appending authoritative clean-zero chunks;
+   the sparse fd and verified parent index make those zeroes storage truth, so
+   snapshotting does not read, hash, or allocate payload for the untouched
+   tail.
+3. Boot via the existing run stack with an internal rootfs-growth profile. It
+   opens the rootfs read-write, marks the VM non-resumable, and transiently
+   offers `VIRTIO_BLK_F_WRITE_ZEROES` only on the root block device. The shared
+   virtio handler validates one bounded range and maps accepted zeroing directly
+   to `ChunkMappedDisk.zeroRange`; the growth-only feature never enters a
+   portable manifest or restored transport state.
+4. The host sends `spore-rootfs-grow-v1`. The managed initrd reads the exact
+   device geometry, calls `EXT4_IOC_RESIZE_FS` on the mounted rootfs, `syncfs`es,
+   and returns bounded geometry/statfs fields. The host requires the reported
+   device size to equal the exact target. No selected-image shell or e2fsprogs
+   utility participates.
+5. Freeze the prepared filesystem, quiesce virtio-blk, seal the changed
+   metadata chunks, emit the canonical logical index, publish the completeness
+   stamp, and write the
+   typed `PREPARE` record last. Thaw without advancing the Dockerfile step
+   index, install the prepared child as the live `ChunkMappedDisk` baseline,
+   and continue step zero in the same VM. A failed grow, freeze, snapshot,
+   stamp, or record publication executes no Dockerfile step and publishes no
+   destination ref.
+6. For an ordinary Dockerfile executor miss, use the prepared parent through
+   the same internal writable-rootfs mode, without the growth-only feature or
+   control request. Continue the VM already live after a preparation miss, or
+   boot the prepared child once after a preparation hit. The host drives the
+   existing initrd agent over bounded `spore_stream_v1` requests:
    - `RUN`: host sends a fixed-shape `spore-build-run-v1` request with the
      step's effective env, workdir, and command length, then sends the command
      text as a length-prefixed payload capped at 64 KiB. The driver runs
@@ -528,7 +689,7 @@ Session lifecycle:
      (see COPY Semantics).
    - `CHECKPOINT`: agent handles `fsfreeze-v1` after the step exits;
      the VMM drains/flushes pending virtio-blk writes, the host calls
-     `ChunkMappedDisk.snapshotIndex()` into the rootfs CAS, writes/repairs the
+     `ChunkMappedDisk.snapshotIndex()` into the rootfs CAS, writes the
      complete stamp, writes the step record with the child `index_digest`, and
      then sends `fsthaw-v1`. Because all
      step processes have already exited and the filesystem is frozen at
@@ -539,22 +700,30 @@ Session lifecycle:
      valid resume point for the next build. The drain requirement belongs to
      the existing virtio-blk write path (`src/virtio/blk.zig`).
    - `DONE`: driver exits; guest shuts down cleanly.
-5. A non-zero step exit fails the build with the exit code and the
+7. A non-zero step exit fails the build with the exit code and the
    instruction; the session is torn down, live overlay state is deleted, and
    no record is written for the failed step. Checkpoints of earlier successful
    steps remain valid — the retry resumes from the last recorded
    `index_digest`.
-6. After the last step's snapshot and shutdown: publish the last
+8. After the last step's snapshot and shutdown: publish the last
    `index_digest` under the requested local image ref. There is no final
    full-image hash or flat install pass.
 
-Overhead on a cache miss, on top of the commands themselves: one boot
-(~1–2s per build), deterministic one-time grow+`resize2fs`,
-sync+freeze+O(dirty) snapshot per changed step, and local-ref publication.
-There is no tar export, no full-image hash, and no flat materialization
-required before the image is runnable. Fixed overhead is one boot plus the
-dirty snapshot work, so uncached builds compete with BuildKit by avoiding
-BuildKit's export and Spore's import boundary entirely.
+Overhead after a prepared-base hit, on top of the commands themselves, is one
+boot for an uncached suffix, sync+freeze, dirty-only sealing plus full-index
+emission per changed step, and local-ref publication. A first preparation miss
+adds the direct kernel ioctl and one metadata-sealing/full-index checkpoint
+inside that same boot. Unrelated Dockerfiles and
+repeated `--no-cache` builds reuse the `PREPARE` child and pay no growth path.
+There is no tar export, full-image hash, flat materialization, guest utility
+launch, or recursively increasing capacity.
+
+Historical diagnostic only: the pre-v7 tiny Alpine fixture measured about
+4.17s cold with the former combined growth path and about 0.36s when supplied a
+pre-grown 10 GiB base through the now-removed hidden override. That roughly
+3.8s delta motivated separating preparation and replacing guest `resize2fs`;
+it is evidence about the superseded implementation, not a v7 performance
+result or a supported configuration path.
 
 De-risk fallback, recorded not planned: if persistent in-guest orchestration
 regresses, the degenerate mode is one boot-snapshot-shutdown cycle per step
@@ -565,10 +734,10 @@ modes.
 The guest sees the writable rootfs plus, when COPY steps execute, a mounted
 read-only context disk (`spore_rootfs=1 spore_rootfs_rw=1
 spore_build_context=1`). The initrd agent now provides the build control verbs
-(`fsfreeze-v1`, `fsthaw-v1`, `spore-build-run-v1`,
+(`spore-rootfs-grow-v1`, `fsfreeze-v1`, `fsthaw-v1`, `spore-build-run-v1`,
 `spore-build-copy-v2`); the target base must provide `/bin/sh` for RUN and
-`resize2fs` for executor misses. A missing guest requirement fails closed
-through the step's captured output.
+nothing for capacity preparation. A missing RUN shell fails closed through the
+step's captured output.
 
 ## COPY Semantics
 
@@ -607,8 +776,8 @@ session as `RUN`, rather than host-side ext4 surgery:
    through symlinked directories, and dangling file symlink targets are created
    inside the rootfs. It applies entries with root ownership, parent creation,
    directory merge, file overwrite, and symlink preservation.
-5. Checkpoint exactly as RUN does (freeze, O(dirty) snapshot, complete stamp,
-   step record, thaw).
+5. Checkpoint exactly as RUN does (freeze, dirty-only sealing plus full-index
+   emission, complete stamp, step record, thaw).
 
 Corollary: COPY does not require `tar` in the base image, does not add a tar
 or custom entry-stream parser to the initrd agent, and keeps guest memory usage
@@ -685,12 +854,17 @@ single-digit seconds end to end, with the BuildKit tar export removed.
   requests plus the guest kernel's ext4 parser for a host-produced read-only
   disk).
 - `RUN` executes arbitrary user commands — inside the SporeVM guest, which is
-  the existing isolation boundary. The builder adds no new device type or
-  monitor protocol. It may attach one additional read-only virtio-blk instance
-  containing the context disk, and otherwise stays within the existing
-  hypervisor-neutral disk interface. The runtime change is opening a
-  build-owned `ChunkMappedDisk` read-write instead of opening an immutable run
-  image read-only.
+  the existing isolation boundary. The builder adds no new device type. It may
+  attach one read-only virtio-blk context disk and, only in a non-resumable
+  growth session, offer WRITE_ZEROES on the existing root device. The shared
+  virtio parser bounds and prevalidates the complete request before mutation;
+  backend failure poisons the unpublished mutable head so it cannot be
+  snapshotted or forked.
+- `spore-rootfs-grow-v1` is bounded attacker-influenced control input. The
+  managed initrd validates the request/profile combination and device geometry;
+  the host validates its bounded response against the exact target. Malformed
+  input, unsupported ext4 geometry, or an ioctl/block error aborts before
+  PREPARE, Dockerfile records, or the destination ref are published.
 - Step records under `build/steps/` are trusted local build metadata — same
   trust level as the cache directory that holds them — and never leave
   `build/`. The rootfs artifacts they name are normal rootfs CAS
@@ -704,12 +878,14 @@ single-digit seconds end to end, with the BuildKit tar export removed.
 - Executor-side COPY hashing and context-disk emission must consume the same
   immutable sparse-spool slices. No emitted file may reopen the live build
   context, and each COPY request sees only its per-step transport namespace.
-- Built-image metadata must not be mistakable for portable OCI provenance:
-  `kind: sporevm-built-image-v0`, `layers: []`, and explicit
-  `rootfs_storage` pointing at the final `index_digest`. This is the local
-  rootfs metadata field name; portable spore manifests continue to use
-  `rootfs.storage`.
-- Machine state and spore format are untouched. No manifest format changes.
+- Built-image metadata must not be mistakable for portable OCI provenance: it
+  uses the existing `RootFSMetadata` cache shape with `ext4_writer:
+  built-index`, `layers: []`, and explicit `rootfs_storage` pointing at the
+  final `index_digest`. This is the local rootfs metadata field name; portable
+  spore manifests continue to use `rootfs.storage`.
+- Portable machine state and spore format are untouched. Growth-only feature
+  negotiation is transient and capture/restore rejects it; no manifest format
+  or device-ordering change is introduced.
 
 ## Delivery Strategy
 
@@ -732,7 +908,7 @@ Implementation note (2026-07-09): the first M1 implementation slice adds the
 hashing, local step-cache read/write helpers, fully cached build resolution, and
 indexed local image publication/run resolution. M2 starts at executor-owned
 cache misses; it should write the same `sporevm-build-step-v1` records after
-each O(dirty) snapshot.
+each dirty-only sealing/full-index checkpoint.
 
 Implementation note (2026-07-10): COPY discovery opens the canonical context
 root once and walks literal-source parents and glob parents one component at a
@@ -784,11 +960,13 @@ Definition of done:
   usable.
 - A checkpoint taken mid-build boots and fsck's clean when opened from its
   published `index_digest` (freeze correctness smoke).
-- deterministic grow/resize2fs is exercised by the gated build smoke before
+- fixed 16 GiB capacity policy, direct-ioctl PREPARE, transient WRITE_ZEROES,
+  and prepared-base reuse are exercised by the gated build smoke before
   Dockerfile steps execute.
 
-Ceiling proven: uncached RUN/COPY build = one boot + deterministic resize + step
-time + O(dirty) snapshots; cached build ≈ 0.
+Ceiling proven: a first uncached RUN/COPY build = one boot containing direct
+capacity preparation + step time + dirty-only sealing/full-index checkpoints; a prepared uncached
+build = one boot + step time + snapshots; cached build ≈ 0.
 
 Implementation note (2026-07-09, RUN slice): the executor now starts at the
 first uncached `RUN`, opens the parent rootfs through the normal writable
@@ -868,15 +1046,25 @@ version moved to
 `sporevm-build-v5`; older records remain GC roots but are not reusable because
 they may capture filesystem state that raced a surviving RUN descendant.
 
-Implementation note (2026-07-10, stable grow target): the automatic sparse
-disk target is computed once from the `FROM` storage and carried with build
-state across cache hits. A miss requests growth only while the current rootfs
-is smaller than that anchored target. Resuming after a cached prefix therefore
-does not recompute the policy from an already-grown child, double the image,
-or add a second `resize2fs` step. Step records keep the existing identity: the
-first step that performs growth includes the target, while later steps use
-zero, so valid v5 records remain reusable and incorrectly re-grown records
-fall out of the corrected lookup path without another cache-version bump.
+Superseded implementation note (2026-07-10, v6 stable grow target): v6 anchored
+the former additive/doubling target to `FROM` and included that target in the
+first Dockerfile step key. This stopped recursive growth within a cached chain
+but still coupled routine filesystem resize to the first executor miss and
+required guest `resize2fs`. Build cache v7 replaces that mechanism completely:
+the idempotent automatic target is `max(FROM.logical_size, 16 GiB)`, preparation
+has its own parent/target/producer key, and Dockerfile step keys contain no
+growth field. v6 records remain conservative GC roots but cannot hit v7 keys.
+
+Implementation note (2026-07-11, v7 capacity preparation): compact FROM images
+append clean known-zero coverage without physical preallocation. The
+non-resumable growth VM temporarily negotiates WRITE_ZEROES, then the managed
+initrd handles `spore-rootfs-grow-v1` with `EXT4_IOC_RESIZE_FS` and bounded
+geometry validation. Freeze → metadata-only sealing plus canonical full-index
+emission → completeness stamp →
+`PREPARE` record → thaw occurs before Dockerfile step zero, and the same VM
+continues on a miss. A hit supplies the normal Dockerfile parent even under
+`--no-cache`. The hidden growth override was removed; above-cap images remain
+byte-exact and are never rounded or doubled.
 
 Implementation note (2026-07-10, checkpoint control latency): repeated
 freeze/thaw requests used fixed session identities, which reused the same
@@ -886,7 +1074,7 @@ streams now receive monotonically sequenced dynamic host ports, and checkpoint
 session identities include the step number. The VM smoke records the slowest
 freeze/thaw control and requires it to stay below two seconds; the corrected
 run completed these controls in milliseconds. Snapshot cost remains measured
-separately, including the first checkpoint after disk growth.
+separately, including the PREPARE checkpoint after disk growth.
 
 Implementation note (2026-07-09, COPY/context-disk slice): the executor step
 list is now a tagged RUN/COPY sequence, so the first uncached COPY enters the
@@ -905,9 +1093,8 @@ preserving Docker-style rootfs-internal and final-component symlink traversal.
 COPY checkpoints use the same freeze → snapshot → complete stamp → step
 record → thaw ordering as RUN; if any COPY request in a step fails, the build
 fails before snapshot promotion for that step. Session start uses the
-deterministic sparse grow policy above and includes the resolved grow target in
-the first executor-written step key; the hidden `--disk-grow-target` debug
-override bypasses the policy and uses the same key field. A manual
+prepared parent produced by the v7 policy above; COPY keys never carry a grow
+target, and there is no capacity override. A manual
 Docker-vs-Spore metadata oracle lives at
 `scripts/spore-build-copy-oracle.sh`.
 
@@ -915,23 +1102,25 @@ Implementation note (2026-07-10, GC coordination): after `FROM` resolution,
 the build holds the rootfs-cache coarse lock across step-cache lookup and VM
 execution. Lazy runtime-disk setup borrows that live, root-bound guard while it
 publishes the baseline lease, instead of trying to lock the same cache again.
-The build retains ownership and releases the lock before final image
-publication. Valid
+The build retains ownership through final metadata/ref publication. Valid
 `sporevm-build-step-v1` records are GC roots for their child index and objects;
 known incomplete records are ignored as cache misses, and unknown future record
 kinds retain the CAS conservatively. Record retention/pruning remains
 post-core hardening work.
 
-Implementation note (2026-07-10, original workload proof): build RUN requests
-refresh the guest realtime clock before execution, and mounted rootfs images
+Historical implementation note (2026-07-10, original pre-v7 workload proof):
+build RUN requests refresh the guest realtime clock before execution, and
+mounted rootfs images
 receive devpts plus the standard `/dev/fd`, stdio, and `ptmx` links. Named image
 creation accepts the immutable rootfs metadata already recorded by the
 lifecycle parent. The original committed `buildkite-sporevm` Dockerfile context
 at `ad89671` completed its forced `--no-cache` build against the existing
 BuildKit-produced base OCI in 42.59s with no manual disk-headroom override; its
-long apt transaction and Docker package installation both completed. Repeating
-an input key after a forced execution now atomically replaces only the derived
-step mapping, while rootfs CAS indexes and objects retain immutable publication.
+long apt transaction and Docker package installation both completed. This is
+retained as workload-compatibility history, not current capacity-path timing.
+Repeating an input key after a forced execution now atomically replaces only
+the derived step mapping, while rootfs CAS indexes and objects retain immutable
+publication.
 
 Post-merge acceptance on `0a99933` rebuilt the same original Dockerfile in
 148.78s cold, 9.87s warm, and 7.31s after changing one context file. The image
@@ -961,7 +1150,7 @@ Definition of done:
 
 Ceiling proven: cached full build (parse + stat-only context hash + lookups +
 ref refresh) ≤2s warm-stat; uncached COPY ≈ context-disk emit/reuse +
-guest disk-to-disk apply plus one freeze/O(dirty) snapshot, with boot
+guest disk-to-disk apply plus one freeze/dirty-only sealing and full-index checkpoint, with boot
 amortized per build.
 
 ### M3 — Wrapper integration and benchmark
@@ -1006,12 +1195,17 @@ Tests:
 - Step keys: golden tests that keys are stable across runs and change exactly
   when the spec says (each invalidation rule in the Cache Model section gets a
   test).
-- Step cache: records survive process restart; missing artifact ⇒ miss;
-  corrupted record ⇒ miss; missing complete stamp ⇒ miss; atomic write (no
-  partial records after simulated crash between snapshot publication and
-  record write).
+- Step cache: v7 PREPARE keys vary with parent, exact target, and producer;
+  Dockerfile keys use the prepared child and contain no growth target; records
+  survive process restart; missing artifact ⇒ miss; corrupted record ⇒ miss;
+  missing complete stamp ⇒ miss without repair; atomic write leaves no partial
+  record after simulated failure between snapshot publication and record write;
+  v6 records remain GC roots but are cache misses.
 - Executor: exit-code propagation, env/workdir application, network
-  on/off, deterministic disk growth, failure cleanup.
+  on/off, idempotent 16 GiB policy, already-large preservation, clean-zero
+  sparse growth, direct resize response validation, same-VM PREPARE checkpoint,
+  `--no-cache` PREPARE reuse, and failure cleanup before any Dockerfile step or
+  destination-ref publication.
 - COPY matrix listed above, plus context-escape rejection tests.
 - Large COPY: generated sparse fixture with aggregate payload above guest RAM
   succeeds through context-disk apply and records emitted/reused diagnostics.
@@ -1029,7 +1223,9 @@ spore build profile: phase=parse ms=…
 spore build profile: phase=base_resolve ms=…
 spore build profile: phase=context_hash ms=…
 spore build profile: phase=context_disk cache=emitted|reused ms=…
-spore build profile: phase=session_start overlay_ms=… resize_ms=… boot_ms=…
+spore build profile: phase=prepare cache=hit|miss|not-needed target_bytes=…
+  overlay_ms=… resize_ms=… snapshot_ms=…
+spore build profile: phase=session_start boot_ms=…
 spore build profile: step=3 kind=RUN cache=miss exec_ms=… freeze_ms=…
   snapshot_ms=… dirty_chunks=… objects_written=… complete_stamp_ms=…
 spore build profile: phase=finalize shutdown_ms=…
@@ -1042,14 +1238,18 @@ Benchmark plan (M3, recorded in `docs/benchmarks.md`):
 | Scenario | Baseline (buildx+import) | Target |
 | --- | ---: | ---: |
 | Fully cached wrapper rebuild | ~30s warm, ~25s BuildKit tar export | low single-digit wall, `spore build` ≤1s |
-| One trailing RUN changed | 25-45s tar export + import on content change | command + one boot + O(dirty) snapshot |
-| One context file changed | 25-45s tar export + import on content change | COPY apply + one boot + O(dirty) snapshot |
-| Fully uncached (base cached) | BuildKit build + tar export + ~95s import | no tar export; one boot + work + O(dirty) snapshots |
+| One trailing RUN changed | 25-45s tar export + import on content change | command + one boot + dirty-only seal/index checkpoint |
+| One context file changed | 25-45s tar export + import on content change | COPY apply + one boot + dirty-only seal/index checkpoint |
+| Fully uncached (base cached) | BuildKit build + tar export + ~95s import | no tar export; one boot + work + seal/index checkpoints |
 | Base image changed | base import + BuildKit build/export/import | import base once, then rerun changed steps directly |
 
 Each row is measured with the profile phases above plus wall clock on the same
 machine as the current buildkite-sporevm observations, and validated by booting
-the result and running the Rails spec smoke.
+the result and running the Rails spec smoke. The baselines in this table predate
+v7 capacity preparation and remain useful for the wrapper migration only. They
+must not be cited as evidence for the current growth path; cold, prepared,
+warm, incremental, large COPY/RUN, ENOSPC, HVF, and KVM capacity gates are
+defined in `docs/plans/spore-build-rootfs-capacity.md`.
 
 ## Resolved Decisions
 
@@ -1078,9 +1278,20 @@ the result and running the Rails spec smoke.
 - ARG over-invalidation (all declared args key all later exec steps, including
   unused ARGs) accepted for v1 simplicity; the target Dockerfile passes no build
   args.
-- Grow-only sparse disk sizing in v1; no shrink pass. The automatic target is
-  `max(2 * parent_logical_size, parent_logical_size + 8 GiB)` rounded to chunk
-  size, with a hidden debug override only for diagnosing ENOSPC workloads.
+- Grow-only sparse disk sizing; no shrink pass. The automatic target is
+  `max(parent_logical_size, 16 GiB)`. Sixteen GiB is the automatic default and
+  cap: smaller images normalize once, while images already at or above it keep
+  their exact size. There is no hidden override, recursive doubling, additive
+  growth, or public knob.
+- Capacity normalization is the typed synthetic `PREPARE` operation in build
+  cache v7, keyed by parent index, exact target, and exact kernel/initrd plus
+  growth-contract producer identity. Dockerfile keys contain no capacity field,
+  but bind the exact executor kernel/initrd identity; `--no-cache` still reuses
+  PREPARE.
+- The storage layer records the appended sparse tail as authoritative clean
+  zero. Growth-only VMs transiently offer WRITE_ZEROES, and the managed initrd
+  owns ext4 correctness through `EXT4_IOC_RESIZE_FS`. The selected image has no
+  shell or e2fsprogs dependency for preparation.
 - The build executor calls the internal monitor path directly with writable
   rootfs and build-context state. Public `spore run --rootfs` remains
   read-only.
@@ -1093,11 +1304,13 @@ the result and running the Rails spec smoke.
 
 ## Open Questions
 
-- Teach import-tar/native ext4 emission to create generously sized sparse
-  images at import time, so build-start resize becomes a fallback for old or
-  unusually small images rather than routine work.
-- Reuse the same sizing policy for `spore run` writable rootfs paths when that
-  path grows rootfs disks by default; do not change public run semantics in M2.
+- Capacity-at-import remains an optional optimization only if measurements show
+  value. PREPARE is the product contract because it also covers existing local,
+  committed, cached, and source-less images without multiplying formats or
+  user intent.
+- Any future automatic capacity above 16 GiB needs a compact index format or a
+  lower proven dense-index ceiling; the current 64 MiB index limit is a hard
+  format constraint, not a reason to add a user knob.
 
 ## Key Learnings From Pressure-Testing
 
@@ -1107,9 +1320,17 @@ the result and running the Rails spec smoke.
   objects remain immutable and fail closed on conflicting bytes.
 - The ext4 free-space problem is the biggest silent correctness trap: imported
   bases are sized to content, so the first apt-get in a RUN would ENOSPC.
-  The plan makes automatic sparse growth a first-class, tested step (open
-  index → compute deterministic target → grow → resize2fs → boot) rather than
-  a user-facing knob or an incident discovered during wrapper integration.
+  The implemented answer is reusable infrastructure normalization: compute the
+  fixed absolute target, append clean-zero sparse coverage, let the pinned
+  kernel resize ext4 directly, and publish PREPARE before arbitrary RUN. It is
+  not a user-facing knob or an ENOSPC replay loop.
+- Separating PREPARE from Dockerfile identity is what removes the cold-build
+  cliff without pretending guest filesystem mutation is reproducible. One
+  locally recorded child becomes the normal parent for unrelated Dockerfiles
+  and forced executions; exact child index identity remains authoritative.
+- Transient WRITE_ZEROES is a better use of the chunk-mapped architecture than
+  teaching the host ext4 layout. Linux retains filesystem ownership, while
+  storage-known zero operations avoid payload I/O and later zero scans.
 - Guest-side COPY looked expensive at first (a VM boot to copy files) but
   removes the entire macOS host-filesystem fidelity problem (case
   sensitivity, ownership without root, xattrs); with the persistent session

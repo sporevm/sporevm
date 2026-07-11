@@ -29,16 +29,65 @@ identity and are rebuilt from the source image rather than migrated. `spore
 rootfs cas-preload --attach-spore` remains a repair/debug path for existing
 exact-rootfs spores; it is not the normal producer path.
 
+`spore build` uses the same descriptor-bound indexes and writable head. Before
+the first executor-backed instruction, builder v7 computes
+`max(parent_logical_size, 16 GiB)`. A smaller parent is extended once with
+authoritative clean-zero chunks; a parent already at or above 16 GiB retains
+its exact geometry. There is no recursive headroom rule or build capacity
+override. The transient growth profile offers virtio-blk `WRITE_ZEROES`, and
+the managed initrd invokes `EXT4_IOC_RESIZE_FS` from the visible device size,
+so the zero range remains sparse and the growth path invokes neither the
+image's shell nor `resize2fs`.
+
+The grown canonical index is published as a complete rootfs before a typed
+builder-v7 `PREPARE` record makes it reusable. Its key binds the immutable
+parent index, exact target, platform, and exact kernel/initrd plus growth
+protocol identity. `--no-cache` bypasses Dockerfile step-record reads but still
+reuses PREPARE because capacity normalization is infrastructure, not a
+Dockerfile result. RUN/COPY/WORKDIR keys separately bind the same exact
+executor identity. The managed default derives that identity from canonical
+kernel and embedded-initrd digests without reading the artifact bodies on a
+fully cached build; a later miss verifies the once-opened kernel bytes and
+boots that same allocation. Explicit overrides are eagerly retained. Old
+build records remain conservative GC roots but miss under v7; existing rootfs
+indexes and local images remain readable. Failed
+growth, quiescence, completeness, PREPARE, step, or ref publication never
+rewrites the parent or makes incomplete storage reachable.
+
+A format-valid source may end partway through its final 64 KiB chunk. Growth
+preserves and, for CAS sources, verifies that old prefix, materializes at most
+that one chunk, and exposes only sparse zero bytes after the old logical end.
+Known-zero partial tails remain metadata-only. Allocation, read, write, or
+resize failure leaves the source map, digests, dirty state, and logical size
+unchanged.
+
 `spore run --image ... --commit local/name:tag` uses the same writable head but
 publishes its sealed root disk as a new indexed local image after a successful
 guest command. The transaction holds the rootfs cache lock from snapshot
 sealing through the completeness stamp, metadata write, and atomic local-ref
 replacement, so concurrent rootfs collection cannot remove an unpublished CAS
 object. Failed commands and failed snapshots do not update the ref.
-With `--disk-size`, the runtime extends only its private sparse head to the
-requested absolute, chunk-aligned size and requires guest `resize2fs` success
-before starting the user command. The committed rootfs storage descriptor and
-disk index use that grown logical size; the immutable source index is unchanged.
+With `--disk-size`, SporeVM first resolves the source image config and requires
+a complete, descriptor-bound rootfs index, then validates the requested
+absolute size against that immutable source. Referenced chunks remain subject
+to the normal CAS verification contract. The size must be 64 KiB aligned and
+cannot shrink the source; an equal size is an idempotent no-op.
+Only the run's private sparse head is extended, and the appended range enters
+the chunk map as authoritative clean zeros rather than allocated payload. The
+growth-only virtio-blk profile accepts `WRITE_ZEROES`, so ext4 zeroing can clear
+those ranges without proportional overlay or CAS storage.
+
+Before starting the user command, the managed initrd agent derives the visible
+device size with `BLKGETSIZE64`, invokes `EXT4_IOC_RESIZE_FS` on the mounted
+rootfs, syncs it, and returns bounded filesystem geometry for host validation.
+This path does not execute the image's shell or require `resize2fs` or any other
+guest package. Growth sessions use the internal `noinit_itable` mount policy so
+checksum-enabled ext4 layouts finish new inode-table initialization before the
+command and rootfs snapshot instead of leaving a background initializer. A
+missing or mismatched source, invalid geometry, failed zeroing or ioctl, or
+malformed result aborts before the destination ref changes. The committed
+rootfs descriptor and disk index use the grown logical size; the immutable
+source index remains unchanged.
 
 Plain `spore run --rootfs PATH` is still a local read-only escape hatch. Named
 `spore create --rootfs PATH` records exact immutable rootfs identity in the

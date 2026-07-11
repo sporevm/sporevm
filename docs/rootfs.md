@@ -48,6 +48,35 @@ Without `--`, the command runs as `/bin/sh -lc` in the guest. Use
 `-- <argv...>` for exact argv. `--image` applies OCI image `Env` and
 `WorkingDir` when present. It does not apply OCI Entrypoint, Cmd, or User.
 
+`spore build` prepares capacity automatically before the first executor-backed
+Dockerfile instruction. A valid rootfs smaller than 16 GiB grows once to
+exactly 16 GiB; an image already at or above 16 GiB keeps its exact size. The
+policy is absolute and idempotent, so imported OCI images, existing local
+images, committed images, and cached intermediates never recursively double.
+There is no build disk-size, inode-density, or resize-tool option.
+
+The appended logical range is authoritative sparse zero storage. During the
+one growth boot, the managed initrd derives the visible device geometry and
+calls `EXT4_IOC_RESIZE_FS`; capacity preparation does not invoke the selected
+image's shell and needs no e2fsprogs or `resize2fs`. Builder-v7 records the
+complete grown index as a typed `PREPARE` derivation keyed by the parent,
+exact target, and exact kernel/initrd growth
+producer. Other Dockerfiles—and `--no-cache` builds that intentionally bypass
+Dockerfile instruction-cache reads—reuse that preparation without another
+resize. RUN/COPY/WORKDIR cache keys also bind that exact executor identity, so
+a different agent/kernel cannot reuse downstream outputs merely because it
+produced the same prepared bytes. A miss snapshots and publishes `PREPARE`
+before step zero, then continues in the same VM with the digest-bound boot
+artifacts. Managed-default cache hits do not read the kernel or initrd bodies;
+an executor miss verifies and boots the same once-opened kernel bytes.
+
+Block or inode exhaustion during COPY/RUN is terminal for that invocation.
+SporeVM does not replay a step that may have external side effects and does not
+publish the failed step or destination ref. The v1 16 GiB build cap keeps a
+fully populated rootfs index below the current canonical-index limit; a larger
+build capacity requires separate index-format/limit work rather than an unsafe
+override.
+
 Add `--save` to make rootfs writes part of the spore. The guest still sees a
 normal root filesystem, but writes land in a local chunk-mapped head and save
 seals the changed chunks as a disk index:
@@ -94,17 +123,36 @@ Image commit can grow the root disk before setup runs:
 ```bash
 spore run \
   --image local/docker-capable:base \
-  --disk-size 40gb \
+  --disk-size 20gb \
   --commit local/docker-capable:large \
   -- /usr/local/bin/prepare
 ```
 
 `--disk-size` is an absolute logical size, must be 64 KiB aligned, and cannot
-shrink the source image. The first version requires `--commit`. SporeVM grows
-the sparse block device, runs `resize2fs /dev/vda` inside the guest before the
-user command, and publishes nothing if block growth or filesystem resize fails.
-The source image must provide `/bin/sh` and `resize2fs`; this is the same guest
-tool requirement as an executing `spore build` cache miss.
+shrink the resolved source image. An equal size is allowed and performs no
+growth. Explicit sizes are still bounded by the 64 MiB canonical-index format:
+a sufficiently dense disk above about 30.62 GiB fails snapshot/commit closed,
+so use the smallest required capacity. The first version requires `--commit`;
+it also requires the fresh
+`--image` source to resolve to complete indexed rootfs storage and the
+destination to be a valid mutable local ref. SporeVM resolves that immutable
+source before opening a private writable head. A missing or mismatched source
+fails before boot; when source and destination are the same tag, any later
+failure leaves the previous ref unchanged.
+
+For a larger target, SporeVM extends the private head sparsely and records the
+appended range as known-zero chunks. A non-resumable growth-session virtio-blk
+profile exposes `WRITE_ZEROES`, allowing ext4 zero ranges to remain sparse in
+the overlay and rootfs CAS. Before the user command, the managed initrd agent
+reads the visible block-device geometry and calls `EXT4_IOC_RESIZE_FS` directly
+on the mounted rootfs, then syncs the filesystem and returns bounded geometry
+that the host checks against the requested target. The growth step does not
+invoke the selected image's shell and needs no `resize2fs` or e2fsprogs.
+Growth sessions mount with the internal `noinit_itable` policy so
+checksum-enabled ext4 filesystems complete inode-table
+initialization synchronously before commit. Any block growth, zeroing, ioctl,
+sync, or response-validation failure aborts before the command and publishes
+nothing.
 
 Commit is the storage-preparation layer for fan-out, not the warm-machine
 layer. Prepare stable dependencies or Docker data into an image, put frequently

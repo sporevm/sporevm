@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-10
+last_reviewed: 2026-07-11
 spec_refs:
   - docs/filesystem.md
   - docs/lifecycle.md
@@ -55,6 +55,13 @@ The implementation reuses the storage machinery already proven by
 canonical image identity, and local-ref publication. `spore build` remains the
 Dockerfile and cached-recipe frontend; `run --commit` is the direct imperative
 escape hatch.
+
+Disk growth now uses the same backend-neutral path as build preparation: a
+known-zero sparse tail, a non-resumable virtio-blk `WRITE_ZEROES` profile, and
+the fixed `spore-rootfs-grow-v1` managed-initrd request. The agent derives the
+target from the visible block device and calls `EXT4_IOC_RESIZE_FS` directly;
+the growth step does not invoke the source image's shell and does not need
+`resize2fs` or e2fsprogs.
 
 Commit supplies the reusable disk layer for fan-out, not the warm-machine layer.
 The intended composition is: prepare and commit the disk once, capture one warm
@@ -203,6 +210,50 @@ The first slice accepts a fresh, non-interactive `--image` run only. It rejects:
 - missing commands and non-local destination refs.
 
 These are deliberately narrow first-slice restrictions, not format limits.
+
+### Disk capacity
+
+Image commit can request an exact larger root disk:
+
+```bash
+spore run \
+  --image local/docker-capable:base \
+  --disk-size 20gb \
+  --commit local/docker-capable:large \
+  -- /usr/local/bin/prepare
+```
+
+`--disk-size` is an absolute logical size, not additive headroom. It must be
+64 KiB aligned and at least the resolved source's logical size; equality is an
+idempotent no-op, while a smaller request is rejected before boot. The option
+requires a fresh `--image` commit with complete indexed rootfs storage and a
+valid local destination ref.
+
+Explicit logical size does not bypass the current 64 MiB canonical-index
+limit. A sufficiently dense disk above about 30.62 GiB fails snapshot or
+commit closed; copyable examples therefore use 20 GiB, which remains encodable
+even when fully populated.
+
+For growth, the runtime extends only the private sparse head and marks the
+appended range as authoritative clean zeros. The growth-only virtio-blk profile
+accepts `WRITE_ZEROES`, allowing filesystem zero ranges to stay free of
+proportional overlay and CAS payload. The managed initrd agent reads
+`BLKGETSIZE64`, calls `EXT4_IOC_RESIZE_FS` on the mounted rootfs, runs `syncfs`,
+and returns bounded block, free-space, and inode geometry. The host requires
+the reported device size to match the exact requested target before it starts
+the user command.
+
+Growth sessions mount ext4 with the internal `noinit_itable` policy. This is
+particularly important for checksum-enabled layouts: newly added inode tables
+finish initialization synchronously rather than remaining writable background
+work after preparation or commit. The policy is not a user option, and the
+growth-only device feature profile is never serialized as portable machine
+state.
+
+Source/config/index resolution, shrink and alignment checks, block growth,
+zeroing, the ioctl, sync, and response validation are all fail-closed. The
+destination ref is not touched until the later commit transaction is complete,
+including when source and destination name the same mutable local tag.
 
 ### Transient setup inputs
 
@@ -414,19 +465,23 @@ For a successful fresh image-backed run:
 
 1. Resolve the source ref to immutable image config and complete indexed rootfs
    storage before starting the VM.
-2. Open the normal private writable root disk and execute the command using the
-   existing run path.
-3. If the command exits nonzero or the client is interrupted, tear down without
+2. If `--disk-size` is present, validate its absolute aligned size against the
+   resolved source and extend only the private sparse head with known-zero
+   chunks. Boot the non-resumable growth profile, issue
+   `spore-rootfs-grow-v1`, and require the initrd agent's ioctl and bounded
+   geometry result to match the visible target before continuing.
+3. Execute the command using the existing run path.
+4. If the command exits nonzero or the client is interrupted, tear down without
    publishing anything.
-4. Ask the guest agent to freeze the root filesystem using the existing bounded
+5. Ask the guest agent to freeze the root filesystem using the existing bounded
    `fsfreeze-v1` request.
-5. Drain the relevant virtio-blk queue and snapshot the writable disk index into
+6. Drain the relevant virtio-blk queue and snapshot the writable disk index into
    the rootfs CAS.
-6. Convert the disk descriptor to `RootfsStorage`, verify completeness, and
+7. Convert the disk descriptor to `RootfsStorage`, verify completeness, and
    publish canonical image metadata with the inherited source config.
-7. Atomically replace the requested mutable local ref only after all immutable
+8. Atomically replace the requested mutable local ref only after all immutable
    chunks and metadata are durable.
-8. Tear down the guest and release runtime resources. A post-publication cleanup
+9. Tear down the guest and release runtime resources. A post-publication cleanup
    warning does not make a complete committed image invalid.
 
 Publication must be safe against concurrent rootfs GC. Hold the cache lock from
@@ -457,6 +512,16 @@ command must stop and clean application daemons before returning success.
   the committed image contains it.
 - **Source-equals-destination safety.** Source resolution completes before any
   possible destination ref replacement.
+- **Absolute source-bound growth.** Disk size is validated against the resolved
+  source, never interpreted as an increment, and never shrinks or mutates that
+  source.
+- **No guest-tool dependency.** Filesystem growth is a fixed managed-initrd
+  ioctl request; image contents cannot replace the grower or select its target.
+- **Quiescent growth completion.** Internal `noinit_itable` handling prevents a
+  checksum-enabled filesystem from reporting preparation complete while lazy
+  inode-table initialization can still dirty the disk.
+- **Non-resumable growth profile.** Growth-only `WRITE_ZEROES` negotiation is
+  used only before a rootfs-only commit and cannot enter saved machine state.
 - **Backend-neutral artifact.** The output contains architectural rootfs state,
   not KVM or HVF machine state.
 
@@ -489,7 +554,9 @@ Added by S0 and S1:
 - an exclusive cache lock spanning snapshot sealing through ref replacement;
 - transient `--inject` support for disk-only commits while whole-machine save
   retains its existing rejection;
-- absolute, fail-closed disk growth before the requested command;
+- absolute, fail-closed disk growth before the requested command through the
+  shared known-zero, growth-session `WRITE_ZEROES`, and managed-initrd ext4
+  ioctl path, with no guest package dependency;
 - backend-neutral smoke scripts plus durable rootfs, lifecycle, security, API,
   and release documentation.
 
@@ -503,8 +570,9 @@ Implementation progress:
 - [x] S0 fan-out proof: commit, save, offline two-child fork, and isolated
   per-child writable heads over the committed base.
 - [x] S0 review/commit.
-- [x] S1 implementation: absolute chunk-aligned disk sizing, sparse growth,
-  pre-command guest resize, shrink rejection, API/docs, and HVF smoke coverage.
+- [x] S1 implementation: absolute chunk-aligned disk sizing, known-zero sparse
+  growth, pre-command managed-initrd ext4 ioctl, growth-session `WRITE_ZEROES`
+  and `noinit_itable`, shrink rejection, API/docs, and HVF smoke coverage.
 - [x] S1 review/commit.
 - [x] S2 downstream decision gate: the real Buildkite code image cannot be
   represented above the committed cache with the current build contracts; the
@@ -557,9 +625,12 @@ No Docker/Compose code and no manifest-format change.
 ### S1 — Generic disk capacity
 
 Expose absolute `--disk-size SIZE` for image-backed runs, initially required
-only with commit. Reuse the internal sparse grow path and run guest
-`resize2fs` before the user command. Reject shrinking and publish no image if
-block-device or filesystem growth fails.
+only with commit. Reuse the shared known-zero sparse grow path, enable the
+non-resumable rootfs-growth `WRITE_ZEROES` profile, and issue the fixed direct
+ext4 ioctl request through the managed initrd before the user command. Reject
+shrinking, require exact bounded geometry, and publish no image if block-device
+or filesystem growth fails. Do not depend on the source image's shell or
+filesystem tools.
 
 This is a generic resource option for any large prepared rootfs, not Docker
 storage configuration.
@@ -648,6 +719,12 @@ remains the compatible fan-out path for networked or additional-device layouts.
   semantics.
 - Verify source config inheritance and absence of run-only settings from output
   config.
+- Verify `--disk-size` accepts an equal-size no-op and an aligned absolute grow,
+  rejects unaligned sizes and shrink attempts before boot, and works from an
+  image with no shell or e2fsprogs installed.
+- Verify native and checksum-enabled ext4 sources grow through the same request,
+  checksum-enabled growth uses `noinit_itable`, and no background inode-table
+  writes remain before the command or snapshot.
 - Verify output images work with `run`, `create`, accounting, prune, and every
   existing local-image consumer.
 - Verify commit → save → offline fork → per-child `run --from` preserves
@@ -659,8 +736,11 @@ remains the compatible fan-out path for networked or additional-device layouts.
 
 - Interrupt during command execution, freeze, snapshot, completeness marking,
   metadata write, and local-ref replacement.
-- Inject guest freeze timeout, ENOSPC, corrupt/missing CAS objects, and metadata
-  failures.
+- Inject guest grow timeout, `WRITE_ZEROES` backend failure, ioctl/sync failure,
+  malformed or mismatched grow geometry, freeze timeout, ENOSPC,
+  corrupt/missing CAS objects, and metadata failures.
+- Prove every growth failure and every invalid or incomplete source leaves a
+  pre-existing destination ref unchanged, including source-equals-destination.
 - Run rootfs GC at every legal publication boundary.
 - Retry after each failure without manual cache repair.
 
@@ -668,6 +748,8 @@ remains the compatible fan-out path for networked or additional-device layouts.
 
 - Compare source and output indexes to prove unchanged descriptors remain
   shared.
+- Prove appended logical zeros allocate no proportional sparse-head or CAS
+  payload and that snapshot work scales with changed ext4 metadata chunks.
 - Record dirty chunks, new CAS bytes, sparse-head bytes, index size, and
   freeze/snapshot/publication time.
 - Establish that commit cost scales with dirty chunks, not logical rootfs size.
@@ -733,7 +815,9 @@ remains the compatible fan-out path for networked or additional-device layouts.
 - Execute every requested commit; leave caching and mutable-input policy to
   callers.
 - Permit source and destination to be the same tag through atomic ordering.
-- Add generic disk sizing separately.
+- Keep generic disk sizing as absolute, 64 KiB-aligned `run --commit
+  --disk-size`; implement growth in the managed initrd and keep guest image
+  tools outside the contract.
 - Keep Compose and registry policy downstream.
 - Defer named commit and large generic inputs until measured use demands them.
 - Do not add `spore fork --image`; images are cold-boot bases, spores are fork
