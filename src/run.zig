@@ -3889,6 +3889,9 @@ pub const RootfsGrowResult = struct {
     device_bytes: u64,
     block_size: u64,
     target_blocks: u64,
+    before_blocks: u64,
+    filesystem_blocks: u64,
+    blocks_per_group: u32,
     usable_blocks: u64,
     free_bytes: u64,
     inodes: u64,
@@ -3906,6 +3909,9 @@ pub fn parseRootfsGrowResponse(bytes: []const u8) !RootfsGrowResult {
     const device_bytes = try parseRootfsGrowField(tokens.next(), "device_bytes");
     const block_size = try parseRootfsGrowField(tokens.next(), "block_size");
     const target_blocks = try parseRootfsGrowField(tokens.next(), "target_blocks");
+    const before_blocks = try parseRootfsGrowField(tokens.next(), "before_blocks");
+    const filesystem_blocks = try parseRootfsGrowField(tokens.next(), "filesystem_blocks");
+    const blocks_per_group_raw = try parseRootfsGrowField(tokens.next(), "blocks_per_group");
     const usable_blocks = try parseRootfsGrowField(tokens.next(), "usable_blocks");
     const free_bytes = try parseRootfsGrowField(tokens.next(), "free_bytes");
     const inodes = try parseRootfsGrowField(tokens.next(), "inodes");
@@ -3914,13 +3920,19 @@ pub fn parseRootfsGrowResponse(bytes: []const u8) !RootfsGrowResult {
 
     if (device_bytes == 0 or block_size == 0 or device_bytes % block_size != 0) return error.BadRootfsGrowResponse;
     if (target_blocks != device_bytes / block_size) return error.BadRootfsGrowResponse;
-    if (usable_blocks == 0 or usable_blocks > target_blocks or inodes == 0) return error.BadRootfsGrowResponse;
+    const blocks_per_group = std.math.cast(u32, blocks_per_group_raw) orelse return error.BadRootfsGrowResponse;
+    if (before_blocks == 0 or before_blocks >= filesystem_blocks or filesystem_blocks > target_blocks or blocks_per_group == 0) return error.BadRootfsGrowResponse;
+    if (target_blocks - filesystem_blocks >= blocks_per_group) return error.BadRootfsGrowResponse;
+    if (usable_blocks == 0 or usable_blocks > filesystem_blocks or inodes == 0) return error.BadRootfsGrowResponse;
     const usable_bytes = std.math.mul(u64, usable_blocks, block_size) catch return error.BadRootfsGrowResponse;
     if (free_bytes > usable_bytes or free_bytes % block_size != 0 or free_inodes > inodes) return error.BadRootfsGrowResponse;
     return .{
         .device_bytes = device_bytes,
         .block_size = block_size,
         .target_blocks = target_blocks,
+        .before_blocks = before_blocks,
+        .filesystem_blocks = filesystem_blocks,
+        .blocks_per_group = blocks_per_group,
         .usable_blocks = usable_blocks,
         .free_bytes = free_bytes,
         .inodes = inodes,

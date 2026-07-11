@@ -79,7 +79,11 @@ those ranges without proportional overlay or CAS storage.
 
 Before starting the user command, the managed initrd agent derives the visible
 device size with `BLKGETSIZE64`, invokes `EXT4_IOC_RESIZE_FS` on the mounted
-rootfs, syncs it, and returns bounded filesystem geometry for host validation.
+rootfs, and syncs it. It decodes the primary ext4 superblock before and after
+the ioctl; the block count must increase, stay at or below the device-derived
+target, and miss it by less than one ext4 block group. The host independently
+validates the exact response against the same invariants while `statfs`
+supplies free-space/inode diagnostics only.
 This path does not execute the image's shell or require `resize2fs` or any other
 guest package. Growth sessions use the internal `noinit_itable` mount policy so
 checksum-enabled ext4 layouts finish new inode-table initialization before the

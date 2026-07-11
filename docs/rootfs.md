@@ -145,8 +145,11 @@ appended range as known-zero chunks. A non-resumable growth-session virtio-blk
 profile exposes `WRITE_ZEROES`, allowing ext4 zero ranges to remain sparse in
 the overlay and rootfs CAS. Before the user command, the managed initrd agent
 reads the visible block-device geometry and calls `EXT4_IOC_RESIZE_FS` directly
-on the mounted rootfs, then syncs the filesystem and returns bounded geometry
-that the host checks against the requested target. The growth step does not
+on the mounted rootfs, then syncs the filesystem. A feature-aware primary
+superblock read must show that the filesystem block count increased and reached
+the device-derived target within less than one ext4 block group; the host
+independently validates the exact response against the same invariants. The
+growth step does not
 invoke the selected image's shell and needs no `resize2fs` or e2fsprogs.
 Growth sessions mount with the internal `noinit_itable` policy so
 checksum-enabled ext4 filesystems complete inode-table

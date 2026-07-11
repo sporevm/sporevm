@@ -308,6 +308,9 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         error.BuildGuestResizeFailed => {
             try stderr.writeAll("spore build: guest rootfs growth failed before executing build steps\n");
         },
+        error.Poisoned => {
+            try stderr.writeAll("spore build: rootfs storage failed after a validated write; unpublished state was discarded\n");
+        },
         error.BuildGuestProtocolFailed => {
             try stderr.writeAll("spore build: guest executor protocol failed\n");
         },

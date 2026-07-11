@@ -751,7 +751,13 @@ pub const ChunkMappedDisk = struct {
             if (descriptor.overlay(chunk_index)) {
                 source.* = .overlay;
             } else if (descriptor.zero(chunk_index)) {
-                source.* = .zero_dirty;
+                // A zero already authoritative in the descriptor-bound
+                // baseline stays clean. A new zero override must remain dirty
+                // so the next snapshot cannot incorrectly reuse nonzero parent
+                // authority or return a no-op disk.
+                if (!self.chunkKnownZero(chunk_index)) {
+                    source.* = .zero_dirty;
+                }
             }
         }
         self.overlay_fd = overlay_fd;
@@ -2147,6 +2153,7 @@ test "known zero growth reuses appended coverage without sealing" {
     var stats: SnapshotStats = .{};
     const grown = try disk.snapshotIndexWithStats(snapshot_dir, .{ .mmio_slot = 1 }, true, &stats);
     defer freeTestDisk(allocator, grown);
+    try std.testing.expect(!std.mem.eql(u8, parent.base, grown.base));
     try std.testing.expect(!stats.full_scan);
     try std.testing.expectEqual(@as(usize, 0), stats.sealed_candidate_chunks);
     try std.testing.expectEqual(@as(u64, 0), stats.work.sealed_chunks);
@@ -2779,6 +2786,7 @@ test "portable fork head round trips overlay and zero overrides" {
     _ = std.c.close(replaced_fd);
     child_fd = claimed_fd;
     head.overlay_fd = -1;
+    try std.testing.expectEqual(Source.zero_dirty, child.sources[2]);
 
     const readback = try allocator.alloc(u8, disk_size);
     defer allocator.free(readback);
@@ -2794,6 +2802,66 @@ test "portable fork head round trips overlay and zero overrides" {
     try child.writeAt(&child_patch, spore.disk_chunk_size + 91);
     try parent.readAt(readback[0..child_patch.len], spore.disk_chunk_size + 91);
     try std.testing.expectEqualSlices(u8, model[spore.disk_chunk_size + 91 ..][0..child_patch.len], readback[0..child_patch.len]);
+}
+
+test "portable fork adoption preserves authoritative clean grown zeroes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const chunk_size: usize = @intCast(spore.disk_chunk_size);
+    const grown_size = 2 * chunk_size;
+    const base_bytes = try allocator.alloc(u8, grown_size);
+    defer allocator.free(base_bytes);
+    @memset(base_bytes, 0);
+    @memset(base_bytes[0..chunk_size], 0x6d);
+    var base = try tmp.dir.createFile(io, "clean-grow-base.img", .{ .read = true });
+    defer base.close(io);
+    try base.writeStreamingAll(io, base_bytes);
+    const base_source = block_source.FileBlockSource.init(base.handle, grown_size);
+
+    const parent_fd = try createTempOverlayFd(allocator, runtime_overlay_dir);
+    defer _ = std.c.close(parent_fd);
+    var parent = try ChunkMappedDisk.initWritable(allocator, base_source, parent_fd, chunk_size, chunk_size);
+    defer parent.deinit();
+    try parent.growKnownZero(grown_size);
+    try std.testing.expectEqual(Source.zero, parent.sources[1]);
+    try std.testing.expectEqual(@as(usize, 0), parent.dirtyChunkCount());
+
+    var head = try parent.exportForkHead(.{
+        .kind = .rootfs,
+        .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }, .{ .allow_copy = true, .force_copy = true, .quiesced = true });
+    defer head.deinit();
+
+    var child_fd = try createTempOverlayFd(allocator, runtime_overlay_dir);
+    defer {
+        if (child_fd >= 0) _ = std.c.close(child_fd);
+    }
+    var child = try ChunkMappedDisk.initWritable(allocator, base_source, child_fd, chunk_size, chunk_size);
+    defer child.deinit();
+    try child.growKnownZero(grown_size);
+    const claimed_fd = head.overlay_fd;
+    const replaced_fd = try child.applyForkDescriptor(head.descriptor, claimed_fd);
+    try std.testing.expectEqual(child_fd, replaced_fd);
+    _ = std.c.close(replaced_fd);
+    child_fd = claimed_fd;
+    head.overlay_fd = -1;
+    try std.testing.expectEqual(Source.zero, child.sources[1]);
+    try std.testing.expectEqual(@as(usize, 0), child.dirtyChunkCount());
+
+    const parent_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/parent-snapshot", .{tmp.sub_path[0..]});
+    defer allocator.free(parent_dir);
+    const child_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/child-snapshot", .{tmp.sub_path[0..]});
+    defer allocator.free(child_dir);
+    try std.Io.Dir.cwd().createDirPath(io, parent_dir);
+    try std.Io.Dir.cwd().createDirPath(io, child_dir);
+    const parent_snapshot = try parent.snapshotIndex(parent_dir, .{ .mmio_slot = 1 }, true);
+    defer freeTestDisk(allocator, parent_snapshot);
+    const child_snapshot = try child.snapshotIndex(child_dir, .{ .mmio_slot = 1 }, true);
+    defer freeTestDisk(allocator, child_snapshot);
+    try std.testing.expectEqualStrings(parent_snapshot.base, child_snapshot.base);
 }
 
 test "native portable fork head uses its configured overlay filesystem" {

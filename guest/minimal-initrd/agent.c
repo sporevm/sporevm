@@ -88,6 +88,17 @@
 #ifndef EXT4_IOC_RESIZE_FS
 #define EXT4_IOC_RESIZE_FS _IOW('f', 16, uint64_t)
 #endif
+/* Fixed offsets in the little-endian ext4 on-disk superblock, not a C ABI. */
+#define EXT4_PRIMARY_SUPER_OFFSET 1024
+#define EXT4_SUPER_SIZE 1024
+#define EXT4_SUPER_MAGIC 0xef53U
+#define EXT4_FEATURE_INCOMPAT_64BIT 0x0080U
+#define EXT4_SUPER_BLOCKS_COUNT_LO_OFFSET 0x04
+#define EXT4_SUPER_LOG_BLOCK_SIZE_OFFSET 0x18
+#define EXT4_SUPER_BLOCKS_PER_GROUP_OFFSET 0x20
+#define EXT4_SUPER_MAGIC_OFFSET 0x38
+#define EXT4_SUPER_FEATURE_INCOMPAT_OFFSET 0x60
+#define EXT4_SUPER_BLOCKS_COUNT_HI_OFFSET 0x150
 #ifndef SYS_openat2
 #if defined(__aarch64__) || defined(__x86_64__)
 #define SYS_openat2 437
@@ -1020,6 +1031,54 @@ static uint64_t read_le64(const unsigned char *in) {
   return value;
 }
 
+struct ext4_disk_geometry {
+  uint64_t blocks_count;
+  uint32_t blocks_per_group;
+  uint32_t block_size;
+};
+
+static int decode_ext4_disk_geometry(const unsigned char *super, size_t len, struct ext4_disk_geometry *out) {
+  if (len != EXT4_SUPER_SIZE || read_le16(super + EXT4_SUPER_MAGIC_OFFSET) != EXT4_SUPER_MAGIC) return -1;
+  uint32_t log_block_size = read_le32(super + EXT4_SUPER_LOG_BLOCK_SIZE_OFFSET);
+  if (log_block_size > 6) return -1;
+  uint32_t block_size = 1024U << log_block_size;
+  uint32_t blocks_per_group = read_le32(super + EXT4_SUPER_BLOCKS_PER_GROUP_OFFSET);
+  uint32_t feature_incompat = read_le32(super + EXT4_SUPER_FEATURE_INCOMPAT_OFFSET);
+  uint64_t blocks_count = read_le32(super + EXT4_SUPER_BLOCKS_COUNT_LO_OFFSET);
+  if ((feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0) {
+    blocks_count |= (uint64_t)read_le32(super + EXT4_SUPER_BLOCKS_COUNT_HI_OFFSET) << 32;
+  }
+  if (blocks_count == 0 || blocks_per_group == 0) return -1;
+  out->blocks_count = blocks_count;
+  out->blocks_per_group = blocks_per_group;
+  out->block_size = block_size;
+  return 0;
+}
+
+static int read_ext4_disk_geometry(int fd, struct ext4_disk_geometry *out) {
+  unsigned char super[EXT4_SUPER_SIZE];
+  size_t done = 0;
+  while (done < sizeof(super)) {
+    ssize_t n = pread(fd, super + done, sizeof(super) - done, EXT4_PRIMARY_SUPER_OFFSET + (off_t)done);
+    if (n == 0) return -1;
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    done += (size_t)n;
+  }
+  return decode_ext4_disk_geometry(super, sizeof(super), out);
+}
+
+static int validate_rootfs_grow_geometry(uint64_t target_blocks, const struct ext4_disk_geometry *before, const struct ext4_disk_geometry *after) {
+  if (target_blocks == 0 || before->block_size != after->block_size || before->blocks_per_group != after->blocks_per_group) return -1;
+  if (before->blocks_count == 0 || before->blocks_count >= target_blocks) return -1;
+  if (after->blocks_count <= before->blocks_count || after->blocks_count > target_blocks) return -1;
+  /* ext4 may drop an undersized terminal group or round bigalloc to a cluster. */
+  if (target_blocks - after->blocks_count >= after->blocks_per_group) return -1;
+  return 0;
+}
+
 static int send_spio_frame(int fd, uint8_t type, uint32_t stream_id, uint64_t offset, const unsigned char *payload, size_t len) {
   if (len > MAX_FRAME_PAYLOAD) return -1;
   unsigned char header[SPIO_HEADER_LEN];
@@ -1486,7 +1545,43 @@ static int parse_bool_field(const char *req, const char *name, int *out) {
   return -1;
 }
 
-static int parse_request(const char *req, struct run_request *out) {
+static int parse_rootfs_grow_request(const char *req, size_t req_len, struct run_request *out) {
+  if (req_len == 0 || req[req_len - 1] != '\n') return -1;
+  const char *p = skip_ws(req);
+  if (*p != '{') return -1;
+  p++;
+  int seen_type = 0;
+  int seen_session_id = 0;
+  for (int member = 0; member < 2; member++) {
+    p = skip_ws(p);
+    char key[32];
+    if (parse_json_string(&p, key, sizeof(key)) != 0) return -1;
+    p = skip_ws(p);
+    if (*p != ':') return -1;
+    p = skip_ws(p + 1);
+    if (strcmp(key, "type") == 0) {
+      char type[32];
+      if (seen_type || parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, "spore-rootfs-grow-v1") != 0) return -1;
+      seen_type = 1;
+    } else if (strcmp(key, "session_id") == 0) {
+      if (seen_session_id || parse_json_string(&p, out->session_id, sizeof(out->session_id)) != 0 || out->session_id[0] == '\0') return -1;
+      seen_session_id = 1;
+    } else {
+      return -1;
+    }
+    p = skip_ws(p);
+    char terminator = member == 0 ? ',' : '}';
+    if (*p != terminator) return -1;
+    p++;
+  }
+  if (!seen_type || !seen_session_id || *skip_ws(p) != '\0') return -1;
+  out->kind = REQUEST_ROOTFS_GROW;
+  out->protocol_v1 = 1;
+  return 0;
+}
+
+static int parse_request(const char *req, size_t req_len, struct run_request *out) {
+  if (strlen(req) != req_len) return -1;
   memset(out, 0, sizeof(*out));
   out->kind = REQUEST_START;
   out->terminal_rows = 24;
@@ -1526,8 +1621,7 @@ static int parse_request(const char *req, struct run_request *out) {
       out->kind = REQUEST_BUILD_WORKDIR;
       out->protocol_v1 = 1;
     } else if (strcmp(type, "spore-rootfs-grow-v1") == 0) {
-      out->kind = REQUEST_ROOTFS_GROW;
-      out->protocol_v1 = 1;
+      return parse_rootfs_grow_request(req, req_len, out);
     } else if (strcmp(type, "fsfreeze-v1") == 0) {
       out->kind = REQUEST_FSFREEZE;
       out->protocol_v1 = 1;
@@ -2868,60 +2962,83 @@ static int grow_rootfs(struct client *client) {
   if (device_fd < 0) return send_client_error_exit(client, 126, "spore build: rootfs grow device open failed\n");
 
   uint64_t device_bytes = 0;
-  int rc = ioctl(device_fd, BLKGETSIZE64, &device_bytes);
-  if (close(device_fd) != 0) rc = -1;
-  if (rc != 0 || device_bytes == 0) return send_client_error_exit(client, 126, "spore build: rootfs grow device geometry failed\n");
+  if (ioctl(device_fd, BLKGETSIZE64, &device_bytes) != 0 || device_bytes == 0) {
+    close(device_fd);
+    return send_client_error_exit(client, 126, "spore build: rootfs grow device geometry failed\n");
+  }
+
+  struct ext4_disk_geometry before_disk;
+  if (read_ext4_disk_geometry(device_fd, &before_disk) != 0) {
+    close(device_fd);
+    return send_client_error_exit(client, 126, "spore build: rootfs grow ext4 geometry failed\n");
+  }
 
   int fs_fd = open("/mnt/rootfs", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  if (fs_fd < 0) return send_client_error_exit(client, 126, "spore build: rootfs grow mount open failed\n");
+  if (fs_fd < 0) {
+    close(device_fd);
+    return send_client_error_exit(client, 126, "spore build: rootfs grow mount open failed\n");
+  }
 
   struct statfs before;
   if (fstatfs(fs_fd, &before) != 0 || before.f_bsize <= 0) {
     close(fs_fd);
+    close(device_fd);
     return send_client_error_exit(client, 126, "spore build: rootfs grow filesystem geometry failed\n");
   }
-  uint64_t block_size = (uint64_t)before.f_bsize;
-  if (device_bytes % block_size != 0) {
+  uint64_t block_size = before_disk.block_size;
+  if ((uint64_t)before.f_bsize != block_size || before.f_blocks == 0 || before.f_bavail > before.f_blocks || device_bytes % block_size != 0) {
     close(fs_fd);
+    close(device_fd);
     return send_client_error_exit(client, 126, "spore build: rootfs grow geometry is unaligned\n");
   }
   uint64_t target_blocks = device_bytes / block_size;
-  /*
-   * statfs.f_blocks excludes ext4 metadata overhead, so it is not the
-   * filesystem block count accepted by EXT4_IOC_RESIZE_FS. The ioctl is the
-   * authoritative grow-or-idempotent operation and rejects an attempted
-   * online shrink itself.
-   */
-  if (ioctl(fs_fd, EXT4_IOC_RESIZE_FS, &target_blocks) != 0) {
+  if (before_disk.blocks_count >= target_blocks) {
     close(fs_fd);
+    close(device_fd);
+    return send_client_error_exit(client, 126, "spore build: rootfs grow target is not larger than the filesystem\n");
+  }
+
+  uint64_t resize_blocks = target_blocks;
+  if (ioctl(fs_fd, EXT4_IOC_RESIZE_FS, &resize_blocks) != 0) {
+    close(fs_fd);
+    close(device_fd);
     return send_client_error_exit(client, 126, "spore build: rootfs grow ioctl failed\n");
   }
   if (syncfs(fs_fd) != 0) {
     close(fs_fd);
+    close(device_fd);
     return send_client_error_exit(client, 126, "spore build: rootfs grow sync failed\n");
   }
 
+  struct ext4_disk_geometry after_disk;
   struct statfs after;
-  int verify_rc = fstatfs(fs_fd, &after);
+  int verify_rc = read_ext4_disk_geometry(device_fd, &after_disk);
+  if (verify_rc == 0) verify_rc = fstatfs(fs_fd, &after);
   if (close(fs_fd) != 0) verify_rc = -1;
+  if (close(device_fd) != 0) verify_rc = -1;
   if (verify_rc != 0 || after.f_bsize <= 0) {
     return send_client_error_exit(client, 126, "spore build: rootfs grow verification failed\n");
   }
   uint64_t after_block_size = (uint64_t)after.f_bsize;
   uint64_t usable_blocks = (uint64_t)after.f_blocks;
-  if (after_block_size != block_size || usable_blocks == 0 || usable_blocks > target_blocks || (uint64_t)after.f_bavail > usable_blocks) {
+  if (validate_rootfs_grow_geometry(target_blocks, &before_disk, &after_disk) != 0 ||
+      after_block_size != block_size || usable_blocks == 0 || usable_blocks > after_disk.blocks_count ||
+      (uint64_t)after.f_bavail > usable_blocks || after.f_files == 0 || after.f_ffree > after.f_files) {
     return send_client_error_exit(client, 126, "spore build: rootfs grow geometry mismatch\n");
   }
   if ((uint64_t)after.f_bavail > UINT64_MAX / block_size) {
     return send_client_error_exit(client, 126, "spore build: rootfs grow free-space overflow\n");
   }
 
-  char result[256];
+  char result[512];
   int n = snprintf(result, sizeof(result),
-                   "spore-rootfs-grow-v1 device_bytes=%llu block_size=%llu target_blocks=%llu usable_blocks=%llu free_bytes=%llu inodes=%llu free_inodes=%llu\n",
+                   "spore-rootfs-grow-v1 device_bytes=%llu block_size=%llu target_blocks=%llu before_blocks=%llu filesystem_blocks=%llu blocks_per_group=%u usable_blocks=%llu free_bytes=%llu inodes=%llu free_inodes=%llu\n",
                    (unsigned long long)device_bytes,
                    (unsigned long long)block_size,
                    (unsigned long long)target_blocks,
+                   (unsigned long long)before_disk.blocks_count,
+                   (unsigned long long)after_disk.blocks_count,
+                   after_disk.blocks_per_group,
                    (unsigned long long)usable_blocks,
                    (unsigned long long)((uint64_t)after.f_bavail * block_size),
                    (unsigned long long)after.f_files,
@@ -4079,14 +4196,15 @@ static void accept_request(int listener, struct session *session, struct client 
   t_request_accept = now_ms();
 
   char req[MAX_REQUEST];
-  if (read_line(conn, req, sizeof(req)) <= 0) {
+  ssize_t req_len = read_line(conn, req, sizeof(req));
+  if (req_len <= 0) {
     close(conn);
     return;
   }
   t_request_decode = now_ms();
 
   struct run_request request;
-  if (parse_request(req, &request) != 0) {
+  if (parse_request(req, (size_t)req_len, &request) != 0) {
     (void)send_error_exit(conn, 2, "spore run: bad request\n");
     close(conn);
     return;
@@ -4375,7 +4493,7 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   request[request_len] = '\0';
 
   struct run_request parsed;
-  if (parse_request(request, &parsed) != 0) return SPORE_AGENT_FUZZ_INVALID;
+  if (parse_request(request, request_len, &parsed) != 0) return SPORE_AGENT_FUZZ_INVALID;
   if (parsed.kind == REQUEST_READY) return SPORE_AGENT_FUZZ_READY_REQUEST;
   if (parsed.kind == REQUEST_BUILD_COPY) return SPORE_AGENT_FUZZ_COPY_REQUEST;
   if (parsed.kind == REQUEST_BUILD_WORKDIR) return SPORE_AGENT_FUZZ_WORKDIR_REQUEST;
@@ -4400,6 +4518,34 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   int rc = read_build_command_from_spio(&client, parsed.build_command_len, command, sizeof(command), error, sizeof(error));
   close(pipe_fds[0]);
   return rc == 0 ? SPORE_AGENT_FUZZ_RUN_COMPLETE : SPORE_AGENT_FUZZ_RUN_REQUEST;
+}
+
+__attribute__((visibility("hidden"))) int spore_agent_fuzz_ext4_geometry(
+    const unsigned char *super, size_t super_len,
+    uint64_t *blocks_count, uint32_t *blocks_per_group, uint32_t *block_size) {
+  struct ext4_disk_geometry geometry;
+  if (decode_ext4_disk_geometry(super, super_len, &geometry) != 0) return 0;
+  *blocks_count = geometry.blocks_count;
+  *blocks_per_group = geometry.blocks_per_group;
+  *block_size = geometry.block_size;
+  return 1;
+}
+
+__attribute__((visibility("hidden"))) int spore_agent_fuzz_rootfs_grow_geometry(
+    uint64_t target_blocks,
+    uint64_t before_blocks, uint32_t before_blocks_per_group, uint32_t before_block_size,
+    uint64_t after_blocks, uint32_t after_blocks_per_group, uint32_t after_block_size) {
+  struct ext4_disk_geometry before = {
+      .blocks_count = before_blocks,
+      .blocks_per_group = before_blocks_per_group,
+      .block_size = before_block_size,
+  };
+  struct ext4_disk_geometry after = {
+      .blocks_count = after_blocks,
+      .blocks_per_group = after_blocks_per_group,
+      .block_size = after_block_size,
+  };
+  return validate_rootfs_grow_geometry(target_blocks, &before, &after) == 0;
 }
 
 __attribute__((visibility("hidden"))) int spore_agent_fuzz_proc_stat(

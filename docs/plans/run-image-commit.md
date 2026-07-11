@@ -239,9 +239,10 @@ appended range as authoritative clean zeros. The growth-only virtio-blk profile
 accepts `WRITE_ZEROES`, allowing filesystem zero ranges to stay free of
 proportional overlay and CAS payload. The managed initrd agent reads
 `BLKGETSIZE64`, calls `EXT4_IOC_RESIZE_FS` on the mounted rootfs, runs `syncfs`,
-and returns bounded block, free-space, and inode geometry. The host requires
-the reported device size to match the exact requested target before it starts
-the user command.
+and decodes the primary ext4 superblock before and after the ioctl. The total
+block count must increase, remain at or below the target, and fall short by less
+than one block group. The host independently enforces that response alongside
+the exact device size; `statfs` remains bounded free-space/inode diagnostics.
 
 Growth sessions mount ext4 with the internal `noinit_itable` policy. This is
 particularly important for checksum-enabled layouts: newly added inode tables

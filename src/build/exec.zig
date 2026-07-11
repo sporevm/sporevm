@@ -18,7 +18,7 @@ const max_rootfs_grow_response = run_mod.max_rootfs_grow_response;
 const p0_idle_probe_env = "SPOREVM_ROOTFS_GROWTH_P0_IDLE_MS";
 const max_p0_idle_probe_ms: u64 = 10_000;
 const build_producer_domain = "sporevm-build-producer-v2";
-const prepare_host_contract = "grow-v1;ext4-ioctl-v1;noinit-itable-v1;virtio-write-zeroes-1x4m-v1;chunk-zero-map-v1";
+const prepare_host_contract = "grow-v1-strict-request-v2;ext4-superblock-postcondition-v1;ext4-ioctl-v1;noinit-itable-v1;virtio-write-zeroes-1x4m-v1;chunk-zero-map-v1";
 // Provisional build-VM default; make this a `spore build` option when larger
 // workloads such as `bundle install`-style RUN steps need more memory.
 const build_vm_memory_bytes: u64 = 2 * 1024 * 1024 * 1024;
@@ -1043,6 +1043,8 @@ const guest_agent_fuzz_ready_request: c_int = 5;
 const guest_agent_fuzz_grow_request: c_int = 6;
 
 extern fn spore_agent_fuzz_build_request(request: [*]const u8, request_len: usize, stream: [*]const u8, stream_len: usize) c_int;
+extern fn spore_agent_fuzz_ext4_geometry(super: [*]const u8, super_len: usize, blocks_count: *u64, blocks_per_group: *u32, block_size: *u32) c_int;
+extern fn spore_agent_fuzz_rootfs_grow_geometry(target_blocks: u64, before_blocks: u64, before_blocks_per_group: u32, before_block_size: u32, after_blocks: u64, after_blocks_per_group: u32, after_block_size: u32) c_int;
 extern fn spore_agent_fuzz_proc_stat(stat: [*]const u8, stat_len: usize) c_int;
 
 fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
@@ -1131,31 +1133,123 @@ test "build rootfs grow request stays bounded" {
     try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-rootfs-grow-v1\"") != null);
     if (comptime guest_agent_fuzz_supported) {
         try std.testing.expectEqual(guest_agent_fuzz_grow_request, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
+        const reversed = " { \"session_id\" : \"spore-build-resize\", \"type\" : \"spore-rootfs-grow-v1\" } \n";
+        try std.testing.expectEqual(guest_agent_fuzz_grow_request, spore_agent_fuzz_build_request(reversed.ptr, reversed.len, reversed[0..0].ptr, 0));
+
+        const invalid = [_][]const u8{
+            "{\"type\":\"spore-rootfs-grow-v1\"}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\"}",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"\"}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":1}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"type\":\"spore-rootfs-grow-v1\"}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\",\"session_id\":\"b\"}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\",\"capacity\":1}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\",\"stdout_offset\":0}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\"} trailing\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"" ++ ("a" ** 64) ++ "\"}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\"}\x00extra\n",
+        };
+        for (invalid) |raw| {
+            try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(raw.ptr, raw.len, raw[0..0].ptr, 0));
+        }
+        const max_session = "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"" ++ ("a" ** 63) ++ "\"}\n";
+        try std.testing.expectEqual(guest_agent_fuzz_grow_request, spore_agent_fuzz_build_request(max_session.ptr, max_session.len, max_session[0..0].ptr, 0));
     }
 }
 
 test "rootfs grow response is exact and geometry-bound" {
-    const valid = "spore-rootfs-grow-v1 device_bytes=10737418240 block_size=4096 target_blocks=2621440 usable_blocks=2580000 free_bytes=8589934592 inodes=655360 free_inodes=650000\n";
+    const valid = "spore-rootfs-grow-v1 device_bytes=10737418240 block_size=4096 target_blocks=2621440 before_blocks=131072 filesystem_blocks=2621440 blocks_per_group=32768 usable_blocks=2580000 free_bytes=8589934592 inodes=655360 free_inodes=650000\n";
     const parsed = try parseRootfsGrowResponse(valid);
     try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024 * 1024), parsed.device_bytes);
     try std.testing.expectEqual(@as(u64, 4096), parsed.block_size);
+    try std.testing.expectEqual(@as(u64, 131072), parsed.before_blocks);
+    try std.testing.expectEqual(parsed.target_blocks, parsed.filesystem_blocks);
+    try std.testing.expectEqual(@as(u32, 32768), parsed.blocks_per_group);
     try std.testing.expectError(error.BadRootfsGrowResponse, parseRootfsGrowResponse(valid[0 .. valid.len - 1]));
+
+    const legal_shortfall = "spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=69 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n";
+    _ = try parseRootfsGrowResponse(legal_shortfall);
     try std.testing.expectError(
         error.BadRootfsGrowResponse,
-        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=8192 block_size=4096 target_blocks=1 usable_blocks=1 free_bytes=0 inodes=1 free_inodes=1\n"),
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=69 filesystem_blocks=69 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n"),
     );
     try std.testing.expectError(
         error.BadRootfsGrowResponse,
-        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=8192 block_size=4096 target_blocks=2 usable_blocks=2 free_bytes=9000 inodes=1 free_inodes=1\n"),
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=100 filesystem_blocks=100 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n"),
     );
     try std.testing.expectError(
         error.BadRootfsGrowResponse,
-        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=8192 block_size=4096 target_blocks=2 usable_blocks=2 free_bytes=1 inodes=1 free_inodes=1\n"),
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=101 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n"),
     );
     try std.testing.expectError(
         error.BadRootfsGrowResponse,
-        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=8192 block_size=4096 target_blocks=2 usable_blocks=2 free_bytes=0 inodes=0 free_inodes=0\n"),
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=68 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n"),
     );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=69 blocks_per_group=32 usable_blocks=70 free_bytes=0 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 filesystem_blocks=69 before_blocks=40 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=69 blocks_per_group=4294967296 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=69 blocks_per_group=32 usable_blocks=60 free_bytes=249856 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=69 blocks_per_group=32 usable_blocks=60 free_bytes=1 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=69 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=0 free_inodes=0\n"),
+    );
+}
+
+test "guest ext4 superblock and resize geometry validation is feature-aware" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+
+    var super: [1024]u8 = @splat(0);
+    std.mem.writeInt(u32, super[0x04..0x08], 1234, .little);
+    std.mem.writeInt(u32, super[0x18..0x1c], 2, .little);
+    std.mem.writeInt(u32, super[0x20..0x24], 32768, .little);
+    std.mem.writeInt(u16, super[0x38..0x3a], 0xef53, .little);
+    std.mem.writeInt(u32, super[0x150..0x154], 1, .little);
+
+    var blocks_count: u64 = 0;
+    var blocks_per_group: u32 = 0;
+    var block_size: u32 = 0;
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_ext4_geometry(&super, super.len, &blocks_count, &blocks_per_group, &block_size));
+    try std.testing.expectEqual(@as(u64, 1234), blocks_count);
+    try std.testing.expectEqual(@as(u32, 32768), blocks_per_group);
+    try std.testing.expectEqual(@as(u32, 4096), block_size);
+
+    std.mem.writeInt(u32, super[0x60..0x64], 0x80, .little);
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_ext4_geometry(&super, super.len, &blocks_count, &blocks_per_group, &block_size));
+    try std.testing.expectEqual((@as(u64, 1) << 32) | 1234, blocks_count);
+
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 100, 32, 4096));
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 69, 32, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 40, 32, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_rootfs_grow_geometry(100, 100, 32, 4096, 100, 32, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 101, 32, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 68, 32, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 100, 64, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 100, 32, 1024));
+
+    std.mem.writeInt(u16, super[0x38..0x3a], 0, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_geometry(&super, super.len, &blocks_count, &blocks_per_group, &block_size));
+    std.mem.writeInt(u16, super[0x38..0x3a], 0xef53, .little);
+    std.mem.writeInt(u32, super[0x20..0x24], 0, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_geometry(&super, super.len, &blocks_count, &blocks_per_group, &block_size));
+    std.mem.writeInt(u32, super[0x20..0x24], 32768, .little);
+    std.mem.writeInt(u32, super[0x18..0x1c], 7, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_geometry(&super, super.len, &blocks_count, &blocks_per_group, &block_size));
 }
 
 fn fuzzRootfsGrowResponse(_: void, smith: *std.testing.Smith) !void {
@@ -1166,12 +1260,32 @@ fn fuzzRootfsGrowResponse(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expect(parsed.block_size != 0);
     try std.testing.expectEqual(@as(u64, 0), parsed.device_bytes % parsed.block_size);
     try std.testing.expectEqual(parsed.device_bytes / parsed.block_size, parsed.target_blocks);
-    try std.testing.expect(parsed.usable_blocks <= parsed.target_blocks);
+    try std.testing.expect(parsed.before_blocks < parsed.filesystem_blocks);
+    try std.testing.expect(parsed.filesystem_blocks <= parsed.target_blocks);
+    try std.testing.expect(parsed.target_blocks - parsed.filesystem_blocks < parsed.blocks_per_group);
+    try std.testing.expect(parsed.usable_blocks <= parsed.filesystem_blocks);
     try std.testing.expect(parsed.free_inodes <= parsed.inodes);
+}
+
+fn fuzzGuestExt4Geometry(_: void, smith: *std.testing.Smith) !void {
+    if (comptime !guest_agent_fuzz_supported) return;
+    var storage: [1024]u8 = undefined;
+    const bytes = storage[0..smith.slice(&storage)];
+    var blocks_count: u64 = 0;
+    var blocks_per_group: u32 = 0;
+    var block_size: u32 = 0;
+    if (spore_agent_fuzz_ext4_geometry(bytes.ptr, bytes.len, &blocks_count, &blocks_per_group, &block_size) == 0) return;
+    try std.testing.expect(blocks_count != 0);
+    try std.testing.expect(blocks_per_group != 0);
+    try std.testing.expect(block_size >= 1024 and block_size <= 65536 and std.math.isPowerOfTwo(block_size));
 }
 
 test "fuzz rootfs grow response parser" {
     try std.testing.fuzz({}, fuzzRootfsGrowResponse, .{});
+}
+
+test "fuzz guest ext4 geometry parser" {
+    try std.testing.fuzz({}, fuzzGuestExt4Geometry, .{});
 }
 
 test "P0 idle probe is bounded and rejects background block writes" {

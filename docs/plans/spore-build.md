@@ -655,11 +655,12 @@ Session lifecycle:
    virtio handler validates one bounded range and maps accepted zeroing directly
    to `ChunkMappedDisk.zeroRange`; the growth-only feature never enters a
    portable manifest or restored transport state.
-4. The host sends `spore-rootfs-grow-v1`. The managed initrd reads the exact
-   device geometry, calls `EXT4_IOC_RESIZE_FS` on the mounted rootfs, `syncfs`es,
-   and returns bounded geometry/statfs fields. The host requires the reported
-   device size to equal the exact target. No selected-image shell or e2fsprogs
-   utility participates.
+4. The host sends the strict two-field `spore-rootfs-grow-v1` request. The
+   managed initrd reads the exact device geometry, calls `EXT4_IOC_RESIZE_FS` on
+   the mounted rootfs, `syncfs`es, and requires the feature-aware ext4
+   superblock block count to increase and reach the target within less than one
+   block group. The host independently validates the exact response against the
+   same invariants. No selected-image shell or e2fsprogs utility participates.
 5. Freeze the prepared filesystem, quiesce virtio-blk, seal the changed
    metadata chunks, emit the canonical logical index, publish the completeness
    stamp, and write the
@@ -861,10 +862,12 @@ single-digit seconds end to end, with the BuildKit tar export removed.
   backend failure poisons the unpublished mutable head so it cannot be
   snapshotted or forked.
 - `spore-rootfs-grow-v1` is bounded attacker-influenced control input. The
-  managed initrd validates the request/profile combination and device geometry;
-  the host validates its bounded response against the exact target. Malformed
-  input, unsupported ext4 geometry, or an ioctl/block error aborts before
-  PREPARE, Dockerfile records, or the destination ref are published.
+  managed initrd accepts exactly one type and one nonempty bounded session id,
+  rejecting duplicate, unknown, trailing, or embedded-NUL input. It validates
+  the request/profile combination and authoritative pre/post ext4 geometry;
+  the host validates its exact response against the target and one-group bound.
+  Malformed input, unsupported ext4 geometry, or an ioctl/block error aborts
+  before PREPARE, Dockerfile records, or the destination ref are published.
 - Step records under `build/steps/` are trusted local build metadata — same
   trust level as the cache directory that holds them — and never leave
   `build/`. The rootfs artifacts they name are normal rootfs CAS

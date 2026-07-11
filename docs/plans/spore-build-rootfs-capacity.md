@@ -122,12 +122,13 @@ spore build ...
 - **Correctness evidence (2026-07-11, M4/HVF):** native and checksum-enabled
   grown images pass `e2fsck -fn`; multi-GiB sparse COPY, build-cache/no-cache,
   run-commit grow/reuse/shrink rejection, prepared-image save/restore, and
-  bundle pack plus flat materialization pass. Injected valid-backend failure
-  poisons the unpublished head, writes no build record, and leaves every local
-  ref byte unchanged. Format-valid partial-final-chunk parents preserve and
-  CAS-verify the old prefix, expose a sparse-zero suffix, and produce the same
-  canonical snapshot as a full-rescan oracle across base/CAS/zero/overlay
-  sources.
+  bundle pack plus flat materialization pass. The retained disk-size smoke now
+  injects a validated WRITE_ZEROES backend failure during build preparation,
+  proves the unpublished head is poisoned, and verifies the destination ref,
+  PREPARE/step records, indexes, objects, and completeness stamps are unchanged.
+  Format-valid partial-final-chunk parents preserve and CAS-verify the old
+  prefix, expose a sparse-zero suffix, and produce the same canonical snapshot
+  as a full-rescan oracle across base/CAS/zero/overlay sources.
 - **Remaining release evidence:** repeat the native runtime smokes on Linux
   ARM64/KVM. Exploratory HVF runs exercised a multi-GiB sparse COPY, a verified
   512 MiB RUN-generated file, and real block/inode ENOSPC; both exhaustion
@@ -493,27 +494,34 @@ unchanged.
 
 ### 4. Resize Through The Trusted Initrd Agent
 
-The fixed control request `spore-rootfs-grow-v1` carries the existing bounded
-session identifier but no capacity argument or shell text. The exact target is
-already the virtio-blk capacity selected and validated by the host. It is one
-hand-written request branch in the existing initrd control loop, not a
-generated request framework.
+The fixed control request `spore-rootfs-grow-v1` is a strict two-member JSON
+object containing exactly one type and one nonempty bounded session identifier.
+Missing, duplicate, unknown, over-limit, trailing, and embedded-NUL input is
+rejected. It carries no capacity argument or shell text; the exact target is
+already the virtio-blk capacity selected and validated by the host. The
+grow-only parser is isolated from future fields added to the generic request
+path.
 
 The initrd agent:
 
 1. opens `/mnt/rootfs` and `/dev/vda`, outside the selected image's chroot;
-2. gets the exact visible device bytes with `BLKGETSIZE64` and obtains the ext4
-   block size/current geometry;
+2. gets the exact visible device bytes with `BLKGETSIZE64` and decodes the
+   feature-aware primary ext4 superblock at byte 1,024;
 3. rejects shrink, overflow, or device bytes not divisible by filesystem block
    size;
 4. computes the target filesystem block count and calls
    `EXT4_IOC_RESIZE_FS` directly;
-5. calls `statfs` and requires a nonzero usable block count no greater than the
-   target block count, with aligned/bounded free bytes and valid inode counts;
-   ext4 `f_blocks` excludes filesystem metadata and therefore is not expected
-   to equal the raw device block count; and
-6. returns bounded structured diagnostics including device bytes, target and
-   usable blocks, free bytes, and total/free inodes.
+5. after `syncfs`, decodes the superblock again and requires the filesystem
+   block count to increase, remain at or below the target, and fall short by
+   less than one unchanged ext4 block group. This permits bigalloc rounding or
+   omission of an unusably small terminal group without accepting a no-op or
+   an unbounded or multi-group partial resize;
+6. treats `statfs` only as diagnostics, requiring usable blocks no greater than
+   the authoritative post-resize block count plus aligned/bounded free bytes
+   and valid inode counts; and
+7. returns the pre/post filesystem counts, blocks per group, device bytes,
+   target and usable blocks, free bytes, and total/free inodes in one exact
+   bounded line.
 
 P0 validates the internal mount option for rootfs-growth sessions. The v1
 choice is `noinit_itable`, which makes new checksum-enabled groups
@@ -654,8 +662,9 @@ No finite default makes arbitrary RUN output infinitely scalable. The safe
 boundary is generous automatic preparation before execution, then explicit
 failure rather than replay.
 
-- The fixed growth response includes bounded `statfs` block/inode geometry and
-  is validated before preparation can publish.
+- The fixed growth response includes authoritative pre/post ext4 block counts,
+  the block-group bound, and bounded `statfs` diagnostics; the host independently
+  validates them before preparation can publish.
 - Executor failure retains the real exit status/output. The CLI recognizes the
   common `ENOSPC`/`No space left on device` forms and reports that block or
   inode space was exhausted; it does not relabel every nonzero exit.
@@ -718,11 +727,14 @@ and already fails; 32/64 GiB remain experiments rather than product caps.
   lazy-CAS verification, and stateful before/after semantic fuzzing are release
   requirements, not follow-up hardening.
 - The guest-supplied resize response parser is attacker-influenced and has an
-  exact field order, arithmetic/geometry checks, a 1,024-byte limit, and
-  fuzz/unit coverage. The host-generated request carries no capacity authority.
-- The guest rootfs can contain malicious ext4 metadata. The design relies on
-  the pinned kernel's ext4 validation instead of adding a second host parser.
-  A kernel error aborts preparation.
+  exact field order, pre/post/block-group arithmetic checks, a 1,024-byte limit,
+  and fuzz/unit coverage. The host-generated request carries no capacity
+  authority.
+- The guest rootfs can contain malicious ext4 metadata. The pinned kernel owns
+  filesystem validation; the initrd adds only a fuzzed fixed-offset decoder for
+  the already-mounted primary superblock's magic, feature-aware 64-bit block
+  count, block size, and blocks-per-group post-condition. A kernel, decode, or
+  geometry error aborts preparation.
 - CAS/index loading remains canonical, digest-checked, completeness-gated, and
   descriptor-authoritative. Host-local cache metadata cannot override it.
 - The rootfs cache lock spans preparation snapshot, completeness publication,
@@ -1030,9 +1042,12 @@ This slice made no capacity policy change by itself.
 concurrency/publication fault-injection matrix remains in Slice 7.
 
 - Add no-capacity-argument `spore-rootfs-grow-v1` to the initrd agent and host
-  executor.
-- Derive target bytes from `BLKGETSIZE64`, validate filesystem block geometry,
-  and return bounded statfs diagnostics.
+  executor, with exactly one type and one bounded session identifier.
+- Derive target bytes from `BLKGETSIZE64`, validate authoritative pre/post ext4
+  block counts with the one-group terminal bound, and return bounded statfs
+  diagnostics.
+- Bump the PREPARE producer contract so records created under the weaker
+  request or post-resize validation rules are deterministic cache misses.
 - Replace `resize2fs /dev/vda` on the build path.
 - Remove the selected image's `/bin/sh`/e2fsprogs prerequisite and related
   error text/tests.
@@ -1210,6 +1225,9 @@ Update the `spore build` boundary to cover:
   accepted features to request handling.
 - Replace the guest `resize2fs` process with a fixed initrd-agent
   `EXT4_IOC_RESIZE_FS` request.
+- Require the strict two-member grow request, decode the feature-aware ext4
+  superblock pre/post condition in the guest, and validate its reported
+  progression and block-group bound on the host.
 - Use one idempotent absolute-capacity quantum policy, never recursive
   doubling/additive headroom.
 - Configure nothing by default; expose no build capacity override in v1.
