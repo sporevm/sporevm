@@ -836,7 +836,6 @@ def host_environment() -> dict[str, object]:
         "os": system,
         "architecture": architecture,
         "kernel_release": kernel,
-        "hostname": hostname,
         "stable_host_descriptor": (
             "sha256:" + hashlib.sha256(descriptor_payload).hexdigest()
         ),
