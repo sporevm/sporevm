@@ -18,6 +18,7 @@ pub const window_size: u64 = 0x200;
 
 pub const max_queues = 4;
 
+pub const status_features_ok: u32 = 8;
 pub const status_failed: u32 = 128;
 
 /// What the transport asks of a concrete device.
@@ -35,6 +36,9 @@ pub const Device = struct {
     /// Device config space read (offset into config space, 1/2/4 byte widths
     /// arrive as u32). Return 0 for out-of-range reads.
     configReadFn: ?*const fn (context: *anyopaque, offset: u64) u32 = null,
+    /// Called once the driver feature selection is accepted, and with zero
+    /// when transport reset clears that selection.
+    featuresAcceptedFn: ?*const fn (context: *anyopaque, accepted_features: u64) void = null,
     /// Optional device reset hook called after transport-owned state is reset.
     resetFn: ?*const fn (context: *anyopaque) void = null,
 };
@@ -50,6 +54,10 @@ pub const Transport = struct {
     device_features_sel: u32 = 0,
     driver_features_sel: u32 = 0,
     driver_features: u64 = 0,
+    /// The immutable selection accepted at FEATURES_OK. This is reconstructed
+    /// from serialized transport state during restore rather than serialized
+    /// independently.
+    accepted_features: ?u64 = null,
     queue_sel: u32 = 0,
     config_generation: u32 = 0,
     /// Bit 0: used buffer notification pending. Guest acks via InterruptACK.
@@ -65,8 +73,35 @@ pub const Transport = struct {
         return &self.queues[@intCast(self.queue_sel)];
     }
 
-    fn offeredFeatures(self: *const Transport) u64 {
+    pub fn offeredFeatures(self: *const Transport) u64 {
         return self.dev.device_features | f_version_1;
+    }
+
+    fn supportsFeatures(self: *const Transport, features: u64) bool {
+        return features & ~self.offeredFeatures() == 0;
+    }
+
+    fn acceptFeatures(self: *Transport, features: u64) void {
+        self.accepted_features = features;
+        if (self.dev.featuresAcceptedFn) |f| f(self.dev.context, features);
+    }
+
+    /// Validate and apply serialized feature-negotiation state. Restore paths
+    /// must use this instead of assigning `status` and `driver_features`
+    /// directly so attacker-controlled state cannot enable unoffered features.
+    pub fn applyRestoredFeatureState(self: *Transport, status: u32, driver_features: u64) error{UnsupportedFeatures}!void {
+        if (!self.supportsFeatures(driver_features)) return error.UnsupportedFeatures;
+
+        self.status = status;
+        self.driver_features = driver_features;
+        if (status & status_features_ok != 0) {
+            self.acceptFeatures(driver_features);
+        } else {
+            if (self.accepted_features != null) {
+                if (self.dev.featuresAcceptedFn) |f| f(self.dev.context, 0);
+            }
+            self.accepted_features = null;
+        }
     }
 
     pub fn reset(self: *Transport) void {
@@ -74,6 +109,10 @@ pub const Transport = struct {
         self.status = 0;
         self.interrupt_status = 0;
         self.driver_features = 0;
+        if (self.accepted_features != null) {
+            if (self.dev.featuresAcceptedFn) |f| f(self.dev.context, 0);
+        }
+        self.accepted_features = null;
         self.device_features_sel = 0;
         self.driver_features_sel = 0;
         self.queue_sel = 0;
@@ -115,7 +154,7 @@ pub const Transport = struct {
             0x014 => self.device_features_sel = value,
             0x020 => {
                 const shift: u6 = if (self.driver_features_sel == 1) 32 else 0;
-                if (self.driver_features_sel <= 1) {
+                if (self.accepted_features == null and self.driver_features_sel <= 1) {
                     const mask = @as(u64, 0xffff_ffff) << shift;
                     self.driver_features = (self.driver_features & ~mask) | (@as(u64, value) << shift);
                 }
@@ -146,7 +185,20 @@ pub const Transport = struct {
                 if (value == 0) {
                     self.reset();
                 } else {
-                    self.status = value;
+                    var next_status = value;
+                    if (self.accepted_features == null and value & status_features_ok != 0) {
+                        if (self.supportsFeatures(self.driver_features)) {
+                            self.acceptFeatures(self.driver_features);
+                        } else {
+                            next_status &= ~status_features_ok;
+                        }
+                    }
+                    // Feature selection is immutable until reset. Preserve
+                    // FEATURES_OK as well as the latched mask so a hostile
+                    // later status write cannot serialize state that restores
+                    // with different device behavior.
+                    if (self.accepted_features != null) next_status |= status_features_ok;
+                    self.status = next_status;
                 }
             },
             0x080 => if (self.selectedQueue()) |q| setLow(&q.desc_addr, value),
@@ -164,6 +216,19 @@ pub const Transport = struct {
         self.config_generation +%= 1;
         self.interrupt_status |= 2;
         return true;
+    }
+
+    /// Full-machine save must not serialize a feature proposal that this
+    /// device cannot restore, nor an internally inconsistent accepted state.
+    /// Rootfs-only checkpoints do not serialize transport state and need not
+    /// call this validation.
+    pub fn validateSerializableFeatureState(self: *const Transport) !void {
+        if (!self.supportsFeatures(self.driver_features)) return error.UnsupportedFeatures;
+        const features_ok = self.status & status_features_ok != 0;
+        if (features_ok != (self.accepted_features != null)) return error.BadFeatureState;
+        if (self.accepted_features) |accepted| {
+            if (accepted != self.driver_features) return error.BadFeatureState;
+        }
     }
 };
 
@@ -199,6 +264,34 @@ const TestDev = struct {
     }
 };
 
+const test_device_feature: u64 = 1 << 14;
+
+const FeatureDev = struct {
+    accepted_features: ?u64 = null,
+    acceptance_count: u32 = 0,
+
+    fn notify(_: *anyopaque, _: u8, _: *[max_queues]queue.VirtQueue, _: guestmem.GuestRam) bool {
+        return false;
+    }
+
+    fn featuresAccepted(ctx: *anyopaque, features: u64) void {
+        const self: *FeatureDev = @ptrCast(@alignCast(ctx));
+        self.accepted_features = features;
+        self.acceptance_count += 1;
+    }
+
+    fn dev(self: *FeatureDev) Device {
+        return .{
+            .context = self,
+            .device_id = 2,
+            .device_features = test_device_feature,
+            .queue_count = 1,
+            .notifyFn = notify,
+            .featuresAcceptedFn = featuresAccepted,
+        };
+    }
+};
+
 fn testRam(buf: []u8) guestmem.GuestRam {
     return .{ .bytes = buf, .base = 0 };
 }
@@ -221,6 +314,96 @@ test "feature negotiation exposes VERSION_1 in the high word" {
     // Hostile selector value reads as zero features.
     _ = t.write(0x014, 7, testRam(&buf));
     try std.testing.expectEqual(@as(u32, 0), t.read(0x010));
+}
+
+test "FEATURES_OK accepts offered features and freezes the selection until reset" {
+    var fd = FeatureDev{};
+    var t = Transport.init(fd.dev());
+    var buf: [16]u8 = undefined;
+    const ram = testRam(&buf);
+    const selected = test_device_feature | f_version_1;
+
+    try std.testing.expectEqual(selected, t.offeredFeatures());
+    _ = t.write(0x024, 0, ram);
+    _ = t.write(0x020, @truncate(test_device_feature), ram);
+    _ = t.write(0x024, 1, ram);
+    _ = t.write(0x020, @truncate(f_version_1 >> 32), ram);
+    _ = t.write(0x070, 1 | 2 | status_features_ok, ram);
+
+    try std.testing.expectEqual(@as(u32, 1 | 2 | status_features_ok), t.read(0x070));
+    try std.testing.expectEqual(selected, t.driver_features);
+    try std.testing.expectEqual(selected, t.accepted_features.?);
+    try std.testing.expectEqual(selected, fd.accepted_features.?);
+    try std.testing.expectEqual(@as(u32, 1), fd.acceptance_count);
+
+    // Even a hostile status rewrite cannot unfreeze the accepted selection.
+    _ = t.write(0x070, 1 | 2, ram);
+    try std.testing.expectEqual(@as(u32, 1 | 2 | status_features_ok), t.read(0x070));
+    _ = t.write(0x024, 0, ram);
+    _ = t.write(0x020, 0, ram);
+    try std.testing.expectEqual(selected, t.driver_features);
+    try std.testing.expectEqual(selected, t.accepted_features.?);
+    try std.testing.expectEqual(@as(u32, 1), fd.acceptance_count);
+
+    _ = t.write(0x070, 0, ram);
+    try std.testing.expectEqual(@as(?u64, null), t.accepted_features);
+    try std.testing.expectEqual(@as(u64, 0), t.driver_features);
+    try std.testing.expectEqual(@as(u64, 0), fd.accepted_features.?);
+    try std.testing.expectEqual(@as(u32, 2), fd.acceptance_count);
+
+    // Reset re-enables feature register writes.
+    _ = t.write(0x020, @truncate(test_device_feature), ram);
+    try std.testing.expectEqual(test_device_feature, t.driver_features);
+}
+
+test "FEATURES_OK rejects an unoffered selection and permits renegotiation" {
+    var fd = FeatureDev{};
+    var t = Transport.init(fd.dev());
+    var buf: [16]u8 = undefined;
+    const ram = testRam(&buf);
+    const unsupported_feature: u64 = 1 << 15;
+
+    _ = t.write(0x024, 0, ram);
+    _ = t.write(0x020, @truncate(unsupported_feature), ram);
+    _ = t.write(0x024, 1, ram);
+    _ = t.write(0x020, @truncate(f_version_1 >> 32), ram);
+    _ = t.write(0x070, 1 | 2 | status_features_ok, ram);
+
+    try std.testing.expectEqual(@as(u32, 1 | 2), t.read(0x070));
+    try std.testing.expectEqual(unsupported_feature | f_version_1, t.driver_features);
+    try std.testing.expectEqual(@as(?u64, null), t.accepted_features);
+    try std.testing.expectEqual(@as(u32, 0), fd.acceptance_count);
+    try std.testing.expectError(error.UnsupportedFeatures, t.validateSerializableFeatureState());
+
+    _ = t.write(0x024, 0, ram);
+    _ = t.write(0x020, @truncate(test_device_feature), ram);
+    _ = t.write(0x070, 1 | 2 | status_features_ok, ram);
+    try std.testing.expectEqual(test_device_feature | f_version_1, t.accepted_features.?);
+    try std.testing.expectEqual(@as(u32, 1), fd.acceptance_count);
+    try t.validateSerializableFeatureState();
+}
+
+test "restored feature state validates before applying and notifies the device" {
+    var fd = FeatureDev{};
+    var t = Transport.init(fd.dev());
+    const unsupported_feature: u64 = 1 << 15;
+
+    try std.testing.expectError(
+        error.UnsupportedFeatures,
+        t.applyRestoredFeatureState(1 | 2, unsupported_feature),
+    );
+    try std.testing.expectEqual(@as(u32, 0), t.status);
+    try std.testing.expectEqual(@as(u64, 0), t.driver_features);
+    try std.testing.expectEqual(@as(?u64, null), t.accepted_features);
+    try std.testing.expectEqual(@as(u32, 0), fd.acceptance_count);
+
+    const selected = test_device_feature | f_version_1;
+    try t.applyRestoredFeatureState(1 | 2 | status_features_ok, selected);
+    try std.testing.expectEqual(@as(u32, 1 | 2 | status_features_ok), t.status);
+    try std.testing.expectEqual(selected, t.driver_features);
+    try std.testing.expectEqual(selected, t.accepted_features.?);
+    try std.testing.expectEqual(selected, fd.accepted_features.?);
+    try std.testing.expectEqual(@as(u32, 1), fd.acceptance_count);
 }
 
 test "queue configuration and clamping" {

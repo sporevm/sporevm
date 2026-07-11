@@ -2554,7 +2554,7 @@ test "lazy runtime survives destructive prune and gc before its first cas read" 
     try std.testing.expect(!try fileExists(io, rooted_object_path));
 }
 
-test "system cache gc preserves storage rooted only by a build step record" {
+test "system cache gc preserves storage rooted only by a PREPARE record" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
@@ -2568,12 +2568,12 @@ test "system cache gc preserves storage rooted only by a build step record" {
     const orphan = try writeGcStorageFixture(allocator, io, root, null, 0x45);
     try rootfs_cas.markStorageComplete(io, allocator, root, rooted.storage.index_digest);
     try rootfs_cas.markStorageComplete(io, allocator, root, orphan.storage.index_digest);
-    const input = build_step_cache.StepInput{
-        .platform = .{},
-        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .canonical_instruction = "RUN true",
-        .operation = .{ .run = .{ .network_mode = .spore } },
-    };
+    const input = try build_step_cache.prepareInput(
+        .{},
+        "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        rooted.storage.logical_size,
+        "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
     const key = try build_step_cache.stepKey(allocator, input);
     _ = try build_step_cache.writeRecord(io, allocator, root, input, key, rooted.storage);
     const rooted_stamp_path = try rootfs_cas.storageCompleteStampPath(allocator, root, rooted.storage.index_digest);
@@ -2593,9 +2593,11 @@ test "system cache gc preserves storage rooted only by a build step record" {
     try std.testing.expect(try fileExists(io, rooted_object_path));
     try std.testing.expect(!try fileExists(io, orphan_index_path));
     try std.testing.expect(!try fileExists(io, orphan_object_path));
-    const hit = (try build_step_cache.readHit(io, allocator, root, input, key)) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings(rooted.storage.index_digest, hit.index_digest);
-    try std.testing.expect(try fileExists(io, rooted_stamp_path));
+    // GC remains conservative and retains content-complete records, but v7
+    // cache hits require the stamp that must precede record publication. It
+    // does not silently repair an interrupted or tampered record.
+    try std.testing.expect((try build_step_cache.readHit(io, allocator, root, input, key)) == null);
+    try std.testing.expect(!try fileExists(io, rooted_stamp_path));
 }
 
 test "system cache gc ignores known build records with incomplete storage" {
@@ -2614,6 +2616,7 @@ test "system cache gc ignores known build records with incomplete storage" {
         .platform = .{},
         .parent_index_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         .canonical_instruction = "RUN false",
+        .executor_identity = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         .operation = .{ .run = .{ .network_mode = .spore } },
     };
     const key = try build_step_cache.stepKey(allocator, input);

@@ -44,6 +44,9 @@ pub const Config = struct {
     /// Full block backend for writable or layered rootfs runs. Takes
     /// precedence over disk_fd.
     disk_backend: ?blk.Backend = null,
+    /// Ephemeral feature profile for the root disk. The default remains the
+    /// portable, resumable virtio-blk surface.
+    root_blk_options: blk.Options = .{},
     /// Optional read-only build context disk. When present with a rootfs disk,
     /// Linux enumerates it as the second virtio-blk device.
     context_disk_fd: ?std.c.fd_t = null,
@@ -307,7 +310,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var transport_count: usize = 1;
     const disk_backend: ?blk.Backend = if (config.disk_backend) |backend| backend else if (config.disk_fd) |fd| .{ .file = fd } else null;
     if (disk_backend) |backend| {
-        blk_dev = blk.Blk.init(backend);
+        blk_dev = blk.Blk.initWithOptions(backend, config.root_blk_options);
         transports_buf[1] = mmio.Transport.init(blk_dev.device());
         transport_count = 2;
     }
@@ -548,7 +551,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                 try kvm.completePendingExit(vcpu_fd, run_bytes);
                 pending_kvm_completion = false;
             }
-            control.reportStats(monitorStatsFromDirtyTracker(if (dirty_tracker) |*tracker| tracker else null));
+            control.reportStats(monitorStats(if (dirty_tracker) |*tracker| tracker else null, config.root_blk_options.stats));
             switch (try control.poll(&vsock_dev)) {
                 .keep_running => {},
                 .stop => return .monitor_stopped,
@@ -991,7 +994,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
             continue;
         }
         if (options.config.exec_control) |control| {
-            control.reportStats(monitorStatsFromDirtyTracker(options.dirty_tracker));
+            control.reportStats(monitorStats(options.dirty_tracker, options.config.root_blk_options.stats));
             device_lock.lock();
             const action = control.poll(options.vsock_dev) catch |err| {
                 device_lock.unlock();
@@ -1734,12 +1737,55 @@ const DirtyTracker = struct {
     }
 };
 
-fn monitorStatsFromDirtyTracker(tracker: ?*DirtyTracker) vsock.ControlStats {
-    const active = tracker orelse return .{};
-    return .{
-        .chunks_nonzero = @intCast(active.sealer.nonzeroChunkCount()),
-        .dirty_chunks_pending = @intCast(active.sealer.dirtyChunksPending()),
-    };
+fn monitorStats(tracker: ?*DirtyTracker, root_blk_stats: ?*const blk.Stats) vsock.ControlStats {
+    var result = vsock.ControlStats{};
+    if (tracker) |active| {
+        result.chunks_nonzero = @intCast(active.sealer.nonzeroChunkCount());
+        result.dirty_chunks_pending = @intCast(active.sealer.dirtyChunksPending());
+    }
+    if (root_blk_stats) |stats| mergeRootBlkStats(&result, stats.snapshot());
+    return result;
+}
+
+fn mergeRootBlkStats(result: *vsock.ControlStats, snapshot_stats: blk.Stats.Snapshot) void {
+    result.accepted_features = snapshot_stats.accepted_features;
+    result.write_zeroes_requests = snapshot_stats.write_zeroes_requests;
+    result.write_zeroes_bytes = snapshot_stats.write_zeroes_bytes;
+    result.write_zeroes_unmap_requests = snapshot_stats.write_zeroes_unmap_requests;
+    result.write_zeroes_ok = snapshot_stats.write_zeroes_ok;
+    result.write_zeroes_errors = snapshot_stats.write_zeroes_errors;
+    result.write_zeroes_backend_failures = snapshot_stats.write_zeroes_backend_failures;
+    result.write_zeroes_unsupported = snapshot_stats.write_zeroes_unsupported;
+    result.out_requests = snapshot_stats.out_requests;
+    result.out_bytes = snapshot_stats.out_bytes;
+    result.out_all_zero_requests = snapshot_stats.out_all_zero_requests;
+    result.out_all_zero_bytes = snapshot_stats.out_all_zero_bytes;
+}
+
+test "monitor stats merge root block telemetry without replacing dirty RAM stats" {
+    var result = vsock.ControlStats{ .chunks_nonzero = 91, .dirty_chunks_pending = 92 };
+    mergeRootBlkStats(&result, .{
+        .accepted_features = 1,
+        .write_zeroes_requests = 2,
+        .write_zeroes_bytes = 3,
+        .write_zeroes_unmap_requests = 4,
+        .write_zeroes_ok = 5,
+        .write_zeroes_errors = 6,
+        .write_zeroes_backend_failures = 7,
+        .write_zeroes_unsupported = 8,
+        .out_requests = 9,
+        .out_bytes = 10,
+        .out_all_zero_requests = 11,
+        .out_all_zero_bytes = 12,
+    });
+
+    try std.testing.expectEqual(@as(?u64, 91), result.chunks_nonzero);
+    try std.testing.expectEqual(@as(?u64, 92), result.dirty_chunks_pending);
+    try std.testing.expectEqual(@as(?u64, 1), result.accepted_features);
+    try std.testing.expectEqual(@as(?u64, 5), result.write_zeroes_ok);
+    try std.testing.expectEqual(@as(?u64, 7), result.write_zeroes_backend_failures);
+    try std.testing.expectEqual(@as(?u64, 10), result.out_bytes);
+    try std.testing.expectEqual(@as(?u64, 12), result.out_all_zero_bytes);
 }
 
 fn takeRootfsSnapshot(
@@ -1827,6 +1873,7 @@ fn takeSnapshot(
     dirty_tracker: ?*DirtyTracker,
     environ_map: ?*const std.process.Environ.Map,
 ) !void {
+    try validateFullSnapshotTransports(transports);
     if (vsock_dev.pending_len != 0) {
         std.log.err("cannot snapshot while virtio-vsock has pending packets", .{});
         return error.DeviceStatePending;
@@ -2005,6 +2052,7 @@ fn takeSnapshotV1(
     dirty_tracker: ?*DirtyTracker,
     environ_map: ?*const std.process.Environ.Map,
 ) !void {
+    try validateFullSnapshotTransports(transports);
     if (vsock_dev.pending_len != 0) {
         std.log.err("cannot snapshot while virtio-vsock has pending packets", .{});
         return error.DeviceStatePending;
@@ -2169,15 +2217,27 @@ fn captureTransports(allocator: std.mem.Allocator, transports: []mmio.Transport)
     return out;
 }
 
+fn validateFullSnapshotTransports(transports: []const mmio.Transport) !void {
+    // Rootfs-only checkpoints capture queue state transiently for quiescence,
+    // but a portable machine manifest must never contain the growth profile.
+    for (transports) |*transport| {
+        try transport.validateSerializableFeatureState();
+        try validateFullSnapshotFeatures(transport.offeredFeatures());
+    }
+}
+
+fn validateFullSnapshotFeatures(features: u64) !void {
+    if (features & blk.feature_write_zeroes != 0) return error.NonResumableDeviceProfile;
+}
+
 fn applyTransports(transports: []mmio.Transport, states: []const spore.TransportState) !void {
     if (states.len != transports.len) return error.PlatformMismatch;
     for (transports, states) |*t, s| {
         if (t.dev.device_id != s.device_id) return error.PlatformMismatch;
         if (s.queues.len != t.dev.queue_count) return error.PlatformMismatch;
-        t.status = s.status;
+        t.applyRestoredFeatureState(s.status, s.driver_features) catch return error.BadManifest;
         t.device_features_sel = s.device_features_sel;
         t.driver_features_sel = s.driver_features_sel;
-        t.driver_features = s.driver_features;
         t.queue_sel = s.queue_sel;
         t.interrupt_status = s.interrupt_status;
         for (s.queues, 0..) |qs, qi| {
@@ -2194,6 +2254,54 @@ fn applyTransports(transports: []mmio.Transport, states: []const spore.Transport
             t.queues[qi] = restored;
         }
     }
+}
+
+test "full snapshots reject growth-only transport features" {
+    var portable_storage: [blk.sector_size]u8 = undefined;
+    var portable_blk = blk.Blk.initWithOptions(.{ .memory = &portable_storage }, .{});
+    var portable_transports = [_]mmio.Transport{mmio.Transport.init(portable_blk.device())};
+    try validateFullSnapshotTransports(&portable_transports);
+    portable_transports[0].driver_features = 1 << 15;
+    try std.testing.expectError(
+        error.UnsupportedFeatures,
+        validateFullSnapshotTransports(&portable_transports),
+    );
+
+    var growth_storage: [blk.sector_size]u8 = undefined;
+    var growth_blk = blk.Blk.initWithOptions(.{ .memory = &growth_storage }, .{ .write_zeroes = true });
+    var growth_transports = [_]mmio.Transport{mmio.Transport.init(growth_blk.device())};
+    try std.testing.expectError(
+        error.NonResumableDeviceProfile,
+        validateFullSnapshotTransports(&growth_transports),
+    );
+}
+
+test "transport restore rejects unoffered block features" {
+    var storage: [blk.sector_size]u8 = undefined;
+    var block = blk.Blk.initWithOptions(.{ .memory = &storage }, .{});
+    var transports = [_]mmio.Transport{mmio.Transport.init(block.device())};
+    var queues = [_]spore.QueueState{.{
+        .size = 0,
+        .ready = false,
+        .desc_addr = 0,
+        .avail_addr = 0,
+        .used_addr = 0,
+        .last_avail = 0,
+        .used_idx = 0,
+    }};
+    const states = [_]spore.TransportState{.{
+        .device_id = blk.device_id,
+        .status = mmio.status_features_ok,
+        .device_features_sel = 0,
+        .driver_features_sel = 0,
+        .driver_features = blk.feature_write_zeroes,
+        .queue_sel = 0,
+        .interrupt_status = 0,
+        .queues = &queues,
+    }};
+
+    try std.testing.expectError(error.BadManifest, applyTransports(&transports, &states));
+    try std.testing.expectEqual(@as(u64, 0), transports[0].driver_features);
 }
 
 fn raiseGenerationIrqIfPending(vm_fd: std.c.fd_t, gen_dev: *const generation.Device) !void {

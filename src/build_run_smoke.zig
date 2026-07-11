@@ -111,39 +111,38 @@ pub fn main(init: std.process.Init) !void {
     if (!cached.cache_hit) return error.ExpectedCachedBuildHit;
     if (!std.mem.eql(u8, first.index_digest, cached.index_digest)) return error.ExpectedCachedRootfsIdentity;
 
-    var override_diag: build_mod.Diagnostic = .{};
-    const override = try build_mod.build(init, allocator, .{
+    var uncached_diag: build_mod.Diagnostic = .{};
+    const uncached = try build_mod.build(init, allocator, .{
         .tag = "local/build-smoke:dev",
         .context_dir = context_dir,
         .dockerfile_path = dockerfile_path,
         .platform = .{},
         .network = .none,
-        .disk_grow_target_override = 64 << 20,
-        .diagnostic = &override_diag,
+        .no_cache = true,
+        .diagnostic = &uncached_diag,
     });
-    if (override_diag.executor.boot_count != 1) return error.ExpectedOverrideBuildVmBoot;
-    if (override_diag.executor.executed_steps != 18) return error.ExpectedOverrideBuildEighteenSteps;
-    if (override_diag.executor.resize_count != 1) return error.ExpectedOverrideBuildOneResize;
-    if (override_diag.executor.max_checkpoint_control_ms >= 2000) return error.OverrideBuildCheckpointControlTooSlow;
-    if (override.cache_hit) return error.ExpectedOverrideBuildCacheMiss;
-    if (std.mem.eql(u8, first.index_digest, override.index_digest)) return error.ExpectedOverrideRootfsIdentity;
-    if (!override_diag.context_disk.reused) return error.ExpectedOverrideContextDiskReuse;
-    if (!std.mem.eql(u8, first_diag.context_disk.digest, override_diag.context_disk.digest)) return error.ExpectedOverrideContextDiskIdentity;
+    if (uncached_diag.executor.boot_count != 1) return error.ExpectedUncachedBuildVmBoot;
+    if (uncached_diag.executor.executed_steps != 18) return error.ExpectedUncachedBuildEighteenSteps;
+    if (uncached_diag.executor.resize_count != 0) return error.ExpectedUncachedBuildWithoutResize;
+    if (uncached_diag.executor.max_checkpoint_control_ms >= 2000) return error.UncachedBuildCheckpointControlTooSlow;
+    if (uncached.cache_hit) return error.ExpectedUncachedBuildCacheMiss;
+    if (!uncached_diag.context_disk.reused) return error.ExpectedUncachedContextDiskReuse;
+    if (!std.mem.eql(u8, first_diag.context_disk.digest, uncached_diag.context_disk.digest)) return error.ExpectedUncachedContextDiskIdentity;
 
-    var default_after_override_diag: build_mod.Diagnostic = .{};
-    const default_after_override = try build_mod.build(init, allocator, .{
+    var default_after_uncached_diag: build_mod.Diagnostic = .{};
+    const default_after_uncached = try build_mod.build(init, allocator, .{
         .tag = "local/build-smoke:dev",
         .context_dir = context_dir,
         .dockerfile_path = dockerfile_path,
         .platform = .{},
         .network = .none,
-        .diagnostic = &default_after_override_diag,
+        .diagnostic = &default_after_uncached_diag,
     });
-    if (default_after_override_diag.executor.boot_count != 0) return error.ExpectedDefaultAfterOverrideWithoutBoot;
-    if (default_after_override_diag.executor.executed_steps != 0) return error.ExpectedDefaultAfterOverrideWithoutSteps;
-    if (default_after_override_diag.executor.resize_count != 0) return error.ExpectedDefaultAfterOverrideWithoutResize;
-    if (!default_after_override.cache_hit) return error.ExpectedDefaultAfterOverrideCacheHit;
-    if (!std.mem.eql(u8, first.index_digest, default_after_override.index_digest)) return error.ExpectedDefaultAfterOverrideRootfsIdentity;
+    if (default_after_uncached_diag.executor.boot_count != 0) return error.ExpectedDefaultAfterUncachedWithoutBoot;
+    if (default_after_uncached_diag.executor.executed_steps != 0) return error.ExpectedDefaultAfterUncachedWithoutSteps;
+    if (default_after_uncached_diag.executor.resize_count != 0) return error.ExpectedDefaultAfterUncachedWithoutResize;
+    if (!default_after_uncached.cache_hit) return error.ExpectedDefaultAfterUncachedCacheHit;
+    if (!std.mem.eql(u8, uncached.index_digest, default_after_uncached.index_digest)) return error.ExpectedDefaultAfterUncachedRootfsIdentity;
 
     try writeSmokeContext(allocator, io, context_dir, "beta-edited\n");
     var edited_diag: build_mod.Diagnostic = .{};
@@ -171,15 +170,15 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, first_diag.context_disk.digest, edited_diag.context_disk.digest)) return error.ExpectedEditedContextDiskIdentity;
 
     std.debug.print(
-        "spore-build-run-smoke ok: first={s} cached={s} override={s} default-after-override={s} edited={s} context-disk-first=emitted:{d}ms context-disk-override=reused:{d}ms context-disk-edited=emitted:{d}ms\n",
+        "spore-build-run-smoke ok: first={s} cached={s} uncached={s} default-after-uncached={s} edited={s} context-disk-first=emitted:{d}ms context-disk-uncached=reused:{d}ms context-disk-edited=emitted:{d}ms\n",
         .{
             first.index_digest,
             cached.index_digest,
-            override.index_digest,
-            default_after_override.index_digest,
+            uncached.index_digest,
+            default_after_uncached.index_digest,
             edited.index_digest,
             nsToMs(first_diag.context_disk.emit_ns),
-            nsToMs(override_diag.context_disk.emit_ns),
+            nsToMs(uncached_diag.context_disk.emit_ns),
             nsToMs(edited_diag.context_disk.emit_ns),
         },
     );

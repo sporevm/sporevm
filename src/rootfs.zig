@@ -28,6 +28,10 @@ const max_rootfs_layers: usize = 512;
 pub const builder_version = "sporevm-rootfs-v6";
 const rootfs_build_profile_env = "SPOREVM_ROOTFS_BUILD_PROFILE";
 const ext4_writer_env = "SPOREVM_EXT4_WRITER";
+/// Internal P0 fixture selector. It is intentionally absent from CLI help and
+/// carries a distinct producer/cache identity from the normal external
+/// writer so experiment output cannot alias ordinary rootfs materialization.
+const ext4_metadata_csum_experiment_env = "SPOREVM_EXT4_METADATA_CSUM_EXPERIMENT";
 const resolver_placeholder_path = "etc/resolv.conf";
 const resolver_placeholder_bytes =
     "# SporeVM generated placeholder; --net bind-mounts the guest resolver here.\n";
@@ -669,9 +673,14 @@ const MaterializeResult = struct {
 pub const Ext4Writer = enum {
     native,
     external,
+    external_metadata_csum_experiment,
 
     fn text(self: Ext4Writer) []const u8 {
-        return @tagName(self);
+        return switch (self) {
+            .native => "native",
+            .external => "external",
+            .external_metadata_csum_experiment => "external-metadata-csum-experiment",
+        };
     }
 };
 
@@ -782,7 +791,16 @@ fn ext4WriterFromEnvValue(value: ?[]const u8) !Ext4Writer {
 }
 
 pub fn selectedExt4Writer(environ: *const std.process.Environ.Map) !Ext4Writer {
-    return ext4WriterFromEnvValue(environ.get(ext4_writer_env));
+    const writer = try ext4WriterFromEnvValue(environ.get(ext4_writer_env));
+    if (!experimentEnabled(environ.get(ext4_metadata_csum_experiment_env))) return writer;
+    if (writer != .external) return error.UnsupportedExt4Writer;
+    return .external_metadata_csum_experiment;
+}
+
+fn experimentEnabled(value: ?[]const u8) bool {
+    const raw = value orelse return false;
+    if (raw.len == 0 or std.mem.eql(u8, raw, "0")) return false;
+    return !std.ascii.eqlIgnoreCase(raw, "false");
 }
 
 pub fn validateTaggedImageRef(raw_ref: []const u8) !void {
@@ -1615,7 +1633,7 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     var native_preload_result: ?rootfs_cas.PreloadResult = null;
     switch (opts.ext4_writer) {
         .native => native_preload_result = try materializeRootFSNative(init, allocator, opts, layer_meta, deterministic_ext4, native_inline_cache_root, &maybe_cache_lock),
-        .external => try materializeRootFSExternal(init, allocator, opts, layer_meta, deterministic_ext4),
+        .external, .external_metadata_csum_experiment => try materializeRootFSExternal(init, allocator, opts, layer_meta, deterministic_ext4),
     }
     const stat = try Io.Dir.cwd().statFile(init.io, opts.output, .{});
     if (maybe_cache_lock == null and !opts.rootfs_cache_lock_held) {
@@ -1783,17 +1801,37 @@ fn materializeRootFSExternal(
     const inode_count = ext4.computeImageInodes(try ext4.dirEntryCount(init.io, rootfs_dir));
     const image_size = ext4.computeImageSize(content_size);
     opts.profile.phase("ext4_size_scan", scan_start);
+    const metadata_checksum = opts.ext4_writer == .external_metadata_csum_experiment;
 
     const create_start = opts.profile.start();
     try ext4.ensureParentDir(init.io, opts.output);
     try ext4.createEmptyFile(init.io, opts.output, image_size);
     opts.profile.phase("ext4_create_empty", create_start);
     const mkfs_start = opts.profile.start();
-    try ext4.runMkfs(init, allocator, mkfs, rootfs_dir_path, opts.output, deterministic_ext4, inode_count);
+    try ext4.runMkfs(
+        init,
+        allocator,
+        mkfs,
+        rootfs_dir_path,
+        opts.output,
+        deterministic_ext4,
+        inode_count,
+        metadata_checksum,
+    );
     opts.profile.phase("mkfs_ext4", mkfs_start);
     const debugfs_script = try std.fmt.allocPrint(allocator, "{s}/debugfs-ownership.cmds", .{opts.temp_dir});
     const debugfs_start = opts.profile.start();
-    try ext4.runDebugfsFinalize(init, allocator, debugfs, opts.output, debugfs_script, &owners, &xattrs, deterministic_ext4);
+    try ext4.runDebugfsFinalize(
+        init,
+        allocator,
+        debugfs,
+        opts.output,
+        debugfs_script,
+        &owners,
+        &xattrs,
+        deterministic_ext4,
+        metadata_checksum,
+    );
     opts.profile.phase("debugfs_finalize", debugfs_start);
 }
 
@@ -2818,6 +2856,20 @@ test "native ext4 writer env defaults native and fails closed" {
     try std.testing.expectEqual(Ext4Writer.external, try ext4WriterFromEnvValue("external"));
     try std.testing.expectEqual(Ext4Writer.native, try ext4WriterFromEnvValue("native"));
     try std.testing.expectError(error.UnsupportedExt4Writer, ext4WriterFromEnvValue("yes"));
+}
+
+test "metadata checksum fixture has a distinct external writer identity" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.put(ext4_metadata_csum_experiment_env, "1");
+    try std.testing.expectError(error.UnsupportedExt4Writer, selectedExt4Writer(&env));
+    try env.put(ext4_writer_env, "external");
+    try std.testing.expectEqual(Ext4Writer.external_metadata_csum_experiment, try selectedExt4Writer(&env));
+    try std.testing.expectEqualStrings("external-metadata-csum-experiment", (try selectedExt4Writer(&env)).text());
+
+    try env.put(ext4_metadata_csum_experiment_env, "false");
+    try std.testing.expectEqual(Ext4Writer.external, try selectedExt4Writer(&env));
 }
 
 test "materialize rootfs uses native ext4 writer by default" {

@@ -678,6 +678,18 @@ pub const DiskForkAction = struct {
 pub const ControlStats = struct {
     chunks_nonzero: ?u64 = null,
     dirty_chunks_pending: ?u64 = null,
+    accepted_features: ?u64 = null,
+    write_zeroes_requests: ?u64 = null,
+    write_zeroes_bytes: ?u64 = null,
+    write_zeroes_unmap_requests: ?u64 = null,
+    write_zeroes_ok: ?u64 = null,
+    write_zeroes_errors: ?u64 = null,
+    write_zeroes_backend_failures: ?u64 = null,
+    write_zeroes_unsupported: ?u64 = null,
+    out_requests: ?u64 = null,
+    out_bytes: ?u64 = null,
+    out_all_zero_requests: ?u64 = null,
+    out_all_zero_bytes: ?u64 = null,
 };
 
 pub const Wake = struct {

@@ -30,6 +30,7 @@ const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
 const topology = @import("topology.zig");
+const virtio_blk = @import("virtio/blk.zig");
 const virtio_net = @import("virtio/net.zig");
 const vsock = @import("virtio/vsock.zig");
 
@@ -48,14 +49,27 @@ const max_injected_files = 16;
 const max_injected_file_id_len = 96;
 const max_injected_file_total_bytes = 16 * 1024 * 1024;
 const embedded_run_initrd = run_assets.minimal_exec_initrd;
+const embedded_run_initrd_sha256 = blk: {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, run_assets.minimal_exec_initrd_sha256_hex) catch
+        @compileError("generated minimal initrd SHA-256 is not canonical hex");
+    break :blk digest;
+};
 const default_kernel_repository = "sporevm/kernels";
 const default_kernel_release = "v0.6.2";
 const default_kernel_version = "6.1.155";
+pub const rootfs_growth_experiments_env = "SPOREVM_ROOTFS_GROWTH_EXPERIMENTS";
+const force_write_zeroes_unsupported_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_UNSUPPORTED_EXPERIMENT";
+const force_write_zeroes_backend_failure_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_BACKEND_FAILURE_EXPERIMENT";
+const lazy_init_negative_control_experiment_env = "SPOREVM_ROOTFS_LAZY_INIT_NEGATIVE_CONTROL";
 const managed_run_kernel_required_config_symbols = [_][]const u8{
     "CONFIG_CGROUPS",
     "CONFIG_FILE_LOCKING",
     "CONFIG_HW_RANDOM",
     "CONFIG_HW_RANDOM_VIRTIO",
+    "CONFIG_VIRTIO_BLK",
+    "CONFIG_EXT4_FS",
+    "CONFIG_JBD2",
     "CONFIG_SHMEM",
     "CONFIG_TMPFS",
     "CONFIG_FSNOTIFY",
@@ -954,7 +968,7 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
     if (err == error.RunCommitGuestResizeFailed or err == error.RunCommitGuestResizeTimedOut) {
         return machine_output.CliError.init(
             .runtime_execution_failed,
-            "spore run: image commit could not run guest resize2fs before the command; ensure the source image provides /bin/sh and resize2fs; the destination ref was not updated",
+            "spore run: image commit could not grow the guest rootfs before the command; the destination ref was not updated",
             @errorName(err),
         );
     }
@@ -1114,7 +1128,7 @@ pub const cli_usage =
     \\  --pull=missing|always|never
     \\                          Pull policy for mutable --image refs (default: missing)
     \\  --commit LOCAL_REF      On command success, publish the writable root disk as an image
-    \\  --disk-size SIZE        Grow an image-backed commit disk before the command (e.g. 40gb)
+    \\  --disk-size SIZE        Grow an image-backed commit disk before the command (e.g. 20gb)
     \\  --net                   Experimental SporeVM-managed networking
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
@@ -2313,7 +2327,7 @@ pub fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Alloc
         return path;
     }
 
-    return resolveManagedRunKernelPath(init, allocator);
+    return (try resolveManagedRunKernel(init, allocator)).path;
 }
 
 pub fn resolveConfiguredInitrdPath(init: std.process.Init, cli_path: ?[]const u8) !?[]const u8 {
@@ -2325,7 +2339,12 @@ pub fn resolveConfiguredInitrdPath(init: std.process.Init, cli_path: ?[]const u8
     return null;
 }
 
-fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+const ManagedRunKernel = struct {
+    path: []const u8,
+    sha256: [Sha256.digest_length]u8,
+};
+
+fn resolveManagedRunKernel(init: std.process.Init, allocator: std.mem.Allocator) !ManagedRunKernel {
     const opts = managedKernelOptions(init);
     const asset = try managedRunKernelAssetName(allocator, opts.linux_version);
     const config_asset = try managedRunKernelConfigAssetName(allocator, asset);
@@ -2339,8 +2358,8 @@ fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Alloca
     const sha_dest = try std.fmt.allocPrint(allocator, "{s}.sha256", .{dest});
     const config_dest = try std.fmt.allocPrint(allocator, "{s}.config", .{dest});
 
-    if (try managedKernelCacheHit(init.io, allocator, dest, sha_dest, config_dest)) {
-        return dest;
+    if (try managedKernelCacheDigest(init.io, allocator, dest, sha_dest, config_dest, asset)) |digest| {
+        return .{ .path = dest, .sha256 = digest };
     }
 
     try ensureDirPath(init.io, dest_dir);
@@ -2363,7 +2382,8 @@ fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Alloca
     const sha_asset = try std.fmt.allocPrint(allocator, "{s}.sha256", .{asset});
     try fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, sha_asset, temp_sha, max_kernel_config_asset_size);
     try fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, config_asset, temp_config, max_kernel_config_asset_size);
-    if (!try verifiedManagedKernelPath(init.io, allocator, temp_image, temp_sha)) return error.ManagedKernelChecksumMismatch;
+    const expected_digest = (try verifiedManagedKernelDigest(init.io, allocator, temp_image, temp_sha, asset)) orelse
+        return error.ManagedKernelChecksumMismatch;
     if (try missingManagedRunKernelConfigSymbolFromPath(init.io, allocator, temp_config)) |missing| {
         defer allocator.free(missing);
         return error.ManagedKernelConfigMissing;
@@ -2375,7 +2395,7 @@ fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Alloca
     chmodFileReadOnly(allocator, dest) catch {};
     chmodFileReadOnly(allocator, sha_dest) catch {};
     chmodFileReadOnly(allocator, config_dest) catch {};
-    return dest;
+    return .{ .path = dest, .sha256 = expected_digest };
 }
 
 const ManagedKernelOptions = struct {
@@ -2433,31 +2453,60 @@ fn validateManagedKernelRepository(repository: []const u8) !void {
     if (slash_count != 1) return error.BadManagedKernelRepository;
 }
 
-fn verifiedManagedKernelPath(io: Io, allocator: std.mem.Allocator, image_path: []const u8, sha_path: []const u8) !bool {
-    if (!try rootfs_cache.regularFileNoSymlink(io, image_path)) return false;
-    if (!try rootfs_cache.regularFileNoSymlink(io, sha_path)) return false;
-    const expected = readExpectedSha256(io, allocator, sha_path) catch |err| switch (err) {
-        error.BadManagedKernelChecksum => return false,
+fn verifiedManagedKernelDigest(
+    io: Io,
+    allocator: std.mem.Allocator,
+    image_path: []const u8,
+    sha_path: []const u8,
+    asset_name: []const u8,
+) !?[Sha256.digest_length]u8 {
+    if (!try rootfs_cache.regularFileNoSymlink(io, image_path)) return null;
+    if (!try rootfs_cache.regularFileNoSymlink(io, sha_path)) return null;
+    const expected = readExpectedSha256Digest(io, allocator, sha_path, asset_name, false) catch |err| switch (err) {
+        error.BadManagedKernelChecksum => return null,
         else => |e| return e,
     };
-    defer allocator.free(expected);
-    const actual = try sha256FileHex(io, image_path);
-    return std.ascii.eqlIgnoreCase(expected, &actual);
+    const actual = try sha256FileDigest(io, image_path);
+    if (!std.mem.eql(u8, &expected, &actual)) return null;
+    return expected;
 }
 
-fn managedKernelCacheHit(io: Io, allocator: std.mem.Allocator, image_path: []const u8, sha_path: []const u8, config_path: []const u8) !bool {
-    if (!try readOnlyRegularFileNoSymlink(io, image_path)) return false;
-    if (!try readOnlyRegularFileNoSymlink(io, sha_path)) return false;
-    if (!try readOnlyRegularFileNoSymlink(io, config_path)) return false;
+fn managedKernelCacheDigest(
+    io: Io,
+    allocator: std.mem.Allocator,
+    image_path: []const u8,
+    sha_path: []const u8,
+    config_path: []const u8,
+    asset_name: []const u8,
+) !?[Sha256.digest_length]u8 {
+    if (!try readOnlyRegularFileNoSymlink(io, image_path)) return null;
+    if (!try readOnlyRegularFileNoSymlink(io, sha_path)) return null;
+    if (!try readOnlyRegularFileNoSymlink(io, config_path)) return null;
+
+    const expected = readExpectedSha256Digest(io, allocator, sha_path, asset_name, true) catch |err| switch (err) {
+        error.BadManagedKernelChecksum => return null,
+        else => |e| return e,
+    };
 
     // Managed kernel assets are verified against the release checksum before
-    // being atomically installed read-only, then trusted on later opens
-    // (verify-at-install, trust-at-open; see SECURITY.md). The config-symbol
-    // check is not content re-verification and stays: the required symbol
-    // list belongs to the running binary, which may demand more symbols than
-    // the binary that installed this cache entry.
-    if (!try managedRunKernelConfigHasRequiredSymbols(io, allocator, config_path)) return false;
-    return true;
+    // being atomically installed read-only. Cache lookup reads only the small,
+    // canonical checksum sidecar and config; an executor miss separately opens
+    // the Image once, verifies those exact bytes, and boots the same allocation.
+    // The config-symbol check stays because the required symbol list belongs to
+    // the running binary, which may demand more than the installer did.
+    if (!try managedRunKernelConfigHasRequiredSymbols(io, allocator, config_path)) return null;
+    return expected;
+}
+
+fn managedKernelCacheHit(
+    io: Io,
+    allocator: std.mem.Allocator,
+    image_path: []const u8,
+    sha_path: []const u8,
+    config_path: []const u8,
+    asset_name: []const u8,
+) !bool {
+    return (try managedKernelCacheDigest(io, allocator, image_path, sha_path, config_path, asset_name)) != null;
 }
 
 fn managedRunKernelConfigHasRequiredSymbols(io: Io, allocator: std.mem.Allocator, config_path: []const u8) !bool {
@@ -2504,24 +2553,72 @@ fn readOnlyRegularFileNoSymlink(io: Io, path: []const u8) !bool {
     return stat.kind == .file and @intFromEnum(stat.permissions) & 0o222 == 0;
 }
 
-fn readExpectedSha256(io: Io, allocator: std.mem.Allocator, sha_path: []const u8) ![]const u8 {
-    const bytes = try Io.Dir.cwd().readFileAlloc(io, sha_path, allocator, .limited(4096));
+fn readExpectedSha256Digest(
+    io: Io,
+    allocator: std.mem.Allocator,
+    sha_path: []const u8,
+    asset_name: []const u8,
+    require_read_only: bool,
+) ![Sha256.digest_length]u8 {
+    const bytes = try readRegularFileNoSymlinkAlloc(io, allocator, sha_path, 4096, require_read_only);
     defer allocator.free(bytes);
     var fields = std.mem.tokenizeAny(u8, bytes, " \t\r\n");
     const first = fields.next() orelse return error.BadManagedKernelChecksum;
-    if (!isSha256Hex(first)) return error.BadManagedKernelChecksum;
-    return allocator.dupe(u8, first);
+    if (!isCanonicalSha256Hex(first)) return error.BadManagedKernelChecksum;
+    if (fields.next()) |named_asset| {
+        const normalized_name = if (std.mem.startsWith(u8, named_asset, "*")) named_asset[1..] else named_asset;
+        if (!std.mem.eql(u8, normalized_name, asset_name)) return error.BadManagedKernelChecksum;
+    }
+    if (fields.next() != null) return error.BadManagedKernelChecksum;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, first) catch return error.BadManagedKernelChecksum;
+    return digest;
 }
 
-fn isSha256Hex(value: []const u8) bool {
+fn readRegularFileNoSymlinkAlloc(
+    io: Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_size: usize,
+    require_read_only: bool,
+) ![]u8 {
+    const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.ManagedKernelAssetOpenFailed;
+    defer _ = std.c.close(fd);
+
+    const file = Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = file.stat(io) catch return error.ManagedKernelAssetOpenFailed;
+    if (stat.kind != .file) return error.ManagedKernelAssetOpenFailed;
+    if (require_read_only and @intFromEnum(stat.permissions) & 0o222 != 0)
+        return error.ManagedKernelCacheEntryWritable;
+    if (stat.size > max_size) return error.ManagedKernelAssetTooLarge;
+    const len: usize = @intCast(stat.size);
+    const bytes = try allocator.alloc(u8, len);
+    errdefer allocator.free(bytes);
+    var offset: usize = 0;
+    while (offset < len) {
+        const n = std.c.read(fd, bytes[offset..].ptr, len - offset);
+        if (n <= 0) return error.ManagedKernelAssetReadFailed;
+        offset += @intCast(n);
+    }
+    var extra: [1]u8 = undefined;
+    const trailing = std.c.read(fd, extra[0..].ptr, extra.len);
+    if (trailing < 0) return error.ManagedKernelAssetReadFailed;
+    if (trailing != 0) return error.ManagedKernelAssetChanged;
+    return bytes;
+}
+
+fn isCanonicalSha256Hex(value: []const u8) bool {
     if (value.len != Sha256.digest_length * 2) return false;
     for (value) |c| {
-        if (!std.ascii.isHex(c)) return false;
+        if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
     }
     return true;
 }
 
-fn sha256FileHex(io: Io, path: []const u8) ![Sha256.digest_length * 2]u8 {
+fn sha256FileDigest(io: Io, path: []const u8) ![Sha256.digest_length]u8 {
     var file = try Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     var reader_buf: [64 * 1024]u8 = undefined;
@@ -2535,7 +2632,7 @@ fn sha256FileHex(io: Io, path: []const u8) ![Sha256.digest_length * 2]u8 {
     }
     var out: [Sha256.digest_length]u8 = undefined;
     h.final(&out);
-    return std.fmt.bytesToHex(out, .lower);
+    return out;
 }
 
 fn fetchManagedKernelAsset(
@@ -2763,8 +2860,11 @@ const CommitControl = struct {
     guest_port: u32,
     timeout_ms: u64,
     cache_root: []const u8,
+    rootfs_grow_target: u64,
     phase: Phase,
     resize_stream: vsock.HostStream = undefined,
+    resize_stdout: std.array_list.Managed(u8),
+    resize_stdout_overflow: bool = false,
     freeze_stream: vsock.HostStream = undefined,
     storage: ?spore.RootfsStorage = null,
     cache_lock: ?rootfs_mod.RootfsCacheLock = null,
@@ -2781,6 +2881,7 @@ const CommitControl = struct {
     };
 
     fn deinit(self: *CommitControl) void {
+        self.resize_stdout.deinit();
         if (self.cache_lock) |*lock| lock.deinit();
     }
 
@@ -2798,15 +2899,10 @@ const CommitControl = struct {
     fn poll(self: *CommitControl, dev: *vsock.Vsock) !vsock.ControlAction {
         switch (self.phase) {
             .start_resize => {
-                const now: u64 = @intCast(Io.Clock.real.now(self.io).nanoseconds);
-                const request = try execRequestWithSession(
-                    self.allocator,
-                    &.{ "/bin/sh", "-lc", "resize2fs /dev/vda" },
-                    "spore-run-commit-resize",
-                    now,
-                );
-                self.resize_stream = try vsock.HostStream.init(self.guest_port, request);
+                const request = try simpleControlRequest(self.allocator, "spore-rootfs-grow-v1", "spore-run-commit-resize");
+                self.resize_stream = try vsock.HostStream.initWithProtocol(self.guest_port, request, .spore_stream_v1);
                 self.resize_stream.host_port = vsock.HostStream.deriveHostPort(request);
+                self.resize_stream.setOutputSink(self, resizeOutputSink);
                 try self.startStream(dev, &self.resize_stream);
                 self.phase = .active_resize;
                 return .keep_running;
@@ -2818,6 +2914,9 @@ const CommitControl = struct {
                         const exit_code = self.resize_stream.exit_code orelse return error.BadRunExitFrame;
                         dev.resetHostStream();
                         if (exit_code != 0) return error.RunCommitGuestResizeFailed;
+                        if (self.resize_stdout_overflow) return error.RunCommitGuestResizeFailed;
+                        const result = parseRootfsGrowResponse(self.resize_stdout.items) catch return error.RunCommitGuestResizeFailed;
+                        if (result.device_bytes != self.rootfs_grow_target) return error.RunCommitGuestResizeFailed;
                         self.phase = .start_command;
                     },
                     .failed => {
@@ -2884,6 +2983,17 @@ const CommitControl = struct {
         try dev.attachHostStream(stream);
         stream.markStarted();
         _ = try dev.flushHostStreamOutbound();
+    }
+
+    fn resizeOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+        if (output != .stdout) return;
+        const self: *CommitControl = @ptrCast(@alignCast(context.?));
+        const remaining = max_rootfs_grow_response -| self.resize_stdout.items.len;
+        if (bytes.len > remaining) self.resize_stdout_overflow = true;
+        const take = @min(remaining, bytes.len);
+        if (take != 0) self.resize_stdout.appendSlice(bytes[0..take]) catch {
+            self.resize_stdout_overflow = true;
+        };
     }
 
     fn completeRootfsSnapshot(self: *CommitControl, maybe_disk: ?spore.Disk) !void {
@@ -2983,7 +3093,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     });
     const disk_ms = monotonicMs() -| disk_start;
     defer runtime_disk.deinit();
-    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), opts.network, false);
+    const growth_session = opts.rootfs_grow_target != 0;
+    const noinit_itable = growth_session and rootfsGrowthNoInitItable(context.environ_map);
+    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, false);
     const request_start = monotonicMs();
     const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
     var stream = try vsock.HostStream.initWithProtocol(opts.guest_port, request.bytes, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
@@ -3009,7 +3121,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         .guest_port = opts.guest_port,
         .timeout_ms = opts.timeout_ms,
         .cache_root = cache_root,
+        .rootfs_grow_target = opts.rootfs_grow_target,
         .phase = if (opts.rootfs_grow_target != 0) .start_resize else .wait_command,
+        .resize_stdout = std.array_list.Managed(u8).init(allocator),
     } else null;
     defer if (commit_control) |*control| control.deinit();
     if (commit_control != null and runtime_disk.snapshot() == null) return error.RunCommitRootfsNotSnapshotable;
@@ -3019,6 +3133,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         control.control()
     else
         null;
+    var root_blk_stats: virtio_blk.Stats = .{};
+    const root_blk_options = rootBlkOptions(context.environ_map, opts.rootfs_grow_target != 0, &root_blk_stats);
+    defer if (opts.rootfs_grow_target != 0) logRootBlkStats(&root_blk_stats);
     var capture_request = capture.Request{};
     var signal_registration: ?capture.SignalRegistration = null;
     defer if (signal_registration) |*registration| registration.deinit();
@@ -3070,6 +3187,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .initrd = initrd,
                 .console_sink = consoleSink,
                 .disk_backend = runtime_disk.backend(),
+                .root_blk_options = root_blk_options,
                 .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
@@ -3103,6 +3221,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .initrd = initrd,
                 .console_sink = consoleSink,
                 .disk_backend = runtime_disk.backend(),
+                .root_blk_options = root_blk_options,
                 .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
@@ -3226,8 +3345,69 @@ fn runMemoryPlan(memory: memory_config.Config, constraints: RunMemoryConstraints
     };
 }
 
+pub const MonitorBootArtifacts = struct {
+    kernel: []const u8,
+    initrd: []const u8,
+};
+
+/// Identity-only view of the managed default boot producer. Resolving it reads
+/// the bounded checksum/config metadata but deliberately does not read the
+/// kernel Image. The Image is opened exactly once if an executor miss needs to
+/// boot, then the same verified allocation is passed to the VMM.
+pub const ManagedMonitorBootDescriptor = struct {
+    kernel_path: []const u8,
+    kernel_sha256: [Sha256.digest_length]u8,
+    initrd_sha256: [Sha256.digest_length]u8,
+};
+
+pub fn resolveManagedMonitorBootDescriptor(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+) !ManagedMonitorBootDescriptor {
+    if (init.environ_map.get("SPOREVM_KERNEL_IMAGE") != null or
+        init.environ_map.get("SPOREVM_RUN_INITRD") != null)
+    {
+        return error.CustomBootArtifactsConfigured;
+    }
+    const kernel = try resolveManagedRunKernel(init, allocator);
+    return .{
+        .kernel_path = kernel.path,
+        .kernel_sha256 = kernel.sha256,
+        .initrd_sha256 = embedded_run_initrd_sha256,
+    };
+}
+
+pub fn materializeManagedMonitorBootArtifacts(
+    io: Io,
+    allocator: std.mem.Allocator,
+    descriptor: ManagedMonitorBootDescriptor,
+) !MonitorBootArtifacts {
+    if (!std.mem.eql(u8, &descriptor.initrd_sha256, &embedded_run_initrd_sha256))
+        return error.ManagedInitrdIdentityMismatch;
+    const kernel = try readRegularFileNoSymlinkAlloc(io, allocator, descriptor.kernel_path, max_file_size, true);
+    errdefer allocator.free(kernel);
+    var actual: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(kernel, &actual, .{});
+    if (!std.mem.eql(u8, &descriptor.kernel_sha256, &actual))
+        return error.ManagedKernelChecksumMismatch;
+    return .{ .kernel = kernel, .initrd = embedded_run_initrd };
+}
+
+pub fn loadMonitorBootArtifacts(
+    io: Io,
+    allocator: std.mem.Allocator,
+    kernel_path: []const u8,
+    initrd_path: ?[]const u8,
+) !MonitorBootArtifacts {
+    return .{
+        .kernel = try std.Io.Dir.cwd().readFileAlloc(io, kernel_path, allocator, .limited(max_file_size)),
+        .initrd = try loadRunInitrd(io, allocator, initrd_path, &.{}),
+    };
+}
+
 pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control, startup_probe: ?*vsock.HostStream) !MonitorResult {
-    return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, control, startup_probe, null);
+    const artifacts = try loadMonitorBootArtifacts(context.io, allocator, opts.kernel_path, opts.initrd_path);
+    return executeMonitorWithBootArtifacts(context, allocator, opts, artifacts, control, startup_probe);
 }
 
 pub fn executeMonitorWithRootfsCacheLock(
@@ -3238,13 +3418,38 @@ pub fn executeMonitorWithRootfsCacheLock(
     startup_probe: ?*vsock.HostStream,
     rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
 ) !MonitorResult {
-    return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, control, startup_probe, rootfs_cache_lock);
+    const artifacts = try loadMonitorBootArtifacts(context.io, allocator, opts.kernel_path, opts.initrd_path);
+    return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, artifacts, control, startup_probe, rootfs_cache_lock);
+}
+
+pub fn executeMonitorWithBootArtifacts(
+    context: Context,
+    allocator: std.mem.Allocator,
+    opts: Options,
+    artifacts: MonitorBootArtifacts,
+    control: vsock.Control,
+    startup_probe: ?*vsock.HostStream,
+) !MonitorResult {
+    return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, artifacts, control, startup_probe, null);
+}
+
+pub fn executeMonitorWithBootArtifactsAndRootfsCacheLock(
+    context: Context,
+    allocator: std.mem.Allocator,
+    opts: Options,
+    artifacts: MonitorBootArtifacts,
+    control: vsock.Control,
+    startup_probe: ?*vsock.HostStream,
+    rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
+) !MonitorResult {
+    return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, artifacts, control, startup_probe, rootfs_cache_lock);
 }
 
 fn executeMonitorWithOptionalRootfsCacheLock(
     context: Context,
     allocator: std.mem.Allocator,
     opts: Options,
+    artifacts: MonitorBootArtifacts,
     control: vsock.Control,
     startup_probe: ?*vsock.HostStream,
     rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
@@ -3265,9 +3470,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     };
     defer if (gateway_active) gateway.deinit();
     const network_manifest = try manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy);
-    const kernel = try std.Io.Dir.cwd().readFileAlloc(context.io, opts.kernel_path, allocator, .limited(max_file_size));
     if (opts.injected_files.len != 0) return error.InjectedFileMonitorUnsupported;
-    const initrd = try loadRunInitrd(context.io, allocator, opts.initrd_path, &.{});
     var runtime_disk = try runtime_disk_mod.open(context, allocator, .{
         .rootfs_path = opts.rootfs_path,
         .rootfs = opts.rootfs,
@@ -3283,20 +3486,26 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     defer if (context_disk_fd) |fd| {
         _ = std.c.close(fd);
     };
-    const boot_args = try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), opts.network, opts.context_disk_path != null);
+    const growth_session = opts.rootfs_grow_target != 0;
+    const noinit_itable = growth_session and rootfsGrowthNoInitItable(context.environ_map);
+    const boot_args = try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, opts.context_disk_path != null);
+    var root_blk_stats: virtio_blk.Stats = .{};
+    const root_blk_options = rootBlkOptions(context.environ_map, opts.rootfs_grow_target != 0, &root_blk_stats);
+    defer if (opts.rootfs_grow_target != 0) logRootBlkStats(&root_blk_stats);
 
     const cause = switch (backend) {
         .auto => unreachable,
         .hvf => blk: {
             if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
             break :blk try hvf.vm.run(allocator, .{
-                .kernel = kernel,
+                .kernel = artifacts.kernel,
                 .ram_size = opts.memory.bytes,
                 .vcpus = opts.vcpus,
                 .cmdline = boot_args,
-                .initrd = initrd,
+                .initrd = artifacts.initrd,
                 .console_sink = consoleSink,
                 .disk_backend = runtime_disk.backend(),
+                .root_blk_options = root_blk_options,
                 .context_disk_fd = context_disk_fd,
                 .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
@@ -3317,13 +3526,14 @@ fn executeMonitorWithOptionalRootfsCacheLock(
         .kvm => blk: {
             if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
             break :blk try kvm.vm.run(allocator, .{
-                .kernel = kernel,
+                .kernel = artifacts.kernel,
                 .ram_size = opts.memory.bytes,
                 .vcpus = opts.vcpus,
                 .cmdline = boot_args,
-                .initrd = initrd,
+                .initrd = artifacts.initrd,
                 .console_sink = consoleSink,
                 .disk_backend = runtime_disk.backend(),
+                .root_blk_options = root_blk_options,
                 .context_disk_fd = context_disk_fd,
                 .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
@@ -3673,15 +3883,120 @@ pub fn rootfsGrowTarget(current_size: u64, requested_size: u64) !u64 {
     return if (requested_size == current_size) 0 else requested_size;
 }
 
-pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, network: NetworkMode, build_context: bool) ![]const u8 {
+pub const max_rootfs_grow_response: usize = 1024;
+
+pub const RootfsGrowResult = struct {
+    device_bytes: u64,
+    block_size: u64,
+    target_blocks: u64,
+    usable_blocks: u64,
+    free_bytes: u64,
+    inodes: u64,
+    free_inodes: u64,
+};
+
+pub fn parseRootfsGrowResponse(bytes: []const u8) !RootfsGrowResult {
+    if (bytes.len == 0 or bytes.len > max_rootfs_grow_response) return error.BadRootfsGrowResponse;
+    if (!std.mem.endsWith(u8, bytes, "\n") or std.mem.count(u8, bytes, "\n") != 1) return error.BadRootfsGrowResponse;
+    const line = bytes[0 .. bytes.len - 1];
+    if (std.mem.indexOfScalar(u8, line, '\r') != null) return error.BadRootfsGrowResponse;
+
+    var tokens = std.mem.splitScalar(u8, line, ' ');
+    if (!std.mem.eql(u8, tokens.next() orelse return error.BadRootfsGrowResponse, "spore-rootfs-grow-v1")) return error.BadRootfsGrowResponse;
+    const device_bytes = try parseRootfsGrowField(tokens.next(), "device_bytes");
+    const block_size = try parseRootfsGrowField(tokens.next(), "block_size");
+    const target_blocks = try parseRootfsGrowField(tokens.next(), "target_blocks");
+    const usable_blocks = try parseRootfsGrowField(tokens.next(), "usable_blocks");
+    const free_bytes = try parseRootfsGrowField(tokens.next(), "free_bytes");
+    const inodes = try parseRootfsGrowField(tokens.next(), "inodes");
+    const free_inodes = try parseRootfsGrowField(tokens.next(), "free_inodes");
+    if (tokens.next() != null) return error.BadRootfsGrowResponse;
+
+    if (device_bytes == 0 or block_size == 0 or device_bytes % block_size != 0) return error.BadRootfsGrowResponse;
+    if (target_blocks != device_bytes / block_size) return error.BadRootfsGrowResponse;
+    if (usable_blocks == 0 or usable_blocks > target_blocks or inodes == 0) return error.BadRootfsGrowResponse;
+    const usable_bytes = std.math.mul(u64, usable_blocks, block_size) catch return error.BadRootfsGrowResponse;
+    if (free_bytes > usable_bytes or free_bytes % block_size != 0 or free_inodes > inodes) return error.BadRootfsGrowResponse;
+    return .{
+        .device_bytes = device_bytes,
+        .block_size = block_size,
+        .target_blocks = target_blocks,
+        .usable_blocks = usable_blocks,
+        .free_bytes = free_bytes,
+        .inodes = inodes,
+        .free_inodes = free_inodes,
+    };
+}
+
+fn parseRootfsGrowField(maybe_token: ?[]const u8, expected_name: []const u8) !u64 {
+    const token = maybe_token orelse return error.BadRootfsGrowResponse;
+    if (token.len <= expected_name.len + 1 or !std.mem.startsWith(u8, token, expected_name) or token[expected_name.len] != '=') {
+        return error.BadRootfsGrowResponse;
+    }
+    return std.fmt.parseUnsigned(u64, token[expected_name.len + 1 ..], 10) catch error.BadRootfsGrowResponse;
+}
+
+fn rootBlkOptions(environ: *const std.process.Environ.Map, growth_session: bool, stats: *virtio_blk.Stats) virtio_blk.Options {
+    if (!growth_session) return .{};
+    const experiments_enabled = rootfsGrowthExperimentsEnabled(environ);
+    return .{
+        .write_zeroes = true,
+        .force_write_zeroes_unsupported = experiments_enabled and internalExperimentEnabled(environ.get(force_write_zeroes_unsupported_experiment_env)),
+        .force_write_zeroes_backend_failure = experiments_enabled and internalExperimentEnabled(environ.get(force_write_zeroes_backend_failure_experiment_env)),
+        .stats = stats,
+    };
+}
+
+pub fn rootfsGrowthExperimentsEnabled(environ: *const std.process.Environ.Map) bool {
+    return if (environ.get(rootfs_growth_experiments_env)) |value|
+        std.mem.eql(u8, value, "1")
+    else
+        false;
+}
+
+fn internalExperimentEnabled(value: ?[]const u8) bool {
+    const raw = value orelse return false;
+    if (raw.len == 0 or std.mem.eql(u8, raw, "0")) return false;
+    return !std.ascii.eqlIgnoreCase(raw, "false");
+}
+
+pub fn rootfsGrowthNoInitItable(environ: *const std.process.Environ.Map) bool {
+    return !rootfsGrowthExperimentsEnabled(environ) or
+        !internalExperimentEnabled(environ.get(lazy_init_negative_control_experiment_env));
+}
+
+fn logRootBlkStats(stats: *const virtio_blk.Stats) void {
+    const snapshot = stats.snapshot();
+    std.log.info(
+        "rootfs growth blk metrics: accepted_features=0x{x} write_zeroes_requests={d} write_zeroes_bytes={d} write_zeroes_unmap={d} write_zeroes_ok={d} write_zeroes_errors={d} write_zeroes_backend_failures={d} write_zeroes_unsupported={d} out_requests={d} out_bytes={d} out_all_zero_requests={d} out_all_zero_bytes={d}",
+        .{
+            snapshot.accepted_features,
+            snapshot.write_zeroes_requests,
+            snapshot.write_zeroes_bytes,
+            snapshot.write_zeroes_unmap_requests,
+            snapshot.write_zeroes_ok,
+            snapshot.write_zeroes_errors,
+            snapshot.write_zeroes_backend_failures,
+            snapshot.write_zeroes_unsupported,
+            snapshot.out_requests,
+            snapshot.out_bytes,
+            snapshot.out_all_zero_requests,
+            snapshot.out_all_zero_bytes,
+        },
+    );
+}
+
+pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, rootfs_growth: bool, noinit_itable: bool, network: NetworkMode, build_context: bool) ![]const u8 {
     const rootfs_flag = if (rootfs) " spore_rootfs=1" else "";
     const rootfs_rw_flag = if (rootfs and rootfs_writable) " spore_rootfs_rw=1" else "";
+    const rootfs_growth_flag = if (rootfs and rootfs_writable and rootfs_growth) " spore_rootfs_growth=1" else "";
+    const noinit_itable_flag = if (rootfs and rootfs_writable and rootfs_growth and noinit_itable) " spore_rootfs_noinit_itable=1" else "";
     const network_flag = if (network == .spore) " spore_net=1" else "";
     const build_context_flag = if (build_context) " spore_build_context=1" else "";
     return std.fmt.allocPrint(
         allocator,
-        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}{s}{s}",
-        .{ guest_port, rootfs_flag, rootfs_rw_flag, network_flag, build_context_flag },
+        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}{s}{s}{s}{s}",
+        .{ guest_port, rootfs_flag, rootfs_rw_flag, rootfs_growth_flag, noinit_itable_flag, network_flag, build_context_flag },
     );
 }
 
@@ -5287,20 +5602,63 @@ test "run image cache creates absolute cache directories" {
 }
 
 test "run cmdline marks rootfs mode" {
-    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, false, .disabled, false);
+    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, true, true, true, .disabled, false);
     defer std.testing.allocator.free(without_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_rw=1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_growth=1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_noinit_itable=1") == null);
 
-    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, false, .disabled, false);
+    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, false, true, true, .disabled, false);
     defer std.testing.allocator.free(with_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_rw=1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_growth=1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_noinit_itable=1") == null);
 
-    const with_writable_rootfs = try cmdline(std.testing.allocator, 10700, true, true, .disabled, false);
+    const with_writable_rootfs = try cmdline(std.testing.allocator, 10700, true, true, false, true, .disabled, false);
     defer std.testing.allocator.free(with_writable_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs_rw=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs_growth=1") == null);
+
+    const with_growth = try cmdline(std.testing.allocator, 10700, true, true, true, true, .disabled, false);
+    defer std.testing.allocator.free(with_growth);
+    try std.testing.expect(std.mem.indexOf(u8, with_growth, "spore_rootfs_growth=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_growth, "spore_rootfs_noinit_itable=1") != null);
+
+    const lazy_init_control = try cmdline(std.testing.allocator, 10700, true, true, true, false, .disabled, false);
+    defer std.testing.allocator.free(lazy_init_control);
+    try std.testing.expect(std.mem.indexOf(u8, lazy_init_control, "spore_rootfs_growth=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lazy_init_control, "spore_rootfs_noinit_itable=1") == null);
+}
+
+test "rootfs growth block profile is internal and opt in" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var stats: virtio_blk.Stats = .{};
+
+    const ordinary = rootBlkOptions(&env, false, &stats);
+    try std.testing.expect(!ordinary.write_zeroes);
+    try std.testing.expect(ordinary.stats == null);
+
+    const growth = rootBlkOptions(&env, true, &stats);
+    try std.testing.expect(growth.write_zeroes);
+    try std.testing.expect(!growth.force_write_zeroes_unsupported);
+    try std.testing.expect(!growth.force_write_zeroes_backend_failure);
+    try std.testing.expect(growth.stats == &stats);
+
+    try env.put(force_write_zeroes_unsupported_experiment_env, "1");
+    try std.testing.expect(!rootBlkOptions(&env, true, &stats).force_write_zeroes_unsupported);
+    try env.put(force_write_zeroes_backend_failure_experiment_env, "1");
+    try std.testing.expect(!rootBlkOptions(&env, true, &stats).force_write_zeroes_backend_failure);
+    try env.put(lazy_init_negative_control_experiment_env, "1");
+    try std.testing.expect(rootfsGrowthNoInitItable(&env));
+
+    try env.put(rootfs_growth_experiments_env, "1");
+    try std.testing.expect(rootBlkOptions(&env, true, &stats).force_write_zeroes_unsupported);
+    try std.testing.expect(rootBlkOptions(&env, true, &stats).force_write_zeroes_backend_failure);
+    try std.testing.expect(!rootfsGrowthNoInitItable(&env));
 }
 
 test "run rootfs path stays read-only without manifest rootfs metadata" {
@@ -5337,27 +5695,30 @@ test "indexed rootfs input enables rootfs boot mode" {
 }
 
 test "run cmdline marks network mode" {
-    const without_network = try cmdline(std.testing.allocator, 10700, false, false, .disabled, false);
+    const without_network = try cmdline(std.testing.allocator, 10700, false, false, false, false, .disabled, false);
     defer std.testing.allocator.free(without_network);
     try std.testing.expect(std.mem.indexOf(u8, without_network, "spore_net=1") == null);
 
-    const with_network = try cmdline(std.testing.allocator, 10700, false, false, .spore, false);
+    const with_network = try cmdline(std.testing.allocator, 10700, false, false, false, false, .spore, false);
     defer std.testing.allocator.free(with_network);
     try std.testing.expect(std.mem.indexOf(u8, with_network, "spore_net=1") != null);
 }
 
 test "run cmdline marks build context disk only when requested" {
-    const without_context = try cmdline(std.testing.allocator, 10700, true, true, .disabled, false);
+    const without_context = try cmdline(std.testing.allocator, 10700, true, true, false, false, .disabled, false);
     defer std.testing.allocator.free(without_context);
     try std.testing.expect(std.mem.indexOf(u8, without_context, "spore_build_context=1") == null);
 
-    const with_context = try cmdline(std.testing.allocator, 10700, true, true, .disabled, true);
+    const with_context = try cmdline(std.testing.allocator, 10700, true, true, false, false, .disabled, true);
     defer std.testing.allocator.free(with_context);
     try std.testing.expect(std.mem.indexOf(u8, with_context, "spore_build_context=1") != null);
 }
 
-test "run embeds default initrd" {
+test "run embeds default initrd with its generated canonical digest" {
     try std.testing.expect(embedded_run_initrd.len > 0);
+    var actual: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(embedded_run_initrd, &actual, .{});
+    try std.testing.expectEqualSlices(u8, &embedded_run_initrd_sha256, &actual);
 }
 
 test "managed run kernel asset names validate input" {
@@ -5397,12 +5758,27 @@ test "managed kernel checksum parser reads sha256 sidecar" {
         .data = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  Image\n",
     });
 
-    const expected = try readExpectedSha256(io, allocator, sha_path);
-    defer allocator.free(expected);
-    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", expected);
+    const expected = try readExpectedSha256Digest(io, allocator, sha_path, "Image", false);
+    const expected_hex = std.fmt.bytesToHex(expected, .lower);
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &expected_hex);
 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = sha_path, .data = "not-a-sha\n" });
-    try std.testing.expectError(error.BadManagedKernelChecksum, readExpectedSha256(io, allocator, sha_path));
+    try std.testing.expectError(error.BadManagedKernelChecksum, readExpectedSha256Digest(io, allocator, sha_path, "Image", false));
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = sha_path,
+        .data = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  Image\n",
+    });
+    try std.testing.expectError(error.BadManagedKernelChecksum, readExpectedSha256Digest(io, allocator, sha_path, "Image", false));
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = sha_path,
+        .data = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  Other\n",
+    });
+    try std.testing.expectError(error.BadManagedKernelChecksum, readExpectedSha256Digest(io, allocator, sha_path, "Image", false));
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = sha_path,
+        .data = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  Image extra\n",
+    });
+    try std.testing.expectError(error.BadManagedKernelChecksum, readExpectedSha256Digest(io, allocator, sha_path, "Image", false));
 }
 
 test "managed kernel cache hit trusts read-only image with checksum sidecar" {
@@ -5428,6 +5804,9 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
             "CONFIG_CGROUPS=y\n" ++
             "CONFIG_HW_RANDOM=y\n" ++
             "CONFIG_HW_RANDOM_VIRTIO=y\n" ++
+            "CONFIG_VIRTIO_BLK=y\n" ++
+            "CONFIG_EXT4_FS=y\n" ++
+            "CONFIG_JBD2=y\n" ++
             "CONFIG_SHMEM=y\n" ++
             "CONFIG_TMPFS=y\n" ++
             "CONFIG_FSNOTIFY=y\n" ++
@@ -5447,37 +5826,68 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_sha_path, .data = "not-a-sha\n" });
 
-    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path, "Image"));
     try chmodFileReadOnly(allocator, image_path);
-    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path, "Image"));
     try chmodFileReadOnly(allocator, sha_path);
-    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path, "Image"));
     try chmodFileReadOnly(allocator, config_path);
-    try std.testing.expect(try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
+    try std.testing.expect(try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path, "Image"));
 
-    // Trust-at-open contract: cache hits do not re-hash installed content, so
-    // a same-shape content change or a garbage checksum sidecar is trusted.
-    // Content integrity is enforced at install time; see SECURITY.md.
+    // Identity-only cache hits do not read the large Image. An executor miss
+    // verifies the exact opened bytes before boot; see the materialization test.
     try chmodFileWritable(allocator, image_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "tampered kernel bytes" });
     try chmodFileReadOnly(allocator, image_path);
-    try std.testing.expect(try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
+    try std.testing.expect(try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path, "Image"));
 
     try chmodFileReadOnly(allocator, bad_sha_path);
-    try std.testing.expect(try managedKernelCacheHit(io, allocator, image_path, bad_sha_path, config_path));
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, bad_sha_path, config_path, "Image"));
 
     // A writable image is not trusted, and missing required config symbols
     // still miss so a newer binary re-fetches a suitable kernel.
     try chmodFileWritable(allocator, image_path);
-    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path));
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path, "Image"));
     try chmodFileReadOnly(allocator, image_path);
     const sparse_config_path = tmp ++ "/Image.sparse.config";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = sparse_config_path, .data = "CONFIG_FILE_LOCKING=y\n" });
     try chmodFileReadOnly(allocator, sparse_config_path);
-    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, sparse_config_path));
+    try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, sparse_config_path, "Image"));
 }
 
-test "managed run kernel config requires Docker and virtio-mem runtime symbols" {
+test "managed monitor boot materialization verifies and retains opened kernel bytes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-run-managed-boot-materialization";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try ensureDirPath(io, tmp);
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+
+    const image_path = tmp ++ "/Image";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "kernel bytes" });
+    try chmodFileReadOnly(allocator, image_path);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash("kernel bytes", &digest, .{});
+    const descriptor = ManagedMonitorBootDescriptor{
+        .kernel_path = image_path,
+        .kernel_sha256 = digest,
+        .initrd_sha256 = embedded_run_initrd_sha256,
+    };
+    const boot = try materializeManagedMonitorBootArtifacts(io, allocator, descriptor);
+    defer allocator.free(boot.kernel);
+    try std.testing.expectEqualStrings("kernel bytes", boot.kernel);
+    try std.testing.expect(boot.initrd.ptr == embedded_run_initrd.ptr);
+
+    try chmodFileWritable(allocator, image_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "changed kernel bytes" });
+    try chmodFileReadOnly(allocator, image_path);
+    try std.testing.expectError(
+        error.ManagedKernelChecksumMismatch,
+        materializeManagedMonitorBootArtifacts(io, allocator, descriptor),
+    );
+}
+
+test "managed run kernel config requires rootfs, Docker, and virtio-mem runtime symbols" {
     const allocator = std.testing.allocator;
     const good_config =
         "# CONFIG_DEVMEM is not set\n" ++
@@ -5485,6 +5895,9 @@ test "managed run kernel config requires Docker and virtio-mem runtime symbols" 
         "CONFIG_CGROUPS=y\n" ++
         "CONFIG_HW_RANDOM=y\n" ++
         "CONFIG_HW_RANDOM_VIRTIO=y\n" ++
+        "CONFIG_VIRTIO_BLK=y\n" ++
+        "CONFIG_EXT4_FS=y\n" ++
+        "CONFIG_JBD2=y\n" ++
         "CONFIG_SHMEM=y\n" ++
         "CONFIG_TMPFS=y\n" ++
         "CONFIG_FSNOTIFY=y\n" ++
@@ -5503,6 +5916,18 @@ test "managed run kernel config requires Docker and virtio-mem runtime symbols" 
         "CONFIG_VIRTIO_MEM=y\n";
 
     try std.testing.expect(try missingManagedRunKernelConfigSymbol(allocator, good_config) == null);
+
+    const missing_virtio_blk = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        good_config,
+        "CONFIG_VIRTIO_BLK=y",
+        "# CONFIG_VIRTIO_BLK is not set",
+    );
+    defer allocator.free(missing_virtio_blk);
+    const missing_rootfs_symbol = (try missingManagedRunKernelConfigSymbol(allocator, missing_virtio_blk)).?;
+    defer allocator.free(missing_rootfs_symbol);
+    try std.testing.expectEqualStrings("CONFIG_VIRTIO_BLK", missing_rootfs_symbol);
 
     const missing_file_locking =
         "# CONFIG_FILE_LOCKING is not set\n" ++

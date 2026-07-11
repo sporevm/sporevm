@@ -342,10 +342,6 @@ int main(int argc, char **argv) {
   }
 
   const char *cmd = argv[2];
-  if (strcmp(cmd, "resize2fs /dev/vda") == 0) {
-    write_str(1, "resize2fs\n");
-    return 0;
-  }
   if (strcmp(cmd, "verify-clock") == 0) {
     return verify_clock();
   }

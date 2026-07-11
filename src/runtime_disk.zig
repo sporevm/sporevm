@@ -204,7 +204,10 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             var parsed = try readDiskIndex(context, allocator, cache_root, storage);
             defer parsed.deinit();
             try runtime.chunk_mapped.?.attachCasIndexTraced(cache_root, parsed.value, runtime.trace_fd);
-            try runtime.chunk_mapped.?.grow(grown_size);
+            // The sparse fd and verified parent index make every appended byte
+            // authoritative zero. Preserve that fact in the source map rather
+            // than manufacturing dirty zero payload.
+            try runtime.chunk_mapped.?.growKnownZero(grown_size);
             runtime.base_disk = base;
             runtime.base_disk.?.size = grown_size;
             runtime.chunk_mapped.?.setLazyCasRuntimeOpenNs(elapsedNs(trace_open_start_ns));

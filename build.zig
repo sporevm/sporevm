@@ -36,7 +36,15 @@ pub fn build(b: *std.Build) void {
         "-c",
         \\set -euo pipefail
         \\scripts/kernel/make-minimal-exec-initrd.sh --toybox-source "$3" "$1"
-        \\printf '%s\n' 'pub const minimal_exec_initrd = @embedFile("minimal-exec-initrd.cpio");' >"$2"
+        \\if command -v sha256sum >/dev/null 2>&1; then
+        \\  initrd_sha256="$(sha256sum "$1" | awk '{print $1}')"
+        \\else
+        \\  initrd_sha256="$(shasum -a 256 "$1" | awk '{print $1}')"
+        \\fi
+        \\printf '%s\n' \
+        \\  'pub const minimal_exec_initrd = @embedFile("minimal-exec-initrd.cpio");' \
+        \\  "pub const minimal_exec_initrd_sha256_hex = \"${initrd_sha256}\";" \
+        \\  >"$2"
         ,
         "sporevm-initrd-assets",
     });

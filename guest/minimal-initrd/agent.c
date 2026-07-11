@@ -6,6 +6,7 @@
 #include <net/if.h>
 #include <net/route.h>
 #include <netinet/in.h>
+#include <linux/fs.h>
 #include <linux/openat2.h>
 #include <poll.h>
 #include <sched.h>
@@ -21,6 +22,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -82,6 +84,9 @@
 #endif
 #ifndef FITHAW
 #define FITHAW _IOWR('X', 120, int)
+#endif
+#ifndef EXT4_IOC_RESIZE_FS
+#define EXT4_IOC_RESIZE_FS _IOW('f', 16, uint64_t)
 #endif
 #ifndef SYS_openat2
 #if defined(__aarch64__) || defined(__x86_64__)
@@ -349,15 +354,23 @@ static int setup_rootfs_dev(char *error, size_t cap) {
   return 0;
 }
 
-static int setup_rootfs(int writable, char *error, size_t cap) {
+static int setup_rootfs(int writable, int growth_session, int noinit_itable, char *error, size_t cap) {
   mkdir("/mnt", 0755);
   mkdir("/mnt/rootfs", 0755);
+  if (growth_session && !writable) {
+    snprintf(error, cap, "rootfs growth requires a writable rootfs");
+    return -1;
+  }
+  if (noinit_itable && !growth_session) {
+    snprintf(error, cap, "rootfs noinit_itable requires a growth session");
+    return -1;
+  }
   if (wait_for_path("/dev/vda", 100, 50000) != 0) {
     snprintf(error, cap, "rootfs block device not found");
     return -1;
   }
   unsigned long rootfs_flags = writable ? 0 : MS_RDONLY;
-  const char *rootfs_data = writable ? "" : "noload";
+  const char *rootfs_data = writable ? (noinit_itable ? "noinit_itable" : "") : "noload";
   if (mount("/dev/vda", "/mnt/rootfs", "ext4", rootfs_flags, rootfs_data) != 0) {
     snprintf(error, cap, "rootfs mount failed: errno=%d", errno);
     return -1;
@@ -1403,6 +1416,7 @@ enum request_kind {
   REQUEST_BUILD_RUN,
   REQUEST_BUILD_COPY,
   REQUEST_BUILD_WORKDIR,
+  REQUEST_ROOTFS_GROW,
   REQUEST_FSFREEZE,
   REQUEST_FSTHAW,
 };
@@ -1510,6 +1524,9 @@ static int parse_request(const char *req, struct run_request *out) {
       out->protocol_v1 = 1;
     } else if (strcmp(type, "spore-build-workdir-v1") == 0) {
       out->kind = REQUEST_BUILD_WORKDIR;
+      out->protocol_v1 = 1;
+    } else if (strcmp(type, "spore-rootfs-grow-v1") == 0) {
+      out->kind = REQUEST_ROOTFS_GROW;
       out->protocol_v1 = 1;
     } else if (strcmp(type, "fsfreeze-v1") == 0) {
       out->kind = REQUEST_FSFREEZE;
@@ -1659,6 +1676,15 @@ static int send_client_error_exit(struct client *client, int code, const char *m
   }
   if (send_spio_timing_frame(client->fd) != 0) return -1;
   return send_spio_exit(client->fd, code);
+}
+
+static int send_client_stdout(struct client *client, const char *message) {
+  if (client->fd < 0 || !client->protocol_v1) return -1;
+  size_t len = strlen(message);
+  if (len == 0) return 0;
+  if (send_spio_data(client->fd, SPIO_STDOUT_STREAM, client->stdout_offset, (const unsigned char *)message, len) != 0) return -1;
+  client->stdout_offset += len;
+  return 0;
 }
 
 static int send_client_exit(struct client *client, int code) {
@@ -2562,12 +2588,24 @@ static int apply_context_copy_file(int root_fd, const char *source_path, const c
     return -1;
   }
   int rc = copy_fd_to_fd(in_fd, fd, path, size, error, cap);
-  if (rc == 0 && fchown(fd, 0, 0) != 0) rc = -1;
-  if (rc == 0 && fchmod(fd, mode & 07777) != 0) rc = -1;
-  if (close(fd) != 0) rc = -1;
-  if (close(in_fd) != 0 && rc == 0) rc = -1;
+  int saved = rc != 0 ? errno : 0;
+  if (rc == 0 && fchown(fd, 0, 0) != 0) {
+    rc = -1;
+    saved = errno;
+  }
+  if (rc == 0 && fchmod(fd, mode & 07777) != 0) {
+    rc = -1;
+    saved = errno;
+  }
+  if (close(fd) != 0 && rc == 0) {
+    rc = -1;
+    saved = errno;
+  }
+  if (close(in_fd) != 0 && rc == 0) {
+    rc = -1;
+    saved = errno;
+  }
   if (rc != 0 && cleanup_on_error) unlinkat(parent_fd, name, 0);
-  int saved = errno;
   if (close(parent_fd) != 0 && rc == 0) return -1;
   errno = saved;
   return rc;
@@ -2635,6 +2673,7 @@ static int copy_context_tree(int root_fd, const char *source_path, const char *d
       return -1;
     }
     int rc = 0;
+    int saved = 0;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
       if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
@@ -2644,10 +2683,15 @@ static int copy_context_tree(int root_fd, const char *source_path, const char *d
           join_dest_path(child_dest, sizeof(child_dest), dest_path, entry->d_name) != 0 ||
           copy_context_tree(root_fd, child_source, child_dest, expected_entries, seen_entries, error, cap) != 0) {
         rc = -1;
+        saved = errno;
         break;
       }
     }
-    if (closedir(dir) != 0 && rc == 0) rc = -1;
+    if (closedir(dir) != 0 && rc == 0) {
+      rc = -1;
+      saved = errno;
+    }
+    if (rc != 0) errno = saved;
     return rc;
   }
   if (S_ISREG(st.st_mode)) {
@@ -2702,10 +2746,16 @@ static int build_workdir_apply(struct client *client, const char *root, const ch
   int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (root_fd < 0) return send_client_error_exit(client, 126, "spore build: rootfs unavailable\n");
   int rc = ensure_confined_directory(root_fd, path, 0755);
-  int saved = errno;
-  if (close(root_fd) != 0 && rc == 0) rc = -1;
+  int saved = rc != 0 ? errno : 0;
+  if (close(root_fd) != 0 && rc == 0) {
+    rc = -1;
+    saved = errno;
+  }
   errno = saved;
-  if (rc != 0) return send_client_error_exit(client, 1, "spore build: WORKDIR creation failed\n");
+  if (rc != 0) {
+    if (saved == ENOSPC) return send_client_error_exit(client, 1, "spore build: SPORE_BUILD_ENOSPC WORKDIR creation failed\n");
+    return send_client_error_exit(client, 1, "spore build: WORKDIR creation failed\n");
+  }
   return send_client_exit(client, 0);
 }
 
@@ -2780,6 +2830,11 @@ static int build_context_copy_apply(struct client *client, const char *root, con
   error[0] = '\0';
   uint64_t seen_entries = 0;
   if (copy_context_tree(root_fd, source_path, dest_path, entry_count, &seen_entries, error, sizeof(error)) != 0) {
+    int copy_errno = errno;
+    if (copy_errno == ENOSPC) {
+      close(root_fd);
+      return send_client_error_exit(client, 1, "spore build: SPORE_BUILD_ENOSPC COPY apply failed\n");
+    }
     const char *message = error[0] != '\0' ? error : "spore build: COPY apply failed\n";
     close(root_fd);
     return send_client_error_exit(client, 1, message);
@@ -2805,6 +2860,73 @@ static int freeze_or_thaw_rootfs(struct client *client, int freeze) {
   if (ioctl(fd, freeze ? FIFREEZE : FITHAW, &arg) != 0) rc = -1;
   if (close(fd) != 0) rc = -1;
   if (rc != 0) return send_client_error_exit(client, 126, freeze ? "spore build: fsfreeze failed\n" : "spore build: fsthaw failed\n");
+  return send_client_exit(client, 0);
+}
+
+static int grow_rootfs(struct client *client) {
+  int device_fd = open("/dev/vda", O_RDONLY | O_CLOEXEC);
+  if (device_fd < 0) return send_client_error_exit(client, 126, "spore build: rootfs grow device open failed\n");
+
+  uint64_t device_bytes = 0;
+  int rc = ioctl(device_fd, BLKGETSIZE64, &device_bytes);
+  if (close(device_fd) != 0) rc = -1;
+  if (rc != 0 || device_bytes == 0) return send_client_error_exit(client, 126, "spore build: rootfs grow device geometry failed\n");
+
+  int fs_fd = open("/mnt/rootfs", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fs_fd < 0) return send_client_error_exit(client, 126, "spore build: rootfs grow mount open failed\n");
+
+  struct statfs before;
+  if (fstatfs(fs_fd, &before) != 0 || before.f_bsize <= 0) {
+    close(fs_fd);
+    return send_client_error_exit(client, 126, "spore build: rootfs grow filesystem geometry failed\n");
+  }
+  uint64_t block_size = (uint64_t)before.f_bsize;
+  if (device_bytes % block_size != 0) {
+    close(fs_fd);
+    return send_client_error_exit(client, 126, "spore build: rootfs grow geometry is unaligned\n");
+  }
+  uint64_t target_blocks = device_bytes / block_size;
+  /*
+   * statfs.f_blocks excludes ext4 metadata overhead, so it is not the
+   * filesystem block count accepted by EXT4_IOC_RESIZE_FS. The ioctl is the
+   * authoritative grow-or-idempotent operation and rejects an attempted
+   * online shrink itself.
+   */
+  if (ioctl(fs_fd, EXT4_IOC_RESIZE_FS, &target_blocks) != 0) {
+    close(fs_fd);
+    return send_client_error_exit(client, 126, "spore build: rootfs grow ioctl failed\n");
+  }
+  if (syncfs(fs_fd) != 0) {
+    close(fs_fd);
+    return send_client_error_exit(client, 126, "spore build: rootfs grow sync failed\n");
+  }
+
+  struct statfs after;
+  int verify_rc = fstatfs(fs_fd, &after);
+  if (close(fs_fd) != 0) verify_rc = -1;
+  if (verify_rc != 0 || after.f_bsize <= 0) {
+    return send_client_error_exit(client, 126, "spore build: rootfs grow verification failed\n");
+  }
+  uint64_t after_block_size = (uint64_t)after.f_bsize;
+  uint64_t usable_blocks = (uint64_t)after.f_blocks;
+  if (after_block_size != block_size || usable_blocks == 0 || usable_blocks > target_blocks || (uint64_t)after.f_bavail > usable_blocks) {
+    return send_client_error_exit(client, 126, "spore build: rootfs grow geometry mismatch\n");
+  }
+  if ((uint64_t)after.f_bavail > UINT64_MAX / block_size) {
+    return send_client_error_exit(client, 126, "spore build: rootfs grow free-space overflow\n");
+  }
+
+  char result[256];
+  int n = snprintf(result, sizeof(result),
+                   "spore-rootfs-grow-v1 device_bytes=%llu block_size=%llu target_blocks=%llu usable_blocks=%llu free_bytes=%llu inodes=%llu free_inodes=%llu\n",
+                   (unsigned long long)device_bytes,
+                   (unsigned long long)block_size,
+                   (unsigned long long)target_blocks,
+                   (unsigned long long)usable_blocks,
+                   (unsigned long long)((uint64_t)after.f_bavail * block_size),
+                   (unsigned long long)after.f_files,
+                   (unsigned long long)after.f_ffree);
+  if (n <= 0 || (size_t)n >= sizeof(result) || send_client_stdout(client, result) != 0) return -1;
   return send_client_exit(client, 0);
 }
 
@@ -3946,7 +4068,7 @@ static const char *apply_request_generation(struct generation_monitor *generatio
   return NULL;
 }
 
-static void accept_request(int listener, struct session *session, struct client *client, struct detached_children *detached, struct generation_monitor *generation, const char *generation_root, int use_rootfs, int rootfs_ready, const char *rootfs_error, int build_context_requested, int build_context_ready, const char *build_context_error, int network_requested, int network_ready, const char *network_error) {
+static void accept_request(int listener, struct session *session, struct client *client, struct detached_children *detached, struct generation_monitor *generation, const char *generation_root, int use_rootfs, int rootfs_writable, int rootfs_growth_session, int rootfs_ready, const char *rootfs_error, int build_context_requested, int build_context_ready, const char *build_context_error, int network_requested, int network_ready, const char *network_error) {
   int conn = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
   if (conn < 0) {
     if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -4072,6 +4194,27 @@ static void accept_request(int listener, struct session *session, struct client 
       return;
     }
     (void)build_workdir_apply(client, "/mnt/rootfs", request.working_dir);
+    close_client(client);
+    return;
+  }
+
+  if (request.kind == REQUEST_ROOTFS_GROW) {
+    if (!request.protocol_v1) {
+      (void)send_client_error_exit(client, 2, "spore build: rootfs grow requires v1 protocol\n");
+      close_client(client);
+      return;
+    }
+    if (!use_rootfs || !rootfs_ready) {
+      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore build: rootfs unavailable\n");
+      close_client(client);
+      return;
+    }
+    if (!rootfs_writable || !rootfs_growth_session) {
+      (void)send_client_error_exit(client, 126, "spore build: rootfs growth is not enabled\n");
+      close_client(client);
+      return;
+    }
+    (void)grow_rootfs(client);
     close_client(client);
     return;
   }
@@ -4220,6 +4363,7 @@ enum spore_agent_fuzz_result {
   SPORE_AGENT_FUZZ_RUN_COMPLETE = 3,
   SPORE_AGENT_FUZZ_WORKDIR_REQUEST = 4,
   SPORE_AGENT_FUZZ_READY_REQUEST = 5,
+  SPORE_AGENT_FUZZ_GROW_REQUEST = 6,
 };
 
 __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
@@ -4235,6 +4379,7 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   if (parsed.kind == REQUEST_READY) return SPORE_AGENT_FUZZ_READY_REQUEST;
   if (parsed.kind == REQUEST_BUILD_COPY) return SPORE_AGENT_FUZZ_COPY_REQUEST;
   if (parsed.kind == REQUEST_BUILD_WORKDIR) return SPORE_AGENT_FUZZ_WORKDIR_REQUEST;
+  if (parsed.kind == REQUEST_ROOTFS_GROW) return SPORE_AGENT_FUZZ_GROW_REQUEST;
   if (parsed.kind != REQUEST_BUILD_RUN) return SPORE_AGENT_FUZZ_INVALID;
 
   int pipe_fds[2];
@@ -4282,6 +4427,8 @@ int main(void) {
   read_cmdline(cmdline, sizeof(cmdline));
   int use_rootfs = cmdline_has_flag_in(cmdline, "spore_rootfs=1");
   int rootfs_writable = cmdline_has_flag_in(cmdline, "spore_rootfs_rw=1");
+  int rootfs_growth_session = cmdline_has_flag_in(cmdline, "spore_rootfs_growth=1");
+  int rootfs_noinit_itable = cmdline_has_flag_in(cmdline, "spore_rootfs_noinit_itable=1");
   int use_build_context = cmdline_has_flag_in(cmdline, "spore_build_context=1");
   int use_network = cmdline_has_flag_in(cmdline, "spore_net=1");
   int listener = listen_vsock(resolve_port_from_cmdline(cmdline));
@@ -4295,7 +4442,7 @@ int main(void) {
   int rootfs_ready = 1;
   char rootfs_error[128];
   rootfs_error[0] = '\0';
-  if (use_rootfs && setup_rootfs(rootfs_writable, rootfs_error, sizeof(rootfs_error)) != 0) {
+  if (use_rootfs && setup_rootfs(rootfs_writable, rootfs_growth_session, rootfs_noinit_itable, rootfs_error, sizeof(rootfs_error)) != 0) {
     rootfs_ready = 0;
     dprintf(2, "%s\n", rootfs_error);
     size_t len = strlen(rootfs_error);
@@ -4412,7 +4559,7 @@ int main(void) {
       for (nfds_t i = 0; i < nfds; i++) {
         if (fds[i].revents == 0) continue;
         if (roles[i] == 0 && (fds[i].revents & POLLIN)) {
-          accept_request(listener, &session, &client, &detached, &generation, generation_root, use_rootfs, rootfs_ready, rootfs_error, use_build_context, build_context_ready, build_context_error, use_network, network_ready, network_error);
+          accept_request(listener, &session, &client, &detached, &generation, generation_root, use_rootfs, rootfs_writable, rootfs_growth_session, rootfs_ready, rootfs_error, use_build_context, build_context_ready, build_context_error, use_network, network_ready, network_error);
         } else if (roles[i] == 1) {
           if (fds[i].revents & POLLIN) {
             pump_client_v1(&session, &client);

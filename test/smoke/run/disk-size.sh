@@ -35,10 +35,11 @@ fi
 "${spore_bin}" run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
-  --net \
   --image "${image_ref}" \
   --commit local/run-disk-size:base \
-  -- /bin/sh -lc 'apk add --no-cache e2fsprogs-extra'
+  -- /bin/true
+
+base_before="$("${spore_bin}" rootfs resolve local/run-disk-size:base)"
 
 "${spore_bin}" run \
   --backend "${backend}" \
@@ -48,7 +49,10 @@ fi
   --pull=never \
   --disk-size 2gb \
   --commit local/run-disk-size:grown \
-  -- /bin/sh -lc 'test "$(cat /sys/class/block/vda/size)" -eq 4194304 && echo ready >/grown-marker'
+  -- /bin/sh -lc 'test ! -x /sbin/resize2fs && test ! -x /usr/sbin/resize2fs && test "$(cat /sys/class/block/vda/size)" -eq 4194304 && test "$(df -k / | awk "NR == 2 { print \$2 }")" -gt 1500000 && echo ready >/grown-marker'
+
+base_after="$("${spore_bin}" rootfs resolve local/run-disk-size:base)"
+[[ "${base_before}" == "${base_after}" ]] || die "successful growth changed the source ref"
 
 "${spore_bin}" run \
   --backend "${backend}" \
@@ -70,26 +74,5 @@ if "${spore_bin}" run \
 fi
 grown_after="$("${spore_bin}" rootfs resolve local/run-disk-size:grown)"
 [[ "${grown_before}" == "${grown_after}" ]] || die "shrink failure changed the destination ref"
-
-base_before="$("${spore_bin}" rootfs resolve local/run-disk-size:base)"
-"${spore_bin}" run \
-  --backend "${backend}" \
-  --memory "${smoke_memory}" \
-  --image local/run-disk-size:base \
-  --pull=never \
-  --commit local/run-disk-size:no-resize-tool \
-  -- /bin/sh -lc 'rm /usr/sbin/resize2fs'
-if "${spore_bin}" run \
-  --backend "${backend}" \
-  --memory "${smoke_memory}" \
-  --image local/run-disk-size:no-resize-tool \
-  --pull=never \
-  --disk-size 2gb \
-  --commit local/run-disk-size:base \
-  -- /bin/true >"${workdir}/resize-failure.stdout" 2>"${workdir}/resize-failure.stderr"; then
-  die "image without resize2fs unexpectedly grew"
-fi
-base_after="$("${spore_bin}" rootfs resolve local/run-disk-size:base)"
-[[ "${base_before}" == "${base_after}" ]] || die "resize failure changed the destination ref"
 
 echo "smoke:run-disk-size ok backend=${backend} image=${image_ref}"
