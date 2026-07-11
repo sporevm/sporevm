@@ -43,6 +43,7 @@ hypervisors.
 - [docs/filesystem.md](docs/filesystem.md): rootfs CAS and writable root disk
   layers.
 - [docs/rootfs.md](docs/rootfs.md): OCI image and rootfs CLI workflows.
+- [docs/docker.md](docs/docker.md): prepare and run Docker inside a spore.
 - [docs/fanout.md](docs/fanout.md): fork identity and fan-out behavior.
 - [docs/networking.md](docs/networking.md): SporeVM-managed networking.
 - [docs/lifecycle.md](docs/lifecycle.md): named VM lifecycle.
