@@ -11,6 +11,7 @@ const machine_output = @import("machine_output.zig");
 const rootfs = @import("rootfs.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
+const runtime_disk = @import("runtime_disk.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const spore = @import("spore.zig");
 const default_prune_max_bytes = 0;
@@ -1145,6 +1146,14 @@ fn collectStorageRootsFromRuntimeLeases(
     runtime_root: []const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
 ) !void {
+    var active = try runtime_disk_lease.ActiveIterator.init(allocator, io, runtime_root);
+    defer active.deinit();
+    while (try active.next()) |parsed_value| {
+        var parsed = parsed_value;
+        defer parsed.deinit();
+        try addStorageRootFromRuntimeLease(allocator, io, cache_root, parsed.value, storage_roots);
+    }
+
     const vms_dir_path = try std.fs.path.join(allocator, &.{ runtime_root, "vms" });
     var vms_dir = openDirPath(io, vms_dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -1168,13 +1177,23 @@ fn collectStorageRootsFromRuntimeLeases(
         }) catch return error.BadManifest;
         defer parsed.deinit();
         const lease = parsed.value.disk_baseline_lease orelse continue;
-        try lease.validate();
-        if (lease.store != .rootfs_cache or !try sameResolvedPath(allocator, lease.root, cache_root)) continue;
-        if (lease.rootfs_storage) |storage| {
-            // The parsed lease owns these strings. Keep an independent copy in
-            // the root set because Parsed.deinit() runs before GC walks it.
-            try addStorageRoot(storage_roots, try spore.cloneRootfsStorage(allocator, storage));
-        }
+        try addStorageRootFromRuntimeLease(allocator, io, cache_root, lease, storage_roots);
+    }
+}
+
+fn addStorageRootFromRuntimeLease(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    lease: runtime_disk_lease.Lease,
+    storage_roots: *std.StringHashMap(spore.RootfsStorage),
+) !void {
+    try lease.validate();
+    if (lease.store != .rootfs_cache or !try sameResolvedPath(allocator, io, lease.root, cache_root)) return;
+    if (lease.rootfs_storage) |storage| {
+        // Parsed lease strings are short-lived. Keep an independent root for
+        // the mark phase after the JSON value is released.
+        try addStorageRoot(storage_roots, try spore.cloneRootfsStorage(allocator, storage));
     }
 }
 
@@ -1185,6 +1204,14 @@ fn collectRuntimeLeaseProtectedPaths(
     runtime_root: []const u8,
     protected_paths: *std.StringHashMap(void),
 ) !void {
+    var active = try runtime_disk_lease.ActiveIterator.init(allocator, io, runtime_root);
+    defer active.deinit();
+    while (try active.next()) |parsed_value| {
+        var parsed = parsed_value;
+        defer parsed.deinit();
+        try addProtectedPathsFromRuntimeLease(allocator, io, cache_root, parsed.value, protected_paths);
+    }
+
     const vms_dir_path = try std.fs.path.join(allocator, &.{ runtime_root, "vms" });
     var vms_dir = openDirPath(io, vms_dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -1208,35 +1235,47 @@ fn collectRuntimeLeaseProtectedPaths(
         }) catch return error.BadManifest;
         defer parsed.deinit();
         const lease = parsed.value.disk_baseline_lease orelse continue;
-        try lease.validate();
-        if (lease.store != .rootfs_cache or !try sameResolvedPath(allocator, lease.root, cache_root)) continue;
-
-        switch (lease.baseline_kind) {
-            .rootfs => try protected_paths.put(try rootfs_cache.digestPath(allocator, cache_root, lease.baseline_identity), {}),
-            .disk_index => {
-                const storage = lease.rootfs_storage orelse return error.BadManifest;
-                const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
-                try protected_paths.put(index_path, {});
-                const bytes = Io.Dir.cwd().readFileAlloc(io, index_path, allocator, .limited(disk_index.max_index_bytes)) catch |err| switch (err) {
-                    error.FileNotFound, error.StreamTooLong => return error.BadManifest,
-                    else => |e| return e,
-                };
-                defer allocator.free(bytes);
-                const descriptor = try spore.diskIndexDescriptorForStorage(storage);
-                var index = disk_index.parseDiskIndex(allocator, bytes, descriptor) catch return error.BadManifest;
-                defer index.deinit();
-                for (index.value.chunks) |chunk_entry| {
-                    try protected_paths.put(try rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest), {});
-                }
-            },
-        }
+        try addProtectedPathsFromRuntimeLease(allocator, io, cache_root, lease, protected_paths);
     }
 }
 
-fn sameResolvedPath(allocator: std.mem.Allocator, a: []const u8, b: []const u8) !bool {
-    const resolved_a = try std.fs.path.resolve(allocator, &.{a});
+fn addProtectedPathsFromRuntimeLease(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    lease: runtime_disk_lease.Lease,
+    protected_paths: *std.StringHashMap(void),
+) !void {
+    try lease.validate();
+    if (lease.store != .rootfs_cache or !try sameResolvedPath(allocator, io, lease.root, cache_root)) return;
+
+    switch (lease.baseline_kind) {
+        .rootfs => try protected_paths.put(try rootfs_cache.digestPath(allocator, cache_root, lease.baseline_identity), {}),
+        .disk_index => {
+            const storage = lease.rootfs_storage orelse return error.BadManifest;
+            const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
+            try protected_paths.put(index_path, {});
+            const bytes = Io.Dir.cwd().readFileAlloc(io, index_path, allocator, .limited(disk_index.max_index_bytes)) catch |err| switch (err) {
+                error.FileNotFound, error.StreamTooLong => return error.BadManifest,
+                else => |e| return e,
+            };
+            defer allocator.free(bytes);
+            const descriptor = try spore.diskIndexDescriptorForStorage(storage);
+            var index = disk_index.parseDiskIndex(allocator, bytes, descriptor) catch return error.BadManifest;
+            defer index.deinit();
+            for (index.value.chunks) |chunk_entry| {
+                try protected_paths.put(try rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest), {});
+            }
+        },
+    }
+}
+
+fn sameResolvedPath(allocator: std.mem.Allocator, io: Io, a: []const u8, b: []const u8) !bool {
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const resolved_a = try std.fs.path.resolve(allocator, if (std.fs.path.isAbsolute(a)) &.{a} else &.{ cwd, a });
     defer allocator.free(resolved_a);
-    const resolved_b = try std.fs.path.resolve(allocator, &.{b});
+    const resolved_b = try std.fs.path.resolve(allocator, if (std.fs.path.isAbsolute(b)) &.{b} else &.{ cwd, b });
     defer allocator.free(resolved_b);
     return std.mem.eql(u8, resolved_a, resolved_b);
 }
@@ -2446,6 +2485,73 @@ test "runtime disk lease protects its cache baseline from prune and gc" {
     try std.testing.expect(try fileExists(io, rooted_object_path));
     try std.testing.expect(!try fileExists(io, gc_orphan_index_path));
     try std.testing.expect(!try fileExists(io, gc_orphan_object_path));
+}
+
+test "lazy runtime survives destructive prune and gc before its first cas read" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "cache" });
+    const runtime_root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    const rooted = try writeGcStorageFixture(allocator, io, root, null, 0x41);
+    try rootfs_cas.markStorageComplete(io, allocator, root, rooted.storage.index_digest);
+    const prune_orphan = try writeGcStorageFixture(allocator, io, root, null, 0x51);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, root);
+    try env.put(local_paths.runtime_dir_env, runtime_root);
+    const rootfs_value = spore.Rootfs{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = .{ .digest = rooted.storage.index_digest, .size = rooted.storage.logical_size },
+        .storage = rooted.storage,
+    };
+    var runtime = try runtime_disk.open(.{ .io = io, .environ_map = &env }, allocator, .{ .rootfs = rootfs_value });
+    var runtime_open = true;
+    defer if (runtime_open) runtime.deinit();
+    const rooted_index_path = try rootfs_cas.manifestIndexPath(allocator, root, rooted.storage.index_digest);
+    const rooted_object_path = try rootfs_cas.manifestObjectPath(allocator, root, rooted.object_digest);
+
+    const prune_orphan_index_path = try rootfs_cas.manifestIndexPath(allocator, root, prune_orphan.storage.index_digest);
+    const prune_orphan_object_path = try rootfs_cas.manifestObjectPath(allocator, root, prune_orphan.object_digest);
+    _ = try pruneRootfsCache(allocator, io, root, runtime_root, .{
+        .dry_run = false,
+        .include_rootfs_chunks = true,
+        .max_bytes = 0,
+    }, std.time.ns_per_s);
+    try std.testing.expect(!try fileExists(io, prune_orphan_index_path));
+    try std.testing.expect(!try fileExists(io, prune_orphan_object_path));
+
+    const gc_orphan = try writeGcStorageFixture(allocator, io, root, null, 0x61);
+    const gc_orphan_index_path = try rootfs_cas.manifestIndexPath(allocator, root, gc_orphan.storage.index_digest);
+    const gc_orphan_object_path = try rootfs_cas.manifestObjectPath(allocator, root, gc_orphan.object_digest);
+    _ = try gcRootfsCache(allocator, io, .{
+        .cache_root = root,
+        .runtime_root = runtime_root,
+        .dry_run = false,
+    });
+    try std.testing.expect(!try fileExists(io, gc_orphan_index_path));
+    try std.testing.expect(!try fileExists(io, gc_orphan_object_path));
+
+    var readback: [4]u8 = undefined;
+    try runtime.chunk_mapped.?.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0x42, 0x43, 0x44 }, &readback);
+
+    runtime.deinit();
+    runtime_open = false;
+    _ = try gcRootfsCache(allocator, io, .{
+        .cache_root = root,
+        .runtime_root = runtime_root,
+        .dry_run = false,
+    });
+    try std.testing.expect(!try fileExists(io, rooted_index_path));
+    try std.testing.expect(!try fileExists(io, rooted_object_path));
 }
 
 test "system cache gc preserves storage rooted only by a build step record" {

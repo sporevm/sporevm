@@ -99,7 +99,10 @@ sparse temporary base fd. Nonzero index entries start as `.cas` map entries;
 the first read verifies the local chunk object against the descriptor-selected
 BLAKE3 digest, writes it into the sparse base, and promotes the map entry to
 the hot `.base` path. Serving repeated guest reads with plain preads on one fd
-is what keeps resume-to-first-command fast.
+is what keeps resume-to-first-command fast. The runtime first publishes a
+process-owned baseline lease while holding the rootfs cache lock. Both
+foreground runs and named monitors keep that lease until their runtime disk is
+closed, so destructive prune or GC cannot remove a still-unread CAS object.
 
 Chunked rootfs storage (`rootfs.storage`) is a distribution and dedupe format,
 and now also the local cold-start fallback when a flat materialization is not
@@ -173,8 +176,10 @@ spores.
 `spore system df --rootfs` reports image ext4 files, metadata, exact digest
 artifacts, rootfs CAS indexes, rootfs CAS objects, ref records, and temporary
 entries. `spore cache gc --rootfs` performs a mark/sweep of rootfs CAS indexes
-and objects from cache metadata, ref records, and live runtime manifests; it is
-dry-run by default and requires `--force` to delete candidates.
+and objects from cache metadata, ref records, live runtime manifests, and
+process-owned lazy-runtime leases; it is dry-run by default and requires
+`--force` to delete candidates. Destructive prune consults the same runtime
+leases before selecting explicit CAS entries.
 
 Default `spore system prune --rootfs` only selects rebuildable image rootfs
 entries. Flat digest artifacts are skipped unless `--include-digest-artifacts`
