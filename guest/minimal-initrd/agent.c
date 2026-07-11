@@ -92,12 +92,22 @@
 #define EXT4_PRIMARY_SUPER_OFFSET 1024
 #define EXT4_SUPER_SIZE 1024
 #define EXT4_SUPER_MAGIC 0xef53U
+#define EXT4_STATE_ERROR 0x0002U
+#define EXT4_STATE_ORPHAN 0x0004U
+#define EXT4_FEATURE_COMPAT_HAS_JOURNAL 0x0004U
+#define EXT4_FEATURE_INCOMPAT_RECOVER 0x0004U
+#define EXT4_FEATURE_INCOMPAT_JOURNAL_DEV 0x0008U
 #define EXT4_FEATURE_INCOMPAT_64BIT 0x0080U
+#define EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT 0x00010000U
 #define EXT4_SUPER_BLOCKS_COUNT_LO_OFFSET 0x04
 #define EXT4_SUPER_LOG_BLOCK_SIZE_OFFSET 0x18
 #define EXT4_SUPER_BLOCKS_PER_GROUP_OFFSET 0x20
 #define EXT4_SUPER_MAGIC_OFFSET 0x38
+#define EXT4_SUPER_STATE_OFFSET 0x3a
+#define EXT4_SUPER_FEATURE_COMPAT_OFFSET 0x5c
 #define EXT4_SUPER_FEATURE_INCOMPAT_OFFSET 0x60
+#define EXT4_SUPER_FEATURE_RO_COMPAT_OFFSET 0x64
+#define EXT4_SUPER_LAST_ORPHAN_OFFSET 0xe8
 #define EXT4_SUPER_BLOCKS_COUNT_HI_OFFSET 0x150
 #ifndef SYS_openat2
 #if defined(__aarch64__) || defined(__x86_64__)
@@ -365,6 +375,8 @@ static int setup_rootfs_dev(char *error, size_t cap) {
   return 0;
 }
 
+static int preflight_rootfs_growth_source(char *error, size_t cap);
+
 static int setup_rootfs(int writable, int growth_session, int noinit_itable, char *error, size_t cap) {
   mkdir("/mnt", 0755);
   mkdir("/mnt/rootfs", 0755);
@@ -380,6 +392,7 @@ static int setup_rootfs(int writable, int growth_session, int noinit_itable, cha
     snprintf(error, cap, "rootfs block device not found");
     return -1;
   }
+  if (growth_session && preflight_rootfs_growth_source(error, cap) != 0) return -1;
   unsigned long rootfs_flags = writable ? 0 : MS_RDONLY;
   const char *rootfs_data = writable ? (noinit_itable ? "noinit_itable" : "") : "noload";
   if (mount("/dev/vda", "/mnt/rootfs", "ext4", rootfs_flags, rootfs_data) != 0) {
@@ -1035,6 +1048,11 @@ struct ext4_disk_geometry {
   uint64_t blocks_count;
   uint32_t blocks_per_group;
   uint32_t block_size;
+  uint16_t state;
+  uint32_t feature_compat;
+  uint32_t feature_incompat;
+  uint32_t feature_ro_compat;
+  uint32_t last_orphan;
 };
 
 static int decode_ext4_disk_geometry(const unsigned char *super, size_t len, struct ext4_disk_geometry *out) {
@@ -1052,6 +1070,11 @@ static int decode_ext4_disk_geometry(const unsigned char *super, size_t len, str
   out->blocks_count = blocks_count;
   out->blocks_per_group = blocks_per_group;
   out->block_size = block_size;
+  out->state = read_le16(super + EXT4_SUPER_STATE_OFFSET);
+  out->feature_compat = read_le32(super + EXT4_SUPER_FEATURE_COMPAT_OFFSET);
+  out->feature_incompat = feature_incompat;
+  out->feature_ro_compat = read_le32(super + EXT4_SUPER_FEATURE_RO_COMPAT_OFFSET);
+  out->last_orphan = read_le32(super + EXT4_SUPER_LAST_ORPHAN_OFFSET);
   return 0;
 }
 
@@ -1068,6 +1091,35 @@ static int read_ext4_disk_geometry(int fd, struct ext4_disk_geometry *out) {
     done += (size_t)n;
   }
   return decode_ext4_disk_geometry(super, sizeof(super), out);
+}
+
+static int validate_ext4_growth_source(const struct ext4_disk_geometry *source) {
+  if ((source->feature_compat & EXT4_FEATURE_COMPAT_HAS_JOURNAL) != 0) return -1;
+  if ((source->feature_incompat & (EXT4_FEATURE_INCOMPAT_RECOVER | EXT4_FEATURE_INCOMPAT_JOURNAL_DEV)) != 0) return -1;
+  if ((source->state & (EXT4_STATE_ERROR | EXT4_STATE_ORPHAN)) != 0) return -1;
+  if (source->last_orphan != 0) return -1;
+  if ((source->feature_ro_compat & EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT) != 0) return -1;
+  return 0;
+}
+
+static int preflight_rootfs_growth_source(char *error, size_t cap) {
+  int fd = open("/dev/vda", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    snprintf(error, cap, "rootfs growth source open failed");
+    return -1;
+  }
+  struct ext4_disk_geometry source;
+  int read_rc = read_ext4_disk_geometry(fd, &source);
+  int close_rc = close(fd);
+  if (read_rc != 0 || close_rc != 0) {
+    snprintf(error, cap, "rootfs growth source validation failed");
+    return -1;
+  }
+  if (validate_ext4_growth_source(&source) != 0) {
+    snprintf(error, cap, "rootfs growth source is unsupported or requires recovery");
+    return -1;
+  }
+  return 0;
 }
 
 static int validate_rootfs_grow_geometry(uint64_t target_blocks, const struct ext4_disk_geometry *before, const struct ext4_disk_geometry *after) {
@@ -4529,6 +4581,13 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_ext4_geometry(
   *blocks_per_group = geometry.blocks_per_group;
   *block_size = geometry.block_size;
   return 1;
+}
+
+__attribute__((visibility("hidden"))) int spore_agent_fuzz_ext4_growth_source(
+    const unsigned char *super, size_t super_len) {
+  struct ext4_disk_geometry source;
+  if (decode_ext4_disk_geometry(super, super_len, &source) != 0) return 0;
+  return validate_ext4_growth_source(&source) == 0;
 }
 
 __attribute__((visibility("hidden"))) int spore_agent_fuzz_rootfs_grow_geometry(

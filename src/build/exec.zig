@@ -18,7 +18,7 @@ const max_rootfs_grow_response = run_mod.max_rootfs_grow_response;
 const p0_idle_probe_env = "SPOREVM_ROOTFS_GROWTH_P0_IDLE_MS";
 const max_p0_idle_probe_ms: u64 = 10_000;
 const build_producer_domain = "sporevm-build-producer-v2";
-const prepare_host_contract = "grow-v1-strict-request-v2;ext4-superblock-postcondition-v1;ext4-ioctl-v1;noinit-itable-v1;virtio-write-zeroes-1x4m-v1;chunk-zero-map-v1";
+const prepare_host_contract = "grow-v1-strict-request-v2;ext4-source-preflight-v1;ext4-superblock-postcondition-v1;ext4-ioctl-v1;noinit-itable-v1;virtio-write-zeroes-1x4m-v1;chunk-zero-map-v1";
 // Provisional build-VM default; make this a `spore build` option when larger
 // workloads such as `bundle install`-style RUN steps need more memory.
 const build_vm_memory_bytes: u64 = 2 * 1024 * 1024 * 1024;
@@ -1044,6 +1044,7 @@ const guest_agent_fuzz_grow_request: c_int = 6;
 
 extern fn spore_agent_fuzz_build_request(request: [*]const u8, request_len: usize, stream: [*]const u8, stream_len: usize) c_int;
 extern fn spore_agent_fuzz_ext4_geometry(super: [*]const u8, super_len: usize, blocks_count: *u64, blocks_per_group: *u32, block_size: *u32) c_int;
+extern fn spore_agent_fuzz_ext4_growth_source(super: [*]const u8, super_len: usize) c_int;
 extern fn spore_agent_fuzz_rootfs_grow_geometry(target_blocks: u64, before_blocks: u64, before_blocks_per_group: u32, before_block_size: u32, after_blocks: u64, after_blocks_per_group: u32, after_block_size: u32) c_int;
 extern fn spore_agent_fuzz_proc_stat(stat: [*]const u8, stat_len: usize) c_int;
 
@@ -1228,6 +1229,34 @@ test "guest ext4 superblock and resize geometry validation is feature-aware" {
     try std.testing.expectEqual(@as(u64, 1234), blocks_count);
     try std.testing.expectEqual(@as(u32, 32768), blocks_per_group);
     try std.testing.expectEqual(@as(u32, 4096), block_size);
+    // A frozen journal-less checkpoint is consistent but need not carry the
+    // clean-unmount bit, so both state values are accepted by the preflight.
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u16, super[0x3a..0x3c], 0x0001, .little);
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+
+    std.mem.writeInt(u32, super[0x5c..0x60], 0x0004, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u32, super[0x5c..0x60], 0, .little);
+
+    std.mem.writeInt(u32, super[0x60..0x64], 0x0004, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u32, super[0x60..0x64], 0x0008, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u32, super[0x60..0x64], 0, .little);
+
+    std.mem.writeInt(u16, super[0x3a..0x3c], 0x0002, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u16, super[0x3a..0x3c], 0x0004, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u16, super[0x3a..0x3c], 0, .little);
+
+    std.mem.writeInt(u32, super[0xe8..0xec], 1, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u32, super[0xe8..0xec], 0, .little);
+    std.mem.writeInt(u32, super[0x64..0x68], 0x00010000, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u32, super[0x64..0x68], 0, .little);
 
     std.mem.writeInt(u32, super[0x60..0x64], 0x80, .little);
     try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_ext4_geometry(&super, super.len, &blocks_count, &blocks_per_group, &block_size));
@@ -1280,12 +1309,29 @@ fn fuzzGuestExt4Geometry(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expect(block_size >= 1024 and block_size <= 65536 and std.math.isPowerOfTwo(block_size));
 }
 
+fn fuzzGuestExt4GrowthSource(_: void, smith: *std.testing.Smith) !void {
+    if (comptime !guest_agent_fuzz_supported) return;
+    var storage: [1024]u8 = undefined;
+    const bytes = storage[0..smith.slice(&storage)];
+    const accepted = spore_agent_fuzz_ext4_growth_source(bytes.ptr, bytes.len);
+    try std.testing.expect(accepted == 0 or accepted == 1);
+    if (accepted == 0) return;
+    var blocks_count: u64 = 0;
+    var blocks_per_group: u32 = 0;
+    var block_size: u32 = 0;
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_ext4_geometry(bytes.ptr, bytes.len, &blocks_count, &blocks_per_group, &block_size));
+}
+
 test "fuzz rootfs grow response parser" {
     try std.testing.fuzz({}, fuzzRootfsGrowResponse, .{});
 }
 
 test "fuzz guest ext4 geometry parser" {
     try std.testing.fuzz({}, fuzzGuestExt4Geometry, .{});
+}
+
+test "fuzz guest ext4 growth source preflight" {
+    try std.testing.fuzz({}, fuzzGuestExt4GrowthSource, .{});
 }
 
 test "P0 idle probe is bounded and rejects background block writes" {
