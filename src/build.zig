@@ -128,6 +128,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
             },
             else => {
                 if (!saw_from) return error.MissingDockerfileFrom;
+                const build_cache_lock = if (cache_lock) |*lock| lock else unreachable;
                 if (state) |*s| {
                     if (try applyMetadataInstruction(allocator, options, pre_from_args.items, s, instruction)) continue;
                     switch (instruction.value) {
@@ -135,7 +136,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                             any_exec_step = true;
                             s.storage = cachedExecStep(init, allocator, options, s.*, instruction, "") catch |err| switch (err) {
                                 error.CacheMissRequiresBuildExecutor => {
-                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*);
+                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock);
                                     break :instructions;
                                 },
                                 else => |e| return e,
@@ -154,7 +155,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                             });
                             s.storage = cachedExecStep(init, allocator, options, s.*, instruction, input_digest) catch |err| switch (err) {
                                 error.CacheMissRequiresBuildExecutor => {
-                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*);
+                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock);
                                     break :instructions;
                                 },
                                 else => |e| return e,
@@ -165,7 +166,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                             const target = try resolvedWorkdir(allocator, s.*, raw);
                             s.storage = cachedExecStep(init, allocator, options, s.*, instruction, "") catch |err| switch (err) {
                                 error.CacheMissRequiresBuildExecutor => {
-                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*);
+                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock);
                                     break :instructions;
                                 },
                                 else => |e| return e,
@@ -318,6 +319,7 @@ fn executeFromMiss(
     pre_from_args: []const ArgValue,
     instructions: []const dockerfile.Instruction,
     initial_state: State,
+    rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
 ) !State {
     var state = initial_state;
     var steps = std.array_list.Managed(build_exec.Step).init(allocator);
@@ -354,6 +356,7 @@ fn executeFromMiss(
         .cache_root = cache_root,
         .base_storage = state.storage,
         .steps = steps.items,
+        .rootfs_cache_lock = rootfs_cache_lock,
         .disk_grow_target = try pendingDiskGrowTarget(state),
         .context_disk_path = context_disk_path,
         .output = options.output,

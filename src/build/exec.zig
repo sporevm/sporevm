@@ -104,6 +104,7 @@ pub const Options = struct {
     cache_root: []const u8,
     base_storage: spore.RootfsStorage,
     steps: []const Step,
+    rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
     disk_grow_target: u64 = 0,
     context_disk_path: ?[]const u8 = null,
     output: ?*Io.Writer = null,
@@ -192,7 +193,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     const rootfs = try rootfsFromStorage(allocator, options.base_storage);
     const kernel_path = try run_mod.resolveDefaultKernelPath(init, allocator);
     const initrd_path = try run_mod.resolveConfiguredInitrdPath(init, null);
-    _ = try run_mod.executeMonitor(.{ .io = init.io, .environ_map = init.environ_map }, allocator, .{
+    _ = try run_mod.executeMonitorWithRootfsCacheLock(.{ .io = init.io, .environ_map = init.environ_map }, allocator, .{
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
         .rootfs = rootfs,
@@ -202,7 +203,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         .memory = .{ .policy = .explicit, .bytes = build_vm_memory_bytes },
         .network = if (network_mode == .spore) .spore else .disabled,
         .timeout_ms = step_timeout_ms,
-    }, control.control(), null);
+    }, control.control(), null, options.rootfs_cache_lock);
 
     if (control.failed_exit_code) |exit_code| {
         if (options.diagnostic) |diag| {
