@@ -15,33 +15,71 @@ const rootfs_cas = spore_internal.rootfs_cas;
 const spore = spore_internal.spore;
 
 const Io = std.Io;
+const Blake3 = std.crypto.hash.Blake3;
+const ext4_superblock_offset: u64 = 1024;
+const ext4_feature_incompat_offset: u64 = ext4_superblock_offset + 0x60;
+const ext4_feature_incompat_extents: u32 = 0x40;
+
+extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
+
+const Mode = enum {
+    normal,
+    large_copy,
+    large_run,
+    block_enospc,
+    inode_enospc,
+
+    fn tempLabel(self: Mode) []const u8 {
+        return switch (self) {
+            .normal => "run-smoke",
+            .large_copy => "large-copy-smoke",
+            .large_run => "large-run-smoke",
+            .block_enospc => "block-enospc",
+            .inode_enospc => "inode-enospc",
+        };
+    }
+};
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    if (args.len < 2 or args.len > 3) {
-        std.debug.print("usage: build-run-smoke <aarch64-linux-sh-helper> [--large-copy]\n", .{});
+    if (args.len < 2 or args.len > 4) {
+        printUsage();
         return error.InvalidArguments;
     }
-    const large_copy = args.len == 3 and std.mem.eql(u8, args[2], "--large-copy");
-    if (args.len == 3 and !large_copy) return error.InvalidArguments;
+    const mode = parseMode(args) catch {
+        printUsage();
+        return error.InvalidArguments;
+    };
 
-    const tmp = "zig-cache/spore-build-run-smoke";
-    const context_dir = tmp ++ "/context";
-    const cache_dir = tmp ++ "/rootfs-cache";
-    const runtime_dir = tmp ++ "/runtime";
-    const rootfs_path = tmp ++ "/base.ext4";
-    const dockerfile_path = context_dir ++ "/Dockerfile";
     const io = init.io;
+    const provided_tmp = if (args.len == 4) args[3] else null;
+    if (provided_tmp != null and mode != .block_enospc and mode != .inode_enospc) {
+        printUsage();
+        return error.InvalidArguments;
+    }
+    const tmp = if (provided_tmp) |path| blk: {
+        try validateProvidedSmokeRoot(allocator, io, path, mode);
+        break :blk path;
+    } else try createSmokeRoot(allocator, init.environ_map, mode);
+    const owns_tmp = provided_tmp == null;
+    defer if (owns_tmp) Io.Dir.cwd().deleteTree(io, tmp) catch {};
 
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    const context_dir = try std.fs.path.join(allocator, &.{ tmp, "context" });
+    const cache_dir = try std.fs.path.join(allocator, &.{ tmp, "rootfs-cache" });
+    const runtime_dir = try std.fs.path.join(allocator, &.{ tmp, "runtime" });
+    const rootfs_path = try std.fs.path.join(allocator, &.{ tmp, "base.ext4" });
+    const dockerfile_path = try std.fs.path.join(allocator, &.{ context_dir, "Dockerfile" });
     try Io.Dir.cwd().createDirPath(io, context_dir);
     try Io.Dir.cwd().createDirPath(io, cache_dir);
     try Io.Dir.cwd().createDirPath(io, runtime_dir);
+    const runtime_dir_z = try allocator.dupeZ(u8, runtime_dir);
+    if (std.c.chmod(runtime_dir_z, 0o700) != 0) return error.IoFailed;
     try writeSmokeContext(allocator, io, context_dir, "beta\n");
 
     try init.environ_map.put(local_paths.rootfs_cache_env, cache_dir);
     try init.environ_map.put(local_paths.runtime_dir_env, runtime_dir);
+    try init.environ_map.put("TMPDIR", tmp);
 
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     const shell_bytes = try Io.Dir.cwd().readFileAlloc(io, args[1], allocator, .limited(4 * 1024 * 1024));
@@ -55,16 +93,22 @@ pub fn main(init: std.process.Init) !void {
         .{ .path = "sys", .kind = .directory, .mode = 0o755 },
         .{ .path = "tmp", .kind = .directory, .mode = 0o1777 },
     };
-    const base_image_size: u64 = if (large_copy) 6 * 1024 * 1024 * 1024 else 16 << 20;
+    const base_image_size: u64 = if (mode == .large_copy) 6 * 1024 * 1024 * 1024 else 16 << 20;
     const emitted = try ext4_writer.emit(allocator, io, rootfs_path, &entries, .{
         .image_size = base_image_size,
-        .inode_count = 1024,
+        .inode_count = if (mode == .inode_enospc) 32 else 1024,
         .determinism = ext4.Determinism.fromDigest("sha256:spore-build-run-smoke-base"),
-        .cas_cache_root = cache_root,
+        // The native test writer intentionally emits block-mapped filesystems.
+        // The block-ENOSPC case enables the compatible extents feature below so
+        // a newly created guest file can reserve blocks without writing 16 GiB.
+        .cas_cache_root = if (mode == .block_enospc) null else cache_root,
         .cas_chunk_size = rootfs_cas.default_chunk_size,
         .cas_seal_workers = 1,
     });
-    const preload = emitted.preload_result orelse return error.BadManifest;
+    const preload = if (mode == .block_enospc) blk: {
+        try enableExtentsFeature(allocator, rootfs_path);
+        break :blk try rootfs_cas.preloadPath(io, allocator, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
+    } else emitted.preload_result orelse return error.BadManifest;
     const base_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
     _ = try rootfs.publishIndexedImage(init, allocator, .{
         .ref = "local/build-smoke-base:dev",
@@ -73,9 +117,11 @@ pub fn main(init: std.process.Init) !void {
         .rootfs_storage = base_storage,
     });
 
-    if (large_copy) {
-        try runLargeCopySmoke(init, allocator, io, context_dir, dockerfile_path);
-        return;
+    switch (mode) {
+        .normal => {},
+        .large_copy => return runLargeCopySmoke(init, allocator, io, context_dir, dockerfile_path),
+        .large_run => return runLargeRunSmoke(init, allocator, io, dockerfile_path),
+        .block_enospc, .inode_enospc => return runEnospcSmoke(init, allocator, io, cache_root, dockerfile_path, base_storage, mode),
     }
 
     try writeDockerfile(io, dockerfile_path, "step2");
@@ -184,6 +230,50 @@ pub fn main(init: std.process.Init) !void {
     );
 }
 
+fn createSmokeRoot(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, mode: Mode) ![]const u8 {
+    const temp_parent = env.get("TMPDIR") orelse "/tmp";
+    if (!std.fs.path.isAbsolute(temp_parent)) return error.InvalidTemporaryDirectory;
+    const template = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/sporevm-build-{s}.XXXXXX",
+        .{ std.mem.trimEnd(u8, temp_parent, "/"), mode.tempLabel() },
+        0,
+    );
+    const dir_ptr = mkdtemp(template.ptr) orelse return error.IoFailed;
+    return std.mem.span(dir_ptr);
+}
+
+fn validateProvidedSmokeRoot(allocator: std.mem.Allocator, io: Io, path: []const u8, mode: Mode) !void {
+    if (!std.fs.path.isAbsolute(path)) return error.InvalidSmokeWorkspace;
+    const expected_prefix = try std.fmt.allocPrint(allocator, "sporevm-build-{s}.", .{mode.tempLabel()});
+    if (!std.mem.startsWith(u8, std.fs.path.basename(path), expected_prefix)) return error.InvalidSmokeWorkspace;
+
+    const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    if (stat.kind != .directory) return error.InvalidSmokeWorkspace;
+    if (@intFromEnum(stat.permissions) & 0o077 != 0) return error.InsecureSmokeWorkspace;
+
+    var dir = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(io);
+    var it = dir.iterate();
+    if (try it.next(io) != null) return error.NonEmptySmokeWorkspace;
+}
+
+fn parseMode(args: []const []const u8) !Mode {
+    if (args.len == 2) return .normal;
+    if (std.mem.eql(u8, args[2], "--large-copy")) return .large_copy;
+    if (std.mem.eql(u8, args[2], "--large-run")) return .large_run;
+    if (std.mem.eql(u8, args[2], "--block-enospc")) return .block_enospc;
+    if (std.mem.eql(u8, args[2], "--inode-enospc")) return .inode_enospc;
+    return error.InvalidArguments;
+}
+
+fn printUsage() void {
+    std.debug.print(
+        "usage: build-run-smoke <aarch64-linux-sh-helper> [--large-copy|--large-run|--block-enospc|--inode-enospc] [absolute-enospc-workspace]\n",
+        .{},
+    );
+}
+
 fn runLargeCopySmoke(init: std.process.Init, allocator: std.mem.Allocator, io: Io, context_dir: []const u8, dockerfile_path: []const u8) !void {
     try writeLargeCopyContext(allocator, io, context_dir);
     try Io.Dir.cwd().writeFile(io, .{
@@ -227,6 +317,322 @@ fn runLargeCopySmoke(init: std.process.Init, allocator: std.mem.Allocator, io: I
             nsToMs(diagnostic.context_disk.emit_ns),
         },
     );
+}
+
+fn runLargeRunSmoke(init: std.process.Init, allocator: std.mem.Allocator, io: Io, dockerfile_path: []const u8) !void {
+    try writeLargeRunDockerfile(io, dockerfile_path);
+    const context_dir = std.fs.path.dirname(dockerfile_path) orelse return error.BadManifest;
+
+    var diagnostic: build_mod.Diagnostic = .{};
+    const first = build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-large-run:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &diagnostic,
+    }) catch |err| {
+        std.debug.print(
+            "large RUN build failed: err={s} line={d} instruction={?s} exit={?d} output={s}\n",
+            .{ @errorName(err), diagnostic.executor.instruction_line, diagnostic.executor.instruction, diagnostic.executor.exit_code, diagnostic.executor.output },
+        );
+        return err;
+    };
+    if (diagnostic.executor.boot_count != 1) return error.ExpectedLargeRunBuildVmBoot;
+    if (diagnostic.executor.executed_steps != 2) return error.ExpectedLargeRunTwoSteps;
+    if (diagnostic.executor.resize_count != 1) return error.ExpectedLargeRunOneResize;
+    if (first.cache_hit) return error.ExpectedLargeRunCacheMiss;
+
+    // Reopen the published image through a fresh no-cache build. This proves
+    // the 512 MiB payload is durable in CAS rather than merely readable from
+    // the live ChunkMappedDisk that produced it.
+    try writeSingleRunFromDockerfile(io, dockerfile_path, "local/build-smoke-large-run:dev", "verify-large-run");
+    var reopen_diagnostic: build_mod.Diagnostic = .{};
+    const reopened = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-large-run-reopen:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .no_cache = true,
+        .diagnostic = &reopen_diagnostic,
+    });
+    if (reopen_diagnostic.executor.boot_count != 1) return error.ExpectedReopenedLargeRunVmBoot;
+    if (reopen_diagnostic.executor.executed_steps != 1) return error.ExpectedReopenedLargeRunStep;
+    if (reopen_diagnostic.executor.resize_count != 0) return error.ExpectedReopenedLargeRunWithoutResize;
+    if (reopened.cache_hit) return error.ExpectedReopenedLargeRunCacheMiss;
+
+    // Keep the ordinary warm zero-boot assertion separate from the CAS reopen
+    // proof above: it exercises the original two-step build on an exact hit.
+    try writeLargeRunDockerfile(io, dockerfile_path);
+    var cached_diagnostic: build_mod.Diagnostic = .{};
+    const cached = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-large-run:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &cached_diagnostic,
+    });
+    if (cached_diagnostic.executor.boot_count != 0) return error.ExpectedCachedLargeRunWithoutBoot;
+    if (cached_diagnostic.executor.executed_steps != 0) return error.ExpectedCachedLargeRunWithoutSteps;
+    if (cached_diagnostic.executor.resize_count != 0) return error.ExpectedCachedLargeRunWithoutResize;
+    if (!cached.cache_hit) return error.ExpectedCachedLargeRunHit;
+    if (!std.mem.eql(u8, first.index_digest, cached.index_digest)) return error.ExpectedCachedLargeRunIdentity;
+
+    std.debug.print(
+        "spore-build-large-run-smoke ok: bytes=536870912 first={s} reopened={s} cached={s}\n",
+        .{ first.index_digest, reopened.index_digest, cached.index_digest },
+    );
+}
+
+fn writeLargeRunDockerfile(io: Io, dockerfile_path: []const u8) !void {
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-base:dev
+        \\RUN generate-large-run
+        \\RUN verify-large-run
+        \\
+        ,
+    });
+}
+
+const PublicationState = struct {
+    root_metadata_files: usize,
+    root_metadata_digest: [Blake3.digest_length]u8,
+    local_refs: usize,
+    step_records: usize,
+    indexes: usize,
+    complete_stamps: usize,
+    objects: usize,
+};
+
+fn runEnospcSmoke(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    dockerfile_path: []const u8,
+    base_storage: spore.RootfsStorage,
+    mode: Mode,
+) !void {
+    const command = switch (mode) {
+        .block_enospc => "exhaust-blocks",
+        .inode_enospc => "exhaust-inodes",
+        else => return error.InvalidArguments,
+    };
+    const destination = switch (mode) {
+        .block_enospc => "local/build-smoke-block-enospc:dev",
+        .inode_enospc => "local/build-smoke-inode-enospc:dev",
+        else => unreachable,
+    };
+    const prepared_tag = switch (mode) {
+        .block_enospc => "local/build-smoke-block-enospc-prepare:dev",
+        .inode_enospc => "local/build-smoke-inode-enospc-prepare:dev",
+        else => unreachable,
+    };
+    const context_dir = std.fs.path.dirname(dockerfile_path) orelse return error.BadManifest;
+
+    // Prepare the exact parent once through an unrelated successful build.
+    // The failing --no-cache build below must reuse this synthetic PREPARE
+    // record while still executing its RUN instruction.
+    try writeSingleRunDockerfile(io, dockerfile_path, "step1");
+    var prepare_diagnostic: build_mod.Diagnostic = .{};
+    const prepared = try build_mod.build(init, allocator, .{
+        .tag = prepared_tag,
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &prepare_diagnostic,
+    });
+    if (prepared.cache_hit) return error.ExpectedPreparationCacheMiss;
+    if (prepare_diagnostic.executor.boot_count != 1) return error.ExpectedPreparationVmBoot;
+    if (prepare_diagnostic.executor.executed_steps != 1) return error.ExpectedOnePreparationRun;
+    if (prepare_diagnostic.executor.resize_count != 1) return error.ExpectedOnePreparationResize;
+
+    // Seed the destination so failure can prove byte-for-byte ref stability.
+    _ = try rootfs.publishIndexedImage(init, allocator, .{
+        .ref = destination,
+        .platform = .{},
+        .config = .{ .architecture = "arm64", .os = "linux" },
+        .rootfs_storage = base_storage,
+    });
+    const destination_ref_path = try rootfs.localRefCachePath(allocator, cache_root, destination, .{});
+    const ref_before = try Io.Dir.cwd().readFileAlloc(io, destination_ref_path, allocator, .limited(64 * 1024));
+    const resolved_before = try rootfs.resolveLocalCachedRef(io, allocator, cache_root, destination, .{});
+    const publication_before = try publicationState(io, allocator, cache_root);
+
+    try writeSingleRunDockerfile(io, dockerfile_path, command);
+    var diagnostic: build_mod.Diagnostic = .{};
+    if (build_mod.build(init, allocator, .{
+        .tag = destination,
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .no_cache = true,
+        .diagnostic = &diagnostic,
+    })) |_| {
+        return error.ExpectedEnospcBuildFailure;
+    } else |err| {
+        if (err != error.BuildRunFailed) {
+            std.debug.print(
+                "ENOSPC build failed unexpectedly: mode={s} err={s} line={d} instruction={?s} exit={?d} output={s}\n",
+                .{ @tagName(mode), @errorName(err), diagnostic.executor.instruction_line, diagnostic.executor.instruction, diagnostic.executor.exit_code, diagnostic.executor.output },
+            );
+            return err;
+        }
+    }
+
+    if (diagnostic.executor.boot_count != 1) return error.ExpectedEnospcBuildVmBoot;
+    if (diagnostic.executor.executed_steps != 1) return error.ExpectedOneEnospcRunWithoutRetry;
+    if (diagnostic.executor.resize_count != 0) return error.ExpectedPreparedBaseReuse;
+    if (!diagnostic.executor.enospc) return error.ExpectedEnospcDiagnostic;
+    if (diagnostic.executor.exit_code != 28) return error.ExpectedEnospcExitCode;
+    const expected_instruction = try std.fmt.allocPrint(allocator, "RUN {s}", .{command});
+    if (diagnostic.executor.instruction == null or
+        !std.mem.eql(u8, diagnostic.executor.instruction.?, expected_instruction)) return error.ExpectedEnospcInstruction;
+    const marker = try std.fmt.allocPrint(allocator, "SPORE_BUILD_ENOSPC {s}", .{if (mode == .block_enospc) "block" else "inode"});
+    if (std.mem.count(u8, diagnostic.executor.output, marker) != 1) return error.ExpectedSingleEnospcExecutionMarker;
+
+    const ref_after = try Io.Dir.cwd().readFileAlloc(io, destination_ref_path, allocator, .limited(64 * 1024));
+    if (!std.mem.eql(u8, ref_before, ref_after)) return error.EnospcBuildChangedDestinationRef;
+    const resolved_after = try rootfs.resolveLocalCachedRef(io, allocator, cache_root, destination, .{});
+    if (!std.mem.eql(u8, resolved_before.ref, resolved_after.ref) or
+        !std.mem.eql(u8, resolved_before.manifest_digest, resolved_after.manifest_digest)) return error.EnospcBuildChangedDestinationIdentity;
+
+    const publication_after = try publicationState(io, allocator, cache_root);
+    if (!std.meta.eql(publication_before, publication_after)) {
+        std.debug.print(
+            "ENOSPC build published authoritative state: mode={s} before={any} after={any}\n",
+            .{ @tagName(mode), publication_before, publication_after },
+        );
+        return error.EnospcBuildPublishedState;
+    }
+    if (try stepRecordsContain(io, allocator, cache_root, command)) return error.EnospcBuildPublishedStepRecord;
+
+    std.debug.print(
+        "spore-build-{s}-smoke ok: exit=28 executed_steps=1 resize_count=0 ref={s}\n",
+        .{ @tagName(mode), resolved_after.ref },
+    );
+}
+
+fn writeSingleRunDockerfile(io: Io, path: []const u8, command: []const u8) !void {
+    return writeSingleRunFromDockerfile(io, path, "local/build-smoke-base:dev", command);
+}
+
+fn writeSingleRunFromDockerfile(io: Io, path: []const u8, from: []const u8, command: []const u8) !void {
+    var buf: [384]u8 = undefined;
+    const dockerfile = try std.fmt.bufPrint(&buf,
+        \\FROM {s}
+        \\RUN {s}
+        \\
+    , .{ from, command });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = dockerfile });
+}
+
+fn publicationState(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) !PublicationState {
+    const root_metadata = try rootMetadataState(io, allocator, cache_root);
+    return .{
+        .root_metadata_files = root_metadata.files,
+        .root_metadata_digest = root_metadata.digest,
+        .local_refs = try countFiles(io, try std.fs.path.join(allocator, &.{ cache_root, "refs", "local" })),
+        .step_records = try countFiles(io, try std.fs.path.join(allocator, &.{ cache_root, "build", "steps" })),
+        .indexes = try countFiles(io, try std.fs.path.join(allocator, &.{ cache_root, "cas", "rootfs", "blake3", "indexes" })),
+        .complete_stamps = try countFiles(io, try std.fs.path.join(allocator, &.{ cache_root, "cas", "rootfs", "blake3", "complete" })),
+        .objects = try countFiles(io, try std.fs.path.join(allocator, &.{ cache_root, "cas", "rootfs", "blake3", "objects" })),
+    };
+}
+
+const RootMetadataState = struct {
+    files: usize,
+    digest: [Blake3.digest_length]u8,
+};
+
+fn rootMetadataState(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) !RootMetadataState {
+    var dir = try Io.Dir.cwd().openDir(io, cache_root, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(io);
+
+    var names = std.ArrayList([]const u8).empty;
+    defer names.deinit(allocator);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".json")) {
+            try names.append(allocator, try allocator.dupe(u8, entry.name));
+        }
+    }
+    std.mem.sort([]const u8, names.items, {}, stringLessThan);
+
+    var h = Blake3.init(.{});
+    for (names.items) |name| {
+        const path = try std.fs.path.join(allocator, &.{ cache_root, name });
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+        hashSmokeField(&h, name);
+        hashSmokeField(&h, bytes);
+    }
+    var digest: [Blake3.digest_length]u8 = undefined;
+    h.final(&digest);
+    return .{ .files = names.items.len, .digest = digest };
+}
+
+fn hashSmokeField(h: *Blake3, bytes: []const u8) void {
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, bytes.len, .little);
+    h.update(&len);
+    h.update(bytes);
+}
+
+fn stringLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+fn countFiles(io: Io, path: []const u8) !usize {
+    var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => |e| return e,
+    };
+    defer dir.close(io);
+    var count: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| if (entry.kind == .file) {
+        count += 1;
+    };
+    return count;
+}
+
+fn stepRecordsContain(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, needle: []const u8) !bool {
+    const steps_path = try std.fs.path.join(allocator, &.{ cache_root, "build", "steps" });
+    var dir = Io.Dir.cwd().openDir(io, steps_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => |e| return e,
+    };
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const path = try std.fs.path.join(allocator, &.{ steps_path, entry.name });
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 * 1024));
+        if (std.mem.indexOf(u8, bytes, needle) != null) return true;
+    }
+    return false;
+}
+
+fn enableExtentsFeature(allocator: std.mem.Allocator, path: []const u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+
+    var feature_bytes: [4]u8 = undefined;
+    const feature_len: isize = @intCast(feature_bytes.len);
+    if (std.c.pread(fd, &feature_bytes, feature_bytes.len, @intCast(ext4_feature_incompat_offset)) != feature_len) return error.IoFailed;
+    const features = std.mem.readInt(u32, &feature_bytes, .little) | ext4_feature_incompat_extents;
+    std.mem.writeInt(u32, &feature_bytes, features, .little);
+    if (std.c.pwrite(fd, &feature_bytes, feature_bytes.len, @intCast(ext4_feature_incompat_offset)) != feature_len) return error.IoFailed;
+    if (std.c.fsync(fd) != 0) return error.IoFailed;
 }
 
 fn nsToMs(ns: u64) u64 {

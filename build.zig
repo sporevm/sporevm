@@ -321,6 +321,47 @@ pub fn build(b: *std.Build) void {
 
         const build_large_copy_smoke_step = b.step("spore-build-large-copy-smoke", "Run the VM-backed multi-GiB spore build COPY smoke test");
         build_large_copy_smoke_step.dependOn(&run_large_copy_smoke.step);
+
+        const run_large_run_smoke = b.addSystemCommand(&.{
+            b.getInstallPath(.bin, "spore-build-run-smoke"),
+            b.getInstallPath(.bin, "spore-build-smoke-sh"),
+            "--large-run",
+        });
+        run_large_run_smoke.step.dependOn(build_run_smoke_ready);
+        run_large_run_smoke.step.dependOn(&install_build_smoke_shell.step);
+
+        const build_large_run_smoke_step = b.step("spore-build-large-run-smoke", "Run the VM-backed 512 MiB nonzero spore build RUN smoke test");
+        build_large_run_smoke_step.dependOn(&run_large_run_smoke.step);
+
+        const run_block_enospc_cli_smoke = b.addSystemCommand(&.{
+            "bash",
+            "test/smoke/rootfs/build-enospc-cli.sh",
+            "block",
+            b.getInstallPath(.bin, "spore"),
+            b.getInstallPath(.bin, "spore-build-run-smoke"),
+            b.getInstallPath(.bin, "spore-build-smoke-sh"),
+        });
+        run_block_enospc_cli_smoke.step.dependOn(build_run_smoke_ready);
+        run_block_enospc_cli_smoke.step.dependOn(&install_build_smoke_shell.step);
+        run_block_enospc_cli_smoke.step.dependOn(b.getInstallStep());
+
+        const build_block_enospc_smoke_step = b.step("spore-build-block-enospc-smoke", "Run the VM-backed spore build block ENOSPC publication smoke test");
+        build_block_enospc_smoke_step.dependOn(&run_block_enospc_cli_smoke.step);
+
+        const run_inode_enospc_cli_smoke = b.addSystemCommand(&.{
+            "bash",
+            "test/smoke/rootfs/build-enospc-cli.sh",
+            "inode",
+            b.getInstallPath(.bin, "spore"),
+            b.getInstallPath(.bin, "spore-build-run-smoke"),
+            b.getInstallPath(.bin, "spore-build-smoke-sh"),
+        });
+        run_inode_enospc_cli_smoke.step.dependOn(build_run_smoke_ready);
+        run_inode_enospc_cli_smoke.step.dependOn(&install_build_smoke_shell.step);
+        run_inode_enospc_cli_smoke.step.dependOn(b.getInstallStep());
+
+        const build_inode_enospc_smoke_step = b.step("spore-build-inode-enospc-smoke", "Run the VM-backed spore build inode ENOSPC publication smoke test");
+        build_inode_enospc_smoke_step.dependOn(&run_inode_enospc_cli_smoke.step);
     }
 
     // Hypervisor.framework smoke test: host-only, needs entitlement signing.

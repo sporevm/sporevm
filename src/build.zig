@@ -6,6 +6,7 @@ const build_context = @import("build/context.zig");
 const build_context_disk = @import("build/context_disk.zig");
 const build_exec = @import("build/exec.zig");
 const step_cache = @import("build/step_cache.zig");
+const disk_index = @import("disk_index.zig");
 const local_paths = @import("local_paths.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
@@ -1193,6 +1194,129 @@ test "COPY directory source preserves empty subdirectory entry" {
     try std.testing.expectEqualStrings("s0/src", step.requests[0].source);
     try std.testing.expectEqualStrings("/dest", step.requests[0].dest);
     try std.testing.expectEqual(@as(usize, 2), step.requests[0].entry_count);
+}
+
+test "fully cached build publishes final indexed image" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-spore-build-cached";
+    const context_dir = tmp ++ "/context";
+    const cache_dir = tmp ++ "/cache";
+    const dockerfile_path = context_dir ++ "/Dockerfile";
+    const base_rootfs = tmp ++ "/base.ext4";
+    const kernel_path = tmp ++ "/Image";
+    const initrd_path = tmp ++ "/root.cpio";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, context_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = base_rootfs, .data = "base rootfs bytes" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = kernel_path, .data = "test kernel bytes" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = initrd_path, .data = "test initrd bytes" });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/base:dev
+        \\RUN echo cached
+        \\CMD ["/bin/true"]
+        \\
+        ,
+    });
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_dir);
+    try env.put("SPOREVM_KERNEL_IMAGE", kernel_path);
+    try env.put("SPOREVM_RUN_INITRD", initrd_path);
+    const init = testInit(allocator, io, &arena_state, &env);
+    const cache_root = try local_paths.rootfsCacheRootPath(arena, &env);
+
+    const base_preload = try rootfs_cas.preloadPath(io, arena, cache_root, base_rootfs, rootfs_cas.default_chunk_size);
+    const base_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, base_preload);
+    _ = try rootfs_mod.publishIndexedImage(init, arena, .{
+        .ref = "local/base:dev",
+        .platform = .{},
+        .rootfs_storage = base_storage,
+    });
+
+    const producer = try build_exec.resolveProducer(init, arena);
+    const prepared_size = try buildDiskGrowTarget(base_storage);
+    const prepared_chunk_count: usize = @intCast(prepared_size / rootfs_cas.default_chunk_size);
+    const zero_chunks = try arena.alloc(u64, prepared_chunk_count);
+    for (zero_chunks, 0..) |*logical_chunk, i| logical_chunk.* = @intCast(i);
+    const encoded_prepared = try disk_index.encodeCanonicalAlloc(arena, .{
+        .kind = disk_index.disk_index_kind,
+        .logical_size = prepared_size,
+        .chunk_size = rootfs_cas.default_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+        .zero_chunks = zero_chunks,
+    });
+    const prepared_index_path = try rootfs_cas.manifestIndexPath(arena, cache_root, encoded_prepared.digest);
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(prepared_index_path) orelse return error.BadManifest);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = prepared_index_path, .data = encoded_prepared.bytes });
+    const prepared_storage = spore.RootfsStorage{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = .{ .mmio_slot = 1 },
+        .logical_size = prepared_size,
+        .chunk_size = rootfs_cas.default_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .index_digest = encoded_prepared.digest,
+        .base_identity = encoded_prepared.digest,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+    };
+    try std.testing.expect(try rootfs_cas.storageComplete(io, arena, cache_root, prepared_storage));
+
+    const prepare_input = try step_cache.prepareInput(
+        .{},
+        base_storage.index_digest,
+        prepared_size,
+        producer.identity,
+    );
+    const prepare_key = try step_cache.stepKey(arena, prepare_input);
+    _ = try step_cache.writeRecord(io, arena, cache_root, prepare_input, prepare_key, prepared_storage);
+
+    const env_digest = try step_cache.envDigest(arena, &.{}, &.{});
+    const run_input = step_cache.StepInput{
+        .platform = .{},
+        .parent_index_digest = prepared_storage.index_digest,
+        .canonical_instruction = "RUN echo cached",
+        .executor_identity = producer.identity,
+        .operation = .{ .run = .{
+            .env_digest = env_digest,
+            .workdir = "/",
+            .network_mode = .spore,
+        } },
+    };
+    const run_key = try step_cache.stepKey(arena, run_input);
+    _ = try step_cache.writeRecord(io, arena, cache_root, run_input, run_key, prepared_storage);
+
+    var diagnostic: Diagnostic = .{};
+    const result = try build(init, arena, .{
+        .tag = "local/app:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .diagnostic = &diagnostic,
+    });
+
+    try std.testing.expect(result.cache_hit);
+    try std.testing.expectEqual(@as(usize, 0), diagnostic.executor.boot_count);
+    try std.testing.expectEqual(@as(usize, 0), diagnostic.executor.executed_steps);
+    try std.testing.expectEqualStrings(prepared_storage.index_digest, result.index_digest);
+    const resolved = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, "local/app:dev", .{});
+    try std.testing.expect(!std.mem.eql(u8, prepared_storage.index_digest, resolved.manifest_digest));
+    const indexed = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_root, resolved)) orelse return error.MissingIndexedRootfs;
+    defer rootfs_mod.deinitCachedIndexedRootfs(arena, indexed);
+    try std.testing.expectEqualStrings(prepared_storage.index_digest, indexed.storage.index_digest);
+
+    const resolved_direct = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, result.resolved_image_ref, .{});
+    try std.testing.expectEqualStrings(resolved.manifest_digest, resolved_direct.manifest_digest);
+    const indexed_direct = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_root, resolved_direct)) orelse return error.MissingIndexedRootfs;
+    defer rootfs_mod.deinitCachedIndexedRootfs(arena, indexed_direct);
+    try std.testing.expectEqualStrings(prepared_storage.index_digest, indexed_direct.storage.index_digest);
 }
 
 test "metadata-only builds with different CMD publish distinct image identities" {
