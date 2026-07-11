@@ -130,6 +130,42 @@ With the default prewarm enabled, `cold_tti` is also the guardrail for warm
 `spore run --image`: the rootfs has already been built outside the timed loop,
 so the timed rows measure the cached image run path that regressed in PR #421.
 
+### Lazy Rootfs TTI
+
+Use `lazy_rootfs_tti` to compare first-command readiness from the same complete
+chunked image cache in three storage states:
+
+```console
+scripts/benchmark/suite.py \
+  --profile smoke \
+  --benchmarks lazy_rootfs_tti \
+  --iterations 3 \
+  --modes sequential \
+  --image local/example:dev
+```
+
+- `lazy-cold` removes the derived flat artifact and faults CAS chunks as the
+  guest reads them.
+- `eager-cold` removes the flat artifact and materializes it completely from
+  the warm CAS before boot.
+- `flat-hot` reuses the eager run's derived flat artifact.
+
+The benchmark accepts registry `@sha256` identities and native local
+`@blake3` identities. It selects cache metadata by the exact resolved image, so
+it never evicts an unrelated image's flat artifact. Native `spore build`
+outputs may be chunk-only and have no source flat path; the eager row creates
+the flat artifact that the following hot row uses.
+
+Each timed run requests a rootfs trace. Lazy rows must emit exactly one
+versioned `lazy_cas_fault_summary`, report zero fault errors, and fault at least
+one CAS chunk. `SPOREVM_ROOTFS_TRACE_SUMMARY_ONLY=1` suppresses per-read events
+so measurement does not add one trace write per fault. The row and summary
+include runtime-open and index-attach time, exact owned index payload bytes,
+initial and remaining CAS chunks, fault count and bytes, working-set
+percentage, and cumulative object preparation, read, verification, sparse
+write, and unclassified fault-service time. The trace contains no paths or
+digests.
+
 ### Cold Import
 
 Cold import measures deterministic rootfs materialization without depending on
