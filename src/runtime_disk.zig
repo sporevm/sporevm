@@ -20,6 +20,7 @@ const virtio_blk = @import("virtio/blk.zig");
 
 const Io = std.Io;
 const rootfs_trace_env = "SPOREVM_ROOTFS_TRACE";
+const rootfs_trace_summary_only_env = "SPOREVM_ROOTFS_TRACE_SUMMARY_ONLY";
 const rootfs_eager_materialize_env = "SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCHMARK";
 
 pub const Options = struct {
@@ -37,6 +38,7 @@ pub const RuntimeDisk = struct {
     /// Owned trace fd, opened once from SPOREVM_ROOTFS_TRACE (O_APPEND) so
     /// per-read trace events do not pay an open/close each.
     trace_fd: ?std.c.fd_t = null,
+    trace_summary_only: bool = false,
     rootfs_fd: ?std.c.fd_t = null,
     overlay: ?disk_layer.TempOverlay = null,
     chunk_mapped: ?chunk_mapped_disk.ChunkMappedDisk = null,
@@ -93,7 +95,7 @@ pub const RuntimeDisk = struct {
 
     fn baseSource(self: *RuntimeDisk, size: u64) !block_source.FileBlockSource {
         const fd = self.rootfs_fd orelse return error.BadManifest;
-        return block_source.FileBlockSource.initWithTrace(fd, size, self.trace_fd);
+        return block_source.FileBlockSource.initWithTrace(fd, size, if (self.trace_summary_only) null else self.trace_fd);
     }
 
     fn forkBaseline(self: *RuntimeDisk) !runtime_disk_fork.Baseline {
@@ -122,6 +124,8 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
     var runtime = RuntimeDisk{ .allocator = allocator };
     errdefer runtime.deinit();
     runtime.trace_fd = try openRootfsTraceFd(context, allocator);
+    runtime.trace_summary_only = envEnabled(context, rootfs_trace_summary_only_env);
+    const trace_open_start_ns = if (runtime.trace_fd != null) monotonicNs() else 0;
 
     // A durable disk index is a complete baseline authority. Open it directly
     // from its lease root instead of first requiring the original rootfs cache
@@ -146,8 +150,9 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         runtime.chunk_mapped = writable.disk;
         var parsed = try readDiskIndex(context, allocator, disk_root, diskStorageDescriptor(disk));
         defer parsed.deinit();
-        try runtime.chunk_mapped.?.attachCasIndex(disk_root, parsed.value);
+        try runtime.chunk_mapped.?.attachCasIndexTraced(disk_root, parsed.value, runtime.trace_fd);
         runtime.base_disk = disk;
+        runtime.chunk_mapped.?.setLazyCasRuntimeOpenNs(elapsedNs(trace_open_start_ns));
         return runtime;
     }
     var rootfs_lazy_storage: ?spore.RootfsStorage = null;
@@ -198,10 +203,11 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             runtime.chunk_mapped = writable.disk;
             var parsed = try readDiskIndex(context, allocator, cache_root, storage);
             defer parsed.deinit();
-            try runtime.chunk_mapped.?.attachCasIndex(cache_root, parsed.value);
+            try runtime.chunk_mapped.?.attachCasIndexTraced(cache_root, parsed.value, runtime.trace_fd);
             try runtime.chunk_mapped.?.grow(grown_size);
             runtime.base_disk = base;
             runtime.base_disk.?.size = grown_size;
+            runtime.chunk_mapped.?.setLazyCasRuntimeOpenNs(elapsedNs(trace_open_start_ns));
             return runtime;
         }
         const base_source = try runtime.baseSource(base.size);
@@ -481,7 +487,11 @@ fn openRootfsTraceFd(context: Context, allocator: std.mem.Allocator) !?std.c.fd_
 }
 
 fn forceEagerRootfsMaterialization(context: Context) bool {
-    const raw = context.environ_map.get(rootfs_eager_materialize_env) orelse return false;
+    return envEnabled(context, rootfs_eager_materialize_env);
+}
+
+fn envEnabled(context: Context, name: []const u8) bool {
+    const raw = context.environ_map.get(name) orelse return false;
     if (raw.len == 0) return false;
     if (std.mem.eql(u8, raw, "0")) return false;
     if (std.ascii.eqlIgnoreCase(raw, "false")) return false;
@@ -507,6 +517,17 @@ fn monotonicMs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
+
+fn monotonicNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn elapsedNs(start_ns: u64) u64 {
+    if (start_ns == 0) return 0;
+    return monotonicNs() -| start_ns;
 }
 
 test "runtime disk owns trace path without a rootfs" {
@@ -706,6 +727,7 @@ test "runtime disk lazily faults rootfs cas chunks when the flat artifact is mis
     const tmp = "zig-cache/test-run-runtime-disk-cas-fallback-missing";
     const rootfs_path = tmp ++ "/source.ext4";
     const cache_root = tmp ++ "/cache";
+    const trace_path = tmp ++ "/lazy-cas-trace.jsonl";
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
     try Io.Dir.cwd().createDirPath(io, tmp);
     const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
@@ -731,6 +753,9 @@ test "runtime disk lazily faults rootfs cas chunks when the flat artifact is mis
     const unrelated_cache_root = try std.fs.path.resolve(arena, &.{ tmp, "unrelated-cache" });
     try Io.Dir.cwd().createDirPath(io, unrelated_cache_root);
     try env.put(local_paths.rootfs_cache_env, unrelated_cache_root);
+    const absolute_trace_path = try std.fs.path.resolve(arena, &.{trace_path});
+    try env.put(rootfs_trace_env, absolute_trace_path);
+    try env.put(rootfs_trace_summary_only_env, "1");
 
     const context = Context{ .io = io, .environ_map = &env };
 
@@ -743,7 +768,8 @@ test "runtime disk lazily faults rootfs cas chunks when the flat artifact is mis
         .rootfs = rootfs,
         .disk_root = absolute_cache_root,
     });
-    defer runtime.deinit();
+    var runtime_open = true;
+    defer if (runtime_open) runtime.deinit();
 
     try std.testing.expect(runtime.rootfs_fd != null);
     try std.testing.expect(runtime.chunk_mapped != null);
@@ -756,6 +782,18 @@ test "runtime disk lazily faults rootfs cas chunks when the flat artifact is mis
     // Lazy fault-in promotes into the sparse runtime base, not the by-digest
     // materialization cache.
     try std.testing.expect(!try rootfs_cache.regularFileNoSymlink(io, digest_path));
+
+    runtime.deinit();
+    runtime_open = false;
+    const trace = try Io.Dir.cwd().readFileAlloc(io, trace_path, arena, .limited(1 << 20));
+    try std.testing.expect(std.mem.indexOf(u8, trace, "\"event\":\"block_source_read\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "\"event\":\"lazy_cas_fault_summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "\"cas_chunks_initial\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "\"cas_chunks_remaining\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "\"fault_attempts\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "\"fault_errors\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "\"unique_chunks\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "\"fault_bytes\":65536") != null);
 }
 
 test "build-owned cache lock permits lazy runtime disk open" {

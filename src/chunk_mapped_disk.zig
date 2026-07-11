@@ -72,6 +72,28 @@ pub const SnapshotStats = struct {
     work: chunk_sealer.WorkStats = .{},
 };
 
+const LazyCasTraceStats = struct {
+    runtime_open_ns: u64 = 0,
+    index_attach_ns: u64 = 0,
+    index_payload_bytes: u64 = 0,
+    total_chunks: u64 = 0,
+    cas_chunks_initial: u64 = 0,
+    fault_attempts: u64 = 0,
+    fault_errors: u64 = 0,
+    unique_chunks: u64 = 0,
+    fault_bytes: u64 = 0,
+    fault_total_ns: u64 = 0,
+    object_open_ns: u64 = 0,
+    object_read_ns: u64 = 0,
+    object_verify_ns: u64 = 0,
+    sparse_write_ns: u64 = 0,
+};
+
+const LazyCasTrace = struct {
+    fd: std.c.fd_t,
+    stats: LazyCasTraceStats,
+};
+
 pub const ForkedDisk = struct {
     disk: ChunkMappedDisk,
     clone_method: ForkCloneMethod,
@@ -109,6 +131,7 @@ pub const ChunkMappedDisk = struct {
     parent_root: ?[]const u8 = null,
     parent_digests: []?[]const u8 = &.{},
     snapshot_published: bool = false,
+    lazy_cas_trace: ?LazyCasTrace = null,
 
     pub fn initReadOnly(
         allocator: std.mem.Allocator,
@@ -176,6 +199,7 @@ pub const ChunkMappedDisk = struct {
     }
 
     pub fn deinit(self: *ChunkMappedDisk) void {
+        self.appendLazyCasTrace();
         self.deinitCasState();
         self.deinitParentIndex();
         if (self.overlay_dir) |dir| self.allocator.free(dir);
@@ -217,6 +241,10 @@ pub const ChunkMappedDisk = struct {
 
     pub fn clusterCount(self: ChunkMappedDisk) usize {
         return self.chunkCount();
+    }
+
+    pub fn setLazyCasRuntimeOpenNs(self: *ChunkMappedDisk, elapsed_ns: u64) void {
+        if (self.lazy_cas_trace) |*trace| trace.stats.runtime_open_ns = elapsed_ns;
     }
 
     pub fn grow(self: *ChunkMappedDisk, new_size: u64) Error!void {
@@ -487,6 +515,15 @@ pub const ChunkMappedDisk = struct {
     }
 
     pub fn attachCasIndex(self: *ChunkMappedDisk, cache_root: []const u8, index: disk_index.DiskIndex) Error!void {
+        return self.attachCasIndexTraced(cache_root, index, null);
+    }
+
+    pub fn attachCasIndexTraced(
+        self: *ChunkMappedDisk,
+        cache_root: []const u8,
+        index: disk_index.DiskIndex,
+        trace_fd: ?std.c.fd_t,
+    ) Error!void {
         if (self.cas_root != null or self.cas_digests.len != 0 or self.parent_digests.len != 0) return error.BadManifest;
         if (index.logical_size != self.size or index.chunk_size != self.chunk_size) return error.BadManifest;
         try disk_index.validateDiskIndex(index, .{
@@ -496,8 +533,21 @@ pub const ChunkMappedDisk = struct {
             .object_namespace = spore.rootfs_storage_object_namespace,
         });
 
+        if (trace_fd) |fd| {
+            self.lazy_cas_trace = .{
+                .fd = fd,
+                .stats = .{ .total_chunks = self.sources.len },
+            };
+        }
+        errdefer self.lazy_cas_trace = null;
+        const attach_start_ns = if (trace_fd != null) monotonicNs() catch 0 else 0;
         const next = try self.indexStateFrom(cache_root, index);
         self.installIndexState(next);
+        if (self.lazy_cas_trace) |*trace| {
+            trace.stats.index_attach_ns = elapsedSince(attach_start_ns);
+            trace.stats.cas_chunks_initial = @intCast(index.chunks.len);
+            trace.stats.index_payload_bytes = indexStatePayloadBytes(self.sources.len, cache_root, index);
+        }
     }
 
     /// Attaches a verified index as snapshot baseline metadata while keeping
@@ -875,16 +925,83 @@ pub const ChunkMappedDisk = struct {
     fn faultCasChunk(self: *ChunkMappedDisk, chunk_index: usize) Error!void {
         if (chunk_index >= self.sources.len) return error.OutOfRange;
         if (self.sources[chunk_index] != .cas) return;
+        const fault_start_ns = if (self.lazy_cas_trace != null) monotonicNs() catch 0 else 0;
+        if (self.lazy_cas_trace) |*trace| trace.stats.fault_attempts +|= 1;
         const cache_root = self.cas_root orelse return error.BadManifest;
         if (self.cas_digests.len != self.sources.len) return error.BadManifest;
         const digest = self.cas_digests[chunk_index] orelse return error.BadManifest;
         const len = try self.chunkLen(chunk_index);
-        const data = try rootfs_cas.readVerifiedManifestObject(self.allocator, cache_root, digest, len);
+        var object_stats: rootfs_cas.ManifestObjectReadStats = .{};
+        const data = if (self.lazy_cas_trace != null)
+            rootfs_cas.readVerifiedManifestObjectTimed(self.allocator, cache_root, digest, len, &object_stats) catch |err| {
+                self.recordLazyCasFault(false, 0, fault_start_ns, 0, object_stats);
+                return err;
+            }
+        else
+            try rootfs_cas.readVerifiedManifestObject(self.allocator, cache_root, digest, len);
         defer self.allocator.free(data);
         const offset = std.math.mul(u64, chunk_index, self.chunk_size) catch return error.OutOfRange;
-        try writeExact(self.base.fd, data, offset);
+        const write_start_ns = if (self.lazy_cas_trace != null) monotonicNs() catch 0 else 0;
+        writeExact(self.base.fd, data, offset) catch |err| {
+            self.recordLazyCasFault(false, 0, fault_start_ns, elapsedSince(write_start_ns), object_stats);
+            return err;
+        };
+        const write_ns = if (self.lazy_cas_trace != null) elapsedSince(write_start_ns) else 0;
         self.clearCasDigest(chunk_index);
         self.sources[chunk_index] = .base;
+        self.recordLazyCasFault(true, len, fault_start_ns, write_ns, object_stats);
+    }
+
+    fn recordLazyCasFault(
+        self: *ChunkMappedDisk,
+        success: bool,
+        bytes: usize,
+        fault_start_ns: u64,
+        write_ns: u64,
+        object: rootfs_cas.ManifestObjectReadStats,
+    ) void {
+        if (self.lazy_cas_trace) |*trace| {
+            if (success) {
+                trace.stats.unique_chunks +|= 1;
+                trace.stats.fault_bytes +|= bytes;
+            } else {
+                trace.stats.fault_errors +|= 1;
+            }
+            trace.stats.fault_total_ns +|= elapsedSince(fault_start_ns);
+            trace.stats.object_open_ns +|= object.open_ns;
+            trace.stats.object_read_ns +|= object.read_ns;
+            trace.stats.object_verify_ns +|= object.verify_ns;
+            trace.stats.sparse_write_ns +|= write_ns;
+        }
+    }
+
+    fn appendLazyCasTrace(self: *ChunkMappedDisk) void {
+        const trace = self.lazy_cas_trace orelse return;
+        const stats = trace.stats;
+        const remaining = stats.cas_chunks_initial -| stats.unique_chunks;
+        var line_buf: [1024]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &line_buf,
+            "{{\"event\":\"lazy_cas_fault_summary\",\"version\":1,\"runtime_open_ns\":{d},\"index_attach_ns\":{d},\"index_payload_bytes\":{d},\"total_chunks\":{d},\"cas_chunks_initial\":{d},\"cas_chunks_remaining\":{d},\"fault_attempts\":{d},\"fault_errors\":{d},\"unique_chunks\":{d},\"fault_bytes\":{d},\"fault_total_ns\":{d},\"object_open_ns\":{d},\"object_read_ns\":{d},\"object_verify_ns\":{d},\"sparse_write_ns\":{d}}}\n",
+            .{
+                stats.runtime_open_ns,
+                stats.index_attach_ns,
+                stats.index_payload_bytes,
+                stats.total_chunks,
+                stats.cas_chunks_initial,
+                remaining,
+                stats.fault_attempts,
+                stats.fault_errors,
+                stats.unique_chunks,
+                stats.fault_bytes,
+                stats.fault_total_ns,
+                stats.object_open_ns,
+                stats.object_read_ns,
+                stats.object_verify_ns,
+                stats.sparse_write_ns,
+            },
+        ) catch return;
+        fd_util.writeAllBestEffort(trace.fd, line);
     }
 
     fn clearCasDigest(self: *ChunkMappedDisk, chunk_index: usize) void {
@@ -1053,6 +1170,14 @@ fn appendChunkEntry(
 
 fn computeChunkCount(size: u64, chunk_size: u64) Error!u64 {
     return std.math.divCeil(u64, size, chunk_size) catch return error.BadDiskSize;
+}
+
+fn indexStatePayloadBytes(source_count: usize, cache_root: []const u8, index: disk_index.DiskIndex) u64 {
+    var bytes: u64 = @as(u64, @intCast(source_count)) *| @sizeOf(Source);
+    bytes +|= @as(u64, @intCast(source_count)) *| @sizeOf(?[]const u8) *| 2;
+    bytes +|= @as(u64, @intCast(cache_root.len)) *| 2;
+    for (index.chunks) |entry| bytes +|= @as(u64, @intCast(entry.digest.len)) *| 2;
+    return bytes;
 }
 
 fn readExact(fd: std.c.fd_t, buf: []u8, offset: u64) Error!void {

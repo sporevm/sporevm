@@ -55,6 +55,12 @@ pub const InstallResult = struct {
     bytes_fetched: u64,
 };
 
+pub const ManifestObjectReadStats = struct {
+    open_ns: u64 = 0,
+    read_ns: u64 = 0,
+    verify_ns: u64 = 0,
+};
+
 const LoadedIndex = struct {
     chunk_ids: []?chunk.ChunkId,
     logical_size: u64,
@@ -619,11 +625,35 @@ pub fn readVerifiedManifestObject(
     object_digest: []const u8,
     expected_size: usize,
 ) (SourceError || spore.Error)![]u8 {
+    return readVerifiedManifestObjectInner(allocator, cache_root, object_digest, expected_size, null);
+}
+
+pub fn readVerifiedManifestObjectTimed(
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    object_digest: []const u8,
+    expected_size: usize,
+    stats: *ManifestObjectReadStats,
+) (SourceError || spore.Error)![]u8 {
+    return readVerifiedManifestObjectInner(allocator, cache_root, object_digest, expected_size, stats);
+}
+
+fn readVerifiedManifestObjectInner(
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    object_digest: []const u8,
+    expected_size: usize,
+    stats: ?*ManifestObjectReadStats,
+) (SourceError || spore.Error)![]u8 {
+    const path_start_ns = if (stats != null) monotonicNs() else 0;
     const object_path = try manifestObjectPath(allocator, cache_root, object_digest);
     defer allocator.free(object_path);
-    const object = try readFileExact(allocator, object_path, expected_size);
+    if (stats) |value| value.open_ns +|= elapsedNs(path_start_ns);
+    const object = try readFileExactTimed(allocator, object_path, expected_size, stats);
     errdefer allocator.free(object);
+    const verify_start_ns = if (stats != null) monotonicNs() else 0;
     try verifyDigestBytes(object_digest, object);
+    if (stats) |value| value.verify_ns +|= elapsedNs(verify_start_ns);
     return object;
 }
 
@@ -778,13 +808,32 @@ fn preadExact(fd: std.c.fd_t, buf: []u8, offset: u64) SourceError!void {
 }
 
 fn readFileExact(allocator: std.mem.Allocator, path: []const u8, expected_size: usize) SourceError![]u8 {
-    const data = try readFileAll(allocator, path, expected_size);
+    return readFileExactTimed(allocator, path, expected_size, null);
+}
+
+fn readFileExactTimed(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    expected_size: usize,
+    stats: ?*ManifestObjectReadStats,
+) SourceError![]u8 {
+    const data = try readFileAllTimed(allocator, path, expected_size, stats);
     errdefer allocator.free(data);
     if (data.len != expected_size) return error.BadChunk;
     return data;
 }
 
 fn readFileAll(allocator: std.mem.Allocator, path: []const u8, max: usize) SourceError![]u8 {
+    return readFileAllTimed(allocator, path, max, null);
+}
+
+fn readFileAllTimed(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max: usize,
+    stats: ?*ManifestObjectReadStats,
+) SourceError![]u8 {
+    const open_start_ns = if (stats != null) monotonicNs() else 0;
     const pathz = try allocator.dupeZ(u8, path);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
@@ -794,7 +843,10 @@ fn readFileAll(allocator: std.mem.Allocator, path: []const u8, max: usize) Sourc
     if (size > max) return error.BadChunk;
     const data = try allocator.alloc(u8, size);
     errdefer allocator.free(data);
+    if (stats) |value| value.open_ns +|= elapsedNs(open_start_ns);
+    const read_start_ns = if (stats != null) monotonicNs() else 0;
     try preadExact(fd, data, 0);
+    if (stats) |value| value.read_ns +|= elapsedNs(read_start_ns);
     return data;
 }
 
@@ -912,6 +964,17 @@ fn monotonicMs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
+
+fn monotonicNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn elapsedNs(start_ns: u64) u64 {
+    if (start_ns == 0) return 0;
+    return monotonicNs() -| start_ns;
 }
 test "materialize assembles the flat artifact from verified chunks" {
     const allocator = std.testing.allocator;
