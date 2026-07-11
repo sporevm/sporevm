@@ -13,7 +13,7 @@ fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${repo_root}"
 
-baseline_version="${SPOREVM_NAMED_RESTORE_BASELINE_VERSION:-v0.11.1}"
+baseline_version="${SPOREVM_NAMED_RESTORE_BASELINE_VERSION:-v0.12.0}"
 image="${SPOREVM_NAMED_RESTORE_IMAGE:-public.ecr.aws/docker/library/node:22-alpine}"
 memory="${SPOREVM_NAMED_RESTORE_MEMORY:-512mb}"
 iterations="${SPOREVM_NAMED_RESTORE_ITERATIONS:-5}"
