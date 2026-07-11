@@ -1023,18 +1023,32 @@ Every lazy run faulted the same 34 unique chunks (2,228,224 bytes, 0.179% of
 the nonzero chunk set) with zero errors, leaving 19,001 chunks in CAS. Mean
 cumulative fault service was 6.04ms: 1.02ms object preparation, 1.67ms reading,
 2.62ms verification, 0.64ms sparse writes, and 0.08ms other work. Runtime open
-averaged 78.63ms; attaching the 3,704,220-byte (3.53 MiB) owned index state
-averaged 2.28ms.
+averaged 78.63ms; before runtime-index compaction, attaching the 3,704,220-byte
+(3.53 MiB) owned index state averaged 2.28ms.
+
+Follow-up decision: keep the canonical on-disk index unchanged, but store its
+nonzero entries in the lazy runtime as one sorted `{ logical_chunk, ChunkId }`
+array. CAS fault identity and logical parent identity are the same for every
+unmodified `.cas` entry; promotion changes only the source tag, so a second
+digest table was duplicate ownership. First faults use a bounded binary search,
+while snapshots merge the sorted table with the chunk walk in O(N+K). Fork
+copies the table once and grow leaves it unchanged. The exact dense-trace
+dimensions now account for 791,898 owned bytes in four allocations, down from
+3,704,220 bytes in 38,075 allocations (78.6% fewer bytes and 99.99% fewer
+allocations). The regression test also covers one-entry and all-zero indexes,
+so compaction does not trade dense savings for an ultra-sparse regression.
 
 Those results close the remaining design gates. Do not add a background filler
 or boot-priority list: demand faults already fetch a tiny, stable working set.
 Do not add local packfiles: file-per-chunk open/read/verify service is only a few
-milliseconds across the entire boot. Index compaction is not latency-urgent:
-the owned state attaches in about 2ms. This benchmark did not measure process
-RSS, so memory cost remains an open measurement rather than evidence for or
-against compaction. Revisit any of these decisions only when a representative
-workload produces materially different traces. To repeat the timed portion
-against an admitted dense local image, run:
+milliseconds across the entire boot. Index compaction was not latency-urgent,
+but the owned-allocation evidence above justified a narrow representation
+change without touching the fault or format contracts. The original benchmark
+did not sample process RSS; exact owned bytes and allocation count are the
+repeatable proxy, not a claim about allocator or kernel accounting. Revisit any
+of these decisions only when a representative workload produces materially
+different traces. To repeat the timed portion against an admitted dense local
+image, run:
 
 ```sh
 python3 scripts/benchmark/suite.py --profile smoke --benchmarks lazy_rootfs_tti --iterations 3 --modes sequential --image <dense-local-image-ref> --output-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs-large --scratch-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs-large-scratch --timeout-s 900
@@ -1046,8 +1060,8 @@ boot working set, not full image assembly. Both the CI-sized check and the
 dense synthetic run start the guest before full flat materialization; on the
 dense run, eager materialization was about 13.6 times slower than lazy startup.
 The measured fault path does not justify a background filler, boot-priority
-ordering, or local packfiles. Index compaction has no measured latency urgency;
-its unmeasured RSS cost remains separate follow-up evidence.
+ordering, or local packfiles. The runtime index now has compact, measured owned
+storage without changing the on-disk index.
 
 ### U8 — Cleanup and docs
 
@@ -1152,11 +1166,6 @@ directly; it does not assemble or rescan the derived flat rootfs cache.
   dedupe and unlink-based GC. Reopen this only if representative fault traces
   show materially larger working sets or object-service cost; the index format
   is unaffected either way.
-- Compact index storage remains an RSS measurement question, not a latency
-  problem. The dense trace owned 3,704,220 bytes of index state and attached it
-  in 2.28ms on average, but the benchmark did not measure process RSS. Measure
-  that cost across representative concurrent VMs before changing the in-memory
-  layout.
 - Whether RAM and disk chunks should eventually share one *store*. This
   plan closes the code/format gaps (shared sealer in U3, shared index
   encoding and identity in U5, granularity as a parameter — RAM 2MiB, disk
