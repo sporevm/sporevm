@@ -346,17 +346,13 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     const vcpu_count: usize = @intCast(config.vcpus);
     var vcpus = try allocator.alloc(KvmVcpu, vcpu_count);
     for (vcpus) |*vcpu| vcpu.* = .{};
-    errdefer {
+    defer {
         for (vcpus) |*vcpu| vcpu.deinit();
         allocator.free(vcpus);
     }
     for (vcpus, 0..) |*vcpu, index| {
         try vcpu.init(vm_fd, run_size, @intCast(index));
         try initVcpu(vm_fd, vcpu.fd, config.resume_dir == null and index != 0);
-    }
-    defer {
-        for (vcpus) |*vcpu| vcpu.deinit();
-        allocator.free(vcpus);
     }
     const primary_vcpu = &vcpus[0];
     const vcpu_fd = primary_vcpu.fd;

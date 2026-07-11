@@ -87,11 +87,17 @@ if SPOREVM_ROOTFS_GROWTH_EXPERIMENTS=1 \
     --no-cache \
     -t local/run-disk-size:grown \
     "${failure_context}" >"${workdir}/forced-failure.stdout" 2>"${workdir}/forced-failure.stderr"; then
-  die "forced rootfs growth failure unexpectedly succeeded"
+  failure_status=0
+else
+  failure_status=$?
+fi
+if [[ "${failure_status}" -ne 2 ]]; then
+  cat "${workdir}/forced-failure.stderr" >&2
+  die "forced rootfs growth failure exited with status ${failure_status}, expected 2"
 fi
 if ! grep -Fq 'rootfs storage failed after a validated write; unpublished state was discarded' "${workdir}/forced-failure.stderr"; then
   cat "${workdir}/forced-failure.stderr" >&2
-  die "forced growth failure did not reach the guest resize boundary"
+  die "forced growth failure did not reach the validated storage failure path"
 fi
 if ! grep -Eq 'write_zeroes_backend_failures=[1-9][0-9]*' "${workdir}/forced-failure.stderr"; then
   cat "${workdir}/forced-failure.stderr" >&2
