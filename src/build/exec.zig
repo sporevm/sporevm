@@ -18,7 +18,7 @@ const max_rootfs_grow_response = run_mod.max_rootfs_grow_response;
 const p0_idle_probe_env = "SPOREVM_ROOTFS_GROWTH_P0_IDLE_MS";
 const max_p0_idle_probe_ms: u64 = 10_000;
 const build_producer_domain = "sporevm-build-producer-v2";
-const prepare_host_contract = "grow-v1-strict-request-v2;ext4-source-preflight-v1;ext4-superblock-postcondition-v1;ext4-ioctl-v1;noinit-itable-v1;virtio-write-zeroes-1x4m-v1;chunk-zero-map-v1";
+const prepare_host_contract = "grow-v1-strict-request-v2;ext4-source-preflight-v2;ext4-superblock-postcondition-v1;ext4-ioctl-v1;noinit-itable-v1;virtio-write-zeroes-1x4m-v1;chunk-zero-map-v1";
 // Provisional build-VM default; make this a `spore build` option when larger
 // workloads such as `bundle install`-style RUN steps need more memory.
 const build_vm_memory_bytes: u64 = 2 * 1024 * 1024 * 1024;

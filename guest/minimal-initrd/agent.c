@@ -3020,7 +3020,8 @@ static int grow_rootfs(struct client *client) {
   }
 
   struct ext4_disk_geometry before_disk;
-  if (read_ext4_disk_geometry(device_fd, &before_disk) != 0) {
+  if (read_ext4_disk_geometry(device_fd, &before_disk) != 0 ||
+      validate_ext4_growth_source(&before_disk) != 0) {
     close(device_fd);
     return send_client_error_exit(client, 126, "spore build: rootfs grow ext4 geometry failed\n");
   }
@@ -3065,6 +3066,7 @@ static int grow_rootfs(struct client *client) {
   struct ext4_disk_geometry after_disk;
   struct statfs after;
   int verify_rc = read_ext4_disk_geometry(device_fd, &after_disk);
+  if (verify_rc == 0 && validate_ext4_growth_source(&after_disk) != 0) verify_rc = -1;
   if (verify_rc == 0) verify_rc = fstatfs(fs_fd, &after);
   if (close(fs_fd) != 0) verify_rc = -1;
   if (close(device_fd) != 0) verify_rc = -1;
