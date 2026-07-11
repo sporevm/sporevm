@@ -41,6 +41,8 @@ EAGER_ROOTFS_ENV = "SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCHMARK"
 ROOTFS_TRACE_ENV = "SPOREVM_ROOTFS_TRACE"
 ROOTFS_TRACE_SUMMARY_ONLY_ENV = "SPOREVM_ROOTFS_TRACE_SUMMARY_ONLY"
 LAZY_CAS_TRACE_VERSION = 1
+SHA256_PINNED_IMAGE_REF_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
+LOCAL_BLAKE3_PINNED_IMAGE_REF_RE = re.compile(r"^local/[^@\s]+@blake3:[0-9a-f]{64}$")
 LAZY_CAS_TRACE_INT_FIELDS = {
     "index_payload_bytes": "lazy_cas_index_payload_bytes",
     "total_chunks": "lazy_cas_total_chunks",
@@ -55,7 +57,7 @@ LAZY_CAS_TRACE_MS_FIELDS = {
     "runtime_open_ns": "lazy_cas_runtime_open_ms",
     "index_attach_ns": "lazy_cas_index_attach_ms",
     "fault_total_ns": "lazy_cas_fault_service_ms",
-    "object_open_ns": "lazy_cas_object_open_ms",
+    "object_prepare_ns": "lazy_cas_object_prepare_ms",
     "object_read_ns": "lazy_cas_object_read_ms",
     "object_verify_ns": "lazy_cas_object_verify_ms",
     "sparse_write_ns": "lazy_cas_sparse_write_ms",
@@ -104,7 +106,7 @@ PHASE_METRIC_FIELDS = (
     "lazy_cas_runtime_open_ms",
     "lazy_cas_index_attach_ms",
     "lazy_cas_fault_service_ms",
-    "lazy_cas_object_open_ms",
+    "lazy_cas_object_prepare_ms",
     "lazy_cas_object_read_ms",
     "lazy_cas_object_verify_ms",
     "lazy_cas_sparse_write_ms",
@@ -432,7 +434,7 @@ def parse_lazy_cas_trace_metrics(path: Path) -> dict[str, object]:
     metrics.update({metric: summary[raw] for raw, metric in LAZY_CAS_TRACE_INT_FIELDS.items()})
     metrics.update({metric: summary[raw] / 1_000_000 for raw, metric in LAZY_CAS_TRACE_MS_FIELDS.items()})
     total_ns = summary["fault_total_ns"]
-    phase_ns = sum(summary[name] for name in ("object_open_ns", "object_read_ns", "object_verify_ns", "sparse_write_ns"))
+    phase_ns = sum(summary[name] for name in ("object_prepare_ns", "object_read_ns", "object_verify_ns", "sparse_write_ns"))
     metrics["lazy_cas_other_ms"] = max(0, total_ns - phase_ns) / 1_000_000
     initial_chunks = summary["cas_chunks_initial"]
     metrics["lazy_cas_working_set_pct"] = (
@@ -477,6 +479,13 @@ def rootfs_digest_cache_path(cache_root: Path, digest: str) -> Path:
     if len(hex_digest) != 64 or any(c not in "0123456789abcdef" for c in hex_digest):
         die(f"invalid rootfs digest for cache path: {digest}")
     return cache_root / "by-digest" / "blake3" / f"{hex_digest}.ext4"
+
+
+def is_pinned_image_ref(value: str) -> bool:
+    return (
+        SHA256_PINNED_IMAGE_REF_RE.search(value) is not None
+        or LOCAL_BLAKE3_PINNED_IMAGE_REF_RE.fullmatch(value) is not None
+    )
 
 
 def parse_rootfs_import_stdout(path: Path) -> dict[str, object]:
@@ -733,7 +742,7 @@ class BenchmarkRunner:
             die(f"build failed rc={rc} elapsed_ms={elapsed_ms} error={error or ''} stderr={stderr}")
 
     def resolve_image(self) -> None:
-        if "@sha256:" in self.args.image:
+        if is_pinned_image_ref(self.args.image):
             self.effective_image = self.args.image
             return
         argv = [str(self.spore_bin), "rootfs", "resolve", self.args.image, "--platform", self.args.platform]
@@ -758,7 +767,7 @@ class BenchmarkRunner:
                 return
             die(f"rootfs resolve failed rc={rc} elapsed_ms={elapsed_ms} error={error or ''} stderr={stderr}")
         resolved = stdout.read_text(encoding="utf-8").strip()
-        if "@sha256:" not in resolved:
+        if not is_pinned_image_ref(resolved):
             die(f"rootfs resolve did not return a digest-pinned image ref: {resolved}")
         self.effective_image = resolved
         self.emit({
@@ -910,22 +919,26 @@ class BenchmarkRunner:
             data = parse_json_file(metadata_path)
             if not isinstance(data, dict):
                 continue
+            if data.get("resolved_image_ref") != self.effective_image:
+                continue
             rootfs_path_raw = data.get("rootfs_path")
             rootfs_size = data.get("rootfs_size")
             storage = data.get("rootfs_storage")
-            if not isinstance(rootfs_path_raw, str) or not isinstance(rootfs_size, int) or not isinstance(storage, dict):
+            if not isinstance(rootfs_size, int) or not isinstance(storage, dict):
                 continue
             index_digest = storage.get("index_digest")
             if not isinstance(index_digest, str) or not index_digest.startswith("blake3:"):
                 continue
-            rootfs_path = Path(rootfs_path_raw)
-            if not rootfs_path.is_absolute():
-                rootfs_path = (metadata_path.parent / rootfs_path).resolve()
-            if not rootfs_path.is_file():
-                continue
+            rootfs_path: Path | None = None
+            if isinstance(rootfs_path_raw, str) and rootfs_path_raw:
+                candidate = Path(rootfs_path_raw)
+                if not candidate.is_absolute():
+                    candidate = (metadata_path.parent / candidate).resolve()
+                if candidate.is_file():
+                    rootfs_path = candidate
             records.append({
                 "metadata_path": str(metadata_path),
-                "rootfs_path": str(rootfs_path),
+                "rootfs_path": str(rootfs_path) if rootfs_path is not None else None,
                 "rootfs_size": rootfs_size,
                 "index_digest": index_digest,
                 "flat_path": str(rootfs_digest_cache_path(self.rootfs_cache_dir, index_digest)),
@@ -949,7 +962,10 @@ class BenchmarkRunner:
     def restore_flat_materializations(self, records: list[dict[str, object]]) -> int:
         count = 0
         for record in records:
-            source_path = Path(str(record["rootfs_path"]))
+            rootfs_path = record.get("rootfs_path")
+            if not isinstance(rootfs_path, str):
+                continue
+            source_path = Path(rootfs_path)
             flat_path = Path(str(record["flat_path"]))
             if flat_path.exists():
                 continue
@@ -1754,7 +1770,7 @@ def self_test() -> None:
             '"index_attach_ns":3000000,"index_payload_bytes":9000,"total_chunks":100,'
             '"cas_chunks_initial":80,"cas_chunks_remaining":60,"fault_attempts":20,'
             '"fault_errors":0,"unique_chunks":20,"fault_bytes":1310720,'
-            '"fault_total_ns":10000000,"object_open_ns":4000000,"object_read_ns":2000000,'
+            '"fault_total_ns":10000000,"object_prepare_ns":4000000,"object_read_ns":2000000,'
             '"object_verify_ns":1000000,"sparse_write_ns":2000000}\n',
             encoding="utf-8",
         )
@@ -1846,18 +1862,28 @@ def self_test() -> None:
         cache_root = Path(tmp) / "cache"
         cache_root.mkdir()
         digest = "blake3:" + ("a" * 64)
+        assert is_pinned_image_ref("local/test@blake3:" + ("a" * 64))
+        assert is_pinned_image_ref("docker.io/library/test@sha256:" + ("b" * 64))
+        assert not is_pinned_image_ref("docker.io/library/test@blake3:" + ("a" * 64))
+        assert not is_pinned_image_ref("local/test:latest")
+        assert not is_pinned_image_ref("local/test@blake3:abc")
         assert rootfs_digest_cache_path(cache_root, digest) == cache_root / "by-digest" / "blake3" / f"{'a' * 64}.ext4"
         rootfs_path = cache_root / "image.ext4"
         rootfs_path.write_bytes(b"rootfs")
-        (cache_root / "image.json").write_text(json.dumps({
+        cache_runner = object.__new__(BenchmarkRunner)
+        cache_runner.rootfs_cache_dir = cache_root
+        cache_runner.effective_image = "local/test@blake3:" + ("c" * 64)
+        metadata = {
+            "resolved_image_ref": cache_runner.effective_image,
             "rootfs_path": str(rootfs_path),
             "rootfs_size": 6,
             "rootfs_storage": {
                 "index_digest": digest,
             },
-        }), encoding="utf-8")
-        cache_runner = object.__new__(BenchmarkRunner)
-        cache_runner.rootfs_cache_dir = cache_root
+        }
+        (cache_root / "image.json").write_text(json.dumps(metadata), encoding="utf-8")
+        unrelated = metadata | {"resolved_image_ref": "local/other@blake3:" + ("d" * 64)}
+        (cache_root / "unrelated.json").write_text(json.dumps(unrelated), encoding="utf-8")
         records = BenchmarkRunner.image_rootfs_cache_records(cache_runner)
         assert len(records) == 1
         assert records[0]["index_digest"] == digest
@@ -1871,6 +1897,14 @@ def self_test() -> None:
         restored_count = BenchmarkRunner.restore_flat_materializations(cache_runner, records)
         assert restored_count == 1
         assert flat_path.read_bytes() == b"rootfs"
+        flat_path.unlink()
+        metadata["rootfs_path"] = ""
+        (cache_root / "image.json").write_text(json.dumps(metadata), encoding="utf-8")
+        records = BenchmarkRunner.image_rootfs_cache_records(cache_runner)
+        assert len(records) == 1
+        assert records[0]["rootfs_path"] is None
+        assert BenchmarkRunner.restore_flat_materializations(cache_runner, records) == 0
+        assert not flat_path.exists()
         runner = object.__new__(BenchmarkRunner)
         runner.run_id = "self-test"
         runner.raw_path = Path(tmp) / "results.jsonl"

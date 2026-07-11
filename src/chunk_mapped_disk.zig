@@ -83,7 +83,7 @@ const LazyCasTraceStats = struct {
     unique_chunks: u64 = 0,
     fault_bytes: u64 = 0,
     fault_total_ns: u64 = 0,
-    object_open_ns: u64 = 0,
+    object_prepare_ns: u64 = 0,
     object_read_ns: u64 = 0,
     object_verify_ns: u64 = 0,
     sparse_write_ns: u64 = 0,
@@ -968,7 +968,7 @@ pub const ChunkMappedDisk = struct {
                 trace.stats.fault_errors +|= 1;
             }
             trace.stats.fault_total_ns +|= elapsedSince(fault_start_ns);
-            trace.stats.object_open_ns +|= object.open_ns;
+            trace.stats.object_prepare_ns +|= object.prepare_ns;
             trace.stats.object_read_ns +|= object.read_ns;
             trace.stats.object_verify_ns +|= object.verify_ns;
             trace.stats.sparse_write_ns +|= write_ns;
@@ -978,11 +978,14 @@ pub const ChunkMappedDisk = struct {
     fn appendLazyCasTrace(self: *ChunkMappedDisk) void {
         const trace = self.lazy_cas_trace orelse return;
         const stats = trace.stats;
-        const remaining = stats.cas_chunks_initial -| stats.unique_chunks;
+        var remaining: u64 = 0;
+        for (self.sources) |source| {
+            if (source == .cas) remaining +|= 1;
+        }
         var line_buf: [1024]u8 = undefined;
         const line = std.fmt.bufPrint(
             &line_buf,
-            "{{\"event\":\"lazy_cas_fault_summary\",\"version\":1,\"runtime_open_ns\":{d},\"index_attach_ns\":{d},\"index_payload_bytes\":{d},\"total_chunks\":{d},\"cas_chunks_initial\":{d},\"cas_chunks_remaining\":{d},\"fault_attempts\":{d},\"fault_errors\":{d},\"unique_chunks\":{d},\"fault_bytes\":{d},\"fault_total_ns\":{d},\"object_open_ns\":{d},\"object_read_ns\":{d},\"object_verify_ns\":{d},\"sparse_write_ns\":{d}}}\n",
+            "{{\"event\":\"lazy_cas_fault_summary\",\"version\":1,\"runtime_open_ns\":{d},\"index_attach_ns\":{d},\"index_payload_bytes\":{d},\"total_chunks\":{d},\"cas_chunks_initial\":{d},\"cas_chunks_remaining\":{d},\"fault_attempts\":{d},\"fault_errors\":{d},\"unique_chunks\":{d},\"fault_bytes\":{d},\"fault_total_ns\":{d},\"object_prepare_ns\":{d},\"object_read_ns\":{d},\"object_verify_ns\":{d},\"sparse_write_ns\":{d}}}\n",
             .{
                 stats.runtime_open_ns,
                 stats.index_attach_ns,
@@ -995,7 +998,7 @@ pub const ChunkMappedDisk = struct {
                 stats.unique_chunks,
                 stats.fault_bytes,
                 stats.fault_total_ns,
-                stats.object_open_ns,
+                stats.object_prepare_ns,
                 stats.object_read_ns,
                 stats.object_verify_ns,
                 stats.sparse_write_ns,

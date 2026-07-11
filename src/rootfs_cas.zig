@@ -56,7 +56,7 @@ pub const InstallResult = struct {
 };
 
 pub const ManifestObjectReadStats = struct {
-    open_ns: u64 = 0,
+    prepare_ns: u64 = 0,
     read_ns: u64 = 0,
     verify_ns: u64 = 0,
 };
@@ -648,7 +648,7 @@ fn readVerifiedManifestObjectInner(
     const path_start_ns = if (stats != null) monotonicNs() else 0;
     const object_path = try manifestObjectPath(allocator, cache_root, object_digest);
     defer allocator.free(object_path);
-    if (stats) |value| value.open_ns +|= elapsedNs(path_start_ns);
+    if (stats) |value| value.prepare_ns +|= elapsedNs(path_start_ns);
     const object = try readFileExactTimed(allocator, object_path, expected_size, stats);
     errdefer allocator.free(object);
     const verify_start_ns = if (stats != null) monotonicNs() else 0;
@@ -833,7 +833,7 @@ fn readFileAllTimed(
     max: usize,
     stats: ?*ManifestObjectReadStats,
 ) SourceError![]u8 {
-    const open_start_ns = if (stats != null) monotonicNs() else 0;
+    const prepare_start_ns = if (stats != null) monotonicNs() else 0;
     const pathz = try allocator.dupeZ(u8, path);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
@@ -843,7 +843,7 @@ fn readFileAllTimed(
     if (size > max) return error.BadChunk;
     const data = try allocator.alloc(u8, size);
     errdefer allocator.free(data);
-    if (stats) |value| value.open_ns +|= elapsedNs(open_start_ns);
+    if (stats) |value| value.prepare_ns +|= elapsedNs(prepare_start_ns);
     const read_start_ns = if (stats != null) monotonicNs() else 0;
     try preadExact(fd, data, 0);
     if (stats) |value| value.read_ns +|= elapsedNs(read_start_ns);

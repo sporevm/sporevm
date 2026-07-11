@@ -779,6 +779,8 @@ test "runtime disk lazily faults rootfs cas chunks when the flat artifact is mis
     try Io.Dir.cwd().deleteFile(io, first_chunk_path);
     try runtime.chunk_mapped.?.readAt(&readback, 0);
     try std.testing.expectEqualStrings("abcd", &readback);
+    // Non-fault transitions also reduce the remaining lazy working set.
+    try runtime.chunk_mapped.?.markZeroChunk(1);
     // Lazy fault-in promotes into the sparse runtime base, not the by-digest
     // materialization cache.
     try std.testing.expect(!try rootfs_cache.regularFileNoSymlink(io, digest_path));
@@ -789,7 +791,7 @@ test "runtime disk lazily faults rootfs cas chunks when the flat artifact is mis
     try std.testing.expect(std.mem.indexOf(u8, trace, "\"event\":\"block_source_read\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, trace, "\"event\":\"lazy_cas_fault_summary\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, trace, "\"cas_chunks_initial\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, trace, "\"cas_chunks_remaining\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "\"cas_chunks_remaining\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, trace, "\"fault_attempts\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, trace, "\"fault_errors\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, trace, "\"unique_chunks\":1") != null);
