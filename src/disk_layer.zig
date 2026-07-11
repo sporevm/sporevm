@@ -48,6 +48,61 @@ pub const ActiveHead = union(enum) {
     }
 };
 
+const DiskSnapshotMetrics = struct {
+    logical_bytes: u64,
+    chunks: u64,
+    dirty_chunks: usize,
+    non_dirty_chunks: u64,
+    full_scan: bool,
+    sealed_candidate_chunks: usize,
+    sealed_chunks: u64,
+    parent_chunks_reused: usize,
+    parent: chunk_mapped_disk.ParentPublicationStats,
+    zero_scan_us: u64,
+    hash_us: u64,
+    object_write_us: u64,
+    index_bytes: u64,
+    index_encode_us: u64,
+    index_publish_us: u64,
+    total_us: u64,
+};
+
+fn formatDiskSnapshotMetrics(buf: []u8, metrics: DiskSnapshotMetrics) std.fmt.BufPrintError![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "disk snapshot metrics: schema=1 logical_bytes={d} chunks={d} dirty_chunks={d} non_dirty_chunks={d} full_scan={} sealed_candidate_chunks={d} sealed_chunks={d} parent_chunks_reused={d} parent_referenced_bytes={d} parent_objects_linked={d} parent_objects_reused={d} parent_objects_copied={d} parent_object_bytes={d} parent_link_bytes={d} parent_reuse_bytes={d} parent_copy_bytes={d} parent_link_us={d} parent_reuse_us={d} parent_copy_us={d} parent_sync_us={d} zero_scan_us={d} hash_us={d} object_write_us={d} index_bytes={d} index_encode_us={d} index_publish_us={d} total_us={d}",
+        .{
+            metrics.logical_bytes,
+            metrics.chunks,
+            metrics.dirty_chunks,
+            metrics.non_dirty_chunks,
+            metrics.full_scan,
+            metrics.sealed_candidate_chunks,
+            metrics.sealed_chunks,
+            metrics.parent_chunks_reused,
+            metrics.parent.referenced_bytes,
+            metrics.parent.linked.objects,
+            metrics.parent.reused.objects,
+            metrics.parent.copied.objects,
+            metrics.parent.object_bytes,
+            metrics.parent.linked.bytes,
+            metrics.parent.reused.bytes,
+            metrics.parent.copied.bytes,
+            metrics.parent.linked.ns / std.time.ns_per_us,
+            metrics.parent.reused.ns / std.time.ns_per_us,
+            metrics.parent.copied.ns / std.time.ns_per_us,
+            metrics.parent.sync_ns / std.time.ns_per_us,
+            metrics.zero_scan_us,
+            metrics.hash_us,
+            metrics.object_write_us,
+            metrics.index_bytes,
+            metrics.index_encode_us,
+            metrics.index_publish_us,
+            metrics.total_us,
+        },
+    );
+}
+
 pub const SnapshotState = struct {
     base: spore.Disk,
     active: ActiveHead,
@@ -59,31 +114,33 @@ pub const SnapshotState = struct {
         if (self.active.dirtyClusterCount() == 0) {
             if (std.mem.eql(u8, self.base.kind, spore.disk_kind_cow_block) and !self.active.hasPublishedSnapshot()) return null;
         }
-        const start_ms = try monotonicMs();
+        const start_ns = try monotonicNs();
         const dirty_chunks = self.active.dirtyClusterCount();
         var stats: chunk_mapped_disk.SnapshotStats = .{};
         const result = switch (self.active) {
             .chunk_mapped => |disk| try disk.snapshotIndexWithStats(dir, self.base.device, quiesced, &stats),
         };
-        std.log.info(
-            "disk snapshot metrics: logical_mib={d} chunks={d} dirty_chunks={d} full_scan={} sealed_chunks={d} parent_chunks_reused={d} parent_objects_linked={d} parent_objects_reused={d} parent_objects_copied={d} parent_object_mib={d} zero_scan_ms={d} hash_ms={d} object_write_ms={d} total_ms={d}",
-            .{
-                result.size / 1024 / 1024,
-                std.math.divCeil(u64, result.size, result.chunk_size) catch 0,
-                dirty_chunks,
-                stats.full_scan,
-                stats.work.sealed_chunks,
-                stats.parent_chunks_reused,
-                stats.parent_objects_linked,
-                stats.parent_objects_reused,
-                stats.parent_objects_copied,
-                stats.parent_object_bytes / 1024 / 1024,
-                stats.work.zero_scan_ns / std.time.ns_per_ms,
-                stats.work.hash_ns / std.time.ns_per_ms,
-                stats.work.chunk_write_ns / std.time.ns_per_ms,
-                (try monotonicMs()) -| start_ms,
-            },
-        );
+        const chunks = std.math.divCeil(u64, result.size, result.chunk_size) catch 0;
+        var metrics_buf: [2048]u8 = undefined;
+        const metrics = formatDiskSnapshotMetrics(&metrics_buf, .{
+            .logical_bytes = result.size,
+            .chunks = chunks,
+            .dirty_chunks = dirty_chunks,
+            .non_dirty_chunks = chunks -| dirty_chunks,
+            .full_scan = stats.full_scan,
+            .sealed_candidate_chunks = stats.sealed_candidate_chunks,
+            .sealed_chunks = stats.work.sealed_chunks,
+            .parent_chunks_reused = stats.parent_chunks_reused,
+            .parent = stats.parent,
+            .zero_scan_us = stats.work.zero_scan_ns / std.time.ns_per_us,
+            .hash_us = stats.work.hash_ns / std.time.ns_per_us,
+            .object_write_us = stats.work.chunk_write_ns / std.time.ns_per_us,
+            .index_bytes = stats.index_bytes,
+            .index_encode_us = stats.index_encode_ns / std.time.ns_per_us,
+            .index_publish_us = stats.index_publish_ns / std.time.ns_per_us,
+            .total_us = ((try monotonicNs()) -| start_ns) / std.time.ns_per_us,
+        }) catch return error.ShortWrite;
+        std.log.info("{s}", .{metrics});
         return result;
     }
 
@@ -128,10 +185,40 @@ pub fn forkBaseline(base: spore.Disk) Error!runtime_disk_fork.Baseline {
     return .{ .kind = kind, .identity = base.base };
 }
 
-fn monotonicMs() Error!u64 {
+fn monotonicNs() Error!u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return error.IoFailed;
-    return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "disk snapshot schema-1 metric matches parser golden record" {
+    var buf: [2048]u8 = undefined;
+    const actual = try formatDiskSnapshotMetrics(&buf, .{
+        .logical_bytes = 196608,
+        .chunks = 3,
+        .dirty_chunks = 1,
+        .non_dirty_chunks = 2,
+        .full_scan = false,
+        .sealed_candidate_chunks = 1,
+        .sealed_chunks = 1,
+        .parent_chunks_reused = 2,
+        .parent = .{
+            .referenced_bytes = 131072,
+            .object_bytes = 131072,
+            .linked = .{ .objects = 1, .bytes = 65536, .ns = 11 * std.time.ns_per_us },
+            .reused = .{ .objects = 1, .bytes = 65536, .ns = 12 * std.time.ns_per_us },
+            .sync_ns = 13 * std.time.ns_per_us,
+        },
+        .zero_scan_us = 1,
+        .hash_us = 2,
+        .object_write_us = 3,
+        .index_bytes = 100,
+        .index_encode_us = 4,
+        .index_publish_us = 5,
+        .total_us = 51,
+    });
+    const golden = std.mem.trimEnd(u8, @embedFile("testdata/disk-snapshot-metrics-v1.txt"), "\n");
+    try std.testing.expectEqualStrings(golden, actual);
 }
 
 pub fn createTempOverlay(allocator: std.mem.Allocator) Error!TempOverlay {

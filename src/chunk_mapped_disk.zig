@@ -127,14 +127,47 @@ pub const ExportForkOptions = struct {
     quiesced: bool = false,
 };
 
+pub const ParentObjectPublication = enum {
+    linked,
+    reused_existing,
+    copied,
+};
+
+pub const PublicationClassStats = struct {
+    objects: usize = 0,
+    bytes: u64 = 0,
+    ns: u64 = 0,
+};
+
+pub const ParentPublicationStats = struct {
+    referenced_bytes: u64 = 0,
+    object_bytes: u64 = 0,
+    linked: PublicationClassStats = .{},
+    reused: PublicationClassStats = .{},
+    copied: PublicationClassStats = .{},
+    sync_ns: u64 = 0,
+
+    fn record(self: *ParentPublicationStats, outcome: ParentObjectPublication, bytes: usize, elapsed_ns: u64) void {
+        const class = switch (outcome) {
+            .linked => &self.linked,
+            .reused_existing => &self.reused,
+            .copied => &self.copied,
+        };
+        class.objects += 1;
+        class.bytes +|= bytes;
+        class.ns +|= elapsed_ns;
+        self.object_bytes +|= bytes;
+    }
+};
+
 pub const SnapshotStats = struct {
     full_scan: bool = false,
     sealed_candidate_chunks: usize = 0,
     parent_chunks_reused: usize = 0,
-    parent_objects_linked: usize = 0,
-    parent_objects_reused: usize = 0,
-    parent_objects_copied: usize = 0,
-    parent_object_bytes: u64 = 0,
+    parent: ParentPublicationStats = .{},
+    index_bytes: u64 = 0,
+    index_encode_ns: u64 = 0,
+    index_publish_ns: u64 = 0,
     work: chunk_sealer.WorkStats = .{},
 };
 
@@ -702,10 +735,7 @@ pub const ChunkMappedDisk = struct {
         const use_parent_index = self.canReuseParentIndex();
         var sealed_candidate_chunks: usize = 0;
         var parent_chunks_reused: usize = 0;
-        var parent_objects_linked: usize = 0;
-        var parent_objects_reused: usize = 0;
-        var parent_objects_copied: usize = 0;
-        var parent_object_bytes: u64 = 0;
+        var parent_stats: ParentPublicationStats = .{};
         var linked_parent_object = false;
         var published_parent_objects = std.AutoHashMap(chunk.ChunkId, void).init(self.allocator);
         defer published_parent_objects.deinit();
@@ -716,6 +746,8 @@ pub const ChunkMappedDisk = struct {
             const parent_id = parent_digest_cursor.next(logical_chunk);
             if (use_parent_index and !self.needsSnapshotSeal(chunk_index)) {
                 if (parent_id) |id| {
+                    const object_len = try self.chunkLen(chunk_index);
+                    parent_stats.referenced_bytes +|= object_len;
                     var digest_buf: ManifestDigest = undefined;
                     const digest = manifestDigest(id, &digest_buf);
                     try appendChunkEntry(self.allocator, &chunks, chunk_index, digest);
@@ -723,16 +755,10 @@ pub const ChunkMappedDisk = struct {
                     if (!std.mem.eql(u8, self.parent_root.?, dir)) {
                         const entry = try published_parent_objects.getOrPut(id);
                         if (!entry.found_existing) {
-                            const object_len = try self.chunkLen(chunk_index);
-                            switch (try self.publishParentObject(self.parent_root.?, dir, digest, object_len, &work_stats)) {
-                                .linked => {
-                                    parent_objects_linked += 1;
-                                    linked_parent_object = true;
-                                },
-                                .reused_existing => parent_objects_reused += 1,
-                                .copied => parent_objects_copied += 1,
-                            }
-                            parent_object_bytes +|= object_len;
+                            const publish_start_ns = try monotonicNs();
+                            const outcome = try self.publishParentObject(self.parent_root.?, dir, digest, object_len);
+                            parent_stats.record(outcome, object_len, elapsedSince(publish_start_ns));
+                            if (outcome == .linked) linked_parent_object = true;
                         }
                     }
                 } else {
@@ -744,7 +770,11 @@ pub const ChunkMappedDisk = struct {
             sealed_candidate_chunks += 1;
             try self.sealSnapshotChunk(dir, chunk_index, buf, &chunks, &zero_chunks, &work_stats);
         }
-        if (linked_parent_object) try chunk_sealer.fsyncDirPath(self.allocator, object_dir);
+        if (linked_parent_object) {
+            const sync_start_ns = try monotonicNs();
+            try chunk_sealer.fsyncDirPath(self.allocator, object_dir);
+            parent_stats.sync_ns = elapsedSince(sync_start_ns);
+        }
 
         const chunk_slice = try chunks.toOwnedSlice(self.allocator);
         defer {
@@ -763,7 +793,9 @@ pub const ChunkMappedDisk = struct {
             .chunks = chunk_slice,
             .zero_chunks = zero_slice,
         };
+        const index_encode_start_ns = try monotonicNs();
         const encoded_index = try disk_index.encodeCanonicalAlloc(self.allocator, index);
+        const index_encode_ns = elapsedSince(index_encode_start_ns);
         defer self.allocator.free(encoded_index.bytes);
         const index_digest = encoded_index.digest;
         errdefer self.allocator.free(index_digest);
@@ -773,7 +805,9 @@ pub const ChunkMappedDisk = struct {
         try chunk_sealer.ensureDirPath(self.allocator, index_dir);
         // Durable-index invariant: all object writes above have fsynced their
         // data and parent directory; publish the index last via temp/fsync/rename.
+        const index_publish_start_ns = try monotonicNs();
         try chunk_sealer.writeFileAtomicDurable(self.allocator, index_path, encoded_index.bytes, 0o444);
+        const index_publish_ns = elapsedSince(index_publish_start_ns);
         const next_parent = try self.parentStateFrom(dir, index);
         errdefer next_parent.deinit(self.allocator);
         const kind = try self.allocator.dupe(u8, spore.disk_kind_chunk_index);
@@ -803,10 +837,10 @@ pub const ChunkMappedDisk = struct {
                 .full_scan = !use_parent_index,
                 .sealed_candidate_chunks = sealed_candidate_chunks,
                 .parent_chunks_reused = parent_chunks_reused,
-                .parent_objects_linked = parent_objects_linked,
-                .parent_objects_reused = parent_objects_reused,
-                .parent_objects_copied = parent_objects_copied,
-                .parent_object_bytes = parent_object_bytes,
+                .parent = parent_stats,
+                .index_bytes = encoded_index.bytes.len,
+                .index_encode_ns = index_encode_ns,
+                .index_publish_ns = index_publish_ns,
                 .work = work_stats,
             };
         }
@@ -879,19 +913,12 @@ pub const ChunkMappedDisk = struct {
         }
     }
 
-    const ParentObjectPublication = enum {
-        linked,
-        reused_existing,
-        copied,
-    };
-
     fn publishParentObject(
         self: *ChunkMappedDisk,
         parent_root: []const u8,
         dir: []const u8,
         digest: []const u8,
         expected_size: usize,
-        work_stats: *chunk_sealer.WorkStats,
     ) Error!ParentObjectPublication {
         const source_path = try rootfs_cas.manifestObjectPath(self.allocator, parent_root, digest);
         defer self.allocator.free(source_path);
@@ -905,7 +932,8 @@ pub const ChunkMappedDisk = struct {
 
         const data = try rootfs_cas.readVerifiedManifestObject(self.allocator, parent_root, digest, expected_size);
         defer self.allocator.free(data);
-        _ = try chunk_sealer.writePathAllIfMissingTimedResult(self.allocator, dest_path, data, work_stats);
+        var copy_stats: chunk_sealer.WorkStats = .{};
+        _ = try chunk_sealer.writePathAllIfMissingTimedResult(self.allocator, dest_path, data, &copy_stats);
         return .copied;
     }
 
@@ -1522,8 +1550,12 @@ test "zero marking and growth advance dirty state" {
     try std.testing.expect(baseline_id.eql(disk.digest_index.get(0) orelse return error.TestExpectedEqual));
     try disk.markZeroChunk(0);
     try std.testing.expectEqual(@as(usize, 2), disk.dirtyChunkCount());
-    const grown = try disk.snapshotIndex(spore_dir, .{ .mmio_slot = 1 }, true);
+    var stats: SnapshotStats = .{};
+    const grown = try disk.snapshotIndexWithStats(spore_dir, .{ .mmio_slot = 1 }, true, &stats);
     defer freeTestDisk(allocator, grown);
+    // Zero-classified dirty chunks are still sealed candidates and work items.
+    try std.testing.expectEqual(@as(usize, 2), stats.sealed_candidate_chunks);
+    try std.testing.expectEqual(@as(u64, 2), stats.work.sealed_chunks);
     try std.testing.expectEqual(@as(u64, chunk_size * 2), grown.size);
     try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
 }
@@ -1560,6 +1592,7 @@ test "snapshot writes disk index and chunk objects" {
     try std.testing.expect(stats.full_scan);
     try std.testing.expectEqual(@as(usize, 1), stats.sealed_candidate_chunks);
     try std.testing.expectEqual(@as(u64, 1), stats.work.sealed_chunks);
+    try std.testing.expect(stats.index_bytes > 0);
 
     try std.testing.expectEqualStrings(spore.disk_kind_chunk_index, manifest_disk.kind);
     try std.testing.expectEqual(@as(u64, spore.disk_chunk_size), manifest_disk.chunk_size);
@@ -1794,8 +1827,14 @@ test "snapshot from parent index seals only dirty chunks and matches full rescan
     try std.testing.expectEqual(dirty_count, snapshot_stats.sealed_candidate_chunks);
     try std.testing.expectEqual(@as(u64, @intCast(dirty_count)), snapshot_stats.work.sealed_chunks);
     try std.testing.expect(snapshot_stats.parent_chunks_reused > 0);
-    try std.testing.expect(snapshot_stats.parent_objects_linked + snapshot_stats.parent_objects_reused + snapshot_stats.parent_objects_copied > 0);
-    try std.testing.expect(snapshot_stats.parent_object_bytes > 0);
+    try std.testing.expect(snapshot_stats.parent.linked.objects + snapshot_stats.parent.reused.objects + snapshot_stats.parent.copied.objects > 0);
+    try std.testing.expect(snapshot_stats.parent.object_bytes > 0);
+    try std.testing.expect(snapshot_stats.parent.referenced_bytes >= snapshot_stats.parent.object_bytes);
+    try std.testing.expectEqual(
+        snapshot_stats.parent.object_bytes,
+        snapshot_stats.parent.linked.bytes + snapshot_stats.parent.reused.bytes + snapshot_stats.parent.copied.bytes,
+    );
+    try std.testing.expect(snapshot_stats.index_bytes > 0);
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full_path, .data = model });
     const full_preload = try rootfs_cas.preloadPath(io, arena, full_cache, full_path, spore.disk_chunk_size);

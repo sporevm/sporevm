@@ -252,11 +252,41 @@ scripts/benchmark/hot-run-save.sh --spore-bin zig-out/bin/spore --backend kvm
 This prewarms `node:22-bookworm-slim`, then times fresh
 `spore run --image ... --save ... --save-on USR1` captures triggered by the
 same stdout marker used by the public Kubernetes runtime. Each capture records
-the disk snapshot metrics. The benchmark fails if a hot capture performs a
-full logical-rootfs scan instead of sealing only dirty chunks; use
-`--allow-full-scan` only when comparing historical binaries that predate the
-guardrail. Performance claims from this benchmark require a ReleaseSafe binary
-on Linux ARM64/KVM.
+the disk snapshot metrics as a schema-versioned JSON object. The benchmark
+fails if a hot capture performs a full logical-rootfs scan instead of sealing
+only dirty chunks. `--allow-full-scan` permits a schema-1 full scan but does not
+accept older, unversioned metric records. Performance claims from this
+benchmark require a ReleaseSafe binary on Linux ARM64/KVM.
+
+The `disk_metrics` object separates logical parent data referenced by the new
+index from what publication actually did. `parent_referenced_bytes` counts
+logical nonzero parent references before digest deduplication;
+`parent_object_bytes` is the unique parent data considered for publication.
+`parent_link_bytes`, `parent_reuse_bytes`, and `parent_copy_bytes` partition
+it. Their matching
+object counts and microsecond timings show whether save used same-filesystem
+hard links, found objects already present, or paid the cross-filesystem verified
+copy fallback. `parent_sync_us` records the final directory durability barrier
+after batched hard links. The record also reports dirty versus non-dirty chunks, index
+encoding/publication, dirty-object writes, and total disk snapshot time. RAM
+and whole-capture timings remain in the backend snapshot metric and the
+benchmark's `snapshot_metrics` and `duration_ms`; do not substitute either for
+disk snapshot cost. `snapshot_metrics` retains the backend's machine, device,
+generation, RAM, disk, manifest, and total snapshot millisecond breakdown.
+
+Use `--work-dir` and `--cache-dir` to make filesystem placement explicit. For
+example, placing both beneath the prepared NVMe scratch measures the normal
+same-filesystem path. Placing the cache on that scratch and the work directory
+on a different filesystem measures portable save-output copy cost. Verify the
+mounts with `findmnt -T` before interpreting the result. The disk parser is
+bounded to 4 KiB and the backend snapshot parser to 8 KiB. They reject
+duplicate, missing, malformed, or internally inconsistent required fields, and
+the disk schema also rejects unknown fields. A standalone regression test
+covers both:
+
+```console
+python3 scripts/benchmark/parse-save-metrics.py --self-test
+```
 
 The timed value is the product-path command duration from the underlying script,
 stored in the suite's existing `tti_ms` summary field so the same comparator can

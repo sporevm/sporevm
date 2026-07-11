@@ -16,8 +16,8 @@ run = "zig build --release=safe --prefix \"$HOME\""
 description = "Install optimized spore into ~/bin"
 
 [tasks.test]
-run = "zig build test"
-description = "Run unit tests"
+run = "zig build test && python3 scripts/benchmark/parse-save-metrics.py --self-test"
+description = "Run unit tests and benchmark parser contract checks"
 
 [tasks."test:rootfs-slow"]
 run = "zig build rootfs-slow-test"

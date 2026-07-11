@@ -15,10 +15,12 @@ Options:
   --memory VALUE            Guest memory (default: 1024mb)
   --iterations N            Timed captures (default: 5)
   --cache-dir PATH          Rootfs cache (default: benchmark workdir/cache)
+  --work-dir PATH           Parent for temporary run state and save outputs.
+                            Existing path; default: TMPDIR or /tmp.
   --output PATH             JSONL output (default: benchmark workdir/results.jsonl)
   --strace-output PATH      Linux only: write `strace -f -c` syscall summary.
                             Use one iteration for a focused profile.
-  --allow-full-scan         Historical comparison mode; do not enforce the
+  --allow-full-scan         Permit a schema-1 full scan; do not enforce the
                             dirty-bounded disk snapshot metric.
   --keep-workdir            Keep per-run spores and logs.
 EOF
@@ -49,6 +51,7 @@ image="docker.io/library/node:22-bookworm-slim"
 memory="1024mb"
 iterations=5
 cache_dir=""
+work_dir="${TMPDIR:-/tmp}"
 output=""
 strace_output=""
 allow_full_scan=0
@@ -62,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --memory) need_value "$1" "${2-}"; memory="$2"; shift 2 ;;
     --iterations) need_value "$1" "${2-}"; iterations="$2"; shift 2 ;;
     --cache-dir) need_value "$1" "${2-}"; cache_dir="$2"; shift 2 ;;
+    --work-dir) need_value "$1" "${2-}"; work_dir="$2"; shift 2 ;;
     --output) need_value "$1" "${2-}"; output="$2"; shift 2 ;;
     --strace-output) need_value "$1" "${2-}"; strace_output="$2"; shift 2 ;;
     --allow-full-scan) allow_full_scan=1; shift ;;
@@ -74,7 +78,8 @@ done
 [[ -x "${spore_bin}" ]] || die "spore binary is not executable: ${spore_bin}"
 [[ "${iterations}" =~ ^[1-9][0-9]*$ ]] || die "--iterations must be positive"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-hot-run-save.XXXXXX")"
+[[ -d "${work_dir}" ]] || die "--work-dir must be an existing directory: ${work_dir}"
+workdir="$(mktemp -d "${work_dir%/}/sporevm-hot-run-save.XXXXXX")"
 if [[ -z "${cache_dir}" ]]; then cache_dir="${workdir}/cache"; fi
 if [[ -z "${output}" ]]; then output="${workdir}/results.jsonl"; fi
 mkdir -p "${cache_dir}" "$(dirname "${output}")"
@@ -147,12 +152,20 @@ for iteration in $(seq 1 "${iterations}"); do
   duration_ms="$(( $(now_ms) - start_ms ))"
   rm -f "${events_pipe}"
 
-  disk_metrics="$(grep 'disk snapshot metrics:' "${stderr_path}" | tail -n 1 || true)"
-  if [[ "${allow_full_scan}" != "1" && "${disk_metrics}" != *"full_scan=false"* ]]; then
-    die "iteration ${iteration} did not report a dirty-bounded disk snapshot: ${disk_metrics:-missing metric}"
+  disk_metrics_line="$(grep 'disk snapshot metrics:' "${stderr_path}" | tail -n 1 || true)"
+  [[ -n "${disk_metrics_line}" ]] || die "iteration ${iteration} did not report disk snapshot metrics"
+  disk_metrics="$(python3 "${repo_root}/scripts/benchmark/parse-save-metrics.py" "${disk_metrics_line}")" || \
+    die "iteration ${iteration} reported malformed disk snapshot metrics"
+  snapshot_metrics_line="$(grep -E '(kvm|hvf) snapshot metrics:' "${stderr_path}" | tail -n 1 || true)"
+  [[ -n "${snapshot_metrics_line}" ]] || die "iteration ${iteration} did not report backend snapshot metrics"
+  snapshot_metrics="$(python3 "${repo_root}/scripts/benchmark/parse-save-metrics.py" --snapshot "${snapshot_metrics_line}")" || \
+    die "iteration ${iteration} reported malformed backend snapshot metrics"
+  full_scan="$(python3 -c 'import json,sys; print(str(json.loads(sys.argv[1])["full_scan"]).lower())' "${disk_metrics}")"
+  if [[ "${allow_full_scan}" != "1" && "${full_scan}" != "false" ]]; then
+    die "iteration ${iteration} did not report a dirty-bounded disk snapshot: ${disk_metrics}"
   fi
-  printf '{"phase":"capture","iteration":%d,"duration_ms":%d,"disk_metrics":%s,"save_dir":%s}\n' \
-    "${iteration}" "${duration_ms}" "$(json_string "${disk_metrics}")" "$(json_string "${save_dir}")" >>"${output}"
+  printf '{"phase":"capture","iteration":%d,"duration_ms":%d,"disk_metrics":%s,"snapshot_metrics":%s,"save_dir":%s}\n' \
+    "${iteration}" "${duration_ms}" "${disk_metrics}" "${snapshot_metrics}" "$(json_string "${save_dir}")" >>"${output}"
 done
 
 cat "${output}"
