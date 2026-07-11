@@ -925,30 +925,34 @@ pub const ChunkMappedDisk = struct {
     fn faultCasChunk(self: *ChunkMappedDisk, chunk_index: usize) Error!void {
         if (chunk_index >= self.sources.len) return error.OutOfRange;
         if (self.sources[chunk_index] != .cas) return;
-        const fault_start_ns = if (self.lazy_cas_trace != null) monotonicNs() catch 0 else 0;
+        const trace_enabled = self.lazy_cas_trace != null;
+        const fault_start_ns = if (trace_enabled) monotonicNs() catch 0 else 0;
         if (self.lazy_cas_trace) |*trace| trace.stats.fault_attempts +|= 1;
+        var fault_recorded = false;
+        var object_stats: rootfs_cas.ManifestObjectReadStats = .{};
+        var write_ns: u64 = 0;
+        defer if (trace_enabled and !fault_recorded) {
+            self.recordLazyCasFault(false, 0, fault_start_ns, write_ns, object_stats);
+        };
         const cache_root = self.cas_root orelse return error.BadManifest;
         if (self.cas_digests.len != self.sources.len) return error.BadManifest;
         const digest = self.cas_digests[chunk_index] orelse return error.BadManifest;
         const len = try self.chunkLen(chunk_index);
-        var object_stats: rootfs_cas.ManifestObjectReadStats = .{};
-        const data = if (self.lazy_cas_trace != null)
-            rootfs_cas.readVerifiedManifestObjectTimed(self.allocator, cache_root, digest, len, &object_stats) catch |err| {
-                self.recordLazyCasFault(false, 0, fault_start_ns, 0, object_stats);
-                return err;
-            }
+        const data = if (trace_enabled)
+            try rootfs_cas.readVerifiedManifestObjectTimed(self.allocator, cache_root, digest, len, &object_stats)
         else
             try rootfs_cas.readVerifiedManifestObject(self.allocator, cache_root, digest, len);
         defer self.allocator.free(data);
         const offset = std.math.mul(u64, chunk_index, self.chunk_size) catch return error.OutOfRange;
-        const write_start_ns = if (self.lazy_cas_trace != null) monotonicNs() catch 0 else 0;
+        const write_start_ns = if (trace_enabled) monotonicNs() catch 0 else 0;
         writeExact(self.base.fd, data, offset) catch |err| {
-            self.recordLazyCasFault(false, 0, fault_start_ns, elapsedSince(write_start_ns), object_stats);
+            write_ns = elapsedSince(write_start_ns);
             return err;
         };
-        const write_ns = if (self.lazy_cas_trace != null) elapsedSince(write_start_ns) else 0;
+        write_ns = if (trace_enabled) elapsedSince(write_start_ns) else 0;
         self.clearCasDigest(chunk_index);
         self.sources[chunk_index] = .base;
+        fault_recorded = true;
         self.recordLazyCasFault(true, len, fault_start_ns, write_ns, object_stats);
     }
 

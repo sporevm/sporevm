@@ -1064,6 +1064,7 @@ test "runtime disk reports missing cas object on first read of that chunk" {
     const tmp = "zig-cache/test-run-runtime-disk-lazy-cas-missing-object";
     const rootfs_path = tmp ++ "/source.ext4";
     const cache_root = tmp ++ "/cache";
+    const trace_path = tmp ++ "/lazy-cas-trace.jsonl";
     Io.Dir.cwd().deleteTree(io, tmp) catch {};
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
     try Io.Dir.cwd().createDirPath(io, tmp);
@@ -1090,6 +1091,9 @@ test "runtime disk reports missing cas object on first read of that chunk" {
     defer env.deinit();
     const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
     try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
+    const absolute_trace_path = try std.fs.path.resolve(arena, &.{trace_path});
+    try env.put(rootfs_trace_env, absolute_trace_path);
+    try env.put(rootfs_trace_summary_only_env, "1");
     const context = Context{ .io = io, .environ_map = &env };
 
     const rootfs = spore.Rootfs{
@@ -1100,7 +1104,8 @@ test "runtime disk reports missing cas object on first read of that chunk" {
     var runtime = try open(context, allocator, .{
         .rootfs = rootfs,
     });
-    defer runtime.deinit();
+    var runtime_open = true;
+    defer if (runtime_open) runtime.deinit();
 
     var readback: [4]u8 = undefined;
     try runtime.chunk_mapped.?.readAt(&readback, 0);
@@ -1109,6 +1114,13 @@ test "runtime disk reports missing cas object on first read of that chunk" {
     @memset(failed_read, 0xaa);
     try std.testing.expectError(error.MissingChunk, runtime.chunk_mapped.?.readAt(failed_read, 0));
     try std.testing.expect(std.mem.allEqual(u8, failed_read, 0xaa));
+
+    runtime.deinit();
+    runtime_open = false;
+    const trace = try Io.Dir.cwd().readFileAlloc(io, trace_path, arena, .limited(1 << 20));
+    try std.testing.expect(std.mem.indexOf(u8, trace, "\"fault_attempts\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "\"fault_errors\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "\"unique_chunks\":1") != null);
 }
 
 test "runtime disk lazy rootfs survives promoted chunk eviction and rejects corrupt unread chunks" {
