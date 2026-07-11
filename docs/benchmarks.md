@@ -166,6 +166,13 @@ percentage, and cumulative object preparation, read, verification, sparse
 write, and unclassified fault-service time. The trace contains no paths or
 digests.
 
+`lazy_cas_index_payload_bytes` measures the live runtime representation, not
+the canonical JSON index. Nonzero digests are one sorted array of raw BLAKE3
+IDs shared by lazy faults and snapshot-parent reuse. The focused
+`chunk_mapped_disk` ownership regression fixes the dense U7 case at 791,898
+bytes in four allocations, down from 3,704,220 bytes in 38,075 allocations,
+and covers sparse and all-zero indexes as well.
+
 ### Cold Import
 
 Cold import measures deterministic rootfs materialization without depending on

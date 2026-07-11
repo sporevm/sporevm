@@ -637,7 +637,7 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
     try std.testing.expect(runtime.chunk_mapped != null);
     try std.testing.expect(runtime.chunk_mapped.?.cas_root == null);
     try std.testing.expect(runtime.chunk_mapped.?.parent_root != null);
-    try std.testing.expectEqual(runtime.chunk_mapped.?.chunkCount(), runtime.chunk_mapped.?.parent_digests.len);
+    try std.testing.expectEqual(@as(usize, @intCast(preload_result.nonzero_chunks)), runtime.chunk_mapped.?.indexDigestCount());
     var readback: [4]u8 = undefined;
     try runtime.chunk_mapped.?.readAt(&readback, 0);
     try std.testing.expectEqualStrings("abcd", &readback);
