@@ -113,7 +113,7 @@ spore build ...
   `WRITE_ZEROES`, and still executed Dockerfile steps. Fully warm builds avoid
   boot; the edited incremental smoke boots once, executes four steps, and
   performs no resize.
-- **Native KVM result (2026-07-11, Linux ARM64/KVM):** branch commit `ab631dd`
+- **Native KVM result (2026-07-11, Linux ARM64/KVM):** rebased commit `b78da6c`
   passed native tests and ReleaseSafe assembly. The build/run smoke covered
   first preparation, prepared reuse, warm, `--no-cache`, and incremental
   paths functionally; the 2.25 GiB sparse-COPY smoke, run-commit lifecycle
@@ -131,7 +131,7 @@ spore build ...
   and prepared/no-growth samples of the exact historical fixture on the same
   host and commit. KVM warm and incremental paths passed functionally, but
   their performance gates also remain unmeasured.
-  Commit `f71e617` gives the KVM vCPU slice one cleanup owner and makes the
+  Rebased commit `9be8d24` gives the KVM vCPU slice one cleanup owner and makes the
   failure smoke require the exact CLI build-error status 2. Native unit tests,
   Zig formatting, ReleaseSafe assembly, and the full KVM disk-size smoke pass
   at that commit. The injected WRITE_ZEROES backend failure returns status 2,
@@ -300,10 +300,11 @@ In priority order:
 4. A clean appended zero is distinguishable from a dirty operation that
    changes old nonzero bytes to zero. The latter must replace the parent entry
    in child identity, but neither state needs a payload read or zero scan.
-5. Under a fully validated parent index, `parent_digests[i] == null` means the
-   canonical parent chunk is zero; it never means unknown. Growth may append a
-   null digest only with source state `.zero`, and the child index must emit
-   explicit `zero_chunks` coverage for the entire appended tail.
+5. Under a fully validated parent index, absence from the compact
+   `DigestIndex` means the canonical parent chunk is zero; it never means
+   unknown. `parent_logical_size` bounds that authority after growth, appended
+   source entries are `.zero`, and the child index must emit explicit
+   `zero_chunks` coverage for the entire appended tail.
 6. Capacity affects rootfs bytes and therefore `H(index)`. No mutable hint can
    select different bytes under the same identity.
 7. Preparation cache hits validate their record, target, output index, and
@@ -427,9 +428,10 @@ Add a growth primitive whose semantic input is an immutable parent index plus
 a larger exact logical size:
 
 - `ftruncate` the private sparse backing to the target;
-- extend source and optional digest maps with `.zero`, not `.zero_dirty`;
-- extend the parent-baseline digest table with null zero entries;
-- preserve all parent digest references unchanged; and
+- extend the dense source map with `.zero`, not `.zero_dirty`;
+- leave the compact, immutable parent digest index unchanged and bound its
+  authority with `parent_logical_size`;
+- preserve all parent digest entries unchanged; and
 - let snapshot encoding reuse untouched appended zeros directly.
 
 `.zero_dirty` remains necessary when an operation changes previously nonzero
@@ -718,8 +720,9 @@ Logical capacity must remain cheap but is not literally free:
 - ext4 superblocks, group descriptors, and bitmaps create bounded nonzero
   metadata chunks;
 - zero inode tables remain logical zeros; and
-- current `spore-disk-index-v1` and in-memory maps still have one entry per
-  64 KiB logical chunk.
+- current `spore-disk-index-v1` still emits explicit coverage for every
+  64 KiB logical chunk, and the in-memory source map has one byte per chunk;
+  the in-memory `DigestIndex` is compact and contains only nonzero entries.
 
 The automatic cap protects index size, map RSS, canonical JSON limits, startup,
 and checkpoint time—not physical zero storage alone. Range-compressed zero
@@ -783,7 +786,8 @@ unbounded design work.
 **Result: passed on HVF and KVM for the exercised paths.** Native
 type-13/UNMAP, HVF forced fallback, checksum `noinit_itable`, and checksum-lazy
 negative-control results are summarized in Current Progress. The positive
-paths quiesced; the lazy negative control did not publish. At `f71e617`, the
+paths quiesced; the lazy negative control did not publish. At rebased commit
+`9be8d24`, the
 KVM backend-failure control returns exact CLI status 2, preserves
 destination/cache state, permits a subsequent VM run, and exits without a
 teardown abort.
@@ -910,9 +914,10 @@ Measure 10, 16, 32, and 64 GiB targets for native Alpine, Debian/Ubuntu, and
 at least one large external-writer image. Record:
 
 - grow and total cold time;
-- peak RSS and map allocation, including `grow()` temporarily duplicating
-  source, CAS-digest, parent-digest, and populated digest-string storage before
-  releasing the old tables;
+- peak RSS and map allocation, including `grow()` temporarily duplicating the
+  dense source map and, for a partial final chunk, buffering only that verified
+  prefix before releasing the old map; the compact digest index is not cloned
+  by growth;
 - index bytes and zero-entry count;
 - canonical index bytes at 0%, 25%, 50%, and 100% nonzero-chunk density,
   including the exact 64 MiB encode/parse failure threshold;
@@ -1287,7 +1292,7 @@ Update the `spore build` boundary to cover:
   unchanged publication state. The KVM run printed the intended growth error
   before a pre-existing duplicate vCPU cleanup aborted teardown, demonstrating
   that matching diagnostics alone are insufficient fail-closed evidence.
-  Commit `f71e617` removed the duplicate owner, made exact status 2 part of the
+  Rebased commit `9be8d24` removed the duplicate owner, made exact status 2 part of the
   smoke contract, and passed the original failure path on native KVM.
 
 ## Resolved Recommendations

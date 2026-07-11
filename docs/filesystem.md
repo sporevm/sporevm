@@ -54,6 +54,13 @@ indexes and local images remain readable. Failed
 growth, quiescence, completeness, PREPARE, step, or ref publication never
 rewrites the parent or makes incomplete storage reachable.
 
+Automatic growth supports the native ext4 profile and conventional
+e2fsprogs-produced layouts that the pinned guest kernel can online-grow with
+synchronous inode-table initialization; the retained compatibility fixtures
+cover native and metadata-checksum/uninitialized-group filesystems. Unknown,
+dirty, or unsupported ext4 geometry fails closed. SporeVM neither guesses at a
+host-side rewrite nor falls back to a guest `resize2fs` process.
+
 A format-valid source may end partway through its final 64 KiB chunk. Growth
 preserves and, for CAS sources, verifies that old prefix, materializes at most
 that one chunk, and exposes only sparse zero bytes after the old logical end.

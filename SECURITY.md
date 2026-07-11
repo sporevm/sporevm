@@ -77,7 +77,11 @@ once to exactly 16 GiB, while a parent already at or above that cap is never
 enlarged automatically. Block or inode ENOSPC after an executor instruction is
 terminal for that invocation; SporeVM does not replay a potentially
 side-effecting step and publishes neither its step record nor the destination
-ref.
+ref. The supported growth envelope is the native ext4 profile plus
+e2fsprogs-produced layouts that the pinned guest kernel can online-grow under
+the internal synchronous inode-table policy; unsupported features, dirty
+state, or inconsistent geometry fail before publication, without a
+`resize2fs` fallback.
 
 When a valid source ends in a partial final chunk, growth verifies any CAS
 authority and preserves the old prefix before exposing a sparse-zero suffix.

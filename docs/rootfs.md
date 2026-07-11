@@ -70,6 +70,14 @@ before step zero, then continues in the same VM with the digest-bound boot
 artifacts. Managed-default cache hits do not read the kernel or initrd bodies;
 an executor miss verifies and boots the same once-opened kernel bytes.
 
+The v1 growth contract covers SporeVM's native ext4 profile and conventional
+e2fsprogs-produced ext4 layouts that the pinned guest kernel can online-grow
+under the internal synchronous inode-table policy. The retained corpus includes
+the native profile and a metadata-checksum/uninitialized-group layout. This is
+not a promise to rewrite every ext4 feature or topology: an unsupported, dirty,
+or geometrically inconsistent filesystem fails before PREPARE, step, image, or
+destination-ref publication. There is no slow `resize2fs` fallback.
+
 Block or inode exhaustion during COPY/RUN is terminal for that invocation.
 SporeVM does not replay a step that may have external side effects and does not
 publish the failed step or destination ref. The v1 16 GiB build cap keeps a
