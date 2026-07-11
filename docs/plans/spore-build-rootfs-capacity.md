@@ -1,6 +1,6 @@
 ---
-status: active
-last_reviewed: 2026-07-11
+status: landed
+last_reviewed: 2026-07-12
 spec_refs:
   - docs/rootfs.md
   - docs/filesystem.md
@@ -80,9 +80,9 @@ spore build ...
 
 ## Current Progress
 
-**Implementation and release validation are complete on the active branch at
-clean commit `0bb559a2f5d03c48d5d5016a4181b177d1cf5413`. The plan remains
-`active` until the change lands.**
+**Implementation and release validation are complete at clean commit
+`0bb559a2f5d03c48d5d5016a4181b177d1cf5413`. This plan landed with the
+implementation.**
 
 | Track | Current evidence |
 |---|---|
@@ -1020,7 +1020,7 @@ through Slice 5 experimentation, but it is required before release.
 
 **Status: complete.** The retained code, benchmark harness, lifecycle smokes,
 security contract, durable docs, and final HVF/KVM release validation are
-complete. The plan remains `active` only until the change lands.
+complete. This plan lands with the implementation.
 
 - Every retained validation command from the matrix passed on Linux ARM64/KVM,
   including the capacity lifecycle smoke with
@@ -1031,7 +1031,7 @@ complete. The plan remains `active` only until the change lands.
   Current Progress and Decision Gates. Cross-host conclusions use paired
   deltas rather than comparing absolute KVM time with the historical HVF
   baseline.
-- Keep the plan `active` until the change lands, then mark it `landed`.
+- Mark the plan `landed` with the implementation.
 
 ## Documentation, Security, And Format Impacts
 

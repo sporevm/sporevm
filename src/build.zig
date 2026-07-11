@@ -69,10 +69,6 @@ const State = struct {
     cmd: ?[]const []const u8 = null,
 };
 
-const PendingPreparation = struct {
-    preparation: build_exec.Preparation,
-};
-
 const ArgValue = step_cache.ArgInput;
 
 const CachedMetadata = struct {
@@ -136,13 +132,13 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                 const build_cache_lock = if (cache_lock) |*lock| lock else unreachable;
                 if (state) |*s| {
                     if (try applyMetadataInstruction(allocator, options, pre_from_args.items, s, instruction)) continue;
+                    any_exec_step = true;
+                    if (try ensurePrepared(init, allocator, options.platform, cache_root, s, &diagnostic.executor)) |preparation| {
+                        state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock, preparation);
+                        break :instructions;
+                    }
                     switch (instruction.value) {
                         .run => {
-                            any_exec_step = true;
-                            if (try ensurePrepared(init, allocator, options.platform, cache_root, s, &diagnostic.executor)) |pending| {
-                                state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock, pending);
-                                break :instructions;
-                            }
                             s.storage = cachedExecStep(init, allocator, options, s.*, instruction, "") catch |err| switch (err) {
                                 error.CacheMissRequiresBuildExecutor => {
                                     state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock, null);
@@ -152,11 +148,6 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                             };
                         },
                         .copy => |copy| {
-                            any_exec_step = true;
-                            if (try ensurePrepared(init, allocator, options.platform, cache_root, s, &diagnostic.executor)) |pending| {
-                                state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock, pending);
-                                break :instructions;
-                            }
                             const resolved_sources = try substituteList(allocator, copy.sources, s.args.items, s.env.items);
                             const resolution = build_context.resolveCopySourcesWithDiagnostic(allocator, init.io, ctx, resolved_sources, &diagnostic.copy) catch |err| {
                                 diagnostic.instruction_line = instruction.line;
@@ -175,11 +166,6 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                             };
                         },
                         .workdir => |raw| {
-                            any_exec_step = true;
-                            if (try ensurePrepared(init, allocator, options.platform, cache_root, s, &diagnostic.executor)) |pending| {
-                                state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock, pending);
-                                break :instructions;
-                            }
                             const target = try resolvedWorkdir(allocator, s.*, raw);
                             s.storage = cachedExecStep(init, allocator, options, s.*, instruction, "") catch |err| switch (err) {
                                 error.CacheMissRequiresBuildExecutor => {
@@ -316,7 +302,7 @@ fn ensurePrepared(
     cache_root: []const u8,
     state: *State,
     diagnostic: *build_exec.Diagnostic,
-) !?PendingPreparation {
+) !?build_exec.Preparation {
     if (state.producer == null) {
         state.producer = try build_exec.resolveProducer(init, allocator);
         diagnostic.boot_artifact_file_reads = state.producer.?.eager_artifact_file_reads;
@@ -337,11 +323,9 @@ fn ensurePrepared(
         return null;
     }
     return .{
-        .preparation = .{
-            .input = input,
-            .step_key = key,
-            .exact_target = state.disk_grow_target,
-        },
+        .input = input,
+        .step_key = key,
+        .exact_target = state.disk_grow_target,
     };
 }
 
@@ -372,7 +356,7 @@ fn executeFromMiss(
     instructions: []const dockerfile.Instruction,
     initial_state: State,
     rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
-    pending_preparation: ?PendingPreparation,
+    pending_preparation: ?build_exec.Preparation,
 ) !State {
     var state = initial_state;
     var steps = std.array_list.Managed(build_exec.Step).init(allocator);
@@ -410,7 +394,7 @@ fn executeFromMiss(
         .base_storage = state.storage,
         .steps = steps.items,
         .rootfs_cache_lock = rootfs_cache_lock,
-        .preparation = if (pending_preparation) |pending| pending.preparation else null,
+        .preparation = pending_preparation,
         .producer = state.producer orelse return error.BadManifest,
         .context_disk_path = context_disk_path,
         .output = options.output,

@@ -22,6 +22,7 @@ const console = @import("../virtio/console.zig");
 const blk = @import("../virtio/blk.zig");
 const net = @import("../virtio/net.zig");
 const rng = @import("../virtio/rng.zig");
+const transport_snapshot = @import("../virtio/transport_snapshot.zig");
 const virtio_mem = @import("../virtio/mem.zig");
 const vsock = @import("../virtio/vsock.zig");
 const platform_contract = @import("../platform.zig");
@@ -2321,7 +2322,7 @@ fn takeSnapshot(
     dirty_tracker: ?*DirtyTracker,
     environ_map: ?*const std.process.Environ.Map,
 ) !void {
-    try validateFullSnapshotTransports(transports);
+    try transport_snapshot.validateFullSnapshotTransports(transports);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -2510,7 +2511,7 @@ fn takeSnapshotV1(
     // Feature selection is guest-mutable MMIO state. Validate it only after
     // every vCPU has stopped, immediately before transport capture, so a guest
     // cannot race validation with a reset or DRIVER_FEATURES write.
-    try validateFullSnapshotTransports(transports);
+    try transport_snapshot.validateFullSnapshotTransports(transports);
     if (vsock_dev.pending_len != 0) {
         std.log.err("cannot snapshot while virtio-vsock has pending packets", .{});
         return error.DeviceStatePending;
@@ -2679,19 +2680,6 @@ fn captureTransports(allocator: std.mem.Allocator, transports: []mmio.Transport)
     return out;
 }
 
-fn validateFullSnapshotTransports(transports: []const mmio.Transport) !void {
-    // Rootfs-only checkpoints capture queue state transiently for quiescence,
-    // but a portable machine manifest must never contain the growth profile.
-    for (transports) |*transport| {
-        try transport.validateSerializableFeatureState();
-        try validateFullSnapshotFeatures(transport.offeredFeatures());
-    }
-}
-
-fn validateFullSnapshotFeatures(features: u64) !void {
-    if (features & blk.feature_write_zeroes != 0) return error.NonResumableDeviceProfile;
-}
-
 fn applyTransports(transports: []mmio.Transport, states: []const spore.TransportState) !void {
     if (states.len != transports.len) return error.PlatformMismatch;
     for (transports, states) |*t, s| {
@@ -2716,26 +2704,6 @@ fn applyTransports(transports: []mmio.Transport, states: []const spore.Transport
             t.queues[qi] = restored;
         }
     }
-}
-
-test "full snapshots reject growth-only transport features" {
-    var portable_storage: [blk.sector_size]u8 = undefined;
-    var portable_blk = blk.Blk.initWithOptions(.{ .memory = &portable_storage }, .{});
-    var portable_transports = [_]mmio.Transport{mmio.Transport.init(portable_blk.device())};
-    try validateFullSnapshotTransports(&portable_transports);
-    portable_transports[0].driver_features = 1 << 15;
-    try std.testing.expectError(
-        error.UnsupportedFeatures,
-        validateFullSnapshotTransports(&portable_transports),
-    );
-
-    var growth_storage: [blk.sector_size]u8 = undefined;
-    var growth_blk = blk.Blk.initWithOptions(.{ .memory = &growth_storage }, .{ .write_zeroes = true });
-    var growth_transports = [_]mmio.Transport{mmio.Transport.init(growth_blk.device())};
-    try std.testing.expectError(
-        error.NonResumableDeviceProfile,
-        validateFullSnapshotTransports(&growth_transports),
-    );
 }
 
 test "transport restore rejects unoffered block features" {
