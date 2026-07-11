@@ -27,8 +27,9 @@ related_plans:
 Make rootfs growth an automatic storage operation rather than an expensive
 guest command or a filesystem-creation mode the user must anticipate.
 
-On the first build use of a rootfs smaller than SporeVM's build-capacity
-target, the host extends the chunk-mapped disk with clean, known-zero chunks.
+On the first build use of a supported journal-less rootfs smaller than
+SporeVM's build-capacity target, the host extends the chunk-mapped disk with
+clean, known-zero chunks.
 The ephemeral build VM exposes virtio-blk `WRITE_ZEROES`; Linux performs the
 ext4 grow through `EXT4_IOC_RESIZE_FS`; and zeroing requested by ext4 remains
 zero-map metadata instead of becoming guest payload I/O or dirty CAS work. The
@@ -64,7 +65,7 @@ The intended behavior is deliberately boring:
 spore build ...
 ```
 
-- grows a small valid ext4 base automatically;
+- grows a small supported journal-less ext4 base automatically;
 - works for OCI imports, existing local images, committed images, and cached
   intermediates without a tool inside those images;
 - keeps zero capacity sparse in the host file and rootfs CAS;
@@ -79,94 +80,43 @@ spore build ...
 
 ## Current Progress
 
-- **Implemented on the active branch:** clean-known-zero growth and range
-  zeroing, growth-session-only virtio-blk `WRITE_ZEROES`, direct
-  `EXT4_IOC_RESIZE_FS` through the managed initrd, the fixed 16 GiB policy,
-  builder-v7 typed `PREPARE` reuse, and the same primitive for
-  `spore run --commit --disk-size`.
-- **P0 kernel behavior (2026-07-11, M4/HVF):** the pinned Linux 6.1.155 guest
-  completed the current 16 GiB product grow through 124 type-13 requests
-  covering 520,093,696 bytes, all `UNMAP`/OK, with no ordinary all-zero OUT.
-  The forced-unsupported control produced 124 `UNSUPP` responses and exactly
-  520,093,696 bytes of ordinary all-zero OUT, proving both the native fast path
-  and the intended negative control. Six seconds after resize, both paths
-  showed no additional block writes. The checksum/lazy negative control did
-  show background writes and failed before publication.
-- **P1 clean-tail result (2026-07-11, M4/HVF):** the old 16 MiB -> 8,208 MiB
-  checkpoint sealed 131,073 chunks, spent 3,292 ms zero-scanning, and took
-  3,376 ms total. Clean-zero growth sealed one metadata chunk, performed no
-  zero scan, and took 7 ms.
-- **P2/P3 product-path result (2026-07-11, M4/HVF):** five isolated
-  instrumented ReleaseSafe 16 GiB probes took 362, 365, 358, 359, and 362 ms
-  (362 ms median, 365 ms nearest-rank p95). Explicit host instrumentation puts
-  resize-through-CAS-publication at 127, 126, 125, 125, and 126 ms (126 ms
-  median, 127 ms p95). Median peak host RSS was 174,211,072 bytes (166.1 MiB).
-  The harness's literal uninstrumented default-path mode took 354, 356, 351,
-  373, and 357 ms (356 ms median, 373 ms p95) for the same two-RUN probe.
-  Five uninstrumented default-path runs of the original
-  ARG/ENV/WORKDIR/two-COPY/one-RUN shape, cloned from the same exact compact
-  parent into isolated caches, took 0.44, 0.44, 0.43, 0.43, and 0.44s (0.44s
-  median/p95). All five emitted the same PREPARE key, producer identity, and
-  child index. Fully warm samples were 0.13s; three one-COPY-plus-RUN changes
-  were 0.44, 0.40, and 0.39s (0.40s median).
-  A shared `PREPARE` hit under `--no-cache` took 0.16s, issued no resize or
-  `WRITE_ZEROES`, and still executed Dockerfile steps. Fully warm builds avoid
-  boot; the edited incremental smoke boots once, executes four steps, and
-  performs no resize.
-- **Native KVM result (2026-07-11, Linux ARM64/KVM):** rebased commit `b78da6c`
-  passed native tests and ReleaseSafe assembly. The build/run smoke covered
-  first preparation, prepared reuse, warm, `--no-cache`, and incremental
-  paths functionally; the 2.25 GiB sparse-COPY smoke, run-commit lifecycle
-  smoke including save/fork/restore, and local pull also passed. Five
-  six-second P0 samples each completed the same 124 type-13/UNMAP requests
-  covering 520,093,696 bytes, with no ordinary all-zero OUT, errors, or
-  post-resize writes. Five instrumented P3 misses took
-  529 ms median / 532 ms p95; preparation-through-publication took 211 ms
-  median / 218 ms p95, and median peak RSS was 140.7 MiB. A separate
-  same-exact-parent run produced the same PREPARE key, parent index, prepared
-  child index, and producer identity in all five samples. The literal
-  uninstrumented two-RUN harness took 525 ms median / 527 ms p95. This is a
-  useful absolute observation, but it is not comparable to the historical
-  macOS/HVF 0.36s prepared baseline: the KVM cold gate requires paired default
-  and prepared/no-growth samples of the exact historical fixture on the same
-  host and commit. KVM warm and incremental paths passed functionally, but
-  their performance gates also remain unmeasured.
-  Rebased commit `9be8d24` gives the KVM vCPU slice one cleanup owner and makes the
-  failure smoke require the exact CLI build-error status 2. Native unit tests,
-  Zig formatting, ReleaseSafe assembly, and the full KVM disk-size smoke pass
-  at that commit. The injected WRITE_ZEROES backend failure returns status 2,
-  reports the validated storage failure, leaves destination/cache state
-  unchanged, and permits the subsequent VM run without a teardown abort. The
-  native KVM storage-failure gate is therefore closed.
-- **P4 canonical-index envelope (2026-07-11):** a fully nonzero 16 GiB index
-  is about 33.39 MiB, leaving 30.61 MiB (47.8%) below `max_index_bytes`. A
-  fully nonzero 32 GiB index is about 66.89 MiB and is rejected; the largest
-  fully dense current-format disk is about 30.62 GiB. At 64 GiB the index
-  fails above roughly 42.67% nonzero chunks. Sixteen GiB is therefore the v1
-  target and cap; 32/64 GiB remain format stress points, not user promises.
-- **Correctness evidence (2026-07-11, M4/HVF):** native and checksum-enabled
-  grown images pass `e2fsck -fn`; multi-GiB sparse COPY, build-cache/no-cache,
-  run-commit grow/reuse/shrink rejection, prepared-image save/restore, and
-  bundle pack plus flat materialization pass. The retained disk-size smoke now
-  injects a validated WRITE_ZEROES backend failure during build preparation,
-  proves the unpublished head is poisoned, and verifies the destination ref,
-  PREPARE/step records, indexes, objects, and completeness stamps are unchanged.
-  Format-valid partial-final-chunk parents preserve and CAS-verify the old
-  prefix, expose a sparse-zero suffix, and produce the same canonical snapshot
-  as a full-rescan oracle across base/CAS/zero/overlay sources.
-- **Remaining release evidence:** native KVM storage failure and teardown are
-  green; paired performance and the wider lifecycle/workload corpus remain.
-  Resolve the tiny-cold gate with paired same-host samples of the exact
-  historical fixture, and record KVM warm and incremental timings in the same
-  run. Exploratory HVF runs exercised a verified 512 MiB RUN-generated file
-  and real block/inode ENOSPC;
-  both exhaustion cases produced terminal diagnostics without retry and left
-  the destination ref unchanged. Those one-off runs establish feasibility but
-  are not retained as reproducible repository evidence, so large RUN and both
-  ENOSPC modes remain release gates until an identical smoke records them.
-  Concurrency/publication fault injection, prepared-output-specific
-  pack/unpack/pull identity, and commit-as-a-later-build-base also remain
-  explicit matrix items.
+**Implementation and release validation are complete on the active branch at
+clean commit `0bb559a2f5d03c48d5d5016a4181b177d1cf5413`. The plan remains
+`active` until the change lands.**
+
+| Track | Current evidence |
+|---|---|
+| Storage and filesystem implementation | Clean-known-zero growth, checked zero ranges, growth-session-only virtio-blk `WRITE_ZEROES`, pre-mount and around-ioctl ext4 source validation, direct `EXT4_IOC_RESIZE_FS`, the fixed 16 GiB policy, builder-v7 typed `PREPARE` reuse, and convergence of `spore run --commit --disk-size` are implemented. |
+| HVF default-path release gate | Five paired ReleaseSafe trials passed. Compact-parent cold median was 457.235 ms versus 486.913 ms for the independently pre-grown control, a median paired delta of -26.899 ms against the +150 ms limit. Warm was 125.044 ms versus 144.568 ms, with a -14.083% median paired delta. One-COPY incremental was 457.110 ms versus 468.937 ms, with a -3.222% median paired delta. All five trials produced one stable PREPARE key, child index, and producer identity. |
+| HVF instrumented engineering control | Five trials passed the separate instrumentation gates: preparation median was 113 ms and p95 was 117 ms against the 250 ms p95 limit; both compact and pre-grown warm lanes booted zero VMs. Instrumented timing is not substituted for the literal default-path gate. |
+| KVM default-path release gate | Five paired ReleaseSafe trials passed. Compact-parent cold median was 707.891 ms versus 776.327 ms for the independently pre-grown control, a median paired delta of -67.936 ms. Warm was 230.335 ms versus 266.757 ms, with a -13.339% median paired delta. One-COPY incremental was 692.431 ms versus 731.216 ms, with a -5.221% median paired delta. All five trials produced one stable PREPARE key, child index, and producer identity. |
+| KVM instrumented engineering control | Five trials passed the separate instrumentation gates: preparation median was 210 ms and p95 was 213 ms; both compact and pre-grown warm lanes booted zero VMs. |
+| Cross-backend correctness | On HVF and KVM, retained large COPY, deterministic 512 MiB RUN output, block ENOSPC, inode ENOSPC, concurrent PREPARE/publication fault injection, prepared-output save/restore, pack/unpack/pull identity, and committed-image-as-a-later-build-base checks pass. KVM also passed the capacity lifecycle smoke with required `e2fsck`. A failed Dockerfile step is terminal, is not retried, publishes no record for that failed step, and leaves the destination ref unchanged; an earlier successfully published `PREPARE` remains reusable. |
+
+The final summaries from 2026-07-11 bind both backends to clean repository
+commit `0bb559a2f5d03c48d5d5016a4181b177d1cf5413`. The HVF run used a
+5,023,056-byte ReleaseSafe binary with SHA-256
+`a7e923d415ab17328ce2ca28ab548ec8836541a671085980055543c20d8e6fd8c`
+on Darwin arm64 kernel 25.3.0 and anonymized host descriptor
+`sha256:c6450abbb38ec9adca545d2f309f45b3937a640de0d5e1a2726a95836ea37d8c`.
+The KVM run used a 21,406,440-byte ReleaseSafe binary with SHA-256
+`10571d0145b4a3d9695f48058e53ec0796636453faa518f376b4d529df79964e`
+on Linux aarch64 kernel 6.17.0-1015-aws with `/dev/kvm` available and
+anonymized host descriptor
+`sha256:ca12353903df920acba418a91a54c4880dbe980fe8da492c3287b74500b92d3f`.
+Each harness run verified that its measured binary stayed byte-identical
+through the matrix, recorded bounded stdout and stderr plus full hashes and
+byte counts in self-contained JSONL command rows, and exited zero only after
+validation and the applicable aggregate gates passed.
+
+Historical stop/go evidence remains useful for the cost boundary: on M4/HVF,
+the pinned Linux 6.1.155 guest expressed a 16 GiB grow as 124 type-13 UNMAP
+requests covering 520,093,696 bytes with no ordinary all-zero OUT, while a
+forced-unsupported control restored the same amount of ordinary zero payload.
+Clean-zero storage changed the old 3,376 ms, 131,073-sealed-chunk checkpoint
+into 7 ms with one sealed metadata chunk and no zero scan. A fully nonzero
+16 GiB canonical index is about 33.39 MiB, leaving 47.8% below the 64 MiB
+limit; a fully nonzero 32 GiB index is about 66.89 MiB and cannot be encoded.
 
 ## Original Path And Cost Boundaries
 
@@ -200,8 +150,7 @@ The prepared case used hidden `--disk-grow-target 10737418240` only to make
 the requested target equal the base's existing logical size. It is evidence
 about the no-growth path, not a proposed user feature.
 
-The relevant path was revalidated on 2026-07-11 against `origin/main` commit
-`8790d6ae6ad8f027616f28908a2d210abbb8c0a3`:
+The relevant branch-base path was revalidated on 2026-07-11:
 
 1. `ChunkMappedDisk.grow` appended every new 64 KiB chunk as `.zero_dirty`.
 2. The first checkpoint therefore reads and zero-scans the entire appended
@@ -262,8 +211,9 @@ In priority order:
 - Make appended zero capacity create no proportional CAS payload and no
   proportional snapshot sealing work.
 - Automatically handle imported OCI rootfs images, locally committed images,
-  cached intermediate states, and existing compact images through the same
-  build path.
+  cached intermediate states, and existing compact images produced inside the
+  journal-less v1 envelope through the same build path; reject other sources
+  before writable mount.
 - Preserve canonical rootfs/index identity, exact object verification,
   atomic publication, sparse physical allocation, and backend-neutral disk
   behavior.
@@ -536,18 +486,25 @@ path.
 
 The initrd agent:
 
-1. opens `/mnt/rootfs` and `/dev/vda`, outside the selected image's chroot;
-2. gets the exact visible device bytes with `BLKGETSIZE64` and decodes the
+1. opens `/dev/vda` read-only before the first writable mount and decodes the
    feature-aware primary ext4 superblock at byte 1,024;
-3. rejects shrink, overflow, or device bytes not divisible by filesystem block
-   size;
-4. computes the target filesystem block count and calls
-   `EXT4_IOC_RESIZE_FS` directly;
-5. after `syncfs`, decodes the superblock again and requires the filesystem
-   block count to increase, remain at or below the target, and fall short by
-   less than one unchanged ext4 block group. This permits bigalloc rounding or
-   omission of an unusably small terminal group without accepting a no-op or
-   an unbounded or multi-group partial resize;
+2. rejects journaled filesystems, recovery/journal-device flags, filesystem
+   error or orphan state, a nonzero legacy orphan head, and the orphan-file
+   pending-cleanup flag. A frozen journal-less checkpoint need not carry the
+   clean-unmount bit and remains acceptable;
+3. mounts the validated source outside the selected image's chroot, opens
+   `/mnt/rootfs`, and gets the exact visible device bytes with
+   `BLKGETSIZE64`;
+4. re-reads and revalidates the same source-state fields after mount and before
+   any resize mutation, rejects shrink, overflow, or device bytes not divisible
+   by filesystem block size, then computes the target filesystem block count
+   and calls `EXT4_IOC_RESIZE_FS` directly;
+5. after the ioctl and `syncfs`, decodes and validates the source-state fields
+   again and requires the filesystem block count to increase, remain at or
+   below the target, and fall short by less than one unchanged ext4 block group.
+   This permits bigalloc rounding or omission of an unusably small terminal
+   group without accepting a no-op or an unbounded or multi-group partial
+   resize;
 6. treats `statfs` only as diagnostics, requiring usable blocks no greater than
    the authoritative post-resize block count plus aligned/bounded free bytes
    and valid inode counts; and
@@ -555,12 +512,13 @@ The initrd agent:
    target and usable blocks, free bytes, and total/free inodes in one exact
    bounded line.
 
-P0 validates the internal mount option for rootfs-growth sessions. The v1
-choice is `noinit_itable`, which makes new checksum-enabled groups
+The product default for every rootfs-growth session is the internal
+`noinit_itable` mount policy, which makes new checksum-enabled groups
 perform their inode-table initialization synchronously instead of leaving
 `ext4lazyinit` to dirty the disk after `PREPARE`. This is managed initrd policy,
-not a user option. The agent must not report preparation success while a
-background inode-table initializer can still mutate the rootfs.
+not a user option. Only the master-gated engineering negative control omits it.
+The agent does not report preparation success while a background inode-table
+initializer can still mutate the rootfs.
 
 The host treats nonzero exit, malformed response, geometry mismatch, VM exit,
 or timeout as preparation failure. It never trusts a guest-supplied target.
@@ -594,7 +552,7 @@ record schemas parse conservatively; a v7 `PREPARE` hit requires both.
 
 For a Dockerfile with at least one executor-backed instruction:
 
-1. Resolve the exact automatic/explicit target from the immutable base.
+1. Resolve the exact automatic target from the immutable base.
 2. If the base is already at that target or larger, use it directly.
 3. Otherwise compute a synthetic step key from:
 
@@ -676,7 +634,7 @@ preparation miss therefore requires an isolated preparation/step cache.
 |---|---|
 | Fresh OCI base used by build | Import normally, then transparently normalize on first executor use; preparation is reusable across Dockerfiles. |
 | Native-writer rootfs | Kernel resize plus storage zero semantics; no native-layout special case. |
-| External-writer rootfs | Same path if it mounts as supported ext4 and the kernel accepts online resize; otherwise fail before steps. |
+| External-writer rootfs | Same path only for a journal-less layout that passes the pre-mount recovery/error/orphan checks and that the pinned kernel accepts for online resize; otherwise fail before steps. |
 | Existing small local image | Normalize automatically even when original OCI/tar source is unavailable. |
 | Locally committed image | Inherit current geometry; normalize once only if below the selected target. |
 | Cached intermediate | Its index is authoritative. A state at or above 16 GiB is not grown again; a smaller state prepares once to 16 GiB. |
@@ -763,10 +721,14 @@ and already fails; 32/64 GiB remain experiments rather than product caps.
   exact field order, pre/post/block-group arithmetic checks, a 1,024-byte limit,
   and fuzz/unit coverage. The host-generated request carries no capacity
   authority.
-- The guest rootfs can contain malicious ext4 metadata. The pinned kernel owns
-  filesystem validation; the initrd adds only a fuzzed fixed-offset decoder for
-  the already-mounted primary superblock's magic, feature-aware 64-bit block
-  count, block size, and blocks-per-group post-condition. A kernel, decode, or
+- The guest rootfs can contain malicious ext4 metadata. Before its first
+  writable mount, the initrd's fuzzed fixed-offset decoder validates the
+  primary superblock geometry and rejects journal, recovery, journal-device,
+  error, and orphan state. It revalidates that source state immediately before
+  the ioctl and after `syncfs`. The pinned kernel still owns ext4 resize
+  semantics; the decoder only enforces the supported source envelope and the
+  feature-aware 64-bit block-count, block-size, and blocks-per-group
+  post-condition. A preflight, source-state regression, kernel, decode, or
   geometry error aborts preparation.
 - CAS/index loading remains canonical, digest-checked, completeness-gated, and
   descriptor-authoritative. Host-local cache metadata cannot override it.
@@ -774,23 +736,21 @@ and already fails; 32/64 GiB remain experiments rather than product caps.
   `PREPARE` record publication, and any destination ref update that makes the
   result reachable.
 
-## Experiment Evidence And Remaining Corpus
+## Experiment And Release Evidence
 
-P0-P4 were used as stop/go experiments before the behavior switch. Their
-results are recorded here so the implementation remains traceable. P5 and the
-remaining KVM performance-gate work are release validation rather than
-unbounded design work.
+P0-P4 were stop/go experiments before the behavior switch. Their results remain
+here for traceability. P5 is now a retained cross-backend release corpus.
 
 ### P0. Verify Kernel Zeroing And Lazy-Init Timing First
 
-**Result: passed on HVF and KVM for the exercised paths.** Native
-type-13/UNMAP, HVF forced fallback, checksum `noinit_itable`, and checksum-lazy
-negative-control results are summarized in Current Progress. The positive
-paths quiesced; the lazy negative control did not publish. At rebased commit
-`9be8d24`, the
-KVM backend-failure control returns exact CLI status 2, preserves
-destination/cache state, permits a subsequent VM run, and exits without a
-teardown abort.
+**Result: passed as a stop/go and cross-backend release gate.** Native
+type-13/UNMAP, forced fallback, checksum `noinit_itable`, and checksum-lazy
+negative-control results are summarized in Current Progress. Positive HVF and
+KVM paths quiesced; the lazy negative control did not publish. The final KVM
+checksum fixture completed 132 successful UNMAP/write-zeroes requests and
+showed no background writes during the six-second idle observation. Shared
+unit/fuzz coverage retains feature, request, source-preflight, revalidation,
+and failure semantics.
 
 This was the first stop/go gate before production Slice 1 or Slice 2 code. It
 observed the managed Linux 6.1.155 guest rather than inferring behavior only
@@ -808,33 +768,31 @@ The pinned virtio-blk driver maps successful block-layer zeroout to request
 telemetry must distinguish that path from the block layer's ordinary-write
 fallback.
 
-For native and checksum/uninitialized-group external fixtures, record:
+The retained telemetry records:
 
 - whether online resize submits virtio request type 13 or ordinary OUT writes;
 - whether request type 13 carries the standard UNMAP bit;
 - whether every type-13 request completes successfully without the block layer
   silently retrying bulk zero-page OUT writes;
-- synchronous inode-table zero bytes versus journal/bitmap metadata writes;
+- synchronous inode-table zero bytes versus bitmap/superblock metadata writes;
 - whether `ext4lazyinit` starts or remains active after the resize response;
 - writes that occur before, during, and after the preparation freeze/snapshot;
   and
 - behavior when the ephemeral build rootfs is mounted with internal
   `noinit_itable` rather than the normal writable mount options.
 
-The intended v1 contract must reach a quiescent filesystem before publishing
-`PREPARE`. If `noinit_itable` safely makes all new-group inode-table work
-synchronous, use that internal growth-session mount option and verify the zeroes
-arrive through request type 13. If supported external layouts still leave
-background initialization or mostly ordinary bulk writes, stop and compare
-the CAS-native grower or capacity-at-birth fallback before implementing the
-full virtio path.
+The v1 contract reaches a quiescent filesystem before publishing `PREPARE`.
+The default growth mount uses `noinit_itable`, and the pre-mount source check
+restricts automatic growth to journal-less ext4 without recovery, error, or
+orphan state. Unsupported layouts fail closed; there is no userspace resize
+fallback.
 
 ### P1. Split Current Cost And Prove Clean-Zero Growth
 
 **Result: passed.** Appended capacity changed the checkpoint from 3,376 ms and
 131,073 sealed chunks to 7 ms, one sealed metadata chunk, and zero scan time.
 
-Add structured timings/counters for:
+Structured timings and counters cover:
 
 - map allocation and sparse `ftruncate`;
 - guest boot-to-resize request;
@@ -845,210 +803,104 @@ Add structured timings/counters for:
 - zero-scan/hash/object-write time; and
 - canonical index encode/write/completeness time.
 
-Run compact default growth, compact growth with appended sources treated as
-clean zero, and pre-grown 10 GiB. The clean-zero variant must not seal or scan
-work proportional to the appended 8 GiB tail.
+The compact default, clean-zero, and pre-grown controls proved that clean-zero
+growth neither seals nor scans work proportional to the appended tail.
 
 ### P2. Prototype `WRITE_ZEROES` Plus Direct Ioctl
 
-**Result: passed on HVF.** The prototype became the product path. Growth does
-not invoke the selected rootfs shell, the no-`resize2fs` smoke passes, and the
-managed initrd sends the fixed request before Linux issues the ioctl.
-
-In an experiment-only branch:
-
-- advertise one write-zeroes segment;
-- implement checked `zeroRange`;
-- call `EXT4_IOC_RESIZE_FS` from the initrd agent; and
-- remove the `resize2fs` process from the experiment path.
-
-Use the P0-selected build mount behavior. Confirm that request type 13 reaches
-the chunk backend, that ordinary journal/bitmap writes remain bounded metadata,
-and that no lazy-init writer remains after the preparation checkpoint.
-
-For 512 MiB -> 8.5/10/16 GiB, record request count, logical zeroed bytes,
-overlay bytes, changed chunks, unique CAS bytes, resize time, and total build
-time. Assemble once and require `e2fsck -fn`, successful boot, correct
-`statfs`, and writes beyond the old boundary.
+**Result: passed and became the product path.** The shared block device offers
+one bounded write-zeroes segment only in a non-resumable growth session,
+`zeroRange` validates before mutation, and the managed initrd issues the direct
+ioctl. Growth does not invoke the selected rootfs shell. The retained capacity
+smoke checks fsck, boot, exact device/filesystem geometry, and writes beyond the
+old boundary.
 
 ### P3. Quantify Preparation Variance And Prove Prepared Reuse
 
-**Result: passed on HVF; KVM preparation passes but its performance gate remains
-open.** Five isolated ReleaseSafe runs are stable at 362 ms
-cold median, 126 ms preparation-publication median, 127 ms preparation p95,
-and 166.1 MiB median peak RSS. Five uninstrumented equivalent-fixture runs from
-the same exact parent have a 0.44s cold median/p95 and produced the same
-prepared index, key, and producer identity. Shared `PREPARE` reuse works under
-`--no-cache` while skipping resize/checkpoint work. On KVM, five instrumented
-samples had 529 ms median / 532 ms p95 total time and 211 ms median / 218 ms
-p95 preparation-publication time; a same-parent follow-up produced identical
-PREPARE derivation identity in all five samples. The KVM two-RUN harness has no
-same-host prepared/no-growth baseline, and its functional warm/incremental
-paths were not timed, so those KVM performance gates remain open.
-
-Repeat the same parent/target preparation at least five times with isolated
-caches on one pinned kernel/initrd, then on HVF and KVM using the identical
-guest artifacts.
-
-- Compare canonical index digest and changed chunk digests.
-- If they differ, identify exact bytes and classify them as bounded
-  kernel-managed metadata, ongoing lazy-init activity, or semantic filesystem
-  differences. Quantify lost dedup/cache reuse; do not make timestamps alone a
-  correctness failure.
-- Measure a preparation-record hit, miss, extra pre-step checkpoint, GC root,
-  and two unrelated Dockerfiles sharing the same base.
-- Include repeated `--no-cache` builds.
-
-Prove that the one-boot pre-step checkpoint stays inside the cold-build gate
-and that a `PREPARE` hit avoids resize/checkpoint work under `--no-cache`.
+**Result: passed on final HVF and KVM evidence.** The literal default-path
+five-pair matrices passed the cold, warm, incremental, and PREPARE identity
+gates at clean commit `0bb559a2f5d03c48d5d5016a4181b177d1cf5413`.
+The separate instrumented matrices measured 113 ms median / 117 ms p95 on HVF
+and 210 ms median / 213 ms p95 on KVM, and proved the warm path boot-free on
+both backends. Shared `PREPARE` reuse under `--no-cache` skipped
+resize/checkpoint work while still executing Dockerfile steps.
 
 ### P4. Select Default Capacity And Cap
 
 **Result: the format gate selected 16 GiB for v1.** Dense 16 GiB fits with
-47.8% headroom; dense 32 GiB fails the current format limit. Large COPY and
-representative native/checksum fixtures pass. The wider distro, large-RUN,
-and inode-exhaustion corpus remains release/next-slice evidence, not a reason
-to expose a larger unsafe target.
-
-Measure 10, 16, 32, and 64 GiB targets for native Alpine, Debian/Ubuntu, and
-at least one large external-writer image. Record:
-
-- grow and total cold time;
-- peak RSS and map allocation, including `grow()` temporarily duplicating the
-  dense source map and, for a partial final chunk, buffering only that verified
-  prefix before releasing the old map; the compact digest index is not cloned
-  by growth;
-- index bytes and zero-entry count;
-- canonical index bytes at 0%, 25%, 50%, and 100% nonzero-chunk density,
-  including the exact 64 MiB encode/parse failure threshold;
-- unique CAS object bytes/count;
-- sparse flat logical versus physical bytes;
-- runtime disk-open and first snapshot latency;
-- free blocks/inodes and inode density; and
-- behavior crossing the native profile's 16 GiB descriptor-block boundary.
-
-Exercise Alpine package install, apt, Node, Ruby bundle, the current
-`buildkite-sporevm` workload, a large COPY, a large RUN-generated output, and
-an empty-file inode-exhaustion workload. Confirm or replace the candidate
-16 GiB quantum and select a checkpoint-safe cap from this corpus.
+47.8% headroom; dense 32 GiB fails the current format limit. The release corpus
+retains a 2.25 GiB sparse COPY, a deterministic 512 MiB RUN output, and real
+block and inode exhaustion. A broader 10/16/32/64 GiB distro/package workload
+grid is useful characterization, but it is not needed to establish the fixed
+v1 cap and is listed under Deferred Work.
 
 ### P5. Compatibility And Failure Corpus
 
-**Status: in progress.** Unit/fuzz/cache-GC/backend-failure, existing-small,
-basic run-commit, generic save/restore and bundle, and HVF build-smoke coverage
-is present. Native KVM now covers build/run, a 2.25 GiB sparse COPY, the
-run-commit lifecycle including save/fork/restore, and local pull. That
-run-commit smoke does not save or restore an actual `spore build` prepared
-output, so prepared-output lifecycle coverage remains open. The injected KVM
-growth failure now returns exact CLI status 2, preserves authoritative state,
-and passes the subsequent-run check. An additional generic writable-rootfs
-smoke stopped at a pre-existing assertion for legacy layered manifests before
-its lifecycle checks; it is not counted as KVM capacity evidence. Exploratory
-HVF runs completed a verified 512 MiB
-RUN-generated file in 5.00s and observed the intended
-terminal/no-retry/unchanged-ref behavior for both block and inode ENOSPC. The
-wider distro/workload corpus and reproducible retained large-RUN plus
-block/inode exhaustion smokes remain.
-
-Cover:
-
-- native and external rootfs writers;
-- full and partial final ext4 groups;
-- existing compact images and source-less commits;
-- a cached intermediate below and at the target;
-- corrupt/missing parent chunks and synthetic `PREPARE` records;
-- unsupported/dirty ext4 states;
-- ioctl timeout/error and malformed write-zeroes requests;
-- concurrent preparation and injected failure at each publication boundary;
-- ENOSPC for blocks and inodes; and
-- a large existing image above the automatic cap.
+**Status: retained and passed on HVF and KVM.** Unit and fuzz tests cover
+canonical index/CAS failures, partial final chunks, virtio and grow-response
+parsing, and pre-mount plus around-ioctl ext4 source rejection. The retained
+cross-backend smokes cover existing compact images, cached PREPARE reuse,
+concurrent publication, six injected publication failures, large COPY/RUN,
+block/inode ENOSPC, exact save/restore geometry, pack/unpack/pull identity, and
+an image commit reused as a later build base. Journaled, recovery-needed,
+errored, and orphaned sources fail before writable mount and publication. The
+KVM capacity lifecycle run required and passed `e2fsck`.
 
 ## Decision Gates
 
-P0/P1 justified implementing Design A on the reference M4/HVF host. Linux
-ARM64/KVM storage failure and teardown now pass, but the branch is not
-release-complete until its unpaired performance gates are resolved and every
-still-unmeasured item below is recorded:
+The implementation and final cross-backend release gates are closed:
 
-- incremental preparation work inside the same already-booted executor session
-  (grow/ioctl/pre-step checkpoint/record, excluding the shared build boot) has
-  p95 at most 250 ms on each backend, with the median reported rather than
-  hidden; HVF measures 126 ms median / 127 ms p95 and KVM measures 211 ms
-  median / 218 ms p95, while the user-facing cold-build gate below remains
-  authoritative;
-- on each backend, tiny cold median is within 150 ms of a paired
-  prepared/no-growth baseline using the same host, commit, parent, and fixture;
-  the historical 0.36s baseline and preferred result at or below 0.50s are
-  reference M4/HVF measurements, not KVM thresholds;
-- appended known-zero bytes cause no proportional overlay writes, CAS payload,
-  sealed-candidate count, or zero-scan time;
-- the fully nonzero canonical index at the selected default/cap fits below
-  `max_index_bytes` with measured RSS/headroom, and normal ENOSPC cannot first
-  appear as an unencodable snapshot;
-- changed/sealed chunks scale with ext4 group metadata rather than logical
-  bytes added;
-- P3 shows no post-checkpoint background writer or semantic/backend-dependent
-  filesystem difference; bounded timestamp-only variance is reported rather
-  than treated as a correctness failure;
-- all supported ext4 corpus cases are fsck-clean and bootable;
-- malformed requests and injected failures leave parent/cache/ref state
-  unchanged, the CLI exits through its normal build-error path, and no backend
-  teardown abort follows; and
-- the warm path remains boot-free on both backends. On reference M4/HVF it is
-  at most 0.15s, and the historical one-COPY 0.34s path regresses by no more
-  than 20%; the measured values are 0.13s and 0.40s. On KVM, compare warm and
-  one-COPY medians with paired pre-grown/no-preparation controls on the same
-  host and require no more than 20% regression. Retaining full index/CAS
-  validation is preferable to chasing the historical 0.09s HVF warm result by
-  weakening cache integrity.
+| Gate | HVF at `0bb559a2f5d03c48d5d5016a4181b177d1cf5413` | Linux ARM64/KVM at `0bb559a2f5d03c48d5d5016a4181b177d1cf5413` |
+|---|---|---|
+| Preparation p95 <= 250 ms | Pass: 117 ms p95, 113 ms median in the instrumented control | Pass: 213 ms p95, 210 ms median in the instrumented control |
+| Tiny cold median paired delta <= +150 ms | Pass: -26.899 ms | Pass: -67.936 ms |
+| Warm paired median regression <= 20% and zero boot | Pass: -14.083%; zero boot in both instrumented lanes | Pass: -13.339%; zero boot in both instrumented lanes |
+| One-COPY incremental paired median regression <= 20% | Pass: -3.222% | Pass: -5.221% |
+| Stable PREPARE identity across five complete pairs | Pass: one key, child index, and producer identity | Pass: one key, child index, and producer identity |
+| Sparse and canonical-index bounds | Pass: no proportional zero scan/payload; dense 16 GiB index fits with 47.8% headroom | Pass: retained sparse/index runtime checks |
+| Supported journal-less ext4 is fsck-clean, bootable, and quiescent | Pass: boot and quiescence; retained native and checksum fixtures passed, with earlier fsck evidence | Pass: required `e2fsck`, boot, and checksum-fixture quiescence |
+| Large COPY/RUN and block/inode ENOSPC | Pass: exact payload checks; terminal status, no retry, unchanged ref | Pass: exact payload checks; terminal status, no retry, unchanged ref |
+| Publication and lifecycle integrity | Pass: concurrency plus six injected boundaries; save/restore, pack/unpack/pull, and commit-as-base preserve identity/geometry | Pass: identical retained publication and lifecycle corpus |
 
-If latency, quiescence, or filesystem semantics fail, prototype the narrow
-CAS-native grower for the Spore native profile before expanding device/cache
-complexity. Bounded kernel timestamp variance alone is not a fallback trigger.
-If compatibility alone fails for a minority external layout, compare
-capacity-at-birth for that producer with a clear fail-closed error; do not
-silently fall back to a slow guest `resize2fs` process.
+The paired harness is authoritative for user-facing performance. The
+instrumented profile is an engineering control and cannot substitute for a
+default-path row. All release rows require a clean checkout, checkout-bound
+ReleaseSafe binary fingerprint, fixed image identity, five complete pairs,
+successful output verification, and a zero harness exit. Full index/CAS
+validation remains mandatory even if weakening it would improve a historical
+warm number.
 
 ## Benchmark And Validation Matrix
 
-Use ReleaseSafe, fixed source/image digests, isolated and shared preparation
-caches, isolated Dockerfile caches, successful runnable-output verification,
-and at least five tiny samples or three large samples. Always report the fixed
-default path separately from engineering-only negative controls. The harness
-must set the explicit `SPOREVM_ROOTFS_GROWTH_EXPERIMENTS=1` master opt-in before
-any fault or idle control is honored; ordinary builds ignore the individual
-control variables when that master opt-in is absent.
+Use a clean checkout, a checkout-bound ReleaseSafe binary, digest-pinned image
+inputs, isolated and shared caches, and successful runnable-output verification.
+Run the same retained commands with `SPORE_BACKEND=hvf` and
+`SPORE_BACKEND=kvm`; require e2fsck on the Linux host. Engineering controls are
+enabled only behind `SPOREVM_ROOTFS_GROWTH_EXPERIMENTS=1` and are reported
+separately from the default path.
 
-| Workload | Cold/no-cache | Prepared/shared | Warm | Incremental/failure proof |
-|---|---|---|---|---|
-| Tiny Alpine fixture | default and isolated preparation | preparation hit | full step-cache hit | one COPY and trailing RUN change |
-| Medium package install | native and external base | repeat same base | cache hit | package-list change, blocks/inodes |
-| Large `buildkite-sporevm` | default capacity | shared base | cache hit | one COPY and one RUN change |
-| Large COPY | below/near/above capacity | repeat base | cache hit | changed tail; terminal ENOSPC |
-| Large RUN output | below/near/above capacity | repeat base | cache hit | changed command; no retry |
-| Inode exhaustion | increasing empty files | repeat base | n/a | free-inode diagnostics, unchanged ref |
+| Retained check | Contract |
+|---|---|
+| `mise exec -- zig build --release=safe spore-build-large-copy-smoke` | Writes and verifies a 2.25 GiB sparse COPY beyond the old boundary. |
+| `mise exec -- zig build --release=safe spore-build-large-run-smoke` | Produces and verifies a deterministic nonzero 512 MiB RUN file, reopens the fresh no-cache output from CAS, then proves a warm zero-boot hit. |
+| `mise exec -- zig build --release=safe spore-build-block-enospc-smoke` | Exhausts blocks, returns the build-error status without retry, and preserves authoritative metadata/ref state. |
+| `mise exec -- zig build --release=safe spore-build-inode-enospc-smoke` | Exhausts inodes with the same terminal/no-retry/unchanged-state contract. |
+| `test/smoke/rootfs/build-publication.sh` | Uses a deterministic lock barrier for concurrent PREPARE, then injects all six publication boundaries and verifies recovery/GC. |
+| `test/smoke/rootfs/build-capacity.sh` | Verifies exact guest geometry after build, save/restore, pack/unpack/pull, image commit reused as a later build base, and an existing image above 16 GiB. |
+| `scripts/benchmark/spore-build-rootfs-capacity.py --paired-matrix --paired-profile default-path --iterations 5 ...` | Runs paired cold, warm, incremental, and shared-PREPARE scenarios and enforces user-facing gates. |
+| `scripts/benchmark/spore-build-rootfs-capacity.py --paired-matrix --paired-profile instrumented --iterations 5 ...` | Records preparation p95, zero-boot evidence, and storage counters without replacing default-path evidence. |
 
-Required correctness passes:
-
-- canonical index/object validation and completeness;
-- `e2fsck -fn` after growth and after representative builds;
-- read/write beyond the original filesystem boundary;
-- save a VM from a built image, restore it, and preserve exact disk geometry;
-- commit a built image and use the commit as a later build base without
-  another default grow;
-- pack/unpack/pull the resulting rootfs and preserve exact identity;
-- identical smoke script and visible behavior on HVF and KVM;
-- cache corruption/miss and GC reachability tests;
-- concurrency/fault-injection publication tests; and
-- fuzz/unit coverage for virtio write-zeroes, zero-range arithmetic, resize
-  control parsing, capacity parsing, and existing index/descriptor loading.
+Unit/fuzz coverage additionally enforces canonical index/object completeness,
+compact `DigestIndex` semantics, partial-tail CAS verification, virtio
+write-zeroes framing and mutation rules, ext4 source preflight, resize response
+arithmetic, cache corruption/GC behavior, and failure poisoning.
 
 ## Delivery Strategy
 
 ### Slice 0. Instrument And Run The Stop/Go Experiments
 
-**Status: complete on HVF; KVM positive/error-path repeats complete, with
-unpaired performance gates remaining in Slice 7.**
+**Status: complete.** These stop/go experiments selected the implemented
+design. Final backend release execution is tracked in Slice 7.
 
 - Add P1 phase timings/counters behind existing build profiling.
 - Prototype clean-zero growth, one-segment `WRITE_ZEROES`, and direct ioctl in
@@ -1063,19 +915,19 @@ This slice made no default behavior or public CLI changes.
 
 ### Slice 1. Correct Known-Zero Storage Semantics
 
-**Status: implementation complete.** Shared backend unit/compile coverage and
-the HVF runtime smoke pass are complete. Native KVM positive-path runtime is
-measured, and its injected storage-failure path now exits cleanly with status
-2; wider lifecycle/workload coverage remains in Slice 7.
+**Status: complete.** Shared unit/fuzz coverage and final HVF/KVM runtime
+evidence pass.
 
 - Add clean-zero disk growth and `zeroRange` to `ChunkMappedDisk`.
 - Preserve dirty-zero semantics for clearing parent data.
 - Add unit/property tests for full/partial/CAS/read-only/out-of-range cases.
-- Pin the mixed-parent growth invariant: old digests remain unchanged, every
-  appended null digest is paired with `.zero`, the child index explicitly
-  covers the full tail in `zero_chunks`, no tail chunk is sealed, and the
-  result equals a full-rescan oracle. Then write one appended chunk and require
-  exactly that chunk to seal.
+- Pin the mixed-parent growth invariant: the compact `DigestIndex` continues to
+  contain only nonzero parent digests, and absence within
+  `parent_logical_size` means canonical zero. Growth leaves that index
+  unchanged, extends the dense source map with `.zero`, and makes the child
+  index explicitly cover the appended tail in `zero_chunks`; no appended tail
+  chunk seals until written. The result equals a full-rescan oracle, and writing
+  one appended chunk seals exactly that chunk.
 - Expose snapshot counters proving appended zeros are reused without sealing.
 
 This slice is useful independently and does not change the guest device
@@ -1094,8 +946,8 @@ feature surface.
   HVF and KVM.
 - Validate every request completely before mutation.
 - Add stateful before/after fuzzing, malformed-chain tests, status/error tests,
-  and shared HVF/KVM backend coverage. The native KVM failure-path rerun passes
-  with exact CLI status 2 and no teardown abort.
+  and shared backend coverage. The retained failure smoke requires exact CLI
+  status 2, unchanged authority, and normal teardown on each backend.
 - Update `SECURITY.md` and the device contract documentation in the same
   change.
 
@@ -1103,8 +955,9 @@ This slice made no capacity policy change by itself.
 
 ### Slice 3. Replace The Guest Tool With Direct Resize
 
-**Status: implementation complete.** Corruption and GC coverage pass; the
-concurrency/publication fault-injection matrix remains in Slice 7.
+**Status: complete.** Corruption, GC, pre-mount and around-ioctl source
+rejection, concurrent publication, and six publication-boundary fault cases
+are retained and pass on HVF and KVM.
 
 - Add no-capacity-argument `spore-rootfs-grow-v1` to the initrd agent and host
   executor, with exactly one type and one bounded session identifier.
@@ -1116,10 +969,9 @@ concurrency/publication fault-injection matrix remains in Slice 7.
 - Replace `resize2fs /dev/vda` on the build path.
 - Remove the selected image's `/bin/sh`/e2fsprogs prerequisite and related
   error text/tests.
-- During the intermediate branch state, keep build versus
-  `run --commit --disk-size` dependency/error text explicit; do not publish a
-  release that implies the run path has converged before Slice 6.
-- Prove the default tiny path meets the performance gate before proceeding.
+- Reject journaled, recovery-needed, errored, and orphaned ext4 before the first
+  writable mount; include this rule in the producer identity.
+- Prove the default tiny path meets the performance gate.
 
 The temporary target/cache identity was removed by Slices 4 and 5.
 
@@ -1144,9 +996,8 @@ The temporary target/cache identity was removed by Slices 4 and 5.
   add a `PREPARE` coverage test.
 - Resolve it before Dockerfile step-cache keys; honor it under `--no-cache`.
 - Continue an executing VM from the published preparation baseline.
-- Reuse step-record GC roots and cover corruption in this slice; defer the
-  wider races, fault injection, and concurrent-preparation release matrix to
-  Slice 7.
+- Reuse step-record GC roots and retain corruption, concurrent-preparation, and
+  publication fault-injection coverage.
 - Remove `disk_grow_target` from new step records and bump the step-cache
   version.
 
@@ -1167,48 +1018,43 @@ through Slice 5 experimentation, but it is required before release.
 
 ### Slice 7. Cross-Backend, Lifecycle, And Durable Docs
 
-**Status: in progress.** Core HVF growth smokes and documentation are complete.
-Native KVM positive paths, the run-commit lifecycle, large COPY, and local pull
-pass. Its forced storage failure now returns exact CLI status 2, preserves
-authoritative state, and exits without a teardown abort. Paired
-cold/warm/incremental performance measurements remain open, alongside
-concurrency/publication injection, prepared-output
-save/restore/pack/unpack/pull identity, and committed-image-as-a-later-build-base.
+**Status: complete.** The retained code, benchmark harness, lifecycle smokes,
+security contract, durable docs, and final HVF/KVM release validation are
+complete. The plan remains `active` only until the change lands.
 
-- Run the full benchmark/correctness matrix on HVF and KVM.
-- The KVM vCPU allocation now has exactly one cleanup owner; the forced-failure
-  smoke requires CLI exit status 2, rejects signal exits, and passes on native
-  KVM.
-- On that KVM host, measure paired default and prepared/no-growth runs of the
-  exact historical fixture plus warm and one-COPY incremental samples; do not
-  compare absolute KVM time with the historical macOS/HVF baseline, and judge
-  the paired deltas against the per-backend gates above.
-- Cover commit, save/restore, pack/unpack/pull, old caches, and existing local
-  images.
-- Update the active `spore-build` plan and durable docs below.
-- Add release notes for the cache break, new default/cap, dependency removal,
-  and absence of a build-capacity knob in v1.
+- Every retained validation command from the matrix passed on Linux ARM64/KVM,
+  including the capacity lifecycle smoke with
+  `SPORE_SMOKE_REQUIRE_E2FSCK=1`.
+- Both five-pair profiles ran from the same clean checkout; the default-path
+  and instrumented gate summaries exited zero.
+- Exact final-commit measurements and anonymized provenance are recorded in
+  Current Progress and Decision Gates. Cross-host conclusions use paired
+  deltas rather than comparing absolute KVM time with the historical HVF
+  baseline.
+- Keep the plan `active` until the change lands, then mark it `landed`.
 
 ## Documentation, Security, And Format Impacts
 
 ### `docs/plans/spore-build.md`
 
-Replace the current doubling formula, resize process, hidden override, and
-guest package requirement with the final automatic target, direct initrd
-request, storage-aware zero behavior, typed `PREPARE` record, and measured
-results.
+The plan records the fixed automatic target, direct initrd request,
+storage-aware zero behavior, typed `PREPARE` record, and measured results. The
+old doubling formula, hidden override, userspace resize, and guest package
+requirement are removed from the current design.
 
 ### `docs/rootfs.md`
 
-Document automatic build growth, sparse logical versus physical capacity, the
-fixed 16 GiB v1 target/cap, inode behavior, existing/local/committed image
-handling, prepared-base reuse, and terminal ENOSPC behavior.
+The rootfs contract documents automatic sparse growth, the fixed 16 GiB v1
+target/cap, existing/local/committed image handling, prepared-base reuse,
+pre-mount ext4 source rejection, default synchronous inode-table policy, and
+terminal ENOSPC behavior.
 
 ### `docs/filesystem.md`
 
-Document clean appended zero semantics, growth-session `WRITE_ZEROES`, direct
-kernel resize, exact geometry inheritance, and why zero capacity creates
-bounded metadata/index/map overhead rather than payload storage.
+The filesystem contract documents clean appended zeros, growth-session
+`WRITE_ZEROES`, pre-mount source validation, direct kernel resize, exact
+geometry inheritance, and why zero capacity creates bounded metadata/index/map
+overhead rather than payload storage.
 
 ### `docs/spore-format.md`
 
@@ -1216,14 +1062,13 @@ No rootfs or disk-index schema change is required. Synthetic `PREPARE` step
 records are host-local cache metadata, not portable restore authority. Exact
 grown bytes are already named by the canonical disk index.
 
-Record that the write-zeroes offer is limited to non-resumable rootfs-growth
-VMs and is not serialized into a spore. Offering it to savable VMs later
-requires a separate negotiated-device-state compatibility review and matching
-HVF/KVM restore coverage.
+The format contract records that write-zeroes is offered only to non-resumable
+rootfs-growth VMs and is not serialized into a spore. Offering it to savable
+VMs later remains a separate negotiated-device-state compatibility change.
 
 ### `SECURITY.md`
 
-Update the `spore build` boundary to cover:
+The `spore build` boundary now covers:
 
 - fixed-shape direct resize rather than arbitrary `resize2fs` execution;
 - selected/restored virtio-feature subset validation and propagation of only
@@ -1234,6 +1079,8 @@ Update the `spore build` boundary to cover:
   while rootfs-only checkpoint/quiescence capture remains valid;
 - clean-zero versus dirty-zero integrity;
 - lazy-CAS partial-zero behavior;
+- read-only primary-superblock preflight before the first writable mount,
+  including journal, recovery, error, and orphan rejection;
 - synchronous inode-table initialization, lazy-init exclusion, and filesystem
   quiescence before preparation publication;
 - discard of an unpublished head after a valid request encounters backend I/O
@@ -1244,14 +1091,15 @@ Update the `spore build` boundary to cover:
 
 ### Cache And Release Compatibility
 
-- Bump the build step-cache version when preparation replaces grow-target
+- The build step-cache version is v7 after preparation replaced grow-target
   fields.
-- Include kernel/initrd/protocol identity in preparation keys.
-- Keep old rootfs indexes/images readable.
-- Keep old build records conservative GC roots but do not reuse them under new
-  key semantics.
-- Release notes call out one-time cache misses and removal of the guest
-  e2fsprogs requirement.
+- Preparation keys include exact kernel/initrd/protocol and source-preflight
+  identity.
+- Old rootfs indexes and images remain readable.
+- Old build records remain conservative GC roots but are not reused under the
+  new key semantics.
+- The release-note impact is a one-time build-cache miss, the fixed 16 GiB
+  target/cap, and removal of the guest e2fsprogs requirement.
 
 ## Key Learnings From Pressure-Testing
 
@@ -1289,11 +1137,9 @@ Update the `spore build` boundary to cover:
   on a fully nonzero index fitting the current 64 MiB bound with headroom, not
   only `du` output or an all-zero growth benchmark.
 - Backend failure injection must prove normal process termination as well as
-  unchanged publication state. The KVM run printed the intended growth error
-  before a pre-existing duplicate vCPU cleanup aborted teardown, demonstrating
-  that matching diagnostics alone are insufficient fail-closed evidence.
-  Rebased commit `9be8d24` removed the duplicate owner, made exact status 2 part of the
-  smoke contract, and passed the original failure path on native KVM.
+  unchanged publication state. The retained smoke therefore requires exact
+  build-error status 2, rejects signal exits, verifies unchanged authority, and
+  runs a subsequent VM so matching diagnostics alone cannot close the gate.
 
 ## Resolved Recommendations
 
@@ -1301,8 +1147,12 @@ Update the `spore build` boundary to cover:
 - Append capacity as clean known-zero chunks and implement checked zero ranges.
 - Add rootfs-growth-session virtio-blk `WRITE_ZEROES` so ext4 zeroout stays
   metadata.
-- Make `noinit_itable` the internal growth-session mount policy, subject to P0
-  fixture validation, so no lazy inode-table writer survives `PREPARE`.
+- Make `noinit_itable` the product-default internal growth-session mount policy,
+  with only a master-gated engineering negative control able to omit it, so no
+  lazy inode-table writer survives `PREPARE`.
+- Restrict automatic growth to journal-less ext4 that passes pre-mount
+  recovery, error, and orphan validation; fail closed before writable mount for
+  every other source.
 - Validate selected/restored virtio features against the offered set and pass
   accepted features to request handling.
 - Replace the guest `resize2fs` process with a fixed initrd-agent
@@ -1326,17 +1176,24 @@ Update the `spore build` boundary to cover:
 - Keep default-path performance results separate from negative-control and
   isolated-preparation-cache experiments.
 
-## Remaining Release Questions
+## Deferred Work
 
-1. Do paired same-host samples of the exact historical fixture meet the KVM
-   cold, warm, and incremental performance gates? Native KVM request shape,
-   quiescence, prepared identity, cache reuse, forced-failure status/state
-   integrity, run-commit lifecycle, large COPY, and local pull pass; prepared
-   build-output save/restore remains open.
-2. Which additional external-writer ext4 layouts should be declared supported
-   after the current native and checksum-enabled fixtures? A layout that the
-   pinned kernel cannot online-resize remains a narrow fail-closed
-   compatibility case; there is no slow `resize2fs` fallback.
-3. If real workloads eventually require more than 16 GiB, should the next
-   proposal raise the canonical-index limit or introduce range-compressed
-   coverage? That is a format/RSS design prerequisite, not a v1 knob.
+- Characterize 10/16/32/64 GiB targets across additional journal-less
+  Debian/Ubuntu/e2fsprogs fixtures, package installation, Node, Ruby bundle,
+  and `buildkite-sporevm` workloads. This broad grid may tune future policy or
+  expose producer-specific limits, but it is not a v1 release gate after the
+  dense-index bound and retained large COPY/RUN/ENOSPC corpus selected 16 GiB.
+- Add journal-less external-writer fixtures only when they represent a real
+  producer SporeVM intends to support. Journaled, recovery-needed, errored, or
+  orphaned filesystems remain outside the v1 automatic-growth envelope and
+  fail before writable mount; there is no `resize2fs` fallback.
+- Split the paired benchmark harness into smaller modules only as a mechanical
+  maintainability follow-up, preceded by golden CLI/help, JSONL schema, summary,
+  and exit-policy tests. The validated single-file harness is intentionally not
+  reorganized during release evidence collection.
+- If real workloads require more than 16 GiB, separately design a higher
+  canonical-index limit or range-compressed coverage before adding a larger
+  default or user knob.
+- Reconsider capacity-at-birth or the narrow CAS-native grower only if measured
+  compatibility, latency, or quiescence evidence invalidates the kernel-resize
+  design; do not maintain parallel grow paths speculatively.

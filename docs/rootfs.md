@@ -49,34 +49,45 @@ Without `--`, the command runs as `/bin/sh -lc` in the guest. Use
 `WorkingDir` when present. It does not apply OCI Entrypoint, Cmd, or User.
 
 `spore build` prepares capacity automatically before the first executor-backed
-Dockerfile instruction. A valid rootfs smaller than 16 GiB grows once to
-exactly 16 GiB; an image already at or above 16 GiB keeps its exact size. The
-policy is absolute and idempotent, so imported OCI images, existing local
-images, committed images, and cached intermediates never recursively double.
-There is no build disk-size, inode-density, or resize-tool option.
+Dockerfile instruction. A supported journal-less rootfs smaller than 16 GiB
+grows once to exactly 16 GiB; an image already at or above 16 GiB keeps its
+exact size. The policy is absolute and idempotent, so imported OCI images,
+existing local images, committed images, and cached intermediates never
+recursively double. There is no build disk-size, inode-density, or resize-tool
+option.
 
 The appended logical range is authoritative sparse zero storage. During the
-one growth boot, the managed initrd derives the visible device geometry and
-calls `EXT4_IOC_RESIZE_FS`; capacity preparation does not invoke the selected
-image's shell and needs no e2fsprogs or `resize2fs`. Builder-v7 records the
-complete grown index as a typed `PREPARE` derivation keyed by the parent,
-exact target, and exact kernel/initrd growth
-producer. Other Dockerfiles—and `--no-cache` builds that intentionally bypass
-Dockerfile instruction-cache reads—reuse that preparation without another
-resize. RUN/COPY/WORKDIR cache keys also bind that exact executor identity, so
-a different agent/kernel cannot reuse downstream outputs merely because it
-produced the same prepared bytes. A miss snapshots and publishes `PREPARE`
-before step zero, then continues in the same VM with the digest-bound boot
-artifacts. Managed-default cache hits do not read the kernel or initrd bodies;
-an executor miss verifies and boots the same once-opened kernel bytes.
+one growth boot, the managed initrd validates the primary ext4 superblock
+read-only before the first writable mount, derives the visible device geometry,
+revalidates the source state before the ioctl and after the resized filesystem
+is synced, and calls `EXT4_IOC_RESIZE_FS`; capacity preparation does not invoke
+the selected image's shell and needs no e2fsprogs or `resize2fs`. Builder-v7
+records the complete grown index as a typed `PREPARE` derivation keyed by the
+parent, exact target, and exact kernel/initrd growth producer. Other Dockerfiles
+and `--no-cache` builds that intentionally bypass Dockerfile instruction-cache
+reads reuse that preparation without another resize. RUN/COPY/WORKDIR cache
+keys also bind that exact executor identity, so a different agent/kernel cannot
+reuse downstream outputs merely because it produced the same prepared bytes. A
+miss snapshots and publishes `PREPARE` before step zero, then continues in the
+same VM with the digest-bound boot artifacts. Managed-default cache hits do not
+read the kernel or initrd bodies; an executor miss verifies and boots the same
+once-opened kernel bytes.
 
-The v1 growth contract covers SporeVM's native ext4 profile and conventional
-e2fsprogs-produced ext4 layouts that the pinned guest kernel can online-grow
-under the internal synchronous inode-table policy. The retained corpus includes
-the native profile and a metadata-checksum/uninitialized-group layout. This is
-not a promise to rewrite every ext4 feature or topology: an unsupported, dirty,
-or geometrically inconsistent filesystem fails before PREPARE, step, image, or
-destination-ref publication. There is no slow `resize2fs` fallback.
+The v1 growth contract covers SporeVM's journal-less native ext4 profile and
+journal-less layouts produced by SporeVM's e2fsprogs writer, or equivalent
+layouts that the pinned guest kernel can online-grow. Before writable mount,
+the initrd rejects `has_journal`, recovery and journal-device flags, filesystem
+error or orphan state, a nonzero legacy orphan head, and the orphan-file
+pending-cleanup flag. A frozen journal-less checkpoint is still accepted when
+it lacks the clean-unmount bit. After mount, the initrd re-reads and validates
+the same source-state fields before any resize mutation and validates them again
+after `syncfs`. The product-default growth mount uses the internal
+`noinit_itable` policy so new inode tables finish synchronously; only a guarded
+engineering negative control can omit it. The retained corpus includes the
+native profile and a journal-less metadata-checksum/uninitialized-group layout.
+Other features or topology may still fail kernel online resize or geometry
+validation. Every unsupported case fails before PREPARE, step, image, or
+destination-ref publication; there is no slow `resize2fs` fallback.
 
 Block or inode exhaustion during COPY/RUN is terminal for that invocation.
 SporeVM does not replay a step that may have external side effects and does not
@@ -151,19 +162,18 @@ failure leaves the previous ref unchanged.
 For a larger target, SporeVM extends the private head sparsely and records the
 appended range as known-zero chunks. A non-resumable growth-session virtio-blk
 profile exposes `WRITE_ZEROES`, allowing ext4 zero ranges to remain sparse in
-the overlay and rootfs CAS. Before the user command, the managed initrd agent
-reads the visible block-device geometry and calls `EXT4_IOC_RESIZE_FS` directly
-on the mounted rootfs, then syncs the filesystem. A feature-aware primary
-superblock read must show that the filesystem block count increased and reached
-the device-derived target within less than one ext4 block group; the host
+the overlay and rootfs CAS. Before writable mount, the managed initrd applies
+the same journal/recovery/error/orphan preflight described above. It then mounts
+with the product-default internal `noinit_itable` policy, reads the visible
+block-device geometry, revalidates the same source state before any resize
+mutation, calls `EXT4_IOC_RESIZE_FS` directly on the mounted rootfs, syncs the
+filesystem, and validates that state again. A feature-aware primary superblock
+read must show that the filesystem block count increased and reached the
+device-derived target within less than one ext4 block group; the host
 independently validates the exact response against the same invariants. The
-growth step does not
-invoke the selected image's shell and needs no `resize2fs` or e2fsprogs.
-Growth sessions mount with the internal `noinit_itable` policy so
-checksum-enabled ext4 filesystems complete inode-table
-initialization synchronously before commit. Any block growth, zeroing, ioctl,
-sync, or response-validation failure aborts before the command and publishes
-nothing.
+growth step does not invoke the selected image's shell and needs no `resize2fs`
+or e2fsprogs. Any source preflight, block growth, zeroing, ioctl, sync, or
+response-validation failure aborts before the command and publishes nothing.
 
 Commit is the storage-preparation layer for fan-out, not the warm-machine
 layer. Prepare stable dependencies or Docker data into an image, put frequently
@@ -458,12 +468,16 @@ filesystem with SporeVM's native writer.
 The generated ext4 image uses UUID and directory hash seeds derived from the
 selected OCI manifest digest, normalizes filesystem and inode timestamps to the
 Unix epoch, and omits the ext4 journal and metadata checksum features so
-repeated builds of the same resolved image produce identical bytes.
+repeated builds of the same resolved image produce identical bytes. This
+journal-less native profile is inside the automatic-growth support envelope.
 
-Set `SPOREVM_EXT4_WRITER=external` to use the legacy e2fsprogs writer.
-`mkfs.ext4` and `debugfs` are then auto-detected from `PATH`, common Linux
-locations, and Homebrew's `e2fsprogs` prefix. Use `--mkfs` and `--debugfs` to
-override the detected binaries for that external fallback.
+Set `SPOREVM_EXT4_WRITER=external` to use the legacy e2fsprogs writer. SporeVM
+also disables its journal (and orphan-file feature when supported), keeping
+SporeVM-produced external layouts inside the pre-mount growth envelope when
+their remaining features and geometry are accepted by the pinned kernel.
+`mkfs.ext4` and `debugfs` are auto-detected from `PATH`, common Linux locations,
+and Homebrew's `e2fsprogs` prefix. Use `--mkfs` and `--debugfs` to override the
+detected binaries for that external fallback.
 
 The current native default uses builder version `sporevm-rootfs-v6`; older
 rootfs cache entries are rebuilt once. Rootfs metadata records the selected

@@ -31,13 +31,13 @@ exact-rootfs spores; it is not the normal producer path.
 
 `spore build` uses the same descriptor-bound indexes and writable head. Before
 the first executor-backed instruction, builder v7 computes
-`max(parent_logical_size, 16 GiB)`. A smaller parent is extended once with
-authoritative clean-zero chunks; a parent already at or above 16 GiB retains
-its exact geometry. There is no recursive headroom rule or build capacity
-override. The transient growth profile offers virtio-blk `WRITE_ZEROES`, and
-the managed initrd invokes `EXT4_IOC_RESIZE_FS` from the visible device size,
-so the zero range remains sparse and the growth path invokes neither the
-image's shell nor `resize2fs`.
+`max(parent_logical_size, 16 GiB)`. A smaller supported journal-less parent is
+extended once with authoritative clean-zero chunks; a parent already at or
+above 16 GiB retains its exact geometry. There is no recursive headroom rule or
+build capacity override. The transient growth profile offers virtio-blk
+`WRITE_ZEROES`, and the managed initrd invokes `EXT4_IOC_RESIZE_FS` from the
+visible device size, so the zero range remains sparse and the growth path
+invokes neither the image's shell nor `resize2fs`.
 
 The grown canonical index is published as a complete rootfs before a typed
 builder-v7 `PREPARE` record makes it reusable. Its key binds the immutable
@@ -54,12 +54,21 @@ indexes and local images remain readable. Failed
 growth, quiescence, completeness, PREPARE, step, or ref publication never
 rewrites the parent or makes incomplete storage reachable.
 
-Automatic growth supports the native ext4 profile and conventional
-e2fsprogs-produced layouts that the pinned guest kernel can online-grow with
-synchronous inode-table initialization; the retained compatibility fixtures
-cover native and metadata-checksum/uninitialized-group filesystems. Unknown,
-dirty, or unsupported ext4 geometry fails closed. SporeVM neither guesses at a
-host-side rewrite nor falls back to a guest `resize2fs` process.
+Automatic growth supports SporeVM's journal-less native ext4 profile and
+journal-less layouts from SporeVM's e2fsprogs writer, or equivalent layouts the
+pinned guest kernel can online-grow. Before the first writable mount, the initrd
+reads the primary superblock and rejects journal presence, recovery or
+journal-device flags, filesystem error or orphan state, a nonzero legacy orphan
+head, and the orphan-file pending-cleanup flag. A frozen journal-less checkpoint
+does not need the clean-unmount bit. After mount, the initrd re-reads and
+validates the same source-state fields before any resize mutation and validates
+them again after `syncfs`. The product-default growth mount uses internal
+`noinit_itable` so new inode tables initialize synchronously; a guarded
+engineering negative control is the only path that omits it. The retained
+fixtures cover native and journal-less metadata-checksum/uninitialized-group
+filesystems. Unknown or unsupported features and inconsistent geometry fail
+closed. SporeVM neither guesses at a host-side rewrite nor falls back to a guest
+`resize2fs` process.
 
 A format-valid source may end partway through its final 64 KiB chunk. Growth
 preserves and, for CAS sources, verifies that old prefix, materializes at most
@@ -84,18 +93,17 @@ the chunk map as authoritative clean zeros rather than allocated payload. The
 growth-only virtio-blk profile accepts `WRITE_ZEROES`, so ext4 zeroing can clear
 those ranges without proportional overlay or CAS storage.
 
-Before starting the user command, the managed initrd agent derives the visible
-device size with `BLKGETSIZE64`, invokes `EXT4_IOC_RESIZE_FS` on the mounted
-rootfs, and syncs it. It decodes the primary ext4 superblock before and after
-the ioctl; the block count must increase, stay at or below the device-derived
+Before starting the user command, the managed initrd performs the pre-mount
+source validation above, mounts with the product-default internal
+`noinit_itable` policy, derives the visible device size with `BLKGETSIZE64`, and
+revalidates the source state before invoking `EXT4_IOC_RESIZE_FS`. After the
+ioctl it syncs the filesystem and validates that state again. The primary ext4
+superblock block count must increase, stay at or below the device-derived
 target, and miss it by less than one ext4 block group. The host independently
-validates the exact response against the same invariants while `statfs`
-supplies free-space/inode diagnostics only.
-This path does not execute the image's shell or require `resize2fs` or any other
-guest package. Growth sessions use the internal `noinit_itable` mount policy so
-checksum-enabled ext4 layouts finish new inode-table initialization before the
-command and rootfs snapshot instead of leaving a background initializer. A
-missing or mismatched source, invalid geometry, failed zeroing or ioctl, or
+validates the exact response against the same invariants while `statfs` supplies
+free-space/inode diagnostics only. This path does not execute the image's shell
+or require `resize2fs` or any other guest package. A missing or mismatched
+source, rejected preflight, invalid geometry, failed zeroing or ioctl, or
 malformed result aborts before the destination ref changes. The committed
 rootfs descriptor and disk index use the grown logical size; the immutable
 source index remains unchanged.

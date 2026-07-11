@@ -51,10 +51,11 @@ related_plans:
 >
 > **Capacity update (2026-07-11).** Build cache v7 separates rootfs capacity
 > preparation from Dockerfile instruction caching. The automatic policy is the
-> idempotent absolute target `max(parent_logical_size, 16 GiB)`: compact images
-> prepare once to 16 GiB, while images already at or above 16 GiB retain their
-> exact size. A typed `PREPARE` record reuses that normalization across
-> Dockerfiles and under `--no-cache`. On a miss, the storage layer appends
+> idempotent absolute target `max(parent_logical_size, 16 GiB)`: supported
+> journal-less compact images prepare once to 16 GiB, while images already at
+> or above 16 GiB retain their exact size. A typed `PREPARE` record reuses that
+> normalization across Dockerfiles and under `--no-cache`. On a miss, the
+> storage layer appends
 > authoritative sparse zero chunks, the transient growth VM exposes
 > `WRITE_ZEROES`, and the managed initrd calls the ext4 resize ioctl directly
 > before publishing a same-VM checkpoint. There is no recursive growth, hidden
@@ -194,20 +195,23 @@ one target from the immutable `FROM` storage:
 automatic_target = max(parent_logical_size, 16 GiB)
 ```
 
-The 16 GiB value is both the default and the automatic-growth cap. A compact
-image grows once to exactly 16 GiB; a 16 GiB or larger image is unchanged, so
-reusing a built or committed image never doubles or adds capacity recursively.
-There is no hidden override or public capacity knob. Logical capacity remains
-sparse and does not reserve 16 GiB of physical storage.
+The 16 GiB value is both the default and the automatic-growth cap. A supported
+journal-less compact image grows once to exactly 16 GiB; a 16 GiB or larger
+image is unchanged, so reusing a built or committed image never doubles or adds
+capacity recursively. There is no hidden override or public capacity knob.
+Logical capacity remains sparse and does not reserve 16 GiB of physical
+storage.
 
 Before the first executor-backed instruction, the builder resolves a typed v7
 `PREPARE` key from the parent index, exact target, and the exact managed
 kernel/initrd plus growth-protocol producer identity. A hit becomes the parent
 for ordinary Dockerfile keys. On a miss, the same VM that will execute the
-remaining steps grows the clean-zero chunk map, asks the managed initrd to run
-the ext4 resize ioctl, freezes and snapshots the prepared filesystem, publishes
-the completeness stamp and `PREPARE` record, thaws, and continues with step
-zero. The selected image needs no `/bin/sh` or `resize2fs` for preparation.
+remaining steps grows the clean-zero chunk map. Before the first writable
+mount, the managed initrd rejects journal, recovery, error, and pending-orphan
+state and revalidates that source state around the ext4 resize ioctl. The
+builder then freezes and snapshots the prepared filesystem, publishes the
+completeness stamp and `PREPARE` record, thaws, and continues with step zero.
+The selected image needs no `/bin/sh` or `resize2fs` for preparation.
 
 `FROM` also accepts existing image refs directly (`FROM local/foo:dev`,
 `FROM local/foo@sha256:…`), resolved through `resolveLocalCachedRef`. Registry
@@ -649,18 +653,24 @@ Session lifecycle:
    the sparse fd and verified parent index make those zeroes storage truth, so
    snapshotting does not read, hash, or allocate payload for the untouched
    tail.
-3. Boot via the existing run stack with an internal rootfs-growth profile. It
-   opens the rootfs read-write, marks the VM non-resumable, and transiently
-   offers `VIRTIO_BLK_F_WRITE_ZEROES` only on the root block device. The shared
-   virtio handler validates one bounded range and maps accepted zeroing directly
-   to `ChunkMappedDisk.zeroRange`; the growth-only feature never enters a
-   portable manifest or restored transport state.
+3. Boot via the existing run stack with an internal rootfs-growth profile. The
+   host marks the VM non-resumable and transiently offers
+   `VIRTIO_BLK_F_WRITE_ZEROES` only on the root block device. Before the first
+   writable mount, the managed initrd opens `/dev/vda` read-only and rejects
+   journal presence, recovery or journal-device flags, filesystem error or
+   orphan state, a nonzero legacy orphan head, and pending orphan cleanup; it
+   then mounts the rootfs read-write. The shared virtio handler validates one
+   bounded range and maps accepted zeroing directly to
+   `ChunkMappedDisk.zeroRange`; the growth-only feature never enters a portable
+   manifest or restored transport state.
 4. The host sends the strict two-field `spore-rootfs-grow-v1` request. The
-   managed initrd reads the exact device geometry, calls `EXT4_IOC_RESIZE_FS` on
-   the mounted rootfs, `syncfs`es, and requires the feature-aware ext4
-   superblock block count to increase and reach the target within less than one
-   block group. The host independently validates the exact response against the
-   same invariants. No selected-image shell or e2fsprogs utility participates.
+   managed initrd re-reads and validates the source state before any resize
+   mutation, reads the exact device geometry, calls `EXT4_IOC_RESIZE_FS` on the
+   mounted rootfs, `syncfs`es, and validates the source state again. It requires
+   the feature-aware ext4 superblock block count to increase and reach the
+   target within less than one block group. The host independently validates
+   the exact response against the same invariants. No selected-image shell or
+   e2fsprogs utility participates.
 5. Freeze the prepared filesystem, quiesce virtio-blk, seal the changed
    metadata chunks, emit the canonical logical index, publish the completeness
    stamp, and write the
@@ -864,9 +874,10 @@ single-digit seconds end to end, with the BuildKit tar export removed.
 - `spore-rootfs-grow-v1` is bounded attacker-influenced control input. The
   managed initrd accepts exactly one type and one nonempty bounded session id,
   rejecting duplicate, unknown, trailing, or embedded-NUL input. It validates
-  the request/profile combination and authoritative pre/post ext4 geometry;
-  the host validates its exact response against the target and one-group bound.
-  Malformed input, unsupported ext4 geometry, or an ioctl/block error aborts
+  the journal-less source state before writable mount, revalidates it before
+  and after the ioctl, and checks authoritative pre/post ext4 geometry; the host
+  validates its exact response against the target and one-group bound. Malformed
+  input, unsupported ext4 state or geometry, or an ioctl/block error aborts
   before PREPARE, Dockerfile records, or the destination ref are published.
 - Step records under `build/steps/` are trusted local build metadata — same
   trust level as the cache directory that holds them — and never leave
@@ -1058,8 +1069,9 @@ the idempotent automatic target is `max(FROM.logical_size, 16 GiB)`, preparation
 has its own parent/target/producer key, and Dockerfile step keys contain no
 growth field. v6 records remain conservative GC roots but cannot hit v7 keys.
 
-Implementation note (2026-07-11, v7 capacity preparation): compact FROM images
-append clean known-zero coverage without physical preallocation. The
+Implementation note (2026-07-11, v7 capacity preparation): supported
+journal-less compact FROM images append clean known-zero coverage without
+physical preallocation. The
 non-resumable growth VM temporarily negotiates WRITE_ZEROES, then the managed
 initrd handles `spore-rootfs-grow-v1` with `EXT4_IOC_RESIZE_FS` and bounded
 geometry validation. Freeze → metadata-only sealing plus canonical full-index
@@ -1293,8 +1305,9 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
   PREPARE.
 - The storage layer records the appended sparse tail as authoritative clean
   zero. Growth-only VMs transiently offer WRITE_ZEROES, and the managed initrd
-  owns ext4 correctness through `EXT4_IOC_RESIZE_FS`. The selected image has no
-  shell or e2fsprogs dependency for preparation.
+  preflights journal-less source state before writable mount, revalidates it
+  around `EXT4_IOC_RESIZE_FS`, and leaves ext4 correctness to the pinned kernel.
+  The selected image has no shell or e2fsprogs dependency for preparation.
 - The build executor calls the internal monitor path directly with writable
   rootfs and build-context state. Public `spore run --rootfs` remains
   read-only.

@@ -58,10 +58,12 @@ escape hatch.
 
 Disk growth now uses the same backend-neutral path as build preparation: a
 known-zero sparse tail, a non-resumable virtio-blk `WRITE_ZEROES` profile, and
-the fixed `spore-rootfs-grow-v1` managed-initrd request. The agent derives the
-target from the visible block device and calls `EXT4_IOC_RESIZE_FS` directly;
-the growth step does not invoke the source image's shell and does not need
-`resize2fs` or e2fsprogs.
+the fixed `spore-rootfs-grow-v1` managed-initrd request. For a supported
+journal-less source, the agent rejects recovery, error, and pending-orphan state
+before the first writable mount, revalidates that state around the ioctl,
+derives the target from the visible block device, and calls
+`EXT4_IOC_RESIZE_FS` directly. The growth step does not invoke the source
+image's shell and does not need `resize2fs` or e2fsprogs.
 
 Commit supplies the reusable disk layer for fan-out, not the warm-machine layer.
 The intended composition is: prepare and commit the disk once, capture one warm
@@ -237,12 +239,16 @@ even when fully populated.
 For growth, the runtime extends only the private sparse head and marks the
 appended range as authoritative clean zeros. The growth-only virtio-blk profile
 accepts `WRITE_ZEROES`, allowing filesystem zero ranges to stay free of
-proportional overlay and CAS payload. The managed initrd agent reads
-`BLKGETSIZE64`, calls `EXT4_IOC_RESIZE_FS` on the mounted rootfs, runs `syncfs`,
-and decodes the primary ext4 superblock before and after the ioctl. The total
-block count must increase, remain at or below the target, and fall short by less
-than one block group. The host independently enforces that response alongside
-the exact device size; `statfs` remains bounded free-space/inode diagnostics.
+proportional overlay and CAS payload. Before the first writable mount, the
+managed initrd opens `/dev/vda` read-only and rejects journal presence, recovery
+or journal-device flags, filesystem error or orphan state, a nonzero legacy
+orphan head, and pending orphan cleanup. After mount it re-reads and validates
+that source state before any resize mutation, reads `BLKGETSIZE64`, calls
+`EXT4_IOC_RESIZE_FS` on the mounted rootfs, runs `syncfs`, and validates the
+source state again. The total block count must increase, remain at or below the
+target, and fall short by less than one block group. The host independently
+enforces that response alongside the exact device size; `statfs` remains
+bounded free-space/inode diagnostics.
 
 Growth sessions mount ext4 with the internal `noinit_itable` policy. This is
 particularly important for checksum-enabled layouts: newly added inode tables
@@ -518,6 +524,9 @@ command must stop and clean application daemons before returning success.
   source.
 - **No guest-tool dependency.** Filesystem growth is a fixed managed-initrd
   ioctl request; image contents cannot replace the grower or select its target.
+- **Supported source envelope.** Before writable mount, growth rejects
+  journaled, recovery-needed, errored, or orphaned sources and repeats the same
+  state validation around the ioctl.
 - **Quiescent growth completion.** Internal `noinit_itable` handling prevents a
   checksum-enabled filesystem from reporting preparation complete while lazy
   inode-table initialization can still dirty the disk.
@@ -738,8 +747,9 @@ remains the compatible fan-out path for networked or additional-device layouts.
 - Interrupt during command execution, freeze, snapshot, completeness marking,
   metadata write, and local-ref replacement.
 - Inject guest grow timeout, `WRITE_ZEROES` backend failure, ioctl/sync failure,
-  malformed or mismatched grow geometry, freeze timeout, ENOSPC,
-  corrupt/missing CAS objects, and metadata failures.
+  journal/recovery/error/orphan source state, malformed or mismatched grow
+  geometry, freeze timeout, ENOSPC, corrupt/missing CAS objects, and metadata
+  failures.
 - Prove every growth failure and every invalid or incomplete source leaves a
   pre-existing destination ref unchanged, including source-equals-destination.
 - Run rootfs GC at every legal publication boundary.
