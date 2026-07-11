@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-10
+last_reviewed: 2026-07-11
 spec_refs:
   - docs/rootfs.md
   - docs/filesystem.md
@@ -18,17 +18,15 @@ related_plans:
 
 # Spore-Native Dockerfile Subset Builder (`spore build`)
 
-> **Active** (revived 2026-07-09). This plan was deferred until the unified
-> chunk-backed storage workstream landed. It has: inline CAS+index emission at
-> import (#420), O(dirty) snapshots plus lazy rootfs materialization (#421),
-> and O(1) rootfs completeness stamps for warm `--image` resolution (#423).
-> The old 5m47s/347s framing is obsolete. Current `buildkite-sporevm`
-> measurements put the warm wrapper flow around 30s, with roughly 25s in
-> BuildKit's own tar export, warm `spore run --image` around 0.10s, and cold
-> import around 95s when content changes. A separate autoresearch loop is
-> attacking the remaining import hotspot in `src/rootfs/ext4_writer.zig`;
-> this plan's job is to remove BuildKit tar export and avoid serializing a tar
-> at all.
+> **Active** (revived 2026-07-09). The native builder now builds the original
+> committed `buildkite-sporevm` Dockerfile and runs the resulting image. On
+> merged SporeVM main, the acceptance run completed a forced cold build in
+> 148.78s, a warm rebuild in 9.87s, and a one-file incremental rebuild in
+> 7.31s. The named workflow then reached ready, completed `bin/setup` with live
+> untruncated output, and passed 11 examples in a real RSpec file. Remaining
+> core work is the Docker-vs-Spore filesystem oracle and exact real-workload
+> COPY invalidation proof. Wrapper integration, profiling, repeatable
+> benchmarks, and step-record retirement remain follow-ups.
 >
 > The revival updates M2 onto the unified primitives instead of the original
 > flat-file machinery: persistent-session checkpoints are `ChunkMappedDisk`
@@ -285,10 +283,11 @@ starts as the base `WorkingDir` (default `/`), and `cmd` starts as the base
 extra keying: they are a pure function of the base rootfs index that already
 roots the chain.
 
-Metadata-only instructions (`ENV`, `ARG`, `WORKDIR`, `CMD`) advance `step_key`
-and `BuildState` but never touch the rootfs and never boot anything; their
-child `index_digest` is the parent `index_digest`. Only `RUN` and `COPY`
-produce new rootfs indexes.
+Metadata-only instructions (`ENV`, `ARG`, `CMD`) advance `step_key` and
+`BuildState` without touching the rootfs; their child `index_digest` is the
+parent `index_digest`. `WORKDIR` updates the same state but is also a
+filesystem step: the guest creates the directory when needed and publishes a
+child rootfs index. `RUN` and `COPY` likewise produce new rootfs indexes.
 
 Reused existing machinery, unchanged:
 
@@ -364,10 +363,13 @@ Per-instruction inputs:
   file content, symlink target text, or empty bytes for a directory.
   Ownership is not hashed (COPY forces 0:0). mtimes are not hashed
   (Docker parity).
-- `ENV` / `ARG` / `WORKDIR` / `CMD`: metadata instructions update the state
-  consumed by later execution keys. A changed `ENV`, `ARG`, or `WORKDIR`
-  invalidates later `RUN`/`COPY` steps, while a final metadata-only `CMD` keeps
-  the same rootfs `index_digest` and costs only a local ref/config re-publish.
+- `ENV` / `ARG` / `CMD`: metadata instructions update the state consumed by
+  later execution keys. A changed `ENV` or `ARG` invalidates later `RUN`/`COPY`
+  steps, while a final `CMD` keeps the same rootfs `index_digest` and costs only
+  a local ref/config re-publish.
+- `WORKDIR`: the normalized absolute path and current state key the filesystem
+  step that creates the directory. A changed `WORKDIR` publishes a new child
+  index and invalidates later `RUN`/`COPY` steps.
 
 `network_mode` is present only for `RUN`; COPY keys are deliberately invariant
 across `--network spore` and `--network none` because COPY never uses the build
@@ -744,9 +746,9 @@ Definition of done:
   same change as the new parsers.
 - A fully cached fixture build resolves the final `index_digest`, verifies the
   complete stamp, updates the local ref, and exits in <1s without booting a VM.
-- A metadata-only Dockerfile (`FROM`/`ENV`/`ARG`/`WORKDIR`/`CMD`) publishes a
-  runnable image by reusing the base `index_digest`; a second invocation is a
-  full cache hit in <1s.
+- A metadata-only Dockerfile (`FROM`/`ENV`/`ARG`/`CMD`) publishes a runnable
+  image by reusing the base `index_digest`; a second invocation is a full cache
+  hit in <1s. `WORKDIR` is covered by the M2 filesystem-step smoke.
 - `spore run --image local/x:dev -- /bin/true` boots the published result.
 - `mise run build` and `zig build test --summary all` pass.
 
@@ -803,9 +805,10 @@ instruction, exit code, and captured output without writing the failed step
 record. The slice also fixes
 `spore run --image` for indexed rootfs images so build-published images pass
 `spore_rootfs=1` even when there is no flat rootfs path.
-The build VM memory is currently a provisional 2 GiB default; promote it to a
-`spore build` option when real workloads such as large `bundle install`-style
-RUN steps need more memory.
+The build VM memory remains a fixed 2 GiB default. The original Buildkite
+Dockerfile's apt and Docker installation RUN completed at that size. Add a
+`spore build` option only when a build-time workload demonstrates that 2 GiB
+is insufficient.
 
 Implementation note (2026-07-10, RUN shell expansion): shell-form RUN is now
 opaque to Dockerfile variable substitution and reaches guest `/bin/sh -c`
@@ -913,7 +916,8 @@ the build holds the rootfs-cache coarse lock across step-cache lookup and VM
 execution, then releases it before final image publication. Valid
 `sporevm-build-step-v1` records are GC roots for their child index and objects;
 known incomplete records are ignored as cache misses, and unknown future record
-kinds retain the CAS conservatively. Record retention/pruning remains M5 work.
+kinds retain the CAS conservatively. Record retention/pruning remains
+post-core hardening work.
 
 Implementation note (2026-07-10, original workload proof): build RUN requests
 refresh the guest realtime clock before execution, and mounted rootfs images
@@ -926,13 +930,23 @@ long apt transaction and Docker package installation both completed. Repeating
 an input key after a forced execution now atomically replaces only the derived
 step mapping, while rootfs CAS indexes and objects retain immutable publication.
 
+Post-merge acceptance on `0a99933` rebuilt the same original Dockerfile in
+148.78s cold, 9.87s warm, and 7.31s after changing one context file. The image
+booted, `/bin/true` and Ruby/RSpec probes passed, and wrapper readiness took
+36.23s. Later runtime fixes proved the application path: one-shot `bin/setup`
+completed in 709.87s on `d8db64a`; named `bin/setup` completed in 1081.69s on
+`8790d6a` while streaming 45,495 bytes without truncation; and
+`spec/middleware/admin/developer_tools_guard_spec.rb` passed 11 examples with
+zero failures in 27.80s. All runs ended with no VM left behind.
+
 Remaining M2 completion work: record the full Docker-vs-Spore file-tree
 equivalence result and the exact trailing-COPY invalidation behavior for the
 real workload.
 
 Definition of done:
 - The full `buildkite-sporevm` Dockerfile (`FROM base`, apt RUN, five COPYs,
-  chmod RUN, CMD) builds end to end with no BuildKit involvement.
+  chmod RUN, CMD) builds end to end through Spore after the base OCI layout is
+  prepared separately.
 - File-tree diff of the built rootfs against the docker-buildx-built rootfs
   for the same inputs shows only expected divergence (mtimes, `/etc/resolv.conf`
   placeholder, ext4 identity) — paths, modes, sizes, symlink targets, uid/gid
@@ -947,27 +961,31 @@ ref refresh) ≤2s warm-stat; uncached COPY ≈ context-disk emit/reuse +
 guest disk-to-disk apply plus one freeze/O(dirty) snapshot, with boot
 amortized per build.
 
-### M4 — Wrapper switch and benchmark
+### M3 — Wrapper integration and benchmark
 
-Patch `bin/buildkite-spore`: replace buildx/import-tar with `spore build`,
-make `prepare_context` incremental/clonefile-based. Add build profiling
-phases (see Verification) and record before/after in `docs/benchmarks.md`.
+The original wrapper Dockerfile now builds and runs through Spore, but the
+repeatable integration still belongs in `buildkite-sporevm`. Replace its final
+buildx/import-tar seam with `spore build`, keep base OCI preparation explicit,
+keep any generated application context incremental and clonefile-based, and add
+one smoke command that performs build -> named start -> setup -> known-good
+RSpec -> stop with guaranteed cleanup and preserved failure logs. Add the
+profiling phases below and record before/after results in `docs/benchmarks.md`.
 
 Definition of done:
 - `buildkite-spore build` (cached) completes in single-digit seconds wall
   clock, from the current ~30s warm baseline, with `spore build` itself <1s.
 - `buildkite-spore start` boots the built image, `setup-spore` reaches
   `/tmp/sporevm-buildkite/ready`, and `buildkite-spore rspec <known-good
-  spec>` passes — the rootfs is proven equivalent for the real workload.
+  spec>` passes. This behavior is proven manually; the milestone completes
+  when the repeatable smoke path lands in `buildkite-sporevm`.
 - Uncached full build wall clock recorded; target ≤ current uncached path.
 - Benchmark script lives in `scripts/` and runs identically by hand and in CI
   where hardware allows.
 
-### M5 — Ergonomics and hardening (follow-ups, ordered by need)
+### M4 — Ergonomics and hardening (follow-ups, ordered by need)
 
-- `spore build .` with `-f` defaults, once the narrow wrapper path is proven.
-- `spore build prune` / step-cache GC for build records and CAS indexes that
-  are no longer reachable from local refs or live build-cache records.
+- Define an explicit retention policy for obsolete step records, then retire
+  them before root-aware cache GC reclaims their CAS indexes and objects.
 - Host-side COPY fast path (apply a COPY without booting the session when it
   is the only uncached step), after a separate design proves it can stay out
   of the import hot path.
@@ -996,7 +1014,7 @@ Tests:
   succeeds through context-disk apply and records emitted/reused diagnostics.
 - End-to-end: small fixture base (tiny OCI layout already used by import
   tests) through FROM+RUN+COPY+CMD, then `spore run` smoke; the real
-  `buildkite-sporevm` path as the M4 hardware smoke.
+  `buildkite-sporevm` path as the M3 hardware smoke.
 - Equivalence: scripted file-tree diff (path, type, mode, uid/gid, size,
   symlink target) between spore-built and buildx-built rootfs.
 
@@ -1016,7 +1034,7 @@ spore build profile: phase=publish ms=…
 spore build profile: phase=total ms=…
 ```
 
-Benchmark plan (M4, recorded in `docs/benchmarks.md`):
+Benchmark plan (M3, recorded in `docs/benchmarks.md`):
 
 | Scenario | Baseline (buildx+import) | Target |
 | --- | ---: | ---: |
@@ -1060,20 +1078,18 @@ the result and running the Rails spec smoke.
 - Grow-only sparse disk sizing in v1; no shrink pass. The automatic target is
   `max(2 * parent_logical_size, parent_logical_size + 8 GiB)` rounded to chunk
   size, with a hidden debug override only for diagnosing ENOSPC workloads.
+- The build executor calls the internal monitor path directly with writable
+  rootfs and build-context state. Public `spore run --rootfs` remains
+  read-only.
+- Named `--build-context NAME=oci-layout://PATH` inputs are the builder's base
+  image boundary. The wrapper can keep its generated application context while
+  passing the separately prepared base OCI layout by name.
+- An `ARG` declaration without a default records an absent value. Referencing
+  that value during builder-owned substitution fails closed instead of
+  silently substituting an empty string.
 
 ## Open Questions
 
-- Unset `ARG` without default: hard error (proposed, fail-closed bias) versus
-  Docker's empty-string-plus-warning. Default: hard error until a consumer
-  needs otherwise.
-- Where the internal rw-rootfs run mode lives: a private field on
-  `run_mod.Options` versus a narrower executor entry point that bypasses
-  `api.runManaged`. Decide in M2 against the actual code; the constraint is
-  that public `spore run` semantics (plain `--rootfs` stays read-only) do not
-  change.
-- Whether M4 keeps the wrapper's generated-context design or teaches
-  `spore build` multiple contexts. Default: keep the generated context; it is
-  cheap once copies are clonefile-based.
 - Teach import-tar/native ext4 emission to create generously sized sparse
   images at import time, so build-start resize becomes a fallback for old or
   unusually small images rather than routine work.
@@ -1090,7 +1106,7 @@ the result and running the Rails spec smoke.
   bases are sized to content, so the first apt-get in a RUN would ENOSPC.
   The plan makes automatic sparse growth a first-class, tested step (open
   index → compute deterministic target → grow → resize2fs → boot) rather than
-  a user-facing knob or an incident discovered in M4.
+  a user-facing knob or an incident discovered during wrapper integration.
 - Guest-side COPY looked expensive at first (a VM boot to copy files) but
   removes the entire macOS host-filesystem fidelity problem (case
   sensitivity, ownership without root, xattrs); with the persistent session
@@ -1100,12 +1116,12 @@ the result and running the Rails spec smoke.
   chunk-index primitives change the shape: the persistent session publishes a
   child `index_digest` after each frozen step, and "layers" collapse into
   cache records over rootfs CAS indexes.
-- Valid step records root the indexes and objects they name. M5 GC/prune must
+- Valid step records root the indexes and objects they name. M4 GC/prune must
   retire unreachable build records before their CAS indexes, with complete
   stamps deleted before referenced indexes or chunks.
 - The cached path must be fast *end to end*, not just inside `spore build`:
   the wrapper's `rm -rf` + 573M context copy would have silently kept the
-  rebuild at ~30s. M4 explicitly owns the wrapper-side incremental context.
+  rebuild at ~30s. M3 explicitly owns the wrapper-side integration cost.
 - Docker cache-semantics fidelity matters more than feature breadth: the test
   plan pins one golden test per invalidation rule so that "cached" never means
   "stale" — the failure mode that would destroy trust in the builder fastest.
