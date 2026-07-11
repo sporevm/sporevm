@@ -55,17 +55,13 @@ parent="${workdir}/immutable-parent.spore"
   -- /bin/true
 chmod -R a-w "${parent}"
 
-baseline_runtime="${workdir}/baseline-runtime"
-current_runtime="${workdir}/current-runtime"
-mkdir -m 0700 "${baseline_runtime}" "${current_runtime}"
-
 scripts/benchmark/named-restore-readiness.py \
   --spore-dir "${parent}" \
   --spore-bin "${baseline_bin}" \
   --backend kvm \
   --iterations "${iterations}" \
   --repeated-execs "${repeated_execs}" \
-  --runtime-dir "${baseline_runtime}" \
+  --runtime-dir "${capture_runtime}" \
   --output "${output_dir}/baseline-${baseline_version}.jsonl" \
   --include-run-from \
   --no-build
@@ -76,7 +72,7 @@ scripts/benchmark/named-restore-readiness.py \
   --backend kvm \
   --iterations "${iterations}" \
   --repeated-execs "${repeated_execs}" \
-  --runtime-dir "${current_runtime}" \
+  --runtime-dir "${capture_runtime}" \
   --output "${output_dir}/current.jsonl" \
   --include-run-from \
   --no-build
