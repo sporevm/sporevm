@@ -913,7 +913,10 @@ Docker-vs-Spore metadata oracle lives at
 
 Implementation note (2026-07-10, GC coordination): after `FROM` resolution,
 the build holds the rootfs-cache coarse lock across step-cache lookup and VM
-execution, then releases it before final image publication. Valid
+execution. Lazy runtime-disk setup borrows that live, root-bound guard while it
+publishes the baseline lease, instead of trying to lock the same cache again.
+The build retains ownership and releases the lock before final image
+publication. Valid
 `sporevm-build-step-v1` records are GC roots for their child index and objects;
 known incomplete records are ignored as cache misses, and unknown future record
 kinds retain the CAS conservatively. Record retention/pruning remains

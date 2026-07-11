@@ -191,14 +191,45 @@ const LocalRefMetadata = struct {
     builder_version: []const u8 = builder_version,
 };
 
+const RootfsCacheLockState = struct {
+    fd: std.c.fd_t,
+    file_identity: RootfsCacheLockFileIdentity,
+};
+
+const RootfsCacheLockFileIdentity = struct {
+    device: u64,
+    inode: u64,
+};
+
 pub const RootfsCacheLock = struct {
-    fd: std.c.fd_t = -1,
+    state: RootfsCacheLockState,
+
+    /// Ensures this borrowed guard's fd owns the lockfile selected by
+    /// `cache_root`. Reasserting nonblocking flock also safely reacquires an
+    /// unlocked but otherwise valid fd instead of trusting caller state.
+    pub fn ensureHeldFor(self: *const RootfsCacheLock, allocator: std.mem.Allocator, cache_root: []const u8) !bool {
+        if (self.state.fd < 0) return false;
+        const held_identity = rootfsCacheLockFileIdentity(self.state.fd) orelse return false;
+        if (!std.meta.eql(self.state.file_identity, held_identity)) return false;
+
+        const path = try std.fs.path.join(allocator, &.{ cache_root, rootfs_cache_lock_name });
+        defer allocator.free(path);
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+        const expected_fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+        if (expected_fd < 0) return false;
+        defer _ = std.c.close(expected_fd);
+        const expected_identity = rootfsCacheLockFileIdentity(expected_fd) orelse return false;
+        if (!std.meta.eql(self.state.file_identity, expected_identity)) return false;
+        return std.c.flock(self.state.fd, flock_exclusive | flock_nonblocking) == 0;
+    }
 
     pub fn deinit(self: *RootfsCacheLock) void {
-        if (self.fd >= 0) {
-            _ = std.c.flock(self.fd, flock_unlock);
-            _ = std.c.close(self.fd);
-            self.fd = -1;
+        if (self.state.fd >= 0) {
+            _ = std.c.flock(self.state.fd, flock_unlock);
+            _ = std.c.close(self.state.fd);
+            self.state.fd = -1;
+            self.state.file_identity = .{ .device = 0, .inode = 0 };
         }
     }
 };
@@ -228,7 +259,24 @@ fn openRootfsCacheLock(io: Io, allocator: std.mem.Allocator, cache_root: []const
             else => error.IoFailed,
         };
     }
-    return .{ .fd = fd };
+    const file_identity = rootfsCacheLockFileIdentity(fd) orelse return error.IoFailed;
+    return .{ .state = .{ .fd = fd, .file_identity = file_identity } };
+}
+
+fn rootfsCacheLockFileIdentity(fd: std.c.fd_t) ?RootfsCacheLockFileIdentity {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var stat: linux.Statx = std.mem.zeroes(linux.Statx);
+        const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .INO = true }, &stat);
+        if (linux.errno(rc) != .SUCCESS or !stat.mask.TYPE or !stat.mask.INO or !linux.S.ISREG(stat.mode)) return null;
+        return .{
+            .device = (@as(u64, stat.dev_major) << 32) | stat.dev_minor,
+            .inode = stat.ino,
+        };
+    }
+    var stat: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &stat) != 0 or !std.c.S.ISREG(stat.mode)) return null;
+    return .{ .device = @intCast(stat.dev), .inode = @intCast(stat.ino) };
 }
 
 pub fn parseResolveOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedResolveOptions {

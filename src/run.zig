@@ -3227,6 +3227,28 @@ fn runMemoryPlan(memory: memory_config.Config, constraints: RunMemoryConstraints
 }
 
 pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control, startup_probe: ?*vsock.HostStream) !MonitorResult {
+    return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, control, startup_probe, null);
+}
+
+pub fn executeMonitorWithRootfsCacheLock(
+    context: Context,
+    allocator: std.mem.Allocator,
+    opts: Options,
+    control: vsock.Control,
+    startup_probe: ?*vsock.HostStream,
+    rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
+) !MonitorResult {
+    return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, control, startup_probe, rootfs_cache_lock);
+}
+
+fn executeMonitorWithOptionalRootfsCacheLock(
+    context: Context,
+    allocator: std.mem.Allocator,
+    opts: Options,
+    control: vsock.Control,
+    startup_probe: ?*vsock.HostStream,
+    rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
+) !MonitorResult {
     try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
 
@@ -3250,6 +3272,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
         .rootfs_path = opts.rootfs_path,
         .rootfs = opts.rootfs,
         .rootfs_grow_target = opts.rootfs_grow_target,
+        .rootfs_cache_lock = rootfs_cache_lock,
         .disk = opts.disk,
         .spore_dir = opts.resume_dir,
         .disk_root = opts.disk_root,
