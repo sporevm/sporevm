@@ -113,6 +113,30 @@ spore build ...
   `WRITE_ZEROES`, and still executed Dockerfile steps. Fully warm builds avoid
   boot; the edited incremental smoke boots once, executes four steps, and
   performs no resize.
+- **Native KVM result (2026-07-11, Linux ARM64/KVM):** branch commit `ab631dd`
+  passed native tests and ReleaseSafe assembly. The build/run smoke covered
+  first preparation, prepared reuse, warm, `--no-cache`, and incremental
+  paths functionally; the 2.25 GiB sparse-COPY smoke, run-commit lifecycle
+  smoke including save/fork/restore, and local pull also passed. Five
+  six-second P0 samples each completed the same 124 type-13/UNMAP requests
+  covering 520,093,696 bytes, with no ordinary all-zero OUT, errors, or
+  post-resize writes. Five instrumented P3 misses took
+  529 ms median / 532 ms p95; preparation-through-publication took 211 ms
+  median / 218 ms p95, and median peak RSS was 140.7 MiB. A separate
+  same-exact-parent run produced the same PREPARE key, parent index, prepared
+  child index, and producer identity in all five samples. The literal
+  uninstrumented two-RUN harness took 525 ms median / 527 ms p95. This is a
+  useful absolute observation, but it is not comparable to the historical
+  macOS/HVF 0.36s prepared baseline: the KVM cold gate requires paired default
+  and prepared/no-growth samples of the exact historical fixture on the same
+  host and commit. KVM warm and incremental paths passed functionally, but
+  their performance gates also remain unmeasured.
+  The validated WRITE_ZEROES failure smoke emitted its intended failure
+  diagnostic but then aborted in KVM vCPU teardown: duplicate cleanup
+  ownership in `src/kvm/vm.zig` deinitialized the vCPU slice twice on a
+  post-start error. This bug predates the branch, but abnormal termination
+  violates the fail-closed release gate and makes native KVM validation
+  incomplete.
 - **P4 canonical-index envelope (2026-07-11):** a fully nonzero 16 GiB index
   is about 33.39 MiB, leaving 30.61 MiB (47.8%) below `max_index_bytes`. A
   fully nonzero 32 GiB index is about 66.89 MiB and is rejected; the largest
@@ -129,16 +153,20 @@ spore build ...
   Format-valid partial-final-chunk parents preserve and CAS-verify the old
   prefix, expose a sparse-zero suffix, and produce the same canonical snapshot
   as a full-rescan oracle across base/CAS/zero/overlay sources.
-- **Remaining release evidence:** repeat the native runtime smokes on Linux
-  ARM64/KVM. Exploratory HVF runs exercised a multi-GiB sparse COPY, a verified
-  512 MiB RUN-generated file, and real block/inode ENOSPC; both exhaustion
-  cases produced terminal diagnostics without retry and left the destination
-  ref unchanged. Those one-off runs establish feasibility but are not retained
-  as reproducible repository evidence, so large RUN and both ENOSPC modes remain
-  release gates until an identical smoke records them. Concurrency/publication
-  fault injection, pack/unpack/pull identity, and commit-as-a-later-build-base
-  also remain explicit matrix items. Compile/unit coverage exercises both
-  backend implementations; that is not a substitute for native KVM proof.
+- **Remaining release evidence:** native KVM is now measured but not green.
+  Repair the vCPU teardown ownership bug, require the forced-failure smoke to
+  return the normal CLI build-error status rather than merely printing the
+  expected diagnostic, rerun the affected KVM paths, and resolve the tiny-cold
+  gate with paired same-host samples of the exact historical fixture. Record
+  KVM warm and incremental timings as part of that rerun. Exploratory HVF runs
+  exercised a verified 512 MiB RUN-generated file and real block/inode ENOSPC;
+  both exhaustion cases produced terminal diagnostics without retry and left
+  the destination ref unchanged. Those one-off runs establish feasibility but
+  are not retained as reproducible repository evidence, so large RUN and both
+  ENOSPC modes remain release gates until an identical smoke records them.
+  Concurrency/publication fault injection, prepared-output-specific
+  pack/unpack/pull identity, and commit-as-a-later-build-base also remain
+  explicit matrix items.
 
 ## Original Path And Cost Boundaries
 
@@ -225,8 +253,10 @@ In priority order:
 
 ## Goals
 
-- Bring the tiny cold build to within 150 ms of its measured 0.36s prepared
-  baseline on the same host, with a preferred median at or below 0.50s.
+- Bring the tiny cold build to within 150 ms of a paired prepared/no-growth
+  baseline on the same host and commit. On the reference M4/HVF host, the
+  historical prepared baseline is 0.36s and the preferred cold median is at
+  or below 0.50s.
 - Remove the selected rootfs's dependency on `resize2fs` and `/bin/sh` for
   capacity growth.
 - Make appended zero capacity create no proportional CAS payload and no
@@ -745,14 +775,17 @@ and already fails; 32/64 GiB remain experiments rather than product caps.
 
 P0-P4 were used as stop/go experiments before the behavior switch. Their
 results are recorded here so the implementation remains traceable. P5 and the
-KVM half of P3 remain release validation rather than unbounded design work.
+remaining KVM error-path/performance-gate work are release validation rather
+than unbounded design work.
 
 ### P0. Verify Kernel Zeroing And Lazy-Init Timing First
 
-**Result: passed on HVF.** Native type-13/UNMAP, forced fallback, checksum
-`noinit_itable`, and checksum-lazy negative-control results are summarized in
-Current Progress. The positive paths quiesced; the lazy negative control did
-not publish.
+**Result: positive path passed on HVF and KVM.** Native type-13/UNMAP, HVF
+forced fallback, checksum `noinit_itable`, and checksum-lazy negative-control
+results are summarized in Current Progress. The positive paths quiesced; the
+lazy negative control did not publish. The KVM backend-failure control reached
+the intended growth error but exposed a pre-existing double cleanup during VM
+teardown, so KVM failure-path validation remains blocked until that is fixed.
 
 This was the first stop/go gate before production Slice 1 or Slice 2 code. It
 observed the managed Linux 6.1.155 guest rather than inferring behavior only
@@ -835,13 +868,19 @@ time. Assemble once and require `e2fsck -fn`, successful boot, correct
 
 ### P3. Quantify Preparation Variance And Prove Prepared Reuse
 
-**Result: passed on HVF.** Five isolated ReleaseSafe runs are stable at 362 ms
+**Result: passed on HVF; KVM preparation passes but the overall KVM gate remains
+open.** Five isolated ReleaseSafe runs are stable at 362 ms
 cold median, 126 ms preparation-publication median, 127 ms preparation p95,
 and 166.1 MiB median peak RSS. Five uninstrumented equivalent-fixture runs from
 the same exact parent have a 0.44s cold median/p95 and produced the same
 prepared index, key, and producer identity. Shared `PREPARE` reuse works under
-`--no-cache` while skipping resize/checkpoint work. The native KVM repeat
-remains.
+`--no-cache` while skipping resize/checkpoint work. On KVM, five instrumented
+samples had 529 ms median / 532 ms p95 total time and 211 ms median / 218 ms
+p95 preparation-publication time; a same-parent follow-up produced identical
+PREPARE derivation identity in all five samples. The KVM two-RUN harness has no
+same-host prepared/no-growth baseline, and its functional warm/incremental
+paths were not timed, so those KVM performance gates remain open. The
+failure-path teardown bug also prevents an overall KVM pass.
 
 Repeat the same parent/target preparation at least five times with isolated
 caches on one pinned kernel/initrd, then on HVF and KVM using the identical
@@ -892,10 +931,18 @@ an empty-file inode-exhaustion workload. Confirm or replace the candidate
 
 **Status: in progress.** Unit/fuzz/cache-GC/backend-failure, existing-small,
 basic run-commit, generic save/restore and bundle, and HVF build-smoke coverage
-is present. Exploratory HVF runs completed a verified 512 MiB RUN-generated
-file in 5.00s and observed the intended terminal/no-retry/unchanged-ref behavior
-for both block and inode ENOSPC. Native KVM, the wider distro/workload corpus,
-and reproducible retained large-RUN plus block/inode exhaustion smokes remain.
+is present. Native KVM now covers build/run, a 2.25 GiB sparse COPY, the
+run-commit lifecycle including save/fork/restore, and local pull. That
+run-commit smoke does not save or restore an actual `spore build` prepared
+output, so prepared-output lifecycle coverage remains open. Its injected
+growth failure is blocked by the teardown crash described above. An additional
+generic writable-rootfs smoke stopped at a pre-existing assertion for legacy
+layered manifests before its lifecycle checks; it is not counted as KVM
+capacity evidence. Exploratory HVF runs completed a verified 512 MiB
+RUN-generated file in 5.00s and observed the intended
+terminal/no-retry/unchanged-ref behavior for both block and inode ENOSPC. The
+wider distro/workload corpus and reproducible retained large-RUN plus
+block/inode exhaustion smokes remain.
 
 Cover:
 
@@ -912,17 +959,21 @@ Cover:
 
 ## Decision Gates
 
-P0/P1 justified implementing Design A on the reference M4/HVF host. The branch
-is not release-complete until every still-unmeasured item below is recorded,
-including the Linux ARM64/KVM smokes:
+P0/P1 justified implementing Design A on the reference M4/HVF host. Linux
+ARM64/KVM is now measured, but the branch is not release-complete until its
+teardown blocker and unpaired performance gates are resolved and every
+still-unmeasured item below is recorded:
 
 - incremental preparation work inside the same already-booted executor session
   (grow/ioctl/pre-step checkpoint/record, excluding the shared build boot) has
-  p95 at most 250 ms, with the median reported rather than hidden; the measured
-  126 ms median / 127 ms p95 supersedes the uninstrumented 100 ms median stretch
-  estimate, while the user-facing cold-build gate below remains authoritative;
-- tiny cold median is within 150 ms of the 0.36s prepared baseline, with a
-  preferred result at or below 0.50s;
+  p95 at most 250 ms on each backend, with the median reported rather than
+  hidden; HVF measures 126 ms median / 127 ms p95 and KVM measures 211 ms
+  median / 218 ms p95, while the user-facing cold-build gate below remains
+  authoritative;
+- on each backend, tiny cold median is within 150 ms of a paired
+  prepared/no-growth baseline using the same host, commit, parent, and fixture;
+  the historical 0.36s baseline and preferred result at or below 0.50s are
+  reference M4/HVF measurements, not KVM thresholds;
 - appended known-zero bytes cause no proportional overlay writes, CAS payload,
   sealed-candidate count, or zero-scan time;
 - the fully nonzero canonical index at the selected default/cap fits below
@@ -935,11 +986,15 @@ including the Linux ARM64/KVM smokes:
   than treated as a correctness failure;
 - all supported ext4 corpus cases are fsck-clean and bootable;
 - malformed requests and injected failures leave parent/cache/ref state
-  unchanged; and
-- the warm path remains boot-free and at most 0.15s, and the one-COPY 0.34s
-  path regresses by no more than 20%. The measured values are 0.13s and 0.40s;
-  retaining full index/CAS validation is preferable to chasing the historical
-  0.09s warm result by weakening cache integrity.
+  unchanged, the CLI exits through its normal build-error path, and no backend
+  teardown abort follows; and
+- the warm path remains boot-free on both backends. On reference M4/HVF it is
+  at most 0.15s, and the historical one-COPY 0.34s path regresses by no more
+  than 20%; the measured values are 0.13s and 0.40s. On KVM, compare warm and
+  one-COPY medians with paired pre-grown/no-preparation controls on the same
+  host and require no more than 20% regression. Retaining full index/CAS
+  validation is preferable to chasing the historical 0.09s HVF warm result by
+  weakening cache integrity.
 
 If latency, quiescence, or filesystem semantics fail, prototype the narrow
 CAS-native grower for the Spore native profile before expanding device/cache
@@ -986,7 +1041,8 @@ Required correctness passes:
 
 ### Slice 0. Instrument And Run The Stop/Go Experiments
 
-**Status: complete on HVF; native KVM repeat remains in Slice 7.**
+**Status: complete on HVF; KVM positive-path repeat complete, with the
+error-path blocker and unpaired performance gates remaining in Slice 7.**
 
 - Add P1 phase timings/counters behind existing build profiling.
 - Prototype clean-zero growth, one-segment `WRITE_ZEROES`, and direct ioctl in
@@ -1002,7 +1058,8 @@ This slice made no default behavior or public CLI changes.
 ### Slice 1. Correct Known-Zero Storage Semantics
 
 **Status: implementation complete.** Shared backend unit/compile coverage and
-the HVF runtime smoke pass; native KVM runtime remains in Slice 7.
+the HVF runtime smoke pass are complete. Native KVM positive-path runtime is
+measured; its error-path blocker remains in Slice 7.
 
 - Add clean-zero disk growth and `zeroRange` to `ChunkMappedDisk`.
 - Preserve dirty-zero semantics for clearing parent data.
@@ -1030,7 +1087,8 @@ feature surface.
   HVF and KVM.
 - Validate every request completely before mutation.
 - Add stateful before/after fuzzing, malformed-chain tests, status/error tests,
-  and shared HVF/KVM backend coverage. Run the native KVM smoke in Slice 7.
+  and shared HVF/KVM backend coverage. Complete the native KVM failure-path
+  rerun in Slice 7.
 - Update `SECURITY.md` and the device contract documentation in the same
   change.
 
@@ -1102,11 +1160,21 @@ through Slice 5 experimentation, but it is required before release.
 
 ### Slice 7. Cross-Backend, Lifecycle, And Durable Docs
 
-**Status: in progress.** Core HVF growth smokes and documentation are complete;
-native KVM, concurrency/publication injection, prepared-output pack/unpack/pull
-identity, and committed-image-as-a-later-build-base remain open.
+**Status: in progress.** Core HVF growth smokes and documentation are complete.
+Native KVM positive paths, the run-commit lifecycle, large COPY, and local pull
+pass; its forced-failure teardown blocker and paired cold/warm/incremental
+performance measurements remain open, alongside concurrency/publication
+injection, prepared-output save/restore/pack/unpack/pull identity, and
+committed-image-as-a-later-build-base.
 
 - Run the full benchmark/correctness matrix on HVF and KVM.
+- Give the KVM vCPU allocation exactly one cleanup owner, strengthen the
+  forced-failure smoke to require CLI exit status 2 and reject signal exits,
+  then rerun the affected KVM matrix before release.
+- On that KVM host, measure paired default and prepared/no-growth runs of the
+  exact historical fixture plus warm and one-COPY incremental samples; do not
+  compare absolute KVM time with the historical macOS/HVF baseline, and judge
+  the paired deltas against the per-backend gates above.
 - Cover commit, save/restore, pack/unpack/pull, old caches, and existing local
   images.
 - Update the active `spore-build` plan and durable docs below.
@@ -1212,6 +1280,10 @@ Update the `spore build` boundary to cover:
 - Sparse capacity still consumes index/map/RSS overhead. The cap must be based
   on a fully nonzero index fitting the current 64 MiB bound with headroom, not
   only `du` output or an all-zero growth benchmark.
+- Backend failure injection must prove normal process termination as well as
+  unchanged publication state. The KVM run printed the intended growth error
+  before a pre-existing duplicate vCPU cleanup aborted teardown, demonstrating
+  that matching diagnostics alone are insufficient fail-closed evidence.
 
 ## Resolved Recommendations
 
@@ -1246,8 +1318,12 @@ Update the `spore build` boundary to cover:
 
 ## Remaining Release Questions
 
-1. Does native Linux ARM64/KVM reproduce the HVF request shape, quiescence,
-   prepared identity, cache reuse, save rejection, and run-commit behavior?
+1. After correcting KVM vCPU teardown ownership, does forced growth failure
+   return CLI status 2 with unchanged parent/cache/ref state, and do paired
+   same-host samples of the exact historical fixture meet the cold, warm, and
+   incremental performance gates? Native KVM request shape, quiescence,
+   prepared identity, cache reuse, run-commit lifecycle, large COPY, and local
+   pull already pass; prepared build-output save/restore remains open.
 2. Which additional external-writer ext4 layouts should be declared supported
    after the current native and checksum-enabled fixtures? A layout that the
    pinned kernel cannot online-resize remains a narrow fail-closed
