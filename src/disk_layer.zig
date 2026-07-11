@@ -46,6 +46,12 @@ pub const ActiveHead = union(enum) {
             .chunk_mapped => |disk| disk.hasPublishedSnapshot(),
         };
     }
+
+    pub fn ensurePublishable(self: ActiveHead) Error!void {
+        switch (self) {
+            .chunk_mapped => |disk| if (disk.isPoisoned()) return error.Poisoned,
+        }
+    }
 };
 
 const DiskSnapshotMetrics = struct {
@@ -56,6 +62,8 @@ const DiskSnapshotMetrics = struct {
     full_scan: bool,
     sealed_candidate_chunks: usize,
     sealed_chunks: u64,
+    clean_zero_chunks_reused: usize,
+    dirty_zero_chunks_recorded: usize,
     parent_chunks_reused: usize,
     parent: chunk_mapped_disk.ParentPublicationStats,
     zero_scan_us: u64,
@@ -70,7 +78,7 @@ const DiskSnapshotMetrics = struct {
 fn formatDiskSnapshotMetrics(buf: []u8, metrics: DiskSnapshotMetrics) std.fmt.BufPrintError![]const u8 {
     return std.fmt.bufPrint(
         buf,
-        "disk snapshot metrics: schema=1 logical_bytes={d} chunks={d} dirty_chunks={d} non_dirty_chunks={d} full_scan={} sealed_candidate_chunks={d} sealed_chunks={d} parent_chunks_reused={d} parent_referenced_bytes={d} parent_objects_linked={d} parent_objects_reused={d} parent_objects_copied={d} parent_object_bytes={d} parent_link_bytes={d} parent_reuse_bytes={d} parent_copy_bytes={d} parent_link_us={d} parent_reuse_us={d} parent_copy_us={d} parent_sync_us={d} zero_scan_us={d} hash_us={d} object_write_us={d} index_bytes={d} index_encode_us={d} index_publish_us={d} total_us={d}",
+        "disk snapshot metrics: schema=2 logical_bytes={d} chunks={d} dirty_chunks={d} non_dirty_chunks={d} full_scan={} sealed_candidate_chunks={d} sealed_chunks={d} clean_zero_chunks_reused={d} dirty_zero_chunks_recorded={d} parent_chunks_reused={d} parent_referenced_bytes={d} parent_objects_linked={d} parent_objects_reused={d} parent_objects_copied={d} parent_object_bytes={d} parent_link_bytes={d} parent_reuse_bytes={d} parent_copy_bytes={d} parent_link_us={d} parent_reuse_us={d} parent_copy_us={d} parent_sync_us={d} zero_scan_us={d} hash_us={d} object_write_us={d} index_bytes={d} index_encode_us={d} index_publish_us={d} total_us={d}",
         .{
             metrics.logical_bytes,
             metrics.chunks,
@@ -79,6 +87,8 @@ fn formatDiskSnapshotMetrics(buf: []u8, metrics: DiskSnapshotMetrics) std.fmt.Bu
             metrics.full_scan,
             metrics.sealed_candidate_chunks,
             metrics.sealed_chunks,
+            metrics.clean_zero_chunks_reused,
+            metrics.dirty_zero_chunks_recorded,
             metrics.parent_chunks_reused,
             metrics.parent.referenced_bytes,
             metrics.parent.linked.objects,
@@ -111,6 +121,7 @@ pub const SnapshotState = struct {
     /// verified the matching virtio-blk queues have no pending requests.
     pub fn finish(self: SnapshotState, _: std.mem.Allocator, dir: []const u8, quiesced: bool) Error!?spore.Disk {
         std.debug.assert(quiesced);
+        try self.active.ensurePublishable();
         if (self.active.dirtyClusterCount() == 0) {
             if (std.mem.eql(u8, self.base.kind, spore.disk_kind_cow_block) and !self.active.hasPublishedSnapshot()) return null;
         }
@@ -130,6 +141,8 @@ pub const SnapshotState = struct {
             .full_scan = stats.full_scan,
             .sealed_candidate_chunks = stats.sealed_candidate_chunks,
             .sealed_chunks = stats.work.sealed_chunks,
+            .clean_zero_chunks_reused = stats.clean_zero_chunks_reused,
+            .dirty_zero_chunks_recorded = stats.dirty_zero_chunks_recorded,
             .parent_chunks_reused = stats.parent_chunks_reused,
             .parent = stats.parent,
             .zero_scan_us = stats.work.zero_scan_ns / std.time.ns_per_us,
@@ -191,22 +204,23 @@ fn monotonicNs() Error!u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-test "disk snapshot schema-1 metric matches parser golden record" {
+test "disk snapshot schema-2 metric matches parser golden record" {
     var buf: [2048]u8 = undefined;
     const actual = try formatDiskSnapshotMetrics(&buf, .{
-        .logical_bytes = 196608,
-        .chunks = 3,
-        .dirty_chunks = 1,
+        .logical_bytes = 262144,
+        .chunks = 4,
+        .dirty_chunks = 2,
         .non_dirty_chunks = 2,
         .full_scan = false,
         .sealed_candidate_chunks = 1,
         .sealed_chunks = 1,
-        .parent_chunks_reused = 2,
+        .clean_zero_chunks_reused = 1,
+        .dirty_zero_chunks_recorded = 1,
+        .parent_chunks_reused = 1,
         .parent = .{
-            .referenced_bytes = 131072,
-            .object_bytes = 131072,
+            .referenced_bytes = 65536,
+            .object_bytes = 65536,
             .linked = .{ .objects = 1, .bytes = 65536, .ns = 11 * std.time.ns_per_us },
-            .reused = .{ .objects = 1, .bytes = 65536, .ns = 12 * std.time.ns_per_us },
             .sync_ns = 13 * std.time.ns_per_us,
         },
         .zero_scan_us = 1,
@@ -217,7 +231,7 @@ test "disk snapshot schema-1 metric matches parser golden record" {
         .index_publish_us = 5,
         .total_us = 51,
     });
-    const golden = std.mem.trimEnd(u8, @embedFile("testdata/disk-snapshot-metrics-v1.txt"), "\n");
+    const golden = std.mem.trimEnd(u8, @embedFile("testdata/disk-snapshot-metrics-v2.txt"), "\n");
     try std.testing.expectEqualStrings(golden, actual);
 }
 
@@ -318,6 +332,12 @@ test "snapshot returns null for a clean exact-rootfs sentinel disk" {
         .active = .{ .chunk_mapped = &disk },
     }).finish(allocator, ".", true);
     try std.testing.expect(snapshot == null);
+
+    disk.poison();
+    try std.testing.expectError(error.Poisoned, (SnapshotState{
+        .base = base_disk,
+        .active = .{ .chunk_mapped = &disk },
+    }).finish(allocator, ".", true));
 }
 
 test "clean chunk-index save publishes its index" {

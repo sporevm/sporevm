@@ -33,6 +33,7 @@ pub const Error = error{
     ShortWrite,
     ResizeFailed,
     FlushFailed,
+    Poisoned,
     FastForkUnavailable,
 } || chunk_sealer.Error || rootfs_cas.SourceError || runtime_disk_fork.Error || spore.Error || block_source.Error || std.mem.Allocator.Error;
 
@@ -163,6 +164,8 @@ pub const ParentPublicationStats = struct {
 pub const SnapshotStats = struct {
     full_scan: bool = false,
     sealed_candidate_chunks: usize = 0,
+    clean_zero_chunks_reused: usize = 0,
+    dirty_zero_chunks_recorded: usize = 0,
     parent_chunks_reused: usize = 0,
     parent: ParentPublicationStats = .{},
     index_bytes: u64 = 0,
@@ -228,7 +231,14 @@ pub const ChunkMappedDisk = struct {
     cas_root: ?[]const u8 = null,
     digest_index: DigestIndex = .{},
     parent_root: ?[]const u8 = null,
+    /// Logical coverage of `parent_root` and `digest_index`. Known-zero growth
+    /// extends only the source map; appended coverage remains child-owned.
+    parent_logical_size: u64 = 0,
     snapshot_published: bool = false,
+    /// A validated block request reached backend mutation and failed. The
+    /// head is no longer publishable because host I/O may have completed only
+    /// a prefix. This latch is monotonic for the lifetime of the head.
+    poisoned: std.atomic.Value(bool) = .init(false),
     lazy_cas_trace: ?LazyCasTrace = null,
 
     pub fn initReadOnly(
@@ -308,6 +318,18 @@ pub const ChunkMappedDisk = struct {
         return self.size;
     }
 
+    pub fn isWritable(self: ChunkMappedDisk) bool {
+        return self.overlay_fd != null;
+    }
+
+    pub fn poison(self: *ChunkMappedDisk) void {
+        self.poisoned.store(true, .release);
+    }
+
+    pub fn isPoisoned(self: *const ChunkMappedDisk) bool {
+        return self.poisoned.load(.acquire);
+    }
+
     pub fn dirtyChunkCount(self: ChunkMappedDisk) usize {
         var count: usize = 0;
         for (self.sources) |source| {
@@ -349,10 +371,21 @@ pub const ChunkMappedDisk = struct {
     }
 
     pub fn grow(self: *ChunkMappedDisk, new_size: u64) Error!void {
+        return self.growWithSource(new_size, .zero_dirty);
+    }
+
+    /// Extends a private sparse disk with bytes whose zero value is already
+    /// authoritative from the storage layer. Unlike `grow`, a later snapshot
+    /// may reuse the appended coverage without reading or sealing it.
+    pub fn growKnownZero(self: *ChunkMappedDisk, new_size: u64) Error!void {
+        return self.growWithSource(new_size, .zero);
+    }
+
+    fn growWithSource(self: *ChunkMappedDisk, new_size: u64, appended_source: Source) Error!void {
+        std.debug.assert(appended_source == .zero or appended_source == .zero_dirty);
         const overlay_fd = self.overlay_fd orelse return error.ReadOnly;
         if (new_size < self.size) return error.BadDiskSize;
         if (new_size == self.size) return;
-        if (self.size % self.chunk_size != 0) return error.BadDiskSize;
         if (self.base.capacityBytes() < new_size) return error.BadDiskSize;
 
         const new_chunk_count = try computeChunkCount(new_size, self.chunk_size);
@@ -360,15 +393,65 @@ pub const ChunkMappedDisk = struct {
         const old_chunk_count = self.sources.len;
         const new_sources = try self.allocator.alloc(Source, @intCast(new_chunk_count));
         @memcpy(new_sources[0..old_chunk_count], self.sources);
-        @memset(new_sources[old_chunk_count..], .zero_dirty);
+        @memset(new_sources[old_chunk_count..], appended_source);
         errdefer self.allocator.free(new_sources);
 
+        // A partial final chunk changes identity when its logical length grows:
+        // an old digest names only the old prefix, never that prefix plus the
+        // newly exposed zero suffix. Materialize at most that one old prefix
+        // into the sparse overlay, then classify the extended chunk dirty so a
+        // snapshot seals it at its new canonical length. CAS bytes are read
+        // through their digest authority without promoting the live source map.
+        // All allocations and reads finish before the first backend mutation.
+        const old_tail_len = self.size % self.chunk_size;
+        if (old_tail_len != 0) {
+            const tail_index = old_chunk_count - 1;
+            const old_source = self.sources[tail_index];
+            if (self.chunkKnownZero(tail_index)) {
+                new_sources[tail_index] = if (appended_source == .zero_dirty or old_source == .zero_dirty)
+                    .zero_dirty
+                else
+                    .zero;
+            } else {
+                const tail_len = std.math.cast(usize, old_tail_len) orelse return error.BadClusterSize;
+                const tail = try self.allocator.alloc(u8, tail_len);
+                defer self.allocator.free(tail);
+                try self.readGrowthBoundary(tail_index, tail);
+
+                // Rewriting the existing logical prefix is idempotent. A short
+                // write therefore leaves caller-visible bytes and source-map
+                // authority unchanged, and the growth fails closed.
+                const tail_offset = std.math.mul(u64, tail_index, self.chunk_size) catch return error.BadDiskSize;
+                try writeExact(overlay_fd, tail, tail_offset);
+                new_sources[tail_index] = .overlay;
+            }
+        }
         const overlay_size = std.math.cast(std.c.off_t, new_size) orelse return error.BadDiskSize;
         if (std.c.ftruncate(overlay_fd, overlay_size) != 0) return error.ResizeFailed;
 
         self.allocator.free(self.sources);
         self.sources = new_sources;
         self.size = new_size;
+    }
+
+    fn readGrowthBoundary(self: *ChunkMappedDisk, chunk_index: usize, buf: []u8) Error!void {
+        if (chunk_index >= self.sources.len) return error.OutOfRange;
+        if (buf.len != try self.chunkLen(chunk_index)) return error.OutOfRange;
+        const offset = std.math.mul(u64, chunk_index, self.chunk_size) catch return error.OutOfRange;
+        switch (self.sources[chunk_index]) {
+            .base => try self.base.readAt(buf, offset),
+            .overlay, .overlay_clean => try readExact(self.overlay_fd orelse return error.ShortRead, buf, offset),
+            .zero, .zero_dirty => @memset(buf, 0),
+            .cas => {
+                const cache_root = self.cas_root orelse return error.BadManifest;
+                const id = self.digest_index.get(@intCast(chunk_index)) orelse return error.BadManifest;
+                var digest_buf: ManifestDigest = undefined;
+                const digest = manifestDigest(id, &digest_buf);
+                const data = try rootfs_cas.readVerifiedManifestObject(self.allocator, cache_root, digest, buf.len);
+                defer self.allocator.free(data);
+                @memcpy(buf, data);
+            },
+        }
     }
 
     pub fn chunkLen(self: ChunkMappedDisk, chunk_index: usize) Error!usize {
@@ -392,8 +475,9 @@ pub const ChunkMappedDisk = struct {
     }
 
     pub fn markZeroChunk(self: *ChunkMappedDisk, chunk_index: usize) Error!void {
+        _ = self.overlay_fd orelse return error.ReadOnly;
         if (chunk_index >= self.sources.len) return error.OutOfRange;
-        if (self.sources[chunk_index] == .zero or self.sources[chunk_index] == .zero_dirty) return;
+        if (self.chunkKnownZero(chunk_index)) return;
         self.sources[chunk_index] = .zero_dirty;
     }
 
@@ -464,6 +548,97 @@ pub const ChunkMappedDisk = struct {
         }
     }
 
+    /// Applies block-device zero semantics without materializing zero payload
+    /// for whole chunks. The complete arithmetic/range/read-only request is
+    /// validated before any source-map or overlay mutation.
+    pub fn zeroRange(self: *ChunkMappedDisk, offset: u64, len: u64) Error!void {
+        _ = self.overlay_fd orelse return error.ReadOnly;
+        const end = std.math.add(u64, offset, len) catch return error.OutOfRange;
+        if (end > self.size) return error.OutOfRange;
+        if (len == 0) return;
+
+        const PreparedBoundary = struct {
+            chunk_index: usize,
+            chunk_start: u64,
+            zero_start: usize,
+            zero_len: usize,
+            bytes: []u8,
+        };
+        var boundaries: [2]PreparedBoundary = undefined;
+        var boundary_count: usize = 0;
+        defer for (boundaries[0..boundary_count]) |boundary| self.allocator.free(boundary.bytes);
+
+        // Read and verify both possible partial boundary chunks before any
+        // logical mutation. Successful CAS promotions may remain on failure,
+        // but their bytes are identical to the validated parent authority.
+        const first_chunk = offset / self.chunk_size;
+        const last_chunk = (end - 1) / self.chunk_size;
+        const candidates = [_]u64{ first_chunk, last_chunk };
+        for (candidates, 0..) |chunk_index_u64, candidate_index| {
+            if (candidate_index == 1 and chunk_index_u64 == first_chunk) continue;
+            if (chunk_index_u64 > std.math.maxInt(usize)) return error.OutOfRange;
+            const chunk_index: usize = @intCast(chunk_index_u64);
+            const chunk_start = std.math.mul(u64, chunk_index_u64, self.chunk_size) catch return error.OutOfRange;
+            const chunk_len = try self.chunkLen(chunk_index);
+            const chunk_end = std.math.add(u64, chunk_start, chunk_len) catch return error.OutOfRange;
+            const range_start = @max(offset, chunk_start);
+            const range_end = @min(end, chunk_end);
+            if (range_start == chunk_start and range_end == chunk_end) continue;
+            if (self.chunkKnownZero(chunk_index)) continue;
+
+            const bytes = try self.allocator.alloc(u8, chunk_len);
+            boundaries[boundary_count] = .{
+                .chunk_index = chunk_index,
+                .chunk_start = chunk_start,
+                .zero_start = std.math.cast(usize, range_start - chunk_start) orelse return error.OutOfRange,
+                .zero_len = std.math.cast(usize, range_end - range_start) orelse return error.OutOfRange,
+                .bytes = bytes,
+            };
+            boundary_count += 1;
+            try self.readChunk(chunk_index, boundaries[boundary_count - 1].bytes);
+        }
+
+        var cursor = offset;
+        while (cursor < end) {
+            const chunk_index_u64 = cursor / self.chunk_size;
+            if (chunk_index_u64 > std.math.maxInt(usize)) return error.OutOfRange;
+            const chunk_index: usize = @intCast(chunk_index_u64);
+            const chunk_start = std.math.mul(u64, chunk_index_u64, self.chunk_size) catch return error.OutOfRange;
+            const chunk_len = try self.chunkLen(chunk_index);
+            const chunk_end = std.math.add(u64, chunk_start, chunk_len) catch return error.OutOfRange;
+            const range_end = @min(end, chunk_end);
+            const range_offset = cursor - chunk_start;
+            const range_len = range_end - cursor;
+
+            if (range_offset == 0 and range_len == chunk_len) {
+                try self.markZeroChunk(chunk_index);
+                cursor = range_end;
+                continue;
+            }
+
+            if (self.chunkKnownZero(chunk_index)) {
+                cursor = range_end;
+                continue;
+            }
+
+            var prepared: ?*PreparedBoundary = null;
+            for (boundaries[0..boundary_count]) |*boundary| {
+                if (boundary.chunk_index == chunk_index) {
+                    prepared = boundary;
+                    break;
+                }
+            }
+            const boundary = prepared orelse return error.OutOfRange;
+            @memset(boundary.bytes[boundary.zero_start..][0..boundary.zero_len], 0);
+            if (std.mem.allEqual(u8, boundary.bytes, 0)) {
+                try self.markZeroChunk(chunk_index);
+            } else {
+                try self.writeAt(boundary.bytes, boundary.chunk_start);
+            }
+            cursor = range_end;
+        }
+    }
+
     pub fn flush(self: *ChunkMappedDisk) Error!void {
         if (self.overlay_fd) |fd| {
             if (std.c.fsync(fd) != 0) return error.FlushFailed;
@@ -475,6 +650,7 @@ pub const ChunkMappedDisk = struct {
     /// source map and overlay fd; this primitive does not drain device queues.
     pub fn fork(self: *ChunkMappedDisk, options: ForkOptions) Error!ForkedDisk {
         std.debug.assert(options.quiesced);
+        if (self.isPoisoned()) return error.Poisoned;
         const parent_fd = self.overlay_fd orelse return error.ReadOnly;
         const child_sources = try self.allocator.dupe(Source, self.sources);
         errdefer self.allocator.free(child_sources);
@@ -497,6 +673,7 @@ pub const ChunkMappedDisk = struct {
                 .cas_root = child_index.cas_root,
                 .digest_index = child_index.digest_index,
                 .parent_root = child_index.parent_root,
+                .parent_logical_size = child_index.parent_logical_size,
                 .snapshot_published = self.snapshot_published,
             },
             .clone_method = cloned.method,
@@ -512,6 +689,7 @@ pub const ChunkMappedDisk = struct {
         options: ExportForkOptions,
     ) Error!runtime_disk_fork.Head {
         std.debug.assert(options.quiesced);
+        if (self.isPoisoned()) return error.Poisoned;
         const prepare_start_ns = monotonicNs() catch 0;
         const parent_fd = self.overlay_fd orelse return error.ReadOnly;
         spore.validateDiskDigest(baseline.identity) catch return error.BadManifest;
@@ -573,7 +751,13 @@ pub const ChunkMappedDisk = struct {
             if (descriptor.overlay(chunk_index)) {
                 source.* = .overlay;
             } else if (descriptor.zero(chunk_index)) {
-                source.* = .zero_dirty;
+                // A zero already authoritative in the descriptor-bound
+                // baseline stays clean. A new zero override must remain dirty
+                // so the next snapshot cannot incorrectly reuse nonzero parent
+                // authority or return a no-op disk.
+                if (!self.chunkKnownZero(chunk_index)) {
+                    source.* = .zero_dirty;
+                }
             }
         }
         self.overlay_fd = overlay_fd;
@@ -630,6 +814,7 @@ pub const ChunkMappedDisk = struct {
         const parent = try self.parentStateFrom(cache_root, index);
         self.parent_root = parent.root;
         self.digest_index = parent.digest_index;
+        self.parent_logical_size = parent.parent_logical_size;
     }
 
     /// Preallocates a stable snapshot authority before an atomic directory
@@ -680,6 +865,7 @@ pub const ChunkMappedDisk = struct {
             .cas_root = next_root,
             .digest_index = next_digest_index,
             .parent_root = next_parent_root,
+            .parent_logical_size = index.logical_size,
         };
     }
 
@@ -693,6 +879,7 @@ pub const ChunkMappedDisk = struct {
         self.cas_root = next.cas_root;
         self.digest_index = next.digest_index;
         self.parent_root = next.parent_root;
+        self.parent_logical_size = next.parent_logical_size;
 
         self.allocator.free(old_sources);
         if (old_cas_root) |root| self.allocator.free(root);
@@ -716,6 +903,7 @@ pub const ChunkMappedDisk = struct {
         stats_out: ?*SnapshotStats,
     ) Error!spore.Disk {
         std.debug.assert(quiesced);
+        if (self.isPoisoned()) return error.Poisoned;
         var chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty;
         errdefer {
             for (chunks.items) |entry| self.allocator.free(entry.digest);
@@ -734,17 +922,33 @@ pub const ChunkMappedDisk = struct {
         var work_stats: chunk_sealer.WorkStats = .{};
         const use_parent_index = self.canReuseParentIndex();
         var sealed_candidate_chunks: usize = 0;
+        var clean_zero_chunks_reused: usize = 0;
+        var dirty_zero_chunks_recorded: usize = 0;
         var parent_chunks_reused: usize = 0;
         var parent_stats: ParentPublicationStats = .{};
         var linked_parent_object = false;
         var published_parent_objects = std.AutoHashMap(chunk.ChunkId, void).init(self.allocator);
         defer published_parent_objects.deinit();
         var parent_digest_cursor = self.digest_index.cursor();
+        const parent_chunk_count = self.parentChunkCount();
 
         for (0..self.chunkCount()) |chunk_index| {
             const logical_chunk: u64 = @intCast(chunk_index);
             const parent_id = parent_digest_cursor.next(logical_chunk);
-            if (use_parent_index and !self.needsSnapshotSeal(chunk_index)) {
+            switch (self.sources[chunk_index]) {
+                .zero => {
+                    try zero_chunks.append(self.allocator, @intCast(chunk_index));
+                    clean_zero_chunks_reused += 1;
+                    continue;
+                },
+                .zero_dirty => {
+                    try zero_chunks.append(self.allocator, @intCast(chunk_index));
+                    dirty_zero_chunks_recorded += 1;
+                    continue;
+                },
+                else => {},
+            }
+            if (use_parent_index and chunk_index < parent_chunk_count and !self.needsSnapshotSeal(chunk_index)) {
                 if (parent_id) |id| {
                     const object_len = try self.chunkLen(chunk_index);
                     parent_stats.referenced_bytes +|= object_len;
@@ -763,7 +967,7 @@ pub const ChunkMappedDisk = struct {
                     }
                 } else {
                     try zero_chunks.append(self.allocator, @intCast(chunk_index));
-                    parent_chunks_reused += 1;
+                    clean_zero_chunks_reused += 1;
                 }
                 continue;
             }
@@ -836,6 +1040,8 @@ pub const ChunkMappedDisk = struct {
             out.* = .{
                 .full_scan = !use_parent_index,
                 .sealed_candidate_chunks = sealed_candidate_chunks,
+                .clean_zero_chunks_reused = clean_zero_chunks_reused,
+                .dirty_zero_chunks_recorded = dirty_zero_chunks_recorded,
                 .parent_chunks_reused = parent_chunks_reused,
                 .parent = parent_stats,
                 .index_bytes = encoded_index.bytes.len,
@@ -849,7 +1055,25 @@ pub const ChunkMappedDisk = struct {
     }
 
     fn canReuseParentIndex(self: ChunkMappedDisk) bool {
-        return self.parent_root != null;
+        _ = self.parent_root orelse return false;
+        return self.parent_logical_size != 0 and
+            self.parent_logical_size <= self.size;
+    }
+
+    fn parentChunkCount(self: ChunkMappedDisk) usize {
+        const count = computeChunkCount(self.parent_logical_size, self.chunk_size) catch return 0;
+        return std.math.cast(usize, count) orelse 0;
+    }
+
+    fn chunkKnownZero(self: ChunkMappedDisk, chunk_index: usize) bool {
+        if (chunk_index >= self.sources.len) return false;
+        return switch (self.sources[chunk_index]) {
+            .zero, .zero_dirty => true,
+            .base, .overlay_clean => self.canReuseParentIndex() and
+                chunk_index < self.parentChunkCount() and
+                self.digest_index.get(@intCast(chunk_index)) == null,
+            .overlay, .cas => false,
+        };
     }
 
     fn needsSnapshotSeal(self: ChunkMappedDisk, chunk_index: usize) bool {
@@ -862,7 +1086,11 @@ pub const ChunkMappedDisk = struct {
         for (index.chunks) |entry| {
             if (entry.logical_chunk >= self.sources.len) return error.BadManifest;
         }
-        return .{ .root = parent_root, .digest_index = try DigestIndex.fromDiskIndex(self.allocator, index) };
+        return .{
+            .root = parent_root,
+            .digest_index = try DigestIndex.fromDiskIndex(self.allocator, index),
+            .parent_logical_size = index.logical_size,
+        };
     }
 
     fn installSnapshotBaseline(self: *ChunkMappedDisk, next: ParentClone) void {
@@ -870,6 +1098,7 @@ pub const ChunkMappedDisk = struct {
         var old_digest_index = self.digest_index;
         self.parent_root = next.root;
         self.digest_index = next.digest_index;
+        self.parent_logical_size = next.parent_logical_size;
         self.snapshot_published = true;
         for (self.sources) |*source| {
             source.* = switch (source.*) {
@@ -1071,6 +1300,7 @@ pub const ChunkMappedDisk = struct {
             self.parent_root = null;
         }
         self.digest_index.deinit(self.allocator);
+        self.parent_logical_size = 0;
     }
 
     fn cloneIndexState(self: ChunkMappedDisk) Error!IndexClone {
@@ -1082,6 +1312,7 @@ pub const ChunkMappedDisk = struct {
             .cas_root = cas_root,
             .parent_root = parent_root,
             .digest_index = try self.digest_index.clone(self.allocator),
+            .parent_logical_size = self.parent_logical_size,
         };
     }
 
@@ -1140,6 +1371,7 @@ const IndexClone = struct {
     cas_root: ?[]const u8 = null,
     parent_root: ?[]const u8 = null,
     digest_index: DigestIndex = .{},
+    parent_logical_size: u64 = 0,
 
     fn deinit(self: IndexClone, allocator: std.mem.Allocator) void {
         if (self.cas_root) |root| allocator.free(root);
@@ -1152,6 +1384,7 @@ const IndexClone = struct {
 const ParentClone = struct {
     root: ?[]const u8 = null,
     digest_index: DigestIndex = .{},
+    parent_logical_size: u64 = 0,
 
     fn deinit(self: ParentClone, allocator: std.mem.Allocator) void {
         if (self.root) |root| allocator.free(root);
@@ -1165,6 +1398,7 @@ const IndexState = struct {
     cas_root: []const u8,
     digest_index: DigestIndex,
     parent_root: []const u8,
+    parent_logical_size: u64,
 };
 
 const ManifestDigest = [spore.rootfs_digest_prefix.len + chunk.ChunkId.hex_len]u8;
@@ -1403,6 +1637,238 @@ test "sparse raw digest index reduces dense lazy runtime ownership" {
     }
 }
 
+const PartialGrowthSource = enum {
+    base,
+    cas,
+    zero,
+    overlay,
+};
+
+fn testKnownZeroGrowthFromPartialTail(tail_source: PartialGrowthSource) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const chunk_size: usize = 512;
+    const old_size: usize = chunk_size + 137;
+    // The base case also covers extending within the existing final chunk;
+    // the other cases cover appending whole and partial clean-zero chunks.
+    const new_size: usize = if (tail_source == .base) old_size + 211 else 3 * chunk_size + 73;
+    const tail_index: usize = 1;
+
+    const parent_bytes = try allocator.alloc(u8, old_size);
+    defer allocator.free(parent_bytes);
+    for (parent_bytes, 0..) |*byte, i| byte.* = @truncate((i * 29) + 17);
+    if (tail_source == .zero) @memset(parent_bytes[chunk_size..], 0);
+
+    const expected = try allocator.alloc(u8, new_size);
+    defer allocator.free(expected);
+    @memset(expected, 0);
+    @memcpy(expected[0..old_size], parent_bytes);
+
+    var parent_file = try tmp.dir.createFile(io, "parent.img", .{ .read = true });
+    defer parent_file.close(io);
+    try parent_file.writeStreamingAll(io, parent_bytes);
+    const parent_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/parent.img", .{tmp.sub_path[0..]});
+    const parent_cache = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/parent-cache", .{tmp.sub_path[0..]});
+    const parent_preload = try rootfs_cas.preloadPath(io, arena, parent_cache, parent_path, chunk_size);
+    const parent_index_bytes = try std.Io.Dir.cwd().readFileAlloc(io, parent_preload.index_path, arena, .limited(disk_index.max_index_bytes));
+    const parent_index = try disk_index.parseDiskIndex(arena, parent_index_bytes, .{
+        .logical_size = old_size,
+        .chunk_size = chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+        .index_digest = parent_preload.index_digest,
+    });
+    defer parent_index.deinit();
+
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    try base.writeStreamingAll(io, parent_bytes);
+    if (std.c.ftruncate(base.handle, @intCast(new_size)) != 0) return error.ResizeFailed;
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+
+    const base_source = block_source.FileBlockSource.init(base.handle, new_size);
+    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, old_size, chunk_size);
+    defer disk.deinit();
+    switch (tail_source) {
+        .base, .overlay => try disk.attachParentIndex(parent_cache, parent_index.value),
+        .cas, .zero => try disk.attachCasIndex(parent_cache, parent_index.value),
+    }
+
+    switch (tail_source) {
+        .base => try std.testing.expectEqual(Source.base, disk.sources[tail_index]),
+        .cas => try std.testing.expectEqual(Source.cas, disk.sources[tail_index]),
+        .zero => try std.testing.expectEqual(Source.zero, disk.sources[tail_index]),
+        .overlay => {
+            const patch = [_]u8{0xe7} ** 19;
+            const patch_offset = chunk_size + 23;
+            try disk.writeAt(&patch, patch_offset);
+            @memcpy(expected[patch_offset..][0..patch.len], &patch);
+            try std.testing.expectEqual(Source.overlay, disk.sources[tail_index]);
+        },
+    }
+    const tail_id_before = disk.digest_index.get(@intCast(tail_index));
+
+    try disk.growKnownZero(new_size);
+    try std.testing.expectEqual(@as(u64, new_size), disk.capacityBytes());
+    try std.testing.expectEqual(try computeChunkCount(new_size, chunk_size), disk.chunkCount());
+    if (tail_source == .zero) {
+        try std.testing.expectEqual(Source.zero, disk.sources[tail_index]);
+        try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
+    } else {
+        try std.testing.expectEqual(Source.overlay, disk.sources[tail_index]);
+        try std.testing.expectEqual(@as(usize, 1), disk.dirtyChunkCount());
+    }
+    if (tail_id_before) |id| {
+        try std.testing.expect(id.eql(disk.digest_index.get(@intCast(tail_index)) orelse return error.TestExpectedEqual));
+    } else {
+        try std.testing.expect(disk.digest_index.get(@intCast(tail_index)) == null);
+    }
+    for (disk.sources[2..]) |source| try std.testing.expectEqual(Source.zero, source);
+
+    const readback = try allocator.alloc(u8, new_size);
+    defer allocator.free(readback);
+    try disk.readAt(readback, 0);
+    try std.testing.expectEqualSlices(u8, expected, readback);
+
+    const snapshot_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/snapshot", .{tmp.sub_path[0..]});
+    try std.Io.Dir.cwd().createDirPath(io, snapshot_dir);
+    var stats: SnapshotStats = .{};
+    const snapshot = try disk.snapshotIndexWithStats(snapshot_dir, .{ .mmio_slot = 1 }, true, &stats);
+    defer freeTestDisk(allocator, snapshot);
+    try std.testing.expectEqual(@as(u64, if (tail_source == .zero) 0 else 1), stats.work.sealed_chunks);
+    try std.testing.expect(stats.index_bytes > 0);
+    if (tail_source == .zero) {
+        try std.testing.expectEqual(@as(usize, 0), stats.sealed_candidate_chunks);
+        try std.testing.expectEqual(@as(usize, 3), stats.clean_zero_chunks_reused);
+        try std.testing.expectEqual(@as(usize, 1), stats.parent_chunks_reused);
+    }
+
+    const oracle_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/oracle.img", .{tmp.sub_path[0..]});
+    const oracle_cache = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/oracle-cache", .{tmp.sub_path[0..]});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = oracle_path, .data = expected });
+    const oracle = try rootfs_cas.preloadPath(io, arena, oracle_cache, oracle_path, chunk_size);
+    try std.testing.expectEqualStrings(oracle.index_digest, snapshot.base);
+
+    const snapshot_index_path = try rootfs_cas.manifestIndexPath(arena, snapshot_dir, snapshot.base);
+    const snapshot_index_bytes = try std.Io.Dir.cwd().readFileAlloc(io, snapshot_index_path, arena, .limited(disk_index.max_index_bytes));
+    const oracle_index_bytes = try std.Io.Dir.cwd().readFileAlloc(io, oracle.index_path, arena, .limited(disk_index.max_index_bytes));
+    try std.testing.expectEqualSlices(u8, oracle_index_bytes, snapshot_index_bytes);
+}
+
+test "known zero growth preserves a partial base tail and canonical snapshot" {
+    try testKnownZeroGrowthFromPartialTail(.base);
+}
+
+test "known zero growth verifies and preserves a partial CAS tail" {
+    try testKnownZeroGrowthFromPartialTail(.cas);
+}
+
+test "known zero growth keeps a partial zero tail metadata only" {
+    try testKnownZeroGrowthFromPartialTail(.zero);
+}
+
+test "known zero growth preserves a partial overlay tail" {
+    try testKnownZeroGrowthFromPartialTail(.overlay);
+}
+
+test "known zero growth rejects a corrupt partial CAS tail before mutation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const chunk_size: usize = 512;
+    const old_size: usize = chunk_size + 137;
+    const new_size: usize = 2 * chunk_size;
+    var parent_bytes: [old_size]u8 = undefined;
+    for (&parent_bytes, 0..) |*byte, i| byte.* = @truncate((i * 41) + 3);
+    var parent = try tmp.dir.createFile(io, "parent.img", .{ .read = true });
+    defer parent.close(io);
+    try parent.writeStreamingAll(io, &parent_bytes);
+
+    const parent_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/parent.img", .{tmp.sub_path[0..]});
+    const parent_cache = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/parent-cache", .{tmp.sub_path[0..]});
+    const preload = try rootfs_cas.preloadPath(io, arena, parent_cache, parent_path, chunk_size);
+    const index_bytes = try std.Io.Dir.cwd().readFileAlloc(io, preload.index_path, arena, .limited(disk_index.max_index_bytes));
+    const index = try disk_index.parseDiskIndex(arena, index_bytes, .{
+        .logical_size = old_size,
+        .chunk_size = chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+        .index_digest = preload.index_digest,
+    });
+    defer index.deinit();
+    const tail_digest = try digestForChunk(index.value, 1);
+    const object_path = try rootfs_cas.manifestObjectPath(arena, parent_cache, tail_digest);
+    try std.Io.Dir.cwd().deleteFile(io, object_path);
+    const corrupt_tail = [_]u8{0xa5} ** (old_size - chunk_size);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = object_path, .data = &corrupt_tail });
+
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    if (std.c.ftruncate(base.handle, @intCast(new_size)) != 0) return error.ResizeFailed;
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+    const base_source = block_source.FileBlockSource.init(base.handle, new_size);
+    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, old_size, chunk_size);
+    defer disk.deinit();
+    try disk.attachCasIndex(parent_cache, index.value);
+
+    try std.testing.expectError(error.BadChunk, disk.growKnownZero(new_size));
+    try std.testing.expectEqual(@as(u64, old_size), disk.capacityBytes());
+    try std.testing.expectEqual(@as(usize, 2), disk.chunkCount());
+    try std.testing.expectEqual(Source.cas, disk.sources[1]);
+    const tail_id = try chunkIdFromDigest(tail_digest);
+    try std.testing.expect(tail_id.eql(disk.digest_index.get(1) orelse return error.TestExpectedEqual));
+    try std.testing.expectEqual(@as(u64, old_size), disk.parent_logical_size);
+    try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
+    const overlay_end = std.c.lseek(overlay.handle, 0, std.c.SEEK.END);
+    try std.testing.expectEqual(@as(std.c.off_t, old_size), overlay_end);
+}
+
+test "known zero growth keeps partial base authority after overlay write failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const chunk_size: usize = 512;
+    const old_size: usize = chunk_size + 83;
+    const new_size: usize = 2 * chunk_size;
+    var base_bytes: [old_size]u8 = undefined;
+    for (&base_bytes, 0..) |*byte, i| byte.* = @truncate((i * 13) + 5);
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    try base.writeStreamingAll(io, &base_bytes);
+    if (std.c.ftruncate(base.handle, @intCast(new_size)) != 0) return error.ResizeFailed;
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+
+    const base_source = block_source.FileBlockSource.init(base.handle, new_size);
+    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, old_size, chunk_size);
+    defer disk.deinit();
+    overlay.close(io);
+
+    try std.testing.expectError(error.ShortWrite, disk.growKnownZero(new_size));
+    try std.testing.expectEqual(@as(u64, old_size), disk.capacityBytes());
+    try std.testing.expectEqual(@as(usize, 2), disk.chunkCount());
+    try std.testing.expectEqual(Source.base, disk.sources[1]);
+    try std.testing.expectEqual(@as(u64, 0), disk.parent_logical_size);
+    try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
+    var readback: [old_size]u8 = undefined;
+    try disk.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, &base_bytes, &readback);
+}
+
 test "partial write preserves untouched bytes from base" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1517,6 +1983,93 @@ test "zero chunks seed partial overlay writes from zeroes" {
     try std.testing.expect(std.mem.allEqual(u8, readback[14..], 0));
 }
 
+test "zero range validates before mutation and matches a byte model" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const chunk_size: usize = 512;
+    var base_bytes: [4 * chunk_size]u8 = undefined;
+    for (&base_bytes, 0..) |*byte, i| byte.* = @truncate((i * 37) + 11);
+    var model = base_bytes;
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    try base.writeStreamingAll(io, &base_bytes);
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
+    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, base_bytes.len, chunk_size);
+    defer disk.deinit();
+
+    try disk.zeroRange(base_bytes.len, 0);
+    try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
+    try std.testing.expectError(error.OutOfRange, disk.zeroRange(base_bytes.len, 1));
+    try std.testing.expectError(error.OutOfRange, disk.zeroRange(std.math.maxInt(u64), 2));
+    try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
+
+    try disk.zeroRange(100, 900);
+    @memset(model[100..1000], 0);
+    try std.testing.expectEqual(@as(usize, 2), disk.dirtyChunkCount());
+    try disk.zeroRange(2 * chunk_size, chunk_size);
+    @memset(model[2 * chunk_size ..][0..chunk_size], 0);
+    try std.testing.expectEqual(@as(usize, 3), disk.dirtyChunkCount());
+
+    var readback: [4 * chunk_size]u8 = undefined;
+    try disk.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, &model, &readback);
+}
+
+test "zero range clears a full lazy CAS chunk without fetching and rejects a corrupt partial chunk before mutation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const chunk_size: usize = 512;
+    const total_size = 2 * chunk_size;
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    if (std.c.ftruncate(base.handle, total_size) != 0) return error.ResizeFailed;
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+
+    const digest_a = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const digest_b = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const chunks = [_]disk_index.DiskIndexChunk{
+        .{ .logical_chunk = 0, .digest = digest_a },
+        .{ .logical_chunk = 1, .digest = digest_b },
+    };
+    const index = disk_index.DiskIndex{
+        .kind = disk_index.disk_index_kind,
+        .logical_size = total_size,
+        .chunk_size = chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+        .chunks = &chunks,
+        .zero_chunks = &.{},
+    };
+
+    const base_source = block_source.FileBlockSource.init(base.handle, total_size);
+    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, total_size, chunk_size);
+    defer disk.deinit();
+    try disk.attachCasIndex("/missing-cache", index);
+    const digest_a_id = try chunkIdFromDigest(digest_a);
+    const digest_b_id = try chunkIdFromDigest(digest_b);
+
+    // A complete chunk does not need its old payload to establish zeroes.
+    try disk.zeroRange(0, chunk_size);
+    try std.testing.expectEqual(Source.zero_dirty, disk.sources[0]);
+    try std.testing.expect(digest_a_id.eql(disk.digest_index.get(0) orelse return error.TestExpectedEqual));
+
+    const source_before = disk.sources[1];
+    try std.testing.expectError(error.MissingChunk, disk.zeroRange(chunk_size + 1, 1));
+    try std.testing.expectEqual(source_before, disk.sources[1]);
+    try std.testing.expect(digest_b_id.eql(disk.digest_index.get(1) orelse return error.TestExpectedEqual));
+    try std.testing.expectEqual(@as(usize, 1), disk.dirtyChunkCount());
+}
+
 test "zero marking and growth advance dirty state" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1550,14 +2103,159 @@ test "zero marking and growth advance dirty state" {
     try std.testing.expect(baseline_id.eql(disk.digest_index.get(0) orelse return error.TestExpectedEqual));
     try disk.markZeroChunk(0);
     try std.testing.expectEqual(@as(usize, 2), disk.dirtyChunkCount());
-    var stats: SnapshotStats = .{};
-    const grown = try disk.snapshotIndexWithStats(spore_dir, .{ .mmio_slot = 1 }, true, &stats);
+    var zero_stats: SnapshotStats = .{};
+    const grown = try disk.snapshotIndexWithStats(spore_dir, .{ .mmio_slot = 1 }, true, &zero_stats);
     defer freeTestDisk(allocator, grown);
-    // Zero-classified dirty chunks are still sealed candidates and work items.
-    try std.testing.expectEqual(@as(usize, 2), stats.sealed_candidate_chunks);
-    try std.testing.expectEqual(@as(u64, 2), stats.work.sealed_chunks);
+    try std.testing.expectEqual(@as(usize, 0), zero_stats.sealed_candidate_chunks);
+    try std.testing.expectEqual(@as(usize, 2), zero_stats.dirty_zero_chunks_recorded);
+    try std.testing.expectEqual(@as(usize, 0), zero_stats.parent_chunks_reused);
+    try std.testing.expectEqual(@as(u64, 0), zero_stats.work.sealed_chunks);
+    try std.testing.expectEqual(@as(u64, 0), zero_stats.work.zero_scan_ns);
+    try std.testing.expect(zero_stats.index_bytes > 0);
     try std.testing.expectEqual(@as(u64, chunk_size * 2), grown.size);
     try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
+}
+
+test "known zero growth reuses appended coverage without sealing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const snapshot_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/snapshot", .{tmp.sub_path[0..]});
+    const oracle_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/oracle", .{tmp.sub_path[0..]});
+    const oracle_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/oracle.img", .{tmp.sub_path[0..]});
+    try std.Io.Dir.cwd().createDirPath(io, snapshot_dir);
+
+    const chunk_size: usize = @intCast(spore.disk_chunk_size);
+    const base_bytes = try allocator.alloc(u8, 2 * chunk_size);
+    defer allocator.free(base_bytes);
+    @memset(base_bytes, 0);
+    @memset(base_bytes[0..chunk_size], 0x31);
+    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+    defer base.close(io);
+    try base.writeStreamingAll(io, base_bytes);
+    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+    defer overlay.close(io);
+
+    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
+    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, chunk_size, chunk_size);
+    defer disk.deinit();
+
+    const parent = try disk.snapshotIndex(snapshot_dir, .{ .mmio_slot = 1 }, true);
+    defer freeTestDisk(allocator, parent);
+    try disk.growKnownZero(2 * chunk_size);
+    try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
+
+    var stats: SnapshotStats = .{};
+    const grown = try disk.snapshotIndexWithStats(snapshot_dir, .{ .mmio_slot = 1 }, true, &stats);
+    defer freeTestDisk(allocator, grown);
+    try std.testing.expect(!std.mem.eql(u8, parent.base, grown.base));
+    try std.testing.expect(!stats.full_scan);
+    try std.testing.expectEqual(@as(usize, 0), stats.sealed_candidate_chunks);
+    try std.testing.expectEqual(@as(u64, 0), stats.work.sealed_chunks);
+    try std.testing.expectEqual(@as(usize, 1), stats.parent_chunks_reused);
+    try std.testing.expectEqual(@as(usize, 1), stats.clean_zero_chunks_reused);
+
+    const index_path = try rootfs_cas.manifestIndexPath(arena, snapshot_dir, grown.base);
+    const index_bytes = try std.Io.Dir.cwd().readFileAlloc(io, index_path, arena, .limited(disk_index.max_index_bytes));
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, .{
+        .index_path = index_path,
+        .index_digest = grown.base,
+        .rootfs_digest = grown.base,
+        .rootfs_size = grown.size,
+        .chunk_size = grown.chunk_size,
+        .chunk_count = 2,
+        .zero_chunks = 1,
+        .nonzero_chunks = 1,
+        .objects_written = 0,
+        .object_bytes_written = 0,
+        .index_bytes = index_bytes.len,
+    });
+    const parsed = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
+    defer parsed.deinit();
+    try expectZeroChunk(parsed.value, 1);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = oracle_path, .data = base_bytes });
+    const oracle = try rootfs_cas.preloadPath(io, arena, oracle_dir, oracle_path, chunk_size);
+    try std.testing.expectEqualStrings(oracle.index_digest, grown.base);
+
+    const tail_patch = [_]u8{0x7a} ** 97;
+    try disk.writeAt(&tail_patch, chunk_size + 23);
+    @memcpy(base_bytes[chunk_size + 23 ..][0..tail_patch.len], &tail_patch);
+    var tail_stats: SnapshotStats = .{};
+    const changed = try disk.snapshotIndexWithStats(snapshot_dir, .{ .mmio_slot = 1 }, true, &tail_stats);
+    defer freeTestDisk(allocator, changed);
+    try std.testing.expectEqual(@as(usize, 1), tail_stats.sealed_candidate_chunks);
+    try std.testing.expectEqual(@as(u64, 1), tail_stats.work.sealed_chunks);
+    try std.testing.expectEqual(@as(usize, 1), tail_stats.parent_chunks_reused);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = oracle_path, .data = base_bytes });
+    const changed_oracle = try rootfs_cas.preloadPath(io, arena, oracle_dir, oracle_path, chunk_size);
+    try std.testing.expectEqualStrings(changed_oracle.index_digest, changed.base);
+}
+
+test "known zero growth rolls back every fallible allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const io = std.testing.io;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+
+            const chunk_size: usize = 512;
+            const base_bytes = [_]u8{0x4c} ** chunk_size;
+            var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
+            defer base.close(io);
+            try base.writeStreamingAll(io, &base_bytes);
+            // The flat source already has sparse capacity for the requested
+            // logical growth, as runtime_disk does before constructing this
+            // mapping.
+            if (std.c.ftruncate(base.handle, 2 * chunk_size) != 0) return error.ResizeFailed;
+            var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
+            defer overlay.close(io);
+
+            const base_source = block_source.FileBlockSource.init(base.handle, 2 * chunk_size);
+            var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, chunk_size, chunk_size);
+            defer disk.deinit();
+
+            const digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            const chunks = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .digest = digest }};
+            const index = disk_index.DiskIndex{
+                .kind = disk_index.disk_index_kind,
+                .logical_size = chunk_size,
+                .chunk_size = chunk_size,
+                .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+                .object_namespace = spore.rootfs_storage_object_namespace,
+                .chunks = &chunks,
+                .zero_chunks = &.{},
+            };
+            try disk.attachParentIndex("/parent-cache", index);
+            const parent_id = try chunkIdFromDigest(digest);
+
+            disk.growKnownZero(2 * chunk_size) catch |err| {
+                if (err != error.OutOfMemory) return err;
+                try std.testing.expectEqual(@as(u64, chunk_size), disk.capacityBytes());
+                try std.testing.expectEqual(@as(usize, 1), disk.sources.len);
+                try std.testing.expectEqual(Source.base, disk.sources[0]);
+                try std.testing.expectEqual(@as(usize, 1), disk.digest_index.entries.len);
+                try std.testing.expect(parent_id.eql(disk.digest_index.get(0) orelse return error.TestExpectedEqual));
+                try std.testing.expectEqual(@as(u64, chunk_size), disk.parent_logical_size);
+                const overlay_end = std.c.lseek(overlay.handle, 0, std.c.SEEK.END);
+                try std.testing.expectEqual(@as(std.c.off_t, chunk_size), overlay_end);
+                return error.OutOfMemory;
+            };
+
+            try std.testing.expectEqual(@as(u64, 2 * chunk_size), disk.capacityBytes());
+            try std.testing.expectEqual(@as(usize, 2), disk.sources.len);
+            try std.testing.expectEqual(Source.zero, disk.sources[1]);
+            try std.testing.expectEqual(@as(usize, 1), disk.digest_index.entries.len);
+            try std.testing.expect(parent_id.eql(disk.digest_index.get(0) orelse return error.TestExpectedEqual));
+            try std.testing.expectEqual(@as(u64, chunk_size), disk.parent_logical_size);
+        }
+    }.run, .{});
 }
 
 test "snapshot writes disk index and chunk objects" {
@@ -1919,6 +2617,8 @@ test "read only disk rejects writes" {
 
     const patch = [_]u8{0x22} ** 4;
     try std.testing.expectError(error.ReadOnly, disk.writeAt(&patch, 0));
+    try std.testing.expectError(error.ReadOnly, disk.zeroRange(0, 4));
+    try std.testing.expectError(error.ReadOnly, disk.markZeroChunk(0));
 
     var readback: [512]u8 = undefined;
     try disk.readAt(&readback, 0);
@@ -2086,6 +2786,7 @@ test "portable fork head round trips overlay and zero overrides" {
     _ = std.c.close(replaced_fd);
     child_fd = claimed_fd;
     head.overlay_fd = -1;
+    try std.testing.expectEqual(Source.zero_dirty, child.sources[2]);
 
     const readback = try allocator.alloc(u8, disk_size);
     defer allocator.free(readback);
@@ -2101,6 +2802,66 @@ test "portable fork head round trips overlay and zero overrides" {
     try child.writeAt(&child_patch, spore.disk_chunk_size + 91);
     try parent.readAt(readback[0..child_patch.len], spore.disk_chunk_size + 91);
     try std.testing.expectEqualSlices(u8, model[spore.disk_chunk_size + 91 ..][0..child_patch.len], readback[0..child_patch.len]);
+}
+
+test "portable fork adoption preserves authoritative clean grown zeroes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const chunk_size: usize = @intCast(spore.disk_chunk_size);
+    const grown_size = 2 * chunk_size;
+    const base_bytes = try allocator.alloc(u8, grown_size);
+    defer allocator.free(base_bytes);
+    @memset(base_bytes, 0);
+    @memset(base_bytes[0..chunk_size], 0x6d);
+    var base = try tmp.dir.createFile(io, "clean-grow-base.img", .{ .read = true });
+    defer base.close(io);
+    try base.writeStreamingAll(io, base_bytes);
+    const base_source = block_source.FileBlockSource.init(base.handle, grown_size);
+
+    const parent_fd = try createTempOverlayFd(allocator, runtime_overlay_dir);
+    defer _ = std.c.close(parent_fd);
+    var parent = try ChunkMappedDisk.initWritable(allocator, base_source, parent_fd, chunk_size, chunk_size);
+    defer parent.deinit();
+    try parent.growKnownZero(grown_size);
+    try std.testing.expectEqual(Source.zero, parent.sources[1]);
+    try std.testing.expectEqual(@as(usize, 0), parent.dirtyChunkCount());
+
+    var head = try parent.exportForkHead(.{
+        .kind = .rootfs,
+        .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }, .{ .allow_copy = true, .force_copy = true, .quiesced = true });
+    defer head.deinit();
+
+    var child_fd = try createTempOverlayFd(allocator, runtime_overlay_dir);
+    defer {
+        if (child_fd >= 0) _ = std.c.close(child_fd);
+    }
+    var child = try ChunkMappedDisk.initWritable(allocator, base_source, child_fd, chunk_size, chunk_size);
+    defer child.deinit();
+    try child.growKnownZero(grown_size);
+    const claimed_fd = head.overlay_fd;
+    const replaced_fd = try child.applyForkDescriptor(head.descriptor, claimed_fd);
+    try std.testing.expectEqual(child_fd, replaced_fd);
+    _ = std.c.close(replaced_fd);
+    child_fd = claimed_fd;
+    head.overlay_fd = -1;
+    try std.testing.expectEqual(Source.zero, child.sources[1]);
+    try std.testing.expectEqual(@as(usize, 0), child.dirtyChunkCount());
+
+    const parent_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/parent-snapshot", .{tmp.sub_path[0..]});
+    defer allocator.free(parent_dir);
+    const child_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/child-snapshot", .{tmp.sub_path[0..]});
+    defer allocator.free(child_dir);
+    try std.Io.Dir.cwd().createDirPath(io, parent_dir);
+    try std.Io.Dir.cwd().createDirPath(io, child_dir);
+    const parent_snapshot = try parent.snapshotIndex(parent_dir, .{ .mmio_slot = 1 }, true);
+    defer freeTestDisk(allocator, parent_snapshot);
+    const child_snapshot = try child.snapshotIndex(child_dir, .{ .mmio_slot = 1 }, true);
+    defer freeTestDisk(allocator, child_snapshot);
+    try std.testing.expectEqualStrings(parent_snapshot.base, child_snapshot.base);
 }
 
 test "native portable fork head uses its configured overlay filesystem" {

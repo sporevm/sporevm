@@ -76,6 +76,14 @@ description = "Smoke image commit, ref stability, and warm two-child fan-out"
 run = "mise run build && test/smoke/run/disk-size.sh"
 description = "Smoke absolute image-commit disk growth and fail-closed sizing"
 
+[tasks."smoke:build-rootfs-capacity"]
+run = "mise run build:release && test/smoke/rootfs/build-capacity.sh"
+description = "Smoke prepared build output save/restore, bundle transfer, commit reuse, and above-cap inheritance"
+
+[tasks."smoke:build-publication"]
+run = "mise run build:release && test/smoke/rootfs/build-publication.sh"
+description = "Smoke concurrent PREPARE reuse and fail-closed build publication boundaries"
+
 [tasks."smoke:run-file-locking"]
 run = "mise run build && test/smoke/run/file-locking.sh"
 description = "Smoke product spore run guest file locking support"

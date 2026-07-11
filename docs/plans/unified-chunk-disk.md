@@ -1092,8 +1092,13 @@ directly; it does not assemble or rescan the derived flat rootfs cache.
 Status: measured; a shared-store save follow-up is justified, but its design
 and implementation are deliberately outside this observability slice.
 
-The product save path now emits a bounded schema-1 disk metric. It separates
-dirty and non-dirty chunks, logical parent-reference bytes, unique parent bytes
+The product save path now emits a bounded schema-2 disk metric. It preserves
+the schema-1 publication fields and adds disjoint clean-known-zero and
+dirty-zero counts, so sparse capacity is distinguished from chunks that
+required sealing/scanning and from nonzero parent reuse. The strict parser
+retains schema-1 support for the historical evidence below. The metric
+separates dirty and non-dirty chunks,
+logical parent-reference bytes, unique parent bytes
 published by hard link, existing-object reuse, or verified copy, and the
 corresponding time plus the batched link-directory sync. It also records
 dirty-object work, canonical index encoding and durable

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const rootfs_cas = @import("../rootfs_cas.zig");
 const rootfs_mod = @import("../rootfs.zig");
@@ -13,6 +14,11 @@ const vsock = @import("../virtio/vsock.zig");
 const guest_port: u32 = 10700;
 const step_timeout_ms: u64 = 30 * 60 * 1000;
 const max_captured_output = 64 * 1024;
+const max_rootfs_grow_response = run_mod.max_rootfs_grow_response;
+const p0_idle_probe_env = "SPOREVM_ROOTFS_GROWTH_P0_IDLE_MS";
+const max_p0_idle_probe_ms: u64 = 10_000;
+const build_producer_domain = "sporevm-build-producer-v2";
+const prepare_host_contract = "grow-v1-strict-request-v2;ext4-source-preflight-v2;ext4-superblock-postcondition-v1;ext4-ioctl-v1;noinit-itable-v1;virtio-write-zeroes-1x4m-v1;chunk-zero-map-v1";
 // Provisional build-VM default; make this a `spore build` option when larger
 // workloads such as `bundle install`-style RUN steps need more memory.
 const build_vm_memory_bytes: u64 = 2 * 1024 * 1024 * 1024;
@@ -23,18 +29,103 @@ const max_guest_env_len = 255;
 const max_guest_working_dir_len = 255;
 pub const max_copy_entries = 65536;
 pub const max_copy_entry_path_len = 512;
-const resize_command = "resize2fs /dev/vda";
+const enospc_patterns = [_][]const u8{
+    "SPORE_BUILD_ENOSPC",
+    "No space left on device",
+    "ENOSPC",
+};
+const max_enospc_pattern_len = "No space left on device".len;
 
 pub const Diagnostic = struct {
     instruction: ?[]const u8 = null,
     instruction_line: usize = 0,
     exit_code: ?i32 = null,
     output: []const u8 = "",
+    enospc: bool = false,
     boot_count: usize = 0,
     executed_steps: usize = 0,
     resize_count: usize = 0,
+    boot_artifact_file_reads: usize = 0,
+    boot_artifact_bytes_read: usize = 0,
     max_checkpoint_control_ms: u64 = 0,
 };
+
+pub const Producer = struct {
+    identity: []const u8,
+    boot_source: union(enum) {
+        retained: run_mod.MonitorBootArtifacts,
+        managed: run_mod.ManagedMonitorBootDescriptor,
+    },
+    eager_artifact_file_reads: usize = 0,
+    eager_artifact_bytes_read: usize = 0,
+};
+
+pub fn resolveProducer(init: std.process.Init, allocator: std.mem.Allocator) !Producer {
+    const noinit_itable = run_mod.rootfsGrowthNoInitItable(init.environ_map);
+    if (init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null and
+        init.environ_map.get("SPOREVM_RUN_INITRD") == null)
+    {
+        const managed = try run_mod.resolveManagedMonitorBootDescriptor(init, allocator);
+        return managedProducer(allocator, managed, noinit_itable);
+    }
+
+    const kernel_path = try run_mod.resolveDefaultKernelPath(init, allocator);
+    const initrd_path = try run_mod.resolveConfiguredInitrdPath(init, null);
+    const boot = try run_mod.loadMonitorBootArtifacts(init.io, allocator, kernel_path, initrd_path);
+    const kernel_sha256 = sha256Bytes(boot.kernel);
+    const initrd_sha256 = sha256Bytes(boot.initrd);
+    return .{
+        .identity = try producerIdentity(allocator, kernel_sha256, initrd_sha256, noinit_itable),
+        .boot_source = .{ .retained = boot },
+        .eager_artifact_file_reads = 1 + @as(usize, @intFromBool(initrd_path != null)),
+        .eager_artifact_bytes_read = boot.kernel.len + if (initrd_path != null) boot.initrd.len else 0,
+    };
+}
+
+fn managedProducer(
+    allocator: std.mem.Allocator,
+    managed: run_mod.ManagedMonitorBootDescriptor,
+    noinit_itable: bool,
+) !Producer {
+    return .{
+        .identity = try producerIdentity(allocator, managed.kernel_sha256, managed.initrd_sha256, noinit_itable),
+        .boot_source = .{ .managed = managed },
+    };
+}
+
+fn producerIdentity(
+    allocator: std.mem.Allocator,
+    kernel_sha256: [Sha256.digest_length]u8,
+    initrd_sha256: [Sha256.digest_length]u8,
+    noinit_itable: bool,
+) ![]const u8 {
+    var h = std.crypto.hash.Blake3.init(.{});
+    hashProducerField(&h, build_producer_domain);
+    hashProducerField(&h, "sha256");
+    hashProducerField(&h, &kernel_sha256);
+    hashProducerField(&h, "sha256");
+    hashProducerField(&h, &initrd_sha256);
+    hashProducerField(&h, "spore-rootfs-grow-v1");
+    hashProducerField(&h, prepare_host_contract);
+    hashProducerField(&h, if (noinit_itable) "noinit_itable=1" else "noinit_itable=0");
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    h.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "blake3:{s}", .{&hex});
+}
+
+fn sha256Bytes(bytes: []const u8) [Sha256.digest_length]u8 {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
+
+fn hashProducerField(h: *std.crypto.hash.Blake3, bytes: []const u8) void {
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, bytes.len, .little);
+    h.update(&len);
+    h.update(bytes);
+}
 
 pub const RunStep = struct {
     line: usize = 0,
@@ -105,19 +196,31 @@ pub const Options = struct {
     base_storage: spore.RootfsStorage,
     steps: []const Step,
     rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
-    disk_grow_target: u64 = 0,
+    preparation: ?Preparation = null,
+    producer: Producer,
     context_disk_path: ?[]const u8 = null,
     output: ?*Io.Writer = null,
     diagnostic: ?*Diagnostic = null,
 };
 
-pub fn cacheInputForStep(platform: rootfs_mod.Platform, parent_index_digest: []const u8, step: Step, disk_grow_target: u64) step_cache.StepInput {
+pub const Preparation = struct {
+    input: step_cache.StepInput,
+    step_key: []const u8,
+    exact_target: u64,
+};
+
+pub fn cacheInputForStep(
+    platform: rootfs_mod.Platform,
+    parent_index_digest: []const u8,
+    executor_identity: []const u8,
+    step: Step,
+) step_cache.StepInput {
     return switch (step) {
         .run => |run| .{
             .platform = platform,
             .parent_index_digest = parent_index_digest,
             .canonical_instruction = run.canonical_instruction,
-            .disk_grow_target = disk_grow_target,
+            .executor_identity = executor_identity,
             .operation = .{ .run = .{
                 .env_digest = run.env_digest,
                 .workdir = run.workdir,
@@ -128,7 +231,7 @@ pub fn cacheInputForStep(platform: rootfs_mod.Platform, parent_index_digest: []c
             .platform = platform,
             .parent_index_digest = parent_index_digest,
             .canonical_instruction = copy.canonical_instruction,
-            .disk_grow_target = disk_grow_target,
+            .executor_identity = executor_identity,
             .operation = .{ .copy = .{
                 .input_digest = copy.input_digest,
                 .env_digest = copy.env_digest,
@@ -139,7 +242,7 @@ pub fn cacheInputForStep(platform: rootfs_mod.Platform, parent_index_digest: []c
             .platform = platform,
             .parent_index_digest = parent_index_digest,
             .canonical_instruction = workdir.canonical_instruction,
-            .disk_grow_target = disk_grow_target,
+            .executor_identity = executor_identity,
             .operation = .{ .workdir = .{
                 .target = workdir.target,
                 .env_digest = workdir.env_digest,
@@ -160,6 +263,8 @@ const Phase = enum {
     snapshot,
     start_thaw,
     active_thaw,
+    p0_idle_start,
+    p0_idle_wait,
     done,
     failed,
 };
@@ -173,6 +278,53 @@ const ActiveStream = enum {
     thaw,
 };
 
+const CheckpointKind = enum {
+    prepare,
+    dockerfile_step,
+};
+
+const EnospcDetector = struct {
+    seen: bool = false,
+    tail: [max_enospc_pattern_len - 1]u8 = undefined,
+    tail_len: usize = 0,
+
+    fn observe(self: *EnospcDetector, bytes: []const u8) void {
+        if (self.seen or bytes.len == 0) return;
+        for (enospc_patterns) |pattern| {
+            if (std.mem.indexOf(u8, bytes, pattern) != null) {
+                self.seen = true;
+                return;
+            }
+            for (1..pattern.len) |split| {
+                if (split > self.tail_len or pattern.len - split > bytes.len) continue;
+                if (std.mem.endsWith(u8, self.tail[0..self.tail_len], pattern[0..split]) and
+                    std.mem.startsWith(u8, bytes, pattern[split..]))
+                {
+                    self.seen = true;
+                    return;
+                }
+            }
+        }
+        self.retainTail(bytes);
+    }
+
+    fn retainTail(self: *EnospcDetector, bytes: []const u8) void {
+        const capacity = self.tail.len;
+        if (bytes.len >= capacity) {
+            @memcpy(&self.tail, bytes[bytes.len - capacity ..]);
+            self.tail_len = capacity;
+            return;
+        }
+        var merged: [2 * (max_enospc_pattern_len - 1)]u8 = undefined;
+        @memcpy(merged[0..self.tail_len], self.tail[0..self.tail_len]);
+        @memcpy(merged[self.tail_len..][0..bytes.len], bytes);
+        const merged_len = self.tail_len + bytes.len;
+        const keep = @min(capacity, merged_len);
+        @memcpy(self.tail[0..keep], merged[merged_len - keep .. merged_len]);
+        self.tail_len = keep;
+    }
+};
+
 /// Runs all uncached build steps in one build VM session.
 ///
 /// Allocation ownership follows the build path's arena-per-invocation contract:
@@ -182,28 +334,49 @@ const ActiveStream = enum {
 pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !spore.RootfsStorage {
     if (options.steps.len == 0) return spore.cloneRootfsStorage(allocator, options.base_storage);
     if (options.diagnostic) |diag| {
-        diag.* = .{};
-        diag.resize_count = @intFromBool(options.disk_grow_target != 0);
+        diag.* = .{
+            .resize_count = @intFromBool(options.preparation != null),
+            .boot_artifact_file_reads = options.producer.eager_artifact_file_reads,
+            .boot_artifact_bytes_read = options.producer.eager_artifact_bytes_read,
+        };
     }
     const network_mode = try networkModeForSteps(options.steps);
 
-    var control = try BuildControl.init(init.io, allocator, options);
+    var control = try BuildControl.init(init.io, allocator, options, try p0IdleProbeMs(init.environ_map));
     defer control.deinit();
 
     const rootfs = try rootfsFromStorage(allocator, options.base_storage);
-    const kernel_path = try run_mod.resolveDefaultKernelPath(init, allocator);
-    const initrd_path = try run_mod.resolveConfiguredInitrdPath(init, null);
-    _ = try run_mod.executeMonitorWithRootfsCacheLock(.{ .io = init.io, .environ_map = init.environ_map }, allocator, .{
-        .kernel_path = kernel_path,
-        .initrd_path = initrd_path,
+    const monitor_options = run_mod.Options{
+        .kernel_path = "",
+        .initrd_path = null,
         .rootfs = rootfs,
-        .rootfs_grow_target = options.disk_grow_target,
+        .rootfs_grow_target = if (options.preparation) |preparation| preparation.exact_target else 0,
         .context_disk_path = options.context_disk_path,
         .command = &.{},
         .memory = .{ .policy = .explicit, .bytes = build_vm_memory_bytes },
         .network = if (network_mode == .spore) .spore else .disabled,
         .timeout_ms = step_timeout_ms,
-    }, control.control(), null, options.rootfs_cache_lock);
+    };
+    const boot = switch (options.producer.boot_source) {
+        .retained => |retained| retained,
+        .managed => |managed| blk: {
+            const artifacts = try run_mod.materializeManagedMonitorBootArtifacts(init.io, allocator, managed);
+            if (options.diagnostic) |diag| {
+                diag.boot_artifact_file_reads += 1;
+                diag.boot_artifact_bytes_read += artifacts.kernel.len;
+            }
+            break :blk artifacts;
+        },
+    };
+    _ = try run_mod.executeMonitorWithBootArtifactsAndRootfsCacheLock(
+        .{ .io = init.io, .environ_map = init.environ_map },
+        allocator,
+        monitor_options,
+        boot,
+        control.control(),
+        null,
+        options.rootfs_cache_lock,
+    );
 
     if (control.failed_exit_code) |exit_code| {
         if (options.diagnostic) |diag| {
@@ -211,6 +384,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
             diag.instruction_line = control.failed_instruction_line;
             diag.exit_code = exit_code;
             diag.output = try control.capture.toOwnedSlice();
+            diag.enospc = control.enospc_detector.seen;
             diag.boot_count = 1;
             diag.executed_steps = control.executed_steps;
             diag.max_checkpoint_control_ms = control.max_checkpoint_control_ms;
@@ -249,11 +423,14 @@ const BuildControl = struct {
     io: Io,
     allocator: std.mem.Allocator,
     platform: rootfs_mod.Platform,
+    executor_identity: []const u8,
     cache_root: []const u8,
     steps: []const Step,
     output: ?*Io.Writer,
     current_storage: spore.RootfsStorage,
-    disk_grow_target: u64 = 0,
+    preparation: ?Preparation = null,
+    rootfs_grow_target: u64 = 0,
+    checkpoint_kind: CheckpointKind = .dockerfile_step,
     step_index: usize = 0,
     phase: Phase = .start_run,
     active_stream: ActiveStream = .run,
@@ -267,30 +444,47 @@ const BuildControl = struct {
     active_stdin_close_sent: bool = true,
     active_copy_request_index: usize = 0,
     capture: std.array_list.Managed(u8),
+    resize_stdout: std.array_list.Managed(u8),
+    resize_stdout_overflow: bool = false,
+    enospc_detector: EnospcDetector = .{},
+    p0_idle_probe_ms: u64 = 0,
+    p0_idle_deadline_ns: u64 = 0,
+    p0_idle_baseline: vsock.ControlStats = .{},
+    latest_stats: vsock.ControlStats = .{},
     executed_steps: usize = 0,
     failed_instruction: ?[]const u8 = null,
     failed_instruction_line: usize = 0,
     failed_exit_code: ?i32 = null,
     failure: ?anyerror = null,
     max_checkpoint_control_ms: u64 = 0,
+    preparation_start_ns: ?u64 = null,
+    preparation_publish_ms: ?u64 = null,
 
-    fn init(io: Io, allocator: std.mem.Allocator, options: Options) !BuildControl {
+    fn init(io: Io, allocator: std.mem.Allocator, options: Options, p0_idle_probe_ms: u64) !BuildControl {
         return .{
             .io = io,
             .allocator = allocator,
             .platform = options.platform,
+            .executor_identity = options.producer.identity,
             .cache_root = options.cache_root,
             .steps = options.steps,
             .output = options.output,
             .current_storage = try spore.cloneRootfsStorage(allocator, options.base_storage),
-            .disk_grow_target = options.disk_grow_target,
-            .phase = if (options.disk_grow_target == 0) .start_run else .start_resize,
+            .preparation = options.preparation,
+            .rootfs_grow_target = if (options.preparation) |preparation| preparation.exact_target else 0,
+            .checkpoint_kind = if (options.preparation == null) .dockerfile_step else .prepare,
+            .phase = if (options.preparation == null) .start_run else .start_resize,
+            .active_input = if (options.preparation) |preparation| preparation.input else null,
+            .active_step_key = if (options.preparation) |preparation| preparation.step_key else "",
             .capture = std.array_list.Managed(u8).init(allocator),
+            .resize_stdout = std.array_list.Managed(u8).init(allocator),
+            .p0_idle_probe_ms = p0_idle_probe_ms,
         };
     }
 
     fn deinit(self: *BuildControl) void {
         self.capture.deinit();
+        self.resize_stdout.deinit();
     }
 
     fn control(self: *BuildControl) vsock.Control {
@@ -331,19 +525,36 @@ const BuildControl = struct {
                 return .keep_running;
             },
             .active_thaw => return try self.pollActiveStream(dev),
+            .p0_idle_start => {
+                self.p0_idle_baseline = self.latest_stats;
+                self.p0_idle_deadline_ns = std.math.add(u64, try monotonicNs(), self.p0_idle_probe_ms * std.time.ns_per_ms) catch return error.ClockFailed;
+                self.phase = .p0_idle_wait;
+                return .keep_running;
+            },
+            .p0_idle_wait => {
+                if (try monotonicNs() < self.p0_idle_deadline_ns) return .keep_running;
+                try validateIdleBlockStats(self.p0_idle_baseline, self.latest_stats);
+                std.log.info("rootfs growth P0 idle: ms={d} write_zeroes_delta=0 out_delta=0", .{self.p0_idle_probe_ms});
+                self.phase = .start_freeze;
+                return .keep_running;
+            },
             .done, .failed => return .stop,
         }
     }
 
     fn startResize(self: *BuildControl, dev: *vsock.Vsock) !void {
-        const request = try runRequest(self.allocator, "spore-build-resize", resize_command, &.{}, "/", self.io);
-        try self.startStream(dev, request, .spore_stream_v1, .resize, resize_command);
+        if (self.preparation_start_ns != null) return error.BadManifest;
+        self.preparation_start_ns = try monotonicNs();
+        const request = try run_mod.simpleControlRequest(self.allocator, "spore-rootfs-grow-v1", "spore-build-resize");
+        try self.startStream(dev, request, .spore_stream_v1, .resize, "");
         self.phase = .active_resize;
     }
 
     fn startStep(self: *BuildControl, dev: *vsock.Vsock) !void {
         const step = self.steps[self.step_index];
+        self.enospc_detector = .{};
         self.executed_steps += 1;
+        self.checkpoint_kind = .dockerfile_step;
         const input = self.stepInput(step);
         self.active_input = input;
         self.active_step_key = try step_cache.stepKey(self.allocator, input);
@@ -379,12 +590,11 @@ const BuildControl = struct {
     }
 
     fn stepInput(self: BuildControl, step: Step) step_cache.StepInput {
-        const disk_grow_target = if (self.step_index == 0) self.disk_grow_target else 0;
-        return cacheInputForStep(self.platform, self.current_storage.index_digest, step, disk_grow_target);
+        return cacheInputForStep(self.platform, self.current_storage.index_digest, self.executor_identity, step);
     }
 
     fn startSimpleControl(self: *BuildControl, dev: *vsock.Vsock, kind: ActiveStream) !void {
-        const session_id = try checkpointSessionId(self.allocator, kind, self.step_index);
+        const session_id = try checkpointSessionId(self.allocator, kind, self.checkpoint_kind, self.step_index);
         const request = switch (kind) {
             .freeze => try run_mod.simpleControlRequest(self.allocator, "fsfreeze-v1", session_id),
             .thaw => try run_mod.simpleControlRequest(self.allocator, "fsthaw-v1", session_id),
@@ -406,7 +616,7 @@ const BuildControl = struct {
         if (kind == .run or kind == .copy or kind == .workdir or kind == .resize) self.stream.setOutputSink(self, outputSink);
         self.active_stdin_payload = stdin_payload;
         self.active_stdin_offset = 0;
-        self.active_stdin_close_sent = !(kind == .run or kind == .resize);
+        self.active_stdin_close_sent = kind != .run;
         try dev.attachHostStream(&self.stream);
         self.stream.markStarted();
         self.stream_valid = true;
@@ -451,8 +661,11 @@ const BuildControl = struct {
                     self.phase = .failed;
                     return;
                 }
+                if (self.resize_stdout_overflow) return error.BuildGuestResizeResponseInvalid;
+                const result = parseRootfsGrowResponse(self.resize_stdout.items) catch return error.BuildGuestResizeResponseInvalid;
+                if (result.device_bytes != self.rootfs_grow_target) return error.BuildGuestResizeGeometryMismatch;
                 self.capture.clearRetainingCapacity();
-                self.phase = .start_run;
+                self.phase = if (self.p0_idle_probe_ms == 0) .start_freeze else .p0_idle_start;
             },
             .run, .copy, .workdir => {
                 if (exit_code != 0) {
@@ -492,7 +705,8 @@ const BuildControl = struct {
                     self.phase = .failed;
                     return;
                 }
-                self.step_index += 1;
+                const completed_kind = self.checkpoint_kind;
+                if (completed_kind == .dockerfile_step) self.step_index += 1;
                 self.active_input = null;
                 self.active_step_key = "";
                 self.active_stdin_payload = "";
@@ -500,7 +714,24 @@ const BuildControl = struct {
                 self.active_stdin_close_sent = true;
                 self.active_copy_request_index = 0;
                 self.capture.clearRetainingCapacity();
-                self.phase = if (self.step_index >= self.steps.len) .done else .start_run;
+                if (completed_kind == .prepare) {
+                    const start_ns = self.preparation_start_ns orelse return error.BadManifest;
+                    const elapsed_ns = (try monotonicNs()) -| start_ns;
+                    std.log.info(
+                        "rootfs preparation metrics: publish_ms={d} resume_ms={d} target_mib={d} checkpoint_control_max_ms={d}",
+                        .{
+                            self.preparation_publish_ms orelse return error.BadManifest,
+                            elapsed_ns / std.time.ns_per_ms,
+                            self.rootfs_grow_target / (1024 * 1024),
+                            self.max_checkpoint_control_ms,
+                        },
+                    );
+                    self.preparation = null;
+                    self.checkpoint_kind = .dockerfile_step;
+                    self.phase = .start_run;
+                } else {
+                    self.phase = if (self.step_index >= self.steps.len) .done else .start_run;
+                }
             },
         }
     }
@@ -519,11 +750,16 @@ const BuildControl = struct {
         if (self.phase != .snapshot) return;
         const disk = maybe_disk orelse return error.BadManifest;
         const storage = try runtime_disk.storageFromSnapshotDisk(self.allocator, disk);
+        if (self.checkpoint_kind == .prepare) try validatePreparedStorage(self.current_storage, storage, self.rootfs_grow_target);
         // A zero-dirty RUN/COPY/WORKDIR can intentionally yield child digest ==
         // parent digest; the step key still proves which instruction inputs ran.
         try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, storage.index_digest);
         const input = self.active_input orelse return error.BadManifest;
         _ = try step_cache.writeRecord(self.io, self.allocator, self.cache_root, input, self.active_step_key, storage);
+        if (self.checkpoint_kind == .prepare) {
+            const start_ns = self.preparation_start_ns orelse return error.BadManifest;
+            self.preparation_publish_ms = ((try monotonicNs()) -| start_ns) / std.time.ns_per_ms;
+        }
         self.current_storage = storage;
         self.phase = .start_thaw;
     }
@@ -532,9 +768,12 @@ const BuildControl = struct {
 
     fn completeSnapshot(_: *BuildControl, _: []const u8) !void {}
 
-    fn reportStats(_: *BuildControl, _: vsock.ControlStats) void {}
+    fn reportStats(self: *BuildControl, stats: vsock.ControlStats) void {
+        self.latest_stats = stats;
+    }
 
     fn appendOutput(self: *BuildControl, bytes: []const u8) void {
+        self.enospc_detector.observe(bytes);
         if (self.output) |writer| {
             writer.writeAll(bytes) catch {};
             writer.flush() catch {};
@@ -544,8 +783,16 @@ const BuildControl = struct {
         if (take != 0) self.capture.appendSlice(bytes[0..take]) catch {};
     }
 
-    fn outputSink(context: ?*anyopaque, _: vsock.HostStreamOutput, bytes: []const u8) void {
+    fn outputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
         const self: *BuildControl = @ptrCast(@alignCast(context.?));
+        if (self.active_stream == .resize and output == .stdout) {
+            const remaining = max_rootfs_grow_response -| self.resize_stdout.items.len;
+            if (bytes.len > remaining) self.resize_stdout_overflow = true;
+            const take = @min(remaining, bytes.len);
+            if (take != 0) self.resize_stdout.appendSlice(bytes[0..take]) catch {
+                self.resize_stdout_overflow = true;
+            };
+        }
         self.appendOutput(bytes);
     }
 
@@ -575,13 +822,74 @@ const BuildControl = struct {
     }
 };
 
-fn checkpointSessionId(allocator: std.mem.Allocator, kind: ActiveStream, step_index: usize) ![]const u8 {
+pub fn validatePreparedStorage(parent: spore.RootfsStorage, child: spore.RootfsStorage, exact_target: u64) !void {
+    try spore.validateRootfsStorageDescriptor(parent);
+    try spore.validateRootfsStorageDescriptor(child);
+    if (child.logical_size != exact_target or
+        !std.mem.eql(u8, parent.kind, child.kind) or
+        !spore.rootfsDeviceEql(parent.device, child.device) or
+        parent.chunk_size != child.chunk_size or
+        !std.mem.eql(u8, parent.hash_algorithm, child.hash_algorithm) or
+        !std.mem.eql(u8, parent.object_namespace, child.object_namespace))
+    {
+        return error.BuildGuestResizeGeometryMismatch;
+    }
+}
+
+fn checkpointSessionId(allocator: std.mem.Allocator, kind: ActiveStream, checkpoint_kind: CheckpointKind, step_index: usize) ![]const u8 {
     const name = switch (kind) {
         .freeze => "freeze",
         .thaw => "thaw",
         .resize, .run, .copy, .workdir => unreachable,
     };
-    return std.fmt.allocPrint(allocator, "spore-build-{s}-{d}", .{ name, step_index + 1 });
+    return if (checkpoint_kind == .prepare)
+        std.fmt.allocPrint(allocator, "spore-build-prepare-{s}", .{name})
+    else
+        std.fmt.allocPrint(allocator, "spore-build-{s}-{d}", .{ name, step_index + 1 });
+}
+
+fn parseRootfsGrowResponse(bytes: []const u8) !run_mod.RootfsGrowResult {
+    return run_mod.parseRootfsGrowResponse(bytes);
+}
+
+fn parseP0IdleProbeMs(value: ?[]const u8) !u64 {
+    const raw = value orelse return 0;
+    if (raw.len == 0 or std.mem.eql(u8, raw, "0")) return 0;
+    const parsed = std.fmt.parseUnsigned(u64, raw, 10) catch return error.BadP0IdleProbe;
+    if (parsed > max_p0_idle_probe_ms) return error.BadP0IdleProbe;
+    return parsed;
+}
+
+fn p0IdleProbeMs(environ: *const std.process.Environ.Map) !u64 {
+    if (!run_mod.rootfsGrowthExperimentsEnabled(environ)) return 0;
+    return parseP0IdleProbeMs(environ.get(p0_idle_probe_env));
+}
+
+fn validateIdleBlockStats(before: vsock.ControlStats, after: vsock.ControlStats) !void {
+    const before_write_zeroes_requests = before.write_zeroes_requests orelse return error.MissingP0BlockStats;
+    const before_write_zeroes_bytes = before.write_zeroes_bytes orelse return error.MissingP0BlockStats;
+    const before_write_zeroes_errors = before.write_zeroes_errors orelse return error.MissingP0BlockStats;
+    const before_write_zeroes_backend_failures = before.write_zeroes_backend_failures orelse return error.MissingP0BlockStats;
+    const before_write_zeroes_unsupported = before.write_zeroes_unsupported orelse return error.MissingP0BlockStats;
+    const before_out_requests = before.out_requests orelse return error.MissingP0BlockStats;
+    const before_out_bytes = before.out_bytes orelse return error.MissingP0BlockStats;
+    if ((after.write_zeroes_requests orelse return error.MissingP0BlockStats) != before_write_zeroes_requests or
+        (after.write_zeroes_bytes orelse return error.MissingP0BlockStats) != before_write_zeroes_bytes or
+        (after.write_zeroes_errors orelse return error.MissingP0BlockStats) != before_write_zeroes_errors or
+        (after.write_zeroes_backend_failures orelse return error.MissingP0BlockStats) != before_write_zeroes_backend_failures or
+        (after.write_zeroes_unsupported orelse return error.MissingP0BlockStats) != before_write_zeroes_unsupported or
+        (after.out_requests orelse return error.MissingP0BlockStats) != before_out_requests or
+        (after.out_bytes orelse return error.MissingP0BlockStats) != before_out_bytes)
+    {
+        return error.RootfsBackgroundWritesDetected;
+    }
+}
+
+fn monotonicNs() !u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return error.ClockFailed;
+    const seconds = std.math.mul(u64, @intCast(ts.sec), std.time.ns_per_s) catch return error.ClockFailed;
+    return std.math.add(u64, seconds, @intCast(ts.nsec)) catch return error.ClockFailed;
 }
 
 fn runRequest(
@@ -732,8 +1040,12 @@ const guest_agent_fuzz_copy_request: c_int = 2;
 const guest_agent_fuzz_run_complete: c_int = 3;
 const guest_agent_fuzz_workdir_request: c_int = 4;
 const guest_agent_fuzz_ready_request: c_int = 5;
+const guest_agent_fuzz_grow_request: c_int = 6;
 
 extern fn spore_agent_fuzz_build_request(request: [*]const u8, request_len: usize, stream: [*]const u8, stream_len: usize) c_int;
+extern fn spore_agent_fuzz_ext4_geometry(super: [*]const u8, super_len: usize, blocks_count: *u64, blocks_per_group: *u32, block_size: *u32) c_int;
+extern fn spore_agent_fuzz_ext4_growth_source(super: [*]const u8, super_len: usize) c_int;
+extern fn spore_agent_fuzz_rootfs_grow_geometry(target_blocks: u64, before_blocks: u64, before_blocks_per_group: u32, before_block_size: u32, after_blocks: u64, after_blocks_per_group: u32, after_block_size: u32) c_int;
 extern fn spore_agent_fuzz_proc_stat(stat: [*]const u8, stat_len: usize) c_int;
 
 fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
@@ -815,19 +1127,260 @@ test "build fsfreeze request stays bounded" {
     try std.testing.expect(std.mem.indexOf(u8, request, "\"fsfreeze-v1\"") != null);
 }
 
+test "build rootfs grow request stays bounded" {
+    const request = try run_mod.simpleControlRequest(std.testing.allocator, "spore-rootfs-grow-v1", "spore-build-resize");
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.endsWith(u8, request, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-rootfs-grow-v1\"") != null);
+    if (comptime guest_agent_fuzz_supported) {
+        try std.testing.expectEqual(guest_agent_fuzz_grow_request, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
+        const reversed = " { \"session_id\" : \"spore-build-resize\", \"type\" : \"spore-rootfs-grow-v1\" } \n";
+        try std.testing.expectEqual(guest_agent_fuzz_grow_request, spore_agent_fuzz_build_request(reversed.ptr, reversed.len, reversed[0..0].ptr, 0));
+
+        const invalid = [_][]const u8{
+            "{\"type\":\"spore-rootfs-grow-v1\"}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\"}",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"\"}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":1}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"type\":\"spore-rootfs-grow-v1\"}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\",\"session_id\":\"b\"}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\",\"capacity\":1}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\",\"stdout_offset\":0}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\"} trailing\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"" ++ ("a" ** 64) ++ "\"}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\"}\x00extra\n",
+        };
+        for (invalid) |raw| {
+            try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(raw.ptr, raw.len, raw[0..0].ptr, 0));
+        }
+        const max_session = "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"" ++ ("a" ** 63) ++ "\"}\n";
+        try std.testing.expectEqual(guest_agent_fuzz_grow_request, spore_agent_fuzz_build_request(max_session.ptr, max_session.len, max_session[0..0].ptr, 0));
+    }
+}
+
+test "rootfs grow response is exact and geometry-bound" {
+    const valid = "spore-rootfs-grow-v1 device_bytes=10737418240 block_size=4096 target_blocks=2621440 before_blocks=131072 filesystem_blocks=2621440 blocks_per_group=32768 usable_blocks=2580000 free_bytes=8589934592 inodes=655360 free_inodes=650000\n";
+    const parsed = try parseRootfsGrowResponse(valid);
+    try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024 * 1024), parsed.device_bytes);
+    try std.testing.expectEqual(@as(u64, 4096), parsed.block_size);
+    try std.testing.expectEqual(@as(u64, 131072), parsed.before_blocks);
+    try std.testing.expectEqual(parsed.target_blocks, parsed.filesystem_blocks);
+    try std.testing.expectEqual(@as(u32, 32768), parsed.blocks_per_group);
+    try std.testing.expectError(error.BadRootfsGrowResponse, parseRootfsGrowResponse(valid[0 .. valid.len - 1]));
+
+    const legal_shortfall = "spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=69 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n";
+    _ = try parseRootfsGrowResponse(legal_shortfall);
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=69 filesystem_blocks=69 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=100 filesystem_blocks=100 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=101 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=68 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=69 blocks_per_group=32 usable_blocks=70 free_bytes=0 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 filesystem_blocks=69 before_blocks=40 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=69 blocks_per_group=4294967296 usable_blocks=60 free_bytes=0 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=69 blocks_per_group=32 usable_blocks=60 free_bytes=249856 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=69 blocks_per_group=32 usable_blocks=60 free_bytes=1 inodes=1 free_inodes=1\n"),
+    );
+    try std.testing.expectError(
+        error.BadRootfsGrowResponse,
+        parseRootfsGrowResponse("spore-rootfs-grow-v1 device_bytes=409600 block_size=4096 target_blocks=100 before_blocks=40 filesystem_blocks=69 blocks_per_group=32 usable_blocks=60 free_bytes=0 inodes=0 free_inodes=0\n"),
+    );
+}
+
+test "guest ext4 superblock and resize geometry validation is feature-aware" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+
+    var super: [1024]u8 = @splat(0);
+    std.mem.writeInt(u32, super[0x04..0x08], 1234, .little);
+    std.mem.writeInt(u32, super[0x18..0x1c], 2, .little);
+    std.mem.writeInt(u32, super[0x20..0x24], 32768, .little);
+    std.mem.writeInt(u16, super[0x38..0x3a], 0xef53, .little);
+    std.mem.writeInt(u32, super[0x150..0x154], 1, .little);
+
+    var blocks_count: u64 = 0;
+    var blocks_per_group: u32 = 0;
+    var block_size: u32 = 0;
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_ext4_geometry(&super, super.len, &blocks_count, &blocks_per_group, &block_size));
+    try std.testing.expectEqual(@as(u64, 1234), blocks_count);
+    try std.testing.expectEqual(@as(u32, 32768), blocks_per_group);
+    try std.testing.expectEqual(@as(u32, 4096), block_size);
+    // A frozen journal-less checkpoint is consistent but need not carry the
+    // clean-unmount bit, so both state values are accepted by the preflight.
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u16, super[0x3a..0x3c], 0x0001, .little);
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+
+    std.mem.writeInt(u32, super[0x5c..0x60], 0x0004, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u32, super[0x5c..0x60], 0, .little);
+
+    std.mem.writeInt(u32, super[0x60..0x64], 0x0004, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u32, super[0x60..0x64], 0x0008, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u32, super[0x60..0x64], 0, .little);
+
+    std.mem.writeInt(u16, super[0x3a..0x3c], 0x0002, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u16, super[0x3a..0x3c], 0x0004, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u16, super[0x3a..0x3c], 0, .little);
+
+    std.mem.writeInt(u32, super[0xe8..0xec], 1, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u32, super[0xe8..0xec], 0, .little);
+    std.mem.writeInt(u32, super[0x64..0x68], 0x00010000, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_growth_source(&super, super.len));
+    std.mem.writeInt(u32, super[0x64..0x68], 0, .little);
+
+    std.mem.writeInt(u32, super[0x60..0x64], 0x80, .little);
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_ext4_geometry(&super, super.len, &blocks_count, &blocks_per_group, &block_size));
+    try std.testing.expectEqual((@as(u64, 1) << 32) | 1234, blocks_count);
+
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 100, 32, 4096));
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 69, 32, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 40, 32, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_rootfs_grow_geometry(100, 100, 32, 4096, 100, 32, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 101, 32, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 68, 32, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 100, 64, 4096));
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_rootfs_grow_geometry(100, 40, 32, 4096, 100, 32, 1024));
+
+    std.mem.writeInt(u16, super[0x38..0x3a], 0, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_geometry(&super, super.len, &blocks_count, &blocks_per_group, &block_size));
+    std.mem.writeInt(u16, super[0x38..0x3a], 0xef53, .little);
+    std.mem.writeInt(u32, super[0x20..0x24], 0, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_geometry(&super, super.len, &blocks_count, &blocks_per_group, &block_size));
+    std.mem.writeInt(u32, super[0x20..0x24], 32768, .little);
+    std.mem.writeInt(u32, super[0x18..0x1c], 7, .little);
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_fuzz_ext4_geometry(&super, super.len, &blocks_count, &blocks_per_group, &block_size));
+}
+
+fn fuzzRootfsGrowResponse(_: void, smith: *std.testing.Smith) !void {
+    var storage: [max_rootfs_grow_response + 1]u8 = undefined;
+    const bytes = storage[0..smith.slice(&storage)];
+    const parsed = parseRootfsGrowResponse(bytes) catch return;
+    try std.testing.expect(parsed.device_bytes != 0);
+    try std.testing.expect(parsed.block_size != 0);
+    try std.testing.expectEqual(@as(u64, 0), parsed.device_bytes % parsed.block_size);
+    try std.testing.expectEqual(parsed.device_bytes / parsed.block_size, parsed.target_blocks);
+    try std.testing.expect(parsed.before_blocks < parsed.filesystem_blocks);
+    try std.testing.expect(parsed.filesystem_blocks <= parsed.target_blocks);
+    try std.testing.expect(parsed.target_blocks - parsed.filesystem_blocks < parsed.blocks_per_group);
+    try std.testing.expect(parsed.usable_blocks <= parsed.filesystem_blocks);
+    try std.testing.expect(parsed.free_inodes <= parsed.inodes);
+}
+
+fn fuzzGuestExt4Geometry(_: void, smith: *std.testing.Smith) !void {
+    if (comptime !guest_agent_fuzz_supported) return;
+    var storage: [1024]u8 = undefined;
+    const bytes = storage[0..smith.slice(&storage)];
+    var blocks_count: u64 = 0;
+    var blocks_per_group: u32 = 0;
+    var block_size: u32 = 0;
+    if (spore_agent_fuzz_ext4_geometry(bytes.ptr, bytes.len, &blocks_count, &blocks_per_group, &block_size) == 0) return;
+    try std.testing.expect(blocks_count != 0);
+    try std.testing.expect(blocks_per_group != 0);
+    try std.testing.expect(block_size >= 1024 and block_size <= 65536 and std.math.isPowerOfTwo(block_size));
+}
+
+fn fuzzGuestExt4GrowthSource(_: void, smith: *std.testing.Smith) !void {
+    if (comptime !guest_agent_fuzz_supported) return;
+    var storage: [1024]u8 = undefined;
+    const bytes = storage[0..smith.slice(&storage)];
+    const accepted = spore_agent_fuzz_ext4_growth_source(bytes.ptr, bytes.len);
+    try std.testing.expect(accepted == 0 or accepted == 1);
+    if (accepted == 0) return;
+    var blocks_count: u64 = 0;
+    var blocks_per_group: u32 = 0;
+    var block_size: u32 = 0;
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_ext4_geometry(bytes.ptr, bytes.len, &blocks_count, &blocks_per_group, &block_size));
+}
+
+test "fuzz rootfs grow response parser" {
+    try std.testing.fuzz({}, fuzzRootfsGrowResponse, .{});
+}
+
+test "fuzz guest ext4 geometry parser" {
+    try std.testing.fuzz({}, fuzzGuestExt4Geometry, .{});
+}
+
+test "fuzz guest ext4 growth source preflight" {
+    try std.testing.fuzz({}, fuzzGuestExt4GrowthSource, .{});
+}
+
+test "P0 idle probe is bounded and rejects background block writes" {
+    try std.testing.expectEqual(@as(u64, 0), try parseP0IdleProbeMs(null));
+    try std.testing.expectEqual(@as(u64, 6000), try parseP0IdleProbeMs("6000"));
+    try std.testing.expectError(error.BadP0IdleProbe, parseP0IdleProbeMs("10001"));
+
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put(p0_idle_probe_env, "6000");
+    try std.testing.expectEqual(@as(u64, 0), try p0IdleProbeMs(&env));
+    try env.put(run_mod.rootfs_growth_experiments_env, "1");
+    try std.testing.expectEqual(@as(u64, 6000), try p0IdleProbeMs(&env));
+
+    const baseline = vsock.ControlStats{
+        .write_zeroes_requests = 3,
+        .write_zeroes_bytes = 4096,
+        .write_zeroes_errors = 0,
+        .write_zeroes_backend_failures = 0,
+        .write_zeroes_unsupported = 0,
+        .out_requests = 7,
+        .out_bytes = 8192,
+    };
+    try validateIdleBlockStats(baseline, baseline);
+    var changed = baseline;
+    changed.out_requests.? += 1;
+    try std.testing.expectError(error.RootfsBackgroundWritesDetected, validateIdleBlockStats(baseline, changed));
+    try std.testing.expectError(error.MissingP0BlockStats, validateIdleBlockStats(.{}, baseline));
+}
+
 test "checkpoint controls use step-specific vsock identities" {
     const allocator = std.testing.allocator;
-    const freeze_one = try checkpointSessionId(allocator, .freeze, 0);
+    const freeze_one = try checkpointSessionId(allocator, .freeze, .dockerfile_step, 0);
     defer allocator.free(freeze_one);
-    const freeze_two = try checkpointSessionId(allocator, .freeze, 1);
+    const freeze_two = try checkpointSessionId(allocator, .freeze, .dockerfile_step, 1);
     defer allocator.free(freeze_two);
-    const thaw_one = try checkpointSessionId(allocator, .thaw, 0);
+    const thaw_one = try checkpointSessionId(allocator, .thaw, .dockerfile_step, 0);
     defer allocator.free(thaw_one);
-    const thaw_two = try checkpointSessionId(allocator, .thaw, 1);
+    const thaw_two = try checkpointSessionId(allocator, .thaw, .dockerfile_step, 1);
     defer allocator.free(thaw_two);
 
     try std.testing.expectEqualStrings("spore-build-freeze-1", freeze_one);
     try std.testing.expectEqualStrings("spore-build-thaw-2", thaw_two);
+    const prepare_freeze = try checkpointSessionId(allocator, .freeze, .prepare, 0);
+    defer allocator.free(prepare_freeze);
+    const prepare_thaw = try checkpointSessionId(allocator, .thaw, .prepare, 0);
+    defer allocator.free(prepare_thaw);
+    try std.testing.expectEqualStrings("spore-build-prepare-freeze", prepare_freeze);
+    try std.testing.expectEqualStrings("spore-build-prepare-thaw", prepare_thaw);
 }
 
 test "build session network mode derives from RUN steps" {
@@ -984,6 +1537,10 @@ test "guest build request parser rejects malformed RUN framing and accepts build
 
     const ready_request = "{\"type\":\"ready\",\"nonce\":\"1234\"}\n";
     try std.testing.expectEqual(guest_agent_fuzz_ready_request, spore_agent_fuzz_build_request(ready_request.ptr, ready_request.len, stream[0..0].ptr, 0));
+
+    const grow_request = try run_mod.simpleControlRequest(std.testing.allocator, "spore-rootfs-grow-v1", "spore-build-resize");
+    defer std.testing.allocator.free(grow_request);
+    try std.testing.expectEqual(guest_agent_fuzz_grow_request, spore_agent_fuzz_build_request(grow_request.ptr, grow_request.len, stream[0..0].ptr, 0));
 }
 
 test "guest proc stat parser identifies kernel threads with adversarial task names" {
@@ -995,6 +1552,68 @@ test "guest proc stat parser identifies kernel threads with adversarial task nam
     try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_proc_stat(kernel.ptr, kernel.len));
     const malformed = "2 (unterminated S 0 0 0";
     try std.testing.expectEqual(@as(c_int, -1), spore_agent_fuzz_proc_stat(malformed.ptr, malformed.len));
+}
+
+test "prepare producer identity binds exact boot bytes but not paths or backend" {
+    const allocator = std.testing.allocator;
+    const a = try producerIdentity(allocator, sha256Bytes("kernel-a"), sha256Bytes("initrd-a"), true);
+    defer allocator.free(a);
+    const same = try producerIdentity(allocator, sha256Bytes("kernel-a"), sha256Bytes("initrd-a"), true);
+    defer allocator.free(same);
+    const kernel_changed = try producerIdentity(allocator, sha256Bytes("kernel-b"), sha256Bytes("initrd-a"), true);
+    defer allocator.free(kernel_changed);
+    const initrd_changed = try producerIdentity(allocator, sha256Bytes("kernel-a"), sha256Bytes("initrd-b"), true);
+    defer allocator.free(initrd_changed);
+    const swapped = try producerIdentity(allocator, sha256Bytes("initrd-a"), sha256Bytes("kernel-a"), true);
+    defer allocator.free(swapped);
+
+    try std.testing.expectEqualStrings(a, same);
+    try std.testing.expect(!std.mem.eql(u8, a, kernel_changed));
+    try std.testing.expect(!std.mem.eql(u8, a, initrd_changed));
+    try std.testing.expect(!std.mem.eql(u8, a, swapped));
+    const lazy_init = try producerIdentity(allocator, sha256Bytes("kernel-a"), sha256Bytes("initrd-a"), false);
+    defer allocator.free(lazy_init);
+    try std.testing.expect(!std.mem.eql(u8, a, lazy_init));
+    try spore.validateRootfsDigest(a);
+}
+
+test "managed producer identity resolves without materializing boot artifact bytes" {
+    const kernel_sha256 = sha256Bytes("kernel-a");
+    const initrd_sha256 = sha256Bytes("initrd-a");
+    const producer = try managedProducer(std.testing.allocator, .{
+        .kernel_path = "/path-is-not-opened-during-identity-resolution",
+        .kernel_sha256 = kernel_sha256,
+        .initrd_sha256 = initrd_sha256,
+    }, true);
+    defer std.testing.allocator.free(producer.identity);
+
+    try std.testing.expectEqual(@as(usize, 0), producer.eager_artifact_file_reads);
+    try std.testing.expectEqual(@as(usize, 0), producer.eager_artifact_bytes_read);
+    switch (producer.boot_source) {
+        .managed => |managed| {
+            try std.testing.expectEqualStrings("/path-is-not-opened-during-identity-resolution", managed.kernel_path);
+            try std.testing.expectEqualSlices(u8, &kernel_sha256, &managed.kernel_sha256);
+            try std.testing.expectEqualSlices(u8, &initrd_sha256, &managed.initrd_sha256);
+        },
+        .retained => return error.TestUnexpectedResult,
+    }
+}
+
+test "ENOSPC detector survives output truncation and frame splits" {
+    var detector: EnospcDetector = .{};
+    const noise = [_]u8{'x'} ** 4096;
+    for (0..20) |_| detector.observe(&noise);
+    try std.testing.expect(!detector.seen);
+
+    detector.observe("fallocate: No space left");
+    try std.testing.expect(!detector.seen);
+    detector.observe(" on device\n");
+    try std.testing.expect(detector.seen);
+
+    var stable: EnospcDetector = .{};
+    stable.observe("SPORE_BUILD_");
+    stable.observe("ENOSPC COPY apply failed\n");
+    try std.testing.expect(stable.seen);
 }
 
 test "fuzz build control request framing" {

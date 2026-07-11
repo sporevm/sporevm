@@ -22,6 +22,34 @@ Writable overlays and lazy sparse rootfs bases now follow absolute `TMPDIR`,
 so Linux hosts can place the fast-fork path on reflink-capable scratch storage;
 child adoption rejects a head from a different filesystem before readiness.
 
+`spore build` now prepares small root filesystems to a fixed sparse 16 GiB
+capacity without recursive growth or user tuning. The host appends known-zero
+chunks, a transient growth VM negotiates virtio-blk `WRITE_ZEROES`, and the
+managed initrd calls `EXT4_IOC_RESIZE_FS` directly; capacity preparation no
+longer invokes the selected image's shell or needs e2fsprogs/`resize2fs`.
+Builder-v7 stores this normalization as a typed `PREPARE` derivation, so
+unrelated Dockerfiles and `--no-cache`
+builds reuse it while ordinary Dockerfile cache semantics remain unchanged.
+RUN/COPY/WORKDIR keys bind the same exact executor kernel/initrd identity.
+Managed-default cache hits avoid kernel/initrd body reads; a miss verifies and
+boots the same once-opened kernel bytes, while explicit overrides are eagerly
+retained. This prevents cross-producer cache reuse or artifact-path races after
+a PREPARE hit.
+Old build records miss once but remain conservative GC roots; old rootfs
+indexes and local images stay readable. There is no build capacity knob in
+this version: 16 GiB is both the automatic target and cap because the next
+useful quantum is not safe for a fully dense index under the current 64 MiB
+canonical-index limit.
+
+Automatic growth is limited to SporeVM's journal-less native and e2fsprogs
+ext4 profiles, or equivalent layouts accepted by the pinned guest kernel.
+Before the first writable mount, the managed initrd rejects journal presence,
+recovery/error/orphan state, and pending orphan cleanup. Unsupported small
+sources remain readable but fail growth before a build step, image, or mutable
+destination ref is published. After mount, the agent repeats the same source
+state validation before the resize ioctl and after the resized filesystem is
+synced.
+
 `spore run --image SOURCE --commit local/name:tag -- COMMAND` can now publish a
 successful one-shot run's writable root disk as an indexed local image. The
 commit path freezes the guest filesystem, reuses the quiesced rootfs snapshot
@@ -30,8 +58,17 @@ inputs, and leaves the destination ref unchanged on nonzero command exit or
 commit failure. It composes with the existing save/fork path: commit stable disk
 preparation once, save one warm machine, then fork children.
 Image commit also accepts `--disk-size SIZE` to sparsely grow the root block
-device and run guest `resize2fs` before the setup command. The size is absolute,
-cannot shrink the source, and is published only when resize and setup succeed.
+device before the setup command. The size is absolute, 64 KiB aligned, and
+cannot shrink the resolved source. SporeVM records the appended capacity as
+known-zero chunks, enables growth-session virtio-blk `WRITE_ZEROES`, and asks
+the managed initrd agent to invoke `EXT4_IOC_RESIZE_FS` directly from verified
+device geometry. Growth does not invoke the image shell, and no `resize2fs` or
+e2fsprogs package is required in the image. Growth sessions use internal
+`noinit_itable` handling so
+checksum-enabled ext4 layouts finish inode-table initialization before commit.
+The same pre-mount source check and around-ioctl revalidation apply to commit.
+Source/index validation, growth, bounded geometry validation, and setup all fail
+closed before the destination ref is replaced.
 
 This release breaks saved-spore, disk, memory, and rootfs cache formats.
 Existing pre-unified saved spores and old flat/disk-layer cache entries should

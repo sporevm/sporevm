@@ -138,10 +138,15 @@ pub fn runMkfs(
     output: []const u8,
     determinism: Determinism,
     inode_count: u64,
+    metadata_checksum: bool,
 ) !void {
     const inode_count_arg = try std.fmt.allocPrint(allocator, "{d}", .{inode_count});
     defer allocator.free(inode_count_arg);
-    const feature_options = try mkfsFeatureOptions(allocator, try mkfsSupportsOrphanFile(init, allocator, mkfs));
+    const feature_options = try mkfsFeatureOptions(
+        allocator,
+        try mkfsSupportsOrphanFile(init, allocator, mkfs),
+        metadata_checksum,
+    );
     defer allocator.free(feature_options);
     const extended_options = try std.fmt.allocPrint(
         allocator,
@@ -178,8 +183,11 @@ pub fn runMkfs(
     return error.MkfsFailed;
 }
 
-fn mkfsFeatureOptions(allocator: std.mem.Allocator, supports_orphan_file: bool) ![]u8 {
-    const base = "^has_journal,^metadata_csum,^metadata_csum_seed";
+fn mkfsFeatureOptions(allocator: std.mem.Allocator, supports_orphan_file: bool, metadata_checksum: bool) ![]u8 {
+    const base = if (metadata_checksum)
+        "^has_journal,metadata_csum,^metadata_csum_seed"
+    else
+        "^has_journal,^metadata_csum,^metadata_csum_seed";
     if (!supports_orphan_file) return allocator.dupe(u8, base);
     return std.fmt.allocPrint(allocator, "{s},^orphan_file", .{base});
 }
@@ -246,10 +254,16 @@ pub fn runDebugfsFinalize(
     owners: *ownership.Map,
     xattrs: *xattrs_mod.Map,
     determinism: Determinism,
+    metadata_checksum: bool,
 ) !void {
     var script: Io.Writer.Allocating = .init(allocator);
     defer script.deinit();
 
+    if (metadata_checksum) {
+        // libext2fs treats zero as "now". Pin its command clock to the first
+        // representable second so debugfs close does not reintroduce wall time.
+        try script.writer.writeAll("set_current_time 1\n");
+    }
     try script.writer.writeAll(
         \\set_super_value mkfs_time 0
         \\set_super_value wtime 0
@@ -278,6 +292,12 @@ pub fn runDebugfsFinalize(
         try writeDebugfsPathTimestampFields(&script.writer, rel);
     }
     try appendDebugfsXattrCommands(init.io, allocator, &script.writer, script_path, xattrs);
+    if (metadata_checksum) {
+        // Ask libext2fs to update every backup superblock and its checksum.
+        // The raw legacy normalizer below cannot safely edit metadata_csum
+        // filesystems.
+        try script.writer.writeAll("close -a\n");
+    }
     try writeFileAtPath(init.io, script_path, script.written());
 
     const stderr_path = try std.fmt.allocPrint(allocator, "{s}.stderr", .{script_path});
@@ -299,7 +319,14 @@ pub fn runDebugfsFinalize(
     };
     if (!ok) return error.DebugfsFailed;
     try checkDebugfsStderr(allocator, init.io, stderr_path);
-    try normalizeSuperblockTimestamps(allocator, init.io, output, determinism.uuid_bytes);
+    // debugfs updates the primary superblock checksum when metadata_csum is
+    // enabled. The legacy raw normalization below deliberately visits backup
+    // superblocks too, but does not recalculate their checksums. Keep that
+    // compatibility path for the production checksum-free profile and leave
+    // checksum-protected superblocks to checksum-aware tooling.
+    if (!metadata_checksum) {
+        try normalizeSuperblockTimestamps(allocator, init.io, output, determinism.uuid_bytes);
+    }
 }
 
 const DebugfsXattrEntry = struct {
@@ -629,13 +656,17 @@ test "directory entry count includes directories and files" {
 
 test "mkfs feature options omit orphan_file when unsupported" {
     const allocator = std.testing.allocator;
-    const unsupported = try mkfsFeatureOptions(allocator, false);
+    const unsupported = try mkfsFeatureOptions(allocator, false, false);
     defer allocator.free(unsupported);
     try std.testing.expectEqualStrings("^has_journal,^metadata_csum,^metadata_csum_seed", unsupported);
 
-    const supported = try mkfsFeatureOptions(allocator, true);
+    const supported = try mkfsFeatureOptions(allocator, true, false);
     defer allocator.free(supported);
     try std.testing.expectEqualStrings("^has_journal,^metadata_csum,^metadata_csum_seed,^orphan_file", supported);
+
+    const checksum = try mkfsFeatureOptions(allocator, true, true);
+    defer allocator.free(checksum);
+    try std.testing.expectEqualStrings("^has_journal,metadata_csum,^metadata_csum_seed,^orphan_file", checksum);
 }
 
 test "e2fsprogs orphan_file support is version gated" {

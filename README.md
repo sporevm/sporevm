@@ -192,8 +192,14 @@ spore run \
 Commit is disk-only and leaves the destination ref unchanged unless the guest
 command and publication both succeed. Save one warm machine from the resulting
 image, then use offline `spore fork` for low-latency fan-out.
-Add `--disk-size 40gb` when preparation needs a larger root disk; commit grows
-the sparse device and runs guest `resize2fs` before the requested command.
+Add `--disk-size 20gb` when preparation needs a larger root disk; commit grows
+the private sparse head with known-zero chunks and asks the managed initrd to
+grow ext4 directly. The selected image needs no `resize2fs` or e2fsprogs for
+that growth.
+Explicit larger disks remain subject to the current 64 MiB canonical-index
+limit: a sufficiently dense disk above about 30.62 GiB will fail a later
+snapshot or commit closed. Prefer the smallest required size; the 20 GiB
+example remains encodable even when fully populated.
 
 Build a reusable rootfs artifact explicitly:
 

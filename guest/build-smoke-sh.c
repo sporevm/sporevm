@@ -1,14 +1,25 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/fs.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#define LARGE_RUN_CHUNK_BYTES (1024 * 1024)
+#define LARGE_RUN_FILE_BYTES ((off_t)512 * 1024 * 1024)
+#define BLOCK_ENOSPC_CHUNK_BYTES ((off_t)256 * 1024 * 1024)
+#define INODE_ENOSPC_FILES_PER_DIR 128U
+#define INODE_ENOSPC_FILE_LIMIT 1000000U
+
+static unsigned char large_run_chunk[LARGE_RUN_CHUNK_BYTES];
 
 static void write_str(int fd, const char *data) {
   size_t len = strlen(data);
@@ -27,6 +38,17 @@ static int write_file(const char *path, const char *data) {
   ssize_t n = write(fd, data, len);
   int close_rc = close(fd);
   return n == (ssize_t)len && close_rc == 0 ? 0 : 1;
+}
+
+static int write_all(int fd, const unsigned char *data, size_t len) {
+  while (len > 0) {
+    ssize_t n = write(fd, data, len);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return 1;
+    data += n;
+    len -= (size_t)n;
+  }
+  return 0;
 }
 
 static int make_dir(const char *path, mode_t mode) {
@@ -335,6 +357,135 @@ static int verify_large_copy(void) {
   return write_file("/verified-large-copy", "ok\n");
 }
 
+static void fill_large_run_chunk(void) {
+  for (size_t i = 0; i < sizeof(large_run_chunk); i++) {
+    large_run_chunk[i] = (unsigned char)(((i * 131U + 17U) % 251U) + 1U);
+  }
+}
+
+static void stamp_large_run_chunk(uint64_t block_index) {
+  const size_t cas_chunk_bytes = 64 * 1024;
+  for (size_t subchunk = 0; subchunk < sizeof(large_run_chunk) / cas_chunk_bytes;
+       subchunk++) {
+    uint64_t logical_chunk = block_index *
+                             (sizeof(large_run_chunk) / cas_chunk_bytes) +
+                             subchunk;
+    for (size_t nibble = 0; nibble < 8; nibble++) {
+      large_run_chunk[subchunk * cas_chunk_bytes + nibble] =
+          (unsigned char)(((logical_chunk >> (nibble * 4)) & 0xfU) + 1U);
+    }
+  }
+}
+
+static int generate_large_run(void) {
+  fill_large_run_chunk();
+  int fd = open("/large-run.bin", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) return 8;
+  for (off_t offset = 0; offset < LARGE_RUN_FILE_BYTES;
+       offset += (off_t)sizeof(large_run_chunk)) {
+    stamp_large_run_chunk((uint64_t)offset / sizeof(large_run_chunk));
+    if (write_all(fd, large_run_chunk, sizeof(large_run_chunk)) != 0) {
+      close(fd);
+      return 8;
+    }
+  }
+  if (close(fd) != 0) return 8;
+  write_str(1, "generate-large-run\n");
+  return 0;
+}
+
+static int verify_large_run(void) {
+  fill_large_run_chunk();
+  int fd = open("/large-run.bin", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return 8;
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+      st.st_size != LARGE_RUN_FILE_BYTES) {
+    close(fd);
+    return 8;
+  }
+  unsigned char read_buf[LARGE_RUN_CHUNK_BYTES];
+  for (off_t offset = 0; offset < LARGE_RUN_FILE_BYTES;
+       offset += (off_t)sizeof(read_buf)) {
+    stamp_large_run_chunk((uint64_t)offset / sizeof(read_buf));
+    size_t done = 0;
+    while (done < sizeof(read_buf)) {
+      ssize_t n = read(fd, read_buf + done, sizeof(read_buf) - done);
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0) {
+        close(fd);
+        return 8;
+      }
+      done += (size_t)n;
+    }
+    if (memcmp(read_buf, large_run_chunk, sizeof(read_buf)) != 0) {
+      close(fd);
+      return 8;
+    }
+  }
+  unsigned char trailing;
+  if (read(fd, &trailing, 1) != 0 || close(fd) != 0) return 8;
+  write_str(1, "verify-large-run\n");
+  return write_file("/verified-large-run", "ok\n");
+}
+
+static int exhaust_blocks(void) {
+  int fd = open("/block-enospc", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) return 9;
+  unsigned long flags = 0;
+  if (ioctl(fd, FS_IOC_GETFLAGS, &flags) != 0 || (flags & FS_EXTENT_FL) == 0) {
+    write_str(2, "build-smoke-sh: block ENOSPC file is not extent mapped\n");
+    close(fd);
+    return 9;
+  }
+  for (off_t offset = 0; offset < (off_t)1024 * 1024 * 1024 * 1024;
+       offset += BLOCK_ENOSPC_CHUNK_BYTES) {
+    if (fallocate(fd, 0, offset, BLOCK_ENOSPC_CHUNK_BYTES) == 0) continue;
+    int saved_errno = errno;
+    close(fd);
+    if (saved_errno == ENOSPC) {
+      write_str(2, "SPORE_BUILD_ENOSPC block\n");
+      return ENOSPC;
+    }
+    write_str(2, "build-smoke-sh: fallocate failed before block ENOSPC\n");
+    return 9;
+  }
+  close(fd);
+  write_str(2, "build-smoke-sh: block ENOSPC limit was not reached\n");
+  return 9;
+}
+
+static int inode_enospc(void) {
+  write_str(2, "SPORE_BUILD_ENOSPC inode\n");
+  return ENOSPC;
+}
+
+static int exhaust_inodes(void) {
+  if (make_dir("/inode-enospc", 0755) != 0) {
+    return errno == ENOSPC ? inode_enospc() : 10;
+  }
+  char dir[64];
+  char path[96];
+  for (unsigned int i = 0; i < INODE_ENOSPC_FILE_LIMIT; i++) {
+    if (i % INODE_ENOSPC_FILES_PER_DIR == 0) {
+      int len = snprintf(dir, sizeof(dir), "/inode-enospc/d%06u",
+                         i / INODE_ENOSPC_FILES_PER_DIR);
+      if (len <= 0 || (size_t)len >= sizeof(dir)) return 10;
+      if (mkdir(dir, 0755) != 0) {
+        return errno == ENOSPC ? inode_enospc() : 10;
+      }
+    }
+    int len = snprintf(path, sizeof(path), "%s/f%03u", dir,
+                       i % INODE_ENOSPC_FILES_PER_DIR);
+    if (len <= 0 || (size_t)len >= sizeof(path)) return 10;
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) return errno == ENOSPC ? inode_enospc() : 10;
+    if (close(fd) != 0) return errno == ENOSPC ? inode_enospc() : 10;
+  }
+  write_str(2, "build-smoke-sh: inode ENOSPC limit was not reached\n");
+  return 10;
+}
+
 int main(int argc, char **argv) {
   if (argc != 3 || strcmp(argv[1], "-c") != 0) {
     write_str(2, "build-smoke-sh: expected -c command\n");
@@ -342,10 +493,6 @@ int main(int argc, char **argv) {
   }
 
   const char *cmd = argv[2];
-  if (strcmp(cmd, "resize2fs /dev/vda") == 0) {
-    write_str(1, "resize2fs\n");
-    return 0;
-  }
   if (strcmp(cmd, "verify-clock") == 0) {
     return verify_clock();
   }
@@ -370,6 +517,18 @@ int main(int argc, char **argv) {
   }
   if (strcmp(cmd, "verify-large-copy") == 0) {
     return verify_large_copy();
+  }
+  if (strcmp(cmd, "generate-large-run") == 0) {
+    return generate_large_run();
+  }
+  if (strcmp(cmd, "verify-large-run") == 0) {
+    return verify_large_run();
+  }
+  if (strcmp(cmd, "exhaust-blocks") == 0) {
+    return exhaust_blocks();
+  }
+  if (strcmp(cmd, "exhaust-inodes") == 0) {
+    return exhaust_inodes();
   }
   if (strcmp(cmd, "step2") == 0) {
     if (!file_exists("/step1")) {

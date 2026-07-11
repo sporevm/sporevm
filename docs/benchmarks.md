@@ -95,6 +95,58 @@ config so build-mode changes are attributable in the series.
 
 ## Benchmarks
 
+### `spore build` Rootfs Capacity
+
+Run the user-facing paired gate and the separately labelled engineering control
+from the repository root:
+
+```console
+scripts/benchmark/spore-build-rootfs-capacity.py \
+  --spore "$PWD/zig-out/bin/spore" \
+  --paired-matrix \
+  --paired-profile default-path \
+  --iterations 5 \
+  --work-dir /path/to/default-work \
+  --raw-output /path/to/default.jsonl \
+  --output /path/to/default-summary.json
+
+scripts/benchmark/spore-build-rootfs-capacity.py \
+  --spore "$PWD/zig-out/bin/spore" \
+  --paired-matrix \
+  --paired-profile instrumented \
+  --iterations 5 \
+  --work-dir /path/to/instrumented-work \
+  --raw-output /path/to/instrumented.jsonl \
+  --output /path/to/instrumented-summary.json
+```
+
+The default profile uses literal product-path commands without debug or growth
+experiment controls. It pairs cold preparation, warm, one-COPY incremental, and
+shared-PREPARE `--no-cache` scenarios against an independently pre-grown lane.
+Both lanes start from the same cloned compact parent and expose the same exact
+16 GiB geometry; the measured control build must contain no PREPARE record.
+The independent `run --commit` conditioning step takes its own snapshot, so its
+index is not required to be byte-identical to the build PREPARE child.
+
+The instrumented profile records preparation timing, boot counts, and storage
+counters; add `--measure-rss` when host peak RSS is also required. Its results
+never substitute for the default-path cold, warm, or incremental gates. P0-only
+modes such as `force-fallback` and `checksum-lazy` are engineering negative
+controls, not user configuration.
+
+Before timing, the harness runs an untimed checkout-local ReleaseSafe build and
+requires `--spore` to resolve to that checkout's `zig-out/bin/spore`. The
+summary records repository HEAD and dirty/worktree identity; resolved binary
+path, SHA-256, size, and version before and after the matrix; OS, architecture,
+kernel, inferred backend, and an anonymized stable host descriptor. JSONL
+command rows embed bounded stdout/stderr text together with byte counts, hashes,
+and truncation state, so retained raw evidence does not depend on the
+disposable work directory.
+
+The command exits nonzero for provenance drift, incomplete or invalid trials,
+insufficient samples, output/identity violations, or a failed aggregate gate.
+Treat only a zero exit with five complete pairs as release evidence.
+
 ### Named Restore Readiness
 
 Use an immutable saved parent to measure the persistent named path separately
@@ -254,7 +306,7 @@ This prewarms `node:22-bookworm-slim`, then times fresh
 same stdout marker used by the public Kubernetes runtime. Each capture records
 the disk snapshot metrics as a schema-versioned JSON object. The benchmark
 fails if a hot capture performs a full logical-rootfs scan instead of sealing
-only dirty chunks. `--allow-full-scan` permits a schema-1 full scan but does not
+only dirty chunks. `--allow-full-scan` permits a versioned full scan but does not
 accept older, unversioned metric records. Performance claims from this
 benchmark require a ReleaseSafe binary on Linux ARM64/KVM.
 
@@ -267,8 +319,12 @@ it. Their matching
 object counts and microsecond timings show whether save used same-filesystem
 hard links, found objects already present, or paid the cross-filesystem verified
 copy fallback. `parent_sync_us` records the final directory durability barrier
-after batched hard links. The record also reports dirty versus non-dirty chunks, index
-encoding/publication, dirty-object writes, and total disk snapshot time. RAM
+after batched hard links. Schema 2 additionally partitions every logical chunk
+into a sealed/scanned candidate, nonzero parent reuse, clean known-zero reuse,
+or a dirty zero recorded without payload work. The parser retains strict
+schema-1 support for checked-in historical evidence. The record also reports
+dirty versus non-dirty chunks, index encoding/publication, dirty-object writes,
+and total disk snapshot time. RAM
 and whole-capture timings remain in the backend snapshot metric and the
 benchmark's `snapshot_metrics` and `duration_ms`; do not substitute either for
 disk snapshot cost. `snapshot_metrics` retains the backend's machine, device,

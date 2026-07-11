@@ -40,15 +40,42 @@ before boot.
 
 `spore build` uses local build step records under the rootfs cache at
 `build/steps/<step_key>.json`. These records are host-local cache metadata, not
-portable spore format. A `sporevm-build-step-v1` record binds
-`builder_version`, `platform`, `step_key`, `parent_index_digest`,
-`child_index_digest`, `instruction_kind`, canonical Dockerfile instruction text,
-`input_digest`, `env_digest`, `workdir`, and the child's `rootfs_storage`
-descriptor. A cache hit is valid only when the recomputed key matches the
-record, the descriptor passes the normal chunked-rootfs storage validation,
-`base_identity` and `index_digest` both equal `child_index_digest`, and the
-selected rootfs CAS completeness stamp is present or repairable from verified
-CAS contents.
+portable spore format. The record envelope remains
+`kind: "sporevm-build-step-v1"`; the current build-cache ABI is identified by
+`builder_version: "sporevm-build-v7"`. A record binds `platform`, `step_key`,
+`parent_index_digest`, `child_index_digest`, `instruction_kind`, canonical
+instruction text, `input_digest`, `env_digest`, `workdir`, optional
+`network_mode`, optional preparation fields, executor identity for ordinary
+executor-backed steps, and the child's `rootfs_storage` descriptor.
+
+Builder v7 represents rootfs capacity normalization as the typed synthetic
+operation `PREPARE`, not as Dockerfile syntax. Its canonical instruction and
+instruction kind are both `PREPARE`; `exact_target` and `producer_identity`
+are required, length-framed step-key inputs alongside the exact parent index,
+builder ABI, and platform. A PREPARE hit is valid only when the recomputed key
+and explicit fields match, the child logical size equals `exact_target`, the
+descriptor passes normal chunked-rootfs validation, `base_identity` and
+`index_digest` both equal `child_index_digest`, and the selected rootfs CAS
+completeness stamp is present. PREPARE lookup remains enabled under
+`spore build --no-cache`; that flag continues to bypass Dockerfile instruction
+reuse only.
+
+Every RUN/COPY/WORKDIR key and record also binds `executor_identity`, the exact
+kernel/initrd plus build-agent contract for the build. For managed defaults the
+identity is derived from canonical kernel and embedded-initrd digests without
+materializing either body on a cache hit. An executor miss reads the kernel
+once, verifies those opened bytes against the bound digest, and boots the same
+allocation; explicit overrides are eagerly loaded and retained. This prevents
+two producer versions that happen to emit the same prepared index from
+aliasing downstream step results.
+
+Build publication keeps the exclusive rootfs cache lock through final image-ref
+replacement. A quiesced rootfs checkpoint durably publishes verified objects
+first and its canonical index second; only then does the build publish the
+completeness stamp and atomically replace the step record. Final image metadata
+and the mutable local ref are published after the selected storage is
+revalidated. PREPARE records use the existing step-record GC root and introduce
+no portable manifest, rootfs descriptor, index, or object kind.
 
 The local image identity published by `spore build` is distinct from the raw
 rootfs storage identity. `spore build` first serializes the final
@@ -213,7 +240,21 @@ under `rootfs.cache`.
   Builder-only attachments, such as the read-only context disk used by
   `spore build` COPY execution, reuse the existing virtio-blk device type as
   additional transient virtio-mmio instances and are not serialized into the
-  manifest.
+  manifest. Rootfs capacity growth likewise adds no device, slot, register, or
+  manifest field. A transient, non-resumable profile on the existing root
+  virtio-blk device alone offers `VIRTIO_BLK_F_WRITE_ZEROES` (bit 14); ordinary
+  attachments retain the frozen feature surface. The shared transport accepts
+  only driver features that are a subset of the reconstructed device's offered
+  set, latches the accepted set until reset, and validates selected/restored
+  feature state before it can be serialized or applied to the device. HVF and
+  KVM full-machine capture reject any transport offering bit 14, including one
+  whose guest has not accepted it. Rootfs-only build/commit checkpoints use
+  transport state only to prove queue quiescence and serialize the resulting
+  canonical disk index, not the growth profile. The runtime profile advertises
+  exactly one write-zeroes range capped at 4 MiB; a request is accepted only
+  after negotiation and with an exact 16-byte header, one 16-byte range, a
+  one-byte status, zero command-level sector, nonzero bounded sector count,
+  and no flag other than `UNMAP`.
 - `generation`: non-virtio generation MMIO device state — `generation`
   counter, `interrupt_status`, and `params_b64` (base64-encoded
   resume-parameter bytes with trailing zeroes elided). `spore fork` increments
@@ -248,6 +289,16 @@ names and values, decimal integers, both arrays even when empty, lowercase
 JSON with different member order, whitespace, escaping, omitted empty arrays,
 or digest case. This makes the index map—not producer-specific JSON choices—the
 single identity-bearing representation.
+
+Known-zero disk growth and whole-chunk write-zeroes operations are encoded as
+ordinary `zero_chunks`; they create no payload object and do not expose whether
+the transient source-map entry was clean or dirty. A partial-chunk zero
+operation preserves the remaining bytes and verifies any lazy CAS boundary
+source before mutation. The resulting `logical_size`, non-zero entries, and
+explicit zero coverage determine a new canonical index identity. A mutable
+head poisoned by a backend failure after a validated mutating block request
+cannot be snapshotted, forked, exported, or published and has no serialized
+representation.
 
 - `memory`: sparse memory index using the same shape as disk indexes:
   `kind: "spore-disk-index-v1"`, `logical_size`, `chunk_size`,
@@ -369,6 +420,10 @@ before mutating VM state.
   fresh managed-run optimization. Manifest v2 records the fixed RAM image that
   capture/resume can restore, not virtio-mem plug state, unplug state, or guest
   hotplug policy.
+- Transient rootfs-growth block state: write-zeroes feature bit 14, its accepted
+  feature latch, and in-progress growth requests are not a saved-machine
+  contract. Both backends reject full-machine capture of the growth profile;
+  rootfs-only checkpoints persist only the resulting canonical disk index.
 
 ## Invariants that hold regardless of version
 

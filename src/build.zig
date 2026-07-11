@@ -6,6 +6,7 @@ const build_context = @import("build/context.zig");
 const build_context_disk = @import("build/context_disk.zig");
 const build_exec = @import("build/exec.zig");
 const step_cache = @import("build/step_cache.zig");
+const disk_index = @import("disk_index.zig");
 const local_paths = @import("local_paths.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
@@ -32,7 +33,6 @@ pub const Options = struct {
     build_args: []const BuildArg = &.{},
     network: NetworkMode = .spore,
     no_cache: bool = false,
-    disk_grow_target_override: u64 = 0,
     mkfs: ?[]const u8 = null,
     debugfs: ?[]const u8 = null,
     output: ?*Io.Writer = null,
@@ -62,6 +62,7 @@ pub const Result = struct {
 const State = struct {
     storage: spore.RootfsStorage,
     disk_grow_target: u64 = 0,
+    producer: ?build_exec.Producer = null,
     env: std.array_list.Managed([]const u8),
     args: std.array_list.Managed(ArgValue),
     workdir: []const u8 = "/",
@@ -76,7 +77,7 @@ const CachedMetadata = struct {
     rootfs_size: u64 = 0,
 };
 
-const default_disk_grow_extra_bytes: u64 = 8 * 1024 * 1024 * 1024;
+const automatic_build_capacity_bytes: u64 = 16 * 1024 * 1024 * 1024;
 
 pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !Result {
     var local_diagnostic: Diagnostic = .{};
@@ -119,7 +120,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                 const source = try substitute(allocator, from.source, pre_from_args.items, &.{});
                 const base = try resolveBase(init, allocator, options, source);
                 if (!try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, base.cache_root, base.storage)) return error.RootFSDigestCacheMiss;
-                state = try stateFromBase(allocator, base.config, base.storage, try buildDiskGrowTarget(options, base.storage));
+                state = try stateFromBase(allocator, base.config, base.storage, try buildDiskGrowTarget(base.storage));
                 // FROM resolution may import and lock the cache itself. Once it
                 // completes, serialize the remaining build against destructive
                 // GC until every resulting storage value has a durable root.
@@ -131,19 +132,22 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                 const build_cache_lock = if (cache_lock) |*lock| lock else unreachable;
                 if (state) |*s| {
                     if (try applyMetadataInstruction(allocator, options, pre_from_args.items, s, instruction)) continue;
+                    any_exec_step = true;
+                    if (try ensurePrepared(init, allocator, options.platform, cache_root, s, &diagnostic.executor)) |preparation| {
+                        state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock, preparation);
+                        break :instructions;
+                    }
                     switch (instruction.value) {
                         .run => {
-                            any_exec_step = true;
                             s.storage = cachedExecStep(init, allocator, options, s.*, instruction, "") catch |err| switch (err) {
                                 error.CacheMissRequiresBuildExecutor => {
-                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock);
+                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock, null);
                                     break :instructions;
                                 },
                                 else => |e| return e,
                             };
                         },
                         .copy => |copy| {
-                            any_exec_step = true;
                             const resolved_sources = try substituteList(allocator, copy.sources, s.args.items, s.env.items);
                             const resolution = build_context.resolveCopySourcesWithDiagnostic(allocator, init.io, ctx, resolved_sources, &diagnostic.copy) catch |err| {
                                 diagnostic.instruction_line = instruction.line;
@@ -155,18 +159,17 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                             });
                             s.storage = cachedExecStep(init, allocator, options, s.*, instruction, input_digest) catch |err| switch (err) {
                                 error.CacheMissRequiresBuildExecutor => {
-                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock);
+                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock, null);
                                     break :instructions;
                                 },
                                 else => |e| return e,
                             };
                         },
                         .workdir => |raw| {
-                            any_exec_step = true;
                             const target = try resolvedWorkdir(allocator, s.*, raw);
                             s.storage = cachedExecStep(init, allocator, options, s.*, instruction, "") catch |err| switch (err) {
                                 error.CacheMissRequiresBuildExecutor => {
-                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock);
+                                    state = try executeFromMiss(init, allocator, options, diagnostic, ctx, &stat_cache, pre_from_args.items, doc.instructions[index..], s.*, build_cache_lock, null);
                                     break :instructions;
                                 },
                                 else => |e| return e,
@@ -180,17 +183,21 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         }
     }
     const final_state = state orelse return error.MissingDockerfileFrom;
-    // Executed states are rooted by step records; metadata-only builds still
-    // reference their already-rooted base. Release before local-ref publication,
-    // which takes the cache lock through its own writer path.
-    cache_lock.?.deinit();
-    cache_lock = null;
-    const publish = try rootfs_mod.publishIndexedImage(init, allocator, .{
+    // Keep the exclusive cache lock through local-ref publication so every
+    // PREPARE/step root and its destination ref become reachable in one GC
+    // exclusion window.
+    const publish = try rootfs_mod.publishIndexedImageWithCacheLockHeld(init.io, allocator, cache_root, .{
         .ref = options.tag,
         .platform = options.platform,
         .config = try imageConfig(allocator, options.platform, final_state.env.items, final_state.workdir, final_state.cmd),
         .rootfs_storage = final_state.storage,
     });
+    if (any_exec_step) {
+        std.log.info(
+            "build boot artifact metrics: file_reads={d} bytes_read={d}",
+            .{ diagnostic.executor.boot_artifact_file_reads, diagnostic.executor.boot_artifact_bytes_read },
+        );
+    }
     return .{
         .resolved_image_ref = publish.resolved_image_ref,
         .index_digest = publish.rootfs_storage.index_digest,
@@ -288,6 +295,40 @@ fn declareArg(
     try putArg(allocator, args, arg.key, value);
 }
 
+fn ensurePrepared(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    platform: rootfs_mod.Platform,
+    cache_root: []const u8,
+    state: *State,
+    diagnostic: *build_exec.Diagnostic,
+) !?build_exec.Preparation {
+    if (state.producer == null) {
+        state.producer = try build_exec.resolveProducer(init, allocator);
+        diagnostic.boot_artifact_file_reads = state.producer.?.eager_artifact_file_reads;
+        diagnostic.boot_artifact_bytes_read = state.producer.?.eager_artifact_bytes_read;
+    }
+    const producer = state.producer.?;
+    if (state.storage.logical_size >= state.disk_grow_target) return null;
+    const input = try step_cache.prepareInput(
+        platform,
+        state.storage.index_digest,
+        state.disk_grow_target,
+        producer.identity,
+    );
+    const key = try step_cache.stepKey(allocator, input);
+    if (try step_cache.readHit(init.io, allocator, cache_root, input, key)) |prepared| {
+        try build_exec.validatePreparedStorage(state.storage, prepared, state.disk_grow_target);
+        state.storage = prepared;
+        return null;
+    }
+    return .{
+        .input = input,
+        .step_key = key,
+        .exact_target = state.disk_grow_target,
+    };
+}
+
 fn cachedExecStep(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -298,15 +339,10 @@ fn cachedExecStep(
 ) !spore.RootfsStorage {
     if (options.no_cache) return error.CacheMissRequiresBuildExecutor;
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    const grow_target = try pendingDiskGrowTarget(state);
-    const grown_input = try execStepInput(allocator, options, state, instruction, input_digest, grow_target);
-    const grown_key = try step_cache.stepKey(allocator, grown_input);
-    if (try step_cache.readHit(init.io, allocator, cache_root, grown_input, grown_key)) |hit| return hit;
-    if (grow_target == 0 or options.disk_grow_target_override != 0) return error.CacheMissRequiresBuildExecutor;
-
-    const normal_input = try execStepInput(allocator, options, state, instruction, input_digest, 0);
-    const normal_key = try step_cache.stepKey(allocator, normal_input);
-    return (try step_cache.readHit(init.io, allocator, cache_root, normal_input, normal_key)) orelse error.CacheMissRequiresBuildExecutor;
+    const producer = state.producer orelse return error.BadManifest;
+    const input = try execStepInput(allocator, options, state, instruction, input_digest, producer.identity);
+    const key = try step_cache.stepKey(allocator, input);
+    return (try step_cache.readHit(init.io, allocator, cache_root, input, key)) orelse error.CacheMissRequiresBuildExecutor;
 }
 
 fn executeFromMiss(
@@ -320,6 +356,7 @@ fn executeFromMiss(
     instructions: []const dockerfile.Instruction,
     initial_state: State,
     rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
+    pending_preparation: ?build_exec.Preparation,
 ) !State {
     var state = initial_state;
     var steps = std.array_list.Managed(build_exec.Step).init(allocator);
@@ -357,7 +394,8 @@ fn executeFromMiss(
         .base_storage = state.storage,
         .steps = steps.items,
         .rootfs_cache_lock = rootfs_cache_lock,
-        .disk_grow_target = try pendingDiskGrowTarget(state),
+        .preparation = pending_preparation,
+        .producer = state.producer orelse return error.BadManifest,
         .context_disk_path = context_disk_path,
         .output = options.output,
         .diagnostic = &diagnostic.executor,
@@ -553,7 +591,7 @@ fn execStepInput(
     state: State,
     instruction: dockerfile.Instruction,
     input_digest: []const u8,
-    disk_grow_target: u64,
+    executor_identity: []const u8,
 ) !step_cache.StepInput {
     const env_digest = try effectiveEnvDigest(allocator, state);
     const operation: step_cache.StepInput.Operation = switch (instruction.value) {
@@ -578,31 +616,15 @@ fn execStepInput(
         .platform = options.platform,
         .parent_index_digest = state.storage.index_digest,
         .canonical_instruction = instruction.raw,
-        .disk_grow_target = disk_grow_target,
+        .executor_identity = executor_identity,
         .operation = operation,
     };
 }
 
-fn execStepKey(allocator: std.mem.Allocator, options: Options, state: State, instruction: dockerfile.Instruction, input_digest: []const u8) ![]const u8 {
-    return step_cache.stepKey(allocator, try execStepInput(allocator, options, state, instruction, input_digest, try pendingDiskGrowTarget(state)));
-}
-
-fn pendingDiskGrowTarget(state: State) !u64 {
-    if (state.disk_grow_target == 0) return error.BadManifest;
-    return if (state.storage.logical_size < state.disk_grow_target) state.disk_grow_target else 0;
-}
-
-fn buildDiskGrowTarget(options: Options, storage: spore.RootfsStorage) !u64 {
-    if (storage.chunk_size == 0) return error.BadManifest;
-    const raw = if (options.disk_grow_target_override != 0) options.disk_grow_target_override else blk: {
-        const doubled = std.math.mul(u64, storage.logical_size, 2) catch return error.BadManifest;
-        const plus_extra = std.math.add(u64, storage.logical_size, default_disk_grow_extra_bytes) catch return error.BadManifest;
-        break :blk @max(doubled, plus_extra);
-    };
-    if (raw < storage.logical_size) return error.BadManifest;
-    const remainder = raw % storage.chunk_size;
-    if (remainder == 0) return raw;
-    return std.math.add(u64, raw, storage.chunk_size - remainder) catch return error.BadManifest;
+fn buildDiskGrowTarget(storage: spore.RootfsStorage) !u64 {
+    try spore.validateRootfsStorageDescriptor(storage);
+    comptime std.debug.assert(automatic_build_capacity_bytes % spore.disk_chunk_size == 0);
+    return @max(storage.logical_size, automatic_build_capacity_bytes);
 }
 
 fn effectiveEnvDigest(allocator: std.mem.Allocator, state: State) ![]const u8 {
@@ -804,14 +826,16 @@ fn testStorage() spore.RootfsStorage {
     return .{
         .kind = spore.rootfs_storage_kind_chunked_ext4,
         .device = .{ .mmio_slot = 1 },
-        .logical_size = 4096,
-        .chunk_size = 4096,
+        .logical_size = spore.disk_chunk_size,
+        .chunk_size = spore.disk_chunk_size,
         .hash_algorithm = "blake3",
         .index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .object_namespace = "rootfs/blake3",
     };
 }
+
+const test_executor_identity = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 test "variable substitution uses env before args" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -836,8 +860,8 @@ test "run environment includes declared args after env" {
         .storage = .{
             .kind = spore.rootfs_storage_kind_chunked_ext4,
             .device = .{ .mmio_slot = 1 },
-            .logical_size = 4096,
-            .chunk_size = 4096,
+            .logical_size = spore.disk_chunk_size,
+            .chunk_size = spore.disk_chunk_size,
             .hash_algorithm = "blake3",
             .index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             .base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -903,18 +927,16 @@ test "RUN cache identity includes network mode and matches executor" {
     none_options.network = .none;
     var diagnostic: Diagnostic = .{};
     const step = try runStep(arena, &diagnostic, state, instruction, instruction.value.run, .spore);
-    const grow_target = try buildDiskGrowTarget(spore_options, state.storage);
-
-    const spore_read = try execStepInput(arena, spore_options, state, instruction, "", grow_target);
-    const spore_write = build_exec.cacheInputForStep(spore_options.platform, state.storage.index_digest, .{ .run = step }, grow_target);
+    const spore_read = try execStepInput(arena, spore_options, state, instruction, "", test_executor_identity);
+    const spore_write = build_exec.cacheInputForStep(spore_options.platform, state.storage.index_digest, test_executor_identity, .{ .run = step });
     const spore_read_key = try step_cache.stepKey(arena, spore_read);
     const spore_write_key = try step_cache.stepKey(arena, spore_write);
     try std.testing.expectEqualStrings(spore_read_key, spore_write_key);
 
-    const none_read = try execStepInput(arena, none_options, state, instruction, "", grow_target);
+    const none_read = try execStepInput(arena, none_options, state, instruction, "", test_executor_identity);
     var none_step = step;
     none_step.network_mode = .none;
-    const none_write = build_exec.cacheInputForStep(none_options.platform, state.storage.index_digest, .{ .run = none_step }, grow_target);
+    const none_write = build_exec.cacheInputForStep(none_options.platform, state.storage.index_digest, test_executor_identity, .{ .run = none_step });
     const none_read_key = try step_cache.stepKey(arena, none_read);
     const none_write_key = try step_cache.stepKey(arena, none_write);
     try std.testing.expectEqualStrings(none_read_key, none_write_key);
@@ -946,11 +968,10 @@ test "WORKDIR executor step key matches cached read key" {
         .context_dir = "unused",
         .dockerfile_path = "unused",
     };
-    const grow_target = try buildDiskGrowTarget(options, state.storage);
     const step = try workdirStep(arena, state, instruction, instruction.value.workdir);
     try std.testing.expectEqualStrings("/srv/app", step.target);
-    const read_input = try execStepInput(arena, options, state, instruction, "", grow_target);
-    const write_input = build_exec.cacheInputForStep(options.platform, state.storage.index_digest, .{ .workdir = step }, grow_target);
+    const read_input = try execStepInput(arena, options, state, instruction, "", test_executor_identity);
+    const write_input = build_exec.cacheInputForStep(options.platform, state.storage.index_digest, test_executor_identity, .{ .workdir = step });
     try std.testing.expectEqualStrings(try step_cache.stepKey(arena, read_input), try step_cache.stepKey(arena, write_input));
 }
 
@@ -969,8 +990,8 @@ test "COPY executor step key matches cached read key" {
     const storage = spore.RootfsStorage{
         .kind = spore.rootfs_storage_kind_chunked_ext4,
         .device = .{ .mmio_slot = 1 },
-        .logical_size = 4096,
-        .chunk_size = 4096,
+        .logical_size = spore.disk_chunk_size,
+        .chunk_size = spore.disk_chunk_size,
         .hash_algorithm = "blake3",
         .index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -988,8 +1009,7 @@ test "COPY executor step key matches cached read key" {
         .dockerfile_path = "unused",
     };
     const input_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const grow_target = try buildDiskGrowTarget(options, storage);
-    const read_input = try execStepInput(arena, options, state, instruction, input_digest, grow_target);
+    const read_input = try execStepInput(arena, options, state, instruction, input_digest, test_executor_identity);
     const read_key = try step_cache.stepKey(arena, read_input);
     const env_digest = try effectiveEnvDigest(arena, state);
     const copy_step = build_exec.Step{ .copy = .{
@@ -999,141 +1019,47 @@ test "COPY executor step key matches cached read key" {
         .workdir = state.workdir,
         .requests = &.{},
     } };
-    const write_input = build_exec.cacheInputForStep(options.platform, storage.index_digest, copy_step, grow_target);
+    const write_input = build_exec.cacheInputForStep(options.platform, storage.index_digest, test_executor_identity, copy_step);
     const write_key = try step_cache.stepKey(arena, write_input);
-    try std.testing.expectEqual(grow_target, write_input.disk_grow_target);
     try std.testing.expectEqualStrings(read_key, write_key);
 
     var none_options = options;
     none_options.network = .none;
-    const none_read_input = try execStepInput(arena, none_options, state, instruction, input_digest, grow_target);
-    const none_write_input = build_exec.cacheInputForStep(none_options.platform, storage.index_digest, copy_step, grow_target);
+    const none_read_input = try execStepInput(arena, none_options, state, instruction, input_digest, test_executor_identity);
+    const none_write_input = build_exec.cacheInputForStep(none_options.platform, storage.index_digest, test_executor_identity, copy_step);
     try std.testing.expectEqualStrings(read_key, try step_cache.stepKey(arena, none_read_input));
     try std.testing.expectEqualStrings(write_key, try step_cache.stepKey(arena, none_write_input));
 }
 
 test "build disk grow target uses deterministic sparse policy" {
-    const storage = spore.RootfsStorage{
-        .kind = spore.rootfs_storage_kind_chunked_ext4,
-        .device = .{ .mmio_slot = 1 },
-        .logical_size = 16 * 1024 * 1024,
-        .chunk_size = rootfs_cas.default_chunk_size,
-        .hash_algorithm = "blake3",
-        .index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .object_namespace = "rootfs/blake3",
+    const Case = struct { parent: u64, expected: u64 };
+    const cases = [_]Case{
+        .{ .parent = 1, .expected = automatic_build_capacity_bytes },
+        .{ .parent = 512 * 1024 * 1024, .expected = automatic_build_capacity_bytes },
+        .{ .parent = 10 * 1024 * 1024 * 1024, .expected = automatic_build_capacity_bytes },
+        .{ .parent = automatic_build_capacity_bytes - 1, .expected = automatic_build_capacity_bytes },
+        .{ .parent = automatic_build_capacity_bytes, .expected = automatic_build_capacity_bytes },
+        .{ .parent = automatic_build_capacity_bytes + 1, .expected = automatic_build_capacity_bytes + 1 },
+        .{ .parent = 17 * 1024 * 1024 * 1024, .expected = 17 * 1024 * 1024 * 1024 },
+        .{ .parent = 32 * 1024 * 1024 * 1024, .expected = 32 * 1024 * 1024 * 1024 },
+        .{ .parent = std.math.maxInt(usize), .expected = std.math.maxInt(usize) },
     };
-    const options = Options{
-        .tag = "local/app:dev",
-        .context_dir = "unused",
-        .dockerfile_path = "unused",
-    };
-    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 + default_disk_grow_extra_bytes), try buildDiskGrowTarget(options, storage));
-    const override = Options{
-        .tag = "local/app:dev",
-        .context_dir = "unused",
-        .dockerfile_path = "unused",
-        .disk_grow_target_override = 20 * 1024 * 1024 + 1,
-    };
-    try std.testing.expectEqual(@as(u64, 20 * 1024 * 1024 + rootfs_cas.default_chunk_size), try buildDiskGrowTarget(override, storage));
-}
+    try std.testing.expectEqual(@as(u64, 0), automatic_build_capacity_bytes % spore.disk_chunk_size);
+    for (cases) |case| {
+        var storage = testStorage();
+        storage.logical_size = case.parent;
+        const target = try buildDiskGrowTarget(storage);
+        try std.testing.expectEqual(case.expected, target);
+        storage.logical_size = target;
+        try std.testing.expectEqual(target, try buildDiskGrowTarget(storage));
+    }
 
-test "build disk grow target remains anchored to FROM storage after a cached prefix" {
-    const options = Options{
-        .tag = "local/app:dev",
-        .context_dir = "unused",
-        .dockerfile_path = "unused",
-    };
-    var state = State{
-        .storage = testStorage(),
-        .disk_grow_target = try buildDiskGrowTarget(options, testStorage()),
-        .env = std.array_list.Managed([]const u8).init(std.testing.allocator),
-        .args = std.array_list.Managed(ArgValue).init(std.testing.allocator),
-    };
-    defer state.env.deinit();
-    defer state.args.deinit();
-
-    try std.testing.expectEqual(state.disk_grow_target, try pendingDiskGrowTarget(state));
-    state.storage.logical_size = state.disk_grow_target;
-    try std.testing.expectEqual(@as(u64, 0), try pendingDiskGrowTarget(state));
-    state.storage.logical_size += state.storage.chunk_size;
-    try std.testing.expectEqual(@as(u64, 0), try pendingDiskGrowTarget(state));
-}
-
-test "hidden disk grow override misses without poisoning default cache" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const tmp = "zig-cache/test-spore-build-disk-grow-cache";
-    const cache_dir = tmp ++ "/cache";
-    const base_rootfs = tmp ++ "/base.ext4";
-    const default_child_rootfs = tmp ++ "/default-child.ext4";
-    const override_child_rootfs = tmp ++ "/override-child.ext4";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = base_rootfs, .data = "base rootfs bytes" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = default_child_rootfs, .data = "default child rootfs bytes" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = override_child_rootfs, .data = "override child rootfs bytes" });
-
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    try env.put(local_paths.rootfs_cache_env, cache_dir);
-    const init = testInit(allocator, io, &arena_state, &env);
-    const cache_root = try local_paths.rootfsCacheRootPath(arena, &env);
-
-    const base_preload = try rootfs_cas.preloadPath(io, arena, cache_root, base_rootfs, rootfs_cas.default_chunk_size);
-    const base_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, base_preload);
-    const default_child_preload = try rootfs_cas.preloadPath(io, arena, cache_root, default_child_rootfs, rootfs_cas.default_chunk_size);
-    const default_child_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, default_child_preload);
-    const override_child_preload = try rootfs_cas.preloadPath(io, arena, cache_root, override_child_rootfs, rootfs_cas.default_chunk_size);
-    const override_child_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, override_child_preload);
-
-    var diag: dockerfile.Diagnostic = .{};
-    const doc = try dockerfile.parse(arena,
-        \\FROM base
-        \\RUN echo cached
-        \\
-    , &diag);
-    const instruction = doc.instructions[1];
-    const options = Options{
-        .tag = "local/app:dev",
-        .context_dir = "unused",
-        .dockerfile_path = "unused",
-    };
-    const state = State{
-        .storage = base_storage,
-        .disk_grow_target = try buildDiskGrowTarget(options, base_storage),
-        .env = std.array_list.Managed([]const u8).init(arena),
-        .args = std.array_list.Managed(ArgValue).init(arena),
-    };
-    const default_input = try execStepInput(arena, options, state, instruction, "", try buildDiskGrowTarget(options, base_storage));
-    const default_key = try step_cache.stepKey(arena, default_input);
-    _ = try step_cache.writeRecord(io, arena, cache_root, default_input, default_key, default_child_storage);
-
-    const default_hit = try cachedExecStep(init, arena, options, state, instruction, "");
-    try std.testing.expectEqualStrings(default_child_storage.index_digest, default_hit.index_digest);
-
-    const override_options = Options{
-        .tag = "local/app:dev",
-        .context_dir = "unused",
-        .dockerfile_path = "unused",
-        .disk_grow_target_override = try buildDiskGrowTarget(options, base_storage) + rootfs_cas.default_chunk_size,
-    };
-    var override_state = state;
-    override_state.disk_grow_target = try buildDiskGrowTarget(override_options, base_storage);
-    try std.testing.expectError(error.CacheMissRequiresBuildExecutor, cachedExecStep(init, arena, override_options, override_state, instruction, ""));
-
-    const override_input = try execStepInput(arena, override_options, state, instruction, "", try buildDiskGrowTarget(override_options, base_storage));
-    const override_key = try step_cache.stepKey(arena, override_input);
-    _ = try step_cache.writeRecord(io, arena, cache_root, override_input, override_key, override_child_storage);
-    const override_hit = try cachedExecStep(init, arena, override_options, override_state, instruction, "");
-    try std.testing.expectEqualStrings(override_child_storage.index_digest, override_hit.index_digest);
-
-    const default_hit_again = try cachedExecStep(init, arena, options, state, instruction, "");
-    try std.testing.expectEqualStrings(default_child_storage.index_digest, default_hit_again.index_digest);
+    var malformed = testStorage();
+    malformed.logical_size = 0;
+    try std.testing.expectError(error.BadManifest, buildDiskGrowTarget(malformed));
+    malformed = testStorage();
+    malformed.chunk_size = 4096;
+    try std.testing.expectError(error.BadManifest, buildDiskGrowTarget(malformed));
 }
 
 test "COPY destination rejects guest path escape" {
@@ -1266,11 +1192,13 @@ test "fully cached build publishes final indexed image" {
     const cache_dir = tmp ++ "/cache";
     const dockerfile_path = context_dir ++ "/Dockerfile";
     const base_rootfs = tmp ++ "/base.ext4";
-    const child_rootfs = tmp ++ "/child.ext4";
+    const kernel_path = tmp ++ "/Image";
+    const initrd_path = tmp ++ "/root.cpio";
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
     try Io.Dir.cwd().createDirPath(io, context_dir);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = base_rootfs, .data = "base rootfs bytes" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "child rootfs bytes" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = kernel_path, .data = "test kernel bytes" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = initrd_path, .data = "test initrd bytes" });
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = dockerfile_path,
         .data =
@@ -1284,6 +1212,8 @@ test "fully cached build publishes final indexed image" {
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
     try env.put(local_paths.rootfs_cache_env, cache_dir);
+    try env.put("SPOREVM_KERNEL_IMAGE", kernel_path);
+    try env.put("SPOREVM_RUN_INITRD", initrd_path);
     const init = testInit(allocator, io, &arena_state, &env);
     const cache_root = try local_paths.rootfsCacheRootPath(arena, &env);
 
@@ -1295,19 +1225,49 @@ test "fully cached build publishes final indexed image" {
         .rootfs_storage = base_storage,
     });
 
-    const child_preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
-    const child_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, child_preload);
+    const producer = try build_exec.resolveProducer(init, arena);
+    const prepared_size = try buildDiskGrowTarget(base_storage);
+    const prepared_chunk_count: usize = @intCast(prepared_size / rootfs_cas.default_chunk_size);
+    const zero_chunks = try arena.alloc(u64, prepared_chunk_count);
+    for (zero_chunks, 0..) |*logical_chunk, i| logical_chunk.* = @intCast(i);
+    const encoded_prepared = try disk_index.encodeCanonicalAlloc(arena, .{
+        .kind = disk_index.disk_index_kind,
+        .logical_size = prepared_size,
+        .chunk_size = rootfs_cas.default_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+        .zero_chunks = zero_chunks,
+    });
+    const prepared_index_path = try rootfs_cas.manifestIndexPath(arena, cache_root, encoded_prepared.digest);
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(prepared_index_path) orelse return error.BadManifest);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = prepared_index_path, .data = encoded_prepared.bytes });
+    const prepared_storage = spore.RootfsStorage{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = .{ .mmio_slot = 1 },
+        .logical_size = prepared_size,
+        .chunk_size = rootfs_cas.default_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .index_digest = encoded_prepared.digest,
+        .base_identity = encoded_prepared.digest,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+    };
+    try std.testing.expect(try rootfs_cas.storageComplete(io, arena, cache_root, prepared_storage));
+
+    const prepare_input = try step_cache.prepareInput(
+        .{},
+        base_storage.index_digest,
+        prepared_size,
+        producer.identity,
+    );
+    const prepare_key = try step_cache.stepKey(arena, prepare_input);
+    _ = try step_cache.writeRecord(io, arena, cache_root, prepare_input, prepare_key, prepared_storage);
+
     const env_digest = try step_cache.envDigest(arena, &.{}, &.{});
     const run_input = step_cache.StepInput{
         .platform = .{},
-        .parent_index_digest = base_storage.index_digest,
+        .parent_index_digest = prepared_storage.index_digest,
         .canonical_instruction = "RUN echo cached",
-        .disk_grow_target = try buildDiskGrowTarget(.{
-            .tag = "local/app:dev",
-            .context_dir = context_dir,
-            .dockerfile_path = dockerfile_path,
-            .platform = .{},
-        }, base_storage),
+        .executor_identity = producer.identity,
         .operation = .{ .run = .{
             .env_digest = env_digest,
             .workdir = "/",
@@ -1315,7 +1275,7 @@ test "fully cached build publishes final indexed image" {
         } },
     };
     const run_key = try step_cache.stepKey(arena, run_input);
-    _ = try step_cache.writeRecord(io, arena, cache_root, run_input, run_key, child_storage);
+    _ = try step_cache.writeRecord(io, arena, cache_root, run_input, run_key, prepared_storage);
 
     var diagnostic: Diagnostic = .{};
     const result = try build(init, arena, .{
@@ -1327,18 +1287,20 @@ test "fully cached build publishes final indexed image" {
     });
 
     try std.testing.expect(result.cache_hit);
-    try std.testing.expectEqualStrings(child_storage.index_digest, result.index_digest);
+    try std.testing.expectEqual(@as(usize, 0), diagnostic.executor.boot_count);
+    try std.testing.expectEqual(@as(usize, 0), diagnostic.executor.executed_steps);
+    try std.testing.expectEqualStrings(prepared_storage.index_digest, result.index_digest);
     const resolved = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, "local/app:dev", .{});
-    try std.testing.expect(!std.mem.eql(u8, child_storage.index_digest, resolved.manifest_digest));
+    try std.testing.expect(!std.mem.eql(u8, prepared_storage.index_digest, resolved.manifest_digest));
     const indexed = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_root, resolved)) orelse return error.MissingIndexedRootfs;
     defer rootfs_mod.deinitCachedIndexedRootfs(arena, indexed);
-    try std.testing.expectEqualStrings(child_storage.index_digest, indexed.storage.index_digest);
+    try std.testing.expectEqualStrings(prepared_storage.index_digest, indexed.storage.index_digest);
 
     const resolved_direct = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, result.resolved_image_ref, .{});
     try std.testing.expectEqualStrings(resolved.manifest_digest, resolved_direct.manifest_digest);
     const indexed_direct = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_root, resolved_direct)) orelse return error.MissingIndexedRootfs;
     defer rootfs_mod.deinitCachedIndexedRootfs(arena, indexed_direct);
-    try std.testing.expectEqualStrings(child_storage.index_digest, indexed_direct.storage.index_digest);
+    try std.testing.expectEqualStrings(prepared_storage.index_digest, indexed_direct.storage.index_digest);
 }
 
 test "metadata-only builds with different CMD publish distinct image identities" {
@@ -1377,6 +1339,7 @@ test "metadata-only builds with different CMD publish distinct image identities"
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
     try env.put(local_paths.rootfs_cache_env, cache_dir);
+    try env.put("SPOREVM_KERNEL_IMAGE", "/missing-metadata-only-kernel");
     const init = testInit(allocator, io, &arena_state, &env);
     const cache_root = try local_paths.rootfsCacheRootPath(arena, &env);
 
