@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "source_revision": "e83adad0d8f46c5f06261287d578e01fd78ffc58",
+  "host": {
+    "architecture": "arm64",
+    "backend": "kvm",
+    "instance_class": "c7gd.metal"
+  },
+  "fixture": {
+    "base_image": "docker.io/library/node@sha256:d51cff3fa44ab8a368ae8708ae974480165be1b699b19527b7c0d2523433b271",
+    "payload_bytes": 1073741824,
+    "payload_cipher": "aes-256-ctr",
+    "payload_key_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "payload_iv_hex": "00000000000000000000000000000000",
+    "logical_bytes": 1988100096,
+    "chunks": 30336,
+    "nonzero_parent_objects": 19023,
+    "parent_object_bytes": 1246691328
+  },
+  "runs": [
+    {"topology":"zfs-cas-to-zfs-output","iteration":1,"dirty_chunks":6,"parent_objects_linked":19023,"parent_link_us":448067,"parent_objects_copied":0,"parent_copy_us":0,"index_encode_us":17497,"index_publish_us":1327,"disk_total_us":491060,"command_duration_ms":779},
+    {"topology":"zfs-cas-to-zfs-output","iteration":2,"dirty_chunks":6,"parent_objects_linked":19023,"parent_link_us":448017,"parent_objects_copied":0,"parent_copy_us":0,"index_encode_us":17401,"index_publish_us":1261,"disk_total_us":490803,"command_duration_ms":787},
+    {"topology":"zfs-cas-to-zfs-output","iteration":3,"dirty_chunks":6,"parent_objects_linked":19023,"parent_link_us":437595,"parent_objects_copied":0,"parent_copy_us":0,"index_encode_us":17312,"index_publish_us":1572,"disk_total_us":481454,"command_duration_ms":774},
+    {"topology":"zfs-cas-to-ext4-output","iteration":1,"dirty_chunks":6,"parent_objects_linked":0,"parent_link_us":0,"parent_objects_copied":19023,"parent_copy_us":106163174,"index_encode_us":17333,"index_publish_us":7428,"disk_total_us":106243158,"command_duration_ms":106635},
+    {"topology":"zfs-cas-to-ext4-output","iteration":2,"dirty_chunks":6,"parent_objects_linked":0,"parent_link_us":0,"parent_objects_copied":19023,"parent_copy_us":106325279,"index_encode_us":17261,"index_publish_us":7494,"disk_total_us":106408330,"command_duration_ms":106824},
+    {"topology":"zfs-cas-to-ext4-output","iteration":3,"dirty_chunks":6,"parent_objects_linked":0,"parent_link_us":0,"parent_objects_copied":19023,"parent_copy_us":106887969,"index_encode_us":17383,"index_publish_us":7503,"disk_total_us":106967625,"command_duration_ms":107391}
+  ],
+  "final_shape_same_filesystem": {
+    "source_revision": "ede5247dfc61d19e2735eae7cc2d6d022007e302",
+    "resolved_fixture": "local/sporevm-save-cost@sha256:dcb6caf7c7d07e9172b2a89f66c1f7af25400de2c87b2ea037b3347e928bb171",
+    "rootfs_identity": "blake3:7557a75b8fbe409a14c7579ea9397c63e5a1d7964e07f4c01f9c562996ebb7eb",
+    "runs": [
+      {"iteration":1,"dirty_chunks":6,"parent_referenced_bytes":1247084544,"parent_objects_linked":19023,"parent_link_bytes":1246691328,"parent_link_us":445107,"parent_sync_us":280,"index_encode_us":17612,"index_publish_us":1359,"disk_total_us":488224,"memory_ms":26,"manifest_ms":1,"snapshot_total_ms":515,"command_duration_ms":818},
+      {"iteration":2,"dirty_chunks":6,"parent_referenced_bytes":1247084544,"parent_objects_linked":19023,"parent_link_bytes":1246691328,"parent_link_us":449339,"parent_sync_us":257,"index_encode_us":17499,"index_publish_us":1301,"disk_total_us":493053,"memory_ms":26,"manifest_ms":0,"snapshot_total_ms":519,"command_duration_ms":781},
+      {"iteration":3,"dirty_chunks":6,"parent_referenced_bytes":1247084544,"parent_objects_linked":19023,"parent_link_bytes":1246691328,"parent_link_us":440340,"parent_sync_us":259,"index_encode_us":17516,"index_publish_us":1263,"disk_total_us":483314,"memory_ms":25,"manifest_ms":0,"snapshot_total_ms":509,"command_duration_ms":776}
+    ]
+  }
+}

@@ -1087,6 +1087,93 @@ benchmark reports canonical index identity plus the current CAS preload phase.
 Bundle pack consumes the descriptor-bound canonical index and verified objects
 directly; it does not assemble or rescan the derived flat rootfs cache.
 
+### Large-image save publication follow-up
+
+Status: measured; a shared-store save follow-up is justified, but its design
+and implementation are deliberately outside this observability slice.
+
+The product save path now emits a bounded schema-1 disk metric. It separates
+dirty and non-dirty chunks, logical parent-reference bytes, unique parent bytes
+published by hard link, existing-object reuse, or verified copy, and the
+corresponding time plus the batched link-directory sync. It also records
+dirty-object work, canonical index encoding and durable
+publication, and total disk snapshot time. The existing backend snapshot metric
+continues to report RAM and manifest publication separately.
+
+The native evidence used ReleaseSafe revisions
+`e83adad0d8f46c5f06261287d578e01fd78ffc58` for the initial same- and
+cross-filesystem comparison, then
+`ede5247dfc61d19e2735eae7cc2d6d022007e302` for the final-shape
+same-filesystem rerun. Both ran on the standalone Linux/KVM `c7gd.metal` host.
+The fixture repeated the U7 dense-image method using
+`docker.io/library/node@sha256:d51cff3fa44ab8a368ae8708ae974480165be1b699b19527b7c0d2523433b271`
+plus a deterministic 1 GiB AES-256-CTR payload with an all-zero 256-bit key and
+all-zero 128-bit IV, imported as a local chunked image. The resulting rootfs was 1,988,100,096 logical bytes,
+30,336 chunks, and 19,023 unique nonzero parent objects. Each hot capture dirtied
+only six chunks and reused 30,330 parent chunks, so the measurements isolate
+publication of the existing global-CAS working set rather than a full scan.
+
+Three product-path captures on each filesystem shape measured:
+
+| Output relative to global CAS | Parent publication | Parent object operations | Disk snapshot | Product command |
+| --- | ---: | ---: | ---: | ---: |
+| same filesystem | 19,023 links / 1,246,691,328 bytes | 440 to 449 ms (445 ms median) | 483 to 493 ms (488 ms median) | 776 to 818 ms (781 ms median) |
+| different filesystem | 19,023 copies / 1,246,691,328 bytes | 106.163 to 106.888 s (106.325 s median) | 106.243 to 106.968 s (106.408 s median) | 106.635 to 107.391 s (106.824 s median) |
+
+The same-filesystem rows used a ZFS instance-store CAS and ZFS output. The
+cross-filesystem rows kept the CAS on ZFS and wrote the spore to the host's
+ext4 root volume. The sanitized per-iteration record is checked in at
+`benchmarks/evidence/large-save-cost-2026-07-11.json`.
+
+The final-shape same-filesystem run also measured the batched parent-directory
+sync at 257 to 280 microseconds (259 microseconds median). KVM RAM capture took
+25 to 26 ms, manifest publication took 0 to 1 ms, and the complete snapshot
+took 509 to 519 ms. Those values keep the 445 ms parent-object work distinct
+from RAM, manifest, and command-wall time.
+
+The dense payload and import were built with:
+
+```sh
+image=docker.io/library/node@sha256:d51cff3fa44ab8a368ae8708ae974480165be1b699b19527b7c0d2523433b271
+docker pull --platform linux/arm64/v8 "$image"
+cid=$(docker create --platform linux/arm64/v8 "$image")
+docker export "$cid" -o rootfs.tar
+docker rm "$cid"
+dd if=/dev/zero bs=1M count=1024 status=none | \
+  openssl enc -aes-256-ctr \
+    -K 0000000000000000000000000000000000000000000000000000000000000000 \
+    -iv 00000000000000000000000000000000 >dense.bin
+tar --append --file rootfs.tar \
+  --transform='s|^|opt/sporevm-save-cost/|' dense.bin
+spore rootfs import-tar rootfs.tar --ref local/sporevm-save-cost:dense
+```
+
+The exact benchmark shape was:
+
+```sh
+scripts/benchmark/hot-run-save.sh \
+  --spore-bin zig-out/bin/spore --backend kvm \
+  --image <pinned-dense-local-ref> --memory 1024mb --iterations 3 \
+  --cache-dir <global-cas-dir> --work-dir <same-filesystem-work-dir> \
+  --output same.jsonl
+
+scripts/benchmark/hot-run-save.sh \
+  --spore-bin zig-out/bin/spore --backend kvm \
+  --image <pinned-dense-local-ref> --memory 1024mb --iterations 3 \
+  --cache-dir <global-cas-dir> --work-dir <different-filesystem-work-dir> \
+  --output cross.jsonl
+```
+
+Decision: copying global-CAS chunks during save is a material cost, not a
+hypothetical portability edge. Even the normal same-filesystem path spends
+about 0.45 seconds issuing 19,023 hard links. A portable output on another
+filesystem spends about 106 seconds verifying, copying, and durably publishing
+the same 1.25 GB. The later shared-store save slice is warranted: local saves
+should be able to reference rooted global-CAS objects and defer
+complete/self-contained copying to an explicit export boundary. That follow-up
+must preserve the existing cache-lock/GC-root contract and portable bundle
+semantics; this PR does not choose or implement the design.
+
 ## Security
 
 - Net parser reduction: the `DiskLayer` parser is deleted, and writable disks
@@ -1128,8 +1215,9 @@ directly; it does not assemble or rescan the derived flat rootfs cache.
   implementation of the model, disk adopts its identity plus the shared
   classification, publication, and work-accounting primitives (U3), and memory
   adopts the unified index encoding (U5).
-  Chunk granularity stays per-domain (RAM 2MiB, disk 64KiB). Only store
-  unification remains open.
+  Chunk granularity stays per-domain (RAM 2MiB, disk 64KiB). Evidence now
+  justifies a separate store-unification save follow-up; its design remains
+  open.
 - Flat materialization stays the hot steady-state read path; the CAS is
   read per-chunk only during U7 fault-in, and each faulted chunk is
   promoted into the materialization so it is read from the store at most
@@ -1166,17 +1254,3 @@ directly; it does not assemble or rescan the derived flat rootfs cache.
   dedupe and unlink-based GC. Reopen this only if representative fault traces
   show materially larger working sets or object-service cost; the index format
   is unaffected either way.
-- Whether RAM and disk chunks should eventually share one *store*. This
-  plan closes the code/format gaps (shared sealer in U3, shared index
-  encoding and identity in U5, granularity as a parameter — RAM 2MiB, disk
-  64KiB); what stays open is the store split: memory chunks in per-spore
-  `chunks/` directories with a portable bundle lifecycle, disk chunks in
-  the machine-global CAS with a cache/GC lifecycle. The forcing case is
-  `spore save` of a VM booted from an image: its disk index is ~mostly the
-  image's chunks, already in the global CAS, and copying gigabytes into
-  every spore directory at save time is waste. Sketched direction:
-  **complete-on-export, not complete-on-save** — a local bundle's index may
-  reference global-CAS chunks (GC roots already enumerate manifests, so
-  they stay protected), and an explicit `spore export` copies chunks in to
-  make the directory self-contained and portable. Adopt when that save
-  path becomes real; the U1 namespace choice must not preclude it.
