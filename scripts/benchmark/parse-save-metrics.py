@@ -34,6 +34,21 @@ SCHEMA_FIELDS = {
         "clean_zero_chunks_reused", "dirty_zero_chunks_recorded",
     },
 }
+PARENT_ACTIVITY_FIELDS = (
+    "parent_chunks_reused",
+    "parent_referenced_bytes",
+    "parent_objects_linked",
+    "parent_objects_reused",
+    "parent_objects_copied",
+    "parent_object_bytes",
+    "parent_link_bytes",
+    "parent_reuse_bytes",
+    "parent_copy_bytes",
+    "parent_link_us",
+    "parent_reuse_us",
+    "parent_copy_us",
+    "parent_sync_us",
+)
 
 
 def parse_metric(line: str) -> dict[str, int | bool]:
@@ -84,6 +99,10 @@ def parse_metric(line: str) -> dict[str, int | bool]:
 
     if result["dirty_chunks"] + result["non_dirty_chunks"] != result["chunks"]:
         raise ValueError("dirty and non-dirty chunk counts do not cover the disk")
+    if result["parent_referenced_bytes"] > result["logical_bytes"]:
+        raise ValueError("logical parent references exceed the disk")
+    if result["parent_chunks_reused"] == 0 and result["parent_referenced_bytes"] != 0:
+        raise ValueError("parent bytes reported without a reused parent chunk")
     if schema == 1:
         if result["sealed_candidate_chunks"] + result["parent_chunks_reused"] != result["chunks"]:
             raise ValueError("sealed and parent-reused chunks do not cover the disk")
@@ -93,14 +112,21 @@ def parse_metric(line: str) -> dict[str, int | bool]:
         elif result["sealed_candidate_chunks"] != result["dirty_chunks"]:
             raise ValueError("incremental sealed chunks do not match dirty chunks")
     else:
+        if (result["parent_chunks_reused"] == 0) != (result["parent_referenced_bytes"] == 0):
+            raise ValueError("nonzero parent chunks and referenced bytes disagree")
+        if result["dirty_zero_chunks_recorded"] > result["dirty_chunks"]:
+            raise ValueError("dirty-zero chunks exceed dirty chunks")
+        if result["clean_zero_chunks_reused"] > result["non_dirty_chunks"]:
+            raise ValueError("clean-zero chunks exceed non-dirty chunks")
         if sum(result[key] for key in (
             "sealed_chunks", "parent_chunks_reused",
             "clean_zero_chunks_reused", "dirty_zero_chunks_recorded",
         )) != result["chunks"]:
             raise ValueError("sealed, parent, clean-zero, and dirty-zero chunks do not cover the disk")
         if result["full_scan"]:
-            if result["parent_chunks_reused"] != 0:
-                raise ValueError("full scan reuses parent chunks")
+            for key in PARENT_ACTIVITY_FIELDS:
+                if result[key] != 0:
+                    raise ValueError(f"full scan reports parent activity: {key}")
         else:
             if result["sealed_chunks"] + result["dirty_zero_chunks_recorded"] != result["dirty_chunks"]:
                 raise ValueError("incremental sealed and dirty-zero chunks do not cover dirty chunks")
@@ -182,6 +208,36 @@ def self_test() -> None:
     parsed_full_scan_v2 = parse_metric(full_scan_v2)
     assert parsed_full_scan_v2["full_scan"] is True
     assert parsed_full_scan_v2["sealed_chunks"] == 4
+    zero_parent_v1 = golden_v1
+    for old, new in (
+        ("parent_referenced_bytes=131072", "parent_referenced_bytes=0"),
+        ("parent_objects_linked=1", "parent_objects_linked=0"),
+        ("parent_objects_reused=1", "parent_objects_reused=0"),
+        ("parent_object_bytes=131072", "parent_object_bytes=0"),
+        ("parent_link_bytes=65536", "parent_link_bytes=0"),
+        ("parent_reuse_bytes=65536", "parent_reuse_bytes=0"),
+        ("parent_link_us=11", "parent_link_us=0"),
+        ("parent_reuse_us=12", "parent_reuse_us=0"),
+        ("parent_sync_us=13", "parent_sync_us=0"),
+    ):
+        zero_parent_v1 = zero_parent_v1.replace(old, new)
+    assert parse_metric(zero_parent_v1)["parent_chunks_reused"] == 2
+    dirty_zero_overflow_v2 = full_scan_v2.replace(
+        "sealed_candidate_chunks=4 sealed_chunks=4",
+        "sealed_candidate_chunks=3 sealed_chunks=3",
+    ).replace("dirty_zero_chunks_recorded=0", "dirty_zero_chunks_recorded=1")
+    clean_zero_overflow_v2 = full_scan_v2.replace(
+        "dirty_chunks=0 non_dirty_chunks=4",
+        "dirty_chunks=4 non_dirty_chunks=0",
+    ).replace(
+        "sealed_candidate_chunks=4 sealed_chunks=4",
+        "sealed_candidate_chunks=3 sealed_chunks=3",
+    ).replace("clean_zero_chunks_reused=0", "clean_zero_chunks_reused=1")
+    parent_activity_v2 = []
+    for field in PARENT_ACTIVITY_FIELDS:
+        token = f"{field}=0"
+        assert token in full_scan_v2
+        parent_activity_v2.append(full_scan_v2.replace(token, f"{field}=1", 1))
     snapshot = parse_snapshot_metric(
         "info: kvm snapshot metrics: mode=dirty-log "
         "machine_ms=1 devices_ms=2 generation_ms=3 memory_ms=4 disk_ms=5 "
@@ -190,12 +246,14 @@ def self_test() -> None:
     assert snapshot == {"schema": 1, "backend": "kvm", "machine_ms": 1,
                         "devices_ms": 2, "generation_ms": 3, "memory_ms": 4,
                         "disk_ms": 5, "manifest_ms": 6, "snapshot_total_ms": 21}
-    for bad in (
+    invalid_metrics = [
         golden_v1.rsplit(" ", 1)[0],
         golden_v1 + " extra=1",
         golden_v1.replace("schema=1", "schema=2"),
         golden_v1.replace("dirty_chunks=1", "dirty_chunks=-1"),
         golden_v1.replace("parent_chunks_reused=2", "parent_chunks_reused=99"),
+        golden_v1.replace("parent_chunks_reused=2", "parent_chunks_reused=0"),
+        golden_v1.replace("logical_bytes=196608", "logical_bytes=131071"),
         golden_v1.replace("parent_link_bytes=65536", "parent_link_bytes=0"),
         golden_v1.replace("sealed_candidate_chunks=1", "sealed_candidate_chunks=2"),
         golden_v2.rsplit(" ", 1)[0],
@@ -207,9 +265,16 @@ def self_test() -> None:
             "dirty_chunks=1 non_dirty_chunks=3",
         ),
         golden_v2.replace("parent_chunks_reused=1", "parent_chunks_reused=2"),
+        golden_v2.replace("parent_chunks_reused=1", "parent_chunks_reused=0"),
+        golden_v2.replace("parent_referenced_bytes=65536", "parent_referenced_bytes=0"),
+        golden_v2.replace("logical_bytes=262144", "logical_bytes=65535"),
         golden_v2.replace("sealed_candidate_chunks=1", "sealed_candidate_chunks=2"),
         golden_v2.replace("full_scan=false", "full_scan=true"),
-    ):
+        dirty_zero_overflow_v2,
+        clean_zero_overflow_v2,
+        *parent_activity_v2,
+    ]
+    for bad in invalid_metrics:
         try:
             parse_metric(bad)
         except ValueError:

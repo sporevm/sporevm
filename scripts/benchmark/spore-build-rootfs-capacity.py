@@ -16,6 +16,7 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import stat
@@ -44,6 +45,7 @@ PAIRED_BASE_IMAGE = (
 PAIRED_DISK_SIZE = "16gb"
 MIN_PAIRED_GATE_SAMPLES = 5
 MAX_VERSION_OUTPUT_BYTES = 4096
+MAX_RAW_COMMAND_OUTPUT_BYTES = 64 * 1024
 PREGROWN_CONTROL_CONTRACT = (
     "The pre-grown lane is independently grown from the same cloned compact "
     "parent to the same 16 GiB geometry before measurement. Its measured build "
@@ -426,6 +428,7 @@ def run_paired_command(
     lane: str,
     scenario: str,
     measured: bool,
+    cwd: Path | None = None,
 ) -> dict[str, object]:
     log_dir.mkdir(parents=True, exist_ok=True)
     executed = measured_command(command, args.measure_rss and measured)
@@ -433,16 +436,18 @@ def run_paired_command(
     completed = subprocess.run(
         executed,
         env=env,
-        text=True,
+        cwd=cwd,
         capture_output=True,
         check=False,
     )
     elapsed_ms = (time.monotonic_ns() - started) / 1_000_000
     stdout_path = log_dir / f"{log_name}.stdout.log"
     stderr_path = log_dir / f"{log_name}.stderr.log"
-    stdout_path.write_text(completed.stdout, encoding="utf-8")
-    stderr_path.write_text(completed.stderr, encoding="utf-8")
-    combined = completed.stdout + "\n" + completed.stderr
+    stdout_path.write_bytes(completed.stdout)
+    stderr_path.write_bytes(completed.stderr)
+    stdout_text = completed.stdout.decode("utf-8", errors="replace")
+    stderr_text = completed.stderr.decode("utf-8", errors="replace")
+    combined = stdout_text + "\n" + stderr_text
     return {
         "row_type": row_type,
         "profile": profile,
@@ -459,15 +464,24 @@ def run_paired_command(
         "exit_code": completed.returncode,
         "command": command,
         "executed_command": executed,
+        "cwd": str(cwd or Path.cwd()),
         "stdout_log": str(stdout_path),
         "stderr_log": str(stderr_path),
-        "rootfs_index": first_match(ROOTFS_INDEX_RE, completed.stdout),
-        "resolved_image": first_match(RESOLVED_IMAGE_RE, completed.stdout),
-        "cache_status": first_match(CACHE_STATUS_RE, completed.stdout),
+        "stdout": bounded_process_output(
+            completed.stdout,
+            MAX_RAW_COMMAND_OUTPUT_BYTES,
+        ),
+        "stderr": bounded_process_output(
+            completed.stderr,
+            MAX_RAW_COMMAND_OUTPUT_BYTES,
+        ),
+        "rootfs_index": first_match(ROOTFS_INDEX_RE, stdout_text),
+        "resolved_image": first_match(RESOLVED_IMAGE_RE, stdout_text),
+        "cache_status": first_match(CACHE_STATUS_RE, stdout_text),
         "prepare_ms": parse_prepare_ms(combined),
         "counts": paired_counts(combined, profile == "instrumented") if measured else None,
         "peak_rss_bytes": (
-            parse_peak_rss(completed.stderr, args.measure_rss) if measured else None
+            parse_peak_rss(stderr_text, args.measure_rss) if measured else None
         ),
         "rss_requested": args.measure_rss and measured,
         "validation_errors": [],
@@ -601,22 +615,20 @@ def delta_stats(rows: list[dict[str, object]], name: str) -> dict[str, object]:
         for row in paired_rows
         if row["delta_pct_of_control"] is not None
     ]
-    left_values = [float(row["left_ms"]) for row in paired_rows]
-    right_values = [float(row["right_ms"]) for row in paired_rows]
-    left_median = statistics.median(left_values) if left_values else None
-    right_median = statistics.median(right_values) if right_values else None
-    regression_pct = (
-        round((left_median - right_median) * 100 / right_median, 3)
-        if left_median is not None and right_median not in (None, 0)
-        else None
-    )
     return {
         **number_stats(values_ms),
         "median_delta_pct": statistics.median(values_pct) if values_pct else None,
         "p95_delta_pct": nearest_rank_or_none(values_pct, 0.95),
-        "left_median_ms": left_median,
-        "right_median_ms": right_median,
-        "median_regression_pct": regression_pct,
+        "paired_observations": [
+            {
+                "iteration": row["iteration"],
+                "candidate_ms": row["left_ms"],
+                "control_ms": row["right_ms"],
+                "delta_ms": row["delta_ms"],
+                "delta_pct_of_control": row["delta_pct_of_control"],
+            }
+            for row in paired_rows
+        ],
     }
 
 
@@ -660,14 +672,18 @@ def aggregate_gate_status(gates: dict[str, dict[str, object]]) -> str:
     return "pass"
 
 
-def bounded_process_output(data: bytes | None) -> dict[str, object]:
+def bounded_process_output(
+    data: bytes | None,
+    limit: int = MAX_VERSION_OUTPUT_BYTES,
+) -> dict[str, object]:
     payload = data or b""
-    bounded = payload[:MAX_VERSION_OUTPUT_BYTES]
+    bounded = payload[:limit]
     return {
         "text": bounded.decode("utf-8", errors="replace"),
         "bytes": len(payload),
+        "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
         "truncated": len(payload) > len(bounded),
-        "limit_bytes": MAX_VERSION_OUTPUT_BYTES,
+        "limit_bytes": limit,
     }
 
 
@@ -732,6 +748,100 @@ def spore_binary_identity(path: Path) -> dict[str, object]:
         "sha256": sha256,
         "version": version_result,
         "validation_errors": errors,
+    }
+
+
+def spore_binary_stability(
+    before: dict[str, object],
+    after: dict[str, object],
+) -> dict[str, object]:
+    before_version = before["version"]
+    after_version = after["version"]
+    assert isinstance(before_version, dict)
+    assert isinstance(after_version, dict)
+    fields = {
+        "resolved_path": (before.get("resolved_path"), after.get("resolved_path")),
+        "size_bytes": (before.get("size_bytes"), after.get("size_bytes")),
+        "sha256": (before.get("sha256"), after.get("sha256")),
+        "version_exit_code": (
+            before_version.get("exit_code"),
+            after_version.get("exit_code"),
+        ),
+        "version_stdout_sha256": (
+            before_version.get("stdout", {}).get("sha256"),
+            after_version.get("stdout", {}).get("sha256"),
+        ),
+        "version_stderr_sha256": (
+            before_version.get("stderr", {}).get("sha256"),
+            after_version.get("stderr", {}).get("sha256"),
+        ),
+    }
+    changed = {
+        name: {"before": values[0], "after": values[1]}
+        for name, values in fields.items()
+        if values[0] != values[1]
+    }
+    return {
+        "stable": not changed,
+        "changed_fields": changed,
+    }
+
+
+def host_environment() -> dict[str, object]:
+    system = platform.system()
+    architecture = platform.machine()
+    kernel = platform.release()
+    hostname = platform.node()
+    stable_token: str | None = None
+    descriptor_source = "hostname"
+    machine_id = Path("/etc/machine-id")
+    if machine_id.is_file():
+        try:
+            stable_token = machine_id.read_text(encoding="ascii").strip()
+            descriptor_source = "/etc/machine-id"
+        except OSError:
+            pass
+    elif system == "Darwin":
+        try:
+            ioreg = subprocess.run(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            match = re.search(rb'"IOPlatformUUID"\s*=\s*"([^"]+)"', ioreg.stdout)
+            if ioreg.returncode == 0 and match:
+                stable_token = match.group(1).decode("ascii", errors="replace")
+                descriptor_source = "IOPlatformUUID"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if not stable_token:
+        stable_token = hostname
+    descriptor_payload = "\0".join(
+        (system, architecture, stable_token or "unknown")
+    ).encode()
+    lowered_arch = architecture.lower()
+    if system == "Darwin" and lowered_arch in ("arm64", "aarch64"):
+        backend = "hvf"
+        backend_basis = "Darwin arm64 paired builds use Hypervisor.framework"
+    elif system == "Linux":
+        backend = "kvm"
+        backend_basis = "Linux paired builds use KVM"
+    else:
+        backend = "unknown"
+        backend_basis = "no supported paired backend inferred from host OS/arch"
+    return {
+        "inferred_effective_backend": backend,
+        "backend_inference_basis": backend_basis,
+        "os": system,
+        "architecture": architecture,
+        "kernel_release": kernel,
+        "hostname": hostname,
+        "stable_host_descriptor": (
+            "sha256:" + hashlib.sha256(descriptor_payload).hexdigest()
+        ),
+        "stable_descriptor_source": descriptor_source,
+        "kvm_device_present": Path("/dev/kvm").exists() if system == "Linux" else None,
     }
 
 
@@ -901,9 +1011,15 @@ def prepare_identity_stability_gate(
 def run_paired_matrix(args: argparse.Namespace, root: Path) -> tuple[dict[str, object], bool]:
     profile = args.paired_profile
     instrumented = profile == "instrumented"
-    binary_identity = spore_binary_identity(args.spore)
-    args.spore = Path(str(binary_identity["resolved_path"]))
-    repo_identity = repository_identity(Path(__file__).resolve().parents[2])
+    measurement_class = (
+        "instrumented-engineering-control"
+        if instrumented
+        else "literal-default-path"
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    requested_spore = args.spore.expanduser().resolve()
+    checkout_spore = (repo_root / "zig-out/bin/spore").resolve()
+    args.spore = checkout_spore
     raw_path = args.raw_output or root / f"paired-{profile}-raw.jsonl"
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path.write_text("", encoding="utf-8")
@@ -918,25 +1034,89 @@ def run_paired_matrix(args: argparse.Namespace, root: Path) -> tuple[dict[str, o
             raw.write(json.dumps(row, sort_keys=True) + "\n")
         print(json.dumps(row, sort_keys=True), flush=True)
 
-    binary_errors = list(binary_identity["validation_errors"])
+    host = host_environment()
+    host_errors = (
+        []
+        if host["inferred_effective_backend"] in ("hvf", "kvm")
+        else ["cannot infer a supported effective backend from the host"]
+    )
+    host_row = {
+        "row_type": "setup",
+        "profile": profile,
+        "measurement_class": measurement_class,
+        "iteration": 0,
+        "lane": "provenance",
+        "scenario": "host_environment",
+        "measured": False,
+        "host": host,
+        "validation_errors": host_errors,
+    }
+    setup_rows.append(host_row)
+    record(host_row)
+    matrix_errors.extend(host_errors)
+
+    binding_errors = []
+    if requested_spore != checkout_spore:
+        binding_errors.append(
+            "paired release matrix requires --spore to resolve to "
+            f"{checkout_spore}, got {requested_spore}"
+        )
+    binding_row = {
+        "row_type": "setup",
+        "profile": profile,
+        "measurement_class": measurement_class,
+        "iteration": 0,
+        "lane": "provenance",
+        "scenario": "checkout_spore_binding",
+        "measured": False,
+        "requested_spore": str(requested_spore),
+        "required_checkout_spore": str(checkout_spore),
+        "matches": not binding_errors,
+        "validation_errors": binding_errors,
+    }
+    setup_rows.append(binding_row)
+    record(binding_row)
+    matrix_errors.extend(binding_errors)
+
+    release_build = run_paired_command(
+        args,
+        command=[str(shutil.which("mise") or "mise"), "run", "build:release"],
+        env=mode_env(os.environ, "native"),
+        log_dir=root / profile / "provenance-logs",
+        log_name="release-safe-build",
+        row_type="setup",
+        profile=profile,
+        iteration=0,
+        lane="provenance",
+        scenario="checkout_release_safe_build_not_timed",
+        measured=False,
+        cwd=repo_root,
+    )
+    if release_build["exit_code"] != 0:
+        release_build["validation_errors"] = [
+            f"ReleaseSafe build exited {release_build['exit_code']}"
+        ]
+        matrix_errors.extend(release_build["validation_errors"])
+    setup_rows.append(release_build)
+    record(release_build)
+
+    binary_identity_pre = spore_binary_identity(checkout_spore)
+    binary_errors = list(binary_identity_pre["validation_errors"])
     binary_row: dict[str, object] = {
         "row_type": "setup",
         "profile": profile,
-        "measurement_class": (
-            "instrumented-engineering-control"
-            if instrumented
-            else "literal-default-path"
-        ),
+        "measurement_class": measurement_class,
         "iteration": 0,
         "lane": "provenance",
-        "scenario": "measured_spore_binary",
+        "scenario": "measured_spore_binary_pre",
         "measured": False,
-        "spore_binary": binary_identity,
+        "spore_binary": binary_identity_pre,
         "validation_errors": binary_errors,
     }
     setup_rows.append(binary_row)
     record(binary_row)
     matrix_errors.extend(binary_errors)
+    repo_identity = repository_identity(repo_root)
 
     suffix = profile.replace("-", "")
     compact_ref = f"local/rootfs-capacity-paired-base-{suffix}:seed"
@@ -945,34 +1125,37 @@ def run_paired_matrix(args: argparse.Namespace, root: Path) -> tuple[dict[str, o
     seed_cache = seed / "rootfs-cache"
     seed_runtime = seed / "runtime"
     seed_env = paired_env(seed_cache, seed_runtime, instrumented)
-    seed_row = run_paired_command(
-        args,
-        command=[
-            str(args.spore),
-            "run",
-            "--image",
-            PAIRED_BASE_IMAGE,
-            "--pull=missing",
-            "--commit",
-            compact_ref,
-            "--",
-            "/bin/true",
-        ],
-        env=seed_env,
-        log_dir=seed / "logs",
-        log_name="setup-compact-seed",
-        row_type="setup",
-        profile=profile,
-        iteration=0,
-        lane="seed",
-        scenario="compact_seed_setup_not_timed",
-        measured=False,
-    )
-    if seed_row["exit_code"] != 0:
-        seed_row["validation_errors"] = [f"compact seed setup exited {seed_row['exit_code']}"]
-        matrix_errors.append("compact seed setup failed")
-    setup_rows.append(seed_row)
-    record(seed_row)
+    if not matrix_errors:
+        seed_row = run_paired_command(
+            args,
+            command=[
+                str(args.spore),
+                "run",
+                "--image",
+                PAIRED_BASE_IMAGE,
+                "--pull=missing",
+                "--commit",
+                compact_ref,
+                "--",
+                "/bin/true",
+            ],
+            env=seed_env,
+            log_dir=seed / "logs",
+            log_name="setup-compact-seed",
+            row_type="setup",
+            profile=profile,
+            iteration=0,
+            lane="seed",
+            scenario="compact_seed_setup_not_timed",
+            measured=False,
+        )
+        if seed_row["exit_code"] != 0:
+            seed_row["validation_errors"] = [
+                f"compact seed setup exited {seed_row['exit_code']}"
+            ]
+            matrix_errors.append("compact seed setup failed")
+        setup_rows.append(seed_row)
+        record(seed_row)
     copy_bin = shutil.which("cp")
     if copy_bin is None:
         matrix_errors.append("cp is required to clone the exact compact seed cache")
@@ -1266,6 +1449,30 @@ def run_paired_matrix(args: argparse.Namespace, root: Path) -> tuple[dict[str, o
         trial_identities.append(identities)
         record({"row_type": "identities", "profile": profile, **identities})
 
+    binary_identity_post = spore_binary_identity(checkout_spore)
+    binary_stability = spore_binary_stability(
+        binary_identity_pre,
+        binary_identity_post,
+    )
+    post_binary_errors = list(binary_identity_post["validation_errors"])
+    if not binary_stability["stable"]:
+        post_binary_errors.append("measured Spore binary changed during the matrix")
+    post_binary_row = {
+        "row_type": "verification",
+        "profile": profile,
+        "measurement_class": measurement_class,
+        "iteration": 0,
+        "lane": "provenance",
+        "scenario": "measured_spore_binary_post",
+        "measured": False,
+        "spore_binary": binary_identity_post,
+        "stability": binary_stability,
+        "validation_errors": post_binary_errors,
+    }
+    verification_rows.append(post_binary_row)
+    record(post_binary_row)
+    matrix_errors.extend(post_binary_errors)
+
     valid_rows = [row for row in rows if not row["validation_errors"]]
     scenario_stats = {
         scenario: number_stats(
@@ -1356,27 +1563,25 @@ def run_paired_matrix(args: argparse.Namespace, root: Path) -> tuple[dict[str, o
                 unit="ms",
                 samples=int(cold_delta["samples"]),
             ),
-            "warm_median_regression": upper_bound_gate(
-                observed_name="median_regression_pct",
-                observed=warm_delta["median_regression_pct"],
+            "warm_median_paired_percentage_delta": upper_bound_gate(
+                observed_name="median_paired_delta_pct",
+                observed=warm_delta["median_delta_pct"],
                 threshold=20,
                 unit="percent",
                 samples=int(warm_delta["samples"]),
                 details={
-                    "compact_median_ms": warm_delta["left_median_ms"],
-                    "pregrown_control_median_ms": warm_delta["right_median_ms"],
+                    "paired_observations": warm_delta["paired_observations"],
                 },
             ),
-            "incremental_median_regression": upper_bound_gate(
-                observed_name="median_regression_pct",
-                observed=incremental_delta["median_regression_pct"],
+            "incremental_median_paired_percentage_delta": upper_bound_gate(
+                observed_name="median_paired_delta_pct",
+                observed=incremental_delta["median_delta_pct"],
                 threshold=20,
                 unit="percent",
                 samples=int(incremental_delta["samples"]),
                 details={
-                    "compact_median_ms": incremental_delta["left_median_ms"],
-                    "pregrown_control_median_ms": incremental_delta[
-                        "right_median_ms"
+                    "paired_observations": incremental_delta[
+                        "paired_observations"
                     ],
                 },
             ),
@@ -1478,22 +1683,28 @@ def run_paired_matrix(args: argparse.Namespace, root: Path) -> tuple[dict[str, o
     )
     failed = failed or aggregate_status != "pass"
     gate_evaluation["command_exit_nonzero"] = failed
+    spore_binary_summary = {
+        "required_checkout_path": str(checkout_spore),
+        "requested_path": str(requested_spore),
+        "checkout_binding_matches": requested_spore == checkout_spore,
+        "release_safe_build": release_build,
+        "pre_matrix": binary_identity_pre,
+        "post_matrix": binary_identity_post,
+        "stability": binary_stability,
+    }
     summary = {
         "schema": "spore-build-rootfs-capacity-paired-v1",
         "profile": profile,
-        "measurement_class": (
-            "instrumented-engineering-control"
-            if instrumented
-            else "literal-default-path"
-        ),
+        "measurement_class": measurement_class,
         "performance_gate_eligible": performance_gate_eligible,
         "performance_gate_ineligible_reasons": eligibility_reasons,
         "complete_paired_iterations": complete_iterations,
         "gate_evaluation": gate_evaluation,
         "repository_commit": repo_identity["head"],
         "repository_identity": repo_identity,
-        "repository_identity_captured_at": "paired-matrix-start",
-        "spore_binary": binary_identity,
+        "repository_identity_captured_at": "post-release-build-matrix-start",
+        "spore_binary": spore_binary_summary,
+        "host": host,
         "base_image": PAIRED_BASE_IMAGE,
         "pregrown_control_disk_size": PAIRED_DISK_SIZE,
         "pregrown_control_contract": PREGROWN_CONTROL_CONTRACT,
@@ -1515,7 +1726,7 @@ def run_paired_matrix(args: argparse.Namespace, root: Path) -> tuple[dict[str, o
 
 def main() -> int:
     args = parse_args()
-    if not args.spore.is_file():
+    if not args.paired_matrix and not args.spore.is_file():
         print(f"error: spore binary not found: {args.spore}", file=sys.stderr)
         return 2
     owned_root = args.work_dir is None
@@ -1548,6 +1759,7 @@ def main() -> int:
                         ],
                         "gate_evaluation": summary["gate_evaluation"],
                         "spore_binary": summary["spore_binary"],
+                        "host": summary["host"],
                         "pregrown_control_contract": summary[
                             "pregrown_control_contract"
                         ],
