@@ -25,7 +25,7 @@ import time
 import uuid
 
 
-SUITE_VERSION = "1.4"
+SUITE_VERSION = "1.5"
 DEFAULT_IMAGE = "docker.io/library/node:22-alpine"
 DEFAULT_COMMAND = "/usr/local/bin/node -v"
 DEFAULT_PLATFORM = "linux/arm64"
@@ -38,6 +38,31 @@ DEFAULT_SYNTHETIC_ROOTFS_HARDLINK_COUNT = 1_024
 DEFAULT_SYNTHETIC_ROOTFS_DEPTH = 4
 SYNTHETIC_ROOTFS_SEED = 0x5A17_0F57
 EAGER_ROOTFS_ENV = "SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCHMARK"
+ROOTFS_TRACE_ENV = "SPOREVM_ROOTFS_TRACE"
+ROOTFS_TRACE_SUMMARY_ONLY_ENV = "SPOREVM_ROOTFS_TRACE_SUMMARY_ONLY"
+LAZY_CAS_TRACE_VERSION = 1
+SHA256_PINNED_IMAGE_REF_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
+LOCAL_BLAKE3_PINNED_IMAGE_REF_RE = re.compile(r"^local/[^@\s]+@blake3:[0-9a-f]{64}$")
+LAZY_CAS_TRACE_INT_FIELDS = {
+    "index_payload_bytes": "lazy_cas_index_payload_bytes",
+    "total_chunks": "lazy_cas_total_chunks",
+    "cas_chunks_initial": "lazy_cas_cas_chunks_initial",
+    "cas_chunks_remaining": "lazy_cas_cas_chunks_remaining",
+    "fault_attempts": "lazy_cas_fault_attempts",
+    "fault_errors": "lazy_cas_fault_errors",
+    "unique_chunks": "lazy_cas_unique_chunks",
+    "fault_bytes": "lazy_cas_fault_bytes",
+}
+LAZY_CAS_TRACE_MS_FIELDS = {
+    "runtime_open_ns": "lazy_cas_runtime_open_ms",
+    "index_attach_ns": "lazy_cas_index_attach_ms",
+    "fault_total_ns": "lazy_cas_fault_service_ms",
+    "object_prepare_ns": "lazy_cas_object_prepare_ms",
+    "object_read_ns": "lazy_cas_object_read_ms",
+    "object_verify_ns": "lazy_cas_object_verify_ms",
+    "sparse_write_ns": "lazy_cas_sparse_write_ms",
+}
+LAZY_CAS_TRACE_REQUIRED_FIELDS = frozenset(LAZY_CAS_TRACE_INT_FIELDS) | frozenset(LAZY_CAS_TRACE_MS_FIELDS)
 RESTORE_METRICS_RE = re.compile(r"(?:kvm|hvf) restore metrics: (?P<fields>.+)")
 EXEC_PROBE_TIMING_RE = re.compile(r"run exec probe timing: (?P<fields>.+)")
 BACKEND_TIMING_RE = re.compile(r"run backend timing: (?P<fields>.+)")
@@ -78,6 +103,22 @@ PHASE_METRIC_FIELDS = (
     "kvm_probe_complete_observed_ms",
     "kvm_pending_exit_completion_ms",
     "kvm_probe_return_ms",
+    "lazy_cas_runtime_open_ms",
+    "lazy_cas_index_attach_ms",
+    "lazy_cas_fault_service_ms",
+    "lazy_cas_object_prepare_ms",
+    "lazy_cas_object_read_ms",
+    "lazy_cas_object_verify_ms",
+    "lazy_cas_sparse_write_ms",
+    "lazy_cas_other_ms",
+    "lazy_cas_fault_attempts",
+    "lazy_cas_fault_errors",
+    "lazy_cas_unique_chunks",
+    "lazy_cas_fault_bytes",
+    "lazy_cas_cas_chunks_initial",
+    "lazy_cas_cas_chunks_remaining",
+    "lazy_cas_working_set_pct",
+    "lazy_cas_index_payload_bytes",
 )
 
 IMAGE_SETUP_BENCHMARKS = {"cold_tti", "warm_spore_tti", "distribution_tti", "lazy_rootfs_tti"}
@@ -359,6 +400,49 @@ def parse_run_stderr_metrics(path: Path) -> dict[str, object]:
     return {key: value for key, value in metrics.items() if value is not None}
 
 
+def parse_lazy_cas_trace_metrics(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    summaries: list[dict[str, object]] = []
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.lstrip().startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and event.get("event") == "lazy_cas_fault_summary":
+                summaries.append(event)
+    if not summaries:
+        return {}
+    if len(summaries) != 1:
+        return {"lazy_cas_trace_error": "duplicate lazy CAS summaries"}
+    summary = summaries[0]
+    version = summary.get("version")
+    if type(version) is not int or version != LAZY_CAS_TRACE_VERSION:
+        return {"lazy_cas_trace_error": f"unsupported lazy CAS trace version: {summary.get('version')}"}
+    missing = sorted(LAZY_CAS_TRACE_REQUIRED_FIELDS - summary.keys())
+    if missing:
+        return {"lazy_cas_trace_error": f"lazy CAS summary missing fields: {','.join(missing)}"}
+    for name in LAZY_CAS_TRACE_REQUIRED_FIELDS:
+        value = summary[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return {"lazy_cas_trace_error": f"invalid lazy CAS summary field: {name}"}
+
+    metrics: dict[str, object] = {"lazy_cas_trace_version": LAZY_CAS_TRACE_VERSION}
+    metrics.update({metric: summary[raw] for raw, metric in LAZY_CAS_TRACE_INT_FIELDS.items()})
+    metrics.update({metric: summary[raw] / 1_000_000 for raw, metric in LAZY_CAS_TRACE_MS_FIELDS.items()})
+    total_ns = summary["fault_total_ns"]
+    phase_ns = sum(summary[name] for name in ("object_prepare_ns", "object_read_ns", "object_verify_ns", "sparse_write_ns"))
+    metrics["lazy_cas_other_ms"] = max(0, total_ns - phase_ns) / 1_000_000
+    initial_chunks = summary["cas_chunks_initial"]
+    metrics["lazy_cas_working_set_pct"] = (
+        100.0 * summary["unique_chunks"] / initial_chunks if initial_chunks else 0.0
+    )
+    return metrics
+
+
 def parse_rootfs_base_mode(path: Path) -> str | None:
     if not path.exists():
         return None
@@ -395,6 +479,13 @@ def rootfs_digest_cache_path(cache_root: Path, digest: str) -> Path:
     if len(hex_digest) != 64 or any(c not in "0123456789abcdef" for c in hex_digest):
         die(f"invalid rootfs digest for cache path: {digest}")
     return cache_root / "by-digest" / "blake3" / f"{hex_digest}.ext4"
+
+
+def is_pinned_image_ref(value: str) -> bool:
+    return (
+        SHA256_PINNED_IMAGE_REF_RE.search(value) is not None
+        or LOCAL_BLAKE3_PINNED_IMAGE_REF_RE.fullmatch(value) is not None
+    )
 
 
 def parse_rootfs_import_stdout(path: Path) -> dict[str, object]:
@@ -651,7 +742,7 @@ class BenchmarkRunner:
             die(f"build failed rc={rc} elapsed_ms={elapsed_ms} error={error or ''} stderr={stderr}")
 
     def resolve_image(self) -> None:
-        if "@sha256:" in self.args.image:
+        if is_pinned_image_ref(self.args.image):
             self.effective_image = self.args.image
             return
         argv = [str(self.spore_bin), "rootfs", "resolve", self.args.image, "--platform", self.args.platform]
@@ -676,7 +767,7 @@ class BenchmarkRunner:
                 return
             die(f"rootfs resolve failed rc={rc} elapsed_ms={elapsed_ms} error={error or ''} stderr={stderr}")
         resolved = stdout.read_text(encoding="utf-8").strip()
-        if "@sha256:" not in resolved:
+        if not is_pinned_image_ref(resolved):
             die(f"rootfs resolve did not return a digest-pinned image ref: {resolved}")
         self.effective_image = resolved
         self.emit({
@@ -828,22 +919,26 @@ class BenchmarkRunner:
             data = parse_json_file(metadata_path)
             if not isinstance(data, dict):
                 continue
+            if data.get("resolved_image_ref") != self.effective_image:
+                continue
             rootfs_path_raw = data.get("rootfs_path")
             rootfs_size = data.get("rootfs_size")
             storage = data.get("rootfs_storage")
-            if not isinstance(rootfs_path_raw, str) or not isinstance(rootfs_size, int) or not isinstance(storage, dict):
+            if not isinstance(rootfs_size, int) or not isinstance(storage, dict):
                 continue
             index_digest = storage.get("index_digest")
             if not isinstance(index_digest, str) or not index_digest.startswith("blake3:"):
                 continue
-            rootfs_path = Path(rootfs_path_raw)
-            if not rootfs_path.is_absolute():
-                rootfs_path = (metadata_path.parent / rootfs_path).resolve()
-            if not rootfs_path.is_file():
-                continue
+            rootfs_path: Path | None = None
+            if isinstance(rootfs_path_raw, str) and rootfs_path_raw:
+                candidate = Path(rootfs_path_raw)
+                if not candidate.is_absolute():
+                    candidate = (metadata_path.parent / candidate).resolve()
+                if candidate.is_file():
+                    rootfs_path = candidate
             records.append({
                 "metadata_path": str(metadata_path),
-                "rootfs_path": str(rootfs_path),
+                "rootfs_path": str(rootfs_path) if rootfs_path is not None else None,
                 "rootfs_size": rootfs_size,
                 "index_digest": index_digest,
                 "flat_path": str(rootfs_digest_cache_path(self.rootfs_cache_dir, index_digest)),
@@ -867,7 +962,10 @@ class BenchmarkRunner:
     def restore_flat_materializations(self, records: list[dict[str, object]]) -> int:
         count = 0
         for record in records:
-            source_path = Path(str(record["rootfs_path"]))
+            rootfs_path = record.get("rootfs_path")
+            if not isinstance(rootfs_path, str):
+                continue
+            source_path = Path(rootfs_path)
             flat_path = Path(str(record["flat_path"]))
             if flat_path.exists():
                 continue
@@ -892,9 +990,11 @@ class BenchmarkRunner:
         prefix = self.log_dir / benchmark / mode / f"{iteration:06d}"
         stdout = prefix.with_suffix(".stdout")
         stderr = prefix.with_suffix(".stderr")
-        env = self.env
+        trace_path = prefix.with_suffix(".rootfs-trace.jsonl")
+        env = self.env.copy()
+        env[ROOTFS_TRACE_ENV] = str(trace_path)
+        env[ROOTFS_TRACE_SUMMARY_ONLY_ENV] = "1"
         if extra_env:
-            env = self.env.copy()
             env.update(extra_env)
         argv = [
             str(self.spore_bin),
@@ -924,9 +1024,11 @@ class BenchmarkRunner:
             "stdout_first_line": first_output_line(stdout),
             "stdout_path": str(stdout),
             "stderr_path": str(stderr),
+            "rootfs_trace_path": str(trace_path),
             "started_at_ms": started_at_ms,
             "ended_at_ms": ended_at_ms,
             **parse_run_stderr_metrics(stderr),
+            **parse_lazy_cas_trace_metrics(trace_path),
         }
 
     def run_lazy_rootfs_tti(self) -> None:
@@ -941,13 +1043,23 @@ class BenchmarkRunner:
             lazy_row = self.run_image_tti_once("lazy_rootfs_tti", "lazy-cold", iteration, batch_start)
             lazy_row["flat_materializations_evicted"] = evicted_count
             lazy_row["flat_materialization_bytes_evicted"] = evicted_bytes
-            lazy_row["success"] = lazy_row["status"] == 0 and lazy_row.get("rootfs_base_mode") == "lazy"
+            lazy_row["success"] = (
+                lazy_row["status"] == 0
+                and lazy_row.get("rootfs_base_mode") == "lazy"
+                and lazy_row.get("lazy_cas_trace_version") == LAZY_CAS_TRACE_VERSION
+                and lazy_row.get("lazy_cas_fault_errors") == 0
+                and isinstance(lazy_row.get("lazy_cas_unique_chunks"), int)
+                and lazy_row["lazy_cas_unique_chunks"] > 0
+            )
             self.emit(lazy_row)
             rows_by_mode["lazy-cold"].append(lazy_row)
             print(
                 f"lazy_rootfs_tti lazy-cold iteration={iteration} "
                 f"{'ok' if lazy_row.get('success') else 'failed'} "
-                f"tti_ms={lazy_row.get('tti_ms')} first_output_ms={lazy_row.get('first_output_ms')}",
+                f"tti_ms={lazy_row.get('tti_ms')} first_output_ms={lazy_row.get('first_output_ms')} "
+                f"faults={lazy_row.get('lazy_cas_unique_chunks')} "
+                f"working_set_pct={lazy_row.get('lazy_cas_working_set_pct')} "
+                f"fault_service_ms={lazy_row.get('lazy_cas_fault_service_ms')}",
                 file=sys.stderr,
             )
 
@@ -1651,6 +1763,37 @@ def self_test() -> None:
         assert metrics["kvm_pending_exit_completion_ms"] == 2
         assert metrics["exec_response_ms"] == 8
         assert summarize_field([metrics], "exec_response_ms")["median"] == 8.0
+        trace = Path(tmp) / "rootfs-trace.jsonl"
+        trace.write_text(
+            '{"event":"block_source_read","source":"file","offset":0,"len":4096,"elapsed_ms":1}\n'
+            '{"event":"lazy_cas_fault_summary","version":1,"runtime_open_ns":12000000,'
+            '"index_attach_ns":3000000,"index_payload_bytes":9000,"total_chunks":100,'
+            '"cas_chunks_initial":80,"cas_chunks_remaining":60,"fault_attempts":20,'
+            '"fault_errors":0,"unique_chunks":20,"fault_bytes":1310720,'
+            '"fault_total_ns":10000000,"object_prepare_ns":4000000,"object_read_ns":2000000,'
+            '"object_verify_ns":1000000,"sparse_write_ns":2000000}\n',
+            encoding="utf-8",
+        )
+        lazy_metrics = parse_lazy_cas_trace_metrics(trace)
+        assert lazy_metrics["lazy_cas_runtime_open_ms"] == 12.0
+        assert lazy_metrics["lazy_cas_unique_chunks"] == 20
+        assert lazy_metrics["lazy_cas_working_set_pct"] == 25.0
+        assert lazy_metrics["lazy_cas_fault_service_ms"] == 10.0
+        assert lazy_metrics["lazy_cas_other_ms"] == 1.0
+        summary_line = trace.read_text(encoding="utf-8").splitlines()[-1] + "\n"
+        trace.write_text(summary_line.replace('"version":1', '"version":2'), encoding="utf-8")
+        assert "unsupported" in str(parse_lazy_cas_trace_metrics(trace).get("lazy_cas_trace_error"))
+        trace.write_text(summary_line + summary_line, encoding="utf-8")
+        assert "duplicate" in str(parse_lazy_cas_trace_metrics(trace).get("lazy_cas_trace_error"))
+        spaced_summary = json.dumps(json.loads(summary_line), sort_keys=True) + "\n"
+        trace.write_text(summary_line + spaced_summary, encoding="utf-8")
+        assert "duplicate" in str(parse_lazy_cas_trace_metrics(trace).get("lazy_cas_trace_error"))
+        trace.write_text(summary_line.replace('"version":1', '"version":true'), encoding="utf-8")
+        assert "unsupported" in str(parse_lazy_cas_trace_metrics(trace).get("lazy_cas_trace_error"))
+        trace.write_text(summary_line.replace('"version":1', '"version":1.0'), encoding="utf-8")
+        assert "unsupported" in str(parse_lazy_cas_trace_metrics(trace).get("lazy_cas_trace_error"))
+        trace.write_text(summary_line.replace(',"sparse_write_ns":2000000', ""), encoding="utf-8")
+        assert "missing fields" in str(parse_lazy_cas_trace_metrics(trace).get("lazy_cas_trace_error"))
         stderr.write_text(
             "spore rootfs profile: phase=rootfs_cas_inline ms=42 chunks=3 zero_chunks=1 nonzero_chunks=2 objects_written=2 object_bytes_written=8192 index_bytes=256\n",
             encoding="utf-8",
@@ -1719,18 +1862,28 @@ def self_test() -> None:
         cache_root = Path(tmp) / "cache"
         cache_root.mkdir()
         digest = "blake3:" + ("a" * 64)
+        assert is_pinned_image_ref("local/test@blake3:" + ("a" * 64))
+        assert is_pinned_image_ref("docker.io/library/test@sha256:" + ("b" * 64))
+        assert not is_pinned_image_ref("docker.io/library/test@blake3:" + ("a" * 64))
+        assert not is_pinned_image_ref("local/test:latest")
+        assert not is_pinned_image_ref("local/test@blake3:abc")
         assert rootfs_digest_cache_path(cache_root, digest) == cache_root / "by-digest" / "blake3" / f"{'a' * 64}.ext4"
         rootfs_path = cache_root / "image.ext4"
         rootfs_path.write_bytes(b"rootfs")
-        (cache_root / "image.json").write_text(json.dumps({
+        cache_runner = object.__new__(BenchmarkRunner)
+        cache_runner.rootfs_cache_dir = cache_root
+        cache_runner.effective_image = "local/test@blake3:" + ("c" * 64)
+        metadata = {
+            "resolved_image_ref": cache_runner.effective_image,
             "rootfs_path": str(rootfs_path),
             "rootfs_size": 6,
             "rootfs_storage": {
                 "index_digest": digest,
             },
-        }), encoding="utf-8")
-        cache_runner = object.__new__(BenchmarkRunner)
-        cache_runner.rootfs_cache_dir = cache_root
+        }
+        (cache_root / "image.json").write_text(json.dumps(metadata), encoding="utf-8")
+        unrelated = metadata | {"resolved_image_ref": "local/other@blake3:" + ("d" * 64)}
+        (cache_root / "unrelated.json").write_text(json.dumps(unrelated), encoding="utf-8")
         records = BenchmarkRunner.image_rootfs_cache_records(cache_runner)
         assert len(records) == 1
         assert records[0]["index_digest"] == digest
@@ -1744,6 +1897,14 @@ def self_test() -> None:
         restored_count = BenchmarkRunner.restore_flat_materializations(cache_runner, records)
         assert restored_count == 1
         assert flat_path.read_bytes() == b"rootfs"
+        flat_path.unlink()
+        metadata["rootfs_path"] = ""
+        (cache_root / "image.json").write_text(json.dumps(metadata), encoding="utf-8")
+        records = BenchmarkRunner.image_rootfs_cache_records(cache_runner)
+        assert len(records) == 1
+        assert records[0]["rootfs_path"] is None
+        assert BenchmarkRunner.restore_flat_materializations(cache_runner, records) == 0
+        assert not flat_path.exists()
         runner = object.__new__(BenchmarkRunner)
         runner.run_id = "self-test"
         runner.raw_path = Path(tmp) / "results.jsonl"

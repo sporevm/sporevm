@@ -47,15 +47,15 @@ mechanisms before both calcify — is how those goals get met with less code,
 not a separate justification. The plan deliberately breaks the on-disk and
 manifest formats to do so.
 
-> **Current state (2026-07-11): U6 is complete.** Disk-backed
+> **Current state (2026-07-11): U7 is complete.** Disk-backed
 > `spore fork --vm` now uses the live monitor/VMM quiescence boundary, one-use
 > fd claims, independently rooted child baselines, and readiness-after-adoption.
 > The maintained product smoke and native clone path pass on APFS/HVF and on a
-> real ARM64 Linux/KVM `c7gd.metal` host. U7 lazy runtimes now root their CAS
-> storage for the complete named-monitor or foreground-run lifetime. Its
-> deferred filler and boot-priority work, packfiles, and RAM/disk store
-> convergence are separate evidence-gated follow-ups, not incomplete U6
-> implementation.
+> real ARM64 Linux/KVM host. U7 lazy runtimes now root their CAS storage for the
+> complete named-monitor or foreground-run lifetime. Dense-image fault traces
+> do not justify a background filler, boot-priority list, or packfiles, and show
+> no latency urgency for index compaction. RAM/disk store convergence remains a
+> separate follow-up, not incomplete U6 implementation.
 
 ## Product Goals This Serves
 
@@ -904,11 +904,11 @@ faster reflink scratch filesystem or a different Linux clone primitive.
 
 ### U7 — Partial materialization
 
-Status: complete for local CAS fault-in and measured cold-flat startup.
+Status: complete for local CAS fault-in and measured dense-image cold-flat
+startup.
 
-Add the `.cas` map source, fault-in path, background filler, and
-boot-critical chunk ordering (fault-trace a reference boot to derive the
-priority set).
+Add the `.cas` map source and fault-in path, then use a reference boot trace to
+decide whether background fill or boot-critical chunk ordering is warranted.
 
 Landed behavior: chunk-index disks and chunked rootfs caches can now open over
 a sparse temporary base fd without assembling the full flat image first. The
@@ -931,11 +931,13 @@ descriptor-selected index and objects while the owner process is alive; normal
 teardown removes the record after closing the runtime disk, and records left by
 dead processes do not remain roots.
 
-Decision: a concurrent background filler and boot-critical priority list are
-deferred until fault traces show they are needed. Adding a filler now would
-require synchronization around the hot chunk map and would reintroduce eager
-whole-image work in another form. The guest's actual read stream provides the
-correct initial ordering for this slice.
+Decision: do not add a concurrent background filler or boot-critical priority
+list. The dense-image fault trace below touched 34 of 19,035 nonzero chunks
+before the first command completed. Fault service took about 6ms in total,
+while eager materialization added about 2.7 seconds over lazy startup. A filler
+would require synchronization around the hot chunk map and would reintroduce
+eager whole-image work in another form. The guest's actual read stream is the
+right ordering for this slice.
 
 Validation: `mise exec -- zig test src/runtime_disk.zig` covers lazy rootfs
 open without publishing a flat cache, wrong-sized flat-cache fallback, CAS
@@ -965,6 +967,19 @@ benchmark reports three rows per iteration:
   before boot.
 - `flat-hot`: reuse the hot flat materialization as the overhead baseline.
 
+Lazy CAS tracing is also opt-in. When the benchmark supplies
+`SPOREVM_ROOTFS_TRACE`, a lazy disk emits one bounded
+`lazy_cas_fault_summary` JSONL record at teardown. Version 1 records runtime
+open and index-attach time, exact owned index payload bytes, initial and
+remaining CAS chunks, fault attempts/errors/bytes, and cumulative object
+preparation, read, verification, and sparse-write time. Object preparation
+includes path construction, path duplication, open and stat, and the read
+buffer allocation. It is deliberately named for that whole boundary. The
+record contains no paths or digests. `SPOREVM_ROOTFS_TRACE_SUMMARY_ONLY=1`
+suppresses the older per-read events so tracing does not add a write syscall to
+every fault. With tracing disabled, the fault path uses the original untimed
+object reader and does not sample clocks.
+
 Command used for the local U7 check after `mise run build`:
 
 ```sh
@@ -985,22 +1000,54 @@ used the CI-runnable 512 MiB flat image and measured:
   `rootfs_base_mode=flat`, `tti_ms=182`, `first_output_ms=38`.
 
 The small node image validates the repeatable benchmark and CI-friendly
-assertions. The meaningful asymptotic demonstration is a large image such as
-the approximately 7.4 GiB `buildkite-sporevm` rootfs: with warm CAS and evicted
-flat materializations, `lazy-cold` should stay bounded by the boot working set
-while `eager-cold` scales with full flat materialization. Run it by hand with:
+assertions, but it is not asymptotic evidence. An earlier native 8 GiB cached
+image was also rejected for that purpose: it contained only 70 non-zero CAS
+chunks, so eager materialization did not scale with its nominal logical size.
+
+The dense-image gate used the same pinned ARM64 Node base as the small check
+plus a deterministic 1 GiB AES-CTR payload. BuildKit exported the rootfs as a
+tar, then `spore rootfs import-tar` converted it into a complete local chunked
+image. This is synthetic asymptotic evidence, not a representative production
+image. The 1.85 GiB logical rootfs contained 19,035 nonzero 64 KiB CAS chunks,
+comfortably above the 10,000-chunk admission threshold.
+
+Three ReleaseSafe Linux/KVM iterations measured:
+
+| Mode | Median TTI | Range |
+| --- | ---: | ---: |
+| `lazy-cold` | 214ms | 214–215ms |
+| `eager-cold` | 2,918ms | 2,917–2,967ms |
+| `flat-hot` | 164ms | 164–165ms |
+
+Every lazy run faulted the same 34 unique chunks (2,228,224 bytes, 0.179% of
+the nonzero chunk set) with zero errors, leaving 19,001 chunks in CAS. Mean
+cumulative fault service was 6.04ms: 1.02ms object preparation, 1.67ms reading,
+2.62ms verification, 0.64ms sparse writes, and 0.08ms other work. Runtime open
+averaged 78.63ms; attaching the 3,704,220-byte (3.53 MiB) owned index state
+averaged 2.28ms.
+
+Those results close the remaining design gates. Do not add a background filler
+or boot-priority list: demand faults already fetch a tiny, stable working set.
+Do not add local packfiles: file-per-chunk open/read/verify service is only a few
+milliseconds across the entire boot. Index compaction is not latency-urgent:
+the owned state attaches in about 2ms. This benchmark did not measure process
+RSS, so memory cost remains an open measurement rather than evidence for or
+against compaction. Revisit any of these decisions only when a representative
+workload produces materially different traces. To repeat the timed portion
+against an admitted dense local image, run:
 
 ```sh
-python3 scripts/benchmark/suite.py --profile smoke --benchmarks lazy_rootfs_tti --iterations 1 --modes sequential --image <large-image-ref> --output-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs-large --scratch-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs-large-scratch --timeout-s 900
+python3 scripts/benchmark/suite.py --profile smoke --benchmarks lazy_rootfs_tti --iterations 3 --modes sequential --image <dense-local-image-ref> --output-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs-large --scratch-dir zig-cache/sporevm-benchmarks/u7-lazy-rootfs-large-scratch --timeout-s 900
 ```
 
-Done when: complete for the local lazy path, virtio-blk error completion, and
+Done: complete for the local lazy path, virtio-blk error completion, and
 repeatable lazy/eager/flat TTI measurement. Cold-flat startup is bounded by the
-boot working set, not full image assembly; the measured lazy run starts the
-guest before restoring or rebuilding the 512 MiB flat materialization, while
-the eager-cold baseline pays full materialization before boot. Background
-filler and boot-priority ordering remain deferred until fault traces show they
-are needed.
+boot working set, not full image assembly. Both the CI-sized check and the
+dense synthetic run start the guest before full flat materialization; on the
+dense run, eager materialization was about 13.6 times slower than lazy startup.
+The measured fault path does not justify a background filler, boot-priority
+ordering, or local packfiles. Index compaction has no measured latency urgency;
+its unmeasured RSS cost remains separate follow-up evidence.
 
 ### U8 — Cleanup and docs
 
@@ -1096,18 +1143,20 @@ directly; it does not assemble or rescan the derived flat rootfs cache.
 
 ## Open Questions
 
-- Chunk object packing (many small files vs packfiles). File-per-chunk
-  has shipped through the unified storage slices: RAM already runs
-  file-per-chunk at 2MiB without trouble, and incremental snapshots mostly
-  skip writes via
-  write-if-missing, so the snapshot write path is expected to be fine. The
-  access pattern that could force packing is U7 fault-in — an
-  open+read+close per 64KiB miss on cold boot (~70K objects for the
-  reference image). U7 landed without evidence requiring packing; revisit only
-  if large-image fault traces justify it. Do not build packfiles speculatively,
-  since file-per-chunk is what keeps
-  write-if-missing dedupe and unlink-based GC trivial. The index format is
-  unaffected either way.
+- Chunk object packing (many small files vs packfiles) is closed for the current
+  runtime. File-per-chunk has shipped through the unified storage slices: RAM
+  already runs file-per-chunk at 2MiB without trouble, and incremental
+  snapshots mostly skip writes via write-if-missing. The dense U7 trace faulted
+  only 34 objects, with object preparation, read, and verification totaling
+  about 5.3ms. That does not justify trading away the simple write-if-missing
+  dedupe and unlink-based GC. Reopen this only if representative fault traces
+  show materially larger working sets or object-service cost; the index format
+  is unaffected either way.
+- Compact index storage remains an RSS measurement question, not a latency
+  problem. The dense trace owned 3,704,220 bytes of index state and attached it
+  in 2.28ms on average, but the benchmark did not measure process RSS. Measure
+  that cost across representative concurrent VMs before changing the in-memory
+  layout.
 - Whether RAM and disk chunks should eventually share one *store*. This
   plan closes the code/format gaps (shared sealer in U3, shared index
   encoding and identity in U5, granularity as a parameter — RAM 2MiB, disk
