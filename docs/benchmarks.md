@@ -254,7 +254,7 @@ This prewarms `node:22-bookworm-slim`, then times fresh
 same stdout marker used by the public Kubernetes runtime. Each capture records
 the disk snapshot metrics as a schema-versioned JSON object. The benchmark
 fails if a hot capture performs a full logical-rootfs scan instead of sealing
-only dirty chunks. `--allow-full-scan` permits a schema-1 full scan but does not
+only dirty chunks. `--allow-full-scan` permits a versioned full scan but does not
 accept older, unversioned metric records. Performance claims from this
 benchmark require a ReleaseSafe binary on Linux ARM64/KVM.
 
@@ -267,8 +267,12 @@ it. Their matching
 object counts and microsecond timings show whether save used same-filesystem
 hard links, found objects already present, or paid the cross-filesystem verified
 copy fallback. `parent_sync_us` records the final directory durability barrier
-after batched hard links. The record also reports dirty versus non-dirty chunks, index
-encoding/publication, dirty-object writes, and total disk snapshot time. RAM
+after batched hard links. Schema 2 additionally partitions every logical chunk
+into sealed payload, nonzero parent reuse, clean known-zero reuse, or a dirty
+zero recorded without payload work. The parser retains strict schema-1 support
+for checked-in historical evidence. The record also reports dirty versus
+non-dirty chunks, index encoding/publication, dirty-object writes, and total
+disk snapshot time. RAM
 and whole-capture timings remain in the backend snapshot metric and the
 benchmark's `snapshot_metrics` and `duration_ms`; do not substitute either for
 disk snapshot cost. `snapshot_metrics` retains the backend's machine, device,

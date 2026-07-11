@@ -20,7 +20,7 @@ Options:
   --output PATH             JSONL output (default: benchmark workdir/results.jsonl)
   --strace-output PATH      Linux only: write `strace -f -c` syscall summary.
                             Use one iteration for a focused profile.
-  --allow-full-scan         Permit a schema-1 full scan; do not enforce the
+  --allow-full-scan         Permit a versioned full scan; do not enforce the
                             dirty-bounded disk snapshot metric.
   --keep-workdir            Keep per-run spores and logs.
 EOF
