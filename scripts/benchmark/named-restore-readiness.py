@@ -8,7 +8,6 @@ import json
 import os
 import pathlib
 import re
-import shlex
 import statistics
 import subprocess
 import sys
@@ -35,6 +34,13 @@ def parse_restore_metrics(stderr: str) -> dict[str, object]:
     return fields
 
 
+def restore_metrics_complete(metrics: dict[str, object]) -> bool:
+    return (
+        metrics.get("mode") in ("local_backing", "eager_chunks", "lazy_chunks")
+        and all(isinstance(metrics.get(field), int) for field in ("ram_mib", "memory_ms", "state_ms", "pre_run_ms"))
+    )
+
+
 def self_test() -> None:
     metrics = parse_restore_metrics(
         "info: kvm restore metrics: mode=local_backing ram_mib=1024 chunks=16 "
@@ -45,6 +51,8 @@ def self_test() -> None:
     assert metrics["memory_ms"] == 0
     assert metrics["state_ms"] == 2
     assert metrics["pre_run_ms"] == 4
+    assert restore_metrics_complete(metrics)
+    assert not restore_metrics_complete({"mode": "local_backing"})
     assert parse_restore_metrics("no restore metrics") == {}
     print("self-test ok")
 
@@ -62,7 +70,12 @@ def run(argv: list[str], env: dict[str, str]) -> tuple[subprocess.CompletedProce
 def debug_spore_wrapper(real_spore_bin: pathlib.Path, runtime_dir: pathlib.Path) -> pathlib.Path:
     wrapper = runtime_dir / "spore-with-restore-metrics"
     wrapper.write_text(
-        f"#!/bin/sh\nexec {shlex.quote(str(real_spore_bin))} --debug \"$@\"\n",
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        # Preserve the wrapper as argv[0] so lifecycle monitor re-exec also
+        # passes through here and enables backend restore metrics.
+        f"os.execv({str(real_spore_bin)!r}, [sys.argv[0], '--debug', *sys.argv[1:]])\n",
         encoding="utf-8",
     )
     wrapper.chmod(0o700)
@@ -132,7 +145,7 @@ def main() -> int:
                 run_from_argv = [str(spore_bin), "run", "--backend", args.backend, "--from", str(spore_dir), "--", "/bin/true"]
                 one_shot, run_from_ms = run(run_from_argv, env)
                 run_from_status = one_shot.returncode
-                run_from_error = one_shot.stderr.strip()
+                run_from_error = one_shot.stderr.strip() if one_shot.returncode != 0 else ""
             restore_argv = [str(spore_bin), "--json", "restore", str(spore_dir), "--name", name]
             if args.backend != "auto":
                 restore_argv.extend(("--backend", args.backend))
@@ -164,14 +177,15 @@ def main() -> int:
                 path.read_text(encoding="utf-8", errors="replace") for path in monitor_log_paths
             )
             restore_metrics = parse_restore_metrics(f"{restored.stderr}\n{monitor_log}")
+            metrics_complete = restore_metrics_complete(restore_metrics)
             removed, cleanup_ms = run([str(spore_bin), "rm", name], env)
             timing = restore_json.get("timing") if isinstance(restore_json.get("timing"), dict) else {}
             has_readiness_contract = isinstance(timing.get("wait_exec_ready_ms"), (int, float))
             exec_ready_ms = restore_return_ms if has_readiness_contract else (
                 restore_return_ms + first_exec_ms if first_exec_ms is not None else None
             )
-            ok = (run_from_status in (None, 0) and restored.returncode == 0 and not exec_errors and
-                  len(repeated_exec_ms) == args.repeated_execs and removed.returncode == 0)
+            ok = (run_from_status in (None, 0) and restored.returncode == 0 and metrics_complete and
+                  not exec_errors and len(repeated_exec_ms) == args.repeated_execs and removed.returncode == 0)
             failures += 0 if ok else 1
             row = {
                 "schema": "spore.named-restore-readiness.v1",
@@ -191,13 +205,18 @@ def main() -> int:
                 "backend_memory_ms": restore_metrics.get("memory_ms"),
                 "backend_state_ms": restore_metrics.get("state_ms"),
                 "backend_pre_run_ms": restore_metrics.get("pre_run_ms"),
+                "restore_metrics_complete": metrics_complete,
                 "first_noop_exec_ms": first_exec_ms,
                 "repeated_exec_ms": repeated_exec_ms,
                 "repeated_exec_median_ms": statistics.median(repeated_exec_ms) if repeated_exec_ms else None,
                 "cleanup_ms": cleanup_ms,
                 "restore_status": restored.returncode,
                 "cleanup_status": removed.returncode,
-                "error": run_from_error or restored.stderr.strip() or "; ".join(exec_errors) or removed.stderr.strip(),
+                "error": (run_from_error or
+                          (restored.stderr.strip() if restored.returncode != 0 else "") or
+                          "; ".join(exec_errors) or
+                          (removed.stderr.strip() if removed.returncode != 0 else "") or
+                          ("missing or incomplete backend restore metrics" if not metrics_complete else "")),
             }
             rows.write(json.dumps(row, separators=(",", ":")) + "\n")
             rows.flush()
