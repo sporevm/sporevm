@@ -15,7 +15,7 @@ cd "${repo_root}"
 
 baseline_version="${SPOREVM_NAMED_RESTORE_BASELINE_VERSION:-v0.12.0}"
 image="${SPOREVM_NAMED_RESTORE_IMAGE:-public.ecr.aws/docker/library/node:22-alpine}"
-memory="${SPOREVM_NAMED_RESTORE_MEMORY:-512mb}"
+memory="${SPOREVM_NAMED_RESTORE_MEMORY:-1024mb}"
 iterations="${SPOREVM_NAMED_RESTORE_ITERATIONS:-5}"
 repeated_execs="${SPOREVM_NAMED_RESTORE_REPEATED_EXECS:-5}"
 output_dir="${SPOREVM_NAMED_RESTORE_OUTPUT_DIR:-zig-cache/named-restore-readiness}"
