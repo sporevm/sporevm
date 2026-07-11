@@ -15,6 +15,7 @@ cd "${repo_root}"
 
 baseline_version="${SPOREVM_NAMED_RESTORE_BASELINE_VERSION:-v0.11.1}"
 image="${SPOREVM_NAMED_RESTORE_IMAGE:-public.ecr.aws/docker/library/node:22-alpine}"
+memory="${SPOREVM_NAMED_RESTORE_MEMORY:-512mb}"
 iterations="${SPOREVM_NAMED_RESTORE_ITERATIONS:-5}"
 repeated_execs="${SPOREVM_NAMED_RESTORE_REPEATED_EXECS:-5}"
 output_dir="${SPOREVM_NAMED_RESTORE_OUTPUT_DIR:-zig-cache/named-restore-readiness}"
@@ -49,7 +50,7 @@ parent="${workdir}/immutable-parent.spore"
 "${baseline_bin}" run \
   --backend kvm \
   --image "${image}" \
-  --memory 512mb \
+  --memory "${memory}" \
   --save "${parent}" \
   -- /bin/true
 chmod -R a-w "${parent}"
@@ -88,7 +89,9 @@ import sys
 for path in sys.argv[1:]:
     rows = [json.loads(line) for line in open(path, encoding="utf-8")]
     print(path)
-    for field in ("run_from_noop_ms", "restore_return_ms", "exec_ready_ms", "exec_ready_wait_ms", "first_noop_exec_ms", "repeated_exec_median_ms"):
+    sources = sorted({row.get("restore_source") for row in rows if row.get("restore_source")})
+    print(f"  restore_source: {','.join(sources) if sources else 'unknown'}")
+    for field in ("run_from_noop_ms", "restore_return_ms", "exec_ready_ms", "exec_ready_wait_ms", "backend_memory_ms", "backend_state_ms", "backend_pre_run_ms", "first_noop_exec_ms", "repeated_exec_median_ms"):
         values = [row[field] for row in rows if isinstance(row.get(field), (int, float))]
         print(f"  {field}: median={statistics.median(values):.3f}ms n={len(values)}" if values else f"  {field}: n=0")
 PY
