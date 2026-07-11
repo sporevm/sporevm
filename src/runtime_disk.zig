@@ -10,9 +10,11 @@ const disk_index = @import("disk_index.zig");
 const disk_layer = @import("disk_layer.zig");
 const fd_util = @import("fd.zig");
 const local_paths = @import("local_paths.zig");
+const rootfs_mod = @import("rootfs.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const runtime_disk_fork = @import("runtime_disk_fork.zig");
+const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const spore = @import("spore.zig");
 const virtio_blk = @import("virtio/blk.zig");
 
@@ -38,6 +40,7 @@ pub const RuntimeDisk = struct {
     overlay: ?disk_layer.TempOverlay = null,
     chunk_mapped: ?chunk_mapped_disk.ChunkMappedDisk = null,
     base_disk: ?spore.Disk = null,
+    runtime_lease: ?runtime_disk_lease.Active = null,
 
     pub fn backend(self: *RuntimeDisk) ?virtio_blk.Backend {
         if (self.chunk_mapped) |*disk| return .{ .chunk_mapped = disk };
@@ -83,6 +86,7 @@ pub const RuntimeDisk = struct {
         if (self.overlay) |*overlay| overlay.deinit();
         if (self.rootfs_fd) |fd| _ = std.c.close(fd);
         if (self.trace_fd) |fd| _ = std.c.close(fd);
+        if (self.runtime_lease) |*lease| lease.deinit();
         self.* = .{};
     }
 
@@ -183,9 +187,10 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         if (runtime.rootfs_fd == null) {
             const storage = rootfs_lazy_storage orelse return error.BadManifest;
             const grown_size = try grownRootfsSize(storage.logical_size, storage.chunk_size, options.rootfs_grow_target);
-            runtime.rootfs_fd = try createSparseTempFd(context, allocator, grown_size);
             const cache_root = try baselineRootPath(context, allocator, options.disk_root);
             defer allocator.free(cache_root);
+            runtime.runtime_lease = try acquireLazyRootfsLease(context, allocator, cache_root, storage);
+            runtime.rootfs_fd = try createSparseTempFd(context, allocator, grown_size);
             const base_source = try runtime.baseSource(grown_size);
             const writable = try openWritable(context, allocator, base_source, storage.logical_size, storage.chunk_size);
             runtime.overlay = writable.overlay;
@@ -423,6 +428,39 @@ fn rootfsCacheRootPath(context: Context, allocator: std.mem.Allocator) ![]const 
 fn baselineRootPath(context: Context, allocator: std.mem.Allocator, root_override: ?[]const u8) ![]const u8 {
     if (root_override) |root| return allocator.dupe(u8, root);
     return rootfsCacheRootPath(context, allocator);
+}
+
+fn acquireLazyRootfsLease(
+    context: Context,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    storage: spore.RootfsStorage,
+) !?runtime_disk_lease.Active {
+    const configured_cache_root = try rootfsCacheRootPath(context, allocator);
+    defer allocator.free(configured_cache_root);
+    if (!std.mem.eql(u8, configured_cache_root, cache_root)) return null;
+
+    var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, cache_root);
+    defer cache_lock.deinit();
+    if (!try rootfs_cas.storageMarkedComplete(context.io, allocator, cache_root, storage)) return error.BadManifest;
+
+    const runtime_root = try local_paths.runtimeRootPath(allocator, context.environ_map);
+    defer allocator.free(runtime_root);
+    const lease_root = if (std.fs.path.isAbsolute(cache_root))
+        try allocator.dupe(u8, cache_root)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(context.io, allocator);
+        defer allocator.free(cwd);
+        break :blk try std.fs.path.resolve(allocator, &.{ cwd, cache_root });
+    };
+    defer allocator.free(lease_root);
+    return try runtime_disk_lease.acquireActive(context.io, allocator, runtime_root, .{
+        .store = .rootfs_cache,
+        .root = lease_root,
+        .baseline_kind = .disk_index,
+        .baseline_identity = storage.index_digest,
+        .rootfs_storage = storage,
+    });
 }
 
 fn openRootfsTraceFd(context: Context, allocator: std.mem.Allocator) !?std.c.fd_t {

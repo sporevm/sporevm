@@ -58,6 +58,11 @@ local CAS chunks in on first read. Missing or corrupt chunk objects fail the
 complete multi-chunk virtio-blk request before any disk payload bytes are copied;
 only the request's I/O-error status byte is written.
 
+Live lazy rootfs runtimes now publish a process-owned cache lease before they
+open the index. Destructive rootfs prune and CAS GC preserve unread chunks for
+the full foreground-run or named-monitor lifetime, then reclaim them normally
+after the runtime disk closes.
+
 `spore pack` now emits chunked rootfs bundles directly from the canonical CAS
 index and verified objects. It no longer assembles and rescans a full flat ext4
 materialization before export. Packing chunked storage now requires that

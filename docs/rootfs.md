@@ -128,7 +128,10 @@ When a chunked rootfs has its index and objects but no usable flat
 materialization, `spore run` can start from the index directly. The runtime
 opens a sparse base fd, verifies each chunk object on first read, and promotes
 the verified bytes into that base for subsequent reads instead of rebuilding the
-whole ext4 file before boot.
+whole ext4 file before boot. Before opening the index, it publishes a
+process-owned runtime lease under the rootfs cache lock. Destructive prune and
+GC retain the selected index and objects until the foreground run exits or the
+named monitor stops.
 
 For local Docker buildx workflows, SporeVM consumes an OCI layout instead of the
 Docker daemon or socket. Buildx writes the layout, then `spore rootfs
@@ -240,10 +243,10 @@ prune selectors:
   `spore cache gc --rootfs` command to preserve reachable state.
 
 `spore cache gc --rootfs` is stricter than prune. It roots descriptor-selected
-`spore-disk-index-v1` indexes from cache metadata, image ref records, and live
-runtime manifests, then selects only unrooted CAS indexes and chunk objects. It
-is the preferred command when the goal is to clean chunk garbage without
-discarding reachable chunked storage.
+`spore-disk-index-v1` indexes from cache metadata, image ref records, live
+runtime manifests, and process-owned lazy-runtime leases, then selects only
+unrooted CAS indexes and chunk objects. It is the preferred command when the
+goal is to clean chunk garbage without discarding reachable chunked storage.
 
 When `spore run --image ... --save SPORE` saves a VM, the spore manifest
 records an immutable rootfs artifact: the ext4 materialization identity, size,

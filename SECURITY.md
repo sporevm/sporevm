@@ -62,6 +62,11 @@ fuzz targets from the slice that introduces it:
 - **Chunks are verified before use.** Any chunk received from any source is
   checked against its BLAKE3 id before being mapped into guest memory or
   parsed. A malicious peer can deny service, never inject state.
+- **Live lazy runtimes root their CAS.** Before a cache-backed lazy disk opens
+  its index, the runtime publishes its validated baseline lease while holding
+  the rootfs cache lock. Foreground runs and named monitors retain that root
+  until the runtime disk closes, so GC or destructive prune cannot remove an
+  unread object during the VM lifetime.
 - **Fail closed.** Unknown manifest versions, unsatisfiable platform
   contracts, and unverifiable chunks are errors, never degraded behavior.
 - **Caller-influenced paths are validated before use.** Platform limits such

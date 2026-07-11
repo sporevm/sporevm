@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-10
+last_reviewed: 2026-07-11
 spec_refs:
   - docs/spore-format.md
   - docs/rootfs.md
@@ -47,13 +47,15 @@ mechanisms before both calcify — is how those goals get met with less code,
 not a separate justification. The plan deliberately breaks the on-disk and
 manifest formats to do so.
 
-> **Current state (2026-07-10): U6 is complete.** Disk-backed
+> **Current state (2026-07-11): U6 is complete.** Disk-backed
 > `spore fork --vm` now uses the live monitor/VMM quiescence boundary, one-use
 > fd claims, independently rooted child baselines, and readiness-after-adoption.
 > The maintained product smoke and native clone path pass on APFS/HVF and on a
-> real ARM64 Linux/KVM `c7gd.metal` host. U7's deferred filler and boot-priority
-> work, packfiles, and RAM/disk store convergence are separate evidence-gated
-> follow-ups, not incomplete U6 implementation.
+> real ARM64 Linux/KVM `c7gd.metal` host. U7 lazy runtimes now root their CAS
+> storage for the complete named-monitor or foreground-run lifetime. Its
+> deferred filler and boot-priority work, packfiles, and RAM/disk store
+> convergence are separate evidence-gated follow-ups, not incomplete U6
+> implementation.
 
 ## Product Goals This Serves
 
@@ -921,6 +923,14 @@ Managed `spore run --image` resolves chunked image-rootfs storage even without
 materialization as a side effect, so a warm-CAS/cold-flat image run reaches the
 lazy runtime path.
 
+Before that lazy index is opened, `RuntimeDisk` validates and publishes the
+existing baseline-lease JSON under the private runtime root while holding the
+same rootfs cache lock as GC and destructive prune. Foreground runs and named
+monitors therefore share one lifetime boundary. GC and prune retain the
+descriptor-selected index and objects while the owner process is alive; normal
+teardown removes the record after closing the runtime disk, and records left by
+dead processes do not remain roots.
+
 Decision: a concurrent background filler and boot-critical priority list are
 deferred until fault traces show they are needed. Adding a filler now would
 require synchronization around the hot chunk map and would reintroduce eager
@@ -940,6 +950,9 @@ promoted healthy chunk on the same queue. Only the status byte is updated; the
 non-overlapping test data segments remain sentinel-filled. Descriptor validation
 also completes before I/O, so a malformed later segment cannot expose data
 through an earlier valid segment or partially change backend bytes.
+`src/system.zig` additionally opens a lazy runtime, runs destructive CAS prune
+and mark/sweep GC, and proves the first read of an untouched object still
+succeeds before checking that runtime teardown releases the lease.
 
 Repeatable time-to-first-exec measurement lives in
 `scripts/benchmark/suite.py` as the opt-in `lazy_rootfs_tti` benchmark. The

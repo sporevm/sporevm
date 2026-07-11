@@ -5527,9 +5527,8 @@ fn validateExistingPrivateDir(io: Io, path: []const u8) !void {
 
 pub fn pidAlive(pid: i64) bool {
     if (pid <= 0) return false;
-    if (comptime builtin.os.tag == .windows) return false;
-    std.posix.kill(@intCast(pid), @enumFromInt(0)) catch |err| return err == error.PermissionDenied;
-    return true;
+    const owner_pid = std.math.cast(runtime_disk_lease.OwnerPid, pid) orelse return false;
+    return runtime_disk_lease.ownerAlive(owner_pid);
 }
 
 fn lessListEntry(_: void, a: ListEntry, b: ListEntry) bool {
