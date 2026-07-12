@@ -156,6 +156,17 @@ this version: 16 GiB is both the automatic target and cap because the next
 useful quantum is not safe for a fully dense index under the current 64 MiB
 canonical-index limit.
 
+`spore build` now supports ordinary multi-stage Dockerfiles with named and
+numeric earlier-stage references, target pruning, `scratch`, public/local/OCI
+bases, named OCI-layout build contexts, OCI config inheritance, and literal
+`COPY --from`. Immutable source stages are attached as bounded read-only
+virtio-blk inputs, and cache keys bind the exact source index plus the exact
+kernel, initrd, and embedded build-agent identity. Cross-stage COPY preserves
+modes, ownership, mtimes, symlinks, hardlinks within each source tree, and regular-file
+`security.capability`; every other visible `security.*` xattr fails closed.
+Mounted RUN, heredocs, exec-form RUN, advanced COPY flags, and non-root build
+execution remain unsupported.
+
 Automatic growth is limited to SporeVM's journal-less native and e2fsprogs
 ext4 profiles, or equivalent layouts accepted by the pinned guest kernel.
 Before the first writable mount, the managed initrd rejects journal presence,

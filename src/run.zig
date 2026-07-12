@@ -57,7 +57,7 @@ const embedded_run_initrd_sha256 = blk: {
     break :blk digest;
 };
 const default_kernel_repository = "sporevm/kernels";
-const default_kernel_release = "v0.6.2";
+const default_kernel_release = "v0.6.3";
 const default_kernel_version = "6.1.155";
 pub const rootfs_growth_experiments_env = "SPOREVM_ROOTFS_GROWTH_EXPERIMENTS";
 const force_write_zeroes_unsupported_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_UNSUPPORTED_EXPERIMENT";
@@ -81,6 +81,7 @@ const managed_run_kernel_required_config_symbols = [_][]const u8{
     "CONFIG_CGROUP_PIDS",
     "CONFIG_CPUSETS",
     "CONFIG_CGROUP_DEVICE",
+    "CONFIG_EXT4_FS_SECURITY",
     "CONFIG_MEMORY_HOTPLUG",
     "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE",
     "CONFIG_MEMORY_HOTREMOVE",
@@ -150,6 +151,14 @@ pub const Options = struct {
     rootfs: ?spore.Rootfs = null,
     rootfs_grow_target: u64 = 0,
     context_disk_path: ?[]const u8 = null,
+    /// Immutable rootfs artifacts attached read-only after the optional build
+    /// context disk. Build requests address these by bounded input index.
+    build_input_rootfs: []const spore.Rootfs = &.{},
+    /// Selects the build guest contract. Build checkpoints must persist
+    /// Docker-visible rootfs paths such as /tmp and /run instead of covering
+    /// them with the runtime's ephemeral tmpfs mounts.
+    build_mode: bool = false,
+    disk_snapshot_metrics: ?*disk_layer.SnapshotMetrics = null,
     disk: ?spore.Disk = null,
     disk_root: ?[]const u8 = null,
     runtime_disk_head: ?*runtime_disk_fork.Head = null,
@@ -3095,7 +3104,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     defer runtime_disk.deinit();
     const growth_session = opts.rootfs_grow_target != 0;
     const noinit_itable = growth_session and rootfsGrowthNoInitItable(context.environ_map);
-    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, false);
+    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, false, false, 0);
     const request_start = monotonicMs();
     const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
     var stream = try vsock.HostStream.initWithProtocol(opts.guest_port, request.bytes, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
@@ -3188,7 +3197,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .console_sink = consoleSink,
                 .disk_backend = runtime_disk.backend(),
                 .root_blk_options = root_blk_options,
-                .disk_snapshot = runtime_disk.snapshot(),
+                .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
@@ -3222,7 +3231,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .console_sink = consoleSink,
                 .disk_backend = runtime_disk.backend(),
                 .root_blk_options = root_blk_options,
-                .disk_snapshot = runtime_disk.snapshot(),
+                .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
@@ -3489,9 +3498,22 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     defer if (context_disk_fd) |fd| {
         _ = std.c.close(fd);
     };
+    const build_input_disks = try allocator.alloc(runtime_disk_mod.RuntimeDisk, opts.build_input_rootfs.len);
+    defer allocator.free(build_input_disks);
+    var build_input_count: usize = 0;
+    defer {
+        for (build_input_disks[0..build_input_count]) |*disk| disk.deinit();
+    }
+    for (opts.build_input_rootfs, 0..) |input_rootfs, index| {
+        build_input_disks[index] = try runtime_disk_mod.openReadOnlyRootfs(context, allocator, input_rootfs, opts.disk_root, rootfs_cache_lock);
+        build_input_count += 1;
+    }
+    const build_input_backends = try allocator.alloc(virtio_blk.Backend, build_input_disks.len);
+    defer allocator.free(build_input_backends);
+    for (build_input_disks, 0..) |*disk, index| build_input_backends[index] = disk.backend() orelse return error.BadManifest;
     const growth_session = opts.rootfs_grow_target != 0;
     const noinit_itable = growth_session and rootfsGrowthNoInitItable(context.environ_map);
-    const boot_args = try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, opts.context_disk_path != null);
+    const boot_args = try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, opts.context_disk_path != null, opts.build_mode, build_input_disks.len);
     var root_blk_stats: virtio_blk.Stats = .{};
     const root_blk_options = rootBlkOptions(context.environ_map, opts.rootfs_grow_target != 0, &root_blk_stats);
     defer if (opts.rootfs_grow_target != 0) logRootBlkStats(&root_blk_stats);
@@ -3510,7 +3532,8 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                 .disk_backend = runtime_disk.backend(),
                 .root_blk_options = root_blk_options,
                 .context_disk_fd = context_disk_fd,
-                .disk_snapshot = runtime_disk.snapshot(),
+                .build_input_disk_backends = build_input_backends,
+                .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
@@ -3538,7 +3561,8 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                 .disk_backend = runtime_disk.backend(),
                 .root_blk_options = root_blk_options,
                 .context_disk_fd = context_disk_fd,
-                .disk_snapshot = runtime_disk.snapshot(),
+                .build_input_disk_backends = build_input_backends,
+                .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
                 .annotations = opts.annotations,
@@ -3977,17 +4001,23 @@ fn logRootBlkStats(stats: *const virtio_blk.Stats) void {
     );
 }
 
-pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, rootfs_growth: bool, noinit_itable: bool, network: NetworkMode, build_context: bool) ![]const u8 {
+pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, rootfs_growth: bool, noinit_itable: bool, network: NetworkMode, build_context: bool, build_mode: bool, build_input_count: usize) ![]const u8 {
     const rootfs_flag = if (rootfs) " spore_rootfs=1" else "";
     const rootfs_rw_flag = if (rootfs and rootfs_writable) " spore_rootfs_rw=1" else "";
     const rootfs_growth_flag = if (rootfs and rootfs_writable and rootfs_growth) " spore_rootfs_growth=1" else "";
     const noinit_itable_flag = if (rootfs and rootfs_writable and rootfs_growth and noinit_itable) " spore_rootfs_noinit_itable=1" else "";
     const network_flag = if (network == .spore) " spore_net=1" else "";
     const build_context_flag = if (build_context) " spore_build_context=1" else "";
+    const build_mode_flag = if (build_mode) " spore_build=1" else "";
+    const build_inputs_flag = if (build_input_count != 0)
+        try std.fmt.allocPrint(allocator, " spore_build_inputs={d}", .{build_input_count})
+    else
+        null;
+    defer if (build_inputs_flag) |flag| allocator.free(flag);
     return std.fmt.allocPrint(
         allocator,
-        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}{s}{s}{s}{s}",
-        .{ guest_port, rootfs_flag, rootfs_rw_flag, rootfs_growth_flag, noinit_itable_flag, network_flag, build_context_flag },
+        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}{s}{s}{s}{s}{s}{s}",
+        .{ guest_port, rootfs_flag, rootfs_rw_flag, rootfs_growth_flag, noinit_itable_flag, network_flag, build_context_flag, build_mode_flag, build_inputs_flag orelse "" },
     );
 }
 
@@ -5593,32 +5623,32 @@ test "run image cache creates absolute cache directories" {
 }
 
 test "run cmdline marks rootfs mode" {
-    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, true, true, true, .disabled, false);
+    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, true, true, true, .disabled, false, false, 0);
     defer std.testing.allocator.free(without_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_rw=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_growth=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_noinit_itable=1") == null);
 
-    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, false, true, true, .disabled, false);
+    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, false, true, true, .disabled, false, false, 0);
     defer std.testing.allocator.free(with_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_rw=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_growth=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_noinit_itable=1") == null);
 
-    const with_writable_rootfs = try cmdline(std.testing.allocator, 10700, true, true, false, true, .disabled, false);
+    const with_writable_rootfs = try cmdline(std.testing.allocator, 10700, true, true, false, true, .disabled, false, false, 0);
     defer std.testing.allocator.free(with_writable_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs_rw=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs_growth=1") == null);
 
-    const with_growth = try cmdline(std.testing.allocator, 10700, true, true, true, true, .disabled, false);
+    const with_growth = try cmdline(std.testing.allocator, 10700, true, true, true, true, .disabled, false, false, 0);
     defer std.testing.allocator.free(with_growth);
     try std.testing.expect(std.mem.indexOf(u8, with_growth, "spore_rootfs_growth=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_growth, "spore_rootfs_noinit_itable=1") != null);
 
-    const lazy_init_control = try cmdline(std.testing.allocator, 10700, true, true, true, false, .disabled, false);
+    const lazy_init_control = try cmdline(std.testing.allocator, 10700, true, true, true, false, .disabled, false, false, 0);
     defer std.testing.allocator.free(lazy_init_control);
     try std.testing.expect(std.mem.indexOf(u8, lazy_init_control, "spore_rootfs_growth=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazy_init_control, "spore_rootfs_noinit_itable=1") == null);
@@ -5686,23 +5716,27 @@ test "indexed rootfs input enables rootfs boot mode" {
 }
 
 test "run cmdline marks network mode" {
-    const without_network = try cmdline(std.testing.allocator, 10700, false, false, false, false, .disabled, false);
+    const without_network = try cmdline(std.testing.allocator, 10700, false, false, false, false, .disabled, false, false, 0);
     defer std.testing.allocator.free(without_network);
     try std.testing.expect(std.mem.indexOf(u8, without_network, "spore_net=1") == null);
 
-    const with_network = try cmdline(std.testing.allocator, 10700, false, false, false, false, .spore, false);
+    const with_network = try cmdline(std.testing.allocator, 10700, false, false, false, false, .spore, false, false, 0);
     defer std.testing.allocator.free(with_network);
     try std.testing.expect(std.mem.indexOf(u8, with_network, "spore_net=1") != null);
 }
 
-test "run cmdline marks build context disk only when requested" {
-    const without_context = try cmdline(std.testing.allocator, 10700, true, true, false, false, .disabled, false);
+test "run cmdline marks build mode and immutable input disks only when requested" {
+    const without_context = try cmdline(std.testing.allocator, 10700, true, true, false, false, .disabled, false, true, 0);
     defer std.testing.allocator.free(without_context);
     try std.testing.expect(std.mem.indexOf(u8, without_context, "spore_build_context=1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, without_context, "spore_build=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, without_context, "spore_build_inputs=") == null);
 
-    const with_context = try cmdline(std.testing.allocator, 10700, true, true, false, false, .disabled, true);
+    const with_context = try cmdline(std.testing.allocator, 10700, true, true, false, false, .disabled, true, true, 2);
     defer std.testing.allocator.free(with_context);
     try std.testing.expect(std.mem.indexOf(u8, with_context, "spore_build_context=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_context, "spore_build=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_context, "spore_build_inputs=2") != null);
 }
 
 test "run embeds default initrd with its generated canonical digest" {
@@ -5808,6 +5842,7 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
             "CONFIG_CGROUP_PIDS=y\n" ++
             "CONFIG_CPUSETS=y\n" ++
             "CONFIG_CGROUP_DEVICE=y\n" ++
+            "CONFIG_EXT4_FS_SECURITY=y\n" ++
             "CONFIG_MEMORY_HOTPLUG=y\n" ++
             "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
             "CONFIG_MEMORY_HOTREMOVE=y\n" ++
@@ -5899,6 +5934,7 @@ test "managed run kernel config requires rootfs, Docker, and virtio-mem runtime 
         "CONFIG_CGROUP_PIDS=y\n" ++
         "CONFIG_CPUSETS=y\n" ++
         "CONFIG_CGROUP_DEVICE=y\n" ++
+        "CONFIG_EXT4_FS_SECURITY=y\n" ++
         "CONFIG_MEMORY_HOTPLUG=y\n" ++
         "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
         "CONFIG_MEMORY_HOTREMOVE=y\n" ++
@@ -5935,6 +5971,7 @@ test "managed run kernel config requires rootfs, Docker, and virtio-mem runtime 
         "CONFIG_CGROUP_PIDS=y\n" ++
         "CONFIG_CPUSETS=y\n" ++
         "CONFIG_CGROUP_DEVICE=y\n" ++
+        "CONFIG_EXT4_FS_SECURITY=y\n" ++
         "CONFIG_MEMORY_HOTPLUG=y\n" ++
         "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
         "CONFIG_MEMORY_HOTREMOVE=y\n" ++
@@ -5958,6 +5995,7 @@ test "managed run kernel config requires rootfs, Docker, and virtio-mem runtime 
         "CONFIG_CGROUP_PIDS=y\n" ++
         "CONFIG_CPUSETS=y\n" ++
         "CONFIG_CGROUP_DEVICE=y\n" ++
+        "CONFIG_EXT4_FS_SECURITY=y\n" ++
         "CONFIG_MEMORY_HOTPLUG=y\n" ++
         "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
         "CONFIG_MEMORY_HOTREMOVE=y\n" ++

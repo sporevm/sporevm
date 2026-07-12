@@ -7,6 +7,7 @@ const std = @import("std");
 const spore_internal = @import("spore_internal");
 
 const build_mod = spore_internal.build;
+const disk_index = spore_internal.disk_index;
 const ext4 = spore_internal.rootfs_ext4;
 const ext4_writer = spore_internal.rootfs.ext4_writer;
 const local_paths = spore_internal.local_paths;
@@ -53,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     const io = init.io;
-    const provided_tmp = if (args.len == 4) args[3] else null;
+    const provided_tmp = if (args.len == 4 and (mode == .block_enospc or mode == .inode_enospc)) args[3] else null;
     if (provided_tmp != null and mode != .block_enospc and mode != .inode_enospc) {
         printUsage();
         return error.InvalidArguments;
@@ -69,6 +70,8 @@ pub fn main(init: std.process.Init) !void {
     const cache_dir = try std.fs.path.join(allocator, &.{ tmp, "rootfs-cache" });
     const runtime_dir = try std.fs.path.join(allocator, &.{ tmp, "runtime" });
     const rootfs_path = try std.fs.path.join(allocator, &.{ tmp, "base.ext4" });
+    const second_rootfs_path = try std.fs.path.join(allocator, &.{ tmp, "base-two.ext4" });
+    const third_rootfs_path = try std.fs.path.join(allocator, &.{ tmp, "base-three.ext4" });
     const dockerfile_path = try std.fs.path.join(allocator, &.{ context_dir, "Dockerfile" });
     try Io.Dir.cwd().createDirPath(io, context_dir);
     try Io.Dir.cwd().createDirPath(io, cache_dir);
@@ -88,6 +91,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .path = "bin/sh", .kind = .{ .file = shell_bytes }, .mode = 0o755 },
         .{ .path = "dev", .kind = .directory, .mode = 0o755 },
         .{ .path = "etc", .kind = .directory, .mode = 0o755 },
+        .{ .path = "etc/resolv.conf", .kind = .{ .symlink = "../run/systemd/resolve/stub-resolv.conf" } },
         .{ .path = "proc", .kind = .directory, .mode = 0o755 },
         .{ .path = "run", .kind = .directory, .mode = 0o755 },
         .{ .path = "sys", .kind = .directory, .mode = 0o755 },
@@ -124,18 +128,59 @@ pub fn main(init: std.process.Init) !void {
         .block_enospc, .inode_enospc => return runEnospcSmoke(init, allocator, io, cache_root, dockerfile_path, base_storage, mode),
     }
 
+    const second_emitted = try ext4_writer.emit(allocator, io, second_rootfs_path, &entries, .{
+        .image_size = 16 << 20,
+        .inode_count = 1024,
+        .determinism = ext4.Determinism.fromDigest("sha256:spore-build-run-smoke-base-two"),
+        .cas_cache_root = cache_root,
+        .cas_chunk_size = rootfs_cas.default_chunk_size,
+        .cas_seal_workers = 1,
+    });
+    const second_preload = second_emitted.preload_result orelse return error.BadManifest;
+    const second_base_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, second_preload);
+    if (std.mem.eql(u8, base_storage.index_digest, second_base_storage.index_digest)) return error.ExpectedDistinctMultiStageBases;
+    _ = try rootfs.publishIndexedImage(init, allocator, .{
+        .ref = "local/build-smoke-base-two:dev",
+        .platform = .{},
+        .config = .{ .architecture = "arm64", .os = "linux" },
+        .rootfs_storage = second_base_storage,
+    });
+    const third_emitted = try ext4_writer.emit(allocator, io, third_rootfs_path, &entries, .{
+        .image_size = 16 << 20,
+        .inode_count = 1024,
+        .determinism = ext4.Determinism.fromDigest("sha256:spore-build-run-smoke-base-three"),
+        .cas_cache_root = cache_root,
+        .cas_chunk_size = rootfs_cas.default_chunk_size,
+        .cas_seal_workers = 1,
+    });
+    const third_preload = third_emitted.preload_result orelse return error.BadManifest;
+    const third_base_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, third_preload);
+    if (std.mem.eql(u8, second_base_storage.index_digest, third_base_storage.index_digest)) return error.ExpectedDistinctMultiStageBases;
+    _ = try rootfs.publishIndexedImage(init, allocator, .{
+        .ref = "local/build-smoke-base-three:dev",
+        .platform = .{},
+        .config = .{ .architecture = "arm64", .os = "linux" },
+        .rootfs_storage = third_base_storage,
+    });
+
     try writeDockerfile(io, dockerfile_path, "step2");
     var first_diag: build_mod.Diagnostic = .{};
-    const first = try build_mod.build(init, allocator, .{
+    const first = build_mod.build(init, allocator, .{
         .tag = "local/build-smoke:dev",
         .context_dir = context_dir,
         .dockerfile_path = dockerfile_path,
         .platform = .{},
         .network = .none,
         .diagnostic = &first_diag,
-    });
+    }) catch |err| {
+        std.debug.print("first build failed: err={s} line={d} instruction={?s} exit={?d} output={s}\n", .{
+            @errorName(err),               first_diag.executor.instruction_line, first_diag.executor.instruction,
+            first_diag.executor.exit_code, first_diag.executor.output,
+        });
+        return err;
+    };
     if (first_diag.executor.boot_count != 1) return error.ExpectedOneBuildVmBoot;
-    if (first_diag.executor.executed_steps != 18) return error.ExpectedEighteenBuildSteps;
+    if (first_diag.executor.executed_steps != 19) return error.ExpectedNineteenBuildSteps;
     if (first_diag.executor.resize_count != 1) return error.ExpectedOneBuildResize;
     if (first_diag.executor.max_checkpoint_control_ms >= 2000) return error.BuildCheckpointControlTooSlow;
     if (first.cache_hit) return error.ExpectedFirstBuildCacheMiss;
@@ -168,7 +213,7 @@ pub fn main(init: std.process.Init) !void {
         .diagnostic = &uncached_diag,
     });
     if (uncached_diag.executor.boot_count != 1) return error.ExpectedUncachedBuildVmBoot;
-    if (uncached_diag.executor.executed_steps != 18) return error.ExpectedUncachedBuildEighteenSteps;
+    if (uncached_diag.executor.executed_steps != 19) return error.ExpectedUncachedBuildNineteenSteps;
     if (uncached_diag.executor.resize_count != 0) return error.ExpectedUncachedBuildWithoutResize;
     if (uncached_diag.executor.max_checkpoint_control_ms >= 2000) return error.UncachedBuildCheckpointControlTooSlow;
     if (uncached.cache_hit) return error.ExpectedUncachedBuildCacheMiss;
@@ -215,6 +260,14 @@ pub fn main(init: std.process.Init) !void {
     if (!edited_diag.context_disk.emitted) return error.ExpectedEditedContextDiskEmit;
     if (std.mem.eql(u8, first_diag.context_disk.digest, edited_diag.context_disk.digest)) return error.ExpectedEditedContextDiskIdentity;
 
+    try runTrailingCopySmoke(init, allocator, io, context_dir, dockerfile_path);
+    try runMultiStageCopySmoke(init, allocator, io, context_dir, dockerfile_path);
+    try runInheritedArgSmoke(init, allocator, io, context_dir, dockerfile_path);
+    try runScratchInodeSmoke(init, allocator, io, context_dir, dockerfile_path);
+    try runLaterStageFailureRetrySmoke(init, allocator, io, cache_root, context_dir, dockerfile_path, base_storage);
+    try runShelllessResizeSmoke(init, allocator, io, cache_root, context_dir, dockerfile_path);
+    try runResolverScaffoldSmoke(init, allocator, io, context_dir, dockerfile_path, args[2]);
+
     std.debug.print(
         "spore-build-run-smoke ok: first={s} cached={s} uncached={s} default-after-uncached={s} edited={s} context-disk-first=emitted:{d}ms context-disk-uncached=reused:{d}ms context-disk-edited=emitted:{d}ms\n",
         .{
@@ -259,11 +312,13 @@ fn validateProvidedSmokeRoot(allocator: std.mem.Allocator, io: Io, path: []const
 }
 
 fn parseMode(args: []const []const u8) !Mode {
-    if (args.len == 2) return .normal;
+    if (args.len < 3) return error.InvalidArguments;
+    if (args.len == 3 and !std.mem.startsWith(u8, args[2], "--")) return .normal;
     if (std.mem.eql(u8, args[2], "--large-copy")) return .large_copy;
     if (std.mem.eql(u8, args[2], "--large-run")) return .large_run;
     if (std.mem.eql(u8, args[2], "--block-enospc")) return .block_enospc;
     if (std.mem.eql(u8, args[2], "--inode-enospc")) return .inode_enospc;
+    if (args.len == 4 and std.mem.eql(u8, args[3], "--large-copy")) return .large_copy;
     return error.InvalidArguments;
 }
 
@@ -272,6 +327,563 @@ fn printUsage() void {
         "usage: build-run-smoke <aarch64-linux-sh-helper> [--large-copy|--large-run|--block-enospc|--inode-enospc] [absolute-enospc-workspace]\n",
         .{},
     );
+}
+
+fn runMultiStageCopySmoke(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    io: Io,
+    context_dir: []const u8,
+    dockerfile_path: []const u8,
+) !void {
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-base-two:dev AS one
+        \\COPY loose.txt /source-one
+        \\FROM local/build-smoke-base-three:dev AS two
+        \\COPY app/a.txt /source-two
+        \\FROM scratch AS runtime
+        \\COPY --from=one /source-one /one
+        \\COPY --from=two /source-two /two
+        \\ENTRYPOINT ["/one"]
+        \\
+        ,
+    });
+    var diagnostic: build_mod.Diagnostic = .{};
+    const first = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-multistage:dev",
+        .target = "runtime",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .network = .none,
+        .diagnostic = &diagnostic,
+    });
+    if (diagnostic.executor.boot_count != 3) return error.ExpectedThreeMultiStageBuildVmBoots;
+    if (diagnostic.executor.executed_steps != 4) return error.ExpectedFourMultiStageBuildSteps;
+    if (diagnostic.executor.resize_count != 2) return error.ExpectedTwoMultiStagePrepares;
+    if (diagnostic.executor.boot_artifact_file_reads != 3 or diagnostic.executor.boot_artifact_bytes_read == 0) return error.ExpectedAccumulatedMultiStageBootArtifacts;
+    if (first.cache_hit) return error.ExpectedMultiStageBuildCacheMiss;
+
+    var warm_diagnostic: build_mod.Diagnostic = .{};
+    const warm = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-multistage:dev",
+        .target = "runtime",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .network = .none,
+        .diagnostic = &warm_diagnostic,
+    });
+    if (warm_diagnostic.executor.boot_count != 0 or warm_diagnostic.executor.executed_steps != 0 or warm_diagnostic.executor.resize_count != 0 or !warm.cache_hit) {
+        return error.ExpectedWarmMultiStageBuild;
+    }
+    if (!std.mem.eql(u8, first.index_digest, warm.index_digest)) return error.ExpectedWarmMultiStageIdentity;
+
+    var uncached_diagnostic: build_mod.Diagnostic = .{};
+    const uncached = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-multistage:dev",
+        .target = "runtime",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .network = .none,
+        .no_cache = true,
+        .diagnostic = &uncached_diagnostic,
+    });
+    if (uncached_diagnostic.executor.boot_count != 3 or uncached_diagnostic.executor.executed_steps != 4 or uncached_diagnostic.executor.resize_count != 0 or uncached.cache_hit) {
+        return error.ExpectedUncachedMultiStagePreparedReuse;
+    }
+
+    const loose_path = try std.fs.path.join(allocator, &.{ context_dir, "loose.txt" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = loose_path, .data = "loose-edited\n" });
+    var edited_diagnostic: build_mod.Diagnostic = .{};
+    const edited = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-multistage:dev",
+        .target = "runtime",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .network = .none,
+        .diagnostic = &edited_diagnostic,
+    });
+    if (edited_diagnostic.executor.boot_count != 2 or edited_diagnostic.executor.executed_steps != 3 or edited_diagnostic.executor.resize_count != 0) {
+        return error.ExpectedSelectiveMultiStageInvalidation;
+    }
+    if (std.mem.eql(u8, first.index_digest, edited.index_digest)) return error.ExpectedEditedMultiStageIdentity;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = loose_path, .data = "loose\n" });
+
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM scratch AS one
+        \\ENTRYPOINT ["/one"]
+        \\FROM local/does-not-exist:dev AS unreachable
+        \\RUN false
+        \\
+        ,
+    });
+    var target_diagnostic: build_mod.Diagnostic = .{};
+    _ = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-multistage:one",
+        .target = "one",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .network = .none,
+        .diagnostic = &target_diagnostic,
+    });
+    if (target_diagnostic.executor.boot_count != 0 or target_diagnostic.executor.executed_steps != 0) {
+        return error.ExpectedColdPrunedMultiStageTarget;
+    }
+}
+
+fn runInheritedArgSmoke(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    io: Io,
+    context_dir: []const u8,
+    dockerfile_path: []const u8,
+) !void {
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\ARG CHOICE
+        \\FROM local/build-smoke-base:dev AS parent
+        \\ARG CHOICE
+        \\FROM parent
+        \\RUN record-inherited-arg
+        \\
+        ,
+    });
+    const cases = [_]struct { value: []const u8, expected_cache_hit: bool }{
+        .{ .value = "alpha", .expected_cache_hit = false },
+        .{ .value = "beta", .expected_cache_hit = false },
+        .{ .value = "beta", .expected_cache_hit = true },
+    };
+    var prior_index: ?[]const u8 = null;
+    for (cases) |case| {
+        var diagnostic: build_mod.Diagnostic = .{};
+        const result = build_mod.build(init, allocator, .{
+            .tag = "local/build-smoke-inherited-arg:dev",
+            .context_dir = context_dir,
+            .dockerfile_path = dockerfile_path,
+            .build_args = &.{.{ .key = "CHOICE", .value = case.value }},
+            .platform = .{},
+            .network = .none,
+            .diagnostic = &diagnostic,
+        }) catch |err| {
+            std.debug.print(
+                "inherited ARG build failed: value={s} err={s} line={d} instruction={?s} exit={?d} output={s}\n",
+                .{ case.value, @errorName(err), diagnostic.executor.instruction_line, diagnostic.executor.instruction, diagnostic.executor.exit_code, diagnostic.executor.output },
+            );
+            return err;
+        };
+        if (result.cache_hit != case.expected_cache_hit) return error.ExpectedInheritedArgCacheStatus;
+        const expected_exec: usize = @intFromBool(!case.expected_cache_hit);
+        if (diagnostic.executor.boot_count != expected_exec or diagnostic.executor.executed_steps != expected_exec or
+            diagnostic.executor.resize_count != 0)
+        {
+            return error.ExpectedInheritedArgExecutionCounts;
+        }
+        if (prior_index) |prior| {
+            if (!case.expected_cache_hit and std.mem.eql(u8, prior, result.index_digest)) return error.ExpectedInheritedArgInvalidation;
+            if (case.expected_cache_hit and !std.mem.eql(u8, prior, result.index_digest)) return error.ExpectedInheritedArgWarmIdentity;
+        }
+        prior_index = try allocator.dupe(u8, result.index_digest);
+    }
+
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-base:dev AS parent
+        \\ARG CHOICE=parent-default
+        \\FROM parent
+        \\ARG CHOICE
+        \\RUN record-inherited-arg
+        \\
+        ,
+    });
+    var inherited_diagnostic: build_mod.Diagnostic = .{};
+    const inherited = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-inherited-default:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &inherited_diagnostic,
+    });
+    if (inherited.cache_hit or inherited_diagnostic.executor.boot_count != 1 or
+        inherited_diagnostic.executor.executed_steps != 1 or inherited_diagnostic.executor.resize_count != 0)
+    {
+        return error.ExpectedInheritedDefaultExecutionCounts;
+    }
+}
+
+fn runScratchInodeSmoke(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    io: Io,
+    context_dir: []const u8,
+    dockerfile_path: []const u8,
+) !void {
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-base:dev AS producer
+        \\RUN generate-scratch-inode-tree
+        \\FROM scratch AS copied
+        \\COPY --from=producer /many-files /many-files
+        \\FROM local/build-smoke-base:dev AS verifier
+        \\COPY --from=copied /many-files /many-files
+        \\RUN verify-scratch-inode-tree
+        \\
+        ,
+    });
+    var diagnostic: build_mod.Diagnostic = .{};
+    const result = build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-scratch-inodes:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &diagnostic,
+    }) catch |err| {
+        std.debug.print(
+            "scratch inode build failed: err={s} line={d} instruction={?s} exit={?d} output={s}\n",
+            .{ @errorName(err), diagnostic.executor.instruction_line, diagnostic.executor.instruction, diagnostic.executor.exit_code, diagnostic.executor.output },
+        );
+        return err;
+    };
+    if (result.cache_hit) return error.ExpectedScratchInodeBuildCacheMiss;
+    if (diagnostic.executor.boot_count != 3 or diagnostic.executor.executed_steps != 4) {
+        return error.ExpectedScratchInodeBuildExecution;
+    }
+    if (diagnostic.executor.resize_count != 0) return error.ExpectedScratchInodeBuildWithoutPrepare;
+    if (diagnostic.scratch.created != 0 or diagnostic.scratch.reused != 1) return error.ExpectedScratchInodeCacheReuse;
+}
+
+fn runLaterStageFailureRetrySmoke(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    context_dir: []const u8,
+    dockerfile_path: []const u8,
+    base_storage: spore.RootfsStorage,
+) !void {
+    const destination = "local/build-smoke-later-failure:dev";
+    _ = try rootfs.publishIndexedImage(init, allocator, .{
+        .ref = destination,
+        .platform = .{},
+        .config = .{ .architecture = "arm64", .os = "linux" },
+        .rootfs_storage = base_storage,
+    });
+    const destination_ref_path = try rootfs.localRefCachePath(allocator, cache_root, destination, .{});
+    const ref_before = try Io.Dir.cwd().readFileAlloc(io, destination_ref_path, allocator, .limited(64 * 1024));
+    const resolved_before = try rootfs.resolveLocalCachedRef(io, allocator, cache_root, destination, .{});
+
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-base:dev AS producer
+        \\RUN transaction-prefix
+        \\FROM producer AS runtime
+        \\RUN transaction-fail
+        \\RUN transaction-final
+        \\
+        ,
+    });
+    var failure_diagnostic: build_mod.Diagnostic = .{};
+    if (build_mod.build(init, allocator, .{
+        .tag = destination,
+        .target = "runtime",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &failure_diagnostic,
+    })) |_| {
+        return error.ExpectedLaterStageBuildFailure;
+    } else |err| {
+        if (err != error.BuildRunFailed) return err;
+    }
+    if (failure_diagnostic.executor.boot_count != 2 or failure_diagnostic.executor.executed_steps != 2 or
+        failure_diagnostic.executor.resize_count != 0)
+    {
+        return error.ExpectedLaterStageFailureCounts;
+    }
+    if (failure_diagnostic.executor.exit_code != 23 or failure_diagnostic.executor.enospc) {
+        return error.ExpectedOrdinaryLaterStageFailure;
+    }
+    const ref_after_failure = try Io.Dir.cwd().readFileAlloc(io, destination_ref_path, allocator, .limited(64 * 1024));
+    if (!std.mem.eql(u8, ref_before, ref_after_failure)) return error.LaterStageFailureChangedDestinationRef;
+    const resolved_after_failure = try rootfs.resolveLocalCachedRef(io, allocator, cache_root, destination, .{});
+    if (!std.mem.eql(u8, resolved_before.ref, resolved_after_failure.ref) or
+        !std.mem.eql(u8, resolved_before.manifest_digest, resolved_after_failure.manifest_digest))
+    {
+        return error.LaterStageFailureChangedDestinationIdentity;
+    }
+    var prefix_before_retry = try findStepRecord(io, allocator, cache_root, "RUN transaction-prefix");
+    defer prefix_before_retry.deinit();
+    if (try stepRecordsContain(io, allocator, cache_root, "RUN transaction-fail")) return error.LaterStageFailurePublishedRecord;
+    if (try stepRecordsContain(io, allocator, cache_root, "RUN transaction-final")) return error.LaterStageFailureExecutedSuffix;
+    const publication_after_failure = try publicationState(io, allocator, cache_root);
+
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-base:dev AS producer
+        \\RUN transaction-prefix
+        \\FROM producer AS runtime
+        \\RUN transaction-suffix
+        \\RUN transaction-final
+        \\
+        ,
+    });
+    var retry_diagnostic: build_mod.Diagnostic = .{};
+    const retry = try build_mod.build(init, allocator, .{
+        .tag = destination,
+        .target = "runtime",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &retry_diagnostic,
+    });
+    if (retry.cache_hit or retry_diagnostic.executor.boot_count != 1 or
+        retry_diagnostic.executor.executed_steps != 2 or retry_diagnostic.executor.resize_count != 0)
+    {
+        return error.ExpectedSuffixOnlyRetry;
+    }
+    var prefix_after_retry = try findStepRecord(io, allocator, cache_root, "RUN transaction-prefix");
+    defer prefix_after_retry.deinit();
+    if (!std.mem.eql(u8, prefix_before_retry.value.rootfs_storage.index_digest, prefix_after_retry.value.rootfs_storage.index_digest)) {
+        return error.EarlierStageRecordIdentityChanged;
+    }
+    if (try stepRecordsContain(io, allocator, cache_root, "RUN transaction-fail")) return error.FailedInstructionRecordAppeared;
+    if (!try stepRecordsContain(io, allocator, cache_root, "RUN transaction-suffix") or
+        !try stepRecordsContain(io, allocator, cache_root, "RUN transaction-final"))
+    {
+        return error.MissingCorrectedSuffixRecords;
+    }
+    const publication_after_retry = try publicationState(io, allocator, cache_root);
+    if (publication_after_retry.step_records != publication_after_failure.step_records + 2) {
+        return error.ExpectedOnlySuffixRecordsOnRetry;
+    }
+    const ref_after_retry = try Io.Dir.cwd().readFileAlloc(io, destination_ref_path, allocator, .limited(64 * 1024));
+    if (std.mem.eql(u8, ref_before, ref_after_retry)) return error.CorrectedRetryDidNotPublishDestination;
+}
+
+fn runResolverScaffoldSmoke(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    io: Io,
+    context_dir: []const u8,
+    dockerfile_path: []const u8,
+    spore_executable: []const u8,
+) !void {
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-base:dev
+        \\RUN verify-resolver
+        \\RUN verify-resolver
+        \\
+        ,
+    });
+    var network_diag: build_mod.Diagnostic = .{};
+    const networked = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-resolver:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .spore,
+        .spore_executable = spore_executable,
+        .diagnostic = &network_diag,
+    });
+    if (network_diag.executor.boot_count != 1 or network_diag.executor.executed_steps != 2 or networked.cache_hit) {
+        return error.ExpectedResolverScaffoldNetworkBuild;
+    }
+
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-resolver:dev
+        \\RUN verify-resolver-snapshot
+        \\
+        ,
+    });
+    var snapshot_diag: build_mod.Diagnostic = .{};
+    const snapshot_check = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-resolver-check:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &snapshot_diag,
+    });
+    if (snapshot_diag.executor.boot_count != 1 or snapshot_diag.executor.executed_steps != 1 or snapshot_check.cache_hit) {
+        return error.ExpectedResolverScaffoldSnapshotCheck;
+    }
+
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-base:dev
+        \\RUN remove-resolver
+        \\
+        ,
+    });
+    for (0..2) |_| {
+        var failure_diag: build_mod.Diagnostic = .{};
+        _ = build_mod.build(init, allocator, .{
+            .tag = "local/build-smoke-resolver-failure:dev",
+            .context_dir = context_dir,
+            .dockerfile_path = dockerfile_path,
+            .platform = .{},
+            .network = .spore,
+            .spore_executable = spore_executable,
+            .diagnostic = &failure_diag,
+        }) catch |err| {
+            if (err != error.BuildGuestThawFailed) return err;
+            continue;
+        };
+        return error.ResolverRestoreFailureWasCached;
+    }
+}
+
+fn runTrailingCopySmoke(init: std.process.Init, allocator: std.mem.Allocator, io: Io, context_dir: []const u8, dockerfile_path: []const u8) !void {
+    const payload_path = try std.fs.path.join(allocator, &.{ context_dir, "trailing.txt" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = payload_path, .data = "alpha\n" });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-base:dev
+        \\RUN trailing-step
+        \\COPY trailing.txt /trailing.txt
+        \\CMD ["/bin/sh","-c","trailing"]
+        \\
+        ,
+    });
+
+    var cold_diag: build_mod.Diagnostic = .{};
+    const cold = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-trailing:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &cold_diag,
+    });
+    if (cold_diag.executor.boot_count != 1 or cold_diag.executor.executed_steps != 2 or cold.cache_hit) return error.ExpectedTrailingCopyColdBuild;
+
+    var warm_diag: build_mod.Diagnostic = .{};
+    const warm = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-trailing:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &warm_diag,
+    });
+    if (warm_diag.executor.boot_count != 0 or warm_diag.executor.executed_steps != 0 or !warm.cache_hit) return error.ExpectedTrailingCopyWarmBuild;
+    if (!std.mem.eql(u8, cold.index_digest, warm.index_digest)) return error.ExpectedTrailingCopyWarmIdentity;
+
+    const original_stat = try Io.Dir.cwd().statFile(io, payload_path, .{ .follow_symlinks = false });
+    var rewritten_stat = original_stat;
+    for (0..200) |_| {
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = payload_path, .data = "bravo\n" });
+        try Io.Dir.cwd().setTimestamps(io, payload_path, .{ .modify_timestamp = .{ .new = original_stat.mtime } });
+        rewritten_stat = try Io.Dir.cwd().statFile(io, payload_path, .{ .follow_symlinks = false });
+        if (rewritten_stat.ctime.nanoseconds != original_stat.ctime.nanoseconds) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    if (rewritten_stat.size != original_stat.size or rewritten_stat.mtime.nanoseconds != original_stat.mtime.nanoseconds or rewritten_stat.ctime.nanoseconds == original_stat.ctime.nanoseconds) {
+        return error.ExpectedSameSizeRestoredMtimeRewrite;
+    }
+
+    var edited_diag: build_mod.Diagnostic = .{};
+    const edited = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-trailing:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &edited_diag,
+    });
+    if (edited_diag.executor.boot_count != 1 or edited_diag.executor.executed_steps != 1 or edited_diag.executor.resize_count != 0 or edited.cache_hit) {
+        return error.ExpectedExactlyOneTrailingCopyStep;
+    }
+    if (std.mem.eql(u8, cold.index_digest, edited.index_digest)) return error.ExpectedTrailingCopyEditedIdentity;
+
+    var edited_warm_diag: build_mod.Diagnostic = .{};
+    const edited_warm = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-trailing:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &edited_warm_diag,
+    });
+    if (edited_warm_diag.executor.boot_count != 0 or edited_warm_diag.executor.executed_steps != 0 or !edited_warm.cache_hit) return error.ExpectedEditedTrailingCopyWarmBuild;
+    if (!std.mem.eql(u8, edited.index_digest, edited_warm.index_digest)) return error.ExpectedEditedTrailingCopyWarmIdentity;
+}
+
+fn runShelllessResizeSmoke(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    context_dir: []const u8,
+    dockerfile_path: []const u8,
+) !void {
+    const smoke_root = std.fs.path.dirname(context_dir) orelse return error.BadManifest;
+    const shellless_rootfs_path = try std.fs.path.join(allocator, &.{ smoke_root, "shellless-base.ext4" });
+    const entries = [_]ext4_writer.Entry{
+        .{ .path = "dev", .kind = .directory, .mode = 0o755 },
+        .{ .path = "proc", .kind = .directory, .mode = 0o755 },
+        .{ .path = "sys", .kind = .directory, .mode = 0o755 },
+        .{ .path = "run", .kind = .directory, .mode = 0o755 },
+        .{ .path = "tmp", .kind = .directory, .mode = 0o1777 },
+    };
+    const emitted = try ext4_writer.emit(allocator, io, shellless_rootfs_path, &entries, .{
+        .image_size = 16 << 20,
+        .inode_count = 1024,
+        .determinism = ext4.Determinism.fromDigest("sha256:spore-build-run-smoke-shellless-base"),
+        .cas_cache_root = cache_root,
+        .cas_chunk_size = rootfs_cas.default_chunk_size,
+        .cas_seal_workers = 1,
+    });
+    const preload = emitted.preload_result orelse return error.BadManifest;
+    _ = try rootfs.publishIndexedImage(init, allocator, .{
+        .ref = "local/build-smoke-shellless-base:dev",
+        .platform = .{},
+        .config = .{ .architecture = "arm64", .os = "linux" },
+        .rootfs_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload),
+    });
+
+    const payload_path = try std.fs.path.joinZ(allocator, &.{ context_dir, "shellless.bin" });
+    try createSparseFile(payload_path, 32 << 20);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-shellless-base:dev
+        \\COPY shellless.bin /payload.bin
+        \\WORKDIR /empty/work
+        \\CMD ["/payload.bin"]
+        \\
+        ,
+    });
+
+    var diagnostic: build_mod.Diagnostic = .{};
+    const result = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-shellless:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &diagnostic,
+    });
+    if (diagnostic.executor.boot_count != 1 or diagnostic.executor.executed_steps != 2 or diagnostic.executor.resize_count != 1 or result.cache_hit) {
+        return error.ExpectedShelllessResizeBuild;
+    }
 }
 
 fn runLargeCopySmoke(init: std.process.Init, allocator: std.mem.Allocator, io: Io, context_dir: []const u8, dockerfile_path: []const u8) !void {
@@ -317,6 +929,110 @@ fn runLargeCopySmoke(init: std.process.Init, allocator: std.mem.Allocator, io: I
             nsToMs(diagnostic.context_disk.emit_ns),
         },
     );
+
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-base:dev AS producer
+        \\RUN generate-large-run
+        \\FROM scratch AS copied
+        \\COPY --from=producer /large-run.bin /large-run.bin
+        \\
+        ,
+    });
+    var stage_copy_diagnostic: build_mod.Diagnostic = .{};
+    const copied = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-large-copy-from:dev",
+        .target = "copied",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &stage_copy_diagnostic,
+    });
+    if (stage_copy_diagnostic.executor.boot_count != 2 or stage_copy_diagnostic.executor.executed_steps != 2 or
+        stage_copy_diagnostic.executor.resize_count != 0 or copied.cache_hit)
+    {
+        return error.ExpectedLargeStageCopyBuild;
+    }
+    const snapshot = stage_copy_diagnostic.executor.snapshot_metrics;
+    if (snapshot.full_scan or snapshot.sealed_candidate_chunks < 8192 or snapshot.sealed_candidate_chunks > 8400) {
+        return error.ExpectedBoundedLargeStageCopySnapshot;
+    }
+
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    var copy_record = try findStepRecord(io, allocator, cache_root, "COPY --from=producer /large-run.bin /large-run.bin");
+    defer copy_record.deinit();
+    const copy_storage = copy_record.value.rootfs_storage;
+    const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, copy_storage.index_digest);
+    const index_bytes = try Io.Dir.cwd().readFileAlloc(io, index_path, allocator, .limited(disk_index.max_index_bytes));
+    var parsed = try disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(copy_storage));
+    defer parsed.deinit();
+    const last_logical_chunk = copy_storage.logical_size / copy_storage.chunk_size - 1;
+    var zero_tail = false;
+    for (parsed.value.zero_chunks) |logical_chunk| if (logical_chunk == last_logical_chunk) {
+        zero_tail = true;
+        break;
+    };
+    if (!zero_tail) return error.ExpectedLargeStageCopyZeroTailWithoutObject;
+
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dockerfile_path,
+        .data =
+        \\FROM local/build-smoke-base:dev
+        \\COPY --from=local/build-smoke-large-copy-from:dev /large-run.bin /large-run.bin
+        \\RUN verify-large-run
+        \\
+        ,
+    });
+    var reopen_diagnostic: build_mod.Diagnostic = .{};
+    const reopened = build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-large-copy-from-reopen:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .no_cache = true,
+        .diagnostic = &reopen_diagnostic,
+    }) catch |err| {
+        std.debug.print(
+            "large COPY reopen failed: err={s} line={d} instruction={?s} exit={?d} output={s}\n",
+            .{ @errorName(err), reopen_diagnostic.executor.instruction_line, reopen_diagnostic.executor.instruction, reopen_diagnostic.executor.exit_code, reopen_diagnostic.executor.output },
+        );
+        return err;
+    };
+    if (reopen_diagnostic.executor.boot_count != 1 or reopen_diagnostic.executor.executed_steps != 2 or
+        reopen_diagnostic.executor.resize_count != 0 or reopened.cache_hit)
+    {
+        return error.ExpectedLargeStageCopyDigestReopen;
+    }
+    std.debug.print(
+        "spore-build-large-copy-from-smoke ok: bytes=536870912 copied={s} reopened={s} candidates={d} full_scan={}\n",
+        .{ copied.index_digest, reopened.index_digest, snapshot.sealed_candidate_chunks, snapshot.full_scan },
+    );
+}
+
+const SmokeStepRecord = struct {
+    instruction: []const u8,
+    rootfs_storage: spore.RootfsStorage,
+};
+
+fn findStepRecord(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, instruction: []const u8) !std.json.Parsed(SmokeStepRecord) {
+    const steps_path = try std.fs.path.join(allocator, &.{ cache_root, "build", "steps" });
+    var dir = try Io.Dir.cwd().openDir(io, steps_path, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const path = try std.fs.path.join(allocator, &.{ steps_path, entry.name });
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 * 1024));
+        var parsed = std.json.parseFromSlice(SmokeStepRecord, allocator, bytes, .{ .ignore_unknown_fields = true }) catch continue;
+        if (std.mem.eql(u8, parsed.value.instruction, instruction)) {
+            return parsed;
+        }
+        parsed.deinit();
+    }
+    return error.MissingBuildCacheRecord;
 }
 
 fn runLargeRunSmoke(init: std.process.Init, allocator: std.mem.Allocator, io: Io, dockerfile_path: []const u8) !void {
@@ -648,6 +1364,7 @@ fn writeDockerfile(io: Io, path: []const u8, second_step: []const u8) !void {
         \\RUN spawn-background
         \\RUN verify-background-reaped
         \\RUN step1
+        \\RUN persist-runtime-paths
         \\WORKDIR /work
         \\RUN setup-symlink-targets
         \\COPY symlink-internal.txt symlinked-dir/internal.txt

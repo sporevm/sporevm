@@ -140,14 +140,15 @@ pub fn build(b: *std.Build) void {
     const install_exe = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&install_exe.step);
 
-    if (target_is_hvf and host_is_hvf) {
+    const spore_ready = if (target_is_hvf and host_is_hvf) blk: {
         const sign_spore = b.addSystemCommand(&.{
             "codesign",                      "--sign", "-", "--force", "--entitlements", "spore.entitlements",
             b.getInstallPath(.bin, "spore"),
         });
         sign_spore.step.dependOn(&install_exe.step);
         b.getInstallStep().dependOn(&sign_spore.step);
-    }
+        break :blk &sign_spore.step;
+    } else &install_exe.step;
 
     const run_step = b.step("run", "Run the spore CLI");
     const run_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "spore")});
@@ -320,9 +321,11 @@ pub fn build(b: *std.Build) void {
         const run_build_smoke = b.addSystemCommand(&.{
             b.getInstallPath(.bin, "spore-build-run-smoke"),
             b.getInstallPath(.bin, "spore-build-smoke-sh"),
+            b.getInstallPath(.bin, "spore"),
         });
         run_build_smoke.step.dependOn(build_run_smoke_ready);
         run_build_smoke.step.dependOn(&install_build_smoke_shell.step);
+        run_build_smoke.step.dependOn(spore_ready);
 
         const build_run_smoke_step = b.step("spore-build-run-smoke", "Run the VM-backed spore build RUN executor smoke test");
         build_run_smoke_step.dependOn(&run_build_smoke.step);
@@ -330,10 +333,12 @@ pub fn build(b: *std.Build) void {
         const run_large_copy_smoke = b.addSystemCommand(&.{
             b.getInstallPath(.bin, "spore-build-run-smoke"),
             b.getInstallPath(.bin, "spore-build-smoke-sh"),
+            b.getInstallPath(.bin, "spore"),
             "--large-copy",
         });
         run_large_copy_smoke.step.dependOn(build_run_smoke_ready);
         run_large_copy_smoke.step.dependOn(&install_build_smoke_shell.step);
+        run_large_copy_smoke.step.dependOn(spore_ready);
 
         const build_large_copy_smoke_step = b.step("spore-build-large-copy-smoke", "Run the VM-backed multi-GiB spore build COPY smoke test");
         build_large_copy_smoke_step.dependOn(&run_large_copy_smoke.step);

@@ -111,6 +111,8 @@ pub const EmitProfile = struct {
     metadata_build_ms: u64 = 0,
     file_create_ms: u64 = 0,
     emit_map_ms: u64 = 0,
+    emit_map_bytes: u64 = 0,
+    counted_emitter_buffers_bytes: u64 = 0,
     metadata_write_ms: u64 = 0,
     source_read_ms: u64 = 0,
     data_write_ms: u64 = 0,
@@ -278,16 +280,18 @@ const DataBlockRun = struct {
     byte_len: u64,
 };
 
-const DataBlockSource = struct {
-    source: tar.FileSource,
-    offset: u64,
-    len: usize,
+const EmitSpan = struct {
+    first_block: u32,
+    block_count: u32,
+    payload: union(enum) {
+        metadata: []u8,
+        data: DataBlockRun,
+    },
 };
 
-const EmitBlock = union(enum) {
-    zero,
-    metadata: []u8,
-    data: DataBlockSource,
+const EmitPlan = struct {
+    spans: []EmitSpan,
+    allocated_bytes: u64,
 };
 
 const SourceFile = struct {
@@ -1667,16 +1671,14 @@ fn writeImage(
     defer if (!file_closed) file.close(io);
 
     const emit_map_start = monotonicMs();
-    const emit_blocks = try buildEmitBlocks(allocator, total_blocks, blocks, data_blocks);
+    const emit_plan = try buildEmitSpans(allocator, total_blocks, blocks, data_blocks);
+    const emit_spans = emit_plan.spans;
     profile.emit_map_ms +|= monotonicMs() -| emit_map_start;
-    defer allocator.free(emit_blocks);
+    profile.emit_map_bytes = emit_plan.allocated_bytes;
+    defer allocator.free(emit_spans);
 
-    var source_block: [block_size]u8 = undefined;
     const source_buffer = try allocator.alloc(u8, source_batch_bytes);
     defer allocator.free(source_buffer);
-    const zero_buffer = try allocator.alloc(u8, source_batch_bytes);
-    defer allocator.free(zero_buffer);
-    @memset(zero_buffer, 0);
     var source_files = SourceFileCache{};
     defer source_files.deinit(allocator, io);
     var maybe_inline_cas: ?InlineRootfsCas = if (cas_cache_root) |cache_root|
@@ -1684,11 +1686,13 @@ fn writeImage(
     else
         null;
     defer if (maybe_inline_cas) |*inline_cas| inline_cas.deinit();
-    var block_index: usize = 0;
-    while (block_index < total_blocks) {
-        const block_no: u32 = @intCast(block_index);
-        const offset = @as(u64, block_no) * block_size;
-        switch (emit_blocks[block_index]) {
+    var block_cursor: u32 = 0;
+    for (emit_spans) |span| {
+        if (span.first_block > block_cursor) {
+            try emitZeroGap(span.first_block - block_cursor, if (maybe_inline_cas) |*cas| cas else null, profile);
+        }
+        const offset = @as(u64, span.first_block) * block_size;
+        switch (span.payload) {
             .metadata => |block| {
                 const write_start = monotonicMs();
                 try file.writePositionalAll(io, block, offset);
@@ -1701,41 +1705,30 @@ fn writeImage(
                     profile.inline_cas_metadata_ms +|= monotonicMs() -| cas_start;
                 }
             },
-            .data => |source| {
-                const written_blocks = try writeDataRun(
+            .data => |run| {
+                try writeDataSpan(
                     allocator,
                     io,
                     &file,
                     &source_files,
-                    emit_blocks,
-                    source,
-                    block_no,
+                    run,
                     offset,
-                    &source_block,
                     source_buffer,
                     if (maybe_inline_cas) |*inline_cas| inline_cas else null,
                     profile,
                 );
-                block_index += written_blocks;
-                continue;
-            },
-            .zero => {
-                const zero_start = monotonicMs();
-                const zero_blocks = zeroRunLength(emit_blocks, block_index, zero_buffer.len / block_size);
-                profile.zero_blocks +|= @intCast(zero_blocks);
-                profile.zero_bytes_skipped +|= @as(u64, @intCast(zero_blocks)) * block_size;
-                if (maybe_inline_cas) |*inline_cas| {
-                    const cas_start = monotonicMs();
-                    try inline_cas.writeZeroBytes(zero_blocks * block_size);
-                    profile.inline_cas_zero_ms +|= monotonicMs() -| cas_start;
-                }
-                profile.zero_ms +|= monotonicMs() -| zero_start;
-                block_index += zero_blocks;
-                continue;
             },
         }
-        block_index += 1;
+        block_cursor = span.first_block + span.block_count;
     }
+    if (block_cursor < total_blocks) {
+        try emitZeroGap(total_blocks - block_cursor, if (maybe_inline_cas) |*cas| cas else null, profile);
+    }
+    // Count the large, fixed emitter-owned buffers. Planner/hash-map and
+    // source-file-cache allocations are intentionally excluded; native RSS is
+    // measured separately by the scratch performance gate.
+    profile.counted_emitter_buffers_bytes = profile.emit_map_bytes + source_buffer.len + profile.metadata_bytes_written +
+        (if (cas_cache_root != null) cas_chunk_size else 0);
     const preload_result = if (maybe_inline_cas) |*inline_cas| blk: {
         const cas_finish_start = monotonicMs();
         const result = try inline_cas.finish();
@@ -1753,18 +1746,22 @@ fn writeImage(
     };
 }
 
-fn buildEmitBlocks(
+fn buildEmitSpans(
     allocator: std.mem.Allocator,
     total_blocks: u32,
     blocks: *BlockStore,
     data_blocks: *DataBlockStore,
-) ![]EmitBlock {
-    const emit_blocks = try allocator.alloc(EmitBlock, total_blocks);
-    errdefer allocator.free(emit_blocks);
-    @memset(emit_blocks, .zero);
+) !EmitPlan {
+    var spans = try std.ArrayList(EmitSpan).initCapacity(allocator, blocks.count() + data_blocks.items.len);
+    errdefer spans.deinit(allocator);
     var metadata_it = blocks.iterator();
     while (metadata_it.next()) |entry| {
-        emit_blocks[entry.key_ptr.*] = .{ .metadata = entry.value_ptr.* };
+        if (entry.key_ptr.* >= total_blocks) return error.Ext4ImageTooSmall;
+        try spans.append(allocator, .{
+            .first_block = entry.key_ptr.*,
+            .block_count = 1,
+            .payload = .{ .metadata = entry.value_ptr.* },
+        });
     }
     for (data_blocks.items) |run| {
         if (run.block_count == 0 or run.byte_len == 0) return error.BadExt4Tree;
@@ -1777,164 +1774,93 @@ fn buildEmitBlocks(
         const source_end = std.math.add(u64, run.source_offset, run.byte_len) catch return error.BadExt4Tree;
         if (source_end > run.source.size()) return error.BadExt4Tree;
 
-        var remaining = run.byte_len;
-        var source_offset = run.source_offset;
-        var i: u32 = 0;
-        while (i < run.block_count) : (i += 1) {
-            const block = run.first_block + i;
-            if (emit_blocks[block] != .zero) return error.BadExt4Tree;
-            const take: usize = @intCast(@min(remaining, block_size));
-            emit_blocks[block] = .{ .data = .{
-                .source = run.source,
-                .offset = source_offset,
-                .len = take,
-            } };
-            source_offset += take;
-            remaining -= take;
+        try spans.append(allocator, .{
+            .first_block = run.first_block,
+            .block_count = run.block_count,
+            .payload = .{ .data = run },
+        });
+    }
+    std.mem.sort(EmitSpan, spans.items, {}, struct {
+        fn lessThan(_: void, a: EmitSpan, b: EmitSpan) bool {
+            return a.first_block < b.first_block;
         }
-        if (remaining != 0) return error.BadExt4Tree;
+    }.lessThan);
+    var previous_end: u32 = 0;
+    for (spans.items, 0..) |span, index| {
+        if (index != 0 and span.first_block < previous_end) return error.BadExt4Tree;
+        previous_end = span.first_block + span.block_count;
     }
-    return emit_blocks;
+    const allocated_bytes = @as(u64, spans.capacity) * @sizeOf(EmitSpan);
+    return .{ .spans = try spans.toOwnedSlice(allocator), .allocated_bytes = allocated_bytes };
 }
 
-fn zeroRunLength(emit_blocks: []const EmitBlock, first_block_index: usize, max_blocks: usize) usize {
-    var count: usize = 1;
-    while (count < max_blocks and first_block_index + count < emit_blocks.len) : (count += 1) {
-        if (emit_blocks[first_block_index + count] != .zero) break;
+fn emitZeroGap(block_count: u32, inline_cas: ?*InlineRootfsCas, profile: *EmitProfile) !void {
+    if (block_count == 0) return;
+    const zero_start = monotonicMs();
+    const byte_len = @as(u64, block_count) * block_size;
+    profile.zero_blocks +|= block_count;
+    profile.zero_bytes_skipped +|= byte_len;
+    if (inline_cas) |cas| {
+        const cas_start = monotonicMs();
+        try cas.writeZeroBytes(@intCast(byte_len));
+        profile.inline_cas_zero_ms +|= monotonicMs() -| cas_start;
     }
-    return count;
+    profile.zero_ms +|= monotonicMs() -| zero_start;
 }
 
-fn writeDataRun(
+fn writeDataSpan(
     allocator: std.mem.Allocator,
     io: Io,
     output: *Io.File,
     cache: *SourceFileCache,
-    emit_blocks: []const EmitBlock,
-    first: DataBlockSource,
-    first_block_no: u32,
+    run: DataBlockRun,
     output_offset: u64,
-    fallback_block: *[block_size]u8,
     buffer: []u8,
     inline_cas: ?*InlineRootfsCas,
     profile: *EmitProfile,
-) !usize {
-    const run_blocks = dataRunLength(emit_blocks, first, first_block_no, buffer.len / block_size);
-    if (run_blocks <= 1) {
+) !void {
+    var remaining_blocks = run.block_count;
+    var remaining_payload = run.byte_len;
+    var consumed_payload: u64 = 0;
+    var write_offset = output_offset;
+    const max_batch_blocks: u32 = @intCast(buffer.len / block_size);
+    if (max_batch_blocks == 0) return error.BadExt4Tree;
+    while (remaining_blocks != 0) {
+        const batch_blocks = @min(remaining_blocks, max_batch_blocks);
+        const batch_bytes: usize = @as(usize, batch_blocks) * block_size;
+        const source_bytes: usize = @intCast(@min(remaining_payload, batch_bytes));
+        const run_source_offset = std.math.add(u64, run.source_offset, consumed_payload) catch return error.BadExt4Tree;
         const read_start = monotonicMs();
-        try readDataBlock(allocator, io, cache, first, fallback_block);
+        switch (run.source) {
+            .memory => |data| {
+                const start: usize = @intCast(run_source_offset);
+                @memcpy(buffer[0..source_bytes], data[start .. start + source_bytes]);
+            },
+            .file => |slice| {
+                const source_file = try cache.open(allocator, io, slice.path);
+                const source_offset = try std.math.add(u64, slice.offset, run_source_offset);
+                const n = try source_file.readPositionalAll(io, buffer[0..source_bytes], source_offset);
+                if (n != source_bytes) return error.UnexpectedEndOfStream;
+            },
+        }
         profile.source_read_ms +|= monotonicMs() -| read_start;
+        if (source_bytes < batch_bytes) @memset(buffer[source_bytes..batch_bytes], 0);
         const write_start = monotonicMs();
-        try output.writePositionalAll(io, fallback_block, output_offset);
+        try output.writePositionalAll(io, buffer[0..batch_bytes], write_offset);
         profile.data_write_ms +|= monotonicMs() -| write_start;
-        profile.data_blocks +|= 1;
-        profile.data_bytes_written +|= @intCast(block_size);
+        profile.data_blocks +|= batch_blocks;
+        profile.data_bytes_written +|= batch_bytes;
         if (inline_cas) |cas| {
             const cas_start = monotonicMs();
-            try cas.writeBytes(fallback_block[0..]);
+            try cas.writeBytes(buffer[0..batch_bytes]);
             profile.inline_cas_data_ms +|= monotonicMs() -| cas_start;
         }
-        return 1;
+        remaining_blocks -= batch_blocks;
+        remaining_payload -= source_bytes;
+        consumed_payload += source_bytes;
+        write_offset += batch_bytes;
     }
-
-    const byte_len = run_blocks * block_size;
-    var source_len: usize = undefined;
-    const read_start = monotonicMs();
-    switch (first.source) {
-        .memory => |data| {
-            const start: usize = @intCast(first.offset);
-            source_len = runPayloadLen(emit_blocks, first_block_no, run_blocks);
-            @memcpy(buffer[0..source_len], data[start .. start + source_len]);
-        },
-        .file => |slice| {
-            source_len = runPayloadLen(emit_blocks, first_block_no, run_blocks);
-            const source_offset = try std.math.add(u64, slice.offset, first.offset);
-            const source_file = try cache.open(allocator, io, slice.path);
-            const n = try source_file.readPositionalAll(io, buffer[0..source_len], source_offset);
-            if (n != source_len) return error.UnexpectedEndOfStream;
-        },
-    }
-    profile.source_read_ms +|= monotonicMs() -| read_start;
-    if (source_len < byte_len) @memset(buffer[source_len..byte_len], 0);
-    const write_start = monotonicMs();
-    try output.writePositionalAll(io, buffer[0..byte_len], output_offset);
-    profile.data_write_ms +|= monotonicMs() -| write_start;
-    profile.data_blocks +|= @intCast(run_blocks);
-    profile.data_bytes_written +|= @intCast(byte_len);
-    if (inline_cas) |cas| {
-        const cas_start = monotonicMs();
-        try cas.writeBytes(buffer[0..byte_len]);
-        profile.inline_cas_data_ms +|= monotonicMs() -| cas_start;
-    }
-    return run_blocks;
-}
-
-fn dataRunLength(
-    emit_blocks: []const EmitBlock,
-    first: DataBlockSource,
-    first_block_no: u32,
-    max_blocks: usize,
-) usize {
-    var count: usize = 1;
-    var expected_offset = first.offset + first.len;
-    while (count < max_blocks) : (count += 1) {
-        const block_no = first_block_no + @as(u32, @intCast(count));
-        if (block_no >= emit_blocks.len) break;
-        const next = switch (emit_blocks[block_no]) {
-            .data => |source| source,
-            else => break,
-        };
-        if (!sameSource(first.source, next.source)) break;
-        if (next.offset != expected_offset) break;
-        expected_offset += next.len;
-    }
-    return count;
-}
-
-fn runPayloadLen(emit_blocks: []const EmitBlock, first_block_no: u32, run_blocks: usize) usize {
-    var len: usize = 0;
-    for (0..run_blocks) |i| {
-        len += switch (emit_blocks[first_block_no + @as(u32, @intCast(i))]) {
-            .data => |source| source.len,
-            else => unreachable,
-        };
-    }
-    return len;
-}
-
-fn sameSource(a: tar.FileSource, b: tar.FileSource) bool {
-    return switch (a) {
-        .memory => |a_data| switch (b) {
-            .memory => |b_data| a_data.ptr == b_data.ptr and a_data.len == b_data.len,
-            .file => false,
-        },
-        .file => |a_slice| switch (b) {
-            .memory => false,
-            .file => |b_slice| a_slice.offset == b_slice.offset and a_slice.size == b_slice.size and std.mem.eql(u8, a_slice.path, b_slice.path),
-        },
-    };
-}
-
-fn readDataBlock(
-    allocator: std.mem.Allocator,
-    io: Io,
-    cache: *SourceFileCache,
-    block: DataBlockSource,
-    out: *[block_size]u8,
-) !void {
-    @memset(out, 0);
-    switch (block.source) {
-        .memory => |data| {
-            const start: usize = @intCast(block.offset);
-            @memcpy(out[0..block.len], data[start .. start + block.len]);
-        },
-        .file => |slice| {
-            const file = try cache.open(allocator, io, slice.path);
-            const source_offset = try std.math.add(u64, slice.offset, block.offset);
-            const n = try file.readPositionalAll(io, out[0..block.len], source_offset);
-            if (n != block.len) return error.UnexpectedEndOfStream;
-        },
-    }
+    if (remaining_payload != 0) return error.BadExt4Tree;
 }
 
 fn freeBlockStore(allocator: std.mem.Allocator, blocks: *BlockStore) void {
@@ -2176,6 +2102,65 @@ test "native ext4 writer inline CAS index matches rescanned image" {
     try std.testing.expect(inline_result.objects_written > 0);
 }
 
+test "sparse emit plan rejects metadata and data overlap deterministically" {
+    const allocator = std.testing.allocator;
+    var blocks = BlockStore.init(allocator);
+    defer freeBlockStore(allocator, &blocks);
+    try blocks.put(7, try zeroBlock(allocator));
+    var payload = [_]u8{'x'};
+    var data_blocks = DataBlockStore.empty;
+    defer data_blocks.deinit(allocator);
+    try data_blocks.append(allocator, .{
+        .first_block = 7,
+        .block_count = 1,
+        .source = .{ .memory = &payload },
+        .source_offset = 0,
+        .byte_len = payload.len,
+    });
+    try std.testing.expectError(error.BadExt4Tree, buildEmitSpans(allocator, 16, &blocks, &data_blocks));
+}
+
+test "sparse data span zero pads its partial final block" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-native-ext4-sparse-data-span";
+    const path = tmp ++ "/output";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    var output = try Io.Dir.cwd().createFile(io, path, .{ .read = true });
+    defer output.close(io);
+
+    const payload = try allocator.alloc(u8, block_size + 123);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @truncate(index * 17 + 3);
+    var source_files = SourceFileCache{};
+    defer source_files.deinit(allocator, io);
+    const buffer = try allocator.alloc(u8, 4 * block_size);
+    defer allocator.free(buffer);
+    var profile: EmitProfile = .{};
+    try writeDataSpan(allocator, io, &output, &source_files, .{
+        .first_block = 0,
+        .block_count = 2,
+        .source = .{ .memory = payload },
+        .source_offset = 0,
+        .byte_len = payload.len,
+    }, 0, buffer, null, &profile);
+
+    var actual: [2 * block_size]u8 = undefined;
+    try std.testing.expectEqual(actual.len, try output.readPositionalAll(io, &actual, 0));
+    try std.testing.expectEqualSlices(u8, payload, actual[0..payload.len]);
+    try std.testing.expect(std.mem.allEqual(u8, actual[payload.len..], 0));
+}
+
+test "sparse zero gap accounts a large logical tail without a dense map" {
+    var profile: EmitProfile = .{};
+    const blocks: u32 = 4 * 1024 * 1024;
+    try emitZeroGap(blocks, null, &profile);
+    try std.testing.expectEqual(@as(u64, blocks), profile.zero_blocks);
+    try std.testing.expectEqual(@as(u64, blocks) * block_size, profile.zero_bytes_skipped);
+    try std.testing.expectEqual(@as(u64, 0), profile.emit_map_bytes);
+}
+
 test "indexed directory children match scanned directory bytes" {
     const allocator = std.testing.allocator;
     const entries = [_]Entry{
@@ -2244,8 +2229,9 @@ test "source data runs split across block group metadata gaps" {
     }
     try std.testing.expect(saw_gap);
 
-    const emit_blocks = try buildEmitBlocks(allocator, total_blocks, &blocks, &data_blocks);
-    defer allocator.free(emit_blocks);
+    const emit_plan = try buildEmitSpans(allocator, total_blocks, &blocks, &data_blocks);
+    const emit_spans = emit_plan.spans;
+    defer allocator.free(emit_spans);
     var large_inode: ?InodePlan = null;
     for (planned.inodes.items) |inode| {
         if (inode.kind == .file and inode.file_source != null) {
@@ -2255,11 +2241,16 @@ test "source data runs split across block group metadata gaps" {
     }
     const inode = large_inode orelse return error.BadExt4Tree;
     const last_block = inode.data_blocks[inode.data_blocks.len - 1];
-    const last_source = switch (emit_blocks[last_block]) {
-        .data => |source| source,
-        else => return error.BadExt4Tree,
-    };
-    try std.testing.expectEqual(@as(usize, 123), last_source.len);
+    var last_payload_len: ?u64 = null;
+    for (emit_spans) |span| {
+        if (last_block < span.first_block or last_block >= span.first_block + span.block_count) continue;
+        last_payload_len = switch (span.payload) {
+            .data => |run| run.byte_len - @as(u64, span.block_count - 1) * block_size,
+            .metadata => return error.BadExt4Tree,
+        };
+        break;
+    }
+    try std.testing.expectEqual(@as(?u64, 123), last_payload_len);
 }
 
 fn fuzzNativeExt4PlannerAndMetadataEmitter(_: void, s: *std.testing.Smith) !void {

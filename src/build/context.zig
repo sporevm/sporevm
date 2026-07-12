@@ -3,6 +3,7 @@ const Io = std.Io;
 const Blake3 = std.crypto.hash.Blake3;
 
 const chunk_sealer = @import("../chunk_sealer.zig");
+const path_pattern = @import("path_pattern.zig");
 
 pub const IgnoreDiagnostic = struct {
     line: usize = 0,
@@ -55,17 +56,19 @@ pub const BuildContext = struct {
     root: []const u8,
     absolute_root: []const u8,
     rules: []IgnoreRule = &.{},
+    has_negations: bool = false,
 };
 
 const IgnoreRule = struct {
-    pattern: []const u8,
+    pattern: path_pattern.Pattern,
     negated: bool = false,
-    directory_only: bool = false,
-    anchored: bool = false,
 };
 
 pub const CopyEntry = struct {
     rel: []const u8,
+    /// Physical context path to capture when Docker dereferences a symlink
+    /// selected as a top-level COPY source. Empty means `rel`.
+    source_rel: []const u8 = "",
     kind: Io.File.Kind,
 };
 
@@ -311,16 +314,22 @@ pub const StatCache = struct {
             self.allocator.free(key);
             return;
         }
-        try self.index.put(self.allocator, key, self.records.items.len);
+        const owned_path = try self.allocator.dupe(u8, record.path);
+        errdefer self.allocator.free(owned_path);
+        const owned_digest = try self.allocator.dupe(u8, record.digest);
+        errdefer self.allocator.free(owned_digest);
+        const record_index = self.records.items.len;
         try self.records.append(.{
-            .path = try self.allocator.dupe(u8, record.path),
+            .path = owned_path,
             .size = record.size,
             .mtime_ns = record.mtime_ns,
             .ctime_ns = record.ctime_ns,
             .inode = record.inode,
-            .digest = try self.allocator.dupe(u8, record.digest),
+            .digest = owned_digest,
             .last_seen_unix_ns = record.last_seen_unix_ns,
         });
+        errdefer self.records.shrinkRetainingCapacity(record_index);
+        try self.index.put(self.allocator, key, record_index);
     }
 
     fn get(self: *StatCache, path: []const u8, stat: Io.File.Stat) ?[]const u8 {
@@ -351,12 +360,7 @@ pub const StatCache = struct {
             self.allocator.free(key);
             return;
         };
-        self.index.put(self.allocator, key, self.records.items.len) catch {
-            self.allocator.free(owned_digest);
-            self.allocator.free(owned_path);
-            self.allocator.free(key);
-            return;
-        };
+        const record_index = self.records.items.len;
         self.records.append(.{
             .path = owned_path,
             .size = stat.size,
@@ -365,7 +369,19 @@ pub const StatCache = struct {
             .inode = stat.inode,
             .digest = owned_digest,
             .last_seen_unix_ns = self.now_ns,
-        }) catch {};
+        }) catch {
+            self.allocator.free(owned_digest);
+            self.allocator.free(owned_path);
+            self.allocator.free(key);
+            return;
+        };
+        self.index.put(self.allocator, key, record_index) catch {
+            self.records.shrinkRetainingCapacity(record_index);
+            self.allocator.free(owned_digest);
+            self.allocator.free(owned_path);
+            self.allocator.free(key);
+            return;
+        };
     }
 };
 
@@ -379,7 +395,9 @@ pub fn load(allocator: std.mem.Allocator, io: Io, root: []const u8, diagnostic: 
         else => |e| return e,
     };
     const rules = try parseDockerignore(allocator, bytes, diagnostic);
-    return .{ .root = root, .absolute_root = absolute_root, .rules = rules };
+    var has_negations = false;
+    for (rules) |rule| has_negations = has_negations or rule.negated;
+    return .{ .root = root, .absolute_root = absolute_root, .rules = rules, .has_negations = has_negations };
 }
 
 pub fn parseDockerignore(allocator: std.mem.Allocator, bytes: []const u8, diagnostic: *IgnoreDiagnostic) ![]IgnoreRule {
@@ -387,35 +405,30 @@ pub fn parseDockerignore(allocator: std.mem.Allocator, bytes: []const u8, diagno
     var line_no: usize = 1;
     var it = std.mem.splitScalar(u8, bytes, '\n');
     while (it.next()) |raw| : (line_no += 1) {
-        var line = std.mem.trim(u8, raw, " \t\r\n");
-        if (line.len == 0 or line[0] == '#') continue;
+        var untrimmed = raw;
+        if (line_no == 1 and std.mem.startsWith(u8, untrimmed, "\xef\xbb\xbf")) untrimmed = untrimmed[3..];
+        // Docker recognizes comments before trimming whitespace. A leading
+        // space therefore escapes a literal pattern beginning with '#'.
+        if (untrimmed.len != 0 and untrimmed[0] == '#') continue;
+        var line = path_pattern.trimSpace(untrimmed);
+        if (line.len == 0) continue;
         var negated = false;
         if (line[0] == '!') {
             negated = true;
-            line = line[1..];
+            line = path_pattern.trimSpace(line[1..]);
             if (line.len == 0) return ignoreFail(diagnostic, line_no, "empty .dockerignore negation");
         }
-        if (std.mem.indexOf(u8, line, "**") != null or std.mem.indexOfAny(u8, line, "[]?") != null) {
+        const cleaned = path_pattern.cleanDockerignorePattern(allocator, line) catch {
             return ignoreFail(diagnostic, line_no, "unsupported .dockerignore pattern");
-        }
-        var anchored = false;
-        if (line[0] == '/') {
-            anchored = true;
-            line = line[1..];
-        }
-        var directory_only = false;
-        if (line.len != 0 and line[line.len - 1] == '/') {
-            directory_only = true;
-            line = line[0 .. line.len - 1];
-        }
-        validateRelative(line) catch {
+        };
+        // Docker historically treats a cleaned single dot as a no-op.
+        if (std.mem.eql(u8, cleaned, ".")) continue;
+        const pattern = path_pattern.Pattern.compile(allocator, cleaned, .dockerignore) catch {
             return ignoreFail(diagnostic, line_no, "unsupported .dockerignore pattern");
         };
         try rules.append(.{
-            .pattern = try allocator.dupe(u8, line),
+            .pattern = pattern,
             .negated = negated,
-            .directory_only = directory_only,
-            .anchored = anchored,
         });
     }
     return rules.toOwnedSlice();
@@ -555,8 +568,9 @@ fn resolveCopyEntries(
     defer context_root.close(io);
     for (resolution.entries) |entry| {
         if (options.diagnostic) |diag| diag.entries +|= 1;
-        const parent_rel = std.fs.path.dirname(entry.rel) orelse "";
-        const basename = std.fs.path.basename(entry.rel);
+        const source_rel = if (entry.source_rel.len == 0) entry.rel else entry.source_rel;
+        const parent_rel = std.fs.path.dirname(source_rel) orelse "";
+        const basename = std.fs.path.basename(source_rel);
         var parent = openContextDir(io, context_root, parent_rel) catch |err| switch (err) {
             error.FileNotFound, error.NotDir, error.SymLinkLoop => return error.BuildContextChangedDuringSnapshot,
             else => |e| return e,
@@ -582,8 +596,8 @@ fn resolveCopyEntries(
                 const digest = if (captured) |value|
                     value.digest
                 else
-                    try contentDigestForFile(allocator, io, context, entry.rel, file, stat, options);
-                if (captured != null) try updateStatCache(allocator, context, entry.rel, stat, digest, options.stat_cache);
+                    try contentDigestForFile(allocator, io, context, source_rel, file, stat, options);
+                if (captured != null) try updateStatCache(allocator, context, source_rel, stat, digest, options.stat_cache);
                 try out.append(.{
                     .rel = entry.rel,
                     .kind = entry.kind,
@@ -652,7 +666,8 @@ pub fn hashResolvedCopyEntries(
         switch (entry.kind) {
             .file => hashField(&h, entry.content_digest),
             .directory => hashField(&h, ""),
-            // Docker COPY preserves symlinks without following them, including targets outside the context.
+            // Symlinks discovered inside a copied directory are preserved.
+            // A symlink selected as the source root is dereferenced earlier.
             .sym_link => hashField(&h, entry.symlink_target),
             else => return error.UnsupportedCopySourceType,
         }
@@ -754,39 +769,65 @@ fn appendSourceMatches(
     entries: *std.array_list.Managed(CopyEntry),
     roots: *std.array_list.Managed(CopyRoot),
 ) !void {
-    try validateRelative(raw_source);
-    const source = trimTrailingSlashes(raw_source);
-    if (std.mem.indexOfAny(u8, source, "?[]") != null or std.mem.indexOf(u8, source, "**") != null) {
-        return error.UnsupportedCopyGlob;
-    }
-    if (std.mem.indexOfScalar(u8, source, '*')) |star| {
-        const slash = std.mem.lastIndexOfScalar(u8, source[0..star], '/') orelse 0;
-        const parent_rel = if (slash == 0 and source[0] != '/') "" else source[0..slash];
-        const pattern = source[(if (slash == 0) 0 else slash + 1)..];
-        var dir = try openContextDir(io, context_root, parent_rel);
+    const source = try cleanCopySource(allocator, raw_source);
+    if (path_pattern.hasCopyMeta(source)) {
+        const pattern = path_pattern.Pattern.compile(allocator, source, .copy) catch return error.UnsupportedCopyGlob;
+        var dir = try openContextDir(io, context_root, "");
         defer dir.close(io);
-        var matched = false;
-        var it = dir.iterate();
-        while (try it.next(io)) |child| {
-            if (!starMatch(pattern, child.name)) continue;
-            const rel = if (parent_rel.len == 0) try allocator.dupe(u8, child.name) else try std.fs.path.join(allocator, &.{ parent_rel, child.name });
-            try appendPathAt(allocator, io, context, dir, child.name, rel, entries, roots, true);
-            matched = true;
-        }
-        if (!matched) return error.CopySourceNotFound;
+        if (!try appendWildcardMatches(allocator, io, context, dir, "", pattern, entries, roots)) return error.CopySourceNotFound;
         return;
     }
     const parent_rel = std.fs.path.dirname(source) orelse "";
     const basename = std.fs.path.basename(source);
     var parent = try openContextDir(io, context_root, parent_rel);
     defer parent.close(io);
-    try appendPathAt(allocator, io, context, parent, basename, source, entries, roots, true);
+    if (!try appendPathAt(allocator, io, context, parent, basename, source, source, entries, roots, true)) return error.CopySourceNotFound;
 }
 
-fn trimTrailingSlashes(path: []const u8) []const u8 {
-    var end = path.len;
-    while (end > 1 and path[end - 1] == '/') end -= 1;
-    return path[0..end];
+fn appendWildcardMatches(
+    allocator: std.mem.Allocator,
+    io: Io,
+    context: BuildContext,
+    dir: Io.Dir,
+    parent_rel: []const u8,
+    pattern: path_pattern.Pattern,
+    entries: *std.array_list.Managed(CopyEntry),
+    roots: *std.array_list.Managed(CopyRoot),
+) !bool {
+    var children = std.array_list.Managed([]const u8).init(allocator);
+    var it = dir.iterate();
+    while (try it.next(io)) |child| try children.append(try allocator.dupe(u8, child.name));
+    std.mem.sort([]const u8, children.items, {}, stringLessThan);
+
+    var matched = false;
+    for (children.items) |child| {
+        const rel = if (parent_rel.len == 0)
+            try allocator.dupe(u8, child)
+        else
+            try std.fs.path.join(allocator, &.{ parent_rel, child });
+        const stat = try dir.statFile(io, child, .{ .follow_symlinks = false });
+        if (pattern.matches(rel)) {
+            matched = (try appendPathAt(allocator, io, context, dir, child, rel, rel, entries, roots, true)) or matched;
+            continue;
+        }
+        if (!pattern.couldMatchDescendant(rel)) continue;
+        switch (stat.kind) {
+            .directory => {
+                if (ignored(context, rel) and !couldIncludeDescendant(context, rel)) continue;
+                {
+                    var child_dir = dir.openDir(io, child, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+                        error.SymLinkLoop => return error.CopySourceEscapesContext,
+                        else => |e| return e,
+                    };
+                    defer child_dir.close(io);
+                    matched = (try appendWildcardMatches(allocator, io, context, child_dir, rel, pattern, entries, roots)) or matched;
+                }
+            },
+            .sym_link => if (pattern.requiresLiteralDirectory(rel)) return error.CopySourceEscapesContext,
+            else => {},
+        }
+    }
+    return matched;
 }
 
 fn openContextDir(io: Io, context_root: Io.Dir, rel: []const u8) !Io.Dir {
@@ -813,19 +854,38 @@ fn appendPathAt(
     context: BuildContext,
     parent: Io.Dir,
     basename: []const u8,
-    rel: []const u8,
+    source_rel: []const u8,
+    output_rel: []const u8,
     entries: *std.array_list.Managed(CopyEntry),
     roots: *std.array_list.Managed(CopyRoot),
     source_root: bool,
-) !void {
-    if (ignored(context, rel, false)) return;
+) anyerror!bool {
     const stat = try parent.statFile(io, basename, .{ .follow_symlinks = false });
-    if (source_root) try roots.append(.{ .rel = try allocator.dupe(u8, rel), .kind = stat.kind });
-    switch (stat.kind) {
-        .file, .sym_link => try entries.append(.{ .rel = try allocator.dupe(u8, rel), .kind = stat.kind }),
-        .directory => {
-            if (ignored(context, rel, true)) return;
-            try entries.append(.{ .rel = try allocator.dupe(u8, rel), .kind = .directory });
+    if (source_root and stat.kind == .sym_link) {
+        if (ignored(context, output_rel)) return false;
+        const included = try appendDereferencedSourceSymlink(allocator, io, context, source_rel, output_rel, entries, roots);
+        const after = try parent.statFile(io, basename, .{ .follow_symlinks = false });
+        if (!sameFileStat(stat, after)) return error.BuildContextChangedDuringSnapshot;
+        return included;
+    }
+    const is_ignored = ignored(context, source_rel);
+    const included = switch (stat.kind) {
+        .file, .sym_link => blk: {
+            if (is_ignored) break :blk false;
+            try entries.append(.{
+                .rel = try allocator.dupe(u8, output_rel),
+                .source_rel = if (std.mem.eql(u8, source_rel, output_rel)) "" else try allocator.dupe(u8, source_rel),
+                .kind = stat.kind,
+            });
+            break :blk true;
+        },
+        .directory => blk: {
+            if (is_ignored and !couldIncludeDescendant(context, source_rel)) break :blk false;
+            if (!is_ignored) try entries.append(.{
+                .rel = try allocator.dupe(u8, output_rel),
+                .source_rel = if (std.mem.eql(u8, source_rel, output_rel)) "" else try allocator.dupe(u8, source_rel),
+                .kind = .directory,
+            });
             var dir = parent.openDir(io, basename, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
                 error.SymLinkLoop => return error.CopySourceEscapesContext,
                 else => |e| return e,
@@ -835,58 +895,103 @@ fn appendPathAt(
             var it = dir.iterate();
             while (try it.next(io)) |child| try children.append(try allocator.dupe(u8, child.name));
             std.mem.sort([]const u8, children.items, {}, stringLessThan);
+            var child_included = false;
             for (children.items) |child| {
-                const child_rel = if (std.mem.eql(u8, rel, "."))
+                const child_source_rel = if (std.mem.eql(u8, source_rel, "."))
                     try allocator.dupe(u8, child)
                 else
-                    try std.fs.path.join(allocator, &.{ rel, child });
-                try appendPathAt(allocator, io, context, dir, child, child_rel, entries, roots, false);
+                    try std.fs.path.join(allocator, &.{ source_rel, child });
+                const child_output_rel = if (std.mem.eql(u8, output_rel, "."))
+                    try allocator.dupe(u8, child)
+                else
+                    try std.fs.path.join(allocator, &.{ output_rel, child });
+                child_included = (try appendPathAt(allocator, io, context, dir, child, child_source_rel, child_output_rel, entries, roots, false)) or child_included;
             }
+            if (is_ignored and child_included) try entries.append(.{
+                .rel = try allocator.dupe(u8, output_rel),
+                .source_rel = if (std.mem.eql(u8, source_rel, output_rel)) "" else try allocator.dupe(u8, source_rel),
+                .kind = .directory,
+            });
+            break :blk !is_ignored or child_included;
         },
         else => return error.UnsupportedCopySourceType,
-    }
+    };
+    if (included and source_root) try roots.append(.{ .rel = try allocator.dupe(u8, output_rel), .kind = stat.kind });
+    return included;
 }
 
-fn ignored(context: BuildContext, rel: []const u8, is_dir: bool) bool {
+fn appendDereferencedSourceSymlink(
+    allocator: std.mem.Allocator,
+    io: Io,
+    context: BuildContext,
+    source_rel: []const u8,
+    output_rel: []const u8,
+    entries: *std.array_list.Managed(CopyEntry),
+    roots: *std.array_list.Managed(CopyRoot),
+) !bool {
+    const target_rel = try resolveContextSymlinkTarget(allocator, context, source_rel);
+    const parent_rel = std.fs.path.dirname(target_rel) orelse "";
+    const basename = std.fs.path.basename(target_rel);
+    var context_root = Io.Dir.cwd().openDir(io, context.absolute_root, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        error.SymLinkLoop => return error.CopySourceEscapesContext,
+        else => |e| return e,
+    };
+    defer context_root.close(io);
+    var parent = try openContextDir(io, context_root, parent_rel);
+    defer parent.close(io);
+    const target_stat = try parent.statFile(io, basename, .{ .follow_symlinks = false });
+    const included = try appendPathAt(allocator, io, context, parent, basename, target_rel, output_rel, entries, roots, false);
+    const target_after = try parent.statFile(io, basename, .{ .follow_symlinks = false });
+    if (!sameFileStat(target_stat, target_after)) return error.BuildContextChangedDuringSnapshot;
+    if (included) try roots.append(.{ .rel = try allocator.dupe(u8, output_rel), .kind = target_stat.kind });
+    return included;
+}
+
+fn resolveContextSymlinkTarget(allocator: std.mem.Allocator, context: BuildContext, source_rel: []const u8) ![]const u8 {
+    const source = try std.fs.path.join(allocator, &.{ context.absolute_root, source_rel });
+    defer allocator.free(source);
+    const resolved = realpathAlloc(allocator, source) catch return error.CopySourceEscapesContext;
+    defer allocator.free(resolved);
+    if (std.mem.eql(u8, resolved, context.absolute_root)) return allocator.dupe(u8, ".");
+    if (!std.mem.startsWith(u8, resolved, context.absolute_root) or
+        resolved.len <= context.absolute_root.len or
+        resolved[context.absolute_root.len] != std.fs.path.sep)
+    {
+        return error.CopySourceEscapesContext;
+    }
+    return allocator.dupe(u8, resolved[context.absolute_root.len + 1 ..]);
+}
+
+fn ignored(context: BuildContext, rel: []const u8) bool {
     var result = false;
     for (context.rules) |rule| {
-        if (rule.directory_only and !is_dir and !pathUnderDirectoryPattern(rule.pattern, rel)) continue;
-        if (ignoreRuleMatches(rule, rel, is_dir)) result = !rule.negated;
+        if (rule.negated != result) continue;
+        if (rule.pattern.matchesOrParent(rel)) result = !rule.negated;
     }
     return result;
 }
 
-fn ignoreRuleMatches(rule: IgnoreRule, rel: []const u8, is_dir: bool) bool {
-    _ = is_dir;
-    if (rule.anchored or std.mem.indexOfScalar(u8, rule.pattern, '/') != null) {
-        if (starMatch(rule.pattern, rel)) return true;
-        return rule.directory_only and std.mem.startsWith(u8, rel, rule.pattern) and rel.len > rule.pattern.len and rel[rule.pattern.len] == '/';
+fn couldIncludeDescendant(context: BuildContext, rel: []const u8) bool {
+    if (!context.has_negations) return false;
+    for (context.rules) |rule| {
+        if (!rule.negated) continue;
+        if (rule.pattern.matchesOrParent(rel) or rule.pattern.couldMatchDescendant(rel)) return true;
     }
-    var it = std.mem.splitScalar(u8, rel, '/');
-    while (it.next()) |component| if (starMatch(rule.pattern, component)) return true;
     return false;
 }
 
-fn pathUnderDirectoryPattern(pattern: []const u8, rel: []const u8) bool {
-    if (!std.mem.startsWith(u8, rel, pattern)) return false;
-    return rel.len > pattern.len and rel[pattern.len] == '/';
-}
-
-fn validateRelative(path: []const u8) !void {
-    if (path.len == 0) return error.BadCopySource;
-    if (std.fs.path.isAbsolute(path)) return error.CopySourceEscapesContext;
-    var it = std.mem.splitScalar(u8, path, '/');
+fn cleanCopySource(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    if (raw.len == 0) return error.BadCopySource;
+    if (std.fs.path.isAbsolute(raw)) return error.CopySourceEscapesContext;
+    var components = std.array_list.Managed([]const u8).init(allocator);
+    var it = std.mem.splitScalar(u8, raw, '/');
     while (it.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
         if (std.mem.eql(u8, part, "..")) return error.CopySourceEscapesContext;
+        try components.append(part);
     }
-}
-
-fn starMatch(pattern: []const u8, value: []const u8) bool {
-    const star = std.mem.indexOfScalar(u8, pattern, '*') orelse return std.mem.eql(u8, pattern, value);
-    const prefix = pattern[0..star];
-    const suffix = pattern[star + 1 ..];
-    return std.mem.startsWith(u8, value, prefix) and std.mem.endsWith(u8, value, suffix) and value.len >= prefix.len + suffix.len;
+    if (components.items.len == 0) return allocator.dupe(u8, ".");
+    return std.mem.join(allocator, "/", components.items);
 }
 
 fn entryLessThan(_: void, a: CopyEntry, b: CopyEntry) bool {
@@ -1004,10 +1109,14 @@ test "COPY source resolution rejects intermediate symlinks" {
     const context_root = root ++ "/context";
     defer Io.Dir.cwd().deleteTree(io, root) catch {};
     try Io.Dir.cwd().createDirPath(io, context_root ++ "/safe");
+    try Io.Dir.cwd().createDirPath(io, context_root ++ "/src");
     try Io.Dir.cwd().createDirPath(io, root ++ "/outside");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/outside/secret.txt", .data = "secret" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/safe/inside.txt", .data = "inside" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/src/visible.txt", .data = "visible" });
     try Io.Dir.cwd().symLink(io, "../../outside", context_root ++ "/safe/leak", .{});
     try Io.Dir.cwd().symLink(io, "../outside", context_root ++ "/packages", .{});
+    try Io.Dir.cwd().symLink(io, "../outside", context_root ++ "/unrelated", .{});
 
     var diag: IgnoreDiagnostic = .{};
     const ctx = try load(arena, io, context_root, &diag);
@@ -1023,9 +1132,12 @@ test "COPY source resolution rejects intermediate symlinks" {
         error.CopySourceEscapesContext,
         resolveCopySources(arena, io, ctx, &.{"packages/*.txt"}),
     );
+    const broad = try resolveCopySources(arena, io, ctx, &.{"**/*.txt"});
+    try std.testing.expect(copyResolutionContains(broad, "safe/inside.txt"));
+    try std.testing.expect(copyResolutionContains(broad, "src/visible.txt"));
 }
 
-test "COPY source resolution preserves a final symlink outside the context" {
+test "COPY source resolution rejects a selected symlink outside the context" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1041,13 +1153,34 @@ test "COPY source resolution preserves a final symlink outside the context" {
 
     var diag: IgnoreDiagnostic = .{};
     const ctx = try load(arena, io, context_root, &diag);
-    const resolution = try resolveCopySources(arena, io, ctx, &.{"payload"});
+    try std.testing.expectError(error.CopySourceEscapesContext, resolveCopySources(arena, io, ctx, &.{"payload"}));
+}
+
+test "COPY dereferences a selected symlink within the context" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-selected-symlink";
+    const context_root = root ++ "/context";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, context_root ++ "/files");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/files/plain.txt", .data = "plain\n" });
+    try Io.Dir.cwd().setFilePermissions(io, context_root ++ "/files/plain.txt", @enumFromInt(0o640), .{ .follow_symlinks = false });
+    try Io.Dir.cwd().symLink(io, "files/plain.txt", context_root ++ "/plain-link", .{});
+
+    var diag: IgnoreDiagnostic = .{};
+    const ctx = try load(arena, io, context_root, &diag);
+    const resolution = try resolveCopySources(arena, io, ctx, &.{"plain-link"});
     try std.testing.expectEqual(@as(usize, 1), resolution.entries.len);
-    try std.testing.expectEqual(Io.File.Kind.sym_link, resolution.entries[0].kind);
-    try std.testing.expectEqual(@as(usize, 1), resolution.roots.len);
-    try std.testing.expectEqual(Io.File.Kind.sym_link, resolution.roots[0].kind);
+    try std.testing.expectEqualStrings("plain-link", resolution.entries[0].rel);
+    try std.testing.expectEqualStrings("files/plain.txt", resolution.entries[0].source_rel);
+    try std.testing.expectEqual(Io.File.Kind.file, resolution.entries[0].kind);
+    try std.testing.expectEqual(Io.File.Kind.file, resolution.roots[0].kind);
     const entries = try describeCopyResolutionWithOptions(arena, io, ctx, resolution, .{});
-    try std.testing.expectEqualStrings("../outside/secret.txt", entries[0].symlink_target);
+    try std.testing.expectEqual(@as(u32, 0o640), entries[0].mode);
+    try std.testing.expect(std.mem.startsWith(u8, entries[0].content_digest, "blake3:"));
 }
 
 test "COPY snapshot pins file bytes and symlink targets" {
@@ -1060,16 +1193,17 @@ test "COPY snapshot pins file bytes and symlink targets" {
     const context_root = root ++ "/context";
     const cache_root = root ++ "/cache";
     const file_path = context_root ++ "/payload.txt";
-    const link_path = context_root ++ "/link";
+    const link_path = context_root ++ "/tree/link";
     defer Io.Dir.cwd().deleteTree(io, root) catch {};
     try Io.Dir.cwd().createDirPath(io, context_root);
+    try Io.Dir.cwd().createDirPath(io, context_root ++ "/tree");
     try Io.Dir.cwd().createDirPath(io, cache_root);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = "alpha" });
     try Io.Dir.cwd().symLink(io, "target-a", link_path, .{});
 
     var diag: IgnoreDiagnostic = .{};
     const ctx = try load(arena, io, context_root, &diag);
-    const resolution = try resolveCopySources(arena, io, ctx, &.{ "payload.txt", "link" });
+    const resolution = try resolveCopySources(arena, io, ctx, &.{ "payload.txt", "tree" });
     var snapshot = try CopySnapshot.init(arena, io, cache_root);
     defer snapshot.deinit(io);
     const captured = try captureCopyResolutionWithOptions(arena, io, ctx, resolution, .{}, &snapshot);
@@ -1083,7 +1217,7 @@ test "COPY snapshot pins file bytes and symlink targets" {
     var captured_link: ?CopyResolvedEntry = null;
     for (captured) |entry| {
         if (std.mem.eql(u8, entry.rel, "payload.txt")) captured_file = entry;
-        if (std.mem.eql(u8, entry.rel, "link")) captured_link = entry;
+        if (std.mem.eql(u8, entry.rel, "tree/link")) captured_link = entry;
     }
     var snapshot_file = try Io.Dir.cwd().openFile(io, captured_file.?.snapshot_path, .{ .mode = .read_only });
     defer snapshot_file.close(io);
@@ -1092,7 +1226,7 @@ test "COPY snapshot pins file bytes and symlink targets" {
     try std.testing.expectEqualStrings("alpha", &bytes);
     try std.testing.expectEqualStrings("target-a", captured_link.?.symlink_target);
 
-    const fresh_resolution = try resolveCopySources(arena, io, ctx, &.{ "payload.txt", "link" });
+    const fresh_resolution = try resolveCopySources(arena, io, ctx, &.{ "payload.txt", "tree" });
     var fresh_snapshot = try CopySnapshot.init(arena, io, cache_root);
     defer fresh_snapshot.deinit(io);
     const fresh = try captureCopyResolutionWithOptions(arena, io, ctx, fresh_resolution, .{}, &fresh_snapshot);
@@ -1134,13 +1268,105 @@ test "COPY snapshot rejects an intermediate symlink swap" {
     );
 }
 
-test "dockerignore rejects question-mark patterns" {
+test "dockerignore rejects an empty negation" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var diag: IgnoreDiagnostic = .{};
-    try std.testing.expectError(error.UnsupportedDockerignorePattern, parseDockerignore(arena_state.allocator(), "file?.txt\n", &diag));
-    try std.testing.expectEqualStrings("unsupported .dockerignore pattern", diag.message);
+    try std.testing.expectError(error.UnsupportedDockerignorePattern, parseDockerignore(arena_state.allocator(), "!\n", &diag));
+    try std.testing.expectEqualStrings("empty .dockerignore negation", diag.message);
     try std.testing.expectEqual(@as(usize, 1), diag.line);
+}
+
+test "COPY source resolution supports filepath globs across components" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-copy-globs";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root ++ "/src/one");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/src/two/deep");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/babel.config.js", .data = "js" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/relay.config.mjs", .data = "mjs" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/plain.js", .data = "plain" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/literal*star", .data = "escaped" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/src/one/main.c", .data = "c" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/src/two/main.h", .data = "h" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/src/two/deep/main.c", .data = "deep" });
+
+    var diag: IgnoreDiagnostic = .{};
+    const ctx = try load(arena, io, root, &diag);
+    const configs = try resolveCopySources(arena, io, ctx, &.{"*.config.*"});
+    try std.testing.expectEqual(@as(usize, 2), configs.roots.len);
+    try std.testing.expect(copyResolutionContains(configs, "babel.config.js"));
+    try std.testing.expect(copyResolutionContains(configs, "relay.config.mjs"));
+    try std.testing.expect(!copyResolutionContains(configs, "plain.js"));
+
+    const dot_prefixed = try resolveCopySources(arena, io, ctx, &.{ "./babel.config.js", "./*.config.*" });
+    try std.testing.expectEqual(@as(usize, 2), dot_prefixed.roots.len);
+    try std.testing.expect(copyResolutionContains(dot_prefixed, "babel.config.js"));
+    try std.testing.expect(copyResolutionContains(dot_prefixed, "relay.config.mjs"));
+    for (dot_prefixed.entries) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.rel, "./"));
+
+    const nested = try resolveCopySources(arena, io, ctx, &.{"./src//*/./main.[ch]"});
+    try std.testing.expectEqual(@as(usize, 2), nested.roots.len);
+    try std.testing.expect(copyResolutionContains(nested, "src/one/main.c"));
+    try std.testing.expect(copyResolutionContains(nested, "src/two/main.h"));
+    try std.testing.expect(!copyResolutionContains(nested, "src/two/deep/main.c"));
+
+    const class_separator = try resolveCopySources(arena, io, ctx, &.{"src[/]one/main.c"});
+    try std.testing.expectEqual(@as(usize, 1), class_separator.roots.len);
+    try std.testing.expect(copyResolutionContains(class_separator, "src/one/main.c"));
+
+    const escaped = try resolveCopySources(arena, io, ctx, &.{"literal\\*star"});
+    try std.testing.expectEqual(@as(usize, 1), escaped.roots.len);
+    try std.testing.expect(copyResolutionContains(escaped, "literal*star"));
+}
+
+test "dockerignore supports normalization globstars and excluded-parent reinclusion" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-dockerignore-modern";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root ++ "/build/keep");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/vendor");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/build/drop.txt", .data = "drop" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/build/keep/ok.txt", .data = "keep" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/vendor/dependency", .data = "ignored" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/a.tmp", .data = "ignored" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/aa.tmp", .data = "kept" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/a.log", .data = "ignored" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/c.log", .data = "kept" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/#literal", .data = "ignored" });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = root ++ "/.dockerignore",
+        .data = "\xef\xbb\xbf# BOM comment\nbuild\n!build/keep/**\n?.tmp\n[ab].log\n/vendor/./\n #literal\n",
+    });
+
+    var diag: IgnoreDiagnostic = .{};
+    const ctx = try load(arena, io, root, &diag);
+    const resolution = try resolveCopySources(arena, io, ctx, &.{"."});
+    try std.testing.expect(copyResolutionContains(resolution, "build"));
+    try std.testing.expect(copyResolutionContains(resolution, "build/keep"));
+    try std.testing.expect(copyResolutionContains(resolution, "build/keep/ok.txt"));
+    try std.testing.expect(!copyResolutionContains(resolution, "build/drop.txt"));
+    try std.testing.expect(!copyResolutionContains(resolution, "vendor"));
+    try std.testing.expect(!copyResolutionContains(resolution, "a.tmp"));
+    try std.testing.expect(copyResolutionContains(resolution, "aa.tmp"));
+    try std.testing.expect(!copyResolutionContains(resolution, "a.log"));
+    try std.testing.expect(copyResolutionContains(resolution, "c.log"));
+    try std.testing.expect(!copyResolutionContains(resolution, "#literal"));
+}
+
+fn copyResolutionContains(resolution: CopyResolution, rel: []const u8) bool {
+    for (resolution.entries) |entry| {
+        if (std.mem.eql(u8, entry.rel, rel)) return true;
+    }
+    return false;
 }
 
 test "context hashing frames fields so payload NULs cannot alias records" {
@@ -1243,6 +1469,62 @@ test "context stat cache preserves cold hash identity and warms hits" {
     try std.testing.expectEqualStrings(cold, warm);
     try std.testing.expect(warm_diag.stat_cache_hits >= 2);
     try std.testing.expectEqual(@as(u64, 0), warm_diag.bytes_hashed);
+}
+
+test "stat cache allocation failures never publish a dangling index" {
+    const digest = "blake3:0000000000000000000000000000000000000000000000000000000000000000";
+    const loaded = StatCacheRecord{
+        .path = "input.txt",
+        .size = 7,
+        .mtime_ns = 11,
+        .ctime_ns = 13,
+        .inode = 17,
+        .digest = digest,
+    };
+    const stat = std.mem.zeroes(Io.File.Stat);
+
+    for (0..16) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+        var cache = StatCache{
+            .allocator = allocator,
+            .io = std.testing.io,
+            .path = "",
+            .records = std.array_list.Managed(StatCacheRecord).init(allocator),
+            .now_ns = 19,
+        };
+        defer deinitTestStatCache(&cache);
+        _ = cache.putLoaded(loaded) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        };
+        try std.testing.expectEqual(cache.records.items.len, cache.index.count());
+    }
+
+    for (0..16) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+        var cache = StatCache{
+            .allocator = allocator,
+            .io = std.testing.io,
+            .path = "",
+            .records = std.array_list.Managed(StatCacheRecord).init(allocator),
+            .now_ns = 19,
+        };
+        defer deinitTestStatCache(&cache);
+        cache.put("input.txt", stat, digest);
+        try std.testing.expectEqual(cache.records.items.len, cache.index.count());
+    }
+}
+
+fn deinitTestStatCache(cache: *StatCache) void {
+    var keys = cache.index.keyIterator();
+    while (keys.next()) |key| cache.allocator.free(key.*);
+    cache.index.deinit(cache.allocator);
+    for (cache.records.items) |record| {
+        cache.allocator.free(record.path);
+        cache.allocator.free(record.digest);
+    }
+    cache.records.deinit();
 }
 
 test "context stat cache invalidates same-size rewrites with restored mtime" {

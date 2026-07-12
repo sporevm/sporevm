@@ -2,7 +2,10 @@ const std = @import("std");
 const Io = std.Io;
 
 const build_mod = @import("build.zig");
+const memory_config = @import("memory.zig");
 const rootfs_mod = @import("rootfs.zig");
+const run_mod = @import("run.zig");
+const topology = @import("topology.zig");
 
 pub const usage =
     \\Usage:
@@ -12,6 +15,7 @@ pub const usage =
     \\  -t, --tag REF                  Local image ref to update, for example local/app:dev
     \\  -f, --file PATH                Dockerfile path, defaults to CONTEXT/Dockerfile
     \\  --platform OS/ARCH             Target platform, currently linux/arm64
+    \\  --target STAGE                 Build and publish the named stage
     \\  --build-context NAME=oci-layout://PATH
     \\                                  Named OCI layout base available to FROM NAME
     \\  --build-arg KEY=VALUE          Build argument value
@@ -30,16 +34,23 @@ const ParsedOptions = struct {
     context_dir: ?[]const u8 = null,
     dockerfile_path: ?[]const u8 = null,
     platform: rootfs_mod.Platform = .{},
+    target: ?[]const u8 = null,
     build_contexts: std.array_list.Managed(build_mod.BuildContextArg),
     build_args: std.array_list.Managed(build_mod.BuildArg),
     network: build_mod.NetworkMode = .spore,
     no_cache: bool = false,
+    memory: memory_config.Config = build_mod.default_build_memory,
+    vcpus: topology.VcpuCount = build_mod.default_build_vcpus,
+    timeout_ms: u64 = build_mod.default_step_timeout_ms,
+    nofile: build_mod.NofileLimit = build_mod.default_build_nofile,
     mkfs: ?[]const u8 = null,
     debugfs: ?[]const u8 = null,
 };
 
 pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer) !void {
     const allocator = init.arena.allocator();
+    const full_args = try init.minimal.args.toSlice(allocator);
+    const spore_executable = full_args[0];
     if (wantsHelp(args)) {
         try stdout.writeAll(usage);
         return;
@@ -73,10 +84,16 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
         .context_dir = context_dir,
         .dockerfile_path = dockerfile_path,
         .platform = parsed.platform,
+        .target = parsed.target,
         .build_contexts = parsed.build_contexts.items,
         .build_args = parsed.build_args.items,
         .network = parsed.network,
         .no_cache = parsed.no_cache,
+        .memory = parsed.memory,
+        .vcpus = parsed.vcpus,
+        .timeout_ms = parsed.timeout_ms,
+        .nofile = parsed.nofile,
+        .spore_executable = spore_executable,
         .mkfs = parsed.mkfs,
         .debugfs = parsed.debugfs,
         .output = stdout,
@@ -100,6 +117,14 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
     else
         "metadata-only";
     try stdout.print("  Cache: {s}\n", .{cache_status});
+    try stdout.print(
+        "  Executor: executed_steps={d} boot_count={d} resize_count={d}\n",
+        .{
+            diagnostic.executor.executed_steps,
+            diagnostic.executor.boot_count,
+            diagnostic.executor.resize_count,
+        },
+    );
     if (diagnostic.context_hash.entries != 0) {
         try stdout.print(
             "  Context: entries={d} files={d} hashed={d} bytes stat-cache={d} hits/{d} misses stat={d}ms hash={d}ms cache-load={d}ms cache-save={d}ms\n",
@@ -159,6 +184,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedOpti
             parsed.platform = try rootfs_mod.Platform.parse(try nextValue(args, &i, arg));
         } else if (std.mem.startsWith(u8, arg, "--platform=")) {
             parsed.platform = try rootfs_mod.Platform.parse(try nonEmptyValue(arg["--platform=".len..]));
+        } else if (std.mem.eql(u8, arg, "--target")) {
+            parsed.target = try nextValue(args, &i, arg);
+        } else if (std.mem.startsWith(u8, arg, "--target=")) {
+            parsed.target = try nonEmptyValue(arg["--target=".len..]);
         } else if (std.mem.eql(u8, arg, "--build-context")) {
             try parsed.build_contexts.append(try parseBuildContext(try nextValue(args, &i, arg)));
         } else if (std.mem.startsWith(u8, arg, "--build-context=")) {
@@ -173,6 +202,22 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedOpti
             parsed.network = try parseNetwork(try nonEmptyValue(arg["--network=".len..]));
         } else if (std.mem.eql(u8, arg, "--no-cache")) {
             parsed.no_cache = true;
+        } else if (std.mem.eql(u8, arg, "--memory")) {
+            parsed.memory = parseMemory(try nextValue(args, &i, arg)) catch return error.BadMemory;
+        } else if (std.mem.startsWith(u8, arg, "--memory=")) {
+            parsed.memory = parseMemory(try nonEmptyValue(arg["--memory=".len..])) catch return error.BadMemory;
+        } else if (std.mem.eql(u8, arg, "--vcpus")) {
+            parsed.vcpus = topology.parseVcpuCount(try nextValue(args, &i, arg)) catch return error.BadVcpus;
+        } else if (std.mem.startsWith(u8, arg, "--vcpus=")) {
+            parsed.vcpus = topology.parseVcpuCount(try nonEmptyValue(arg["--vcpus=".len..])) catch return error.BadVcpus;
+        } else if (std.mem.eql(u8, arg, "--timeout")) {
+            parsed.timeout_ms = run_mod.parseDurationMs(try nextValue(args, &i, arg)) catch return error.BadTimeout;
+        } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
+            parsed.timeout_ms = run_mod.parseDurationMs(try nonEmptyValue(arg["--timeout=".len..])) catch return error.BadTimeout;
+        } else if (std.mem.eql(u8, arg, "--ulimit")) {
+            parsed.nofile = try parseUlimit(try nextValue(args, &i, arg));
+        } else if (std.mem.startsWith(u8, arg, "--ulimit=")) {
+            parsed.nofile = try parseUlimit(try nonEmptyValue(arg["--ulimit=".len..]));
         } else if (std.mem.eql(u8, arg, "--mkfs")) {
             parsed.mkfs = try nextValue(args, &i, arg);
         } else if (std.mem.startsWith(u8, arg, "--mkfs=")) {
@@ -228,6 +273,27 @@ fn parseNetwork(raw: []const u8) !build_mod.NetworkMode {
     return error.BadNetworkMode;
 }
 
+fn parseMemory(raw: []const u8) !memory_config.Config {
+    return memory_config.parse(raw);
+}
+
+fn parseUlimit(raw: []const u8) !build_mod.NofileLimit {
+    const prefix = "nofile=";
+    if (!std.mem.startsWith(u8, raw, prefix)) return error.BadUlimit;
+    const value = raw[prefix.len..];
+    if (value.len == 0) return error.BadUlimit;
+    const colon = std.mem.indexOfScalar(u8, value, ':');
+    const soft_raw = if (colon) |index| value[0..index] else value;
+    const hard_raw = if (colon) |index| value[index + 1 ..] else value;
+    if (soft_raw.len == 0 or hard_raw.len == 0 or (colon != null and std.mem.indexOfScalar(u8, hard_raw, ':') != null)) return error.BadUlimit;
+    const limit = build_mod.NofileLimit{
+        .soft = std.fmt.parseInt(u64, soft_raw, 10) catch return error.BadUlimit,
+        .hard = std.fmt.parseInt(u64, hard_raw, 10) catch return error.BadUlimit,
+    };
+    limit.validate() catch return error.BadUlimit;
+    return limit;
+}
+
 fn validName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name, 0..) |c, i| {
@@ -252,6 +318,10 @@ fn writeParseError(stderr: *Io.Writer, err: anyerror) !void {
         error.BadBuildContext => "spore build: --build-context must be NAME=oci-layout://PATH",
         error.BadBuildArg => "spore build: --build-arg must be KEY=VALUE",
         error.BadNetworkMode => "spore build: --network must be spore or none",
+        error.BadMemory => "spore build: --memory must be a positive page-aligned size like 512mb or 16gb",
+        error.BadVcpus => "spore build: --vcpus must be an integer from 1 through 8",
+        error.BadTimeout => "spore build: --timeout must be a positive duration like 30s, 5m, or 500ms",
+        error.BadUlimit => "spore build: --ulimit currently accepts only nofile=SOFT:HARD up to 1048576",
         error.BadPlatform, error.UnsupportedPlatform => "spore build: --platform must be linux/arm64",
         else => "spore build: invalid arguments",
     };
@@ -260,9 +330,13 @@ fn writeParseError(stderr: *Io.Writer, err: anyerror) !void {
 
 fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diagnostic) !void {
     switch (err) {
-        error.DockerfileParseFailed => {
+        error.DockerfileParseFailed, error.DockerfilePlanFailed => {
             if (diagnostic.dockerfile.message.len != 0) {
-                try stderr.print("spore build: Dockerfile line {d}: {s}\n", .{ diagnostic.dockerfile.line, diagnostic.dockerfile.message });
+                if (diagnostic.dockerfile.line != 0) {
+                    try stderr.print("spore build: Dockerfile line {d}: {s}\n", .{ diagnostic.dockerfile.line, diagnostic.dockerfile.message });
+                } else {
+                    try stderr.print("spore build: {s}\n", .{diagnostic.dockerfile.message});
+                }
             } else {
                 try stderr.writeAll("spore build: unsupported Dockerfile syntax\n");
             }
@@ -340,10 +414,10 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
             try stderr.writeAll("spore build: WORKDIR is too long for the guest executor\n");
         },
         error.UnsupportedBuildFrom => {
-            try stderr.writeAll("spore build: FROM must be a local image ref or a named --build-context OCI layout in M1\n");
+            try stderr.writeAll("spore build: FROM image reference is not supported\n");
         },
         error.UnsupportedMultiStageDockerfile => {
-            try stderr.writeAll("spore build: multi-stage Dockerfiles are not supported in this subset\n");
+            try stderr.writeAll("spore build: the planned multi-stage operation is not supported\n");
         },
         error.MissingDockerfileFrom => {
             try stderr.writeAll("spore build: Dockerfile must start from a supported FROM instruction\n");
@@ -368,7 +442,10 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
             try stderr.writeAll("spore build: COPY source changed while the build context was being read; retry the build\n");
         },
         error.UnsupportedCopyGlob => {
-            try stderr.writeAll("spore build: COPY only supports literal paths and single-component * globs\n");
+            try stderr.writeAll("spore build: COPY source pattern is malformed or exceeds the supported pattern bound\n");
+        },
+        error.UnsupportedCopyFromPattern => {
+            try stderr.writeAll("spore build: COPY --from currently requires literal source paths\n");
         },
         error.UnsupportedCopySourceType => {
             try stderr.writeAll("spore build: COPY source must be a regular file, directory, or symlink\n");
@@ -391,6 +468,22 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         },
         error.RootFSDigestCacheMiss => {
             try stderr.writeAll("spore build: cached rootfs storage is missing its completeness stamp\n");
+        },
+        error.TooManyBuildInputDisks => {
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print(
+                    "spore build: Dockerfile line {d}: a stage may copy from at most {d} distinct stage, named-context, or image inputs; this instruction requires input {d}\n",
+                    .{ diagnostic.instruction_line, diagnostic.limit, diagnostic.actual },
+                );
+            } else {
+                try stderr.writeAll("spore build: a stage may copy from at most two distinct stage, named-context, or image inputs\n");
+            }
+        },
+        error.UnsupportedBuildUser => {
+            try stderr.writeAll("spore build: executing RUN, COPY, or WORKDIR from a non-root inherited USER is not supported yet\n");
+        },
+        error.UnsupportedOnBuild => {
+            try stderr.writeAll("spore build: reachable base image contains unsupported ONBUILD triggers\n");
         },
         else => {
             try stderr.print("spore build: {s}\n", .{@errorName(err)});
@@ -440,4 +533,38 @@ test "build CLI parses M1 options" {
 
     try std.testing.expectError(error.UnknownArgument, parseArgs(allocator, &.{ "--disk-grow-target", "67108864", "." }));
     try std.testing.expectError(error.UnknownArgument, parseArgs(allocator, &.{ "--disk-grow-target=67108864", "." }));
+}
+
+test "build CLI bounds nofile ulimit" {
+    const one = try parseUlimit("nofile=4096");
+    try std.testing.expectEqual(@as(u64, 4096), one.soft);
+    try std.testing.expectEqual(@as(u64, 4096), one.hard);
+    try std.testing.expectError(error.BadUlimit, parseUlimit("core=1:1"));
+    try std.testing.expectError(error.BadUlimit, parseUlimit("nofile=2:1"));
+    try std.testing.expectError(error.BadUlimit, parseUlimit("nofile=1:1048577"));
+}
+
+test "build CLI reports the instruction that exceeds the stage input limit" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+    var diagnostic: build_mod.Diagnostic = .{};
+    diagnostic.instruction_line = 7;
+    diagnostic.limit = 2;
+    diagnostic.actual = 3;
+    try writeBuildError(&stderr.writer, error.TooManyBuildInputDisks, diagnostic);
+    try std.testing.expectEqualStrings(
+        "spore build: Dockerfile line 7: a stage may copy from at most 2 distinct stage, named-context, or image inputs; this instruction requires input 3\n",
+        stderr.written(),
+    );
+}
+
+test "build CLI reports an unknown target without a fake Dockerfile line" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+    var diagnostic: build_mod.Diagnostic = .{};
+    diagnostic.dockerfile.message = "unknown build target: missing";
+    try writeBuildError(&stderr.writer, error.DockerfilePlanFailed, diagnostic);
+    try std.testing.expectEqualStrings("spore build: unknown build target: missing\n", stderr.written());
 }

@@ -1,0 +1,9 @@
+{
+  "description": "unsupported exec-form RUN fails closed with an exact diagnostic",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: unsupported exec-form RUN"
+  },
+  "scan_prefixes": []
+}

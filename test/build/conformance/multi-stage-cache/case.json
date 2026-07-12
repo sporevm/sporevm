@@ -1,0 +1,46 @@
+{
+  "description": "one changed producer invalidates only its stage and the dependent runtime suffix",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 4,
+    "expect_boot_count": 3,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/runtime"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "one-source-edit",
+      "writes": {
+        "one.txt": "one-edited\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 3,
+      "expect_boot_count": 2,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-edit",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

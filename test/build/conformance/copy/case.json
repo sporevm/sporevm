@@ -1,0 +1,28 @@
+{
+  "description": "COPY preserves files, modes, symlinks, and empty directories",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 7,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle"
+  ],
+  "empty_dirs": [
+    "empty-dir"
+  ],
+  "symlinks": {
+    "links/plain-link": "../files/plain.txt"
+  },
+  "modes": {
+    "empty-dir": "0775",
+    "files": "0775",
+    "files/executable.sh": "0755",
+    "files/plain.txt": "0640"
+  }
+}

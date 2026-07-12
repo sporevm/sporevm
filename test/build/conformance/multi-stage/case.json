@@ -1,0 +1,58 @@
+{
+  "description": "two immutable source stages copy into a runtime with matching filesystem and config",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 7,
+    "expect_boot_count": 3,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/runtime"
+  ],
+  "compare_mtime_paths": [
+    "/runtime/owned/file",
+    "/runtime/owned/hard",
+    "/runtime/owned/link",
+    "/runtime/owned/nested"
+  ],
+  "compare_hardlink_paths": [
+    "/runtime/owned/file",
+    "/runtime/owned/hard",
+    "/runtime/split/a",
+    "/runtime/split/b"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "one-source-edit",
+      "writes": {
+        "one.txt": "one-edited\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 6,
+      "expect_boot_count": 2,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-edit",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

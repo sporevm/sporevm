@@ -4,15 +4,18 @@ const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const rootfs_cas = @import("../rootfs_cas.zig");
+const disk_layer = @import("../disk_layer.zig");
 const rootfs_mod = @import("../rootfs.zig");
 const run_mod = @import("../run.zig");
+const memory_config = @import("../memory.zig");
+const topology = @import("../topology.zig");
 const runtime_disk = @import("../runtime_disk.zig");
 const spore = @import("../spore.zig");
 const step_cache = @import("step_cache.zig");
 const vsock = @import("../virtio/vsock.zig");
 
 const guest_port: u32 = 10700;
-const step_timeout_ms: u64 = 30 * 60 * 1000;
+pub const default_step_timeout_ms: u64 = 30 * 60 * 1000;
 const max_captured_output = 64 * 1024;
 const max_rootfs_grow_response = run_mod.max_rootfs_grow_response;
 const p0_idle_probe_env = "SPOREVM_ROOTFS_GROWTH_P0_IDLE_MS";
@@ -22,19 +25,45 @@ const prepare_host_contract = "grow-v1-strict-request-v2;ext4-source-preflight-v
 // Provisional build-VM default; make this a `spore build` option when larger
 // workloads such as `bundle install`-style RUN steps need more memory.
 const build_vm_memory_bytes: u64 = 2 * 1024 * 1024 * 1024;
+pub const default_build_memory = memory_config.Config{ .policy = .explicit, .bytes = build_vm_memory_bytes };
+pub const default_build_vcpus: topology.VcpuCount = 1;
+pub const max_build_nofile: u64 = 1_048_576;
+pub const default_build_nofile = NofileLimit{ .soft = 65_536, .hard = 65_536 };
 const max_guest_request_len = 8191;
 pub const max_run_command_len = 64 * 1024;
-const max_guest_envc = 64;
-const max_guest_env_len = 255;
-const max_guest_working_dir_len = 255;
+pub const max_guest_envc = 64;
+pub const max_guest_env_len = 255;
+pub const max_guest_working_dir_len = 255;
 pub const max_copy_entries = 65536;
 pub const max_copy_entry_path_len = 512;
+pub const max_build_input_disks = 2;
 const enospc_patterns = [_][]const u8{
     "SPORE_BUILD_ENOSPC",
     "No space left on device",
     "ENOSPC",
 };
 const max_enospc_pattern_len = "No space left on device".len;
+
+pub const NofileLimit = struct {
+    soft: u64,
+    hard: u64,
+
+    pub fn validate(self: NofileLimit) !void {
+        if (self.soft == 0 or self.soft > self.hard or self.hard > max_build_nofile) return error.InvalidBuildNofileLimit;
+    }
+};
+
+pub const RunResources = struct {
+    memory: memory_config.Config = default_build_memory,
+    vcpus: topology.VcpuCount = default_build_vcpus,
+    nofile: NofileLimit = default_build_nofile,
+
+    pub fn validate(self: RunResources) !void {
+        _ = try memory_config.fromManifestBytes(self.memory.bytes);
+        try topology.validateVcpuCount(self.vcpus);
+        try self.nofile.validate();
+    }
+};
 
 pub const Diagnostic = struct {
     instruction: ?[]const u8 = null,
@@ -48,6 +77,7 @@ pub const Diagnostic = struct {
     boot_artifact_file_reads: usize = 0,
     boot_artifact_bytes_read: usize = 0,
     max_checkpoint_control_ms: u64 = 0,
+    snapshot_metrics: disk_layer.SnapshotMetrics = std.mem.zeroes(disk_layer.SnapshotMetrics),
 };
 
 pub const Producer = struct {
@@ -138,9 +168,15 @@ pub const RunStep = struct {
 };
 
 pub const CopySourceKind = enum {
+    auto,
     directory,
     file,
     sym_link,
+};
+
+pub const CopySourceDisk = enum {
+    context,
+    build_input,
 };
 
 pub const CopyRequest = struct {
@@ -149,6 +185,8 @@ pub const CopyRequest = struct {
     source_kind: CopySourceKind,
     dest_is_dir: bool,
     entry_count: usize,
+    source_disk: CopySourceDisk = .context,
+    input_index: usize = 0,
 };
 
 pub const CopyStep = struct {
@@ -199,6 +237,10 @@ pub const Options = struct {
     preparation: ?Preparation = null,
     producer: Producer,
     context_disk_path: ?[]const u8 = null,
+    build_input_rootfs: []const spore.Rootfs = &.{},
+    resources: RunResources = .{},
+    timeout_ms: u64 = default_step_timeout_ms,
+    spore_executable: []const u8 = "spore",
     output: ?*Io.Writer = null,
     diagnostic: ?*Diagnostic = null,
 };
@@ -214,6 +256,7 @@ pub fn cacheInputForStep(
     parent_index_digest: []const u8,
     executor_identity: []const u8,
     step: Step,
+    resources: RunResources,
 ) step_cache.StepInput {
     return switch (step) {
         .run => |run| .{
@@ -225,6 +268,10 @@ pub fn cacheInputForStep(
                 .env_digest = run.env_digest,
                 .workdir = run.workdir,
                 .network_mode = run.network_mode,
+                .memory_bytes = resources.memory.bytes,
+                .vcpus = resources.vcpus,
+                .nofile_soft = resources.nofile.soft,
+                .nofile_hard = resources.nofile.hard,
             } },
         },
         .copy => |copy| .{
@@ -332,12 +379,13 @@ const EnospcDetector = struct {
 /// replacements live until the caller resets its arena. Do not call this with a
 /// long-lived general-purpose allocator.
 pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !spore.RootfsStorage {
+    try options.resources.validate();
+    if (options.build_input_rootfs.len > max_build_input_disks) return error.TooManyBuildInputDisks;
+    if (options.timeout_ms == 0) return error.InvalidBuildTimeout;
     if (options.steps.len == 0) return spore.cloneRootfsStorage(allocator, options.base_storage);
     if (options.diagnostic) |diag| {
         diag.* = .{
             .resize_count = @intFromBool(options.preparation != null),
-            .boot_artifact_file_reads = options.producer.eager_artifact_file_reads,
-            .boot_artifact_bytes_read = options.producer.eager_artifact_bytes_read,
         };
     }
     const network_mode = try networkModeForSteps(options.steps);
@@ -352,10 +400,14 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         .rootfs = rootfs,
         .rootfs_grow_target = if (options.preparation) |preparation| preparation.exact_target else 0,
         .context_disk_path = options.context_disk_path,
+        .build_input_rootfs = options.build_input_rootfs,
+        .build_mode = true,
+        .disk_snapshot_metrics = if (options.diagnostic) |diag| &diag.snapshot_metrics else null,
         .command = &.{},
-        .memory = .{ .policy = .explicit, .bytes = build_vm_memory_bytes },
+        .memory = options.resources.memory,
+        .vcpus = options.resources.vcpus,
         .network = if (network_mode == .spore) .spore else .disabled,
-        .timeout_ms = step_timeout_ms,
+        .timeout_ms = options.timeout_ms,
     };
     const boot = switch (options.producer.boot_source) {
         .retained => |retained| retained,
@@ -426,6 +478,8 @@ const BuildControl = struct {
     executor_identity: []const u8,
     cache_root: []const u8,
     steps: []const Step,
+    resources: RunResources,
+    timeout_ms: u64,
     output: ?*Io.Writer,
     current_storage: spore.RootfsStorage,
     preparation: ?Preparation = null,
@@ -439,6 +493,7 @@ const BuildControl = struct {
     stream_sequence: u64 = 0,
     active_input: ?step_cache.StepInput = null,
     active_step_key: []const u8 = "",
+    pending_storage: ?spore.RootfsStorage = null,
     active_stdin_payload: []const u8 = "",
     active_stdin_offset: usize = 0,
     active_stdin_close_sent: bool = true,
@@ -459,6 +514,7 @@ const BuildControl = struct {
     max_checkpoint_control_ms: u64 = 0,
     preparation_start_ns: ?u64 = null,
     preparation_publish_ms: ?u64 = null,
+    instruction_elapsed_ms: u64 = 0,
 
     fn init(io: Io, allocator: std.mem.Allocator, options: Options, p0_idle_probe_ms: u64) !BuildControl {
         return .{
@@ -468,6 +524,8 @@ const BuildControl = struct {
             .executor_identity = options.producer.identity,
             .cache_root = options.cache_root,
             .steps = options.steps,
+            .resources = options.resources,
+            .timeout_ms = options.timeout_ms,
             .output = options.output,
             .current_storage = try spore.cloneRootfsStorage(allocator, options.base_storage),
             .preparation = options.preparation,
@@ -561,7 +619,7 @@ const BuildControl = struct {
         const session_id = try std.fmt.allocPrint(self.allocator, "spore-build-{d}", .{self.step_index + 1});
         switch (step) {
             .run => |run| {
-                const request = try runRequest(self.allocator, session_id, run.command, run.env, run.workdir, self.io);
+                const request = try runRequest(self.allocator, session_id, run.command, run.env, run.workdir, self.resources.nofile, self.io);
                 try self.startStream(dev, request, .spore_stream_v1, .run, run.command);
             },
             .copy => |copy| {
@@ -590,7 +648,7 @@ const BuildControl = struct {
     }
 
     fn stepInput(self: BuildControl, step: Step) step_cache.StepInput {
-        return cacheInputForStep(self.platform, self.current_storage.index_digest, self.executor_identity, step);
+        return cacheInputForStep(self.platform, self.current_storage.index_digest, self.executor_identity, step, self.resources);
     }
 
     fn startSimpleControl(self: *BuildControl, dev: *vsock.Vsock, kind: ActiveStream) !void {
@@ -631,6 +689,9 @@ const BuildControl = struct {
         switch (self.stream.state) {
             .complete => {
                 const exit_code = self.stream.exit_code orelse return error.BadRunExitFrame;
+                if (self.active_stream == .run or self.active_stream == .copy or self.active_stream == .workdir) {
+                    self.instruction_elapsed_ms +|= self.stream.elapsedMs();
+                }
                 dev.resetHostStream();
                 self.stream_valid = false;
                 try self.finishActiveStream(exit_code);
@@ -642,7 +703,11 @@ const BuildControl = struct {
                 self.phase = .failed;
             },
             else => {
-                if (self.stream.elapsedMs() > step_timeout_ms) {
+                const elapsed = if (self.active_stream == .run or self.active_stream == .copy or self.active_stream == .workdir)
+                    self.instruction_elapsed_ms +| self.stream.elapsedMs()
+                else
+                    self.stream.elapsedMs();
+                if (elapsed > self.timeout_ms) {
                     dev.resetHostStream();
                     self.stream_valid = false;
                     self.failure = error.BuildGuestTimedOut;
@@ -705,7 +770,21 @@ const BuildControl = struct {
                     self.phase = .failed;
                     return;
                 }
+                // The storage index is durable after the snapshot, but the
+                // step is not reusable until the guest has restored its
+                // filesystem state. Publishing the record here keeps a failed
+                // thaw from turning an incomplete build transition into a hit.
+                const storage = self.pending_storage orelse return error.BadManifest;
+                const input = self.active_input orelse return error.BadManifest;
+                if (self.active_step_key.len == 0) return error.BadManifest;
+                _ = try step_cache.writeRecord(self.io, self.allocator, self.cache_root, input, self.active_step_key, storage);
                 const completed_kind = self.checkpoint_kind;
+                if (completed_kind == .prepare) {
+                    const start_ns = self.preparation_start_ns orelse return error.BadManifest;
+                    self.preparation_publish_ms = ((try monotonicNs()) -| start_ns) / std.time.ns_per_ms;
+                }
+                self.current_storage = storage;
+                self.pending_storage = null;
                 if (completed_kind == .dockerfile_step) self.step_index += 1;
                 self.active_input = null;
                 self.active_step_key = "";
@@ -717,15 +796,15 @@ const BuildControl = struct {
                 if (completed_kind == .prepare) {
                     const start_ns = self.preparation_start_ns orelse return error.BadManifest;
                     const elapsed_ns = (try monotonicNs()) -| start_ns;
-                    std.log.info(
-                        "rootfs preparation metrics: publish_ms={d} resume_ms={d} target_mib={d} checkpoint_control_max_ms={d}",
-                        .{
-                            self.preparation_publish_ms orelse return error.BadManifest,
-                            elapsed_ns / std.time.ns_per_ms,
-                            self.rootfs_grow_target / (1024 * 1024),
-                            self.max_checkpoint_control_ms,
-                        },
+                    var metrics_buf: [256]u8 = undefined;
+                    const metrics = try preparationMetricsLine(
+                        &metrics_buf,
+                        self.preparation_publish_ms orelse return error.BadManifest,
+                        elapsed_ns / std.time.ns_per_ms,
+                        self.rootfs_grow_target / (1024 * 1024),
+                        self.max_checkpoint_control_ms,
                     );
+                    std.log.info("{s}", .{metrics});
                     self.preparation = null;
                     self.checkpoint_kind = .dockerfile_step;
                     self.phase = .start_run;
@@ -748,19 +827,16 @@ const BuildControl = struct {
 
     fn completeRootfsSnapshot(self: *BuildControl, maybe_disk: ?spore.Disk) !void {
         if (self.phase != .snapshot) return;
+        if (self.pending_storage != null) return error.BadManifest;
+        _ = self.active_input orelse return error.BadManifest;
+        if (self.active_step_key.len == 0) return error.BadManifest;
         const disk = maybe_disk orelse return error.BadManifest;
         const storage = try runtime_disk.storageFromSnapshotDisk(self.allocator, disk);
         if (self.checkpoint_kind == .prepare) try validatePreparedStorage(self.current_storage, storage, self.rootfs_grow_target);
         // A zero-dirty RUN/COPY/WORKDIR can intentionally yield child digest ==
         // parent digest; the step key still proves which instruction inputs ran.
         try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, storage.index_digest);
-        const input = self.active_input orelse return error.BadManifest;
-        _ = try step_cache.writeRecord(self.io, self.allocator, self.cache_root, input, self.active_step_key, storage);
-        if (self.checkpoint_kind == .prepare) {
-            const start_ns = self.preparation_start_ns orelse return error.BadManifest;
-            self.preparation_publish_ms = ((try monotonicNs()) -| start_ns) / std.time.ns_per_ms;
-        }
-        self.current_storage = storage;
+        self.pending_storage = storage;
         self.phase = .start_thaw;
     }
 
@@ -848,6 +924,14 @@ fn checkpointSessionId(allocator: std.mem.Allocator, kind: ActiveStream, checkpo
         std.fmt.allocPrint(allocator, "spore-build-{s}-{d}", .{ name, step_index + 1 });
 }
 
+fn preparationMetricsLine(buf: []u8, publish_ms: u64, resume_ms: u64, target_mib: u64, checkpoint_control_max_ms: u64) ![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "rootfs preparation metrics: publish_ms={d} resume_ms={d} target_mib={d} checkpoint_control_max_ms={d}",
+        .{ publish_ms, resume_ms, target_mib, checkpoint_control_max_ms },
+    );
+}
+
 fn parseRootfsGrowResponse(bytes: []const u8) !run_mod.RootfsGrowResult {
     return run_mod.parseRootfsGrowResponse(bytes);
 }
@@ -898,8 +982,10 @@ fn runRequest(
     command: []const u8,
     env: []const []const u8,
     workdir: []const u8,
+    nofile: NofileLimit,
     io: Io,
 ) ![]const u8 {
+    try nofile.validate();
     if (command.len > max_run_command_len) return error.RunCommandTooLong;
     if (workdir.len == 0 or workdir.len > max_guest_working_dir_len) return error.RunWorkingDirUnsupported;
     if (env.len > max_guest_envc) return error.RunEnvCountUnsupported;
@@ -917,6 +1003,8 @@ fn runRequest(
         terminal_rows: u16 = 24,
         terminal_cols: u16 = 80,
         memory_pressure: bool = false,
+        nofile_soft: u64,
+        nofile_hard: u64,
         closed_env: bool = true,
     }{
         .session_id = session_id,
@@ -924,6 +1012,8 @@ fn runRequest(
         .command_len = command.len,
         .env = env,
         .working_dir = workdir,
+        .nofile_soft = nofile.soft,
+        .nofile_hard = nofile.hard,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
@@ -934,13 +1024,15 @@ fn runRequest(
 fn copyRequest(allocator: std.mem.Allocator, session_id: []const u8, request: CopyRequest) ![]const u8 {
     try validateCopyRequest(request);
     const payload = struct {
-        type: []const u8 = "spore-build-copy-v2",
+        type: []const u8 = "spore-build-copy-v3",
         session_id: []const u8,
         source: []const u8,
         dest: []const u8,
         source_kind: []const u8,
         dest_is_dir: bool,
         entry_count: usize,
+        source_disk: []const u8,
+        input_index: usize,
     }{
         .session_id = session_id,
         .source = request.source,
@@ -948,6 +1040,8 @@ fn copyRequest(allocator: std.mem.Allocator, session_id: []const u8, request: Co
         .source_kind = @tagName(request.source_kind),
         .dest_is_dir = request.dest_is_dir,
         .entry_count = request.entry_count,
+        .source_disk = @tagName(request.source_disk),
+        .input_index = request.input_index,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
@@ -987,10 +1081,15 @@ fn validateCopyRequest(request: CopyRequest) !void {
     while (it.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.CopyDestinationUnsupported;
     }
-    if (request.entry_count == 0 or request.entry_count > max_copy_entries) return error.CopyEntryCountUnsupported;
+    if (request.source_disk == .context) {
+        if (request.source_kind == .auto or request.input_index != 0) return error.CopySourceUnsupported;
+        if (request.entry_count == 0 or request.entry_count > max_copy_entries) return error.CopyEntryCountUnsupported;
+    } else {
+        if (request.source_kind != .auto or request.entry_count != 0 or request.input_index >= max_build_input_disks) return error.CopySourceUnsupported;
+    }
 }
 
-fn rootfsFromStorage(allocator: std.mem.Allocator, storage: spore.RootfsStorage) !spore.Rootfs {
+pub fn rootfsFromStorage(allocator: std.mem.Allocator, storage: spore.RootfsStorage) !spore.Rootfs {
     return .{
         .device = try spore.cloneRootfsDevice(allocator, storage.device),
         .artifact = .{
@@ -1047,12 +1146,18 @@ extern fn spore_agent_fuzz_ext4_geometry(super: [*]const u8, super_len: usize, b
 extern fn spore_agent_fuzz_ext4_growth_source(super: [*]const u8, super_len: usize) c_int;
 extern fn spore_agent_fuzz_rootfs_grow_geometry(target_blocks: u64, before_blocks: u64, before_blocks_per_group: u32, before_block_size: u32, after_blocks: u64, after_blocks_per_group: u32, after_block_size: u32) c_int;
 extern fn spore_agent_fuzz_proc_stat(stat: [*]const u8, stat_len: usize) c_int;
+extern fn spore_agent_fuzz_build_resolv_target(target: [*]const u8, target_len: usize, logical: [*]u8, logical_cap: usize) c_int;
+extern fn spore_agent_test_bounded_readlink(target: [*]const u8, target_len: usize) c_int;
+extern fn spore_agent_test_confined_source_parent(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize) c_int;
+extern fn spore_agent_fuzz_copy_tree(source_root: [*]const u8, source_root_len: usize, dest_root: [*]const u8, dest_root_len: usize, fuzz: [*]const u8, fuzz_len: usize) c_int;
+extern fn spore_agent_test_build_fd_budget() u64;
+extern fn spore_agent_test_security_xattr_long_name(root: [*]const u8, root_len: usize) c_int;
 
 fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
     if (comptime guest_agent_fuzz_supported) {
         var fuzz_bytes: [128]u8 = undefined;
         const fuzz_len = s.slice(&fuzz_bytes);
-        const mode = if (fuzz_len == 0) 0 else fuzz_bytes[0] % 7;
+        const mode = if (fuzz_len == 0) 0 else fuzz_bytes[0] % 8;
         const command = if (fuzz_len <= 1) "x" else fuzz_bytes[1..fuzz_len];
         var stream: [256]u8 = undefined;
         var stream_len: usize = 0;
@@ -1089,11 +1194,43 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
             return;
         }
 
-        const request = runRequest(std.testing.allocator, "spore-build-fuzz", command, &.{}, "/", std.testing.io) catch return;
+        if (mode == 7) {
+            const request = copyRequest(std.testing.allocator, "spore-build-fuzz", .{
+                .source = "out/app",
+                .dest = "/app",
+                .source_kind = .auto,
+                .dest_is_dir = false,
+                .entry_count = 0,
+                .source_disk = .build_input,
+                .input_index = 1,
+            }) catch return;
+            defer std.testing.allocator.free(request);
+            _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
+            return;
+        }
+
+        const request = runRequest(std.testing.allocator, "spore-build-fuzz", command, &.{}, "/", default_build_nofile, std.testing.io) catch return;
         defer std.testing.allocator.free(request);
         appendTestSpioFrame(&stream, &stream_len, 1, if (mode == 1) 1 else 0, command);
         if (mode != 3) appendTestSpioFrame(&stream, &stream_len, 2, command.len, "");
         _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..stream_len].ptr, stream_len);
+    }
+}
+
+test "build agent fd budget covers every bounded hardlink authority" {
+    if (comptime guest_agent_fuzz_supported) {
+        try std.testing.expectEqual(@as(u64, max_copy_entries + 256), spore_agent_test_build_fd_budget());
+    }
+}
+
+test "security xattr inspection accepts an ext4 maximum-length clean name" {
+    if (comptime guest_agent_fuzz_supported) {
+        const io = std.testing.io;
+        const tmp = "zig-cache/test-copy-security-long-name";
+        Io.Dir.cwd().deleteTree(io, tmp) catch {};
+        defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+        try Io.Dir.cwd().createDirPath(io, tmp);
+        try std.testing.expectEqual(@as(c_int, 0), spore_agent_test_security_xattr_long_name(tmp.ptr, tmp.len));
     }
 }
 
@@ -1102,6 +1239,31 @@ fn fuzzGuestProcStat(_: void, s: *std.testing.Smith) !void {
         var bytes: [256]u8 = undefined;
         const len = s.slice(&bytes);
         _ = spore_agent_fuzz_proc_stat(bytes[0..len].ptr, len);
+    }
+}
+
+fn fuzzGuestBuildResolvTarget(_: void, s: *std.testing.Smith) !void {
+    if (comptime guest_agent_fuzz_supported) {
+        var target: [512]u8 = undefined;
+        const len = s.slice(&target);
+        var logical: [512]u8 = undefined;
+        _ = spore_agent_fuzz_build_resolv_target(target[0..len].ptr, len, &logical, logical.len);
+    }
+}
+
+fn fuzzGuestCopyTree(_: void, s: *std.testing.Smith) !void {
+    if (comptime guest_agent_fuzz_supported) {
+        const io = std.testing.io;
+        const tmp = "zig-cache/fuzz-guest-copy-tree";
+        const source = tmp ++ "/source";
+        const dest = tmp ++ "/dest";
+        Io.Dir.cwd().deleteTree(io, tmp) catch {};
+        defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+        try Io.Dir.cwd().createDirPath(io, source);
+        try Io.Dir.cwd().createDirPath(io, dest);
+        var bytes: [256]u8 = undefined;
+        const len = s.slice(&bytes);
+        _ = spore_agent_fuzz_copy_tree(source.ptr, source.len, dest.ptr, dest.len, bytes[0..len].ptr, len);
     }
 }
 
@@ -1383,6 +1545,15 @@ test "checkpoint controls use step-specific vsock identities" {
     try std.testing.expectEqualStrings("spore-build-prepare-thaw", prepare_thaw);
 }
 
+test "preparation metric line preserves authoritative publication and total fields" {
+    var buf: [256]u8 = undefined;
+    const line = try preparationMetricsLine(&buf, 217, 219, 16_384, 31);
+    try std.testing.expectEqualStrings(
+        "rootfs preparation metrics: publish_ms=217 resume_ms=219 target_mib=16384 checkpoint_control_max_ms=31",
+        line,
+    );
+}
+
 test "build session network mode derives from RUN steps" {
     const copy = Step{ .copy = .{
         .canonical_instruction = "COPY . /app",
@@ -1416,12 +1587,34 @@ test "build copy request names context disk source" {
         .entry_count = 2,
     });
     defer std.testing.allocator.free(request);
-    try std.testing.expect(std.mem.endsWith(u8, request, "\n"));
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-copy-v2\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"source\":\"src\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"dest\":\"/work\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"source_kind\":\"directory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"entry_count\":2") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("spore-build-copy-v3", object.get("type").?.string);
+    try std.testing.expectEqualStrings("src", object.get("source").?.string);
+    try std.testing.expectEqualStrings("/work", object.get("dest").?.string);
+    try std.testing.expectEqualStrings("directory", object.get("source_kind").?.string);
+    try std.testing.expectEqual(@as(i64, 2), object.get("entry_count").?.integer);
+    try std.testing.expectEqualStrings("context", object.get("source_disk").?.string);
+}
+
+test "build copy request selects an immutable build input" {
+    const request = try copyRequest(std.testing.allocator, "spore-build-1", .{
+        .source = "out/app",
+        .dest = "/app",
+        .source_kind = .auto,
+        .dest_is_dir = false,
+        .entry_count = 0,
+        .source_disk = .build_input,
+        .input_index = 1,
+    });
+    defer std.testing.allocator.free(request);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("build_input", object.get("source_disk").?.string);
+    try std.testing.expectEqual(@as(i64, 1), object.get("input_index").?.integer);
+    try std.testing.expectEqualStrings("auto", object.get("source_kind").?.string);
 }
 
 test "build workdir request names an absolute target" {
@@ -1479,29 +1672,49 @@ test "build copy request accepts exact path bound" {
 }
 
 test "build run request uses spore stream v1 start" {
-    const request = try runRequest(std.testing.allocator, "spore-build-1", "echo ok", &.{"PATH=/usr/bin"}, "/work", std.testing.io);
+    const request = try runRequest(std.testing.allocator, "spore-build-1", "echo ok", &.{"PATH=/usr/bin"}, "/work", default_build_nofile, std.testing.io);
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.endsWith(u8, request, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-run-v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"pipe\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"command_len\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"nofile_soft\":65536") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"nofile_hard\":65536") != null);
+}
+
+test "build nofile limit is bounded" {
+    try default_build_nofile.validate();
+    try std.testing.expectError(error.InvalidBuildNofileLimit, (NofileLimit{ .soft = 0, .hard = 1 }).validate());
+    try std.testing.expectError(error.InvalidBuildNofileLimit, (NofileLimit{ .soft = 2, .hard = 1 }).validate());
+    try std.testing.expectError(error.InvalidBuildNofileLimit, (NofileLimit{ .soft = 1, .hard = max_build_nofile + 1 }).validate());
+}
+
+test "build RUN resources validate as one execution contract" {
+    try (RunResources{}).validate();
+    try std.testing.expectError(error.ZeroMemory, (RunResources{
+        .memory = .{ .policy = .explicit, .bytes = 0 },
+    }).validate());
+    try std.testing.expectError(error.UnsupportedVcpuCount, (RunResources{ .vcpus = 0 }).validate());
+    try std.testing.expectError(error.InvalidBuildNofileLimit, (RunResources{
+        .nofile = .{ .soft = 2, .hard = 1 },
+    }).validate());
 }
 
 test "build run request accepts multi-kib command and rejects configured bound" {
     const multi_kib = "x" ** 4096;
-    const request = try runRequest(std.testing.allocator, "spore-build-1", multi_kib, &.{}, "/", std.testing.io);
+    const request = try runRequest(std.testing.allocator, "spore-build-1", multi_kib, &.{}, "/", default_build_nofile, std.testing.io);
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"command_len\":4096") != null);
     const command = "x" ** (max_run_command_len + 1);
-    try std.testing.expectError(error.RunCommandTooLong, runRequest(std.testing.allocator, "spore-build-1", command, &.{}, "/", std.testing.io));
+    try std.testing.expectError(error.RunCommandTooLong, runRequest(std.testing.allocator, "spore-build-1", command, &.{}, "/", default_build_nofile, std.testing.io));
     const workdir = "/" ** (max_guest_working_dir_len + 1);
-    try std.testing.expectError(error.RunWorkingDirUnsupported, runRequest(std.testing.allocator, "spore-build-1", "true", &.{}, workdir, std.testing.io));
+    try std.testing.expectError(error.RunWorkingDirUnsupported, runRequest(std.testing.allocator, "spore-build-1", "true", &.{}, workdir, default_build_nofile, std.testing.io));
 }
 
 test "guest build request parser rejects malformed RUN framing and accepts build controls" {
     if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
 
-    const run_request = try runRequest(std.testing.allocator, "spore-build-1", "abc", &.{}, "/", std.testing.io);
+    const run_request = try runRequest(std.testing.allocator, "spore-build-1", "abc", &.{}, "/", default_build_nofile, std.testing.io);
     defer std.testing.allocator.free(run_request);
     var stream: [128]u8 = undefined;
     var stream_len: usize = 0;
@@ -1531,9 +1744,25 @@ test "guest build request parser rejects malformed RUN framing and accepts build
     defer std.testing.allocator.free(copy_request);
     try std.testing.expectEqual(guest_agent_fuzz_copy_request, spore_agent_fuzz_build_request(copy_request.ptr, copy_request.len, stream[0..0].ptr, 0));
 
+    const input_copy_request = try copyRequest(std.testing.allocator, "spore-build-1", .{
+        .source = "out/app",
+        .dest = "/app",
+        .source_kind = .auto,
+        .dest_is_dir = false,
+        .entry_count = 0,
+        .source_disk = .build_input,
+        .input_index = 1,
+    });
+    defer std.testing.allocator.free(input_copy_request);
+    try std.testing.expectEqual(guest_agent_fuzz_copy_request, spore_agent_fuzz_build_request(input_copy_request.ptr, input_copy_request.len, stream[0..0].ptr, 0));
+
     const workdir_request = try workdirRequest(std.testing.allocator, "spore-build-1", "/work");
     defer std.testing.allocator.free(workdir_request);
     try std.testing.expectEqual(guest_agent_fuzz_workdir_request, spore_agent_fuzz_build_request(workdir_request.ptr, workdir_request.len, stream[0..0].ptr, 0));
+
+    const stale_resize_request = try run_mod.simpleControlRequest(std.testing.allocator, "spore-build-resize-v1", "spore-build-resize");
+    defer std.testing.allocator.free(stale_resize_request);
+    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(stale_resize_request.ptr, stale_resize_request.len, stream[0..0].ptr, 0));
 
     const ready_request = "{\"type\":\"ready\",\"nonce\":\"1234\"}\n";
     try std.testing.expectEqual(guest_agent_fuzz_ready_request, spore_agent_fuzz_build_request(ready_request.ptr, ready_request.len, stream[0..0].ptr, 0));
@@ -1621,4 +1850,6 @@ test "fuzz build control request framing" {
     try std.testing.fuzz({}, fuzzCopyRequest, .{});
     try std.testing.fuzz({}, fuzzGuestBuildRequest, .{});
     try std.testing.fuzz({}, fuzzGuestProcStat, .{});
+    try std.testing.fuzz({}, fuzzGuestBuildResolvTarget, .{});
+    try std.testing.fuzz({}, fuzzGuestCopyTree, .{});
 }

@@ -17,7 +17,7 @@ Kinds:
 
 Environment:
   SPOREVM_KERNEL_IMAGE       explicit local Image path; skips download
-  SPOREVM_KERNEL_RELEASE     kernel release tag (default: v0.6.2)
+  SPOREVM_KERNEL_RELEASE     kernel release tag (default: v0.6.3)
   SPOREVM_KERNEL_VERSION     Linux version in the asset name (default: 6.1.155)
   SPOREVM_KERNEL_REPOSITORY  GitHub repo override
                               default: sporevm/kernels for run/sporevm,
@@ -78,6 +78,7 @@ required_run_config_symbols=(
   CONFIG_CGROUP_PIDS
   CONFIG_CPUSETS
   CONFIG_CGROUP_DEVICE
+  CONFIG_EXT4_FS_SECURITY
   CONFIG_MEMORY_HOTPLUG
   CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE
   CONFIG_MEMORY_HOTREMOVE
@@ -97,6 +98,10 @@ verify_run_kernel_config() {
       return 1
     fi
   done
+  if ! grep -Fxq "# CONFIG_SECURITY is not set" "${config_file}"; then
+    echo "error: managed run kernel config ${config_file} unexpectedly enables CONFIG_SECURITY" >&2
+    return 1
+  fi
 }
 
 verify_kernel() {
@@ -159,7 +164,7 @@ if [[ -n "${SPOREVM_KERNEL_IMAGE:-}" ]]; then
   exit 0
 fi
 
-release="${SPOREVM_KERNEL_RELEASE:-v0.6.2}"
+release="${SPOREVM_KERNEL_RELEASE:-v0.6.3}"
 linux_version="${SPOREVM_KERNEL_VERSION:-6.1.155}"
 repo="${SPOREVM_KERNEL_REPOSITORY:-}"
 

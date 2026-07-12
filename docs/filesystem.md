@@ -257,6 +257,10 @@ and objects from cache metadata, ref records, live runtime manifests, and
 process-owned lazy-runtime leases; it is dry-run by default and requires
 `--force` to delete candidates. Destructive prune consults the same runtime
 leases before selecting explicit CAS entries.
+Current build step records are roots. GC also reports recognized legacy and
+stale build step records, removes them under the rootfs cache lock on `--force`
+before the CAS sweep, and preserves unknown future record kinds or schema
+versions conservatively.
 
 Default `spore system prune --rootfs` only selects rebuildable image rootfs
 entries. Flat digest artifacts are skipped unless `--include-digest-artifacts`
