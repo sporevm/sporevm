@@ -18,11 +18,13 @@ fork does not downshift an already-booted guest to a smaller CPU topology.
 
 For a running named VM, `spore fork --vm NAME --count N --name PATTERN` creates
 ready named children directly. Disk-backed sources use a queue-drained,
-single-epoch RAM/machine capture plus independent native-cloned disk heads, so
-siblings inherit the same bytes and then diverge without a read-depth chain.
-The supported disk shape is one writable rootfs device; networked live fork
-remains unsupported. See [Named Lifecycle](lifecycle.md#saves-and-forks) for
-the fallback, readiness, and baseline-lease contract.
+single-epoch RAM/machine capture plus independent disk heads, so siblings
+inherit the same bytes and then diverge without a read-depth chain. Physical
+overrides use native-cloned heads by default; after a successful save commits
+the exact baseline, an override-free fork uses fresh sparse heads. The
+supported disk shape is one writable rootfs device; networked live fork remains
+unsupported. See [Named Lifecycle](lifecycle.md#saves-and-forks) for the
+fallback, readiness, and baseline-lease contract.
 
 Fan-out attaches to the saved process session. Machine-only spores can
 still start new commands with `spore run --from`, but they cannot fan out the
@@ -57,6 +59,21 @@ trust flag or special mode: each child uses normal product attach (`spore
 attach`, or `spore run --from` for run/rootfs children), which maps local
 backing only when the proof validates and otherwise restores from verified
 chunks.
+
+The batch directory is the movement and ownership boundary. Child `chunks`
+links are batch-relative (`../shared-chunks`), so moving the complete batch
+preserves RAM authority. Moving or deleting one child does not transfer or
+clean up the shared store; use pack/unpack when a child must be independently
+portable.
+
+Each disk-backed child gets its own durable disk pin, so removing the parent or
+a sibling cannot release that child's disk state. A raw copy of a child does not
+mint another pin and still shares the original identity; use another fork for
+an independent machine-local lifetime.
+
+For pinned disk-backed batches, human and JSON fork results report cache-lock
+wait separately from the lock-held pin and batch publication interval. These
+timings make contention distinct from the short publication critical section.
 
 ## Local Child Identity
 

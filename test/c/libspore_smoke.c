@@ -14,7 +14,7 @@ int main(void) {
 
   uint32_t abi_version = 0;
   if (expect_success(spore_build_info(SPORE_BUILD_INFO_ABI_VERSION, &abi_version)) != 0) return 1;
-  if (abi_version != 14) return 1;
+  if (abi_version != SPORE_ABI_VERSION) return 1;
   if (SPORE_REEXEC_CONTRACT_VERSION != 1u) return 1;
 
   SporeInspectBundleOptions options;
@@ -99,6 +99,10 @@ int main(void) {
   spore_remove_named_options_init(&remove_options);
   if (remove_options.size != sizeof(remove_options)) return 1;
   if (remove_options.version != SPORE_REMOVE_NAMED_OPTIONS_VERSION) return 1;
+  SporeRemoveSavedOptions remove_saved_options;
+  spore_remove_saved_options_init(&remove_saved_options);
+  if (remove_saved_options.size != sizeof(remove_saved_options)) return 1;
+  if (remove_saved_options.version != SPORE_REMOVE_SAVED_OPTIONS_VERSION) return 1;
 
 #if defined(SPORE_SMOKE_HOST_INFO)
   SporeContext context = 0;

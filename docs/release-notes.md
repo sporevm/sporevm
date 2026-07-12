@@ -22,12 +22,58 @@ writing a child proof. Path replacement, identity mismatch, and unexpected I/O
 remove the link and fail closed. KVM and HVF continue to map every child with
 `MAP_PRIVATE`, so parent and sibling writes remain isolated.
 
+The additive saved-spore removal Zig/C/Go API raises the libspore C ABI version
+to 15. Clients can compare
+`spore_build_info(SPORE_BUILD_INFO_ABI_VERSION, ...)` with `SPORE_ABI_VERSION`
+before using `spore_remove_saved_json`.
+
+Writable-disk saves now reference the machine's global rootfs CAS through an
+opaque durable pin in host-private lifecycle metadata. In the cache-backed
+steady state, where the parent is already in the global CAS, saves no longer
+hardlink or copy every unchanged parent object, remain valid after directory moves, and
+survive rootfs GC and destructive prune. `spore rm --spore DIR` removes a save
+and unregisters its pin. Raw moves are supported, but raw copies share one pin
+identity and are not independently removable; removing one may invalidate the
+others. Use fork for an independent machine-local lifecycle or pack/unpack for
+portability. Raw deletion safely leaks a pin. `spore cache pins` lists IDs and
+canonical-index health but does not detect orphans; expert-only
+`spore cache unpin PIN_ID --force` removes a known ID with an explicit warning.
+This pre-1.0 contract adds no global reference registry. `spore pack` still
+copies and verifies every required index and object into a self-contained
+portable bundle.
+
+Offline pinned-disk fork results now report cache-lock wait separately from the
+lock-held pin and batch publication interval in human output, JSON, and
+`libspore.ForkResult`.
+
+Save publication durably orders writable-disk objects, the canonical index,
+and its completeness stamp before publishing the pin and save. A named VM can
+therefore continue after its first save is removed and collected, publish a
+second save, restore it, and fast-fork the restored VM from that exact new
+baseline. The continuing VM's active lease and durable registry spec move to
+that baseline before the old lease is released, so a failed handoff retains the
+old authority instead of persisting a split view.
+
+Named saves now acquire the global cache lock before pausing vCPUs. A contended
+save remains pending while the guest runs, reports the accumulated lock wait
+separately, and starts its measured source-pause interval only after acquiring
+the lock that spans capture and durable publication.
+
+Offline fork output remains batch-owned: children share RAM chunks through
+batch-relative `../shared-chunks` links. The complete batch may be moved, but
+an individual child directory is not independently movable; pack/unpack is the
+portable per-child boundary.
+
 `spore fork --vm` now fast-forks disk-backed named VMs with one writable rootfs
 device. The source monitor pauses once, drains virtio-blk, captures shared
 RAM/machine state, and prepares up to 32 independent disk heads from the same
 epoch without sealing dirty disk state. APFS clone and Linux `FICLONE` are the
-default path; native-clone failure is closed unless the caller explicitly uses
-`--allow-slow-copy`. Networked named fork remains unsupported.
+default path when the live head has physical overrides; native-clone failure is
+closed unless the caller explicitly uses `--allow-slow-copy`. When a successful
+save has committed the exact canonical baseline and no later overrides exist,
+children receive fresh sparse heads without a filesystem clone or slow-copy.
+The `sparse` clone method is private runtime descriptor metadata, not a durable
+spore-format change. Networked named fork remains unsupported.
 
 Fork children claim their unlinked overlay fd through a random, one-use,
 child-bound local token and do not publish readiness until they have reopened

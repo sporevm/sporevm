@@ -181,6 +181,16 @@ starts. Named VM names remain lifecycle monitor handles.
 ## Saves And Forks
 
 `spore save NAME --out DIR` writes a spore and leaves the named VM running.
+Writable-disk saves are machine-local by default: host-private lifecycle
+metadata names an opaque durable pin in the configured rootfs cache. The pin
+roots the immutable disk index and chunks independently of the save path, so
+moving or renaming the directory is safe. A raw filesystem copy retains the
+same pin identity; it is not independently removable, and removing either copy
+through SporeVM may invalidate the other. Use `spore fork` for an independent
+machine-local lifecycle or pack/unpack for a self-contained portable artifact.
+Offline fork children instead share RAM through the batch-owned
+`shared-chunks` directory. Move the complete batch, not an individual child;
+pack/unpack is the supported independently portable child boundary.
 Non-destructive save supports both single-vCPU and multi-vCPU named VMs on every
 supported backend (KVM and HVF), for diskless, image-created writable rootfs, and
 explicit `--rootfs PATH` VMs: the monitor quiesces every vCPU at one barrier,
@@ -190,12 +200,34 @@ same-backend spore that restores only on HVF. `spore save NAME --out DIR --stop`
 writes a spore and removes the named VM from the runtime registry. A failed save
 leaves no partial spore at `--out`; if the capture itself fails, the monitor
 stops the VM and the command reports the error (parity with single-vCPU save).
+Named saves try the global cache lock before pausing any vCPU. While the lock
+is contended, the request stays pending and the guest continues running; the
+same acquired lock then spans capture and durable publication. Named saves
+report the complete source-pause time through manifest/pin
+authorization, active baseline-lease handoff, lifecycle metadata, final rename,
+and destination-parent sync. Cache-lock wait and each publication phase are
+logged separately, so backend RAM/disk capture time is not mistaken for the
+full pause experienced by the guest.
 Repeated `--annotation KEY=VALUE` flags merge save-time annotations into the
 manifest without dropping create-time annotations:
 
 ```bash
 spore save bench-1 --out bench-1.spore --stop --annotation saved=true
 ```
+
+Delete a machine-local saved spore with `spore rm --spore DIR`. This removes
+the directory before unregistering its pin under the cache lock. Raw `rm -rf`
+cannot make live CAS data collectable, but it leaks the pin. `spore cache pins`
+lists pin IDs and canonical-index health; it does not track save paths or claim
+to detect orphans. An operator who already knows that an exact pin ID is unused
+may remove it with the expert-only `spore cache unpin PIN_ID --force`; this can
+invalidate every raw copy sharing that identity.
+
+`spore cache pins` reports `index_valid` only after validating the record and
+canonical index. It deliberately does not stat or hash every object; lazy reads
+and `spore pack` still verify object bytes and may fail closed on missing or
+corrupt content. There is no global save-reference registry in this pre-1.0
+contract.
 
 If a saved manifest declares bound services, named restore requires fresh host
 socket bindings:
@@ -224,9 +256,13 @@ Disk-backed live fork supports the single writable rootfs device used by
 image-created, explicit-rootfs, restored, and previously forked named VMs. The
 source monitor drains the block queue, creates every child disk head at the
 same paused epoch, and resumes the source without sealing a durable disk
-snapshot. Native APFS or Linux reflink cloning is required by default. Use
+snapshot. A live head with physical overrides requires native APFS or Linux
+reflink cloning by default. After a successful save commits the exact canonical
+baseline, a fork with no later overrides instead gives each child a fresh
+sparse head and needs neither filesystem cloning nor slow-copy. Use
 `--allow-slow-copy` only when a full dirty-overlay copy is acceptable; without
-that explicit opt-in, unavailable native cloning fails closed.
+that explicit opt-in, unavailable native cloning of required overrides fails
+closed.
 
 Anonymous writable overlays, fork heads, and lazy sparse rootfs bases use the
 absolute `TMPDIR` when it is set, falling back to `/tmp`. Put `TMPDIR` on the

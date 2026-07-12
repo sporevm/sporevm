@@ -74,6 +74,7 @@ Use the matching helper for owned results:
 - `deinitRootfsCasPreloadResult`
 - `deinitRootfsSystemSummary`
 - `deinitRootfsPruneResult`
+- `deinitRemovedSavedSpore`
 
 `run`, `runManaged`, `runFromSpore`, and `attachSpore` return value results and
 do not need deinit.
@@ -223,6 +224,16 @@ session.
 `runFromSpore` and `attachSpore`, so embedders can tell whether RAM came from
 `local_backing` or verified `chunks` without parsing logs.
 
+Use `fork` to mint an offline child batch from a saved spore. For pinned
+disk-backed parents, `ForkResult.pin_lock_wait_ms` reports time waiting for the
+global cache lock and `pin_publish_ms` reports only the lock-held pin and batch
+publication interval; both fields are null when durable pin publication is not
+needed.
+
+Use `removeSavedSpore` to remove a saved-spore directory and unregister its
+durable disk pin. The owned `RemovedSavedSpore.spore_dir` and `pin_id` must
+be released with `deinitRemovedSavedSpore`.
+
 Use `run` only when you already have explicit kernel and rootfs or disk inputs.
 
 ## Named Lifecycle
@@ -283,9 +294,11 @@ defer libspore.deinitNamedForkResult(allocator, forked);
 `forkNamed` supports diskless sources and the single writable rootfs disk used
 by image-created, explicit-rootfs, restored, and previously forked named VMs.
 Networked sources remain unsupported, and a batch is capped at 32 children.
-Disk-backed fork requires native APFS/Linux cloning by default; Zig callers can
-set `ForkNamedOptions.allow_slow_copy = true` to permit a full dirty-overlay
-copy when native cloning is unavailable.
+Disk-backed fork requires native APFS/Linux cloning by default when physical
+overrides remain; Zig callers can set `ForkNamedOptions.allow_slow_copy = true`
+to permit a full dirty-overlay copy when native cloning is unavailable. After
+a successful save commits the exact baseline, an override-free fork uses fresh
+sparse heads and requires neither cloning nor slow-copy.
 
 For disk-backed sources, `NamedForkResult` reports `ram_capture_ms`,
 `disk_fork_ms`, `source_pause_ms`, and `child_ready_ms`. These phase metrics are
@@ -560,7 +573,9 @@ The C ABI is declared in [`include/spore.h`](../include/spore.h). The current
 surface exposes context management, build info, context-local environment
 overrides, context-local last errors, owned string cleanup, host-info JSON,
 inspect-bundle JSON, inspect-spore JSON, pull JSON, named lifecycle JSON, and
-named copy side-effect calls.
+named copy side-effect calls. ABI version 15 adds saved-spore removal through
+`spore_remove_saved_json`; clients should compare the runtime build-info ABI
+with `SPORE_ABI_VERSION` before calling it.
 
 Release builds publish separate `libspore_Linux` and `libspore_Darwin`
 archives so CLI-only installs do not carry development files. Each libspore
@@ -876,6 +891,13 @@ if err != nil {
     return err
 }
 
+removedSave, err := client.RemoveSaved(ctx, spore.RemoveSavedOptions{
+    SporeDir: "worker.spore",
+})
+if err != nil {
+    return err
+}
+
 _ = info
 _ = network
 _ = bundle
@@ -890,13 +912,14 @@ _ = workspace
 _ = restored
 _ = named
 _ = removed
+_ = removedSave
 ```
 
 The surface covers build info, context lifetime, host-info, network
 capabilities, inspect-bundle, inspect-spore, pull, context-local environment
 variables through `SetEnv`, and named lifecycle `CreateNamed`, `ExecNamed`,
 `OpenExecNamedStream`, `CopyInNamed`, `CopyOutNamed`, `SaveNamed`,
-`RestoreNamed`, `RemoveNamed`, and `ListNamed`.
+`RestoreNamed`, `RemoveNamed`, `RemoveSaved`, and `ListNamed`.
 `CreateNamedOptions` exposes the create-time network policy supported by the C
 ABI: `NetworkEnabled`, `AllowCIDRs`, `AllowHosts`, exact host/port
 `NetworkRules`, and `BoundServices` for host Unix sockets exposed to the guest.
@@ -918,7 +941,7 @@ is private to the current user, matching the named lifecycle registry rules.
 
 The Go binding decodes the same JSON contracts as the CLI and C ABI where calls
 return JSON, and exposes named copy as error-returning side-effect methods. It
-requires C ABI version 13 or newer. Go context cancellation is checked before
+requires C ABI version 15 or newer. Go context cancellation is checked before
 entering C calls; long-running runtime cancellation is not exposed until the Zig
 product API and C ABI provide it.
 

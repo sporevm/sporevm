@@ -8,6 +8,9 @@
 const std = @import("std");
 const capture = @import("../capture.zig");
 const disk_layer = @import("../disk_layer.zig");
+const local_paths = @import("../local_paths.zig");
+const rootfs_mod = @import("../rootfs.zig");
+const saved_spore_pin = @import("../saved_spore_pin.zig");
 const dirty_ram = @import("../dirty_ram.zig");
 const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const hvf = @import("hvf.zig");
@@ -586,21 +589,28 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             switch (try control.poll(&vsock_dev)) {
                 .keep_running => {},
                 .stop => return .monitor_stopped,
-                .snapshot => |request| {
+                .snapshot => |request| snapshot_action: {
+                    var preparation = if (request.publish_dir != null)
+                        (try control.prepareSnapshot()) orelse break :snapshot_action
+                    else
+                        null;
+                    defer if (preparation) |*owned| owned.deinit();
                     var prepared_root = if (request.publish_dir) |publish_dir|
                         if (config.disk_snapshot) |disk_state| try disk_state.prepareSnapshotRoot(publish_dir) else null
                     else
                         null;
                     defer if (prepared_root) |*root| root.deinit();
+                    const source_pause_started_ns = runtime_disk_fork_capture.monotonicNs();
                     try takeSnapshot(allocator, request.dir, vcpu, transports, &gen_dev, ram_bytes, .{
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
                         .ram_size = config.ram_size,
-                    }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                    }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, if (preparation) |*owned| owned.cacheLock() else null);
                     if (!request.continue_after) return .snapshotted;
                     const completed_dir = if (request.publish_dir) |publish_dir| blk: {
-                        try control.publishSnapshot(request.dir, publish_dir);
-                        if (prepared_root) |*root| try config.disk_snapshot.?.commitSnapshotRoot(request.dir, root);
+                        const publish_metrics = try control.publishSnapshot(&preparation.?, request.dir, publish_dir);
+                        if (prepared_root) |*root| try config.disk_snapshot.?.commitSnapshotRoot(request.dir, root, if (config.environ_map != null) .shared_no_rebind else .local_rebind);
+                        logNamedSnapshotPublication(publish_metrics, source_pause_started_ns);
                         break :blk publish_dir;
                     } else request.dir;
                     try control.completeSnapshot(completed_dir);
@@ -640,7 +650,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
                 if (config.continue_after_capture) {
@@ -665,7 +675,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                                 .dist_base = dist_base,
                                 .redist_base = vcpu_redist_base,
                                 .ram_size = config.ram_size,
-                            }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                            }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
                             return .snapshotted;
                         }
                         return .probe_complete;
@@ -688,7 +698,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
+                }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
                 return .snapshotted;
             }
         }
@@ -1291,13 +1301,22 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                     state.finish(.{ .exit = .monitor_stopped });
                     continue;
                 },
-                .snapshot => |request| {
+                .snapshot => |request| snapshot_action: {
                     if (request.continue_after) {
+                        var preparation = if (request.publish_dir != null)
+                            (control.prepareSnapshot() catch |err| {
+                                state.finish(.{ .err = err });
+                                break :snapshot_action;
+                            }) orelse break :snapshot_action
+                        else
+                            null;
+                        defer if (preparation) |*owned| owned.deinit();
                         var prepared_root = if (request.publish_dir) |publish_dir|
                             if (options.disk_snapshot) |disk_state| try disk_state.prepareSnapshotRoot(publish_dir) else null
                         else
                             null;
                         defer if (prepared_root) |*root| root.deinit();
+                        var source_pause_started_ns: u64 = 0;
                         takeSnapshotV1(
                             allocator,
                             request.dir,
@@ -1316,22 +1335,25 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                             options.annotations,
                             options.config.sessions,
                             options.environ_map,
+                            &source_pause_started_ns,
+                            if (preparation) |*owned| owned.cacheLock() else null,
                         ) catch |err| {
                             state.clearSnapshot();
                             state.finish(.{ .err = err });
                             continue;
                         };
                         const completed_dir = if (request.publish_dir) |publish_dir| blk: {
-                            control.publishSnapshot(request.dir, publish_dir) catch |err| {
+                            const publish_metrics = control.publishSnapshot(&preparation.?, request.dir, publish_dir) catch |err| {
                                 state.clearSnapshot();
                                 state.finish(.{ .err = err });
                                 continue;
                             };
-                            if (prepared_root) |*root| options.disk_snapshot.?.commitSnapshotRoot(request.dir, root) catch |err| {
+                            if (prepared_root) |*root| options.disk_snapshot.?.commitSnapshotRoot(request.dir, root, if (options.environ_map != null) .shared_no_rebind else .local_rebind) catch |err| {
                                 state.clearSnapshot();
                                 state.finish(.{ .err = err });
                                 continue;
                             };
+                            logNamedSnapshotPublication(publish_metrics, source_pause_started_ns);
                             break :blk publish_dir;
                         } else request.dir;
                         state.clearSnapshot();
@@ -1467,6 +1489,8 @@ fn snapshotMultiHvfAndStop(
         options.annotations,
         options.config.sessions,
         options.environ_map,
+        null,
+        null,
     ) catch |err| {
         if (state.result()) |result| return finishMultiHvfResult(result);
         state.finish(.{ .err = err });
@@ -2202,6 +2226,21 @@ fn mergeRootBlkStats(result: *vsock.ControlStats, snapshot_stats: blk.Stats.Snap
     result.out_all_zero_bytes = snapshot_stats.out_all_zero_bytes;
 }
 
+fn logNamedSnapshotPublication(metrics: vsock.SnapshotPublishMetrics, pause_started_ns: u64) void {
+    const source_pause_ns = runtime_disk_fork_capture.elapsedSince(pause_started_ns);
+    std.log.info(
+        "hvf named snapshot publication metrics: cache_lock_wait_ms={d} manifest_pin_authorization_ms={d} active_lease_handoff_ms={d} lifecycle_spec_ms={d} final_publication_ms={d} source_pause_ms={d}",
+        .{
+            vsock.SnapshotPublishMetrics.nsToMs(metrics.cache_lock_wait_ns),
+            vsock.SnapshotPublishMetrics.nsToMs(metrics.manifest_pin_authorization_ns),
+            vsock.SnapshotPublishMetrics.nsToMs(metrics.active_lease_handoff_ns),
+            vsock.SnapshotPublishMetrics.nsToMs(metrics.lifecycle_spec_ns),
+            vsock.SnapshotPublishMetrics.nsToMs(metrics.final_publication_ns),
+            vsock.SnapshotPublishMetrics.nsToMs(source_pause_ns),
+        },
+    );
+}
+
 test "monitor stats merge root block telemetry without replacing dirty RAM stats" {
     var result = vsock.ControlStats{ .chunks_nonzero = 91, .dirty_chunks_pending = 92 };
     mergeRootBlkStats(&result, .{
@@ -2304,6 +2343,7 @@ fn captureSingleHvfDiskFork(
         config.sessions,
         dirty_tracker,
         config.environ_map,
+        null,
     );
     const ram_capture_ns = runtime_disk_fork_capture.elapsedSince(pause_started_ns);
     var batch = try runtime_disk_fork_capture.prepare(allocator, disk, request.count, .{
@@ -2332,12 +2372,16 @@ fn takeSnapshot(
     sessions: []const spore.Session,
     dirty_tracker: ?*DirtyTracker,
     environ_map: ?*const std.process.Environ.Map,
+    rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
 ) !void {
     try transport_snapshot.validateFullSnapshotTransports(transports);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var pin_threaded = std.Io.Threaded.init(allocator, .{});
+    defer pin_threaded.deinit();
+    const pin_io = pin_threaded.io();
 
     const total_start = monotonicMs();
     const machine_start = total_start;
@@ -2371,11 +2415,20 @@ fn takeSnapshot(
     if (environ_map) |environ| {
         try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, platform.ram_size);
     }
+    var owned_cache_lock: ?rootfs_mod.RootfsCacheLock = null;
+    defer if (owned_cache_lock) |*lock| lock.deinit();
+    const disk_root = if (disk_snapshot != null and environ_map != null) blk: {
+        const cache_root = try local_paths.rootfsCacheRootPath(arena, environ_map.?);
+        if (rootfs_cache_lock) |lock| {
+            if (!try lock.ensureHeldFor(arena, cache_root)) return error.RootfsCacheLockNotHeld;
+        } else owned_cache_lock = try rootfs_mod.lockRootfsCacheExclusive(pin_io, arena, cache_root);
+        break :blk cache_root;
+    } else dir;
     const disk_start = monotonicMs();
-    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir, disk_quiesced) else null;
+    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, disk_root, disk_quiesced) else null;
     const disk_ms = monotonicMs() - disk_start;
     const manifest_start = monotonicMs();
-    try spore.saveManifest(arena, dir, .{
+    const saved_manifest = spore.Manifest{
         .platform = .{
             .cpu_profile = board.cpu_profile,
             .device_model_version = board.device_model_version,
@@ -2394,7 +2447,13 @@ fn takeSnapshot(
         .network = network_manifest,
         .sessions = sessions,
         .memory = memory,
-    });
+    };
+    if (disk_manifest) |disk| {
+        if (environ_map != null) {
+            const registry = try saved_spore_pin.LockedRegistry.init(arena, disk_root, rootfs_cache_lock orelse &owned_cache_lock.?);
+            try saved_spore_pin.publishManifest(pin_io, arena, registry, dir, disk, saved_manifest);
+        } else try spore.saveManifest(arena, dir, saved_manifest);
+    } else try spore.saveManifest(arena, dir, saved_manifest);
     const manifest_ms = monotonicMs() - manifest_start;
     const snapshot_total_ms = monotonicMs() - total_start;
     const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
@@ -2515,8 +2574,11 @@ fn takeSnapshotV1(
     annotations: spore.Annotations,
     sessions: []const spore.Session,
     environ_map: ?*const std.process.Environ.Map,
+    pause_started_ns_out: ?*u64,
+    rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
 ) !void {
     try pauseHvfVcpusForSnapshot(vcpus, state, wake_set);
+    if (pause_started_ns_out) |out| out.* = runtime_disk_fork_capture.monotonicNs();
     // Feature selection is guest-mutable MMIO state. Validate it only after
     // every vCPU has stopped, immediately before transport capture, so a guest
     // cannot race validation with a reset or DRIVER_FEATURES write.
@@ -2529,6 +2591,9 @@ fn takeSnapshotV1(
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var pin_threaded = std.Io.Threaded.init(allocator, .{});
+    defer pin_threaded.deinit();
+    const pin_io = pin_threaded.io();
 
     const total_start = monotonicMs();
     const machine_start = total_start;
@@ -2560,11 +2625,20 @@ fn takeSnapshotV1(
     if (environ_map) |environ| {
         try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, platform.ram_size);
     }
+    var owned_cache_lock: ?rootfs_mod.RootfsCacheLock = null;
+    defer if (owned_cache_lock) |*lock| lock.deinit();
+    const disk_root = if (disk_snapshot != null and environ_map != null) blk: {
+        const cache_root = try local_paths.rootfsCacheRootPath(arena, environ_map.?);
+        if (rootfs_cache_lock) |lock| {
+            if (!try lock.ensureHeldFor(arena, cache_root)) return error.RootfsCacheLockNotHeld;
+        } else owned_cache_lock = try rootfs_mod.lockRootfsCacheExclusive(pin_io, arena, cache_root);
+        break :blk cache_root;
+    } else dir;
     const disk_start = monotonicMs();
-    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir, disk_quiesced) else null;
+    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, disk_root, disk_quiesced) else null;
     const disk_ms = monotonicMs() - disk_start;
     const manifest_start = monotonicMs();
-    try spore.saveManifestV1(arena, dir, .{
+    const saved_manifest = spore.ManifestV1{
         .platform = .{
             .cpu_profile = board.cpu_profile,
             .device_model_version = board.device_model_version,
@@ -2585,7 +2659,13 @@ fn takeSnapshotV1(
         .network = network_manifest,
         .sessions = sessions,
         .memory = memory,
-    });
+    };
+    if (disk_manifest) |disk| {
+        if (environ_map != null) {
+            const registry = try saved_spore_pin.LockedRegistry.init(arena, disk_root, rootfs_cache_lock orelse &owned_cache_lock.?);
+            try saved_spore_pin.publishManifest(pin_io, arena, registry, dir, disk, saved_manifest);
+        } else try spore.saveManifestV1(arena, dir, saved_manifest);
+    } else try spore.saveManifestV1(arena, dir, saved_manifest);
     const manifest_ms = monotonicMs() - manifest_start;
     const snapshot_total_ms = monotonicMs() - total_start;
     const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
@@ -2645,6 +2725,8 @@ fn captureMultiHvfDiskFork(
         options.annotations,
         options.config.sessions,
         options.environ_map,
+        null,
+        null,
     );
     const ram_capture_ns = runtime_disk_fork_capture.elapsedSince(pause_started_ns);
     var batch = try runtime_disk_fork_capture.prepare(allocator, disk, request.count, .{

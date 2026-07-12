@@ -199,8 +199,9 @@ chunk-index-disk-v0
 
 Active writes stay local in a sparse writable head. Capture writes nonzero
 chunks into `cas/rootfs/blake3/objects/`, writes the canonical
-`spore-disk-index-v1` under `cas/rootfs/blake3/indexes/`, and records that index
-digest in the manifest disk. Canonical indexes use the exact field order,
+`spore-disk-index-v1` under `cas/rootfs/blake3/indexes/`, then durably publishes
+its derived completeness stamp before the pin and visible save. The manifest
+disk records that index digest. Canonical indexes use the exact field order,
 two-space JSON layout, lowercase digest references, and no trailing newline
 specified in `docs/spore-format.md`; differently encoded aliases are rejected.
 Restore attaches the verified index to the
@@ -209,7 +210,15 @@ first read and then use the same hot `.base` path as a materialized image.
 
 ## Distribution
 
-`spore pack` follows the selected manifest:
+`spore pack` follows the selected manifest. Machine-local saves may keep
+writable-disk indexes and objects only in the global rootfs CAS. A validated
+host-private durable pin, not the save path, keeps that storage reachable across
+save moves and cache GC/prune. Pack resolves saved-local storage first and then
+the pinned global CAS, verifies the canonical index and every object while
+copying, and emits a self-contained bundle that still restores after the source
+CAS and pin are removed. Raw copies share the source pin identity and can be
+invalidated when either copy is removed; fork or pack/unpack creates an
+independent lifecycle.
 
 - spores without `rootfs.storage` include exact rootfs bytes under
   `rootfs/blake3/<hex>.ext4`;

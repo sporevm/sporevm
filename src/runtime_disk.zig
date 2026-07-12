@@ -13,6 +13,7 @@ const local_paths = @import("local_paths.zig");
 const rootfs_mod = @import("rootfs.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
+const saved_spore_pin = @import("saved_spore_pin.zig");
 const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const spore = @import("spore.zig");
@@ -132,7 +133,6 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
     // artifact, which may legitimately have been pruned after the save.
     if (options.disk) |disk| {
         const rootfs = options.rootfs orelse return error.BadManifest;
-        const disk_root = options.disk_root orelse options.spore_dir orelse return error.BadManifest;
         if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) {
             if (std.mem.eql(u8, disk.kind, spore.disk_kind_cow_block)) return error.FormatTooOld;
             return error.BadManifest;
@@ -143,6 +143,11 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         if (disk.chunk_size != spore.disk_chunk_size) return error.BadManifest;
         if (!std.mem.eql(u8, disk.hash_algorithm, spore.rootfs_storage_hash_algorithm_blake3)) return error.BadManifest;
         if (!std.mem.eql(u8, disk.object_namespace, spore.rootfs_storage_object_namespace)) return error.BadManifest;
+        var authority = try resolveSavedDiskRoot(context, allocator, options, disk);
+        defer allocator.free(authority.root);
+        runtime.runtime_lease = authority.runtime_lease;
+        authority.runtime_lease = null;
+        const disk_root = authority.root;
         runtime.rootfs_fd = try createSparseTempFd(context, allocator, disk.size);
         const base_source = try runtime.baseSource(disk.size);
         const writable = try openWritable(context, allocator, base_source, disk.size, disk.chunk_size);
@@ -235,6 +240,41 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
     }
 
     return runtime;
+}
+
+const SavedDiskAuthority = struct { root: []const u8, runtime_lease: ?runtime_disk_lease.Active = null };
+
+fn resolveSavedDiskRoot(context: Context, allocator: std.mem.Allocator, options: Options, disk: spore.Disk) !SavedDiskAuthority {
+    if (options.disk_root) |root| return .{ .root = try allocator.dupe(u8, root) };
+    const spore_dir = options.spore_dir orelse return error.BadManifest;
+    if (try saved_spore_pin.hasLocalIndex(context.io, allocator, spore_dir, disk)) {
+        return .{ .root = try allocator.dupe(u8, spore_dir) };
+    }
+    const configured_root = try rootfsCacheRootPath(context, allocator);
+    defer allocator.free(configured_root);
+    const cache_root = if (std.fs.path.isAbsolute(configured_root))
+        try allocator.dupe(u8, configured_root)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(context.io, allocator);
+        defer allocator.free(cwd);
+        break :blk try std.fs.path.resolve(allocator, &.{ cwd, configured_root });
+    };
+    errdefer allocator.free(cache_root);
+    var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, cache_root);
+    defer cache_lock.deinit();
+    const registry = try saved_spore_pin.LockedRegistry.init(allocator, cache_root, &cache_lock);
+    var pin = try saved_spore_pin.loadForSporeLocked(context.io, allocator, registry, spore_dir, disk);
+    defer pin.deinit();
+    const runtime_root = try local_paths.runtimeRootPath(allocator, context.environ_map);
+    defer allocator.free(runtime_root);
+    const lease = runtime_disk_lease.Lease{
+        .store = .rootfs_cache,
+        .root = cache_root,
+        .baseline_kind = .disk_index,
+        .baseline_identity = disk.base,
+        .rootfs_storage = try saved_spore_pin.storageForDisk(disk),
+    };
+    return .{ .root = cache_root, .runtime_lease = try runtime_disk_lease.acquireActive(context.io, allocator, runtime_root, lease) };
 }
 
 const WritableDisk = struct {
@@ -1270,7 +1310,7 @@ test "runtime disk restores chunk-index disk manifests" {
 
     const patch = "chunk-index restore";
     try source_disk.writeAt(patch, 4096 + 32);
-    const saved_disk = try source_disk.snapshotIndex(spore_dir, rootfs.device, true);
+    const saved_disk = try source_disk.snapshotIndex(cache_root, rootfs.device, true);
     defer {
         allocator.free(saved_disk.kind);
         allocator.free(saved_disk.device.kind);
@@ -1285,16 +1325,53 @@ test "runtime disk restores chunk-index disk manifests" {
     const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
     try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
     const context = Context{ .io = io, .environ_map = &env };
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = spore_dir ++ "/manifest.json", .data = "manifest" });
+    var pin_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, absolute_cache_root);
+    defer pin_lock.deinit();
+    const pin_registry = try saved_spore_pin.LockedRegistry.init(arena, absolute_cache_root, &pin_lock);
+    const pin_id = try saved_spore_pin.create(io, arena, pin_registry, spore_dir, saved_disk);
+    pin_lock.deinit();
+    const storage = try saved_spore_pin.storageForDisk(saved_disk);
+    const global_index_path = try rootfs_cas.manifestIndexPath(arena, absolute_cache_root, storage.index_digest);
+    const index_bytes = try Io.Dir.cwd().readFileAlloc(io, global_index_path, arena, .limited(disk_index.max_index_bytes));
+    var local_index = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
+    defer local_index.deinit();
+    const local_index_path = try rootfs_cas.manifestIndexPath(arena, spore_dir, storage.index_digest);
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(local_index_path).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = local_index_path, .data = index_bytes });
+    for (local_index.value.chunks) |entry| {
+        const source_object = try rootfs_cas.manifestObjectPath(arena, absolute_cache_root, entry.digest);
+        const object_bytes = try Io.Dir.cwd().readFileAlloc(io, source_object, arena, .limited(rootfs_cas.default_chunk_size));
+        const local_object = try rootfs_cas.manifestObjectPath(arena, spore_dir, entry.digest);
+        try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(local_object).?);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = local_object, .data = object_bytes });
+    }
+    // Leave the host-private ref stale. Runtime open must prefer the complete
+    // local CAS and must not consult the missing global pin.
+    var remove_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, absolute_cache_root);
+    defer remove_lock.deinit();
+    const remove_registry = try saved_spore_pin.LockedRegistry.init(arena, absolute_cache_root, &remove_lock);
+    try saved_spore_pin.remove(io, arena, remove_registry, pin_id);
+    remove_lock.deinit();
+    const moved_dir = tmp ++ "/moved.spore";
+    try Io.Dir.rename(Io.Dir.cwd(), spore_dir, Io.Dir.cwd(), moved_dir, io);
 
     var runtime = try open(context, allocator, .{
         .rootfs = rootfs,
         .disk = saved_disk,
-        .spore_dir = spore_dir,
+        .spore_dir = moved_dir,
     });
-    defer runtime.deinit();
 
     try std.testing.expect(runtime.chunk_mapped != null);
     var readback: [patch.len]u8 = undefined;
     try runtime.chunk_mapped.?.readAt(&readback, 4096 + 32);
     try std.testing.expectEqualStrings(patch, &readback);
+
+    runtime.deinit();
+    const missing = try rootfs_cas.manifestObjectPath(arena, moved_dir, local_index.value.chunks[0].digest);
+    try Io.Dir.cwd().deleteFile(io, missing);
+    var missing_runtime = try open(context, allocator, .{ .rootfs = rootfs, .disk = saved_disk, .spore_dir = moved_dir });
+    defer missing_runtime.deinit();
+    var missing_byte: [1]u8 = undefined;
+    try std.testing.expectError(error.MissingChunk, missing_runtime.chunk_mapped.?.readAt(&missing_byte, local_index.value.chunks[0].logical_chunk * storage.chunk_size));
 }
