@@ -1477,6 +1477,35 @@ fn mapFileBackedRamFd(fd: std.c.fd_t, size: u64) !RamMapping {
     return .{ .bytes = bytes, .file_backed = true };
 }
 
+test "file-backed RAM mappings isolate parent and siblings" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var backing = try tmp.dir.createFile(io, "ram.backing", .{ .read = true });
+    defer backing.close(io);
+    const size: u64 = std.heap.page_size_min;
+    if (std.c.ftruncate(backing.handle, @intCast(size)) != 0) return error.IoFailed;
+    try backing.writePositionalAll(io, &[_]u8{0x42}, 0);
+
+    const parent = try mapFileBackedRamFd(backing.handle, size);
+    defer parent.deinit();
+    const first = try mapFileBackedRamFd(backing.handle, size);
+    defer first.deinit();
+    const second = try mapFileBackedRamFd(backing.handle, size);
+    defer second.deinit();
+    parent.bytes[0] = 0x11;
+    try std.testing.expectEqual(@as(u8, 0x42), first.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x42), second.bytes[0]);
+    first.bytes[0] = 0x22;
+    second.bytes[0] = 0x33;
+    try std.testing.expectEqual(@as(u8, 0x11), parent.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x22), first.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x33), second.bytes[0]);
+    var stored: [1]u8 = undefined;
+    try std.testing.expectEqual(stored.len, try backing.readPositionalAll(io, &stored, 0));
+    try std.testing.expectEqual(@as(u8, 0x42), stored[0]);
+}
+
 fn fileSize(fd: std.c.fd_t) !u64 {
     const cur = std.c.lseek(fd, 0, std.c.SEEK.CUR);
     if (cur < 0) return error.IoFailed;
@@ -1907,9 +1936,7 @@ fn takeSnapshot(
         try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
     const memory_ms = (try monotonicMs()) - memory_start;
     if (environ_map) |environ| {
-        spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, ram_size) catch |err| {
-            std.log.debug("local RAM backing proof unavailable: {s}", .{@errorName(err)});
-        };
+        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, ram_size);
     }
     const disk_start = try monotonicMs();
     const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir, disk_quiesced) else null;
@@ -2088,9 +2115,7 @@ fn takeSnapshotV1(
         try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
     const memory_ms = (try monotonicMs()) - memory_start;
     if (environ_map) |environ| {
-        spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, ram_size) catch |err| {
-            std.log.debug("local RAM backing proof unavailable: {s}", .{@errorName(err)});
-        };
+        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, ram_size);
     }
     const disk_start = try monotonicMs();
     const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir, disk_quiesced) else null;

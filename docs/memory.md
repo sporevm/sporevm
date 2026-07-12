@@ -36,8 +36,13 @@ The backing file is never portable restore authority. Product restore maps it
 only when `ram.backing.proof` validates against the canonical memory index
 identity, opened file identity, backing metadata, and host-local runtime key.
 That fingerprint uses the same canonical `spore-disk-index-v1` byte encoding as
-disk and rootfs indexes. Missing, corrupt, foreign-key, symlinked, or mismatched
-proofs fall back to chunks.
+disk and rootfs indexes. The fixed backing and proof paths are inspected without
+following symlinks and must name regular files. Missing, symlinked, non-regular,
+or size-mismatched optional paths, and stale, malformed, foreign-key, or
+cryptographically mismatched proofs, fall back to chunks. Malformed
+authoritative memory/index/backing metadata, allocation failure, unexpected
+host I/O, corrupt chunks, and backend/platform/topology errors remain restore
+errors; fallback does not hide failures outside the optional acceleration hint.
 
 ## Local CoW
 
@@ -46,8 +51,13 @@ can be shared by the host; guest writes fault into private CoW pages. This is
 the same-host fork/fan-out fast path.
 
 `spore fork` hard-links a proof-valid parent backing file into each child and
-writes child-local proofs. If hard-linking, parent proof validation, or child
-proof writing fails, children omit backing metadata and resume from chunks.
+writes child-local proofs. The proven parent fd stays open across the batch; each
+new child link is opened without following symlinks and must match every
+proof-bound parent file-identity field before its proof is written. An
+unavailable or invalid parent proof, a specifically classified unavailable
+hard-link capability, or a conflicting optional child proof produces chunk-only
+children. Malformed parent metadata, allocation failure, identity races, and
+unexpected hard-link or proof-write I/O abort the fork instead of being hidden.
 
 `spore pack`, `spore unpack`, and `spore pull` remain chunk-authoritative.
 Bundles must not treat proof files as distribution authority.

@@ -127,6 +127,32 @@ const RestoreStats = struct {
     nonzero_chunk_count: usize = 0,
 };
 
+fn formatRestoreMetrics(buffer: []u8, ram_size: u64, stats: *RestoreStats, start_ms: u64) []const u8 {
+    stats.pre_run_ms = start_ms - stats.start_ms;
+    return std.fmt.bufPrint(
+        buffer,
+        "hvf restore metrics: mode={s} ram_mib={d} chunks={d} nonzero_chunks={d} manifest_ms={d} map_ram_ms={d} memory_ms={d} state_ms={d} pre_run_ms={d}",
+        .{
+            stats.mode,
+            ram_size / 1024 / 1024,
+            stats.chunk_count,
+            stats.nonzero_chunk_count,
+            stats.manifest_ms,
+            stats.map_ram_ms,
+            stats.memory_ms,
+            stats.state_ms,
+            stats.pre_run_ms,
+        },
+    ) catch unreachable;
+}
+
+fn emitRestoreMetrics(config: Config, restore_stats: *?RestoreStats, start_ms: u64) void {
+    if (restore_stats.*) |*stats| {
+        var buffer: [512]u8 = undefined;
+        std.log.info("{s}", .{formatRestoreMetrics(&buffer, config.ram_size, stats, start_ms)});
+    }
+}
+
 const RamMapping = struct {
     bytes: []align(std.heap.page_size_min) u8,
     file_backed: bool,
@@ -492,23 +518,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     const counter_start = snapshot.hostCounter();
     const counter_freq = snapshot.hostCounterFreq();
     const start_ms = monotonicMs();
-    if (restore_stats) |*stats| {
-        stats.pre_run_ms = start_ms - stats.start_ms;
-        std.log.info(
-            "hvf restore metrics: mode={s} ram_mib={d} chunks={d} nonzero_chunks={d} manifest_ms={d} map_ram_ms={d} memory_ms={d} state_ms={d} pre_run_ms={d}",
-            .{
-                stats.mode,
-                config.ram_size / 1024 / 1024,
-                stats.chunk_count,
-                stats.nonzero_chunk_count,
-                stats.manifest_ms,
-                stats.map_ram_ms,
-                stats.memory_ms,
-                stats.state_ms,
-                stats.pre_run_ms,
-            },
-        );
-    }
+    emitRestoreMetrics(config, &restore_stats, start_ms);
     var attach_probe_ms: u64 = 0;
     if (config.exec_probe_start == .immediate) {
         if (config.exec_probe) |probe| {
@@ -1214,6 +1224,8 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
         boot_ms = monotonicMs() - boot_start;
     }
 
+    emitRestoreMetrics(options.config.*, options.restore_stats, monotonicMs());
+
     var attach_probe_ms: u64 = 0;
     if (options.config.exec_probe_start == .immediate) {
         if (options.config.exec_probe) |probe| {
@@ -1913,6 +1925,35 @@ fn mapFileBackedRamFd(fd: std.c.fd_t, size: u64) !RamMapping {
     return .{ .bytes = bytes, .file_backed = true };
 }
 
+test "file-backed RAM mappings isolate parent and siblings" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var backing = try tmp.dir.createFile(io, "ram.backing", .{ .read = true });
+    defer backing.close(io);
+    const size: u64 = std.heap.page_size_min;
+    if (std.c.ftruncate(backing.handle, @intCast(size)) != 0) return error.IoFailed;
+    try backing.writePositionalAll(io, &[_]u8{0x42}, 0);
+
+    const parent = try mapFileBackedRamFd(backing.handle, size);
+    defer parent.deinit();
+    const first = try mapFileBackedRamFd(backing.handle, size);
+    defer first.deinit();
+    const second = try mapFileBackedRamFd(backing.handle, size);
+    defer second.deinit();
+    parent.bytes[0] = 0x11;
+    try std.testing.expectEqual(@as(u8, 0x42), first.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x42), second.bytes[0]);
+    first.bytes[0] = 0x22;
+    second.bytes[0] = 0x33;
+    try std.testing.expectEqual(@as(u8, 0x11), parent.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x22), first.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x33), second.bytes[0]);
+    var stored: [1]u8 = undefined;
+    try std.testing.expectEqual(stored.len, try backing.readPositionalAll(io, &stored, 0));
+    try std.testing.expectEqual(@as(u8, 0x42), stored[0]);
+}
+
 fn fileSize(fd: std.c.fd_t) !u64 {
     const cur = std.c.lseek(fd, 0, std.c.SEEK.CUR);
     if (cur < 0) return error.IoFailed;
@@ -2328,9 +2369,7 @@ fn takeSnapshot(
         try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
     const memory_ms = monotonicMs() - memory_start;
     if (environ_map) |environ| {
-        spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, platform.ram_size) catch |err| {
-            std.log.debug("local RAM backing proof unavailable: {s}", .{@errorName(err)});
-        };
+        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, platform.ram_size);
     }
     const disk_start = monotonicMs();
     const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir, disk_quiesced) else null;
@@ -2519,9 +2558,7 @@ fn takeSnapshotV1(
     const memory = try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
     const memory_ms = monotonicMs() - memory_start;
     if (environ_map) |environ| {
-        spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, platform.ram_size) catch |err| {
-            std.log.debug("local RAM backing proof unavailable: {s}", .{@errorName(err)});
-        };
+        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, platform.ram_size);
     }
     const disk_start = monotonicMs();
     const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir, disk_quiesced) else null;
@@ -2943,6 +2980,25 @@ fn dataAbortExitForTest(ipa: u64, sas: u2, srt: u5, is_write: bool) hvf.VcpuExit
             .physical_address = ipa,
         },
     };
+}
+
+test "restore metrics include source, RAM size, and backend timings" {
+    var stats = RestoreStats{
+        .start_ms = 100,
+        .manifest_ms = 1,
+        .map_ram_ms = 2,
+        .memory_ms = 3,
+        .state_ms = 4,
+        .mode = "local_backing",
+        .chunk_count = 5,
+        .nonzero_chunk_count = 6,
+    };
+    var buffer: [512]u8 = undefined;
+    const line = formatRestoreMetrics(&buffer, 1024 * 1024 * 1024, &stats, 110);
+    try std.testing.expectEqualStrings(
+        "hvf restore metrics: mode=local_backing ram_mib=1024 chunks=5 nonzero_chunks=6 manifest_ms=1 map_ram_ms=2 memory_ms=3 state_ms=4 pre_run_ms=10",
+        line,
+    );
 }
 
 test "psci target index accepts normalized mpidr affinity" {

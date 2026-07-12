@@ -7,6 +7,7 @@
 
 const std = @import("std");
 
+const local_paths = @import("local_paths.zig");
 const spore = @import("spore.zig");
 const topology = @import("topology.zig");
 
@@ -31,8 +32,6 @@ pub const Plan = struct {
         vcpu_count: topology.VcpuCount,
     ) !Plan {
         try topology.validateVcpuCount(vcpu_count);
-        const ram_len = std.math.cast(usize, ram_size) orelse return error.BadManifest;
-        _ = try spore.validateMemoryForRam(memory, ram_len);
         const local = try spore.openProvenLocalMemoryBacking(allocator, environ, dir, memory, ram_size);
         return fromLocalBacking(local);
     }
@@ -109,7 +108,7 @@ test "RAM restore plan resolves local and chunk strategies" {
     try std.testing.expectEqual(spore.LocalBackingRestoreReason.proof_unavailable, chunks_plan.reason);
 }
 
-test "RAM restore plan validates multi-vCPU chunk restore" {
+test "RAM restore plan validates one and multi-vCPU chunk restore" {
     const allocator = std.testing.allocator;
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -118,9 +117,46 @@ test "RAM restore plan validates multi-vCPU chunk restore" {
         .chunk_size = spore.chunk_size,
         .zero_chunks = &.{0},
     };
-    const plan = try Plan.fromMemory(allocator, &env, "/unused", memory, spore.chunk_size, 2);
-    try std.testing.expect(plan.strategy == .eager_chunks);
-    try std.testing.expectEqual(spore.LocalBackingRestoreReason.no_backing, plan.reason);
+    const one_vcpu = try Plan.fromMemory(allocator, &env, "/unused", memory, spore.chunk_size, 1);
+    try std.testing.expect(one_vcpu.strategy == .eager_chunks);
+    try std.testing.expectEqual(spore.LocalBackingRestoreReason.no_backing, one_vcpu.reason);
+    const multi_vcpu = try Plan.fromMemory(allocator, &env, "/unused", memory, spore.chunk_size, 2);
+    try std.testing.expect(multi_vcpu.strategy == .eager_chunks);
+    try std.testing.expectEqual(spore.LocalBackingRestoreReason.no_backing, multi_vcpu.reason);
     try std.testing.expectError(error.UnsupportedVcpuCount, Plan.fromMemory(allocator, &env, "/unused", memory, spore.chunk_size, 0));
     try std.testing.expectError(error.UnsupportedVcpuCount, Plan.fromMemory(allocator, &env, "/unused", memory, spore.chunk_size, topology.max_vcpus + 1));
+}
+
+test "RAM restore plan preserves proven backing for one and multi-vCPU restore" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_root = try std.fmt.allocPrintSentinel(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]}, 0);
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const resolved_root = std.c.realpath(relative_root, &root_buf) orelse return error.IoFailed;
+    const root = try arena.dupe(u8, std.mem.span(resolved_root));
+    const dir = try std.fmt.allocPrint(arena, "{s}/spore", .{root});
+    const runtime_dir = try std.fmt.allocPrint(arena, "{s}/runtime", .{root});
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.runtime_dir_env, runtime_dir);
+
+    const ram = try arena.alloc(u8, spore.chunk_size);
+    @memset(ram, 0x5A);
+    const memory = try spore.saveMemoryWithBacking(arena, dir, ram);
+    try spore.writeLocalMemoryBackingProof(arena, &env, dir, memory, ram.len);
+
+    var one = try Plan.fromMemory(arena, &env, dir, memory, ram.len, 1);
+    try std.testing.expect(one.strategy == .local_backing);
+    try std.testing.expectEqual(spore.LocalBackingRestoreReason.proof_valid, one.reason);
+    one.deinit();
+
+    var multi = try Plan.fromMemory(arena, &env, dir, memory, ram.len, 2);
+    defer multi.deinit();
+    try std.testing.expect(multi.strategy == .local_backing);
+    try std.testing.expectEqual(spore.LocalBackingRestoreReason.proof_valid, multi.reason);
 }
