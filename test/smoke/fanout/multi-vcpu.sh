@@ -57,10 +57,10 @@ print(value)
 PY
 }
 
-expect_manifest_v1() {
+expect_manifest_v3() {
   local dir="$1"
   [[ -f "${dir}/manifest.json" ]] || die "missing manifest: ${dir}/manifest.json"
-  [[ "$(manifest_field "${dir}/manifest.json" version)" == "1" ]] || die "manifest is not v1: ${dir}/manifest.json"
+  [[ "$(manifest_field "${dir}/manifest.json" version)" == "3" ]] || die "manifest is not v3: ${dir}/manifest.json"
   [[ "$(manifest_field "${dir}/manifest.json" platform.vcpu_count)" == "${vcpus}" ]] || die "manifest vcpu_count mismatch: ${dir}/manifest.json"
 }
 
@@ -76,6 +76,32 @@ expect_nproc_equals() {
     cat "${stdout}" >&2 || true
     die "guest reported ${count} CPUs, expected ${vcpus}"
   }
+}
+
+expect_online_cpus() {
+  local stdout="$1"
+  local actual expected="0"
+  actual="$(awk '/^spore cpus-online / {print $3; exit}' "${stdout}")"
+  if (( vcpus > 1 )); then
+    expected="0-$((vcpus - 1))"
+  fi
+  [[ "${actual}" == "${expected}" ]] || {
+    cat "${stdout}" >&2 || true
+    die "guest reported online CPUs ${actual:-unknown}, expected ${expected}"
+  }
+}
+
+expect_named_online_cpus() {
+  local name="$1"
+  local prefix="$2"
+  local stdout="${workdir}/${prefix}.stdout"
+  local stderr="${workdir}/${prefix}.stderr"
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${name}" -- "${online_cpu_command[@]}" >"${stdout}" 2>"${stderr}"; then
+    cat "${stdout}" >&2 || true
+    cat "${stderr}" >&2 || true
+    die "multi-vCPU online CPU check failed for ${name}"
+  fi
+  expect_online_cpus "${stdout}"
 }
 
 # expect_still_ticking NAME PREFIX -> assert the guest counter advances, proving
@@ -110,6 +136,8 @@ esac
 vcpus="${SPORE_SMOKE_VCPUS:-2}"
 memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-512}mib}"
 create_timeout_ms="${SPORE_SMOKE_CREATE_TIMEOUT_MS:-120000}"
+(( vcpus > 1 )) || die "multi-vCPU smoke requires SPORE_SMOKE_VCPUS greater than 1"
+online_cpu_command=(/bin/sh -c 'printf "spore cpus-online "; cat /sys/devices/system/cpu/online')
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-multi-vcpu.XXXXXX")"
 # Keep the runtime dir short: control socket paths must fit the 104-byte
 # macOS sun_path limit, and macOS TMPDIR lives under a deep /var/folders path.
@@ -163,9 +191,9 @@ if ! "${spore_bin}" run \
   cat "${workdir}/from-base.stderr" >&2 || true
   die "multi-vCPU run --save base failed"
 fi
-expect_manifest_v1 "${from_base_dir}"
+expect_manifest_v3 "${from_base_dir}"
 
-fork_dir="${workdir}/v1-children"
+fork_dir="${workdir}/v3-children"
 fork_child_stdout="${workdir}/fork-child.stdout"
 fork_child_stderr="${workdir}/fork-child.stderr"
 if ! "${spore_bin}" fork "${from_base_dir}" --count 2 --out "${fork_dir}" \
@@ -174,8 +202,8 @@ if ! "${spore_bin}" fork "${from_base_dir}" --count 2 --out "${fork_dir}" \
   cat "${workdir}/fork.stderr" >&2 || true
   die "multi-vCPU fork failed"
 fi
-expect_manifest_v1 "${fork_dir}/000000"
-expect_manifest_v1 "${fork_dir}/000001"
+expect_manifest_v3 "${fork_dir}/000000"
+expect_manifest_v3 "${fork_dir}/000001"
 
 if ! "${spore_bin}" run \
   --backend "${backend}" \
@@ -236,7 +264,7 @@ if [[ "${capture_status}" != "0" ]]; then
   cat "${capture_stderr}" >&2 || true
   die "multi-vCPU signal capture did not finish cleanly"
 fi
-expect_manifest_v1 "${capture_dir}"
+expect_manifest_v3 "${capture_dir}"
 
 resume_stdout="${workdir}/resume.stdout"
 resume_stderr="${workdir}/resume.stderr"
@@ -259,23 +287,13 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     cat "${workdir}/create.stderr" >&2 || true
     die "multi-vCPU named create failed"
   fi
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${vm_name}" -- /bin/nproc >"${workdir}/exec-nproc.stdout" 2>"${workdir}/exec-nproc.stderr"; then
-    cat "${workdir}/exec-nproc.stdout" >&2 || true
-    cat "${workdir}/exec-nproc.stderr" >&2 || true
-    die "multi-vCPU named exec nproc failed"
-  fi
-  expect_nproc_equals "${workdir}/exec-nproc.stdout"
+  expect_named_online_cpus "${vm_name}" "exec-cpus-online"
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" fork --vm "${vm_name}" --count 1 --name "${forked_name}" >"${workdir}/named-fork.stdout" 2>"${workdir}/named-fork.stderr"; then
     cat "${workdir}/named-fork.stdout" >&2 || true
     cat "${workdir}/named-fork.stderr" >&2 || true
     die "multi-vCPU named fork failed"
   fi
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${forked_name}" -- /bin/nproc >"${workdir}/forked-nproc.stdout" 2>"${workdir}/forked-nproc.stderr"; then
-    cat "${workdir}/forked-nproc.stdout" >&2 || true
-    cat "${workdir}/forked-nproc.stderr" >&2 || true
-    die "multi-vCPU named fork child exec nproc failed"
-  fi
-  expect_nproc_equals "${workdir}/forked-nproc.stdout"
+  expect_named_online_cpus "${forked_name}" "forked-cpus-online"
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${forked_name}" >/dev/null
 
   # Non-destructive multi-vCPU save for an exec-ready VM: save it WITHOUT
@@ -288,7 +306,7 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     cat "${workdir}/named-live-save.stderr" >&2 || true
     die "multi-vCPU named non-destructive save failed"
   fi
-  expect_manifest_v1 "${concurrent_dir}"
+  expect_manifest_v3 "${concurrent_dir}"
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" ls >"${workdir}/named-live-ls.stdout" 2>"${workdir}/named-live-ls.stderr"; then
     cat "${workdir}/named-live-ls.stdout" >&2 || true
     cat "${workdir}/named-live-ls.stderr" >&2 || true
@@ -303,18 +321,13 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     cat "${workdir}/named-live-restore.stderr" >&2 || true
     die "multi-vCPU restore of non-destructive save failed"
   fi
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${concurrent_name}" -- /bin/nproc >"${workdir}/named-live-nproc.stdout" 2>"${workdir}/named-live-nproc.stderr"; then
-    cat "${workdir}/named-live-nproc.stdout" >&2 || true
-    cat "${workdir}/named-live-nproc.stderr" >&2 || true
-    die "multi-vCPU exec after non-destructive restore failed"
-  fi
-  expect_nproc_equals "${workdir}/named-live-nproc.stdout"
+  expect_named_online_cpus "${concurrent_name}" "named-live-cpus-online"
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${concurrent_name}" >/dev/null
 
   # Non-destructive multi-vCPU save of an active workload: prove the source VM
   # stays registered and keeps ticking after save, then remove the source and
   # verify the point-in-time spore restores and preserves the captured workload
-  # state. `expect_manifest_v1` above verifies the saved vCPU topology; the first
+  # state. `expect_manifest_v3` above verifies the saved vCPU topology; the first
   # post-restore exec may run under the restored file-stdio affinity gate.
   live_name="${vm_name}-live"
   live_restored_name="${vm_name}-live-restored"
@@ -331,7 +344,7 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     cat "${workdir}/live-save.stderr" >&2 || true
     die "multi-vCPU non-destructive save failed"
   fi
-  expect_manifest_v1 "${live_dir}"
+  expect_manifest_v3 "${live_dir}"
   # The source VM must still be registered as ready after a non-destructive save.
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" ls >"${workdir}/live-ls.stdout" 2>"${workdir}/live-ls.stderr"; then
     cat "${workdir}/live-ls.stdout" >&2 || true
@@ -360,8 +373,8 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     cat "${workdir}/suspend.stderr" >&2 || true
     die "multi-vCPU named save --stop failed"
   fi
-  expect_manifest_v1 "${named_dir}"
-  # Multi-vCPU stopped saves write v1 manifests; inspect must accept everything
+  expect_manifest_v3 "${named_dir}"
+  # Multi-vCPU stopped saves write v3 manifests; inspect must accept everything
   # restore accepts.
   if ! "${spore_bin}" --json inspect "${named_dir}" >"${workdir}/inspect.json" 2>"${workdir}/inspect.stderr"; then
     cat "${workdir}/inspect.json" >&2 || true
@@ -377,12 +390,7 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     cat "${workdir}/named-resume.stderr" >&2 || true
     die "multi-vCPU named restore failed"
   fi
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${resumed_name}" -- /bin/nproc >"${workdir}/named-exec.stdout" 2>"${workdir}/named-exec.stderr"; then
-    cat "${workdir}/named-exec.stdout" >&2 || true
-    cat "${workdir}/named-exec.stderr" >&2 || true
-    die "multi-vCPU named exec after restore failed"
-  fi
-  expect_nproc_equals "${workdir}/named-exec.stdout"
+  expect_named_online_cpus "${resumed_name}" "named-cpus-online"
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${resumed_name}" >/dev/null
 fi
 
