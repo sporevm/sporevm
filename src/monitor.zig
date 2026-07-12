@@ -2516,6 +2516,10 @@ test "snapshot publication handoff retains the new baseline across concurrent sa
         .baseline_identity = new_fixture.storage.index_digest,
         .rootfs_storage = new_fixture.storage,
     };
+    // The successful handoff replaces active_slot with an Active allocated by
+    // this worker arena. Keep that owner alive until active_slot is released.
+    var handoff_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer handoff_arena_state.deinit();
     var active_slot: ?runtime_disk_lease.Active = try runtime_disk_lease.acquireActive(io, allocator, runtime_root, old_lease);
     defer if (active_slot) |*active| active.deinit();
     {
@@ -2561,8 +2565,6 @@ test "snapshot publication handoff retains the new baseline across concurrent sa
             self.finish.waitUncancelable(self.io);
         }
     };
-    var handoff_arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer handoff_arena_state.deinit();
     var handoff_context = HandoffContext{
         .allocator = handoff_arena_state.allocator(),
         .io = io,
