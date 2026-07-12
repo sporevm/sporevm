@@ -3012,6 +3012,14 @@ struct supported_copy_xattrs {
   unsigned char capability[MAX_COPY_XATTR_VALUE];
 };
 
+// The only accepted security namespace entry is a capability attached to a
+// regular source file. Directory/symlink sources and every pre-existing
+// destination must reject all visible security.* metadata.
+static int copy_security_xattr_allowed(int regular_source, int existing_destination, const char *name) {
+  if (strncmp(name, "security.", 9) != 0) return 1;
+  return regular_source && !existing_destination && strcmp(name, "security.capability") == 0;
+}
+
 static int read_supported_xattrs(int source_fd, struct supported_copy_xattrs *out) {
   memset(out, 0, sizeof(*out));
   char names[MAX_COPY_XATTR_NAMES + 1];
@@ -3030,7 +3038,7 @@ static int read_supported_xattrs(int source_fd, struct supported_copy_xattrs *ou
       return -1;
     }
     if (strncmp(name, "security.", 9) == 0) {
-      if (strcmp(name, "security.capability") != 0) {
+      if (!copy_security_xattr_allowed(1, 0, name)) {
         errno = EOPNOTSUPP;
         return -1;
       }
@@ -3075,7 +3083,7 @@ static int reject_security_xattrs_at(int parent_fd, const char *name) {
       errno = EIO;
       return -1;
     }
-    if (strncmp(xattr_name, "security.", 9) == 0) {
+    if (!copy_security_xattr_allowed(0, 0, xattr_name)) {
       errno = EOPNOTSUPP;
       return -1;
     }
@@ -3100,7 +3108,7 @@ static int reject_security_xattrs_fd(int fd) {
       errno = EIO;
       return -1;
     }
-    if (strncmp(name, "security.", 9) == 0) {
+    if (!copy_security_xattr_allowed(0, 0, name)) {
       errno = EOPNOTSUPP;
       return -1;
     }
@@ -5620,6 +5628,14 @@ __attribute__((visibility("hidden"))) int spore_agent_test_security_xattr_long_n
   unlinkat(root_fd, name, 0);
   close(root_fd);
   return rc;
+}
+
+__attribute__((visibility("hidden"))) int spore_agent_test_copy_security_xattr_policy(int regular_source, int existing_destination, const unsigned char *name_bytes, size_t name_len) {
+  if (name_len == 0 || name_len > 255 || memchr(name_bytes, '\0', name_len) != NULL) return -1;
+  char name[256];
+  memcpy(name, name_bytes, name_len);
+  name[name_len] = '\0';
+  return copy_security_xattr_allowed(regular_source, existing_destination, name) ? 0 : -1;
 }
 #else
 int main(void) {

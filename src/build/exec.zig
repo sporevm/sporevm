@@ -1152,6 +1152,7 @@ extern fn spore_agent_test_confined_source_parent(root: [*]const u8, root_len: u
 extern fn spore_agent_fuzz_copy_tree(source_root: [*]const u8, source_root_len: usize, dest_root: [*]const u8, dest_root_len: usize, fuzz: [*]const u8, fuzz_len: usize) c_int;
 extern fn spore_agent_test_build_fd_budget() u64;
 extern fn spore_agent_test_security_xattr_long_name(root: [*]const u8, root_len: usize) c_int;
+extern fn spore_agent_test_copy_security_xattr_policy(regular_source: c_int, existing_destination: c_int, name: [*]const u8, name_len: usize) c_int;
 
 fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
     if (comptime guest_agent_fuzz_supported) {
@@ -1231,6 +1232,34 @@ test "security xattr inspection accepts an ext4 maximum-length clean name" {
         defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
         try Io.Dir.cwd().createDirPath(io, tmp);
         try std.testing.expectEqual(@as(c_int, 0), spore_agent_test_security_xattr_long_name(tmp.ptr, tmp.len));
+    }
+}
+
+test "COPY security xattr policy is regular-file capability only" {
+    if (comptime guest_agent_fuzz_supported) {
+        const cases = [_]struct {
+            regular_source: c_int,
+            existing_destination: c_int,
+            name: []const u8,
+            accepted: bool,
+        }{
+            .{ .regular_source = 1, .existing_destination = 0, .name = "security.capability", .accepted = true },
+            .{ .regular_source = 1, .existing_destination = 0, .name = "security.ima", .accepted = false },
+            .{ .regular_source = 0, .existing_destination = 0, .name = "security.capability", .accepted = false },
+            .{ .regular_source = 0, .existing_destination = 0, .name = "security.selinux", .accepted = false },
+            .{ .regular_source = 1, .existing_destination = 1, .name = "security.capability", .accepted = false },
+            .{ .regular_source = 0, .existing_destination = 1, .name = "security.capability", .accepted = false },
+            .{ .regular_source = 0, .existing_destination = 1, .name = "user.visible", .accepted = true },
+        };
+        for (cases) |case| {
+            const result = spore_agent_test_copy_security_xattr_policy(
+                case.regular_source,
+                case.existing_destination,
+                case.name.ptr,
+                case.name.len,
+            );
+            try std.testing.expectEqual(case.accepted, result == 0);
+        }
     }
 }
 

@@ -18,10 +18,16 @@ const ext4 = @import("rootfs/ext4.zig");
 const ext4_writer = @import("rootfs/ext4_writer.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
+const system_mod = @import("system.zig");
+const test_barrier = @import("test_barrier.zig");
 const topology = @import("topology.zig");
 
 const scratch_inode_count: u32 = 131_072;
 const scratch_format_identity = "sporevm-empty-ext4-scratch-v2:image=16GiB:inodes=131072:writer=ext4-sparse-spans-v1";
+
+pub const testing = if (builtin.is_test) struct {
+    pub var before_final_publish_barrier: ?*test_barrier.Barrier = null;
+} else struct {};
 
 pub const BuildContextArg = struct {
     name: []const u8,
@@ -242,6 +248,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         };
     }
     const final_artifact = artifacts[plan.target_index] orelse return error.BadManifest;
+    if (comptime builtin.is_test) if (testing.before_final_publish_barrier) |barrier| barrier.pause(init.io);
     // Keep the exclusive cache lock through local-ref publication so every
     // PREPARE/step root and its destination ref become reachable in one GC
     // exclusion window.
@@ -2227,6 +2234,123 @@ test "scratch stage publishes an empty native rootfs without guest execution" {
     try std.testing.expectEqual(@as(u64, 0), warm_diagnostic.scratch.first_object_bytes_written);
     try std.testing.expectEqual(@as(usize, 0), warm_diagnostic.executor.boot_count);
     try std.testing.expectEqual(@as(usize, 0), warm_diagnostic.executor.resize_count);
+}
+
+test "metadata-only scratch publication serializes destructive GC until ref visibility" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tmp = "zig-cache/test-spore-build-scratch-gc";
+    const context_dir = tmp ++ "/context";
+    const cache_dir = tmp ++ "/cache";
+    const runtime_dir = tmp ++ "/runtime";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, context_dir);
+    try Io.Dir.cwd().createDirPath(io, runtime_dir);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = context_dir ++ "/Dockerfile",
+        .data = "FROM scratch\nENTRYPOINT [\"/app\"]\n",
+    });
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_dir);
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const absolute_runtime_dir = try std.fs.path.resolve(arena, &.{ cwd, runtime_dir });
+
+    const BuildContext = struct {
+        allocator: std.mem.Allocator,
+        io: Io,
+        env: *const std.process.Environ.Map,
+        context_dir: []const u8,
+        arena: *std.heap.ArenaAllocator,
+        result: ?Result = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer if (testing.before_final_publish_barrier) |barrier| barrier.reached.post(self.io);
+            const init = testInit(self.allocator, self.io, self.arena, @constCast(self.env));
+            self.result = build(init, self.arena.allocator(), .{
+                .tag = "local/app:scratch-gc",
+                .context_dir = self.context_dir,
+                .dockerfile_path = "zig-cache/test-spore-build-scratch-gc/context/Dockerfile",
+            }) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var publish_boundary = test_barrier.Barrier{};
+    testing.before_final_publish_barrier = &publish_boundary;
+    defer testing.before_final_publish_barrier = null;
+    var build_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer build_arena_state.deinit();
+    var build_thread_context = BuildContext{
+        .allocator = allocator,
+        .io = io,
+        .env = &env,
+        .context_dir = context_dir,
+        .arena = &build_arena_state,
+    };
+    var build_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, BuildContext.run, .{&build_thread_context}),
+        .barriers = &.{&publish_boundary},
+    };
+    defer build_thread.deinit();
+    publish_boundary.waitReached(io);
+    if (build_thread_context.err) |err| return err;
+    try std.testing.expectError(error.LockBusy, rootfs_mod.tryLockRootfsCacheExclusive(io, arena, cache_dir));
+
+    const GcContext = struct {
+        allocator: std.mem.Allocator,
+        io: Io,
+        cache_root: []const u8,
+        runtime_root: []const u8,
+        attempting: *Io.Semaphore,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.attempting.post(self.io);
+            const result = system_mod.gc(self.allocator, self.io, .{
+                .cache_root = self.cache_root,
+                .runtime_root = self.runtime_root,
+                .dry_run = false,
+            }) catch |err| {
+                self.err = err;
+                return;
+            };
+            system_mod.deinitRootfsGcResult(self.allocator, result);
+        }
+    };
+    var gc_attempting = Io.Semaphore{};
+    var gc_context = GcContext{
+        .allocator = allocator,
+        .io = io,
+        .cache_root = cache_dir,
+        .runtime_root = absolute_runtime_dir,
+        .attempting = &gc_attempting,
+    };
+    var gc_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, GcContext.run, .{&gc_context}),
+        .barriers = &.{},
+    };
+    defer gc_thread.deinit();
+    gc_attempting.waitUncancelable(io);
+    publish_boundary.release(io);
+    build_thread.join();
+    if (build_thread_context.err) |err| return err;
+    gc_thread.join();
+    if (gc_context.err) |err| return err;
+
+    const result = build_thread_context.result orelse return error.BadManifest;
+    const resolved = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_dir, "local/app:scratch-gc", .{});
+    try std.testing.expectEqualStrings(result.resolved_image_ref, resolved.ref);
+    const indexed = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_dir, resolved)) orelse return error.MissingIndexedRootfs;
+    defer rootfs_mod.deinitCachedIndexedRootfs(arena, indexed);
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, cache_dir, indexed.storage));
 }
 
 test "scratch allocation accounting is bound to the opened inode" {

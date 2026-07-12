@@ -894,6 +894,58 @@ test "prepare record rejects target mismatch and missing completeness stamp" {
     try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, arena, cache_root, storage));
 }
 
+test "pre-capability COPY record misses after executor identity changes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-build-step-cache-copy-executor-upgrade";
+    const cache_root = tmp ++ "/cache";
+    const child_rootfs = tmp ++ "/child.ext4";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "capability-preserving child rootfs bytes" });
+
+    const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
+    const old_identity = "blake3:2222222222222222222222222222222222222222222222222222222222222222";
+    const new_identity = "blake3:3333333333333333333333333333333333333333333333333333333333333333";
+    const old_input = StepInput{
+        .platform = .{},
+        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .canonical_instruction = "COPY --from=build /owned/capability /capability",
+        .executor_identity = old_identity,
+        .operation = .{ .copy = .{
+            .input_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .env_digest = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            .workdir = "/",
+        } },
+    };
+    const old_key = try stepKey(arena, old_input);
+    const old_path = try writeRecord(io, arena, cache_root, old_input, old_key, storage);
+    try std.testing.expect((try readHit(io, arena, cache_root, old_input, old_key)) != null);
+
+    var new_input = old_input;
+    new_input.executor_identity = new_identity;
+    const new_key = try stepKey(arena, new_input);
+    try std.testing.expect(!std.mem.eql(u8, old_key, new_key));
+    // Model a stale/malicious alias at the new key too: the inner exact
+    // identity check must still reject the pre-upgrade record.
+    const new_path = try recordPath(arena, cache_root, new_key);
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(new_path) orelse return error.BadManifest);
+    const old_bytes = try Io.Dir.cwd().readFileAlloc(io, old_path, arena, .limited(max_step_record_bytes));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = new_path, .data = old_bytes });
+    try std.testing.expect((try readHit(io, arena, cache_root, new_input, new_key)) == null);
+
+    // Rebuilding under the v0.6.3 executor replaces the record with the new
+    // identity. The native multi-stage conformance fixture independently
+    // compares the exact security.capability bytes in that rebuilt output.
+    _ = try writeRecord(io, arena, cache_root, new_input, new_key, storage);
+    try std.testing.expect((try readHit(io, arena, cache_root, new_input, new_key)) != null);
+}
+
 test "gc inspection retains complete v6 records with removed fields" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

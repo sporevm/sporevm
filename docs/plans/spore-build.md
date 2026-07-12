@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-11
+last_reviewed: 2026-07-13
 spec_refs:
   - docs/rootfs.md
   - docs/filesystem.md
@@ -144,10 +144,13 @@ The missing work falls into three different categories:
 
 ## Current Contract And Progress
 
-- No BuildKit compatibility beyond the stated subset. No multi-stage `FROM …
-  AS`, `COPY --from/--link/--parents/--chown/--chmod`, `RUN --mount`, `ADD`,
-  heredocs, `ENTRYPOINT`, `USER`, `VOLUME`, `EXPOSE`, `HEALTHCHECK`,
-  `ONBUILD`, or `--target`. These fail closed.
+- No BuildKit compatibility beyond the stated subset. C1 accepts source-spanned
+  multi-stage `FROM … AS`, reachable-target planning, `scratch`, public
+  registry/local/named-context bases, previous-stage inheritance, literal
+  `COPY --from`, `--target`, and final `ENTRYPOINT`/`CMD` publication. COPY
+  flags (`--link`, `--parents`, `--chown`, `--chmod`), `RUN --mount`, `ADD`,
+  heredocs, `USER`, `VOLUME`, `EXPOSE`, `HEALTHCHECK`, and `ONBUILD` still fail
+  closed.
 - No replacement for the wrapper's preliminary `docker build --target ci` of
   the Buildkite app image. That Dockerfile uses `syntax=docker/dockerfile:1.20`
   features (`RUN --mount=type=cache`, `COPY --link`, remote `ADD`, heredocs)
@@ -161,16 +164,20 @@ The missing work falls into three different categories:
 - No cross-machine or shared build cache. The step cache is local, same trust
   model as the existing rootfs CAS cache.
 - No new persistent device type or portable machine-state contract. The build
-  VM uses the existing device set and may attach one transient read-only
-  virtio-blk context disk. A non-resumable rootfs-growth session temporarily
-  offers `VIRTIO_BLK_F_WRITE_ZEROES` on the existing root block device. The
-  guest contracts are `spore-rootfs-grow-v1`, the `fsfreeze` checkpoint
-  handshake, and fixed-shape RUN/COPY requests over the existing exec stream.
+  VM uses the existing device set and may attach bounded transient read-only
+  virtio-blk context or stage/rootfs disks. A non-resumable rootfs-growth
+  session temporarily offers `VIRTIO_BLK_F_WRITE_ZEROES` on the existing root
+  block device. The guest contracts are `spore-rootfs-grow-v1`, the `fsfreeze`
+  checkpoint handshake, and fixed-shape RUN/COPY requests over the existing
+  exec stream.
 
 C0 closes the known checkpoint, resize, resource-envelope, matcher, and cache
-lifecycle gaps in the current subset. The same VM smoke and differential
-harness now pass on Linux ARM64/KVM. Each newly accepted metadata instruction
-must extend final image configuration inheritance and the oracle together.
+lifecycle gaps in the original single-stage subset. C1 adds ordinary
+multi-stage planning and immutable cross-stage COPY without widening the
+device model or cache authority. The same-VM smoke and differential harness
+cover the implemented subset on Linux ARM64/KVM. Each newly accepted metadata
+instruction must extend final image configuration inheritance and the oracle
+together.
 
 ## Compatibility Contract
 
@@ -908,11 +915,12 @@ and enumerate one canonical full rootfs CAS index.
    - `COPY`: before boot, the host emits the resolved context entries needed
      by executed COPY steps into a cached read-only ext4 context disk and
      attaches it as an additional virtio-blk device. Per step, the host sends
-     one or more fixed-shape `spore-build-copy-v2` control requests naming the
-     source subtree on `/mnt/build-context`, destination, source kind, and
-     bounded entry count. The agent recursively copies from the mounted
-     context disk into `/mnt/rootfs` using the confined destination resolver
-     (see COPY Semantics).
+     one or more fixed-shape `spore-build-copy-v3` control requests naming the
+     source disk and bounded input index, source subtree, destination, source
+     kind, and bounded entry count. The agent recursively copies from the
+     selected context or immutable build-input disk into `/mnt/rootfs` using
+     the confined destination resolver (see COPY Semantics). The guest retains
+     `spore-build-copy-v2` only as an older context-disk-compatible input.
    - `CHECKPOINT`: agent handles `fsfreeze-v1` after the step exits;
      the VMM drains/flushes pending virtio-blk writes, the host calls
      `ChunkMappedDisk.snapshotIndex()` into the rootfs CAS, writes the
@@ -957,13 +965,15 @@ regresses, the degenerate mode is one boot-snapshot-shutdown cycle per step
 per changed step instead of per build; the cache model is identical in both
 modes.
 
-The guest sees the writable rootfs plus, when COPY steps execute, a mounted
-read-only context disk (`spore_rootfs=1 spore_rootfs_rw=1
-spore_build_context=1`). The initrd agent now provides the build control verbs
+The guest sees the writable rootfs plus, when COPY steps execute, bounded
+read-only context or immutable build-input disks (`spore_rootfs=1
+spore_rootfs_rw=1`, with `spore_build_context=1` and/or
+`spore_build_inputs=<count>`). The initrd agent now provides the build control verbs
 (`spore-rootfs-grow-v1`, `fsfreeze-v1`, `fsthaw-v1`, `spore-build-run-v1`,
-`spore-build-copy-v2`); the target base must provide `/bin/sh` for RUN and
-nothing for capacity preparation. A missing RUN shell fails closed through the
-step's captured output.
+`spore-build-copy-v3`); the target base must provide `/bin/sh` for RUN and
+nothing for capacity preparation. The guest accepts the older
+`spore-build-copy-v2` context-only request for compatibility. A missing RUN
+shell fails closed through the step's captured output.
 
 ## COPY Semantics
 
@@ -990,10 +1000,11 @@ session as `RUN`, rather than host-side ext4 surgery:
    the sidecar is published after full disk emission. Changed contexts still
    mostly dedupe through the rootfs CAS chunks emitted by the native ext4
    writer.
-4. Send fixed-shape `spore-build-copy-v2` control requests. Each request names
-   the context-disk source subtree, destination, source kind, `dest_is_dir`,
-   and entry count. The guest enforces path and entry-count bounds, then
-   recursively copies from `/mnt/build-context`. Destination paths are resolved
+4. Send fixed-shape `spore-build-copy-v3` control requests. Each request names
+   the context or immutable build-input disk and bounded input index, source
+   subtree, destination, source kind, `dest_is_dir`, and entry count. The guest
+   enforces disk, index, path, and entry-count bounds, then recursively copies
+   from the selected read-only mount. Destination paths are resolved
    relative to an fd for `/mnt/rootfs` with `openat2(RESOLVE_IN_ROOT |
    RESOLVE_NO_MAGICLINKS)`, falling back on kernels without `openat2` to a
    confined manual component walk that keeps symlink targets rooted in the
@@ -1276,11 +1287,13 @@ context walk feeds both the COPY input digest and the context-disk builder; a
 cold full hash and a warm stat-cache hit path must produce byte-identical step
 keys. The host emits or reuses a cached read-only ext4 image under
 `build/context-disks/`, attaches it as a second virtio-blk instance at boot,
-and sends bounded `spore-build-copy-v2` control messages naming source,
-destination, kind, destination-directory behavior, and entry count. The guest
-agent validates the request shape and count, mounts the context disk read-only,
-and confines all destination apply-path resolution to `/mnt/rootfs` while
-preserving Docker-style rootfs-internal and final-component symlink traversal.
+and originally sent bounded `spore-build-copy-v2` context-only control
+messages. The current executor emits `spore-build-copy-v3`, which also binds
+the selected context or immutable build-input disk and bounded input index.
+The guest retains v2 only for older context-compatible input, validates both
+request shapes, mounts the selected disk read-only, and confines all
+destination apply-path resolution to `/mnt/rootfs` while preserving
+Docker-style rootfs-internal and final-component symlink traversal.
 COPY checkpoints use the same freeze → snapshot → complete stamp → step
 record → thaw ordering as RUN; if any COPY request in a step fails, the build
 fails before snapshot promotion for that step. Session start uses the
@@ -1313,9 +1326,11 @@ Repeating an input key after a forced execution now atomically replaces only
 the derived step mapping, while rootfs CAS indexes and objects retain immutable
 publication.
 
-**Stop/go gate:** passed on both backends. C2 may begin. The implementation
-reuses bounded instances of the existing virtio-blk device and changes neither
-the frozen device types nor the spore manifest format.
+**Stop/go gate:** the C1 product gate passed on both backends. C2 instruction
+and COPY-policy widening remains blocked until the four structural extractions
+above land. The C1 implementation reuses bounded instances of the existing
+virtio-blk device and changes neither the frozen device types nor the spore
+manifest format.
 
 ### C2 — Stable frontend and filesystem breadth
 
