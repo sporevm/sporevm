@@ -375,7 +375,9 @@ callers can read `lastLifecycleErrorMessage()` after a failed lifecycle call.
 The C ABI copies the same text into `spore_context_last_error`, and the Go
 binding returns it through `CallError`. Startup, already-exists, and not-ready
 diagnostics include the last known VM state, recorded PID when present,
-`console.log`, `monitor.log`, and the control socket path where useful.
+the configured console path when present, `monitor.log`, and the control socket
+path where useful. When no console log is configured, diagnostics report
+`console_log=none` instead of claiming a default file exists.
 
 `openExecNamedStream` is the primary named-exec primitive and is also what the
 CLI uses for plain noninteractive exec. It preserves stdout and stderr as

@@ -395,7 +395,10 @@ Each `machine.vcpus[]` entry records one normalized aarch64 vCPU state:
 `index`, `mpidr`, `gprs`, `pc`, `cpsr`, `fpcr`, `fpsr`, `simd`, `sys_regs`,
 `icc_regs`, and `vtimer`. The validator requires stable array order
 (`index == array position`), unique indexes, unique MPIDRs, and the normalized
-MPIDR mapping from `src/topology.zig`.
+MPIDR mapping from `src/topology.zig`. New multi-vCPU captures store one shared
+`vtimer.cntvct` value in every entry. Restore accepts older unequal values by
+using vCPU 0 as the machine counter authority and translating each absolute
+`cntv_cval` so `cntv_cval - cntvct` remains unchanged modulo 64 bits.
 
 V3 portable GIC state uses `machine.gic.kind: "gicv3_multi"`. It carries global
 distributor registers, per-vCPU redistributor register arrays keyed by MPIDR,

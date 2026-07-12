@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-12
+last_reviewed: 2026-07-13
 spec_refs:
   - docs/memory.md
   - docs/spore-format.md
@@ -63,17 +63,45 @@ Backend-specific lazy fault handling remains inside KVM and HVF. The shared
 strategy makes fresh RAM, local backing, eager chunks, and lazy chunks mutually
 exclusive before backend startup.
 
-## Remaining Work
+## Release Evidence
 
-- Run the release matrix at its exact committed head on Linux ARM64/KVM and an
-  unsandboxed macOS ARM64/HVF host. Retain the normalized evidence JSON and the
-  per-lane JSONL for review.
-- Record Linux schema-v2 fs-verity proof-write cost, parent and fan-out
-  validation cost, five-row tmpfs schema-v1 behavior, and five-row
-  cross-filesystem chunk fallback from that run.
-- Confirm on the provisioned ext4 runner that `FS_IOC_ENABLE_VERITY` succeeds
-  through the existing `O_RDONLY` backing fd after temporary owner-write is
-  added, and that the final backing mode is restored before proof publication.
+Exact candidate `0ce47154dcb777cca8ce7fbcecdb7deea172a6d6` closes the native
+correctness and evidence gates without retries or waivers:
+
+- The complete exact-head graph passed 18/18 steps: 1,681/1,694 tests passed,
+  13 skipped, and none failed. Internal tests passed 781/786, build tests passed
+  874/882, the durable crash suite passed 2/2, and the C smoke test passed.
+- HVF restored an old unequal-counter two-vCPU manifest through ten valid-local
+  restores with ten repeated execs each (100/100). Every row selected
+  `local_backing` with `proof_valid` and `memory_ms=0`. Five deliberate eager
+  restores with five repeated execs each passed 25/25, selected `eager_chunks`
+  with `key_unavailable`, and reported 115-116 ms of memory materialization.
+- The HVF cross-vCPU timer oracle passed 20,000 affinity alternations before
+  save, while continuing after save, after the first restore, and after a
+  second save and restore. CNTVCT and `CLOCK_MONOTONIC` never stepped backward,
+  newly saved two-vCPU anchors were identical, and retained output contained no
+  RCU stall or soft-lockup report.
+- The checked-in KVM matrix passed all five rows and five repeated execs for
+  current one- and two-vCPU local backing and deliberate eager fallback. Local
+  restores took 70.7-71.7 ms with 30-31 ms wait time and `memory_ms=0`; eager
+  restores took 613.2-634.8 ms with 572-593 ms wait time and 533-544 ms of
+  memory materialization.
+- Historical baseline/current lanes, unsupported schema-v1 local and
+  missing-key behavior, real ext4 fs-verity schema-v2 plus fan-out, tmpfs
+  schema-v1, and cross-filesystem eager fallback all passed. Cross-filesystem
+  fallback selected `no_backing`, took 611.8-612.7 ms, and materialized memory
+  in 533-538 ms. The ext4 run enabled and measured fs-verity through the owned
+  backing fd, restored its exact final mode, and published the proof only after
+  identity revalidation.
+
+The retained public-safe evidence digests are KVM `evidence.json`
+`b1f835d855cb584c5835fa06e9a3e0ee7bb1c64b937a5bd30740dc5b135b82d7`,
+full-suite transcript
+`7d6c395ff495eb5d2f3f261f367ee24719478dd0a62d243b00e623aad1dab492`, HVF
+valid-local JSONL
+`cd5a96fe7a3bf1f9688b64b50041a136d6643ecad4be48558a47485f24cb40dc`, and HVF
+eager JSONL
+`8cf5b32328f4efc72e70e1aff7cd233a89945e64f49162c0913f78dc86ff63a6`.
 
 The release harness and proof telemetry are implemented in this follow-up. The
 harness fixes the matrix at 1024 MiB with five complete rows and five repeated
@@ -87,17 +115,30 @@ ignores the general benchmark scratch, requires the selected scratch to be
 ext4, and enables and measures a disposable fs-verity file before parent
 capture. The Linux job selects the host-provisioned, agent-writable
 `/var/tmp/sporevm-named-restore-verity` task scratch root rather than the
-checkout or general benchmark scratch. Candidate ship-risk, maintainability,
-documentation, and draft PR-description review is complete; exact native
-evidence remains the release gate.
+checkout or general benchmark scratch. Earlier candidate review and native
+evidence predated the HVF counter finding; the exact-head evidence above
+supersedes those runs and closes the corrected KVM/HVF release gate.
+
+## Key Learnings From Pressure-Testing
+
+- Repeated HVF exec timeouts were not lost MMIO completions. Exact QueueNotify
+  tracing showed the host consumed each console descriptor and advanced the
+  guest PC; retained guest output identified cross-CPU virtual-time skew through
+  the RCU stall report.
+- The single-vCPU HVF timer re-anchor could not be applied independently to
+  multiple vCPUs. One machine counter plus modular per-vCPU deadline
+  translation is the smallest architecture-correct model.
+- Runtime diagnostics must describe configured state. An unconditional default
+  console path hid the useful output while claiming a file existed, and saved
+  lifecycle paths cannot become fresh host write authority during restore.
 
 ## Done When
 
-- Exact-head KVM and HVF evidence passes correctness before performance, with
-  no retry or waiver for repeated exec.
-- Linux fs-verity and unsupported-filesystem evidence is recorded in the PR or
-  a short durable docs note.
-- Unsupported filesystems continue to use v1 provenance proofs or verified
+- [x] Exact-head KVM and HVF evidence passes correctness before performance,
+  with no retry or waiver for repeated exec.
+- [x] Linux fs-verity and unsupported-filesystem evidence is recorded in the
+  active plan and retained release artifacts.
+- [x] Unsupported filesystems continue to use v1 provenance proofs or verified
   chunks without a user-facing mode.
 
 ## Non-Goals

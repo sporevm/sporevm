@@ -138,7 +138,7 @@ $SPOREVM_RUNTIME_DIR/vms/<name>/
   create-timing.json
   monitor-timing.json
   monitor-stats.json
-  console.log
+  console.log                 # only with --console-log
   monitor.log
 ```
 
@@ -148,9 +148,12 @@ user. Stale entries fail closed unless the recorded monitor pid is dead and the
 user removes or recreates the VM.
 
 Each VM has one monitor process. The monitor owns the hypervisor VM, vCPU loop,
-virtio state, rootfs fd, writable disk state, console log, monitor log, vsock
-state, optional network gateway, and a local newline-delimited JSON control
-socket.
+virtio state, rootfs fd, writable disk state, optional configured console log,
+monitor log, vsock state, optional network gateway, and a local newline-delimited
+JSON control socket. `ready.json`, list output, and lifecycle results report a
+console path only when the monitor actually opened one. Restore never reuses a
+saved lifecycle console path as host authority; a future explicit restore option
+would need to select a new path.
 
 ## Session Handles
 
@@ -317,9 +320,9 @@ binary. Version mismatch is a startup error that names both versions and the
 resolved executable path.
 
 Named lifecycle failures include the last known lifecycle state, recorded PID
-when present, `console.log`, `monitor.log`, and the control socket path where
-useful. This is the same diagnostic state visible through `spore ls`, carried
-back to the caller that hit the lifecycle error.
+when present, the configured console path when one exists, `monitor.log`, and
+the control socket path where useful. This is the same diagnostic state visible
+through `spore ls`, carried back to the caller that hit the lifecycle error.
 
 `spore --json restore` includes `timing.prepare_ms`,
 `timing.spawn_monitor_ms`, `timing.wait_exec_ready_ms`, and `timing.total_ms`.

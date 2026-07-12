@@ -61,6 +61,19 @@ pub fn hostCounterFreq() u64 {
     );
 }
 
+/// Translate one per-vCPU timer into the machine's shared virtual-counter
+/// domain without changing its deadline relative to CNTVCT. Modular arithmetic
+/// preserves enabled, masked, and already-expired timers across counter wrap.
+pub fn canonicalizeVtimer(vtimer: *spore.VtimerState, canonical_cntvct: u64) void {
+    const delta = canonical_cntvct -% vtimer.cntvct;
+    vtimer.cntv_cval +%= delta;
+    vtimer.cntvct = canonical_cntvct;
+}
+
+pub fn vtimerOffset(host_counter: u64, guest_counter: u64) u64 {
+    return host_counter -% guest_counter;
+}
+
 pub fn captureMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle) !spore.MachineState {
     const vcpu_state = try captureVcpuState(allocator, .{ .index = 0, .handle = vcpu });
     return .{
@@ -169,6 +182,10 @@ pub fn applyMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle, state: s
 }
 
 pub fn applyVcpuState(vcpu: hvf.VcpuHandle, state: spore.VcpuState) !void {
+    try applyVcpuStateWithOffset(vcpu, state, vtimerOffset(hostCounter(), state.vtimer.cntvct));
+}
+
+pub fn applyVcpuStateWithOffset(vcpu: hvf.VcpuHandle, state: spore.VcpuState, shared_vtimer_offset: u64) !void {
     if (state.mpidr != topology.mpidrForIndex(state.index)) return error.PlatformMismatch;
 
     for (0..31) |i| {
@@ -204,11 +221,37 @@ pub fn applyVcpuState(vcpu: hvf.VcpuHandle, state: spore.VcpuState) !void {
     }
 
     // Re-anchor the virtual counter: guest time continues from the snapshot.
-    const new_offset = hostCounter() -% state.vtimer.cntvct;
-    try hvf.check(hvf.hv_vcpu_set_vtimer_offset(vcpu, new_offset), "set vtimer offset");
+    try hvf.check(hvf.hv_vcpu_set_vtimer_offset(vcpu, shared_vtimer_offset), "set vtimer offset");
     try hvf.check(hvf.hv_vcpu_set_sys_reg(vcpu, .cntv_cval_el0, state.vtimer.cntv_cval), "set cntv_cval");
     try hvf.check(hvf.hv_vcpu_set_sys_reg(vcpu, .cntv_ctl_el0, state.vtimer.cntv_ctl), "set cntv_ctl");
     try hvf.check(hvf.hv_vcpu_set_vtimer_mask(vcpu, false), "vtimer unmask");
+}
+
+test "vtimer canonicalization preserves modular deadline and control" {
+    const Case = struct {
+        saved_counter: u64,
+        saved_cval: u64,
+        canonical: u64,
+        ctl: u64,
+    };
+    const cases = [_]Case{
+        .{ .saved_counter = 100, .saved_cval = 130, .canonical = 140, .ctl = 1 },
+        .{ .saved_counter = 140, .saved_cval = 130, .canonical = 100, .ctl = 3 },
+        .{ .saved_counter = std.math.maxInt(u64) - 4, .saved_cval = 3, .canonical = 6, .ctl = 0 },
+    };
+    for (cases) |case| {
+        var timer = spore.VtimerState{
+            .cntvct = case.saved_counter,
+            .cntv_ctl = case.ctl,
+            .cntv_cval = case.saved_cval,
+        };
+        const deadline_delta = timer.cntv_cval -% timer.cntvct;
+        canonicalizeVtimer(&timer, case.canonical);
+        try std.testing.expectEqual(case.canonical, timer.cntvct);
+        try std.testing.expectEqual(deadline_delta, timer.cntv_cval -% timer.cntvct);
+        try std.testing.expectEqual(case.ctl, timer.cntv_ctl);
+    }
+    try std.testing.expectEqual(@as(u64, 5), vtimerOffset(3, std.math.maxInt(u64) - 1));
 }
 
 fn captureGicState(allocator: std.mem.Allocator) !gicv3.State {

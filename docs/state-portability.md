@@ -153,11 +153,16 @@ backend feature registers.
 The value is meaningful only after backend-specific re-anchoring.
 
 - Virtual timer state stores the guest virtual counter value plus
-  `cntv_ctl`/`cntv_cval`.
+  `cntv_ctl`/`cntv_cval`. A multi-vCPU machine has one shared architectural
+  counter authority. Capture normalizes every vCPU to the vCPU 0 counter and
+  translates each absolute `cntv_cval` with wrapping arithmetic so its deadline
+  delta is unchanged.
 - KVM restores by setting `KVM_ARM_SET_COUNTER_OFFSET` to align host counter
   time with the saved guest counter.
-- Hypervisor.framework restores by setting the vtimer offset to align host
-  counter time with the saved guest counter.
+- Hypervisor.framework restores by computing one vtimer offset and applying it
+  identically to every vCPU. Older manifests with unequal per-vCPU `cntvct`
+  fields use vCPU 0 as authority and translate each timer deadline into that
+  domain before apply.
 - This translation is only valid when `counter_frequency_hz` matches exactly.
 
 ### Backend-private

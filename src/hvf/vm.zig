@@ -861,6 +861,7 @@ const HvfVcpuCaptureCommand = struct {
 
 const HvfVcpuApplyCommand = struct {
     state: spore.VcpuState,
+    shared_vtimer_offset: u64,
 };
 
 const HvfVcpuCommand = union(enum) {
@@ -1572,15 +1573,61 @@ fn captureHvfVcpuStates(allocator: std.mem.Allocator, vcpus: []HvfVcpu) ![]spore
         var command = HvfVcpuCaptureCommand{ .allocator = allocator, .out = out };
         _ = try vcpu.submit(.{ .capture = &command });
     }
+    normalizeHvfVtimerCounters(states);
     return states;
 }
 
 fn applyHvfVcpuStates(vcpus: []HvfVcpu, machine: spore.MachineStateV1) !void {
     if (machine.vcpus.len != vcpus.len) return error.PlatformMismatch;
+    const timer_plan = try planHvfVtimerRestore(machine.vcpus, snapshot.hostCounter());
     for (machine.vcpus, 0..) |vcpu_state, i| {
         if (vcpu_state.index != vcpus[i].index) return error.PlatformMismatch;
-        var command = HvfVcpuApplyCommand{ .state = vcpu_state };
+        var normalized_state = vcpu_state;
+        snapshot.canonicalizeVtimer(&normalized_state.vtimer, timer_plan.canonical_cntvct);
+        var command = HvfVcpuApplyCommand{ .state = normalized_state, .shared_vtimer_offset = timer_plan.shared_offset };
         _ = try vcpus[i].submit(.{ .apply = &command });
+    }
+}
+
+const HvfVtimerRestorePlan = struct {
+    canonical_cntvct: u64,
+    shared_offset: u64,
+};
+
+fn planHvfVtimerRestore(states: []const spore.VcpuState, host_counter: u64) !HvfVtimerRestorePlan {
+    if (states.len == 0) return error.PlatformMismatch;
+    const canonical_cntvct = states[0].vtimer.cntvct;
+    return .{
+        .canonical_cntvct = canonical_cntvct,
+        .shared_offset = snapshot.vtimerOffset(host_counter, canonical_cntvct),
+    };
+}
+
+fn normalizeHvfVtimerCounters(states: []spore.VcpuState) void {
+    if (states.len == 0) return;
+    const canonical_cntvct = states[0].vtimer.cntvct;
+    for (states) |*state| snapshot.canonicalizeVtimer(&state.vtimer, canonical_cntvct);
+}
+
+test "multi-vcpu HVF timer normalization uses one counter authority" {
+    var states: [2]spore.VcpuState = undefined;
+    states[0].vtimer = .{ .cntvct = 100, .cntv_ctl = 1, .cntv_cval = 130 };
+    states[1].vtimer = .{ .cntvct = 140, .cntv_ctl = 3, .cntv_cval = 120 };
+    const secondary_delta = states[1].vtimer.cntv_cval -% states[1].vtimer.cntvct;
+    normalizeHvfVtimerCounters(&states);
+    try std.testing.expectEqual(@as(u64, 100), states[0].vtimer.cntvct);
+    try std.testing.expectEqual(@as(u64, 100), states[1].vtimer.cntvct);
+    try std.testing.expectEqual(secondary_delta, states[1].vtimer.cntv_cval -% states[1].vtimer.cntvct);
+    try std.testing.expectEqual(@as(u64, 3), states[1].vtimer.cntv_ctl);
+
+    const plan = try planHvfVtimerRestore(&states, 175);
+    try std.testing.expectEqual(@as(u64, 100), plan.canonical_cntvct);
+    try std.testing.expectEqual(@as(u64, 75), plan.shared_offset);
+    for (states) |state| {
+        var normalized = state;
+        snapshot.canonicalizeVtimer(&normalized.vtimer, plan.canonical_cntvct);
+        try std.testing.expectEqual(plan.canonical_cntvct, normalized.vtimer.cntvct);
+        try std.testing.expectEqual(plan.shared_offset, snapshot.vtimerOffset(175, normalized.vtimer.cntvct));
     }
 }
 
@@ -1756,7 +1803,7 @@ fn processHvfVcpuCommand(vcpu: *HvfVcpu, command: HvfVcpuCommand) void {
             break :blk .ok;
         },
         .apply => |apply_cmd| blk: {
-            snapshot.applyVcpuState(vcpu.handle, apply_cmd.state) catch |err| break :blk .{ .err = err };
+            snapshot.applyVcpuStateWithOffset(vcpu.handle, apply_cmd.state, apply_cmd.shared_vtimer_offset) catch |err| break :blk .{ .err = err };
             break :blk .ok;
         },
     };

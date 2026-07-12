@@ -275,11 +275,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
             .ready_after_start_ms = 0,
         },
         .started_ms = start_ms,
-        .ready = .{
-            .pid = currentPid(),
-            .control_socket_path = paths.control_socket_path,
-            .console_log_path = paths.console_log_path,
-        },
+        .ready = monitorReadyMetadata(currentPid(), paths, opts.console_log_path),
     };
     const readiness_probe = try server.startReadinessProbe();
     const thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
@@ -324,6 +320,40 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         thread.join();
         return err;
     }
+}
+
+fn monitorReadyMetadata(pid: i64, paths: lifecycle.Paths, console_log_path: ?[]const u8) lifecycle.Ready {
+    return .{
+        .pid = pid,
+        .control_socket_path = paths.control_socket_path,
+        .console_log_path = console_log_path,
+    };
+}
+
+test "monitor console configuration matches opened and advertised path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = "zig-cache/test-monitor-console-contract";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const paths = try lifecycle.pathsFromRoot(allocator, root, "bench-1");
+    defer paths.deinit(allocator);
+    try Io.Dir.cwd().createDirPath(io, paths.vm_dir);
+
+    const default_ready = monitorReadyMetadata(1, paths, null);
+    try std.testing.expectEqual(@as(?[]const u8, null), default_ready.console_log_path);
+    try run.openConsoleLog(null);
+    run.closeConsoleLog();
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, paths.console_log_path, .{}));
+
+    const explicit_ready = monitorReadyMetadata(2, paths, paths.console_log_path);
+    try std.testing.expectEqualStrings(paths.console_log_path, explicit_ready.console_log_path.?);
+    try run.openConsoleLog(paths.console_log_path);
+    defer run.closeConsoleLog();
+    run.consoleSink("console parity\n");
+    run.closeConsoleLog();
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, paths.console_log_path, allocator, .limited(4096));
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("console parity\n", bytes);
 }
 
 fn monitorImageRootfsAvailable(image_ref: ?[]const u8, rootfs_path: ?[]const u8, lifecycle_rootfs: bool) bool {

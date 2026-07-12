@@ -26,6 +26,15 @@ concurrent network wakes, so virtio MMIO operations cannot be dropped and
 re-executed while the guest is inside an interrupt handler. After multi-vCPU
 HVF delivers a host vsock request and raises its SPI, it exits the running vCPUs
 once so an idle guest observes the interrupt promptly; empty polls do not wake.
+Multi-vCPU HVF capture and restore also use one shared virtual-counter authority
+for every vCPU. Per-vCPU timer deadlines are translated into that counter domain
+with wrapping arithmetic, preventing cross-CPU time skew from surfacing as RCU
+stalls after restore while preserving enabled, masked, and expired timers.
+
+Named lifecycle console paths are now optional and truthful. Ready, list,
+result, and failure output report a path only when `--console-log` is configured,
+and restore ignores console paths embedded in saved lifecycle metadata so
+an input spore cannot select or truncate an arbitrary host file.
 
 The named-restore release harness pins v0.12.0 archives and managed-kernel
 assets by digest and requires an exact clean current commit on Linux ARM64/KVM
