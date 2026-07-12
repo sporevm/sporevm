@@ -394,21 +394,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     defer control.deinit();
 
     const rootfs = try rootfsFromStorage(allocator, options.base_storage);
-    const monitor_options = run_mod.Options{
-        .kernel_path = "",
-        .initrd_path = null,
-        .rootfs = rootfs,
-        .rootfs_grow_target = if (options.preparation) |preparation| preparation.exact_target else 0,
-        .context_disk_path = options.context_disk_path,
-        .build_input_rootfs = options.build_input_rootfs,
-        .build_mode = true,
-        .disk_snapshot_metrics = if (options.diagnostic) |diag| &diag.snapshot_metrics else null,
-        .command = &.{},
-        .memory = options.resources.memory,
-        .vcpus = options.resources.vcpus,
-        .network = if (network_mode == .spore) .spore else .disabled,
-        .timeout_ms = options.timeout_ms,
-    };
+    const monitor_options = monitorOptionsForSession(options, rootfs, network_mode);
     const boot = switch (options.producer.boot_source) {
         .retained => |retained| retained,
         .managed => |managed| blk: {
@@ -451,6 +437,25 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         diag.max_checkpoint_control_ms = control.max_checkpoint_control_ms;
     }
     return try spore.cloneRootfsStorage(allocator, control.current_storage);
+}
+
+fn monitorOptionsForSession(options: Options, rootfs: spore.Rootfs, network_mode: step_cache.NetworkMode) run_mod.Options {
+    return .{
+        .kernel_path = "",
+        .initrd_path = null,
+        .rootfs = rootfs,
+        .rootfs_grow_target = if (options.preparation) |preparation| preparation.exact_target else 0,
+        .context_disk_path = options.context_disk_path,
+        .build_input_rootfs = options.build_input_rootfs,
+        .build_mode = true,
+        .disk_snapshot_metrics = if (options.diagnostic) |diag| &diag.snapshot_metrics else null,
+        .command = &.{},
+        .memory = options.resources.memory,
+        .vcpus = options.resources.vcpus,
+        .network = if (network_mode == .spore) .spore else .disabled,
+        .timeout_ms = options.timeout_ms,
+        .spore_executable = options.spore_executable,
+    };
 }
 
 fn networkModeForSteps(steps: []const Step) !step_cache.NetworkMode {
@@ -1605,6 +1610,26 @@ test "build session network mode derives from RUN steps" {
     try std.testing.expectEqual(step_cache.NetworkMode.none, try networkModeForSteps(&.{copy}));
     try std.testing.expectEqual(step_cache.NetworkMode.spore, try networkModeForSteps(&.{ copy, spore_run }));
     try std.testing.expectError(error.BuildNetworkModeMismatch, networkModeForSteps(&.{ spore_run, none_run }));
+}
+
+test "build session forwards the selected spore executable to the monitor" {
+    const executable = "/opt/sporevm/exact-build/spore";
+    const options = Options{
+        .platform = .{},
+        .cache_root = "/cache",
+        .base_storage = undefined,
+        .steps = &.{},
+        .rootfs_cache_lock = undefined,
+        .producer = undefined,
+        .spore_executable = executable,
+    };
+    const rootfs = spore.Rootfs{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = .{ .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .size = 4096 },
+    };
+    const monitor_options = monitorOptionsForSession(options, rootfs, .spore);
+    try std.testing.expectEqualStrings(executable, monitor_options.spore_executable);
+    try std.testing.expectEqual(run_mod.NetworkMode.spore, monitor_options.network);
 }
 
 test "build copy request names context disk source" {
