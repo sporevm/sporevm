@@ -529,7 +529,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             try vsock_dev.attachHostStream(probe);
             probe.markStarted();
             const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
-            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
+            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
             attach_probe_ms = monotonicMs() - attach_probe_start;
         }
     }
@@ -561,7 +561,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     while (true) {
         if (config.exec_probe != null and !exec_probe_done) {
             const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
-            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
+            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
         }
         if (mem_transport_index != null) {
             if (config.exec_probe) |probe| {
@@ -640,7 +640,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                 },
             }
             const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
-            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
+            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
         }
         if (config.capture_request) |request_capture| {
             if (request_capture.isAbortRequested()) return error.CaptureAborted;
@@ -1242,7 +1242,10 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
             const attach_probe_start = monotonicMs();
             try options.vsock_dev.attachHostStream(probe);
             probe.markStarted();
-            try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, null, @intCast(options.vsock_transport_index));
+            wakeAfterVsockRxDelivery(
+                try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, null, @intCast(options.vsock_transport_index)),
+                .{ .context = &wake_set, .wakeFn = wakeVcpuSet },
+            );
             attach_probe_ms = monotonicMs() - attach_probe_start;
         }
     }
@@ -1280,8 +1283,9 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                 state.finish(.{ .err = err });
                 continue;
             };
+            var vsock_rx_delivered = false;
             switch (action) {
-                .keep_running => flushVsockRx(
+                .keep_running => vsock_rx_delivered = flushVsockRx(
                     options.vsock_dev,
                     &options.transports_buf[options.vsock_transport_index],
                     options.ram,
@@ -1295,6 +1299,10 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                 else => {},
             }
             device_lock.unlock();
+            wakeAfterVsockRxDelivery(
+                vsock_rx_delivered,
+                .{ .context = &wake_set, .wakeFn = wakeVcpuSet },
+            );
             switch (action) {
                 .keep_running => {},
                 .stop => {
@@ -2845,12 +2853,18 @@ fn flushVsockRx(
     ram: guestmem.GuestRam,
     lazy_pager: ?*lazy_ram.Pager,
     transport_index: u32,
-) !void {
+) !bool {
     try maybeMaterializeTransportQueues(lazy_pager, transport);
     if (vsock_dev.flushPendingRx(&transport.queues, ram)) {
         transport.interrupt_status |= 1;
         try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(transport_index), true), "raise vsock spi");
+        return true;
     }
+    return false;
+}
+
+fn wakeAfterVsockRxDelivery(delivered: bool, wake: vsock.Wake) void {
+    if (delivered) wake.wake();
 }
 
 fn wakeNetworkVcpu(context: ?*anyopaque) void {
@@ -3153,6 +3167,27 @@ test "vsock rx flush materializes lazy transport queues before delivery" {
         error.BadManifest,
         flushVsockRx(&vsock_dev, &transport, ram, &pager, 0),
     );
+}
+
+const TestVsockWakeCounter = struct {
+    count: usize = 0,
+
+    fn wake(context: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.count += 1;
+    }
+};
+
+test "multi-vcpu vsock delivery kicks idle vcpus after every delivered attach" {
+    var counter = TestVsockWakeCounter{};
+    const wake = vsock.Wake{ .context = &counter, .wakeFn = TestVsockWakeCounter.wake };
+
+    wakeAfterVsockRxDelivery(false, wake);
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+
+    wakeAfterVsockRxDelivery(true, wake);
+    wakeAfterVsockRxDelivery(true, wake);
+    try std.testing.expectEqual(@as(usize, 2), counter.count);
 }
 
 test "gic data-abort classification routes remote redistributor before device lock" {

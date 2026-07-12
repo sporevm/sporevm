@@ -386,6 +386,8 @@ const ExecServer = struct {
     network_events: ?*net_gateway.Process = null,
     session_nonce: u64,
     next_session_id: u64 = 1,
+    active_session_sequence: u64 = 0,
+    next_host_stream_sequence: u64,
     wake: ?vsock.Wake = null,
     stats_written: bool = false,
     stats_written_value: vsock.ControlStats = .{},
@@ -420,6 +422,7 @@ const ExecServer = struct {
         const address = try net.UnixAddress.init(socket_path);
         var session_nonce_bytes: [8]u8 = undefined;
         io.random(&session_nonce_bytes);
+        const session_nonce = std.mem.readInt(u64, &session_nonce_bytes, .little);
         var server = ExecServer{
             .allocator = allocator,
             .io = io,
@@ -433,7 +436,8 @@ const ExecServer = struct {
             .server = try address.listen(io, .{ .kernel_backlog = 8 }),
             .generation_params = generation_params,
             .disk_claims = runtime_disk_claim.Registry.init(allocator),
-            .session_nonce = std.mem.readInt(u64, &session_nonce_bytes, .little),
+            .session_nonce = session_nonce,
+            .next_host_stream_sequence = session_nonce,
         };
         var nonce_bytes: [8]u8 = undefined;
         io.random(&nonce_bytes);
@@ -448,7 +452,11 @@ const ExecServer = struct {
         self.active_stream = try vsock.HostStream.initWithProtocol(self.guest_port, self.request[0..self.request_len], .legacy_text);
         self.resetExecCapture();
         self.active_stream.setOutputSink(self, captureOutputThunk);
-        self.active_stream.host_port = vsock.HostStream.deriveHostPort(self.request[0..self.request_len]);
+        self.active_stream.host_port = self.nextHostStreamPort();
+        std.log.debug(
+            "monitor vsock stream start: kind=readiness session_id=ready host_port={d}",
+            .{self.active_stream.host_port},
+        );
         self.active_stream_valid = true;
         self.state = .active_ready;
         return &self.active_stream;
@@ -547,10 +555,18 @@ const ExecServer = struct {
                 } else {
                     self.active_stream.setOutputSink(self, captureOutputThunk);
                 }
-                // Resumed product-run guests can carry the original default
-                // host port in serialized vsock state; use the same dynamic
-                // port scheme as one-shot resume probes for monitor requests.
-                self.active_stream.host_port = vsock.HostStream.deriveHostPort(self.request[0..self.request_len]);
+                // Restored guests can carry the original default host port in
+                // serialized vsock state. Start from a random dynamic offset,
+                // then advance for readiness and every request so neither the
+                // restored tuple nor an earlier monitor stream is reused.
+                self.active_stream.host_port = self.nextHostStreamPort();
+                var stream_log: [160]u8 = undefined;
+                std.log.debug("{s}", .{formatExecHostStreamStart(
+                    &stream_log,
+                    self.session_nonce,
+                    self.active_session_sequence,
+                    self.active_stream.host_port,
+                )});
                 try dev.attachHostStream(&self.active_stream);
                 self.active_stream.markStarted();
                 self.active_stream_valid = true;
@@ -758,10 +774,17 @@ const ExecServer = struct {
     }
 
     fn nextSessionId(self: *ExecServer, buffer: *[64]u8) ![]const u8 {
+        self.active_session_sequence = self.next_session_id;
         const session_id = try formatSessionId(buffer, self.session_nonce, self.next_session_id);
         self.next_session_id +%= 1;
         if (self.next_session_id == 0) self.next_session_id = 1;
         return session_id;
+    }
+
+    fn nextHostStreamPort(self: *ExecServer) u32 {
+        const port = vsock.HostStream.hostPortForSequence(self.next_host_stream_sequence);
+        self.next_host_stream_sequence +%= 1;
+        return port;
     }
 
     fn resetExecCapture(self: *ExecServer) void {
@@ -1382,6 +1405,14 @@ fn persistSourceDiskLeaseHandoff(
 
 fn formatSessionId(buffer: *[64]u8, nonce: u64, sequence: u64) ![]const u8 {
     return std.fmt.bufPrint(buffer, "lifecycle-{x}-{d}", .{ nonce, sequence });
+}
+
+fn formatExecHostStreamStart(buffer: *[160]u8, nonce: u64, sequence: u64, host_port: u32) []const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "monitor vsock stream start: kind=exec session_id=lifecycle-{x}-{d} host_port={d}",
+        .{ nonce, sequence, host_port },
+    ) catch unreachable;
 }
 
 fn registryDirMissing(io: Io, vm_dir: []const u8) bool {
@@ -2092,6 +2123,40 @@ test "monitor session ids cannot replay across restored monitors" {
     const restored_id = try formatSessionId(&restored, 0xfedcba9876543210, 1);
     try std.testing.expectEqualStrings("lifecycle-123456789abcdef-1", first_id);
     try std.testing.expect(!std.mem.eql(u8, first_id, restored_id));
+}
+
+test "monitor records the exact generated request sequence for stream logging" {
+    var server: ExecServer = undefined;
+    server.session_nonce = 0x0123_4567_89ab_cdef;
+    server.next_session_id = 41;
+    server.active_session_sequence = 0;
+    var buffer: [64]u8 = undefined;
+
+    const session_id = try server.nextSessionId(&buffer);
+
+    try std.testing.expectEqualStrings("lifecycle-123456789abcdef-41", session_id);
+    try std.testing.expectEqual(@as(u64, 41), server.active_session_sequence);
+    try std.testing.expectEqual(@as(u64, 42), server.next_session_id);
+    var log_buffer: [160]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "monitor vsock stream start: kind=exec session_id=lifecycle-123456789abcdef-41 host_port=54321",
+        formatExecHostStreamStart(&log_buffer, server.session_nonce, server.active_session_sequence, 54321),
+    );
+}
+
+test "monitor host streams use nonce-seeded ports without early reuse" {
+    var server: ExecServer = undefined;
+    server.next_host_stream_sequence = 0x1234_5678_9abc_def0;
+
+    const readiness = server.nextHostStreamPort();
+    const first_exec = server.nextHostStreamPort();
+    const repeated_exec = server.nextHostStreamPort();
+
+    try std.testing.expectEqual(vsock.HostStream.hostPortForSequence(0x1234_5678_9abc_def0), readiness);
+    try std.testing.expectEqual(vsock.HostStream.hostPortForSequence(0x1234_5678_9abc_def1), first_exec);
+    try std.testing.expectEqual(vsock.HostStream.hostPortForSequence(0x1234_5678_9abc_def2), repeated_exec);
+    try std.testing.expect(readiness != first_exec);
+    try std.testing.expect(first_exec != repeated_exec);
 }
 
 test "named snapshot cache contention returns pending before the pause authority is borrowed" {
