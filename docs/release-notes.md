@@ -10,11 +10,33 @@ inputs still fall back to verified chunks, while malformed authoritative
 metadata, allocation failure, unexpected I/O, corruption, and backend or
 platform failures remain errors.
 
-On the same cached immutable 1 GiB parent under Linux ARM64/KVM, the v0.12.0
-baseline restored in 841.848 ms with 813 ms spent waiting for exec readiness
-and 778 ms materializing RAM. The local-backing path restored in 59.678 ms,
-waited 31 ms for exec readiness, and reported 0 ms of RAM materialization.
-Same-parent `run --from`, first exec, and repeated exec medians remained flat.
+Linux proof creation now measures existing fs-verity state before changing
+permissions. New owned read-only backings temporarily regain owner-write only
+for enablement, then restore their exact mode and stable device, inode, owner,
+and size before a schema-v2 proof can be published. The proof binds the
+post-enable mtime and digest after an exact re-stat; failure leaves chunks
+authoritative.
+
+Named monitors now advance host-side vsock ports from a random per-process
+offset for readiness and every control stream. Completing a stream also drops
+queued packets for its old four-tuple before the next attach, preventing stale
+credit or control traffic from crossing into a repeated named exec.
+After the multi-vCPU HVF coordinator delivers a host vsock request and raises
+its SPI, it now exits the running vCPUs once so an idle guest observes the new
+interrupt promptly; polls that deliver nothing do not wake the vCPUs.
+
+The named-restore release harness pins v0.12.0 archives and managed-kernel
+assets by digest and requires an exact clean current commit on Linux ARM64/KVM
+and macOS ARM64/HVF. Its five-row matrix separates correctness from
+performance, covers one- and two-vCPU local backing plus deliberate eager
+fallback, requires zero reported
+RAM materialization on every valid local-backing row, and retains the measured
+eager materialization cost. It also records proof-write and validation timing,
+fan-out validation, Linux fs-verity v2, tmpfs v1, cross-filesystem fallback,
+and signal-safe named cleanup in a path-sanitized evidence artifact. The Linux
+release lane ignores the general benchmark scratch and requires a dedicated
+host-provisioned ext4 path that passes an fs-verity enable-and-measure
+preflight before parent capture.
 
 Fork now retains the proven parent backing fd across child creation and checks
 each opened child hardlink against the proof-bound parent file identity before

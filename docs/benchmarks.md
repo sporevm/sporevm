@@ -70,15 +70,15 @@ launch path rather than the first-slice `auto` memory contract. Pass
 
 ## CI Defaults
 
-CI benchmark builds (`scripts/ci/buildkite-benchmarks.sh`, triggered from the
-main pipeline) default to `public.ecr.aws/docker/library/node:22-alpine` with
-the suite's default `node -v` first command, on every branch. This keeps the
+Dedicated CI benchmark builds (`scripts/ci/buildkite-benchmarks.sh`) default to
+`public.ecr.aws/docker/library/node:22-alpine` with the suite's default
+`node -v` first command, on every branch. This keeps the
 published trends like-for-like with the public
 [ComputeSDK sandbox TTI benchmark](https://www.computesdk.com/benchmarks/sandboxes/)
 (node runtime, `node -v` as the timed first command) while sourcing the image
 from the AWS public ECR mirror of Docker Official Images instead of Docker Hub,
 which rate-limits anonymous CI pulls. Scheduled builds run the `nightly`
-profile, main-triggered builds run `comparison`, and other branches run `ci`.
+profile, builds of `main` run `comparison`, and other branches run `ci`.
 Override with
 `SPOREVM_BENCHMARK_IMAGE`, `SPOREVM_BENCHMARK_COMMAND`, and
 `SPOREVM_BENCHMARK_PROFILE`.
@@ -166,15 +166,102 @@ and `pre_run_ms` as `backend_memory_ms`, `backend_state_ms`, and
 `backend_pre_run_ms`. This separates RAM materialization from the guest
 readiness handshake instead of hiding both inside `wait_exec_ready_ms`.
 
-The standard Linux comparison requires successful rows with complete backend
-restore metrics and asserts an `eager_chunks` baseline and `local_backing`
-candidate. It reports the candidate's `backend_memory_ms` but does not yet gate
-on that value. Performance thresholds, input provenance, exact row-count
-enforcement, and signal-safe cleanup belong to the dedicated release-benchmark
-hardening follow-up.
-
 Pass `--include-run-from` to also record one-shot `run --from ... /bin/true`
 wall time against the same parent and host.
+
+For release evidence, run the native wrapper on Linux ARM64/KVM and macOS
+ARM64/HVF:
+
+```console
+scripts/ci/buildkite-named-restore-readiness.sh
+```
+
+The wrapper accepts only the repository-pinned v0.12.0 release identity. It
+checks the downloaded checksum file before parsing it, checks that file's
+platform archive entry against the pinned archive digest, checks the archive,
+and checks the extracted executable byte-for-byte against its regular archive
+member. The current checkout must be clean and match the expected full commit.
+The current and historical binaries are recorded by version, size, and SHA-256,
+and the requested and resolved image references are exact digests. Parent
+manifest and proof files are SHA-256 hashed; RAM backing records stable device,
+inode, owner, size, mtime, and allocation identity instead of reading and
+hashing the 1 GiB file. Schema-v2 proofs additionally bind the backing's
+fs-verity SHA-256 digest, while schema v1 makes no backing-content hash claim.
+The managed kernel source is fixed to the checked-in
+repository, release, version, Image, checksum-sidecar, and config digests; its
+task-owned cache must match that closed identity exactly. Ambient `SPOREVM_*`
+product settings are removed; runtime, rootfs, kernel, and temporary
+directories are task-owned.
+The checked-in image default is
+`docker.io/library/node@sha256:d51cff3fa44ab8a368ae8708ae974480165be1b699b19527b7c0d2523433b271`;
+an override must also be an exact digest reference, so KVM and HVF cannot
+independently resolve a moving tag.
+
+Release mode is fixed at 1024 MiB, five rows per lane, and five repeated execs
+per row. For each backend it covers current one- and two-vCPU parents in two
+lanes: the proof key is present for `local_backing`, then absent in a fresh
+runtime for deliberate `eager_chunks` with `reason=key_unavailable`. A separate
+one-vCPU historical pair runs the v0.12.0 binary and the current binary against
+the same v0.12.0 parent. The historical lane is separate because v0.12.0 did
+not publish the current proof telemetry and its HVF multi-vCPU path did not
+publish complete backend restore metrics.
+
+Every current row must report one proof-validation line and one backend restore
+line, and every current or tmpfs parent must report exactly one proof-write
+line. Valid proof rows require `status=ok`, `source=local_backing`,
+`reason=proof_valid`, the platform proof schema and verity mode, and
+`memory_ms=0`: Linux current parents must use schema v2 with fs-verity SHA-256,
+while macOS uses schema v1 with no verity. Deliberate fallback requires
+`source=eager_chunks`, the expected reason, complete proof/backend timing, and
+positive measured RAM materialization.
+Every row must also satisfy the lifecycle readiness contract, exact requested
+topology, successful first and repeated execs, and normal named cleanup. There
+is no retry or waiver for the intermittent HVF two-vCPU repeated-exec failure.
+
+Linux adds five-row controls on tmpfs for schema-v1/no-verity local backing and
+missing-key eager fallback. The harness requires the control filesystem to
+identify as `tmpfs`. A cross-filesystem fork must prove different source and
+destination `st_dev`, omit local backing metadata, and restore through verified
+chunks. Fan-out checks the parent validation plus every child proof write and
+run-from validation, including schema, verity, source, reason, status, and
+timing.
+
+The Linux release lane ignores the general benchmark scratch setting and uses
+a unique work directory beneath `SPOREVM_NAMED_RESTORE_SCRATCH_ROOT`, or
+checkout-local `zig-cache` when that variable is absent. The selected location
+must resolve to ext4, and before parent capture a disposable file must
+successfully enable and measure fs-verity with SHA-256. The Linux opt-in job
+sets the dedicated override to the host-provisioned, agent-writable task
+scratch at `/var/tmp/sporevm-named-restore-verity`; `/dev/shm` remains the
+deliberate tmpfs/schema-v1 control.
+
+The macOS lane defaults its task scratch to `/tmp` rather than inheriting the
+runner's potentially long `TMPDIR`. Both backends use a short work-directory
+prefix, runtime aliases, and per-iteration VM names while retaining the full
+scenario name in JSON evidence. Before each lane, the harness rejects any
+generated `runtime/vms/<name>/control.sock` path longer than the portable
+103-byte Unix-socket limit.
+
+Correctness gates run before performance gates. Same-head median public restore
+wall time, `restore_return_ms`, must be at least twice as fast with local backing
+as with deliberate eager fallback for each backend and vCPU count. This field
+is used because it is the public restore-to-ready API wall, including prepare,
+monitor startup, and the readiness wait. Local backing must report zero backend
+RAM materialization on every row; eager materialization must be positive but
+has no upper threshold. Run-from, first-exec, and repeated-exec medians fail a
+non-regression gate only when they are both more than 20 percent and at least
+50 ms slower. Historical v0.12.0 comparison uses that non-regression rule but
+does not substitute for the same-head local-versus-eager gate.
+
+Python owns named cleanup and evidence generation. Parser failure, output
+failure, timeout, SIGINT, and SIGTERM all run `spore rm`, verify the exact
+runtime and monitor PID are gone, and require the task-owned active-lease set
+to return exactly to its pre-restore state. Exact-PID and added-lease cleanup
+are last-resort fallbacks and make a release row fail. The shell forwards
+signals to the matrix child and waits until that cleanup has finished before
+deleting scratch space. Public
+command output is path-normalized before bounding and hashing, and the final
+evidence object is normalized again before it is written.
 
 ### Cold TTI
 
@@ -619,7 +706,11 @@ files.
 ## Buildkite
 
 The dedicated `sporevm-benchmarks` pipeline is launched manually in Buildkite.
-The main `sporevm` pipeline does not trigger benchmark builds.
+The main `sporevm` pipeline does not trigger that benchmark suite. It defines
+the Linux and macOS named-restore release matrix as opt-in jobs, and omits them
+unless `SPOREVM_RUN_NAMED_RESTORE_BENCHMARK=1` is set for the build. Ordinary
+Linux and macOS test jobs always run the named-restore parser, cleanup/signal,
+path-sanitization, and pinned-release-input self-tests.
 
 The dedicated benchmark pipeline runs macOS and Linux ARM64 benchmark jobs in
 parallel on `sporevm-mac` and `sporevm-linux-arm64`. Each platform job uses a
@@ -634,9 +725,9 @@ Before the timed suite starts, the CI wrapper logs the host load averages and
 CPU count. Set `SPOREVM_BENCHMARK_MAX_LOADAVG_1M` to fail early when the
 one-minute load average is too high for a trustworthy run.
 
-The CI wrapper honors `SPOREVM_BENCHMARK_SCRATCH_ROOT` when set. Otherwise it
-uses `/var/tmp/nvme/sporevm-benchmarks` when that prepared path exists and is
-writable, falling back to the checkout disk.
+The general benchmark CI wrapper honors `SPOREVM_BENCHMARK_SCRATCH_ROOT` when
+set. Otherwise it uses `/var/tmp/nvme/sporevm-benchmarks` when that prepared
+path exists and is writable, falling back to the checkout disk.
 
 The benchmark steps live in `.buildkite/pipeline.benchmarks.yaml`. A standalone
 Buildkite pipeline can use this repository with this upload command:

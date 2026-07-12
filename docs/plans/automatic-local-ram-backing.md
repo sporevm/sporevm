@@ -29,6 +29,16 @@ Malformed authoritative memory/index/backing metadata, allocation failure,
 unexpected host I/O, platform mismatch, corrupt chunks, and backend restore
 failure remain errors rather than being reclassified as chunk fallback.
 
+Linux proof creation first reuses an existing fs-verity digest without changing
+permissions. For a new owned read-only backing it temporarily adds owner-write,
+enables and measures verity through the opened fd, restores the exact original
+mode, and revalidates device, inode, owner, and size before publishing the
+proof. Schema v2 binds the proof to the post-enable mtime and digest and
+re-stats that exact identity; v1 and the existing-verity fast path retain exact
+mtime stability. Errors attempt to restore the mode and publish no proof. A
+crash can leave only an
+unproved optional backing; verified chunks remain authoritative.
+
 `spore fork` hard-links a proof-valid parent backing file into children and
 writes child-local proofs. It retains the proven parent fd across the batch and
 checks each opened child link against the proof-bound parent identity before
@@ -55,20 +65,38 @@ exclusive before backend startup.
 
 ## Remaining Work
 
-- Collect Linux fs-verity benchmark evidence for schema v2 proofs: proof write
-  cost, resume/fan-out validation cost, and fallback behavior on unsupported
-  filesystems.
-- Keep restore-source reporting (`local_backing` versus `chunks`) in product
-  smokes so fast-path regressions are visible.
-- After restore planning and fallback semantics settle, land a dedicated
-  release-benchmark follow-up covering HVF, KVM, and eager fallback. It must
-  enforce exact all-row readiness/timing fields and meaningful performance
-  thresholds, pin and checksum every input, emit self-contained provenance,
-  and clean named monitors on parser failure, cancellation, and signals.
+- Run the release matrix at its exact committed head on Linux ARM64/KVM and an
+  unsandboxed macOS ARM64/HVF host. Retain the normalized evidence JSON and the
+  per-lane JSONL for review.
+- Record Linux schema-v2 fs-verity proof-write cost, parent and fan-out
+  validation cost, five-row tmpfs schema-v1 behavior, and five-row
+  cross-filesystem chunk fallback from that run.
+- Confirm on the provisioned ext4 runner that `FS_IOC_ENABLE_VERITY` succeeds
+  through the existing `O_RDONLY` backing fd after temporary owner-write is
+  added, and that the final backing mode is restored before proof publication.
+
+The release harness and proof telemetry are implemented in this follow-up. The
+harness fixes the matrix at 1024 MiB with five complete rows and five repeated
+execs per lane. It validates current one- and two-vCPU local backing and
+deliberate eager fallback on KVM and HVF, keeps the v0.12.0 historical lane
+separate, pins every historical release input and each managed-kernel artifact,
+records the task-owned kernel cache, and enforces named cleanup through parser
+failure and signals. Linux additionally exercises schema-v2 fs-verity,
+schema-v1 tmpfs, fan-out, and cross-filesystem fallback. Its Linux release lane
+ignores the general benchmark scratch, requires the selected scratch to be
+ext4, and enables and measures a disposable fs-verity file before parent
+capture. The Linux job selects the host-provisioned, agent-writable
+`/var/tmp/sporevm-named-restore-verity` task scratch root rather than the
+checkout or general benchmark scratch. Candidate ship-risk, maintainability,
+documentation, and draft PR-description review is complete; exact native
+evidence remains the release gate.
 
 ## Done When
 
-- Linux fs-verity evidence is recorded in the PR or a short durable docs note.
+- Exact-head KVM and HVF evidence passes correctness before performance, with
+  no retry or waiver for repeated exec.
+- Linux fs-verity and unsupported-filesystem evidence is recorded in the PR or
+  a short durable docs note.
 - Unsupported filesystems continue to use v1 provenance proofs or verified
   chunks without a user-facing mode.
 

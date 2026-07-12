@@ -5,6 +5,9 @@ steps:
       mise install
       mise exec -- zig build test --summary all
       mise exec -- zig fmt --check build.zig src
+      python3 scripts/benchmark/named-restore-readiness.py --self-test
+      python3 scripts/benchmark/named-restore-readiness-test.py
+      bash scripts/ci/named-restore-release-inputs-test.sh
     plugins:
       - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
           version: "2026.5.12"
@@ -23,6 +26,9 @@ steps:
     command: |
       mise install
       mise exec -- zig build test --summary all
+      python3 scripts/benchmark/named-restore-readiness.py --self-test
+      python3 scripts/benchmark/named-restore-readiness-test.py
+      bash scripts/ci/named-restore-release-inputs-test.sh
     plugins:
       - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
           version: "2026.5.12"
@@ -41,9 +47,11 @@ steps:
     if: build.env("SPOREVM_RUN_NAMED_RESTORE_BENCHMARK") == "1"
     command: |
       mise install
-      scripts/ci/buildkite-named-restore-readiness.sh
+      SPOREVM_NAMED_RESTORE_SCRATCH_ROOT="/var/tmp/sporevm-named-restore-verity" \
+        scripts/ci/buildkite-named-restore-readiness.sh
     artifact_paths:
       - "zig-cache/named-restore-readiness/*.jsonl"
+      - "zig-cache/named-restore-readiness/*.json"
     plugins:
       - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
           version: "2026.5.12"
@@ -56,6 +64,28 @@ steps:
       name: "mise-cache"
     agents:
       queue: sporevm-linux-arm64
+
+  - label: ":stopwatch: Named restore readiness (macOS ARM64)"
+    key: "named-restore-readiness-macos-arm64"
+    if: build.env("SPOREVM_RUN_NAMED_RESTORE_BENCHMARK") == "1"
+    command: |
+      mise install
+      scripts/ci/buildkite-named-restore-readiness.sh
+    artifact_paths:
+      - "zig-cache/named-restore-readiness/*.jsonl"
+      - "zig-cache/named-restore-readiness/*.json"
+    plugins:
+      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          version: "2026.5.12"
+    cache:
+      paths:
+        - "~/.local/share/mise"
+        - "~/.cache/mise"
+        - "~/.local/state/mise"
+      size: "20g"
+      name: "mise-cache"
+    agents:
+      queue: sporevm-mac
 
   - label: ":ext4: Slow Rootfs Tests (Linux)"
     key: "rootfs-slow-test-linux"
