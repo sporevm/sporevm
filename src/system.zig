@@ -1,6 +1,7 @@
 //! Local system inspection and cleanup commands.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const build_step_cache = @import("build/step_cache.zig");
@@ -16,10 +17,16 @@ const saved_spore_pin = @import("saved_spore_pin.zig");
 const runtime_disk = @import("runtime_disk.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const spore = @import("spore.zig");
+const test_barrier = @import("test_barrier.zig");
 const default_prune_max_bytes = 0;
 const max_runtime_spec_bytes = 64 * 1024;
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const max_root_record_bytes = 1024 * 1024;
+
+pub const testing = if (builtin.is_test) struct {
+    pub var gc_mutation_barrier: ?*test_barrier.Barrier = null;
+    pub var prune_mutation_barrier: ?*test_barrier.Barrier = null;
+} else struct {};
 
 const usage =
     \\Usage:
@@ -842,6 +849,7 @@ fn pruneRootfsCache(
     const pins_conservative = collectPinnedProtectedPaths(allocator, io, cache_root, &protected_paths) catch true;
 
     const plan = try collectPruneEntries(allocator, io, cache_root, opts.include_digest_artifacts, opts.include_rootfs_chunks);
+    if (comptime builtin.is_test) if (testing.prune_mutation_barrier) |barrier| barrier.pause(io);
     if (pins_conservative) for (plan) |entry| {
         if (entry.kind == .cas_index or entry.kind == .cas_object) try protected_paths.put(entry.path, {});
     };
@@ -1011,6 +1019,7 @@ fn gcRootfsCache(
             }
         }
     }
+    if (comptime builtin.is_test) if (testing.gc_mutation_barrier) |barrier| barrier.pause(io);
 
     var result_entries = std.array_list.Managed(RootfsGcEntry).init(allocator);
     var candidate_bytes: u64 = 0;

@@ -61,15 +61,24 @@ const LoadedManifest = union(enum) {
     }
 };
 
+const CrashBoundary = enum { none, before_batch_rename, batch_rename, parent_sync };
+
 const TestFault = struct {
     fail_before_child: ?usize = null,
     fail_before_registry_sync: bool = false,
     fail_before_batch_rename: bool = false,
     fail_before_portable_sync: ?usize = null,
     portable_sync_count: usize = 0,
+    crash_after: CrashBoundary = .none,
 };
 
-var test_fault: TestFault = .{};
+pub const testing = if (builtin.is_test) struct {
+    pub var fault: TestFault = .{};
+} else struct {};
+
+fn crashAfterBoundary(boundary: CrashBoundary) void {
+    if (comptime builtin.is_test) if (testing.fault.crash_after == boundary) std.process.exit(87);
+}
 
 pub fn execute(context: Context, allocator: std.mem.Allocator, options: Options) !Result {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -113,9 +122,12 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, options: Options)
     });
     if (disk_root == null) if (disk) |portable_disk| {
         try materializeForkDiskStore(context.io, arena, allocator, options.parent_dir, fork_out, portable_disk, options.count);
-        if (builtin.is_test and test_fault.fail_before_batch_rename) return error.InjectedFailure;
+        if (comptime builtin.is_test) if (testing.fault.fail_before_batch_rename) return error.InjectedFailure;
+        crashAfterBoundary(.before_batch_rename);
         try std.Io.Dir.rename(std.Io.Dir.cwd(), fork_out, std.Io.Dir.cwd(), options.out_dir, context.io);
+        crashAfterBoundary(.batch_rename);
         try chunk_sealer.fsyncDirPath(arena, std.fs.path.dirname(options.out_dir) orelse ".");
+        crashAfterBoundary(.parent_sync);
         cleanup_stage = false;
     };
     var prepared_pins: ?[]saved_spore_pin.PreparedPin = null;
@@ -158,14 +170,17 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, options: Options)
         if (!std.mem.eql(u8, current.value.id, parent_pin_id.?)) return error.BadManifest;
         try saved_spore_pin.ensureRegistryDurable(arena, publish_registry);
         for (0..options.count) |index| {
-            if (builtin.is_test and test_fault.fail_before_child == index) return error.InjectedFailure;
+            if (comptime builtin.is_test) if (testing.fault.fail_before_child == index) return error.InjectedFailure;
             try saved_spore_pin.publishPreparedRecord(arena, publish_registry, validated_storage.?, prepared_pins.?[index]);
         }
-        if (builtin.is_test and test_fault.fail_before_registry_sync) return error.InjectedFailure;
+        if (comptime builtin.is_test) if (testing.fault.fail_before_registry_sync) return error.InjectedFailure;
         try saved_spore_pin.syncPreparedRecords(arena, publish_registry);
-        if (builtin.is_test and test_fault.fail_before_batch_rename) return error.InjectedFailure;
+        if (comptime builtin.is_test) if (testing.fault.fail_before_batch_rename) return error.InjectedFailure;
+        crashAfterBoundary(.before_batch_rename);
         try std.Io.Dir.rename(std.Io.Dir.cwd(), fork_out, std.Io.Dir.cwd(), options.out_dir, context.io);
+        crashAfterBoundary(.batch_rename);
         try chunk_sealer.fsyncDirPath(arena, std.fs.path.dirname(options.out_dir) orelse ".");
+        crashAfterBoundary(.parent_sync);
         cleanup_stage = false;
         const lock_finished = runtime_disk_fork_capture.monotonicNs();
         pin_publish_ms = (lock_finished -| lock_started) / std.time.ns_per_ms;
@@ -217,12 +232,12 @@ fn materializeForkDiskStore(
         const dest_object = try rootfs_cas.manifestObjectPath(path_allocator, shared_root, entry.digest);
         const dest_parent = std.fs.path.dirname(dest_object) orelse return error.BadManifest;
         try chunk_sealer.ensureDirPath(path_allocator, dest_parent);
-        if (builtin.is_test and test_fault.fail_before_portable_sync == test_fault.portable_sync_count) return error.InjectedFailure;
+        if (comptime builtin.is_test) if (testing.fault.fail_before_portable_sync == testing.fault.portable_sync_count) return error.InjectedFailure;
         switch (try chunk_sealer.publishTrustedFileIfMissing(path_allocator, source_object, dest_object, expected_size)) {
             .copy_required => try chunk_sealer.writeFileAtomicDurable(path_allocator, dest_object, source_bytes, 0o444),
             .linked, .reused_existing => try chunk_sealer.fsyncDirPath(path_allocator, dest_parent),
         }
-        if (builtin.is_test) test_fault.portable_sync_count += 1;
+        if (comptime builtin.is_test) testing.fault.portable_sync_count += 1;
         const dest_bytes = try rootfs_cas.readVerifiedChunkPath(scratch_allocator, dest_object, entry.digest, expected_size);
         scratch_allocator.free(dest_bytes);
     }
@@ -231,9 +246,9 @@ fn materializeForkDiskStore(
     // the batch after its final rename.
     const durable_parents = [_][]const u8{ objects_root, blake3_root, rootfs_root, cas_root, shared_root };
     for (durable_parents) |path| {
-        if (builtin.is_test and test_fault.fail_before_portable_sync == test_fault.portable_sync_count) return error.InjectedFailure;
+        if (comptime builtin.is_test) if (testing.fault.fail_before_portable_sync == testing.fault.portable_sync_count) return error.InjectedFailure;
         try chunk_sealer.fsyncDirPath(path_allocator, path);
-        if (builtin.is_test) test_fault.portable_sync_count += 1;
+        if (comptime builtin.is_test) testing.fault.portable_sync_count += 1;
     }
     for (0..child_count) |index| {
         const child = try std.fmt.allocPrint(path_allocator, "{s}/{d:0>6}", .{ batch_dir, index });
@@ -342,28 +357,28 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
     // A portable/local-CAS fork stays hidden until every new CAS directory
     // entry has been synced bottom-up. Failure at any boundary leaves no
     // visible batch; the final rename is a separate injected boundary.
-    defer test_fault = .{};
+    defer testing.fault = .{};
     for (0..6) |sync_index| {
         const failed_portable = try std.fmt.allocPrint(arena, "{s}/portable-sync-{d}", .{ root, sync_index });
-        test_fault = .{ .fail_before_portable_sync = sync_index };
+        testing.fault = .{ .fail_before_portable_sync = sync_index };
         try std.testing.expectError(error.InjectedFailure, execute(context, allocator, .{
             .parent_dir = parent,
             .out_dir = failed_portable,
             .count = 1,
         }));
-        try std.testing.expectEqual(sync_index, test_fault.portable_sync_count);
+        try std.testing.expectEqual(sync_index, testing.fault.portable_sync_count);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, failed_portable, .{ .follow_symlinks = false }));
     }
     const failed_portable_rename = try std.fs.path.join(arena, &.{ root, "portable-rename" });
-    test_fault = .{ .fail_before_batch_rename = true };
+    testing.fault = .{ .fail_before_batch_rename = true };
     try std.testing.expectError(error.InjectedFailure, execute(context, allocator, .{
         .parent_dir = parent,
         .out_dir = failed_portable_rename,
         .count = 1,
     }));
-    try std.testing.expectEqual(@as(usize, 6), test_fault.portable_sync_count);
+    try std.testing.expectEqual(@as(usize, 6), testing.fault.portable_sync_count);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, failed_portable_rename, .{ .follow_symlinks = false }));
-    test_fault = .{};
+    testing.fault = .{};
 
     var parent_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache);
     defer parent_lock.deinit();
@@ -380,10 +395,10 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
     defer allocator.free(record_before_fault);
     var replacement_manifest = manifest;
     replacement_manifest.generation.generation += 1;
-    saved_spore_pin.publish_test_fault = .{ .fail_before_complete_stamp = true };
-    defer saved_spore_pin.publish_test_fault = .{};
+    saved_spore_pin.testing.publish_fault = .{ .fail_before_complete_stamp = true };
+    defer saved_spore_pin.testing.publish_fault = .{};
     try std.testing.expectError(error.InjectedFailure, saved_spore_pin.publishManifest(io, arena, parent_registry, parent, disk, replacement_manifest));
-    saved_spore_pin.publish_test_fault = .{};
+    saved_spore_pin.testing.publish_fault = .{};
     const manifest_after_fault = try std.Io.Dir.cwd().readFileAlloc(io, parent_manifest_path, allocator, .limited(saved_spore_pin.max_manifest_bytes));
     defer allocator.free(manifest_after_fault);
     const ref_after_fault = try std.Io.Dir.cwd().readFileAlloc(io, parent_ref_path, allocator, .limited(saved_spore_pin.max_record_bytes));
@@ -481,27 +496,27 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
     // A pin failure never exposes a partial batch. Pins already published for
     // hidden children are safe orphans and remain explicitly reclaimable.
     const failed_batch = try std.fs.path.join(arena, &.{ root, "failed-children" });
-    test_fault.fail_before_child = 1;
+    testing.fault.fail_before_child = 1;
     try std.testing.expectError(error.InjectedFailure, execute(context, allocator, .{
         .parent_dir = moved_first_child,
         .out_dir = failed_batch,
         .count = 2,
     }));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, failed_batch, .{ .follow_symlinks = false }));
-    test_fault = .{};
+    testing.fault = .{};
     var orphan_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache);
     const pins_after_failed_batch = try saved_spore_pin.list(io, arena, cache);
     try std.testing.expect(pins_after_failed_batch.len >= 4);
     orphan_lock.deinit();
     const failed_sync_batch = try std.fs.path.join(arena, &.{ root, "failed-sync-children" });
-    test_fault.fail_before_registry_sync = true;
+    testing.fault.fail_before_registry_sync = true;
     try std.testing.expectError(error.InjectedFailure, execute(context, allocator, .{
         .parent_dir = moved_first_child,
         .out_dir = failed_sync_batch,
         .count = 1,
     }));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, failed_sync_batch, .{ .follow_symlinks = false }));
-    test_fault = .{ .fail_before_batch_rename = true };
+    testing.fault = .{ .fail_before_batch_rename = true };
     const failed_rename_batch = try std.fs.path.join(arena, &.{ root, "failed-rename-children" });
     try std.testing.expectError(error.InjectedFailure, execute(context, allocator, .{
         .parent_dir = moved_first_child,
@@ -509,7 +524,7 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
         .count = 1,
     }));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, failed_rename_batch, .{ .follow_symlinks = false }));
-    test_fault = .{};
+    testing.fault = .{};
 
     // A process-owned active lease protects unread lazy disk data after every
     // visible save and pin has been removed.

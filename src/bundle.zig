@@ -10,11 +10,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const block_source = @import("block_source.zig");
 const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
+const chunk_sealer = @import("chunk_sealer.zig");
 const contracts = @import("contracts.zig");
 const chunklib = @import("chunk.zig");
 const disk_layer = @import("disk_layer.zig");
 const fetch_policy = @import("host_fetch_policy.zig");
 const gicv3 = @import("gicv3.zig");
+const manifest_test_support = @import("manifest_test_support.zig");
 const rootfs_mod = @import("rootfs.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -22,6 +24,8 @@ const saved_spore_pin = @import("saved_spore_pin.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const disk_index = @import("disk_index.zig");
 const spore = @import("spore.zig");
+const system = @import("system.zig");
+const test_barrier = @import("test_barrier.zig");
 const topology = @import("topology.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Io = std.Io;
@@ -51,6 +55,11 @@ pub const bundle_schema_version = contracts.bundle_schema_version;
 const max_remote_bundle_metadata_file_bytes: u64 = 64 * 1024 * 1024;
 const max_remote_bundle_metadata_bytes: u64 = 256 * 1024 * 1024;
 const max_remote_bundle_materialization_bytes: u64 = 128 * 1024 * 1024 * 1024;
+
+const testing = if (builtin.is_test) struct {
+    var pack_authority_barrier: ?*test_barrier.Barrier = null;
+    var rootfs_unpack_source_object_reads: ?*usize = null;
+} else struct {};
 
 const LoadedManifest = struct {
     v0: ?std.json.Parsed(spore.Manifest) = null,
@@ -852,6 +861,7 @@ pub fn unpack(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unpack
         local_source.source(),
         null,
     );
+    errdefer Io.Dir.cwd().deleteTree(options.io, options.out_dir) catch {};
 
     const rootfs_result = try unpackRootfsArtifact(allocator, options, manifest.rootfs());
     try unpackDiskIndexForManifest(allocator, options.io, options.bundle_dir, options.out_dir, manifest.disk());
@@ -889,8 +899,6 @@ fn unpackIndexed(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unp
     defer parsed_index.deinit();
     try validateIndex(allocator, parsed_index.value);
 
-    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, options, bundle_index, manifest.rootfs());
-
     var by_id = try indexById(allocator, parsed_index.value);
     defer by_id.deinit();
     var local_source = LocalBundleContentSource{ .bundle_dir = options.bundle_dir };
@@ -905,6 +913,9 @@ fn unpackIndexed(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unp
         local_source.source(),
         null,
     );
+    errdefer Io.Dir.cwd().deleteTree(options.io, options.out_dir) catch {};
+
+    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, options, bundle_index, manifest.rootfs());
 
     try unpackDiskIndexForManifest(allocator, options.io, options.bundle_dir, options.out_dir, manifest.disk());
     try manifest.saveDir(allocator, options.out_dir);
@@ -1004,8 +1015,6 @@ fn pullLocalIndexedBundle(
         .child_id = child_id,
         .allow_metadata_only_rootfs = options.allow_metadata_only_rootfs,
     };
-    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, unpack_options, bundle_index, manifest.rootfs());
-
     var by_id = try indexById(allocator, parsed_index.value);
     defer by_id.deinit();
 
@@ -1021,6 +1030,9 @@ fn pullLocalIndexedBundle(
         local_source.source(),
         options.bundle_cache_dir,
     );
+    errdefer Io.Dir.cwd().deleteTree(options.io, options.out_dir) catch {};
+
+    const rootfs_result = try unpackRootfsArtifactIndexed(allocator, unpack_options, bundle_index, manifest.rootfs());
 
     try unpackDiskIndexForManifest(allocator, options.io, bundle_dir, options.out_dir, manifest.disk());
     try manifest.saveDir(allocator, options.out_dir);
@@ -1354,6 +1366,7 @@ fn materializeChunks(
     chunk_cache_dir: ?[]const u8,
 ) Error!MaterializeResult {
     try ensureNewDir(try pathZ(allocator, "{s}", .{out_dir}));
+    errdefer Io.Dir.cwd().deleteTree(io, out_dir) catch {};
     try ensureNewDir(try pathZ(allocator, "{s}/chunks", .{out_dir}));
 
     var seen = std.StringHashMap(void).init(allocator);
@@ -1630,11 +1643,18 @@ fn packRootfsStorageIndexed(
         return 0;
     }
 
-    // Index and object reads share the cache with destructive GC.
-    var cache_lock = rootfs_mod.lockRootfsCacheExclusive(options.io, allocator, cache_root) catch |err| return rootfsError(err);
-    defer cache_lock.deinit();
+    const local_index_path = rootfs_cas.manifestIndexPath(allocator, options.spore_dir, storage.index_digest) catch |err| return rootfsError(err);
+    const source_root = if (try localFilePresent(options.io, local_index_path)) options.spore_dir else cache_root;
+    // Global-cache reads share the cache lock with destructive GC. A portable
+    // unpacked spore instead carries its own descriptor-bound rootfs CAS and
+    // is deep-verified directly without consulting host cache state.
+    var cache_lock: ?rootfs_mod.RootfsCacheLock = if (std.mem.eql(u8, source_root, cache_root))
+        rootfs_mod.lockRootfsCacheExclusive(options.io, allocator, cache_root) catch |err| return rootfsError(err)
+    else
+        null;
+    defer if (cache_lock) |*lock| lock.deinit();
 
-    const source_index_path = rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
+    const source_index_path = rootfs_cas.manifestIndexPath(allocator, source_root, storage.index_digest) catch |err| return rootfsError(err);
     const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
     defer allocator.free(index_bytes);
     const parsed_index = try parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
@@ -1650,7 +1670,7 @@ fn packRootfsStorageIndexed(
     var object_count: usize = 0;
     for (parsed_index.value.chunks) |chunk_entry| {
         const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
-        const source_object_path = rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest) catch |err| return rootfsError(err);
+        const source_object_path = rootfs_cas.manifestObjectPath(allocator, source_root, chunk_entry.digest) catch |err| return rootfsError(err);
         const object_data = rootfs_cas.readVerifiedChunkPath(allocator, source_object_path, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
         defer allocator.free(object_data);
         object_count += 1;
@@ -1779,23 +1799,34 @@ fn unpackRootfsStorageIndexed(
     if (entry.index_bytes != @as(u64, @intCast(index_bytes.len))) return error.BadManifest;
     try validateRootfsStoragePayloadStats(entry, storage, parsed_index.value);
 
+    const local_index_path = rootfs_cas.manifestIndexPath(allocator, options.out_dir, storage.index_digest) catch |err| return rootfsError(err);
     const cache_index_path = rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
     var result = RootfsMaterializeResult{
         .artifact_count = 1,
         .payload_bytes = @intCast(index_bytes.len),
     };
-    // Publish into the shared cache as one GC-safe transaction. A failed
-    // object verification may leave verified objects for reuse, but never a
-    // newly visible index or completeness stamp.
+    // Read and verify each unique bundle object once, then publish it to both
+    // the portable local CAS and the shared host cache. Indexes and completion
+    // stamps remain hidden until every referenced object is durable.
     var cache_lock = rootfs_mod.lockRootfsCacheExclusive(options.io, allocator, cache_root) catch |err| return rootfsError(err);
     defer cache_lock.deinit();
 
+    var seen_objects = std.StringHashMap(void).init(allocator);
+    defer seen_objects.deinit();
     for (parsed_index.value.chunks) |chunk_entry| {
+        const seen = try seen_objects.getOrPut(chunk_entry.digest);
+        if (seen.found_existing) continue;
         const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
         const source_object_rel_path = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
         const source_object_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, source_object_rel_path });
         const object_data = rootfs_cas.readVerifiedChunkPath(allocator, source_object_path, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
         defer allocator.free(object_data);
+        if (comptime builtin.is_test) {
+            if (testing.rootfs_unpack_source_object_reads) |count| count.* += 1;
+        }
+
+        const local_object_path = rootfs_cas.manifestObjectPath(allocator, options.out_dir, chunk_entry.digest) catch |err| return rootfsError(err);
+        _ = rootfs_cas.installChunkPath(allocator, options.io, local_object_path, object_data, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
         const cache_object_path = rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest) catch |err| return rootfsError(err);
         const installed_object = rootfs_cas.installChunkPath(allocator, options.io, cache_object_path, object_data, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
         if (installed_object.cache_hit) {
@@ -1808,6 +1839,7 @@ fn unpackRootfsStorageIndexed(
         result.payload_bytes += @intCast(object_data.len);
     }
 
+    _ = rootfs_cas.installStorageIndexPath(allocator, options.io, local_index_path, index_bytes, storage) catch |err| return rootfsError(err);
     const installed_index = rootfs_cas.installStorageIndexPath(allocator, options.io, cache_index_path, index_bytes, storage) catch |err| return rootfsError(err);
     if (installed_index.cache_hit) {
         result.cache_hit_count += 1;
@@ -1816,6 +1848,7 @@ fn unpackRootfsStorageIndexed(
         result.cache_miss_count += 1;
         result.bytes_fetched += installed_index.bytes_fetched;
     }
+    rootfs_cas.markStorageComplete(options.io, allocator, options.out_dir, storage.index_digest) catch |err| return rootfsError(err);
     rootfs_cas.markStorageComplete(options.io, allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
     // The flat digest-addressed artifact is the only runtime base source;
     // assemble it eagerly from the just-installed verified chunks so the
@@ -1944,6 +1977,7 @@ fn packDiskIndexForManifest(
         }) catch return error.BadManifest;
         break :blk cache_root;
     };
+    if (comptime builtin.is_test) if (testing.pack_authority_barrier) |barrier| barrier.pause(io);
     const source_index_path = rootfs_cas.manifestIndexPath(allocator, source_root, storage.index_digest) catch |err| return rootfsError(err);
     const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
     defer allocator.free(index_bytes);
@@ -1995,10 +2029,6 @@ fn unpackDiskIndexForManifest(
     const parsed_index = try parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
     defer parsed_index.deinit();
 
-    const dest_index_path = rootfs_cas.manifestIndexPath(allocator, out_dir, storage.index_digest) catch |err| return rootfsError(err);
-    if (std.fs.path.dirname(dest_index_path)) |parent| try ensureDirPath(io, parent);
-    try writeFileAll(try pathZ(allocator, "{s}", .{dest_index_path}), index_bytes);
-
     for (parsed_index.value.chunks) |chunk_entry| {
         const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
         const source_object_rel_path = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
@@ -2007,9 +2037,11 @@ fn unpackDiskIndexForManifest(
         defer allocator.free(object_data);
 
         const dest_object_path = rootfs_cas.manifestObjectPath(allocator, out_dir, chunk_entry.digest) catch |err| return rootfsError(err);
-        if (std.fs.path.dirname(dest_object_path)) |parent| try ensureDirPath(io, parent);
-        try writeFileAll(try pathZ(allocator, "{s}", .{dest_object_path}), object_data);
+        _ = rootfs_cas.installChunkPath(allocator, io, dest_object_path, object_data, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
     }
+
+    const dest_index_path = rootfs_cas.manifestIndexPath(allocator, out_dir, storage.index_digest) catch |err| return rootfsError(err);
+    _ = rootfs_cas.installStorageIndexPath(allocator, io, dest_index_path, index_bytes, storage) catch |err| return rootfsError(err);
 }
 
 fn diskStorageDescriptor(disk: spore.Disk) Error!spore.RootfsStorage {
@@ -4183,32 +4215,36 @@ test "pack and unpack disk indexes in existing bundle shape" {
     try spore.saveManifest(arena, parent_dir, manifest);
     const disk = manifest.disk orelse return error.BadManifest;
     const storage = try diskStorageDescriptor(disk);
-    var pin_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, pack_cache_root);
-    defer pin_lock.deinit();
-    const pin_registry = try saved_spore_pin.LockedRegistry.init(arena, pack_cache_root, &pin_lock);
-    const pin_id = try saved_spore_pin.create(io, arena, pin_registry, parent_dir, disk);
-    pin_lock.deinit();
+    const pin_id = blk: {
+        var pin_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, pack_cache_root);
+        defer pin_lock.deinit();
+        const pin_registry = try saved_spore_pin.LockedRegistry.init(arena, pack_cache_root, &pin_lock);
+        break :blk try saved_spore_pin.create(io, arena, pin_registry, parent_dir, disk);
+    };
     const source_index = try rootfs_cas.manifestIndexPath(arena, pack_cache_root, storage.index_digest);
     const index_bytes = try readFileAllNoSymlink(arena, source_index, disk_index.max_index_bytes);
-    const local_index = try rootfs_cas.manifestIndexPath(arena, parent_dir, storage.index_digest);
-    try ensureDirPath(io, std.fs.path.dirname(local_index).?);
-    try writeFileAll(try pathZ(arena, "{s}", .{local_index}), index_bytes);
     var local_index_parsed = try parseRootfsDiskIndexForStorage(arena, index_bytes, storage);
     defer local_index_parsed.deinit();
     for (local_index_parsed.value.chunks) |entry| {
         const source_object = try rootfs_cas.manifestObjectPath(arena, pack_cache_root, entry.digest);
         const object_bytes = try readFileAllNoSymlink(arena, source_object, rootfs_cas.default_chunk_size);
         const local_object = try rootfs_cas.manifestObjectPath(arena, parent_dir, entry.digest);
-        try ensureDirPath(io, std.fs.path.dirname(local_object).?);
-        try writeFileAll(try pathZ(arena, "{s}", .{local_object}), object_bytes);
+        try chunk_sealer.ensureDirPath(arena, std.fs.path.dirname(local_object).?);
+        try chunk_sealer.writeFileAtomicDurable(arena, local_object, object_bytes, 0o444);
+        const verified = try rootfs_cas.readVerifiedChunkPath(arena, local_object, entry.digest, object_bytes.len);
+        try std.testing.expectEqualSlices(u8, object_bytes, verified);
     }
+    const local_index = try rootfs_cas.manifestIndexPath(arena, parent_dir, storage.index_digest);
+    try chunk_sealer.ensureDirPath(arena, std.fs.path.dirname(local_index).?);
+    try chunk_sealer.writeFileAtomicDurable(arena, local_index, index_bytes, 0o444);
     // A copied host-private ref may be stale. Pack remains local-first for a
     // complete self-contained/local-CAS spore.
-    var remove_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, pack_cache_root);
-    defer remove_lock.deinit();
-    const remove_registry = try saved_spore_pin.LockedRegistry.init(arena, pack_cache_root, &remove_lock);
-    try saved_spore_pin.remove(io, arena, remove_registry, pin_id);
-    remove_lock.deinit();
+    {
+        var remove_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, pack_cache_root);
+        defer remove_lock.deinit();
+        const remove_registry = try saved_spore_pin.LockedRegistry.init(arena, pack_cache_root, &remove_lock);
+        try saved_spore_pin.remove(io, arena, remove_registry, pin_id);
+    }
 
     const pack_result = try pack(arena, .{
         .io = io,
@@ -4259,6 +4295,182 @@ test "pack and unpack disk indexes in existing bundle shape" {
         .rootfs_cache_dir = unpack_cache_root,
     }));
     try std.testing.expect(std.c.access(try pathZ(arena, "{s}/manifest.json", .{out_bad_dir}), 0) != 0);
+}
+
+test "pack active lease survives concurrent saved-spore removal and destructive collection" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
+    const save_dir = try std.fs.path.join(arena, &.{ root, "saved.spore" });
+    const bundle_dir = try std.fs.path.join(arena, &.{ root, "bundle" });
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache_root, save_dir, 0x71, false);
+    const pin_id = blk: {
+        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
+        defer lock.deinit();
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &lock);
+        try saved_spore_pin.publishManifest(io, arena, registry, save_dir, fixture.disk, fixture.manifest);
+        var record = try saved_spore_pin.loadForSporeLocked(io, arena, registry, save_dir, fixture.disk);
+        defer record.deinit();
+        break :blk try arena.dupe(u8, record.value.id);
+    };
+
+    var barrier = test_barrier.Barrier{};
+    testing.pack_authority_barrier = &barrier;
+    defer testing.pack_authority_barrier = null;
+    const ThreadContext = struct {
+        allocator: std.mem.Allocator,
+        io: Io,
+        save_dir: []const u8,
+        bundle_dir: []const u8,
+        cache_root: []const u8,
+        runtime_root: []const u8,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer if (testing.pack_authority_barrier) |active_barrier| active_barrier.reached.post(self.io);
+            _ = pack(self.allocator, .{
+                .io = self.io,
+                .spore_dir = self.save_dir,
+                .out_dir = self.bundle_dir,
+                .rootfs_cache_dir = self.cache_root,
+                .runtime_root = self.runtime_root,
+            }) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var thread_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer thread_arena_state.deinit();
+    var thread_context = ThreadContext{
+        .allocator = thread_arena_state.allocator(),
+        .io = io,
+        .save_dir = save_dir,
+        .bundle_dir = bundle_dir,
+        .cache_root = cache_root,
+        .runtime_root = runtime_root,
+    };
+    var pack_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, ThreadContext.run, .{&thread_context}),
+        .barriers = &.{&barrier},
+    };
+    defer pack_thread.deinit();
+    barrier.waitReached(io);
+    if (thread_context.err) |err| return err;
+
+    try Io.Dir.cwd().deleteTree(io, save_dir);
+    {
+        var remove_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
+        defer remove_lock.deinit();
+        const remove_registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &remove_lock);
+        try saved_spore_pin.remove(io, arena, remove_registry, pin_id);
+    }
+    const DestructiveContext = struct {
+        allocator: std.mem.Allocator,
+        io: Io,
+        cache_root: []const u8,
+        runtime_root: []const u8,
+        operation: enum { gc, prune },
+        attempting: *Io.Semaphore,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer {
+                if (system.testing.gc_mutation_barrier) |active_barrier| active_barrier.reached.post(self.io);
+                if (system.testing.prune_mutation_barrier) |active_barrier| active_barrier.reached.post(self.io);
+            }
+            self.attempting.post(self.io);
+            switch (self.operation) {
+                .gc => {
+                    const result = system.gc(self.allocator, self.io, .{
+                        .cache_root = self.cache_root,
+                        .runtime_root = self.runtime_root,
+                        .dry_run = false,
+                    }) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                    system.deinitRootfsGcResult(self.allocator, result);
+                },
+                .prune => {
+                    const result = system.prune(self.allocator, self.io, .{
+                        .cache_root = self.cache_root,
+                        .runtime_root = self.runtime_root,
+                        .dry_run = false,
+                        .include_rootfs_chunks = true,
+                        .max_bytes = 0,
+                        .rootfs_only = true,
+                    }, Io.Clock.real.now(self.io).nanoseconds) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                    system.deinitRootfsPruneResult(self.allocator, result);
+                },
+            }
+        }
+    };
+    var gc_barrier = test_barrier.Barrier{};
+    var gc_attempting = Io.Semaphore{};
+    system.testing.gc_mutation_barrier = &gc_barrier;
+    defer system.testing.gc_mutation_barrier = null;
+    var gc_context = DestructiveContext{ .allocator = allocator, .io = io, .cache_root = cache_root, .runtime_root = runtime_root, .operation = .gc, .attempting = &gc_attempting };
+    var gc_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, DestructiveContext.run, .{&gc_context}),
+        .barriers = &.{&gc_barrier},
+    };
+    defer gc_thread.deinit();
+    gc_attempting.waitUncancelable(io);
+    gc_barrier.waitReached(io);
+    if (gc_context.err) |err| return err;
+    gc_barrier.release(io);
+    gc_thread.join();
+    if (gc_context.err) |err| return err;
+
+    var prune_barrier = test_barrier.Barrier{};
+    var prune_attempting = Io.Semaphore{};
+    system.testing.prune_mutation_barrier = &prune_barrier;
+    defer system.testing.prune_mutation_barrier = null;
+    var prune_context = DestructiveContext{ .allocator = allocator, .io = io, .cache_root = cache_root, .runtime_root = runtime_root, .operation = .prune, .attempting = &prune_attempting };
+    var prune_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, DestructiveContext.run, .{&prune_context}),
+        .barriers = &.{&prune_barrier},
+    };
+    defer prune_thread.deinit();
+    prune_attempting.waitUncancelable(io);
+    prune_barrier.waitReached(io);
+    if (prune_context.err) |err| return err;
+    prune_barrier.release(io);
+    prune_thread.join();
+    if (prune_context.err) |err| return err;
+    const cache_index_path = try rootfs_cas.manifestIndexPath(arena, cache_root, fixture.storage.index_digest);
+    const object_path = try rootfs_cas.manifestObjectPath(arena, cache_root, fixture.object_digest);
+    _ = try Io.Dir.cwd().statFile(io, cache_index_path, .{ .follow_symlinks = false });
+    _ = try Io.Dir.cwd().statFile(io, object_path, .{ .follow_symlinks = false });
+
+    barrier.release(io);
+    pack_thread.join();
+    if (thread_context.err) |err| return err;
+    const bundle_object = try rootfsStorageObjectRelPath(arena, fixture.object_digest);
+    const packed_bytes = try readFileAllNoSymlink(allocator, try std.fs.path.join(arena, &.{ bundle_dir, bundle_object }), fixture.object_bytes.len);
+    defer allocator.free(packed_bytes);
+    try std.testing.expectEqualSlices(u8, fixture.object_bytes, packed_bytes);
+    const unpacked_dir = try std.fs.path.join(arena, &.{ root, "unpacked.spore" });
+    const unpack_cache = try std.fs.path.join(arena, &.{ root, "unpack-cache" });
+    _ = try unpack(arena, .{ .io = io, .bundle_dir = bundle_dir, .out_dir = unpacked_dir, .rootfs_cache_dir = unpack_cache });
+    const unpacked_object = try rootfs_cas.manifestObjectPath(arena, unpacked_dir, fixture.object_digest);
+    const verified = try rootfs_cas.readVerifiedChunkPath(allocator, unpacked_object, fixture.object_digest, fixture.object_bytes.len);
+    defer allocator.free(verified);
+    try std.testing.expectEqualSlices(u8, fixture.object_bytes, verified);
 }
 
 test "unpack rejects corrupted rootfs artifact" {
@@ -5205,13 +5417,17 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
     const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
     const single_bundle_dir = try pathZ(arena, "{s}/single-bundle", .{root_dir});
+    const repacked_bundle_dir = try pathZ(arena, "{s}/repacked-bundle", .{root_dir});
     const metadata_only_storage_bundle_dir = try pathZ(arena, "{s}/metadata-only-storage-bundle", .{root_dir});
     const single_out_dir = try pathZ(arena, "{s}/single-unpacked", .{root_dir});
+    const corrupt_unpack_out_dir = try pathZ(arena, "{s}/corrupt-unpack", .{root_dir});
     const out_dir = try pathZ(arena, "{s}/pulled-child", .{root_dir});
     const out_cached_dir = try pathZ(arena, "{s}/pulled-cached-child", .{root_dir});
     const out_bad_dir = try pathZ(arena, "{s}/pulled-bad-child", .{root_dir});
     const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
     const single_rootfs_cache = try pathZ(arena, "{s}/single-rootfs-cache", .{root_dir});
+    const empty_repack_cache = try pathZ(arena, "{s}/empty-repack-cache", .{root_dir});
+    const corrupt_unpack_cache = try pathZ(arena, "{s}/corrupt-unpack-cache", .{root_dir});
     const pull_rootfs_cache = try pathZ(arena, "{s}/pull-rootfs-cache", .{root_dir});
     const bad_rootfs_cache = try pathZ(arena, "{s}/bad-rootfs-cache", .{root_dir});
     const pull_bundle_cache = try pathZ(arena, "{s}/pull-bundle-cache", .{root_dir});
@@ -5225,6 +5441,7 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     const rootfs_bytes = try arena.alloc(u8, 3 * spore.disk_chunk_size + 7);
     @memset(rootfs_bytes, 0);
     rootfs_bytes[0] = 0x11;
+    rootfs_bytes[spore.disk_chunk_size] = 0x11;
     rootfs_bytes[2 * spore.disk_chunk_size + 3] = 0x22;
     try writeFileAll(rootfs_source_path, rootfs_bytes);
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
@@ -5261,14 +5478,34 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     try std.testing.expectEqual(@as(usize, 1), single_pack.rootfs_artifact_count);
     try std.testing.expect(!try pathExistsNoSymlink(io, pack_flat_path));
     try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, arena, pack_cache_root, manifest_storage));
+    const source_index_bytes = try rootfs_cas.readVerifiedStorageIndexPath(arena, preload_result.index_path, manifest_storage);
+    const source_index = try disk_index.parseDiskIndex(arena, source_index_bytes, try spore.diskIndexDescriptorForStorage(manifest_storage));
+    defer source_index.deinit();
+    var unique_source_objects = std.StringHashMap(void).init(arena);
+    for (source_index.value.chunks) |entry| try unique_source_objects.put(entry.digest, {});
+    try std.testing.expect(unique_source_objects.count() < preload_result.nonzero_chunks);
+    var source_object_reads: usize = 0;
+    testing.rootfs_unpack_source_object_reads = &source_object_reads;
+    defer testing.rootfs_unpack_source_object_reads = null;
     const single_unpacked = try unpack(arena, .{
         .io = io,
         .bundle_dir = single_bundle_dir,
         .out_dir = single_out_dir,
         .rootfs_cache_dir = single_rootfs_cache,
     });
+    testing.rootfs_unpack_source_object_reads = null;
     try std.testing.expectEqual(@as(usize, 0), single_unpacked.child_count);
     try std.testing.expectEqual(@as(usize, 1), single_unpacked.rootfs_artifact_count);
+    try std.testing.expectEqual(unique_source_objects.count(), source_object_reads);
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, single_out_dir, manifest_storage));
+    const repacked = try pack(arena, .{
+        .io = io,
+        .spore_dir = single_out_dir,
+        .out_dir = repacked_bundle_dir,
+        .rootfs_cache_dir = empty_repack_cache,
+    });
+    try std.testing.expectEqualStrings(single_pack.bundle_digest, repacked.bundle_digest);
+    try std.testing.expectEqual(single_pack.rootfs_payload_bytes, repacked.rootfs_payload_bytes);
     _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 1 });
 
     const pack_result = try pack(arena, .{
@@ -5304,7 +5541,7 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     });
     try std.testing.expectEqual(@as(usize, 1), pulled.rootfs.artifact_count);
     try std.testing.expectEqual(@as(usize, 0), pulled.rootfs.cache.hit_count);
-    try std.testing.expectEqual(preload_result.nonzero_chunks + 1, pulled.rootfs.cache.miss_count);
+    try std.testing.expectEqual(unique_source_objects.count() + 1, pulled.rootfs.cache.miss_count);
     try std.testing.expect(pulled.rootfs.cache.bytes_fetched > 0);
     try std.testing.expectEqual(@as(u64, 0), pulled.rootfs.cache.bytes_reused);
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
@@ -5317,7 +5554,7 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
         .bundle_cache_dir = pull_bundle_cache,
         .child_id = "000000",
     });
-    try std.testing.expectEqual(preload_result.nonzero_chunks + 1, pulled_cached.rootfs.cache.hit_count);
+    try std.testing.expectEqual(unique_source_objects.count() + 1, pulled_cached.rootfs.cache.hit_count);
     try std.testing.expectEqual(@as(usize, 0), pulled_cached.rootfs.cache.miss_count);
     try std.testing.expectEqual(@as(u64, 0), pulled_cached.rootfs.cache.bytes_fetched);
     try std.testing.expectEqual(pulled.rootfs.payload_bytes, pulled_cached.rootfs.cache.bytes_reused);
@@ -5334,7 +5571,7 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     const exact_cache_path_z = try arena.dupeZ(u8, exact_cache_path);
     const assembled = try readFileAll(arena, exact_cache_path_z, 1 << 20);
     try std.testing.expectEqual(@as(u8, 0x11), assembled[0]);
-    try std.testing.expectEqual(@as(u8, 0), assembled[spore.disk_chunk_size]);
+    try std.testing.expectEqual(@as(u8, 0x11), assembled[spore.disk_chunk_size]);
     try std.testing.expectEqual(@as(u8, 0x22), assembled[2 * spore.disk_chunk_size + 3]);
 
     const parsed_block_index = try loadDiskIndexForEntry(arena, bundle_dir, storage_entry, storage);
@@ -5344,6 +5581,30 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     const last_chunk = parsed_block_index.value.chunks[parsed_block_index.value.chunks.len - 1];
     const object_rel_path = try rootfsStorageObjectRelPath(arena, last_chunk.digest);
     const object_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, object_rel_path });
+    const single_object_path = try pathZ(arena, "{s}/{s}", .{ single_bundle_dir, object_rel_path });
+    const original_single_object = try readFileAll(arena, single_object_path, spore.disk_chunk_size);
+    const corrupt_single_object = try arena.dupe(u8, original_single_object);
+    corrupt_single_object[0] ^= 0xff;
+    try writeFileAll(single_object_path, corrupt_single_object);
+    try std.testing.expectError(error.BadChunk, unpack(arena, .{
+        .io = io,
+        .bundle_dir = single_bundle_dir,
+        .out_dir = corrupt_unpack_out_dir,
+        .rootfs_cache_dir = corrupt_unpack_cache,
+    }));
+    try std.testing.expect(!try pathExistsNoSymlink(io, corrupt_unpack_out_dir));
+    try writeFileAll(single_object_path, original_single_object);
+    _ = try unpack(arena, .{
+        .io = io,
+        .bundle_dir = single_bundle_dir,
+        .out_dir = corrupt_unpack_out_dir,
+        .rootfs_cache_dir = corrupt_unpack_cache,
+    });
+    const retried_manifest = try spore.loadManifest(arena, corrupt_unpack_out_dir);
+    defer retried_manifest.deinit();
+    try std.testing.expect(retried_manifest.value.rootfs != null);
+    try std.testing.expect(try pathExistsNoSymlink(io, try pathZ(arena, "{s}/chunks", .{corrupt_unpack_out_dir})));
+
     const clean_digest = try digestHex(arena, bundle_dir);
     const object_data = try readFileAll(arena, object_path, spore.disk_chunk_size);
     object_data[0] ^= 0xff;
@@ -5362,7 +5623,11 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     const installed_first_object = try rootfs_cas.manifestObjectPath(arena, bad_rootfs_cache, first_chunk.digest);
     const unpublished_index = try rootfs_cas.manifestIndexPath(arena, bad_rootfs_cache, storage.index_digest);
     const unpublished_stamp = try rootfs_cas.storageCompleteStampPath(arena, bad_rootfs_cache, storage.index_digest);
-    try std.testing.expect(try pathExistsNoSymlink(io, installed_first_object));
+    // A failed object verification may leave already verified objects in the
+    // shared cache for reuse, but neither destination publishes the index or
+    // completeness stamp and the hidden output is removed.
+    const installed_first = try rootfs_cas.readVerifiedChunkPath(arena, installed_first_object, first_chunk.digest, spore.disk_chunk_size);
+    try std.testing.expect(installed_first.len != 0);
     try std.testing.expect(!try pathExistsNoSymlink(io, unpublished_index));
     try std.testing.expect(!try pathExistsNoSymlink(io, unpublished_stamp));
 

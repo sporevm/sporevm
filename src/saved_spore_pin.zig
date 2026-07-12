@@ -7,6 +7,7 @@ const disk_index = @import("disk_index.zig");
 const rootfs_mod = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
+const test_barrier = @import("test_barrier.zig");
 
 const Io = std.Io;
 pub const schema = "spore.saved-disk-pin.v1";
@@ -44,11 +45,29 @@ pub const ListingState = enum { index_valid, corrupt, missing };
 pub const Listing = struct { id: []const u8, state: ListingState, index_digest: ?[]const u8 = null };
 pub const ListStats = struct { index_validation_count: usize = 0 };
 
-pub const PublishTestFault = struct {
-    fail_before_complete_stamp: bool = false,
+const PublishCrashBoundary = enum {
+    none,
+    staged_manifest,
+    complete_stamp,
+    pin_record,
+    reference_rename,
+    manifest_rename,
+    directory_sync,
 };
 
-pub var publish_test_fault: PublishTestFault = .{};
+const PublishTestFault = struct {
+    fail_before_complete_stamp: bool = false,
+    crash_after: PublishCrashBoundary = .none,
+};
+pub const testing = if (builtin.is_test) struct {
+    pub var publish_fault: PublishTestFault = .{};
+    pub var remove_mutation_barrier: ?*test_barrier.Barrier = null;
+    pub var publish_authority_barrier: ?*test_barrier.Barrier = null;
+} else struct {};
+
+fn crashAfterPublishBoundary(boundary: PublishCrashBoundary) void {
+    if (comptime builtin.is_test) if (testing.publish_fault.crash_after == boundary) std.process.exit(86);
+}
 
 /// Proof that the caller owns the lock serializing pin mutation and GC for
 /// this exact cache root. Construct once per critical section and pass the
@@ -155,6 +174,7 @@ pub fn deinitListings(allocator: std.mem.Allocator, listings: []Listing) void {
 pub fn remove(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, id: []const u8) !void {
     const path = try recordPath(allocator, registry.cache_root, id);
     defer allocator.free(path);
+    if (comptime builtin.is_test) if (testing.remove_mutation_barrier) |barrier| barrier.pause(io);
     try Io.Dir.cwd().deleteFile(io, path);
     const pins_path = try std.fs.path.join(allocator, &.{ registry.cache_root, dir_name });
     defer allocator.free(pins_path);
@@ -212,24 +232,31 @@ pub fn publishManifest(io: Io, allocator: std.mem.Allocator, registry: LockedReg
     defer allocator.free(manifest_bytes);
     if (manifest_bytes.len > max_manifest_bytes) return error.StreamTooLong;
     try chunk_sealer.replaceFileAtomicDurable(allocator, staged_manifest, manifest_bytes, 0o644);
+    crashAfterPublishBoundary(.staged_manifest);
     const storage = try storageForDisk(disk);
     try validateRoot(allocator, registry.cache_root, storage);
+    if (comptime builtin.is_test) if (testing.publish_authority_barrier) |barrier| barrier.pause(io);
     // Snapshot sealing durably publishes every object before the canonical
     // index. Publish the derived completeness proof next, before the pin and
     // save path can become visible, so restore and named fast-fork agree on
     // the same bound global-CAS authority.
-    if (builtin.is_test and publish_test_fault.fail_before_complete_stamp) return error.InjectedFailure;
+    if (comptime builtin.is_test) if (testing.publish_fault.fail_before_complete_stamp) return error.InjectedFailure;
     try rootfs_cas.markStorageComplete(io, allocator, registry.cache_root, storage.index_digest);
+    crashAfterPublishBoundary(.complete_stamp);
     _ = try createValidated(io, allocator, registry, stage, disk, storage);
+    crashAfterPublishBoundary(.pin_record);
     const staged_ref = try std.fs.path.join(allocator, &.{ stage, reference_file });
     defer allocator.free(staged_ref);
     const final_ref = try std.fs.path.join(allocator, &.{ spore_dir, reference_file });
     defer allocator.free(final_ref);
     try Io.Dir.renameAbsolute(staged_ref, final_ref, io);
+    crashAfterPublishBoundary(.reference_rename);
     const final_manifest = try std.fs.path.join(allocator, &.{ spore_dir, "manifest.json" });
     defer allocator.free(final_manifest);
     try Io.Dir.renameAbsolute(staged_manifest, final_manifest, io);
+    crashAfterPublishBoundary(.manifest_rename);
     try chunk_sealer.fsyncDirPath(allocator, spore_dir);
+    crashAfterPublishBoundary(.directory_sync);
 }
 
 /// The caller holds the rootfs cache lock. The manifest and every CAS value
