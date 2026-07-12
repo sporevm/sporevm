@@ -47,12 +47,16 @@ spore fanout children/ \
 are not written into child manifests.
 
 When the parent has a proof-validated local `ram.backing` file, `spore fork`
-hard-links that file into each child and writes a child-local
-`ram.backing.proof`. If the parent proof is missing or stale, children omit
-backing metadata and restore from chunks. `spore fanout` does not need a trust
-flag or special mode: each child uses normal product attach (`spore attach`, or
-`spore run --from` for run/rootfs children), which maps local backing only when
-the proof validates and otherwise restores from verified chunks.
+keeps the proven parent fd open across the batch, hard-links that file into each
+child, and writes a child-local `ram.backing.proof`. Each child link is reopened
+without following symlinks and must match the proof-bound parent file identity
+before the proof is written. A missing or stale parent proof, an unavailable
+hard-link capability, or a conflicting child proof produces a chunk-only child;
+identity races and unexpected I/O abort the fork. `spore fanout` does not need a
+trust flag or special mode: each child uses normal product attach (`spore
+attach`, or `spore run --from` for run/rootfs children), which maps local
+backing only when the proof validates and otherwise restores from verified
+chunks.
 
 ## Local Child Identity
 

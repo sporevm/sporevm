@@ -160,7 +160,18 @@ The benchmark builds SporeVM in ReleaseSafe mode unless `--no-build` is passed.
 Each JSONL row records CLI restore-return wall time, the observed exec-ready
 point and its source, the machine-reported exec-ready wait and total, the first
 `/bin/true` exec, repeated no-op exec samples and median, and cleanup time. The
-input spore is only read and can be reused across iterations.
+input spore is only read and can be reused across iterations. Rows also expose
+`restore_source`, `restore_ram_mib`, and the backend's `memory_ms`, `state_ms`,
+and `pre_run_ms` as `backend_memory_ms`, `backend_state_ms`, and
+`backend_pre_run_ms`. This separates RAM materialization from the guest
+readiness handshake instead of hiding both inside `wait_exec_ready_ms`.
+
+The standard Linux comparison requires successful rows with complete backend
+restore metrics and asserts an `eager_chunks` baseline and `local_backing`
+candidate. It reports the candidate's `backend_memory_ms` but does not yet gate
+on that value. Performance thresholds, input provenance, exact row-count
+enforcement, and signal-safe cleanup belong to the dedicated release-benchmark
+hardening follow-up.
 
 Pass `--include-run-from` to also record one-shot `run --from ... /bin/true`
 wall time against the same parent and host.

@@ -2,6 +2,26 @@
 
 ## Next
 
+Named persistent restore now uses the same proof-gated local RAM backing as
+one-shot `spore run --from` and attach. Restore selection is centralized across
+KVM and HVF, and the plan owns the backing fd until the private mapping has been
+created. Optional missing, stale, foreign, non-regular, or mismatched backing
+inputs still fall back to verified chunks, while malformed authoritative
+metadata, allocation failure, unexpected I/O, corruption, and backend or
+platform failures remain errors.
+
+On the same cached immutable 1 GiB parent under Linux ARM64/KVM, the v0.12.0
+baseline restored in 841.848 ms with 813 ms spent waiting for exec readiness
+and 778 ms materializing RAM. The local-backing path restored in 59.678 ms,
+waited 31 ms for exec readiness, and reported 0 ms of RAM materialization.
+Same-parent `run --from`, first exec, and repeated exec medians remained flat.
+
+Fork now retains the proven parent backing fd across child creation and checks
+each opened child hardlink against the proof-bound parent file identity before
+writing a child proof. Path replacement, identity mismatch, and unexpected I/O
+remove the link and fail closed. KVM and HVF continue to map every child with
+`MAP_PRIVATE`, so parent and sibling writes remain isolated.
+
 `spore fork --vm` now fast-forks disk-backed named VMs with one writable rootfs
 device. The source monitor pauses once, drains virtio-blk, captures shared
 RAM/machine state, and prepares up to 32 independent disk heads from the same

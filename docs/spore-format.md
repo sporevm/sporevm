@@ -310,17 +310,19 @@ representation.
   be covered exactly once by either list. `backing` is optional local
   acceleration metadata for same-host KVM/HVF fork/fan-out: `kind:
   "map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks remain the
-  portable verified source of truth; unsupported backends and imported/cold
-  spores materialize from chunks instead. Product restore paths (`spore attach`
-  and `spore run --from`) may automatically map `ram.backing` when the manifest
-  vCPU count is supported and the local `ram.backing.proof` validates against
-  the canonical memory index identity, backing metadata, opened file identity,
-  and host-local runtime key. A missing, corrupt, foreign-key, mismatched proof,
-  or unsupported topology falls back to chunks. The proof is local provenance
-  metadata; it is not a portable trust root and does not prove every RAM byte
-  still matches the manifest's chunk refs. KVM and HVF map a validated fd
-  `MAP_PRIVATE` to share clean parent pages across fork children while child
-  writes fault into private CoW pages.
+  portable verified source of truth; imported and cold spores materialize from
+  chunks instead. Product restore paths (`spore attach`, `spore run --from`, and
+  named monitor restore) may automatically map `ram.backing` when the local
+  `ram.backing.proof` validates against the canonical memory index identity,
+  backing metadata, opened file identity, and host-local runtime key. Missing,
+  symlinked, non-regular, stale, foreign-key, size-mismatched, or
+  cryptographically mismatched optional backing/proof inputs may fall back to
+  chunks. Malformed authoritative memory/index/backing metadata, allocation
+  failure, unexpected I/O, corruption, and backend/platform/topology errors
+  remain errors. The proof is local provenance metadata; it is not a portable
+  trust root and does not prove every RAM byte still matches the manifest's
+  chunk refs. KVM and HVF map a validated fd `MAP_PRIVATE` to share clean parent
+  pages across fork children while child writes fault into private CoW pages.
 - `rootfs`: optional immutable rootfs artifact required by a captured
   read-only virtio-blk root device. `kind` is
   `immutable-ext4-rootfs-v0`, `mode` is `read-only`, `device` binds the
