@@ -171,93 +171,39 @@ download_benchmark_history() {
     return 0
   fi
   [[ -n "${BUILDKITE_BUILD_NUMBER:-}" ]] || return 0
-  command -v buildkite-agent >/dev/null 2>&1 || return 0
 
   local limit="${SPOREVM_BENCHMARK_HISTORY_BUILDS:-20}"
   local dest="zig-cache/sporevm-benchmarks/history"
   mkdir -p "${dest}"
 
-  download_history_build() {
-    local build_ref="$1"
-    local label
-    label="$(printf '%s' "${build_ref}" | tr -c 'A-Za-z0-9_.-' '_')"
-    local build_dest="${dest}/build-${label}"
-    mkdir -p "${build_dest}"
-    buildkite-agent artifact download "zig-cache/sporevm-benchmarks/*/results.jsonl" "${build_dest}" --build "${build_ref}" >/dev/null 2>&1 || true
-    buildkite-agent artifact download "zig-cache/sporevm-benchmarks/*/config.json" "${build_dest}" --build "${build_ref}" >/dev/null 2>&1 || true
-    buildkite-agent artifact download "zig-cache/sporevm-benchmarks/*/summary.json" "${build_dest}" --build "${build_ref}" >/dev/null 2>&1 || true
-  }
-
-  local downloaded=0
-  if [[ -n "${BUILDKITE_API_TOKEN:-}" && -n "${BUILDKITE_ORGANIZATION_SLUG:-}" && -n "${BUILDKITE_PIPELINE_SLUG:-}" ]]; then
-    while IFS= read -r build_id; do
-      [[ -n "${build_id}" ]] || continue
-      download_history_build "${build_id}"
-      downloaded=1
-    done < <(python3 - "${limit}" <<'PY'
-import json
-import os
-import sys
-import urllib.parse
-import urllib.request
-
-limit = int(sys.argv[1])
-token = os.environ.get("BUILDKITE_API_TOKEN")
-org = os.environ.get("BUILDKITE_ORGANIZATION_SLUG")
-pipeline = os.environ.get("BUILDKITE_PIPELINE_SLUG")
-current_raw = os.environ.get("BUILDKITE_BUILD_NUMBER", "0")
-branch = os.environ.get("BUILDKITE_BRANCH", "")
-try:
-    current = int(current_raw)
-except ValueError:
-    current = 0
-if not token or not org or not pipeline or current <= 0:
-    raise SystemExit(0)
-
-query = {"per_page": str(max(limit * 2, limit))}
-if branch:
-    query["branch"] = branch
-url = (
-    "https://api.buildkite.com/v2/organizations/"
-    + urllib.parse.quote(org)
-    + "/pipelines/"
-    + urllib.parse.quote(pipeline)
-    + "/builds?"
-    + urllib.parse.urlencode(query)
-)
-request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-try:
-    with urllib.request.urlopen(request, timeout=20) as response:
-        builds = json.load(response)
-except Exception:
-    raise SystemExit(0)
-
-emitted = 0
-for build in builds:
-    number = build.get("number")
-    build_id = build.get("id")
-    if not isinstance(number, int) or not isinstance(build_id, str):
-        continue
-    if number >= current:
-        continue
-    print(build_id)
-    emitted += 1
-    if emitted >= limit:
-        break
-PY
-)
-  fi
-
-  if [[ "${downloaded}" == "0" ]]; then
-    local current="${BUILDKITE_BUILD_NUMBER}"
-    local offset build
-    for offset in $(seq 1 "${limit}"); do
-      build=$((current - offset))
-      [[ "${build}" -gt 0 ]] || break
-      download_history_build "${build}"
-    done
-  fi
+  local platform
+  case "$(uname -s)" in
+    Darwin) platform="macos" ;;
+    Linux) platform="linux-arm64" ;;
+    *) platform="unknown" ;;
+  esac
+  scripts/benchmark/download-history.sh "${dest}" "${limit}" "${BUILDKITE_BRANCH:-main}" "${platform}" || return 0
   printf '%s\n' "${dest}"
+}
+
+publish_benchmark_history() {
+  [[ "${BUILDKITE_BRANCH:-}" == "main" ]] || return 0
+  command -v aws >/dev/null 2>&1 || return 0
+
+  local platform
+  case "$(uname -s)" in
+    Darwin) platform="macos" ;;
+    Linux) platform="linux-arm64" ;;
+    *) return 0 ;;
+  esac
+  local history_uri="${SPOREVM_BENCHMARK_HISTORY_S3_URI:-s3://sporevm-benchmarks/history}"
+  aws s3 sync zig-cache/sporevm-benchmarks/ "${history_uri%/}/main/${platform}/" \
+    --no-progress \
+    --exclude "*" \
+    --include "*/config.json" \
+    --include "*/results.jsonl" \
+    --include "*/summary.json" \
+    --exclude "history/*"
 }
 
 run_regression_detector() {
@@ -344,6 +290,7 @@ check_benchmark_host_load
 scripts/benchmark/suite.py "${benchmark_args[@]}"
 scripts/benchmark/export-site-data.py zig-cache/sporevm-benchmarks/latest-summary.json
 run_regression_detector
+publish_benchmark_history
 if [[ -n "${SPOREVM_BENCHMARK_BASELINE:-}" ]]; then
   scripts/benchmark/compare.py "${SPOREVM_BENCHMARK_BASELINE}" zig-cache/sporevm-benchmarks/latest-summary.json
 fi
