@@ -13,6 +13,7 @@ const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
 else
     struct {};
 const net_gateway = @import("net_gateway.zig");
+const ram_restore = @import("ram_restore.zig");
 const generation = @import("generation.zig");
 const run_mod = @import("run.zig");
 const runtime_disk = @import("runtime_disk.zig");
@@ -250,11 +251,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     const ram_size = if (parsed) |manifest| manifest.value.platform.ram_size else parsed_v1.?.value.platform.ram_size;
     const vcpu_count = if (parsed) |_| @as(u32, 1) else parsed_v1.?.value.platform.vcpu_count;
     const memory = if (parsed) |manifest| manifest.value.memory else parsed_v1.?.value.memory;
-    const local_backing = try spore.openProvenLocalMemoryBackingForVcpuCount(allocator, context.environ_map, opts.spore_dir, memory, ram_size, vcpu_count);
-    defer if (local_backing.fd) |fd| {
-        _ = std.c.close(fd);
-    };
-    std.log.info("attach memory restore source={s} reason={s}", .{ @tagName(local_backing.source), @tagName(local_backing.reason) });
+    var ram_plan = try ram_restore.Plan.fromMemory(allocator, context.environ_map, opts.spore_dir, memory, ram_size, vcpu_count);
+    defer ram_plan.deinit();
+    std.log.info("attach memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
     const cause = switch (backend) {
         .auto => unreachable,
         .hvf => blk: {
@@ -267,7 +266,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .resume_dir = opts.spore_dir,
                 .resume_generation = attach.generation_state,
                 .vcpus = vcpu_count,
-                .ram_backing_fd = local_backing.fd,
+                .ram_restore = ram_plan.strategy,
                 .network = network,
                 .exec_probe = identity_probe,
                 .exec_control = exec_control,
@@ -286,7 +285,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .resume_dir = opts.spore_dir,
                 .resume_generation = attach.generation_state,
                 .vcpus = vcpu_count,
-                .ram_backing_fd = local_backing.fd,
+                .ram_restore = ram_plan.strategy,
                 .network = network,
                 .exec_probe = identity_probe,
                 .exec_control = exec_control,
@@ -301,7 +300,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .guest_off, .guest_reset => {},
         .probe_complete => {
             var result = try resultFromAttachStream(backend, ram_size, vcpu_count, identity_stream);
-            result = result.withMemoryRestore(local_backing);
+            result = result.withMemoryRestore(&ram_plan);
             run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
             try events.emitExit(result);
             if (events.write_failed) return error.EventSinkFailed;
@@ -324,7 +323,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .vcpus = vcpu_count,
         .memory_bytes = ram_size,
     };
-    result = result.withMemoryRestore(local_backing);
+    result = result.withMemoryRestore(&ram_plan);
     try events.emitExit(result);
     if (events.write_failed) return error.EventSinkFailed;
     return result;

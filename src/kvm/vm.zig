@@ -27,6 +27,7 @@ const rng = @import("../virtio/rng.zig");
 const transport_snapshot = @import("../virtio/transport_snapshot.zig");
 const virtio_mem = @import("../virtio/mem.zig");
 const platform = @import("../platform.zig");
+const ram_restore = @import("../ram_restore.zig");
 const spore = @import("../spore.zig");
 const topology = @import("../topology.zig");
 const vsock = @import("../virtio/vsock.zig");
@@ -64,17 +65,13 @@ pub const Config = struct {
     resume_dir: ?[]const u8 = null,
     /// Optional pre-refreshed generation state for product resume attach.
     resume_generation: ?generation.State = null,
-    /// Proof-validated same-host RAM backing fd. The fd must refer to the
-    /// manifest's optional RAM backing and is mapped MAP_PRIVATE; imported or
-    /// unproven spores must leave this null so RAM is materialized through
-    /// verified chunks.
-    ram_backing_fd: ?std.c.fd_t = null,
+    /// Resolved RAM source. Product callers proof-validate local backing
+    /// before selecting it; imported or unproven spores select verified
+    /// chunks instead.
+    ram_restore: ram_restore.Strategy = .fresh,
     /// Product callers provide their environment so snapshot code can write
     /// local-only RAM backing proofs under the configured runtime root.
     environ_map: ?*const std.process.Environ.Map = null,
-    /// Chunk restore strategy for cold/imported KVM resumes. Eager remains the
-    /// default; lazy is an explicit development path backed by userfaultfd.
-    ram_restore_mode: RamRestoreMode = .eager_chunks,
     /// Optional fd that receives one line per lazily materialized chunk.
     lazy_ram_trace_fd: ?std.c.fd_t = null,
     /// Take a spore snapshot after this many milliseconds of run time and
@@ -112,11 +109,6 @@ pub const DirtyTrackingOptions = struct {
     enabled: bool = false,
     /// 0 disables periodic collection and measures only the final tail flush.
     epoch_ms: u64 = 250,
-};
-
-pub const RamRestoreMode = enum {
-    eager_chunks,
-    lazy_chunks,
 };
 
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete, monitor_stopped };
@@ -1380,13 +1372,15 @@ fn ratePerSec(count: u64, elapsed_ms: u64) u64 {
 
 fn mapRam(allocator: std.mem.Allocator, config: Config, manifest_memory: ?spore.MemoryManifest) !RamMapping {
     _ = allocator;
-    if (config.ram_backing_fd) |fd| {
-        const memory = manifest_memory orelse return error.BadManifest;
-        const backing = memory.backing orelse return error.BadManifest;
-        try spore.validateMemoryBacking(backing, config.ram_size);
-        return mapFileBackedRamFd(fd, config.ram_size);
-    }
-    return mapAnonymousRam(config.ram_size);
+    return switch (config.ram_restore) {
+        .local_backing => |fd| blk: {
+            const memory = manifest_memory orelse return error.BadManifest;
+            const backing = memory.backing orelse return error.BadManifest;
+            try spore.validateMemoryBacking(backing, config.ram_size);
+            break :blk try mapFileBackedRamFd(fd, config.ram_size);
+        },
+        .fresh, .eager_chunks, .lazy_chunks => mapAnonymousRam(config.ram_size),
+    };
 }
 
 fn restoreMemory(
@@ -1405,18 +1399,21 @@ fn restoreMemory(
         stats.chunk_count = memory_plan.chunk_count;
         stats.nonzero_chunk_count = memory_plan.nonzero_chunk_count;
     }
-    if (file_backed) {
-        if (restore_stats.*) |*stats| stats.mode = "local_backing";
-        return;
-    }
-    switch (config.ram_restore_mode) {
+    switch (config.ram_restore) {
+        .fresh => return error.BadManifest,
+        .local_backing => {
+            if (!file_backed) return error.BadManifest;
+            if (restore_stats.*) |*stats| stats.mode = "local_backing";
+        },
         .eager_chunks => {
+            if (file_backed) return error.BadManifest;
             if (restore_stats.*) |*stats| stats.mode = "eager_chunks";
             const memory_start = try monotonicMs();
             try spore.loadMemory(allocator, config.resume_dir.?, memory, ram_bytes);
             if (restore_stats.*) |*stats| stats.memory_ms = (try monotonicMs()) - memory_start;
         },
         .lazy_chunks => {
+            if (file_backed) return error.BadManifest;
             if (restore_stats.*) |*stats| stats.mode = "lazy_chunks";
             const memory_start = try monotonicMs();
             lazy_pager.* = try lazy_ram.Pager.start(.{
@@ -1478,6 +1475,35 @@ fn mapFileBackedRamFd(fd: std.c.fd_t, size: u64) !RamMapping {
     );
     std.log.info("mapped RAM from file backing fd: size={d} mode=MAP_PRIVATE", .{size});
     return .{ .bytes = bytes, .file_backed = true };
+}
+
+test "file-backed RAM mappings isolate parent and siblings" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var backing = try tmp.dir.createFile(io, "ram.backing", .{ .read = true });
+    defer backing.close(io);
+    const size: u64 = std.heap.page_size_min;
+    if (std.c.ftruncate(backing.handle, @intCast(size)) != 0) return error.IoFailed;
+    try backing.writePositionalAll(io, &[_]u8{0x42}, 0);
+
+    const parent = try mapFileBackedRamFd(backing.handle, size);
+    defer parent.deinit();
+    const first = try mapFileBackedRamFd(backing.handle, size);
+    defer first.deinit();
+    const second = try mapFileBackedRamFd(backing.handle, size);
+    defer second.deinit();
+    parent.bytes[0] = 0x11;
+    try std.testing.expectEqual(@as(u8, 0x42), first.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x42), second.bytes[0]);
+    first.bytes[0] = 0x22;
+    second.bytes[0] = 0x33;
+    try std.testing.expectEqual(@as(u8, 0x11), parent.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x22), first.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x33), second.bytes[0]);
+    var stored: [1]u8 = undefined;
+    try std.testing.expectEqual(stored.len, try backing.readPositionalAll(io, &stored, 0));
+    try std.testing.expectEqual(@as(u8, 0x42), stored[0]);
 }
 
 fn fileSize(fd: std.c.fd_t) !u64 {
@@ -1910,9 +1936,7 @@ fn takeSnapshot(
         try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
     const memory_ms = (try monotonicMs()) - memory_start;
     if (environ_map) |environ| {
-        spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, ram_size) catch |err| {
-            std.log.debug("local RAM backing proof unavailable: {s}", .{@errorName(err)});
-        };
+        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, ram_size);
     }
     const disk_start = try monotonicMs();
     const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir, disk_quiesced) else null;
@@ -2091,9 +2115,7 @@ fn takeSnapshotV1(
         try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
     const memory_ms = (try monotonicMs()) - memory_start;
     if (environ_map) |environ| {
-        spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, ram_size) catch |err| {
-            std.log.debug("local RAM backing proof unavailable: {s}", .{@errorName(err)});
-        };
+        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, ram_size);
     }
     const disk_start = try monotonicMs();
     const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, dir, disk_quiesced) else null;
