@@ -17,6 +17,7 @@ spec_refs:
   - src/runtime_disk_fork.zig
   - src/runtime_disk_fork_control.zig
   - src/runtime_disk_lease.zig
+  - src/saved_spore_fork.zig
   - src/saved_spore_pin.zig
   - src/snapshot_publication.zig
   - src/dirty_ram.zig
@@ -1247,14 +1248,12 @@ creates an independent lifecycle boundary. Raw deletion safely leaks a pin.
 detection, and expert-only `spore cache unpin ID --force` removes an exact known
 ID. The pre-1.0 design deliberately has no global reference registry.
 
-Mandatory immediate post-PR follow-up: move the durable offline-fork
-transaction and portable shared-disk materialization out of `src/api.zig` into
-a focused saved-spore fork module. The public API should retain only option
-validation and result ownership; the new module should own the three-phase pin
-transaction, current/V1 manifest normalization, fault injection, and durable
-batch publication. This is sequencing work, not optional cleanup: the current
-PR establishes the contract, and the next PR restores the API/module ownership
-boundary before more saved-spore lifecycle behavior is added.
+Mandatory immediate post-PR follow-up status: complete. The durable
+offline-fork transaction and portable shared-disk materialization now live in
+`src/saved_spore_fork.zig`. The public API retains option validation and result
+ownership; the focused module owns the three-phase pin transaction, current/V1
+manifest normalization, fault injection, durable batch publication, and its
+integration coverage.
 
 ## Security
 
