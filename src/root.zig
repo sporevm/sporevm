@@ -37,6 +37,7 @@ pub const monitor = @import("monitor.zig");
 pub const monitor_jail = @import("monitor_jail.zig");
 pub const net_gateway = @import("net_gateway.zig");
 pub const platform = @import("platform.zig");
+pub const ram_restore = @import("ram_restore.zig");
 const dirty_ram = @import("dirty_ram.zig");
 pub const hvf = @import("hvf/hvf.zig");
 pub const attach_stream = @import("attach_stream.zig");
@@ -108,6 +109,7 @@ test {
     testing.refAllDecls(monitor_jail);
     testing.refAllDecls(net_gateway);
     testing.refAllDecls(platform);
+    testing.refAllDecls(ram_restore);
     testing.refAllDecls(dirty_ram);
     testing.refAllDecls(attach_stream);
     testing.refAllDecls(attach_cli);

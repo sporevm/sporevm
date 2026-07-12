@@ -20,6 +20,7 @@ const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
 const net_gateway = @import("net_gateway.zig");
+const ram_restore = @import("ram_restore.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
@@ -328,9 +329,9 @@ pub const Result = struct {
         return @intCast(self.exit_code);
     }
 
-    pub fn withMemoryRestore(self: Result, plan: spore.LocalBackingPlan) Result {
+    pub fn withMemoryRestore(self: Result, plan: *const ram_restore.Plan) Result {
         var result = self;
-        result.memory_restore_source = @tagName(plan.source);
+        result.memory_restore_source = @tagName(plan.restoreSource().?);
         result.memory_restore_reason = @tagName(plan.reason);
         return result;
     }
@@ -3070,11 +3071,10 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         .auto_hotplug_capable = opts.auto_memory_hotplug_capable,
     });
     const local_backing_start = monotonicMs();
-    const local_backing = try openRunLocalMemoryBacking(allocator, context.environ_map, opts.resume_dir, memory_plan.boot_ram_size);
+    var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, memory_plan.boot_ram_size);
     const local_backing_ms = monotonicMs() -| local_backing_start;
-    defer if (local_backing.fd) |fd| {
-        _ = std.c.close(fd);
-    };
+    defer ram_plan.deinit();
+    if (resuming) std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
     const kernel_start = monotonicMs();
     const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(context.io, opts.kernel_path, allocator, .limited(max_file_size));
     const kernel_ms = monotonicMs() -| kernel_start;
@@ -3195,7 +3195,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .sessions = saved_sessions,
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
-                .ram_backing_fd = local_backing.fd,
+                .ram_restore = ram_plan.strategy,
                 .exec_probe = &stream,
                 .exec_probe_start = if (opts.rootfs_grow_target != 0) .control else .immediate,
                 .exec_probe_completes_run = opts.commit == null,
@@ -3229,7 +3229,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .sessions = saved_sessions,
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
-                .ram_backing_fd = local_backing.fd,
+                .ram_restore = ram_plan.strategy,
                 .exec_probe = &stream,
                 .exec_probe_start = if (opts.rootfs_grow_target != 0) .control else .immediate,
                 .exec_probe_completes_run = opts.commit == null,
@@ -3248,7 +3248,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         if ((opts.interactive or opts.tty) and err == error.VsockProbeFailed) return error.InteractiveStreamProtocolFailed;
         if (capture_plan.isSignalCapture() and capture_request.isCompleted() and isCaptureAborted(err)) {
             var result = resultFromAbortedSignalCapture(backend, opts, &stream);
-            if (resuming) result = result.withMemoryRestore(local_backing);
+            if (resuming) result = result.withMemoryRestore(&ram_plan);
             finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
             try events.emitExit(result);
             if (events.write_failed) return error.EventSinkFailed;
@@ -3302,7 +3302,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             result.committed = true;
         }
     }
-    if (resuming) result = result.withMemoryRestore(local_backing);
+    if (resuming) result = result.withMemoryRestore(&ram_plan);
     finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
     try events.emitExit(result);
     if (events.write_failed) return error.EventSinkFailed;
@@ -3458,10 +3458,9 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     try spore.validateAnnotations(opts.annotations);
 
     const backend = try opts.backend.resolveForHost();
-    const local_backing = try openLocalMemoryBacking(allocator, context.environ_map, opts.resume_dir, opts.memory.bytes, "named monitor");
-    defer if (local_backing.fd) |fd| {
-        _ = std.c.close(fd);
-    };
+    var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, opts.memory.bytes);
+    defer ram_plan.deinit();
+    if (opts.resume_dir != null) std.log.info("named monitor memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     const network: virtio_net.Runtime = if (opts.network_runtime) |runtime| runtime else blk: {
@@ -3518,8 +3517,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                 .sessions = opts.resume_sessions,
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
-                .ram_backing_fd = local_backing.fd,
-                .ram_restore_mode = .eager_chunks,
+                .ram_restore = ram_plan.strategy,
                 .exec_probe = startup_probe,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .exec_probe_completes_run = false,
@@ -3547,8 +3545,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                 .sessions = opts.resume_sessions,
                 .resume_dir = opts.resume_dir,
                 .resume_generation = opts.resume_generation,
-                .ram_backing_fd = local_backing.fd,
-                .ram_restore_mode = .eager_chunks,
+                .ram_restore = ram_plan.strategy,
                 .exec_probe = startup_probe,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .exec_probe_completes_run = false,
@@ -3576,40 +3573,6 @@ fn openReadOnlyDiskFd(io: Io, allocator: std.mem.Allocator, path: []const u8) !s
     const stat = file.stat(io) catch return error.ContextDiskOpenFailed;
     if (stat.kind != .file) return error.ContextDiskOpenFailed;
     return fd;
-}
-
-fn openRunLocalMemoryBacking(
-    allocator: std.mem.Allocator,
-    environ: *const std.process.Environ.Map,
-    resume_dir: ?[]const u8,
-    ram_size: u64,
-) !spore.LocalBackingPlan {
-    return openLocalMemoryBacking(allocator, environ, resume_dir, ram_size, "run --from");
-}
-
-fn openLocalMemoryBacking(
-    allocator: std.mem.Allocator,
-    environ: *const std.process.Environ.Map,
-    resume_dir: ?[]const u8,
-    ram_size: u64,
-    operation: []const u8,
-) !spore.LocalBackingPlan {
-    const dir = resume_dir orelse return .{};
-    var parsed = spore.loadManifest(allocator, dir) catch |err| switch (err) {
-        error.BadManifest => null,
-        else => |e| return e,
-    };
-    if (parsed) |*manifest| {
-        defer manifest.deinit();
-        const local_backing = try spore.openProvenLocalMemoryBackingForVcpuCount(allocator, environ, dir, manifest.value.memory, ram_size, 1);
-        std.log.info("{s} memory restore source={s} reason={s}", .{ operation, @tagName(local_backing.source), @tagName(local_backing.reason) });
-        return local_backing;
-    }
-    var manifest = try spore.loadManifestV1(allocator, dir);
-    defer manifest.deinit();
-    const local_backing = try spore.openProvenLocalMemoryBackingForVcpuCount(allocator, environ, dir, manifest.value.memory, ram_size, manifest.value.platform.vcpu_count);
-    std.log.info("{s} memory restore source={s} reason={s}", .{ operation, @tagName(local_backing.source), @tagName(local_backing.reason) });
-    return local_backing;
 }
 
 pub var console_fd: std.c.fd_t = -1;

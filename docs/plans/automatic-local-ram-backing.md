@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-06
+last_reviewed: 2026-07-11
 spec_refs:
   - docs/memory.md
   - docs/spore-format.md
@@ -27,6 +27,19 @@ remain chunk-authoritative. The user-facing CLI has no trust flag.
 
 The durable contract lives in `docs/memory.md`, `docs/spore-format.md`,
 `docs/fanout.md`, and `SECURITY.md`.
+
+## Restore Planning Module
+
+`src/ram_restore.zig` is the single product restore-planning module. It loads or
+accepts the manifest memory description, validates the vCPU contract, selects
+proof-gated local backing or verified chunks, owns any opened backing fd, and
+hands KVM or HVF one resolved strategy. Product run-from, attach, and named
+monitor restore use that module instead of independently combining a nullable
+backing fd with a chunk restore mode.
+
+Backend-specific lazy fault handling remains inside KVM and HVF. The shared
+strategy makes fresh RAM, local backing, eager chunks, and lazy chunks mutually
+exclusive before backend startup.
 
 ## Remaining Work
 
