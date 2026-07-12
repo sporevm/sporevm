@@ -1326,11 +1326,31 @@ Repeating an input key after a forced execution now atomically replaces only
 the derived step mapping, while rootfs CAS indexes and objects retain immutable
 publication.
 
-**Stop/go gate:** the C1 product gate passed on both backends. C2 instruction
-and COPY-policy widening remains blocked until the four structural extractions
-above land. The C1 implementation reuses bounded instances of the existing
-virtio-blk device and changes neither the frozen device types nor the spore
-manifest format.
+**Stop/go gate:** passed on 2026-07-13 at exact head `79ffbb2`. Buildkite
+#1317 passed the exact Linux and macOS unit graphs plus Linux BuildKit
+conformance. The complete local graph passed all 18 build steps with
+1,742/1,755 tests passing and 13 skipped. Native HVF and KVM each passed all
+11 build-run smoke sections, publication, capacity save/restore/pack/commit,
+and block- plus inode-ENOSPC coverage; KVM also passed BuildKit conformance.
+The native harness requires an absolute work root, so failed operator
+invocations with a relative root are not product evidence.
+
+The five-sample paired default-path gate remained stable at one PREPARE step,
+one child, and one producer per sample, and every acceptance threshold passed:
+
+| Backend | Profile | Cold median | Warm median | Incremental median |
+| --- | --- | ---: | ---: | ---: |
+| HVF | compact | 927.249 ms | 153.553 ms | 825.444 ms |
+| HVF | pregrown | 926.491 ms | 198.975 ms | 977.930 ms |
+| KVM | compact | 703.670 ms | 235.334 ms | 684.439 ms |
+| KVM | pregrown | 808.544 ms | 304.584 ms | 752.371 ms |
+
+The public evidence ledger identifies the HVF raw and summary artifacts by
+SHA-256 prefixes `a16da275` and `aca67a54`, and the KVM raw and summary
+artifacts by prefixes `b1156452` and `5536d36b`. C2 instruction and COPY-policy
+widening remains blocked until the four structural extractions above land. The
+C1 implementation reuses bounded instances of the existing virtio-blk device
+and changes neither the frozen device types nor the spore manifest format.
 
 ### C2 — Stable frontend and filesystem breadth
 
