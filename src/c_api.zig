@@ -1592,7 +1592,7 @@ test "C ABI can list named VMs from context runtime env" {
     try std.testing.expectEqualStrings("[]\n", json.ptr.?[0..json.len]);
 }
 
-test "C ABI named lifecycle last error carries state and log paths" {
+test "C ABI named lifecycle last error carries state and truthful log paths" {
     var context: ?*SporeContextImpl = null;
     try std.testing.expectEqual(result_success, spore_context_new(&context));
     defer spore_context_free(context);
@@ -1603,8 +1603,6 @@ test "C ABI named lifecycle last error carries state and log paths" {
     defer allocator.free(runtime);
     defer std.Io.Dir.cwd().deleteTree(io, runtime) catch {};
     try std.testing.expectEqual(result_success, spore_context_set_env(context, borrowString("SPOREVM_RUNTIME_DIR"), borrowString(runtime)));
-    const console_log_path = try std.fs.path.resolve(allocator, &.{ runtime, "vms", "bench-1", "console.log" });
-    defer allocator.free(console_log_path);
     const monitor_log_path = try std.fs.path.resolve(allocator, &.{ runtime, "vms", "bench-1", "monitor.log" });
     defer allocator.free(monitor_log_path);
     const control_socket_path = try std.fs.path.resolve(allocator, &.{ runtime, "vms", "bench-1", "control.sock" });
@@ -1624,7 +1622,7 @@ test "C ABI named lifecycle last error carries state and log paths" {
     const last = spore_context_last_error(context);
     const detail = last.ptr.?[0..last.len];
     try std.testing.expect(std.mem.indexOf(u8, detail, "state=absent") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, console_log_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "console_log=none") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, monitor_log_path) != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, control_socket_path) != null);
 }

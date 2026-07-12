@@ -308,7 +308,7 @@ pub const DiskForkClaim = struct {
 pub const Ready = struct {
     pid: i64,
     control_socket_path: []const u8,
-    console_log_path: []const u8,
+    console_log_path: ?[]const u8 = null,
 };
 
 pub const CreateTiming = struct {
@@ -967,7 +967,9 @@ pub fn restoreNamed(
         .vcpus = manifest_vcpus,
         .guest_port = base.guest_port,
         .timeout_ms = base.timeout_ms,
-        .console_log_path = base.console_log_path,
+        // Saved lifecycle metadata is part of the spore input and must not
+        // authorize truncating an arbitrary host path during restore.
+        .console_log_path = restoreConsoleLogPath(base.console_log_path),
     };
     if (!monitorBackendSupported(spec.backend)) return error.HostUnsupported;
 
@@ -999,6 +1001,10 @@ pub fn restoreNamed(
             .total_ms = ready_ms - start_ms,
         },
     });
+}
+
+fn restoreConsoleLogPath(_: ?[]const u8) ?[]const u8 {
+    return null;
 }
 
 const SavedDiskLeaseHandoff = struct {
@@ -4157,28 +4163,41 @@ fn createFileAtPath(io: Io, path: []const u8) !Io.File {
 fn setStartupError(allocator: std.mem.Allocator, io: Io, paths: Paths, name: []const u8, spore_executable_path: []const u8, reason: []const u8) void {
     const state = classifyVmState(allocator, io, paths, pidAlive) catch VmState.incomplete;
     const pid = readPid(allocator, io, paths) catch null;
+    const console_log_path = configuredConsoleLogPath(allocator, io, paths);
+    defer if (console_log_path) |path| allocator.free(path);
     setLastError(
         "named VM {s} startup failed: {s}; state={s} pid={?d} console_log={s} monitor_log={s} control_socket={s} spore_executable={s}",
-        .{ name, reason, state.name(), pid, paths.console_log_path, paths.monitor_log_path, paths.control_socket_path, spore_executable_path },
+        .{ name, reason, state.name(), pid, console_log_path orelse "none", paths.monitor_log_path, paths.control_socket_path, spore_executable_path },
     );
 }
 
 fn namedVmNotReady(allocator: std.mem.Allocator, io: Io, paths: Paths, operation: []const u8, name: []const u8, state: VmState) anyerror {
     const pid = readPid(allocator, io, paths) catch null;
+    const console_log_path = configuredConsoleLogPath(allocator, io, paths);
+    defer if (console_log_path) |path| allocator.free(path);
     setLastError(
         "named VM {s} is not ready for {s}: state={s} pid={?d} console_log={s} monitor_log={s} control_socket={s}",
-        .{ name, operation, state.name(), pid, paths.console_log_path, paths.monitor_log_path, paths.control_socket_path },
+        .{ name, operation, state.name(), pid, console_log_path orelse "none", paths.monitor_log_path, paths.control_socket_path },
     );
     return error.NamedVmNotReady;
 }
 
 fn namedVmExists(allocator: std.mem.Allocator, io: Io, paths: Paths, operation: []const u8, name: []const u8, state: VmState) anyerror {
     const pid = readPid(allocator, io, paths) catch null;
+    const console_log_path = configuredConsoleLogPath(allocator, io, paths);
+    defer if (console_log_path) |path| allocator.free(path);
     setLastError(
         "named VM {s} already exists for {s}: state={s} pid={?d} console_log={s} monitor_log={s} control_socket={s}",
-        .{ name, operation, state.name(), pid, paths.console_log_path, paths.monitor_log_path, paths.control_socket_path },
+        .{ name, operation, state.name(), pid, console_log_path orelse "none", paths.monitor_log_path, paths.control_socket_path },
     );
     return error.NamedVmExists;
+}
+
+fn configuredConsoleLogPath(allocator: std.mem.Allocator, io: Io, paths: Paths) ?[]u8 {
+    var spec = readSpec(allocator, io, paths) catch return null;
+    defer spec.deinit();
+    const path = spec.value.console_log_path orelse return null;
+    return allocator.dupe(u8, path) catch null;
 }
 
 test "lifecycle readiness requires monitor control socket hello" {
@@ -4197,7 +4216,7 @@ test "lifecycle readiness requires monitor control socket hello" {
     try writeReady(allocator, io, paths, .{
         .pid = pid,
         .control_socket_path = paths.control_socket_path,
-        .console_log_path = paths.console_log_path,
+        .console_log_path = null,
     });
     try writePid(allocator, io, paths, pid);
 
@@ -4206,7 +4225,7 @@ test "lifecycle readiness requires monitor control socket hello" {
     const detail = lastErrorMessage();
     try std.testing.expect(std.mem.indexOf(u8, detail, "timed out waiting for monitor readiness") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "state=ready") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, paths.console_log_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "console_log=none") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, paths.monitor_log_path) != null);
 }
 
@@ -4222,7 +4241,7 @@ test "lifecycle readiness fails on monitor version mismatch" {
     defer paths.deinit(allocator);
 
     const pid = currentTestPid();
-    try writeSpec(allocator, io, paths, .{ .name = "bench-1" });
+    try writeSpec(allocator, io, paths, .{ .name = "bench-1", .console_log_path = paths.console_log_path });
     try writeReady(allocator, io, paths, .{
         .pid = pid,
         .control_socket_path = paths.control_socket_path,
@@ -4262,7 +4281,7 @@ test "lifecycle named not ready diagnostics include state pid and logs" {
     defer paths.deinit(allocator);
 
     const dead_pid: i64 = 999_999_999;
-    try writeSpec(allocator, io, paths, .{ .name = "bench-1" });
+    try writeSpec(allocator, io, paths, .{ .name = "bench-1", .console_log_path = paths.console_log_path });
     try writeReady(allocator, io, paths, .{
         .pid = dead_pid,
         .control_socket_path = paths.control_socket_path,
@@ -4305,7 +4324,7 @@ test "lifecycle named exists diagnostics include stale state and logs" {
     try writeReady(allocator, io, paths, .{
         .pid = dead_pid,
         .control_socket_path = paths.control_socket_path,
-        .console_log_path = paths.console_log_path,
+        .console_log_path = null,
     });
     try writePid(allocator, io, paths, dead_pid);
 
@@ -4328,7 +4347,7 @@ test "lifecycle named exists diagnostics include stale state and logs" {
     const detail = lastErrorMessage();
     try std.testing.expect(std.mem.indexOf(u8, detail, "state=stale") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "pid=999999998") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, paths.console_log_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "console_log=none") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, paths.monitor_log_path) != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, paths.control_socket_path) != null);
 }
@@ -6029,6 +6048,18 @@ test "durable lifecycle metadata drops transient disk fork claims" {
     var parsed = try std.json.parseFromSlice(Spec, allocator, bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     try std.testing.expect(parsed.value.disk_fork_claim == null);
+}
+
+test "named restore rejects every saved console host path authority" {
+    const saved_paths = [_]?[]const u8{
+        null,
+        "/tmp/attacker-selected.log",
+        "../../relative-escape.log",
+        "/tmp/symlink-shaped/target.log",
+    };
+    for (saved_paths) |saved_path| {
+        try std.testing.expectEqual(@as(?[]const u8, null), restoreConsoleLogPath(saved_path));
+    }
 }
 
 test "lifecycle monitor stop distinguishes accepted socket close from pid exit" {

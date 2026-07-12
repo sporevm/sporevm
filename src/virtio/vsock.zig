@@ -783,6 +783,10 @@ pub const Vsock = struct {
     }
 
     pub fn attachHostStream(self: *Vsock, stream: *HostStream) !void {
+        std.log.debug(
+            "vsock host stream attach: host_port={d} guest_port={d} pending_before={d}",
+            .{ stream.host_port, stream.guest_port, self.pending_len },
+        );
         self.host_stream = stream;
         stream.markAttached();
         try self.enqueueHostConnectRequest(stream);
@@ -794,10 +798,22 @@ pub const Vsock = struct {
     /// the guest agent and every subsequent exec.
     pub fn resetHostStream(self: *Vsock) void {
         const stream = self.host_stream orelse return;
+        const old_state = stream.state;
+        const pending_before = self.pending_len;
         self.host_stream = null;
-        if (stream.state == .complete) return;
-        // Drop packets queued for the dead stream so the reset always fits.
+        // The monitor owns only one host stream at a time, so a stream boundary
+        // deliberately drops the whole pending queue. That includes packets
+        // for this stream and RSTs queued for unknown or abandoned guest tuples;
+        // none may cross into the successor attach. A normally completed stream
+        // does not need an explicit reset packet.
         self.pending_len = 0;
+        if (old_state == .complete) {
+            std.log.debug(
+                "vsock host stream reset: host_port={d} state={s} pending_before={d} pending_after=0 rst=false",
+                .{ stream.host_port, @tagName(old_state), pending_before },
+            );
+            return;
+        }
         self.enqueuePacket(.{
             .src_cid = host_cid,
             .dst_cid = self.guest_cid,
@@ -809,6 +825,10 @@ pub const Vsock = struct {
             .buf_alloc = host_stream_credit,
             .fwd_cnt = stream.received_bytes,
         }, "") catch {};
+        std.log.debug(
+            "vsock host stream reset: host_port={d} state={s} pending_before={d} pending_after={d} rst=true",
+            .{ stream.host_port, @tagName(old_state), pending_before, self.pending_len },
+        );
     }
 
     pub fn flushPendingRx(self: *Vsock, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
@@ -1851,6 +1871,28 @@ test "host stream sequences dynamic host ports without early reuse" {
     try std.testing.expectEqual(dynamic_host_port_first, HostStream.hostPortForSequence(0));
     try std.testing.expectEqual(dynamic_host_port_first + 1, HostStream.hostPortForSequence(1));
     try std.testing.expectEqual(dynamic_host_port_first, HostStream.hostPortForSequence(dynamic_host_port_count));
+}
+
+test "completed host stream reset drops stale packets before next attach" {
+    var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
+    var completed = try HostStream.init(10700, "first\n");
+    completed.host_port = HostStream.hostPortForSequence(0x1234);
+    completed.state = .complete;
+    dev.host_stream = &completed;
+    try dev.enqueueHostPacket(&completed, op_credit_update, "");
+    try std.testing.expectEqual(@as(usize, 1), dev.pending_len);
+
+    dev.resetHostStream();
+    try std.testing.expect(dev.host_stream == null);
+    try std.testing.expectEqual(@as(usize, 0), dev.pending_len);
+
+    var next = try HostStream.init(10700, "second\n");
+    next.host_port = HostStream.hostPortForSequence(0x1235);
+    try dev.attachHostStream(&next);
+    try std.testing.expectEqual(@as(usize, 1), dev.pending_len);
+    try std.testing.expectEqual(op_request, dev.pending[0].header.op);
+    try std.testing.expectEqual(next.host_port, dev.pending[0].header.src_port);
+    try std.testing.expect(next.host_port != completed.host_port);
 }
 
 test "host stream frame parser handles split frames" {

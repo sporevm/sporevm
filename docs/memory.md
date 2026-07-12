@@ -44,6 +44,18 @@ authoritative memory/index/backing metadata, allocation failure, unexpected
 host I/O, corrupt chunks, and backend/platform/topology errors remain restore
 errors; fallback does not hide failures outside the optional acceleration hint.
 
+On Linux, proof creation measures an existing fs-verity digest before attempting
+any permission change. A new owned read-only backing is made owner-writable only
+around the enable-and-measure ioctl, then restored to its exact original mode
+and checked for the same device, inode, owner, and size before the proof is
+published. Enabling verity may update mtime, so schema v2 binds the proof to the
+post-enable mtime and digest and re-stats that exact identity before publication;
+existing-verity and schema-v1 paths require the original mtime. Errors attempt
+the same restoration and publish no proof. A crash
+inside this bounded window may leave an owner-writable unproved backing, but it
+cannot make that file authoritative: chunks remain the restore authority and a
+missing proof selects the verified-chunk path.
+
 ## Local CoW
 
 KVM and HVF map a validated `ram.backing` fd with private mappings. Clean pages

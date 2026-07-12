@@ -112,6 +112,14 @@ fn hasFreshCaptureTrigger(config: Config) bool {
 
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete, monitor_stopped };
 
+const HvfPostRunAction = enum { dispatch_exit, resume_before_run };
+
+fn hvfPostRunAction(reason: hvf.ExitReason) HvfPostRunAction {
+    // Async wakes surface as canceled. Every other return carries completed
+    // guest work that must be dispatched before the next pre-run wake flush.
+    return if (reason == .canceled) .resume_before_run else .dispatch_exit;
+}
+
 pub const DirtyTrackingOptions = struct {
     enabled: bool = false,
     /// 0 disables periodic sealing and measures only the final tail flush.
@@ -529,7 +537,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             try vsock_dev.attachHostStream(probe);
             probe.markStarted();
             const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
-            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
+            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
             attach_probe_ms = monotonicMs() - attach_probe_start;
         }
     }
@@ -561,7 +569,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     while (true) {
         if (config.exec_probe != null and !exec_probe_done) {
             const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
-            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
+            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
         }
         if (mem_transport_index != null) {
             if (config.exec_probe) |probe| {
@@ -640,7 +648,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                 },
             }
             const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
-            try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
+            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
         }
         if (config.capture_request) |request_capture| {
             if (request_capture.isAbortRequested()) return error.CaptureAborted;
@@ -853,6 +861,7 @@ const HvfVcpuCaptureCommand = struct {
 
 const HvfVcpuApplyCommand = struct {
     state: spore.VcpuState,
+    shared_vtimer_offset: u64,
 };
 
 const HvfVcpuCommand = union(enum) {
@@ -1242,7 +1251,10 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
             const attach_probe_start = monotonicMs();
             try options.vsock_dev.attachHostStream(probe);
             probe.markStarted();
-            try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, null, @intCast(options.vsock_transport_index));
+            wakeAfterVsockRxDelivery(
+                try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, null, @intCast(options.vsock_transport_index)),
+                .{ .context = &wake_set, .wakeFn = wakeVcpuSet },
+            );
             attach_probe_ms = monotonicMs() - attach_probe_start;
         }
     }
@@ -1280,8 +1292,9 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                 state.finish(.{ .err = err });
                 continue;
             };
+            var vsock_rx_delivered = false;
             switch (action) {
-                .keep_running => flushVsockRx(
+                .keep_running => vsock_rx_delivered = flushVsockRx(
                     options.vsock_dev,
                     &options.transports_buf[options.vsock_transport_index],
                     options.ram,
@@ -1295,6 +1308,10 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                 else => {},
             }
             device_lock.unlock();
+            wakeAfterVsockRxDelivery(
+                vsock_rx_delivered,
+                .{ .context = &wake_set, .wakeFn = wakeVcpuSet },
+            );
             switch (action) {
                 .keep_running => {},
                 .stop => {
@@ -1556,15 +1573,61 @@ fn captureHvfVcpuStates(allocator: std.mem.Allocator, vcpus: []HvfVcpu) ![]spore
         var command = HvfVcpuCaptureCommand{ .allocator = allocator, .out = out };
         _ = try vcpu.submit(.{ .capture = &command });
     }
+    normalizeHvfVtimerCounters(states);
     return states;
 }
 
 fn applyHvfVcpuStates(vcpus: []HvfVcpu, machine: spore.MachineStateV1) !void {
     if (machine.vcpus.len != vcpus.len) return error.PlatformMismatch;
+    const timer_plan = try planHvfVtimerRestore(machine.vcpus, snapshot.hostCounter());
     for (machine.vcpus, 0..) |vcpu_state, i| {
         if (vcpu_state.index != vcpus[i].index) return error.PlatformMismatch;
-        var command = HvfVcpuApplyCommand{ .state = vcpu_state };
+        var normalized_state = vcpu_state;
+        snapshot.canonicalizeVtimer(&normalized_state.vtimer, timer_plan.canonical_cntvct);
+        var command = HvfVcpuApplyCommand{ .state = normalized_state, .shared_vtimer_offset = timer_plan.shared_offset };
         _ = try vcpus[i].submit(.{ .apply = &command });
+    }
+}
+
+const HvfVtimerRestorePlan = struct {
+    canonical_cntvct: u64,
+    shared_offset: u64,
+};
+
+fn planHvfVtimerRestore(states: []const spore.VcpuState, host_counter: u64) !HvfVtimerRestorePlan {
+    if (states.len == 0) return error.PlatformMismatch;
+    const canonical_cntvct = states[0].vtimer.cntvct;
+    return .{
+        .canonical_cntvct = canonical_cntvct,
+        .shared_offset = snapshot.vtimerOffset(host_counter, canonical_cntvct),
+    };
+}
+
+fn normalizeHvfVtimerCounters(states: []spore.VcpuState) void {
+    if (states.len == 0) return;
+    const canonical_cntvct = states[0].vtimer.cntvct;
+    for (states) |*state| snapshot.canonicalizeVtimer(&state.vtimer, canonical_cntvct);
+}
+
+test "multi-vcpu HVF timer normalization uses one counter authority" {
+    var states: [2]spore.VcpuState = undefined;
+    states[0].vtimer = .{ .cntvct = 100, .cntv_ctl = 1, .cntv_cval = 130 };
+    states[1].vtimer = .{ .cntvct = 140, .cntv_ctl = 3, .cntv_cval = 120 };
+    const secondary_delta = states[1].vtimer.cntv_cval -% states[1].vtimer.cntvct;
+    normalizeHvfVtimerCounters(&states);
+    try std.testing.expectEqual(@as(u64, 100), states[0].vtimer.cntvct);
+    try std.testing.expectEqual(@as(u64, 100), states[1].vtimer.cntvct);
+    try std.testing.expectEqual(secondary_delta, states[1].vtimer.cntv_cval -% states[1].vtimer.cntvct);
+    try std.testing.expectEqual(@as(u64, 3), states[1].vtimer.cntv_ctl);
+
+    const plan = try planHvfVtimerRestore(&states, 175);
+    try std.testing.expectEqual(@as(u64, 100), plan.canonical_cntvct);
+    try std.testing.expectEqual(@as(u64, 75), plan.shared_offset);
+    for (states) |state| {
+        var normalized = state;
+        snapshot.canonicalizeVtimer(&normalized.vtimer, plan.canonical_cntvct);
+        try std.testing.expectEqual(plan.canonical_cntvct, normalized.vtimer.cntvct);
+        try std.testing.expectEqual(plan.shared_offset, snapshot.vtimerOffset(175, normalized.vtimer.cntvct));
     }
 }
 
@@ -1605,12 +1668,6 @@ fn hvfVcpuThreadMain(ctx: *MultiHvfThreadContext) void {
             sleepMs(1);
             continue;
         }
-        hvf.check(hvf.hv_vcpu_run(ctx.vcpu.handle), "hv_vcpu_run") catch |err| {
-            ctx.state.finish(.{ .err = err });
-            return;
-        };
-        if (ctx.state.stopped()) continue;
-
         if (ctx.network.failed()) {
             ctx.state.finish(.{ .err = error.NetworkGatewayFailed });
             continue;
@@ -1627,6 +1684,12 @@ fn hvfVcpuThreadMain(ctx: *MultiHvfThreadContext) void {
         }
         ctx.device_lock.unlock();
         if (flushed_network) continue;
+        hvf.check(hvf.hv_vcpu_run(ctx.vcpu.handle), "hv_vcpu_run") catch |err| {
+            ctx.state.finish(.{ .err = err });
+            return;
+        };
+        if (ctx.state.stopped()) continue;
+        if (hvfPostRunAction(ctx.vcpu.exit.reason) == .resume_before_run) continue;
 
         switch (ctx.vcpu.exit.reason) {
             .exception => {
@@ -1715,7 +1778,7 @@ fn hvfVcpuThreadMain(ctx: *MultiHvfThreadContext) void {
                     return;
                 };
             },
-            .canceled => continue,
+            .canceled => unreachable,
             else => {
                 std.log.err("unhandled HVF exit reason {} on vcpu {d}", .{ ctx.vcpu.exit.reason, ctx.vcpu.index });
                 ctx.state.finish(.{ .err = error.UnhandledExit });
@@ -1740,7 +1803,7 @@ fn processHvfVcpuCommand(vcpu: *HvfVcpu, command: HvfVcpuCommand) void {
             break :blk .ok;
         },
         .apply => |apply_cmd| blk: {
-            snapshot.applyVcpuState(vcpu.handle, apply_cmd.state) catch |err| break :blk .{ .err = err };
+            snapshot.applyVcpuStateWithOffset(vcpu.handle, apply_cmd.state, apply_cmd.shared_vtimer_offset) catch |err| break :blk .{ .err = err };
             break :blk .ok;
         },
     };
@@ -2845,12 +2908,18 @@ fn flushVsockRx(
     ram: guestmem.GuestRam,
     lazy_pager: ?*lazy_ram.Pager,
     transport_index: u32,
-) !void {
+) !bool {
     try maybeMaterializeTransportQueues(lazy_pager, transport);
     if (vsock_dev.flushPendingRx(&transport.queues, ram)) {
         transport.interrupt_status |= 1;
         try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(transport_index), true), "raise vsock spi");
+        return true;
     }
+    return false;
+}
+
+fn wakeAfterVsockRxDelivery(delivered: bool, wake: vsock.Wake) void {
+    if (delivered) wake.wake();
 }
 
 fn wakeNetworkVcpu(context: ?*anyopaque) void {
@@ -3153,6 +3222,41 @@ test "vsock rx flush materializes lazy transport queues before delivery" {
         error.BadManifest,
         flushVsockRx(&vsock_dev, &transport, ram, &pager, 0),
     );
+}
+
+test "multi-vcpu network wake preserves completed HVF MMIO exit" {
+    var exit = dataAbortExitForTest(board.virtio_base + 0x050, 2, 3, true);
+    try std.testing.expectEqual(hvf.ec_data_abort, exit.exception.exceptionClass());
+    try std.testing.expectEqual(HvfPostRunAction.dispatch_exit, hvfPostRunAction(exit.reason));
+    const access = try decodeMmioAccess(&exit);
+    try std.testing.expect(access.is_write);
+    try std.testing.expectEqual(board.virtio_base + 0x050, access.ipa);
+
+    // A canceled return has no completed guest exit; its still-pending network
+    // wake is consumed by the pre-run flush on the next iteration.
+    try std.testing.expectEqual(HvfPostRunAction.resume_before_run, hvfPostRunAction(.canceled));
+}
+
+const TestVsockWakeCounter = struct {
+    count: usize = 0,
+
+    fn wake(context: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.count += 1;
+    }
+};
+
+test "multi-vcpu vsock delivery wakes once per delivered batch" {
+    var counter = TestVsockWakeCounter{};
+    const wake = vsock.Wake{ .context = &counter, .wakeFn = TestVsockWakeCounter.wake };
+
+    wakeAfterVsockRxDelivery(false, wake);
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+
+    wakeAfterVsockRxDelivery(true, wake);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+    wakeAfterVsockRxDelivery(true, wake);
+    try std.testing.expectEqual(@as(usize, 2), counter.count);
 }
 
 test "gic data-abort classification routes remote redistributor before device lock" {
