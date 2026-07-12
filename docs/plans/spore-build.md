@@ -1,9 +1,10 @@
 ---
 status: active
-last_reviewed: 2026-07-11
+last_reviewed: 2026-07-13
 spec_refs:
   - docs/rootfs.md
   - docs/filesystem.md
+  - docs/spore-format.md
   - SECURITY.md
   - src/rootfs.zig
   - src/rootfs_cache.zig
@@ -22,7 +23,7 @@ related_plans:
   - docs/plans/spore-build-rootfs-capacity.md
 ---
 
-# Spore-Native Dockerfile Subset Builder (`spore build`)
+# Spore-Native Dockerfile Builder Compatibility Roadmap
 
 > **Active** (revived 2026-07-09). The native builder now builds the original
 > committed `buildkite-sporevm` Dockerfile and runs the resulting image. On
@@ -69,53 +70,62 @@ related_plans:
 
 ## Summary
 
-Add a `spore build` command that executes a narrow Dockerfile subset directly
-against Spore rootfs artifacts, with a deterministic per-instruction cache, so
-that a fully cached rebuild resolves the final `index_digest` and updates the
-local image ref without booting anything, exporting anything, or touching
-BuildKit.
+Evolve `spore build` from a single-stage recipe runner into a generally useful
+builder for stable, isolated Linux Dockerfiles. The target is the standard
+stable `docker/dockerfile` frontend used by ordinary modern builds: multi-stage
+planning, target selection, cross-stage copies, common metadata instructions,
+remote bases and inputs, heredocs, COPY flags, and non-privileged mounted RUN
+operations.
 
-This replaces the earlier direction of optimizing the BuildKit-to-Spore
-conversion boundary. That work made import faster and made warm `--image`
-resolution effectively instant, but the remaining warm build floor is now
-BuildKit's own tar export, typically 25-45s, and content changes still pay the
-import path after the tar is produced. This plan removes that boundary entirely:
-cached rebuilds resolve the final `index_digest`, update the local ref, and
-exit; uncached builds mutate a chunk-mapped rootfs directly and snapshot the
-dirty chunks without ever serializing a tar.
+Compatibility has a precise boundary. When Spore accepts a Dockerfile feature,
+it must produce the same final filesystem and OCI runtime configuration as the
+selected Dockerfile frontend, and its cache must be sound: a cache hit must
+never return stale or semantically different output. Spore may invalidate more
+work than BuildKit, use different artifact identities, and omit Docker layer
+and exporter behavior. That lets Spore remain a rootfs-native builder rather
+than becoming an OCI layer engine while still making existing Dockerfiles run
+correctly.
 
-The builder does not reimplement BuildKit. It supports exactly the instructions
-the `buildkite-sporevm` wrapper's Dockerfile needs — `FROM` (including a named
-`--build-context` OCI layout base), shell-form `RUN`, flag-less `COPY`, `ENV`,
-`ARG`, `WORKDIR`, `CMD` — and fails closed with an actionable error on
-everything else.
+The first useful expansion is ordinary multi-stage application builds. A Go,
+Rust, Node, or similar builder stage should be able to copy its result into a
+small runtime stage with no Dockerfile rewrite. BuildKit-only optimization,
+privileged host integration, arbitrary frontend plugins, and raw credential
+mounts are explicit non-goals. A minimally adapted Buildkite `ci` target is a
+late acceptance workload because it combines most supported advanced features;
+it is not the shape around which the core architecture is specialized.
+
+An upstream stable-runtime target remains a valid interim way to unblock the
+Buildkite cache-layering experiment. It does not replace this roadmap and adds
+no Docker-specific policy to SporeVM.
 
 ## Problem
 
-The current `bin/buildkite-spore build` flow is:
+The current builder is intentionally linear:
 
-1. `docker buildx build --build-context base=oci-layout://… --output
-   type=tar,dest=…`. With all Dockerfile steps cached, the warm flow is now
-   about 30s and roughly 25s of that is BuildKit exporting a client tarball.
-2. `spore rootfs import-tar …` when the tar content changes. The unified
-   import path now emits rootfs CAS objects and the index inline, but a cold
-   `buildkite-sporevm` import is still about 95s while the remaining
-   `assignBlocks` hotspot is investigated separately.
-3. `spore run --image local/buildkite-spore:dev …`, which is already around
-   0.10s when the rootfs index has its completeness stamp.
+- one mutable build state;
+- one `FROM` resolved from a local image or named OCI layout;
+- ordered `RUN`, `COPY`, `WORKDIR`, and metadata updates;
+- every rootfs-changing step keyed by its parent rootfs index;
+- one persistent VM from the first cache miss to the end of the build.
 
-Even when every Dockerfile step is cached, the pipeline serializes a large tar
-out of BuildKit just to refresh a local Spore image ref that already has a
-complete rootfs index. When content changes, the same boundary forces Spore to
-parse the tar and rebuild/index the rootfs instead of applying the changed
-instruction directly.
+That model proved the rootfs-native cache and execution path, but it excludes
+the normal structure of modern Dockerfiles. Even a basic compiled application
+usually has two stages and a `COPY --from`. Larger applications use named
+targets, automatic platform arguments, heredocs, ownership flags, remote bases,
+and cache or bind mounts. Accepting their syntax without representing their
+stage and mount semantics would create builds that appear successful but are
+incorrect or unexpectedly stale.
 
-No amount of import optimization fixes BuildKit's export floor, and import
-optimizations only help after the tar already exists. The only way to make the
-cached path low single-digit seconds, and to make uncached builds avoid tar
-serialization, is to build directly on Spore's chunk-indexed rootfs artifacts.
+The missing work falls into three different categories:
 
-## Goals
+1. **Frontend compatibility:** parse directives, instruction forms, flags,
+   JSON arrays, heredocs, variable expansion, and stage references.
+2. **Result compatibility:** construct the same selected stage filesystem and
+   OCI runtime configuration, including correct ownership, mount exclusion,
+   and metadata inheritance.
+3. **Cache compatibility:** identify every persistent and ephemeral input so
+   reuse is sound. Exact BuildKit cache keys and cache-hit performance are not
+   required; conservative invalidation is acceptable.
 
 - A fully cached `spore build` of the `buildkite-sporevm` Dockerfile completes
   in under one second: hash inputs, resolve the final `index_digest` from the
@@ -132,12 +142,15 @@ serialization, is to build directly on Spore's chunk-indexed rootfs artifacts.
 - linux/arm64 only and single-stage Dockerfiles only in the first
   implementation.
 
-## Non-Goals
+## Current Contract And Progress
 
-- No BuildKit compatibility beyond the stated subset. No multi-stage `FROM …
-  AS`, `COPY --from/--link/--parents/--chown/--chmod`, `RUN --mount`, `ADD`,
-  heredocs, `ENTRYPOINT`, `USER`, `VOLUME`, `EXPOSE`, `HEALTHCHECK`,
-  `ONBUILD`, or `--target`. These fail closed.
+- No BuildKit compatibility beyond the stated subset. C1 accepts source-spanned
+  multi-stage `FROM … AS`, reachable-target planning, `scratch`, public
+  registry/local/named-context bases, previous-stage inheritance, literal
+  `COPY --from`, `--target`, and final `ENTRYPOINT`/`CMD` publication. COPY
+  flags (`--link`, `--parents`, `--chown`, `--chmod`), `RUN --mount`, `ADD`,
+  heredocs, `USER`, `VOLUME`, `EXPOSE`, `HEALTHCHECK`, and `ONBUILD` still fail
+  closed.
 - No replacement for the wrapper's preliminary `docker build --target ci` of
   the Buildkite app image. That Dockerfile uses `syntax=docker/dockerfile:1.20`
   features (`RUN --mount=type=cache`, `COPY --link`, remote `ADD`, heredocs)
@@ -151,25 +164,99 @@ serialization, is to build directly on Spore's chunk-indexed rootfs artifacts.
 - No cross-machine or shared build cache. The step cache is local, same trust
   model as the existing rootfs CAS cache.
 - No new persistent device type or portable machine-state contract. The build
-  VM uses the existing device set and may attach one transient read-only
-  virtio-blk context disk. A non-resumable rootfs-growth session temporarily
-  offers `VIRTIO_BLK_F_WRITE_ZEROES` on the existing root block device. The
-  guest contracts are `spore-rootfs-grow-v1`, the `fsfreeze` checkpoint
-  handshake, and fixed-shape RUN/COPY requests over the existing exec stream.
+  VM uses the existing device set and may attach bounded transient read-only
+  virtio-blk context or stage/rootfs disks. A non-resumable rootfs-growth
+  session temporarily offers `VIRTIO_BLK_F_WRITE_ZEROES` on the existing root
+  block device. The guest contracts are `spore-rootfs-grow-v1`, the `fsfreeze`
+  checkpoint handshake, and fixed-shape RUN/COPY requests over the existing
+  exec stream.
 
-## Target Model
+C0 closes the known checkpoint, resize, resource-envelope, matcher, and cache
+lifecycle gaps in the original single-stage subset. C1 adds ordinary
+multi-stage planning and immutable cross-stage COPY without widening the
+device model or cache authority. The same-VM smoke and differential harness
+cover the implemented subset on Linux ARM64/KVM. Each newly accepted metadata
+instruction must extend final image configuration inheritance and the oracle
+together.
 
-### CLI
+## Compatibility Contract
+
+### Accepted features
+
+For every accepted instruction or flag:
+
+- the entire Dockerfile is parsed and planned before any stage executes;
+- the selected target's reachable stage closure is known before execution;
+- final paths, types, content, mode, uid/gid, symlink target, and relevant
+  extended metadata match the Docker/BuildKit oracle;
+- final OCI runtime configuration and inheritance match the oracle;
+- ephemeral mount data, credentials, SSH state, and helper sockets are absent
+  from every rootfs checkpoint and final image;
+- all semantically relevant inputs are represented in cache identity or cause
+  conservative invalidation;
+- unsupported values or combinations fail closed with file, line, instruction,
+  and actionable reason.
+
+Filesystem and config parity are required. These differences are allowed:
+
+- rootfs ext4 allocation, inode numbers, and timestamps that Docker does not
+  define as build inputs;
+- Spore rootfs index and image identities;
+- additional cache misses caused by conservative keys;
+- sequential execution of independent stages;
+- absence of Docker layers, history, registry cache manifests, and exporter
+  metadata.
+
+No accepted option may silently downgrade result semantics. A flag whose only
+portable effect is cache performance may use a more conservative cache
+implementation, but its filesystem behavior still has to match. For example,
+`COPY --link` may initially depend on the current parent and therefore re-run
+more often than BuildKit, but it must still enforce `--link` destination and
+symlink rules and must never reuse stale output.
+
+### Dockerfile frontend versions
+
+The native frontend supports the standard `docker/dockerfile` dialect. Leading
+`# syntax=docker/dockerfile:<version>` and `# escape=<character>` directives
+are parsed in Docker's directive window and included in plan identity.
+
+- Known stable standard versions are accepted when every used feature is
+  implemented.
+- A known directive may contain unsupported instructions; those instructions
+  fail individually during planning.
+- Custom frontend image references, `-labs` features, and unknown directive
+  forms fail closed by product policy.
+- Accepting a newer directive never implies support for every feature of that
+  frontend version.
+
+The compatibility matrix and tests, rather than a broad version claim, are the
+source of truth.
+
+### Planned CLI surface
+
+Existing options remain. New options land only with the feature that consumes
+them:
 
 ```bash
 spore build \
-  -t local/buildkite-spore:dev \
+  -t local/app:dev \
+  --target runtime \
   --platform linux/arm64 \
-  --build-context base=oci-layout:///path/to/base-oci \
-  /path/to/context
+  --build-arg VERSION=dev \
+  --network spore \
+  --memory 4gb \
+  --vcpus 4 \
+  --timeout 30m \
+  --ulimit nofile=65536:65536 \
+  .
 ```
 
-Options for the first implementation:
+Resource controls reuse Spore's memory, vCPU, and duration parsers and expose a
+bounded `nofile`-only ulimit contract. RUN cache identity includes resolved
+memory, vCPU, and `nofile` values because commands can observe them; timeout is
+host-only and failed/timed-out operations never publish a record. The core
+builder does not add raw `--secret` or `--ssh` host-input options. Do not expose
+an option before its cache, snapshot, and failure semantics are implemented.
 
 - `-t, --tag REF` (required): mutable local ref, `local/<name>:<tag>` only,
   same constraint as `spore rootfs import-*` (`parseLocalTagRef`).
@@ -213,23 +300,92 @@ builder then freezes and snapshots the prepared filesystem, publishes the
 completeness stamp and `PREPARE` record, thaws, and continues with step zero.
 The selected image needs no `/bin/sh` or `resize2fs` for preparation.
 
-`FROM` also accepts existing image refs directly (`FROM local/foo:dev`,
-`FROM local/foo@sha256:…`), resolved through `resolveLocalCachedRef`. Registry
-refs (`FROM debian:bookworm`) reuse the existing OCI resolution used by
-`spore run --image`, in a later milestone.
+- Build ordinary modern multi-stage Linux Dockerfiles without source rewrites.
+- Preserve Docker-equivalent final filesystem and OCI runtime configuration for
+  accepted features.
+- Keep cache reuse sound while allowing conservative over-invalidation.
+- Retain the current rootfs-native artifact model: immutable CAS-backed stage
+  outputs and no mandatory tar/layer conversion boundary.
+- Make stage, operation, mount, and cache lifetimes explicit in the planner.
+- Reuse the persistent build VM and O(dirty) checkpoints where doing so remains
+  correct and measurably useful.
+- Keep all guest/device behavior backend-neutral across KVM and HVF.
+- Fail before execution on unsupported frontend semantics.
+- Grow support through representative public fixtures and differential
+  Docker/BuildKit oracles rather than one private workload.
+- Build a minimal, reviewed compatibility variant of the Buildkite `ci` target
+  faithfully enough to use its result as a local Spore image, without adding
+  SSH or application-specific behavior to SporeVM.
 
-Unsupported features fail closed at parse time, before any execution:
+## Non-Goals
 
+- No byte-for-byte BuildKit cache-key or layer identity compatibility.
+- No OCI layer/history generation, registry push output, zstd exporter, or
+  registry cache import/export in this plan.
+- No cross-machine shared Spore build cache. Cache records and writable cache
+  mounts remain in the local host trust domain initially.
+- No arbitrary Dockerfile frontend plugins or frontend gateway protocol.
+- No custom frontend images, `dockerfile:labs`, nightly syntax, or frontend
+  build-check framework. Only the supported stable `docker/dockerfile` dialect
+  is accepted.
+- No Windows containers or non-Linux filesystem semantics.
+- No foreign-architecture execution or emulation. A reachable stage must be
+  executable on `linux/arm64`; platform expansion requires a separate backend
+  plan.
+- No Docker daemon, Compose, package-manager, or language-specific behavior in
+  the builder.
+- No automatic translation or best-effort execution of unsupported features.
+- No `RUN --device`, `RUN --security=insecure`, `RUN --network=host`, arbitrary
+  host paths, host devices, Docker socket mounts, or privileged build mode.
+- No Docker-style raw secret-file mounts, PEM injection, or SSH-agent mounts.
+  A future named credential broker would require a separate security plan.
+- No remote Git `ADD`, Git build contexts, `ADD --keep-git-dir`, or remote
+  archive `ADD --unpack` in this roadmap.
+- No deprecated `MAINTAINER`; use OCI author labels.
+- No Docker anonymous-volume creation, health supervisor, port publication, or
+  stop-signal runtime orchestration. Common metadata instructions are preserved
+  in image config only.
+- No parent-independent `COPY --link` layer rebasing or BuildKit-exact cache
+  mount scheduling. Spore may conservatively depend on the parent and serialize
+  cache writers.
+- No performance promise that every BuildKit cache hit is also a Spore cache
+  hit. Correct conservative execution is preferred over speculative reuse.
+
+## Target Architecture
+
+The current instruction slice becomes a frontend and graph planner feeding a
+typed operation executor:
+
+```text
+Dockerfile bytes
+    │
+    ▼
+versioned native frontend
+    │  directives, spans, stages, typed flags, heredocs
+    ▼
+target-pruned stage graph
+    │  base edges, stage-copy edges, mount/input dependencies
+    ▼
+topologically ordered stage plans
+    │
+    ├── metadata operations
+    ├── RUN operations with explicit mounts/network/user/shell
+    ├── context COPY/ADD operations
+    └── stage COPY operations
+    ▼
+Spore stage executor
+    │  local cache lookup or persistent build VM
+    ▼
+immutable {rootfs index, image config} stage artifact
 ```
-error: unsupported Dockerfile instruction: RUN --mount=type=cache
-hint: this Dockerfile needs BuildKit; use docker buildx + spore rootfs import-tar
-```
 
-Every parse error names the file, line, and instruction. The whole Dockerfile
-is validated before step one executes, so a build never fails halfway through
-on a feature error.
+### Native frontend and intermediate representation
 
-### Supported subset, exactly
+Continue with the native Zig frontend. Parsing Dockerfile grammar is smaller
+than implementing its execution model, the existing parser already has fuzz
+coverage and bounded diagnostics, and an upstream BuildKit/LLB helper would add
+a second runtime and a much broader generic operation contract without
+implementing Spore's mounts or cache policy.
 
 | Instruction | Support |
 | --- | --- |
@@ -326,60 +482,49 @@ const BuildState = struct {
 };
 ```
 
-`BuildState` seeds from the base image's stored `ImageConfig` (the import
-metadata sidecar already carries it): `env` starts as the base config `Env`
-(so `RUN` sees the base's `PATH`, `RUBYOPT`, etc., as Docker does), `workdir`
-starts as the base `WorkingDir` (default `/`), and `cmd` starts as the base
-`Cmd` so an override-free Dockerfile inherits it. Base config values need no
-extra keying: they are a pure function of the base rootfs index that already
-roots the chain.
+Every value retains source spans for diagnostics. Flags and mount options are
+typed during planning rather than re-parsed by the executor. Unknown flags,
+duplicates, invalid combinations, and unresolved variables fail before any
+stage runs.
 
-Metadata-only instructions (`ENV`, `ARG`, `CMD`) advance `step_key` and
-`BuildState` without touching the rootfs; their child `index_digest` is the
-parent `index_digest`. `WORKDIR` updates the same state but is also a
-filesystem step: the guest creates the directory when needed and publishes a
-child rootfs index. `RUN` and `COPY` likewise produce new rootfs indexes.
+The frontend owns Dockerfile syntax and substitution. The planner owns stage
+resolution and dependency closure. The executor never receives raw Dockerfile
+text as authority; raw/canonical text may still be recorded for diagnostics and
+cache migration.
 
-Reused existing machinery, unchanged:
+If maintaining native parser conformance later proves disproportionate, an
+upstream-frontend adapter can target the same typed plan. LLB is not accepted as
+a public or cache format in this roadmap.
 
-- `importOciLayout` (`src/rootfs.zig:779`) resolves `--build-context`
-  oci-layout bases, cached by manifest digest — a base that was imported last
-  build is a cache hit.
-- `rootfs_cas` + `disk_index` store chunk objects and `spore-disk-index-v1`
-  bytes named by `index_digest`; complete stamps make known-good rootfs
-  indexes O(1) to re-open.
-- Local ref records (`refs/local/<sha256>.json`, `writeLocalRefCache`) and the
-  image metadata path make the result visible to `spore run --image` with no
-  run-path changes.
-- The run/exec stack (`run_mod.execute`, vsock exec protocol, exit codes,
-  `--net` gateway) executes guest steps.
+### Stage graph and artifacts
 
-## Cache Model
+Each stage has independent filesystem and image-config state. Its base is one
+of:
 
-### Checkpoints, not layers
+- a registry/local/named OCI image;
+- a previous stage artifact;
+- `scratch`.
 
-`spore build` has no layer concept. The artifact of every step — and of the
-final image — is one rootfs `index_digest` naming a `spore-disk-index-v1` plus
-its referenced 64KiB rootfs CAS objects. OCI layers exist only at the `FROM`
-edge, parsed once by the existing import path and never re-emitted. There is no
-Docker overlay stack, no whiteout resolution at build or run time, and no
-flatten/export pass; the run path consumes the indexed rootfs unchanged.
+Global ARGs and automatic platform ARGs are resolved for base selection without
+leaking into stage runtime environment unless redeclared according to Docker
+rules. `FROM previous-stage` inherits both rootfs and image configuration.
+`COPY --from` reads filesystem state but does not inherit source-stage config.
+Numeric stage indexes, named stages, named contexts, and external image
+references share one explicitly tested resolution namespace; the planner never
+guesses after execution has started.
 
-The three jobs Docker layers perform are covered separately:
+The planner computes the selected target's transitive closure, rejects cycles,
+and executes stages in deterministic topological order. Parallel independent
+stage execution is deferred until sequential behavior and cache identity are
+proven.
 
-- **Caching**: deterministic step records map
-  `parent index_digest + instruction + inputs` to a recorded child
-  `index_digest`. A cache hit resolves a rootfs index, not a layer stack.
-- **Storage sharing**: unchanged chunks are shared by the rootfs CAS. During an
-  uncached session, `ChunkMappedDisk` keeps only overlay-backed dirty chunks in
-  memory/file-backed state and `snapshotIndex()` publishes only those dirty
-  chunks into CAS when the guest is frozen.
-- **Distribution/dedupe**: the existing rootfs CAS and `spore-disk-index-v1`
-  are the dedupe unit for both intermediate checkpoints and final images.
+All reachable external bases and named image contexts are resolved to immutable
+identities before taking the coarse cache lock used during stage execution.
+Alternatively, locking may be narrowed to individual cache lookup/publication
+transactions. The executor must not hold the current non-reentrant cache lock
+while resolving a later stage's remote base.
 
-Accepted one-way door: built images cannot be exported back to Docker (there
-are no layers to emit). Checkpoint granularity is the chunk-indexed rootfs
-state, and the cache records are local build metadata over those indexes.
+A completed stage artifact is:
 
 ### Step keys
 
@@ -447,9 +592,7 @@ Per-instruction inputs:
   step that creates the directory. A changed `WORKDIR` publishes a new child
   index and invalidates later `RUN`/`COPY` steps.
 
-`network_mode` is present only for `RUN`; COPY keys are deliberately invariant
-across `--network spore` and `--network none` because COPY never uses the build
-VM network.
+### Scheduler and build sessions
 
 `--no-cache` bypasses only RUN/COPY/WORKDIR record reads. It deliberately still
 reads `PREPARE`: forcing Dockerfile execution must not repeat stable
@@ -463,20 +606,114 @@ environment of every subsequent `RUN`/`COPY`, so changing any declared
 This over-invalidates relative to Docker (which tracks reference), and is
 recorded as an accepted tradeoff below.
 
-### On-disk layout
+- parent stage artifact;
+- network mode;
+- immutable source disks;
+- writable cache volumes and their locks;
+- resource settings.
 
-All under the existing rootfs cache root (`local_paths.rootfsCacheRootPath`):
+Operations with a compatible envelope continue in one persistent VM and retain
+the current checkpoint efficiency. A changed envelope ends the session at a
+completed checkpoint and starts another from that immutable stage state.
+Independent stages execute sequentially at first. Per-RUN network or mount
+semantics must never be approximated by applying one policy to an incompatible
+whole-stage suffix.
 
-```
-cas/rootfs/blake3/indexes/<index_digest>.json      (existing) disk index
-cas/rootfs/blake3/objects/<chunk_digest>.chunk      (existing) CAS object
-cas/rootfs/blake3/complete/<index_digest>.complete  (existing) completeness stamp
-build/steps/<step_key>.json                         build step record
-build/context-stat-cache-v1.json                    context content-digest memo
-build/context-disks/<context_disk_digest>.ext4      cached read-only COPY disk
-build/context-disks/<context_disk_digest>.ext4.complete  context disk completeness stamp
-refs/local/<sha256>.json                            (existing) final ref
-<image_cache_key>.json                              (existing) image metadata
+Rootfs growth and filesystem checking move into the initrd or a host/native
+storage path. Session startup must be able to grow and mount a `scratch` stage
+without executing any program from that stage's rootfs.
+
+### Typed execution operations
+
+A RUN operation records:
+
+- shell or exact argv form;
+- effective shell from `SHELL`;
+- effective user and groups from `USER`;
+- environment and working directory;
+- network mode (`spore`/default or `none` only);
+- an ordered list of typed mounts;
+- resource requirements relevant to execution and cache safety.
+
+A COPY/ADD operation records:
+
+- source kind: context, stage, URL, or local archive;
+- immutable resolved input identity;
+- destination and destination-shape rules;
+- ownership, mode, parents, exclude, link, and follow/extract policy;
+- the exact filesystem behavior required at the destination.
+
+Metadata operations update the stage config and, where Docker requires it,
+filesystem state. Expand `ImageConfig` and canonical image identity before
+accepting instructions that set `Entrypoint`, `User`, labels, ports,
+healthcheck, stop signal, or volumes. Imported ONBUILD triggers must be
+preserved only so a reachable base containing them can fail closed rather than
+silently dropping hidden build behavior.
+The import metadata schema is versioned when fields are added so cached bases
+that were decoded under the older lossy schema cannot silently masquerade as
+complete configuration.
+Until non-root RUN execution lands, an inherited or explicit non-root `User`
+that would affect an executed operation remains a planning error; Spore must
+never silently execute it as root.
+
+### Mount model
+
+Mounted RUN support is one generic execution facility, not a collection of
+instruction-specific exceptions:
+
+| Mount | Source | Writable | Snapshot into rootfs | Cache identity |
+| --- | --- | ---: | ---: | --- |
+| context bind | immutable context capture | no by default | no | resolved content and mount options |
+| stage bind | immutable stage rootfs | no by default | no | source stage artifact, path, options |
+| tmpfs | empty per operation | yes | no | mount options only |
+| cache | local named cache store | yes | no | cache id/options; contents do not make a rootfs hit valid |
+
+All mounts live outside the rootfs disk and are applied in an operation-owned
+mount namespace before chroot/exec. The agent unmounts and verifies cleanup
+before descendant cleanup, freeze, and snapshot. A failed unmount, busy mount,
+or surviving helper fails the step without publishing a cache record.
+
+Immutable bind inputs can reuse the context or stage disks. Writable cache
+mounts require a separate local storage contract with explicit ownership,
+locking, crash recovery, and GC. Do not emulate cache mounts with directories
+inside the rootfs followed by deletion: their blocks would enter intermediate
+snapshots and alter later behavior.
+
+`sharing=locked` is the first writable cache mode because it has deterministic
+one-writer behavior. `private` and `shared` land only with explicit clone and
+concurrency semantics. A missing cache may change command performance and
+downloads but not permit reuse of an output produced from semantically
+different rootfs inputs.
+
+### Credential boundary
+
+The core builder rejects `RUN --mount=type=secret`,
+`RUN --mount=type=ssh`, raw host secret files, PEM inputs, and SSH-agent
+forwarding. These features do not align with the repository invariant that
+credentials stay out of the VMM process and durable machine state, and their
+usage does not justify making them part of the compatibility architecture.
+
+A future named credential broker may implement a deliberately different,
+mediated contract if real consumers justify it. That work requires a separate
+security plan and does not block this roadmap. Dockerfiles that require raw
+secret or SSH mounts continue to fail during planning.
+
+### Cache model
+
+The existing step cache becomes an operation cache scoped to a stage plan.
+Every rootfs-changing operation key includes at least:
+
+```text
+builder/cache schema
+frontend directives and semantic version
+platform
+stage identity
+parent rootfs index and effective image config
+typed canonical operation
+resolved immutable inputs
+effective env, args, user, shell, and workdir
+network and mount options
+resource settings that can affect observable output
 ```
 
 Intermediates are input-addressed by their step key, but their artifacts are
@@ -488,8 +725,7 @@ stamp during lookup: missing or malformed indexes, missing complete stamps, or
 bad records are misses. GC continues to parse older records conservatively and
 may retain their complete content, but v6 records cannot hit v7 keys.
 
-Step record, written or replaced atomically (temp + rename) only after
-`snapshotIndex()` has published the index/chunks and the complete stamp exists:
+Cache correctness rules:
 
 ```json
 {
@@ -553,31 +789,17 @@ completeness stamps, and GC roots rather than a second cache subsystem:
 }
 ```
 
-Final rootfs identities are **recorded outcomes, not recomputed promises**. Guest
-writes (inode allocation, timestamps) are not deterministic, so the same step
-key can map to different rootfs indexes on different machines or after a cache
-wipe. A successful `--no-cache` execution may therefore replace an existing
-step record for the same key with its newly produced child index. The step
-record is a derived mapping; rootfs CAS indexes and objects remain immutable.
-That is the same model Docker uses: cache keys are deterministic, the artifact
-identity is whatever the execution produced. Nothing downstream assumes
-reproducibility of the ext4 bytes.
+Prefer operation-family semantic versions over one global builder version once
+the typed plan lands. A frontend-only change should not invalidate unrelated
+executor records, while a changed RUN or COPY contract must not reuse older
+outcomes. Add record pruning before repeated compatibility migrations leave
+obsolete-but-valid records as permanent CAS roots.
 
-Context hashing also maintains
-`build/context-stat-cache-v1.json` under the same local cache root. The JSON
-file has `kind: "sporevm-build-context-stat-cache-v1"`, `max_records`,
-`eviction: "least-recently-seen stat tuple"`, and `records` containing
-`path`, `size`, `mtime_ns`, `ctime_ns`, `inode`, `digest`, and
-`last_seen_unix_ns`. The lookup key is `(absolute path, size, mtime
-nanoseconds, ctime nanoseconds, inode)`. A hit reuses only the per-file BLAKE3
-content digest; the overall COPY/context input digest is still rebuilt from the
-same sorted entry fields a cold hash would use.
-Missing, corrupt, oversized, or stale stat-cache entries fall back to reading
-and hashing file content, and the build proceeds. The file is capped at
-131,072 records and 32 MiB; save eviction keeps the most recently seen stat
-tuples.
+Exact BuildKit cache equivalence is unnecessary. `COPY --link`, unused ARGs,
+stage scheduling, and mount caches may over-invalidate provided the result and
+reuse remain correct.
 
-### Final image identity
+### Registry and remote input model
 
 The final image's rootfs identity is the last step's `index_digest`, but the
 published local image identity is a digest over that `index_digest` plus the
@@ -618,20 +840,20 @@ shape; it does not add a new kind or format contract.
 }
 ```
 
-Publication follows the import path:
+Anonymous public bases land first. Docker credential files and helpers are a
+separate host-side credential feature; credentials never enter rootfs metadata
+or the guest.
 
-1. verify the final `index_digest` and complete stamp;
-2. write `RootFSMetadata`-compatible image metadata carrying the rootfs storage
-   descriptor and final config so `readCachedImageRunConfig` picks it up at run
-   time;
-3. compute the image digest from rootfs identity plus config and update the
-   mutable tag with that resolved ref.
+Remote URL `ADD` reuses the host fetch policy and verifies downloaded bytes
+before publishing them as immutable build input. `ADD --checksum` lands first.
+An unpinned URL may be supported by fetching and hashing it on each build; this
+is conservative but sound. Local tar extraction reuses the bounded, path-safe
+rootfs tar machinery and extends its fuzz corpus. Remote Git sources, Git build
+contexts, `ADD --keep-git-dir`, and remote `ADD --unpack` remain unsupported.
 
-Result: `spore run --image local/buildkite-spore:dev` works today's way, and
-`--save` records portable chunked storage immediately because the cache
-metadata already carries the rootfs storage index.
+## Compatibility Matrix
 
-## RUN Execution And Snapshot
+The matrix records planned result support, not BuildKit layer/export parity.
 
 Uncached steps execute in **one persistent build VM per build**, not one VM per
 step. A preparation miss and all remaining RUN/COPY/WORKDIR instructions share
@@ -640,7 +862,7 @@ later Dockerfile miss boots directly from the prepared child with no resize.
 Checkpoints freeze the filesystem, drain virtio-blk, seal only changed chunks,
 and enumerate one canonical full rootfs CAS index.
 
-Session lifecycle:
+## Safety And Correctness Invariants
 
 1. Before the first executor-backed instruction, compute the absolute target
    `max(FROM.logical_size, 16 GiB)`. If no growth is needed, continue directly.
@@ -672,13 +894,13 @@ Session lifecycle:
    the exact response against the same invariants. No selected-image shell or
    e2fsprogs utility participates.
 5. Freeze the prepared filesystem, quiesce virtio-blk, seal the changed
-   metadata chunks, emit the canonical logical index, publish the completeness
-   stamp, and write the
-   typed `PREPARE` record last. Thaw without advancing the Dockerfile step
-   index, install the prepared child as the live `ChunkMappedDisk` baseline,
-   and continue step zero in the same VM. A failed grow, freeze, snapshot,
-   stamp, or record publication executes no Dockerfile step and publishes no
-   destination ref.
+   metadata chunks, emit the canonical logical index, and publish the
+   completeness stamp. Thaw without advancing the Dockerfile step index, then
+   atomically publish the typed `PREPARE` record and install the prepared child
+   as the live `ChunkMappedDisk` baseline before continuing step zero in the
+   same VM. A failed grow, freeze, snapshot, stamp, thaw, or record publication
+   executes no Dockerfile step and publishes no destination ref or reusable
+   step record; complete orphaned CAS storage remains collectable.
 6. For an ordinary Dockerfile executor miss, use the prepared parent through
    the same internal writable-rootfs mode, without the growth-only feature or
    control request. Continue the VM already live after a preparation miss, or
@@ -693,11 +915,12 @@ Session lifecycle:
    - `COPY`: before boot, the host emits the resolved context entries needed
      by executed COPY steps into a cached read-only ext4 context disk and
      attaches it as an additional virtio-blk device. Per step, the host sends
-     one or more fixed-shape `spore-build-copy-v2` control requests naming the
-     source subtree on `/mnt/build-context`, destination, source kind, and
-     bounded entry count. The agent recursively copies from the mounted
-     context disk into `/mnt/rootfs` using the confined destination resolver
-     (see COPY Semantics).
+     one or more fixed-shape `spore-build-copy-v3` control requests naming the
+     source disk and bounded input index, source subtree, destination, source
+     kind, and bounded entry count. The agent recursively copies from the
+     selected context or immutable build-input disk into `/mnt/rootfs` using
+     the confined destination resolver (see COPY Semantics). The guest retains
+     `spore-build-copy-v2` only as an older context-disk-compatible input.
    - `CHECKPOINT`: agent handles `fsfreeze-v1` after the step exits;
      the VMM drains/flushes pending virtio-blk writes, the host calls
      `ChunkMappedDisk.snapshotIndex()` into the rootfs CAS, writes the
@@ -742,13 +965,15 @@ regresses, the degenerate mode is one boot-snapshot-shutdown cycle per step
 per changed step instead of per build; the cache model is identical in both
 modes.
 
-The guest sees the writable rootfs plus, when COPY steps execute, a mounted
-read-only context disk (`spore_rootfs=1 spore_rootfs_rw=1
-spore_build_context=1`). The initrd agent now provides the build control verbs
+The guest sees the writable rootfs plus, when COPY steps execute, bounded
+read-only context or immutable build-input disks (`spore_rootfs=1
+spore_rootfs_rw=1`, with `spore_build_context=1` and/or
+`spore_build_inputs=<count>`). The initrd agent now provides the build control verbs
 (`spore-rootfs-grow-v1`, `fsfreeze-v1`, `fsthaw-v1`, `spore-build-run-v1`,
-`spore-build-copy-v2`); the target base must provide `/bin/sh` for RUN and
-nothing for capacity preparation. A missing RUN shell fails closed through the
-step's captured output.
+`spore-build-copy-v3`); the target base must provide `/bin/sh` for RUN and
+nothing for capacity preparation. The guest accepts the older
+`spore-build-copy-v2` context-only request for compatibility. A missing RUN
+shell fails closed through the step's captured output.
 
 ## COPY Semantics
 
@@ -775,10 +1000,11 @@ session as `RUN`, rather than host-side ext4 surgery:
    the sidecar is published after full disk emission. Changed contexts still
    mostly dedupe through the rootfs CAS chunks emitted by the native ext4
    writer.
-4. Send fixed-shape `spore-build-copy-v2` control requests. Each request names
-   the context-disk source subtree, destination, source kind, `dest_is_dir`,
-   and entry count. The guest enforces path and entry-count bounds, then
-   recursively copies from `/mnt/build-context`. Destination paths are resolved
+4. Send fixed-shape `spore-build-copy-v3` control requests. Each request names
+   the context or immutable build-input disk and bounded input index, source
+   subtree, destination, source kind, `dest_is_dir`, and entry count. The guest
+   enforces disk, index, path, and entry-count bounds, then recursively copies
+   from the selected read-only mount. Destination paths are resolved
    relative to an fd for `/mnt/rootfs` with `openat2(RESOLVE_IN_ROOT |
    RESOLVE_NO_MAGICLINKS)`, falling back on kernels without `openat2` to a
    confined manual component walk that keeps symlink targets rooted in the
@@ -903,19 +1129,11 @@ single-digit seconds end to end, with the BuildKit tar export removed.
 
 ## Delivery Strategy
 
-### M1 — Parser, cache resolution, fully cached path
+Effort ranges are planning estimates for one engineer familiar with the code,
+including tests, fuzzing, docs, and real-hardware smoke. Tracks overlap and are
+not additive commitments.
 
-`spore build` exists without VM execution. The parser handles the full subset
-grammar and fails closed (with tests asserting exact error text) on everything
-outside it. `FROM` resolves `--build-context oci-layout://` (through
-`importOciLayout`, including the wrapper's patched docker-save layout) and
-local refs. The context walker applies `.dockerignore`, rejects escapes, and
-computes deterministic COPY input digests. The cache walker derives every step
-key from parent `index_digest`, instruction, input digests, env, workdir, and
-platform; a fully cached build verifies the final record, index, and complete
-stamp, updates the local ref, and exits. On the first cache miss for `RUN` or
-`COPY`, M1 fails closed with "cache miss requires build executor" rather than
-falling back to BuildKit or doing partial work.
+### C0 — Baseline closure and conformance harness
 
 Implementation note (2026-07-09): the first M1 implementation slice adds the
 `spore build` CLI, Dockerfile subset parser, `.dockerignore`/COPY context
@@ -924,40 +1142,44 @@ indexed local image publication/run resolution. M2 starts at executor-owned
 cache misses; it should write the same `sporevm-build-step-v1` records after
 each dirty-only sealing/full-index checkpoint.
 
-Implementation note (2026-07-10): COPY discovery opens the canonical context
-root once and walks literal-source parents and glob parents one component at a
-time with no-follow directory handles. This rejects intermediate symlinks while
-retaining Docker's final-symlink preservation semantics.
+**Implementation status:** complete.
 
-Definition of done:
-- Dockerfile parser unit tests cover the supported subset and exact
-  fail-closed errors for unsupported features.
-- Parser and `.dockerignore`/context-ingestion fuzz targets are in-tree in the
-  same change as the new parsers.
-- A fully cached fixture build resolves the final `index_digest`, verifies the
-  complete stamp, updates the local ref, and exits in <1s without booting a VM.
-- A metadata-only Dockerfile (`FROM`/`ENV`/`ARG`/`CMD`) publishes a runnable
-  image by reusing the base `index_digest`; a second invocation is a full cache
-  hit in <1s. `WORKDIR` is covered by the M2 filesystem-step smoke.
-- `spore run --image local/x:dev -- /bin/true` boots the published result.
-- `mise run build` and `zig build test --summary all` pass.
+The implemented baseline now:
 
-Ceiling proven: cached build resolution and ref publication <1s; base import
-cost paid once.
+- records the Docker-vs-Spore filesystem/config oracle for the existing
+  single-stage workload;
+- proves exact trailing-COPY invalidation and warm cache behavior;
+- preserves Docker-visible `/tmp` and `/run` across cached-prefix restarts;
+- keeps resolver injection transient across checkpoints, including bases whose
+  `/etc/resolv.conf` has a dangling systemd-style target;
+- moves rootfs grow/resize support out of the selected base so a shell-less
+  `scratch` stage can execute COPY and metadata operations;
+- adds build memory, vCPU, timeout, and `nofile` controls sufficient for large
+  dependency and frontend builds, and makes command/environment/workdir/timeout
+  bounds explicit product limits rather than hidden protocol surprises;
+- normalizes ordinary `./` COPY sources, replaces the single-star matcher with
+  a bounded Docker-compatible glob matcher, and adds `.dockerignore`
+  differential fixtures;
+- adds step-record pruning and defines the operation-specific cache-schema
+  migration used by later compatibility slices;
+- provides a table-driven conformance harness with strictly validated fixture
+  manifests that runs the same small Dockerfile through BuildKit and Spore,
+  then compares normalized filesystem, config, success/failure, and selected
+  cache behavior.
 
-### M2 — RUN/COPY via the persistent build-VM session
+The harness contains small public fixtures: metadata-only, shell RUN plus a
+negative exec-form fixture, context COPY, workdir, symlinks, empty directories,
+and cache invalidation. It is runnable locally and on real Linux ARM64 hardware.
+The Buildkite pipeline has a bounded Linux ARM64 conformance step that remains
+the regression gate for this baseline.
 
-The session executor: open the deepest cached index through `ChunkMappedDisk`
-with build-owned overlay state, rw rootfs boot behind the hypervisor-neutral
-disk interface, bounded agent requests over `spore_stream_v1`, length-prefixed
-64 KiB-capped `/bin/sh -c` RUN payloads with env/workdir/network, cached
-read-only ext4 context disks for COPY, fixed-shape `spore-build-copy-v2`
-control requests, freeze/snapshot/stamp/record/thaw checkpointing (including
-the virtio-blk drain), complete-stamp publication, streamed step output, and
-non-zero-exit cleanup.
-Every executed instruction produces exactly one child `index_digest` through
-`ChunkMappedDisk.snapshotIndex()`; no flat checkpoint and no full-image hash
-exist in this path.
+**Local proof (2026-07-11):** `mise run build`, `mise run test`,
+`zig build spore-build-run-smoke`, and
+`scripts/spore-build-conformance.py --spore-bin zig-out/bin/spore` pass. The
+differential harness reports 8/8 cases against BuildKit v0.30.0 on
+`linux/arm64`; the Spore side ran natively on HVF. The COPY fixture forces a
+`0775` source-root directory and verifies Docker's `0755` mode for a newly
+created destination container while preserving an existing destination's mode.
 
 Definition of done:
 - `FROM base` + `RUN apt-get update && apt-get install -y …` builds against
@@ -982,83 +1204,47 @@ Ceiling proven: a first uncached RUN/COPY build = one boot containing direct
 capacity preparation + step time + dirty-only sealing/full-index checkpoints; a prepared uncached
 build = one boot + step time + snapshots; cached build ≈ 0.
 
-Implementation note (2026-07-09, RUN slice): the executor now starts at the
-first uncached `RUN`, opens the parent rootfs through the normal writable
-`ChunkMappedDisk` run path, boots one build VM, and drives each remaining `RUN`
-over `spore_stream_v1` with the step env/workdir applied to `/bin/sh -c`.
-After each successful RUN the guest agent handles `fsfreeze-v1`, the host takes
-a rootfs-only `ChunkMappedDisk` snapshot after the existing virtio-blk
-quiescence check, writes the completeness stamp, writes the
-`sporevm-build-step-v1` record through `step_cache.writeRecord`, then sends
-`fsthaw-v1` before continuing. This publish-before-thaw ordering is
-intentional: if thaw fails, the active build fails but the completed frozen
-snapshot remains a valid cache resume point. Failed RUNs report the
-instruction, exit code, and captured output without writing the failed step
-record. The slice also fixes
-`spore run --image` for indexed rootfs images so build-published images pass
-`spore_rootfs=1` even when there is no flat rootfs path.
-The build VM memory remains a fixed 2 GiB default. The original Buildkite
-Dockerfile's apt and Docker installation RUN completed at that size. Add a
-`spore build` option only when a build-time workload demonstrates that 2 GiB
-is insufficient.
+**Stop/go gate:** passed on 2026-07-11. C1 may begin. Any future unexplained
+filesystem or metadata difference in the baseline oracle is a stop.
 
-Implementation note (2026-07-10, RUN shell expansion): shell-form RUN is now
-opaque to Dockerfile variable substitution and reaches guest `/bin/sh -c`
-unchanged. ARG and ENV values are exported through the step environment, so
-the shell owns quoting, command substitution, special parameters, and
-variables created earlier in the same command. The build cache version moved
-to `sporevm-build-v2` to prevent reuse of checkpoints created under the old
-host-substitution behavior.
+### C1 — Ordinary multi-stage Dockerfiles — implemented 2026-07-11
 
-Implementation note (2026-07-10, cache execution identity): RUN step records
-now key the typed `spore`/`none` network mode, and ENV/ARG state uses ordered,
-length-framed typed records rather than a sorted newline-delimited projection.
-The build cache version moved to `sporevm-build-v3`; v2 records are retained as
-GC roots but cannot be reused by the corrected lookup path.
+**Estimate:** 6–10 weeks, delivered as several reviewable changes.
 
-Implementation note (2026-07-10, immutable COPY capture): executor-side COPY
-opens source components fd-relatively without following symlinks, streams file
-bytes once through BLAKE3 into a private 0600 sparse spool, verifies the opened
-file did not change during capture, and seals the spool before ext4 emission.
-Context-disk entries reference only captured spool slices or by-value metadata;
-the original host paths are never reopened. Per-step `sN/` namespaces prevent
-overlapping directory and glob requests from observing another step's unioned
-entries. The spool is deleted after context-disk emission or on every error.
-The build cache version moved to `sporevm-build-v4` so checkpoints created by
-the old split hash/emission path cannot be reused; earlier records remain GC
-roots only.
+1. **Done:** replace the flat frontend output with source-spanned stages and typed
+   operations. Parse standard directives, `FROM ... AS`, `FROM --platform`,
+   global ARGs, automatic platform ARGs, stage names, and `--target`.
+2. **Done:** build and validate the selected target dependency graph. Execute stages
+   sequentially in topological order and cache immutable `StageArtifact`s.
+3. **Done:** support `scratch`, public registry bases, previous-stage bases, and complete
+   OCI config inheritance.
+4. **Done:** implement literal-path `COPY --from` from stages, named build contexts, and local/OCI
+   images through confined read-only stage disks.
+5. **Done:** preserve and publish `Entrypoint` and `Cmd`, including exec-form
+   `ENTRYPOINT` needed by shell-less runtime stages.
+6. **Done:** publish the selected target only; unreferenced invalid stages must still be
+   syntactically valid but need not fetch or execute external bases.
 
-Implementation note (2026-07-10, WORKDIR and COPY filesystem semantics):
-`WORKDIR` is now a cacheable filesystem step, not metadata-only state. The
-guest creates its normalized absolute path through the same rootfs-confined
-resolution used by COPY, snapshots it, and only then applies it to later RUN
-and relative COPY instructions. COPY resolves an existing destination
-directory at apply time even when the Dockerfile destination has no trailing
-slash, and copied files/directories are explicitly reset to root ownership
-when they replace existing entries. The VM smoke requires WORKDIR creation
-before the following RUN, exercises a no-slash existing-directory COPY, and
-overwrites a deliberately non-root file. The build cache version moved to
-`sporevm-build-v6`; v5 records remain GC roots but cannot represent the new
-WORKDIR checkpoint or corrected ownership outcomes.
+Structural follow-ups are explicit gates before C2 widens the instruction
+surface. Extract the cache-walk and miss-suffix lowering from `src/build.zig`
+behind one typed instruction transition, decode builder-v7 records through one
+canonical adapter shared by cache hits and GC validation, move the build COPY
+filesystem engine out of the PID1 protocol dispatcher, and split the
+conformance schema/comparison code from its CLI lifecycle. C1 keeps these paths
+co-located so its behavior lands as one cohesive slice; adding more operation
+kinds or COPY policy before those extractions would multiply the current
+representations.
 
-Implementation note (2026-07-10, RUN descendant cleanup): every build RUN
-shell is moved into a dedicated cgroup v2 leaf before its start gate opens.
-After the direct shell exits, the guest writes `cgroup.kill`, waits for the
-leaf to become empty, then repeatedly kills and reaps every remaining process
-in the dedicated build guest through a procfs directory descriptor retained
-by PID 1 from boot. RUN processes cannot replace that descriptor or inherit it
-across exec. The agent removes the leaf and sends the SPIO exit frame only
-after the sweep is empty, allowing the host to freeze and checkpoint the
-rootfs. This covers descendants that detach into a new session, process group,
-or ancestor cgroup, even if they alter their mount namespace or overmount
-`/proc`. The bounded `/proc/<pid>/stat` classifier uses the kernel-owned
-`PF_KTHREAD` flag and is unit/fuzz covered for RUN-controlled task names.
-Setup, kill, drain, or removal failures return exit 125 and prevent a
-step-cache record. The VM-backed smoke moves a detached delayed writer out of
-the RUN cgroup and proves it cannot mutate the next step. The build cache
-version moved to
-`sporevm-build-v5`; older records remain GC roots but are not reusable because
-they may capture filesystem state that raced a surviving RUN descendant.
+Representative acceptance fixture:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM golang:1 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/app ./cmd/app
 
 Superseded implementation note (2026-07-10, v6 stable grow target): v6 anchored
 the former additive/doubling target to `FROM` and included that target in the
@@ -1075,11 +1261,12 @@ physical preallocation. The
 non-resumable growth VM temporarily negotiates WRITE_ZEROES, then the managed
 initrd handles `spore-rootfs-grow-v1` with `EXT4_IOC_RESIZE_FS` and bounded
 geometry validation. Freeze → metadata-only sealing plus canonical full-index
-emission → completeness stamp →
-`PREPARE` record → thaw occurs before Dockerfile step zero, and the same VM
-continues on a miss. A hit supplies the normal Dockerfile parent even under
-`--no-cache`. The hidden growth override was removed; above-cap images remain
-byte-exact and are never rounded or doubled.
+emission → completeness stamp → thaw → `PREPARE` record occurs before
+Dockerfile step zero, and the same VM continues on a miss. Deferring the
+authoritative record until thaw succeeds prevents an un-restorable VM
+transition from becoming a cache hit. A hit supplies the normal Dockerfile
+parent even under `--no-cache`. The hidden growth override was removed;
+above-cap images remain byte-exact and are never rounded or doubled.
 
 Implementation note (2026-07-10, checkpoint control latency): repeated
 freeze/thaw requests used fixed session identities, which reused the same
@@ -1100,11 +1287,13 @@ context walk feeds both the COPY input digest and the context-disk builder; a
 cold full hash and a warm stat-cache hit path must produce byte-identical step
 keys. The host emits or reuses a cached read-only ext4 image under
 `build/context-disks/`, attaches it as a second virtio-blk instance at boot,
-and sends bounded `spore-build-copy-v2` control messages naming source,
-destination, kind, destination-directory behavior, and entry count. The guest
-agent validates the request shape and count, mounts the context disk read-only,
-and confines all destination apply-path resolution to `/mnt/rootfs` while
-preserving Docker-style rootfs-internal and final-component symlink traversal.
+and originally sent bounded `spore-build-copy-v2` context-only control
+messages. The current executor emits `spore-build-copy-v3`, which also binds
+the selected context or immutable build-input disk and bounded input index.
+The guest retains v2 only for older context-compatible input, validates both
+request shapes, mounts the selected disk read-only, and confines all
+destination apply-path resolution to `/mnt/rootfs` while preserving
+Docker-style rootfs-internal and final-component symlink traversal.
 COPY checkpoints use the same freeze → snapshot → complete stamp → step
 record → thaw ordering as RUN; if any COPY request in a step fails, the build
 fails before snapshot promotion for that step. Session start uses the
@@ -1137,73 +1326,155 @@ Repeating an input key after a forced execution now atomically replaces only
 the derived step mapping, while rootfs CAS indexes and objects retain immutable
 publication.
 
-Post-merge acceptance on `0a99933` rebuilt the same original Dockerfile in
-148.78s cold, 9.87s warm, and 7.31s after changing one context file. The image
-booted, `/bin/true` and Ruby/RSpec probes passed, and wrapper readiness took
-36.23s. Later runtime fixes proved the application path: one-shot `bin/setup`
-completed in 709.87s on `d8db64a`; named `bin/setup` completed in 1081.69s on
-`8790d6a` while streaming 45,495 bytes without truncation; and
-`spec/middleware/admin/developer_tools_guard_spec.rb` passed 11 examples with
-zero failures in 27.80s. All runs ended with no VM left behind.
+**Stop/go gate:** passed on 2026-07-13 at exact head `79ffbb2`. Buildkite
+#1317 passed the exact Linux and macOS unit graphs plus Linux BuildKit
+conformance. The complete local graph passed all 18 build steps with
+1,742/1,755 tests passing and 13 skipped. Native HVF and KVM each passed all
+11 build-run smoke sections, publication, capacity save/restore/pack/commit,
+and block- plus inode-ENOSPC coverage; KVM also passed BuildKit conformance.
+The native harness requires an absolute work root, so failed operator
+invocations with a relative root are not product evidence.
 
-Remaining M2 completion work: record the full Docker-vs-Spore file-tree
-equivalence result and the exact trailing-COPY invalidation behavior for the
-real workload.
+The five-sample paired default-path gate remained stable at one PREPARE step,
+one child, and one producer per sample, and every acceptance threshold passed:
 
-Definition of done:
-- The full `buildkite-sporevm` Dockerfile (`FROM base`, apt RUN, five COPYs,
-  chmod RUN, CMD) builds end to end through Spore after the base OCI layout is
-  prepared separately.
-- File-tree diff of the built rootfs against the docker-buildx-built rootfs
-  for the same inputs shows only expected divergence (mtimes, `/etc/resolv.conf`
-  placeholder, ext4 identity) — paths, modes, sizes, symlink targets, uid/gid
-  match.
-- Touching one context file invalidates exactly the COPY that matched it and
-  later steps.
-- COPY semantics test matrix passes (dir-contents, multi-source, relative
-  dest, overwrite/merge, symlink, empty dir, mode preservation, exec bit).
+| Backend | Profile | Cold median | Warm median | Incremental median |
+| --- | --- | ---: | ---: | ---: |
+| HVF | compact | 927.249 ms | 153.553 ms | 825.444 ms |
+| HVF | pregrown | 926.491 ms | 198.975 ms | 977.930 ms |
+| KVM | compact | 703.670 ms | 235.334 ms | 684.439 ms |
+| KVM | pregrown | 808.544 ms | 304.584 ms | 752.371 ms |
+
+The public evidence ledger identifies the HVF raw and summary artifacts by
+SHA-256 prefixes `a16da275` and `aca67a54`, and the KVM raw and summary
+artifacts by prefixes `b1156452` and `5536d36b`. C2 instruction and COPY-policy
+widening remains blocked until the four structural extractions above land. The
+C1 implementation reuses bounded instances of the existing virtio-blk device
+and changes neither the frozen device types nor the spore manifest format.
+
+### C2 — Stable frontend and filesystem breadth
+
+**Estimate:** 5–9 weeks.
 
 Ceiling proven: cached full build (parse + stat-only context hash + lookups +
 ref refresh) ≤2s warm-stat; uncached COPY ≈ context-disk emit/reuse +
 guest disk-to-disk apply plus one freeze/dirty-only sealing and full-index checkpoint, with boot
 amortized per build.
 
-### M3 — Wrapper integration and benchmark
+- exec-form RUN and full stable variable expansion;
+- explicit `RUN --security=sandbox` as the only accepted security mode;
+- RUN and COPY heredocs;
+- `COPY --chmod`, `--chown`, `--parents`, `--exclude`, and result-correct
+  `--link` with conservative cache behavior;
+- complete glob and `.dockerignore` parity for supported host filesystems;
+- `SHELL`, `USER`, `LABEL`, `EXPOSE`, `STOPSIGNAL`, and
+  `HEALTHCHECK` with full inheritance and final-config identity;
+- preserve `VOLUME` declarations in image config without adding Docker-style
+  anonymous-volume creation to `spore run`;
+- Docker-compatible unset ARG behavior and automatic platform values;
+- bounded resource and diagnostic behavior for large commands/configs.
 
-The original wrapper Dockerfile now builds and runs through Spore, but the
-repeatable integration still belongs in `buildkite-sporevm`. Replace its final
-buildx/import-tar seam with `spore build`, keep base OCI preparation explicit,
-keep any generated application context incremental and clonefile-based, and add
-one smoke command that performs build -> named start -> setup -> known-good
-RSpec -> stop with guaranteed cleanup and preserved failure logs. Add the
-profiling phases below and record before/after results in `docs/benchmarks.md`.
+Acceptance corpus includes representative Go, Rust, Node, and Ruby multi-stage
+images plus focused ownership, symlink, JSON, heredoc, and metadata fixtures.
 
-Definition of done:
-- `buildkite-spore build` (cached) completes in single-digit seconds wall
-  clock, from the current ~30s warm baseline, with `spore build` itself <1s.
-- `buildkite-spore start` boots the built image, `setup-spore` reaches
-  `/tmp/sporevm-buildkite/ready`, and `buildkite-spore rspec <known-good
-  spec>` passes. This behavior is proven manually; the milestone completes
-  when the repeatable smoke path lands in `buildkite-sporevm`.
-- Uncached full build wall clock recorded; target ≤ current uncached path.
-- Benchmark script lives in `scripts/` and runs identically by hand and in CI
-  where hardware allows.
+**Done when:** Dockerfiles generated by common application templates build
+without syntax rewrites and normalized result/config differential tests pass.
 
-### M4 — Ergonomics and hardening (follow-ups, ordered by need)
+**Stop/go gate:** a feature with unresolved result semantics remains rejected.
+Do not accept it merely because parsing succeeds.
 
-- Define an explicit retention policy for obsolete step records, then retire
-  them before root-aware cache GC reclaims their CAS indexes and objects.
-- Host-side COPY fast path (apply a COPY without booting the session when it
-  is the only uncached step), after a separate design proves it can stay out
-  of the import hot path.
-- Registry `FROM` refs; exec-form `RUN`; `--chown`/`--chmod` on COPY if a
-  real consumer appears.
-- `--builder=buildkit` convenience fallback that shells out to buildx +
-  import-tar, if the fail-closed hint proves annoying in practice.
+### C3 — Generic mounted RUN
+
+**Estimate:** 6–10 weeks.
+
+1. Add typed RUN mount plans and an operation-owned guest mount namespace.
+2. Implement read-only context and stage bind mounts plus tmpfs mounts.
+3. Add per-RUN network selection and key it independently from global default.
+4. Design and implement the local writable cache store with bounded ids,
+   atomic creation, exclusive locking, crash recovery, accounting, prune, and
+   sound conservative behavior. `sharing=locked` maps directly to exclusive
+   locking; default/shared writers may be serialized more aggressively;
+   unsupported `private` behavior fails closed.
+
+Every mounted operation verifies unmount and helper cleanup before snapshot.
+Cache volumes have separate reachability and GC from rootfs step records.
+
+**Done when:** apt, compiler, Bundler, and Yarn cache-mount fixtures produce the
+same final image as BuildKit; cache contents survive intended rebuilds but are
+absent from every stage artifact; concurrent builds cannot corrupt a cache even
+when Spore serializes work that BuildKit could run concurrently.
+
+**Stop/go gate:** if cache mounts require broad multi-disk manifest or runtime
+format changes, stop and compare a build-local aggregate cache disk against the
+larger generic design. Do not expand spore manifests solely for build caches.
+
+### C4 — Safe ADD inputs
+
+**Estimate:** 3–5 weeks.
+
+- `ADD --checksum` for HTTPS URLs, followed by conservative mutable URL ADD;
+- local tar ADD through the existing bounded extraction model;
+- `--chmod`, ownership, excludes, link behavior, and destination rules shared
+  with COPY where Docker defines the same contract;
+- explicit rejection for remote Git sources, Git build contexts,
+  `--keep-git-dir`, and remote `--unpack`.
+
+**Done when:** remote/local ADD fixtures match BuildKit result semantics under
+redirects, errors, checksum mismatch, archives, ownership, merge, and cache
+rebuilds, while every unsupported Git/unpack form fails before network access.
+
+**Stop/go gate:** do not turn `ADD` into a source-control client or general
+remote archive service. A feature requiring Git credentials, submodules, SSH,
+or mutable repository semantics remains rejected.
+
+### C5 — Buildkite `ci` compatibility recipe
+
+**Estimate:** 2–4 weeks after C1–C4, mostly integration and discovered gaps.
+
+Maintain the smallest reviewed compatibility variant of the current Buildkite
+Dockerfile as an advanced acceptance workload. The expected delta removes the
+declared SSH mount while the resolved dependency inputs do not require it; any
+additional delta must correspond to another explicitly unsupported feature and
+remain outside SporeVM. The target closure still exercises:
+
+- standard syntax directive and automatic platform ARGs;
+- public remote bases and URL ADD;
+- target-pruned multi-stage inheritance;
+- cross-stage COPY and `--link`;
+- cache and bind RUN mounts;
+- RUN/COPY heredocs;
+- `--parents`, chmod, and multi-star globs;
+- large Bundler/Yarn/frontend/Rails steps and high `nofile` requirements.
+
+Validation compares the selected `ci` target's normalized filesystem and OCI
+config against BuildKit, runs representative Ruby/RSpec, Node/Yarn, and bktec
+probes, and verifies code-only changes reuse stable dependency stages. The
+upstream stable-runtime/committed-Docker-store path may continue in parallel as
+an operational benchmark, but no Buildkite-specific instruction or cache type
+enters SporeVM.
+
+**Done when:** `spore build --target ci -f <compatibility-Dockerfile>` builds on
+Linux ARM64, the compatibility diff stays minimal and auditable, the result
+passes the workload smoke, and cache invalidation is sound under source,
+lockfile, build-arg, and base changes.
+
+### C6 — Evidence-gated long tail
+
+No blanket parity milestone follows C5. Add features from real corpus failures:
+
+- registry Docker config, basic auth, and credential helpers;
+- ONBUILD only if representative image bases demonstrate material demand;
+- richer healthcheck and metadata edge cases;
+- standard frontend version updates.
+
+OCI layer output, registry publishing, cache import/export, remote shared cache,
+custom frontend images, labs features, secret/SSH mounts, remote Git inputs,
+privileged execution, and host integration stay outside this roadmap. A future
+named credential broker requires its own product and security plan.
 
 ## Verification
 
-Tests:
+### Frontend and planner
 
 - Parser: unit tests per instruction, substitution, continuations, comments;
   exact fail-closed error text for each unsupported feature; fuzz target.
@@ -1230,8 +1501,7 @@ Tests:
 - Equivalence: scripted file-tree diff (path, type, mode, uid/gid, size,
   symlink target) between spore-built and buildx-built rootfs.
 
-Instrumentation (extends the existing `SPOREVM_ROOTFS_BUILD_PROFILE`
-convention, same output shape):
+### Filesystem and configuration
 
 ```
 spore build profile: phase=parse ms=…
@@ -1248,7 +1518,7 @@ spore build profile: phase=publish ms=…
 spore build profile: phase=total ms=…
 ```
 
-Benchmark plan (M3, recorded in `docs/benchmarks.md`):
+### Cache
 
 | Scenario | Baseline (buildx+import) | Target |
 | --- | ---: | ---: |
@@ -1318,7 +1588,7 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
   that value during builder-owned substitution fails closed instead of
   silently substituting an empty string.
 
-## Open Questions
+## Deferred Decisions And Triggers
 
 - Capacity-at-import remains an optional optimization only if measurements show
   value. PREPARE is the product contract because it also covers existing local,

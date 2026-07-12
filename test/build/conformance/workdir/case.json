@@ -1,0 +1,16 @@
+{
+  "description": "relative WORKDIR resolution and directory creation match Docker",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 3,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle"
+  ]
+}

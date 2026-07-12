@@ -6,11 +6,32 @@ pub const Diagnostic = struct {
 };
 
 pub const Document = struct {
+    directives: Directives = .{},
+    global_args: []Instruction = &.{},
+    stages: []Stage = &.{},
+};
+
+pub const Directives = struct {
+    syntax: ?[]const u8 = null,
+    escape: u8 = '\\',
+};
+
+pub const Span = struct {
+    start_line: usize,
+    end_line: usize,
+};
+
+pub const Stage = struct {
+    index: usize,
+    span: Span,
+    from: Instruction,
+    name: ?[]const u8,
     instructions: []Instruction,
 };
 
 pub const Instruction = struct {
     line: usize,
+    span: Span,
     raw: []const u8,
     value: Value,
 
@@ -22,11 +43,14 @@ pub const Instruction = struct {
         arg: Arg,
         workdir: []const u8,
         cmd: Cmd,
+        entrypoint: Cmd,
     };
 };
 
 pub const From = struct {
     source: []const u8,
+    platform: ?[]const u8 = null,
+    name: ?[]const u8 = null,
 };
 
 pub const Run = struct {
@@ -34,6 +58,7 @@ pub const Run = struct {
 };
 
 pub const Copy = struct {
+    from: ?[]const u8 = null,
     sources: []const []const u8,
     dest: []const u8,
 };
@@ -59,17 +84,20 @@ pub const Cmd = union(enum) {
 
 const LogicalLine = struct {
     line: usize,
+    end_line: usize,
     text: []const u8,
 };
 
 const max_dockerfile_bytes = 1024 * 1024;
 const max_logical_line_bytes = 64 * 1024;
+const max_stages = 256;
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diagnostic: *Diagnostic) !Document {
     diagnostic.* = .{};
     if (bytes.len > max_dockerfile_bytes) return fail(diagnostic, 1, "Dockerfile is too large");
+    const directives = try parseDirectives(allocator, bytes, diagnostic);
     var lines = std.array_list.Managed(LogicalLine).init(allocator);
-    try logicalLines(allocator, bytes, &lines, diagnostic);
+    try logicalLines(allocator, bytes, directives.escape, &lines, diagnostic);
 
     var instructions = std.array_list.Managed(Instruction).init(allocator);
     for (lines.items) |line| {
@@ -79,10 +107,44 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diagnostic: *Diagn
         const op = trimmed[0..space];
         const rest = std.mem.trimStart(u8, trimmed[space..], " \t");
         const raw = try allocator.dupe(u8, trimmed);
-        const value = parseInstruction(allocator, line.line, op, rest, diagnostic) catch return error.DockerfileParseFailed;
-        try instructions.append(.{ .line = line.line, .raw = raw, .value = value });
+        const value = parseInstruction(allocator, line.line, op, rest, directives.escape, diagnostic) catch return error.DockerfileParseFailed;
+        try instructions.append(.{
+            .line = line.line,
+            .span = .{ .start_line = line.line, .end_line = line.end_line },
+            .raw = raw,
+            .value = value,
+        });
     }
-    return .{ .instructions = try instructions.toOwnedSlice() };
+    const owned = try instructions.toOwnedSlice();
+    var global_count: usize = 0;
+    while (global_count < owned.len and owned[global_count].value == .arg) : (global_count += 1) {}
+
+    var stages = std.array_list.Managed(Stage).init(allocator);
+    var cursor = global_count;
+    while (cursor < owned.len) {
+        if (owned[cursor].value != .from) return fail(diagnostic, owned[cursor].line, "Dockerfile instruction must follow FROM");
+        const start = cursor;
+        cursor += 1;
+        while (cursor < owned.len and owned[cursor].value != .from) : (cursor += 1) {}
+        const from = owned[start];
+        if (stages.items.len == max_stages) return fail(diagnostic, from.line, "Dockerfile has too many stages");
+        try stages.append(.{
+            .index = stages.items.len,
+            .span = .{
+                .start_line = from.span.start_line,
+                .end_line = if (cursor == start + 1) from.span.end_line else owned[cursor - 1].span.end_line,
+            },
+            .from = from,
+            .name = from.value.from.name,
+            .instructions = owned[start + 1 .. cursor],
+        });
+    }
+    if (stages.items.len == 0) return fail(diagnostic, 1, "Dockerfile requires at least one FROM instruction");
+    return .{
+        .directives = directives,
+        .global_args = owned[0..global_count],
+        .stages = try stages.toOwnedSlice(),
+    };
 }
 
 fn parseInstruction(
@@ -90,17 +152,36 @@ fn parseInstruction(
     line: usize,
     op: []const u8,
     rest: []const u8,
+    escape: u8,
     diagnostic: *Diagnostic,
 ) !Instruction.Value {
-    // RUN is shell input. Its expansions belong to /bin/sh in the guest, not
-    // to the Dockerfile substitution subset below.
-    if (!asciiEql(op, "RUN")) try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
     if (asciiEql(op, "FROM")) {
-        const args = try splitWords(allocator, rest, line, diagnostic);
-        if (args.len != 1) return fail(diagnostic, line, "unsupported FROM form; expected exactly `FROM <name>`");
-        if (std.mem.startsWith(u8, args[0], "--")) return fail(diagnostic, line, "unsupported FROM flag");
-        if (asciiEql(args[0], "AS")) return fail(diagnostic, line, "unsupported multi-stage FROM");
-        return .{ .from = .{ .source = args[0] } };
+        try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
+        const args = try splitWords(allocator, rest, escape, line, diagnostic);
+        if (args.len == 0) return fail(diagnostic, line, "FROM requires a source image");
+        var index: usize = 0;
+        var platform: ?[]const u8 = null;
+        if (std.mem.startsWith(u8, args[index], "--")) {
+            if (!std.mem.startsWith(u8, args[index], "--platform=") or args[index].len == "--platform=".len) {
+                return fail(diagnostic, line, "unsupported FROM flag");
+            }
+            platform = args[index]["--platform=".len..];
+            index += 1;
+        }
+        if (index >= args.len) return fail(diagnostic, line, "FROM requires a source image");
+        const source = args[index];
+        index += 1;
+        var name: ?[]const u8 = null;
+        if (index < args.len) {
+            if (!asciiEql(args[index], "AS") or index + 2 != args.len) {
+                return fail(diagnostic, line, "unsupported FROM form; expected `FROM [--platform=<platform>] <name> [AS <stage>]`");
+            }
+            if (!validStageName(args[index + 1])) return fail(diagnostic, line, "FROM AS has an invalid stage name");
+            name = args[index + 1];
+            index += 2;
+        }
+        if (index != args.len) return fail(diagnostic, line, "unsupported FROM form");
+        return .{ .from = .{ .source = source, .platform = platform, .name = name } };
     }
     if (asciiEql(op, "RUN")) {
         if (rest.len == 0) return fail(diagnostic, line, "RUN requires a shell command");
@@ -110,24 +191,39 @@ fn parseInstruction(
         return .{ .run = .{ .shell = try allocator.dupe(u8, rest) } };
     }
     if (asciiEql(op, "COPY")) {
+        try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
         if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported COPY heredoc");
-        const args = try splitWords(allocator, rest, line, diagnostic);
-        if (args.len < 2) return fail(diagnostic, line, "COPY requires at least one source and a destination");
-        for (args) |arg| {
+        const args = try splitWords(allocator, rest, escape, line, diagnostic);
+        var first_source: usize = 0;
+        var from: ?[]const u8 = null;
+        while (first_source < args.len and std.mem.startsWith(u8, args[first_source], "--")) : (first_source += 1) {
+            const arg = args[first_source];
+            if (std.mem.startsWith(u8, arg, "--from=") and arg.len > "--from=".len and from == null) {
+                from = arg["--from=".len..];
+                continue;
+            }
+            const flag = if (std.mem.indexOfScalar(u8, arg, '=')) |eq| arg[0..eq] else arg;
+            const message = try std.fmt.allocPrint(allocator, "unsupported COPY flag: {s}", .{flag});
+            return fail(diagnostic, line, message);
+        }
+        if (args.len - first_source < 2) return fail(diagnostic, line, "COPY requires at least one source and a destination");
+        for (args[first_source..]) |arg| {
             if (std.mem.startsWith(u8, arg, "--")) {
                 const flag = if (std.mem.indexOfScalar(u8, arg, '=')) |eq| arg[0..eq] else arg;
                 const message = try std.fmt.allocPrint(allocator, "unsupported COPY flag: {s}", .{flag});
                 return fail(diagnostic, line, message);
             }
         }
-        return .{ .copy = .{ .sources = args[0 .. args.len - 1], .dest = args[args.len - 1] } };
+        return .{ .copy = .{ .from = from, .sources = args[first_source .. args.len - 1], .dest = args[args.len - 1] } };
     }
     if (asciiEql(op, "ENV")) {
-        const pairs = try parseEnv(allocator, rest, line, diagnostic);
+        try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
+        const pairs = try parseEnv(allocator, rest, escape, line, diagnostic);
         return .{ .env = .{ .pairs = pairs } };
     }
     if (asciiEql(op, "ARG")) {
-        const args = try splitWords(allocator, rest, line, diagnostic);
+        try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
+        const args = try splitWords(allocator, rest, escape, line, diagnostic);
         if (args.len != 1) return fail(diagnostic, line, "ARG requires exactly one name or name=default");
         const eq = std.mem.indexOfScalar(u8, args[0], '=');
         const key = if (eq) |idx| args[0][0..idx] else args[0];
@@ -135,13 +231,18 @@ fn parseInstruction(
         return .{ .arg = .{ .key = key, .default = if (eq) |idx| args[0][idx + 1 ..] else null } };
     }
     if (asciiEql(op, "WORKDIR")) {
-        const args = try splitWords(allocator, rest, line, diagnostic);
+        try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
+        const args = try splitWords(allocator, rest, escape, line, diagnostic);
         if (args.len != 1) return fail(diagnostic, line, "WORKDIR requires exactly one path");
         return .{ .workdir = args[0] };
     }
     if (asciiEql(op, "CMD")) {
         if (rest.len == 0) return fail(diagnostic, line, "CMD requires a command");
         return .{ .cmd = try parseCmd(allocator, rest, line, diagnostic) };
+    }
+    if (asciiEql(op, "ENTRYPOINT")) {
+        if (rest.len == 0) return fail(diagnostic, line, "ENTRYPOINT requires a command");
+        return .{ .entrypoint = try parseCmd(allocator, rest, line, diagnostic) };
     }
     const message = try std.fmt.allocPrint(allocator, "unsupported Dockerfile instruction: {s}", .{op});
     diagnostic.* = .{ .line = line, .message = message };
@@ -151,6 +252,7 @@ fn parseInstruction(
 fn logicalLines(
     allocator: std.mem.Allocator,
     bytes: []const u8,
+    escape: u8,
     lines: *std.array_list.Managed(LogicalLine),
     diagnostic: *Diagnostic,
 ) !void {
@@ -162,32 +264,61 @@ fn logicalLines(
     while (it.next()) |raw_line| : (line_no += 1) {
         const line = std.mem.trimEnd(u8, raw_line, "\r");
         const trimmed_left = std.mem.trimStart(u8, line, " \t");
-        if (!continuing and trimmed_left.len == 0) continue;
-        if (!continuing and trimmed_left[0] == '#') {
-            if (isUnsupportedParserDirective(trimmed_left)) {
-                return fail(diagnostic, line_no, "unsupported Dockerfile parser directive");
-            }
-            continue;
-        }
+        if (trimmed_left.len == 0) continue;
+        if (trimmed_left[0] == '#') continue;
         if (!continuing) current_line = line_no;
         const trimmed_right = std.mem.trimEnd(u8, line, " \t");
-        const has_continuation = trimmed_right.len != 0 and trimmed_right[trimmed_right.len - 1] == '\\';
+        const has_continuation = trimmed_right.len != 0 and trimmed_right[trimmed_right.len - 1] == escape;
         const part = if (has_continuation) trimmed_right[0 .. trimmed_right.len - 1] else line;
         if (continuing) try current.append(' ');
         try current.appendSlice(part);
         if (current.items.len > max_logical_line_bytes) return fail(diagnostic, current_line, "Dockerfile logical line is too long");
         continuing = has_continuation;
         if (!continuing) {
-            try lines.append(.{ .line = current_line, .text = try current.toOwnedSlice() });
+            try lines.append(.{ .line = current_line, .end_line = line_no, .text = try current.toOwnedSlice() });
             current = std.array_list.Managed(u8).init(allocator);
         }
     }
     if (continuing) return fail(diagnostic, current_line, "unterminated Dockerfile line continuation");
 }
 
-fn isUnsupportedParserDirective(trimmed_left: []const u8) bool {
-    const body = std.mem.trimStart(u8, trimmed_left[1..], " \t");
-    return asciiStartsWith(body, "syntax=") or asciiStartsWith(body, "escape=");
+fn parseDirectives(allocator: std.mem.Allocator, bytes: []const u8, diagnostic: *Diagnostic) !Directives {
+    var directives: Directives = .{};
+    var saw_escape = false;
+    var line_no: usize = 1;
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |raw_line| : (line_no += 1) {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) break;
+        if (line[0] != '#') break;
+        const body = std.mem.trimStart(u8, line[1..], " \t");
+        if (asciiStartsWith(body, "syntax=")) {
+            if (directives.syntax != null) return fail(diagnostic, line_no, "duplicate syntax parser directive");
+            const value = std.mem.trim(u8, body["syntax=".len..], " \t");
+            if (value.len == 0) return fail(diagnostic, line_no, "syntax parser directive requires a value");
+            if (!supportedSyntaxDirective(value)) return fail(diagnostic, line_no, "unsupported Dockerfile syntax frontend");
+            directives.syntax = try allocator.dupe(u8, value);
+        } else if (asciiStartsWith(body, "escape=")) {
+            if (saw_escape) return fail(diagnostic, line_no, "duplicate escape parser directive");
+            const value = std.mem.trim(u8, body["escape=".len..], " \t");
+            if (value.len != 1 or (value[0] != '\\' and value[0] != '`')) {
+                return fail(diagnostic, line_no, "escape parser directive must be `\\` or ```");
+            }
+            directives.escape = value[0];
+            saw_escape = true;
+        } else break;
+    }
+    return directives;
+}
+
+fn supportedSyntaxDirective(value: []const u8) bool {
+    const normalized = if (std.mem.startsWith(u8, value, "docker.io/")) value["docker.io/".len..] else value;
+    const prefix = "docker/dockerfile:";
+    if (!std.mem.startsWith(u8, normalized, prefix)) return false;
+    const version = normalized[prefix.len..];
+    if (version.len == 0 or version[0] != '1') return false;
+    if (version.len == 1) return true;
+    return version[1] == '.' or version[1] == '@';
 }
 
 fn rejectUnsupportedVariableExpansion(input: []const u8, line: usize, diagnostic: *Diagnostic) !void {
@@ -218,10 +349,11 @@ fn rejectUnsupportedVariableExpansion(input: []const u8, line: usize, diagnostic
 fn parseEnv(
     allocator: std.mem.Allocator,
     rest: []const u8,
+    escape: u8,
     line: usize,
     diagnostic: *Diagnostic,
 ) ![]const Pair {
-    const words = try splitWords(allocator, rest, line, diagnostic);
+    const words = try splitWords(allocator, rest, escape, line, diagnostic);
     if (words.len == 0) return fail(diagnostic, line, "ENV requires at least one key/value pair");
     var pairs = std.array_list.Managed(Pair).init(allocator);
     var all_equals = true;
@@ -265,6 +397,7 @@ fn parseCmd(
 fn splitWords(
     allocator: std.mem.Allocator,
     input: []const u8,
+    escape: u8,
     line: usize,
     diagnostic: *Diagnostic,
 ) ![]const []const u8 {
@@ -282,7 +415,7 @@ fn splitWords(
                     quote = null;
                     continue;
                 }
-                if (c == '\\' and q == '"' and i + 1 < input.len) {
+                if (c == escape and q == '"' and i + 1 < input.len) {
                     i += 1;
                     try word.append(input[i]);
                     continue;
@@ -295,7 +428,7 @@ fn splitWords(
                 quote = c;
                 continue;
             }
-            if (c == '\\' and i + 1 < input.len) {
+            if (c == escape and i + 1 < input.len) {
                 i += 1;
                 try word.append(input[i]);
                 continue;
@@ -336,6 +469,16 @@ fn validName(name: []const u8) bool {
     return true;
 }
 
+fn validStageName(name: []const u8) bool {
+    if (name.len == 0 or !std.ascii.isAlphabetic(name[0])) return false;
+    var all_digits = true;
+    for (name) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-')) return false;
+        all_digits = all_digits and std.ascii.isDigit(c);
+    }
+    return !all_digits;
+}
+
 fn fail(diagnostic: *Diagnostic, line: usize, message: []const u8) error{DockerfileParseFailed} {
     diagnostic.* = .{ .line = line, .message = message };
     return error.DockerfileParseFailed;
@@ -369,8 +512,9 @@ test "Dockerfile parser accepts supported subset" {
         \\CMD ["/bin/sh","-c","echo ok"]
         \\
     , &diag);
-    try std.testing.expectEqual(@as(usize, 7), doc.instructions.len);
-    try std.testing.expectEqualStrings("base", doc.instructions[0].value.from.source);
+    try std.testing.expectEqual(@as(usize, 1), doc.stages.len);
+    try std.testing.expectEqual(@as(usize, 6), doc.stages[0].instructions.len);
+    try std.testing.expectEqualStrings("base", doc.stages[0].from.value.from.source);
 }
 
 test "Dockerfile parser fails closed on unsupported features" {
@@ -381,16 +525,108 @@ test "Dockerfile parser fails closed on unsupported features" {
     try std.testing.expectEqualStrings("unsupported RUN flag", diag.message);
 }
 
-test "Dockerfile parser rejects parser directives" {
+test "Dockerfile parser accepts standard parser directives" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var diag: Diagnostic = .{};
-    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "# syntax=docker/dockerfile:1\nFROM base\n", &diag));
-    try std.testing.expectEqualStrings("unsupported Dockerfile parser directive", diag.message);
-    try std.testing.expectEqual(@as(usize, 1), diag.line);
+    const syntax = try parse(arena_state.allocator(), "# syntax=docker/dockerfile:1\nFROM base\n", &diag);
+    try std.testing.expectEqualStrings("docker/dockerfile:1", syntax.directives.syntax.?);
+    try std.testing.expectEqual(@as(u8, '\\'), syntax.directives.escape);
 
-    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "# escape=`\nFROM base\n", &diag));
-    try std.testing.expectEqualStrings("unsupported Dockerfile parser directive", diag.message);
+    const escaped = try parse(arena_state.allocator(), "# escape=`\nFROM base`\n  AS final\n", &diag);
+    try std.testing.expectEqual(@as(u8, '`'), escaped.directives.escape);
+    try std.testing.expectEqualStrings("final", escaped.stages[0].name.?);
+    try std.testing.expectEqual(@as(usize, 2), escaped.stages[0].from.span.start_line);
+    try std.testing.expectEqual(@as(usize, 3), escaped.stages[0].from.span.end_line);
+
+    const literal_backslash = try parse(arena_state.allocator(), "# escape=`\nFROM base\nARG VALUE=left\\right\n", &diag);
+    try std.testing.expectEqualStrings("left\\right", literal_backslash.stages[0].instructions[0].value.arg.default.?);
+
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "# syntax=docker/dockerfile:labs\nFROM base\n", &diag));
+    try std.testing.expectEqualStrings("unsupported Dockerfile syntax frontend", diag.message);
+
+    const outside_window = try parse(arena_state.allocator(), "# ordinary comment\n# syntax=example/custom:latest\nFROM base\n", &diag);
+    try std.testing.expect(outside_window.directives.syntax == null);
+
+    const blank_closes_window = try parse(arena_state.allocator(), "# syntax=docker/dockerfile:1\n\n# escape=`\nFROM scratch\n", &diag);
+    try std.testing.expectEqual(@as(u8, '\\'), blank_closes_window.directives.escape);
+}
+
+test "Dockerfile parser removes comments inside continuations" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var diagnostic: Diagnostic = .{};
+
+    const default_escape = try parse(allocator,
+        \\FROM scratch
+        \\RUN echo one \
+        \\    # explain the next command
+        \\
+        \\    && echo two
+        \\
+    , &diagnostic);
+    const default_shell = default_escape.stages[0].instructions[0].value.run.shell;
+    try std.testing.expect(std.mem.indexOfScalar(u8, default_shell, '#') == null);
+    try std.testing.expect(std.mem.indexOf(u8, default_shell, "&& echo two") != null);
+
+    const backtick_crlf = "# escape=`\r\nFROM scratch\r\nRUN echo one `\r\n  # comment\r\n  && echo two\r\n";
+    const backtick_escape = try parse(allocator, backtick_crlf, &diagnostic);
+    const backtick_shell = backtick_escape.stages[0].instructions[0].value.run.shell;
+    try std.testing.expect(std.mem.indexOfScalar(u8, backtick_shell, '#') == null);
+    try std.testing.expect(std.mem.indexOf(u8, backtick_shell, "&& echo two") != null);
+}
+
+test "Dockerfile parser leaves command variables for runtime expansion" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diagnostic: Diagnostic = .{};
+    const document = try parse(arena_state.allocator(),
+        \\FROM scratch
+        \\ENTRYPOINT ["app", "$TOKEN"]
+        \\CMD echo "${VALUE:-default}"
+        \\
+    , &diagnostic);
+    try std.testing.expectEqualStrings("$TOKEN", document.stages[0].instructions[0].value.entrypoint.exec[1]);
+    try std.testing.expectEqualStrings("echo \"${VALUE:-default}\"", document.stages[0].instructions[1].value.cmd.shell);
+}
+
+test "Dockerfile parser rejects duplicate escape directives" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diagnostic: Diagnostic = .{};
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(),
+        \\# escape=\
+        \\# escape=`
+        \\FROM scratch
+        \\
+    , &diagnostic));
+    try std.testing.expectEqualStrings("duplicate escape parser directive", diagnostic.message);
+}
+
+test "Dockerfile parser emits source-spanned stages and typed cross-stage copies" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    const doc = try parse(arena_state.allocator(),
+        \\ARG BASE=base
+        \\FROM --platform=$BUILDPLATFORM ${BASE} AS build
+        \\RUN make /out/app
+        \\FROM scratch AS final
+        \\COPY --from=build /out/app /app
+        \\ENTRYPOINT ["/app"]
+        \\CMD ["serve"]
+        \\
+    , &diag);
+    try std.testing.expectEqual(@as(usize, 1), doc.global_args.len);
+    try std.testing.expectEqual(@as(usize, 2), doc.stages.len);
+    try std.testing.expectEqualStrings("build", doc.stages[0].name.?);
+    try std.testing.expectEqualStrings("$BUILDPLATFORM", doc.stages[0].from.value.from.platform.?);
+    try std.testing.expectEqualStrings("final", doc.stages[1].name.?);
+    try std.testing.expectEqualStrings("build", doc.stages[1].instructions[0].value.copy.from.?);
+    try std.testing.expect(doc.stages[1].instructions[1].value == .entrypoint);
+    try std.testing.expectEqual(@as(usize, 4), doc.stages[1].span.start_line);
+    try std.testing.expectEqual(@as(usize, 7), doc.stages[1].span.end_line);
 }
 
 test "Dockerfile parser leaves RUN shell expansion untouched" {
@@ -404,7 +640,7 @@ test "Dockerfile parser leaves RUN shell expansion untouched" {
     , &diag);
     try std.testing.expectEqualStrings(
         "echo $? $(dpkg --print-architecture) \"${VERSION_CODENAME}\" '$BUILD_ARG' $$",
-        doc.instructions[1].value.run.shell,
+        doc.stages[0].instructions[0].value.run.shell,
     );
 }
 
@@ -442,6 +678,25 @@ test "Dockerfile parser rejects ADD fail closed" {
     var diag: Diagnostic = .{};
     try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD a /dest\n", &diag));
     try std.testing.expectEqualStrings("unsupported Dockerfile instruction: ADD", diag.message);
+}
+
+test "unsupported instructions win over expansion diagnostics" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diagnostic: Diagnostic = .{};
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM scratch\nLABEL x=${A:-b}\n", &diagnostic));
+    try std.testing.expectEqualStrings("unsupported Dockerfile instruction: LABEL", diagnostic.message);
+}
+
+test "stage aliases must begin with an ASCII letter" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diagnostic: Diagnostic = .{};
+    inline for (.{ ".bad", "-bad", "_bad", "1bad" }) |name| {
+        const source = try std.fmt.allocPrint(arena_state.allocator(), "FROM scratch AS {s}\n", .{name});
+        try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), source, &diagnostic));
+        try std.testing.expectEqualStrings("FROM AS has an invalid stage name", diagnostic.message);
+    }
 }
 
 test "Dockerfile parser enforces production input bounds" {

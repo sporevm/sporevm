@@ -18,11 +18,13 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/vfs.h>
+#include <sys/xattr.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -75,9 +77,18 @@
 #define COPY_KIND_DIR 'D'
 #define COPY_KIND_SYMLINK 'L'
 #define COPY_KIND_END 'E'
+#define COPY_KIND_AUTO 'A'
+#define COPY_SOURCE_CONTEXT 0
+#define COPY_SOURCE_BUILD_INPUT 1
 #define MAX_BUILD_RUN_COMMAND_LEN 65536ULL
 #define MAX_BUILD_CONTEXT_COPY_ENTRIES 65536ULL
+#define BUILD_AGENT_FIXED_FD_BUDGET 256ULL
+#define BUILD_AGENT_FD_BUDGET (MAX_BUILD_CONTEXT_COPY_ENTRIES + BUILD_AGENT_FIXED_FD_BUDGET)
+#define MAX_COPY_XATTR_NAMES 512
+#define MAX_COPY_XATTR_VALUE 256
 #define BUILD_CONTEXT_ROOT "/mnt/build-context"
+#define BUILD_INPUT_ROOT "/mnt/build-inputs"
+#define MAX_BUILD_INPUT_DISKS 2
 #define SPORE_PF_KTHREAD 0x00200000UL
 #ifndef FIFREEZE
 #define FIFREEZE _IOWR('X', 119, int)
@@ -88,6 +99,11 @@
 #ifndef EXT4_IOC_RESIZE_FS
 #define EXT4_IOC_RESIZE_FS _IOW('f', 16, uint64_t)
 #endif
+#ifndef BLKGETSIZE64
+#define BLKGETSIZE64 _IOR(0x12, 114, size_t)
+#endif
+#define MAX_BUILD_NOFILE 1048576ULL
+#define MAX_BUILD_RESOLV_COMPONENTS 64
 /* Fixed offsets in the little-endian ext4 on-disk superblock, not a C ABI. */
 #define EXT4_PRIMARY_SUPER_OFFSET 1024
 #define EXT4_SUPER_SIZE 1024
@@ -119,6 +135,9 @@
 #endif
 #ifndef RESOLVE_IN_ROOT
 #define RESOLVE_IN_ROOT 0x10
+#endif
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
 #endif
 #define MAX_SYMLINK_DEPTH 40
 #define GEN_BASE 0x0c001000ULL
@@ -230,6 +249,21 @@ struct generation_monitor {
   uint64_t last_generation;
   int unavailable;
 };
+
+struct build_resolv_state {
+  int configured;
+  int mounted;
+  int scaffold;
+  int link_configured;
+  int created_file;
+  char link_path[1024];
+  char logical_target[512];
+  char mount_target[1024];
+  size_t created_dir_lens[MAX_BUILD_RESOLV_COMPONENTS];
+  size_t created_dir_count;
+};
+
+static struct build_resolv_state build_resolv;
 
 static int64_t now_ms(void) {
   struct timespec ts;
@@ -377,7 +411,7 @@ static int setup_rootfs_dev(char *error, size_t cap) {
 
 static int preflight_rootfs_growth_source(char *error, size_t cap);
 
-static int setup_rootfs(int writable, int growth_session, int noinit_itable, char *error, size_t cap) {
+static int setup_rootfs(int writable, int growth_session, int noinit_itable, int build_mode, char *error, size_t cap) {
   mkdir("/mnt", 0755);
   mkdir("/mnt/rootfs", 0755);
   if (growth_session && !writable) {
@@ -403,9 +437,11 @@ static int setup_rootfs(int writable, int growth_session, int noinit_itable, cha
   if (mount_if_dir("proc", "/mnt/rootfs/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, "", error, cap) != 0) return -1;
   if (mount_if_dir("sysfs", "/mnt/rootfs/sys", "sysfs", MS_RDONLY | MS_NOSUID | MS_NOEXEC | MS_NODEV, "", error, cap) != 0) return -1;
   mount_cgroup2_if_dir("/mnt/rootfs/sys/fs/cgroup");
-  if (mount_if_dir("tmpfs", "/mnt/rootfs/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755", error, cap) != 0) return -1;
-  if (mount_if_dir("tmpfs", "/mnt/rootfs/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777", error, cap) != 0) return -1;
-  if (copy_injected_files_to_rootfs(error, cap) != 0) return -1;
+  if (!build_mode) {
+    if (mount_if_dir("tmpfs", "/mnt/rootfs/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755", error, cap) != 0) return -1;
+    if (mount_if_dir("tmpfs", "/mnt/rootfs/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777", error, cap) != 0) return -1;
+    if (copy_injected_files_to_rootfs(error, cap) != 0) return -1;
+  }
   return 0;
 }
 
@@ -419,6 +455,40 @@ static int setup_build_context(char *error, size_t cap) {
   if (mount("/dev/vdb", BUILD_CONTEXT_ROOT, "ext4", MS_RDONLY, "noload") != 0) {
     snprintf(error, cap, "build context mount failed: path=/dev/vdb target=%s errno=%d", BUILD_CONTEXT_ROOT, errno);
     return -1;
+  }
+  return 0;
+}
+
+static int resolve_build_input_count(const char *buf) {
+  const char *key = "spore_build_inputs=";
+  const char *p = strstr(buf, key);
+  if (p == NULL) return 0;
+  p += strlen(key);
+  char *end = NULL;
+  unsigned long value = strtoul(p, &end, 10);
+  if (end == p || value > MAX_BUILD_INPUT_DISKS) return -1;
+  return (int)value;
+}
+
+static int setup_build_inputs(int count, int has_context, char *error, size_t cap) {
+  mkdir("/mnt", 0755);
+  mkdir(BUILD_INPUT_ROOT, 0755);
+  for (int i = 0; i < count; i++) {
+    char device[32];
+    char target[64];
+    int letter = 'b' + has_context + i;
+    int dn = snprintf(device, sizeof(device), "/dev/vd%c", letter);
+    int tn = snprintf(target, sizeof(target), "%s/%d", BUILD_INPUT_ROOT, i);
+    if (dn <= 0 || (size_t)dn >= sizeof(device) || tn <= 0 || (size_t)tn >= sizeof(target)) return -1;
+    mkdir(target, 0755);
+    if (wait_for_path(device, 100, 50000) != 0) {
+      snprintf(error, cap, "build input block device not found: index=%d path=%s", i, device);
+      return -1;
+    }
+    if (mount(device, target, "ext4", MS_RDONLY, "noload") != 0) {
+      snprintf(error, cap, "build input mount failed: index=%d path=%s target=%s errno=%d", i, device, target, errno);
+      return -1;
+    }
   }
   return 0;
 }
@@ -511,7 +581,225 @@ static int prepare_rootfs_resolv_targets(void) {
   return 0;
 }
 
-static int bind_rootfs_resolv(char *error, size_t cap) {
+static ssize_t readlink_bounded(const char *path, char *out, size_t cap) {
+  if (cap < 2) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  ssize_t len = readlink(path, out, cap);
+  if (len <= 0) return -1;
+  if ((size_t)len == cap) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  out[len] = '\0';
+  return len;
+}
+
+static ssize_t readlinkat_bounded(int dir_fd, const char *path, char *out, size_t cap) {
+  if (cap < 2) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  ssize_t len = readlinkat(dir_fd, path, out, cap);
+  if (len <= 0) return -1;
+  if ((size_t)len == cap) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  out[len] = '\0';
+  return len;
+}
+
+static int existing_rootfs_symlink_target(const char *link_path, char *out, size_t cap) {
+  char target[512];
+  if (readlink_bounded(link_path, target, sizeof(target)) < 0) return -1;
+
+  char candidate[1024];
+  int written = target[0] == '/'
+      ? snprintf(candidate, sizeof(candidate), "/mnt/rootfs%s", target)
+      : snprintf(candidate, sizeof(candidate), "/mnt/rootfs/etc/%s", target);
+  if (written <= 0 || (size_t)written >= sizeof(candidate)) return -1;
+
+  char resolved[1024];
+  if (realpath(candidate, resolved) == NULL) return -1;
+  const char prefix[] = "/mnt/rootfs";
+  size_t prefix_len = sizeof(prefix) - 1;
+  if (strncmp(resolved, prefix, prefix_len) != 0 || resolved[prefix_len] != '/') return -1;
+  struct stat root_st;
+  struct stat st;
+  if (stat("/mnt/rootfs", &root_st) != 0) return -1;
+  if (stat(resolved, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+  if (st.st_dev != root_st.st_dev) return -1;
+  written = snprintf(out, cap, "%s", resolved);
+  return written > 0 && (size_t)written < cap ? 0 : -1;
+}
+
+static void pop_build_resolv_component(char *path) {
+  char *slash = strrchr(path, '/');
+  if (slash == NULL) {
+    path[0] = '\0';
+  } else {
+    *slash = '\0';
+  }
+}
+
+static int append_build_resolv_component(char *path, size_t cap, const char *component) {
+  size_t len = strlen(path);
+  size_t component_len = strlen(component);
+  if (component_len == 0 || len + (len == 0 ? 0 : 1) + component_len >= cap) return -1;
+  if (len != 0) path[len++] = '/';
+  memcpy(path + len, component, component_len + 1);
+  return 0;
+}
+
+static int normalize_build_resolv_target(const char *raw_target, struct build_resolv_state *state) {
+  size_t raw_len = strlen(raw_target);
+  if (raw_len == 0 || raw_target[raw_len - 1] == '/') return -1;
+  char pending[512];
+  int written = snprintf(pending, sizeof(pending), "%s", raw_target);
+  if (written <= 0 || (size_t)written >= sizeof(pending)) return -1;
+
+  state->logical_target[0] = '\0';
+  if (raw_target[0] != '/') {
+    snprintf(state->logical_target, sizeof(state->logical_target), "%s", "etc");
+  }
+  char *save = NULL;
+  for (char *component = strtok_r(pending, "/", &save); component != NULL; component = strtok_r(NULL, "/", &save)) {
+    if (strcmp(component, ".") == 0) continue;
+    if (strcmp(component, "..") == 0) {
+      pop_build_resolv_component(state->logical_target);
+      continue;
+    }
+    if (append_build_resolv_component(state->logical_target, sizeof(state->logical_target), component) != 0) return -1;
+  }
+  if (state->logical_target[0] == '\0') return -1;
+  written = snprintf(state->mount_target, sizeof(state->mount_target), "/mnt/rootfs/%s", state->logical_target);
+  return written > 0 && (size_t)written < sizeof(state->mount_target) ? 0 : -1;
+}
+
+static int cleanup_build_resolv_scaffold(struct build_resolv_state *state) {
+  int rc = 0;
+  if (state->created_file) {
+    if (unlink(state->mount_target) != 0 && errno != ENOENT) rc = -1;
+    state->created_file = 0;
+  }
+  for (size_t i = state->created_dir_count; i > 0; i--) {
+    char path[sizeof(state->mount_target)];
+    size_t len = state->created_dir_lens[i - 1];
+    if (len == 0 || len >= sizeof(path)) {
+      rc = -1;
+      continue;
+    }
+    memcpy(path, state->mount_target, len);
+    path[len] = '\0';
+    if (rmdir(path) != 0 && errno != ENOENT && errno != ENOTEMPTY && errno != EEXIST) rc = -1;
+  }
+  state->created_dir_count = 0;
+  return rc;
+}
+
+static int prepare_build_resolv_scaffold(struct build_resolv_state *state) {
+  if (!state->scaffold) return 0;
+  state->created_file = 0;
+  state->created_dir_count = 0;
+
+  char logical[sizeof(state->logical_target)];
+  snprintf(logical, sizeof(logical), "%s", state->logical_target);
+  char *components[MAX_BUILD_RESOLV_COMPONENTS];
+  size_t component_count = 0;
+  char *save = NULL;
+  for (char *component = strtok_r(logical, "/", &save); component != NULL; component = strtok_r(NULL, "/", &save)) {
+    if (component_count == MAX_BUILD_RESOLV_COMPONENTS) return -1;
+    components[component_count++] = component;
+  }
+  if (component_count == 0) return -1;
+
+  char path[sizeof(state->mount_target)];
+  snprintf(path, sizeof(path), "%s", "/mnt/rootfs");
+  struct stat root_st;
+  if (stat(path, &root_st) != 0) return -1;
+  for (size_t i = 0; i < component_count; i++) {
+    size_t len = strlen(path);
+    int written = snprintf(path + len, sizeof(path) - len, "/%s", components[i]);
+    if (written <= 0 || (size_t)written >= sizeof(path) - len) goto fail;
+
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+      if (st.st_dev != root_st.st_dev) goto fail;
+      if (i + 1 == component_count) {
+        if (!S_ISREG(st.st_mode)) goto fail;
+      } else if (!S_ISDIR(st.st_mode)) {
+        goto fail;
+      }
+      continue;
+    }
+    if (errno != ENOENT) goto fail;
+    if (i + 1 == component_count) {
+      int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+      if (fd < 0) goto fail;
+      state->created_file = 1;
+      if (close(fd) != 0) goto fail;
+    } else {
+      if (mkdir(path, 0755) != 0) goto fail;
+      state->created_dir_lens[state->created_dir_count++] = strlen(path);
+    }
+  }
+  return 0;
+
+fail:
+  (void)cleanup_build_resolv_scaffold(state);
+  return -1;
+}
+
+static int mount_build_resolv(struct build_resolv_state *state) {
+  if (!state->configured || state->mounted) return 0;
+  if (state->link_configured) {
+    struct stat st;
+    char target[512];
+    struct build_resolv_state current;
+    memset(&current, 0, sizeof(current));
+    if (lstat(state->link_path, &st) != 0 || !S_ISLNK(st.st_mode) ||
+        readlink_bounded(state->link_path, target, sizeof(target)) < 0 ||
+        normalize_build_resolv_target(target, &current) != 0 ||
+        strcmp(current.logical_target, state->logical_target) != 0 ||
+        strcmp(current.mount_target, state->mount_target) != 0) {
+      return -1;
+    }
+  }
+  if (prepare_build_resolv_scaffold(state) != 0) return -1;
+  if (mount("/run/sporevm/resolv.conf", state->mount_target, NULL, MS_BIND, NULL) != 0) {
+    (void)cleanup_build_resolv_scaffold(state);
+    return -1;
+  }
+  state->mounted = 1;
+  return 0;
+}
+
+static int unmount_build_resolv_for_snapshot(struct build_resolv_state *state) {
+  if (!state->configured || !state->mounted) return 0;
+  if (umount(state->mount_target) != 0) return -1;
+  state->mounted = 0;
+  return cleanup_build_resolv_scaffold(state);
+}
+
+static int configure_build_resolv_symlink(const char *link_path, struct build_resolv_state *state) {
+  int link_written = snprintf(state->link_path, sizeof(state->link_path), "%s", link_path);
+  if (link_written <= 0 || (size_t)link_written >= sizeof(state->link_path)) return -1;
+  state->link_configured = 1;
+  char target[512];
+  if (existing_rootfs_symlink_target(link_path, state->mount_target, sizeof(state->mount_target)) == 0) {
+    state->scaffold = 0;
+  } else {
+    if (readlink_bounded(link_path, target, sizeof(target)) < 0) return -1;
+    if (normalize_build_resolv_target(target, state) != 0) return -1;
+    state->scaffold = 1;
+  }
+  state->configured = 1;
+  return mount_build_resolv(state);
+}
+
+static int bind_rootfs_resolv(int build_mode, char *error, size_t cap) {
   if (!path_is_dir("/mnt/rootfs/etc")) {
     snprintf(error, cap, "network setup failed: rootfs /etc missing");
     return -1;
@@ -521,7 +809,38 @@ static int bind_rootfs_resolv(char *error, size_t cap) {
     snprintf(error, cap, "network setup failed: rootfs /etc/resolv.conf missing");
     return -1;
   }
-  if (S_ISLNK(st.st_mode)) return 0;
+  if (build_mode) {
+    if (write_resolv_conf_path("/run/sporevm/resolv.conf") != 0) {
+      snprintf(error, cap, "network setup failed: refresh build resolver source errno=%d", errno);
+      return -1;
+    }
+    memset(&build_resolv, 0, sizeof(build_resolv));
+    int rc = -1;
+    if (S_ISLNK(st.st_mode)) {
+      rc = configure_build_resolv_symlink("/mnt/rootfs/etc/resolv.conf", &build_resolv);
+    } else if (S_ISREG(st.st_mode)) {
+      struct stat root_st;
+      if (stat("/mnt/rootfs", &root_st) == 0 && st.st_dev == root_st.st_dev) {
+        int written = snprintf(build_resolv.mount_target, sizeof(build_resolv.mount_target), "%s", "/mnt/rootfs/etc/resolv.conf");
+        if (written > 0 && (size_t)written < sizeof(build_resolv.mount_target)) {
+          build_resolv.configured = 1;
+          rc = mount_build_resolv(&build_resolv);
+        }
+      }
+    }
+    if (rc != 0) {
+      snprintf(error, cap, "network setup failed: build rootfs resolv target unavailable errno=%d", errno);
+      return -1;
+    }
+    return 0;
+  }
+  if (S_ISLNK(st.st_mode)) {
+    if (prepare_rootfs_resolv_targets() != 0) {
+      snprintf(error, cap, "network setup failed: rootfs resolv target errno=%d", errno);
+      return -1;
+    }
+    return 0;
+  }
   if (prepare_rootfs_resolv_targets() != 0) {
     snprintf(error, cap, "network setup failed: rootfs resolv target errno=%d", errno);
     return -1;
@@ -533,7 +852,7 @@ static int bind_rootfs_resolv(char *error, size_t cap) {
   return 0;
 }
 
-static int setup_network(int use_rootfs, char *error, size_t cap) {
+static int setup_network(int use_rootfs, int build_mode, char *error, size_t cap) {
   int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     snprintf(error, cap, "network setup failed: socket errno=%d", errno);
@@ -579,7 +898,7 @@ static int setup_network(int use_rootfs, char *error, size_t cap) {
       snprintf(error, cap, "network setup failed: write rootfs resolv source errno=%d", errno);
       return -1;
     }
-    if (bind_rootfs_resolv(error, cap) != 0) return -1;
+    if (bind_rootfs_resolv(build_mode, error, cap) != 0) return -1;
   }
   return 0;
 }
@@ -1553,8 +1872,12 @@ struct run_request {
   char copy_dest[MAX_COPY_PATH_LEN + 1];
   uint64_t copy_entry_count;
   int copy_source_kind;
+  int copy_source_disk;
+  uint64_t copy_input_index;
   int copy_dest_is_dir;
   uint64_t build_command_len;
+  uint64_t nofile_soft;
+  uint64_t nofile_hard;
   char arg_storage[MAX_ARG_STORAGE];
   char *argv[MAX_ARGC + 1];
   char env_storage[MAX_ENVC][MAX_ENV_LEN];
@@ -1666,9 +1989,10 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
     } else if (strcmp(type, "spore-build-run-v1") == 0) {
       out->kind = REQUEST_BUILD_RUN;
       out->protocol_v1 = 1;
-    } else if (strcmp(type, "spore-build-copy-v2") == 0) {
+    } else if (strcmp(type, "spore-build-copy-v2") == 0 || strcmp(type, "spore-build-copy-v3") == 0) {
       out->kind = REQUEST_BUILD_COPY;
       out->protocol_v1 = 1;
+      out->copy_source_disk = COPY_SOURCE_CONTEXT;
     } else if (strcmp(type, "spore-build-workdir-v1") == 0) {
       out->kind = REQUEST_BUILD_WORKDIR;
       out->protocol_v1 = 1;
@@ -1726,6 +2050,11 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
     int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
     if (working_dir_rc < 0) return -1;
     if (working_dir_rc == 0) out->working_dir[0] = '\0';
+    int nofile_soft_rc = parse_u64_field(req, "nofile_soft", &out->nofile_soft);
+    int nofile_hard_rc = parse_u64_field(req, "nofile_hard", &out->nofile_hard);
+    if (nofile_soft_rc <= 0 || nofile_hard_rc <= 0 ||
+        out->nofile_soft == 0 || out->nofile_soft > out->nofile_hard ||
+        out->nofile_hard > MAX_BUILD_NOFILE) return -1;
   }
   if (out->kind == REQUEST_BUILD_WORKDIR) {
     int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
@@ -1745,6 +2074,8 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
       out->copy_source_kind = COPY_KIND_FILE;
     } else if (strcmp(source_kind, "sym_link") == 0) {
       out->copy_source_kind = COPY_KIND_SYMLINK;
+    } else if (strcmp(source_kind, "auto") == 0) {
+      out->copy_source_kind = COPY_KIND_AUTO;
     } else {
       return -1;
     }
@@ -1756,6 +2087,26 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
     int count_rc = parse_u64_field(req, "entry_count", &entry_count);
     if (count_rc <= 0 || entry_count > MAX_BUILD_CONTEXT_COPY_ENTRIES) return -1;
     out->copy_entry_count = entry_count;
+    char source_disk[24];
+    int source_disk_rc = parse_string_field(req, "source_disk", source_disk, sizeof(source_disk));
+    if (source_disk_rc > 0) {
+      if (strcmp(source_disk, "context") == 0) {
+        out->copy_source_disk = COPY_SOURCE_CONTEXT;
+      } else if (strcmp(source_disk, "build_input") == 0) {
+        out->copy_source_disk = COPY_SOURCE_BUILD_INPUT;
+      } else {
+        return -1;
+      }
+    } else if (source_disk_rc < 0) {
+      return -1;
+    }
+    int input_index_rc = parse_u64_field(req, "input_index", &out->copy_input_index);
+    if (input_index_rc < 0 || out->copy_input_index >= MAX_BUILD_INPUT_DISKS) return -1;
+    if (out->copy_source_disk == COPY_SOURCE_CONTEXT) {
+      if (out->copy_source_kind == COPY_KIND_AUTO || out->copy_entry_count == 0 || out->copy_input_index != 0) return -1;
+    } else {
+      if (out->copy_source_kind != COPY_KIND_AUTO || out->copy_entry_count != 0 || input_index_rc <= 0) return -1;
+    }
   }
   if (out->protocol_v1 && (out->kind == REQUEST_START || out->kind == REQUEST_ATTACH)) {
     char stdio[16];
@@ -2625,6 +2976,8 @@ static int ensure_parent_dirs(int root_fd, const char *path) {
   return 0;
 }
 
+static int reject_security_xattrs_at(int parent_fd, const char *name);
+
 static int prepare_overwrite_path(int root_fd, const char *path, int allow_existing_dir) {
   char name[MAX_COPY_PATH_LEN + 1];
   int parent_fd = confined_parent_fd(root_fd, path, name, sizeof(name));
@@ -2635,6 +2988,12 @@ static int prepare_overwrite_path(int root_fd, const char *path, int allow_exist
     close(parent_fd);
     errno = saved;
     return errno == ENOENT ? 0 : -1;
+  }
+  if (reject_security_xattrs_at(parent_fd, name) != 0) {
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return -1;
   }
   if (S_ISDIR(st.st_mode)) {
     if (close(parent_fd) != 0) return -1;
@@ -2647,22 +3006,336 @@ static int prepare_overwrite_path(int root_fd, const char *path, int allow_exist
   return rc;
 }
 
-static int apply_context_copy_dir(int root_fd, const char *path, mode_t mode) {
+struct supported_copy_xattrs {
+  int has_capability;
+  size_t capability_len;
+  unsigned char capability[MAX_COPY_XATTR_VALUE];
+};
+
+// The only accepted security namespace entry is a capability attached to a
+// regular source file. Directory/symlink sources and every pre-existing
+// destination must reject all visible security.* metadata.
+static int copy_security_xattr_allowed(int regular_source, int existing_destination, const char *name) {
+  if (strncmp(name, "security.", 9) != 0) return 1;
+  return regular_source && !existing_destination && strcmp(name, "security.capability") == 0;
+}
+
+static int read_supported_xattrs(int source_fd, struct supported_copy_xattrs *out) {
+  memset(out, 0, sizeof(*out));
+  char names[MAX_COPY_XATTR_NAMES + 1];
+  ssize_t names_len = flistxattr(source_fd, names, sizeof(names));
+  if (names_len < 0) return -1;
+  if ((size_t)names_len > MAX_COPY_XATTR_NAMES) {
+    errno = E2BIG;
+    return -1;
+  }
+  for (size_t offset = 0; offset < (size_t)names_len;) {
+    const char *name = names + offset;
+    size_t remaining = (size_t)names_len - offset;
+    size_t name_len = strnlen(name, remaining);
+    if (name_len == remaining) {
+      errno = EIO;
+      return -1;
+    }
+    if (strncmp(name, "security.", 9) == 0) {
+      if (!copy_security_xattr_allowed(1, 0, name)) {
+        errno = EOPNOTSUPP;
+        return -1;
+      }
+      ssize_t value_len = fgetxattr(source_fd, name, out->capability, sizeof(out->capability));
+      if (value_len < 0) return -1;
+      if ((size_t)value_len > sizeof(out->capability)) {
+        errno = E2BIG;
+        return -1;
+      }
+      out->has_capability = 1;
+      out->capability_len = (size_t)value_len;
+    }
+    offset += name_len + 1;
+  }
+  return 0;
+}
+
+static int apply_supported_xattrs(int dest_fd, const struct supported_copy_xattrs *attrs) {
+  if (!attrs->has_capability) return 0;
+  return fsetxattr(dest_fd, "security.capability", attrs->capability, attrs->capability_len, 0);
+}
+
+static int reject_security_xattrs_at(int parent_fd, const char *name) {
+  char path[MAX_COPY_PATH_LEN + 64];
+  int path_len = snprintf(path, sizeof(path), "/proc/self/fd/%d/%s", parent_fd, name);
+  if (path_len <= 0 || (size_t)path_len >= sizeof(path)) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  char names[MAX_COPY_XATTR_NAMES + 1];
+  ssize_t names_len = llistxattr(path, names, sizeof(names));
+  if (names_len < 0) return -1;
+  if ((size_t)names_len > MAX_COPY_XATTR_NAMES) {
+    errno = E2BIG;
+    return -1;
+  }
+  for (size_t offset = 0; offset < (size_t)names_len;) {
+    const char *xattr_name = names + offset;
+    size_t remaining = (size_t)names_len - offset;
+    size_t name_len = strnlen(xattr_name, remaining);
+    if (name_len == remaining) {
+      errno = EIO;
+      return -1;
+    }
+    if (!copy_security_xattr_allowed(0, 0, xattr_name)) {
+      errno = EOPNOTSUPP;
+      return -1;
+    }
+    offset += name_len + 1;
+  }
+  return 0;
+}
+
+static int reject_security_xattrs_fd(int fd) {
+  char names[MAX_COPY_XATTR_NAMES + 1];
+  ssize_t names_len = flistxattr(fd, names, sizeof(names));
+  if (names_len < 0) return -1;
+  if ((size_t)names_len > MAX_COPY_XATTR_NAMES) {
+    errno = E2BIG;
+    return -1;
+  }
+  for (size_t offset = 0; offset < (size_t)names_len;) {
+    const char *name = names + offset;
+    size_t remaining = (size_t)names_len - offset;
+    size_t name_len = strnlen(name, remaining);
+    if (name_len == remaining) {
+      errno = EIO;
+      return -1;
+    }
+    if (!copy_security_xattr_allowed(0, 0, name)) {
+      errno = EOPNOTSUPP;
+      return -1;
+    }
+    offset += name_len + 1;
+  }
+  return 0;
+}
+
+static int set_fd_mtime(int fd, const struct stat *source_stat) {
+  struct timespec times[2] = {
+    { .tv_sec = 0, .tv_nsec = UTIME_OMIT },
+    source_stat->st_mtim,
+  };
+  return futimens(fd, times);
+}
+
+static int set_symlink_mtime(int parent_fd, const char *name, const struct stat *source_stat) {
+  struct timespec times[2] = {
+    { .tv_sec = 0, .tv_nsec = UTIME_OMIT },
+    source_stat->st_mtim,
+  };
+  return utimensat(parent_fd, name, times, AT_SYMLINK_NOFOLLOW);
+}
+
+static int set_path_mtime(int root_fd, const char *path, const struct stat *source_stat) {
+  int fd = confined_open_existing(root_fd, path, O_RDONLY | O_DIRECTORY);
+  if (fd < 0) return -1;
+  int rc = set_fd_mtime(fd, source_stat);
+  int saved = errno;
+  if (close(fd) != 0 && rc == 0) rc = -1;
+  errno = saved;
+  return rc;
+}
+
+struct copied_hardlink {
+  dev_t dev;
+  ino_t ino;
+  int dest_fd;
+};
+
+struct copy_tree_state {
+  uint64_t expected_entries;
+  uint64_t seen_entries;
+  struct copied_hardlink *hardlinks;
+  size_t hardlink_count;
+  size_t hardlink_capacity;
+};
+
+static void copy_tree_state_deinit(struct copy_tree_state *state) {
+  for (size_t i = 0; i < state->hardlink_count; i++) close(state->hardlinks[i].dest_fd);
+  free(state->hardlinks);
+  memset(state, 0, sizeof(*state));
+}
+
+static int apply_existing_hardlink(int root_fd, const struct stat *source_stat, const char *dest_path, struct copy_tree_state *state) {
+  if (source_stat->st_nlink < 2) return 0;
+  int existing_fd = -1;
+  for (size_t i = 0; i < state->hardlink_count; i++) {
+    if (state->hardlinks[i].dev == source_stat->st_dev && state->hardlinks[i].ino == source_stat->st_ino) {
+      existing_fd = state->hardlinks[i].dest_fd;
+      break;
+    }
+  }
+  if (existing_fd < 0) return 0;
+  if (ensure_parent_dirs(root_fd, dest_path) != 0 || prepare_overwrite_path(root_fd, dest_path, 0) != 0) return -1;
+
+  char dest_name[MAX_COPY_PATH_LEN + 1];
+  int dest_parent_fd = confined_parent_fd(root_fd, dest_path, dest_name, sizeof(dest_name));
+  if (dest_parent_fd < 0) return -1;
+  int rc = linkat(existing_fd, "", dest_parent_fd, dest_name, AT_EMPTY_PATH);
+  int saved = errno;
+  if (close(dest_parent_fd) != 0 && rc == 0) rc = -1;
+  errno = saved;
+  return rc == 0 ? 1 : -1;
+}
+
+static int record_hardlink(const struct stat *source_stat, int dest_fd, struct copy_tree_state *state) {
+  if (source_stat->st_nlink < 2) return 0;
+  if (state->hardlink_count >= state->hardlink_capacity) {
+    if (state->hardlink_capacity >= MAX_BUILD_CONTEXT_COPY_ENTRIES) {
+      errno = E2BIG;
+      return -1;
+    }
+    size_t next_capacity = state->hardlink_capacity == 0 ? 8 : state->hardlink_capacity * 2;
+    if (next_capacity > MAX_BUILD_CONTEXT_COPY_ENTRIES) next_capacity = MAX_BUILD_CONTEXT_COPY_ENTRIES;
+    struct copied_hardlink *grown = realloc(state->hardlinks, next_capacity * sizeof(*grown));
+    if (grown == NULL) return -1;
+    state->hardlinks = grown;
+    state->hardlink_capacity = next_capacity;
+  }
+  int owned_fd = fcntl(dest_fd, F_DUPFD_CLOEXEC, 0);
+  if (owned_fd < 0) return -1;
+  state->hardlinks[state->hardlink_count++] = (struct copied_hardlink){
+    .dev = source_stat->st_dev,
+    .ino = source_stat->st_ino,
+    .dest_fd = owned_fd,
+  };
+  return 0;
+}
+
+static int apply_context_copy_dir(int root_fd, const char *path, mode_t mode, uid_t uid, gid_t gid) {
   if (ensure_parent_dirs(root_fd, path) != 0) return -1;
   char name[MAX_COPY_PATH_LEN + 1];
   int parent_fd = confined_parent_fd(root_fd, path, name, sizeof(name));
   if (parent_fd < 0) return -1;
-  int rc = mkdirat(parent_fd, name, mode & 07777);
-  if (rc != 0 && errno == EEXIST) rc = 0;
+
+  struct stat existing;
+  int exists = fstatat(parent_fd, name, &existing, AT_SYMLINK_NOFOLLOW) == 0;
+  if (exists && reject_security_xattrs_at(parent_fd, name) != 0) {
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return -1;
+  }
+  if (!exists && errno != ENOENT) {
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return -1;
+  }
+
+  int dir_fd = -1;
+  if (exists) {
+    // Docker directory COPY merges through an existing confined symlink to a
+    // directory. Validate both the path inode above and the actual directory
+    // inode before changing its metadata or copying children into it.
+    dir_fd = confined_open_existing(root_fd, path, O_RDONLY | O_DIRECTORY);
+    if (dir_fd >= 0 && reject_security_xattrs_fd(dir_fd) != 0) {
+      int saved = errno;
+      close(dir_fd);
+      close(parent_fd);
+      errno = saved;
+      return -1;
+    }
+  }
+
+  if (dir_fd < 0) {
+    if (exists) {
+      if (prepare_overwrite_path(root_fd, path, 1) != 0) {
+        int saved = errno;
+        close(parent_fd);
+        errno = saved;
+        return -1;
+      }
+    }
+    int rc = mkdirat(parent_fd, name, mode & 07777);
+    if (rc != 0 && errno != EEXIST) {
+      int saved = errno;
+      close(parent_fd);
+      errno = saved;
+      return -1;
+    }
+    dir_fd = confined_open_existing(root_fd, path, O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0 || reject_security_xattrs_fd(dir_fd) != 0) {
+      int saved = errno;
+      if (dir_fd >= 0) close(dir_fd);
+      close(parent_fd);
+      errno = saved;
+      return -1;
+    }
+  }
+
+  int rc = fchown(dir_fd, uid, gid);
+  if (rc == 0) rc = fchmod(dir_fd, mode & 07777);
+  int saved = errno;
+  if (close(dir_fd) != 0 && rc == 0) return -1;
+  if (close(parent_fd) != 0 && rc == 0) return -1;
+  errno = saved;
+  return rc;
+}
+
+static int ensure_context_copy_root_dir(int root_fd, const char *path) {
+  if (strcmp(path, "/") == 0) {
+    if (reject_security_xattrs_fd(root_fd) != 0) return -1;
+    return 0;
+  }
+  if (ensure_parent_dirs(root_fd, path) != 0) return -1;
+
+  char name[MAX_COPY_PATH_LEN + 1];
+  int parent_fd = confined_parent_fd(root_fd, path, name, sizeof(name));
+  if (parent_fd < 0) return -1;
+  struct stat existing;
+  int exists = fstatat(parent_fd, name, &existing, AT_SYMLINK_NOFOLLOW) == 0;
+  if (exists && reject_security_xattrs_at(parent_fd, name) != 0) {
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return -1;
+  }
+  if (!exists && errno != ENOENT) {
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return -1;
+  }
+
+  int existing_fd = confined_open_existing(root_fd, path, O_RDONLY | O_DIRECTORY);
+  if (existing_fd >= 0) {
+    int rc = reject_security_xattrs_fd(existing_fd);
+    int saved = errno;
+    if (close(existing_fd) != 0 && rc == 0) rc = -1;
+    if (close(parent_fd) != 0 && rc == 0) rc = -1;
+    errno = saved;
+    return rc;
+  }
+  if (exists && prepare_overwrite_path(root_fd, path, 1) != 0) {
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return -1;
+  }
+
+  int rc = mkdirat(parent_fd, name, 0700);
   int saved = errno;
   if (close(parent_fd) != 0 && rc == 0) return -1;
   errno = saved;
-  if (rc != 0) return rc;
+  if (rc != 0) {
+    if (errno != EEXIST) return -1;
+    existing_fd = confined_open_existing(root_fd, path, O_RDONLY | O_DIRECTORY);
+    if (existing_fd < 0) return -1;
+    return close(existing_fd);
+  }
 
   int dir_fd = confined_open_existing(root_fd, path, O_RDONLY | O_DIRECTORY);
   if (dir_fd < 0) return -1;
   rc = fchown(dir_fd, 0, 0);
-  if (rc == 0) rc = fchmod(dir_fd, mode & 07777);
+  if (rc == 0) rc = fchmod(dir_fd, 0755);
   saved = errno;
   if (close(dir_fd) != 0 && rc == 0) return -1;
   errno = saved;
@@ -2687,8 +3360,8 @@ static int copy_fd_to_fd(int in_fd, int out_fd, const char *path, uint64_t size,
   return 0;
 }
 
-static int apply_context_copy_file(int root_fd, const char *source_path, const char *dest_path, mode_t mode, uint64_t size, char *error, size_t cap) {
-  int in_fd = open(source_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+static int apply_context_copy_file(int root_fd, int source_parent_fd, const char *source_name, const char *source_path, const char *dest_path, int preserve_owner, struct copy_tree_state *state, char *error, size_t cap) {
+  int in_fd = openat(source_parent_fd, source_name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
   if (in_fd < 0) {
     snprintf(error, cap, "spore build: COPY source open failed: path=%s errno=%d\n", source_path, errno);
     return -1;
@@ -2699,6 +3372,26 @@ static int apply_context_copy_file(int root_fd, const char *source_path, const c
     close(in_fd);
     snprintf(error, cap, "spore build: COPY source is not a regular file: path=%s errno=%d\n", source_path, saved);
     return -1;
+  }
+  if (source_stat.st_size < 0) {
+    close(in_fd);
+    errno = EFBIG;
+    return -1;
+  }
+  struct supported_copy_xattrs source_xattrs;
+  if (read_supported_xattrs(in_fd, &source_xattrs) != 0) {
+    int saved = errno;
+    close(in_fd);
+    errno = saved;
+    return -1;
+  }
+
+  int hardlink_rc = apply_existing_hardlink(root_fd, &source_stat, dest_path, state);
+  if (hardlink_rc != 0) {
+    int saved = errno;
+    close(in_fd);
+    errno = saved;
+    return hardlink_rc < 0 ? -1 : 0;
   }
 
   const char *path = dest_path;
@@ -2716,6 +3409,13 @@ static int apply_context_copy_file(int root_fd, const char *source_path, const c
   struct stat st;
   int cleanup_on_error = 1;
   if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+    if (reject_security_xattrs_at(parent_fd, name) != 0) {
+      int saved = errno;
+      close(parent_fd);
+      close(in_fd);
+      errno = saved;
+      return -1;
+    }
     cleanup_on_error = !S_ISLNK(st.st_mode);
   } else if (errno != ENOENT) {
     int saved = errno;
@@ -2725,7 +3425,7 @@ static int apply_context_copy_file(int root_fd, const char *source_path, const c
     return -1;
   }
 
-  int fd = confined_open_path(root_fd, path, O_WRONLY | O_CREAT | O_TRUNC, mode & 07777);
+  int fd = confined_open_path(root_fd, path, O_WRONLY | O_CREAT, source_stat.st_mode & 07777);
   if (fd < 0) {
     int saved = errno;
     close(parent_fd);
@@ -2733,13 +3433,27 @@ static int apply_context_copy_file(int root_fd, const char *source_path, const c
     errno = saved;
     return -1;
   }
-  int rc = copy_fd_to_fd(in_fd, fd, path, size, error, cap);
+  int rc = reject_security_xattrs_fd(fd);
+  if (rc == 0) rc = ftruncate(fd, 0);
+  if (rc == 0) rc = copy_fd_to_fd(in_fd, fd, path, (uint64_t)source_stat.st_size, error, cap);
   int saved = rc != 0 ? errno : 0;
-  if (rc == 0 && fchown(fd, 0, 0) != 0) {
+  if (rc == 0 && fchown(fd, preserve_owner ? source_stat.st_uid : 0, preserve_owner ? source_stat.st_gid : 0) != 0) {
     rc = -1;
     saved = errno;
   }
-  if (rc == 0 && fchmod(fd, mode & 07777) != 0) {
+  if (rc == 0 && fchmod(fd, source_stat.st_mode & 07777) != 0) {
+    rc = -1;
+    saved = errno;
+  }
+  if (rc == 0 && apply_supported_xattrs(fd, &source_xattrs) != 0) {
+    rc = -1;
+    saved = errno;
+  }
+  if (rc == 0 && set_fd_mtime(fd, &source_stat) != 0) {
+    rc = -1;
+    saved = errno;
+  }
+  if (rc == 0 && record_hardlink(&source_stat, fd, state) != 0) {
     rc = -1;
     saved = errno;
   }
@@ -2757,22 +3471,26 @@ static int apply_context_copy_file(int root_fd, const char *source_path, const c
   return rc;
 }
 
-static int apply_context_copy_symlink(int root_fd, const char *source_path, const char *dest_path, char *error, size_t cap) {
+static int apply_context_copy_symlink(int root_fd, int source_parent_fd, const char *source_name, const char *source_path, const char *dest_path, uid_t uid, gid_t gid, const struct stat *source_stat, char *error, size_t cap) {
   char target[MAX_COPY_PATH_LEN + 1];
-  ssize_t size = readlink(source_path, target, sizeof(target) - 1);
-  if (size < 0) {
+  if (readlinkat_bounded(source_parent_fd, source_name, target, sizeof(target)) < 0) {
     snprintf(error, cap, "spore build: COPY symlink read failed: path=%s errno=%d\n", source_path, errno);
     return -1;
   }
-  target[size] = '\0';
   const char *path = dest_path;
   if (ensure_parent_dirs(root_fd, path) != 0) return -1;
   if (prepare_overwrite_path(root_fd, path, 0) != 0) return -1;
   char name[MAX_COPY_PATH_LEN + 1];
   int parent_fd = confined_parent_fd(root_fd, path, name, sizeof(name));
   if (parent_fd < 0) return -1;
+  mode_t previous_umask = umask(0);
   int rc = symlinkat(target, parent_fd, name);
   int saved = errno;
+  umask(previous_umask);
+  errno = saved;
+  if (rc == 0 && fchownat(parent_fd, name, uid, gid, AT_SYMLINK_NOFOLLOW) != 0) rc = -1;
+  if (rc == 0 && set_symlink_mtime(parent_fd, name, source_stat) != 0) rc = -1;
+  saved = errno;
   if (close(parent_fd) != 0 && rc == 0) return -1;
   errno = saved;
   return rc;
@@ -2797,24 +3515,38 @@ static int join_source_path(char *out, size_t cap, const char *base, const char 
   return n > 0 && (size_t)n < cap ? 0 : -1;
 }
 
-static int copy_context_tree(int root_fd, const char *source_path, const char *dest_path, uint64_t expected_entries, uint64_t *seen_entries, char *error, size_t cap) {
-  if (*seen_entries >= expected_entries) {
-    snprintf(error, cap, "spore build: COPY context entry count exceeds request: path=%s limit=%llu actual=%llu\n", source_path, (unsigned long long)expected_entries, (unsigned long long)(*seen_entries + 1));
+static int copy_context_tree(int root_fd, int source_parent_fd, const char *source_name, const char *source_path, const char *dest_path, int source_root, int preserve_owner, struct copy_tree_state *state, char *error, size_t cap) {
+  uint64_t traversal_limit = state->expected_entries == 0 ? MAX_BUILD_CONTEXT_COPY_ENTRIES : state->expected_entries;
+  if (state->seen_entries >= traversal_limit) {
+    snprintf(error, cap, "spore build: COPY context entry count exceeds request: path=%s limit=%llu actual=%llu\n", source_path, (unsigned long long)traversal_limit, (unsigned long long)(state->seen_entries + 1));
     return -1;
   }
   struct stat st;
-  if (lstat(source_path, &st) != 0) {
+  if (fstatat(source_parent_fd, source_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
     snprintf(error, cap, "spore build: COPY source subtree missing on context disk: path=%s errno=%d\n", source_path, errno);
     return -1;
   }
-  (*seen_entries)++;
+  state->seen_entries++;
+  if (!S_ISREG(st.st_mode) && reject_security_xattrs_at(source_parent_fd, source_name) != 0) {
+    snprintf(error, cap, "spore build: COPY source has unsupported security xattr: path=%s errno=%d\n", source_path, errno);
+    return -1;
+  }
   if (S_ISDIR(st.st_mode)) {
-    if (apply_context_copy_dir(root_fd, dest_path, st.st_mode & 07777) != 0) {
+    int dir_rc = source_root
+        ? ensure_context_copy_root_dir(root_fd, dest_path)
+        : apply_context_copy_dir(root_fd, dest_path, st.st_mode & 07777, preserve_owner ? st.st_uid : 0, preserve_owner ? st.st_gid : 0);
+    if (dir_rc != 0) {
       snprintf(error, cap, "spore build: COPY directory apply failed: path=%s errno=%d\n", dest_path, errno);
       return -1;
     }
-    DIR *dir = opendir(source_path);
+    int source_dir_fd = openat(source_parent_fd, source_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (source_dir_fd < 0) {
+      snprintf(error, cap, "spore build: COPY source directory open failed: path=%s errno=%d\n", source_path, errno);
+      return -1;
+    }
+    DIR *dir = fdopendir(source_dir_fd);
     if (dir == NULL) {
+      close(source_dir_fd);
       snprintf(error, cap, "spore build: COPY source directory open failed: path=%s errno=%d\n", source_path, errno);
       return -1;
     }
@@ -2827,7 +3559,7 @@ static int copy_context_tree(int root_fd, const char *source_path, const char *d
       char child_dest[MAX_COPY_PATH_LEN + 1];
       if (join_source_path(child_source, sizeof(child_source), source_path, entry->d_name) != 0 ||
           join_dest_path(child_dest, sizeof(child_dest), dest_path, entry->d_name) != 0 ||
-          copy_context_tree(root_fd, child_source, child_dest, expected_entries, seen_entries, error, cap) != 0) {
+          copy_context_tree(root_fd, dirfd(dir), entry->d_name, child_source, child_dest, 0, preserve_owner, state, error, cap) != 0) {
         rc = -1;
         saved = errno;
         break;
@@ -2837,17 +3569,38 @@ static int copy_context_tree(int root_fd, const char *source_path, const char *d
       rc = -1;
       saved = errno;
     }
+    if (!source_root && rc == 0 && set_path_mtime(root_fd, dest_path, &st) != 0) {
+      rc = -1;
+      saved = errno;
+    }
     if (rc != 0) errno = saved;
     return rc;
   }
   if (S_ISREG(st.st_mode)) {
-    return apply_context_copy_file(root_fd, source_path, dest_path, st.st_mode & 07777, (uint64_t)st.st_size, error, cap);
+    return apply_context_copy_file(root_fd, source_parent_fd, source_name, source_path, dest_path, preserve_owner, state, error, cap);
   }
   if (S_ISLNK(st.st_mode)) {
-    return apply_context_copy_symlink(root_fd, source_path, dest_path, error, cap);
+    return apply_context_copy_symlink(root_fd, source_parent_fd, source_name, source_path, dest_path, preserve_owner ? st.st_uid : 0, preserve_owner ? st.st_gid : 0, &st, error, cap);
   }
   snprintf(error, cap, "spore build: COPY source has unsupported type: path=%s\n", source_path);
   return -1;
+}
+
+static int ensure_build_agent_fd_budget(void) {
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return -1;
+  const rlim_t required = (rlim_t)BUILD_AGENT_FD_BUDGET;
+  if (limit.rlim_cur >= required) return 0;
+  if (limit.rlim_max != RLIM_INFINITY && limit.rlim_max < required) {
+    limit.rlim_max = required;
+  }
+  limit.rlim_cur = required;
+  if (setrlimit(RLIMIT_NOFILE, &limit) != 0) return -1;
+  if (getrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_cur < required) {
+    errno = EMFILE;
+    return -1;
+  }
+  return 0;
 }
 
 static int validate_build_context_source_path(const char *path) {
@@ -2855,12 +3608,12 @@ static int validate_build_context_source_path(const char *path) {
   return validate_copy_archive_path(path, strlen(path), 0);
 }
 
-static int build_context_source_path(char *out, size_t cap, const char *source) {
+static int build_copy_source_path(char *out, size_t cap, const char *source_root, const char *source) {
   int n;
   if (strcmp(source, ".") == 0) {
-    n = snprintf(out, cap, "%s", BUILD_CONTEXT_ROOT);
+    n = snprintf(out, cap, "%s", source_root);
   } else {
-    n = snprintf(out, cap, "%s/%s", BUILD_CONTEXT_ROOT, source);
+    n = snprintf(out, cap, "%s/%s", source_root, source);
   }
   return n > 0 && (size_t)n < cap ? 0 : -1;
 }
@@ -2905,14 +3658,14 @@ static int build_workdir_apply(struct client *client, const char *root, const ch
   return send_client_exit(client, 0);
 }
 
-static int build_context_copy_apply(struct client *client, const char *root, const char *source, const char *dest, int source_kind, int dest_is_dir, uint64_t entry_count) {
+static int build_context_copy_apply(struct client *client, const char *root, const char *source_root, const char *source, const char *dest, int source_kind, int dest_is_dir, uint64_t entry_count) {
   if (validate_build_context_source_path(source) != 0) {
     return send_client_error_exit(client, 2, "spore build: invalid COPY source path on context disk\n");
   }
   if (dest[0] != '/' || (dest[1] != '\0' && validate_spore_copy_entry_path(dest) != 0)) {
     return send_client_error_exit(client, 2, "spore build: invalid COPY destination\n");
   }
-  if (entry_count == 0 || entry_count > MAX_BUILD_CONTEXT_COPY_ENTRIES) {
+  if ((source_kind != COPY_KIND_AUTO && entry_count == 0) || entry_count > MAX_BUILD_CONTEXT_COPY_ENTRIES) {
     char msg[192];
     snprintf(msg, sizeof(msg), "spore build: COPY entry count exceeds limit: path=%s limit=%llu actual=%llu\n", source, (unsigned long long)MAX_BUILD_CONTEXT_COPY_ENTRIES, (unsigned long long)entry_count);
     return send_client_error_exit(client, 2, msg);
@@ -2921,24 +3674,52 @@ static int build_context_copy_apply(struct client *client, const char *root, con
   if (root_fd < 0) {
     return send_client_error_exit(client, 126, "spore build: rootfs unavailable\n");
   }
+  int source_root_fd = open(source_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (source_root_fd < 0) {
+    close(root_fd);
+    return send_client_error_exit(client, 126, "spore build: COPY source root unavailable\n");
+  }
 
   char source_path[MAX_COPY_FULL_PATH_LEN + MAX_COPY_PATH_LEN + 2];
-  if (build_context_source_path(source_path, sizeof(source_path), source) != 0) {
+  if (build_copy_source_path(source_path, sizeof(source_path), source_root, source) != 0) {
+    close(source_root_fd);
     close(root_fd);
     return send_client_error_exit(client, 2, "spore build: COPY source path is too long for context disk\n");
   }
+  char source_name[MAX_COPY_PATH_LEN + 1];
+  int source_parent_fd;
+  if (strcmp(source, ".") == 0) {
+    source_parent_fd = dup(source_root_fd);
+    snprintf(source_name, sizeof(source_name), ".");
+  } else {
+    source_parent_fd = confined_parent_fd(source_root_fd, source, source_name, sizeof(source_name));
+  }
+  close(source_root_fd);
+  if (source_parent_fd < 0) {
+    close(root_fd);
+    return send_client_error_exit(client, 1, "spore build: COPY source path escapes input root\n");
+  }
   struct stat st;
-  if (lstat(source_path, &st) != 0) {
+  if (fstatat(source_parent_fd, source_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
     char msg[256];
     snprintf(msg, sizeof(msg), "spore build: COPY source subtree missing on context disk: path=%s errno=%d\n", source, errno);
+    close(source_parent_fd);
     close(root_fd);
     return send_client_error_exit(client, 1, msg);
+  }
+  int preserve_owner = source_kind == COPY_KIND_AUTO;
+  if (source_kind == COPY_KIND_AUTO) {
+    if (S_ISDIR(st.st_mode)) source_kind = COPY_KIND_DIR;
+    else if (S_ISREG(st.st_mode)) source_kind = COPY_KIND_FILE;
+    else if (S_ISLNK(st.st_mode)) source_kind = COPY_KIND_SYMLINK;
+    else source_kind = 0;
   }
   if ((source_kind == COPY_KIND_DIR && !S_ISDIR(st.st_mode)) ||
       (source_kind == COPY_KIND_FILE && !S_ISREG(st.st_mode)) ||
       (source_kind == COPY_KIND_SYMLINK && !S_ISLNK(st.st_mode))) {
     char msg[256];
     snprintf(msg, sizeof(msg), "spore build: COPY source kind mismatch on context disk: path=%s\n", source);
+    close(source_parent_fd);
     close(root_fd);
     return send_client_error_exit(client, 1, msg);
   }
@@ -2949,10 +3730,12 @@ static int build_context_copy_apply(struct client *client, const char *root, con
     if (dest_fd >= 0) {
       resolved_dest_is_dir = 1;
       if (close(dest_fd) != 0) {
+        close(source_parent_fd);
         close(root_fd);
         return send_client_error_exit(client, 1, "spore build: COPY destination inspection failed\n");
       }
     } else if (errno != ENOENT && errno != ENOTDIR) {
+      close(source_parent_fd);
       close(root_fd);
       return send_client_error_exit(client, 1, "spore build: COPY destination inspection failed\n");
     }
@@ -2965,6 +3748,7 @@ static int build_context_copy_apply(struct client *client, const char *root, con
     const char *base = strrchr(source, '/');
     base = base == NULL ? source : base + 1;
     if (join_dest_path(dest_path, sizeof(dest_path), dest, base) != 0) {
+      close(source_parent_fd);
       close(root_fd);
       return send_client_error_exit(client, 2, "spore build: COPY destination path is too long\n");
     }
@@ -2974,30 +3758,42 @@ static int build_context_copy_apply(struct client *client, const char *root, con
 
   char error[384];
   error[0] = '\0';
-  uint64_t seen_entries = 0;
-  if (copy_context_tree(root_fd, source_path, dest_path, entry_count, &seen_entries, error, sizeof(error)) != 0) {
+  struct copy_tree_state copy_state;
+  memset(&copy_state, 0, sizeof(copy_state));
+  copy_state.expected_entries = entry_count;
+  if (copy_context_tree(root_fd, source_parent_fd, source_name, source_path, dest_path, 1, preserve_owner, &copy_state, error, sizeof(error)) != 0) {
     int copy_errno = errno;
+    copy_tree_state_deinit(&copy_state);
+    close(source_parent_fd);
+    close(root_fd);
     if (copy_errno == ENOSPC) {
-      close(root_fd);
       return send_client_error_exit(client, 1, "spore build: SPORE_BUILD_ENOSPC COPY apply failed\n");
     }
     const char *message = error[0] != '\0' ? error : "spore build: COPY apply failed\n";
-    close(root_fd);
     return send_client_error_exit(client, 1, message);
   }
-  if (seen_entries != entry_count) {
+  if (entry_count != 0 && copy_state.seen_entries != entry_count) {
     char msg[256];
-    snprintf(msg, sizeof(msg), "spore build: COPY context entry count mismatch: path=%s limit=%llu actual=%llu\n", source, (unsigned long long)entry_count, (unsigned long long)seen_entries);
+    snprintf(msg, sizeof(msg), "spore build: COPY context entry count mismatch: path=%s limit=%llu actual=%llu\n", source, (unsigned long long)entry_count, (unsigned long long)copy_state.seen_entries);
+    copy_tree_state_deinit(&copy_state);
+    close(source_parent_fd);
     close(root_fd);
     return send_client_error_exit(client, 1, msg);
   }
-  if (close(root_fd) != 0) {
+  copy_tree_state_deinit(&copy_state);
+  int close_rc = close(source_parent_fd);
+  if (close(root_fd) != 0) close_rc = -1;
+  if (close_rc != 0) {
     return send_client_error_exit(client, 1, "spore build: COPY apply failed\n");
   }
   return send_client_exit(client, 0);
 }
 
 static int freeze_or_thaw_rootfs(struct client *client, int freeze) {
+  int restore_build_resolv = !freeze && build_resolv.configured;
+  if (freeze && unmount_build_resolv_for_snapshot(&build_resolv) != 0) {
+    return send_client_error_exit(client, 126, "spore build: resolver cleanup before freeze failed\n");
+  }
   int fd = open("/mnt/rootfs", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (fd < 0) return send_client_error_exit(client, 126, freeze ? "spore build: rootfs freeze open failed\n" : "spore build: rootfs thaw open failed\n");
   int arg = 0;
@@ -3006,6 +3802,13 @@ static int freeze_or_thaw_rootfs(struct client *client, int freeze) {
   if (ioctl(fd, freeze ? FIFREEZE : FITHAW, &arg) != 0) rc = -1;
   if (close(fd) != 0) rc = -1;
   if (rc != 0) return send_client_error_exit(client, 126, freeze ? "spore build: fsfreeze failed\n" : "spore build: fsthaw failed\n");
+  if (restore_build_resolv) {
+    char error[192];
+    error[0] = '\0';
+    if (bind_rootfs_resolv(1, error, sizeof(error)) != 0) {
+      return send_client_error_exit(client, 126, "spore build: resolver restore after thaw failed\n");
+    }
+  }
   return send_client_exit(client, 0);
 }
 
@@ -3194,7 +3997,7 @@ static void execve_or_report(char *const argv[], char *const envp[], int use_roo
 }
 
 static void pin_to_current_cpu(pid_t pid);
-static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio, int memory_pressure, int build_run_isolation, int stdin_enabled, int tty, uint16_t terminal_rows, uint16_t terminal_cols) {
+static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio, int memory_pressure, int build_run_isolation, uint64_t nofile_soft, uint64_t nofile_hard, int stdin_enabled, int tty, uint16_t terminal_rows, uint16_t terminal_cols) {
   t_command_start = now_ms();
   int stdin_pipe[2] = { -1, -1 };
   int stdout_pipe[2] = { -1, -1 };
@@ -3300,6 +4103,12 @@ static int start_session(struct session *session, const char *session_id, char *
     while (read(start_pipe[0], &start_byte, 1) < 0 && errno == EINTR) {
     }
     if (start_byte != 1) _exit(127);
+    if (nofile_hard != 0) {
+      struct rlimit nofile_limit;
+      nofile_limit.rlim_cur = (rlim_t)nofile_soft;
+      nofile_limit.rlim_max = (rlim_t)nofile_hard;
+      if (setrlimit(RLIMIT_NOFILE, &nofile_limit) != 0) _exit(126);
+    }
     if (write_all(ready_pipe[1], "\1", 1) != 0) _exit(127);
     close(ready_pipe[1]);
     close(start_pipe[0]);
@@ -4104,7 +4913,7 @@ static void run_transient_exec(struct client *client, const struct run_request *
   }
 
   struct session transient;
-  int rc = start_session(&transient, request->session_id, request->argv, request->envp, request->working_dir, use_rootfs, 0, 0, 0, 0, 0, request->terminal_rows, request->terminal_cols);
+  int rc = start_session(&transient, request->session_id, request->argv, request->envp, request->working_dir, use_rootfs, 0, 0, 0, 0, 0, 0, 0, request->terminal_rows, request->terminal_cols);
   if (rc != 0) {
     (void)send_client_error_exit(client, rc, "spore run: exec setup failed\n");
     close_client(client);
@@ -4164,7 +4973,7 @@ static void run_build_exec(struct client *client, const struct run_request *requ
   argv[3] = NULL;
 
   struct session transient;
-  int rc = start_session(&transient, request->session_id, argv, request->envp, request->working_dir, use_rootfs, 0, 0, 1, 0, 0, request->terminal_rows, request->terminal_cols);
+  int rc = start_session(&transient, request->session_id, argv, request->envp, request->working_dir, use_rootfs, 0, 0, 1, request->nofile_soft, request->nofile_hard, 0, 0, request->terminal_rows, request->terminal_cols);
   if (rc != 0) {
     (void)send_client_error_exit(client, rc, "spore build: RUN exec setup failed\n");
     close_client(client);
@@ -4239,7 +5048,7 @@ static const char *apply_request_generation(struct generation_monitor *generatio
   return NULL;
 }
 
-static void accept_request(int listener, struct session *session, struct client *client, struct detached_children *detached, struct generation_monitor *generation, const char *generation_root, int use_rootfs, int rootfs_writable, int rootfs_growth_session, int rootfs_ready, const char *rootfs_error, int build_context_requested, int build_context_ready, const char *build_context_error, int network_requested, int network_ready, const char *network_error) {
+static void accept_request(int listener, struct session *session, struct client *client, struct detached_children *detached, struct generation_monitor *generation, const char *generation_root, int use_rootfs, int rootfs_writable, int rootfs_growth_session, int rootfs_ready, const char *rootfs_error, int build_context_requested, int build_context_ready, const char *build_context_error, int build_input_count, int build_inputs_ready, const char *build_inputs_error, int network_requested, int network_ready, const char *network_error) {
   int conn = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
   if (conn < 0) {
     if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -4349,12 +5158,28 @@ static void accept_request(int listener, struct session *session, struct client 
       close_client(client);
       return;
     }
-    if (!build_context_requested || !build_context_ready) {
-      (void)send_client_error_exit(client, 126, build_context_error[0] != '\0' ? build_context_error : "spore build: context disk unavailable\n");
-      close_client(client);
-      return;
+    char source_root[64];
+    if (request.copy_source_disk == COPY_SOURCE_CONTEXT) {
+      if (!build_context_requested || !build_context_ready) {
+        (void)send_client_error_exit(client, 126, build_context_error[0] != '\0' ? build_context_error : "spore build: context disk unavailable\n");
+        close_client(client);
+        return;
+      }
+      snprintf(source_root, sizeof(source_root), "%s", BUILD_CONTEXT_ROOT);
+    } else {
+      if (!build_inputs_ready || request.copy_input_index >= (uint64_t)build_input_count) {
+        (void)send_client_error_exit(client, 126, build_inputs_error[0] != '\0' ? build_inputs_error : "spore build: input disk unavailable\n");
+        close_client(client);
+        return;
+      }
+      int n = snprintf(source_root, sizeof(source_root), "%s/%llu", BUILD_INPUT_ROOT, (unsigned long long)request.copy_input_index);
+      if (n <= 0 || (size_t)n >= sizeof(source_root)) {
+        (void)send_client_error_exit(client, 2, "spore build: input disk path is too long\n");
+        close_client(client);
+        return;
+      }
     }
-    (void)build_context_copy_apply(client, "/mnt/rootfs", request.copy_source, request.copy_dest, request.copy_source_kind, request.copy_dest_is_dir, request.copy_entry_count);
+    (void)build_context_copy_apply(client, "/mnt/rootfs", source_root, request.copy_source, request.copy_dest, request.copy_source_kind, request.copy_dest_is_dir, request.copy_entry_count);
     close_client(client);
     return;
   }
@@ -4457,7 +5282,7 @@ static void accept_request(int listener, struct session *session, struct client 
       file_stdio = request.tty ? 0 : 1;
       reset_session(session);
     }
-    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs, file_stdio, request.memory_pressure, 0, request.stdin_enabled, request.tty, request.terminal_rows, request.terminal_cols);
+    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs, file_stdio, request.memory_pressure, 0, 0, 0, request.stdin_enabled, request.tty, request.terminal_rows, request.terminal_cols);
     if (rc != 0) {
       (void)send_client_error_exit(client, rc, "spore run: exec setup failed\n");
       close_client(client);
@@ -4617,6 +5442,201 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_proc_stat(
   stat[stat_len] = '\0';
   return parse_proc_stat_kernel_thread(stat);
 }
+
+__attribute__((visibility("hidden"))) int spore_agent_fuzz_build_resolv_target(
+    const unsigned char *target_bytes, size_t target_len,
+    unsigned char *logical_bytes, size_t logical_cap) {
+  if (target_len >= 512 || logical_cap == 0) return -1;
+  char target[512];
+  memcpy(target, target_bytes, target_len);
+  target[target_len] = '\0';
+  struct build_resolv_state state;
+  memset(&state, 0, sizeof(state));
+  if (normalize_build_resolv_target(target, &state) != 0) return -1;
+  size_t logical_len = strlen(state.logical_target);
+  if (logical_len + 1 > logical_cap) return -1;
+  memcpy(logical_bytes, state.logical_target, logical_len + 1);
+  return 0;
+}
+
+__attribute__((visibility("hidden"))) int spore_agent_test_bounded_readlink(
+    const unsigned char *target_bytes, size_t target_len) {
+  if (target_len == 0 || target_len >= 1024) return -1;
+  char target[1024];
+  memcpy(target, target_bytes, target_len);
+  target[target_len] = '\0';
+
+  char path[] = "/tmp/spore-agent-readlink-XXXXXX";
+  int fd = mkstemp(path);
+  if (fd < 0) return -1;
+  int rc = close(fd);
+  if (unlink(path) != 0) rc = -1;
+  if (rc == 0 && symlink(target, path) != 0) rc = -1;
+  if (rc == 0) {
+    char out[512];
+    rc = readlink_bounded(path, out, sizeof(out)) < 0 ? -1 : 0;
+  }
+  if (unlink(path) != 0 && errno != ENOENT) rc = -1;
+  return rc;
+}
+
+__attribute__((visibility("hidden"))) int spore_agent_test_confined_source_parent(
+    const unsigned char *root_bytes, size_t root_len,
+    const unsigned char *path_bytes, size_t path_len) {
+  if (root_len == 0 || root_len >= 1024 || path_len == 0 || path_len > MAX_COPY_PATH_LEN) return -1;
+  char root[1024];
+  char path[MAX_COPY_PATH_LEN + 1];
+  memcpy(root, root_bytes, root_len);
+  root[root_len] = '\0';
+  memcpy(path, path_bytes, path_len);
+  path[path_len] = '\0';
+  int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (root_fd < 0) return -1;
+  char name[MAX_COPY_PATH_LEN + 1];
+  int parent_fd = confined_parent_fd(root_fd, path, name, sizeof(name));
+  close(root_fd);
+  if (parent_fd < 0) return -1;
+  int rc = fstatat(parent_fd, name, &(struct stat){0}, AT_SYMLINK_NOFOLLOW);
+  close(parent_fd);
+  return rc;
+}
+
+__attribute__((visibility("hidden"))) int spore_agent_fuzz_copy_tree(
+    const unsigned char *source_root_bytes, size_t source_root_len,
+    const unsigned char *dest_root_bytes, size_t dest_root_len,
+    const unsigned char *fuzz, size_t fuzz_len) {
+  if (source_root_len == 0 || source_root_len >= 1024 || dest_root_len == 0 || dest_root_len >= 1024 || fuzz_len > 256) return -1;
+  char source_root[1024];
+  char dest_root[1024];
+  memcpy(source_root, source_root_bytes, source_root_len);
+  source_root[source_root_len] = '\0';
+  memcpy(dest_root, dest_root_bytes, dest_root_len);
+  dest_root[dest_root_len] = '\0';
+
+  char tree[1200];
+  if (snprintf(tree, sizeof(tree), "%s/tree", source_root) <= 0 || mkdir_p(tree, 0755) != 0) return -1;
+  size_t entry_count = fuzz_len > 16 ? 16 : fuzz_len;
+  char first_file[1200];
+  first_file[0] = '\0';
+  for (size_t i = 0; i < entry_count; i++) {
+    char path[1200];
+    int n = snprintf(path, sizeof(path), "%s/tree/e%02zu", source_root, i);
+    if (n <= 0 || (size_t)n >= sizeof(path)) return -1;
+    switch (fuzz[i] % 6) {
+      case 0: {
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600 | (fuzz[i] & 077));
+        if (fd < 0) return -1;
+        int rc = write_all(fd, fuzz, fuzz_len);
+        if (close(fd) != 0 && rc == 0) rc = -1;
+        if (rc != 0) return -1;
+        if (first_file[0] == '\0') snprintf(first_file, sizeof(first_file), "%s", path);
+        break;
+      }
+      case 1: {
+        if (mkdir(path, 0700 | (fuzz[i] & 077)) != 0) return -1;
+        char nested[1200];
+        snprintf(nested, sizeof(nested), "%s", path);
+        size_t depth = 1 + (fuzz[i] >> 6);
+        for (size_t level = 0; level < depth; level++) {
+          size_t used = strlen(nested);
+          int written = snprintf(nested + used, sizeof(nested) - used, "/d%zu", level);
+          if (written <= 0 || (size_t)written >= sizeof(nested) - used || mkdir(nested, 0755) != 0) return -1;
+        }
+        size_t used = strlen(nested);
+        int written = snprintf(nested + used, sizeof(nested) - used, "/leaf");
+        if (written <= 0 || (size_t)written >= sizeof(nested) - used) return -1;
+        int fd = open(nested, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (fd < 0 || close(fd) != 0) return -1;
+        break;
+      }
+      case 2:
+        if (symlink("../../outside", path) != 0) return -1;
+        break;
+      case 3: {
+        char target[MAX_COPY_PATH_LEN];
+        size_t target_len = 1 + (fuzz[i] % (sizeof(target) - 1));
+        memset(target, 'x', target_len);
+        target[target_len] = '\0';
+        if (symlink(target, path) != 0) return -1;
+        break;
+      }
+      case 4:
+        if (mkfifo(path, 0600) != 0) return -1;
+        break;
+      case 5:
+        if (first_file[0] != '\0') {
+          if (link(first_file, path) != 0) return -1;
+        } else if (mkdir(path, 0755) != 0) {
+          return -1;
+        }
+        break;
+    }
+  }
+
+  int source_fd = open(source_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  int dest_fd = open(dest_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (source_fd < 0 || dest_fd < 0) {
+    if (source_fd >= 0) close(source_fd);
+    if (dest_fd >= 0) close(dest_fd);
+    return -1;
+  }
+  uint64_t expected = fuzz_len > 1 && (fuzz[1] & 1) != 0
+      ? 64
+      : (fuzz_len == 0 ? 1 : 1 + (uint64_t)(fuzz[0] % (entry_count + 1)));
+  struct copy_tree_state state = {
+    .expected_entries = expected,
+    .hardlink_capacity = (size_t)expected,
+  };
+  state.hardlinks = calloc(state.hardlink_capacity, sizeof(*state.hardlinks));
+  if (state.hardlinks == NULL) {
+    close(source_fd);
+    close(dest_fd);
+    return -1;
+  }
+  char error[384];
+  int rc = copy_context_tree(dest_fd, source_fd, "tree", tree, "/copy", 1, 1, &state, error, sizeof(error));
+  copy_tree_state_deinit(&state);
+  close(source_fd);
+  close(dest_fd);
+  return rc;
+}
+
+__attribute__((visibility("hidden"))) uint64_t spore_agent_test_build_fd_budget(void) {
+  return BUILD_AGENT_FD_BUDGET;
+}
+
+__attribute__((visibility("hidden"))) int spore_agent_test_security_xattr_long_name(const unsigned char *root_bytes, size_t root_len) {
+  if (root_len == 0 || root_len >= 1024) return -1;
+  char root[1024];
+  memcpy(root, root_bytes, root_len);
+  root[root_len] = '\0';
+  int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (root_fd < 0) return -1;
+  char name[256];
+  memset(name, 'n', sizeof(name) - 1);
+  name[sizeof(name) - 1] = '\0';
+  int fd = openat(root_fd, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    close(root_fd);
+    return -1;
+  }
+  if (close(fd) != 0) {
+    close(root_fd);
+    return -1;
+  }
+  int rc = reject_security_xattrs_at(root_fd, name);
+  unlinkat(root_fd, name, 0);
+  close(root_fd);
+  return rc;
+}
+
+__attribute__((visibility("hidden"))) int spore_agent_test_copy_security_xattr_policy(int regular_source, int existing_destination, const unsigned char *name_bytes, size_t name_len) {
+  if (name_len == 0 || name_len > 255 || memchr(name_bytes, '\0', name_len) != NULL) return -1;
+  char name[256];
+  memcpy(name, name_bytes, name_len);
+  name[name_len] = '\0';
+  return copy_security_xattr_allowed(regular_source, existing_destination, name) ? 0 : -1;
+}
 #else
 int main(void) {
   t_init_start = now_ms();
@@ -4637,6 +5657,12 @@ int main(void) {
   int rootfs_growth_session = cmdline_has_flag_in(cmdline, "spore_rootfs_growth=1");
   int rootfs_noinit_itable = cmdline_has_flag_in(cmdline, "spore_rootfs_noinit_itable=1");
   int use_build_context = cmdline_has_flag_in(cmdline, "spore_build_context=1");
+  int build_input_count = resolve_build_input_count(cmdline);
+  int build_mode = cmdline_has_flag_in(cmdline, "spore_build=1");
+  if (build_mode && ensure_build_agent_fd_budget() != 0) {
+    dprintf(2, "build agent fd budget unavailable: required=%llu errno=%d\n", (unsigned long long)BUILD_AGENT_FD_BUDGET, errno);
+    return 1;
+  }
   int use_network = cmdline_has_flag_in(cmdline, "spore_net=1");
   int listener = listen_vsock(resolve_port_from_cmdline(cmdline));
   if (listener < 0) {
@@ -4649,7 +5675,7 @@ int main(void) {
   int rootfs_ready = 1;
   char rootfs_error[128];
   rootfs_error[0] = '\0';
-  if (use_rootfs && setup_rootfs(rootfs_writable, rootfs_growth_session, rootfs_noinit_itable, rootfs_error, sizeof(rootfs_error)) != 0) {
+  if (use_rootfs && setup_rootfs(rootfs_writable, rootfs_growth_session, rootfs_noinit_itable, build_mode, rootfs_error, sizeof(rootfs_error)) != 0) {
     rootfs_ready = 0;
     dprintf(2, "%s\n", rootfs_error);
     size_t len = strlen(rootfs_error);
@@ -4670,10 +5696,25 @@ int main(void) {
       build_context_error[len + 1] = '\0';
     }
   }
+  int build_inputs_ready = build_input_count >= 0;
+  char build_inputs_error[192];
+  build_inputs_error[0] = '\0';
+  if (build_input_count < 0) {
+    snprintf(build_inputs_error, sizeof(build_inputs_error), "invalid build input count");
+    build_input_count = 0;
+  } else if (build_input_count > 0 && setup_build_inputs(build_input_count, use_build_context, build_inputs_error, sizeof(build_inputs_error)) != 0) {
+    build_inputs_ready = 0;
+    dprintf(2, "%s\n", build_inputs_error);
+    size_t len = strlen(build_inputs_error);
+    if (len + 1 < sizeof(build_inputs_error)) {
+      build_inputs_error[len] = '\n';
+      build_inputs_error[len + 1] = '\0';
+    }
+  }
   int network_ready = 1;
   char network_error[160];
   network_error[0] = '\0';
-  if (use_network && setup_network(use_rootfs, network_error, sizeof(network_error)) != 0) {
+  if (use_network && setup_network(use_rootfs, build_mode, network_error, sizeof(network_error)) != 0) {
     network_ready = 0;
     dprintf(2, "%s\n", network_error);
     size_t len = strlen(network_error);
@@ -4766,7 +5807,7 @@ int main(void) {
       for (nfds_t i = 0; i < nfds; i++) {
         if (fds[i].revents == 0) continue;
         if (roles[i] == 0 && (fds[i].revents & POLLIN)) {
-          accept_request(listener, &session, &client, &detached, &generation, generation_root, use_rootfs, rootfs_writable, rootfs_growth_session, rootfs_ready, rootfs_error, use_build_context, build_context_ready, build_context_error, use_network, network_ready, network_error);
+          accept_request(listener, &session, &client, &detached, &generation, generation_root, use_rootfs, rootfs_writable, rootfs_growth_session, rootfs_ready, rootfs_error, use_build_context, build_context_ready, build_context_error, build_input_count, build_inputs_ready, build_inputs_error, use_network, network_ready, network_error);
         } else if (roles[i] == 1) {
           if (fds[i].revents & POLLIN) {
             pump_client_v1(&session, &client);

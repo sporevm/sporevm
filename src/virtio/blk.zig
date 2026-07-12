@@ -245,6 +245,13 @@ pub const Blk = struct {
         return initWithOptions(backend, .{});
     }
 
+    /// Context and cross-stage build inputs are immutable authority. Keep
+    /// their feature surface frozen even when the writable root disk opts in
+    /// to transient growth features.
+    pub fn initImmutableSource(backend: Backend) Blk {
+        return init(backend);
+    }
+
     pub fn initWithOptions(backend: Backend, options: Options) Blk {
         return .{
             .backend = backend,
@@ -705,6 +712,54 @@ test "write zeroes feature and config are opt in and negotiation is resettable" 
     _ = transport.write(0x070, 0, ram);
     try std.testing.expectEqual(@as(u64, 0), growth.accepted_features);
     try std.testing.expectEqual(@as(u64, 0), stats.snapshot().accepted_features);
+}
+
+test "immutable build input rejects WRITE_ZEROES negotiation without mutation" {
+    var disk = [_]u8{0x5a} ** (4 * sector_size);
+    var source = Blk.initImmutableSource(.{ .memory = &disk });
+    var transport = mmio.Transport.init(source.device());
+    try std.testing.expectEqual(@as(u64, 0), transport.dev.device_features & feature_write_zeroes);
+
+    var ram_bytes: [1]u8 = .{0};
+    const ram: guestmem.GuestRam = .{ .bytes = &ram_bytes, .base = 0 };
+    _ = transport.write(0x020, @truncate(feature_write_zeroes), ram);
+    _ = transport.write(0x070, mmio.status_features_ok, ram);
+    try std.testing.expectEqual(@as(u32, 0), transport.read(0x070) & mmio.status_features_ok);
+    try std.testing.expectEqual(@as(u64, 0), source.accepted_features);
+    try std.testing.expect(std.mem.allEqual(u8, &disk, 0x5a));
+}
+
+test "immutable build input rejects ordinary OUT on a product-style read-only fd" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-virtio-blk-immutable-source-fd";
+    const path = tmp ++ "/source.img";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    const canonical = [_]u8{0x5a} ** (2 * sector_size);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &canonical });
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.FileNotFound;
+    defer _ = std.c.close(fd);
+
+    var source = Blk.initImmutableSource(.{ .file = fd });
+    var header = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, header[0..4], req_out, .little);
+    std.mem.writeInt(u64, header[8..16], 0, .little);
+    var attempted = [_]u8{0xa5} ** sector_size;
+    var status: [1]u8 = .{0xff};
+    const chain = makeChain(&.{
+        .{ .data = &header, .writable = false },
+        .{ .data = &attempted, .writable = false },
+        .{ .data = &status, .writable = true },
+    });
+    try std.testing.expectEqual(@as(u32, 1), source.handleRequest(&chain));
+    try std.testing.expectEqual(status_ioerr, status[0]);
+    const actual = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(canonical.len + 1));
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(u8, &canonical, actual);
 }
 
 test "write zeroes requires negotiated feature without mutating memory" {

@@ -1,0 +1,19 @@
+{
+  "description": "ARG, ENV, and CMD produce the same normalized runtime config",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "metadata-only",
+  "initial_execution": {
+    "expect_executed_steps": 0,
+    "expect_boot_count": 0,
+    "expect_resize_count": 0
+  },
+  "scan_prefixes": [
+    "/oracle"
+  ],
+  "build_args": {
+    "FLAVOR": "chocolate"
+  }
+}

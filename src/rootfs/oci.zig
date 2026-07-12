@@ -135,6 +135,7 @@ pub const RuntimeConfig = struct {
     Cmd: ?[][]const u8 = null,
     WorkingDir: ?[]const u8 = null,
     User: ?[]const u8 = null,
+    OnBuild: ?[][]const u8 = null,
 };
 
 pub const LayerMetadata = struct {

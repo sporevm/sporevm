@@ -1,0 +1,46 @@
+{
+  "description": "Docker-visible /tmp and /run state survives a cached-prefix restart",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 4,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "trigger-change",
+      "writes": {
+        "trigger.txt": "second\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 3,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-change",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

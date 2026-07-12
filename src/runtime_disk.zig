@@ -57,8 +57,12 @@ pub const RuntimeDisk = struct {
     }
 
     pub fn snapshot(self: *RuntimeDisk) ?disk_layer.SnapshotState {
+        return self.snapshotWithMetrics(null);
+    }
+
+    pub fn snapshotWithMetrics(self: *RuntimeDisk, metrics: ?*disk_layer.SnapshotMetrics) ?disk_layer.SnapshotState {
         const base = self.base_disk orelse return null;
-        if (self.chunk_mapped) |*disk| return .{ .base = base, .active = .{ .chunk_mapped = disk } };
+        if (self.chunk_mapped) |*disk| return .{ .base = base, .active = .{ .chunk_mapped = disk }, .metrics = metrics };
         return null;
     }
 
@@ -244,6 +248,40 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initReadOnly(allocator, base_source, size, rootfs_cas.default_chunk_size);
     }
 
+    return runtime;
+}
+
+/// Open an immutable rootfs artifact as a plain read-only virtio-blk input.
+/// Chunk-indexed artifacts keep their normal CAS lease and verified lazy-read
+/// path, but never receive a writable overlay or growth profile.
+pub fn openReadOnlyRootfs(
+    context: Context,
+    allocator: std.mem.Allocator,
+    rootfs: spore.Rootfs,
+    disk_root: ?[]const u8,
+    rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
+) !RuntimeDisk {
+    var runtime = RuntimeDisk{ .allocator = allocator };
+    errdefer runtime.deinit();
+    runtime.trace_fd = try openRootfsTraceFd(context, allocator);
+    if (rootfs.storage) |storage| {
+        try validateRuntimeRootfsStorage(rootfs, storage);
+        if (try openCachedFlatRootfs(context, allocator, rootfs, runtime.trace_fd, disk_root)) |fd| {
+            runtime.rootfs_fd = fd;
+            return runtime;
+        }
+        const cache_root = try baselineRootPath(context, allocator, disk_root);
+        defer allocator.free(cache_root);
+        runtime.runtime_lease = try acquireLazyRootfsLease(context, allocator, cache_root, storage, rootfs_cache_lock);
+        runtime.rootfs_fd = try createSparseTempFd(context, allocator, storage.logical_size);
+        const base_source = try runtime.baseSource(storage.logical_size);
+        runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initReadOnly(allocator, base_source, storage.logical_size, storage.chunk_size);
+        var parsed = try readDiskIndex(context, allocator, cache_root, storage);
+        defer parsed.deinit();
+        try runtime.chunk_mapped.?.attachCasIndexTraced(cache_root, parsed.value, runtime.trace_fd);
+        return runtime;
+    }
+    runtime.rootfs_fd = try openTrustedRootfs(context, allocator, rootfs, runtime.trace_fd, disk_root);
     return runtime;
 }
 

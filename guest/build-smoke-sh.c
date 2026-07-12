@@ -4,9 +4,11 @@
 #include <linux/fs.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <sys/vfs.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -18,6 +20,7 @@
 #define BLOCK_ENOSPC_CHUNK_BYTES ((off_t)256 * 1024 * 1024)
 #define INODE_ENOSPC_FILES_PER_DIR 128U
 #define INODE_ENOSPC_FILE_LIMIT 1000000U
+#define SCRATCH_INODE_SMOKE_FILES 2048U
 
 static unsigned char large_run_chunk[LARGE_RUN_CHUNK_BYTES];
 
@@ -49,6 +52,58 @@ static int write_all(int fd, const unsigned char *data, size_t len) {
     len -= (size_t)n;
   }
   return 0;
+}
+
+static int make_dir(const char *path, mode_t mode);
+static int file_exists(const char *path);
+
+static int generate_scratch_inode_tree(void) {
+  if (make_dir("/many-files", 0755) != 0) return 1;
+  for (unsigned int i = 0; i < SCRATCH_INODE_SMOKE_FILES; i++) {
+    char path[64];
+    int n = snprintf(path, sizeof(path), "/many-files/file-%05u", i);
+    if (n <= 0 || (size_t)n >= sizeof(path) || write_file(path, "x\n") != 0) return 1;
+  }
+  write_str(1, "generate-scratch-inode-tree\n");
+  return 0;
+}
+
+static int verify_scratch_inode_tree(void) {
+  for (unsigned int i = 0; i < SCRATCH_INODE_SMOKE_FILES; i++) {
+    char path[64];
+    struct stat st;
+    int n = snprintf(path, sizeof(path), "/many-files/file-%05u", i);
+    if (n <= 0 || (size_t)n >= sizeof(path) || lstat(path, &st) != 0 ||
+        !S_ISREG(st.st_mode) || st.st_size != 2) {
+      return 1;
+    }
+  }
+  write_str(1, "verify-scratch-inode-tree\n");
+  return 0;
+}
+
+static int transaction_prefix(void) {
+  write_str(1, "transaction-prefix\n");
+  return write_file("/transaction-prefix", "prefix\n");
+}
+
+static int transaction_suffix(void) {
+  if (!file_exists("/transaction-prefix")) return 3;
+  write_str(1, "transaction-suffix\n");
+  return write_file("/transaction-suffix", "suffix\n");
+}
+
+static int transaction_final(void) {
+  if (!file_exists("/transaction-prefix") || !file_exists("/transaction-suffix")) return 3;
+  write_str(1, "transaction-final\n");
+  return write_file("/transaction-final", "final\n");
+}
+
+static int record_inherited_arg(void) {
+  const char *value = getenv("CHOICE");
+  if (value == NULL || value[0] == '\0') return 3;
+  write_str(1, "record-inherited-arg\n");
+  return write_file("/inherited-arg", value);
 }
 
 static int make_dir(const char *path, mode_t mode) {
@@ -139,6 +194,11 @@ static int verify_clock(void) {
     write_str(2, "build-smoke-sh: realtime clock was not restored\n");
     return 7;
   }
+  struct rlimit nofile;
+  if (getrlimit(RLIMIT_NOFILE, &nofile) != 0 || nofile.rlim_cur != 65536 || nofile.rlim_max != 65536) {
+    write_str(2, "build-smoke-sh: RUN nofile limit was not applied\n");
+    return 7;
+  }
   write_str(1, "verify-clock\n");
   return 0;
 }
@@ -225,6 +285,11 @@ static int symlink_target_is(const char *path, const char *expected) {
 static int verify_copy(void) {
   if (!file_exists("/step1")) {
     write_str(2, "build-smoke-sh: missing /step1\n");
+    return 3;
+  }
+  if (!file_content_is("/tmp/spore-build-persist", "tmp\n") ||
+      !file_content_is("/run/spore-build-persist", "run\n")) {
+    write_str(2, "build-smoke-sh: cached-prefix /tmp or /run state was lost\n");
     return 3;
   }
   if (!file_content_is("/work/app/a.txt", "merged\n")) {
@@ -486,6 +551,46 @@ static int exhaust_inodes(void) {
   return 10;
 }
 
+static int persist_runtime_paths(void) {
+  if (write_file("/tmp/spore-build-persist", "tmp\n") != 0 ||
+      write_file("/run/spore-build-persist", "run\n") != 0) {
+    write_str(2, "build-smoke-sh: cannot persist /tmp and /run fixtures\n");
+    return 7;
+  }
+  write_str(1, "persist-runtime-paths\n");
+  return 0;
+}
+
+static int verify_resolver(void) {
+  if (!symlink_target_is("/etc/resolv.conf", "../run/systemd/resolve/stub-resolv.conf") ||
+      !file_content_is("/etc/resolv.conf", "nameserver 100.96.0.1\n")) {
+    write_str(2, "build-smoke-sh: build resolver is unavailable\n");
+    return 7;
+  }
+  write_str(1, "verify-resolver\n");
+  return 0;
+}
+
+static int verify_resolver_snapshot(void) {
+  if (!symlink_target_is("/etc/resolv.conf", "../run/systemd/resolve/stub-resolv.conf") ||
+      !path_absent("/run/systemd/resolve/stub-resolv.conf") ||
+      !path_absent("/run/systemd")) {
+    write_str(2, "build-smoke-sh: resolver scaffold entered rootfs snapshot\n");
+    return 7;
+  }
+  write_str(1, "verify-resolver-snapshot\n");
+  return 0;
+}
+
+static int remove_resolver(void) {
+  if (unlink("/etc/resolv.conf") != 0) {
+    write_str(2, "build-smoke-sh: cannot remove resolver\n");
+    return 7;
+  }
+  write_str(1, "remove-resolver\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc != 3 || strcmp(argv[1], "-c") != 0) {
     write_str(2, "build-smoke-sh: expected -c command\n");
@@ -509,6 +614,22 @@ int main(int argc, char **argv) {
     write_str(1, "step1\n");
     return write_file("/step1", "one\n");
   }
+  if (strcmp(cmd, "persist-runtime-paths") == 0) {
+    return persist_runtime_paths();
+  }
+  if (strcmp(cmd, "verify-resolver") == 0) {
+    return verify_resolver();
+  }
+  if (strcmp(cmd, "verify-resolver-snapshot") == 0) {
+    return verify_resolver_snapshot();
+  }
+  if (strcmp(cmd, "remove-resolver") == 0) {
+    return remove_resolver();
+  }
+  if (strcmp(cmd, "trailing-step") == 0) {
+    write_str(1, "trailing-step\n");
+    return write_file("/trailing-step", "stable\n");
+  }
   if (strcmp(cmd, "setup-symlink-targets") == 0) {
     return setup_symlink_targets();
   }
@@ -523,6 +644,28 @@ int main(int argc, char **argv) {
   }
   if (strcmp(cmd, "verify-large-run") == 0) {
     return verify_large_run();
+  }
+  if (strcmp(cmd, "generate-scratch-inode-tree") == 0) {
+    return generate_scratch_inode_tree();
+  }
+  if (strcmp(cmd, "verify-scratch-inode-tree") == 0) {
+    return verify_scratch_inode_tree();
+  }
+  if (strcmp(cmd, "transaction-prefix") == 0) {
+    return transaction_prefix();
+  }
+  if (strcmp(cmd, "transaction-fail") == 0) {
+    write_str(2, "transaction-fail\n");
+    return 23;
+  }
+  if (strcmp(cmd, "transaction-suffix") == 0) {
+    return transaction_suffix();
+  }
+  if (strcmp(cmd, "transaction-final") == 0) {
+    return transaction_final();
+  }
+  if (strcmp(cmd, "record-inherited-arg") == 0) {
+    return record_inherited_arg();
   }
   if (strcmp(cmd, "exhaust-blocks") == 0) {
     return exhaust_blocks();

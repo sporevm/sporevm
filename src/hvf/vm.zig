@@ -54,6 +54,8 @@ pub const Config = struct {
     /// Optional read-only build context disk. When present with a rootfs disk,
     /// Linux enumerates it as the second virtio-blk device.
     context_disk_fd: ?std.c.fd_t = null,
+    /// Bounded immutable build inputs, enumerated after the context disk.
+    build_input_disk_backends: []const blk.Backend = &.{},
     /// Optional active disk head to seal into a portable manifest layer when
     /// a snapshot is taken.
     disk_snapshot: ?disk_layer.SnapshotState = null,
@@ -346,12 +348,13 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     defer if (hotplug_mapping) |*mapping| mapping.deinit();
 
     // Devices: console is virtio-mmio slot 0, rootfs disk (if any) follows,
-    // then optional build context disk, net, vsock, rng.
+    // then optional build context and immutable input disks, net, vsock, rng.
     // The generation device is a separate fixed MMIO window after the reserved virtio range.
     const devices_start = monotonicMs();
     var con = console.Console{ .sink = config.console_sink };
     var blk_dev: blk.Blk = undefined;
     var context_blk_dev: blk.Blk = undefined;
+    var build_input_blk_devs: [2]blk.Blk = undefined;
     var net_dev = net.Net.init(.{ .backend = config.network.backend });
     defer net_dev.shutdown();
     var rng_dev = rng.Rng{};
@@ -368,8 +371,15 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         transport_count = 2;
     }
     if (config.context_disk_fd) |fd| {
-        context_blk_dev = blk.Blk.init(.{ .file = fd });
+        context_blk_dev = blk.Blk.initImmutableSource(.{ .file = fd });
         transports_buf[transport_count] = mmio.Transport.init(context_blk_dev.device());
+        transport_count += 1;
+    }
+    if (config.build_input_disk_backends.len > build_input_blk_devs.len) return error.TooManyBuildInputDisks;
+    if (transport_count + config.build_input_disk_backends.len + 3 + @intFromBool(hotplug_mapping != null) > transports_buf.len) return error.TooManyVirtioDevices;
+    for (config.build_input_disk_backends, 0..) |backend, index| {
+        build_input_blk_devs[index] = blk.Blk.initImmutableSource(backend);
+        transports_buf[transport_count] = mmio.Transport.init(build_input_blk_devs[index].device());
         transport_count += 1;
     }
     const net_transport_index = transport_count;
@@ -2884,6 +2894,14 @@ test "transport restore rejects unoffered block features" {
 
     try std.testing.expectError(error.BadManifest, applyTransports(&transports, &states));
     try std.testing.expectEqual(@as(u64, 0), transports[0].driver_features);
+}
+
+test "HVF build input wiring keeps WRITE_ZEROES on root vda only" {
+    var storage = [_]u8{0} ** blk.sector_size;
+    var root = blk.Blk.initWithOptions(.{ .memory = &storage }, .{ .write_zeroes = true });
+    var source = blk.Blk.initImmutableSource(.{ .memory = &storage });
+    try std.testing.expect(root.device().device_features & blk.feature_write_zeroes != 0);
+    try std.testing.expectEqual(@as(u64, 0), source.device().device_features & blk.feature_write_zeroes);
 }
 
 fn raiseGenerationIrqIfPending(gen_dev: *const generation.Device) !void {

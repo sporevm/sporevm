@@ -8,9 +8,14 @@ const rootfs_mod = @import("../rootfs.zig");
 const chunk_sealer = @import("../chunk_sealer.zig");
 
 pub const builder_version = "sporevm-build-v7";
+const legacy_builder_version = "sporevm-build-v6";
 const record_kind = "sporevm-build-step-v1";
+const stale_record_kind_v2 = "sporevm-build-step-v2";
 const max_step_record_bytes = 256 * 1024;
 const test_executor_identity = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+// SCRATCH has no filesystem parent. This reserved identity occupies the
+// parent-key domain without pretending that a user-visible image exists.
+const internal_scratch_parent_identity = "blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 const RecordEnvelope = struct {
     kind: []const u8,
@@ -18,6 +23,7 @@ const RecordEnvelope = struct {
 
 pub const GcRecordInspection = union(enum) {
     root: spore.RootfsStorage,
+    legacy: spore.RootfsStorage,
     stale,
     unknown,
 };
@@ -42,10 +48,16 @@ pub const StepInput = struct {
     operation: Operation,
 
     pub const Operation = union(enum) {
+        scratch: Scratch,
         prepare: Prepare,
         run: Run,
         copy: Copy,
         workdir: Workdir,
+    };
+
+    pub const Scratch = struct {
+        exact_target: u64,
+        format_identity: []const u8,
     };
 
     pub const Prepare = struct {
@@ -57,6 +69,10 @@ pub const StepInput = struct {
         env_digest: []const u8 = "",
         workdir: []const u8 = "/",
         network_mode: NetworkMode,
+        memory_bytes: ?u64 = null,
+        vcpus: ?u32 = null,
+        nofile_soft: ?u64 = null,
+        nofile_hard: ?u64 = null,
     };
 
     pub const Copy = struct {
@@ -77,6 +93,10 @@ pub const StepInput = struct {
         env_digest: []const u8,
         workdir: []const u8,
         network_mode: ?NetworkMode,
+        memory_bytes: ?u64,
+        vcpus: ?u32,
+        nofile_soft: ?u64,
+        nofile_hard: ?u64,
         exact_target: ?u64,
         producer_identity: ?[]const u8,
         executor_identity: []const u8,
@@ -84,12 +104,30 @@ pub const StepInput = struct {
 
     fn flatFields(self: StepInput) FlatFields {
         return switch (self.operation) {
+            .scratch => |scratch| .{
+                .instruction_kind = "SCRATCH",
+                .input_digest = scratch.format_identity,
+                .env_digest = "",
+                .workdir = "",
+                .network_mode = null,
+                .memory_bytes = null,
+                .vcpus = null,
+                .nofile_soft = null,
+                .nofile_hard = null,
+                .exact_target = scratch.exact_target,
+                .producer_identity = null,
+                .executor_identity = "",
+            },
             .prepare => |prepare| .{
                 .instruction_kind = "PREPARE",
                 .input_digest = "",
                 .env_digest = "",
                 .workdir = "",
                 .network_mode = null,
+                .memory_bytes = null,
+                .vcpus = null,
+                .nofile_soft = null,
+                .nofile_hard = null,
                 .exact_target = prepare.exact_target,
                 .producer_identity = prepare.producer_identity,
                 .executor_identity = "",
@@ -100,6 +138,10 @@ pub const StepInput = struct {
                 .env_digest = run.env_digest,
                 .workdir = run.workdir,
                 .network_mode = run.network_mode,
+                .memory_bytes = run.memory_bytes,
+                .vcpus = run.vcpus,
+                .nofile_soft = run.nofile_soft,
+                .nofile_hard = run.nofile_hard,
                 .exact_target = null,
                 .producer_identity = null,
                 .executor_identity = self.executor_identity,
@@ -110,6 +152,10 @@ pub const StepInput = struct {
                 .env_digest = copy.env_digest,
                 .workdir = copy.workdir,
                 .network_mode = null,
+                .memory_bytes = null,
+                .vcpus = null,
+                .nofile_soft = null,
+                .nofile_hard = null,
                 .exact_target = null,
                 .producer_identity = null,
                 .executor_identity = self.executor_identity,
@@ -120,6 +166,10 @@ pub const StepInput = struct {
                 .env_digest = workdir.env_digest,
                 .workdir = workdir.workdir,
                 .network_mode = null,
+                .memory_bytes = null,
+                .vcpus = null,
+                .nofile_soft = null,
+                .nofile_hard = null,
                 .exact_target = null,
                 .producer_identity = null,
                 .executor_identity = self.executor_identity,
@@ -127,6 +177,17 @@ pub const StepInput = struct {
         };
     }
 };
+
+pub fn scratchInput(platform: rootfs_mod.Platform, exact_target: u64, format_identity: []const u8) !StepInput {
+    const input = StepInput{
+        .platform = platform,
+        .parent_index_digest = internal_scratch_parent_identity,
+        .canonical_instruction = "SCRATCH",
+        .operation = .{ .scratch = .{ .exact_target = exact_target, .format_identity = format_identity } },
+    };
+    try validateInput(input, input.flatFields());
+    return input;
+}
 
 pub fn prepareInput(
     platform: rootfs_mod.Platform,
@@ -161,6 +222,10 @@ pub const StepRecord = struct {
     env_digest: []const u8 = "",
     workdir: []const u8 = "/",
     network_mode: ?NetworkMode = null,
+    memory_bytes: ?u64 = null,
+    vcpus: ?u32 = null,
+    nofile_soft: ?u64 = null,
+    nofile_hard: ?u64 = null,
     exact_target: ?u64 = null,
     producer_identity: ?[]const u8 = null,
     executor_identity: []const u8 = "",
@@ -181,6 +246,10 @@ pub fn stepKey(allocator: std.mem.Allocator, input: StepInput) ![]const u8 {
     hashField(&h, fields.env_digest);
     hashField(&h, fields.workdir);
     hashOptionalField(&h, if (fields.network_mode) |mode| @tagName(mode) else null);
+    hashOptionalU64(&h, fields.memory_bytes);
+    hashOptionalU32(&h, fields.vcpus);
+    hashOptionalU64(&h, fields.nofile_soft);
+    hashOptionalU64(&h, fields.nofile_hard);
     hashOptionalU64(&h, fields.exact_target);
     hashOptionalField(&h, fields.producer_identity);
     hashField(&h, fields.executor_identity);
@@ -245,6 +314,10 @@ pub fn writeRecord(
         .env_digest = fields.env_digest,
         .workdir = fields.workdir,
         .network_mode = fields.network_mode,
+        .memory_bytes = fields.memory_bytes,
+        .vcpus = fields.vcpus,
+        .nofile_soft = fields.nofile_soft,
+        .nofile_hard = fields.nofile_hard,
         .exact_target = fields.exact_target,
         .producer_identity = fields.producer_identity,
         .executor_identity = fields.executor_identity,
@@ -295,6 +368,8 @@ pub fn readHit(
     if (!std.mem.eql(u8, record.env_digest, fields.env_digest)) return null;
     if (!std.mem.eql(u8, record.workdir, fields.workdir)) return null;
     if (record.network_mode != fields.network_mode) return null;
+    if (record.memory_bytes != fields.memory_bytes or record.vcpus != fields.vcpus or
+        record.nofile_soft != fields.nofile_soft or record.nofile_hard != fields.nofile_hard) return null;
     if (!recordPreparationFieldsMatch(record, fields)) return null;
     if (!std.mem.eql(u8, record.executor_identity, fields.executor_identity)) return null;
     validateChildForInput(input, storage) catch return null;
@@ -320,6 +395,7 @@ pub fn inspectRecordForGc(
         .ignore_unknown_fields = true,
     }) catch return .unknown;
     defer envelope.deinit();
+    if (std.mem.eql(u8, envelope.value.kind, stale_record_kind_v2)) return .stale;
     if (!std.mem.eql(u8, envelope.value.kind, record_kind)) return .unknown;
 
     var parsed = std.json.parseFromSlice(StepRecord, allocator, bytes, .{
@@ -327,10 +403,21 @@ pub fn inspectRecordForGc(
         .ignore_unknown_fields = true,
     }) catch return .stale;
     defer parsed.deinit();
-    // Builder-version mismatches are cache misses for this binary, but the
-    // schema-valid child may still be live for another version. Root it until
-    // explicit step-record retention policy removes the record.
     const storage = validChildStorage(parsed.value, expected_key) orelse return .stale;
+    if (std.mem.eql(u8, parsed.value.builder_version, legacy_builder_version)) {
+        if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, storage) and
+            !try rootfs_cas.storageContentComplete(io, allocator, cache_root, storage)) return .stale;
+        return .{ .legacy = try spore.cloneRootfsStorage(allocator, storage) };
+    }
+    if (!std.mem.eql(u8, parsed.value.builder_version, builder_version)) return .unknown;
+    const input = currentRecordInput(parsed.value) catch |err| switch (err) {
+        error.UnknownBuildOperation => return .unknown,
+        else => return .stale,
+    };
+    const semantic_key = stepKey(allocator, input) catch return .stale;
+    defer allocator.free(semantic_key);
+    if (!std.mem.eql(u8, semantic_key, expected_key)) return .stale;
+    validateChildForInput(input, storage) catch return .stale;
     // Complete stamps are invalidated before normal CAS deletion, so retain the
     // O(1) fast path when possible and scan every object only to repair legacy
     // or interrupted publication.
@@ -348,6 +435,82 @@ fn validChildStorage(record: StepRecord, expected_key: []const u8) ?spore.Rootfs
     return record.rootfs_storage;
 }
 
+fn currentRecordInput(record: StepRecord) !StepInput {
+    const no_prepare_fields = record.exact_target == null and record.producer_identity == null;
+    const no_resource_fields = record.memory_bytes == null and record.vcpus == null and record.nofile_soft == null and record.nofile_hard == null;
+    if (std.mem.eql(u8, record.instruction_kind, "SCRATCH")) {
+        const target = record.exact_target orelse return error.MalformedBuildRecord;
+        if (!std.mem.eql(u8, record.instruction, "SCRATCH") or record.input_digest.len == 0 or
+            record.env_digest.len != 0 or record.workdir.len != 0 or record.network_mode != null or
+            !no_resource_fields or record.producer_identity != null or record.executor_identity.len != 0)
+        {
+            return error.MalformedBuildRecord;
+        }
+        return scratchInput(record.platform, target, record.input_digest);
+    }
+    if (std.mem.eql(u8, record.instruction_kind, "PREPARE")) {
+        const target = record.exact_target orelse return error.MalformedBuildRecord;
+        const producer = record.producer_identity orelse return error.MalformedBuildRecord;
+        if (!std.mem.eql(u8, record.instruction, "PREPARE") or record.input_digest.len != 0 or
+            record.env_digest.len != 0 or record.workdir.len != 0 or record.network_mode != null or
+            !no_resource_fields or record.executor_identity.len != 0) return error.MalformedBuildRecord;
+        const input = try prepareInput(record.platform, record.parent_index_digest, target, producer);
+        return input;
+    }
+    if (!no_prepare_fields) return error.MalformedBuildRecord;
+    if (std.mem.eql(u8, record.instruction_kind, "RUN")) {
+        if (!std.mem.startsWith(u8, record.instruction, "RUN ") or record.input_digest.len != 0 or
+            record.network_mode == null or record.memory_bytes == null or record.vcpus == null or
+            record.nofile_soft == null or record.nofile_hard == null) return error.MalformedBuildRecord;
+        return .{
+            .platform = record.platform,
+            .parent_index_digest = record.parent_index_digest,
+            .canonical_instruction = record.instruction,
+            .executor_identity = record.executor_identity,
+            .operation = .{ .run = .{
+                .env_digest = record.env_digest,
+                .workdir = record.workdir,
+                .network_mode = record.network_mode.?,
+                .memory_bytes = record.memory_bytes,
+                .vcpus = record.vcpus,
+                .nofile_soft = record.nofile_soft,
+                .nofile_hard = record.nofile_hard,
+            } },
+        };
+    }
+    if (std.mem.eql(u8, record.instruction_kind, "COPY")) {
+        if (!std.mem.startsWith(u8, record.instruction, "COPY ") or record.input_digest.len == 0 or
+            record.network_mode != null or !no_resource_fields) return error.MalformedBuildRecord;
+        return .{
+            .platform = record.platform,
+            .parent_index_digest = record.parent_index_digest,
+            .canonical_instruction = record.instruction,
+            .executor_identity = record.executor_identity,
+            .operation = .{ .copy = .{
+                .input_digest = record.input_digest,
+                .env_digest = record.env_digest,
+                .workdir = record.workdir,
+            } },
+        };
+    }
+    if (std.mem.eql(u8, record.instruction_kind, "WORKDIR")) {
+        if (!std.mem.startsWith(u8, record.instruction, "WORKDIR ") or record.input_digest.len == 0 or
+            record.network_mode != null or !no_resource_fields) return error.MalformedBuildRecord;
+        return .{
+            .platform = record.platform,
+            .parent_index_digest = record.parent_index_digest,
+            .canonical_instruction = record.instruction,
+            .executor_identity = record.executor_identity,
+            .operation = .{ .workdir = .{
+                .target = record.input_digest,
+                .env_digest = record.env_digest,
+                .workdir = record.workdir,
+            } },
+        };
+    }
+    return error.UnknownBuildOperation;
+}
+
 fn validateInput(input: StepInput, fields: StepInput.FlatFields) !void {
     if (!std.mem.eql(u8, input.platform.os, "linux") or !std.mem.eql(u8, input.platform.arch, "arm64")) {
         return error.BadBuildCacheInput;
@@ -356,6 +519,11 @@ fn validateInput(input: StepInput, fields: StepInput.FlatFields) !void {
     if (input.canonical_instruction.len == 0) return error.BadBuildCacheInput;
 
     switch (input.operation) {
+        .scratch => |scratch| {
+            if (!std.mem.eql(u8, input.canonical_instruction, "SCRATCH")) return error.BadBuildCacheInput;
+            if (input.executor_identity.len != 0 or scratch.exact_target == 0 or scratch.format_identity.len == 0) return error.BadBuildCacheInput;
+            if (fields.exact_target != scratch.exact_target or fields.producer_identity != null) return error.BadBuildCacheInput;
+        },
         .prepare => |prepare| {
             if (!std.mem.eql(u8, input.canonical_instruction, "PREPARE")) return error.BadBuildCacheInput;
             if (input.executor_identity.len != 0) return error.BadBuildCacheInput;
@@ -382,6 +550,7 @@ fn validateInput(input: StepInput, fields: StepInput.FlatFields) !void {
 
 fn validateChildForInput(input: StepInput, storage: spore.RootfsStorage) !void {
     switch (input.operation) {
+        .scratch => |scratch| if (storage.logical_size != scratch.exact_target) return error.BadManifest,
         .prepare => |prepare| if (storage.logical_size != prepare.exact_target) return error.BadManifest,
         .run, .copy, .workdir => {},
     }
@@ -441,6 +610,17 @@ fn hashOptionalU64(h: *Blake3, maybe_value: ?u64) void {
         h.update("\x01");
         var buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &buf, value, .little);
+        h.update(&buf);
+    } else {
+        h.update("\x00");
+    }
+}
+
+fn hashOptionalU32(h: *Blake3, maybe_value: ?u32) void {
+    if (maybe_value) |value| {
+        h.update("\x01");
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buf, value, .little);
         h.update(&buf);
     } else {
         h.update("\x00");
@@ -714,6 +894,58 @@ test "prepare record rejects target mismatch and missing completeness stamp" {
     try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, arena, cache_root, storage));
 }
 
+test "pre-capability COPY record misses after executor identity changes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-build-step-cache-copy-executor-upgrade";
+    const cache_root = tmp ++ "/cache";
+    const child_rootfs = tmp ++ "/child.ext4";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "capability-preserving child rootfs bytes" });
+
+    const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
+    const old_identity = "blake3:2222222222222222222222222222222222222222222222222222222222222222";
+    const new_identity = "blake3:3333333333333333333333333333333333333333333333333333333333333333";
+    const old_input = StepInput{
+        .platform = .{},
+        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .canonical_instruction = "COPY --from=build /owned/capability /capability",
+        .executor_identity = old_identity,
+        .operation = .{ .copy = .{
+            .input_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .env_digest = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            .workdir = "/",
+        } },
+    };
+    const old_key = try stepKey(arena, old_input);
+    const old_path = try writeRecord(io, arena, cache_root, old_input, old_key, storage);
+    try std.testing.expect((try readHit(io, arena, cache_root, old_input, old_key)) != null);
+
+    var new_input = old_input;
+    new_input.executor_identity = new_identity;
+    const new_key = try stepKey(arena, new_input);
+    try std.testing.expect(!std.mem.eql(u8, old_key, new_key));
+    // Model a stale/malicious alias at the new key too: the inner exact
+    // identity check must still reject the pre-upgrade record.
+    const new_path = try recordPath(arena, cache_root, new_key);
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(new_path) orelse return error.BadManifest);
+    const old_bytes = try Io.Dir.cwd().readFileAlloc(io, old_path, arena, .limited(max_step_record_bytes));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = new_path, .data = old_bytes });
+    try std.testing.expect((try readHit(io, arena, cache_root, new_input, new_key)) == null);
+
+    // Rebuilding under the v0.6.3 executor replaces the record with the new
+    // identity. The native multi-stage conformance fixture independently
+    // compares the exact security.capability bytes in that rebuilt output.
+    _ = try writeRecord(io, arena, cache_root, new_input, new_key, storage);
+    try std.testing.expect((try readHit(io, arena, cache_root, new_input, new_key)) != null);
+}
+
 test "gc inspection retains complete v6 records with removed fields" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -749,7 +981,7 @@ test "gc inspection retains complete v6 records with removed fields" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = legacy_json });
 
     switch (try inspectRecordForGc(io, arena, cache_root, path, legacy_key)) {
-        .root => |root| try std.testing.expectEqualStrings(storage.index_digest, root.index_digest),
-        .stale, .unknown => return error.MissingBuildCacheRecord,
+        .legacy => |legacy_storage| try std.testing.expectEqualStrings(storage.index_digest, legacy_storage.index_digest),
+        .root, .stale, .unknown => return error.MissingBuildCacheRecord,
     }
 }

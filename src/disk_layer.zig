@@ -54,7 +54,7 @@ pub const ActiveHead = union(enum) {
     }
 };
 
-const DiskSnapshotMetrics = struct {
+pub const SnapshotMetrics = struct {
     logical_bytes: u64,
     chunks: u64,
     dirty_chunks: usize,
@@ -75,7 +75,7 @@ const DiskSnapshotMetrics = struct {
     total_us: u64,
 };
 
-fn formatDiskSnapshotMetrics(buf: []u8, metrics: DiskSnapshotMetrics) std.fmt.BufPrintError![]const u8 {
+fn formatDiskSnapshotMetrics(buf: []u8, metrics: SnapshotMetrics) std.fmt.BufPrintError![]const u8 {
     return std.fmt.bufPrint(
         buf,
         "disk snapshot metrics: schema=2 logical_bytes={d} chunks={d} dirty_chunks={d} non_dirty_chunks={d} full_scan={} sealed_candidate_chunks={d} sealed_chunks={d} clean_zero_chunks_reused={d} dirty_zero_chunks_recorded={d} parent_chunks_reused={d} parent_referenced_bytes={d} parent_objects_linked={d} parent_objects_reused={d} parent_objects_copied={d} parent_object_bytes={d} parent_link_bytes={d} parent_reuse_bytes={d} parent_copy_bytes={d} parent_link_us={d} parent_reuse_us={d} parent_copy_us={d} parent_sync_us={d} zero_scan_us={d} hash_us={d} object_write_us={d} index_bytes={d} index_encode_us={d} index_publish_us={d} total_us={d}",
@@ -116,6 +116,7 @@ fn formatDiskSnapshotMetrics(buf: []u8, metrics: DiskSnapshotMetrics) std.fmt.Bu
 pub const SnapshotState = struct {
     base: spore.Disk,
     active: ActiveHead,
+    metrics: ?*SnapshotMetrics = null,
 
     /// Finish a writable disk snapshot after the VMM has paused the guest and
     /// verified the matching virtio-blk queues have no pending requests.
@@ -133,7 +134,7 @@ pub const SnapshotState = struct {
         };
         const chunks = std.math.divCeil(u64, result.size, result.chunk_size) catch 0;
         var metrics_buf: [2048]u8 = undefined;
-        const metrics = formatDiskSnapshotMetrics(&metrics_buf, .{
+        const snapshot_metrics: SnapshotMetrics = .{
             .logical_bytes = result.size,
             .chunks = chunks,
             .dirty_chunks = dirty_chunks,
@@ -152,7 +153,9 @@ pub const SnapshotState = struct {
             .index_encode_us = stats.index_encode_ns / std.time.ns_per_us,
             .index_publish_us = stats.index_publish_ns / std.time.ns_per_us,
             .total_us = ((try monotonicNs()) -| start_ns) / std.time.ns_per_us,
-        }) catch return error.ShortWrite;
+        };
+        if (self.metrics) |sink| sink.* = snapshot_metrics;
+        const metrics = formatDiskSnapshotMetrics(&metrics_buf, snapshot_metrics) catch return error.ShortWrite;
         std.log.info("{s}", .{metrics});
         return result;
     }

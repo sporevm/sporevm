@@ -16,12 +16,16 @@ run = "zig build --release=safe --prefix \"$HOME\""
 description = "Install optimized spore into ~/bin"
 
 [tasks.test]
-run = "zig build test && python3 scripts/benchmark/parse-save-metrics.py --self-test && python3 scripts/benchmark/named-restore-readiness.py --self-test && python3 scripts/benchmark/named-restore-readiness-test.py && bash scripts/ci/named-restore-release-inputs-test.sh"
+run = "zig build test && python3 scripts/benchmark/parse-save-metrics.py --self-test && python3 scripts/benchmark/named-restore-readiness.py --self-test && python3 scripts/benchmark/named-restore-readiness-test.py && bash scripts/ci/named-restore-release-inputs-test.sh && python3 scripts/spore-build-conformance.py --self-test-schema"
 description = "Run unit tests and benchmark parser contract checks"
 
 [tasks."test:rootfs-slow"]
 run = "zig build rootfs-slow-test"
 description = "Run slow rootfs/ext4 conformance tests"
+
+[tasks."test:spore-build-conformance"]
+run = "mise run build && scripts/spore-build-conformance.py --spore-bin zig-out/bin/spore"
+description = "Compare the landed spore build subset with BuildKit on small fixtures"
 
 [tasks.docs]
 run = "zig build docs"

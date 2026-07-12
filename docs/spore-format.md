@@ -85,6 +85,12 @@ and the mutable local ref are published after the selected storage is
 revalidated. PREPARE records use the existing step-record GC root and introduce
 no portable manifest, rootfs descriptor, index, or object kind.
 
+Rootfs cache GC recognizes valid complete builder-v6 records as legacy cache
+misses but retains both the record and its child storage as roots. Malformed or
+incomplete known records and semantically stale builder-v7 records are
+pruneable. Unknown future record kinds or schema versions are preserved and
+conservatively retain the rootfs CAS namespace.
+
 The local image identity published by `spore build` is distinct from the raw
 rootfs storage identity. `spore build` first serializes the final
 `ImageConfig` as canonical JSON with optional null fields omitted and the
