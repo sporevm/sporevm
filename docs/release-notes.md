@@ -21,9 +21,11 @@ Named monitors now advance host-side vsock ports from a random per-process
 offset for readiness and every control stream. Completing a stream also drops
 queued packets for its old four-tuple before the next attach, preventing stale
 credit or control traffic from crossing into a repeated named exec.
-After the multi-vCPU HVF coordinator delivers a host vsock request and raises
-its SPI, it now exits the running vCPUs once so an idle guest observes the new
-interrupt promptly; polls that deliver nothing do not wake the vCPUs.
+Multi-vCPU HVF and KVM now dispatch completed hypervisor exits before handling
+concurrent network wakes, so virtio MMIO operations cannot be dropped and
+re-executed while the guest is inside an interrupt handler. After multi-vCPU
+HVF delivers a host vsock request and raises its SPI, it exits the running vCPUs
+once so an idle guest observes the interrupt promptly; empty polls do not wake.
 
 The named-restore release harness pins v0.12.0 archives and managed-kernel
 assets by digest and requires an exact clean current commit on Linux ARM64/KVM

@@ -116,6 +116,21 @@ pub const DirtyTrackingOptions = struct {
 
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete, monitor_stopped };
 
+const KvmPostRunAction = enum { dispatch_exit, handle_async_wake };
+
+fn kvmPostRunAction(result: kvm.RunResult, immediate_exit: bool) KvmPostRunAction {
+    // KVM_RUN returning success publishes an authoritative exit_reason. A
+    // racing immediate_exit must be handled on the next entry, after userspace
+    // has completed this exit.
+    _ = immediate_exit;
+    return if (result == .completed) .dispatch_exit else .handle_async_wake;
+}
+
+test "completed KVM exit wins a racing network wake" {
+    try std.testing.expectEqual(KvmPostRunAction.dispatch_exit, kvmPostRunAction(.completed, true));
+    try std.testing.expectEqual(KvmPostRunAction.handle_async_wake, kvmPostRunAction(.interrupted, true));
+}
+
 const RestoreStats = struct {
     start_ms: u64,
     manifest_ms: u64 = 0,
@@ -668,19 +683,13 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             }
         }
 
-        switch (try kvm.runVcpu(vcpu_fd)) {
-            .completed => {
-                const stopped_for_wake = run_bytes[kvm.RunLayout.immediate_exit] != 0;
-                if (consumeCaptureWake(config.capture_request, run_bytes)) continue;
-                if (config.network.failed()) continue;
-                if (config.network.consumeWake()) {
-                    try flushNetworkRxKvm(vm_fd, &net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
-                    if (stopped_for_wake) continue;
-                }
-                if (stopped_for_wake and config.exec_control != null) continue;
-                pending_kvm_completion = false;
-            },
-            .interrupted => {
+        const run_result = try kvm.runVcpu(vcpu_fd);
+        // KVM completes a prior userspace MMIO operation before checking
+        // immediate_exit or pending signals, so either return completes it.
+        pending_kvm_completion = false;
+        switch (kvmPostRunAction(run_result, run_bytes[kvm.RunLayout.immediate_exit] != 0)) {
+            .dispatch_exit => {},
+            .handle_async_wake => {
                 const stopped_for_wake = run_bytes[kvm.RunLayout.immediate_exit] != 0;
                 _ = consumeCaptureWake(config.capture_request, run_bytes);
                 if (config.capture_request) |request_capture| {
@@ -1224,23 +1233,22 @@ fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
             ctx.state.finish(.{ .err = err });
             return;
         };
-        const stopped_for_wake = ctx.vcpu.run_bytes[kvm.RunLayout.immediate_exit] != 0;
-        _ = consumeCaptureWake(null, ctx.vcpu.run_bytes);
-        if (run_result == .completed) pending_kvm_completion = false;
-        if (ctx.state.snapshotRequested() and (run_result == .interrupted or stopped_for_wake)) {
-            if (!completePendingKvmExitBeforeSnapshot(ctx, &pending_kvm_completion)) return;
-            ctx.vcpu.snapshot_paused.store(true, .release);
-            continue;
-        }
-        const stop_requested = ctx.state.stopped();
-        if (stop_requested and (run_result == .interrupted or stopped_for_wake)) continue;
-
-        if (!stop_requested and ctx.network.failed()) {
-            ctx.state.finish(.{ .err = error.NetworkGatewayFailed });
-            continue;
-        }
-        var flushed_network = false;
-        if (!stop_requested) {
+        // KVM completes a prior userspace MMIO operation before checking
+        // immediate_exit or pending signals, so either return completes it.
+        pending_kvm_completion = false;
+        const post_run_action = kvmPostRunAction(run_result, ctx.vcpu.run_bytes[kvm.RunLayout.immediate_exit] != 0);
+        if (post_run_action == .handle_async_wake) {
+            _ = consumeCaptureWake(null, ctx.vcpu.run_bytes);
+            if (ctx.state.snapshotRequested()) {
+                if (!completePendingKvmExitBeforeSnapshot(ctx, &pending_kvm_completion)) return;
+                ctx.vcpu.snapshot_paused.store(true, .release);
+                continue;
+            }
+            if (ctx.state.stopped()) continue;
+            if (ctx.network.failed()) {
+                ctx.state.finish(.{ .err = error.NetworkGatewayFailed });
+                continue;
+            }
             ctx.device_lock.lock();
             if (ctx.network.consumeWake()) {
                 flushNetworkRxKvm(ctx.vm_fd, ctx.net_dev, &ctx.transports[ctx.net_transport_index], ctx.ram, ctx.net_transport_index) catch |err| {
@@ -1248,12 +1256,10 @@ fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
                     ctx.state.finish(.{ .err = err });
                     return;
                 };
-                flushed_network = true;
             }
             ctx.device_lock.unlock();
+            continue;
         }
-        if (flushed_network) continue;
-        if (run_result == .interrupted or stopped_for_wake) continue;
 
         switch (kvm.exitReason(ctx.vcpu.run_bytes)) {
             kvm.KVM_EXIT_MMIO => {

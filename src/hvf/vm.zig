@@ -112,6 +112,14 @@ fn hasFreshCaptureTrigger(config: Config) bool {
 
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete, monitor_stopped };
 
+const HvfPostRunAction = enum { dispatch_exit, resume_before_run };
+
+fn hvfPostRunAction(reason: hvf.ExitReason) HvfPostRunAction {
+    // Async wakes surface as canceled. Every other return carries completed
+    // guest work that must be dispatched before the next pre-run wake flush.
+    return if (reason == .canceled) .resume_before_run else .dispatch_exit;
+}
+
 pub const DirtyTrackingOptions = struct {
     enabled: bool = false,
     /// 0 disables periodic sealing and measures only the final tail flush.
@@ -1613,12 +1621,6 @@ fn hvfVcpuThreadMain(ctx: *MultiHvfThreadContext) void {
             sleepMs(1);
             continue;
         }
-        hvf.check(hvf.hv_vcpu_run(ctx.vcpu.handle), "hv_vcpu_run") catch |err| {
-            ctx.state.finish(.{ .err = err });
-            return;
-        };
-        if (ctx.state.stopped()) continue;
-
         if (ctx.network.failed()) {
             ctx.state.finish(.{ .err = error.NetworkGatewayFailed });
             continue;
@@ -1635,6 +1637,12 @@ fn hvfVcpuThreadMain(ctx: *MultiHvfThreadContext) void {
         }
         ctx.device_lock.unlock();
         if (flushed_network) continue;
+        hvf.check(hvf.hv_vcpu_run(ctx.vcpu.handle), "hv_vcpu_run") catch |err| {
+            ctx.state.finish(.{ .err = err });
+            return;
+        };
+        if (ctx.state.stopped()) continue;
+        if (hvfPostRunAction(ctx.vcpu.exit.reason) == .resume_before_run) continue;
 
         switch (ctx.vcpu.exit.reason) {
             .exception => {
@@ -1723,7 +1731,7 @@ fn hvfVcpuThreadMain(ctx: *MultiHvfThreadContext) void {
                     return;
                 };
             },
-            .canceled => continue,
+            .canceled => unreachable,
             else => {
                 std.log.err("unhandled HVF exit reason {} on vcpu {d}", .{ ctx.vcpu.exit.reason, ctx.vcpu.index });
                 ctx.state.finish(.{ .err = error.UnhandledExit });
@@ -3169,6 +3177,19 @@ test "vsock rx flush materializes lazy transport queues before delivery" {
     );
 }
 
+test "multi-vcpu network wake preserves completed HVF MMIO exit" {
+    var exit = dataAbortExitForTest(board.virtio_base + 0x050, 2, 3, true);
+    try std.testing.expectEqual(hvf.ec_data_abort, exit.exception.exceptionClass());
+    try std.testing.expectEqual(HvfPostRunAction.dispatch_exit, hvfPostRunAction(exit.reason));
+    const access = try decodeMmioAccess(&exit);
+    try std.testing.expect(access.is_write);
+    try std.testing.expectEqual(board.virtio_base + 0x050, access.ipa);
+
+    // A canceled return has no completed guest exit; its still-pending network
+    // wake is consumed by the pre-run flush on the next iteration.
+    try std.testing.expectEqual(HvfPostRunAction.resume_before_run, hvfPostRunAction(.canceled));
+}
+
 const TestVsockWakeCounter = struct {
     count: usize = 0,
 
@@ -3178,7 +3199,7 @@ const TestVsockWakeCounter = struct {
     }
 };
 
-test "multi-vcpu vsock delivery kicks idle vcpus after every delivered attach" {
+test "multi-vcpu vsock delivery wakes once per delivered batch" {
     var counter = TestVsockWakeCounter{};
     const wake = vsock.Wake{ .context = &counter, .wakeFn = TestVsockWakeCounter.wake };
 
@@ -3186,6 +3207,7 @@ test "multi-vcpu vsock delivery kicks idle vcpus after every delivered attach" {
     try std.testing.expectEqual(@as(usize, 0), counter.count);
 
     wakeAfterVsockRxDelivery(true, wake);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
     wakeAfterVsockRxDelivery(true, wake);
     try std.testing.expectEqual(@as(usize, 2), counter.count);
 }
