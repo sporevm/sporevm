@@ -33,6 +33,7 @@
 #define SPORE_ENUM_TYPED
 #endif
 #define SPORE_ENUM_MAX_VALUE INT_MAX
+#define SPORE_ABI_VERSION 15u
 
 #ifdef __cplusplus
 extern "C" {
@@ -82,6 +83,7 @@ typedef struct SporeExecNamedStreamImpl *SporeExecNamedStream;
 #define SPORE_COPY_NAMED_OPTIONS_VERSION 1u
 #define SPORE_SAVE_NAMED_OPTIONS_VERSION 1u
 #define SPORE_REMOVE_NAMED_OPTIONS_VERSION 1u
+#define SPORE_REMOVE_SAVED_OPTIONS_VERSION 1u
 #define SPORE_INSPECT_SPORE_OPTIONS_VERSION 1u
 #define SPORE_REEXEC_CONTRACT_VERSION 1u
 
@@ -296,6 +298,13 @@ typedef struct SporeRemoveNamedOptions {
   SporeString name;
 } SporeRemoveNamedOptions;
 
+/** Options for spore_remove_saved_json(). */
+typedef struct SporeRemoveSavedOptions {
+  uint32_t size;
+  uint32_t version;
+  SporeString spore_dir;
+} SporeRemoveSavedOptions;
+
 /** Initialize inspect-bundle options with the current ABI size and version. */
 SPORE_API void spore_inspect_bundle_options_init(SporeInspectBundleOptions *options);
 
@@ -334,6 +343,7 @@ SPORE_API void spore_save_named_options_init(SporeSaveNamedOptions *options);
 
 /** Initialize remove-named options with defaults. */
 SPORE_API void spore_remove_named_options_init(SporeRemoveNamedOptions *options);
+SPORE_API void spore_remove_saved_options_init(SporeRemoveSavedOptions *options);
 
 /**
  * Query compile-time library information.
@@ -510,6 +520,11 @@ SPORE_API SporeResult spore_save_named_json(SporeContext context,
 /** Remove a named VM and return `spore.lifecycle.v1` JSON. */
 SPORE_API SporeResult spore_remove_named_json(SporeContext context,
                                               const SporeRemoveNamedOptions *options,
+                                              SporeOwnedString *out_json);
+
+/** Remove a machine-local saved spore and unregister its durable CAS pin. */
+SPORE_API SporeResult spore_remove_saved_json(SporeContext context,
+                                              const SporeRemoveSavedOptions *options,
                                               SporeOwnedString *out_json);
 
 /** List named VMs and return JSON. */

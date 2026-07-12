@@ -1,6 +1,12 @@
 //! Per-VM monitor process and local control protocol.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const local_paths = @import("local_paths.zig");
+const rootfs_mod = @import("rootfs.zig");
+const saved_spore_pin = @import("saved_spore_pin.zig");
+const snapshot_publication = @import("snapshot_publication.zig");
+const chunk_sealer = @import("chunk_sealer.zig");
 const Io = std.Io;
 const net = std.Io.net;
 
@@ -9,6 +15,7 @@ const lifecycle = @import("lifecycle.zig");
 const memory_config = @import("memory.zig");
 const monitor_jail = @import("monitor_jail.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
+const runtime_disk = @import("runtime_disk.zig");
 const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const runtime_disk_fork_capture = @import("runtime_disk_fork_capture.zig");
 const runtime_disk_fork_control = @import("runtime_disk_fork_control.zig");
@@ -27,6 +34,12 @@ const max_control_response = 128 * 1024;
 const max_suspend_path = 4096;
 const stats_write_interval_ms = 250;
 const registry_check_interval_ms = 1_000;
+
+const SnapshotLeaseHandoffTestFault = struct {
+    fail_before_source_spec: bool = false,
+};
+
+var snapshot_lease_handoff_test_fault: SnapshotLeaseHandoffTestFault = .{};
 const streaming_send_deadline_ms = 25;
 const disk_claim_timeout_ns = 5 * 60 * std.time.ns_per_s;
 
@@ -220,8 +233,15 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .console_log_path = opts.console_log_path,
     });
 
-    var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.control_socket_path, paths.monitor_stats_path, opts.guest_port, opts.timeout_ms, spec_resume_generation_params);
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.runtime_root, paths.control_socket_path, paths.monitor_stats_path, cache_root, opts.guest_port, opts.timeout_ms, spec_resume_generation_params);
     defer server.disk_claims.deinit();
+    defer if (server.disk_baseline_active) |*active| active.deinit();
+    if (spec_disk_baseline_lease) |lease| if (lease.store == .rootfs_cache) {
+        var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, lease.root);
+        defer cache_lock.deinit();
+        server.disk_baseline_active = try runtime_disk_lease.acquireActive(init.io, allocator, paths.runtime_root, lease);
+    };
     if (gateway_active) server.network_events = &gateway;
     const metadata_ms = lifecycle.monotonicMs();
     server.startup = .{
@@ -300,8 +320,10 @@ const ExecServer = struct {
     allocator: std.mem.Allocator,
     io: Io,
     vm_dir: []const u8,
+    runtime_root: []const u8,
     socket_path: []const u8,
     stats_path: []const u8,
+    cache_root: []const u8,
     guest_port: u32,
     timeout_ms: u64,
     server: net.Server,
@@ -350,8 +372,10 @@ const ExecServer = struct {
     last_registry_check_ms: u64 = 0,
     closed: std.atomic.Value(bool) = .init(false),
     startup: ?StartupMetadata = null,
+    disk_baseline_active: ?runtime_disk_lease.Active = null,
+    snapshot_publication_wait: snapshot_publication.Wait = .{},
 
-    fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, socket_path: []const u8, stats_path: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8) !ExecServer {
+    fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, runtime_root: []const u8, socket_path: []const u8, stats_path: []const u8, cache_root: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8) !ExecServer {
         // Zig's UnixAddress accepts 108-byte paths everywhere, but macOS
         // sun_path holds only 104; enforce the real platform limit before
         // listen so an oversized path fails with a clear log line instead
@@ -379,8 +403,10 @@ const ExecServer = struct {
             .allocator = allocator,
             .io = io,
             .vm_dir = vm_dir,
+            .runtime_root = runtime_root,
             .socket_path = socket_path,
             .stats_path = stats_path,
+            .cache_root = cache_root,
             .guest_port = guest_port,
             .timeout_ms = timeout_ms,
             .server = try address.listen(io, .{ .kernel_backlog = 8 }),
@@ -429,6 +455,7 @@ const ExecServer = struct {
             .context = self,
             .pollFn = pollThunk,
             .setWakeFn = setWakeThunk,
+            .prepareSnapshotFn = prepareSnapshotThunk,
             .publishSnapshotFn = publishSnapshotThunk,
             .completeSnapshotFn = completeSnapshotThunk,
             .completeRootfsSnapshotFn = completeRootfsSnapshotThunk,
@@ -442,6 +469,15 @@ const ExecServer = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.wake = wake;
+    }
+
+    fn prepareSnapshot(self: *ExecServer) !?snapshot_publication.SnapshotPreparation {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.state != .active_snapshot) return error.ControlBusy;
+        const preparation = try self.snapshot_publication_wait.tryPrepare(self.io, self.allocator, self.cache_root);
+        if (preparation == null) self.state = .pending_snapshot;
+        return preparation;
     }
 
     fn poll(self: *ExecServer, dev: *vsock.Vsock) !vsock.ControlAction {
@@ -959,7 +995,9 @@ const ExecServer = struct {
         }
     }
 
-    fn publishSnapshot(self: *ExecServer, work_dir: []const u8, publish_dir: []const u8) !void {
+    fn publishSnapshot(self: *ExecServer, preparation: *const snapshot_publication.SnapshotPreparation, work_dir: []const u8, publish_dir: []const u8) !vsock.SnapshotPublishMetrics {
+        var metrics = vsock.SnapshotPublishMetrics{ .cache_lock_wait_ns = preparation.wait_ns };
+        const registry = try preparation.registry(self.allocator, self.cache_root);
         var lifecycle_spec = (try lifecycle.readSporeLifecycleSpec(self.allocator, self.io, work_dir)) orelse return error.BadManifest;
         defer lifecycle_spec.deinit();
         var manifest = spore.loadManifest(self.allocator, work_dir) catch |err| switch (err) {
@@ -971,19 +1009,75 @@ const ExecServer = struct {
         defer if (manifest_v1) |*parsed| parsed.deinit();
         if (manifest) |*parsed| {
             parsed.value.annotations = lifecycle_spec.value.annotations;
-            try spore.saveManifest(self.allocator, work_dir, parsed.value);
+            if (parsed.value.disk) |disk| {
+                const bytes = try std.json.Stringify.valueAlloc(self.allocator, parsed.value, .{ .whitespace = .indent_2 });
+                defer self.allocator.free(bytes);
+                const authorization_started = runtime_disk_fork_capture.monotonicNs();
+                try saved_spore_pin.replaceAuthorizedManifest(self.io, self.allocator, registry, work_dir, disk, bytes);
+                metrics.manifest_pin_authorization_ns = runtime_disk_fork_capture.elapsedSince(authorization_started);
+                const lease_started = runtime_disk_fork_capture.monotonicNs();
+                try self.handoffSnapshotDiskLease(registry, work_dir, disk, &lifecycle_spec);
+                metrics.active_lease_handoff_ns = runtime_disk_fork_capture.elapsedSince(lease_started);
+            } else {
+                try spore.saveManifest(self.allocator, work_dir, parsed.value);
+            }
         } else {
             manifest_v1 = try spore.loadManifestV1(self.allocator, work_dir);
             manifest_v1.?.value.annotations = lifecycle_spec.value.annotations;
-            try spore.saveManifestV1(self.allocator, work_dir, manifest_v1.?.value);
+            if (manifest_v1.?.value.disk) |disk| {
+                const bytes = try std.json.Stringify.valueAlloc(self.allocator, manifest_v1.?.value, .{ .whitespace = .indent_2 });
+                defer self.allocator.free(bytes);
+                const authorization_started = runtime_disk_fork_capture.monotonicNs();
+                try saved_spore_pin.replaceAuthorizedManifest(self.io, self.allocator, registry, work_dir, disk, bytes);
+                metrics.manifest_pin_authorization_ns = runtime_disk_fork_capture.elapsedSince(authorization_started);
+                const lease_started = runtime_disk_fork_capture.monotonicNs();
+                try self.handoffSnapshotDiskLease(registry, work_dir, disk, &lifecycle_spec);
+                metrics.active_lease_handoff_ns = runtime_disk_fork_capture.elapsedSince(lease_started);
+            } else {
+                try spore.saveManifestV1(self.allocator, work_dir, manifest_v1.?.value);
+            }
         }
-        const saved_disk = if (manifest) |parsed| parsed.value.disk else manifest_v1.?.value.disk;
-        if (saved_disk) |disk| {
-            lifecycle_spec.value.disk = disk;
-            lifecycle_spec.value.disk_baseline_lease = try runtime_disk_lease.fromSavedDisk(publish_dir, disk);
-        }
+        const lifecycle_started = runtime_disk_fork_capture.monotonicNs();
         try lifecycle.writeSporeLifecycleSpec(self.allocator, self.io, work_dir, lifecycle_spec.value);
+        metrics.lifecycle_spec_ns = runtime_disk_fork_capture.elapsedSince(lifecycle_started);
+        const publication_started = runtime_disk_fork_capture.monotonicNs();
         try Io.Dir.renameAbsolute(work_dir, publish_dir, self.io);
+        try chunk_sealer.fsyncDirPath(self.allocator, std.fs.path.dirname(publish_dir) orelse ".");
+        metrics.final_publication_ns = runtime_disk_fork_capture.elapsedSince(publication_started);
+        return metrics;
+    }
+
+    /// Caller holds the prepared snapshot publication authority.
+    fn handoffSnapshotDiskLease(
+        self: *ExecServer,
+        registry: saved_spore_pin.LockedRegistry,
+        work_dir: []const u8,
+        disk: spore.Disk,
+        lifecycle_spec: *std.json.Parsed(lifecycle.Spec),
+    ) !void {
+        const lease = runtime_disk_lease.Lease{
+            .store = .rootfs_cache,
+            .root = self.cache_root,
+            .baseline_kind = .disk_index,
+            .baseline_identity = disk.base,
+            .rootfs_storage = try saved_spore_pin.storageForDisk(disk),
+        };
+        var pin = try saved_spore_pin.loadForSporeLocked(self.io, self.allocator, registry, work_dir, disk);
+        pin.deinit();
+        const source_paths = try lifecycle.pathsFromRoot(self.allocator, self.runtime_root, lifecycle_spec.value.name);
+        defer source_paths.deinit(self.allocator);
+        if (!std.mem.eql(u8, source_paths.vm_dir, self.vm_dir)) return error.BadManifest;
+        try persistSourceDiskLeaseHandoff(
+            self.io,
+            self.allocator,
+            self.runtime_root,
+            source_paths,
+            disk,
+            lease,
+            &self.disk_baseline_active,
+        );
+        lifecycle_spec.value.disk = disk;
+        lifecycle_spec.value.disk_baseline_lease = lease;
     }
 
     fn completeRootfsSnapshot(_: *ExecServer, _: ?spore.Disk) !void {}
@@ -1183,9 +1277,14 @@ const ExecServer = struct {
         self.setWake(wake);
     }
 
-    fn publishSnapshotThunk(context: *anyopaque, work_dir: []const u8, publish_dir: []const u8) !void {
+    fn prepareSnapshotThunk(context: *anyopaque) !?snapshot_publication.SnapshotPreparation {
         const self: *ExecServer = @ptrCast(@alignCast(context));
-        try self.publishSnapshot(work_dir, publish_dir);
+        return try self.prepareSnapshot();
+    }
+
+    fn publishSnapshotThunk(context: *anyopaque, preparation: *const snapshot_publication.SnapshotPreparation, work_dir: []const u8, publish_dir: []const u8) !vsock.SnapshotPublishMetrics {
+        const self: *ExecServer = @ptrCast(@alignCast(context));
+        return try self.publishSnapshot(preparation, work_dir, publish_dir);
     }
 
     fn completeSnapshotThunk(context: *anyopaque, dir: []const u8) !void {
@@ -1223,6 +1322,39 @@ const ExecServer = struct {
         self.streamOutput(output, bytes);
     }
 };
+
+fn persistSourceDiskLeaseHandoff(
+    io: Io,
+    allocator: std.mem.Allocator,
+    runtime_root: []const u8,
+    source_paths: lifecycle.Paths,
+    disk: spore.Disk,
+    lease: runtime_disk_lease.Lease,
+    active_slot: *?runtime_disk_lease.Active,
+) !void {
+    try lease.validate();
+    if (lease.store != .rootfs_cache or
+        lease.baseline_kind != .disk_index or
+        !std.mem.eql(u8, lease.baseline_identity, disk.base) or
+        !spore.rootfsStorageEql(lease.rootfs_storage orelse return error.BadManifest, try saved_spore_pin.storageForDisk(disk))) return error.BadManifest;
+
+    var source_spec = try lifecycle.readSpec(allocator, io, source_paths);
+    defer source_spec.deinit();
+    var next_active = try runtime_disk_lease.acquireActive(io, allocator, runtime_root, lease);
+    var committed = false;
+    defer if (!committed) next_active.deinit();
+    if (builtin.is_test and snapshot_lease_handoff_test_fault.fail_before_source_spec) return error.InjectedFailure;
+
+    source_spec.value.disk = disk;
+    source_spec.value.disk_baseline_lease = lease;
+    // Atomic durable replacement is the commit point. Everything afterward is
+    // infallible: swap the in-memory owner, then release the old active root.
+    try lifecycle.writeSpec(allocator, io, source_paths, source_spec.value);
+    var old_active = active_slot.*;
+    active_slot.* = next_active;
+    committed = true;
+    if (old_active) |*old| old.deinit();
+}
 
 fn formatSessionId(buffer: *[64]u8, nonce: u64, sequence: u64) ![]const u8 {
     return std.fmt.bufPrint(buffer, "lifecycle-{x}-{d}", .{ nonce, sequence });
@@ -1936,6 +2068,174 @@ test "monitor session ids cannot replay across restored monitors" {
     const restored_id = try formatSessionId(&restored, 0xfedcba9876543210, 1);
     try std.testing.expectEqualStrings("lifecycle-123456789abcdef-1", first_id);
     try std.testing.expect(!std.mem.eql(u8, first_id, restored_id));
+}
+
+test "named snapshot cache contention returns pending before the pause authority is borrowed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const cache_root = try std.fs.path.join(allocator, &.{ root, "cache" });
+    defer allocator.free(cache_root);
+    var server: ExecServer = undefined;
+    server.allocator = allocator;
+    server.io = io;
+    server.cache_root = cache_root;
+    server.mutex = .init;
+    server.state = .active_snapshot;
+    server.snapshot_publication_wait = .{};
+    var held = try rootfs_mod.lockRootfsCacheExclusive(io, allocator, cache_root);
+    defer held.deinit();
+    try std.testing.expect(try server.prepareSnapshot() == null);
+    try std.testing.expectEqual(RequestState.pending_snapshot, server.state);
+    try std.testing.expect(server.snapshot_publication_wait.started_ns != null);
+
+    // This is the state in which each backend falls through to one normal
+    // guest-run opportunity instead of retrying the lock in a tight loop.
+    server.state = .active_snapshot;
+    held.deinit();
+    var preparation = (try server.prepareSnapshot()) orelse return error.TestUnexpectedResult;
+    const borrowed = preparation.cacheLock();
+    try std.testing.expect(try borrowed.ensureHeldFor(allocator, cache_root));
+    const wrong_root = try std.fs.path.join(allocator, &.{ root, "wrong-cache" });
+    defer allocator.free(wrong_root);
+    try Io.Dir.cwd().createDirPath(io, wrong_root);
+    try std.testing.expect(!try borrowed.ensureHeldFor(allocator, wrong_root));
+
+    preparation.deinit();
+    try std.testing.expect(server.snapshot_publication_wait.started_ns == null);
+}
+
+test "snapshot disk lease handoff preserves old authority on failure and commits new authority transactionally" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const runtime_root = try std.fs.path.join(allocator, &.{ root, "runtime" });
+    defer allocator.free(runtime_root);
+    const cache_root = try std.fs.path.join(allocator, &.{ root, "cache" });
+    defer allocator.free(cache_root);
+    const paths = try lifecycle.pathsFromRoot(allocator, runtime_root, "source");
+    defer paths.deinit(allocator);
+
+    const old_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const new_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const device = spore.RootfsDevice{ .mmio_slot = 1 };
+    const old_storage = spore.RootfsStorage{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = device,
+        .logical_size = spore.disk_chunk_size,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .index_digest = old_digest,
+        .base_identity = old_digest,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+    };
+    const new_storage = spore.RootfsStorage{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = device,
+        .logical_size = spore.disk_chunk_size,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .index_digest = new_digest,
+        .base_identity = new_digest,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+    };
+    const old_disk = spore.Disk{
+        .kind = spore.disk_kind_chunk_index,
+        .device = device,
+        .size = spore.disk_chunk_size,
+        .base = old_digest,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+        .layers = &.{},
+    };
+    const new_disk = spore.Disk{
+        .kind = spore.disk_kind_chunk_index,
+        .device = device,
+        .size = spore.disk_chunk_size,
+        .base = new_digest,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+        .layers = &.{},
+    };
+    const old_lease = runtime_disk_lease.Lease{
+        .store = .rootfs_cache,
+        .root = cache_root,
+        .baseline_kind = .disk_index,
+        .baseline_identity = old_digest,
+        .rootfs_storage = old_storage,
+    };
+    const new_lease = runtime_disk_lease.Lease{
+        .store = .rootfs_cache,
+        .root = cache_root,
+        .baseline_kind = .disk_index,
+        .baseline_identity = new_digest,
+        .rootfs_storage = new_storage,
+    };
+    try lifecycle.writeSpec(allocator, io, paths, .{
+        .name = "source",
+        .disk = old_disk,
+        .disk_baseline_lease = old_lease,
+    });
+    var active_slot: ?runtime_disk_lease.Active = try runtime_disk_lease.acquireActive(io, allocator, runtime_root, old_lease);
+    defer if (active_slot) |*active| active.deinit();
+    const old_active_path = try allocator.dupe(u8, active_slot.?.path);
+    defer allocator.free(old_active_path);
+
+    snapshot_lease_handoff_test_fault = .{ .fail_before_source_spec = true };
+    defer snapshot_lease_handoff_test_fault = .{};
+    try std.testing.expectError(error.InjectedFailure, persistSourceDiskLeaseHandoff(
+        io,
+        allocator,
+        runtime_root,
+        paths,
+        new_disk,
+        new_lease,
+        &active_slot,
+    ));
+    snapshot_lease_handoff_test_fault = .{};
+    var after_failure = try lifecycle.readSpec(allocator, io, paths);
+    defer after_failure.deinit();
+    try std.testing.expectEqualStrings(old_digest, after_failure.value.disk.?.base);
+    try std.testing.expectEqualStrings(old_digest, after_failure.value.disk_baseline_lease.?.baseline_identity);
+    _ = try Io.Dir.cwd().statFile(io, old_active_path, .{ .follow_symlinks = false });
+    var failed_active_it = try runtime_disk_lease.ActiveIterator.init(allocator, io, runtime_root);
+    defer failed_active_it.deinit();
+    var failed_active_count: usize = 0;
+    while (try failed_active_it.next()) |parsed_value| {
+        var parsed = parsed_value;
+        defer parsed.deinit();
+        failed_active_count += 1;
+        try std.testing.expectEqualStrings(old_digest, parsed.value.baseline_identity);
+    }
+    try std.testing.expectEqual(@as(usize, 1), failed_active_count);
+
+    try persistSourceDiskLeaseHandoff(io, allocator, runtime_root, paths, new_disk, new_lease, &active_slot);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, old_active_path, .{ .follow_symlinks = false }));
+    var after_success = try lifecycle.readSpec(allocator, io, paths);
+    defer after_success.deinit();
+    try std.testing.expectEqualStrings(new_digest, after_success.value.disk.?.base);
+    try std.testing.expectEqualStrings(new_digest, after_success.value.disk_baseline_lease.?.baseline_identity);
+    try std.testing.expect(spore.rootfsStorageEql(new_storage, after_success.value.disk_baseline_lease.?.rootfs_storage.?));
+    _ = try Io.Dir.cwd().statFile(io, active_slot.?.path, .{ .follow_symlinks = false });
+    var success_active_it = try runtime_disk_lease.ActiveIterator.init(allocator, io, runtime_root);
+    defer success_active_it.deinit();
+    var success_active_count: usize = 0;
+    while (try success_active_it.next()) |parsed_value| {
+        var parsed = parsed_value;
+        defer parsed.deinit();
+        success_active_count += 1;
+        try std.testing.expectEqualStrings(new_digest, parsed.value.baseline_identity);
+        try std.testing.expect(spore.rootfsStorageEql(new_storage, parsed.value.rootfs_storage.?));
+    }
+    try std.testing.expectEqual(@as(usize, 1), success_active_count);
 }
 
 test "monitor registry detector notices deleted vm dir" {

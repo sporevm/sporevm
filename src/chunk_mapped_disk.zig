@@ -220,6 +220,8 @@ pub const PreparedSnapshotRoot = struct {
     }
 };
 
+pub const SnapshotRootCommit = enum { local_rebind, shared_no_rebind };
+
 pub const ChunkMappedDisk = struct {
     allocator: std.mem.Allocator,
     base: block_source.FileBlockSource,
@@ -234,6 +236,11 @@ pub const ChunkMappedDisk = struct {
     /// Logical coverage of `parent_root` and `digest_index`. Known-zero growth
     /// extends only the source map; appended coverage remains child-owned.
     parent_logical_size: u64 = 0,
+    /// A newly installed snapshot is not fork authority until
+    /// `commitSnapshotRoot` runs after durable save publication and the source
+    /// runtime lease handoff.
+    pending_snapshot_identity: ?[]const u8 = null,
+    committed_snapshot_identity: ?[]const u8 = null,
     snapshot_published: bool = false,
     /// A validated block request reached backend mutation and failed. The
     /// head is no longer publishable because host I/O may have completed only
@@ -658,6 +665,10 @@ pub const ChunkMappedDisk = struct {
         errdefer child_index.deinit(self.allocator);
         const child_overlay_dir = try self.allocator.dupe(u8, self.overlay_dir orelse return error.ReadOnly);
         errdefer self.allocator.free(child_overlay_dir);
+        const child_pending_identity = if (self.pending_snapshot_identity) |identity| try self.allocator.dupe(u8, identity) else null;
+        errdefer if (child_pending_identity) |identity| self.allocator.free(identity);
+        const child_committed_identity = if (self.committed_snapshot_identity) |identity| try self.allocator.dupe(u8, identity) else null;
+        errdefer if (child_committed_identity) |identity| self.allocator.free(identity);
 
         const cloned = try self.cloneOverlay(parent_fd, .{ .allow_copy = true, .force_copy = options.force_copy });
         errdefer _ = std.c.close(cloned.fd);
@@ -674,6 +685,8 @@ pub const ChunkMappedDisk = struct {
                 .digest_index = child_index.digest_index,
                 .parent_root = child_index.parent_root,
                 .parent_logical_size = child_index.parent_logical_size,
+                .pending_snapshot_identity = child_pending_identity,
+                .committed_snapshot_identity = child_committed_identity,
                 .snapshot_published = self.snapshot_published,
             },
             .clone_method = cloned.method,
@@ -693,6 +706,12 @@ pub const ChunkMappedDisk = struct {
         const prepare_start_ns = monotonicNs() catch 0;
         const parent_fd = self.overlay_fd orelse return error.ReadOnly;
         spore.validateDiskDigest(baseline.identity) catch return error.BadManifest;
+        const committed_snapshot = self.committed_snapshot_identity;
+        const clean_sources_are_baseline = committed_snapshot != null and self.pending_snapshot_identity == null;
+        const effective_baseline = if (committed_snapshot != null)
+            runtime_disk_fork.Baseline{ .kind = .disk_index, .identity = committed_snapshot.? }
+        else
+            baseline;
         const bitmap_len = try runtime_disk_fork.bitmapLen(@intCast(self.chunkCount()));
         const overlay_chunks = try self.allocator.alloc(u8, bitmap_len);
         errdefer self.allocator.free(overlay_chunks);
@@ -701,22 +720,32 @@ pub const ChunkMappedDisk = struct {
         errdefer self.allocator.free(zero_chunks);
         @memset(zero_chunks, 0);
         for (self.sources, 0..) |source, chunk_index| switch (source) {
-            .overlay, .overlay_clean => runtime_disk_fork.bitmapSet(overlay_chunks, chunk_index),
-            .zero, .zero_dirty => runtime_disk_fork.bitmapSet(zero_chunks, chunk_index),
+            .overlay => runtime_disk_fork.bitmapSet(overlay_chunks, chunk_index),
+            // Once publication commits this installed index, it owns clean
+            // overlay bytes. Before that commit they remain explicit child
+            // overrides against the previous authoritative baseline.
+            .overlay_clean => if (!clean_sources_are_baseline) {
+                runtime_disk_fork.bitmapSet(overlay_chunks, chunk_index);
+            },
+            .zero => if (!clean_sources_are_baseline) runtime_disk_fork.bitmapSet(zero_chunks, chunk_index),
+            .zero_dirty => runtime_disk_fork.bitmapSet(zero_chunks, chunk_index),
             .base, .cas => {},
         };
 
-        const identity = try self.allocator.dupe(u8, baseline.identity);
+        const identity = try self.allocator.dupe(u8, effective_baseline.identity);
         errdefer self.allocator.free(identity);
-        const cloned = try self.cloneOverlay(parent_fd, .{
-            .allow_copy = options.allow_copy,
-            .force_copy = options.force_copy,
-        });
+        const cloned = if (!std.mem.allEqual(u8, overlay_chunks, 0))
+            try self.cloneOverlay(parent_fd, .{
+                .allow_copy = options.allow_copy,
+                .force_copy = options.force_copy,
+            })
+        else
+            try self.createSparseOverlay();
         errdefer _ = std.c.close(cloned.fd);
         return .{
             .descriptor = .{
                 .allocator = self.allocator,
-                .baseline = .{ .kind = baseline.kind, .identity = identity },
+                .baseline = .{ .kind = effective_baseline.kind, .identity = identity },
                 .clone_method = cloned.method,
                 .logical_size = self.size,
                 .chunk_size = self.chunk_size,
@@ -811,7 +840,7 @@ pub const ChunkMappedDisk = struct {
             .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
             .object_namespace = spore.rootfs_storage_object_namespace,
         });
-        const parent = try self.parentStateFrom(cache_root, index);
+        const parent = try self.parentStateFrom(cache_root, index, null);
         self.parent_root = parent.root;
         self.digest_index = parent.digest_index;
         self.parent_logical_size = parent.parent_logical_size;
@@ -827,14 +856,20 @@ pub const ChunkMappedDisk = struct {
     /// Rebinds a just-published snapshot from its temporary directory to the
     /// final atomic-publish path. A fresh clean rootfs may not publish a disk
     /// index; in that case there is no baseline to rebind.
-    pub fn commitSnapshotRoot(self: *ChunkMappedDisk, expected_root: []const u8, prepared: *PreparedSnapshotRoot) Error!void {
+    pub fn commitSnapshotRoot(self: *ChunkMappedDisk, expected_root: []const u8, prepared: *PreparedSnapshotRoot, intent: SnapshotRootCommit) Error!void {
         if (!self.snapshot_published) return;
         const current = self.parent_root orelse return error.BadManifest;
+        if (intent == .shared_no_rebind) {
+            if (std.mem.eql(u8, current, expected_root)) return error.BadManifest;
+            self.commitSnapshotIdentity();
+            return;
+        }
         if (!std.mem.eql(u8, current, expected_root)) return error.BadManifest;
         const next = prepared.root orelse return error.BadManifest;
         prepared.root = null;
         self.parent_root = next;
         self.allocator.free(current);
+        self.commitSnapshotIdentity();
     }
 
     fn indexStateFrom(self: *ChunkMappedDisk, cache_root: []const u8, index: disk_index.DiskIndex) Error!IndexState {
@@ -1012,7 +1047,7 @@ pub const ChunkMappedDisk = struct {
         const index_publish_start_ns = try monotonicNs();
         try chunk_sealer.writeFileAtomicDurable(self.allocator, index_path, encoded_index.bytes, 0o444);
         const index_publish_ns = elapsedSince(index_publish_start_ns);
-        const next_parent = try self.parentStateFrom(dir, index);
+        const next_parent = try self.parentStateFrom(dir, index, index_digest);
         errdefer next_parent.deinit(self.allocator);
         const kind = try self.allocator.dupe(u8, spore.disk_kind_chunk_index);
         errdefer self.allocator.free(kind);
@@ -1080,9 +1115,11 @@ pub const ChunkMappedDisk = struct {
         return sourceIsDirty(self.sources[chunk_index]);
     }
 
-    fn parentStateFrom(self: *ChunkMappedDisk, root: []const u8, index: disk_index.DiskIndex) Error!ParentClone {
+    fn parentStateFrom(self: *ChunkMappedDisk, root: []const u8, index: disk_index.DiskIndex, identity: ?[]const u8) Error!ParentClone {
         const parent_root = try self.allocator.dupe(u8, root);
         errdefer self.allocator.free(parent_root);
+        const pending_identity = if (identity) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (pending_identity) |value| self.allocator.free(value);
         for (index.chunks) |entry| {
             if (entry.logical_chunk >= self.sources.len) return error.BadManifest;
         }
@@ -1090,6 +1127,7 @@ pub const ChunkMappedDisk = struct {
             .root = parent_root,
             .digest_index = try DigestIndex.fromDiskIndex(self.allocator, index),
             .parent_logical_size = index.logical_size,
+            .pending_identity = pending_identity,
         };
     }
 
@@ -1099,6 +1137,8 @@ pub const ChunkMappedDisk = struct {
         self.parent_root = next.root;
         self.digest_index = next.digest_index;
         self.parent_logical_size = next.parent_logical_size;
+        if (self.pending_snapshot_identity) |identity| self.allocator.free(identity);
+        self.pending_snapshot_identity = next.pending_identity;
         self.snapshot_published = true;
         for (self.sources) |*source| {
             source.* = switch (source.*) {
@@ -1109,6 +1149,13 @@ pub const ChunkMappedDisk = struct {
         }
         if (old_root) |root| self.allocator.free(root);
         old_digest_index.deinit(self.allocator);
+    }
+
+    fn commitSnapshotIdentity(self: *ChunkMappedDisk) void {
+        const next = self.pending_snapshot_identity orelse return;
+        self.pending_snapshot_identity = null;
+        if (self.committed_snapshot_identity) |identity| self.allocator.free(identity);
+        self.committed_snapshot_identity = next;
     }
 
     fn sealSnapshotChunk(
@@ -1300,6 +1347,10 @@ pub const ChunkMappedDisk = struct {
             self.parent_root = null;
         }
         self.digest_index.deinit(self.allocator);
+        if (self.pending_snapshot_identity) |identity| self.allocator.free(identity);
+        if (self.committed_snapshot_identity) |identity| self.allocator.free(identity);
+        self.pending_snapshot_identity = null;
+        self.committed_snapshot_identity = null;
         self.parent_logical_size = 0;
     }
 
@@ -1359,6 +1410,15 @@ pub const ChunkMappedDisk = struct {
         const copied_bytes = try self.copyOverlayChunks(parent_fd, child_fd);
         return .{ .fd = child_fd, .method = .copy, .copied_bytes = copied_bytes };
     }
+
+    fn createSparseOverlay(self: *ChunkMappedDisk) Error!ClonedOverlay {
+        const overlay_dir = self.overlay_dir orelse return error.ReadOnly;
+        const child_fd = try createTempOverlayFd(self.allocator, overlay_dir);
+        errdefer _ = std.c.close(child_fd);
+        const overlay_size = std.math.cast(std.c.off_t, self.size) orelse return error.BadDiskSize;
+        if (std.c.ftruncate(child_fd, overlay_size) != 0) return error.ResizeFailed;
+        return .{ .fd = child_fd, .method = .sparse, .copied_bytes = 0 };
+    }
 };
 
 const Span = struct {
@@ -1385,9 +1445,11 @@ const ParentClone = struct {
     root: ?[]const u8 = null,
     digest_index: DigestIndex = .{},
     parent_logical_size: u64 = 0,
+    pending_identity: ?[]const u8 = null,
 
     fn deinit(self: ParentClone, allocator: std.mem.Allocator) void {
         if (self.root) |root| allocator.free(root);
+        if (self.pending_identity) |identity| allocator.free(identity);
         var digest_index = self.digest_index;
         digest_index.deinit(allocator);
     }
@@ -2159,6 +2221,14 @@ test "known zero growth reuses appended coverage without sealing" {
     try std.testing.expectEqual(@as(u64, 0), stats.work.sealed_chunks);
     try std.testing.expectEqual(@as(usize, 1), stats.parent_chunks_reused);
     try std.testing.expectEqual(@as(usize, 1), stats.clean_zero_chunks_reused);
+    // Shared-store saves target the already-rooted global CAS. Unchanged
+    // parents remain index references only: no link, copy, content hash, or
+    // directory-sync fanout regardless of parent object count.
+    try std.testing.expectEqual(@as(u64, 0), stats.parent.linked.objects);
+    try std.testing.expectEqual(@as(u64, 0), stats.parent.copied.objects);
+    try std.testing.expectEqual(@as(u64, 0), stats.parent.reused.objects);
+    try std.testing.expectEqual(@as(u64, 0), stats.parent.linked.ns + stats.parent.copied.ns + stats.parent.reused.ns);
+    try std.testing.expectEqual(@as(u64, 0), stats.parent.sync_ns);
 
     const index_path = try rootfs_cas.manifestIndexPath(arena, snapshot_dir, grown.base);
     const index_bytes = try std.Io.Dir.cwd().readFileAlloc(io, index_path, arena, .limited(disk_index.max_index_bytes));
@@ -2371,7 +2441,12 @@ test "snapshot output does not become live disk storage" {
     try disk.readAt(readback, 0);
     try std.testing.expectEqualSlices(u8, model, readback);
     try std.Io.Dir.rename(std.Io.Dir.cwd(), temp_dir, std.Io.Dir.cwd(), final_dir, io);
-    try disk.commitSnapshotRoot(temp_dir, &prepared_root);
+    try disk.commitSnapshotRoot(temp_dir, &prepared_root, .local_rebind);
+    var wrong_local = try disk.prepareSnapshotRoot(second_dir);
+    defer wrong_local.deinit();
+    try std.testing.expectError(error.BadManifest, disk.commitSnapshotRoot(temp_dir, &wrong_local, .local_rebind));
+    try disk.commitSnapshotRoot(temp_dir, &wrong_local, .shared_no_rebind);
+    try std.testing.expect(wrong_local.root != null);
     try disk.readAt(readback, 0);
     try std.testing.expectEqualSlices(u8, model, readback);
 
@@ -2802,6 +2877,150 @@ test "portable fork head round trips overlay and zero overrides" {
     try child.writeAt(&child_patch, spore.disk_chunk_size + 91);
     try parent.readAt(readback[0..child_patch.len], spore.disk_chunk_size + 91);
     try std.testing.expectEqualSlices(u8, model[spore.disk_chunk_size + 91 ..][0..child_patch.len], readback[0..child_patch.len]);
+}
+
+test "post-snapshot fast fork uses sealed baseline without native overlay clone" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const snapshot_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/post-save-cas", .{tmp.sub_path[0..]});
+    defer allocator.free(snapshot_dir);
+    try std.Io.Dir.cwd().createDirPath(io, snapshot_dir);
+
+    const disk_size: usize = @intCast(spore.disk_chunk_size);
+    const base_bytes = try allocator.alloc(u8, disk_size);
+    defer allocator.free(base_bytes);
+    @memset(base_bytes, 0x31);
+    var expected = try allocator.dupe(u8, base_bytes);
+    defer allocator.free(expected);
+
+    var parent_base = try tmp.dir.createFile(io, "post-save-parent-base.img", .{ .read = true });
+    defer parent_base.close(io);
+    try parent_base.writeStreamingAll(io, base_bytes);
+    const parent_overlay_fd = try createTempOverlayFd(allocator, runtime_overlay_dir);
+    defer _ = std.c.close(parent_overlay_fd);
+    var parent = try ChunkMappedDisk.initWritable(
+        allocator,
+        block_source.FileBlockSource.init(parent_base.handle, disk_size),
+        parent_overlay_fd,
+        disk_size,
+        spore.disk_chunk_size,
+    );
+    defer parent.deinit();
+
+    const saved_patch = [_]u8{0x72} ** 113;
+    try parent.writeAt(&saved_patch, 73);
+    @memcpy(expected[73..][0..saved_patch.len], &saved_patch);
+    const snapshot = try parent.snapshotIndex(snapshot_dir, .{ .mmio_slot = 1 }, true);
+    defer freeTestDisk(allocator, snapshot);
+    try std.testing.expectEqual(Source.overlay_clean, parent.sources[0]);
+
+    const index_path = try rootfs_cas.manifestIndexPath(allocator, snapshot_dir, snapshot.base);
+    defer allocator.free(index_path);
+    const index_bytes = try std.Io.Dir.cwd().readFileAlloc(io, index_path, allocator, .limited(disk_index.max_index_bytes));
+    defer allocator.free(index_bytes);
+    const storage = spore.RootfsStorage{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = snapshot.device,
+        .logical_size = snapshot.size,
+        .chunk_size = snapshot.chunk_size,
+        .hash_algorithm = snapshot.hash_algorithm,
+        .index_digest = snapshot.base,
+        .base_identity = snapshot.base,
+        .object_namespace = snapshot.object_namespace,
+    };
+    const parsed = try disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
+    defer parsed.deinit();
+
+    var rejected_root = try parent.prepareSnapshotRoot("unused-rejected-save");
+    defer rejected_root.deinit();
+    try std.testing.expectError(error.BadManifest, parent.commitSnapshotRoot(snapshot_dir, &rejected_root, .shared_no_rebind));
+
+    var precommit_head = try parent.exportForkHead(.{
+        .kind = .rootfs,
+        .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }, .{ .allow_copy = true, .force_copy = true, .quiesced = true });
+    defer precommit_head.deinit();
+    try std.testing.expectEqual(runtime_disk_fork.CloneMethod.copy, precommit_head.descriptor.clone_method);
+    try std.testing.expect(precommit_head.descriptor.overlay(0));
+
+    var prepared_root = try parent.prepareSnapshotRoot("unused-published-save");
+    defer prepared_root.deinit();
+    try parent.commitSnapshotRoot("snapshot-staging-root", &prepared_root, .shared_no_rebind);
+
+    var in_process_child = try parent.fork(.{ .force_copy = true, .quiesced = true });
+    defer in_process_child.deinit();
+    try std.testing.expect(in_process_child.disk.pending_snapshot_identity == null);
+    try std.testing.expectEqualStrings(snapshot.base, in_process_child.disk.committed_snapshot_identity.?);
+
+    var head = try parent.exportForkHead(.{
+        .kind = .rootfs,
+        .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }, .{ .allow_copy = false, .quiesced = true });
+    defer head.deinit();
+    try std.testing.expectEqual(runtime_disk_fork.CloneMethod.sparse, head.descriptor.clone_method);
+    try std.testing.expectEqual(runtime_disk_fork.BaselineKind.disk_index, head.descriptor.baseline.kind);
+    try std.testing.expectEqualStrings(snapshot.base, head.descriptor.baseline.identity);
+    try std.testing.expect(std.mem.allEqual(u8, head.descriptor.overlay_chunks, 0));
+    try std.testing.expect(std.mem.allEqual(u8, head.descriptor.zero_chunks, 0));
+    try std.testing.expectEqual(@as(u64, 0), head.stats.copied_bytes);
+
+    var child_base = try tmp.dir.createFile(io, "post-save-child-base.img", .{ .read = true });
+    defer child_base.close(io);
+    if (std.c.ftruncate(child_base.handle, @intCast(disk_size)) != 0) return error.ResizeFailed;
+    const child_initial_overlay = try createTempOverlayFd(allocator, runtime_overlay_dir);
+    var child_overlay_owner = child_initial_overlay;
+    defer {
+        if (child_overlay_owner >= 0) _ = std.c.close(child_overlay_owner);
+    }
+    var child = try ChunkMappedDisk.initWritable(
+        allocator,
+        block_source.FileBlockSource.init(child_base.handle, disk_size),
+        child_initial_overlay,
+        disk_size,
+        spore.disk_chunk_size,
+    );
+    defer child.deinit();
+    try child.attachCasIndex(snapshot_dir, parsed.value);
+    const claimed_fd = head.overlay_fd;
+    const replaced_fd = try child.applyForkDescriptor(head.descriptor, claimed_fd);
+    try std.testing.expectEqual(child_initial_overlay, replaced_fd);
+    _ = std.c.close(replaced_fd);
+    child_overlay_owner = claimed_fd;
+    head.overlay_fd = -1;
+
+    var readback: [256]u8 = undefined;
+    try child.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, expected[0..readback.len], &readback);
+
+    const child_patch = [_]u8{0x93} ** 41;
+    try child.writeAt(&child_patch, 101);
+    try parent.readAt(&readback, 0);
+    try std.testing.expectEqualSlices(u8, expected[0..readback.len], &readback);
+
+    const continued_parent_patch = [_]u8{0xa4} ** 37;
+    try parent.writeAt(&continued_parent_patch, 211);
+    try std.testing.expectEqual(Source.overlay, parent.sources[0]);
+    var dirty_head = try parent.exportForkHead(.{
+        .kind = .disk_index,
+        .identity = snapshot.base,
+    }, .{ .allow_copy = true, .force_copy = true, .quiesced = true });
+    defer dirty_head.deinit();
+    try std.testing.expectEqual(runtime_disk_fork.CloneMethod.copy, dirty_head.descriptor.clone_method);
+    try std.testing.expect(dirty_head.descriptor.overlay(0));
+
+    try parent.markZeroChunk(0);
+    const pending_zero_snapshot = try parent.snapshotIndex(snapshot_dir, .{ .mmio_slot = 1 }, true);
+    defer freeTestDisk(allocator, pending_zero_snapshot);
+    var mismatched_head = try parent.exportForkHead(.{
+        .kind = .rootfs,
+        .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }, .{ .allow_copy = false, .quiesced = true });
+    defer mismatched_head.deinit();
+    try std.testing.expect(mismatched_head.descriptor.zero(0));
+    try std.testing.expectEqualStrings(snapshot.base, mismatched_head.descriptor.baseline.identity);
 }
 
 test "portable fork adoption preserves authoritative clean grown zeroes" {

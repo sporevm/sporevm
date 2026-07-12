@@ -36,6 +36,9 @@ pub const BaselineKind = enum(u8) {
 pub const CloneMethod = enum(u8) {
     reflink = 1,
     copy = 2,
+    /// The immutable baseline covers every nonzero byte, so the child needs
+    /// only a new sparse writable head and no parent overlay clone.
+    sparse = 3,
 
     fn parse(raw: u8) ?CloneMethod {
         return std.enums.fromInt(CloneMethod, raw);
@@ -228,6 +231,7 @@ fn validateFields(descriptor: Descriptor) Error!void {
     for (descriptor.overlay_chunks, descriptor.zero_chunks) |overlay, zero| {
         if ((overlay & zero) != 0) return error.BadDescriptor;
     }
+    if (descriptor.clone_method == .sparse and !std.mem.allEqual(u8, descriptor.overlay_chunks, 0)) return error.BadDescriptor;
     if (descriptor.chunk_count % 8 != 0) {
         const used: u3 = @intCast(descriptor.chunk_count % 8);
         const padding_mask: u8 = ~((@as(u8, 1) << used) - 1);
@@ -285,6 +289,19 @@ test "runtime disk fork descriptor rejects overlapping and padded maps" {
     descriptor.zero_chunks[0] &= ~@as(u8, 1);
     descriptor.overlay_chunks[0] |= 0x80;
     try std.testing.expectError(error.BadDescriptor, descriptor.encodeAlloc(std.testing.allocator));
+}
+
+test "runtime disk fork sparse descriptor rejects physical overrides" {
+    var descriptor = try testDescriptor(std.testing.allocator);
+    defer descriptor.deinit();
+    descriptor.clone_method = .sparse;
+    try std.testing.expectError(error.BadDescriptor, descriptor.encodeAlloc(std.testing.allocator));
+    @memset(descriptor.overlay_chunks, 0);
+    const encoded = try descriptor.encodeAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    var parsed = try Descriptor.parse(std.testing.allocator, encoded);
+    defer parsed.deinit();
+    try std.testing.expectEqual(CloneMethod.sparse, parsed.clone_method);
 }
 
 test "runtime disk fork descriptor rejects truncation and trailing bytes" {

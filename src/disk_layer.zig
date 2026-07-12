@@ -167,9 +167,10 @@ pub const SnapshotState = struct {
         self: SnapshotState,
         expected_root: []const u8,
         prepared: *chunk_mapped_disk.PreparedSnapshotRoot,
+        intent: chunk_mapped_disk.SnapshotRootCommit,
     ) Error!void {
         return switch (self.active) {
-            .chunk_mapped => |disk| disk.commitSnapshotRoot(expected_root, prepared),
+            .chunk_mapped => |disk| disk.commitSnapshotRoot(expected_root, prepared, intent),
         };
     }
 

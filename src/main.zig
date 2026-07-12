@@ -908,6 +908,8 @@ fn writeForkResult(writer: *Io.Writer, result: spore_api.ForkResult) !void {
     try writer.print("  Children: {d}\n", .{result.count});
     try writer.print("  Output: {s}\n", .{result.out_dir});
     try writer.print("  Generation range: {d}..{d}\n", .{ result.first_generation, result.last_generation });
+    if (result.pin_publish_ms) |ms| try writer.print("  Pin publish: {d}ms\n", .{ms});
+    if (result.pin_lock_wait_ms) |ms| try writer.print("  Pin lock wait: {d}ms\n", .{ms});
 }
 
 fn writePackResult(writer: *Io.Writer, result: spore_api.PackResult) !void {

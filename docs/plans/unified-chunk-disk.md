@@ -1,12 +1,14 @@
 ---
 status: active
-last_reviewed: 2026-07-11
+last_reviewed: 2026-07-12
 spec_refs:
   - docs/spore-format.md
   - docs/rootfs.md
   - docs/filesystem.md
   - SECURITY.md
   - src/spore.zig
+  - src/api.zig
+  - src/bundle.zig
   - src/disk_layer.zig
   - src/rootfs_cas.zig
   - src/disk_index.zig
@@ -15,6 +17,8 @@ spec_refs:
   - src/runtime_disk_fork.zig
   - src/runtime_disk_fork_control.zig
   - src/runtime_disk_lease.zig
+  - src/saved_spore_pin.zig
+  - src/snapshot_publication.zig
   - src/dirty_ram.zig
   - src/monitor.zig
   - src/lifecycle.zig
@@ -625,12 +629,14 @@ structure with two instantiations (RAM 2MiB, disk 64KiB).
 
 Status: complete; APFS/HVF and Linux/KVM product validation pass.
 
-`ChunkMappedDisk.fork()` copies the one-level source map and clones
-an unlinked overlay fd, and its unit tests cover rejection, copy fallback,
-divergence, and flat 32-generation lineage. Disk-backed `spore fork --vm` is
-now its production caller. Diskless children retain the existing durable
-snapshot-and-open flow; disk-backed children use runtime heads and never seal
-dirty disk chunks before resuming the source.
+`ChunkMappedDisk.exportForkHead()` copies the one-level source map and either
+clones an unlinked overlay fd when physical overrides remain or creates a fresh
+sparse fd when the exact committed baseline owns all clean state. Its unit tests cover
+rejection, copy fallback, sparse baseline reads, divergence, and flat
+32-generation lineage. Disk-backed `spore fork --vm` is now its production
+caller. Diskless children retain the existing durable snapshot-and-open flow;
+disk-backed children use runtime heads and never seal dirty disk chunks before
+resuming the source.
 
 Landed behavior supports image-created, explicit-rootfs, restored disk-index,
 and previously forked named VMs with exactly one writable rootfs device. The
@@ -638,8 +644,13 @@ source monitor prepares up to 32 heads at one queue-drained paused epoch. Each
 child receives only a transient claim, independently reopens the lease-bound
 baseline, adopts its fd before readiness, and can outlive the source, fork
 again, or publish a durable save. Networked and unsupported device layouts
-remain fail-closed. Native APFS/Linux cloning is the default; the full-overlay
-copy path requires the explicit `--allow-slow-copy`/Zig API opt-in.
+remain fail-closed. Native APFS/Linux cloning is the default when physical
+overrides remain; the full-overlay copy path requires the explicit
+`--allow-slow-copy`/Zig API opt-in. Once save publication commits the exact
+canonical baseline, clean overlay and zero state are baseline authority rather
+than child overrides, so an override-free fork mints fresh sparse heads on any
+filesystem. `sparse` is an internal runtime descriptor method and does not
+change the durable spore format.
 
 The first product boundary is the existing named live-fork command with one
 supported writable rootfs-bound `ChunkMappedDisk`. It covers image-created,
@@ -686,11 +697,12 @@ control action with these invariants:
    sealer.
 2. Each head contains one unlinked overlay fd and a bounded, same-version
    runtime descriptor: exact baseline lease/identity, logical size, chunk
-   size/count, clone method, a physical-overlay bitmap
-   (`overlay` + `overlay_clean`), and a logical-zero bitmap
-   (`zero` + `zero_dirty`). All other chunks are reopened through the bound
-   baseline lease. Imported `overlay_clean` chunks may be conservatively dirty
-   in the child; extra rehashing on a later save is acceptable, lost state is
+   size/count, clone method, a physical-overlay bitmap, and a logical-zero
+   bitmap. Against an older or uncommitted baseline these conservatively include
+   `overlay_clean` and clean `zero` state. Against the exact committed baseline,
+   only dirty physical/zero overrides remain; an empty physical bitmap permits
+   the private `sparse` method. All other chunks are reopened through the bound
+   baseline lease. Extra rehashing on a later save is acceptable, lost state is
    not.
 3. A child monitor applies the existing exec-deny jail, reads its lifecycle
    spec, then claims exactly one descriptor and one fd directly from the
@@ -724,13 +736,14 @@ control action with these invariants:
    ancillary fd. The separate lineage proof remains 32 sequential one-child
    generations.
 
-APFS `fclonefileat` needs a destination name. It may create an `O_EXCL` file
+When physical overrides remain, APFS `fclonefileat` needs a destination name. It may create an `O_EXCL` file
 inside a private `0700` directory on the same filesystem as the source
 overlay, open it, and unlink it immediately; the overlay factory must preserve
 that same-filesystem guarantee. No persistent overlay path or linked child
-handoff is permitted. Linux continues to use `FICLONE`. If native cloning is
-unavailable, production fast fork fails closed unless the caller explicitly
-requests the measured slow-copy path.
+handoff is permitted. Linux continues to use `FICLONE`. If native cloning of
+required overrides is unavailable, production fast fork fails closed unless
+the caller explicitly requests the measured slow-copy path. An exact committed
+baseline with no physical overrides instead uses a fresh sparse fd.
 
 The baseline binding must survive source history. In particular, a
 non-destructive save currently snapshots into a temporary directory and then
@@ -758,11 +771,13 @@ save→rename→fork→save coverage.
    the 8GiB disk-only benchmark. No CLI. **Complete for the head boundary:**
    `RuntimeDisk` now exports and adopts a versioned, bounded descriptor plus an
    owned unlinked fd, validates the independently opened baseline and fd shape,
-   uses native APFS/Linux cloning by default, and exposes a measured explicit
-   copy fallback. Descriptor unit/fuzz coverage and the opt-in 0/50/100% 8GiB
-   benchmark landed with it. The lifecycle record that makes the baseline a
-   GC/prune root lands with item 4, where the record is actually created and
-   can be rollback-tested; the descriptor already binds its kind and identity.
+   uses native APFS/Linux cloning by default for physical overrides, mints a
+   fresh sparse head when the exact committed baseline needs no physical
+   overrides, and exposes a measured explicit copy fallback. Descriptor
+   unit/fuzz coverage and the opt-in 0/50/100% 8GiB benchmark landed with it.
+   The lifecycle record that makes the baseline a GC/prune root lands with item
+   4, where the record is actually created and can be rollback-tested; the
+   descriptor already binds its kind and identity.
 3. **Add the one-shot fd-claim transport.** Land `SCM_RIGHTS` send/receive,
    token registry, indexed bounded control requests, exact-length binary
    descriptor framing, receiver validation/ownership, expiry/cancellation,
@@ -1089,8 +1104,50 @@ directly; it does not assemble or rescan the derived flat rootfs cache.
 
 ### Large-image save publication follow-up
 
-Status: measured; a shared-store save follow-up is justified, but its design
-and implementation are deliberately outside this observability slice.
+Status: implemented. Machine-local saves now publish writable-disk objects,
+their canonical index, and the derived completeness stamp in that order in the
+global rootfs CAS, then durably pin the resulting root before final save
+visibility. This lets repeated named saves hand the exact new baseline to a
+restored VM without making nested fast fork depend on the original image's
+completeness proof. The opaque pin and manifest binding live in
+host-private lifecycle metadata, not the portable manifest. Restore is
+local-first with validated pinned-CAS fallback; `spore pack` remains the
+self-contained copy-and-verify boundary.
+
+Pinned offline fork uses a hidden three-phase batch. RAM chunks, manifests, and
+child references are prepared and synced before taking the rootfs-cache lock.
+Under that lock the parent pin is revalidated, independently bound child records
+are file-synced, the pin directory is synced once for the complete set, and only
+then is the batch renamed into view and its destination parent synced. Failures
+can leave reclaimable pin records, but never visible unpinned or partial
+children. The result reports monotonic lock-wait and lock-held publication time
+separately.
+
+The native publication gate is complete. Physical same- and cross-filesystem
+pack→unpack→run passed on distinct device IDs with the same verified bundle
+digest (`bd13758c8df47d7b98725accaf56d390613abee6fdf0aec79c5c216c345ea0a5`),
+17 chunks, and 35,651,584 payload bytes. Five samples at each fork scale minted
+unique child pin references and completed public `spore rm --spore` cleanup:
+
+| Children | Lock wait p50/p95 | Lock held p50/p95 | Lock held per child p50/p95 | Wall p50/p95 | Wall per child p50/p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0 / 0 ms | 28 / 28 ms | 28 / 28 ms | 106.995 / 107.990 ms | 106.995 / 107.990 ms |
+| 32 | 0 / 0 ms | 32 / 33 ms | 1.000 / 1.031 ms | 212.737 / 214.686 ms | 6.648 / 6.709 ms |
+| 1,000 | 0 / 0 ms | 153 / 155 ms | 0.153 / 0.155 ms | 3,505.735 / 3,537.499 ms | 3.506 / 3.537 ms |
+
+This is O(N children), not O(N × disk objects). Unit coverage separately proves
+one canonical-index validation per unique storage root and at most one
+pin-registry parent-directory fsync for a batch.
+
+Named continue-save logs the complete paused interval through durable final
+publication. Its structured phases separate cache-lock wait, manifest/pin
+authorization, active baseline-lease handoff, lifecycle-spec publication, and
+the final rename plus parent-directory sync. This keeps the earlier backend
+snapshot timings useful without hiding the durability work performed while all
+vCPUs remain paused. The handoff acquires the exact new active lease, atomically
+and durably replaces the continuing VM's source registry spec, swaps the
+in-memory owner, and releases the old lease last. A failure before that commit
+removes the candidate lease and preserves the old spec/root.
 
 The product save path now emits a bounded schema-2 disk metric. It preserves
 the schema-1 publication fields and adds disjoint clean-known-zero and
@@ -1177,7 +1234,27 @@ the same 1.25 GB. The later shared-store save slice is warranted: local saves
 should be able to reference rooted global-CAS objects and defer
 complete/self-contained copying to an explicit export boundary. That follow-up
 must preserve the existing cache-lock/GC-root contract and portable bundle
-semantics; this PR does not choose or implement the design.
+semantics. The landed durable-pin design removes unchanged-parent object
+link/copy/hash operations from cache-backed steady-state saves whose parent is
+already in the global CAS. A first save after portable/local-CAS restore still
+performs a one-time verified migration into the global CAS; benchmark that
+migration separately from steady-state save and same-/cross-filesystem export.
+`spore rm --spore` removes the save before
+unpinning under the cache lock. Raw moves preserve the opaque identity, while
+raw copies share it and cannot be removed independently; fork or pack/unpack
+creates an independent lifecycle boundary. Raw deletion safely leaks a pin.
+`spore cache pins` reports IDs and index health without claiming orphan
+detection, and expert-only `spore cache unpin ID --force` removes an exact known
+ID. The pre-1.0 design deliberately has no global reference registry.
+
+Mandatory immediate post-PR follow-up: move the durable offline-fork
+transaction and portable shared-disk materialization out of `src/api.zig` into
+a focused saved-spore fork module. The public API should retain only option
+validation and result ownership; the new module should own the three-phase pin
+transaction, current/V1 manifest normalization, fault injection, and durable
+batch publication. This is sequencing work, not optional cleanup: the current
+PR establishes the contract, and the next PR restores the API/module ownership
+boundary before more saved-spore lifecycle behavior is added.
 
 ## Security
 

@@ -1,6 +1,7 @@
 //! Named VM lifecycle registry and CLI shape.
 
 const std = @import("std");
+const chunk_sealer = @import("chunk_sealer.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const net = std.Io.net;
@@ -13,8 +14,10 @@ const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
+const runtime_disk = @import("runtime_disk.zig");
 const runtime_disk_fork_control = @import("runtime_disk_fork_control.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
+const saved_spore_pin = @import("saved_spore_pin.zig");
 const generation = @import("generation.zig");
 const attach_mod = @import("attach.zig");
 const run_mod = @import("run.zig");
@@ -164,6 +167,7 @@ const copy_out_usage =
 const rm_usage =
     \\Usage:
     \\  spore rm NAME
+    \\  spore rm --spore DIR
     \\
     \\Options:
     \\  -h, --help              Show this help
@@ -935,6 +939,11 @@ pub fn restoreNamed(
     }
 
     const base = if (lifecycle_spec) |spec| spec.value else Spec{ .name = options.name };
+    var disk_handoff: ?SavedDiskLeaseHandoff = if (disk) |saved_disk|
+        try leaseForSavedDisk(init.io, arena, init.environ_map, spore_dir, saved_disk)
+    else
+        null;
+    defer if (disk_handoff) |*handoff| if (handoff.active) |*active| active.deinit();
     const spec = Spec{
         .name = options.name,
         .backend = if (options.backend) |backend| backend.name() else base.backend,
@@ -944,13 +953,7 @@ pub fn restoreNamed(
         .resume_generation = resume_generation,
         .rootfs = rootfs,
         .disk = disk,
-        // Saved-spore authority moves with the spore directory. Rebind it to
-        // the resolved restore path instead of trusting the producer's old
-        // absolute publish path from lifecycle metadata.
-        .disk_baseline_lease = if (disk) |saved_disk|
-            try runtime_disk_lease.fromSavedDisk(spore_dir, saved_disk)
-        else
-            base.disk_baseline_lease,
+        .disk_baseline_lease = if (disk_handoff) |handoff| handoff.lease else base.disk_baseline_lease,
         .network = try run_mod.manifestNetworkFromOptions(arena, network_options.network, &network_options.policy),
         .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
         .sessions = sessions,
@@ -990,6 +993,37 @@ pub fn restoreNamed(
             .total_ms = ready_ms - start_ms,
         },
     });
+}
+
+const SavedDiskLeaseHandoff = struct {
+    lease: runtime_disk_lease.Lease,
+    active: ?runtime_disk_lease.Active = null,
+};
+
+fn leaseForSavedDisk(io: Io, allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, spore_dir: []const u8, disk: spore.Disk) !SavedDiskLeaseHandoff {
+    if (try saved_spore_pin.hasLocalIndex(io, allocator, spore_dir, disk)) {
+        return .{ .lease = try runtime_disk_lease.fromSavedDisk(spore_dir, disk) };
+    }
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, environ);
+    var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(io, allocator, cache_root);
+    defer cache_lock.deinit();
+    const registry = try saved_spore_pin.LockedRegistry.init(allocator, cache_root, &cache_lock);
+    if (saved_spore_pin.loadForSporeLocked(io, allocator, registry, spore_dir, disk)) |parsed_value| {
+        var parsed = parsed_value;
+        defer parsed.deinit();
+        const lease = runtime_disk_lease.Lease{
+            .store = .rootfs_cache,
+            .root = cache_root,
+            .baseline_kind = .disk_index,
+            .baseline_identity = disk.base,
+            .rootfs_storage = try runtime_disk.storageFromSnapshotDisk(allocator, disk),
+        };
+        const runtime_root = try local_paths.runtimeRootPath(allocator, environ);
+        return .{ .lease = lease, .active = try runtime_disk_lease.acquireActive(io, allocator, runtime_root, lease) };
+    } else |err| switch (err) {
+        error.FileNotFound => return .{ .lease = try runtime_disk_lease.fromSavedDisk(spore_dir, disk) },
+        else => |e| return e,
+    }
 }
 
 pub fn execNamed(
@@ -1258,18 +1292,43 @@ fn saveStopNamed(
     if (!spore.annotationsEmpty(options.annotations)) {
         if (manifest) |*parsed| {
             parsed.value.annotations = try spore.mergeAnnotations(arena, parsed.value.annotations, options.annotations);
-            try spore.saveManifest(arena, out_dir, parsed.value);
+            if (parsed.value.disk) |disk| {
+                const bytes = try std.json.Stringify.valueAlloc(arena, parsed.value, .{ .whitespace = .indent_2 });
+                const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
+                var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, arena, cache_root);
+                defer cache_lock.deinit();
+                const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &cache_lock);
+                try saved_spore_pin.replaceAuthorizedManifest(context.io, arena, registry, out_dir, disk, bytes);
+            } else {
+                try spore.saveManifest(arena, out_dir, parsed.value);
+            }
             suspend_spec.annotations = parsed.value.annotations;
         } else if (manifest_v1) |*parsed| {
             parsed.value.annotations = try spore.mergeAnnotations(arena, parsed.value.annotations, options.annotations);
-            try spore.saveManifestV1(arena, out_dir, parsed.value);
+            if (parsed.value.disk) |disk| {
+                const bytes = try std.json.Stringify.valueAlloc(arena, parsed.value, .{ .whitespace = .indent_2 });
+                const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
+                var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, arena, cache_root);
+                defer cache_lock.deinit();
+                const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &cache_lock);
+                try saved_spore_pin.replaceAuthorizedManifest(context.io, arena, registry, out_dir, disk, bytes);
+            } else {
+                try spore.saveManifestV1(arena, out_dir, parsed.value);
+            }
             suspend_spec.annotations = parsed.value.annotations;
         }
     }
     const saved_disk = if (manifest) |parsed| parsed.value.disk else manifest_v1.?.value.disk;
     if (saved_disk) |disk| {
         suspend_spec.disk = disk;
-        suspend_spec.disk_baseline_lease = try runtime_disk_lease.fromSavedDisk(out_dir, disk);
+        const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
+        suspend_spec.disk_baseline_lease = .{
+            .store = .rootfs_cache,
+            .root = cache_root,
+            .baseline_kind = .disk_index,
+            .baseline_identity = disk.base,
+            .rootfs_storage = try runtime_disk.storageFromSnapshotDisk(arena, disk),
+        };
     }
     try writeSporeLifecycleSpec(arena, context.io, out_dir, suspend_spec);
     const saved_sessions = if (manifest) |parsed| parsed.value.sessions.len else manifest_v1.?.value.sessions.len;
@@ -1797,6 +1856,14 @@ pub fn rmCli(
         return;
     }
     const allocator = init.arena.allocator();
+    if (args.len == 2 and std.mem.eql(u8, args[0], "--spore")) {
+        const removed = try removeSavedSpore(.{ .io = init.io, .environ_map = init.environ_map }, allocator, args[1]);
+        if (mode == .json) try machine_output.writeJson(allocator, stdout, removed) else {
+            try stdout.print("removed spore {s} (pin {s})\n", .{ removed.spore_dir, removed.pin_id });
+            try stdout.flush();
+        }
+        return;
+    }
     const name = parseRmArgs(args, allocator, stderr, mode);
     const result = removeNamed(.{
         .io = init.io,
@@ -1820,6 +1887,39 @@ pub fn rmCli(
     } else {
         try writeNamedLifecycleResult(stdout, result);
     }
+}
+
+pub const RemovedSavedSpore = struct { action: []const u8 = "removed_spore", spore_dir: []const u8, pin_id: []const u8 };
+
+pub fn deinitRemovedSavedSpore(allocator: std.mem.Allocator, result: RemovedSavedSpore) void {
+    allocator.free(result.spore_dir);
+    allocator.free(result.pin_id);
+}
+
+pub fn removeSavedSpore(context: Context, allocator: std.mem.Allocator, raw_dir: []const u8) !RemovedSavedSpore {
+    const dir = try resolveExistingSporeDirApi(allocator, context.io, raw_dir);
+    errdefer allocator.free(dir);
+    var manifest = spore.loadManifest(allocator, dir) catch |err| switch (err) {
+        error.BadManifest => null,
+        else => |e| return e,
+    };
+    defer if (manifest) |*parsed| parsed.deinit();
+    var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
+    defer if (manifest_v1) |*parsed| parsed.deinit();
+    if (manifest == null) manifest_v1 = try spore.loadManifestV1(allocator, dir);
+    const disk = (if (manifest) |parsed| parsed.value.disk else manifest_v1.?.value.disk) orelse return error.BadManifest;
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, context.environ_map);
+    var lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, cache_root);
+    defer lock.deinit();
+    const registry = try saved_spore_pin.LockedRegistry.init(allocator, cache_root, &lock);
+    var pin = try saved_spore_pin.loadForSporeLocked(context.io, allocator, registry, dir, disk);
+    defer pin.deinit();
+    const id = try allocator.dupe(u8, pin.value.id);
+    errdefer allocator.free(id);
+    try Io.Dir.cwd().deleteTree(context.io, dir);
+    try chunk_sealer.fsyncDirPath(allocator, std.fs.path.dirname(dir) orelse ".");
+    try saved_spore_pin.remove(context.io, allocator, registry, id);
+    return .{ .spore_dir = dir, .pin_id = id };
 }
 
 pub fn saveCli(
@@ -2328,7 +2428,7 @@ pub fn writeSpec(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec)
     try ensureVmDir(io, paths);
     const json = try std.json.Stringify.valueAlloc(allocator, spec, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.spec_path, .data = json });
+    try chunk_sealer.replaceFileAtomicDurable(allocator, paths.spec_path, json, 0o600);
 }
 
 pub fn readSpec(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.Parsed(Spec) {
@@ -6371,6 +6471,50 @@ test "lifecycle detects incomplete ready and stale pid state" {
 
     try writeSpec(allocator, io, paths, .{ .name = "wrong-name" });
     try std.testing.expectEqual(VmState.stale, try classifyVmState(allocator, io, paths, alwaysAlive));
+}
+
+test "named restore lease planning prefers local CAS over stale pin reference" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const spore_dir = try std.fs.path.join(allocator, &.{ root, "local.spore" });
+    defer allocator.free(spore_dir);
+    try Io.Dir.cwd().createDirPath(io, spore_dir);
+
+    const digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const disk = spore.Disk{
+        .kind = spore.disk_kind_chunk_index,
+        .device = .{ .mmio_slot = 1 },
+        .size = spore.disk_chunk_size,
+        .base = digest,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+        .layers = &.{},
+    };
+    const local_index = try rootfs_cas.manifestIndexPath(allocator, spore_dir, digest);
+    defer allocator.free(local_index);
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(local_index).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = local_index, .data = "local index selected before validation" });
+    const stale_ref = try std.fs.path.join(allocator, &.{ spore_dir, saved_spore_pin.reference_file });
+    defer allocator.free(stale_ref);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = stale_ref, .data =
+        \\{"schema":"spore.saved-disk-pin-ref.v1","id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+    });
+
+    const missing_cache = try std.fs.path.join(allocator, &.{ root, "missing-cache" });
+    defer allocator.free(missing_cache);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, missing_cache);
+    var handoff = try leaseForSavedDisk(io, allocator, &env, spore_dir, disk);
+    defer if (handoff.active) |*active| active.deinit();
+    try std.testing.expectEqual(runtime_disk_lease.Store.saved_spore, handoff.lease.store);
+    try std.testing.expectEqualStrings(spore_dir, handoff.lease.root);
+    try std.testing.expect(handoff.active == null);
 }
 
 test "lifecycle rejects insecure existing runtime directories" {

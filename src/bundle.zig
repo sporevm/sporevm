@@ -18,6 +18,8 @@ const gicv3 = @import("gicv3.zig");
 const rootfs_mod = @import("rootfs.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
+const saved_spore_pin = @import("saved_spore_pin.zig");
+const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const disk_index = @import("disk_index.zig");
 const spore = @import("spore.zig");
 const topology = @import("topology.zig");
@@ -135,6 +137,7 @@ pub const PackOptions = struct {
     spore_dir: []const u8,
     out_dir: []const u8,
     rootfs_cache_dir: ?[]const u8 = null,
+    runtime_root: ?[]const u8 = null,
     children_dir: ?[]const u8 = null,
     rootfs_policy: RootfsBundlePolicy = .exact_bytes,
 };
@@ -664,7 +667,7 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
     }
 
     const rootfs_payload_bytes = try packRootfsArtifact(allocator, options, manifest.rootfs());
-    try packDiskIndexForManifest(allocator, options.io, options.spore_dir, options.out_dir, manifest.disk());
+    try packDiskIndexForManifest(allocator, options.io, options.spore_dir, options.rootfs_cache_dir, options.runtime_root, options.out_dir, manifest.disk());
     try manifest.saveDir(allocator, options.out_dir);
     try saveIndex(allocator, options.out_dir, .{
         .chunk_size = spore.chunk_size,
@@ -750,7 +753,7 @@ fn packIndexed(allocator: std.mem.Allocator, options: PackOptions) Error!PackRes
         &rootfs_storage_entries,
         &seen_rootfs_objects,
     );
-    try packDiskIndexForManifest(allocator, options.io, options.spore_dir, options.out_dir, parent_manifest.disk());
+    try packDiskIndexForManifest(allocator, options.io, options.spore_dir, options.rootfs_cache_dir, options.runtime_root, options.out_dir, parent_manifest.disk());
     try parent_manifest.savePath(allocator, try pathZ(allocator, "{s}/{s}", .{ options.out_dir, parent_manifest_path }));
 
     for (children) |child| {
@@ -778,7 +781,7 @@ fn packIndexed(allocator: std.mem.Allocator, options: PackOptions) Error!PackRes
             &rootfs_storage_entries,
             &seen_rootfs_objects,
         );
-        try packDiskIndexForManifest(allocator, options.io, child_dir, options.out_dir, child_manifest.disk());
+        try packDiskIndexForManifest(allocator, options.io, child_dir, options.rootfs_cache_dir, options.runtime_root, options.out_dir, child_manifest.disk());
         const manifest_rel = try childManifestRelPath(allocator, child.id);
         try child_manifest.savePath(allocator, try pathZ(allocator, "{s}/{s}", .{ options.out_dir, manifest_rel }));
         try bundle_children.append(.{
@@ -1915,12 +1918,33 @@ fn packDiskIndexForManifest(
     allocator: std.mem.Allocator,
     io: Io,
     source_dir: []const u8,
+    cache_root_opt: ?[]const u8,
+    runtime_root_opt: ?[]const u8,
     bundle_dir: []const u8,
     disk_opt: ?spore.Disk,
 ) Error!void {
     const disk = disk_opt orelse return;
     const storage = try diskStorageDescriptor(disk);
-    const source_index_path = rootfs_cas.manifestIndexPath(allocator, source_dir, storage.index_digest) catch |err| return rootfsError(err);
+    var active_lease: ?runtime_disk_lease.Active = null;
+    defer if (active_lease) |*lease| lease.deinit();
+    const source_root = if (saved_spore_pin.hasLocalIndex(io, allocator, source_dir, disk) catch |err| return rootfsError(err)) source_dir else blk: {
+        const cache_root = cache_root_opt orelse return error.BadManifest;
+        const runtime_root = runtime_root_opt orelse return error.BadManifest;
+        var cache_lock = rootfs_mod.lockRootfsCacheExclusive(io, allocator, cache_root) catch return error.BadManifest;
+        defer cache_lock.deinit();
+        const registry = saved_spore_pin.LockedRegistry.init(allocator, cache_root, &cache_lock) catch return error.BadManifest;
+        var pin = saved_spore_pin.loadForSporeLocked(io, allocator, registry, source_dir, disk) catch return error.BadManifest;
+        defer pin.deinit();
+        active_lease = runtime_disk_lease.acquireActive(io, allocator, runtime_root, .{
+            .store = .rootfs_cache,
+            .root = cache_root,
+            .baseline_kind = .disk_index,
+            .baseline_identity = disk.base,
+            .rootfs_storage = storage,
+        }) catch return error.BadManifest;
+        break :blk cache_root;
+    };
+    const source_index_path = rootfs_cas.manifestIndexPath(allocator, source_root, storage.index_digest) catch |err| return rootfsError(err);
     const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
     defer allocator.free(index_bytes);
     const parsed_index = try parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
@@ -1933,7 +1957,9 @@ fn packDiskIndexForManifest(
 
     for (parsed_index.value.chunks) |chunk_entry| {
         const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
-        const source_object_path = rootfs_cas.manifestObjectPath(allocator, source_dir, chunk_entry.digest) catch |err| return rootfsError(err);
+        const local_object_path = rootfs_cas.manifestObjectPath(allocator, source_dir, chunk_entry.digest) catch |err| return rootfsError(err);
+        const object_root = if (try localFilePresent(io, local_object_path)) source_dir else source_root;
+        const source_object_path = rootfs_cas.manifestObjectPath(allocator, object_root, chunk_entry.digest) catch |err| return rootfsError(err);
         const object_data = rootfs_cas.readVerifiedChunkPath(allocator, source_object_path, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
         defer allocator.free(object_data);
 
@@ -1942,6 +1968,15 @@ fn packDiskIndexForManifest(
         if (std.fs.path.dirname(dest_object_path)) |parent| try ensureDirPath(io, parent);
         try writeFileAll(dest_object_path, object_data);
     }
+}
+
+fn localFilePresent(io: Io, path: []const u8) Error!bool {
+    const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return error.IoFailed,
+    };
+    if (stat.kind != .file) return error.BadManifest;
+    return true;
 }
 
 fn unpackDiskIndexForManifest(
@@ -4049,6 +4084,7 @@ test "pack and unpack rootfs artifact in existing bundle shape" {
         .spore_dir = parent_dir,
         .out_dir = bundle_dir,
         .rootfs_cache_dir = pack_cache_root,
+        .runtime_root = try pathZ(arena, "{s}/runtime", .{root_dir}),
     });
     try std.testing.expectEqual(@as(usize, 1), pack_result.rootfs_artifact_count);
     try std.testing.expectEqual(artifact.size, pack_result.rootfs_payload_bytes);
@@ -4103,6 +4139,7 @@ test "bundle digest covers rootfs artifact bytes" {
         .spore_dir = parent_dir,
         .out_dir = bundle_dir,
         .rootfs_cache_dir = pack_cache_root,
+        .runtime_root = try pathZ(arena, "{s}/runtime", .{root_dir}),
     });
     const clean_digest = pack_result.bundle_digest;
 
@@ -4142,18 +4179,45 @@ test "pack and unpack disk indexes in existing bundle shape" {
     try writeFileAll(rootfs_source_path, base_bytes);
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
     var manifest = testRootfsManifest(memory, ram.len, 17, artifact);
-    try attachTestDiskIndex(arena, parent_dir, &manifest, rootfs_source_path, 4096, "disk bundle payload");
+    try attachTestDiskIndex(arena, pack_cache_root, &manifest, rootfs_source_path, 4096, "disk bundle payload");
     try spore.saveManifest(arena, parent_dir, manifest);
+    const disk = manifest.disk orelse return error.BadManifest;
+    const storage = try diskStorageDescriptor(disk);
+    var pin_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, pack_cache_root);
+    defer pin_lock.deinit();
+    const pin_registry = try saved_spore_pin.LockedRegistry.init(arena, pack_cache_root, &pin_lock);
+    const pin_id = try saved_spore_pin.create(io, arena, pin_registry, parent_dir, disk);
+    pin_lock.deinit();
+    const source_index = try rootfs_cas.manifestIndexPath(arena, pack_cache_root, storage.index_digest);
+    const index_bytes = try readFileAllNoSymlink(arena, source_index, disk_index.max_index_bytes);
+    const local_index = try rootfs_cas.manifestIndexPath(arena, parent_dir, storage.index_digest);
+    try ensureDirPath(io, std.fs.path.dirname(local_index).?);
+    try writeFileAll(try pathZ(arena, "{s}", .{local_index}), index_bytes);
+    var local_index_parsed = try parseRootfsDiskIndexForStorage(arena, index_bytes, storage);
+    defer local_index_parsed.deinit();
+    for (local_index_parsed.value.chunks) |entry| {
+        const source_object = try rootfs_cas.manifestObjectPath(arena, pack_cache_root, entry.digest);
+        const object_bytes = try readFileAllNoSymlink(arena, source_object, rootfs_cas.default_chunk_size);
+        const local_object = try rootfs_cas.manifestObjectPath(arena, parent_dir, entry.digest);
+        try ensureDirPath(io, std.fs.path.dirname(local_object).?);
+        try writeFileAll(try pathZ(arena, "{s}", .{local_object}), object_bytes);
+    }
+    // A copied host-private ref may be stale. Pack remains local-first for a
+    // complete self-contained/local-CAS spore.
+    var remove_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, pack_cache_root);
+    defer remove_lock.deinit();
+    const remove_registry = try saved_spore_pin.LockedRegistry.init(arena, pack_cache_root, &remove_lock);
+    try saved_spore_pin.remove(io, arena, remove_registry, pin_id);
+    remove_lock.deinit();
 
     const pack_result = try pack(arena, .{
         .io = io,
         .spore_dir = parent_dir,
         .out_dir = bundle_dir,
         .rootfs_cache_dir = pack_cache_root,
+        .runtime_root = try pathZ(arena, "{s}/runtime", .{root_dir}),
     });
 
-    const disk = manifest.disk orelse return error.BadManifest;
-    const storage = try diskStorageDescriptor(disk);
     const index_rel = try rootfsStorageIndexRelPath(arena, disk.base);
     try std.testing.expectEqual(@as(c_int, 0), std.c.access(try pathZ(arena, "{s}/{s}", .{ bundle_dir, index_rel }), 0));
     const parsed_index = try loadDiskIndexForDisk(arena, bundle_dir, storage);
@@ -4162,6 +4226,11 @@ test "pack and unpack disk indexes in existing bundle shape" {
     const object_rel = try rootfsStorageObjectRelPath(arena, parsed_index.value.chunks[0].digest);
     const object_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, object_rel });
     try std.testing.expectEqual(@as(c_int, 0), std.c.access(object_path, 0));
+
+    // Pack is the portable boundary: the bundle remains complete after the
+    // source global CAS and pin registry disappear.
+    try Io.Dir.cwd().deleteTree(io, try pathZ(arena, "{s}/cas", .{pack_cache_root}));
+    try Io.Dir.cwd().deleteTree(io, try pathZ(arena, "{s}/pins", .{pack_cache_root}));
 
     const unpacked = try unpack(arena, .{
         .io = io,

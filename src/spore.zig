@@ -30,6 +30,7 @@ pub const format_version_legacy_v0: u32 = 0;
 pub const format_version_legacy_v1: u32 = 1;
 pub const format_version: u32 = 2;
 pub const format_version_v1: u32 = 3;
+pub const max_manifest_bytes: usize = 64 * 1024 * 1024;
 pub const machine_schema_version_v1: u32 = 1;
 pub const chunk_size: usize = 2 * 1024 * 1024;
 pub const ram_backing_kind = "map-private-file-v0";
@@ -1774,7 +1775,7 @@ pub fn loadManifest(allocator: std.mem.Allocator, dir: []const u8) Error!std.jso
 
 pub fn loadManifestPath(allocator: std.mem.Allocator, path: []const u8) Error!std.json.Parsed(Manifest) {
     const path_z = try pathZ(allocator, "{s}", .{path});
-    const bytes = try readFileAll(allocator, path_z, 64 * 1024 * 1024);
+    const bytes = try readFileAll(allocator, path_z, max_manifest_bytes);
     defer allocator.free(bytes);
     const parsed = std.json.parseFromSlice(Manifest, allocator, bytes, .{
         // The byte buffer is freed before the parse result is used.
@@ -1799,7 +1800,7 @@ pub fn loadManifestV1(allocator: std.mem.Allocator, dir: []const u8) Error!std.j
 
 pub fn loadManifestV1Path(allocator: std.mem.Allocator, path: []const u8) Error!std.json.Parsed(ManifestV1) {
     const path_z = try pathZ(allocator, "{s}", .{path});
-    const bytes = try readFileAll(allocator, path_z, 64 * 1024 * 1024);
+    const bytes = try readFileAll(allocator, path_z, max_manifest_bytes);
     defer allocator.free(bytes);
     const parsed = std.json.parseFromSlice(ManifestV1, allocator, bytes, .{
         // The byte buffer is freed before the parse result is used.
@@ -1822,6 +1823,7 @@ pub const ForkOptions = struct {
     out_dir: []const u8,
     count: usize,
     environ_map: ?*const std.process.Environ.Map = null,
+    disk_root: ?[]const u8 = null,
 };
 
 pub const ForkResult = struct {
@@ -1853,7 +1855,7 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
 fn forkV0(allocator: std.mem.Allocator, options: ForkOptions, parent: Manifest) Error!ForkResult {
     if (parent.generation.generation > std.math.maxInt(u64) - options.count) return error.BadForkCount;
 
-    const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.disk);
+    const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.memory, parent.disk, options.disk_root);
     const shared_backing = try provenForkBacking(allocator, options.environ_map, options.parent_dir, parent.memory, parent.platform.ram_size, 1);
     defer if (shared_backing) |backing| backing.deinit();
 
@@ -1900,7 +1902,7 @@ fn forkV1(allocator: std.mem.Allocator, options: ForkOptions, parent: ManifestV1
     if (parent.generation.generation > std.math.maxInt(u64) - options.count) return error.BadForkCount;
 
     const child_gic = try forkGicStateV1(allocator, parent.machine.gic);
-    const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.disk);
+    const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.memory, parent.disk, options.disk_root);
     const shared_backing = try provenForkBacking(allocator, options.environ_map, options.parent_dir, parent.memory, parent.platform.ram_size, parent.platform.vcpu_count);
     defer if (shared_backing) |backing| backing.deinit();
     const fork_batch_id = try randomHex(allocator, 16);
@@ -1947,17 +1949,63 @@ const ForkSharedStores = struct {
     disk_cas: ?[]const u8 = null,
 };
 
-fn prepareForkSharedStores(allocator: std.mem.Allocator, parent_dir: []const u8, out_dir: []const u8, disk: ?Disk) Error!ForkSharedStores {
+fn prepareForkSharedStores(allocator: std.mem.Allocator, parent_dir: []const u8, out_dir: []const u8, memory: MemoryManifest, disk: ?Disk, disk_root: ?[]const u8) Error!ForkSharedStores {
     const parent_chunks = try pathZ(allocator, "{s}/chunks", .{parent_dir});
-    const shared_chunks = try realpathAlloc(allocator, parent_chunks);
-    var stores = ForkSharedStores{ .chunks = shared_chunks };
+    try ensureDir(try pathZ(allocator, "{s}", .{out_dir}));
+    const shared_chunks_path = try pathZ(allocator, "{s}/shared-chunks", .{out_dir});
+    try ensureNewDir(shared_chunks_path);
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    for (memory.chunks) |entry| {
+        const hex = try memoryChunkDigestHex(entry.digest);
+        if (seen.contains(hex)) continue;
+        try seen.put(hex, {});
+        const source = try pathZ(allocator, "{s}/{s}", .{ parent_chunks, hex });
+        const dest = try pathZ(allocator, "{s}/{s}", .{ shared_chunks_path, hex });
+        try hardlinkOrCopyPath(source, dest);
+    }
+    try fsyncDirPath(shared_chunks_path);
+    // Child links must survive the API's atomic rename of the hidden batch.
+    var stores = ForkSharedStores{ .chunks = "../shared-chunks" };
     if (disk) |parent_disk| {
         if (std.mem.eql(u8, parent_disk.kind, disk_kind_chunk_index)) {
-            stores.disk_cas = try realpathAlloc(allocator, try pathZ(allocator, "{s}/cas", .{parent_dir}));
+            // Pinned parents deliberately leave children without a local CAS
+            // symlink. The product API publishes an independent child pin
+            // bound to each rewritten child manifest before returning.
+            if (disk_root == null) stores.disk_cas = try realpathAlloc(allocator, try pathZ(allocator, "{s}/cas", .{parent_dir}));
         }
     }
-    try ensureDir(try pathZ(allocator, "{s}", .{out_dir}));
     return stores;
+}
+
+fn fsyncDirPath(path: [:0]const u8) Error!void {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECTORY = true }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    if (std.c.fsync(fd) != 0) return error.IoFailed;
+}
+
+fn hardlinkOrCopyPath(source: [:0]const u8, dest: [:0]const u8) Error!void {
+    if (std.c.link(source, dest) == 0) return;
+    const in_fd = std.c.open(source, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (in_fd < 0) return error.IoFailed;
+    defer _ = std.c.close(in_fd);
+    const out_fd = std.c.open(dest, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o444));
+    if (out_fd < 0) return error.IoFailed;
+    defer _ = std.c.close(out_fd);
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = std.c.read(in_fd, &buf, buf.len);
+        if (n < 0) return error.IoFailed;
+        if (n == 0) break;
+        var off: usize = 0;
+        while (off < n) {
+            const wrote = std.c.write(out_fd, buf[off..].ptr, @as(usize, @intCast(n)) - off);
+            if (wrote <= 0) return error.IoFailed;
+            off += @intCast(wrote);
+        }
+    }
+    if (std.c.fsync(out_fd) != 0) return error.IoFailed;
 }
 
 fn linkForkSharedStores(allocator: std.mem.Allocator, child_dir: []const u8, stores: ForkSharedStores) Error!void {

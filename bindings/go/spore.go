@@ -18,7 +18,7 @@ import (
 	"unsafe"
 )
 
-const minABIVersion uint32 = 14
+const minABIVersion uint32 = 15
 const reexecContractVersion uint32 = C.SPORE_REEXEC_CONTRACT_VERSION
 const reexecRoleEnv = "SPORE_REEXEC_ROLE"
 const reexecContractEnv = "SPORE_REEXEC_CONTRACT"
@@ -657,6 +657,26 @@ func (c *Client) RemoveNamed(ctx context.Context, options RemoveNamedOptions) (N
 	}
 	defer C.spore_free_string(c.ctx, out)
 	return decodeJSON[NamedLifecycleResult](goBytes(out), "named lifecycle result")
+}
+
+// RemoveSaved removes a machine-local saved spore and unregisters its durable disk pin.
+func (c *Client) RemoveSaved(ctx context.Context, options RemoveSavedOptions) (RemovedSavedSpore, error) {
+	if err := c.ready(ctx); err != nil {
+		return RemovedSavedSpore{}, err
+	}
+	sporeDir, freeSporeDir := cString(options.SporeDir)
+	defer freeSporeDir()
+
+	var opts C.SporeRemoveSavedOptions
+	C.spore_remove_saved_options_init(&opts)
+	opts.spore_dir = sporeDir
+
+	var out C.SporeOwnedString
+	if result := Result(C.spore_remove_saved_json(c.ctx, &opts, &out)); result != Success {
+		return RemovedSavedSpore{}, c.callError(result)
+	}
+	defer C.spore_free_string(c.ctx, out)
+	return decodeJSON[RemovedSavedSpore](goBytes(out), "removed saved spore")
 }
 
 // ListNamed returns the current local named VM registry.

@@ -13,7 +13,7 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 14;
+const c_abi_version: u32 = 15;
 const reexec_contract_version: u32 = 1;
 const reexec_role_env = "SPORE_REEXEC_ROLE";
 const reexec_contract_env = "SPORE_REEXEC_CONTRACT";
@@ -30,6 +30,7 @@ const exec_named_stream_options_version: u32 = 1;
 const copy_named_options_version: u32 = 1;
 const save_named_options_version: u32 = 1;
 const remove_named_options_version: u32 = 1;
+const remove_saved_options_version: u32 = 1;
 
 const stream_event_stdout: c_int = 1;
 const stream_event_stderr: c_int = 2;
@@ -241,6 +242,12 @@ const SporeRemoveNamedOptions = extern struct {
     size: u32,
     version: u32,
     name: SporeString,
+};
+
+const SporeRemoveSavedOptions = extern struct {
+    size: u32,
+    version: u32,
+    spore_dir: SporeString,
 };
 
 const SporeExecNamedStreamImpl = struct {
@@ -456,6 +463,10 @@ pub export fn spore_remove_named_options_init(options: ?*SporeRemoveNamedOptions
         .version = remove_named_options_version,
         .name = .{},
     };
+}
+
+pub export fn spore_remove_saved_options_init(options: ?*SporeRemoveSavedOptions) void {
+    if (options) |out| out.* = .{ .size = @sizeOf(SporeRemoveSavedOptions), .version = remove_saved_options_version, .spore_dir = .{} };
 }
 
 pub export fn spore_build_info(field: c_int, out: ?*anyopaque) c_int {
@@ -1072,6 +1083,19 @@ pub export fn spore_remove_named_json(
     return result_success;
 }
 
+pub export fn spore_remove_saved_json(context: ?*SporeContextImpl, options: ?*const SporeRemoveSavedOptions, out_json: ?*SporeOwnedString) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    const out = out_json orelse return fail(ctx, error.InvalidValue);
+    out.* = .{};
+    ctx.clearLastError();
+    if (opts.version != remove_saved_options_version or opts.size < @sizeOf(SporeRemoveSavedOptions)) return fail(ctx, error.InvalidValue);
+    const result = libspore.removeSavedSpore(ctx.productContext(), ctx.allocator, toSlice(opts.spore_dir) catch |err| return fail(ctx, err)) catch |err| return fail(ctx, err);
+    defer libspore.deinitRemovedSavedSpore(ctx.allocator, result);
+    out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
 pub export fn spore_list_named_json(context: ?*SporeContextImpl, out_json: ?*SporeOwnedString) c_int {
     const ctx = context orelse return result_invalid_value;
     const out = out_json orelse return fail(ctx, error.InvalidValue);
@@ -1492,6 +1516,12 @@ test "named lifecycle options initialize defaults" {
     try std.testing.expectEqual(save_named_options_version, save.version);
     try std.testing.expectEqual(@as(u8, 0), save.stop);
     try std.testing.expectEqual(@as(usize, 0), save.annotation_count);
+
+    var remove_saved: SporeRemoveSavedOptions = undefined;
+    spore_remove_saved_options_init(&remove_saved);
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeRemoveSavedOptions))), remove_saved.size);
+    try std.testing.expectEqual(remove_saved_options_version, remove_saved.version);
+    try std.testing.expectEqual(@as(usize, 0), remove_saved.spore_dir.len);
 }
 
 test "C ABI exposes network capabilities JSON" {

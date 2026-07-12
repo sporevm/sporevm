@@ -14,6 +14,7 @@ const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
 const spore = @import("../spore.zig");
 const spore_stream = @import("../spore_stream.zig");
+const snapshot_publication = @import("../snapshot_publication.zig");
 
 pub const device_id: u32 = 19;
 
@@ -705,7 +706,8 @@ pub const Control = struct {
     context: *anyopaque,
     pollFn: *const fn (context: *anyopaque, dev: *Vsock) anyerror!ControlAction,
     setWakeFn: *const fn (context: *anyopaque, wake: Wake) void,
-    publishSnapshotFn: ?*const fn (context: *anyopaque, work_dir: []const u8, publish_dir: []const u8) anyerror!void = null,
+    prepareSnapshotFn: ?*const fn (context: *anyopaque) anyerror!?snapshot_publication.SnapshotPreparation = null,
+    publishSnapshotFn: ?*const fn (context: *anyopaque, preparation: *const snapshot_publication.SnapshotPreparation, work_dir: []const u8, publish_dir: []const u8) anyerror!SnapshotPublishMetrics = null,
     completeSnapshotFn: *const fn (context: *anyopaque, dir: []const u8) anyerror!void,
     completeRootfsSnapshotFn: *const fn (context: *anyopaque, disk: ?spore.Disk) anyerror!void,
     completeDiskForkFn: ?*const fn (context: *anyopaque, batch: *runtime_disk_fork_capture.Batch) anyerror!void = null,
@@ -720,9 +722,17 @@ pub const Control = struct {
         self.setWakeFn(self.context, wake);
     }
 
-    pub fn publishSnapshot(self: Control, work_dir: []const u8, publish_dir: []const u8) !void {
+    /// Attempts to acquire named-snapshot publication authority without
+    /// blocking. A false result returns the request to pending so the VMM can
+    /// run the guest before polling again.
+    pub fn prepareSnapshot(self: Control) !?snapshot_publication.SnapshotPreparation {
+        const prepare = self.prepareSnapshotFn orelse return error.UnsupportedSnapshot;
+        return try prepare(self.context);
+    }
+
+    pub fn publishSnapshot(self: Control, preparation: *const snapshot_publication.SnapshotPreparation, work_dir: []const u8, publish_dir: []const u8) !SnapshotPublishMetrics {
         const publish = self.publishSnapshotFn orelse return error.UnsupportedSnapshot;
-        try publish(self.context, work_dir, publish_dir);
+        return try publish(self.context, preparation, work_dir, publish_dir);
     }
 
     pub fn completeSnapshot(self: Control, dir: []const u8) !void {
@@ -747,6 +757,14 @@ pub const Control = struct {
         self.reportStatsFn(self.context, stats);
     }
 };
+
+pub const SnapshotPublishMetrics = snapshot_publication.Metrics;
+
+test "snapshot publish metrics use monotonic nanosecond units" {
+    const metrics = SnapshotPublishMetrics{};
+    try std.testing.expectEqual(@as(u64, 0), metrics.cache_lock_wait_ns);
+    try std.testing.expectEqual(@as(u64, 17), SnapshotPublishMetrics.nsToMs(17 * std.time.ns_per_ms + 999));
+}
 
 fn monotonicMs() u64 {
     var ts: std.c.timespec = undefined;

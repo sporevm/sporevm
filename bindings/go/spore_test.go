@@ -93,6 +93,41 @@ func TestClientHostInfo(t *testing.T) {
 	}
 }
 
+func TestRemoveSavedValidationAndResultContract(t *testing.T) {
+	client, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	removed, err := client.RemoveSaved(context.Background(), RemoveSavedOptions{})
+	if err == nil {
+		t.Fatal("empty saved-spore path unexpectedly accepted")
+	}
+	if removed != (RemovedSavedSpore{}) {
+		t.Fatalf("failed RemoveSaved returned data: %#v", removed)
+	}
+	var callErr *CallError
+	if !errors.As(err, &callErr) || callErr.Code == Success || callErr.Message == "" {
+		t.Fatalf("RemoveSaved error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.RemoveSaved(ctx, RemoveSavedOptions{SporeDir: "save.spore"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled RemoveSaved error = %v", err)
+	}
+	decoded, err := decodeJSON[RemovedSavedSpore]([]byte(`{"action":"removed_spore","spore_dir":"save.spore","pin_id":"abc"}`), "removed saved spore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Action != "removed_spore" || decoded.SporeDir != "save.spore" || decoded.PinID != "abc" {
+		t.Fatalf("unexpected removed save: %#v", decoded)
+	}
+	if _, err := decodeJSON[RemovedSavedSpore]([]byte(`{"action":`), "removed saved spore"); err == nil {
+		t.Fatal("malformed removed-save result unexpectedly decoded")
+	}
+}
+
 func TestClientNetworkCapabilities(t *testing.T) {
 	client, err := New()
 	if err != nil {
