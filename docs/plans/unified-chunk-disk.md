@@ -1124,6 +1124,52 @@ can leave reclaimable pin records, but never visible unpinned or partial
 children. The result reports monotonic lock-wait and lock-held publication time
 separately.
 
+Portable unpack now preserves both sides of the rootfs authority boundary. It
+reads and verifies each unique bundled rootfs object once, publishes that buffer
+to the spore-local CAS and host cache, then publishes each descriptor-bound
+index and completeness stamp after its objects. A fresh runtime can reinstall
+from the local CAS into an empty host cache and serve verified reads. Once that
+exact host root has a valid index and completeness stamp, warm opens trust it
+without another local object walk; if it is incomplete, local reinstall remains
+fail-closed. Pack deliberately stays stricter and deep-verifies a present local
+rootfs CAS so portability checks cannot be satisfied by host cache state.
+
+The native correctness gate is complete: Linux/KVM and macOS/HVF both passed
+build, the portability and destructive-race tests, the standalone process-crash
+matrix, and the complete test suite at product head
+`0f1e1b553f70f7df76013c3c4dc1372dc2c706ee`. The final candidate
+`c7f064f8d0aa31ecc350410adbe57c4921062cf0` changes only benchmark-owned
+runtime-directory privacy, so it inherits that product correctness evidence;
+c7f064f itself passed the exact-head migration gate on both backends. The
+benchmark used the pinned Node
+arm64 base—not the earlier augmented dense 1 GiB fixture—and a self-contained
+unpacked spore whose disk index was
+`blake3:8fdab2fa2ac1e3e101a28656631e05d85a2df7326170a2be3bf18ce55b1994fa`.
+Its local CAS contained 2,621 objects / 171,769,856 bytes. Seed pack/unpack
+reported 21 of 512 RAM chunks, 44,040,192 payload bytes, and one 172,170,747-byte
+rootfs artifact. Each backend emitted exactly one provenance row, one named
+restore row, one `first_migration` row, and four `steady_cache_backed` rows;
+the first row migrated all 2,621 objects and every steady row migrated zero.
+Public saved-spore cleanup succeeded after evidence capture.
+
+| Backend | Named restore | First duration / snapshot / source pause | Steady duration / snapshot / source pause |
+| --- | ---: | ---: | ---: |
+| KVM | 1,086 ms | 4,734 / 4,536 / 4,688 ms | 4,607–4,610 / 4,410–4,414 / 4,562–4,566 ms |
+| HVF | 934 ms | 2,843 / 2,729 / 2,808 ms | 2,063–2,077 / 1,948–1,964 / 2,029–2,044 ms |
+
+KVM's first migration spent 156 ms in disk snapshot work, 4,301 ms in memory,
+75 ms authorizing the pin, and 75 ms handing off the lease. Its steady rows
+spent 31–35 ms in disk snapshot work, 4,301–4,303 ms in memory, and 74–75 ms in
+each pin/lease phase. HVF's first row spent 806 ms in disk snapshot work,
+1,872 ms in memory, 37 ms authorizing the pin, and 38 ms handing off the lease;
+steady rows spent 24–34 ms in disk snapshot work, 1,871–1,876 ms in memory,
+37 ms on pin authorization, and 38 ms on lease handoff. Cache-lock wait, final
+publication, and lifecycle-spec time were zero in every row. The raw JSONL
+SHA256 values were
+`6830bab29f46feac4ae04b43b38c1d948774188a5935dc1ef832efa705968ccb` for KVM
+and `8ccbcea2bf5d33a774c80b0ca7f386d4a251e4a256ec8d4c87fc84dcb7b695e1` for
+HVF.
+
 The native publication gate is complete. Physical same- and cross-filesystem
 pack→unpack→run passed on distinct device IDs with the same verified bundle
 digest (`bd13758c8df47d7b98725accaf56d390613abee6fdf0aec79c5c216c345ea0a5`),
@@ -1238,8 +1284,9 @@ must preserve the existing cache-lock/GC-root contract and portable bundle
 semantics. The landed durable-pin design removes unchanged-parent object
 link/copy/hash operations from cache-backed steady-state saves whose parent is
 already in the global CAS. A first save after portable/local-CAS restore still
-performs a one-time verified migration into the global CAS; benchmark that
-migration separately from steady-state save and same-/cross-filesystem export.
+performs a one-time verified migration into the global CAS; the exact-head
+measurements above report it separately from steady-state save and the existing
+same-/cross-filesystem export evidence.
 `spore rm --spore` removes the save before
 unpinning under the cache lock. Raw moves preserve the opaque identity, while
 raw copies share it and cannot be removed independently; fork or pack/unpack

@@ -201,6 +201,20 @@ pub fn build(b: *std.Build) void {
     } else internal_mod;
     const internal_tests = b.addTest(.{ .root_module = internal_test_mod });
     const run_internal_tests = b.addRunArtifact(internal_tests);
+    const durable_crash_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/durable_release_proof.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const durable_crash_tests = b.addTest(.{
+        .root_module = durable_crash_test_mod,
+        .filters = &.{"durable process-boundary release proof"},
+    });
+    const run_durable_crash_tests = b.addRunArtifact(durable_crash_tests);
+    const run_durable_crash_tests_suite = b.addRunArtifact(durable_crash_tests);
+    const durable_crash_test_step = b.step("durable-crash-test", "Run saved-disk process-boundary crash recovery proof");
+    durable_crash_test_step.dependOn(&run_durable_crash_tests.step);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const rootfs_slow_mod = b.createModule(.{
@@ -237,7 +251,8 @@ pub fn build(b: *std.Build) void {
     run_libspore_smoke_tests.step.dependOn(&run_libspore_tests.step);
     run_c_api_tests.step.dependOn(&run_libspore_smoke_tests.step);
     run_internal_tests.step.dependOn(&run_c_api_tests.step);
-    run_exe_tests.step.dependOn(&run_internal_tests.step);
+    run_durable_crash_tests_suite.step.dependOn(&run_internal_tests.step);
+    run_exe_tests.step.dependOn(&run_durable_crash_tests_suite.step);
     run_c_smoke.step.dependOn(&run_exe_tests.step);
 
     const test_step = b.step("test", "Run unit tests");
@@ -245,6 +260,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_libspore_smoke_tests.step);
     test_step.dependOn(&run_c_api_tests.step);
     test_step.dependOn(&run_internal_tests.step);
+    test_step.dependOn(&run_durable_crash_tests_suite.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_c_smoke.step);
 

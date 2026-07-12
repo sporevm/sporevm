@@ -42,6 +42,22 @@ This pre-1.0 contract adds no global reference registry. `spore pack` still
 copies and verifies every required index and object into a self-contained
 portable bundle.
 
+Indexed unpack and pull now retain descriptor-bound chunked rootfs authority
+inside the output spore while populating the selected host cache from the same
+verified object reads. A fresh host can reinstall that local CAS into an empty
+cache; an exact index-valid, complete host cache remains the trusted warm-open
+path. `spore pack` continues to deep-verify a present local rootfs CAS, so host
+cache state cannot mask loss of the spore's claimed self-containment.
+
+On exact-head KVM and HVF runs using the pinned Node arm64 base, the first save
+after portable restore migrated 2,621 verified objects / 171,769,856 bytes and
+all four later saves migrated zero. KVM measured a 4,688 ms first-migration
+source pause versus 4,562–4,566 ms steady; HVF measured 2,808 ms versus
+2,029–2,044 ms. The independent empty-cache product pack, fresh named restore,
+five-save sequence, and public saved-spore cleanup all completed on both
+backends. These results are separate from the earlier augmented dense 1 GiB
+same-/cross-filesystem export fixture.
+
 Offline pinned-disk fork results now report cache-lock wait separately from the
 lock-held pin and batch publication interval in human output, JSON, and
 `libspore.ForkResult`.

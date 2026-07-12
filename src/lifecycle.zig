@@ -9,6 +9,7 @@ const net = std.Io.net;
 const Context = @import("context.zig").Context;
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
+const manifest_test_support = @import("manifest_test_support.zig");
 const memory_config = @import("memory.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -24,6 +25,8 @@ const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
+const system = @import("system.zig");
+const test_barrier = @import("test_barrier.zig");
 const topology = @import("topology.zig");
 const version = @import("version.zig");
 
@@ -59,6 +62,9 @@ else
 const last_lifecycle_error_max = 2048;
 threadlocal var last_lifecycle_error_buf: [last_lifecycle_error_max]u8 = undefined;
 threadlocal var last_lifecycle_error: []const u8 = &.{};
+const testing = if (builtin.is_test) struct {
+    var named_restore_authority_barrier: ?*test_barrier.Barrier = null;
+} else struct {};
 
 pub fn clearLastError() void {
     last_lifecycle_error = &.{};
@@ -1019,7 +1025,9 @@ fn leaseForSavedDisk(io: Io, allocator: std.mem.Allocator, environ: *const std.p
             .rootfs_storage = try runtime_disk.storageFromSnapshotDisk(allocator, disk),
         };
         const runtime_root = try local_paths.runtimeRootPath(allocator, environ);
-        return .{ .lease = lease, .active = try runtime_disk_lease.acquireActive(io, allocator, runtime_root, lease) };
+        const active = try runtime_disk_lease.acquireActive(io, allocator, runtime_root, lease);
+        if (comptime builtin.is_test) if (testing.named_restore_authority_barrier) |barrier| barrier.pause(io);
+        return .{ .lease = lease, .active = active };
     } else |err| switch (err) {
         error.FileNotFound => return .{ .lease = try runtime_disk_lease.fromSavedDisk(spore_dir, disk) },
         else => |e| return e,
@@ -6515,6 +6523,181 @@ test "named restore lease planning prefers local CAS over stale pin reference" {
     try std.testing.expectEqual(runtime_disk_lease.Store.saved_spore, handoff.lease.store);
     try std.testing.expectEqualStrings(spore_dir, handoff.lease.root);
     try std.testing.expect(handoff.active == null);
+}
+
+test "named restore active lease survives concurrent saved-spore removal and destructive collection" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
+    const save_dir = try std.fs.path.join(arena, &.{ root, "saved.spore" });
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache_root, save_dir, 0x72, false);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    try env.put(local_paths.runtime_dir_env, runtime_root);
+    {
+        var pin_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
+        defer pin_lock.deinit();
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &pin_lock);
+        try saved_spore_pin.publishManifest(io, arena, registry, save_dir, fixture.disk, fixture.manifest);
+    }
+
+    var restore_boundary = test_barrier.Barrier{};
+    testing.named_restore_authority_barrier = &restore_boundary;
+    defer testing.named_restore_authority_barrier = null;
+    var restore_ready = Io.Semaphore{};
+    var restore_finish = Io.Semaphore{};
+    const RestoreContext = struct {
+        allocator: std.mem.Allocator,
+        io: Io,
+        env: *const std.process.Environ.Map,
+        save_dir: []const u8,
+        disk: spore.Disk,
+        object_path: []const u8,
+        object_digest: []const u8,
+        expected: []const u8,
+        ready: *Io.Semaphore,
+        finish: *Io.Semaphore,
+        read_ok: bool = false,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer if (testing.named_restore_authority_barrier) |barrier| barrier.reached.post(self.io);
+            var handoff = leaseForSavedDisk(self.io, self.allocator, self.env, self.save_dir, self.disk) catch |err| {
+                self.err = err;
+                self.ready.post(self.io);
+                return;
+            };
+            defer if (handoff.active) |*active| active.deinit();
+            self.ready.post(self.io);
+            self.finish.waitUncancelable(self.io);
+            const bytes = rootfs_cas.readVerifiedChunkPath(self.allocator, self.object_path, self.object_digest, self.expected.len) catch |err| {
+                self.err = err;
+                return;
+            };
+            defer self.allocator.free(bytes);
+            self.read_ok = std.mem.eql(u8, bytes, self.expected);
+        }
+    };
+    var restore_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer restore_arena_state.deinit();
+    const object_path = try rootfs_cas.manifestObjectPath(arena, cache_root, fixture.object_digest);
+    var restore_context = RestoreContext{
+        .allocator = restore_arena_state.allocator(),
+        .io = io,
+        .env = &env,
+        .save_dir = save_dir,
+        .disk = fixture.disk,
+        .object_path = object_path,
+        .object_digest = fixture.object_digest,
+        .expected = fixture.object_bytes,
+        .ready = &restore_ready,
+        .finish = &restore_finish,
+    };
+    var restore_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, RestoreContext.run, .{&restore_context}),
+        .barriers = &.{&restore_boundary},
+    };
+    defer restore_thread.deinit();
+    restore_boundary.waitReached(io);
+    if (restore_context.err) |err| return err;
+
+    var remove_boundary = test_barrier.Barrier{};
+    var gc_boundary = test_barrier.Barrier{};
+    var prune_boundary = test_barrier.Barrier{};
+    saved_spore_pin.testing.remove_mutation_barrier = &remove_boundary;
+    defer saved_spore_pin.testing.remove_mutation_barrier = null;
+    system.testing.gc_mutation_barrier = &gc_boundary;
+    defer system.testing.gc_mutation_barrier = null;
+    system.testing.prune_mutation_barrier = &prune_boundary;
+    defer system.testing.prune_mutation_barrier = null;
+    const DestructiveContext = struct {
+        allocator: std.mem.Allocator,
+        io: Io,
+        cache_root: []const u8,
+        runtime_root: []const u8,
+        save_dir: []const u8,
+        env: *const std.process.Environ.Map,
+        attempting: *Io.Semaphore,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer {
+                if (saved_spore_pin.testing.remove_mutation_barrier) |barrier| barrier.reached.post(self.io);
+                if (system.testing.gc_mutation_barrier) |barrier| barrier.reached.post(self.io);
+                if (system.testing.prune_mutation_barrier) |barrier| barrier.reached.post(self.io);
+            }
+            self.attempting.post(self.io);
+            const removed = removeSavedSpore(.{ .io = self.io, .environ_map = self.env }, self.allocator, self.save_dir) catch |err| {
+                self.err = err;
+                return;
+            };
+            deinitRemovedSavedSpore(self.allocator, removed);
+            const gc_result = system.gc(self.allocator, self.io, .{ .cache_root = self.cache_root, .runtime_root = self.runtime_root, .dry_run = false }) catch |err| {
+                self.err = err;
+                return;
+            };
+            system.deinitRootfsGcResult(self.allocator, gc_result);
+            const prune_result = system.prune(self.allocator, self.io, .{
+                .cache_root = self.cache_root,
+                .runtime_root = self.runtime_root,
+                .dry_run = false,
+                .include_rootfs_chunks = true,
+                .max_bytes = 0,
+                .rootfs_only = true,
+            }, Io.Clock.real.now(self.io).nanoseconds) catch |err| {
+                self.err = err;
+                return;
+            };
+            system.deinitRootfsPruneResult(self.allocator, prune_result);
+        }
+    };
+    var destructive_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer destructive_arena_state.deinit();
+    var destructive_attempting = Io.Semaphore{};
+    var destructive_context = DestructiveContext{
+        .allocator = destructive_arena_state.allocator(),
+        .io = io,
+        .cache_root = cache_root,
+        .runtime_root = runtime_root,
+        .save_dir = save_dir,
+        .env = &env,
+        .attempting = &destructive_attempting,
+    };
+    var destructive_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, DestructiveContext.run, .{&destructive_context}),
+        .barriers = &.{ &remove_boundary, &gc_boundary, &prune_boundary },
+    };
+    defer destructive_thread.deinit();
+    destructive_attempting.waitUncancelable(io);
+    restore_boundary.release(io);
+    restore_ready.waitUncancelable(io);
+    if (restore_context.err) |err| return err;
+    remove_boundary.waitReached(io);
+    if (destructive_context.err) |err| return err;
+    remove_boundary.release(io);
+    gc_boundary.waitReached(io);
+    if (destructive_context.err) |err| return err;
+    gc_boundary.release(io);
+    prune_boundary.waitReached(io);
+    if (destructive_context.err) |err| return err;
+    prune_boundary.release(io);
+    destructive_thread.join();
+    if (destructive_context.err) |err| return err;
+    _ = try Io.Dir.cwd().statFile(io, object_path, .{ .follow_symlinks = false });
+    restore_finish.post(io);
+    restore_thread.join();
+    if (restore_context.err) |err| return err;
+    try std.testing.expect(restore_context.read_ok);
 }
 
 test "lifecycle rejects insecure existing runtime directories" {

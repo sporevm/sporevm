@@ -161,9 +161,10 @@ If `manifest.json` records `rootfs.storage.kind:
 `rootfs/blake3/indexes/<hex>.json`, plus each referenced nonzero rootfs chunk
 object under `rootfs/blake3/objects/<hex>.chunk`. Unpack and pull verify the
 index against the manifest storage descriptor and verify every chunk by BLAKE3
-before installing them into the destination rootfs CAS cache. They do not require
-the monolithic ext4 digest-cache artifact on the destination for a chunked
-rootfs child.
+before publishing the objects, index, and completeness stamp to both the
+portable output spore's local CAS and the selected host rootfs cache. They do
+not require the monolithic ext4 digest-cache artifact on the destination for a
+chunked rootfs child.
 
 If the selected manifest records a writable disk index, `spore pack` includes
 the exact `spore-disk-index-v1` bytes named by `disk.base` under
@@ -460,16 +461,27 @@ before mutating VM state.
   objects when present. Bundle materialization refuses corrupt or missing disk
   index/object bytes before writing a resumable spore manifest.
 - Immutable rootfs artifacts and chunked rootfs storage are portable by digest,
-  not by local path. For fd-backed manifests, resume opens the digest-addressed
-  rootfs cache entry read-only, verifies the same fd by BLAKE3 and size, and
-  only then attaches it to the VM. For chunked manifests, the flat ext4 file is
-  a materialization cache keyed by the storage index digest.
+  not by local path. The fd-backed rootfs cache uses a verify-at-install,
+  trust-at-open contract inside the host-local cache trust domain. User-supplied
+  bytes are content-verified before publication under their digest; resume then
+  opens that installed entry read-only and fails closed if it is a symlink,
+  is not a regular file, or has the wrong size, without rehashing trusted cache
+  bytes on every open. For chunked manifests, the flat ext4 file is a
+  materialization cache keyed by the storage index digest.
 - Manifest-bound chunked rootfs storage descriptors are the authority for
   bundle/pull CAS installation and for rebuilding a missing flat rootfs cache
   entry. Rebuild opens the exact local `spore-disk-index-v1` named by
   `rootfs.storage.index_digest`, validates the index against that descriptor,
   reads only BLAKE3-verified local chunk objects, then publishes the assembled
-  flat cache entry under the same index identity.
+  flat cache entry under the same index identity. Unpack publishes each unique
+  verified bundle object to both the portable spore-local CAS and the host
+  cache before publishing either index and completeness stamp. A later warm
+  runtime open may use an exact descriptor-bound host cache whose index and
+  completeness stamp validate, without rereading the local objects. When that
+  complete host authority is absent, the local index and stamp are the
+  reinstall source and any missing or corrupt local object fails closed.
+  `spore pack` always deep-verifies a present local index and its objects, so a
+  warm host cache cannot mask loss of the spore's claimed self-containment.
 - Local RAM backing files and `ram.backing.proof` are same-host acceleration
   hints, not portable trust roots. Product restore paths treat a valid proof as
   local provenance for opening a backing fd; invalid or absent proof uses the
