@@ -60,15 +60,19 @@ to 15. Clients can compare
 `spore_build_info(SPORE_BUILD_INFO_ABI_VERSION, ...)` with `SPORE_ABI_VERSION`
 before using `spore_remove_saved_json`.
 
+`spore rm --spore DIR` now removes valid diskless single- and multi-vCPU saves
+as well as disk-backed saves. Text and JSON results distinguish the diskless
+case instead of inventing a pin identity; the existing disk-backed
+validate-delete-sync-unpin ordering is unchanged.
+
 Writable-disk saves now reference the machine's global rootfs CAS through an
 opaque durable pin in host-private lifecycle metadata. In the cache-backed
 steady state, where the parent is already in the global CAS, saves no longer
 hardlink or copy every unchanged parent object, remain valid after directory moves, and
-survive rootfs GC and destructive prune. `spore rm --spore DIR` removes a save
-and unregisters its pin. Raw moves are supported, but raw copies share one pin
-identity and are not independently removable; removing one may invalidate the
-others. Use fork for an independent machine-local lifecycle or pack/unpack for
-portability. Raw deletion safely leaks a pin. `spore cache pins` lists IDs and
+survive rootfs GC and destructive prune. Raw moves are supported, but raw copies
+share one pin identity and are not independently removable; removing one may
+invalidate the others. Use fork for an independent machine-local lifecycle or
+pack/unpack for portability. Raw deletion safely leaks a pin. `spore cache pins` lists IDs and
 canonical-index health but does not detect orphans; expert-only
 `spore cache unpin PIN_ID --force` removes a known ID with an explicit warning.
 This pre-1.0 contract adds no global reference registry. `spore pack` still

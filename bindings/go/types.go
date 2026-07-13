@@ -360,16 +360,17 @@ type RemoveNamedOptions struct {
 	Name string
 }
 
-// RemoveSavedOptions removes a machine-local saved spore and its durable disk pin.
+// RemoveSavedOptions removes a machine-local saved spore and, when present, its durable disk pin.
 type RemoveSavedOptions struct {
 	SporeDir string
 }
 
-// RemovedSavedSpore reports the removed save directory and pin identity.
+// RemovedSavedSpore reports the removed save directory and whether a disk pin was removed.
 type RemovedSavedSpore struct {
-	Action   string `json:"action"`
-	SporeDir string `json:"spore_dir"`
-	PinID    string `json:"pin_id"`
+	Action     string `json:"action"`
+	SporeDir   string `json:"spore_dir"`
+	PinID      string `json:"pin_id"`
+	PinRemoved bool   `json:"pin_removed"`
 }
 
 // NamedLifecycleResult is the decoded spore.lifecycle.v1 contract.

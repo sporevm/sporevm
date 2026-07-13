@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-12
+last_reviewed: 2026-07-13
 spec_refs:
   - docs/spore-format.md
   - docs/rootfs.md
@@ -1287,8 +1287,10 @@ already in the global CAS. A first save after portable/local-CAS restore still
 performs a one-time verified migration into the global CAS; the exact-head
 measurements above report it separately from steady-state save and the existing
 same-/cross-filesystem export evidence.
-`spore rm --spore` removes the save before
-unpinning under the cache lock. Raw moves preserve the opaque identity, while
+`spore rm --spore` removes a valid diskless save without creating pin
+authority. For disk-backed saves it removes the visible directory and syncs
+its parent before unpinning under the cache lock. Raw moves preserve the opaque
+identity, while
 raw copies share it and cannot be removed independently; fork or pack/unpack
 creates an independent lifecycle boundary. Raw deletion safely leaks a pin.
 `spore cache pins` reports IDs and index health without claiming orphan

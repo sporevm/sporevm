@@ -218,13 +218,16 @@ manifest without dropping create-time annotations:
 spore save bench-1 --out bench-1.spore --stop --annotation saved=true
 ```
 
-Delete a machine-local saved spore with `spore rm --spore DIR`. This removes
-the directory before unregistering its pin under the cache lock. Raw `rm -rf`
-cannot make live CAS data collectable, but it leaks the pin. `spore cache pins`
-lists pin IDs and canonical-index health; it does not track save paths or claim
-to detect orphans. An operator who already knows that an exact pin ID is unused
-may remove it with the expert-only `spore cache unpin PIN_ID --force`; this can
-invalidate every raw copy sharing that identity.
+Delete a machine-local saved spore with `spore rm --spore DIR`. Diskless saves
+have no pin, so removal validates the manifest, deletes the directory, and
+durably syncs its parent. Disk-backed removal keeps the cache lock while it
+validates the pin, deletes the visible save, syncs the parent, and unregisters
+the pin. Raw `rm -rf` cannot make live CAS data collectable, but it leaks a
+disk pin. `spore cache pins` lists pin IDs and canonical-index health; it does
+not track save paths or claim to detect orphans. An operator who already knows
+that an exact pin ID is unused may remove it with the expert-only
+`spore cache unpin PIN_ID --force`; this can invalidate every raw copy sharing
+that identity.
 
 `spore cache pins` reports `index_valid` only after validating the record and
 canonical index. It deliberately does not stat or hash every object; lazy reads

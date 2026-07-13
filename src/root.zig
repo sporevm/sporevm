@@ -57,6 +57,7 @@ pub const runtime_disk_fork = @import("runtime_disk_fork.zig");
 pub const runtime_disk_fork_capture = @import("runtime_disk_fork_capture.zig");
 pub const runtime_disk_fork_control = @import("runtime_disk_fork_control.zig");
 pub const runtime_disk_lease = @import("runtime_disk_lease.zig");
+pub const saved_spore_remove = @import("saved_spore_remove.zig");
 pub const spore_net = @import("spore_net.zig");
 pub const spore_net_policy = @import("spore_net_policy.zig");
 pub const spore_netd = @import("spore_netd.zig");
@@ -127,6 +128,7 @@ test {
     testing.refAllDecls(runtime_disk_fork_capture);
     testing.refAllDecls(runtime_disk_fork_control);
     testing.refAllDecls(runtime_disk_lease);
+    testing.refAllDecls(saved_spore_remove);
     testing.refAllDecls(spore_net);
     testing.refAllDecls(spore_net_policy);
     testing.refAllDecls(spore_netd);

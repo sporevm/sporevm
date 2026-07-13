@@ -231,8 +231,10 @@ publication interval; both fields are null when durable pin publication is not
 needed.
 
 Use `removeSavedSpore` to remove a saved-spore directory and unregister its
-durable disk pin. The owned `RemovedSavedSpore.spore_dir` and `pin_id` must
-be released with `deinitRemovedSavedSpore`.
+durable disk pin when present. `RemovedSavedSpore.pin_removed` distinguishes
+disk-backed removal from a diskless save; `pin_id` is empty for the diskless
+case. The owned `spore_dir` and `pin_id` must be released with
+`deinitRemovedSavedSpore`.
 
 Use `run` only when you already have explicit kernel and rootfs or disk inputs.
 

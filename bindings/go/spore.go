@@ -659,7 +659,7 @@ func (c *Client) RemoveNamed(ctx context.Context, options RemoveNamedOptions) (N
 	return decodeJSON[NamedLifecycleResult](goBytes(out), "named lifecycle result")
 }
 
-// RemoveSaved removes a machine-local saved spore and unregisters its durable disk pin.
+// RemoveSaved removes a machine-local saved spore and unregisters its durable disk pin when present.
 func (c *Client) RemoveSaved(ctx context.Context, options RemoveSavedOptions) (RemovedSavedSpore, error) {
 	if err := c.ready(ctx); err != nil {
 		return RemovedSavedSpore{}, err
@@ -676,7 +676,21 @@ func (c *Client) RemoveSaved(ctx context.Context, options RemoveSavedOptions) (R
 		return RemovedSavedSpore{}, c.callError(result)
 	}
 	defer C.spore_free_string(c.ctx, out)
-	return decodeJSON[RemovedSavedSpore](goBytes(out), "removed saved spore")
+	return decodeRemovedSavedSpore(goBytes(out))
+}
+
+func decodeRemovedSavedSpore(data []byte) (RemovedSavedSpore, error) {
+	removed, err := decodeJSON[RemovedSavedSpore](data, "removed saved spore")
+	if err != nil {
+		return RemovedSavedSpore{}, err
+	}
+	// ABI 15 originally emitted only pin_id because every removable save had a
+	// disk. Preserve compatibility with those libraries while the additive
+	// pin_removed field distinguishes diskless results from current libraries.
+	if removed.PinID != "" {
+		removed.PinRemoved = true
+	}
+	return removed, nil
 }
 
 // ListNamed returns the current local named VM registry.
