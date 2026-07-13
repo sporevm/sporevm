@@ -18,6 +18,8 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
+    concurrency: 1
+    concurrency_group: "sporevm-benchmarks/linux-arm64"
     agents:
       queue: sporevm-linux-arm64
 
@@ -39,6 +41,8 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
+    concurrency: 1
+    concurrency_group: "sporevm-benchmarks/macos"
     agents:
       queue: sporevm-mac
 
@@ -87,6 +91,8 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
+    concurrency: 1
+    concurrency_group: "sporevm-benchmarks/linux-arm64"
     agents:
       queue: sporevm-linux-arm64
 
@@ -110,6 +116,8 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
+    concurrency: 1
+    concurrency_group: "sporevm-benchmarks/linux-arm64"
     agents:
       queue: sporevm-linux-arm64
 
@@ -132,6 +140,8 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
+    concurrency: 1
+    concurrency_group: "sporevm-benchmarks/macos"
     agents:
       queue: sporevm-mac
 
@@ -151,6 +161,8 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
+    concurrency: 1
+    concurrency_group: "sporevm-benchmarks/linux-arm64"
     agents:
       queue: sporevm-linux-arm64
 
@@ -170,6 +182,8 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
+    concurrency: 1
+    concurrency_group: "sporevm-benchmarks/linux-arm64"
     agents:
       queue: sporevm-linux-arm64
 
@@ -189,6 +203,8 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
+    concurrency: 1
+    concurrency_group: "sporevm-benchmarks/macos"
     agents:
       queue: sporevm-mac
 
@@ -211,6 +227,8 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
+    concurrency: 1
+    concurrency_group: "sporevm-benchmarks/linux-arm64"
     agents:
       queue: sporevm-linux-arm64
 
@@ -233,6 +251,8 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
+    concurrency: 1
+    concurrency_group: "sporevm-benchmarks/macos"
     agents:
       queue: sporevm-mac
 
