@@ -413,8 +413,11 @@ New module family, backend-neutral, sibling to the existing rootfs code:
 ```
 src/build_cli.zig        CLI parse + dispatch (registered in src/main.zig
                          next to "rootfs"/"run")
-src/build.zig            orchestrator: plan, cache walk, step execution,
+src/build.zig            orchestrator: plan, typed stage transitions,
                          final ref publication
+src/build/instruction_transition.zig
+                         cache-prefix walk and executor-suffix lowering from
+                         one typed RUN/COPY/WORKDIR transition
 src/build/dockerfile.zig subset parser -> []Instruction, fail-closed,
                          fuzz target required (new parser of
                          user-influenced input per SECURITY.md)
@@ -423,10 +426,11 @@ src/build/context.zig    .dockerignore-aware context walking, stat-cache
 src/build/context_disk.zig
                          read-only ext4 context disk emission/reuse for
                          executed COPY steps
-src/build/step_cache.zig step-key computation + on-disk records that map
-                         deterministic parent+instruction inputs to child
-                         index_digest outcomes, including the typed v7
-                         PREPARE normalization record
+src/build/step_cache.zig step-key computation + canonical v7 record adapter
+                         shared by cache-hit and GC validation; on-disk records
+                         map deterministic parent+instruction inputs to child
+                         index_digest outcomes, including the typed v7 PREPARE
+                         normalization record
 src/build/exec.zig       persistent build-VM session: boot the deepest
                          cached index writable through ChunkMappedDisk,
                          perform direct-ioctl capacity preparation when
@@ -1246,16 +1250,21 @@ Dockerfile operation key, so older records created without it miss safely. This
 does not add `USER` execution semantics.
 
 Structural follow-ups are explicit gates before C2 widens the instruction
-surface. Extract the cache-walk and miss-suffix lowering from `src/build.zig`
-behind one typed instruction transition, decode builder-v7 records through one
-canonical adapter shared by cache hits and GC validation, and split the
-conformance schema/comparison code from its CLI lifecycle. The build COPY
-filesystem engine is now extracted into `guest/minimal-initrd/build_copy.c`:
-the PID1 agent retains bounded v2/v3 request parsing, source-disk readiness,
-dispatch, and SPIO replies, while the focused module owns confined source and
-destination resolution, traversal limits, metadata/xattr/hardlink handling,
-and filesystem application. Adding more operation kinds or COPY policy before
-the remaining extractions would multiply the current representations.
+surface:
+
+- **Done:** extract the cache-prefix walk and executor-suffix lowering from
+  `src/build.zig` behind one typed RUN/COPY/WORKDIR transition.
+- **Done:** decode builder-v7 records through one canonical adapter shared by
+  cache-hit and GC validation.
+- **Done:** move the build COPY filesystem engine out of the PID1 protocol
+  dispatcher into `guest/minimal-initrd/build_copy.c`; the PID1 agent retains
+  bounded request parsing, source-disk readiness, dispatch, and SPIO replies.
+- **Done:** split the conformance schema and comparison code from its CLI
+  lifecycle.
+
+All four structural gates are complete, so C2 may widen the supported
+instruction surface without duplicating these representations. Further
+operation kinds and COPY policy should build on the extracted seams.
 
 Representative acceptance fixture:
 
