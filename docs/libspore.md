@@ -389,6 +389,14 @@ stderr are each bounded to 16 KiB, and exceeding either bound returns
 `error.ExecOutputTruncated` instead of a partial successful result. Interactive
 or TTY collector requests return `error.UnsupportedInteractiveExec`.
 
+The C JSON result keeps valid UTF-8 `stdout` and `stderr` as strings for
+existing consumers. If either stream contains invalid UTF-8, that field is an
+array of byte values from 0 through 255 instead, preserving the exact output.
+The Go binding accepts both forms and returns the original bytes in its string
+fields. Zig callers already receive owned byte slices. This hybrid encoding is
+limited to the bounded compatibility collector; streaming events always carry
+raw bytes.
+
 Use the stream for output beyond the collector bound and interactive or TTY
 exec:
 

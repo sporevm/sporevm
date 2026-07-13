@@ -358,6 +358,10 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
   backpressure: a disconnected consumer or local socket that cannot accept a
   complete frame within the 25 ms send deadline aborts that exec so it cannot
   block the VM control loop indefinitely.
+- The bounded `execNamed` compatibility collector returns owned byte slices to
+  Zig. Its C JSON result keeps valid UTF-8 stdout and stderr as strings and
+  represents invalid UTF-8 streams as integer byte arrays; the Go binding
+  accepts both forms without changing the bytes.
 - `spore copy-in` and `spore copy-out` transfer explicit regular files or
   directory trees. Symlinks, special files, overwrite, and workspace sync are
   intentionally outside this primitive. Embedders use the matching

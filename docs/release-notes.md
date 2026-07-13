@@ -2,6 +2,11 @@
 
 ## Next
 
+Bounded named exec now has a documented lossless JSON representation for
+arbitrary stdout and stderr bytes. Valid UTF-8 remains a JSON string, while an
+invalid UTF-8 stream is emitted as an integer byte array; Zig, C, and Go callers
+therefore preserve exact output without changing existing valid-text results.
+
 `spore build` now supplies the conventional `HOME=/root` process environment
 to root `RUN` steps when the effective HOME is absent or empty. This matches
 Docker/BuildKit for tools such as Go that require a cache home. Explicit

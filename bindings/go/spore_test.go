@@ -535,7 +535,7 @@ func TestDecodeExecNamedResult(t *testing.T) {
 	binary, err := decodeJSON[ExecNamedResult]([]byte(`{
 		"exit_code": 0,
 		"stdout": [255, 0, 65],
-		"stderr": [],
+		"stderr": [254, 66],
 		"network_events_jsonl": "",
 		"stdout_truncated": false,
 		"stderr_truncated": false
@@ -545,6 +545,9 @@ func TestDecodeExecNamedResult(t *testing.T) {
 	}
 	if binary.Stdout != string([]byte{255, 0, 65}) {
 		t.Fatalf("binary stdout = %q", binary.Stdout)
+	}
+	if binary.Stderr != string([]byte{254, 66}) {
+		t.Fatalf("binary stderr = %q", binary.Stderr)
 	}
 }
 

@@ -1608,6 +1608,44 @@ test "C ABI saved-spore removal JSON distinguishes disk pin ownership" {
     try std.testing.expect(std.mem.indexOf(u8, data, "\"pin_removed\": true") != null);
 }
 
+test "C ABI named exec JSON preserves arbitrary output bytes" {
+    var context: ?*SporeContextImpl = null;
+    try std.testing.expectEqual(result_success, spore_context_new(&context));
+    defer spore_context_free(context);
+
+    var stdout = [_]u8{ 0xff, 0x00, 'A' };
+    var stderr = [_]u8{ 0xfe, 'B' };
+    var json = try jsonOwned(context.?, libspore.ExecNamedResult{
+        .exit_code = 0,
+        .stdout = &stdout,
+        .stderr = &stderr,
+    });
+    defer spore_free_string(context, json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json.ptr.?[0..json.len], .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    const stdout_json = object.get("stdout").?.array.items;
+    const stderr_json = object.get("stderr").?.array.items;
+    try std.testing.expectEqual(stdout.len, stdout_json.len);
+    try std.testing.expectEqual(stderr.len, stderr_json.len);
+    for (stdout_json, stdout) |value, byte| try std.testing.expectEqual(@as(i64, byte), value.integer);
+    for (stderr_json, stderr) |value, byte| try std.testing.expectEqual(@as(i64, byte), value.integer);
+
+    var stdout_text = [_]u8{ 'o', 'k', '\n' };
+    var stderr_text = [_]u8{ 'e', 'r', 'r', '\n' };
+    var text_json = try jsonOwned(context.?, libspore.ExecNamedResult{
+        .exit_code = 0,
+        .stdout = &stdout_text,
+        .stderr = &stderr_text,
+    });
+    defer spore_free_string(context, text_json);
+    var parsed_text = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text_json.ptr.?[0..text_json.len], .{});
+    defer parsed_text.deinit();
+    try std.testing.expectEqualStrings("ok\n", parsed_text.value.object.get("stdout").?.string);
+    try std.testing.expectEqualStrings("err\n", parsed_text.value.object.get("stderr").?.string);
+}
+
 test "pull rejects missing required options at ABI boundary" {
     var context: ?*SporeContextImpl = null;
     try std.testing.expectEqual(result_success, spore_context_new(&context));

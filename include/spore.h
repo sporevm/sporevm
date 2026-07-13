@@ -443,7 +443,10 @@ SPORE_API SporeResult spore_create_named_json(SporeContext context,
                                               const SporeCreateNamedOptions *options,
                                               SporeOwnedString *out_json);
 
-/** Execute a command in a named VM and return JSON output. */
+/**
+ * Execute a command in a named VM and return JSON output. Valid UTF-8 stdout
+ * and stderr are JSON strings; other byte sequences are arrays of integers.
+ */
 SPORE_API SporeResult spore_exec_named_json(SporeContext context,
                                             const SporeExecNamedOptions *options,
                                             SporeOwnedString *out_json);
