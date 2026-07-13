@@ -522,7 +522,7 @@ SPORE_API SporeResult spore_remove_named_json(SporeContext context,
                                               const SporeRemoveNamedOptions *options,
                                               SporeOwnedString *out_json);
 
-/** Remove a machine-local saved spore and unregister its durable CAS pin. */
+/** Remove a machine-local saved spore and unregister its durable CAS pin when present. */
 SPORE_API SporeResult spore_remove_saved_json(SporeContext context,
                                               const SporeRemoveSavedOptions *options,
                                               SporeOwnedString *out_json);

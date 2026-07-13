@@ -1966,6 +1966,7 @@ pub fn memoryDigestFromHex(allocator: std.mem.Allocator, hex: []const u8) Error!
 
 pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Manifest) Error!void {
     const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
+    defer allocator.free(path);
     try saveManifestPath(allocator, path, manifest);
 }
 
@@ -1975,11 +1976,13 @@ pub fn saveManifestPath(allocator: std.mem.Allocator, path: []const u8, manifest
     const json = std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
     defer allocator.free(json);
     const path_z = try pathZ(allocator, "{s}", .{path});
+    defer allocator.free(path_z);
     try writeFileAll(path_z, json);
 }
 
 pub fn saveManifestV1(allocator: std.mem.Allocator, dir: []const u8, manifest: ManifestV1) Error!void {
     const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
+    defer allocator.free(path);
     try saveManifestV1Path(allocator, path, manifest);
 }
 
@@ -1988,16 +1991,19 @@ pub fn saveManifestV1Path(allocator: std.mem.Allocator, path: []const u8, manife
     const json = std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
     defer allocator.free(json);
     const path_z = try pathZ(allocator, "{s}", .{path});
+    defer allocator.free(path_z);
     try writeFileAll(path_z, json);
 }
 
 pub fn loadManifest(allocator: std.mem.Allocator, dir: []const u8) Error!std.json.Parsed(Manifest) {
     const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
+    defer allocator.free(path);
     return loadManifestPath(allocator, path);
 }
 
 pub fn loadManifestPath(allocator: std.mem.Allocator, path: []const u8) Error!std.json.Parsed(Manifest) {
     const path_z = try pathZ(allocator, "{s}", .{path});
+    defer allocator.free(path_z);
     const bytes = try readFileAll(allocator, path_z, max_manifest_bytes);
     defer allocator.free(bytes);
     const parsed = std.json.parseFromSlice(Manifest, allocator, bytes, .{
@@ -2018,11 +2024,13 @@ pub fn loadManifestPath(allocator: std.mem.Allocator, path: []const u8) Error!st
 
 pub fn loadManifestV1(allocator: std.mem.Allocator, dir: []const u8) Error!std.json.Parsed(ManifestV1) {
     const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
+    defer allocator.free(path);
     return loadManifestV1Path(allocator, path);
 }
 
 pub fn loadManifestV1Path(allocator: std.mem.Allocator, path: []const u8) Error!std.json.Parsed(ManifestV1) {
     const path_z = try pathZ(allocator, "{s}", .{path});
+    defer allocator.free(path_z);
     const bytes = try readFileAll(allocator, path_z, max_manifest_bytes);
     defer allocator.free(bytes);
     const parsed = std.json.parseFromSlice(ManifestV1, allocator, bytes, .{

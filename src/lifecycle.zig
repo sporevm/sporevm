@@ -19,6 +19,7 @@ const runtime_disk = @import("runtime_disk.zig");
 const runtime_disk_fork_control = @import("runtime_disk_fork_control.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
+const saved_spore_remove = @import("saved_spore_remove.zig");
 const generation = @import("generation.zig");
 const attach_mod = @import("attach.zig");
 const run_mod = @import("run.zig");
@@ -1872,10 +1873,7 @@ pub fn rmCli(
     const allocator = init.arena.allocator();
     if (args.len == 2 and std.mem.eql(u8, args[0], "--spore")) {
         const removed = try removeSavedSpore(.{ .io = init.io, .environ_map = init.environ_map }, allocator, args[1]);
-        if (mode == .json) try machine_output.writeJson(allocator, stdout, removed) else {
-            try stdout.print("removed spore {s} (pin {s})\n", .{ removed.spore_dir, removed.pin_id });
-            try stdout.flush();
-        }
+        if (mode == .json) try machine_output.writeJson(allocator, stdout, removed) else try writeRemovedSavedSpore(stdout, removed);
         return;
     }
     const name = parseRmArgs(args, allocator, stderr, mode);
@@ -1903,37 +1901,23 @@ pub fn rmCli(
     }
 }
 
-pub const RemovedSavedSpore = struct { action: []const u8 = "removed_spore", spore_dir: []const u8, pin_id: []const u8 };
+pub const RemovedSavedSpore = saved_spore_remove.Result;
 
 pub fn deinitRemovedSavedSpore(allocator: std.mem.Allocator, result: RemovedSavedSpore) void {
-    allocator.free(result.spore_dir);
-    allocator.free(result.pin_id);
+    saved_spore_remove.deinit(allocator, result);
 }
 
 pub fn removeSavedSpore(context: Context, allocator: std.mem.Allocator, raw_dir: []const u8) !RemovedSavedSpore {
-    const dir = try resolveExistingSporeDirApi(allocator, context.io, raw_dir);
-    errdefer allocator.free(dir);
-    var manifest = spore.loadManifest(allocator, dir) catch |err| switch (err) {
-        error.BadManifest => null,
-        else => |e| return e,
-    };
-    defer if (manifest) |*parsed| parsed.deinit();
-    var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
-    defer if (manifest_v1) |*parsed| parsed.deinit();
-    if (manifest == null) manifest_v1 = try spore.loadManifestV1(allocator, dir);
-    const disk = (if (manifest) |parsed| parsed.value.disk else manifest_v1.?.value.disk) orelse return error.BadManifest;
-    const cache_root = try local_paths.rootfsCacheRootPath(allocator, context.environ_map);
-    var lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, cache_root);
-    defer lock.deinit();
-    const registry = try saved_spore_pin.LockedRegistry.init(allocator, cache_root, &lock);
-    var pin = try saved_spore_pin.loadForSporeLocked(context.io, allocator, registry, dir, disk);
-    defer pin.deinit();
-    const id = try allocator.dupe(u8, pin.value.id);
-    errdefer allocator.free(id);
-    try Io.Dir.cwd().deleteTree(context.io, dir);
-    try chunk_sealer.fsyncDirPath(allocator, std.fs.path.dirname(dir) orelse ".");
-    try saved_spore_pin.remove(context.io, allocator, registry, id);
-    return .{ .spore_dir = dir, .pin_id = id };
+    return saved_spore_remove.remove(context, allocator, raw_dir);
+}
+
+fn writeRemovedSavedSpore(writer: *Io.Writer, result: RemovedSavedSpore) !void {
+    if (result.pin_removed) {
+        try writer.print("removed spore {s} (pin {s})\n", .{ result.spore_dir, result.pin_id });
+    } else {
+        try writer.print("removed spore {s} (no disk pin)\n", .{result.spore_dir});
+    }
+    try writer.flush();
 }
 
 pub fn saveCli(
@@ -3438,6 +3422,7 @@ fn temporarySiblingOutputDir(allocator: std.mem.Allocator, io: Io, out_dir: []co
 
 fn resolveExistingSporeDirApi(allocator: std.mem.Allocator, io: Io, raw: []const u8) ![]const u8 {
     const path = try std.fs.path.resolve(allocator, &.{raw});
+    errdefer allocator.free(path);
     const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
     if (stat.kind != Io.File.Kind.directory) return error.InvalidSporeDir;
     return path;
@@ -6917,6 +6902,59 @@ test "lifecycle human results render terse status lines" {
         .children = &.{ "child-0", "child-1" },
     });
     try std.testing.expectEqualStrings("forked child-0 child-1\n", out.written());
+
+    out.clearRetainingCapacity();
+    try writeRemovedSavedSpore(&out.writer, .{
+        .spore_dir = "diskless.spore",
+        .pin_id = "",
+        .pin_removed = false,
+    });
+    try std.testing.expectEqualStrings("removed spore diskless.spore (no disk pin)\n", out.written());
+
+    out.clearRetainingCapacity();
+    try writeRemovedSavedSpore(&out.writer, .{
+        .spore_dir = "disk.spore",
+        .pin_id = "abc",
+        .pin_removed = true,
+    });
+    try std.testing.expectEqualStrings("removed spore disk.spore (pin abc)\n", out.written());
+}
+
+test "saved-spore removal machine output distinguishes disk pin ownership" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try machine_output.writeJson(allocator, &out.writer, RemovedSavedSpore{
+        .spore_dir = "diskless.spore",
+        .pin_id = "",
+        .pin_removed = false,
+    });
+    try std.testing.expectEqualStrings(
+        "{\n" ++
+            "  \"action\": \"removed_spore\",\n" ++
+            "  \"spore_dir\": \"diskless.spore\",\n" ++
+            "  \"pin_id\": \"\",\n" ++
+            "  \"pin_removed\": false\n" ++
+            "}\n",
+        out.written(),
+    );
+
+    out.clearRetainingCapacity();
+    try machine_output.writeJson(allocator, &out.writer, RemovedSavedSpore{
+        .spore_dir = "disk.spore",
+        .pin_id = "abc",
+        .pin_removed = true,
+    });
+    try std.testing.expectEqualStrings(
+        "{\n" ++
+            "  \"action\": \"removed_spore\",\n" ++
+            "  \"spore_dir\": \"disk.spore\",\n" ++
+            "  \"pin_id\": \"abc\",\n" ++
+            "  \"pin_removed\": true\n" ++
+            "}\n",
+        out.written(),
+    );
 }
 
 test "named restore machine result reports exec readiness timing" {

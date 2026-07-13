@@ -1565,6 +1565,49 @@ test "C ABI inspect spore JSON includes annotation values" {
     try std.testing.expect(std.mem.indexOf(u8, data, "\"name\": \"cleanroom-gateway\"") != null);
 }
 
+test "C ABI removes diskless saved spores without inventing a pin" {
+    var context: ?*SporeContextImpl = null;
+    try std.testing.expectEqual(result_success, spore_context_new(&context));
+    defer spore_context_free(context);
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/diskless.spore", .{tmp.sub_path[0..]});
+    defer std.testing.allocator.free(dir);
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = inspect_spore_manifest_json });
+
+    var options: SporeRemoveSavedOptions = undefined;
+    spore_remove_saved_options_init(&options);
+    options.spore_dir = borrowString(dir);
+    var json: SporeOwnedString = .{};
+    try std.testing.expectEqual(result_success, spore_remove_saved_json(context, &options, &json));
+    defer spore_free_string(context, json);
+    const data = json.ptr.?[0..json.len];
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"pin_id\": \"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"pin_removed\": false") != null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, dir, .{ .follow_symlinks = false }));
+}
+
+test "C ABI saved-spore removal JSON distinguishes disk pin ownership" {
+    var context: ?*SporeContextImpl = null;
+    try std.testing.expectEqual(result_success, spore_context_new(&context));
+    defer spore_context_free(context);
+
+    var json = try jsonOwned(context.?, libspore.RemovedSavedSpore{
+        .spore_dir = "disk.spore",
+        .pin_id = "abc",
+        .pin_removed = true,
+    });
+    defer spore_free_string(context, json);
+    const data = json.ptr.?[0..json.len];
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"pin_id\": \"abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"pin_removed\": true") != null);
+}
+
 test "pull rejects missing required options at ABI boundary" {
     var context: ?*SporeContextImpl = null;
     try std.testing.expectEqual(result_success, spore_context_new(&context));

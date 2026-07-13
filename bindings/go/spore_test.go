@@ -116,14 +116,40 @@ func TestRemoveSavedValidationAndResultContract(t *testing.T) {
 	if _, err := client.RemoveSaved(ctx, RemoveSavedOptions{SporeDir: "save.spore"}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled RemoveSaved error = %v", err)
 	}
-	decoded, err := decodeJSON[RemovedSavedSpore]([]byte(`{"action":"removed_spore","spore_dir":"save.spore","pin_id":"abc"}`), "removed saved spore")
+	decoded, err := decodeRemovedSavedSpore([]byte(`{"action":"removed_spore","spore_dir":"save.spore","pin_id":"abc","pin_removed":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Action != "removed_spore" || decoded.SporeDir != "save.spore" || decoded.PinID != "abc" {
+	if decoded.Action != "removed_spore" || decoded.SporeDir != "save.spore" || decoded.PinID != "abc" || !decoded.PinRemoved {
 		t.Fatalf("unexpected removed save: %#v", decoded)
 	}
-	if _, err := decodeJSON[RemovedSavedSpore]([]byte(`{"action":`), "removed saved spore"); err == nil {
+	legacy, err := decodeRemovedSavedSpore([]byte(`{"action":"removed_spore","spore_dir":"save.spore","pin_id":"legacy"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.PinID != "legacy" || !legacy.PinRemoved {
+		t.Fatalf("unexpected legacy removed save: %#v", legacy)
+	}
+	diskless, err := decodeRemovedSavedSpore([]byte(`{"action":"removed_spore","spore_dir":"diskless.spore","pin_id":"","pin_removed":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diskless.PinID != "" || diskless.PinRemoved {
+		t.Fatalf("unexpected diskless removed save: %#v", diskless)
+	}
+
+	dir := writeRemovableSporeFixture(t)
+	removed, err = client.RemoveSaved(context.Background(), RemoveSavedOptions{SporeDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed.Action != "removed_spore" || removed.SporeDir != dir || removed.PinID != "" || removed.PinRemoved {
+		t.Fatalf("unexpected removed diskless save: %#v", removed)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed diskless save still exists: %v", err)
+	}
+	if _, err := decodeRemovedSavedSpore([]byte(`{"action":`)); err == nil {
 		t.Fatal("malformed removed-save result unexpectedly decoded")
 	}
 }
@@ -935,6 +961,20 @@ func writeSporeFixture(t *testing.T, annotations map[string]string) string {
 	}
 	manifest := strings.Replace(tinyManifest, `  "platform": {`, `  "annotations": `+string(annotationJSON)+","+"\n"+`  "platform": {`, 1)
 	manifest = strings.Replace(manifest, `"network": null`, `"network": {"bound_services":[{"name":"cleanroom-gateway","guest_host":"gateway.cleanroom.internal","guest_port":8170}],"requirements":{"tcp_ipv4":true,"exact_host_port":false,"bound_services":true}}`, 1)
+	mustWrite(t, filepath.Join(dir, "manifest.json"), manifest)
+	return dir
+}
+
+func writeRemovableSporeFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	manifest := strings.Replace(tinyManifest, `"version": 0`, `"version": 2`, 1)
+	manifest = strings.Replace(
+		manifest,
+		`"memory": {"chunk_size":2097152,"chunks":[null],"backing":null}`,
+		`"memory": {"kind":"spore-disk-index-v1","logical_size":1,"chunk_size":2097152,"hash_algorithm":"blake3","object_namespace":"memory/blake3","chunks":[],"zero_chunks":[0],"backing":null}`,
+		1,
+	)
 	mustWrite(t, filepath.Join(dir, "manifest.json"), manifest)
 	return dir
 }

@@ -154,6 +154,44 @@ steps:
     agents:
       queue: sporevm-linux-arm64
 
+  - label: ":package: Diskless saved-spore removal (Linux ARM64)"
+    key: "diskless-remove-packaged-linux-arm64"
+    if: build.env("SPOREVM_RUN_DISKLESS_REMOVE_PACKAGED_SMOKE") == "1"
+    command: |
+      mise install
+      mise exec -- scripts/ci/diskless-remove-packaged-smoke.sh
+    plugins:
+      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          version: "2026.5.12"
+    cache:
+      paths:
+        - "~/.local/share/mise"
+        - "~/.cache/mise"
+        - "~/.local/state/mise"
+      size: "20g"
+      name: "mise-cache"
+    agents:
+      queue: sporevm-linux-arm64
+
+  - label: ":package: Diskless saved-spore removal (macOS ARM64)"
+    key: "diskless-remove-packaged-macos-arm64"
+    if: build.env("SPOREVM_RUN_DISKLESS_REMOVE_PACKAGED_SMOKE") == "1"
+    command: |
+      mise install
+      mise exec -- scripts/ci/diskless-remove-packaged-smoke.sh
+    plugins:
+      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          version: "2026.5.12"
+    cache:
+      paths:
+        - "~/.local/share/mise"
+        - "~/.cache/mise"
+        - "~/.local/state/mise"
+      size: "20g"
+      name: "mise-cache"
+    agents:
+      queue: sporevm-mac
+
   - label: ":package: Build Linux ARM64 release archive"
     key: "release-linux-arm64"
     if: build.tag != null
