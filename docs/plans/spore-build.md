@@ -1378,10 +1378,11 @@ one child, and one producer per sample, and every acceptance threshold passed:
 
 The public evidence ledger identifies the HVF raw and summary artifacts by
 SHA-256 prefixes `a16da275` and `aca67a54`, and the KVM raw and summary
-artifacts by prefixes `b1156452` and `5536d36b`. C2 instruction and COPY-policy
-widening remains blocked until the four structural extractions above land. The
-C1 implementation reuses bounded instances of the existing virtio-blk device
-and changes neither the frozen device types nor the spore manifest format.
+artifacts by prefixes `b1156452` and `5536d36b`. The four structural
+extractions above are complete, so C2 instruction and COPY-policy widening may
+proceed through those seams. The C1 implementation reuses bounded instances of
+the existing virtio-blk device and changes neither the frozen device types nor
+the spore manifest format.
 
 ### C2 — Stable frontend and filesystem breadth
 
