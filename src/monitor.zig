@@ -2227,6 +2227,51 @@ test "named snapshot cache contention returns pending before the pause authority
     try std.testing.expect(server.snapshot_publication_wait.started_ns == null);
 }
 
+test "snapshot publication preserves create annotations and applies save overlay" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const work_dir = try std.fs.path.join(arena, &.{ root, "snapshot.tmp" });
+    const publish_dir = try std.fs.path.join(arena, &.{ root, "snapshot.spore" });
+    try Io.Dir.cwd().createDirPath(io, work_dir);
+
+    var create_annotations = spore.Annotations{};
+    try create_annotations.map.put(arena, "create-only", "create");
+    try create_annotations.map.put(arena, "shared", "create");
+    var save_annotations = spore.Annotations{};
+    try save_annotations.map.put(arena, "save-only", "save");
+    try save_annotations.map.put(arena, "shared", "save");
+    const merged = try spore.mergeAnnotations(arena, create_annotations, save_annotations);
+
+    try spore.saveManifest(arena, work_dir, manifest_test_support.manifest(create_annotations));
+    try lifecycle.writeSporeLifecycleSpec(arena, io, work_dir, .{
+        .name = "source",
+        .annotations = merged,
+    });
+
+    var wait = snapshot_publication.Wait{};
+    var preparation = (try wait.tryPrepare(io, arena, cache_root)) orelse return error.TestUnexpectedResult;
+    defer preparation.deinit();
+    var server: ExecServer = undefined;
+    server.allocator = arena;
+    server.io = io;
+    server.cache_root = cache_root;
+    _ = try server.publishSnapshot(&preparation, work_dir, publish_dir);
+
+    var published = try spore.loadManifest(arena, publish_dir);
+    defer published.deinit();
+    try std.testing.expectEqual(@as(usize, 3), published.value.annotations.map.count());
+    try std.testing.expectEqualStrings("create", published.value.annotations.map.get("create-only").?);
+    try std.testing.expectEqualStrings("save", published.value.annotations.map.get("save-only").?);
+    try std.testing.expectEqualStrings("save", published.value.annotations.map.get("shared").?);
+}
+
 test "snapshot disk lease handoff preserves old authority on failure and commits new authority transactionally" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
