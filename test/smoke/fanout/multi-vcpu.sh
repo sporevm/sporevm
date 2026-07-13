@@ -104,6 +104,104 @@ expect_named_online_cpus() {
   expect_online_cpus "${stdout}"
 }
 
+save_named_with_metrics() {
+  local name="$1"
+  local out_dir="$2"
+  local label="$3"
+  local monitor_log="${runtime_dir}/vms/${name}/monitor.log"
+  local snapshot_before publication_before
+
+  snapshot_before="$(grep -c "${backend} snapshot metrics:" "${monitor_log}" 2>/dev/null || true)"
+  publication_before="$(grep -c "${backend} named snapshot publication metrics:" "${monitor_log}" 2>/dev/null || true)"
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" save "${name}" --out "${out_dir}" \
+    >"${workdir}/${label}-save.stdout" 2>"${workdir}/${label}-save.stderr"; then
+    cat "${workdir}/${label}-save.stdout" >&2 || true
+    cat "${workdir}/${label}-save.stderr" >&2 || true
+    die "${label} non-destructive save failed"
+  fi
+
+  local snapshot_after publication_after snapshot_line publication_line
+  snapshot_after="$(grep -c "${backend} snapshot metrics:" "${monitor_log}" || true)"
+  publication_after="$(grep -c "${backend} named snapshot publication metrics:" "${monitor_log}" || true)"
+  [[ "${snapshot_after}" == "$((snapshot_before + 1))" ]] || die "${label} save did not emit exactly one snapshot metric"
+  [[ "${publication_after}" == "$((publication_before + 1))" ]] || die "${label} save did not emit exactly one publication metric"
+  snapshot_line="$(grep "${backend} snapshot metrics:" "${monitor_log}" | tail -1)"
+  publication_line="$(grep "${backend} named snapshot publication metrics:" "${monitor_log}" | tail -1)"
+  python3 "${repo_root}/scripts/benchmark/parse-save-metrics.py" --snapshot "${snapshot_line}" >"${workdir}/${label}-snapshot.json"
+  python3 "${repo_root}/scripts/benchmark/parse-save-metrics.py" --named-publication "${publication_line}" >"${workdir}/${label}-publication.json"
+
+  python3 - "${workdir}/${label}-snapshot.json" "${workdir}/${label}-publication.json" "${out_dir}/manifest.json" "${backend}" "${vcpus}" "${label}" <<'PY'
+import json
+import sys
+
+snapshot_path, publication_path, manifest_path, backend, vcpus, label = sys.argv[1:]
+snapshot = json.load(open(snapshot_path, encoding="utf-8"))
+publication = json.load(open(publication_path, encoding="utf-8"))
+manifest = json.load(open(manifest_path, encoding="utf-8"))
+ram_mib = manifest["platform"]["ram_size"] // (1024 * 1024)
+assert snapshot["backend"] == backend, snapshot
+assert publication["backend"] == backend, publication
+assert manifest["platform"]["vcpu_count"] == int(vcpus), manifest["platform"]
+assert publication["source_pause_ms"] >= snapshot["snapshot_total_ms"], (snapshot, publication)
+print(
+    f"named save metrics case={label} backend={backend} vcpus={vcpus} "
+    f"ram_mib={ram_mib} snapshot_total_ms={snapshot['snapshot_total_ms']} "
+    f"source_pause_ms={publication['source_pause_ms']} "
+    f"cache_lock_wait_ms={publication['cache_lock_wait_ms']} "
+    f"manifest_pin_authorization_ms={publication['manifest_pin_authorization_ms']} "
+    f"active_lease_handoff_ms={publication['active_lease_handoff_ms']} "
+    f"lifecycle_spec_ms={publication['lifecycle_spec_ms']} "
+    f"final_publication_ms={publication['final_publication_ms']}"
+)
+PY
+}
+
+run_disk_point_in_time_case() {
+  local kind="$1"
+  shift
+  local source_name="${vm_name}-${kind}"
+  local restored_name="${source_name}-restored"
+  local saved_dir="${workdir}/${kind}.spore"
+
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${source_name}" \
+    --backend "${backend}" \
+    --vcpus "${vcpus}" \
+    --memory "${memory}" \
+    --timeout "${create_timeout_ms}ms" \
+    "$@" \
+    >"${workdir}/${kind}-create.stdout" 2>"${workdir}/${kind}-create.stderr"; then
+    cat "${workdir}/${kind}-create.stdout" >&2 || true
+    cat "${workdir}/${kind}-create.stderr" >&2 || true
+    die "${kind} multi-vCPU named create failed"
+  fi
+  expect_named_online_cpus "${source_name}" "${kind}-source-cpus-online"
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${source_name}" -- \
+    /bin/sh -lc 'printf captured > /var/sporevm-save-point; sync'
+  save_named_with_metrics "${source_name}" "${saved_dir}" "${kind}"
+  expect_manifest_v3 "${saved_dir}"
+  [[ "$(manifest_field "${saved_dir}/manifest.json" disk.kind)" == "chunk-index-disk-v0" ]] || \
+    die "${kind} save did not record a writable disk index"
+
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${source_name}" -- \
+    /bin/sh -lc 'printf continued > /var/sporevm-save-point; sync'
+  [[ "$(SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${source_name}" -- /bin/cat /var/sporevm-save-point)" == "continued" ]] || \
+    die "${kind} source did not observe its post-save disk mutation"
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${source_name}" >/dev/null
+
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" restore "${saved_dir}" \
+    --name "${restored_name}" --backend "${backend}" \
+    >"${workdir}/${kind}-restore.stdout" 2>"${workdir}/${kind}-restore.stderr"; then
+    cat "${workdir}/${kind}-restore.stdout" >&2 || true
+    cat "${workdir}/${kind}-restore.stderr" >&2 || true
+    die "${kind} point-in-time restore failed"
+  fi
+  expect_named_online_cpus "${restored_name}" "${kind}-restored-cpus-online"
+  [[ "$(SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${restored_name}" -- /bin/cat /var/sporevm-save-point)" == "captured" ]] || \
+    die "${kind} restore did not preserve the saved point-in-time disk state"
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${restored_name}" >/dev/null
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm --spore "${saved_dir}" >/dev/null
+}
+
 # expect_still_ticking NAME PREFIX -> assert the guest counter advances, proving
 # the VM is still running and executing the workload.
 expect_still_ticking() {
@@ -145,6 +243,17 @@ runtime_parent="${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}"
 mkdir -p "${runtime_parent}"
 runtime_dir="$(mktemp -d "${runtime_parent%/}/svm-mvcpu.XXXXXX")"
 chmod 700 "${runtime_dir}"
+if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
+  exact_spore_bin="$(cd "$(dirname "${spore_bin}")" && pwd -P)/$(basename "${spore_bin}")"
+  debug_spore_bin="${workdir}/spore-debug"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'exact_spore=%q\n' "${exact_spore_bin}"
+    printf 'exec -a "$0" "$exact_spore" --debug "$@"\n'
+  } >"${debug_spore_bin}"
+  chmod 700 "${debug_spore_bin}"
+  spore_bin="${debug_spore_bin}"
+fi
 vm_name="mvcpus-${backend}"
 forked_name="${vm_name}-forked"
 resumed_name="${vm_name}-resumed"
@@ -153,7 +262,16 @@ cleanup() {
   if [[ -d "${runtime_dir}" ]]; then
     SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${forked_name}" >/dev/null 2>&1 || true
     SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${resumed_name}" >/dev/null 2>&1 || true
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}-image" >/dev/null 2>&1 || true
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}-image-restored" >/dev/null 2>&1 || true
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}-explicit-rootfs" >/dev/null 2>&1 || true
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}-explicit-rootfs-restored" >/dev/null 2>&1 || true
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}-auto" >/dev/null 2>&1 || true
     SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
+    for saved_dir in "${workdir}/image.spore" "${workdir}/explicit-rootfs.spore" "${workdir}/auto.spore"; do
+      [[ -d "${saved_dir}" ]] || continue
+      SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm --spore "${saved_dir}" >/dev/null 2>&1 || true
+    done
   fi
   if [[ "${SPORE_SMOKE_KEEP_WORKDIR:-0}" == "1" || "${status}" != "0" ]]; then
     echo "kept smoke workdir: ${workdir} runtime_dir=${runtime_dir}" >&2
@@ -323,6 +441,45 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   fi
   expect_named_online_cpus "${concurrent_name}" "named-live-cpus-online"
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${concurrent_name}" >/dev/null
+
+  # Prove a disk-backed non-destructive save is a point-in-time boundary for
+  # both public named-rootfs sources. The continuing VM mutates the same file
+  # after save; restore must still observe the captured value.
+  disk_image="${SPORE_SMOKE_MULTI_VCPU_DISK_IMAGE:-docker.io/library/alpine:3.20}"
+  disk_platform="${SPORE_SMOKE_MULTI_VCPU_DISK_PLATFORM:-linux/arm64}"
+  if [[ "${disk_image}" == *@sha256:* ]]; then
+    resolved_disk_image="${disk_image}"
+  else
+    resolved_disk_image="$("${spore_bin}" rootfs resolve "${disk_image}" --platform "${disk_platform}")"
+  fi
+  run_disk_point_in_time_case image --image "${resolved_disk_image}"
+  explicit_rootfs="${workdir}/explicit-rootfs.ext4"
+  "${spore_bin}" rootfs build "${resolved_disk_image}" \
+    --platform "${disk_platform}" \
+    --output "${explicit_rootfs}" \
+    >"${workdir}/explicit-rootfs-build.stdout" 2>"${workdir}/explicit-rootfs-build.stderr"
+  run_disk_point_in_time_case explicit-rootfs --rootfs "${explicit_rootfs}"
+
+  # The default memory contract is auto/16GiB. Keep this as a separate sparse
+  # diskless save so the native gate records its complete source pause without
+  # conflating it with rootfs publication work.
+  auto_name="${vm_name}-auto"
+  auto_dir="${workdir}/auto.spore"
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${auto_name}" \
+    --backend "${backend}" \
+    --vcpus "${vcpus}" \
+    --timeout "${create_timeout_ms}ms" \
+    >"${workdir}/auto-create.stdout" 2>"${workdir}/auto-create.stderr"; then
+    cat "${workdir}/auto-create.stdout" >&2 || true
+    cat "${workdir}/auto-create.stderr" >&2 || true
+    die "default-memory multi-vCPU named create failed"
+  fi
+  expect_named_online_cpus "${auto_name}" "auto-cpus-online"
+  save_named_with_metrics "${auto_name}" "${auto_dir}" "default-auto-memory"
+  [[ "$(manifest_field "${auto_dir}/manifest.json" platform.ram_size)" == "17179869184" ]] || \
+    die "default-memory save did not preserve the 16GiB auto contract"
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${auto_name}" >/dev/null
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm --spore "${auto_dir}" >/dev/null
 
   # Non-destructive multi-vCPU save of an active workload: prove the source VM
   # stays registered and keeps ticking after save, then remove the source and
