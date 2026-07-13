@@ -1,0 +1,31 @@
+{
+  "description": "non-empty --build-arg HOME overrides earlier ENV for root RUN only",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 5,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle"
+  ],
+  "network": "none",
+  "build_args": {
+    "EXPECTED_HOME_AFTER_ARG": "/cli-home",
+    "HOME": "/cli-home"
+  },
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

@@ -2,6 +2,24 @@
 
 ## Next
 
+`spore build` now supplies the conventional `HOME=/root` process environment
+to root `RUN` steps when the effective HOME is absent or empty. This matches
+Docker/BuildKit for tools such as Go that require a cache home. Explicit
+non-empty HOME values remain authoritative; `ENV HOME=` remains empty in the
+published OCI config while root `RUN` receives `/root`. ENV and ARG follow
+Dockerfile instruction order for build execution without publishing ARG.
+Affected RUN cache keys include the effective value, so records produced by the
+older environment contract miss safely; HOME normalization does not affect
+COPY or WORKDIR identities. Stages without PATH also receive and publish
+BuildKit's conventional Linux PATH, including `FROM scratch`. Explicit PATH
+values remain authoritative in the published config, while later ARG values
+affect only subsequent build-time state according to Dockerfile instruction
+order.
+The stage PATH participates in RUN, COPY, and WORKDIR cache identities, so older
+records created without it miss safely. Build help also lists the existing
+memory, vCPU, timeout, and `nofile` controls, and missing Dockerfiles, contexts,
+or base inputs receive a concrete diagnostic instead of a bare `FileNotFound`.
+
 Named persistent restore now uses the same proof-gated local RAM backing as
 one-shot `spore run --from` and attach. Restore selection is centralized across
 KVM and HVF, and the plan owns the backing fd until the private mapping has been

@@ -96,6 +96,7 @@ class Transition:
     expect_boot_count: int
     expect_resize_count: int
     compare: bool
+    no_cache: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -358,6 +359,7 @@ def parse_transition(value: Any, label: str) -> Transition:
             "expect_boot_count",
             "expect_resize_count",
             "compare",
+            "no_cache",
         },
         label,
     )
@@ -374,6 +376,9 @@ def parse_transition(value: Any, label: str) -> Transition:
     compare = raw.get("compare", False)
     if type(compare) is not bool:
         raise HarnessError(f"{label}.compare must be a boolean")
+    no_cache = raw.get("no_cache", False)
+    if type(no_cache) is not bool:
+        raise HarnessError(f"{label}.no_cache must be a boolean")
     return Transition(
         name=require_string(raw["name"], f"{label}.name"),
         writes=require_string_map(raw.get("writes", {}), f"{label}.writes"),
@@ -396,6 +401,7 @@ def parse_transition(value: Any, label: str) -> Transition:
             raw["expect_resize_count"], f"{label}.expect_resize_count"
         ),
         compare=compare,
+        no_cache=no_cache,
     )
 
 
@@ -530,6 +536,19 @@ def self_test_schema(cases: list[Case]) -> None:
         {**valid, "unknown": True},
         {**valid, "initial_execution": {"expect_executed_steps": 1, "expect_boot_count": 1}},
         {**valid, "initial_execution": {"expect_executed_steps": -1, "expect_boot_count": 1, "expect_resize_count": 1}},
+        {
+            **valid,
+            "transitions": [
+                {
+                    "name": "bad-no-cache",
+                    "expect_cache": "miss",
+                    "expect_executed_steps": 1,
+                    "expect_boot_count": 1,
+                    "expect_resize_count": 0,
+                    "no_cache": "yes",
+                }
+            ],
+        },
     ]
     for index, fixture in enumerate(invalid):
         try:
@@ -785,6 +804,8 @@ def spore_build(
     base_layout: pathlib.Path,
     tag: str,
     log_prefix: pathlib.Path,
+    *,
+    no_cache: bool = False,
 ) -> SporeBuildResult:
     command = [
         spore_bin,
@@ -797,6 +818,7 @@ def spore_build(
         f"base={oci_layout_uri(base_layout)}",
         "--network",
         case.spec.network.value,
+        *(["--no-cache"] if no_cache else []),
         *build_args(case.spec),
         str(context),
     ]
@@ -1068,6 +1090,7 @@ def run_case(
             base_layout,
             spore_tag,
             transition_dir / "spore-build",
+            no_cache=transition.no_cache,
         )
         if transitioned.command.returncode != 0:
             raise CaseError(f"transition {name}: {command_failure(transitioned.command)}")

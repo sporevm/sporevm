@@ -1,0 +1,31 @@
+{
+  "description": "empty --build-arg HOME defaults root RUN to /root while config remains declared ENV",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 5,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle"
+  ],
+  "network": "none",
+  "build_args": {
+    "EXPECTED_HOME_AFTER_ARG": "/root",
+    "HOME": ""
+  },
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}
