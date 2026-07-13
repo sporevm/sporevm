@@ -1248,12 +1248,14 @@ does not add `USER` execution semantics.
 Structural follow-ups are explicit gates before C2 widens the instruction
 surface. Extract the cache-walk and miss-suffix lowering from `src/build.zig`
 behind one typed instruction transition, decode builder-v7 records through one
-canonical adapter shared by cache hits and GC validation, move the build COPY
-filesystem engine out of the PID1 protocol dispatcher, and split the
-conformance schema/comparison code from its CLI lifecycle. C1 keeps these paths
-co-located so its behavior lands as one cohesive slice; adding more operation
-kinds or COPY policy before those extractions would multiply the current
-representations.
+canonical adapter shared by cache hits and GC validation, and split the
+conformance schema/comparison code from its CLI lifecycle. The build COPY
+filesystem engine is now extracted into `guest/minimal-initrd/build_copy.c`:
+the PID1 agent retains bounded v2/v3 request parsing, source-disk readiness,
+dispatch, and SPIO replies, while the focused module owns confined source and
+destination resolution, traversal limits, metadata/xattr/hardlink handling,
+and filesystem application. Adding more operation kinds or COPY policy before
+the remaining extractions would multiply the current representations.
 
 Representative acceptance fixture:
 

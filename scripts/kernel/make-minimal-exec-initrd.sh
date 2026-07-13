@@ -120,11 +120,18 @@ for src in "${sources[@]}"; do
     exit 1
   fi
 done
+for src in build_copy.c build_copy.h; do
+  if [[ ! -f "${source_dir}/${src}" ]]; then
+    echo "error: missing minimal initrd source: ${source_dir}/${src}" >&2
+    exit 1
+  fi
+done
 
 compile_static() {
   local src="$1"
   local dst="$2"
-  "${cc_cmd[@]}" -static -Os -s "${source_dir}/${src}.c" -o "${dst}"
+  shift 2
+  "${cc_cmd[@]}" -static -Os -s "${source_dir}/${src}.c" "$@" -o "${dst}"
 }
 
 build_toybox() {
@@ -279,7 +286,7 @@ build_toybox() {
   chmod 0755 "${dst}"
 }
 
-compile_static agent "${workdir}/root/init"
+compile_static agent "${workdir}/root/init" "${source_dir}/build_copy.c"
 compile_static true "${workdir}/root/bin/true"
 compile_static false "${workdir}/root/bin/false"
 compile_static writeout "${workdir}/root/bin/writeout"

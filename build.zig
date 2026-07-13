@@ -57,6 +57,8 @@ pub fn build(b: *std.Build) void {
     for (minimal_exec_sources) |src| {
         minimal_exec_assets.addFileInput(b.path(b.fmt("guest/minimal-initrd/{s}.c", .{src})));
     }
+    minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/build_copy.c"));
+    minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/build_copy.h"));
     libspore_mod.addAnonymousImport("run_assets", .{
         .root_source_file = minimal_exec_initrd_module,
     });
@@ -196,6 +198,10 @@ pub fn build(b: *std.Build) void {
         mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
         mod.addCSourceFile(.{
             .file = b.path("guest/minimal-initrd/agent.c"),
+            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-DSPORE_AGENT_REQUEST_FUZZ" },
+        });
+        mod.addCSourceFile(.{
+            .file = b.path("guest/minimal-initrd/build_copy.c"),
             .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-DSPORE_AGENT_REQUEST_FUZZ" },
         });
         break :blk mod;

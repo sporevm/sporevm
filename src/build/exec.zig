@@ -1153,11 +1153,11 @@ extern fn spore_agent_fuzz_rootfs_grow_geometry(target_blocks: u64, before_block
 extern fn spore_agent_fuzz_proc_stat(stat: [*]const u8, stat_len: usize) c_int;
 extern fn spore_agent_fuzz_build_resolv_target(target: [*]const u8, target_len: usize, logical: [*]u8, logical_cap: usize) c_int;
 extern fn spore_agent_test_bounded_readlink(target: [*]const u8, target_len: usize) c_int;
-extern fn spore_agent_test_confined_source_parent(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize) c_int;
-extern fn spore_agent_fuzz_copy_tree(source_root: [*]const u8, source_root_len: usize, dest_root: [*]const u8, dest_root_len: usize, fuzz: [*]const u8, fuzz_len: usize) c_int;
-extern fn spore_agent_test_build_fd_budget() u64;
-extern fn spore_agent_test_security_xattr_long_name(root: [*]const u8, root_len: usize) c_int;
-extern fn spore_agent_test_copy_security_xattr_policy(regular_source: c_int, existing_destination: c_int, name: [*]const u8, name_len: usize) c_int;
+extern fn spore_build_copy_test_confined_source_parent(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize) c_int;
+extern fn spore_build_copy_fuzz_tree(source_root: [*]const u8, source_root_len: usize, dest_root: [*]const u8, dest_root_len: usize, fuzz: [*]const u8, fuzz_len: usize) c_int;
+extern fn spore_build_copy_test_fd_budget() u64;
+extern fn spore_build_copy_test_security_xattr_long_name(root: [*]const u8, root_len: usize) c_int;
+extern fn spore_build_copy_test_security_xattr_policy(regular_source: c_int, existing_destination: c_int, name: [*]const u8, name_len: usize) c_int;
 
 fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
     if (comptime guest_agent_fuzz_supported) {
@@ -1225,7 +1225,32 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
 
 test "build agent fd budget covers every bounded hardlink authority" {
     if (comptime guest_agent_fuzz_supported) {
-        try std.testing.expectEqual(@as(u64, max_copy_entries + 256), spore_agent_test_build_fd_budget());
+        try std.testing.expectEqual(@as(u64, max_copy_entries + 256), spore_build_copy_test_fd_budget());
+    }
+}
+
+test "build COPY engine confines source parent resolution" {
+    if (comptime guest_agent_fuzz_supported) {
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "root/safe");
+        try tmp.dir.createDirPath(io, "outside");
+        try tmp.dir.writeFile(io, .{ .sub_path = "root/safe/inside", .data = "inside" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "outside/secret", .data = "secret" });
+        try tmp.dir.symLink(io, "../../outside", "root/safe/escape", .{});
+        const root = try tmp.dir.realPathFileAlloc(io, "root", allocator);
+        defer allocator.free(root);
+
+        try std.testing.expectEqual(
+            @as(c_int, 0),
+            spore_build_copy_test_confined_source_parent(root.ptr, root.len, "safe/inside".ptr, "safe/inside".len),
+        );
+        try std.testing.expectEqual(
+            @as(c_int, -1),
+            spore_build_copy_test_confined_source_parent(root.ptr, root.len, "safe/escape/secret".ptr, "safe/escape/secret".len),
+        );
     }
 }
 
@@ -1236,7 +1261,7 @@ test "security xattr inspection accepts an ext4 maximum-length clean name" {
         Io.Dir.cwd().deleteTree(io, tmp) catch {};
         defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
         try Io.Dir.cwd().createDirPath(io, tmp);
-        try std.testing.expectEqual(@as(c_int, 0), spore_agent_test_security_xattr_long_name(tmp.ptr, tmp.len));
+        try std.testing.expectEqual(@as(c_int, 0), spore_build_copy_test_security_xattr_long_name(tmp.ptr, tmp.len));
     }
 }
 
@@ -1257,7 +1282,7 @@ test "COPY security xattr policy is regular-file capability only" {
             .{ .regular_source = 0, .existing_destination = 1, .name = "user.visible", .accepted = true },
         };
         for (cases) |case| {
-            const result = spore_agent_test_copy_security_xattr_policy(
+            const result = spore_build_copy_test_security_xattr_policy(
                 case.regular_source,
                 case.existing_destination,
                 case.name.ptr,
@@ -1297,7 +1322,7 @@ fn fuzzGuestCopyTree(_: void, s: *std.testing.Smith) !void {
         try Io.Dir.cwd().createDirPath(io, dest);
         var bytes: [256]u8 = undefined;
         const len = s.slice(&bytes);
-        _ = spore_agent_fuzz_copy_tree(source.ptr, source.len, dest.ptr, dest.len, bytes[0..len].ptr, len);
+        _ = spore_build_copy_fuzz_tree(source.ptr, source.len, dest.ptr, dest.len, bytes[0..len].ptr, len);
     }
 }
 

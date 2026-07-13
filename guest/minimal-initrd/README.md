@@ -13,6 +13,11 @@ streams terminal bytes on SPIO stream 4, and applies resize frames with
 `TIOCSWINSZ`. The other programs are fixed helper binaries used by product and
 lifecycle smokes.
 
+Build COPY request decoding and SPIO dispatch remain in `agent.c`.
+`build_copy.c` owns the confined source/destination resolver and filesystem
+application engine used by COPY, including metadata, hardlink, and xattr
+handling.
+
 The default embedded initrd also carries a minimal Toybox build for `/bin/sh`
 and basic applets such as `echo`, `cat`, `env`, `printf`, `pwd`, `test`,
 `uname`, `ls`, `mkdir`, `rm`, `touch`, and `sleep`. `toybox-sh.c` is a small
