@@ -722,8 +722,11 @@ guardrail selection, or `full` when a build should pay for the full benchmark
 matrix.
 
 Before the timed suite starts, the CI wrapper logs the host load averages and
-CPU count. Set `SPOREVM_BENCHMARK_MAX_LOADAVG_1M` to fail early when the
-one-minute load average is too high for a trustworthy run.
+CPU count. Set `SPOREVM_BENCHMARK_MAX_LOADAVG_1M` or
+`SPOREVM_BENCHMARK_MAX_LOADAVG_1M_PER_CPU` to wait for a trustworthy load
+level. `SPOREVM_BENCHMARK_LOAD_WAIT_TIMEOUT_SECONDS` bounds the wait; the
+wrapper samples every 15 seconds and fails immediately unless the timeout is
+greater than zero.
 
 The general benchmark CI wrapper honors `SPOREVM_BENCHMARK_SCRATCH_ROOT` when
 set. Otherwise it uses `/var/tmp/nvme/sporevm-benchmarks` when that prepared

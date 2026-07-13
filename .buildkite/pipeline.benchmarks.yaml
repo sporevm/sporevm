@@ -1,6 +1,8 @@
 env:
   BUILDKITE_REPO: "https://github.com/sporevm/sporevm.git"
   SPOREVM_BENCHMARK_ALLOW_IMAGE_RESOLVE_FALLBACK: "1"
+  SPOREVM_BENCHMARK_MAX_LOADAVG_1M_PER_CPU: "0.4"
+  SPOREVM_BENCHMARK_LOAD_WAIT_TIMEOUT_SECONDS: "900"
 
 steps:
   - label: ":bar_chart: Benchmarks macOS"
@@ -109,4 +111,4 @@ steps:
       set -euo pipefail
       scripts/benchmark/publish-site-data.py
     agents:
-      queue: sporevm-linux-arm64
+      queue: hosted

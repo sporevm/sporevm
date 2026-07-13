@@ -131,37 +131,74 @@ cleanup_benchmark_scratch() {
   rm -rf "${benchmark_scratch_dir}" || true
 }
 
-check_benchmark_host_load() {
+wait_for_quiet_benchmark_host() {
   python3 - <<'PY'
+import math
 import os
 import sys
+import time
 
-limit_raw = os.environ.get("SPOREVM_BENCHMARK_MAX_LOADAVG_1M", "")
-try:
-    load1, load5, load15 = os.getloadavg()
-except OSError:
-    if limit_raw:
-        print("error: pre-benchmark loadavg unavailable", file=sys.stderr)
+def parse_number(name, raw):
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"error: invalid {name}={raw!r}", file=sys.stderr)
         sys.exit(1)
-    print("pre-benchmark loadavg: unavailable", file=sys.stderr)
-    sys.exit(0)
+    if not math.isfinite(value) or value < 0:
+        print(f"error: {name} must be non-negative", file=sys.stderr)
+        sys.exit(1)
+    return value
 
-cpus = os.cpu_count() or 1
-print(
-    f"pre-benchmark loadavg: 1m={load1:.2f} 5m={load5:.2f} 15m={load15:.2f} "
-    f"cpus={cpus} load1_per_cpu={load1 / cpus:.3f}",
-    file=sys.stderr,
+limit = parse_number(
+    "SPOREVM_BENCHMARK_MAX_LOADAVG_1M",
+    os.environ.get("SPOREVM_BENCHMARK_MAX_LOADAVG_1M", ""),
 )
-if not limit_raw:
-    sys.exit(0)
-try:
-    limit = float(limit_raw)
-except ValueError:
-    print(f"error: invalid SPOREVM_BENCHMARK_MAX_LOADAVG_1M={limit_raw!r}", file=sys.stderr)
-    sys.exit(1)
-if load1 > limit:
-    print(f"error: pre-benchmark 1m loadavg {load1:.2f} exceeds {limit:.2f}", file=sys.stderr)
-    sys.exit(1)
+per_cpu_limit = parse_number(
+    "SPOREVM_BENCHMARK_MAX_LOADAVG_1M_PER_CPU",
+    os.environ.get("SPOREVM_BENCHMARK_MAX_LOADAVG_1M_PER_CPU", ""),
+)
+timeout = parse_number(
+    "SPOREVM_BENCHMARK_LOAD_WAIT_TIMEOUT_SECONDS",
+    os.environ.get("SPOREVM_BENCHMARK_LOAD_WAIT_TIMEOUT_SECONDS", ""),
+) or 0
+
+started = time.monotonic()
+while True:
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except OSError:
+        if limit is not None or per_cpu_limit is not None:
+            print("error: pre-benchmark loadavg unavailable", file=sys.stderr)
+            sys.exit(1)
+        print("pre-benchmark loadavg: unavailable", file=sys.stderr)
+        sys.exit(0)
+
+    cpus = os.cpu_count() or 1
+    load1_per_cpu = load1 / cpus
+    print(
+        f"pre-benchmark loadavg: 1m={load1:.2f} 5m={load5:.2f} 15m={load15:.2f} "
+        f"cpus={cpus} load1_per_cpu={load1_per_cpu:.3f}",
+        file=sys.stderr,
+    )
+    if limit is None and per_cpu_limit is None:
+        sys.exit(0)
+
+    quiet = (limit is None or load1 <= limit) and (
+        per_cpu_limit is None or load1_per_cpu <= per_cpu_limit
+    )
+    if quiet:
+        sys.exit(0)
+
+    elapsed = time.monotonic() - started
+    if elapsed >= timeout:
+        print(
+            f"error: benchmark host did not become quiet within {timeout:.0f}s",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    time.sleep(min(15, timeout - elapsed))
 PY
 }
 
@@ -286,7 +323,7 @@ fi
 if [[ -n "${benchmark_rootfs_cache_dir}" ]]; then
   benchmark_args+=(--rootfs-cache-dir "${benchmark_rootfs_cache_dir}")
 fi
-check_benchmark_host_load
+wait_for_quiet_benchmark_host
 scripts/benchmark/suite.py "${benchmark_args[@]}"
 scripts/benchmark/export-site-data.py zig-cache/sporevm-benchmarks/latest-summary.json
 run_regression_detector
