@@ -21,6 +21,10 @@ pub const usage =
     \\  --build-arg KEY=VALUE          Build argument value
     \\  --network spore|none           Network mode for build RUN execution
     \\  --no-cache                     Bypass Dockerfile step-cache reads; PREPARE is still reused
+    \\  --memory SIZE                  Build VM memory, for example 512mb or 16gb
+    \\  --vcpus COUNT                  Build VM vCPUs, from 1 through 8
+    \\  --timeout DURATION             Per-step timeout, for example 30s or 5m
+    \\  --ulimit nofile=SOFT[:HARD]    RUN open-file limit, up to 1048576
     \\  --mkfs PATH                    mkfs helper for OCI layout imports
     \\  --debugfs PATH                 debugfs helper for OCI layout imports
     \\  -h, --help                     Show this help
@@ -469,6 +473,13 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         error.RootFSDigestCacheMiss => {
             try stderr.writeAll("spore build: cached rootfs storage is missing its completeness stamp\n");
         },
+        error.BuildInputNotFound => {
+            if (diagnostic.missing_input) |missing| switch (missing.kind) {
+                .dockerfile => try stderr.print("spore build: Dockerfile not found: {s}\n", .{missing.path}),
+                .context => try stderr.print("spore build: build context not found: {s}\n", .{missing.path}),
+                .base => try stderr.print("spore build: base image or named build context not found: {s}\n", .{missing.path}),
+            } else try stderr.writeAll("spore build: required build input was not found\n");
+        },
         error.TooManyBuildInputDisks => {
             if (diagnostic.instruction_line != 0) {
                 try stderr.print(
@@ -530,6 +541,9 @@ test "build CLI parses M1 options" {
     try std.testing.expectEqualStrings("MODE", parsed.build_args.items[0].key);
     try std.testing.expectEqualStrings("test", parsed.build_args.items[0].value);
     try std.testing.expect(std.mem.indexOf(u8, usage, "--disk-grow-target") == null);
+    for ([_][]const u8{ "--memory", "--vcpus", "--timeout", "--ulimit" }) |option| {
+        try std.testing.expect(std.mem.indexOf(u8, usage, option) != null);
+    }
 
     try std.testing.expectError(error.UnknownArgument, parseArgs(allocator, &.{ "--disk-grow-target", "67108864", "." }));
     try std.testing.expectError(error.UnknownArgument, parseArgs(allocator, &.{ "--disk-grow-target=67108864", "." }));
@@ -567,4 +581,24 @@ test "build CLI reports an unknown target without a fake Dockerfile line" {
     diagnostic.dockerfile.message = "unknown build target: missing";
     try writeBuildError(&stderr.writer, error.DockerfilePlanFailed, diagnostic);
     try std.testing.expectEqualStrings("spore build: unknown build target: missing\n", stderr.written());
+}
+
+test "build CLI reports missing inputs without a bare FileNotFound" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        missing: build_mod.MissingInput,
+        expected: []const u8,
+    }{
+        .{ .missing = .{ .kind = .dockerfile, .path = "/tmp/missing/Dockerfile" }, .expected = "spore build: Dockerfile not found: /tmp/missing/Dockerfile\n" },
+        .{ .missing = .{ .kind = .context, .path = "/tmp/missing/context" }, .expected = "spore build: build context not found: /tmp/missing/context\n" },
+        .{ .missing = .{ .kind = .base, .path = "local/missing:dev" }, .expected = "spore build: base image or named build context not found: local/missing:dev\n" },
+    };
+    for (cases) |case| {
+        var stderr: Io.Writer.Allocating = .init(allocator);
+        defer stderr.deinit();
+        var diagnostic: build_mod.Diagnostic = .{};
+        diagnostic.missing_input = case.missing;
+        try writeBuildError(&stderr.writer, error.BuildInputNotFound, diagnostic);
+        try std.testing.expectEqualStrings(case.expected, stderr.written());
+    }
 }

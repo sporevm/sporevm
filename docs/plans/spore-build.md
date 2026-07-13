@@ -1225,6 +1225,26 @@ filesystem or metadata difference in the baseline oracle is a stop.
 6. **Done:** publish the selected target only; unreferenced invalid stages must still be
    syntactically valid but need not fetch or execute external bases.
 
+Post-merge compatibility correction (2026-07-13): executor-backed `RUN`
+steps execute as root and receive `HOME=/root` when the inherited/base
+environment and effective Dockerfile/build arguments leave `HOME` absent or
+empty. This matches BuildKit's root-process environment without rewriting the
+published OCI config: `ENV HOME=` stays published as empty, while explicit
+non-empty values remain authoritative. ENV and ARG follow instruction order for
+build execution without publishing ARG. The effective root-process value
+participates in the RUN environment digest, so pre-correction empty-HOME records
+cannot hit; HOME normalization alone does not change COPY or WORKDIR cache
+identities. Stages also receive BuildKit's conventional Linux
+`PATH` when it is absent; unlike HOME, PATH is stage environment state and part
+of the published OCI environment, including for `FROM scratch`. An explicit
+PATH remains authoritative in the published config; a later ARG follows
+BuildKit's ordinary instruction-order semantics for effective build state
+without becoming published ENV. In particular, ARG followed by ENV leaves ENV
+effective, while ENV followed by ARG changes later build execution but retains
+the published ENV value. PATH participates in every environment-bound
+Dockerfile operation key, so older records created without it miss safely. This
+does not add `USER` execution semantics.
+
 Structural follow-ups are explicit gates before C2 widens the instruction
 surface. Extract the cache-walk and miss-suffix lowering from `src/build.zig`
 behind one typed instruction transition, decode builder-v7 records through one

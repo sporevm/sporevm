@@ -1,0 +1,58 @@
+{
+  "description": "pinned Go builder gets Docker-compatible root HOME and publishes a scratch runtime",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 9,
+    "expect_boot_count": 2,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/app",
+    "/explicit-home",
+    "/empty-home-defaulted"
+  ],
+  "network": "none",
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "source-edit",
+      "writes": {
+        "message.txt": "spore-home-edited\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 8,
+      "expect_boot_count": 2,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-edit",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "no-cache",
+      "expect_cache": "miss",
+      "expect_executed_steps": 9,
+      "expect_boot_count": 2,
+      "expect_resize_count": 0,
+      "compare": true,
+      "no_cache": true
+    }
+  ]
+}
