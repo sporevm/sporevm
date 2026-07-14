@@ -705,6 +705,14 @@ const RootfsBuildProfile = struct {
         std.debug.print("spore rootfs profile: phase={s} ms={d}\n", .{ name, monotonicMs() -| start_ms });
     }
 
+    fn layerPhase(self: RootfsBuildProfile, layer: usize, start_ms: u64, input_bytes: u64, entries: u64, content_bytes: u64) void {
+        if (!self.enabled) return;
+        std.debug.print(
+            "spore rootfs profile: phase=tree_merge_layer layer={d} ms={d} input_bytes={d} merged_entries={d} merged_content_bytes={d}\n",
+            .{ layer, monotonicMs() -| start_ms, input_bytes, entries, content_bytes },
+        );
+    }
+
     fn preloadPhase(self: RootfsBuildProfile, start_ms: u64, result: rootfs_cas.PreloadResult) void {
         self.casPhase("rootfs_cas_preload", start_ms, result);
     }
@@ -1714,7 +1722,18 @@ fn materializeRootFSNative(
         layer_meta[i] = .{ .media_type = layer.media_type, .digest = layer.digest };
         native_layers[i] = .{ .media_type = layer.media_type, .path = layer.path, .spill_dir = opts.temp_dir };
     }
-    var tree = try tar.buildMergedTree(allocator, init.io, native_layers);
+    var tree = tar.MergedTree.init(allocator);
+    errdefer tree.deinit(allocator);
+    for (native_layers, 0..) |layer, layer_index| {
+        const layer_start = opts.profile.start();
+        try tar.applyLayerToMergedTree(allocator, init.io, &tree, layer);
+        const content_size = tree.contentSize();
+        if (content_size > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
+        if (opts.profile.enabled) {
+            const stat = try Io.Dir.cwd().statFile(init.io, layer.path, .{});
+            opts.profile.layerPhase(layer_index, layer_start, stat.size, tree.entryCount(), content_size);
+        }
+    }
     defer tree.deinit(allocator);
     opts.profile.phase("tree_merge", merge_start);
 

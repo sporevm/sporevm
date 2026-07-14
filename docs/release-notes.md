@@ -14,6 +14,14 @@ Malformed, empty, NUL-containing, or oversized arrays fail during full-file
 parsing before a build VM starts. Shell-form RUN remains `/bin/sh -c`; mounted
 RUN and heredocs remain unsupported.
 
+Cold OCI base imports no longer scan the complete merged filesystem for every
+regular-file replacement. The importer keeps per-inode hardlink reference
+counts and removes non-directory paths directly, preserving source lifetime
+and directory-subtree semantics while avoiding quadratic work in overwrite-
+heavy layers. Opt-in rootfs profiling now reports each OCI layer separately,
+and build output splits executor session time into guest instructions,
+snapshots, checkpoint control, and remaining overhead.
+
 Bounded named exec now has a documented lossless JSON representation for
 arbitrary stdout and stderr bytes. Valid UTF-8 remains a JSON string, while an
 invalid UTF-8 stream is emitted as an integer byte array; Zig, C, and Go callers

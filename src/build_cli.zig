@@ -129,6 +129,21 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
             diagnostic.executor.resize_count,
         },
     );
+    if (diagnostic.executor.session_ms != 0) {
+        const accounted_ms = diagnostic.executor.instruction_ms +|
+            diagnostic.executor.checkpoint_control_ms +|
+            diagnostic.executor.snapshot_ms;
+        try stdout.print(
+            "  Executor timing: session={d}ms instructions={d}ms snapshots={d}ms checkpoint-control={d}ms other={d}ms\n",
+            .{
+                diagnostic.executor.session_ms,
+                diagnostic.executor.instruction_ms,
+                diagnostic.executor.snapshot_ms,
+                diagnostic.executor.checkpoint_control_ms,
+                diagnostic.executor.session_ms -| accounted_ms,
+            },
+        );
+    }
     if (diagnostic.context_hash.entries != 0) {
         try stdout.print(
             "  Context: entries={d} files={d} hashed={d} bytes stat-cache={d} hits/{d} misses stat={d}ms hash={d}ms cache-load={d}ms cache-save={d}ms\n",

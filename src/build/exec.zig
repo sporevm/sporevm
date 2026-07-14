@@ -79,6 +79,10 @@ pub const Diagnostic = struct {
     resize_count: usize = 0,
     boot_artifact_file_reads: usize = 0,
     boot_artifact_bytes_read: usize = 0,
+    session_ms: u64 = 0,
+    instruction_ms: u64 = 0,
+    checkpoint_control_ms: u64 = 0,
+    snapshot_ms: u64 = 0,
     max_checkpoint_control_ms: u64 = 0,
     snapshot_metrics: disk_layer.SnapshotMetrics = std.mem.zeroes(disk_layer.SnapshotMetrics),
 };
@@ -397,6 +401,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         };
     }
     const network_mode = try networkModeForSteps(options.steps);
+    const session_start_ns = try monotonicNs();
 
     var control = try BuildControl.init(init.io, allocator, options, try p0IdleProbeMs(init.environ_map));
     defer control.deinit();
@@ -433,6 +438,10 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
             diag.enospc = control.enospc_detector.seen;
             diag.boot_count = 1;
             diag.executed_steps = control.executed_steps;
+            diag.session_ms = ((try monotonicNs()) -| session_start_ns) / std.time.ns_per_ms;
+            diag.instruction_ms = control.instruction_elapsed_ms;
+            diag.checkpoint_control_ms = control.checkpoint_control_ms;
+            diag.snapshot_ms = control.snapshot_ms;
             diag.max_checkpoint_control_ms = control.max_checkpoint_control_ms;
         }
         return error.BuildRunFailed;
@@ -442,6 +451,10 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     if (options.diagnostic) |diag| {
         diag.boot_count = 1;
         diag.executed_steps = control.executed_steps;
+        diag.session_ms = ((try monotonicNs()) -| session_start_ns) / std.time.ns_per_ms;
+        diag.instruction_ms = control.instruction_elapsed_ms;
+        diag.checkpoint_control_ms = control.checkpoint_control_ms;
+        diag.snapshot_ms = control.snapshot_ms;
         diag.max_checkpoint_control_ms = control.max_checkpoint_control_ms;
     }
     return try spore.cloneRootfsStorage(allocator, control.current_storage);
@@ -524,6 +537,9 @@ const BuildControl = struct {
     failed_instruction_line: usize = 0,
     failed_exit_code: ?i32 = null,
     failure: ?anyerror = null,
+    checkpoint_control_ms: u64 = 0,
+    snapshot_ms: u64 = 0,
+    snapshot_metrics: ?*disk_layer.SnapshotMetrics = null,
     max_checkpoint_control_ms: u64 = 0,
     preparation_start_ns: ?u64 = null,
     preparation_publish_ms: ?u64 = null,
@@ -550,6 +566,7 @@ const BuildControl = struct {
             .capture = std.array_list.Managed(u8).init(allocator),
             .resize_stdout = std.array_list.Managed(u8).init(allocator),
             .p0_idle_probe_ms = p0_idle_probe_ms,
+            .snapshot_metrics = if (options.diagnostic) |diag| &diag.snapshot_metrics else null,
         };
     }
 
@@ -772,7 +789,9 @@ const BuildControl = struct {
                 self.phase = .start_freeze;
             },
             .freeze => {
-                self.max_checkpoint_control_ms = @max(self.max_checkpoint_control_ms, self.stream.elapsedMs());
+                const elapsed_ms = self.stream.elapsedMs();
+                self.checkpoint_control_ms +|= elapsed_ms;
+                self.max_checkpoint_control_ms = @max(self.max_checkpoint_control_ms, elapsed_ms);
                 if (exit_code != 0) {
                     self.failure = error.BuildGuestFreezeFailed;
                     self.phase = .failed;
@@ -781,7 +800,9 @@ const BuildControl = struct {
                 self.phase = .snapshot;
             },
             .thaw => {
-                self.max_checkpoint_control_ms = @max(self.max_checkpoint_control_ms, self.stream.elapsedMs());
+                const elapsed_ms = self.stream.elapsedMs();
+                self.checkpoint_control_ms +|= elapsed_ms;
+                self.max_checkpoint_control_ms = @max(self.max_checkpoint_control_ms, elapsed_ms);
                 if (exit_code != 0) {
                     self.failure = error.BuildGuestThawFailed;
                     self.phase = .failed;
@@ -848,6 +869,7 @@ const BuildControl = struct {
         _ = self.active_input orelse return error.BadManifest;
         if (self.active_step_key.len == 0) return error.BadManifest;
         const disk = maybe_disk orelse return error.BadManifest;
+        if (self.snapshot_metrics) |metrics| self.snapshot_ms +|= metrics.total_us / std.time.us_per_ms;
         const storage = try runtime_disk.storageFromSnapshotDisk(self.allocator, disk);
         if (self.checkpoint_kind == .prepare) try validatePreparedStorage(self.current_storage, storage, self.rootfs_grow_target);
         // A zero-dirty RUN/COPY/WORKDIR can intentionally yield child digest ==
