@@ -1826,7 +1826,12 @@ fn unpackRootfsStorageIndexed(
         }
 
         const local_object_path = rootfs_cas.manifestObjectPath(allocator, options.out_dir, chunk_entry.digest) catch |err| return rootfsError(err);
-        _ = rootfs_cas.installChunkPath(allocator, options.io, local_object_path, object_data, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
+        const local_object_parent = std.fs.path.dirname(local_object_path) orelse return error.BadManifest;
+        chunk_sealer.ensureDirPath(allocator, local_object_parent) catch |err| return rootfsError(err);
+        // The bundle read above already verified these exact bytes against the
+        // descriptor-selected digest. Publish that allocation directly instead
+        // of hashing it before and after the durable write.
+        chunk_sealer.writeFileAtomicDurable(allocator, local_object_path, object_data, 0o444) catch |err| return rootfsError(err);
         const cache_object_path = rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest) catch |err| return rootfsError(err);
         const installed_object = rootfs_cas.installChunkPath(allocator, options.io, cache_object_path, object_data, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
         if (installed_object.cache_hit) {
@@ -1839,7 +1844,11 @@ fn unpackRootfsStorageIndexed(
         result.payload_bytes += @intCast(object_data.len);
     }
 
-    _ = rootfs_cas.installStorageIndexPath(allocator, options.io, local_index_path, index_bytes, storage) catch |err| return rootfsError(err);
+    const local_index_parent = std.fs.path.dirname(local_index_path) orelse return error.BadManifest;
+    chunk_sealer.ensureDirPath(allocator, local_index_parent) catch |err| return rootfsError(err);
+    // readVerifiedStorageIndexPath and parseRootfsDiskIndexForStorage already
+    // authenticated and validated these exact bytes before object publication.
+    chunk_sealer.writeFileAtomicDurable(allocator, local_index_path, index_bytes, 0o444) catch |err| return rootfsError(err);
     const installed_index = rootfs_cas.installStorageIndexPath(allocator, options.io, cache_index_path, index_bytes, storage) catch |err| return rootfsError(err);
     if (installed_index.cache_hit) {
         result.cache_hit_count += 1;
