@@ -36,21 +36,21 @@ NON_REGRESSION_ABSOLUTE_MS = 50.0
 MAX_CAPTURE_BYTES = 16 * 1024
 MANAGED_KERNEL_PIN: dict[str, object] = {
     "repository": "sporevm/kernels",
-    "release": "v0.6.2",
+    "release": "v0.6.3",
     "linux_version": "6.1.155",
     "asset": "sporevm-arm64-linux-6.1.155-Image",
     "files": {
-        "sporevm-kernels/v0.6.2/sporevm-arm64-linux-6.1.155-Image": {
+        "sporevm-kernels/v0.6.3/sporevm-arm64-linux-6.1.155-Image": {
             "size": 7_680_008,
-            "sha256": "902a03e83d87fc6c03427b3f47d27d1e4ee5ef48337d3879ccb844de8faa3660",
+            "sha256": "885c819cb929ec074d4e13c92a40daaf1ffaf2c278a63ebd7de92e1d9ae9dd4d",
         },
-        "sporevm-kernels/v0.6.2/sporevm-arm64-linux-6.1.155-Image.sha256": {
+        "sporevm-kernels/v0.6.3/sporevm-arm64-linux-6.1.155-Image.sha256": {
             "size": 100,
-            "sha256": "bb5b00da3b40f0c58c96612c90fe929a63c1c4b19e0a8007840d41392ef37684",
+            "sha256": "fd694a2c9d1617a1984fa7c327e1804820c4367b51d865ed7f61eb9b38c0d65d",
         },
-        "sporevm-kernels/v0.6.2/sporevm-arm64-linux-6.1.155-Image.config": {
-            "size": 70_865,
-            "sha256": "4177e7f394d8d199201be7a5e82c5073912147da7a2e6e1282a7dd4b6aef1d70",
+        "sporevm-kernels/v0.6.3/sporevm-arm64-linux-6.1.155-Image.config": {
+            "size": 70_854,
+            "sha256": "ef0b16575d5a616d47d2d664bafe2c061f9123338d3daf93bb2cfbe13aba6784",
         },
     },
 }
