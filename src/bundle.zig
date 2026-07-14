@@ -59,6 +59,7 @@ const max_remote_bundle_materialization_bytes: u64 = 128 * 1024 * 1024 * 1024;
 const testing = if (builtin.is_test) struct {
     var pack_authority_barrier: ?*test_barrier.Barrier = null;
     var rootfs_unpack_source_object_reads: ?*usize = null;
+    var disk_unpack_source_object_reads: ?*usize = null;
 } else struct {};
 
 const LoadedManifest = struct {
@@ -2072,6 +2073,9 @@ fn unpackDiskIndexForManifest(
         const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
         const source_object_rel_path = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
         const source_object_path = try pathZ(allocator, "{s}/{s}", .{ bundle_dir, source_object_rel_path });
+        if (comptime builtin.is_test) {
+            if (testing.disk_unpack_source_object_reads) |count| count.* += 1;
+        }
         const object_data = rootfs_cas.readVerifiedChunkPath(allocator, source_object_path, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
         defer allocator.free(object_data);
 
@@ -4315,12 +4319,17 @@ test "pack and unpack disk indexes in existing bundle shape" {
     try Io.Dir.cwd().deleteTree(io, try pathZ(arena, "{s}/cas", .{pack_cache_root}));
     try Io.Dir.cwd().deleteTree(io, try pathZ(arena, "{s}/pins", .{pack_cache_root}));
 
+    var disk_source_reads: usize = 0;
+    testing.disk_unpack_source_object_reads = &disk_source_reads;
+    defer testing.disk_unpack_source_object_reads = null;
     const unpacked = try unpack(arena, .{
         .io = io,
         .bundle_dir = bundle_dir,
         .out_dir = out_dir,
         .rootfs_cache_dir = unpack_cache_root,
     });
+    testing.disk_unpack_source_object_reads = null;
+    try std.testing.expectEqual(parsed_index.value.chunks.len, disk_source_reads);
     try std.testing.expectEqualStrings(pack_result.bundle_digest, unpacked.bundle_digest);
     const restored_manifest = try spore.loadManifest(arena, out_dir);
     defer restored_manifest.deinit();
@@ -4335,12 +4344,16 @@ test "pack and unpack disk indexes in existing bundle shape" {
     try writeFileAll(object_path, data);
     const corrupt_digest = try digestHex(arena, bundle_dir);
     try std.testing.expect(!std.mem.eql(u8, clean_digest, corrupt_digest));
+    disk_source_reads = 0;
+    testing.disk_unpack_source_object_reads = &disk_source_reads;
     try std.testing.expectError(error.BadChunk, unpack(arena, .{
         .io = io,
         .bundle_dir = bundle_dir,
         .out_dir = out_bad_dir,
         .rootfs_cache_dir = unpack_cache_root,
     }));
+    testing.disk_unpack_source_object_reads = null;
+    try std.testing.expect(disk_source_reads > 0);
     try std.testing.expect(std.c.access(try pathZ(arena, "{s}/manifest.json", .{out_bad_dir}), 0) != 0);
 }
 
@@ -5578,6 +5591,9 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     const storage = rootfsStorageEntryDescriptor(storage_entry);
 
     const source_uri = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
+    var disk_source_reads: usize = 0;
+    testing.disk_unpack_source_object_reads = &disk_source_reads;
+    defer testing.disk_unpack_source_object_reads = null;
     const pulled = try pull(arena, .{
         .io = io,
         .source = source_uri,
@@ -5586,6 +5602,8 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
         .bundle_cache_dir = pull_bundle_cache,
         .child_id = "000000",
     });
+    testing.disk_unpack_source_object_reads = null;
+    try std.testing.expectEqual(@as(usize, 0), disk_source_reads);
     try std.testing.expectEqual(@as(usize, 1), pulled.rootfs.artifact_count);
     try std.testing.expectEqual(@as(usize, 0), pulled.rootfs.cache.hit_count);
     try std.testing.expectEqual(unique_source_objects.count() + 1, pulled.rootfs.cache.miss_count);
