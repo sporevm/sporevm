@@ -1,6 +1,6 @@
 ---
-status: active
-last_reviewed: 2026-07-11
+status: landed
+last_reviewed: 2026-07-13
 spec_refs:
   - docs/lifecycle.md
   - docs/libspore.md
@@ -38,24 +38,33 @@ stdin closed by default. `-i` controls stdin forwarding and `-t` controls PTY
 allocation. The bounded compatibility collector fails with
 `ExecOutputTruncated` instead of returning partial output as success.
 
-## Remaining Work
+The bounded result keeps valid UTF-8 output as JSON strings and emits invalid
+UTF-8 output as integer byte arrays. Zig exposes the decoded owned byte slices,
+the C ABI returns the lossless hybrid JSON shape, and Go accepts either form
+without changing the bytes. Streaming exec remains unchanged.
 
-- Make bounded named exec JSON byte-safe for invalid UTF-8 stdout/stderr. The
-  monitor already sends `stdout_b64` and `stderr_b64`; the public JSON producer
-  still needs a lossless shape, either byte arrays or documented base64 fields.
-- Add a Zig/C/Go round-trip check proving invalid UTF-8 survives buffered named
-  exec decode. The streaming exec path is already the answer for long or
-  interactive output.
-- Add or tighten a snapshot annotation merge test for overlay-wins semantics.
-  The user-facing docs already state that save-time annotations merge into the
-  manifest without dropping create-time annotations.
+Snapshot publication coverage now begins with create-time annotations, applies
+save-time annotations, runs the actual monitor publication step, and verifies
+that create-only keys survive, save-only keys are added, and save-time values
+win collisions in the visible manifest.
 
-## Done When
+## Completion Evidence
 
-- Invalid UTF-8 bytes survive monitor, Zig, C JSON, and Go decode.
-- Bounded collection reports truncation as an error rather than partial
+- Invalid UTF-8 fixtures survive monitor base64 decode, Zig owned slices, C
+  JSON byte arrays, and Go decode.
+- Existing valid UTF-8 fixtures remain JSON strings.
+- Bounded collection still reports truncation as an error rather than partial
   success.
-- Annotation merge-through-snapshot is pinned by a focused test.
+- Annotation overlay semantics are pinned through actual snapshot publication.
+
+## Key Learnings From Pressure-Testing
+
+The pinned Zig JSON encoder already had the smallest compatible lossless shape:
+it writes valid byte slices as strings and invalid UTF-8 slices as integer
+arrays. Documenting and testing that behavior avoids duplicate base64 fields
+and leaves valid-text consumers unchanged. The annotation regression belongs at
+the monitor publication boundary, where lifecycle metadata replaces the
+captured manifest annotations.
 
 ## Non-Goals
 

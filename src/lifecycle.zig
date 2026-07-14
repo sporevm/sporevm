@@ -5770,14 +5770,14 @@ test "named exec response rejects truncated collector output" {
 test "named exec response decodes complete bounded output" {
     const allocator = std.testing.allocator;
     const response =
-        \\{"type":"exec_result","exit_code":7,"stdout_b64":"b2s=","stderr_b64":"ZXJy","network_events_jsonl_b64":"eyJldmVudCI6Im5ldHdvcmtfZGVjaXNpb24ifQo=","stdout_truncated":false,"stderr_truncated":false}
+        \\{"type":"exec_result","exit_code":7,"stdout_b64":"/wBB","stderr_b64":"/kI=","network_events_jsonl_b64":"eyJldmVudCI6Im5ldHdvcmtfZGVjaXNpb24ifQo=","stdout_truncated":false,"stderr_truncated":false}
     ;
     const result = try parseExecNamedResponse(allocator, allocator, response);
     defer deinitExecNamedResult(allocator, result);
 
     try std.testing.expectEqual(@as(u8, 7), result.exit_code);
-    try std.testing.expectEqualStrings("ok", result.stdout);
-    try std.testing.expectEqualStrings("err", result.stderr);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 'A' }, result.stdout);
+    try std.testing.expectEqualSlices(u8, &.{ 0xfe, 'B' }, result.stderr);
     try std.testing.expectEqualStrings("{\"event\":\"network_decision\"}\n", result.network_events_jsonl);
 }
 
