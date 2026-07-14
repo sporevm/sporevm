@@ -1822,7 +1822,11 @@ fn unpackRootfsStorageIndexed(
     // stamps remain hidden until every referenced object is durable.
     var cache_lock = rootfs_mod.lockRootfsCacheExclusive(options.io, allocator, cache_root) catch |err| return rootfsError(err);
     defer cache_lock.deinit();
-    const cache_storage_complete = rootfs_cas.storageMarkedComplete(options.io, allocator, cache_root, storage) catch |err| return rootfsError(err);
+    const cache_storage_marked = rootfs_cas.storageMarkedComplete(options.io, allocator, cache_root, storage) catch |err| return rootfsError(err);
+    const cache_storage_complete = cache_storage_marked and (rootfs_cas.storageContentComplete(options.io, allocator, cache_root, storage) catch |err| return rootfsError(err));
+    if (cache_storage_marked and !cache_storage_complete) {
+        rootfs_cas.removeStorageCompleteStamp(options.io, allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
+    }
 
     var seen_objects = std.StringHashMap(void).init(allocator);
     defer seen_objects.deinit();
@@ -5589,6 +5593,11 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     try std.testing.expectEqual(@as(u64, 0), pulled.rootfs.cache.bytes_reused);
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
 
+    const repair_entry = source_index.value.chunks[0];
+    const missing_cached_object = try rootfs_cas.manifestObjectPath(arena, pull_rootfs_cache, repair_entry.digest);
+    try Io.Dir.cwd().deleteFile(io, missing_cached_object);
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
+
     const pulled_cached = try pull(arena, .{
         .io = io,
         .source = source_uri,
@@ -5597,11 +5606,13 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
         .bundle_cache_dir = pull_bundle_cache,
         .child_id = "000000",
     });
-    try std.testing.expectEqual(unique_source_objects.count() + 1, pulled_cached.rootfs.cache.hit_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled_cached.rootfs.cache.miss_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled_cached.rootfs.cache.bytes_fetched);
-    try std.testing.expectEqual(pulled.rootfs.payload_bytes, pulled_cached.rootfs.cache.bytes_reused);
+    try std.testing.expectEqual(unique_source_objects.count(), pulled_cached.rootfs.cache.hit_count);
+    try std.testing.expectEqual(@as(usize, 1), pulled_cached.rootfs.cache.miss_count);
+    try std.testing.expectEqual(@as(u64, spore.disk_chunk_size), pulled_cached.rootfs.cache.bytes_fetched);
+    try std.testing.expectEqual(pulled.rootfs.payload_bytes - spore.disk_chunk_size, pulled_cached.rootfs.cache.bytes_reused);
     try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled_cached.materialization.cache.bytes_reused);
+    const repaired_cached_object = try rootfs_cas.readVerifiedChunkPath(arena, missing_cached_object, repair_entry.digest, spore.disk_chunk_size);
+    try std.testing.expectEqual(@as(usize, spore.disk_chunk_size), repaired_cached_object.len);
 
     // Chunked pulls eagerly assemble the flat digest-addressed artifact from
     // the installed verified chunks; it is the only runtime base source.

@@ -461,10 +461,12 @@ pub fn removeStorageCompleteStamp(
 ) !void {
     const stamp_path = try storageCompleteStampPath(allocator, cache_root, index_digest);
     defer allocator.free(stamp_path);
+    var removed = true;
     Io.Dir.cwd().deleteFile(io, stamp_path) catch |err| switch (err) {
-        error.FileNotFound => {},
+        error.FileNotFound => removed = false,
         else => |e| return e,
     };
+    if (removed) try chunk_sealer.fsyncParentDirPath(allocator, stamp_path);
 }
 
 pub fn removeStorageCompleteStampsReferencingObject(
