@@ -495,6 +495,15 @@ const ExecServer = struct {
     fn publishReady(self: *ExecServer) !void {
         var startup = self.startup orelse return error.MissingMonitorStartupMetadata;
         startup.timing.ready_after_start_ms = lifecycle.monotonicMs() - startup.started_ms;
+        startup.timing.readiness_attach_ms = self.active_stream.attach_ms;
+        startup.timing.readiness_connect_request_delivered_ms = self.active_stream.connect_request_delivered_ms;
+        startup.timing.readiness_connect_ms = self.active_stream.connect_ms;
+        startup.timing.readiness_request_delivered_ms = self.active_stream.request_delivered_ms;
+        startup.timing.readiness_guest_timing_ms = self.active_stream.guest_timing_ms;
+        startup.timing.readiness_response_ms = self.active_stream.response_ms;
+        startup.timing.backend_restore_memory_ms = self.active_stream.backend_restore_memory_ms;
+        startup.timing.backend_restore_state_ms = self.active_stream.backend_restore_state_ms;
+        startup.timing.backend_restore_pre_run_ms = self.active_stream.backend_restore_pre_run_ms;
         lifecycle.writeMonitorTiming(self.allocator, self.io, startup.paths, startup.timing) catch {};
         try lifecycle.writeReady(self.allocator, self.io, startup.paths, startup.ready);
     }
@@ -637,6 +646,18 @@ const ExecServer = struct {
                     };
                     if (readiness_probe) {
                         if (!readinessProbeSucceeded(exit_code, self.stderr_capture[0..self.stderr_capture_len])) return error.GuestReadinessProbeFailed;
+                        std.log.info(
+                            "monitor readiness metrics: attach_ms={?d} connect_request_delivered_ms={?d} connect_ms={?d} request_delivered_ms={?d} guest_timing_ms={?d} response_ms={?d} ready_ms={d}",
+                            .{
+                                self.active_stream.attach_ms,
+                                self.active_stream.connect_request_delivered_ms,
+                                self.active_stream.connect_ms,
+                                self.active_stream.request_delivered_ms,
+                                self.active_stream.guest_timing_ms,
+                                self.active_stream.response_ms,
+                                self.active_stream.elapsedMs(),
+                            },
+                        );
                         dev.resetHostStream();
                         self.active_stream_valid = false;
                         try self.publishReady();

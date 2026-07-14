@@ -165,6 +165,10 @@ input spore is only read and can be reused across iterations. Rows also expose
 and `pre_run_ms` as `backend_memory_ms`, `backend_state_ms`, and
 `backend_pre_run_ms`. This separates RAM materialization from the guest
 readiness handshake instead of hiding both inside `wait_exec_ready_ms`.
+Readiness rows also record connect-request delivery, connect completion,
+request delivery, guest timing, response, and ready-publication milestones
+from the monitor's structured timing file, so the evidence remains available
+without enabling monitor debug logs.
 
 Pass `--include-run-from` to also record one-shot `run --from ... /bin/true`
 wall time against the same parent and host.

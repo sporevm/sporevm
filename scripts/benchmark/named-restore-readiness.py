@@ -48,9 +48,11 @@ from named_restore_readiness import (
     normalize_paths,
     non_regression_gates,
     parse_proof_metrics,
+    parse_readiness_metrics,
     parse_restore_metrics_all,
     performance_gate,
     read_monitor_log,
+    read_monitor_timing,
     release_scratch_precondition,
     require_managed_kernel_pin,
     require_single_proof_metric,
@@ -121,6 +123,7 @@ def run_lane(
             restore_json: dict[str, object] = {}
             parse_error = ""
             monitor_log = ""
+            monitor_timing: dict[str, object] = {}
             if include_run_from:
                 run_from = runner.run(
                     [str(spore_bin), "run", "--backend", backend, "--from", str(spore_dir), "--", "/bin/true"],
@@ -152,6 +155,7 @@ def run_lane(
             finally:
                 try:
                     monitor_log = read_monitor_log(runtime_dir, name)
+                    monitor_timing = read_monitor_timing(runtime_dir, name)
                 finally:
                     cleanup = cleanup_named(
                         runner, spore_bin, env, runtime_dir, name, leases_before, min(timeout_s, 15)
@@ -162,6 +166,8 @@ def run_lane(
                 raise BenchmarkSignal(runner.signals.signum)
             restore_metrics_rows = parse_restore_metrics_all(monitor_log)
             restore_metrics = restore_metrics_rows[0] if len(restore_metrics_rows) == 1 else {}
+            readiness_metrics_rows = parse_readiness_metrics(monitor_log)
+            readiness_metrics = monitor_timing if monitor_timing else (readiness_metrics_rows[0] if len(readiness_metrics_rows) == 1 else {})
             proof_metrics = parse_proof_metrics(monitor_log, "validate")
             proof_metric = proof_metrics[0] if len(proof_metrics) == 1 else {}
             proof_plan_source = proof_metric.get("source")
@@ -207,9 +213,17 @@ def run_lane(
                 "restore_metric_count": len(restore_metrics_rows),
                 "restore_reason": proof_metric.get("reason"),
                 "restore_ram_mib": restore_metrics.get("ram_mib"),
-                "backend_memory_ms": restore_metrics.get("memory_ms"),
-                "backend_state_ms": restore_metrics.get("state_ms"),
-                "backend_pre_run_ms": restore_metrics.get("pre_run_ms"),
+                "backend_memory_ms": monitor_timing.get("backend_restore_memory_ms") if monitor_timing.get("backend_restore_memory_ms") is not None else restore_metrics.get("memory_ms"),
+                "backend_state_ms": monitor_timing.get("backend_restore_state_ms") if monitor_timing.get("backend_restore_state_ms") is not None else restore_metrics.get("state_ms"),
+                "backend_pre_run_ms": monitor_timing.get("backend_restore_pre_run_ms") if monitor_timing.get("backend_restore_pre_run_ms") is not None else restore_metrics.get("pre_run_ms"),
+                "readiness_metric_count": 1 if readiness_metrics else 0,
+                "readiness_attach_ms": readiness_metrics.get("readiness_attach_ms", readiness_metrics.get("attach_ms")),
+                "readiness_connect_request_delivered_ms": readiness_metrics.get("readiness_connect_request_delivered_ms", readiness_metrics.get("connect_request_delivered_ms")),
+                "readiness_connect_ms": readiness_metrics.get("readiness_connect_ms", readiness_metrics.get("connect_ms")),
+                "readiness_request_delivered_ms": readiness_metrics.get("readiness_request_delivered_ms", readiness_metrics.get("request_delivered_ms")),
+                "readiness_guest_timing_ms": readiness_metrics.get("readiness_guest_timing_ms", readiness_metrics.get("guest_timing_ms")),
+                "readiness_response_ms": readiness_metrics.get("readiness_response_ms", readiness_metrics.get("response_ms")),
+                "readiness_ready_ms": readiness_metrics.get("ready_after_start_ms", readiness_metrics.get("ready_ms")),
                 "proof_schema_version": proof_metric.get("schema"),
                 "proof_metric_count": len(proof_metrics),
                 "proof_status": proof_metric.get("status"),
@@ -308,6 +322,7 @@ def validate_rows(
             "exec_ready_source": "restore_contract",
             "restore_source": expected_source,
             "restore_metric_count": 1,
+            "readiness_metric_count": 1,
             "restore_ram_mib": expected_ram_mib,
             "restore_status": 0,
             "first_exec_status": 0,
@@ -346,6 +361,13 @@ def validate_rows(
             "backend_memory_ms",
             "backend_state_ms",
             "backend_pre_run_ms",
+            "readiness_attach_ms",
+            "readiness_connect_request_delivered_ms",
+            "readiness_connect_ms",
+            "readiness_request_delivered_ms",
+            "readiness_guest_timing_ms",
+            "readiness_response_ms",
+            "readiness_ready_ms",
             "first_noop_exec_ms",
             "repeated_exec_median_ms",
             "cleanup_ms",

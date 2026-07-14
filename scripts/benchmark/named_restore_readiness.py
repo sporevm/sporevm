@@ -26,6 +26,7 @@ from typing import Any, Iterator
 ROW_SCHEMA = "spore.named-restore-readiness.v2"
 EVIDENCE_SCHEMA = "spore.named-restore-readiness-evidence.v1"
 RESTORE_METRICS_RE = re.compile(r"(?P<backend>kvm|hvf) restore metrics: (?P<fields>.+)")
+READINESS_METRICS_RE = re.compile(r"monitor readiness metrics: (?P<fields>.+)")
 PROOF_METRICS_RE = re.compile(r"local RAM backing proof metrics: (?P<fields>.+)")
 PINNED_IMAGE_RE = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
 MEMORY_RE = re.compile(r"^(?P<value>[1-9][0-9]*)(?P<unit>mb|mib)$", re.IGNORECASE)
@@ -114,6 +115,10 @@ def parse_restore_metrics_all(stderr: str) -> list[dict[str, object]]:
         fields["backend"] = match.group("backend")
         metrics.append(fields)
     return metrics
+
+
+def parse_readiness_metrics(stderr: str) -> list[dict[str, object]]:
+    return [parse_fields(match.group("fields")) for match in READINESS_METRICS_RE.finditer(stderr)]
 
 
 def parse_proof_metrics(stderr: str, operation: str | None = None) -> list[dict[str, object]]:
@@ -380,6 +385,15 @@ def cleanup_named(
 def read_monitor_log(runtime_dir: pathlib.Path, name: str) -> str:
     logs = list(runtime_dir.rglob(f"{name}/monitor.log"))
     return "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in logs)
+
+
+def read_monitor_timing(runtime_dir: pathlib.Path, name: str) -> dict[str, object]:
+    path = runtime_dir / "vms" / name / "monitor-timing.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def normalize_paths(value: object, aliases: dict[str, str]) -> object:
@@ -722,6 +736,10 @@ def lane_summary(rows: list[dict[str, object]]) -> dict[str, object]:
         "backend_memory_ms",
         "backend_state_ms",
         "backend_pre_run_ms",
+        "readiness_connect_request_delivered_ms",
+        "readiness_connect_ms",
+        "readiness_response_ms",
+        "readiness_ready_ms",
         "run_from_noop_ms",
         "first_noop_exec_ms",
         "repeated_exec_median_ms",
@@ -848,6 +866,19 @@ def self_test() -> None:
         "kvm restore metrics: mode=eager_chunks ram_mib=1 memory_ms=1 state_ms=1 pre_run_ms=1\n"
         "kvm restore metrics: mode=local_backing ram_mib=1 memory_ms=0 state_ms=1 pre_run_ms=1"
     )) == 2
+    readiness = parse_readiness_metrics(
+        "info: monitor readiness metrics: attach_ms=0 connect_request_delivered_ms=1 "
+        "connect_ms=4 request_delivered_ms=5 guest_timing_ms=6 response_ms=7 ready_ms=8"
+    )
+    assert readiness == [{
+        "attach_ms": 0,
+        "connect_request_delivered_ms": 1,
+        "connect_ms": 4,
+        "request_delivered_ms": 5,
+        "guest_timing_ms": 6,
+        "response_ms": 7,
+        "ready_ms": 8,
+    }]
     proof = parse_proof_metrics(
         "debug: local RAM backing proof metrics: operation=validate status=ok source=local_backing "
         "reason=proof_valid schema=2 verity=sha256 validation_us=91 precharge_us=7",

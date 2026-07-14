@@ -492,6 +492,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     const start_ms = try monotonicMs();
     if (restore_stats) |*stats| {
         stats.pre_run_ms = start_ms - stats.start_ms;
+        if (config.exec_probe) |probe| probe.setBackendRestoreMetrics(stats.memory_ms, stats.state_ms, stats.pre_run_ms);
         std.log.info(
             "kvm restore metrics: mode={s} ram_mib={d} chunks={d} nonzero_chunks={d} manifest_ms={d} map_ram_ms={d} memory_ms={d} state_ms={d} pre_run_ms={d}",
             .{
