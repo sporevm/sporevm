@@ -2042,6 +2042,7 @@ fn unpackDiskIndexForManifest(
     out_dir: []const u8,
     disk_opt: ?spore.Disk,
 ) Error!void {
+    _ = io;
     const disk = disk_opt orelse return;
     const storage = try diskStorageDescriptor(disk);
     const index_rel_path = try rootfsStorageIndexRelPath(allocator, storage.index_digest);
@@ -2059,11 +2060,19 @@ fn unpackDiskIndexForManifest(
         defer allocator.free(object_data);
 
         const dest_object_path = rootfs_cas.manifestObjectPath(allocator, out_dir, chunk_entry.digest) catch |err| return rootfsError(err);
-        _ = rootfs_cas.installChunkPath(allocator, io, dest_object_path, object_data, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
+        const dest_object_parent = std.fs.path.dirname(dest_object_path) orelse return error.BadManifest;
+        chunk_sealer.ensureDirPath(allocator, dest_object_parent) catch |err| return rootfsError(err);
+        // The bundle read above verified these exact bytes against the
+        // descriptor-selected digest. Publish that allocation directly.
+        chunk_sealer.writeFileAtomicDurable(allocator, dest_object_path, object_data, 0o444) catch |err| return rootfsError(err);
     }
 
     const dest_index_path = rootfs_cas.manifestIndexPath(allocator, out_dir, storage.index_digest) catch |err| return rootfsError(err);
-    _ = rootfs_cas.installStorageIndexPath(allocator, io, dest_index_path, index_bytes, storage) catch |err| return rootfsError(err);
+    const dest_index_parent = std.fs.path.dirname(dest_index_path) orelse return error.BadManifest;
+    chunk_sealer.ensureDirPath(allocator, dest_index_parent) catch |err| return rootfsError(err);
+    // readVerifiedStorageIndexPath and parseRootfsDiskIndexForStorage already
+    // authenticated and validated these exact bytes after all objects.
+    chunk_sealer.writeFileAtomicDurable(allocator, dest_index_path, index_bytes, 0o444) catch |err| return rootfsError(err);
 }
 
 fn diskStorageDescriptor(disk: spore.Disk) Error!spore.RootfsStorage {
