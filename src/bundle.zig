@@ -1825,7 +1825,10 @@ fn unpackRootfsStorageIndexed(
     defer cache_lock.deinit();
     const cache_storage_marked = rootfs_cas.storageMarkedComplete(options.io, allocator, cache_root, storage) catch |err| return rootfsError(err);
     const cache_storage_complete = cache_storage_marked and (rootfs_cas.storageContentComplete(options.io, allocator, cache_root, storage) catch |err| return rootfsError(err));
-    if (cache_storage_marked and !cache_storage_complete) {
+    // A malformed stamp or index makes storageMarkedComplete return false, so
+    // remove any physical stamp on every incomplete path before repairing CAS
+    // entries. A missing stamp is a cheap no-op.
+    if (!cache_storage_complete) {
         rootfs_cas.removeStorageCompleteStamp(options.io, allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
     }
 
@@ -1855,7 +1858,7 @@ fn unpackRootfsStorageIndexed(
             result.bytes_reused += @intCast(object_data.len);
         } else {
             const cache_object_path = rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest) catch |err| return rootfsError(err);
-            const installed_object = rootfs_cas.installChunkPath(allocator, options.io, cache_object_path, object_data, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
+            const installed_object = rootfs_cas.installChunkPathRepairingInvalid(allocator, options.io, cache_object_path, object_data, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
             if (installed_object.cache_hit) {
                 result.cache_hit_count += 1;
                 result.bytes_reused += @intCast(object_data.len);
@@ -1876,7 +1879,7 @@ fn unpackRootfsStorageIndexed(
         result.cache_hit_count += 1;
         result.bytes_reused += @intCast(index_bytes.len);
     } else {
-        const installed_index = rootfs_cas.installStorageIndexPath(allocator, options.io, cache_index_path, index_bytes, storage) catch |err| return rootfsError(err);
+        const installed_index = rootfs_cas.installStorageIndexPathRepairingInvalid(allocator, options.io, cache_index_path, index_bytes, storage) catch |err| return rootfsError(err);
         if (installed_index.cache_hit) {
             result.cache_hit_count += 1;
             result.bytes_reused += @intCast(index_bytes.len);
@@ -5483,6 +5486,7 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     const corrupt_unpack_out_dir = try pathZ(arena, "{s}/corrupt-unpack", .{root_dir});
     const out_dir = try pathZ(arena, "{s}/pulled-child", .{root_dir});
     const out_cached_dir = try pathZ(arena, "{s}/pulled-cached-child", .{root_dir});
+    const out_repaired_dir = try pathZ(arena, "{s}/pulled-repaired-child", .{root_dir});
     const out_bad_dir = try pathZ(arena, "{s}/pulled-bad-child", .{root_dir});
     const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
     const single_rootfs_cache = try pathZ(arena, "{s}/single-rootfs-cache", .{root_dir});
@@ -5631,6 +5635,32 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled_cached.materialization.cache.bytes_reused);
     const repaired_cached_object = try rootfs_cas.readVerifiedChunkPath(arena, missing_cached_object, repair_entry.digest, spore.disk_chunk_size);
     try std.testing.expectEqual(@as(usize, spore.disk_chunk_size), repaired_cached_object.len);
+
+    // A completed cache can contain a structurally invalid regular file after
+    // truncation or an interrupted external repair. Keep the old stamp present
+    // to prove pull removes it before atomically replacing both invalid entries.
+    const cached_index_path = try rootfs_cas.manifestIndexPath(arena, pull_rootfs_cache, storage.index_digest);
+    const cached_stamp_path = try rootfs_cas.storageCompleteStampPath(arena, pull_rootfs_cache, storage.index_digest);
+    try Io.Dir.cwd().deleteFile(io, missing_cached_object);
+    try writeFileAll(try arena.dupeZ(u8, missing_cached_object), "truncated");
+    try Io.Dir.cwd().deleteFile(io, cached_index_path);
+    try writeFileAll(try arena.dupeZ(u8, cached_index_path), "{}");
+    try std.testing.expect(try pathExistsNoSymlink(io, cached_stamp_path));
+    try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
+
+    _ = try pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out_repaired_dir,
+        .rootfs_cache_dir = pull_rootfs_cache,
+        .bundle_cache_dir = pull_bundle_cache,
+        .child_id = "000000",
+    });
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
+    const repaired_truncated_object = try rootfs_cas.readVerifiedChunkPath(arena, missing_cached_object, repair_entry.digest, spore.disk_chunk_size);
+    try std.testing.expectEqual(@as(usize, spore.disk_chunk_size), repaired_truncated_object.len);
+    const repaired_index = try rootfs_cas.readVerifiedStorageIndexPath(arena, cached_index_path, storage);
+    try std.testing.expectEqualStrings(source_index_bytes, repaired_index);
 
     // Chunked pulls eagerly assemble the flat digest-addressed artifact from
     // the installed verified chunks; it is the only runtime base source.
