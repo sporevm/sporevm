@@ -71,16 +71,19 @@ pub const MergedEntry = struct {
 };
 
 const FileInodeMap = std.AutoHashMap(u64, FileSource);
+const FileLinkCountMap = std.AutoHashMap(u64, usize);
 
 pub const MergedTree = struct {
     entries: std.StringHashMap(MergedEntry),
     file_sources: FileInodeMap,
+    file_link_counts: FileLinkCountMap,
     next_inode_id: u64 = 1,
 
     pub fn init(allocator: std.mem.Allocator) MergedTree {
         return .{
             .entries = std.StringHashMap(MergedEntry).init(allocator),
             .file_sources = FileInodeMap.init(allocator),
+            .file_link_counts = FileLinkCountMap.init(allocator),
         };
     }
 
@@ -95,6 +98,7 @@ pub const MergedTree = struct {
         var files = self.file_sources.valueIterator();
         while (files.next()) |source| source.deinit(allocator);
         self.file_sources.deinit();
+        self.file_link_counts.deinit();
     }
 
     pub fn fileSource(self: *const MergedTree, inode_id: u64) !FileSource {
@@ -890,6 +894,10 @@ fn prepareMergedPath(
 ) !void {
     if (tree.entries.get(rel)) |entry| {
         if (incoming == .directory and entry.kind == .directory) return;
+        if (entry.kind != .directory) {
+            try removeMergedPath(allocator, tree, rel);
+            return;
+        }
         try removeMergedSubtree(allocator, tree, rel);
     }
 }
@@ -952,9 +960,17 @@ fn putMergedEntry(allocator: std.mem.Allocator, tree: *MergedTree, rel: []const 
     const result = try tree.entries.getOrPut(key);
     if (result.found_existing) {
         allocator.free(key);
-        deinitMergedEntry(allocator, result.value_ptr.*);
+        releaseMergedEntry(allocator, tree, result.value_ptr.*);
     }
     result.value_ptr.* = entry;
+    if (entry.kind == .file) {
+        const count = try tree.file_link_counts.getOrPut(entry.inode_id);
+        if (count.found_existing) {
+            count.value_ptr.* += 1;
+        } else {
+            count.value_ptr.* = 1;
+        }
+    }
 }
 
 fn removeMergedSubtree(allocator: std.mem.Allocator, tree: *MergedTree, rel: []const u8) !void {
@@ -995,10 +1011,19 @@ fn removeMergedLowerChildren(
 fn removeMergedPath(allocator: std.mem.Allocator, tree: *MergedTree, rel: []const u8) !void {
     const removed = tree.entries.fetchRemove(rel) orelse return;
     defer allocator.free(removed.key);
-    defer deinitMergedEntry(allocator, removed.value);
-    if (removed.value.kind == .file and !treeHasInode(tree, removed.value.inode_id)) {
-        if (tree.file_sources.fetchRemove(removed.value.inode_id)) |source| source.value.deinit(allocator);
-    }
+    releaseMergedEntry(allocator, tree, removed.value);
+}
+
+fn releaseMergedEntry(allocator: std.mem.Allocator, tree: *MergedTree, entry: MergedEntry) void {
+    defer deinitMergedEntry(allocator, entry);
+    if (entry.kind != .file) return;
+
+    const count = tree.file_link_counts.getPtr(entry.inode_id) orelse return;
+    std.debug.assert(count.* != 0);
+    count.* -= 1;
+    if (count.* != 0) return;
+    _ = tree.file_link_counts.remove(entry.inode_id);
+    if (tree.file_sources.fetchRemove(entry.inode_id)) |source| source.value.deinit(allocator);
 }
 
 fn normalizeMergedHardlinkMetadata(
@@ -1024,14 +1049,6 @@ fn normalizeMergedHardlinkMetadata(
 fn deinitMergedEntry(allocator: std.mem.Allocator, entry: MergedEntry) void {
     if (entry.kind == .symlink) allocator.free(entry.symlink_target);
     xattrs_mod.freeAttributes(allocator, entry.xattrs);
-}
-
-fn treeHasInode(tree: *const MergedTree, inode_id: u64) bool {
-    var it = tree.entries.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.kind == .file and entry.value_ptr.inode_id == inode_id) return true;
-    }
-    return false;
 }
 
 fn isMergedDescendant(parent: []const u8, path: []const u8) bool {
@@ -2559,6 +2576,95 @@ test "merged tree applies whiteouts and hardlinks" {
     const data = try readFileSourceAlloc(allocator, io, source);
     defer allocator.free(data);
     try std.testing.expectEqualStrings("same", data);
+}
+
+test "merged tree retains hardlink sources until the final path is removed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-merged-tree-hardlink-lifetime";
+    const layer1 = tmp ++ "/layer1.tar";
+    const layer2 = tmp ++ "/layer2.tar";
+    const layer3 = tmp ++ "/layer3.tar";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    var first = std.ArrayList(u8).empty;
+    defer first.deinit(allocator);
+    try appendTestTarEntry(allocator, &first, "target", '0', "same", null);
+    try appendTestTarEntry(allocator, &first, "alias", '1', "", "target");
+    try finishTestTar(allocator, &first);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer1, .data = first.items });
+
+    var second = std.ArrayList(u8).empty;
+    defer second.deinit(allocator);
+    try appendTestTarEntry(allocator, &second, ".wh.target", '0', "", null);
+    try finishTestTar(allocator, &second);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer2, .data = second.items });
+
+    var third = std.ArrayList(u8).empty;
+    defer third.deinit(allocator);
+    try appendTestTarEntry(allocator, &third, ".wh.alias", '0', "", null);
+    try finishTestTar(allocator, &third);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer3, .data = third.items });
+
+    var tree = MergedTree.init(allocator);
+    defer tree.deinit(allocator);
+    try applyLayerToMergedTree(allocator, io, &tree, .{ .media_type = "application/vnd.oci.image.layer.v1.tar", .path = layer1 });
+    try std.testing.expectEqual(@as(usize, 1), tree.file_sources.count());
+    const target = tree.entries.get("target") orelse return error.BadManifest;
+    try std.testing.expectEqual(@as(usize, 2), tree.file_link_counts.get(target.inode_id).?);
+
+    try applyLayerToMergedTree(allocator, io, &tree, .{ .media_type = "application/vnd.oci.image.layer.v1.tar", .path = layer2 });
+    try std.testing.expect(tree.entries.get("target") == null);
+    const alias = tree.entries.get("alias") orelse return error.BadManifest;
+    const alias_data = try readFileSourceAlloc(allocator, io, try tree.fileSource(alias.inode_id));
+    defer allocator.free(alias_data);
+    try std.testing.expectEqualStrings("same", alias_data);
+    try std.testing.expectEqual(@as(usize, 1), tree.file_link_counts.get(alias.inode_id).?);
+
+    try applyLayerToMergedTree(allocator, io, &tree, .{ .media_type = "application/vnd.oci.image.layer.v1.tar", .path = layer3 });
+    try std.testing.expectEqual(@as(usize, 0), tree.file_sources.count());
+    try std.testing.expectEqual(@as(usize, 0), tree.file_link_counts.count());
+}
+
+test "merged tree replaces a file without scanning or removing siblings" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-merged-tree-file-replacement";
+    const layer1 = tmp ++ "/layer1.tar";
+    const layer2 = tmp ++ "/layer2.tar";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    var first = std.ArrayList(u8).empty;
+    defer first.deinit(allocator);
+    try appendTestTarEntry(allocator, &first, "app/target", '0', "old", null);
+    try appendTestTarEntry(allocator, &first, "app/sibling", '0', "keep", null);
+    try finishTestTar(allocator, &first);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer1, .data = first.items });
+
+    var second = std.ArrayList(u8).empty;
+    defer second.deinit(allocator);
+    try appendTestTarEntry(allocator, &second, "app/target", '0', "new", null);
+    try finishTestTar(allocator, &second);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer2, .data = second.items });
+
+    var tree = MergedTree.init(allocator);
+    defer tree.deinit(allocator);
+    try applyLayerToMergedTree(allocator, io, &tree, .{ .media_type = "application/vnd.oci.image.layer.v1.tar", .path = layer1 });
+    try applyLayerToMergedTree(allocator, io, &tree, .{ .media_type = "application/vnd.oci.image.layer.v1.tar", .path = layer2 });
+
+    const target = tree.entries.get("app/target") orelse return error.BadManifest;
+    const target_data = try readFileSourceAlloc(allocator, io, try tree.fileSource(target.inode_id));
+    defer allocator.free(target_data);
+    try std.testing.expectEqualStrings("new", target_data);
+
+    const sibling = tree.entries.get("app/sibling") orelse return error.BadManifest;
+    const sibling_data = try readFileSourceAlloc(allocator, io, try tree.fileSource(sibling.inode_id));
+    defer allocator.free(sibling_data);
+    try std.testing.expectEqualStrings("keep", sibling_data);
+    try std.testing.expectEqual(@as(usize, 2), tree.file_sources.count());
+    try std.testing.expectEqual(@as(usize, 2), tree.file_link_counts.count());
 }
 
 test "merged tree spools gzip layers to file sources" {

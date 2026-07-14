@@ -853,6 +853,10 @@ fn accumulateExecutorDiagnostic(current: *build_exec.Diagnostic, previous: build
     current.resize_count += previous.resize_count;
     current.boot_artifact_file_reads += previous.boot_artifact_file_reads;
     current.boot_artifact_bytes_read += previous.boot_artifact_bytes_read;
+    current.session_ms += previous.session_ms;
+    current.instruction_ms += previous.instruction_ms;
+    current.checkpoint_control_ms += previous.checkpoint_control_ms;
+    current.snapshot_ms += previous.snapshot_ms;
     current.max_checkpoint_control_ms = @max(current.max_checkpoint_control_ms, previous.max_checkpoint_control_ms);
 }
 
@@ -863,6 +867,10 @@ test "executor diagnostics aggregate artifact reads across sessions" {
         .resize_count = 1,
         .boot_artifact_file_reads = 4,
         .boot_artifact_bytes_read = 400,
+        .session_ms = 40,
+        .instruction_ms = 30,
+        .checkpoint_control_ms = 20,
+        .snapshot_ms = 10,
         .max_checkpoint_control_ms = 7,
     };
     accumulateExecutorDiagnostic(&current, .{
@@ -871,6 +879,10 @@ test "executor diagnostics aggregate artifact reads across sessions" {
         .resize_count = 2,
         .boot_artifact_file_reads = 8,
         .boot_artifact_bytes_read = 800,
+        .session_ms = 80,
+        .instruction_ms = 60,
+        .checkpoint_control_ms = 40,
+        .snapshot_ms = 20,
         .max_checkpoint_control_ms = 11,
     });
     try std.testing.expectEqual(@as(usize, 8), current.executed_steps);
@@ -878,6 +890,10 @@ test "executor diagnostics aggregate artifact reads across sessions" {
     try std.testing.expectEqual(@as(usize, 3), current.resize_count);
     try std.testing.expectEqual(@as(usize, 12), current.boot_artifact_file_reads);
     try std.testing.expectEqual(@as(usize, 1200), current.boot_artifact_bytes_read);
+    try std.testing.expectEqual(@as(u64, 120), current.session_ms);
+    try std.testing.expectEqual(@as(u64, 90), current.instruction_ms);
+    try std.testing.expectEqual(@as(u64, 60), current.checkpoint_control_ms);
+    try std.testing.expectEqual(@as(u64, 30), current.snapshot_ms);
     try std.testing.expectEqual(@as(u64, 11), current.max_checkpoint_control_ms);
 }
 

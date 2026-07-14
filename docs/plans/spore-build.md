@@ -1371,6 +1371,20 @@ Repeating an input key after a forced execution now atomically replaces only
 the derived step mapping, while rootfs CAS indexes and objects retain immutable
 publication.
 
+Performance follow-up (2026-07-14): profiling the current 64 MiB
+`buildkite-sporevm` context against its 3 GiB OCI base found one 8.8 MiB layer
+spending 13.28s replacing 1,538 existing regular files. Each replacement
+scanned all 211,136 merged entries both for subtree removal and file-source
+liveness. Non-directory replacement now removes the exact path, while
+per-inode link counts preserve hardlink source lifetime; the layer fell to
+27ms and total layer merge fell from 15.31s to 1.83s with the same final
+rootfs identity. `SPOREVM_ROOTFS_BUILD_PROFILE=1` reports per-layer merge
+timing, and executor diagnostics separate guest instruction, snapshot,
+checkpoint-control, and remaining session time. An empty isolated cache must
+still emit and seal the complete ext4/CAS artifact before publication, so that
+first-use write remains distinct from BuildKit's already-unpacked local base
+snapshot.
+
 **Stop/go gate:** passed on 2026-07-13 at exact head `79ffbb2`. Buildkite
 #1317 passed the exact Linux and macOS unit graphs plus Linux BuildKit
 conformance. The complete local graph passed all 18 build steps with
