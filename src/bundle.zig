@@ -1810,6 +1810,7 @@ fn unpackRootfsStorageIndexed(
     // stamps remain hidden until every referenced object is durable.
     var cache_lock = rootfs_mod.lockRootfsCacheExclusive(options.io, allocator, cache_root) catch |err| return rootfsError(err);
     defer cache_lock.deinit();
+    const cache_storage_complete = rootfs_cas.storageMarkedComplete(options.io, allocator, cache_root, storage) catch |err| return rootfsError(err);
 
     var seen_objects = std.StringHashMap(void).init(allocator);
     defer seen_objects.deinit();
@@ -1832,14 +1833,19 @@ fn unpackRootfsStorageIndexed(
         // descriptor-selected digest. Publish that allocation directly instead
         // of hashing it before and after the durable write.
         chunk_sealer.writeFileAtomicDurable(allocator, local_object_path, object_data, 0o444) catch |err| return rootfsError(err);
-        const cache_object_path = rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest) catch |err| return rootfsError(err);
-        const installed_object = rootfs_cas.installChunkPath(allocator, options.io, cache_object_path, object_data, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
-        if (installed_object.cache_hit) {
+        if (cache_storage_complete) {
             result.cache_hit_count += 1;
             result.bytes_reused += @intCast(object_data.len);
         } else {
-            result.cache_miss_count += 1;
-            result.bytes_fetched += installed_object.bytes_fetched;
+            const cache_object_path = rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest) catch |err| return rootfsError(err);
+            const installed_object = rootfs_cas.installChunkPath(allocator, options.io, cache_object_path, object_data, chunk_entry.digest, expected_size) catch |err| return rootfsError(err);
+            if (installed_object.cache_hit) {
+                result.cache_hit_count += 1;
+                result.bytes_reused += @intCast(object_data.len);
+            } else {
+                result.cache_miss_count += 1;
+                result.bytes_fetched += installed_object.bytes_fetched;
+            }
         }
         result.payload_bytes += @intCast(object_data.len);
     }
@@ -1849,16 +1855,23 @@ fn unpackRootfsStorageIndexed(
     // readVerifiedStorageIndexPath and parseRootfsDiskIndexForStorage already
     // authenticated and validated these exact bytes before object publication.
     chunk_sealer.writeFileAtomicDurable(allocator, local_index_path, index_bytes, 0o444) catch |err| return rootfsError(err);
-    const installed_index = rootfs_cas.installStorageIndexPath(allocator, options.io, cache_index_path, index_bytes, storage) catch |err| return rootfsError(err);
-    if (installed_index.cache_hit) {
+    if (cache_storage_complete) {
         result.cache_hit_count += 1;
         result.bytes_reused += @intCast(index_bytes.len);
     } else {
-        result.cache_miss_count += 1;
-        result.bytes_fetched += installed_index.bytes_fetched;
+        const installed_index = rootfs_cas.installStorageIndexPath(allocator, options.io, cache_index_path, index_bytes, storage) catch |err| return rootfsError(err);
+        if (installed_index.cache_hit) {
+            result.cache_hit_count += 1;
+            result.bytes_reused += @intCast(index_bytes.len);
+        } else {
+            result.cache_miss_count += 1;
+            result.bytes_fetched += installed_index.bytes_fetched;
+        }
     }
     rootfs_cas.markStorageComplete(options.io, allocator, options.out_dir, storage.index_digest) catch |err| return rootfsError(err);
-    rootfs_cas.markStorageComplete(options.io, allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
+    if (!cache_storage_complete) {
+        rootfs_cas.markStorageComplete(options.io, allocator, cache_root, storage.index_digest) catch |err| return rootfsError(err);
+    }
     // The flat digest-addressed artifact is the only runtime base source;
     // assemble it eagerly from the just-installed verified chunks so the
     // first resume of a pulled child does not pay the assembly cost.
