@@ -123,14 +123,10 @@ const State = struct {
     producer: ?build_exec.Producer = null,
     env: std.array_list.Managed([]const u8),
     args: std.array_list.Managed(ArgValue),
-    // BuildKit applies ARG values to effective LLB state without publishing
-    // them in image Config.Env. PATH needs this provenance because every stage
-    // also carries a published builder-default PATH.
-    path_arg_override: ?[]const u8 = null,
-    // BuildKit keeps ARG values in effective build state without publishing
-    // them in image Config.Env. HOME needs the same instruction-order
-    // provenance so root RUN can additionally normalize absent/empty values.
-    home_arg_override: ?[]const u8 = null,
+    // ARG values participate in effective build state according to instruction
+    // order without being published in image Config.Env. A later ENV for the
+    // same key clears the effective ARG override.
+    arg_overrides: std.array_list.Managed(ArgValue),
     workdir: []const u8 = "/",
     entrypoint: ?[]const []const u8 = null,
     cmd: ?[]const []const u8 = null,
@@ -142,8 +138,7 @@ const StageArtifact = struct {
     storage: spore.RootfsStorage,
     config: rootfs_mod.ImageConfig,
     args: []const ArgValue = &.{},
-    path_arg_override: ?[]const u8 = null,
-    home_arg_override: ?[]const u8 = null,
+    arg_overrides: []const ArgValue = &.{},
 };
 
 const StageCopyBinding = struct {
@@ -288,8 +283,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
             .scratch => try scratchArtifact(init, allocator, cache_root, options.platform, &diagnostic.scratch),
         };
         var state = try stateFromBase(allocator, base_artifact.config, base_artifact.storage, base_artifact.args, try buildDiskGrowTarget(base_artifact.storage));
-        state.path_arg_override = base_artifact.path_arg_override;
-        state.home_arg_override = base_artifact.home_arg_override;
+        for (base_artifact.arg_overrides) |arg| try putArg(allocator, &state.arg_overrides, arg.key, arg.value);
         state.producer = shared_producer;
         const stage_inputs = try prepareStageInputs(allocator, diagnostic, planned_stage, artifacts, resolved_copy_bases[stage_index]);
         const built = try buildStage(init, allocator, options, diagnostic, ctx, &stat_cache, global_args.items, planned_stage.source.instructions, stage_inputs, state, build_cache_lock);
@@ -300,8 +294,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
             .storage = try spore.cloneRootfsStorage(allocator, state.storage),
             .config = try imageConfig(allocator, options.platform, state),
             .args = try cloneArgs(allocator, state.args.items),
-            .path_arg_override = state.path_arg_override,
-            .home_arg_override = state.home_arg_override,
+            .arg_overrides = try cloneArgs(allocator, state.arg_overrides.items),
         };
     }
     const final_artifact = artifacts[plan.target_index] orelse return error.BadManifest;
@@ -727,6 +720,7 @@ fn normalizeBuildImageRef(allocator: std.mem.Allocator, source: []const u8) ![]c
 fn stateFromBase(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig, storage: spore.RootfsStorage, inherited_args: []const ArgValue, disk_grow_target: u64) !State {
     var env = std.array_list.Managed([]const u8).init(allocator);
     var args = std.array_list.Managed(ArgValue).init(allocator);
+    const arg_overrides = std.array_list.Managed(ArgValue).init(allocator);
     for (inherited_args) |arg| try args.append(.{
         .key = try allocator.dupe(u8, arg.key),
         .value = if (arg.value) |value| try allocator.dupe(u8, value) else null,
@@ -740,6 +734,7 @@ fn stateFromBase(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig, s
             .disk_grow_target = disk_grow_target,
             .env = env,
             .args = args,
+            .arg_overrides = arg_overrides,
             .workdir = if (runtime.WorkingDir) |dir| if (dir.len == 0) "/" else try allocator.dupe(u8, dir) else "/",
             .entrypoint = if (runtime.Entrypoint) |entrypoint| try cloneStringList(allocator, entrypoint) else null,
             .cmd = if (runtime.Cmd) |cmd| try cloneStringList(allocator, cmd) else null,
@@ -747,7 +742,7 @@ fn stateFromBase(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig, s
         };
     }
     try env.append(default_linux_path);
-    return .{ .storage = try spore.cloneRootfsStorage(allocator, storage), .disk_grow_target = disk_grow_target, .env = env, .args = args };
+    return .{ .storage = try spore.cloneRootfsStorage(allocator, storage), .disk_grow_target = disk_grow_target, .env = env, .args = args, .arg_overrides = arg_overrides };
 }
 
 fn cloneArgs(allocator: std.mem.Allocator, args: []const ArgValue) ![]const ArgValue {
@@ -772,8 +767,7 @@ fn applyMetadataInstruction(
                 const key = try substituteState(allocator, pair.key, state.*);
                 const value = try substituteState(allocator, pair.value, state.*);
                 try putEnv(allocator, &state.env, key, value);
-                if (std.mem.eql(u8, key, "PATH")) state.path_arg_override = null;
-                if (std.mem.eql(u8, key, "HOME")) state.home_arg_override = null;
+                removeArg(&state.arg_overrides, key);
             }
         },
         .cmd => |cmd| {
@@ -788,8 +782,11 @@ fn applyMetadataInstruction(
         },
         .arg => |arg| {
             try declareArg(allocator, options.build_args, pre_from_args, &state.args, arg);
-            if (std.mem.eql(u8, arg.key, "PATH")) state.path_arg_override = lookupArg("PATH", state.args.items);
-            if (std.mem.eql(u8, arg.key, "HOME")) state.home_arg_override = lookupArg("HOME", state.args.items);
+            if (lookupArg(arg.key, state.args.items)) |value| {
+                try putArg(allocator, &state.arg_overrides, arg.key, value);
+            } else {
+                removeArg(&state.arg_overrides, arg.key);
+            }
         },
         else => return false,
     }
@@ -892,17 +889,36 @@ fn runStep(
     run: dockerfile.Run,
     options: Options,
 ) !build_exec.RunStep {
-    if (run.shell.len > build_exec.max_run_command_len) {
-        diagnostic.instruction_line = instruction.line;
-        diagnostic.limit = build_exec.max_run_command_len;
-        diagnostic.actual = run.shell.len;
-        return error.RunCommandTooLong;
+    switch (run) {
+        .shell => |shell| if (shell.len > build_exec.max_run_command_len) {
+            diagnostic.instruction_line = instruction.line;
+            diagnostic.limit = build_exec.max_run_command_len;
+            diagnostic.actual = shell.len;
+            return error.RunCommandTooLong;
+        },
+        .exec => |argv| {
+            if (argv.len == 0 or argv.len > build_exec.max_run_exec_args) {
+                diagnostic.instruction_line = instruction.line;
+                diagnostic.limit = build_exec.max_run_exec_args;
+                diagnostic.actual = argv.len;
+                return error.RunArgCountUnsupported;
+            }
+        },
     }
+    const command: build_exec.RunCommand = switch (run) {
+        .shell => |shell| .{ .shell = shell },
+        .exec => |argv| .{ .exec = argv },
+    };
+    const env = try runEnvironment(allocator, state);
+    build_exec.validateRunRequest(allocator, command, env, state.workdir, runResources(options).nofile) catch |err| {
+        diagnostic.instruction_line = instruction.line;
+        return err;
+    };
     return .{
         .line = instruction.line,
         .canonical_instruction = instruction.raw,
-        .command = run.shell,
-        .env = try runEnvironment(allocator, state),
+        .command = command,
+        .env = env,
         .env_digest = try effectiveRunEnvDigest(allocator, state),
         .workdir = state.workdir,
         .network_mode = options.network,
@@ -971,20 +987,19 @@ fn runEnvironment(allocator: std.mem.Allocator, state: State) ![]const []const u
 fn effectiveStateEnv(allocator: std.mem.Allocator, state: State) ![]const []const u8 {
     var entries = std.array_list.Managed([]const u8).init(allocator);
     try entries.appendSlice(state.env.items);
-    if (state.path_arg_override) |value| try putEnv(allocator, &entries, "PATH", value);
-    if (state.home_arg_override) |value| try putEnv(allocator, &entries, "HOME", value);
+    for (state.arg_overrides.items) |arg| if (arg.value) |value| try putEnv(allocator, &entries, arg.key, value);
     return entries.toOwnedSlice();
 }
 
 fn effectiveRootRunHome(state: State) []const u8 {
-    if (state.home_arg_override) |value| return if (value.len == 0) default_root_run_home_value else value;
+    if (lookupArg("HOME", state.arg_overrides.items)) |value| return if (value.len == 0) default_root_run_home_value else value;
     if (envValue(state.env.items, "HOME")) |value| return if (value.len == 0) default_root_run_home_value else value;
     if (lookupArg("HOME", state.args.items)) |value| return if (value.len == 0) default_root_run_home_value else value;
     return default_root_run_home_value;
 }
 
 fn rootRunHomeUsesDefault(state: State) bool {
-    if (state.home_arg_override) |value| return value.len == 0;
+    if (lookupArg("HOME", state.arg_overrides.items)) |value| return value.len == 0;
     if (envValue(state.env.items, "HOME")) |value| return value.len == 0;
     if (lookupArg("HOME", state.args.items)) |value| return value.len == 0;
     return true;
@@ -1086,6 +1101,15 @@ fn putArg(allocator: std.mem.Allocator, args: *std.array_list.Managed(ArgValue),
         }
     }
     try args.append(.{ .key = key, .value = if (value) |v| try allocator.dupe(u8, v) else null });
+}
+
+fn removeArg(args: *std.array_list.Managed(ArgValue), key: []const u8) void {
+    for (args.items, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg.key, key)) {
+            _ = args.orderedRemove(i);
+            return;
+        }
+    }
 }
 
 fn readCachedMetadata(allocator: std.mem.Allocator, io: Io, path: []const u8) !CachedMetadata {
@@ -1216,6 +1240,39 @@ test "run environment includes declared args after env" {
     try std.testing.expectEqualStrings(default_root_run_home, entries[4]);
 }
 
+test "ARG and ENV instruction order controls RUN state without changing image config" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\FROM scratch
+        \\ENV ORDER=from-env
+        \\ARG ORDER=from-arg
+        \\
+    , &diagnostic);
+    var state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
+    for (document.stages[0].instructions) |instruction| {
+        try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instruction));
+    }
+    try std.testing.expectEqualStrings("from-arg", envValue(try runEnvironment(arena, state), "ORDER").?);
+    try std.testing.expectEqualStrings("ORDER=from-env", (try imageConfig(arena, .{}, state)).config.?.Env.?[1]);
+
+    var later_env_diagnostic: dockerfile.Diagnostic = .{};
+    const later_env = try dockerfile.parse(arena,
+        \\FROM scratch
+        \\ARG ORDER=from-arg
+        \\ENV ORDER=from-env
+        \\
+    , &later_env_diagnostic);
+    var later_state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    for (later_env.stages[0].instructions) |instruction| {
+        try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &later_state, instruction));
+    }
+    try std.testing.expectEqualStrings("from-env", envValue(try runEnvironment(arena, later_state), "ORDER").?);
+}
+
 test "build stage defaults PATH and root RUN HOME when absent or empty" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1283,7 +1340,7 @@ test "stage PATH participates in expansion while ARG overrides only effective st
     const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
 
     try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instructions[0]));
-    try std.testing.expectEqualStrings("/toolchain/bin", state.path_arg_override.?);
+    try std.testing.expectEqualStrings("/toolchain/bin", lookupArg("PATH", state.arg_overrides.items).?);
     const arg_effective_env = try effectiveStateEnv(arena, state);
     try std.testing.expectEqualStrings("PATH=/toolchain/bin", arg_effective_env[0]);
     const arg_config = try imageConfig(arena, .{}, state);
@@ -1292,7 +1349,7 @@ test "stage PATH participates in expansion while ARG overrides only effective st
     for (instructions[1..]) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instruction));
     }
-    try std.testing.expect(state.path_arg_override == null);
+    try std.testing.expect(lookupArg("PATH", state.arg_overrides.items) == null);
     try std.testing.expectEqualStrings("PATH=/explicit/bin", state.env.items[0]);
     try std.testing.expectEqualStrings("SNAPSHOT=/toolchain/bin", state.env.items[1]);
     try std.testing.expectEqualStrings("AFTER=/explicit/bin", state.env.items[2]);
@@ -1309,7 +1366,7 @@ test "stage PATH participates in expansion while ARG overrides only effective st
     for (env_first_document.stages[0].instructions) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &env_first_state, instruction));
     }
-    try std.testing.expectEqualStrings("/effective/bin", env_first_state.path_arg_override.?);
+    try std.testing.expectEqualStrings("/effective/bin", lookupArg("PATH", env_first_state.arg_overrides.items).?);
     try std.testing.expectEqualStrings("PATH=/published/bin", env_first_state.env.items[0]);
     try std.testing.expectEqualStrings("SNAPSHOT=/effective/bin", env_first_state.env.items[1]);
     const env_first_effective = try effectiveStateEnv(arena, env_first_state);
@@ -1334,7 +1391,7 @@ test "root RUN HOME follows ENV and ARG instruction order without changing image
     for (document.stages[0].instructions) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instruction));
     }
-    try std.testing.expectEqualStrings("/arg-home", state.home_arg_override.?);
+    try std.testing.expectEqualStrings("/arg-home", lookupArg("HOME", state.arg_overrides.items).?);
     const env_then_arg = try runEnvironment(arena, state);
     try std.testing.expectEqualStrings("/arg-home", envValue(env_then_arg, "HOME").?);
     const env_then_arg_config = try imageConfig(arena, .{}, state);
@@ -1352,7 +1409,7 @@ test "root RUN HOME follows ENV and ARG instruction order without changing image
     for (later_env_document.stages[0].instructions) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &later_env_state, instruction));
     }
-    try std.testing.expect(later_env_state.home_arg_override == null);
+    try std.testing.expect(lookupArg("HOME", later_env_state.arg_overrides.items) == null);
     const arg_then_empty_env = try runEnvironment(arena, later_env_state);
     try std.testing.expectEqualStrings(default_root_run_home_value, envValue(arg_then_empty_env, "HOME").?);
     const arg_then_empty_config = try imageConfig(arena, .{}, later_env_state);
@@ -1367,6 +1424,7 @@ test "implicit root HOME transitions only affected RUN cache identities" {
         .storage = testStorage(),
         .env = std.array_list.Managed([]const u8).init(arena),
         .args = std.array_list.Managed(ArgValue).init(arena),
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
     };
     const old_digest = try effectiveEnvDigest(arena, state);
     const run_digest = try effectiveRunEnvDigest(arena, state);
@@ -1378,6 +1436,7 @@ test "implicit root HOME transitions only affected RUN cache identities" {
         .storage = testStorage(),
         .env = empty_env,
         .args = std.array_list.Managed(ArgValue).init(arena),
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
     };
     const empty_state_digest = try effectiveEnvDigest(arena, empty_state);
     const empty_run_digest = try effectiveRunEnvDigest(arena, empty_state);
@@ -1389,6 +1448,7 @@ test "implicit root HOME transitions only affected RUN cache identities" {
         .storage = testStorage(),
         .env = explicit_env,
         .args = std.array_list.Managed(ArgValue).init(arena),
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
     };
     try std.testing.expectEqualStrings(
         try effectiveEnvDigest(arena, explicit_state),
@@ -1452,14 +1512,57 @@ test "RUN executor preserves shell text for guest expansion" {
         .storage = testStorage(),
         .env = env,
         .args = args,
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
     }, instruction, instruction.value.run, .{
         .tag = "local/test:dev",
         .context_dir = "unused",
         .dockerfile_path = "unused",
     });
-    try std.testing.expectEqualStrings(shell, step.command);
+    try std.testing.expectEqualStrings(shell, step.command.shell);
     try std.testing.expectEqualStrings("APP_ENV=test", step.env[0]);
     try std.testing.expectEqualStrings("BUILD_ARG=from-arg", step.env[1]);
+}
+
+test "RUN executor preserves exact argv and effective ENV ARG state" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser_diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\FROM base
+        \\RUN ["printf","%s|%s","two words","$UNSET"]
+        \\
+    , &parser_diagnostic);
+    var env = std.array_list.Managed([]const u8).init(arena);
+    try env.append("PATH=/custom/bin:/usr/bin");
+    try env.append("INHERITED=env-value");
+    var args = std.array_list.Managed(ArgValue).init(arena);
+    try args.append(.{ .key = "BUILD_ARG", .value = "arg-value" });
+    const instruction = document.stages[0].instructions[0];
+    var diagnostic: Diagnostic = .{};
+    const step = try runStep(arena, &diagnostic, .{
+        .storage = testStorage(),
+        .env = env,
+        .args = args,
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
+    }, instruction, instruction.value.run, .{
+        .tag = "local/test:dev",
+        .context_dir = "unused",
+        .dockerfile_path = "unused",
+    });
+    try std.testing.expectEqualStrings("printf", step.command.exec[0]);
+    try std.testing.expectEqualStrings("two words", step.command.exec[2]);
+    try std.testing.expectEqualStrings("$UNSET", step.command.exec[3]);
+    try std.testing.expectEqualStrings("PATH=/custom/bin:/usr/bin", step.env[0]);
+    try std.testing.expectEqualStrings("INHERITED=env-value", step.env[1]);
+    try std.testing.expectEqualStrings("BUILD_ARG=arg-value", step.env[2]);
+
+    const original = build_exec.cacheInputForStep(.{}, testStorage().index_digest, test_executor_identity, .{ .run = step }, .{});
+    const original_key = try step_cache.stepKey(arena, original);
+    var changed = step;
+    changed.canonical_instruction = "RUN [\"printf\",\"%s|%s\",\"two words\",\"changed\"]";
+    const changed_key = try step_cache.stepKey(arena, build_exec.cacheInputForStep(.{}, testStorage().index_digest, test_executor_identity, .{ .run = changed }, .{}));
+    try std.testing.expect(!std.mem.eql(u8, original_key, changed_key));
 }
 
 test "stage config inheritance preserves entrypoint cmd user env and workdir" {
@@ -1545,6 +1648,7 @@ test "RUN cache identity includes network mode and resources" {
         .storage = testStorage(),
         .env = std.array_list.Managed([]const u8).init(arena),
         .args = std.array_list.Managed(ArgValue).init(arena),
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
     };
     const spore_options = Options{
         .tag = "local/app:dev",
@@ -1597,6 +1701,7 @@ test "WORKDIR transition resolves environment before cache lookup" {
         .storage = testStorage(),
         .env = env,
         .args = std.array_list.Managed(ArgValue).init(arena),
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
         .workdir = "/previous",
     };
     const instruction = doc.stages[0].instructions[1];
@@ -1632,6 +1737,7 @@ test "COPY cache identity ignores run-only network mode" {
         .storage = storage,
         .env = std.array_list.Managed([]const u8).init(arena),
         .args = std.array_list.Managed(ArgValue).init(arena),
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
         .workdir = "/app",
     };
     const options = Options{
@@ -1722,6 +1828,7 @@ test "COPY file source can target non-slash file destination" {
         .storage = testStorage(),
         .env = std.array_list.Managed([]const u8).init(arena),
         .args = std.array_list.Managed(ArgValue).init(arena),
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
         .workdir = "/app",
     };
     var diagnostic: Diagnostic = .{};
@@ -1764,6 +1871,7 @@ test "COPY multiple sources require trailing slash destination" {
         .storage = testStorage(),
         .env = std.array_list.Managed([]const u8).init(arena),
         .args = std.array_list.Managed(ArgValue).init(arena),
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
         .workdir = "/app",
     };
     var diagnostic: Diagnostic = .{};
@@ -1797,6 +1905,7 @@ test "COPY directory source preserves empty subdirectory entry" {
         .storage = testStorage(),
         .env = std.array_list.Managed([]const u8).init(arena),
         .args = std.array_list.Managed(ArgValue).init(arena),
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
     };
     var diagnostic: Diagnostic = .{};
     var snapshot = try build_context.CopySnapshot.init(arena, io, root);

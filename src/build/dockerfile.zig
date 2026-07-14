@@ -1,4 +1,5 @@
 const std = @import("std");
+const run_contract = @import("run_contract.zig");
 
 pub const Diagnostic = struct {
     line: usize = 0,
@@ -53,8 +54,9 @@ pub const From = struct {
     name: ?[]const u8 = null,
 };
 
-pub const Run = struct {
+pub const Run = union(enum) {
     shell: []const u8,
+    exec: []const []const u8,
 };
 
 pub const Copy = struct {
@@ -91,6 +93,8 @@ const LogicalLine = struct {
 const max_dockerfile_bytes = 1024 * 1024;
 const max_logical_line_bytes = 64 * 1024;
 const max_stages = 256;
+pub const max_run_exec_args = run_contract.max_exec_args;
+pub const max_run_exec_args_bytes = run_contract.max_exec_args_bytes;
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diagnostic: *Diagnostic) !Document {
     diagnostic.* = .{};
@@ -186,7 +190,9 @@ fn parseInstruction(
     if (asciiEql(op, "RUN")) {
         if (rest.len == 0) return fail(diagnostic, line, "RUN requires a shell command");
         if (std.mem.startsWith(u8, std.mem.trimStart(u8, rest, " \t"), "--")) return fail(diagnostic, line, "unsupported RUN flag");
-        if (std.mem.startsWith(u8, std.mem.trimStart(u8, rest, " \t"), "[")) return fail(diagnostic, line, "unsupported exec-form RUN");
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, rest, " \t"), "[")) {
+            return .{ .run = .{ .exec = try parseRunExec(allocator, rest, line, diagnostic) } };
+        }
         if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported RUN heredoc");
         return .{ .run = .{ .shell = try allocator.dupe(u8, rest) } };
     }
@@ -392,6 +398,27 @@ fn parseCmd(
     };
     defer parsed.deinit();
     return .{ .exec = try cloneStringList(allocator, parsed.value) };
+}
+
+fn parseRunExec(
+    allocator: std.mem.Allocator,
+    rest: []const u8,
+    line: usize,
+    diagnostic: *Diagnostic,
+) ![]const []const u8 {
+    const trimmed = std.mem.trimStart(u8, rest, " \t");
+    var parsed = std.json.parseFromSlice([][]const u8, allocator, trimmed, .{ .allocate = .alloc_always }) catch {
+        return fail(diagnostic, line, "RUN exec form must be a non-empty JSON string array");
+    };
+    defer parsed.deinit();
+    if (run_contract.execArgvViolation(parsed.value)) |violation| switch (violation) {
+        .empty => return fail(diagnostic, line, "RUN exec form must be a non-empty JSON string array"),
+        .empty_executable => return fail(diagnostic, line, "RUN exec form requires a non-empty executable"),
+        .too_many_args => return fail(diagnostic, line, "RUN exec form has too many arguments; limit is 16"),
+        .nul => return fail(diagnostic, line, "RUN exec form arguments cannot contain NUL bytes"),
+        .decoded_too_large => return fail(diagnostic, line, "RUN exec form arguments are too large; limit is 4096 decoded bytes"),
+    };
+    return cloneStringList(allocator, parsed.value);
 }
 
 fn splitWords(
@@ -642,6 +669,48 @@ test "Dockerfile parser leaves RUN shell expansion untouched" {
         "echo $? $(dpkg --print-architecture) \"${VERSION_CODENAME}\" '$BUILD_ARG' $$",
         doc.stages[0].instructions[0].value.run.shell,
     );
+}
+
+test "Dockerfile parser preserves bounded exec-form RUN argv" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    const doc = try parse(arena_state.allocator(),
+        \\FROM base
+        \\RUN ["printf","%s|%s|%s","two words","","$VALUE"]
+        \\
+    , &diag);
+    const argv = doc.stages[0].instructions[0].value.run.exec;
+    try std.testing.expectEqual(@as(usize, 5), argv.len);
+    try std.testing.expectEqualStrings("two words", argv[2]);
+    try std.testing.expectEqualStrings("", argv[3]);
+    try std.testing.expectEqualStrings("$VALUE", argv[4]);
+
+    const invalid = [_]struct { dockerfile: []const u8, message: []const u8 }{
+        .{ .dockerfile = "FROM base\nRUN []\n", .message = "RUN exec form must be a non-empty JSON string array" },
+        .{ .dockerfile = "FROM base\nRUN [\"\"]\n", .message = "RUN exec form requires a non-empty executable" },
+        .{ .dockerfile = "FROM base\nRUN [\"true\",1]\n", .message = "RUN exec form must be a non-empty JSON string array" },
+        .{ .dockerfile = "FROM base\nRUN [\"true\",\"\\u0000\"]\n", .message = "RUN exec form arguments cannot contain NUL bytes" },
+    };
+    for (invalid) |case| {
+        try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), case.dockerfile, &diag));
+        try std.testing.expectEqual(@as(usize, 2), diag.line);
+        try std.testing.expectEqualStrings(case.message, diag.message);
+    }
+}
+
+test "Dockerfile parser validates later exec-form RUN before returning a document" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(),
+        \\FROM base
+        \\RUN ["true"]
+        \\RUN ["false",{}]
+        \\
+    , &diag));
+    try std.testing.expectEqual(@as(usize, 3), diag.line);
+    try std.testing.expectEqualStrings("RUN exec form must be a non-empty JSON string array", diag.message);
 }
 
 test "Dockerfile parser rejects unsupported non-RUN variable expansion operators" {

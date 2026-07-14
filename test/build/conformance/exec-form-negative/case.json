@@ -1,9 +1,9 @@
 {
-  "description": "unsupported exec-form RUN fails closed with an exact diagnostic",
+  "description": "malformed exec-form RUN fails during full-file parsing with an exact diagnostic",
   "expect": {
-    "docker": "success",
+    "docker": "failure",
     "spore": "failure",
-    "spore_diagnostic": "spore build: Dockerfile line 2: unsupported exec-form RUN"
+    "spore_diagnostic": "spore build: Dockerfile line 3: RUN exec form must be a non-empty JSON string array"
   },
   "scan_prefixes": []
 }

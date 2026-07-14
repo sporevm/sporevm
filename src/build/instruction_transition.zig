@@ -359,7 +359,7 @@ test "cache walk advances the parent and reports only the miss suffix" {
         .{ .run = .{
             .line = 1,
             .canonical_instruction = "RUN true",
-            .command = "true",
+            .command = .{ .shell = "true" },
             .env = &.{},
             .env_digest = "",
             .workdir = "/",

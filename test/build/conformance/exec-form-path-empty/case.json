@@ -1,0 +1,9 @@
+{
+  "description": "exec-form RUN does not search the working directory when PATH is empty",
+  "expect": {
+    "docker": "failure",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 5: instruction failed: RUN [\"tool\"]"
+  },
+  "scan_prefixes": []
+}
