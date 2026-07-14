@@ -2,6 +2,18 @@
 
 ## Next
 
+`spore build` now accepts bounded exec-form `RUN` JSON arrays. It executes the
+decoded argv directly, preserves spaces, empty arguments, quotes, and literal
+`$NAME` text, and searches absolute entries in the effective build PATH when
+the executable contains no slash. Empty PATH and relative matches fail closed,
+matching BuildKit. ENV and ARG state, workdir, network, resources, parent
+rootfs, exact instruction text, and the embedded executor identity remain cache
+inputs, so a changed argv or effective environment misses while an unchanged
+rebuild hits.
+Malformed, empty, NUL-containing, or oversized arrays fail during full-file
+parsing before a build VM starts. Shell-form RUN remains `/bin/sh -c`; mounted
+RUN and heredocs remain unsupported.
+
 Bounded named exec now has a documented lossless JSON representation for
 arbitrary stdout and stderr bytes. Valid UTF-8 remains a JSON string, while an
 invalid UTF-8 stream is emitted as an integer byte array; Zig, C, and Go callers
@@ -191,8 +203,8 @@ virtio-blk inputs, and cache keys bind the exact source index plus the exact
 kernel, initrd, and embedded build-agent identity. Cross-stage COPY preserves
 modes, ownership, mtimes, symlinks, hardlinks within each source tree, and regular-file
 `security.capability`; every other visible `security.*` xattr fails closed.
-Mounted RUN, heredocs, exec-form RUN, advanced COPY flags, and non-root build
-execution remain unsupported.
+Mounted RUN, heredocs, advanced COPY flags, and non-root build execution remain
+unsupported.
 
 Automatic growth is limited to SporeVM's journal-less native and e2fsprogs
 ext4 profiles, or equivalent layouts accepted by the pinned guest kernel.

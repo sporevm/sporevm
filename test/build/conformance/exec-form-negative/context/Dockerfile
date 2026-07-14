@@ -1,2 +1,3 @@
 FROM base
-RUN ["/bin/sh","-c","printf negative >/oracle-negative"]
+RUN ["/bin/sh","-c","printf must-not-run >/oracle-negative"]
+RUN ["true",1]

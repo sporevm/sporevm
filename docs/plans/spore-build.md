@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-13
+last_reviewed: 2026-07-14
 spec_refs:
   - docs/rootfs.md
   - docs/filesystem.md
@@ -150,7 +150,9 @@ The missing work falls into three different categories:
   `COPY --from`, `--target`, and final `ENTRYPOINT`/`CMD` publication. COPY
   flags (`--link`, `--parents`, `--chown`, `--chmod`), `RUN --mount`, `ADD`,
   heredocs, `USER`, `VOLUME`, `EXPOSE`, `HEALTHCHECK`, and `ONBUILD` still fail
-  closed.
+  closed. C2 now also accepts bounded non-empty JSON-array `RUN` and executes
+  its exact argv with Docker-compatible PATH lookup and no implicit variable
+  expansion.
 - No replacement for the wrapper's preliminary `docker build --target ci` of
   the Buildkite app image. That Dockerfile uses `syntax=docker/dockerfile:1.20`
   features (`RUN --mount=type=cache`, `COPY --link`, remote `ADD`, heredocs)
@@ -389,22 +391,24 @@ implementing Spore's mounts or cache policy.
 
 | Instruction | Support |
 | --- | --- |
-| `FROM <name>` | named `--build-context` (oci-layout), local ref, digest ref. No `AS`, no `--platform` flag. |
-| `RUN <shell>` | shell form only, executed as `/bin/sh -c` in the guest as root. No `--mount`, no `--network`, no heredoc, no exec form in v1. |
-| `COPY <src>… <dest>` | context-relative sources, files and directories. No flags. |
+| `FROM [--platform=linux/arm64] <source> [AS <name>]` | `scratch`, previous stage, named `--build-context` (OCI layout), local ref, public registry ref, or digest ref. Other platforms fail closed. |
+| `RUN <shell>` / `RUN ["argv", …]` | shell form executes as `/bin/sh -c`; exec form preserves a bounded non-empty JSON string array and searches PATH only when argv zero contains no slash. Both run in the guest as root. No `--mount`, per-instruction `--network`, or heredoc. |
+| `COPY [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative literal sources, including files and directories. Other COPY flags fail closed. |
 | `ENV K=V` / `ENV K V` | build env + final image config. |
 | `ARG K[=default]` | value from `--build-arg` or default; unset used ARG is an error (stricter than Docker's warning; surfaced as a decision below). |
 | `WORKDIR /path` | affects `RUN` cwd, `COPY` relative dest, final config. Created in the guest if missing, matching Docker. |
 | `CMD ["…"]` / `CMD <shell>` | final image config only; both JSON exec form and shell form are supported. |
-| comments, line continuations, `${VAR}`/`$VAR` substitution in instruction arguments | Parser directives such as `# syntax=` and `# escape=` are rejected anywhere in the file, not only in Docker's leading directive window. |
+| `ENTRYPOINT ["…"]` / `ENTRYPOINT <shell>` | final image config only; both JSON exec form and shell form are supported. |
+| comments, line continuations, `${VAR}`/`$VAR` substitution in supported instruction arguments | The leading directive window accepts the stable Dockerfile syntax directive and backslash/backtick escape directives; unsupported syntax frontends fail closed. |
 
-Variable substitution applies to `ENV`, `ARG` defaults, `WORKDIR`, `COPY`
-arguments, and `CMD`, using the declared `ARG`/`ENV` state, as Docker does.
-`RUN` strings are not pre-expanded; the guest shell expands them, with
-`ARG`/`ENV` values exported into the step environment. Only `$NAME` and
-`${NAME}` substitution are in the subset; parameter-expansion operators such as
-`${NAME:-default}`, `${NAME:+alt}`, `${NAME#prefix}`, and `${NAME%suffix}` fail
-closed.
+Builder-owned variable substitution applies to `FROM`, `ENV`, `ARG` defaults,
+`WORKDIR`, and `COPY` arguments using the declared `ARG`/`ENV` state. `CMD` and
+`ENTRYPOINT` retain variables for runtime. Shell-form `RUN` is not pre-expanded;
+its guest shell sees the effective `ARG`/`ENV` environment and performs shell
+expansion. Exec-form `RUN` preserves every argv string literally. Only `$NAME`
+and `${NAME}` substitution are in the builder-owned subset; parameter operators
+such as `${NAME:-default}`, `${NAME:+alt}`, `${NAME#prefix}`, and
+`${NAME%suffix}` fail closed in those instruction fields.
 
 ## Architecture
 
@@ -573,7 +577,8 @@ Per-instruction inputs:
   `index_digest`, exact target, and producer identity. Its validated child must
   have the exact requested logical size and preserve the parent's rootfs device,
   chunk size, hash algorithm, and object namespace.
-- `RUN`: the exact command string, the current `WORKDIR`, and the network mode.
+- `RUN`: the exact canonical shell- or exec-form instruction, the current
+  `WORKDIR`, and the network mode.
   The environment digest is an ordered, length-framed sequence of accumulated
   `ENV` entries followed by typed `ARG` records (key, presence bit, value),
   including list counts. It preserves duplicate ENV order, distinguishes ENV
@@ -910,12 +915,19 @@ and enumerate one canonical full rootfs CAS index.
    control request. Continue the VM already live after a preparation miss, or
    boot the prepared child once after a preparation hit. The host drives the
    existing initrd agent over bounded `spore_stream_v1` requests:
-   - `RUN`: host sends a fixed-shape `spore-build-run-v1` request with the
+   - `RUN`: shell form sends a fixed-shape `spore-build-run-v1` request with the
      step's effective env, workdir, and command length, then sends the command
      text as a length-prefixed payload capped at 64 KiB. The driver runs
      `/bin/sh -c` as root (Docker parity: `-c`, not the `-lc` that
-     `spore run`'s shell mode uses), streams output through, and reports the
-     exit code. Network per `--network` for the whole session.
+     `spore run`'s shell mode uses). Exec form sends `spore-build-run-v2` with
+     at most 16 exact argv strings and 4 KiB of decoded argv bytes. The host
+     preflights the fully serialized request while constructing the
+     source-spanned transition. Exec form invokes no implicit shell, so `$NAME`
+     stays literal unless the argv explicitly starts a shell; a slashless
+     executable is searched through the absolute entries in the effective
+     non-empty PATH, continuing after non-executable candidates and rejecting
+     relative matches as Docker does. Both forms stream output, report the
+     exact exit code, and use the session's `--network` policy.
    - `COPY`: before boot, the host emits the resolved context entries needed
      by executed COPY steps into a cached read-only ext4 context disk and
      attaches it as an additional virtio-blk device. Per step, the host sends
@@ -974,8 +986,10 @@ read-only context or immutable build-input disks (`spore_rootfs=1
 spore_rootfs_rw=1`, with `spore_build_context=1` and/or
 `spore_build_inputs=<count>`). The initrd agent now provides the build control verbs
 (`spore-rootfs-grow-v1`, `fsfreeze-v1`, `fsthaw-v1`, `spore-build-run-v1`,
-`spore-build-copy-v3`); the target base must provide `/bin/sh` for RUN and
-nothing for capacity preparation. The guest accepts the older
+`spore-build-run-v2`,
+`spore-build-copy-v3`); the target base must provide `/bin/sh` for shell-form
+RUN and nothing for capacity preparation. Exec-form RUN instead requires only
+its selected executable. The guest accepts the older
 `spore-build-copy-v2` context-only request for compatibility. A missing RUN
 shell fails closed through the step's captured output.
 
@@ -1393,7 +1407,13 @@ ref refresh) ≤2s warm-stat; uncached COPY ≈ context-disk emit/reuse +
 guest disk-to-disk apply plus one freeze/dirty-only sealing and full-index checkpoint, with boot
 amortized per build.
 
-- exec-form RUN and full stable variable expansion;
+- **Done:** bounded exec-form RUN with exact argv, effective ENV/ARG, PATH
+  lookup, cache invalidation, and Docker/BuildKit differential coverage;
+- full stable builder-owned variable expansion, including same-instruction
+  snapshots, unset-to-empty behavior, quote/escape provenance, and the stable
+  parameter operators. Exec-form RUN is deliberately separate from that work:
+  Docker preserves its argv literally, while builder-owned expansion changes
+  the state and cache semantics of instructions such as ENV, COPY, and WORKDIR;
 - explicit `RUN --security=sandbox` as the only accepted security mode;
 - RUN and COPY heredocs;
 - `COPY --chmod`, `--chown`, `--parents`, `--exclude`, and result-correct
@@ -1587,7 +1607,8 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
   keys, not artifacts, carry determinism.
 - Default `--network spore` for RUN (Docker parity; the target Dockerfile
   needs apt/curl). `--network none` for hermetic builds.
-- `/bin/sh -c` for RUN, not `-lc` (Docker parity).
+- `/bin/sh -c` for shell-form RUN, not `-lc`; exec form runs its exact argv
+  without a shell (Docker parity).
 - The last step's `index_digest` is the final rootfs identity; the published
   local image identity additionally hashes that rootfs identity with canonical
   config JSON and still uses the existing local-ref machinery rather than

@@ -396,13 +396,19 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
             try stderr.writeAll("spore build: guest executor step timed out\n");
         },
         error.RunEnvCountUnsupported => {
-            try stderr.writeAll("spore build: RUN environment has too many entries for the guest executor\n");
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: RUN environment has too many entries for the guest executor\n", .{diagnostic.instruction_line});
+            } else try stderr.writeAll("spore build: RUN environment has too many entries for the guest executor\n");
         },
         error.RunEnvTooLong => {
-            try stderr.writeAll("spore build: RUN environment entry is too long for the guest executor\n");
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: RUN environment entry is too long for the guest executor\n", .{diagnostic.instruction_line});
+            } else try stderr.writeAll("spore build: RUN environment entry is too long for the guest executor\n");
         },
         error.RunRequestTooLarge => {
-            try stderr.writeAll("spore build: RUN request is too large for the guest executor\n");
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: resolved RUN request is too large for the guest executor\n", .{diagnostic.instruction_line});
+            } else try stderr.writeAll("spore build: RUN request is too large for the guest executor\n");
         },
         error.RunCommandTooLong => {
             if (diagnostic.instruction_line != 0 and diagnostic.limit != 0) {
@@ -413,6 +419,19 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
             } else {
                 try stderr.writeAll("spore build: RUN shell command is too long for the guest executor\n");
             }
+        },
+        error.RunArgCountUnsupported => {
+            if (diagnostic.instruction_line != 0 and diagnostic.limit != 0) {
+                try stderr.print(
+                    "spore build: Dockerfile line {d}: RUN exec form has too many arguments for the guest executor: limit={d} arguments actual={d} arguments\n",
+                    .{ diagnostic.instruction_line, diagnostic.limit, diagnostic.actual },
+                );
+            } else {
+                try stderr.writeAll("spore build: RUN exec form has an unsupported argument count\n");
+            }
+        },
+        error.RunArgUnsupported => {
+            try stderr.writeAll("spore build: RUN exec form contains an unsupported argument\n");
         },
         error.RunWorkingDirUnsupported => {
             try stderr.writeAll("spore build: WORKDIR is too long for the guest executor\n");

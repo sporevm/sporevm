@@ -1,0 +1,16 @@
+{
+  "description": "exec-form RUN skips a relative PATH directory and continues to an absolute executable",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 3,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle/relative-directory"
+  ]
+}

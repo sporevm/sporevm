@@ -1,0 +1,50 @@
+{
+  "description": "exec-form RUN preserves exact argv, resolves PATH, inherits ENV and ARG, and keys argv changes",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 5,
+    "expect_boot_count": 2,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle"
+  ],
+  "build_args": {
+    "BUILD_ARG": "cli-arg"
+  },
+  "network": "none",
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "changed-argv",
+      "writes": {
+        "Dockerfile": "FROM base AS parent\nARG BUILD_ARG=default-arg\nENV INHERITED_ENV=parent-env\nENV ORDER=env-before-arg\nARG ORDER=arg-after-env\nRUN mkdir -p /oracle/path-a /oracle/path-b && printf '#!/bin/sh\\nprintf wrong > /oracle/path-result\\n' > /oracle/path-a/tool && printf '#!/bin/sh\\nprintf right > /oracle/path-result\\n' > /oracle/path-b/tool && chmod 0644 /oracle/path-a/tool && chmod 0755 /oracle/path-b/tool\nENV PATH=/oracle/path-a:/oracle/path-b:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nRUN [\"tool\"]\nRUN [\"python3\",\"-c\",\"import json,os,pathlib,sys; pathlib.Path('/oracle/parent.json').write_text(json.dumps({'argv':sys.argv[1:],'env':[os.getenv('INHERITED_ENV'),os.getenv('BUILD_ARG'),os.getenv('ORDER'),str('UNSET' in os.environ)]},sort_keys=True))\",\"two words\",\"\",\"\\\"quoted\\\"\",\"$UNSET\"]\n\nFROM parent\nARG BUILD_ARG\nARG ORDER\nENV ORDER=env-after-arg\nRUN [\"sh\",\"-c\",\"test \\\"$INHERITED_ENV\\\" = parent-env && test \\\"$BUILD_ARG\\\" = cli-arg && test \\\"$ORDER\\\" = env-after-arg && test -z \\\"${UNSET+x}\\\" && printf inherited > /oracle/inherited\"]\nRUN [\"python3\",\"-c\",\"import pathlib,sys; pathlib.Path('/oracle/cache-value').write_text(sys.argv[1])\",\"changed\"]\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 1,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-argv-change",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

@@ -82,6 +82,8 @@
 #define COPY_SOURCE_CONTEXT SPORE_BUILD_COPY_SOURCE_CONTEXT
 #define COPY_SOURCE_BUILD_INPUT SPORE_BUILD_COPY_SOURCE_BUILD_INPUT
 #define MAX_BUILD_RUN_COMMAND_LEN 65536ULL
+#define MAX_BUILD_EXEC_ARGS_BYTES 4096
+#define MAX_BUILD_EXEC_PATH_LEN 8192
 #define MAX_BUILD_CONTEXT_COPY_ENTRIES SPORE_BUILD_COPY_MAX_ENTRIES
 #define BUILD_AGENT_FD_BUDGET SPORE_BUILD_COPY_FD_BUDGET
 #define BUILD_CONTEXT_ROOT "/mnt/build-context"
@@ -1729,6 +1731,12 @@ static int parse_json_string(const char **cursor, char *out, size_t cap) {
         case '\\':
         case '/':
           break;
+        case 'b':
+          c = '\b';
+          break;
+        case 'f':
+          c = '\f';
+          break;
         case 'n':
           c = '\n';
           break;
@@ -1738,6 +1746,21 @@ static int parse_json_string(const char **cursor, char *out, size_t cap) {
         case 't':
           c = '\t';
           break;
+        case 'u': {
+          if (p[0] == '\0' || p[1] == '\0' || p[2] == '\0' || p[3] == '\0') return -1;
+          if (p[0] != '0' || p[1] != '0') return -1;
+          int hi = p[2] >= '0' && p[2] <= '9' ? p[2] - '0' :
+                   p[2] >= 'a' && p[2] <= 'f' ? p[2] - 'a' + 10 :
+                   p[2] >= 'A' && p[2] <= 'F' ? p[2] - 'A' + 10 : -1;
+          int lo = p[3] >= '0' && p[3] <= '9' ? p[3] - '0' :
+                   p[3] >= 'a' && p[3] <= 'f' ? p[3] - 'a' + 10 :
+                   p[3] >= 'A' && p[3] <= 'F' ? p[3] - 'A' + 10 : -1;
+          if (hi < 0 || lo < 0) return -1;
+          c = (char)((hi << 4) | lo);
+          if (c == '\0') return -1;
+          p += 4;
+          break;
+        }
         default:
           return -1;
       }
@@ -1874,6 +1897,7 @@ struct run_request {
   uint64_t copy_input_index;
   int copy_dest_is_dir;
   uint64_t build_command_len;
+  int build_exec_form;
   uint64_t nofile_soft;
   uint64_t nofile_hard;
   char arg_storage[MAX_ARG_STORAGE];
@@ -1987,6 +2011,10 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
     } else if (strcmp(type, "spore-build-run-v1") == 0) {
       out->kind = REQUEST_BUILD_RUN;
       out->protocol_v1 = 1;
+    } else if (strcmp(type, "spore-build-run-v2") == 0) {
+      out->kind = REQUEST_BUILD_RUN;
+      out->protocol_v1 = 1;
+      out->build_exec_form = 1;
     } else if (strcmp(type, "spore-build-copy-v2") == 0 || strcmp(type, "spore-build-copy-v3") == 0) {
       out->kind = REQUEST_BUILD_COPY;
       out->protocol_v1 = 1;
@@ -2040,10 +2068,23 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
     if (path_rc <= 0) return -1;
   }
   if (out->kind == REQUEST_BUILD_RUN) {
-    uint64_t command_len = 0;
-    int command_len_rc = parse_u64_field(req, "command_len", &command_len);
-    if (command_len_rc <= 0 || command_len > MAX_BUILD_RUN_COMMAND_LEN) return -1;
-    out->build_command_len = command_len;
+    if (out->build_exec_form) {
+      int argc = parse_argv(req, out->arg_storage, out->argv);
+      if (argc <= 0 || out->argv[0][0] == '\0') return -1;
+      size_t args_bytes = 0;
+      for (int i = 0; i < argc; i++) {
+        size_t arg_len = strlen(out->argv[i]);
+        if (arg_len > MAX_BUILD_EXEC_ARGS_BYTES - args_bytes) return -1;
+        args_bytes += arg_len;
+      }
+      if (find_field_value(req, "command_len") != NULL) return -1;
+    } else {
+      uint64_t command_len = 0;
+      int command_len_rc = parse_u64_field(req, "command_len", &command_len);
+      if (command_len_rc <= 0 || command_len > MAX_BUILD_RUN_COMMAND_LEN) return -1;
+      out->build_command_len = command_len;
+      if (find_field_value(req, "argv") != NULL) return -1;
+    }
     if (parse_env(req, out->env_storage, out->envp) < 0) return -1;
     int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
     if (working_dir_rc < 0) return -1;
@@ -2893,11 +2934,68 @@ static int exec_failure_code(int err) {
   return err == ENOENT || err == ENOTDIR ? 127 : 126;
 }
 
-static void execve_or_report(char *const argv[], char *const envp[], int use_rootfs, int failure_fd) {
+static const char *env_value(char *const envp[], const char *name) {
+  size_t name_len = strlen(name);
+  for (size_t i = 0; envp[i] != NULL; i++) {
+    if (strncmp(envp[i], name, name_len) == 0 && envp[i][name_len] == '=') return envp[i] + name_len + 1;
+  }
+  return NULL;
+}
+
+static void execve_or_report(char *const argv[], char *const envp[], int use_rootfs, int failure_fd, int search_path) {
   char *const empty_env[] = { NULL };
-  execve(argv[0], argv, envp[0] != NULL ? envp : empty_env);
+  char *const *effective_env = envp[0] != NULL ? envp : empty_env;
+  if (search_path && strchr(argv[0], '/') == NULL) {
+    const char *path = env_value(envp, "PATH");
+    if (path != NULL && path[0] != '\0') {
+      int saved_error = ENOENT;
+      const char *entry = path;
+      for (;;) {
+        const char *end = strchr(entry, ':');
+        size_t dir_len = end != NULL ? (size_t)(end - entry) : strlen(entry);
+        const char *dir = dir_len == 0 ? "." : entry;
+        if (dir_len == 0) dir_len = 1;
+        size_t command_len = strlen(argv[0]);
+        if (dir_len + 1 + command_len + 1 <= MAX_BUILD_EXEC_PATH_LEN) {
+          char candidate[MAX_BUILD_EXEC_PATH_LEN];
+          memcpy(candidate, dir, dir_len);
+          candidate[dir_len] = '/';
+          memcpy(candidate + dir_len + 1, argv[0], command_len + 1);
+          if (dir[0] != '/') {
+            struct stat candidate_stat;
+            if (stat(candidate, &candidate_stat) == 0) {
+              if (!S_ISDIR(candidate_stat.st_mode) && access(candidate, X_OK) == 0) {
+                saved_error = EACCES;
+                break;
+              }
+              if (!S_ISDIR(candidate_stat.st_mode) && errno == EACCES) saved_error = EACCES;
+            } else if (errno != ENOENT && errno != ENOTDIR) {
+              saved_error = errno;
+              break;
+            }
+          } else {
+            execve(candidate, argv, effective_env);
+            if (errno == EACCES) saved_error = EACCES;
+            else if (errno != ENOENT && errno != ENOTDIR) {
+              saved_error = errno;
+              break;
+            }
+          }
+        } else {
+          saved_error = ENAMETOOLONG;
+        }
+        if (end == NULL) break;
+        entry = end + 1;
+      }
+      errno = saved_error;
+    } else {
+      errno = ENOENT;
+    }
+  } else {
+    execve(argv[0], argv, effective_env);
+  }
   int err = errno;
-  if ((err == ENOENT || err == ENOTDIR) && strchr(argv[0], '/') == NULL) {
+  if (!search_path && (err == ENOENT || err == ENOTDIR) && strchr(argv[0], '/') == NULL) {
     dprintf(STDERR_FILENO, "spore run: exact argv command \"%s\" was not found.\nExact argv mode does not run through /bin/sh or PATH lookup. Use shell command form or pass an absolute guest path.\n", argv[0]);
   } else if (!use_rootfs && (err == ENOENT || err == ENOTDIR)) {
     dprintf(STDERR_FILENO, "spore run: initrd cannot execute %s: not found; use --image, --rootfs, or provide an initrd containing the command\n", argv[0]);
@@ -2909,7 +3007,36 @@ static void execve_or_report(char *const argv[], char *const envp[], int use_roo
 }
 
 static void pin_to_current_cpu(pid_t pid);
-static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio, int memory_pressure, int build_run_isolation, uint64_t nofile_soft, uint64_t nofile_hard, int stdin_enabled, int tty, uint16_t terminal_rows, uint16_t terminal_cols) {
+enum exec_lookup_mode {
+  EXEC_LOOKUP_EXACT = 0,
+  EXEC_LOOKUP_PATH = 1,
+};
+
+struct session_start_options {
+  int use_rootfs;
+  int file_stdio;
+  int memory_pressure;
+  int build_run_isolation;
+  enum exec_lookup_mode exec_lookup;
+  uint64_t nofile_soft;
+  uint64_t nofile_hard;
+  int stdin_enabled;
+  int tty;
+  uint16_t terminal_rows;
+  uint16_t terminal_cols;
+};
+
+static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, const struct session_start_options *options) {
+  int use_rootfs = options->use_rootfs;
+  int file_stdio = options->file_stdio;
+  int memory_pressure = options->memory_pressure;
+  int build_run_isolation = options->build_run_isolation;
+  uint64_t nofile_soft = options->nofile_soft;
+  uint64_t nofile_hard = options->nofile_hard;
+  int stdin_enabled = options->stdin_enabled;
+  int tty = options->tty;
+  uint16_t terminal_rows = options->terminal_rows;
+  uint16_t terminal_cols = options->terminal_cols;
   t_command_start = now_ms();
   int stdin_pipe[2] = { -1, -1 };
   int stdout_pipe[2] = { -1, -1 };
@@ -3055,7 +3182,7 @@ static int start_session(struct session *session, const char *session_id, char *
     }
     const char *cwd = working_dir[0] != '\0' ? working_dir : "/";
     if (chdir(cwd) != 0) _exit(126);
-    execve_or_report(argv, envp, use_rootfs, -1);
+    execve_or_report(argv, envp, use_rootfs, -1, options->exec_lookup == EXEC_LOOKUP_PATH);
   }
   if (stdin_pipe[0] >= 0) close(stdin_pipe[0]);
   if (pty_slave >= 0) close(pty_slave);
@@ -3370,7 +3497,7 @@ static int start_detached(char *const argv[], char *const envp[], const char *wo
     }
     const char *cwd = working_dir[0] != '\0' ? working_dir : "/";
     if (chdir(cwd) != 0) detached_child_fail(exec_pipe[1]);
-    execve_or_report(argv, envp, use_rootfs, exec_pipe[1]);
+    execve_or_report(argv, envp, use_rootfs, exec_pipe[1], 0);
   }
 
   close_fd_if_open(&devnull);
@@ -3825,7 +3952,13 @@ static void run_transient_exec(struct client *client, const struct run_request *
   }
 
   struct session transient;
-  int rc = start_session(&transient, request->session_id, request->argv, request->envp, request->working_dir, use_rootfs, 0, 0, 0, 0, 0, 0, 0, request->terminal_rows, request->terminal_cols);
+  const struct session_start_options options = {
+    .use_rootfs = use_rootfs,
+    .exec_lookup = EXEC_LOOKUP_EXACT,
+    .terminal_rows = request->terminal_rows,
+    .terminal_cols = request->terminal_cols,
+  };
+  int rc = start_session(&transient, request->session_id, request->argv, request->envp, request->working_dir, &options);
   if (rc != 0) {
     (void)send_client_error_exit(client, rc, "spore run: exec setup failed\n");
     close_client(client);
@@ -3879,13 +4012,26 @@ static void run_transient_exec(struct client *client, const struct run_request *
 
 static void run_build_exec(struct client *client, const struct run_request *request, char *command, int use_rootfs) {
   char *argv[4];
-  argv[0] = "/bin/sh";
-  argv[1] = "-c";
-  argv[2] = command;
-  argv[3] = NULL;
+  char *const *effective_argv = request->argv;
+  if (!request->build_exec_form) {
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = command;
+    argv[3] = NULL;
+    effective_argv = argv;
+  }
 
   struct session transient;
-  int rc = start_session(&transient, request->session_id, argv, request->envp, request->working_dir, use_rootfs, 0, 0, 1, request->nofile_soft, request->nofile_hard, 0, 0, request->terminal_rows, request->terminal_cols);
+  const struct session_start_options options = {
+    .use_rootfs = use_rootfs,
+    .build_run_isolation = 1,
+    .exec_lookup = request->build_exec_form ? EXEC_LOOKUP_PATH : EXEC_LOOKUP_EXACT,
+    .nofile_soft = request->nofile_soft,
+    .nofile_hard = request->nofile_hard,
+    .terminal_rows = request->terminal_rows,
+    .terminal_cols = request->terminal_cols,
+  };
+  int rc = start_session(&transient, request->session_id, effective_argv, request->envp, request->working_dir, &options);
   if (rc != 0) {
     (void)send_client_error_exit(client, rc, "spore build: RUN exec setup failed\n");
     close_client(client);
@@ -4053,7 +4199,7 @@ static void accept_request(int listener, struct session *session, struct client 
     char command[MAX_BUILD_RUN_COMMAND_LEN + 1];
     char error[256];
     error[0] = '\0';
-    if (read_build_command_from_spio(client, request.build_command_len, command, sizeof(command), error, sizeof(error)) != 0) {
+    if (!request.build_exec_form && read_build_command_from_spio(client, request.build_command_len, command, sizeof(command), error, sizeof(error)) != 0) {
       (void)send_client_error_exit(client, 2, error[0] != '\0' ? error : "spore build: RUN command payload invalid\n");
       close_client(client);
       return;
@@ -4204,7 +4350,17 @@ static void accept_request(int listener, struct session *session, struct client 
       file_stdio = request.tty ? 0 : 1;
       reset_session(session);
     }
-    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs, file_stdio, request.memory_pressure, 0, 0, 0, request.stdin_enabled, request.tty, request.terminal_rows, request.terminal_cols);
+    const struct session_start_options options = {
+      .use_rootfs = use_rootfs,
+      .file_stdio = file_stdio,
+      .memory_pressure = request.memory_pressure,
+      .exec_lookup = EXEC_LOOKUP_EXACT,
+      .stdin_enabled = request.stdin_enabled,
+      .tty = request.tty,
+      .terminal_rows = request.terminal_rows,
+      .terminal_cols = request.terminal_cols,
+    };
+    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, &options);
     if (rc != 0) {
       (void)send_client_error_exit(client, rc, "spore run: exec setup failed\n");
       close_client(client);
@@ -4300,6 +4456,7 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   if (parsed.kind == REQUEST_BUILD_WORKDIR) return SPORE_AGENT_FUZZ_WORKDIR_REQUEST;
   if (parsed.kind == REQUEST_ROOTFS_GROW) return SPORE_AGENT_FUZZ_GROW_REQUEST;
   if (parsed.kind != REQUEST_BUILD_RUN) return SPORE_AGENT_FUZZ_INVALID;
+  if (parsed.build_exec_form) return SPORE_AGENT_FUZZ_RUN_COMPLETE;
 
   int pipe_fds[2];
   if (pipe2(pipe_fds, O_CLOEXEC) != 0) return SPORE_AGENT_FUZZ_RUN_REQUEST;

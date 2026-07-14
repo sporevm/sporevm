@@ -11,6 +11,7 @@ const memory_config = @import("../memory.zig");
 const topology = @import("../topology.zig");
 const runtime_disk = @import("../runtime_disk.zig");
 const spore = @import("../spore.zig");
+const run_contract = @import("run_contract.zig");
 const step_cache = @import("step_cache.zig");
 const vsock = @import("../virtio/vsock.zig");
 
@@ -31,6 +32,8 @@ pub const max_build_nofile: u64 = 1_048_576;
 pub const default_build_nofile = NofileLimit{ .soft = 65_536, .hard = 65_536 };
 const max_guest_request_len = 8191;
 pub const max_run_command_len = 64 * 1024;
+pub const max_run_exec_args = run_contract.max_exec_args;
+pub const max_run_exec_args_bytes = run_contract.max_exec_args_bytes;
 pub const max_guest_envc = 64;
 pub const max_guest_env_len = 255;
 pub const max_guest_working_dir_len = 255;
@@ -157,10 +160,15 @@ fn hashProducerField(h: *std.crypto.hash.Blake3, bytes: []const u8) void {
     h.update(bytes);
 }
 
+pub const RunCommand = union(enum) {
+    shell: []const u8,
+    exec: []const []const u8,
+};
+
 pub const RunStep = struct {
     line: usize = 0,
     canonical_instruction: []const u8,
-    command: []const u8,
+    command: RunCommand,
     env: []const []const u8,
     env_digest: []const u8,
     workdir: []const u8,
@@ -625,7 +633,11 @@ const BuildControl = struct {
         switch (step) {
             .run => |run| {
                 const request = try runRequest(self.allocator, session_id, run.command, run.env, run.workdir, self.resources.nofile, self.io);
-                try self.startStream(dev, request, .spore_stream_v1, .run, run.command);
+                const stdin_payload = switch (run.command) {
+                    .shell => |shell| shell,
+                    .exec => "",
+                };
+                try self.startStream(dev, request, .spore_stream_v1, .run, stdin_payload);
             },
             .copy => |copy| {
                 if (copy.requests.len == 0) return error.CopyEntryCountUnsupported;
@@ -679,7 +691,7 @@ const BuildControl = struct {
         if (kind == .run or kind == .copy or kind == .workdir or kind == .resize) self.stream.setOutputSink(self, outputSink);
         self.active_stdin_payload = stdin_payload;
         self.active_stdin_offset = 0;
-        self.active_stdin_close_sent = kind != .run;
+        self.active_stdin_close_sent = kind != .run or stdin_payload.len == 0;
         try dev.attachHostStream(&self.stream);
         self.stream.markStarted();
         self.stream_valid = true;
@@ -984,46 +996,107 @@ fn monotonicNs() !u64 {
 fn runRequest(
     allocator: std.mem.Allocator,
     session_id: []const u8,
-    command: []const u8,
+    command: RunCommand,
     env: []const []const u8,
     workdir: []const u8,
     nofile: NofileLimit,
     io: Io,
 ) ![]const u8 {
-    try nofile.validate();
-    if (command.len > max_run_command_len) return error.RunCommandTooLong;
-    if (workdir.len == 0 or workdir.len > max_guest_working_dir_len) return error.RunWorkingDirUnsupported;
-    if (env.len > max_guest_envc) return error.RunEnvCountUnsupported;
-    for (env) |entry| if (entry.len > max_guest_env_len) return error.RunEnvTooLong;
     const now: u64 = @intCast(Io.Clock.real.now(io).nanoseconds);
-    const payload = struct {
-        type: []const u8 = "spore-build-run-v1",
-        session_id: []const u8,
-        resume_time_unix_ns: u64,
-        command_len: usize,
-        env: []const []const u8,
-        working_dir: []const u8,
-        stdio: []const u8 = "pipe",
-        term: []const u8 = "xterm",
-        terminal_rows: u16 = 24,
-        terminal_cols: u16 = 80,
-        memory_pressure: bool = false,
-        nofile_soft: u64,
-        nofile_hard: u64,
-        closed_env: bool = true,
-    }{
-        .session_id = session_id,
-        .resume_time_unix_ns = now,
-        .command_len = command.len,
-        .env = env,
-        .working_dir = workdir,
-        .nofile_soft = nofile.soft,
-        .nofile_hard = nofile.hard,
-    };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    const json = try runRequestJson(allocator, session_id, command, env, workdir, nofile, now);
     defer allocator.free(json);
     if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+}
+
+pub fn validateRunRequest(
+    allocator: std.mem.Allocator,
+    command: RunCommand,
+    env: []const []const u8,
+    workdir: []const u8,
+    nofile: NofileLimit,
+) !void {
+    const max_session_id = "x" ** 63;
+    const json = try runRequestJson(allocator, max_session_id, command, env, workdir, nofile, std.math.maxInt(u64));
+    defer allocator.free(json);
+    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
+}
+
+fn runRequestJson(
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+    command: RunCommand,
+    env: []const []const u8,
+    workdir: []const u8,
+    nofile: NofileLimit,
+    now: u64,
+) ![]const u8 {
+    try nofile.validate();
+    if (workdir.len == 0 or workdir.len > max_guest_working_dir_len) return error.RunWorkingDirUnsupported;
+    if (env.len > max_guest_envc) return error.RunEnvCountUnsupported;
+    for (env) |entry| if (entry.len > max_guest_env_len) return error.RunEnvTooLong;
+    return switch (command) {
+        .shell => |shell| blk: {
+            if (shell.len > max_run_command_len) return error.RunCommandTooLong;
+            const payload = struct {
+                type: []const u8 = "spore-build-run-v1",
+                session_id: []const u8,
+                resume_time_unix_ns: u64,
+                command_len: usize,
+                env: []const []const u8,
+                working_dir: []const u8,
+                stdio: []const u8 = "pipe",
+                term: []const u8 = "xterm",
+                terminal_rows: u16 = 24,
+                terminal_cols: u16 = 80,
+                memory_pressure: bool = false,
+                nofile_soft: u64,
+                nofile_hard: u64,
+                closed_env: bool = true,
+            }{
+                .session_id = session_id,
+                .resume_time_unix_ns = now,
+                .command_len = shell.len,
+                .env = env,
+                .working_dir = workdir,
+                .nofile_soft = nofile.soft,
+                .nofile_hard = nofile.hard,
+            };
+            break :blk try std.json.Stringify.valueAlloc(allocator, payload, .{});
+        },
+        .exec => |argv| blk: {
+            if (run_contract.execArgvViolation(argv)) |violation| switch (violation) {
+                .empty, .too_many_args => return error.RunArgCountUnsupported,
+                .empty_executable, .nul => return error.RunArgUnsupported,
+                .decoded_too_large => return error.RunRequestTooLarge,
+            };
+            const payload = struct {
+                type: []const u8 = "spore-build-run-v2",
+                session_id: []const u8,
+                resume_time_unix_ns: u64,
+                argv: []const []const u8,
+                env: []const []const u8,
+                working_dir: []const u8,
+                stdio: []const u8 = "pipe",
+                term: []const u8 = "xterm",
+                terminal_rows: u16 = 24,
+                terminal_cols: u16 = 80,
+                memory_pressure: bool = false,
+                nofile_soft: u64,
+                nofile_hard: u64,
+                closed_env: bool = true,
+            }{
+                .session_id = session_id,
+                .resume_time_unix_ns = now,
+                .argv = argv,
+                .env = env,
+                .working_dir = workdir,
+                .nofile_soft = nofile.soft,
+                .nofile_hard = nofile.hard,
+            };
+            break :blk try std.json.Stringify.valueAlloc(allocator, payload, .{});
+        },
+    };
 }
 
 fn copyRequest(allocator: std.mem.Allocator, session_id: []const u8, request: CopyRequest) ![]const u8 {
@@ -1163,7 +1236,7 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
     if (comptime guest_agent_fuzz_supported) {
         var fuzz_bytes: [128]u8 = undefined;
         const fuzz_len = s.slice(&fuzz_bytes);
-        const mode = if (fuzz_len == 0) 0 else fuzz_bytes[0] % 8;
+        const mode = if (fuzz_len == 0) 0 else fuzz_bytes[0] % 9;
         const command = if (fuzz_len <= 1) "x" else fuzz_bytes[1..fuzz_len];
         var stream: [256]u8 = undefined;
         var stream_len: usize = 0;
@@ -1215,7 +1288,14 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
             return;
         }
 
-        const request = runRequest(std.testing.allocator, "spore-build-fuzz", command, &.{}, "/", default_build_nofile, std.testing.io) catch return;
+        if (mode == 8) {
+            const request = runRequest(std.testing.allocator, "spore-build-fuzz", .{ .exec = &.{ "printf", "%s", command } }, &.{"PATH=/usr/bin"}, "/", default_build_nofile, std.testing.io) catch return;
+            defer std.testing.allocator.free(request);
+            _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
+            return;
+        }
+
+        const request = runRequest(std.testing.allocator, "spore-build-fuzz", .{ .shell = command }, &.{}, "/", default_build_nofile, std.testing.io) catch return;
         defer std.testing.allocator.free(request);
         appendTestSpioFrame(&stream, &stream_len, 1, if (mode == 1) 1 else 0, command);
         if (mode != 3) appendTestSpioFrame(&stream, &stream_len, 2, command.len, "");
@@ -1623,7 +1703,7 @@ test "build session network mode derives from RUN steps" {
     } };
     const spore_run = Step{ .run = .{
         .canonical_instruction = "RUN fetch",
-        .command = "fetch",
+        .command = .{ .shell = "fetch" },
         .env = &.{},
         .env_digest = "blake3:env",
         .workdir = "/",
@@ -1751,7 +1831,7 @@ test "build copy request accepts exact path bound" {
 }
 
 test "build run request uses spore stream v1 start" {
-    const request = try runRequest(std.testing.allocator, "spore-build-1", "echo ok", &.{"PATH=/usr/bin"}, "/work", default_build_nofile, std.testing.io);
+    const request = try runRequest(std.testing.allocator, "spore-build-1", .{ .shell = "echo ok" }, &.{"PATH=/usr/bin"}, "/work", default_build_nofile, std.testing.io);
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.endsWith(u8, request, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-run-v1\"") != null);
@@ -1759,6 +1839,65 @@ test "build run request uses spore stream v1 start" {
     try std.testing.expect(std.mem.indexOf(u8, request, "\"command_len\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"nofile_soft\":65536") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"nofile_hard\":65536") != null);
+}
+
+fn rawExecRequestForTest(allocator: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
+    const payload = struct {
+        type: []const u8 = "spore-build-run-v2",
+        session_id: []const u8 = "spore-build-test",
+        argv: []const []const u8,
+        env: []const []const u8 = &.{},
+        working_dir: []const u8 = "/",
+        nofile_soft: u64 = 1,
+        nofile_hard: u64 = 1,
+    }{ .argv = argv };
+    return std.json.Stringify.valueAlloc(allocator, payload, .{});
+}
+
+test "build exec-form RUN request carries exact bounded argv" {
+    const request = try runRequest(
+        std.testing.allocator,
+        "spore-build-1",
+        .{ .exec = &.{ "printf", "%s|%s", "two words", "", "$VALUE", "control\x01" } },
+        &.{ "PATH=/usr/bin", "VALUE=expanded" },
+        "/work",
+        default_build_nofile,
+        std.testing.io,
+    );
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-run-v2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"argv\":[\"printf\",\"%s|%s\",\"two words\",\"\",\"$VALUE\",\"control\\u0001\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "command_len") == null);
+    if (comptime guest_agent_fuzz_supported) {
+        try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
+    }
+
+    try std.testing.expectError(error.RunArgCountUnsupported, runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &.{} }, &.{}, "/", default_build_nofile, std.testing.io));
+    try std.testing.expectError(error.RunArgUnsupported, runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &.{""} }, &.{}, "/", default_build_nofile, std.testing.io));
+
+    const sixteen = [_][]const u8{"x"} ** max_run_exec_args;
+    const max_count_request = try runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &sixteen }, &.{}, "/", default_build_nofile, std.testing.io);
+    defer std.testing.allocator.free(max_count_request);
+    const seventeen = [_][]const u8{"x"} ** (max_run_exec_args + 1);
+    try std.testing.expectError(error.RunArgCountUnsupported, runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &seventeen }, &.{}, "/", default_build_nofile, std.testing.io));
+
+    const max_bytes_request = try runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &.{"x" ** max_run_exec_args_bytes} }, &.{}, "/", default_build_nofile, std.testing.io);
+    defer std.testing.allocator.free(max_bytes_request);
+    try std.testing.expectError(error.RunRequestTooLarge, runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &.{"x" ** (max_run_exec_args_bytes + 1)} }, &.{}, "/", default_build_nofile, std.testing.io));
+
+    if (comptime guest_agent_fuzz_supported) {
+        try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(max_count_request.ptr, max_count_request.len, max_count_request[0..0].ptr, 0));
+        try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(max_bytes_request.ptr, max_bytes_request.len, max_bytes_request[0..0].ptr, 0));
+        const too_many_request = try rawExecRequestForTest(std.testing.allocator, &seventeen);
+        defer std.testing.allocator.free(too_many_request);
+        try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(too_many_request.ptr, too_many_request.len, too_many_request[0..0].ptr, 0));
+        const too_large_request = try rawExecRequestForTest(std.testing.allocator, &.{"x" ** (max_run_exec_args_bytes + 1)});
+        defer std.testing.allocator.free(too_large_request);
+        try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(too_large_request.ptr, too_large_request.len, too_large_request[0..0].ptr, 0));
+    }
+
+    const escaped_controls = "\x01" ** 1366;
+    try std.testing.expectError(error.RunRequestTooLarge, validateRunRequest(std.testing.allocator, .{ .exec = &.{ "printf", escaped_controls } }, &.{"PATH=/usr/bin"}, "/", default_build_nofile));
 }
 
 test "build nofile limit is bounded" {
@@ -1781,19 +1920,19 @@ test "build RUN resources validate as one execution contract" {
 
 test "build run request accepts multi-kib command and rejects configured bound" {
     const multi_kib = "x" ** 4096;
-    const request = try runRequest(std.testing.allocator, "spore-build-1", multi_kib, &.{}, "/", default_build_nofile, std.testing.io);
+    const request = try runRequest(std.testing.allocator, "spore-build-1", .{ .shell = multi_kib }, &.{}, "/", default_build_nofile, std.testing.io);
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"command_len\":4096") != null);
     const command = "x" ** (max_run_command_len + 1);
-    try std.testing.expectError(error.RunCommandTooLong, runRequest(std.testing.allocator, "spore-build-1", command, &.{}, "/", default_build_nofile, std.testing.io));
+    try std.testing.expectError(error.RunCommandTooLong, runRequest(std.testing.allocator, "spore-build-1", .{ .shell = command }, &.{}, "/", default_build_nofile, std.testing.io));
     const workdir = "/" ** (max_guest_working_dir_len + 1);
-    try std.testing.expectError(error.RunWorkingDirUnsupported, runRequest(std.testing.allocator, "spore-build-1", "true", &.{}, workdir, default_build_nofile, std.testing.io));
+    try std.testing.expectError(error.RunWorkingDirUnsupported, runRequest(std.testing.allocator, "spore-build-1", .{ .shell = "true" }, &.{}, workdir, default_build_nofile, std.testing.io));
 }
 
 test "guest build request parser rejects malformed RUN framing and accepts build controls" {
     if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
 
-    const run_request = try runRequest(std.testing.allocator, "spore-build-1", "abc", &.{}, "/", default_build_nofile, std.testing.io);
+    const run_request = try runRequest(std.testing.allocator, "spore-build-1", .{ .shell = "abc" }, &.{}, "/", default_build_nofile, std.testing.io);
     defer std.testing.allocator.free(run_request);
     var stream: [128]u8 = undefined;
     var stream_len: usize = 0;
@@ -1812,6 +1951,9 @@ test "guest build request parser rejects malformed RUN framing and accepts build
 
     const over_limit = "{\"type\":\"spore-build-run-v1\",\"command_len\":65537}\n";
     try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(over_limit.ptr, over_limit.len, stream[0..0].ptr, 0));
+
+    const empty_exec = "{\"type\":\"spore-build-run-v2\",\"argv\":[],\"env\":[],\"working_dir\":\"/\",\"nofile_soft\":1,\"nofile_hard\":1}\n";
+    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(empty_exec.ptr, empty_exec.len, stream[0..0].ptr, 0));
 
     const copy_request = try copyRequest(std.testing.allocator, "spore-build-1", .{
         .source = "input",

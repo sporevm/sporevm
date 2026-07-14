@@ -1,0 +1,9 @@
+{
+  "description": "exec-form RUN rejects executables found through a relative PATH component",
+  "expect": {
+    "docker": "failure",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 5: instruction failed: RUN [\"tool\"]"
+  },
+  "scan_prefixes": []
+}
