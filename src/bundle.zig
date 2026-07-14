@@ -1034,7 +1034,19 @@ fn pullLocalIndexedBundle(
 
     const rootfs_result = try unpackRootfsArtifactIndexed(allocator, unpack_options, bundle_index, manifest.rootfs());
 
-    try unpackDiskIndexForManifest(allocator, options.io, bundle_dir, options.out_dir, manifest.disk());
+    const disk_storage_already_published = if (manifest.disk()) |disk|
+        if (manifest.rootfs()) |rootfs|
+            if (rootfs.storage) |rootfs_storage|
+                spore.rootfsStorageEql(try diskStorageDescriptor(disk), rootfs_storage)
+            else
+                false
+        else
+            false
+    else
+        true;
+    if (!disk_storage_already_published) {
+        try unpackDiskIndexForManifest(allocator, options.io, bundle_dir, options.out_dir, manifest.disk());
+    }
     try manifest.saveDir(allocator, options.out_dir);
     const bundle_digest = try digestHex(allocator, bundle_dir);
 
