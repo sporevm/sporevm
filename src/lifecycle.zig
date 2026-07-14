@@ -331,6 +331,15 @@ pub const MonitorTiming = struct {
     asset_resolve_ms: u64,
     metadata_ms: u64,
     ready_after_start_ms: u64,
+    readiness_attach_ms: ?u64 = null,
+    readiness_connect_request_delivered_ms: ?u64 = null,
+    readiness_connect_ms: ?u64 = null,
+    readiness_request_delivered_ms: ?u64 = null,
+    readiness_guest_timing_ms: ?u64 = null,
+    readiness_response_ms: ?u64 = null,
+    backend_restore_memory_ms: ?u64 = null,
+    backend_restore_state_ms: ?u64 = null,
+    backend_restore_pre_run_ms: ?u64 = null,
 };
 
 pub const VmState = enum {

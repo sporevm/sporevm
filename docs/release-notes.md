@@ -33,6 +33,11 @@ inputs still fall back to verified chunks, while malformed authoritative
 metadata, allocation failure, unexpected I/O, corruption, and backend or
 platform failures remain errors.
 
+Named monitor timing now separates backend RAM, machine-state, and pre-run
+restore work from vsock request delivery, connect, guest response, and ready
+publication. The named-restore benchmark consumes those structured fields, so
+a proof fallback cannot be mistaken for a slow guest readiness handshake.
+
 Linux proof creation now measures existing fs-verity state before changing
 permissions. New owned read-only backings temporarily regain owner-write only
 for enablement, then restore their exact mode and stable device, inode, owner,

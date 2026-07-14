@@ -65,10 +65,27 @@ if command == "restore":
         "info: kvm restore metrics: mode=local_backing ram_mib=1024 chunks=1 "
         "nonzero_chunks=1 manifest_ms=0 map_ram_ms=0 memory_ms=0 state_ms=1 pre_run_ms=2\n"
     )
-    metrics = proof_metric + restore_metric
+    readiness_metric = (
+        "info: monitor readiness metrics: attach_ms=0 connect_request_delivered_ms=1 "
+        "connect_ms=2 request_delivered_ms=3 guest_timing_ms=4 response_ms=5 ready_ms=6\n"
+    )
+    metrics = proof_metric + restore_metric + readiness_metric
     if os.environ.get("FAKE_DUPLICATE_METRICS") == "1":
-        metrics += proof_metric + restore_metric
+        metrics += proof_metric + restore_metric + readiness_metric
     (vm_dir / "monitor.log").write_text(metrics, encoding="utf-8")
+    (vm_dir / "monitor-timing.json").write_text(json.dumps({
+        "version": 1,
+        "ready_after_start_ms": 6,
+        "readiness_attach_ms": 0,
+        "readiness_connect_request_delivered_ms": 1,
+        "readiness_connect_ms": 2,
+        "readiness_request_delivered_ms": 3,
+        "readiness_guest_timing_ms": 4,
+        "readiness_response_ms": 5,
+        "backend_restore_memory_ms": 0,
+        "backend_restore_state_ms": 1,
+        "backend_restore_pre_run_ms": 2,
+    }), encoding="utf-8")
     pathlib.Path(os.environ["FAKE_RESTORE_STARTED"]).touch()
     if os.environ.get("FAKE_INVALID_RESTORE_JSON") == "1":
         print("{invalid")

@@ -140,6 +140,9 @@ pub const HostStream = struct {
     first_output_ms: ?u64 = null,
     response_ms: ?u64 = null,
     guest_timing_ms: ?u64 = null,
+    backend_restore_memory_ms: ?u64 = null,
+    backend_restore_state_ms: ?u64 = null,
+    backend_restore_pre_run_ms: ?u64 = null,
     received_bytes: u32 = 0,
     sent_bytes: u32 = 0,
     credit_fwd_cnt_sent: u32 = 0,
@@ -198,6 +201,12 @@ pub const HostStream = struct {
     pub fn markStarted(self: *HostStream) void {
         self.started_at_ms = monotonicMs();
         self.start_ms = self.elapsedMs();
+    }
+
+    pub fn setBackendRestoreMetrics(self: *HostStream, memory_ms: u64, state_ms: u64, pre_run_ms: u64) void {
+        self.backend_restore_memory_ms = memory_ms;
+        self.backend_restore_state_ms = state_ms;
+        self.backend_restore_pre_run_ms = pre_run_ms;
     }
 
     fn markAttached(self: *HostStream) void {

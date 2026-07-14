@@ -162,7 +162,9 @@ fn formatRestoreMetrics(buffer: []u8, ram_size: u64, stats: *RestoreStats, start
 fn emitRestoreMetrics(config: Config, restore_stats: *?RestoreStats, start_ms: u64) void {
     if (restore_stats.*) |*stats| {
         var buffer: [512]u8 = undefined;
-        std.log.info("{s}", .{formatRestoreMetrics(&buffer, config.ram_size, stats, start_ms)});
+        const message = formatRestoreMetrics(&buffer, config.ram_size, stats, start_ms);
+        if (config.exec_probe) |probe| probe.setBackendRestoreMetrics(stats.memory_ms, stats.state_ms, stats.pre_run_ms);
+        std.log.info("{s}", .{message});
     }
 }
 

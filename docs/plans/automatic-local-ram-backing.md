@@ -1,6 +1,6 @@
 ---
 status: landed
-last_reviewed: 2026-07-13
+last_reviewed: 2026-07-14
 spec_refs:
   - docs/memory.md
   - docs/spore-format.md
@@ -23,6 +23,11 @@ canonical memory index identity, opened file identity, backing metadata, and the
 host-local runtime key. Missing, symlinked, non-regular, or size-mismatched
 optional paths, and stale, foreign, malformed, or mismatched proofs, fall back
 to verified chunks.
+
+Deployments that retain local backing across process or container lifetimes
+must place `SPOREVM_RUNTIME_DIR` on the same persistent host storage. The
+runtime key is the host-local authority for those proofs, so losing it while
+retaining templates correctly selects verified chunks on every restore.
 
 Fallback is limited to the optional acceleration hint being absent or unsafe.
 Malformed authoritative memory/index/backing metadata, allocation failure,
