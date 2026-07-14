@@ -1,5 +1,5 @@
 ---
-status: active
+status: landed
 last_reviewed: 2026-07-13
 spec_refs:
   - docs/spore-format.md
@@ -52,15 +52,16 @@ mechanisms before both calcify — is how those goals get met with less code,
 not a separate justification. The plan deliberately breaks the on-disk and
 manifest formats to do so.
 
-> **Current state (2026-07-11): U7 is complete.** Disk-backed
+> **Current state (2026-07-13): landed.** Disk-backed
 > `spore fork --vm` now uses the live monitor/VMM quiescence boundary, one-use
 > fd claims, independently rooted child baselines, and readiness-after-adoption.
 > The maintained product smoke and native clone path pass on APFS/HVF and on a
 > real ARM64 Linux/KVM host. U7 lazy runtimes now root their CAS storage for the
 > complete named-monitor or foreground-run lifetime. Dense-image fault traces
 > do not justify a background filler, boot-priority list, or packfiles, and show
-> no latency urgency for index compaction. RAM/disk store convergence remains a
-> separate follow-up, not incomplete U6 implementation.
+> no latency urgency for index compaction. The shared-store save follow-up also
+> landed: durable pins root machine-local disk state, while portable migration
+> and pack/unpack retain self-contained ownership boundaries.
 
 ## Product Goals This Serves
 
@@ -395,8 +396,8 @@ At end state:
 All planned implementation slices are complete. U6, production
 disk-backed named fast fork, is proven on APFS/HVF and by the maintained
 product smoke on a reflink-capable Linux/KVM host. Its platform evidence is
-complete, with no prerequisite from the remaining evidence-gated U7 follow-ups
-or the open store/packing questions.
+complete. U7 and the durable-pin/shared-store save follow-up are also complete;
+packing remains evidence-deferred rather than open implementation work.
 `docs/plans/spore-build.md` was revived after the unified storage primitives
 landed and now consumes them as a separate active workstream. Dirty tracking
 and incremental index maintenance — previously drafted as a separate plan —
@@ -1277,11 +1278,11 @@ Decision: copying global-CAS chunks during save is a material cost, not a
 hypothetical portability edge. Even the normal same-filesystem path spends
 about 0.45 seconds issuing 19,023 hard links. A portable output on another
 filesystem spends about 106 seconds verifying, copying, and durably publishing
-the same 1.25 GB. The later shared-store save slice is warranted: local saves
-should be able to reference rooted global-CAS objects and defer
-complete/self-contained copying to an explicit export boundary. That follow-up
-must preserve the existing cache-lock/GC-root contract and portable bundle
-semantics. The landed durable-pin design removes unchanged-parent object
+the same 1.25 GB. These measurements warranted the shared-store save slice:
+local saves now reference rooted global-CAS objects and defer
+complete/self-contained copying to an explicit export boundary. The landed
+design preserves the cache-lock/GC-root contract and portable bundle semantics.
+Durable pins remove unchanged-parent object
 link/copy/hash operations from cache-backed steady-state saves whose parent is
 already in the global CAS. A first save after portable/local-CAS restore still
 performs a one-time verified migration into the global CAS; the exact-head
@@ -1345,9 +1346,10 @@ integration coverage.
   implementation of the model, disk adopts its identity plus the shared
   classification, publication, and work-accounting primitives (U3), and memory
   adopts the unified index encoding (U5).
-  Chunk granularity stays per-domain (RAM 2MiB, disk 64KiB). Evidence now
-  justifies a separate store-unification save follow-up; its design remains
-  open.
+  Chunk granularity stays per-domain (RAM 2MiB, disk 64KiB). The subsequent
+  shared-store save work landed durable pins for machine-local authority and a
+  measured portable migration plus pack/unpack boundary; it does not merge RAM
+  and disk object namespaces.
 - Flat materialization stays the hot steady-state read path; the CAS is
   read per-chunk only during U7 fault-in, and each faulted chunk is
   promoted into the materialization so it is read from the store at most

@@ -21,6 +21,32 @@ const RecordEnvelope = struct {
     kind: []const u8,
 };
 
+const DecodedRecord = union(enum) {
+    current: Current,
+    legacy: Parsed,
+    stale,
+    unknown,
+
+    const Parsed = struct {
+        json: std.json.Parsed(StepRecord),
+        storage: spore.RootfsStorage,
+    };
+
+    const Current = struct {
+        json: std.json.Parsed(StepRecord),
+        input: StepInput,
+        storage: spore.RootfsStorage,
+    };
+
+    fn deinit(self: *DecodedRecord) void {
+        switch (self.*) {
+            .current => |*record| record.json.deinit(),
+            .legacy => |*record| record.json.deinit(),
+            .stale, .unknown => {},
+        }
+    }
+};
+
 pub const GcRecordInspection = union(enum) {
     root: spore.RootfsStorage,
     legacy: spore.RootfsStorage,
@@ -352,29 +378,15 @@ pub fn readHit(
         else => |e| return e,
     };
     defer allocator.free(bytes);
-    var parsed = std.json.parseFromSlice(StepRecord, allocator, bytes, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    }) catch return null;
-    defer parsed.deinit();
-    const record = parsed.value;
-    if (!std.mem.eql(u8, record.builder_version, builder_version)) return null;
-    const storage = validChildStorage(record, expected_key) orelse return null;
-    if (!std.mem.eql(u8, record.platform.os, input.platform.os) or !std.mem.eql(u8, record.platform.arch, input.platform.arch)) return null;
-    if (!std.mem.eql(u8, record.parent_index_digest, input.parent_index_digest)) return null;
-    if (!std.mem.eql(u8, record.instruction_kind, fields.instruction_kind)) return null;
-    if (!std.mem.eql(u8, record.instruction, input.canonical_instruction)) return null;
-    if (!std.mem.eql(u8, record.input_digest, fields.input_digest)) return null;
-    if (!std.mem.eql(u8, record.env_digest, fields.env_digest)) return null;
-    if (!std.mem.eql(u8, record.workdir, fields.workdir)) return null;
-    if (record.network_mode != fields.network_mode) return null;
-    if (record.memory_bytes != fields.memory_bytes or record.vcpus != fields.vcpus or
-        record.nofile_soft != fields.nofile_soft or record.nofile_hard != fields.nofile_hard) return null;
-    if (!recordPreparationFieldsMatch(record, fields)) return null;
-    if (!std.mem.eql(u8, record.executor_identity, fields.executor_identity)) return null;
-    validateChildForInput(input, storage) catch return null;
-    if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, storage)) return null;
-    return try spore.cloneRootfsStorage(allocator, storage);
+    var decoded = try decodeRecord(allocator, bytes, expected_key);
+    defer decoded.deinit();
+    const current = switch (decoded) {
+        .current => |record| record,
+        .legacy, .stale, .unknown => return null,
+    };
+    if (!stepInputEql(current.input, input)) return null;
+    if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, current.storage)) return null;
+    return try spore.cloneRootfsStorage(allocator, current.storage);
 }
 
 pub fn inspectRecordForGc(
@@ -390,6 +402,31 @@ pub fn inspectRecordForGc(
         else => |e| return e,
     };
     defer allocator.free(bytes);
+    var decoded = try decodeRecord(allocator, bytes, expected_key);
+    defer decoded.deinit();
+    const InspectionKind = enum { root, legacy };
+    const storage, const inspection: InspectionKind = switch (decoded) {
+        .current => |record| blk: {
+            if (!currentRecordRetainedByGc(record.input)) return .stale;
+            break :blk .{ record.storage, .root };
+        },
+        .legacy => |record| .{ record.storage, .legacy },
+        .stale => return .stale,
+        .unknown => return .unknown,
+    };
+    // Complete stamps are invalidated before normal CAS deletion, so retain the
+    // O(1) fast path when possible and scan every object only to repair legacy
+    // or interrupted publication.
+    if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, storage) and
+        !try rootfs_cas.storageContentComplete(io, allocator, cache_root, storage)) return .stale;
+    const cloned = try spore.cloneRootfsStorage(allocator, storage);
+    return switch (inspection) {
+        .root => .{ .root = cloned },
+        .legacy => .{ .legacy = cloned },
+    };
+}
+
+fn decodeRecord(allocator: std.mem.Allocator, bytes: []const u8, expected_key: []const u8) !DecodedRecord {
     var envelope = std.json.parseFromSlice(RecordEnvelope, allocator, bytes, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
@@ -402,28 +439,63 @@ pub fn inspectRecordForGc(
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch return .stale;
-    defer parsed.deinit();
-    const storage = validChildStorage(parsed.value, expected_key) orelse return .stale;
-    if (std.mem.eql(u8, parsed.value.builder_version, legacy_builder_version)) {
-        if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, storage) and
-            !try rootfs_cas.storageContentComplete(io, allocator, cache_root, storage)) return .stale;
-        return .{ .legacy = try spore.cloneRootfsStorage(allocator, storage) };
-    }
-    if (!std.mem.eql(u8, parsed.value.builder_version, builder_version)) return .unknown;
-    const input = currentRecordInput(parsed.value) catch |err| switch (err) {
-        error.UnknownBuildOperation => return .unknown,
-        else => return .stale,
+    errdefer parsed.deinit();
+    const storage = validChildStorage(parsed.value, expected_key) orelse {
+        parsed.deinit();
+        return .stale;
     };
-    const semantic_key = stepKey(allocator, input) catch return .stale;
+    if (std.mem.eql(u8, parsed.value.builder_version, legacy_builder_version)) {
+        return .{ .legacy = .{ .json = parsed, .storage = storage } };
+    }
+    if (!std.mem.eql(u8, parsed.value.builder_version, builder_version)) {
+        parsed.deinit();
+        return .unknown;
+    }
+    const input = currentRecordInput(parsed.value) catch |err| {
+        parsed.deinit();
+        return switch (err) {
+            error.UnknownBuildOperation => .unknown,
+            else => .stale,
+        };
+    };
+    const semantic_key = stepKey(allocator, input) catch {
+        parsed.deinit();
+        return .stale;
+    };
     defer allocator.free(semantic_key);
-    if (!std.mem.eql(u8, semantic_key, expected_key)) return .stale;
-    validateChildForInput(input, storage) catch return .stale;
-    // Complete stamps are invalidated before normal CAS deletion, so retain the
-    // O(1) fast path when possible and scan every object only to repair legacy
-    // or interrupted publication.
-    if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, storage) and
-        !try rootfs_cas.storageContentComplete(io, allocator, cache_root, storage)) return .stale;
-    return .{ .root = try spore.cloneRootfsStorage(allocator, storage) };
+    if (!std.mem.eql(u8, semantic_key, expected_key)) {
+        parsed.deinit();
+        return .stale;
+    }
+    validateChildForInput(input, storage) catch {
+        parsed.deinit();
+        return .stale;
+    };
+    return .{ .current = .{ .json = parsed, .input = input, .storage = storage } };
+}
+
+fn stepInputEql(a: StepInput, b: StepInput) bool {
+    const af = a.flatFields();
+    const bf = b.flatFields();
+    return std.mem.eql(u8, a.platform.os, b.platform.os) and
+        std.mem.eql(u8, a.platform.arch, b.platform.arch) and
+        std.mem.eql(u8, a.parent_index_digest, b.parent_index_digest) and
+        std.mem.eql(u8, a.canonical_instruction, b.canonical_instruction) and
+        std.mem.eql(u8, af.instruction_kind, bf.instruction_kind) and
+        std.mem.eql(u8, af.input_digest, bf.input_digest) and
+        std.mem.eql(u8, af.env_digest, bf.env_digest) and
+        std.mem.eql(u8, af.workdir, bf.workdir) and
+        af.network_mode == bf.network_mode and
+        af.memory_bytes == bf.memory_bytes and af.vcpus == bf.vcpus and
+        af.nofile_soft == bf.nofile_soft and af.nofile_hard == bf.nofile_hard and
+        af.exact_target == bf.exact_target and
+        optionalStringEql(af.producer_identity, bf.producer_identity) and
+        std.mem.eql(u8, af.executor_identity, bf.executor_identity);
+}
+
+fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a) |value| return b != null and std.mem.eql(u8, value, b.?);
+    return b == null;
 }
 
 fn validChildStorage(record: StepRecord, expected_key: []const u8) ?spore.RootfsStorage {
@@ -460,8 +532,7 @@ fn currentRecordInput(record: StepRecord) !StepInput {
     if (!no_prepare_fields) return error.MalformedBuildRecord;
     if (std.mem.eql(u8, record.instruction_kind, "RUN")) {
         if (!std.mem.startsWith(u8, record.instruction, "RUN ") or record.input_digest.len != 0 or
-            record.network_mode == null or record.memory_bytes == null or record.vcpus == null or
-            record.nofile_soft == null or record.nofile_hard == null) return error.MalformedBuildRecord;
+            record.network_mode == null) return error.MalformedBuildRecord;
         return .{
             .platform = record.platform,
             .parent_index_digest = record.parent_index_digest,
@@ -511,6 +582,14 @@ fn currentRecordInput(record: StepRecord) !StepInput {
     return error.UnknownBuildOperation;
 }
 
+fn currentRecordRetainedByGc(input: StepInput) bool {
+    return switch (input.operation) {
+        .run => |run| run.memory_bytes != null and run.vcpus != null and
+            run.nofile_soft != null and run.nofile_hard != null,
+        .scratch, .prepare, .copy, .workdir => true,
+    };
+}
+
 fn validateInput(input: StepInput, fields: StepInput.FlatFields) !void {
     if (!std.mem.eql(u8, input.platform.os, "linux") or !std.mem.eql(u8, input.platform.arch, "arm64")) {
         return error.BadBuildCacheInput;
@@ -554,15 +633,6 @@ fn validateChildForInput(input: StepInput, storage: spore.RootfsStorage) !void {
         .prepare => |prepare| if (storage.logical_size != prepare.exact_target) return error.BadManifest,
         .run, .copy, .workdir => {},
     }
-}
-
-fn recordPreparationFieldsMatch(record: StepRecord, fields: StepInput.FlatFields) bool {
-    if (record.exact_target != fields.exact_target) return false;
-    if (fields.producer_identity) |expected| {
-        const actual = record.producer_identity orelse return false;
-        return std.mem.eql(u8, actual, expected);
-    }
-    return record.producer_identity == null;
 }
 
 fn validateBlake3Identity(identity: []const u8) !void {
@@ -833,6 +903,10 @@ test "prepare record round trips typed identity and exact target" {
     const hit = (try readHit(io, arena, cache_root, input, key)) orelse return error.MissingBuildCacheRecord;
     try std.testing.expectEqual(storage.logical_size, hit.logical_size);
     try std.testing.expectEqualStrings(storage.index_digest, hit.index_digest);
+    switch (try inspectRecordForGc(io, arena, cache_root, path, key)) {
+        .root => |root| try std.testing.expectEqualStrings(storage.index_digest, root.index_digest),
+        .legacy, .stale, .unknown => return error.MissingBuildCacheRecord,
+    }
 
     try std.testing.expectError(error.BuildCacheKeyMismatch, readHit(
         io,
@@ -887,6 +961,10 @@ test "prepare record rejects target mismatch and missing completeness stamp" {
     });
     try chunk_sealer.replaceFileAtomicDurable(arena, path, mismatched_json, 0o444);
     try std.testing.expect((try readHit(io, arena, cache_root, input, key)) == null);
+    switch (try inspectRecordForGc(io, arena, cache_root, path, key)) {
+        .stale => {},
+        .root, .legacy, .unknown => return error.MalformedBuildRecordAccepted,
+    }
 
     _ = try writeRecord(io, arena, cache_root, input, key, storage);
     try rootfs_cas.removeStorageCompleteStamp(io, arena, cache_root, storage.index_digest);

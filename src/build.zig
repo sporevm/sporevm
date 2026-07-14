@@ -6,6 +6,7 @@ const dockerfile = @import("build/dockerfile.zig");
 const build_context = @import("build/context.zig");
 const build_context_disk = @import("build/context_disk.zig");
 const build_exec = @import("build/exec.zig");
+const instruction_transition = @import("build/instruction_transition.zig");
 const build_plan = @import("build/plan.zig");
 const variable_expansion = @import("build/variables.zig");
 const step_cache = @import("build/step_cache.zig");
@@ -391,77 +392,138 @@ fn buildStage(
     rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
 ) !BuiltStage {
     var state = initial_state;
-    var has_exec_step = false;
+    var transitions = std.array_list.Managed(instruction_transition.InstructionTransition).init(allocator);
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    stage_instructions: for (instructions, 0..) |instruction, index| {
-        if (try applyMetadataInstruction(allocator, options, global_args, &state, instruction)) continue;
-        if (!rootUser(state.user)) {
-            diagnostic.instruction_line = instruction.line;
-            return error.UnsupportedBuildUser;
-        }
-        if (instruction.value == .copy) {
-            const copy = instruction.value.copy;
-            if (copy.from != null) {
-                const binding = findStageCopyBinding(stage_inputs.bindings, index) orelse return error.BadManifest;
-                _ = stageCopyStep(allocator, state, instruction, copy, binding) catch |err| {
-                    diagnostic.instruction_line = instruction.line;
-                    return err;
-                };
-            }
-        }
-        has_exec_step = true;
-        if (try ensurePrepared(init, allocator, options.platform, cache_root, &state, &diagnostic.executor)) |preparation| {
-            state = try executeFromMiss(init, allocator, options, diagnostic, ctx, stat_cache, global_args, instructions[index..], stage_inputs, index, state, rootfs_cache_lock, preparation);
-            break :stage_instructions;
-        }
-        switch (instruction.value) {
-            .run => {
-                state.storage = cachedExecStep(init, allocator, options, state, instruction, "") catch |err| switch (err) {
-                    error.CacheMissRequiresBuildExecutor => {
-                        state = try executeFromMiss(init, allocator, options, diagnostic, ctx, stat_cache, global_args, instructions[index..], stage_inputs, index, state, rootfs_cache_lock, null);
-                        break :stage_instructions;
-                    },
-                    else => |e| return e,
-                };
-            },
-            .copy => |copy| {
-                const input_digest = if (copy.from != null)
-                    (findStageCopyBinding(stage_inputs.bindings, index) orelse return error.BadManifest).storage.index_digest
-                else blk: {
-                    const resolved_sources = try substituteStateList(allocator, copy.sources, state);
-                    const resolution = build_context.resolveCopySourcesWithDiagnostic(allocator, init.io, ctx, resolved_sources, &diagnostic.copy) catch |err| {
-                        diagnostic.instruction_line = instruction.line;
-                        return err;
-                    };
-                    break :blk try build_context.hashCopyResolutionWithOptions(allocator, init.io, ctx, resolution, .{
-                        .stat_cache = stat_cache,
-                        .diagnostic = &diagnostic.context_hash,
-                    });
-                };
-                state.storage = cachedExecStep(init, allocator, options, state, instruction, input_digest) catch |err| switch (err) {
-                    error.CacheMissRequiresBuildExecutor => {
-                        state = try executeFromMiss(init, allocator, options, diagnostic, ctx, stat_cache, global_args, instructions[index..], stage_inputs, index, state, rootfs_cache_lock, null);
-                        break :stage_instructions;
-                    },
-                    else => |e| return e,
-                };
-            },
-            .workdir => |raw| {
-                const target = try resolvedWorkdir(allocator, state, raw);
-                state.storage = cachedExecStep(init, allocator, options, state, instruction, "") catch |err| switch (err) {
-                    error.CacheMissRequiresBuildExecutor => {
-                        state = try executeFromMiss(init, allocator, options, diagnostic, ctx, stat_cache, global_args, instructions[index..], stage_inputs, index, state, rootfs_cache_lock, null);
-                        break :stage_instructions;
-                    },
-                    else => |e| return e,
-                };
-                state.workdir = target;
-            },
-            .from => unreachable,
-            else => unreachable,
+    for (instructions, 0..) |instruction, index| {
+        if (try instructionTransition(allocator, options, diagnostic, global_args, stage_inputs, &state, instruction, index)) |transition| {
+            try transitions.append(transition);
         }
     }
-    return .{ .state = state, .has_exec_step = has_exec_step };
+    if (transitions.items.len == 0) return .{ .state = state, .has_exec_step = false };
+
+    const pending_preparation = try ensurePrepared(init, allocator, options.platform, cache_root, &state, &diagnostic.executor);
+    const producer = state.producer orelse return error.BadManifest;
+    var transition_diagnostic = transitionDiagnostics(diagnostic);
+    const miss = if (pending_preparation != null)
+        instruction_transition.CacheWalkResult.Miss{ .transition_index = 0, .storage = state.storage }
+    else switch (try instruction_transition.walkCache(
+        init.io,
+        allocator,
+        cache_root,
+        options.platform,
+        producer.identity,
+        runResources(options),
+        options.no_cache,
+        ctx,
+        stat_cache,
+        &transition_diagnostic,
+        state.storage,
+        transitions.items,
+    )) {
+        .complete => |storage| {
+            state.storage = storage;
+            return .{ .state = state, .has_exec_step = true };
+        },
+        .miss => |value| value,
+    };
+
+    const lowered = try instruction_transition.lowerMissSuffix(
+        init.io,
+        allocator,
+        cache_root,
+        ctx,
+        stat_cache,
+        &transition_diagnostic,
+        transitions.items[miss.transition_index..],
+    );
+    const previous_executor = diagnostic.executor;
+    state.storage = build_exec.runSession(init, allocator, .{
+        .platform = options.platform,
+        .cache_root = cache_root,
+        .base_storage = miss.storage,
+        .steps = lowered.steps,
+        .rootfs_cache_lock = rootfs_cache_lock,
+        .preparation = pending_preparation,
+        .producer = producer,
+        .context_disk_path = lowered.context_disk_path,
+        .build_input_rootfs = stage_inputs.rootfs,
+        .resources = runResources(options),
+        .timeout_ms = options.timeout_ms,
+        .spore_executable = options.spore_executable,
+        .output = options.output,
+        .diagnostic = &diagnostic.executor,
+    }) catch |err| {
+        accumulateExecutorDiagnostic(&diagnostic.executor, previous_executor);
+        return err;
+    };
+    accumulateExecutorDiagnostic(&diagnostic.executor, previous_executor);
+    return .{ .state = state, .has_exec_step = true };
+}
+
+fn instructionTransition(
+    allocator: std.mem.Allocator,
+    options: Options,
+    diagnostic: *Diagnostic,
+    global_args: []const ArgValue,
+    stage_inputs: StageInputs,
+    state: *State,
+    instruction: dockerfile.Instruction,
+    instruction_index: usize,
+) !?instruction_transition.InstructionTransition {
+    if (try applyMetadataInstruction(allocator, options, global_args, state, instruction)) return null;
+    if (!rootUser(state.user)) {
+        diagnostic.instruction_line = instruction.line;
+        return error.UnsupportedBuildUser;
+    }
+    return switch (instruction.value) {
+        .run => |run| .{ .run = try runStep(allocator, diagnostic, state.*, instruction, run, options) },
+        .copy => |copy| if (copy.from != null) blk: {
+            const binding = findStageCopyBinding(stage_inputs.bindings, instruction_index) orelse return error.BadManifest;
+            const transition = instruction_transition.buildInputCopy(
+                allocator,
+                instruction.line,
+                instruction.raw,
+                try substituteStateList(allocator, copy.sources, state.*),
+                try substituteState(allocator, copy.dest, state.*),
+                try effectiveEnvDigest(allocator, state.*),
+                state.workdir,
+                binding.input_index,
+                binding.storage,
+            ) catch |err| {
+                diagnostic.instruction_line = instruction.line;
+                return err;
+            };
+            break :blk transition;
+        } else blk: {
+            const resolved_sources = try substituteStateList(allocator, copy.sources, state.*);
+            break :blk .{ .copy = .{ .context = .{
+                .line = instruction.line,
+                .canonical_instruction = instruction.raw,
+                .resolved_sources = resolved_sources,
+                .resolved_dest = try substituteState(allocator, copy.dest, state.*),
+                .env_digest = try effectiveEnvDigest(allocator, state.*),
+                .workdir = state.workdir,
+            } } };
+        },
+        .workdir => |raw| blk: {
+            const step = try workdirStep(allocator, state.*, instruction, raw);
+            state.workdir = step.target;
+            break :blk .{ .workdir = step };
+        },
+        .from => unreachable,
+        else => unreachable,
+    };
+}
+
+fn transitionDiagnostics(diagnostic: *Diagnostic) instruction_transition.Diagnostics {
+    return .{
+        .context_hash = &diagnostic.context_hash,
+        .context_disk = &diagnostic.context_disk,
+        .instruction_line = &diagnostic.instruction_line,
+        .copy = &diagnostic.copy,
+        .limit = &diagnostic.limit,
+        .actual = &diagnostic.actual,
+    };
 }
 
 fn findStageCopyBinding(bindings: []const StageCopyBinding, instruction_index: usize) ?StageCopyBinding {
@@ -788,100 +850,6 @@ fn ensurePrepared(
     };
 }
 
-fn cachedExecStep(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: Options,
-    state: State,
-    instruction: dockerfile.Instruction,
-    input_digest: []const u8,
-) !spore.RootfsStorage {
-    if (options.no_cache) return error.CacheMissRequiresBuildExecutor;
-    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    const producer = state.producer orelse return error.BadManifest;
-    const input = try execStepInput(allocator, options, state, instruction, input_digest, producer.identity);
-    const key = try step_cache.stepKey(allocator, input);
-    return (try step_cache.readHit(init.io, allocator, cache_root, input, key)) orelse error.CacheMissRequiresBuildExecutor;
-}
-
-fn executeFromMiss(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: Options,
-    diagnostic: *Diagnostic,
-    ctx: build_context.BuildContext,
-    stat_cache: ?*build_context.StatCache,
-    pre_from_args: []const ArgValue,
-    instructions: []const dockerfile.Instruction,
-    stage_inputs: StageInputs,
-    instruction_offset: usize,
-    initial_state: State,
-    rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
-    pending_preparation: ?build_exec.Preparation,
-) !State {
-    var state = initial_state;
-    var steps = std.array_list.Managed(build_exec.Step).init(allocator);
-    var context_disk = build_context_disk.Builder.init(allocator);
-    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    var context_snapshot: ?build_context.CopySnapshot = null;
-    defer if (context_snapshot) |*snapshot| snapshot.deinit(init.io);
-    for (instructions, 0..) |instruction, suffix_index| {
-        if (try applyMetadataInstruction(allocator, options, pre_from_args, &state, instruction)) continue;
-        switch (instruction.value) {
-            .run => |run| try steps.append(.{ .run = try runStep(allocator, diagnostic, state, instruction, run, options) }),
-            .copy => |copy| {
-                if (copy.from != null) {
-                    const binding = findStageCopyBinding(stage_inputs.bindings, instruction_offset + suffix_index) orelse return error.BadManifest;
-                    const step = stageCopyStep(allocator, state, instruction, copy, binding) catch |err| {
-                        diagnostic.instruction_line = instruction.line;
-                        return err;
-                    };
-                    try steps.append(.{ .copy = step });
-                } else {
-                    if (context_snapshot == null) context_snapshot = try build_context.CopySnapshot.init(allocator, init.io, cache_root);
-                    if (context_snapshot) |*snapshot| {
-                        try steps.append(.{ .copy = try copyStep(allocator, init.io, ctx, stat_cache, snapshot, &context_disk, diagnostic, state, instruction, copy) });
-                    } else unreachable;
-                }
-            },
-            .workdir => |raw| {
-                const step = try workdirStep(allocator, state, instruction, raw);
-                try steps.append(.{ .workdir = step });
-                state.workdir = step.target;
-            },
-            .from => return error.UnsupportedMultiStageDockerfile,
-            else => unreachable,
-        }
-    }
-
-    if (context_snapshot) |*snapshot| try snapshot.seal(init.io);
-    const context_disk_path = try context_disk.emitOrReuse(init.io, cache_root, &diagnostic.context_disk);
-    if (context_snapshot) |*snapshot| snapshot.deinit(init.io);
-    context_snapshot = null;
-    const previous_executor = diagnostic.executor;
-    state.storage = build_exec.runSession(init, allocator, .{
-        .platform = options.platform,
-        .cache_root = cache_root,
-        .base_storage = state.storage,
-        .steps = steps.items,
-        .rootfs_cache_lock = rootfs_cache_lock,
-        .preparation = pending_preparation,
-        .producer = state.producer orelse return error.BadManifest,
-        .context_disk_path = context_disk_path,
-        .build_input_rootfs = stage_inputs.rootfs,
-        .resources = runResources(options),
-        .timeout_ms = options.timeout_ms,
-        .spore_executable = options.spore_executable,
-        .output = options.output,
-        .diagnostic = &diagnostic.executor,
-    }) catch |err| {
-        accumulateExecutorDiagnostic(&diagnostic.executor, previous_executor);
-        return err;
-    };
-    accumulateExecutorDiagnostic(&diagnostic.executor, previous_executor);
-    return state;
-}
-
 fn accumulateExecutorDiagnostic(current: *build_exec.Diagnostic, previous: build_exec.Diagnostic) void {
     current.executed_steps += previous.executed_steps;
     current.boot_count += previous.boot_count;
@@ -959,235 +927,6 @@ fn workdirStep(
 fn resolvedWorkdir(allocator: std.mem.Allocator, state: State, raw: []const u8) ![]const u8 {
     const substituted = try substituteState(allocator, raw, state);
     return resolveWorkdir(allocator, state.workdir, substituted);
-}
-
-fn copyStep(
-    allocator: std.mem.Allocator,
-    io: Io,
-    ctx: build_context.BuildContext,
-    stat_cache: ?*build_context.StatCache,
-    context_snapshot: *build_context.CopySnapshot,
-    context_disk: *build_context_disk.Builder,
-    diagnostic: *Diagnostic,
-    state: State,
-    instruction: dockerfile.Instruction,
-    copy: dockerfile.Copy,
-) !build_exec.CopyStep {
-    const resolved_sources = try substituteStateList(allocator, copy.sources, state);
-    const resolved_dest = try substituteState(allocator, copy.dest, state);
-    const resolution = build_context.resolveCopySourcesWithDiagnostic(allocator, io, ctx, resolved_sources, &diagnostic.copy) catch |err| {
-        diagnostic.instruction_line = instruction.line;
-        return err;
-    };
-    const resolved_entries = try build_context.captureCopyResolutionWithOptions(allocator, io, ctx, resolution, .{
-        .stat_cache = stat_cache,
-        .diagnostic = &diagnostic.context_hash,
-    }, context_snapshot);
-    const input_digest = try build_context.hashResolvedCopyEntries(allocator, resolved_entries);
-    const source_prefix = try context_disk.addCapturedCopy(resolved_entries);
-    const dest_is_dir = copyDestIsDirectory(resolved_dest, resolution);
-    if (resolution.roots.len > 1 and !copyDestEndsWithSlash(resolved_dest)) {
-        diagnostic.instruction_line = instruction.line;
-        return error.CopyDestinationMustBeDirectory;
-    }
-    const dest = try normalizeGuestPath(allocator, state.workdir, resolved_dest);
-    const requests = try copyRequests(allocator, diagnostic, instruction.line, resolution, source_prefix, dest, dest_is_dir);
-    return .{
-        .line = instruction.line,
-        .canonical_instruction = instruction.raw,
-        .input_digest = input_digest,
-        .env_digest = try effectiveEnvDigest(allocator, state),
-        .workdir = state.workdir,
-        .requests = requests,
-    };
-}
-
-fn stageCopyStep(
-    allocator: std.mem.Allocator,
-    state: State,
-    instruction: dockerfile.Instruction,
-    copy: dockerfile.Copy,
-    binding: StageCopyBinding,
-) !build_exec.CopyStep {
-    const resolved_sources = try substituteStateList(allocator, copy.sources, state);
-    const resolved_dest = try substituteState(allocator, copy.dest, state);
-    if (resolved_sources.len > 1 and !copyDestEndsWithSlash(resolved_dest)) return error.CopyDestinationMustBeDirectory;
-    const dest = try normalizeGuestPath(allocator, state.workdir, resolved_dest);
-    const requests = try allocator.alloc(build_exec.CopyRequest, resolved_sources.len);
-    for (resolved_sources, 0..) |source, index| {
-        requests[index] = .{
-            .source = try normalizeStageCopySource(allocator, source),
-            .dest = dest,
-            .source_kind = .auto,
-            .dest_is_dir = copyDestEndsWithSlash(resolved_dest) or resolved_sources.len > 1,
-            .entry_count = 0,
-            .source_disk = .build_input,
-            .input_index = binding.input_index,
-        };
-    }
-    return .{
-        .line = instruction.line,
-        .canonical_instruction = instruction.raw,
-        .input_digest = binding.storage.index_digest,
-        .env_digest = try effectiveEnvDigest(allocator, state),
-        .workdir = state.workdir,
-        .requests = requests,
-    };
-}
-
-fn normalizeStageCopySource(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
-    if (source.len == 0) return error.CopySourceNotFound;
-    if (std.mem.indexOfAny(u8, source, "*?[") != null) return error.UnsupportedCopyFromPattern;
-    var parts = std.array_list.Managed([]const u8).init(allocator);
-    var it = std.mem.splitScalar(u8, source, '/');
-    while (it.next()) |part| {
-        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
-        if (std.mem.eql(u8, part, "..")) return error.CopySourceEscapesContext;
-        try parts.append(part);
-    }
-    if (parts.items.len == 0) return allocator.dupe(u8, ".");
-    return std.mem.join(allocator, "/", parts.items);
-}
-
-fn copyDestIsDirectory(dest: []const u8, resolution: build_context.CopyResolution) bool {
-    if (copyDestEndsWithSlash(dest)) return true;
-    if (resolution.roots.len != 1) return false;
-    return resolution.roots[0].kind == .directory;
-}
-
-fn copyDestEndsWithSlash(dest: []const u8) bool {
-    return dest.len != 0 and dest[dest.len - 1] == '/';
-}
-
-fn copyRequests(
-    allocator: std.mem.Allocator,
-    diagnostic: *Diagnostic,
-    instruction_line: usize,
-    resolution: build_context.CopyResolution,
-    source_prefix: []const u8,
-    dest: []const u8,
-    dest_is_dir: bool,
-) ![]const build_exec.CopyRequest {
-    if (resolution.roots.len == 0) return error.CopySourceNotFound;
-    var out = std.array_list.Managed(build_exec.CopyRequest).init(allocator);
-    for (resolution.roots) |root| {
-        const entry_count = copyRootEntryCount(resolution, root);
-        if (entry_count == 0) return error.CopySourceNotFound;
-        if (entry_count > build_exec.max_copy_entries) {
-            diagnostic.instruction_line = instruction_line;
-            diagnostic.copy.source = root.rel;
-            diagnostic.limit = build_exec.max_copy_entries;
-            diagnostic.actual = entry_count;
-            return error.CopyEntryCountUnsupported;
-        }
-        const source = if (std.mem.eql(u8, root.rel, "."))
-            source_prefix
-        else
-            try std.fs.path.join(allocator, &.{ source_prefix, root.rel });
-        try out.append(.{
-            .source = source,
-            .dest = dest,
-            .source_kind = try copySourceKind(root.kind),
-            .dest_is_dir = dest_is_dir,
-            .entry_count = entry_count,
-        });
-    }
-    return out.toOwnedSlice();
-}
-
-fn copyRootEntryCount(resolution: build_context.CopyResolution, root: build_context.CopyRoot) usize {
-    if (std.mem.eql(u8, root.rel, ".")) return resolution.entries.len;
-    var count: usize = 0;
-    for (resolution.entries) |entry| {
-        if (std.mem.eql(u8, entry.rel, root.rel) or
-            (entry.rel.len > root.rel.len and std.mem.startsWith(u8, entry.rel, root.rel) and entry.rel[root.rel.len] == '/'))
-        {
-            count += 1;
-        }
-    }
-    return count;
-}
-
-fn copySourceKind(kind: Io.File.Kind) !build_exec.CopySourceKind {
-    return switch (kind) {
-        .directory => .directory,
-        .file => .file,
-        .sym_link => .sym_link,
-        else => error.UnsupportedCopySourceType,
-    };
-}
-
-fn normalizeGuestPath(allocator: std.mem.Allocator, workdir: []const u8, raw: []const u8) ![]const u8 {
-    var parts = std.array_list.Managed([]const u8).init(allocator);
-    if (!std.fs.path.isAbsolute(raw)) {
-        try appendGuestPathParts(&parts, workdir);
-    }
-    try appendGuestPathParts(&parts, raw);
-    return guestPathFromParts(allocator, parts.items);
-}
-
-fn appendGuestPathParts(parts: *std.array_list.Managed([]const u8), path: []const u8) !void {
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |part| {
-        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
-        if (std.mem.eql(u8, part, "..")) return error.CopyDestinationUnsupported;
-        try parts.append(part);
-    }
-}
-
-fn guestPathFromParts(allocator: std.mem.Allocator, parts: []const []const u8) ![]const u8 {
-    if (parts.len == 0) return allocator.dupe(u8, "/");
-    var out = std.array_list.Managed(u8).init(allocator);
-    for (parts) |part| {
-        try out.append('/');
-        try out.appendSlice(part);
-    }
-    return out.toOwnedSlice();
-}
-
-fn execStepInput(
-    allocator: std.mem.Allocator,
-    options: Options,
-    state: State,
-    instruction: dockerfile.Instruction,
-    input_digest: []const u8,
-    executor_identity: []const u8,
-) !step_cache.StepInput {
-    const env_digest = try effectiveEnvDigest(allocator, state);
-    const step: build_exec.Step = switch (instruction.value) {
-        .run => |run| .{ .run = .{
-            .line = instruction.line,
-            .canonical_instruction = instruction.raw,
-            .command = run.shell,
-            .env = &.{},
-            .env_digest = try effectiveRunEnvDigest(allocator, state),
-            .workdir = state.workdir,
-            .network_mode = options.network,
-        } },
-        .copy => .{ .copy = .{
-            .line = instruction.line,
-            .canonical_instruction = instruction.raw,
-            .input_digest = input_digest,
-            .env_digest = env_digest,
-            .workdir = state.workdir,
-            .requests = &.{},
-        } },
-        .workdir => |raw| .{ .workdir = .{
-            .line = instruction.line,
-            .canonical_instruction = instruction.raw,
-            .target = try resolvedWorkdir(allocator, state, raw),
-            .env_digest = env_digest,
-            .workdir = state.workdir,
-        } },
-        else => unreachable,
-    };
-    return build_exec.cacheInputForStep(
-        options.platform,
-        state.storage.index_digest,
-        executor_identity,
-        step,
-        runResources(options),
-    );
 }
 
 fn runResources(options: Options) build_exec.RunResources {
@@ -1295,7 +1034,7 @@ fn resolveCmd(allocator: std.mem.Allocator, cmd: dockerfile.Cmd) ![]const []cons
 }
 
 fn resolveWorkdir(allocator: std.mem.Allocator, current: []const u8, next: []const u8) ![]const u8 {
-    return normalizeGuestPath(allocator, current, next);
+    return instruction_transition.normalizeGuestPath(allocator, current, next);
 }
 
 fn substituteStateList(allocator: std.mem.Allocator, raw: []const []const u8, state: State) ![]const []const u8 {
@@ -1407,6 +1146,29 @@ fn testStorage() spore.RootfsStorage {
 }
 
 const test_executor_identity = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+fn contextCopyTransitionForTest(
+    allocator: std.mem.Allocator,
+    context_dir: []const u8,
+    diagnostic: *Diagnostic,
+    initial_state: State,
+    instruction: dockerfile.Instruction,
+    instruction_index: usize,
+) !instruction_transition.InstructionTransition.ContextCopy {
+    var state = initial_state;
+    const transition = (try instructionTransition(allocator, .{
+        .tag = "local/app:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = "unused",
+    }, diagnostic, &.{}, .{ .bindings = &.{}, .rootfs = &.{} }, &state, instruction, instruction_index)) orelse unreachable;
+    return switch (transition) {
+        .copy => |copy| switch (copy) {
+            .context => |context| context,
+            .build_input => unreachable,
+        },
+        .run, .workdir => unreachable,
+    };
+}
 
 test "variable substitution uses env before args" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1768,7 +1530,7 @@ test "build image references use Docker Hub defaults" {
     try std.testing.expectEqualStrings("ghcr.io/example/app:v1", explicit);
 }
 
-test "RUN cache identity includes network mode and matches executor" {
+test "RUN cache identity includes network mode and resources" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1794,39 +1556,31 @@ test "RUN cache identity includes network mode and matches executor" {
     none_options.network = .none;
     var diagnostic: Diagnostic = .{};
     const step = try runStep(arena, &diagnostic, state, instruction, instruction.value.run, spore_options);
-    const spore_read = try execStepInput(arena, spore_options, state, instruction, "", test_executor_identity);
-    const spore_write = build_exec.cacheInputForStep(spore_options.platform, state.storage.index_digest, test_executor_identity, .{ .run = step }, runResources(spore_options));
-    const spore_read_key = try step_cache.stepKey(arena, spore_read);
-    const spore_write_key = try step_cache.stepKey(arena, spore_write);
-    try std.testing.expectEqualStrings(spore_read_key, spore_write_key);
+    const spore_input = build_exec.cacheInputForStep(spore_options.platform, state.storage.index_digest, test_executor_identity, .{ .run = step }, runResources(spore_options));
+    const spore_key = try step_cache.stepKey(arena, spore_input);
 
-    const none_read = try execStepInput(arena, none_options, state, instruction, "", test_executor_identity);
     var none_step = step;
     none_step.network_mode = .none;
-    const none_write = build_exec.cacheInputForStep(none_options.platform, state.storage.index_digest, test_executor_identity, .{ .run = none_step }, runResources(none_options));
-    const none_read_key = try step_cache.stepKey(arena, none_read);
-    const none_write_key = try step_cache.stepKey(arena, none_write);
-    try std.testing.expectEqualStrings(none_read_key, none_write_key);
-    try std.testing.expect(!std.mem.eql(u8, spore_read_key, none_read_key));
+    const none_input = build_exec.cacheInputForStep(none_options.platform, state.storage.index_digest, test_executor_identity, .{ .run = none_step }, runResources(none_options));
+    const none_key = try step_cache.stepKey(arena, none_input);
+    try std.testing.expect(!std.mem.eql(u8, spore_key, none_key));
 
     var resource_options = spore_options;
     resource_options.memory.bytes += memory_config.page_alignment;
     resource_options.vcpus = 2;
     resource_options.nofile = .{ .soft = 32_768, .hard = 65_536 };
-    const resource_read = try execStepInput(arena, resource_options, state, instruction, "", test_executor_identity);
-    const resource_write = build_exec.cacheInputForStep(
+    const resource_input = build_exec.cacheInputForStep(
         resource_options.platform,
         state.storage.index_digest,
         test_executor_identity,
         .{ .run = step },
         runResources(resource_options),
     );
-    const resource_read_key = try step_cache.stepKey(arena, resource_read);
-    try std.testing.expectEqualStrings(resource_read_key, try step_cache.stepKey(arena, resource_write));
-    try std.testing.expect(!std.mem.eql(u8, spore_read_key, resource_read_key));
+    const resource_key = try step_cache.stepKey(arena, resource_input);
+    try std.testing.expect(!std.mem.eql(u8, spore_key, resource_key));
 }
 
-test "WORKDIR executor step key matches cached read key" {
+test "WORKDIR transition resolves environment before cache lookup" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1846,19 +1600,13 @@ test "WORKDIR executor step key matches cached read key" {
         .workdir = "/previous",
     };
     const instruction = doc.stages[0].instructions[1];
-    const options = Options{
-        .tag = "local/app:dev",
-        .context_dir = "unused",
-        .dockerfile_path = "unused",
-    };
     const step = try workdirStep(arena, state, instruction, instruction.value.workdir);
     try std.testing.expectEqualStrings("/srv/app", step.target);
-    const read_input = try execStepInput(arena, options, state, instruction, "", test_executor_identity);
-    const write_input = build_exec.cacheInputForStep(options.platform, state.storage.index_digest, test_executor_identity, .{ .workdir = step }, runResources(options));
-    try std.testing.expectEqualStrings(try step_cache.stepKey(arena, read_input), try step_cache.stepKey(arena, write_input));
+    try std.testing.expectEqualStrings("/previous", step.workdir);
+    try std.testing.expectEqualStrings(try effectiveEnvDigest(arena, state), step.env_digest);
 }
 
-test "COPY executor step key matches cached read key" {
+test "COPY cache identity ignores run-only network mode" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1892,8 +1640,6 @@ test "COPY executor step key matches cached read key" {
         .dockerfile_path = "unused",
     };
     const input_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const read_input = try execStepInput(arena, options, state, instruction, input_digest, test_executor_identity);
-    const read_key = try step_cache.stepKey(arena, read_input);
     const env_digest = try effectiveEnvDigest(arena, state);
     const copy_step = build_exec.Step{ .copy = .{
         .canonical_instruction = instruction.raw,
@@ -1902,16 +1648,13 @@ test "COPY executor step key matches cached read key" {
         .workdir = state.workdir,
         .requests = &.{},
     } };
-    const write_input = build_exec.cacheInputForStep(options.platform, storage.index_digest, test_executor_identity, copy_step, runResources(options));
-    const write_key = try step_cache.stepKey(arena, write_input);
-    try std.testing.expectEqualStrings(read_key, write_key);
+    const input = build_exec.cacheInputForStep(options.platform, storage.index_digest, test_executor_identity, copy_step, runResources(options));
+    const key = try step_cache.stepKey(arena, input);
 
     var none_options = options;
     none_options.network = .none;
-    const none_read_input = try execStepInput(arena, none_options, state, instruction, input_digest, test_executor_identity);
-    const none_write_input = build_exec.cacheInputForStep(none_options.platform, storage.index_digest, test_executor_identity, copy_step, runResources(none_options));
-    try std.testing.expectEqualStrings(read_key, try step_cache.stepKey(arena, none_read_input));
-    try std.testing.expectEqualStrings(write_key, try step_cache.stepKey(arena, none_write_input));
+    const none_input = build_exec.cacheInputForStep(none_options.platform, storage.index_digest, test_executor_identity, copy_step, runResources(none_options));
+    try std.testing.expectEqualStrings(key, try step_cache.stepKey(arena, none_input));
 }
 
 test "build disk grow target uses deterministic sparse policy" {
@@ -1949,9 +1692,9 @@ test "COPY destination rejects guest path escape" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try std.testing.expectError(error.CopyDestinationUnsupported, normalizeGuestPath(arena, "/app", "../secret"));
-    try std.testing.expectError(error.CopyDestinationUnsupported, normalizeGuestPath(arena, "/app", "/tmp/../secret"));
-    const resolved = try normalizeGuestPath(arena, "/app", "subdir/.");
+    try std.testing.expectError(error.CopyDestinationUnsupported, instruction_transition.normalizeGuestPath(arena, "/app", "../secret"));
+    try std.testing.expectError(error.CopyDestinationUnsupported, instruction_transition.normalizeGuestPath(arena, "/app", "/tmp/../secret"));
+    const resolved = try instruction_transition.normalizeGuestPath(arena, "/app", "subdir/.");
     try std.testing.expectEqualStrings("/app/subdir", resolved);
 }
 
@@ -1985,7 +1728,9 @@ test "COPY file source can target non-slash file destination" {
     var snapshot = try build_context.CopySnapshot.init(arena, io, root);
     defer snapshot.deinit(io);
     var context_disk = build_context_disk.Builder.init(arena);
-    const step = try copyStep(arena, io, ctx, null, &snapshot, &context_disk, &diagnostic, state, doc.stages[0].instructions[1], doc.stages[0].instructions[1].value.copy);
+    const context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[1], 1);
+    var transition_diagnostic = transitionDiagnostics(&diagnostic);
+    const step = try instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &context_disk, &transition_diagnostic, context);
     try std.testing.expectEqual(@as(usize, 1), step.requests.len);
     try std.testing.expectEqual(.file, step.requests[0].source_kind);
     try std.testing.expectEqualStrings("s0/source.txt", step.requests[0].source);
@@ -2025,7 +1770,9 @@ test "COPY multiple sources require trailing slash destination" {
     var snapshot = try build_context.CopySnapshot.init(arena, io, root);
     defer snapshot.deinit(io);
     var context_disk = build_context_disk.Builder.init(arena);
-    try std.testing.expectError(error.CopyDestinationMustBeDirectory, copyStep(arena, io, ctx, null, &snapshot, &context_disk, &diagnostic, state, doc.stages[0].instructions[1], doc.stages[0].instructions[1].value.copy));
+    const context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[1], 1);
+    var transition_diagnostic = transitionDiagnostics(&diagnostic);
+    try std.testing.expectError(error.CopyDestinationMustBeDirectory, instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &context_disk, &transition_diagnostic, context));
 }
 
 test "COPY directory source preserves empty subdirectory entry" {
@@ -2055,7 +1802,9 @@ test "COPY directory source preserves empty subdirectory entry" {
     var snapshot = try build_context.CopySnapshot.init(arena, io, root);
     defer snapshot.deinit(io);
     var context_disk = build_context_disk.Builder.init(arena);
-    const step = try copyStep(arena, io, ctx, null, &snapshot, &context_disk, &diagnostic, state, doc.stages[0].instructions[0], doc.stages[0].instructions[0].value.copy);
+    const context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[0], 0);
+    var transition_diagnostic = transitionDiagnostics(&diagnostic);
+    const step = try instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &context_disk, &transition_diagnostic, context);
     try std.testing.expectEqual(@as(usize, 1), step.requests.len);
     try std.testing.expectEqual(.directory, step.requests[0].source_kind);
     try std.testing.expectEqualStrings("s0/src", step.requests[0].source);
