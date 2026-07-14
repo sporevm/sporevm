@@ -8,6 +8,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const chunk = @import("chunk.zig");
 
+const testing = if (builtin.is_test) struct {
+    var created_dir_syncs: ?*usize = null;
+} else struct {};
+
 pub const Error = error{
     BadChunk,
     ClockFailed,
@@ -270,10 +274,20 @@ pub fn ensureDirPath(allocator: std.mem.Allocator, path: []const u8) Error!void 
         if (byte != std.fs.path.sep) continue;
         if (i == 0) continue;
         path_z[i] = 0;
-        try mkdirIfMissing(path_z.ptr);
+        if (try mkdirIfMissing(path_z.ptr)) {
+            try fsyncParentDirPath(allocator, path_z[0..i]);
+            if (comptime builtin.is_test) {
+                if (testing.created_dir_syncs) |count| count.* += 1;
+            }
+        }
         path_z[i] = std.fs.path.sep;
     }
-    try mkdirIfMissing(path_z.ptr);
+    if (try mkdirIfMissing(path_z.ptr)) {
+        try fsyncParentDirPath(allocator, path_z[0..path_z.len]);
+        if (comptime builtin.is_test) {
+            if (testing.created_dir_syncs) |count| count.* += 1;
+        }
+    }
 }
 
 pub fn pwriteFileAll(fd: std.c.fd_t, offset: usize, data: []const u8) Error!void {
@@ -355,10 +369,10 @@ fn fstatRegularSize(fd: std.c.fd_t) Error!usize {
     }
 }
 
-fn mkdirIfMissing(path: [*:0]const u8) Error!void {
-    if (std.c.mkdir(path, 0o755) == 0) return;
+fn mkdirIfMissing(path: [*:0]const u8) Error!bool {
+    if (std.c.mkdir(path, 0o755) == 0) return true;
     switch (std.c.errno(-1)) {
-        .EXIST => return,
+        .EXIST => return false,
         else => return error.IoFailed,
     }
 }
@@ -582,4 +596,18 @@ test "durable atomic replace updates existing data" {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(64));
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("second", bytes);
+}
+
+test "ensure directory path durably syncs each newly created ancestor" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/a/b/c", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
+
+    var sync_count: usize = 0;
+    testing.created_dir_syncs = &sync_count;
+    defer testing.created_dir_syncs = null;
+    try ensureDirPath(allocator, path);
+    try std.testing.expectEqual(@as(usize, 3), sync_count);
 }

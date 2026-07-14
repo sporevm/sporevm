@@ -461,10 +461,12 @@ pub fn removeStorageCompleteStamp(
 ) !void {
     const stamp_path = try storageCompleteStampPath(allocator, cache_root, index_digest);
     defer allocator.free(stamp_path);
+    var removed = true;
     Io.Dir.cwd().deleteFile(io, stamp_path) catch |err| switch (err) {
-        error.FileNotFound => {},
+        error.FileNotFound => removed = false,
         else => |e| return e,
     };
+    if (removed) try chunk_sealer.fsyncParentDirPath(allocator, stamp_path);
 }
 
 pub fn removeStorageCompleteStampsReferencingObject(
@@ -570,6 +572,30 @@ pub fn installStorageIndexPath(
     return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
 }
 
+/// Installs a verified storage index, atomically replacing an invalid entry.
+/// The caller must hold the exclusive rootfs cache lock and must have durably
+/// removed any completeness stamp that could make the entry visible as
+/// complete before calling this repair path.
+pub fn installStorageIndexPathRepairingInvalid(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_path: []const u8,
+    data: []const u8,
+    storage: spore.RootfsStorage,
+) !InstallResult {
+    return installStorageIndexPath(allocator, io, cache_path, data, storage) catch |err| switch (err) {
+        error.MissingChunk, error.BadChunk, error.ShortRead, error.BadManifest, error.FormatTooOld => {
+            var parsed = try parseStorageDiskIndex(allocator, data, storage);
+            parsed.deinit();
+            try chunk_sealer.replaceFileAtomicDurable(allocator, cache_path, data, 0o444);
+            const installed = try readVerifiedStorageIndexPath(allocator, cache_path, storage);
+            defer allocator.free(installed);
+            return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
+        },
+        else => |e| return e,
+    };
+}
+
 pub fn installChunkPath(
     allocator: std.mem.Allocator,
     io: Io,
@@ -591,6 +617,30 @@ pub fn installChunkPath(
     const installed = try readVerifiedChunkPath(allocator, cache_path, digest, expected_size);
     defer allocator.free(installed);
     return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
+}
+
+/// Installs a verified chunk, atomically replacing an invalid entry. The
+/// caller must hold the exclusive rootfs cache lock and must have durably
+/// removed any completeness stamp that could reference the entry.
+pub fn installChunkPathRepairingInvalid(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_path: []const u8,
+    data: []const u8,
+    digest: []const u8,
+    expected_size: usize,
+) !InstallResult {
+    return installChunkPath(allocator, io, cache_path, data, digest, expected_size) catch |err| switch (err) {
+        error.MissingChunk, error.BadChunk, error.ShortRead => {
+            if (data.len != expected_size) return error.BadChunk;
+            try verifyDigestBytes(digest, data);
+            try chunk_sealer.replaceFileAtomicDurable(allocator, cache_path, data, 0o444);
+            const installed = try readVerifiedChunkPath(allocator, cache_path, digest, expected_size);
+            defer allocator.free(installed);
+            return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
+        },
+        else => |e| return e,
+    };
 }
 
 pub fn manifestIndexPath(allocator: std.mem.Allocator, cache_root: []const u8, index_digest: []const u8) ![]const u8 {
