@@ -152,7 +152,8 @@ The missing work falls into three different categories:
   heredocs, `USER`, `VOLUME`, `EXPOSE`, `HEALTHCHECK`, and `ONBUILD` still fail
   closed. C2 now also accepts bounded non-empty JSON-array `RUN` and executes
   its exact argv with Docker-compatible PATH lookup and no implicit variable
-  expansion.
+  expansion. Effective RUN environments normalize duplicate inherited keys
+  with runc's last-value-wins rule before cache hashing and guest serialization.
 - No replacement for the wrapper's preliminary `docker build --target ci` of
   the Buildkite app image. That Dockerfile uses `syntax=docker/dockerfile:1.20`
   features (`RUN --mount=type=cache`, `COPY --link`, remote `ADD`, heredocs)
@@ -483,7 +484,8 @@ The orchestrator threads a `BuildState` through the instruction list:
 const BuildState = struct {
     storage: RootfsStorage,      // current parent rootfs index + geometry
     capacity_target: u64,        // fixed once from immutable FROM storage
-    env: []const EnvPair,       // base config Env, then ENV accumulation
+    config_env: []const EnvPair, // ordered OCI publication view
+    effective_env: []const EnvPair, // last-value-wins expansion/RUN view
     args: []const ArgPair,      // declared ARG values
     workdir: []const u8,        // current WORKDIR
     cmd: ?[]const []const u8,   // CMD, metadata only
@@ -579,11 +581,13 @@ Per-instruction inputs:
   chunk size, hash algorithm, and object namespace.
 - `RUN`: the exact canonical shell- or exec-form instruction, the current
   `WORKDIR`, and the network mode.
-  The environment digest is an ordered, length-framed sequence of accumulated
-  `ENV` entries followed by typed `ARG` records (key, presence bit, value),
-  including list counts. It preserves duplicate ENV order, distinguishes ENV
-  from ARG state and unset ARG from an explicitly empty value, and cannot alias
-  embedded newlines with multiple entries. `input_digest` is empty.
+  The environment digest is an ordered, length-framed sequence of the effective
+  last-value-wins `ENV` entries followed by typed `ARG` records (key, presence
+  bit, value), including list counts. Raw duplicate `Config.Env` entries remain
+  ordered for OCI publication, while equivalent normalized ENV plus typed ARG
+  state intentionally shares a digest. The digest distinguishes ENV from ARG state
+  and unset ARG from an explicitly empty value, and cannot alias embedded
+  newlines with multiple entries. `input_digest` is empty.
 - `COPY`: the substituted source patterns and dest, the current `WORKDIR`,
   and `input_digest` = the context content hash of the matched sources:
   after sorting by relative path and deduplicating repeated matches, each
@@ -931,9 +935,11 @@ and enumerate one canonical full rootfs CAS index.
      selected candidate is terminal and never falls through to a later entry.
      The v2 guest request is an exact bounded object: every documented field
      appears once, aliases and unknown fields are rejected, arrays have no
-     trailing commas, and no non-whitespace bytes follow the object. Both forms
-     stream output, report the exact exit code, and use the session's
-     `--network` policy.
+     trailing commas, the complete request ends in a newline, and no
+     non-whitespace bytes follow the object. Strings preserve valid raw UTF-8
+     and decoded Unicode escapes, while invalid UTF-8, embedded NULs, and
+     unpaired surrogates fail closed. Both forms stream output, report the exact
+     exit code, and use the session's `--network` policy.
    - `COPY`: before boot, the host emits the resolved context entries needed
      by executed COPY steps into a cached read-only ext4 context disk and
      attaches it as an additional virtio-blk device. Per step, the host sends
@@ -1267,7 +1273,17 @@ without becoming published ENV. In particular, ARG followed by ENV leaves ENV
 effective, while ENV followed by ARG changes later build execution but retains
 the published ENV value. PATH participates in every environment-bound
 Dockerfile operation key, so older records created without it miss safely. This
-does not add `USER` execution semantics.
+does not add `USER` execution semantics. Imported duplicate environment keys
+remain ordered in published `Config.Env`, while the current stage carries a
+separate last-value-wins effective view. A later Dockerfile `ENV` updates both
+views according to their respective Docker semantics before subsequent
+expansion, execution, and cache hashing. A new `FROM` reconstructs its
+effective view from the preceding stage's published `Config.Env`, matching
+BuildKit when that raw list still contains duplicates. RUN rejects effective
+entries that are bare empty strings, have an empty `=value` name, or contain an
+embedded NUL before cache lookup. Nonempty entries without `=` are omitted from
+the effective environment to match the pinned BuildKit/runc path, while raw OCI
+publication remains unchanged.
 
 Structural follow-ups are explicit gates before C2 widens the instruction
 surface:
@@ -1427,8 +1443,9 @@ ref refresh) ≤2s warm-stat; uncached COPY ≈ context-disk emit/reuse +
 guest disk-to-disk apply plus one freeze/dirty-only sealing and full-index checkpoint, with boot
 amortized per build.
 
-- **Done:** bounded exec-form RUN with exact argv, effective ENV/ARG, PATH
-  lookup, cache invalidation, and Docker/BuildKit differential coverage;
+- **Done:** bounded exec-form RUN with exact Unicode-preserving argv, effective
+  last-value-wins ENV/ARG, PATH lookup, strict newline framing, cache
+  invalidation, and Docker/BuildKit differential coverage;
 - full stable builder-owned variable expansion, including same-instruction
   snapshots, unset-to-empty behavior, quote/escape provenance, and the stable
   parameter operators. Exec-form RUN is deliberately separate from that work:

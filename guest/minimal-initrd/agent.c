@@ -936,6 +936,7 @@ static ssize_t read_line(int fd, char *buf, size_t cap) {
     if (c == '\n') break;
   }
   buf[len] = '\0';
+  if (len + 1 == cap && (len == 0 || buf[len - 1] != '\n')) return -2;
   return (ssize_t)len;
 }
 
@@ -1717,15 +1718,87 @@ static const char *skip_ws(const char *p) {
   return p;
 }
 
+static int json_hex_quad(const char *p, uint32_t *out) {
+  uint32_t value = 0;
+  for (size_t i = 0; i < 4; i++) {
+    unsigned char c = (unsigned char)p[i];
+    int digit = c >= '0' && c <= '9' ? c - '0' :
+                c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+    if (digit < 0) return -1;
+    value = (value << 4) | (uint32_t)digit;
+  }
+  *out = value;
+  return 0;
+}
+
+static int append_json_codepoint(char *out, size_t cap, size_t *len, uint32_t codepoint) {
+  unsigned char encoded[4];
+  size_t encoded_len = 0;
+  if (codepoint == 0 || codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff)) return -1;
+  if (codepoint <= 0x7f) {
+    encoded[0] = (unsigned char)codepoint;
+    encoded_len = 1;
+  } else if (codepoint <= 0x7ff) {
+    encoded[0] = (unsigned char)(0xc0 | (codepoint >> 6));
+    encoded[1] = (unsigned char)(0x80 | (codepoint & 0x3f));
+    encoded_len = 2;
+  } else if (codepoint <= 0xffff) {
+    encoded[0] = (unsigned char)(0xe0 | (codepoint >> 12));
+    encoded[1] = (unsigned char)(0x80 | ((codepoint >> 6) & 0x3f));
+    encoded[2] = (unsigned char)(0x80 | (codepoint & 0x3f));
+    encoded_len = 3;
+  } else {
+    encoded[0] = (unsigned char)(0xf0 | (codepoint >> 18));
+    encoded[1] = (unsigned char)(0x80 | ((codepoint >> 12) & 0x3f));
+    encoded[2] = (unsigned char)(0x80 | ((codepoint >> 6) & 0x3f));
+    encoded[3] = (unsigned char)(0x80 | (codepoint & 0x3f));
+    encoded_len = 4;
+  }
+  if (encoded_len >= cap - *len) return -1;
+  memcpy(out + *len, encoded, encoded_len);
+  *len += encoded_len;
+  return 0;
+}
+
+static int raw_utf8_sequence_len(const unsigned char *p) {
+  unsigned char c = p[0];
+  if (c >= 0xc2 && c <= 0xdf) {
+    unsigned char c1 = p[1];
+    return c1 >= 0x80 && c1 <= 0xbf ? 2 : -1;
+  }
+  if (c >= 0xe0 && c <= 0xef) {
+    unsigned char c1 = p[1];
+    if (c1 == '\0') return -1;
+    unsigned char c2 = p[2];
+    if (c2 < 0x80 || c2 > 0xbf) return -1;
+    if (c == 0xe0) return c1 >= 0xa0 && c1 <= 0xbf ? 3 : -1;
+    if (c == 0xed) return c1 >= 0x80 && c1 <= 0x9f ? 3 : -1;
+    return c1 >= 0x80 && c1 <= 0xbf ? 3 : -1;
+  }
+  if (c >= 0xf0 && c <= 0xf4) {
+    unsigned char c1 = p[1];
+    if (c1 == '\0') return -1;
+    unsigned char c2 = p[2];
+    if (c2 == '\0') return -1;
+    unsigned char c3 = p[3];
+    if (c2 < 0x80 || c2 > 0xbf || c3 < 0x80 || c3 > 0xbf) return -1;
+    if (c == 0xf0) return c1 >= 0x90 && c1 <= 0xbf ? 4 : -1;
+    if (c == 0xf4) return c1 >= 0x80 && c1 <= 0x8f ? 4 : -1;
+    return c1 >= 0x80 && c1 <= 0xbf ? 4 : -1;
+  }
+  return -1;
+}
+
 static int parse_json_string(const char **cursor, char *out, size_t cap) {
   const char *p = *cursor;
   if (*p != '"') return -1;
   p++;
   size_t len = 0;
   while (*p != '\0' && *p != '"') {
-    char c = *p++;
+    unsigned char c = (unsigned char)*p++;
     if (c == '\\') {
-      c = *p++;
+      c = (unsigned char)*p++;
       switch (c) {
         case '"':
         case '\\':
@@ -1747,33 +1820,122 @@ static int parse_json_string(const char **cursor, char *out, size_t cap) {
           c = '\t';
           break;
         case 'u': {
-          if (p[0] == '\0' || p[1] == '\0' || p[2] == '\0' || p[3] == '\0') return -1;
-          if (p[0] != '0' || p[1] != '0') return -1;
-          int hi = p[2] >= '0' && p[2] <= '9' ? p[2] - '0' :
-                   p[2] >= 'a' && p[2] <= 'f' ? p[2] - 'a' + 10 :
-                   p[2] >= 'A' && p[2] <= 'F' ? p[2] - 'A' + 10 : -1;
-          int lo = p[3] >= '0' && p[3] <= '9' ? p[3] - '0' :
-                   p[3] >= 'a' && p[3] <= 'f' ? p[3] - 'a' + 10 :
-                   p[3] >= 'A' && p[3] <= 'F' ? p[3] - 'A' + 10 : -1;
-          if (hi < 0 || lo < 0) return -1;
-          c = (char)((hi << 4) | lo);
-          if (c == '\0') return -1;
+          uint32_t codepoint = 0;
+          if (json_hex_quad(p, &codepoint) != 0) return -1;
           p += 4;
-          break;
+          if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
+            uint32_t low = 0;
+            if (p[0] != '\\' || p[1] != 'u' || json_hex_quad(p + 2, &low) != 0 || low < 0xdc00 || low > 0xdfff) return -1;
+            p += 6;
+            codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
+          } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) {
+            return -1;
+          }
+          if (append_json_codepoint(out, cap, &len, codepoint) != 0) return -1;
+          continue;
         }
         default:
           return -1;
       }
-    } else if ((unsigned char)c < 0x20) {
+    } else if (c < 0x20) {
       return -1;
+    } else if (c >= 0x80) {
+      const unsigned char *sequence = (const unsigned char *)(p - 1);
+      int sequence_len = raw_utf8_sequence_len(sequence);
+      if (sequence_len < 0 || (size_t)sequence_len >= cap - len) return -1;
+      memcpy(out + len, sequence, (size_t)sequence_len);
+      len += (size_t)sequence_len;
+      p += sequence_len - 1;
+      continue;
     }
     if (len + 1 >= cap) return -1;
-    out[len++] = c;
+    out[len++] = (char)c;
   }
   if (*p != '"') return -1;
   out[len] = '\0';
   *cursor = p + 1;
   return 0;
+}
+
+static int skip_json_dispatch_value(const char **cursor, char *scratch, size_t scratch_cap) {
+  const char *p = skip_ws(*cursor);
+  if (*p == '"') {
+    if (parse_json_string(&p, scratch, scratch_cap) != 0) return -1;
+    *cursor = p;
+    return 0;
+  }
+
+  const char *start = p;
+  char closers[16];
+  size_t depth = 0;
+  while (*p != '\0') {
+    if (*p == '"') {
+      if (parse_json_string(&p, scratch, scratch_cap) != 0) return -1;
+      continue;
+    }
+    if (*p == '[' || *p == '{') {
+      if (depth >= sizeof(closers)) return -1;
+      closers[depth++] = *p == '[' ? ']' : '}';
+      p++;
+      continue;
+    }
+    if (*p == ']' || *p == '}') {
+      if (depth == 0) {
+        if (*p != '}' || p == start) return -1;
+        *cursor = p;
+        return 0;
+      }
+      if (closers[depth - 1] != *p) return -1;
+      depth--;
+      p++;
+      continue;
+    }
+    if (*p == ',' && depth == 0) {
+      if (p == start) return -1;
+      *cursor = p;
+      return 0;
+    }
+    p++;
+  }
+  return -1;
+}
+
+static int parse_top_level_request_type(const char *req, char *type, size_t type_cap) {
+  const char *p = skip_ws(req);
+  if (*p != '{') return -1;
+  p++;
+  int seen_type = 0;
+  char scratch[MAX_REQUEST];
+  for (;;) {
+    p = skip_ws(p);
+    if (*p == '}') {
+      p++;
+      break;
+    }
+
+    char key[32];
+    if (parse_json_string(&p, key, sizeof(key)) != 0) return -1;
+    p = skip_ws(p);
+    if (*p != ':') return -1;
+    p = skip_ws(p + 1);
+    if (strcmp(key, "type") == 0) {
+      if (seen_type || parse_json_string(&p, type, type_cap) != 0) return -1;
+      seen_type = 1;
+    } else if (skip_json_dispatch_value(&p, scratch, sizeof(scratch)) != 0) {
+      return -1;
+    }
+
+    p = skip_ws(p);
+    if (*p == '}') {
+      p++;
+      break;
+    }
+    if (*p != ',') return -1;
+    p = skip_ws(p + 1);
+    if (*p == '}') return -1;
+  }
+  if (*skip_ws(p) != '\0') return -1;
+  return seen_type;
 }
 
 static int parse_argv(const char *req, char storage[MAX_ARG_STORAGE], char *argv[MAX_ARGC + 1]) {
@@ -2009,7 +2171,8 @@ static int parse_exec_env_value(const char **cursor, struct run_request *out) {
   return 0;
 }
 
-static int parse_build_run_v2_request(const char *req, struct run_request *out) {
+static int parse_build_run_v2_request(const char *req, size_t req_len, struct run_request *out) {
+  if (req_len == 0 || req[req_len - 1] != '\n') return -1;
   enum {
     SEEN_TYPE = 1u << 0,
     SEEN_SESSION_ID = 1u << 1,
@@ -2199,10 +2362,10 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
   out->terminal_cols = 80;
 
   char type[32];
-  int type_rc = parse_string_field(req, "type", type, sizeof(type));
+  int type_rc = parse_top_level_request_type(req, type, sizeof(type));
   if (type_rc < 0) return -1;
   if (type_rc > 0 && strcmp(type, "spore-build-run-v2") == 0) {
-    return parse_build_run_v2_request(req, out);
+    return parse_build_run_v2_request(req, req_len, out);
   }
   if (type_rc > 0) {
     if (strcmp(type, "ready") == 0) {
@@ -4632,6 +4795,7 @@ enum spore_agent_fuzz_result {
   SPORE_AGENT_FUZZ_WORKDIR_REQUEST = 4,
   SPORE_AGENT_FUZZ_READY_REQUEST = 5,
   SPORE_AGENT_FUZZ_GROW_REQUEST = 6,
+  SPORE_AGENT_FUZZ_OTHER_REQUEST = 7,
 };
 
 __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
@@ -4648,7 +4812,7 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   if (parsed.kind == REQUEST_BUILD_COPY) return SPORE_AGENT_FUZZ_COPY_REQUEST;
   if (parsed.kind == REQUEST_BUILD_WORKDIR) return SPORE_AGENT_FUZZ_WORKDIR_REQUEST;
   if (parsed.kind == REQUEST_ROOTFS_GROW) return SPORE_AGENT_FUZZ_GROW_REQUEST;
-  if (parsed.kind != REQUEST_BUILD_RUN) return SPORE_AGENT_FUZZ_INVALID;
+  if (parsed.kind != REQUEST_BUILD_RUN) return SPORE_AGENT_FUZZ_OTHER_REQUEST;
   if (parsed.build_exec_form) return SPORE_AGENT_FUZZ_RUN_COMPLETE;
 
   int pipe_fds[2];
@@ -4669,6 +4833,20 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   int rc = read_build_command_from_spio(&client, parsed.build_command_len, command, sizeof(command), error, sizeof(error));
   close(pipe_fds[0]);
   return rc == 0 ? SPORE_AGENT_FUZZ_RUN_COMPLETE : SPORE_AGENT_FUZZ_RUN_REQUEST;
+}
+
+__attribute__((visibility("hidden"))) int spore_agent_fuzz_exec_arg_equals(
+    const unsigned char *request_bytes, size_t request_len, size_t arg_index,
+    const unsigned char *expected, size_t expected_len) {
+  if (request_len >= MAX_REQUEST || arg_index >= MAX_ARGC) return 0;
+  char request[MAX_REQUEST];
+  memcpy(request, request_bytes, request_len);
+  request[request_len] = '\0';
+
+  struct run_request parsed;
+  if (parse_request(request, request_len, &parsed) != 0 || !parsed.build_exec_form || parsed.argv[arg_index] == NULL) return 0;
+  size_t actual_len = strlen(parsed.argv[arg_index]);
+  return actual_len == expected_len && memcmp(parsed.argv[arg_index], expected, expected_len) == 0;
 }
 
 __attribute__((visibility("hidden"))) int spore_agent_fuzz_ext4_geometry(

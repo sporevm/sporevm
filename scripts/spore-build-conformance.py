@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -21,6 +22,7 @@ from spore_build_conformance_contract import (
     BUILDKIT_VERSION,
     PLATFORM,
     SCANNER,
+    SCANNER_PYTHON,
     CacheStatus,
     Case,
     CaseError,
@@ -277,6 +279,51 @@ def build_base(
     return layout
 
 
+def blob_path(layout: pathlib.Path, digest: str) -> pathlib.Path:
+    algorithm, separator, encoded = digest.partition(":")
+    if separator != ":" or algorithm != "sha256" or len(encoded) != 64:
+        raise HarnessError(f"unsupported OCI descriptor digest: {digest!r}")
+    return layout / "blobs" / algorithm / encoded
+
+
+def write_oci_blob(layout: pathlib.Path, payload: bytes) -> tuple[str, int]:
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    path = blob_path(layout, digest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return digest, len(payload)
+
+
+def base_layout_for_case(base_layout: pathlib.Path, case: Case, case_dir: pathlib.Path) -> pathlib.Path:
+    if case.spec.base_env is None:
+        return base_layout
+
+    layout = case_dir / "base-oci"
+    shutil.copytree(base_layout, layout)
+    index_path = layout / "index.json"
+    index = json.loads(index_path.read_text())
+    manifests = index.get("manifests")
+    if not isinstance(manifests, list) or len(manifests) != 1:
+        raise HarnessError("base OCI layout must contain exactly one manifest")
+    descriptor = manifests[0]
+    manifest = json.loads(blob_path(layout, descriptor["digest"]).read_text())
+    config_descriptor = manifest.get("config")
+    if not isinstance(config_descriptor, dict):
+        raise HarnessError("base OCI manifest has no config descriptor")
+    config = json.loads(blob_path(layout, config_descriptor["digest"]).read_text())
+    runtime_config = config.setdefault("config", {})
+    if not isinstance(runtime_config, dict):
+        raise HarnessError("base OCI image config.config is not an object")
+    runtime_config["Env"] = list(case.spec.base_env)
+
+    config_payload = json.dumps(config, separators=(",", ":"), ensure_ascii=False).encode()
+    config_descriptor["digest"], config_descriptor["size"] = write_oci_blob(layout, config_payload)
+    manifest_payload = json.dumps(manifest, separators=(",", ":"), ensure_ascii=False).encode()
+    descriptor["digest"], descriptor["size"] = write_oci_blob(layout, manifest_payload)
+    index_path.write_text(json.dumps(index, separators=(",", ":")))
+    return layout
+
+
 def confined_path(root: pathlib.Path, raw: str) -> pathlib.Path:
     relative = pathlib.PurePosixPath(raw)
     if relative.is_absolute() or ".." in relative.parts or not relative.parts:
@@ -382,6 +429,7 @@ def capture_filesystems(
     docker_tag: str,
     spore_tag: str,
     prefixes: list[str],
+    scanner: list[str],
     output_dir: pathlib.Path,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     docker_result = run_command(
@@ -392,15 +440,16 @@ def capture_filesystems(
             "--platform",
             PLATFORM,
             "--entrypoint",
-            SCANNER,
+            scanner[0],
             docker_tag,
+            *scanner[1:],
             *prefixes,
         ],
         log_prefix=output_dir / "docker-scan",
     )
     require_success(docker_result)
     spore_result = run_command(
-        [spore_bin, "run", "--image", spore_tag, "--", SCANNER, *prefixes],
+        [spore_bin, "run", "--image", spore_tag, "--", *scanner, *prefixes],
         env=spore_env,
         log_prefix=output_dir / "spore-scan",
     )
@@ -457,12 +506,14 @@ def compare_outputs(
     output_dir: pathlib.Path,
 ) -> None:
     prefixes = list(case.spec.scan_prefixes)
+    scanner = [SCANNER_PYTHON, SCANNER] if case.spec.base_env is not None else [SCANNER]
     docker_filesystem, spore_filesystem = capture_filesystems(
         spore_bin,
         spore_env,
         docker_tag,
         spore_tag,
         prefixes,
+        scanner,
         output_dir,
     )
     mtime_paths = set(case.spec.compare_mtime_paths)
@@ -499,6 +550,7 @@ def run_case(
     case_dir = work_dir / "cases" / case.name
     context = case_dir / "context"
     materialize_context(case, context)
+    base_layout = base_layout_for_case(base_layout, case, case_dir)
     initial_dir = case_dir / "initial"
 
     docker = docker_build(builder, case, context, base_layout, docker_tag, initial_dir / "docker-build")
