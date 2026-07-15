@@ -1,0 +1,54 @@
+{
+  "description": "stable expansion, instruction snapshots, automatic platform args, and resolved COPY cache identity match Docker",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 2,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "base_env": [
+    "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin",
+    "INHERITED=from-base"
+  ],
+  "build_args": {
+    "GLOBAL": "cli value",
+    "EMPTY": ""
+  },
+  "scan_prefixes": [
+    "/oracle"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "resolved-destination-change",
+      "writes": {
+        "Dockerfile": "ARG GLOBAL=global-default\nARG TARGETARCH\nARG BASE=base\nFROM --platform=$TARGETPLATFORM ${BASE}\nARG GLOBAL\nARG EMPTY\nARG TARGETOS\nARG TARGETARCH\nARG DEFAULTED=${MISSING:-arg-default}\nENV INHERITED_SNAPSHOT=\"$INHERITED\" START=before\nENV START=after SNAPSHOT=$START UNSET=$MISSING SINGLE='$GLOBAL' DOUBLE=\"$GLOBAL\" ESCAPED=\\$GLOBAL DOUBLE_ESCAPED=\"\\$GLOBAL\" DEFAULT=${MISSING:-fallback} EMPTY_SET=${EMPTY-default} EMPTY_NULL=${EMPTY:-default} ALTERNATE=${GLOBAL:+alternate} EMPTY_ALTERNATE=${EMPTY+alternate} ARG_DEFAULT=\"$DEFAULTED\" PLATFORM=\"${TARGETOS}/${TARGETARCH}\"\nWORKDIR \"/oracle/${MISSING:-work}\"\nARG SOURCE=payload.txt\nARG DEST=/oracle/work/changed.txt\nCOPY \"$SOURCE\" \"$DEST\"\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 1,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-destination-change",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

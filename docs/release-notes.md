@@ -2,6 +2,22 @@
 
 ## Next
 
+`spore build` now resolves builder-owned variables with Docker-compatible
+instruction-start snapshots, quote and escape handling, unset-to-empty
+behavior, and the stable `:-`, `-`, `:+`, and `+` parameter operators. The
+selected platform supplies automatic BUILD/TARGET platform args, including
+`TARGETOS` and `TARGETARCH`; a stage still declares an automatic arg before
+using it. FROM, ARG defaults, ENV, COPY source/destination operands, and WORKDIR
+use the shared resolver; `COPY --from` remains literal. Shell-form RUN remains
+guest-shell text and exec-form RUN remains exact literal argv.
+Expansion-capable operands retain their original parser spelling,
+malformed or unsupported modifiers fail during full-file parsing, and resolved
+COPY/WORKDIR inputs plus their instruction-start ENV/ARG state remain cache
+inputs. The environment-state digest has a new identity so records produced by
+the older quote-stripping resolver miss safely. Expansion depth, individual
+resolved words, and aggregate variable state are bounded and fail with the
+responsible Dockerfile line before executor startup.
+
 `spore build` now accepts bounded exec-form `RUN` JSON arrays. It executes the
 decoded argv directly, preserves spaces, empty arguments, quotes, and literal
 `$NAME` text, and searches absolute entries in the effective build PATH when

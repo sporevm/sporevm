@@ -284,7 +284,9 @@ pub fn stepKey(allocator: std.mem.Allocator, input: StepInput) ![]const u8 {
 
 pub fn envDigest(allocator: std.mem.Allocator, env: []const []const u8, args: []const ArgInput) ![]const u8 {
     var h = Blake3.init(.{});
-    hashField(&h, "sporevm-build-env-v2");
+    // v3 invalidates step results produced before quoted operands and stable
+    // parameter operators were resolved from the exact instruction spelling.
+    hashField(&h, "sporevm-build-env-v3");
     hashCount(&h, env.len);
     for (env) |entry| hashField(&h, entry);
     hashCount(&h, args.len);

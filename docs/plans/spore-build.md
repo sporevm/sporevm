@@ -164,8 +164,9 @@ The missing work falls into three different categories:
 - The unchanged Buildkite `ci` target is also exercised independently as a
   read-only prioritization oracle. Its first grounded failure may identify C2,
   C3, or C4 work, but does not move mounted RUN or remote ADD semantics into
-  C2. The next C2 implementation remains blocked until the merged exec-form RUN
-  contract completes independent manual acceptance.
+  C2. The merged exec-form RUN contract passed independent manual acceptance
+  on exact main `606a7a24`; its packaged and Linux ARM64/KVM proofs closed the
+  gate for the expansion foundation.
 - The first post-merge oracle run was pinned to SporeVM
   `606a7a24c8ae77ffd81d1e6c533685122c2185ee` and Buildkite
   `fb742fd5291244e2a1b9c174112f23e2a1581217`, tree
@@ -413,22 +414,24 @@ implementing Spore's mounts or cache policy.
 | --- | --- |
 | `FROM [--platform=linux/arm64] <source> [AS <name>]` | `scratch`, previous stage, named `--build-context` (OCI layout), local ref, public registry ref, or digest ref. Other platforms fail closed. |
 | `RUN <shell>` / `RUN ["argv", …]` | shell form executes as `/bin/sh -c`; exec form preserves a bounded non-empty JSON string array and searches PATH only when argv zero contains no slash. Both run in the guest as root. No `--mount`, per-instruction `--network`, or heredoc. |
-| `COPY [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative literal sources, including files and directories. Other COPY flags fail closed. |
+| `COPY [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative expanded source/destination operands, including files and directories. `--from` remains literal, matching BuildKit. Other COPY flags fail closed. |
 | `ENV K=V` / `ENV K V` | build env + final image config. |
-| `ARG K[=default]` | value from `--build-arg` or default; unset used ARG is an error (stricter than Docker's warning; surfaced as a decision below). |
+| `ARG K[=default]` | value from `--build-arg` or an expanded default; unset values expand to empty unless a supported operator supplies another result. |
 | `WORKDIR /path` | affects `RUN` cwd, `COPY` relative dest, final config. Created in the guest if missing, matching Docker. |
 | `CMD ["…"]` / `CMD <shell>` | final image config only; both JSON exec form and shell form are supported. |
 | `ENTRYPOINT ["…"]` / `ENTRYPOINT <shell>` | final image config only; both JSON exec form and shell form are supported. |
-| comments, line continuations, `${VAR}`/`$VAR` substitution in supported instruction arguments | The leading directive window accepts the stable Dockerfile syntax directive and backslash/backtick escape directives; unsupported syntax frontends fail closed. |
+| comments, line continuations, `${VAR}`/`$VAR` substitution in supported instruction arguments | The leading directive window accepts the stable Dockerfile syntax directive and backslash/backtick escape directives; single quotes remain literal, double quotes expand, and unsupported syntax frontends fail closed. |
 
 Builder-owned variable substitution applies to `FROM`, `ENV`, `ARG` defaults,
-`WORKDIR`, and `COPY` arguments using the declared `ARG`/`ENV` state. `CMD` and
+`WORKDIR`, and `COPY` source/destination arguments using the declared
+`ARG`/`ENV` state. `COPY --from` remains literal. `CMD` and
 `ENTRYPOINT` retain variables for runtime. Shell-form `RUN` is not pre-expanded;
 its guest shell sees the effective `ARG`/`ENV` environment and performs shell
-expansion. Exec-form `RUN` preserves every argv string literally. Only `$NAME`
-and `${NAME}` substitution are in the builder-owned subset; parameter operators
-such as `${NAME:-default}`, `${NAME:+alt}`, `${NAME#prefix}`, and
-`${NAME%suffix}` fail closed in those instruction fields.
+expansion. Exec-form `RUN` preserves every argv string literally. The
+builder-owned subset accepts `$NAME`, `${NAME}`, `${NAME:-word}`,
+`${NAME-word}`, `${NAME:+word}`, and `${NAME+word}`, including nested stable
+expansion in `word`. Pattern removal, replacement, required-value, and other
+modifiers fail closed in those instruction fields.
 
 ## Architecture
 
@@ -1477,24 +1480,24 @@ amortized per build.
   last-value-wins ENV/ARG, PATH lookup, strict newline framing, cache
   invalidation, and Docker/BuildKit differential coverage;
 
-Do not begin the next implementation until the merged exec-form RUN work has an
-independent manual SHIP verdict. Once that gate passes, land small general PRs
-in the order the unchanged Buildkite oracle demonstrates:
+The merged exec-form RUN work has an independent manual SHIP verdict. Land
+small general PRs in the order the unchanged Buildkite oracle demonstrates:
 
-1. **Builder-owned expansion and automatic platform arguments.** Define
-   instruction-start snapshots, quoting and escaping, unset-to-empty behavior,
-   stable parameter operators, and automatic `TARGETOS`/`TARGETARCH` values.
-   Extend the existing `build/variables.zig` engine and typed instruction
-   transitions: the current helper only handles `$NAME`/`${NAME}`, fails on
-   unset values for executed instructions, and seeds automatic values with
-   fixed Linux/ARM64 strings instead of deriving them from the selected
-   platform. Preserve the parser provenance needed to distinguish quoted and
-   escaped input rather than reconstructing it from raw instruction text.
-   Every resolved semantic input participates in instruction state and cache
-   identity. Exec-form RUN remains literal; expansion changes the state and
-   cache semantics of instructions such as ENV, COPY, WORKDIR, and the operands
-   of a later typed ADD plan. Land and review this as a C2 foundation before
-   enabling any remote input.
+1. **Done locally, reviewed and validated; pending landing:** builder-owned expansion and
+   automatic platform arguments. Expansion-capable operands retain quote and
+   escape provenance through parsing and resolve from one instruction-start
+   snapshot. The shared resolver implements unset-to-empty plus stable `:-`,
+   `-`, `:+`, and `+` operators; automatic BUILD/TARGET values derive from the
+   selected platform and accept normal build-arg overrides. FROM, ARG defaults,
+   ENV, COPY, and WORKDIR use that resolver, while exec-form RUN remains
+   literal. A new environment-state digest identity prevents older
+   quote-stripping COPY/WORKDIR records from aliasing the new semantics. The
+   Dockerfile parser and dedicated resolver are fuzzed, and the pinned
+   BuildKit v0.30.0 HVF differential graph passes all 30 cases, including
+   ordering, inherited ENV/ARG, quoting, unset/set-empty operators, automatic
+   platform values, warm hits, a resolved COPY-destination miss, malformed
+   input, and a deliberately unsupported unstable modifier. No remote input is
+   accepted by this slice.
 2. **Oracle-proven public HTTPS ADD.** After the expansion foundation lands,
    implement the narrow C4 mutable-URL slice described below as a separate PR,
    then rerun the unchanged target. The parser happens to encounter C4 before

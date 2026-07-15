@@ -1,0 +1,9 @@
+{
+  "description": "unstable pattern modifiers remain outside the accepted expansion subset",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 3: unsupported variable expansion"
+  },
+  "scan_prefixes": []
+}

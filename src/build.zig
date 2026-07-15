@@ -28,6 +28,7 @@ const scratch_format_identity = "sporevm-empty-ext4-scratch-v2:image=16GiB:inode
 const default_linux_path = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const default_root_run_home_value = "/root";
 const default_root_run_home = "HOME=" ++ default_root_run_home_value;
+const max_builder_variable_state_bytes: usize = 64 * 1024 * 1024;
 
 pub const testing = if (builtin.is_test) struct {
     pub var before_final_publish_barrier: ?*test_barrier.Barrier = null;
@@ -191,7 +192,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         error.DockerfileParseFailed => return error.DockerfileParseFailed,
         else => |e| return e,
     };
-    const global_args = try globalBuildArgs(allocator, options, doc.global_args);
+    const global_args = try globalBuildArgs(allocator, options, doc.global_args, &diagnostic.dockerfile);
     const variables = try plannerVariables(allocator, global_args.items);
     const plan = build_plan.create(allocator, &doc, .{
         .target = options.target,
@@ -476,6 +477,25 @@ fn instructionTransition(
     instruction: dockerfile.Instruction,
     instruction_index: usize,
 ) !?instruction_transition.InstructionTransition {
+    return instructionTransitionResolved(allocator, options, diagnostic, global_args, stage_inputs, state, instruction, instruction_index) catch |err| switch (err) {
+        error.VariableExpansionTooLarge => {
+            diagnostic.dockerfile = .{ .line = instruction.line, .message = "expanded Dockerfile argument is too large" };
+            return error.DockerfilePlanFailed;
+        },
+        else => |other| return other,
+    };
+}
+
+fn instructionTransitionResolved(
+    allocator: std.mem.Allocator,
+    options: Options,
+    diagnostic: *Diagnostic,
+    global_args: []const ArgValue,
+    stage_inputs: StageInputs,
+    state: *State,
+    instruction: dockerfile.Instruction,
+    instruction_index: usize,
+) !?instruction_transition.InstructionTransition {
     if (try applyMetadataInstruction(allocator, options, global_args, state, instruction)) return null;
     if (!rootUser(state.user)) {
         diagnostic.instruction_line = instruction.line;
@@ -489,8 +509,8 @@ fn instructionTransition(
                 allocator,
                 instruction.line,
                 instruction.raw,
-                try substituteStateList(allocator, copy.sources, state.*),
-                try substituteState(allocator, copy.dest, state.*),
+                try substituteStateList(allocator, copy.sources, state.*, instruction.escape),
+                try substituteState(allocator, copy.dest, state.*, instruction.escape),
                 try effectiveEnvDigest(allocator, state.*),
                 state.workdir,
                 binding.input_index,
@@ -501,12 +521,12 @@ fn instructionTransition(
             };
             break :blk transition;
         } else blk: {
-            const resolved_sources = try substituteStateList(allocator, copy.sources, state.*);
+            const resolved_sources = try substituteStateList(allocator, copy.sources, state.*, instruction.escape);
             break :blk .{ .copy = .{ .context = .{
                 .line = instruction.line,
                 .canonical_instruction = instruction.raw,
                 .resolved_sources = resolved_sources,
-                .resolved_dest = try substituteState(allocator, copy.dest, state.*),
+                .resolved_dest = try substituteState(allocator, copy.dest, state.*, instruction.escape),
                 .env_digest = try effectiveEnvDigest(allocator, state.*),
                 .workdir = state.workdir,
             } } };
@@ -541,28 +561,47 @@ fn globalBuildArgs(
     allocator: std.mem.Allocator,
     options: Options,
     instructions: []const dockerfile.Instruction,
+    diagnostic: *dockerfile.Diagnostic,
 ) !std.array_list.Managed(ArgValue) {
     var args = std.array_list.Managed(ArgValue).init(allocator);
+    const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ options.platform.os, options.platform.arch });
     const automatic = [_]ArgValue{
-        .{ .key = "BUILDPLATFORM", .value = "linux/arm64" },
-        .{ .key = "BUILDOS", .value = "linux" },
-        .{ .key = "BUILDARCH", .value = "arm64" },
+        .{ .key = "BUILDPLATFORM", .value = platform },
+        .{ .key = "BUILDOS", .value = options.platform.os },
+        .{ .key = "BUILDOSVERSION", .value = "" },
+        .{ .key = "BUILDARCH", .value = options.platform.arch },
         .{ .key = "BUILDVARIANT", .value = "" },
-        .{ .key = "TARGETPLATFORM", .value = "linux/arm64" },
-        .{ .key = "TARGETOS", .value = "linux" },
-        .{ .key = "TARGETARCH", .value = "arm64" },
+        .{ .key = "TARGETPLATFORM", .value = platform },
+        .{ .key = "TARGETOS", .value = options.platform.os },
+        .{ .key = "TARGETOSVERSION", .value = "" },
+        .{ .key = "TARGETARCH", .value = options.platform.arch },
         .{ .key = "TARGETVARIANT", .value = "" },
+        .{ .key = "TARGETSTAGE", .value = options.target orelse "default" },
     };
-    for (automatic) |arg| try putArg(allocator, &args, arg.key, arg.value);
+    for (automatic) |arg| {
+        const value = if (findBuildArg(options.build_args, arg.key)) |override| override.value else arg.value;
+        try putArg(allocator, &args, arg.key, value);
+        if (!argsWithinVariableStateLimit(args.items)) return error.VariableExpansionTooLarge;
+    }
     for (instructions) |instruction| {
         const arg = instruction.value.arg;
         const value = if (findBuildArg(options.build_args, arg.key)) |cli|
             cli.value
         else if (arg.default) |default|
-            try substitute(allocator, default, args.items, &.{})
+            substitute(allocator, default, args.items, &.{}, instruction.escape) catch |err| switch (err) {
+                error.VariableExpansionTooLarge => {
+                    diagnostic.* = .{ .line = instruction.line, .message = "expanded Dockerfile argument is too large" };
+                    return error.DockerfilePlanFailed;
+                },
+                else => |other| return other,
+            }
         else
             lookupArg(arg.key, args.items);
         try putArg(allocator, &args, arg.key, value);
+        if (!argsWithinVariableStateLimit(args.items)) {
+            diagnostic.* = .{ .line = instruction.line, .message = "expanded Dockerfile argument is too large" };
+            return error.DockerfilePlanFailed;
+        }
     }
     return args;
 }
@@ -780,12 +819,21 @@ fn applyMetadataInstruction(
 ) !bool {
     switch (instruction.value) {
         .env => |env| {
-            for (env.pairs) |pair| {
-                const key = try substituteState(allocator, pair.key, state.*);
-                const value = try substituteState(allocator, pair.value, state.*);
+            const resolved = try allocator.alloc(dockerfile.Pair, env.pairs.len);
+            var remaining = max_builder_variable_state_bytes;
+            for (env.pairs, resolved) |pair, *dest| {
+                const key = try substituteState(allocator, pair.key, state.*, instruction.escape);
+                const value = try substituteState(allocator, pair.value, state.*, instruction.escape);
+                if (!consumeVariableBytes(&remaining, key.len) or !consumeVariableBytes(&remaining, value.len)) return error.VariableExpansionTooLarge;
+                dest.* = .{ .key = key, .value = value };
+            }
+            for (resolved) |pair| {
+                const key = pair.key;
+                const value = pair.value;
                 try state.environment.put(allocator, key, value);
                 removeArg(&state.arg_overrides, key);
             }
+            if (!stateWithinVariableStateLimit(state.*)) return error.VariableExpansionTooLarge;
         },
         .cmd => |cmd| {
             state.cmd = try resolveCmd(allocator, cmd);
@@ -798,12 +846,17 @@ fn applyMetadataInstruction(
             if (!state.cmd_set) state.cmd = null;
         },
         .arg => |arg| {
-            try declareArg(allocator, options.build_args, pre_from_args, &state.args, arg);
+            const resolved_arg: dockerfile.Arg = .{
+                .key = arg.key,
+                .default = if (arg.default) |default| try substituteState(allocator, default, state.*, instruction.escape) else null,
+            };
+            try declareArg(allocator, options.build_args, pre_from_args, &state.args, resolved_arg);
             if (lookupArg(arg.key, state.args.items)) |value| {
                 try putArg(allocator, &state.arg_overrides, arg.key, value);
             } else {
                 removeArg(&state.arg_overrides, arg.key);
             }
+            if (!stateWithinVariableStateLimit(state.*)) return error.VariableExpansionTooLarge;
         },
         else => return false,
     }
@@ -970,14 +1023,14 @@ fn workdirStep(
     return .{
         .line = instruction.line,
         .canonical_instruction = instruction.raw,
-        .target = try resolvedWorkdir(allocator, state, raw),
+        .target = try resolvedWorkdir(allocator, state, raw, instruction.escape),
         .env_digest = try effectiveEnvDigest(allocator, state),
         .workdir = state.workdir,
     };
 }
 
-fn resolvedWorkdir(allocator: std.mem.Allocator, state: State, raw: []const u8) ![]const u8 {
-    const substituted = try substituteState(allocator, raw, state);
+fn resolvedWorkdir(allocator: std.mem.Allocator, state: State, raw: []const u8, escape: u8) ![]const u8 {
+    const substituted = try substituteState(allocator, raw, state, escape);
     return resolveWorkdir(allocator, state.workdir, substituted);
 }
 
@@ -1137,17 +1190,21 @@ fn resolveWorkdir(allocator: std.mem.Allocator, current: []const u8, next: []con
     return instruction_transition.normalizeGuestPath(allocator, current, next);
 }
 
-fn substituteStateList(allocator: std.mem.Allocator, raw: []const []const u8, state: State) ![]const []const u8 {
+fn substituteStateList(allocator: std.mem.Allocator, raw: []const []const u8, state: State, escape: u8) ![]const []const u8 {
     const out = try allocator.alloc([]const u8, raw.len);
-    for (raw, 0..) |entry, i| out[i] = try substituteState(allocator, entry, state);
+    var remaining = max_builder_variable_state_bytes;
+    for (raw, 0..) |entry, i| {
+        out[i] = try substituteState(allocator, entry, state, escape);
+        if (!consumeVariableBytes(&remaining, out[i].len)) return error.VariableExpansionTooLarge;
+    }
     return out;
 }
 
-fn substituteState(allocator: std.mem.Allocator, input: []const u8, state: State) ![]const u8 {
-    return substitute(allocator, input, state.args.items, try effectiveStateEnv(allocator, state));
+fn substituteState(allocator: std.mem.Allocator, input: []const u8, state: State, escape: u8) ![]const u8 {
+    return substitute(allocator, input, state.args.items, try effectiveStateEnv(allocator, state), escape);
 }
 
-fn substitute(allocator: std.mem.Allocator, input: []const u8, args: []const ArgValue, env: []const []const u8) ![]const u8 {
+fn substitute(allocator: std.mem.Allocator, input: []const u8, args: []const ArgValue, env: []const []const u8, escape: u8) ![]const u8 {
     var variables = std.array_list.Managed(variable_expansion.Variable).init(allocator);
     for (env) |entry| {
         if (std.mem.indexOfScalar(u8, entry, '=')) |eq| {
@@ -1157,7 +1214,7 @@ fn substitute(allocator: std.mem.Allocator, input: []const u8, args: []const Arg
     for (args) |arg| {
         try variables.append(.{ .key = arg.key, .value = arg.value });
     }
-    return variable_expansion.expand(allocator, input, variables.items, .fail);
+    return variable_expansion.expand(allocator, input, variables.items, .{ .escape = escape });
 }
 
 fn lookupArg(name: []const u8, args: []const ArgValue) ?[]const u8 {
@@ -1165,6 +1222,31 @@ fn lookupArg(name: []const u8, args: []const ArgValue) ?[]const u8 {
         if (std.mem.eql(u8, arg.key, name)) return arg.value;
     }
     return null;
+}
+
+fn stateWithinVariableStateLimit(state: State) bool {
+    var remaining = max_builder_variable_state_bytes;
+    for (state.environment.effective.items) |entry| if (!consumeVariableBytes(&remaining, entry.len)) return false;
+    return argsConsumeVariableState(&remaining, state.args.items) and argsConsumeVariableState(&remaining, state.arg_overrides.items);
+}
+
+fn argsWithinVariableStateLimit(args: []const ArgValue) bool {
+    var remaining = max_builder_variable_state_bytes;
+    return argsConsumeVariableState(&remaining, args);
+}
+
+fn argsConsumeVariableState(remaining: *usize, args: []const ArgValue) bool {
+    for (args) |arg| {
+        if (!consumeVariableBytes(remaining, arg.key.len)) return false;
+        if (arg.value) |value| if (!consumeVariableBytes(remaining, value.len)) return false;
+    }
+    return true;
+}
+
+fn consumeVariableBytes(remaining: *usize, amount: usize) bool {
+    if (amount > remaining.*) return false;
+    remaining.* -= amount;
+    return true;
 }
 
 fn putEnv(allocator: std.mem.Allocator, env: *std.array_list.Managed([]const u8), key: []const u8, value: []const u8) !void {
@@ -1284,8 +1366,85 @@ test "variable substitution uses env before args" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const got = try substitute(arena, "${APP}/$MODE", &.{.{ .key = "MODE", .value = "arg" }}, &.{"APP=/srv"});
+    const got = try substitute(arena, "${APP}/$MODE", &.{.{ .key = "MODE", .value = "arg" }}, &.{"APP=/srv"}, '\\');
     try std.testing.expectEqualStrings("/srv/arg", got);
+}
+
+test "automatic platform args derive from the selected platform and accept overrides" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\ARG ARTIFACT=${TARGETOS}-${TARGETARCH}-${TARGETSTAGE}
+        \\FROM scratch
+        \\
+    , &diagnostic);
+    const args = try globalBuildArgs(arena, .{
+        .tag = "local/test:dev",
+        .context_dir = ".",
+        .dockerfile_path = "Dockerfile",
+        .target = "ci",
+        .build_args = &.{.{ .key = "TARGETARCH", .value = "override" }},
+    }, document.global_args, &diagnostic);
+    try std.testing.expectEqualStrings("linux", lookupArg("TARGETOS", args.items).?);
+    try std.testing.expectEqualStrings("override", lookupArg("TARGETARCH", args.items).?);
+    try std.testing.expectEqualStrings("linux/arm64", lookupArg("TARGETPLATFORM", args.items).?);
+    try std.testing.expectEqualStrings("ci", lookupArg("TARGETSTAGE", args.items).?);
+    try std.testing.expectEqualStrings("linux-override-ci", lookupArg("ARTIFACT", args.items).?);
+}
+
+test "ENV expansion uses one instruction-start snapshot" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\FROM scratch
+        \\ENV abc=hello
+        \\ENV abc=bye def=$abc empty=$UNSET literal='$abc' fallback=${UNSET:-$abc}
+        \\
+    , &diagnostic);
+    var state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
+    for (document.stages[0].instructions) |instruction| {
+        try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instruction));
+    }
+    try std.testing.expectEqualStrings("bye", envValue(state.environment.effective.items, "abc").?);
+    try std.testing.expectEqualStrings("hello", envValue(state.environment.effective.items, "def").?);
+    try std.testing.expectEqualStrings("", envValue(state.environment.effective.items, "empty").?);
+    try std.testing.expectEqualStrings("$abc", envValue(state.environment.effective.items, "literal").?);
+    try std.testing.expectEqualStrings("hello", envValue(state.environment.effective.items, "fallback").?);
+}
+
+test "COPY and WORKDIR expand exact quoted operands from stage state" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\FROM scratch
+        \\ARG SOURCE="two words"
+        \\ENV ROOT=/srv
+        \\COPY "$SOURCE" '$SOURCE' ${UNSET:-fallback} "$ROOT/"
+        \\WORKDIR "$ROOT/${UNSET:-work}"
+        \\
+    , &diagnostic);
+    var state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
+    const instructions = document.stages[0].instructions;
+    try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instructions[0]));
+    try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instructions[1]));
+
+    const copy = instructions[2].value.copy;
+    const sources = try substituteStateList(arena, copy.sources, state, instructions[2].escape);
+    try std.testing.expectEqualStrings("two words", sources[0]);
+    try std.testing.expectEqualStrings("$SOURCE", sources[1]);
+    try std.testing.expectEqualStrings("fallback", sources[2]);
+    try std.testing.expectEqualStrings("/srv/", try substituteState(arena, copy.dest, state, instructions[2].escape));
+
+    const workdir = try workdirStep(arena, state, instructions[3], instructions[3].value.workdir);
+    try std.testing.expectEqualStrings("/srv/work", workdir.target);
 }
 
 test "CMD and ENTRYPOINT retain variables for runtime expansion" {
