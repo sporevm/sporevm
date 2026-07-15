@@ -78,7 +78,10 @@ steps:
       - "zig-cache/spore-build-conformance/*/cases/**/*.command"
       - "zig-cache/spore-build-conformance/*/cases/**/*.stdout"
       - "zig-cache/spore-build-conformance/*/cases/**/*.stderr"
-      - "zig-cache/spore-build-conformance/*/cases/**/*.json"
+      - "zig-cache/spore-build-conformance/*/cases/**/docker-filesystem.json"
+      - "zig-cache/spore-build-conformance/*/cases/**/spore-filesystem.json"
+      - "zig-cache/spore-build-conformance/*/cases/**/docker-config.json"
+      - "zig-cache/spore-build-conformance/*/cases/**/spore-config.json"
       - "zig-cache/spore-build-conformance/*/cases/**/*.diff"
     timeout_in_minutes: 30
     plugins:
