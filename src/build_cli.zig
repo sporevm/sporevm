@@ -420,6 +420,11 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
                 try stderr.print("spore build: Dockerfile line {d}: RUN environment entry is too long for the guest executor\n", .{diagnostic.instruction_line});
             } else try stderr.writeAll("spore build: RUN environment entry is too long for the guest executor\n");
         },
+        error.InvalidRunEnvironment => {
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: RUN environment contains an invalid entry\n", .{diagnostic.instruction_line});
+            } else try stderr.writeAll("spore build: RUN environment contains an invalid entry\n");
+        },
         error.RunRequestTooLarge => {
             if (diagnostic.instruction_line != 0) {
                 try stderr.print("spore build: Dockerfile line {d}: resolved RUN request is too large for the guest executor\n", .{diagnostic.instruction_line});
@@ -603,6 +608,19 @@ test "build CLI reports the instruction that exceeds the stage input limit" {
     try writeBuildError(&stderr.writer, error.TooManyBuildInputDisks, diagnostic);
     try std.testing.expectEqualStrings(
         "spore build: Dockerfile line 7: a stage may copy from at most 2 distinct stage, named-context, or image inputs; this instruction requires input 3\n",
+        stderr.written(),
+    );
+}
+
+test "build CLI reports an invalid inherited RUN environment at its instruction" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+    var diagnostic: build_mod.Diagnostic = .{};
+    diagnostic.instruction_line = 2;
+    try writeBuildError(&stderr.writer, error.InvalidRunEnvironment, diagnostic);
+    try std.testing.expectEqualStrings(
+        "spore build: Dockerfile line 2: RUN environment contains an invalid entry\n",
         stderr.written(),
     );
 }

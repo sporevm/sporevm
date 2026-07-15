@@ -1240,8 +1240,10 @@ const guest_agent_fuzz_run_complete: c_int = 3;
 const guest_agent_fuzz_workdir_request: c_int = 4;
 const guest_agent_fuzz_ready_request: c_int = 5;
 const guest_agent_fuzz_grow_request: c_int = 6;
+const guest_agent_fuzz_other_request: c_int = 7;
 
 extern fn spore_agent_fuzz_build_request(request: [*]const u8, request_len: usize, stream: [*]const u8, stream_len: usize) c_int;
+extern fn spore_agent_fuzz_exec_arg_equals(request: [*]const u8, request_len: usize, arg_index: usize, expected: [*]const u8, expected_len: usize) c_int;
 extern fn spore_agent_fuzz_ext4_geometry(super: [*]const u8, super_len: usize, blocks_count: *u64, blocks_per_group: *u32, block_size: *u32) c_int;
 extern fn spore_agent_fuzz_ext4_growth_source(super: [*]const u8, super_len: usize) c_int;
 extern fn spore_agent_fuzz_rootfs_grow_geometry(target_blocks: u64, before_blocks: u64, before_blocks_per_group: u32, before_block_size: u32, after_blocks: u64, after_blocks_per_group: u32, after_block_size: u32) c_int;
@@ -1931,6 +1933,41 @@ test "build exec-form RUN request carries exact bounded argv" {
     try std.testing.expectError(error.RunRequestTooLarge, validateRunRequest(std.testing.allocator, .{ .exec = &.{ "printf", escaped_controls } }, &.{"PATH=/usr/bin"}, "/", default_build_nofile));
 }
 
+test "guest exec request parser preserves Unicode and rejects invalid scalar encodings" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const raw_utf8 = try rawExecRequestForTest(allocator, &.{"café"});
+    defer allocator.free(raw_utf8);
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_exec_arg_equals(raw_utf8.ptr, raw_utf8.len, 0, "café", "café".len));
+
+    const escaped_utf8 = try std.mem.replaceOwned(u8, allocator, raw_utf8, "café", "caf\\u00e9");
+    defer allocator.free(escaped_utf8);
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_exec_arg_equals(escaped_utf8.ptr, escaped_utf8.len, 0, "café", "café".len));
+
+    const raw_supplementary = try rawExecRequestForTest(allocator, &.{"😀"});
+    defer allocator.free(raw_supplementary);
+    const escaped_supplementary = try std.mem.replaceOwned(u8, allocator, raw_supplementary, "😀", "\\ud83d\\ude00");
+    defer allocator.free(escaped_supplementary);
+    try std.testing.expectEqual(@as(c_int, 1), spore_agent_fuzz_exec_arg_equals(escaped_supplementary.ptr, escaped_supplementary.len, 0, "😀", "😀".len));
+
+    const nul_escape = try std.mem.replaceOwned(u8, allocator, raw_utf8, "café", "\\u0000");
+    defer allocator.free(nul_escape);
+    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(nul_escape.ptr, nul_escape.len, nul_escape[0..0].ptr, 0));
+
+    const invalid_utf8 = try std.mem.replaceOwned(u8, allocator, raw_utf8, "café", "\xff");
+    defer allocator.free(invalid_utf8);
+    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(invalid_utf8.ptr, invalid_utf8.len, invalid_utf8[0..0].ptr, 0));
+
+    const lone_high = try std.mem.replaceOwned(u8, allocator, raw_utf8, "café", "\\ud83d");
+    defer allocator.free(lone_high);
+    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(lone_high.ptr, lone_high.len, lone_high[0..0].ptr, 0));
+
+    const lone_low = try std.mem.replaceOwned(u8, allocator, raw_utf8, "café", "\\ude00");
+    defer allocator.free(lone_low);
+    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(lone_low.ptr, lone_low.len, lone_low[0..0].ptr, 0));
+}
+
 test "build nofile limit is bounded" {
     try default_build_nofile.validate();
     try std.testing.expectError(error.InvalidBuildNofileLimit, (NofileLimit{ .soft = 0, .hard = 1 }).validate());
@@ -2002,10 +2039,33 @@ test "guest build request parser rejects malformed RUN framing and accepts build
         "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"line\nbreak\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
         "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"tty\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
         "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":01,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"start\",\"type\":\"spore-build-run-v2\",\"argv\":[\"/bin/true\"]}\n",
+        "{\"type\":\"spore-build-run-v2\",\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n",
     };
     for (malformed_exec_requests) |malformed| {
         try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(malformed.ptr, malformed.len, stream[0..0].ptr, 0));
     }
+
+    const missing_newline = reordered_exec[0 .. reordered_exec.len - 1];
+    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(missing_newline.ptr, missing_newline.len, stream[0..0].ptr, 0));
+
+    const exactly_full = try std.testing.allocator.alloc(u8, max_guest_request_len);
+    defer std.testing.allocator.free(exactly_full);
+    @memcpy(exactly_full[0..missing_newline.len], missing_newline);
+    @memset(exactly_full[missing_newline.len..], ' ');
+    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(exactly_full.ptr, exactly_full.len, stream[0..0].ptr, 0));
+
+    const escaped_type_key = "{\"\\u0074ype\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n";
+    try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(escaped_type_key.ptr, escaped_type_key.len, stream[0..0].ptr, 0));
+
+    const ordinary_start = "{\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n";
+    try std.testing.expectEqual(guest_agent_fuzz_other_request, spore_agent_fuzz_build_request(ordinary_start.ptr, ordinary_start.len, stream[0..0].ptr, 0));
+
+    const escaped_ordinary_start = "{\"type\":\"st\\u0061rt\",\"argv\":[\"/bin/true\"]}\n";
+    try std.testing.expectEqual(guest_agent_fuzz_other_request, spore_agent_fuzz_build_request(escaped_ordinary_start.ptr, escaped_ordinary_start.len, stream[0..0].ptr, 0));
+
+    const invalid_ordinary_start = "{\"type\":\"st\xffrt\",\"argv\":[\"/bin/true\"]}\n";
+    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(invalid_ordinary_start.ptr, invalid_ordinary_start.len, stream[0..0].ptr, 0));
 
     const copy_request = try copyRequest(std.testing.allocator, "spore-build-1", .{
         .source = "input",

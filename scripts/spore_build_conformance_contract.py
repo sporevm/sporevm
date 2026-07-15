@@ -18,6 +18,7 @@ BUILDKIT_IMAGE = (
 )
 BUILDKIT_VERSION = "v0.30.0"
 SCANNER = "/usr/local/bin/spore-build-conformance-scan"
+SCANNER_PYTHON = "/usr/local/bin/python3"
 CONFIG_FIELDS = ("Env", "Entrypoint", "Cmd", "WorkingDir", "User")
 
 
@@ -110,6 +111,7 @@ class CaseSpec:
     symlinks: dict[str, str]
     modes: dict[str, str]
     build_args: dict[str, str]
+    base_env: tuple[str, ...] | None
     network: SporeNetwork
     transitions: tuple[Transition, ...]
 
@@ -151,10 +153,13 @@ def require_string(value: Any, label: str, *, nonempty: bool = True) -> str:
     return value
 
 
-def require_string_list(value: Any, label: str) -> tuple[str, ...]:
+def require_string_list(value: Any, label: str, *, nonempty: bool = True) -> tuple[str, ...]:
     if not isinstance(value, list):
         raise HarnessError(f"{label} must be an array of strings")
-    return tuple(require_string(item, f"{label}[{index}]") for index, item in enumerate(value))
+    return tuple(
+        require_string(item, f"{label}[{index}]", nonempty=nonempty)
+        for index, item in enumerate(value)
+    )
 
 
 def require_string_map(value: Any, label: str) -> dict[str, str]:
@@ -313,6 +318,7 @@ def parse_case_spec(value: Any, label: str) -> CaseSpec:
             "symlinks",
             "modes",
             "build_args",
+            "base_env",
             "network",
             "transitions",
         },
@@ -367,6 +373,11 @@ def parse_case_spec(value: Any, label: str) -> CaseSpec:
         symlinks=require_string_map(raw.get("symlinks", {}), f"{label}.symlinks"),
         modes=require_string_map(raw.get("modes", {}), f"{label}.modes"),
         build_args=require_string_map(raw.get("build_args", {}), f"{label}.build_args"),
+        base_env=(
+            require_string_list(raw["base_env"], f"{label}.base_env", nonempty=False)
+            if "base_env" in raw
+            else None
+        ),
         network=parse_spore_network(raw.get("network", "none"), f"{label}.network"),
         transitions=transitions,
     )

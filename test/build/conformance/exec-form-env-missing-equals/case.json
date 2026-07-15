@@ -1,0 +1,29 @@
+{
+  "description": "RUN matches BuildKit handling of a nonempty inherited environment entry without an equals sign",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 1,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "base_env": [
+    "BROKEN"
+  ],
+  "scan_prefixes": [
+    "/oracle-env-missing-equals"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

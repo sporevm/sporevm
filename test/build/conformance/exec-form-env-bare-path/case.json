@@ -1,0 +1,12 @@
+{
+  "description": "a bare inherited PATH is effective as an empty value and does not receive the default PATH",
+  "expect": {
+    "docker": "failure",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: instruction failed: RUN [\"true\"]"
+  },
+  "base_env": [
+    "PATH"
+  ],
+  "scan_prefixes": []
+}

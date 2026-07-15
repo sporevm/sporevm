@@ -1,0 +1,12 @@
+{
+  "description": "RUN rejects a bare empty inherited environment entry",
+  "expect": {
+    "docker": "failure",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: RUN environment contains an invalid entry"
+  },
+  "base_env": [
+    ""
+  ],
+  "scan_prefixes": []
+}

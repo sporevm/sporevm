@@ -13,12 +13,26 @@ as a symlink loop remain skippable. ENV and ARG state, workdir, network,
 resources, parent
 rootfs, exact instruction text, and the embedded executor identity remain cache
 inputs, so a changed argv or effective environment misses while an unchanged
-rebuild hits.
+rebuild hits. Duplicate inherited environment keys now follow runc's
+last-value-wins rule before the effective RUN environment is hashed or sent to
+the guest, including PATH selection after later Dockerfile `ENV` updates in the
+current stage. Raw entries retain their Docker-compatible order in the
+published OCI config, and a later `FROM` reconstructs its effective environment
+from that published list just as BuildKit does. Inherited entries that are bare
+empty strings, have an empty `=value` name, or contain an embedded NUL now fail
+before RUN cache lookup or executor startup. Matching the pinned path, nonempty
+entries without `=` become empty-valued `NAME=` entries in the effective
+environment without rewriting OCI config. A bare inherited `PATH` is therefore
+authoritative as an empty PATH and does not receive the conventional default.
 Malformed, empty, NUL-containing, or oversized arrays fail during full-file
 parsing before a build VM starts. The versioned guest request also requires its
 exact fields once and rejects aliases, unknown fields, trailing commas, and
-trailing bytes. Shell-form RUN remains `/bin/sh -c`; mounted RUN and heredocs
-remain unsupported.
+trailing non-whitespace bytes. It now requires its framing newline. The shared
+guest request boundary rejects full-buffer truncation and duplicate top-level
+type keys for every request kind, validates raw UTF-8 in JSON strings, and
+decodes Unicode escapes and valid surrogate pairs to UTF-8 so raw and
+equivalently escaped JSON produce identical argv bytes. Shell-form RUN remains `/bin/sh -c`;
+mounted RUN and heredocs remain unsupported.
 
 Cold OCI base imports no longer scan the complete merged filesystem for every
 regular-file replacement. The importer keeps per-inode hardlink reference
