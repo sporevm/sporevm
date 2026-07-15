@@ -530,8 +530,8 @@ scripts/benchmark/detect_regressions.py \
   --json-out zig-cache/sporevm-benchmarks/regression-report.json
 ```
 
-The detector compares the current run's per-metric minimum against the minimum
-from a trailing window of prior runs on the same `host_id`. It uses history from
+The detector compares each current run median against the median of the last
+five compatible run medians from the same `host_id`. It uses history from
 downloaded Buildkite artifacts when available. Non-scheduled runs tolerate empty
 or missing history so developers can run the same script locally. Scheduled
 Buildkite runs fail when no compatible same-host history exists unless the
@@ -539,6 +539,14 @@ current run declares an intentional reset with `SPOREVM_BENCHMARK_RESET` or a
 `spore-benchmark-reset:` commit-message line. The failure annotation points at
 the likely causes: artifact fetch failure, `host_id` drift, or a fresh pipeline
 that needs an intentional bootstrap.
+
+Only headline timing fields are rolling guardrails: `tti_ms`, `elapsed_ms`,
+`wall_clock_ms`, `time_to_first_ready_ms`, `fork_ms_per_child`, `pull_ms`,
+`resume_exec_ms`, `vsock_connect_ms`, and `exec_response_ms`. Other phase and
+guest timers remain in the raw results and site exports for diagnosis, but do
+not affect the build unless `benchmarks/expectations.json` gives the matching
+metric an absolute ceiling. Counters, success rates, and rootfs digests retain
+their guardrails.
 
 The detector also checks durable absolute ceilings from
 `benchmarks/expectations.json`. A metric that exceeds its `max` value fails even
@@ -550,17 +558,23 @@ refreshed from scheduled artifacts.
 Thresholds are metric-class based:
 
 - latency metrics such as warm image TTI, warm spore TTI, fork latency,
-  `vsock_connect_ms`, and `exec_response_ms`: warn above 30 percent, fail above
-  60 percent;
-- throughput/import metrics such as synthetic cold import, rootfs emit phases,
-  and batch wall times: warn above 10 percent, fail above 20 percent;
+  `vsock_connect_ms`, and `exec_response_ms`: warn at 30 percent, fail at 60
+  percent, and ignore changes smaller than 50ms;
+- throughput/import metrics such as synthetic cold import and batch wall times:
+  warn at 10 percent, fail at 20 percent, and ignore changes smaller than
+  50ms;
 - counter metrics such as rootfs objects, chunks, bytes, and block counts: warn
   on any change, fail when an increase reaches 2x or moves from zero to nonzero.
 - digest metrics such as `cold_import/synthetic_tar/rootfs_import_index_digest`:
   fail on any change against compatible history;
 - success-rate metrics derived from raw benchmark rows before failed rows are
-  filtered: warn on any decrease, and fail when a benchmark with a 100 percent
-  baseline drops below 100 percent.
+  filtered: fail immediately on any decrease.
+
+Relative timing regressions must reach the fail tier in two consecutive
+compatible runs before failing the build. The first fail-tier breach is a
+warning. Durable absolute ceilings, digest changes, counter changes, and
+success-rate failures are evaluated immediately rather than waiting for a
+confirmation run.
 
 The Buildkite annotation table shows the current value, trailing baseline, delta,
 verdict, number of history runs used, and threshold for each metric. `warning`
@@ -771,7 +785,10 @@ emits `no_history` rows and keeps non-scheduled builds green until comparable
 history exists. Scheduled builds require at least one compatible same-host
 history run unless the current run carries an intentional reset marker, so
 artifact download failures or host-id drift do not silently disable the
-guardrail.
+guardrail. Once a benchmark suite has produced a complete result, the wrapper
+publishes that observation and its regression report to S3 even when regression
+detection fails. Failed observations therefore remain available for variance
+analysis and consecutive-run confirmation instead of disappearing from history.
 
 Regardless of comparison result, the step exports `site/data.json` and
 `site/data.js`, uploads benchmark JSON, logs, rootfs metadata, trend data,

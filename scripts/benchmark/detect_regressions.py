@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import statistics
 import sys
 import tempfile
 from typing import Any, Union
@@ -18,7 +19,8 @@ from typing import Any, Union
 
 LATENCY_WARN = 0.30
 THROUGHPUT_WARN = 0.10
-DEFAULT_TRAILING_WINDOW = 10
+TIMING_ABSOLUTE_DELTA_MS = 50.0
+DEFAULT_TRAILING_WINDOW = 5
 MISSING_HISTORY_NOTE = (
     "scheduled benchmark guardrail requires at least one compatible prior run for this host; "
     "likely causes are artifact fetch failure, a host_id change, or a fresh pipeline. "
@@ -39,6 +41,8 @@ TIMING_FIELDS = {
     "fork_ms_per_child",
     "pull_ms",
     "resume_exec_ms",
+    "vsock_connect_ms",
+    "exec_response_ms",
 }
 IGNORED_NUMERIC_FIELDS = {
     "iteration",
@@ -343,12 +347,14 @@ def digest_metric_class(field: str, value: Any) -> str | None:
     return None
 
 
-def metric_class(benchmark: str, mode: str, field: str, value: float) -> str | None:
+def metric_class(run: BenchmarkRun, benchmark: str, mode: str, field: str) -> str | None:
     if field in IGNORED_NUMERIC_FIELDS or field.endswith("_status"):
         return None
     if field == "success_rate":
         return "success_rate"
-    if field in TIMING_FIELDS or field.endswith("_ms"):
+    metric_id = f"{benchmark}/{mode}/{field}"
+    explicitly_bounded_timing = field.endswith("_ms") and metric_absolute_max(run, metric_id) is not None
+    if field in TIMING_FIELDS or explicitly_bounded_timing:
         if benchmark in THROUGHPUT_BENCHMARKS or field.startswith("rootfs_profile_") or field == "wall_clock_ms":
             return "throughput"
         return "latency"
@@ -393,7 +399,7 @@ def extract_metrics(run: BenchmarkRun) -> dict[str, MetricSeries]:
                         metrics[metric_id] = series
                     series.values.append(str(value))
         for field, value in flattened.items():
-            cls = metric_class(benchmark, mode, field, value)
+            cls = metric_class(run, benchmark, mode, field)
             if cls is None:
                 continue
             metric_id = f"{benchmark}/{mode}/{field}"
@@ -535,15 +541,19 @@ def compare_counter(current: float, baseline: float) -> tuple[str, float | None,
 
 def compare_timing(current: float, baseline: float, warn_threshold: float) -> tuple[str, float | None, str]:
     fail_threshold = warn_threshold * 2.0
-    threshold = f"warn >{warn_threshold * 100:.0f}%, fail >{fail_threshold * 100:.0f}%"
-    if baseline <= 0:
-        if current > baseline:
-            return "fail", None, threshold
+    threshold = (
+        f"warn >{warn_threshold * 100:.0f}%, fail >{fail_threshold * 100:.0f}%, "
+        f"and delta >= {TIMING_ABSOLUTE_DELTA_MS:.0f}ms"
+    )
+    delta = current - baseline
+    if delta < TIMING_ABSOLUTE_DELTA_MS:
+        if baseline > 0:
+            return "ok", (delta / baseline) * 100.0, threshold
         return "ok", None, threshold
-    delta_pct = ((current - baseline) / baseline) * 100.0
-    if current <= baseline:
-        return "ok", delta_pct, threshold
-    ratio = (current - baseline) / baseline
+    if baseline <= 0:
+        return "fail", None, threshold
+    delta_pct = (delta / baseline) * 100.0
+    ratio = delta / baseline
     if ratio >= fail_threshold:
         return "fail", delta_pct, threshold
     if ratio >= warn_threshold:
@@ -552,13 +562,11 @@ def compare_timing(current: float, baseline: float, warn_threshold: float) -> tu
 
 
 def compare_success_rate(current: float, baseline: float) -> tuple[str, float | None, str]:
-    threshold = "warn on any decrease; fail below 100% when baseline is 100%"
+    threshold = "fail on any decrease"
     delta_pct = (current - baseline) * 100.0
     if current >= baseline:
         return "ok", delta_pct, threshold
-    if baseline >= 1.0 and current < 1.0:
-        return "fail", delta_pct, threshold
-    return "warn", delta_pct, threshold
+    return "fail", delta_pct, threshold
 
 
 def compare_digest(current_values: list[MetricValue], baseline_values: list[MetricValue]) -> tuple[str, str | None, str, str]:
@@ -584,7 +592,7 @@ def current_stat(series: MetricSeries) -> MetricValue:
     if series.metric_class == "digest":
         return ",".join(sorted({str(value) for value in series.values}))
     values = numeric_values(series.values)
-    return min(values)
+    return float(statistics.median(values))
 
 
 def history_baseline(metric_class: str, baseline_runs: list[tuple[BenchmarkRun, MetricSeries]]) -> MetricValue:
@@ -592,7 +600,8 @@ def history_baseline(metric_class: str, baseline_runs: list[tuple[BenchmarkRun, 
         return ",".join(sorted({str(value) for _, hist_series in baseline_runs for value in hist_series.values}))
     if metric_class == "success_rate":
         return max(max(numeric_values(hist_series.values)) for _, hist_series in baseline_runs)
-    return min(min(numeric_values(hist_series.values)) for _, hist_series in baseline_runs)
+    run_medians = [float(statistics.median(numeric_values(hist_series.values))) for _, hist_series in baseline_runs]
+    return float(statistics.median(run_medians))
 
 
 def compatible_history_runs(current: BenchmarkRun, history_runs: list[BenchmarkRun], *, ignore_host: bool) -> list[BenchmarkRun]:
@@ -694,7 +703,6 @@ def evaluate(args: argparse.Namespace) -> tuple[list[Verdict], dict[str, Any]]:
             ))
             continue
         baseline = history_baseline(series.metric_class, baseline_runs)
-        delta = current_value - baseline if isinstance(current_value, (int, float)) and isinstance(baseline, (int, float)) else None
         if ceiling_failed:
             verdict, delta_pct, threshold = "fail", ((current_value - baseline) / baseline) * 100.0 if baseline else None, f"absolute max <= {fmt_value(absolute_max, metric_id)}"
             note = "current value exceeds the durable expectation ceiling"
@@ -714,8 +722,22 @@ def evaluate(args: argparse.Namespace) -> tuple[list[Verdict], dict[str, Any]]:
         else:
             assert isinstance(current_value, (int, float)) and isinstance(baseline, (int, float))
             warn = THROUGHPUT_WARN if series.metric_class == "throughput" else LATENCY_WARN
+            confirmed = False
+            if len(baseline_runs) >= 2:
+                prior_baseline = history_baseline(series.metric_class, baseline_runs[:-1])
+                prior_value = current_stat(baseline_runs[-1][1])
+                assert isinstance(prior_baseline, (int, float)) and isinstance(prior_value, (int, float))
+                prior_verdict, _, _ = compare_timing(prior_value, prior_baseline, warn)
+                if prior_verdict == "fail":
+                    baseline = prior_baseline
+                    confirmed = True
             verdict, delta_pct, threshold = compare_timing(current_value, baseline, warn)
-            note = ""
+            if verdict == "fail" and not confirmed:
+                verdict = "warn"
+                note = "first fail-tier relative breach; a second consecutive breach is required"
+            else:
+                note = ""
+        delta = current_value - baseline if isinstance(current_value, (int, float)) and isinstance(baseline, (int, float)) else None
         verdicts.append(Verdict(
             metric_id=metric_id,
             metric_class=series.metric_class,
@@ -816,7 +838,7 @@ def render_markdown(verdicts: list[Verdict], summary: dict[str, Any]) -> str:
             f"{fmt_delta(item)} | {item.history_runs} | {item.threshold} | {item.note} |"
         )
     lines.append("")
-    lines.append("_Current and baseline values are min-of-run samples for lower-is-better metrics; success_rate uses the trailing best rate. Digest metrics fail on any change. Counters warn on any unexplained change._")
+    lines.append("_Timing and counter values are run medians compared with the median of trailing run medians; success_rate uses the trailing best rate. Relative timing failures require two consecutive fail-tier breaches. Digest metrics fail on any change, and counters warn on any unexplained change._")
     return "\n".join(lines) + "\n"
 
 
@@ -859,7 +881,7 @@ def self_test() -> None:
         assert any(item.verdict == "no_history" for item in verdicts)
 
         hist = write_fixture_run(tmp, "hist", [{"benchmark": "warm_spore_tti", "mode": "sequential", "tti_ms": 100}])
-        warn = write_fixture_run(tmp, "current-warn", [{"benchmark": "warm_spore_tti", "mode": "sequential", "tti_ms": 135}])
+        warn = write_fixture_run(tmp, "current-warn", [{"benchmark": "warm_spore_tti", "mode": "sequential", "tti_ms": 155}])
         args = parse_args([str(warn / "results.jsonl"), "--history", str(hist)])
         verdicts, summary = evaluate(args)
         assert summary["warnings"] == 1 and summary["failures"] == 0
@@ -868,7 +890,58 @@ def self_test() -> None:
         fail = write_fixture_run(tmp, "current-fail", [{"benchmark": "warm_spore_tti", "mode": "sequential", "tti_ms": 170}])
         args = parse_args([str(fail / "results.jsonl"), "--history", str(hist)])
         verdicts, summary = evaluate(args)
-        assert summary["failures"] == 1
+        fail_item = next(item for item in verdicts if item.metric_id == "warm_spore_tti/sequential/tti_ms")
+        assert summary["failures"] == 0 and fail_item.verdict == "warn"
+        assert "second consecutive breach" in fail_item.note
+
+        confirmed_hist = write_fixture_run(
+            tmp,
+            "hist-fail-tier",
+            [{"benchmark": "warm_spore_tti", "mode": "sequential", "tti_ms": 170}],
+        )
+        confirmed = write_fixture_run(
+            tmp,
+            "current-confirmed-fail",
+            [{"benchmark": "warm_spore_tti", "mode": "sequential", "tti_ms": 175}],
+        )
+        args = parse_args([
+            str(confirmed / "results.jsonl"),
+            "--history", str(hist),
+            "--history", str(confirmed_hist),
+        ])
+        verdicts, summary = evaluate(args)
+        confirmed_item = next(item for item in verdicts if item.metric_id == "warm_spore_tti/sequential/tti_ms")
+        assert summary["failures"] == 1 and confirmed_item.verdict == "fail"
+        assert confirmed_item.baseline == 100.0
+
+        small_delta = write_fixture_run(
+            tmp,
+            "current-small-delta",
+            [{"benchmark": "distribution_tti", "mode": "sequential", "pull_ms": 1}],
+        )
+        zero_hist = write_fixture_run(
+            tmp,
+            "hist-zero",
+            [{"benchmark": "distribution_tti", "mode": "sequential", "pull_ms": 0}],
+        )
+        args = parse_args([str(small_delta / "results.jsonl"), "--history", str(zero_hist)])
+        verdicts, summary = evaluate(args)
+        assert summary["failures"] == 0 and summary["warnings"] == 0
+        assert next(item for item in verdicts if item.metric_id.endswith("/pull_ms")).verdict == "ok"
+
+        median_current = write_fixture_run(
+            tmp,
+            "current-median",
+            [
+                {"benchmark": "warm_spore_tti", "mode": "sequential", "tti_ms": 80},
+                {"benchmark": "warm_spore_tti", "mode": "sequential", "tti_ms": 155},
+                {"benchmark": "warm_spore_tti", "mode": "sequential", "tti_ms": 160},
+            ],
+        )
+        args = parse_args([str(median_current / "results.jsonl"), "--history", str(hist)])
+        verdicts, _ = evaluate(args)
+        median_item = next(item for item in verdicts if item.metric_id == "warm_spore_tti/sequential/tti_ms")
+        assert median_item.current == 155.0 and median_item.verdict == "warn"
 
         ceiling_expectations = {"version": 1, "metrics": {"warm_spore_tti/sequential/tti_ms": {"max": 120}}}
         ceiling = write_fixture_run(
@@ -885,7 +958,7 @@ def self_test() -> None:
         ceiling_uses_history = write_fixture_run(
             tmp,
             "current-ceiling-uses-history",
-            [{"benchmark": "warm_spore_tti", "mode": "sequential", "tti_ms": 135}],
+            [{"benchmark": "warm_spore_tti", "mode": "sequential", "tti_ms": 155}],
             {"benchmark_expectations": {"version": 1, "metrics": {"warm_spore_tti/sequential/tti_ms": {"max": 200}}}},
         )
         args = parse_args([str(ceiling_uses_history / "results.jsonl"), "--history", str(hist)])
@@ -932,28 +1005,28 @@ def self_test() -> None:
         assert summary["failures"] >= 1
         assert next(item for item in verdicts if item.metric_id == "warm_spore_tti/sequential/success_rate").verdict == "fail"
 
-        success_warn_hist = write_fixture_run(
+        partial_success_hist = write_fixture_run(
             tmp,
-            "success-warn-hist",
+            "partial-success-hist",
             [
                 {"benchmark": "warm_spore_tti", "mode": "sequential", "iteration": 0, "tti_ms": 100, "success": True},
                 {"benchmark": "warm_spore_tti", "mode": "sequential", "iteration": 1, "tti_ms": 101, "success": True},
                 {"benchmark": "warm_spore_tti", "mode": "sequential", "iteration": 2, "tti_ms": 102, "success": False},
             ],
         )
-        success_warn = write_fixture_run(
+        partial_success_drop = write_fixture_run(
             tmp,
-            "success-warn",
+            "partial-success-drop",
             [
                 {"benchmark": "warm_spore_tti", "mode": "sequential", "iteration": 0, "tti_ms": 100, "success": True},
                 {"benchmark": "warm_spore_tti", "mode": "sequential", "iteration": 1, "tti_ms": 101, "success": False},
                 {"benchmark": "warm_spore_tti", "mode": "sequential", "iteration": 2, "tti_ms": 102, "success": False},
             ],
         )
-        args = parse_args([str(success_warn / "results.jsonl"), "--history", str(success_warn_hist)])
+        args = parse_args([str(partial_success_drop / "results.jsonl"), "--history", str(partial_success_hist)])
         verdicts, summary = evaluate(args)
-        assert summary["warnings"] >= 1
-        assert next(item for item in verdicts if item.metric_id == "warm_spore_tti/sequential/success_rate").verdict == "warn"
+        assert summary["failures"] >= 1
+        assert next(item for item in verdicts if item.metric_id == "warm_spore_tti/sequential/success_rate").verdict == "fail"
 
         counter = write_fixture_run(
             tmp,
@@ -1007,25 +1080,39 @@ def self_test() -> None:
         assert summary["failures"] == 0
         assert next(item for item in verdicts if item.metric_id == "cold_import/synthetic_tar/rootfs_import_index_digest").verdict == "reset"
 
-        writable_phase = write_fixture_run(
+        diagnostic_phase = write_fixture_run(
             tmp,
-            "current-writable-phase",
-            [{"benchmark": "writable_rootfs", "mode": "package:sealed-layer-append", "rootfs_profile_native_ext4_emit_ms": 122}],
+            "current-diagnostic-phase",
+            [{"benchmark": "warm_spore_tti", "mode": "sequential", "guest_listen_ms": 5000}],
         )
-        writable_phase_hist = write_fixture_run(
+        diagnostic_phase_hist = write_fixture_run(
             tmp,
-            "writable-phase-hist",
-            [{"benchmark": "writable_rootfs", "mode": "package:sealed-layer-append", "rootfs_profile_native_ext4_emit_ms": 100}],
+            "diagnostic-phase-hist",
+            [{"benchmark": "warm_spore_tti", "mode": "sequential", "guest_listen_ms": 1}],
         )
-        args = parse_args([str(writable_phase / "results.jsonl"), "--history", str(writable_phase_hist)])
+        args = parse_args([str(diagnostic_phase / "results.jsonl"), "--history", str(diagnostic_phase_hist)])
         verdicts, summary = evaluate(args)
-        writable_item = next(
-            item
-            for item in verdicts
-            if item.metric_id == "writable_rootfs/package:sealed-layer-append/rootfs_profile_native_ext4_emit_ms"
+        assert summary["metrics"] == 1
+        assert all(not item.metric_id.endswith("/guest_listen_ms") for item in verdicts)
+
+        explicitly_bounded_phase = write_fixture_run(
+            tmp,
+            "current-explicitly-bounded-phase",
+            [{"benchmark": "writable_rootfs", "mode": "package:sealed-layer-append", "rootfs_profile_native_ext4_emit_ms": 122}],
+            {
+                "benchmark_expectations": {
+                    "version": 1,
+                    "metrics": {
+                        "writable_rootfs/package:sealed-layer-append/rootfs_profile_native_ext4_emit_ms": {"max": 120}
+                    },
+                }
+            },
         )
-        assert writable_item.metric_class == "throughput"
-        assert writable_item.verdict == "fail"
+        args = parse_args([str(explicitly_bounded_phase / "results.jsonl")])
+        verdicts, summary = evaluate(args)
+        bounded_item = next(item for item in verdicts if item.metric_id.endswith("/rootfs_profile_native_ext4_emit_ms"))
+        assert summary["failures"] == 1
+        assert bounded_item.metric_class == "throughput" and bounded_item.verdict == "fail"
 
         expectations = {"version": 1, "metrics": {"warm_spore_tti/sequential/tti_ms": {"reset": "fixture-reset"}}}
         reset = write_fixture_run(

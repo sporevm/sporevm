@@ -240,7 +240,27 @@ publish_benchmark_history() {
     --include "*/config.json" \
     --include "*/results.jsonl" \
     --include "*/summary.json" \
+    --include "*/regression-report.json" \
     --exclude "history/*"
+}
+
+archive_regression_report() {
+  local summary="$1"
+  [[ -f zig-cache/sporevm-benchmarks/regression-report.json ]] || return 0
+  local run_dir
+  run_dir="$(python3 - "${summary}" <<'PY'
+import json
+import pathlib
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+raw_results = data.get("raw_results")
+if isinstance(raw_results, str):
+    print(pathlib.Path(raw_results).parent)
+PY
+)"
+  [[ -n "${run_dir}" && -d "${run_dir}" ]] || return 0
+  cp zig-cache/sporevm-benchmarks/regression-report.json "${run_dir}/regression-report.json"
 }
 
 run_regression_detector() {
@@ -262,10 +282,12 @@ run_regression_detector() {
   fi
 
   local status=0
+  rm -f zig-cache/sporevm-benchmarks/regression-report.md zig-cache/sporevm-benchmarks/regression-report.json
   set +e
   scripts/benchmark/detect_regressions.py "${args[@]}"
   status="$?"
   set -e
+  archive_regression_report "${summary}"
   annotate_regression_results "${status}"
   return "${status}"
 }
@@ -326,8 +348,12 @@ fi
 wait_for_quiet_benchmark_host
 scripts/benchmark/suite.py "${benchmark_args[@]}"
 scripts/benchmark/export-site-data.py zig-cache/sporevm-benchmarks/latest-summary.json
-run_regression_detector
+regression_status=0
+run_regression_detector || regression_status="$?"
 publish_benchmark_history
+if [[ "${regression_status}" != "0" ]]; then
+  exit "${regression_status}"
+fi
 if [[ -n "${SPOREVM_BENCHMARK_BASELINE:-}" ]]; then
   scripts/benchmark/compare.py "${SPOREVM_BENCHMARK_BASELINE}" zig-cache/sporevm-benchmarks/latest-summary.json
 fi
