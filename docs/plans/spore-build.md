@@ -1281,9 +1281,11 @@ expansion, execution, and cache hashing. A new `FROM` reconstructs its
 effective view from the preceding stage's published `Config.Env`, matching
 BuildKit when that raw list still contains duplicates. RUN rejects effective
 entries that are bare empty strings, have an empty `=value` name, or contain an
-embedded NUL before cache lookup. Nonempty entries without `=` are omitted from
-the effective environment to match the pinned BuildKit/runc path, while raw OCI
-publication remains unchanged.
+embedded NUL before cache lookup. Nonempty entries without `=` remain unchanged
+in raw OCI publication but become empty-valued `NAME=` entries in the effective
+environment to match the pinned BuildKit/runc path. This also makes a bare
+inherited `PATH` authoritative as an empty PATH instead of adding the
+conventional default.
 
 Structural follow-ups are explicit gates before C2 widens the instruction
 surface:

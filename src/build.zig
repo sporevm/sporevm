@@ -1024,10 +1024,8 @@ fn runEnvironment(allocator: std.mem.Allocator, state: State) ![]const []const u
 
 fn validateRunEnvironment(env: []const []const u8) !void {
     for (env) |entry| {
-        if (entry.len == 0) return error.InvalidRunEnvironment;
-        if (std.mem.indexOfScalar(u8, entry, '=')) |eq| {
-            if (eq == 0) return error.InvalidRunEnvironment;
-        }
+        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return error.InvalidRunEnvironment;
+        if (eq == 0) return error.InvalidRunEnvironment;
         if (std.mem.indexOfScalar(u8, entry, 0) != null) return error.InvalidRunEnvironment;
     }
 }
@@ -1067,9 +1065,8 @@ fn envValue(env: []const []const u8, key: []const u8) ?[]const u8 {
 
 fn envContainsKey(env: []const []const u8, key: []const u8) bool {
     for (env) |entry| {
-        if (std.mem.indexOfScalar(u8, entry, '=')) |eq| {
-            if (std.mem.eql(u8, entry[0..eq], key)) return true;
-        }
+        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse entry.len;
+        if (std.mem.eql(u8, entry[0..eq], key)) return true;
     }
     return false;
 }
@@ -1083,12 +1080,13 @@ fn normalizeEnvLastWins(allocator: std.mem.Allocator, env: []const []const u8) !
     while (i > 0) {
         i -= 1;
         const entry = env[i];
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse {
-            if (entry.len == 0 or std.mem.indexOfScalar(u8, entry, 0) != null) try entries.append(entry);
-            continue;
-        };
-        const result = try seen.getOrPut(entry[0..eq]);
-        if (!result.found_existing) try entries.append(entry);
+        const eq = std.mem.indexOfScalar(u8, entry, '=');
+        const key = if (eq) |separator| entry[0..separator] else entry;
+        const result = try seen.getOrPut(key);
+        if (!result.found_existing) try entries.append(if (eq == null)
+            try std.fmt.allocPrint(allocator, "{s}=", .{entry})
+        else
+            entry);
     }
     var left: usize = 0;
     var right = entries.items.len;
@@ -1368,8 +1366,15 @@ test "effective RUN environment normalizes inherited duplicate keys with the las
     try std.testing.expectEqualStrings("/oracle/b", envValue(inherited_state.environment.effective.items, "PATH").?);
 
     const missing_equals = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"BROKEN"}) } }, testStorage(), &.{}, 0);
-    try std.testing.expect(envValue(try runEnvironment(arena, missing_equals), "BROKEN") == null);
+    try std.testing.expectEqualStrings("", envValue(try runEnvironment(arena, missing_equals), "BROKEN").?);
+    try std.testing.expectEqualStrings("BROKEN=", missing_equals.environment.effective.items[0]);
     try std.testing.expectEqualStrings("BROKEN", (try imageConfig(arena, .{}, missing_equals)).config.?.Env.?[0]);
+    const missing = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        try effectiveRunEnvDigest(arena, missing_equals),
+        try effectiveRunEnvDigest(arena, missing),
+    ));
 
     const empty_entry = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{""}) } }, testStorage(), &.{}, 0);
     try std.testing.expectError(error.InvalidRunEnvironment, runEnvironment(arena, empty_entry));
@@ -1468,6 +1473,12 @@ test "build stage defaults PATH and root RUN HOME when absent or empty" {
     const empty_path_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"PATH="}) } }, testStorage(), &.{}, 0);
     try std.testing.expectEqual(@as(usize, 1), empty_path_state.environment.effective.items.len);
     try std.testing.expectEqualStrings("PATH=", empty_path_state.environment.effective.items[0]);
+
+    const bare_path_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"PATH"}) } }, testStorage(), &.{}, 0);
+    try std.testing.expectEqual(@as(usize, 1), bare_path_state.environment.config.items.len);
+    try std.testing.expectEqualStrings("PATH", bare_path_state.environment.config.items[0]);
+    try std.testing.expectEqualStrings("PATH=", bare_path_state.environment.effective.items[0]);
+    try std.testing.expectEqualStrings("", envValue(try runEnvironment(arena, bare_path_state), "PATH").?);
 }
 
 test "stage PATH participates in expansion while ARG overrides only effective state" {

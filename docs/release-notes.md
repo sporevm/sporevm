@@ -21,8 +21,9 @@ published OCI config, and a later `FROM` reconstructs its effective environment
 from that published list just as BuildKit does. Inherited entries that are bare
 empty strings, have an empty `=value` name, or contain an embedded NUL now fail
 before RUN cache lookup or executor startup. Matching the pinned path, nonempty
-entries without `=` are omitted from the effective environment without
-rewriting OCI config.
+entries without `=` become empty-valued `NAME=` entries in the effective
+environment without rewriting OCI config. A bare inherited `PATH` is therefore
+authoritative as an empty PATH and does not receive the conventional default.
 Malformed, empty, NUL-containing, or oversized arrays fail during full-file
 parsing before a build VM starts. The versioned guest request also requires its
 exact fields once and rejects aliases, unknown fields, trailing commas, and
