@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-14
+last_reviewed: 2026-07-15
 spec_refs:
   - docs/rootfs.md
   - docs/filesystem.md
@@ -924,10 +924,16 @@ and enumerate one canonical full rootfs CAS index.
      preflights the fully serialized request while constructing the
      source-spanned transition. Exec form invokes no implicit shell, so `$NAME`
      stays literal unless the argv explicitly starts a shell; a slashless
-     executable is searched through the absolute entries in the effective
-     non-empty PATH, continuing after non-executable candidates and rejecting
-     relative matches as Docker does. Both forms stream output, report the
-     exact exit code, and use the session's `--network` policy.
+     executable is resolved through the effective non-empty PATH before one
+     execution attempt. Lookup skips missing, non-executable, directory, and
+     other lookup-time failures, rejects a relative executable match, and
+     selects the first executable absolute candidate; failure to execute that
+     selected candidate is terminal and never falls through to a later entry.
+     The v2 guest request is an exact bounded object: every documented field
+     appears once, aliases and unknown fields are rejected, arrays have no
+     trailing commas, and no non-whitespace bytes follow the object. Both forms
+     stream output, report the exact exit code, and use the session's
+     `--network` policy.
    - `COPY`: before boot, the host emits the resolved context entries needed
      by executed COPY steps into a cached read-only ext4 context disk and
      attaches it as an additional virtio-blk device. Per step, the host sends

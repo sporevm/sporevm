@@ -6,13 +6,19 @@
 decoded argv directly, preserves spaces, empty arguments, quotes, and literal
 `$NAME` text, and searches absolute entries in the effective build PATH when
 the executable contains no slash. Empty PATH and relative matches fail closed,
-matching BuildKit. ENV and ARG state, workdir, network, resources, parent
+matching BuildKit. PATH lookup now selects the first executable candidate
+before one execution attempt, so a missing shebang interpreter fails the step
+instead of falling through to a later program, while lookup-time errors such
+as a symlink loop remain skippable. ENV and ARG state, workdir, network,
+resources, parent
 rootfs, exact instruction text, and the embedded executor identity remain cache
 inputs, so a changed argv or effective environment misses while an unchanged
 rebuild hits.
 Malformed, empty, NUL-containing, or oversized arrays fail during full-file
-parsing before a build VM starts. Shell-form RUN remains `/bin/sh -c`; mounted
-RUN and heredocs remain unsupported.
+parsing before a build VM starts. The versioned guest request also requires its
+exact fields once and rejects aliases, unknown fields, trailing commas, and
+trailing bytes. Shell-form RUN remains `/bin/sh -c`; mounted RUN and heredocs
+remain unsupported.
 
 Cold OCI base imports no longer scan the complete merged filesystem for every
 regular-file replacement. The importer keeps per-inode hardlink reference

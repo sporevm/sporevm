@@ -1867,13 +1867,22 @@ fn rawExecRequestForTest(allocator: std.mem.Allocator, argv: []const []const u8)
     const payload = struct {
         type: []const u8 = "spore-build-run-v2",
         session_id: []const u8 = "spore-build-test",
+        resume_time_unix_ns: u64 = 1,
         argv: []const []const u8,
         env: []const []const u8 = &.{},
         working_dir: []const u8 = "/",
+        stdio: []const u8 = "pipe",
+        term: []const u8 = "xterm",
+        terminal_rows: u16 = 24,
+        terminal_cols: u16 = 80,
+        memory_pressure: bool = false,
         nofile_soft: u64 = 1,
         nofile_hard: u64 = 1,
+        closed_env: bool = true,
     }{ .argv = argv };
-    return std.json.Stringify.valueAlloc(allocator, payload, .{});
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
 test "build exec-form RUN request carries exact bounded argv" {
@@ -1974,8 +1983,29 @@ test "guest build request parser rejects malformed RUN framing and accepts build
     const over_limit = "{\"type\":\"spore-build-run-v1\",\"command_len\":65537}\n";
     try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(over_limit.ptr, over_limit.len, stream[0..0].ptr, 0));
 
-    const empty_exec = "{\"type\":\"spore-build-run-v2\",\"argv\":[],\"env\":[],\"working_dir\":\"/\",\"nofile_soft\":1,\"nofile_hard\":1}\n";
+    const empty_exec = try rawExecRequestForTest(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(empty_exec);
     try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(empty_exec.ptr, empty_exec.len, stream[0..0].ptr, 0));
+
+    const reordered_exec = "{\"closed_env\":true,\"nofile_hard\":1,\"nofile_soft\":1,\"memory_pressure\":false,\"terminal_cols\":80,\"terminal_rows\":24,\"term\":\"xterm\",\"stdio\":\"pipe\",\"working_dir\":\"/\",\"env\":[],\"argv\":[\"true\"],\"resume_time_unix_ns\":1,\"session_id\":\"s\",\"type\":\"spore-build-run-v2\"}\n";
+    try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(reordered_exec.ptr, reordered_exec.len, stream[0..0].ptr, 0));
+
+    const malformed_exec_requests = [_][]const u8{
+        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\",],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true} trailing\n",
+        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"argv\":[\"false\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v2\",\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true,\"unknown\":0}\n",
+        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1}\n",
+        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,}\n",
+        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"line\nbreak\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"tty\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":01,\"nofile_hard\":1,\"closed_env\":true}\n",
+    };
+    for (malformed_exec_requests) |malformed| {
+        try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(malformed.ptr, malformed.len, stream[0..0].ptr, 0));
+    }
 
     const copy_request = try copyRequest(std.testing.allocator, "spore-build-1", .{
         .source = "input",
