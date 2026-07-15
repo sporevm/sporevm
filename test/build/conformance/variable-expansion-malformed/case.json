@@ -1,0 +1,9 @@
+{
+  "description": "malformed expansion fails during the full-file parse pass",
+  "expect": {
+    "docker": "failure",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: unsupported variable expansion"
+  },
+  "scan_prefixes": []
+}

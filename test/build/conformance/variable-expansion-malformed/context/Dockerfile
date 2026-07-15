@@ -1,0 +1,2 @@
+FROM base
+ENV VALUE=${BROKEN

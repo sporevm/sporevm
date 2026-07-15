@@ -72,8 +72,8 @@ pub fn create(
     const stages = try allocator.alloc(Stage, document.stages.len);
     for (document.stages, 0..) |*source_stage, stage_index| {
         var dependencies = std.array_list.Managed(usize).init(allocator);
-        const source_name = try expand(allocator, source_stage.from.value.from.source, options.variables, source_stage.from.line, diagnostic);
-        const platform = if (source_stage.from.value.from.platform) |raw| try expand(allocator, raw, options.variables, source_stage.from.line, diagnostic) else null;
+        const source_name = try expand(allocator, source_stage.from.value.from.source, options.variables, document.directives.escape, source_stage.from.line, diagnostic);
+        const platform = if (source_stage.from.value.from.platform) |raw| try expand(allocator, raw, options.variables, document.directives.escape, source_stage.from.line, diagnostic) else null;
         const base: Base = if (std.ascii.eqlIgnoreCase(source_name, "scratch"))
             .scratch
         else if (try resolveStageReference(document, stage_index, source_name, .from, source_stage.from.line, diagnostic)) |dependency| blk: {
@@ -84,8 +84,7 @@ pub fn create(
         var copies = std.array_list.Managed(PlannedCopy).init(allocator);
         for (source_stage.instructions, 0..) |instruction, instruction_index| switch (instruction.value) {
             .copy => |copy| {
-                const copy_source: CopySource = if (copy.from) |raw_reference| source: {
-                    const reference = try expand(allocator, raw_reference, options.variables, instruction.line, diagnostic);
+                const copy_source: CopySource = if (copy.from) |reference| source: {
                     if (try resolveStageReference(document, stage_index, reference, .copy, instruction.line, diagnostic)) |dependency| {
                         try appendDependency(&dependencies, dependency);
                         break :source .{ .stage = dependency };
@@ -115,11 +114,13 @@ fn expand(
     allocator: std.mem.Allocator,
     input: []const u8,
     variables: []const Variable,
+    escape: u8,
     line: usize,
     diagnostic: *dockerfile.Diagnostic,
 ) ![]const u8 {
-    return variable_expansion.expand(allocator, input, variables, .empty) catch |err| switch (err) {
-        error.BadVariableSubstitution => return fail(diagnostic, line, "unsupported variable expansion"),
+    return variable_expansion.expand(allocator, input, variables, .{ .escape = escape }) catch |err| switch (err) {
+        error.BadVariableSubstitution, error.UnsupportedVariableModifier => return fail(diagnostic, line, "unsupported variable expansion"),
+        error.VariableExpansionTooLarge => return fail(diagnostic, line, "expanded Dockerfile argument is too large"),
         else => |other| return other,
     };
 }

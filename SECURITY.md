@@ -79,6 +79,19 @@ global reference registry.
 | Saved lifecycle metadata | input spore directories and bundles | Saved lifecycle fields are compatibility hints, not fresh host authority. In particular, `console_log_path` is untrusted and restore never opens or truncates it; named restore currently configures no console log until a future explicit restore option selects a new host path. Ready, list, result, and failure output expose only the path actually configured for the live monitor. |
 | Embedded initrd Toybox shell and applets | host-selected guest argv and guest workload input | the default initrd builds Toybox from pinned source with a minimal applet config and runs it only as guest child workload code; Toybox does not add host parsers, VMM devices, monitor control requests, or rootfs cache authority. Unsupported applets are absent, existing SporeVM helper binaries win over Toybox symlinks, and exact argv still uses `execve(argv[0], ...)` without guest PATH lookup |
 
+Builder-owned Dockerfile expansion is part of the full-file parse boundary.
+Expansion-capable operands retain their exact quote and escape spelling through
+parsing, and the bounded stable `$NAME`, `${NAME}`, default, and alternate
+grammar is validated before any base fetch or guest boot. Unset variables
+resolve to empty, automatic platform args derive from the selected platform,
+and every ENV instruction resolves all pairs from one instruction-start
+snapshot; malformed or unsupported modifiers remain fail-closed. The existing
+Dockerfile parser fuzz target and a dedicated expansion fuzz target cover
+malformed quoting, escaping, nesting, substitutions, and modifier bytes.
+Expansion depth, each resolved word, and aggregate builder variable state are
+capped at 64 levels, 1 MiB, and 64 MiB respectively, with a source-spanned
+failure before executor startup or image publication.
+
 Builder-v7 RUN/COPY/WORKDIR cache keys bind the same exact kernel/initrd and
 agent-contract identity used for PREPARE. On the managed default, the identity
 uses the canonical SHA-256 from the bounded read-only kernel sidecar and the

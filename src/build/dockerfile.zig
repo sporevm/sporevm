@@ -1,5 +1,6 @@
 const std = @import("std");
 const run_contract = @import("run_contract.zig");
+const variable_expansion = @import("variables.zig");
 
 pub const Diagnostic = struct {
     line: usize = 0,
@@ -34,6 +35,7 @@ pub const Instruction = struct {
     line: usize,
     span: Span,
     raw: []const u8,
+    escape: u8 = '\\',
     value: Value,
 
     pub const Value = union(enum) {
@@ -116,6 +118,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diagnostic: *Diagn
             .line = line.line,
             .span = .{ .start_line = line.line, .end_line = line.end_line },
             .raw = raw,
+            .escape = directives.escape,
             .value = value,
         });
     }
@@ -160,28 +163,31 @@ fn parseInstruction(
     diagnostic: *Diagnostic,
 ) !Instruction.Value {
     if (asciiEql(op, "FROM")) {
-        try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
         const args = try splitWords(allocator, rest, escape, line, diagnostic);
         if (args.len == 0) return fail(diagnostic, line, "FROM requires a source image");
         var index: usize = 0;
         var platform: ?[]const u8 = null;
-        if (std.mem.startsWith(u8, args[index], "--")) {
-            if (!std.mem.startsWith(u8, args[index], "--platform=") or args[index].len == "--platform=".len) {
+        if (std.mem.startsWith(u8, args[index].value, "--")) {
+            if (!std.mem.startsWith(u8, args[index].value, "--platform=") or args[index].value.len == "--platform=".len or
+                !std.mem.startsWith(u8, args[index].raw, "--platform="))
+            {
                 return fail(diagnostic, line, "unsupported FROM flag");
             }
-            platform = args[index]["--platform=".len..];
+            platform = args[index].raw["--platform=".len..];
+            try validateExpansion(allocator, platform.?, escape, line, diagnostic);
             index += 1;
         }
         if (index >= args.len) return fail(diagnostic, line, "FROM requires a source image");
-        const source = args[index];
+        const source = args[index].raw;
+        try validateExpansion(allocator, source, escape, line, diagnostic);
         index += 1;
         var name: ?[]const u8 = null;
         if (index < args.len) {
-            if (!asciiEql(args[index], "AS") or index + 2 != args.len) {
+            if (!asciiEql(args[index].value, "AS") or index + 2 != args.len) {
                 return fail(diagnostic, line, "unsupported FROM form; expected `FROM [--platform=<platform>] <name> [AS <stage>]`");
             }
-            if (!validStageName(args[index + 1])) return fail(diagnostic, line, "FROM AS has an invalid stage name");
-            name = args[index + 1];
+            if (!validStageName(args[index + 1].value)) return fail(diagnostic, line, "FROM AS has an invalid stage name");
+            name = args[index + 1].value;
             index += 2;
         }
         if (index != args.len) return fail(diagnostic, line, "unsupported FROM form");
@@ -197,50 +203,63 @@ fn parseInstruction(
         return .{ .run = .{ .shell = try allocator.dupe(u8, rest) } };
     }
     if (asciiEql(op, "COPY")) {
-        try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
         if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported COPY heredoc");
         const args = try splitWords(allocator, rest, escape, line, diagnostic);
         var first_source: usize = 0;
         var from: ?[]const u8 = null;
-        while (first_source < args.len and std.mem.startsWith(u8, args[first_source], "--")) : (first_source += 1) {
+        while (first_source < args.len and std.mem.startsWith(u8, args[first_source].value, "--")) : (first_source += 1) {
             const arg = args[first_source];
-            if (std.mem.startsWith(u8, arg, "--from=") and arg.len > "--from=".len and from == null) {
-                from = arg["--from=".len..];
+            if (std.mem.startsWith(u8, arg.value, "--from=") and arg.value.len > "--from=".len and from == null and
+                std.mem.startsWith(u8, arg.raw, "--from="))
+            {
+                from = arg.raw["--from=".len..];
+                const resolved = variable_expansion.expand(allocator, from.?, &.{}, .{ .escape = escape }) catch {
+                    return fail(diagnostic, line, "COPY --from does not support variable expansion or quoting");
+                };
+                defer allocator.free(resolved);
+                if (!std.mem.eql(u8, resolved, from.?)) return fail(diagnostic, line, "COPY --from does not support variable expansion or quoting");
                 continue;
             }
-            const flag = if (std.mem.indexOfScalar(u8, arg, '=')) |eq| arg[0..eq] else arg;
+            const flag = if (std.mem.indexOfScalar(u8, arg.value, '=')) |eq| arg.value[0..eq] else arg.value;
             const message = try std.fmt.allocPrint(allocator, "unsupported COPY flag: {s}", .{flag});
             return fail(diagnostic, line, message);
         }
         if (args.len - first_source < 2) return fail(diagnostic, line, "COPY requires at least one source and a destination");
         for (args[first_source..]) |arg| {
-            if (std.mem.startsWith(u8, arg, "--")) {
-                const flag = if (std.mem.indexOfScalar(u8, arg, '=')) |eq| arg[0..eq] else arg;
+            if (std.mem.startsWith(u8, arg.value, "--")) {
+                const flag = if (std.mem.indexOfScalar(u8, arg.value, '=')) |eq| arg.value[0..eq] else arg.value;
                 const message = try std.fmt.allocPrint(allocator, "unsupported COPY flag: {s}", .{flag});
                 return fail(diagnostic, line, message);
             }
+            try validateExpansion(allocator, arg.raw, escape, line, diagnostic);
         }
-        return .{ .copy = .{ .from = from, .sources = args[first_source .. args.len - 1], .dest = args[args.len - 1] } };
+        const sources = try allocator.alloc([]const u8, args.len - first_source - 1);
+        for (args[first_source .. args.len - 1], sources) |arg, *source_arg| source_arg.* = arg.raw;
+        return .{ .copy = .{ .from = from, .sources = sources, .dest = args[args.len - 1].raw } };
     }
     if (asciiEql(op, "ENV")) {
-        try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
         const pairs = try parseEnv(allocator, rest, escape, line, diagnostic);
         return .{ .env = .{ .pairs = pairs } };
     }
     if (asciiEql(op, "ARG")) {
-        try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
         const args = try splitWords(allocator, rest, escape, line, diagnostic);
         if (args.len != 1) return fail(diagnostic, line, "ARG requires exactly one name or name=default");
-        const eq = std.mem.indexOfScalar(u8, args[0], '=');
-        const key = if (eq) |idx| args[0][0..idx] else args[0];
+        const eq = std.mem.indexOfScalar(u8, args[0].value, '=');
+        const key = if (eq) |idx| args[0].value[0..idx] else args[0].value;
         if (!validName(key)) return fail(diagnostic, line, "ARG has an invalid name");
-        return .{ .arg = .{ .key = key, .default = if (eq) |idx| args[0][idx + 1 ..] else null } };
+        const default = if (eq != null) blk: {
+            const raw_eq = std.mem.indexOfScalar(u8, args[0].raw, '=') orelse return fail(diagnostic, line, "ARG has an invalid default");
+            const raw_default = args[0].raw[raw_eq + 1 ..];
+            try validateExpansion(allocator, raw_default, escape, line, diagnostic);
+            break :blk raw_default;
+        } else null;
+        return .{ .arg = .{ .key = key, .default = default } };
     }
     if (asciiEql(op, "WORKDIR")) {
-        try rejectUnsupportedVariableExpansion(rest, line, diagnostic);
         const args = try splitWords(allocator, rest, escape, line, diagnostic);
         if (args.len != 1) return fail(diagnostic, line, "WORKDIR requires exactly one path");
-        return .{ .workdir = args[0] };
+        try validateExpansion(allocator, args[0].raw, escape, line, diagnostic);
+        return .{ .workdir = args[0].raw };
     }
     if (asciiEql(op, "CMD")) {
         if (rest.len == 0) return fail(diagnostic, line, "CMD requires a command");
@@ -327,29 +346,12 @@ fn supportedSyntaxDirective(value: []const u8) bool {
     return version[1] == '.' or version[1] == '@';
 }
 
-fn rejectUnsupportedVariableExpansion(input: []const u8, line: usize, diagnostic: *Diagnostic) !void {
-    var i: usize = 0;
-    while (i < input.len) : (i += 1) {
-        if (input[i] != '$') continue;
-        if (i + 1 >= input.len) continue;
-        if (input[i + 1] == '$') {
-            i += 1;
-            continue;
-        }
-        if (input[i + 1] == '{') {
-            const end = std.mem.indexOfScalarPos(u8, input, i + 2, '}') orelse {
-                return fail(diagnostic, line, "unsupported variable expansion");
-            };
-            const name = input[i + 2 .. end];
-            if (!validName(name)) return fail(diagnostic, line, "unsupported variable expansion");
-            i = end;
-            continue;
-        }
-        if (!(std.ascii.isAlphabetic(input[i + 1]) or input[i + 1] == '_')) {
-            return fail(diagnostic, line, "unsupported variable expansion");
-        }
-        while (i + 1 < input.len and (std.ascii.isAlphanumeric(input[i + 1]) or input[i + 1] == '_')) i += 1;
-    }
+fn validateExpansion(allocator: std.mem.Allocator, input: []const u8, escape: u8, line: usize, diagnostic: *Diagnostic) !void {
+    variable_expansion.validate(allocator, input, .{ .escape = escape }) catch |err| switch (err) {
+        error.BadVariableSubstitution, error.UnsupportedVariableModifier => return fail(diagnostic, line, "unsupported variable expansion"),
+        error.VariableExpansionTooLarge => return fail(diagnostic, line, "expanded Dockerfile argument is too large"),
+        else => |other| return other,
+    };
 }
 
 fn parseEnv(
@@ -364,24 +366,28 @@ fn parseEnv(
     var pairs = std.array_list.Managed(Pair).init(allocator);
     var all_equals = true;
     for (words) |word| {
-        if (std.mem.indexOfScalar(u8, word, '=') == null) {
+        if (std.mem.indexOfScalar(u8, word.value, '=') == null) {
             all_equals = false;
             break;
         }
     }
     if (all_equals) {
         for (words) |word| {
-            const eq = std.mem.indexOfScalar(u8, word, '=').?;
-            const key = word[0..eq];
+            const eq = std.mem.indexOfScalar(u8, word.value, '=').?;
+            const key = word.value[0..eq];
             if (!validName(key)) return fail(diagnostic, line, "ENV has an invalid name");
-            try pairs.append(.{ .key = key, .value = word[eq + 1 ..] });
+            const raw_eq = std.mem.indexOfScalar(u8, word.raw, '=') orelse return fail(diagnostic, line, "ENV has an invalid value");
+            const value = word.raw[raw_eq + 1 ..];
+            try validateExpansion(allocator, value, escape, line, diagnostic);
+            try pairs.append(.{ .key = key, .value = value });
         }
         return pairs.toOwnedSlice();
     }
     if (words.len < 2) return fail(diagnostic, line, "ENV requires KEY VALUE or KEY=VALUE");
-    if (!validName(words[0])) return fail(diagnostic, line, "ENV has an invalid name");
-    const value_start = std.mem.indexOf(u8, rest, words[1]) orelse return fail(diagnostic, line, "ENV requires KEY VALUE");
-    try pairs.append(.{ .key = words[0], .value = std.mem.trimStart(u8, rest[value_start..], " \t") });
+    if (!validName(words[0].value)) return fail(diagnostic, line, "ENV has an invalid name");
+    const value = std.mem.trimStart(u8, rest[words[1].start..], " \t");
+    try validateExpansion(allocator, value, escape, line, diagnostic);
+    try pairs.append(.{ .key = words[0].value, .value = value });
     return pairs.toOwnedSlice();
 }
 
@@ -421,18 +427,25 @@ fn parseRunExec(
     return cloneStringList(allocator, parsed.value);
 }
 
+const WordToken = struct {
+    raw: []const u8,
+    value: []const u8,
+    start: usize,
+};
+
 fn splitWords(
     allocator: std.mem.Allocator,
     input: []const u8,
     escape: u8,
     line: usize,
     diagnostic: *Diagnostic,
-) ![]const []const u8 {
-    var out = std.array_list.Managed([]const u8).init(allocator);
+) ![]const WordToken {
+    var out = std.array_list.Managed(WordToken).init(allocator);
     var i: usize = 0;
     while (true) {
         while (i < input.len and std.ascii.isWhitespace(input[i])) i += 1;
         if (i >= input.len) break;
+        const start = i;
         var word = std.array_list.Managed(u8).init(allocator);
         var quote: ?u8 = null;
         while (i < input.len) : (i += 1) {
@@ -463,7 +476,7 @@ fn splitWords(
             try word.append(c);
         }
         if (quote != null) return fail(diagnostic, line, "unterminated quoted Dockerfile argument");
-        try out.append(try word.toOwnedSlice());
+        try out.append(.{ .raw = input[start..i], .value = try word.toOwnedSlice(), .start = start });
     }
     return out.toOwnedSlice();
 }
@@ -713,12 +726,13 @@ test "Dockerfile parser validates later exec-form RUN before returning a documen
     try std.testing.expectEqualStrings("RUN exec form must be a non-empty JSON string array", diag.message);
 }
 
-test "Dockerfile parser rejects unsupported non-RUN variable expansion operators" {
+test "Dockerfile parser accepts stable and rejects unstable variable expansion operators" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var diag: Diagnostic = .{};
-    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nENV A=${VAR:-default}\n", &diag));
-    try std.testing.expectEqualStrings("unsupported variable expansion", diag.message);
+    const doc = try parse(arena_state.allocator(), "FROM base\nENV A=${VAR:-default} B=${VAR+alternate}\n", &diag);
+    try std.testing.expectEqualStrings("${VAR:-default}", doc.stages[0].instructions[0].value.env.pairs[0].value);
+    try std.testing.expectEqualStrings("${VAR+alternate}", doc.stages[0].instructions[0].value.env.pairs[1].value);
 
     try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nWORKDIR ${VAR#prefix}\n", &diag));
     try std.testing.expectEqualStrings("unsupported variable expansion", diag.message);
@@ -739,6 +753,9 @@ test "Dockerfile parser rejects COPY flags in any position" {
 
     try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nCOPY --link a /dest\n", &diag));
     try std.testing.expectEqualStrings("unsupported COPY flag: --link", diag.message);
+
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nCOPY --from=$STAGE /a /dest\n", &diag));
+    try std.testing.expectEqualStrings("COPY --from does not support variable expansion or quoting", diag.message);
 }
 
 test "Dockerfile parser rejects ADD fail closed" {
