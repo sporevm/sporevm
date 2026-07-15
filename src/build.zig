@@ -1170,7 +1170,8 @@ fn lookupArg(name: []const u8, args: []const ArgValue) ?[]const u8 {
 fn putEnv(allocator: std.mem.Allocator, env: *std.array_list.Managed([]const u8), key: []const u8, value: []const u8) !void {
     const entry = try std.fmt.allocPrint(allocator, "{s}={s}", .{ key, value });
     for (env.items, 0..) |existing, i| {
-        if (std.mem.startsWith(u8, existing, key) and existing.len > key.len and existing[key.len] == '=') {
+        const eq = std.mem.indexOfScalar(u8, existing, '=') orelse existing.len;
+        if (std.mem.eql(u8, existing[0..eq], key)) {
             env.items[i] = entry;
             return;
         }
@@ -1479,6 +1480,25 @@ test "build stage defaults PATH and root RUN HOME when absent or empty" {
     try std.testing.expectEqualStrings("PATH", bare_path_state.environment.config.items[0]);
     try std.testing.expectEqualStrings("PATH=", bare_path_state.environment.effective.items[0]);
     try std.testing.expectEqualStrings("", envValue(try runEnvironment(arena, bare_path_state), "PATH").?);
+
+    var overridden_bare_path_state = bare_path_state;
+    try overridden_bare_path_state.environment.put(arena, "PATH", "/custom/bin");
+    try std.testing.expectEqual(@as(usize, 1), overridden_bare_path_state.environment.config.items.len);
+    try std.testing.expectEqualStrings("PATH=/custom/bin", overridden_bare_path_state.environment.config.items[0]);
+
+    var bare_then_value = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{ "A", "A=last" }) } }, testStorage(), &.{}, 0);
+    try bare_then_value.environment.put(arena, "A", "new");
+    try std.testing.expectEqualStrings("A=new", bare_then_value.environment.config.items[0]);
+    try std.testing.expectEqualStrings("A=last", bare_then_value.environment.config.items[1]);
+    const bare_then_value_inherited = try stateFromBase(arena, try imageConfig(arena, .{}, bare_then_value), testStorage(), &.{}, 0);
+    try std.testing.expectEqualStrings("last", envValue(bare_then_value_inherited.environment.effective.items, "A").?);
+
+    var value_then_bare = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{ "A=first", "A" }) } }, testStorage(), &.{}, 0);
+    try value_then_bare.environment.put(arena, "A", "new");
+    try std.testing.expectEqualStrings("A=new", value_then_bare.environment.config.items[0]);
+    try std.testing.expectEqualStrings("A", value_then_bare.environment.config.items[1]);
+    const value_then_bare_inherited = try stateFromBase(arena, try imageConfig(arena, .{}, value_then_bare), testStorage(), &.{}, 0);
+    try std.testing.expectEqualStrings("", envValue(value_then_bare_inherited.environment.effective.items, "A").?);
 }
 
 test "stage PATH participates in expansion while ARG overrides only effective state" {
