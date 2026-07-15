@@ -90,9 +90,11 @@ The first useful expansion is ordinary multi-stage application builds. A Go,
 Rust, Node, or similar builder stage should be able to copy its result into a
 small runtime stage with no Dockerfile rewrite. BuildKit-only optimization,
 privileged host integration, arbitrary frontend plugins, and raw credential
-mounts are explicit non-goals. A minimally adapted Buildkite `ci` target is a
-late acceptance workload because it combines most supported advanced features;
-it is not the shape around which the core architecture is specialized.
+mounts are explicit non-goals. The exact unmodified Buildkite `ci` target at
+revision `fb742fd5291244e2a1b9c174112f23e2a1581217` is the north-star oracle for
+ordering the remaining work: after each general slice lands, its next grounded
+failure determines what to consider next. The workload does not define
+Buildkite-specific product behavior, cache types, or compatibility shortcuts.
 
 An upstream stable-runtime target remains a valid interim way to unblock the
 Buildkite cache-layering experiment. It does not replace this roadmap and adds
@@ -159,6 +161,22 @@ The missing work falls into three different categories:
   features (`RUN --mount=type=cache`, `COPY --link`, remote `ADD`, heredocs)
   far outside the subset. The base image keeps arriving as an OCI layout via
   `--build-context`.
+- The unchanged Buildkite `ci` target is also exercised independently as a
+  read-only prioritization oracle. Its first grounded failure may identify C2,
+  C3, or C4 work, but does not move mounted RUN or remote ADD semantics into
+  C2. The next C2 implementation remains blocked until the merged exec-form RUN
+  contract completes independent manual acceptance.
+- The first post-merge oracle run was pinned to SporeVM
+  `606a7a24c8ae77ffd81d1e6c533685122c2185ee` and Buildkite
+  `fb742fd5291244e2a1b9c174112f23e2a1581217`, tree
+  `3cffc0c8aee0bb8871ecd293a732529fea24d214`, with Dockerfile SHA-256
+  `36867efe6eef1e96da5115aa91df0d087be61763c0097846a971d8709e659a2b`.
+  Full-file parsing stopped at Dockerfile line 42 on a mutable public HTTPS
+  `ADD`; the URL and destination also require builder-owned expansion and
+  automatic `TARGETOS`/`TARGETARCH`. No fetch, cache write, or VM boot occurred.
+  The syntax 1.20 directive was accepted, while C3 mounts and SSH remained
+  unreached. The oracle removed its task-owned scratch afterward, leaving no VM
+  or task-owned runtime/cache state.
 - No OCI image/layer output. `spore build` produces Spore rootfs artifacts and
   local refs, not pushable OCI images.
 - No flat checkpoint store and no full-image hash fallback in the executor.
@@ -316,9 +334,10 @@ The selected image needs no `/bin/sh` or `resize2fs` for preparation.
 - Fail before execution on unsupported frontend semantics.
 - Grow support through representative public fixtures and differential
   Docker/BuildKit oracles rather than one private workload.
-- Build a minimal, reviewed compatibility variant of the Buildkite `ci` target
-  faithfully enough to use its result as a local Spore image, without adding
-  SSH or application-specific behavior to SporeVM.
+- Use the exact unmodified Buildkite `ci` target at pinned revision `fb742fd` as
+  an ordering and final-acceptance oracle, while implementing only general
+  Dockerfile semantics and keeping SSH or application-specific behavior out of
+  SporeVM unless a separate product decision explicitly changes that boundary.
 
 ## Non-Goals
 
@@ -710,6 +729,15 @@ A future named credential broker may implement a deliberately different,
 mediated contract if real consumers justify it. That work requires a separate
 security plan and does not block this roadmap. Dockerfiles that require raw
 secret or SSH mounts continue to fail during planning.
+
+The unchanged Buildkite oracle contains a declared SSH mount, but it does not
+authorize credential forwarding. When that declaration becomes the first real
+blocker, preserve pinned BuildKit evidence and stop for a product/security
+decision between two narrow outcomes: accept an optional absent SSH declaration
+only when no socket or credential input is present or used, or retain a small
+compatibility-Dockerfile exception outside SporeVM. Do not choose between those
+outcomes implicitly, and do not add an SSH socket, host input, or durable secret
+state as part of C2 or C3.
 
 ### Cache model
 
@@ -1448,28 +1476,55 @@ amortized per build.
 - **Done:** bounded exec-form RUN with exact Unicode-preserving argv, effective
   last-value-wins ENV/ARG, PATH lookup, strict newline framing, cache
   invalidation, and Docker/BuildKit differential coverage;
-- full stable builder-owned variable expansion, including same-instruction
-  snapshots, unset-to-empty behavior, quote/escape provenance, and the stable
-  parameter operators. Exec-form RUN is deliberately separate from that work:
-  Docker preserves its argv literally, while builder-owned expansion changes
-  the state and cache semantics of instructions such as ENV, COPY, and WORKDIR;
-- explicit `RUN --security=sandbox` as the only accepted security mode;
-- RUN and COPY heredocs;
-- `COPY --chmod`, `--chown`, `--parents`, `--exclude`, and result-correct
-  `--link` with conservative cache behavior;
-- complete glob and `.dockerignore` parity for supported host filesystems;
-- `SHELL`, `USER`, `LABEL`, `EXPOSE`, `STOPSIGNAL`, and
-  `HEALTHCHECK` with full inheritance and final-config identity;
-- preserve `VOLUME` declarations in image config without adding Docker-style
-  anonymous-volume creation to `spore run`;
-- Docker-compatible unset ARG behavior and automatic platform values;
-- bounded resource and diagnostic behavior for large commands/configs.
+
+Do not begin the next implementation until the merged exec-form RUN work has an
+independent manual SHIP verdict. Once that gate passes, land small general PRs
+in the order the unchanged Buildkite oracle demonstrates:
+
+1. **Builder-owned expansion and automatic platform arguments.** Define
+   instruction-start snapshots, quoting and escaping, unset-to-empty behavior,
+   stable parameter operators, and automatic `TARGETOS`/`TARGETARCH` values.
+   Extend the existing `build/variables.zig` engine and typed instruction
+   transitions: the current helper only handles `$NAME`/`${NAME}`, fails on
+   unset values for executed instructions, and seeds automatic values with
+   fixed Linux/ARM64 strings instead of deriving them from the selected
+   platform. Preserve the parser provenance needed to distinguish quoted and
+   escaped input rather than reconstructing it from raw instruction text.
+   Every resolved semantic input participates in instruction state and cache
+   identity. Exec-form RUN remains literal; expansion changes the state and
+   cache semantics of instructions such as ENV, COPY, WORKDIR, and the operands
+   of a later typed ADD plan. Land and review this as a C2 foundation before
+   enabling any remote input.
+2. **Oracle-proven public HTTPS ADD.** After the expansion foundation lands,
+   implement the narrow C4 mutable-URL slice described below as a separate PR,
+   then rerun the unchanged target. The parser happens to encounter C4 before
+   the remaining C2 breadth; that changes delivery order, not ownership.
+3. **Buildkite-reachable frontend and filesystem behavior.** Add RUN and COPY
+   heredocs, `COPY --parents`, `COPY --chmod`, and result-correct `COPY --link`
+   including `--from` only when a later unchanged-oracle run reaches them.
+   Split these into separate PRs whenever their parser, filesystem result,
+   cache identity, or failure-publication protocols differ.
+4. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
+   a later unchanged-oracle run produces a concrete mismatch or unsupported
+   span.
+5. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
+   `--exclude`, `SHELL`, `USER`, `LABEL`, `EXPOSE`, `STOPSIGNAL`,
+   `HEALTHCHECK`, `VOLUME`, and other metadata only when the unchanged workload
+   or the representative common-template corpus demonstrates demand.
+
+C3 cache/bind mounts and C4 ADD remain outside C2 PRs even when the oracle
+reaches them. C2 changes should preserve typed plan, input, and cleanup seams
+that those later phases can extend without accepting their semantics early.
 
 Acceptance corpus includes representative Go, Rust, Node, and Ruby multi-stage
 images plus focused ownership, symlink, JSON, heredoc, and metadata fixtures.
+After every landed slice, rerun the exact pinned Buildkite target unchanged and
+record its next first failure before selecting another slice.
 
-**Done when:** Dockerfiles generated by common application templates build
-without syntax rewrites and normalized result/config differential tests pass.
+**Done when:** the C2 capabilities required by the unchanged Buildkite target
+and common application templates build without syntax rewrites and normalized
+result/config differential tests pass. A subsequent C3 or C4 blocker does not
+make the preceding C2 slice incomplete.
 
 **Stop/go gate:** a feature with unresolved result semantics remains rejected.
 Do not accept it merely because parsing succeeds.
@@ -1503,16 +1558,40 @@ larger generic design. Do not expand spore manifests solely for build caches.
 
 **Estimate:** 3–5 weeks.
 
-- `ADD --checksum` for HTTPS URLs, followed by conservative mutable URL ADD;
+- first, a bounded host-fetched public HTTPS single-file ADD for the exact
+  mutable-URL form proven by the oracle, while keeping the implementation
+  general. Expand URL and destination through the C2 engine, preserve remote
+  gzip bytes without local-tar extraction, stage bytes durably before applying
+  them through the shared COPY destination/ownership/mode machinery, and fail
+  closed on unsupported schemes, redirect-policy violations, status codes,
+  size, or destination behavior;
+- use Zig's standard URI/HTTP primitives, the existing public-target and
+  DNS-rebinding policy in `host_fetch_policy.zig`, and a factored generic form
+  of the registry fetcher's bounded redirect/streaming logic. Do not introduce
+  a second HTTP stack or hand-roll URI, TLS, redirect, or IP-range parsing;
+- key every persistent semantic input, including the resolved URL and
+  destination, platform/ARG values, response identity or content bytes,
+  redirect result, mode/ownership policy, parent state, and executor/parser
+  producer identities. Mutable-URL reuse must be conservative. Before fixing
+  the precise revalidation and cache-hit contract, stop for an explicit product
+  decision backed by pinned BuildKit behavior;
+- add `ADD --checksum` as a separate integrity-pinned form rather than
+  pretending the observed mutable URL is immutable;
 - local tar ADD through the existing bounded extraction model;
 - `--chmod`, ownership, excludes, link behavior, and destination rules shared
   with COPY where Docker defines the same contract;
 - explicit rejection for remote Git sources, Git build contexts,
-  `--keep-git-dir`, and remote `--unpack`.
+  `--keep-git-dir`, and remote `--unpack`;
+- update `SECURITY.md`, compatibility notes, and release notes in the owning
+  slice, and extend the Dockerfile fuzz target in the same change for every new
+  attacker-influenced ADD operand or flag grammar.
 
-**Done when:** remote/local ADD fixtures match BuildKit result semantics under
-redirects, errors, checksum mismatch, archives, ownership, merge, and cache
-rebuilds, while every unsupported Git/unpack form fails before network access.
+**Done when:** pinned remote/local ADD fixtures match BuildKit result semantics
+under expansion, redirects, errors, checksum mismatch, changed remote bytes,
+destination rules, ownership, merge, and cold/warm/rebuild cache behavior,
+while every unsupported Git/unpack form fails before network access. Full-file
+parse-before-execute remains mandatory, so an unsupported later instruction
+prevents the earlier ADD from fetching.
 
 **Stop/go gate:** do not turn `ADD` into a source-control client or general
 remote archive service. A feature requiring Git credentials, submodules, SSH,
@@ -1520,13 +1599,11 @@ or mutable repository semantics remains rejected.
 
 ### C5 — Buildkite `ci` compatibility recipe
 
-**Estimate:** 2–4 weeks after C1–C4, mostly integration and discovered gaps.
+**Estimate:** integration and discovered gaps after the required C2–C4 slices.
 
-Maintain the smallest reviewed compatibility variant of the current Buildkite
-Dockerfile as an advanced acceptance workload. The expected delta removes the
-declared SSH mount while the resolved dependency inputs do not require it; any
-additional delta must correspond to another explicitly unsupported feature and
-remain outside SporeVM. The target closure still exercises:
+Use the exact unmodified Buildkite Dockerfile at revision
+`fb742fd5291244e2a1b9c174112f23e2a1581217` as the advanced acceptance
+workload throughout delivery, not only after C4. Its target closure exercises:
 
 - standard syntax directive and automatic platform ARGs;
 - public remote bases and URL ADD;
@@ -1544,10 +1621,13 @@ upstream stable-runtime/committed-Docker-store path may continue in parallel as
 an operational benchmark, but no Buildkite-specific instruction or cache type
 enters SporeVM.
 
-**Done when:** `spore build --target ci -f <compatibility-Dockerfile>` builds on
-Linux ARM64, the compatibility diff stays minimal and auditable, the result
-passes the workload smoke, and cache invalidation is sound under source,
-lockfile, build-arg, and base changes.
+**Done when:** `spore build --target ci --tag local/buildkite-ci
+/path/to/fb742fd` builds the unmodified pinned target on Linux ARM64 with no
+BuildKit prerequisite, the result passes `/bin/true` plus Ruby, Bundler, and
+RSpec probes, and cold, warm, incremental, source, lockfile, build-arg, and
+base-change evidence proves sound cache behavior. If SSH is the only remaining
+incompatibility, completion waits on the explicit credential-boundary decision
+above rather than silently changing the Dockerfile or forwarding credentials.
 
 ### C6 — Evidence-gated long tail
 
@@ -1591,6 +1671,14 @@ named credential broker requires its own product and security plan.
   `buildkite-sporevm` path as the M3 hardware smoke.
 - Equivalence: scripted file-tree diff (path, type, mode, uid/gid, size,
   symlink target) between spore-built and buildx-built rootfs.
+- Prioritization oracle: after every relevant landing, run the exact unmodified
+  Buildkite `ci` target at `fb742fd` in read-only task-owned scratch and stop at
+  its first grounded unsupported behavior. Map the failure to C2, C3, C4, or
+  the explicit SSH decision before selecting more work.
+- The first pinned run on `606a7a24` stops during full-file parsing at line 42,
+  before network or execution, on the mutable HTTPS `ADD` whose URL and
+  destination contain ARG/platform expansion. Preserve that result as the
+  baseline until the separate C2 expansion and C4 URL-ADD slices land.
 
 ### Filesystem and configuration
 
@@ -1676,9 +1764,19 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
 - Named `--build-context NAME=oci-layout://PATH` inputs are the builder's base
   image boundary. The wrapper can keep its generated application context while
   passing the separately prepared base OCI layout by name.
-- An `ARG` declaration without a default records an absent value. Referencing
-  that value during builder-owned substitution fails closed instead of
-  silently substituting an empty string.
+- An `ARG` declaration without a default records an absent value in the
+  instruction-start snapshot. Ordinary builder-owned substitution expands an
+  unset value to empty, while supported parameter operators may distinguish
+  unset from set-empty; the resolved operand and the snapshot inputs that
+  determine it participate in cache identity.
+- The unchanged Buildkite `ci` target at `fb742fd` is the prioritization oracle
+  for remaining compatibility work. It selects ordering by evidence but does
+  not define Buildkite-specific product behavior or permit C3 mounts, C4 ADD,
+  or credential forwarding to enter C2.
+- The first post-merge oracle failure is the mutable public HTTPS `ADD` at line
+  42. Delivery therefore advances the independent C2 expansion/platform-value
+  foundation and then the smallest sound C4 URL-ADD slice before unrelated C2
+  metadata breadth; the two capabilities remain separately reviewed and owned.
 
 ## Deferred Decisions And Triggers
 
@@ -1689,6 +1787,11 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
 - Any future automatic capacity above 16 GiB needs a compact index format or a
   lower proven dense-index ceiling; the current 64 MiB index limit is a hard
   format constraint, not a reason to add a user knob.
+- SSH remains a product/security decision. Revisit it only when the unchanged
+  pinned target reaches its SSH declaration as the first real blocker, with
+  BuildKit evidence for whether the build actually consumes a socket or input.
+  Choose explicitly between an optional absent declaration with no credential
+  authority and retaining the compatibility-Dockerfile exception.
 
 ## Key Learnings From Pressure-Testing
 
@@ -1727,3 +1830,12 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
 - Docker cache-semantics fidelity matters more than feature breadth: the test
   plan pins one golden test per invalidation rule so that "cached" never means
   "stale" — the failure mode that would destroy trust in the builder fastest.
+- An unchanged real target is a better ordering oracle than a speculative
+  compatibility checklist, but it must remain an oracle. Its C3, C4, or SSH
+  failures route work to those explicit phases or decisions instead of
+  broadening the current C2 PR.
+- Parser order can expose a later milestone before earlier breadth is complete.
+  Advancing the narrow owning slice preserves fail-closed parsing and keeps the
+  cache and security contract coherent; combining C2 expansion with C4 network
+  input merely to make one Dockerfile progress would erase those review
+  boundaries.
