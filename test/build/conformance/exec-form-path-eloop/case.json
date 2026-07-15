@@ -1,0 +1,16 @@
+{
+  "description": "exec-form RUN skips an ELOOP PATH candidate before selecting a later executable",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 2,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle/eloop/result"
+  ]
+}

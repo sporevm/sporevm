@@ -1764,6 +1764,8 @@ static int parse_json_string(const char **cursor, char *out, size_t cap) {
         default:
           return -1;
       }
+    } else if ((unsigned char)c < 0x20) {
+      return -1;
     }
     if (len + 1 >= cap) return -1;
     out[len++] = c;
@@ -1907,6 +1909,218 @@ struct run_request {
   char working_dir[MAX_WORKDIR_LEN];
 };
 
+static int json_token_finished(char c);
+
+static int parse_json_u64(const char **cursor, uint64_t *out) {
+  const char *p = *cursor;
+  if (*p < '0' || *p > '9') return -1;
+  if (*p == '0' && p[1] >= '0' && p[1] <= '9') return -1;
+  uint64_t value = 0;
+  do {
+    uint64_t digit = (uint64_t)(*p - '0');
+    if (value > (UINT64_MAX - digit) / 10) return -1;
+    value = value * 10 + digit;
+    p++;
+  } while (*p >= '0' && *p <= '9');
+  *out = value;
+  *cursor = p;
+  return 0;
+}
+
+static int parse_json_bool(const char **cursor, int *out) {
+  const char *p = *cursor;
+  if (strncmp(p, "true", 4) == 0 && json_token_finished(p[4])) {
+    *out = 1;
+    *cursor = p + 4;
+    return 0;
+  }
+  if (strncmp(p, "false", 5) == 0 && json_token_finished(p[5])) {
+    *out = 0;
+    *cursor = p + 5;
+    return 0;
+  }
+  return -1;
+}
+
+static int parse_exec_argv_value(const char **cursor, struct run_request *out) {
+  const char *p = *cursor;
+  if (*p != '[') return -1;
+  p++;
+
+  int argc = 0;
+  size_t storage_len = 0;
+  size_t decoded_len = 0;
+  p = skip_ws(p);
+  if (*p == ']') return -1;
+  for (;;) {
+    if (argc >= MAX_ARGC || storage_len >= sizeof(out->arg_storage)) return -1;
+    out->argv[argc] = out->arg_storage + storage_len;
+    if (parse_json_string(&p, out->argv[argc], sizeof(out->arg_storage) - storage_len) != 0) return -1;
+    size_t arg_len = strlen(out->argv[argc]);
+    if (arg_len > MAX_BUILD_EXEC_ARGS_BYTES - decoded_len) return -1;
+    decoded_len += arg_len;
+    storage_len += arg_len + 1;
+    argc++;
+
+    p = skip_ws(p);
+    if (*p == ']') {
+      p++;
+      break;
+    }
+    if (*p != ',') return -1;
+    p = skip_ws(p + 1);
+    if (*p == ']') return -1;
+  }
+  if (out->argv[0][0] == '\0') return -1;
+  out->argv[argc] = NULL;
+  *cursor = p;
+  return 0;
+}
+
+static int parse_exec_env_value(const char **cursor, struct run_request *out) {
+  const char *p = *cursor;
+  if (*p != '[') return -1;
+  p++;
+
+  int envc = 0;
+  p = skip_ws(p);
+  if (*p == ']') {
+    out->envp[0] = NULL;
+    *cursor = p + 1;
+    return 0;
+  }
+  for (;;) {
+    if (envc >= MAX_ENVC) return -1;
+    if (parse_json_string(&p, out->env_storage[envc], MAX_ENV_LEN) != 0) return -1;
+    out->envp[envc] = out->env_storage[envc];
+    envc++;
+
+    p = skip_ws(p);
+    if (*p == ']') {
+      p++;
+      break;
+    }
+    if (*p != ',') return -1;
+    p = skip_ws(p + 1);
+    if (*p == ']') return -1;
+  }
+  out->envp[envc] = NULL;
+  *cursor = p;
+  return 0;
+}
+
+static int parse_build_run_v2_request(const char *req, struct run_request *out) {
+  enum {
+    SEEN_TYPE = 1u << 0,
+    SEEN_SESSION_ID = 1u << 1,
+    SEEN_RESUME_TIME = 1u << 2,
+    SEEN_ARGV = 1u << 3,
+    SEEN_ENV = 1u << 4,
+    SEEN_WORKDIR = 1u << 5,
+    SEEN_STDIO = 1u << 6,
+    SEEN_TERM = 1u << 7,
+    SEEN_ROWS = 1u << 8,
+    SEEN_COLS = 1u << 9,
+    SEEN_MEMORY_PRESSURE = 1u << 10,
+    SEEN_NOFILE_SOFT = 1u << 11,
+    SEEN_NOFILE_HARD = 1u << 12,
+    SEEN_CLOSED_ENV = 1u << 13,
+    SEEN_ALL = (1u << 14) - 1,
+  };
+
+  const char *p = skip_ws(req);
+  if (*p != '{') return -1;
+  p++;
+  unsigned int seen = 0;
+  for (;;) {
+    p = skip_ws(p);
+    if (*p == '}') {
+      p++;
+      break;
+    }
+
+    char key[32];
+    if (parse_json_string(&p, key, sizeof(key)) != 0) return -1;
+    p = skip_ws(p);
+    if (*p != ':') return -1;
+    p = skip_ws(p + 1);
+
+    unsigned int bit = 0;
+    if (strcmp(key, "type") == 0) {
+      bit = SEEN_TYPE;
+      char type[32];
+      if (parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, "spore-build-run-v2") != 0) return -1;
+    } else if (strcmp(key, "session_id") == 0) {
+      bit = SEEN_SESSION_ID;
+      if (parse_json_string(&p, out->session_id, sizeof(out->session_id)) != 0 || out->session_id[0] == '\0') return -1;
+    } else if (strcmp(key, "resume_time_unix_ns") == 0) {
+      bit = SEEN_RESUME_TIME;
+      if (parse_json_u64(&p, &out->resume_time_unix_ns) != 0) return -1;
+    } else if (strcmp(key, "argv") == 0) {
+      bit = SEEN_ARGV;
+      if (parse_exec_argv_value(&p, out) != 0) return -1;
+    } else if (strcmp(key, "env") == 0) {
+      bit = SEEN_ENV;
+      if (parse_exec_env_value(&p, out) != 0) return -1;
+    } else if (strcmp(key, "working_dir") == 0) {
+      bit = SEEN_WORKDIR;
+      if (parse_json_string(&p, out->working_dir, sizeof(out->working_dir)) != 0 || out->working_dir[0] != '/') return -1;
+    } else if (strcmp(key, "stdio") == 0) {
+      bit = SEEN_STDIO;
+      char stdio[8];
+      if (parse_json_string(&p, stdio, sizeof(stdio)) != 0 || strcmp(stdio, "pipe") != 0) return -1;
+    } else if (strcmp(key, "term") == 0) {
+      bit = SEEN_TERM;
+      char term[8];
+      if (parse_json_string(&p, term, sizeof(term)) != 0 || strcmp(term, "xterm") != 0) return -1;
+    } else if (strcmp(key, "terminal_rows") == 0) {
+      bit = SEEN_ROWS;
+      uint64_t rows = 0;
+      if (parse_json_u64(&p, &rows) != 0 || rows != 24) return -1;
+      out->terminal_rows = (uint16_t)rows;
+    } else if (strcmp(key, "terminal_cols") == 0) {
+      bit = SEEN_COLS;
+      uint64_t cols = 0;
+      if (parse_json_u64(&p, &cols) != 0 || cols != 80) return -1;
+      out->terminal_cols = (uint16_t)cols;
+    } else if (strcmp(key, "memory_pressure") == 0) {
+      bit = SEEN_MEMORY_PRESSURE;
+      int memory_pressure = 0;
+      if (parse_json_bool(&p, &memory_pressure) != 0 || memory_pressure) return -1;
+    } else if (strcmp(key, "nofile_soft") == 0) {
+      bit = SEEN_NOFILE_SOFT;
+      if (parse_json_u64(&p, &out->nofile_soft) != 0) return -1;
+    } else if (strcmp(key, "nofile_hard") == 0) {
+      bit = SEEN_NOFILE_HARD;
+      if (parse_json_u64(&p, &out->nofile_hard) != 0) return -1;
+    } else if (strcmp(key, "closed_env") == 0) {
+      bit = SEEN_CLOSED_ENV;
+      int closed_env = 0;
+      if (parse_json_bool(&p, &closed_env) != 0 || !closed_env) return -1;
+    } else {
+      return -1;
+    }
+    if ((seen & bit) != 0) return -1;
+    seen |= bit;
+
+    p = skip_ws(p);
+    if (*p == '}') {
+      p++;
+      break;
+    }
+    if (*p != ',') return -1;
+    p = skip_ws(p + 1);
+    if (*p == '}') return -1;
+  }
+  if (seen != SEEN_ALL || *skip_ws(p) != '\0') return -1;
+  if (out->nofile_soft == 0 || out->nofile_soft > out->nofile_hard || out->nofile_hard > MAX_BUILD_NOFILE) return -1;
+
+  out->kind = REQUEST_BUILD_RUN;
+  out->protocol_v1 = 1;
+  out->build_exec_form = 1;
+  return 0;
+}
+
 static int parse_string_field(const char *req, const char *name, char *out, size_t cap) {
   const char *p = find_field_value(req, name);
   if (p == NULL) return 0;
@@ -1987,6 +2201,9 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
   char type[32];
   int type_rc = parse_string_field(req, "type", type, sizeof(type));
   if (type_rc < 0) return -1;
+  if (type_rc > 0 && strcmp(type, "spore-build-run-v2") == 0) {
+    return parse_build_run_v2_request(req, out);
+  }
   if (type_rc > 0) {
     if (strcmp(type, "ready") == 0) {
       out->kind = REQUEST_READY;
@@ -2011,10 +2228,6 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
     } else if (strcmp(type, "spore-build-run-v1") == 0) {
       out->kind = REQUEST_BUILD_RUN;
       out->protocol_v1 = 1;
-    } else if (strcmp(type, "spore-build-run-v2") == 0) {
-      out->kind = REQUEST_BUILD_RUN;
-      out->protocol_v1 = 1;
-      out->build_exec_form = 1;
     } else if (strcmp(type, "spore-build-copy-v2") == 0 || strcmp(type, "spore-build-copy-v3") == 0) {
       out->kind = REQUEST_BUILD_COPY;
       out->protocol_v1 = 1;
@@ -2068,23 +2281,11 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
     if (path_rc <= 0) return -1;
   }
   if (out->kind == REQUEST_BUILD_RUN) {
-    if (out->build_exec_form) {
-      int argc = parse_argv(req, out->arg_storage, out->argv);
-      if (argc <= 0 || out->argv[0][0] == '\0') return -1;
-      size_t args_bytes = 0;
-      for (int i = 0; i < argc; i++) {
-        size_t arg_len = strlen(out->argv[i]);
-        if (arg_len > MAX_BUILD_EXEC_ARGS_BYTES - args_bytes) return -1;
-        args_bytes += arg_len;
-      }
-      if (find_field_value(req, "command_len") != NULL) return -1;
-    } else {
-      uint64_t command_len = 0;
-      int command_len_rc = parse_u64_field(req, "command_len", &command_len);
-      if (command_len_rc <= 0 || command_len > MAX_BUILD_RUN_COMMAND_LEN) return -1;
-      out->build_command_len = command_len;
-      if (find_field_value(req, "argv") != NULL) return -1;
-    }
+    uint64_t command_len = 0;
+    int command_len_rc = parse_u64_field(req, "command_len", &command_len);
+    if (command_len_rc <= 0 || command_len > MAX_BUILD_RUN_COMMAND_LEN) return -1;
+    out->build_command_len = command_len;
+    if (find_field_value(req, "argv") != NULL) return -1;
     if (parse_env(req, out->env_storage, out->envp) < 0) return -1;
     int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
     if (working_dir_rc < 0) return -1;
@@ -2948,7 +3149,8 @@ static void execve_or_report(char *const argv[], char *const envp[], int use_roo
   if (search_path && strchr(argv[0], '/') == NULL) {
     const char *path = env_value(envp, "PATH");
     if (path != NULL && path[0] != '\0') {
-      int saved_error = ENOENT;
+      char executable[MAX_BUILD_EXEC_PATH_LEN];
+      int found = 0;
       const char *entry = path;
       for (;;) {
         const char *end = strchr(entry, ':');
@@ -2961,39 +3163,30 @@ static void execve_or_report(char *const argv[], char *const envp[], int use_roo
           memcpy(candidate, dir, dir_len);
           candidate[dir_len] = '/';
           memcpy(candidate + dir_len + 1, argv[0], command_len + 1);
-          if (dir[0] != '/') {
-            struct stat candidate_stat;
-            if (stat(candidate, &candidate_stat) == 0) {
-              if (!S_ISDIR(candidate_stat.st_mode) && access(candidate, X_OK) == 0) {
-                saved_error = EACCES;
-                break;
-              }
-              if (!S_ISDIR(candidate_stat.st_mode) && errno == EACCES) saved_error = EACCES;
-            } else if (errno != ENOENT && errno != ENOTDIR) {
-              saved_error = errno;
-              break;
+          struct stat candidate_stat;
+          if (stat(candidate, &candidate_stat) == 0 &&
+              !S_ISDIR(candidate_stat.st_mode) && access(candidate, X_OK) == 0) {
+            if (dir[0] != '/') {
+              errno = EACCES;
+              goto exec_failed;
             }
-          } else {
-            execve(candidate, argv, effective_env);
-            if (errno == EACCES) saved_error = EACCES;
-            else if (errno != ENOENT && errno != ENOTDIR) {
-              saved_error = errno;
-              break;
-            }
+            memcpy(executable, candidate, dir_len + 1 + command_len + 1);
+            found = 1;
+            break;
           }
-        } else {
-          saved_error = ENAMETOOLONG;
         }
         if (end == NULL) break;
         entry = end + 1;
       }
-      errno = saved_error;
+      if (found) execve(executable, argv, effective_env);
+      else errno = ENOENT;
     } else {
       errno = ENOENT;
     }
   } else {
     execve(argv[0], argv, effective_env);
   }
+exec_failed:;
   int err = errno;
   if (!search_path && (err == ENOENT || err == ENOTDIR) && strchr(argv[0], '/') == NULL) {
     dprintf(STDERR_FILENO, "spore run: exact argv command \"%s\" was not found.\nExact argv mode does not run through /bin/sh or PATH lookup. Use shell command form or pass an absolute guest path.\n", argv[0]);
