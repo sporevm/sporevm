@@ -317,7 +317,9 @@ spore build \
 Resource controls reuse Spore's memory, vCPU, and duration parsers and expose a
 bounded `nofile`-only ulimit contract. RUN cache identity includes resolved
 memory, vCPU, and `nofile` values because commands can observe them; timeout is
-host-only and failed/timed-out operations never publish a record. The core
+host-only, applies independently to each Dockerfile instruction, and never
+publishes a failed or timed-out operation. Multiple guest requests belonging
+to one COPY instruction share its timeout budget. The core
 builder does not add raw `--secret` or `--ssh` host-input options. Do not expose
 an option before its cache, snapshot, and failure semantics are implemented.
 
@@ -455,15 +457,15 @@ implementing Spore's mounts or cache policy.
 | Instruction | Support |
 | --- | --- |
 | `FROM [--platform=linux/arm64] <source> [AS <name>]` | `scratch`, previous stage, named `--build-context` (OCI layout), local ref, public registry ref, or digest ref. Other platforms fail closed. |
-| `RUN <shell>` / `RUN ["argv", …]` | shell form executes as `/bin/sh -c`; exec form preserves a bounded non-empty JSON string array and searches PATH only when argv zero contains no slash. Both run in the guest as root. No `--mount`, per-instruction `--network`, or heredoc. |
+| `RUN <shell>` / `RUN ["argv", …]` | shell form executes as `/bin/sh -c`; bracket-prefixed text falls back to shell form when it is not valid JSON. Exec form preserves a bounded non-empty JSON string array, rejects valid arrays containing non-string values, and searches PATH only when argv zero contains no slash. Both run in the guest as root. No `--mount`, per-instruction `--network`, or heredoc. |
 | `COPY [--link[=<bool>]] [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative expanded source/destination operands, including files and directories. `--from` remains literal, matching BuildKit. `--link=true` is accepted only with `--from` and uses no-follow scratch-merge destination behavior; `--link=false` retains ordinary cross-stage COPY behavior. Local-context `--link` and other COPY flags fail closed. |
 | `ADD [--chmod=<octal>] <https-url> <dest>` | one public HTTPS URL with literal scheme/authority and expanded path/query plus one expanded destination. The opaque response is always refetched, bounded, and content-addressed. Numeric chmod expands at instruction start and must resolve from `0` through `07777`; other flags, symbolic modes, local/Git sources, credentials, and archive extraction fail closed. |
 | `ENV K=V` / `ENV K V` | build env + final image config. |
 | `ARG K[=default]` | value from `--build-arg` or an expanded default; unset values expand to empty unless a supported operator supplies another result. |
-| `WORKDIR /path` | affects `RUN` cwd, `COPY` relative dest, final config. Created in the guest if missing, matching Docker. |
-| `CMD ["…"]` / `CMD <shell>` | final image config only; both JSON exec form and shell form are supported. |
-| `ENTRYPOINT ["…"]` / `ENTRYPOINT <shell>` | final image config only; both JSON exec form and shell form are supported. |
-| comments, line continuations, `${VAR}`/`$VAR` substitution in supported instruction arguments | The leading directive window accepts the stable Dockerfile syntax directive and backslash/backtick escape directives; single quotes remain literal, double quotes expand, and unsupported syntax frontends fail closed. |
+| `WORKDIR /path` | affects `RUN` cwd, `COPY` relative dest, final config. Relative and parent components normalize from the current directory within the guest root, and the result is created in the guest if missing, matching Docker. |
+| `CMD ["…"]` / `CMD <shell>` | final image config only; bracket-prefixed invalid JSON is shell form, while valid JSON containing non-string values is rejected. |
+| `ENTRYPOINT ["…"]` / `ENTRYPOINT <shell>` | final image config only; bracket-prefixed invalid JSON is shell form, while valid JSON containing non-string values is rejected. |
+| comments, line continuations, `${VAR}`/`$VAR` substitution in supported instruction arguments | The leading directive window accepts the stable Dockerfile syntax directive and backslash/backtick escape directives. Removing an escape and physical newline inserts no bytes, single quotes remain literal, double quotes expand, and unsupported syntax frontends fail closed. |
 
 Builder-owned variable substitution applies to `FROM`, `ENV`, `ARG` defaults,
 `WORKDIR`, `COPY` source/destination arguments, and the accepted `ADD` numeric

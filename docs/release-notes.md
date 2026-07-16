@@ -2,6 +2,18 @@
 
 ## Next
 
+`spore build` now matches Docker's frontend behavior for continued tokens,
+bracket-prefixed shell commands, parent-relative `WORKDIR`, and step timeouts.
+Removing a line-continuation escape no longer inserts a space, so identifiers
+and COPY source names may continue across physical lines without changing.
+`RUN`, `CMD`, and `ENTRYPOINT` text beginning with `[` falls back to shell form
+when it is not valid JSON, while valid JSON arrays containing non-string values
+still fail closed. `WORKDIR ..` and other parent components normalize within
+the guest root, while COPY paths retain their stricter rejection of parent
+segments. The build timeout now applies independently to each Dockerfile
+instruction; multi-request COPY operations share one instruction budget, and
+aggregate instruction timing remains available in build diagnostics.
+
 `spore build` now accepts numeric `--chmod` on the public HTTPS single-file
 `ADD` form. Octal values from `0` through `07777`, including ARG-expanded and
 leading-zero spellings, apply to the downloaded regular file; the default
